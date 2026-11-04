@@ -42,7 +42,7 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install 1.99.0 --profile minimal
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwayland-dev libxkbcommon-dev libegl1-mesa-dev
-      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
             ~/.cargo/registry
