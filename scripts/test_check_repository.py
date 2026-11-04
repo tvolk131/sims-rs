@@ -287,5 +287,22 @@ class RepositoryHygieneTests(unittest.TestCase):
         self.assert_fails("known private game payload", "--history", second)
 
 
+class PublicBuildManifestTests(unittest.TestCase):
+    def test_linux_window_backend_is_explicit_and_target_scoped(self):
+        metadata = json.loads(subprocess.check_output(
+            ["cargo", "metadata", "--offline", "--locked", "--no-deps", "--format-version", "1"],
+            cwd=SCRIPT.parent.parent, text=True, timeout=30,
+        ))
+        app = next(package for package in metadata["packages"] if package["name"] == "sims-app")
+        iced_dependencies = [dependency for dependency in app["dependencies"] if dependency["name"] == "iced"]
+        linux = next(dependency for dependency in iced_dependencies
+                     if dependency["target"] == 'cfg(target_os = "linux")')
+        self.assertEqual(linux["features"], ["wayland"])
+        for dependency in iced_dependencies:
+            self.assertFalse(dependency["uses_default_features"])
+            if dependency["target"] is None:
+                self.assertFalse({"x11", "wayland"}.intersection(dependency["features"]))
+
+
 if __name__ == "__main__":
     unittest.main()

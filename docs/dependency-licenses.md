@@ -5,7 +5,7 @@ using the repository lockfile. This includes resolved target-specific dependenci
 not just the libraries linked into one executable. No dependency source or binary
 is vendored by this inventory.
 
-`Cargo.lock` SHA-256: `e943741376af2e0fae0f27f0e35dabda0e8486fb1fc33a3b44e85b6e06a203ec`.
+`Cargo.lock` SHA-256: `8b36a35b76afe2d805006d4458a4dc6d9030375af1c919dbeb5be330ba28b136`.
 
 The table reproduces declared Cargo license metadata, including legacy slash
 separators. It does not choose among alternatives, verify every upstream source
@@ -15,7 +15,10 @@ distributing builds. See `THIRD_PARTY_NOTICES.md` and `legal-and-provenance.md`.
 
 | Package | Version | Declared license metadata |
 | --- | --- | --- |
+| `ab_glyph` | `0.2.32` | Apache-2.0 |
+| `ab_glyph_rasterizer` | `0.1.10` | Apache-2.0 |
 | `adler2` | `2.0.1` | 0BSD OR MIT OR Apache-2.0 |
+| `ahash` | `0.8.12` | MIT OR Apache-2.0 |
 | `android-activity` | `0.6.1` | MIT OR Apache-2.0 |
 | `android-properties` | `0.2.2` | MIT |
 | `android_system_properties` | `0.1.6` | MIT OR Apache-2.0 |
@@ -43,6 +46,9 @@ distributing builds. See `THIRD_PARTY_NOTICES.md` and `legal-and-provenance.md`.
 | `byteorder-lite` | `0.1.0` | Unlicense OR MIT |
 | `bytes` | `1.12.1` | MIT |
 | `calloop` | `0.13.0` | MIT |
+| `calloop` | `0.14.5` | MIT |
+| `calloop-wayland-source` | `0.3.0` | MIT |
+| `calloop-wayland-source` | `0.4.1` | MIT |
 | `cc` | `1.6.0` | MIT OR Apache-2.0 |
 | `cfg-if` | `1.0.5` | MIT OR Apache-2.0 |
 | `cfg_aliases` | `0.2.2` | MIT |
@@ -52,6 +58,7 @@ distributing builds. See `THIRD_PARTY_NOTICES.md` and `legal-and-provenance.md`.
 | `clap_lex` | `1.1.1` | MIT OR Apache-2.0 |
 | `clipboard-win` | `5.4.1` | BSL-1.0 |
 | `clipboard_macos` | `0.1.1` | Apache-2.0 |
+| `clipboard_wayland` | `0.2.2` | Apache-2.0 |
 | `cobs` | `0.3.0` | MIT OR Apache-2.0 |
 | `codespan-reporting` | `0.12.0` | Apache-2.0 |
 | `colorchoice` | `1.0.5` | MIT OR Apache-2.0 |
@@ -78,6 +85,7 @@ distributing builds. See `THIRD_PARTY_NOTICES.md` and `legal-and-provenance.md`.
 | `dispatch2` | `0.3.1` | Zlib OR Apache-2.0 OR MIT |
 | `dlib` | `0.5.3` | MIT |
 | `document-features` | `0.2.12` | MIT OR Apache-2.0 |
+| `downcast-rs` | `1.2.1` | MIT/Apache-2.0 |
 | `dpi` | `0.1.2` | Apache-2.0 AND MIT |
 | `embedded-io` | `0.4.0` | MIT OR Apache-2.0 |
 | `embedded-io` | `0.6.1` | MIT OR Apache-2.0 |
@@ -110,6 +118,7 @@ distributing builds. See `THIRD_PARTY_NOTICES.md` and `legal-and-provenance.md`.
 | `futures-task` | `0.3.34` | MIT OR Apache-2.0 |
 | `futures-util` | `0.3.34` | MIT OR Apache-2.0 |
 | `generic-array` | `0.14.7` | MIT |
+| `getrandom` | `0.3.4` | MIT OR Apache-2.0 |
 | `getrandom` | `0.4.3` | MIT OR Apache-2.0 |
 | `gl_generator` | `0.14.0` | Apache-2.0 |
 | `glam` | `0.25.0` | MIT OR Apache-2.0 |
@@ -213,6 +222,7 @@ distributing builds. See `THIRD_PARTY_NOTICES.md` and `legal-and-provenance.md`.
 | `once_cell_polyfill` | `1.70.2` | MIT OR Apache-2.0 |
 | `orbclient` | `0.3.55` | MIT |
 | `ordered-float` | `5.5.0` | MIT |
+| `owned_ttf_parser` | `0.25.1` | Apache-2.0 |
 | `parking_lot` | `0.12.5` | MIT OR Apache-2.0 |
 | `parking_lot_core` | `0.9.12` | MIT OR Apache-2.0 |
 | `paste` | `1.0.15` | MIT OR Apache-2.0 |
@@ -232,7 +242,9 @@ distributing builds. See `THIRD_PARTY_NOTICES.md` and `legal-and-provenance.md`.
 | `proc-macro2` | `1.0.107` | MIT OR Apache-2.0 |
 | `profiling` | `1.0.18` | MIT OR Apache-2.0 |
 | `pxfm` | `0.1.30` | BSD-3-Clause OR Apache-2.0 |
+| `quick-xml` | `0.41.0` | MIT |
 | `quote` | `1.0.47` | MIT OR Apache-2.0 |
+| `r-efi` | `5.3.0` | MIT OR Apache-2.0 OR LGPL-2.1-or-later |
 | `r-efi` | `6.0.0` | MIT OR Apache-2.0 OR LGPL-2.1-or-later |
 | `range-alloc` | `0.1.5` | MIT OR Apache-2.0 |
 | `rangemap` | `1.8.0` | MIT/Apache-2.0 |
@@ -253,7 +265,9 @@ distributing builds. See `THIRD_PARTY_NOTICES.md` and `legal-and-provenance.md`.
 | `rustix` | `1.1.5` | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | `rustversion` | `1.0.23` | MIT OR Apache-2.0 |
 | `same-file` | `1.0.6` | Unlicense/MIT |
+| `scoped-tls` | `1.0.1` | MIT/Apache-2.0 |
 | `scopeguard` | `1.2.0` | MIT OR Apache-2.0 |
+| `sctk-adwaita` | `0.10.1` | MIT |
 | `self_cell` | `1.3.0` | Apache-2.0 OR GPL-2.0-only |
 | `semver` | `1.0.28` | MIT OR Apache-2.0 |
 | `serde` | `1.0.229` | MIT OR Apache-2.0 |
@@ -271,6 +285,9 @@ distributing builds. See `THIRD_PARTY_NOTICES.md` and `legal-and-provenance.md`.
 | `slab` | `0.4.12` | MIT |
 | `slotmap` | `1.1.1` | Zlib |
 | `smallvec` | `1.16.2` | MIT OR Apache-2.0 |
+| `smithay-client-toolkit` | `0.19.2` | MIT |
+| `smithay-client-toolkit` | `0.20.0` | MIT |
+| `smithay-clipboard` | `0.7.3` | MIT |
 | `smol_str` | `0.2.2` | MIT OR Apache-2.0 |
 | `softbuffer` | `0.4.8` | MIT OR Apache-2.0 |
 | `spirv` | `0.3.0+sdk-1.3.268.0` | Apache-2.0 |
@@ -309,12 +326,24 @@ distributing builds. See `THIRD_PARTY_NOTICES.md` and `legal-and-provenance.md`.
 | `utf8parse` | `0.2.2` | Apache-2.0 OR MIT |
 | `version_check` | `0.9.5` | MIT/Apache-2.0 |
 | `walkdir` | `2.5.0` | Unlicense/MIT |
+| `wasip2` | `1.0.4+wasi-0.2.12` | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | `wasm-bindgen` | `0.2.129` | MIT OR Apache-2.0 |
 | `wasm-bindgen-futures` | `0.4.79` | MIT OR Apache-2.0 |
 | `wasm-bindgen-macro` | `0.2.129` | MIT OR Apache-2.0 |
 | `wasm-bindgen-macro-support` | `0.2.129` | MIT OR Apache-2.0 |
 | `wasm-bindgen-shared` | `0.2.129` | MIT OR Apache-2.0 |
 | `wasmtimer` | `0.4.3` | MIT |
+| `wayland-backend` | `0.3.17` | MIT |
+| `wayland-client` | `0.31.15` | MIT |
+| `wayland-csd-frame` | `0.3.0` | MIT |
+| `wayland-cursor` | `0.31.14` | MIT |
+| `wayland-protocols` | `0.32.13` | MIT |
+| `wayland-protocols-experimental` | `20250721.0.1` | MIT |
+| `wayland-protocols-misc` | `0.3.12` | MIT |
+| `wayland-protocols-plasma` | `0.3.12` | MIT |
+| `wayland-protocols-wlr` | `0.3.12` | MIT |
+| `wayland-scanner` | `0.31.11` | MIT |
+| `wayland-sys` | `0.31.11` | MIT |
 | `web-sys` | `0.3.106` | MIT OR Apache-2.0 |
 | `web-time` | `1.1.0` | MIT OR Apache-2.0 |
 | `wgpu` | `27.0.1` | MIT OR Apache-2.0 |
@@ -347,6 +376,8 @@ distributing builds. See `THIRD_PARTY_NOTICES.md` and `legal-and-provenance.md`.
 | `windows_x86_64_msvc` | `0.52.6` | MIT OR Apache-2.0 |
 | `winit` | `0.30.13` | Apache-2.0 |
 | `winnow` | `1.0.4` | MIT |
+| `wit-bindgen` | `0.57.1` | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
+| `xcursor` | `0.3.11` | MIT |
 | `xkbcommon-dl` | `0.4.2` | MIT |
 | `xkeysym` | `0.2.1` | MIT OR Apache-2.0 OR Zlib |
 | `xml-rs` | `0.8.29` | MIT |

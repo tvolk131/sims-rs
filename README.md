@@ -40,7 +40,9 @@ python3 -B -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 GPU/application builds also require the native window-system dependencies for
-your platform. On Ubuntu, CI installs `libwayland-dev`, `libxkbcommon-dev` and
+your platform. Linux builds explicitly enable Iced's Wayland backend without
+enabling its unrelated default features; running the GUI requires a Wayland
+session. On Ubuntu, CI installs `libwayland-dev`, `libxkbcommon-dev` and
 `libegl1-mesa-dev`. Runtime tests that need a GPU, game content or a private
 observation are separate from the asset-free library unit suites above.
 Manual research examples are not part of that CI check; known pre-existing
