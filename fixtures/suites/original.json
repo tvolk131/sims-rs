@@ -1,0 +1,88 @@
+{
+  "schema": 1,
+  "id": "original",
+  "cases": [
+    {
+      "id": "saved-rng",
+      "adapter": {
+        "kind": "saved_rng"
+      },
+      "fixture": {
+        "store": "../private/conformance-components-20261026-first",
+        "case_id": "native-saved-rng-v1"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 64
+    },
+    {
+      "id": "scheduler-clock",
+      "adapter": {
+        "kind": "scheduler_clock"
+      },
+      "fixture": {
+        "store": "../private/conformance-components-20261026-first",
+        "case_id": "native-scheduler-clock-gameplay-v1"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 64
+    },
+    {
+      "id": "newbie-native-256",
+      "adapter": {
+        "kind": "native_household",
+        "house": "UserData/Houses/House07.iff"
+      },
+      "fixture": null,
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 256,
+      "estimated_memory_mib": 64
+    },
+    {
+      "id": "goth-native-256",
+      "adapter": {
+        "kind": "native_household",
+        "house": "UserData/Houses/House05.iff"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-physical-baseline-20261027-v1"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 256,
+      "estimated_memory_mib": 64
+    },
+    {
+      "id": "mashuga-native-256",
+      "adapter": {
+        "kind": "native_household",
+        "house": "UserData2/Houses/House09.iff"
+      },
+      "fixture": null,
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 256,
+      "estimated_memory_mib": 64
+    },
+    {
+      "id": "goth-startup-observation",
+      "adapter": {
+        "kind": "evidence_only",
+        "reason": "Observed startup modal/screenshots; no qualified resumable baseline or executable native tick comparison"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "goth-startup-magic-town-observed-20261026-v1"
+      },
+      "required": false,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 64
+    }
+  ]
+}

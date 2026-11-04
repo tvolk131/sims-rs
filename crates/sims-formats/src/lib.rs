@@ -1,0 +1,20 @@
+//! Checked readers for the original Sims data. No windowing or GPU dependencies.
+pub mod behavior;
+pub mod career;
+pub mod execution;
+pub mod far;
+pub mod ffn;
+pub mod field;
+pub mod iff;
+mod legacy_sprite;
+pub mod lot;
+pub mod neighborhood;
+mod reader;
+pub mod saved_objects;
+pub mod sprite;
+pub mod strings;
+pub mod tatt;
+pub mod tuning;
+pub use reader::{Error, Result};
+pub mod animation;
+pub mod avatar;

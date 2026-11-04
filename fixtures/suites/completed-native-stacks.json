@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "id": "completed-native-stacks",
+  "cases": [
+    {
+      "id": "goth-completed-stacks",
+      "adapter": {
+        "kind": "completed_stacks"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-stacks-20261027-v2"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 128
+    }
+  ]
+}

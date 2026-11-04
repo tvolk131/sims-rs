@@ -1,0 +1,73 @@
+{
+  "adapter_epoch_source": "authored-private-epoch",
+  "boundary": {
+    "advanced": 1,
+    "advanced_observation": {
+      "address": 590079,
+      "bytes": 1,
+      "raw": "01",
+      "sha256": "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a"
+    },
+    "eip": 4642077,
+    "kind": "lot_update_return",
+    "main_thread_stack_sha256": "f4d71ab3e2f495c0bb8a5e61782edb6400b4940b05ffc80ec5aa40206a86374b",
+    "main_thread_tib_sha256": "4bd87c80c51d3a9f7811efe02b4fa5363555b5f482b426d54a6a10705db99324",
+    "registry": 131072,
+    "scheduler_cursor": 0,
+    "simulator": 65536,
+    "tick": 987
+  },
+  "cached_init": 4101,
+  "cached_main": 4096,
+  "construction_ownership_source": "authored known-empty ownership",
+  "frame_shapes": [
+    {
+      "argc": 4,
+      "context": 458752,
+      "locals": 1,
+      "node": 0,
+      "offset_words": 0,
+      "tree": 4096
+    },
+    {
+      "argc": 1,
+      "context": 458752,
+      "locals": 0,
+      "node": 0,
+      "offset_words": 16,
+      "tree": 280
+    }
+  ],
+  "group_ownership_source": "authored World topology",
+  "native_consumer_ownership_source": "authored no pending outer consumer",
+  "native_pointer": 196608,
+  "native_reentry": {
+    "argument_index": 0,
+    "argument_value": 20000,
+    "countdown": 10,
+    "flags": 9,
+    "kind": "ordinary-main-at-sleep-next-eligible-registry-tick",
+    "known_flags": {
+      "enabled": true,
+      "error_service_bit": false,
+      "run_while_paused": false
+    },
+    "last_frame": 1,
+    "last_yield_tick": "not inferred",
+    "registry_word": 589834,
+    "wake_tick": "not synthesized"
+  },
+  "object": 1,
+  "profile": "sims191/ordinary-main-sleep-registry-reentry-v1",
+  "raw_capture_sha256": "0f7a91ded96e43a5ac0ad3877b02e0743cd16150436027992f5e39244023d785",
+  "reference_image_sha256": "a4d9f7134f52a186685961800608af72c23036ba62637eb9a99d75d4c5b1b321",
+  "schema": 1,
+  "source_binding": {
+    "context": 458752,
+    "definition": 471040,
+    "guid": 4045620583,
+    "objd": 16807,
+    "resource": 466944
+  },
+  "source_witness_sha256": "de6e1070f01253349cec2f33e85ec0edee265f561088c6d4e7455e4280c7b29f"
+}

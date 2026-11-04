@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "id": "completed-native-ordinary-v1",
+  "cases": [
+    {
+      "id": "goth-completed-ordinary",
+      "adapter": {
+        "kind": "completed_ordinary",
+        "immutable_content": "../../game-data/cabinet-extracted"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-ordinary-graphs-20261028-v2"
+      },
+      "required": true,
+      "timeout_seconds": 120,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 768
+    }
+  ]
+}

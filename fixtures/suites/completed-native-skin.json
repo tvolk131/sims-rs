@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "id": "completed-native-skin",
+  "cases": [
+    {
+      "id": "goth-completed-skin",
+      "adapter": {
+        "kind": "completed_skin"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-skin-20261027-v1"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 128
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "mode": "sweep",
+  "target_scope": "drawn",
+  "plan": {
+    "seed": 1,
+    "limits": {
+      "commands": 128,
+      "completed_ticks": 256,
+      "service_polls": 10000,
+      "wall_seconds": 120
+    },
+    "compare_fork": true,
+    "cold_restore_at": null
+  },
+  "max_targets": 12,
+  "max_actions_per_target": 4,
+  "action_frames": 32,
+  "failure_checkpoint_limit": 4,
+  "screenshot_limit": 0
+}

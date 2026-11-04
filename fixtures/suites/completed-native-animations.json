@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "id": "completed-native-animations",
+  "cases": [
+    {
+      "id": "goth-completed-animations",
+      "adapter": {
+        "kind": "completed_animations"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-animations-20261027-v1"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 128
+    }
+  ]
+}

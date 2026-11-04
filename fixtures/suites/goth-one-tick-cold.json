@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "id": "goth-one-tick-cold-qualified-native-replay",
+  "cases": [
+    {
+      "id": "goth-native-88448-to-88449",
+      "adapter": {
+        "kind": "native_household",
+        "house": "UserData/Houses/House05.iff",
+        "immutable_content": "../../cache/managed-independent-20261022-third/immutable-assets",
+        "checks": "cold"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-qualified-replay-20261029-v1"
+      },
+      "required": true,
+      "timeout_seconds": 900,
+      "minimum_matched_ticks": 1,
+      "estimated_memory_mib": 1024
+    }
+  ]
+}

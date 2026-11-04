@@ -1,0 +1,27 @@
+{
+  "mode": "script",
+  "plan": {
+    "seed": 1,
+    "minimum_completed_ticks": 60,
+    "compare_ticks": false,
+    "limits": { "commands": 16, "completed_ticks": 120, "service_polls": 10000, "wall_seconds": 300.0 },
+    "compare_fork": false,
+    "cold_restore_at": null
+  },
+  "commands": [
+    { "kind": "playing", "value": true },
+    { "kind": "advance", "millis": 40 },
+    { "kind": "dialog", "id": 14, "result": 2, "body_sha256": "8adc30cd1de26fbbbf34b0e9a2c619161c31903c1c2e2fe5c5b4bf750b798588" },
+    { "kind": "dialog", "id": 15, "result": 2, "body_sha256": "74458af6ac718e72b3a2ab6598af7e3bea98e2d04da12a23a4c8794850231d2f" },
+    { "kind": "dialog", "id": 16, "result": 2, "body_sha256": "018722c9a7b117b343d7815d4ce26980a01f01a1f544a691e0b1da621c0365cb" },
+    { "kind": "dialog", "id": 17, "result": 2, "body_sha256": "2fbd7eaa7fe4848c76c02c21954e6f8c8df1f623401370a70d3daa0f2f1ce63a" },
+    { "kind": "dialog", "id": 18, "result": 2, "body_sha256": "5ef4d7566d4762c9e0f57717f8a20f650cdbbced96b82ebcf93899c863b62d4d" },
+    { "kind": "playing", "value": true },
+    { "kind": "advance", "millis": 40 },
+    { "kind": "dialog", "id": 19, "result": 3, "body_sha256": "52f35949be4524be16205e81c259ff3e338cc6e87ff98c641387cfa7191e766f" },
+    { "kind": "playing", "value": true },
+    { "kind": "wait", "milestone": { "kind": "completed_ticks", "count": 60 }, "max_ticks": 120, "max_frames": 10000, "frame_millis": 40 }
+  ],
+  "failure_checkpoint_limit": 1,
+  "save_final": false
+}

@@ -1,0 +1,15 @@
+{
+  "mode": "explore",
+  "plan": {
+    "seed": 17,
+    "limits": {
+      "commands": 64,
+      "completed_ticks": 256,
+      "service_polls": 10000,
+      "wall_seconds": 120
+    },
+    "compare_fork": true,
+    "cold_restore_at": 8
+  },
+  "failure_checkpoint_limit": 4
+}

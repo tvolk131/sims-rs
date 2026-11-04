@@ -1,0 +1,19 @@
+{
+  "mode": "explore",
+  "progress_burst_ticks": 32,
+  "plan": {
+    "seed": 101,
+    "minimum_completed_ticks": 512,
+    "compare_ticks": true,
+    "limits": {
+      "commands": 512,
+      "completed_ticks": 544,
+      "service_polls": 10000,
+      "wall_seconds": 600
+    },
+    "compare_fork": true,
+    "cold_restore_at": 8
+  },
+  "save_final": true,
+  "failure_checkpoint_limit": 1
+}

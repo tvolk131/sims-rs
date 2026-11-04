@@ -1,0 +1,190 @@
+{
+  "schema": 1,
+  "id": "original-components",
+  "cases": [
+    {
+      "id": "saved-rng",
+      "adapter": {
+        "kind": "saved_rng"
+      },
+      "fixture": {
+        "store": "../private/conformance-components-20261026-first",
+        "case_id": "native-saved-rng-v1"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 64
+    },
+    {
+      "id": "scheduler-clock",
+      "adapter": {
+        "kind": "scheduler_clock"
+      },
+      "fixture": {
+        "store": "../private/conformance-components-20261026-first",
+        "case_id": "native-scheduler-clock-gameplay-v1"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 64
+    },
+    {
+      "id": "goth-completed-stacks",
+      "adapter": {
+        "kind": "completed_stacks"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-stacks-20261027-v2"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 128
+    },
+    {
+      "id": "goth-completed-animations",
+      "adapter": {
+        "kind": "completed_animations"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-animations-20261027-v1"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 128
+    },
+    {
+      "id": "goth-completed-groups",
+      "adapter": {
+        "kind": "completed_groups"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-groups-20261027-v1"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 128
+    },
+    {
+      "id": "goth-completed-person-world",
+      "adapter": {
+        "kind": "completed_person_world"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-person-world-20261027-v1"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 128
+    },
+    {
+      "id": "goth-completed-reentry",
+      "adapter": {
+        "kind": "completed_reentry"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-reentry-20261027-v2"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 256
+    },
+    {
+      "id": "goth-completed-skeletons",
+      "adapter": {
+        "kind": "completed_skeletons"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-skeletons-20261027-v1"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 128
+    },
+    {
+      "id": "goth-completed-skin",
+      "adapter": {
+        "kind": "completed_skin"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-skin-20261027-v1"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 128
+    },
+    {
+      "id": "goth-completed-residents",
+      "adapter": {
+        "kind": "completed_residents"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-residents-20261027-v1"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 128
+    },
+    {
+      "id": "goth-completed-prototypes",
+      "adapter": {
+        "kind": "completed_prototypes"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-prototypes-20261028-v1"
+      },
+      "required": true,
+      "timeout_seconds": 60,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 128
+    },
+    {
+      "id": "goth-completed-appearances",
+      "adapter": {
+        "kind": "completed_appearances",
+        "immutable_content": "../../game-data/cabinet-extracted"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-appearance-bindings-20261028-v1"
+      },
+      "required": true,
+      "timeout_seconds": 120,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 768
+    },
+    {
+      "id": "goth-completed-ordinary",
+      "adapter": {
+        "kind": "completed_ordinary",
+        "immutable_content": "../../game-data/cabinet-extracted"
+      },
+      "fixture": {
+        "store": "../private/player-action-regressions-20261025",
+        "case_id": "native-goth-completed-ordinary-graphs-20261028-v2"
+      },
+      "required": true,
+      "timeout_seconds": 120,
+      "minimum_matched_ticks": 0,
+      "estimated_memory_mib": 768
+    }
+  ]
+}

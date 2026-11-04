@@ -1,0 +1,36 @@
+{
+  "process": {
+    "loaded": 0,
+    "words": [
+      1045220557,
+      1028443341,
+      990057071,
+      1017370378,
+      1036831949,
+      990057071,
+      1017370378,
+      1036831949,
+      1036831949,
+      10,
+      25,
+      1077936128
+    ]
+  },
+  "configuration": {
+    "profile": "CompleteCollection191",
+    "fp_control": 63,
+    "source": {
+      "module": "Global.iff",
+      "module_sha256": "bdfd8456abceaa3e44f0a9754815248ea1e80c7b0df4fbaff53843fae3731478",
+      "resource_id": 2,
+      "resource_sha256": "fd3a44e2068aa43ba01d17d79bafb2cd8882beb44a2f53376d34f6172c637a2e"
+    }
+  },
+  "input_evidence": {
+    "capture": "cache/native-autonomy-startup-20261024-second/autonomy-initialization-third.jsonl",
+    "capture_sha256": "3b5b2e3ab15c1d9b22800d8583eb6e9976cad146499c195db67709845c408bbb",
+    "sample_line": 7,
+    "sample_sha256": "f0e613e4c67e5542d0900652951490857b3edb73c568217f9d4208bc1b990a62",
+    "entry": 4560964
+  }
+}

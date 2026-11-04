@@ -1,0 +1,52 @@
+# Rust build output
+/target/
+
+# Local copies of original game content, saves, and extracted resources.
+# Keep the user's installation outside the repository when possible.
+/game-data/
+/userdata/
+/saves/
+/extracted/
+/cache/
+/fixtures/private/
+/rust-simplicity/
+
+# Private reference evidence and research tooling are not part of the public tree.
+/scripts/research/
+**/tests/fixtures/
+**/private_tests.rs
+/crates/sims-vm/src/native_registry_reentry/tests.rs
+/crates/sims-vm/src/native_suspension/tests.rs
+/crates/sims-vm/src/retained_epoch/tests.rs
+/crates/sims-vm/src/scheduler/storage/word_tail_tests.rs
+/crates/sims-app/src/original_viewer_continuation_tests.rs
+/crates/sims-app/src/tutorial_presentation_tests.rs
+/crates/sims-sim/src/pose/transform/retained-goth.json
+/crates/sims-content/src/autonomy_resources/expected-final-process.json
+
+# Historical research notes remain local until separately reviewed for publication.
+/docs/*
+!/docs/legal-and-provenance.md
+!/docs/dependency-licenses.md
+!/docs/repository-workflow.md
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+/.aws/
+/.ssh/
+/.gnupg/
+
+# Local research-tool bytecode
+__pycache__/
+
+# Local configuration and platform files
+/sims-rs.local.toml
+.DS_Store
+
+/crates/sims-app/src/original_viewer/exploration/startup_play/host_journey/tutorial_camera/go_here/walking/tests.rs
+/crates/sims-render/tests/clown_household_continuation.rs
+/crates/sims-render/tests/fresh_household_replay.rs

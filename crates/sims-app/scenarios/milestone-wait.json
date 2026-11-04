@@ -1,0 +1,27 @@
+{
+  "mode": "script",
+  "plan": {
+    "seed": 1,
+    "minimum_completed_ticks": 64,
+    "compare_ticks": true,
+    "limits": {
+      "commands": 8,
+      "completed_ticks": 70,
+      "service_polls": 10000,
+      "wall_seconds": 180
+    },
+    "compare_fork": true,
+    "cold_restore_at": 1
+  },
+  "commands": [
+    {"kind": "playing", "value": true},
+    {
+      "kind": "wait",
+      "milestone": {"kind": "completed_ticks", "count": 64},
+      "max_ticks": 70,
+      "max_frames": 2000,
+      "frame_millis": 250
+    }
+  ],
+  "save_final": true
+}

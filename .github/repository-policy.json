@@ -1,0 +1,600 @@
+{
+  "schema": 2,
+  "max_blob_bytes": 5242880,
+  "max_tree_bytes": 67108864,
+  "large_blob_allowlist": [],
+  "reviewed_data": [
+    {
+      "path": "crates/sims-app/scenarios/menu-sweep.json",
+      "bytes": 400,
+      "sha256": "74f31e55b8e29cceb5de247b8db64018bf5983222fb0fd847d8a170997249387",
+      "provenance": "Project-authored scenario or synthetic test-owner record; no original game resource payload."
+    },
+    {
+      "path": "crates/sims-app/scenarios/milestone-wait.json",
+      "bytes": 550,
+      "sha256": "01fd5dced56edd879ab1f77bc10e31057cf9661da3bcb050abc016caaa52043e",
+      "provenance": "Project-authored scenario or synthetic test-owner record; no original game resource payload."
+    },
+    {
+      "path": "crates/sims-app/scenarios/quick-play.json",
+      "bytes": 272,
+      "sha256": "e591ac57a1f8221f1c0345154a65bc002659e7ee34aaa8e154e9e2c5c4cdc0c6",
+      "provenance": "Project-authored scenario or synthetic test-owner record; no original game resource payload."
+    },
+    {
+      "path": "crates/sims-app/scenarios/seeded-endurance.json",
+      "bytes": 389,
+      "sha256": "6f2ea2bbd205959d55e395518d50fadbb9ece7c845b771f1857e0227f02c1015",
+      "provenance": "Project-authored scenario or synthetic test-owner record; no original game resource payload."
+    },
+    {
+      "path": "crates/sims-content/src/autonomy_resources/initial-input.json",
+      "bytes": 954,
+      "sha256": "3d898ef159716cfcc854b8081a0acf5d3f2e77779d05d0717abbd7d5d8baf8d1",
+      "provenance": "Reviewed scalar initial configuration and source fingerprints; no executable instructions, game prose or resource payload."
+    },
+    {
+      "path": "crates/sims-content/src/graphic_retirement/observed/authored.json",
+      "bytes": 3761,
+      "sha256": "99d36ee7474971854ed4a395515e38c470b45c989b03102d64f38d2afc2f231d",
+      "provenance": "Project-authored scenario or synthetic test-owner record; no original game resource payload."
+    },
+    {
+      "path": "crates/sims-vm/src/registry_suspension/token.authored.json",
+      "bytes": 2131,
+      "sha256": "3c2454fec1692892d397aaa59951d868102fe5e34e8c110018502543069c176d",
+      "provenance": "Project-authored scenario or synthetic test-owner record; no original game resource payload."
+    },
+    {
+      "path": "fixtures/suites/all.json",
+      "bytes": 6866,
+      "sha256": "ab8028e7bf340ffd88ff2a7e72ad3af118cdc629708bec9b79d3b39dda4329c0",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/completed-native-animations.json",
+      "bytes": 476,
+      "sha256": "a0aa7658f8b94edd8ab128a33638b535695e8585b77654531fd4b6c8efd76d7d",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/completed-native-appearances.json",
+      "bytes": 558,
+      "sha256": "9cc7aceff400a7b1026b7d15af3c171be28f56f157785c800a9092fe077926cf",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/completed-native-groups.json",
+      "bytes": 460,
+      "sha256": "0297be823d956f2d8c9ba69a4f55e2682b11a0490b6688ebf1fd1a6204556c4b",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/completed-native-ordinary.json",
+      "bytes": 545,
+      "sha256": "26c88f8bb37706f3f0e4db290d00de8d96b7529804cb779145e47dddc596ef86",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/completed-native-person-world.json",
+      "bytes": 484,
+      "sha256": "316aac94da61f3e2da8733eff0927e3a7af1cc05e2a276a3ffb1f4167d40e526",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/completed-native-prototypes.json",
+      "bytes": 479,
+      "sha256": "810a0ba425839ce2c38e9f91597b5dde5ecd4ac88a1a1f4b248d71f1cdbe85da",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/completed-native-reentry.json",
+      "bytes": 464,
+      "sha256": "7f006e8faa920ee4313d43e49b651a545c5d6ea7507fcdaa7c64ca526018d7ad",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/completed-native-residents.json",
+      "bytes": 475,
+      "sha256": "acd34bddf784957c10382c461ecf3c8d4b912a907cfce8356b4baae38f78dbe6",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/completed-native-skeletons.json",
+      "bytes": 472,
+      "sha256": "d817d0ad8ed7fdedc11470f431624e491eea7521b8d11218b5543249ccf18020",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/completed-native-skin.json",
+      "bytes": 452,
+      "sha256": "2666c0fef7e1f329eff0e1dfe5150d42e045335a3b52a5c21199e2b4a8b19dc4",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/completed-native-stacks.json",
+      "bytes": 460,
+      "sha256": "e26bc3f1a1ddb116db75ba36dc6ca34da0491fb9040208fe21cdb2f88658584f",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/components.json",
+      "bytes": 5314,
+      "sha256": "6045ea5902e3146cc89af9e96ad4e0c837396054bbf3fd55d6121a830a6c629f",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/continuation.json",
+      "bytes": 532,
+      "sha256": "12c9917b287bc18efef3a54e4fb0c3a358f7b3a50c4f87ac2db4b0996def1136",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/goth-fresh-original-play.json",
+      "bytes": 1494,
+      "sha256": "8af19d27833d119f4159275f011adaf5e38e70b55bec0e0251b53cad57723f38",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/goth-one-tick-cold.json",
+      "bytes": 656,
+      "sha256": "a3f4170c21880ace018cc538b17b6c4d5fb0e9861c500520bcc11b4611f1a17f",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/goth-one-tick.json",
+      "bytes": 653,
+      "sha256": "40e5e2d58ef58ce8cc78f50d6de228fd8a6c6a80f29f7c2d619716ed0288f4e1",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    },
+    {
+      "path": "fixtures/suites/original.json",
+      "bytes": 2356,
+      "sha256": "01525b0a9195eb7ad41c615f89531078b3a0a20f1ba0c9eea7877fbd25aa2b24",
+      "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
+    }
+  ],
+  "blocked_payloads": [
+    {
+      "bytes": 3,
+      "sha256": "e598d0c3ba86d917b177d7adde0556aa99bc355543c57aee0a3e50b684dd7e99",
+      "reason": "original executable identity guard"
+    },
+    {
+      "bytes": 4,
+      "sha256": "916ae10aa3fd76a4d5b25b2fb66e9df0fd04957c7ab10930268d1ed7808be689",
+      "reason": "original executable identity guard"
+    },
+    {
+      "bytes": 5,
+      "sha256": "46eada20450a6b6f8e09daac29adb4f006003d8603766bb4989a349a40e5c67d",
+      "reason": "original executable identity guard"
+    },
+    {
+      "bytes": 6,
+      "sha256": "41d2c23fed43a1e28c11cda3efe2d5f2c1983f13669f2da6c9b83c8622baf8f3",
+      "reason": "original executable identity guard"
+    },
+    {
+      "bytes": 7,
+      "sha256": "22adc00d4671dad3f241b60f3c8835a481a38d566eef872c64f38a30c2cb6e1d",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 7,
+      "sha256": "555ec9d4ac5626fac7385093e799055f2fa16dc8edbca263a9b6d93bbbdd7885",
+      "reason": "original executable identity guard"
+    },
+    {
+      "bytes": 7,
+      "sha256": "b26137ce17a8386215bb1fde2b53f227d965b04ec16598700dc9cd28de01928f",
+      "reason": "original executable identity guard"
+    },
+    {
+      "bytes": 8,
+      "sha256": "9fe5e4b912ae090b1d0ee45966c85be1a006085e1b6777d1ae2fb9af6d62a1a3",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 8,
+      "sha256": "b09540ff36f486fafd91acb451c6d92cc0c31ab1e9f4379a9342bc0cc88df1a6",
+      "reason": "original executable identity guard"
+    },
+    {
+      "bytes": 10,
+      "sha256": "fb5d97cab12e883381bf6416fdd0eafefd18f417929d51a87ba4fcbee353b264",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 12,
+      "sha256": "9d2d908b9153082d1f0331911bf85a577cfe7505d2df58b03b592e462c2892d6",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 14,
+      "sha256": "aebfd93a49863274a60704193e95f26c78645e770fc25423da890b4e74c7ecca",
+      "reason": "original executable witness"
+    },
+    {
+      "bytes": 15,
+      "sha256": "1f6be242c1808a4876e51202ef71a57be5650adad00915729d4417711932408c",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 15,
+      "sha256": "d76068611fabd7331faa247d711fad19058a7f9aa49a628c302a81b356301d31",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 19,
+      "sha256": "4cb1c7d5a9cb8b73920e026e498adaf5e32672a44f5c0abdbf8b52574defabc8",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 23,
+      "sha256": "eb6cfd6140eaeb687346da267917f2b7012320752e19c3a003b4aa6286466285",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 24,
+      "sha256": "01b5dc6865257b1f0065dbbc39b1b3d20d7749b9ea4b8c52c5c98a9c800f3913",
+      "reason": "original executable witness"
+    },
+    {
+      "bytes": 25,
+      "sha256": "05fd3bd36120c1e48dacc3c52e7b298c99e80d3f1367e192c193b59235a6e82e",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 27,
+      "sha256": "cf281015456392752dccea611647f8edb80c47504c915d24947f8f7c80d92d17",
+      "reason": "original executable witness"
+    },
+    {
+      "bytes": 28,
+      "sha256": "f0b429a4e795a74e0316878cac6c1f31aedffc4058083d6e012307a86dc43ec7",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 32,
+      "sha256": "bc7d6050cdf9bbc672a9a55fdfb7e96fa98333ea06858f00136e3507020e50fc",
+      "reason": "original executable witness"
+    },
+    {
+      "bytes": 34,
+      "sha256": "2a5d10c8c0eac407e78fec5d7c6efa496f2a748a74047c102db0c4ff4c60f0b6",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 34,
+      "sha256": "c8edc0675f69f89ad16a46794ca40e65494821d33f9ae0a32cd322106dd5db71",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 35,
+      "sha256": "10c0aa0a3256ce978c24378609f12b1a1bbdd8e31c84c49a231974fcd034ab2c",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 41,
+      "sha256": "c7b392b25fb038885419e7c35dc85eed2383c52dba36603198900781e38ac8f8",
+      "reason": "original executable witness"
+    },
+    {
+      "bytes": 42,
+      "sha256": "ccdb5655d8be72b82dc54a592be42c38098d917904ba97c924560611884a3cbb",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 43,
+      "sha256": "698641c8101931e1ea92650c6cddc3450417440a79189921049a58771de0bf60",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 43,
+      "sha256": "77557c9c62d7114d2a7d556ac1e89bddc69eabbc1e0d7fc62b2446fbebe8f200",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 49,
+      "sha256": "1b79ac1e47d398f1b0f65948e092bbe63390c6bbb330b87b71c75ca9ad4e22c4",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 51,
+      "sha256": "846fdff3ccfee6d995a5affa87add38f7f429f04975fd767eda1b8315976d13b",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 52,
+      "sha256": "50e06d1e26bd6eda5a16b541176f92b8510fb64375e9fa66af1971060e7444d2",
+      "reason": "original executable witness"
+    },
+    {
+      "bytes": 52,
+      "sha256": "7fbb4eca45f433efd2388fb69677eb1cea37bc388afeba7528f60109504d9350",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 53,
+      "sha256": "3e9eef34b908fda444cb833500fa4e6f2662f618c9802037600ca12f978997ff",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 53,
+      "sha256": "b3a70a44690fe52bc72ac4fdb009329186cbc3b52cf5543652a3053e5e0cef81",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 55,
+      "sha256": "c4f983d1377ed8931ec9c56fbe8d1c7dd975c29b8732edab106c7ab5eeaa8c9f",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 60,
+      "sha256": "85d2709e1f1fdcee1e966a95dc7413167cfc3042ec935ac48f9005807057c2d2",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 62,
+      "sha256": "730d714538d2fd0547e3bd647c2b9530a2f05751a6d5201c5094a449852af3e6",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 62,
+      "sha256": "9a95a7326b6af360a0fbf72ac36b9f12ecb8096769b6143067146234f799db1f",
+      "reason": "original executable witness"
+    },
+    {
+      "bytes": 68,
+      "sha256": "39b95c35b9e9e0bf354d0303aa50f2f950cd6342210e1fc8642da7154d5de487",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 72,
+      "sha256": "9d4cc40972150f94446a8899ced264ba6a4a799f6bb0bbb603f9354a5948d7c9",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 81,
+      "sha256": "03ef81ca58417e4d98f6eeda9d4a6df8c8950f4c12369eb749586bf09a70e49f",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 87,
+      "sha256": "37e028227ee05595a412765af0d3f2064cd1779e7be61bdb5d7fc4c5c0520fdd",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 92,
+      "sha256": "3089620aab9124e700faa38c03b11f08f03af4596949cb6c1678375c5c2a23f4",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 98,
+      "sha256": "0b1b1b91bfb6a11b537e44b93bc39a7d502e6fffde65480ca4e8cfe0fd24b2b4",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 100,
+      "sha256": "163eaba238dbebb1c29abc71ea7805eedee1e318885e9eac81b3037728637018",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 100,
+      "sha256": "8b6ab98fa35768d41d6c78096e7adb46fca68239e6acf19b5f7951fb003d8c62",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 102,
+      "sha256": "5219563698a4e6ce3180fc03ea76988949838360a30c788a6afff7a0c1fdfa5a",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 108,
+      "sha256": "d2c3fa568945ffbd5bf00949715a9d67eda1fe1c111e1abd4894db0ef364520e",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 120,
+      "sha256": "7379c0a38612b241c496b40da9d884cbc7c4dabb32c1732ba057adf0695e384d",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 144,
+      "sha256": "74458af6ac718e72b3a2ab6598af7e3bea98e2d04da12a23a4c8794850231d2f",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 151,
+      "sha256": "dfb2dd6d699f3eebd221b6c057557d8a456440f3f66a2c8c1b917246c037d10d",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 163,
+      "sha256": "1a918e165ac7c4734425b55f3670a5ee5a3320bc2b595609302c288ffaf57247",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 164,
+      "sha256": "40814f944cfbd3daf2454b1db4b02ce7a6090ad4d6c815e5db85cd9d8336d707",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 183,
+      "sha256": "1750fa43fd9116f0ab9fa27e6672253254b22609b03f5a7997c90856f5f8bb39",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 184,
+      "sha256": "502573a6a7f3ae55e8311bcaa8e9fa7f6a512e7b958ec2e39f1e7902425ae446",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 202,
+      "sha256": "abeb6a30a3ea59df062afb914d72fd442f920293f5b32a02afdc3bd6d0fd58f5",
+      "reason": "original game-authored prose"
+    },
+    {
+      "bytes": 324,
+      "sha256": "370ddd86ca475047c5e6faaed023c4b28a3ab8a6d45415bff839a572f3f53ba9",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 326,
+      "sha256": "7a316c182d41c69a1acf1521c4061d0cf74807c9463f07a0e2fcdc8ba8144127",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 363,
+      "sha256": "c4b3f692c844f8e5741b936dc45014effa9c6c71c9e57af124386bebd80e9673",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 770,
+      "sha256": "016f6c45990fe8c39cf45ff5c4acbb9ea5891f3cdc44b6e696e86632e3e85c71",
+      "reason": "original executable witness"
+    },
+    {
+      "bytes": 839,
+      "sha256": "1c23ff56f49a6eefa1e644dc36a6bceaef3855552dda0409ddd4061c92229f15",
+      "reason": "private research instruction witness"
+    },
+    {
+      "bytes": 154,
+      "sha256": "52f35949be4524be16205e81c259ff3e338cc6e87ff98c641387cfa7191e766f",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 120,
+      "sha256": "c2d68cb76742120d20a6cca36c74dd3a7422493003e9b8908206a601618dc312",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 236,
+      "sha256": "d62954b453b5b38184947a3a33b9f51be88c60fc976d622e7e63fc979b0ffd1d",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 249,
+      "sha256": "00e3f452981fffc40dd5e5f62a800459ecbda732ff5eaa261dc2fda4543e5042",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 287,
+      "sha256": "62c04706a460a19512a54d8c5fe140d79ab6f751a54dbc83a5660c0de9002658",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 80,
+      "sha256": "5338ab8d1c97c9b76500b6298c5dd9b2012b40f96fb233833e6f5a5f0cd11224",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 170,
+      "sha256": "272c32a8a1b5035aa904a06b709d79eec3b5fcd6bfe05b3a7d0d3175dd5100c1",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 85,
+      "sha256": "59156a780ddab17d47b5803810696af8c5e17b34ff148417924eb630a3f512d2",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 76,
+      "sha256": "76ff22751e84c1015c75b90ffafaa916502bb6dfc41c093a658ede2662c703b3",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 83,
+      "sha256": "e18cde3c5d02dca1f7d055d945a155b5656732e7e0e31b2c140bdccfb8877a29",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 80,
+      "sha256": "2f3996a5be1fafee33d35b34089400e0e4dbf186861f31ea466c4d25abe6b620",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 84,
+      "sha256": "1be83ac20d08ef23349929d89047e9e1f21a60c1dd5e2e64061a2c04ac4a14e6",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 75,
+      "sha256": "26f3f7d0164d58e71257f13fb3d204b5eb5e8a9ddb1703acea57ee55a892545d",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 77,
+      "sha256": "ac0b6645886dfccf80bae3331fcc0d5d324a91ada1971ba68b51502e45784cd0",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 74,
+      "sha256": "914d3b03e231845bf2fd324b6677e0f1a403784960f2b9464060ef8d9d103973",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 158,
+      "sha256": "a09c5348f7a40667e14339d18db6af28025784a5c023a3cb683eb2f5c299b22e",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 81,
+      "sha256": "673ed7a73312a928bf95658fb8107672b33c70d505a223a9e4990dba85247b99",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 79,
+      "sha256": "ffe52be2764f4b4d38a8a842f5246e781dd1c46d21c852d2762034caa02de93c",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 87,
+      "sha256": "e2f013557ffbb9e13090380fdd76bcaf33fbfc60e63a4c3a4df728f00d2bbc63",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 731,
+      "sha256": "463b23e586bc568d6cb1370e5a9f95d6ce033cb6e111748e5ffcae44428190ec",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 72,
+      "sha256": "631d595327e7ca994210ff8b21757e7860e23d17eaf3b92a18d7ff1e09acc108",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 86,
+      "sha256": "f0993c7c0c6458601c8328f2cb2f9bde2517df9fa8413e1493a90fa62572fd41",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 105,
+      "sha256": "6deca31536ed24265bada0bb006c8b1d7883de580aad350160385af773d3c7d3",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 201,
+      "sha256": "9ace9fe3d65681b6e757887df6918c8a948893dc108dcd045e1fb26379fa3154",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 88,
+      "sha256": "abd8c114cb66a63f8cace3547a03e51cb81c6d71fbbbd9c83e7d1c0c39a45f8d",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 129,
+      "sha256": "655327cebd194f566f3fa3fc5d692d90b5d59fd02b7e07cc09d90062062f675f",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    },
+    {
+      "bytes": 104,
+      "sha256": "abf3f972fd5b02e31d5deefdb54383e77f5c30047b79c86ba5b5f8c113bf3ea8",
+      "reason": "Private dialogue or associated unpublished manual-test string; excluded conservatively."
+    }
+  ]
+}

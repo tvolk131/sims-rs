@@ -1,0 +1,26 @@
+[package]
+name = "sims-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+private-fixtures = []
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+image.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sims-formats.workspace = true
+sims-content.workspace = true
+sims-vm.workspace = true
+sims-sim.workspace = true
+
+[[bin]]
+name = "sims"
+path = "src/bin/sims.rs"

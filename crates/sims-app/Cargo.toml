@@ -1,0 +1,42 @@
+[package]
+name = "sims-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+private-fixtures = []
+macos-sha2-asm = ["dep:sha2"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sims-formats.workspace = true
+sims-content.workspace = true
+sims-vm.workspace = true
+sims-sim.workspace = true
+sims-runtime.workspace = true
+sims-render = { path = "../sims-render" }
+iced = { version = "=0.14.0", default-features = false, features = ["wgpu", "image-without-codecs", "thread-pool", "crisp", "advanced"] }
+wgpu = "27"
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+sha2 = { workspace = true, optional = true, features = ["asm"] }
+
+[dev-dependencies]
+sha2.workspace = true
+iced_runtime = "=0.14.0"
+
+[[bin]]
+name = "sims-room"
+path = "src/bin/room.rs"
+
+[[bin]]
+name = "sims-inspector"
+path = "src/bin/inspector.rs"

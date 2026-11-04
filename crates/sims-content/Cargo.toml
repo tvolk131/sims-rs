@@ -1,0 +1,27 @@
+[package]
+name = "sims-content"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+private-fixtures = []
+
+[dependencies]
+anyhow.workspace = true
+encoding_rs.workspace = true
+sims-formats.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sims-vm.workspace = true
+sims-sim.workspace = true
+image.workspace = true
+cosmic-text = "=0.15.0"
+
+[dev-dependencies]
+sims-runtime.workspace = true
+
