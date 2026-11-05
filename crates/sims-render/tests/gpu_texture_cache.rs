@@ -6,6 +6,93 @@ mod offscreen;
 
 #[test]
 #[ignore = "offscreen GPU; no original assets or window required"]
+fn deferred_uploads_revalidate_hidden_changes_and_reused_slots() -> anyhow::Result<()> {
+    let mut base = rgba_scene(8, 8, [255, 0, 0, 255].repeat(64))?;
+    Arc::make_mut(&mut base.textures).extend([
+        Texture {
+            width: 1,
+            height: 1,
+            rgba: vec![0, 255, 0, 255].into(),
+            depth: vec![255].into(),
+        },
+        Texture {
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 255, 255].into(),
+            depth: vec![255].into(),
+        },
+    ]);
+    let mut scenes = vec![base.clone()];
+    let mut green = base.clone();
+    green.draws[0].texture = 1;
+    scenes.push(green);
+    let mut hidden_change = base.clone();
+    Arc::make_mut(&mut hidden_change.textures)[1].rgba = vec![255, 255, 0, 255].into();
+    scenes.push(hidden_change.clone());
+    let mut yellow = hidden_change.clone();
+    yellow.draws[0].texture = 1;
+    scenes.push(yellow.clone());
+    scenes.push(yellow);
+    let mut blue = hidden_change.clone();
+    blue.draws[0].texture = 2;
+    scenes.push(blue);
+    let mut shrink = hidden_change.clone();
+    Arc::make_mut(&mut shrink.textures).truncate(1);
+    scenes.push(shrink.clone());
+    Arc::make_mut(&mut shrink.textures).extend([
+        Texture {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 255, 0, 255].into(),
+            depth: vec![255].into(),
+        },
+        Texture {
+            width: 1,
+            height: 2,
+            rgba: [255, 0, 255, 255].repeat(2).into(),
+            depth: vec![255; 2].into(),
+        },
+    ]);
+    shrink.draws[0].texture = 2;
+    scenes.push(shrink);
+    scenes.push(base);
+    let references = scenes.iter().collect::<Vec<_>>();
+    let results =
+        offscreen::render_sequence_with_preparation(&references, [8, 8], [0., 0., 8., 8.])?;
+    let expected_uploads = [1, 1, 0, 1, 0, 1, 0, 1, 0];
+    let expected_colors = [
+        [255, 0, 0, 255],
+        [0, 255, 0, 255],
+        [255, 0, 0, 255],
+        [255, 255, 0, 255],
+        [255, 255, 0, 255],
+        [0, 0, 255, 255],
+        [255, 0, 0, 255],
+        [255, 0, 255, 255],
+        [255, 0, 0, 255],
+    ];
+    for (index, (image, preparation)) in results.iter().enumerate() {
+        assert_eq!(
+            preparation.uploaded_textures, expected_uploads[index],
+            "transition {index}"
+        );
+        assert!(
+            image
+                .pixels()
+                .all(|pixel| pixel.0 == expected_colors[index]),
+            "transition {index}"
+        );
+        assert_eq!(
+            *image,
+            offscreen::render(&scenes[index])?,
+            "warm/fresh transition {index}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "offscreen GPU; no original assets or window required"]
 fn changed_texture_slots_render_exactly_like_a_fresh_gpu() -> anyhow::Result<()> {
     let mut base = rgba_scene(8, 8, [255, 0, 0, 255].repeat(64))?;
     base.vertices.iter_mut().for_each(|v| v.position[2] = 0.1);
