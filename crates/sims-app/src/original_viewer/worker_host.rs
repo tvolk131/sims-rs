@@ -97,20 +97,29 @@ impl Engine {
             publication.journey_object.as_mut(),
         ) {
             let (vm, route, visit) = match (
-                self.object_progress_fixture.as_ref(), self.viewer.session.as_ref(),
+                self.object_progress_fixture.as_ref(),
+                self.viewer.session.as_ref(),
             ) {
                 (Some(fixture), _) => (&fixture.vm, None, None),
                 (None, Some(session)) => {
                     let simulation = &session.simulation;
-                    let route = simulation.vm.object_threads.get(&native.actor)
+                    let route = simulation
+                        .vm
+                        .object_threads
+                        .get(&native.actor)
                         .and_then(|thread| simulation.routes.get(thread));
                     (&simulation.vm, route, simulation.visit)
                 }
                 (None, None) => return,
             };
-            object.progress = Some(Box::new(super::ui_publication::JourneyObjectProgress::capture(
-                vm, native.actor, route, visit,
-            )));
+            object.progress = Some(Box::new(
+                super::ui_publication::JourneyObjectProgress::capture(
+                    vm,
+                    native.actor,
+                    route,
+                    visit,
+                ),
+            ));
         }
     }
 }
@@ -345,6 +354,20 @@ impl Host {
             revision: self.shell_revision,
         }
     }
+    fn transport_waiting(&self) -> bool {
+        self.closing.is_none()
+            && !self.close_sent
+            && !self.replacing
+            && self.application_confirmation.is_none()
+            && self.frontend.error.is_none()
+            && self.frontend.native_transport
+            && self.frontend.pending
+            && !self.frontend.modal
+            && self.queued.front().is_some_and(|next| {
+                next.generation == self.generation()
+                    && matches!(next.work.message, Message::Toggle | Message::NativeSpeed(_))
+            })
+    }
     fn poll(&mut self) -> Task<Event> {
         let Some(worker) = &mut self.worker else {
             return Task::none();
@@ -402,6 +425,7 @@ impl Host {
     }
     fn enqueue_origin(&mut self, generation: u64, message: Message, popup: Option<PopupSource>) {
         let shell = self.shell();
+        let drain_transport = matches!(message, Message::Frame(_)) && self.transport_waiting();
         // This is the existing consecutive-Motion coalescing rule, applied
         // before dispatch only when no enter/leave/button/shell boundary lies
         // between the motions. No completed engine call is coalesced.
@@ -415,12 +439,12 @@ impl Host {
             last.work.message = message;
             return;
         }
-        if self.queued.len() == 256 {
+        if self.queued.len() >= 256 && !drain_transport {
             self.error =
                 Some("Household input queue is full; no input was executed out of order.".into());
             return;
         }
-        self.queued.push_back(Queued {
+        let queued = Queued {
             generation,
             work: Work {
                 message,
@@ -429,10 +453,15 @@ impl Host {
                 #[cfg(test)]
                 gate: self.next_gate.take(),
             },
-        });
+        };
+        if drain_transport {
+            self.queued.push_front(queued);
+        } else {
+            self.queued.push_back(queued);
+        }
     }
     fn pump(&mut self) -> Task<Event> {
-        if self.error.is_some() {
+        if self.error.is_some() || self.transport_waiting() {
             return Task::none();
         }
         let Some(worker) = &mut self.worker else {
@@ -508,7 +537,7 @@ impl Host {
                     && !self.close_sent
                     && !self.replacing
                     && self.application_confirmation.is_none()
-                    && self.queued.is_empty()
+                    && (self.queued.is_empty() || self.transport_waiting())
                     && self.worker.as_ref().is_some_and(|w| !w.busy())
                 {
                     self.enqueue(self.generation(), Message::Frame(now));

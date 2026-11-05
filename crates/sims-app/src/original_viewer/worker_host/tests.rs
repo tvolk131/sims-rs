@@ -254,6 +254,118 @@ fn settings_host() -> Host {
 }
 
 #[test]
+fn pending_native_transport_waits_for_frame_and_preserves_input_order() -> Result<()> {
+    run(pending_transport)
+}
+fn pending_transport() -> Result<()> {
+    for message in [Message::Toggle, Message::NativeSpeed(760)] {
+        let mut host = Host::from_viewer_for_test(loading());
+        let publication = Arc::make_mut(&mut host.frontend.data);
+        publication.native_transport = true;
+        publication.pending = true;
+        let (entered, resume) = host.gate_next_for_test();
+        input(&mut host, message);
+        let (following_entered, following_resume) = host.gate_next_for_test();
+        input(&mut host, Message::Shift(true));
+        assert!(host.transport_waiting());
+        assert_eq!(host.queued.len(), 2);
+        assert!(!host.worker.as_ref().unwrap().busy());
+        assert!(entered.try_recv().is_err());
+        assert_eq!(host.update(Event::Completion).units(), 0);
+        assert_eq!(host.update(Event::Frame(Instant::now())).units(), 1);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while entered.try_recv().is_err() {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "transport did not follow settling frame"
+            );
+            drop(host.update(Event::Completion));
+            std::thread::yield_now();
+        }
+        assert_eq!(host.queued.len(), 1);
+        assert!(matches!(host.queued[0].work.message, Message::Shift(true)));
+        assert!(!host.frontend.pending);
+        assert!(following_entered.try_recv().is_err());
+        resume.send(())?;
+        while following_entered.try_recv().is_err() {
+            anyhow::ensure!(Instant::now() < deadline, "following input did not run");
+            drop(host.update(Event::Completion));
+            std::thread::yield_now();
+        }
+        following_resume.send(())?;
+        assert!(host.settle_for_test()?.is_empty());
+        assert!(host.queued.is_empty());
+        assert!(!host.worker.as_ref().unwrap().busy());
+    }
+    Ok(())
+}
+
+#[test]
+fn modal_and_close_do_not_deadlock_deferred_transport() -> Result<()> {
+    run(transport_boundaries)
+}
+fn transport_boundaries() -> Result<()> {
+    let mut host = Host::from_viewer_for_test(loading());
+    let publication = Arc::make_mut(&mut host.frontend.data);
+    publication.native_transport = true;
+    publication.pending = true;
+    publication.modal = true;
+    input(&mut host, Message::Toggle);
+    assert!(!host.transport_waiting());
+    assert!(host.settle_for_test()?.is_empty());
+    let publication = Arc::make_mut(&mut host.frontend.data);
+    publication.native_transport = true;
+    publication.pending = true;
+    input(&mut host, Message::Toggle);
+    assert!(host.transport_waiting());
+    let id = window::Id::unique();
+    let task = host.update(Event::Close(id));
+    let iced_runtime::Action::Output(Event::Completion) = task_action(task)? else {
+        anyhow::bail!("missing transport completion wake");
+    };
+    assert_eq!(host.update(Event::Completion).units(), 1);
+    assert!(host.close_sent);
+    assert!(host.queued.is_empty());
+    Ok(())
+}
+
+#[test]
+fn full_input_queue_still_allows_the_frame_that_releases_transport() -> Result<()> {
+    run(full_transport_queue)
+}
+fn full_transport_queue() -> Result<()> {
+    let mut host = Host::from_viewer_for_test(loading());
+    let publication = Arc::make_mut(&mut host.frontend.data);
+    publication.native_transport = true;
+    publication.pending = true;
+    let (entered, resume) = host.gate_next_for_test();
+    input(&mut host, Message::Toggle);
+    for _ in 1..256 {
+        input(&mut host, Message::Shift(true));
+    }
+    assert!(host.transport_waiting());
+    assert_eq!(host.queued.len(), 256);
+    assert_eq!(host.update(Event::Frame(Instant::now())).units(), 1);
+    assert!(host.error.is_none());
+    assert_eq!(host.queued.len(), 256);
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while entered.try_recv().is_err() {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "full queue blocked settling frame"
+        );
+        drop(host.update(Event::Completion));
+        std::thread::yield_now();
+    }
+    assert_eq!(host.queued.len(), 255);
+    assert!(host.error.is_none());
+    resume.send(())?;
+    assert!(host.settle_for_test()?.is_empty());
+    assert!(host.queued.is_empty());
+    Ok(())
+}
+
+#[test]
 fn application_confirmation_cancel_is_shell_only_and_does_not_submit_owner_work() -> Result<()> {
     run(settings_cancel)
 }
