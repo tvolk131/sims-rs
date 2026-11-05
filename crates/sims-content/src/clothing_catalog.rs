@@ -123,13 +123,25 @@ pub fn installed_names(index: &crate::Index) -> Result<Names> {
 /// its complete provider order and source-error checks when proving a missing
 /// appearance; a failed global filename scan alone cannot establish absence.
 pub(crate) fn installed_catalog(index: &crate::Index) -> Result<(Loaded, Directories)> {
+    let installation = crate::avatar_installation::Installation::new(
+        index,
+        crate::avatar_installation::complete_collection_asset_bindings(&index.root),
+    )?;
+    installed_catalog_from(index, installation, None)
+}
+
+pub(crate) fn installed_catalog_from(
+    index: &crate::Index,
+    mut installation: crate::avatar_installation::Installation<'_>,
+    inputs: Option<&crate::startup_inputs::Session>,
+) -> Result<(Loaded, Directories)> {
     use crate::{
-        avatar_installation::{Installation, complete_collection_asset_bindings},
         object_catalog::{Catalog, Settings},
         object_resources::Resources,
     };
-    let mut installation =
-        Installation::new(index, complete_collection_asset_bindings(&index.root))?;
+    if let Some(inputs) = inputs {
+        installation.observe(inputs);
+    }
     let initial = installation.initial_mounts(b"./", 255, false)?;
     let paths = sims_sim::object_scan::Paths {
         objects: initial[1].clone(),
@@ -145,6 +157,9 @@ pub(crate) fn installed_catalog(index: &crate::Index) -> Result<(Loaded, Directo
         installation.directories()?,
         installation.directory_search(),
     );
+    if let Some(inputs) = inputs {
+        resources.observe(inputs)?;
+    }
     let global = resources
         .acquire(&[initial[0].as_slice(), b"Global"].concat(), 0)
         .map_err(anyhow::Error::msg)?

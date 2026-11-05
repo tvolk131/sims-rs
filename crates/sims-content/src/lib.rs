@@ -47,6 +47,8 @@ pub mod saved_layers;
 pub mod saves;
 pub mod skeleton_resources;
 pub mod stairs;
+mod startup_inputs;
+mod startup_memo;
 pub mod surfaces;
 pub mod vm;
 pub mod zoning;

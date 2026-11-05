@@ -19,7 +19,7 @@ mod pool_sharing_tests;
 /// Explicit directory file maps. Non-resource entries still occupy hash nodes.
 /// `from_mounted` preserves the entire map, including its collision chains;
 /// `insert_first` is for callers supplying individual insertion operations.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Directories {
     maps: BTreeMap<Vec<u8>, Files<Option<usize>>>,
     // Filesystem wildcard searches are distinct from mounted hash-map iteration.

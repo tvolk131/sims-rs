@@ -96,8 +96,19 @@ pub fn load_accessories(index: &Index) -> Result<BTreeMap<String, Accessory>> {
 /// catalogs. The name is not a filename: pets use dog_skeleton/kat_skeleton.
 /// Native provider order and lazy record replacement select the actual asset.
 pub fn load_skeleton(index: &Index, name: &str) -> Result<(Skeleton, usize)> {
+    load_skeleton_with_startup(index, name, None)
+}
+
+pub(crate) fn load_skeleton_with_startup(
+    index: &Index,
+    name: &str,
+    startup: Option<&mut crate::startup_memo::Memo>,
+) -> Result<(Skeleton, usize)> {
     use sims_formats::avatar::{catalog::Asset, index::Kind};
-    let (mut installed, directories) = crate::clothing_catalog::installed_catalog(index)?;
+    let (mut installed, directories) = match startup {
+        Some(startup) => startup.installed_catalog(index)?,
+        None => crate::clothing_catalog::installed_catalog(index)?,
+    };
     let record = installed
         .catalog
         .resolve(index, &directories, Kind::Skeleton, name.as_bytes())?

@@ -55,18 +55,40 @@ struct Opened {
 
 #[derive(Default)]
 pub(crate) struct Scan {
+    inputs: Option<Observed>,
     #[cfg(unix)]
     files: VecDeque<Opened>,
     #[cfg(test)]
     opens: usize,
 }
+struct Observed {
+    inputs: crate::startup_inputs::Session,
+    scope: u64,
+}
+impl Drop for Observed {
+    fn drop(&mut self) {
+        self.inputs.end(self.scope);
+    }
+}
 impl Scan {
+    pub(crate) fn observed(inputs: &crate::startup_inputs::Session) -> Result<Self> {
+        Ok(Self {
+            inputs: Some(Observed {
+                inputs: inputs.clone(),
+                scope: inputs.begin()?,
+            }),
+            ..Self::default()
+        })
+    }
     #[cfg(all(test, unix))]
     pub(crate) fn open_count(&self) -> usize {
         self.opens
     }
 
     pub(crate) fn read(&mut self, resource: &Resource) -> Result<Vec<u8>> {
+        if let Some(observed) = &self.inputs {
+            return observed.inputs.read(observed.scope, resource);
+        }
         #[cfg(not(unix))]
         return resource.read();
         #[cfg(unix)]

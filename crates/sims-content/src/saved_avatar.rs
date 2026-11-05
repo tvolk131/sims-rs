@@ -236,7 +236,17 @@ impl BoundAvatar {
         owner: u64,
         state: &BindingState,
     ) -> Result<Self> {
-        Self::restore_with_geometry(index, skeleton, owner, state, |_| Ok(()))
+        Self::restore_with_startup(index, skeleton, owner, state, None)
+    }
+
+    pub(crate) fn restore_with_startup(
+        index: &Index,
+        skeleton: &str,
+        owner: u64,
+        state: &BindingState,
+        startup: Option<&mut crate::startup_memo::Memo>,
+    ) -> Result<Self> {
+        Self::restore_with_geometry(index, skeleton, owner, state, startup, |_| Ok(()))
     }
 
     /// The same immutable reconstruction, with the exact prototype keys used
@@ -249,7 +259,7 @@ impl BoundAvatar {
         state: &BindingState,
     ) -> Result<(Self, BTreeMap<u64, Vec<String>>)> {
         let mut keys = BTreeMap::new();
-        let avatar = Self::restore_with_geometry(index, skeleton, owner, state, |event| {
+        let avatar = Self::restore_with_geometry(index, skeleton, owner, state, None, |event| {
             if let GeometryEvent::Attach {
                 binding,
                 catalog_id,
@@ -285,6 +295,7 @@ impl BoundAvatar {
         skeleton: &str,
         owner: u64,
         state: &BindingState,
+        startup: Option<&mut crate::startup_memo::Memo>,
         mut geometry: impl FnMut(GeometryEvent<'_>) -> Result<()>,
     ) -> Result<Self> {
         let mut expected = BTreeMap::new();
@@ -310,7 +321,7 @@ impl BoundAvatar {
             state.next_binding > 0 && state.order.len() == expected.len(),
             "saved binding order length mismatch"
         );
-        let mut bound = Self::empty(index, skeleton, owner)?;
+        let mut bound = Self::empty_with_startup(index, skeleton, owner, startup)?;
         bound.records = state.records.clone();
         for entry in &mut bound.records.entries {
             entry.binding = None;
@@ -346,12 +357,22 @@ impl BoundAvatar {
     }
 
     pub fn empty(index: &Index, skeleton_name: &str, owner: u64) -> Result<Self> {
+        Self::empty_with_startup(index, skeleton_name, owner, None)
+    }
+
+    pub(crate) fn empty_with_startup(
+        index: &Index,
+        skeleton_name: &str,
+        owner: u64,
+        startup: Option<&mut crate::startup_memo::Memo>,
+    ) -> Result<Self> {
         let mut sources = BTreeMap::new();
         let skeleton = if skeleton_name.eq_ignore_ascii_case("root") {
             // Native 5a06d4 constructs this rig without a source catalog.
             sims_sim::pose::skeleton::root_source()
         } else {
-            let (skeleton, id) = crate::avatar::load_skeleton(index, skeleton_name)?;
+            let (skeleton, id) =
+                crate::avatar::load_skeleton_with_startup(index, skeleton_name, startup)?;
             // Preserve the decoded catalog's source/hash in saved appearance
             // provenance, as for the earlier single-catalog loader.
             read(index, id, &mut sources)?;
