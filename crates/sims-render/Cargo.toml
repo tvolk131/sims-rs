@@ -21,7 +21,7 @@ image.workspace = true
 glam = "0.30"
 serde.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
-wgpu = "27"
+wgpu = "30"
 
 [dev-dependencies]
 serde_json.workspace = true
