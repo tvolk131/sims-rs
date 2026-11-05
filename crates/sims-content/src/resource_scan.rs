@@ -1,4 +1,4 @@
-//! Bounded handles for one synchronous descriptor scan. Bytes, parse results,
+//! Bounded handles for a descriptor scan or mounted resource owner. Bytes, parse results,
 //! errors and resource IDs are never cached. Each read revalidates the current
 //! pathname, then uses Resource's ordinary bounds/seek/read checks. This avoids
 //! repeatedly opening the same FAR without assuming its contents are immutable.
@@ -61,6 +61,11 @@ pub(crate) struct Scan {
     opens: usize,
 }
 impl Scan {
+    #[cfg(all(test, unix))]
+    pub(crate) fn open_count(&self) -> usize {
+        self.opens
+    }
+
     pub(crate) fn read(&mut self, resource: &Resource) -> Result<Vec<u8>> {
         #[cfg(not(unix))]
         return resource.read();

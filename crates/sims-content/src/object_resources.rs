@@ -5,12 +5,13 @@ use crate::{Index, avatar_catalog::Directories};
 use sims_sim::object_catalog::access::{self, Access};
 use sims_sim::object_catalog::iff::{Stream, WriteStream};
 use std::sync::Arc;
+type SharedScan = Arc<std::sync::Mutex<crate::resource_scan::Scan>>;
 mod overlay;
 mod owner;
 pub use overlay::Overlay;
 pub use owner::{
-    Checkpoint, NOOP_CALLBACK, Resources, RetainedComponent, RetainedIdentities,
-    RetainedResources, RetainedStream,
+    Checkpoint, NOOP_CALLBACK, Resources, RetainedComponent, RetainedIdentities, RetainedResources,
+    RetainedStream,
 };
 
 #[derive(Clone)]
@@ -53,6 +54,7 @@ struct MountedFile<'a> {
     source: Option<usize>,
     filename: Vec<u8>,
     overlay: overlay::Shared,
+    scan: SharedScan,
 }
 impl<'a> MountedStream<'a> {
     pub fn new(index: &'a Index, directories: &'a Directories) -> Self {
@@ -66,6 +68,7 @@ impl<'a> MountedStream<'a> {
                 source: None,
                 filename: vec![],
                 overlay: Arc::new(std::sync::Mutex::new(Overlay::default())),
+                scan: Arc::new(Default::default()),
             },
         }
     }
@@ -74,12 +77,14 @@ impl<'a> MountedStream<'a> {
             IndexView::Borrowed(index),
             directories,
             Arc::new(std::sync::Mutex::new(Overlay::default())),
+            Arc::new(Default::default()),
         )
     }
     fn with_overlay(
         index: IndexView<'a>,
         directories: Arc<Directories>,
         overlay: overlay::Shared,
+        scan: SharedScan,
     ) -> Self {
         Self {
             access: Access::default(),
@@ -91,6 +96,7 @@ impl<'a> MountedStream<'a> {
                 source: None,
                 filename: vec![],
                 overlay,
+                scan,
             },
         }
     }
@@ -232,7 +238,12 @@ impl access::Host for FileAccess<'_, '_> {
         };
         let bytes = match copy {
             Some(bytes) => bytes,
-            None => resource.read().map_err(|e| e.to_string())?,
+            None => file
+                .scan
+                .lock()
+                .map_err(|_| "resource scan lock poisoned")?
+                .read(resource)
+                .map_err(|e| e.to_string())?,
         };
         file.bytes = Some(bytes);
         file.position = 0;

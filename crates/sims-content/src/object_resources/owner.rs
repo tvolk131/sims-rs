@@ -50,6 +50,7 @@ struct Components<'a> {
     next_handle: u32,
     opens: Vec<(Vec<u8>, i32)>,
     overlay: overlay::Shared,
+    scan: SharedScan,
     buffers: BTreeMap<u32, Vec<u8>>,
 }
 impl<'a> Components<'a> {
@@ -120,6 +121,7 @@ impl composite::Host for Components<'_> {
                     self.index.clone(),
                     self.directories.clone(),
                     self.overlay.clone(),
+                    self.scan.clone(),
                 ),
             },
             3 => Component::Directory(Directory::default()),
@@ -490,6 +492,7 @@ impl<'a> Resources<'a> {
                     next_handle: 1,
                     opens: vec![],
                     overlay: Arc::new(std::sync::Mutex::new(overlay)),
+                    scan: Arc::new(Default::default()),
                     buffers: BTreeMap::new(),
                 },
             },
@@ -758,3 +761,6 @@ impl<'a> Resources<'a> {
         )
     }
 }
+
+#[cfg(test)]
+mod tests;

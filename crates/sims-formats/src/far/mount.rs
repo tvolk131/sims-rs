@@ -4,6 +4,7 @@
 use crate::{Error, Result};
 pub struct Reader<'a> {
     data: &'a [u8],
+    directory: Option<&'a [u8]>,
     pub position: usize,
     pub manifest_offset: Option<u32>,
 }
@@ -17,16 +18,28 @@ impl<'a> Reader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self {
             data,
+            directory: None,
             position: 0,
             manifest_offset: None,
         }
     }
+    pub fn with_directory(header: &'a [u8], directory: &'a [u8]) -> Self {
+        Self {
+            directory: Some(directory),
+            ..Self::new(header)
+        }
+    }
     fn take(&mut self, count: usize) -> Option<&'a [u8]> {
-        let available = self.data.len().saturating_sub(self.position).min(count);
-        let start = self.position;
+        let (data, start) = match (self.directory, self.manifest_offset) {
+            (Some(directory), Some(offset)) => {
+                (directory, self.position.checked_sub(offset as usize)?)
+            }
+            _ => (self.data, self.position),
+        };
+        let available = data.len().saturating_sub(start).min(count);
         self.position += available;
         if available == count {
-            self.data.get(start..self.position)
+            data.get(start..start + available)
         } else {
             None
         }

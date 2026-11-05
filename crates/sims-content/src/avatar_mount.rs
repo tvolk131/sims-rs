@@ -10,6 +10,7 @@ use sims_sim::pose::clothing::{
 };
 use std::{
     collections::BTreeMap,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -176,16 +177,30 @@ impl<'a> Sources<'a> {
 fn key(path: &[u8]) -> Result<Vec<u8>> {
     Files::<()>::key(path).map_err(anyhow::Error::msg)
 }
+fn read_archive(input: &mut (impl Read + Seek), identity: u32) -> std::io::Result<Opened> {
+    let mut header = Vec::new();
+    input.by_ref().take(16).read_to_end(&mut header)?;
+    let mut directory = Vec::new();
+    if let Some(offset) = header.get(12..16) {
+        let offset = u32::from_le_bytes(offset.try_into().unwrap());
+        if (offset as usize) < header.len() {
+            directory.extend_from_slice(&header[offset as usize..]);
+        } else {
+            input.seek(SeekFrom::Start(u64::from(offset)))?;
+        }
+        input.read_to_end(&mut directory)?;
+    }
+    Ok(Opened::from_directory(identity, header, directory))
+}
 impl ArchiveHost for Sources<'_> {
     fn open(&mut self, path: &[u8]) -> Result<Option<Opened>, String> {
         let Some(archive) = self.archives.get(path) else {
             return Ok(None);
         };
-        match std::fs::read(&archive.physical) {
-            Ok(bytes) => Ok(Some(Opened {
-                identity: archive.identity,
-                bytes,
-            })),
+        let result = std::fs::File::open(&archive.physical)
+            .and_then(|mut input| read_archive(&mut input, archive.identity));
+        match result {
+            Ok(opened) => Ok(Some(opened)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(format!(
                 "read archive {}: {error}",
