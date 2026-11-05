@@ -3,16 +3,27 @@ use crate::{Scene, Vertex};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Preparation {
+    pub uploaded_textures: usize,
+    pub uploaded_bytes: usize,
+    pub software_composited: bool,
+}
+
 // A scene can replace its texture-vector owner when a single appearance is
 // attached. Slots are still addressed by the scene's texture indices. Compare
 // complete immutable payloads, not pointer addresses, hashes or filenames.
-fn changed_textures(previous: Option<&[crate::Texture]>, current: &[crate::Texture]) -> Vec<usize> {
-    current
+fn changed_textures(
+    previous: &[Option<crate::Texture>],
+    current: &[crate::Texture],
+    draws: &[crate::Draw],
+) -> Vec<usize> {
+    draws
         .iter()
-        .enumerate()
-        .filter_map(|(i, texture)| {
-            (previous.and_then(|old| old.get(i)) != Some(texture)).then_some(i)
-        })
+        .map(|draw| draw.texture)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|&index| previous.get(index).and_then(Option::as_ref) != Some(&current[index]))
         .collect()
 }
 
@@ -27,17 +38,33 @@ mod cache_tests {
             depth: vec![255].into(),
         }
     }
+    fn draws(slots: &[usize]) -> Vec<crate::Draw> {
+        slots
+            .iter()
+            .map(|&texture| crate::Draw {
+                vertices: 0..0,
+                texture,
+                object: None,
+            })
+            .collect()
+    }
+
     #[test]
     fn texture_diff_checks_payload_and_dimensions_and_preserves_slot_identity() {
         let old = vec![texture(1), texture(2)];
-        assert_eq!(changed_textures(None, &old), [0, 1]);
-        assert!(changed_textures(Some(&old), &old.clone()).is_empty());
-        assert!(changed_textures(Some(&old), &old[..1]).is_empty());
+        let cached = old.iter().cloned().map(Some).collect::<Vec<_>>();
+        let visible = draws(&[0, 1, 0]);
+        assert_eq!(changed_textures(&[], &old, &visible), [0, 1]);
+        assert!(changed_textures(&cached, &old.clone(), &visible).is_empty());
+        assert!(changed_textures(&cached, &old[..1], &draws(&[0])).is_empty());
         let mut new = old.clone();
         new.push(texture(3));
-        assert_eq!(changed_textures(Some(&old), &new), [2]);
+        assert_eq!(changed_textures(&cached, &new, &draws(&[2, 0])), [2]);
         new.swap(0, 1);
-        assert_eq!(changed_textures(Some(&old), &new), [0, 1, 2]);
+        assert_eq!(
+            changed_textures(&cached, &new, &draws(&[2, 0, 1])),
+            [0, 1, 2]
+        );
         for field in 0..4 {
             let mut new = old.clone();
             match field {
@@ -46,8 +73,28 @@ mod cache_tests {
                 2 => Arc::make_mut(&mut new[1].rgba)[0] = 17,
                 _ => Arc::make_mut(&mut new[1].depth)[0] = 17,
             }
-            assert_eq!(changed_textures(Some(&old), &new), [1]);
+            assert_eq!(changed_textures(&cached, &new, &visible), [1]);
         }
+    }
+
+    #[test]
+    fn unseen_slots_and_changes_remain_pending_until_first_visible_use() {
+        let original = vec![texture(1), texture(2), texture(3)];
+        let mut cached = vec![Some(original[0].clone()), None, None];
+        assert!(changed_textures(&cached, &original, &draws(&[0])).is_empty());
+        let mut current = original.clone();
+        current[1] = texture(4);
+        assert!(changed_textures(&cached, &current, &draws(&[0])).is_empty());
+        assert_eq!(changed_textures(&cached, &current, &draws(&[2, 2])), [2]);
+        cached[2] = Some(current[2].clone());
+        assert_eq!(changed_textures(&cached, &current, &draws(&[1, 0])), [1]);
+        cached[1] = Some(current[1].clone());
+        current[1] = texture(5);
+        assert!(changed_textures(&cached, &current, &draws(&[0])).is_empty());
+        assert_eq!(changed_textures(&cached, &current, &draws(&[1])), [1]);
+        cached.truncate(1);
+        assert_eq!(changed_textures(&cached, &current, &draws(&[2])), [2]);
+        assert!(changed_textures(&cached, &current, &[]).is_empty());
     }
 }
 pub struct Renderer {
@@ -55,7 +102,9 @@ pub struct Renderer {
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     textures: Option<Arc<Vec<crate::Texture>>>,
-    groups: Vec<wgpu::BindGroup>,
+    cached_textures: Vec<Option<crate::Texture>>,
+    validated_textures: Vec<bool>,
+    groups: Vec<Option<wgpu::BindGroup>>,
     vertices: Option<wgpu::Buffer>,
     draws: Vec<crate::Draw>,
     depth: Option<wgpu::TextureView>,
@@ -120,6 +169,8 @@ impl Renderer {
             layout,
             sampler,
             textures: None,
+            cached_textures: vec![],
+            validated_textures: vec![],
             groups: vec![],
             vertices: None,
             draws: vec![],
@@ -133,7 +184,7 @@ impl Renderer {
         queue: &wgpu::Queue,
         scene: &Scene,
         target_size: [u32; 2],
-    ) {
+    ) -> Preparation {
         if !scene.censors.is_empty() {
             // The recovered 16-bit mosaic is currently a CPU compositor. Keep
             // one implementation for Iced and headless verification; upload
@@ -141,17 +192,35 @@ impl Renderer {
             // A GPU implementation can replace this bounded slow path once it
             // matches the native pixel/depth/RNG corpus.
             let frame = crate::software::composited_scene(scene);
-            self.prepare(device, queue, &frame, target_size);
-            return;
+            let mut preparation = self.prepare(device, queue, &frame, target_size);
+            preparation.software_composited = true;
+            return preparation;
         }
-        if self
+        let mut preparation = Preparation::default();
+        let textures_changed = self
             .textures
             .as_ref()
-            .is_none_or(|a| !Arc::ptr_eq(a, &scene.textures))
+            .is_none_or(|previous| !Arc::ptr_eq(previous, &scene.textures));
+        if textures_changed {
+            self.validated_textures.clear();
+            self.validated_textures.resize(scene.textures.len(), false);
+        }
+        if textures_changed
+            || scene.draws.iter().any(|draw| {
+                !self
+                    .validated_textures
+                    .get(draw.texture)
+                    .copied()
+                    .unwrap_or(false)
+            })
         {
-            for i in changed_textures(self.textures.as_deref().map(Vec::as_slice), &scene.textures)
-            {
+            self.groups.resize_with(scene.textures.len(), || None);
+            self.cached_textures
+                .resize_with(scene.textures.len(), || None);
+            for i in changed_textures(&self.cached_textures, &scene.textures, &scene.draws) {
                 let t = &scene.textures[i];
+                preparation.uploaded_textures += 1;
+                preparation.uploaded_bytes += t.rgba.len() + t.depth.len();
                 let size = wgpu::Extent3d {
                     width: t.width,
                     height: t.height,
@@ -202,13 +271,12 @@ impl Renderer {
                         },
                     ],
                 });
-                if i < self.groups.len() {
-                    self.groups[i] = group;
-                } else {
-                    self.groups.push(group);
-                }
+                self.groups[i] = Some(group);
+                self.cached_textures[i] = Some(t.clone());
             }
-            self.groups.truncate(scene.textures.len());
+            for draw in &scene.draws {
+                self.validated_textures[draw.texture] = true;
+            }
             self.textures = Some(scene.textures.clone());
         }
         self.vertices = Some(
@@ -237,6 +305,7 @@ impl Renderer {
             self.depth = Some(depth.create_view(&Default::default()));
             self.size = target_size;
         }
+        preparation
     }
     pub fn render(
         &self,
@@ -279,7 +348,13 @@ impl Renderer {
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, vertices.slice(..));
         for draw in &self.draws {
-            pass.set_bind_group(0, &self.groups[draw.texture], &[]);
+            pass.set_bind_group(
+                0,
+                self.groups[draw.texture]
+                    .as_ref()
+                    .expect("drawn texture was prepared"),
+                &[],
+            );
             pass.draw(draw.vertices.clone(), 0..1);
         }
     }

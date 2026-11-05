@@ -49,6 +49,17 @@ pub fn render_sequence_at(
     target: [u32; 2],
     viewport: [f32; 4],
 ) -> Result<Vec<image::RgbaImage>> {
+    Ok(render_sequence_with_preparation(scenes, target, viewport)?
+        .into_iter()
+        .map(|(image, _)| image)
+        .collect())
+}
+
+pub fn render_sequence_with_preparation(
+    scenes: &[&sims_render::Scene],
+    target: [u32; 2],
+    viewport: [f32; 4],
+) -> Result<Vec<(image::RgbaImage, sims_render::gpu::Preparation)>> {
     let instance = wgpu::Instance::default();
     let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
     let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
@@ -78,7 +89,7 @@ pub fn render_sequence_at(
     let mut renderer = sims_render::gpu::Renderer::new(&device, format);
     let mut images = Vec::new();
     for scene in scenes {
-        renderer.prepare(&device, &queue, scene, target);
+        let preparation = renderer.prepare(&device, &queue, scene, target);
         let mut encoder = device.create_command_encoder(&Default::default());
         renderer.render(
             &mut encoder,
@@ -116,10 +127,11 @@ pub fn render_sequence_at(
             .chunks_exact(row_bytes as usize)
             .flat_map(|row| row[..target[0] as usize * 4].iter().copied())
             .collect();
-        images.push(
+        images.push((
             image::RgbaImage::from_raw(target[0], target[1], pixels)
                 .context("invalid GPU readback")?,
-        );
+            preparation,
+        ));
         drop(mapped);
         buffer.unmap();
     }
