@@ -30,7 +30,7 @@ impl Prepared {
         settings: Settings,
         crt: &mut u32,
     ) -> Result<Self> {
-        Self::begin_inner(index, vm, program, object, settings, crt, None)
+        Self::begin_inner(index, vm, program, object, settings, crt, None, None)
     }
     /// Live construction uses the process resource owner. `begin` above is the
     /// isolated, already-loaded-prototype diagnostic used by native rig probes.
@@ -43,7 +43,29 @@ impl Prepared {
         crt: &mut u32,
         resources: &mut crate::skeleton_resources::Cache,
     ) -> Result<Self> {
-        Self::begin_inner(index, vm, program, object, settings, crt, Some(resources))
+        Self::begin_with_startup(index, vm, program, object, settings, crt, resources, None)
+    }
+
+    pub(crate) fn begin_with_startup(
+        index: &Index,
+        vm: &mut Vm,
+        program: &Program,
+        object: ObjectId,
+        settings: Settings,
+        crt: &mut u32,
+        resources: &mut crate::skeleton_resources::Cache,
+        startup: Option<&mut crate::startup_memo::Memo>,
+    ) -> Result<Self> {
+        Self::begin_inner(
+            index,
+            vm,
+            program,
+            object,
+            settings,
+            crt,
+            Some(resources),
+            startup,
+        )
     }
     fn begin_inner(
         index: &Index,
@@ -53,6 +75,7 @@ impl Prepared {
         settings: Settings,
         crt: &mut u32,
         resources: Option<&mut crate::skeleton_resources::Cache>,
+        startup: Option<&mut crate::startup_memo::Memo>,
     ) -> Result<Self> {
         ensure!(
             !vm.object_threads.contains_key(&object),
@@ -87,8 +110,8 @@ impl Prepared {
             .get(0xcc / 2)
             .context("initializer person flags absent")? as u8;
         let skeleton = match resources {
-            Some(resources) => resources.load(index, name, crt)?,
-            None => crate::avatar::load_skeleton(index, name)?.0,
+            Some(resources) => resources.load_with_startup(index, name, crt, startup)?,
+            None => crate::avatar::load_skeleton_with_startup(index, name, startup)?.0,
         };
         ensure!(
             skeleton.name.eq_ignore_ascii_case(name),
@@ -259,21 +282,31 @@ impl Prepared {
                             *selection,
                             |table, i| {
                                 let (source, table) = match table {
-                                    sims_vm::animation::NameTable::Private(t) =>
-                                        (self.source.as_str(), t),
-                                    sims_vm::animation::NameTable::Global(t) =>
-                                        (program.globals.as_str(), t),
+                                    sims_vm::animation::NameTable::Private(t) => {
+                                        (self.source.as_str(), t)
+                                    }
+                                    sims_vm::animation::NameTable::Global(t) => {
+                                        (program.globals.as_str(), t)
+                                    }
                                 };
-                                let strings = program.modules.get(source)
+                                let strings = program
+                                    .modules
+                                    .get(source)
                                     .and_then(|module| module.strings.get(&table));
                                 lookups.push((source, table, i, strings.map(Vec::len)));
-                                strings.and_then(|strings| strings.get(i)).map(String::as_str)
+                                strings
+                                    .and_then(|strings| strings.get(i))
+                                    .map(String::as_str)
                             },
                         );
                         anyhow::bail!(
                             "{error}; actor {} source {} selection {} age {} special {} species {}; STR# lookups (source, table, index, resident length): {lookups:?}",
-                            self.object, self.source, selection,
-                            field(58)?, field(64)?, field(65)?,
+                            self.object,
+                            self.source,
+                            selection,
+                            field(58)?,
+                            field(64)?,
+                            field(65)?,
                         );
                     }
                 }

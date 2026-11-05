@@ -82,7 +82,17 @@ struct Node {
     entries: Option<Vec<Found>>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Namespace(BTreeMap<Vec<u8>, NamespaceNode>);
+
+#[derive(Clone, PartialEq, Eq)]
+struct NamespaceNode {
+    physical: PathBuf,
+    entries: Option<Vec<(Vec<u8>, u32)>>,
+}
+
 pub struct Installation<'a> {
+    inputs: Option<crate::startup_inputs::Session>,
     index: &'a Index,
     pub bindings: Vec<Binding>,
     tree: BTreeMap<Vec<u8>, Node>,
@@ -130,6 +140,7 @@ impl<'a> Installation<'a> {
             .map(|(i, r)| (r.source.clone(), i))
             .collect();
         Ok(Self {
+            inputs: None,
             index,
             bindings,
             tree,
@@ -138,6 +149,33 @@ impl<'a> Installation<'a> {
             prepared: BTreeSet::new(),
             manager: Manager::default(),
         })
+    }
+
+    pub(crate) fn namespace(&self) -> Namespace {
+        Namespace(
+            self.tree
+                .iter()
+                .map(|(key, node)| {
+                    (
+                        key.clone(),
+                        NamespaceNode {
+                            physical: node.physical.clone(),
+                            entries: node.entries.as_ref().map(|entries| {
+                                entries
+                                    .iter()
+                                    .map(|entry| (entry.name.clone(), entry.attributes))
+                                    .collect()
+                            }),
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn observe(&mut self, inputs: &crate::startup_inputs::Session) {
+        self.inputs = Some(inputs.clone());
+        self.sources.observe(inputs.clone());
     }
     pub fn physical_exists(&self, path: &[u8]) -> Result<bool> {
         let path = path.split(|&b| b == 0).next().unwrap();
@@ -294,6 +332,7 @@ impl<'a> Installation<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Loaded {
     pub catalog: Catalog,
     pub paths: Paths,
@@ -328,13 +367,14 @@ impl Host for CatalogHost<'_, '_> {
         let indexed = kind == Kind::Animations;
         self.visits[usize::from(indexed)] = self
             .catalog
-            .load_startup_paths(
+            .load_startup_paths_observed(
                 self.installation.index,
                 &mut self.installation.directories().map_err(|e| e.to_string())?,
                 paths,
                 indexed,
                 if indexed { 2 } else { 1 },
                 &mut self.flags,
+                self.installation.inputs.as_ref(),
             )
             .map_err(|e| e.to_string())?;
         Ok(())

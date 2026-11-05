@@ -431,6 +431,20 @@ pub struct Resources<'a> {
     retained_identity: Arc<()>,
 }
 impl<'a> Resources<'a> {
+    pub(crate) fn observe(
+        &mut self,
+        inputs: &crate::startup_inputs::Session,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.owner.aggregates.is_empty() && self.owner.components.entries.is_empty(),
+            "startup observation requires an unopened resource owner"
+        );
+        self.owner.components.scan = Arc::new(std::sync::Mutex::new(
+            crate::resource_scan::Scan::observed(inputs)?,
+        ));
+        Ok(())
+    }
+
     pub fn new(index: &'a Index, directories: Directories, search: DirectorySearch) -> Self {
         Self::build(
             IndexView::Borrowed(index),

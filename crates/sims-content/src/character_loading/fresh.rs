@@ -38,10 +38,24 @@ impl Fresh {
         settings: Settings,
         crt: &mut u32,
         resources: &mut crate::skeleton_resources::Cache,
+        mut startup: Option<&mut crate::startup_memo::Memo>,
     ) -> Result<Self> {
-        let prepared =
-            Prepared::begin_with_resources(index, vm, program, id, settings, crt, resources)?;
-        let avatar = BoundAvatar::empty(index, &prepared.execution.source.name, id as u64)?;
+        let prepared = Prepared::begin_with_startup(
+            index,
+            vm,
+            program,
+            id,
+            settings,
+            crt,
+            resources,
+            startup.as_deref_mut(),
+        )?;
+        let avatar = BoundAvatar::empty_with_startup(
+            index,
+            &prepared.execution.source.name,
+            id as u64,
+            startup,
+        )?;
         let geometry = CharacterGeometry::new(avatar.avatar.skeleton.bones.len());
         Ok(Self {
             prepared,
@@ -60,7 +74,11 @@ impl Fresh {
         }
     }
 
-    pub fn restore(index: &Index, saved: Saved) -> Result<Self> {
+    pub fn restore(
+        index: &Index,
+        saved: Saved,
+        startup: Option<&mut crate::startup_memo::Memo>,
+    ) -> Result<Self> {
         let id = saved.prepared.object;
         ensure!(id > 0, "invalid fresh animator owner");
         if let Some(reload) = &saved.reload {
@@ -71,11 +89,12 @@ impl Fresh {
                 "invalid fresh profile continuation"
             );
         }
-        let avatar = BoundAvatar::restore(
+        let avatar = BoundAvatar::restore_with_startup(
             index,
             &saved.prepared.execution.source.name,
             id as u64,
             &saved.binding,
+            startup,
         )?;
         ensure!(
             avatar.avatar.skeleton == saved.prepared.execution.source,

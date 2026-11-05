@@ -28,6 +28,8 @@ use std::collections::BTreeMap;
 
 mod fresh;
 mod startup;
+#[cfg(test)]
+mod startup_tests;
 pub use startup::RetainedGraphics;
 pub mod live;
 use fresh::Fresh;
@@ -298,11 +300,17 @@ impl<'a, P: Presentation> Reader<'a, P> {
         //45962b prepares the built-in slots before binding the animator. The
         //saved-object allocator already reserved this layout; occupancy is read
         //later. Keep its initialized geometry too, as the live factory does.
-        let object = vm.world.objects.get_mut(&id).context("saved person absent")?;
-        ensure!(object.person.is_some()
-            && object.slots.len() == sims_vm::person::BUILTIN_SLOT_HEIGHTS.len()
-            && object.native_slot_geometry.is_none(),
-            "saved person slot construction requires the native built-in layout");
+        let object = vm
+            .world
+            .objects
+            .get_mut(&id)
+            .context("saved person absent")?;
+        ensure!(
+            object.person.is_some()
+                && object.slots.len() == sims_vm::person::BUILTIN_SLOT_HEIGHTS.len()
+                && object.native_slot_geometry.is_none(),
+            "saved person slot construction requires the native built-in layout"
+        );
         object.native_slot_geometry = Some(sims_vm::person::builtin_slot_geometry());
         let mut fresh = Fresh::begin(
             self.index,
@@ -312,6 +320,7 @@ impl<'a, P: Presentation> Reader<'a, P> {
             self.settings,
             &mut self.crt_state,
             &mut self.skeletons,
+            None,
         )?;
         for _ in 0..10_000 {
             if fresh.advance(
@@ -366,9 +375,12 @@ impl<'a, P: Presentation> Reader<'a, P> {
             read.acknowledge(&mut owner, &mut fresh.avatar.records)
                 .map_err(anyhow::Error::msg)?;
         }
-        let context = self
-            .presentation
-            .context_at(id, &initialized.scalars.placement, owner.selection.cached[0], &vm.world)?;
+        let context = self.presentation.context_at(
+            id,
+            &initialized.scalars.placement,
+            owner.selection.cached[0],
+            &vm.world,
+        )?;
         let now = initialized.scalars.clock;
         let (resident, model) = saved_layers::restore_initialized(
             self.index,
@@ -409,9 +421,12 @@ impl<'a, P: Presentation> Reader<'a, P> {
         } = loaded;
         let mut services = 0;
         loop {
-            let context = self
-                .presentation
-                .context_at(id, &resident.character.placement, appearance_owner.selection.cached[0], &vm.world)?;
+            let context = self.presentation.context_at(
+                id,
+                &resident.character.placement,
+                appearance_owner.selection.cached[0],
+                &vm.world,
+            )?;
             ensure!(
                 context.actor == id,
                 "saved animator context belongs to another person"
