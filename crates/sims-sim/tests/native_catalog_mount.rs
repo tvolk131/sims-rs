@@ -175,10 +175,7 @@ impl ArchiveHost for Archive {
     fn open(&mut self, path: &[u8]) -> Result<Option<Opened>, String> {
         let open = self.operation["open"].as_bool().unwrap();
         self.events.push(json!(["open", path, open]));
-        Ok(open.then(|| Opened {
-            identity: self.serial,
-            bytes: bytes(&self.operation["data"]),
-        }))
+        Ok(open.then(|| Opened::from_bytes(self.serial, bytes(&self.operation["data"]))))
     }
     fn open_failed(&mut self, path: &[u8]) -> Result<(), String> {
         self.events.push(json!(["error", path]));

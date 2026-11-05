@@ -126,7 +126,7 @@ impl Manager {
             return Ok(Mounted::empty(false));
         };
         self.archives.insert(path.clone(), opened.identity);
-        let mut reader = Reader::new(&opened.bytes);
+        let mut reader = opened.reader();
         let Some(count) = reader.count() else {
             return Ok(Mounted::read(false, &reader));
         };
@@ -215,6 +215,29 @@ pub trait DirectoryHost {
 pub struct Opened {
     pub identity: u32,
     pub bytes: Vec<u8>,
+    directory: Option<Vec<u8>>,
+}
+impl Opened {
+    pub fn from_bytes(identity: u32, bytes: Vec<u8>) -> Self {
+        Self {
+            identity,
+            bytes,
+            directory: None,
+        }
+    }
+    pub fn from_directory(identity: u32, header: Vec<u8>, directory: Vec<u8>) -> Self {
+        Self {
+            identity,
+            bytes: header,
+            directory: Some(directory),
+        }
+    }
+    fn reader(&self) -> Reader<'_> {
+        match &self.directory {
+            Some(directory) => Reader::with_directory(&self.bytes, directory),
+            None => Reader::new(&self.bytes),
+        }
+    }
 }
 pub trait ArchiveHost {
     fn open(&mut self, path: &[u8]) -> Result<Option<Opened>, String>;
