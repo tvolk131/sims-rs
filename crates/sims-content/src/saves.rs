@@ -119,6 +119,16 @@ pub fn definitions(
     neighborhood: &str,
     guids: &BTreeSet<u32>,
 ) -> Result<BTreeMap<u32, DefinitionSource>> {
+    let mut scan = crate::resource_scan::Scan::default();
+    definitions_read(index, neighborhood, guids, |resource| scan.read(resource))
+}
+
+pub(crate) fn definitions_read(
+    index: &Index,
+    neighborhood: &str,
+    guids: &BTreeSet<u32>,
+    mut read: impl FnMut(&crate::Resource) -> Result<Vec<u8>>,
+) -> Result<BTreeMap<u32, DefinitionSource>> {
     let character_prefix = format!("{neighborhood}/characters/").to_ascii_lowercase();
     let mut candidates = BTreeMap::<u32, Vec<(DefinitionSource, bool)>>::new();
     for resource in &index.resources {
@@ -130,27 +140,22 @@ pub fn definitions(
         if location.contains("/characters/") && !is_local {
             continue;
         }
-        let iff = Iff::parse(resource.read()?)?;
+        let bytes = read(resource)?;
         let mut sha256 = None;
-        for c in iff.all(b"OBJD") {
-            let b = iff.data(c);
-            if b.len() < 32 {
-                continue;
-            }
-            let guid = u32::from_le_bytes(b[28..32].try_into().unwrap());
-            if !guids.contains(&guid) {
-                continue;
-            }
+        for object in crate::resource_scan::matching_objects(&bytes, guids)? {
             let def = DefinitionSource {
                 source: resource.locator.clone(),
                 sha256: sha256
-                    .get_or_insert_with(|| format!("{:x}", Sha256::digest(&iff.bytes)))
+                    .get_or_insert_with(|| format!("{:x}", Sha256::digest(&bytes)))
                     .clone(),
-                chunk: c.id,
-                kind: u16::from_le_bytes(b[18..20].try_into().unwrap()),
-                multipart: u16::from_le_bytes(b[20..22].try_into().unwrap()) != 0,
+                chunk: object.chunk,
+                kind: object.kind,
+                multipart: object.multipart,
             };
-            candidates.entry(guid).or_default().push((def, is_local));
+            candidates
+                .entry(object.guid)
+                .or_default()
+                .push((def, is_local));
         }
     }
     let mut result = BTreeMap::new();
