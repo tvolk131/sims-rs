@@ -5,6 +5,9 @@ use crate::{Simulation, Step};
 use serde::{Deserialize, Serialize};
 use sims_vm::{ObjectId, Program, Status, ThreadId, Vm};
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Callback {
     object: ObjectId,
@@ -376,10 +379,16 @@ impl Simulation {
                     self.native_lot.as_mut().unwrap().diagnostics.error = result.error;
                     e.floor.resume(Request::WallFit, Reply::Geometry(result))?;
                 }
-                Some(request) => {
-                    return Err(format!(
-                        "native acceptance environmental service required: {request:?}"
-                    ));
+                Some(Request::ActiveLevel) => {
+                    let level = self
+                        .vm
+                        .world
+                        .refresh
+                        .as_ref()
+                        .ok_or("native acceptance active view level unavailable")?
+                        .visible_level;
+                    e.floor
+                        .resume(Request::ActiveLevel, Reply::ActiveLevel(level))?;
                 }
                 None => {
                     let outcome = e.floor.outcome().ok_or("native acceptance result absent")?;
