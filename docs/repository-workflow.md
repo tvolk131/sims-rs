@@ -96,3 +96,32 @@ An attempted all-target check exposed pre-existing initializer incompatibilities
 implementations are not changed by this cleanup. `cargo check --all-targets`
 therefore remains a known failing broader check; CI success must not be described
 as validation of those examples or of every private-feature configuration.
+
+## Avatar-codec test selectors
+
+The synthetic `sims-formats` targets `animation`, `avatar` and `avatar_index` are
+grouped in `avatar_codecs`. The three leaf files remain byte-identical in separate
+modules, preserving all nine tests. Cargo autodiscovery remains enabled; private
+fixtures remain opt-in and are not needed by this group.
+
+Run the full group:
+
+```sh
+cargo test --locked -p sims-formats --test avatar_codecs
+```
+
+The old target selectors no longer exist. For one former `avatar` case, use:
+
+```sh
+cargo test --locked -p sims-formats --test avatar_codecs \
+  avatar::skeleton_hierarchy_and_truncations -- --exact
+```
+
+Former `animation` and `avatar_index` cases similarly gain `animation::` and
+`avatar_index::` prefixes. Require the expected positive test count: an obsolete
+`--exact` name can otherwise succeed after running zero tests. Substring filters
+containing a module name can select more cases than before.
+
+This removes two integration binaries, not tests or assertions. It does not
+change CI's separately executed library suites or establish a general build,
+runtime or gameplay improvement.
