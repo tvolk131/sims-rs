@@ -50,3 +50,7 @@ jobs:
           key: cargo-${{ runner.os }}-1.99.0-${{ hashFiles('Cargo.lock') }}
       - run: cargo +1.99.0 check --locked --workspace --lib --bins --tests
       - run: cargo +1.99.0 test --locked --lib -p sims-formats -p sims-vm -p sims-sim -p sims-content -p sims-runtime -p sims-fixtures -- --test-threads=1
+      - name: Synthetic avatar-codec tests
+        run: cargo +1.99.0 test --locked -p sims-formats --test avatar_codecs -- --test-threads=1
+      - name: Asset-free renderer library tests
+        run: cargo +1.99.0 test --locked -p sims-render --lib -- --test-threads=1
