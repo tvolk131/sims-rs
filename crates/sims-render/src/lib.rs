@@ -16,6 +16,8 @@ pub mod portrait;
 pub mod pose;
 pub mod software;
 pub mod sprite_depth;
+#[cfg(test)]
+mod texture_tests;
 mod wall_objects;
 pub mod wall_view;
 mod walls;
@@ -39,6 +41,25 @@ pub struct Texture {
     /// older scenes and the GPU cache's content-based comparisons.
     pub rgba: Arc<[u8]>,
     pub depth: Arc<[u8]>,
+}
+impl Texture {
+    fn from_avatar(texture: &sims_content::avatar::Texture) -> Self {
+        Self {
+            width: texture.width,
+            height: texture.height,
+            rgba: texture.rgba.clone().into(),
+            depth: vec![255; (texture.width * texture.height) as usize].into(),
+        }
+    }
+
+    fn with_rgba(&self, rgba: Vec<u8>) -> Self {
+        Self {
+            width: self.width,
+            height: self.height,
+            rgba: rgba.into(),
+            depth: Arc::clone(&self.depth),
+        }
+    }
 }
 #[derive(Debug, Clone)]
 struct Sprite {
@@ -90,12 +111,7 @@ impl Assets {
         let textures = Arc::make_mut(&mut self.textures);
         let texture_base = textures.len();
         for p in &avatar.parts {
-            textures.push(Texture {
-                width: p.texture.width,
-                height: p.texture.height,
-                rgba: p.texture.rgba.clone().into(),
-                depth: vec![255; (p.texture.width * p.texture.height) as usize].into(),
-            });
+            textures.push(Texture::from_avatar(&p.texture));
         }
         self.residents.insert(
             id,
@@ -184,42 +200,22 @@ impl Assets {
             depth: vec![255].into(),
         }];
         for p in &avatar.parts {
-            textures.push(Texture {
-                width: p.texture.width,
-                height: p.texture.height,
-                rgba: p.texture.rgba.clone().into(),
-                depth: vec![255; (p.texture.width * p.texture.height) as usize].into(),
-            });
+            textures.push(Texture::from_avatar(&p.texture));
         }
         let nude = sims_content::avatar::load_adult_outfit(index, true)?;
         let nude_texture = textures.len();
         for p in &nude.parts {
-            textures.push(Texture {
-                width: p.texture.width,
-                height: p.texture.height,
-                rgba: p.texture.rgba.clone().into(),
-                depth: vec![255; (p.texture.width * p.texture.height) as usize].into(),
-            });
+            textures.push(Texture::from_avatar(&p.texture));
         }
         let alternate = sims_content::avatar::load_adult_profile(index, false, true)?;
         let alternate_texture = textures.len();
         for p in &alternate.parts {
-            textures.push(Texture {
-                width: p.texture.width,
-                height: p.texture.height,
-                rgba: p.texture.rgba.clone().into(),
-                depth: vec![255; (p.texture.width * p.texture.height) as usize].into(),
-            });
+            textures.push(Texture::from_avatar(&p.texture));
         }
         let sleepwear = sims_content::avatar::load_adult_sleepwear(index)?;
         let sleepwear_texture = textures.len();
         for p in &sleepwear.parts {
-            textures.push(Texture {
-                width: p.texture.width,
-                height: p.texture.height,
-                rgba: p.texture.rgba.clone().into(),
-                depth: vec![255; (p.texture.width * p.texture.height) as usize].into(),
-            });
+            textures.push(Texture::from_avatar(&p.texture));
         }
         let mut accessories = BTreeMap::new();
         let layers = if let Some(requested) = requested {
@@ -253,12 +249,7 @@ impl Assets {
                     }
                 }
                 let texture = textures.len();
-                textures.push(Texture {
-                    width: part.texture.width,
-                    height: part.texture.height,
-                    rgba: part.texture.rgba.clone().into(),
-                    depth: vec![255; (part.texture.width * part.texture.height) as usize].into(),
-                });
+                textures.push(Texture::from_avatar(&part.texture));
                 parts.push((part, texture));
             }
             accessories.insert(name, parts);
