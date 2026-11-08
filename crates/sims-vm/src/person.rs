@@ -54,7 +54,7 @@ pub struct WorldState {
     pub free_will: bool,
     pub pet_autonomy_disabled: bool,
     pub controlled_family: i16,
-    /// Successful native inventory queries/removals publish the UI dirty flag.
+    /// Successful native inventory operations publish the UI dirty flag.
     /// A zero-quantity removal succeeds and publishes even without a token.
     pub inventory_dirty: bool,
     pub lot_zoning: BTreeMap<i16, i32>,
@@ -1227,6 +1227,34 @@ impl Vm {
             .values_mut()
             .find(|n| n.guid == owner_guid)
             .ok_or("inventory owner has no neighborhood record")?;
+        if b[0] == 0 {
+            let quantity = if flags & 2 != 0 {
+                actor.temps[usize::from((flags >> 2) & 3)]
+            } else {
+                1
+            };
+            if quantity != 0 {
+                if let Some(entry) = record
+                    .inventory
+                    .iter_mut()
+                    .find(|entry| entry.kind == b[1] && entry.guid == guid)
+                {
+                    entry.count = (i32::from(entry.count) + i32::from(quantity))
+                        .min(i32::from(i16::MAX)) as i16;
+                } else {
+                    if record.inventory.len() >= i16::MAX as usize {
+                        return Ok((false, "inventory add: entry limit".into()));
+                    }
+                    record.inventory.push(InventoryEntry {
+                        kind: b[1],
+                        guid,
+                        count: quantity,
+                    });
+                }
+            }
+            world.inventory_dirty = true;
+            return Ok((true, format!("inventory add: requested {quantity}")));
+        }
         if b[0] == 1 {
             //4552f8 selects a signed caller temp only when bit1 is set.
             let quantity = if flags & 2 != 0 {

@@ -76,8 +76,9 @@ CI runs on pull requests, pushes to `main` and manual dispatch. The check names
 are `Repository hygiene` and `Rust checks`. The Rust job pins toolchain 1.99.0,
 checks default-feature workspace library, binary and test targets, and runs the
 six core libraries' asset-free unit suites serially. It also executes the
-synthetic `avatar_codecs` integration target and the asset-free `sims-render`
-library tests as separate steps. These renderer tests do not qualify native GPU
+synthetic `avatar_codecs` integration target, the asset-free `inventory_operations`
+integration target, and the `sims-render` library tests as separate steps.
+These renderer tests do not qualify native GPU
 presentation or installed-asset loaders. Fixture-gated tests do not silently
 count as executed coverage. CI does not enable private fixtures or all features.
 
