@@ -48,6 +48,9 @@ observation are separate from the asset-free library unit suites above.
 Manual research examples are not part of that CI check; known pre-existing
 example compile issues are recorded in the repository workflow.
 
+See the [avatar-codec selector notes](docs/repository-workflow.md#avatar-codec-test-selectors)
+for the consolidated synthetic integration-test target and exact case names.
+
 Explore the CLI without opening a game or a GUI:
 
 ```sh
