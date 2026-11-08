@@ -157,4 +157,5 @@ mod tests;
 
 // Discovery needs complete IFF validation, without unused decoded metadata.
 mod object_guids;
+pub(crate) use object_guids::matching as matching_objects;
 pub(crate) use object_guids::parse as object_guids;
