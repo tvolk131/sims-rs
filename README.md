@@ -16,11 +16,14 @@ The project is being re-founded. An earlier prototype mirrored the original
 executable's internals. That code now lives under [legacy/](legacy/README.md)
 as reference material and is not built. The
 [salvage audit](docs/salvage-audit.md) records what is being carried forward.
+The [roadmap](docs/roadmap.md) sets the current goal: a headless lot boot that
+matches the original game tick for tick.
 
 | Crate | Responsibility |
 | --- | --- |
 | `sims-core` | Deterministic primitives: the x87-faithful float model and the game's random streams. |
 | `sims-formats` | Readers for the game's archive, resource and save formats. |
+| `sims-cli` | The `sims` developer tool, starting with a content census. |
 
 ## Determinism rules
 
