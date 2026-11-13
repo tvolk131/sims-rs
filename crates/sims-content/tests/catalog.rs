@@ -27,7 +27,9 @@ fn base(tree: &Tree, semi_globals: &[(&str, &[u8])]) {
 fn registers_definitions_in_load_order_and_later_guids_win() {
     let tree = Tree::new("register");
     base(&tree, &[]);
-    let chair = iff(&[(b"OBJD", 128, &objd(0x1111)), (b"OBJD", 129, &objd(0x2222))]);
+    let mut tile = objd(0x2222);
+    tile[20..22].copy_from_slice(&7u16.to_le_bytes()); // multi-tile group 7
+    let chair = iff(&[(b"OBJD", 128, &objd(0x1111)), (b"OBJD", 129, &tile)]);
     let replacement = iff(&[(b"OBJD", 300, &objd(0x1111))]);
     tree.file(
         "GameData/Objects/Objects.far",
@@ -51,6 +53,8 @@ fn registers_definitions_in_load_order_and_later_guids_win() {
     );
     assert_eq!(catalog.object(0x1111).unwrap().chunk, 300);
     assert_eq!(catalog.object(0x2222).unwrap().chunk, 129);
+    assert_eq!(catalog.object(0x2222).unwrap().master, 7);
+    assert_eq!(catalog.object(0x1111).unwrap().master, 0);
     assert!(catalog.object(0x3333).is_none());
     assert_eq!(catalog.diagnostics.len(), 1);
     assert!(

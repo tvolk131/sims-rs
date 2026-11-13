@@ -99,6 +99,21 @@ impl Index {
         Ok(index)
     }
 
+    /// Appends a directory outside the install's mounts, such as a
+    /// neighborhood's `Characters`, as one more mount named `label`. Its
+    /// resources load after everything already indexed.
+    pub fn add_directory(&mut self, label: &str, path: &Path, recursive: bool) -> Result<()> {
+        let number = self.mounts.len();
+        self.mounts.push(Mount {
+            path: label.to_owned(),
+            recursive,
+        });
+        if path.is_dir() {
+            self.walk(number, path, recursive)?;
+        }
+        Ok(())
+    }
+
     /// Resources whose own name matches, ignoring ASCII case, in load
     /// order, with their positions in [`Index::resources`].
     pub fn named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = (usize, &'a Resource)> {
@@ -146,7 +161,7 @@ impl Index {
 
 /// A directory's entries in NTFS name order: ASCII case folded to upper case
 /// (NTFS's upcase table agrees with ASCII there), then raw bytes.
-fn sorted_entries(directory: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn sorted_entries(directory: &Path) -> Result<Vec<PathBuf>> {
     let entries = std::fs::read_dir(directory).map_err(|e| Error::io(directory, e))?;
     let mut paths = Vec::new();
     for entry in entries {

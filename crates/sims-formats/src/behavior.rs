@@ -105,6 +105,10 @@ pub fn branch(target: u8, count: usize) -> String {
 #[derive(Debug, Clone)]
 pub struct ObjectDefinition {
     pub stand_function: u16,
+    /// 2 is a person.
+    pub object_type: u16,
+    /// Nonzero for every tile of a multi-tile object: the group it belongs to.
+    pub master_id: u16,
     pub animation_table: u16,
     pub version: u32,
     pub graphic: u16,
@@ -127,7 +131,10 @@ impl ObjectDefinition {
         let graphics = r.u16()?;
         r.skip(4)?;
         let table = r.u16()?;
-        r.skip(10)?;
+        r.skip(2)?; // interaction group
+        let object_type = r.u16()?;
+        let master_id = r.u16()?;
+        r.skip(4)?; // sub-index, wash-hands tree
         let animation_table = r.u16()?;
         let guid = r.u32()?;
         r.skip(4)?;
@@ -142,6 +149,8 @@ impl ObjectDefinition {
         let catalog = fields.u16()?;
         Ok(Self {
             stand_function,
+            object_type,
+            master_id,
             animation_table,
             version,
             graphic,
