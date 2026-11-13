@@ -159,9 +159,7 @@ fn boots_the_goth_house() {
     let neighborhood = Neighborhood::open(&install.file("UserData").unwrap()).unwrap();
     let mut index = Index::build(&install).unwrap();
     let characters = neighborhood.characters().unwrap().unwrap();
-    index
-        .add_directory("Characters", &characters, false)
-        .unwrap();
+    index.add_characters(&characters).unwrap();
     let catalog = Catalog::build(&index).unwrap();
     let house = House::load(&neighborhood.houses().unwrap()[&5], &catalog).unwrap();
     let world = World::from_house(&house, &catalog).unwrap();

@@ -9,7 +9,7 @@ pub fn report(root: &Path, neighborhood: &Path) -> sims_content::Result<(String,
     let neighborhood = Neighborhood::open(neighborhood)?;
     let mut index = Index::build(&install)?;
     if let Some(characters) = neighborhood.characters()? {
-        index.add_directory("Characters", &characters, false)?;
+        index.add_characters(&characters)?;
     }
     let catalog = Catalog::build(&index)?;
     let people = catalog.objects.iter().filter(|o| o.kind == 2).count();

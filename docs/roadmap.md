@@ -101,7 +101,8 @@ saved instance of each, deletes later duplicates, and creates the missing
 ones through the ordinary object factory, which runs their Init and their
 first Main visit. It walks the whole catalog, in catalog order, so the new
 objects' IDs depend on that order. The Complete Collection has 141 such
-definitions.
+definitions, and our catalog lists them in the order the original creates
+them.
 
 **5. Grid repair and links.** Ground-floor grid cells that name an object
 which is not at that cell are cleared. Containment and multi-tile links are
@@ -138,20 +139,6 @@ this.
 
 **10. Indicators.** Two indicator objects are created through the factory
 and hidden, and the selected person is found.
-
-#### Known gap before load step 4
-
-The catalog order `sims-content` uses differs from the original's in two
-ways the old prototype recovered. Both change which IDs new objects get.
-
-- The original registers definitions in scan order (`0x43c609`): base
-  objects, user objects, the neighborhood's people, Downloads, then each
-  pack, the shared directories, and Makin' Magic last. `Index` uses the
-  mount order (`0x43ae81`) and appends people last.
-- Within a directory the original walks its file manager's hash table
-  (`0x5ba9bd`), not the file system's order. The table's order depends on
-  the lowercase file names and, for names that share a bucket, on the
-  order they were inserted.
 
 ## Working rules
 

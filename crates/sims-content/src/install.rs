@@ -105,8 +105,18 @@ impl Install {
         })
     }
 
-    /// The directories the original registers before loading objects, in
-    /// its order (0x43ae81). Downloads always comes last.
+    /// The user objects directory, which neighborhood characters follow.
+    pub(crate) const USER_OBJECTS: &'static str = "GameData/UserObjects";
+
+    /// The directories objects come from, in the order the original scans
+    /// them (0x43c609): the base game, Downloads, the packs in bit order,
+    /// the shared directories, and Makin' Magic last. `GameData/Global`
+    /// comes first here although the object scan does not visit it: it
+    /// holds the global and semi-global behavior files.
+    ///
+    /// The original registers the same directories with its file manager
+    /// in another order (0x43ae81). That order does not show: each
+    /// directory has its own file table.
     pub fn mounts(&self) -> Vec<Mount> {
         let mount = |path: &str, recursive| Mount {
             path: path.to_owned(),
@@ -115,20 +125,24 @@ impl Install {
         let mut mounts = vec![
             mount("GameData/Global", true),
             mount("GameData/Objects", true),
-            mount("GameData/UserObjects", true),
+            mount(Self::USER_OBJECTS, true),
+            mount("Downloads", true),
         ];
-        for (bit, directory, _) in Expansions::ALL {
+        let (magic, earlier) = Expansions::ALL.split_last().expect("eight packs");
+        for &(bit, directory, _) in earlier {
             if self.expansions.contains(bit) {
                 mounts.push(mount(directory, true));
             }
         }
         // The original compares the edition as a signed number: anything
-        // beyond Livin' Large and House Party mounts the shared directories.
+        // beyond Livin' Large and House Party scans the shared directories.
         if self.expansions.0 > 3 {
             mounts.push(mount("ExpansionShared", true));
             mounts.push(mount("TemplateNPCs", false));
         }
-        mounts.push(mount("Downloads", true));
+        if self.expansions.contains(magic.0) {
+            mounts.push(mount(magic.1, true));
+        }
         mounts
     }
 

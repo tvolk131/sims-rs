@@ -1,6 +1,8 @@
+use crate::file_table::{Table, key};
 use crate::install::resolve;
 use crate::{Error, Install, Mount, Result};
 use sims_formats::far;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -75,13 +77,14 @@ pub struct Index {
 }
 
 impl Index {
-    /// Lists the install's mounts in the original's order.
+    /// Lists the install's mounts in the order the original scans them for
+    /// objects.
     ///
-    /// Within a directory, entries are taken in Windows/NTFS name order
-    /// (ASCII case-insensitive), and a subdirectory is searched where its
-    /// name falls among the files. Archive members keep their stored order.
-    /// How the original walks a directory has not been confirmed yet; see
-    /// `docs/decisions.md`. A mount that does not exist contributes nothing.
+    /// Within a directory, entries come in the order of the original's file
+    /// table (see `file_table`): by the hash of each name, not by name. A
+    /// subdirectory is searched where its own name falls in that order, and
+    /// an archive's members are entries of the directory the archive is in.
+    /// A mount that does not exist contributes nothing.
     pub fn build(install: &Install) -> Result<Self> {
         let mut index = Self {
             root: install.root.clone(),
@@ -99,18 +102,36 @@ impl Index {
         Ok(index)
     }
 
-    /// Appends a directory outside the install's mounts, such as a
-    /// neighborhood's `Characters`, as one more mount named `label`. Its
-    /// resources load after everything already indexed.
-    pub fn add_directory(&mut self, label: &str, path: &Path, recursive: bool) -> Result<()> {
-        let number = self.mounts.len();
-        self.mounts.push(Mount {
-            path: label.to_owned(),
-            recursive,
-        });
+    /// Adds a neighborhood's `Characters` directory as a mount named
+    /// `Characters`. The original scans the neighborhood's people after the
+    /// user objects and before Downloads (0x43c609), so the mount and its
+    /// resources go there, not at the end.
+    pub fn add_characters(&mut self, path: &Path) -> Result<()> {
+        let number = self
+            .mounts
+            .iter()
+            .position(|m| m.path == Install::USER_OBJECTS)
+            .map_or(self.mounts.len(), |n| n + 1);
+        self.mounts.insert(
+            number,
+            Mount {
+                path: "Characters".to_owned(),
+                recursive: true,
+            },
+        );
+        let at = self
+            .resources
+            .iter()
+            .position(|r| r.mount >= number)
+            .unwrap_or(self.resources.len());
+        let later = self.resources.split_off(at);
         if path.is_dir() {
-            self.walk(number, path, recursive)?;
+            self.walk(number, path, true)?;
         }
+        self.resources.extend(later.into_iter().map(|mut r| {
+            r.mount += 1;
+            r
+        }));
         Ok(())
     }
 
@@ -123,44 +144,174 @@ impl Index {
             .filter(move |(_, r)| r.name().eq_ignore_ascii_case(name))
     }
 
+    /// Lists one mount: gathers its directories, then walks them.
     fn walk(&mut self, mount: usize, directory: &Path, recursive: bool) -> Result<()> {
+        let mut directories = Directories::new();
+        self.scan(&mut directories, &[], directory, recursive)?;
+        self.list(mount, &directories, &[]);
+        Ok(())
+    }
+
+    /// Gathers entries the way the original's directory scan does
+    /// (0x5ba5d8): each entry the file system lists goes into its
+    /// directory, a subdirectory is scanned as soon as it is reached, and
+    /// so is an archive. `at` is the directory's key: its path below the
+    /// mount, in key form, ending in `\`.
+    fn scan(
+        &mut self,
+        directories: &mut Directories,
+        at: &[u8],
+        directory: &Path,
+        recursive: bool,
+    ) -> Result<()> {
+        directories.entry(at.to_vec()).or_default();
         for path in sorted_entries(directory)? {
+            let name = key(path.file_name().unwrap_or_default().as_encoded_bytes());
+            let here = directories.get_mut(at).expect("inserted above");
             if path.is_dir() {
+                // A file or directory on disk replaces an archive member of
+                // the same name, keeping the member's place in the order.
+                here.put(name.clone(), Entry::Directory);
                 if recursive {
-                    self.walk(mount, &path, true)?;
+                    let child = [at, &name, b"\\"].concat();
+                    self.scan(directories, &child, &path, true)?;
                 }
-            } else if is_far(&path) {
-                self.archive(mount, path);
+            } else if name.ends_with(b"far") {
+                // The original tests the last three letters, with no dot.
+                here.add(name, Entry::Archive);
+                match far_members(&path) {
+                    Ok(members) => mount_archive(directories, at, &path, members),
+                    // An unreadable archive is skipped, so one bad download
+                    // does not stop the game loading.
+                    Err(error) => self.diagnostics.push(error.to_string()),
+                }
             } else {
-                self.resources.push(Resource {
-                    mount,
-                    path,
-                    member: None,
-                });
+                here.put(name, Entry::File(path));
             }
         }
         Ok(())
     }
 
-    /// Adds an archive's members. An unreadable archive is skipped with a
-    /// diagnostic, so one bad download does not stop the game loading.
-    fn archive(&mut self, mount: usize, path: PathBuf) {
-        match far_members(&path) {
-            Ok(members) => {
-                self.resources
-                    .extend(members.into_iter().map(|member| Resource {
-                        mount,
-                        path: path.clone(),
-                        member: Some(member),
-                    }));
+    /// Lists a directory in the order the object scan walks its table
+    /// (0x5ba9bd), going into each subdirectory where its name falls.
+    fn list(&mut self, mount: usize, directories: &Directories, at: &[u8]) {
+        let Some(directory) = directories.get(at) else {
+            // A subdirectory of a mount that is not searched recursively.
+            return;
+        };
+        for name in directory.table().iter() {
+            match directory.entries.get(name) {
+                // The object scan skips directories named `*.dir` (0x43a436).
+                Some(Entry::Directory) => {
+                    if !name.ends_with(b".dir") {
+                        self.list(mount, directories, &[at, name, b"\\"].concat());
+                    }
+                }
+                Some(Entry::File(path)) => self.resources.push(Resource {
+                    mount,
+                    path: path.clone(),
+                    member: None,
+                }),
+                Some(Entry::Member(path, member)) => self.resources.push(Resource {
+                    mount,
+                    path: path.clone(),
+                    member: Some(member.clone()),
+                }),
+                // An archive file itself.
+                Some(Entry::Archive) | None => {}
             }
-            Err(error) => self.diagnostics.push(error.to_string()),
+        }
+    }
+}
+
+/// Every directory of one mount, by key: its path below the mount in key
+/// form, ending in `\`. The mount itself has the empty key.
+type Directories = BTreeMap<Vec<u8>, Directory>;
+
+#[derive(Default)]
+struct Directory {
+    /// Names in the order they were first added.
+    order: Vec<Vec<u8>>,
+    entries: BTreeMap<Vec<u8>, Entry>,
+}
+
+impl Directory {
+    /// Adds an entry unless the name is taken. Returns whether it was added.
+    fn add(&mut self, name: Vec<u8>, entry: Entry) -> bool {
+        if self.entries.contains_key(&name) {
+            return false;
+        }
+        self.order.push(name.clone());
+        self.entries.insert(name, entry);
+        true
+    }
+
+    /// Adds an entry, or replaces the one of that name where it stands.
+    fn put(&mut self, name: Vec<u8>, entry: Entry) {
+        if !self.entries.contains_key(&name) {
+            self.order.push(name.clone());
+        }
+        self.entries.insert(name, entry);
+    }
+
+    /// The original's table for this directory.
+    fn table(&self) -> Table {
+        let mut table = Table::default();
+        for name in &self.order {
+            table.insert(name.clone());
+        }
+        table
+    }
+}
+
+/// What a name in a directory stands for.
+enum Entry {
+    Directory,
+    File(PathBuf),
+    Member(PathBuf, Member),
+    /// An archive file. Its members are entries of their own.
+    Archive,
+}
+
+/// Adds an archive's members (0x5b9dbc). A member's name may hold a path,
+/// which places it in a subdirectory of the archive's own directory `at`,
+/// whether or not that subdirectory exists on disk. A member never
+/// replaces an entry that is already there.
+fn mount_archive(directories: &mut Directories, at: &[u8], archive: &Path, members: Vec<Member>) {
+    let split = |path: &[u8]| path.iter().rposition(|&b| b == b'\\').map_or(0, |n| n + 1);
+    for member in members {
+        let full = [at, &key(member.name.as_bytes())].concat();
+        let (directory, name) = full.split_at(split(&full));
+        let entry = Entry::Member(archive.to_path_buf(), member);
+        if !directories
+            .entry(directory.to_vec())
+            .or_default()
+            .add(name.to_vec(), entry)
+        {
+            continue;
+        }
+        // Each directory on the member's path becomes an entry of its
+        // parent, up to the archive's own directory.
+        let mut child = directory;
+        while child.len() > at.len() {
+            let trimmed = &child[..child.len() - 1];
+            let (parent, name) = trimmed.split_at(split(trimmed));
+            directories
+                .entry(parent.to_vec())
+                .or_default()
+                .add(name.to_vec(), Entry::Directory);
+            child = parent;
         }
     }
 }
 
 /// A directory's entries in NTFS name order: ASCII case folded to upper case
-/// (NTFS's upcase table agrees with ASCII there), then raw bytes.
+/// (NTFS's upcase table agrees with ASCII there), then raw bytes. This
+/// stands in for the order Windows lists a directory in. That order decides
+/// which of two names sharing a bucket of the original's file table comes
+/// first, and which archive supplies a member two archives both hold.
+/// **Unverified**: the capture the catalog order is checked against holds
+/// no such pair.
 pub(crate) fn sorted_entries(directory: &Path) -> Result<Vec<PathBuf>> {
     let entries = std::fs::read_dir(directory).map_err(|e| Error::io(directory, e))?;
     let mut paths = Vec::new();
@@ -172,11 +323,6 @@ pub(crate) fn sorted_entries(directory: &Path) -> Result<Vec<PathBuf>> {
         (name.to_ascii_uppercase(), name.to_vec())
     });
     Ok(paths)
-}
-
-fn is_far(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("far"))
 }
 
 fn far_members(path: &Path) -> Result<Vec<Member>> {

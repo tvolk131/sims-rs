@@ -57,8 +57,9 @@ fn base_game_mounts_and_indexes_in_load_order() {
             (0, "Global.iff".into()),
             (1, "Chair.iff".into()),
             (1, "Bed.iff".into()),
-            (3, "Apple.iff".into()),
+            // The file table puts Zebra.iff before the apple directory.
             (3, "Zebra.iff".into()),
+            (3, "Apple.iff".into()),
         ]
     );
     let (_, bed) = index.named("BED.IFF").next().unwrap();
@@ -101,12 +102,13 @@ fn expansions_come_from_pack_directories_holding_archives() {
             "GameData/Global",
             "GameData/Objects",
             "GameData/UserObjects",
+            "Downloads",
             "ExpansionPack",
             "Deluxe",
-            "ExpansionPack7",
             "ExpansionShared",
             "TemplateNPCs",
-            "Downloads",
+            // Makin' Magic is scanned last, after the shared directories.
+            "ExpansionPack7",
         ]
     );
     let names: Vec<_> = index.resources.iter().map(|r| r.name()).collect();
@@ -118,9 +120,9 @@ fn expansions_come_from_pack_directories_holding_archives() {
             "Chair.iff",
             "Bed.iff",
             "Sofa.iff",
-            "Wand.iff",
             "Shared.iff",
-            "Npc.iff"
+            "Npc.iff",
+            "Wand.iff",
         ]
     );
 }
@@ -141,23 +143,97 @@ fn only_later_packs_mount_the_shared_directories() {
     assert!(!mount_paths(&mounts).contains(&"ExpansionShared"));
 }
 
+/// Mount 3 (Downloads) as names.
+fn downloads(tree: &Tree) -> Vec<String> {
+    let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
+    assert!(index.diagnostics.is_empty(), "{:?}", index.diagnostics);
+    index
+        .resources
+        .iter()
+        .filter(|r| r.mount == 3)
+        .map(|r| r.name())
+        .collect()
+}
+
 #[test]
-fn directory_order_ignores_case_and_interleaves_subdirectories() {
+fn a_directory_lists_in_file_table_order() {
     let tree = Tree::new("order");
     base_game(&tree);
     tree.file("Downloads/b.iff", b"")
         .file("Downloads/A/inner.iff", b"")
         .file("Downloads/C.iff", b"")
         .file("Downloads/a.iff", b"");
+    // By the hash of each lower-case name, in a table of 193 buckets:
+    // c.iff 124, a.iff 138, a 165, b.iff 192. The subdirectory A is
+    // searched where its own name falls.
+    assert_eq!(downloads(&tree), ["C.iff", "a.iff", "inner.iff", "b.iff"]);
+}
+
+#[test]
+fn names_sharing_a_bucket_list_newest_first() {
+    let tree = Tree::new("bucket");
+    base_game(&tree);
+    // obj8.iff and obj19.iff both hash to bucket 111. The directory lists
+    // obj19.iff first (name order), so obj8.iff is added later and comes
+    // out first. An archive's members are added in their stored order, at
+    // the point the archive is reached: both land in bucket 111 too.
+    tree.file("Downloads/obj8.iff", b"")
+        .file("Downloads/obj19.iff", b"");
+    assert_eq!(downloads(&tree), ["obj8.iff", "obj19.iff"]);
+
+    let tree = Tree::new("bucket-archive");
+    base_game(&tree);
+    tree.file(
+        "Downloads/pack.far",
+        &far(&[("obj8.iff", b"8"), ("obj19.iff", b"19")]),
+    );
+    assert_eq!(downloads(&tree), ["obj19.iff", "obj8.iff"]);
+}
+
+#[test]
+fn archive_members_with_paths_go_into_subdirectories() {
+    let tree = Tree::new("member-paths");
+    base_game(&tree);
+    // The archive's People member joins the People directory on disk, and
+    // the loose Chair.iff, listed before the archive, wins over the
+    // archive's member of the same name.
+    tree.file("Downloads/Chair.iff", b"loose")
+        .file("Downloads/People/Maid.iff", b"maid")
+        .file(
+            "Downloads/pack.far",
+            &far(&[
+                ("chair.IFF", b"packed"),
+                ("People\\Cook.iff", b"cook"),
+                ("Skins/skin.bmp", b"skin"),
+            ]),
+        );
     let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
-    let downloads: Vec<_> = index
+    let listed: Vec<_> = index
         .resources
         .iter()
         .filter(|r| r.mount == 3)
-        .map(|r| r.name())
+        .map(|r| (r.name(), r.read().unwrap()))
         .collect();
-    // "A" sorts before "a.iff" ("A" < "A.IFF"), then b, then C.
-    assert_eq!(downloads, ["inner.iff", "a.iff", "b.iff", "C.iff"]);
+    // Buckets: skins 3, chair.iff 78, people 102; inside People,
+    // maid.iff 23 and cook.iff 89.
+    assert_eq!(
+        listed,
+        [
+            ("Skins/skin.bmp".to_owned(), b"skin".to_vec()),
+            ("Chair.iff".to_owned(), b"loose".to_vec()),
+            ("Maid.iff".to_owned(), b"maid".to_vec()),
+            ("People\\Cook.iff".to_owned(), b"cook".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn directories_named_dir_are_not_searched() {
+    let tree = Tree::new("dot-dir");
+    base_game(&tree);
+    tree.file("Downloads/Old.dir/Hidden.iff", b"")
+        .file("Downloads/Seen.iff", b"");
+    assert_eq!(downloads(&tree), ["Seen.iff"]);
 }
 
 #[test]

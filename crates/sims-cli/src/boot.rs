@@ -29,7 +29,7 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     let neighborhood = Neighborhood::open(directory)?;
     let mut index = Index::build(&install)?;
     if let Some(characters) = neighborhood.characters()? {
-        index.add_directory("Characters", &characters, false)?;
+        index.add_characters(&characters)?;
     }
     let catalog = Catalog::build(&index)?;
     let house = House::load(options.house, &catalog)?;

@@ -21,7 +21,7 @@ pub struct Object {
 pub struct Catalog {
     /// The resource holding the global behaviors (`Global.iff`).
     pub global: usize,
-    /// Definitions in registration order: mount order, then file order, then
+    /// Definitions in registration order: the index's order of files, then
     /// each file's OBJD resource order.
     pub objects: Vec<Object>,
     /// The definition each GUID resolves to. Later registrations win, as in

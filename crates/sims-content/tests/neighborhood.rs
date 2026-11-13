@@ -79,9 +79,7 @@ fn catalog(tree: &Tree, neighborhood: &Neighborhood) -> (Index, Catalog) {
     let install = Install::detect(&tree.0.join("Game")).unwrap();
     let mut index = Index::build(&install).unwrap();
     let characters = neighborhood.characters().unwrap().unwrap();
-    index
-        .add_directory("Characters", &characters, false)
-        .unwrap();
+    index.add_characters(&characters).unwrap();
     let catalog = Catalog::build(&index).unwrap();
     (index, catalog)
 }
@@ -105,7 +103,7 @@ fn reads_families_and_finds_houses() {
 }
 
 #[test]
-fn characters_register_after_the_install() {
+fn characters_register_after_user_objects() {
     let tree = Tree::new("characters");
     setup(&tree);
     let neighborhood = Neighborhood::open(&tree.0.join("Hood")).unwrap();
@@ -116,7 +114,9 @@ fn characters_register_after_the_install() {
     assert_eq!(person.kind, 2);
     let mount = index.resources[person.resource].mount;
     assert_eq!(index.mounts[mount].path, "Characters");
-    assert_eq!(mount, index.mounts.len() - 1);
+    // The people come after the user objects and before Downloads.
+    assert_eq!(index.mounts[mount - 1].path, "GameData/UserObjects");
+    assert_eq!(index.mounts[mount + 1].path, "Downloads");
 }
 
 #[test]

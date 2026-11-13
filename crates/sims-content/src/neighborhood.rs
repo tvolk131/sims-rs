@@ -37,7 +37,7 @@ impl Neighborhood {
     }
 
     /// The character directory, whose files define this neighborhood's Sims.
-    /// Add it to the index with [`crate::Index::add_directory`] before
+    /// Add it to the index with [`crate::Index::add_characters`] before
     /// building the catalog.
     pub fn characters(&self) -> Result<Option<PathBuf>> {
         resolve(&self.directory, "Characters")
