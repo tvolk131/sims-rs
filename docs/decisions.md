@@ -4,6 +4,31 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-13: The Complete Collection ISO is the supported install
+
+Decided by the maintainer. The vision named the Legacy Collection as the
+primary install; it now names The Sims Complete Collection, installed from
+its ISO, and leaves other editions out of scope. That is the install the
+emulator image already holds and every check so far ran against, so no
+code changes. It replaces the entry below on recognizing only the CD
+layout: that is no longer a gap.
+
+## 2026-11-13: The state hash is SHA-256 of the postcard encoding
+
+`World` is encoded with postcard: fields in declaration order, integers as
+little-endian varints, floats as raw bits (NaN payloads and negative zero
+kept), and maps in key order. Nothing in it depends on the platform, and a
+pinned-hash test runs on both CI platforms. Snapshots store the same bytes
+behind a 4-byte format number, in a REDB table keyed by name. Changing the
+encoding means bumping `snapshot::FORMAT` and the pinned hash. Comparison
+with the original goes field by field, not through this hash: the hash only
+proves that our own runs repeat.
+
+`World` keeps every field the readers decode for objects, the simulator
+and the lot arrays. It leaves out bytes nobody understands yet (format
+tails, raw ObjM records), the HOUS view and model, and the wall and floor
+chunks. They join when the interpreter or the comparison needs them.
+
 ## 2026-11-13: The target house is the Goth house
 
 The boot goal needs one house. It is `House05.iff` in the base game's

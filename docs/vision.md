@@ -64,8 +64,9 @@ A modern macOS game that:
 
 ## Content
 
-- Supported installs: the Legacy Collection (primary) and the original
-  CD/Complete Collection.
+- Supported install: The Sims Complete Collection, installed from its ISO
+  (the base game and all seven expansions). Other editions, including the
+  Legacy Collection, are out of scope.
 - All expansion content is always loaded. With expansions installed, the
   game's shared core scripts are expansion versions, so there's no separate
   "base game only" mode.
