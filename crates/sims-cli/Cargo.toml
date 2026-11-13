@@ -16,6 +16,7 @@ path = "src/main.rs"
 sims-content.workspace = true
 sims-formats.workspace = true
 sims-sim.workspace = true
+sims-vm.workspace = true
 
 [lints]
 workspace = true

@@ -14,6 +14,9 @@ pub struct Behavior {
     pub kind: u8,
     pub args: u8,
     pub locals: u16,
+    /// The header word at offset 8. The original sums these into the
+    /// signatures a save keeps per object type (0x4026ed).
+    pub revision: u32,
     pub instructions: Vec<Instruction>,
 }
 impl Behavior {
@@ -29,7 +32,7 @@ impl Behavior {
         let kind = r.u8()?;
         let args = r.u8()?;
         let locals = r.u16()?;
-        r.skip(4)?;
+        let revision = r.u32()?;
         r.count(count, 12)?;
         let mut instructions = Vec::with_capacity(count);
         for _ in 0..count {
@@ -45,6 +48,7 @@ impl Behavior {
             kind,
             args,
             locals,
+            revision,
             instructions,
         })
     }

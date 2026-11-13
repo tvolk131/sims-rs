@@ -2,6 +2,7 @@
 
 use sims_content::{Catalog, House, Index, Install, Neighborhood};
 use sims_sim::{Snapshots, World};
+use sims_vm::{Callback, Program};
 use std::error::Error;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -32,6 +33,26 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     let catalog = Catalog::build(&index)?;
     let house = House::load(options.house, &catalog)?;
     let world = World::from_house(&house, &catalog)?;
+    let types = &house.types.entries;
+    let program = Program::link(&index, &catalog, types.iter().map(|t| t.guid))?;
+    let mut mismatches = Vec::new();
+    for entry in types {
+        let object = catalog.object(entry.guid).expect("linked above");
+        let current = [Callback::Init, Callback::Main]
+            .map(|c| program.signature(object.resource, program.callback(object, c)));
+        if current != [entry.init_signature, entry.main_signature] {
+            mismatches.push(format!(
+                "  type {} {:?} (0x{:08X}): saved {:08x}/{:08x}, linked {:08x}/{:08x}",
+                entry.id,
+                entry.name,
+                entry.guid,
+                entry.init_signature,
+                entry.main_signature,
+                current[0],
+                current[1]
+            ));
+        }
+    }
     if let Some(path) = options.snapshot {
         Snapshots::open(path)?.save("boot", &world)?;
     }
@@ -48,6 +69,16 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
         world.objects.len(),
         world.ticks
     );
+    let _ = writeln!(
+        out,
+        "Linked:  {} files; {} of {} object types match their saved signatures",
+        program.libraries.len(),
+        types.len() - mismatches.len(),
+        types.len()
+    );
+    for line in &mismatches {
+        let _ = writeln!(out, "{line}");
+    }
     let _ = writeln!(out, "Hash:    {}", world.hash_hex());
     Ok(out)
 }

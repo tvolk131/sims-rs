@@ -8,6 +8,7 @@ members = [
     "crates/sims-core",
     "crates/sims-formats",
     "crates/sims-sim",
+    "crates/sims-vm",
 ]
 resolver = "3"
 
@@ -29,6 +30,7 @@ sims-content = { path = "crates/sims-content" }
 sims-core = { path = "crates/sims-core" }
 sims-formats = { path = "crates/sims-formats" }
 sims-sim = { path = "crates/sims-sim" }
+sims-vm = { path = "crates/sims-vm" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -20,7 +20,7 @@ pub enum Error {
 }
 
 impl Error {
-    pub(crate) fn format(location: &str, source: sims_formats::Error) -> Self {
+    pub fn format(location: &str, source: sims_formats::Error) -> Self {
         Self::Format {
             location: location.to_owned(),
             source,
