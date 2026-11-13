@@ -9,9 +9,9 @@ use std::{
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
-struct Directory(PathBuf);
+pub(super) struct Directory(pub(super) PathBuf);
 impl Directory {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let p = std::env::temp_dir().join(format!(
             "sims-content-scan-{}-{}",
             std::process::id(),
@@ -20,7 +20,7 @@ impl Directory {
         fs::create_dir(&p).unwrap();
         Self(p)
     }
-    fn path(&self, name: &str) -> PathBuf {
+    pub(super) fn path(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
 }
@@ -29,7 +29,7 @@ impl Drop for Directory {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-fn resource(source: &Path, offset: u64, size: u64) -> Resource {
+pub(super) fn resource(source: &Path, offset: u64, size: u64) -> Resource {
     Resource {
         locator: format!("archive.far::{offset}"),
         name: "entry.cmx.bcf".into(),
@@ -44,6 +44,12 @@ fn resource(source: &Path, offset: u64, size: u64) -> Resource {
 fn compare(scan: &mut Scan, r: &Resource) {
     let expected = r.read().map_err(|e| format!("{e:#}"));
     assert_eq!(scan.read(r).map_err(|e| format!("{e:#}")), expected);
+    let mut bytes = vec![0xa5; 1024];
+    let actual = scan
+        .read_into(r, &mut bytes)
+        .map(|()| bytes)
+        .map_err(|error| format!("{error:#}"));
+    assert_eq!(actual, expected);
 }
 
 #[test]

@@ -500,6 +500,46 @@ impl Simulation {
         remaining: &mut usize,
         step: &mut Step,
     ) -> Result<bool, String> {
+        self.drive_native_find_location_observed(
+            p,
+            remaining,
+            step,
+            crate::service_observation::ContinuationMoment::Reentry,
+            &mut crate::service_observation::Observer::default(),
+        )
+    }
+    pub(crate) fn drive_native_find_location_observed(
+        &mut self,
+        p: &Program,
+        remaining: &mut usize,
+        step: &mut Step,
+        moment: crate::service_observation::ContinuationMoment,
+        observer: &mut crate::service_observation::Observer<'_>,
+    ) -> Result<bool, String> {
+        if let Some(retained) = self
+            .native_lot
+            .as_ref()
+            .and_then(|n| n.find_location.as_ref())
+        {
+            let (thread, request) = retained.binding();
+            let phase = match retained {
+                Execution::Search(_) => crate::service_observation::FindLocationPhase::Search,
+                Execution::Detach { .. } => crate::service_observation::FindLocationPhase::Detach,
+                Execution::DynamicDetach { .. } => {
+                    crate::service_observation::FindLocationPhase::DynamicDetach
+                }
+            };
+            observer.emit(
+                crate::ServiceCut::FindLocation {
+                    moment,
+                    phase,
+                    thread,
+                    request: request.id,
+                    object: crate::service_observation::ObjectLifetime::at(self, request.target),
+                },
+                self,
+            )?;
+        }
         let Some(mut e) = self
             .native_lot
             .as_mut()

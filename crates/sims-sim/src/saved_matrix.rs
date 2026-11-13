@@ -98,6 +98,91 @@ pub struct Resize {
     pending: Option<Allocated>,
 }
 impl Resize {
+    pub(crate) fn dimensions(&self) -> (i32, i32) {
+        (self.width, self.height)
+    }
+
+    pub(crate) fn validate(&self, matrix: &Matrix) -> Result<(), Stop> {
+        if (self.phase == ResizePhase::Accept) != self.pending.is_some() {
+            return Err(Stop::Unsupported(
+                "matrix resize cursor and pending allocation differ".into(),
+            ));
+        }
+        match self.phase {
+            ResizePhase::Free(token)
+                if !matches!(&matrix.allocation, Allocation::Known(backing) if backing.token == token)
+                    || (matrix.width == self.width && matrix.height == self.height) =>
+            {
+                return Err(Stop::Unsupported(
+                    "matrix resize free is not its active backing".into(),
+                ));
+            }
+            ResizePhase::Allocate | ResizePhase::Accept => {
+                allocation_request(self.width, self.height, matrix.stride)?;
+                if matrix.width != self.width
+                    || matrix.height != self.height
+                    || !matches!(
+                        matrix.allocation,
+                        Allocation::Null | Allocation::Released { .. }
+                    )
+                {
+                    return Err(Stop::Unsupported(
+                        "matrix resize allocation lost its dimensions or old-backing release"
+                            .into(),
+                    ));
+                }
+            }
+            ResizePhase::Complete(success) => {
+                if matrix.width != self.width
+                    || matrix.height != self.height
+                    || (!success && matrix.allocation != Allocation::Null)
+                {
+                    return Err(Stop::Unsupported(
+                        "completed matrix resize differs from its retained result".into(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_fresh(&self, matrix: &Matrix) -> Result<(), Stop> {
+        self.validate(matrix)?;
+        if matches!(self.phase, ResizePhase::Free(_))
+            || matches!(matrix.allocation, Allocation::Released { .. })
+            || (matches!(self.phase, ResizePhase::Inspect | ResizePhase::Dimensions)
+                && (matrix.width != -1
+                    || matrix.height != -1
+                    || matrix.allocation != Allocation::Null))
+        {
+            return Err(Stop::Unsupported(
+                "fresh matrix resize cannot release or replace an existing backing".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        matches!(self.phase, ResizePhase::Complete(_))
+    }
+
+    pub(crate) fn pending_span(&self, stride: i32) -> Result<Option<(u64, usize)>, Stop> {
+        match &self.pending {
+            Some(Allocated::Bytes { token, data }) => {
+                let request = allocation_request(self.width, self.height, stride)?;
+                let bytes = data
+                    .len()
+                    .checked_add(request.columns as usize * 4)
+                    .ok_or_else(|| {
+                        Stop::Unsupported("pending matrix allocation extent overflows".into())
+                    })?;
+                Ok(Some((*token, bytes)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub fn new(width: i32, height: i32) -> Self {
         Self {
             width,
@@ -112,6 +197,7 @@ impl Resize {
         matrix: &mut Matrix,
         host: &mut impl Host,
     ) -> Result<Option<bool>, Stop> {
+        self.validate(matrix)?;
         match self.phase {
             ResizePhase::Inspect => {
                 if matrix.width == self.width && matrix.height == self.height {
@@ -254,6 +340,12 @@ pub struct Read {
     raw_stream: bool,
 }
 impl Read {
+    /// Match the active reader to its caller's selected operation before a
+    /// restored cursor can issue a different resource callback.
+    pub(crate) fn matches_request(&self, tag: u32, id: u32, converter: u32) -> bool {
+        (self.tag, self.id, self.converter) == (tag, id, converter)
+    }
+
     pub fn new(tag: u32, id: u32, requested_converter: u32) -> Self {
         Self {
             tag,

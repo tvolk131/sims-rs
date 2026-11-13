@@ -40,6 +40,7 @@ fn inventory(app: &Application, guid: u32) -> Result<Vec<InventoryEntry>> {
 }
 
 fn save_checkpoint(app: &Application, output: &std::path::Path, name: &str) -> Result<String> {
+    verify_retained_routing(app.session()?, app.viewer.args.inferred_routing)?;
     let bytes = app.checkpoint()?;
     std::fs::OpenOptions::new()
         .write(true)
@@ -166,6 +167,8 @@ fn run_collection() -> Result<()> {
             &checkpoint,
         )?);
         let app = app.as_mut().unwrap();
+        report["retained_routing_before_service"] =
+            verify_retained_routing(app.session()?, inferred)?;
         app.drain(&limits)?;
         let initial_tick = app.session()?.simulation.vm.tick;
         let runtime = Instant::now();
@@ -428,6 +431,8 @@ fn run_collection() -> Result<()> {
             completed.push(json!({"item":item,"attribute":attribute,"routine":routine,"serial":serial,"kind":kind,"guid":guid,
                 "quantity":quantity,"inventory":inventory(app,resident.guid)?,"tick":app.session()?.simulation.vm.tick}));
         }
+        report["retained_routing_before_final_checkpoint"] =
+            verify_retained_routing(app.session()?, inferred)?;
         report["after_collection_sha256"] = json!(save_checkpoint(
             app,
             &output,
@@ -488,4 +493,52 @@ fn run_collection() -> Result<()> {
         .write_all(&serde_json::to_vec_pretty(&report)?)?;
     println!("collection stage={stage}; success={}", result.is_ok());
     result
+}
+
+#[test]
+fn retained_routing_requires_both_actual_policies_and_the_native_lot_owner() {
+    for inferred in [false, true] {
+        let expected = if inferred {
+            Policy::InferredRectangles
+        } else {
+            Policy::Strict
+        };
+        for session in [Policy::Strict, Policy::InferredRectangles] {
+            for native_lot in [None, Some(Policy::Strict), Some(Policy::InferredRectangles)] {
+                let result = validate_retained_routing(inferred, session, native_lot);
+                assert_eq!(
+                    result.is_ok(),
+                    session == expected && native_lot == Some(expected),
+                    "inferred={inferred}, session={session:?}, native_lot={native_lot:?}"
+                );
+                if let Ok(report) = result {
+                    assert_eq!(report["requested"], json!(expected));
+                    assert_eq!(report["session"], json!(session));
+                    assert_eq!(report["native_lot"], json!(native_lot.unwrap()));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn retained_routing_failures_identify_the_unmatched_owner() {
+    let wrong_session =
+        validate_retained_routing(false, Policy::InferredRectangles, Some(Policy::Strict))
+            .unwrap_err();
+    assert!(
+        wrong_session
+            .to_string()
+            .contains("Session routing differs")
+    );
+    let missing_lot = validate_retained_routing(false, Policy::Strict, None).unwrap_err();
+    assert!(
+        missing_lot
+            .to_string()
+            .contains("native lot routing owner absent")
+    );
+    let wrong_lot =
+        validate_retained_routing(false, Policy::Strict, Some(Policy::InferredRectangles))
+            .unwrap_err();
+    assert!(wrong_lot.to_string().contains("native lot routing differs"));
 }

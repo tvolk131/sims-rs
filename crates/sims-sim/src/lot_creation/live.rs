@@ -1,6 +1,7 @@
 //! Live 0x44e0c8 floor/contained creation: factory, acceptance, SetObject, or synchronous
 //! destruction. This continuation freezes ordinary scheduling, not Init/Main
 //! or placement callbacks. Original resources determine the created behavior.
+use crate::service_observation::{CreationMoment, CreationPhase, Observer, ServiceCut};
 use crate::{Simulation, Step, lot_acceptance, lot_links::Descriptor, lot_placement, removal};
 use serde::{Deserialize, Serialize};
 use sims_vm::{
@@ -36,6 +37,22 @@ pub struct Execution {
     dynamic: Option<crate::lot_dynamic::live::Execution>,
 }
 impl Execution {
+    fn service_cut(&self, s: &Simulation, moment: CreationMoment) -> ServiceCut {
+        let phase = match self.phase {
+            Phase::Factory => CreationPhase::Factory,
+            Phase::GroupFactory => CreationPhase::GroupFactory,
+            Phase::GroupRotate => CreationPhase::GroupRotate,
+            Phase::RotateOffLot => CreationPhase::RotateOffLot,
+            Phase::RotatePlaced => CreationPhase::RotatePlaced,
+            Phase::BeginPlacement => CreationPhase::BeginPlacement,
+            Phase::Check => CreationPhase::Check,
+            Phase::Place => CreationPhase::Place,
+            Phase::Dynamic => CreationPhase::Dynamic,
+            Phase::Detach => CreationPhase::Detach,
+            Phase::Destroy => CreationPhase::Destroy,
+        };
+        ServiceCut::creation(s, moment, phase, self.thread, &self.request)
+    }
     pub(crate) fn binding(&self) -> (u64, sims_vm::ObjectId) {
         (self.request.id, self.request.created.unwrap_or(0))
     }
@@ -567,6 +584,7 @@ impl Simulation {
         r: Request,
         remaining: &mut usize,
         step: &mut Step,
+        observer: &mut Observer<'_>,
     ) -> Result<bool, String> {
         let id = r.created.ok_or("rotation factory instance absent")?;
         let target = self.vm.threads[&thread]
@@ -597,7 +615,14 @@ impl Simulation {
                 dynamic: None,
             },
         );
-        self.drive_native_creation(p, r.id, remaining, step)
+        self.drive_native_creation_observed(
+            p,
+            r.id,
+            remaining,
+            step,
+            CreationMoment::RotationInstalled,
+            observer,
+        )
     }
     pub(crate) fn owns_immediate_creation_deletion(&self) -> bool {
         self.deletion.first().is_some_and(|d| {
@@ -637,16 +662,24 @@ impl Simulation {
                     .is_some_and(|e| e.owns_deletion(d.target))
         })
     }
-    pub(crate) fn drive_pending_native_creations(
+    pub(crate) fn drive_pending_native_creations_observed(
         &mut self,
         p: &Program,
         remaining: &mut usize,
         step: &mut Step,
+        observer: &mut Observer<'_>,
     ) -> Result<bool, String> {
         // Nested synchronous factories have newer request IDs. Finish the inner
         // call before re-entering its parent's suspended Init/Main frame.
         while let Some((&key, _)) = self.native_creations.last_key_value() {
-            if !self.drive_native_creation(p, key, remaining, step)? {
+            if !self.drive_native_creation_observed(
+                p,
+                key,
+                remaining,
+                step,
+                CreationMoment::Reentry,
+                observer,
+            )? {
                 return Ok(false);
             }
         }
@@ -661,11 +694,12 @@ impl Simulation {
         catalog: u16,
         remaining: &mut usize,
         step: &mut Step,
+        observer: &mut Observer<'_>,
     ) -> Result<bool, String> {
         if r.created.is_some() || r.placement.is_some() {
             return Err("orphan multipart factory request".into());
         }
-        self.begin_group_factory(p, thread, r, source, catalog, remaining, step)
+        self.begin_group_factory(p, thread, r, source, catalog, remaining, step, observer)
     }
     fn begin_group_factory(
         &mut self,
@@ -676,6 +710,7 @@ impl Simulation {
         catalog: u16,
         remaining: &mut usize,
         step: &mut Step,
+        observer: &mut Observer<'_>,
     ) -> Result<bool, String> {
         let date = &self
             .household
@@ -726,7 +761,14 @@ impl Simulation {
                 dynamic: None,
             },
         );
-        self.drive_native_creation(p, r.id, remaining, step)
+        self.drive_native_creation_observed(
+            p,
+            r.id,
+            remaining,
+            step,
+            CreationMoment::Registered,
+            observer,
+        )
     }
     pub(crate) fn service_native_placed_creation(
         &mut self,
@@ -735,8 +777,10 @@ impl Simulation {
         mut r: Request,
         remaining: &mut usize,
         step: &mut Step,
+        observer: &mut Observer<'_>,
     ) -> Result<bool, String> {
-        if !self.native_creations.contains_key(&r.id) {
+        let registered = !self.native_creations.contains_key(&r.id);
+        if registered {
             if r.created.is_some() || r.placement.is_some() {
                 return Err("orphan native creation continuation".into());
             }
@@ -778,6 +822,7 @@ impl Simulation {
                     number,
                     remaining,
                     step,
+                    observer,
                 );
             }
             let Some(id) = (1..=i16::MAX).find(|id| !self.vm.world.objects.contains_key(id)) else {
@@ -807,15 +852,33 @@ impl Simulation {
                 },
             );
         }
-        self.drive_native_creation(p, r.id, remaining, step)
+        self.drive_native_creation_observed(
+            p,
+            r.id,
+            remaining,
+            step,
+            if registered {
+                CreationMoment::Registered
+            } else {
+                CreationMoment::Reentry
+            },
+            observer,
+        )
     }
-    pub(crate) fn drive_native_creation(
+    pub(crate) fn drive_native_creation_observed(
         &mut self,
         p: &Program,
         key: u64,
         remaining: &mut usize,
         step: &mut Step,
+        moment: CreationMoment,
+        observer: &mut Observer<'_>,
     ) -> Result<bool, String> {
+        let retained = self
+            .native_creations
+            .get(&key)
+            .ok_or("native creation continuation missing")?;
+        observer.emit(retained.service_cut(self, moment), self)?;
         let mut e = self
             .native_creations
             .remove(&key)

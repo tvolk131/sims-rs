@@ -1,6 +1,6 @@
 //! Original Look Towards coordinate/continuation contract, excluding animator
 //! progression. Native coordinates are sixteenths of a tile.
-use crate::{Program, Status, Thread, TurnRequest, Vm, branch};
+use crate::{Program, Status, Thread, TurnRequest, Vm};
 use serde::{Deserialize, Serialize};
 impl Vm {
     pub(crate) fn request_turn(
@@ -8,6 +8,16 @@ impl Vm {
         program: &Program,
         t: &mut Thread,
         ins: &sims_formats::behavior::Instruction,
+    ) -> Result<String, String> {
+        self.request_turn_with_observation(program, t, ins, &mut crate::action_observation::Observation::disabled())
+    }
+
+    pub(crate) fn request_turn_with_observation(
+        &mut self,
+        program: &Program,
+        t: &mut Thread,
+        ins: &sims_formats::behavior::Instruction,
+        observation: &mut crate::action_observation::Observation<'_>,
     ) -> Result<String, String> {
         let mode = i16::from_le_bytes(ins.operands[..2].try_into().unwrap());
         if !(1..=3).contains(&mode) {
@@ -23,7 +33,7 @@ impl Vm {
             .ok_or("turn caller is not a person")?;
         if f.continuation == 0 && *person.get(&0).ok_or("turn posture is missing")? != 0 {
             t.last_result = false;
-            branch(program, t, ins.on_false)?;
+            crate::branch_observed(program, t, ins.on_false, Some(&self.world), observation)?;
             return Ok("Look Towards declined non-standing posture; branch false".into());
         }
         if f.continuation == 0 && mode != 1 && !self.world.objects.contains_key(&f.stack_object) {

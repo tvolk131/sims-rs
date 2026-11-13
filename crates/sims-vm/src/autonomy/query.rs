@@ -371,13 +371,24 @@ impl Vm {
         yes: u8,
         no: u8,
     ) -> Result<String, String> {
+        self.find_best_interaction_with_observation(p, t, yes, no, &mut crate::action_observation::Observation::disabled())
+    }
+
+    pub(crate) fn find_best_interaction_with_observation(
+        &mut self,
+        p: &Program,
+        t: &mut Thread,
+        yes: u8,
+        no: u8,
+        observation: &mut crate::action_observation::Observation<'_>,
+    ) -> Result<String, String> {
         if t.check || t.dispatch.is_some() {
             return Err("nested autonomy search inside a check/dispatch is unsupported".into());
         }
         if t.autonomy.is_none() {
             if self.autonomy_disabled(t)? {
                 t.last_result = false;
-                crate::branch(p, t, no)?;
+                crate::branch_observed(p, t, no, Some(&self.world), observation)?;
                 return Ok("native free-will gate declined autonomy".into());
             }
             let state = self.world.person.as_ref().unwrap();
@@ -390,7 +401,7 @@ impl Vm {
                     && context.selected_person == Some(t.stack.last().unwrap().caller))
             {
                 t.last_result = false;
-                crate::branch(p, t, no)?;
+                crate::branch_observed(p, t, no, Some(&self.world), observation)?;
                 return Ok("native lot control gate declined autonomy".into());
             }
             t.autonomy = Some(Query::start(self, p, t)?);
@@ -490,7 +501,7 @@ impl Vm {
             t.stack.last_mut().unwrap().stack_object = candidate.object;
         }
         t.last_result = result;
-        crate::branch(p, t, if result { yes } else { no })?;
+        crate::branch_observed(p, t, if result { yes } else { no }, Some(&self.world), observation)?;
         Ok(format!(
             "Find Best Action evaluated {} candidates; selected={result}",
             q.candidates.len()

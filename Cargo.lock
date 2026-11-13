@@ -2557,10 +2557,12 @@ dependencies = [
  "cosmic-text",
  "encoding_rs",
  "image",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
  "sims-formats",
+ "sims-kernel",
  "sims-runtime",
  "sims-sim",
  "sims-vm",
@@ -2589,6 +2591,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "sims-kernel"
+version = "0.1.0"
 
 [[package]]
 name = "sims-render"
@@ -2636,6 +2642,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sims-formats",
+ "sims-kernel",
  "sims-vm",
 ]
 

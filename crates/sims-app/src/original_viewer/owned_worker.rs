@@ -11,6 +11,9 @@ pub(super) trait Owner: Send + 'static {
     fn apply(&mut self, command: Self::Command) -> Result<Self::Reply, String>;
     fn publish(&self) -> Result<Self::Published, String>;
     fn replaces(command: &Self::Command) -> bool;
+    // Inert for every unrelated owner. The guard owns only recorder metadata.
+    fn begin_observed_work(&self) -> Option<super::super::support::window_session::loaded_input::WorkScope> { None }
+    fn observation_monitor(&self) -> Option<super::super::support::window_session::loaded_input::Monitor> { None }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Ticket {
@@ -58,6 +61,7 @@ impl std::fmt::Display for PollError {
     }
 }
 pub(super) struct Worker<O: Owner> {
+    observation: Option<super::super::support::window_session::loaded_input::Monitor>,
     requests: Option<mpsc::SyncSender<Request<O>>>,
     completions: mpsc::Receiver<Completion<O>>,
     #[cfg(test)]
@@ -71,6 +75,9 @@ pub(super) struct Worker<O: Owner> {
 }
 impl<O: Owner> Worker<O> {
     pub fn start(owner: O) -> Result<Self, StartError<O>> {
+        let observation = owner.observation_monitor();
+        let mut initial_scope = owner.begin_observed_work();
+        if let Some(scope) = initial_scope.as_mut() { scope.owner_prepared(); }
         let published = match owner.publish() {
             Ok(p) => Arc::new(p),
             Err(error) => return Err(StartError { owner, error }),
@@ -78,6 +85,7 @@ impl<O: Owner> Worker<O> {
         let (initial_tx, initial_rx) = mpsc::sync_channel::<O>(1);
         let (requests, incoming) = mpsc::sync_channel::<Request<O>>(1);
         let (results, completions) = mpsc::channel();
+        let thread_observation = observation.clone();
         let thread = match thread::Builder::new()
             .name("sims-household-owner".into())
             .stack_size(64 * 1024 * 1024)
@@ -85,12 +93,20 @@ impl<O: Owner> Worker<O> {
                 let mut owner = initial_rx.recv().expect("initial owner sender disappeared");
                 let mut generation = 0u64;
                 let mut quarantined = false;
-                while let Ok(request) = incoming.recv() {
+                loop {
+                    let request = match incoming.recv() {
+                        Ok(request) => request,
+                        Err(_) => {
+                            if let Some(monitor) = &thread_observation { monitor.request_channel_closed(); }
+                            break;
+                        }
+                    };
                     let Request {
                         ticket,
                         command,
                         notify,
                     } = request;
+                    let mut scope = owner.begin_observed_work();
                     // A panic still terminates the owner. Close the result
                     // channel before waking the UI, so its one wake cannot
                     // race an incompletely disconnected sender.
@@ -109,17 +125,22 @@ impl<O: Owner> Worker<O> {
                             Err("engine generation exhausted".into())
                         } else {
                             match owner.apply(command) {
-                                Ok(reply) => match owner.publish() {
-                                    Ok(p) => {
-                                        if replacing {
-                                            generation += 1;
+                                Ok(reply) => {
+                                    // Engine::apply includes popup bookkeeping. Keep
+                                    // this same guard through publication/send/notify.
+                                    if let Some(scope) = scope.as_mut() { scope.owner_prepared(); }
+                                    match owner.publish() {
+                                        Ok(p) => {
+                                            if replacing {
+                                                generation += 1;
+                                            }
+                                            publication = Some(Arc::new(p));
+                                            Ok(reply)
                                         }
-                                        publication = Some(Arc::new(p));
-                                        Ok(reply)
-                                    }
-                                    Err(error) => {
-                                        quarantined = true;
-                                        Err(error)
+                                        Err(error) => {
+                                            quarantined = true;
+                                            Err(error)
+                                        }
                                     }
                                 },
                                 // No rollback or retry after a partially changed owner.
@@ -139,19 +160,24 @@ impl<O: Owner> Worker<O> {
                     }));
                     match completion {
                         Ok(completion) => {
+                            let successful = completion.reply.is_ok() && !completion.quarantined;
                             let sent = results.send(completion).is_ok();
                             if let Some(notify) = notify {
                                 notify();
                             }
+                            if let Some(scope) = scope { scope.complete(successful && sent); }
                             if !sent {
+                                if let Some(monitor) = &thread_observation { monitor.invalidate("result_delivery_failed"); }
                                 break;
                             }
                         }
                         Err(panic) => {
+                            if let Some(monitor) = &thread_observation { monitor.invalidate("owner_panicked"); }
                             drop(results);
                             if let Some(notify) = notify {
                                 notify();
                             }
+                            if let Some(scope) = scope { scope.complete(false); }
                             std::panic::resume_unwind(panic);
                         }
                     }
@@ -176,7 +202,9 @@ impl<O: Owner> Worker<O> {
         // The UI never joins the owner, including during application drop.
         #[cfg(not(test))]
         drop(thread);
+        if let Some(scope) = initial_scope { scope.complete(true); }
         Ok(Self {
+            observation,
             requests: Some(requests),
             completions,
             #[cfg(test)]
@@ -188,6 +216,12 @@ impl<O: Owner> Worker<O> {
             quarantined: false,
             disconnected: false,
         })
+    }
+    fn observation_failure(&self, reason: &'static str) {
+        if let Some(monitor) = &self.observation { monitor.invalidate(reason); }
+    }
+    pub fn record_ui_retirement_intent(&self) {
+        if let Some(monitor) = &self.observation { monitor.ui_retirement_intent(); }
     }
     pub fn published(&self) -> &Arc<O::Published> {
         &self.published
@@ -208,15 +242,18 @@ impl<O: Owner> Worker<O> {
         notify: Option<Box<dyn FnOnce() + Send>>,
     ) -> Result<Ticket, SubmitError<O::Command>> {
         if self.disconnected {
+            self.observation_failure("submit_disconnected");
             return Err(SubmitError::Disconnected(command));
         }
         if self.busy() {
             return Err(SubmitError::Busy(command));
         }
         if self.quarantined {
+            self.observation_failure("submit_quarantined");
             return Err(SubmitError::Quarantined(command));
         }
         let Some(next) = self.next_serial.checked_add(1) else {
+            self.observation_failure("worker_serial_exhausted");
             return Err(SubmitError::Exhausted(command));
         };
         let ticket = Ticket {
@@ -224,6 +261,7 @@ impl<O: Owner> Worker<O> {
             serial: self.next_serial,
         };
         let Some(sender) = &self.requests else {
+            self.observation_failure("request_sender_unavailable");
             return Err(SubmitError::Disconnected(command));
         };
         match sender.try_send(Request {
@@ -238,6 +276,7 @@ impl<O: Owner> Worker<O> {
             }
             Err(mpsc::TrySendError::Full(r)) => Err(SubmitError::Busy(r.command)),
             Err(mpsc::TrySendError::Disconnected(r)) => {
+                self.observation_failure("request_send_disconnected");
                 self.disconnected = true;
                 Err(SubmitError::Disconnected(r.command))
             }
@@ -245,11 +284,13 @@ impl<O: Owner> Worker<O> {
     }
     pub fn poll(&mut self) -> Result<Option<Completion<O>>, PollError> {
         if self.disconnected {
+            self.observation_failure("poll_disconnected");
             return Err(PollError::Disconnected);
         }
         match self.completions.try_recv() {
             Ok(completion) => {
                 if self.flight != Some(completion.ticket) {
+                    self.observation_failure("unexpected_completion_ticket");
                     self.disconnected = true;
                     self.requests.take();
                     return Err(PollError::UnexpectedTicket {
@@ -267,6 +308,7 @@ impl<O: Owner> Worker<O> {
             }
             Err(mpsc::TryRecvError::Empty) => Ok(None),
             Err(mpsc::TryRecvError::Disconnected) => {
+                self.observation_failure("completion_channel_disconnected");
                 self.disconnected = true;
                 // The sender has gone; no owner call can still complete.
                 // Keep the last good publication, but do not leave Close
@@ -276,6 +318,11 @@ impl<O: Owner> Worker<O> {
                 Err(PollError::Disconnected)
             }
         }
+    }
+    #[cfg(test)]
+    pub fn disconnect_results_for_test(&mut self) {
+        let (_sender, disconnected) = mpsc::channel();
+        drop(std::mem::replace(&mut self.completions, disconnected));
     }
     /// Explicit test/off-UI shutdown. Drop only disconnects and never joins.
     #[cfg(test)]

@@ -86,16 +86,23 @@ impl Scan {
     }
 
     pub(crate) fn read(&mut self, resource: &Resource) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.read_into(resource, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn read_into(&mut self, resource: &Resource, bytes: &mut Vec<u8>) -> Result<()> {
         if let Some(observed) = &self.inputs {
-            return observed.inputs.read(observed.scope, resource);
+            *bytes = observed.inputs.read(observed.scope, resource)?;
+            return Ok(());
         }
         #[cfg(not(unix))]
-        return resource.read();
+        return resource.read_into(bytes);
         #[cfg(unix)]
         {
             resource.validate_storage()?;
             if resource.owned.is_some() || !resource.archived {
-                return resource.read();
+                return resource.read_into(bytes);
             }
             // A failed pathname lookup must use the ordinary open/error path.
             // Revalidating metadata also catches replacement, symlink changes,
@@ -106,7 +113,7 @@ impl Scan {
                 .map(Stamp::from);
             if stamp.is_none() {
                 self.files.retain(|f| f.source != resource.source);
-                return resource.read();
+                return resource.read_into(bytes);
             }
             if let Some(at) = self
                 .files
@@ -114,7 +121,7 @@ impl Scan {
                 .position(|f| f.source == resource.source && stamp.as_ref() == Some(&f.stamp))
             {
                 let mut opened = self.files.remove(at).unwrap();
-                let result = resource.read_file(&mut opened.file);
+                let result = resource.read_file_into(&mut opened.file, bytes);
                 if result.is_ok() {
                     self.files.push_back(opened);
                 }
@@ -134,7 +141,7 @@ impl Scan {
                 .ok()
                 .filter(|m| m.is_file())
                 .map(Stamp::from);
-            let result = resource.read_file(&mut file);
+            let result = resource.read_file_into(&mut file, bytes);
             if result.is_ok() {
                 if let Some(stamp) = opened_stamp {
                     if self.files.len() == CAPACITY {
@@ -154,6 +161,9 @@ impl Scan {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod buffer_tests;
 
 // Discovery needs complete IFF validation, without unused decoded metadata.
 mod object_guids;

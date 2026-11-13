@@ -6,6 +6,10 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sims_vm::scheduler::clock::{self as native, speed_override};
 
+#[cfg(test)]
+#[path = "action_execution_tests.rs"]
+mod action_execution_tests;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NeighborhoodRequest {
     pub id: i16,
@@ -287,14 +291,14 @@ impl Session {
         }
     }
     pub fn advance_clock(&mut self, budget: usize) -> Result<Progress> {
-        self.advance_clock_monitored(budget, None, None)
+        self.advance_clock_monitored(budget, None, None, None)
     }
     pub fn advance_clock_with_trace(
         &mut self,
         budget: usize,
         trace: &mut Vec<sims_vm::Trace>,
     ) -> Result<Progress> {
-        self.advance_clock_monitored(budget, Some(trace), None)
+        self.advance_clock_monitored(budget, Some(trace), None, None)
     }
     pub fn advance_clock_with_dependent_observer(
         &mut self,
@@ -302,13 +306,62 @@ impl Session {
         trace: &mut Vec<sims_vm::Trace>,
         observer: &mut dyn FnMut(&Self) -> Result<()>,
     ) -> Result<Progress> {
-        self.advance_clock_monitored(budget, Some(trace), Some(observer))
+        self.advance_clock_monitored(budget, Some(trace), Some(observer), None)
+    }
+    /// Observe retained simulation services inside the existing elapsed-frame
+    /// household call, before its clock tick or parent return is acknowledged.
+    pub fn advance_clock_with_service_observer(
+        &mut self,
+        budget: usize,
+        observer: &mut dyn FnMut(sims_sim::ServiceCut, &Session) -> Result<()>,
+    ) -> Result<Progress> {
+        self.advance_clock_monitored(budget, None, None, Some(observer))
+    }
+    pub fn advance_clock_with_trace_and_service_observer(
+        &mut self,
+        budget: usize,
+        trace: &mut Vec<sims_vm::Trace>,
+        observer: &mut dyn FnMut(sims_sim::ServiceCut, &Session) -> Result<()>,
+    ) -> Result<Progress> {
+        self.advance_clock_monitored(budget, Some(trace), None, Some(observer))
     }
     fn advance_clock_monitored(
         &mut self,
         budget: usize,
+        trace: Option<&mut Vec<sims_vm::Trace>>,
+        observer: Option<&mut dyn FnMut(&Self) -> Result<()>>,
+        service_observer: Option<&mut dyn FnMut(sims_sim::ServiceCut, &Session) -> Result<()>>,
+    ) -> Result<Progress> {
+        self.advance_clock_monitored_with_actions(budget, trace, observer, service_observer, None)
+    }
+
+    /// Observe the real elapsed UpdateLot child, acknowledging only a Tick or
+    /// PartialPass as before. The borrowed sink must not panic or reenter; no
+    /// unwind isolation or continuous clock/Session coverage is provided.
+    pub fn advance_clock_with_action_observer(
+        &mut self,
+        budget: usize,
+        sink: &mut dyn FnMut(sims_sim::SimExecutionEvent),
+    ) -> Result<Progress> {
+        self.advance_clock_monitored_with_actions(budget, None, None, None, Some(sink))
+    }
+
+    pub fn advance_clock_with_trace_and_action_observer(
+        &mut self,
+        budget: usize,
+        trace: &mut Vec<sims_vm::Trace>,
+        sink: &mut dyn FnMut(sims_sim::SimExecutionEvent),
+    ) -> Result<Progress> {
+        self.advance_clock_monitored_with_actions(budget, Some(trace), None, None, Some(sink))
+    }
+
+    fn advance_clock_monitored_with_actions(
+        &mut self,
+        budget: usize,
         mut trace: Option<&mut Vec<sims_vm::Trace>>,
         mut observer: Option<&mut dyn FnMut(&Self) -> Result<()>>,
+        mut service_observer: Option<&mut dyn FnMut(sims_sim::ServiceCut, &Session) -> Result<()>>,
+        mut action_observer: Option<&mut dyn FnMut(sims_sim::SimExecutionEvent)>,
     ) -> Result<Progress> {
         ensure!(budget > 0, "elapsed clock needs a work budget");
         if let Some(parent) = &self.host.presentation.application_parent {
@@ -394,6 +447,7 @@ impl Session {
                     if let Some(notice) = notice {
                         let started = call.notice.is_some();
                         if !started {
+                            super::action_execution_gap(&mut action_observer, "Session::begin_clock_notice");
                             self.begin_clock_notice(notice.event, notice.argument)?;
                             self.host
                                 .presentation
@@ -405,6 +459,7 @@ impl Session {
                                 .unwrap()
                                 .notice = Some(notice);
                         }
+                        super::action_execution_gap(&mut action_observer, "Session::advance_clock_notice");
                         if self.advance_clock_notice()? {
                             let call = self
                                 .host
@@ -432,7 +487,13 @@ impl Session {
                 native::Request::UpdateLot => {
                     // This branch returns immediately after this one child;
                     // the borrowed observers cannot outlive or alter it.
-                    let result = self.step_for_clock_monitored(trace.take(), observer.take());
+                    super::action_execution_gap(&mut action_observer, "clock::UpdateLot");
+                    let result = self.step_for_clock_monitored_with_actions(
+                        trace.take(),
+                        observer.take(),
+                        service_observer.take(),
+                        action_observer.take(),
+                    )?;
                     let call = self
                         .host
                         .presentation
@@ -443,7 +504,6 @@ impl Session {
                         .as_mut()
                         .unwrap();
                     call.tick = self.simulation.vm.tick;
-                    let result = result?;
                     if matches!(result, super::Progress::Tick | super::Progress::PartialPass) {
                         call.frame
                             .acknowledge(request, 0)
@@ -456,6 +516,7 @@ impl Session {
                     return Ok(Progress::Household(result));
                 }
                 native::Request::ProcessRequests => {
+                    super::action_execution_gap(&mut action_observer, "clock::ProcessRequests");
                     ensure!(
                         state.requests.is_empty(),
                         "original neighborhood request queue requires its service host"
@@ -464,10 +525,16 @@ impl Session {
                         .acknowledge(request, 0)
                         .map_err(anyhow::Error::msg)?;
                 }
-                native::Request::Publish => anyhow::bail!(
-                    "original neighborhood publication requires its application service host"
-                ),
-                native::Request::PeekMessage => return Ok(Progress::PollInput),
+                native::Request::Publish => {
+                    super::action_execution_gap(&mut action_observer, "clock::Publish");
+                    anyhow::bail!(
+                        "original neighborhood publication requires its application service host"
+                    );
+                }
+                native::Request::PeekMessage => {
+                    super::action_execution_gap(&mut action_observer, "clock::PeekMessage");
+                    return Ok(Progress::PollInput);
+                }
                 native::Request::DebugBreak => {
                     anyhow::bail!("original elapsed clock diagnostic break")
                 }

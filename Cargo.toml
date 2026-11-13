@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/sims-formats",
+    "crates/sims-kernel",
     "crates/sims-content",
     "crates/sims-vm",
     "crates/sims-sim",
@@ -28,6 +29,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sims-formats = { path = "crates/sims-formats" }
+sims-kernel = { path = "crates/sims-kernel" }
 sims-content = { path = "crates/sims-content" }
 sims-vm = { path = "crates/sims-vm" }
 sims-sim = { path = "crates/sims-sim" }

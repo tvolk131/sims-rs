@@ -3,6 +3,9 @@ use iced::{Color, Element, Size, Theme, widget, window};
 use sims_render::Scene;
 use std::{path::Path, sync::Arc, time::Instant};
 
+#[path = "window_session.rs"]
+pub(super) mod window_session;
+
 pub(super) fn validate_output(root: &Path, path: &Path) -> anyhow::Result<()> {
     let root = root.canonicalize()?;
     let absolute = if path.is_absolute() {
@@ -96,6 +99,7 @@ impl widget::shader::Primitive for Primitive {
         bounds: &iced::Rectangle,
         viewport: &widget::shader::Viewport,
     ) {
+        let started = window_session::enabled().then(Instant::now);
         let dpi = viewport.scale_factor();
         let size = viewport.physical_size();
         let scale =
@@ -108,8 +112,11 @@ impl widget::shader::Primitive for Primitive {
             w * dpi,
             h * dpi,
         ];
-        p.renderer
+        let preparation = p.renderer
             .prepare(device, queue, &self.scene, [size.width, size.height]);
+        if let Some(started) = started {
+            window_session::prepared(started, preparation, &self.scene);
+        }
     }
     fn render(
         &self,
@@ -118,6 +125,10 @@ impl widget::shader::Primitive for Primitive {
         target: &wgpu::TextureView,
         clip: &iced::Rectangle<u32>,
     ) {
+        let started = window_session::enabled().then(Instant::now);
+        if started.is_some() {
+            window_session::bind_presentation(target);
+        }
         p.renderer.render(
             encoder,
             target,
@@ -125,6 +136,9 @@ impl widget::shader::Primitive for Primitive {
             [clip.x, clip.y, clip.width, clip.height],
             None,
         );
+        if let Some(started) = started {
+            window_session::stage("scene_encode", started);
+        }
     }
 }
 pub(super) fn room_theme() -> Theme {

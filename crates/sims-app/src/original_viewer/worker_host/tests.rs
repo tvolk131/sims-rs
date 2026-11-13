@@ -550,3 +550,59 @@ fn restart_failure() -> Result<()> {
     assert_eq!(owner.error.as_deref(), Some("failed retry"));
     Ok(())
 }
+
+#[test]
+fn post_update_popup_overflow_invalidates_account_and_retains_old_publication() -> Result<()> {
+    // Authored UNRUN: force the bookkeeping comparison to differ, then enter
+    // the real Engine apply and generic worker result path. No fake save origin.
+    run(|| {
+        let account = window_session::loaded_input::Account::default();
+        let mut viewer = loading(); viewer.loaded_input = Some(account.register());
+        let mut engine = Engine::new(viewer);
+        engine.popup_epoch = u64::MAX;
+        engine.popup = Some(serde_json::from_value(serde_json::json!({
+            "kind":"Ground","tick":0,"actor":[1,1],"target":[2,2],"clicked":null,
+            "saved_poll_messages":0,"saved_stopping":0,"command":null
+        }))?);
+        let mut worker = match Worker::start(engine) { Ok(worker) => worker, Err(_) => anyhow::bail!("start") };
+        let old = worker.published().clone();
+        let (notify, ready) = std::sync::mpsc::sync_channel(1);
+        let work = Work { camera_shortcut: false, save_shortcut: None, message: Message::FocusLost, shell: Shell { diagnostics: false, options_open: false, revision: 0 },
+            popup: None, gate: None };
+        assert!(worker.submit_notifying(work, Some(Box::new(move || { let _ = notify.send(()); }))).is_ok());
+        ready.recv_timeout(std::time::Duration::from_secs(5))?;
+        let completion = worker.poll().map_err(|error| anyhow::anyhow!("{error}"))?.context("completion absent")?;
+        assert!(completion.reply.err().is_some_and(|error| error.contains("popup lifetime counter exhausted")));
+        assert!(completion.quarantined);
+        assert!(Arc::ptr_eq(&old, worker.published()));
+        let _owner = worker.recover().map_err(|_| anyhow::anyhow!("owner panicked"))?;
+        let terminal = account.terminal();
+        assert_eq!(terminal["eligible"], false);
+        assert!(terminal["invalidation_reasons"].as_array().unwrap().iter().any(|r| r == "owner_work_failed"));
+        Ok(())
+    })
+}
+
+#[test]
+fn late_accepted_effect_after_ui_close_keeps_gameplay_and_invalidates_retirement_metadata() -> Result<()> {
+    // UNRUN: close intent excludes no future effects; the existing handler
+    // still executes this accepted effect and the ledger records contradiction.
+    run(|| {
+        let account = window_session::loaded_input::Account::default();
+        let mut viewer = loading(); viewer.loaded_input = Some(account.register());
+        let mut host = Host::from_viewer_for_test(viewer);
+        assert_eq!(host.update(Event::Close(window::Id::unique())).units(), 1);
+        assert_eq!(account.inspect_for_test()["ui_retirement_intent_lifetime"], 1);
+        drop(host.update(Event::Effect { generation: 0, message: Message::FocusLost }));
+        host.settle_for_test()?;
+        let owner = host.recover_for_test();
+        assert_eq!(owner.widget_epoch, 1, "the late accepted effect must still execute");
+        let observed = account.inspect_for_test();
+        assert_eq!(observed["request_channel_closed_after_ui_retirement"], true);
+        assert!(observed["invalidation_reasons"].as_array().unwrap().iter().any(|v| v == "work_after_ui_retirement"));
+        assert_eq!(observed["eligible"], false);
+        drop(owner);
+        assert_eq!(account.terminal()["worker_finalized"], false);
+        Ok(())
+    })
+}

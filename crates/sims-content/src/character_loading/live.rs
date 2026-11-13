@@ -65,6 +65,7 @@ pub struct Host<P> {
     floors: BTreeMap<u16, floors::Binding>,
     index: std::sync::Arc<Index>,
     startup: crate::startup_memo::Memo,
+    animation_catalogs: crate::assets::AnimationCatalogs,
     neighborhood_source: String,
     initializer_settings: Settings,
     fresh: BTreeMap<ObjectId, Fresh>,
@@ -172,6 +173,7 @@ impl<'a, P: Presentation> Reader<'a, P> {
             floors: floors::load(self.index, self.house)?,
             index,
             startup,
+            animation_catalogs: crate::assets::AnimationCatalogs::default(),
             neighborhood_source: self.house.neighborhood_source.clone(),
             initializer_settings: self.settings,
             fresh: BTreeMap::new(),
@@ -204,6 +206,7 @@ impl<P: Presentation> Host<P> {
             floors: self.floors.clone(),
             index: self.index.clone(),
             startup: crate::startup_memo::Memo::new(self.index.clone()),
+            animation_catalogs: self.animation_catalogs.clone(),
             neighborhood_source: self.neighborhood_source.clone(),
             initializer_settings: self.initializer_settings,
             fresh: self.fresh.clone(),
@@ -270,6 +273,20 @@ impl<P: Presentation> Host<P> {
         }
     }
     pub fn restore(index: &Index, presentation: P, snapshot: Snapshot) -> Result<Self> {
+        Self::restore_with_animation_catalogs(
+            index,
+            presentation,
+            snapshot,
+            crate::assets::AnimationCatalogs::default(),
+        )
+    }
+
+    pub fn restore_with_animation_catalogs(
+        index: &Index,
+        presentation: P,
+        snapshot: Snapshot,
+        animation_catalogs: crate::assets::AnimationCatalogs,
+    ) -> Result<Self> {
         snapshot.clothing.validate(index)?;
         if let Some(provider) = &snapshot.autonomy_resources {
             provider.validate(index)?;
@@ -368,6 +385,7 @@ impl<P: Presentation> Host<P> {
             floors: snapshot.floors,
             index: index_owner,
             startup,
+            animation_catalogs,
             neighborhood_source: snapshot.neighborhood_source,
             initializer_settings: snapshot.initializer_settings,
             fresh,
@@ -591,7 +609,9 @@ impl<P: Presentation> Host<P> {
             .pending_animation_assets(program)
             .map_err(anyhow::Error::msg)?;
         if !names.is_empty() {
-            let report = crate::assets::load_named_native_animations(&self.index, program, &names)?;
+            let report = self
+                .animation_catalogs
+                .load_native(&self.index, program, &names)?;
             ensure!(
                 report.unresolved.is_empty(),
                 "unresolved live animation assets: {:?}",

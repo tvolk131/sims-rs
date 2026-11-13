@@ -1,4 +1,5 @@
 //! A small deterministic host for the SimAntics VM. No renderer or filesystem.
+pub mod action_execution;
 pub mod animation;
 pub mod architecture;
 pub mod burn;
@@ -22,6 +23,8 @@ pub mod household;
 pub mod immediate;
 pub mod interaction;
 pub mod locomotion;
+pub mod native_application;
+pub mod native_system;
 pub mod lot_acceptance;
 pub mod lot_adjacency;
 pub mod lot_clear;
@@ -50,6 +53,11 @@ pub mod lot_snap;
 pub mod lot_transfer;
 pub mod lot_walls;
 pub mod native_turn;
+pub mod native_grass;
+pub mod native_game;
+pub mod native_matrix;
+pub mod native_world;
+pub mod native_world_children;
 pub mod native_wall_io;
 pub mod native_wall_vertices;
 pub mod object_catalog;
@@ -73,6 +81,7 @@ pub mod saved_matrix;
 pub mod saved_types;
 pub mod saved_world;
 pub mod scheduler;
+pub mod service_observation;
 mod snapshot;
 pub mod spatial;
 pub mod surface_remap;
@@ -80,6 +89,8 @@ pub mod transfer;
 pub mod turn;
 pub mod ui_wait;
 pub use geometry::{Body, Destination, Point, Rect, Room};
+pub use action_execution::SimExecutionEvent;
+pub use service_observation::ServiceCut;
 use serde::{Deserialize, Serialize};
 use sims_vm::{
     ObjectId, Program, RouteRequest, SnapRequest, Start, Status, Stop, ThreadId, Trace, Vm,
@@ -352,7 +363,13 @@ impl Simulation {
         if self.native_scheduler.is_none() || self.fixture_driver.is_some() {
             return Err("original household tick requires the native registry scheduler".into());
         }
-        self.run_scheduled_slice_observed(program, budget, Self::next_registry_thread, Some(polls))
+        self.run_scheduled_slice_observed(
+            program,
+            budget,
+            Self::next_registry_thread,
+            Some(polls),
+            &mut service_observation::Observer::default(),
+        )
     }
     fn run_scheduled_slice(
         &mut self,
@@ -360,12 +377,31 @@ impl Simulation {
         budget: usize,
         next_thread: fn(&mut Self) -> Result<Option<ThreadId>, String>,
     ) -> Result<Step, String> {
-        self.run_scheduled_slice_observed(program, budget, next_thread, None)
+        self.run_scheduled_slice_observed(
+            program,
+            budget,
+            next_thread,
+            None,
+            &mut service_observation::Observer::default(),
+        )
     }
     fn run_scheduled_slice_observed(
         &mut self, program: &Program, budget: usize,
         next_thread: fn(&mut Self) -> Result<Option<ThreadId>, String>,
         polls: Option<&mut Vec<HostPollTrace>>,
+        observer: &mut service_observation::Observer<'_>,
+    ) -> Result<Step, String> {
+        self.run_scheduled_slice_with_action_observer(
+            program, budget, next_thread, polls, observer,
+            &mut action_execution::Observer::default(),
+        )
+    }
+    fn run_scheduled_slice_with_action_observer(
+        &mut self, program: &Program, budget: usize,
+        next_thread: fn(&mut Self) -> Result<Option<ThreadId>, String>,
+        polls: Option<&mut Vec<HostPollTrace>>,
+        observer: &mut service_observation::Observer<'_>,
+        action_observer: &mut action_execution::Observer<'_>,
     ) -> Result<Step, String> {
         if self.cursor_work_pending() {
             return Err("cursor factory must return before household ticks".into());
@@ -411,8 +447,14 @@ impl Simulation {
                 events: vec![],
             });
         }
-        let result = self.run_current_tick_inner_observed(program, budget, next_thread, polls);
+        let result = self.run_current_tick_inner_observed(
+            program, budget, next_thread, polls, observer, action_observer,
+        );
+        action_observer.gap("Simulation::sync_spatial_world");
         self.sync_spatial_world();
+        if observer.failed() {
+            return result;
+        }
         self.validate_native_lot()?;
         result
     }
@@ -423,12 +465,21 @@ impl Simulation {
         budget: usize,
         next_thread: fn(&mut Self) -> Result<Option<ThreadId>, String>,
     ) -> Result<Step, String> {
-        self.run_current_tick_inner_observed(program, budget, next_thread, None)
+        self.run_current_tick_inner_observed(
+            program,
+            budget,
+            next_thread,
+            None,
+            &mut service_observation::Observer::default(),
+            &mut action_execution::Observer::default(),
+        )
     }
     fn run_current_tick_inner_observed(
         &mut self, program: &Program, budget: usize,
         next_thread: fn(&mut Self) -> Result<Option<ThreadId>, String>,
         mut polls: Option<&mut Vec<HostPollTrace>>,
+        observer: &mut service_observation::Observer<'_>,
+        action_observer: &mut action_execution::Observer<'_>,
     ) -> Result<Step, String> {
         if self.characters.values().any(|c| {
             c.evaluated_tick > self.vm.tick
@@ -450,83 +501,116 @@ impl Simulation {
             step.stop = StepStop::Dialog;
             return Ok(step);
         }
+        action_observer.gap("Vm::resume_accessory_assets");
         self.vm.resume_accessory_assets(program);
         if !self.pending_skill_profiles().is_empty() {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
         let mut remaining = budget;
+        action_observer.gap("Simulation::drive_pending_native_transfers");
         if !self.drive_pending_native_transfers(program, &mut remaining, &mut step)? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
+        action_observer.gap("Simulation::drive_pending_native_reaches");
         if !self.drive_pending_native_reaches(program, &mut remaining, &mut step)? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
-        if !self.drive_native_removal(program, &mut remaining, &mut step)? {
+        action_observer.gap("Simulation::drive_native_removal_observed");
+        if !self.drive_native_removal_observed(
+            program,
+            &mut remaining,
+            &mut step,
+            service_observation::ContinuationMoment::Reentry,
+            observer,
+        )? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
-        if !self.drive_pending_native_creations(program, &mut remaining, &mut step)? {
+        action_observer.gap("Simulation::drive_pending_native_creations_observed");
+        if !self.drive_pending_native_creations_observed(
+            program, &mut remaining, &mut step, observer,
+        )? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
+        action_observer.gap("Simulation::drive_pending_rejected_person_cleanup");
         if !self.drive_pending_rejected_person_cleanup(program, &mut remaining, &mut step)? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
+        action_observer.gap("Simulation::drive_native_burn");
         if !self.drive_native_burn(program, &mut remaining, &mut step)? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
+        action_observer.gap("Simulation::drive_pending_factory_acceptance");
         if !self.drive_pending_factory_acceptance(program, &mut remaining, &mut step)? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
+        action_observer.gap("Simulation::drive_pending_person_visitors");
         if !self.drive_pending_person_visitors(program, &mut remaining, &mut step)? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
+        action_observer.gap("Simulation::drive_native_route_prefix");
         if !self.drive_native_route_prefix(program, &mut remaining, &mut step)? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
+        action_observer.gap("Simulation::drive_native_shoo");
         if !self.drive_native_shoo(program, &mut remaining, &mut step)? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
+        action_observer.gap("Simulation::drive_pending_native_movement");
         if !self.drive_pending_native_movement(program, &mut remaining, &mut step)? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
+        action_observer.gap("Simulation::drive_native_route_completion");
         if !self.drive_native_route_completion(program, &mut remaining, &mut step)? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
+        action_observer.gap("Simulation::drive_native_snap");
         if !self.drive_native_snap(program, &mut remaining, &mut step)? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
-        if !self.drive_native_find_location(program, &mut remaining, &mut step)? {
+        action_observer.gap("Simulation::drive_native_find_location_observed");
+        if !self.drive_native_find_location_observed(
+            program,
+            &mut remaining,
+            &mut step,
+            service_observation::ContinuationMoment::Reentry,
+            observer,
+        )? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
+        action_observer.gap("Simulation::drive_pending_native_turn");
         if !self.drive_pending_native_turn(program, &mut remaining, &mut step)? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
         if !self.deletion.is_empty() {
-            return self.finish_lot_tick(program, &mut remaining, step);
+            return self.finish_lot_tick(program, &mut remaining, step, observer, action_observer);
         }
+        action_observer.gap("Simulation::drive_reach_callback");
         if !self.drive_reach_callback(program, &mut remaining, &mut step)? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
+        action_observer.gap("Simulation::drive_cancellation");
         if !self.drive_cancellation(program, &mut remaining, &mut step)? {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
+        action_observer.gap("Simulation::drive_immediate");
         if self.immediate.is_some()
             && self
                 .drive_immediate(program, &mut remaining, &mut step)?
@@ -535,12 +619,16 @@ impl Simulation {
             step.stop = StepStop::Budget;
             return Ok(step);
         }
+        action_observer.gap("Simulation::advance_animations");
         self.advance_animations(program, &mut step.events)?;
+        action_observer.gap("Simulation::sync_carry");
         self.sync_carry(program)?;
+        action_observer.gap("Simulation::service_interactions");
         self.service_interactions(program, &mut step.events)?;
         loop {
             // Native lot updates visit object IDs in ascending order. Host-created
             // check/action continuations for an actor finish before the next object.
+            action_observer.gap("Simulation::next_registry_thread");
             let next = next_thread(self)?;
             let Some(id) = next else {
                 break;
@@ -572,6 +660,7 @@ impl Simulation {
                     .map(|v| v.object())
                     .or_else(|| self.vm.threads[&id].stack.first().map(|f| f.caller));
                 self.visit = Some((id, actor));
+                action_observer.gap("Simulation::begin_person_update");
                 self.begin_person_update(id);
                 actor
             };
@@ -582,20 +671,25 @@ impl Simulation {
                 .values()
                 .any(|c| c.person_update.as_ref().is_some_and(|p| p.thread == id))
             {
+                action_observer.gap("Simulation::drive_native_person_update");
                 if !self.drive_native_person_update(program, id, &mut remaining, &mut step)? {
                     step.stop = StepStop::Budget;
                     return Ok(step);
                 }
+                action_observer.gap("Simulation::service_interactions");
                 self.service_interactions(program, &mut step.events)?;
+                action_observer.gap("Simulation::finish_registry_object");
                 self.finish_registry_object()?;
                 self.visit = None;
                 continue;
             }
             loop {
+                action_observer.gap("Simulation::drive_reach_callback");
                 if !self.drive_reach_callback(program, &mut remaining, &mut step)? {
                     step.stop = StepStop::Budget;
                     return Ok(step);
                 }
+                action_observer.gap("Simulation::drive_cancellation");
                 if !self.drive_cancellation(program, &mut remaining, &mut step)? {
                     step.stop = StepStop::Budget;
                     return Ok(step);
@@ -636,7 +730,8 @@ impl Simulation {
                         } else {
                             remaining
                         };
-                        let run = self.vm.run_slice(program, id, slice_budget)?;
+                        let run = action_observer.run_slice(&mut self.vm, program, id, slice_budget)?;
+                        action_observer.gap("Simulation::sync_script_directions");
                         self.sync_script_directions()?;
                         self.publish_budget_statistics();
                         remaining -= run.trace.len();
@@ -645,6 +740,7 @@ impl Simulation {
                             step.stop = StepStop::Budget;
                             return Ok(step);
                         }
+                        action_observer.gap("Simulation::service_interactions");
                         self.service_interactions(program, &mut step.events)?;
                         if run.stop == Stop::AwaitingAccessory {
                             if self.vm.native_accessory_host {
@@ -672,10 +768,12 @@ impl Simulation {
                         return Err(format!("required accessory asset {name:?} is not loaded"));
                     }
                     Status::AwaitingDialog(_) | Status::AwaitingUiEffect(_) => {
+                        action_observer.gap("Simulation::Status::AwaitingDialog");
                         step.stop = StepStop::Budget;
                         return Ok(step);
                     }
                     Status::AwaitingTransfer(request) => {
+                        action_observer.gap("Simulation::Status::AwaitingTransfer");
                         if self.native_lot.is_some() {
                             if !self.service_native_transfer(
                                 program,
@@ -690,35 +788,43 @@ impl Simulation {
                             continue;
                         }
                         self.service_transfer(program, id, &request, &mut step.events)?;
+                        action_observer.gap("Simulation::sync_carry");
                         self.sync_carry(program)?;
                     }
                     Status::AwaitingBurn(request) => {
+                        action_observer.gap("Simulation::Status::AwaitingBurn");
                         if !self.service_burn(program, id, request, &mut remaining, &mut step)? {
                             step.stop = StepStop::Budget;
                             return Ok(step);
                         }
                     }
                     Status::AwaitingRemoval(request) => {
-                        if !self.service_removal(
+                        action_observer.gap("Simulation::Status::AwaitingRemoval");
+                        if !self.service_removal_observed(
                             program,
                             id,
                             &request,
                             &mut remaining,
                             &mut step,
+                            observer,
                         )? {
                             step.stop = StepStop::Budget;
                             return Ok(step);
                         }
                     }
                     Status::AwaitingPlacement(request) => {
+                        action_observer.gap("Simulation::Status::AwaitingPlacement");
                         if self.native_lot.is_some() {
                             let e =
                                 lot_find_location::Execution::begin(self, program, id, &request)?;
                             self.native_lot.as_mut().unwrap().find_location = Some(e);
-                            if !self.drive_native_find_location(
+                            action_observer.gap("Simulation::drive_native_find_location_observed");
+                            if !self.drive_native_find_location_observed(
                                 program,
                                 &mut remaining,
                                 &mut step,
+                                service_observation::ContinuationMoment::Installed,
+                                observer,
                             )? {
                                 step.stop = StepStop::Budget;
                                 return Ok(step);
@@ -728,6 +834,7 @@ impl Simulation {
                         self.service_find_location(program, id, &request, &mut step.events)?;
                     }
                     Status::AwaitingImmediate(request) => {
+                        action_observer.gap("Simulation::Status::AwaitingImmediate");
                         if let Some(result) = self.begin_immediate(
                             program,
                             request.actor,
@@ -744,20 +851,24 @@ impl Simulation {
                         }
                     }
                     Status::AwaitingCreation(request) => {
-                        if !self.service_creation(
+                        action_observer.gap("Simulation::Status::AwaitingCreation");
+                        if !self.service_creation_observed(
                             program,
                             id,
                             request,
                             &mut remaining,
                             &mut step,
+                            observer,
                         )? {
                             step.stop = StepStop::Budget;
                             return Ok(step);
                         }
                     }
                     Status::AwaitingRoute(request) => {
+                        action_observer.gap("Simulation::Status::AwaitingRoute");
                         if self.native_lot.is_some() {
                             if self.native_lot.as_ref().unwrap().shoo.is_some() {
+                                action_observer.gap("Simulation::drive_native_shoo");
                                 if !self.drive_native_shoo(program, &mut remaining, &mut step)? {
                                     step.stop = StepStop::Budget;
                                     return Ok(step);
@@ -765,6 +876,7 @@ impl Simulation {
                                 continue;
                             }
                             if self.native_lot.as_ref().unwrap().completion.is_some() {
+                                action_observer.gap("Simulation::drive_native_route_completion");
                                 if !self.drive_native_route_completion(
                                     program,
                                     &mut remaining,
@@ -850,6 +962,7 @@ impl Simulation {
                             let execution =
                                 lot_route::live::Execution::begin(self, program, id, &request)?;
                             self.native_lot.as_mut().unwrap().route = Some(execution);
+                            action_observer.gap("Simulation::drive_native_route_prefix");
                             if !self.drive_native_route_prefix(
                                 program,
                                 &mut remaining,
@@ -871,9 +984,11 @@ impl Simulation {
                         }
                     }
                     Status::AwaitingSnap(request) => {
+                        action_observer.gap("Simulation::Status::AwaitingSnap");
                         if self.native_lot.is_some() {
                             let e = lot_snap::Execution::begin(self, program, id, &request)?;
                             self.native_lot.as_mut().unwrap().snap = Some(e);
+                            action_observer.gap("Simulation::drive_native_snap");
                             if !self.drive_native_snap(program, &mut remaining, &mut step)? {
                                 step.stop = StepStop::Budget;
                                 return Ok(step);
@@ -890,6 +1005,15 @@ impl Simulation {
                         }
                     }
                     Status::AwaitingAnimation(request) => {
+                        action_observer.gap("Simulation::Status::AwaitingAnimation");
+                        observer.emit(
+                            ServiceCut::AwaitingAnimation {
+                                thread: id,
+                                request: request.id,
+                                object: service_observation::ObjectLifetime::at(self, request.caller),
+                            },
+                            self,
+                        )?;
                         if self.characters.contains_key(&request.caller)
                             && self.native_command_profile(program, id, &request)?
                         {
@@ -910,6 +1034,7 @@ impl Simulation {
                         }
                         let ready =
                             self.service_animation(program, id, &request, &mut step.events)?;
+                        action_observer.gap("Simulation::sync_carry");
                         self.sync_carry(program)?;
                         if !ready {
                             if self.characters.contains_key(&request.caller) {
@@ -928,6 +1053,7 @@ impl Simulation {
                         }
                     }
                     Status::AwaitingReach(request) => {
+                        action_observer.gap("Simulation::Status::AwaitingReach");
                         if self.native_lot.is_some() {
                             match self.service_native_reach(
                                 program,
@@ -948,6 +1074,7 @@ impl Simulation {
                         }
                     }
                     Status::AwaitingTurn(request) => {
+                        action_observer.gap("Simulation::Status::AwaitingTurn");
                         if self.characters.contains_key(&request.caller) {
                             match self.service_native_turn(
                                 program,
@@ -968,6 +1095,7 @@ impl Simulation {
                         }
                     }
                     Status::Returned(value) => {
+                        action_observer.gap("Simulation::Status::Returned");
                         self.release(id);
                         if let Some(action) = self.pending_actions.remove(&id) {
                             self.event(
@@ -1003,6 +1131,7 @@ impl Simulation {
                         );
                     }
                     Status::Faulted(_) => {
+                        action_observer.gap("Simulation::Status::Faulted");
                         self.release(id);
                         step.stop = StepStop::Faulted;
                         return Ok(step);
@@ -1011,9 +1140,11 @@ impl Simulation {
             }
             if let Some(actor) = visit_actor {
                 if self.vm.object_threads.get(&actor) == Some(&id) && !self.vm.threads[&id].check {
+                    action_observer.gap("Vm::finish_object_update");
                     self.vm.finish_object_update(actor, true)?;
                 }
             }
+            action_observer.gap("Simulation::update_turn");
             self.update_turn(program, id, &mut step.events)?;
             let native_person = self
                 .vm
@@ -1021,30 +1152,49 @@ impl Simulation {
                 .iter()
                 .any(|(actor, thread)| *thread == id && self.characters.contains_key(actor));
             if native_person {
+                action_observer.gap("Simulation::drive_native_person_update");
                 if !self.drive_native_person_update(program, id, &mut remaining, &mut step)? {
                     step.stop = StepStop::Budget;
                     return Ok(step);
                 }
             } else {
+                action_observer.gap("Simulation::finish_person_update");
                 self.finish_person_update(id)?;
             }
+            action_observer.gap("Simulation::service_interactions");
             self.service_interactions(program, &mut step.events)?;
+            action_observer.gap("Simulation::finish_registry_object");
             self.finish_registry_object()?;
             self.visit = None;
         }
+        action_observer.gap("Simulation::retire_interaction_threads");
         self.retire_interaction_threads();
-        self.finish_lot_tick(program, &mut remaining, step)
+        self.finish_lot_tick(program, &mut remaining, step, observer, action_observer)
     }
     fn finish_lot_tick(
         &mut self,
         program: &Program,
         remaining: &mut usize,
         mut step: Step,
+        observer: &mut service_observation::Observer<'_>,
+        action_observer: &mut action_execution::Observer<'_>,
     ) -> Result<Step, String> {
+        action_observer.gap("Vm::pump_dialogs");
         if self.vm.pump_dialogs()?.is_some() {
             step.stop = StepStop::Dialog;
             return Ok(step);
         }
+        for (index, pending) in self.removals.iter().enumerate() {
+            observer.emit(
+                ServiceCut::QueuedCleanup {
+                    index,
+                    object: service_observation::ObjectLifetime::at(self, pending.target),
+                    suppress_reset: pending.suppress_reset,
+                },
+                self,
+            )?;
+        }
+        action_observer.gap("Simulation::flush_removals");
         if !self.flush_removals(program, remaining, &mut step)? {
             step.stop = StepStop::Budget;
             return Ok(step);

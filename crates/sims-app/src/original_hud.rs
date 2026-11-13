@@ -607,7 +607,7 @@ impl Viewer {
         menu = menu.push(at(text("Application").size(13).into(), 229., 4.));
         // These are explicit application actions, not original icon aliases.
         for (label, message, x, y) in [
-            ("Load", Message::Load, 229., 25.),
+            ("Load", Message::ChooseLoad, 229., 25.),
             ("Details", Message::Diagnostics, 315., 25.),
             ("Restart", Message::Restart, 229., 55.),
             ("Close", Message::Options, 315., 55.),
@@ -630,6 +630,7 @@ impl Viewer {
                 self.application_confirmation,
                 self.session.is_some(),
             ),
+            text(self.feedback_status()).size(12),
             menu
         ];
         container(widget::opaque(menu))
@@ -644,6 +645,7 @@ impl Viewer {
     }
     fn residents_hud(&self) -> Element<'_, Message> {
         let s = self.session.as_ref().unwrap();
+        let selection = resident_selection::selected(s);
         let mut people = row![].spacing(0);
         if self.people_panel_visible()
             && let Some(h) = &s.house.household
@@ -663,14 +665,7 @@ impl Viewer {
                             .then_some(Message::Resident(id)),
                     )
                     .style(move |_, status| {
-                        let mut style = text_button_style(&iced::Theme::Dark, status);
-                        style.border.color = if id == self.resident {
-                            CYAN
-                        } else {
-                            Color::from_rgb8(87, 108, 180)
-                        };
-                        style.border.width = 2.;
-                        style
+                        resident_selection::portrait_style(selection, id, status)
                     })
                     .into();
                 if self

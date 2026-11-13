@@ -1,6 +1,7 @@
 //! Native Remove Object selection (0x451b6a) and deferred queue (0x442d70).
 use crate::{Location, ObjectId, Program, Status, ThreadId, Vm, World, current};
 use serde::{Deserialize, Serialize};
+use crate::action_observation::{Context, Fact, Observation, QueueTransition};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Request {
     pub id: u64,
@@ -188,6 +189,19 @@ impl crate::action::Actor {
     /// The non-running-target branch of cXPerson's deletion notification,
     /// 0x45e791. Caller services returned cancellation callbacks before erasure.
     pub fn remove_object_references(&mut self, target: ObjectId) -> Result<Vec<ObjectId>, String> {
+        self.remove_object_references_with_observation(target, &Context::default(), &mut Observation::disabled())
+    }
+
+    /// A standalone Actor has no registry or actor-ID provenance.
+    pub fn remove_object_references_observed(
+        &mut self, target: ObjectId, sink: &mut dyn FnMut(Fact),
+    ) -> Result<Vec<ObjectId>, String> {
+        self.remove_object_references_with_observation(target, &Context::default(), &mut Observation::new(sink, None))
+    }
+
+    fn remove_object_references_with_observation(
+        &mut self, target: ObjectId, context: &Context, observation: &mut Observation<'_>,
+    ) -> Result<Vec<ObjectId>, String> {
         if self
             .active
             .as_ref()
@@ -199,6 +213,9 @@ impl crate::action::Actor {
         let mut callbacks = vec![];
         self.queue.pending.retain(|a| {
             let remove = a.target == target || a.icon_owner == target;
+            if remove {
+                context.emit(observation, a, QueueTransition::ReferenceRemoved { target });
+            }
             if remove && a.target != 0 {
                 callbacks.push(a.target);
             }
@@ -210,5 +227,18 @@ impl crate::action::Actor {
             a.icon_owner = 0;
         }
         Ok(callbacks)
+    }
+}
+
+impl Vm {
+    /// Identity-aware form of Actor::remove_object_references. It removes only
+    /// action references; this is not registry/actor deletion or a BHAV return.
+    pub fn remove_action_object_references_observed(
+        &mut self, actor: ObjectId, target: ObjectId, sink: &mut dyn FnMut(Fact),
+    ) -> Result<Vec<ObjectId>, String> {
+        let context = Context::capture(&self.world, actor, None);
+        self.world.actions.as_mut().ok_or("native action services unavailable")?
+            .actors.get_mut(&actor).ok_or("missing actor action state")?
+            .remove_object_references_with_observation(target, &context, &mut Observation::new(sink, None))
     }
 }

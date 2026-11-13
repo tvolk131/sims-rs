@@ -68,6 +68,7 @@ fn host(index: Arc<Index>) -> Host<UnusedPresentation> {
     Host {
         floors: BTreeMap::new(),
         startup: Memo::new(index.clone()),
+        animation_catalogs: crate::assets::AnimationCatalogs::default(),
         index,
         neighborhood_source,
         initializer_settings: SETTINGS,

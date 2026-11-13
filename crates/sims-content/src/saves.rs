@@ -120,17 +120,20 @@ pub fn definitions(
     guids: &BTreeSet<u32>,
 ) -> Result<BTreeMap<u32, DefinitionSource>> {
     let mut scan = crate::resource_scan::Scan::default();
-    definitions_read(index, neighborhood, guids, |resource| scan.read(resource))
+    definitions_read(index, neighborhood, guids, |resource, bytes| {
+        scan.read_into(resource, bytes)
+    })
 }
 
 pub(crate) fn definitions_read(
     index: &Index,
     neighborhood: &str,
     guids: &BTreeSet<u32>,
-    mut read: impl FnMut(&crate::Resource) -> Result<Vec<u8>>,
+    mut read: impl FnMut(&crate::Resource, &mut Vec<u8>) -> Result<()>,
 ) -> Result<BTreeMap<u32, DefinitionSource>> {
     let character_prefix = format!("{neighborhood}/characters/").to_ascii_lowercase();
     let mut candidates = BTreeMap::<u32, Vec<(DefinitionSource, bool)>>::new();
+    let mut bytes = Vec::new();
     for resource in &index.resources {
         if !resource.is_iff() {
             continue;
@@ -140,7 +143,7 @@ pub(crate) fn definitions_read(
         if location.contains("/characters/") && !is_local {
             continue;
         }
-        let bytes = read(resource)?;
+        read(resource, &mut bytes)?;
         let mut sha256 = None;
         for object in crate::resource_scan::matching_objects(&bytes, guids)? {
             let def = DefinitionSource {

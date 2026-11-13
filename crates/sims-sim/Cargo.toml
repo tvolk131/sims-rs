@@ -13,6 +13,7 @@ private-fixtures = []
 [dependencies]
 sims-vm.workspace = true
 sims-formats.workspace = true
+sims-kernel.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

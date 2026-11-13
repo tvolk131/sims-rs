@@ -443,6 +443,15 @@ pub(crate) fn finish_entry(
     frame: Frame,
     context: Option<ObjectId>,
 ) -> Result<(), String> {
+    finish_entry_with(t, frame, context, |_| {})
+}
+
+pub(crate) fn finish_entry_with(
+    t: &mut Thread,
+    frame: Frame,
+    context: Option<ObjectId>,
+    mut entered: impl FnMut(&Thread),
+) -> Result<(), String> {
     ensure_capacity(
         t,
         frame.storage_offset + crate::frame_words(frame.args.len(), frame.locals.len()),
@@ -457,6 +466,7 @@ pub(crate) fn finish_entry(
     }
     let offset = frame.storage_offset;
     t.stack.push(frame);
+    entered(t);
     if let Some(arena) = &mut t.retained_frame_arena {
         arena.active_contexts.insert(offset, context.unwrap());
         crate::save_frame_storage(t)?;

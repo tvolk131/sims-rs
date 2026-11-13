@@ -1,6 +1,10 @@
 //! Lot calendar advancement from Sims 1.91 0x0046d345.
 use serde::{Deserialize, Serialize};
 
+pub fn host_ticks_from_milliseconds(milliseconds: u32) -> u32 {
+    milliseconds.wrapping_mul(60) / 1000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LotClock {
     pub hour: i16,
@@ -113,5 +117,44 @@ impl LotClock {
             });
         }
         events
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_ticks_from_milliseconds;
+
+    #[test]
+    fn native_host_tick_millisecond_boundaries_preserve_integer_truncation() {
+        for (milliseconds, ticks) in [
+            (0, 0),
+            (1, 0),
+            (16, 0),
+            (17, 1),
+            (999, 59),
+            (1000, 60),
+            (1001, 60),
+            (65535, 3932),
+        ] {
+            assert_eq!(host_ticks_from_milliseconds(milliseconds), ticks);
+        }
+    }
+
+    #[test]
+    fn native_host_tick_product_wraps_before_unsigned_division() {
+        for (milliseconds, ticks) in [
+            (71582788, 4294967),
+            (71582789, 0),
+            (i32::MAX as u32, 4294967),
+            (1 << 31, 0),
+            (u32::MAX - 1, 4294967),
+            (u32::MAX, 4294967),
+        ] {
+            assert_eq!(host_ticks_from_milliseconds(milliseconds), ticks);
+        }
+        assert_ne!(
+            u64::from(host_ticks_from_milliseconds(u32::MAX)),
+            u64::from(u32::MAX) * 60 / 1000,
+        );
     }
 }

@@ -4,6 +4,7 @@ use super::super::{Session, completed_baseline, managed};
 use super::{Result, Value, fact, json, obligation};
 pub fn evaluate(session: &Session) -> Result<Value> {
     let Session {
+        loaded_input_origin,
         index,
         managed_policy,
         house,
@@ -13,6 +14,10 @@ pub fn evaluate(session: &Session) -> Result<Value> {
         options,
     } = session;
     let mut rows = vec![];
+    // Runtime input observation is nonserialized diagnostics, not native equality.
+    let _ = loaded_input_origin;
+    rows.push(json!({"field":"loaded_input_origin",
+        "kind":"nonserialized_process_local_observation_not_native_admission"}));
     let owned = index
         .resources
         .iter()
@@ -49,7 +54,7 @@ pub fn evaluate(session: &Session) -> Result<Value> {
     ] {
         obligation(field, comparison, &mut rows);
     }
-    anyhow::ensure!(rows.len() == 7, "Session field coverage inventory changed");
+    anyhow::ensure!(rows.len() == 8, "Session field coverage inventory changed");
     let differences = rows
         .iter()
         .filter(|r| r.get("matched") == Some(&Value::Bool(false)))
@@ -57,6 +62,6 @@ pub fn evaluate(session: &Session) -> Result<Value> {
     Ok(
         json!({"schema":1,"comparisons":rows,"difference_count":differences,
         "native_parity_ticks":0,"complete_native_Session_admitted":false,
-        "scope":"All7 in-memory Session fields classified. Mutable resource fallback is forbidden; source/native equality and exact independent Program/asset restore remain separate mandatory obligations."}),
+        "scope":"All8 in-memory Session fields classified. Mutable resource fallback is forbidden; source/native equality and exact independent Program/asset restore remain separate mandatory obligations."}),
     )
 }

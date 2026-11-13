@@ -105,6 +105,34 @@ impl Vm {
     /// Execute one logical caller, including synchronous calls on other VMs.
     /// Every original instruction is charged to the same diagnostic budget.
     pub fn run_slice(&mut self, p: &Program, id: ThreadId, budget: usize) -> Result<Run, String> {
+        self.run_slice_with_observation(
+            p, id, budget, &mut crate::action_observation::Observation::disabled(),
+        )
+    }
+
+    /// Observe the real logical owner, including its selected named recipients.
+    /// The borrowed sink must not panic or reenter execution. It is not stored;
+    /// this API provides no unwind isolation or continuous host coverage.
+    /// FrameBound does not recover Returned bindings on preexisting frames.
+    pub fn run_slice_with_action_observer(
+        &mut self,
+        program: &Program,
+        id: ThreadId,
+        budget: usize,
+        sink: &mut dyn FnMut(crate::action_observation::Fact),
+    ) -> Result<Run, String> {
+        self.run_slice_with_observation(
+            program, id, budget, &mut crate::action_observation::Observation::new(sink, None),
+        )
+    }
+
+    fn run_slice_with_observation(
+        &mut self,
+        p: &Program,
+        id: ThreadId,
+        budget: usize,
+        observation: &mut crate::action_observation::Observation<'_>,
+    ) -> Result<Run, String> {
         // Reject before accessory publication or selecting another named caller.
         self.reject_native_suspension_run(id)?;
         if self.scheduled_object_visit.as_ref().is_some_and(|visit| {
@@ -131,6 +159,9 @@ impl Vm {
         {
             return Err("player-menu query owns synchronous execution".into());
         }
+        observation.emit(|| crate::action_observation::Fact::Gap(
+            crate::action_observation::CoverageGap::HostAndNamedOrchestration,
+        ));
         self.resume_accessory_assets(p);
         if self.named_calls.first().is_some_and(|c| c.requester != id) {
             return Err("another VM owns synchronous named execution".into());
@@ -145,7 +176,10 @@ impl Vm {
                     c.recipient
                 }
             });
-            let run = self.run_local_slice(p, active, remaining)?;
+            let previous_thread = observation.thread.replace(active);
+            let result = self.run_local_slice_with_observation(p, active, remaining, observation);
+            observation.thread = previous_thread;
+            let run = result?;
             remaining = remaining
                 .checked_sub(run.trace.len())
                 .ok_or("named callback exceeded instruction budget")?;
@@ -285,5 +319,40 @@ impl Vm {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod action_execution_context_tests {
+    use super::*;
+    use crate::action_observation::Observation;
+
+    #[test]
+    fn actual_thread_context_is_restored_before_propagating_local_owner_error() {
+        let mut vm = Vm::new(crate::World::default(), 1);
+        let mut facts = Vec::new();
+        let mut sink = |fact| facts.push(fact);
+        let mut observation = Observation::new(&mut sink, Some(777));
+        assert_eq!(
+            vm.run_slice_with_observation(&Program::default(), 999, 1, &mut observation),
+            Err("unknown thread".into()),
+        );
+        assert_eq!(observation.thread, Some(777));
+    }
+
+    #[test]
+    fn missing_selected_named_recipient_restores_the_enclosing_context_on_error() {
+        let mut vm = Vm::new(crate::World::default(), 1);
+        vm.named_calls.push(Call {
+            requester: 1, recipient: 999, depth: 1, object: 2,
+            owner: "authored".into(), bhav: 4096, base_depth: 0, result: None,
+        });
+        let mut sink = |_| {};
+        let mut observation = Observation::new(&mut sink, Some(777));
+        assert_eq!(
+            vm.run_slice_with_observation(&Program::default(), 1, 1, &mut observation),
+            Err("unknown thread".into()),
+        );
+        assert_eq!(observation.thread, Some(777));
     }
 }

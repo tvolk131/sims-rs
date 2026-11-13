@@ -366,10 +366,7 @@ fn serials(publication: &Published) -> Vec<u64> {
     publication
         .queue
         .iter()
-        .filter_map(|entry| match &entry.cancel {
-            Intent::Cancel(serial) => Some(*serial),
-            _ => None,
-        })
+        .map(|entry| u64::from(entry.action.serial))
         .collect()
 }
 
@@ -515,7 +512,8 @@ fn observation(publication: &Published) -> Value {
             "error":menu.error,"offered":menu.popup.iter().map(|choice| &choice.label).collect::<Vec<_>>()})),
         "queue":publication.queue.iter().map(|entry| json!({"label":entry.label,
             "diagnostic_label":entry.diagnostic_label,"target":entry.target,
-            "serial":match &entry.cancel {Intent::Cancel(serial)=>Some(*serial),_=>None}})).collect::<Vec<_>>(),
+            "serial":entry.action.serial,"active":entry.action.active,
+            "cancellation_requested":entry.action.cancel_requested})).collect::<Vec<_>>(),
         "native_popup":publication.native_popup,"native_popup_epoch":publication.native_popup_epoch,
         "dialog":publication.dialog,"configuration":publication.application})
 }
@@ -1581,8 +1579,8 @@ impl Journey {
                 let entry = publication
                     .queue
                     .iter()
-                    .find(|entry| matches!(&entry.cancel, Intent::Cancel(id) if *id == serial))
-                    .unwrap();
+                    .find(|entry| u64::from(entry.action.serial) == serial && entry.action.cancel().is_some())
+                    .context("new queue action is not available for cancellation")?;
                 ensure!(
                     [entry.label.as_str(), entry.diagnostic_label.as_str()]
                         .contains(&choice.label.as_str()),
@@ -1594,7 +1592,7 @@ impl Journey {
                     Operation::Cancellation,
                     Role::PlayerPath,
                     |journey| {
-                        journey.ui(entry.cancel.message())?;
+                        journey.ui(entry.action.cancel().context("cancellation is already requested")?.message())?;
                         receipt["status"] = json!("cancellation_requested");
                         journey.play("cancel_continuation", None, Some(serial))
                     },

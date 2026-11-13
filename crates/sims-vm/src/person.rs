@@ -446,6 +446,20 @@ impl Vm {
         continuation: u32,
         supplied: Option<&[i16]>,
     ) -> Result<(), String> {
+        self.push_target_tree_args_with_observation(p, t, owner, bhav, target, continuation, supplied, &mut crate::action_observation::Observation::disabled())
+    }
+
+    pub(crate) fn push_target_tree_args_with_observation(
+        &mut self,
+        p: &Program,
+        t: &mut Thread,
+        owner: String,
+        bhav: u16,
+        target: i16,
+        continuation: u32,
+        supplied: Option<&[i16]>,
+        observation: &mut crate::action_observation::Observation<'_>,
+    ) -> Result<(), String> {
         let frame = t.stack.last().ok_or("missing target-tree frame")?.clone();
         let (source, routine) = p.resolve(&owner, bhav)?;
         let (argc, locals) = crate::dimensions(routine)?;
@@ -490,7 +504,7 @@ impl Vm {
             .filter(|i| t.frame_memory[offset + 8 + argc + i].is_none())
             .collect();
         t.stack.last_mut().unwrap().continuation = continuation;
-        crate::retained_frames::finish_entry(
+        crate::retained_frames::finish_entry_with(
             t,
             crate::Frame {
                 continuation: 0,
@@ -511,6 +525,19 @@ impl Vm {
                 storage_offset: offset,
             },
             context,
+            |entered| {
+                if person {
+                    let thread = observation.thread;
+                    observation.emit(|| crate::action_observation::Fact::ActionUseEntered {
+                        frame: crate::action_observation::FrameFingerprint::capture(
+                            &self.world, Some(p), thread, entered.stack.len(), entered.stack.last().unwrap(),
+                        ),
+                        binding: crate::action_observation::Evidence::Unavailable(
+                            crate::action_observation::Unavailable::FrameHasNoSerialBinding,
+                        ),
+                    });
+                }
+            },
         )?;
         if let Some(count) = count {
             self.world
@@ -529,6 +556,17 @@ impl Vm {
         id: crate::ThreadId,
         t: &mut Thread,
         ins: &sims_formats::behavior::Instruction,
+    ) -> Result<String, String> {
+        self.run_named_tree_with_observation(p, id, t, ins, &mut crate::action_observation::Observation::disabled())
+    }
+
+    pub(crate) fn run_named_tree_with_observation(
+        &mut self,
+        p: &Program,
+        id: crate::ThreadId,
+        t: &mut Thread,
+        ins: &sims_formats::behavior::Instruction,
+        observation: &mut crate::action_observation::Observation<'_>,
     ) -> Result<String, String> {
         let frame = t.stack.last().ok_or("missing named-tree frame")?.clone();
         let result = if frame.continuation == 3 {
@@ -575,14 +613,14 @@ impl Vm {
                     "Run Tree By Name synchronously entered {bhav} on recipient VM #{target}"
                 ));
             }
-            self.push_target_tree(p, t, owner, bhav, target, 1)?;
+            self.push_target_tree_args_with_observation(p, t, owner, bhav, target, 1, None, observation)?;
             return Ok(format!("Run Tree By Name entered {bhav} on #{target}"));
         } else {
             false
         };
         t.stack.last_mut().unwrap().continuation = 0;
         t.last_result = result;
-        crate::branch(p, t, if result { ins.on_true } else { ins.on_false })?;
+        crate::branch_observed(p, t, if result { ins.on_true } else { ins.on_false }, Some(&self.world), observation)?;
         Ok(format!("Run Tree By Name returned {result}"))
     }
 

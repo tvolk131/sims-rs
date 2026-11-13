@@ -38,6 +38,27 @@ fn loading_publication_is_owned_and_does_not_load_or_prepare() {
 }
 
 #[test]
+fn window_observation_does_not_invent_unsupported_completion_or_readiness() {
+    let args = Args::parse_from(["sims-room", "--original", "UserData/Houses/House05.iff"]);
+    let (app, task) = Viewer::new(args);
+    drop(task);
+    let observation = window_observation_value(&app);
+    assert!(observation["terminals"].is_null());
+    assert!(observation["hud_transport_ready"].is_null());
+    assert!(observation["hud_normal_ready"].is_null());
+    assert_eq!(
+        observation["observation_capabilities"],
+        serde_json::json!({
+            "action_terminals": false,
+            "route_terminals": false,
+            "transport_readiness": false
+        })
+    );
+    assert!(app.session.is_none() && app.client.is_none() && app.device.is_none());
+    assert!(capture_window_observation(&app).is_none());
+}
+
+#[test]
 fn shared_catalog_keys_keep_complete_value_equality() {
     let original = CatalogIdentity {
         revision: 3,
@@ -98,4 +119,25 @@ fn shared_catalog_keys_keep_complete_value_equality() {
         }
         assert!(shared != Arc::new(changed));
     }
+}
+
+#[test]
+fn captured_loaded_input_metadata_stays_immutable_across_later_work_and_snapshot_closure() {
+    // Authored UNRUN helper coverage: copied observation JSON stays immutable
+    // as accounting changes. This does not exercise Published::capture or draw;
+    // the separate loaded-owner Host control covers retained publications.
+    let account = window_session::loaded_input::Account::default();
+    let args = Args::parse_from(["sims-room", "--paused"]);
+    let (mut app, task) = Viewer::new(args); drop(task);
+    app.loaded_input = Some(account.register());
+    let before = window_observation_value(&app);
+    let work = app.owner_work().unwrap();
+    let during = window_observation_value(&app);
+    assert_eq!(before["loaded_input"]["unresolved_in_flight"], false);
+    assert_eq!(during["loaded_input"]["unresolved_in_flight"], true);
+    let terminal = account.terminal(); work.complete(true);
+    assert_eq!(before["loaded_input"]["unresolved_in_flight"], false);
+    assert_eq!(before["loaded_input"]["work_ordinal"], 0);
+    assert_eq!(during["loaded_input"]["work_ordinal"], 1);
+    assert_eq!(terminal["unresolved_in_flight"], true);
 }

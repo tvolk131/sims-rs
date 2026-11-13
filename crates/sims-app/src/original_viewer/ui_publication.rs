@@ -2,12 +2,17 @@
 //! Capturing reads owners only. It never polls, prepares assets, clones World,
 //! serializes a Session, or supplies an engine service result.
 use super::*;
+use super::super::support::window_session;
 use sims_render::camera_device::panels::{ButtonView, Panel};
 use sims_vm::interface::view_control::Widget;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[path = "ui_publication/view.rs"]
 pub(super) mod view;
+
+#[cfg(test)]
+#[path = "ui_publication/queue_tests.rs"]
+mod queue_tests;
 
 #[cfg(test)]
 #[path = "ui_publication/journey_ground_probe.rs"]
@@ -87,11 +92,52 @@ pub(crate) struct Menu {
 }
 #[derive(Clone)]
 pub(crate) struct QueueEntry {
-    pub cancel: Intent,
+    pub action: QueueAction,
     pub label: String,
     pub diagnostic_label: String,
     pub target: String,
     pub image: Option<widget::image::Handle>,
+}
+/// Immutable engine facts, including the resident lifetime and exact action
+/// serial/target. CANCELLED records remain visible until the engine removes
+/// them; the flag means a cancellation request, not completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueueAction {
+    pub resident: i16,
+    pub resident_lifetime: Option<u32>,
+    pub serial: u32,
+    pub target: i16,
+    pub active: bool,
+    pub cancel_requested: bool,
+}
+impl QueueAction {
+    fn capture(
+        resident: i16,
+        resident_lifetime: Option<u32>,
+        action: &sims_vm::action::Action,
+        active: bool,
+    ) -> Self {
+        Self {
+            resident,
+            resident_lifetime,
+            serial: action.id,
+            target: action.target,
+            active,
+            cancel_requested: action.flags & sims_vm::action::CANCELLED != 0,
+        }
+    }
+    pub(crate) fn cancel(&self) -> Option<Intent> {
+        (!self.cancel_requested).then_some(Intent::Cancel(self.serial.into()))
+    }
+    fn status(&self) -> &'static str {
+        if self.cancel_requested {
+            "Cancelling…"
+        } else if self.active {
+            "Active"
+        } else {
+            "Queued"
+        }
+    }
 }
 #[derive(Clone)]
 pub(crate) struct Furniture {
@@ -288,9 +334,17 @@ pub(crate) struct Published {
     pub hud_height: u32,
     pub tutorial_highlight: Option<i32>,
     pub status: String,
+    pub save_load_feedback: Option<String>,
+    pub player_shortcuts_blocked: bool,
+    pub camera_shortcuts_blocked: bool,
+    pub load_picker_blocked: bool,
+    pub load_seed: std::path::PathBuf,
     pub error: Option<String>,
     pub policy: sims_sim::lot_route::path::Policy,
     pub resident: i16,
+    /// Native selection and input eligibility at this same observation cut.
+    /// `resident` remains the separate queue/legacy bookkeeping identity.
+    pub resident_selection: resident_selection::Snapshot,
     pub residents: Vec<Resident>,
     pub money: Option<Money>,
     pub clock_fallback: Option<String>,
@@ -308,6 +362,7 @@ pub(crate) struct Published {
     /// lifetimes. It is command provenance, not a mutable engine reference.
     pub native_popup: Option<sims_runtime::original_session::live_menu::State>,
     pub native_popup_epoch: u64,
+    pub window_observation: Option<Arc<serde_json::Value>>,
     #[cfg(test)]
     pub audit: Option<serde_json::Value>,
     #[cfg(test)]
@@ -342,6 +397,7 @@ impl Published {
         let people_visible = app.people_panel_visible();
         let pending = app.presentation_pending();
         let mut out = Self {
+            window_observation: capture_window_observation(app),
             application: app.application.clone(),
             scene: app.scene.clone(),
             art: app.art.clone(),
@@ -416,7 +472,12 @@ impl Published {
                 .is_some_and(|s| s.host.presentation.tool_selection.is_some()),
             hud_height: app.hud_height(),
             tutorial_highlight: app.tutorial_highlight,
-            status: app.status.clone(),
+            status: app.feedback_status().to_owned(),
+            save_load_feedback: app.retained_feedback().map(str::to_owned),
+            player_shortcuts_blocked: app.player_shortcuts_blocked(),
+            camera_shortcuts_blocked: app.camera_shortcuts_blocked(),
+            load_picker_blocked: app.load_owner_blocked(),
+            load_seed: app.load_seed().to_path_buf(),
             error: app.error.clone(),
             policy: app
                 .session
@@ -424,6 +485,7 @@ impl Published {
                 .map(|s| s.options.routing)
                 .unwrap_or_default(),
             resident: app.resident,
+            resident_selection: resident_selection::Snapshot::capture(app),
             residents: vec![],
             money: None,
             clock_fallback: None,
@@ -552,7 +614,19 @@ impl Published {
                 .as_ref()
                 .and_then(|a| a.actors.get(&app.resident))
         {
-            for action in actor.active.iter().chain(actor.queue.pending.iter()) {
+            let resident_lifetime = s
+                .simulation
+                .vm
+                .world
+                .scheduler_storage
+                .as_ref()
+                .and_then(|storage| storage.handle(app.resident));
+            for (action, active) in actor
+                .active
+                .iter()
+                .map(|action| (action, true))
+                .chain(actor.queue.pending.iter().map(|action| (action, false)))
+            {
                 let image = s
                     .simulation
                     .vm
@@ -582,7 +656,7 @@ impl Published {
                     })
                     .unwrap_or_else(|| "Interaction".into());
                 out.queue.push(QueueEntry {
-                    cancel: Intent::Cancel(action.id.into()),
+                    action: QueueAction::capture(app.resident, resident_lifetime, action, active),
                     label: app.action_label(action),
                     diagnostic_label,
                     target: app.label(action.target),
@@ -662,6 +736,112 @@ impl Published {
         }
         out
     }
+}
+
+fn capture_window_observation(app: &Viewer) -> Option<Arc<serde_json::Value>> {
+    // A production registration exists only through this Recorder. The second
+    // condition also lets UNRUN controls supply an isolated test ledger without
+    // starting a global recorder or emitting fabricated journal records.
+    if !window_session::enabled() && app.loaded_input.is_none() {
+        return None;
+    }
+    if let Some(error) = app.error.as_deref().or(app.menu_error.as_deref()) {
+        window_session::emit("application_error", serde_json::json!({"error":error}));
+    }
+    Some(Arc::new(window_observation_value(app)))
+}
+
+fn window_observation_value(app: &Viewer) -> serde_json::Value {
+    let session = app.session.as_ref();
+    let menu = capture_menu(app).map(|menu| {
+        serde_json::json!({
+            "title": menu.title,
+            "preview": menu.preview,
+            "ready": menu.ready,
+            "visible": menu.popup_visible,
+            "choices": menu.popup.iter().map(|choice| {
+                serde_json::json!({"label":choice.label,"enabled":choice.intent.is_some()})
+            }).collect::<Vec<_>>()
+        })
+    });
+    let object_input = session
+        .and_then(|session| session.host.presentation.object_input.as_ref())
+        .map(|input| {
+            serde_json::json!({"target":input.target(),"ready":input.ready(),"actions":input.actions()})
+        });
+    let ground_input = session
+        .and_then(|session| session.host.presentation.ground_input.as_ref())
+        .map(|input| serde_json::json!({"ready":input.ready(),"actions":input.actions()}));
+    let actor = session
+        .and_then(|session| session.simulation.vm.world.actions.as_ref())
+        .and_then(|actions| actions.actors.get(&app.resident));
+    let resident_position =
+        session.and_then(|session| session.simulation.vm.world.positions.get(&app.resident));
+    let ground_destination = session.and_then(|session| {
+        session
+            .host
+            .presentation
+            .ground_input
+            .as_ref()
+            .and_then(|input| input.target())
+            .and_then(|target| session.simulation.vm.world.positions.get(&target))
+    });
+    serde_json::json!({
+        "loaded_input": app.loaded_input_capture(),
+        "tick": session.map(|session| session.simulation.vm.tick),
+        "status": app.status,
+        "save_feedback": app.save_feedback,
+        "load_feedback": app.load_feedback,
+        "application_mode": session.and_then(|session| session.host.presentation.presenter.as_ref())
+            .and_then(|presenter| presenter.camera.as_ref())
+            .map(|camera| camera.settings.application_mode),
+        "people_visible": app.people_panel_visible(),
+        "panel_state": app.device.as_ref().and_then(|device| device.panel_state()),
+        "needs_selected": app.client.as_ref().and_then(|client| client.live_panel())
+            .map(|panel| panel.selected()),
+        "walls": session.and_then(|session| session.host.presentation.presenter.as_ref())
+            .map(|presenter| serde_json::json!({
+                "all_walls":presenter.view.floor.all_walls,
+                "cutaway":presenter.view.floor.visibility.enabled
+            })),
+        "resident": app.resident,
+        "selected": app.selected,
+        "playing": app.playing,
+        "pending": app.presentation_pending(),
+        "clock_pending": session.is_some_and(Session::clock_pending),
+        "presentation_children_pending": app.presentation_children_pending(),
+        "clock": session.and_then(|session| session.host.presentation.clock.as_ref()).map(|clock| {
+            serde_json::json!({"now":clock.now,"fields":clock.fields,
+                "at_completed_update":clock.at_completed_update()})
+        }),
+        "hud_ready": app.hud_cluster.as_ref().map(|cluster| cluster.values.ready),
+        "hud_transport_ready": serde_json::Value::Null,
+        "hud_normal_ready": serde_json::Value::Null,
+        "error": app.error,
+        "menu_error": app.menu_error,
+        "modal": session.is_some_and(|session| session.simulation.vm.world.dialogs.modal.is_some()),
+        "dialog": session.and_then(|session| {
+            let dialogs = &session.simulation.vm.world.dialogs;
+            dialogs.records.iter().find(|record| Some(record.id) == dialogs.modal)
+        }).map(window_observation::dialog),
+        "dialog_answer": app.window_dialog_answer,
+        "camera": session.and_then(|session| session.retained_camera_input().ok()),
+        "scene_size": app.scene.as_ref().map(|scene| [scene.width,scene.height]),
+        "scene_id": window_session::scene_id(app.scene.as_ref()),
+        "display_size": app.display_size,
+        "actor": actor,
+        "actions": window_observation::actions(actor),
+        "work": session.map(|session| window_observation::work(&session.simulation, app.resident)),
+        "terminals": serde_json::Value::Null,
+        "observation_capabilities": {
+            "action_terminals":false,"route_terminals":false,"transport_readiness":false
+        },
+        "resident_position": resident_position,
+        "ground_destination": ground_destination,
+        "menu": menu,
+        "object_input": object_input,
+        "ground_input": ground_input
+    })
 }
 
 fn capture_menu(app: &Viewer) -> Option<Menu> {

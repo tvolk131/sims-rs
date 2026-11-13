@@ -7,12 +7,18 @@ use sims_content::saved_avatar::BindingState;
 use sims_runtime::original_session::Session;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+#[path = "original_house/ground_reuse_tests.rs"]
+mod ground_reuse_tests;
+
 pub struct OriginalHouse {
     assets: Option<Assets>,
     definitions: BTreeSet<(String, u16)>,
     bindings: BTreeMap<i16, BindingState>,
     static_textures: usize,
     resource_scope: Option<ResourceScope>,
+    decoded_sprites: crate::decoded_sprites::Documents,
+    ground_pixels: crate::grass::Cache,
 }
 ///Exact inputs of the decoded resource binding, separate from live geometry.
 ///Compared only at the original reclamation boundary, never each VM slice.
@@ -80,6 +86,8 @@ impl Default for OriginalHouse {
             bindings: BTreeMap::new(),
             static_textures: 0,
             resource_scope: None,
+            decoded_sprites: crate::decoded_sprites::Documents::default(),
+            ground_pixels: crate::grass::Cache::default(),
         }
     }
 }
@@ -294,15 +302,20 @@ impl OriginalHouse {
         let definitions = Self::live_definitions(session);
         if self.assets.is_none() || !definitions.is_subset(&self.definitions) {
             let definitions: BTreeSet<_> = self.definitions.union(&definitions).cloned().collect();
-            let mut assets = Assets::load_objects_profile(
+            let mut assets = Assets::load_objects_profile_decoded(
                 session.index(),
                 &definitions
                     .iter()
                     .map(|(s, id)| (s.as_str(), *id))
                     .collect::<Vec<_>>(),
                 Some(&BTreeSet::new()),
+                &mut self.decoded_sprites,
             )?;
-            assets.bind_original_floors(session.index(), &session.house)?;
+            assets.bind_original_floors_with_ground(
+                session.index(),
+                &session.house,
+                Some(&mut self.ground_pixels),
+            )?;
             assets.bind_original_walls(
                 session.index(),
                 &session.house,

@@ -22,6 +22,16 @@ impl Vm {
         t: &mut Thread,
         ins: &Instruction,
     ) -> Result<String, String> {
+        self.run_functional_tree_with_observation(p, t, ins, &mut crate::action_observation::Observation::disabled())
+    }
+
+    pub(crate) fn run_functional_tree_with_observation(
+        &mut self,
+        p: &Program,
+        t: &mut Thread,
+        ins: &Instruction,
+        observation: &mut crate::action_observation::Observation<'_>,
+    ) -> Result<String, String> {
         let f = t.stack.last().ok_or("missing functional tree frame")?;
         let target = f.stack_object;
         let obj = self
@@ -53,7 +63,7 @@ impl Vm {
         .map(|e| (def.source.clone(), e.action));
         if let Some((owner, bhav)) = binding {
             let actor = f.caller;
-            self.push_target_tree(p, t, owner, bhav, target, 0)?;
+            self.push_target_tree_args_with_observation(p, t, owner, bhav, target, 0, None, observation)?;
             if ins.operands[2] & 1 != 0 && self.world.objects[&actor].person.is_some() {
                 t.stack.last_mut().unwrap().action_icon = true;
                 if let Some(a) = self
@@ -73,7 +83,7 @@ impl Vm {
             Ok(format!("Run Functional Tree entered {bhav} on #{target}"))
         } else {
             t.last_result = false;
-            crate::branch(p, t, ins.on_false)?;
+            crate::branch_observed(p, t, ins.on_false, Some(&self.world), observation)?;
             Ok("Run Functional Tree unavailable".into())
         }
     }

@@ -1,6 +1,7 @@
 //! A deterministic, headless SimAntics interpreter. No wall clock, graphics, or async tasks.
 //! Unsupported engine services stop at an explicit boundary; they never report success.
 pub mod action;
+pub mod action_observation;
 pub mod animation;
 pub mod autonomy;
 pub mod autonomy_constants;
@@ -831,6 +832,17 @@ impl Vm {
         id: ThreadId,
         budget: usize,
     ) -> Result<Run, String> {
+        self.run_local_slice_with_observation(
+            program, id, budget, &mut action_observation::Observation::disabled(),
+        )
+    }
+    fn run_local_slice_with_observation(
+        &mut self,
+        program: &Program,
+        id: ThreadId,
+        budget: usize,
+        observation: &mut action_observation::Observation<'_>,
+    ) -> Result<Run, String> {
         self.reject_native_suspension_run(id)?;
         let mut t = self.threads.remove(&id).ok_or("unknown thread")?;
         let scheduled_object = t
@@ -911,7 +923,7 @@ impl Vm {
             };
             let callback_depth = t.callback.as_ref().map(|b| b.base_depth);
             let in_service = t.service.as_ref().is_some_and(|s| s.result.is_none());
-            entry.effect = match self.execute(program, id, &mut t, &ins) {
+            entry.effect = match self.execute(program, id, &mut t, &ins, observation) {
                 Ok(effect) => effect,
                 Err(e) => {
                     fault(&mut t, e.clone());
@@ -936,6 +948,9 @@ impl Vm {
                 break;
             }
         }
+        observation.emit(|| action_observation::Fact::Gap(
+            action_observation::CoverageGap::LifecycleContinuation,
+        ));
         if let Err(e) = self.continue_lifecycle(program, id, &mut t) {
             fault(&mut t, e);
         }
@@ -971,6 +986,7 @@ impl Vm {
         thread_id: ThreadId,
         t: &mut Thread,
         ins: &Instruction,
+        observation: &mut action_observation::Observation<'_>,
     ) -> Result<String, String> {
         if ins.opcode >= 256 {
             if ins.opcode & 0x8000 != 0 {
@@ -984,22 +1000,22 @@ impl Vm {
             );
         }
         if ins.opcode == 0x24 {
-            return self.dialog_primitive(program, t, ins);
+            return self.dialog_primitive_with_observation(program, t, ins, observation);
         }
         if ins.opcode == 0x22 {
-            return self.ui_effect_primitive(program, t, ins);
+            return self.ui_effect_primitive_with_observation(program, t, ins, observation);
         }
         if ins.opcode == 0x23 {
-            return self.special_effect(program, t, ins);
+            return self.special_effect_with_observation(program, t, ins, observation);
         }
         if ins.opcode == 0x0e {
-            return self.find_best_function(program, t, ins);
+            return self.find_best_function_with_observation(program, t, ins, observation);
         }
         if ins.opcode == 0x14 {
-            return self.run_functional_tree(program, t, ins);
+            return self.run_functional_tree_with_observation(program, t, ins, observation);
         }
         if ins.opcode == 0x1c {
-            return self.run_named_tree(program, thread_id, t, ins);
+            return self.run_named_tree_with_observation(program, thread_id, t, ins, observation);
         }
         if matches!(ins.opcode, 4 | 5 | 43) {
             let f = t.stack.last().ok_or("missing transfer frame")?;
@@ -1041,7 +1057,7 @@ impl Vm {
             let f = t.stack.last().ok_or("missing removal frame")?;
             let target = removal::selection(word(&ins.operands, 0), f.caller, f.stack_object)?;
             if !self.world.objects.contains_key(&target) {
-                branch(program, t, ins.on_false)?;
+                branch_observed(program, t, ins.on_false, Some(&self.world), observation)?;
                 return Ok("Remove Object missing target; branch false".into());
             }
             t.status = Status::AwaitingRemoval(removal::Request {
@@ -1090,13 +1106,16 @@ impl Vm {
             return Ok("awaiting original object factory and placement".into());
         }
         if ins.opcode == 0x1e {
-            return self.gosub_found_action(program, t, ins.on_true, ins.on_false);
+            if !observation.enabled() {
+                return self.gosub_found_action(program, t, ins.on_true, ins.on_false);
+            }
+            return self.gosub_found_action_observed(program, t, ins.on_true, ins.on_false, observation);
         }
         if ins.opcode == 3 {
-            return self.find_best_interaction(program, t, ins.on_true, ins.on_false);
+            return self.find_best_interaction_with_observation(program, t, ins.on_true, ins.on_false, observation);
         }
         if ins.opcode == 0x16 && word(&ins.operands, 0) != 0 {
-            return self.request_turn(program, t, ins);
+            return self.request_turn_with_observation(program, t, ins, observation);
         }
         let (result, effect) = match ins.opcode {
             0x0a => {
@@ -1257,9 +1276,12 @@ impl Vm {
             2 => self.expression(program, t, &ins.operands)?,
             8 => self.random_primitive(program, t, &ins.operands)?,
             11 | 12 => self.spatial_query(program, t, ins.opcode, &ins.operands)?,
-            13 => self.push_interaction(program, t, &ins.operands)?,
+            13 => self.push_interaction_observed(program, t, &ins.operands, observation)?,
             17 => {
-                return self.idle_for_input(program, t, &ins.operands, ins.on_true);
+                if !observation.enabled() {
+                    return self.idle_for_input(program, t, &ins.operands, ins.on_true);
+                }
+                return self.idle_for_input_observed(program, t, &ins.operands, ins.on_true, observation);
             }
             0x1b | 0x2d => {
                 if t.check {
@@ -1333,7 +1355,7 @@ impl Vm {
             .ok_or("primitive lost its frame")?
             .continuation = 0;
         t.last_result = result;
-        branch(program, t, if result { ins.on_true } else { ins.on_false })?;
+        branch_observed(program, t, if result { ins.on_true } else { ins.on_false }, Some(&self.world), observation)?;
         Ok(format!("{effect}; branch {result}"))
     }
     fn request_route(
@@ -1636,12 +1658,27 @@ fn call(
     ))
 }
 
-fn branch(program: &Program, t: &mut Thread, mut target: u8) -> Result<(), String> {
+fn branch(program: &Program, t: &mut Thread, target: u8) -> Result<(), String> {
+    branch_observed(program, t, target, None, &mut action_observation::Observation::disabled())
+}
+
+fn branch_observed(
+    program: &Program,
+    t: &mut Thread,
+    mut target: u8,
+    world: Option<&World>,
+    observation: &mut action_observation::Observation<'_>,
+) -> Result<(), String> {
     loop {
         match target {
             0xfd => return Err("explicit ERROR branch (0xFD)".into()),
             0xfe | 0xff => {
                 let value = target == 0xfe;
+                let original = if observation.enabled() {
+                    t.stack.last().filter(|frame| frame.action_target.is_some()).cloned()
+                } else {
+                    None
+                };
                 t.stack
                     .last_mut()
                     .ok_or("return from empty stack")?
@@ -1649,6 +1686,21 @@ fn branch(program: &Program, t: &mut Thread, mut target: u8) -> Result<(), Strin
                     .instruction = usize::from(target);
                 save_frame_storage(t)?;
                 let popped = t.stack.pop().ok_or("return from empty stack")?;
+                if let (Some(frame), Some(world)) = (original, world) {
+                    let thread = observation.thread;
+                    observation.emit(|| action_observation::Fact::Returned {
+                        frame: action_observation::FrameFingerprint::capture(
+                            world, Some(program), thread, t.stack.len() + 1, &frame,
+                        ),
+                        branch: if value { action_observation::NativeReturn::TrueFe } else {
+                            action_observation::NativeReturn::FalseFf
+                        },
+                        outermost_action_use: !t.stack.iter().any(|f| f.action_target.is_some()),
+                        binding: action_observation::Evidence::Unavailable(
+                            action_observation::Unavailable::FrameHasNoSerialBinding,
+                        ),
+                    });
+                }
                 retained_frames::remove_frame(t, popped.storage_offset);
                 if let Some(target) = popped.action_target {
                     t.completed_actions.push((

@@ -4,6 +4,7 @@
 //! rasterizer. Its private RNG never borrows a simulation random stream.
 use crate::Texture;
 use anyhow::{Context, Result, ensure};
+use sims_formats::lot::Array;
 
 const TEXELS: usize = 32;
 const LIGHT_BROWN: [u8; 3] = [157, 117, 65];
@@ -26,25 +27,93 @@ pub(crate) struct Ground {
     pub texture: usize,
     size: usize,
 }
-impl Ground {
-    pub fn bind(house: &sims_content::saves::House, texture: usize) -> Result<(Self, Texture)> {
-        let map = house
-            .arrays
-            .get(&6)
-            .context("original lot grass map absent")?;
+
+#[derive(Clone, Copy)]
+struct Input<'a> {
+    map: &'a Array,
+    size: usize,
+    width: usize,
+}
+
+impl<'a> Input<'a> {
+    fn new(dimensions: [usize; 2], map: Option<&'a Array>) -> Result<Self> {
+        let map = map.context("original lot grass map absent")?;
         ensure!(
-            map.width == house.width
-                && map.height == house.height
+            map.width == dimensions[0]
+                && map.height == dimensions[1]
                 && map.stride == 1
-                && map.data.len() == house.width * house.height
-                && house.width == house.height,
+                && map.data.len() == dimensions[0] * dimensions[1]
+                && dimensions[0] == dimensions[1],
             "invalid original grass map"
         );
-        let size = house.width;
+        let size = dimensions[0];
         let width = size
             .checked_mul(TEXELS)
             .filter(|&n| n > 0 && n <= 4096)
             .context("ground presentation texture too large")?;
+        Ok(Self { map, size, width })
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Cache {
+    entry: Option<Entry>,
+}
+
+struct Entry {
+    map: Array,
+    size: usize,
+    pixels: Texture,
+}
+
+impl Cache {
+    pub(crate) fn bind(
+        &mut self,
+        house: &sims_content::saves::House,
+        texture: usize,
+    ) -> Result<(Ground, Texture)> {
+        self.bind_input([house.width, house.height], house.arrays.get(&6), texture)
+    }
+
+    fn bind_input(
+        &mut self,
+        dimensions: [usize; 2],
+        map: Option<&Array>,
+        texture: usize,
+    ) -> Result<(Ground, Texture)> {
+        let input = Input::new(dimensions, map)?;
+        if let Some(entry) = &self.entry
+            && entry.size == input.size
+            && entry.map == *input.map
+        {
+            return Ok((
+                Ground {
+                    texture,
+                    size: input.size,
+                },
+                entry.pixels.clone(),
+            ));
+        }
+        let (ground, pixels) = Ground::from_input(input, texture)?;
+        self.entry = Some(Entry {
+            map: input.map.clone(),
+            size: input.size,
+            pixels: pixels.clone(),
+        });
+        Ok((ground, pixels))
+    }
+}
+
+impl Ground {
+    pub fn bind(house: &sims_content::saves::House, texture: usize) -> Result<(Self, Texture)> {
+        Self::from_input(
+            Input::new([house.width, house.height], house.arrays.get(&6))?,
+            texture,
+        )
+    }
+
+    fn from_input(input: Input<'_>, texture: usize) -> Result<(Self, Texture)> {
+        let Input { map, size, width } = input;
         let light: Vec<_> = (0..32)
             .map(|i| interpolate(LIGHT_BROWN, LIGHT_GREEN, i as f32 / 31.))
             .collect();
@@ -112,6 +181,10 @@ impl Ground {
         ]
     }
 }
+
+#[cfg(test)]
+#[path = "grass/cache_tests.rs"]
+mod cache_tests;
 
 #[cfg(test)]
 mod tests {

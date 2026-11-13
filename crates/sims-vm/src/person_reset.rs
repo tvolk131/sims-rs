@@ -7,6 +7,7 @@ use crate::{
     action::{Action, Callback},
 };
 use serde::{Deserialize, Serialize};
+use crate::action_observation::{ClearCause, Context, CoverageGap, Fact, Observation, QueueTransition};
 use std::collections::VecDeque;
 
 #[cfg(test)]
@@ -546,6 +547,22 @@ impl Reset {
         Ok(())
     }
     pub fn next(&mut self, vm: &mut Vm, p: &Program) -> Result<Option<Request>, String> {
+        self.next_with_observation(vm, p, &mut Observation::disabled())
+    }
+
+    /// Emits synchronous mutation facts even if a later Reset phase fails.
+    /// Host callbacks, Main restart and actual registry erasure are not covered.
+    pub fn next_observed(
+        &mut self, vm: &mut Vm, p: &Program, sink: &mut dyn FnMut(Fact),
+    ) -> Result<Option<Request>, String> {
+        let mut observation = Observation::new(sink, self.thread);
+        observation.emit(|| Fact::Gap(CoverageGap::ResetHostServices));
+        self.next_with_observation(vm, p, &mut observation)
+    }
+
+    fn next_with_observation(
+        &mut self, vm: &mut Vm, p: &Program, observation: &mut Observation<'_>,
+    ) -> Result<Option<Request>, String> {
         loop {
             let object = self.object;
             match self.phase {
@@ -699,9 +716,16 @@ impl Reset {
                         .find_map(|(i, f)| f.action_target.map(|id| (i + 1, id)));
                     if let Some((depth, target)) = latest {
                         let mut t = vm.threads.remove(&thread).unwrap();
+                        observation.thread = Some(thread);
                         let unwind: Result<(), String> = (|| {
                             while t.stack.len() >= depth {
-                                vm.pop_person_reset_frame(&mut t)?;
+                                if observation.enabled() {
+                                    vm.pop_person_reset_frame_with_observation(
+                                        &mut t, Some(p), self.notification.map(|(target, _)| target), observation,
+                                    )?;
+                                } else {
+                                    vm.pop_person_reset_frame(&mut t)?;
+                                }
                             }
                             Ok(())
                         })();
@@ -769,7 +793,9 @@ impl Reset {
                         o.data.insert(i, 0);
                     }
                     let footprint =
-                        vm.clear_person_action(object, vm.threads[&thread].last_result)?;
+                        vm.clear_person_action_with_observation(
+                            object, vm.threads[&thread].last_result, ClearCause::Reset, observation,
+                        )?;
                     self.phase = if self.notification.is_some() { 12 } else { 7 };
                     if footprint {
                         return Ok(Some(Request::Footprint(object)));
@@ -778,6 +804,7 @@ impl Reset {
                 7 => {
                     // Pop one item before invoking its callback. That callback
                     // may mutate the remaining queue; do not precollect it.
+                    let context = if observation.enabled() { Context::capture(&vm.world, object, None) } else { Context::default() };
                     let actor = vm
                         .world
                         .actions
@@ -787,6 +814,7 @@ impl Reset {
                         .get_mut(&object)
                         .unwrap();
                     if let Some(action) = actor.queue.pending.pop_front() {
+                        context.emit(observation, &action, QueueTransition::ResetRemoved);
                         if action.target != 0 {
                             return Ok(Some(Request::Cancel(Callback {
                                 object: action.target,
@@ -815,6 +843,7 @@ impl Reset {
                 }
                 13 => {
                     let target = self.notification.unwrap().0;
+                    let context = if observation.enabled() { Context::capture(&vm.world, object, None) } else { Context::default() };
                     let actor = vm
                         .world
                         .actions
@@ -824,7 +853,9 @@ impl Reset {
                         .get_mut(&object)
                         .unwrap();
                     if let Some(action) = actor.queue.pending.pop_front() {
+                        context.emit(observation, &action, QueueTransition::ReferenceScanDequeued { target });
                         if action.target == target || action.icon_owner == target {
+                            context.emit(observation, &action, QueueTransition::ReferenceRemoved { target });
                             if action.target != 0 {
                                 return Ok(Some(Request::Cancel(Callback {
                                     object: action.target,
@@ -868,9 +899,11 @@ impl Reset {
                     }
                     self.phase = 15;
                     if clear
-                        && vm.clear_person_action(
+                        && vm.clear_person_action_with_observation(
                             object,
                             vm.threads[&self.thread.unwrap()].last_result,
+                            ClearCause::ReferenceNotification { target },
+                            observation,
                         )?
                     {
                         return Ok(Some(Request::Footprint(object)));

@@ -213,6 +213,7 @@ impl Session {
         let simulation = simulation(&input.program, input.simulation)?;
         let host = live::Host::restore(&index, input.view, input.assets)?;
         let mut session = Self {
+            loaded_input_origin: None,
             index,
             managed_policy: super::managed::Policy::CompletedOwnedSchema2,
             house: input.house,

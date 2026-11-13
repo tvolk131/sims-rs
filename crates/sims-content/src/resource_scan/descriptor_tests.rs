@@ -280,7 +280,7 @@ fn appearance_scan_keeps_whole_catalog_conflicts_filtering_and_failure_order() {
     assert_eq!(appearance_query(&fixture.index, "suit"), Ok(Some(0)));
 }
 
-fn legacy_definitions(
+pub(super) fn legacy_definitions(
     index: &Index,
     neighborhood: &str,
     guids: &BTreeSet<u32>,
@@ -376,9 +376,9 @@ fn definition_query(index: &Index, neighborhood: &str, requested: &[u32]) -> ser
     .map(|value| serde_json::to_value(value).unwrap())
     .map_err(|error| format!("{error:#}"));
     let mut scan = Scan::default();
-    let actual = crate::saves::definitions_read(index, neighborhood, &guids, |resource| {
+    let actual = crate::saves::definitions_read(index, neighborhood, &guids, |resource, bytes| {
         scan_order.push(resource.locator.clone());
-        scan.read(resource)
+        scan.read_into(resource, bytes)
     })
     .map(|value| serde_json::to_value(value).unwrap())
     .map_err(|error| format!("{error:#}"));
@@ -591,10 +591,11 @@ fn definition_scan_reuses_one_archive_without_caching_payloads() {
     );
     let guids: BTreeSet<_> = (1..=64).collect();
     let mut scan = Scan::default();
-    let result = crate::saves::definitions_read(&fixture.index, "UserData", &guids, |resource| {
-        scan.read(resource)
-    })
-    .unwrap();
+    let result =
+        crate::saves::definitions_read(&fixture.index, "UserData", &guids, |resource, bytes| {
+            scan.read_into(resource, bytes)
+        })
+        .unwrap();
     assert_eq!(result.len(), 64);
     #[cfg(unix)]
     assert_eq!(scan.open_count(), 1);
@@ -602,15 +603,21 @@ fn definition_scan_reuses_one_archive_without_caching_payloads() {
     let mut bytes = fs::read(&path).unwrap();
     bytes[64 + 76 + 28..64 + 76 + 32].copy_from_slice(&1000u32.to_le_bytes());
     fs::write(&path, bytes).unwrap();
-    let updated =
-        crate::saves::definitions_read(&fixture.index, "UserData", &[1000].into(), |resource| {
-            scan.read(resource)
-        })
-        .unwrap();
+    let updated = crate::saves::definitions_read(
+        &fixture.index,
+        "UserData",
+        &[1000].into(),
+        |resource, bytes| scan.read_into(resource, bytes),
+    )
+    .unwrap();
     assert_eq!(updated[&1000].source, "objects.far::object-1.iff");
     assert!(
-        crate::saves::definitions_read(&fixture.index, "UserData", &[1].into(), |resource| scan
-            .read(resource))
+        crate::saves::definitions_read(
+            &fixture.index,
+            "UserData",
+            &[1].into(),
+            |resource, bytes| scan.read_into(resource, bytes)
+        )
         .is_err()
     );
 }

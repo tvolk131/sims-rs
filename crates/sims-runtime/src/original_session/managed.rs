@@ -206,6 +206,7 @@ fn restore_inner(index: &Index, mut saved: Saved, retained: Option<Program>) -> 
             "managed import/catalog asset changed: {source}"
         );
     }
+    let mut animation_catalogs = sims_content::assets::AnimationCatalogs::default();
     let program = if let Some(program) = retained {
         ensure!(
             completed.is_some(),
@@ -242,6 +243,7 @@ fn restore_inner(index: &Index, mut saved: Saved, retained: Option<Program>) -> 
             &saved.animations,
             saved.headline_catalog,
             &saved.normalized_object_definitions,
+            &mut animation_catalogs,
         )?
     };
     if let Some((modules, _)) = &completed {
@@ -259,8 +261,14 @@ fn restore_inner(index: &Index, mut saved: Saved, retained: Option<Program>) -> 
         .simulation
         .restore(&program)
         .map_err(anyhow::Error::msg)?;
-    let host = character_loading::live::Host::restore(&index, saved.view, saved.assets)?;
+    let host = character_loading::live::Host::restore_with_animation_catalogs(
+        &index,
+        saved.view,
+        saved.assets,
+        animation_catalogs,
+    )?;
     let mut session = Session {
+        loaded_input_origin: None,
         index,
         managed_policy: if completed.is_some() {
             Policy::CompletedOwnedSchema2
@@ -290,6 +298,7 @@ fn link(
     animations: &BTreeSet<String>,
     headlines: bool,
     normalized_definitions: &BTreeSet<String>,
+    animation_catalogs: &mut sims_content::assets::AnimationCatalogs,
 ) -> Result<Program> {
     let mut program = Program {
         globals: catalog.globals,
@@ -329,8 +338,7 @@ fn link(
         sims_content::vm::load_headline_catalog(&index, &mut program)?;
     }
     sims_content::vm::restore_string_dependencies(index, &mut program, &catalog.strings)?;
-    let loaded =
-        sims_content::assets::load_named_native_animations(&index, &mut program, animations)?;
+    let loaded = animation_catalogs.load_native(index, &mut program, animations)?;
     ensure!(
         loaded.unresolved.is_empty(),
         "managed animation assets missing: {:?}",
@@ -368,6 +376,7 @@ mod tests {
                     &saved.animations,
                     saved.headline_catalog,
                     &saved.normalized_object_definitions,
+                    &mut sims_content::assets::AnimationCatalogs::default(),
                 )?;
                 fn difference(
                     a: &serde_json::Value,

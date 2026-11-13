@@ -261,6 +261,42 @@ impl Simulation {
         remaining: &mut usize,
         step: &mut Step,
     ) -> Result<bool, String> {
+        self.drive_native_removal_observed(
+            p,
+            remaining,
+            step,
+            crate::service_observation::ContinuationMoment::Reentry,
+            &mut crate::service_observation::Observer::default(),
+        )
+    }
+    pub(crate) fn drive_native_removal_observed(
+        &mut self,
+        p: &Program,
+        remaining: &mut usize,
+        step: &mut Step,
+        moment: crate::service_observation::ContinuationMoment,
+        observer: &mut crate::service_observation::Observer<'_>,
+    ) -> Result<bool, String> {
+        if let Some(Execution {
+            origin:
+                Origin::Primitive {
+                    thread,
+                    request,
+                    target,
+                },
+            ..
+        }) = self.native_lot.as_ref().and_then(|n| n.removal.as_ref())
+        {
+            observer.emit(
+                crate::ServiceCut::PrimitiveRemoval {
+                    moment,
+                    thread: *thread,
+                    request: request.id,
+                    object: crate::service_observation::ObjectLifetime::at(self, *target),
+                },
+                self,
+            )?;
+        }
         let Some(mut e) = self.native_lot.as_mut().and_then(|n| n.removal.take()) else {
             return Ok(true);
         };

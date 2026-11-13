@@ -552,6 +552,7 @@ mod tests {
                 millis: 0,
                 paths: Default::default(),
                 progress_burst_ticks: 0,
+                camera_pointer: Default::default(),
             }
         };
         app.drain(&limits())?;

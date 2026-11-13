@@ -1,7 +1,7 @@
 use super::{Message, Viewer};
 use iced::{Event, Rectangle, mouse};
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Drag {
     origin: Option<[f64; 2]>,
     endpoint: [f64; 2],
@@ -189,7 +189,7 @@ impl Viewer {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Pointer {
     pub(super) left: Option<[f32; 2]>,
     right: bool,

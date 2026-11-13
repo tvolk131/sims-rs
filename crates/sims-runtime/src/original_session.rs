@@ -69,6 +69,7 @@ pub mod ground;
 pub mod interface;
 pub mod live_menu;
 pub mod managed;
+pub mod player_input;
 pub mod move_tool;
 pub mod neighborhood_input;
 pub mod notifications;
@@ -80,6 +81,7 @@ pub mod person_publication;
 pub mod postload;
 pub mod presenter;
 mod products;
+mod service_capture;
 pub mod property_refresh;
 pub mod publication;
 pub mod purchase_cursor;
@@ -90,6 +92,15 @@ pub mod transport;
 pub mod ui_wait;
 pub mod valuation;
 pub mod window_update;
+
+fn action_execution_gap(
+    observer: &mut Option<&mut dyn FnMut(sims_sim::SimExecutionEvent)>,
+    owner: &'static str,
+) {
+    if let Some(sink) = observer.as_deref_mut() {
+        sink(sims_sim::SimExecutionEvent::Gap { owner });
+    }
+}
 
 /// Wire-format marker, not a scheduler choice. Retains byte-identical native
 /// checkpoints while explicitly rejecting old legacy-only saved sessions.
@@ -498,6 +509,8 @@ pub enum Progress {
 }
 
 pub struct Session {
+    // Process-local read observation; deliberately absent from Saved and forks.
+    loaded_input_origin: Option<player_input::Observation>,
     index: Arc<Index>,
     managed_policy: managed::Policy,
     pub house: House,
@@ -507,11 +520,15 @@ pub struct Session {
     pub options: Options,
 }
 impl Session {
+    pub fn loaded_input_origin(&self) -> Option<&player_input::Observation> {
+        self.loaded_input_origin.as_ref()
+    }
     /// Branch an already-loaded trusted session for deterministic exploration.
     /// This is not a save loader: external bytes still require `restore` and
     /// its source/ownership validation. No opcode, callback or RNG is advanced.
     pub fn fork_for_exploration(&self) -> Result<Self> {
         Ok(Self {
+            loaded_input_origin: None,
             index: self.index.clone(),
             managed_policy: self.managed_policy,
             house: self.house.clone(),
@@ -1318,6 +1335,7 @@ impl Session {
                 .map_err(anyhow::Error::msg)?;
         }
         Ok(Self {
+            loaded_input_origin: None,
             index: Arc::new(index.clone()),
             managed_policy: managed::Policy::HistoricalSchema1,
             house,
@@ -1436,6 +1454,74 @@ impl Session {
     pub(super) fn step_for_clock(&mut self) -> Result<Progress> {
         self.step_for_clock_observed(None)
     }
+    /// Borrow facts from the ordinary registry VM owner. Uncovered Session
+    /// services declare gaps; this is not continuous nested execution coverage.
+    /// The sink must not panic or reenter. It is never saved or retained, and
+    /// preexisting frames stay unbound after a restore or exploration fork.
+    pub fn step_with_action_observer(
+        &mut self,
+        sink: &mut dyn FnMut(sims_sim::SimExecutionEvent),
+    ) -> Result<Progress> {
+        self.step_with_optional_trace_and_action_observer(None, sink)
+    }
+
+    /// Retain ordinary instruction/host-poll tracing alongside borrowed facts.
+    pub fn step_with_trace_and_action_observer(
+        &mut self,
+        trace: &mut Vec<sims_vm::Trace>,
+        sink: &mut dyn FnMut(sims_sim::SimExecutionEvent),
+    ) -> Result<Progress> {
+        self.step_with_optional_trace_and_action_observer(Some(trace), sink)
+    }
+
+    fn step_with_optional_trace_and_action_observer(
+        &mut self,
+        trace: Option<&mut Vec<sims_vm::Trace>>,
+        sink: &mut dyn FnMut(sims_sim::SimExecutionEvent),
+    ) -> Result<Progress> {
+        ensure!(
+            self.host.presentation.application_parent.is_none(),
+            "retained application parent owns the household entry"
+        );
+        ensure!(
+            !self.clock_pending(),
+            "elapsed frame owns the household update"
+        );
+        self.step_for_clock_monitored_with_actions(trace, None, None, Some(sink))
+    }
+    /// Observe actual retained simulation services through a callback-local,
+    /// immutable session view. Existing parent and clock validation still apply;
+    /// a service event alone does not certify a restorable save boundary.
+    pub fn step_with_service_observer(
+        &mut self,
+        observer: &mut dyn FnMut(sims_sim::ServiceCut, &Session) -> Result<()>,
+    ) -> Result<Progress> {
+        self.step_with_optional_trace_and_service_observer(None, observer)
+    }
+    /// Preserve the ordinary instruction and host-poll trace while observing
+    /// retained services at the same synchronous simulation cuts.
+    pub fn step_with_trace_and_service_observer(
+        &mut self,
+        trace: &mut Vec<sims_vm::Trace>,
+        observer: &mut dyn FnMut(sims_sim::ServiceCut, &Session) -> Result<()>,
+    ) -> Result<Progress> {
+        self.step_with_optional_trace_and_service_observer(Some(trace), observer)
+    }
+    fn step_with_optional_trace_and_service_observer(
+        &mut self,
+        trace: Option<&mut Vec<sims_vm::Trace>>,
+        observer: &mut dyn FnMut(sims_sim::ServiceCut, &Session) -> Result<()>,
+    ) -> Result<Progress> {
+        ensure!(
+            self.host.presentation.application_parent.is_none(),
+            "retained application parent owns the household entry"
+        );
+        ensure!(
+            !self.clock_pending(),
+            "elapsed frame owns the household update"
+        );
+        self.step_for_clock_monitored(trace, None, Some(observer))
+    }
     /// Read-only dependent-service cuts for retained-state/replay verification.
     /// The production and observed paths share budgets and service ordering.
     pub fn step_with_dependent_observer(
@@ -1451,18 +1537,28 @@ impl Session {
             !self.clock_pending(),
             "elapsed frame owns the household update"
         );
-        self.step_for_clock_monitored(Some(trace), Some(observer))
+        self.step_for_clock_monitored(Some(trace), Some(observer), None)
     }
     fn step_for_clock_observed(
         &mut self,
         trace: Option<&mut Vec<sims_vm::Trace>>,
     ) -> Result<Progress> {
-        self.step_for_clock_monitored(trace, None)
+        self.step_for_clock_monitored(trace, None, None)
     }
     fn step_for_clock_monitored(
         &mut self,
+        trace: Option<&mut Vec<sims_vm::Trace>>,
+        observer: Option<&mut dyn FnMut(&Self) -> Result<()>>,
+        service_observer: Option<&mut dyn FnMut(sims_sim::ServiceCut, &Session) -> Result<()>>,
+    ) -> Result<Progress> {
+        self.step_for_clock_monitored_with_actions(trace, observer, service_observer, None)
+    }
+    fn step_for_clock_monitored_with_actions(
+        &mut self,
         mut trace: Option<&mut Vec<sims_vm::Trace>>,
         mut observer: Option<&mut dyn FnMut(&Self) -> Result<()>>,
+        mut service_observer: Option<&mut dyn FnMut(sims_sim::ServiceCut, &Session) -> Result<()>>,
+        mut action_observer: Option<&mut dyn FnMut(sims_sim::SimExecutionEvent)>,
     ) -> Result<Progress> {
         ensure!(
             !self.person_draw_preparation_pending(),
@@ -1510,6 +1606,7 @@ impl Session {
                 .iter()
                 .find(|(_, t)| matches!(t.status, sims_vm::Status::AwaitingUiEffect(_)))
             {
+                action_execution_gap(&mut action_observer, "Session::UiEffect");
                 return Ok(Progress::UiEffect(thread));
             }
             if self.simulation.pending_removal_graphic().is_some() {
@@ -1521,6 +1618,7 @@ impl Session {
                         rotation: 0,
                     },
                 );
+                action_execution_gap(&mut action_observer, "Session::service_removal_graphic");
                 self.service_removal_graphic(camera)?;
                 continue;
             }
@@ -1535,8 +1633,10 @@ impl Session {
                         rotation: 0,
                     },
                 );
+                action_execution_gap(&mut action_observer, "Session::service_selection_assets");
                 self.service_selection_assets(camera, BUDGET)?;
                 if self.house_notification_pending() {
+                    action_execution_gap(&mut action_observer, "Session::HouseNotification");
                     return Ok(Progress::HouseNotification);
                 }
                 continue;
@@ -1552,16 +1652,45 @@ impl Session {
                 .iter()
                 .find(|(_, t)| matches!(t.status, sims_vm::Status::AwaitingDialog(_)))
             {
+                action_execution_gap(&mut action_observer, "Session::DialogConstruction");
                 return Ok(Progress::DialogConstruction(thread));
             }
             // A pending modal stays byte-for-byte unchanged. Resource hydration
             // is part of resuming play, never a repair of a faulted thread.
             if self.simulation.vm.world.dialogs.modal.is_none() {
+                action_execution_gap(&mut action_observer, "Session::prepare_headline_catalog");
                 self.prepare_headline_catalog()?;
             }
+            action_execution_gap(&mut action_observer, "Host::update_contexts");
             self.host.update_contexts(&mut self.simulation)?;
             let mut host_polls = Vec::new();
-            let result = if trace.is_some() {
+            let result = if let Some(observer) = service_observer.as_deref_mut() {
+                let polls = trace.is_some().then_some(&mut host_polls);
+                service_capture::with_view(self, observer, |program, simulation, observe| {
+                    let mut callback_error = None;
+                    let result = simulation.run_current_tick_with_host_polls_and_service_observer(
+                        program,
+                        BUDGET,
+                        polls,
+                        &mut |cut, simulation| match observe(cut, simulation) {
+                            Ok(()) => Ok(()),
+                            Err(error) => {
+                                let message = format!("{error:#}");
+                                callback_error = Some(error);
+                                Err(message)
+                            }
+                        },
+                    );
+                    match callback_error {
+                        Some(error) => Err(error),
+                        None => Ok(result),
+                    }
+                })?
+            } else if let Some(sink) = action_observer.as_deref_mut() {
+                self.simulation.run_current_tick_with_host_polls_and_action_observer(
+                    &self.program, BUDGET, trace.is_some().then_some(&mut host_polls), sink,
+                )
+            } else if trace.is_some() {
                 self.simulation.run_current_tick_with_host_polls(&self.program, BUDGET, &mut host_polls)
             } else {
                 self.simulation.run_current_tick(&self.program, BUDGET)
@@ -1583,6 +1712,7 @@ impl Session {
                 .find(|(_, t)| matches!(t.status, sims_vm::Status::AwaitingUiEffect(_)))
             {
                 result.map_err(anyhow::Error::msg)?;
+                action_execution_gap(&mut action_observer, "Session::UiEffect");
                 return Ok(Progress::UiEffect(thread));
             }
             self.host.presentation.selected = self
@@ -1597,6 +1727,7 @@ impl Session {
                 .find(|(_, t)| matches!(t.status, sims_vm::Status::AwaitingDialog(_)))
             {
                 result.map_err(anyhow::Error::msg)?;
+                action_execution_gap(&mut action_observer, "Session::DialogConstruction");
                 return Ok(Progress::DialogConstruction(thread));
             }
             if let Some((parent, _)) = self
@@ -1623,6 +1754,7 @@ impl Session {
                     .capture_raw(&self.simulation.vm.world, child)
                     .map_err(anyhow::Error::msg)?
                     .on_lot;
+                action_execution_gap(&mut action_observer, "Host::service_dependent");
                 self.host.service_dependent(
                     &mut self.simulation,
                     &self.program,
@@ -1648,17 +1780,22 @@ impl Session {
                         normal_material_mode: 0,
                     },
                 )?;
+                action_execution_gap(&mut action_observer, "Session::dependent_observer");
                 if let Some(f) = observer.as_deref_mut() {
                     f(self)?;
                 }
                 continue;
             }
+            action_execution_gap(&mut action_observer, "Host::service");
             if self.host.service(&mut self.simulation, &mut self.program)? > 0 {
                 continue;
             }
             let step = result.map_err(anyhow::Error::msg)?;
             match step.stop {
-                StepStop::Dialog => return Ok(Progress::Dialog),
+                StepStop::Dialog => {
+                    action_execution_gap(&mut action_observer, "Session::Dialog");
+                    return Ok(Progress::Dialog);
+                }
                 StepStop::Budget
                     if step.trace.len() >= BUDGET
                         || self.simulation.deletion_entry_pending()
@@ -1689,6 +1826,7 @@ impl Session {
                     anyhow::bail!("VM fault: {faults:?}");
                 }
                 _ => {
+                    action_execution_gap(&mut action_observer, "Host::present_notifications");
                     self.host.present_notifications(
                         self.simulation.vm.tick as u32,
                         &self
@@ -1698,10 +1836,12 @@ impl Session {
                             .copied()
                             .collect::<Vec<_>>(),
                     )?;
+                    action_execution_gap(&mut action_observer, "Simulation::finish_registry_pass");
                     let advanced = self
                         .simulation
                         .finish_registry_pass()
                         .map_err(anyhow::Error::msg)?;
+                    action_execution_gap(&mut action_observer, "Simulation::update_original_environment");
                     self.simulation
                         .update_original_environment(&self.program)
                         .map_err(anyhow::Error::msg)?;

@@ -19,6 +19,8 @@ use sims_sim::{
 use sims_vm::{Program, Vm};
 use std::collections::BTreeSet;
 
+pub mod saved_arrays;
+
 /// One retained asset owner spans resize/clear and the saved-object reader.
 /// Preparation validates existing storage; it must not initialize replacements.
 pub trait AssetHost {

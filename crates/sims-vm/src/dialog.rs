@@ -719,6 +719,16 @@ impl Vm {
         t: &mut Thread,
         ins: &sims_formats::behavior::Instruction,
     ) -> Result<String, String> {
+        self.dialog_primitive_with_observation(p, t, ins, &mut crate::action_observation::Observation::disabled())
+    }
+
+    pub(crate) fn dialog_primitive_with_observation(
+        &mut self,
+        p: &Program,
+        t: &mut Thread,
+        ins: &sims_formats::behavior::Instruction,
+        observation: &mut crate::action_observation::Observation<'_>,
+    ) -> Result<String, String> {
         let f = t.stack.last().ok_or("Dialog frame absent")?;
         let mode = ins.operands[5] & 127;
         if !presentation::supported(mode) {
@@ -816,7 +826,7 @@ impl Vm {
                 wake_tick: self.tick.checked_add(1).ok_or("Dialog tick overflow")?,
             };
         } else {
-            crate::branch(
+            crate::branch_observed(
                 p,
                 t,
                 if step.returned == 1 {
@@ -824,6 +834,8 @@ impl Vm {
                 } else {
                     ins.on_false
                 },
+                Some(&self.world),
+                observation,
             )?;
         }
         Ok(format!("Dialog result {}", step.returned))

@@ -399,6 +399,7 @@ fn adapt(repo: &Path, input: &Path, output: &Path) -> Result<()> {
         millis: 0,
         paths: Default::default(),
         progress_burst_ticks: 0,
+        camera_pointer: Default::default(),
     };
     ensure!(
         state(app.session()?)? == after_binding,

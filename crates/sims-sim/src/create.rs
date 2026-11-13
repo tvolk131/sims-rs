@@ -1,6 +1,7 @@
 //! Original object factories and Create Object placement. Recovered ordering
 //! is preserved across diagnostic budget slices; unsupported placement and
 //! subclass services remain explicit boundaries.
+use crate::service_observation::{CreationMoment, CreationPhase, Observer, ServiceCut};
 use crate::{Body, Simulation, Step};
 use sims_vm::{Definition, ObjectId, Program, Status, ThreadId, create::Request};
 
@@ -9,9 +10,20 @@ impl Simulation {
         &mut self,
         p: &Program,
         thread: ThreadId,
+        r: Request,
+        remaining: &mut usize,
+        step: &mut Step,
+    ) -> Result<bool, String> {
+        self.service_creation_observed(p, thread, r, remaining, step, &mut Observer::default())
+    }
+    pub(crate) fn service_creation_observed(
+        &mut self,
+        p: &Program,
+        thread: ThreadId,
         mut r: Request,
         remaining: &mut usize,
         step: &mut Step,
+        observer: &mut Observer<'_>,
     ) -> Result<bool, String> {
         if let Some(done) =
             self.service_native_person_creation(p, thread, r.clone(), remaining, step)?
@@ -19,13 +31,20 @@ impl Simulation {
             return Ok(done);
         }
         if self.native_creations.contains_key(&r.id) {
-            return self.drive_native_creation(p, r.id, remaining, step);
+            return self.drive_native_creation_observed(
+                p,
+                r.id,
+                remaining,
+                step,
+                CreationMoment::Reentry,
+                observer,
+            );
         }
         if self.native_lot.is_some()
             && matches!(r.operands[4], 0 | 2 | 3 | 4 | 5 | 7 | 8 | 9)
             && r.operands[5] & !0x3b == 0
         {
-            return self.service_native_placed_creation(p, thread, r, remaining, step);
+            return self.service_native_placed_creation(p, thread, r, remaining, step, observer);
         }
         let rotate_off_lot = self.native_lot.is_some() && r.operands[4] == 6 && r.operands[5] == 32;
         let check_off_lot = self.native_lot.is_some() && r.operands[4] == 6 && r.operands[5] == 1;
@@ -51,7 +70,8 @@ impl Simulation {
                 r.operands[4], r.operands[5]
             ));
         }
-        if r.created.is_none() {
+        let registered = r.created.is_none();
+        if registered {
             // Resource resolution precedes the placement-target lookup.
             let mut definitions = p.modules.values().flat_map(|m| {
                 m.object_definition_words
@@ -93,6 +113,7 @@ impl Simulation {
                     number,
                     remaining,
                     step,
+                    observer,
                 );
             }
             if group {
@@ -226,6 +247,20 @@ impl Simulation {
                 format!("registered #{id} off-lot; starting original Init/Main"),
             );
         }
+        observer.emit(
+            ServiceCut::creation(
+                self,
+                if registered {
+                    CreationMoment::Registered
+                } else {
+                    CreationMoment::Reentry
+                },
+                CreationPhase::Factory,
+                thread,
+                &r,
+            ),
+            self,
+        )?;
         let id = r.created.unwrap();
         if !self.drive_object_factory(p, id, remaining, step)? {
             return Ok(false);
@@ -248,7 +283,8 @@ impl Simulation {
                     });
             }
             if rotate_off_lot {
-                return self.finish_native_rotated_creation(p, thread, r, remaining, step);
+                return self
+                    .finish_native_rotated_creation(p, thread, r, remaining, step, observer);
             }
             self.vm.finish_creation(p, thread, r.id, Some(id))?;
             return Ok(true);

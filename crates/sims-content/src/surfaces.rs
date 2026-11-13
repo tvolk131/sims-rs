@@ -54,6 +54,7 @@ pub fn load_walls(index: &Index, house: &House) -> Result<BTreeMap<u16, WallMate
             );
         }
     }
+    let names = ResourceNames::new(index);
     let mut files = BTreeMap::<usize, Iff>::new();
     let mut result = BTreeMap::new();
     for id in used {
@@ -66,7 +67,7 @@ pub fn load_walls(index: &Index, house: &House) -> Result<BTreeMap<u16, WallMate
                 .clone();
             (name, local, [0, 1792, 2048])
         };
-        let source = resource(index, &name)?;
+        let source = names.resource(&name)?;
         if let std::collections::btree_map::Entry::Vacant(e) = files.entry(source) {
             e.insert(Iff::parse(index.resources[source].read()?)?);
         }
@@ -288,9 +289,14 @@ impl<'a> ResourceNames<'a> {
         Self { index, names }
     }
     pub(crate) fn resource(&self, name: &str) -> Result<usize> {
-        let candidates: Vec<_> = self.names.get(&name.len()).into_iter().flatten()
+        let candidates: Vec<_> = self
+            .names
+            .get(&name.len())
+            .into_iter()
+            .flatten()
             .filter(|(_, candidate)| candidate.eq_ignore_ascii_case(name))
-            .map(|&(id, _)| id).collect();
+            .map(|&(id, _)| id)
+            .collect();
         select_resource(self.index, name, &candidates)
     }
 }
@@ -347,6 +353,7 @@ pub fn load_floors(index: &Index, house: &House) -> Result<BTreeMap<u16, FloorMa
             );
         }
     }
+    let names = ResourceNames::new(index);
     let mut files = BTreeMap::<usize, Iff>::new();
     let mut result = BTreeMap::new();
     for id in used {
@@ -358,7 +365,7 @@ pub fn load_floors(index: &Index, house: &House) -> Result<BTreeMap<u16, FloorMa
                 .with_context(|| format!("saved floor {id} has no source mapping"))?
                 .clone()
         };
-        let source = resource(index, &name)?;
+        let source = names.resource(&name)?;
         if let std::collections::btree_map::Entry::Vacant(e) = files.entry(source) {
             e.insert(Iff::parse(index.resources[source].read()?)?);
         }

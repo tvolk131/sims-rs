@@ -170,6 +170,24 @@ impl Simulation {
         remaining: &mut usize,
         step: &mut Step,
     ) -> Result<bool, String> {
+        self.service_removal_observed(
+            p,
+            thread,
+            r,
+            remaining,
+            step,
+            &mut crate::service_observation::Observer::default(),
+        )
+    }
+    pub(crate) fn service_removal_observed(
+        &mut self,
+        p: &Program,
+        thread: ThreadId,
+        r: &Request,
+        remaining: &mut usize,
+        step: &mut Step,
+        observer: &mut crate::service_observation::Observer<'_>,
+    ) -> Result<bool, String> {
         if self.native_lot.is_some() {
             let Some(target) = crate::lot_removal::queue_target(&self.vm.world, p, r.target)?
             else {
@@ -198,7 +216,13 @@ impl Simulation {
                 &self.vm.world,
                 &self.native_lot.as_ref().unwrap().placement.links,
             )?);
-            return self.drive_native_removal(p, remaining, step);
+            return self.drive_native_removal_observed(
+                p,
+                remaining,
+                step,
+                crate::service_observation::ContinuationMoment::Installed,
+                observer,
+            );
         }
         if !sims_vm::removal::already_queued(&self.vm.world, &self.removals, r.target)? {
             self.empty_removal_callbacks(p, r.target)?;

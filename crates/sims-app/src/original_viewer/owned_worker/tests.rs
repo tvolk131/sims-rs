@@ -274,3 +274,164 @@ fn single_notification_follows_queued_completion_and_disconnect() {
         ));
     }
 }
+
+// Authored observer-hook component controls, UNRUN. These use the real generic
+// worker and a test owner; no Session/input identity or final journal is forged.
+struct AccountedFake {
+    fake: Fake,
+    registration: super::super::super::support::window_session::loaded_input::Registration,
+    fail_at: Option<i32>,
+}
+impl Owner for AccountedFake {
+    type Command = Command;
+    type Reply = i32;
+    type Published = i32;
+    fn apply(&mut self, command: Command) -> Result<i32, String> { self.fake.apply(command) }
+    fn publish(&self) -> Result<i32, String> {
+        if self.fail_at == Some(self.fake.value) { Err("authored publication failure".into()) }
+        else { self.fake.publish() }
+    }
+    fn replaces(command: &Command) -> bool { Fake::replaces(command) }
+    fn begin_observed_work(&self) -> Option<super::super::super::support::window_session::loaded_input::WorkScope> {
+        Some(self.registration.work())
+    }
+    fn observation_monitor(&self) -> Option<super::super::super::support::window_session::loaded_input::Monitor> {
+        Some(self.registration.monitor())
+    }
+}
+fn accounted(account: &super::super::super::support::window_session::loaded_input::Account, fail_at: Option<i32>) -> AccountedFake {
+    AccountedFake { fake: Fake { value: 7, fail_publication: false }, registration: account.register(), fail_at }
+}
+#[test]
+fn observed_initial_publication_failure_closes_work_as_failed() {
+    let account = super::super::super::support::window_session::loaded_input::Account::default();
+    let error = match Worker::start(accounted(&account, Some(7))) { Err(error) => error, Ok(_) => panic!("publication succeeded") };
+    assert!(error.error.contains("publication failure"));
+    let terminal = account.terminal();
+    assert_eq!(terminal["eligible"], false);
+    assert_eq!(terminal["last_operation"], "failed");
+    assert!(terminal["active_work"].as_array().unwrap().is_empty());
+}
+#[test]
+fn observed_publish_failure_retains_the_exact_old_frame_and_real_mutated_owner() {
+    let account = super::super::super::support::window_session::loaded_input::Account::default();
+    let mut worker = match Worker::start(accounted(&account, Some(8))) { Ok(worker) => worker, Err(_) => panic!("start") };
+    let old = worker.published().clone();
+    let (notify, ready) = mpsc::sync_channel(1);
+    assert!(worker.submit_notifying(Command::Add(1), Some(Box::new(move || { let _ = notify.send(()); }))).is_ok());
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    let completion = worker.poll().unwrap().unwrap();
+    assert!(completion.reply.is_err() && completion.quarantined);
+    assert!(Arc::ptr_eq(&old, worker.published()));
+    let owner = worker.recover().ok().unwrap();
+    assert_eq!(owner.fake.value, 8); assert_eq!(*old, 7);
+    assert_eq!(account.terminal()["eligible"], false);
+}
+#[test]
+fn terminal_snapshot_during_real_worker_mutation_stays_unresolved_after_the_worker_returns() {
+    let account = super::super::super::support::window_session::loaded_input::Account::default();
+    let mut worker = match Worker::start(accounted(&account, None)) { Ok(worker) => worker, Err(_) => panic!("start") };
+    let (started, entered) = mpsc::sync_channel(1); let (release, resume) = mpsc::sync_channel(1);
+    assert!(worker.submit(Command::Wait { started, resume }).is_ok());
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let snapshot = account.terminal();
+    assert_eq!(snapshot["unresolved_in_flight"], true);
+    assert_eq!(snapshot["current_owner_asserted"], false);
+    assert_eq!(snapshot["eligible"], false);
+    release.send(()).unwrap();
+    let _ = worker.recover().ok().unwrap();
+    assert_eq!(account.inspect_for_test()["active_work"], snapshot["active_work"]);
+}
+#[test]
+fn observed_panic_and_worker_serial_exhaustion_cannot_certify_retained_publication() {
+    let account = super::super::super::support::window_session::loaded_input::Account::default();
+    let mut worker = match Worker::start(accounted(&account, None)) { Ok(worker) => worker, Err(_) => panic!("start") };
+    worker.next_serial = u64::MAX;
+    assert!(matches!(worker.submit(Command::Add(1)), Err(SubmitError::Exhausted(_))));
+    let exhausted = account.inspect_for_test();
+    assert_eq!(exhausted["eligible"], false);
+    assert_eq!(exhausted["ownership_status"], "unknown_invalid");
+    assert!(exhausted["invalidation_reasons"].as_array().unwrap().iter().any(|value| value == "worker_serial_exhausted"));
+    worker.next_serial = 1; // Test the independent panic path after exhaustion.
+    assert!(worker.submit(Command::Panic).is_ok());
+    assert!(worker.recover().is_err());
+    let snapshot = account.terminal();
+    assert_eq!(snapshot["eligible"], false);
+    assert!(snapshot["invalidation_reasons"].as_array().unwrap().iter().any(|r| r == "owner_panicked"));
+}
+#[test]
+fn failed_result_delivery_is_accounted_after_real_apply_without_a_replacement_frame() {
+    let account = super::super::super::support::window_session::loaded_input::Account::default();
+    let mut worker = match Worker::start(accounted(&account, None)) { Ok(worker) => worker, Err(_) => panic!("start") };
+    let old = worker.published().clone();
+    let (started, entered) = mpsc::sync_channel(1); let (release, resume) = mpsc::sync_channel(1);
+    assert!(worker.submit(Command::Wait { started, resume }).is_ok());
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (_unused, disconnected) = mpsc::channel();
+    drop(std::mem::replace(&mut worker.completions, disconnected));
+    release.send(()).unwrap();
+    let owner = worker.recover().ok().unwrap();
+    assert_eq!(owner.fake.value, 8); assert_eq!(*old, 7);
+    let terminal = account.terminal();
+    assert!(terminal["invalidation_reasons"].as_array().unwrap().iter().any(|r| r == "result_delivery_failed"));
+    assert_eq!(terminal["eligible"], false);
+}
+
+#[test]
+fn observed_notification_barrier_keeps_prepared_guard_open_after_ui_accepts_completion() {
+    let account = super::super::super::support::window_session::loaded_input::Account::default();
+    let mut worker = match Worker::start(accounted(&account, None)) { Ok(worker) => worker, Err(_) => panic!("start") };
+    let (entered, ready) = mpsc::sync_channel(1); let (release, resume) = mpsc::sync_channel(1);
+    assert!(worker.submit_notifying(Command::Add(1), Some(Box::new(move || {
+        entered.send(()).unwrap(); resume.recv().unwrap();
+    }))).is_ok());
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    let completion = worker.poll().unwrap().unwrap();
+    assert!(completion.reply.is_ok()); assert!(!worker.busy());
+    worker.record_ui_retirement_intent();
+    let footer = account.terminal();
+    assert_eq!(footer["unresolved_in_flight"], true);
+    assert_eq!(footer["owner_preparation_complete"], true);
+    assert_eq!(footer["publication_delivery_pending"], true);
+    assert_eq!(footer["owner_mutation_pending"], false);
+    assert_eq!(footer["request_channel_closed_after_ui_retirement"], false);
+    assert_eq!(footer["ui_retirement_intent_lifetime"], 1);
+    assert_eq!(footer["worker_finalized"], false); assert_eq!(footer["quiescence_proven"], false);
+    assert_eq!(footer["eligible"], false); assert_eq!(footer["current_owner_asserted"], false);
+    release.send(()).unwrap(); let owner = worker.recover().ok().unwrap(); drop(owner);
+    assert_eq!(account.terminal(), footer);
+}
+
+#[test]
+fn real_worker_channel_closure_distinguishes_ui_retirement_from_unknown_disconnect() {
+    for known in [false, true] {
+        let account = super::super::super::support::window_session::loaded_input::Account::default();
+        let worker = match Worker::start(accounted(&account, None)) { Ok(worker) => worker, Err(_) => panic!("start") };
+        if known { worker.record_ui_retirement_intent(); }
+        let owner = worker.recover().ok().unwrap();
+        let closed = account.inspect_for_test();
+        assert_eq!(closed["request_channel_closed_after_ui_retirement"], known);
+        assert!(closed["active_work"].as_array().unwrap().is_empty());
+        assert_eq!(closed["invalidation_reasons"].as_array().unwrap().iter().any(|v| v == "request_channel_disconnected"), !known);
+        drop(owner);
+        let footer = account.terminal();
+        assert_eq!(footer["retired_lifetime"], 1);
+        assert_eq!(footer["live_lifetime"], serde_json::Value::Null);
+        assert_eq!(footer["worker_finalized"], false); assert_eq!(footer["quiescence_proven"], false);
+    }
+}
+
+#[test]
+fn notification_panic_after_send_retains_actual_owner_account_and_sticky_failure() {
+    let account = super::super::super::support::window_session::loaded_input::Account::default();
+    let mut worker = match Worker::start(accounted(&account, None)) { Ok(worker) => worker, Err(_) => panic!("start") };
+    let old = worker.published().clone();
+    assert!(worker.submit_notifying(Command::Add(1), Some(Box::new(|| panic!("authored notification panic")))).is_ok());
+    assert!(worker.recover().is_err());
+    assert_eq!(*old, 7);
+    let footer = account.terminal();
+    assert_eq!(footer["eligible"], false);
+    assert_eq!(footer["retired_lifetime"], 1);
+    assert!(footer["invalidation_reasons"].as_array().unwrap().iter().any(|v| v == "abandoned_or_panicked_work"));
+    assert_eq!(footer["worker_finalized"], false);
+}

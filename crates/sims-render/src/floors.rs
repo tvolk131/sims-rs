@@ -173,6 +173,15 @@ impl Assets {
         index: &sims_content::Index,
         house: &sims_content::saves::House,
     ) -> Result<()> {
+        self.bind_original_floors_with_ground(index, house, None)
+    }
+
+    pub(crate) fn bind_original_floors_with_ground(
+        &mut self,
+        index: &sims_content::Index,
+        house: &sims_content::saves::House,
+        ground: Option<&mut crate::grass::Cache>,
+    ) -> Result<()> {
         let materials = sims_content::surfaces::load_floors(index, house)?;
         let textures = Arc::make_mut(&mut self.textures);
         let mut bound = BTreeMap::new();
@@ -195,7 +204,10 @@ impl Assets {
         // Keep that saved phase in presentation; camera turns must not edit the
         // retained simulation geometry just to select the matching texture.
         self.saved_road_rotation = (house.view.camera_direction as u16 & 3) as u8;
-        let (ground, texture) = crate::grass::Ground::bind(house, textures.len())?;
+        let (ground, texture) = match ground {
+            Some(cache) => cache.bind(house, textures.len())?,
+            None => crate::grass::Ground::bind(house, textures.len())?,
+        };
         textures.push(texture);
         self.ground = Some(ground);
         self.original_background = Some(textures.len());

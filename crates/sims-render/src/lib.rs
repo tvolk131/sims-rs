@@ -3,6 +3,7 @@ mod camera;
 pub mod camera_device;
 pub mod censor;
 mod depth_range;
+mod decoded_sprites;
 pub mod dialog;
 mod floors;
 pub use floors::active_size as original_lot_size;
@@ -192,6 +193,19 @@ impl Assets {
         objects: &[(&str, u16)],
         requested: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<Self> {
+        Self::load_objects_profile_decoded(
+            index,
+            objects,
+            requested,
+            &mut decoded_sprites::Documents::default(),
+        )
+    }
+    fn load_objects_profile_decoded(
+        index: &Index,
+        objects: &[(&str, u16)],
+        requested: Option<&std::collections::BTreeSet<String>>,
+        decoded_documents: &mut decoded_sprites::Documents,
+    ) -> Result<Self> {
         let avatar = load_adult(index)?;
         let mut textures = vec![Texture {
             width: 1,
@@ -272,6 +286,7 @@ impl Assets {
                 .graphic
                 .checked_add(obj.value.graphics)
                 .context("object graphics overflow")?;
+            let decoded = decoded_documents.for_document(&doc.source, &doc.iff.bytes);
             for group_id in obj.value.graphic..end {
                 let Some(group) = doc.groups.iter().find(|g| g.id == group_id) else {
                     // OBJD declares a range; unused entries may have no DGRP.
@@ -298,9 +313,10 @@ impl Assets {
                                 s.id
                             );
                         }
+                        let sprite_id = u16::try_from(s.id)?;
                         let chunk =
                             doc.iff
-                                .get(b"SPR2", u16::try_from(s.id)?)
+                                .get(b"SPR2", sprite_id)
                                 .with_context(|| {
                                     format!(
                                         "missing SPR2 {} for {} DGRP {group_id}, frame {}",
@@ -308,21 +324,20 @@ impl Assets {
                                     )
                                 })?;
                         let raw = doc.iff.data(chunk);
-                        let f = SpriteSet::parse(raw)?.decode(raw, s.frame as usize, &doc.iff)?;
+                        let texture = decoded.get((sprite_id, s.frame as usize), || {
+                            Ok(SpriteSet::parse(raw)?.decode(raw, s.frame as usize, &doc.iff)?)
+                        })?;
                         // Original household objects include empty SPR2 frames.
                         // They contribute no pixels or pick geometry, and wgpu
                         // cannot allocate a zero-sized texture for them.
-                        if f.width == 0 || f.height == 0 {
+                        let Some(texture) = texture else {
                             continue;
-                        }
-                        if f.flags & 2 == 0 {
-                            bail!("object sprite needs original depth channel");
-                        }
+                        };
                         // DGRP screen offsets use the bottom of the sprite, independently of SPR2's preview origin.
                         layers.push(Sprite {
-                            id: u16::try_from(s.id)?,
+                            id: sprite_id,
                             texture: textures.len(),
-                            offset: Vec2::new(s.x as f32, s.y as f32 - f.height as f32),
+                            offset: Vec2::new(s.x as f32, s.y as f32 - texture.height as f32),
                             object: Vec3::new(
                                 s.object[0] / 16.,
                                 s.object[2] / 5.,
@@ -330,12 +345,7 @@ impl Assets {
                             ),
                             flip: s.flags & 1 != 0,
                         });
-                        textures.push(Texture {
-                            width: f.width,
-                            height: f.height,
-                            rgba: f.rgba.into(),
-                            depth: f.depth.into(),
-                        });
+                        textures.push(texture);
                     }
                     sprites.insert(
                         (doc.source.clone(), group_id, view.direction, view.zoom),
@@ -343,6 +353,7 @@ impl Assets {
                     );
                 }
             }
+            decoded_documents.retain_document(&doc.source, doc.iff.bytes);
         }
         Ok(Self {
             floor_materials: None,

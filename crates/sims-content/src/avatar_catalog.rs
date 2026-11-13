@@ -70,6 +70,21 @@ impl Directories {
             .map(|v| v.flatten())
             .map_err(anyhow::Error::msg)
     }
+    /// Distinguish an absent file in a supplied mounted map from a directory
+    /// whose provider context has never been supplied.
+    pub fn contains_directory(&self, directory: &[u8]) -> Result<bool> {
+        let key = Files::<usize>::key(directory).map_err(anyhow::Error::msg)?;
+        Ok(self.maps.contains_key(&key))
+    }
+    /// Preserve a present node whose readable resource binding is unavailable.
+    /// Outer None means absent; Some(None) means present without a source.
+    pub fn source_entry(&self, directory: &[u8], filename: &[u8]) -> Result<Option<Option<usize>>> {
+        let key = Files::<usize>::key(directory).map_err(anyhow::Error::msg)?;
+        let Some(files) = self.maps.get(&key) else {
+            return Ok(None);
+        };
+        Ok(files.get(filename).map_err(anyhow::Error::msg)?.copied())
+    }
     /// First readable resource in the original concrete-type plain-file pass.
     /// This does not supply type aliases or the later numbered/wildcard pass.
     pub fn open_plain_paths(

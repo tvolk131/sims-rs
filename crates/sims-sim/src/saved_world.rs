@@ -61,7 +61,7 @@ pub trait Host: saved_matrix::Host {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum Slot {
+pub enum Slot {
     Altitude,
     Ground,
     Grass,
@@ -73,6 +73,12 @@ enum Slot {
     Pool,
     Water,
     Temporary,
+}
+
+pub trait Storage {
+    fn active_size(&self) -> i32;
+    fn matrix_mut(&mut self, slot: Slot) -> Result<&mut Matrix, Stop>;
+    fn reset_lights(&mut self, level: u8) -> Result<(), Stop>;
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Operation {
@@ -106,7 +112,124 @@ pub struct Execution {
     copy_y: usize,
     status: Option<i32>,
 }
+
+/// Matching a model continuation is distinct from authenticating a native
+/// execution or the earlier resource reads. Keep the complete cursor snapshot,
+/// including abandoned leases and legacy copy coordinates, across this call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NamesRequest {
+    source: Box<Execution>,
+}
+
+impl NamesRequest {
+    pub(crate) fn validate(&self) -> Result<(), Stop> {
+        let source = &self.source;
+        source.validate_profile()?;
+        let canonical = Execution::new(source.version)?;
+        if source.operations != canonical.operations
+            || source.next.checked_add(1) != Some(source.operations.len())
+            || source.operations.get(source.next) != Some(&Operation::Names)
+            || source.status.is_some()
+            || source.read.is_some()
+            || source.temporary.is_some()
+        {
+            return Err(Stop::Unsupported(
+                "saved-world names request is not its clean canonical terminal operation".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn matches(&self, execution: &Execution) -> bool {
+        self.validate().is_ok() && *self.source == *execution
+    }
+
+    pub(crate) fn completed(&self, execution: &Execution) -> bool {
+        if self.validate().is_err() {
+            return false;
+        }
+        let mut expected = (*self.source).clone();
+        expected.next += 1;
+        expected.status = Some(0);
+        expected == *execution
+    }
+}
+
+pub(crate) enum Advance {
+    Pending,
+    Returned(i32),
+    Names(NamesRequest),
+}
 impl Execution {
+    /// This binds a model cursor to its selected version/schedule and active
+    /// Read. It does not authenticate earlier source reads or native history.
+    pub(crate) fn validate_profile(&self) -> Result<(), Stop> {
+        let canonical = Self::new(self.version)?;
+        if self.operations != canonical.operations || self.next > self.operations.len() {
+            return Err(Stop::Unsupported(
+                "saved-world cursor lost its selected canonical schedule".into(),
+            ));
+        }
+        if self.status == Some(0) {
+            if self.next != self.operations.len() || self.read.is_some() || self.temporary.is_some()
+            {
+                return Err(Stop::Unsupported(
+                    "saved-world successful cursor has no clean terminal return".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let operation = self.operations.get(self.next).ok_or_else(|| {
+            Stop::Unsupported("saved-world active cursor is outside its schedule".into())
+        })?;
+        if let Some(read) = &self.read {
+            match operation {
+                Operation::Read { id, converter, .. }
+                    if read.matches_request(ARRY, *id, *converter) =>
+                {
+                    ()
+                }
+                _ => {
+                    return Err(Stop::Unsupported(
+                        "saved-world active Read differs from its selected resource operation"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        if let Some(status) = self.status {
+            if !matches!(
+                operation,
+                Operation::Read {
+                    ignore_status: false,
+                    ..
+                }
+            ) || self.read.as_ref().and_then(saved_matrix::Read::status) != Some(status)
+            {
+                return Err(Stop::Unsupported(
+                    "saved-world error return lost its actual active reader".into(),
+                ));
+            }
+        }
+        if self.temporary.is_some()
+            && !matches!(
+                operation,
+                Operation::Construct(_)
+                    | Operation::Read {
+                        slot: Slot::Temporary,
+                        ..
+                    }
+                    | Operation::Copy { .. }
+                    | Operation::Destroy
+            )
+        {
+            return Err(Stop::Unsupported(
+                "saved-world temporary has no active legacy caller".into(),
+            ));
+        }
+        Ok(())
+    }
     /// Complete Collection inputs use this version range. Older procedural
     /// grass/water initialization requires additional original semantics; this
     /// explicit host-profile gate is not a native version rejection/status.
@@ -184,12 +307,41 @@ impl Execution {
     /// RNG draw, primary-room rebuild or tile-head repair happens here.
     pub fn step(
         &mut self,
-        state: &mut State,
+        state: &mut impl Storage,
         scratch: &mut Scratch,
         host: &mut impl Host,
     ) -> Result<Option<i32>, Stop> {
+        match self.advance(state, scratch, host)? {
+            Advance::Pending => Ok(None),
+            Advance::Returned(status) => Ok(Some(status)),
+            Advance::Names(request) => {
+                host.name_arrays()?;
+                self.acknowledge_names(&request)?;
+                Ok(Some(0))
+            }
+        }
+    }
+
+    pub(crate) fn acknowledge_names(&mut self, request: &NamesRequest) -> Result<(), Stop> {
+        if !request.matches(self) {
+            return Err(Stop::Unsupported(
+                "saved-world names return lost its exact caller cursor".into(),
+            ));
+        }
+        self.next += 1;
+        self.status = Some(0);
+        Ok(())
+    }
+
+    pub(crate) fn advance(
+        &mut self,
+        state: &mut impl Storage,
+        scratch: &mut Scratch,
+        host: &mut impl Host,
+    ) -> Result<Advance, Stop> {
+        self.validate_profile()?;
         if let Some(status) = self.status {
-            return Ok(Some(status));
+            return Ok(Advance::Returned(status));
         }
         let operation = *self.operations.get(self.next).ok_or_else(|| {
             Stop::Unsupported("saved-world operation cursor outside sequence".into())
@@ -219,7 +371,7 @@ impl Execution {
                 if let Some(status) = read.step(matrix, scratch, host)? {
                     if status != 0 && !ignore_status {
                         self.status = Some(status);
-                        return Ok(self.status);
+                        return Ok(Advance::Returned(status));
                     }
                     let completed = self.read.take().unwrap();
                     if completed.held_lease.is_some() {
@@ -243,7 +395,7 @@ impl Execution {
                 self.next += 1;
             }
             Operation::Copy { kind, level } => {
-                let extent = usize::try_from(state.active_size.max(0))
+                let extent = usize::try_from(state.active_size().max(0))
                     .map_err(|_| Stop::Unsupported("active extent outside host".into()))?;
                 if self.copy_y >= extent {
                     self.next += 1;
@@ -298,31 +450,35 @@ impl Execution {
                 self.next += 1;
             }
             Operation::Lights(level) => {
-                let light = &mut state.floors[usize::from(level)].lights;
-                if light.values.len() > light.capacity || light.used > light.capacity {
-                    return Err(Stop::Unsupported(
-                        "inconsistent retained light extents".into(),
-                    ));
-                }
-                if light.values.len() < light.used {
-                    return Err(Stop::Unavailable(
-                        "used light allocation prefix is not retained".into(),
-                    ));
-                }
-                saved_matrix::reset_lights(light.used, &mut light.values)?;
+                state.reset_lights(level)?;
                 self.next += 1;
             }
             Operation::Names => {
-                host.name_arrays()?;
-                self.next += 1;
-                self.status = Some(0);
+                let request = NamesRequest {
+                    source: Box::new(self.clone()),
+                };
+                request.validate()?;
+                return Ok(Advance::Names(request));
             }
         }
-        Ok(self.status)
+        Ok(self.status.map_or(Advance::Pending, Advance::Returned))
     }
 }
-impl State {
+impl Storage for State {
+    fn active_size(&self) -> i32 {
+        self.active_size
+    }
+
     fn matrix_mut(&mut self, slot: Slot) -> Result<&mut Matrix, Stop> {
+        if matches!(
+            slot,
+            Slot::Covering(level) | Slot::Wall(level) | Slot::Head(level) | Slot::Flags(level)
+                if usize::from(level) >= self.floors.len()
+        ) {
+            return Err(Stop::Unsupported(
+                "saved-world matrix floor outside profile".into(),
+            ));
+        }
         Ok(match slot {
             Slot::Altitude => &mut self.altitude,
             Slot::Ground => &mut self.ground,
@@ -340,6 +496,25 @@ impl State {
                 ));
             }
         })
+    }
+
+    fn reset_lights(&mut self, level: u8) -> Result<(), Stop> {
+        let light = &mut self
+            .floors
+            .get_mut(usize::from(level))
+            .ok_or_else(|| Stop::Unsupported("saved-world light floor outside profile".into()))?
+            .lights;
+        if light.values.len() > light.capacity || light.used > light.capacity {
+            return Err(Stop::Unsupported(
+                "inconsistent retained light extents".into(),
+            ));
+        }
+        if light.values.len() < light.used {
+            return Err(Stop::Unavailable(
+                "used light allocation prefix is not retained".into(),
+            ));
+        }
+        saved_matrix::reset_lights(light.used, &mut light.values)
     }
 }
 fn span(

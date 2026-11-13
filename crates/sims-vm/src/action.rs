@@ -2,6 +2,7 @@
 //! The eight-slot queue has observable truncation rules; it is not a sorted FIFO.
 use crate::{Object, ObjectId, Program, Thread, Vm};
 use serde::{Deserialize, Serialize};
+use crate::action_observation::{Context, CoverageGap, Fact, FrameFingerprint, Observation, QueueTransition};
 use std::collections::{BTreeMap, VecDeque};
 
 pub const CAPACITY: usize = 8;
@@ -117,8 +118,23 @@ pub struct Insertion {
 }
 impl Queue {
     /// Caller assigns a serial before this operation, even when insertion fails.
-    pub fn insert(&mut self, mut action: Action) -> Result<Insertion, String> {
+    pub fn insert(&mut self, action: Action) -> Result<Insertion, String> {
+        self.insert_with_observation(action, &Context::default(), &mut Observation::disabled())
+    }
+
+    /// Raw queues do not own an actor or registry lifetime mapping.
+    pub fn insert_observed(&mut self, action: Action, sink: &mut dyn FnMut(Fact)) -> Result<Insertion, String> {
+        self.insert_with_observation(action, &Context::default(), &mut Observation::new(sink, None))
+    }
+
+    fn insert_with_observation(
+        &mut self,
+        mut action: Action,
+        context: &Context,
+        observation: &mut Observation<'_>,
+    ) -> Result<Insertion, String> {
         if self.pending.len() > CAPACITY {
+            context.emit(observation, &action, QueueTransition::PreinsertError);
             return Err("invalid native action queue capacity".into());
         }
         let mut result = Insertion {
@@ -135,18 +151,37 @@ impl Queue {
             // the new action plus only six old records. Preserve this native edge.
             if self.pending.len() == CAPACITY {
                 result.discarded = self.pending.split_off(CAPACITY - 2).into();
+                for discarded in &result.discarded {
+                    context.emit(observation, discarded, QueueTransition::DiscardedBeforeStart);
+                }
             }
+            let incoming = observation.enabled().then(|| context.action(&action));
             self.pending.push_front(action);
+            if let Some(action) = incoming {
+                observation.emit(|| Fact::Queue { action, transition: QueueTransition::InsertionAccepted });
+            }
         } else {
             let mut keep = self.pending.len();
             while keep > 0 && self.pending[keep - 1].priority < action.priority {
                 keep -= 1;
             }
             result.cancelled = self.pending.split_off(keep).into();
+            for cancelled in &result.cancelled {
+                context.emit(observation, cancelled, QueueTransition::ReplacedBeforeStart);
+            }
+            let incoming = observation.enabled().then(|| context.action(&action));
             if self.pending.len() == CAPACITY {
                 result.accepted = false;
             } else {
                 self.pending.push_back(action);
+            }
+            if let Some(action) = incoming {
+                observation.emit(|| Fact::Queue {
+                    action,
+                    transition: if result.accepted { QueueTransition::InsertionAccepted } else {
+                        QueueTransition::InsertionRejected
+                    },
+                });
             }
         }
         Ok(result)
@@ -154,6 +189,14 @@ impl Queue {
 
     /// Native cancellation removes every matching pending serial in queue order.
     pub fn cancel(&mut self, id: u32) -> Vec<Action> {
+        self.cancel_with_observation(id, &Context::default(), &mut Observation::disabled())
+    }
+
+    pub fn cancel_observed(&mut self, id: u32, sink: &mut dyn FnMut(Fact)) -> Vec<Action> {
+        self.cancel_with_observation(id, &Context::default(), &mut Observation::new(sink, None))
+    }
+
+    fn cancel_with_observation(&mut self, id: u32, context: &Context, observation: &mut Observation<'_>) -> Vec<Action> {
         let mut removed = vec![];
         self.pending.retain(|a| {
             if a.id == id {
@@ -163,6 +206,9 @@ impl Queue {
                 true
             }
         });
+        for action in &removed {
+            context.emit(observation, action, QueueTransition::CancelledBeforeStart);
+        }
         removed
     }
 
@@ -296,6 +342,19 @@ impl Vm {
         actor: ObjectId,
         id: u32,
     ) -> Result<bool, String> {
+        self.cancel_action_with_observation(program, actor, id, &mut Observation::disabled())
+    }
+
+    pub fn cancel_action_observed(
+        &mut self, program: &Program, actor: ObjectId, id: u32, sink: &mut dyn FnMut(Fact),
+    ) -> Result<bool, String> {
+        self.cancel_action_with_observation(program, actor, id, &mut Observation::new(sink, None))
+    }
+
+    fn cancel_action_with_observation(
+        &mut self, program: &Program, actor: ObjectId, id: u32, observation: &mut Observation<'_>,
+    ) -> Result<bool, String> {
+        let context = if observation.enabled() { Context::capture(&self.world, actor, None) } else { Context::default() };
         let state = self
             .world
             .actions
@@ -306,6 +365,7 @@ impl Vm {
             .ok_or("missing actor action state")?;
         if let Some(active) = state.active.as_mut().filter(|a| a.id == id) {
             active.flags |= CANCELLED;
+            observation.emit(|| Fact::ActiveCancelRequested { action: context.action(active) });
             self.world
                 .objects
                 .get_mut(&actor)
@@ -329,12 +389,12 @@ impl Vm {
                     }
                     let mut action = self.menu_action(actor, actor, entry, 50)?;
                     action.icon_owner = 0;
-                    self.enqueue_action(program, actor, action)?;
+                    self.enqueue_action_with_observation(program, actor, action, observation)?;
                 }
             }
             Ok(true)
         } else {
-            let removed = state.queue.cancel(id);
+            let removed = state.queue.cancel_with_observation(id, &context, observation);
             let result = !removed.is_empty();
             for action in removed {
                 if action.target != 0 {
@@ -361,9 +421,17 @@ impl Vm {
         bytes: &[u8; 8],
         yes: u8,
     ) -> Result<String, String> {
+        self.idle_for_input_observed(program, t, bytes, yes, &mut Observation::disabled())
+    }
+
+    pub(crate) fn idle_for_input_observed(
+        &mut self, program: &Program, t: &mut Thread, bytes: &[u8; 8], yes: u8, observation: &mut Observation<'_>,
+    ) -> Result<String, String> {
         if t.dispatch.is_some() && t.callback.is_none() {
             let mut dispatch = t.dispatch.take().unwrap();
-            let result = t
+            let context = if observation.enabled() { Context::capture(&self.world, dispatch.actor, Some(&dispatch.action)) } else { Context::default() };
+            let prepared: Result<bool, String> = (|| {
+                let result = t
                 .callback_result
                 .take()
                 .ok_or("dispatch check has not returned")?;
@@ -372,10 +440,19 @@ impl Vm {
                 .get_mut(&dispatch.actor)
                 .ok_or("missing check actor")?
                 .temps = dispatch.saved_temps;
+                Ok(result)
+            })();
+            let result = match prepared {
+                Ok(result) => result,
+                Err(error) => {
+                    observation.emit(|| Fact::DispatchFailed { action: context.action(&dispatch.action), frame_entered: crate::action_observation::Evidence::Known(false) });
+                    return Err(error);
+                }
+            };
             if result {
                 dispatch.action.flags |= AVAILABLE;
             }
-            return self.finish_dispatch(program, t, dispatch);
+            return self.finish_dispatch(program, t, dispatch, observation);
         }
         let f = t.stack.last().ok_or("missing idle frame")?;
         let actor = f.caller;
@@ -420,7 +497,7 @@ impl Vm {
             IdleDecision::Complete => {
                 t.stack.last_mut().unwrap().continuation = 0;
                 t.last_result = true;
-                crate::branch(program, t, yes)?;
+                crate::branch_observed(program, t, yes, Some(&self.world), observation)?;
                 Ok("Idle For Input completed".into())
             }
             IdleDecision::Yield => self.yield_action(t),
@@ -428,6 +505,7 @@ impl Vm {
                 if t.check {
                     return Err("dispatch inside synchronous check is unsupported".into());
                 }
+                let context = if observation.enabled() { Context::capture(&self.world, actor, None) } else { Context::default() };
                 let mut action = self
                     .world
                     .actions
@@ -440,9 +518,12 @@ impl Vm {
                     .pending
                     .pop_front()
                     .unwrap();
+                context.emit(observation, &action, QueueTransition::Dequeued);
                 if action.target == 0 {
+                    context.emit(observation, &action, QueueTransition::PrestartRejected);
                     return self.yield_action(t);
                 }
+                let prepared: Result<_, String> = (|| {
                 let entry = self
                     .action_menu(program, action.target)?
                     .iter()
@@ -457,6 +538,15 @@ impl Vm {
                     .clone();
                 action.flags = (action.flags & !AVAILABLE) | CHECKED;
                 let allowed = self.action_eligibility_gate(actor, action.target, entry.flags)?;
+                Ok((entry, owner, allowed))
+                })();
+                let (entry, owner, allowed) = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        observation.emit(|| Fact::DispatchFailed { action: context.action(&action), frame_entered: crate::action_observation::Evidence::Known(false) });
+                        return Err(error);
+                    }
+                };
                 let mut dispatch = Dispatch {
                     actor,
                     action,
@@ -466,13 +556,13 @@ impl Vm {
                     saved_temps: self.world.objects[&actor].temps,
                 };
                 if !allowed {
-                    return self.finish_dispatch(program, t, dispatch);
+                    return self.finish_dispatch(program, t, dispatch, observation);
                 }
                 if entry.check == 0 {
                     dispatch.action.flags |= AVAILABLE;
-                    return self.finish_dispatch(program, t, dispatch);
+                    return self.finish_dispatch(program, t, dispatch, observation);
                 }
-                if !self.try_push_callback_start(
+                let callback = self.try_push_callback_start(
                     program,
                     t,
                     crate::Start {
@@ -484,8 +574,16 @@ impl Vm {
                         args: eligibility_arguments(false, 0, 0, entry.check),
                         check: true,
                     },
-                )? {
-                    return self.finish_dispatch(program, t, dispatch);
+                );
+                let callback = match callback {
+                    Ok(callback) => callback,
+                    Err(error) => {
+                        observation.emit(|| Fact::DispatchFailed { action: context.action(&dispatch.action), frame_entered: crate::action_observation::Evidence::Known(false) });
+                        return Err(error);
+                    }
+                };
+                if !callback {
+                    return self.finish_dispatch(program, t, dispatch, observation);
                 }
                 t.dispatch = Some(dispatch);
                 Ok("Idle For Input entered original eligibility callback".into())
@@ -597,6 +695,12 @@ impl Vm {
         yes: u8,
         no: u8,
     ) -> Result<String, String> {
+        self.gosub_found_action_observed(program, t, yes, no, &mut Observation::disabled())
+    }
+
+    pub(crate) fn gosub_found_action_observed(
+        &mut self, program: &Program, t: &mut Thread, yes: u8, no: u8, observation: &mut Observation<'_>,
+    ) -> Result<String, String> {
         let frame = t.stack.last().ok_or("missing found-action frame")?;
         let actor = frame.caller;
         let target = frame.stack_object;
@@ -625,7 +729,7 @@ impl Vm {
         };
         let Some(entry) = entry else {
             t.last_result = false;
-            crate::branch(program, t, no)?;
+            crate::branch_observed(program, t, no, Some(&self.world), observation)?;
             return Ok("Gosub Found Action target/table unavailable".into());
         };
         if t.check {
@@ -652,6 +756,7 @@ impl Vm {
                 parent_depth: t.stack.len(),
                 saved_temps: self.world.objects[&actor].temps,
             },
+            observation,
         )
     }
 
@@ -660,9 +765,14 @@ impl Vm {
         program: &Program,
         t: &mut Thread,
         mut dispatch: Dispatch,
+        observation: &mut Observation<'_>,
     ) -> Result<String, String> {
         let actor = dispatch.actor;
         let target = dispatch.action.target;
+        let identities = if observation.enabled() { Context::capture(&self.world, actor, Some(&dispatch.action)) } else { Context::default() };
+        let mut attempted = observation.enabled().then(|| identities.action(&dispatch.action));
+        let mut entered = crate::action_observation::Evidence::Known(false);
+        let result = (|| {
         let found = crate::current(program, t)?.opcode == 30;
         if !found {
             if *self.world.objects[&actor].data.get(&50).unwrap_or(&0) != 0 {
@@ -670,6 +780,9 @@ impl Vm {
             } else {
                 dispatch.action.flags &= !16;
             }
+        }
+        if observation.enabled() {
+            attempted = Some(identities.action(&dispatch.action));
         }
         if (!found && dispatch.action.flags & AVAILABLE == 0) || dispatch.action.routine == 0 {
             self.world
@@ -682,6 +795,7 @@ impl Vm {
                     function: 4,
                     stack_object: actor,
                 });
+            identities.emit(observation, &dispatch.action, QueueTransition::PrestartRejected);
             return self.yield_action(t);
         }
         let (source, routine) = program.resolve(&dispatch.owner, dispatch.action.routine)?;
@@ -730,7 +844,8 @@ impl Vm {
             t.stack.last_mut().unwrap().args[index] = 0;
             t.stack.last_mut().unwrap().continuation = 1;
         }
-        crate::retained_frames::finish_entry(
+        let mut fingerprint = None;
+        crate::retained_frames::finish_entry_with(
             t,
             crate::Frame {
                 continuation: 0,
@@ -751,6 +866,19 @@ impl Vm {
                 storage_offset: offset,
             },
             context,
+            |entered_thread| {
+                entered = crate::action_observation::Evidence::Known(true);
+                if observation.enabled() {
+                    let frame = FrameFingerprint::capture(
+                        &self.world, Some(program), observation.thread, entered_thread.stack.len(), entered_thread.stack.last().unwrap(),
+                    );
+                    observation.emit(|| Fact::FrameEntered {
+                        frame: frame.clone(), candidate: identities.action(&dispatch.action),
+                        serial_assignment_pending: dispatch.action.id == 0,
+                    });
+                    fingerprint = Some(frame);
+                }
+            },
         )?;
         self.world
             .objects
@@ -766,6 +894,10 @@ impl Vm {
         if dispatch.action.id == 0 {
             actions.serial = actions.serial.wrapping_add(1);
             dispatch.action.id = actions.serial;
+            identities.emit(observation, &dispatch.action, QueueTransition::SerialAssigned);
+        }
+        if observation.enabled() {
+            attempted = Some(identities.action(&dispatch.action));
         }
         let state = actions
             .actors
@@ -773,12 +905,21 @@ impl Vm {
             .ok_or("missing actor action state")?;
         // 45e6cd only replaces history when the old active target is present.
         // Completion may already have moved that record into previous.
+        let mut displaced = None;
         if let Some(mut previous) = state.active.take() {
+            displaced = observation.enabled().then(|| identities.action(&previous));
             previous.flags = (previous.flags & !32) | u32::from(t.last_result) * 32;
             state.previous = Some(previous);
         }
         let priority = dispatch.action.priority as i16;
         state.active = Some(dispatch.action);
+        if let Some(frame) = fingerprint {
+            let action = identities.action(state.active.as_ref().unwrap());
+            if let Some(previous) = displaced {
+                observation.emit(|| Fact::ActiveDisplaced { previous, installed: action.clone() });
+            }
+            observation.emit(|| Fact::FrameBound { frame, action });
+        }
         state.empty_action_icon = 0;
         let object = self.world.objects.get_mut(&actor).unwrap();
         // Native 0x45e6cd clears all continuous motive changes when installing
@@ -798,9 +939,23 @@ impl Vm {
             "Idle For Input dispatched native action frame"
         }
         .into())
+        })();
+        if result.is_err() && let Some(action) = attempted {
+            observation.emit(|| Fact::DispatchFailed { action, frame_entered: entered });
+        }
+        result
     }
 
     pub(crate) fn finish_action_frames(&mut self, t: &mut Thread) -> Result<(), String> {
+        self.finish_action_frames_with_observation(t, None, &mut Observation::disabled())
+    }
+
+    fn finish_action_frames_with_observation(
+        &mut self,
+        t: &mut Thread,
+        cause: Option<crate::action_observation::ClearCause>,
+        observation: &mut Observation<'_>,
+    ) -> Result<(), String> {
         if t.completed_actions.is_empty() {
             return Ok(());
         }
@@ -844,7 +999,11 @@ impl Vm {
             *count = count.wrapping_sub(1);
         }
         if !t.stack.iter().any(|f| f.action_target.is_some()) {
-            self.clear_person_action(actor, last_result)?;
+            if let Some(cause) = cause {
+                self.clear_person_action_with_observation(actor, last_result, cause, observation)?;
+            } else {
+                self.clear_person_action(actor, last_result)?;
+            }
         }
         Ok(())
     }
@@ -853,8 +1012,28 @@ impl Vm {
     /// frame without executing its return branch or changing interpreter
     /// last_result. The frame arena, including the suspended PC, survives.
     pub(crate) fn pop_person_reset_frame(&mut self, t: &mut Thread) -> Result<(), String> {
+        self.pop_person_reset_frame_with_observation(t, None, None, &mut Observation::disabled())
+    }
+
+    pub(crate) fn pop_person_reset_frame_with_observation(
+        &mut self,
+        t: &mut Thread,
+        program: Option<&Program>,
+        notification_target: Option<ObjectId>,
+        observation: &mut Observation<'_>,
+    ) -> Result<(), String> {
         crate::save_frame_storage(t)?;
         let frame = t.stack.pop().ok_or("person Reset popped an empty stack")?;
+        if frame.action_target.is_some() {
+            let thread = observation.thread;
+            observation.emit(|| Fact::ResetUnwound {
+                frame: FrameFingerprint::capture(&self.world, program, thread, t.stack.len() + 1, &frame),
+                notification_target,
+                binding: crate::action_observation::Evidence::Unavailable(
+                    crate::action_observation::Unavailable::FrameHasNoSerialBinding,
+                ),
+            });
+        }
         crate::retained_frames::remove_frame(t, frame.storage_offset);
         if let Some(target) = frame.action_target {
             t.completed_actions.push((
@@ -865,7 +1044,7 @@ impl Vm {
                 t.stack.len() + 1,
             ));
         }
-        self.finish_action_frames(t)
+        self.finish_action_frames_with_observation(t, Some(crate::action_observation::ClearCause::Reset), observation)
     }
 
     /// Empty-action branch of 0x45e6cd. An absent active record preserves
@@ -876,6 +1055,17 @@ impl Vm {
         actor: ObjectId,
         last_result: bool,
     ) -> Result<bool, String> {
+        self.clear_person_action_with_observation(actor, last_result, crate::action_observation::ClearCause::Reset, &mut Observation::disabled())
+    }
+
+    pub(crate) fn clear_person_action_with_observation(
+        &mut self,
+        actor: ObjectId,
+        last_result: bool,
+        cause: crate::action_observation::ClearCause,
+        observation: &mut Observation<'_>,
+    ) -> Result<bool, String> {
+        let identities = if observation.enabled() { Context::capture(&self.world, actor, None) } else { Context::default() };
         let state = self
             .world
             .actions
@@ -885,6 +1075,7 @@ impl Vm {
             .get_mut(&actor)
             .ok_or("missing actor action state")?;
         if let Some(mut previous) = state.active.take() {
+            observation.emit(|| Fact::ActiveCleared { action: identities.action(&previous), cause });
             previous.flags = (previous.flags & !32) | u32::from(last_result) * 32;
             state.previous = Some(previous);
         }
@@ -898,6 +1089,7 @@ impl Vm {
         }
         Ok(footprint)
     }
+
     pub fn action_menu<'a>(
         &self,
         program: &'a Program,
@@ -988,8 +1180,22 @@ impl Vm {
         &mut self,
         program: &Program,
         actor: ObjectId,
-        mut action: Action,
+        action: Action,
     ) -> Result<(u32, bool), String> {
+        self.enqueue_action_with_observation(program, actor, action, &mut Observation::disabled())
+    }
+
+    pub fn enqueue_action_observed(
+        &mut self, program: &Program, actor: ObjectId, action: Action, sink: &mut dyn FnMut(Fact),
+    ) -> Result<(u32, bool), String> {
+        self.enqueue_action_with_observation(program, actor, action, &mut Observation::new(sink, None))
+    }
+
+    fn enqueue_action_with_observation(
+        &mut self, program: &Program, actor: ObjectId, mut action: Action, observation: &mut Observation<'_>,
+    ) -> Result<(u32, bool), String> {
+        let context = if observation.enabled() { Context::capture(&self.world, actor, Some(&action)) } else { Context::default() };
+        let result = (|| {
         let state = self
             .world
             .actions
@@ -997,6 +1203,7 @@ impl Vm {
             .ok_or("native action services unavailable")?;
         state.serial = state.serial.wrapping_add(1);
         action.id = state.serial;
+        context.emit(observation, &action, QueueTransition::SerialAssigned);
         // Front pushes inherit the active record, even during an immediate
         // callback. Ordinary pushes inherit only a matching immediate owner.
         if action.flags & 64 != 0 {
@@ -1049,7 +1256,7 @@ impl Vm {
             .get_mut(&actor)
             .ok_or("missing actor action state")?
             .queue;
-        let result = queue.insert(action)?;
+        let result = queue.insert_with_observation(action, &context, observation)?;
         for cancelled in result.cancelled {
             if cancelled.target != 0 {
                 state.callbacks.push_back(Callback {
@@ -1060,6 +1267,11 @@ impl Vm {
             }
         }
         Ok((state.serial, result.accepted))
+        })();
+        if result.is_err() {
+            observation.emit(|| Fact::EnqueueFailed { actor: context.actor() });
+        }
+        result
     }
 
     pub(crate) fn push_interaction(
@@ -1067,6 +1279,12 @@ impl Vm {
         program: &Program,
         t: &mut Thread,
         bytes: &[u8; 8],
+    ) -> Result<(bool, String), String> {
+        self.push_interaction_observed(program, t, bytes, &mut Observation::disabled())
+    }
+
+    pub(crate) fn push_interaction_observed(
+        &mut self, program: &Program, t: &mut Thread, bytes: &[u8; 8], observation: &mut Observation<'_>,
     ) -> Result<(bool, String), String> {
         let f = t.stack.last().ok_or("missing Push Interaction frame")?;
         let index = usize::from(bytes[1]);
@@ -1159,6 +1377,7 @@ impl Vm {
         action.flags |=
             u32::from(bytes[3] & 8 != 0) * 64 | u32::from(bytes[3] & 4 != 0) * PUSH_FRONT;
         if immediate {
+            observation.emit(|| Fact::Gap(CoverageGap::ImmediateTransaction));
             t.status = crate::Status::AwaitingImmediate(crate::immediate::Request {
                 id: self.next_request,
                 origin: t.stack.last().unwrap().location.clone(),
@@ -1171,7 +1390,7 @@ impl Vm {
                 .ok_or("request ID overflow")?;
             return Ok((false, "awaiting original immediate TTAB action".into()));
         }
-        let (id, accepted) = self.enqueue_action(program, actor, action)?;
+        let (id, accepted) = self.enqueue_action_with_observation(program, actor, action, observation)?;
         Ok((
             accepted,
             format!("native Push Interaction #{id} on actor #{actor}: accepted={accepted}"),

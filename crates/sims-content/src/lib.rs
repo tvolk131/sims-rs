@@ -20,6 +20,9 @@ pub mod clothing_catalog;
 pub mod clothing_profile;
 pub mod compatibility;
 #[cfg(test)]
+#[path = "resource_scan/definition_buffer_tests.rs"]
+mod definition_buffer_tests;
+#[cfg(test)]
 #[path = "resource_scan/descriptor_tests.rs"]
 mod descriptor_scan_tests;
 pub mod dialog;
@@ -35,6 +38,7 @@ pub mod house_startup;
 pub mod house_valuation;
 pub mod household;
 pub mod neighborhood_input;
+pub mod native_bootstrap;
 pub mod notifications;
 pub mod object_catalog;
 pub mod object_graphics;
@@ -94,6 +98,11 @@ impl Resource {
         Ok(())
     }
     pub fn read(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.read_into(&mut bytes)?;
+        Ok(bytes)
+    }
+    fn read_into(&self, output: &mut Vec<u8>) -> Result<()> {
         self.validate_storage()?;
         if let Some(bytes) = &self.owned {
             anyhow::ensure!(
@@ -101,13 +110,15 @@ impl Resource {
                 "owned resource size differs: {}",
                 self.locator
             );
-            return Ok(bytes.to_vec());
+            output.clear();
+            output.extend_from_slice(bytes);
+            return Ok(());
         }
         let mut f =
             File::open(&self.source).with_context(|| format!("open {}", self.source.display()))?;
-        self.read_file(&mut f)
+        self.read_file_into(&mut f, output)
     }
-    fn read_file(&self, f: &mut File) -> Result<Vec<u8>> {
+    fn read_file_into(&self, f: &mut File, bytes: &mut Vec<u8>) -> Result<()> {
         if self
             .offset
             .checked_add(self.size)
@@ -116,9 +127,9 @@ impl Resource {
             bail!("resource outside source file: {}", self.locator);
         }
         f.seek(SeekFrom::Start(self.offset))?;
-        let mut bytes = vec![0; self.size as usize];
-        f.read_exact(&mut bytes)?;
-        Ok(bytes)
+        bytes.resize(self.size as usize, 0);
+        f.read_exact(bytes)?;
+        Ok(())
     }
     pub fn is_iff(&self) -> bool {
         self.name.to_ascii_lowercase().ends_with(".iff")

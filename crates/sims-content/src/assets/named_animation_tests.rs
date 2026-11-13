@@ -144,6 +144,29 @@ fn compare(
         "complete Program, including partial animation mutation, changed"
     );
     assert_eq!(reads, expected_reads, "primary read callback order changed");
+    let mut catalogs = AnimationCatalogs::default();
+    for pass in ["cold", "warm"] {
+        let mut cached = initial.clone();
+        let mut cached_reads = Vec::new();
+        let cached_result = outcome(catalogs.load_read(
+            index,
+            &mut cached,
+            requested,
+            retain_empty,
+            |resource| {
+                cached_reads.push(resource.locator.clone());
+                read(resource)
+            },
+        ));
+        assert_eq!(cached_result, reference, "{pass}: report/error chain changed");
+        assert_eq!(
+            serde_json::to_value(&cached).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "{pass}: complete or partially mutated Program changed"
+        );
+        assert_eq!(cached_reads, expected_reads, "{pass}: read order changed");
+        assert_eq!(format!("{cached:?}"), format!("{expected:?}"));
+    }
     Observation {
         result,
         program: actual,
@@ -663,6 +686,119 @@ fn source_hash_and_samples_use_direct_reads_not_the_primary_callback_payload() {
         format!("{:x}", Sha256::digest([127, 126, 126]))
     );
     assert_ne!(asset.samples.translations, [[0.0; 3]]);
+}
+
+fn compare_retained(
+    index: &Index,
+    requested: &BTreeSet<String>,
+    retain_empty: bool,
+    catalogs: &mut AnimationCatalogs,
+) -> Observation {
+    let mut expected = Program::default();
+    let mut expected_reads = Vec::new();
+    let expected_result = outcome(reference(
+        index,
+        &mut expected,
+        requested,
+        retain_empty,
+        |resource| {
+            expected_reads.push(resource.locator.clone());
+            resource.read()
+        },
+    ));
+    let mut program = Program::default();
+    let mut reads = Vec::new();
+    let result = outcome(catalogs.load_read(
+        index,
+        &mut program,
+        requested,
+        retain_empty,
+        |resource| {
+            reads.push(resource.locator.clone());
+            resource.read()
+        },
+    ));
+    assert_eq!(result, expected_result, "retained report/error changed");
+    assert_eq!(
+        serde_json::to_value(&program).unwrap(),
+        serde_json::to_value(&expected).unwrap(),
+        "retained complete or partially mutated Program changed"
+    );
+    assert_eq!(reads, expected_reads, "retained read order changed");
+    assert_eq!(format!("{program:?}"), format!("{expected:?}"));
+    Observation {
+        result,
+        program,
+        reads,
+    }
+}
+
+#[test]
+fn retained_catalogs_revalidate_changed_clips_samples_errors_and_restored_inputs() {
+    let original = catalog(&[("Wanted", "samples", 1)]);
+    let fixture = Fixture::new(&[
+        ("catalog.cmx.bcf", original.clone()),
+        ("samples.cfp", vec![126; 3]),
+    ]);
+    let requested = names(&["wanted"]);
+    let mut catalogs = AnimationCatalogs::default();
+    let first = compare_retained(&fixture.index, &requested, true, &mut catalogs);
+    assert_eq!(first.result.unwrap()["loaded_clips"], 1);
+    let original_asset = &first.program.animations["wanted"];
+    let source = fixture.root.join("catalog.cmx.bcf");
+    let changed = catalog(&[("WANTED", "samples", 1)]);
+    assert_eq!(changed.len(), original.len());
+    fs::write(&source, &changed).unwrap();
+    let updated = compare_retained(&fixture.index, &requested, true, &mut catalogs);
+    assert_ne!(updated.program.animations["wanted"].clip, original_asset.clip);
+    fs::write(fixture.root.join("samples.cfp"), [127, 126, 126]).unwrap();
+    let resampled = compare_retained(&fixture.index, &requested, true, &mut catalogs);
+    assert_ne!(
+        resampled.program.animations["wanted"].samples,
+        updated.program.animations["wanted"].samples
+    );
+    fs::write(fixture.root.join("samples.cfp"), [126, 126]).unwrap();
+    assert!(
+        compare_retained(&fixture.index, &requested, true, &mut catalogs)
+            .result
+            .is_err()
+    );
+    fs::write(fixture.root.join("samples.cfp"), [126; 3]).unwrap();
+    let mut malformed = changed;
+    malformed[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    fs::write(&source, malformed).unwrap();
+    let rejected = compare_retained(&fixture.index, &requested, true, &mut catalogs);
+    let report = rejected.result.unwrap();
+    assert_eq!(report["catalog_errors"].as_array().unwrap().len(), 1);
+    assert_eq!(report["unresolved"], json!(["wanted"]));
+    let hidden = source.with_extension("hidden");
+    fs::rename(&source, &hidden).unwrap();
+    assert!(
+        compare_retained(&fixture.index, &requested, true, &mut catalogs)
+            .result
+            .is_err()
+    );
+    fs::rename(hidden, &source).unwrap();
+    fs::write(&source, &original).unwrap();
+    let restored = compare_retained(&fixture.index, &requested, true, &mut catalogs);
+    assert_eq!(
+        serde_json::to_value(&restored.program.animations["wanted"]).unwrap(),
+        serde_json::to_value(original_asset).unwrap()
+    );
+}
+
+#[test]
+fn retained_parser_modes_do_not_convert_native_empty_clips_into_legacy_assets() {
+    let fixture = Fixture::new(&[
+        ("catalog.cmx.bcf", catalog(&[("Empty", "samples", 0)])),
+        ("samples.cfp", vec![]),
+    ]);
+    let requested = names(&["empty"]);
+    let mut catalogs = AnimationCatalogs::default();
+    for retain_empty in [false, true, false, true] {
+        let observed = compare_retained(&fixture.index, &requested, retain_empty, &mut catalogs);
+        assert_eq!(observed.program.animations.contains_key("empty"), retain_empty);
+    }
 }
 
 fn reference(

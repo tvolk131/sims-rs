@@ -216,6 +216,16 @@ impl crate::Vm {
         thread: &mut crate::Thread,
         instruction: &sims_formats::behavior::Instruction,
     ) -> Result<String, String> {
+        self.special_effect_with_observation(program, thread, instruction, &mut crate::action_observation::Observation::disabled())
+    }
+
+    pub(crate) fn special_effect_with_observation(
+        &mut self,
+        program: &crate::Program,
+        thread: &mut crate::Thread,
+        instruction: &sims_formats::behavior::Instruction,
+        observation: &mut crate::action_observation::Observation<'_>,
+    ) -> Result<String, String> {
         if thread.check {
             return Err("Special Effect yielded in synchronous callback".into());
         }
@@ -235,7 +245,7 @@ impl crate::Vm {
         match result? {
             Outcome::Complete => {
                 thread.stack.last_mut().unwrap().continuation = 0;
-                crate::branch(program, thread, instruction.on_true)?;
+                crate::branch_observed(program, thread, instruction.on_true, Some(&self.world), observation)?;
                 Ok("Special Effect completed; branch true".into())
             }
             Outcome::Yield => {

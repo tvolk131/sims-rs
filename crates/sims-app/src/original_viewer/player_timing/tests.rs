@@ -52,7 +52,7 @@ fn disabled_recorder_has_no_buffer_clock_or_artifact_path() {
 fn disabled_loader_constructor_matches_existing_loading_path_without_polling() {
     let args = Args::parse_from(["sims-room", "--original", "UserData2/Houses/House09.iff"]);
     let (existing, task) = Viewer::new(args.clone());
-    let (disabled, disabled_task) = Viewer::new_inner(args, None);
+    let (disabled, disabled_task) = Viewer::new_inner(args, false, None);
     assert_eq!(task.units(), disabled_task.units());
     drop((task, disabled_task));
     assert!(existing.session.is_none() && disabled.session.is_none());

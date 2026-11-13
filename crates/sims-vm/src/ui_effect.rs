@@ -100,13 +100,23 @@ impl Vm {
         t: &mut Thread,
         ins: &sims_formats::behavior::Instruction,
     ) -> Result<String, String> {
+        self.ui_effect_primitive_with_observation(p, t, ins, &mut crate::action_observation::Observation::disabled())
+    }
+
+    pub(crate) fn ui_effect_primitive_with_observation(
+        &mut self,
+        p: &Program,
+        t: &mut Thread,
+        ins: &sims_formats::behavior::Instruction,
+        observation: &mut crate::action_observation::Observation<'_>,
+    ) -> Result<String, String> {
         let Some(kind) = Kind::first(ins.operands[0]) else {
             t.last_result = true;
             t.stack
                 .last_mut()
                 .ok_or("UI-effect frame absent")?
                 .continuation = 0;
-            crate::branch(p, t, ins.on_true)?;
+            crate::branch_observed(p, t, ins.on_true, Some(&self.world), observation)?;
             return Ok("UI-effect unknown mode returns true without reading operands".into());
         };
         let value = self.read(p, t, ins.operands[1], crate::word(&ins.operands, 2))?;

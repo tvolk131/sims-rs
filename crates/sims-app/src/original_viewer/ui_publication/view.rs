@@ -1,10 +1,10 @@
 //! Pure Iced frontend. Its only owner is an immutable Published value.
 //! There are no Session/Client/Device getters, locks, IO or engine callbacks.
 use super::super::{
-    Message, Viewport, dialog_view, hud, neighborhood_usability, published_control,
-    widget_lifetimes,
+    Message, Viewport, camera_shortcuts, dialog_view, feedback_notice, hud, neighborhood_usability, player_shortcuts, published_control,
+    resident_selection, widget_lifetimes,
 };
-use super::{Catalog, Published};
+use super::{Catalog, Published, QueueEntry};
 use hud::motives;
 use hud::tutorial_highlight;
 use hud::{cluster, icon, panel_style, text_button_style};
@@ -39,10 +39,25 @@ impl Frontend {
         confirmation: Option<neighborhood_usability::Confirmation>,
         enabled: bool,
     ) -> Element<'_, Message> {
+        self.view_with_selection_gate(confirmation, enabled, enabled)
+    }
+    /// The Host additionally knows about its Load picker and closing owner.
+    pub fn view_with_selection_gate(
+        &self,
+        confirmation: Option<neighborhood_usability::Confirmation>,
+        enabled: bool,
+        selection_enabled: bool,
+    ) -> Element<'_, Message> {
+        self.view_with_copy_gate(confirmation, enabled, selection_enabled, enabled && selection_enabled)
+    }
+    pub(crate) fn view_with_copy_gate(
+        &self, confirmation: Option<neighborhood_usability::Confirmation>, enabled: bool,
+        selection_enabled: bool, copy_enabled: bool,
+    ) -> Element<'_, Message> {
         widget_lifetimes::retain(
             self.widget_epoch,
             neighborhood_usability::recovery(
-                self.view_content(confirmation, enabled),
+                self.view_content(confirmation, enabled, selection_enabled, copy_enabled),
                 self.error.is_some(),
             ),
         )
@@ -104,15 +119,15 @@ impl Frontend {
             }
         }
         toolbar = toolbar
-            .push(button("Save").on_press(Message::Save))
+            .push(button(player_shortcuts::save_caption()).on_press(Message::Save))
             .push(button("Load").on_press(Message::Load))
             .push(button("Restart").on_press(Message::Restart))
-            .push(self.control(2012, "Rotate left", Message::RotateBack))
-            .push(self.control(2011, "Rotate right", Message::Rotate))
-            .push(self.control(2013, "Zoom in", Message::ZoomIn))
-            .push(self.control(2014, "Zoom out", Message::ZoomOut))
-            .push(self.control(2023, "Downstairs", Message::Floor(1)))
-            .push(self.control(2024, "Upstairs", Message::Floor(2)));
+            .push(self.control(2012, camera_shortcuts::caption(camera_shortcuts::Action::RotateLeft), Message::RotateBack))
+            .push(self.control(2011, camera_shortcuts::caption(camera_shortcuts::Action::RotateRight), Message::Rotate))
+            .push(self.control(2013, camera_shortcuts::caption(camera_shortcuts::Action::ZoomIn), Message::ZoomIn))
+            .push(self.control(2014, camera_shortcuts::caption(camera_shortcuts::Action::ZoomOut), Message::ZoomOut))
+            .push(self.control(2023, camera_shortcuts::caption(camera_shortcuts::Action::Downstairs), Message::Floor(1)))
+            .push(self.control(2024, camera_shortcuts::caption(camera_shortcuts::Action::Upstairs), Message::Floor(2)));
         let pause_display = self.pause;
         let status = if pause_display.is_some_and(|v| v != 0) {
             "PAUSED"
@@ -154,9 +169,9 @@ impl Frontend {
                     } else {
                         text(&r.name).into()
                     };
-                    if r.highlighted {
+                    if r.highlighted && let Some(art) = &self.art {
                         panel = panel.push(
-                            widget::image(self.art.as_ref().unwrap().tutorial())
+                            widget::image(art.tutorial())
                                 .width(50)
                                 .height(50),
                         );
@@ -164,7 +179,7 @@ impl Frontend {
                     panel = panel.push(
                         button(content)
                             .on_press_maybe(r.enabled.then_some(Message::Resident(r.object)))
-                            .style(if r.object == self.resident {
+                            .style(if self.resident_selection.state.is_selected(r.object) {
                                 button::primary
                             } else {
                                 button::secondary
@@ -275,17 +290,7 @@ impl Frontend {
                     panel = panel.push(text("Select an object in the room.").size(13));
                 }
                 panel = panel.push(text("INTERACTION QUEUE").size(13));
-                for action in &self.queue {
-                    panel = panel.push(
-                        row![
-                            text(format!("{} · {}", action.diagnostic_label, action.target))
-                                .size(13)
-                                .width(Fill),
-                            button("×").on_press(action.cancel.message())
-                        ]
-                        .spacing(8),
-                    );
-                }
+                panel = panel.push(self.queue_diagnostics());
             } else if let Some(active) = self.active_panel {
                 use sims_render::camera_device::panels::Panel;
                 panel = panel.push(
@@ -338,11 +343,13 @@ impl Frontend {
         &self,
         confirmation: Option<neighborhood_usability::Confirmation>,
         enabled: bool,
+        selection_enabled: bool,
+        copy_enabled: bool,
     ) -> Element<'_, Message> {
         // Play view never installs these controls. Avoid allocating and
         // formatting a complete sidebar only to drop it before layout.
         let diagnostics = self.diagnostics.then(|| self.diagnostic_widgets());
-        self.view_with_diagnostics(diagnostics, confirmation, enabled)
+        self.view_with_diagnostics(diagnostics, confirmation, enabled, selection_enabled, copy_enabled)
     }
     /// Same-binary control retaining the former eager widget construction.
     #[cfg(test)]
@@ -353,6 +360,8 @@ impl Frontend {
                 Some(self.diagnostic_widgets()),
                 None,
                 self.session_present,
+                self.session_present,
+                self.session_present,
             ),
         )
     }
@@ -361,6 +370,8 @@ impl Frontend {
         diagnostics: Option<(Element<'a, Message>, Element<'a, Message>)>,
         confirmation: Option<neighborhood_usability::Confirmation>,
         enabled: bool,
+        selection_enabled: bool,
+        copy_enabled: bool,
     ) -> Element<'a, Message> {
         let viewport: Element<_> = if let Some(scene) = &self.scene {
             container(
@@ -481,12 +492,20 @@ impl Frontend {
                 );
             }
             play = play.push(self.tutorial_hud_overlay());
+            if let Some(selection) = resident_selection::overlay(
+                self, enabled && selection_enabled && confirmation.is_none(),
+            ) {
+                play = play.push(selection);
+            }
             play = play.push(neighborhood_usability::notice(&self.application));
+            if let Some(feedback) = &self.save_load_feedback {
+                play = play.push(feedback_notice::view(feedback, self.hud_height()));
+            }
             let play: Element<_> = play.into();
             let play = if self.options_open {
                 widget::stack![
                     play,
-                    self.application_options_with_confirmation(confirmation, enabled)
+                    self.application_options_with_confirmation(confirmation, enabled, copy_enabled)
                 ]
                 .into()
             } else {
@@ -657,12 +676,13 @@ impl Frontend {
         cluster::background(self.art.as_deref(), id, width, height)
     }
     pub(super) fn application_options(&self) -> Element<'_, Message> {
-        self.application_options_with_confirmation(None, self.session_present)
+        self.application_options_with_confirmation(None, self.session_present, self.session_present)
     }
     fn application_options_with_confirmation(
         &self,
         confirmation: Option<neighborhood_usability::Confirmation>,
         enabled: bool,
+        copy_enabled: bool,
     ) -> Element<'_, Message> {
         let mut menu = widget::stack![self.hud_background(4910, 0., 100.)]
             .width(Fill)
@@ -671,7 +691,7 @@ impl Frontend {
         // The five unhosted actions remain disabled rather than dispatching
         // unrelated application commands through their original artwork.
         for (id, label, message, x, y) in [
-            (4950, "Save game", Some(Message::Save), 29., 6.),
+            (4950, player_shortcuts::save_caption(), Some(Message::Save), 29., 6.),
             (4951, "Neighborhood (unavailable)", None, 88., 6.),
             (4952, "Exit game (unavailable)", None, 159., 6.),
             (4957, "Graphics options (unavailable)", None, 29., 58.),
@@ -705,7 +725,7 @@ impl Frontend {
         menu = menu.push(at(text("Application").size(13).into(), 229., 4.));
         // These are explicit application actions, not original icon aliases.
         for (label, message, x, y) in [
-            ("Load", Message::Load, 229., 25.),
+            ("Load", Message::ChooseLoad, 229., 25.),
             ("Details", Message::Diagnostics, 315., 25.),
             ("Restart", Message::Restart, 229., 55.),
             ("Close", Message::Options, 315., 55.),
@@ -723,7 +743,15 @@ impl Frontend {
             ));
         }
         let menu = column![
+            copy_action(copy_enabled && !self.load_picker_blocked && !self.player_shortcuts_blocked
+                && self.error.is_none() && !self.modal && confirmation.is_none()),
             neighborhood_usability::controls(&self.application, confirmation, enabled),
+            text("Space: pause/resume during play; answer an open dialog.").size(12),
+            text(player_shortcuts::save_guidance()).size(12),
+            container(text(&self.status).size(12))
+                .width(Fill)
+                .padding(8)
+                .style(panel_style),
             menu
         ];
         container(widget::opaque(menu))
@@ -735,6 +763,14 @@ impl Frontend {
                 ..Default::default()
             })
             .into()
+    }
+    #[cfg(test)]
+    pub(crate) fn selection_widgets_for_test(&self, kind: u8) -> Element<'_, Message> {
+        match kind {
+            0 => self.residents_hud(),
+            1 => self.needs_hud(true),
+            _ => self.diagnostic_widgets().1,
+        }
     }
     fn residents_hud(&self) -> Element<'_, Message> {
         let mut people = row![].spacing(0);
@@ -751,14 +787,7 @@ impl Frontend {
                     .padding(0)
                     .on_press_maybe(resident.enabled.then_some(Message::Resident(id)))
                     .style(move |_, status| {
-                        let mut style = text_button_style(&iced::Theme::Dark, status);
-                        style.border.color = if id == self.resident {
-                            CYAN
-                        } else {
-                            Color::from_rgb8(87, 108, 180)
-                        };
-                        style.border.width = 2.;
-                        style
+                        resident_selection::portrait_style(self.resident_selection.state, id, status)
                     })
                     .into();
                 if resident.highlighted
@@ -1198,6 +1227,75 @@ impl Frontend {
                 .into(),
         ))
     }
+    fn queue_cancel_message(&self, entry: &QueueEntry) -> Option<Message> {
+        (self.session_present
+            && self.people_visible
+            && self.resident == entry.action.resident
+            && !self.pending
+            && !self.modal
+            && self.error.is_none())
+        .then(|| entry.action.cancel())
+        .flatten()
+        .map(|intent| intent.message())
+    }
+    fn queue_cancel_control<'a>(
+        &'a self,
+        entry: &'a QueueEntry,
+        control: widget::Button<'a, Message>,
+    ) -> Element<'a, Message> {
+        let message = self.queue_cancel_message(entry);
+        // Repaint age and labels do not end a valid held press. Replacing a
+        // resident/action, changing its cancellation state or blocking input
+        // does: an old pressed button must never cancel its new occupant.
+        widget_lifetimes::retain_owner_key(
+            (entry.action, message.is_some()),
+            control.on_press_maybe(message).into(),
+        )
+    }
+    fn queue_cancel_tooltip(&self, entry: &QueueEntry) -> String {
+        let hint = if entry.action.cancel_requested {
+            "Cancellation requested; waiting for the engine to remove the action."
+        } else if self.queue_cancel_message(entry).is_some() {
+            "Click to request cancellation."
+        } else {
+            "Cancellation is currently unavailable."
+        };
+        format!(
+            "{} · {} · {} — {}",
+            entry.label, entry.target, entry.action.status(), hint
+        )
+    }
+    pub(super) fn queue_diagnostics(&self) -> Element<'_, Message> {
+        let mut queue = column![].spacing(8);
+        if self.people_visible {
+            for entry in &self.queue {
+                queue = queue.push(
+                    row![
+                        text(format!(
+                            "{} · {} · {}",
+                            entry.diagnostic_label, entry.target, entry.action.status()
+                        ))
+                        .size(13)
+                        .width(Fill),
+                        widget::tooltip(
+                            self.queue_cancel_control(
+                                entry,
+                                button(if entry.action.cancel_requested {
+                                    "Cancelling…"
+                                } else {
+                                    "Cancel"
+                                }),
+                            ),
+                            text(self.queue_cancel_tooltip(entry)),
+                            widget::tooltip::Position::Bottom,
+                        ),
+                    ]
+                    .spacing(8),
+                );
+            }
+        }
+        queue.into()
+    }
     pub(super) fn queue_hud(&self) -> Element<'_, Message> {
         let mut queue = row![].spacing(6);
         if self.people_visible {
@@ -1212,14 +1310,24 @@ impl Frontend {
                     container(text("…").size(20)).center(45).into()
                 };
                 queue = queue.push(widget::tooltip(
-                    button(content)
+                    self.queue_cancel_control(
+                        action,
+                        button(
+                            column![
+                                content,
+                                text(if action.action.cancel_requested {
+                                    "Cancelling…"
+                                } else {
+                                    "Cancel"
+                                })
+                                .size(11),
+                            ]
+                            .align_x(iced::Alignment::Center),
+                        )
                         .padding(2)
-                        .on_press(action.cancel.message())
                         .style(text_button_style),
-                    text(format!(
-                        "{} · {} — click to cancel",
-                        action.label, action.target
-                    )),
+                    ),
+                    text(self.queue_cancel_tooltip(action)),
                     widget::tooltip::Position::Bottom,
                 ));
             }
@@ -1228,7 +1336,7 @@ impl Frontend {
             .direction(scrollable::Direction::Horizontal(
                 scrollable::Scrollbar::default(),
             ))
-            .height(68)
+            .height(86)
             .into()
     }
 }
@@ -1302,4 +1410,13 @@ fn buy_catalog_view(catalog: &Catalog, ready: bool) -> Element<'_, Message> {
         }
     }
     widget_lifetimes::retain_owner_key(catalog.identity(), view.into())
+}
+
+/// An application action in its own row, outside the fixed original artwork.
+pub(crate) fn copy_action(enabled: bool) -> Element<'static, Message> {
+    column![button(text("Save a Copy…").size(13))
+        .on_press_maybe(enabled.then_some(Message::ChooseSaveCopy))
+        .padding(8),
+        text(player_shortcuts::file_guidance()).size(12),
+    ].into()
 }

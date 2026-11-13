@@ -7,6 +7,10 @@ use sha2::{Digest, Sha256};
 use sims_formats::animation::{Animation, read_bcf, read_cfp};
 use sims_vm::{Program, program::AnimationAsset};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+mod animation_catalogs;
+pub use animation_catalogs::AnimationCatalogs;
 
 #[derive(Debug, Default, serde::Serialize)]
 pub struct Report {
@@ -80,7 +84,25 @@ pub(crate) fn load_named_animations_read(
     program: &mut Program,
     names: &BTreeSet<String>,
     retain_empty: bool,
+    read: impl FnMut(&crate::Resource) -> Result<Vec<u8>>,
+) -> Result<Report> {
+    load_named_animations_using(
+        index,
+        program,
+        names,
+        retain_empty,
+        read,
+        |_, bytes, native| animation_catalogs::parse(&bytes, native),
+    )
+}
+
+fn load_named_animations_using(
+    index: &Index,
+    program: &mut Program,
+    names: &BTreeSet<String>,
+    retain_empty: bool,
     mut read: impl FnMut(&crate::Resource) -> Result<Vec<u8>>,
+    mut parse: impl FnMut(&crate::Resource, Vec<u8>, bool) -> Result<Arc<[Animation]>>,
 ) -> Result<Report> {
     let mut discovered = BTreeSet::new();
     let mut candidates: BTreeMap<String, Vec<(usize, Animation)>> = BTreeMap::new();
@@ -94,11 +116,7 @@ pub(crate) fn load_named_animations_read(
         if bytes.get(..8) != Some(&[0; 8]) {
             continue;
         }
-        let clips = match if retain_empty {
-            sims_formats::animation::read_bcf_native(&bytes)
-        } else {
-            read_bcf(&bytes)
-        } {
+        let clips = match parse(resource, bytes, retain_empty) {
             Ok(clips) => clips,
             Err(e) => {
                 report
@@ -107,13 +125,13 @@ pub(crate) fn load_named_animations_read(
                 continue;
             }
         };
-        for clip in clips {
+        for clip in clips.iter() {
             let normalized = clip.name.to_ascii_lowercase();
             if names.contains(&normalized) {
                 candidates
                     .entry(normalized.clone())
                     .or_default()
-                    .push((id, clip));
+                    .push((id, clip.clone()));
             }
             discovered.insert(normalized);
         }

@@ -80,6 +80,14 @@ pub fn render_with_background(scene: &Scene, background: [u8; 4]) -> image::Rgba
             if area.abs() < 1e-6 {
                 continue;
             }
+            // Screen Y grows downward. Normalize edge direction for either
+            // winding, then give a shared sample to only its top/left owner.
+            // Equal-depth independent draws still blend normally below.
+            let inclusive_edges = [(p[1], p[2]), (p[2], p[0]), (p[0], p[1])]
+                .map(|(a, b)| {
+                    let edge = if area > 0. { b - a } else { a - b };
+                    edge.y < 0. || (edge.y == 0. && edge.x > 0.)
+                });
             let lo = p[0].min(p[1]).min(p[2]).floor().max(Vec2::ZERO);
             let hi = p[0]
                 .max(p[1])
@@ -94,7 +102,9 @@ pub fn render_with_background(scene: &Scene, background: [u8; 4]) -> image::Rgba
                         (p[2] - q).perp_dot(p[0] - q) / area,
                         (p[0] - q).perp_dot(p[1] - q) / area,
                     ];
-                    if b.iter().any(|v| *v < 0.) {
+                    if b.iter().zip(inclusive_edges).any(|(weight, inclusive)| {
+                        *weight < 0. || (*weight == 0. && !inclusive)
+                    }) {
                         continue;
                     }
                     let mut uv = [0.; 2];
@@ -165,3 +175,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "software/raster_context_tests.rs"]
+mod raster_context_tests;

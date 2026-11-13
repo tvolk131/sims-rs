@@ -13,8 +13,13 @@ mod milestone;
 use milestone::Milestone;
 #[path = "exploration/buy_edit_cycle.rs"]
 mod buy_edit_cycle;
+#[path = "exploration/camera_input.rs"]
+mod camera_input;
 #[path = "exploration/checkpoint.rs"]
 mod checkpoint;
+#[cfg(test)]
+#[path = "exploration/service_capture.rs"]
+pub(super) mod service_capture;
 #[cfg(test)]
 #[path = "exploration/interaction_sequences.rs"]
 mod interaction_sequences;
@@ -133,6 +138,13 @@ enum Command {
     Rotate,
     ZoomIn,
     ZoomOut,
+    CameraMotion {
+        pixel: [u32; 2],
+    },
+    CameraRightButton {
+        down: bool,
+        pixel: [u32; 2],
+    },
     Floor {
         level: i32,
     },
@@ -230,28 +242,86 @@ impl Default for Config {
 /// Application-owned state omitted from a player save but relevant to exact
 /// test continuation. Instants are offsets from a fixed driver epoch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Local {
-    diagnostics: bool,
-    options_open: bool,
-    display_size: [u32; 2],
-    tutorial_highlight: Option<i32>,
-    resident: i16,
-    selected: Option<i16>,
-    floor: i32,
-    zoom: f32,
-    playing: bool,
-    speed: f32,
-    last_ms: Option<u64>,
-    clock_origin: Option<(u64, u32)>,
-    accumulator: f32,
-    pan: [i32; 2],
-    shift: bool,
-    viewport_enter_requested: bool,
-    move_inputs: std::collections::VecDeque<MoveInput>,
-    status: String,
-    error: Option<String>,
-    menu_error: Option<String>,
-    millis: u64,
+pub(super) struct Local {
+    pub(super) diagnostics: bool,
+    pub(super) options_open: bool,
+    pub(super) display_size: [u32; 2],
+    pub(super) tutorial_highlight: Option<i32>,
+    pub(super) resident: i16,
+    pub(super) selected: Option<i16>,
+    pub(super) floor: i32,
+    pub(super) zoom: f32,
+    pub(super) playing: bool,
+    pub(super) speed: f32,
+    pub(super) last_ms: Option<u64>,
+    pub(super) clock_origin: Option<(u64, u32)>,
+    pub(super) accumulator: f32,
+    pub(super) pan: [i32; 2],
+    pub(super) shift: bool,
+    pub(super) viewport_enter_requested: bool,
+    pub(super) move_inputs: std::collections::VecDeque<MoveInput>,
+    pub(super) status: String,
+    pub(super) error: Option<String>,
+    pub(super) menu_error: Option<String>,
+    pub(super) millis: u64,
+    #[serde(default)]
+    pub(super) camera_pointer: viewport_drag::Pointer,
+    #[serde(default)]
+    pub(super) viewport_drag: viewport_drag::Drag,
+    #[serde(default)]
+    pub(super) application_revision: u64,
+}
+
+macro_rules! local_state {
+    ($viewer:expr, $epoch:expr, $millis:expr, $pointer:expr) => {
+        $crate::original_viewer::exploration::Local {
+            diagnostics: $viewer.diagnostics,
+            options_open: $viewer.options_open,
+            display_size: $viewer.display_size,
+            tutorial_highlight: $viewer.tutorial_highlight,
+            resident: $viewer.resident,
+            selected: $viewer.selected,
+            floor: $viewer.floor,
+            zoom: $viewer.zoom,
+            playing: $viewer.playing,
+            speed: $viewer.speed,
+            last_ms: $viewer
+                .last
+                .map(|instant| instant.duration_since($epoch).as_millis() as u64),
+            clock_origin: $viewer
+                .clock_origin
+                .map(|(instant, tick)| (instant.duration_since($epoch).as_millis() as u64, tick)),
+            accumulator: $viewer.accumulator,
+            pan: $viewer.pan,
+            shift: $viewer.shift,
+            viewport_enter_requested: $viewer.viewport_enter_requested,
+            move_inputs: $viewer.move_inputs.clone(),
+            status: $viewer.status.clone(),
+            error: $viewer.error.clone(),
+            menu_error: $viewer.menu_error.clone(),
+            millis: $millis,
+            camera_pointer: $pointer.clone(),
+            viewport_drag: $viewer.viewport_drag.clone(),
+            application_revision: $viewer.application_revision,
+        }
+    };
+}
+pub(super) use local_state;
+
+fn capture_envelope(
+    session: &Session,
+    client: &DialogClient,
+    device: Option<&CameraDevice>,
+    local: &Local,
+    managed: bool,
+) -> Result<Value> {
+    Ok(json!({
+        "schema":1,
+        "session":if managed { session.save_managed()? } else { session.save() },
+        "dialog_client":client.save(session)?,
+        "camera_device":device.map(|device| device.save(session)).transpose()?,
+        "application":local,
+    }))
 }
 struct Application {
     viewer: Viewer,
@@ -259,6 +329,7 @@ struct Application {
     millis: u64,
     paths: std::collections::BTreeSet<String>,
     progress_burst_ticks: u64,
+    camera_pointer: viewport_drag::Pointer,
 }
 impl Application {
     /// Install the same Ready result consumed by the GUI's Loaded message.
@@ -270,7 +341,7 @@ impl Application {
         if let Some(clock) = viewer.session.as_ref().and_then(|s| s.host.presentation.clock.as_ref()) {
             viewer.clock_origin = Some((epoch, clock.now));
         }
-        let mut app = Self { viewer, epoch, millis: 0, paths: Default::default(), progress_burst_ticks: 0 };
+        let mut app = Self { viewer, epoch, millis: 0, paths: Default::default(), progress_burst_ticks: 0, camera_pointer: Default::default() };
         app.drain(limits)?;
         Ok(app)
     }
@@ -278,37 +349,11 @@ impl Application {
         self.viewer.session.as_ref().context("session absent")
     }
     fn local(&self) -> Local {
-        let v = &self.viewer;
-        Local {
-            diagnostics: v.diagnostics,
-            options_open: v.options_open,
-            display_size: v.display_size,
-            tutorial_highlight: v.tutorial_highlight,
-            resident: v.resident,
-            selected: v.selected,
-            floor: v.floor,
-            zoom: v.zoom,
-            playing: v.playing,
-            speed: v.speed,
-            last_ms: v
-                .last
-                .map(|t| t.duration_since(self.epoch).as_millis() as u64),
-            clock_origin: v
-                .clock_origin
-                .map(|(t, n)| (t.duration_since(self.epoch).as_millis() as u64, n)),
-            accumulator: v.accumulator,
-            pan: v.pan,
-            shift: v.shift,
-            viewport_enter_requested: v.viewport_enter_requested,
-            move_inputs: v.move_inputs.clone(),
-            status: v.status.clone(),
-            error: v.error.clone(),
-            menu_error: v.menu_error.clone(),
-            millis: self.millis,
-        }
+        local_state!(self.viewer, self.epoch, self.millis, self.camera_pointer)
     }
     fn apply_local(&mut self, state: Local) {
         self.millis = state.millis;
+        self.camera_pointer = state.camera_pointer;
         let v = &mut self.viewer;
         v.diagnostics = state.diagnostics;
         v.options_open = state.options_open;
@@ -332,15 +377,20 @@ impl Application {
         v.status = state.status;
         v.error = state.error;
         v.menu_error = state.menu_error;
+        v.viewport_drag = state.viewport_drag;
+        v.application_revision = state.application_revision;
         v.publish_hud_cluster();
     }
     fn capture(&self, managed: bool) -> Result<Value> {
-        let s = self.session()?;
-        Ok(
-            json!({"schema":1,"session":if managed {s.save_managed()?} else {s.save()},
-            "dialog_client":self.viewer.client.as_ref().context("dialog client absent")?.save(s)?,
-            "camera_device":self.viewer.device.as_ref().map(|d| d.save(s)).transpose()?,
-            "application":self.local()}),
+        capture_envelope(
+            self.session()?,
+            self.viewer
+                .client
+                .as_ref()
+                .context("dialog client absent")?,
+            self.viewer.device.as_ref(),
+            &self.local(),
+            managed,
         )
     }
     fn sample_paths(&mut self) {
@@ -369,14 +419,30 @@ impl Application {
         Ok(())
     }
     fn dispatch(&mut self, message: Message) -> Result<()> {
+        #[cfg(test)]
+        if let Some(request) = &mut self.viewer.service_capture {
+            request.frame = service_capture::FrameContext {
+                epoch: self.epoch,
+                millis: self.millis,
+                camera_pointer: self.camera_pointer.clone(),
+            };
+        }
         let _ = self.viewer.update(message);
         self.sample_paths();
         self.check_errors()
     }
     fn drain(&mut self, limits: &Limits) -> Result<()> {
+        self.drain_observed(limits, &mut |_| Ok(()))
+    }
+    fn drain_observed(
+        &mut self,
+        limits: &Limits,
+        observer: &mut impl FnMut(&mut Self) -> Result<()>,
+    ) -> Result<()> {
         let now = self.epoch + Duration::from_millis(self.millis);
         for _ in 0..limits.service_polls {
             self.check_errors()?;
+            observer(self)?;
             // An original modal needs an explicit recorded player command.
             if self.session()?.simulation.vm.world.dialogs.modal.is_some()
                 && !self.viewer.presentation_children_pending()
@@ -666,6 +732,66 @@ impl Driver for Application {
         self.viewer.exploration_ticks.take().unwrap_or_default()
     }
     fn execute(&mut self, command: &Command, limits: &Limits) -> Result<()> {
+        self.execute_observed(command, limits, &mut |_| Ok(()))
+    }
+    fn fork(&self) -> Result<Self> {
+        let s = self.session()?.fork_for_exploration()?;
+        let client = DialogClient::restore(
+            &s,
+            self.viewer
+                .client
+                .as_ref()
+                .context("client absent")?
+                .save(self.session()?)?,
+        )?;
+        let (mut viewer, _) = Viewer::new(self.viewer.args.clone());
+        viewer.client = Some(client);
+        debug_assert!(viewer.loaded_input.is_none());
+        viewer.session = Some(s);
+        viewer.device = self
+            .viewer
+            .device
+            .as_ref()
+            .map(CameraDevice::fork_for_exploration);
+        viewer.icons = self
+            .viewer
+            .icons
+            .as_ref()
+            .map(|i| i.fork_for_exploration().map(Arc::new))
+            .transpose()?;
+        viewer.art = self.viewer.art.clone();
+        viewer.scene = self.viewer.scene.clone();
+        let mut result = Self {
+            viewer,
+            epoch: self.epoch,
+            millis: self.millis,
+            paths: self.paths.clone(),
+            progress_burst_ticks: self.progress_burst_ticks,
+            camera_pointer: Default::default(),
+        };
+        result.apply_local(self.local());
+        Ok(result)
+    }
+    fn checkpoint(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&self.capture(true)?)?)
+    }
+    fn restore(&self, bytes: &[u8]) -> Result<Self> {
+        Self::restore_checkpoint(
+            &self.viewer.args,
+            self.session()?.index(),
+            self.viewer.icons.as_ref().context("icons absent")?,
+            self.epoch,
+            bytes,
+        )
+    }
+}
+impl Application {
+    fn execute_observed(
+        &mut self,
+        command: &Command,
+        limits: &Limits,
+        observer: &mut impl FnMut(&mut Self) -> Result<()>,
+    ) -> Result<()> {
         match command {
             Command::AdvanceBurst { ticks } => {
                 ensure!((1..=512).contains(ticks), "invalid progress burst");
@@ -913,6 +1039,8 @@ impl Driver for Application {
             Command::Rotate => self.dispatch(Message::Rotate)?,
             Command::ZoomIn => self.dispatch(Message::ZoomIn)?,
             Command::ZoomOut => self.dispatch(Message::ZoomOut)?,
+            Command::CameraMotion { pixel } => self.camera_input(*pixel, None)?,
+            Command::CameraRightButton { down, pixel } => self.camera_input(*pixel, Some(*down))?,
             Command::Floor { level } => {
                 ensure!((1..=2).contains(level), "invalid floor");
                 self.dispatch(Message::Floor(*level))?;
@@ -1016,58 +1144,8 @@ impl Driver for Application {
                 self.dispatch(Message::Dialog(*id, *result))?;
             }
         }
-        self.drain(limits)
+        self.drain_observed(limits, observer)
     }
-    fn fork(&self) -> Result<Self> {
-        let s = self.session()?.fork_for_exploration()?;
-        let client = DialogClient::restore(
-            &s,
-            self.viewer
-                .client
-                .as_ref()
-                .context("client absent")?
-                .save(self.session()?)?,
-        )?;
-        let (mut viewer, _) = Viewer::new(self.viewer.args.clone());
-        viewer.client = Some(client);
-        viewer.session = Some(s);
-        viewer.device = self
-            .viewer
-            .device
-            .as_ref()
-            .map(CameraDevice::fork_for_exploration);
-        viewer.icons = self
-            .viewer
-            .icons
-            .as_ref()
-            .map(|i| i.fork_for_exploration().map(Arc::new))
-            .transpose()?;
-        viewer.art = self.viewer.art.clone();
-        viewer.scene = self.viewer.scene.clone();
-        let mut result = Self {
-            viewer,
-            epoch: self.epoch,
-            millis: self.millis,
-            paths: self.paths.clone(),
-            progress_burst_ticks: self.progress_burst_ticks,
-        };
-        result.apply_local(self.local());
-        Ok(result)
-    }
-    fn checkpoint(&self) -> Result<Vec<u8>> {
-        Ok(serde_json::to_vec(&self.capture(true)?)?)
-    }
-    fn restore(&self, bytes: &[u8]) -> Result<Self> {
-        Self::restore_checkpoint(
-            &self.viewer.args,
-            self.session()?.index(),
-            self.viewer.icons.as_ref().context("icons absent")?,
-            self.epoch,
-            bytes,
-        )
-    }
-}
-impl Application {
     fn restore_checkpoint(
         args: &Args,
         index: &Index,
@@ -1101,6 +1179,7 @@ impl Application {
             .transpose()?;
         let (mut viewer, _) = Viewer::new(args.clone());
         viewer.client = Some(client);
+        debug_assert!(viewer.loaded_input.is_none());
         viewer.session = Some(s);
         viewer.device = device;
         viewer.icons = Some(Arc::new(icons.fork_for_exploration()?));
@@ -1115,6 +1194,7 @@ impl Application {
             millis: 0,
             paths: Default::default(),
             progress_burst_ticks: 0,
+            camera_pointer: Default::default(),
         };
         result.apply_local(serde_json::from_value(value["application"].clone())?);
         Ok(result)
@@ -1604,3 +1684,7 @@ pub(super) fn tick_observation(viewer: &Viewer) -> Result<Observation> {
         state_sha256: engine::digest_serialized(&(&s.simulation, &s.host.presentation))?,
     })
 }
+
+#[cfg(test)]
+#[path = "loaded_input_tests.rs"]
+mod loaded_input_tests;

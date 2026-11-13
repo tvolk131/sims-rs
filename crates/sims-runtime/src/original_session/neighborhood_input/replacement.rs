@@ -264,6 +264,7 @@ mod tests {
         )
         .unwrap();
         Session {
+            loaded_input_origin: None,
             index: Arc::new(index),
             managed_policy: managed::Policy::HistoricalSchema1,
             house,
