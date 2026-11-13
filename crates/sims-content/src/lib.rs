@@ -14,11 +14,13 @@ mod file_table;
 mod index;
 mod install;
 mod neighborhood;
+mod people;
 
 pub use catalog::{Catalog, Object};
 pub use error::Error;
 pub use index::{Index, Member, Resource};
 pub use install::{Expansions, Install, Layout, Mount};
 pub use neighborhood::{House, Neighborhood};
+pub use people::{People, Record, Skeleton};
 
 pub type Result<T> = std::result::Result<T, Error>;

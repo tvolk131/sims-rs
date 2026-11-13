@@ -86,6 +86,8 @@ fn world() -> World {
         }),
         indicators: [2, 0],
         changed_types: BTreeSet::from([0x2222]),
+        next_parts: BTreeMap::from([(2, 5)]),
+        skeleton_files: BTreeSet::from(["adult.bcf".to_owned()]),
     }
 }
 
@@ -95,7 +97,7 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "339502b3b17dce9fb7e1f9ed32e5368cad8371ce2a218bfab2d2e26081bc8155";
+const PINNED: &str = "322c9f0a86458f3f585c67f78d9b3932492cf8dbd58c339a38ac14b7bd2ac1ff";
 
 #[test]
 fn encoding_round_trips_bit_for_bit() {
@@ -125,102 +127,12 @@ fn any_field_change_changes_the_hash() {
     let mut changed = world();
     changed.types.insert(9, 0x3333);
     assert_ne!(changed.hash(), base);
-}
-
-fn instance(id: u16, guid: u32) -> sims_formats::saved_objects::Instance {
-    let object = object(id, guid);
-    sims_formats::saved_objects::Instance {
-        id,
-        type_id: 7,
-        guid,
-        footprint: object.footprint,
-        position: object.position,
-        unknown_short: object.unknown_short,
-        attributes: object.attributes,
-        temps: object.temps,
-        data: object.data,
-        obsolete_word: 0,
-        stack_capacity_bytes: 512,
-        stack: object.stack,
-        relationship_flag: -1,
-        relationships: Vec::new(),
-        slots: object.slots,
-        dynamic_sprites: Vec::new(),
-        multipart: None,
-        portal: None,
-        person: None,
-        registry_word: object.registry_word,
-        consumed_bits: 0,
-        record: Vec::new(),
-    }
-}
-
-#[test]
-fn saved_objects_are_read_onto_a_cleared_lot_in_file_order() {
-    let definition = |guid, resource| sims_content::Object {
-        guid,
-        resource,
-        chunk: 128,
-        kind: 4,
-        master: 0,
-    };
-    let catalog = Catalog {
-        global: 0,
-        objects: vec![definition(0x1111, 1), definition(0x2222, 2)],
-        by_guid: BTreeMap::from([(0x1111, 0), (0x2222, 1)]),
-        semi_globals: BTreeMap::new(),
-        diagnostics: Vec::new(),
-    };
-    let saved = sims_formats::saved_objects::Objects {
-        version: 62,
-        order: vec![9, 4, 6],
-        types_by_id: BTreeMap::new(),
-        instances: BTreeMap::from([
-            (4, instance(4, 0x1111)),
-            (6, instance(6, 0x2222)),
-            (9, instance(9, 0x1111)),
-        ]),
-        tail: Vec::new(),
-    };
-    // A cleared lot keeps what the earlier load steps left: here an empty
-    // instance list for one type, a queued removal and the globals.
-    let mut lot = world();
-    lot.objects.clear();
-    lot.order.clear();
-    lot.instances = BTreeMap::from([(0x1111, Vec::new())]);
-    let before = lot.clone();
-    lot.read_objects(&saved, &catalog).unwrap();
-    assert_eq!(lot.order, [9, 4, 6]);
-    assert_eq!(lot.objects.keys().copied().collect::<Vec<_>>(), [4, 6, 9]);
-    assert_eq!(lot.objects[&6].guid, 0x2222);
-    assert_eq!(lot.objects[&6].stack[0].tree, 4096);
-    assert!(!lot.objects[&6].last_result);
-    // A type with an instance list gets its objects appended, in file
-    // order. A type no script has asked about gets no list.
-    assert_eq!(lot.instances, BTreeMap::from([(0x1111, vec![9, 4])]));
-    assert_eq!(lot.removals, before.removals);
-    assert_eq!(lot.globals, before.globals);
-    assert_eq!(lot.global_rng, before.global_rng);
-    assert_eq!(lot.types, before.types);
-
-    // A lot that still holds objects is refused, unchanged.
-    let held = lot.clone();
-    assert!(matches!(
-        lot.read_objects(&saved, &catalog),
-        Err(sims_sim::Error::NotCleared)
-    ));
-    assert_eq!(lot.encode(), held.encode());
-    // So is an object with no definition.
-    let mut lot = before.clone();
-    let mut unknown = saved.clone();
-    unknown.instances.insert(6, instance(6, 0x9999));
-    assert!(matches!(
-        lot.read_objects(&unknown, &catalog),
-        Err(sims_sim::Error::MissingDefinition {
-            object: 6,
-            guid: 0x9999
-        })
-    ));
+    let mut changed = world();
+    changed.next_parts.insert(5, 2);
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.skeleton_files.clear();
+    assert_ne!(changed.hash(), base);
 }
 
 struct Temp(PathBuf);

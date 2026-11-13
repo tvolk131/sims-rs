@@ -2,8 +2,8 @@ use crate::index::sorted_entries;
 use crate::install::resolve;
 use crate::{Catalog, Error, Result};
 use sims_formats::iff::Iff;
-use sims_formats::lot::{self, Array, HouseView, ObjectTypes, Simulator};
-use sims_formats::neighborhood::Family;
+use sims_formats::lot::{self, Array, HouseView, ObjectTypes, Simulator, SurfaceMapping};
+use sims_formats::neighborhood::{Family, Neighbor, Neighbors};
 use sims_formats::saved_objects::Objects;
 use sims_formats::strings::StringTable;
 use sims_formats::tatt::Tatt;
@@ -19,6 +19,9 @@ pub struct Neighborhood {
     pub families: BTreeMap<u16, Family>,
     /// The saved type attributes (TATT #1), when the file has them.
     pub type_attributes: Option<Tatt>,
+    /// The records of the neighborhood's people (NBRS), in the file's slot
+    /// order, empty slots left out.
+    pub neighbors: Vec<Neighbor>,
 }
 
 impl Neighborhood {
@@ -41,10 +44,17 @@ impl Neighborhood {
                     .map_err(|e| Error::format(&format!("{} TATT #1", path.display()), e))
             })
             .transpose()?;
+        let mut neighbors = Vec::new();
+        for chunk in iff.all(b"NBRS") {
+            let parsed = Neighbors::parse(iff.data(chunk))
+                .map_err(|e| Error::format(&format!("{} NBRS #{}", path.display(), chunk.id), e))?;
+            neighbors.extend(parsed.entries.into_iter().flatten());
+        }
         Ok(Self {
             directory: directory.to_path_buf(),
             families,
             type_attributes,
+            neighbors,
         })
     }
 
@@ -155,9 +165,22 @@ pub struct House {
     /// which the original applies to the type table's GUIDs as it reads
     /// them (0x43dd76). Nothing reads the table itself yet.
     pub guid_table: bool,
+    /// The house's map from saved floor IDs to pattern files (FLRm), or
+    /// None when the file has none. See [`House::version`] for which chunk
+    /// this is.
+    pub floor_map: Option<Vec<SurfaceMapping>>,
+    /// The same for walls (WALm).
+    pub wall_map: Option<Vec<SurfaceMapping>>,
 }
 
 impl House {
+    /// The house's version: the version of its HOUS 1 chunk, which the
+    /// original passes to the readers of the lot arrays and of the floor
+    /// and wall maps (0x415fdf). None for a file without that chunk.
+    pub fn version(&self) -> Option<u32> {
+        self.model.as_ref().map(|model| model.version)
+    }
+
     /// Reads a house file. Saved objects are matched to their definitions
     /// through `catalog`, which must already include the neighborhood's
     /// characters; an object whose GUID it lacks is an error.
@@ -204,6 +227,18 @@ impl House {
                 }
             }
         }
+        // Before version 63 the maps are chunk 0 and hold byte IDs; from
+        // 63 they are chunk 1 and hold words (0x4a0e3b, 0x4c5d35).
+        let map_id = u16::from(model.as_ref().is_some_and(|m| m.version >= 63));
+        let surface_map = |tag: &'static [u8; 4], floor| {
+            iff.get(tag, map_id)
+                .map(|chunk| {
+                    lot::surface_map(iff.data(chunk), map_id, floor).map_err(|e| {
+                        Error::format(&location(&String::from_utf8_lossy(tag), map_id), e)
+                    })
+                })
+                .transpose()
+        };
         Ok(Self {
             path: path.to_path_buf(),
             simulator,
@@ -213,6 +248,8 @@ impl House {
             view,
             model,
             guid_table: iff.chunks.iter().any(|c| &c.tag == b"Gtab"),
+            floor_map: surface_map(b"FLRm", true)?,
+            wall_map: surface_map(b"WALm", false)?,
         })
     }
 }
