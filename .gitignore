@@ -29,6 +29,8 @@
 !/docs/legal-and-provenance.md
 !/docs/dependency-licenses.md
 !/docs/repository-workflow.md
+!/docs/vision.md
+!/docs/salvage-audit.md
 
 # Local credentials and environment overrides
 .env
