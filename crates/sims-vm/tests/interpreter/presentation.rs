@@ -1,0 +1,89 @@
+//! Refresh and Play Sound Event, whose effects are mostly presentation.
+//! The lamp runs; its stack object is the Sim.
+
+use crate::support::*;
+use sims_vm::{Fault, Trap};
+
+fn refresh(fx: &mut Fixture, selector: i16, mode: i16, stack_object: i16) -> Result<bool, Fault> {
+    let mut operands = [0; 8];
+    operands[..2].copy_from_slice(&selector.to_le_bytes());
+    operands[2..4].copy_from_slice(&mode.to_le_bytes());
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(7, RETURN_TRUE, RETURN_FALSE, operands)]),
+    );
+    fx.run_with(LAMP, 4096, stack_object, &[], 10)
+}
+
+#[test]
+fn refreshing_a_drawing_changes_nothing() {
+    let mut fx = Fixture::new();
+    let before = fx.world.hash();
+    assert_eq!(refresh(&mut fx, 0, 0, SIM as i16), Ok(true));
+    assert_eq!(refresh(&mut fx, 1, 0, SIM as i16), Ok(true));
+    assert_eq!(fx.world.hash(), before);
+}
+
+#[test]
+fn an_object_in_no_room_has_no_room_to_mark() {
+    let mut fx = Fixture::new();
+    fx.lamp_mut().data[29] = -5;
+    fx.sim_mut().data[29] = -5;
+    let before = fx.world.hash();
+    for selector in [0, 1] {
+        for mode in [1, 2] {
+            assert_eq!(refresh(&mut fx, selector, mode, SIM as i16), Ok(true));
+        }
+    }
+    assert_eq!(fx.world.hash(), before);
+}
+
+#[test]
+fn marking_a_room_fails_loudly() {
+    let mut fx = Fixture::new();
+    fx.sim_mut().data[29] = 1025;
+    for mode in [1, 2] {
+        let text = trap(refresh(&mut fx, 1, mode, SIM as i16)).to_string();
+        assert!(
+            text.contains(&format!("Refresh mode {mode} marks room 1025 dirty")),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn refresh_errors() {
+    let mut fx = Fixture::new();
+    // An invalid selector, a missing stack object, an invalid mode.
+    assert_eq!(code(refresh(&mut fx, 2, 0, SIM as i16)), Some(3));
+    assert_eq!(code(refresh(&mut fx, -1, 0, SIM as i16)), Some(3));
+    assert_eq!(code(refresh(&mut fx, 1, 0, 40)), Some(0x15));
+    assert_eq!(code(refresh(&mut fx, 1, 0, -2)), Some(0x15));
+    assert_eq!(code(refresh(&mut fx, 0, 3, SIM as i16)), Some(3));
+    assert_eq!(code(refresh(&mut fx, 0, -1, SIM as i16)), Some(3));
+    // The object is chosen before the mode is checked.
+    assert_eq!(code(refresh(&mut fx, 1, 3, 40)), Some(0x15));
+    // Mode 0 never looks at the room word.
+    fx.lamp_mut().data.truncate(20);
+    assert_eq!(refresh(&mut fx, 0, 0, SIM as i16), Ok(true));
+    assert!(matches!(
+        trap(refresh(&mut fx, 0, 2, SIM as i16)),
+        Trap::Invalid(_)
+    ));
+}
+
+#[test]
+fn play_sound_takes_the_true_branch_and_changes_nothing() {
+    let mut fx = Fixture::new();
+    let before = fx.world.hash();
+    for operands in [[0; 8], [5, 0, 0, 1, 3, 0, 0, 0], [0xff; 8]] {
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![ins(23, RETURN_TRUE, RETURN_FALSE, operands)]),
+        );
+        assert_eq!(fx.run(), Ok(true));
+    }
+    assert_eq!(fx.world.hash(), before);
+}

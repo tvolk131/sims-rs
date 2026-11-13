@@ -25,6 +25,6 @@ pub use fault::{Fault, Location, Trap};
 pub use interpreter::{Interpreter, MAX_STACK, Status, Stream};
 pub use memory::scope_name;
 pub use primitives::primitive_name;
-pub use program::{Callback, Library, Program, Tree};
+pub use program::{Callback, DEFINITION_WORDS, Library, Program, Tree};
 
 pub type Result<T> = std::result::Result<T, Error>;

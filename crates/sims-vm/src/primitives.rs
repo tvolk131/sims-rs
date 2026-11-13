@@ -3,7 +3,11 @@
 //! implementation fails with [`Trap::Unimplemented`], which names it.
 
 mod expression;
+mod object_type;
 mod random;
+mod refresh;
+mod set_to_next;
+mod sound;
 
 use crate::fault::Trap;
 use crate::interpreter::Machine;
@@ -81,7 +85,11 @@ impl Machine<'_, '_> {
     pub(crate) fn primitive(&mut self, instruction: &Instruction) -> Result<bool, Trap> {
         match instruction.opcode {
             2 => self.expression(&instruction.operands),
+            7 => self.refresh(&instruction.operands),
             8 => self.random(&instruction.operands),
+            23 => self.play_sound(&instruction.operands),
+            31 => self.set_to_next(&instruction.operands),
+            32 => self.test_object_type(&instruction.operands),
             opcode => Err(Trap::Unimplemented { opcode }),
         }
     }

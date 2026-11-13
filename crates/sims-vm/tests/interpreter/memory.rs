@@ -335,8 +335,43 @@ fn stack_object_callbacks() {
 }
 
 #[test]
+fn stack_object_definition() {
+    let mut fx = Fixture::new();
+    // The Sim's definition: type 2 in word 9, its GUID in words 14 and 15,
+    // and 1000 + i in the other words.
+    assert!(reads(&mut fx, 21, 9, 2));
+    assert!(reads(&mut fx, 21, 14, SIM_GUID as u16 as i16));
+    assert!(reads(&mut fx, 21, 0, 1000));
+    assert!(reads(&mut fx, 21, 107, 1107));
+    assert_eq!(code(read(&mut fx, 21, 108)), Some(0x23));
+    assert_eq!(code(read(&mut fx, 21, -1)), Some(0x23));
+    // Definition words are read only.
+    assert_eq!(code(write(&mut fx, 21, 0, 1)), Some(0x13));
+    // The index is checked before the stack object.
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![expression(21, 0, EQUAL, LITERAL, 0)]),
+    );
+    assert_eq!(code(fx.run_with(LAMP, 4096, 40, &[], 10)), Some(10));
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![expression(21, 108, EQUAL, LITERAL, 0)]),
+    );
+    assert_eq!(code(fx.run_with(LAMP, 4096, 40, &[], 10)), Some(0x23));
+    // The lamp's own definition, as stack object.
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![expression(21, 9, EQUAL, LITERAL, 4)]),
+    );
+    assert_eq!(fx.run_with(LAMP, 4096, LAMP as i16, &[], 10), Ok(true));
+}
+
+#[test]
 fn unsupported_scopes_name_themselves() {
-    for scope in [12, 21, 23, 24, 28, 29, 32, 33, 34, 36, 37, 38] {
+    for scope in [12, 23, 24, 28, 29, 32, 33, 34, 36, 37, 38] {
         let mut fx = Fixture::new();
         let fault = read(&mut fx, scope, 0).unwrap_err();
         assert_eq!(fault.trap, Trap::UnsupportedScope { scope });

@@ -11,6 +11,7 @@
 
 use crate::fault::Trap;
 use crate::interpreter::Machine;
+use crate::program::DEFINITION_WORDS;
 use sims_core::{Ext, F32};
 use sims_formats::saved_objects::Frame;
 use sims_sim::{Object, World};
@@ -220,6 +221,14 @@ impl Machine<'_, '_> {
                 person(stack_object, index)?
             }
             20 => slot(me_id, index)?,
+            21 => {
+                // The stack object's definition as words
+                // (legacy/crates/sims-vm/src/memory.rs:235). Definitions are
+                // normalized to 108 words, so every index in bounds reads.
+                let index = bounded(index, DEFINITION_WORDS, 0x23)?;
+                let (_, object) = self.object(stack_object, 10)?;
+                Cell::Literal(self.definition_words(object.guid)?[index])
+            }
             22 => {
                 let i = bounded(index, frame.parameters.len(), 8)?;
                 attribute(stack_object, frame.parameters[i])?
@@ -276,11 +285,10 @@ impl Machine<'_, '_> {
                         .is_some_and(|c| c.action != 0),
                 ))
             }
-            // Tree advertisements (12, 28, 29), the stack object's
-            // definition words (21), rooms (23), neighbors (24, 32), jobs
-            // (33), neighborhood data (34), type attributes (36, 37) and
-            // scope 38 need state the simulation doesn't hold yet.
-            12 | 21 | 23 | 24 | 28 | 29 | 32 | 33 | 34 | 36..=38 => {
+            // Tree advertisements (12, 28, 29), rooms (23), neighbors (24,
+            // 32), jobs (33), neighborhood data (34), type attributes (36,
+            // 37) and scope 38 need state the simulation doesn't hold yet.
+            12 | 23 | 24 | 28 | 29 | 32 | 33 | 34 | 36..=38 => {
                 return Err(unsupported(scope));
             }
             2 | 5 | 39..=255 => return Err(Trap::native(9, "invalid memory scope")),

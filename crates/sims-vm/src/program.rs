@@ -14,7 +14,16 @@ pub struct Library {
     pub constants: BTreeMap<u16, Vec<i16>>,
     /// Each OBJD's callback table, by OBJD chunk ID.
     pub callbacks: BTreeMap<u16, Vec<ObjectFunction>>,
+    /// Each OBJD as the original holds it once registered, as 16-bit words,
+    /// by OBJD chunk ID. See [`definition_words`].
+    pub definitions: BTreeMap<u16, [i16; DEFINITION_WORDS]>,
+    /// OBJD chunk IDs in the file's native resource order.
+    pub definition_order: Vec<u16>,
 }
+
+/// The words in a registered object definition: the original keeps every
+/// OBJD as a 216-byte record.
+pub const DEFINITION_WORDS: usize = 108;
 
 /// What a tree ID names, seen from an object's file.
 #[derive(Debug, Clone, Copy)]
@@ -111,25 +120,32 @@ impl Program {
                 _ => {}
             }
         }
-        for chunk in iff.all(b"OBJD") {
+        // The native resource order (the rsmp map when there is one), as the
+        // catalog registers definitions. The old prototype kept physical
+        // file order instead (legacy/crates/sims-content/src/vm.rs:187).
+        let definitions = iff
+            .resource_order(b"OBJD")
+            .map_err(|e| sims_content::Error::format(&location, e))?;
+        for chunk in definitions {
+            let words =
+                definition_words(iff.data(chunk)).map_err(|e| format("OBJD", chunk.id, e))?;
+            library.definition_order.push(chunk.id);
+            library.definitions.insert(chunk.id, words);
             let callbacks = match iff.get(b"OBJf", chunk.id) {
                 Some(table) => {
                     ObjectFunctions::parse(iff.data(table))
                         .map_err(|e| format("OBJf", table.id, e))?
                         .entries
                 }
-                None => {
-                    let bytes = iff.data(chunk);
-                    DEFINITION_CALLBACKS
-                        .iter()
-                        .map(|&offset| ObjectFunction {
-                            condition: 0,
-                            action: bytes
-                                .get(offset..offset + 2)
-                                .map_or(0, |b| u16::from_le_bytes([b[0], b[1]])),
-                        })
-                        .collect()
-                }
+                // The fallback reads the normalized record
+                // (legacy/crates/sims-content/src/vm.rs:351-370).
+                None => DEFINITION_CALLBACKS
+                    .iter()
+                    .map(|&offset| ObjectFunction {
+                        condition: 0,
+                        action: words[offset / 2] as u16,
+                    })
+                    .collect(),
             };
             library.callbacks.insert(chunk.id, callbacks);
         }
@@ -185,6 +201,12 @@ impl Program {
             .copied()
     }
 
+    /// An object definition's words, by the resource and OBJD chunk ID that
+    /// hold it.
+    pub fn definition(&self, resource: usize, chunk: u16) -> Option<&[i16; DEFINITION_WORDS]> {
+        self.libraries.get(&resource)?.definitions.get(&chunk)
+    }
+
     /// The tree an object's callback names, or 0 when it names none.
     pub fn callback(&self, object: &Object, callback: Callback) -> u16 {
         self.libraries
@@ -221,5 +243,73 @@ impl Program {
             }
         }
         value
+    }
+}
+
+/// An OBJD's words as the original holds them. Registration (0x43ba52)
+/// normalizes the resource with 0x431759 before reading any field
+/// (legacy/crates/sims-sim/src/object_catalog/definition.rs:9): versions
+/// 136 and 137 become 138, and if such a record is shorter than 216 bytes
+/// and odd, its last byte is cleared. Every version is then cut or
+/// zero-padded to 216 bytes, so all 108 words read, whatever the payload's
+/// length.
+pub(crate) fn definition_words(data: &[u8]) -> sims_formats::Result<[i16; DEFINITION_WORDS]> {
+    let version = data
+        .first_chunk::<4>()
+        .map(|&b| u32::from_le_bytes(b))
+        .ok_or_else(|| sims_formats::Error::new(0, "OBJD version absent"))?;
+    let mut bytes = data.to_vec();
+    if matches!(version, 136 | 137) {
+        bytes[..4].copy_from_slice(&138u32.to_le_bytes());
+        if bytes.len() < DEFINITION_WORDS * 2
+            && !bytes.len().is_multiple_of(2)
+            && let Some(last) = bytes.last_mut()
+        {
+            *last = 0;
+        }
+    }
+    bytes.resize(DEFINITION_WORDS * 2, 0);
+    let mut words = [0; DEFINITION_WORDS];
+    for (word, pair) in words.iter_mut().zip(bytes.as_chunks::<2>().0) {
+        *word = i16::from_le_bytes(*pair);
+    }
+    Ok(words)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFINITION_WORDS, definition_words};
+
+    #[test]
+    fn short_definitions_are_padded() {
+        let mut data = 138u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&[0x34, 0x12, 0x78]);
+        let words = definition_words(&data).unwrap();
+        assert_eq!(words[..4], [138, 0, 0x1234, 0x78]);
+        assert!(words[4..].iter().all(|&w| w == 0));
+    }
+
+    #[test]
+    fn versions_136_and_137_are_upgraded() {
+        for version in [136u32, 137] {
+            let mut data = version.to_le_bytes().to_vec();
+            data.extend_from_slice(&[0x34, 0x12, 0x78]);
+            // The odd trailing byte is cleared.
+            assert_eq!(definition_words(&data).unwrap()[..4], [138, 0, 0x1234, 0]);
+        }
+    }
+
+    #[test]
+    fn long_definitions_are_cut() {
+        let mut data = 138u32.to_le_bytes().to_vec();
+        data.resize(300, 0xff);
+        let words = definition_words(&data).unwrap();
+        assert_eq!(words.len(), DEFINITION_WORDS);
+        assert_eq!(words[DEFINITION_WORDS - 1], -1);
+    }
+
+    #[test]
+    fn a_definition_needs_a_version() {
+        assert!(definition_words(&[1, 2, 3]).is_err());
     }
 }

@@ -10,7 +10,7 @@ use sims_formats::behavior::{Behavior, Instruction};
 use sims_formats::execution::ObjectFunction;
 use sims_formats::saved_objects::{Interaction, Person, Slot};
 use sims_sim::{Budget, Object, World};
-use sims_vm::{Fault, Interpreter, Library, Program, Stream, Trap};
+use sims_vm::{DEFINITION_WORDS, Fault, Interpreter, Library, Program, Stream, Trap};
 use std::collections::BTreeMap;
 
 pub const GLOBAL: usize = 0;
@@ -223,6 +223,18 @@ fn catalog() -> Catalog {
     }
 }
 
+/// An object definition of `kind` (word 9) for `guid` (words 14 and 15), in
+/// no multi-tile group. Its other words count up from 1000.
+pub fn definition(guid: u32, kind: i16) -> [i16; DEFINITION_WORDS] {
+    let mut words = std::array::from_fn(|i| 1000 + i as i16);
+    words[9] = kind;
+    words[10] = 0;
+    words[11] = 0;
+    words[14] = guid as u16 as i16;
+    words[15] = (guid >> 16) as u16 as i16;
+    words
+}
+
 fn program() -> Program {
     let library = |constants: Vec<(u16, Vec<i16>)>, callbacks: Vec<u16>| Library {
         behaviors: BTreeMap::new(),
@@ -237,8 +249,9 @@ fn program() -> Program {
                 })
                 .collect(),
         )]),
+        ..Library::default()
     };
-    Program {
+    let mut program = Program {
         global: GLOBAL,
         libraries: BTreeMap::from([
             (GLOBAL, library(vec![(256, vec![300, 301])], vec![])),
@@ -250,7 +263,13 @@ fn program() -> Program {
             (SIM_FILE, library(vec![], vec![])),
         ]),
         semi_globals: BTreeMap::from([(LAMP_FILE, Some(SEMI_FILE)), (SIM_FILE, None)]),
+    };
+    for (resource, guid, kind) in [(LAMP_FILE, LAMP_GUID, 4), (SIM_FILE, SIM_GUID, 2)] {
+        let library = program.libraries.get_mut(&resource).unwrap();
+        library.definitions.insert(128, definition(guid, kind));
+        library.definition_order.push(128);
     }
+    program
 }
 
 pub struct Fixture {
@@ -322,6 +341,22 @@ impl Fixture {
             )]),
         );
         self.run()
+    }
+
+    /// Adds an object of the lamp's type, registered after the others.
+    pub fn add_object(&mut self, id: u16) -> &mut Object {
+        self.world.order.push(id);
+        self.world.objects.insert(id, object(id, LAMP_GUID));
+        self.world.objects.get_mut(&id).unwrap()
+    }
+
+    /// Adds a Sim of the Sim's type, registered after the others.
+    pub fn add_sim(&mut self, id: u16) -> &mut Object {
+        let mut sim = object(id, SIM_GUID);
+        sim.person = Some(person());
+        self.world.order.push(id);
+        self.world.objects.insert(id, sim);
+        self.world.objects.get_mut(&id).unwrap()
     }
 
     pub fn lamp(&self) -> &Object {
