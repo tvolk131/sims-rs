@@ -1,0 +1,16 @@
+[package]
+name = "sims-vm"
+description = "The SimAntics interpreter: linked object programs and script execution."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+sims-content.workspace = true
+sims-formats.workspace = true
+
+[lints]
+workspace = true

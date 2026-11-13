@@ -239,6 +239,7 @@ dependencies = [
  "sims-content",
  "sims-formats",
  "sims-sim",
+ "sims-vm",
 ]
 
 [[package]]
@@ -275,6 +276,14 @@ dependencies = [
  "sha2",
  "sims-content",
  "sims-core",
+ "sims-formats",
+]
+
+[[package]]
+name = "sims-vm"
+version = "0.1.0"
+dependencies = [
+ "sims-content",
  "sims-formats",
 ]
 
