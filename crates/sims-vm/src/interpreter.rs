@@ -8,7 +8,7 @@
 //! native-suspension and retained-frame machinery.
 
 use crate::fault::{Fault, Location, Trap};
-use crate::program::{Program, Tree};
+use crate::program::{DEFINITION_WORDS, Program, Tree};
 use sims_content::Catalog;
 use sims_formats::behavior::{Behavior, Instruction};
 use sims_formats::saved_objects::Frame;
@@ -202,6 +202,18 @@ impl<'a> Machine<'a, '_> {
         self.catalog
             .object(guid)
             .ok_or_else(|| Trap::Invalid(format!("no definition for GUID 0x{guid:08X}")))
+    }
+
+    /// The words of the object definition a GUID resolves to.
+    pub fn definition_words(&self, guid: u32) -> Result<&'a [i16; DEFINITION_WORDS], Trap> {
+        let definition = self.definition(guid)?;
+        self.program
+            .definition(definition.resource, definition.chunk)
+            .ok_or_else(|| {
+                Trap::Invalid(format!(
+                    "the program holds no definition for GUID 0x{guid:08X}"
+                ))
+            })
     }
 
     fn behavior(&self, owner: usize, id: u16) -> Result<&'a Behavior, Trap> {
