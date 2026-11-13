@@ -211,3 +211,50 @@ fn every_guid_needs_a_definition() {
         .to_string();
     assert!(error.contains("0x00003333"), "{error}");
 }
+
+/// The catalog's order, checked against the original on a real install
+/// when `SIMS_INSTALL` names one. Game data is never committed, so CI
+/// skips this.
+///
+/// When the original loads a lot it creates the lot-wide controllers the
+/// lot lacks, walking its catalog: every definition of type 7 or 12 with a
+/// nonzero global word. A capture of the original, taken by the old
+/// prototype's harness as the Complete Collection loaded a lot with none,
+/// holds the 141 objects that made, in creation order. The digest below is
+/// SHA-256 of their GUIDs in that order, as little-endian words. Selecting
+/// the same definitions from our catalog, in our order, must give it.
+#[test]
+fn the_catalog_lists_controllers_in_the_originals_order() {
+    use sha2::{Digest, Sha256};
+    const CAPTURED: &str = "3b30c2e6279467a816d49e377f02bc9da2ed6bf5875eed09dcde094cde298a78";
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let install = Install::detect(std::path::Path::new(&root)).unwrap();
+    let neighborhood =
+        sims_content::Neighborhood::open(&install.file("UserData").unwrap()).unwrap();
+    let mut index = Index::build(&install).unwrap();
+    index
+        .add_characters(&neighborhood.characters().unwrap().unwrap())
+        .unwrap();
+    let catalog = Catalog::build(&index).unwrap();
+    let program = Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid)).unwrap();
+    let mut digest = Sha256::new();
+    let mut count = 0;
+    for object in &catalog.objects {
+        let words = program.definition(object.resource, object.chunk).unwrap();
+        // Word 9 is the type and word 42 the global word.
+        if matches!(words[9], 7 | 12) && words[42] != 0 {
+            digest.update(object.guid.to_le_bytes());
+            count += 1;
+        }
+    }
+    assert_eq!(count, 141);
+    let digest: String = digest
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(digest, CAPTURED);
+}

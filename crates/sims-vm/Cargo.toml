@@ -14,5 +14,8 @@ sims-core.workspace = true
 sims-formats.workspace = true
 sims-sim.workspace = true
 
+[dev-dependencies]
+sha2.workspace = true
+
 [lints]
 workspace = true
