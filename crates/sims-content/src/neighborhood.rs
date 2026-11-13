@@ -151,6 +151,10 @@ pub struct House {
     pub arrays: BTreeMap<u16, Array>,
     pub view: Option<HouseView>,
     pub model: Option<lot::House>,
+    /// Whether the file has a GUID translation table (a `Gtab` chunk),
+    /// which the original applies to the type table's GUIDs as it reads
+    /// them (0x43dd76). Nothing reads the table itself yet.
+    pub guid_table: bool,
 }
 
 impl House {
@@ -208,6 +212,7 @@ impl House {
             arrays,
             view,
             model,
+            guid_table: iff.chunks.iter().any(|c| &c.tag == b"Gtab"),
         })
     }
 }

@@ -4,8 +4,10 @@ use sha2::{Digest, Sha256};
 use sims_content::{Catalog, House};
 use sims_core::{CrtRng, GameRng};
 use sims_formats::lot::{Array, Simulator};
-use sims_formats::saved_objects::{Frame, Instance, Multipart, Person, Relationship, Slot};
-use std::collections::BTreeMap;
+use sims_formats::saved_objects::{
+    Frame, Instance, Multipart, Objects, Person, Relationship, Slot,
+};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One lot's simulation state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +57,16 @@ pub struct World {
     /// game, not to the lot. Nothing sets it yet: selecting a family
     /// should.
     pub magic_history: Option<MagicHistory>,
+    /// The two indicator objects the game keeps on the lot, or 0 for none:
+    /// the marker over the selected Sim, then the one over a date
+    /// (0x445e4a). Clearing the lot removes them first (0x445f84).
+    pub indicators: [u16; 2],
+    /// The GUIDs of the object types whose scripts changed since a house
+    /// that listed them was saved (0x43a516). The original keeps this as a
+    /// flag on each definition, so it belongs to the running game and
+    /// outlives a load: reading a house's type table sets or clears the
+    /// flag of each type the table lists and leaves the others alone.
+    pub changed_types: BTreeSet<u32>,
 }
 
 /// One type's shared words. See [`World::type_attributes`].
@@ -154,6 +166,8 @@ impl World {
             instances: BTreeMap::new(),
             event_owner: 0,
             magic_history: None,
+            indicators: [0; 2],
+            changed_types: BTreeSet::new(),
         }
     }
 
@@ -180,16 +194,65 @@ impl World {
         };
     }
 
-    /// The state a saved house describes, before any script runs. Every
-    /// object must have a definition in `catalog`.
+    /// Reads a house's saved objects onto the lot (part of 0x449c5e). The
+    /// lot must hold no objects: the original clears it first. Each object
+    /// keeps its saved ID and is appended to the registration list in the
+    /// file's order (0x4434cd). An object whose type already has an
+    /// instance list is appended to it; the list of a type no script has
+    /// asked about stays unmade. Every object must have a definition in
+    /// `catalog`.
     ///
-    /// This reads the whole file onto an empty lot in one go. The original
-    /// reads the simulator state first and creates and removes the lot-wide
-    /// controllers before it reads the objects (`docs/roadmap.md`, load
-    /// sequence), so this is not a state the original passes through.
+    /// This is the saved state only, and **unverified**: no capture of the
+    /// original covers the object read. The original constructs each
+    /// object before it reads the saved fields into it. That gives an
+    /// object at least as many attributes as its definition asks for, runs
+    /// the constructors of people and of object graphics, which draw from
+    /// the C runtime's random stream, and attaches each person to its
+    /// neighborhood record. None of that happens here, so the lot load in
+    /// `docs/roadmap.md` does not use this yet.
+    ///
+    /// The order and the instance lists follow the old prototype's
+    /// `import_saved_storage_inner`
+    /// (legacy/crates/sims-content/src/save_storage.rs).
+    pub fn read_objects(&mut self, saved: &Objects, catalog: &Catalog) -> Result<()> {
+        if !self.objects.is_empty() || !self.order.is_empty() {
+            return Err(Error::NotCleared);
+        }
+        for &id in &saved.order {
+            let Some(instance) = saved.instances.get(&id) else {
+                continue;
+            };
+            if catalog.object(instance.guid).is_none() {
+                return Err(Error::MissingDefinition {
+                    object: id,
+                    guid: instance.guid,
+                });
+            }
+            self.objects.insert(id, Object::from_instance(instance));
+            self.order.push(id);
+            if let Some(instances) = self.instances.get_mut(&instance.guid) {
+                instances.push(id);
+            }
+        }
+        Ok(())
+    }
+
+    /// The state a saved house describes, before any script runs: the
+    /// whole file read onto an empty lot in one go. Every object must have
+    /// a definition in `catalog`.
+    ///
+    /// The original never holds this state. It reads the simulator state
+    /// first, creates and removes the lot-wide controllers, and only then
+    /// reads the arrays, the type table and the objects, each onto the lot
+    /// it is holding (`docs/roadmap.md`, load sequence). This is for
+    /// looking at a house file, not for loading one.
     pub fn from_house(house: &House, catalog: &Catalog) -> Result<Self> {
         let mut world = Self::empty();
         world.read_simulator(&house.simulator);
+        world.arrays = house.arrays.clone();
+        world.types = house.types.entries.iter().map(|t| (t.id, t.guid)).collect();
+        // Every object the file describes, whether or not its registration
+        // list names it.
         for (&id, instance) in &house.objects.instances {
             if catalog.object(instance.guid).is_none() {
                 return Err(Error::MissingDefinition {
@@ -200,8 +263,6 @@ impl World {
             world.objects.insert(id, Object::from_instance(instance));
         }
         world.order = house.objects.order.clone();
-        world.types = house.types.entries.iter().map(|t| (t.id, t.guid)).collect();
-        world.arrays = house.arrays.clone();
         Ok(world)
     }
 

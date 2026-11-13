@@ -15,9 +15,12 @@
 //! a [`Fault`] that names them.
 //!
 //! [`Interpreter::create`] is the original's object factory, and
-//! [`Interpreter::resize`], [`Interpreter::reconcile_controllers`] and
+//! [`Interpreter::remove_now`] and [`Interpreter::delete`] take an object
+//! off the lot and destroy it. [`Interpreter::resize`],
+//! [`Interpreter::clear`], [`Interpreter::read_types`],
+//! [`Interpreter::reconcile_controllers`] and
 //! [`Interpreter::create_indicators`] are the lot load's steps that run
-//! scripts.
+//! scripts or need the linked code.
 
 mod error;
 mod factory;
@@ -27,6 +30,7 @@ mod load;
 mod memory;
 mod primitives;
 mod program;
+mod removal;
 
 pub use error::Error;
 pub use factory::TURN_BUDGET;

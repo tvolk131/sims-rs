@@ -2,6 +2,7 @@
 //! data.
 
 mod calls;
+mod deletion;
 mod expression;
 mod factory;
 mod load;

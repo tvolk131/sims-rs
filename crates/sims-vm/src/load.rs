@@ -4,7 +4,10 @@
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
+use crate::program::Callback;
+use sims_formats::lot::{ObjectType, ObjectTypes};
 use sims_sim::World;
+use std::collections::BTreeMap;
 
 /// The two indicator objects the original keeps on every lot: the marker
 /// over the selected Sim and the one over a date (0x445e4a).
@@ -21,10 +24,11 @@ const INDOOR_AREA: usize = 27;
 impl Interpreter<'_> {
     /// Creates the two indicator objects through the factory and hides
     /// them (0x445e4a). The original does this at the end of every load,
-    /// so a lot the game holds always has them. Returns their IDs.
+    /// so a lot the game holds always has them. Their IDs go to
+    /// [`World::indicators`] and are returned.
     ///
-    /// Only the creation is ported. The original also records the IDs for
-    /// the interface and attaches the markers to Sims later.
+    /// Only the creation is ported. The original also attaches the markers
+    /// to Sims later.
     pub fn create_indicators(&self, world: &mut World) -> Result<[u16; 2], Fault> {
         let mut ids = [0; 2];
         for (id, guid) in ids.iter_mut().zip(INDICATORS) {
@@ -34,6 +38,7 @@ impl Interpreter<'_> {
                 object.data[8] |= 0x4000;
             }
         }
+        world.indicators = ids;
         Ok(ids)
     }
 
@@ -89,6 +94,95 @@ impl Interpreter<'_> {
         // (0x466c3c). A bare lot has no indoor room.
         world.globals[INDOOR_AREA] = 0;
         self.reconcile_controllers(world)
+    }
+
+    /// Whether a saved type's scripts changed since the house was saved
+    /// (0x43a516), or None for a GUID the catalog has no definition for.
+    ///
+    /// The save holds a signature of the type's Init tree and one of its
+    /// Main tree ([`crate::Program::signature`]). The type changed if the
+    /// linked Init signature differs from the saved one, or else if the
+    /// Main signatures differ. The original does not work out the Main
+    /// signature when Init already differs.
+    ///
+    /// A type table older than version 1 holds no signatures, and there
+    /// the original flags exactly the people (type 2). The reader takes
+    /// only versions 2 and 3, so that rule is not ported.
+    pub fn type_changed(&self, saved: &ObjectType) -> Option<bool> {
+        let definition = self.catalog.object(saved.guid)?;
+        let signature = |callback| {
+            self.program.signature(
+                definition.resource,
+                self.program.callback(definition, callback),
+            )
+        };
+        Some(
+            signature(Callback::Init) != saved.init_signature
+                || signature(Callback::Main) != saved.main_signature,
+        )
+    }
+
+    /// Reads a house's type table onto the lot (0x43dd76) and marks the
+    /// types whose scripts changed since the save (0x43a516). The original
+    /// does both in one pass, after it has read the lot arrays and before
+    /// it reads the objects.
+    ///
+    /// For each saved type with a definition, in the file's order, the
+    /// definition takes the saved type ID and its changed flag is set or
+    /// cleared in [`World::changed_types`] ([`Interpreter::type_changed`]).
+    /// A type the table does not list keeps the flag it had. A saved type
+    /// with no definition gets no flag and no entry.
+    ///
+    /// Then [`World::types`] is rebuilt from the definitions' saved IDs, in
+    /// catalog order. When two saved types name one definition, the
+    /// definition keeps the later ID and the earlier ID names nothing.
+    ///
+    /// The lot must hold no objects, because the frames of an object name
+    /// their code by the table this replaces. Returns the GUIDs flagged as
+    /// changed, in the file's order.
+    ///
+    /// Ported from the old prototype's `Execution::step`
+    /// (legacy/crates/sims-sim/src/saved_types.rs), which was compared with
+    /// the original's 0x43a516 run in isolation on authored records. Three
+    /// results were also compared with a capture of the original loading
+    /// the Goth house; see `docs/decisions.md`. The rest is
+    /// **unverified**.
+    ///
+    /// Not ported: a GUID translation table in the house file
+    /// (`sims_content::House::guid_table`), which the caller must refuse;
+    /// and type ID 0, which in the original
+    /// ends up naming the last definition in the catalog that no saved type
+    /// names.
+    pub fn read_types(&self, world: &mut World, saved: &ObjectTypes) -> Result<Vec<u32>, Fault> {
+        if let Some((&id, _)) = world.objects.first_key_value() {
+            return Err(Fault {
+                object: id,
+                at: None,
+                trap: Trap::Unsupported(
+                    "reading a type table onto a lot that holds objects".into(),
+                ),
+            });
+        }
+        // Each definition's saved type ID, by its place in the catalog.
+        let mut saved_ids = BTreeMap::new();
+        let mut changed = Vec::new();
+        for entry in &saved.entries {
+            let Some(&place) = self.catalog.by_guid.get(&entry.guid) else {
+                continue;
+            };
+            saved_ids.insert(place, entry.id);
+            if self.type_changed(entry) == Some(true) {
+                world.changed_types.insert(entry.guid);
+                changed.push(entry.guid);
+            } else {
+                world.changed_types.remove(&entry.guid);
+            }
+        }
+        world.types = saved_ids
+            .into_iter()
+            .map(|(place, id)| (id, self.catalog.objects[place].guid))
+            .collect();
+        Ok(changed)
     }
 
     /// Makes the lot hold exactly one of every lot-wide controller

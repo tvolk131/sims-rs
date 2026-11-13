@@ -2,8 +2,9 @@
 //!
 //! The original keeps one lot for as long as it runs and loads each house
 //! into it, and [`World`] is that lot. [`World::empty`] is the lot before
-//! any load and [`World::read_simulator`] reads a house's simulator state
-//! into it. [`World::from_house`] reads a whole saved house at once: every
+//! any load, and [`World::read_simulator`], [`World::read_arrays`] and
+//! [`World::read_objects`] read parts of a house file into it.
+//! [`World::from_house`] reads a whole saved house at once: every
 //! object with its attributes, data and script stack, the scheduler cursor,
 //! both random streams, the budget and the lot arrays. [`World::hash`]
 //! fingerprints the state, and [`Snapshots`] stores it in a REDB file.

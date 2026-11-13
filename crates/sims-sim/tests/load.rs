@@ -278,3 +278,63 @@ fn the_scheduler_word_keeps_a_countdown_and_flags() {
     object.set_countdown(19999);
     assert_eq!((object.countdown(), object.flags()), (Some(19999), 0x8003));
 }
+
+fn array(side: usize, fill: u8) -> sims_formats::lot::Array {
+    sims_formats::lot::Array {
+        width: side,
+        height: side,
+        stride: 1,
+        encoding: 0,
+        data: vec![fill; side * side],
+    }
+}
+
+#[test]
+fn the_saved_lot_arrays_replace_the_lots() {
+    use sims_sim::load::SAVED_ARRAYS;
+    let mut saved: std::collections::BTreeMap<u16, _> = SAVED_ARRAYS
+        .iter()
+        .map(|&id| (id, array(64, id as u8)))
+        .collect();
+    // An array the load does not ask for.
+    saved.insert(55, array(64, 55));
+    let mut world = lot(vec![0; 64]);
+    world.arrays.insert(1, array(64, 200));
+    world.arrays.insert(77, array(64, 77));
+    world.size = 52;
+    let before = world.clone();
+    world.read_arrays(&saved).unwrap();
+    let mut ids: Vec<u16> = SAVED_ARRAYS.to_vec();
+    ids.push(77);
+    ids.sort_unstable();
+    assert_eq!(world.arrays.keys().copied().collect::<Vec<_>>(), ids);
+    assert_eq!(world.arrays[&1].data[0], 1);
+    assert_eq!(world.arrays[&77].data[0], 77, "an array of the lot's own");
+    // Nothing else changes: the lot's size is not in the arrays.
+    world.arrays = before.arrays.clone();
+    assert_eq!(world.encode(), before.encode());
+
+    // Arrays 9 and 10 may be absent; the lot keeps its own.
+    let mut world = before.clone();
+    world.arrays.insert(9, array(64, 99));
+    saved.remove(&9);
+    saved.remove(&10);
+    world.read_arrays(&saved).unwrap();
+    assert_eq!(world.arrays[&9].data[0], 99);
+    assert!(!world.arrays.contains_key(&10));
+
+    // Any other missing array, or one of another size, changes nothing.
+    let mut world = before.clone();
+    saved.remove(&103);
+    assert_eq!(world.read_arrays(&saved), Err(LoadError::MissingArray(103)));
+    saved.insert(103, array(32, 0));
+    assert_eq!(
+        world.read_arrays(&saved),
+        Err(LoadError::ArraySize {
+            array: 103,
+            width: 32,
+            height: 32
+        })
+    );
+    assert_eq!(world.encode(), before.encode());
+}
