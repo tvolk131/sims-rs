@@ -32,6 +32,7 @@ impl Factory {
         if ids.len() != plan.len() {
             return Err("group factory registry exhaustion cleanup is unsupported".into());
         }
+        let observations = vm.terminal_observation_checkpoint();
         let before = vm.clone();
         let result = (|| {
             for (i, (&id, &number)) in ids.iter().zip(&plan).enumerate() {
@@ -55,6 +56,7 @@ impl Factory {
         })();
         if result.is_err() {
             *vm = before;
+            vm.restore_terminal_observation_checkpoint(observations);
         }
         result
     }

@@ -211,6 +211,7 @@ impl Simulation {
             ..Default::default()
         };
         if immediate {
+            let observations = self.vm.terminal_observation_checkpoint();
             let before = self.clone();
             let mut step = crate::Step {
                 stop: crate::StepStop::Waiting,
@@ -228,6 +229,7 @@ impl Simulation {
             })();
             if !matches!(result, Ok(Some(true))) {
                 *self = before;
+                self.vm.restore_terminal_observation_checkpoint(observations);
                 return Err(result.err().unwrap_or_else(|| {
                     "immediate interaction unavailable or exceeded command budget".into()
                 }));

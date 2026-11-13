@@ -5,6 +5,15 @@ use clap::Parser;
 #[path = "startup_play/host_journey.rs"]
 mod host_journey;
 
+#[path = "startup_play/alpha_discovery.rs"]
+mod alpha_discovery;
+
+#[path = "startup_play/alpha_activities.rs"]
+mod alpha_activities;
+
+#[path = "startup_play/alpha_tutorial.rs"]
+mod alpha_tutorial;
+
 #[derive(Debug, PartialEq, Eq)]
 enum NextInput {
     Dialog(u64),

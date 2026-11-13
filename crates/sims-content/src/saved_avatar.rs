@@ -101,6 +101,63 @@ mod resource_tests {
     use super::*;
 
     #[test]
+    fn live_registry_lookups_are_isolated_and_preserve_selected_source_errors() {
+        let fixture = crate::startup_memo::tests::Fixture::new();
+        let mut memo = crate::startup_memo::Memo::for_session(fixture.index.clone());
+        memo.prepare_session().unwrap();
+        let mut first =
+            BoundAvatar::empty_with_startup(&fixture.index, "root", 1, Some(&mut memo)).unwrap();
+        let mut sibling = first.clone();
+        assert!(
+            first
+                .resolve_record(&fixture.index, "first")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            first
+                .session_catalog
+                .as_ref()
+                .unwrap()
+                .0
+                .catalog
+                .get(sims_formats::avatar::index::Kind::Appearance, b"extra")
+                .is_some()
+        );
+        assert!(
+            sibling
+                .session_catalog
+                .as_ref()
+                .unwrap()
+                .0
+                .catalog
+                .get(sims_formats::avatar::index::Kind::Appearance, b"extra")
+                .is_none()
+        );
+        let unrelated = fixture
+            .root
+            .join("GameData_ALL_Recursive/Animation/lazy.cmx.bcf");
+        let mut invalid = vec![0; std::fs::metadata(&unrelated).unwrap().len() as usize];
+        invalid[4..8].copy_from_slice(&1u32.to_le_bytes());
+        invalid[8] = 127;
+        std::fs::write(unrelated, invalid).unwrap();
+        assert!(crate::avatar::appearance_catalog(&fixture.index, "eager").is_err());
+        let (selected, appearance) = sibling
+            .resolve_record(&fixture.index, "eager")
+            .unwrap()
+            .unwrap();
+        assert_eq!(appearance.name, "eager");
+        assert!(
+            sibling
+                .avatar
+                .sources
+                .contains_key(&fixture.index.resources[selected].locator)
+        );
+        std::fs::remove_file(&fixture.index.resources[selected].source).unwrap();
+        assert!(sibling.resolve_record(&fixture.index, "eager").is_err());
+    }
+
+    #[test]
     fn archive_texture_paths_keep_the_provider_conflict_guard() {
         // Only provider bytes matter to this resolver; image decoding belongs
         // to the original-asset integration test.
@@ -182,6 +239,12 @@ pub struct BoundAvatar {
     /// Derived lookup cache for this read-only installation. Like `catalogs`,
     /// it is rebuilt after restore and never substitutes for a failed read.
     missing_catalogs: std::collections::BTreeSet<String>,
+    /// Session-scoped provider order and independent lazy lookup state. Derived
+    /// from the immutable installation; never serialized into player saves.
+    session_catalog: Option<(
+        crate::avatar_installation::Loaded,
+        crate::avatar_catalog::Directories,
+    )>,
 }
 
 /// Save binding identities/order without embedding decoded textures or meshes.
@@ -236,7 +299,17 @@ impl BoundAvatar {
         owner: u64,
         state: &BindingState,
     ) -> Result<Self> {
-        Self::restore_with_geometry(index, skeleton, owner, state, |_| Ok(()))
+        Self::restore_with_startup(index, skeleton, owner, state, None)
+    }
+
+    pub(crate) fn restore_with_startup(
+        index: &Index,
+        skeleton: &str,
+        owner: u64,
+        state: &BindingState,
+        startup: Option<&mut crate::startup_memo::Memo>,
+    ) -> Result<Self> {
+        Self::restore_with_geometry(index, skeleton, owner, state, startup, |_| Ok(()))
     }
 
     /// The same immutable reconstruction, with the exact prototype keys used
@@ -249,7 +322,7 @@ impl BoundAvatar {
         state: &BindingState,
     ) -> Result<(Self, BTreeMap<u64, Vec<String>>)> {
         let mut keys = BTreeMap::new();
-        let avatar = Self::restore_with_geometry(index, skeleton, owner, state, |event| {
+        let avatar = Self::restore_with_geometry(index, skeleton, owner, state, None, |event| {
             if let GeometryEvent::Attach {
                 binding,
                 catalog_id,
@@ -285,6 +358,7 @@ impl BoundAvatar {
         skeleton: &str,
         owner: u64,
         state: &BindingState,
+        startup: Option<&mut crate::startup_memo::Memo>,
         mut geometry: impl FnMut(GeometryEvent<'_>) -> Result<()>,
     ) -> Result<Self> {
         let mut expected = BTreeMap::new();
@@ -310,7 +384,7 @@ impl BoundAvatar {
             state.next_binding > 0 && state.order.len() == expected.len(),
             "saved binding order length mismatch"
         );
-        let mut bound = Self::empty(index, skeleton, owner)?;
+        let mut bound = Self::empty_with_startup(index, skeleton, owner, startup)?;
         bound.records = state.records.clone();
         for entry in &mut bound.records.entries {
             entry.binding = None;
@@ -346,12 +420,25 @@ impl BoundAvatar {
     }
 
     pub fn empty(index: &Index, skeleton_name: &str, owner: u64) -> Result<Self> {
+        Self::empty_with_startup(index, skeleton_name, owner, None)
+    }
+
+    pub(crate) fn empty_with_startup(
+        index: &Index,
+        skeleton_name: &str,
+        owner: u64,
+        mut startup: Option<&mut crate::startup_memo::Memo>,
+    ) -> Result<Self> {
         let mut sources = BTreeMap::new();
         let skeleton = if skeleton_name.eq_ignore_ascii_case("root") {
             // Native 5a06d4 constructs this rig without a source catalog.
             sims_sim::pose::skeleton::root_source()
         } else {
-            let (skeleton, id) = crate::avatar::load_skeleton(index, skeleton_name)?;
+            let (skeleton, id) = crate::avatar::load_skeleton_with_startup(
+                index,
+                skeleton_name,
+                startup.as_deref_mut(),
+            )?;
             // Preserve the decoded catalog's source/hash in saved appearance
             // provenance, as for the earlier single-catalog loader.
             read(index, id, &mut sources)?;
@@ -375,7 +462,14 @@ impl BoundAvatar {
             next_binding: 1,
             catalogs: BTreeMap::new(),
             missing_catalogs: Default::default(),
+            session_catalog: startup
+                .as_deref()
+                .and_then(|memo| memo.session_catalog(index)),
         })
+    }
+
+    pub(crate) fn bind_session_catalog(&mut self, index: &Index, memo: &crate::startup_memo::Memo) {
+        self.session_catalog = memo.session_catalog(index);
     }
 
     pub fn auxiliary(&self) -> &BTreeMap<u64, AuxiliaryBinding> {
@@ -395,6 +489,23 @@ impl BoundAvatar {
         index: &Index,
         name: &str,
     ) -> Result<Option<(usize, avatar::Appearance)>> {
+        if let Some((installed, directories)) = &mut self.session_catalog {
+            let Some(loaded) = installed.catalog.resolve(
+                index,
+                directories,
+                sims_formats::avatar::index::Kind::Appearance,
+                name.as_bytes(),
+            )?
+            else {
+                return Ok(None);
+            };
+            let sims_formats::avatar::catalog::Asset::Appearance(appearance) = &loaded.value else {
+                anyhow::bail!("appearance registry returned another asset kind");
+            };
+            let result = (loaded.source, appearance.clone());
+            read(index, loaded.source, &mut self.avatar.sources)?;
+            return Ok(Some(result));
+        }
         if self.missing_catalogs.contains(name) {
             return Ok(None);
         }

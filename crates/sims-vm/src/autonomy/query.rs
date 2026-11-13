@@ -377,7 +377,7 @@ impl Vm {
         if t.autonomy.is_none() {
             if self.autonomy_disabled(t)? {
                 t.last_result = false;
-                crate::branch(p, t, no)?;
+                self.branch(p, t, no)?;
                 return Ok("native free-will gate declined autonomy".into());
             }
             let state = self.world.person.as_ref().unwrap();
@@ -390,7 +390,7 @@ impl Vm {
                     && context.selected_person == Some(t.stack.last().unwrap().caller))
             {
                 t.last_result = false;
-                crate::branch(p, t, no)?;
+                self.branch(p, t, no)?;
                 return Ok("native lot control gate declined autonomy".into());
             }
             t.autonomy = Some(Query::start(self, p, t)?);
@@ -490,7 +490,7 @@ impl Vm {
             t.stack.last_mut().unwrap().stack_object = candidate.object;
         }
         t.last_result = result;
-        crate::branch(p, t, if result { yes } else { no })?;
+        self.branch(p, t, if result { yes } else { no })?;
         Ok(format!(
             "Find Best Action evaluated {} candidates; selected={result}",
             q.candidates.len()

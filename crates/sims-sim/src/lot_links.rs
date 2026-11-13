@@ -115,9 +115,18 @@ impl Cursor {
             if node == self.root {
                 return Ok(());
             }
-            let parent = Links::registered(world, Links::word(world, node, 26)?)
+            let predecessor = *object
+                .data
+                .get(&26)
+                .ok_or("native physical link word absent")?;
+            let parent = Links::registered(world, predecessor)
                 .ok_or("physical iterator lost its predecessor")?;
-            slot = i32::from(Links::word(world, node, 14)?) + 1;
+            slot = i32::from(
+                *object
+                    .data
+                    .get(&14)
+                    .ok_or("native physical link word absent")?,
+            ) + 1;
             if slot < 0 {
                 return Err("physical iterator has a negative slot".into());
             }

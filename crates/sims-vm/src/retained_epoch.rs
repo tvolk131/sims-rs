@@ -208,6 +208,7 @@ impl Vm {
         Snapshot::validate_owned(
             program,
             Self {
+                terminal_observer: Default::default(),
                 world,
                 scheduled_object_visit: projection.scheduled_object_visit,
                 player_menu: projection.player_menu,

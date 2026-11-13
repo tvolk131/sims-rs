@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use sims_formats::avatar::Skeleton;
+use sims_formats::avatar::{Bone, Skeleton, Wiggle};
 use sims_sim::pose::skeleton::Instance;
 
 #[cfg(feature = "private-fixtures")]
@@ -97,4 +97,66 @@ fn original_skeleton_clone_preserves_pose_stamps_and_process_rng() {
         );
     }
     assert_eq!(report["cases"].as_array().unwrap().len(), 52);
+    let prototype = Skeleton {
+        name: "synthetic-crt-sequence".into(),
+        bones: (0usize..29)
+            .map(|index| Bone {
+                name: format!("bone-{index}"),
+                parent: index.checked_sub(1),
+                translation: [0.; 3],
+                rotation: [0., 0., 0., 1.],
+                properties: vec![],
+                flags: [1; 3],
+                wiggle: Wiggle {
+                    gradient_scale: 2,
+                    amplitude: 0.,
+                },
+            })
+            .collect(),
+    };
+    assert_eq!(prototype.bones.len(), 29);
+    assert_eq!(
+        prototype
+            .bones
+            .iter()
+            .map(|bone| 32
+                + if bone.wiggle.gradient_scale == 1 {
+                    0
+                } else {
+                    16
+                })
+            .sum::<usize>(),
+        1392
+    );
+    for (markers, loaded, before_traits, after_traits) in [
+        (0, 3504597470, 3600189262, [4281969421, 3939946756]),
+        (2, 3031781918, 317955982, [3110177490, 1750507675]),
+    ] {
+        let mut crt = 0x51a5cafe;
+        for _ in 0..2 {
+            Instance::clone_prototype(&prototype, &mut crt).unwrap();
+        }
+        assert_eq!(crt, 3504597470);
+        for _ in 0..markers {
+            Instance::root(&mut crt);
+        }
+        assert_eq!(crt, loaded, "{markers} load markers");
+        Instance::clone_prototype(&prototype, &mut crt).unwrap();
+        assert_eq!(crt, before_traits, "{markers} load markers, third rig");
+        for (iteration, expected_state) in after_traits.into_iter().enumerate() {
+            let mut person: std::collections::BTreeMap<_, _> = (0..256)
+                .map(|field| {
+                    (
+                        field as i16,
+                        (((field * 257 + iteration * 31 + 12345) % 65536) as i32 - 32768) as i16,
+                    )
+                })
+                .collect();
+            sims_vm::person_factory::default_traits(&mut person, &mut crt).unwrap();
+            assert_eq!(
+                crt, expected_state,
+                "{markers} load markers, trait {iteration}"
+            );
+        }
+    }
 }

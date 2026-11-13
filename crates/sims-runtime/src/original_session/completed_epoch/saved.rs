@@ -10,6 +10,7 @@ pub fn evaluate(saved: &Saved) -> Result<Value> {
         modules,
         normalized_object_definitions,
         animations,
+        native_animation_absences,
         headline_catalog,
         simulation,
         assets,
@@ -36,6 +37,7 @@ pub fn evaluate(saved: &Saved) -> Result<Value> {
         modules,
         normalized_object_definitions,
         animations,
+        native_animation_absences,
         headline_catalog,
         simulation,
         assets,
@@ -58,6 +60,10 @@ pub fn evaluate(saved: &Saved) -> Result<Value> {
         (
             "animations",
             "actual_clip_cache_source_closure_and_independent_Program",
+        ),
+        (
+            "native_animation_absences",
+            "complete_native_animation_inventory_and_exact_Program_proofs",
         ),
         (
             "headline_catalog",
@@ -83,7 +89,7 @@ pub fn evaluate(saved: &Saved) -> Result<Value> {
     );
     rows.last_mut().unwrap()["source_versions_and_no_starting_save_fallback_required_separately"] =
         true.into();
-    anyhow::ensure!(rows.len() == 12, "Saved field coverage inventory changed");
+    anyhow::ensure!(rows.len() == 13, "Saved field coverage inventory changed");
     let differences = rows
         .iter()
         .filter(|r| r.get("matched") == Some(&Value::Bool(false)))
@@ -91,6 +97,6 @@ pub fn evaluate(saved: &Saved) -> Result<Value> {
     Ok(
         json!({"schema":1,"comparisons":rows,"difference_count":differences,
         "native_parity_ticks":0,"complete_native_Session_admitted":false,
-        "scope":"All12 Saved root fields. Native/source equality obligations and cold Program/asset/source reconstruction are not replaced by shape checks."}),
+        "scope":"All13 Saved root fields. Native/source equality obligations and cold Program/asset/source reconstruction are not replaced by shape checks."}),
     )
 }

@@ -366,6 +366,103 @@ fn live_checks_keep_side_effects_restore_temps_once_and_resume_on_same_arena() {
 }
 
 #[test]
+fn person_without_active_join_preserves_real_checks_and_cold_continuations() {
+    let (program, mut initial) = fixture();
+    initial.world.objects.get_mut(&2).unwrap().person =
+        Some((0..256).map(|index| (index, 0)).collect());
+    initial
+        .world
+        .actions
+        .as_mut()
+        .unwrap()
+        .actors
+        .insert(2, Default::default());
+    let mut results = Vec::new();
+    for budget in [1, 64] {
+        let mut vm = initial.clone();
+        vm.begin_player_menu(&program, 1, 2).unwrap();
+        let actions = loop {
+            vm = Snapshot::capture(&program, &vm).restore(&program).unwrap();
+            let (actions, _) = vm.advance_player_menu(&program, budget).unwrap();
+            if let Some(actions) = actions {
+                break actions;
+            }
+        };
+        assert_eq!(
+            actions
+                .iter()
+                .map(|action| action.menu_id)
+                .collect::<Vec<_>>(),
+            [2, 9]
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.target == 2 && action.icon_owner == 2)
+        );
+        assert_eq!(vm.tick, initial.tick);
+        assert_eq!(vm.rng_state, initial.rng_state);
+        assert_eq!(vm.world.objects[&1].temps, initial.world.objects[&1].temps);
+        results.push((vm, actions));
+    }
+    assert_eq!(results[0], results[1]);
+}
+
+#[test]
+fn available_person_join_rejects_before_mutation_but_never_applies_to_self() {
+    let (mut program, mut vm) = fixture();
+    vm.world.objects.get_mut(&2).unwrap().person = Some((0..256).map(|index| (index, 0)).collect());
+    let entries = program
+        .modules
+        .get_mut("fixture")
+        .unwrap()
+        .object_interactions
+        .get_mut(&2)
+        .unwrap();
+    entries[0].flags |= 2;
+    entries[0].autonomy.joining_index = 9;
+    vm.world.actions.as_mut().unwrap().actors.insert(
+        2,
+        action::Actor {
+            active: Some(action::Action {
+                target: 2,
+                menu_id: 7,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    assert_eq!(vm.autonomy_join_target(&program, 2).unwrap(), Some((2, 9)));
+    let before = Snapshot::capture(&program, &vm);
+    assert!(
+        vm.begin_player_menu(&program, 1, 2)
+            .unwrap_err()
+            .contains("native join enumeration")
+    );
+    assert_eq!(Snapshot::capture(&program, &vm), before);
+    vm.world
+        .actions
+        .as_mut()
+        .unwrap()
+        .actors
+        .get_mut(&1)
+        .unwrap()
+        .active = Some(action::Action {
+        target: 2,
+        menu_id: 7,
+        ..Default::default()
+    });
+    vm.begin_player_menu(&program, 1, 1).unwrap();
+    assert!(
+        vm.advance_player_menu(&program, 1)
+            .unwrap()
+            .0
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn missing_checks_keep_native_sentinel_and_empty_tables_return_empty() {
     let (mut p, mut vm) = fixture();
     p.modules

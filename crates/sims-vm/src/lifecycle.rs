@@ -205,6 +205,7 @@ impl Vm {
         args: Option<&[i16]>,
         parent_state: Option<u32>,
     ) -> Result<(), String> {
+        let observations = self.terminal_observation_checkpoint();
         let before = self.clone();
         let mut t = self.threads.remove(&id).ok_or("missing portal thread")?;
         let result = (|| {
@@ -237,6 +238,7 @@ impl Vm {
         self.threads.insert(id, t);
         if result.is_err() {
             *self = before;
+            self.restore_terminal_observation_checkpoint(observations);
         }
         result
     }
@@ -353,6 +355,7 @@ impl Vm {
             //synchronous boundaries; batching their base resets changes order.
             return Err("cursor reset requires its ordered subclass service".into());
         }
+        let observations = self.terminal_observation_checkpoint();
         let before = self.clone();
         let result = (|| {
             for &id in &ids {
@@ -363,6 +366,7 @@ impl Vm {
         })();
         if result.is_err() {
             *self = before;
+            self.restore_terminal_observation_checkpoint(observations);
         }
         result
     }

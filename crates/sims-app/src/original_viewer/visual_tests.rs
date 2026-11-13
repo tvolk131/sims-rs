@@ -8,6 +8,12 @@ fn managed_player_save_cold_loads_with_no_original_save_files() -> Result<()> {
 }
 
 #[test]
+#[ignore = "completed original tutorial, immutable-only installation and offscreen Metal adapter"]
+fn completed_tutorial_save_cold_loads_with_prepared_thumbnail_catalog() -> Result<()> {
+    managed_iced_restore("cache/playable-alpha/tutorial-v53-shared-25-run-01/player-save.json")
+}
+
+#[test]
 #[ignore = "private v86 Newbie Buy checkpoint, immutable-only installation and offscreen Metal adapter"]
 fn managed_buy_save_cold_loads_tool_catalog_and_history_without_original_saves() -> Result<()> {
     managed_iced_restore("cache/newbie-play-20261021-10/catalog.json")
@@ -85,6 +91,10 @@ fn managed_iced_restore(checkpoint: &str) -> Result<()> {
     );
     let (mut cold, _) = Viewer::new(args);
     cold.install(ready)?;
+    ensure!(
+        cold.thumbnails.is_some(),
+        "cold-load thumbnail catalog absent"
+    );
     let session = cold.session.as_ref().unwrap();
     ensure!(
         before == serde_json::to_vec(&session.save())?,
@@ -101,6 +111,10 @@ fn managed_iced_restore(checkpoint: &str) -> Result<()> {
     // install() draws once. Inspect the exact device owner before the next
     // draw too, rather than removing its legitimate frame-generation counters.
     cold.load(&save)?;
+    ensure!(
+        cold.thumbnails.is_some(),
+        "explicit-load thumbnail catalog absent"
+    );
     ensure!(
         device
             == cold

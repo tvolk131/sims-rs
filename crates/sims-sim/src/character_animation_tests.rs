@@ -298,6 +298,226 @@ fn restore(s: &Simulation) -> Simulation {
     serde_json::from_slice(&serde_json::to_vec(s).unwrap()).unwrap()
 }
 
+fn confirmed_absence_fixture() -> (Simulation, Program, u64, AnimationAsset) {
+    let (simulation, mut program, thread, mut fallback) = fixture(0);
+    program
+        .modules
+        .get_mut("person")
+        .unwrap()
+        .strings
+        .get_mut(&150)
+        .unwrap()[37] = "fallback".into();
+    program
+        .native_animation_absences
+        .insert("test".into(), "a".repeat(64));
+    fallback.clip.name = "fallback".into();
+    fallback.clip.skill = "fallback".into();
+    (simulation, program, thread, fallback)
+}
+
+#[test]
+fn native_command_unknown_clip_still_requires_an_asset_without_mutation() {
+    let (mut simulation, mut program, thread, _) = fixture(0);
+    program
+        .native_animation_absences
+        .insert("unrelated".into(), "a".repeat(64));
+    let request = request(&simulation, thread);
+    let before = simulation.clone();
+    assert_eq!(
+        simulation
+            .pending_native_command_animation_assets(&program)
+            .unwrap(),
+        ["test".into()].into()
+    );
+    assert!(
+        simulation
+            .pending_required_animation_assets(&program)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        simulation.pending_animation_assets(&program).unwrap(),
+        ["test".into()].into()
+    );
+    let mut events = Vec::new();
+    assert!(
+        simulation
+            .service_animation(&program, thread, &request, &mut events)
+            .unwrap_err()
+            .contains("asset needs loading")
+    );
+    assert!(events.is_empty());
+    assert_eq!(simulation, before);
+}
+
+#[test]
+fn native_command_confirmed_absence_retries_real_fallback_transactionally() {
+    let (mut simulation, mut program, thread, fallback) = confirmed_absence_fixture();
+    let request = request(&simulation, thread);
+    let resident = simulation.characters.get_mut(&1).unwrap();
+    resident
+        .character
+        .skin
+        .animator
+        .start(
+            pose::animator::Slot::Foreground,
+            resident.source.as_ref().unwrap(),
+            Some(&fallback.clip),
+            false,
+            0,
+            resident.controls.settings,
+        )
+        .unwrap();
+    let before = simulation.clone();
+    for _ in 0..2 {
+        assert_eq!(
+            simulation
+                .pending_native_command_animation_assets(&program)
+                .unwrap(),
+            ["fallback".into()].into()
+        );
+        assert!(
+            simulation
+                .pending_required_animation_assets(&program)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            simulation.pending_animation_assets(&program).unwrap(),
+            ["fallback".into()].into()
+        );
+        let mut events = Vec::new();
+        assert!(
+            simulation
+                .service_animation(&program, thread, &request, &mut events)
+                .unwrap_err()
+                .contains("asset needs loading")
+        );
+        assert!(events.is_empty());
+        assert_eq!(simulation, before);
+        simulation = restore(&simulation);
+    }
+    program.animations.insert("fallback".into(), fallback);
+    let mut resumed = restore(&simulation);
+    for current in [&mut simulation, &mut resumed] {
+        let mut events = Vec::new();
+        assert!(
+            current
+                .pending_animation_assets(&program)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !current
+                .service_animation(&program, thread, &request, &mut events)
+                .unwrap()
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].thread, thread);
+        assert_eq!(events[0].detail, "missing native Foreground animation tree");
+        assert_eq!(
+            current.vm.threads[&thread].status,
+            Status::AwaitingAnimation(request.clone())
+        );
+        let resident = &current.characters[&1];
+        let animator = &resident.character.skin.animator;
+        let foreground = animator.slot(pose::animator::Slot::Foreground).unwrap();
+        assert_eq!(animator.layer(foreground).unwrap().name, "fallback");
+        assert!(!animator.finished(pose::animator::Slot::Foreground).unwrap());
+        assert_eq!(resident.controls.engaged, 1);
+        assert!(current.animations.is_empty());
+        let waiting = current.clone();
+        assert!(
+            !current
+                .service_animation(&program, thread, &request, &mut events)
+                .unwrap()
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(*current, waiting);
+    }
+    assert_eq!(simulation, resumed);
+}
+
+#[test]
+fn native_command_loaded_clip_wins_over_absence_proof() {
+    let (mut simulation, mut program, thread, asset) = fixture(0);
+    let request = request(&simulation, thread);
+    program
+        .native_animation_absences
+        .insert("test".into(), "a".repeat(64));
+    program.animations.insert("test".into(), asset);
+    assert!(
+        simulation
+            .pending_animation_assets(&program)
+            .unwrap()
+            .is_empty()
+    );
+    let mut events = Vec::new();
+    assert!(
+        !simulation
+            .service_animation(&program, thread, &request, &mut events)
+            .unwrap()
+    );
+    assert!(events.is_empty());
+    let animator = &simulation.characters[&1].character.skin.animator;
+    let foreground = animator.slot(pose::animator::Slot::Foreground).unwrap();
+    assert_eq!(animator.layer(foreground).unwrap().name, "test");
+    assert_eq!(
+        simulation.vm.threads[&thread].status,
+        Status::AwaitingAnimation(request)
+    );
+}
+
+#[test]
+fn native_command_absence_does_not_exempt_legacy_or_automatic_carry_assets() {
+    let (mut simulation, mut program, thread, _) = confirmed_absence_fixture();
+    simulation.characters.clear();
+    simulation.vm.world.objects.get_mut(&1).unwrap().slots = vec![Some(2)];
+    simulation.vm.world.objects.insert(2, Object::default());
+    program
+        .modules
+        .get_mut("person")
+        .unwrap()
+        .strings
+        .get_mut(&150)
+        .unwrap()[38] = "carry".into();
+    program
+        .native_animation_absences
+        .insert("carry".into(), "a".repeat(64));
+    let request = request(&simulation, thread);
+    let before = simulation.clone();
+    let expected: std::collections::BTreeSet<String> = ["carry".into(), "test".into()].into();
+    assert!(
+        simulation
+            .pending_native_command_animation_assets(&program)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        simulation
+            .pending_required_animation_assets(&program)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        simulation.pending_animation_assets(&program).unwrap(),
+        expected
+    );
+    let mut events = Vec::new();
+    assert_eq!(
+        simulation
+            .service_animation(&program, thread, &request, &mut events)
+            .unwrap_err(),
+        "missing loaded animation test"
+    );
+    assert_eq!(
+        simulation.sync_carry(&program).unwrap_err(),
+        "automatic carry animation not loaded: carry"
+    );
+    assert!(events.is_empty());
+    assert_eq!(simulation, before);
+}
+
 #[test]
 fn native_command_asset_retry_and_event_continuations_survive_restore() {
     let (mut s, mut p, id, asset) = fixture(32);

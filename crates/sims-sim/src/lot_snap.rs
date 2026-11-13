@@ -607,7 +607,7 @@ impl Simulation {
         let old = self.vm.world.positions[&actor];
         let mut error = n.diagnostics.error;
         let result = adjacency(
-            lot.size,
+            active_extent(&self.vm.world, lot)?,
             [old.x, old.y, old.level],
             self.vm.world.objects[&actor].data[&29],
             plan,
@@ -625,6 +625,25 @@ impl Simulation {
         self.native_lot.as_mut().unwrap().diagnostics.error = error;
         Ok(result)
     }
+}
+
+pub fn active_extent(world: &sims_vm::World, lot: &crate::lot_geometry::Lot) -> Result<usize, String> {
+    if let Some(map) = world.map_size {
+        return map.checked_size(lot.size);
+    }
+    if lot.active_size.is_some() {
+        return Ok(lot.active_extent());
+    }
+    let requested = match world.globals.get(&23).copied() {
+        Some(0) => 64,
+        Some(value) => usize::try_from(value).unwrap_or(0),
+        None => 0,
+    };
+    Ok(if (4..=lot.size).contains(&requested) {
+        requested
+    } else {
+        lot.size
+    })
 }
 
 /// 0x4550a0 invokes this only after acceptance and before SetObject. The

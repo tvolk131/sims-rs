@@ -106,7 +106,7 @@ impl Vm {
                 .last_mut()
                 .ok_or("UI-effect frame absent")?
                 .continuation = 0;
-            crate::branch(p, t, ins.on_true)?;
+            self.branch(p, t, ins.on_true)?;
             return Ok("UI-effect unknown mode returns true without reading operands".into());
         };
         let value = self.read(p, t, ins.operands[1], crate::word(&ins.operands, 2))?;

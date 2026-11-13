@@ -2,9 +2,7 @@ use anyhow::{Context, Result, ensure};
 use sims_content::{Index, object_catalog::Catalog, object_resources::Overlay};
 use sims_render::{camera_device::Device, software};
 use sims_runtime::original_session::{Saved, Session};
-use sims_sim::edit_history::snapshot::{
-    self, CaptureView, References, Registry, lifecycle, live::View, placement,
-};
+use sims_sim::edit_history::snapshot::{References, live::View};
 use sims_sim::edit_history::{
     Store,
     command::{self, Method},
@@ -12,42 +10,9 @@ use sims_sim::edit_history::{
 };
 use std::{cell::RefCell, sync::Arc};
 
-struct Live<'a>(View<'a>);
-impl Registry for Live<'_> {
-    fn lookup(&self, id: i16) -> Result<Option<u32>, String> {
-        Registry::lookup(&self.0, id)
-    }
-    fn on_lot(&mut self, id: u32) -> Result<bool, String> {
-        Registry::on_lot(&mut self.0, id)
-    }
-}
-impl CaptureView for Live<'_> {
-    fn normalized_master(&self, o: u32) -> Result<Option<u32>, String> {
-        CaptureView::normalized_master(&self.0, o)
-    }
-    fn script_id(&self, o: u32) -> Result<i16, String> {
-        CaptureView::script_id(&self.0, o)
-    }
-    fn capture(&mut self, o: u32) -> Result<snapshot::Position, String> {
-        CaptureView::capture(&mut self.0, o)
-    }
-    fn definition(&self, o: u32) -> Result<u32, String> {
-        CaptureView::definition(&self.0, o)
-    }
-    fn facing(&self, o: u32) -> Result<i16, String> {
-        CaptureView::facing(&self.0, o)
-    }
-}
-impl placement::View for Live<'_> {
-    fn facing(&self, o: u32) -> Result<i16, String> {
-        CaptureView::facing(&self.0, o)
-    }
-}
-impl lifecycle::View for Live<'_> {
-    fn manager(&self) -> Result<u32, String> {
-        Err("capture/destruction check must not request a factory manager".into())
-    }
-}
+#[path = "support/object_command_live.rs"]
+mod object_command_live;
+use object_command_live::CaptureOnly as Live;
 
 #[test]
 #[ignore = "private original houses, furniture callbacks, and headless rendering; run release"]

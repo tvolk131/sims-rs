@@ -22,11 +22,26 @@ use std::sync::Arc;
 
 const SURFACE: u32 = 1;
 mod bind;
+mod camera_motion;
 pub mod mode;
 mod normal_frame;
 pub mod panels;
 mod properties;
 mod viewport;
+
+fn validate_camera_clock_owner(session: &Session, saved: &Saved) -> Result<()> {
+    ensure!(
+        !session
+            .host
+            .presentation
+            .camera_command
+            .as_ref()
+            .is_some_and(|command| command.uses_frontend_clock())
+            || saved.mode_window.is_some(),
+        "camera motion frontend clock absent"
+    );
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct Frame {
@@ -148,7 +163,37 @@ impl Device {
     /// renderer/UI/audio boundaries.
     pub fn begin(&self, session: &mut Session, change: Change) -> Result<()> {
         self.require_unowned_normal_frame(session)?;
-        session.begin_camera_change(change, 0)
+        if matches!(change, Change::CenterPerson { .. } | Change::MotionFrame) {
+            ensure!(
+                self.saved.mode_window.is_some(),
+                "camera motion frontend clock absent"
+            );
+        }
+        session.begin_camera_change(change, 0)?;
+        self.sample_camera_clock(session)?;
+        Ok(())
+    }
+    fn sample_camera_clock(&self, session: &mut Session) -> Result<()> {
+        if !session
+            .host
+            .presentation
+            .camera_command
+            .as_ref()
+            .is_some_and(|command| command.uses_frontend_clock())
+        {
+            return Ok(());
+        }
+        validate_camera_clock_owner(session, &self.saved)?;
+        let clock = self.saved.mode_window.as_ref().unwrap().panel_inputs().2;
+        let camera = session
+            .host
+            .presentation
+            .presenter
+            .as_mut()
+            .and_then(|presenter| presenter.camera.as_mut())
+            .context("camera motion presenter absent")?;
+        camera.settings.clock = clock;
+        Ok(())
     }
     pub fn new(session: &Session) -> Result<Self> {
         let frame = Frame::current(session)?;
@@ -181,6 +226,7 @@ impl Device {
         Self::restore(session, saved)
     }
     pub fn restore(session: &Session, mut saved: Saved) -> Result<Self> {
+        validate_camera_clock_owner(session, &saved)?;
         normal_frame::validate(&saved, session)?;
         normal_frame::validate_pixels(&saved)?;
         mode::validate(session, &saved)?;
@@ -267,6 +313,7 @@ impl Device {
         })
     }
     pub fn save(&self, session: &Session) -> Result<Saved> {
+        validate_camera_clock_owner(session, &self.saved)?;
         normal_frame::validate(&self.saved, session)?;
         ensure!(
             self.saved.normal_frame.is_none() || self.frozen,
@@ -687,6 +734,9 @@ impl Device {
                 }
             }
             Listener::UiRefresh => return self.advance_property_listener(session, call, budget),
+            Listener::SpeedOverride { .. } => {
+                return self.advance_speed_override(session, call, budget);
+            }
             _ => anyhow::bail!("camera notification needs its UI owner: {service:?}"),
         }
         Ok(true)
@@ -735,7 +785,8 @@ impl Device {
             }
             _ => anyhow::bail!("house-open service needs its original owner: {request:?}"),
         };
-        session.acknowledge_house_notification(request, reply)
+        session.acknowledge_house_notification(request, reply)?;
+        self.finish_speed_override(request)
     }
     /// Drive an explicitly started native completion through the actual modern
     /// device. There is no legacy terrain-renderer pointer in this backend;
@@ -822,6 +873,13 @@ impl Device {
                 self.prepare(session)?;
                 camera::Reply::Done
             }
+            S::MotionFrame(_) | S::Displacement(_) => {
+                self.motion_frame_service(session, request)?
+            }
+            S::Portrait(camera::portrait_centering::Request::InvalidateView) => {
+                self.saved.dirty = true;
+                camera::Reply::Done
+            }
             S::Transition(T::InvalidateView)
             | S::Floor(lifecycle::Request::InvalidateView)
             | S::Cancel(motion::cancel::Request::Invalidate)
@@ -854,6 +912,7 @@ impl Device {
     /// Session owns the selected picker/Move callback after each native setter.
     pub fn advance(&mut self, session: &mut Session, budget: usize) -> Result<bool> {
         self.require_unowned_normal_frame(session)?;
+        self.sample_camera_clock(session)?;
         let input = Frame::current(session)?.input;
         match session.advance_camera_command(input, budget)? {
             Progress::Pending => (),
@@ -906,6 +965,10 @@ impl Device {
                     .as_mut()
                     .context("drawing backend absent")?;
                 session.advance_publication_drawing(drawing)?;
+            }
+            P::World(W::WindowReset) => {
+                self.saved.tool_cursor = Some(0);
+                session.complete_publication_window_reset(0)?;
             }
             P::World(
                 r @ (W::PauseAudio

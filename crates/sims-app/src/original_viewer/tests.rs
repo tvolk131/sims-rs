@@ -71,6 +71,26 @@ fn reused_resident_id_keeps_live_object_name_and_rejects_stale_controls() -> Res
     Ok(())
 }
 
+fn trace_startup_presentation(viewer: &Viewer, stage: &str) {
+    if let Some(session) = viewer.session.as_ref() {
+        let vm = &session.simulation.vm;
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "stage":stage,"tick":vm.tick,"playing":viewer.playing,
+                "globals": ([11,17,19].map(|index|(index,vm.world.globals.get(&index)))),
+                "modal":vm.world.dialogs.modal.and_then(|id|vm.world.dialogs.records.iter().find(|record|record.id==id)),
+                "clock":session.host.presentation.clock,
+                "clock_pending":session.clock_pending(),
+                "children_pending":viewer.presentation_children_pending(),
+                "client_pending":viewer.client.as_ref().is_some_and(|client|client.pending()),
+                "publication_pending":session.publication_pending(),
+                "status":viewer.status,"error":viewer.error,
+            })
+        );
+    }
+}
+
 fn drain_presentation(viewer: &mut Viewer) -> Result<()> {
     for _ in 0..10000 {
         ensure!(viewer.error.is_none(), "{:?}", viewer.error);
@@ -79,7 +99,48 @@ fn drain_presentation(viewer: &mut Viewer) -> Result<()> {
         }
         let _ = viewer.update(Message::Frame(Instant::now()));
     }
+    trace_startup_presentation(viewer, "presentation_drain_exhausted");
     anyhow::bail!("Iced presentation did not finish")
+}
+
+#[test]
+#[ignore = "original three-house installations and actual native loading"]
+fn fresh_households_prepare_thumbnail_catalog_without_gameplay_mutation() -> Result<()> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../game-data/cabinet-extracted")
+        .canonicalize()?;
+    for source in [
+        "UserData/Houses/House07.iff",
+        "UserData/Houses/House05.iff",
+        "UserData2/Houses/House09.iff",
+    ] {
+        let args = Args::parse_from([
+            "sims-room",
+            "--original",
+            source,
+            "--inferred-routing",
+            "--paused",
+            "--root",
+            root.to_str().unwrap(),
+        ]);
+        let ready = Arc::new(Ready::load(&args)?);
+        let (mut viewer, _) = Viewer::new(args);
+        viewer.install(ready)?;
+        ensure!(
+            viewer.thumbnails.is_some(),
+            "{source}: startup catalog absent"
+        );
+        let before = serde_json::to_vec(&viewer.session.as_ref().unwrap().save())?;
+        viewer.thumbnails = None;
+        viewer.prepare_thumbnail_catalog()?;
+        ensure!(viewer.thumbnails.is_some());
+        viewer.prepare_thumbnail_catalog()?;
+        ensure!(
+            before == serde_json::to_vec(&viewer.session.as_ref().unwrap().save())?,
+            "{source}: thumbnail catalog preparation changed gameplay state"
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -194,6 +255,7 @@ fn default_original_startup_completes_native_loading_for_three_homes() -> Result
         let mut modal = false;
         for _ in 0..64 {
             let _ = viewer.update(Message::Step);
+            trace_startup_presentation(&viewer, "fresh_start_after_step");
             drain_presentation(&mut viewer)?;
             ensure!(viewer.error.is_none(), "{name}: {:?}", viewer.error);
             if viewer

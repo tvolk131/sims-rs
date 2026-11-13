@@ -1,6 +1,8 @@
 //! Action records and queue decisions recovered from Sims 1.91.
 //! The eight-slot queue has observable truncation rules; it is not a sorted FIFO.
-use crate::{Object, ObjectId, Program, Thread, Vm};
+use crate::{
+    Object, ObjectId, Program, Thread, ThreadId, Vm, observations::ActionTerminalReason,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -357,6 +359,7 @@ impl Vm {
     pub(crate) fn idle_for_input(
         &mut self,
         program: &Program,
+        thread: ThreadId,
         t: &mut Thread,
         bytes: &[u8; 8],
         yes: u8,
@@ -375,7 +378,7 @@ impl Vm {
             if result {
                 dispatch.action.flags |= AVAILABLE;
             }
-            return self.finish_dispatch(program, t, dispatch);
+            return self.finish_dispatch(program, thread, t, dispatch);
         }
         let f = t.stack.last().ok_or("missing idle frame")?;
         let actor = f.caller;
@@ -420,7 +423,7 @@ impl Vm {
             IdleDecision::Complete => {
                 t.stack.last_mut().unwrap().continuation = 0;
                 t.last_result = true;
-                crate::branch(program, t, yes)?;
+                self.branch(program, t, yes)?;
                 Ok("Idle For Input completed".into())
             }
             IdleDecision::Yield => self.yield_action(t),
@@ -466,11 +469,11 @@ impl Vm {
                     saved_temps: self.world.objects[&actor].temps,
                 };
                 if !allowed {
-                    return self.finish_dispatch(program, t, dispatch);
+                    return self.finish_dispatch(program, thread, t, dispatch);
                 }
                 if entry.check == 0 {
                     dispatch.action.flags |= AVAILABLE;
-                    return self.finish_dispatch(program, t, dispatch);
+                    return self.finish_dispatch(program, thread, t, dispatch);
                 }
                 if !self.try_push_callback_start(
                     program,
@@ -485,7 +488,7 @@ impl Vm {
                         check: true,
                     },
                 )? {
-                    return self.finish_dispatch(program, t, dispatch);
+                    return self.finish_dispatch(program, thread, t, dispatch);
                 }
                 t.dispatch = Some(dispatch);
                 Ok("Idle For Input entered original eligibility callback".into())
@@ -593,6 +596,7 @@ impl Vm {
     pub(crate) fn gosub_found_action(
         &mut self,
         program: &Program,
+        thread: ThreadId,
         t: &mut Thread,
         yes: u8,
         no: u8,
@@ -625,7 +629,7 @@ impl Vm {
         };
         let Some(entry) = entry else {
             t.last_result = false;
-            crate::branch(program, t, no)?;
+            self.branch(program, t, no)?;
             return Ok("Gosub Found Action target/table unavailable".into());
         };
         if t.check {
@@ -643,6 +647,7 @@ impl Vm {
         let _ = yes; // The ordinary parent instruction branches when the child returns.
         self.finish_dispatch(
             program,
+            thread,
             t,
             Dispatch {
                 actor,
@@ -658,6 +663,7 @@ impl Vm {
     fn finish_dispatch(
         &mut self,
         program: &Program,
+        thread: ThreadId,
         t: &mut Thread,
         mut dispatch: Dispatch,
     ) -> Result<String, String> {
@@ -774,10 +780,18 @@ impl Vm {
         // 45e6cd only replaces history when the old active target is present.
         // Completion may already have moved that record into previous.
         if let Some(mut previous) = state.active.take() {
+            self.terminal_observer.retire(
+                actor,
+                &previous,
+                self.tick,
+                ActionTerminalReason::Replacement,
+            );
             previous.flags = (previous.flags & !32) | u32::from(t.last_result) * 32;
             state.previous = Some(previous);
         }
         let priority = dispatch.action.priority as i16;
+        self.terminal_observer
+            .bind(actor, &dispatch.action, thread, &t.stack);
         state.active = Some(dispatch.action);
         state.empty_action_icon = 0;
         let object = self.world.objects.get_mut(&actor).unwrap();
@@ -801,6 +815,14 @@ impl Vm {
     }
 
     pub(crate) fn finish_action_frames(&mut self, t: &mut Thread) -> Result<(), String> {
+        self.finish_action_frames_with_reason(t, ActionTerminalReason::NormalReturn)
+    }
+
+    fn finish_action_frames_with_reason(
+        &mut self,
+        t: &mut Thread,
+        reason: ActionTerminalReason,
+    ) -> Result<(), String> {
         if t.completed_actions.is_empty() {
             return Ok(());
         }
@@ -844,7 +866,7 @@ impl Vm {
             *count = count.wrapping_sub(1);
         }
         if !t.stack.iter().any(|f| f.action_target.is_some()) {
-            self.clear_person_action(actor, last_result)?;
+            self.clear_person_action(actor, last_result, reason)?;
         }
         Ok(())
     }
@@ -865,7 +887,7 @@ impl Vm {
                 t.stack.len() + 1,
             ));
         }
-        self.finish_action_frames(t)
+        self.finish_action_frames_with_reason(t, ActionTerminalReason::Reset)
     }
 
     /// Empty-action branch of 0x45e6cd. An absent active record preserves
@@ -875,6 +897,7 @@ impl Vm {
         &mut self,
         actor: ObjectId,
         last_result: bool,
+        reason: ActionTerminalReason,
     ) -> Result<bool, String> {
         let state = self
             .world
@@ -885,6 +908,8 @@ impl Vm {
             .get_mut(&actor)
             .ok_or("missing actor action state")?;
         if let Some(mut previous) = state.active.take() {
+            self.terminal_observer
+                .retire(actor, &previous, self.tick, reason);
             previous.flags = (previous.flags & !32) | u32::from(last_result) * 32;
             state.previous = Some(previous);
         }

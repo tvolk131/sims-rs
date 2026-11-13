@@ -215,7 +215,7 @@ impl Retrieval {
     }
 }
 
-pub(super) fn refresh_service(
+pub(crate) fn refresh_service(
     session: &mut Session,
     catalog: &mut Catalog<'_>,
     images: &Images,

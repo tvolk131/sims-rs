@@ -12,6 +12,9 @@ pub trait NeighborHost {
     fn live(&mut self, _definition: &crate::Definition) -> Result<Option<u32>, String> {
         Err("dialog live resource host unavailable".into())
     }
+    fn guid(&mut self, _guid: u32) -> Result<Option<u32>, String> {
+        Err("dialog GUID resource host unavailable".into())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +22,8 @@ pub struct Description {
     pub record: Record,
     /// Borrowed catalog definition handle, not a live object ID.
     pub resource: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relationship: bool,
 }
 
 /// Original text passes followed by 436279..43634d resource selection. This
@@ -33,7 +38,7 @@ pub fn describe_resources(
     host: &mut impl NeighborHost,
 ) -> Result<Description, String> {
     let resource_host = std::cell::RefCell::new(host);
-    let (record, formatted_resource) =
+    let (record, formatted_resource, named) =
         super::describe_using(p, w, frame, operands, id, true, &mut |text, id| {
             let mut selected = 0;
             let text = super::format_neighbor(
@@ -67,12 +72,20 @@ pub fn describe_resources(
         // Mode two discards the formatter's resource and resolves Stack Object
         // in the neighborhood namespace again, even after a successful lookup.
         2 if frame.stack_object > 0 => resource_host.borrow_mut().neighbor(frame.stack_object)?,
+        4 => match named {
+            Some(super::NamedIcon::Guid(guid)) => resource_host.borrow_mut().guid(guid)?,
+            _ => None,
+        },
         _ => None,
     };
     if resource == Some(0) {
         return Err("null dialog resource must be absent".into());
     }
-    Ok(Description { record, resource })
+    Ok(Description {
+        record,
+        resource,
+        relationship: named == Some(super::NamedIcon::Relationship),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +114,37 @@ impl Construction {
     }
     pub fn tick(&self) -> u64 {
         self.tick
+    }
+
+    pub fn named_icon(
+        &self,
+        program: &Program,
+        world: &World,
+    ) -> Result<Option<super::NamedIcon>, String> {
+        if (self.operands[7] >> 1) & 7 != 4 {
+            return Ok(None);
+        }
+        let (_, _, named) = super::describe_using(
+            program,
+            world,
+            &self.frame,
+            self.operands,
+            self.id,
+            false,
+            &mut |_, _| Err("Dialog neighbor resource host absent".into()),
+        )?;
+        Ok(named)
+    }
+
+    pub fn relationship_icon(&self, program: &Program, world: &World) -> Result<bool, String> {
+        Ok(self.named_icon(program, world)? == Some(super::NamedIcon::Relationship))
+    }
+
+    pub fn guid_icon(&self, program: &Program, world: &World) -> Result<Option<u32>, String> {
+        Ok(match self.named_icon(program, world)? {
+            Some(super::NamedIcon::Guid(guid)) => Some(guid),
+            _ => None,
+        })
     }
 
     /// Finish text passes and explicit resource selection before any portrait
@@ -138,7 +182,11 @@ impl Construction {
             || ins.opcode != 0x24
             || ins.operands != self.operands
             || !super::presentation::supported(self.operands[5])
-            || !matches!((self.operands[7] >> 1) & 7, 0 | 2)
+            || (!matches!((self.operands[7] >> 1) & 7, 0 | 2)
+                && !matches!(
+                    self.named_icon(p, &vm.world)?,
+                    Some(super::NamedIcon::Relationship | super::NamedIcon::Guid(_))
+                ))
             || self.returned != if self.operands[7] & 1 != 0 { 1 } else { 2 }
             || !vm.world.objects.contains_key(&self.frame.caller)
             || vm.world.dialogs.records.iter().any(|r| r.id == self.id)
@@ -239,6 +287,7 @@ impl Vm {
             || record.job_icon.is_some()
             || record.bitmap_icon.is_some()
             || record.global_bitmap_icon.is_some()
+            || record.guid_icon != request.guid_icon(p, &self.world)?
             || record.title.len() > 65536
             || record.body.len() > 65536
             || record.buttons.len() != super::presentation::button_count(request.operands[5])
@@ -248,10 +297,9 @@ impl Vm {
                 .enumerate()
                 .any(|(i, b)| b.result != i as u32 + 2 || b.label.len() > 65536)
             || self.world.dialogs.records.len() >= 4096
-            || record
-                .portrait
-                .as_ref()
-                .is_some_and(|image| !matches!(image.rect, [0, 0, 45, 45] | [0, 0, 120, 120]))
+            || record.portrait.as_ref().is_some_and(|image| {
+                !super::portrait_rect(request.operands[7], record.guid_icon, image.rect)
+            })
         {
             return Err("dialog construction result does not match request".into());
         }
@@ -266,7 +314,7 @@ impl Vm {
             t.status = Status::Sleeping { wake_tick: wake };
         } else {
             t.status = Status::Ready;
-            if let Err(e) = crate::branch(p, &mut t, yes) {
+            if let Err(e) = self.branch_in_thread(p, thread, &mut t, yes) {
                 crate::fault(&mut t, e);
             }
         }

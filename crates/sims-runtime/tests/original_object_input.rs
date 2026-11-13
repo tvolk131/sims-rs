@@ -74,8 +74,8 @@ fn tile_scan_defers_escape_and_restores_its_retained_caller() -> Result<()> {
 }
 
 #[test]
-#[ignore = "private original assets; unsupported person menu retains its owner"]
-fn original_unimplemented_person_menu_restores_and_cancels_without_removal() -> Result<()> {
+#[ignore = "private original assets; person prequery retains its owner"]
+fn original_person_menu_prequery_restores_and_cancels_without_removal() -> Result<()> {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()?;
@@ -88,15 +88,12 @@ fn original_unimplemented_person_menu_restores_and_cancels_without_removal() -> 
     )?)?;
     let saved: Saved = serde_json::from_value(value["session"].clone())?;
     let mut reports = vec![];
-    for (target, expected) in [(105, "person menu requires original join enumeration")] {
+    for target in [105] {
         let mut s = Session::restore(&index, saved.clone())?;
         s.begin_object_input(target)?;
-        ensure!(s.advance_object_input(10000).unwrap_err().to_string() == expected);
         let before = serde_json::to_vec(&s.save())?;
         std::fs::write(output.join(format!("pending-{target}.json")), &before)?;
         s = Session::restore(&index, serde_json::from_slice(&before)?)?;
-        ensure!(before == serde_json::to_vec(&s.save())?);
-        ensure!(s.advance_object_input(1).unwrap_err().to_string() == expected);
         ensure!(before == serde_json::to_vec(&s.save())?);
         let state = s.save();
         s.cancel_object_input()?;
@@ -106,7 +103,7 @@ fn original_unimplemented_person_menu_restores_and_cancels_without_removal() -> 
                 && s.host.snapshot() == state.assets
                 && s.simulation.vm.world.objects.contains_key(&target)
         );
-        reports.push(serde_json::json!({"target":target,"error":expected,"restored":true,"blocked_repeat_unchanged":true,"cancel_preserves_vm_and_object":true}));
+        reports.push(serde_json::json!({"target":target,"restored":true,"prequery_owner_retained":true,"cancel_preserves_vm_and_object":true}));
     }
     std::fs::write(
         output.join("report.json"),

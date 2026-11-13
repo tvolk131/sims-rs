@@ -71,6 +71,9 @@ pub enum Request {
     SharedInterface,
     PanelBefore,
     PanelAfter,
+    SpeedOverride {
+        active: bool,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum Stage {
@@ -102,10 +105,10 @@ impl Call {
         if ![0xf6, 0xe4, 0xe2, 0xf9, 0x83, 0x84, 0xc2, 0x109, 0xda, 0xee].contains(&event) {
             return Err("house notification branch not implemented".into());
         }
-        if event == 0x109 && receiver == Receiver::Interface {
-            return Err("original speed-override Windows panel service is not bound".into());
-        }
         let stage = match (receiver, event) {
+            (Receiver::Interface, 0x109) => {
+                Stage::Request(Request::SpeedOverride { active: value != 0 })
+            }
             (Receiver::Viewer, 0x83) => Stage::Request(Request::ViewerInvalidate),
             (_, 0x83) => Stage::Done(0),
             // All eight original house listeners ignore the transport notice.
@@ -191,7 +194,7 @@ impl Call {
             | (Receiver::Objects, 0xf6)
             | (Receiver::Globals, 0xe4 | 0xf9)
             | (Receiver::Renderer, 0x84)
-            | (Receiver::Interface, 0xf6 | 0xe4 | 0xda | 0xee) => 1,
+            | (Receiver::Interface, 0xf6 | 0xe4 | 0xda | 0xee | 0x109) => 1,
             _ => 0,
         };
         let valid = match &self.stage {
@@ -235,12 +238,14 @@ impl Call {
                 | (Receiver::Viewer, 0x84, Request::ViewerRotation { value }) => {
                     *value == self.value
                 }
+                (Receiver::Interface, 0x109, Request::SpeedOverride { active }) => {
+                    *active == (self.value != 0)
+                }
                 _ => false,
             },
         };
         if !valid
             || ![0xf6, 0xe4, 0xe2, 0xf9, 0x83, 0x84, 0xc2, 0x109, 0xda, 0xee].contains(&self.event)
-            || (self.event == 0x109 && self.receiver == Receiver::Interface)
         {
             return Err("invalid house notification continuation".into());
         }
@@ -317,5 +322,93 @@ impl Call {
     }
     pub fn value(&self) -> u32 {
         self.value
+    }
+}
+
+#[cfg(test)]
+mod speed_override_tests {
+    use super::*;
+
+    fn fields() -> Fields {
+        Fields {
+            viewer_interface: true,
+            include_visible: 1,
+            renderer_dirty: 0,
+            ui: Interface {
+                mask_owner_present: true,
+                panel_active: true,
+                shared_present: true,
+                gated: 1,
+                creation_gated: 1,
+                dirty: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn native_speed_override_requires_exact_interface_service_across_restore() {
+        for value in [0, 1, 256, u32::MAX] {
+            let mut fields = fields();
+            let before = fields.clone();
+            let mut globals = BTreeMap::new();
+            let mut call = Call::begin(
+                Receiver::Interface,
+                0x109,
+                value,
+                false,
+                &mut fields,
+                &mut globals,
+            )
+            .unwrap();
+            let request = Request::SpeedOverride { active: value != 0 };
+            assert_eq!(call.advance(&fields, &globals).unwrap(), Some(&request));
+            assert_eq!(call.returned(), None);
+            assert_eq!(fields, before);
+            call = serde_json::from_slice(&serde_json::to_vec(&call).unwrap()).unwrap();
+            call.validate().unwrap();
+            let saved = call.clone();
+            assert!(
+                call.acknowledge(&Request::SpeedOverride { active: value == 0 })
+                    .is_err()
+            );
+            assert_eq!(call, saved);
+            let mut malformed = serde_json::to_value(&call).unwrap();
+            malformed["stage"]["Request"]["SpeedOverride"]["active"] = (value == 0).into();
+            assert!(
+                serde_json::from_value::<Call>(malformed)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+            call.acknowledge(&request).unwrap();
+            assert_eq!(call.returned(), Some(1));
+            call.validate().unwrap();
+            assert_eq!(fields, before);
+            assert!(globals.is_empty());
+        }
+    }
+
+    #[test]
+    fn native_speed_override_other_house_listeners_return_unhandled() {
+        for receiver in [
+            Receiver::Base,
+            Receiver::World,
+            Receiver::Module,
+            Receiver::Objects,
+            Receiver::Globals,
+            Receiver::Lot,
+            Receiver::Viewer,
+            Receiver::Renderer,
+        ] {
+            let mut fields = fields();
+            let before = fields.clone();
+            let mut globals = BTreeMap::new();
+            let call = Call::begin(receiver, 0x109, 1, true, &mut fields, &mut globals).unwrap();
+            call.validate().unwrap();
+            assert_eq!(call.returned(), Some(0));
+            assert!(call.pending().is_none());
+            assert_eq!(fields, before);
+            assert!(globals.is_empty());
+        }
     }
 }

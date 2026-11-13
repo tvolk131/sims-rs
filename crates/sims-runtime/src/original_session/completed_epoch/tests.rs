@@ -54,7 +54,7 @@ fn run() -> Result<()> {
         (world::evaluate(&saved)?, 27),
         (options::evaluate(&saved)?, 8),
         (vm::evaluate(&saved)?, 17),
-        (saved::evaluate(&saved)?, 12),
+        (saved::evaluate(&saved)?, 13),
     ] {
         ensure!(
             report["difference_count"] == 0

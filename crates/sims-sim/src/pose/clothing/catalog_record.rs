@@ -93,7 +93,7 @@ pub enum Registered {
     Discarded,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Registry {
     names: [Names; 3],
     records: [BTreeMap<Vec<u8>, Record>; 3],

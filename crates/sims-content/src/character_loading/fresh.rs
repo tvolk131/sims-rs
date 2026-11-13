@@ -38,10 +38,24 @@ impl Fresh {
         settings: Settings,
         crt: &mut u32,
         resources: &mut crate::skeleton_resources::Cache,
+        mut startup: Option<&mut crate::startup_memo::Memo>,
     ) -> Result<Self> {
-        let prepared =
-            Prepared::begin_with_resources(index, vm, program, id, settings, crt, resources)?;
-        let avatar = BoundAvatar::empty(index, &prepared.execution.source.name, id as u64)?;
+        let prepared = Prepared::begin_with_startup(
+            index,
+            vm,
+            program,
+            id,
+            settings,
+            crt,
+            resources,
+            startup.as_deref_mut(),
+        )?;
+        let avatar = BoundAvatar::empty_with_startup(
+            index,
+            &prepared.execution.source.name,
+            id as u64,
+            startup,
+        )?;
         let geometry = CharacterGeometry::new(avatar.avatar.skeleton.bones.len());
         Ok(Self {
             prepared,
@@ -60,7 +74,11 @@ impl Fresh {
         }
     }
 
-    pub fn restore(index: &Index, saved: Saved) -> Result<Self> {
+    pub fn restore(
+        index: &Index,
+        saved: Saved,
+        startup: Option<&mut crate::startup_memo::Memo>,
+    ) -> Result<Self> {
         let id = saved.prepared.object;
         ensure!(id > 0, "invalid fresh animator owner");
         if let Some(reload) = &saved.reload {
@@ -71,11 +89,12 @@ impl Fresh {
                 "invalid fresh profile continuation"
             );
         }
-        let avatar = BoundAvatar::restore(
+        let avatar = BoundAvatar::restore_with_startup(
             index,
             &saved.prepared.execution.source.name,
             id as u64,
             &saved.binding,
+            startup,
         )?;
         ensure!(
             avatar.avatar.skeleton == saved.prepared.execution.source,
@@ -99,6 +118,7 @@ impl Fresh {
         presentation: &mut P,
         pool: &mut MeshPool,
         clothing: &mut crate::clothing_catalog::Cache,
+        mut startup: Option<&mut crate::startup_memo::Memo>,
         environment: Environment<'_>,
     ) -> Result<bool> {
         let id = self.prepared.object;
@@ -112,7 +132,14 @@ impl Fresh {
             context.actor == id,
             "initializer context belongs to another person"
         );
-        let Some(request) = self.prepared.advance(index, vm, program, context)? else {
+        let Some(request) = self.prepared.advance_with_startup(
+            index,
+            vm,
+            program,
+            context,
+            startup.as_deref_mut(),
+        )?
+        else {
             ensure!(
                 self.reload.is_none(),
                 "completed initializer still owns a reload"
@@ -134,9 +161,10 @@ impl Fresh {
                     &mut self.prepared.execution.bound,
                     &mut self.prepared.execution.scalars.placement,
                     pool,
-                    &mut crate::clothing_catalog::Installed {
+                    &mut crate::clothing_catalog::WithStartup {
                         index,
                         cache: clothing,
+                        startup,
                     },
                 )? {
                     character_appearance::notify_images(vm, id, &request)?;

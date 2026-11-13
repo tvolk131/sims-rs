@@ -434,6 +434,8 @@ fn viewer_controls_and_mid_animation_save_load_preserve_scene_and_simulation() {
     let args = Args {
         exploration_plan: None,
         exploration_output: None,
+        window_session_output: None,
+        window_session_present_library: None,
         original: None,
         laboratory: true,
         inferred_routing: false,

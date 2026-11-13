@@ -40,9 +40,9 @@ impl Assets {
         let textures = Arc::make_mut(&mut self.textures);
         let mut bound = BTreeMap::new();
         for (id, m) in materials {
-            let mut images = [[0; 4]; 3];
+            let mut coverings = [[0; 4]; 3];
             for (zoom, frames) in m.frames.iter().enumerate() {
-                images[zoom] = std::array::from_fn(|direction| {
+                coverings[zoom] = std::array::from_fn(|direction| {
                     let f = &frames[direction];
                     let texture = textures.len();
                     textures.push(Texture {
@@ -71,17 +71,12 @@ impl Assets {
                             pixel[3] = ((u16::from(pixel[3]) * u16::from(shape[3])) / 255) as u8;
                         }
                         images[zoom][direction] = textures.len();
-                        textures.push(Texture {
-                            width: f.width,
-                            height: f.height,
-                            rgba: rgba.into(),
-                            depth: f.depth.clone().into(),
-                        });
+                        textures.push(textures[coverings[zoom][direction]].with_rgba(rgba));
                     }
                 }
                 self.wall_shapes.insert((id, style, cut), images);
             }
-            bound.insert(id, images);
+            bound.insert(id, coverings);
             for ((source, base), modes) in &object_shapes {
                 for (cut, masks) in modes.iter().enumerate() {
                     let mut images = [[0; 4]; 3];
@@ -98,12 +93,7 @@ impl Assets {
                                 p[3] = ((u16::from(p[3]) * u16::from(m[3])) / 255) as u8;
                             }
                             images[zoom][direction] = textures.len();
-                            textures.push(Texture {
-                                width: f.width,
-                                height: f.height,
-                                rgba: rgba.into(),
-                                depth: f.depth.clone().into(),
-                            });
+                            textures.push(textures[coverings[zoom][direction]].with_rgba(rgba));
                         }
                     }
                     self.object_wall_shapes

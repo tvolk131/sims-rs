@@ -189,6 +189,7 @@ impl<'a> Resources<'a> {
             overlay.commit(&index.resources[source].locator, source_current[&source])?;
         }
         let overlay = Arc::new(std::sync::Mutex::new(overlay));
+        let scan: SharedScan = Arc::new(Default::default());
         let directories = Arc::new(directories);
         let mut entries = BTreeMap::new();
         for (id, component) in retained.components {
@@ -208,6 +209,7 @@ impl<'a> Resources<'a> {
                             source: Some(sources[&id]),
                             filename: stream.filename,
                             overlay: overlay.clone(),
+                            scan: scan.clone(),
                         },
                     },
                 },
@@ -230,6 +232,7 @@ impl<'a> Resources<'a> {
                     next_handle,
                     opens: vec![],
                     overlay,
+                    scan,
                     buffers: retained.buffers,
                 },
             },

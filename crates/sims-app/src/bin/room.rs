@@ -85,6 +85,10 @@ struct Args {
     /// New directory for isolated checkpoints, commands, failures and optional frames.
     #[arg(long, requires = "exploration_plan")]
     exploration_output: Option<PathBuf>,
+    #[arg(long, requires = "original", conflicts_with_all = ["exploration_plan", "screenshot"])]
+    window_session_output: Option<PathBuf>,
+    #[arg(long, requires = "window_session_output")]
+    window_session_present_library: Option<PathBuf>,
 }
 impl Args {
     fn select_default_house(&mut self) {

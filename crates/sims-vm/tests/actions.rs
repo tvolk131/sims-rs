@@ -147,6 +147,254 @@ fn restored(p: &Program, vm: &Vm) -> Vm {
     Snapshot::from_json(&serde_json::to_vec(&Snapshot::capture(p, vm)).unwrap(), p).unwrap()
 }
 
+fn dispatch_observed_action(program: &Program, vm: &mut Vm) {
+    for _ in 0..16 {
+        vm.run_slice(program, 1, 1).unwrap();
+        if vm.world.actions.as_ref().unwrap().actors[&1]
+            .active
+            .is_some()
+        {
+            return;
+        }
+    }
+    panic!("synthetic action did not dispatch");
+}
+
+#[test]
+fn terminal_observations_do_not_change_execution_rng_saves_or_equality() {
+    use observations::ActionTerminalReason;
+    for child_return in [254, 255] {
+        let (program, mut observed) = fixture(child_return, 254);
+        let mut reference = observed.clone();
+        observed.enable_terminal_observations(8);
+        let mut done = false;
+        for _ in 0..16 {
+            let actual = observed.run_slice(&program, 1, 1).unwrap();
+            assert_eq!(actual, reference.run_slice(&program, 1, 1).unwrap());
+            assert_eq!(observed, reference);
+            assert_eq!(
+                serde_json::to_vec(&observed).unwrap(),
+                serde_json::to_vec(&reference).unwrap()
+            );
+            assert_eq!(
+                Snapshot::capture(&program, &observed),
+                Snapshot::capture(&program, &reference)
+            );
+            if actual.stop != Stop::Budget {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
+        assert!(!reference.terminal_observations().enabled());
+        assert!(reference.drain_terminal_observations().is_empty());
+        let events = observed.drain_terminal_observations();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, ActionTerminalReason::NormalReturn);
+        assert_eq!(events[0].result, Some(child_return == 254));
+        assert_eq!(
+            (events[0].actor, events[0].serial, events[0].target),
+            (1, 1, 2)
+        );
+        assert_eq!(events[0].thread, Some(1));
+        assert_eq!(events[0].invocation, Some(1));
+        assert!(!events[0].cancelled);
+        assert_eq!(observed.terminal_observations().dropped(), 0);
+    }
+}
+
+#[test]
+fn terminal_observations_ignore_nested_returns_until_outer_action_returns() {
+    let (mut program, mut vm) = fixture(254, 254);
+    let module = program.modules.get_mut("fixture").unwrap();
+    module
+        .routines
+        .insert(4099, routine(vec![expr(0, 1, 88, 254)]));
+    module.routines.insert(
+        4097,
+        routine(vec![
+            Instruction {
+                opcode: 4099,
+                on_true: 1,
+                on_false: 1,
+                operands: [0; 8],
+            },
+            expr(0, 1, 99, 255),
+        ]),
+    );
+    vm.enable_terminal_observations(8);
+    dispatch_observed_action(&program, &mut vm);
+    assert_eq!(vm.threads[&1].stack.len(), 2);
+    vm.run_slice(&program, 1, 1).unwrap();
+    assert_eq!(vm.threads[&1].stack.len(), 3);
+    vm.run_slice(&program, 1, 1).unwrap();
+    assert_eq!(vm.threads[&1].stack.len(), 2);
+    assert!(vm.terminal_observations().events().is_empty());
+    assert!(
+        vm.world.actions.as_ref().unwrap().actors[&1]
+            .active
+            .is_some()
+    );
+    vm.run_slice(&program, 1, 1).unwrap();
+    let events = vm.drain_terminal_observations();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].reason,
+        observations::ActionTerminalReason::NormalReturn
+    );
+    assert_eq!(events[0].result, Some(false));
+}
+
+#[test]
+fn terminal_observations_saved_active_actions_remain_unqualified_after_opt_in() {
+    let (program, mut producer) = fixture(254, 254);
+    producer.enable_terminal_observations(8);
+    dispatch_observed_action(&program, &mut producer);
+    let mut saved = restored(&program, &producer);
+    assert!(!saved.terminal_observations().enabled());
+    saved.enable_terminal_observations(8);
+    saved.run_slice(&program, 1, 1).unwrap();
+    assert_eq!(
+        saved.drain_terminal_observations()[0].reason,
+        observations::ActionTerminalReason::Unqualified
+    );
+    assert!(producer.terminal_observations().events().is_empty());
+    producer.run_slice(&program, 1, 1).unwrap();
+    assert_eq!(
+        producer.drain_terminal_observations()[0].reason,
+        observations::ActionTerminalReason::NormalReturn
+    );
+}
+
+#[test]
+fn terminal_observations_cancellation_is_recorded_only_when_the_active_serial_retires() {
+    let (program, mut vm) = fixture(254, 254);
+    vm.enable_terminal_observations(8);
+    dispatch_observed_action(&program, &mut vm);
+    let serial = vm.world.actions.as_ref().unwrap().actors[&1]
+        .active
+        .as_ref()
+        .unwrap()
+        .id;
+    assert!(!vm.cancel_action(&program, 1, serial + 100).unwrap());
+    assert!(vm.cancel_action(&program, 1, serial).unwrap());
+    assert!(vm.terminal_observations().events().is_empty());
+    vm.run_slice(&program, 1, 1).unwrap();
+    vm.world
+        .actions
+        .as_mut()
+        .unwrap()
+        .actors
+        .get_mut(&1)
+        .unwrap()
+        .previous = None;
+    let events = vm.drain_terminal_observations();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].serial, serial);
+    assert_eq!(
+        events[0].reason,
+        observations::ActionTerminalReason::NormalReturn
+    );
+    assert_eq!(events[0].result, Some(true));
+    assert!(events[0].cancelled);
+}
+
+#[test]
+fn terminal_observations_replacement_never_uses_the_predecessor_result_bit() {
+    let (program, mut vm) = fixture(254, 254);
+    let mut previous = action(100, 900);
+    previous.flags = action::CANCELLED | 32;
+    vm.world
+        .actions
+        .as_mut()
+        .unwrap()
+        .actors
+        .get_mut(&1)
+        .unwrap()
+        .active = Some(previous);
+    vm.enable_terminal_observations(8);
+    for _ in 0..16 {
+        vm.run_slice(&program, 1, 1).unwrap();
+        if !vm.terminal_observations().events().is_empty() {
+            break;
+        }
+    }
+    let events = vm.drain_terminal_observations();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].serial, 900);
+    assert_eq!(
+        events[0].reason,
+        observations::ActionTerminalReason::Replacement
+    );
+    assert_eq!(events[0].result, None);
+    assert!(events[0].cancelled);
+}
+
+#[test]
+fn terminal_observations_queue_and_previous_disappearance_are_not_terminals() {
+    let (program, mut vm) = fixture(254, 254);
+    vm.enable_terminal_observations(8);
+    let actor = vm
+        .world
+        .actions
+        .as_mut()
+        .unwrap()
+        .actors
+        .get_mut(&1)
+        .unwrap();
+    actor.queue.pending.clear();
+    actor.previous = Some(action(10, 21));
+    actor.previous = None;
+    vm.run_slice(&program, 1, 1).unwrap();
+    assert!(vm.terminal_observations().events().is_empty());
+}
+
+#[test]
+fn terminal_observations_route_owner_requires_the_exact_live_outer_action_and_request() {
+    let (mut program, mut vm) = fixture(254, 254);
+    program.modules.get_mut("fixture").unwrap().routines.insert(
+        4097,
+        routine(vec![Instruction {
+            opcode: 0x1b,
+            on_true: 254,
+            on_false: 255,
+            operands: [0; 8],
+        }]),
+    );
+    vm.enable_terminal_observations(8);
+    dispatch_observed_action(&program, &mut vm);
+    vm.run_slice(&program, 1, 1).unwrap();
+    let Status::AwaitingRoute(request) = vm.threads[&1].status.clone() else {
+        panic!("action route request absent");
+    };
+    assert_eq!(vm.native_route_action_owner(1, &request), Some((1, 1)));
+    let mut stale = request.clone();
+    stale.id += 1;
+    assert_eq!(vm.native_route_action_owner(1, &stale), None);
+    assert_eq!(vm.native_route_action_owner(2, &request), None);
+    let mut preview = vm.clone();
+    preview.enable_terminal_observations(8);
+    assert_eq!(preview.native_route_action_owner(1, &request), None);
+    let active = vm
+        .world
+        .actions
+        .as_mut()
+        .unwrap()
+        .actors
+        .get_mut(&1)
+        .unwrap()
+        .active
+        .as_mut()
+        .unwrap();
+    active.id += 1;
+    assert_eq!(vm.native_route_action_owner(1, &request), None);
+    vm.finish_route(&program, 1, request.id, false).unwrap();
+    assert_eq!(
+        vm.drain_terminal_observations()[0].reason,
+        observations::ActionTerminalReason::Unqualified
+    );
+}
+
 #[cfg(feature = "private-fixtures")]
 #[test]
 fn inherited_action_labels_match_original_queue_and_restore() {

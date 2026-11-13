@@ -37,6 +37,7 @@ fn program(mode: u8) -> Program {
         resource_storage: None,
         careers: None,
         accessories: BTreeMap::new(),
+        native_animation_absences: BTreeMap::new(),
         globals: "person".into(),
         modules: BTreeMap::from([("person".into(), module)]),
         animations: names

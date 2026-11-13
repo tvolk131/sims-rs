@@ -28,6 +28,9 @@ impl Viewer {
                 ready: !pending
                     && self.error.is_none()
                     && s.simulation.vm.world.dialogs.modal.is_none(),
+                transport_ready: (!pending || self.native_clock())
+                    && self.error.is_none()
+                    && s.simulation.vm.world.dialogs.modal.is_none(),
                 mode_raw: s
                     .host
                     .presentation
@@ -41,13 +44,14 @@ impl Viewer {
                 native_clock: self.native_clock(),
                 pause_raw: self.device.as_ref().and_then(CameraDevice::transport_pause),
                 people_visible: self.people_panel_visible(),
-                clock: household_text_label(s, texts.map(|t| t.clock()).unwrap_or_default(), true)
-                    .unwrap_or_default(),
+                clock: household_clock_label(s).unwrap_or_default(),
                 funds: household_funds_label(s, texts.map(|t| t.funds()).unwrap_or_default())
                     .unwrap_or_default(),
                 buttons: Buttons {
                     live: button(sims_vm::interface::view_control::Widget::Live),
                     buy: button(sims_vm::interface::view_control::Widget::Buy),
+                    options: s.host.presentation.tool_selection.as_ref().and_then(|owner| owner.mode_context())
+                        .and_then(|_| button(sims_vm::interface::view_control::Widget::Options)),
                     zoom_in: button(sims_vm::interface::view_control::Widget::ZoomIn),
                     zoom_out: button(sims_vm::interface::view_control::Widget::ZoomOut),
                     floor_one: button(sims_vm::interface::view_control::Widget::FloorOne),
@@ -55,6 +59,33 @@ impl Viewer {
                     normal: button(sims_vm::interface::view_control::Widget::Normal),
                     fast: button(sims_vm::interface::view_control::Widget::Fast),
                     ultra: button(sims_vm::interface::view_control::Widget::Ultra),
+                    walls_down: button(sims_vm::interface::view_control::Widget::WallsDown),
+                    walls_up: button(sims_vm::interface::view_control::Widget::WallsUp),
+                    cutaway: button(sims_vm::interface::view_control::Widget::Cutaway),
+                    walls: s
+                        .host
+                        .presentation
+                        .publication
+                        .as_ref()
+                        .map(|publication| publication.walls())
+                        .or_else(|| {
+                            s.host
+                                .presentation
+                                .frontend_context
+                                .as_ref()
+                                .map(|fields| fields.walls)
+                        })
+                        .or_else(|| {
+                            s.host.presentation.presenter.as_ref().map(|presenter| {
+                                if presenter.view.floor.all_walls != 0 {
+                                    2
+                                } else if presenter.view.floor.visibility.enabled != 0 {
+                                    4
+                                } else {
+                                    1
+                                }
+                            })
+                        }),
                 },
             },
             art: self.art.clone(),

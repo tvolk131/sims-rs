@@ -50,6 +50,27 @@ impl Cache {
     pub fn loaded(&self) -> bool {
         self.names.is_some()
     }
+    fn names_using(&mut self, load: impl FnOnce() -> Result<Names>) -> Result<&Names> {
+        if self
+            .names
+            .as_ref()
+            .is_none_or(|n| n.bodies.is_empty() || n.textures.names.is_empty())
+        {
+            ensure!(
+                !self.retained,
+                "native clothing cache population requires its observed catalog/path provider"
+            );
+            let names = load()?;
+            let retained = self.names.get_or_insert_with(Names::default);
+            if retained.bodies.is_empty() {
+                retained.bodies = names.bodies;
+            }
+            if retained.textures.names.is_empty() {
+                retained.textures = names.textures;
+            }
+        }
+        Ok(self.names.as_ref().unwrap())
+    }
     pub fn validate(&self, index: &crate::Index) -> Result<()> {
         if self.retained {
             return self.validate_retained();
@@ -85,26 +106,29 @@ pub struct Installed<'a> {
 }
 impl Provider for Installed<'_> {
     fn names(&mut self) -> Result<&Names> {
-        if self
-            .cache
-            .names
-            .as_ref()
-            .is_none_or(|n| n.bodies.is_empty() || n.textures.names.is_empty())
-        {
-            ensure!(
-                !self.cache.retained,
-                "native clothing cache population requires its observed catalog/path provider"
-            );
-            let names = installed_names(self.index)?;
-            let retained = self.cache.names.get_or_insert_with(Names::default);
-            if retained.bodies.is_empty() {
-                retained.bodies = names.bodies;
-            }
-            if retained.textures.names.is_empty() {
-                retained.textures = names.textures;
-            }
-        }
-        Ok(self.cache.names.as_ref().unwrap())
+        self.cache.names_using(|| installed_names(self.index))
+    }
+}
+
+/// Keep the saved clothing cache lazy while reusing a live session's prepared
+/// installation at the first actual outfit request. Research callers without
+/// a memo retain the ordinary source-backed discovery path.
+pub(crate) struct WithStartup<'a> {
+    pub index: &'a crate::Index,
+    pub cache: &'a mut Cache,
+    pub startup: Option<&'a mut crate::startup_memo::Memo>,
+}
+impl Provider for WithStartup<'_> {
+    fn names(&mut self) -> Result<&Names> {
+        self.cache.names_using(|| {
+            let Some(startup) = self.startup.as_deref_mut() else {
+                return installed_names(self.index);
+            };
+            let (loaded, mut directories) = startup.installed_catalog(self.index)?;
+            let mut names = Names::default();
+            names.load(&loaded, &mut directories)?;
+            Ok(names)
+        })
     }
 }
 
@@ -123,13 +147,25 @@ pub fn installed_names(index: &crate::Index) -> Result<Names> {
 /// its complete provider order and source-error checks when proving a missing
 /// appearance; a failed global filename scan alone cannot establish absence.
 pub(crate) fn installed_catalog(index: &crate::Index) -> Result<(Loaded, Directories)> {
+    let installation = crate::avatar_installation::Installation::new(
+        index,
+        crate::avatar_installation::complete_collection_asset_bindings(&index.root),
+    )?;
+    installed_catalog_from(index, installation, None)
+}
+
+pub(crate) fn installed_catalog_from(
+    index: &crate::Index,
+    mut installation: crate::avatar_installation::Installation<'_>,
+    inputs: Option<&crate::startup_inputs::Session>,
+) -> Result<(Loaded, Directories)> {
     use crate::{
-        avatar_installation::{Installation, complete_collection_asset_bindings},
         object_catalog::{Catalog, Settings},
         object_resources::Resources,
     };
-    let mut installation =
-        Installation::new(index, complete_collection_asset_bindings(&index.root))?;
+    if let Some(inputs) = inputs {
+        installation.observe(inputs);
+    }
     let initial = installation.initial_mounts(b"./", 255, false)?;
     let paths = sims_sim::object_scan::Paths {
         objects: initial[1].clone(),
@@ -145,6 +181,9 @@ pub(crate) fn installed_catalog(index: &crate::Index) -> Result<(Loaded, Directo
         installation.directories()?,
         installation.directory_search(),
     );
+    if let Some(inputs) = inputs {
+        resources.observe(inputs)?;
+    }
     let global = resources
         .acquire(&[initial[0].as_slice(), b"Global"].concat(), 0)
         .map_err(anyhow::Error::msg)?

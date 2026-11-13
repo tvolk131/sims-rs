@@ -33,6 +33,8 @@ pub struct GlobalBitmap {
 pub enum NamedIcon {
     Job(i32),
     Global(GlobalBitmap),
+    Relationship,
+    Guid(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +103,8 @@ pub struct Record {
     pub bitmap_icon: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_bitmap_icon: Option<GlobalBitmap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guid_icon: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub portrait: Option<Image>,
     pub status: u32,
@@ -413,7 +417,10 @@ pub fn named_icon(text: &str) -> Result<Option<NamedIcon>, String> {
     // 46f874/46f891 compares ASCII letters without case; only literal spaces
     // separate the two buffers. Numeric conversion is CRT atoi (636029).
     let category = category.to_ascii_lowercase();
-    if !matches!(category.as_str(), "job" | "gz" | "gzi") {
+    if category == "rel" {
+        return Ok(Some(NamedIcon::Relationship));
+    }
+    if !matches!(category.as_str(), "job" | "gz" | "gzi" | "guid") {
         return Err(format!(
             "Dialog named icon category {category:?} unsupported"
         ));
@@ -435,6 +442,7 @@ pub fn named_icon(text: &str) -> Result<Option<NamedIcon>, String> {
         number
     } as i32;
     Ok(match category.as_str() {
+        "guid" => Some(NamedIcon::Guid(number as u32)),
         "job" => (-1..=21)
             .contains(&number)
             .then_some(NamedIcon::Job(number)),
@@ -450,6 +458,8 @@ pub fn named_job_icon(text: &str) -> Result<Option<i32>, String> {
         None => Ok(None),
         Some(NamedIcon::Job(job)) => Ok(Some(job)),
         Some(NamedIcon::Global(_)) => Err("named icon requires global bitmap loader".into()),
+        Some(NamedIcon::Relationship) => Err("named icon requires relationship image loader".into()),
+        Some(NamedIcon::Guid(_)) => Err("named icon requires GUID resource image loader".into()),
     }
 }
 
@@ -476,19 +486,21 @@ pub fn private_bitmap_id(index: u8) -> u16 {
     5000 + u16::from(index)
 }
 
+pub(crate) fn portrait_rect(flags: u8, guid: Option<u32>, rect: [i32; 4]) -> bool {
+    match (flags >> 1) & 7 {
+        0 | 2 => matches!(rect, [0, 0, 45, 45] | [0, 0, 120, 120]),
+        4 if guid.is_some() => rect == [0, 0, 45, 45],
+        4 => rect == [80, 0, 120, 40],
+        _ => false,
+    }
+}
+
 pub fn response_status(current: u32, result: u32, immediate: bool) -> u32 {
     if (2..5).contains(&result) {
         if immediate { 5 } else { result }
     } else {
         current
     }
-}
-
-fn describe(p: &Program, w: &World, f: &Frame, b: [u8; 8], id: u64) -> Result<Record, String> {
-    describe_using(p, w, f, b, id, false, &mut |_, _| {
-        Err("Dialog neighbor resource host absent".into())
-    })
-    .map(|(record, _)| record)
 }
 
 fn describe_using(
@@ -499,7 +511,7 @@ fn describe_using(
     id: u64,
     neighbor_available: bool,
     neighbor: &mut impl FnMut(&str, i16) -> Result<(String, Option<u32>), String>,
-) -> Result<(Record, Option<u32>), String> {
+) -> Result<(Record, Option<u32>, Option<NamedIcon>), String> {
     let mode = b[5] & 127;
     if !presentation::supported(mode) {
         return Err(format!("Dialog presentation mode {mode} unsupported"));
@@ -624,6 +636,10 @@ fn describe_using(
         Some(NamedIcon::Global(image)) => Some(image),
         _ => None,
     };
+    let guid_icon = match named {
+        Some(NamedIcon::Guid(guid)) => Some(guid),
+        _ => None,
+    };
     let bitmap_icon = if icon_mode == 3 {
         icon = FormattedIcon::default();
         Some(private_bitmap_id(b[1]))
@@ -664,10 +680,12 @@ fn describe_using(
             job_icon,
             bitmap_icon,
             global_bitmap_icon,
+            guid_icon,
             portrait: None,
             status: 0,
         },
         icon.resource,
+        named,
     ))
 }
 
@@ -757,7 +775,27 @@ impl Vm {
             &mut temps,
             &mut status,
         )?;
-        if step.effects.contains(&Effect::Create) && matches!((ins.operands[7] >> 1) & 7, 0 | 2) {
+        let immediate = if step.effects.contains(&Effect::Create)
+            && !matches!((ins.operands[7] >> 1) & 7, 0 | 2)
+        {
+            Some(describe_using(
+                p,
+                &self.world,
+                f,
+                ins.operands,
+                self.next_request,
+                false,
+                &mut |_, _| Err("Dialog neighbor resource host absent".into()),
+            )?)
+        } else {
+            None
+        };
+        if step.effects.contains(&Effect::Create)
+            && (matches!((ins.operands[7] >> 1) & 7, 0 | 2)
+                || immediate.as_ref().is_some_and(|(_, _, icon)| {
+                    matches!(icon, Some(NamedIcon::Relationship | NamedIcon::Guid(_)))
+                }))
+        {
             if self.world.dialogs.records.len() >= 4096 {
                 return Err("Dialog registry exceeds limit".into());
             }
@@ -785,13 +823,7 @@ impl Vm {
             if self.world.dialogs.records.len() >= 4096 {
                 return Err("Dialog registry exceeds limit".into());
             }
-            Some(describe(
-                p,
-                &self.world,
-                f,
-                ins.operands,
-                self.next_request,
-            )?)
+            Some(immediate.ok_or("Dialog immediate description absent")?.0)
         } else {
             None
         };
@@ -816,7 +848,7 @@ impl Vm {
                 wake_tick: self.tick.checked_add(1).ok_or("Dialog tick overflow")?,
             };
         } else {
-            crate::branch(
+            self.branch(
                 p,
                 t,
                 if step.returned == 1 {
@@ -928,10 +960,18 @@ impl Vm {
                 || r.global_bitmap_icon.is_some_and(|icon| {
                     icon.id == 0 || (r.operands[7] >> 1) & 7 != 4 || r.job_icon.is_some()
                 })
+                || r.guid_icon.is_some_and(|_| {
+                    (r.operands[7] >> 1) & 7 != 4
+                        || r.job_icon.is_some()
+                        || r.global_bitmap_icon.is_some()
+                        || r.bitmap_icon.is_some()
+                })
                 || (r.operands[7] >> 1) & 7 != 0 && r.icon_object.is_some()
                 || r.portrait.as_ref().is_some_and(|image| {
-                    !matches!((r.operands[7] >> 1) & 7, 0 | 2)
-                        || !matches!(image.rect, [0, 0, 45, 45] | [0, 0, 120, 120])
+                    !portrait_rect(r.operands[7], r.guid_icon, image.rect)
+                        || r.job_icon.is_some()
+                        || r.global_bitmap_icon.is_some()
+                        || r.bitmap_icon.is_some()
                         || self
                             .world
                             .image_cache

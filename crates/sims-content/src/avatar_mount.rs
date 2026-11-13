@@ -10,6 +10,7 @@ use sims_sim::pose::clothing::{
 };
 use std::{
     collections::BTreeMap,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -23,6 +24,7 @@ struct Archive {
 }
 
 pub struct Sources<'a> {
+    inputs: Option<crate::startup_inputs::Session>,
     index: &'a Index,
     archive_sources: Option<BTreeMap<&'a Path, Vec<usize>>>,
     archives: BTreeMap<Vec<u8>, Archive>,
@@ -33,6 +35,7 @@ pub struct Sources<'a> {
 impl<'a> Sources<'a> {
     pub fn new(index: &'a Index) -> Self {
         Self {
+            inputs: None,
             index,
             archive_sources: None,
             archives: BTreeMap::new(),
@@ -40,6 +43,9 @@ impl<'a> Sources<'a> {
             directories: BTreeMap::new(),
             open_failures: vec![],
         }
+    }
+    pub(crate) fn observe(&mut self, inputs: crate::startup_inputs::Session) {
+        self.inputs = Some(inputs);
     }
     pub fn bind_archive(&mut self, virtual_path: &[u8], physical: &Path) -> Result<()> {
         let path = key(virtual_path)?;
@@ -176,16 +182,55 @@ impl<'a> Sources<'a> {
 fn key(path: &[u8]) -> Result<Vec<u8>> {
     Files::<()>::key(path).map_err(anyhow::Error::msg)
 }
+fn read_archive(input: &mut (impl Read + Seek), identity: u32) -> std::io::Result<Opened> {
+    Ok(read_archive_bytes(input)?.opened(identity))
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArchiveInput {
+    header: Vec<u8>,
+    directory: Vec<u8>,
+}
+impl ArchiveInput {
+    pub(crate) fn len(&self) -> usize {
+        self.header.len().saturating_add(self.directory.len())
+    }
+    fn opened(self, identity: u32) -> Opened {
+        Opened::from_directory(identity, self.header, self.directory)
+    }
+}
+pub(crate) fn read_archive_input(path: &Path) -> std::io::Result<ArchiveInput> {
+    read_archive_bytes(&mut std::fs::File::open(path)?)
+}
+fn read_archive_bytes(input: &mut (impl Read + Seek)) -> std::io::Result<ArchiveInput> {
+    let mut header = Vec::new();
+    input.by_ref().take(16).read_to_end(&mut header)?;
+    let mut directory = Vec::new();
+    if let Some(offset) = header.get(12..16) {
+        let offset = u32::from_le_bytes(offset.try_into().unwrap());
+        if (offset as usize) < header.len() {
+            directory.extend_from_slice(&header[offset as usize..]);
+        } else {
+            input.seek(SeekFrom::Start(u64::from(offset)))?;
+        }
+        input.read_to_end(&mut directory)?;
+    }
+    Ok(ArchiveInput { header, directory })
+}
 impl ArchiveHost for Sources<'_> {
     fn open(&mut self, path: &[u8]) -> Result<Option<Opened>, String> {
         let Some(archive) = self.archives.get(path) else {
             return Ok(None);
         };
-        match std::fs::read(&archive.physical) {
-            Ok(bytes) => Ok(Some(Opened {
-                identity: archive.identity,
-                bytes,
-            })),
+        let result = if let Some(inputs) = &self.inputs {
+            inputs
+                .archive(&archive.physical, archive.identity, || read_archive_input(&archive.physical))
+                .map(|input| input.opened(archive.identity))
+        } else {
+            std::fs::File::open(&archive.physical)
+                .and_then(|mut input| read_archive(&mut input, archive.identity))
+        };
+        match result {
+            Ok(opened) => Ok(Some(opened)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(format!(
                 "read archive {}: {error}",

@@ -9,7 +9,8 @@ fn potential_clearance_ignored_pointer_is_independent_of_footprint_word() {
             let (p, mut s) = crate::lot_runtime::tests::fixture();
             s.vm.world.objects.get_mut(&2).unwrap().person =
                 Some((0..100).map(|i| (i, 0)).collect());
-            s.visit = Some((0, None));
+            let thread = s.vm.object_threads[&4];
+            s.visit = Some((thread, None));
             let descriptor = sims_vm::routing::Descriptor([
                 0,
                 0,
@@ -47,7 +48,8 @@ fn potential_clearance_ignored_pointer_is_independent_of_footprint_word() {
             };
             let q = Execution::begin_potential(
                 &mut s,
-                0,
+                &p,
+                thread,
                 &route,
                 Potential {
                     ignored_person: pointer,

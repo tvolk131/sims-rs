@@ -2,6 +2,7 @@
 //! motive updates retain the observed gameplay or historical probe precision.
 use serde::{Deserialize, Serialize};
 pub mod score_owner;
+mod worst;
 
 /// Precision of the native motive update's arithmetic, distinct from its f32
 /// storage. Live Wine gameplay uses x87 PC=00; the historical isolated probes

@@ -4,6 +4,9 @@ use sims_content::Index;
 use sims_render::{camera_device::Device, software};
 use sims_runtime::original_session::{Saved, Session};
 
+#[path = "support/cursor_checkpoint.rs"]
+mod cursor_checkpoint;
+
 #[test]
 #[ignore = "private original-house checkpoints; release/headless"]
 fn original_house_cursor_release_and_cold_resume() -> Result<()> {
@@ -21,12 +24,9 @@ fn run() -> Result<()> {
     let index = Index::scan(&root.join("game-data/cabinet-extracted"))?;
     let mut cases = vec![];
     for lot in ["goth", "mashuga"] {
-        let camera_wrapper: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join(format!(
-                "cache/original-ui-timer-dispatch-iced/{lot}/resumed.json"
-            )))?)?;
-        let camera: sims_render::camera_device::Saved =
-            serde_json::from_value(camera_wrapper["camera_device"].clone())?;
+        let camera = cursor_checkpoint::read_camera(&root.join(format!(
+            "cache/original-ui-timer-dispatch-iced/{lot}/resumed.json"
+        )))?;
         for grouped in [false, true] {
             let saved: Saved = serde_json::from_slice(&std::fs::read(root.join(format!(
                 "cache/original-cursor-return-frames-2/{lot}-{grouped}-session.json"
@@ -36,41 +36,14 @@ fn run() -> Result<()> {
             for resumed in [false, true] {
                 eprintln!("{lot}, grouped={grouped}, resumed={resumed}");
                 let mut session = Session::restore(&index, saved.clone())?;
-                let focus = session
-                    .host
-                    .presentation
-                    .object_focus
-                    .context("cursor focus absent")?;
-                let cursor = session
-                    .simulation
-                    .vm
-                    .world
-                    .scheduler_storage
-                    .as_ref()
-                    .unwrap()
-                    .object_for_handle(focus)
-                    .unwrap();
+                let (focus, cursor) = cursor_checkpoint::focused_cursor(&session)?;
                 let chain = sims_vm::multitile::chain(&session.simulation.vm.world, cursor)
                     .map_err(anyhow::Error::msg)?;
                 let targets = chain
                     .iter()
-                    .map(|id| {
-                        let h = session.simulation.vm.world.objects[id]
-                            .cursor
-                            .as_ref()
-                            .unwrap()
-                            .underlying
-                            .unwrap();
-                        let id = session
-                            .simulation
-                            .vm
-                            .world
-                            .scheduler_storage
-                            .as_ref()
-                            .unwrap()
-                            .object_for_handle(h)
-                            .unwrap();
-                        (id, session.simulation.vm.world.positions[&id])
+                    .map(|cursor| {
+                        let object = cursor_checkpoint::underlying_object(&session, *cursor);
+                        (object, session.simulation.vm.world.positions[&object])
                     })
                     .collect::<Vec<_>>();
                 let tick = session.simulation.vm.tick;
@@ -111,10 +84,7 @@ fn run() -> Result<()> {
                     if resumed && (n == 5 || callback && !callback_restore) {
                         ensure!(!complete, "checkpoint must retain a live release");
                         let snapshot = session.save();
-                        session = Session::restore(
-                            &index,
-                            serde_json::from_slice(&serde_json::to_vec(&snapshot)?)?,
-                        )?;
+                        session = cursor_checkpoint::restore_json(&index, &snapshot)?;
                         ensure!(
                             serde_json::to_value(session.save())?
                                 == serde_json::to_value(snapshot)?
@@ -161,10 +131,7 @@ fn run() -> Result<()> {
                         out.join(format!("{lot}-{grouped}-session.json")),
                         serde_json::to_vec(&snapshot)?,
                     )?;
-                    session = Session::restore(
-                        &index,
-                        serde_json::from_slice(&serde_json::to_vec(&snapshot)?)?,
-                    )?;
+                    session = cursor_checkpoint::restore_json(&index, &snapshot)?;
                     ensure!(
                         serde_json::to_value(session.save())? == serde_json::to_value(snapshot)?
                     );

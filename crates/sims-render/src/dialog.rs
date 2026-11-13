@@ -15,6 +15,8 @@ use sims_vm::{
     dialog::{Construction, Description, Image},
 };
 pub mod client;
+mod relationship;
+mod guid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pending {
@@ -24,6 +26,10 @@ pub struct Pending {
     retrieval: Option<Retrieval>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     object_preview: Option<sims_vm::Definition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relationship: Option<relationship::Relationship>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    guid: Option<guid::Guid>,
     complete: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,8 +73,21 @@ impl Pending {
                 },
             )
             .map_err(anyhow::Error::msg)?;
+        let relationship = if description.relationship {
+            relationship::Relationship::new(session, background, thumbnail, color)?
+        } else {
+            None
+        };
+        let guid = match (description.record.guid_icon, description.resource) {
+            (Some(guid), Some(resource)) => {
+                Some(guid::Guid::new(guid, resource, catalog, color)?)
+            }
+            _ => None,
+        };
         let mut object_preview = None;
-        let retrieval = if let Some(resource) = description.resource {
+        let retrieval = if description.record.guid_icon.is_some() {
+            None
+        } else if let Some(resource) = description.resource {
             catalog
                 .portrait_file(resource)
                 .map_err(anyhow::Error::msg)?;
@@ -105,6 +124,8 @@ impl Pending {
             description,
             retrieval,
             object_preview,
+            relationship,
+            guid,
             complete: false,
         })
     }
@@ -133,6 +154,43 @@ impl Pending {
             "dialog record identity changed"
         );
         images.validate(&session.simulation.vm.world.image_cache)?;
+        let relationship_icon = self.request
+            .relationship_icon(&session.program, &session.simulation.vm.world)
+            .map_err(anyhow::Error::msg)?;
+        ensure!(
+            self.description.relationship == relationship_icon,
+            "dialog relationship icon binding changed"
+        );
+        ensure!(
+            self.description.record.guid_icon
+                == self.request.guid_icon(&session.program, &session.simulation.vm.world)
+                    .map_err(anyhow::Error::msg)?,
+            "dialog GUID request binding changed"
+        );
+        ensure!(
+            self.guid.is_some()
+                == (self.description.record.guid_icon.is_some() && self.description.resource.is_some()),
+            "dialog GUID continuation absent or unowned"
+        );
+        if let Some(guid) = &self.guid {
+            ensure!(
+                self.retrieval.is_none() && self.object_preview.is_none() && self.relationship.is_none(),
+                "overlapping dialog GUID image owners"
+            );
+            guid.validate(self.description.record.guid_icon, self.description.resource)?;
+        }
+        ensure!(
+            self.relationship.is_some()
+                == (self.description.relationship && relationship::Relationship::available(session)?),
+            "dialog relationship continuation absent or unowned"
+        );
+        if let Some(relationship) = &self.relationship {
+            ensure!(
+                self.retrieval.is_none() && self.object_preview.is_none(),
+                "overlapping dialog image owners"
+            );
+            relationship.validate(session, images)?;
+        }
         ensure!(
             self.object_preview.is_none()
                 || (self.retrieval.is_none()
@@ -156,6 +214,27 @@ impl Pending {
     ) -> Result<Progress> {
         images.collect(&host.session.simulation.vm.world.image_cache)?;
         self.validate(host.session, images)?;
+        if let Some(guid) = &self.guid {
+            if *remaining == 0 {
+                return Ok(Progress::Yielded);
+            }
+            let raster = guid.render(catalog, host.session.index(), settings)?;
+            let handle = images.insert(&mut host.session.simulation.vm.world.image_cache, raster)?;
+            self.description.record.portrait = Some(Image {
+                handle,
+                rect: [0, 0, 45, 45],
+            });
+            *remaining -= 1;
+        }
+        if let Some(relationship) = &mut self.relationship {
+            match relationship.advance(host, catalog, images, settings, remaining, step)? {
+                Progress::Temporary(service) => return Ok(Progress::Temporary(service)),
+                Progress::Yielded => return Ok(Progress::Yielded),
+                Progress::Complete => {}
+            }
+            self.description.record.portrait = relationship.finish(host.session, images)?;
+            self.relationship = None;
+        }
         if let Some(definition) = &self.object_preview {
             if *remaining == 0 {
                 return Ok(Progress::Yielded);
@@ -231,6 +310,7 @@ impl Pending {
         // retains text only and cannot transfer the same image a second time.
         self.description.record.portrait = None;
         self.object_preview = None;
+        self.guid = None;
         self.complete = true;
         Ok(Progress::Complete)
     }

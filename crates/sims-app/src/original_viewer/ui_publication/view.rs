@@ -1,8 +1,8 @@
 //! Pure Iced frontend. Its only owner is an immutable Published value.
 //! There are no Session/Client/Device getters, locks, IO or engine callbacks.
 use super::super::{
-    Message, Viewport, dialog_view, hud, neighborhood_usability, published_control,
-    widget_lifetimes,
+    Message, Primitive, Viewport, dialog_view, hud, neighborhood_usability, published_control,
+    viewport_drag, widget_lifetimes,
 };
 use super::{Catalog, Published};
 use hud::motives;
@@ -15,8 +15,158 @@ use iced::{
 use sims_vm::interface::view_control::Widget as Control;
 use std::sync::Arc;
 const CYAN: Color = Color::from_rgb8(0, 235, 235);
+
+struct PublishedViewport {
+    input: Viewport,
+    render: Arc<sims_render::Scene>,
+}
+
+impl PublishedViewport {
+    fn new(source: Arc<sims_render::Scene>, render: Option<&Arc<sims_render::Scene>>) -> Self {
+        let render = render.cloned().unwrap_or_else(|| source.clone());
+        Self {
+            input: Viewport(source),
+            render,
+        }
+    }
+}
+
+impl widget::shader::Program<Message> for PublishedViewport {
+    type State = viewport_drag::Pointer;
+    type Primitive = Primitive;
+
+    fn update(
+        &self,
+        state: &mut Self::State,
+        event: &iced::Event,
+        bounds: iced::Rectangle,
+        cursor: iced::mouse::Cursor,
+    ) -> Option<widget::shader::Action<Message>> {
+        widget::shader::Program::update(&self.input, state, event, bounds, cursor)
+    }
+
+    fn draw(&self, _: &Self::State, _: iced::mouse::Cursor, _: iced::Rectangle) -> Primitive {
+        Primitive {
+            scene: self.render.clone(),
+        }
+    }
+}
+
 fn at<'a>(element: Element<'a, Message>, x: f32, y: f32) -> Element<'a, Message> {
     widget::pin(element).x(x).y(y).into()
+}
+
+#[cfg(test)]
+mod render_scene_tests {
+    use super::*;
+    use iced::widget::shader::Program;
+
+    fn fixture() -> (Arc<sims_render::Scene>, Arc<sims_render::Scene>) {
+        let mut source =
+            sims_render::software::rgba_scene(4, 4, [113, 71, 39, 255].repeat(16)).unwrap();
+        source.draws[0].object = Some(77);
+        source.censors.push(sims_render::censor::Region {
+            rect: [0, 0, 4, 4],
+            depth: 0.9,
+            seed: 17,
+        });
+        let source = Arc::new(source);
+        let render = Arc::new(sims_render::software::composited_scene(&source));
+        (source, render)
+    }
+
+    #[test]
+    fn render_scene_viewport_press_preserves_source_object_picking() {
+        let (source, render) = fixture();
+        assert_eq!(source.pick([2., 2.]), Some(77));
+        assert_eq!(render.pick([2., 2.]), None);
+        let viewport = PublishedViewport::new(source, Some(&render));
+        let mut state = viewport_drag::Pointer::default();
+        let bounds = iced::Rectangle::new(iced::Point::ORIGIN, iced::Size::new(4., 4.));
+        let cursor = iced::mouse::Cursor::Available(iced::Point::new(2., 2.));
+        let action = viewport
+            .update(
+                &mut state,
+                &iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                bounds,
+                cursor,
+            )
+            .unwrap();
+        let (message, _, status) = action.into_inner();
+        assert_eq!(status, iced::event::Status::Captured);
+        assert!(matches!(
+            message,
+            Some(Message::ViewportButton {
+                down: true,
+                picked: Some(77),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn render_scene_viewport_release_keeps_original_pointer_semantics() {
+        let (source, render) = fixture();
+        let original = Viewport(source.clone());
+        let viewport = PublishedViewport::new(source, Some(&render));
+        let mut original_state = viewport_drag::Pointer::default();
+        let mut state = viewport_drag::Pointer::default();
+        let bounds = iced::Rectangle::new(iced::Point::ORIGIN, iced::Size::new(4., 4.));
+        for (event, cursor) in [
+            (
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                iced::mouse::Cursor::Available(iced::Point::new(2., 2.)),
+            ),
+            (
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
+                iced::mouse::Cursor::Unavailable,
+            ),
+        ] {
+            let actual = viewport
+                .update(&mut state, &event, bounds, cursor)
+                .unwrap()
+                .into_inner();
+            let expected = original
+                .update(&mut original_state, &event, bounds, cursor)
+                .unwrap()
+                .into_inner();
+            assert_eq!(format!("{:?}", actual.0), format!("{:?}", expected.0));
+            assert_eq!(actual.2, expected.2);
+        }
+    }
+
+    #[test]
+    fn render_scene_viewport_draw_uses_precomposed_pixels_not_pick_geometry() {
+        let (source, render) = fixture();
+        let viewport = PublishedViewport::new(source.clone(), Some(&render));
+        assert!(Arc::ptr_eq(&viewport.input.0, &source));
+        let primitive = viewport.draw(
+            &viewport_drag::Pointer::default(),
+            iced::mouse::Cursor::Unavailable,
+            iced::Rectangle::default(),
+        );
+        assert!(Arc::ptr_eq(&primitive.scene, &render));
+        assert!(primitive.scene.censors.is_empty());
+        assert_eq!(
+            primitive.scene.textures[0].rgba.as_ref(),
+            sims_render::software::render(&source).as_raw()
+        );
+    }
+
+    #[test]
+    fn render_scene_viewport_without_precomposition_retains_the_original_scene() {
+        let (source, _) = fixture();
+        let viewport = PublishedViewport::new(source.clone(), None);
+        let primitive = viewport.draw(
+            &viewport_drag::Pointer::default(),
+            iced::mouse::Cursor::Unavailable,
+            iced::Rectangle::default(),
+        );
+        assert!(Arc::ptr_eq(&viewport.input.0, &source));
+        assert!(Arc::ptr_eq(&primitive.scene, &source));
+    }
 }
 pub(crate) struct Frontend {
     pub data: Arc<Published>,
@@ -179,43 +329,11 @@ impl Frontend {
                             panel =
                                 panel.push(widget::image(icons.tutorial()).width(50).height(50));
                         }
-                        panel = panel.push(
-                            button("Needs")
-                                .on_press_maybe(needs.person().map(|_| Message::Needs))
-                                .style(if needs.selected() {
-                                    button::primary
-                                } else {
-                                    button::secondary
-                                }),
-                        );
-                        if needs.shown()
-                            && let Some(person) = needs.person()
-                        {
-                            use sims_render::dialog::client::live_panel::MOTIVES;
-                            for pair in (0..8).collect::<Vec<_>>().chunks(2) {
-                                panel = panel.push(
-                                    row(pair.iter().map(|&i| {
-                                        let value = f32::from_bits(person.values[i]);
-                                        button(
-                                            column![
-                                                text(MOTIVES[i].0).size(12),
-                                                progress_bar(
-                                                    0.0..=1.0,
-                                                    ((value + 100.) / 200.).clamp(0., 1.)
-                                                )
-                                                .girth(7)
-                                            ]
-                                            .spacing(4),
-                                        )
-                                        .on_press(Message::MotiveDetails(i))
-                                        .style(button::secondary)
-                                        .width(Fill)
-                                        .into()
-                                    }))
-                                    .spacing(10),
-                                );
-                            }
-                        }
+                        panel = panel.push(super::super::person_panel::sidebar(
+                            needs,
+                            !self.pending && !self.modal && !self.options_open,
+                            self.tutorial_highlight,
+                        ));
                     }
                 } else if let Some(m) = &self.legacy_motives {
                     for pair in [
@@ -299,6 +417,15 @@ impl Frontend {
                     })
                     .size(18),
                 );
+                if active == Panel::Options
+                    && let Some(options) = &self.game_options
+                {
+                    panel = panel.push(super::super::game_options::view(
+                        options,
+                        self.art.as_deref(),
+                        !self.pending && !self.modal,
+                    ));
+                }
                 if active == Panel::Buy
                     && let Some(catalog) = &self.catalog
                 {
@@ -349,11 +476,7 @@ impl Frontend {
     pub(crate) fn eager_view_for_test(&self) -> Element<'_, Message> {
         widget_lifetimes::retain(
             self.widget_epoch,
-            self.view_with_diagnostics(
-                Some(self.diagnostic_widgets()),
-                None,
-                self.session_present,
-            ),
+            self.view_with_diagnostics(Some(self.diagnostic_widgets()), None, self.session_present),
         )
     }
     fn view_with_diagnostics<'a>(
@@ -365,9 +488,12 @@ impl Frontend {
         let viewport: Element<_> = if let Some(scene) = &self.scene {
             container(
                 widget::mouse_area(
-                    widget::shader::Shader::new(Viewport(scene.clone()))
-                        .width(Fill)
-                        .height(Fill),
+                    widget::shader::Shader::new(PublishedViewport::new(
+                        scene.clone(),
+                        self.render_scene.as_ref(),
+                    ))
+                    .width(Fill)
+                    .height(Fill),
                 )
                 .on_enter(Message::ViewportEnter)
                 .on_exit(Message::ViewportLeave)
@@ -393,21 +519,11 @@ impl Frontend {
         };
         // This popup is independent of the scrollable/collapsed bar strip.
         // Its original script-visible ownership must correspond to visible UI.
-        let viewport: Element<_> = if let Some((person, index)) =
-            self.needs.as_ref().and_then(|p| p.person().zip(p.popup()))
+        let viewport: Element<_> = if let Some(detail) = self
+            .needs
+            .as_ref()
+            .and_then(super::super::person_panel::popup)
         {
-            use sims_render::dialog::client::live_panel::MOTIVES;
-            let detail = container(
-                column![
-                    text(format!("{} · {}", person.name, MOTIVES[index].0)).size(18),
-                    text(format!("{:.0} / 100", f32::from_bits(person.values[index]))),
-                    button("Close details").on_press(Message::CloseMotiveDetails),
-                ]
-                .spacing(10),
-            )
-            .padding(12)
-            .width(250)
-            .style(container::rounded_box);
             widget::stack![
                 viewport,
                 container(widget::opaque(detail))
@@ -585,16 +701,41 @@ impl Frontend {
                 let target = match id {
                     2010 => Some([10, size.height as i32 - 183 + 6]),
                     2008 => Some([69, size.height as i32 - 183 + 20]),
+                    2009 if self
+                        .cluster
+                        .as_ref()
+                        .is_some_and(|cluster| cluster.values.buttons.options.is_some()) =>
+                    {
+                        Some([193, size.height as i32 - 183 + 125])
+                    }
                     2011 => Some([43, size.height as i32 - 183 + 127]),
                     2012 => Some([9, size.height as i32 - 183 + 127]),
                     2013 => Some([26, size.height as i32 - 183 + 105]),
                     2014 => Some([26, size.height as i32 - 183 + 149]),
                     2023 => Some([5, size.height as i32 - 183 + 92]),
                     2024 => Some([5, size.height as i32 - 183 + 77]),
-                    4500 if self.panel_state != Some(1) && self.needs.is_some() => {
-                        Some([size.width as i32 - 388 + 4, size.height as i32 - 100 + 33])
+                    resource @ (4500 | 4501 | 4503 | 4504)
+                        if self.panel_state != Some(1)
+                            && self.people_visible
+                            && self
+                                .needs
+                                .as_ref()
+                                .and_then(|panel| panel.person())
+                                .is_some() =>
+                    {
+                        super::super::person_panel::hud_position(resource).map(
+                            |[horizontal, vertical]| {
+                                [
+                                    size.width as i32 - 388 + horizontal,
+                                    size.height as i32 - 100 + vertical,
+                                ]
+                            },
+                        )
                     }
-                    _ => None,
+                    id => cluster::WALL_CONTROLS
+                        .iter()
+                        .find(|wall| wall.id == id)
+                        .map(|wall| [wall.x as i32, size.height as i32 - 183 + wall.y as i32]),
                 };
                 if let Some(position) = target
                     && let Some((width, height, _)) = icons.hud(id)
@@ -623,7 +764,14 @@ impl Frontend {
         let cluster = cluster::view(state, self.options_open);
         let mut hud = widget::stack![widget::Space::new().width(Fill).height(183)];
         if !collapsed {
-            let content: Element<_> = if !state.values.people_visible && mode == 1 {
+            let content: Element<_> = if mode == 3 {
+                match &self.game_options {
+                    Some(options) => {
+                        super::super::game_options::view(options, self.art.as_deref(), ready)
+                    }
+                    None => text("Opening game Options…").into(),
+                }
+            } else if !state.values.people_visible && mode == 1 {
                 container(scrollable(self.catalog_hud(ready)))
                     .height(150)
                     .into()
@@ -633,7 +781,7 @@ impl Frontend {
                     .height(100)
                     .into()
             };
-            let height = if mode == 1 { 150. } else { 100. };
+            let height = if matches!(mode, 1 | 3) { 150. } else { 100. };
             let strip = widget::stack![
                 self.hud_background(if mode == 1 { 4918 } else { 4910 }, 0., height),
                 widget::opaque(content)
@@ -651,7 +799,13 @@ impl Frontend {
                     .align_y(iced::alignment::Vertical::Bottom),
             );
         }
-        hud.push(cluster).into()
+        hud.push(cluster)
+            .push(at(
+                button("Application…").on_press(Message::Options).into(),
+                228.,
+                5.,
+            ))
+            .into()
     }
     fn hud_background(&self, id: i32, width: f32, height: f32) -> Element<'_, Message> {
         cluster::background(self.art.as_deref(), id, width, height)
@@ -799,7 +953,7 @@ impl Frontend {
             .into();
         }
         let mut bars = column![].spacing(1);
-        if needs.shown()
+        if needs.selected()
             && let Some(person) = needs.person()
         {
             use sims_render::dialog::client::live_panel::MOTIVES;
@@ -856,12 +1010,40 @@ impl Frontend {
             4.,
             33.,
         ));
-        // Other native subpanels do not yet have hosted command owners.
+        for (category, x, y) in [
+            (
+                sims_render::dialog::client::live_panel::Category::Relationships,
+                76.,
+                2.,
+            ),
+            (
+                sims_render::dialog::client::live_panel::Category::Personality,
+                44.,
+                34.,
+            ),
+            (
+                sims_render::dialog::client::live_panel::Category::Job,
+                76.,
+                34.,
+            ),
+        ] {
+            if let Some(person) = needs.person() {
+                gadget = gadget.push(at(
+                    self.hud_control(
+                        category.control(),
+                        category.label(),
+                        super::super::person_panel::category_message(person.identity(), category),
+                        None,
+                        ready,
+                        needs.category_selected(category),
+                    ),
+                    x,
+                    y,
+                ));
+            }
+        }
         for (id, label, x, y) in [
             (4505, "Interests", 44., 2.),
-            (4504, "Relationships", 76., 2.),
-            (4501, "Personality", 44., 34.),
-            (4503, "Job", 76., 34.),
             (4507, "Gifts", 44., 66.),
             (4502, "House", 76., 66.),
         ] {
@@ -877,7 +1059,13 @@ impl Frontend {
                 y,
             ));
         }
-        let content: Element<'_, Message> = if needs.shown() && needs.person().is_some() {
+        let content: Element<'_, Message> = if needs.shown() && !needs.selected() {
+            container(super::super::person_panel::content(needs, ready))
+                .padding([3, 9])
+                .width(280)
+                .height(100)
+                .into()
+        } else if needs.shown() && needs.person().is_some() {
             container(column![
                 container(text("Needs").font(motives::FONT).size(14)).padding([0, 9]),
                 bars.width(200)
@@ -1059,8 +1247,7 @@ impl Frontend {
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center);
-        let funds = self.funds.clone();
-        let mut content = column![text(funds).size(16).color(CYAN)]
+        let mut content = column![text(self.funds.as_str()).size(16).color(CYAN)]
             .spacing(6)
             .width(Fill);
         if let Some(selected) = self.furniture.as_ref() {

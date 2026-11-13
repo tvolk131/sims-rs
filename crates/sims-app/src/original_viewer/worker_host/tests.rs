@@ -23,6 +23,41 @@ fn run(f: fn() -> Result<()>) -> Result<()> {
 }
 
 #[test]
+fn render_scene_publication_keeps_original_scene_and_a_coherent_cached_frame() -> Result<()> {
+    run(render_scene_publication)
+}
+
+fn render_scene_publication() -> Result<()> {
+    let mut viewer = loading();
+    let mut source = sims_render::software::rgba_scene(4, 4, vec![137; 4 * 4 * 4])?;
+    source.censors.push(sims_render::censor::Region {
+        rect: [0, 0, 4, 4],
+        depth: 0.9,
+        seed: 17,
+    });
+    let source = Arc::new(source);
+    let pixels = sims_render::software::render(&source).into_raw();
+    viewer.scene = Some(source.clone());
+    let mut owner = Engine::new(viewer);
+    let first = owner.publish().map_err(anyhow::Error::msg)?;
+    assert!(Arc::ptr_eq(first.scene.as_ref().unwrap(), &source));
+    let prepared = first.render_scene.as_ref().unwrap();
+    assert!(prepared.censors.is_empty());
+    assert_eq!(prepared.textures[0].rgba.as_ref(), pixels);
+    let repeated = owner.publish().map_err(anyhow::Error::msg)?;
+    assert!(Arc::ptr_eq(
+        prepared,
+        repeated.render_scene.as_ref().unwrap()
+    ));
+    owner.viewer.scene = None;
+    let cleared = owner.publish().map_err(anyhow::Error::msg)?;
+    assert!(cleared.scene.is_none() && cleared.render_scene.is_none());
+    assert_eq!(prepared.textures[0].rgba.as_ref(), pixels);
+    assert!(Arc::ptr_eq(first.scene.as_ref().unwrap(), &source));
+    Ok(())
+}
+
+#[test]
 fn shell_controls_do_not_wait_for_or_borrow_the_owner() -> Result<()> {
     run(shell_controls)
 }
@@ -117,6 +152,205 @@ fn bounded() -> Result<()> {
 }
 
 #[test]
+fn save_feedback_distinguishes_accepted_work_from_each_real_completion() -> Result<()> {
+    run(save_feedback_completions)
+}
+
+fn save_feedback_completions() -> Result<()> {
+    use std::time::Duration;
+    let mut viewer = loading();
+    let output = std::env::temp_dir().join(format!(
+        "sims-unloaded-save-feedback-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    assert!(!output.exists());
+    viewer.args.save = output.clone();
+    let mut host = Host::from_viewer_for_test(viewer);
+    let before = host.frontend.data.clone();
+    let (first_entered, first_resume) = host.gate_next_for_test();
+    input(&mut host, Message::Save);
+    first_entered.recv_timeout(Duration::from_secs(5))?;
+    assert!(host.saving());
+    assert_eq!(host.save_feedback.requested, 1);
+    assert!(Arc::ptr_eq(&before, &host.frontend.data));
+    assert!(!output.exists());
+    let (second_entered, second_resume) = host.gate_next_for_test();
+    input(&mut host, Message::Save);
+    let feedback = host.save_feedback.observation(host.saving());
+    assert_eq!(feedback["requested"], 2);
+    assert_eq!(feedback["submitted"]["request"], 1);
+    assert!(feedback["completed"].is_null());
+    assert_eq!(host.queued.len(), 1);
+    for _ in 0..10 {
+        drop(host.update(Event::Frame(Instant::now())));
+        drop(host.view());
+    }
+    assert_eq!(host.queued.len(), 1);
+    assert_eq!(host.save_feedback.observation(true), feedback);
+    assert!(Arc::ptr_eq(&before, &host.frontend.data));
+    first_resume.send(())?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while host.save_feedback.observation(host.saving())["completed"]["request"].as_u64() != Some(1)
+    {
+        drop(host.update(Event::Completion));
+        ensure!(Instant::now() < deadline, "first Save did not complete");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    second_entered.recv_timeout(Duration::from_secs(5))?;
+    let feedback = host.save_feedback.observation(host.saving());
+    assert!(host.saving());
+    assert_eq!(feedback["submitted"]["request"], 2);
+    assert_eq!(feedback["completed"]["request"], 1);
+    assert!(host.frontend.error.is_some());
+    assert!(!host.frontend.status.starts_with("Saved "));
+    assert!(!output.exists());
+    second_resume.send(())?;
+    host.settle_for_test()?;
+    assert!(!host.saving());
+    assert_eq!(
+        host.save_feedback.observation(false)["completed"]["request"],
+        2
+    );
+    assert!(!output.exists());
+    let owner = host.recover_for_test();
+    assert!(owner.session.is_none() && owner.last.is_none());
+    assert!(owner.error.is_some());
+    Ok(())
+}
+
+#[test]
+fn rejected_save_inputs_do_not_publish_an_accepted_request() -> Result<()> {
+    run(rejected_save_feedback)
+}
+
+#[test]
+fn save_feedback_retires_aborted_queue_but_keeps_a_running_save_pending() -> Result<()> {
+    run(aborted_save_queue)
+}
+
+fn aborted_save_queue() -> Result<()> {
+    use std::time::Duration;
+    for saving_first in [false, true] {
+        let mut host = Host::from_viewer_for_test(loading());
+        let (entered, resume) = host.gate_next_for_test();
+        input(
+            &mut host,
+            if saving_first {
+                Message::Save
+            } else {
+                Message::Shift(false)
+            },
+        );
+        entered.recv_timeout(Duration::from_secs(5))?;
+        input(&mut host, Message::Save);
+        assert!(host.saving());
+        for _ in 0..256 {
+            host.enqueue(0, Message::Shift(false));
+        }
+        assert!(host.error.as_deref().unwrap().contains("queue is full"));
+        assert_eq!(host.saving(), saving_first);
+        let requested = host.save_feedback.requested;
+        assert_eq!(requested, if saving_first { 2 } else { 1 });
+        resume.send(())?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.worker.as_ref().unwrap().busy() {
+            drop(host.poll());
+            ensure!(Instant::now() < deadline, "blocked owner did not return");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!host.saving());
+        assert_eq!(host.queued.len(), 256);
+        assert_eq!(host.save_feedback.requested, requested);
+        let observation = host.save_feedback.observation(host.saving());
+        if saving_first {
+            assert_eq!(observation["completed"]["request"], 1);
+        } else {
+            assert!(observation["submitted"].is_null());
+            assert!(observation["completed"].is_null());
+        }
+        let owner = host.recover_for_test();
+        assert!(owner.session.is_none() && owner.last.is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn submitted_save_disconnect_retires_pending_without_a_completion() -> Result<()> {
+    run(disconnected_save)
+}
+
+fn disconnected_save() -> Result<()> {
+    use std::time::Duration;
+    let mut host = Host::from_viewer_for_test(loading());
+    let publication = host.frontend.data.clone();
+    let (entered, resume) = host.gate_next_for_test();
+    host.next_gate.as_mut().unwrap().disconnect = true;
+    input(&mut host, Message::Save);
+    entered.recv_timeout(Duration::from_secs(5))?;
+    assert!(host.saving());
+    let before = host.save_feedback.observation(true);
+    assert_eq!(before["submitted"]["request"], 1);
+    resume.send(())?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while host.error.is_none() {
+        drop(host.poll());
+        ensure!(Instant::now() < deadline, "owner did not disconnect");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(host.error.as_deref().unwrap().contains("disconnected"));
+    assert!(!host.saving());
+    let after = host.save_feedback.observation(false);
+    assert_eq!(after["requested"], 1);
+    assert!(after["submitted"].is_null() && after["completed"].is_null());
+    assert!(Arc::ptr_eq(&publication, &host.frontend.data));
+    input(&mut host, Message::Save);
+    assert_eq!(host.save_feedback.requested, 1);
+    assert!(host.worker.take().unwrap().recover().is_err());
+    Ok(())
+}
+
+fn rejected_save_feedback() -> Result<()> {
+    let mut host = Host::from_viewer_for_test(loading());
+    drop(host.update(Event::Widget {
+        generation: 1,
+        message: Message::Save,
+    }));
+    assert_eq!(host.save_feedback.requested, 0);
+    host.replacing = true;
+    input(&mut host, Message::Save);
+    assert_eq!(host.save_feedback.requested, 0);
+    host.replacing = false;
+    for _ in 0..256 {
+        host.enqueue(0, Message::Shift(false));
+    }
+    input(&mut host, Message::Save);
+    assert_eq!(host.queued.len(), 256);
+    assert_eq!(host.save_feedback.requested, 0);
+    assert!(!host.saving());
+    assert!(host.error.as_deref().unwrap().contains("queue is full"));
+    let owner = host.recover_for_test();
+    assert!(owner.session.is_none() && owner.last.is_none());
+    let mut host = Host::from_viewer_for_test(loading());
+    host.save_feedback.requested = u64::MAX;
+    input(&mut host, Message::Save);
+    assert!(host.queued.is_empty());
+    assert_eq!(host.save_feedback.requested, u64::MAX);
+    assert!(!host.saving());
+    assert!(
+        host.error
+            .as_deref()
+            .unwrap()
+            .contains("Save request counter exhausted")
+    );
+    let owner = host.recover_for_test();
+    assert!(owner.session.is_none() && owner.last.is_none());
+    Ok(())
+}
+
+#[test]
 fn real_host_paints_and_retains_ordered_input_while_its_owner_is_blocked() -> Result<()> {
     run(blocked_owner)
 }
@@ -130,6 +364,7 @@ fn blocked_owner() -> Result<()> {
     host.next_gate = Some(TestGate {
         started,
         resume: release,
+        disconnect: false,
     });
     input(&mut host, Message::Shift(true));
     entered.recv_timeout(Duration::from_secs(5))?;
@@ -251,6 +486,118 @@ fn settings_host() -> Host {
     Arc::make_mut(&mut host.frontend.data).session_present = true;
     input(&mut host, Message::Options);
     host
+}
+
+#[test]
+fn pending_native_transport_waits_for_frame_and_preserves_input_order() -> Result<()> {
+    run(pending_transport)
+}
+fn pending_transport() -> Result<()> {
+    for message in [Message::Toggle, Message::NativeSpeed(760)] {
+        let mut host = Host::from_viewer_for_test(loading());
+        let publication = Arc::make_mut(&mut host.frontend.data);
+        publication.native_transport = true;
+        publication.pending = true;
+        let (entered, resume) = host.gate_next_for_test();
+        input(&mut host, message);
+        let (following_entered, following_resume) = host.gate_next_for_test();
+        input(&mut host, Message::Shift(true));
+        assert!(host.transport_waiting());
+        assert_eq!(host.queued.len(), 2);
+        assert!(!host.worker.as_ref().unwrap().busy());
+        assert!(entered.try_recv().is_err());
+        assert_eq!(host.update(Event::Completion).units(), 0);
+        assert_eq!(host.update(Event::Frame(Instant::now())).units(), 1);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while entered.try_recv().is_err() {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "transport did not follow settling frame"
+            );
+            drop(host.update(Event::Completion));
+            std::thread::yield_now();
+        }
+        assert_eq!(host.queued.len(), 1);
+        assert!(matches!(host.queued[0].work.message, Message::Shift(true)));
+        assert!(!host.frontend.pending);
+        assert!(following_entered.try_recv().is_err());
+        resume.send(())?;
+        while following_entered.try_recv().is_err() {
+            anyhow::ensure!(Instant::now() < deadline, "following input did not run");
+            drop(host.update(Event::Completion));
+            std::thread::yield_now();
+        }
+        following_resume.send(())?;
+        assert!(host.settle_for_test()?.is_empty());
+        assert!(host.queued.is_empty());
+        assert!(!host.worker.as_ref().unwrap().busy());
+    }
+    Ok(())
+}
+
+#[test]
+fn modal_and_close_do_not_deadlock_deferred_transport() -> Result<()> {
+    run(transport_boundaries)
+}
+fn transport_boundaries() -> Result<()> {
+    let mut host = Host::from_viewer_for_test(loading());
+    let publication = Arc::make_mut(&mut host.frontend.data);
+    publication.native_transport = true;
+    publication.pending = true;
+    publication.modal = true;
+    input(&mut host, Message::Toggle);
+    assert!(!host.transport_waiting());
+    assert!(host.settle_for_test()?.is_empty());
+    let publication = Arc::make_mut(&mut host.frontend.data);
+    publication.native_transport = true;
+    publication.pending = true;
+    input(&mut host, Message::Toggle);
+    assert!(host.transport_waiting());
+    let id = window::Id::unique();
+    let task = host.update(Event::Close(id));
+    let iced_runtime::Action::Output(Event::Completion) = task_action(task)? else {
+        anyhow::bail!("missing transport completion wake");
+    };
+    assert_eq!(host.update(Event::Completion).units(), 1);
+    assert!(host.close_sent);
+    assert!(host.queued.is_empty());
+    Ok(())
+}
+
+#[test]
+fn full_input_queue_still_allows_the_frame_that_releases_transport() -> Result<()> {
+    run(full_transport_queue)
+}
+fn full_transport_queue() -> Result<()> {
+    let mut host = Host::from_viewer_for_test(loading());
+    let publication = Arc::make_mut(&mut host.frontend.data);
+    publication.native_transport = true;
+    publication.pending = true;
+    let (entered, resume) = host.gate_next_for_test();
+    input(&mut host, Message::Toggle);
+    for _ in 1..256 {
+        input(&mut host, Message::Shift(true));
+    }
+    assert!(host.transport_waiting());
+    assert_eq!(host.queued.len(), 256);
+    assert_eq!(host.update(Event::Frame(Instant::now())).units(), 1);
+    assert!(host.error.is_none());
+    assert_eq!(host.queued.len(), 256);
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while entered.try_recv().is_err() {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "full queue blocked settling frame"
+        );
+        drop(host.update(Event::Completion));
+        std::thread::yield_now();
+    }
+    assert_eq!(host.queued.len(), 255);
+    assert!(host.error.is_none());
+    resume.send(())?;
+    assert!(host.settle_for_test()?.is_empty());
+    assert!(host.queued.is_empty());
+    Ok(())
 }
 
 #[test]

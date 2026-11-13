@@ -154,6 +154,194 @@ pub(crate) fn fixture() -> (Program, Simulation) {
     let state = Simulation::from_loaded_lot(vm, architecture, native).unwrap();
     (p, state)
 }
+
+fn terminal_route_fixture() -> (
+    Program,
+    Simulation,
+    sims_vm::ThreadId,
+    sims_vm::RouteRequest,
+) {
+    let (program, mut state) = walking_fixture();
+    state.vm.tick = 73;
+    state
+        .vm
+        .world
+        .objects
+        .get_mut(&1)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .insert(0, 1);
+    let thread = state.vm.object_threads[&1];
+    state.vm.run_slice(&program, thread, 1000).unwrap();
+    let sims_vm::Status::AwaitingRoute(request) = state.vm.threads[&thread].status.clone() else {
+        panic!("synthetic native route request absent");
+    };
+    state.visited.insert(thread);
+    state.visit = Some((thread, Some(1)));
+    let mut events = vec![];
+    assert!(
+        !state
+            .service_original_portals(&program, thread, &request, &mut events)
+            .unwrap()
+    );
+    (program, state, thread, request)
+}
+
+#[test]
+fn terminal_observations_native_cleanup_reports_explicit_outcome_without_changing_execution() {
+    for (success, native_result) in [(false, 0), (false, 7), (true, 0)] {
+        for budget in [1, 1000] {
+            let (program, mut observed, thread, request) = terminal_route_fixture();
+            observed
+                .begin_native_route_completion(thread, &request, success, native_result)
+                .unwrap();
+            let mut reference = observed.clone();
+            observed.enable_terminal_observations(4);
+            let expected_result = if success { 0 } else { native_result.max(1) };
+            let mut done = false;
+            for _ in 0..40 {
+                let mut step = crate::Step {
+                    stop: crate::StepStop::Waiting,
+                    trace: vec![],
+                    events: vec![],
+                };
+                let mut reference_step = step.clone();
+                let mut remaining = budget;
+                let mut reference_remaining = budget;
+                done = observed
+                    .drive_native_route_completion(&program, &mut remaining, &mut step)
+                    .unwrap();
+                assert_eq!(
+                    done,
+                    reference
+                        .drive_native_route_completion(
+                            &program,
+                            &mut reference_remaining,
+                            &mut reference_step
+                        )
+                        .unwrap()
+                );
+                assert_eq!(remaining, reference_remaining);
+                assert_eq!(step, reference_step);
+                assert_eq!(observed, reference);
+                assert_eq!(
+                    serde_json::to_vec(&observed).unwrap(),
+                    serde_json::to_vec(&reference).unwrap()
+                );
+                let saved = crate::Snapshot::capture(&program, &observed);
+                assert!(!saved.state.route_terminal_observations().enabled());
+                assert!(!saved.state.vm.terminal_observations().enabled());
+                assert!(
+                    saved
+                        .state
+                        .route_terminal_observations()
+                        .events()
+                        .is_empty()
+                );
+                assert!(observed.vm.terminal_observations().events().is_empty());
+                if done {
+                    break;
+                }
+                assert!(observed.route_terminal_observations().events().is_empty());
+            }
+            assert!(done);
+            assert!(!reference.route_terminal_observations().enabled());
+            assert!(reference.drain_route_terminal_observations().is_empty());
+            assert_eq!(
+                observed.drain_route_terminal_observations(),
+                [crate::observations::NativeRouteTerminalEvent {
+                    actor: request.caller,
+                    target: request.target,
+                    request: request.id,
+                    thread,
+                    action_serial: None,
+                    action_invocation: None,
+                    tick: 73,
+                    success,
+                    native_result: expected_result,
+                    endpoint: observed.vm.world.positions.get(&request.caller).copied(),
+                }]
+            );
+            assert_eq!(observed.route_terminal_observations().dropped(), 0);
+            let mut step = crate::Step {
+                stop: crate::StepStop::Waiting,
+                trace: vec![],
+                events: vec![],
+            };
+            assert!(
+                observed
+                    .drive_native_route_completion(&program, &mut 1000, &mut step)
+                    .unwrap()
+            );
+            assert!(observed.drain_route_terminal_observations().is_empty());
+            assert_eq!(observed.vm.tick, 73);
+        }
+    }
+}
+
+#[test]
+fn terminal_observations_native_cleanup_drops_are_visible_and_clones_are_disabled() {
+    let (program, mut state, thread, request) = terminal_route_fixture();
+    state
+        .begin_native_route_completion(thread, &request, false, 7)
+        .unwrap();
+    state.enable_terminal_observations(0);
+    let mut preview = state.clone();
+    let mut step = crate::Step {
+        stop: crate::StepStop::Waiting,
+        trace: vec![],
+        events: vec![],
+    };
+    assert!(
+        preview
+            .drive_native_route_completion(&program, &mut 1000, &mut step)
+            .unwrap()
+    );
+    assert!(!preview.route_terminal_observations().enabled());
+    assert_eq!(preview.route_terminal_observations().dropped(), 0);
+    assert_eq!(state.route_terminal_observations().dropped(), 0);
+    assert!(state.native_lot.as_ref().unwrap().completion.is_some());
+    assert!(
+        state
+            .drive_native_route_completion(&program, &mut 1000, &mut step)
+            .unwrap()
+    );
+    assert!(state.drain_route_terminal_observations().is_empty());
+    assert_eq!(state.route_terminal_observations().dropped(), 1);
+    assert_eq!(state, preview);
+    let saved = serde_json::to_vec(&state).unwrap();
+    let restored: Simulation = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(restored, state);
+    assert!(!restored.route_terminal_observations().enabled());
+    assert_eq!(restored.route_terminal_observations().dropped(), 0);
+    state.disable_terminal_observations();
+    assert!(!state.route_terminal_observations().enabled());
+    assert!(!state.vm.terminal_observations().enabled());
+}
+
+#[test]
+fn terminal_observations_native_cleanup_rejects_stale_request_credit() {
+    let (program, mut state, thread, mut request) = terminal_route_fixture();
+    state.enable_terminal_observations(4);
+    request.id += 1;
+    state
+        .begin_native_route_completion(thread, &request, false, 7)
+        .unwrap();
+    let mut step = crate::Step {
+        stop: crate::StepStop::Waiting,
+        trace: vec![],
+        events: vec![],
+    };
+    assert!(
+        state
+            .drive_native_route_completion(&program, &mut 1000, &mut step)
+            .is_err()
+    );
+    assert!(state.route_terminal_observations().events().is_empty());
+    assert_eq!(state.route_terminal_observations().dropped(), 0);
+}
 #[cfg(feature = "private-fixtures")]
 #[test]
 fn picker_low_flags_use_original_group_scope_and_invalidation() {
@@ -1529,7 +1717,6 @@ fn native_person_deletion_resets_before_registry_release_and_saves_callback() {
 
 #[test]
 fn native_route_clearance_owns_other_threads_and_resumes_without_repeating_callbacks() {
-    use sims_formats::behavior::Instruction;
     for (permitted, owner, height_mask) in [false, true].into_iter().flat_map(|allowed| {
         [1, 3].into_iter().flat_map(move |owner| {
             [0, 1]
@@ -1537,124 +1724,9 @@ fn native_route_clearance_owns_other_threads_and_resumes_without_repeating_callb
                 .map(move |height| (allowed, owner, height))
         })
     }) {
-        let (mut p, mut initial) = fixture();
-        let m = p.modules.get_mut("objects").unwrap();
-        let mut words = m.object_definition_words[&1].clone();
-        words[9] = 2;
-        words[14] = 2;
-        m.object_definition_words.insert(2, words);
-        let mut functions = m.object_functions[&1].clone();
-        functions[1].action = 4098;
-        m.object_functions.insert(2, functions);
-        m.object_functions
-            .get_mut(&(if owner == 1 { 2 } else { 1 }))
-            .unwrap()[5]
-            .action = 4099;
-        let mut route = m.routines[&4096].clone();
-        route.body.instructions = vec![Instruction {
-            opcode: 0x2d,
-            on_true: 254,
-            on_false: 255,
-            operands: [0, 0, 1, 0, 1, 0, 0, 0],
-        }];
-        m.routines.insert(4098, route);
-        let mut callback = m.routines[&4096].clone();
-        callback.body.instructions = vec![
-            Instruction {
-                opcode: 2,
-                on_true: 1,
-                on_false: 255,
-                operands: [0, 0, 0, 0, 0, 5, 8, 10],
-            },
-            Instruction {
-                opcode: 2,
-                on_true: if permitted { 254 } else { 255 },
-                on_false: 255,
-                operands: [1, 0, 1, 0, 0, 3, 8, 7],
-            },
-        ];
-        m.routines.insert(4099, callback);
-        let o = initial.vm.world.objects.get_mut(&1).unwrap();
-        o.definition.as_mut().unwrap().object = 2;
-        o.definition.as_mut().unwrap().guid = 2;
-        o.person = Some((0..256).map(|n| (n, 0)).collect());
-        o.data.insert(8, 8);
-        o.data.insert(4, height_mask);
-        o.data.insert(42, 259);
-        initial.vm.world.person.as_mut().unwrap().person_order = vec![1];
-        initial
-            .vm
-            .world
-            .objects
-            .get_mut(&2)
-            .unwrap()
-            .data
-            .insert(8, 16);
-        initial.vm.world.objects.get_mut(&2).unwrap().routing_slots =
-            Some(vec![sims_vm::routing::Descriptor([
-                0,
-                0,
-                0,
-                u32::MAX,
-                0,
-                0,
-                0,
-                0,
-                u32::MAX,
-                16,
-                16,
-                16,
-                0.1875f32.to_bits(),
-                (-2i32) as u32,
-                16,
-            ])]);
-        let a = initial.architecture.as_ref().unwrap();
-        let lot = a.original.as_ref().unwrap();
-        let rebuilt = Lot::rebuild(
-            lot.size,
-            lot.heights.clone(),
-            vec![255; 36],
-            lot.water.clone(),
-            lot.floors.iter().map(|f| f.source.clone()).collect(),
-        )
-        .unwrap();
-        initial.architecture = Some(Architecture::from_original(rebuilt, &p).unwrap());
-        initial
-            .architecture
-            .as_ref()
-            .unwrap()
-            .publish_room_context(&mut initial.vm.world);
-        let native = initial.native_lot.as_mut().unwrap();
-        native.membership = RoomMembership::constructed(&initial.vm.world);
-        native.placement.flags = initial
-            .architecture
-            .as_ref()
-            .unwrap()
-            .original
-            .as_ref()
-            .unwrap()
-            .floors
-            .iter()
-            .map(|f| f.flags.flags.clone())
-            .collect();
-        native.placement.bounds.insert(3, [44, 44, 36, 36]);
-        native.diagnostics = crate::lot_acceptance::person::Diagnostics {
-            error: 91,
-            blocker: Some(2),
-        };
-        initial.vm.start_object_lifecycle(&p, 1).unwrap();
-        initial.vm.start_object_lifecycle(&p, 3).unwrap();
+        let (p, initial) = clearance_fixture(permitted, owner, height_mask);
         let actor = initial.vm.object_threads[&1];
         let other = initial.vm.object_threads[&3];
-        initial
-            .vm
-            .threads
-            .get_mut(&actor)
-            .unwrap()
-            .stack
-            .last_mut()
-            .unwrap()
-            .stack_object = 2;
         let ordinary = initial.vm.threads[&other].clone();
         let before = initial.vm.world.positions.clone();
         let mut results = vec![];
@@ -3484,31 +3556,35 @@ fn native_find_location_resumes_character_refresh_without_repeating_detach() {
     }
 }
 
-fn walking_fixture() -> (Program, Simulation) {
+fn clearance_fixture(
+    permitted: bool,
+    owner: sims_vm::ObjectId,
+    height_mask: i16,
+) -> (Program, Simulation) {
     use sims_formats::behavior::Instruction;
-    let (permitted, owner, height_mask) = (true, 3, 1);
-    let (mut p, mut initial) = fixture();
-    let m = p.modules.get_mut("objects").unwrap();
-    let mut words = m.object_definition_words[&1].clone();
+    let (mut program, mut initial) = fixture();
+    let module = program.modules.get_mut("objects").unwrap();
+    let mut words = module.object_definition_words[&1].clone();
     words[9] = 2;
     words[14] = 2;
-    m.object_definition_words.insert(2, words);
-    let mut functions = m.object_functions[&1].clone();
+    module.object_definition_words.insert(2, words);
+    let mut functions = module.object_functions[&1].clone();
     functions[1].action = 4098;
-    m.object_functions.insert(2, functions);
-    m.object_functions
+    module.object_functions.insert(2, functions);
+    module
+        .object_functions
         .get_mut(&(if owner == 1 { 2 } else { 1 }))
         .unwrap()[5]
         .action = 4099;
-    let mut route = m.routines[&4096].clone();
+    let mut route = module.routines[&4096].clone();
     route.body.instructions = vec![Instruction {
         opcode: 0x2d,
         on_true: 254,
         on_false: 255,
         operands: [0, 0, 1, 0, 1, 0, 0, 0],
     }];
-    m.routines.insert(4098, route);
-    let mut callback = m.routines[&4096].clone();
+    module.routines.insert(4098, route);
+    let mut callback = module.routines[&4096].clone();
     callback.body.instructions = vec![
         Instruction {
             opcode: 2,
@@ -3523,14 +3599,14 @@ fn walking_fixture() -> (Program, Simulation) {
             operands: [1, 0, 1, 0, 0, 3, 8, 7],
         },
     ];
-    m.routines.insert(4099, callback);
-    let o = initial.vm.world.objects.get_mut(&1).unwrap();
-    o.definition.as_mut().unwrap().object = 2;
-    o.definition.as_mut().unwrap().guid = 2;
-    o.person = Some((0..256).map(|n| (n, 0)).collect());
-    o.data.insert(8, 8);
-    o.data.insert(4, height_mask);
-    o.data.insert(42, 259);
+    module.routines.insert(4099, callback);
+    let object = initial.vm.world.objects.get_mut(&1).unwrap();
+    object.definition.as_mut().unwrap().object = 2;
+    object.definition.as_mut().unwrap().guid = 2;
+    object.person = Some((0..256).map(|index| (index, 0)).collect());
+    object.data.insert(8, 8);
+    object.data.insert(4, height_mask);
+    object.data.insert(42, 259);
     initial.vm.world.person.as_mut().unwrap().person_order = vec![1];
     initial
         .vm
@@ -3558,17 +3634,20 @@ fn walking_fixture() -> (Program, Simulation) {
             (-2i32) as u32,
             16,
         ])]);
-    let a = initial.architecture.as_ref().unwrap();
-    let lot = a.original.as_ref().unwrap();
+    let architecture = initial.architecture.as_ref().unwrap();
+    let lot = architecture.original.as_ref().unwrap();
     let rebuilt = Lot::rebuild(
         lot.size,
         lot.heights.clone(),
         vec![255; 36],
         lot.water.clone(),
-        lot.floors.iter().map(|f| f.source.clone()).collect(),
+        lot.floors
+            .iter()
+            .map(|floor| floor.source.clone())
+            .collect(),
     )
     .unwrap();
-    initial.architecture = Some(Architecture::from_original(rebuilt, &p).unwrap());
+    initial.architecture = Some(Architecture::from_original(rebuilt, &program).unwrap());
     initial
         .architecture
         .as_ref()
@@ -3585,17 +3664,16 @@ fn walking_fixture() -> (Program, Simulation) {
         .unwrap()
         .floors
         .iter()
-        .map(|f| f.flags.flags.clone())
+        .map(|floor| floor.flags.flags.clone())
         .collect();
     native.placement.bounds.insert(3, [44, 44, 36, 36]);
     native.diagnostics = crate::lot_acceptance::person::Diagnostics {
         error: 91,
         blocker: Some(2),
     };
-    initial.vm.start_object_lifecycle(&p, 1).unwrap();
-    initial.vm.start_object_lifecycle(&p, 3).unwrap();
+    initial.vm.start_object_lifecycle(&program, 1).unwrap();
+    initial.vm.start_object_lifecycle(&program, 3).unwrap();
     let actor = initial.vm.object_threads[&1];
-    let _other = initial.vm.object_threads[&3];
     initial
         .vm
         .threads
@@ -3605,6 +3683,13 @@ fn walking_fixture() -> (Program, Simulation) {
         .last_mut()
         .unwrap()
         .stack_object = 2;
+
+    (program, initial)
+}
+
+fn walking_fixture() -> (Program, Simulation) {
+    use sims_formats::behavior::Instruction;
+    let (mut p, mut initial) = clearance_fixture(true, 3, 1);
 
     initial
         .vm
@@ -3679,7 +3764,23 @@ fn retain_fixture_environment(p: &Program, s: &mut Simulation) {
     });
 }
 
-fn routed_walking_fixture() -> (Program, Simulation) {
+fn retain_fixture_household_person(simulation: &mut Simulation, identity: sims_vm::ObjectId) {
+    let object = simulation.vm.world.objects.get_mut(&identity).unwrap();
+    object.motives = Some([0; 16]);
+    object.motive_update = Some(sims_vm::motives::UpdateState {
+        previous: [0; 16],
+        last_decay: simulation.vm.tick as i32,
+    });
+    simulation.household.as_mut().unwrap().people.insert(
+        identity,
+        crate::household::PersonUpdate {
+            started: None,
+            finished: None,
+        },
+    );
+}
+
+pub(crate) fn routed_walking_fixture() -> (Program, Simulation) {
     let (mut p, mut s) = walking_fixture();
     let m = p.modules.get_mut("objects").unwrap();
     for id in [1, 5, 6] {
@@ -3719,22 +3820,37 @@ fn routed_walking_fixture() -> (Program, Simulation) {
 
 #[test]
 fn native_shoo_factory_places_queues_and_destroys_rejected_move_with_saved_callbacks() {
+    check_native_shoo_departure_queries(0);
+}
+
+#[test]
+fn native_shoo_mid_stand_lateral_query_saves_without_second_stand() {
+    check_native_shoo_departure_queries(1);
+}
+
+#[test]
+fn native_shoo_contained_lateral_departure_saves_before_move_enqueue() {
+    check_native_shoo_departure_queries(2);
+}
+
+fn install_shoo_program_resources(program: &mut Program) {
     use sims_formats::behavior::Instruction;
-    let (mut p, mut initial) = walking_fixture();
-    let m = p.modules.get_mut("objects").unwrap();
-    let mut words = m.object_definition_words[&1].clone();
+    let module = program.modules.get_mut("objects").unwrap();
+    let mut words = module.object_definition_words[&1].clone();
     words[14] = 0x7c4;
-    m.object_definition_words.insert(3, words);
-    let mut person_words = m.object_definition_words[&2].clone();
+    module.object_definition_words.insert(3, words);
+    let mut person_words = module.object_definition_words[&2].clone();
     person_words[14] = 4;
-    m.object_definition_words.insert(4, person_words);
-    m.object_functions.insert(4, m.object_functions[&1].clone());
-    let mut functions = m.object_functions[&1].clone();
-    for i in [0, 9, 10] {
-        functions[i].action = 4100;
+    module.object_definition_words.insert(4, person_words);
+    module
+        .object_functions
+        .insert(4, module.object_functions[&1].clone());
+    let mut functions = module.object_functions[&1].clone();
+    for function in [0, 9, 10] {
+        functions[function].action = 4100;
     }
-    m.object_functions.insert(3, functions);
-    let mut callback = m.routines[&4099].clone();
+    module.object_functions.insert(3, functions);
+    let mut callback = module.routines[&4099].clone();
     callback.body.instructions = vec![
         Instruction {
             opcode: 2,
@@ -3749,8 +3865,8 @@ fn native_shoo_factory_places_queues_and_destroys_rejected_move_with_saved_callb
             operands: [1, 0, 1, 0, 0, 3, 8, 7],
         },
     ];
-    m.routines.insert(4100, callback);
-    m.object_interactions.insert(
+    module.routines.insert(4100, callback);
+    module.object_interactions.insert(
         3,
         vec![sims_vm::program::MenuEntry {
             id: 3,
@@ -3758,7 +3874,7 @@ fn native_shoo_factory_places_queues_and_destroys_rejected_move_with_saved_callb
             ..Default::default()
         }],
     );
-    m.object_interactions.insert(
+    module.object_interactions.insert(
         1,
         vec![sims_vm::program::MenuEntry {
             id: 0,
@@ -3767,7 +3883,7 @@ fn native_shoo_factory_places_queues_and_destroys_rejected_move_with_saved_callb
         }],
     );
     for id in [1, 5, 6] {
-        m.named_constants.insert(
+        module.named_constants.insert(
             id,
             sims_formats::tuning::Constants {
                 version: 1,
@@ -3776,8 +3892,13 @@ fn native_shoo_factory_places_queues_and_destroys_rejected_move_with_saved_callb
         );
     }
     for id in [501, 502, 503, 504] {
-        m.strings.insert(id, vec![String::new(); 9]);
+        module.strings.insert(id, vec![String::new(); 9]);
     }
+}
+
+fn check_native_shoo_departure_queries(departure: u8) {
+    let (mut p, mut initial) = walking_fixture();
+    install_shoo_program_resources(&mut p);
     initial.vm.world.refresh = Some(Default::default());
     initial
         .architecture
@@ -3805,6 +3926,9 @@ fn native_shoo_factory_places_queues_and_destroys_rejected_move_with_saved_callb
     blocker.data.insert(8, 8);
     blocker.data.insert(4, 1);
     blocker.data.insert(42, 259);
+    if departure != 0 {
+        blocker.person.as_mut().unwrap().extend([(0, 1), (37, 4)]);
+    }
     // Keep its already sleeping Main; this synchronous operation must not run it.
     initial
         .vm
@@ -3856,6 +3980,9 @@ fn native_shoo_factory_places_queues_and_destroys_rejected_move_with_saved_callb
     for id in [1, 3] {
         initial.vm.world.objects.get_mut(&id).unwrap().native_flags = Some(0);
     }
+    if departure == 2 {
+        contain_potential_actor(&mut p, &mut initial, 3, 2, 0x55);
+    }
     let before = initial.vm.world.positions[&3];
     for (accepted, cancelled) in [(true, false), (true, true), (false, false)] {
         let mut results = vec![];
@@ -3890,7 +4017,7 @@ fn native_shoo_factory_places_queues_and_destroys_rejected_move_with_saved_callb
                 ignored_word: 0,
                 blocked_object: 0,
                 retained_result: 0,
-                candidate_limit: Some(48),
+                candidate_limit: Some(if departure == 2 { 8 } else { 48 }),
                 query: None,
                 attempt: None,
             });
@@ -3924,6 +4051,8 @@ fn native_shoo_factory_places_queues_and_destroys_rejected_move_with_saved_callb
                 }
             }
             let mut saved_callback = false;
+            let mut checked_lateral_context = false;
+            let mut saved_lateral_departure = false;
             for n in 0..5000 {
                 assert!(n < 4999, "shoo did not terminate");
                 let mut remaining = budget;
@@ -3934,6 +4063,75 @@ fn native_shoo_factory_places_queues_and_destroys_rejected_move_with_saved_callb
                 };
                 let done = s.drive_native_shoo(&p, &mut remaining, &mut step).unwrap();
                 saved_callback |= s.vm.threads.values().any(|t| t.callback.is_some());
+                if departure == 2 {
+                    if let Some(shoo) = &s.native_lot.as_ref().unwrap().shoo {
+                        assert_eq!(shoo.candidate_limit, Some(8));
+                        let saved = serde_json::to_value(shoo).unwrap();
+                        if !saved["attempt"]["query"].is_null() {
+                            assert_eq!(saved["attempt"]["query"]["candidate_limit"], 48);
+                            saved_lateral_departure |=
+                                !saved["attempt"]["query"]["departure"]["floor"].is_null()
+                                    && s.vm
+                                        .threads
+                                        .values()
+                                        .any(|thread| thread.callback.is_some());
+                            if !checked_lateral_context {
+                                for (path, value) in [
+                                    (
+                                        vec!["attempt", "query", "potential", "ignored_word"],
+                                        serde_json::json!(19),
+                                    ),
+                                    (vec!["attempt", "query", "thread"], serde_json::json!(67)),
+                                    (
+                                        vec!["attempt", "query", "candidate_limit"],
+                                        serde_json::json!(9),
+                                    ),
+                                    (
+                                        vec!["attempt", "query", "potential_request", "target"],
+                                        serde_json::json!(300),
+                                    ),
+                                    (vec!["attempt", "phase"], serde_json::json!("Enqueue")),
+                                ] {
+                                    let mut forged_owner = saved.clone();
+                                    let mut field = &mut forged_owner;
+                                    for component in path {
+                                        field = &mut field[component];
+                                    }
+                                    *field = value;
+                                    let mut forged = s.clone();
+                                    forged.native_lot.as_mut().unwrap().shoo =
+                                        Some(serde_json::from_value(forged_owner).unwrap());
+                                    assert!(
+                                        crate::Snapshot::capture(&p, &forged).restore(&p).is_err()
+                                    );
+                                    let before = forged.clone();
+                                    let mut untouched_budget = 1000;
+                                    let mut untouched_output = crate::Step {
+                                        stop: crate::StepStop::Budget,
+                                        trace: vec![],
+                                        events: vec![],
+                                    };
+                                    assert!(
+                                        forged
+                                            .drive_native_shoo(
+                                                &p,
+                                                &mut untouched_budget,
+                                                &mut untouched_output
+                                            )
+                                            .is_err()
+                                    );
+                                    assert_eq!(forged, before);
+                                    assert_eq!(untouched_budget, 1000);
+                                    assert!(
+                                        untouched_output.trace.is_empty()
+                                            && untouched_output.events.is_empty()
+                                    );
+                                }
+                                checked_lateral_context = true;
+                            }
+                        }
+                    }
+                }
                 if s.cancellation.is_some() {
                     assert!(
                         s.route_control[&r.id].link.is_none(),
@@ -3951,7 +4149,19 @@ fn native_shoo_factory_places_queues_and_destroys_rejected_move_with_saved_callb
                 }
             }
             assert_eq!(saved_callback, budget == 1);
+            if departure == 2 {
+                assert_eq!(checked_lateral_context, budget == 1);
+                assert_eq!(saved_lateral_departure, budget == 1);
+            }
             assert_eq!(s.vm.world.positions[&3], before);
+            assert_eq!(
+                s.vm.world.objects[&3].person.as_ref().unwrap()[&0],
+                i16::from(departure != 0)
+            );
+            assert_eq!(
+                s.vm.world.objects[&3].person.as_ref().unwrap()[&37],
+                if departure == 0 { 0 } else { 4 }
+            );
             assert_eq!(s.route_control[&r.id].shoo_result, Some(accepted));
             if accepted {
                 let link = s.route_control[&r.id].link.as_ref().unwrap();
@@ -3999,7 +4209,255 @@ fn native_shoo_factory_places_queues_and_destroys_rejected_move_with_saved_callb
 }
 #[test]
 fn native_potential_queries_save_callbacks_without_publishing_a_walk() {
-    let (p, mut initial) = routed_walking_fixture();
+    check_native_potential_queries_save_callbacks(false);
+}
+
+#[test]
+fn native_seated_potential_queries_save_callbacks_without_dispatching_stand() {
+    check_native_potential_queries_save_callbacks(true);
+}
+
+#[test]
+fn native_shoo_outer_seated_departure_snapshots_preserve_cap_and_callback_owner() {
+    let (mut program, mut initial) = routed_walking_fixture();
+    initial.native_lot.as_mut().unwrap().routing_policy = crate::lot_route::path::Policy::Strict;
+    assert!(
+        initial
+            .run_fixture_tick(&program, 1000)
+            .unwrap_err()
+            .starts_with("original-lot path construction required")
+    );
+    let previous = initial.native_lot.as_mut().unwrap().route.take().unwrap();
+    let request =
+        crate::contention::pending_route(&initial.vm.threads[&previous.thread], previous.request)
+            .unwrap()
+            .clone();
+    initial.native_lot.as_mut().unwrap().routing_policy =
+        crate::lot_route::path::Policy::InferredRectangles;
+    let module = program.modules.get_mut("objects").unwrap();
+    let mut person_words = module.object_definition_words[&2].clone();
+    person_words[14] = 4;
+    module.object_definition_words.insert(4, person_words);
+    module
+        .object_functions
+        .insert(4, module.object_functions[&1].clone());
+    let blocker = initial.vm.world.objects.get_mut(&3).unwrap();
+    blocker.person = Some((0..256).map(|field| (field, 0)).collect());
+    blocker.definition.as_mut().unwrap().object = 4;
+    blocker.definition.as_mut().unwrap().guid = 4;
+    blocker.data.extend([(8, 8), (4, 1), (42, 259)]);
+    initial.vm.lifecycles.get_mut(&3).unwrap().definition = 4;
+    initial
+        .architecture
+        .as_mut()
+        .unwrap()
+        .bind_footprints(&program)
+        .unwrap();
+    initial
+        .vm
+        .world
+        .person
+        .as_mut()
+        .unwrap()
+        .person_order
+        .push(3);
+    contain_potential_actor(
+        &mut program,
+        &mut initial,
+        request.caller,
+        request.target,
+        0x55,
+    );
+    initial.native_lot.as_mut().unwrap().membership =
+        RoomMembership::constructed(&initial.vm.world);
+    retain_fixture_household_person(&mut initial, 3);
+    initial.route_control.get_mut(&request.id).unwrap().deciding = true;
+    initial.native_lot.as_mut().unwrap().shoo = Some(crate::lot_route::shoo::Execution {
+        thread: previous.thread,
+        route: request.clone(),
+        selection: crate::lot_route::shoo::Selection::new(vec![3]),
+        ignored_word: 0,
+        blocked_object: 219,
+        retained_result: 3,
+        candidate_limit: Some(8),
+        query: None,
+        attempt: None,
+    });
+    let mut outcomes = vec![];
+    for budget in [1, 1000] {
+        let mut simulation = initial.clone();
+        let mut saved_callback = false;
+        let mut checked_callback = false;
+        let mut saved_departure = false;
+        for turn in 0..1000 {
+            assert!(turn < 999);
+            let mut remaining = budget;
+            let mut output = crate::Step {
+                stop: crate::StepStop::Budget,
+                trace: vec![],
+                events: vec![],
+            };
+            let done = simulation
+                .drive_native_shoo(&program, &mut remaining, &mut output)
+                .unwrap();
+            if let Some(shoo) = &simulation.native_lot.as_ref().unwrap().shoo {
+                assert_eq!(shoo.candidate_limit, Some(8));
+            }
+            let callback = simulation
+                .vm
+                .threads
+                .iter()
+                .find_map(|(&thread, state)| state.callback.is_some().then_some(thread));
+            if let Some(shoo) = &simulation.native_lot.as_ref().unwrap().shoo {
+                let saved = serde_json::to_value(shoo).unwrap();
+                saved_departure |=
+                    !saved["query"]["departure"]["floor"].is_null() && callback.is_some();
+            }
+            saved_callback |= callback.is_some();
+            if !checked_callback {
+                if let Some(thread) = callback {
+                    let mut forged = simulation.clone();
+                    forged
+                        .vm
+                        .threads
+                        .get_mut(&thread)
+                        .unwrap()
+                        .stack
+                        .last_mut()
+                        .unwrap()
+                        .caller = 300;
+                    assert!(
+                        crate::Snapshot::capture(&program, &forged)
+                            .restore(&program)
+                            .is_err()
+                    );
+                    let before = forged.clone();
+                    let mut untouched_budget = 1000;
+                    let mut untouched_output = crate::Step {
+                        stop: crate::StepStop::Budget,
+                        trace: vec![],
+                        events: vec![],
+                    };
+                    assert!(
+                        forged
+                            .drive_native_shoo(
+                                &program,
+                                &mut untouched_budget,
+                                &mut untouched_output,
+                            )
+                            .is_err()
+                    );
+                    assert_eq!(forged, before);
+                    assert_eq!(untouched_budget, 1000);
+                    assert!(
+                        untouched_output.trace.is_empty() && untouched_output.events.is_empty()
+                    );
+                    checked_callback = true;
+                }
+            }
+            simulation = serde_json::from_slice::<crate::Snapshot>(
+                &serde_json::to_vec(&crate::Snapshot::capture(&program, &simulation)).unwrap(),
+            )
+            .unwrap()
+            .restore(&program)
+            .unwrap();
+            if done {
+                break;
+            }
+        }
+        assert_eq!(saved_callback, budget == 1);
+        assert_eq!(checked_callback, budget == 1);
+        assert_eq!(saved_departure, budget == 1);
+        assert!(simulation.native_lot.as_ref().unwrap().shoo.is_none());
+        assert_eq!(
+            simulation.vm.world.objects[&request.caller]
+                .person
+                .as_ref()
+                .unwrap()[&0],
+            1
+        );
+        outcomes.push(simulation);
+    }
+    assert_eq!(outcomes[0], outcomes[1]);
+}
+
+pub(crate) fn contain_potential_actor(
+    program: &mut Program,
+    simulation: &mut Simulation,
+    caller: sims_vm::ObjectId,
+    seat: sims_vm::ObjectId,
+    mask: i16,
+) {
+    let definition = simulation.vm.world.objects[&seat]
+        .definition
+        .as_ref()
+        .unwrap()
+        .clone();
+    let module = program.modules.get_mut(&definition.source).unwrap();
+    module.object_functions.get_mut(&definition.object).unwrap()[26].action = 4096;
+    module
+        .object_definition_words
+        .get_mut(&definition.object)
+        .unwrap()[0x84 / 2] = mask;
+    let container = simulation.vm.world.objects.get_mut(&seat).unwrap();
+    container.slots = vec![None];
+    container.native_slot_geometry = Some(vec![sims_vm::slot_geometry::Slot {
+        offset: [0; 3],
+        height: 1,
+        anchor: None,
+    }]);
+    let position = simulation.vm.world.positions[&seat];
+    simulation
+        .native_lot
+        .as_mut()
+        .unwrap()
+        .placement
+        .links
+        .apply(
+            &mut simulation.vm.world,
+            caller,
+            crate::lot_links::Descriptor {
+                on_lot: false,
+                position: [-16, -16],
+                level: position.level,
+                container: None,
+                slot: -1,
+            },
+        )
+        .unwrap();
+    simulation
+        .native_lot
+        .as_mut()
+        .unwrap()
+        .placement
+        .links
+        .apply(
+            &mut simulation.vm.world,
+            caller,
+            crate::lot_links::Descriptor {
+                on_lot: true,
+                position: [position.x, position.y],
+                level: position.level,
+                container: Some(seat),
+                slot: 0,
+            },
+        )
+        .unwrap();
+    simulation
+        .native_lot
+        .as_ref()
+        .unwrap()
+        .placement
+        .links
+        .publish_tile_chains(&mut simulation.vm.world)
+        .unwrap();
+    let actor = simulation.vm.world.objects.get_mut(&caller).unwrap();
+    actor.container = Some((seat, 0));
+    actor.person.as_mut().unwrap().insert(0, 1);
+}
+
+fn check_native_potential_queries_save_callbacks(seated: bool) {
+    let (mut p, mut initial) = routed_walking_fixture();
     initial.native_lot.as_mut().unwrap().routing_policy = crate::lot_route::path::Policy::Strict;
     let error = loop {
         match initial.run_fixture_tick(&p, 1000) {
@@ -4015,6 +4473,40 @@ fn native_potential_queries_save_callbacks_without_publishing_a_walk() {
     let r = crate::contention::pending_route(&initial.vm.threads[&old.thread], old.request)
         .unwrap()
         .clone();
+    let module = p.modules.get_mut("objects").unwrap();
+    let mut person_words = module.object_definition_words[&2].clone();
+    person_words[14] = 4;
+    module.object_definition_words.insert(4, person_words);
+    module
+        .object_functions
+        .insert(4, module.object_functions[&1].clone());
+    let blocker = initial.vm.world.objects.get_mut(&3).unwrap();
+    blocker.person = Some((0..256).map(|field| (field, 0)).collect());
+    blocker.definition.as_mut().unwrap().object = 4;
+    blocker.definition.as_mut().unwrap().guid = 4;
+    blocker.data.extend([(8, 8), (4, 1), (42, 259)]);
+    initial.vm.lifecycles.get_mut(&3).unwrap().definition = 4;
+    initial
+        .architecture
+        .as_mut()
+        .unwrap()
+        .bind_footprints(&p)
+        .unwrap();
+    initial
+        .vm
+        .world
+        .person
+        .as_mut()
+        .unwrap()
+        .person_order
+        .push(3);
+    initial.native_lot.as_mut().unwrap().membership =
+        RoomMembership::constructed(&initial.vm.world);
+    retain_fixture_household_person(&mut initial, 3);
+    initial.route_control.get_mut(&r.id).unwrap().deciding = true;
+    if seated {
+        contain_potential_actor(&mut p, &mut initial, r.caller, r.target, 0x55);
+    }
     initial.native_lot.as_mut().unwrap().routing_policy =
         crate::lot_route::path::Policy::InferredRectangles;
     initial
@@ -4042,10 +4534,11 @@ fn native_potential_queries_save_callbacks_without_publishing_a_walk() {
         let mut s = initial.clone();
         let q = crate::lot_route::live::Execution::begin_potential(
             &mut s,
+            &p,
             old.thread,
             &r,
             crate::lot_route::live::Potential {
-                ignored_person: None,
+                ignored_person: Some(3),
                 ignore_people: false,
                 ignored_word: 0,
                 blocked_object: 0,
@@ -4053,11 +4546,32 @@ fn native_potential_queries_save_callbacks_without_publishing_a_walk() {
             },
         )
         .unwrap();
-        s.native_lot.as_mut().unwrap().route = Some(q);
+        let mut selection = crate::lot_route::shoo::Selection::new(vec![3]);
+        selection.next().unwrap();
+        s.native_lot.as_mut().unwrap().shoo = Some(crate::lot_route::shoo::Execution {
+            thread: old.thread,
+            route: r.clone(),
+            selection,
+            ignored_word: 0,
+            blocked_object: 0,
+            retained_result: 0,
+            candidate_limit: Some(q.potential_candidate_limit()),
+            query: Some(q),
+            attempt: None,
+        });
         let mut saved_callback = false;
         for n in 0..1000 {
             assert!(n < 999, "potential query failed to terminate");
-            let mut q = s.native_lot.as_mut().unwrap().route.take().unwrap();
+            let mut q = s
+                .native_lot
+                .as_mut()
+                .unwrap()
+                .shoo
+                .as_mut()
+                .unwrap()
+                .query
+                .take()
+                .unwrap();
             let mut remaining = budget;
             let mut step = crate::Step {
                 stop: crate::StepStop::Budget,
@@ -4065,7 +4579,7 @@ fn native_potential_queries_save_callbacks_without_publishing_a_walk() {
                 events: vec![],
             };
             let complete = s
-                .drive_point_clearance(&p, &mut q, &mut remaining, &mut step)
+                .drive_potential_preparation(&p, &mut q, &r, &mut remaining, &mut step)
                 .unwrap()
                 && {
                     q.mark_potential_prepared();
@@ -4073,7 +4587,9 @@ fn native_potential_queries_save_callbacks_without_publishing_a_walk() {
                         .unwrap()
                 };
             saved_callback |= s.vm.threads.values().any(|t| t.callback.is_some());
-            s.native_lot.as_mut().unwrap().route = Some(q);
+            let owner = s.native_lot.as_mut().unwrap().shoo.as_mut().unwrap();
+            owner.candidate_limit = Some(q.potential_candidate_limit());
+            owner.query = Some(q);
             s = serde_json::from_slice::<crate::Snapshot>(
                 &serde_json::to_vec(&crate::Snapshot::capture(&p, &s)).unwrap(),
             )
@@ -4085,7 +4601,16 @@ fn native_potential_queries_save_callbacks_without_publishing_a_walk() {
             }
         }
         assert_eq!(saved_callback, budget == 1);
-        let q = s.native_lot.as_ref().unwrap().route.as_ref().unwrap();
+        let q = s
+            .native_lot
+            .as_ref()
+            .unwrap()
+            .shoo
+            .as_ref()
+            .unwrap()
+            .query
+            .as_ref()
+            .unwrap();
         assert!(q.path.as_ref().unwrap().points.as_ref().unwrap().len() >= 2);
         assert!(q.goal.is_none() && q.selected_seat.is_none() && s.routes.is_empty());
         assert_eq!(s.vm.world.positions, before_positions);
@@ -5171,65 +5696,8 @@ fn native_floor_snap_saves_acceptance_and_commits_once_for_people_and_objects() 
 }
 
 fn snap_shoo_fixture() -> (Program, Simulation) {
-    use sims_formats::behavior::Instruction;
     let (mut p, mut initial) = walking_fixture();
-    let m = p.modules.get_mut("objects").unwrap();
-    let mut words = m.object_definition_words[&1].clone();
-    words[14] = 0x7c4;
-    m.object_definition_words.insert(3, words);
-    let mut person_words = m.object_definition_words[&2].clone();
-    person_words[14] = 4;
-    m.object_definition_words.insert(4, person_words);
-    m.object_functions.insert(4, m.object_functions[&1].clone());
-    let mut functions = m.object_functions[&1].clone();
-    for i in [0, 9, 10] {
-        functions[i].action = 4100;
-    }
-    m.object_functions.insert(3, functions);
-    let mut callback = m.routines[&4099].clone();
-    callback.body.instructions = vec![
-        Instruction {
-            opcode: 2,
-            on_true: 1,
-            on_false: 255,
-            operands: [8, 0, 16, 0, 0, 5, 3, 7],
-        },
-        Instruction {
-            opcode: 2,
-            on_true: 254,
-            on_false: 255,
-            operands: [1, 0, 1, 0, 0, 3, 8, 7],
-        },
-    ];
-    m.routines.insert(4100, callback);
-    m.object_interactions.insert(
-        3,
-        vec![sims_vm::program::MenuEntry {
-            id: 3,
-            action: 4096,
-            ..Default::default()
-        }],
-    );
-    m.object_interactions.insert(
-        1,
-        vec![sims_vm::program::MenuEntry {
-            id: 0,
-            action: 4096,
-            ..Default::default()
-        }],
-    );
-    for id in [1, 5, 6] {
-        m.named_constants.insert(
-            id,
-            sims_formats::tuning::Constants {
-                version: 1,
-                entries: vec![],
-            },
-        );
-    }
-    for id in [501, 502, 503, 504] {
-        m.strings.insert(id, vec![String::new(); 9]);
-    }
+    install_shoo_program_resources(&mut p);
     initial.vm.world.refresh = Some(Default::default());
     initial
         .architecture
@@ -6452,6 +6920,85 @@ fn native_floor_snap_bypassed_adjacency_still_rejects_off_lot() {
     assert_eq!(s.vm.world.objects[&1].data[&54], 0);
     assert_eq!(s.native_lot.as_ref().unwrap().diagnostics.error, 1);
     assert_eq!(crate::Snapshot::capture(&p, &s).restore(&p).unwrap(), s);
+}
+
+#[test]
+fn native_floor_snap_reports_off_lot_beyond_the_active_world_extent() {
+    for (global23, map, off_lot) in [
+        (Some(4), None, true),
+        (None, Some(4), true),
+        (Some(4), Some(6), false),
+        (Some(0), None, false),
+        (Some(3), None, false),
+        (None, None, false),
+    ] {
+        let case = (global23, map);
+        let (mut program, mut simulation) = walking_fixture();
+        let instruction = &mut program
+            .modules
+            .get_mut("objects")
+            .unwrap()
+            .routines
+            .get_mut(&4098)
+            .unwrap()
+            .body
+            .instructions[0];
+        instruction.opcode = 0x2e;
+        instruction.operands = [0, 0, 3, 0, 0, 0, 0, 0];
+        simulation
+            .vm
+            .world
+            .objects
+            .get_mut(&2)
+            .unwrap()
+            .routing_slots
+            .as_mut()
+            .unwrap()[0]
+            .0[0] = 16f32.to_bits();
+        match global23 {
+            Some(value) => simulation.vm.world.globals.insert(23, value),
+            None => simulation.vm.world.globals.remove(&23),
+        };
+        simulation.vm.world.map_size =
+            map.map(|active_size| sims_vm::world_map::State { active_size });
+        let lot = simulation
+            .architecture
+            .as_ref()
+            .unwrap()
+            .original
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            crate::lot_snap::active_extent(&simulation.vm.world, lot).unwrap(),
+            if off_lot { 4 } else { 6 },
+            "{case:?}"
+        );
+        let before = simulation.vm.world.positions[&1];
+        let step = simulation.run_fixture_tick(&program, 1000).unwrap();
+        assert!(
+            step.events
+                .iter()
+                .any(|event| event.detail.starts_with("native Snap #1")),
+            "{case:?}"
+        );
+        let object = &simulation.vm.world.objects[&1];
+        assert_eq!(object.data[&52] == 2, off_lot, "{case:?}");
+        assert_eq!(
+            simulation.native_lot.as_ref().unwrap().diagnostics.error == 1,
+            off_lot,
+            "{case:?}"
+        );
+        if off_lot {
+            assert_eq!(object.data[&54], 0, "{case:?}");
+            assert_eq!(simulation.vm.world.positions[&1], before, "{case:?}");
+        }
+        assert_eq!(
+            crate::Snapshot::capture(&program, &simulation)
+                .restore(&program)
+                .unwrap(),
+            simulation
+        );
+    }
 }
 
 #[test]

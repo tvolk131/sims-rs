@@ -27,6 +27,8 @@ pub struct Execution {
     side_path: Option<bool>,
     queued: Option<(u32, bool)>,
     after_delete_room: Option<i16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ignored_word: Option<i16>,
 }
 impl Execution {
     pub(super) fn begin(
@@ -58,6 +60,7 @@ impl Execution {
             side_path: None,
             queued: None,
             after_delete_room: None,
+            ignored_word: None,
         }))
     }
     pub(super) fn owns_callback(
@@ -109,6 +112,7 @@ impl Execution {
             || self.queued.is_some()
                 != matches!(self.phase, Phase::Publish | Phase::Detach | Phase::Destroy)
             || self.route.is_some() != !matches!(self.phase, Phase::Factory | Phase::Place)
+            || self.ignored_word.is_some() != self.route.is_some()
         {
             return Err("invalid native shoo factory phase".into());
         }
@@ -142,6 +146,7 @@ impl Execution {
                             || q.ignore_people
                             || q.blocked_object != 0
                             || q.retained_result != 0
+                            || Some(q.ignored_word) != self.ignored_word
                     })
                 {
                     return Err("invalid native shoo lateral context".into());
@@ -167,6 +172,7 @@ impl Simulation {
         remaining: &mut usize,
         step: &mut Step,
     ) -> Result<Option<bool>, String> {
+        e.validate(self, p, parent, thread)?;
         loop {
             match e.phase {
                 Phase::Factory => {
@@ -227,21 +233,26 @@ impl Simulation {
                         },
                         no_failure_trees: true,
                     };
+                    let ignored_word = self.vm.world.objects[&e.blocker]
+                        .person
+                        .as_ref()
+                        .and_then(|person| person.get(&72))
+                        .copied()
+                        .ok_or("native shoo ignored word absent")?;
                     let q = super::super::live::Execution::begin_potential(
                         self,
+                        p,
                         thread,
                         &r,
                         super::super::live::Potential {
                             ignored_person: None,
                             ignore_people: false,
-                            ignored_word: self.vm.world.objects[&e.blocker]
-                                .person
-                                .as_ref()
-                                .unwrap()[&72],
+                            ignored_word,
                             blocked_object: 0,
                             retained_result: 0,
                         },
                     )?;
+                    e.ignored_word = q.potential.as_ref().map(|settings| settings.ignored_word);
                     e.route = Some(r);
                     e.query = Some(q);
                     e.placement = None;
@@ -249,10 +260,15 @@ impl Simulation {
                 }
                 Phase::Query => {
                     let q = e.query.as_mut().unwrap();
-                    if !self.drive_point_clearance(p, q, remaining, step)? {
+                    if !self.drive_potential_preparation(
+                        p,
+                        q,
+                        e.route.as_ref().unwrap(),
+                        remaining,
+                        step,
+                    )? {
                         return Ok(None);
                     }
-                    q.mark_potential_prepared();
                     let actor = &self.vm.world.objects[&q.caller];
                     let person = actor.person.as_ref().unwrap();
                     let same_room = actor.data[&29] == self.vm.world.objects[&q.target].data[&29]

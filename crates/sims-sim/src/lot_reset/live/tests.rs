@@ -3,6 +3,99 @@ use serde_json::{Value, json};
 use sims_formats::behavior::Instruction;
 
 #[test]
+fn reconstruction_restores_parent_visit_across_budgeted_multipart_updates() {
+    for group in [false, true] {
+        let (mut program, mut initial) = crate::lot_runtime::tests::fixture();
+        let module = program.modules.get_mut("objects").unwrap();
+        module.object_functions.get_mut(&1).unwrap()[0].action = 4100;
+        let mut init = module.routines[&4096].clone();
+        init.body.instructions[0].operands = [0, 0, 11, 0, 0, 5, 0, 3];
+        module.routines.insert(4100, init);
+        if group {
+            module.object_definition_words.get_mut(&1).unwrap()[10] = 7;
+            for (object, head, next) in [
+                (1, None, Some(3)),
+                (3, Some(1), Some(2)),
+                (2, Some(1), None),
+            ] {
+                initial.vm.world.objects.get_mut(&object).unwrap().multitile =
+                    Some(sims_vm::multitile::Part {
+                        head,
+                        next,
+                        origin: [0; 3],
+                        offset: [0; 3],
+                    });
+            }
+        }
+        for object in initial.vm.world.objects.values_mut() {
+            object.attributes = vec![99; 8];
+        }
+        initial.vm = Vm::new(initial.vm.world.clone(), 1);
+        for object in 1..=4 {
+            initial.vm.start_object_lifecycle(&program, object).unwrap();
+            initial.vm.restart_loaded_main(&program, object).unwrap();
+        }
+        initial.vm.begin_scheduled_object_visit(4).unwrap();
+        let parent_visit = initial.vm.scheduled_object_visit.clone();
+        let parent_thread = initial.vm.object_threads[&4];
+        let parent_state = initial.vm.threads[&parent_thread].clone();
+        let now = ObjectDate {
+            year: 1997,
+            month: 3,
+            day: 10,
+        };
+        let mut outcomes = Vec::new();
+        for budget in [1, 3, 1000] {
+            let mut simulation = initial.clone();
+            for _ in 0..2 {
+                let mut reset = Execution::new(1);
+                let mut step = Step {
+                    stop: crate::StepStop::Budget,
+                    trace: Vec::new(),
+                    events: Vec::new(),
+                };
+                for _ in 0..100 {
+                    reset
+                        .advance(
+                            &mut simulation,
+                            &program,
+                            now,
+                            false,
+                            &mut { budget },
+                            &mut step,
+                        )
+                        .unwrap();
+                    reset.validate(&simulation, &program).unwrap();
+                    let saved = serde_json::to_vec(&(&reset, &simulation)).unwrap();
+                    (reset, simulation) = serde_json::from_slice(&saved).unwrap();
+                    simulation.vm = sims_vm::Snapshot::capture(&program, &simulation.vm)
+                        .restore(&program)
+                        .unwrap();
+                    if reset.complete() {
+                        break;
+                    }
+                }
+                assert!(reset.complete());
+                assert_eq!(simulation.vm.scheduled_object_visit, parent_visit);
+                assert_eq!(simulation.vm.threads[&parent_thread], parent_state);
+                assert_eq!(simulation.vm.tick, initial.vm.tick);
+                for object in if group { vec![1, 3, 2] } else { vec![1] } {
+                    assert_eq!(
+                        simulation.vm.world.positions[&object],
+                        initial.vm.world.positions[&object]
+                    );
+                    assert_eq!(simulation.vm.world.objects[&object].attributes[0], object);
+                    assert_eq!(simulation.vm.world.objects[&object].data[&41], 0);
+                }
+            }
+            outcomes.push(simulation);
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+        assert_eq!(outcomes[0], outcomes[2]);
+    }
+}
+
+#[test]
 fn reconstruction_resets_every_group_member_before_init_and_retains_saved_location() {
     for group in [false, true] {
         let (mut p, mut initial) = crate::lot_runtime::tests::fixture();

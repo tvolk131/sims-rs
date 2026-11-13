@@ -44,6 +44,11 @@ pub enum Request {
         position: [i32; 2],
         immediate: u8,
     },
+    CenterPerson {
+        point: [i32; 2],
+        level: i32,
+    },
+    MotionFrame,
     WallState {
         enabled: u8,
         level: i32,
@@ -79,6 +84,9 @@ impl Cursor {
         self.request = match request {
             Request::WallsDown(_) | Request::Cutaway(_) | Request::Roof { .. } => {
                 return Err("wall controls are not house-open children".into());
+            }
+            Request::CenterPerson { .. } | Request::MotionFrame => {
+                return Err("live camera calls are not house-open children".into());
             }
             Request::InvalidateView => {
                 state.widths = [16i32, 8, 8, 4].map(|n| n.wrapping_shl(state.zoom));

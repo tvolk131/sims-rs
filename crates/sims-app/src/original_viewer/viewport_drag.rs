@@ -8,6 +8,9 @@ pub(super) struct Drag {
     intent: [f64; 2],
     camera_owned: bool,
     revision: u64,
+    selection: Option<(i16, u32)>,
+    released_selection: Option<(i16, u32)>,
+    moved: bool,
 }
 
 impl Drag {
@@ -49,6 +52,17 @@ impl Drag {
         }
         self.origin = Some(pixel.map(f64::from));
         self.endpoint = pixel.map(f64::from);
+        self.selection = None;
+        self.released_selection = None;
+        self.moved = false;
+    }
+
+    pub(super) fn bind_selection(&mut self, selection: Option<(i16, u32)>) {
+        self.selection = selection.filter(|_| self.origin.is_some());
+    }
+
+    pub(super) fn take_selection(&mut self) -> Option<(i16, u32)> {
+        self.released_selection.take()
     }
 
     pub(super) fn motion(&mut self, pixel: Option<[f32; 2]>) {
@@ -56,6 +70,7 @@ impl Drag {
             return;
         }
         if let Some(pixel) = pixel.filter(|pixel| pixel.iter().all(|axis| axis.is_finite())) {
+            self.moved |= self.endpoint != pixel.map(f64::from);
             self.endpoint = pixel.map(f64::from);
         } else {
             self.reset();
@@ -64,6 +79,10 @@ impl Drag {
 
     pub(super) fn end(&mut self, pixel: Option<[f32; 2]>) {
         self.motion(pixel);
+        self.released_selection = self
+            .selection
+            .take()
+            .filter(|_| self.origin.is_some() && !self.moved && !self.camera_owned);
         self.intent = self.total();
         self.origin = None;
     }
@@ -296,6 +315,35 @@ impl Pointer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn character_shortcut_right_click_retains_only_an_unmoved_lifetime() {
+        let mut drag = Drag::default();
+        drag.begin(Some([30., 40.]), true);
+        drag.bind_selection(Some((105, 77)));
+        drag.end(Some([30., 40.]));
+        assert_eq!(drag.take_selection(), Some((105, 77)));
+        assert_eq!(drag.take_selection(), None);
+        assert_eq!(drag.take_scroll(), None);
+    }
+
+    #[test]
+    fn character_shortcut_right_drag_blocked_and_cancelled_gestures_never_select() {
+        for variant in 0..5 {
+            let mut drag = Drag::default();
+            drag.begin(Some([30., 40.]), variant != 0);
+            drag.bind_selection(Some((105, 77)));
+            match variant {
+                1 => drag.motion(Some([35., 40.])),
+                2 => drag.reset(),
+                3 => drag.set_camera_owned(true),
+                4 => drag.motion(None),
+                _ => (),
+            }
+            drag.end(Some([30., 40.]));
+            assert_eq!(drag.take_selection(), None, "variant {variant}");
+        }
+    }
+
     use super::*;
 
     fn bounds() -> Rectangle {

@@ -768,8 +768,11 @@ impl Reset {
                     for i in [34, 9] {
                         o.data.insert(i, 0);
                     }
-                    let footprint =
-                        vm.clear_person_action(object, vm.threads[&thread].last_result)?;
+                    let footprint = vm.clear_person_action(
+                        object,
+                        vm.threads[&thread].last_result,
+                        crate::observations::ActionTerminalReason::Reset,
+                    )?;
                     self.phase = if self.notification.is_some() { 12 } else { 7 };
                     if footprint {
                         return Ok(Some(Request::Footprint(object)));
@@ -871,6 +874,7 @@ impl Reset {
                         && vm.clear_person_action(
                             object,
                             vm.threads[&self.thread.unwrap()].last_result,
+                            crate::observations::ActionTerminalReason::Reset,
                         )?
                     {
                         return Ok(Some(Request::Footprint(object)));

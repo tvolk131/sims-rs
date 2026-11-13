@@ -16,6 +16,21 @@ impl Catalog {
         context: u32,
         flags: &mut u32,
     ) -> Result<usize> {
+        self.load_startup_paths_observed(
+            index, directories, paths, indexed, context, flags, None,
+        )
+    }
+
+    pub(crate) fn load_startup_paths_observed(
+        &mut self,
+        index: &Index,
+        directories: &mut Directories,
+        paths: &[Vec<u8>],
+        indexed: bool,
+        context: u32,
+        flags: &mut u32,
+        inputs: Option<&crate::startup_inputs::Session>,
+    ) -> Result<usize> {
         self.ready()?;
         let mut host = Startup {
             index,
@@ -24,6 +39,10 @@ impl Catalog {
             catalog: self,
             flags,
             visited: 0,
+            scan: inputs
+                .map(crate::resource_scan::Scan::observed)
+                .transpose()?
+                .unwrap_or_default(),
         };
         let result = catalog_load::run(indexed, context, &mut host);
         let visited = host.visited;
@@ -38,6 +57,7 @@ struct Startup<'a> {
     catalog: &'a mut Catalog,
     flags: &'a mut u32,
     visited: usize,
+    scan: crate::resource_scan::Scan,
 }
 struct Stream {
     source: Option<usize>,
@@ -95,6 +115,7 @@ impl Host for Startup<'_> {
                 index: self.index,
                 directories: self.directories,
                 stream,
+                scan: &mut self.scan,
             },
         )?;
         if status == 0 {
@@ -166,6 +187,7 @@ pub(super) fn open_plain_paths(
         bytes: None,
         binary: true,
     };
+    let mut scan = crate::resource_scan::Scan::default();
     let status = catalog_open::plain_paths(
         paths,
         Some(name),
@@ -174,6 +196,7 @@ pub(super) fn open_plain_paths(
             index,
             directories,
             stream: &mut stream,
+            scan: &mut scan,
         },
     )
     .map_err(anyhow::Error::msg)?;
@@ -184,6 +207,7 @@ struct Opening<'a> {
     index: &'a Index,
     directories: &'a Directories,
     stream: &'a mut Stream,
+    scan: &'a mut crate::resource_scan::Scan,
 }
 impl catalog_open::Host for Opening<'_> {
     type Search = ();
@@ -200,7 +224,7 @@ impl catalog_open::Host for Opening<'_> {
             .resources
             .get(id)
             .ok_or("startup source ID absent")?;
-        match source.read() {
+        match self.scan.read(source) {
             Ok(bytes) => {
                 self.stream.source = Some(id);
                 self.stream.bytes = Some(bytes);
@@ -244,3 +268,6 @@ impl catalog_open::Host for Opening<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

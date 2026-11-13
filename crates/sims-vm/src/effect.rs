@@ -235,7 +235,7 @@ impl crate::Vm {
         match result? {
             Outcome::Complete => {
                 thread.stack.last_mut().unwrap().continuation = 0;
-                crate::branch(program, thread, instruction.on_true)?;
+                self.branch(program, thread, instruction.on_true)?;
                 Ok("Special Effect completed; branch true".into())
             }
             Outcome::Yield => {

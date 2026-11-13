@@ -10,13 +10,16 @@ use sims_sim::pose::clothing::{
     catalog_record::{AssetId, Assets, CatalogReader, Loader, Record, Registry},
     name_map::Files,
 };
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 mod startup;
+
+#[cfg(test)]
+mod pool_sharing_tests;
 
 /// Explicit directory file maps. Non-resource entries still occupy hash nodes.
 /// `from_mounted` preserves the entire map, including its collision chains;
 /// `insert_first` is for callers supplying individual insertion operations.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Directories {
     maps: BTreeMap<Vec<u8>, Files<Option<usize>>>,
     // Filesystem wildcard searches are distinct from mounted hash-map iteration.
@@ -93,7 +96,7 @@ impl catalog_files::Host for Directories {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Catalog {
     registry: Registry,
     index_sources: [BTreeMap<Vec<u8>, usize>; 3],
@@ -183,6 +186,7 @@ impl Catalog {
         self.get(kind, name)?
             .asset
             .and_then(|id| self.assets.values.get(&id))
+            .map(Arc::as_ref)
     }
     /// Resolve once. A missing catalog, or an ordinary failed read, consumes
     /// the attempt just as 5a3810/5a38da/5a39d2 do. Unsupported Rust decoding
@@ -252,7 +256,7 @@ impl Catalog {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Loaded {
     /// Source of the decoded record, independent of the NDX record's retained
     /// directory/context and independently queryable via `index_source`.
@@ -260,10 +264,10 @@ pub struct Loaded {
     pub context: u32,
     pub value: Asset,
 }
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Pool {
     next: AssetId,
-    values: BTreeMap<AssetId, Loaded>,
+    values: BTreeMap<AssetId, Arc<Loaded>>,
 }
 impl Pool {
     fn insert(&mut self, value: Loaded) -> Result<AssetId, String> {
@@ -271,7 +275,7 @@ impl Pool {
             .next
             .checked_add(1)
             .ok_or("avatar asset identity exhausted")?;
-        self.values.insert(self.next, value);
+        self.values.insert(self.next, Arc::new(value));
         Ok(self.next)
     }
 }
@@ -290,9 +294,11 @@ impl Assets for Pool {
         Ok(bytes.into_owned())
     }
     fn rename(&mut self, asset: AssetId, name: Vec<u8>) -> Result<(), String> {
-        self.values
+        let value = self
+            .values
             .get_mut(&asset)
-            .ok_or("decoded avatar asset absent")?
+            .ok_or("decoded avatar asset absent")?;
+        Arc::make_mut(value)
             .value
             .set_name(encoding_rs::WINDOWS_1252.decode(&name).0.into_owned());
         Ok(())

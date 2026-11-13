@@ -101,6 +101,20 @@ fn names_match_original_basename_case_order_duplicates_and_errors() {
     }
 }
 
+#[test]
+fn names_bucket_only_matching_ascii_folded_basenames_in_source_order() {
+    let mut resources = (0..10_000)
+        .map(|id| owned(&format!("folder/{id:08}.iff"), "unrelated", b"other"))
+        .collect::<Vec<_>>();
+    resources.insert(12, owned("dir/Floors.iff", "first", b"floor"));
+    resources.insert(250, owned("other\\floors.IFF", "second", b"floor"));
+    let index = index(resources);
+    let lookup = ResourceNames::new(&index);
+    assert_eq!(lookup.names.get("floors.iff"), Some(&vec![12, 250]));
+    compare(&index, &lookup, "FLOORS.IFF");
+    assert_eq!(lookup.resource("floors.iff").unwrap(), 12);
+}
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Directory(std::path::PathBuf);
 impl Drop for Directory {

@@ -28,6 +28,8 @@ use std::collections::BTreeMap;
 
 mod fresh;
 mod startup;
+#[cfg(test)]
+mod startup_tests;
 pub use startup::RetainedGraphics;
 pub mod live;
 use fresh::Fresh;
@@ -312,6 +314,7 @@ impl<'a, P: Presentation> Reader<'a, P> {
             self.settings,
             &mut self.crt_state,
             &mut self.skeletons,
+            None,
         )?;
         for _ in 0..10_000 {
             if fresh.advance(
@@ -321,6 +324,7 @@ impl<'a, P: Presentation> Reader<'a, P> {
                 &mut self.presentation,
                 &mut self.mesh_pool,
                 &mut self.clothing,
+                None,
                 fresh::Environment {
                     position: [-16, -16],
                     level: 1,

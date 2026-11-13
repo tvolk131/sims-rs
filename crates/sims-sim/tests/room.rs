@@ -62,6 +62,7 @@ fn fixture() -> (Program, Simulation) {
         careers: None,
         accessories: BTreeMap::new(),
         animations: BTreeMap::new(),
+        native_animation_absences: BTreeMap::new(),
         globals: "global".into(),
         modules: BTreeMap::from([
             (

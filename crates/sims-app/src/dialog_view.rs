@@ -1,6 +1,6 @@
 use iced::{
     Element,
-    widget::{button, column, container, row, scrollable, text},
+    widget::{button, container},
 };
 use sims_vm::dialog::Record;
 use std::{collections::BTreeMap, sync::Mutex};
@@ -9,7 +9,7 @@ mod tutorial_dialog;
 
 type Handle = iced::widget::image::Handle;
 type BitmapFrames = BTreeMap<(String, u16), Option<(u32, u32, Handle)>>;
-type GlobalFrames = BTreeMap<(i32, bool), Option<Handle>>;
+type GlobalFrames = BTreeMap<(i32, bool), Option<(u32, u32, Handle)>>;
 
 /// Immutable installed artwork. No asset Index, lazy cache or mutex is reachable
 /// from this owner. Handle clones retain the original immutable image payload.
@@ -21,7 +21,7 @@ pub struct StaticArt {
     pause: [Handle; 2],
     tutorial: Handle,
     tutorial_skin: tutorial_dialog::Skin,
-    jobs: Vec<Handle>,
+    jobs: Vec<(u32, u32, Handle)>,
 }
 
 /// The exact prepared frontend handles at one ordinary art publication cut.
@@ -164,10 +164,10 @@ impl Icons {
         // Button strips are normal/selected/hover/disabled. Backgrounds and
         // mode trim are single images; Pause2026 is a separate two-row display.
         for id in [
-            150, 151, 152, 153, 154, 155, 156, 157, 2003, 2008, 2009, 2010, 2011, 2012, 2013, 2014,
-            2023, 2024, 2037, 4500, 4501, 4502, 4503, 4504, 4505, 4506, 4507, 4510, 4705, 4706,
-            4707, 4803, 4804, 4805, 4806, 4910, 4911, 4916, 4917, 4918, 4950, 4951, 4952, 4957,
-            4958, 4959,
+            150, 151, 152, 153, 154, 155, 156, 157, 2003, 2004, 2006, 2007, 2008, 2009, 2010, 2011,
+            2012, 2013, 2014, 2023, 2024, 2037, 4500, 4501, 4502, 4503, 4504, 4505, 4506, 4507,
+            4510, 4705, 4706, 4707, 4803, 4804, 4805, 4806, 4910, 4911, 4916, 4917, 4918, 4950,
+            4951, 4952, 4957, 4958, 4959,
         ] {
             let bitmap = global
                 .image(
@@ -239,10 +239,11 @@ impl Icons {
                 jobs: (0..22)
                     .map(|job| {
                         let image = atlas.icon(job).unwrap();
-                        iced::widget::image::Handle::from_rgba(
-                            image.width(),
-                            image.height(),
-                            image.into_raw(),
+                        let (width, height) = image.dimensions();
+                        (
+                            width,
+                            height,
+                            iced::widget::image::Handle::from_rgba(width, height, image.into_raw()),
                         )
                     })
                     .collect(),
@@ -295,10 +296,15 @@ impl Icons {
                     std::sync::Arc::make_mut(&mut global_frames).insert(
                         key,
                         bitmap.map(|image| {
-                            iced::widget::image::Handle::from_rgba(
-                                image.width(),
-                                image.height(),
-                                image.into_raw(),
+                            let (width, height) = image.dimensions();
+                            (
+                                width,
+                                height,
+                                iced::widget::image::Handle::from_rgba(
+                                    width,
+                                    height,
+                                    image.into_raw(),
+                                ),
                             )
                         }),
                     );
@@ -382,86 +388,10 @@ pub fn view<'a, M: Clone + 'a>(
     icons: &'a HudArt,
     response: impl Fn(u64, u32) -> M,
 ) -> Element<'a, M> {
-    if tutorial_dialog::supported(record) {
-        return tutorial_dialog::view(record, icons, response);
-    }
-    let mut actions = row![].spacing(12);
-    for b in &record.buttons {
-        actions = actions.push(
-            button(text(if !record.modal() && record.buttons.len() == 1 {
-                "×"
-            } else {
-                b.label.as_str()
-            }))
-            .on_press(response(record.id, b.result))
-            .padding([10, 22]),
-        );
-    }
-    let mut content = row![].spacing(20);
-    if let Some(handle) = icons.portraits.get(&record.id).cloned() {
-        if let Some(portrait) = &record.portrait {
-            let [left, top, right, bottom] = portrait.rect;
-            content = content.push(
-                iced::widget::image(handle)
-                    .width((right - left) as f32)
-                    .height((bottom - top) as f32),
-            );
-        }
-    }
-    if let Some(job) = record.job_icon {
-        let index = if job == -1 { 11 } else { job };
-        if let Some(handle) = usize::try_from(index).ok().and_then(|i| icons.jobs.get(i)) {
-            content = content.push(iced::widget::image(handle).width(84).height(63));
-        }
-    }
-    if let Some(chunk) = record.bitmap_icon {
-        let bitmap = icons
-            .bitmaps
-            .get(&(record.source.clone(), chunk))
-            .cloned()
-            .flatten();
-        if let Some((_, _, handle)) = bitmap {
-            content = content.push(
-                iced::widget::image(handle)
-                    .width(133)
-                    .height(120)
-                    .content_fit(iced::ContentFit::Contain),
-            );
-        }
-    }
-    if let Some(icon) = record.global_bitmap_icon {
-        if let Some(handle) = icons
-            .global_frames
-            .get(&(icon.id, icon.button_cell))
-            .cloned()
-            .flatten()
-        {
-            content = content.push(
-                iced::widget::image(handle)
-                    .width(64)
-                    .height(64)
-                    .content_fit(iced::ContentFit::Contain),
-            );
-        }
-    }
-    let mut words = column![].spacing(24);
-    if !record.presentation.is_some_and(|p| p.hide_title) {
-        words = words.push(text(&record.title).size(26));
-    }
-    content = content.push(
-        words
-            .push(scrollable(text(&record.body).size(18)).height(iced::Shrink))
-            .push(actions),
-    );
-    container(content)
-        .padding(30)
-        .max_width(570)
-        .style(container::rounded_box)
-        .into()
+    tutorial_dialog::view(record, icons, response)
 }
 
 /// Presentation placement only. Tutorial pictures use the observed original
-/// top-right anchor; unsupported dialog families retain their existing host.
 pub fn overlay<'a, M: Clone + 'a>(
     record: &'a Record,
     icons: &'a HudArt,
@@ -499,6 +429,56 @@ pub fn overlay<'a, M: Clone + 'a>(
                 left: 20.,
             })
             .into()
+    }
+}
+
+#[cfg(test)]
+impl HudArt {
+    pub(crate) fn synthetic_for_test(
+        hud: &[(i32, u32, u32)],
+        pictures: &[(&str, u16, u32, u32)],
+    ) -> Self {
+        let solid = |width: u32, height: u32| {
+            Handle::from_rgba(width, height, vec![255; (width * height * 4) as usize])
+        };
+        Self {
+            static_art: std::sync::Arc::new(StaticArt {
+                hud: hud
+                    .iter()
+                    .map(|&(id, width, height)| {
+                        let count = if id == 2037 { 1 } else { 4 };
+                        (
+                            id,
+                            (
+                                width,
+                                height,
+                                (0..count).map(|_| solid(width, height)).collect(),
+                            ),
+                        )
+                    })
+                    .collect(),
+                hud_edges: BTreeMap::new(),
+                mood_strips: BTreeMap::new(),
+                pause: [solid(15, 15), solid(15, 15)],
+                tutorial: solid(50, 50),
+                tutorial_skin: tutorial_dialog::Skin::synthetic(),
+                jobs: (0..22).map(|_| (84, 63, solid(84, 63))).collect(),
+            }),
+            global_frames: std::sync::Arc::new(BTreeMap::new()),
+            bitmaps: std::sync::Arc::new(
+                pictures
+                    .iter()
+                    .map(|&(source, chunk, width, height)| {
+                        (
+                            (source.to_owned(), chunk),
+                            Some((width, height, solid(width, height))),
+                        )
+                    })
+                    .collect(),
+            ),
+            portraits: std::sync::Arc::new(BTreeMap::new()),
+            residents: std::sync::Arc::new(BTreeMap::new()),
+        }
     }
 }
 

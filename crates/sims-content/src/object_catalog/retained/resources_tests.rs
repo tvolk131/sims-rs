@@ -132,6 +132,22 @@ fn retained_resource_import_keeps_complete_state_and_resident_lookup_without_io(
 }
 
 #[test]
+fn restored_and_new_components_share_a_fresh_owner_local_resource_scan() {
+    let (index, input) = fixture(false);
+    let mut restored = import(&index, input.clone()).unwrap();
+    let independent = import(&index, input).unwrap();
+    let scan = restored.owner.components.scan.clone();
+    assert!(!Arc::ptr_eq(&scan, &independent.owner.components.scan));
+    let constructed = composite::Host::construct(&mut restored.owner.components, 2).unwrap();
+    for component in [7, constructed] {
+        let Component::Iff { stream, .. } = &restored.owner.components.entries[&component] else {
+            panic!()
+        };
+        assert!(Arc::ptr_eq(&scan, &stream.file.scan));
+    }
+}
+
+#[test]
 fn writable_import_uses_explicit_current_bytes_and_preserves_original_source() {
     let (index, input) = fixture(true);
     let current = input.components[&7].stream.bytes.clone();

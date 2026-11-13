@@ -61,6 +61,8 @@ impl Zoom {
                 | (
                     Some(Request::Camera(
                         open::Request::Scroll { .. }
+                            | open::Request::CenterPerson { .. }
+                            | open::Request::MotionFrame
                             | open::Request::Zoom { .. }
                             | open::Request::Rotate { .. }
                             | open::Request::Floor { .. }
@@ -164,6 +166,21 @@ impl Zoom {
                 position,
                 immediate: 1,
             })),
+            tail: Tail::Direct,
+        }
+    }
+    pub fn center_person(point: [i32; 2], level: i32) -> Self {
+        Self {
+            request: Some(Request::Camera(open::Request::CenterPerson {
+                point,
+                level,
+            })),
+            tail: Tail::Direct,
+        }
+    }
+    pub fn motion_frame() -> Self {
+        Self {
+            request: Some(Request::Camera(open::Request::MotionFrame)),
             tail: Tail::Direct,
         }
     }

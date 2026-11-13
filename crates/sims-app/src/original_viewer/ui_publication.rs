@@ -1,6 +1,7 @@
 //! Complete immutable frontend observation at one ordinary application cut.
 //! Capturing reads owners only. It never polls, prepares assets, clones World,
 //! serializes a Session, or supplies an engine service result.
+use super::super::support::window_session;
 use super::*;
 use sims_render::camera_device::panels::{ButtonView, Panel};
 use sims_vm::interface::view_control::Widget;
@@ -259,8 +260,10 @@ impl Catalog {
 /// reachable from this object. Image and Scene Arcs retain coherent versions.
 #[derive(Clone)]
 pub(crate) struct Published {
+    pub window_observation: Option<Arc<serde_json::Value>>,
     pub application: neighborhood_usability::Snapshot,
     pub scene: Option<Arc<Scene>>,
+    pub render_scene: Option<Arc<Scene>>,
     pub art: Option<Arc<dialog_view::HudArt>>,
     pub cluster: Option<Arc<hud::cluster::Published>>,
     pub widget_epoch: u64,
@@ -281,6 +284,7 @@ pub(crate) struct Published {
     pub people_visible: bool,
     pub panel_state: Option<i32>,
     pub active_panel: Option<Panel>,
+    pub game_options: Option<sims_render::camera_device::panels::options::View>,
     pub root_visible: bool,
     pub controls: Vec<(Widget, ButtonView)>,
     pub pause_button: Option<ButtonView>,
@@ -342,8 +346,10 @@ impl Published {
         let people_visible = app.people_panel_visible();
         let pending = app.presentation_pending();
         let mut out = Self {
+            window_observation: capture_window_observation(app),
             application: app.application.clone(),
             scene: app.scene.clone(),
+            render_scene: None,
             art: app.art.clone(),
             cluster: app.hud_cluster.clone(),
             widget_epoch: app.widget_epoch,
@@ -378,6 +384,10 @@ impl Published {
             active_panel: widgets
                 .and_then(|w| w.presentation())
                 .and_then(|p| p.active()),
+            game_options: widgets
+                .and_then(|widgets| widgets.options())
+                .and_then(|options| options.view())
+                .cloned(),
             root_visible: panel_state != Some(1)
                 && widgets
                     .and_then(|w| w.presentation())
@@ -493,29 +503,31 @@ impl Published {
             out.residents = h
                 .residents
                 .iter()
-                .map(|r| Resident {
-                    object: r.object as i16,
-                    neighbor: r.neighbor,
-                    name: r.name.clone(),
-                    enabled: live_resident(s, r.object as i16).is_some()
-                        && s.simulation.has_interaction_actor(r.object as i16),
-                    highlighted: app
-                        .client
-                        .as_ref()
-                        .and_then(|c| c.buttons())
-                        .is_some_and(|b| b.highlighted(r.neighbor)),
+                .map(|r| {
+                    let object = resident_object(s, r);
+                    Resident {
+                        object: object.unwrap_or(r.object as i16),
+                        neighbor: r.neighbor,
+                        name: r.name.clone(),
+                        enabled: object
+                            .is_some_and(|identity| s.simulation.has_interaction_actor(identity)),
+                        highlighted: app
+                            .client
+                            .as_ref()
+                            .and_then(|c| c.buttons())
+                            .is_some_and(|b| b.highlighted(r.neighbor)),
+                    }
                 })
                 .collect();
         }
         let texts = widgets.and_then(|w| w.texts());
-        out.funds = household_funds_label(s, texts.map(|t| t.funds()).unwrap_or_default())
-            .unwrap_or_default();
-        out.money = texts.map(|texts| {
+        let funds = household_funds_label(s, texts.map(|t| t.funds()).unwrap_or_default());
+        out.funds = funds.as_ref().cloned().unwrap_or_default();
+        out.money = texts.map(|_| {
             let access = widgets.unwrap().access();
             Money {
-                clock: texts.clock(),
-                funds: household_funds_label(s, texts.funds())
-                    .unwrap_or_else(|_| "Funds unavailable".into()),
+                clock: household_clock_label(s).unwrap_or_default(),
+                funds: funds.unwrap_or_else(|_| "Funds unavailable".into()),
                 highlighted: widgets.unwrap().button(Widget::Status).selected,
                 secondary: access
                     .filter(|a| a.label_visible())
@@ -562,13 +574,8 @@ impl Published {
                     .and_then(|o| o.definition.as_ref())
                     .and_then(|d| app.thumbnails.as_ref()?.live_image(d))
                     .or_else(|| {
-                        s.house
-                            .household
-                            .as_ref()?
-                            .residents
-                            .iter()
-                            .find(|r| r.object as i16 == action.icon_owner)
-                            .and_then(|r| app.art.as_ref()?.resident(r.neighbor as i16))
+                        live_resident(s, action.icon_owner)
+                            .and_then(|resident| app.art.as_ref()?.resident(resident.neighbor))
                     });
                 let diagnostic_label = action
                     .label
@@ -662,6 +669,104 @@ impl Published {
         }
         out
     }
+}
+
+fn capture_window_observation(app: &Viewer) -> Option<Arc<serde_json::Value>> {
+    if !window_session::enabled() {
+        return None;
+    }
+    if let Some(error) = app.error.as_deref().or(app.menu_error.as_deref()) {
+        window_session::emit("application_error", serde_json::json!({"error":error}));
+    }
+    Some(Arc::new(window_observation_value(app)))
+}
+
+fn window_observation_value(app: &Viewer) -> serde_json::Value {
+    let session = app.session.as_ref();
+    let menu = capture_menu(app).map(|menu| {
+        serde_json::json!({
+            "title": menu.title,
+            "preview": menu.preview,
+            "ready": menu.ready,
+            "visible": menu.popup_visible,
+            "choices": menu.popup.iter().map(|choice| {
+                serde_json::json!({"label":choice.label,"enabled":choice.intent.is_some()})
+            }).collect::<Vec<_>>()
+        })
+    });
+    let object_input = session
+        .and_then(|session| session.host.presentation.object_input.as_ref())
+        .map(|input| {
+            serde_json::json!({"target":input.target(),"ready":input.ready(),"actions":input.actions()})
+        });
+    let ground_input = session
+        .and_then(|session| session.host.presentation.ground_input.as_ref())
+        .map(|input| serde_json::json!({"ready":input.ready(),"actions":input.actions()}));
+    let actor = session
+        .and_then(|session| session.simulation.vm.world.actions.as_ref())
+        .and_then(|actions| actions.actors.get(&app.resident));
+    let resident_position =
+        session.and_then(|session| session.simulation.vm.world.positions.get(&app.resident));
+    let ground_destination = session.and_then(|session| {
+        session
+            .host
+            .presentation
+            .ground_input
+            .as_ref()
+            .and_then(|input| input.target())
+            .and_then(|target| session.simulation.vm.world.positions.get(&target))
+    });
+    serde_json::json!({
+        "tick": session.map(|session| session.simulation.vm.tick),
+        "status": app.status,
+        "application_mode": session.and_then(|session| session.host.presentation.presenter.as_ref())
+            .and_then(|presenter| presenter.camera.as_ref())
+            .map(|camera| camera.settings.application_mode),
+        "people_visible": app.people_panel_visible(),
+        "panel_state": app.device.as_ref().and_then(|device| device.panel_state()),
+        "needs_selected": app.client.as_ref().and_then(|client| client.live_panel())
+            .map(|panel| panel.selected()),
+        "walls": session.and_then(|session| session.host.presentation.presenter.as_ref())
+            .map(|presenter| serde_json::json!({
+                "all_walls":presenter.view.floor.all_walls,
+                "cutaway":presenter.view.floor.visibility.enabled
+            })),
+        "resident": app.resident,
+        "selected": app.selected,
+        "playing": app.playing,
+        "pending": app.presentation_pending(),
+        "clock_pending": session.is_some_and(Session::clock_pending),
+        "presentation_children_pending": app.presentation_children_pending(),
+        "clock": session.and_then(|session| session.host.presentation.clock.as_ref()).map(|clock| {
+            serde_json::json!({"now":clock.now,"fields":clock.fields,
+                "at_completed_update":clock.at_completed_update()})
+        }),
+        "hud_ready": app.hud_cluster.as_ref().map(|cluster| cluster.values.ready),
+        "hud_transport_ready": app.hud_cluster.as_ref().map(|cluster| cluster.values.transport_ready),
+        "hud_normal_ready": app.hud_cluster.as_ref().map(|cluster| cluster.values.transport_ready
+            && cluster.values.buttons.normal.is_none_or(|button|button.enabled)),
+        "error": app.error,
+        "menu_error": app.menu_error,
+        "modal": session.is_some_and(|session| session.simulation.vm.world.dialogs.modal.is_some()),
+        "dialog": session.and_then(|session| {
+            let dialogs = &session.simulation.vm.world.dialogs;
+            dialogs.records.iter().find(|record| Some(record.id) == dialogs.modal)
+        }).map(window_observation::dialog),
+        "dialog_answer": app.window_dialog_answer,
+        "camera": session.and_then(|session| session.retained_camera_input().ok()),
+        "scene_size": app.scene.as_ref().map(|scene| [scene.width,scene.height]),
+        "scene_id": window_session::scene_id(app.scene.as_ref()),
+        "display_size": app.display_size,
+        "actor": actor,
+        "actions": window_observation::actions(actor),
+        "work": session.map(|session| window_observation::work(&session.simulation, app.resident)),
+        "terminals": session.map(|session| window_observation::terminals(&session.simulation, app.resident)),
+        "resident_position": resident_position,
+        "ground_destination": ground_destination,
+        "menu": menu,
+        "object_input": object_input,
+        "ground_input": ground_input
+    })
 }
 
 fn capture_menu(app: &Viewer) -> Option<Menu> {

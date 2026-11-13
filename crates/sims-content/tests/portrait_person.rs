@@ -44,6 +44,7 @@ fn deceased_neighbor_constructs_without_a_live_person_and_restores_real_assets()
             },
             modules: serde_json::from_value(capture["program_modules"].clone())?,
             animations: serde_json::from_value(capture["program_animations"].clone())?,
+            native_animation_absences: Default::default(),
             headline_catalog: false,
             normalized_object_definitions: Default::default(),
             simulation: serde_json::from_value(capture["simulation"].clone())?,

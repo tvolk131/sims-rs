@@ -20,6 +20,8 @@ pub struct Window {
     timers: Registry,
     indicator_visible: bool,
     clock: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    clock_remainder: u32,
     call: Option<Call>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +32,9 @@ struct Call {
     transport: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     property: Option<u32>,
+}
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 impl Window {
     pub(super) fn panel_inputs(&self) -> (u32, u8, u32) {
@@ -55,6 +60,7 @@ impl Window {
             },
             indicator_visible: paused != 0 && indicator.is_some(),
             clock,
+            clock_remainder: 0,
             call: None,
         }
     }
@@ -69,6 +75,23 @@ impl Window {
     }
     pub fn pending(&self) -> bool {
         self.call.is_some()
+    }
+    pub fn clock(&self) -> u32 {
+        self.clock
+    }
+    fn validate_clock(&self) -> Result<()> {
+        ensure!(
+            self.clock_remainder < 1_000_000,
+            "mode window submillisecond clock invalid"
+        );
+        Ok(())
+    }
+    fn advance_clock(&mut self, elapsed: std::time::Duration) -> Result<()> {
+        self.validate_clock()?;
+        let nanos = elapsed.as_nanos() + u128::from(self.clock_remainder);
+        self.clock = self.clock.wrapping_add((nanos / 1_000_000) as u32);
+        self.clock_remainder = (nanos % 1_000_000) as u32;
+        Ok(())
     }
     fn advance_pause(&mut self) -> Result<bool> {
         let call = self.call.as_mut().context("pause window has no caller")?;
@@ -119,6 +142,7 @@ pub(super) fn validate(session: &Session, saved: &Saved) -> Result<()> {
         );
         return Ok(());
     };
+    window.validate_clock()?;
     ensure!(
         window.owner != 0 && window.fields.indicator != Some(0),
         "mode window identities invalid"
@@ -309,12 +333,21 @@ impl Device {
     ///Sample the frontend monotonic clock, not the household tick. The sample
     ///is consumed by native registration's wrapping deadline calculation.
     pub fn set_mode_clock(&mut self, now: u32) -> Result<()> {
+        let window = self
+            .saved
+            .mode_window
+            .as_mut()
+            .context("mode window absent")?;
+        window.clock = now;
+        window.clock_remainder = 0;
+        Ok(())
+    }
+    pub fn advance_mode_clock(&mut self, elapsed: std::time::Duration) -> Result<()> {
         self.saved
             .mode_window
             .as_mut()
             .context("mode window absent")?
-            .clock = now;
-        Ok(())
+            .advance_clock(elapsed)
     }
     pub(super) fn advance_mode_window(
         &mut self,
@@ -352,5 +385,43 @@ impl Device {
             window.call = None;
         }
         validate(session, &self.saved)
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn native_mode_clock_fractional_carry_wrap_and_cold_restore() -> Result<()> {
+        let mut window = Window::new(9000, Some(9001), 80, 1, u32::MAX);
+        window.advance_clock(Duration::from_nanos(750_000))?;
+        ensure!(window.clock() == u32::MAX && window.clock_remainder == 750_000);
+        window = serde_json::from_slice(&serde_json::to_vec(&window)?)?;
+        window.validate_clock()?;
+        window.advance_clock(Duration::from_nanos(250_001))?;
+        ensure!(window.clock() == 0 && window.clock_remainder == 1);
+        window.advance_clock(Duration::from_millis(u64::from(u32::MAX) + 3))?;
+        ensure!(window.clock() == 2 && window.clock_remainder == 1);
+        ensure!(window.fields.paused == 1 && window.timers.entries.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn native_mode_clock_legacy_zero_and_invalid_remainder() -> Result<()> {
+        let window = Window::new(9000, None, 80, 0, 1234);
+        let mut saved = serde_json::to_value(&window)?;
+        ensure!(saved.get("clock_remainder").is_none());
+        let restored: Window = serde_json::from_value(saved.clone())?;
+        restored.validate_clock()?;
+        ensure!(restored == window);
+        saved["clock_remainder"] = 1_000_000.into();
+        let mut invalid: Window = serde_json::from_value(saved)?;
+        ensure!(invalid.validate_clock().is_err());
+        let before = invalid.clone();
+        ensure!(invalid.advance_clock(Duration::from_millis(1)).is_err());
+        ensure!(invalid == before);
+        Ok(())
     }
 }

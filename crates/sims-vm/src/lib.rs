@@ -49,6 +49,7 @@ pub mod registry_suspension;
 pub mod nearby_houses;
 pub mod neighborhood;
 pub mod numeric;
+pub mod observations;
 pub mod person;
 pub mod person_factory;
 mod person_friends;
@@ -393,6 +394,8 @@ pub struct Thread {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Vm {
+    #[serde(skip)]
+    pub(crate) terminal_observer: observations::ActionObserver,
     /// Explicit native object Update owner. Optional so historical authored
     /// profiles keep their existing per-tick scheduling until deliberately bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -475,6 +478,7 @@ pub struct Start<'a> {
 impl Vm {
     pub fn new(world: World, seed: u64) -> Self {
         Self {
+            terminal_observer: Default::default(),
             world,
             scheduled_object_visit: None,
             player_menu: None,
@@ -810,7 +814,9 @@ impl Vm {
             .last_mut()
             .ok_or("missing host primitive frame")?
             .continuation = 0;
-        if let Err(e) = branch(program, &mut t, if success { yes } else { no }) {
+        if let Err(e) =
+            self.branch_in_thread(program, id, &mut t, if success { yes } else { no })
+        {
             fault(&mut t, e);
         }
         if let Err(e) = self.finish_action_frames(&mut t) {
@@ -911,7 +917,10 @@ impl Vm {
             };
             let callback_depth = t.callback.as_ref().map(|b| b.base_depth);
             let in_service = t.service.as_ref().is_some_and(|s| s.result.is_none());
-            entry.effect = match self.execute(program, id, &mut t, &ins) {
+            let previous_thread = self.terminal_observer.executing_thread.replace(id);
+            let effect = self.execute(program, id, &mut t, &ins);
+            self.terminal_observer.executing_thread = previous_thread;
+            entry.effect = match effect {
                 Ok(effect) => effect,
                 Err(e) => {
                     fault(&mut t, e.clone());
@@ -1041,7 +1050,7 @@ impl Vm {
             let f = t.stack.last().ok_or("missing removal frame")?;
             let target = removal::selection(word(&ins.operands, 0), f.caller, f.stack_object)?;
             if !self.world.objects.contains_key(&target) {
-                branch(program, t, ins.on_false)?;
+                self.branch(program, t, ins.on_false)?;
                 return Ok("Remove Object missing target; branch false".into());
             }
             t.status = Status::AwaitingRemoval(removal::Request {
@@ -1090,7 +1099,7 @@ impl Vm {
             return Ok("awaiting original object factory and placement".into());
         }
         if ins.opcode == 0x1e {
-            return self.gosub_found_action(program, t, ins.on_true, ins.on_false);
+            return self.gosub_found_action(program, thread_id, t, ins.on_true, ins.on_false);
         }
         if ins.opcode == 3 {
             return self.find_best_interaction(program, t, ins.on_true, ins.on_false);
@@ -1109,6 +1118,7 @@ impl Vm {
                 )
             }
             0x1a => self.relationship(program, t, &ins.operands)?,
+            0x21 => self.find_worst_motives(program, t, &ins.operands)?,
             0x06 => {
                 if ins.operands[1] != 1 && (self.native_accessory_host || ins.operands[2] & 1 == 0)
                 {
@@ -1259,7 +1269,7 @@ impl Vm {
             11 | 12 => self.spatial_query(program, t, ins.opcode, &ins.operands)?,
             13 => self.push_interaction(program, t, &ins.operands)?,
             17 => {
-                return self.idle_for_input(program, t, &ins.operands, ins.on_true);
+                return self.idle_for_input(program, thread_id, t, &ins.operands, ins.on_true);
             }
             0x1b | 0x2d => {
                 if t.check {
@@ -1333,7 +1343,7 @@ impl Vm {
             .ok_or("primitive lost its frame")?
             .continuation = 0;
         t.last_result = result;
-        branch(program, t, if result { ins.on_true } else { ins.on_false })?;
+        self.branch(program, t, if result { ins.on_true } else { ins.on_false })?;
         Ok(format!("{effect}; branch {result}"))
     }
     fn request_route(
@@ -1517,6 +1527,7 @@ pub fn primitive_name(opcode: u16) -> &'static str {
         0x0e => "find best object for function",
         0x1b => "go to relative position",
         0x20 => "test object type",
+        0x21 => "find five worst motives",
         0x25 => "test Sim interacting with",
         0x2c => "animate Sim",
         0x2d => "go to routing slot",
@@ -1636,7 +1647,29 @@ fn call(
     ))
 }
 
-fn branch(program: &Program, t: &mut Thread, mut target: u8) -> Result<(), String> {
+impl Vm {
+    pub(crate) fn branch_in_thread(
+        &mut self,
+        program: &Program,
+        thread: ThreadId,
+        t: &mut Thread,
+        target: u8,
+    ) -> Result<(), String> {
+        let previous_thread = self.terminal_observer.executing_thread.replace(thread);
+        let result = self.branch(program, t, target);
+        self.terminal_observer.executing_thread = previous_thread;
+        result
+    }
+    pub(crate) fn branch(&mut self, program: &Program, t: &mut Thread, target: u8) -> Result<(), String> {
+        branch(program, t, target, &mut self.terminal_observer)
+    }
+}
+fn branch(
+    program: &Program,
+    t: &mut Thread,
+    mut target: u8,
+    observer: &mut observations::ActionObserver,
+) -> Result<(), String> {
     loop {
         match target {
             0xfd => return Err("explicit ERROR branch (0xFD)".into()),
@@ -1650,6 +1683,13 @@ fn branch(program: &Program, t: &mut Thread, mut target: u8) -> Result<(), Strin
                 save_frame_storage(t)?;
                 let popped = t.stack.pop().ok_or("return from empty stack")?;
                 retained_frames::remove_frame(t, popped.storage_offset);
+                observer.returned(
+                    observer.executing_thread,
+                    &popped,
+                    t.stack.len() + 1,
+                    value,
+                    !t.stack.iter().any(|frame| frame.action_target.is_some()),
+                );
                 if let Some(target) = popped.action_target {
                     t.completed_actions.push((
                         popped.caller,

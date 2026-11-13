@@ -26,6 +26,8 @@ pub struct Execution {
     pub request: u64,
     pub caller: ObjectId,
     pub target: ObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    potential_request: Option<RouteRequest>,
     target_position: [i32; 2],
     target_facing: u8,
     descriptor_facing: i32,
@@ -75,24 +77,78 @@ impl Execution {
         thread: ThreadId,
         r: &RouteRequest,
     ) -> Result<Self, String> {
-        let departure = super::departure::Execution::begin(s, p, r)?.map(Box::new);
-        Self::prepare(s, thread, r, departure, None)
+        let mut execution = Self::prepare(s, thread, r, None, None)?;
+        if let Some(departure) = super::departure::Execution::begin(s, p, r)? {
+            execution = Self::prepare(s, thread, r, Some(Box::new(departure)), None)?;
+        }
+        s.native_lot
+            .as_ref()
+            .unwrap()
+            .placement
+            .links
+            .capture(&mut s.vm.world, r.caller)?;
+        execution.install_preparation(s)?;
+        Ok(execution)
     }
     pub fn begin_potential(
         s: &mut Simulation,
+        p: &Program,
         thread: ThreadId,
         r: &RouteRequest,
         settings: Potential,
     ) -> Result<Self, String> {
-        if s.vm.world.objects[&r.caller].person.as_ref().unwrap()[&0] != 0 {
-            return Err("potential route needs native seated departure preparation".into());
+        if settings
+            .ignored_person
+            .is_some_and(|person| person == 0 || !s.vm.world.objects.contains_key(&person))
+        {
+            return Err("invalid potential ignored-person pointer".into());
         }
-        Self::prepare(s, thread, r, None, Some(settings))
+        let posture =
+            s.vm.world
+                .objects
+                .get(&r.caller)
+                .and_then(|actor| actor.person.as_ref())
+                .and_then(|person| person.get(&0))
+                .ok_or("potential route caller posture absent")?;
+        if !(0..=1).contains(posture) {
+            return Err(format!(
+                "unsupported potential route caller posture {posture}"
+            ));
+        }
+        let actor = &s.vm.world.objects[&r.caller];
+        if [4, 8, 30, 42]
+            .into_iter()
+            .any(|field| !actor.data.contains_key(&field))
+            || [68, 72, 73, 84]
+                .into_iter()
+                .any(|field| !actor.person.as_ref().unwrap().contains_key(&field))
+        {
+            return Err("potential route caller clearance fields absent".into());
+        }
+        let mut execution = Self::prepare(s, thread, r, None, Some(settings.clone()))?;
+        if let Some(departure) = super::departure::Execution::begin_potential(
+            s,
+            p,
+            r,
+            settings.ignored_person,
+            settings.blocked_object,
+        )? {
+            execution = Self::prepare(s, thread, r, Some(Box::new(departure)), Some(settings))?;
+        }
+        s.native_lot
+            .as_ref()
+            .unwrap()
+            .placement
+            .links
+            .capture(&mut s.vm.world, r.caller)?;
+        execution.install_preparation(s)?;
+        Ok(execution)
     }
     /// Reprepare the same temporary semantic context.48235a can lower+98,
     /// but only481693 constructs its initial48; a small room does not reset it.
     pub(super) fn begin_retained_potential(
         s: &mut Simulation,
+        p: &Program,
         thread: ThreadId,
         r: &RouteRequest,
         settings: Potential,
@@ -101,15 +157,15 @@ impl Execution {
         if ![8, 48].contains(&retained_limit) {
             return Err("invalid retained potential candidate limit".into());
         }
-        let mut execution = Self::begin_potential(s, thread, r, settings)?;
+        let mut execution = Self::begin_potential(s, p, thread, r, settings)?;
         execution.candidate_limit = execution.candidate_limit.min(retained_limit);
         Ok(execution)
     }
-    pub(super) fn potential_candidate_limit(&self) -> usize {
+    pub(crate) fn potential_candidate_limit(&self) -> usize {
         self.candidate_limit
     }
     fn prepare(
-        s: &mut Simulation,
+        s: &Simulation,
         thread: ThreadId,
         r: &RouteRequest,
         departure: Option<Box<super::departure::Execution>>,
@@ -134,13 +190,26 @@ impl Execution {
         if actor.person.is_none() {
             return Err("native point route requires a person".into());
         }
+        let actor_position =
+            s.vm.world
+                .positions
+                .get(&r.caller)
+                .ok_or("native route caller position absent")?;
+        if !(1..=2).contains(&actor_position.level) {
+            return Err("unsupported native route caller level".into());
+        }
         let target =
             s.vm.world
                 .positions
                 .get(&r.target)
                 .ok_or("native route target absent")?;
         let target_position = [target.x, target.y];
-        let facing = *s.vm.world.objects[&r.target]
+        let target_object =
+            s.vm.world
+                .objects
+                .get(&r.target)
+                .ok_or("native route target object absent")?;
+        let facing = *target_object
             .data
             .get(&1)
             .ok_or("native route target facing absent")?;
@@ -154,7 +223,7 @@ impl Execution {
             return Err("invalid native actor facing".into());
         }
         let actor_room = *actor.data.get(&29).ok_or("native actor room absent")?;
-        let target_room = *s.vm.world.objects[&r.target]
+        let target_room = *target_object
             .data
             .get(&29)
             .ok_or("native target room absent")?;
@@ -178,7 +247,38 @@ impl Execution {
         if s.vm.world.positions[&r.caller].level != target.level {
             return Err("original-lot cross-floor route adapter required".into());
         }
-        let candidate_limit = s.route_candidate_limit(r.caller);
+        let candidate_limit = if preparing && potential.is_some() {
+            48
+        } else {
+            s.route_candidate_limit(r.caller)
+        };
+        let (retained_result, blocked_object, ignored) = if let Some(settings) = &potential {
+            (
+                settings.retained_result,
+                departure
+                    .as_ref()
+                    .filter(|departure| departure.outcome().is_some())
+                    .map_or(settings.blocked_object, |departure| {
+                        departure.blocked_object
+                    }),
+                settings.ignored_word,
+            )
+        } else {
+            let control = s
+                .route_control
+                .get(&r.id)
+                .ok_or("native route controller absent")?;
+            let context = control
+                .original
+                .as_ref()
+                .ok_or("native route context absent")?;
+            (
+                u8::try_from(control.controller.result)
+                    .map_err(|_| "invalid native route result")?,
+                context.blocked_object,
+                context.ignored,
+            )
+        };
         let point = (!preparing && slot.flags & 255 == 0)
             .then(|| {
                 PointCandidate::prepare(
@@ -224,41 +324,13 @@ impl Execution {
                 request.walls = walls;
             }
             if slot.sitting != 0 {
-                let blocked = potential.as_ref().map_or_else(
-                    || {
-                        s.route_control[&r.id]
-                            .original
-                            .as_ref()
-                            .unwrap()
-                            .blocked_object
-                    },
-                    |q| q.blocked_object,
-                );
-                posture = Some(PostureScan::new(request, slot.sitting, blocked)?);
+                posture = Some(PostureScan::new(request, slot.sitting, blocked_object)?);
                 None
             } else {
                 Some(StandingScan::new(request)?)
             }
         } else {
             None
-        };
-        let (retained_result, blocked_object, ignored) = if let Some(q) = &potential {
-            (q.retained_result, q.blocked_object, q.ignored_word)
-        } else {
-            let control = s
-                .route_control
-                .get(&r.id)
-                .ok_or("native route controller absent")?;
-            let context = control
-                .original
-                .as_ref()
-                .ok_or("native route context absent")?;
-            (
-                u8::try_from(control.controller.result)
-                    .map_err(|_| "invalid native route result")?,
-                context.blocked_object,
-                context.ignored,
-            )
         };
         let input = Input {
             size: super::active_size(&s.vm.world, native.placement.links.size)?,
@@ -281,26 +353,8 @@ impl Execution {
             .map(|_| Check::new(input.clone(), native.diagnostics, blocked_object))
             .transpose()?;
         let policy = native.routing_policy;
-        if !preparing {
-            s.vm.world
-                .objects
-                .get_mut(&r.caller)
-                .unwrap()
-                .person
-                .as_mut()
-                .unwrap()
-                .insert(73, ignored);
-            if let Some(point) = &point {
-                s.vm.world
-                    .objects
-                    .get_mut(&r.caller)
-                    .unwrap()
-                    .data
-                    .insert(1, i16::from(point.actor_facing));
-                s.sync_script_directions()?;
-            }
-        }
         Ok(Self {
+            potential_request: potential.as_ref().map(|_| r.clone()),
             potential,
             thread,
             request: r.id,
@@ -331,6 +385,27 @@ impl Execution {
             path: None,
             failed: false,
         })
+    }
+    fn install_preparation(&self, s: &mut Simulation) -> Result<(), String> {
+        if self.prepared {
+            let ignored = self.potential.as_ref().map_or_else(
+                || {
+                    s.route_control[&self.request]
+                        .original
+                        .as_ref()
+                        .unwrap()
+                        .ignored
+                },
+                |settings| settings.ignored_word,
+            );
+            let actor = s.vm.world.objects.get_mut(&self.caller).unwrap();
+            actor.person.as_mut().unwrap().insert(73, ignored);
+            if let Some(point) = &self.point {
+                actor.data.insert(1, i16::from(point.actor_facing));
+                s.sync_script_directions()?;
+            }
+        }
+        Ok(())
     }
     fn finish_candidates(&mut self, s: &mut Simulation, set: CandidateSet) -> Result<(), String> {
         // The route context retains the last occupant/collision ID even when
@@ -420,6 +495,9 @@ impl Execution {
                 .is_some_and(|e| e.owns_callback(vm, p, thread, depth))
     }
     pub fn validate(&self, s: &Simulation, p: &Program) -> Result<(), String> {
+        if self.potential.is_some() || self.potential_request.is_some() {
+            return Err("temporary potential cannot use ordinary route owner".into());
+        }
         let t =
             s.vm.threads
                 .get(&self.thread)
@@ -451,6 +529,17 @@ impl Execution {
             (context.ignored, control.controller.result as u8)
         };
         if (r.id, r.caller, r.target) != (self.request, self.caller, self.target)
+            || s.vm
+                .world
+                .objects
+                .get(&self.caller)
+                .is_none_or(|actor| actor.person.is_none())
+            || !s.vm.world.positions.contains_key(&self.caller)
+            || !s.vm.world.objects.contains_key(&self.target)
+            || !s.vm.world.positions.contains_key(&self.target)
+            || !s.vm.threads.contains_key(&self.thread)
+            || !(1..=2).contains(&self.input.level)
+            || self.target_facing > 7
             || self.input.size
                 != super::active_size(
                     &s.vm.world,
@@ -466,8 +555,8 @@ impl Execution {
                     .map_or_else(|| (ignored != 0).then_some(ignored), |q| q.ignored_person)
             || self.saved_facing > 7
             || self.retained_result != retained
-            || self.potential.is_some()
-                && (self.departure.is_some() || self.goal.is_some() || self.selected_seat.is_some())
+            || self.potential_request.as_ref() != self.potential.as_ref().map(|_| r)
+            || self.potential.is_some() && (self.goal.is_some() || self.selected_seat.is_some())
             || self.failed
             || ![8, 48].contains(&self.candidate_limit)
             || self.candidates.is_some() != self.subset_rng.is_some()
@@ -483,6 +572,13 @@ impl Execution {
         }
         if let Some(d) = &self.departure {
             d.validate(s, p, self.caller)?;
+            d.validate_context(
+                slot.flags,
+                self.input.ignored,
+                self.potential
+                    .as_ref()
+                    .map(|settings| settings.blocked_object),
+            )?;
             if !self.prepared {
                 if self.point.is_some()
                     || self.standing.is_some()
@@ -721,6 +817,16 @@ impl Simulation {
         remaining: &mut usize,
         step: &mut Step,
     ) -> Result<bool, String> {
+        if self
+            .native_lot
+            .as_ref()
+            .and_then(|native| native.route.as_ref())
+            .is_some_and(|execution| {
+                execution.potential.is_some() || execution.potential_request.is_some()
+            })
+        {
+            return Err("temporary potential cannot use ordinary route owner".into());
+        }
         let Some(mut e) = self.native_lot.as_mut().and_then(|n| n.route.take()) else {
             return Ok(true);
         };
@@ -748,6 +854,7 @@ impl Simulation {
                     .clone();
                 // Destination candidates capture facing/target after departure callbacks.
                 e = Execution::prepare(self, e.thread, &r, Some(departure), None)?;
+                e.install_preparation(self)?;
             }
             if !self.drive_point_clearance(p, &mut e, remaining, step)? {
                 return Ok(false);
@@ -868,6 +975,48 @@ impl Simulation {
         } else {
             self.drive_native_obstacle_prefix(p, e.obstacles.as_mut().unwrap(), remaining, step)
         }
+    }
+    pub(crate) fn drive_potential_preparation(
+        &mut self,
+        program: &Program,
+        execution: &mut Execution,
+        request: &RouteRequest,
+        remaining: &mut usize,
+        step: &mut Step,
+    ) -> Result<bool, String> {
+        if execution.potential.is_none() {
+            return Err("potential preparation without temporary context".into());
+        }
+        execution.validate_request(self, program, request)?;
+        if !execution.prepared {
+            if !self.drive_native_departure(
+                program,
+                execution
+                    .departure
+                    .as_mut()
+                    .ok_or("potential departure absent")?,
+                remaining,
+                step,
+            )? {
+                return Ok(false);
+            }
+            let mut prepared = Execution::prepare(
+                self,
+                execution.thread,
+                request,
+                execution.departure.clone(),
+                execution.potential.clone(),
+            )?;
+            prepared.candidate_limit = prepared.candidate_limit.min(execution.candidate_limit);
+            prepared.policy = execution.policy;
+            prepared.install_preparation(self)?;
+            *execution = prepared;
+        }
+        if !self.drive_point_clearance(program, execution, remaining, step)? {
+            return Ok(false);
+        }
+        execution.mark_potential_prepared();
+        Ok(true)
     }
     pub(crate) fn drive_point_clearance(
         &mut self,
@@ -1000,3 +1149,7 @@ pub(crate) fn descriptor(
 #[cfg(test)]
 #[path = "live/ignored_owner.rs"]
 mod ignored_owner;
+
+#[cfg(test)]
+#[path = "live/potential_departure.rs"]
+mod potential_departure;

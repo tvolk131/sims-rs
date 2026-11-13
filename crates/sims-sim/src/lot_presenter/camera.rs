@@ -7,6 +7,10 @@ use super::{
 use crate::{lot_environment::manager::Manager, lot_geometry::Lot};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[path = "camera_motion_frame.rs"]
+pub mod motion_frame;
+#[path = "portrait_centering.rs"]
+pub mod portrait_centering;
 
 /// Native process/view inputs supplied by the client. Shared origin, pending,
 /// zoom, widths, level and visibility live only in the enclosing open::State.
@@ -204,9 +208,21 @@ impl State {
         a.motion.policy = s.motion_policy;
         a.motion.duration = s.motion_duration;
         a.moving = s.moving;
+        a.locked = s.motion_disabled;
         a.camera_mode = s.camera_mode;
         a.application_value_bits = s.application_value_bits;
         a.saved_value_bits = s.saved_value_bits;
+    }
+    fn scroll_context(&self, view: &open::State) -> Result<scroll::Context, String> {
+        Ok(scroll::Context {
+            camera: self.camera(view)?,
+            size: 64,
+            screen: self.settings.viewport,
+            lot_origin: [0, 0],
+            row_step: view.widths[3],
+            maximum: Some(self.extrema.maximum.clone()),
+            minimum: Some(self.extrema.minimum.clone()),
+        })
     }
     fn projection<T>(
         &self,
@@ -274,6 +290,9 @@ pub enum Service {
     Transition(transition::Request),
     Floor(lifecycle::Request),
     Center(centering::Request),
+    Portrait(portrait_centering::Request),
+    MotionFrame(motion::frame::Request),
+    Displacement(motion::frame::displacement::Request),
     Scroll(scroll::Synchronize),
     Cancel(motion::cancel::Request),
     InvalidateTile([i8; 3]),
@@ -282,6 +301,7 @@ pub enum Service {
 pub enum Reply {
     Done,
     Token(Option<u32>),
+    Enabled(u8),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
@@ -308,6 +328,11 @@ enum Action {
         style: u8,
         immediate: u8,
     },
+    CenterPerson {
+        point: [i32; 2],
+        level: i32,
+    },
+    Frame,
     Scroll {
         position: [i32; 2],
         immediate: u8,
@@ -325,6 +350,8 @@ enum Call {
     Transition(transition::Cursor),
     Floor(lifecycle::Cursor),
     Center(centering::Cursor),
+    Portrait(portrait_centering::Cursor),
+    Frame(motion_frame::Cursor),
     Scroll(scroll::Cursor),
     Cancel(motion::cancel::Cursor),
     Clear(hover::Clear),
@@ -387,19 +414,27 @@ impl Node {
                 *style,
                 *immediate,
             )),
+            Action::CenterPerson { point, level } => {
+                Call::Portrait(portrait_centering::Cursor::begin(
+                    &s.center(v),
+                    *point,
+                    *level,
+                    2,
+                    1,
+                    s.settings.world_rotation,
+                ))
+            }
+            Action::Frame => {
+                let mut state = s.center(v);
+                let cursor = motion_frame::Cursor::begin(&mut state)?;
+                s.publish_center(v, state);
+                Call::Frame(cursor)
+            }
             Action::Scroll {
                 position,
                 immediate,
             } => {
-                let c = scroll::Context {
-                    camera: s.camera(v)?,
-                    size: 64,
-                    screen: s.settings.viewport,
-                    lot_origin: [0, 0],
-                    row_step: v.widths[3],
-                    maximum: Some(s.extrema.maximum.clone()),
-                    minimum: Some(s.extrema.minimum.clone()),
-                };
+                let c = s.scroll_context(v)?;
                 let mut state = scroll::State {
                     origin: v.origin,
                     pending: v.pending,
@@ -445,6 +480,8 @@ impl Node {
                 Call::Transition(c) => c.complete(),
                 Call::Floor(c) => c.complete(),
                 Call::Center(c) => c.complete(),
+                Call::Portrait(c) => c.complete(),
+                Call::Frame(c) => c.complete(),
                 Call::Scroll(c) => c.complete(),
                 Call::Cancel(c) => c.complete(),
                 Call::Clear(c) => c.complete(),
@@ -492,6 +529,40 @@ impl Node {
                 }),
                 _ => None,
             },
+            Call::Portrait(c) => match c.request()? {
+                portrait_centering::Request::World {
+                    point,
+                    level,
+                    style,
+                    immediate,
+                } => Some(Action::Center {
+                    point,
+                    level,
+                    style,
+                    immediate,
+                }),
+                portrait_centering::Request::Scroll {
+                    position,
+                    immediate,
+                } => Some(Action::Scroll {
+                    position,
+                    immediate,
+                }),
+                _ => None,
+            },
+            Call::Frame(c) => match c.request()? {
+                motion_frame::Request::Prepare(motion::frame::Request::Scroll {
+                    position,
+                    immediate,
+                }) => Some(Action::Scroll {
+                    position,
+                    immediate,
+                }),
+                motion_frame::Request::Prepare(motion::frame::Request::CancelMotion) => {
+                    Some(Action::Cancel)
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -516,6 +587,8 @@ impl Node {
                 | (Action::Roof { .. }, Call::Roof(_))
                 | (Action::Floor { .. }, Call::Floor(_))
                 | (Action::Center { .. }, Call::Center(_))
+                | (Action::CenterPerson { .. }, Call::Portrait(_))
+                | (Action::Frame, Call::Frame(_))
                 | (Action::Scroll { .. }, Call::Scroll(_))
                 | (Action::Cancel, Call::Cancel(_))
                 | (Action::Clear, Call::Clear(_))
@@ -557,6 +630,24 @@ impl Node {
                     centering::Reply::Done,
                 )?;
                 s.publish_center(v, a);
+            }
+            Call::Portrait(c) => {
+                let mut state = s.center(v);
+                c.acknowledge(
+                    &mut state,
+                    &c.request().ok_or("camera portrait complete")?,
+                    portrait_centering::Reply::Done,
+                )?;
+                s.publish_center(v, state);
+            }
+            Call::Frame(c) => {
+                let mut state = s.center(v);
+                c.acknowledge(
+                    &mut state,
+                    &c.request().ok_or("camera motion frame complete")?,
+                    motion_frame::Reply::Done,
+                )?;
+                s.publish_center(v, state);
             }
             _ => return Err("camera child has no caller".into()),
         }
@@ -686,6 +777,68 @@ impl Node {
                 c.acknowledge(&mut state, &request, reply)?;
                 s.publish_center(v, state);
             }
+            Call::Portrait(c) => {
+                let request = c.request().ok_or("camera portrait request absent")?;
+                let mut state = s.center(v);
+                let reply = match request {
+                    portrait_centering::Request::Project { point, level } => {
+                        portrait_centering::Reply::Screen(
+                            s.projection(v, i, level, |projection| {
+                                projection.fine_screen(point, level)
+                            })?,
+                        )
+                    }
+                    portrait_centering::Request::Bounds { .. } => {
+                        let bounds = scroll::bounds(&s.scroll_context(v)?)?;
+                        s.settings.bottom_margin = bounds.bottom_margin;
+                        portrait_centering::Reply::Bounds(bounds)
+                    }
+                    portrait_centering::Request::ConfigureMotion {
+                        start,
+                        target,
+                        style,
+                    } => {
+                        s.settings.motion.center_service(
+                            &mut state,
+                            &centering::Request::ConfigureMotion {
+                                start,
+                                target,
+                                style,
+                            },
+                            i.clock,
+                        )?;
+                        portrait_centering::Reply::Done
+                    }
+                    _ => return Ok(Progress::Service(Service::Portrait(request))),
+                };
+                c.acknowledge(&mut state, &request, reply)?;
+                s.publish_center(v, state);
+            }
+            Call::Frame(c) => {
+                let request = c.request().ok_or("camera motion frame request absent")?;
+                let mut state = s.center(v);
+                let reply = match &request {
+                    motion_frame::Request::Prepare(motion::frame::Request::SampleMotion {
+                        axis,
+                    }) => {
+                        let coordinate = s.settings.motion.sample_axis(*axis, i.clock)?;
+                        state.motion_active = s.settings.motion.active;
+                        motion_frame::Reply::Coordinate(coordinate)
+                    }
+                    motion_frame::Request::Prepare(motion::frame::Request::Synchronize)
+                    | motion_frame::Request::Displacement(
+                        motion::frame::displacement::Request::Synchronize,
+                    ) if !s.settings.renderer_ready => motion_frame::Reply::Done,
+                    motion_frame::Request::Prepare(request) => {
+                        return Ok(Progress::Service(Service::MotionFrame(request.clone())));
+                    }
+                    motion_frame::Request::Displacement(request) => {
+                        return Ok(Progress::Service(Service::Displacement(request.clone())));
+                    }
+                };
+                c.acknowledge(&mut state, &request, reply)?;
+                s.publish_center(v, state);
+            }
             Call::Scroll(c) => {
                 return Ok(Progress::Service(Service::Scroll(
                     c.request().ok_or("camera scroll request absent")?.clone(),
@@ -720,6 +873,11 @@ impl Node {
             Call::Transition(c) => c.request().map(Service::Transition),
             Call::Floor(c) => c.request().map(Service::Floor),
             Call::Center(c) => c.request().map(Service::Center),
+            Call::Portrait(c) => c.request().map(Service::Portrait),
+            Call::Frame(c) => c.request().map(|request| match request {
+                motion_frame::Request::Prepare(request) => Service::MotionFrame(request),
+                motion_frame::Request::Displacement(request) => Service::Displacement(request),
+            }),
             Call::Scroll(c) => c.request().cloned().map(Service::Scroll),
             Call::Cancel(c) => c.request().cloned().map(Service::Cancel),
             Call::Clear(c) => c.pending().map(Service::InvalidateTile),
@@ -745,6 +903,7 @@ impl Node {
                 let reply = match reply {
                     Reply::Done => transition::Reply::Done,
                     Reply::Token(t) => transition::Reply::Token(t),
+                    _ => return Err("camera transition reply type mismatch".into()),
                 };
                 let mut state = s.transition(v)?;
                 c.acknowledge(&mut state, &mut s.tiles, r, reply)?;
@@ -761,6 +920,30 @@ impl Node {
             (Call::Center(c), Service::Center(r), Reply::Done) => {
                 let mut state = s.center(v);
                 c.acknowledge(&mut state, r, centering::Reply::Done)?;
+                s.publish_center(v, state);
+            }
+            (Call::Portrait(c), Service::Portrait(request), Reply::Done) => {
+                let mut state = s.center(v);
+                c.acknowledge(&mut state, request, portrait_centering::Reply::Done)?;
+                s.publish_center(v, state);
+            }
+            (Call::Frame(c), request, reply) => {
+                let request = match request {
+                    Service::MotionFrame(request) => {
+                        motion_frame::Request::Prepare(request.clone())
+                    }
+                    Service::Displacement(request) => {
+                        motion_frame::Request::Displacement(request.clone())
+                    }
+                    _ => return Err("camera motion frame service mismatch".into()),
+                };
+                let reply = match reply {
+                    Reply::Done => motion_frame::Reply::Done,
+                    Reply::Enabled(enabled) => motion_frame::Reply::Enabled(enabled),
+                    _ => return Err("camera motion frame reply type mismatch".into()),
+                };
+                let mut state = s.center(v);
+                c.acknowledge(&mut state, &request, reply)?;
                 s.publish_center(v, state);
             }
             (Call::Scroll(c), Service::Scroll(r), Reply::Done) => c.acknowledge(r)?,
@@ -806,6 +989,11 @@ impl Cursor {
                 level: *level,
                 force: *force,
             },
+            open::Request::CenterPerson { point, level } => Action::CenterPerson {
+                point: *point,
+                level: *level,
+            },
+            open::Request::MotionFrame => Action::Frame,
             open::Request::Scroll {
                 position,
                 immediate,

@@ -73,7 +73,7 @@ impl Vm {
             Ok(format!("Run Functional Tree entered {bhav} on #{target}"))
         } else {
             t.last_result = false;
-            crate::branch(p, t, ins.on_false)?;
+            self.branch(p, t, ins.on_false)?;
             Ok("Run Functional Tree unavailable".into())
         }
     }

@@ -4,6 +4,10 @@ use sims_vm::person_factory::{
     PostConstructRequest as Post, registered::Request as FactoryRequest,
 };
 
+#[cfg(test)]
+#[path = "factory/startup_tests.rs"]
+mod startup_tests;
+
 impl<P: Presentation> Host<P> {
     pub(super) fn validate_factory_bindings(&self, simulation: &Simulation) -> Result<()> {
         let pending = simulation.pending_factory_character_services();
@@ -46,7 +50,7 @@ impl<P: Presentation> Host<P> {
                     if !self.fresh.contains_key(&id) {
                         // Construction may load resources before it yields. Keep
                         // the old VM/CRT state if that initial allocation fails.
-                        let mut vm = simulation.vm.clone();
+                        let mut vm = simulation.vm.clone_for_transaction();
                         let mut crt = vm.crt_rng_state.context("factory CRT state absent")?;
                         let mut skeletons = self
                             .skeletons
@@ -60,6 +64,7 @@ impl<P: Presentation> Host<P> {
                             self.initializer_settings,
                             &mut crt,
                             &mut skeletons,
+                            Some(&mut self.startup),
                         )?;
                         vm.crt_rng_state = Some(crt);
                         simulation.vm = vm;
@@ -101,6 +106,7 @@ impl<P: Presentation> Host<P> {
                         &mut self.presentation,
                         &mut self.mesh_pool,
                         &mut self.clothing,
+                        Some(&mut self.startup),
                         fresh::Environment {
                             position: [position.x, position.y],
                             level: position.level,
@@ -113,8 +119,11 @@ impl<P: Presentation> Host<P> {
                     )?;
                     if finished {
                         // Retain the complete fresh owner until handoff succeeds.
-                        let loaded = Fresh::restore(&self.index, self.fresh[&id].snapshot())?
-                            .into_loaded(simulation.vm.tick, &mut self.presentation, &simulation.vm.world)?;
+                        let loaded = self.fresh[&id].clone().into_loaded(
+                            simulation.vm.tick,
+                            &mut self.presentation,
+                            &simulation.vm.world,
+                        )?;
                         loaded
                             .resident
                             .character

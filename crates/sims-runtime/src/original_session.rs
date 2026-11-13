@@ -452,6 +452,12 @@ pub struct Saved {
     )]
     pub normalized_object_definitions: BTreeSet<String>,
     pub animations: BTreeSet<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "native_animation_absences"
+    )]
+    pub native_animation_absences: BTreeMap<String, String>,
     /// Resource dependency reconstructed before validating the program hash.
     /// Older snapshots omitted it and retain their original catalog on restore.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -479,6 +485,94 @@ fn definition_profile<'de, D: serde::Deserializer<'de>>(
         ));
     }
     Ok(owners)
+}
+
+fn native_animation_absences<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, String>, D::Error> {
+    struct Proofs;
+    impl<'de> serde::de::Visitor<'de> for Proofs {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("unique normalized animation names and inventory SHA-256 proofs")
+        }
+
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut entries: M,
+        ) -> std::result::Result<Self::Value, M::Error> {
+            let mut proofs = BTreeMap::new();
+            while let Some((name, proof)) = entries.next_entry::<String, String>()? {
+                if proofs.insert(name, proof).is_some() {
+                    return Err(serde::de::Error::custom(
+                        "duplicate native animation absence proof",
+                    ));
+                }
+            }
+            validate_native_animation_absences(&proofs).map_err(serde::de::Error::custom)?;
+            Ok(proofs)
+        }
+    }
+    deserializer.deserialize_map(Proofs)
+}
+
+fn validate_native_animation_absences(proofs: &BTreeMap<String, String>) -> Result<()> {
+    for (name, proof) in proofs {
+        ensure!(
+            !name.is_empty() && *name == name.to_ascii_lowercase(),
+            "native animation absence name is not normalized: {name}"
+        );
+        ensure!(
+            proof.len() == 64
+                && proof
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "native animation absence inventory SHA-256 malformed: {name}"
+        );
+    }
+    Ok(())
+}
+
+fn restore_native_animation_absences(
+    index: &Index,
+    program: &mut Program,
+    proofs: &BTreeMap<String, String>,
+) -> Result<()> {
+    validate_native_animation_absences(proofs)?;
+    ensure!(
+        program.native_animation_absences.is_empty()
+            || program.native_animation_absences == *proofs,
+        "restored native animation absence proofs conflict"
+    );
+    ensure!(
+        proofs
+            .keys()
+            .all(|name| !program.animations.contains_key(name)),
+        "saved native animation absence conflicts with a loaded clip"
+    );
+    if proofs.is_empty() {
+        return Ok(());
+    }
+    let names = proofs.keys().cloned().collect();
+    let loaded = sims_content::assets::load_named_native_animations(index, program, &names)?;
+    ensure!(
+        loaded.catalog_errors.is_empty(),
+        "native animation absence inventory scan failed: {:?}",
+        loaded.catalog_errors
+    );
+    ensure!(
+        proofs
+            .keys()
+            .all(|name| !program.animations.contains_key(name)),
+        "saved native animation absence now resolves to a clip"
+    );
+    ensure!(
+        loaded.confirmed_absent == *proofs,
+        "native animation absence inventory changed or absence unconfirmed"
+    );
+    program.native_animation_absences = proofs.clone();
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1731,6 +1825,7 @@ impl Session {
                 .map(|(name, _)| name.clone())
                 .collect(),
             animations: self.program.animations.keys().cloned().collect(),
+            native_animation_absences: self.program.native_animation_absences.clone(),
             headline_catalog: self
                 .program
                 .modules
@@ -1799,6 +1894,11 @@ impl Session {
             "saved animation resources missing: {:?}",
             loaded.unresolved
         );
+        restore_native_animation_absences(
+            index,
+            &mut session.program,
+            &saved.native_animation_absences,
+        )?;
         ensure!(
             session
                 .program
@@ -2067,6 +2167,10 @@ fn process_input_for_load(
     }
     profile.map(|profile| profile.prepare(index)).transpose()
 }
+#[cfg(test)]
+#[path = "original_session/native_animation_absence_tests.rs"]
+mod native_animation_absence_tests;
+
 #[cfg(test)]
 mod process_profile_tests {
     use super::*;

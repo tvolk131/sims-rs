@@ -2072,6 +2072,7 @@ fn tutorial_object_popup_release_changed_epoch_owner_or_handles_stop_before_atte
         values: hud::cluster::Values {
             pending: false,
             ready: true,
+            transport_ready: true,
             mode_raw: Some(2),
             panel_state_raw: None,
             can_show_live: true,
@@ -2635,6 +2636,7 @@ fn with_progress_driver_vm(
         values: hud::cluster::Values {
             pending: false,
             ready: true,
+            transport_ready: true,
             mode_raw: Some(2),
             panel_state_raw: None,
             can_show_live: true,

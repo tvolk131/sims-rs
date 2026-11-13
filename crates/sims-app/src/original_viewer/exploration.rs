@@ -22,6 +22,9 @@ mod interaction_sequences;
 #[path = "exploration/native_owned_adapter.rs"]
 mod native_owned_adapter;
 #[cfg(test)]
+#[path = "exploration/native_frame_clock_tests.rs"]
+mod native_frame_clock_tests;
+#[cfg(test)]
 #[path = "exploration/native_owned_continuation.rs"]
 mod native_owned_continuation;
 #[cfg(test)]
@@ -443,14 +446,8 @@ impl Application {
             .context("household absent")?
             .residents
             .iter()
-            .filter(|r| {
-                s.simulation
-                    .vm
-                    .world
-                    .objects
-                    .contains_key(&(r.object as i16))
-            })
-            .map(|r| Identity::get(s, r.object as i16))
+            .filter_map(|resident| resident_object(s, resident))
+            .map(|identity| Identity::get(s, identity))
             .collect()
     }
     fn screenshot(&self, path: &Path) -> Result<()> {

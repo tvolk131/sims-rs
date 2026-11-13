@@ -66,7 +66,17 @@ impl Cache {
         Ok(source)
     }
     pub fn load(&mut self, index: &Index, name: &str, crt: &mut u32) -> Result<Skeleton> {
-        let (selected, id) = crate::avatar::load_skeleton(index, name)?;
+        self.load_with_startup(index, name, crt, None)
+    }
+
+    pub(crate) fn load_with_startup(
+        &mut self,
+        index: &Index,
+        name: &str,
+        crt: &mut u32,
+        startup: Option<&mut crate::startup_memo::Memo>,
+    ) -> Result<Skeleton> {
+        let (selected, id) = crate::avatar::load_skeleton_with_startup(index, name, startup)?;
         let source = &index.resources[id];
         if !self.catalogs.contains_key(&source.locator) {
             let bytes = source.read()?;

@@ -206,7 +206,7 @@ fn restore_inner(index: &Index, mut saved: Saved, retained: Option<Program>) -> 
             "managed import/catalog asset changed: {source}"
         );
     }
-    let program = if let Some(program) = retained {
+    let mut program = if let Some(program) = retained {
         ensure!(
             completed.is_some(),
             "retained Program restore lost completed source ownership"
@@ -219,6 +219,7 @@ fn restore_inner(index: &Index, mut saved: Saved, retained: Option<Program>) -> 
         ensure!(
             program.modules.keys().cloned().collect::<BTreeSet<_>>() == saved.modules
                 && program.animations.keys().cloned().collect::<BTreeSet<_>>() == saved.animations
+                && program.native_animation_absences == saved.native_animation_absences
                 && program
                     .modules
                     .iter()
@@ -244,6 +245,7 @@ fn restore_inner(index: &Index, mut saved: Saved, retained: Option<Program>) -> 
             &saved.normalized_object_definitions,
         )?
     };
+    super::restore_native_animation_absences(&index, &mut program, &saved.native_animation_absences)?;
     if let Some((modules, _)) = &completed {
         completed_owned::validate_modules(&program, modules)?;
         super::completed_baseline::resources(

@@ -3,36 +3,142 @@ use clap::Parser;
 use widget::shader::Program as _;
 
 pub(super) fn object_pixel(v: &Viewer, id: i16) -> Option<[f32; 2]> {
-    let scene = v.scene.as_ref()?;
-    for draw in scene.draws.iter().filter(|d| d.object == Some(id)) {
-        let points: Vec<_> = scene.vertices
-            [draw.vertices.start as usize..draw.vertices.end as usize]
-            .iter()
-            .map(|p| {
-                [
-                    (p.position[0] + 1.) * scene.width as f32 / 2.,
-                    (1. - p.position[1]) * scene.height as f32 / 2.,
-                ]
-            })
-            .collect();
-        let min: [f32; 2] =
-            std::array::from_fn(|i| points.iter().map(|p| p[i]).fold(f32::INFINITY, f32::min));
-        let max: [f32; 2] = std::array::from_fn(|i| {
-            points
-                .iter()
-                .map(|p| p[i])
-                .fold(f32::NEG_INFINITY, f32::max)
-        });
-        for y in (min[1].max(0.) as u32..(max[1].ceil() as u32).min(scene.height)).step_by(2) {
-            for x in (min[0].max(0.) as u32..(max[0].ceil() as u32).min(scene.width)).step_by(2) {
-                let pixel = [x as f32 + 0.5, y as f32 + 0.5];
-                if scene.pick(pixel) == Some(id) {
-                    return Some(pixel);
+    scene_object_pixel(v.scene.as_deref()?, id)
+}
+
+pub(super) fn object_bounds(scene: &Scene, id: i16) -> Vec<[f32; 4]> {
+    scene
+        .draws
+        .iter()
+        .filter(|draw| draw.object == Some(id))
+        .filter_map(|draw| {
+            let mut bounds = [
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            ];
+            for vertex in &scene.vertices[draw.vertices.start as usize..draw.vertices.end as usize]
+            {
+                let horizontal = (vertex.position[0] + 1.) * scene.width as f32 / 2.;
+                let vertical = (1. - vertex.position[1]) * scene.height as f32 / 2.;
+                bounds[0] = bounds[0].min(horizontal);
+                bounds[1] = bounds[1].min(vertical);
+                bounds[2] = bounds[2].max(horizontal);
+                bounds[3] = bounds[3].max(vertical);
+            }
+            bounds.iter().all(|axis| axis.is_finite()).then_some(bounds)
+        })
+        .collect()
+}
+
+fn scene_object_pixel(scene: &Scene, id: i16) -> Option<[f32; 2]> {
+    let bounds = object_bounds(scene, id);
+    for stride in [2, 1] {
+        for &[left, top, right, bottom] in &bounds {
+            for vertical in
+                (top.max(0.) as u32..(bottom.ceil() as u32).min(scene.height)).step_by(stride)
+            {
+                for horizontal in
+                    (left.max(0.) as u32..(right.ceil() as u32).min(scene.width)).step_by(stride)
+                {
+                    let pixel = [horizontal as f32 + 0.5, vertical as f32 + 0.5];
+                    if scene.pick(pixel) == Some(id) {
+                        return Some(pixel);
+                    }
                 }
             }
         }
     }
     None
+}
+
+fn sparse_pick_scene() -> Scene {
+    use sims_render::{Draw, Texture, Vertex};
+    let points = [
+        ([-1., 1., 0.5], [0., 0.]),
+        ([1., 1., 0.5], [1., 0.]),
+        ([1., -1., 0.5], [1., 1.]),
+        ([-1., -1., 0.5], [0., 1.]),
+    ];
+    let mut rgba = vec![0; 4 * 4 * 4];
+    rgba[20..24].copy_from_slice(&[255, 255, 255, 255]);
+    Scene {
+        vertices: [0, 1, 2, 0, 2, 3]
+            .map(|index| Vertex {
+                position: points[index].0,
+                uv: points[index].1,
+                tint: [1.; 4],
+                depth_scale: 0.,
+            })
+            .to_vec(),
+        draws: vec![Draw {
+            vertices: 0..6,
+            texture: 0,
+            object: Some(104),
+        }],
+        censors: vec![],
+        textures: Arc::new(vec![Texture {
+            width: 4,
+            height: 4,
+            rgba: rgba.into(),
+            depth: vec![255; 16].into(),
+        }]),
+        width: 4,
+        height: 4,
+    }
+}
+
+#[test]
+fn visible_object_pixel_search_checks_unsampled_opaque_texels() {
+    let scene = sparse_pick_scene();
+    assert_eq!(object_bounds(&scene, 104), vec![[0., 0., 4., 4.]]);
+    for vertical in [0, 2] {
+        for horizontal in [0, 2] {
+            assert_ne!(
+                scene.pick([horizontal as f32 + 0.5, vertical as f32 + 0.5]),
+                Some(104)
+            );
+        }
+    }
+    let pixel = scene_object_pixel(&scene, 104).unwrap();
+    assert_eq!(pixel, [1.5, 1.5]);
+    assert_eq!(scene.pick(pixel), Some(104));
+    assert!(scene_object_pixel(&scene, 105).is_none());
+}
+
+#[test]
+fn visible_object_pixel_search_preserves_occlusion_and_identity() {
+    use sims_render::{Draw, Texture};
+    let retained = sparse_pick_scene();
+    let mut scene = retained.clone();
+    let mut front = scene.vertices.clone();
+    for vertex in &mut front {
+        vertex.position[2] = 0.25;
+    }
+    scene.vertices.extend(front);
+    Arc::make_mut(&mut scene.textures).push(Texture {
+        width: 1,
+        height: 1,
+        rgba: vec![255; 4].into(),
+        depth: vec![255].into(),
+    });
+    scene.draws.push(Draw {
+        vertices: 6..12,
+        texture: 1,
+        object: None,
+    });
+    assert!(scene_object_pixel(&scene, 104).is_none());
+    scene.draws.last_mut().unwrap().object = Some(105);
+    assert!(scene_object_pixel(&scene, 104).is_none());
+    let front_pixel = scene_object_pixel(&scene, 105).unwrap();
+    assert_eq!(scene.pick(front_pixel), Some(105));
+    assert_eq!(scene_object_pixel(&retained, 104), Some([1.5, 1.5]));
+    let mut outside = retained;
+    for vertex in &mut outside.vertices {
+        vertex.position[0] += 3.;
+    }
+    assert!(scene_object_pixel(&outside, 104).is_none());
 }
 
 #[test]

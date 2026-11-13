@@ -8,15 +8,24 @@ use sims_formats::animation::{Animation, read_bcf, read_cfp};
 use sims_vm::{Program, program::AnimationAsset};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod native_catalog;
+pub(crate) use native_catalog::Catalog as NativeCatalog;
+
 #[derive(Debug, Default, serde::Serialize)]
 pub struct Report {
     pub catalogs: usize,
     pub discovered_clips: usize,
     pub loaded_clips: usize,
     pub catalog_errors: Vec<String>,
-    /// Includes unused/placeholder entries; execution still fails explicitly if
-    /// a script requests one. This is not a claim of whole-game asset coverage.
     pub unresolved: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub confirmed_absent: BTreeMap<String, String>,
+    #[serde(skip)]
+    catalog_inventory: Vec<(String, String, String)>,
+    #[serde(skip)]
+    catalog_names: BTreeSet<String>,
+    #[serde(skip)]
+    absence_complete: bool,
 }
 
 pub fn load_linked_animations(index: &Index, program: &mut Program) -> Result<Report> {
@@ -62,7 +71,22 @@ pub fn load_named_native_animations(
     program: &mut Program,
     names: &BTreeSet<String>,
 ) -> Result<Report> {
-    load_named_animations_inner(index, program, names, true)
+    // Runtime clips already owned by Program remain authoritative. A factory
+    // asking for those clips must not scan every installed BCF again. Missing
+    // dependencies still take the ordinary source/provenance-checked path.
+    if names
+        .iter()
+        .all(|name| program.animations.contains_key(name))
+    {
+        return Ok(Report::default());
+    }
+    let mut report = load_named_animations_inner(index, program, names, true)?;
+    let inventory = std::mem::take(&mut report.catalog_inventory);
+    let catalog_names = std::mem::take(&mut report.catalog_names);
+    let proof = native_absence_inventory(&inventory)?;
+    let complete = report.absence_complete;
+    confirm_native_absence(&mut report, &proof, &catalog_names, complete);
+    Ok(report)
 }
 
 fn load_named_animations_inner(
@@ -84,14 +108,31 @@ pub(crate) fn load_named_animations_read(
 ) -> Result<Report> {
     let mut discovered = BTreeSet::new();
     let mut candidates: BTreeMap<String, Vec<(usize, Animation)>> = BTreeMap::new();
-    let mut report = Report::default();
+    let mut aliases: BTreeMap<String, Vec<(usize, Animation)>> = BTreeMap::new();
+    let mut report = Report {
+        absence_complete: true,
+        ..Report::default()
+    };
     for (id, resource) in index.resources.iter().enumerate() {
         if !resource.name.to_ascii_lowercase().ends_with(".cmx.bcf") {
             continue;
         }
         let bytes = read(resource)?;
+        if retain_empty {
+            report.catalog_inventory.push((
+                resource.locator.clone(),
+                resource.name.clone(),
+                format!("{:x}", Sha256::digest(&bytes)),
+            ));
+            if let Some(name) = native_catalog_name(resource) {
+                report.catalog_names.insert(name);
+            }
+        }
         // The separate avatar parser owns skeleton/appearance catalogs.
         if bytes.get(..8) != Some(&[0; 8]) {
+            if retain_empty && sims_formats::avatar::read_bcf(&bytes).is_err() {
+                report.absence_complete = false;
+            }
             continue;
         }
         let clips = match if retain_empty {
@@ -107,6 +148,13 @@ pub(crate) fn load_named_animations_read(
                 continue;
             }
         };
+        if retain_empty {
+            if let Some((name, clip)) = native_catalog_alias(resource, &clips) {
+                if names.contains(&name) {
+                    aliases.entry(name).or_default().push((id, clip));
+                }
+            }
+        }
         for clip in clips {
             let normalized = clip.name.to_ascii_lowercase();
             if names.contains(&normalized) {
@@ -120,13 +168,86 @@ pub(crate) fn load_named_animations_read(
         report.catalogs += 1;
     }
     report.discovered_clips = discovered.len();
+    load_animation_candidates(
+        index,
+        program,
+        names,
+        &candidates,
+        &aliases,
+        &mut report,
+        |resource| Ok(format!("{:x}", Sha256::digest(resource.read()?))),
+    )?;
+    Ok(report)
+}
+
+fn native_absence_inventory(inventory: &[(String, String, String)]) -> Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(inventory)?)
+    ))
+}
+
+fn confirm_native_absence(
+    report: &mut Report,
+    proof: &str,
+    catalog_names: &BTreeSet<String>,
+    complete: bool,
+) {
+    if complete && report.catalog_errors.is_empty() {
+        for name in &report.unresolved {
+            if !name.is_empty()
+                && *name == name.to_ascii_lowercase()
+                && !catalog_names.contains(name)
+            {
+                report
+                    .confirmed_absent
+                    .insert(name.clone(), proof.to_owned());
+            }
+        }
+    }
+}
+
+fn native_catalog_name(resource: &crate::Resource) -> Option<String> {
+    resource
+        .name
+        .to_ascii_lowercase()
+        .strip_suffix(".cmx.bcf")
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+fn native_catalog_alias(
+    resource: &crate::Resource,
+    clips: &[Animation],
+) -> Option<(String, Animation)> {
+    let [clip] = clips else {
+        return None;
+    };
+    let name = native_catalog_name(resource)?;
+    if name.eq_ignore_ascii_case(&clip.name) {
+        return None;
+    }
+    let mut alias = clip.clone();
+    alias.name = name.clone();
+    Some((name, alias))
+}
+
+fn load_animation_candidates(
+    index: &Index,
+    program: &mut Program,
+    names: &BTreeSet<String>,
+    candidates: &BTreeMap<String, Vec<(usize, Animation)>>,
+    aliases: &BTreeMap<String, Vec<(usize, Animation)>>,
+    report: &mut Report,
+    mut content_hash: impl FnMut(&crate::Resource) -> Result<String>,
+) -> Result<()> {
     for name in names {
         // Explicit locomotion/idle selections remain authoritative until the
         // native content manager's search order has been recovered.
         if program.animations.contains_key(name) {
             continue;
         }
-        let Some(providers) = candidates.get(name) else {
+        let Some(providers) = candidates.get(name).or_else(|| aliases.get(name)) else {
             report.unresolved.push(name.clone());
             continue;
         };
@@ -139,7 +260,7 @@ pub(crate) fn load_named_animations_read(
             let data = cfp.read()?;
             let asset = AnimationAsset {
                 source: resource.locator.clone(),
-                content_hash: format!("{:x}", Sha256::digest(resource.read()?)),
+                content_hash: content_hash(resource)?,
                 samples_source: cfp.locator.clone(),
                 samples_hash: format!("{:x}", Sha256::digest(&data)),
                 samples: read_cfp(&data, clip.translation_count, clip.rotation_count)
@@ -161,7 +282,7 @@ pub(crate) fn load_named_animations_read(
         program.animations.insert(name.clone(), decoded.unwrap());
         report.loaded_clips += 1;
     }
-    Ok(report)
+    Ok(())
 }
 
 /// Prefer the catalog's own archive/directory when resolving its embedded link.

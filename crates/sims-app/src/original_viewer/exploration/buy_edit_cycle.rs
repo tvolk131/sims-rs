@@ -555,10 +555,12 @@ mod tests {
             }
         };
         app.drain(&limits())?;
+        let (locations, locations_input) = locations(&app)?;
         write_json(
             &out.join("profile.json"),
             &json!({"source":source,
             "source_sha256":engine::digest(&bytes),"root":root,
+            "furniture_locations":locations,"frozen_locations_input":locations_input,
             "routing_policy":app.session()?.simulation.native_lot.as_ref().map(|n|n.routing_policy),
             "map_owner":app.session()?.simulation.vm.world.map_size,
             "strict_native_parity_ticks":0,"original_engine_executed":false,"player_save_accessed":false}),
@@ -569,7 +571,7 @@ mod tests {
         } else if std::env::var_os("SIMS_BUY_EDIT_CONTINUE_AFTER_MOVE").is_some() {
             continue_after_move(&mut app, &out)
         } else {
-            cycle(&mut app, &out)
+            cycle(&mut app, &out, locations)
         };
         if let Err(error) = &result {
             write_json(
@@ -905,16 +907,60 @@ mod tests {
         }
         anyhow::bail!("observed startup notice limit exceeded")
     }
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
     struct Locations {
         purchase: [i32; 2],
         destination: [i32; 2],
         cancelled: [i32; 2],
     }
-    fn locations(app: &Application) -> Result<Locations> {
+    fn parse_locations(bytes: &[u8], size: usize) -> Result<Locations> {
+        ensure!((2..=64).contains(&size), "unsupported furniture map size");
+        let locations: Locations = serde_json::from_slice(bytes)?;
+        let points = [
+            locations.purchase,
+            locations.destination,
+            locations.cancelled,
+        ];
+        ensure!(
+            points.iter().flatten().all(|coordinate| {
+                *coordinate >= 0 && *coordinate < size as i32 * 16 && coordinate.rem_euclid(16) == 8
+            }),
+            "furniture locations must be in-bounds tile centers"
+        );
+        ensure!(
+            points[0] != points[1] && points[0] != points[2] && points[1] != points[2],
+            "furniture locations must be distinct"
+        );
+        Ok(locations)
+    }
+    fn locations(app: &Application) -> Result<(Locations, Option<Value>)> {
+        if let Some(filename) = std::env::var_os("SIMS_BUY_EDIT_LOCATIONS") {
+            let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .canonicalize()?;
+            let filename = repo.join(filename).canonicalize()?;
+            ensure!(
+                filename.starts_with(repo.join("cache").canonicalize()?),
+                "furniture location input must stay in private cache"
+            );
+            let bytes = std::fs::read(&filename)?;
+            let size = app
+                .session()?
+                .simulation
+                .architecture
+                .as_ref()
+                .and_then(|architecture| architecture.original.as_ref())
+                .context("furniture location input needs retained original terrain")?
+                .size;
+            return Ok((
+                parse_locations(&bytes, size)?,
+                Some(json!({"path":filename,"sha256":engine::digest(&bytes)})),
+            ));
+        }
         // Physical free tile centers from each retained fixture. Actual Move
         // projection, placement and room predicates must still prove delivery.
-        Ok(match app.session()?.house.source.as_str() {
+        let locations = match app.session()?.house.source.as_str() {
             "UserData/Houses/House05.iff" => Locations {
                 purchase: [552, 456],
                 destination: [456, 392],
@@ -931,10 +977,36 @@ mod tests {
                 cancelled: [568, 296],
             },
             source => anyhow::bail!("no observed furniture targets for {source}"),
-        })
+        };
+        Ok((locations, None))
     }
-    fn cycle(app: &mut Application, out: &Path) -> Result<()> {
-        let locations = locations(app)?;
+    #[test]
+    fn furniture_location_inputs_require_distinct_in_bounds_tile_centers_and_exact_schema()
+    -> Result<()> {
+        let valid = json!({"purchase":[552,280],"destination":[584,280],"cancelled":[568,280]});
+        let expected = Locations {
+            purchase: [552, 280],
+            destination: [584, 280],
+            cancelled: [568, 280],
+        };
+        ensure!(parse_locations(&serde_json::to_vec(&valid)?, 64)? == expected);
+        for coordinate in [-8, 0, 7, 1032] {
+            let mut invalid = valid.clone();
+            invalid["destination"][0] = json!(coordinate);
+            ensure!(parse_locations(&serde_json::to_vec(&invalid)?, 64).is_err());
+        }
+        let mut duplicate = valid.clone();
+        duplicate["destination"] = duplicate["purchase"].clone();
+        ensure!(parse_locations(&serde_json::to_vec(&duplicate)?, 64).is_err());
+        let mut unknown = valid.clone();
+        unknown["ignore_placement"] = json!(true);
+        ensure!(parse_locations(&serde_json::to_vec(&unknown)?, 64).is_err());
+        for size in [0, 65] {
+            ensure!(parse_locations(&serde_json::to_vec(&valid)?, size).is_err());
+        }
+        Ok(())
+    }
+    fn cycle(app: &mut Application, out: &Path, locations: Locations) -> Result<()> {
         let initial = capture(app)?;
         ensure!(
             initial.mode == 2 && initial.ready_paused && initial.cursors == 0,

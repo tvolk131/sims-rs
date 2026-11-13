@@ -1,6 +1,6 @@
 //! Ordinary residential object clicks through48cbec/48c834 and48dd67.
 //! The real VM owns menu checks, including ordered same-tile fallback checks.
-//! Person joins retain an explicit boundary rather than a substitute menu.
+//! Ordinary person entries use their original menu; available joins stay explicit.
 use super::Session;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -300,7 +300,7 @@ impl State {
                 .world
                 .objects
                 .get(&self.target)
-                .is_some_and(|o| o.person.is_some() == (self.phase == Phase::PersonJoin)),
+                .is_some_and(|object| self.phase != Phase::PersonJoin || object.person.is_some()),
             "object menu target kind differs"
         );
         if let Some(q) = &s.simulation.vm.player_menu {
@@ -587,7 +587,13 @@ impl Session {
                     };
                 }
             }
-            Phase::PersonJoin => anyhow::bail!("person menu requires original join enumeration"),
+            Phase::PersonJoin => {
+                self.simulation
+                    .vm
+                    .begin_player_menu(&self.program, state.actor, state.target)
+                    .map_err(anyhow::Error::msg)?;
+                state.phase = Phase::Query;
+            }
             Phase::Ready | Phase::Complete => (),
         }
         Ok(())

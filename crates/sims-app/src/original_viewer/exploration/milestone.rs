@@ -358,7 +358,7 @@ fn object_uses_accounted(vm: &sims_vm::Vm, target: i16) -> Result<bool> {
         .sum();
     Ok(usize::try_from(object_use_count(vm, target)?)? == records)
 }
-fn interaction_released(vm: &sims_vm::Vm, actor: i16, target: i16) -> Result<bool> {
+pub(super) fn interaction_released(vm: &sims_vm::Vm, actor: i16, target: i16) -> Result<bool> {
     let actions = action_owner(vm, actor)?;
     let object = vm
         .world

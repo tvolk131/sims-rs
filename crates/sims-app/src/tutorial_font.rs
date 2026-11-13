@@ -1,6 +1,3 @@
-//! Tutorial body font only:607d9e selects VariableSans_12.ffn;60b97f builds
-//! cTSFont metrics. The Gimex4-bit glyph indices are validated against a native
-//! atlas. Iced alpha blending remains a display-service approximation to565.
 use anyhow::{Context, Result, ensure};
 use iced::advanced::image::Renderer as _;
 use iced::{Point, Rectangle, Size};
@@ -27,8 +24,7 @@ pub(super) struct Font {
     images: [Option<iced::widget::image::Handle>; 256],
 }
 impl Font {
-    pub(super) fn load(index: &sims_content::Index) -> Result<Self> {
-        let path = "Fonts/variablesans_12.ffn";
+    pub(super) fn load(index: &sims_content::Index, path: &str, line_height: i32) -> Result<Self> {
         let loose = format!("UIGraphics/{path}");
         let installed = index
             .resources
@@ -48,9 +44,26 @@ impl Font {
             candidates.len() == 1,
             "tutorial bitmap font absent/ambiguous"
         );
-        Self::decode(&candidates[0].read()?)
+        Self::decode(&candidates[0].read()?, line_height)
     }
-    fn decode(bytes: &[u8]) -> Result<Self> {
+    #[cfg(test)]
+    pub(super) fn synthetic() -> Self {
+        Self {
+            metrics: [Metric::default(); 256],
+            line_height: 23,
+            width_addition: 0,
+            decoded: sims_formats::ffn::Font {
+                flags: 9,
+                glyphs: vec![],
+                width: 0,
+                height: 0,
+                coverage: vec![],
+            },
+            encoding: BTreeMap::new(),
+            images: std::array::from_fn(|_| None),
+        }
+    }
+    fn decode(bytes: &[u8], expected_line_height: i32) -> Result<Self> {
         let decoded = sims_formats::ffn::Font::parse(bytes)?;
         ensure!(
             decoded.flags == 9,
@@ -113,8 +126,8 @@ impl Font {
         metrics[32].packed = [0; 4];
         metrics[32].advance = (f64::from(sum_width) * 0.5 / f64::from(count) + 0.5).trunc() as i32;
         ensure!(
-            line_height == 23,
-            "tutorial logical12 font line advance differs"
+            line_height == expected_line_height,
+            "dialog bitmap font line advance differs"
         );
         let mut images = std::array::from_fn(|_| None);
         //Captured English cTSFont12 color0xc679. Coverage palette alpha is
@@ -161,6 +174,12 @@ impl Font {
         self.encoding
             .get(&ch)
             .map(|b| self.metrics[usize::from(*b)])
+    }
+    pub fn width(&self, text: &str) -> f32 {
+        text.chars()
+            .filter_map(|ch| self.metric(ch))
+            .map(|metric| metric.advance as f32)
+            .sum()
     }
     pub fn supports(&self, text: &str) -> bool {
         text.chars().all(|c| self.encoding.contains_key(&c))
@@ -216,7 +235,7 @@ mod tests {
             .join("../..")
             .canonicalize()?;
         let index = sims_content::Index::scan(&repo.join("game-data/cabinet-extracted"))?;
-        let font = Font::load(&index)?;
+        let font = Font::load(&index, "Fonts/variablesans_12.ffn", 23)?;
         let capture = repo.join(
             "cache/tutorial-walkthrough-20261022-first/first-run/native-font-atlas-pixels-ui.json",
         );

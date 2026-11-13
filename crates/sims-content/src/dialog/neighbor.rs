@@ -10,6 +10,9 @@ pub struct Neighbors<'a, 'b> {
     pub language: u8,
 }
 impl NeighborHost for Neighbors<'_, '_> {
+    fn guid(&mut self, guid: u32) -> Result<Option<u32>, String> {
+        self.catalog.portrait_resource(guid)
+    }
     fn live(&mut self, definition: &sims_vm::Definition) -> Result<Option<u32>, String> {
         self.catalog.live_dialog_resource(definition).map(Some)
     }

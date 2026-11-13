@@ -171,6 +171,7 @@ impl Vm {
     /// of every VM root field; counters remain validated by Snapshot restore.
     pub fn completed_delivery_counters(&self) -> (u64, u64) {
         let Self {
+            terminal_observer: _,
             scheduled_object_visit: _,
             world: _,
             player_menu: _,
@@ -314,6 +315,7 @@ impl Vm {
         Snapshot::validate_owned(
             program,
             Self {
+                terminal_observer: Default::default(),
                 world,
                 scheduled_object_visit: projection.scheduled_object_visit,
                 player_menu: projection.player_menu,

@@ -308,7 +308,10 @@ impl Execution {
             {
                 return Err("shoo temporary path context mismatch".into());
             }
-            q.validate(s, p)?;
+            if q.thread != self.thread {
+                return Err("shoo temporary owner thread mismatch".into());
+            }
+            q.validate_request(s, p, &self.route)?;
         }
         if let Some(a) = &self.attempt {
             if self.query.is_some()
@@ -331,6 +334,13 @@ impl crate::Simulation {
         remaining: &mut usize,
         step: &mut crate::Step,
     ) -> Result<bool, String> {
+        if let Some(execution) = self
+            .native_lot
+            .as_ref()
+            .and_then(|native| native.shoo.as_ref())
+        {
+            execution.validate(self, p)?;
+        }
         let Some(mut e) = self.native_lot.as_mut().and_then(|n| n.shoo.take()) else {
             return Ok(true);
         };
@@ -352,7 +362,8 @@ impl crate::Simulation {
         //Reject historical unknown ownership before mutating selection or World.
         e.retained_candidate_limit()?;
         loop {
-            let Some(request) = e.selection.next() else {
+            let mut selection = e.selection.clone();
+            let Some(request) = selection.next() else {
                 return Ok(true);
             };
             match request {
@@ -364,6 +375,7 @@ impl crate::Simulation {
                         let retained_limit = e.retained_candidate_limit()?;
                         let q = super::live::Execution::begin_retained_potential(
                             self,
+                            p,
                             e.thread,
                             &e.route,
                             super::live::Potential {
@@ -378,11 +390,14 @@ impl crate::Simulation {
                         e.candidate_limit = Some(q.potential_candidate_limit());
                         e.query = Some(q);
                     }
+                    e.selection = selection;
                     let q = e.query.as_mut().unwrap();
-                    if !self.drive_point_clearance(p, q, remaining, step)? {
+                    let prepared =
+                        self.drive_potential_preparation(p, q, &e.route, remaining, step);
+                    e.candidate_limit = Some(q.potential_candidate_limit());
+                    if !prepared? {
                         return Ok(false);
                     }
-                    q.mark_potential_prepared();
                     let actor = &self.vm.world.objects[&q.caller];
                     let person = actor.person.as_ref().unwrap();
                     let same_room = actor.data[&29] == self.vm.world.objects[&q.target].data[&29]
@@ -422,6 +437,7 @@ impl crate::Simulation {
                     e.query = None;
                 }
                 Request::Attempt { blocker, points } => {
+                    e.selection = selection;
                     if let Some(a) = e.attempt.as_mut() {
                         if let Some(accepted) = self
                             .drive_native_shoo_attempt(p, a, e.thread, &e.route, remaining, step)?

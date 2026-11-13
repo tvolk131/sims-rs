@@ -96,6 +96,17 @@ pub fn load_accessories(index: &Index) -> Result<BTreeMap<String, Accessory>> {
 /// catalogs. The name is not a filename: pets use dog_skeleton/kat_skeleton.
 /// Native provider order and lazy record replacement select the actual asset.
 pub fn load_skeleton(index: &Index, name: &str) -> Result<(Skeleton, usize)> {
+    load_skeleton_with_startup(index, name, None)
+}
+
+pub(crate) fn load_skeleton_with_startup(
+    index: &Index,
+    name: &str,
+    startup: Option<&mut crate::startup_memo::Memo>,
+) -> Result<(Skeleton, usize)> {
+    if let Some(startup) = startup {
+        return startup.load_skeleton(index, name);
+    }
     use sims_formats::avatar::{catalog::Asset, index::Kind};
     let (mut installed, directories) = crate::clothing_catalog::installed_catalog(index)?;
     let record = installed
@@ -126,9 +137,38 @@ pub(crate) fn appearance_catalog(index: &Index, name: &str) -> Result<Option<usi
 pub(crate) fn appearance_catalog_read(
     index: &Index,
     name: &str,
-    mut read: impl FnMut(&crate::Resource) -> Result<Vec<u8>>,
+    read: impl FnMut(&crate::Resource) -> Result<Vec<u8>>,
 ) -> Result<Option<usize>> {
     let mut found: Option<(usize, Vec<u8>)> = None;
+    appearance_catalogs_read(index, read, |id, bytes, catalog| {
+        if !catalog
+            .appearances
+            .iter()
+            .any(|appearance| appearance.name.eq_ignore_ascii_case(name))
+        {
+            return Ok(());
+        }
+        if let Some((previous, previous_bytes)) = &found {
+            if previous_bytes != &bytes {
+                bail!(
+                    "conflicting appearance {name}: {} and {}",
+                    index.resources[*previous].locator,
+                    index.resources[id].locator
+                );
+            }
+        } else {
+            found = Some((id, bytes));
+        }
+        Ok(())
+    })?;
+    Ok(found.map(|(id, _)| id))
+}
+
+pub(crate) fn appearance_catalogs_read(
+    index: &Index,
+    mut read: impl FnMut(&crate::Resource) -> Result<Vec<u8>>,
+    mut visit: impl FnMut(usize, Vec<u8>, avatar::Catalog) -> Result<()>,
+) -> Result<()> {
     for (id, resource) in index.resources.iter().enumerate() {
         if !is_appearance_catalog(resource) {
             continue;
@@ -141,26 +181,9 @@ pub(crate) fn appearance_catalog_read(
         }
         let catalog = read_catalog(&resource.name, &bytes)
             .with_context(|| format!("read appearance catalog {}", resource.locator))?;
-        if !catalog
-            .appearances
-            .iter()
-            .any(|a| a.name.eq_ignore_ascii_case(name))
-        {
-            continue;
-        }
-        if let Some((previous, previous_bytes)) = &found {
-            if previous_bytes != &bytes {
-                bail!(
-                    "conflicting appearance {name}: {} and {}",
-                    index.resources[*previous].locator,
-                    resource.locator
-                );
-            }
-        } else {
-            found = Some((id, bytes));
-        }
+        visit(id, bytes, catalog)?;
     }
-    Ok(found.map(|(id, _)| id))
+    Ok(())
 }
 
 fn is_text_catalog(name: &str) -> bool {

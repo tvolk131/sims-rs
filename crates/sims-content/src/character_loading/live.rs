@@ -64,6 +64,7 @@ pub struct Snapshot {
 pub struct Host<P> {
     floors: BTreeMap<u16, floors::Binding>,
     index: std::sync::Arc<Index>,
+    startup: crate::startup_memo::Memo,
     neighborhood_source: String,
     initializer_settings: Settings,
     fresh: BTreeMap<ObjectId, Fresh>,
@@ -165,9 +166,16 @@ impl<'a, P: Presentation> Reader<'a, P> {
         if let Some(error) = self.route_diagnostic {
             simulation.native_lot.as_mut().unwrap().diagnostics.error = error;
         }
+        let index = std::sync::Arc::new(self.index.clone());
+        let mut startup = crate::startup_memo::Memo::for_session(index.clone());
+        startup.prepare_session()?;
+        for assets in characters.values_mut() {
+            assets.avatar.bind_session_catalog(&index, &startup);
+        }
         Ok(Host {
             floors: floors::load(self.index, self.house)?,
-            index: std::sync::Arc::new(self.index.clone()),
+            index,
+            startup,
             neighborhood_source: self.house.neighborhood_source.clone(),
             initializer_settings: self.settings,
             fresh: BTreeMap::new(),
@@ -199,6 +207,7 @@ impl<P: Presentation> Host<P> {
         Ok(Self {
             floors: self.floors.clone(),
             index: self.index.clone(),
+            startup: self.startup.fork_for_session(),
             neighborhood_source: self.neighborhood_source.clone(),
             initializer_settings: self.initializer_settings,
             fresh: self.fresh.clone(),
@@ -294,9 +303,14 @@ impl<P: Presentation> Host<P> {
                 "notification character absent"
             );
         }
+        let index_owner = std::sync::Arc::new(index.clone());
+        let mut startup = crate::startup_memo::Memo::for_session(index_owner.clone());
+        if !snapshot.characters.is_empty() || !snapshot.fresh.is_empty() {
+            startup.prepare_session()?;
+        }
         let mut fresh = BTreeMap::new();
         for (id, saved) in snapshot.fresh {
-            let state = Fresh::restore(index, saved)?;
+            let state = Fresh::restore(&index_owner, saved, Some(&mut startup))?;
             ensure!(
                 !state.clothing_used() || snapshot.clothing.loaded(),
                 "fresh appearance lost its clothing cache"
@@ -346,14 +360,21 @@ impl<P: Presentation> Host<P> {
                 Assets {
                     model: c.model,
                     geometry: c.geometry,
-                    avatar: BoundAvatar::restore(index, &c.skeleton, id as u64, &c.binding)?,
+                    avatar: BoundAvatar::restore_with_startup(
+                        &index_owner,
+                        &c.skeleton,
+                        id as u64,
+                        &c.binding,
+                        Some(&mut startup),
+                    )?,
                     appearance_owner: c.appearance_owner,
                 },
             );
         }
         Ok(Self {
             floors: snapshot.floors,
-            index: std::sync::Arc::new(index.clone()),
+            index: index_owner,
+            startup,
             neighborhood_source: snapshot.neighborhood_source,
             initializer_settings: snapshot.initializer_settings,
             fresh,
@@ -577,11 +598,37 @@ impl<P: Presentation> Host<P> {
             .pending_animation_assets(program)
             .map_err(anyhow::Error::msg)?;
         if !names.is_empty() {
-            let report = crate::assets::load_named_native_animations(&self.index, program, &names)?;
+            let native_commands = simulation
+                .pending_native_command_animation_assets(program)
+                .map_err(anyhow::Error::msg)?;
+            let required = simulation
+                .pending_required_animation_assets(program)
+                .map_err(anyhow::Error::msg)?;
+            let report = self.startup.load_native_animations(&self.index, program, &names)?;
+            let mut unresolved = Vec::new();
+            for name in &report.unresolved {
+                if native_commands.contains(name)
+                    && !required.contains(name)
+                    && let Some(proof) = report.confirmed_absent.get(name)
+                {
+                    if let Some(previous) = program.native_animation_absences.get(name) {
+                        ensure!(
+                            previous == proof,
+                            "native animation absence proof changed during live session: {name}"
+                        );
+                    } else {
+                        program
+                            .native_animation_absences
+                            .insert(name.clone(), proof.clone());
+                    }
+                } else {
+                    unresolved.push(name.clone());
+                }
+            }
             ensure!(
-                report.unresolved.is_empty(),
+                unresolved.is_empty(),
                 "unresolved live animation assets: {:?}",
-                report.unresolved
+                unresolved
             );
             completed += names.len();
         }

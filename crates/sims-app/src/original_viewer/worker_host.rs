@@ -1,10 +1,28 @@
 //! Iced shell around the unchanged synchronous household owner. Only one
 //! engine update runs at a time. Frames keep painting the last publication;
 //! they do not enqueue extra simulation work while that update is executing.
-use super::owned_worker::{Owner, SubmitError, Worker};
+use super::super::support::window_session;
+use super::owned_worker::{Owner, SubmitError, Ticket, Worker};
 use super::ui_publication::{Published, view::Frontend};
 use super::*;
 use std::collections::VecDeque;
+
+#[path = "worker_host/save_feedback.rs"]
+mod save_feedback;
+use save_feedback::SaveFeedback;
+
+#[path = "worker_host/render_scene.rs"]
+mod render_scene;
+use render_scene::RenderScene;
+
+fn observed_subscription_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    id: window::Id,
+) -> Option<Message> {
+    window_session::input(&event);
+    subscription_event(event, status, id)
+}
 
 #[derive(Debug, Clone)]
 pub(super) enum Event {
@@ -42,6 +60,8 @@ struct Work {
     message: Message,
     shell: Shell,
     popup: Option<PopupSource>,
+    queued_at: Option<Instant>,
+    save_request: Option<u64>,
     #[cfg(test)]
     gate: Option<TestGate>,
 }
@@ -49,9 +69,11 @@ struct Work {
 struct TestGate {
     started: std::sync::mpsc::SyncSender<()>,
     resume: std::sync::mpsc::Receiver<()>,
+    disconnect: bool,
 }
 struct Engine {
     viewer: Box<Viewer>,
+    render_scene: std::cell::RefCell<RenderScene>,
     popup: Option<sims_runtime::original_session::live_menu::State>,
     popup_epoch: u64,
     #[cfg(test)]
@@ -75,6 +97,7 @@ impl Engine {
             .and_then(|s| s.host.presentation.live_menu.clone());
         Self {
             viewer: Box::new(viewer),
+            render_scene: Default::default(),
             popup,
             popup_epoch: 0,
             #[cfg(test)]
@@ -97,20 +120,29 @@ impl Engine {
             publication.journey_object.as_mut(),
         ) {
             let (vm, route, visit) = match (
-                self.object_progress_fixture.as_ref(), self.viewer.session.as_ref(),
+                self.object_progress_fixture.as_ref(),
+                self.viewer.session.as_ref(),
             ) {
                 (Some(fixture), _) => (&fixture.vm, None, None),
                 (None, Some(session)) => {
                     let simulation = &session.simulation;
-                    let route = simulation.vm.object_threads.get(&native.actor)
+                    let route = simulation
+                        .vm
+                        .object_threads
+                        .get(&native.actor)
                         .and_then(|thread| simulation.routes.get(thread));
                     (&simulation.vm, route, simulation.visit)
                 }
                 (None, None) => return,
             };
-            object.progress = Some(Box::new(super::ui_publication::JourneyObjectProgress::capture(
-                vm, native.actor, route, visit,
-            )));
+            object.progress = Some(Box::new(
+                super::ui_publication::JourneyObjectProgress::capture(
+                    vm,
+                    native.actor,
+                    route,
+                    visit,
+                ),
+            ));
         }
     }
 }
@@ -120,10 +152,26 @@ impl Owner for Engine {
     type Reply = Task<Message>;
     type Published = Published;
     fn apply(&mut self, work: Work) -> std::result::Result<Self::Reply, String> {
+        let _span = window_session::span("worker_apply", || {
+            serde_json::json!({
+                "message":if matches!(&work.message, Message::Loaded(_)) {
+                    "Loaded".into()
+                } else {
+                    format!("{:?}", work.message)
+                },
+                "control_resource":person_panel::control_resource(&work.message)
+                    .or_else(|| game_options::control_resource(&work.message)),
+                "tick":self.viewer.session.as_ref().map(|session| session.simulation.vm.tick),
+                "pending":self.viewer.presentation_pending(),
+                "clock_pending":self.viewer.session.as_ref().is_some_and(Session::clock_pending),
+                "queue_wait_us":work.queued_at.map(|queued| queued.elapsed().as_micros())
+            })
+        });
         #[cfg(test)]
         if let Some(gate) = work.gate {
             gate.started.send(()).map_err(|e| e.to_string())?;
             gate.resume.recv().map_err(|e| e.to_string())?;
+            assert!(!gate.disconnect, "intentional test owner disconnect");
         }
         // These two flags belong exclusively to the replacement shell. The
         // native handler sees their exact value before its next ordinary call.
@@ -169,7 +217,12 @@ impl Owner for Engine {
         Ok(reply)
     }
     fn publish(&self) -> std::result::Result<Published, String> {
+        let _span = window_session::span("publication_capture", || serde_json::Value::Null);
         let mut publication = Published::capture(&self.viewer);
+        publication.render_scene = self
+            .render_scene
+            .borrow_mut()
+            .capture(publication.scene.as_ref());
         #[cfg(test)]
         if let Some(fixture) = self.object_progress_fixture.as_ref() {
             publication = fixture.publication.clone();
@@ -213,6 +266,7 @@ pub(super) struct Host {
     close_sent: bool,
     shell_revision: u64,
     application_confirmation: Option<neighborhood_usability::Confirmation>,
+    save_feedback: SaveFeedback,
     #[cfg(test)]
     next_gate: Option<TestGate>,
 }
@@ -299,6 +353,7 @@ impl Host {
                         close_sent: false,
                         shell_revision: 0,
                         application_confirmation: None,
+                        save_feedback: SaveFeedback::default(),
                         #[cfg(test)]
                         next_gate: None,
                     },
@@ -327,6 +382,7 @@ impl Host {
                         close_sent: false,
                         shell_revision: 0,
                         application_confirmation: None,
+                        save_feedback: SaveFeedback::default(),
                         #[cfg(test)]
                         next_gate: None,
                     },
@@ -345,14 +401,40 @@ impl Host {
             revision: self.shell_revision,
         }
     }
+    fn transport_waiting(&self) -> bool {
+        self.closing.is_none()
+            && !self.close_sent
+            && !self.replacing
+            && self.application_confirmation.is_none()
+            && self.frontend.error.is_none()
+            && self.frontend.native_transport
+            && self.frontend.pending
+            && !self.frontend.modal
+            && self.queued.front().is_some_and(|next| {
+                next.generation == self.generation()
+                    && matches!(next.work.message, Message::Toggle | Message::NativeSpeed(_))
+            })
+    }
     fn poll(&mut self) -> Task<Event> {
         let Some(worker) = &mut self.worker else {
             return Task::none();
         };
         match worker.poll() {
             Ok(Some(completion)) => {
+                if window_session::enabled() {
+                    window_session::emit(
+                        "worker_complete",
+                        serde_json::json!({
+                            "generation":completion.ticket.generation,
+                            "serial":completion.ticket.serial,
+                            "quarantined":completion.quarantined,
+                            "queued":self.queued.len()
+                        }),
+                    );
+                }
                 let changed_generation = completion.generation != completion.ticket.generation;
                 self.frontend.data = worker.published().clone();
+                self.save_feedback.complete(completion.ticket);
                 // Loading a new owner also ends presses in the old widget
                 // tree. This shell-only fence never changes the native/save
                 // widget epoch or any gameplay owner.
@@ -362,6 +444,7 @@ impl Host {
                     .widget_epoch
                     .wrapping_add(completion.generation);
                 if changed_generation {
+                    self.save_feedback.replaced();
                     self.application_confirmation = None;
                     // Input created by the previous world cannot be replayed on
                     // reused native IDs after Load/Restart.
@@ -392,6 +475,7 @@ impl Host {
             }
             Ok(None) => Task::none(),
             Err(error) => {
+                self.save_feedback.disconnected();
                 self.error = Some(format!("Household worker disconnected: {error}"));
                 Task::none()
             }
@@ -402,6 +486,7 @@ impl Host {
     }
     fn enqueue_origin(&mut self, generation: u64, message: Message, popup: Option<PopupSource>) {
         let shell = self.shell();
+        let drain_transport = matches!(message, Message::Frame(_)) && self.transport_waiting();
         // This is the existing consecutive-Motion coalescing rule, applied
         // before dispatch only when no enter/leave/button/shell boundary lies
         // between the motions. No completed engine call is coalesced.
@@ -413,26 +498,46 @@ impl Host {
             && matches!(last.work.message, Message::ViewportMotion { .. })
         {
             last.work.message = message;
+            last.work.queued_at = window_session::enabled().then(Instant::now);
             return;
         }
-        if self.queued.len() == 256 {
+        if self.queued.len() >= 256 && !drain_transport {
             self.error =
                 Some("Household input queue is full; no input was executed out of order.".into());
             return;
         }
-        self.queued.push_back(Queued {
+        let save_request = if matches!(message, Message::Save | Message::GameOptionsSave(_)) {
+            if generation != self.generation() {
+                return;
+            }
+            let Some(request) = self.save_feedback.accept() else {
+                self.error = Some("Household Save request counter exhausted.".into());
+                return;
+            };
+            Some(request)
+        } else {
+            None
+        };
+        let queued = Queued {
             generation,
             work: Work {
                 message,
                 shell,
                 popup,
+                queued_at: window_session::enabled().then(Instant::now),
+                save_request,
                 #[cfg(test)]
                 gate: self.next_gate.take(),
             },
-        });
+        };
+        if drain_transport {
+            self.queued.push_front(queued);
+        } else {
+            self.queued.push_back(queued);
+        }
     }
     fn pump(&mut self) -> Task<Event> {
-        if self.error.is_some() {
+        if self.error.is_some() || self.transport_waiting() {
             return Task::none();
         }
         let Some(worker) = &mut self.worker else {
@@ -446,13 +551,33 @@ impl Host {
                 continue;
             }
             let (sender, receiver) = iced::futures::channel::oneshot::channel();
+            let label = window_session::enabled().then(|| {
+                if matches!(&next.work.message, Message::Loaded(_)) {
+                    "Loaded".into()
+                } else {
+                    format!("{:?}", next.work.message)
+                }
+            });
+            let save_request = next.work.save_request;
             match worker.submit_notifying(
                 next.work,
                 Some(Box::new(move || {
                     let _ = sender.send(());
                 })),
             ) {
-                Ok(_) => {
+                Ok(ticket) => {
+                    if let Some(request) = save_request {
+                        self.save_feedback.submit(request, ticket);
+                    }
+                    if let Some(label) = label {
+                        window_session::emit(
+                            "worker_submit",
+                            serde_json::json!({
+                                "generation":ticket.generation,"serial":ticket.serial,
+                                "message":label,"queued":self.queued.len()
+                            }),
+                        );
+                    }
                     return Task::perform(
                         async move {
                             let _ = receiver.await;
@@ -481,6 +606,16 @@ impl Host {
         Task::none()
     }
     pub fn update(&mut self, event: Event) -> Task<Event> {
+        if window_session::enabled() {
+            let label = match &event {
+                Event::Effect {
+                    message: Message::Loaded(_),
+                    ..
+                } => "Loaded".into(),
+                _ => format!("{event:?}"),
+            };
+            window_session::emit("dispatch", serde_json::json!({"event":label}));
+        }
         let task = self.poll();
         let (generation, message, effect, popup) = match event {
             Event::Close(id) => {
@@ -508,7 +643,7 @@ impl Host {
                     && !self.close_sent
                     && !self.replacing
                     && self.application_confirmation.is_none()
-                    && self.queued.is_empty()
+                    && (self.queued.is_empty() || self.transport_waiting())
                     && self.worker.as_ref().is_some_and(|w| !w.busy())
                 {
                     self.enqueue(self.generation(), Message::Frame(now));
@@ -614,6 +749,7 @@ impl Host {
         }
         if let Some(id) = self.closing.take() {
             self.close_sent = true;
+            window_session::finish();
             window::close(id)
         } else {
             Task::none()
@@ -636,7 +772,12 @@ impl Host {
                 message,
                 popup: popup.clone(),
             });
-        if let Some(error) = self
+        if let Some(error) = self.error.as_deref()
+            && window_session::enabled()
+        {
+            window_session::emit("host_error", serde_json::json!({"error":error}));
+        }
+        let view = if let Some(error) = self
             .error
             .as_deref()
             .or_else(|| self.closing.map(|_| "Closing…"))
@@ -651,13 +792,61 @@ impl Host {
             .into()
         } else {
             view
-        }
+        };
+        let view = if self.saving() {
+            widget::stack![
+                view,
+                container(
+                    text("Saving household…")
+                        .size(14)
+                        .color(Color::from_rgb8(0, 235, 235))
+                )
+                .width(Fill)
+                .height(Fill)
+                .align_x(iced::alignment::Horizontal::Right)
+                .align_y(iced::alignment::Vertical::Top)
+                .padding(12)
+            ]
+            .into()
+        } else {
+            view
+        };
+        let observation = self
+            .frontend
+            .window_observation
+            .as_ref()
+            .and_then(|observation| {
+                let mut value = observation.as_ref().clone();
+                value["shell"] = serde_json::json!({
+                    "revision": self.shell_revision,
+                    "generation": self.generation(),
+                    "options": self.frontend.options_open,
+                    "diagnostics": self.frontend.diagnostics,
+                    "confirmation": self.application_confirmation.is_some(),
+                    "widget_epoch": self.frontend.widget_epoch,
+                    "popup_epoch": self.frontend.data.native_popup_epoch,
+                    "replacing": self.replacing,
+                    "closing": self.closing.is_some(),
+                    "error": self.error,
+                    "save": self.save_feedback.observation(self.saving())
+                });
+                value["worker_busy"] = self.worker.as_ref().is_some_and(Worker::busy).into();
+                window_session::state(value)
+            });
+        window_session::observe(view, observation)
+    }
+    fn saving(&self) -> bool {
+        self.save_feedback.in_flight()
+            || (self.error.is_none()
+                && self.queued.iter().any(|queued| {
+                    queued.generation == self.generation() && queued.work.save_request.is_some()
+                }))
     }
     pub fn subscription(&self) -> iced::Subscription<Event> {
         iced::Subscription::batch([
             window::frames().map(Event::Frame),
             window::close_requests().map(Event::Close),
-            iced::event::listen_with(subscription_event)
+            iced::event::listen_with(observed_subscription_event)
                 .with(self.generation())
                 .map(|(generation, message)| Event::Widget {
                     generation,
@@ -689,6 +878,7 @@ impl Host {
             close_sent: false,
             shell_revision: 0,
             application_confirmation: None,
+            save_feedback: SaveFeedback::default(),
             next_gate: None,
         }
     }
@@ -749,6 +939,7 @@ impl Host {
             close_sent: false,
             shell_revision: 0,
             application_confirmation: None,
+            save_feedback: SaveFeedback::default(),
             next_gate: None,
         }
     }
@@ -822,6 +1013,7 @@ impl Host {
         self.next_gate = Some(TestGate {
             started,
             resume: release,
+            disconnect: false,
         });
         (entered, resume)
     }

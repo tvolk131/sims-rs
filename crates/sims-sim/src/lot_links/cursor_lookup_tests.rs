@@ -539,3 +539,88 @@ fn long_ancestry_and_inactive_backing_heads_remain_separate() {
         Err("object occurs in multiple native tile chains".into())
     );
 }
+
+#[test]
+fn borrowed_ancestry_words_preserve_predecessor_before_slot_failures() {
+    for (predecessor, expected) in [
+        (None, "native physical link word absent"),
+        (Some(0), "physical iterator lost its predecessor"),
+        (Some(-2), "physical iterator lost its predecessor"),
+        (Some(99), "physical iterator lost its predecessor"),
+        (Some(1), "native physical link word absent"),
+    ] {
+        let (links, mut world) = fixture();
+        let child = world.objects.get_mut(&2).unwrap();
+        child.data.remove(&14);
+        child.data.remove(&26);
+        if let Some(predecessor) = predecessor {
+            child.data.insert(26, predecessor);
+        }
+        let (result, cursor) = check(
+            &format!("predecessor {predecessor:?}, missing slot"),
+            &links,
+            &world,
+            Cursor {
+                root: 1,
+                current: Some(2),
+            },
+        );
+        assert_eq!(result, Err(expected.into()));
+        assert_eq!(cursor.current, None);
+    }
+}
+
+#[test]
+fn borrowed_ancestry_words_preserve_resumed_slot_sentinel_order() {
+    for (physical_slot, expected, next) in [
+        (-2, Err("physical iterator has a negative slot".into()), None),
+        (-1, Err("native sentinel link absent".into()), None),
+        (0, Ok(()), Some(3)),
+        (1, Ok(()), Some(5)),
+        (i16::MAX, Ok(()), None),
+    ] {
+        let (mut links, mut world) = fixture();
+        links.next.remove(&1);
+        world
+            .objects
+            .get_mut(&2)
+            .unwrap()
+            .data
+            .insert(14, physical_slot);
+        let (result, cursor) = check(
+            &format!("resumed physical slot {physical_slot}"),
+            &links,
+            &world,
+            Cursor {
+                root: 1,
+                current: Some(2),
+            },
+        );
+        assert_eq!(result, expected);
+        assert_eq!(cursor.current, next);
+    }
+}
+
+#[test]
+fn borrowed_ancestry_failure_precedes_duplicate_and_registry_checks_without_publication() {
+    let (mut links, mut world) = fixture();
+    links.heads[0][15] = 1;
+    world.objects.get_mut(&2).unwrap().data.remove(&26);
+    for missing_registry in [false, true] {
+        let mut candidate = world.clone();
+        if missing_registry {
+            candidate.person = None;
+        } else {
+            candidate.person.as_mut().unwrap().tile_chains = vec![vec![17]];
+        }
+        let expected = Err("native physical link word absent".into());
+        assert_eq!(links.validate_tile_chains(&candidate), expected);
+        assert_eq!(
+            links.validate_tile_chains(&candidate),
+            reference_validate(&links, &candidate)
+        );
+        let before = candidate.clone();
+        assert_eq!(links.publish_tile_chains(&mut candidate), expected);
+        assert_eq!(candidate, before);
+    }
+}

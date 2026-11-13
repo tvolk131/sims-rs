@@ -64,6 +64,10 @@ pub fn primitive(opcode: u16) -> PrimitiveSupport {
         _ => "unidentified/unassigned",
     };
     let (rust_support, limits) = match opcode {
+        33 => (
+            "partial",
+            "statically recovered synchronous executor/stack-person selection, raw motive ranking with native shortsort ties, and five caller temporaries; accepted operand words and native error order retained; isolated original-handler parity not executed",
+        ),
         34 => (
             "partial",
             "native operand reads, ordered synchronous control/portrait/relationship calls, recursive widget lookup and highlight placement compared in 1894 cases; saved host boundaries and original tutorial control bindings; positive portrait/relationship hosts, application wait-event delivery and highlight animation remain unsupported",

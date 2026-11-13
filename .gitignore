@@ -29,6 +29,9 @@
 !/docs/legal-and-provenance.md
 !/docs/dependency-licenses.md
 !/docs/repository-workflow.md
+!/docs/native-window-session-20261103.md
+!/docs/performance-preview.md
+!/docs/playable-alpha.md
 
 # Local credentials and environment overrides
 .env

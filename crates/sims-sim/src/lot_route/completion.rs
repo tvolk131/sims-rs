@@ -33,6 +33,9 @@ pub trait Services {
     fn update_movement(&mut self) -> Result<(), String>;
     fn depth(&self) -> usize;
     fn finish(&mut self, success: bool) -> Result<(), String>;
+    fn finish_with_result(&mut self, success: bool, _result: i32) -> Result<(), String> {
+        self.finish(success)
+    }
 }
 impl Completion {
     pub fn new(success: bool, result: i32) -> Self {
@@ -114,7 +117,7 @@ impl Completion {
                         h.set_person(39, 1)?;
                     }
                     h.set_data(9, 0)?;
-                    h.finish(self.success)?;
+                    h.finish_with_result(self.success, self.result)?;
                     self.phase = Phase::Done;
                 }
                 Phase::Done => return Ok(true),
@@ -353,6 +356,28 @@ impl Services for Host<'_> {
             self.thread,
             format!("original-lot native route cleanup completed: {success}"),
         );
+        Ok(())
+    }
+    fn finish_with_result(&mut self, success: bool, result: i32) -> Result<(), String> {
+        let event = self.s.vm.route_terminal_observations().enabled().then(|| {
+            let owner = self.s.vm.native_route_action_owner(self.thread, self.request);
+            crate::observations::NativeRouteTerminalEvent {
+                actor: self.request.caller,
+                target: self.request.target,
+                request: self.request.id,
+                thread: self.thread,
+                action_serial: owner.map(|owner| owner.0),
+                action_invocation: owner.map(|owner| owner.1),
+                tick: self.s.vm.tick,
+                success,
+                native_result: result,
+                endpoint: self.s.vm.world.positions.get(&self.request.caller).copied(),
+            }
+        });
+        self.finish(success)?;
+        if let Some(event) = event {
+            self.s.vm.record_native_route_terminal(event);
+        }
         Ok(())
     }
 }

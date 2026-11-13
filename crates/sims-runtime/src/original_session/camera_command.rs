@@ -22,6 +22,34 @@ pub struct State {
     broadcast: Option<camera::Service>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     people: Option<person_refresh::Cursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    walls: Option<Walls>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    portrait: Option<Portrait>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Walls {
+    mode: u32,
+    next: u8,
+    roof: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum Portrait {
+    Center { point: [i32; 2], level: i32 },
+    Roof,
+}
+impl Portrait {
+    fn request(&self) -> sims_sim::lot_presenter::open::Request {
+        match *self {
+            Self::Center { point, level } => {
+                sims_sim::lot_presenter::open::Request::CenterPerson { point, level }
+            }
+            Self::Roof => sims_sim::lot_presenter::open::Request::Roof {
+                enabled: 0,
+                force: 0,
+            },
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
@@ -40,6 +68,8 @@ pub enum Change {
     Rotation(u32),
     Floor(i32),
     Scroll([i32; 2]),
+    CenterPerson { point: [i32; 2], level: i32 },
+    MotionFrame,
 }
 impl super::View {
     /// CPState+0d aliases the second byte of the shared dirty word at+0c.
@@ -82,6 +112,8 @@ impl State {
             camera: None,
             broadcast: None,
             people: None,
+            walls: None,
+            portrait: None,
         })
     }
     pub(super) fn publication_owner(&self) -> Option<u64> {
@@ -93,7 +125,7 @@ impl State {
         Ok(())
     }
     pub fn complete(&self) -> bool {
-        self.setter.complete()
+        self.setter.complete() && self.walls.is_none() && self.portrait.is_none()
     }
     pub fn pending_camera(&self) -> Option<&camera::Service> {
         self.camera.as_ref().and_then(camera::Cursor::pending)
@@ -103,8 +135,59 @@ impl State {
             .as_ref()
             .and_then(person_refresh::Cursor::pending)
     }
+    pub fn uses_frontend_clock(&self) -> bool {
+        self.portrait.is_some()
+            || self.setter.request()
+                == Some(&Request::Camera(sims_sim::lot_presenter::open::Request::MotionFrame))
+    }
+    fn advance_portrait_tail(&mut self) -> Result<bool> {
+        ensure!(
+            self.setter.complete()
+                && self.camera.is_none()
+                && self.broadcast.is_none()
+                && self.people.is_none(),
+            "portrait camera child has not returned"
+        );
+        if matches!(self.portrait, Some(Portrait::Center { .. })) {
+            let next = Portrait::Roof;
+            self.setter = Zoom::publication(next.request()).map_err(anyhow::Error::msg)?;
+            self.portrait = Some(next);
+            return Ok(true);
+        }
+        self.portrait = None;
+        Ok(false)
+    }
     pub fn validate(&self, session: &Session) -> Result<()> {
         self.setter.validate().map_err(anyhow::Error::msg)?;
+        if let Some(portrait) = &self.portrait {
+            ensure!(
+                self.publication.is_none()
+                    && self.walls.is_none()
+                    && self.setter.direct()
+                    && (self.setter.complete()
+                        || self.setter.request() == Some(&Request::Camera(portrait.request()))),
+                "portrait camera lost its native caller"
+            );
+            ensure!(
+                session
+                    .host
+                    .presentation
+                    .presenter
+                    .as_ref()
+                    .and_then(|presenter| presenter.camera.as_ref())
+                    .is_some_and(|camera| camera.settings.roof.is_some()),
+                "portrait camera roof owner absent"
+            );
+        }
+        if let Some(walls) = &self.walls {
+            ensure!(
+                self.publication.is_none()
+                    && self.setter.direct()
+                    && matches!(walls.mode, 1 | 2 | 4)
+                    && (1..=3).contains(&walls.next),
+                "wall camera command lost its native children"
+            );
+        }
         if let Some(owner) = self.publication {
             ensure!(
                 self.setter.direct(),
@@ -167,6 +250,25 @@ impl State {
                 .map_err(anyhow::Error::msg)?;
         }
         if let Some(Request::Camera(request)) = self.setter.request() {
+            if let sims_sim::lot_presenter::open::Request::CenterPerson { point, level } = request {
+                ensure!(
+                    self.portrait
+                        == Some(Portrait::Center {
+                            point: *point,
+                            level: *level,
+                        }),
+                    "portrait centering request lost its caller"
+                );
+            }
+            if matches!(request, sims_sim::lot_presenter::open::Request::MotionFrame) {
+                ensure!(
+                    self.publication.is_none()
+                        && self.walls.is_none()
+                        && self.portrait.is_none()
+                        && self.setter.direct(),
+                    "camera motion frame has another caller"
+                );
+            }
             if matches!(
                 request,
                 sims_sim::lot_presenter::open::Request::WallsDown(_)
@@ -174,7 +276,9 @@ impl State {
                     | sims_sim::lot_presenter::open::Request::Roof { .. }
             ) {
                 ensure!(
-                    self.publication.is_some(),
+                    self.publication.is_some()
+                        || self.walls.is_some()
+                        || self.portrait == Some(Portrait::Roof),
                     "wall camera lost its publication caller"
                 );
             }
@@ -193,6 +297,8 @@ impl State {
                         level: 1..=2,
                         force: 0
                     } | sims_sim::lot_presenter::open::Request::Scroll { immediate: 1, .. }
+                        | sims_sim::lot_presenter::open::Request::CenterPerson { level: 1..=2, .. }
+                        | sims_sim::lot_presenter::open::Request::MotionFrame
                         | sims_sim::lot_presenter::open::Request::WallsDown(_)
                         | sims_sim::lot_presenter::open::Request::Cutaway(_)
                         | sims_sim::lot_presenter::open::Request::Roof { force: 0, .. }
@@ -247,6 +353,20 @@ impl Session {
             .as_ref()
             .is_some_and(|c| !c.complete())
     }
+    pub fn camera_motion_active(&self) -> bool {
+        self.host
+            .presentation
+            .presenter
+            .as_ref()
+            .is_some_and(|presenter| {
+                presenter.camera.as_ref().is_some_and(|camera| {
+                    camera.settings.motion.active != 0
+                        || (camera.settings.moving != 0
+                            && camera.settings.camera_mode == 1
+                            && camera.settings.locked == 0)
+                }) || presenter.view.pending != [0, 0]
+            })
+    }
     /// Bind the frontend's actual property state after constructing its controls.
     pub fn bind_camera_ui(&mut self, ui: Ui) -> Result<()> {
         ensure!(
@@ -263,6 +383,102 @@ impl Session {
         self.begin_camera_change(Change::Zoom(zoom), deferred)
     }
     pub fn begin_camera_change(&mut self, change: Change, deferred: u32) -> Result<()> {
+        self.ensure_camera_input_idle()?;
+        ensure!(
+            match change {
+                Change::Zoom(n) => (1..=3).contains(&n),
+                Change::Rotation(n) => n <= 3,
+                Change::Floor(n) => (0..=2).contains(&n),
+                Change::CenterPerson { level, .. } => (1..=2).contains(&level),
+                Change::Scroll(_) | Change::ZoomIn | Change::ZoomOut | Change::MotionFrame => true,
+            },
+            "camera change outside initialized original view"
+        );
+        let p = self
+            .host
+            .presentation
+            .presenter
+            .as_ref()
+            .context("camera command presenter absent")?;
+        p.validate_simulation(&self.simulation)
+            .map_err(anyhow::Error::msg)?;
+        ensure!(
+            p.camera.is_some() && self.host.presentation.notifications.is_some(),
+            "camera command native context absent"
+        );
+        if matches!(change, Change::CenterPerson { .. }) {
+            ensure!(
+                p.camera.as_ref().unwrap().settings.roof.is_some(),
+                "portrait camera roof owner absent"
+            );
+        }
+        let house = self.house.number as i16;
+        let setter = self
+            .host
+            .presentation
+            .edit_camera_properties(|ui| match change {
+                Change::Zoom(n) => Zoom::begin(ui, n, deferred),
+                Change::ZoomIn => Zoom::step(ui, true, house, deferred),
+                Change::ZoomOut => Zoom::step(ui, false, house, deferred),
+                Change::Rotation(n) => Zoom::rotation(ui, n, deferred),
+                Change::Floor(n) => Zoom::floor(ui, n, deferred),
+                Change::Scroll(position) => Zoom::scroll(position),
+                Change::CenterPerson { point, level } => Zoom::center_person(point, level),
+                Change::MotionFrame => Zoom::motion_frame(),
+            })?;
+        self.host.presentation.camera_command = Some(State {
+            publication: None,
+            tick: self.simulation.vm.tick,
+            setter,
+            camera: None,
+            broadcast: None,
+            people: None,
+            walls: None,
+            portrait: match change {
+                Change::CenterPerson { point, level } => Some(Portrait::Center { point, level }),
+                _ => None,
+            },
+        });
+        Ok(())
+    }
+    pub(super) fn begin_unbound_walls_change(&mut self, walls: u32) -> Result<()> {
+        let presenter = self
+            .host
+            .presentation
+            .presenter
+            .as_ref()
+            .context("wall camera presenter absent")?;
+        presenter
+            .validate_simulation(&self.simulation)
+            .map_err(anyhow::Error::msg)?;
+        let camera = presenter
+            .camera
+            .as_ref()
+            .context("wall camera context absent")?;
+        ensure!(
+            self.host.presentation.notifications.is_some(),
+            "wall camera listeners absent"
+        );
+        self.host.presentation.camera_command = Some(State {
+            publication: None,
+            tick: self.simulation.vm.tick,
+            setter: Zoom::publication(sims_sim::lot_presenter::open::Request::WallsDown(u8::from(
+                walls == 2,
+            )))
+            .map_err(anyhow::Error::msg)?,
+            camera: None,
+            broadcast: None,
+            people: None,
+            walls: Some(Walls {
+                mode: walls,
+                next: 1,
+                roof: camera.settings.roof.is_some(),
+            }),
+            portrait: None,
+        });
+        Ok(())
+    }
+    pub(super) fn ensure_camera_input_idle(&self) -> Result<()> {
         ensure!(
             !self.player_input_pending(),
             "player input owns the live UI"
@@ -290,50 +506,9 @@ impl Session {
                     .vm
                     .threads
                     .values()
-                    .any(|t| matches!(t.status, sims_vm::Status::AwaitingUiEffect(_))),
+                    .any(|thread| matches!(thread.status, sims_vm::Status::AwaitingUiEffect(_))),
             "presentation callback must finish before camera command"
         );
-        ensure!(
-            match change {
-                Change::Zoom(n) => (1..=3).contains(&n),
-                Change::Rotation(n) => n <= 3,
-                Change::Floor(n) => (0..=2).contains(&n),
-                Change::Scroll(_) | Change::ZoomIn | Change::ZoomOut => true,
-            },
-            "camera change outside initialized original view"
-        );
-        let p = self
-            .host
-            .presentation
-            .presenter
-            .as_ref()
-            .context("camera command presenter absent")?;
-        p.validate_simulation(&self.simulation)
-            .map_err(anyhow::Error::msg)?;
-        ensure!(
-            p.camera.is_some() && self.host.presentation.notifications.is_some(),
-            "camera command native context absent"
-        );
-        let house = self.house.number as i16;
-        let setter = self
-            .host
-            .presentation
-            .edit_camera_properties(|ui| match change {
-                Change::Zoom(n) => Zoom::begin(ui, n, deferred),
-                Change::ZoomIn => Zoom::step(ui, true, house, deferred),
-                Change::ZoomOut => Zoom::step(ui, false, house, deferred),
-                Change::Rotation(n) => Zoom::rotation(ui, n, deferred),
-                Change::Floor(n) => Zoom::floor(ui, n, deferred),
-                Change::Scroll(position) => Zoom::scroll(position),
-            })?;
-        self.host.presentation.camera_command = Some(State {
-            publication: None,
-            tick: self.simulation.vm.tick,
-            setter,
-            camera: None,
-            broadcast: None,
-            people: None,
-        });
         Ok(())
     }
     fn publish_command_view(&mut self) -> Result<()> {
@@ -388,6 +563,12 @@ impl Session {
             request,
             camera::Service::Transition(transition::Request::SynchronizeRenderer)
                 | camera::Service::Scroll(_)
+                | camera::Service::MotionFrame(
+                    sims_sim::lot_presenter::motion::frame::Request::Synchronize
+                )
+                | camera::Service::Displacement(
+                    sims_sim::lot_presenter::motion::frame::displacement::Request::Synchronize
+                )
         ) {
             Some(self.retained_camera_input()?)
         } else {
@@ -596,6 +777,27 @@ impl Session {
                 continue;
             }
             let Some(request) = state.setter.request().cloned() else {
+                if state.advance_portrait_tail()? {
+                    continue;
+                }
+                if let Some(walls) = &mut state.walls {
+                    let request = match walls.next {
+                        1 => sims_sim::lot_presenter::open::Request::Cutaway(u8::from(
+                            walls.mode == 4,
+                        )),
+                        2 if walls.roof => sims_sim::lot_presenter::open::Request::Roof {
+                            enabled: 0,
+                            force: 0,
+                        },
+                        _ => {
+                            state.walls = None;
+                            return Ok(Progress::Complete);
+                        }
+                    };
+                    walls.next += 1;
+                    state.setter = Zoom::publication(request).map_err(anyhow::Error::msg)?;
+                    continue;
+                }
                 return Ok(Progress::Complete);
             };
             let Request::Camera(request) = request else {
@@ -717,5 +919,64 @@ impl Session {
         } else {
             Progress::Pending
         })
+    }
+}
+
+#[cfg(test)]
+mod portrait_tests {
+    use super::*;
+
+    fn center() -> State {
+        State {
+            publication: None,
+            tick: 194373,
+            setter: Zoom::center_person([616, 440], 1),
+            camera: None,
+            broadcast: None,
+            people: None,
+            walls: None,
+            portrait: Some(Portrait::Center {
+                point: [616, 440],
+                level: 1,
+            }),
+        }
+    }
+
+    #[test]
+    fn portrait_camera_retains_native_roof_tail_after_completed_center_restore() -> Result<()> {
+        let mut state = center();
+        assert!(state.uses_frontend_clock());
+        assert!(!state.complete());
+        let request = Request::Camera(state.portrait.as_ref().unwrap().request());
+        assert_eq!(state.setter.request(), Some(&request));
+        state.setter.acknowledge(&request).map_err(anyhow::Error::msg)?;
+        state = serde_json::from_slice(&serde_json::to_vec(&state)?)?;
+        assert!(!state.complete());
+        assert!(state.advance_portrait_tail()?);
+        assert_eq!(state.portrait, Some(Portrait::Roof));
+        assert!(state.uses_frontend_clock());
+        let roof = Request::Camera(Portrait::Roof.request());
+        assert_eq!(state.setter.request(), Some(&roof));
+        state.setter.acknowledge(&roof).map_err(anyhow::Error::msg)?;
+        state = serde_json::from_slice(&serde_json::to_vec(&state)?)?;
+        assert!(!state.complete());
+        assert!(!state.advance_portrait_tail()?);
+        assert!(state.complete());
+        assert!(!state.uses_frontend_clock());
+        assert!(!state.advance_portrait_tail()?);
+        assert!(state.complete());
+        Ok(())
+    }
+
+    #[test]
+    fn portrait_camera_cannot_skip_its_unfinished_native_child() -> Result<()> {
+        let mut state = center();
+        let before = serde_json::to_vec(&state)?;
+        assert_eq!(
+            state.advance_portrait_tail().unwrap_err().to_string(),
+            "portrait camera child has not returned"
+        );
+        assert_eq!(serde_json::to_vec(&state)?, before);
+        Ok(())
     }
 }

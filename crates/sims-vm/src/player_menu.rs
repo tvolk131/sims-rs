@@ -1,8 +1,8 @@
 //! Ordinary residential player menus: 4582ad/45859c/458705/458319/4582dd.
 //! Checks use the person's existing frame arena and live world. The caller owns
 //! the paused UI operation; a diagnostic budget never advances household time.
-//! Person joins remain an explicit boundary. Dynamic entries belong to the
-//! current check and suppress its ordinary entry even if the check returns false.
+//! Available active-action joins remain an explicit boundary. Dynamic entries
+//! belong to the current check and suppress its ordinary entry even if it fails.
 use crate::{ObjectId, Program, Run, Start, Status, Stop, ThreadId, Vm, action::Action};
 use serde::{Deserialize, Serialize};
 
@@ -264,7 +264,10 @@ impl Vm {
         if matches!(t.status, Status::Faulted(_)) {
             return Err("player-menu actor is faulted".into());
         }
-        if self.world.objects[&target].person.is_some() {
+        if actor != target
+            && self.world.objects[&target].person.is_some()
+            && self.autonomy_join_target(p, target)?.is_some()
+        {
             return Err("player-menu person target requires native join enumeration".into());
         }
         let guid = self.world.objects[&target]
@@ -408,6 +411,12 @@ impl Vm {
                 continue;
             }
             if q.next == q.count {
+                if actor != target
+                    && self.world.objects[&target].person.is_some()
+                    && self.autonomy_join_target(p, target)?.is_some()
+                {
+                    return Err("player-menu person target requires native join enumeration".into());
+                }
                 let q = self.player_menu.take().unwrap();
                 return Ok((
                     Some(Completed {

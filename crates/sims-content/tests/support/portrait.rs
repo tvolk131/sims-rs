@@ -76,6 +76,7 @@ pub fn capture(index: &Index, root: &std::path::Path) -> Result<Session> {
             },
             modules: serde_json::from_value(data["program_modules"].clone())?,
             animations: serde_json::from_value(data["program_animations"].clone())?,
+            native_animation_absences: Default::default(),
             // This historical capture predates the optional Sprites.iff
             // dependency; retain its recorded program identity on restore.
             headline_catalog: false,

@@ -149,6 +149,7 @@ fn displayed_modal_guard(base: &Session, family: i16) -> Result<()> {
             job_icon: None,
             bitmap_icon: None,
             global_bitmap_icon: None,
+            guid_icon: None,
             portrait: None,
             status: 0,
         });

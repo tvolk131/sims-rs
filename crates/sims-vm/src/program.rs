@@ -123,6 +123,8 @@ pub struct Program {
     pub globals: String,
     pub modules: BTreeMap<String, Module>,
     pub animations: BTreeMap<String, AnimationAsset>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub native_animation_absences: BTreeMap<String, String>,
 }
 impl Program {
     /// Original 0x004026ed: root revision shifted by 16, plus the revision of
@@ -251,6 +253,13 @@ impl Program {
             }
             hash.update(bytes);
         }
+        if !self.native_animation_absences.is_empty() {
+            hash.update(b"sims-vm/native-animation-absences/v1\0");
+            hash.update(
+                serde_json::to_vec(&self.native_animation_absences)
+                    .expect("native animation absence proofs"),
+            );
+        }
         format!("{:x}", hash.finalize())
     }
     pub fn tuning(&self, owner: &str, address: u16) -> Result<i16, String> {
@@ -312,4 +321,37 @@ pub struct Dependencies {
     pub routines: Vec<String>,
     pub primitives: BTreeSet<u16>,
     pub missing: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_native_animation_absences_preserve_historical_fingerprint() {
+        assert_eq!(
+            Program::default().fingerprint(),
+            "093adb343f177ef80ea0baa7fabd2e4cda0973cf2f67d1d30684acc3131555bc"
+        );
+    }
+
+    #[test]
+    fn native_animation_absence_fingerprint_binds_names_and_inventory() {
+        let historical = Program::default().fingerprint();
+        let mut program = Program {
+            native_animation_absences: [("missing".into(), "a".repeat(64))].into(),
+            ..Default::default()
+        };
+        let original = program.fingerprint();
+        assert_ne!(original, historical);
+        assert_eq!(original, program.clone().fingerprint());
+        program
+            .native_animation_absences
+            .insert("missing".into(), "b".repeat(64));
+        assert_ne!(original, program.fingerprint());
+        program.native_animation_absences = [("other".into(), "a".repeat(64))].into();
+        assert_ne!(original, program.fingerprint());
+        program.native_animation_absences.clear();
+        assert_eq!(historical, program.fingerprint());
+    }
 }

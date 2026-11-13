@@ -276,6 +276,9 @@ impl Simulation {
                 if let Some(loaded) = program.animations.get(&name) {
                     return Ok(Some(&loaded.clip));
                 }
+                if program.native_animation_absences.contains_key(&name) {
+                    return Ok(None);
+                }
                 asset = Some(name);
                 Err("native animation asset needs loading".into())
             },

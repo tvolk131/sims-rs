@@ -113,6 +113,7 @@ impl Raster {
 pub fn template(index: &Index, resource: u16, format: Format) -> Result<Option<Raster>> {
     let name = match resource {
         108 => "CPanel/People/ThumbBack.BMP",
+        4300 => "CPanel/Catalog/ThumbTemplate.bmp",
         4600 => "CPanel/People/PeopleTemplate.bmp",
         4602 => "CPanel/People/WebPeopleTemplate.bmp",
         9000 => "Other/SpeechMedium.bmp",

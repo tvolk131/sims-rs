@@ -1,6 +1,3 @@
-//! The supported Tutorial object's picture-dialog presentation. Original
-//! 4efabc binds PopupInfoTiles3008 as style5;523fe3/524257 size and place its
-//! native-size image, wrapped bitmap-font body, buttons and dismiss widget.
 //! No simulation, lesson progress or dialog result is synthesized.
 use super::*;
 use anyhow::{Result, ensure};
@@ -20,6 +17,9 @@ const FONT: iced::Font = iced::Font {
 const FONT_SIZE: f32 = 18.;
 const LINE_HEIGHT: f32 = 23.;
 const INSET: f32 = 21.; //12px style5 edge plus native9px content inset.
+const TITLE_ROWS: f32 = 2.;
+const TITLE_TOP: f32 = 2.;
+const BUTTON_WIDTH: f32 = 100.;
 
 #[derive(Debug, Clone)]
 pub(super) struct Skin {
@@ -27,6 +27,7 @@ pub(super) struct Skin {
     buttons: Vec<iced::widget::image::Handle>,
     minimize: Vec<iced::widget::image::Handle>,
     font: bitmap_font::Font,
+    title_font: bitmap_font::Font,
 }
 fn named(index: &sims_content::Index, path: &str) -> Result<image::RgbaImage> {
     let loose = format!("UIGraphics/{path}");
@@ -74,7 +75,8 @@ impl Skin {
             "tutorial skin dimensions changed"
         );
         Ok(Self {
-            font: bitmap_font::Font::load(index)?,
+            font: bitmap_font::Font::load(index, "Fonts/variablesans_12.ffn", 23)?,
+            title_font: bitmap_font::Font::load(index, "Fonts/variablesans_14.ffn", 27)?,
             border: (0..9)
                 .map(|n| cell(&back, (n % 3) * 12, (n / 3) * 12, 12, 12))
                 .collect(),
@@ -82,12 +84,27 @@ impl Skin {
             minimize: (0..4).map(|n| cell(&minimize, n * 12, 0, 12, 11)).collect(),
         })
     }
+    #[cfg(test)]
+    pub(super) fn synthetic() -> Self {
+        let solid = |width: u32, height: u32| {
+            iced::widget::image::Handle::from_rgba(
+                width,
+                height,
+                vec![255; (width * height * 4) as usize],
+            )
+        };
+        Self {
+            border: (0..9).map(|_| solid(12, 12)).collect(),
+            buttons: (0..4).map(|_| solid(65, 33)).collect(),
+            minimize: (0..4).map(|_| solid(12, 11)).collect(),
+            font: bitmap_font::Font::synthetic(),
+            title_font: bitmap_font::Font::synthetic(),
+        }
+    }
 }
 
 pub(super) fn supported(record: &Record) -> bool {
     // Presentation::capture only hides titles for caller GUID0xc3249a1d.
-    // Keep this bounded renderer on its verified private Tutorial pictures;
-    // global images, other sources and other dialog families retain fallback.
     let source = record.source.replace('\\', "/");
     source
         .rsplit(['/', ':'])
@@ -115,6 +132,8 @@ struct Plan {
     width: f32,
     lines: Vec<Line>,
     bitmap_text: bool,
+    title: Option<Line>,
+    title_bitmap: bool,
 }
 fn description<'a>(content: &'a str) -> advanced_text::Text<&'a str, iced::Font> {
     advanced_text::Text {
@@ -279,9 +298,10 @@ fn flow_layout(glyphs: &[Glyph], width: f32, exclusion: Size, line_height: f32) 
 struct Flow {
     glyphs: Vec<Glyph>,
     image: Size,
+    title: f32,
 }
 impl Flow {
-    fn new(body: &str, image: Size, font: Option<&bitmap_font::Font>) -> Self {
+    fn new(body: &str, image: Size, font: Option<&bitmap_font::Font>, title: f32) -> Self {
         let space = if font.is_none() {
             measure("a a") - measure("aa")
         } else {
@@ -309,13 +329,24 @@ impl Flow {
                 }
             })
             .collect();
-        Self { glyphs, image }
+        Self {
+            glyphs,
+            image,
+            title,
+        }
+    }
+    fn column(&self) -> f32 {
+        if self.image == Size::ZERO {
+            0.
+        } else {
+            self.image.width + 18.
+        }
     }
     fn at(&self, width: f32) -> (Vec<Line>, f32) {
-        let exclusion = if self.image == Size::ZERO {
+        let exclusion = if self.image == Size::ZERO || self.image.height + 18. <= self.title {
             Size::ZERO
         } else {
-            Size::new(self.image.width + 18., self.image.height + 18.)
+            Size::new(self.image.width + 18., self.image.height + 18. - self.title)
         };
         let plan = flow_layout(&self.glyphs, width, exclusion, LINE_HEIGHT);
         let mut lines = vec![];
@@ -333,12 +364,12 @@ impl Flow {
                 lines.push(Line {
                     text: text.trim_end_matches(['\r', '\n', ' ']).to_owned(),
                     x: block.x,
-                    y: block.y + row as f32 * LINE_HEIGHT,
+                    y: self.title + block.y + row as f32 * LINE_HEIGHT,
                 });
                 offset += n;
             }
         }
-        (lines, plan.height)
+        (lines, self.title + plan.height)
     }
 }
 fn extent(body_width: f32, body_height: f32, primary: bool) -> Size {
@@ -347,9 +378,13 @@ fn extent(body_width: f32, body_height: f32, primary: bool) -> Size {
         INSET + body_height + 18. + if primary { 33. + 9. } else { 0. } + 12.,
     )
 }
-fn choose_width(flow: &Flow, primary: bool, large: bool, max: f32) -> f32 {
+fn choose_width(flow: &Flow, primary: bool, large: bool, max: f32, minimum: f32) -> f32 {
     let target = if large { 1.2 } else { 2. };
-    let min = flow.image.width.max(if primary { 130. } else { 100. });
+    let min = flow
+        .image
+        .width
+        .max(if primary { 130. } else { 100. })
+        .max(minimum);
     let max = max.max(min);
     let ratio = |w: f32| {
         let (_, h) = flow.at(w);
@@ -433,13 +468,18 @@ struct ButtonArt<'a> {
     label: &'a str,
     minimize: bool,
 }
-impl<M> Widget<M, iced::Theme, iced::Renderer> for ButtonArt<'_> {
-    fn size(&self) -> Size<Length> {
-        let size = if self.minimize {
+impl ButtonArt<'_> {
+    fn extent(&self) -> Size {
+        if self.minimize {
             Size::new(12., 11.)
         } else {
-            Size::new(100., 33.)
-        };
+            Size::new(BUTTON_WIDTH.max((measure(self.label) + 24.).ceil()), 33.)
+        }
+    }
+}
+impl<M> Widget<M, iced::Theme, iced::Renderer> for ButtonArt<'_> {
+    fn size(&self) -> Size<Length> {
+        let size = self.extent();
         Size::new(size.width.into(), size.height.into())
     }
     fn layout(
@@ -448,12 +488,8 @@ impl<M> Widget<M, iced::Theme, iced::Renderer> for ButtonArt<'_> {
         _: &iced::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let s = if self.minimize {
-            Size::new(12., 11.)
-        } else {
-            Size::new(100., 33.)
-        };
-        layout::Node::new(limits.resolve(s.width, s.height, s))
+        let size = self.extent();
+        layout::Node::new(limits.resolve(size.width, size.height, size))
     }
     fn draw(
         &self,
@@ -490,6 +526,7 @@ struct Card<'a, M> {
     record: &'a Record,
     skin: &'a Skin,
     picture: Option<(iced::widget::image::Handle, Size)>,
+    primary: bool,
     buttons: Vec<Element<'a, M>>,
 }
 impl<M> Widget<M, iced::Theme, iced::Renderer> for Card<'_, M> {
@@ -521,34 +558,84 @@ impl<M> Widget<M, iced::Theme, iced::Renderer> for Card<'_, M> {
         } else {
             self.record.body.replace("\r\n", "\n")
         };
-        let flow = Flow::new(&body, image, bitmap_text.then_some(&self.skin.font));
-        let primary = self.record.modal();
+        let titled = !self
+            .record
+            .presentation
+            .is_some_and(|presentation| presentation.hide_title);
+        let flow = Flow::new(
+            &body,
+            image,
+            bitmap_text.then_some(&self.skin.font),
+            if titled { LINE_HEIGHT * TITLE_ROWS } else { 0. },
+        );
+        let title = self.record.title.trim();
+        let title = (titled && !title.is_empty()).then_some(title);
+        let title_bitmap = title.is_some_and(|title| self.skin.title_font.supports(title));
+        let title_width = title.map_or(0., |title| {
+            if title_bitmap {
+                self.skin.title_font.width(title)
+            } else {
+                measure(title)
+            }
+        });
+        let primary = self.primary;
+        let nodes = self
+            .buttons
+            .iter_mut()
+            .zip(&mut tree.children)
+            .map(|(button, child_tree)| {
+                button.as_widget_mut().layout(
+                    child_tree,
+                    r,
+                    &layout::Limits::new(Size::ZERO, Size::INFINITE),
+                )
+            })
+            .collect::<Vec<_>>();
+        let occupied = nodes.iter().map(|node| node.size().width).sum::<f32>();
+        let minimum = if primary {
+            (occupied + nodes.len().saturating_sub(1) as f32 * 20.)
+                .max(title.map_or(0., |_| flow.column() + title_width))
+        } else {
+            title.map_or(0., |_| flow.column() + title_width)
+        };
         let width = choose_width(
             &flow,
             primary,
-            self.record.presentation.unwrap().large,
+            self.record
+                .presentation
+                .is_some_and(|presentation| presentation.large),
             limits.max().width - INSET * 2.,
+            minimum,
         );
         let (lines, height) = flow.at(width);
         let size = extent(width, height, primary);
+        let gap = ((width - occupied) / (nodes.len() + 1) as f32).max(0.);
+        let mut next_x = INSET + gap;
         let mut children = vec![];
-        for (button, child_tree) in self.buttons.iter_mut().zip(&mut tree.children) {
-            let node = button.as_widget_mut().layout(
-                child_tree,
-                r,
-                &layout::Limits::new(Size::ZERO, size),
-            );
+        for node in nodes {
             let pos = if primary {
-                Point::new((size.width - node.size().width) / 2., INSET + height + 18.)
+                let pos = Point::new(next_x, INSET + height + 18.);
+                next_x += node.size().width + gap;
+                pos
             } else {
                 Point::new(size.width - node.size().width - 5., 5.)
             };
             children.push(node.move_to(pos));
         }
+        let title = title.map(|title| {
+            let column = flow.column();
+            Line {
+                text: title.to_owned(),
+                x: column + ((width - column - title_width) / 2.).max(0.),
+                y: TITLE_TOP,
+            }
+        });
         *tree.state.downcast_mut::<Plan>() = Plan {
             width: size.width,
             lines,
             bitmap_text,
+            title,
+            title_bitmap,
         };
         layout::Node::with_children(size, children)
     }
@@ -626,6 +713,22 @@ impl<M> Widget<M, iced::Theme, iced::Renderer> for Card<'_, M> {
                 *clip,
             );
         }
+        if let Some(line) = &plan.title {
+            let origin = Point::new(b.x + INSET + line.x, b.y + INSET + line.y);
+            let bounds = Rectangle::new(
+                origin,
+                Size::new(plan.width - INSET * 2. - line.x, LINE_HEIGHT * TITLE_ROWS),
+            );
+            if plan.title_bitmap {
+                if let Some(clip) = clip.intersection(&bounds) {
+                    self.skin.title_font.draw(&line.text, r, origin, clip);
+                }
+            } else {
+                let mut text = description(&line.text).with_content(line.text.clone());
+                text.bounds = bounds.size();
+                r.fill_text(text, origin, Color::from_rgb8(189, 188, 188), *clip);
+            }
+        }
         for line in &plan.lines {
             if plan.bitmap_text {
                 let origin = Point::new(b.x + INSET + line.x, b.y + INSET + line.y);
@@ -652,22 +755,49 @@ impl<M> Widget<M, iced::Theme, iced::Renderer> for Card<'_, M> {
         }
     }
 }
+fn picture(record: &Record, icons: &HudArt) -> Option<(iced::widget::image::Handle, Size)> {
+    let sized = |(width, height, handle): (u32, u32, iced::widget::image::Handle)| {
+        (handle, Size::new(width as f32, height as f32))
+    };
+    if let Some(id) = record.bitmap_icon {
+        return icons
+            .bitmaps
+            .get(&(record.source.clone(), id))
+            .cloned()
+            .flatten()
+            .map(sized);
+    }
+    if let Some(icon) = record.global_bitmap_icon {
+        return icons
+            .global_frames
+            .get(&(icon.id, icon.button_cell))
+            .cloned()
+            .flatten()
+            .map(sized);
+    }
+    if let Some(job) = record.job_icon {
+        let index = if job == -1 { 11 } else { job };
+        return usize::try_from(index)
+            .ok()
+            .and_then(|index| icons.jobs.get(index))
+            .cloned()
+            .map(sized);
+    }
+    let [left, top, right, bottom] = record.portrait.as_ref()?.rect;
+    icons.portraits.get(&record.id).cloned().map(|handle| {
+        (
+            handle,
+            Size::new((right - left) as f32, (bottom - top) as f32),
+        )
+    })
+}
 pub(super) fn view<'a, M: Clone + 'a>(
     record: &'a Record,
     icons: &'a HudArt,
     response: impl Fn(u64, u32) -> M,
 ) -> Element<'a, M> {
     let skin = &icons.tutorial_skin;
-    let picture = record
-        .bitmap_icon
-        .and_then(|id| {
-            icons
-                .bitmaps
-                .get(&(record.source.clone(), id))
-                .cloned()
-                .flatten()
-        })
-        .map(|(w, h, handle)| (handle, Size::new(w as f32, h as f32)));
+    let primary = record.modal() || record.buttons.len() > 1;
     let buttons = record
         .buttons
         .iter()
@@ -675,7 +805,7 @@ pub(super) fn view<'a, M: Clone + 'a>(
             button(Element::new(ButtonArt {
                 skin,
                 label: &b.label,
-                minimize: !record.modal(),
+                minimize: !primary,
             }))
             .padding(0)
             .on_press(response(record.id, b.result))
@@ -689,7 +819,8 @@ pub(super) fn view<'a, M: Clone + 'a>(
     Element::new(Card {
         record,
         skin,
-        picture,
+        picture: picture(record, icons),
+        primary,
         buttons,
     })
 }
@@ -697,6 +828,68 @@ pub(super) fn view<'a, M: Clone + 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
+
+    #[test]
+    fn gui_dialog_picture_sources_keep_native_dimensions() {
+        let mut artwork = HudArt::synthetic_for_test(&[], &[("Notice.iff", 5000, 133, 120)]);
+        let mut record: Record = serde_json::from_value(serde_json::json!({
+            "id": 1, "caller": 1,
+            "origin": {"source": "Notice.iff", "bhav": 4119, "instruction": 0},
+            "source": "Notice.iff", "operands": [0, 0, 0, 0, 0, 0, 0, 0],
+            "stack_object": 1, "title": "Notice", "body": "A notice.",
+            "buttons": [{"label": "OK", "result": 2}], "icon_object": null,
+            "job_icon": null, "bitmap_icon": 5000, "status": 1
+        }))
+        .unwrap();
+        assert_eq!(picture(&record, &artwork).unwrap().1, Size::new(133., 120.));
+        record.bitmap_icon = None;
+        for job in [0, 3, -1] {
+            record.job_icon = Some(job);
+            assert_eq!(picture(&record, &artwork).unwrap().1, Size::new(84., 63.));
+        }
+        record.job_icon = None;
+        record.global_bitmap_icon = Some(sims_vm::dialog::GlobalBitmap {
+            id: 9,
+            button_cell: true,
+        });
+        std::sync::Arc::make_mut(&mut artwork.global_frames).insert(
+            (9, true),
+            Some((
+                21,
+                15,
+                iced::widget::image::Handle::from_rgba(21, 15, vec![255; 21 * 15 * 4]),
+            )),
+        );
+        assert_eq!(picture(&record, &artwork).unwrap().1, Size::new(21., 15.));
+        record.global_bitmap_icon = None;
+        record.portrait = Some(sims_vm::dialog::Image {
+            handle: 1,
+            rect: [5, 4, 50, 64],
+        });
+        std::sync::Arc::make_mut(&mut artwork.portraits).insert(
+            record.id,
+            iced::widget::image::Handle::from_rgba(45, 60, vec![255; 45 * 60 * 4]),
+        );
+        assert_eq!(picture(&record, &artwork).unwrap().1, Size::new(45., 60.));
+    }
+
+    #[test]
+    #[ignore = "installed original UI artwork and bitmap fonts"]
+    fn gui_shipped_dialog_skin_and_wall_art_load() -> Result<()> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../game-data/cabinet-extracted");
+        let index = sims_content::Index::scan(&root)?;
+        let icons = super::super::Icons::load(&index)?;
+        assert_eq!(icons.tutorial_skin.font.line_height, 23);
+        assert_eq!(icons.tutorial_skin.title_font.line_height, 27);
+        for (id, dimensions) in [(2006, (21, 21)), (2004, (21, 21)), (2007, (22, 15))] {
+            let (width, height, frames) = icons.hud(id).context("wall artwork absent")?;
+            assert_eq!((*width, *height), dimensions);
+            assert_eq!(frames.len(), 4);
+        }
+        Ok(())
+    }
     #[cfg(feature = "private-fixtures")]
     #[test]
     fn text_regions_match_original_instructions_with_synthetic_font() -> Result<()> {

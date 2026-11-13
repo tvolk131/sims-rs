@@ -118,7 +118,7 @@ impl Vm {
         let b = &ins.operands;
         let mode = i16::from_le_bytes([b[0], b[1]]);
         let Some((score_field, function)) = selector(mode) else {
-            crate::branch(p, t, ins.on_false)?;
+            self.branch(p, t, ins.on_false)?;
             return Ok(format!(
                 "Find Best unsupported native selector {mode} → false"
             ));
@@ -130,7 +130,7 @@ impl Vm {
                 .as_ref()
                 .is_none_or(|person| person.get(&65).is_none_or(|v| *v > 1))
         {
-            crate::branch(p, t, ins.on_false)?;
+            self.branch(p, t, ins.on_false)?;
             return Ok("Find Best excludes non-human caller".into());
         }
         let mut q = if t.find_best.last().is_some_and(|q| q.depth == t.stack.len()) {
@@ -271,7 +271,7 @@ impl Vm {
             t.stack.last_mut().unwrap().stack_object = id;
         }
         t.last_result = success;
-        crate::branch(p, t, if success { ins.on_true } else { ins.on_false })?;
+        self.branch(p, t, if success { ins.on_true } else { ins.on_false })?;
         Ok(format!(
             "Find Best function selector {mode}: {:?}, score {}",
             q.best, q.best_score

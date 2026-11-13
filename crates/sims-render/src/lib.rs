@@ -3,6 +3,7 @@ mod camera;
 pub mod camera_device;
 pub mod censor;
 mod depth_range;
+mod decoded_sprites;
 pub mod dialog;
 mod floors;
 pub use floors::active_size as original_lot_size;
@@ -16,6 +17,8 @@ pub mod portrait;
 pub mod pose;
 pub mod software;
 pub mod sprite_depth;
+#[cfg(test)]
+mod texture_tests;
 mod wall_objects;
 pub mod wall_view;
 mod walls;
@@ -39,6 +42,25 @@ pub struct Texture {
     /// older scenes and the GPU cache's content-based comparisons.
     pub rgba: Arc<[u8]>,
     pub depth: Arc<[u8]>,
+}
+impl Texture {
+    fn from_avatar(texture: &sims_content::avatar::Texture) -> Self {
+        Self {
+            width: texture.width,
+            height: texture.height,
+            rgba: texture.rgba.clone().into(),
+            depth: vec![255; (texture.width * texture.height) as usize].into(),
+        }
+    }
+
+    fn with_rgba(&self, rgba: Vec<u8>) -> Self {
+        Self {
+            width: self.width,
+            height: self.height,
+            rgba: rgba.into(),
+            depth: Arc::clone(&self.depth),
+        }
+    }
 }
 #[derive(Debug, Clone)]
 struct Sprite {
@@ -90,12 +112,7 @@ impl Assets {
         let textures = Arc::make_mut(&mut self.textures);
         let texture_base = textures.len();
         for p in &avatar.parts {
-            textures.push(Texture {
-                width: p.texture.width,
-                height: p.texture.height,
-                rgba: p.texture.rgba.clone().into(),
-                depth: vec![255; (p.texture.width * p.texture.height) as usize].into(),
-            });
+            textures.push(Texture::from_avatar(&p.texture));
         }
         self.residents.insert(
             id,
@@ -184,42 +201,22 @@ impl Assets {
             depth: vec![255].into(),
         }];
         for p in &avatar.parts {
-            textures.push(Texture {
-                width: p.texture.width,
-                height: p.texture.height,
-                rgba: p.texture.rgba.clone().into(),
-                depth: vec![255; (p.texture.width * p.texture.height) as usize].into(),
-            });
+            textures.push(Texture::from_avatar(&p.texture));
         }
         let nude = sims_content::avatar::load_adult_outfit(index, true)?;
         let nude_texture = textures.len();
         for p in &nude.parts {
-            textures.push(Texture {
-                width: p.texture.width,
-                height: p.texture.height,
-                rgba: p.texture.rgba.clone().into(),
-                depth: vec![255; (p.texture.width * p.texture.height) as usize].into(),
-            });
+            textures.push(Texture::from_avatar(&p.texture));
         }
         let alternate = sims_content::avatar::load_adult_profile(index, false, true)?;
         let alternate_texture = textures.len();
         for p in &alternate.parts {
-            textures.push(Texture {
-                width: p.texture.width,
-                height: p.texture.height,
-                rgba: p.texture.rgba.clone().into(),
-                depth: vec![255; (p.texture.width * p.texture.height) as usize].into(),
-            });
+            textures.push(Texture::from_avatar(&p.texture));
         }
         let sleepwear = sims_content::avatar::load_adult_sleepwear(index)?;
         let sleepwear_texture = textures.len();
         for p in &sleepwear.parts {
-            textures.push(Texture {
-                width: p.texture.width,
-                height: p.texture.height,
-                rgba: p.texture.rgba.clone().into(),
-                depth: vec![255; (p.texture.width * p.texture.height) as usize].into(),
-            });
+            textures.push(Texture::from_avatar(&p.texture));
         }
         let mut accessories = BTreeMap::new();
         let layers = if let Some(requested) = requested {
@@ -253,12 +250,7 @@ impl Assets {
                     }
                 }
                 let texture = textures.len();
-                textures.push(Texture {
-                    width: part.texture.width,
-                    height: part.texture.height,
-                    rgba: part.texture.rgba.clone().into(),
-                    depth: vec![255; (part.texture.width * part.texture.height) as usize].into(),
-                });
+                textures.push(Texture::from_avatar(&part.texture));
                 parts.push((part, texture));
             }
             accessories.insert(name, parts);
@@ -267,6 +259,7 @@ impl Assets {
         let mut object_graphics = BTreeMap::new();
         for &(selector, definition) in objects {
             let doc = index.document(index.find(selector)?)?;
+            let mut decoded = decoded_sprites::Frames::default();
             let obj = doc
                 .objects
                 .iter()
@@ -307,31 +300,28 @@ impl Assets {
                                 s.id
                             );
                         }
-                        let chunk =
-                            doc.iff
-                                .get(b"SPR2", u16::try_from(s.id)?)
-                                .with_context(|| {
-                                    format!(
-                                        "missing SPR2 {} for {} DGRP {group_id}, frame {}",
-                                        s.id, doc.source, s.frame
-                                    )
-                                })?;
-                        let raw = doc.iff.data(chunk);
-                        let f = SpriteSet::parse(raw)?.decode(raw, s.frame as usize, &doc.iff)?;
+                        let identifier = u16::try_from(s.id)?;
+                        let texture = decoded.get((identifier, s.frame as usize), || {
+                            let chunk = doc.iff.get(b"SPR2", identifier).with_context(|| {
+                                format!(
+                                    "missing SPR2 {} for {} DGRP {group_id}, frame {}",
+                                    s.id, doc.source, s.frame
+                                )
+                            })?;
+                            let raw = doc.iff.data(chunk);
+                            Ok(SpriteSet::parse(raw)?.decode(raw, s.frame as usize, &doc.iff)?)
+                        })?;
                         // Original household objects include empty SPR2 frames.
                         // They contribute no pixels or pick geometry, and wgpu
                         // cannot allocate a zero-sized texture for them.
-                        if f.width == 0 || f.height == 0 {
+                        let Some(texture) = texture else {
                             continue;
-                        }
-                        if f.flags & 2 == 0 {
-                            bail!("object sprite needs original depth channel");
-                        }
+                        };
                         // DGRP screen offsets use the bottom of the sprite, independently of SPR2's preview origin.
                         layers.push(Sprite {
-                            id: u16::try_from(s.id)?,
+                            id: identifier,
                             texture: textures.len(),
-                            offset: Vec2::new(s.x as f32, s.y as f32 - f.height as f32),
+                            offset: Vec2::new(s.x as f32, s.y as f32 - texture.height as f32),
                             object: Vec3::new(
                                 s.object[0] / 16.,
                                 s.object[2] / 5.,
@@ -339,12 +329,7 @@ impl Assets {
                             ),
                             flip: s.flags & 1 != 0,
                         });
-                        textures.push(Texture {
-                            width: f.width,
-                            height: f.height,
-                            rgba: f.rgba.into(),
-                            depth: f.depth.into(),
-                        });
+                        textures.push(texture);
                     }
                     sprites.insert(
                         (doc.source.clone(), group_id, view.direction, view.zoom),

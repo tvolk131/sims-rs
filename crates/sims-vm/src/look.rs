@@ -1,6 +1,6 @@
 //! Original Look Towards coordinate/continuation contract, excluding animator
 //! progression. Native coordinates are sixteenths of a tile.
-use crate::{Program, Status, Thread, TurnRequest, Vm, branch};
+use crate::{Program, Status, Thread, TurnRequest, Vm};
 use serde::{Deserialize, Serialize};
 impl Vm {
     pub(crate) fn request_turn(
@@ -23,7 +23,7 @@ impl Vm {
             .ok_or("turn caller is not a person")?;
         if f.continuation == 0 && *person.get(&0).ok_or("turn posture is missing")? != 0 {
             t.last_result = false;
-            branch(program, t, ins.on_false)?;
+            self.branch(program, t, ins.on_false)?;
             return Ok("Look Towards declined non-standing posture; branch false".into());
         }
         if f.continuation == 0 && mode != 1 && !self.world.objects.contains_key(&f.stack_object) {

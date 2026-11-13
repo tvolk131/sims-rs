@@ -30,7 +30,7 @@ impl Prepared {
         settings: Settings,
         crt: &mut u32,
     ) -> Result<Self> {
-        Self::begin_inner(index, vm, program, object, settings, crt, None)
+        Self::begin_inner(index, vm, program, object, settings, crt, None, None)
     }
     /// Live construction uses the process resource owner. `begin` above is the
     /// isolated, already-loaded-prototype diagnostic used by native rig probes.
@@ -43,7 +43,29 @@ impl Prepared {
         crt: &mut u32,
         resources: &mut crate::skeleton_resources::Cache,
     ) -> Result<Self> {
-        Self::begin_inner(index, vm, program, object, settings, crt, Some(resources))
+        Self::begin_with_startup(index, vm, program, object, settings, crt, resources, None)
+    }
+
+    pub(crate) fn begin_with_startup(
+        index: &Index,
+        vm: &mut Vm,
+        program: &Program,
+        object: ObjectId,
+        settings: Settings,
+        crt: &mut u32,
+        resources: &mut crate::skeleton_resources::Cache,
+        startup: Option<&mut crate::startup_memo::Memo>,
+    ) -> Result<Self> {
+        Self::begin_inner(
+            index,
+            vm,
+            program,
+            object,
+            settings,
+            crt,
+            Some(resources),
+            startup,
+        )
     }
     fn begin_inner(
         index: &Index,
@@ -53,6 +75,7 @@ impl Prepared {
         settings: Settings,
         crt: &mut u32,
         resources: Option<&mut crate::skeleton_resources::Cache>,
+        startup: Option<&mut crate::startup_memo::Memo>,
     ) -> Result<Self> {
         ensure!(
             !vm.object_threads.contains_key(&object),
@@ -87,8 +110,8 @@ impl Prepared {
             .get(0xcc / 2)
             .context("initializer person flags absent")? as u8;
         let skeleton = match resources {
-            Some(resources) => resources.load(index, name, crt)?,
-            None => crate::avatar::load_skeleton(index, name)?.0,
+            Some(resources) => resources.load_with_startup(index, name, crt, startup)?,
+            None => crate::avatar::load_skeleton_with_startup(index, name, startup)?.0,
         };
         ensure!(
             skeleton.name.eq_ignore_ascii_case(name),
@@ -185,6 +208,17 @@ impl Prepared {
         program: &mut Program,
         context: properties::Context,
     ) -> Result<Option<Request>> {
+        self.advance_with_startup(index, vm, program, context, None)
+    }
+
+    pub(crate) fn advance_with_startup(
+        &mut self,
+        index: &Index,
+        vm: &mut Vm,
+        program: &mut Program,
+        context: properties::Context,
+        mut startup: Option<&mut crate::startup_memo::Memo>,
+    ) -> Result<Option<Request>> {
         loop {
             let person = vm
                 .world
@@ -201,9 +235,11 @@ impl Prepared {
             };
             match &request {
                 Request::NeedsAppearance { name } => {
-                    // The resource key is embedded in a catalog: adult-needs
-                    // lives in adult.cmx.bcf, not adult-needs.cmx.bcf.
-                    crate::avatar::find_appearance_catalog(index, name)?;
+                    if let Some(startup) = startup.as_deref_mut() {
+                        startup.find_appearance_catalog(index, name)?;
+                    } else {
+                        crate::avatar::find_appearance_catalog(index, name)?;
+                    }
                     self.execution
                         .needs_appearance(name)
                         .map_err(anyhow::Error::msg)?;
@@ -240,7 +276,9 @@ impl Prepared {
                         },
                     )
                     .map(str::to_ascii_lowercase);
-                    if let Some(name) = &name {
+                    if let Some(name) = &name
+                        && !program.animations.contains_key(name)
+                    {
                         crate::assets::load_named_animations(
                             index,
                             program,
@@ -292,5 +330,114 @@ impl Prepared {
                 _ => return Ok(Some(request)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::startup_memo::{Memo, tests::Fixture};
+    use sims_formats::avatar::{Bone, Skeleton};
+    use std::{fs, sync::Arc};
+
+    #[test]
+    fn prepared_appearance_discovery_first_advance_uses_loading_metadata_without_rescanning() {
+        let mut fixture = Fixture::new();
+        fixture.write(
+            "GameData_ALL_Recursive/Animation/adult.cmx",
+            b"// synthetic\nversion 300\n0\n1\nadult-needs\n7\n0\n0\n0\n",
+        );
+        fixture.index = Arc::new(Index::scan(&fixture.root).unwrap());
+        let mut startup = Memo::for_session(fixture.index.clone());
+        startup.prepare_session().unwrap();
+        let skeleton = Skeleton {
+            name: "adult".into(),
+            bones: vec![Bone {
+                name: "root".into(),
+                parent: None,
+                translation: [0.; 3],
+                rotation: [0., 0., 0., 1.],
+                flags: [0; 3],
+                properties: vec![],
+                wiggle: Default::default(),
+            }],
+        };
+        let mut crt = 1;
+        let mut prepared = Prepared {
+            object: 1,
+            execution: Initialization::new(
+                skeleton,
+                &["adult", "", "", "", "", "", ""].map(str::to_owned),
+                0,
+                0,
+                Settings {
+                    fade_enabled: false,
+                    fade_duration: 200,
+                    sampling_config: 1,
+                },
+                &mut crt,
+            )
+            .unwrap(),
+            appearance_owner: sims_sim::pose::appearance_reload::Owner::constructed(false),
+            source: "synthetic".into(),
+        };
+        let mut vm = Vm::new(sims_vm::World::default(), 1);
+        vm.world.objects.insert(
+            1,
+            sims_vm::Object {
+                person: Some(Default::default()),
+                ..Default::default()
+            },
+        );
+        let mut program = Program::default();
+        let context = properties::Context {
+            actor: 1,
+            sound_visible: false,
+            selected: false,
+            debug_sound: false,
+            position_x: -999.,
+            appearance_mode: 0,
+            snow: false,
+            lot_kind: 1,
+        };
+        let mut expected = prepared.clone();
+        let mut ordinary = prepared.clone();
+        assert_eq!(
+            expected
+                .advance(&fixture.index, &mut vm, &mut program, context)
+                .unwrap(),
+            Some(Request::ReloadProfile)
+        );
+        fs::remove_file(
+            fixture
+                .root
+                .join("GameData_ALL_Recursive/Animation/adult.cmx"),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared
+                .advance_with_startup(
+                    &fixture.index,
+                    &mut vm,
+                    &mut program,
+                    context,
+                    Some(&mut startup)
+                )
+                .unwrap(),
+            Some(Request::ReloadProfile)
+        );
+        assert_eq!(prepared, expected);
+        assert!(
+            ordinary
+                .advance(&fixture.index, &mut vm, &mut program, context)
+                .is_err()
+        );
+        assert!(ordinary.execution.needs_appearance.is_none());
+        assert_eq!(
+            ordinary.execution.pending_request(),
+            Some(&Request::NeedsAppearance {
+                name: "adult-needs".into()
+            })
+        );
     }
 }

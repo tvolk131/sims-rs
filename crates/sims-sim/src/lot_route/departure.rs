@@ -116,68 +116,105 @@ pub struct Execution {
     scan: Scan,
     clearance: Option<Check>,
     floor: Option<lot_acceptance::live::Execution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    initial_blocked_object: Option<i16>,
     pub blocked_object: i16,
 }
 impl Execution {
-    pub fn begin(
-        s: &mut Simulation,
-        p: &Program,
-        r: &RouteRequest,
+    pub fn begin(s: &Simulation, p: &Program, r: &RouteRequest) -> Result<Option<Self>, String> {
+        let control = s
+            .route_control
+            .get(&r.id)
+            .and_then(|control| control.original.as_ref())
+            .ok_or("departure route context absent")?;
+        Self::begin_potential(
+            s,
+            p,
+            r,
+            (control.ignored != 0).then_some(control.ignored),
+            control.blocked_object,
+        )
+    }
+    pub(super) fn begin_potential(
+        simulation: &Simulation,
+        program: &Program,
+        request: &RouteRequest,
+        ignored_person: Option<ObjectId>,
+        blocked_object: i16,
     ) -> Result<Option<Self>, String> {
-        let descriptor = s
-            .native_lot
-            .as_ref()
-            .unwrap()
-            .placement
-            .links
-            .capture(&mut s.vm.world, r.caller)?;
-        let Some(seat) = descriptor.container else {
+        let mut root = request.caller;
+        let mut seen = std::collections::BTreeSet::new();
+        let seat = loop {
+            if !seen.insert(root) {
+                return Err("cyclic zero-slot predecessor chain".into());
+            }
+            let object = simulation
+                .vm
+                .world
+                .objects
+                .get(&root)
+                .ok_or("departure object absent")?;
+            let physical = *object
+                .data
+                .get(&14)
+                .ok_or("departure physical slot absent")?;
+            let predecessor = *object.data.get(&26).ok_or("departure predecessor absent")?;
+            let parent = (predecessor != 0
+                && simulation.vm.world.objects.contains_key(&predecessor))
+            .then_some(predecessor);
+            if physical != 0 || parent.is_none() {
+                break parent;
+            }
+            root = parent.unwrap();
+        };
+        let Some(seat) = seat else {
             return Ok(None);
         };
-        let d = s.vm.world.objects[&seat]
+        let definition = simulation.vm.world.objects[&seat]
             .definition
             .as_ref()
             .ok_or("departure seat definition absent")?;
-        let module = p
+        let module = program
             .modules
-            .get(&d.source)
+            .get(&definition.source)
             .ok_or("departure seat resource absent")?;
         if module
             .object_functions
-            .get(&d.object)
-            .and_then(|f| f.get(26))
-            .map_or(0, |f| f.action)
+            .get(&definition.object)
+            .and_then(|functions| functions.get(26))
+            .ok_or("departure seat function table absent")?
+            .action
             == 0
         {
             return Ok(None);
         }
         let allowed = *module
             .object_definition_words
-            .get(&d.object)
-            .and_then(|w| w.get(0x84 / 2))
+            .get(&definition.object)
+            .and_then(|words| words.get(0x84 / 2))
             .ok_or("departure seat mask absent")? as u16;
-        let actor = &s.vm.world.positions[&r.caller];
-        let target = &s.vm.world.positions[&r.target];
-        let control = s.route_control[&r.id]
-            .original
-            .as_ref()
-            .ok_or("departure route context absent")?;
-        let (slot, _) = super::live::descriptor(&r.destination)?;
+        simulation.vm.world.objects[&seat]
+            .data
+            .get(&1)
+            .ok_or("departure seat facing absent")?;
+        let actor = &simulation.vm.world.positions[&request.caller];
+        let target = &simulation.vm.world.positions[&request.target];
+        let (slot, _) = super::live::descriptor(&request.destination)?;
         Ok(Some(Self {
-            caller: r.caller,
+            caller: request.caller,
             seat,
             input: Input {
                 size: super::active_size(
-                    &s.vm.world,
-                    s.native_lot.as_ref().unwrap().placement.links.size,
+                    &simulation.vm.world,
+                    simulation.native_lot.as_ref().unwrap().placement.links.size,
                 )?,
                 position: [actor.x, actor.y],
                 target: [target.x, target.y],
                 level: actor.level,
-                room: s.vm.world.objects[&r.caller].data[&29],
+                room: simulation.vm.world.objects[&request.caller].data[&29],
                 flags: slot.flags,
                 direction: None,
-                ignored: (control.ignored != 0).then_some(control.ignored),
+                ignored: ignored_person,
             },
             scan: Scan::new(
                 Point::new(actor.x, actor.y),
@@ -186,8 +223,23 @@ impl Execution {
             ),
             clearance: None,
             floor: None,
-            blocked_object: control.blocked_object,
+            initial_blocked_object: Some(blocked_object),
+            blocked_object,
         }))
+    }
+    pub(super) fn validate_context(
+        &self,
+        flags: u32,
+        ignored_person: Option<ObjectId>,
+        blocked_seed: Option<i16>,
+    ) -> Result<(), String> {
+        if self.input.flags != flags
+            || self.input.ignored != ignored_person
+            || blocked_seed.is_some() && blocked_seed != self.initial_blocked_object
+        {
+            return Err("departure potential context mismatch".into());
+        }
+        Ok(())
     }
     pub fn outcome(&self) -> Option<Departure> {
         self.scan.outcome()
@@ -199,6 +251,30 @@ impl Execution {
     }
     pub fn validate(&self, s: &Simulation, p: &Program, caller: ObjectId) -> Result<(), String> {
         self.scan.validate()?;
+        let definition =
+            s.vm.world
+                .objects
+                .get(&self.seat)
+                .and_then(|seat| seat.definition.as_ref())
+                .ok_or("departure seat definition absent")?;
+        let module = p
+            .modules
+            .get(&definition.source)
+            .ok_or("departure seat resource absent")?;
+        if !s.vm.world.objects[&self.seat].data.contains_key(&1)
+            || module
+                .object_functions
+                .get(&definition.object)
+                .and_then(|functions| functions.get(26))
+                .is_none()
+            || module
+                .object_definition_words
+                .get(&definition.object)
+                .and_then(|words| words.get(0x84 / 2))
+                .is_none()
+        {
+            return Err("departure seat resources absent".into());
+        }
         if self.caller != caller
             || self.input.position != [self.scan.origin.x, self.scan.origin.y]
             || self.input.target != [self.scan.target.x, self.scan.target.y]
@@ -209,6 +285,7 @@ impl Execution {
                 )?
             || !(1..=2).contains(&self.input.level)
             || self.input.direction.is_some()
+            || self.scan.pending.is_some() != self.clearance.is_some()
             || !s.vm.world.objects.contains_key(&self.seat)
             || self.outcome().is_some() && (self.floor.is_some() || self.clearance.is_some())
         {

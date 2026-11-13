@@ -83,6 +83,9 @@ pub enum Progress {
     Panels(Option<u64>),
 }
 impl State {
+    pub fn walls(&self) -> i32 {
+        self.context.walls
+    }
     pub(super) fn set_deferred_walls(&mut self, value: u32) {
         self.context.walls = value as i32;
     }
@@ -616,6 +619,52 @@ impl Session {
         self.begin_interface_publication(context, 0)?;
         Ok(true)
     }
+    pub fn begin_walls_change(&mut self, walls: u32) -> Result<()> {
+        ensure!(
+            matches!(walls, 1 | 2 | 4),
+            "walls change outside original wall modes"
+        );
+        self.ensure_camera_input_idle()?;
+        ensure!(
+            !self.publication_pending(),
+            "walls change overlaps interface publication"
+        );
+        let presentation = &self.host.presentation;
+        let floor = presentation
+            .camera_ui
+            .context("walls change camera properties absent")?
+            .floor;
+        let available = if matches!(floor, 1 | 2) { 7 } else { 1 };
+        ensure!(
+            walls & available != 0,
+            "walls mode unavailable on this floor"
+        );
+        if presentation.publication.is_none() && presentation.frontend_context.is_none() {
+            return self.begin_unbound_walls_change(walls);
+        }
+        ensure!(
+            presentation.publication.is_some() && presentation.transport.is_some(),
+            "walls change publication owners absent"
+        );
+        self.publication_inputs(&presentation.publication.as_ref().unwrap().context)?;
+        let presentation = &mut self.host.presentation;
+        presentation
+            .publication
+            .as_mut()
+            .unwrap()
+            .set_deferred_walls(walls);
+        if let Some(frontend) = &mut presentation.frontend_context {
+            frontend.walls = walls as i32;
+        }
+        presentation
+            .transport
+            .as_mut()
+            .unwrap()
+            .controls
+            .mark_dirty(0x80);
+        self.republish_interface()?;
+        Ok(())
+    }
     fn publication_inputs(&self, context: &Context) -> Result<world::Inputs> {
         let v = &self.host.presentation;
         let (fields, menu_present, menu_active, zoning) = if let Some(t) = &v.tool_selection {
@@ -695,6 +744,20 @@ impl Session {
             .context("world publication absent")?
             .acknowledge(request)
             .map_err(anyhow::Error::msg)
+    }
+    pub fn complete_publication_window_reset(&mut self, cursor: u32) -> Result<()> {
+        self.validate_publication()?;
+        ensure!(cursor == 0, "publication window reset cursor differs");
+        ensure!(
+            self.host
+                .presentation
+                .publication
+                .as_ref()
+                .and_then(State::request)
+                == Some(world::Request::WindowReset),
+            "publication window reset lost its caller"
+        );
+        self.publication_reply(world::Request::WindowReset)
     }
     ///Only actual disabled-audio early returns can use this service boundary.
     pub fn acknowledge_publication_audio(&mut self, request: world::Request) -> Result<()> {

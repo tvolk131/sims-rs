@@ -96,3 +96,41 @@ An attempted all-target check exposed pre-existing initializer incompatibilities
 implementations are not changed by this cleanup. `cargo check --all-targets`
 therefore remains a known failing broader check; CI success must not be described
 as validation of those examples or of every private-feature configuration.
+
+## Avatar-codec test selectors
+
+The synthetic `sims-formats` targets `animation`, `avatar` and `avatar_index` are
+grouped in `avatar_codecs`. The three leaf files are unchanged in separate
+modules; all nine test bodies remain. Cargo autodiscovery remains enabled, and
+private fixtures remain opt-in. Tests with different ownership, restore
+boundaries or independent oracles remain separate.
+
+Run the full group:
+
+```sh
+cargo test --locked -p sims-formats --test avatar_codecs
+```
+
+Old target selectors no longer exist. For one former `avatar` case, use:
+
+```sh
+cargo test --locked -p sims-formats --test avatar_codecs \
+  avatar::skeleton_hierarchy_and_truncations -- --exact
+```
+
+Former `animation` and `avatar_index` cases similarly gain `animation::` and
+`avatar_index::` prefixes. Require the expected positive test count; an obsolete
+`--exact` case name can otherwise succeed after running zero tests. Substring
+filters containing a module name can select more cases than before.
+
+Three paired local trials on Rust 1.99.0, two build jobs and fresh target
+directories measured library/dependency-warm compilation, not cold workspace
+builds. Median compile time for these targets was 1.318s before and 1.159s after;
+median warm serial invocation was 0.560s versus 0.240s. No-op compile time was
+effectively unchanged. Default-threaded invocation varied enough that no general
+speedup is claimed. All nine cases passed in every measured invocation.
+
+This removes two integration binaries, not tests or assertions. It does not
+speed up CI's separately executed library suites. Do not expand this grouping
+without independent-state/selector review and further measurements. Private
+local receipts remain under `cache/consolidation-20261107-v1/`.

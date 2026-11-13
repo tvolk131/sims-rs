@@ -100,9 +100,10 @@ impl<P: Presentation + Clone> Host<P> {
                 flags,
                 portrait,
                 &mut career,
-                &mut crate::clothing_catalog::Installed {
+                &mut crate::clothing_catalog::WithStartup {
                     index: &self.index,
                     cache: &mut self.clothing,
+                    startup: Some(&mut self.startup),
                 },
             )?;
             if selection.is_complete() && !portrait {
@@ -133,7 +134,7 @@ impl<P: Presentation + Clone> Host<P> {
         }
         let mut assets = assets.clone();
         let mut resident = resident.clone();
-        let mut vm = simulation.vm.clone();
+        let mut vm = simulation.vm.clone_for_transaction();
         let mut pool = self.mesh_pool.clone();
         let mut presentation = self.presentation.clone();
         if !portrait && resident.profile_dirty {
@@ -154,9 +155,10 @@ impl<P: Presentation + Clone> Host<P> {
                         bound,
                         &mut placement,
                         &mut pool,
-                        &mut crate::clothing_catalog::Installed {
+                        &mut crate::clothing_catalog::WithStartup {
                             index: &self.index,
                             cache: &mut self.clothing,
+                            startup: Some(&mut self.startup),
                         },
                     )
                 })?;
@@ -216,9 +218,10 @@ impl<P: Presentation + Clone> Host<P> {
                 flags,
                 portrait,
                 &mut object.career_appearance,
-                &mut crate::clothing_catalog::Installed {
+                &mut crate::clothing_catalog::WithStartup {
                     index: &self.index,
                     cache: &mut self.clothing,
+                    startup: Some(&mut self.startup),
                 },
             )?
         };

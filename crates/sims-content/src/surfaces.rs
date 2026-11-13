@@ -29,6 +29,7 @@ pub struct WallMaterial {
 }
 
 pub fn load_walls(index: &Index, house: &House) -> Result<BTreeMap<u16, WallMaterial>> {
+    let names = ResourceNames::new(index);
     let mut used = BTreeSet::new();
     for floor in &house.floors {
         for t in &floor.walls {
@@ -66,7 +67,7 @@ pub fn load_walls(index: &Index, house: &House) -> Result<BTreeMap<u16, WallMate
                 .clone();
             (name, local, [0, 1792, 2048])
         };
-        let source = resource(index, &name)?;
+        let source = names.resource(&name)?;
         if let std::collections::btree_map::Entry::Vacant(e) = files.entry(source) {
             e.insert(Iff::parse(index.resources[source].read()?)?);
         }
@@ -275,23 +276,21 @@ pub(crate) fn resource(index: &Index, name: &str) -> Result<usize> {
 /// retained; every lookup still reads and compares all matching resources.
 pub(crate) struct ResourceNames<'a> {
     index: &'a Index,
-    names: BTreeMap<usize, Vec<(usize, &'a str)>>,
+    names: BTreeMap<String, Vec<usize>>,
 }
 impl<'a> ResourceNames<'a> {
     pub(crate) fn new(index: &'a Index) -> Self {
-        let mut names = BTreeMap::<usize, Vec<(usize, &str)>>::new();
+        let mut names = BTreeMap::<String, Vec<usize>>::new();
         for (id, resource) in index.resources.iter().enumerate() {
             if let Some(name) = resource.name.rsplit(['/', '\\']).next() {
-                names.entry(name.len()).or_default().push((id, name));
+                names.entry(name.to_ascii_lowercase()).or_default().push(id);
             }
         }
         Self { index, names }
     }
     pub(crate) fn resource(&self, name: &str) -> Result<usize> {
-        let candidates: Vec<_> = self.names.get(&name.len()).into_iter().flatten()
-            .filter(|(_, candidate)| candidate.eq_ignore_ascii_case(name))
-            .map(|&(id, _)| id).collect();
-        select_resource(self.index, name, &candidates)
+        let candidates = self.names.get(&name.to_ascii_lowercase()).map(Vec::as_slice).unwrap_or_default();
+        select_resource(self.index, name, candidates)
     }
 }
 
@@ -318,6 +317,7 @@ fn select_resource(index: &Index, name: &str, candidates: &[usize]) -> Result<us
 mod resource_names_tests;
 
 pub fn load_floors(index: &Index, house: &House) -> Result<BTreeMap<u16, FloorMaterial>> {
+    let names = ResourceNames::new(index);
     let mut used = BTreeSet::new();
     for floor in &house.floors {
         for (&id, wall) in floor.coverings.iter().zip(&floor.walls) {
@@ -358,7 +358,7 @@ pub fn load_floors(index: &Index, house: &House) -> Result<BTreeMap<u16, FloorMa
                 .with_context(|| format!("saved floor {id} has no source mapping"))?
                 .clone()
         };
-        let source = resource(index, &name)?;
+        let source = names.resource(&name)?;
         if let std::collections::btree_map::Entry::Vacant(e) = files.entry(source) {
             e.insert(Iff::parse(index.resources[source].read()?)?);
         }

@@ -582,7 +582,7 @@ impl Vm {
         };
         t.stack.last_mut().unwrap().continuation = 0;
         t.last_result = result;
-        crate::branch(p, t, if result { ins.on_true } else { ins.on_false })?;
+        self.branch(p, t, if result { ins.on_true } else { ins.on_false })?;
         Ok(format!("Run Tree By Name returned {result}"))
     }
 
@@ -592,9 +592,28 @@ impl Vm {
         b: &[u8; 8],
     ) -> Result<(bool, String), String> {
         let sub = u16::from_le_bytes([b[0], b[1]]);
+        if sub == 0 {
+            crate::neighborhood::finish_tutorial(&mut self.world)?;
+            return Ok((
+                true,
+                "native tutorial completion retained in managed neighborhood and lot state".into(),
+            ));
+        }
         if sub == 43 {
             crate::magic_history::restore(&mut self.world)?;
             return Ok((true, "native retained magic-history synchronization".into()));
+        }
+        if sub == 4 {
+            let neighbor = t
+                .stack
+                .last()
+                .ok_or("family addition frame absent")?
+                .stack_object;
+            let result = crate::family::add(&mut self.world, neighbor, &mut crate::family::Live)?;
+            return Ok((
+                result,
+                format!("native family addition neighbor #{neighbor} → {result}"),
+            ));
         }
         if sub == 6 {
             let neighbor = t

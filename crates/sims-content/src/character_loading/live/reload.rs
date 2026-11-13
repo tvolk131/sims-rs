@@ -173,7 +173,7 @@ impl<P: Presentation> Host<P> {
             .get(&id)
             .context("appearance character absent")?
             .clone();
-        let mut vm = simulation.vm.clone();
+        let mut vm = simulation.vm.clone_for_transaction();
         let mut pool = self.mesh_pool.clone();
         let mut placement = resident.character.placement.clone();
         let pending = assets.model.with_bound(&mut resident, |bound| {
@@ -186,9 +186,10 @@ impl<P: Presentation> Host<P> {
                 bound,
                 &mut placement,
                 &mut pool,
-                &mut crate::clothing_catalog::Installed {
+                &mut crate::clothing_catalog::WithStartup {
                     index: &self.index,
                     cache: &mut self.clothing,
+                    startup: Some(&mut self.startup),
                 },
             )
         })?;

@@ -96,6 +96,31 @@ impl Simulation {
         &self,
         program: &Program,
     ) -> Result<std::collections::BTreeSet<String>, String> {
+        let mut names = self.pending_required_animation_assets(program)?;
+        names.extend(self.pending_native_command_animation_assets(program)?);
+        Ok(names)
+    }
+    pub fn pending_native_command_animation_assets(
+        &self,
+        program: &Program,
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        let mut names = std::collections::BTreeSet::new();
+        for (&id, thread) in &self.vm.threads {
+            let sims_vm::Status::AwaitingAnimation(request) = &thread.status else {
+                continue;
+            };
+            if self.characters.contains_key(&request.caller) {
+                if let Some(name) = self.native_command_asset(program, id, request)? {
+                    names.insert(name);
+                }
+            }
+        }
+        Ok(names)
+    }
+    pub fn pending_required_animation_assets(
+        &self,
+        program: &Program,
+    ) -> Result<std::collections::BTreeSet<String>, String> {
         let mut names = self.pending_carry_assets(program)?;
         names.extend(self.native_update_asset_names(program)?);
         names.extend(self.native_reach_asset_names(program));
@@ -104,9 +129,6 @@ impl Simulation {
                 continue;
             };
             if self.characters.contains_key(&request.caller) {
-                if let Some(name) = self.native_command_asset(program, id, request)? {
-                    names.insert(name);
-                }
                 continue;
             }
             if matches!(sims_vm::animation::mode(request.operands[5]), 1 | 2)

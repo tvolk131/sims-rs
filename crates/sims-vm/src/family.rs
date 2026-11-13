@@ -127,6 +127,10 @@ pub fn remove(world: &mut World, neighbor: i16, host: &mut impl Host) -> Result<
         .and_then(|i| slots.get(i).copied().flatten())
         .ok_or("family removal neighbor absent (native error 0x37)")?;
     host.close_panel(world)?;
+    remove_resolved(world, id, host)
+}
+
+fn remove_resolved(world: &mut World, id: i16, host: &mut impl Host) -> Result<bool, String> {
     // 42601e reads the retained neighbor after the panel callback has returned.
     let record = world
         .person
@@ -233,6 +237,88 @@ pub fn remove(world: &mut World, neighbor: i16, host: &mut impl Host) -> Result<
     Ok(true)
 }
 
+pub fn add(world: &mut World, neighbor: i16, host: &mut impl Host) -> Result<bool, String> {
+    let people = world.person.as_ref().ok_or("family neighborhood absent")?;
+    people.validate_neighbor_slots()?;
+    let slots = people
+        .neighbor_slots
+        .as_ref()
+        .ok_or("family neighborhood slots not supplied")?;
+    let id = usize::try_from(neighbor)
+        .ok()
+        .and_then(|value| value.checked_sub(1))
+        .and_then(|index| slots.get(index).copied().flatten())
+        .ok_or("family addition neighbor absent (native error 0x37)")?;
+    let family = people.controlled_family;
+    if !people.families.contains_key(&family) {
+        return Ok(false);
+    }
+    let record = people
+        .neighbors
+        .get(&id)
+        .ok_or("family neighbor slot record absent")?;
+    let guid = record.guid;
+    let previous = *record
+        .person
+        .get(&61)
+        .ok_or("family neighbor word absent")?;
+    if previous != 0 && !remove_resolved(world, id, host)? {
+        return Ok(false);
+    }
+    host.observe(Stage::Member, world);
+    if member(world, family, guid)?.is_some() {
+        return Ok(false);
+    }
+    let people = world.person.as_mut().unwrap();
+    let metadata = people
+        .family_metadata
+        .get_mut(&family)
+        .ok_or("family loaded metadata absent")?;
+    if let Some(guids) = &mut metadata.member_guids {
+        guids.push(guid);
+    }
+    people.families.get_mut(&family).unwrap().push(id);
+    refresh_visitors(world, host)?;
+    if member(world, family, guid)?.is_none() {
+        return Ok(false);
+    }
+    host.observe(Stage::Live, world);
+    let mut live = None;
+    for &person in &world.person.as_ref().unwrap().person_order {
+        if live_guid(world, person)? == guid {
+            live = Some(person);
+            break;
+        }
+    }
+    if let Some(person) = live {
+        let fields = world
+            .objects
+            .get_mut(&person)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        fields.insert(61, family);
+        fields.insert(67, 0);
+    }
+    let people = world.person.as_mut().unwrap();
+    let fields = &mut people.neighbors.get_mut(&id).unwrap().person;
+    fields.insert(61, family);
+    fields.insert(67, 0);
+    let metadata = people.family_metadata.get_mut(&family).unwrap();
+    metadata.flags &= !8;
+    metadata.dirty = true;
+    host.broadcast(
+        world,
+        Change {
+            family,
+            neighbor: id,
+            guid,
+        },
+    )?;
+    Ok(true)
+}
+
 pub(crate) struct Live;
 
 pub fn refresh_loaded_visitors(world: &mut World) -> Result<(), String> {
@@ -278,3 +364,7 @@ impl Host for Live {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "family_addition_tests.rs"]
+mod addition_tests;

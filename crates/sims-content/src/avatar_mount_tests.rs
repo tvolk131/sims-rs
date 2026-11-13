@@ -612,3 +612,270 @@ fn archive_source_index_leaves_loose_bindings_discovery_and_failures_untouched()
     );
     assert!(DirectoryHost::first(&mut sources.actual, b".\\absent\\*.*").is_err());
 }
+
+mod manifest_reads {
+    use super::*;
+    use std::io::{Cursor, Error, ErrorKind};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TemporaryDirectory(PathBuf);
+
+    impl TemporaryDirectory {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "sims-mount-manifest-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Host(Option<Opened>);
+
+    impl ArchiveHost for Host {
+        fn open(&mut self, _: &[u8]) -> Result<Option<Opened>, String> {
+            Ok(self.0.take())
+        }
+
+        fn open_failed(&mut self, _: &[u8]) -> Result<(), String> {
+            Err("unexpected missing archive".into())
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct State {
+        outcome: Result<(bool, usize, Option<u32>), String>,
+        directories: Vec<(Vec<u8>, Vec<(Vec<u8>, Metadata)>)>,
+        archives: Vec<(Vec<u8>, u32)>,
+        has_archives: bool,
+    }
+
+    fn mount(opened: Opened) -> State {
+        let mut manager = Manager::default();
+        let outcome = manager
+            .mount(b"./Base/Objects.far", &mut Host(Some(opened)))
+            .map(|mounted| (mounted.success, mounted.consumed, mounted.manifest_offset));
+        State {
+            outcome,
+            directories: manager
+                .directories()
+                .map(|(directory, files)| {
+                    (
+                        directory.to_vec(),
+                        files
+                            .iter()
+                            .map(|(name, metadata)| (name.to_vec(), metadata.clone()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            archives: manager
+                .archives()
+                .map(|(path, identity)| (path.to_vec(), identity))
+                .collect(),
+            has_archives: manager.has_archives,
+        }
+    }
+
+    fn archive(payload_length: usize) -> Vec<u8> {
+        let mut bytes = b"FAR!byAZ".to_vec();
+        bytes.extend(1u32.to_le_bytes());
+        bytes.extend((16u32 + payload_length as u32).to_le_bytes());
+        bytes.resize(16 + payload_length, 29);
+        bytes.extend(3i32.to_le_bytes());
+        for name in [b"Sub/one.iff".as_slice(), b"two.iff", b"Sub/one.iff"] {
+            for word in [7, 7, 16, name.len() as u32] {
+                bytes.extend(word.to_le_bytes());
+            }
+            bytes.extend(name);
+        }
+        bytes
+    }
+
+    fn compare(bytes: &[u8]) {
+        let opened = read_archive(&mut Cursor::new(bytes), 7).unwrap();
+        assert_eq!(mount(opened), mount(Opened::from_bytes(7, bytes.to_vec())));
+    }
+
+    #[test]
+    fn file_manifest_reads_preserve_mount_order_duplicates_and_every_truncation() {
+        let bytes = archive(64);
+        for length in 0..=bytes.len() {
+            compare(&bytes[..length]);
+        }
+        let state = mount(read_archive(&mut Cursor::new(&bytes), 7).unwrap());
+        assert_eq!(state.outcome, Ok((true, bytes.len(), Some(80))));
+        assert!(state.has_archives);
+        assert_eq!(state.archives, [(b".\\base\\objects.far".to_vec(), 7)]);
+    }
+
+    #[test]
+    fn file_manifest_reads_preserve_malformed_header_entry_and_partial_mount_states() {
+        let original = archive(64);
+        for position in (0..16).chain(80..original.len()) {
+            for value in [0, 1, 127, 255] {
+                let mut bytes = original.clone();
+                bytes[position] = value;
+                compare(&bytes);
+            }
+        }
+        for count in [i32::MIN, -1, 0, 1, 2, 3, 4, i32::MAX] {
+            let mut bytes = original.clone();
+            bytes[80..84].copy_from_slice(&count.to_le_bytes());
+            compare(&bytes);
+        }
+    }
+
+    struct Counted {
+        cursor: Cursor<Vec<u8>>,
+        read_bytes: usize,
+        fail_read_after: Option<usize>,
+        fail_seek: bool,
+    }
+
+    impl Read for Counted {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            if self
+                .fail_read_after
+                .is_some_and(|limit| self.read_bytes >= limit)
+            {
+                return Err(Error::new(
+                    ErrorKind::PermissionDenied,
+                    "required read failed",
+                ));
+            }
+            let count = self.cursor.read(output)?;
+            self.read_bytes += count;
+            Ok(count)
+        }
+    }
+
+    impl Seek for Counted {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            if self.fail_seek {
+                return Err(Error::new(
+                    ErrorKind::PermissionDenied,
+                    "required seek failed",
+                ));
+            }
+            self.cursor.seek(position)
+        }
+    }
+
+    #[test]
+    fn native_mount_reads_header_and_directory_without_fetching_unused_payload() {
+        let bytes = archive(2 * 1024 * 1024);
+        let expected_read_bytes = 16 + bytes.len() - (16 + 2 * 1024 * 1024);
+        let expected = mount(Opened::from_bytes(7, bytes.clone()));
+        let mut input = Counted {
+            cursor: Cursor::new(bytes),
+            read_bytes: 0,
+            fail_read_after: None,
+            fail_seek: false,
+        };
+        assert_eq!(mount(read_archive(&mut input, 7).unwrap()), expected);
+        assert_eq!(input.read_bytes, expected_read_bytes);
+    }
+
+    struct ChangingHeader {
+        cursor: Cursor<Vec<u8>>,
+        seeks: Vec<u64>,
+    }
+
+    impl Read for ChangingHeader {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let start = self.cursor.position();
+            let count = self.cursor.read(output)?;
+            if start < 16 && self.cursor.position() >= 16 {
+                self.cursor.get_mut()[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+            }
+            Ok(count)
+        }
+    }
+
+    impl Seek for ChangingHeader {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            let result = self.cursor.seek(position)?;
+            self.seeks.push(result);
+            Ok(result)
+        }
+    }
+
+    #[test]
+    fn overlapping_manifest_bytes_keep_the_captured_header_during_source_changes() {
+        for offset in 0u32..16 {
+            for length in [16, 80] {
+                let mut bytes = archive(0);
+                bytes.truncate(length);
+                bytes[12..16].copy_from_slice(&offset.to_le_bytes());
+                let expected = mount(Opened::from_bytes(7, bytes.clone()));
+                let mut input = ChangingHeader {
+                    cursor: Cursor::new(bytes),
+                    seeks: Vec::new(),
+                };
+                assert_eq!(mount(read_archive(&mut input, 7).unwrap()), expected);
+                assert!(input.seeks.is_empty());
+                assert_eq!(&input.cursor.get_ref()[12..16], &u32::MAX.to_le_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn native_mount_propagates_required_header_directory_and_seek_errors() {
+        for (fail_read_after, fail_seek, message) in [
+            (Some(0), false, "required read failed"),
+            (Some(16), false, "required read failed"),
+            (None, true, "required seek failed"),
+        ] {
+            let mut input = Counted {
+                cursor: Cursor::new(archive(64)),
+                read_bytes: 0,
+                fail_read_after,
+                fail_seek,
+            };
+            let error = read_archive(&mut input, 7).err().unwrap();
+            assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn native_archive_open_rechecks_replacements_truncation_and_source_failures() {
+        let directory = TemporaryDirectory::new();
+        let source = directory.0.join("Objects.far");
+        let replacement = directory.0.join("replacement.far");
+        let index = synthetic_index(vec![]);
+        let mut sources = Sources::new(&index);
+        sources
+            .bind_archive(b"./Base/Objects.far", &source)
+            .unwrap();
+        let path = key(b"./Base/Objects.far").unwrap();
+        for bytes in [archive(64), archive(32), archive(0)[..12].to_vec()] {
+            std::fs::write(&replacement, &bytes).unwrap();
+            std::fs::rename(&replacement, &source).unwrap();
+            let opened = ArchiveHost::open(&mut sources, &path).unwrap().unwrap();
+            assert_eq!(mount(opened), mount(Opened::from_bytes(1, bytes)));
+        }
+        std::fs::remove_file(&source).unwrap();
+        assert!(ArchiveHost::open(&mut sources, &path).unwrap().is_none());
+        std::fs::create_dir(&source).unwrap();
+        let expected = format!(
+            "read archive {}: {}",
+            source.display(),
+            std::fs::read(&source).unwrap_err()
+        );
+        assert_eq!(
+            ArchiveHost::open(&mut sources, &path).err().unwrap(),
+            expected
+        );
+    }
+}

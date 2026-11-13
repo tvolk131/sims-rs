@@ -1,4 +1,4 @@
-//! Bounded handles for one synchronous descriptor scan. Bytes, parse results,
+//! Bounded handles for a descriptor scan or mounted resource owner. Bytes, parse results,
 //! errors and resource IDs are never cached. Each read revalidates the current
 //! pathname, then uses Resource's ordinary bounds/seek/read checks. This avoids
 //! repeatedly opening the same FAR without assuming its contents are immutable.
@@ -55,13 +55,40 @@ struct Opened {
 
 #[derive(Default)]
 pub(crate) struct Scan {
+    inputs: Option<Observed>,
     #[cfg(unix)]
     files: VecDeque<Opened>,
     #[cfg(test)]
     opens: usize,
 }
+struct Observed {
+    inputs: crate::startup_inputs::Session,
+    scope: u64,
+}
+impl Drop for Observed {
+    fn drop(&mut self) {
+        self.inputs.end(self.scope);
+    }
+}
 impl Scan {
+    pub(crate) fn observed(inputs: &crate::startup_inputs::Session) -> Result<Self> {
+        Ok(Self {
+            inputs: Some(Observed {
+                inputs: inputs.clone(),
+                scope: inputs.begin()?,
+            }),
+            ..Self::default()
+        })
+    }
+    #[cfg(all(test, unix))]
+    pub(crate) fn open_count(&self) -> usize {
+        self.opens
+    }
+
     pub(crate) fn read(&mut self, resource: &Resource) -> Result<Vec<u8>> {
+        if let Some(observed) = &self.inputs {
+            return observed.inputs.read(observed.scope, resource);
+        }
         #[cfg(not(unix))]
         return resource.read();
         #[cfg(unix)]
@@ -125,9 +152,11 @@ impl Scan {
     }
 }
 
+
 #[cfg(test)]
 mod tests;
 
 // Discovery needs complete IFF validation, without unused decoded metadata.
 mod object_guids;
+pub(crate) use object_guids::matching as matching_objects;
 pub(crate) use object_guids::parse as object_guids;

@@ -33,6 +33,95 @@ pub struct Buttons {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     follow_images: bool,
 }
+
+#[cfg(test)]
+mod focus_tests {
+    use super::*;
+    use sims_vm::ui_owner::wait::{Poll, Reply, Request, State};
+
+    fn buttons() -> Buttons {
+        Buttons {
+            items: vec![Button {
+                neighbor: 1,
+                guid: 42,
+                image: Some(7),
+                highlighted: true,
+            }],
+            activated: None,
+            initialized: true,
+            follow_images: true,
+        }
+    }
+
+    #[test]
+    fn button_focus_observes_activation_not_selection_or_requested_resource() {
+        let mut buttons = buttons();
+        let condition = Condition::Focus(4500);
+        assert_eq!(
+            buttons.observation(&condition),
+            Some(Observation::Focus(None))
+        );
+        buttons.activated = Some(Key::Control(2010));
+        assert_eq!(
+            buttons.observation(&condition),
+            Some(Observation::Focus(Some(2010)))
+        );
+        buttons.activated = Some(Key::Resident(1));
+        assert_eq!(
+            buttons.observation(&condition),
+            Some(Observation::Focus(Some(-1)))
+        );
+        buttons.activated = Some(Key::Unpictured);
+        assert_eq!(
+            buttons.observation(&condition),
+            Some(Observation::Focus(None))
+        );
+        assert_eq!(buttons.observation(&Condition::Control(4500)), None);
+        buttons.activated = Some(Key::Control(4500));
+        let restored: Buttons =
+            serde_json::from_slice(&serde_json::to_vec(&buttons).unwrap()).unwrap();
+        assert_eq!(restored, buttons);
+        assert_eq!(
+            restored.observation(&condition),
+            Some(Observation::Focus(Some(4500)))
+        );
+    }
+
+    #[test]
+    fn button_focus_wait_requires_the_actual_matching_activation() {
+        for (activation, matched) in [
+            (None, false),
+            (Some(Key::Resident(1)), false),
+            (Some(Key::Unpictured), false),
+            (Some(Key::Control(2010)), false),
+            (Some(Key::Control(4500)), true),
+        ] {
+            let mut buttons = buttons();
+            buttons.activated = activation;
+            let before = buttons.clone();
+            let mut poll = Poll::begin(Some(2), buttons.focused_resource()).unwrap();
+            let mut state = State::default();
+            let publish = poll.request().unwrap().clone();
+            poll.acknowledge(&mut state, &publish, Reply::Done).unwrap();
+            poll.acknowledge(
+                &mut state,
+                &Request::Query(2),
+                Reply::Query(Some([4, 4500])),
+            )
+            .unwrap();
+            let condition = Condition::Focus(4500);
+            poll.acknowledge(
+                &mut state,
+                &Request::Observe(condition.clone()),
+                Reply::Observed(buttons.observation(&condition).unwrap()),
+            )
+            .unwrap();
+            assert_eq!(poll.request() == Some(&Request::Got(2)), matched);
+            assert_eq!(buttons, before);
+        }
+    }
+}
+
 impl Buttons {
     pub fn image(&self, neighbor: i16) -> Option<u32> {
         self.items
@@ -57,6 +146,12 @@ impl Buttons {
     }
     pub fn focused_resource(&self) -> Option<i32> {
         self.activated.and_then(|k| self.bitmap(k)).map(|(_, r)| r)
+    }
+    pub fn observation(&self, condition: &Condition) -> Option<Observation> {
+        match condition {
+            Condition::Focus(_) => Some(Observation::Focus(self.focused_resource())),
+            _ => None,
+        }
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

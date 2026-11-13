@@ -247,6 +247,7 @@ fn dialog_services_match_original_text_responses_and_registry() {
                 portrait: None,
                 bitmap_icon: None,
                 global_bitmap_icon: None,
+                guid_icon: None,
                 id: 1 + i as u64,
                 caller: 1,
                 origin: Location {

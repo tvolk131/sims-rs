@@ -94,6 +94,328 @@ fn existing_asset() -> AnimationAsset {
     }
 }
 
+#[test]
+fn runtime_reuses_owned_clips_but_missing_requests_still_read_sources() {
+    let fixture = Fixture::new(&[("clips.cmx.bcf", catalog(&[("Explicit", "samples", 1)]))]);
+    let mut program = Program::default();
+    program
+        .animations
+        .insert("explicit".into(), existing_asset());
+    let before = serde_json::to_vec(&program.animations).unwrap();
+    fs::remove_file(&fixture.index.resources[0].source).unwrap();
+    let report =
+        load_named_native_animations(&fixture.index, &mut program, &names(&["explicit"])).unwrap();
+    assert_eq!(report.loaded_clips, 0);
+    assert!(report.unresolved.is_empty());
+    assert_eq!(serde_json::to_vec(&program.animations).unwrap(), before);
+    assert!(
+        load_named_native_animations(
+            &fixture.index,
+            &mut program,
+            &names(&["explicit", "missing"])
+        )
+        .is_err()
+    );
+    assert_eq!(serde_json::to_vec(&program.animations).unwrap(), before);
+}
+
+#[test]
+fn session_catalog_matches_source_discovery_and_retains_empty_native_clips() {
+    let fixture = Fixture::new(&[
+        (
+            "animations.cmx.bcf",
+            catalog(&[("Walk", "walk", 1), ("Empty", "empty", 0)]),
+        ),
+        ("walk.cfp", vec![126; 3]),
+        ("empty.cfp", vec![]),
+        ("broken.cmx.bcf", vec![0; 9]),
+    ]);
+    let requested = names(&["walk", "empty", "missing"]);
+    let mut direct = Program::default();
+    let expected = load_named_native_animations(&fixture.index, &mut direct, &requested).unwrap();
+    let retained = NativeCatalog::prepare(&fixture.index).unwrap();
+    let mut actual = Program::default();
+    let report = retained
+        .load(&fixture.index, &mut actual, &requested)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(report).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(actual.animations).unwrap(),
+        serde_json::to_value(direct.animations).unwrap()
+    );
+}
+
+#[test]
+fn session_catalog_does_not_rescan_descriptors_but_reads_requested_samples() {
+    let fixture = Fixture::new(&[
+        ("animations.cmx.bcf", catalog(&[("Walk", "walk", 1)])),
+        ("walk.cfp", vec![126; 3]),
+    ]);
+    let retained = NativeCatalog::prepare(&fixture.index).unwrap();
+    let mut reference = Program::default();
+    load_named_native_animations(&fixture.index, &mut reference, &names(&["walk"])).unwrap();
+    fs::remove_file(&fixture.index.resources[0].source).unwrap();
+    let mut actual = Program::default();
+    let report = retained
+        .load(&fixture.index, &mut actual, &names(&["walk", "missing"]))
+        .unwrap();
+    assert_eq!(report.loaded_clips, 1);
+    assert_eq!(report.unresolved, ["missing"]);
+    assert_eq!(
+        serde_json::to_value(actual.animations).unwrap(),
+        serde_json::to_value(reference.animations).unwrap()
+    );
+    fs::remove_file(&fixture.index.resources[1].source).unwrap();
+    assert!(
+        retained
+            .load(&fixture.index, &mut Program::default(), &names(&["walk"]))
+            .is_err()
+    );
+    assert!(
+        load_named_native_animations(&fixture.index, &mut Program::default(), &names(&["walk"]))
+            .is_err()
+    );
+}
+
+#[test]
+fn session_catalog_rejects_conflicting_providers_and_preserves_explicit_clips() {
+    let fixture = Fixture::new(&[
+        ("first/animations.cmx.bcf", catalog(&[("Walk", "walk", 1)])),
+        ("first/walk.cfp", vec![126; 3]),
+        ("second/animations.cmx.bcf", catalog(&[("Walk", "walk", 1)])),
+        ("second/walk.cfp", vec![127; 3]),
+    ]);
+    let retained = NativeCatalog::prepare(&fixture.index).unwrap();
+    let error = retained
+        .load(&fixture.index, &mut Program::default(), &names(&["walk"]))
+        .unwrap_err();
+    assert!(error.to_string().contains("conflicting animation walk"));
+    let mut program = Program::default();
+    program.animations.insert("walk".into(), existing_asset());
+    let before = serde_json::to_value(&program.animations).unwrap();
+    let report = retained
+        .load(&fixture.index, &mut program, &names(&["walk"]))
+        .unwrap();
+    assert_eq!(report.loaded_clips, 0);
+    assert_eq!(before, serde_json::to_value(&program.animations).unwrap());
+}
+
+#[test]
+fn native_catalog_filename_resolves_only_its_single_clip_with_source_provenance() {
+    let fixture = Fixture::new(&[
+        ("exit.CMX.BCF", catalog(&[("Stop", "samples", 1)])),
+        ("samples.cfp", vec![126; 3]),
+    ]);
+    let requested = names(&["exit"]);
+    let mut ordinary = Program::default();
+    let report = load_named_animations(&fixture.index, &mut ordinary, &requested).unwrap();
+    assert_eq!(report.unresolved, ["exit"]);
+    assert!(ordinary.animations.is_empty());
+    let mut direct = Program::default();
+    let report = load_named_native_animations(&fixture.index, &mut direct, &requested).unwrap();
+    assert_eq!(report.loaded_clips, 1);
+    assert!(report.unresolved.is_empty());
+    let asset = &direct.animations["exit"];
+    let mut expected =
+        sims_formats::animation::read_bcf_native(&fixture.index.resources[0].read().unwrap())
+            .unwrap()
+            .remove(0);
+    expected.name = "exit".into();
+    assert_eq!(asset.clip, expected);
+    assert_eq!(asset.source, "exit.CMX.BCF");
+    assert_eq!(asset.samples_source, "samples.cfp");
+    assert_eq!(asset.samples.translations, [[0.0; 3]]);
+    assert_eq!(
+        asset.content_hash,
+        format!(
+            "{:x}",
+            Sha256::digest(fixture.index.resources[0].read().unwrap())
+        )
+    );
+    let retained = NativeCatalog::prepare(&fixture.index).unwrap();
+    let mut actual = Program::default();
+    retained
+        .load(&fixture.index, &mut actual, &requested)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(actual.animations).unwrap(),
+        serde_json::to_value(direct.animations).unwrap()
+    );
+}
+
+#[test]
+fn native_catalog_filename_does_not_override_exact_names_or_choose_multiple_clips() {
+    let fixture = Fixture::new(&[
+        ("exit.cmx.bcf", catalog(&[("Stop", "absent", 1)])),
+        ("other.cmx.bcf", catalog(&[("Exit", "samples", 1)])),
+        ("samples.cfp", vec![126; 3]),
+        (
+            "ambiguous.cmx.bcf",
+            catalog(&[("First", "absent", 1), ("Second", "absent", 1)]),
+        ),
+    ]);
+    let requested = names(&["exit", "ambiguous"]);
+    for retained in [false, true] {
+        let mut program = Program::default();
+        let report = if retained {
+            NativeCatalog::prepare(&fixture.index).unwrap().load(
+                &fixture.index,
+                &mut program,
+                &requested,
+            )
+        } else {
+            load_named_native_animations(&fixture.index, &mut program, &requested)
+        }
+        .unwrap();
+        assert_eq!(report.unresolved, ["ambiguous"]);
+        assert_eq!(program.animations["exit"].source, "other.cmx.bcf");
+        assert_eq!(program.animations["exit"].clip.name, "Exit");
+    }
+}
+
+#[test]
+fn native_catalog_filename_requires_real_samples_and_rejects_conflicting_aliases() {
+    let fixture = Fixture::new(&[
+        ("first/exit.cmx.bcf", catalog(&[("Stop", "samples", 1)])),
+        ("first/samples.cfp", vec![126; 3]),
+        ("second/exit.cmx.bcf", catalog(&[("Stop", "samples", 1)])),
+        ("second/samples.cfp", vec![127; 3]),
+        ("missing.cmx.bcf", catalog(&[("Missing", "absent", 1)])),
+    ]);
+    for retained in [false, true] {
+        let catalog = NativeCatalog::prepare(&fixture.index).unwrap();
+        let mut program = Program::default();
+        let mut load = |requested: &BTreeSet<String>| {
+            if retained {
+                catalog.load(&fixture.index, &mut program, requested)
+            } else {
+                load_named_native_animations(&fixture.index, &mut program, requested)
+            }
+        };
+        let error = load(&names(&["exit"])).unwrap_err();
+        assert!(error.to_string().contains("conflicting animation exit"));
+        assert!(load(&names(&["missing"])).is_err());
+        assert!(program.animations.is_empty());
+    }
+}
+
+#[test]
+fn native_absence_requires_complete_discovery_and_retains_its_inventory_proof() {
+    let fixture = Fixture::new(&[
+        ("clips.cmx.bcf", catalog(&[("Stop", "samples", 1)])),
+        ("samples.cfp", vec![126; 3]),
+    ]);
+    let requested = names(&["missing"]);
+    let mut ordinary = Program::default();
+    let report = load_named_animations(&fixture.index, &mut ordinary, &requested).unwrap();
+    assert_eq!(report.unresolved, ["missing"]);
+    assert!(report.confirmed_absent.is_empty());
+    let mut program = Program::default();
+    let report = load_named_native_animations(&fixture.index, &mut program, &requested).unwrap();
+    let inventory = vec![(
+        "clips.cmx.bcf",
+        "clips.cmx.bcf",
+        format!(
+            "{:x}",
+            Sha256::digest(fixture.index.resources[0].read().unwrap())
+        ),
+    )];
+    let proof = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&inventory).unwrap())
+    );
+    assert_eq!(
+        report.confirmed_absent,
+        BTreeMap::from([("missing".into(), proof)])
+    );
+    assert_eq!(report.unresolved, ["missing"]);
+    assert!(program.animations.is_empty());
+    let retained = NativeCatalog::prepare(&fixture.index).unwrap();
+    let expected = serde_json::to_value(&report).unwrap();
+    assert_eq!(
+        serde_json::to_value(
+            retained
+                .load(&fixture.index, &mut program, &requested)
+                .unwrap()
+        )
+        .unwrap(),
+        expected
+    );
+    fs::write(
+        &fixture.index.resources[0].source,
+        catalog(&[("Step", "samples", 1)]),
+    )
+    .unwrap();
+    let changed = load_named_native_animations(&fixture.index, &mut program, &requested).unwrap();
+    assert_ne!(changed.confirmed_absent, report.confirmed_absent);
+    fs::remove_file(&fixture.index.resources[0].source).unwrap();
+    assert!(load_named_native_animations(&fixture.index, &mut program, &requested).is_err());
+    assert_eq!(
+        serde_json::to_value(
+            retained
+                .load(&fixture.index, &mut program, &requested)
+                .unwrap()
+        )
+        .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn native_absence_does_not_acknowledge_ambiguous_or_malformed_resources() {
+    let fixture = Fixture::new(&[(
+        "ambiguous.cmx.bcf",
+        catalog(&[("First", "absent", 1), ("Second", "absent", 1)]),
+    )]);
+    for retained in [false, true] {
+        let mut program = Program::default();
+        let requested = names(&["ambiguous", "unknown"]);
+        let report = if retained {
+            NativeCatalog::prepare(&fixture.index).unwrap().load(
+                &fixture.index,
+                &mut program,
+                &requested,
+            )
+        } else {
+            load_named_native_animations(&fixture.index, &mut program, &requested)
+        }
+        .unwrap();
+        assert_eq!(report.unresolved, ["ambiguous", "unknown"]);
+        assert_eq!(
+            report
+                .confirmed_absent
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["unknown"]
+        );
+        assert!(program.animations.is_empty());
+    }
+    for malformed in [vec![0; 9], vec![1; 8]] {
+        let fixture = Fixture::new(&[("broken.cmx.bcf", malformed)]);
+        for retained in [false, true] {
+            let mut program = Program::default();
+            let requested = names(&["unknown"]);
+            let report = if retained {
+                NativeCatalog::prepare(&fixture.index).unwrap().load(
+                    &fixture.index,
+                    &mut program,
+                    &requested,
+                )
+            } else {
+                load_named_native_animations(&fixture.index, &mut program, &requested)
+            }
+            .unwrap();
+            assert_eq!(report.unresolved, ["unknown"]);
+            assert!(report.confirmed_absent.is_empty());
+            assert!(program.animations.is_empty());
+        }
+    }
+}
+
 struct Observation {
     result: std::result::Result<Value, String>,
     program: Program,

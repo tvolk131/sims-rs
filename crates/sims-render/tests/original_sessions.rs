@@ -1288,6 +1288,7 @@ fn original_experiment_after_reset_restores_and_renders_a_live_house() -> Result
         modules: serde_json::from_value(capture["program_modules"].clone())?,
         normalized_object_definitions: Default::default(),
         animations: serde_json::from_value(capture["program_animations"].clone())?,
+        native_animation_absences: Default::default(),
         headline_catalog: false,
         simulation: serde_json::from_value(capture["simulation"].clone())?,
         assets: serde_json::from_value(capture["assets"].clone())?,

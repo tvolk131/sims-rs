@@ -41,6 +41,8 @@ pub mod object_graphics;
 pub mod object_resources;
 pub mod owned_resources;
 mod resource_scan;
+mod startup_inputs;
+mod startup_memo;
 pub mod save_storage;
 pub mod saved_avatar;
 pub mod saved_layers;

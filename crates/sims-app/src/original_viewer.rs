@@ -9,6 +9,7 @@ use iced::{
     widget::{self, button, column, container, progress_bar, row, scrollable, slider, text},
     window,
 };
+use serde::Deserialize;
 use sims_content::Index;
 use sims_render::{
     Scene,
@@ -45,6 +46,18 @@ mod widget_lifetimes;
 mod neighborhood_usability;
 #[path = "original_viewer/viewport_drag.rs"]
 mod viewport_drag;
+#[path = "original_viewer/resident_shortcuts.rs"]
+mod resident_shortcuts;
+#[path = "original_viewer/resident_identity.rs"]
+mod resident_identity;
+#[path = "original_viewer/resident_portrait.rs"]
+mod resident_portrait;
+#[path = "original_viewer/window_observation.rs"]
+mod window_observation;
+#[path = "original_viewer/person_panel.rs"]
+mod person_panel;
+#[path = "original_viewer/game_options.rs"]
+mod game_options;
 
 ///The replacement application deliberately omits the Windows Interface
 ///receiver (camera_device::bind). In that configuration its sidebar reads the
@@ -53,9 +66,6 @@ mod viewport_drag;
 ///current tool merely to redraw a replacement label. When the native receiver
 ///is hosted, preserve its published/deferred text semantics.
 fn household_funds_label(s: &Session, published: String) -> Result<String> {
-    household_text_label(s, published, false)
-}
-fn household_text_label(s: &Session, published: String, clock: bool) -> Result<String> {
     let registry = &s
         .host
         .presentation
@@ -74,9 +84,13 @@ fn household_text_label(s: &Session, published: String, clock: bool) -> Result<S
     }
     let source = s.panel_text()?;
     Ok(sims_formats::strings::decode(
-        if clock { &source.clock } else { &source.funds },
+        &source.funds,
         source.language,
     ))
+}
+fn household_clock_label(session: &Session) -> Result<String> {
+    let source = session.panel_text()?;
+    Ok(sims_formats::strings::decode(&source.clock, source.language))
 }
 
 //485a2e subtracts signed-short grab offsets before inverse projection.
@@ -182,20 +196,15 @@ fn buy_catalog_view(
 // Native object IDs can be reused after death/deletion. The imported family
 // roster is historical metadata, so an ID alone cannot identify a live Sim.
 fn live_resident(session: &Session, id: i16) -> Option<&sims_content::saves::Resident> {
-    let object = session.simulation.vm.world.objects.get(&id)?;
-    object.person.as_ref()?;
-    let definition = object.definition.as_ref()?;
-    session
-        .house
-        .household
-        .as_ref()?
-        .residents
-        .iter()
-        .find(|r| {
-            r.object as i16 == id
-                && r.guid == definition.guid
-                && r.character_source == definition.source
-        })
+    resident_identity::live(
+        &session.simulation.vm.world,
+        &session.house.household.as_ref()?.residents,
+        id,
+    )
+}
+
+fn resident_object(session: &Session, resident: &sims_content::saves::Resident) -> Option<i16> {
+    resident_identity::object(&session.simulation.vm.world, resident)
 }
 
 fn selection_view(
@@ -382,6 +391,8 @@ impl Ready {
                     .unwrap()
                     .publish_live_interface(&mut session)?;
                 client.bind_live_panel(&session)?;
+                client.bind_live_panel_texts(person_panel::load_texts(&index,
+                    session.program.text_language.context("live panel language absent")?)?)?;
                 client.follow_resident_portraits()?;
                 Some(client)
             } else {
@@ -432,6 +443,9 @@ impl Ready {
 enum Message {
     Diagnostics,
     Options,
+    GameOptions,
+    GameOptionsSection(u64, sims_render::camera_device::panels::options::Section),
+    GameOptionsSave(u64),
     RequestApplicationChoice(neighborhood_usability::Choice),
     CancelApplicationChoice(neighborhood_usability::Confirmation),
     ConfirmApplicationChoice(neighborhood_usability::Confirmation),
@@ -450,12 +464,18 @@ enum Message {
     Toggle,
     Live,
     Needs,
+    Personality(sims_render::dialog::client::live_panel::Identity),
+    Relationships(sims_render::dialog::client::live_panel::Identity),
+    Job(sims_render::dialog::client::live_panel::Identity),
+    PersonDetails(sims_render::dialog::client::live_panel::Identity, sims_render::dialog::client::live_panel::Detail),
+    ClosePersonDetails(sims_render::dialog::client::live_panel::Identity, sims_render::dialog::client::live_panel::Popup),
     MotiveDetails(usize),
     CloseMotiveDetails,
     Step,
     Speed(f32),
     NativeSpeed(i32),
     Floor(i32),
+    Walls(u32),
     Rotate,
     RotateBack,
     ZoomIn,
@@ -537,6 +557,9 @@ struct EngineProfile {
 // child work, without changing budgets, service order, or production branches.
 macro_rules! profiled_engine {
     ($profile:expr, $stage:ident, $call:expr) => {{
+        let _span = super::support::window_session::span(
+            concat!("engine_", stringify!($stage)), || serde_json::Value::Null,
+        );
         #[cfg(test)]
         let started = $profile.as_ref().map(|_| Instant::now());
         let result = $call;
@@ -620,6 +643,8 @@ struct Viewer {
     error: Option<String>,
     choices: Vec<sims_sim::interaction::MenuChoice>,
     menu_error: Option<String>,
+    window_dialog_answer: Option<serde_json::Value>,
+    window_dialog_answers: u64,
 }
 impl Viewer {
     fn new(args: Args) -> (Self, Task<Message>) {
@@ -697,6 +722,8 @@ impl Viewer {
                 error: None,
                 choices: vec![],
                 menu_error: None,
+                window_dialog_answer: None,
+                window_dialog_answers: 0,
             },
             task,
         )
@@ -708,10 +735,14 @@ impl Viewer {
         self.accumulator = 0.;
     }
     fn install(&mut self, ready: Arc<Ready>) -> Result<()> {
+        self.window_dialog_answer = None;
         self.viewport_drag.reset();
         self.thumbnails = None;
         self.tutorial_highlight = None;
         self.session = ready.session.lock().unwrap().take();
+        if let Some(session) = &mut self.session {
+            window_observation::enable(&mut session.simulation);
+        }
         self.client = ready.client.lock().unwrap().take();
         self.device = ready.device.lock().unwrap().take();
         self.art = Some(Arc::new(ready.icons.publish_art()));
@@ -821,6 +852,7 @@ impl Viewer {
             "Original household loaded. Select a Sim and an object to queue an action."
         }
         .into();
+        self.prepare_thumbnail_catalog()?;
         self.refresh()
     }
     fn select_resident(&mut self, id: i16) -> Result<()> {
@@ -860,6 +892,7 @@ impl Viewer {
     /// Explicit application resource stage, separate from pure frame refresh.
     /// Retain incomplete native asset callers and resume this cursor on updates.
     fn prepare_and_publish(&mut self) -> Result<()> {
+        let _span = super::support::window_session::span("prepare_publication", || serde_json::Value::Null);
         #[cfg(test)]
         let start = self.frame_profile.as_ref().map(|_| Instant::now());
         if !self.client.as_ref().is_some_and(|client| client.pending())
@@ -885,6 +918,7 @@ impl Viewer {
         self.refresh()
     }
     fn refresh(&mut self) -> Result<()> {
+        let _span = super::support::window_session::span("publication_refresh", || serde_json::Value::Null);
         #[cfg(test)]
         let start = self.frame_profile.as_ref().map(|_| Instant::now());
         let result = self.refresh_inner();
@@ -949,6 +983,15 @@ impl Viewer {
                 profile.refresh.icons_portraits_residents.record(start);
             }
         }
+        if !client.pending() && !session.clock_pending() && !session.simulation.selection_work_pending() {
+            #[cfg(test)]
+            let stage_start = self.frame_profile.as_ref().map(|_| Instant::now());
+            client.refresh_live_panel(session)?;
+            #[cfg(test)]
+            if let (Some(profile), Some(start)) = (&mut self.frame_profile, stage_start) {
+                profile.refresh.live_panel.record(start);
+            }
+        }
         if self.device.is_some()
             && (session.camera_command_pending()
                 || session.interface_update_pending()
@@ -973,15 +1016,6 @@ impl Viewer {
         }
         if client.pending() && self.scene.is_some() {
             return Ok(());
-        }
-        if !client.pending() && !session.clock_pending() {
-            #[cfg(test)]
-            let stage_start = self.frame_profile.as_ref().map(|_| Instant::now());
-            client.refresh_live_panel(session)?;
-            #[cfg(test)]
-            if let (Some(profile), Some(start)) = (&mut self.frame_profile, stage_start) {
-                profile.refresh.live_panel.record(start);
-            }
         }
         #[cfg(test)]
         let stage_start = self.frame_profile.as_ref().map(|_| Instant::now());
@@ -1083,6 +1117,11 @@ impl Viewer {
         self.step_with_clock(true)
     }
     fn step_with_clock(&mut self, elapsed: bool) -> Result<bool> {
+        let _span = super::support::window_session::span("engine_step", || {
+            serde_json::json!({"elapsed":elapsed,
+                "tick":self.session.as_ref().map(|session| session.simulation.vm.tick),
+                "clock_pending":self.session.as_ref().is_some_and(Session::clock_pending)})
+        });
         let before = self.session.as_ref().map(|s| s.simulation.vm.tick);
         #[cfg(test)]
         let start = self.frame_profile.as_ref().map(|_| Instant::now());
@@ -1246,6 +1285,9 @@ impl Viewer {
                 }
                 if device.panel_widgets().is_some_and(|w| w.access().is_none()) {
                     device.bind_panel_access(session)?;
+                }
+                if device.panel_widgets().is_some_and(|widgets| widgets.options().is_none()) {
+                    device.bind_panel_options(session)?;
                 }
                 if device
                     .panel_widgets()
@@ -1586,8 +1628,11 @@ impl Viewer {
                             if session.host.presentation.tool_selection.is_some() {
                                 ids.push(2008);
                             }
+                            if session.host.presentation.tool_selection.as_ref().and_then(|owner| owner.mode_context()).is_some() {
+                                ids.push(2009);
+                            }
                             if client.live_panel().is_some() {
-                                ids.push(4500);
+                                ids.extend(sims_render::dialog::client::live_panel::Category::ALL.map(|category| category.control()));
                             }
                             ensure!(
                                 ids.contains(&i32::from(request.value)),
@@ -1638,6 +1683,9 @@ impl Viewer {
                                 continue;
                             }
                             return Ok(false);
+                        }
+                        sims_vm::ui_effect::Kind::Relationship if client.live_panel().is_some() => {
+                            client.highlight_live_relationship(session, request)?;
                         }
                         sims_vm::ui_effect::Kind::Portrait
                         | sims_vm::ui_effect::Kind::Relationship => {
@@ -1700,8 +1748,9 @@ impl Viewer {
                 }
                 Progress::Dialog => {
                     client.collect(session)?;
-                    self.playing = false;
-                    self.status = "Waiting for your response.".into();
+                    if session.simulation.vm.world.dialogs.modal.is_some() {
+                        self.status = "Waiting for your response.".into();
+                    }
                     return Ok(false);
                 }
                 Progress::Tick => {
@@ -1801,7 +1850,31 @@ impl Viewer {
             .as_ref()
             .is_some_and(|s| s.host.presentation.clock.is_some())
     }
+    fn native_partial_pass(&self) -> Result<bool> {
+        let Some(session) = self
+            .session
+            .as_ref()
+            .filter(|session| session.host.presentation.transport.is_some())
+        else {
+            return Ok(false);
+        };
+        let globals = &session.simulation.vm.world.globals;
+        let word = |index| {
+            globals
+                .get(&index)
+                .copied()
+                .with_context(|| format!("native scheduler global {index} absent"))
+        };
+        Ok(sims_vm::scheduler::Inputs {
+            paused: word(17)?,
+            mode: word(19)?,
+            lot_number: word(10)?,
+            tick: session.simulation.vm.tick as u32,
+        }
+        .partial())
+    }
     fn advance_native_frame_work(&mut self) -> Result<()> {
+        let _span = super::support::window_session::span("native_frame_work", || serde_json::Value::Null);
         for _ in 0..16 {
             self.step()?;
             if !self.session.as_ref().unwrap().clock_pending()
@@ -1823,6 +1896,7 @@ impl Viewer {
         Ok(())
     }
     fn update_clock_time(&mut self, now: Instant) -> Result<()> {
+        let partial = self.native_partial_pass()?;
         let Some(s) = self.session.as_mut() else {
             return Ok(());
         };
@@ -1832,7 +1906,7 @@ impl Viewer {
         // A local diagnostic STOPPED hold freezes the application epoch. Real
         // native pause keeps polling, and a suspended synchronous caller owns
         // its return even if a modal changed the viewer's playing flag.
-        if !self.playing && s.simulation.vm.world.globals[&17] == 0 && !s.clock_pending() {
+        if !self.playing && !partial && !s.clock_pending() {
             self.clock_origin = None;
             return Ok(());
         }
@@ -1867,6 +1941,15 @@ impl Viewer {
                 sims_runtime::original_session::ui_wait::Progress::Complete => return Ok(true),
                 sims_runtime::original_session::ui_wait::Progress::Pending => (),
                 sims_runtime::original_session::ui_wait::Progress::Observe(condition) => {
+                    if let Some(observation) = self
+                        .client
+                        .as_ref()
+                        .and_then(|client| client.buttons())
+                        .and_then(|buttons| buttons.observation(&condition))
+                    {
+                        session.acknowledge_ui_wait(&condition, observation)?;
+                        continue;
+                    }
                     if let sims_vm::ui_owner::wait::Condition::Control(id) = condition {
                         use sims_vm::interface::view_control::Widget;
                         let kind = match id {
@@ -2139,7 +2222,7 @@ impl Viewer {
         self.viewport_drag.reset();
         self.thumbnails = None;
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-        let saved: Saved = serde_json::from_value(value["session"].clone())?;
+        let saved = Saved::deserialize(&value["session"])?;
         let managed = saved.version == 2;
         ensure!(
             Some(&saved.source) == self.args.original.as_ref(),
@@ -2149,7 +2232,7 @@ impl Viewer {
         neighborhood_usability::bind_policy(&mut session, &self.args, false)?;
         bind_neighborhood_observation(&mut session, &self.args)?;
         let client = if value.get("dialog_client").is_some_and(|v| !v.is_null()) {
-            let saved = serde_json::from_value(value["dialog_client"].clone())?;
+            let saved = Deserialize::deserialize(&value["dialog_client"])?;
             if managed {
                 DialogClient::restore_managed(&session, saved)?
             } else {
@@ -2170,26 +2253,19 @@ impl Viewer {
                 .as_i64()
                 .context("saved resident absent")?,
         )?;
-        let selected: Option<i16> = serde_json::from_value(value["selected"].clone())?;
-        let tutorial_highlight: Option<i32> = serde_json::from_value(
-            value
-                .get("tutorial_highlight")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        )?;
+        let selected: Option<i16> = Deserialize::deserialize(&value["selected"])?;
+        let tutorial_highlight: Option<i32> =
+            Deserialize::deserialize(&value["tutorial_highlight"])?;
         ensure!(
             tutorial_highlight.is_none_or(|id| [2011, 2012, 2013, 2014, 2023, 2024].contains(&id)
                 || (id == 2008 && session.host.presentation.tool_selection.is_some())
+                || (id == 2009 && session.host.presentation.tool_selection.as_ref().and_then(|owner| owner.mode_context()).is_some())
                 || (id == 2010 && session.host.presentation.control_panel.is_some())
-                || (id == 4500 && client.live_panel().is_some())),
+                || ([4500, 4501, 4503, 4504].contains(&id) && client.live_panel().is_some())),
             "unsupported saved tutorial highlight"
         );
         ensure!(
-            session
-                .house
-                .household
-                .as_ref()
-                .is_some_and(|h| h.residents.iter().any(|r| r.object as i16 == resident)),
+            live_resident(&session, resident).is_some(),
             "saved selected resident is not a household member"
         );
         ensure!(
@@ -2199,9 +2275,11 @@ impl Viewer {
         self.device = value
             .get("camera_device")
             .filter(|v| !v.is_null())
-            .map(|v| CameraDevice::restore(&session, serde_json::from_value(v.clone())?))
+            .map(|saved| CameraDevice::restore(&session, Deserialize::deserialize(saved)?))
             .transpose()?;
         self.application = neighborhood_usability::Snapshot::capture(&session, &self.args)?;
+        self.window_dialog_answer = None;
+        window_observation::enable(&mut session.simulation);
         self.session = Some(session);
         self.client = Some(client);
         self.scene = None;
@@ -2212,12 +2290,12 @@ impl Viewer {
         self.tutorial_highlight = tutorial_highlight;
         self.viewport_enter_requested = value
             .get("viewport_enter_requested")
-            .map(|v| serde_json::from_value(v.clone()))
+            .map(Deserialize::deserialize)
             .transpose()?
             .unwrap_or(false);
         self.move_inputs = value
             .get("move_inputs")
-            .map(|v| serde_json::from_value(v.clone()))
+            .map(Deserialize::deserialize)
             .transpose()?
             .unwrap_or_default();
         self.renderer = OriginalHouse::default();
@@ -2227,6 +2305,7 @@ impl Viewer {
         self.clock_origin = None;
         self.pan = [0, 0];
         self.accumulator = 0.;
+        self.prepare_thumbnail_catalog()?;
         self.publish_hud_cluster();
         Ok(())
     }
@@ -2318,6 +2397,34 @@ impl Viewer {
             self.options_open = false;
             self.diagnostics = !self.diagnostics;
             return Task::none();
+        }
+        if person_panel::request(&message).is_some() {
+            let available = self.session.as_ref().zip(self.client.as_ref().and_then(|client| client.live_panel()))
+                .is_some_and(|(session, panel)| person_panel::available(panel,
+                    sims_render::dialog::client::live_panel::selected_identity(session).ok().flatten(), &message,
+                    self.error.is_some() || self.options_open || self.presentation_pending()
+                        || session.player_input_pending() || session.simulation.vm.world.dialogs.modal.is_some(),
+                    self.people_panel_visible() && self.device.as_ref().is_none_or(|device| device.panel_state() != Some(1))));
+            if !available { return Task::none(); }
+        }
+        if matches!(message, Message::GameOptions) {
+            let supported = self.session.as_ref().is_some_and(|session|
+                session.host.presentation.tool_selection.as_ref().and_then(|owner| owner.mode_context()).is_some()
+                    && session.simulation.vm.world.dialogs.modal.is_none() && !session.player_input_pending())
+                && self.device.as_ref().and_then(|device| device.panel_widgets())
+                    .is_some_and(|widgets| widgets.button(sims_vm::interface::view_control::Widget::Options).enabled);
+            if !supported || self.error.is_some() || self.options_open || self.presentation_pending() { return Task::none(); }
+        }
+        if let Message::GameOptionsSection(revision, _) | Message::GameOptionsSave(revision) = &message {
+            let widgets = self.device.as_ref().and_then(|device| device.panel_widgets());
+            let visible = widgets.and_then(|widgets| widgets.presentation())
+                .is_some_and(|presentation| presentation.visible(sims_render::camera_device::panels::Panel::Options));
+            let blocked = self.error.is_some() || self.options_open || self.presentation_pending()
+                || self.session.as_ref().is_none_or(|session| session.player_input_pending()
+                    || session.simulation.vm.world.dialogs.modal.is_some()
+                    || session.host.presentation.transport.as_ref().is_none_or(|transport| transport.controls.mode != 3));
+            if !game_options::available(widgets.and_then(|widgets| widgets.options()).and_then(|options| options.view()),
+                *revision, visible, blocked) { return Task::none(); }
         }
         if matches!(message, Message::Buy | Message::Live) {
             use sims_vm::interface::view_control::Widget;
@@ -2421,9 +2528,37 @@ impl Viewer {
             self.pan = [0, 0];
             if down {
                 let ready = !self.viewport_drag_blocked() && !self.presentation_pending();
+                let selection = self.session.as_ref().and_then(|session| {
+                    if session.host.presentation.transport.as_ref()?.controls.mode != 2 {
+                        return None;
+                    }
+                    let object = self.scene.as_ref()?.pick(pixel?)?;
+                    live_resident(session, object)?;
+                    let handle = session
+                        .simulation
+                        .vm
+                        .world
+                        .scheduler_storage
+                        .as_ref()?
+                        .handle(object)?;
+                    Some((object, handle))
+                });
                 self.viewport_drag.begin(pixel, ready);
+                self.viewport_drag.bind_selection(selection);
             } else {
                 self.viewport_drag.end(pixel);
+                if let Some((object, handle)) = self.viewport_drag.take_selection() {
+                    let current = self.session.as_ref().and_then(|session| {
+                        session.simulation.vm.world.scheduler_storage.as_ref()?.handle(object)
+                    });
+                    if current == Some(handle)
+                        && self.scene.as_ref().and_then(|scene| scene.pick(pixel?)) == Some(object)
+                        && !self.viewport_drag_blocked()
+                        && !self.presentation_pending()
+                    {
+                        return self.update(Message::Resident(object));
+                    }
+                }
             }
             return Task::none();
         }
@@ -2496,6 +2631,15 @@ impl Viewer {
             return Task::none();
         }
         if let Message::DialogKey(key) = message {
+            if key == 32
+                && self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.simulation.vm.world.dialogs.modal.is_none())
+            {
+                return resident_shortcuts::next(self)
+                    .map_or_else(Task::none, |resident| self.update(Message::Resident(resident)));
+            }
             if key == 27
                 && self
                     .session
@@ -2573,6 +2717,7 @@ impl Viewer {
                     | Message::Select(..)
                     | Message::ViewportClick(..)
                     | Message::Floor(..)
+                    | Message::Walls(_)
                     | Message::Zoom(..)
             )
         {
@@ -2608,6 +2753,10 @@ impl Viewer {
             message,
             Message::Needs | Message::MotiveDetails(_) | Message::CloseMotiveDetails
         ) {
+            if self.options_open || self.session.as_ref().is_none_or(|session|
+                session.simulation.vm.world.dialogs.modal.is_some()) {
+                return Task::none();
+            }
             let available = self
                 .client
                 .as_ref()
@@ -2616,7 +2765,7 @@ impl Viewer {
                     Message::CloseMotiveDetails => p.popup().is_some(),
                     Message::MotiveDetails(index) => {
                         index < 8
-                            && p.shown()
+                            && p.selected()
                             && self
                                 .device
                                 .as_ref()
@@ -2709,7 +2858,14 @@ impl Viewer {
                     .map(|r| ButtonKey::Resident(r.neighbor)),
                 Message::Live => Some(ButtonKey::Control(2010)),
                 Message::Buy => Some(ButtonKey::Control(2008)),
+                Message::GameOptions => Some(ButtonKey::Control(2009)),
+                Message::GameOptionsSection(_, section) => Some(ButtonKey::Control(section.resource())),
+                Message::GameOptionsSave(_) => Some(ButtonKey::Control(4950)),
                 Message::Needs => Some(ButtonKey::Control(4500)),
+                Message::Personality(_) => Some(ButtonKey::Control(4501)),
+                Message::Relationships(_) => Some(ButtonKey::Control(4504)),
+                Message::Job(_) => Some(ButtonKey::Control(4503)),
+                Message::PersonDetails(..) | Message::ClosePersonDetails(..) => Some(ButtonKey::Unpictured),
                 Message::MotiveDetails(_) | Message::CloseMotiveDetails => {
                     Some(ButtonKey::Unpictured)
                 }
@@ -2719,6 +2875,9 @@ impl Viewer {
                 Message::ZoomOut => Some(ButtonKey::Control(2014)),
                 Message::Floor(1) => Some(ButtonKey::Control(2023)),
                 Message::Floor(2) => Some(ButtonKey::Control(2024)),
+                Message::Walls(1) => Some(ButtonKey::Control(2006)),
+                Message::Walls(4) => Some(ButtonKey::Control(2004)),
+                Message::Walls(2) => Some(ButtonKey::Control(2007)),
                 // Transport/save/dialog controls have no registered original
                 // bitmap button in this backend; they do not synthesize one.
                 _ => None,
@@ -2745,12 +2904,20 @@ impl Viewer {
                     }
                     // Queued host events must not move a monotonic epoch back.
                     let now = self.last.map_or(now, |last| now.max(last));
+                    if let (Some(last), Some(device)) = (self.last, self.device.as_mut()) {
+                        if device.mode_window().is_some() {
+                            device.advance_mode_clock(now.duration_since(last))?;
+                        }
+                    }
                     let dt = self
                         .last
                         .replace(now)
                         .map_or(0., |last| now.duration_since(last).as_secs_f32())
                         .min(0.25);
                     self.update_clock_time(now)?;
+                    if !self.advance_camera_motion_frame()? {
+                        return self.prepare_and_publish();
+                    }
                     if self.presentation_pending() {
                         if self.native_clock() {
                             self.advance_native_frame_work()?;
@@ -2776,8 +2943,7 @@ impl Viewer {
                         if !self.poll_application_ui()? {
                             return Ok(());
                         }
-                        let partial = self.native_transport()
-                            && self.session.as_ref().unwrap().simulation.vm.world.globals[&17] != 0;
+                        let partial = self.native_partial_pass()?;
                         if !self.playing && !partial {
                             return self.prepare_and_publish();
                         }
@@ -2819,7 +2985,12 @@ impl Viewer {
                         .and_then(|s| s.host.presentation.transport.as_ref())
                         .is_some_and(|t| t.controls.mode != 2)
                     {
-                        self.session.as_mut().unwrap().begin_mode_change(2, 0)?;
+                        let session = self.session.as_mut().unwrap();
+                        let playing = *session.simulation.vm.world.globals.get(&17)
+                            .context("Live return native pause state absent")? == 0;
+                        session.begin_mode_change(2, 0)?;
+                        self.playing = playing;
+                        self.accumulator = 0.;
                     } else {
                         self.device
                             .as_ref()
@@ -2834,6 +3005,13 @@ impl Viewer {
                         .as_mut()
                         .context("household still loading")?
                         .begin_mode_change(1, 0)?;
+                }
+                Message::GameOptions => {
+                    self.session.as_mut().context("household still loading")?.begin_mode_change(3, 0)?;
+                }
+                Message::GameOptionsSection(revision, section) => {
+                    self.device.as_mut().context("Options device absent")?.select_options_section(
+                        self.session.as_ref().context("household still loading")?, revision, section)?;
                 }
                 Message::ExpandPanel => {
                     self.device
@@ -2887,6 +3065,19 @@ impl Viewer {
                         self.floor = floor;
                     }
                     self.selected = None;
+                }
+                Message::Walls(walls) => {
+                    if let Some(device) = &self.device {
+                        ensure!(
+                            !device.normal_view_frame_pending(),
+                            "normal-frame owns the published surface"
+                        );
+                        self.session
+                            .as_mut()
+                            .context("household still loading")?
+                            .begin_walls_change(walls)?;
+                        self.status = "Updating view…".into();
+                    }
                 }
                 Message::Zoom(zoom) => {
                     if self.device.is_some() {
@@ -3065,13 +3256,36 @@ impl Viewer {
                 }
                 Message::Select(target) => self.select_object(target)?,
                 Message::Resident(id) => {
-                    self.select_resident(id)?;
-                    let s = self.session.as_ref().unwrap();
-                    if let Some(level) = s.simulation.bodies.get(&id).map(|b| b.level) {
-                        if self.device.is_some() {
-                            self.change_view(Change::Floor(level))?;
-                        } else {
-                            self.floor = level;
+                    let repeated = self.device.is_some()
+                        && self
+                            .session
+                            .as_ref()
+                            .context("household still loading")?
+                            .simulation
+                            .native_selected_person()
+                            .map_err(anyhow::Error::msg)?
+                            == Some(id);
+                    if repeated {
+                        let target = resident_portrait::target(
+                            &self.session.as_ref().unwrap().simulation.vm.world,
+                            id,
+                        )?;
+                        self.resident = id;
+                        if let Some(target) = target {
+                            self.change_view(Change::CenterPerson {
+                                point: target.point,
+                                level: target.level,
+                            })?;
+                        }
+                    } else {
+                        self.select_resident(id)?;
+                        let s = self.session.as_ref().unwrap();
+                        if let Some(level) = s.simulation.bodies.get(&id).map(|b| b.level) {
+                            if self.device.is_some() {
+                                self.change_view(Change::Floor(level))?;
+                            } else {
+                                self.floor = level;
+                            }
                         }
                     }
                 }
@@ -3080,6 +3294,20 @@ impl Viewer {
                         .as_mut()
                         .context("live widget client absent")?
                         .select_needs(self.session.as_ref().context("household still loading")?)?;
+                }
+                Message::Personality(identity) | Message::Relationships(identity) | Message::Job(identity) => {
+                    let category = person_panel::request(&message).and_then(|(_, category)| category)
+                        .context("person category command absent")?;
+                    self.client.as_mut().context("live widget client absent")?.select_person_category(
+                        self.session.as_ref().context("household still loading")?, identity, category)?;
+                }
+                Message::PersonDetails(identity, detail) => {
+                    self.client.as_mut().context("live widget client absent")?.toggle_person_details(
+                        self.session.as_ref().context("household still loading")?, identity, detail)?;
+                }
+                Message::ClosePersonDetails(identity, expected) => {
+                    self.client.as_mut().context("live widget client absent")?.close_person_details(
+                        self.session.as_ref().context("household still loading")?, identity, expected)?;
                 }
                 Message::MotiveDetails(index) => {
                     self.client
@@ -3111,16 +3339,24 @@ impl Viewer {
                     self.status = "Cancellation requested.".into();
                 }
                 Message::Dialog(id, result) => {
-                    self.session
+                    let vm = &mut self.session
                         .as_mut()
                         .context("household still loading")?
                         .simulation
-                        .vm
-                        .answer_dialog(id, result)
+                        .vm;
+                    let answer = window_observation::answer_dialog(
+                        vm, id, result, super::support::window_session::enabled(),
+                    )
                         .map_err(anyhow::Error::msg)?;
-                    self.status = "Response recorded. Press Play to continue.".into();
+                    if let Some(mut answer) = answer {
+                        self.window_dialog_answers += 1;
+                        answer["sequence"] = self.window_dialog_answers.into();
+                        super::support::window_session::emit("dialog_answer", answer.clone());
+                        self.window_dialog_answer = Some(answer);
+                    }
+                    self.status = "Response recorded.".into();
                 }
-                Message::Save => {
+                Message::Save | Message::GameOptionsSave(_) => {
                     self.save()?;
                     self.status = format!("Saved {}", self.args.save.display());
                 }
@@ -3288,7 +3524,7 @@ impl Viewer {
                 if highlighted {
                     funds = funds.color(Color::from_rgb8(70, 184, 159));
                 }
-                panel = panel.push(text(texts.clock()));
+                panel = panel.push(text(household_clock_label(s).unwrap_or_default()));
                 let access = self
                     .device
                     .as_ref()
@@ -3315,7 +3551,7 @@ impl Viewer {
             if self.people_panel_visible() {
                 if let Some(h) = &s.house.household {
                     for r in &h.residents {
-                        let id = r.object as i16;
+                        let identity = resident_object(s, r);
                         let portrait = self.art.as_ref().and_then(|i| i.resident(r.neighbor));
                         let content: Element<'_, Message> = if let Some(image) = portrait {
                             row![widget::image(image).width(45).height(45), text(&r.name)]
@@ -3340,11 +3576,10 @@ impl Viewer {
                         panel = panel.push(
                             button(content)
                                 .on_press_maybe(
-                                    (live_resident(s, id).is_some()
-                                        && s.simulation.has_interaction_actor(id))
-                                    .then_some(Message::Resident(id)),
+                                    identity.filter(|identity| s.simulation.has_interaction_actor(*identity))
+                                        .map(Message::Resident),
                                 )
-                                .style(if id == self.resident {
+                                .style(if identity == Some(self.resident) {
                                     button::primary
                                 } else {
                                     button::secondary
@@ -3364,43 +3599,9 @@ impl Viewer {
                                     .push(widget::image(icons.tutorial()).width(50).height(50));
                             }
                         }
-                        panel = panel.push(
-                            button("Needs")
-                                .on_press_maybe(needs.person().map(|_| Message::Needs))
-                                .style(if needs.selected() {
-                                    button::primary
-                                } else {
-                                    button::secondary
-                                }),
-                        );
-                        if needs.shown() {
-                            if let Some(person) = needs.person() {
-                                use sims_render::dialog::client::live_panel::MOTIVES;
-                                for pair in (0..8).collect::<Vec<_>>().chunks(2) {
-                                    panel = panel.push(
-                                        row(pair.iter().map(|&i| {
-                                            let value = f32::from_bits(person.values[i]);
-                                            button(
-                                                column![
-                                                    text(MOTIVES[i].0).size(12),
-                                                    progress_bar(
-                                                        0.0..=1.0,
-                                                        ((value + 100.) / 200.).clamp(0., 1.)
-                                                    )
-                                                    .girth(7),
-                                                ]
-                                                .spacing(4),
-                                            )
-                                            .on_press(Message::MotiveDetails(i))
-                                            .style(button::secondary)
-                                            .width(Fill)
-                                            .into()
-                                        }))
-                                        .spacing(10),
-                                    );
-                                }
-                            }
-                        }
+                        panel = panel.push(person_panel::sidebar(needs,
+                            !self.presentation_pending() && s.simulation.vm.world.dialogs.modal.is_none()
+                                && !self.options_open, self.tutorial_highlight));
                     }
                 } else if let Some(m) = s
                     .simulation
@@ -3556,6 +3757,11 @@ impl Viewer {
                     })
                     .size(18),
                 );
+                if active == Panel::Options && let Some(options) = self.device.as_ref().and_then(|device| device.panel_widgets())
+                    .and_then(|widgets| widgets.options()).and_then(|options| options.view()) {
+                    panel = panel.push(game_options::view(options, self.art.as_deref(), !self.presentation_pending()
+                        && s.simulation.vm.world.dialogs.modal.is_none()));
+                }
                 if active == Panel::Buy
                     && let Some(catalog) = self
                         .device
@@ -3648,24 +3854,12 @@ impl Viewer {
         };
         // This popup is independent of the scrollable/collapsed bar strip.
         // Its original script-visible ownership must correspond to visible UI.
-        let viewport: Element<_> = if let Some((person, index)) = self
+        let viewport: Element<_> = if let Some(detail) = self
             .client
             .as_ref()
             .and_then(|c| c.live_panel())
-            .and_then(|p| p.person().zip(p.popup()))
+            .and_then(person_panel::popup)
         {
-            use sims_render::dialog::client::live_panel::MOTIVES;
-            let detail = container(
-                column![
-                    text(format!("{} · {}", person.name, MOTIVES[index].0)).size(18),
-                    text(format!("{:.0} / 100", f32::from_bits(person.values[index]))),
-                    button("Close details").on_press(Message::CloseMotiveDetails),
-                ]
-                .spacing(10),
-            )
-            .padding(12)
-            .width(250)
-            .style(container::rounded_box);
             widget::stack![
                 viewport,
                 container(widget::opaque(detail))
@@ -3953,6 +4147,14 @@ mod exploration;
 #[path = "headless_input.rs"]
 mod headless_input;
 
+#[cfg(test)]
+#[path = "original_viewer_gui_tests.rs"]
+mod gui_tests;
+
+#[cfg(test)]
+#[path = "original_viewer_gui_clock_tests.rs"]
+mod gui_clock_tests;
+
 // Shared with the headless widget-event driver so subscription coverage uses
 // the production mapping, including widget-capture precedence.
 fn subscription_event(
@@ -4002,6 +4204,12 @@ fn subscription_event(
 }
 
 pub fn run(mut args: Args) -> Result<()> {
+    if let Some(output) = &args.window_session_output {
+        super::support::window_session::start(output, &args.root)?;
+    }
+    if let Some(library) = &args.window_session_present_library {
+        super::support::window_session::start_presentation(library)?;
+    }
     if args.exploration_plan.is_some() {
         return exploration::run(args);
     }

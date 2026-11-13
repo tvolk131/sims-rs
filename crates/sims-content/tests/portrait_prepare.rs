@@ -7,10 +7,19 @@ use sims_runtime::original_session::{Saved, Session};
 fn original_portrait_forces_selection_before_collecting_head_models() -> Result<()> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let index = Index::scan(&root.join("game-data/cabinet-extracted"))?;
-    let saved: Saved = serde_json::from_slice(&std::fs::read(
-        root.join("cache/original-temporary-person-placed-session.json"),
-    )?)?;
-    let id = 196;
+    let custom_save = std::env::var_os("SIMS_PORTRAIT_TEST_SAVE");
+    let save_path = custom_save
+        .as_ref()
+        .map(|value| root.join(value))
+        .unwrap_or_else(|| root.join("cache/original-temporary-person-placed-session.json"));
+    let envelope: serde_json::Value = serde_json::from_slice(&std::fs::read(save_path)?)?;
+    let saved: Saved =
+        serde_json::from_value(envelope.get("session").unwrap_or(&envelope).clone())?;
+    let id = std::env::var("SIMS_PORTRAIT_TEST_ACTOR")
+        .ok()
+        .map(|value| value.parse::<sims_vm::ObjectId>())
+        .transpose()?
+        .unwrap_or(196);
     for replace in [false, true] {
         let mut session = Session::restore(&index, saved.clone())?;
         let assets = session.host.characters.get_mut(&id).unwrap();
@@ -42,6 +51,27 @@ fn original_portrait_forces_selection_before_collecting_head_models() -> Result<
             &index,
             serde_json::from_slice(&serde_json::to_vec(&before)?)?,
         )?;
+        session.simulation.enable_terminal_observations(1);
+        let witness = sims_vm::observations::NativeRouteTerminalEvent {
+            actor: id,
+            target: id,
+            request: 1,
+            thread: 1,
+            action_serial: None,
+            action_invocation: None,
+            tick: session.simulation.vm.tick,
+            success: false,
+            native_result: 4,
+            endpoint: None,
+        };
+        session
+            .simulation
+            .vm
+            .record_native_route_terminal(witness.clone());
+        session
+            .simulation
+            .vm
+            .record_native_route_terminal(witness.clone());
         // An unsupported tint must fail even with matching selector caches:
         // this proves force=1 did not silently take the cached early return.
         session
@@ -63,6 +93,7 @@ fn original_portrait_forces_selection_before_collecting_head_models() -> Result<
             session.simulation == failed.simulation.state
                 && session.host.snapshot() == failed.assets
         );
+        assert_terminal_witness(&session.simulation, &witness);
         session
             .host
             .characters
@@ -80,6 +111,8 @@ fn original_portrait_forces_selection_before_collecting_head_models() -> Result<
                 .host
                 .prepare_portrait(&mut restored.simulation, &restored.program, id)?;
         ensure!(selected == after_restore && !selected.is_empty());
+        assert_terminal_witness(&session.simulation, &witness);
+        ensure!(!restored.simulation.vm.terminal_observations().enabled());
         ensure!(
             session.simulation == restored.simulation
                 && session.host.snapshot() == restored.host.snapshot()
@@ -131,7 +164,8 @@ fn original_portrait_forces_selection_before_collecting_head_models() -> Result<
         ensure!(
             session.simulation == after.simulation.state && session.host.snapshot() == after.assets
         );
-        if replace {
+        assert_terminal_witness(&session.simulation, &witness);
+        if replace && custom_save.is_none() {
             std::fs::write(
                 root.join("cache/original-portrait-prepared-session.json"),
                 serde_json::to_vec(&after)?,
@@ -143,4 +177,15 @@ fn original_portrait_forces_selection_before_collecting_head_models() -> Result<
         );
     }
     Ok(())
+}
+
+fn assert_terminal_witness(
+    simulation: &sims_sim::Simulation,
+    witness: &sims_vm::observations::NativeRouteTerminalEvent,
+) {
+    assert!(simulation.vm.terminal_observations().enabled());
+    let observations = simulation.route_terminal_observations();
+    assert!(observations.enabled());
+    assert_eq!(observations.events().back(), Some(witness));
+    assert_eq!(observations.dropped(), 1);
 }

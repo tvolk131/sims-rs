@@ -22,7 +22,9 @@ use sims_vm::{
 use std::collections::{BTreeMap, BTreeSet};
 mod access;
 pub mod catalog;
+pub mod options;
 pub mod presentation;
+mod speed_override;
 mod text;
 pub use access::Access;
 pub use presentation::{Panel, Presentation};
@@ -148,6 +150,8 @@ pub enum Boundary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Widgets {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    speed_override: Option<speed_override::Notice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     contents: Option<catalog::Contents>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     presentation: Option<Presentation>,
@@ -155,6 +159,8 @@ pub struct Widgets {
     texts: Option<Texts>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     access: Option<Access>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    options: Option<options::Options>,
     owners: Owners,
     fields: control::Fields,
     buttons: buttons::Fields,
@@ -191,10 +197,12 @@ impl Widgets {
     fn fresh(owners: Owners, visibility_policy: u8, serial: u64) -> Self {
         let ids: Vec<_> = owners.widgets.into_iter().chain([owners.pause]).collect();
         Self {
+            speed_override: None,
             contents: None,
             presentation: None,
             texts: None,
             access: None,
+            options: None,
             fields: control::Fields {
                 registered: owners.state,
                 widgets: owners.widgets,
@@ -256,6 +264,9 @@ impl Widgets {
     pub fn access(&self) -> Option<&Access> {
         self.access.as_ref()
     }
+    pub fn options(&self) -> Option<&options::Options> {
+        self.options.as_ref()
+    }
     pub fn catalog(&self) -> Option<&catalog::Catalog> {
         self.contents.as_ref().map(|c| &c.buy)
     }
@@ -297,6 +308,11 @@ impl Widgets {
         self.call.button.is_some()
     }
     fn validate(&self) -> Result<()> {
+        self.validate_speed_override()?;
+        if let Some(options) = &self.options {
+            ensure!(self.presentation.is_some(), "Options presentation absent");
+            options.validate()?;
+        }
         if let Some(contents) = &self.contents {
             ensure!(self.presentation.is_some(), "catalog presentation absent");
             contents.validate()?;
@@ -342,7 +358,7 @@ impl Widgets {
         } else {
             ensure!(
                 self.call.buttons.is_none()
-                    && self.call.button.is_none()
+                    && (self.call.button.is_none() || self.speed_override.is_some())
                     && self.call.selection.is_none(),
                 "widget child lost ViewControl"
             );
@@ -363,7 +379,8 @@ impl Widgets {
         }
         if let Some(c) = &self.call.button {
             ensure!(self.widgets.contains_key(&c.widget), "setter widget absent");
-            let parent = self.call.buttons.as_ref().and_then(|(_, b)| b.request());
+            let parent = self.call.buttons.as_ref().and_then(|(_, call)| call.request())
+                .or_else(|| self.speed_override.as_ref().and_then(|notice| notice.call.request()));
             let matches_direct = matches!(
                 (self.call.control.as_ref().and_then(control::Update::request), &c.setter),
                 (Some(control::Request::Selected {widget, value}), Setter::Selected(_))
@@ -492,6 +509,11 @@ impl Widgets {
                 let r = b.request().context("button transition request absent")?;
                 ensure!(c.matches(r), "button reply arguments changed");
                 b.acknowledge(r).map_err(anyhow::Error::msg)?;
+            } else if let Some(notice) = &mut self.speed_override {
+                let request = notice.call.request()
+                    .context("speed override button request absent")?;
+                ensure!(c.matches(request), "speed override button reply changed");
+                notice.call.acknowledge(request).map_err(anyhow::Error::msg)?;
             } else {
                 let control = self.call.control.as_mut().context("ViewControl absent")?;
                 let r = control.request().context("ViewControl request absent")?;
@@ -531,6 +553,10 @@ impl Widgets {
         self.validate()?;
         if self.call.button.is_some() {
             self.advance_button()?;
+            return Ok(true);
+        }
+        if self.speed_override.is_some() {
+            self.advance_speed_override_notice(state, window)?;
             return Ok(true);
         }
         if let Some((parent, call)) = &mut self.call.buttons {
@@ -617,10 +643,9 @@ impl Widgets {
                         (0xa8, [show, 0, 0]) => *show != 0,
                         _ => anyhow::bail!("unsupported panel visibility request"),
                     };
-                    // Options Show also refreshes its settings/subpanels.
-                    // Its content service has not been connected to Iced.
                     if panel == Panel::Options && show {
-                        return Ok(false);
+                        let Some(options) = &mut self.options else { return Ok(false) };
+                        options.refresh(state, window)?;
                     }
                     // Immediate presentation replaces cosmetic surface fades.
                     // The Iced view removes hidden children, and its input
@@ -796,6 +821,16 @@ impl Widgets {
                 Ok(true)
             }
             Some(r)
+                if r.operation == dispatch::Operation::Options && self.options.is_some() =>
+            {
+                ensure!(r.child == Some(self.owners.panels[3]) && r.state == Some(self.owners.state),
+                    "Options dispatcher owner differs");
+                self.options.as_mut().unwrap().refresh(state, window)?;
+                self.dirty.insert(self.owners.panels[3]);
+                self.call.dispatch.acknowledge(r).map_err(anyhow::Error::msg)?;
+                Ok(true)
+            }
+            Some(r)
                 if self.contents.is_some()
                     && matches!(
                         r.operation,
@@ -855,6 +890,14 @@ pub(super) fn validate(s: &Session, saved: &Saved) -> Result<()> {
         }
         (Some(w), owner) => {
             w.validate()?;
+            if let Some(notice) = &w.speed_override {
+                ensure!(
+                    owner.is_none() && property.is_none()
+                        && s.host.presentation.notifications.as_ref().and_then(|state| state.pending())
+                            == Some(&sims_runtime::original_session::notifications::Service::Listener(notice.caller.clone())),
+                    "speed override lost its exact notification owner"
+                );
+            }
             if let Some(collapsed) = w.presentation.as_ref().and_then(Presentation::collapsed) {
                 ensure!(
                     saved.panel_state == Some(i32::from(collapsed)),
@@ -879,7 +922,9 @@ pub(super) fn validate(s: &Session, saved: &Saved) -> Result<()> {
                 !w.owners.identities().any(|i| i == id),
                 "panel aliases mode window"
             );
-            if w.call.buttons.is_none() {
+            if w.call.buttons.is_none()
+                && w.speed_override.as_ref().is_none_or(|notice| notice.call.complete())
+            {
                 ensure!(
                     (w.buttons.timer_registered != 0)
                         == window
@@ -1243,6 +1288,7 @@ impl Device {
     }
     pub(super) fn advance_panel_widgets(&mut self, s: &mut Session, budget: usize) -> Result<bool> {
         validate(s, &self.saved)?;
+        self.refresh_options_sources(s)?;
         if self
             .saved
             .panel_widgets
@@ -1727,6 +1773,42 @@ mod tests {
                 }
             }
             ensure!(results.windows(2).all(|pair| pair[0] == pair[1]));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tutorial_panel_options_show_owns_snapshot_before_visibility_across_restore() -> Result<()> {
+        for policy in [0, 1, 128] {
+            for restore in [false, true] {
+                let mut widgets = Widgets::fresh(owners(), policy, 1);
+                widgets.presentation = Some(Presentation::new(Panel::People));
+                widgets.options = Some(options::Options::new(options::Sources {
+                    floor: 1, zoom: 2, rotation: 3, free_will: Some(false),
+                })?);
+                let mut state = State::constructed(760);
+                state.buy.dirty = 2;
+                let before = state.clone();
+                let mut window = mode::Window::new(9000, None, 80, 1, 0);
+                let mut stopped = false;
+                for _ in 0..300 {
+                    let progressed = widgets.advance(&mut state, &mut window)?;
+                    widgets.validate()?;
+                    if restore {
+                        widgets = serde_json::from_slice(&serde_json::to_vec(&widgets)?)?;
+                    }
+                    if !progressed { stopped = true; break; }
+                }
+                ensure!(stopped && state == before);
+                ensure!(widgets.presentation().unwrap().active() == Some(Panel::Options));
+                ensure!(widgets.button(control::Widget::Options).selected);
+                ensure!(!widgets.button(control::Widget::Live).selected);
+                let snapshot = widgets.options().unwrap().view().context("shown Options has no content owner")?;
+                ensure!(snapshot.mode == 3 && snapshot.window_paused == 1 && !snapshot.pause_overlay
+                    && snapshot.sources.rotation == 3 && snapshot.sources.free_will == Some(false));
+                let unchanged = widgets.clone();
+                ensure!(!widgets.advance(&mut state, &mut window)? && widgets == unchanged);
+            }
         }
         Ok(())
     }

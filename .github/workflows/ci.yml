@@ -24,6 +24,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - run: python3 -B -m unittest discover -s scripts -p test_check_repository.py
+      - run: python3 -B -m unittest discover -s scripts -p test_window_session.py
+      - run: python3 -B -m unittest discover -s scripts -p test_window_presentation.py
+      - run: python3 -B -m unittest discover -s scripts -p test_window_display.py
+      - run: python3 -B -m unittest discover -s scripts -p test_window_controls.py
+      - run: python3 -B -m unittest discover -s scripts -p test_play_preview.py
+      - run: python3 -B -m unittest discover -s scripts -p test_play_alpha.py
+      - run: python3 -B -m unittest discover -s scripts -p test_preview_qualification.py
       - run: python3 -B scripts/check_repository.py
       - run: python3 -B scripts/check_repository.py --history HEAD
 

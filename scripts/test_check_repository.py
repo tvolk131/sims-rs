@@ -213,6 +213,20 @@ class RepositoryHygieneTests(unittest.TestCase):
                 self.assert_fails(name)
                 path.unlink()
 
+    def test_native_window_document_allowance_does_not_expose_research_notes(self):
+        self.write("docs/native-window-session-20261103.md", "Project-authored automation documentation.")
+        self.assert_passes()
+        name = "docs/native-window-session-unreviewed.md"
+        self.write(name, "Unreviewed historical research.")
+        self.assert_fails(name)
+
+    def test_performance_preview_allowance_does_not_expose_unreviewed_reports(self):
+        self.write("docs/performance-preview.md", "Project-authored bounded performance handoff.")
+        self.assert_passes()
+        name = "docs/performance-preview-private.md"
+        self.write(name, "Unreviewed private performance evidence.")
+        self.assert_fails(name)
+
     def test_reviewed_json_requires_exact_path_size_and_digest(self):
         content = b'{"synthetic":[1,2,3]}'
         self.write("data/example.json", content)

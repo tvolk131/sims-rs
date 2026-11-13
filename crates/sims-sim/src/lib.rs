@@ -54,6 +54,7 @@ pub mod native_wall_io;
 pub mod native_wall_vertices;
 pub mod object_catalog;
 pub mod object_scan;
+pub mod observations;
 mod path_world;
 pub mod person_creation;
 pub mod person_notification;
@@ -1383,8 +1384,15 @@ impl Simulation {
     /// BHAV expressions. The host body caches that word for geometry/rendering.
     fn sync_script_directions(&mut self) -> Result<(), String> {
         let mut changes = vec![];
+        let mut objects = self.vm.world.objects.iter().peekable();
         for (&id, body) in &self.bodies {
-            let object = &self.vm.world.objects[&id];
+            while objects.peek().is_some_and(|(key, _)| **key < id) {
+                objects.next();
+            }
+            let object = objects
+                .next_if(|(key, _)| **key == id)
+                .map(|(_, object)| object)
+                .expect("no entry found for key");
             let direction = *object.data.get(&1).ok_or("missing object direction")?;
             // BHAVs temporarily add to the raw direction word before wrapping.
             // Preserve that word in the VM; the eight-way spatial cache projects

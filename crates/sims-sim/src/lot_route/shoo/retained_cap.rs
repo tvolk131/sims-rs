@@ -88,11 +88,12 @@ fn absent_or_invalid_historical_cap_is_not_a_fresh_constructor() {
 }
 #[test]
 fn retained_query_cap_cold_binding_rejects_mismatched_owners() {
-    let (_, mut s) = crate::lot_runtime::tests::fixture();
+    let (p, mut s) = crate::lot_runtime::tests::fixture();
     s.vm.world.objects.get_mut(&2).unwrap().person = Some((0..100).map(|i| (i, 0)).collect());
     let mut e = owner(Some(8));
     let q = super::super::live::Execution::begin_retained_potential(
         &mut s,
+        &p,
         0,
         &e.route,
         super::super::live::Potential {
@@ -127,7 +128,7 @@ fn retained_query_cap_cold_binding_rejects_mismatched_owners() {
 fn retained_cap_large_then_small_room_preparation() {
     //Authored room-getter transition. The current shoo caller constructs a new
     //query on each Path; it currently loses the earlier native context cap.
-    let (_, mut s) = crate::lot_runtime::tests::fixture();
+    let (p, mut s) = crate::lot_runtime::tests::fixture();
     s.vm.world.objects.get_mut(&2).unwrap().person = Some((0..100).map(|i| (i, 0)).collect());
     let descriptor = sims_vm::routing::Descriptor([
         0,
@@ -172,25 +173,26 @@ fn retained_cap_large_then_small_room_preparation() {
         retained_result: 0,
     };
     s.vm.world.room_half_tiles.insert(0, 1000);
-    let first = LiveQuery::begin_potential(&mut s, 0, &r, settings.clone()).unwrap();
+    let first = LiveQuery::begin_potential(&mut s, &p, 0, &r, settings.clone()).unwrap();
     assert_eq!(first.potential_candidate_limit(), 8);
     s.vm.world.room_half_tiles.insert(0, 100);
     //This is the current drive_native_shoo reentry behavior, before the private
     //retained-owner correction. The expected8 comes from native unwritten+98.
     let second = LiveQuery::begin_retained_potential(
         &mut s,
+        &p,
         0,
         &r,
         settings.clone(),
         first.potential_candidate_limit(),
     )
     .unwrap();
-    let fresh_small = LiveQuery::begin_potential(&mut s, 0, &r, settings.clone()).unwrap();
+    let fresh_small = LiveQuery::begin_potential(&mut s, &p, 0, &r, settings.clone()).unwrap();
     assert_eq!(fresh_small.potential_candidate_limit(), 48);
     for invalid in [0, 7, 9, 47, 49, usize::MAX] {
         let before = s.clone();
         assert_eq!(
-            LiveQuery::begin_retained_potential(&mut s, 0, &r, settings.clone(), invalid)
+            LiveQuery::begin_retained_potential(&mut s, &p, 0, &r, settings.clone(), invalid)
                 .unwrap_err(),
             "invalid retained potential candidate limit"
         );

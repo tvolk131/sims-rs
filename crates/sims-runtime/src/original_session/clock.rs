@@ -280,10 +280,7 @@ impl Session {
     pub(super) fn advance_clock_notice(&mut self) -> Result<bool> {
         match self.advance_house_notification(self.retained_camera_input()?, 1)? {
             notifications::Progress::Complete(_) => Ok(true),
-            notifications::Progress::Pending => Ok(false),
-            notifications::Progress::Service(s) => {
-                anyhow::bail!("unbound original clock notification service: {s:?}")
-            }
+            notifications::Progress::Pending | notifications::Progress::Service(_) => Ok(false),
         }
     }
     pub fn advance_clock(&mut self, budget: usize) -> Result<Progress> {

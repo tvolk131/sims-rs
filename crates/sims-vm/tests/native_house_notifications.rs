@@ -481,7 +481,7 @@ fn native_created_broadcast_uses_full_id_and_distinct_interface_gate() {
 
 #[cfg(feature = "private-fixtures")]
 #[test]
-fn speed_override_notice_keeps_unbound_windows_panel_explicit() {
+fn speed_override_notice_requires_its_exact_windows_panel_service() {
     let report: Value =
         serde_json::from_str(include_str!("fixtures/house-notifications.json")).unwrap();
     let mut fields: Fields =
@@ -510,17 +510,25 @@ fn speed_override_notice_keeps_unbound_windows_panel_explicit() {
         assert_eq!(call.returned(), Some(0));
         assert_eq!((&fields, &globals), (&before.0, &before.1));
     }
-    assert!(
-        sims_vm::commander::house::Call::begin(
-            Receiver::Interface,
-            0x109,
-            1,
-            false,
-            &mut fields,
-            &mut globals
-        )
-        .is_err()
-    );
+    let mut call = sims_vm::commander::house::Call::begin(
+        Receiver::Interface,
+        0xffff0109,
+        0xffffffff,
+        false,
+        &mut fields,
+        &mut globals,
+    )
+    .unwrap();
+    let request = Request::SpeedOverride { active: true };
+    assert_eq!(call.pending(), Some(&request));
+    assert_eq!(call.returned(), None);
+    call = serde_json::from_slice(&serde_json::to_vec(&call).unwrap()).unwrap();
+    call.validate().unwrap();
+    assert_eq!(call.advance(&fields, &globals).unwrap(), Some(&request));
+    assert!(call.acknowledge(&Request::UiRefresh).is_err());
+    assert_eq!(call.returned(), None);
+    call.acknowledge(&request).unwrap();
+    assert_eq!(call.returned(), Some(1));
     assert_eq!((fields, globals), before);
 }
 

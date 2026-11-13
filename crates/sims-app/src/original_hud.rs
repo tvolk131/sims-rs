@@ -399,6 +399,14 @@ impl Viewer {
             .map_or(2, |t| t.controls.mode);
         if mode == 1 { 150 } else { 100 }
     }
+    pub(super) fn prepare_thumbnail_catalog(&mut self) -> Result<()> {
+        if self.thumbnails.is_none()
+            && let Some(session) = &self.session
+        {
+            self.thumbnails = Some(Thumbnails::new(session)?);
+        }
+        Ok(())
+    }
     /// Separate presentation resource owner: thumbnail loading cannot allocate
     /// game objects or disturb the dialog client's retained resource handles.
     pub(super) fn prepare_catalog_thumbnails(&mut self) -> Result<()> {
@@ -442,19 +450,16 @@ impl Viewer {
         if products.is_empty() && definitions.is_empty() {
             return Ok(());
         }
-        if self.thumbnails.is_none() {
-            self.thumbnails = Some(Thumbnails::new(
-                self.session.as_ref().context("thumbnail session absent")?,
-            )?);
-        }
+        self.prepare_thumbnail_catalog()?;
+        let thumbnails = self.thumbnails.as_mut().context("thumbnail session absent")?;
         //These independent presentation images do not gate catalog commands.
         //Spread cold portrait decoding across UI frames; pending cells already
         //have their labels, prices and clickable product identity.
         for product in products.into_iter().take(2) {
-            self.thumbnails.as_mut().unwrap().prepare(&product);
+            thumbnails.prepare(&product);
         }
         for d in definitions {
-            self.thumbnails.as_mut().unwrap().prepare_live(&d);
+            thumbnails.prepare_live(&d);
         }
         Ok(())
     }
@@ -489,21 +494,28 @@ impl Viewer {
                 let target = match id {
                     2010 => Some([10, size.height as i32 - 183 + 6]),
                     2008 => Some([69, size.height as i32 - 183 + 20]),
+                    2009 if self.hud_cluster.as_ref().is_some_and(|cluster| cluster.values.buttons.options.is_some()) =>
+                        Some([193, size.height as i32 - 183 + 125]),
                     2011 => Some([43, size.height as i32 - 183 + 127]),
                     2012 => Some([9, size.height as i32 - 183 + 127]),
                     2013 => Some([26, size.height as i32 - 183 + 105]),
                     2014 => Some([26, size.height as i32 - 183 + 149]),
                     2023 => Some([5, size.height as i32 - 183 + 92]),
                     2024 => Some([5, size.height as i32 - 183 + 77]),
-                    4500 if self
+                    resource @ (4500 | 4501 | 4503 | 4504) if self
                         .device
                         .as_ref()
                         .is_none_or(|d| d.panel_state() != Some(1))
-                        && self.client.as_ref().and_then(|c| c.live_panel()).is_some() =>
+                        && self.people_panel_visible()
+                        && self.client.as_ref().and_then(|c| c.live_panel()).and_then(|panel| panel.person()).is_some() =>
                     {
-                        Some([size.width as i32 - 388 + 4, size.height as i32 - 100 + 33])
+                        super::person_panel::hud_position(resource).map(|[horizontal, vertical]|
+                            [size.width as i32 - 388 + horizontal, size.height as i32 - 100 + vertical])
                     }
-                    _ => None,
+                    id => cluster::WALL_CONTROLS
+                        .iter()
+                        .find(|wall| wall.id == id)
+                        .map(|wall| [wall.x as i32, size.height as i32 - 183 + wall.y as i32]),
                 };
                 if let Some(position) = target
                     && let Some((width, height, _)) = icons.hud(id)
@@ -532,7 +544,13 @@ impl Viewer {
         let cluster = cluster::view(state, self.options_open);
         let mut hud = widget::stack![widget::Space::new().width(Fill).height(183)];
         if !collapsed {
-            let content: Element<_> = if !state.values.people_visible && mode == 1 {
+            let content: Element<_> = if mode == 3 {
+                match self.device.as_ref().and_then(|device| device.panel_widgets())
+                    .and_then(|widgets| widgets.options()).and_then(|options| options.view()) {
+                    Some(options) => super::game_options::view(options, self.art.as_deref(), ready),
+                    None => text("Opening game Options…").into(),
+                }
+            } else if !state.values.people_visible && mode == 1 {
                 container(scrollable(self.catalog_hud(ready)))
                     .height(150)
                     .into()
@@ -542,7 +560,7 @@ impl Viewer {
                     .height(100)
                     .into()
             };
-            let height = if mode == 1 { 150. } else { 100. };
+            let height = if matches!(mode, 1 | 3) { 150. } else { 100. };
             let strip = widget::stack![
                 self.hud_background(if mode == 1 { 4918 } else { 4910 }, 0., height),
                 widget::opaque(content)
@@ -560,7 +578,7 @@ impl Viewer {
                     .align_y(iced::alignment::Vertical::Bottom),
             );
         }
-        hud.push(cluster).into()
+        hud.push(cluster).push(at(button("Application…").on_press(Message::Options).into(), 228., 5.)).into()
     }
     fn hud_background(&self, id: i32, width: f32, height: f32) -> Element<'_, Message> {
         cluster::background(self.art.as_deref(), id, width, height)
@@ -649,7 +667,7 @@ impl Viewer {
             && let Some(h) = &s.house.household
         {
             for resident in &h.residents {
-                let id = resident.object as i16;
+                let identity = resident_object(s, resident);
                 let face: Element<'_, Message> = self
                     .art
                     .as_ref()
@@ -659,12 +677,12 @@ impl Viewer {
                 let mut item: Element<_> = button(face)
                     .padding(0)
                     .on_press_maybe(
-                        (live_resident(s, id).is_some() && s.simulation.has_interaction_actor(id))
-                            .then_some(Message::Resident(id)),
+                        identity.filter(|identity| s.simulation.has_interaction_actor(*identity))
+                            .map(Message::Resident),
                     )
                     .style(move |_, status| {
                         let mut style = text_button_style(&iced::Theme::Dark, status);
-                        style.border.color = if id == self.resident {
+                        style.border.color = if identity == Some(self.resident) {
                             CYAN
                         } else {
                             Color::from_rgb8(87, 108, 180)
@@ -719,7 +737,7 @@ impl Viewer {
             .into();
         }
         let mut bars = column![].spacing(1);
-        if needs.shown()
+        if needs.selected()
             && let Some(person) = needs.person()
         {
             use sims_render::dialog::client::live_panel::MOTIVES;
@@ -775,12 +793,19 @@ impl Viewer {
             4.,
             33.,
         ));
-        // Other native subpanels do not yet have hosted command owners.
+        for (category, x, y) in [
+            (sims_render::dialog::client::live_panel::Category::Relationships, 76., 2.),
+            (sims_render::dialog::client::live_panel::Category::Personality, 44., 34.),
+            (sims_render::dialog::client::live_panel::Category::Job, 76., 34.),
+        ] {
+            if let Some(person) = needs.person() {
+                gadget = gadget.push(at(self.hud_control(category.control(), category.label(),
+                    super::person_panel::category_message(person.identity(), category), None,
+                    ready, needs.category_selected(category)), x, y));
+            }
+        }
         for (id, label, x, y) in [
             (4505, "Interests", 44., 2.),
-            (4504, "Relationships", 76., 2.),
-            (4501, "Personality", 44., 34.),
-            (4503, "Job", 76., 34.),
             (4507, "Gifts", 44., 66.),
             (4502, "House", 76., 66.),
         ] {
@@ -796,7 +821,9 @@ impl Viewer {
                 y,
             ));
         }
-        let content: Element<'_, Message> = if needs.shown() && needs.person().is_some() {
+        let content: Element<'_, Message> = if needs.shown() && !needs.selected() {
+            container(super::person_panel::content(needs, ready)).padding([3, 9]).width(280).height(100).into()
+        } else if needs.shown() && needs.person().is_some() {
             container(column![
                 container(text("Needs").font(motives::FONT).size(14)).padding([0, 9]),
                 bars.width(200)

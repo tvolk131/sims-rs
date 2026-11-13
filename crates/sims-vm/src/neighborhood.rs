@@ -2,6 +2,19 @@
 use crate::person::WorldState;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) fn finish_tutorial(world: &mut crate::World) -> Result<(), String> {
+    if !world.globals.contains_key(&26)
+        || !world.neighborhood.contains_key(&1)
+        || !world.neighborhood.contains_key(&2)
+    {
+        return Err("tutorial completion storage is incomplete".into());
+    }
+    world.globals.insert(26, 0);
+    world.neighborhood.insert(1, 1);
+    world.neighborhood.insert(2, 0);
+    Ok(())
+}
+
 /// Fields consumed by neighborhood reload before registering new characters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Family {

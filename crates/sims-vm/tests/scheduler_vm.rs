@@ -310,6 +310,55 @@ fn synchronous_callback_can_suspend_inside_the_same_object_visit() {
 }
 
 #[test]
+fn completed_visit_allows_callbacks_but_never_ordinary_reentry() {
+    let (program, mut vm, [thread, other]) = fixture();
+    vm.begin_scheduled_object_visit(1).unwrap();
+    assert_eq!(
+        vm.run_slice(&program, thread, 1).unwrap().stop,
+        Stop::Sleeping
+    );
+    vm.finish_object_update(1, true).unwrap();
+    let suspended = vm.threads[&thread].clone();
+    let visit = vm.scheduled_object_visit.clone();
+    for _ in 0..2 {
+        vm.begin_immediate_callback(
+            &program,
+            thread,
+            Start {
+                owner: "test",
+                bhav: 4096,
+                caller: 1,
+                callee: 1,
+                stack_object: 1,
+                args: vec![0; 4],
+                check: true,
+            },
+        )
+        .unwrap();
+        restore(&mut vm, &program);
+        vm.run_slice(&program, thread, 1).unwrap();
+        assert!(vm.threads[&thread].callback.is_none());
+        restore(&mut vm, &program);
+    }
+    assert_eq!(vm.threads[&thread].stack, suspended.stack);
+    assert_eq!(vm.threads[&thread].status, suspended.status);
+    assert!(!vm.threads[&thread].check);
+    assert_eq!(vm.scheduled_object_visit, visit);
+    assert_eq!(vm.world.objects[&1].data[&25], 8);
+    assert_eq!(vm.tick, 500);
+    let before = vm.clone();
+    assert_eq!(
+        vm.run_slice(&program, thread, 1).unwrap_err(),
+        "native object update has already returned"
+    );
+    assert_eq!(vm, before);
+    assert!(vm.run_slice(&program, other, 1).is_err());
+    assert_eq!(vm, before);
+    vm.end_scheduled_object_visit().unwrap();
+    assert!(vm.scheduled_object_visit.is_none());
+}
+
+#[test]
 fn nested_engine_update_preserves_the_parent_visit_across_save_resume() {
     let (p, mut vm, [first, second]) = fixture();
     vm.begin_scheduled_object_visit(1).unwrap();

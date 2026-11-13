@@ -263,6 +263,7 @@ impl Execution {
                     }
                     s.vm.finish_object_update(id, true)?;
                     s.vm.refresh_registry_flags(p, id)?;
+                    s.vm.finish_factory_object_visit(id)?;
                     *started = false;
                     *cursor += 1;
                 }
