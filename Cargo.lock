@@ -284,7 +284,9 @@ name = "sims-vm"
 version = "0.1.0"
 dependencies = [
  "sims-content",
+ "sims-core",
  "sims-formats",
+ "sims-sim",
 ]
 
 [[package]]

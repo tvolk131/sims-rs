@@ -10,7 +10,9 @@ publish = false
 
 [dependencies]
 sims-content.workspace = true
+sims-core.workspace = true
 sims-formats.workspace = true
+sims-sim.workspace = true
 
 [lints]
 workspace = true

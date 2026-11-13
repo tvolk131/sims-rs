@@ -25,7 +25,7 @@ matches the original game tick for tick.
 | `sims-formats` | Readers for the game's archive, resource and save formats. |
 | `sims-content` | Finds a game install, indexes its files in the original's load order, and loads neighborhoods and houses. |
 | `sims-sim` | A lot's simulation state, its state hash, and REDB snapshots. |
-| `sims-vm` | The SimAntics interpreter, starting with the program linker. |
+| `sims-vm` | The SimAntics interpreter: program linking, frames and calls, operand scopes, and the first primitives. |
 | `sims-cli` | The `sims` developer tool: content census, install and house checks, and `sims boot`. |
 
 ## Determinism rules
