@@ -1,14 +1,18 @@
 //! `sims`: developer tools for the game's data files.
 
 mod census;
+mod install;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: sims census <path>...
+       sims install <install-root>
 
   census   Decode every resource under the given files or directories and
-           report failures and resource types that have no reader yet.";
+           report failures and resource types that have no reader yet.
+  install  Detect a game install and list what each mount contributes, in
+           the original's load order.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -24,6 +28,16 @@ fn main() -> ExitCode {
             print!("{}", census.report());
             ExitCode::SUCCESS
         }
+        Some((command, [root])) if command == "install" => match install::report(root.as_ref()) {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        },
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)

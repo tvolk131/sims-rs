@@ -1,0 +1,15 @@
+[package]
+name = "sims-content"
+description = "Finds a game install and indexes its files and archive members in the original's load order."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+sims-formats.workspace = true
+
+[lints]
+workspace = true
