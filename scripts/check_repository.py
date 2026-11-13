@@ -20,16 +20,27 @@ PUBLIC_DOCUMENTS = {
 }
 PRIVATE_PATHS = {
     "crates/sims-app/src/original_viewer/exploration/startup_play/host_journey/tutorial_camera/go_here/walking/tests.rs",
+    "legacy/crates/sims-app/src/original_viewer/exploration/startup_play/host_journey/tutorial_camera/go_here/walking/tests.rs",
     "crates/sims-render/tests/clown_household_continuation.rs",
+    "legacy/crates/sims-render/tests/clown_household_continuation.rs",
     "crates/sims-render/tests/fresh_household_replay.rs",
+    "legacy/crates/sims-render/tests/fresh_household_replay.rs",
     "crates/sims-vm/src/native_registry_reentry/tests.rs",
+    "legacy/crates/sims-vm/src/native_registry_reentry/tests.rs",
     "crates/sims-vm/src/native_suspension/tests.rs",
+    "legacy/crates/sims-vm/src/native_suspension/tests.rs",
     "crates/sims-vm/src/retained_epoch/tests.rs",
+    "legacy/crates/sims-vm/src/retained_epoch/tests.rs",
     "crates/sims-vm/src/scheduler/storage/word_tail_tests.rs",
+    "legacy/crates/sims-vm/src/scheduler/storage/word_tail_tests.rs",
     "crates/sims-app/src/original_viewer_continuation_tests.rs",
+    "legacy/crates/sims-app/src/original_viewer_continuation_tests.rs",
     "crates/sims-app/src/tutorial_presentation_tests.rs",
+    "legacy/crates/sims-app/src/tutorial_presentation_tests.rs",
     "crates/sims-sim/src/pose/transform/retained-goth.json",
+    "legacy/crates/sims-sim/src/pose/transform/retained-goth.json",
     "crates/sims-content/src/autonomy_resources/expected-final-process.json",
+    "legacy/crates/sims-content/src/autonomy_resources/expected-final-process.json",
 }
 FORBIDDEN_SUFFIXES = {
     ".7z", ".app", ".bcf", ".bin", ".bmf", ".bmp", ".cfp", ".cmx",

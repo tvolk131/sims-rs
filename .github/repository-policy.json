@@ -5,151 +5,151 @@
   "large_blob_allowlist": [],
   "reviewed_data": [
     {
-      "path": "crates/sims-app/scenarios/menu-sweep.json",
+      "path": "legacy/crates/sims-app/scenarios/menu-sweep.json",
       "bytes": 400,
       "sha256": "74f31e55b8e29cceb5de247b8db64018bf5983222fb0fd847d8a170997249387",
       "provenance": "Project-authored scenario or synthetic test-owner record; no original game resource payload."
     },
     {
-      "path": "crates/sims-app/scenarios/milestone-wait.json",
+      "path": "legacy/crates/sims-app/scenarios/milestone-wait.json",
       "bytes": 550,
       "sha256": "01fd5dced56edd879ab1f77bc10e31057cf9661da3bcb050abc016caaa52043e",
       "provenance": "Project-authored scenario or synthetic test-owner record; no original game resource payload."
     },
     {
-      "path": "crates/sims-app/scenarios/quick-play.json",
+      "path": "legacy/crates/sims-app/scenarios/quick-play.json",
       "bytes": 272,
       "sha256": "e591ac57a1f8221f1c0345154a65bc002659e7ee34aaa8e154e9e2c5c4cdc0c6",
       "provenance": "Project-authored scenario or synthetic test-owner record; no original game resource payload."
     },
     {
-      "path": "crates/sims-app/scenarios/seeded-endurance.json",
+      "path": "legacy/crates/sims-app/scenarios/seeded-endurance.json",
       "bytes": 389,
       "sha256": "6f2ea2bbd205959d55e395518d50fadbb9ece7c845b771f1857e0227f02c1015",
       "provenance": "Project-authored scenario or synthetic test-owner record; no original game resource payload."
     },
     {
-      "path": "crates/sims-content/src/autonomy_resources/initial-input.json",
+      "path": "legacy/crates/sims-content/src/autonomy_resources/initial-input.json",
       "bytes": 954,
       "sha256": "3d898ef159716cfcc854b8081a0acf5d3f2e77779d05d0717abbd7d5d8baf8d1",
       "provenance": "Reviewed scalar initial configuration and source fingerprints; no executable instructions, game prose or resource payload."
     },
     {
-      "path": "crates/sims-content/src/graphic_retirement/observed/authored.json",
+      "path": "legacy/crates/sims-content/src/graphic_retirement/observed/authored.json",
       "bytes": 3761,
       "sha256": "99d36ee7474971854ed4a395515e38c470b45c989b03102d64f38d2afc2f231d",
       "provenance": "Project-authored scenario or synthetic test-owner record; no original game resource payload."
     },
     {
-      "path": "crates/sims-vm/src/registry_suspension/token.authored.json",
+      "path": "legacy/crates/sims-vm/src/registry_suspension/token.authored.json",
       "bytes": 2131,
       "sha256": "3c2454fec1692892d397aaa59951d868102fe5e34e8c110018502543069c176d",
       "provenance": "Project-authored scenario or synthetic test-owner record; no original game resource payload."
     },
     {
-      "path": "fixtures/suites/all.json",
+      "path": "legacy/fixtures/suites/all.json",
       "bytes": 6866,
       "sha256": "ab8028e7bf340ffd88ff2a7e72ad3af118cdc629708bec9b79d3b39dda4329c0",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/completed-native-animations.json",
+      "path": "legacy/fixtures/suites/completed-native-animations.json",
       "bytes": 476,
       "sha256": "a0aa7658f8b94edd8ab128a33638b535695e8585b77654531fd4b6c8efd76d7d",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/completed-native-appearances.json",
+      "path": "legacy/fixtures/suites/completed-native-appearances.json",
       "bytes": 558,
       "sha256": "9cc7aceff400a7b1026b7d15af3c171be28f56f157785c800a9092fe077926cf",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/completed-native-groups.json",
+      "path": "legacy/fixtures/suites/completed-native-groups.json",
       "bytes": 460,
       "sha256": "0297be823d956f2d8c9ba69a4f55e2682b11a0490b6688ebf1fd1a6204556c4b",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/completed-native-ordinary.json",
+      "path": "legacy/fixtures/suites/completed-native-ordinary.json",
       "bytes": 545,
       "sha256": "26c88f8bb37706f3f0e4db290d00de8d96b7529804cb779145e47dddc596ef86",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/completed-native-person-world.json",
+      "path": "legacy/fixtures/suites/completed-native-person-world.json",
       "bytes": 484,
       "sha256": "316aac94da61f3e2da8733eff0927e3a7af1cc05e2a276a3ffb1f4167d40e526",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/completed-native-prototypes.json",
+      "path": "legacy/fixtures/suites/completed-native-prototypes.json",
       "bytes": 479,
       "sha256": "810a0ba425839ce2c38e9f91597b5dde5ecd4ac88a1a1f4b248d71f1cdbe85da",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/completed-native-reentry.json",
+      "path": "legacy/fixtures/suites/completed-native-reentry.json",
       "bytes": 464,
       "sha256": "7f006e8faa920ee4313d43e49b651a545c5d6ea7507fcdaa7c64ca526018d7ad",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/completed-native-residents.json",
+      "path": "legacy/fixtures/suites/completed-native-residents.json",
       "bytes": 475,
       "sha256": "acd34bddf784957c10382c461ecf3c8d4b912a907cfce8356b4baae38f78dbe6",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/completed-native-skeletons.json",
+      "path": "legacy/fixtures/suites/completed-native-skeletons.json",
       "bytes": 472,
       "sha256": "d817d0ad8ed7fdedc11470f431624e491eea7521b8d11218b5543249ccf18020",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/completed-native-skin.json",
+      "path": "legacy/fixtures/suites/completed-native-skin.json",
       "bytes": 452,
       "sha256": "2666c0fef7e1f329eff0e1dfe5150d42e045335a3b52a5c21199e2b4a8b19dc4",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/completed-native-stacks.json",
+      "path": "legacy/fixtures/suites/completed-native-stacks.json",
       "bytes": 460,
       "sha256": "e26bc3f1a1ddb116db75ba36dc6ca34da0491fb9040208fe21cdb2f88658584f",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/components.json",
+      "path": "legacy/fixtures/suites/components.json",
       "bytes": 5314,
       "sha256": "6045ea5902e3146cc89af9e96ad4e0c837396054bbf3fd55d6121a830a6c629f",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/continuation.json",
+      "path": "legacy/fixtures/suites/continuation.json",
       "bytes": 532,
       "sha256": "12c9917b287bc18efef3a54e4fb0c3a358f7b3a50c4f87ac2db4b0996def1136",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/goth-fresh-original-play.json",
+      "path": "legacy/fixtures/suites/goth-fresh-original-play.json",
       "bytes": 1494,
       "sha256": "8af19d27833d119f4159275f011adaf5e38e70b55bec0e0251b53cad57723f38",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/goth-one-tick-cold.json",
+      "path": "legacy/fixtures/suites/goth-one-tick-cold.json",
       "bytes": 656,
       "sha256": "a3f4170c21880ace018cc538b17b6c4d5fb0e9861c500520bcc11b4611f1a17f",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/goth-one-tick.json",
+      "path": "legacy/fixtures/suites/goth-one-tick.json",
       "bytes": 653,
       "sha256": "40e5e2d58ef58ce8cc78f50d6de228fd8a6c6a80f29f7c2d619716ed0288f4e1",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."
     },
     {
-      "path": "fixtures/suites/original.json",
+      "path": "legacy/fixtures/suites/original.json",
       "bytes": 2356,
       "sha256": "01525b0a9195eb7ad41c615f89531078b3a0a20f1ba0c9eea7877fbd25aa2b24",
       "provenance": "Project-authored validation suite or input schedule; private case identifiers and hashes only, not the referenced capture bytes."

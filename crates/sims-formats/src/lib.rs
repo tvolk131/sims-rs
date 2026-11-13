@@ -9,7 +9,6 @@ pub mod iff;
 mod legacy_sprite;
 pub mod lot;
 pub mod neighborhood;
-pub mod pe32;
 mod reader;
 pub mod saved_objects;
 pub mod sprite;
