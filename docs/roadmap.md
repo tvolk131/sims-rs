@@ -43,6 +43,14 @@ Each step is a few PRs, and each PR leaves `main` green.
 5. **Match.** Diff our state against the capture, fix the causes one by
    one, and raise K.
 
+### Progress
+
+- Step 1 is done: `sims install` detects the CD layout and builds the
+  object catalog. The Legacy Collection layout waits for a real install.
+- Step 2 is done: `sims boot <install> <house>` loads the Goth house into
+  `World`, prints its state hash and can save a REDB snapshot. `--ticks`
+  waits for step 3.
+
 ## Working rules
 
 - Work in branches, open PRs, and merge when CI is green on both platforms.

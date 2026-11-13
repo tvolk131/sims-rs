@@ -1,0 +1,21 @@
+[package]
+name = "sims-sim"
+description = "The simulation state of a lot: objects, scheduler, random streams, budget and lot arrays, with a state hash and snapshots."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+postcard.workspace = true
+redb.workspace = true
+serde.workspace = true
+sha2.workspace = true
+sims-content.workspace = true
+sims-core.workspace = true
+sims-formats.workspace = true
+
+[lints]
+workspace = true

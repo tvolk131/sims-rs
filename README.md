@@ -23,8 +23,9 @@ matches the original game tick for tick.
 | --- | --- |
 | `sims-core` | Deterministic primitives: the x87-faithful float model and the game's random streams. |
 | `sims-formats` | Readers for the game's archive, resource and save formats. |
-| `sims-content` | Finds a game install and indexes its files in the original's load order. |
-| `sims-cli` | The `sims` developer tool, starting with a content census. |
+| `sims-content` | Finds a game install, indexes its files in the original's load order, and loads neighborhoods and houses. |
+| `sims-sim` | A lot's simulation state, its state hash, and REDB snapshots. |
+| `sims-cli` | The `sims` developer tool: content census, install and house checks, and `sims boot`. |
 
 ## Determinism rules
 
