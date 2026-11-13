@@ -18,15 +18,12 @@
 //! that is off the lot, holds nothing, sits in nothing, is one tile, is
 //! not a person, and has no callbacks for leaving the lot (9, 10 and 26).
 //! Anything else needs the lot's placement and callback services and
-//! fails loudly. Flag bit 1 asks that removing the object does not reset
+//! fails loudly (`Machine::leave_lot` in `removal.rs`). Flag bit 1 asks that removing the object does not reset
 //! the objects that depend on it; it is recorded on the object for
 //! whatever carries the removal out.
 
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine, word};
-
-/// Off the lot: where the factory puts a new object.
-const OFF_LOT: i32 = -16;
 
 impl Machine<'_, '_> {
     pub(crate) fn remove(&mut self, operands: &[u8; 8]) -> Result<Flow, Trap> {
@@ -53,40 +50,12 @@ impl Machine<'_, '_> {
     }
 
     fn queue_removal(&mut self, id: u16, flags: u8) -> Result<(), Trap> {
-        let object = &self.world.objects[&id];
-        let definition = self.definition(object.guid)?;
-        let callbacks = self
-            .program
-            .libraries
-            .get(&definition.resource)
-            .and_then(|l| l.callbacks.get(&definition.chunk));
-        let leaves_quietly = [9, 10, 26].iter().all(|&i| {
-            callbacks
-                .and_then(|c| c.get(i))
-                .is_none_or(|f| f.action == 0)
-        });
-        let simple = object.data.len() == 72
-            && object.person.is_none()
-            && object.multipart.is_none()
-            && object.data.get(2) == Some(&0)
-            && object.slots.iter().skip(1).all(|slot| slot.object == 0)
-            && object.position[..2] == [OFF_LOT, OFF_LOT]
-            && leaves_quietly;
-        if !simple {
-            return Err(Trap::Unsupported(format!(
-                "removing object {id} needs the lot's placement and callback services"
-            )));
-        }
+        self.leave_lot(id)?;
         let object = self
             .world
             .objects
             .get_mut(&id)
             .ok_or(Trap::native(10, "missing object"))?;
-        // Detached: no container, no slot, no room.
-        for (word, value) in [(2, 0), (3, -1), (14, -1), (26, 0), (29, -5)] {
-            object.data[word] = value;
-        }
-        object.data[8] &= !0x100;
         object.removal_skips_resets = flags & 2 != 0;
         self.world.removals.push(id);
         Ok(())

@@ -263,7 +263,7 @@ impl<'a> Machine<'a, '_> {
 
     /// Step 4, the thread part (0x47480c): the Main tree becomes the only
     /// frame, with four zero arguments and no stack object.
-    fn install_main(&mut self) -> Result<(), Trap> {
+    pub(crate) fn install_main(&mut self) -> Result<(), Trap> {
         let definition = self.definition(self.me()?.guid)?;
         let main = self.program.callback(definition, Callback::Main);
         if main == 0 {

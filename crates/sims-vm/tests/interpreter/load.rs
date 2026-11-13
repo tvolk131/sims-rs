@@ -180,3 +180,103 @@ fn the_indicators_are_created_and_hidden() {
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     assert!(interpreter.create_indicators(&mut fx.world).is_err());
 }
+
+/// A saved type-table entry.
+fn saved(id: u16, guid: u32, init: u32, main: u32) -> sims_formats::lot::ObjectType {
+    sims_formats::lot::ObjectType {
+        guid,
+        init_signature: init,
+        main_signature: main,
+        id,
+        kind: 4,
+        name: String::new(),
+        extra: None,
+    }
+}
+
+/// The widget type's linked Init and Main signatures, with the trees'
+/// revisions set to 3 and 5.
+fn signed() -> (Fixture, u32, u32) {
+    let (mut fx, file) = widgets();
+    fx.world.objects.clear();
+    fx.world.order.clear();
+    let library = fx.program.libraries.get_mut(&file).unwrap();
+    library.behaviors.get_mut(&4096).unwrap().revision = 3;
+    library.behaviors.get_mut(&4097).unwrap().revision = 5;
+    let init = fx.program.signature(file, 4096);
+    let main = fx.program.signature(file, 4097);
+    assert_ne!(init, main);
+    (fx, init, main)
+}
+
+#[test]
+fn a_type_is_changed_when_either_signature_differs() {
+    let (fx, init, main) = signed();
+    let interpreter = fx.interpreter();
+    let changed = |init, main| interpreter.type_changed(&saved(9, WIDGET, init, main));
+    assert_eq!(changed(init, main), Some(false));
+    assert_eq!(changed(init + 1, main), Some(true));
+    assert_eq!(changed(init, main + 1), Some(true));
+    // A GUID with no definition has no answer.
+    assert_eq!(
+        interpreter.type_changed(&saved(9, 0xdead, init, main)),
+        None
+    );
+}
+
+#[test]
+fn reading_the_type_table_replaces_it_and_marks_the_changed_types() {
+    let (mut fx, init, main) = signed();
+    // The lamp's saved signatures cannot match: its file has no such trees
+    // and the save says otherwise.
+    let table = sims_formats::lot::ObjectTypes {
+        version: 2,
+        entries: vec![
+            saved(40, WIDGET, init, main),
+            saved(41, LAMP_GUID, 77, 78),
+            saved(42, 0xdead, 1, 2),
+        ],
+    };
+    // Flags from an earlier load: one the table clears, one it does not
+    // list and so leaves alone.
+    fx.world.changed_types = [WIDGET, SIM_GUID].into();
+    let interpreter = fx.interpreter();
+    let mut world = fx.world.clone();
+    assert_eq!(
+        interpreter.read_types(&mut world, &table),
+        Ok(vec![LAMP_GUID])
+    );
+    assert_eq!(world.changed_types, [LAMP_GUID, SIM_GUID].into());
+    // The table holds the saved IDs of the types that have a definition.
+    assert_eq!(
+        world.types,
+        std::collections::BTreeMap::from([(40, WIDGET), (41, LAMP_GUID)])
+    );
+    // A new object's frames use the saved ID.
+    assert_eq!(interpreter.create(&mut world, WIDGET), Ok(1));
+    assert_eq!(world.objects[&1].stack[0].code_owner_type, 40);
+    // With an object on the lot the table cannot be replaced.
+    let fault = interpreter.read_types(&mut world, &table).unwrap_err();
+    assert!(matches!(fault.trap, Trap::Unsupported(_)), "{fault}");
+}
+
+#[test]
+fn two_saved_types_for_one_definition_keep_the_later_id() {
+    let (fx, init, main) = signed();
+    let table = sims_formats::lot::ObjectTypes {
+        version: 2,
+        entries: vec![
+            saved(40, WIDGET, init + 1, main),
+            saved(44, WIDGET, init, main),
+        ],
+    };
+    let interpreter = fx.interpreter();
+    let mut world = fx.world.clone();
+    // The later record's comparison is the one that stands.
+    assert_eq!(interpreter.read_types(&mut world, &table), Ok(vec![WIDGET]));
+    assert!(world.changed_types.is_empty());
+    assert_eq!(
+        world.types,
+        std::collections::BTreeMap::from([(44, WIDGET)])
+    );
+}

@@ -51,7 +51,7 @@ Each step is a few PRs, and each PR leaves `main` green.
 - Step 3 is in progress. The interpreter runs saved frames, creates
   objects through the original's factory, and puts them to sleep. The load
   sequence below tracks the load steps that must run before the first
-  tick; `sims boot` runs the first four.
+  tick; `sims boot` runs the first five and the start of the sixth.
 
 ### Load sequence
 
@@ -62,10 +62,11 @@ changes the state the first tick sees.
 
 The order and the addresses come from the old prototype's research on the
 1.91 executable. Each step was checked there on its own, against the
-original's code run in isolation. Steps 1 to 3 are also checked against a
-capture of the running original (see step 3). The rest of the sequence has
-not been compared with a running game, so it is **unverified** until the
-comparison harness exists.
+original's code run in isolation. Steps 1 to 5 are also checked against
+captures of the running original (see steps 3 and 5), and three results of
+step 7 are (see step 7). The rest of the sequence has not been compared
+with a running game, so it is **unverified** until the comparison harness
+exists.
 
 The original does not build a lot for a house. It keeps one lot for as long
 as it runs and loads each house into it. So a load starts from whatever
@@ -80,9 +81,12 @@ That starting lot is **unverified**; see the decision log.
 | 2 | Set the globals the running game supplies | `0x46cdc6`, `0x46cfb3`, `0x415eff` | Done (`World::apply_context`) |
 | 3 | Resize the held lot, which creates the lot-wide controllers | `0x415e20`, `0x442b9f` | Done for a bare lot that shrinks (`Interpreter::resize`) |
 | 4 | Clear the family global | `0x415eff` | Done (`World::clear_family`) |
-| 5 | Clear the lot: remove every object on it | `0x44279a` | Not started |
-| 6 | Read the house's lot arrays, type table and objects onto the cleared lot | `0x478599`, `0x43dd76`, `0x43fe0a` | Readers done (`World::from_house`); not yet run onto the cleared lot |
-| 7 | Mark the object types whose scripts changed since the save | `0x43a516` | Computed by `sims boot`, not stored yet |
+| 5 | Clear the lot: remove every object on it | `0x44279a`, `0x445f84`, `0x44123f`, `0x440eeb` | Done for objects that are off the lot (`Interpreter::clear`) |
+| 6a | Read the house's lot arrays | `0x478599` | Done (`World::read_arrays`), **unverified** |
+| 6b | Renumber the saved floor and wall IDs | `0x4a0e3b`, `0x4c5d35` | Not started |
+| 6c, 7 | Read the house's type table, marking the object types whose scripts changed since the save | `0x43dd76`, `0x43a516` | Done (`Interpreter::read_types`); not called here yet |
+| 6d | Clear the lot again | `0x445f84`, `0x44279a` | Done (step 5); not called here yet |
+| 6e | Read the house's objects onto the cleared lot | `0x449c5e`, `0x43fe0a` | Saved fields only (`World::read_objects`); the constructors are not started; not called here yet |
 | 8 | Reconcile the lot-wide controllers among the saved objects | `0x43fc02`, `0x442b9f` | Creation done (`Interpreter::reconcile_controllers`); deleting duplicates not started; not called here yet |
 | 9 | Repair the ground object grid and restore placement links | `0x443cb3` | Not started |
 | 10 | Give every object its room | `0x442659` | Not started |
@@ -93,7 +97,7 @@ That starting lot is **unverified**; see the decision log.
 
 `sims boot` runs the steps in order and stops at the first one that is not
 done, so it never prints the hash of a state the original could not be in.
-Today it stops after step 4.
+Today it stops after step 6a.
 
 #### The steps
 
@@ -148,21 +152,76 @@ modeled.
 
 **5. Clear.** Every object on the held lot is removed: first the two
 indicators (`0x445f84`), then whatever heads the registration list until
-the list is empty, which takes the controllers step 3 made. The IDs queued
-for removal stay queued until step 11. Removing an object is not ported
-yet. The old prototype reproduced a capture of the original at the end of
-this step too; the tick, all three random streams and the queued removals
-are the same there as when the resize returns.
+the list is empty, which takes the controllers step 3 made. The list is
+read again after each removal.
 
-**6. House contents.** The lot arrays, the type table and the saved objects
-are read onto the cleared lot. `World::from_house` holds the readers, but
-it reads a whole file onto an empty lot in one go, so it skips steps 3 to
-5 and what they leave behind.
+Removing an object (`0x44123f`) has two parts. The object leaves the lot
+(`0x433125`). Then the registry deletes it (`0x440eeb`): it gives up the
+ownership of interface events, every person drops their references to it,
+it resets one last time, the objects it holds are removed, and it is
+unlinked from the registration list and from its type's instance list. The
+last reset (`0x431fbe`) runs the object's Reset tree if it has one, on top
+of whatever its thread holds, and then restarts its thread at Main. An
+object without a Reset tree just leaves the lot.
 
-**7. Changed types.** For each saved type the original compares the saved
-Init and Main signatures with the linked scripts. A type that differs is
-flagged, and step 13 resets its objects. In the Goth house that is 77 of
-113 types.
+The IDs queued for removal stay queued until step 11, though their objects
+are gone: the queue holds bare IDs, and whoever drains it skips an ID that
+names no object. A type's instance list stays, empty. The clock, the lot's
+size, the globals and the random streams do not change, unless a Reset
+tree changes them.
+
+For the Goth house this step is checked against a capture of the original
+taken when the clear returns. Eighteen of the 141 controllers have a Reset
+tree, and all run. Afterwards the lot has no objects, and the tick, the
+size, the 64 globals, both game random streams, the two queued IDs, the
+instance list and the indicator references all match the capture. The
+gated test `the_goth_house_clear_removes_every_object` pins our state and
+says what was compared.
+
+Only this case is ported: an object that is off the lot, one tile, not a
+person, holding nothing and held by nothing, with no callback for leaving
+the lot, on a lot with no people. Anything else fails with an error that
+says so. The interface, the objects' graphics and the lot's rooms are not
+modeled.
+
+**6. House contents.** The original reads the rest of the house in five
+parts, in this order. The order comes from the old prototype's reading of
+the original's code between two captured moments of the Goth load: the end
+of step 5 and the start of the object read.
+
+*6a. Lot arrays.* Fourteen arrays replace the lot's: IDs 0, 4, 1, 2, 3, 8,
+101, 102, 103, 108, 6, 7, 9 and 10, asked for in that order. Arrays 9 and
+10 may be absent. No capture covers this, so it is **unverified**.
+
+*6b. Floors and walls.* A saved floor or wall names its pattern by an ID
+that belongs to the save. The original maps the saved IDs to the IDs of
+the patterns it has loaded and rewrites the arrays. This is not ported,
+and `sims boot` stops before it.
+
+*6c. Type table.* See step 7, which the original does in the same pass.
+
+*6d. Second clear.* The original clears the lot again. In a load from the
+neighborhood the lot is already empty, so nothing happens.
+
+*6e. Objects.* Each saved object is constructed and then takes its saved
+fields. It keeps its saved ID and is appended to the registration list in
+the file's order. `World::read_objects` holds the saved fields, the order
+and the instance lists. It does not run the constructors: those of people
+and of object graphics draw from the C runtime's random stream, and a
+person's attaches it to its neighborhood record. Until they are ported the
+load cannot do this step, and `World::read_objects` is **unverified**.
+
+**7. Changed types.** As it reads each record of the type table, the
+original compares the saved Init signature with the linked script's, and
+if they are equal the Main signatures too. A type that differs is flagged
+on its definition, and step 13 resets its objects. The flag belongs to the
+running game: a type the table does not list keeps the flag an earlier
+load gave it. The table itself, saved type ID to GUID, is rebuilt from the
+definitions that a record named. In the Goth house 77 of 113 types are
+flagged. A capture confirms three of them, the Goths' own types: the
+original worked out an Init signature of 20 for each, as we do, flagged
+them, and never worked out their Main signature. The other 110 are
+**unverified**.
 
 **8. Controllers again.** The same reconciliation as in step 3, now among
 the saved objects. The original keeps the first saved instance of each

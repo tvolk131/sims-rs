@@ -54,15 +54,25 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     world.apply_context(context)?;
     let created = interpreter.resize(&mut world)?;
     world.clear_family()?;
+    let queued = world.removals.len();
+    let removed = interpreter.clear(&mut world)?;
+    world.read_arrays(&house.arrays)?;
+    // The load stops here. Next the original renumbers the saved floor and
+    // wall IDs, which is not ported. After that it reads the type table,
+    // which marks the types whose scripts changed; that is ported
+    // (`Interpreter::read_types`), so say what it will mark.
+    if house.guid_table {
+        return Err("the house has a GUID translation table (Gtab), which is not ported".into());
+    }
     let types = &house.types.entries;
     let mut mismatches = Vec::new();
     for entry in types {
         let object = catalog
             .object(entry.guid)
             .ok_or_else(|| format!("type {} has no definition", entry.id))?;
-        let current = [Callback::Init, Callback::Main]
-            .map(|c| program.signature(object.resource, program.callback(object, c)));
-        if current != [entry.init_signature, entry.main_signature] {
+        if interpreter.type_changed(entry) == Some(true) {
+            let current = [Callback::Init, Callback::Main]
+                .map(|c| program.signature(object.resource, program.callback(object, c)));
             mismatches.push(format!(
                 "  type {} {:?} (0x{:08X}): saved {:08x}/{:08x}, linked {:08x}/{:08x}",
                 entry.id,
@@ -100,11 +110,20 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     }
     let _ = writeln!(
         out,
-        "Load:    lot resized to {} tiles, {} controllers created, {} waiting for removal; \
-         stopped before the lot is cleared (not implemented yet)",
+        "Load:    lot resized to {} tiles, {} controllers created, {queued} queued for removal",
         world.size,
         created.len(),
-        world.removals.len()
+    );
+    let _ = writeln!(
+        out,
+        "         lot cleared, {} objects removed; {} lot arrays read",
+        removed.len(),
+        world.arrays.len()
+    );
+    let _ = writeln!(
+        out,
+        "         stopped before the saved floors and walls are renumbered (not implemented \
+         yet)"
     );
     let _ = writeln!(
         out,

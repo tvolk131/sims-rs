@@ -3,9 +3,11 @@
 //! lists every step of the original's lot load in order; the ones that run
 //! scripts live in `sims-vm`.
 
-use crate::World;
+use crate::{FULL_SIZE, World};
 use serde::{Deserialize, Serialize};
+use sims_formats::lot::Array;
 use sims_formats::tatt::Tatt;
+use std::collections::BTreeMap;
 
 /// What the running game, rather than the house file, supplies to a lot
 /// load.
@@ -54,6 +56,14 @@ pub enum LoadError {
     /// A step that needs all 64 globals ran on fewer, so before
     /// [`World::apply_context`].
     NoContext,
+    /// The house file lacks a lot array the load reads.
+    MissingArray(u16),
+    /// A saved lot array is not 64 by 64 cells.
+    ArraySize {
+        array: u16,
+        width: usize,
+        height: usize,
+    },
 }
 
 impl std::fmt::Display for LoadError {
@@ -61,11 +71,33 @@ impl std::fmt::Display for LoadError {
         match self {
             Self::GlobalCount(n) => write!(f, "{n} saved globals; expected 32 or 64"),
             Self::NoContext => write!(f, "the load context has not been applied"),
+            Self::MissingArray(array) => write!(f, "the house has no lot array {array}"),
+            Self::ArraySize {
+                array,
+                width,
+                height,
+            } => write!(
+                f,
+                "lot array {array} is {width} by {height} cells; only {FULL_SIZE} by \
+                 {FULL_SIZE} is supported"
+            ),
         }
     }
 }
 
 impl std::error::Error for LoadError {}
+
+/// The lot arrays a load reads from the house file, by Arry chunk ID, in
+/// the order the original asks for them (0x478599) when the house's
+/// version is 62 or later. The order is from the old prototype's reading of
+/// the original's code (legacy/docs/research/
+/// retained-saved-source-prefix-audit-20261026.md), not from a trace of the
+/// reads.
+pub const SAVED_ARRAYS: [u16; 14] = [0, 4, 1, 2, 3, 8, 101, 102, 103, 108, 6, 7, 9, 10];
+
+/// The last two of [`SAVED_ARRAYS`]: the original ignores whether reading
+/// them worked.
+const OPTIONAL_ARRAYS: [u16; 2] = [9, 10];
 
 /// The global that holds the budget mode. Funds change only while it is 0.
 const BUDGET_MODE: usize = 32;
@@ -126,6 +158,41 @@ impl World {
                 record.values[row.values.len()..].fill(0);
             }
         }
+    }
+
+    /// Reads a house's lot arrays onto the lot (0x478599): each array in
+    /// [`SAVED_ARRAYS`] replaces the lot's array of that ID. Arrays 9 and 10
+    /// may be absent, and then the lot keeps its own. Any other array in
+    /// the file is not read. On an error the lot is unchanged.
+    ///
+    /// **Unverified**: no capture of the original covers this step. Three
+    /// things are known to be missing. The original stops at the first
+    /// array that fails to read and goes on with the load; here a missing
+    /// array is an error. The original then renumbers the saved floor and
+    /// wall IDs (0x4a0e3b, 0x4c5d35), which is not ported. And the lot's
+    /// size is not applied to the arrays: every array must be 64 by 64, as
+    /// the original's are whatever the lot's size.
+    pub fn read_arrays(&mut self, saved: &BTreeMap<u16, Array>) -> Result<(), LoadError> {
+        let mut read = Vec::new();
+        for id in SAVED_ARRAYS {
+            let Some(array) = saved.get(&id) else {
+                if OPTIONAL_ARRAYS.contains(&id) {
+                    continue;
+                }
+                return Err(LoadError::MissingArray(id));
+            };
+            let full = FULL_SIZE as usize;
+            if array.width != full || array.height != full {
+                return Err(LoadError::ArraySize {
+                    array: id,
+                    width: array.width,
+                    height: array.height,
+                });
+            }
+            read.push((id, array.clone()));
+        }
+        self.arrays.extend(read);
+        Ok(())
     }
 
     /// Clears the family in global 9 (0x415eff). The house loader does
