@@ -93,11 +93,9 @@ fn faults_come_before_the_draw() {
     // Read-only destination.
     let mut fx = Fixture::new();
     assert_eq!(code(random(&mut fx, 7, 0, 7, 10)), Some(0x13));
-    // Unreadable destination, before the range is even read.
-    assert!(matches!(
-        trap(random(&mut fx, 3, 25, 7, 0)),
-        Trap::Unsupported(_)
-    ));
+    // Unreadable destination (the lamp has no motives), before the range
+    // is even read.
+    assert_eq!(code(random(&mut fx, 14, 0, 7, 0)), Some(0x1c));
     // A destination whose store is unsupported.
     assert!(matches!(
         trap(random(&mut fx, 3, 11, 7, 10)),

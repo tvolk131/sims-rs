@@ -2,15 +2,19 @@
 //! interpreter. Each returns which branch to take. A primitive with no
 //! implementation fails with [`Trap::Unimplemented`], which names it.
 
+mod events;
 mod expression;
+mod generic;
 mod object_type;
 mod random;
 mod refresh;
+mod remove;
 mod set_to_next;
+mod sleep;
 mod sound;
 
 use crate::fault::Trap;
-use crate::interpreter::Machine;
+use crate::interpreter::{Flow, Machine};
 use sims_formats::behavior::Instruction;
 
 /// Primitive names, by opcode. Names the old prototype dispatched on are
@@ -81,16 +85,21 @@ pub fn primitive_name(opcode: u16) -> &'static str {
 }
 
 impl Machine<'_, '_> {
-    /// Runs a primitive and returns its branch.
-    pub(crate) fn primitive(&mut self, instruction: &Instruction) -> Result<bool, Trap> {
-        match instruction.opcode {
-            2 => self.expression(&instruction.operands),
-            7 => self.refresh(&instruction.operands),
-            8 => self.random(&instruction.operands),
-            23 => self.play_sound(&instruction.operands),
-            31 => self.set_to_next(&instruction.operands),
-            32 => self.test_object_type(&instruction.operands),
-            opcode => Err(Trap::Unimplemented { opcode }),
-        }
+    /// Runs a primitive and returns its branch, or that it yields.
+    pub(crate) fn primitive(&mut self, instruction: &Instruction) -> Result<Flow, Trap> {
+        let operands = &instruction.operands;
+        Ok(match instruction.opcode {
+            0 => self.sleep(operands)?,
+            1 => self.generic_call(operands)?.into(),
+            2 => self.expression(operands)?.into(),
+            7 => self.refresh(operands)?.into(),
+            8 => self.random(operands)?.into(),
+            10 => self.own_events(operands)?.into(),
+            18 => self.remove(operands)?,
+            23 => self.play_sound(operands)?.into(),
+            31 => self.set_to_next(operands)?.into(),
+            32 => self.test_object_type(operands)?.into(),
+            opcode => return Err(Trap::Unimplemented { opcode }),
+        })
     }
 }

@@ -5,6 +5,7 @@
 
 use crate::World;
 use serde::{Deserialize, Serialize};
+use sims_formats::tatt::Tatt;
 
 /// What the running game, rather than the house file, supplies to a lot
 /// load.
@@ -25,12 +26,19 @@ pub struct Context {
 
 impl Context {
     /// The values the original has when it loads a lot from the
-    /// neighborhood on a Complete Collection install: mode 0, global 25
-    /// zero, free will on, every expansion, top performance class. The old
-    /// prototype used these as its headless profile. **Unverified**: the
-    /// comparison harness must read them from the running original.
+    /// neighborhood on a Complete Collection install: mode 1, global 25
+    /// zero, free will on, every expansion, top performance class.
+    ///
+    /// A capture of the original, taken by the old prototype's harness as
+    /// it began to load a house whose saved global 15 is 0, has global 15
+    /// at 1, global 20 at 0xff and global 33 at 2 before any script has
+    /// run. The mode is 1 on that evidence; the old prototype's headless
+    /// profile had 0. Global 25 and free will are **unverified**: the
+    /// capture agrees with them but the house saved the same values. The
+    /// performance class comes from the machine's memory and CPU speed, so
+    /// a comparison harness must read it from the running original.
     pub const COMPLETE_COLLECTION: Self = Self {
-        mode: 0,
+        mode: 1,
         global25: 0,
         free_will: 1,
         expansions: 0xff,
@@ -67,9 +75,10 @@ impl World {
     /// simulator's setup zeroes all 64 globals (0x46cdc6, 0x46ceb9), the SIMI
     /// reader overlays the saved words and refreshes the running fields
     /// (0x46cfb3), and the house loader then restores the installation's
-    /// globals and clears the budget mode and family (0x415eff).
+    /// globals and clears the budget mode (0x415eff). The saved family in
+    /// global 9 stays until [`World::clear_family`].
     ///
-    /// Call it once, on the globals [`World::from_house`] read.
+    /// Call it once, on the globals [`World::read_simulator`] read.
     pub fn apply_context(&mut self, context: Context) -> Result<(), LoadError> {
         let saved = &self.globals;
         if !matches!(saved.len(), 32 | 64) {
@@ -91,8 +100,41 @@ impl World {
         globals[20] = context.expansions as i16;
         globals[33] = context.performance_class;
         globals[BUDGET_MODE] = 0;
-        globals[9] = 0;
         self.globals = globals.to_vec();
+        Ok(())
+    }
+
+    /// Reads the neighborhood's saved type attributes (TATT) into the
+    /// records the catalog made (0x43e0f0). Each saved row goes to the
+    /// first record with its GUID, and the rest of that record is zeroed. A
+    /// row for a GUID with no record is skipped, as long as it has at most
+    /// 128 words. A row with more words than its record holds, or more
+    /// than 128 with no record, ends the read: it and every later row
+    /// change nothing.
+    ///
+    /// Ported from the old prototype's `State::load`
+    /// (legacy/crates/sims-vm/src/resource_storage.rs).
+    pub fn read_type_attributes(&mut self, saved: &Tatt) {
+        for row in &saved.entries {
+            let record = self.type_attributes.iter_mut().find(|r| r.guid == row.guid);
+            let capacity = record.as_ref().map_or(128, |r| r.values.len());
+            if row.values.len() > capacity {
+                return;
+            }
+            if let Some(record) = record {
+                record.values[..row.values.len()].copy_from_slice(&row.values);
+                record.values[row.values.len()..].fill(0);
+            }
+        }
+    }
+
+    /// Clears the family in global 9 (0x415eff). The house loader does
+    /// this after the lot is resized and before it reads the house's
+    /// objects, so the lot-wide controllers the resize creates still see
+    /// the saved family. [`World::select_family`] sets it again later.
+    pub fn clear_family(&mut self) -> Result<(), LoadError> {
+        self.context_applied()?;
+        self.globals[9] = 0;
         Ok(())
     }
 

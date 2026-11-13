@@ -19,8 +19,9 @@ const USAGE: &str = "usage: sims census <path>...
            the original's load order.
   houses   Load every house in a neighborhood (such as UserData) against an
            install, with the neighborhood's characters registered.
-  boot     Load a house into simulation state and print its state hash.
-           --snapshot saves that state to a REDB file as \"boot\".";
+  boot     Run a house's lot load as far as it is implemented and print the
+           hash of the state it reaches. --snapshot saves that state to a
+           REDB file as \"boot\".";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

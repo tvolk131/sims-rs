@@ -5,6 +5,8 @@ pub enum Error {
     Content(sims_content::Error),
     /// An object whose GUID the catalog has no definition for.
     MissingDefinition(u32),
+    /// Content that needs something of the original that is not ported.
+    Unsupported(String),
 }
 
 impl fmt::Display for Error {
@@ -12,6 +14,7 @@ impl fmt::Display for Error {
         match self {
             Self::Content(error) => error.fmt(f),
             Self::MissingDefinition(guid) => write!(f, "no definition for GUID 0x{guid:08X}"),
+            Self::Unsupported(message) => write!(f, "unsupported: {message}"),
         }
     }
 }

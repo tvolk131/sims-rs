@@ -145,3 +145,80 @@ fn a_neighborhood_needs_its_family_file() {
         .to_string();
     assert!(error.contains("Neighborhood.iff"), "{error}");
 }
+
+/// A string table in the localized format: (language, text) rows.
+fn strings(rows: &[(u8, &str)]) -> Vec<u8> {
+    let mut bytes = (-3i16).to_le_bytes().to_vec();
+    bytes.extend((rows.len() as u16).to_le_bytes());
+    for (language, text) in rows {
+        bytes.push(*language);
+        bytes.extend(text.as_bytes());
+        bytes.extend([0, 0]); // end of text, empty comment
+    }
+    bytes
+}
+
+#[test]
+fn zoning_comes_from_the_neighborhoods_table() {
+    let tree = Tree::new("zoning");
+    setup(&tree);
+    let neighborhood = Neighborhood::open(&tree.0.join("Hood")).unwrap();
+    // No file, no table.
+    assert!(neighborhood.zoning(0xff).unwrap().is_empty());
+    let table = strings(&[
+        (1, "1, residential"),
+        (1, " 5 , Community"),
+        (1, "5, residential"), // the first row for a lot wins
+        (1, "7, something else"),
+        (1, "8, residential community"),
+        (1, "no comma here"),
+        (1, "x12, community"), // no leading number: lot 0
+        (1, "-3, community"),
+        (1, "99999, community"), // does not fit a lot number
+        (2, "2, community"),     // another language's rows are not read
+    ]);
+    tree.file("Hood/LotZoning.iff", &iff(&[(b"STR#", 1, &table)]));
+    let zoning = neighborhood.zoning(0).unwrap();
+    let rows: Vec<_> = zoning.into_iter().collect();
+    assert_eq!(rows, [(-3, 2), (0, 2), (1, 1), (5, 2), (7, 1), (8, 1)]);
+    // With Makin' Magic installed and no row for its lots, they are added.
+    let zoning = neighborhood.zoning(0x80).unwrap();
+    assert_eq!(zoning.len(), 15);
+    assert_eq!(
+        (zoning[&90], zoning[&92], zoning[&93], zoning[&98]),
+        (1, 1, 2, 2)
+    );
+    // A row for one of them means the file already knows the pack.
+    let table = strings(&[(1, "91, community")]);
+    tree.file("Hood/LotZoning.iff", &iff(&[(b"STR#", 1, &table)]));
+    let zoning = neighborhood.zoning(0x80).unwrap();
+    assert_eq!(zoning.into_iter().collect::<Vec<_>>(), [(91, 2)]);
+}
+
+#[test]
+fn reads_the_saved_type_attributes() {
+    let tree = Tree::new("type-attributes");
+    setup(&tree);
+    assert!(
+        Neighborhood::open(&tree.0.join("Hood"))
+            .unwrap()
+            .type_attributes
+            .is_none()
+    );
+    // Unpacked: a record count, then GUID, word count and words.
+    let mut tatt = saved(b"TTAT", 0);
+    tatt.push(0);
+    tatt.extend(1i32.to_le_bytes());
+    tatt.extend(0x1111u32.to_le_bytes());
+    tatt.extend(2i32.to_le_bytes());
+    tatt.extend([5, 0, 0xff, 0xff]);
+    let houses = iff(&[(b"FAMI", 0, &family(0, 0, &[])), (b"TATT", 1, &tatt)]);
+    tree.file("Hood/Neighborhood.iff", &houses);
+    let neighborhood = Neighborhood::open(&tree.0.join("Hood")).unwrap();
+    let saved = neighborhood.type_attributes.unwrap();
+    assert_eq!(saved.entries.len(), 1);
+    assert_eq!(
+        (saved.entries[0].guid, &saved.entries[0].values[..]),
+        (0x1111, &[5, -1][..])
+    );
+}

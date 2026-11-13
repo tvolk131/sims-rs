@@ -47,6 +47,25 @@ pub enum Status {
     Running,
     /// The outermost frame returned this value and was popped.
     Returned(bool),
+    /// The thread gave up the rest of its turn (Sleep, or an object removing
+    /// itself). Its top frame stays on the instruction that yielded, which
+    /// runs again on the object's next turn.
+    Yielded,
+}
+
+/// What a primitive tells the interpreter to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flow {
+    /// Take the true or the false branch.
+    Branch(bool),
+    /// Stop here and run this instruction again next turn.
+    Yield,
+}
+
+impl From<bool> for Flow {
+    fn from(result: bool) -> Self {
+        Self::Branch(result)
+    }
 }
 
 /// Runs object scripts against a lot. It holds only what doesn't change
@@ -73,8 +92,24 @@ impl<'a> Interpreter<'a> {
     /// [`Status::Returned`]. On a fault the stack is left as it was at the
     /// faulting instruction.
     pub fn step(&self, world: &mut World, object: u16) -> Result<Status, Fault> {
-        let mut machine = self.machine(world, object);
-        machine.step(0).map_err(|trap| machine.fault(trap))
+        let mut machine = self.machine(world, object, 0, false);
+        machine.step().map_err(|trap| machine.fault(trap))
+    }
+
+    /// Runs `object`'s thread for one turn: until it yields or its
+    /// outermost frame returns, executing at most `budget` instructions.
+    /// The budget is a guard against scripts that never yield; the
+    /// original's own limit is not modeled.
+    pub fn turn(&self, world: &mut World, object: u16, budget: usize) -> Result<Status, Fault> {
+        let mut machine = self.machine(world, object, 0, false);
+        for _ in 0..budget {
+            match machine.step() {
+                Ok(Status::Running) => {}
+                Ok(status) => return Ok(status),
+                Err(trap) => return Err(machine.fault(trap)),
+            }
+        }
+        Err(machine.fault(Trap::BudgetExhausted { budget }))
     }
 
     /// Pushes a frame for `tree` on `object`'s stack and runs until that
@@ -82,6 +117,10 @@ impl<'a> Interpreter<'a> {
     /// the object's own code, with `stack_object` as its stack object and
     /// `args` as its parameters (cut or zero-padded to the tree's count). For
     /// an indexed tree (kind 4) the first argument picks the entry node.
+    ///
+    /// The tree runs synchronously, as the original runs callbacks such as
+    /// Init (0x4749b5): it cannot yield, so a Sleep that would wait is
+    /// native error 0x44f.
     ///
     /// Frames already on the stack are left alone. On a fault, the stack is
     /// left as it was at the faulting instruction.
@@ -94,31 +133,60 @@ impl<'a> Interpreter<'a> {
         args: &[i16],
         budget: usize,
     ) -> Result<bool, Fault> {
-        let mut machine = self.machine(world, object);
-        let base = machine
-            .enter(tree, stack_object, args)
+        self.call(world, object, tree, stack_object, args, usize::MAX, budget)
+    }
+
+    /// [`Interpreter::run_tree`] for a caller whose argument buffer holds
+    /// `most` words: a tree that takes more is refused.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn call(
+        &self,
+        world: &mut World,
+        object: u16,
+        tree: u16,
+        stack_object: i16,
+        args: &[i16],
+        most: usize,
+        budget: usize,
+    ) -> Result<bool, Fault> {
+        let base = world.objects.get(&object).map_or(0, |o| o.stack.len());
+        let mut machine = self.machine(world, object, base, true);
+        machine
+            .enter(tree, stack_object, args, most)
             .map_err(|trap| Fault {
                 object,
                 at: Some(Location { tree, node: 0 }),
                 trap,
             })?;
         for _ in 0..budget {
-            match machine.step(base) {
+            match machine.step() {
                 Ok(Status::Running) => {}
                 Ok(Status::Returned(value)) => return Ok(value),
+                Ok(Status::Yielded) => {
+                    let trap = Trap::native(0x44f, "a synchronous tree yielded");
+                    return Err(machine.fault(trap));
+                }
                 Err(trap) => return Err(machine.fault(trap)),
             }
         }
         Err(machine.fault(Trap::BudgetExhausted { budget }))
     }
 
-    fn machine<'w>(&self, world: &'w mut World, me: u16) -> Machine<'a, 'w> {
+    pub(crate) fn machine<'w>(
+        &self,
+        world: &'w mut World,
+        me: u16,
+        base: usize,
+        synchronous: bool,
+    ) -> Machine<'a, 'w> {
         Machine {
             program: self.program,
             catalog: self.catalog,
             world,
             me,
             stream: self.stream,
+            base,
+            synchronous,
         }
     }
 }
@@ -132,6 +200,12 @@ pub(crate) struct Machine<'a, 'w> {
     pub world: &'w mut World,
     pub me: u16,
     pub stream: Stream,
+    /// The stack depth below the frames this run owns. When a return pops
+    /// the stack down to it, the run is over and the frame below is not
+    /// branched.
+    pub base: usize,
+    /// Whether the run must finish without yielding, as a callback does.
+    pub synchronous: bool,
 }
 
 impl<'a> Machine<'a, '_> {
@@ -159,7 +233,7 @@ impl<'a> Machine<'a, '_> {
             .ok_or(Trap::native(10, "missing object"))
     }
 
-    fn me_mut(&mut self) -> Result<&mut Object, Trap> {
+    pub(crate) fn me_mut(&mut self) -> Result<&mut Object, Trap> {
         self.world
             .objects
             .get_mut(&self.me)
@@ -245,10 +319,17 @@ impl<'a> Machine<'a, '_> {
             })
     }
 
-    /// Pushes the entry frame for [`Interpreter::run_tree`] and returns the
-    /// stack depth below it. Mirrors the old prototype's `spawn`
-    /// (legacy lib.rs:498).
-    fn enter(&mut self, tree: u16, stack_object: i16, args: &[i16]) -> Result<usize, Trap> {
+    /// Pushes an entry frame for `tree`, running the object's own code.
+    /// Mirrors the old prototype's `spawn` (legacy lib.rs:498). A tree that
+    /// takes more than `most` arguments is refused: the original would copy
+    /// words from beyond the caller's argument buffer.
+    pub(crate) fn enter(
+        &mut self,
+        tree: u16,
+        stack_object: i16,
+        args: &[i16],
+        most: usize,
+    ) -> Result<(), Trap> {
         let guid = self.me()?.guid;
         let owner_type = self
             .world
@@ -269,6 +350,11 @@ impl<'a> Machine<'a, '_> {
                 "entry arguments exceed the native limit of 255".into(),
             ));
         }
+        if argc > most {
+            return Err(Trap::Unsupported(format!(
+                "tree {tree:#06x} takes {argc} arguments; its caller supplies {most}"
+            )));
+        }
         let node = entry_node(behavior, args.first().copied().unwrap_or(0))?;
         let mut parameters = args.to_vec();
         parameters.resize(argc, 0);
@@ -276,7 +362,6 @@ impl<'a> Machine<'a, '_> {
         if stack.len() >= MAX_STACK {
             return Err(Trap::StackOverflow);
         }
-        let base = stack.len();
         stack.push(Frame {
             stack_object,
             tree,
@@ -286,13 +371,11 @@ impl<'a> Machine<'a, '_> {
             primitive_state: 0,
             code_owner_type,
         });
-        Ok(base)
+        Ok(())
     }
 
-    /// Executes one instruction. `base` is the stack depth below the frames
-    /// this run owns: when a return pops the stack down to it, the run is
-    /// over and the frame below is not branched.
-    pub fn step(&mut self, base: usize) -> Result<Status, Trap> {
+    /// Executes one instruction.
+    pub fn step(&mut self) -> Result<Status, Trap> {
         let instruction = self.current()?;
         if instruction.opcode >= 256 {
             if instruction.opcode & 0x8000 != 0 {
@@ -314,16 +397,17 @@ impl<'a> Machine<'a, '_> {
                 instruction.opcode
             )));
         }
-        let result = self.primitive(instruction)?;
+        let result = match self.primitive(instruction)? {
+            Flow::Branch(result) => result,
+            Flow::Yield => return Ok(Status::Yielded),
+        };
         self.frame_mut()?.primitive_state = 0;
-        self.branch(
-            if result {
-                instruction.on_true
-            } else {
-                instruction.on_false
-            },
-            base,
-        )
+        self.me_mut()?.last_result = result;
+        self.branch(if result {
+            instruction.on_true
+        } else {
+            instruction.on_false
+        })
     }
 
     /// Calls the tree an instruction names (legacy lib.rs:1578).
@@ -400,13 +484,18 @@ impl<'a> Machine<'a, '_> {
     /// Follows a branch target from the top frame (legacy lib.rs:1665).
     /// Returns pop the frame and branch the caller on the returned value,
     /// which may return again.
-    fn branch(&mut self, mut target: u8, base: usize) -> Result<Status, Trap> {
+    fn branch(&mut self, mut target: u8) -> Result<Status, Trap> {
+        let base = self.base;
         loop {
             match target {
                 ERROR => return Err(Trap::ErrorBranch),
                 RETURN_TRUE | RETURN_FALSE => {
                     let value = target == RETURN_TRUE;
-                    let stack = &mut self.me_mut()?.stack;
+                    // A return counts as the thread's last result too
+                    // (legacy lib.rs:1714).
+                    let me = self.me_mut()?;
+                    me.last_result = value;
+                    let stack = &mut me.stack;
                     stack.pop();
                     if stack.len() <= base {
                         return Ok(Status::Returned(value));

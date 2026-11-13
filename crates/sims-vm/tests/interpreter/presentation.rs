@@ -16,10 +16,18 @@ fn refresh(fx: &mut Fixture, selector: i16, mode: i16, stack_object: i16) -> Res
     fx.run_with(LAMP, 4096, stack_object, &[], 10)
 }
 
+/// The lot's hash once the lamp has run a tree that returned true: the
+/// only thing such a run leaves behind is the lamp's last result.
+fn hash_after_success(fx: &Fixture) -> [u8; 32] {
+    let mut world = fx.world.clone();
+    world.objects.get_mut(&LAMP).unwrap().last_result = true;
+    world.hash()
+}
+
 #[test]
 fn refreshing_a_drawing_changes_nothing() {
     let mut fx = Fixture::new();
-    let before = fx.world.hash();
+    let before = hash_after_success(&fx);
     assert_eq!(refresh(&mut fx, 0, 0, SIM as i16), Ok(true));
     assert_eq!(refresh(&mut fx, 1, 0, SIM as i16), Ok(true));
     assert_eq!(fx.world.hash(), before);
@@ -30,7 +38,7 @@ fn an_object_in_no_room_has_no_room_to_mark() {
     let mut fx = Fixture::new();
     fx.lamp_mut().data[29] = -5;
     fx.sim_mut().data[29] = -5;
-    let before = fx.world.hash();
+    let before = hash_after_success(&fx);
     for selector in [0, 1] {
         for mode in [1, 2] {
             assert_eq!(refresh(&mut fx, selector, mode, SIM as i16), Ok(true));
@@ -76,7 +84,7 @@ fn refresh_errors() {
 #[test]
 fn play_sound_takes_the_true_branch_and_changes_nothing() {
     let mut fx = Fixture::new();
-    let before = fx.world.hash();
+    let before = hash_after_success(&fx);
     for operands in [[0; 8], [5, 0, 0, 1, 3, 0, 0, 0], [0xff; 8]] {
         fx.add(
             LAMP_FILE,

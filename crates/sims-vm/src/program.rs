@@ -1,8 +1,9 @@
 use crate::{Error, Result};
 use sims_content::{Catalog, Index, Object};
-use sims_formats::behavior::Behavior;
-use sims_formats::execution::{self, ObjectFunction, ObjectFunctions};
+use sims_formats::behavior::{Behavior, InteractionTable};
+use sims_formats::execution::{self, ObjectFunction, ObjectFunctions, Slots};
 use sims_formats::iff::Iff;
+use sims_sim::TypeAttributes;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The code and constants one IFF file provides.
@@ -19,6 +20,12 @@ pub struct Library {
     pub definitions: BTreeMap<u16, [i16; DEFINITION_WORDS]>,
     /// OBJD chunk IDs in the file's native resource order.
     pub definition_order: Vec<u16>,
+    /// Interaction tables (TTAB) by chunk ID. None is a table this reader
+    /// cannot decode; using one is an error, having one is not.
+    pub interactions: BTreeMap<u16, Option<InteractionTable>>,
+    /// How many slots of each SLOT chunk can hold an object (kind 0), by
+    /// chunk ID.
+    pub containers: BTreeMap<u16, usize>,
 }
 
 /// The words in a registered object definition: the original keeps every
@@ -60,6 +67,16 @@ pub struct Program {
     pub libraries: BTreeMap<usize, Library>,
     /// Each object file's semi-global file, from the catalog.
     pub semi_globals: BTreeMap<usize, Option<usize>>,
+    /// Career IDs in the original's order: the CARR chunks of `work.iff`
+    /// in resource order, each chunk ID sign-extended (legacy
+    /// legacy/crates/sims-content/src/careers.rs). None when the install has no
+    /// `work.iff`, or has a `Careers.txt`, which overrides the table
+    /// through a loader that is not ported.
+    pub careers: Option<Vec<i32>>,
+    /// Each lot's zoning, by lot number: 1 residential, 2 community. It
+    /// comes from the neighborhood ([`sims_content::Neighborhood::zoning`]),
+    /// so [`Program::link`] leaves it empty for the caller to fill.
+    pub zoning: BTreeMap<i16, i32>,
 }
 
 impl Program {
@@ -74,6 +91,8 @@ impl Program {
             global: catalog.global,
             libraries: BTreeMap::new(),
             semi_globals: BTreeMap::new(),
+            careers: careers(index)?,
+            zoning: BTreeMap::new(),
         };
         program.load(index, catalog.global)?;
         for guid in guids {
@@ -116,6 +135,15 @@ impl Program {
                     let constants =
                         execution::constants(data).map_err(|e| format("BCON", chunk.id, e))?;
                     library.constants.insert(chunk.id, constants);
+                }
+                b"TTAB" => {
+                    let table = InteractionTable::parse(data).ok();
+                    library.interactions.insert(chunk.id, table);
+                }
+                b"SLOT" => {
+                    let slots = Slots::parse(data).map_err(|e| format("SLOT", chunk.id, e))?;
+                    let count = slots.entries.iter().filter(|s| s.kind == 0).count();
+                    library.containers.insert(chunk.id, count);
                 }
                 _ => {}
             }
@@ -207,6 +235,102 @@ impl Program {
         self.libraries.get(&resource)?.definitions.get(&chunk)
     }
 
+    /// The interaction table an object definition uses: the TTAB its word 7
+    /// names, in its own file or else its semi-global file. A tile of a
+    /// multi-tile object whose word 7 is -1 uses its group's catalog
+    /// definition's table (0x45726a, 0x43ae0a). Ok(None) is no table.
+    ///
+    /// Ported from the old prototype (legacy/crates/sims-content/src/vm.rs:448-490).
+    pub fn interactions(
+        &self,
+        resource: usize,
+        chunk: u16,
+    ) -> std::result::Result<Option<&InteractionTable>, String> {
+        let Some(library) = self.libraries.get(&resource) else {
+            return Err(format!("resource {resource} is not linked"));
+        };
+        let Some(words) = library.definitions.get(&chunk) else {
+            return Err(format!("resource {resource} has no OBJD #{chunk}"));
+        };
+        let mut table = words[7];
+        if table == -1 {
+            table = library
+                .definition_order
+                .iter()
+                .filter_map(|id| library.definitions.get(id))
+                .find(|parent| words[10] != 0 && parent[10] == words[10] && parent[11] == -1)
+                .map_or(0, |parent| parent[7]);
+        }
+        if table <= 0 {
+            return Ok(None);
+        }
+        let id = table as u16;
+        let semi_global = self.semi_globals.get(&resource).copied().flatten();
+        let found = library.interactions.get(&id).or_else(|| {
+            self.libraries
+                .get(&semi_global?)
+                .and_then(|l| l.interactions.get(&id))
+        });
+        match found {
+            None => Ok(None),
+            Some(Some(table)) => Ok(Some(table)),
+            Some(None) => Err(format!(
+                "TTAB #{id} for OBJD #{chunk} of resource {resource} has no reader"
+            )),
+        }
+    }
+
+    /// How many objects an object definition's slots can hold: the kind 0
+    /// entries of the SLOT chunk its word 20 names, or none when the file
+    /// has no such chunk (0x431aaf, 0x46e2d1).
+    pub fn containers(&self, resource: usize, chunk: u16) -> usize {
+        let Some(library) = self.libraries.get(&resource) else {
+            return 0;
+        };
+        library
+            .definitions
+            .get(&chunk)
+            .and_then(|words| library.containers.get(&(words[20] as u16)))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The type attribute records the catalog makes, all zero: one for
+    /// every definition whose word 90 asks for a number of words, in
+    /// catalog order, two definitions with one GUID included (0x43ba52,
+    /// 0x455f09). A count outside 0..32000 makes a record with no words.
+    /// Every catalog definition must be linked.
+    ///
+    /// Ported from the old prototype (`resource_storage` in
+    /// legacy/crates/sims-content/src/object_catalog/household.rs). A definition
+    /// whose word 91 has bit 1 set wants its words cleared for each lot.
+    /// When the original does that is not known, so one is an error; the
+    /// Complete Collection has none.
+    pub fn type_attributes(&self, catalog: &Catalog) -> Result<Vec<TypeAttributes>> {
+        let mut records = Vec::new();
+        for object in &catalog.objects {
+            let words = self
+                .definition(object.resource, object.chunk)
+                .ok_or(Error::MissingDefinition(object.guid))?;
+            let count = words[90];
+            if count == 0 {
+                continue;
+            }
+            if words[91] & 2 != 0 {
+                return Err(Error::Unsupported(format!(
+                    "GUID 0x{:08X} resets its type attributes for each lot",
+                    object.guid
+                )));
+            }
+            let count = usize::try_from(count).ok().filter(|&n| n < 32000);
+            records.push(TypeAttributes {
+                guid: object.guid,
+                values: vec![0; count.unwrap_or(0)],
+            });
+        }
+        Ok(records)
+    }
+
     /// The tree an object's callback names, or 0 when it names none.
     pub fn callback(&self, object: &Object, callback: Callback) -> u16 {
         self.libraries
@@ -244,6 +368,28 @@ impl Program {
         }
         value
     }
+}
+
+/// The career IDs of `work.iff`, or None when the table cannot be had from
+/// it. See [`Program::careers`].
+fn careers(index: &Index) -> Result<Option<Vec<i32>>> {
+    if index.named("Careers.txt").next().is_some() {
+        return Ok(None);
+    }
+    let Some((_, file)) = index.named("work.iff").next() else {
+        return Ok(None);
+    };
+    let location = file.location(&index.root);
+    let iff = Iff::parse(file.read()?).map_err(|e| sims_content::Error::format(&location, e))?;
+    let chunks = iff
+        .resource_order(b"CARR")
+        .map_err(|e| sims_content::Error::format(&location, e))?;
+    Ok(Some(
+        chunks
+            .iter()
+            .map(|chunk| i32::from(chunk.id as i16))
+            .collect(),
+    ))
 }
 
 /// An OBJD's words as the original holds them. Registration (0x43ba52)

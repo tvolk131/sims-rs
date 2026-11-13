@@ -596,7 +596,11 @@ fn unimplemented_primitives_name_themselves() {
         text.contains("unimplemented primitive 11 (Get Distance To)"),
         "{text}"
     );
-    for (opcode, name) in [(0, "Sleep"), (36, "Dialog"), (44, "Animate Sim")] {
+    for (opcode, name) in [
+        (3, "Find Best Interaction"),
+        (36, "Dialog"),
+        (44, "Animate Sim"),
+    ] {
         let mut fx = Fixture::new();
         fx.add(LAMP_FILE, 4096, tree(vec![ins(opcode, 1, 1, [0; 8])]));
         assert!(trap(fx.run()).to_string().contains(name));

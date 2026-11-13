@@ -8,21 +8,31 @@
 //!
 //! [`Interpreter`] runs that code against a [`sims_sim::World`]. An
 //! object's thread is its saved stack of frames: [`Interpreter::step`]
-//! executes the top frame's instruction, and [`Interpreter::run_tree`] runs
-//! a tree on an object to completion. Primitives without an implementation,
+//! executes the top frame's instruction, [`Interpreter::turn`] runs the
+//! thread until it yields or returns, and [`Interpreter::run_tree`] runs a
+//! tree on an object to completion. Primitives without an implementation,
 //! and memory scopes over state the simulation doesn't hold yet, fail with
 //! a [`Fault`] that names them.
+//!
+//! [`Interpreter::create`] is the original's object factory, and
+//! [`Interpreter::resize`], [`Interpreter::reconcile_controllers`] and
+//! [`Interpreter::create_indicators`] are the lot load's steps that run
+//! scripts.
 
 mod error;
+mod factory;
 mod fault;
 mod interpreter;
+mod load;
 mod memory;
 mod primitives;
 mod program;
 
 pub use error::Error;
+pub use factory::TURN_BUDGET;
 pub use fault::{Fault, Location, Trap};
 pub use interpreter::{Interpreter, MAX_STACK, Status, Stream};
+pub use load::INDICATORS;
 pub use memory::scope_name;
 pub use primitives::primitive_name;
 pub use program::{Callback, DEFINITION_WORDS, Library, Program, Tree};

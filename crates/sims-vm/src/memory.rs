@@ -11,10 +11,15 @@
 
 use crate::fault::Trap;
 use crate::interpreter::Machine;
-use crate::program::DEFINITION_WORDS;
+use crate::program::{DEFINITION_WORDS, Tree};
 use sims_core::{Ext, F32};
 use sims_formats::saved_objects::Frame;
 use sims_sim::{Object, World};
+
+/// Data word 25: how many more turns the object stays locked out. While it
+/// is nonzero a Sleep counts down by itself instead of leaving the count
+/// to the scheduler.
+pub(crate) const LOCKOUT: usize = 25;
 
 /// Scope names, by scope number.
 const SCOPE_NAMES: [&str; 39] = [
@@ -79,6 +84,9 @@ pub(crate) enum Cell {
     Temp(u16, usize),
     DynamicSprite(u16, usize),
     Global(usize),
+    /// A type attribute: the record's position in
+    /// [`World::type_attributes`], then the word.
+    TypeAttribute(usize, usize),
     Parameter(usize),
     Local(usize),
     StackObject,
@@ -109,7 +117,74 @@ impl Machine<'_, '_> {
 
     /// Resolves an operand. `write` is the caller's write intent, which
     /// changes what some globals resolve to.
-    pub(crate) fn resolve(&self, scope: u8, index: i16, write: bool) -> Result<(Cell, bool), Trap> {
+    ///
+    /// Resolving an object's data word 25, to read it or to write it, wakes
+    /// that object (legacy memory.rs:631).
+    pub(crate) fn resolve(
+        &mut self,
+        scope: u8,
+        index: i16,
+        write: bool,
+    ) -> Result<(Cell, bool), Trap> {
+        let resolved = self.locate(scope, index, write)?;
+        if let Cell::Data(id, LOCKOUT) = resolved.0 {
+            self.wake(id)?;
+        }
+        Ok(resolved)
+    }
+
+    /// Wakes an object from a Sleep the scheduler is counting down for it
+    /// (0x44574b): the object runs every tick again, and the time it had
+    /// left goes back into the sleeping frame's first parameter, so the
+    /// Sleep goes on counting by itself. Ported from the old prototype's
+    /// `wake_object` (legacy/crates/sims-vm/src/idle.rs:55).
+    ///
+    /// While the object runs a callback, the frame looked at is the one
+    /// below the callback, which is where its own thread stopped.
+    pub(crate) fn wake(&mut self, id: u16) -> Result<(), Trap> {
+        let object = self
+            .world
+            .objects
+            .get(&id)
+            .ok_or(Trap::native(10, "missing object"))?;
+        let Some(countdown) = object.countdown() else {
+            return Ok(());
+        };
+        let depth = if id == self.me && self.synchronous {
+            self.base
+        } else {
+            object.stack.len()
+        };
+        let sleeping = match depth.checked_sub(1).and_then(|i| object.stack.get(i)) {
+            Some(frame) => {
+                let owner = self.owner(frame)?;
+                match self.program.tree(owner, frame.tree) {
+                    Tree::Behavior(_, behavior) => {
+                        let instruction = behavior
+                            .instructions
+                            .get(usize::from(frame.node))
+                            .ok_or_else(|| Trap::Invalid("woken frame is past its tree".into()))?;
+                        instruction.opcode & 0x7fff == 0
+                    }
+                    _ => return Err(Trap::MissingTree { id: frame.tree }),
+                }
+            }
+            None => false,
+        };
+        let object = object_mut(self.world, id)?;
+        object.set_countdown(-2);
+        if sleeping && countdown >= 0 {
+            *object.stack[depth - 1]
+                .parameters
+                .first_mut()
+                .ok_or_else(|| Trap::Invalid("woken Sleep frame has no parameter".into()))? =
+                countdown;
+        }
+        Ok(())
+    }
+
+    /// Where an operand lives, without the side effects of resolving it.
+    fn locate(&self, scope: u8, index: i16, write: bool) -> Result<(Cell, bool), Trap> {
         let frame = self.frame()?;
         let me = self.me()?;
         let stack_object = frame.stack_object;
@@ -163,14 +238,6 @@ impl Machine<'_, '_> {
                 let index = bounded(index, 72, 7)?;
                 let (id, object) =
                     self.object(if scope == 3 { me_id } else { stack_object }, 10)?;
-                if index == 25 {
-                    // Resolving data word 25 wakes the object from its idle
-                    // countdown, editing the scheduler (legacy idle.rs:55,
-                    // memory.rs:631). The scheduler isn't modeled yet.
-                    return Err(Trap::Unsupported(
-                        "object data word 25 wakes the object; the scheduler is not modeled".into(),
-                    ));
-                }
                 if index >= object.data.len() {
                     return Err(Trap::Invalid(format!(
                         "object {id} has {} data words",
@@ -285,10 +352,27 @@ impl Machine<'_, '_> {
                         .is_some_and(|c| c.action != 0),
                 ))
             }
+            36 | 37 => {
+                // The words belong to the object's own type, whatever code
+                // is running, or to the type its definition's words 92 and
+                // 93 name instead (0x457e95, 0x457eba; legacy
+                // legacy/crates/sims-vm/src/resource_storage.rs). A type with no
+                // record has no words, so every index is out of bounds.
+                let (_, object) =
+                    self.object(if scope == 36 { me_id } else { stack_object }, 10)?;
+                let words = self.definition_words(object.guid)?;
+                let alias = words[92] as u16 as u32 | (words[93] as u16 as u32) << 16;
+                let guid = if alias == 0 { object.guid } else { alias };
+                let records = &self.world.type_attributes;
+                let record = records.iter().position(|r| r.guid == guid);
+                let count = record.map_or(0, |r| records[r].values.len());
+                let index = bounded(index, count, 0x40)?;
+                Cell::TypeAttribute(record.unwrap_or(0), index)
+            }
             // Tree advertisements (12, 28, 29), rooms (23), neighbors (24,
-            // 32), jobs (33), neighborhood data (34), type attributes (36,
-            // 37) and scope 38 need state the simulation doesn't hold yet.
-            12 | 23 | 24 | 28 | 29 | 32 | 33 | 34 | 36..=38 => {
+            // 32), jobs (33), neighborhood data (34) and scope 38 need
+            // state the simulation doesn't hold yet.
+            12 | 23 | 24 | 28 | 29 | 32 | 33 | 34 | 38 => {
                 return Err(unsupported(scope));
             }
             2 | 5 | 39..=255 => return Err(Trap::native(9, "invalid memory scope")),
@@ -327,6 +411,12 @@ impl Machine<'_, '_> {
             Cell::Temp(id, i) => get(&object(id)?.temps, i),
             Cell::DynamicSprite(id, i) => get(&object(id)?.dynamic_sprites, i),
             Cell::Global(i) => get(&self.world.globals, i),
+            Cell::TypeAttribute(record, i) => self
+                .world
+                .type_attributes
+                .get(record)
+                .ok_or_else(|| Trap::Invalid(format!("no type attribute record {record}")))
+                .and_then(|r| get(&r.values, i)),
             Cell::Parameter(i) => get(&self.frame()?.parameters, i),
             Cell::Local(i) => get(&self.frame()?.locals, i),
             Cell::StackObject => Ok(self.frame()?.stack_object),
@@ -403,6 +493,10 @@ impl Machine<'_, '_> {
             Cell::Temp(id, i) => object_mut(world, id)?.temps.get_mut(i),
             Cell::DynamicSprite(id, i) => object_mut(world, id)?.dynamic_sprites.get_mut(i),
             Cell::Global(i) => world.globals.get_mut(i),
+            Cell::TypeAttribute(record, i) => world
+                .type_attributes
+                .get_mut(record)
+                .and_then(|r| r.values.get_mut(i)),
             Cell::Parameter(i) => top_mut(world, me)?.parameters.get_mut(i),
             Cell::Local(i) => top_mut(world, me)?.locals.get_mut(i),
             Cell::StackObject => Some(&mut top_mut(world, me)?.stack_object),
@@ -412,7 +506,7 @@ impl Machine<'_, '_> {
     }
 
     /// Reads an operand.
-    pub(crate) fn read(&self, scope: u8, index: i16) -> Result<i16, Trap> {
+    pub(crate) fn read(&mut self, scope: u8, index: i16) -> Result<i16, Trap> {
         let (cell, _) = self.resolve(scope, index, false)?;
         self.value(cell)
     }

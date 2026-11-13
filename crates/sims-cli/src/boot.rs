@@ -1,9 +1,10 @@
-//! `sims boot`: load a house into simulation state and print its hash.
+//! `sims boot`: run the lot load for a house as far as it is implemented
+//! and print the hash of the state it reaches.
 
 use sims_content::{Catalog, House, Index, Install, Neighborhood};
 use sims_sim::load::Context;
 use sims_sim::{Snapshots, World};
-use sims_vm::{Callback, Program};
+use sims_vm::{Callback, Interpreter, Program, Stream};
 use std::error::Error;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -33,15 +34,32 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     }
     let catalog = Catalog::build(&index)?;
     let house = House::load(options.house, &catalog)?;
-    let mut world = World::from_house(&house, &catalog)?;
+    let context = Context::COMPLETE_COLLECTION;
+    // The original has every definition registered, and the resize step
+    // walks them all, so the whole catalog is linked.
+    let mut program = Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid))?;
+    program.zoning = neighborhood.zoning(context.expansions)?;
+    let interpreter = Interpreter::new(&program, &catalog, Stream::Global);
+    // The lot the game holds before the load: empty, with the type
+    // attributes the neighborhood saved and the two indicator objects.
+    let mut world = World::empty();
+    world.type_attributes = program.type_attributes(&catalog)?;
+    if let Some(saved) = &neighborhood.type_attributes {
+        world.read_type_attributes(saved);
+    }
+    interpreter.create_indicators(&mut world)?;
     // The load steps, in the original's order (docs/roadmap.md, load sequence). The
     // boot stops at the first one not implemented yet.
-    world.apply_context(Context::COMPLETE_COLLECTION)?;
+    world.read_simulator(&house.simulator);
+    world.apply_context(context)?;
+    let created = interpreter.resize(&mut world)?;
+    world.clear_family()?;
     let types = &house.types.entries;
-    let program = Program::link(&index, &catalog, types.iter().map(|t| t.guid))?;
     let mut mismatches = Vec::new();
     for entry in types {
-        let object = catalog.object(entry.guid).expect("linked above");
+        let object = catalog
+            .object(entry.guid)
+            .ok_or_else(|| format!("type {} has no definition", entry.id))?;
         let current = [Callback::Init, Callback::Main]
             .map(|c| program.signature(object.resource, program.callback(object, c)));
         if current != [entry.init_signature, entry.main_signature] {
@@ -60,18 +78,15 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     if let Some(path) = options.snapshot {
         Snapshots::open(path)?.save("boot", &world)?;
     }
-    let people = world
-        .objects
-        .values()
-        .filter(|o| o.person.is_some())
-        .count();
+    let saved = &house.objects.instances;
+    let people = saved.values().filter(|o| o.person.is_some()).count();
     let mut out = String::new();
     let _ = writeln!(out, "House:   {}", options.house.display());
     let _ = writeln!(
         out,
-        "Objects: {} ({people} people), tick {}",
-        world.objects.len(),
-        world.ticks
+        "Saved:   {} objects ({people} people), tick {}",
+        saved.len(),
+        house.simulator.ticks
     );
     let _ = writeln!(
         out,
@@ -85,7 +100,17 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     }
     let _ = writeln!(
         out,
-        "Load:    globals set; stopped before the global controllers (not implemented yet)"
+        "Load:    lot resized to {} tiles, {} controllers created, {} waiting for removal; \
+         stopped before the lot is cleared (not implemented yet)",
+        world.size,
+        created.len(),
+        world.removals.len()
+    );
+    let _ = writeln!(
+        out,
+        "Lot:     {} objects, tick {}",
+        world.objects.len(),
+        world.ticks
     );
     let _ = writeln!(out, "Hash:    {}", world.hash_hex());
     Ok(out)

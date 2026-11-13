@@ -2,8 +2,8 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sims_content::{Catalog, House};
-use sims_core::GameRng;
-use sims_formats::lot::Array;
+use sims_core::{CrtRng, GameRng};
+use sims_formats::lot::{Array, Simulator};
 use sims_formats::saved_objects::{Frame, Instance, Multipart, Person, Relationship, Slot};
 use std::collections::BTreeMap;
 
@@ -20,6 +20,12 @@ pub struct World {
     pub lot_rng: GameRng,
     /// The global random stream.
     pub global_rng: GameRng,
+    /// The C runtime's random stream. It belongs to the running game, not
+    /// to the lot: no save holds it.
+    pub crt_rng: CrtRng,
+    /// The side of the lot's active square, in tiles. The arrays stay 64 by
+    /// 64 whatever this is (0x4778fc).
+    pub size: i16,
     pub budget: Budget,
     /// Object IDs in registration order, the order the scheduler visits.
     pub order: Vec<u16>,
@@ -29,6 +35,40 @@ pub struct World {
     pub objects: BTreeMap<u16, Object>,
     /// Lot arrays (floors, walls, terrain and more) by Arry chunk ID.
     pub arrays: BTreeMap<u16, Array>,
+    /// Objects waiting to be removed, in the order they asked (0x442d70).
+    /// They stay registered until the removals are carried out.
+    pub removals: Vec<u16>,
+    /// Type attributes: words every object of a type shares, which the
+    /// original keeps with its catalog and saves in the neighborhood file
+    /// (TATT). One record per definition that asks for any, in catalog
+    /// order. A type is looked up by GUID and the first record wins.
+    pub type_attributes: Vec<TypeAttributes>,
+    /// The instances of each type a script has asked for the instances of,
+    /// by GUID. The original makes a type's list on first use, from the
+    /// objects of that type in ID order, and from then on appends each new
+    /// instance (0x445857).
+    pub instances: BTreeMap<u32, Vec<u16>>,
+    /// The object that owns interface events, or 0 for none (0x44d906).
+    pub event_owner: u16,
+    /// The magic history of the family the game has selected, or None
+    /// while it has selected none (0x410af6). It belongs to the running
+    /// game, not to the lot. Nothing sets it yet: selecting a family
+    /// should.
+    pub magic_history: Option<MagicHistory>,
+}
+
+/// One type's shared words. See [`World::type_attributes`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeAttributes {
+    pub guid: u32,
+    pub values: Vec<i16>,
+}
+
+/// See [`World::magic_history`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MagicHistory {
+    pub family: i32,
+    pub values: [i16; 6],
 }
 
 /// The household's money and the lot's value.
@@ -70,14 +110,86 @@ pub struct Object {
     /// Scheduler countdown (low half) and flags (high half); None when the
     /// save carries none.
     pub registry_word: Option<i32>,
+    /// The branch the object's last primitive took. No save holds it.
+    pub last_result: bool,
+    /// Set when the object is queued for removal with the request not to
+    /// reset the objects that depend on it (the original's object flag
+    /// 0x1000). No save holds it.
+    pub removal_skips_resets: bool,
 }
 
+/// The side of a lot's arrays, and of a lot nothing has resized.
+pub const FULL_SIZE: i16 = 64;
+
 impl World {
+    /// The lot the game holds before it has loaded any house: no objects,
+    /// all 64 globals zero, the full 64 tiles.
+    ///
+    /// **Unverified**: nothing here was compared with the original at
+    /// startup. The original has a clock and two indicator objects by then,
+    /// and its C runtime stream need not still be at its initial state 1.
+    pub fn empty() -> Self {
+        Self {
+            ticks: 0,
+            globals: vec![0; 64],
+            scheduler_cursor: 0,
+            lot_rng: GameRng::from_state(0),
+            global_rng: GameRng::from_state(0),
+            crt_rng: CrtRng::from_state(1),
+            size: FULL_SIZE,
+            budget: Budget {
+                funds: 0,
+                pending_funds: 0,
+                lot_value: 0,
+                objects_value: 0,
+                architecture_value: 0,
+                days: Vec::new(),
+            },
+            order: Vec::new(),
+            types: BTreeMap::new(),
+            objects: BTreeMap::new(),
+            arrays: BTreeMap::new(),
+            removals: Vec::new(),
+            type_attributes: Vec::new(),
+            instances: BTreeMap::new(),
+            event_owner: 0,
+            magic_history: None,
+        }
+    }
+
+    /// Reads a house's simulator state (SIMI) into the lot the game is
+    /// holding (0x46cfb3): the clock, the globals, the scheduler cursor,
+    /// both game random streams and the budget. The objects on the lot, its
+    /// size and the C runtime stream are not in SIMI and stay as they are.
+    ///
+    /// The globals are the saved 32 or 64 words as they are;
+    /// [`World::apply_context`] turns them into the ones the lot runs with.
+    pub fn read_simulator(&mut self, simulator: &Simulator) {
+        self.ticks = simulator.ticks;
+        self.globals = simulator.globals.clone();
+        self.scheduler_cursor = simulator.scheduler_cursor;
+        self.lot_rng = GameRng::from_state(simulator.lot_rng);
+        self.global_rng = GameRng::from_state(simulator.global_rng);
+        self.budget = Budget {
+            funds: simulator.funds,
+            pending_funds: simulator.pending_funds,
+            lot_value: simulator.lot_value,
+            objects_value: simulator.objects_value,
+            architecture_value: simulator.architecture_value,
+            days: simulator.budget_days.clone(),
+        };
+    }
+
     /// The state a saved house describes, before any script runs. Every
     /// object must have a definition in `catalog`.
+    ///
+    /// This reads the whole file onto an empty lot in one go. The original
+    /// reads the simulator state first and creates and removes the lot-wide
+    /// controllers before it reads the objects (`docs/roadmap.md`, load
+    /// sequence), so this is not a state the original passes through.
     pub fn from_house(house: &House, catalog: &Catalog) -> Result<Self> {
-        let simulator = &house.simulator;
-        let mut objects = BTreeMap::new();
+        let mut world = Self::empty();
+        world.read_simulator(&house.simulator);
         for (&id, instance) in &house.objects.instances {
             if catalog.object(instance.guid).is_none() {
                 return Err(Error::MissingDefinition {
@@ -85,27 +197,12 @@ impl World {
                     guid: instance.guid,
                 });
             }
-            objects.insert(id, Object::from_instance(instance));
+            world.objects.insert(id, Object::from_instance(instance));
         }
-        Ok(Self {
-            ticks: simulator.ticks,
-            globals: simulator.globals.clone(),
-            scheduler_cursor: simulator.scheduler_cursor,
-            lot_rng: GameRng::from_state(simulator.lot_rng),
-            global_rng: GameRng::from_state(simulator.global_rng),
-            budget: Budget {
-                funds: simulator.funds,
-                pending_funds: simulator.pending_funds,
-                lot_value: simulator.lot_value,
-                objects_value: simulator.objects_value,
-                architecture_value: simulator.architecture_value,
-                days: simulator.budget_days.clone(),
-            },
-            order: house.objects.order.clone(),
-            types: house.types.entries.iter().map(|t| (t.id, t.guid)).collect(),
-            objects,
-            arrays: house.arrays.clone(),
-        })
+        world.order = house.objects.order.clone();
+        world.types = house.types.entries.iter().map(|t| (t.id, t.guid)).collect();
+        world.arrays = house.arrays.clone();
+        Ok(world)
     }
 
     /// The canonical encoding: postcard, which writes fields in declaration
@@ -132,6 +229,35 @@ impl World {
 }
 
 impl Object {
+    /// The scheduler countdown, the low half of the registry word: while it
+    /// is above zero the scheduler counts it down instead of running the
+    /// object. None when the object has no registry word.
+    pub fn countdown(&self) -> Option<i16> {
+        self.registry_word.map(|word| word as i16)
+    }
+
+    /// Replaces the countdown and keeps the flags. Does nothing without a
+    /// registry word.
+    pub fn set_countdown(&mut self, countdown: i16) {
+        if let Some(word) = &mut self.registry_word {
+            *word = (*word & !0xffff) | i32::from(countdown as u16);
+        }
+    }
+
+    /// The scheduler flags, the high half of the registry word.
+    pub fn flags(&self) -> u16 {
+        self.registry_word.map_or(0, |word| (word >> 16) as u16)
+    }
+
+    /// Sets or clears the flags in `mask` and keeps the rest (0x4457ef).
+    /// Does nothing without a registry word.
+    pub fn set_flags(&mut self, mask: u16, on: bool) {
+        if let Some(word) = &mut self.registry_word {
+            let flags = ((*word >> 16) as u16 & !mask) | if on { mask } else { 0 };
+            *word = ((u32::from(flags) << 16) | (*word as u32 & 0xffff)) as i32;
+        }
+    }
+
     fn from_instance(instance: &Instance) -> Self {
         Self {
             id: instance.id,
@@ -153,6 +279,8 @@ impl Object {
             portal: instance.portal.clone(),
             person: instance.person.clone(),
             registry_word: instance.registry_word,
+            last_result: false,
+            removal_skips_resets: false,
         }
     }
 }
