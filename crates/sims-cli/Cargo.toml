@@ -13,6 +13,7 @@ name = "sims"
 path = "src/main.rs"
 
 [dependencies]
+sims-content.workspace = true
 sims-formats.workspace = true
 
 [lints]

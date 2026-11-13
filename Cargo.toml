@@ -4,6 +4,7 @@
 # docs/salvage-audit.md.
 members = [
     "crates/sims-cli",
+    "crates/sims-content",
     "crates/sims-core",
     "crates/sims-formats",
 ]
@@ -20,6 +21,7 @@ repository = "https://github.com/tvolk131/sims-rs"
 encoding_rs = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sims-content = { path = "crates/sims-content" }
 sims-core = { path = "crates/sims-core" }
 sims-formats = { path = "crates/sims-formats" }
 
