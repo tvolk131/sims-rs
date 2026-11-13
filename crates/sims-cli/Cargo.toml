@@ -1,0 +1,19 @@
+[package]
+name = "sims-cli"
+description = "Developer command-line tools: corpus census and inspection."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "sims"
+path = "src/main.rs"
+
+[dependencies]
+sims-formats.workspace = true
+
+[lints]
+workspace = true

@@ -74,6 +74,16 @@ fn bcf_presence_words_and_signed_event_times_follow_native_motion_reader() {
     assert_eq!(a.events.len(), 2);
 }
 #[test]
+fn bcf_keeps_motions_with_no_frames() {
+    let mut b = bcf();
+    // The motion's frame count follows its bone name.
+    let at = b.windows(5).position(|w| w == b"\x04ROOT").unwrap() + 5;
+    assert_eq!(b[at..at + 4], 30_u32.to_le_bytes());
+    b[at..at + 4].copy_from_slice(&0_u32.to_le_bytes());
+    let a = read_bcf(&b).unwrap().remove(0);
+    assert_eq!(a.motions[0].frames, 0);
+}
+#[test]
 fn bcf_rejects_truncations_bad_counts_and_nonfinite_values() {
     let b = bcf();
     for n in 0..b.len() {

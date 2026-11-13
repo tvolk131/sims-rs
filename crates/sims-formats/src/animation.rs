@@ -85,33 +85,17 @@ pub(crate) fn pairs(r: &mut Reader<'_>) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
+/// Reads an animation-only BCF. Motions with zero frames are kept, as the
+/// original catalog keeps them (596818); playback checks a motion's channels
+/// before sampling, so an empty motion animates nothing.
 pub fn read_bcf(data: &[u8]) -> Result<Vec<Animation>> {
-    read_bcf_inner(data, false)
-}
-
-/// Native catalog records retain zero-frame motions (596818). Native playback
-/// tests channel flags before sampling; empty records need not animate a bone.
-/// Keep the older convenience reader's strict playback profile separate.
-pub fn read_bcf_native(data: &[u8]) -> Result<Vec<Animation>> {
-    read_bcf_inner(data, true)
-}
-
-fn read_bcf_inner(data: &[u8], retain_empty: bool) -> Result<Vec<Animation>> {
     let mut r = Reader::new(data);
     if r.u32()? != 0 || r.u32()? != 0 {
         return r.fail("only animation-only binary BCF containers are supported");
     }
     let mut animations = Vec::new();
     for _ in 0..count(&mut r, 4096, 26)? {
-        let animation = read_animation(&mut r)?;
-        // This legacy convenience API feeds frame-indexed playback. Catalog
-        // registration can retain empty motion channels without sampling them.
-        if !retain_empty
-            && (animation.frames == 0 || animation.motions.iter().any(|m| m.frames == 0))
-        {
-            return r.fail("animation has empty motion channels");
-        }
-        animations.push(animation);
+        animations.push(read_animation(&mut r)?);
     }
     if r.remaining() != 0 {
         return r.fail("trailing bytes in BCF container");
