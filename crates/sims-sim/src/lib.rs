@@ -2,8 +2,9 @@
 //!
 //! The original keeps one lot for as long as it runs and loads each house
 //! into it, and [`World`] is that lot. [`World::empty`] is the lot before
-//! any load, and [`World::read_simulator`], [`World::read_arrays`] and
-//! [`World::read_objects`] read parts of a house file into it.
+//! any load, and [`World::read_simulator`] and [`World::read_arrays`] read
+//! parts of a house file into it. The saved objects are read by `sims-vm`,
+//! which holds the object definitions the original constructs them from.
 //! [`World::from_house`] reads a whole saved house at once: every
 //! object with its attributes, data and script stack, the scheduler cursor,
 //! both random streams, the budget and the lot arrays. [`World::hash`]

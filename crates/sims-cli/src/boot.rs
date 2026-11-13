@@ -1,7 +1,7 @@
 //! `sims boot`: run the lot load for a house as far as it is implemented
 //! and print the hash of the state it reaches.
 
-use sims_content::{Catalog, House, Index, Install, Neighborhood};
+use sims_content::{Catalog, House, Index, Install, Neighborhood, People};
 use sims_sim::load::Context;
 use sims_sim::{Snapshots, World};
 use sims_vm::{Callback, Interpreter, Program, Stream};
@@ -56,11 +56,15 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     world.clear_family()?;
     let queued = world.removals.len();
     let removed = interpreter.clear(&mut world)?;
-    world.read_arrays(&house.arrays)?;
-    // The load stops here. Next the original renumbers the saved floor and
-    // wall IDs, which is not ported. After that it reads the type table,
-    // which marks the types whose scripts changed; that is ported
-    // (`Interpreter::read_types`), so say what it will mark.
+    // 6a and 6b: the lot arrays, then the saved floor and wall IDs.
+    let version = house
+        .version()
+        .ok_or("the house file has no HOUS 1 chunk, which holds its version")?;
+    world.read_arrays(&house.arrays, version)?;
+    let renumbered =
+        world.renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())?;
+    // 6c and 7: the type table, which marks the types whose scripts
+    // changed. The listing below says which and why.
     if house.guid_table {
         return Err("the house has a GUID translation table (Gtab), which is not ported".into());
     }
@@ -85,6 +89,23 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
             ));
         }
     }
+    let changed = interpreter.read_types(&mut world, &house.types)?;
+    if changed.len() != mismatches.len() {
+        return Err("the type table read and its listing disagree".into());
+    }
+    // 6d: the second clear, then 6e: the saved objects.
+    let cleared_again = interpreter.clear(&mut world)?;
+    let people = People::load(
+        &install,
+        &index,
+        &catalog,
+        &neighborhood,
+        house.objects.instances.values().map(|o| o.guid),
+    )?;
+    let read = interpreter.read_objects(&mut world, &house.objects, &people)?;
+    // The load stops here. Next the original reconciles the lot-wide
+    // controllers among the saved objects (step 8), which is not ported
+    // for a lot that holds objects.
     if let Some(path) = options.snapshot {
         Snapshots::open(path)?.save("boot", &world)?;
     }
@@ -116,14 +137,27 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     );
     let _ = writeln!(
         out,
-        "         lot cleared, {} objects removed; {} lot arrays read",
+        "         lot cleared, {} objects removed; {} lot arrays read, {renumbered} floor \
+         cells renumbered",
         removed.len(),
         world.arrays.len()
     );
     let _ = writeln!(
         out,
-        "         stopped before the saved floors and walls are renumbered (not implemented \
-         yet)"
+        "         type table read, {} types changed; lot cleared again, {} objects removed",
+        changed.len(),
+        cleared_again.len()
+    );
+    let _ = writeln!(
+        out,
+        "         {} saved objects read; their constructors drew {} C runtime random numbers",
+        read.objects.len(),
+        read.draws
+    );
+    let _ = writeln!(
+        out,
+        "         stopped before the lot-wide controllers are reconciled (step 8, not \
+         implemented yet)"
     );
     let _ = writeln!(
         out,

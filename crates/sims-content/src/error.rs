@@ -17,6 +17,8 @@ pub enum Error {
     NotAnInstall { root: PathBuf, reason: String },
     /// A file the caller needs is absent.
     Missing { root: PathBuf, path: String },
+    /// Content that needs a part of the original that is not ported.
+    Unsupported(String),
 }
 
 impl Error {
@@ -49,6 +51,7 @@ impl fmt::Display for Error {
                     root.display()
                 )
             }
+            Self::Unsupported(message) => write!(f, "{message}"),
         }
     }
 }

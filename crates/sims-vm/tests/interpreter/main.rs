@@ -8,6 +8,7 @@ mod factory;
 mod load;
 mod memory;
 mod object_type;
+mod objects;
 mod presentation;
 mod random;
 mod removal;

@@ -4,9 +4,7 @@ use sha2::{Digest, Sha256};
 use sims_content::{Catalog, House};
 use sims_core::{CrtRng, GameRng};
 use sims_formats::lot::{Array, Simulator};
-use sims_formats::saved_objects::{
-    Frame, Instance, Multipart, Objects, Person, Relationship, Slot,
-};
+use sims_formats::saved_objects::{Frame, Instance, Multipart, Person, Relationship, Slot};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One lot's simulation state.
@@ -67,6 +65,16 @@ pub struct World {
     /// outlives a load: reading a house's type table sets or clears the
     /// flag of each type the table lists and leaves the others alone.
     pub changed_types: BTreeSet<u32>,
+    /// For each tile of a multi-tile object that has a following tile, the
+    /// ID of that tile: the list the original keeps from a group's lead
+    /// tile through its other tiles (0x4228a9). Reading saved objects
+    /// appends each tile to its lead's list in the file's order.
+    pub next_parts: BTreeMap<u16, u16>,
+    /// The skeleton files the running game has read, by name. Reading one
+    /// for the first time draws from the C runtime's random stream
+    /// (0x598af7), so whether a file was read before is state. It belongs
+    /// to the running game, not to the lot.
+    pub skeleton_files: BTreeSet<String>,
 }
 
 /// One type's shared words. See [`World::type_attributes`].
@@ -168,6 +176,8 @@ impl World {
             magic_history: None,
             indicators: [0; 2],
             changed_types: BTreeSet::new(),
+            next_parts: BTreeMap::new(),
+            skeleton_files: BTreeSet::new(),
         }
     }
 
@@ -194,49 +204,6 @@ impl World {
         };
     }
 
-    /// Reads a house's saved objects onto the lot (part of 0x449c5e). The
-    /// lot must hold no objects: the original clears it first. Each object
-    /// keeps its saved ID and is appended to the registration list in the
-    /// file's order (0x4434cd). An object whose type already has an
-    /// instance list is appended to it; the list of a type no script has
-    /// asked about stays unmade. Every object must have a definition in
-    /// `catalog`.
-    ///
-    /// This is the saved state only, and **unverified**: no capture of the
-    /// original covers the object read. The original constructs each
-    /// object before it reads the saved fields into it. That gives an
-    /// object at least as many attributes as its definition asks for, runs
-    /// the constructors of people and of object graphics, which draw from
-    /// the C runtime's random stream, and attaches each person to its
-    /// neighborhood record. None of that happens here, so the lot load in
-    /// `docs/roadmap.md` does not use this yet.
-    ///
-    /// The order and the instance lists follow the old prototype's
-    /// `import_saved_storage_inner`
-    /// (legacy/crates/sims-content/src/save_storage.rs).
-    pub fn read_objects(&mut self, saved: &Objects, catalog: &Catalog) -> Result<()> {
-        if !self.objects.is_empty() || !self.order.is_empty() {
-            return Err(Error::NotCleared);
-        }
-        for &id in &saved.order {
-            let Some(instance) = saved.instances.get(&id) else {
-                continue;
-            };
-            if catalog.object(instance.guid).is_none() {
-                return Err(Error::MissingDefinition {
-                    object: id,
-                    guid: instance.guid,
-                });
-            }
-            self.objects.insert(id, Object::from_instance(instance));
-            self.order.push(id);
-            if let Some(instances) = self.instances.get_mut(&instance.guid) {
-                instances.push(id);
-            }
-        }
-        Ok(())
-    }
-
     /// The state a saved house describes, before any script runs: the
     /// whole file read onto an empty lot in one go. Every object must have
     /// a definition in `catalog`.
@@ -244,8 +211,9 @@ impl World {
     /// The original never holds this state. It reads the simulator state
     /// first, creates and removes the lot-wide controllers, and only then
     /// reads the arrays, the type table and the objects, each onto the lot
-    /// it is holding (`docs/roadmap.md`, load sequence). This is for
-    /// looking at a house file, not for loading one.
+    /// it is holding (`docs/roadmap.md`, load sequence). It also constructs
+    /// each object before it reads the saved fields into it, which this
+    /// does not. This is for looking at a house file, not for loading one.
     pub fn from_house(house: &House, catalog: &Catalog) -> Result<Self> {
         let mut world = Self::empty();
         world.read_simulator(&house.simulator);

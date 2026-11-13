@@ -325,7 +325,7 @@ pub(crate) fn sorted_entries(directory: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn far_members(path: &Path) -> Result<Vec<Member>> {
+pub(crate) fn far_members(path: &Path) -> Result<Vec<Member>> {
     let io = |e| Error::io(path, e);
     let mut file = File::open(path).map_err(io)?;
     let len = file.metadata().map_err(io)?.len();

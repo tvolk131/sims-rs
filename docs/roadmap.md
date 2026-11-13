@@ -51,7 +51,7 @@ Each step is a few PRs, and each PR leaves `main` green.
 - Step 3 is in progress. The interpreter runs saved frames, creates
   objects through the original's factory, and puts them to sleep. The load
   sequence below tracks the load steps that must run before the first
-  tick; `sims boot` runs the first five and the start of the sixth.
+  tick; `sims boot` runs the first six.
 
 ### Load sequence
 
@@ -62,9 +62,9 @@ changes the state the first tick sees.
 
 The order and the addresses come from the old prototype's research on the
 1.91 executable. Each step was checked there on its own, against the
-original's code run in isolation. Steps 1 to 5 are also checked against
-captures of the running original (see steps 3 and 5), and three results of
-step 7 are (see step 7). The rest of the sequence has not been compared
+original's code run in isolation. Steps 1 to 6 are also checked against
+captures of the running original (see steps 3, 5 and 6), and three results
+of step 7 are (see step 7). The rest of the sequence has not been compared
 with a running game, so it is **unverified** until the comparison harness
 exists.
 
@@ -82,12 +82,12 @@ That starting lot is **unverified**; see the decision log.
 | 3 | Resize the held lot, which creates the lot-wide controllers | `0x415e20`, `0x442b9f` | Done for a bare lot that shrinks (`Interpreter::resize`) |
 | 4 | Clear the family global | `0x415eff` | Done (`World::clear_family`) |
 | 5 | Clear the lot: remove every object on it | `0x44279a`, `0x445f84`, `0x44123f`, `0x440eeb` | Done for objects that are off the lot (`Interpreter::clear`) |
-| 6a | Read the house's lot arrays | `0x478599` | Done (`World::read_arrays`), **unverified** |
-| 6b | Renumber the saved floor and wall IDs | `0x4a0e3b`, `0x4c5d35` | Not started |
-| 6c, 7 | Read the house's type table, marking the object types whose scripts changed since the save | `0x43dd76`, `0x43a516` | Done (`Interpreter::read_types`); not called here yet |
-| 6d | Clear the lot again | `0x445f84`, `0x44279a` | Done (step 5); not called here yet |
-| 6e | Read the house's objects onto the cleared lot | `0x449c5e`, `0x43fe0a` | Saved fields only (`World::read_objects`); the constructors are not started; not called here yet |
-| 8 | Reconcile the lot-wide controllers among the saved objects | `0x43fc02`, `0x442b9f` | Creation done (`Interpreter::reconcile_controllers`); deleting duplicates not started; not called here yet |
+| 6a | Read the house's lot arrays | `0x478599` | Done for house versions 53 to 62 (`World::read_arrays`) |
+| 6b | Renumber the saved floor and wall IDs | `0x4a0e3b`, `0x4c5d35` | Done for a house whose maps are empty (`World::renumber_surfaces`) |
+| 6c, 7 | Read the house's type table, marking the object types whose scripts changed since the save | `0x43dd76`, `0x43a516` | Done (`Interpreter::read_types`) |
+| 6d | Clear the lot again | `0x445f84`, `0x44279a` | Done (step 5) |
+| 6e | Construct the house's objects on the cleared lot and read their saved fields | `0x449c5e`, `0x43fe0a` | Done (`Interpreter::read_objects`); a person's graphics only as far as they draw random numbers |
+| 8 | Reconcile the lot-wide controllers among the saved objects | `0x43fc02`, `0x442b9f` | Creation done (`Interpreter::reconcile_controllers`) for a bare lot; deleting duplicates not started; not called here yet |
 | 9 | Repair the ground object grid and restore placement links | `0x443cb3` | Not started |
 | 10 | Give every object its room | `0x442659` | Not started |
 | 11 | Discard pending removals | `0x428679` | Not started |
@@ -97,7 +97,7 @@ That starting lot is **unverified**; see the decision log.
 
 `sims boot` runs the steps in order and stops at the first one that is not
 done, so it never prints the hash of a state the original could not be in.
-Today it stops after step 6a.
+Today it stops after step 6e.
 
 #### The steps
 
@@ -191,25 +191,71 @@ of step 5 and the start of the object read.
 
 *6a. Lot arrays.* Fourteen arrays replace the lot's: IDs 0, 4, 1, 2, 3, 8,
 101, 102, 103, 108, 6, 7, 9 and 10, asked for in that order. Arrays 9 and
-10 may be absent. No capture covers this, so it is **unverified**.
+10 may be absent. A house of version 53 to 62 saves a floor cell as one
+byte and a wall cell as 8. The lot holds a floor as a 16-bit ID and a wall
+as 14 bytes, and the original widens the saved cells into the lot's own
+arrays, for the cells inside the lot's size only. Other house versions
+are not ported.
 
-*6b. Floors and walls.* A saved floor or wall names its pattern by an ID
-that belongs to the save. The original maps the saved IDs to the IDs of
-the patterns it has loaded and rewrites the arrays. This is not ported,
-and `sims boot` stops before it.
+*6b. Floors and walls.* A saved floor or wall names a pattern beyond the
+built-in ones by an ID that belongs to the save, and the house lists in
+two maps which pattern file each ID means. The original maps the saved IDs
+to the IDs of the patterns it has loaded and rewrites the cells inside the
+lot's size. Only a house whose maps are empty is ported. There a floor ID
+the map should have listed becomes 65535. A wall cell that would change
+fails, because the original writes walls through a service that also
+updates the neighbouring cells. A map with entries fails too: resolving
+them needs the game's loaded patterns.
+
+For the Goth house 6a and 6b are checked against a capture of the
+original taken after both. The house's maps are empty and none of its
+cells holds an ID the renumbering covers, so 6b changes nothing. Inside
+the lot's 52 tiles the capture's terrain heights, floors, walls, object
+grid, flags, pool and water equal ours. The capture does not hold arrays
+4, 6 and 7, or any cell outside the 52 tiles; those are **unverified**.
+The gated test `the_goth_house_arrays_are_read_and_nothing_is_renumbered`
+pins our arrays and says what was compared.
 
 *6c. Type table.* See step 7, which the original does in the same pass.
 
 *6d. Second clear.* The original clears the lot again. In a load from the
 neighborhood the lot is already empty, so nothing happens.
 
-*6e. Objects.* Each saved object is constructed and then takes its saved
-fields. It keeps its saved ID and is appended to the registration list in
-the file's order. `World::read_objects` holds the saved fields, the order
-and the instance lists. It does not run the constructors: those of people
-and of object graphics draw from the C runtime's random stream, and a
-person's attaches it to its neighborhood record. Until they are ported the
-load cannot do this step, and `World::read_objects` is **unverified**.
+*6e. Objects.* The original first constructs every object the file lists,
+as the factory would, and registers each under its saved ID at the end of
+the registration list, in the file's order. Then it reads each object's
+saved fields into what the constructor made. What the constructor leaves
+shows afterwards:
+
+- An object has as many attributes as its definition asks for, never
+  fewer than 8. The saved ones fill the front.
+- It has a slot for its tile and one for each object it can hold. A
+  person has five more. A save with fewer slots does not shrink that.
+- A tile of a multi-tile object joins its lead tile's list, in the file's
+  order.
+- A person's constructor reads the file of its skeleton if the game has
+  not read it yet, builds the skeleton, and attaches the person to its
+  neighborhood record. If the record gives it no interests, it makes
+  default interests and personality. All of that draws from the C
+  runtime's random stream. The saved person data then replaces the
+  defaults, so only the draws remain.
+
+For the Goth house this step is checked against a capture of the original
+taken when the object read returns. All 245 objects match the capture in
+every field it holds, except one frame's tree ID on one object, which has
+a bit set in the capture that the save does not have; the cause is not
+known. The registration order, the globals, both game random streams and
+the multi-tile links match too. The three people's constructors draw as
+many random numbers as in the original: with the stream's state copied
+from the capture's start of the load, it ends in the capture's state. The
+gated test `the_goth_house_objects_are_constructed_and_read` pins our
+state and says what was and was not compared.
+
+Not ported, and failing with an error that says so: an object with
+graphics of its own (definition byte `0xcc` bit 0), a person with no
+neighborhood record, a skeleton that two files define, and saved
+attributes beyond what the constructor allocates. A person's graphics,
+animations and queue bookkeeping are not modeled beyond the random draws.
 
 **7. Changed types.** As it reads each record of the type table, the
 original compares the saved Init signature with the linked script's, and

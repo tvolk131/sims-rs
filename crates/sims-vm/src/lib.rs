@@ -28,6 +28,7 @@ mod fault;
 mod interpreter;
 mod load;
 mod memory;
+mod objects;
 mod primitives;
 mod program;
 mod removal;
@@ -38,6 +39,7 @@ pub use fault::{Fault, Location, Trap};
 pub use interpreter::{Interpreter, MAX_STACK, Status, Stream};
 pub use load::INDICATORS;
 pub use memory::scope_name;
+pub use objects::SavedRead;
 pub use primitives::primitive_name;
 pub use program::{Callback, DEFINITION_WORDS, Library, Program, Tree};
 
