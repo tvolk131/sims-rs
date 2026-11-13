@@ -66,8 +66,15 @@ impl Iff {
     /// Native IFFResFile3 enumeration. A version-0 resource map supplies its
     /// own per-type order (0x41be90/0x41bbc5); without a map, 0x41c252 appends
     /// live chunks in physical file order. Resource IDs are not sort keys.
+    ///
+    /// Only 2.5 headers carry a map offset, in bytes 60..64. In 2.0 headers
+    /// those bytes are the end of the signature text ("...MAXIS 1996\0").
     pub fn resource_order(&self, tag: &[u8; 4]) -> Result<Vec<&Chunk>> {
-        let offset = u32::from_be_bytes(self.bytes[60..64].try_into().unwrap()) as usize;
+        let offset = if self.bytes.starts_with(b"IFF FILE 2.5:") {
+            u32::from_be_bytes(self.bytes[60..64].try_into().unwrap()) as usize
+        } else {
+            0
+        };
         if offset == 0 {
             return Ok(self
                 .chunks

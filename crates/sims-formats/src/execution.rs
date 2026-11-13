@@ -6,7 +6,9 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
-pub fn global_link(data: &[u8]) -> Result<String> {
+/// The semi-global file a GLOB chunk names, or None for an empty name
+/// (EP5 `ParkRockers.iff` links to nothing with a lone zero byte).
+pub fn global_link(data: &[u8]) -> Result<Option<String>> {
     let mut r = Reader::new(data);
     let first = r.u8()?;
     let raw = if first < 48 {
@@ -16,10 +18,10 @@ pub fn global_link(data: &[u8]) -> Result<String> {
         let n = data.iter().position(|b| *b == 0).unwrap_or(data.len());
         &data[..n]
     };
-    if raw.is_empty() || raw.contains(&0) {
-        return r.fail("empty or embedded-NUL GLOB name");
+    if raw.contains(&0) {
+        return r.fail("embedded NUL in GLOB name");
     }
-    Ok(western(raw))
+    Ok((!raw.is_empty()).then(|| western(raw)))
 }
 
 pub fn constants(data: &[u8]) -> Result<Vec<i16>> {

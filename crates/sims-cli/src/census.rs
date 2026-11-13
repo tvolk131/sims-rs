@@ -225,7 +225,13 @@ fn decode(file: &iff::Iff, chunk: &iff::Chunk) -> Option<Outcome> {
             (0..set.frames.len()).try_for_each(|i| set.decode(data, i, file).map(drop))
         }),
         b"SPR#" => sprite::LegacySpriteSet::parse(data).and_then(|set| {
-            (0..set.frames.len()).try_for_each(|i| set.decode(data, i, file).map(drop))
+            // Sets that name no palette get theirs from the drawing code;
+            // a placeholder still checks the encoding.
+            let placeholder = sprite::Palette(vec![[255; 3]; 256]);
+            (0..set.frames.len()).try_for_each(|i| match set.palette_id() {
+                Some(_) => set.decode(data, i, file).map(drop),
+                None => set.decode_with_palette(data, i, &placeholder).map(drop),
+            })
         }),
         b"FAMI" => neighborhood::Family::parse(data).map(drop),
         b"NBRS" => neighborhood::Neighbors::parse(data).map(drop),
@@ -233,6 +239,8 @@ fn decode(file: &iff::Iff, chunk: &iff::Chunk) -> Option<Outcome> {
         b"Arry" => lot::Array::parse(data).map(drop),
         b"objt" => lot::ObjectTypes::parse(data).map(drop),
         b"SIMI" => lot::Simulator::parse(data).map(drop),
+        // HOUS #0 is the lot's view settings; the house model is #1.
+        b"HOUS" if chunk.id == 0 => lot::HouseView::parse(data).map(drop),
         b"HOUS" => lot::House::parse(data).map(drop),
         b"FLRm" => lot::surface_map(data, chunk.id, true).map(drop),
         b"WALm" => lot::surface_map(data, chunk.id, false).map(drop),

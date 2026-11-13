@@ -58,6 +58,24 @@ fn unknown_iff_chunks_are_lossless_and_zero_lengths_rejected() {
     assert!(Iff::parse(b).is_err());
 }
 #[test]
+fn only_version_2_5_headers_name_a_resource_map() {
+    let mut b = header();
+    b[..13].copy_from_slice(b"IFF FILE 2.0:");
+    b[56..64].copy_from_slice(b"S 1996\0\0");
+    add_chunk(&mut b, b"TEST", 2, &[]);
+    add_chunk(&mut b, b"TEST", 1, &[]);
+    let iff = Iff::parse(b.clone()).unwrap();
+    let ids: Vec<u16> = iff
+        .resource_order(b"TEST")
+        .unwrap()
+        .iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(ids, [2, 1]);
+    b[..13].copy_from_slice(b"IFF FILE 2.5:");
+    assert!(Iff::parse(b).unwrap().resource_order(b"TEST").is_err());
+}
+#[test]
 fn every_iff_truncation_inside_a_chunk_is_rejected() {
     let mut b = header();
     add_chunk(&mut b, b"TEST", 0, &[9; 30]);
@@ -290,10 +308,14 @@ fn arbitrary_bytes_do_not_panic_or_trigger_unbounded_allocations() {
 
 #[test]
 fn globals_and_constants_are_bounded_and_preserve_signed_words() {
-    assert_eq!(global_link(b"\x04Sofa").unwrap(), "Sofa");
-    assert_eq!(global_link(b"SofaGlobals\0").unwrap(), "SofaGlobals");
+    assert_eq!(global_link(b"\x04Sofa").unwrap().unwrap(), "Sofa");
+    assert_eq!(
+        global_link(b"SofaGlobals\0").unwrap().unwrap(),
+        "SofaGlobals"
+    );
     assert!(global_link(b"\x10abc").is_err());
-    assert!(global_link(b"\0").is_err());
+    assert!(global_link(b"\x03a\0b").is_err());
+    assert_eq!(global_link(b"\0").unwrap(), None);
     assert_eq!(constants(&[2, 0, 255, 255, 0, 128]).unwrap(), [-1, -32768]);
     assert!(constants(&[255, 0, 0, 0]).is_err());
 }

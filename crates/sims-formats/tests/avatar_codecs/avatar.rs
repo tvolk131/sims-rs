@@ -1,4 +1,4 @@
-use sims_formats::avatar::{MeshBinding, read_bcf, read_bmf};
+use sims_formats::avatar::{MeshBinding, read_bcf, read_bmf, read_skn};
 fn s(b: &mut Vec<u8>, s: &str) {
     b.push(s.len() as u8);
     b.extend(s.bytes());
@@ -155,4 +155,23 @@ fn mesh_preserves_empty_binding_rows_and_sentinel_offsets() {
     );
     assert_eq!(parsed.bindings[1].vertex_count, 3);
     assert_eq!(parsed.vertices.len(), 3);
+}
+
+fn skn(texture: &str) -> String {
+    format!(
+        "cart\r\n{texture}\r\n1\r\nROOT\r\n1\r\n0 1 2\r\n1\r\n0 0 3 0 0\r\n3\r\n0 0\r\n1 0\r\n0 1\r\n0\r\n3\r\n\
+         0 0 0 0 0 1\r\n1 0 0 0 0 1\r\n0 1 0 0 0 1\r\n"
+    )
+}
+
+#[test]
+fn skn_texture_line_may_be_empty() {
+    let mesh = read_skn(skn("cart-tex").as_bytes()).unwrap();
+    assert_eq!(mesh.texture, "cart-tex");
+    let mesh = read_skn(skn("").as_bytes()).unwrap();
+    assert_eq!(mesh.texture, "");
+    assert_eq!(mesh.bones, ["ROOT"]);
+    assert_eq!(mesh.triangles, [[0, 1, 2]]);
+    assert_eq!(mesh.vertices.len(), 3);
+    assert_eq!(mesh.vertices[1].position, [1.0, 0.0, 0.0]);
 }

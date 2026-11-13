@@ -464,7 +464,10 @@ pub fn render(iff: &Iff, view: &DrawView) -> Result<Preview> {
 }
 
 /// SPR# directories and paletted RLE images, including original wall coverings.
-/// Separate color/depth-plane versions 501/503/506 are not accepted here.
+///
+/// Versions 502 to 505 share one frame encoding: every 503 and 505 chunk in
+/// the original install decodes completely with it. What the version number
+/// itself selects is unknown. 501 and 506 do not occur and are rejected.
 #[derive(Debug, Clone)]
 pub struct LegacySpriteSet {
     pub version: u32,
@@ -477,8 +480,8 @@ impl LegacySpriteSet {
         let mut r = Reader::new(data);
         let word = r.u32()?;
         let (version, big_endian) = match word {
-            502 | 504 => (word, false),
-            _ if matches!(word.swap_bytes(), 502 | 504) => (word.swap_bytes(), true),
+            502..=505 => (word, false),
+            _ if matches!(word.swap_bytes(), 502..=505) => (word.swap_bytes(), true),
             _ => return r.fail("unsupported legacy SPR# version"),
         };
         let read = |r: &mut Reader<'_>| if big_endian { r.be32() } else { r.u32() };
@@ -511,9 +514,17 @@ impl LegacySpriteSet {
             big_endian,
         })
     }
+    /// The PALT chunk this set names, or None when the drawing code supplies
+    /// the palette (wall masks store 0xFFFFFFFF).
+    pub fn palette_id(&self) -> Option<u16> {
+        u16::try_from(self.default_palette).ok()
+    }
+    /// Decodes a frame with the palette the set names. Sets without one
+    /// must use `decode_with_palette`.
     pub fn decode(&self, data: &[u8], index: usize, iff: &Iff) -> Result<Frame> {
-        let id = u16::try_from(self.default_palette)
-            .map_err(|_| Error::new(8, "SPR# requires an explicit engine default palette"))?;
+        let id = self
+            .palette_id()
+            .ok_or_else(|| Error::new(8, "SPR# names no palette; the caller supplies one"))?;
         let c = iff
             .get(b"PALT", id)
             .ok_or_else(|| Error::new(8, format!("missing PALT #{id}")))?;
@@ -556,6 +567,30 @@ mod legacy_tests {
         }
         for length in 0..20 {
             assert!(LegacySpriteSet::parse(&bytes[..length]).is_err());
+        }
+    }
+
+    #[test]
+    fn versions_502_to_505_in_either_byte_order_share_the_directory() {
+        for version in 501u32..=506 {
+            for big_endian in [false, true] {
+                let mut bytes = Vec::new();
+                for n in [version, 1, 0xFFFF_FFFF, 16] {
+                    let word = if big_endian {
+                        n.to_be_bytes()
+                    } else {
+                        n.to_le_bytes()
+                    };
+                    bytes.extend_from_slice(&word);
+                }
+                bytes.resize(24, 0);
+                let set = LegacySpriteSet::parse(&bytes);
+                assert_eq!(set.is_ok(), (502..=505).contains(&version), "{version}");
+                if let Ok(set) = set {
+                    assert_eq!(set.version, version);
+                    assert_eq!(set.palette_id(), None);
+                }
+            }
         }
     }
 }

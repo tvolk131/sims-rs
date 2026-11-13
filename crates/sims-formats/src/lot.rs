@@ -208,7 +208,11 @@ impl Simulator {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
         let version = header(&mut r, b"IMIS")?;
-        if !(0x3e..=0x49).contains(&version) {
+        // 0x33 and 0x38 occur only in the base game's template houses. Their
+        // fields through the budget read plausibly with this layout; 0x33's
+        // unread tail is 24 bytes shorter. Not yet checked against the
+        // original loader.
+        if !(0x33..=0x49).contains(&version) {
             return r.fail(format!("unsupported SIMI version {version}"));
         }
         let mut globals = Vec::new();
@@ -376,4 +380,52 @@ pub fn surface_map(bytes: &[u8], chunk_id: u16, floor: bool) -> Result<Vec<Surfa
         return r.fail("trailing surface map bytes");
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod simulator_tests {
+    use super::*;
+
+    fn simulator(version: u32) -> Vec<u8> {
+        let mut b = vec![0; 4];
+        b.extend(version.to_le_bytes());
+        b.extend(b"IMIS");
+        let globals = if version >= 0x41 { 64 } else { 32 };
+        for g in 0..globals {
+            b.extend((g as i16).to_le_bytes());
+        }
+        b.extend(9175u32.to_le_bytes());
+        b.extend(0i16.to_le_bytes());
+        for n in [94500u32, 0xea8b_32d0, 0xeb1b, 0, 4500, 0, 0] {
+            b.extend(n.to_le_bytes());
+        }
+        b.extend(1i32.to_le_bytes());
+        for n in 1..=8i32 {
+            b.extend(n.to_le_bytes());
+        }
+        for _ in 0..5 {
+            b.extend(0i32.to_le_bytes());
+        }
+        b.extend([7; 3]);
+        b
+    }
+
+    #[test]
+    fn reads_template_house_versions() {
+        for version in [0x33, 0x38, 0x3e, 0x41, 0x49] {
+            let sim = Simulator::parse(&simulator(version)).unwrap();
+            assert_eq!(sim.globals.len(), if version >= 0x41 { 64 } else { 32 });
+            assert_eq!(sim.globals[31], 31);
+            assert_eq!(sim.ticks, 9175);
+            assert_eq!(sim.funds, 94500);
+            assert_eq!(sim.lot_rng, 0xea8b_32d0);
+            assert_eq!(sim.lot_value, 4500);
+            assert_eq!(sim.budget_days[0], Some([1, 2, 3, 4, 5, 6, 7, 8]));
+            assert!(sim.budget_days[1..].iter().all(Option::is_none));
+            assert_eq!(sim.tail, [7; 3]);
+        }
+        for version in [0x32, 0x4a] {
+            assert!(Simulator::parse(&simulator(version)).is_err());
+        }
+    }
 }

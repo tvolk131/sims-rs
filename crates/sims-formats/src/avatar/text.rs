@@ -211,7 +211,9 @@ fn read_appearance(r: &mut Text<'_>) -> Result<Appearance> {
 pub fn read_skn(data: &[u8]) -> Result<Mesh> {
     let mut r = Text::new(data)?;
     let name = r.name(1024)?;
-    let texture = r.name(1024)?;
+    // The texture line directly follows the name and may be empty: EP7's
+    // untextured fun-house cart skins leave it blank.
+    let texture = crate::strings::decode(r.line(1024)?, 1);
     let mut bones = Vec::new();
     for _ in 0..r.count(256)? {
         let bone = r.name(1024)?;
