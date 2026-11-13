@@ -1,6 +1,6 @@
 //! `sims install`: detect an install and summarize its indexed content.
 
-use sims_content::{Index, Install};
+use sims_content::{Catalog, Index, Install};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -40,9 +40,27 @@ pub fn report(root: &Path) -> sims_content::Result<String> {
         let _ = writeln!(out, "{path:<22} {files:>9} {members:>9} {iffs:>9}");
     }
     let _ = writeln!(out, "\nResources: {}", index.resources.len());
-    if !index.diagnostics.is_empty() {
-        let _ = writeln!(out, "\nDiagnostics:");
-        for diagnostic in &index.diagnostics {
+    let catalog = Catalog::build(&index)?;
+    let links = catalog
+        .semi_globals
+        .values()
+        .filter(|l| l.is_some())
+        .count();
+    let _ = writeln!(
+        out,
+        "Objects:   {} definitions, {} GUIDs, {} semi-global links",
+        catalog.objects.len(),
+        catalog.by_guid.len(),
+        links
+    );
+    let diagnostics: Vec<_> = index
+        .diagnostics
+        .iter()
+        .chain(&catalog.diagnostics)
+        .collect();
+    if !diagnostics.is_empty() {
+        let _ = writeln!(out, "\nDiagnostics ({}):", diagnostics.len());
+        for diagnostic in diagnostics {
             let _ = writeln!(out, "  {diagnostic}");
         }
     }

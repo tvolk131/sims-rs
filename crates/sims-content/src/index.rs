@@ -37,6 +37,17 @@ impl Resource {
         }
     }
 
+    /// A readable location: the path relative to `root`, with `/member`
+    /// appended for archive members.
+    pub fn location(&self, root: &Path) -> String {
+        let path = self.path.strip_prefix(root).unwrap_or(&self.path);
+        let path = path.to_string_lossy().replace('\\', "/");
+        match &self.member {
+            Some(member) => format!("{path}/{}", member.name),
+            None => path,
+        }
+    }
+
     pub fn read(&self) -> Result<Vec<u8>> {
         let io = |e| Error::io(&self.path, e);
         match &self.member {
@@ -55,6 +66,8 @@ impl Resource {
 /// Every file and archive member under an install's mounts, in load order.
 #[derive(Debug, Clone)]
 pub struct Index {
+    /// The install root the resources were found under.
+    pub root: PathBuf,
     pub mounts: Vec<Mount>,
     pub resources: Vec<Resource>,
     /// Problems that do not stop indexing, such as an unreadable archive.
@@ -71,6 +84,7 @@ impl Index {
     /// `docs/decisions.md`. A mount that does not exist contributes nothing.
     pub fn build(install: &Install) -> Result<Self> {
         let mut index = Self {
+            root: install.root.clone(),
             mounts: install.mounts(),
             resources: Vec::new(),
             diagnostics: Vec::new(),
@@ -85,11 +99,13 @@ impl Index {
         Ok(index)
     }
 
-    /// Resources whose own name matches, ignoring ASCII case, in load order.
-    pub fn named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Resource> {
+    /// Resources whose own name matches, ignoring ASCII case, in load
+    /// order, with their positions in [`Index::resources`].
+    pub fn named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = (usize, &'a Resource)> {
         self.resources
             .iter()
-            .filter(move |r| r.name().eq_ignore_ascii_case(name))
+            .enumerate()
+            .filter(move |(_, r)| r.name().eq_ignore_ascii_case(name))
     }
 
     fn walk(&mut self, mount: usize, directory: &Path, recursive: bool) -> Result<()> {
