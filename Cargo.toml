@@ -1,16 +1,12 @@
 [workspace]
+# The re-founded engine. Code under legacy/ is reference material only; it is
+# not part of this workspace and is never built. See docs/vision.md and
+# docs/salvage-audit.md.
 members = [
+    "crates/sims-core",
     "crates/sims-formats",
-    "crates/sims-content",
-    "crates/sims-vm",
-    "crates/sims-sim",
-    "crates/sims-runtime",
-    "crates/sims-render",
-    "crates/sims-app",
-    "crates/sims-tools",
-    "crates/sims-fixtures",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 version = "0.1.0"
@@ -20,15 +16,18 @@ license = "MIT"
 repository = "https://github.com/tvolk131/sims-rs"
 
 [workspace.dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
 encoding_rs = "0.8"
-image = { version = "0.25", default-features = false, features = ["png", "bmp", "tga"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sims-core = { path = "crates/sims-core" }
 sims-formats = { path = "crates/sims-formats" }
-sims-content = { path = "crates/sims-content" }
-sims-vm = { path = "crates/sims-vm" }
-sims-sim = { path = "crates/sims-sim" }
-sims-runtime = { path = "crates/sims-runtime" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Determinism bans (docs/vision.md "Simulation"). The method and type lists
+# live in clippy.toml. Crates that never feed simulation state (rendering,
+# audio, the app shell) may allow these explicitly at their crate root.
+disallowed_methods = "deny"
+disallowed_types = "deny"

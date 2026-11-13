@@ -28,31 +28,29 @@ jobs:
       - run: python3 -B scripts/check_repository.py --history HEAD
 
   rust:
-    name: Rust checks
-    runs-on: ubuntu-24.04
+    # The two runners are different architectures (x86_64 and aarch64), so
+    # the float-model tests double as a cross-architecture determinism check.
+    name: Rust checks (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
-      CARGO_BUILD_JOBS: 2
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
-      RUST_MIN_STACK: 33554432
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           persist-credentials: false
-      - run: rustup toolchain install 1.99.0 --profile minimal
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwayland-dev libxkbcommon-dev libegl1-mesa-dev
+      - run: rustup toolchain install 1.99.0 --profile minimal --component clippy,rustfmt
       - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-${{ runner.os }}-1.99.0-${{ hashFiles('Cargo.lock') }}
-      - run: cargo +1.99.0 check --locked --workspace --lib --bins --tests
-      - run: cargo +1.99.0 test --locked --lib -p sims-formats -p sims-vm -p sims-sim -p sims-content -p sims-runtime -p sims-fixtures -- --test-threads=1
-      - name: Synthetic avatar-codec tests
-        run: cargo +1.99.0 test --locked -p sims-formats --test avatar_codecs -- --test-threads=1
-      - name: Asset-free inventory operation tests
-        run: cargo +1.99.0 test --locked -p sims-vm --test inventory_operations -- --test-threads=1
-      - name: Asset-free renderer library tests
-        run: cargo +1.99.0 test --locked -p sims-render --lib -- --test-threads=1
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-1.99.0-${{ hashFiles('Cargo.lock') }}
+      - run: cargo +1.99.0 fmt --all --check
+      - run: cargo +1.99.0 clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo +1.99.0 test --locked --workspace

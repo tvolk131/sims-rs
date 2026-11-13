@@ -1,7 +1,6 @@
 //! FAR 1a: parse the directory independently of large payloads.
 use crate::reader::{Reader, western};
 use crate::{Error, Result};
-pub mod mount;
 
 #[derive(Debug, Clone)]
 pub struct Entry {
