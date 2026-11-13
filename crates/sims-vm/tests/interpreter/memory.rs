@@ -81,11 +81,9 @@ fn object_data() {
             Trap::Unsupported(_)
         ));
     }
-    // Word 25 wakes the object, which needs the scheduler.
-    assert!(matches!(
-        trap(read(&mut fx, scope::STACK_DATA, 25)),
-        Trap::Unsupported(_)
-    ));
+    // Word 25 reads like any other; what resolving it does to a sleeping
+    // object is in sleep.rs.
+    assert!(reads(&mut fx, scope::STACK_DATA, 25, 50));
 }
 
 #[test]
@@ -371,7 +369,7 @@ fn stack_object_definition() {
 
 #[test]
 fn unsupported_scopes_name_themselves() {
-    for scope in [12, 23, 24, 28, 29, 32, 33, 34, 36, 37, 38] {
+    for scope in [12, 23, 24, 28, 29, 32, 33, 34, 38] {
         let mut fx = Fixture::new();
         let fault = read(&mut fx, scope, 0).unwrap_err();
         assert_eq!(fault.trap, Trap::UnsupportedScope { scope });

@@ -3,9 +3,14 @@
 
 mod calls;
 mod expression;
+mod factory;
+mod load;
 mod memory;
 mod object_type;
 mod presentation;
 mod random;
+mod removal;
+mod services;
 mod set_to_next;
+mod sleep;
 mod support;

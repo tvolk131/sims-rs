@@ -212,6 +212,143 @@ fn every_guid_needs_a_definition() {
     assert!(error.contains("0x00003333"), "{error}");
 }
 
+/// One version 7 TTAB entry with the given autonomy threshold.
+fn ttab(autonomy: u32) -> Vec<u8> {
+    let mut bytes = 1u16.to_le_bytes().to_vec();
+    bytes.extend(7u16.to_le_bytes());
+    bytes.extend(4100u16.to_le_bytes()); // action
+    bytes.extend(0u16.to_le_bytes()); // test
+    for value in [0, 0, 0, 0, 0, autonomy, 0] {
+        // motives, flags, string, attenuation code and value, autonomy,
+        // joining index
+        bytes.extend(value.to_le_bytes());
+    }
+    bytes
+}
+
+/// A version 4 SLOT chunk with one entry of each kind given.
+fn slot(kinds: &[u16]) -> Vec<u8> {
+    let mut bytes = vec![0; 4];
+    bytes.extend(4u32.to_le_bytes());
+    bytes.extend(b"TOLS");
+    bytes.extend((kinds.len() as u32).to_le_bytes());
+    for kind in kinds {
+        bytes.extend(kind.to_le_bytes());
+        bytes.extend([0; 32]);
+    }
+    bytes
+}
+
+#[test]
+fn interaction_tables_and_slots_are_found_through_the_definition() {
+    let dir = Dir::new("tables");
+    let (_, _) = setup(&dir);
+    // The lamp names table 200, which only its semi-global file has, and
+    // SLOT 300. The desk names table 201, which no reader decodes, and a
+    // SLOT chunk its file lacks. The stool is a tile whose group's catalog
+    // definition (sub-index -1) names the table.
+    let word = |bytes: &mut Vec<u8>, index: usize, value: i16| {
+        bytes[index * 2..index * 2 + 2].copy_from_slice(&value.to_le_bytes());
+    };
+    let mut lamp = objd(0x1111, 4096, 4097);
+    word(&mut lamp, 7, 200);
+    word(&mut lamp, 20, 300);
+    let mut desk = objd(0x3333, 0, 0);
+    word(&mut desk, 7, 201);
+    word(&mut desk, 20, 301);
+    let mut stool = objd(0x4444, 0, 0);
+    word(&mut stool, 7, -1);
+    word(&mut stool, 10, 6);
+    let mut stools = objd(0x4445, 0, 0);
+    word(&mut stools, 7, 202);
+    word(&mut stools, 10, 6);
+    word(&mut stools, 11, -1);
+    let mut bad_table = 1u16.to_le_bytes().to_vec();
+    bad_table.extend(3u16.to_le_bytes());
+    dir.file(
+        "GameData/Objects/LampGlobals.iff",
+        &iff(&[(b"TTAB", 200, ttab(50))]),
+    )
+    .file(
+        "GameData/Objects/Lamp.iff",
+        &iff(&[
+            (b"OBJD", 128, lamp),
+            (b"GLOB", 128, b"\x0bLampGlobals".to_vec()),
+            (b"SLOT", 300, slot(&[0, 3, 0, 1])),
+        ]),
+    )
+    .file(
+        "GameData/Objects/Desk.iff",
+        &iff(&[
+            (b"OBJD", 128, desk),
+            (b"TTAB", 201, bad_table),
+            (b"OBJD", 129, stool),
+            (b"OBJD", 130, stools),
+            (b"TTAB", 202, ttab(7)),
+        ]),
+    );
+    let index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
+    let catalog = Catalog::build(&index).unwrap();
+    let program = Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid)).unwrap();
+    let lamp = catalog.object(0x1111).unwrap();
+    let desk = catalog.object(0x3333).unwrap();
+    let chair = catalog.object(0x2222).unwrap();
+    let autonomy = |object: &sims_content::Object| {
+        program
+            .interactions(object.resource, object.chunk)
+            .map(|table| table.map(|t| t.interactions[0].autonomy))
+    };
+    assert_eq!(autonomy(lamp), Ok(Some(50)));
+    assert_eq!(autonomy(catalog.object(0x4444).unwrap()), Ok(Some(7)));
+    assert_eq!(autonomy(catalog.object(0x4445).unwrap()), Ok(Some(7)));
+    // The chair names no table.
+    assert_eq!(autonomy(chair), Ok(None));
+    let error = autonomy(desk).unwrap_err();
+    assert!(error.contains("TTAB #201"), "{error}");
+    // Only kind 0 slots hold objects.
+    assert_eq!(program.containers(lamp.resource, lamp.chunk), 2);
+    assert_eq!(program.containers(desk.resource, desk.chunk), 0);
+    assert_eq!(program.containers(chair.resource, chair.chunk), 0);
+    // A SLOT chunk that does not decode stops the link.
+    dir.file(
+        "GameData/Objects/Desk.iff",
+        &iff(&[(b"OBJD", 128, objd(0x3333, 0, 0)), (b"SLOT", 5, vec![0; 6])]),
+    );
+    let index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
+    let catalog = Catalog::build(&index).unwrap();
+    let error = Program::link(&index, &catalog, [0x3333]).unwrap_err();
+    assert!(error.to_string().contains("SLOT #5"), "{error}");
+}
+
+#[test]
+fn careers_come_from_work_iff_in_resource_order() {
+    let dir = Dir::new("careers");
+    let (index, catalog) = setup(&dir);
+    assert_eq!(Program::link(&index, &catalog, []).unwrap().careers, None);
+    // Chunk IDs are sign-extended. The chunks' contents are not read.
+    dir.file(
+        "GameData/Objects/work.iff",
+        &iff(&[
+            (b"CARR", 3, vec![]),
+            (b"CARR", 0xffff, vec![]),
+            (b"STR#", 5, vec![]),
+            (b"CARR", 1, vec![]),
+        ]),
+    );
+    let index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
+    let catalog = Catalog::build(&index).unwrap();
+    let program = Program::link(&index, &catalog, []).unwrap();
+    assert_eq!(program.careers, Some(vec![3, -1, 1]));
+    assert!(program.zoning.is_empty());
+    // A Careers.txt overrides the table through a loader that is not
+    // ported, so there is no list to give.
+    dir.file("GameData/Objects/Careers.txt", b"");
+    let index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
+    let catalog = Catalog::build(&index).unwrap();
+    let program = Program::link(&index, &catalog, []).unwrap();
+    assert_eq!(program.careers, None);
+}
+
 /// The catalog's order, checked against the original on a real install
 /// when `SIMS_INSTALL` names one. Game data is never committed, so CI
 /// skips this.

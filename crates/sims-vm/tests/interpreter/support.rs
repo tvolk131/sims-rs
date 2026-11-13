@@ -8,8 +8,8 @@ use sims_content::Catalog;
 use sims_core::GameRng;
 use sims_formats::behavior::{Behavior, Instruction};
 use sims_formats::execution::ObjectFunction;
-use sims_formats::saved_objects::{Interaction, Person, Slot};
-use sims_sim::{Budget, Object, World};
+use sims_formats::saved_objects::{Frame, Interaction, Person, Slot};
+use sims_sim::{Object, World};
 use sims_vm::{DEFINITION_WORDS, Fault, Interpreter, Library, Program, Stream, Trap};
 use std::collections::BTreeMap;
 
@@ -23,6 +23,7 @@ pub const LAMP_TYPE: i16 = 7;
 pub const LAMP_GUID: u32 = 0x1111;
 pub const SIM_GUID: u32 = 0x2222;
 
+pub const ERROR: u8 = 253;
 pub const RETURN_TRUE: u8 = 254;
 pub const RETURN_FALSE: u8 = 255;
 
@@ -77,6 +78,28 @@ pub fn expression(
         RETURN_TRUE,
         RETURN_FALSE,
         expr(left_scope, left, operator, right_scope, right),
+    )
+}
+
+/// A tree of one parameter that sleeps for that many turns, then returns
+/// true. The base game's global tree 280 is one of these.
+pub fn sleeper() -> Behavior {
+    shaped(
+        0x8002,
+        0,
+        1,
+        0,
+        vec![ins(0, RETURN_TRUE, RETURN_FALSE, [0; 8])],
+    )
+}
+
+/// `left = right`, then go to `next`.
+pub fn assign(left_scope: u8, left: i16, right_scope: u8, right: i16, next: u8) -> Instruction {
+    ins(
+        2,
+        next,
+        next,
+        expr(left_scope, left, op::ASSIGN, right_scope, right),
     )
 }
 
@@ -135,6 +158,8 @@ pub fn object(id: u16, guid: u32) -> Object {
         portal: None,
         person: None,
         registry_word: None,
+        last_result: false,
+        removal_skips_resets: false,
     }
 }
 
@@ -183,23 +208,13 @@ pub fn world() -> World {
     sim.attributes = vec![20, 21];
     sim.person = Some(person());
     World {
-        ticks: 0,
         globals: (0..64).map(|n| n + 100).collect(),
-        scheduler_cursor: 0,
         lot_rng: GameRng::from_state(1),
         global_rng: GameRng::from_state(2),
-        budget: Budget {
-            funds: 0,
-            pending_funds: 0,
-            lot_value: 0,
-            objects_value: 0,
-            architecture_value: 0,
-            days: Vec::new(),
-        },
         order: vec![LAMP, SIM],
         types: BTreeMap::from([(7, LAMP_GUID), (8, SIM_GUID)]),
         objects: BTreeMap::from([(LAMP, object(LAMP, LAMP_GUID)), (SIM, sim)]),
-        arrays: BTreeMap::new(),
+        ..World::empty()
     }
 }
 
@@ -263,6 +278,8 @@ fn program() -> Program {
             (SIM_FILE, library(vec![], vec![])),
         ]),
         semi_globals: BTreeMap::from([(LAMP_FILE, Some(SEMI_FILE)), (SIM_FILE, None)]),
+        careers: None,
+        zoning: BTreeMap::new(),
     };
     for (resource, guid, kind) in [(LAMP_FILE, LAMP_GUID, 4), (SIM_FILE, SIM_GUID, 2)] {
         let library = program.libraries.get_mut(&resource).unwrap();
@@ -297,6 +314,67 @@ impl Fixture {
             .behaviors
             .insert(id, behavior);
         self
+    }
+
+    /// Adds an object type of `kind` in a file of its own, with the given
+    /// Init and Main trees and every other definition word zero. Returns
+    /// the file's resource number.
+    pub fn add_type(&mut self, guid: u32, kind: i16, init: u16, main: u16) -> usize {
+        let resource = self.program.libraries.len();
+        let mut words = [0; DEFINITION_WORDS];
+        words[9] = kind;
+        words[14] = guid as u16 as i16;
+        words[15] = (guid >> 16) as u16 as i16;
+        let callbacks = [init, main].map(|action| ObjectFunction {
+            condition: 0,
+            action,
+        });
+        let library = Library {
+            callbacks: BTreeMap::from([(128, callbacks.to_vec())]),
+            definitions: BTreeMap::from([(128, words)]),
+            definition_order: vec![128],
+            ..Library::default()
+        };
+        self.program.libraries.insert(resource, library);
+        self.program.semi_globals.insert(resource, None);
+        self.catalog
+            .by_guid
+            .insert(guid, self.catalog.objects.len());
+        self.catalog.objects.push(sims_content::Object {
+            guid,
+            resource,
+            chunk: 128,
+            kind: kind as u16,
+            master: 0,
+        });
+        resource
+    }
+
+    /// The definition words of the one type in a file.
+    pub fn words(&mut self, resource: usize) -> &mut [i16; DEFINITION_WORDS] {
+        self.program
+            .libraries
+            .get_mut(&resource)
+            .unwrap()
+            .definitions
+            .get_mut(&128)
+            .unwrap()
+    }
+
+    /// Replaces an object's thread with one frame at the start of `tree`.
+    /// The object's type must be in the lot's type table.
+    pub fn thread(&mut self, object: u16, tree: u16, parameters: &[i16]) {
+        let guid = self.world.objects[&object].guid;
+        let (&code_owner_type, _) = self.world.types.iter().find(|&(_, &g)| g == guid).unwrap();
+        self.world.objects.get_mut(&object).unwrap().stack = vec![Frame {
+            stack_object: 0,
+            tree,
+            node: 0,
+            parameters: parameters.to_vec(),
+            locals: Vec::new(),
+            primitive_state: 0,
+            code_owner_type: code_owner_type as i16,
+        }];
     }
 
     pub fn interpreter(&self) -> Interpreter<'_> {

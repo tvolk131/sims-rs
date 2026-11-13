@@ -45,12 +45,13 @@ Each step is a few PRs, and each PR leaves `main` green.
 
 - Step 1 is done: `sims install` detects a Complete Collection install and
   builds the object catalog.
-- Step 2 is done: `sims boot <install> <house>` loads the Goth house into
-  `World`, prints its state hash and can save a REDB snapshot. `--ticks`
-  waits for step 3.
-- Step 3 is in progress. The interpreter runs saved frames and the
-  operations the Goth house's init scripts reach. The load sequence below
-  tracks the load steps that must run before the first tick.
+- Step 2 is done: the Goth house reads into `World`, which has a state
+  hash and REDB snapshots. `sims boot <install> <house>` prints the hash of
+  the state its load reaches. `--ticks` waits for step 3.
+- Step 3 is in progress. The interpreter runs saved frames, creates
+  objects through the original's factory, and puts them to sleep. The load
+  sequence below tracks the load steps that must run before the first
+  tick; `sims boot` runs the first four.
 
 ### Load sequence
 
@@ -61,62 +62,125 @@ changes the state the first tick sees.
 
 The order and the addresses come from the old prototype's research on the
 1.91 executable. Each step was checked there on its own, against the
-original's code run in isolation. The sequence as a whole has not been
-compared with a running game, so it is **unverified** until the comparison
-harness exists.
+original's code run in isolation. Steps 1 to 3 are also checked against a
+capture of the running original (see step 3). The rest of the sequence has
+not been compared with a running game, so it is **unverified** until the
+comparison harness exists.
+
+The original does not build a lot for a house. It keeps one lot for as long
+as it runs and loads each house into it. So a load starts from whatever
+that lot holds: at least the two indicator objects, which every load
+creates at its end (step 14). `sims boot` has no earlier load, so it starts
+from an empty lot (`World::empty`) and creates the two indicators on it.
+That starting lot is **unverified**; see the decision log.
 
 | # | Step | Original | Status |
 |---|------|----------|--------|
-| 1 | Read the house file: simulator state, type table, objects, lot arrays | `0x415eff` | Done (`World::from_house`) |
+| 1 | Read the house's simulator state into the lot the game is holding | `0x46cfb3` | Done (`World::read_simulator`) |
 | 2 | Set the globals the running game supplies | `0x46cdc6`, `0x46cfb3`, `0x415eff` | Done (`World::apply_context`) |
-| 3 | Mark the object types whose scripts changed since the save | `0x43a516` | Computed by `sims boot`, not stored yet |
-| 4 | Reconcile global controllers | `0x442b9f` | Not started |
-| 5 | Repair the ground object grid and restore placement links | `0x443cb3` | Not started |
-| 6 | Give every object its room | `0x442659` | Not started |
-| 7 | Discard pending removals | `0x428679` | Not started |
-| 8 | Select the household | `0x428041`, `0x46d8dc` | State change done (`World::select_family`), not called yet |
-| 9 | Visit every object in registration order | `0x43fc94`, `0x431e2e` | Not started |
-| 10 | Create the indicator objects and finish selection | `0x445e4a` | Not started |
+| 3 | Resize the held lot, which creates the lot-wide controllers | `0x415e20`, `0x442b9f` | Done for a bare lot that shrinks (`Interpreter::resize`) |
+| 4 | Clear the family global | `0x415eff` | Done (`World::clear_family`) |
+| 5 | Clear the lot: remove every object on it | `0x44279a` | Not started |
+| 6 | Read the house's lot arrays, type table and objects onto the cleared lot | `0x478599`, `0x43dd76`, `0x43fe0a` | Readers done (`World::from_house`); not yet run onto the cleared lot |
+| 7 | Mark the object types whose scripts changed since the save | `0x43a516` | Computed by `sims boot`, not stored yet |
+| 8 | Reconcile the lot-wide controllers among the saved objects | `0x43fc02`, `0x442b9f` | Creation done (`Interpreter::reconcile_controllers`); deleting duplicates not started; not called here yet |
+| 9 | Repair the ground object grid and restore placement links | `0x443cb3` | Not started |
+| 10 | Give every object its room | `0x442659` | Not started |
+| 11 | Discard pending removals | `0x428679` | Not started |
+| 12 | Select the household | `0x428041`, `0x46d8dc` | State change done (`World::select_family`), not called yet |
+| 13 | Visit every object in registration order | `0x43fc94`, `0x431e2e` | Not started |
+| 14 | Create the indicator objects and finish selection | `0x445e4a` | Creation done (`Interpreter::create_indicators`), used only for the starting lot |
 
 `sims boot` runs the steps in order and stops at the first one that is not
 done, so it never prints the hash of a state the original could not be in.
+Today it stops after step 4.
 
 #### The steps
+
+**1. Simulator state.** The clock, the 32 or 64 saved globals, the
+scheduler cursor, both game random streams and the budget replace the held
+lot's. The objects on the lot, its size and the C runtime's random stream
+are not in the house file and stay.
 
 **2. Globals.** The simulator zeroes all 64 globals, then overlays the 32 or
 64 saved words. It then sets the fields that belong to the running game:
 global 15 (mode), 25 (kept from before the load), 29 (always 30), 30 (free
 will), 20 (installed expansions) and 33 (hardware performance class). The
 speed in global 16 is clamped to 0..1000 and copied to global 18 unless
-that is negative. Globals 32 (budget mode) and 9 (family) are cleared.
+that is negative. Global 32 (budget mode) is cleared. The saved family in
+global 9 stays for now.
 
-**3. Changed types.** For each saved type the original compares the saved
+**3. Resize.** The house asks for a lot size in global 23, where 0 means
+the full 64 tiles. If the held lot has another size, it is resized. The
+resize rebuilds the lot's rooms, which writes the lot's indoor area to
+global 27, and the object registry answers the rebuild by creating every
+lot-wide controller the lot lacks. A lot that already has the size skips
+all of this.
+
+A lot-wide controller is an object definition of type 7 or 12 with a
+nonzero global word. The original walks the whole catalog, in catalog
+order, and makes each missing one through the ordinary object factory:
+construct, register at the head of the registration list, stamp with the
+lot's date, reset, install Main, run Init, give the object its first turn.
+Each new object takes the lowest unused ID. The Complete Collection has 141
+such definitions, and our catalog lists them in the order the original
+creates them.
+
+These controllers do not last. They run their Init and first turn on a lot
+that holds only the two indicators, draw from the global random stream and
+write globals and type attributes, and step 5 then removes them. What they
+leave behind is what matters to the first tick.
+
+For the Goth house this step is checked against a capture of the original
+taken when the resize returns: the lot shrinks from 64 to 52 tiles, and all
+141 controllers match the capture field for field, as do the globals, both
+game random streams, the registration order and the two controllers
+waiting for removal. The gated test
+`the_goth_house_resize_creates_the_controllers` pins our state and says
+what was compared.
+
+Only this case is ported: a bare lot, shrinking, with every object off the
+lot. Growing a lot, a lot with walls or floors, and objects standing on the
+lot all fail with an error that says so. The rooms themselves are not
+modeled.
+
+**4. Family.** Global 9 is cleared. It is set again in step 12.
+
+**5. Clear.** Every object on the held lot is removed: first the two
+indicators (`0x445f84`), then whatever heads the registration list until
+the list is empty, which takes the controllers step 3 made. The IDs queued
+for removal stay queued until step 11. Removing an object is not ported
+yet. The old prototype reproduced a capture of the original at the end of
+this step too; the tick, all three random streams and the queued removals
+are the same there as when the resize returns.
+
+**6. House contents.** The lot arrays, the type table and the saved objects
+are read onto the cleared lot. `World::from_house` holds the readers, but
+it reads a whole file onto an empty lot in one go, so it skips steps 3 to
+5 and what they leave behind.
+
+**7. Changed types.** For each saved type the original compares the saved
 Init and Main signatures with the linked scripts. A type that differs is
-flagged, and step 9 resets its objects. In the Goth house that is 77 of 113
-types.
+flagged, and step 13 resets its objects. In the Goth house that is 77 of
+113 types.
 
-**4. Global controllers.** Object definitions of type 7 or 12 with a
-nonzero global word are lot-wide controllers. The original keeps the first
-saved instance of each, deletes later duplicates, and creates the missing
-ones through the ordinary object factory, which runs their Init and their
-first Main visit. It walks the whole catalog, in catalog order, so the new
-objects' IDs depend on that order. The Complete Collection has 141 such
-definitions, and our catalog lists them in the order the original creates
-them.
+**8. Controllers again.** The same reconciliation as in step 3, now among
+the saved objects. The original keeps the first saved instance of each
+controller, deletes later duplicates, and creates the missing ones.
 
-**5. Grid repair and links.** Ground-floor grid cells that name an object
+**9. Grid repair and links.** Ground-floor grid cells that name an object
 which is not at that cell are cleared. Containment and multi-tile links are
 rebuilt from the saved slots.
 
-**6. Rooms.** Two passes over the registration list. The first writes each
+**10. Rooms.** Two passes over the registration list. The first writes each
 object's room into data word 29, turning level 0 into level 1. The second
 runs each object's function 7.
 
-**8. Household.** Global 9 takes the family number, global 10 the house
+**12. Household.** Global 9 takes the family number, global 10 the house
 number, and the family's money becomes the lot's funds, split across
 globals 13 and 14.
 
-**9. Object visits.** For each object, in registration order:
+**13. Object visits.** For each object, in registration order:
 
 1. A person takes its persistent fields from the neighborhood record
    (`0x4258a3`).
@@ -137,7 +201,7 @@ globals 13 and 14.
 Lot time does not advance, and no object's saved Main runs, during any of
 this.
 
-**10. Indicators.** Two indicator objects are created through the factory
+**14. Indicators.** Two indicator objects are created through the factory
 and hidden, and the selected person is found.
 
 ## Working rules

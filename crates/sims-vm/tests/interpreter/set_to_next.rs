@@ -207,7 +207,8 @@ fn the_destination_must_take_a_write() {
 
 #[test]
 fn modes_over_state_the_lot_lacks_fail_loudly() {
-    for mode in [4, 5, 7, 8, 9, 10, 11, 13, 127] {
+    // Mode 10 is here because the fixture's program has no career list.
+    for mode in [5, 7, 8, 9, 10, 11, 13, 127] {
         let mut fx = Fixture::new();
         let text = trap(step(&mut fx, mode, 0)).to_string();
         assert!(

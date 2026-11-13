@@ -156,11 +156,9 @@ fn the_right_operand_resolves_first() {
         code(fx.expression(TEMPS, 99, 5, scope::PARAMETERS, 99)),
         Some(8)
     );
-    // The left operand is read even for a plain assignment.
-    assert!(matches!(
-        trap(fx.expression(scope::MY_DATA, 25, 5, LITERAL, 0)),
-        Trap::Unsupported(_)
-    ));
+    // The left operand is read even for a plain assignment: the lamp has
+    // no motive to read.
+    assert_eq!(code(fx.expression(14, 0, 5, LITERAL, 0)), Some(0x1c));
 }
 
 /// Runs `stack object's motive 0 <operator> rhs` with the motive at `old`.

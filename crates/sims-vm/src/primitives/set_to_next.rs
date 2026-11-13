@@ -19,12 +19,17 @@
 //! - 1: the next person, in the same order.
 //! - 2: the next object that is not a person (definition word 9 is not 2).
 //! - 3: the next tile of the cursor's multi-tile group.
+//! - 4: the next instance of the type the GUID names, in that type's list
+//!   in [`World::instances`], which is made here on first use. A GUID
+//!   with no definition is the false branch with the cursor kept.
 //! - 6: the next object whose data word 59 equals parameter 0 (0x44f211).
+//! - 10: the next career ID in [`crate::Program::careers`] (0x404cb3). A
+//!   cursor that is no career ID starts from the first. Unlike the object
+//!   modes, a next ID of zero still takes the true branch.
 //! - 12: the next member of the cursor's family (0x44f0d9).
 //!
-//! The others fail loudly: 4 needs the original's per-GUID instance cache,
-//! 5 and 7 the neighborhood's person directory, 8 and 9 the tile chains, 10
-//! the career list and 11 the neighborhood's lot order.
+//! The others fail loudly: 5 and 7 need the neighborhood's person
+//! directory, 8 and 9 the tile chains and 11 the neighborhood's lot order.
 //!
 //! [`World::order`]: sims_sim::World::order
 
@@ -60,10 +65,33 @@ impl Machine<'_, '_> {
             0..=2 | 6 => self.next_in_order(mode, current)?,
             3 => Some(self.next_tile(current)?),
             12 => self.next_family_member(current)?,
-            4 => return Err(missing(mode, "the original's per-GUID instance cache")),
+            4 => {
+                let guid = u32::from_le_bytes([operands[0], operands[1], operands[2], operands[3]]);
+                match self.next_instance(guid, current)? {
+                    Some(next) => Some(next),
+                    None => return Ok(false),
+                }
+            }
             5 | 7 => return Err(missing(mode, "the neighborhood's person directory")),
             8 | 9 => return Err(missing(mode, "the lot's tile chains")),
-            10 => return Err(missing(mode, "the career list")),
+            10 => {
+                let careers = self
+                    .program
+                    .careers
+                    .as_ref()
+                    .ok_or_else(|| missing(mode, "the career list"))?;
+                // The cursor is sign-extended and matched against 32-bit
+                // IDs; the next ID is cut to a word.
+                let start = careers
+                    .iter()
+                    .position(|&id| id == i32::from(current))
+                    .map_or(0, |i| i + 1);
+                let Some(&next) = careers.get(start) else {
+                    return Ok(false);
+                };
+                self.store(destination, next as i16)?;
+                return Ok(true);
+            }
             11 => return Err(missing(mode, "the neighborhood's lot order")),
             _ => {
                 return Err(Trap::Unsupported(format!(
@@ -76,6 +104,48 @@ impl Machine<'_, '_> {
         };
         self.store(destination, next)?;
         Ok(next != 0)
+    }
+
+    /// Mode 4: the instance after `current` in the GUID's list, or the
+    /// first for a zero cursor; zero when there is none or the cursor is
+    /// not in the list. None when no definition has the GUID. Ported from
+    /// the old prototype (legacy/crates/sims-vm/src/person.rs:919).
+    fn next_instance(&mut self, guid: u32, current: i16) -> Result<Option<i16>, Trap> {
+        match self
+            .catalog
+            .objects
+            .iter()
+            .filter(|o| o.guid == guid)
+            .count()
+        {
+            0 => return Ok(None),
+            1 => {}
+            _ => {
+                // The original lists instances by definition, not GUID.
+                return Err(Trap::Unsupported(format!(
+                    "Set To Next mode 4: GUID 0x{guid:08X} names more than one definition"
+                )));
+            }
+        }
+        let objects = &self.world.objects;
+        let list = self.world.instances.entry(guid).or_insert_with(|| {
+            objects
+                .iter()
+                .filter(|(_, o)| o.guid == guid)
+                .map(|(&id, _)| id)
+                .collect()
+        });
+        let start = match current {
+            0 => Some(0),
+            _ => list
+                .iter()
+                .position(|&id| i16::try_from(id) == Ok(current))
+                .map(|i| i + 1),
+        };
+        let next = start.and_then(|i| list.get(i)).copied().unwrap_or(0);
+        i16::try_from(next)
+            .map(Some)
+            .map_err(|_| Trap::Invalid(format!("object ID {next} does not fit a script word")))
     }
 
     /// Modes 0, 1, 2 and 6: the next match after `current` in registration

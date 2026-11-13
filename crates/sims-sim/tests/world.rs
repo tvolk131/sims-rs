@@ -1,8 +1,8 @@
 use sims_content::{Catalog, House, Index, Install, Neighborhood};
-use sims_core::GameRng;
+use sims_core::{CrtRng, GameRng};
 use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
-use sims_sim::{Budget, Object, Snapshots, World};
+use sims_sim::{Budget, MagicHistory, Object, Snapshots, TypeAttributes, World};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -38,6 +38,8 @@ fn object(id: u16, guid: u32) -> Object {
         portal: Some(vec![0.5, -0.0, f32::from_bits(0x7fc0_0001)]),
         person: None,
         registry_word: Some(0x0002_0005),
+        last_result: true,
+        removal_skips_resets: false,
     }
 }
 
@@ -48,6 +50,8 @@ fn world() -> World {
         scheduler_cursor: 0,
         lot_rng: GameRng::from_state(0x1234_5678),
         global_rng: GameRng::from_state(0x9abc_def0),
+        crt_rng: CrtRng::from_state(0x0733_3a41),
+        size: 52,
         budget: Budget {
             funds: 2515,
             pending_funds: 0,
@@ -69,6 +73,17 @@ fn world() -> World {
                 data: vec![1, 2, 3, 4],
             },
         )]),
+        removals: vec![5],
+        type_attributes: vec![TypeAttributes {
+            guid: 0x1111,
+            values: vec![0, 1, -1],
+        }],
+        instances: BTreeMap::from([(0x2222, vec![5])]),
+        event_owner: 2,
+        magic_history: Some(MagicHistory {
+            family: 5,
+            values: [1, 2, 3, 4, 5, 6],
+        }),
     }
 }
 
@@ -78,7 +93,7 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "8f641da7b23f28b7d89f80f6684b4ab665327e70b2546b32f0b3c8f69ffa46d2";
+const PINNED: &str = "02410d6afeca26ca7671794717f59ab3a7e8355f2ac07ccd757b7e44e084b903";
 
 #[test]
 fn encoding_round_trips_bit_for_bit() {
