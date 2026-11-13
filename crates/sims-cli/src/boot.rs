@@ -1,6 +1,7 @@
 //! `sims boot`: load a house into simulation state and print its hash.
 
 use sims_content::{Catalog, House, Index, Install, Neighborhood};
+use sims_sim::load::Context;
 use sims_sim::{Snapshots, World};
 use sims_vm::{Callback, Program};
 use std::error::Error;
@@ -32,7 +33,10 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     }
     let catalog = Catalog::build(&index)?;
     let house = House::load(options.house, &catalog)?;
-    let world = World::from_house(&house, &catalog)?;
+    let mut world = World::from_house(&house, &catalog)?;
+    // The load steps, in the original's order (docs/roadmap.md, load sequence). The
+    // boot stops at the first one not implemented yet.
+    world.apply_context(Context::COMPLETE_COLLECTION)?;
     let types = &house.types.entries;
     let program = Program::link(&index, &catalog, types.iter().map(|t| t.guid))?;
     let mut mismatches = Vec::new();
@@ -79,6 +83,10 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     for line in &mismatches {
         let _ = writeln!(out, "{line}");
     }
+    let _ = writeln!(
+        out,
+        "Load:    globals set; stopped before the global controllers (not implemented yet)"
+    );
     let _ = writeln!(out, "Hash:    {}", world.hash_hex());
     Ok(out)
 }
