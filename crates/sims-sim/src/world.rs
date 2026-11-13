@@ -23,6 +23,9 @@ pub struct World {
     pub budget: Budget,
     /// Object IDs in registration order, the order the scheduler visits.
     pub order: Vec<u16>,
+    /// The lot's object type table (objt): type ID to GUID. Script frames
+    /// name the object whose code they run by type ID.
+    pub types: BTreeMap<u16, u32>,
     pub objects: BTreeMap<u16, Object>,
     /// Lot arrays (floors, walls, terrain and more) by Arry chunk ID.
     pub arrays: BTreeMap<u16, Array>,
@@ -99,6 +102,7 @@ impl World {
                 days: simulator.budget_days.clone(),
             },
             order: house.objects.order.clone(),
+            types: house.types.entries.iter().map(|t| (t.id, t.guid)).collect(),
             objects,
             arrays: house.arrays.clone(),
         })

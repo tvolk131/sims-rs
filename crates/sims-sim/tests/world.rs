@@ -57,6 +57,7 @@ fn world() -> World {
             days: vec![None, Some([1, 2, 3, 4, 5, 6, 7, 8]), None],
         },
         order: vec![5, 2],
+        types: BTreeMap::from([(7, 0x1111), (8, 0x2222)]),
         objects: BTreeMap::from([(2, object(2, 0x1111)), (5, object(5, 0x2222))]),
         arrays: BTreeMap::from([(
             1,
@@ -77,7 +78,7 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "5d4f285d8736aa223c50580bc6b54b36585716a18cf64285af6d1b346e71f68e";
+const PINNED: &str = "8f641da7b23f28b7d89f80f6684b4ab665327e70b2546b32f0b3c8f69ffa46d2";
 
 #[test]
 fn encoding_round_trips_bit_for_bit() {
@@ -103,6 +104,9 @@ fn any_field_change_changes_the_hash() {
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.order.reverse();
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.types.insert(9, 0x3333);
     assert_ne!(changed.hash(), base);
 }
 
