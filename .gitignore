@@ -39,6 +39,8 @@
 !/docs/repository-workflow.md
 !/docs/vision.md
 !/docs/salvage-audit.md
+!/docs/roadmap.md
+!/docs/decisions.md
 
 # Local credentials and environment overrides
 .env

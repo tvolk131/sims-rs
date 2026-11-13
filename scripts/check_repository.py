@@ -17,6 +17,7 @@ PRIVATE_COMPONENTS = {".aws", ".gnupg", ".ssh"}
 PUBLIC_DOCUMENTS = {
     "docs/legal-and-provenance.md", "docs/dependency-licenses.md",
     "docs/repository-workflow.md", "docs/vision.md", "docs/salvage-audit.md",
+    "docs/roadmap.md", "docs/decisions.md",
 }
 PRIVATE_PATHS = {
     "crates/sims-app/src/original_viewer/exploration/startup_play/host_journey/tutorial_camera/go_here/walking/tests.rs",
