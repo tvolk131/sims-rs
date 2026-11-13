@@ -3,6 +3,7 @@
 # not part of this workspace and is never built. See docs/vision.md and
 # docs/salvage-audit.md.
 members = [
+    "crates/sims-core",
     "crates/sims-formats",
 ]
 resolver = "3"
@@ -18,7 +19,15 @@ repository = "https://github.com/tvolk131/sims-rs"
 encoding_rs = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sims-core = { path = "crates/sims-core" }
 sims-formats = { path = "crates/sims-formats" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Determinism bans (docs/vision.md "Simulation"). The method and type lists
+# live in clippy.toml. Crates that never feed simulation state (rendering,
+# audio, the app shell) may allow these explicitly at their crate root.
+disallowed_methods = "deny"
+disallowed_types = "deny"
