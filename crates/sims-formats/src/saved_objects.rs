@@ -217,7 +217,11 @@ pub struct Instance {
     pub portal: Option<Vec<f32>>,
     pub person: Option<Person>,
     /// Native registry +0x24 entry: signed countdown low16, scheduler flags high16.
-    pub registry_word: i32,
+    /// None when the record ends first, as every `*Placeholder` record in the
+    /// shipped and played houses does (0 to 7 padding bits remain, against
+    /// 24 or more for every other object). Why the original omits it is not
+    /// known yet; see `docs/decisions.md`.
+    pub registry_word: Option<i32>,
     pub consumed_bits: usize,
     /// Retain raw bytes, including unrecognized trailing fields and bit padding.
     pub record: Vec<u8>,
@@ -402,7 +406,12 @@ impl Objects {
                 } else {
                     None
                 };
-                let registry_word = f.i32()?;
+                // Present only if at least one more byte of the record remains.
+                let registry_word = if f.remaining_bits() >= 8 {
+                    Some(f.i32()?)
+                } else {
+                    None
+                };
                 Ok(Instance {
                     id,
                     type_id,
@@ -446,5 +455,136 @@ impl Objects {
             instances,
             tail,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes an MSB-first field stream, the inverse of [`Fields`].
+    #[derive(Default)]
+    struct Writer {
+        bits: Vec<bool>,
+    }
+    impl Writer {
+        fn raw(&mut self, value: u32, width: usize) {
+            for bit in (0..width).rev() {
+                self.bits.push(value >> bit & 1 == 1);
+            }
+        }
+        fn signed(&mut self, value: i32, widths: [usize; 4]) -> &mut Self {
+            if value == 0 {
+                self.bits.push(false);
+                return self;
+            }
+            let selector = widths
+                .iter()
+                .position(|&w| w == 32 || (-(1 << (w - 1))..1 << (w - 1)).contains(&value))
+                .unwrap();
+            self.bits.push(true);
+            self.raw(selector as u32, 2);
+            self.raw(
+                value as u32 & (u32::MAX >> (32 - widths[selector])),
+                widths[selector],
+            );
+            self
+        }
+        fn i16(&mut self, value: i16) -> &mut Self {
+            self.signed(value.into(), [5, 8, 13, 16])
+        }
+        fn i32(&mut self, value: i32) -> &mut Self {
+            self.signed(value, [6, 11, 21, 32])
+        }
+        fn bytes(&self) -> Vec<u8> {
+            self.bits
+                .chunks(8)
+                .map(|byte| {
+                    byte.iter()
+                        .enumerate()
+                        .fold(0, |acc, (n, &bit)| acc | u8::from(bit) << (7 - n))
+                })
+                .collect()
+        }
+    }
+
+    fn header(magic: &[u8; 4], version: u32) -> Vec<u8> {
+        let mut bytes = vec![0; 4];
+        bytes.extend(version.to_le_bytes());
+        bytes.extend(magic);
+        bytes
+    }
+
+    /// One ordinary object record: no attributes, no stack frames, no
+    /// relationships, one empty slot, no dynamic sprites.
+    fn record(id: i16, registry_word: Option<i32>, padding: usize) -> Vec<u8> {
+        let mut w = Writer::default();
+        // Footprint and position, then the unknown short and attribute count.
+        for _ in 0..7 {
+            w.i32(0);
+        }
+        w.i16(0).i16(0);
+        for _ in 0..8 {
+            w.i16(0);
+        }
+        for n in 0..72 {
+            w.i16(if n == 11 { id } else { 0 });
+        }
+        w.i16(0).i32(0).i32(512).i32(-1).i32(0);
+        w.i16(1).i16(0).i16(0).i16(0);
+        if let Some(word) = registry_word {
+            w.i32(word);
+        }
+        while w.bits.len() % 8 != 0 {
+            w.bits.push(false);
+        }
+        w.raw(0, padding);
+        w.bytes()
+    }
+
+    fn objects(records: &[Vec<u8>]) -> Result<Objects> {
+        let mut types = header(b"tjbo", 2);
+        types.extend(0x1234_5678u32.to_le_bytes());
+        types.extend([0; 8]);
+        types.extend(7u16.to_le_bytes());
+        types.extend(4u16.to_le_bytes());
+        types.extend(b"Chair\0");
+        let types = ObjectTypes::parse(&types)?;
+        let mut bytes = header(b"MjbO", 0x45);
+        bytes.push(1);
+        let mut table = Writer::default();
+        for id in 1..=records.len() as i16 {
+            table.i16(id).i16(7);
+        }
+        table.i16(0);
+        bytes.extend(table.bytes());
+        for record in records {
+            let end = (bytes.len() + 4 + record.len() - 12) as u32;
+            bytes.extend(end.to_le_bytes());
+            bytes.extend(record);
+        }
+        Objects::parse(&bytes, &types, |_| Some(false))
+    }
+
+    #[test]
+    fn the_registry_word_is_read_only_when_a_byte_remains() {
+        let found = objects(&[
+            record(1, Some(0x0002_0005), 0),
+            // A placeholder-style record: ends on a byte boundary right after
+            // the dynamic sprites.
+            record(2, None, 0),
+            record(3, Some(-3), 0),
+        ])
+        .unwrap();
+        let words: Vec<_> = found.instances.values().map(|i| i.registry_word).collect();
+        assert_eq!(words, [Some(0x0002_0005), None, Some(-3)]);
+        assert_eq!(found.order, [1, 2, 3]);
+    }
+
+    #[test]
+    fn a_record_shorter_than_its_fields_is_an_error() {
+        let mut short = record(1, Some(0x0002_0005), 0);
+        short.truncate(8);
+        assert!(objects(&[short]).is_err());
     }
 }

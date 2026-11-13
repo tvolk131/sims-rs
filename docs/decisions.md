@@ -4,6 +4,51 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-13: The target house is the Goth house
+
+The boot goal needs one house. It is `House05.iff` in the base game's
+shipped neighborhood: the Goth family (Mortimer, Bella and Cassandra), 245
+saved objects, SIMI and ObjM version 0x3e. The installed copy is byte for
+byte the shipped one, so the emulator can load it without copying files in.
+The Newbie house (`House07.iff`) is smaller but was played and saved by the
+old harness, so the installed copy differs from the shipped one. Reopen if
+the Goth house needs something the harness cannot capture.
+
+## 2026-11-13: Placeholder objects carry no registry word
+
+Every ObjM record ended with a field-encoded registry word, until the
+expansion houses: the `*Placeholder` object (GUID 0x3C08965F) never has one.
+Across 139,000 ordinary records in the installed and shipped houses, 24
+to 31 bits remain after the dynamic sprites. Across 27,000 placeholder
+records, 0 to 7 remain, so no field fits. The reader now reads the word only
+when at least a byte of the record remains, and stores None otherwise.
+Why the original writes no word is unknown; it may skip objects missing
+from the scheduler's registry. Unverified until the harness compares a
+placeholder.
+
+## 2026-11-13: Neighborhood characters register after the install
+
+A house's Sims are defined by files in the neighborhood's `Characters`
+directory. `Index::add_directory` appends that directory as one more mount,
+after Downloads, so the catalog registers characters last. Where the
+original registers them is unverified. A family with house number 0 has no
+house: in the shipped and installed neighborhoods every such family lacks
+flag bit 0, and every family with it has a nonzero house.
+
+## 2026-11-13: Some installed houses do not load yet, on purpose
+
+`sims houses` loads 660 of the 718 house files in the install's eight
+neighborhoods and the shipped one. The 58 failures:
+
+- 18 are `House00` and `House11` in each neighborhood: base-game templates
+  with ObjM versions 0x33 and 0x38, whose record layout is not known yet.
+- 40 are houses 56, 63, 69, 76 and 77, which hold Sims whose character files
+  are not in the neighborhood: Superstar's community templates, and houses
+  the old harness saved. The original presumably repairs or drops such residents,
+  which we have not reverse engineered.
+
+Neither blocks the target house. Reopen when a goal needs those houses.
+
 ## 2026-11-13: Later GUID registrations win; semi-globals resolve to the first match
 
 The catalog registers object definitions in load order, and a GUID resolves

@@ -10,6 +10,10 @@ pub struct Object {
     pub resource: usize,
     /// The OBJD chunk ID within that file.
     pub chunk: u16,
+    /// The OBJD type: 2 is a person.
+    pub kind: u16,
+    /// Nonzero for each tile of a multi-tile object.
+    pub master: u16,
 }
 
 /// Every object definition an install provides, and the files objects need.
@@ -89,6 +93,8 @@ impl Catalog {
                         guid: definition.guid,
                         resource,
                         chunk: chunk.id,
+                        kind: definition.object_type,
+                        master: definition.master_id,
                     });
                     if let Some(previous) = self.by_guid.insert(definition.guid, number) {
                         let previous = &self.objects[previous];
