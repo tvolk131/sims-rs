@@ -4,6 +4,15 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-13: The Complete Collection ISO is the supported install
+
+Decided by the maintainer. The vision named the Legacy Collection as the
+primary install; it now names The Sims Complete Collection, installed from
+its ISO, and leaves other editions out of scope. That is the install the
+emulator image already holds and every check so far ran against, so no
+code changes. It replaces the entry below on recognizing only the CD
+layout: that is no longer a gap.
+
 ## 2026-11-13: The state hash is SHA-256 of the postcard encoding
 
 `World` is encoded with postcard: fields in declaration order, integers as

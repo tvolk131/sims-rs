@@ -23,12 +23,10 @@ Done when:
 
 Each step is a few PRs, and each PR leaves `main` green.
 
-1. **Install detection and content lookup.** Recognize the CD install and the
-   Legacy Collection layout from their files. Bind every game file and
-   resource by name, and fail loudly on anything missing. The CD layout is
-   checked against the real installed tree in the emulator image; the Legacy
-   Collection table stays marked unverified until someone checks it on a
-   real install.
+1. **Install detection and content lookup.** Recognize a Complete
+   Collection install (from its ISO) by its files. Bind every game file and
+   resource by name, and fail loudly on anything missing. The layout is
+   checked against the real installed tree in the emulator image.
 2. **Lot loading.** Read a house file into simulation state: objects, their
    attributes, the scheduler, both RNG streams, the budget and the lot
    arrays. Snapshots save to and load from REDB and survive a round trip
@@ -45,8 +43,8 @@ Each step is a few PRs, and each PR leaves `main` green.
 
 ### Progress
 
-- Step 1 is done: `sims install` detects the CD layout and builds the
-  object catalog. The Legacy Collection layout waits for a real install.
+- Step 1 is done: `sims install` detects a Complete Collection install and
+  builds the object catalog.
 - Step 2 is done: `sims boot <install> <house>` loads the Goth house into
   `World`, prints its state hash and can save a REDB snapshot. `--ticks`
   waits for step 3.
