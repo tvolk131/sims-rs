@@ -21,7 +21,7 @@
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
-use crate::placement::{capture, closed_directions};
+use crate::placement::{Refusal, capture, closed_directions};
 use sims_core::{Ext, F32};
 use sims_formats::execution::Slot;
 use sims_sim::World;
@@ -303,6 +303,35 @@ fn step(dir: i32) -> [i32; 2] {
     [x * 16, y * 16]
 }
 
+/// The answer for a place from the place test's verdict (0x481585 to
+/// 0x4815dd), and the object to note in the context's word +0x8c: 6 where
+/// the person fits; 3 for a wall in the way (7); for a collision (11), 6
+/// when no object is named or it is `named` (the context's +0x7c), else 5
+/// for a person and 1 for anything else, noting the object; 0 for any
+/// other error.
+fn place_answer(
+    test: Result<(), Refusal>,
+    named: u16,
+    is_person: impl FnOnce(u16) -> Result<bool, Trap>,
+) -> Result<(i32, Option<u16>), Trap> {
+    Ok(match test {
+        Ok(()) => (6, None),
+        Err(Refusal::Wall) => (3, None),
+        Err(Refusal::Collision(None)) => (6, None),
+        Err(Refusal::Collision(Some(other))) if other == named => (6, None),
+        Err(Refusal::Collision(Some(other))) => {
+            (if is_person(other)? { 5 } else { 1 }, Some(other))
+        }
+        Err(Refusal::Other) => (0, None),
+        Err(Refusal::Unrecorded) => {
+            return Err(unsupported(
+                "0x48158c",
+                "a refusal of the place test whose placement error was not read",
+            ));
+        }
+    })
+}
+
 impl Interpreter<'_> {
     /// How a person could stand at a point to use the slot (0x481439),
     /// approaching it from direction `dir` (-1 for none). In order:
@@ -315,14 +344,18 @@ impl Interpreter<'_> {
     ///    ahead, or, for a diagonal `dir`, just to either side.
     /// 3. Without slot flag 0x8000: a point whose tile's four corner
     ///    heights differ, or differ from the slot object's tile's, is 4.
-    /// 4. If the person fits at the point (virtual function 0x54) the
-    ///    answer is 6: it may stand there. Where it does not, the answer
-    ///    depends on why (the placement error, 3, 1, 5, 6 or 0), which is
-    ///    not kept; that fails loudly.
+    /// 4. If the person fits at the point (virtual function 0x54, after
+    ///    0x6e4ad0 is cleared) the answer is 6: it may stand there. Where
+    ///    it does not, the placement error decides (0x48158c): a wall in
+    ///    the way (7) is 3. A collision (11) with no object named, or
+    ///    with the context's object at +0x7c, is 6. A collision with
+    ///    another object writes that object's ID to the context's word
+    ///    +0x8c, and is 5 if it is a person (type 2) and 1 if not. Any
+    ///    other error is 0.
     fn classify(
         &self,
         world: &mut World,
-        ctx: &Context,
+        ctx: &mut Context,
         point: [i32; 2],
         dir: i32,
     ) -> Result<i32, Fault> {
@@ -388,14 +421,15 @@ impl Interpreter<'_> {
                 return Ok(4);
             }
         }
-        if !self.fits(world, person, [first, second], level)? {
-            return Err(fail(unsupported(
-                "0x48158c",
-                "a place the person does not fit: the answer depends on the placement \
-                 error, which is not kept",
-            )));
+        let test = self.place_test(world, person, [first, second], level)?;
+        let (answer, blocker) = place_answer(test, ctx.objects[0], |other| {
+            Ok(self.kind(world, other)? == 2)
+        })
+        .map_err(fail)?;
+        if let Some(other) = blocker {
+            ctx.word_8c = other as i16;
         }
-        Ok(6)
+        Ok(answer)
     }
 
     /// The places a person could stand to use a slot (0x483414). The
@@ -711,7 +745,9 @@ impl Interpreter<'_> {
     }
 
     /// Plans the route to the chosen candidate and adds the last step to
-    /// the slot (0x45c38e). Returns 2: the route is ready.
+    /// the slot (0x45c38e). Returns 2: the route is ready; or 0 when the
+    /// planner finds no way, with the candidates dropped and the chosen
+    /// and best candidates -1 (0x45c4c7, 0x481898).
     pub(crate) fn route_to_slot(
         &self,
         world: &mut World,
@@ -733,10 +769,12 @@ impl Interpreter<'_> {
         }
         path.clear();
         if !self.plan(world, ctx, path)? {
-            return Err(fail(unsupported(
-                "0x45c3f0",
-                "a route the planner finds no way for",
-            )));
+            // 0x45c4c7: no way; the candidates are dropped (0x481898) and
+            // the answer is 0.
+            ctx.candidates.clear();
+            ctx.chosen = -1;
+            ctx.best = -1;
+            return Ok(0);
         }
         let chosen = usize::try_from(ctx.chosen)
             .ok()
@@ -841,6 +879,40 @@ fn finish(path: &mut Vec<[i32; 2]>, last: [i32; 2], next: [i32; 2]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_place_is_answered_by_the_placement_error() {
+        let person = |id: u16| Ok(id == 21);
+        assert_eq!(place_answer(Ok(()), 0, person).unwrap(), (6, None));
+        assert_eq!(
+            place_answer(Err(Refusal::Wall), 0, person).unwrap(),
+            (3, None)
+        );
+        assert_eq!(
+            place_answer(Err(Refusal::Other), 0, person).unwrap(),
+            (0, None)
+        );
+        // A collision with nothing named, or with the context's object,
+        // still lets the person stand there.
+        assert_eq!(
+            place_answer(Err(Refusal::Collision(None)), 0, person).unwrap(),
+            (6, None)
+        );
+        assert_eq!(
+            place_answer(Err(Refusal::Collision(Some(21))), 21, person).unwrap(),
+            (6, None)
+        );
+        // Another person in the way is 5, anything else 1; both noted.
+        assert_eq!(
+            place_answer(Err(Refusal::Collision(Some(21))), 0, person).unwrap(),
+            (5, Some(21))
+        );
+        assert_eq!(
+            place_answer(Err(Refusal::Collision(Some(40))), 0, person).unwrap(),
+            (1, Some(40))
+        );
+        assert!(place_answer(Err(Refusal::Unrecorded), 0, person).is_err());
+    }
 
     #[test]
     fn a_step_is_one_tile_in_the_direction_taken_modulo_8() {

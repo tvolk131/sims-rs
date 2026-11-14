@@ -76,6 +76,7 @@ fn sim_animates(operands: [u8; 8]) -> Fixture {
             age: None,
             skin: None,
             tones: Vec::new(),
+            rig: Default::default(),
         },
     );
     fx.thread(SIM, 4096, &[-7]);
@@ -743,10 +744,21 @@ fn what_the_animator_tick_does_not_port_fails_loudly() {
         .unwrap()[102] = 0;
     fx.sim_mut().person.as_mut().unwrap().data[0] = 1;
     assert!(tick(&mut fx).unwrap_err().to_string().contains("base clip"));
-    // The head following something.
+    // The head following something is ported (0x5907c5): with the target
+    // an eighth of a turn away the turn moves by its most, 0.2. This
+    // person type binds no head anchors, so nothing is measured.
     let mut fx = standing();
-    fx.sim_mut().person.as_mut().unwrap().data[42] = 1;
-    assert!(tick(&mut fx).unwrap_err().to_string().contains("word 42"));
+    tick(&mut fx).unwrap();
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    person.data[41..46].copy_from_slice(&[0, 1, 0, 0, 0]);
+    fx.world
+        .animators
+        .get_mut(&SIM)
+        .unwrap()
+        .head
+        .target_heading = F32::from_f32(1.0);
+    tick(&mut fx).unwrap();
+    assert_eq!(fx.world.animators[&SIM].head.turn.to_bits(), 0xbe4c_cccd);
     // A destination elsewhere, and a state not ported.
     let mut fx = standing();
     let mut animator = LOADED;
@@ -760,10 +772,14 @@ fn what_the_animator_tick_does_not_port_fails_loudly() {
             .contains("walks to its destination")
     );
     let mut fx = standing();
-    fx.world
-        .animators
-        .insert(SIM, sims_sim::animator::Animator { state: 6, ..LOADED });
-    assert!(tick(&mut fx).unwrap_err().to_string().contains("state 6"));
+    fx.world.animators.insert(
+        SIM,
+        sims_sim::animator::Animator {
+            state: 11,
+            ..LOADED
+        },
+    );
+    assert!(tick(&mut fx).unwrap_err().to_string().contains("state 11"));
 }
 
 /// The standing Sim with a route to follow: the animator as the route's
@@ -1007,7 +1023,10 @@ fn at_the_end_of_its_path_a_person_walks_on_then_stops() {
 fn what_the_route_follow_does_not_port_fails_loudly() {
     // Facing the point ahead, a standing animator walks; but the point,
     // 21.33 away, is farther than the stop clip's stride (1 times 16/3),
-    // and stopping short is not ported (0x58ed52).
+    // so it starts with the stop clip instead (state 6, 0x58ed52, then
+    // 0x58e125), still standing. (With data word 17 set it would go to
+    // state 11, which is not ported; the look-ahead for that word fails
+    // loudly first, 0x58e6d5.)
     let mut fx = routed();
     fx.sim_mut().data[1] = 2;
     fx.world.animators.get_mut(&SIM).unwrap().position[2] = F32::from_f32(2.0);
@@ -1027,12 +1046,9 @@ fn what_the_route_follow_does_not_port_fails_loudly() {
             samples: [0, 0],
         },
     );
-    assert!(
-        tick(&mut fx)
-            .unwrap_err()
-            .to_string()
-            .contains("stops short")
-    );
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.state, a.selection, a.walking), (6, 0x13, false));
     // A step onto a tile where the person does not fit (0x58f682): the
     // lot has no floors, and without data word 42 flag 2 the person may
     // not stand without one.

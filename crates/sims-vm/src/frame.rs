@@ -38,8 +38,11 @@
 //!    person's tile (virtual function 0x60, 0x592132): each part of the
 //!    position that is unset takes the person's, and so does the
 //!    destination's.
-//! 6. Each draw then runs the head's countdown (0x590768) and the head's
-//!    turn (0x5904d2) as the animator's tick does.
+//! 6. Each draw then runs the head's step, measurement and restoration
+//!    (0x590768, 0x5904d2, 0x590b27) as the animator's tick does
+//!    (`crate::head`). After the tick the head's clock is the animator's,
+//!    so the step is skipped; a person whose head follows something
+//!    measures both headings again, against the target as it is now.
 //!
 //! Bytes +0xd9 and +0xda are not kept: besides the first draw, many
 //! places set +0xd9 (the appearance read among them), and none of them is
@@ -72,7 +75,6 @@ use sims_sim::animator::{EPSILON, LOADED, UNSET};
 
 /// Person data words the draw reads or writes.
 const BODY: usize = 8;
-const HEAD_MODE: usize = 42;
 const UPPER_LEVEL: usize = 40;
 const KIND: usize = 65;
 /// Object data word 1: the direction.
@@ -190,19 +192,8 @@ impl Interpreter<'_> {
         }
         place(&mut a, position, direction);
 
-        // 6. The head, which the animator's tick brought up to date at the
-        // same clock.
-        let head = world
-            .objects
-            .get(&id)
-            .and_then(|o| o.person.as_ref())
-            .map_or(0, |p| word(&p.data, HEAD_MODE));
-        if a.head_clock != a.clock || head & 1 != 0 {
-            return Err(Trap::Unsupported(format!(
-                "a frame is drawn while person {id}'s head waits for its turn or follows \
-                 something (0x590768, 0x5904d2), which is not ported"
-            )));
-        }
+        // 6. The head (0x590768, 0x5904d2, 0x590b27).
+        self.look(world, id, &mut a)?;
         world.animators.insert(id, a);
         Ok(())
     }
