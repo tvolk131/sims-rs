@@ -28,16 +28,19 @@
 //!   flags from the value; `cmp a, b` sets them from `a - b` and `test r`
 //!   from `r`. The `if` branches test them.
 //! - *(code)* Writing `target` (53) with a track number sends this
-//!   thread's later reads and writes of registers below 100 (other than
-//!   53) to the newest running thread of that track; 0 sends them back
-//!   here. How the original picks among several threads of one track is
-//!   not known. A target that has ended reads 0 and drops writes.
+//!   thread's later reads and writes of registers other than 53 to the
+//!   newest running thread of that track, and on through that thread's
+//!   own `target`; 0, or a track with none running, sends them back here.
+//!   How the original picks among several threads of one track, and what
+//!   it does once the target has ended, are not known (see
+//!   `Player::resolve`).
 //! - *(code)* `main_duckpri` (123) is a request per thread: the global
-//!   holds the largest, and a thread's request goes when it ends.
+//!   holds the largest, and a thread's request goes as soon as it ends.
 //! - *(code)* Volume, pan and pitch: see [`crate::levels`]. Each note
 //!   plays at its thread's levels, updated after the threads run in each
-//!   block (the original updates them as registers change). A note whose
-//!   thread has ended keeps its last levels. A sample plays at the rate
+//!   block and when the thread ends (the original updates them as
+//!   registers change). A note whose thread has ended keeps its last
+//!   levels. A sample plays at the rate
 //!   its pitch sets, whatever its own rate.
 //! - `note_on` starts the patch in register 50 and writes the note's ID
 //!   to its operand; `wait_samp` waits until the thread's last note ends.
@@ -208,7 +211,7 @@ struct Thread {
     /// 3), whose volume scales its own.
     group: i64,
     /// Where register reads and writes go: this thread, or the thread
-    /// register 53 named. A named thread that has ended reads as 0.
+    /// register 53 named (see [`Player::resolve`]).
     target: Target,
 }
 
@@ -216,7 +219,6 @@ struct Thread {
 enum Target {
     Own,
     Thread(u32),
-    None,
 }
 
 #[derive(Debug, Clone)]
@@ -512,8 +514,12 @@ impl<S: Samples> Player<S> {
     /// Renders `frames` frames of interleaved stereo (left, then right):
     /// the player's own output. [`Player::render`] is its mono mix.
     pub fn render_stereo(&mut self, frames: usize, sources: &dyn Sources) -> Vec<i16> {
-        let mut out = Vec::with_capacity(2 * frames);
-        while out.len() < 2 * frames {
+        let Some(samples) = frames.checked_mul(2) else {
+            self.report(format!("cannot render {frames} frames at once"));
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(samples.min(2 * RATE as usize));
+        while out.len() < samples {
             self.run_at_block_start(sources);
             let until_block = BLOCK - (self.frame % BLOCK as u64) as usize;
             let count = until_block.min(frames - out.len() / 2);
@@ -671,7 +677,17 @@ impl<S: Samples> Player<S> {
                     index = at + 1;
                 }
                 Some(at) => {
+                    // Its last register writes still reach its notes, as
+                    // they would have when written.
+                    let levels = self.levels(&thread);
+                    for note in self.notes.iter_mut().filter(|n| n.thread == thread.id) {
+                        note.gains = levels.gains;
+                        note.step = step(levels.rate);
+                    }
                     self.threads.remove(at);
+                    // Its ducking request goes now, before the threads
+                    // after it run.
+                    self.forget_ended();
                     index = at;
                 }
                 None => {}
@@ -791,8 +807,34 @@ impl<S: Samples> Player<S> {
         false
     }
 
+    /// The thread a register access other than to `target` (53) goes
+    /// to, or `None` for `thread` itself. As in the original, an access
+    /// goes to the thread `target` names, then on to the one that
+    /// thread's `target` names, and so on. A link to a thread that has
+    /// ended (the original keeps a pointer to it; what it then does is
+    /// not known) stops the chain there, as does a thread already passed
+    /// (the original would recurse for ever).
+    fn resolve(&self, thread: &Thread) -> Option<u32> {
+        let mut at = None;
+        let mut target = thread.target;
+        let mut passed = vec![thread.id];
+        while let Target::Thread(id) = target
+            && !passed.contains(&id)
+            && let Some(next) = self
+                .threads
+                .iter()
+                .chain(&self.pending)
+                .find(|t| t.id == id)
+        {
+            passed.push(id);
+            at = Some(id);
+            target = next.target;
+        }
+        at
+    }
+
     /// Reads a register. Registers below 100 other than `target` (53)
-    /// come from the thread `target` names, as in the original.
+    /// come from the thread [`Player::resolve`] picks; globals are shared.
     fn read(&self, thread: &Thread, register: i64) -> i32 {
         let Ok(r) = u8::try_from(register) else {
             return 0;
@@ -803,25 +845,26 @@ impl<S: Samples> Player<S> {
         if r == TARGET {
             return thread.registers[usize::from(r)];
         }
-        match thread.target {
-            Target::Own => thread.registers[usize::from(r)],
-            Target::Thread(id) if id == thread.id => thread.registers[usize::from(r)],
-            Target::Thread(id) => self
-                .threads
-                .iter()
-                .chain(&self.pending)
-                .find(|t| t.id == id)
-                .map_or(0, |t| t.registers[usize::from(r)]),
-            Target::None => 0,
-        }
+        let source = self
+            .resolve(thread)
+            .and_then(|id| {
+                self.threads
+                    .iter()
+                    .chain(&self.pending)
+                    .find(|t| t.id == id)
+            })
+            .unwrap_or(thread);
+        source.registers[usize::from(r)]
     }
 
-    /// Writes a register, with the original's side effects: every write
-    /// sets the written thread's comparison flags from the value; `target`
-    /// (53) picks the newest running thread of the track it names (0: this
-    /// thread); `main_duckpri` (123) records this thread's request and
-    /// holds the largest. Registers below 100 other than 53 go to the
-    /// thread `target` names; a write to an ended target is dropped.
+    /// Writes a register, with the original's side effects. Every write
+    /// other than to `target` (53) goes to the thread [`Player::resolve`]
+    /// picks, globals included, and sets that thread's comparison flags
+    /// from the value. `target` picks the newest running thread of the
+    /// track it names; 0, or a track with none running, is this thread
+    /// (the original's lookup returns null, which it takes as itself).
+    /// `main_duckpri` (123) records the written thread's request and
+    /// holds the largest.
     fn write(&mut self, thread: &mut Thread, register: i64, value: i32) {
         let Ok(r) = u8::try_from(register) else {
             return;
@@ -838,25 +881,21 @@ impl<S: Samples> Player<S> {
                     .filter(|t| t.track == value as u32)
                     .map(|t| t.id)
                     .max()
-                    .map_or(Target::None, Target::Thread)
+                    .map_or(Target::Own, Target::Thread)
             };
             return;
         }
-        let me = thread.id;
-        let written = match thread.target {
-            Target::Thread(id) if id != me => {
-                match self
-                    .threads
-                    .iter_mut()
-                    .chain(&mut self.pending)
-                    .find(|t| t.id == id)
-                {
-                    Some(other) => other,
-                    None => return,
-                }
-            }
-            Target::None => return,
-            _ => thread,
+        let written = match self.resolve(thread) {
+            Some(id) => match self
+                .threads
+                .iter_mut()
+                .chain(&mut self.pending)
+                .find(|t| t.id == id)
+            {
+                Some(other) => other,
+                None => thread,
+            },
+            None => thread,
         };
         written.kept = i64::from(value);
         let id = written.id;
@@ -1071,6 +1110,7 @@ impl<S: Samples> Player<S> {
                 self.pending
                     .retain(|t| !(t.object == object && t.track == track));
                 self.notes.retain(|n| !killed.contains(&n.thread));
+                self.forget_ended();
                 Flow::Next
             }
             "seqgroup_kill" => {
@@ -1098,6 +1138,7 @@ impl<S: Samples> Player<S> {
                     if other.registers[reg(EXTVOL)] == 0 {
                         self.threads.remove(at);
                         self.notes.retain(|n| n.thread != other_id);
+                        self.forget_ended();
                     } else {
                         let other_kept = &mut other.kept;
                         let other = &mut other.registers;

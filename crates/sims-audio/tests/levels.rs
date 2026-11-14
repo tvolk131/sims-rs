@@ -99,6 +99,22 @@ fn volume_multiplies_vol_extvol_and_group_and_ducks_by_half() {
         ..inputs()
     };
     assert_eq!(levels::volume(&negative), -1);
+    // The products wrap in 32 bits, as the original's do: no overflow,
+    // whatever the registers hold.
+    let wraps = Inputs {
+        vol: i32::MIN,
+        extvol: i32::MIN,
+        group_volume: 2048,
+        ..inputs()
+    };
+    assert_eq!(levels::volume(&wraps), 0);
+    let wraps = Inputs {
+        vol: 1 << 16,
+        extvol: 1 << 16,
+        ..inputs()
+    };
+    assert_eq!(levels::volume(&wraps), 0);
+    assert_eq!(levels::levels(&wraps).gains, [0, 0]);
     // A 3D track is centred whatever its pan.
     let three_d = Inputs {
         pan: 0,

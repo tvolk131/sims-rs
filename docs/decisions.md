@@ -36,15 +36,19 @@ mix.
   `getsrcdatafield r; ifne`) now follow the value written. Before, they
   followed the last `cmp` or `test`.
 - **`target` (53)** sends a thread's register reads and writes to the
-  newest running thread of the track it names. The install's scripts use
-  it to fade out and kill music and loops. How the original picks among
-  several threads of one track is not known.
+  newest running thread of the track it names, globals included, and
+  on through that thread's own `target`. A track with no running thread
+  means the thread itself, as the original's null lookup does. The
+  install's scripts use it to fade out and kill music and loops. How the
+  original picks among several threads of one track, and what it does
+  when the target has since ended, are not known.
 - **Sequence groups hold track numbers, not thread IDs.** The ID the
   original stores in a slot is the one `target` looks up, and scripts
   pass track numbers to `target`. So two threads of one track no longer
   end each other. This corrects the previous entry.
-- Levels are applied to notes once per block, after the threads run.
-  The original applies them as registers change. 3D position, the
+- Levels are applied to notes once per block, after the threads run,
+  and when a thread ends. The original applies them as registers
+  change. 3D position, the
   second pitch and track priorities are left out.
 - The exponentials use only basic arithmetic, so gains are the same on
   every platform. A track at full volume, centred, passes its samples

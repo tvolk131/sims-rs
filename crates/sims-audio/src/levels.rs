@@ -11,7 +11,8 @@
 //!   0..1024, scales it by the master volume (`* master / 1024`), and
 //!   hands DirectSound an attenuation in hundredths of a decibel: -10000
 //!   for 0, 0 for 1024, and `v * 4000 / 1024 - 4000` between. All
-//!   divisions truncate toward zero, as the original's do.
+//!   divisions truncate toward zero, and the products for `v` wrap in 32
+//!   bits, as the original's do.
 //! - **Pan.** Clamped to 0..1024, then `pan * 20000 / 1024 - 10000`
 //!   hundredths of a decibel: below 0 the right channel is attenuated by
 //!   that much, above 0 the left. 512 is the centre.
@@ -150,13 +151,14 @@ impl Levels {
 }
 
 /// The volume `v` the original hands its sound layer, before the master
-/// volume.
-pub fn volume(inputs: &Inputs) -> i64 {
-    let mut extvol = i64::from(inputs.extvol);
+/// volume. The original multiplies in 32 bits, so products past the range
+/// wrap, as they do here.
+pub fn volume(inputs: &Inputs) -> i32 {
+    let mut extvol = inputs.extvol;
     if inputs.group_volume != 1024 {
-        extvol = extvol * i64::from(inputs.group_volume) / 1024;
+        extvol = inputs.group_volume.wrapping_mul(extvol) / 1024;
     }
-    let mut v = i64::from(inputs.vol) * extvol / 1024;
+    let mut v = inputs.vol.wrapping_mul(extvol) / 1024;
     if inputs.main_duck_priority != 0 && inputs.duck_priority < inputs.main_duck_priority {
         v /= 2;
     }
@@ -165,7 +167,7 @@ pub fn volume(inputs: &Inputs) -> i64 {
 
 /// A track's levels. A 3D track is centred: 3D position is not modeled.
 pub fn levels(inputs: &Inputs) -> Levels {
-    let attenuation = attenuation(volume(inputs), i64::from(inputs.master));
+    let attenuation = attenuation(i64::from(volume(inputs)), i64::from(inputs.master));
     let pan = if inputs.three_d { 0 } else { pan(inputs.pan) };
     Levels {
         gains: gains(attenuation, pan),

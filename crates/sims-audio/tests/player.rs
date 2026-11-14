@@ -682,3 +682,71 @@ fn every_register_write_sets_the_flags() {
     play(&mut player, "e0");
     assert_eq!(player.render(2, &NoSources), [10_000, 10_000]);
 }
+
+#[test]
+fn a_target_naming_no_running_track_is_the_thread_itself() {
+    // Track 99 has no thread, so `target` stays here (the original's
+    // lookup returns null, which it takes as itself): vol 0 is this
+    // thread's, and its note is silent.
+    let mut routine = loadl(53, 99);
+    routine.extend(loadl(18, 0));
+    routine.extend(GENERIC);
+    let mut player = Player::new(vec![module(&[&routine], 1)], loud(4), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(2, &NoSources), [0, 0]);
+}
+
+#[test]
+fn target_follows_the_target_s_own_target() {
+    // e0 targets track 11 (e1, a note) and waits; e2 targets track 10
+    // (e0) and sets vol 512, which goes on to e1.
+    let mut middle = loadl(53, 11);
+    middle.extend([SET_LOOP, LOOP]);
+    let mut setter = loadl(53, 10);
+    setter.extend(loadl(18, 512));
+    setter.push(END);
+    let mut player = Player::new(
+        vec![module(&[&middle, &GENERIC, &setter], 1)],
+        loud(1000),
+        1,
+    );
+    for event in ["e0", "e1", "e2"] {
+        play(&mut player, event);
+    }
+    assert_eq!(player.render(2, &NoSources), [999, 999]);
+}
+
+#[test]
+fn a_ducking_request_goes_as_soon_as_its_thread_ends() {
+    // e0 asks for main_duckpri 30 and ends; e1, later in the same block,
+    // finds it 0 and so ends without playing e2's note.
+    let mut ducker = loadl(123, 30);
+    ducker.push(END);
+    let mut checker = vec![TEST, 123, IFNE];
+    checker.extend(long(0x102));
+    checker.push(END);
+    let mut player = Player::new(vec![module(&[&ducker, &checker, &GENERIC], 1)], loud(4), 1);
+    play(&mut player, "e0");
+    play(&mut player, "e1");
+    assert_eq!(player.render(2, &NoSources), [0, 0]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_thread_s_last_writes_reach_its_notes_when_it_ends() {
+    // note_on, then vol 0, then end: the note plays on, silent.
+    let mut routine = NOTE_ON_V1.to_vec();
+    routine.extend(loadl(18, 0));
+    routine.push(END);
+    let mut player = Player::new(vec![module(&[&routine], 1)], loud(4), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(2, &NoSources), [0, 0]);
+}
+
+#[test]
+fn too_many_frames_at_once_is_a_fault_not_a_panic() {
+    let mut player = Player::new(vec![module(&[&GENERIC], 1)], loud(4), 1);
+    assert!(player.render_stereo(usize::MAX, &NoSources).is_empty());
+    assert!(player.render(usize::MAX / 2 + 1, &NoSources).is_empty());
+    assert_eq!(player.faults.len(), 2, "{:?}", player.faults);
+}
