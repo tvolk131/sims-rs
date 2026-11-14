@@ -326,9 +326,9 @@ class Agent:
 
     def start(self):
         """Start the agent in the guest, unless one already answers. Returns
-        True if one was asked to start. A second agent is harmless: the agent
-        exits when a live one holds the folder, and each command is claimed by
-        a rename, so only one agent runs it."""
+        True if one was asked to start. A second agent is harmless: it exits
+        while a live one holds the agent's lock, and each command is claimed
+        by a rename, so only one agent runs it."""
         self.dir.mkdir(exist_ok=True)
         self.n = self.numbered()
         if (self.dir / 'agent.pid').exists() and self.alive():
