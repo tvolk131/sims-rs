@@ -51,7 +51,7 @@ Each step is a few PRs, and each PR leaves `main` green.
 - Step 3 is in progress. The interpreter runs saved frames, creates
   objects through the original's factory, and puts them to sleep. The load
   sequence below tracks the load steps that must run before the first
-  tick; `sims boot` runs the first six.
+  tick; `sims boot` runs them through step 9.
 
 ### Load sequence
 
@@ -62,11 +62,11 @@ changes the state the first tick sees.
 
 The order and the addresses come from the old prototype's research on the
 1.91 executable. Each step was checked there on its own, against the
-original's code run in isolation. Steps 1 to 6 are also checked against
-captures of the running original (see steps 3, 5 and 6), and three results
-of step 7 are (see step 7). The rest of the sequence has not been compared
-with a running game, so it is **unverified** until the comparison harness
-exists.
+original's code run in isolation. Steps 1 to 6, 8 and 9 are also checked
+against captures of the running original (see steps 3, 5, 6, 8 and 9), and
+three results of step 7 are (see step 7). The rest of the sequence has not
+been compared with a running game, so it is **unverified** until it is
+ported and compared.
 
 The original does not build a lot for a house. It keeps one lot for as long
 as it runs and loads each house into it. So a load starts from whatever
@@ -87,17 +87,17 @@ That starting lot is **unverified**; see the decision log.
 | 6c, 7 | Read the house's type table, marking the object types whose scripts changed since the save | `0x43dd76`, `0x43a516` | Done (`Interpreter::read_types`) |
 | 6d | Clear the lot again | `0x445f84`, `0x44279a` | Done (step 5) |
 | 6e | Construct the house's objects on the cleared lot and read their saved fields | `0x449c5e`, `0x43fe0a` | Done (`Interpreter::read_objects`); a person's graphics only as far as they draw random numbers |
-| 8 | Reconcile the lot-wide controllers among the saved objects | `0x43fc02`, `0x442b9f` | Creation done (`Interpreter::reconcile_controllers`) for a bare lot; deleting duplicates not started; not called here yet |
-| 9 | Repair the ground object grid and restore placement links | `0x443cb3` | Not started |
-| 10 | Give every object its room | `0x442659` | Not started |
-| 11 | Discard pending removals | `0x428679` | Not started |
+| 8 | Reconcile the lot-wide controllers among the saved objects | `0x43fc02`, `0x442b9f` | Done (`Interpreter::reconcile_controllers`); removing a duplicate only if it is off the lot and no person refers to it |
+| 9 | Repair the ground level's object grid | `0x443cb3` | Done (`World::repair_grid`) |
+| 10 | Give every object its room | `0x442659` | Not started; needs the lot's rooms |
+| 11 | Discard pending removals | `0x428679` | State change done (`World::discard_removals`), not called yet |
 | 12 | Select the household | `0x428041`, `0x46d8dc` | State change done (`World::select_family`), not called yet |
 | 13 | Visit every object in registration order | `0x43fc94`, `0x431e2e` | Not started |
 | 14 | Create the indicator objects and finish selection | `0x445e4a` | Creation done (`Interpreter::create_indicators`), used only for the starting lot |
 
 `sims boot` runs the steps in order and stops at the first one that is not
 done, so it never prints the hash of a state the original could not be in.
-Today it stops after step 6e.
+Today it stops after step 9.
 
 #### The steps
 
@@ -180,8 +180,8 @@ says what was compared.
 
 Only this case is ported: an object that is off the lot, one tile, not a
 person, holding nothing and held by nothing, with no callback for leaving
-the lot, on a lot with no people. Anything else fails with an error that
-says so. The interface, the objects' graphics and the lot's rooms are not
+the lot, and that no person on the lot refers to (see step 8). Anything
+else fails with an error that says so. The interface, the objects' graphics and the lot's rooms are not
 modeled.
 
 **6. House contents.** The original reads the rest of the house in five
@@ -270,16 +270,77 @@ them, and never worked out their Main signature. The other 110 are
 **unverified**.
 
 **8. Controllers again.** The same reconciliation as in step 3, now among
-the saved objects. The original keeps the first saved instance of each
-controller, deletes later duplicates, and creates the missing ones.
+the saved objects. The original lists the objects whose definition has a
+nonzero global word, in registration order, once. Then for each controller
+definition, in catalog order, it keeps the first listed instance, removes
+each later one at once (as step 5 removes an object), and creates the
+controller through the factory if the list has none. A controller created
+here runs its Init and first turn on a lot that holds the saved objects
+and people.
 
-**9. Grid repair and links.** Ground-floor grid cells that name an object
-which is not at that cell are cleared. Containment and multi-tile links are
-rebuilt from the saved slots.
+For the Goth house this step and the next are checked against a capture
+of the original taken when the function that does both returns. The house
+saved 4 of the 141 controllers and no duplicate, so 137 are created. They
+take the lowest unused IDs: the four gaps the house left, then 247 and up.
+All 382 objects match the capture field for field, with the one exception
+step 6e already had (a frame's tree ID on object 19). So do the
+registration order, the globals, both game random streams and the removal
+queue. No saved object changes, in the capture or here. The gated test
+`the_goth_house_controllers_are_reconciled_and_the_grid_is_checked` pins
+our state and says what was and was not compared.
+
+Two of the new controllers ask to be removed, as two did in step 3. The
+queue then holds four IDs: 42 and 44 from step 3, and 278 and 280. The
+first two now name saved objects, which nobody asked to remove. Step 11
+discards the queue before anything acts on it.
+
+Removing a duplicate is ported for an object that is off the lot and that
+no person refers to. A person refers to an object when it is using it, or
+when its running, last or a queued action targets it or shows its icon.
+The original tells every person about a deleted object, and a person that
+does not refer to it changes nothing. A person that does must cancel
+actions and unwind its thread; that is not ported and fails with an error
+that names the person. No capture shows a duplicate being removed, so
+that path is **unverified** against the running game.
+
+**9. Grid repair.** The object grid of a level holds, for each tile, the
+ID of the first object standing on it. The original walks the ground
+level's grid inside the lot's size and clears every cell whose ID is
+negative, names no object, or names an object that is not on that tile on
+level 1. It does not look at the upper level or at cells outside the
+size. Then it walks the objects and logs what it finds wrong with their
+containers and tiles; that pass changes nothing and is not ported.
+
+In the Goth house nothing is cleared, here and in the capture. The saved
+grid does name eight objects that are elsewhere, all in cells outside the
+lot's 52 tiles, which stay as they are. So no capture shows a cell being
+cleared: that is **unverified** against the running game.
+
+An earlier version of this table had "restore placement links" in this
+step. The original does nothing of the kind here: the function that runs
+steps 8 and 9 ends after the grid repair. The links are the grid and each
+object's slots (slot 0 names the next object on its tile, the others the
+objects it holds), and the object read of step 6e already filled them. A
+controller created in step 8 has empty slots. The capture agrees for the
+objects whose slots it holds.
 
 **10. Rooms.** Two passes over the registration list. The first writes each
 object's room into data word 29, turning level 0 into level 1. The second
 runs each object's function 7.
+
+Not ported: it needs the lot's rooms, which are worked out from the walls.
+What the capture of the Goth load shows of this step, for whoever ports
+it: the lot's rooms are built between the end of step 9 and the start of
+this step, 11 of them where the lot had 2. During the step no data word of
+any object changes, so every room the first pass writes is the one the
+house saved. Function 7 is asked of all 382 objects in registration
+order. The last result of 62 of them changes, and none of the other
+fields step 8 compares. After the step and before step 11, global 27 (the
+lot's indoor area) goes from 0 to 204.
+
+**11. Removals.** The queue of objects waiting to be removed is emptied.
+The objects stay. In the capture the queue holds four IDs before and none
+after, and no object changes.
 
 **12. Household.** Global 9 takes the family number, global 10 the house
 number, and the family's money becomes the lot's funds, split across

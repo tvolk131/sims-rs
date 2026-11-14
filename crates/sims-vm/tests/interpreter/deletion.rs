@@ -239,15 +239,42 @@ fn deletions_that_need_more_of_the_lot_fail_loudly() {
     });
     // With a callback for leaving the lot.
     unsupported(|fx, file| callback(fx, file, 26, 4400));
-    // A person on the lot would have to drop their references to it.
+    // A person is not deleted this way at all.
     let (mut fx, _) = lot(1, true);
     fx.add_sim(9);
     let interpreter = fx.interpreter();
     let mut world = fx.world.clone();
-    let fault = interpreter.delete(&mut world, 1).unwrap_err();
-    assert!(matches!(fault.trap, Trap::Unsupported(_)), "{fault}");
-    assert_eq!(world.globals[36], 0, "its Reset did not run");
-    // A person is not deleted this way at all.
     let fault = interpreter.delete(&mut world, 9).unwrap_err();
     assert!(matches!(fault.trap, Trap::Unsupported(_)), "{fault}");
+}
+
+#[test]
+fn people_who_do_not_refer_to_a_deleted_object_are_left_alone() {
+    let (mut fx, _) = lot(2, true);
+    fx.add_sim(9);
+    // The person's actions name the other widget and nothing.
+    let person = fx
+        .world
+        .objects
+        .get_mut(&9)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person.active.target = 2;
+    person.last.icon = 2;
+    let sim = fx.world.objects[&9].clone();
+    let interpreter = fx.interpreter();
+    let mut world = fx.world.clone();
+    assert_eq!(interpreter.delete(&mut world, 1), Ok(()));
+    assert_eq!(world.globals[36], 1, "its Reset ran");
+    assert_eq!(world.order, [2, 9]);
+    assert_eq!(format!("{:?}", world.objects[&9]), format!("{sim:?}"));
+    // Deleting the widget the person does refer to fails before its Reset
+    // tree runs.
+    let before = world.clone();
+    let fault = interpreter.delete(&mut world, 2).unwrap_err();
+    assert!(matches!(fault.trap, Trap::Unsupported(_)), "{fault}");
+    assert!(fault.to_string().contains("person 9 refers to object 2"));
+    assert_eq!(world.encode(), before.encode(), "nothing ran");
 }

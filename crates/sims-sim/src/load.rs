@@ -1,5 +1,6 @@
 //! The state-only steps of loading a lot: the globals the running game
-//! supplies, and selecting the household. The load sequence in `docs/roadmap.md`
+//! supplies, the lot arrays, the object grid's repair, and selecting the
+//! household. The load sequence in `docs/roadmap.md`
 //! lists every step of the original's lot load in order; the ones that run
 //! scripts live in `sims-vm`.
 
@@ -154,6 +155,23 @@ fn renumbered(id: u16, wall: bool) -> bool {
 
 /// The global that holds the budget mode. Funds change only while it is 0.
 const BUDGET_MODE: usize = 32;
+
+/// The ground level's object grid: for each tile, the ID of the first
+/// object standing on it, or 0. Each object names the next one on its tile
+/// in its slot 0.
+pub const GROUND_GRID: u16 = 3;
+
+/// A grid cell [`World::repair_grid`] cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridRepair {
+    /// The cell: the grid's column, then the place in the column.
+    pub tile: [usize; 2],
+    /// The ID the cell held.
+    pub object: i16,
+    /// The tile and level of the object with that ID, or None if the lot
+    /// has no such object.
+    pub found: Option<[i8; 3]>,
+}
 
 impl World {
     /// Turns the saved globals into the ones the lot runs with. The
@@ -448,6 +466,109 @@ impl World {
             }
         }
         Ok(rewrites.len())
+    }
+
+    /// The tile an object stands on and its level, as the original keeps
+    /// them beside the position (object bytes 0xfc to 0xfe, 0x4341c7): the
+    /// two coordinates divided by 16, rounding down, and the level, each
+    /// cut to a signed byte. An object off the lot is at -1, -1.
+    ///
+    /// For the Goth house these were compared with the bytes in a capture
+    /// of the original, for all 382 objects after load step 9.
+    pub fn tile(position: [i32; 3]) -> [i8; 3] {
+        [
+            (position[0] >> 4) as i8,
+            (position[1] >> 4) as i8,
+            position[2] as i8,
+        ]
+    }
+
+    /// Load step 9: clears every cell of the ground level's object grid
+    /// that names an object which is not there (0x443cb3). Returns the
+    /// cells cleared, in the order the original visits them.
+    ///
+    /// Only the cells inside the lot's size are looked at, column by
+    /// column. A cell is cleared if its ID, read as a signed word, is
+    /// negative, or names no object, or names an object whose tile and
+    /// level ([`World::tile`]) are not this cell on level 1. The upper
+    /// level's grid is not looked at. The step comes after the lot-wide
+    /// controllers are reconciled, so an ID a new controller took counts
+    /// as an object that is elsewhere.
+    ///
+    /// The original then walks every object and writes to its log what it
+    /// finds wrong with the object's container or tile. That pass changes
+    /// nothing and is not ported.
+    ///
+    /// This follows the original's code, read for this port, and the old
+    /// prototype's `repair_ground_object_heads_in_active`
+    /// (legacy/crates/sims-vm/src/loading.rs), which was compared with the
+    /// original's 0x443cb3 run alone on made-up grids. For the Goth house
+    /// a capture of the original taken after this step has the same grid
+    /// as before it, and here too nothing is cleared. So no capture shows
+    /// a cell being cleared: that is **unverified** against the running
+    /// game.
+    pub fn repair_grid(&mut self) -> Result<Vec<GridRepair>, LoadError> {
+        let full = FULL_SIZE as usize;
+        let active = usize::try_from(self.size).unwrap_or(0).min(full);
+        let grid = self
+            .arrays
+            .get(&GROUND_GRID)
+            .ok_or(LoadError::MissingArray(GROUND_GRID))?;
+        if grid.width != full || grid.height != full {
+            return Err(LoadError::ArraySize {
+                array: GROUND_GRID,
+                width: grid.width,
+                height: grid.height,
+            });
+        }
+        if grid.stride != 2 || grid.data.len() != full * full * 2 {
+            return Err(LoadError::ArrayStride {
+                array: GROUND_GRID,
+                stride: grid.stride,
+            });
+        }
+        let mut repairs = Vec::new();
+        for column in 0..active {
+            for row in 0..active {
+                let cell = (column * full + row) * 2;
+                let object = i16::from_le_bytes([grid.data[cell], grid.data[cell + 1]]);
+                if object == 0 {
+                    continue;
+                }
+                let found = u16::try_from(object)
+                    .ok()
+                    .and_then(|id| self.objects.get(&id))
+                    .map(|o| Self::tile(o.position));
+                if found != Some([column as i8, row as i8, 1]) {
+                    repairs.push(GridRepair {
+                        tile: [column, row],
+                        object,
+                        found,
+                    });
+                }
+            }
+        }
+        if let Some(grid) = self.arrays.get_mut(&GROUND_GRID) {
+            for repair in &repairs {
+                let cell = (repair.tile[0] * full + repair.tile[1]) * 2;
+                grid.data[cell..cell + 2].fill(0);
+            }
+        }
+        Ok(repairs)
+    }
+
+    /// Load step 11: forgets the objects waiting to be removed (0x428679).
+    /// The objects themselves stay, and so does the mark on an object that
+    /// asked to be removed without resets
+    /// ([`crate::Object::removal_skips_resets`]). Returns the IDs dropped.
+    ///
+    /// Not called by the load yet: step 10 comes first and is not ported.
+    /// In a capture of the original loading the Goth house the queue holds
+    /// four IDs before this step and none after, and no object changes.
+    /// Our state at that moment was not compared, because the load does
+    /// not reach it.
+    pub fn discard_removals(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.removals)
     }
 
     /// Clears the family in global 9 (0x415eff). The house loader does

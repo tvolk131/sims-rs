@@ -52,7 +52,7 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     // boot stops at the first one not implemented yet.
     world.read_simulator(&house.simulator);
     world.apply_context(context)?;
-    let created = interpreter.resize(&mut world)?;
+    let created = interpreter.resize(&mut world)?.created;
     world.clear_family()?;
     let queued = world.removals.len();
     let removed = interpreter.clear(&mut world)?;
@@ -103,9 +103,12 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
         house.objects.instances.values().map(|o| o.guid),
     )?;
     let read = interpreter.read_objects(&mut world, &house.objects, &people)?;
-    // The load stops here. Next the original reconciles the lot-wide
-    // controllers among the saved objects (step 8), which is not ported
-    // for a lot that holds objects.
+    // 8: the lot-wide controllers, now among the saved objects. 9: the
+    // ground level's object grid.
+    let reconciled = interpreter.reconcile_controllers(&mut world)?;
+    let repaired = world.repair_grid()?;
+    // The load stops here. Next the original gives every object its room
+    // (step 10), which needs the lot's rooms. They are not ported.
     if let Some(path) = options.snapshot {
         Snapshots::open(path)?.save("boot", &world)?;
     }
@@ -156,8 +159,20 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     );
     let _ = writeln!(
         out,
-        "         stopped before the lot-wide controllers are reconciled (step 8, not \
-         implemented yet)"
+        "         {} controllers created among them, {} duplicates removed; {} IDs queued \
+         for removal",
+        reconciled.created.len(),
+        reconciled.removed.len(),
+        world.removals.len()
+    );
+    let _ = writeln!(
+        out,
+        "         ground object grid checked, {} cells cleared",
+        repaired.len()
+    );
+    let _ = writeln!(
+        out,
+        "         stopped before every object is given its room (step 10, not implemented yet)"
     );
     let _ = writeln!(
         out,

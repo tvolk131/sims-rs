@@ -235,6 +235,33 @@ fn a_row_too_long_for_its_record_ends_the_read() {
     assert_eq!(read(&records, rows), records);
 }
 
+/// An object with nothing but an ID and a position.
+fn object_at(id: u16, position: [i32; 3]) -> sims_sim::Object {
+    sims_sim::Object {
+        id,
+        guid: 1,
+        footprint: [0; 4],
+        position,
+        unknown_short: 0,
+        attributes: Vec::new(),
+        temps: Vec::new(),
+        data: Vec::new(),
+        obsolete_word: 0,
+        stack_capacity_bytes: 0,
+        stack: Vec::new(),
+        relationship_flag: 0,
+        relationships: Vec::new(),
+        slots: Vec::new(),
+        dynamic_sprites: Vec::new(),
+        multipart: None,
+        portal: None,
+        person: None,
+        registry_word: None,
+        last_result: false,
+        removal_skips_resets: false,
+    }
+}
+
 #[test]
 fn the_scheduler_word_keeps_a_countdown_and_flags() {
     let mut object = sims_sim::Object {
@@ -571,4 +598,149 @@ fn renumbering_that_needs_more_fails_and_changes_nothing() {
         world.renumber_surfaces(Some(&[]), Some(&[])),
         Err(LoadError::MissingArray(1))
     );
+}
+
+/// A lot of size 8 with empty object grids on both levels, and objects at
+/// the given positions.
+fn grid(objects: &[(u16, [i32; 3])]) -> World {
+    let mut world = lot(vec![0; 64]);
+    world.size = 8;
+    world.arrays.insert(3, array(64, 2, 0));
+    world.arrays.insert(103, array(64, 2, 0));
+    for &(id, position) in objects {
+        world.objects.insert(id, object_at(id, position));
+        world.order.push(id);
+    }
+    world
+}
+
+fn head(world: &World, level: u16, x: usize, y: usize) -> i16 {
+    let bytes = cell(&world.arrays[&level], x, y);
+    i16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+#[test]
+fn an_objects_tile_is_its_position_in_sixteenths_rounded_down() {
+    assert_eq!(World::tile([0, 0, 1]), [0, 0, 1]);
+    assert_eq!(World::tile([47, 48, 2]), [2, 3, 2]);
+    // Off the lot, where the factory puts a new object.
+    assert_eq!(World::tile([-16, -16, 1]), [-1, -1, 1]);
+    assert_eq!(World::tile([-1, -17, 0]), [-1, -2, 0]);
+    // Each part is cut to a signed byte.
+    assert_eq!(World::tile([128 * 16, 255 * 16, 257]), [-128, -1, 1]);
+}
+
+#[test]
+fn grid_cells_that_name_an_object_which_is_elsewhere_are_cleared() {
+    use sims_sim::load::GridRepair;
+    let mut world = grid(&[
+        (1, [2 * 16 + 5, 3 * 16 + 15, 1]), // on tile 2, 3
+        (2, [2 * 16, 3 * 16, 1]),          // on the same tile, behind 1
+        (3, [5 * 16, 16, 1]),              // on tile 5, 1
+        (4, [-16, -16, 1]),                // off the lot
+        (5, [6 * 16, 6 * 16, 2]),          // upstairs
+        (6, [4 * 16, 4 * 16, 0]),          // on level 0
+    ]);
+    for (x, y, id) in [
+        (2, 3, 1i16), // right
+        (3, 2, 1),    // the same object, coordinates swapped
+        (5, 1, 3),    // right
+        (5, 2, 3),    // the next tile
+        (0, 0, 4),    // an object that is off the lot
+        (6, 6, 5),    // an object that is upstairs
+        (4, 4, 6),    // an object whose level is 0, not 1
+        (1, 1, 7),    // no such object
+        (7, 7, -3),   // a negative ID
+        (7, 0, 2),    // an object that is on another tile, not at its head
+    ] {
+        set(&mut world, 3, x, y, &id.to_le_bytes());
+    }
+    // Outside the lot's size, and upstairs: not looked at.
+    set(&mut world, 3, 8, 0, &7i16.to_le_bytes());
+    set(&mut world, 3, 0, 8, &7i16.to_le_bytes());
+    set(&mut world, 3, 63, 63, &1i16.to_le_bytes());
+    set(&mut world, 103, 1, 1, &7i16.to_le_bytes());
+    set(&mut world, 103, 6, 6, &5i16.to_le_bytes());
+    let before = world.clone();
+    let repair = |tile, object, found| GridRepair {
+        tile,
+        object,
+        found,
+    };
+    // Column by column, as the original walks the grid.
+    assert_eq!(
+        world.repair_grid(),
+        Ok(vec![
+            repair([0, 0], 4, Some([-1, -1, 1])),
+            repair([1, 1], 7, None),
+            repair([3, 2], 1, Some([2, 3, 1])),
+            repair([4, 4], 6, Some([4, 4, 0])),
+            repair([5, 2], 3, Some([5, 1, 1])),
+            repair([6, 6], 5, Some([6, 6, 2])),
+            repair([7, 0], 2, Some([2, 3, 1])),
+            repair([7, 7], -3, None),
+        ])
+    );
+    for (x, y, id) in [(2, 3, 1), (5, 1, 3), (8, 0, 7), (0, 8, 7), (63, 63, 1)] {
+        assert_eq!(head(&world, 3, x, y), id, "cell {x}, {y}");
+    }
+    for (x, y) in [
+        (0, 0),
+        (1, 1),
+        (3, 2),
+        (4, 4),
+        (5, 2),
+        (6, 6),
+        (7, 0),
+        (7, 7),
+    ] {
+        assert_eq!(head(&world, 3, x, y), 0, "cell {x}, {y}");
+    }
+    // Nothing else changes: the upper grid, the objects, the list.
+    assert_eq!(world.arrays[&103], before.arrays[&103]);
+    let mut same = before.clone();
+    same.arrays.insert(3, world.arrays[&3].clone());
+    assert_eq!(world.encode(), same.encode());
+    // A second pass finds nothing.
+    assert_eq!(world.repair_grid(), Ok(vec![]));
+    assert_eq!(world.encode(), same.encode());
+}
+
+#[test]
+fn a_grid_that_is_missing_or_misshapen_is_refused() {
+    let mut world = grid(&[]);
+    world.arrays.remove(&3);
+    assert_eq!(world.repair_grid(), Err(LoadError::MissingArray(3)));
+    world.arrays.insert(3, array(64, 1, 0));
+    assert_eq!(
+        world.repair_grid(),
+        Err(LoadError::ArrayStride {
+            array: 3,
+            stride: 1
+        })
+    );
+    world.arrays.insert(3, array(32, 2, 0));
+    assert_eq!(
+        world.repair_grid(),
+        Err(LoadError::ArraySize {
+            array: 3,
+            width: 32,
+            height: 32
+        })
+    );
+}
+
+#[test]
+fn discarding_the_removals_empties_the_queue_and_touches_no_object() {
+    let mut world = grid(&[(4, [-16, -16, 1]), (9, [-16, -16, 1])]);
+    world.objects.get_mut(&9).unwrap().removal_skips_resets = true;
+    // An ID may outlive its object, and may name an object read later.
+    world.removals = vec![4, 77, 9];
+    let before = world.clone();
+    assert_eq!(world.discard_removals(), [4, 77, 9]);
+    assert!(world.removals.is_empty());
+    let mut same = before;
+    same.removals.clear();
+    assert_eq!(world.encode(), same.encode());
+    assert_eq!(world.discard_removals(), []);
 }

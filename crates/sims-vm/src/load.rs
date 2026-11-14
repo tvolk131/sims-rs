@@ -21,6 +21,15 @@ const GLOBAL_WORD: usize = 42;
 /// Global 27: the area of the lot's indoor rooms, in tiles.
 const INDOOR_AREA: usize = 27;
 
+/// What [`Interpreter::reconcile_controllers`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    /// The IDs of the controllers created, in creation order.
+    pub created: Vec<u16>,
+    /// The IDs of the duplicates removed, in removal order.
+    pub removed: Vec<u16>,
+}
+
 impl Interpreter<'_> {
     /// Creates the two indicator objects through the factory and hides
     /// them (0x445e4a). The original does this at the end of every load,
@@ -49,9 +58,9 @@ impl Interpreter<'_> {
     ///
     /// A resize rebuilds the lot's rooms, and the object registry answers
     /// that by creating every lot-wide controller the lot lacks
-    /// ([`Interpreter::reconcile_controllers`]). Returns the IDs it
-    /// created. A lot that already has the size, or a request below 4
-    /// tiles, changes nothing and creates nothing.
+    /// ([`Interpreter::reconcile_controllers`]). Returns what that did. A
+    /// lot that already has the size, or a request below 4 tiles, changes
+    /// nothing and creates nothing.
     ///
     /// Ported from the old prototype's `prepare_cleared_inner`
     /// (legacy/crates/sims-content/src/house_startup.rs), which reproduced a
@@ -62,7 +71,7 @@ impl Interpreter<'_> {
     /// delete, and no indoor room, so the rebuild leaves global 27 (the
     /// lot's indoor area) at 0. Anything else fails. The rooms themselves
     /// and their tile counts are not modeled.
-    pub fn resize(&self, world: &mut World) -> Result<Vec<u16>, Fault> {
+    pub fn resize(&self, world: &mut World) -> Result<Reconciled, Fault> {
         let fail = |message: &str| Fault {
             object: 0,
             at: None,
@@ -76,7 +85,7 @@ impl Interpreter<'_> {
             size => size,
         };
         if requested < 4 || requested == world.size {
-            return Ok(Vec::new());
+            return Ok(Reconciled::default());
         }
         if requested > world.size {
             return Err(fail("growing a lot is not ported"));
@@ -187,27 +196,59 @@ impl Interpreter<'_> {
 
     /// Makes the lot hold exactly one of every lot-wide controller
     /// (0x442b9f): every definition in the catalog of type 7 or 12 with a
-    /// nonzero global word, in catalog order. An existing instance is
-    /// kept; a missing one is created through the factory, which runs its
-    /// Init and its first turn before the next definition is looked at.
-    /// Returns the IDs created, in creation order.
+    /// nonzero global word, in catalog order. The first instance in the
+    /// registration list is kept. Each later one is removed at once
+    /// ([`Interpreter::remove_now`], 0x44123f), which runs its Reset tree.
+    /// A missing one is created through the factory, which runs its Init
+    /// and its first turn. All of that is done for one definition before
+    /// the next is looked at.
     ///
-    /// The original takes its list of existing instances once, so a
-    /// controller created here never counts as existing. It deletes later
-    /// duplicates of an instance; deletion is not ported, so a duplicate
-    /// fails. It also notes the ID of the animation tester (GUID
+    /// This is load step 8, run among the saved objects, and it is what a
+    /// resize runs (step 3).
+    ///
+    /// The original takes its list of existing instances once, at the
+    /// start: the objects whose definition has a nonzero global word, in
+    /// registration order. A controller created here never joins it. After
+    /// it removes a duplicate it scans the list again from the start for
+    /// the same definition. If a script run on the way has removed an
+    /// object that list names, the original would use freed memory; here
+    /// that fails.
+    ///
+    /// The original also notes the ID of the animation tester (GUID
     /// 0x3EEC206C) for the interface, which is not simulation state.
     ///
-    /// Ported from the old prototype (legacy/crates/sims-vm/src/global_load.rs,
+    /// For the Goth house the creation was compared with captures of the
+    /// original, on a bare lot (step 3) and among the saved objects and
+    /// people (step 8); see `docs/decisions.md`. That house has no
+    /// duplicate. Removing duplicates is **unverified** against the
+    /// running game: it follows the old prototype, which compared its
+    /// selection loop with the original's 0x442b9f run alone on made-up
+    /// catalogs, with the factory and the removal stubbed out.
+    ///
+    /// Ported from the old prototype (`reconcile` in
+    /// legacy/crates/sims-vm/src/global_load.rs,
     /// `reconcile_global_controllers` in
     /// legacy/crates/sims-content/src/save_storage.rs).
-    pub fn reconcile_controllers(&self, world: &mut World) -> Result<Vec<u16>, Fault> {
+    pub fn reconcile_controllers(&self, world: &mut World) -> Result<Reconciled, Fault> {
         let fail = |trap| Fault {
             object: 0,
             at: None,
             trap,
         };
-        // Existing instances by definition, in registration order.
+        let words = |definition: &sims_content::Object| {
+            self.program
+                .definition(definition.resource, definition.chunk)
+                .ok_or_else(|| {
+                    fail(Trap::Invalid(format!(
+                        "the program does not hold the definition of GUID 0x{:08X}; \
+                         link the whole catalog",
+                        definition.guid
+                    )))
+                })
+        };
+        // The instances of every definition with a global word, in
+        // registration order, each with its definition's place in the
+        // files.
         let mut existing = Vec::new();
         for &id in &world.order {
             let Some(object) = world.objects.get(&id) else {
@@ -219,34 +260,45 @@ impl Interpreter<'_> {
                     object.guid
                 )))
             })?;
-            existing.push((definition.resource, definition.chunk));
+            if words(definition)?[GLOBAL_WORD] != 0 {
+                existing.push((id, object.guid, (definition.resource, definition.chunk)));
+            }
         }
-        let mut created = Vec::new();
+        let mut result = Reconciled::default();
         for definition in &self.catalog.objects {
-            let Some(words) = self
-                .program
-                .definition(definition.resource, definition.chunk)
-            else {
-                return Err(fail(Trap::Invalid(format!(
-                    "the program does not hold the definition of GUID 0x{:08X}; \
-                     link the whole catalog",
-                    definition.guid
-                ))));
-            };
+            let words = words(definition)?;
             if !matches!(words[9], 7 | 12) || words[GLOBAL_WORD] == 0 {
                 continue;
             }
             let identity = (definition.resource, definition.chunk);
-            match existing.iter().filter(|&&e| e == identity).count() {
-                0 => {}
-                1 => continue,
-                _ => {
+            let mut kept = false;
+            let mut at = 0;
+            while at < existing.len() {
+                let (id, guid, place) = existing[at];
+                if place != identity {
+                    at += 1;
+                    continue;
+                }
+                if world.objects.get(&id).is_none_or(|o| o.guid != guid) {
                     return Err(fail(Trap::Unsupported(format!(
-                        "the lot has duplicates of controller 0x{:08X}; deleting them is not \
-                         ported",
-                        definition.guid
+                        "controller {id} was removed by a script while the controllers were \
+                         reconciled"
                     ))));
                 }
+                if !kept {
+                    kept = true;
+                    at += 1;
+                    continue;
+                }
+                self.remove_now(world, id)?;
+                result.removed.push(id);
+                existing.remove(at);
+                // The original starts the scan over after each removal.
+                kept = false;
+                at = 0;
+            }
+            if kept {
+                continue;
             }
             // Objects carry a GUID, not a definition. Two definitions with
             // one GUID cannot be told apart here.
@@ -260,8 +312,8 @@ impl Interpreter<'_> {
                     definition.guid
                 ))));
             }
-            created.push(self.create(world, definition.guid)?);
+            result.created.push(self.create(world, definition.guid)?);
         }
-        Ok(created)
+        Ok(result)
     }
 }

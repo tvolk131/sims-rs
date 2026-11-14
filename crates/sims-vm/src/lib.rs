@@ -37,7 +37,7 @@ pub use error::Error;
 pub use factory::TURN_BUDGET;
 pub use fault::{Fault, Location, Trap};
 pub use interpreter::{Interpreter, MAX_STACK, Status, Stream};
-pub use load::INDICATORS;
+pub use load::{INDICATORS, Reconciled};
 pub use memory::scope_name;
 pub use objects::SavedRead;
 pub use primitives::primitive_name;
