@@ -261,6 +261,43 @@ fn a_resolved_path_is_spelled_as_on_disk() {
 }
 
 #[test]
+fn dot_components_must_lead_somewhere() {
+    let tree = Tree::new("dots");
+    base_game(&tree);
+    let install = Install::detect(&tree.0).unwrap();
+    assert!(install.file("GameData/Behavior.iff/..").is_err());
+    assert!(install.file("GameData/./Behavior.iff").is_ok());
+}
+
+#[test]
+fn names_differing_only_in_case_resolve_the_same_everywhere() {
+    let tree = Tree::new("collide");
+    base_game(&tree);
+    tree.file("GameData/x.iff", b"lower")
+        .file("GameData/X.IFF", b"upper");
+    // Only counted, so the listing's order doesn't matter.
+    #[allow(clippy::disallowed_methods)]
+    let listed = std::fs::read_dir(tree.0.join("GameData"))
+        .unwrap()
+        .filter(|e| {
+            let name = e.as_ref().unwrap().file_name();
+            name.eq_ignore_ascii_case("x.iff")
+        })
+        .count();
+    if listed < 2 {
+        // A case-insensitive filesystem holds only one of them.
+        return;
+    }
+    let install = Install::detect(&tree.0).unwrap();
+    let read = |path: &str| std::fs::read(install.file(path).unwrap()).unwrap();
+    // An exact match wins; otherwise the first in sorted order, where
+    // "X.IFF" comes before "x.iff".
+    assert_eq!(read("GameData/x.iff"), b"lower");
+    assert_eq!(read("GameData/X.IFF"), b"upper");
+    assert_eq!(read("GameData/x.IFF"), b"upper");
+}
+
+#[test]
 fn unreadable_archives_are_skipped_with_a_diagnostic() {
     let tree = Tree::new("bad-far");
     base_game(&tree);

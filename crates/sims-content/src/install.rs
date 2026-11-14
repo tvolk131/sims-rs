@@ -169,7 +169,10 @@ pub(crate) fn resolve(root: &Path, relative: &str) -> Result<Option<PathBuf>> {
     let mut path = root.to_path_buf();
     for component in relative.split('/').filter(|c| !c.is_empty()) {
         if component == "." || component == ".." {
+            // Taken as the filesystem takes them (through symlinks), and
+            // only when they lead somewhere.
             path.push(component);
+            path.symlink_metadata().map_err(|e| Error::io(&path, e))?;
             continue;
         }
         let entries = sorted_entries(&path)?;
