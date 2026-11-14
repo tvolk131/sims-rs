@@ -458,6 +458,29 @@ fn a_resource_map_decides_lookup_as_well_as_order() {
     assert_eq!(payloads(&iff, b"STR#"), [&b"two"[..], b"new"]);
 }
 #[test]
+fn a_resource_map_can_choose_the_earlier_chunk() {
+    let mut b = header();
+    let old = add_flagged(&mut b, b"STR#", 1, 0, b"old");
+    add_flagged(&mut b, b"STR#", 1, 0, b"new");
+    add_flagged(&mut b, b"STR#", 2, 0, b"unlisted");
+    let low = add_flagged(&mut b, b"STR#", 3, 0x10, b"low bits");
+    // A later entry for a listed key is dropped without being checked,
+    // and the low flag bits are the map's to state.
+    add_map(
+        &mut b,
+        &[
+            (b"STR#", old, 1, 0),
+            (b"STR#", 9999, 1, 0),
+            (b"STR#", low, 3, 0),
+        ],
+    );
+    let iff = Iff::parse(b).unwrap();
+    // Without the map, the later chunk would replace the earlier one.
+    assert_eq!(iff.data(iff.get(b"STR#", 1).unwrap()), b"old");
+    assert!(iff.get(b"STR#", 2).is_none());
+    assert_eq!(payloads(&iff, b"STR#"), [&b"old"[..], b"low bits"]);
+}
+#[test]
 fn a_map_listing_a_map_is_ignored() {
     let mut b = header();
     let first = add_flagged(&mut b, b"STR#", 1, 0, b"one");

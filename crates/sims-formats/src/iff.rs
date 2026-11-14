@@ -123,10 +123,17 @@ impl Resources {
     /// The table from the resource map at `offset`, or None when the map
     /// lists a map with ID 0.
     fn mapped(bytes: &[u8], chunks: &[Chunk], offset: usize) -> Result<Option<Self>> {
-        let map = chunks
-            .iter()
-            .find(|c| c.offset == offset && c.tag == *b"rsmp" && c.flags & DELETED == 0)
-            .ok_or_else(|| crate::Error::new(offset, "IFF resource map not found"))?;
+        // Chunks are in file order, so by offset.
+        let at = |offset: usize| {
+            chunks
+                .binary_search_by_key(&offset, |c| c.offset)
+                .ok()
+                .map(|i| (i, &chunks[i]))
+        };
+        let map = at(offset)
+            .filter(|(_, c)| c.tag == *b"rsmp" && c.flags & DELETED == 0)
+            .ok_or_else(|| crate::Error::new(offset, "IFF resource map not found"))?
+            .1;
         let map = ResourceMap::parse(&bytes[map.payload.clone()])?;
         if map
             .types
@@ -138,20 +145,27 @@ impl Resources {
         let mut resources = Self::default();
         for (tag, entries) in &map.types {
             for entry in entries {
-                let index = chunks
-                    .iter()
-                    .position(|c| {
-                        c.offset == entry.offset as usize
-                            && c.tag == *tag
-                            && c.id == entry.id
-                            && c.flags == entry.flags
+                // A later entry with a key already listed is dropped
+                // unread, as the original's table insert drops it.
+                let key = (*tag, entry.id, (entry.flags >> 8) as u8);
+                if resources.by_key.contains_key(&key) {
+                    continue;
+                }
+                // The entry's chunk must be there with the entry's key. Its
+                // low flag bits are the map's to state, as in the
+                // prototype, which reads the payload wherever the map
+                // points and checks only the type there.
+                let index = at(entry.offset as usize)
+                    .filter(|(_, c)| {
+                        c.tag == *tag && c.id == entry.id && c.flags >> 8 == entry.flags >> 8
                     })
                     .ok_or_else(|| {
                         crate::Error::new(
                             entry.offset as usize,
                             "resource map entry disagrees with chunk header",
                         )
-                    })?;
+                    })?
+                    .0;
                 resources.add(chunks, index, true);
             }
         }

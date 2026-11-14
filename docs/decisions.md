@@ -48,8 +48,13 @@ The rules follow the frozen prototype's port of the open
   (flag 4) is skipped. A later chunk with a taken key replaces the
   earlier one in its place in the order.
 - With a version-0 map: the map's entries in its order. Of two entries
-  with one key, the first is kept. A map listing a resource map with ID 0
-  is ignored and the chunks are read as if there were none.
+  with one key, the first is kept and the second dropped unread. A map
+  listing a resource map with ID 0 is ignored and the chunks are read as
+  if there were none. An entry's chunk must be at its offset with its
+  type, ID and flags high byte; the low flag bits are the map's to state,
+  as in the prototype. (The prototype checks only the type, when it
+  loads the payload; requiring the ID keeps a resource's chunk agreeing
+  with the key it is found under. The game's own maps always agree.)
 - A resource map is never a resource itself.
 - When the map cannot be used, `resource_order` fails as before, and
   `get` and `all` use the table built as if there were no map.
