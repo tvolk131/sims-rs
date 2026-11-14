@@ -1,7 +1,7 @@
 //! The lot resize at the start of a load, the clear that follows it, the
 //! lot arrays, the type table, the saved objects, the controllers among
-//! them, the object grid, the rooms, the household and the object visits,
-//! on a real install when `SIMS_INSTALL` names one.
+//! them, the object grid, the rooms, the household, the object visits and
+//! the end of the load, on a real install when `SIMS_INSTALL` names one.
 //! Game data is never committed, so CI skips this. The mechanics have
 //! synthetic tests in `tests/interpreter`.
 
@@ -60,6 +60,171 @@ fn with_goth_people(
     then(&house, &interpreter, &mut world, &created, &people);
 }
 
+/// A lot's encoding as snapshot format 7 wrote it. Format 8 added fields
+/// in three places: each object's selected mark; each room's object
+/// counts, light, score and pool mark; and the rooms' waiting levels and
+/// outdoor sum and score. This writes every other field, in the order
+/// format 7 had them, and leaves those out. So a state pinned under
+/// format 7 can be shown to be the same state but for the new fields.
+fn format_7_bytes(world: &World) -> Vec<u8> {
+    use serde::Serialize;
+    use sims_formats::saved_objects as saved;
+    use std::collections::{BTreeMap, BTreeSet};
+    #[derive(Serialize)]
+    struct Object7<'a> {
+        id: u16,
+        guid: u32,
+        footprint: [i32; 4],
+        position: [i32; 3],
+        unknown_short: i16,
+        attributes: &'a Vec<i16>,
+        temps: &'a Vec<i16>,
+        data: &'a Vec<i16>,
+        obsolete_word: i16,
+        stack_capacity_bytes: i32,
+        stack: &'a Vec<saved::Frame>,
+        relationship_flag: i32,
+        relationships: &'a Vec<saved::Relationship>,
+        slots: &'a Vec<saved::Slot>,
+        dynamic_sprites: &'a Vec<i16>,
+        multipart: &'a Option<saved::Multipart>,
+        portal: &'a Option<Vec<f32>>,
+        person: &'a Option<saved::Person>,
+        registry_word: Option<i32>,
+        last_result: bool,
+        removal_skips_resets: bool,
+    }
+    #[derive(Serialize)]
+    struct Room7<'a> {
+        tiles: &'a Vec<[u8; 3]>,
+        outdoors: bool,
+        dirty: bool,
+        half_tiles: i32,
+        covered_half_tiles: i32,
+        walls: i32,
+        covered_walls: i32,
+    }
+    #[derive(Serialize)]
+    struct Rooms7<'a> {
+        map: &'a [Vec<i16>; 2],
+        halves: &'a BTreeMap<[u8; 3], [sims_sim::rooms::Half; 2]>,
+        rooms: BTreeMap<i16, Room7<'a>>,
+    }
+    #[derive(Serialize)]
+    struct World7<'a> {
+        ticks: u32,
+        globals: &'a Vec<i16>,
+        scheduler_cursor: i16,
+        lot_rng: &'a sims_core::GameRng,
+        global_rng: &'a sims_core::GameRng,
+        crt_rng: &'a sims_core::CrtRng,
+        size: i16,
+        budget: &'a sims_sim::Budget,
+        order: &'a Vec<u16>,
+        types: &'a BTreeMap<u16, u32>,
+        objects: BTreeMap<u16, Object7<'a>>,
+        arrays: &'a BTreeMap<u16, sims_formats::lot::Array>,
+        removals: &'a Vec<u16>,
+        type_attributes: &'a Vec<sims_sim::TypeAttributes>,
+        instances: &'a BTreeMap<u32, Vec<u16>>,
+        event_owner: u16,
+        magic_history: &'a Option<sims_sim::MagicHistory>,
+        indicators: [u16; 2],
+        changed_types: &'a BTreeSet<u32>,
+        next_parts: &'a BTreeMap<u16, u16>,
+        skeleton_files: &'a BTreeSet<String>,
+        rooms: Rooms7<'a>,
+        fires: &'a Vec<u16>,
+        frame_storage: &'a BTreeMap<u16, sims_sim::FrameStorage>,
+    }
+    let objects = world
+        .objects
+        .iter()
+        .map(|(&id, o)| {
+            let object = Object7 {
+                id: o.id,
+                guid: o.guid,
+                footprint: o.footprint,
+                position: o.position,
+                unknown_short: o.unknown_short,
+                attributes: &o.attributes,
+                temps: &o.temps,
+                data: &o.data,
+                obsolete_word: o.obsolete_word,
+                stack_capacity_bytes: o.stack_capacity_bytes,
+                stack: &o.stack,
+                relationship_flag: o.relationship_flag,
+                relationships: &o.relationships,
+                slots: &o.slots,
+                dynamic_sprites: &o.dynamic_sprites,
+                multipart: &o.multipart,
+                portal: &o.portal,
+                person: &o.person,
+                registry_word: o.registry_word,
+                last_result: o.last_result,
+                removal_skips_resets: o.removal_skips_resets,
+            };
+            (id, object)
+        })
+        .collect();
+    let rooms = world
+        .rooms
+        .rooms
+        .iter()
+        .map(|(&id, r)| {
+            let room = Room7 {
+                tiles: &r.tiles,
+                outdoors: r.outdoors,
+                dirty: r.dirty,
+                half_tiles: r.half_tiles,
+                covered_half_tiles: r.covered_half_tiles,
+                walls: r.walls,
+                covered_walls: r.covered_walls,
+            };
+            (id, room)
+        })
+        .collect();
+    let old = World7 {
+        ticks: world.ticks,
+        globals: &world.globals,
+        scheduler_cursor: world.scheduler_cursor,
+        lot_rng: &world.lot_rng,
+        global_rng: &world.global_rng,
+        crt_rng: &world.crt_rng,
+        size: world.size,
+        budget: &world.budget,
+        order: &world.order,
+        types: &world.types,
+        objects,
+        arrays: &world.arrays,
+        removals: &world.removals,
+        type_attributes: &world.type_attributes,
+        instances: &world.instances,
+        event_owner: world.event_owner,
+        magic_history: &world.magic_history,
+        indicators: world.indicators,
+        changed_types: &world.changed_types,
+        next_parts: &world.next_parts,
+        skeleton_files: &world.skeleton_files,
+        rooms: Rooms7 {
+            map: &world.rooms.map,
+            halves: &world.rooms.halves,
+            rooms,
+        },
+        fires: &world.fires,
+        frame_storage: &world.frame_storage,
+    };
+    postcard::to_allocvec(&old).unwrap()
+}
+
+/// Checks a state against its digest under today's snapshot format and
+/// against the digest pinned for it under format 7
+/// ([`format_7_bytes`]).
+fn pinned(world: &World, now: &str, format_7: &str) {
+    assert_eq!(world.hash_hex(), now);
+    assert_eq!(digest(&format_7_bytes(world)), format_7);
+}
+
 /// A lot's encoding as snapshot format 6 wrote it, for a state reached
 /// before load step 13. Two things changed since:
 ///
@@ -87,7 +252,7 @@ fn format_6_bytes(world: &World, draws: u32) -> Vec<u8> {
     for _ in 0..draws {
         old.crt_rng.next_u15();
     }
-    let mut encoded = old.encode();
+    let mut encoded = format_7_bytes(&old);
     assert_eq!(encoded.split_off(encoded.len() - 2), [0; 2]);
     encoded
 }
@@ -161,7 +326,10 @@ fn digest(bytes: &[u8]) -> String {
 /// start of the resize, the two indicators matched as well. The capture
 /// has nothing to compare `World`'s other fields with.
 ///
-/// The digest is of our own state, as built here. Snapshot format 7 added
+/// The digests are of our own state, as built here. Snapshot format 8
+/// added fields in the middle of the encoding; `format_7_bytes` writes the
+/// state without them, and every state in this file that was pinned under
+/// format 7 is checked against that digest too ([`pinned`]). Snapshot format 7 added
 /// the frame storage and the list of fires, and the indicators the lot
 /// starts with now draw from the C runtime stream; `format_6_bytes` says
 /// how the encoding is shown to be the state pinned under format 6
@@ -175,7 +343,8 @@ fn digest(bytes: &[u8]) -> String {
 /// bytes.
 #[test]
 fn the_goth_house_resize_creates_the_controllers() {
-    const PINNED: &str = "540a7a822c65b08918239a93d0accb9d46f26c5ab16400573e8d30e88f3cba90";
+    const PINNED: &str = "a1b9ee0fce4ac7efc57ff249f932ad0eee2d609e545a639b0f1bd62b7b27dbf4";
+    const PINNED_7: &str = "540a7a822c65b08918239a93d0accb9d46f26c5ab16400573e8d30e88f3cba90";
 
     const FORMAT_6: &str = "5da903b012eb85ced13111300ed5fd6f125ba083eb7517bac76e5c342eae2d91";
     const FORMAT_5: &str = "9e5cab3b2caf4e1915faf58b9a3ef5fe192495b44cfb09420b9396368947bd15";
@@ -197,7 +366,7 @@ fn the_goth_house_resize_creates_the_controllers() {
         assert!(object.stack.len() >= 2, "object {id}");
         assert_eq!(object.flags() & 1, 1, "object {id}");
     }
-    assert_eq!(world.hash_hex(), PINNED);
+    pinned(&world, PINNED, PINNED_7);
     assert_eq!(format_6(&world, 0), FORMAT_6);
     assert_eq!(format_5(&world, 0), FORMAT_5);
     let encoded = format_6_bytes(&world, 0);
@@ -238,7 +407,8 @@ fn the_goth_house_resize_creates_the_controllers() {
 /// are all empty here.
 #[test]
 fn the_goth_house_clear_removes_every_object() {
-    const PINNED: &str = "1c0600774ae59cb72770086809c94d54b65fd747e09fb5ddf79b7b62b675e8a6";
+    const PINNED: &str = "5893437d45ac7683f04682ff556b863ba1789440ba5f600ea6910505cba469cc";
+    const PINNED_7: &str = "1c0600774ae59cb72770086809c94d54b65fd747e09fb5ddf79b7b62b675e8a6";
 
     const FORMAT_6: &str = "4f0b7439a1379c998d885eb10f2a12c0cb887c29d08524a6600d80da7c7486e7";
     const FORMAT_5: &str = "b97f264759c4f6be2b3a356bb7a55bbdb662f2b0fdd80f1e87f613522362cae0";
@@ -265,7 +435,7 @@ fn the_goth_house_clear_removes_every_object() {
         );
         assert_eq!((world.size, world.ticks), (52, 88444));
         assert!(world.instances.values().all(Vec::is_empty));
-        assert_eq!(world.hash_hex(), PINNED);
+        pinned(world, PINNED, PINNED_7);
         assert_eq!(format_6(world, 0), FORMAT_6);
         assert_eq!(format_5(world, 0), FORMAT_5);
         let encoded = format_6_bytes(world, 0);
@@ -274,7 +444,7 @@ fn the_goth_house_clear_removes_every_object() {
         // The original clears the lot again before it reads the saved
         // objects. On an empty lot that does nothing.
         assert_eq!(interpreter.clear(world), Ok(vec![]));
-        assert_eq!(world.hash_hex(), PINNED);
+        pinned(world, PINNED, PINNED_7);
     });
 }
 
@@ -470,7 +640,8 @@ fn the_goth_house_type_table_marks_the_changed_types() {
 /// digest pinned under format 5.
 #[test]
 fn the_goth_house_objects_are_constructed_and_read() {
-    const PINNED: &str = "d6b094744f72f7bd3dfbc76c30e500dbaff86350487bf6306d2c2c2c5f4467d3";
+    const PINNED: &str = "8f448a4a8e3c7fbd295b5fe61808b392e6c16692d81efb65df9b5fbf3a7da267";
+    const PINNED_7: &str = "d6b094744f72f7bd3dfbc76c30e500dbaff86350487bf6306d2c2c2c5f4467d3";
 
     const FORMAT_6: &str = "bda1f8eee5deabee63609ec1a2a8ea1e027161c7390b19a830bf7ed4c346c81e";
     const FORMAT_5: &str = "1034c34e3d93c040f31b0a56f9593e7e0ec7d8d319706b0afb591e8ac6f1531f";
@@ -533,7 +704,7 @@ fn the_goth_house_objects_are_constructed_and_read() {
                 (world.global_rng, world.lot_rng),
                 (before.global_rng, before.lot_rng)
             );
-            assert_eq!(world.hash_hex(), PINNED);
+            pinned(world, PINNED, PINNED_7);
             assert_eq!(format_6(world, DRAWS_6), FORMAT_6);
             assert_eq!(format_5(&with_zeroed_outer_walls(world), DRAWS_6), FORMAT_5);
         },
@@ -590,7 +761,8 @@ fn the_goth_house_objects_are_constructed_and_read() {
 /// 52 tiles and the four bytes of format 6's new field.
 #[test]
 fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
-    const PINNED: &str = "3724e0d6e307e13a398a6a8c47e7523e1fe4f7f83cb575c4ec6cb4a6aceabdd1";
+    const PINNED: &str = "91d8845e2a929e3c9fd7b4b26f691b56ddf26e444d1f38e83ad1a27b6bf1b140";
+    const PINNED_7: &str = "3724e0d6e307e13a398a6a8c47e7523e1fe4f7f83cb575c4ec6cb4a6aceabdd1";
 
     const FORMAT_6: &str = "2c000ad6962e840ece561db6b3a6ff572d8dd83815680c67a2a7eb861d3698b1";
     const FORMAT_5: &str = "d014a3ce407d420fc6b69248f9e23282b0fdc348bac79afc5670629b60ed46b1";
@@ -668,7 +840,7 @@ fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
             assert_eq!(outside.len(), 8);
             assert!(outside.iter().all(|r| r.tile[0] >= 52 || r.tile[1] >= 52));
             assert_eq!(world.objects.len(), 382);
-            assert_eq!(world.hash_hex(), PINNED);
+            pinned(world, PINNED, PINNED_7);
             assert_eq!(format_6(world, DRAWS_6), FORMAT_6);
             assert_eq!(format_5(&with_zeroed_outer_walls(world), DRAWS_6), FORMAT_5);
         },
@@ -708,9 +880,16 @@ fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
 /// for the test above are equal for all 382 objects, the last result
 /// included, and so are the globals, the random streams and the arrays.
 ///
-/// *The room count.* Equal for all 11 rooms: the half tiles, the covered
-/// half tiles, the walls that can take a covering and those that have
-/// one. Equal: global 27, the indoor area, which is 204.
+/// *The room count.* Equal for all 11 rooms, at the entry of step 11:
+/// the twelve counts (half tiles, covered half tiles, objects, window
+/// light, lamp light, the sum of data word 39, impact, good things, the
+/// two categories, walls and covered walls), the lights and the people,
+/// the score and the light bit for bit, whether the room is outdoors and
+/// whether it is a pool, and the mark that it waits. Equal: the levels
+/// that wait (none), the lot's outdoor sum and outdoor score bit for bit,
+/// and global 27, the indoor area, which is 204. The trace has no stop
+/// between the two room updates the original makes here, so the state
+/// after the first of them is not compared.
 ///
 /// *Steps 11 and 12.* Equal after each: the same fields, the removal
 /// queue (empty), and after step 12 the globals (9 becomes 5 and 13
@@ -726,9 +905,8 @@ fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
 /// split tile has; the room of an object on a split tile, which this
 /// house has none of; room fields 2 and 3 as scripts read them, which no
 /// tree reads here; and global 10 being written, since the house saved
-/// its own number there. Not modeled, so
-/// not compared: what objects add to a room's count, the rooms' light and
-/// scores, and which rooms have people in them.
+/// its own number there. Not modeled, so not compared: which rooms know
+/// they have people in them, and the lighting of the tiles.
 ///
 /// Snapshot format 7 changed the encoding again; `format_6_bytes` says how
 /// this state is shown to be the one pinned under format 6.
@@ -736,8 +914,10 @@ fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
 /// The digests are of our own state, as built here.
 #[test]
 fn the_goth_house_gets_its_rooms_and_its_household() {
-    const COUNTED: &str = "c4c4bba18e2f07090e33ce5c823692498d3cfeac2b50d0652d2315f7ed040829";
-    const SELECTED: &str = "09fcefc61a7bc468bee455e8e7e6ce0e551e9847bf6c6d67b3d773022140609e";
+    const COUNTED: &str = "c1c8a7ad538c67dd4f5dd23ce46e45f95992a05fcb2b7dba5c58d81ca8cb75c2";
+    const COUNTED_7: &str = "c4c4bba18e2f07090e33ce5c823692498d3cfeac2b50d0652d2315f7ed040829";
+    const SELECTED: &str = "3199667febb0a83088ee468c3f5d6713a037e03d0961547fdf41e7a20719b0a5";
+    const SELECTED_7: &str = "09fcefc61a7bc468bee455e8e7e6ce0e551e9847bf6c6d67b3d773022140609e";
     const COUNTED_6: &str = "d994b4eb25b6bb9b8ec8202bb1ede1f33ae40513f9cc2745298d76675ab6d476";
     const SELECTED_6: &str = "6a9a7290da69b6e376c09a57295217df82ef28a8a7259eff97420d5c7c1e649d";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
@@ -805,16 +985,38 @@ fn the_goth_house_gets_its_rooms_and_its_household() {
         // ... and what they left in the frame storage.
         expected.frame_storage = world.frame_storage.clone();
         assert_eq!(world.encode(), expected.encode());
-        // The room count.
+        // The room count. The first update gives every room light, so
+        // every room is announced as changed and marked again. The end of
+        // the house read marks them all and counts what waits, which
+        // changes no light.
         let asked = world.clone();
-        assert_eq!(world.update_rooms().unwrap(), ids);
+        // The global file's table gives the constants the original's code
+        // falls back to.
+        let tuning = interpreter.program.room_tuning();
+        assert_eq!(tuning, sims_sim::rooms::Tuning::default());
+        let table = &interpreter.program.libraries[&interpreter.program.global].tuning;
+        assert!(table[&3].get("area clip to score").is_some());
+        assert_eq!(interpreter.update_rooms(world, 0).unwrap(), ids);
         assert_eq!(world.globals[27], 204);
+        assert!(world.rooms.rooms.values().all(|room| room.dirty));
+        assert_eq!(world.rooms.pending, 0);
+        let first = world.rooms.clone();
+        world.mark_all_rooms();
+        assert_eq!(interpreter.update_pending_rooms(world).unwrap(), ids);
         assert!(world.rooms.rooms.values().all(|room| !room.dirty));
+        for (id, room) in &mut world.rooms.rooms.clone() {
+            // The second count is the first again, but for the marks.
+            room.dirty = true;
+            assert_eq!(*room, first.rooms[id]);
+            // By day every room is fully lit: the outdoor rooms by the
+            // daylight and the indoor ones through their windows.
+            assert_eq!(room.light, sims_core::F32::from_f32(1.0));
+        }
         let mut expected = asked.clone();
         expected.globals[27] = 204;
         expected.rooms = world.rooms.clone();
         assert_eq!(world.encode(), expected.encode());
-        assert_eq!(world.hash_hex(), COUNTED);
+        pinned(world, COUNTED, COUNTED_7);
         assert_eq!(format_6(world, DRAWS_6), COUNTED_6);
         // Step 11.
         assert_eq!(world.discard_removals(), [42, 44, 278, 280]);
@@ -833,7 +1035,7 @@ fn the_goth_house_gets_its_rooms_and_its_household() {
             values: [0; 6],
         });
         assert_eq!(world.encode(), expected.encode());
-        assert_eq!(world.hash_hex(), SELECTED);
+        pinned(world, SELECTED, SELECTED_7);
         assert_eq!(format_6(world, DRAWS_6), SELECTED_6);
     });
 }
@@ -858,7 +1060,9 @@ fn selected(root: &std::path::Path, then: impl FnOnce(&Interpreter, &mut World, 
         world.repair_grid().unwrap();
         world.rebuild_rooms().unwrap();
         interpreter.assign_rooms(world).unwrap();
-        world.update_rooms().unwrap();
+        interpreter.update_rooms(world, 0).unwrap();
+        world.mark_all_rooms();
+        interpreter.update_pending_rooms(world).unwrap();
         world.discard_removals();
         let (id, family) = neighborhood.family_in(5).unwrap();
         let magic = family.magic_history().unwrap();
@@ -869,9 +1073,11 @@ fn selected(root: &std::path::Path, then: impl FnOnce(&Interpreter, &mut World, 
     });
 }
 
-/// Load steps 13 to 16 on the Goth house: the original visits all 382
-/// objects in registration order, asks for the indicators, finishes the
-/// household selection and announces the house. All of it runs here.
+/// Load steps 13 to 15 on the Goth house, and the first half of step 16:
+/// the original visits all 382 objects in registration order, asks for
+/// the indicators, finishes the household selection and, when the house
+/// is announced, asks for the indicators again. All of it runs here. The
+/// test below takes the load from there to its end.
 ///
 /// A trace of the original loading this house, taken by the old
 /// prototype's harness, was compared with this run outside the
@@ -931,8 +1137,10 @@ fn selected(root: &std::path::Path, then: impl FnOnce(&Interpreter, &mut World, 
 /// state after visit 201, pinned when the step stopped there.
 #[test]
 fn the_goth_house_objects_are_all_visited() {
-    const VISIT_201: &str = "13ae49d59cfa5cc946e9b9522b2e7e8634ec060af08d3df31eadd566057d5717";
-    const VISITED: &str = "3986e39715b51dfe7d82f23d7644fc654fe1634c6e1b3e88da7aa891f0e5d73c";
+    const VISIT_201: &str = "fe7546148470609e9fd73a30dd2b0a79d306d1556e0bbb3b536098adf42f27c8";
+    const VISIT_201_7: &str = "13ae49d59cfa5cc946e9b9522b2e7e8634ec060af08d3df31eadd566057d5717";
+    const VISITED: &str = "2374a83ff7cad09db1a9252328948ba39d798f1ead256c6239d4c9429a295de8";
+    const VISITED_7: &str = "3986e39715b51dfe7d82f23d7644fc654fe1634c6e1b3e88da7aa891f0e5d73c";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -951,7 +1159,7 @@ fn the_goth_house_objects_are_all_visited() {
         for &id in &before.order[..201] {
             interpreter.visit(&mut early, id, people).unwrap();
         }
-        assert_eq!(early.hash_hex(), VISIT_201);
+        pinned(&early, VISIT_201, VISIT_201_7);
         asked.borrow_mut().clear();
         let done = interpreter.visit_objects(world, people);
         assert_eq!(done.stopped, None);
@@ -1013,11 +1221,146 @@ fn the_goth_house_objects_are_all_visited() {
         // Nothing here advances the clock or touches the lot's stream.
         assert_eq!((world.ticks, world.lot_rng), (before.ticks, before.lot_rng));
         assert_ne!(world.global_rng, before.global_rng);
-        assert_eq!(world.hash_hex(), VISITED);
-        // Steps 14 to 16 change nothing on this lot.
+        pinned(world, VISITED, VISITED_7);
+        // Steps 14 and 15 change nothing on this lot, and neither does
+        // asking for the indicators again in step 16.
         assert_eq!(interpreter.ensure_indicators(world), Ok(None));
         world.finish_selection(flags).unwrap();
         assert_eq!(interpreter.ensure_indicators(world), Ok(None));
-        assert_eq!(world.hash_hex(), VISITED);
+        pinned(world, VISITED, VISITED_7);
+    });
+}
+
+/// Load steps 16 to 22 on the Goth house: the house is announced, the
+/// funds are set again, a Sim is selected, the game goes to live mode,
+/// the waiting rooms are counted and the interface's wait check runs.
+/// The state this ends in is the one the original's first tick starts
+/// from.
+///
+/// The trace of the original loading this house (see the test above) was
+/// compared with this run outside the repository; the trace is private.
+/// It stops at the entry and the return of the funds setter (0x46d8dc),
+/// of the selection (0x445449, twice), of the mode change (0x4cea5d,
+/// twice) and of the lot's part in it (0x416534), of the wait check
+/// (0x4764fe), and at the entry of the first tick (0x46d345). It holds
+/// every call of "run this object's function" (0x422d46) between them.
+///
+/// Equal to the trace, at the stop after each of our steps (the entry of
+/// the funds setter, the return of the first selection, the return of
+/// 0x416534, the entry of the second selection, the entry of the wait
+/// check, and the entry of the first tick): everything the test above
+/// lists for the end of step 13, and also each object's selected mark
+/// and, for all 11 rooms, everything the rooms test lists for the room
+/// count, with the levels that wait and the lot's outdoor sum and score.
+/// Equal: the four callbacks asked while the Sim is selected, in order,
+/// and that no other callback is asked between the end of step 13 and
+/// the first tick. At the first tick the scheduler cursor is 0 in both.
+///
+/// What the trace cannot show, because the Goth house has only one case
+/// of it: which Sim is selected when the family's first member is not on
+/// the lot or may not be selected; a Sim with a date; and a lot whose
+/// statistics set other bits of global 37. The parts of the statistics
+/// pass that are not ported (global 22, the object and architecture
+/// values) hold their saved values in the trace too, so it does not show
+/// them being written. Six type attribute words belong to the game that
+/// was running, and were equal once copied from the trace's start.
+///
+/// The digest is of our own state, as built here.
+#[test]
+fn the_goth_house_load_ends_where_the_first_tick_starts() {
+    const BASELINE: &str = "13dd5b8ee042ed292266090ef1b7b650b2a6576531279c27db9af23e9c108648";
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = std::path::Path::new(&root);
+    let install = Install::detect(root).unwrap();
+    let neighborhood = Neighborhood::open(&install.file("UserData").unwrap()).unwrap();
+    let family = neighborhood.family_in(5).unwrap().1.clone();
+    selected(root, |interpreter, world, people| {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut interpreter = *interpreter;
+        assert_eq!(interpreter.visit_objects(world, people).stopped, None);
+        interpreter.ensure_indicators(world).unwrap();
+        world.finish_selection(family.flags).unwrap();
+        // Step 16. Nobody is selected, so the saved selection in global 3
+        // is cleared. Nothing else changes.
+        let mut expected = world.clone();
+        assert_eq!(world.globals[3], 21);
+        assert_eq!(sims_vm::selected(world), None);
+        assert_eq!(interpreter.announce_house(world), Ok(None));
+        expected.globals[3] = 0;
+        assert_eq!(world.encode(), expected.encode());
+        // Steps 17 and 18. The funds are what they were. The family's
+        // first member is person 21, who gets the mark and the first
+        // indicator.
+        interpreter.asked = Some(&asked);
+        let sim = interpreter.select_resident(world, family.budget, &family.members);
+        assert_eq!(sim, Ok(Some(21)));
+        assert_eq!(sims_vm::selected(world), Some(21));
+        let calls: Vec<(u16, usize)> = asked
+            .borrow()
+            .iter()
+            .map(|call| (call.object, call.function))
+            .collect();
+        assert_eq!(calls, [(383, 10), (383, 10), (383, 9), (21, 9)]);
+        let before = expected.clone();
+        expected.globals[3] = 21;
+        expected.objects.get_mut(&21).unwrap().selected = true;
+        expected.instances.insert(world.objects[&21].guid, vec![21]);
+        // The indicator sits in the Sim's slot 1, at the Sim's place and
+        // in its room.
+        let indicator = expected.objects.get_mut(&383).unwrap();
+        (indicator.data[2], indicator.data[3]) = (21, 1);
+        (indicator.data[14], indicator.data[26]) = (2, 21);
+        indicator.data[29] = before.objects[&21].data[29];
+        indicator.position = before.objects[&21].position;
+        indicator.footprint = world.objects[&383].footprint;
+        expected.objects.get_mut(&21).unwrap().slots[2].object = 383;
+        expected.frame_storage = world.frame_storage.clone();
+        assert_eq!(world.encode(), expected.encode());
+        asked.borrow_mut().clear();
+        // Step 19. Every room waits, global 37 says what the lot has,
+        // and the mode is live.
+        assert_eq!((world.globals[19], world.globals[37]), (3, 0));
+        interpreter.go_live(world).unwrap();
+        (expected.globals[19], expected.globals[37]) = (0, 1);
+        for room in expected.rooms.rooms.values_mut() {
+            room.dirty = true;
+        }
+        expected.rooms.pending = 3;
+        assert_eq!(world.encode(), expected.encode());
+        // Steps 21 and 22. All 11 rooms are counted. The six indoor rooms
+        // have lost their window light since the count of step 10a (the
+        // visits reset the windows), so their light changed and they are
+        // marked again; no level waits.
+        assert_eq!(world.globals[12], 2009);
+        let counted = interpreter.before_frame(world).unwrap();
+        assert_eq!(counted.len(), 11);
+        let waiting: Vec<i16> = world
+            .rooms
+            .rooms
+            .iter()
+            .filter(|(_, room)| room.dirty)
+            .map(|(&id, _)| id)
+            .collect();
+        assert_eq!(waiting, [1, 2, 3, 4, 1025, 1026]);
+        assert_eq!(world.rooms.pending, 0);
+        for id in waiting {
+            let (now, then) = (&world.rooms.rooms[&id], &expected.rooms.rooms[&id]);
+            assert_eq!((now.window_light, then.window_light > 0), (0, true));
+            assert_ne!(now.light, then.light);
+        }
+        expected.rooms = world.rooms.clone();
+        expected.globals[12] = 0;
+        assert_eq!(world.encode(), expected.encode());
+        // No tree ran in any of this, the clock stands and no random
+        // stream moved.
+        assert_eq!(asked.borrow().len(), 0);
+        assert_eq!((world.ticks, world.scheduler_cursor), (88444, 0));
+        assert_eq!(world.global_rng, before.global_rng);
+        assert_eq!(world.lot_rng, before.lot_rng);
+        assert_eq!(world.crt_rng, before.crt_rng);
+        assert_eq!(world.hash_hex(), BASELINE);
     });
 }

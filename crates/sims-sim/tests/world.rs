@@ -1,5 +1,5 @@
 use sims_content::{Catalog, House, Index, Install, Neighborhood};
-use sims_core::{CrtRng, GameRng};
+use sims_core::{CrtRng, F32, GameRng};
 use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
 use sims_sim::rooms::{Half, Room, Rooms};
@@ -41,6 +41,7 @@ fn object(id: u16, guid: u32) -> Object {
         registry_word: Some(0x0002_0005),
         last_result: true,
         removal_skips_resets: false,
+        selected: id == 5,
     }
 }
 
@@ -114,8 +115,24 @@ fn world() -> World {
                     covered_half_tiles: 2,
                     walls: 3,
                     covered_walls: 1,
+                    objects: 7,
+                    window_light: 50,
+                    lamp_light: 25,
+                    word_39: -2,
+                    impact: -10,
+                    good: 6,
+                    category_4: 1,
+                    category_5_to_7: 2,
+                    lights: 3,
+                    people: 1,
+                    score: F32::from_f32(-12.5),
+                    light: F32::from_f32(0.25),
+                    pool: true,
                 },
             )]),
+            pending: 2,
+            outdoor_sum: F32::from_f32(3.0),
+            outdoor_score: F32::from_f32(1.0),
         },
         fires: vec![7],
         frame_storage: BTreeMap::from([(
@@ -135,7 +152,7 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "e5eef2ff7049b4a63eaaccd0f2fb732bca6ad86fbd39006c538004bd19e013c2";
+const PINNED: &str = "c30d0c3a346a5580c68f56b2e3101730b34a69357685be38a071c7b8f47250e0";
 
 #[test]
 fn encoding_round_trips_bit_for_bit() {
@@ -176,6 +193,15 @@ fn any_field_change_changes_the_hash() {
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.rooms.rooms.get_mut(&1).unwrap().dirty = false;
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.rooms.rooms.get_mut(&1).unwrap().light = F32::ZERO;
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.rooms.pending = 0;
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.objects.get_mut(&5).unwrap().selected ^= true;
     assert_ne!(changed.hash(), base);
 }
 

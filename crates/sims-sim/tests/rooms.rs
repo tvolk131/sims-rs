@@ -1,9 +1,11 @@
 //! The lot's rooms on made-up lots: the partition, the tile flags, the
-//! room of a position, and the room count. No game data.
+//! room of a position, and the room update with its light and scores. No
+//! game data.
 
+use sims_core::F32;
 use sims_formats::lot::Array;
-use sims_sim::World;
-use sims_sim::rooms::{Half, NO_ROOM, RoomError, UNSEEN};
+use sims_sim::rooms::{Half, NO_ROOM, Room, RoomError, Standing, Tuning, UNSEEN};
+use sims_sim::{Object, World};
 
 const WEST: u8 = 1;
 const NORTH: u8 = 2;
@@ -35,6 +37,12 @@ fn lot(size: i16) -> World {
         world.arrays.insert(flags, array(1, 0));
     }
     world
+}
+
+/// The room update for every room of a lot nothing stands on, with the
+/// original's default constants.
+fn count(world: &mut World) -> Result<Vec<i16>, RoomError> {
+    world.update_rooms(&Tuning::default(), 0, &mut |_, _| Ok(Vec::new()))
 }
 
 fn cell(world: &mut World, array: u16, x: usize, y: usize) -> &mut [u8] {
@@ -121,16 +129,22 @@ fn an_empty_lot_is_one_outdoor_room_on_each_level() {
     assert_eq!(room.half_tiles, 0);
     // Counting: two half tiles for each listed tile, and no indoor area.
     world.globals = vec![7; 64];
-    assert_eq!(world.update_rooms(), Ok(vec![0, 1024]));
+    assert_eq!(count(&mut world), Ok(vec![0, 1024]));
     let room = &world.rooms.rooms[&0];
-    assert!(!room.dirty);
     assert_eq!(
         (room.half_tiles, room.covered_half_tiles, room.walls),
         (14, 0, 0)
     );
     assert_eq!(world.globals[27], 0);
+    // A new room has no light. The count gave these two the daylight, so
+    // both were announced as changed and are marked again.
+    assert_eq!(room.light, F32::from_f32(1.0));
+    assert!(room.dirty);
+    // The second count changes no light and leaves them counted.
+    assert_eq!(count(&mut world), Ok(vec![0, 1024]));
+    assert!(world.rooms.rooms.values().all(|room| !room.dirty));
     // A counted room is not counted again.
-    assert_eq!(world.update_rooms(), Ok(vec![]));
+    assert_eq!(count(&mut world), Ok(vec![]));
 }
 
 #[test]
@@ -167,7 +181,7 @@ fn walls_close_off_an_indoor_room() {
     assert!(!world.rooms.rooms[&1].outdoors);
     assert!(world.rooms.rooms[&0].outdoors);
     world.globals = vec![0; 64];
-    world.update_rooms().unwrap();
+    count(&mut world).unwrap();
     let room = &world.rooms.rooms[&1];
     // Seven listed tiles. The floored tile and the covered wall are each
     // listed twice, and so are three of the four corners' two walls.
@@ -194,7 +208,7 @@ fn a_fence_divides_rooms_but_does_not_enclose() {
     assert_eq!(flags(&world, 1, 2, 2), 7);
     assert!(world.rooms.rooms[&1].outdoors);
     world.globals = vec![0; 64];
-    world.update_rooms().unwrap();
+    count(&mut world).unwrap();
     let room = &world.rooms.rooms[&1];
     assert_eq!((room.half_tiles, room.walls), (14, 0));
     assert_eq!(world.globals[27], 0);
@@ -237,7 +251,7 @@ fn a_diagonal_wall_splits_its_tile_between_two_rooms() {
     // The flood for the outside does not enter the tile.
     assert_eq!(flags(&world, 1, 3, 3), 1);
     world.globals = vec![0; 64];
-    world.update_rooms().unwrap();
+    count(&mut world).unwrap();
     // Indoors the split tile counts one half tile and its diagonal wall.
     let room = &world.rooms.rooms[&1];
     assert_eq!((room.half_tiles, room.walls), (11, 11));
@@ -250,7 +264,7 @@ fn a_diagonal_wall_splits_its_tile_between_two_rooms() {
     // The half floor of a split tile is the wall cell's first style word.
     word(&mut world, 2, 3, 3, 0, 4);
     world.rebuild_rooms().unwrap();
-    world.update_rooms().unwrap();
+    count(&mut world).unwrap();
     assert_eq!(world.rooms.rooms[&1].covered_half_tiles, 1);
 }
 
@@ -389,7 +403,7 @@ fn lots_the_port_does_not_cover_are_refused_and_left_alone() {
     assert_eq!(world.rebuild_rooms(), Ok(()));
     // Counting needs the globals.
     world.globals = vec![0; 32];
-    assert_eq!(world.update_rooms(), Err(RoomError::NoContext));
+    assert_eq!(count(&mut world), Err(RoomError::NoContext));
 }
 
 #[test]
@@ -401,4 +415,352 @@ fn a_lot_without_a_pool_array_has_no_pool_edges() {
         world.rooms.rooms.keys().copied().collect::<Vec<_>>(),
         [0, 1024]
     );
+}
+
+/// A lot of 6 tiles with one enclosed room of four tiles, room 1, counted
+/// until nothing waits.
+fn counted_box() -> World {
+    let mut world = lot(6);
+    boxed(&mut world, 2);
+    world.rebuild_rooms().unwrap();
+    world.globals = vec![0; 64];
+    count(&mut world).unwrap();
+    count(&mut world).unwrap();
+    assert!(world.rooms.rooms.values().all(|room| !room.dirty));
+    world
+}
+
+#[test]
+fn marking_a_room_makes_its_level_wait() {
+    let mut world = counted_box();
+    assert_eq!(world.rooms.pending, 0);
+    world.mark_room(1024);
+    assert_eq!(world.rooms.pending, 2);
+    assert!(world.rooms.rooms[&1024].dirty && !world.rooms.rooms[&1].dirty);
+    world.mark_room(1);
+    assert_eq!(world.rooms.pending, 3);
+    // A word that names no room marks nothing.
+    world.mark_room(77);
+    world.mark_room(NO_ROOM);
+    assert_eq!(world.rooms.pending, 3);
+    // Counting one level takes that level's rooms and its bit only.
+    let nothing = &mut |_: &mut World, _| Ok(Vec::new());
+    let tuning = Tuning::default();
+    assert_eq!(world.update_rooms(&tuning, 2, nothing), Ok(vec![1024]));
+    assert_eq!(world.rooms.pending, 1);
+    assert!(world.rooms.rooms[&1].dirty);
+    // The update of what waits goes by the waiting levels.
+    assert_eq!(world.update_pending_rooms(&tuning, nothing), Ok(vec![1]));
+    assert_eq!(world.rooms.pending, 0);
+    assert_eq!(world.update_pending_rooms(&tuning, nothing), Ok(vec![]));
+    // A room that is marked while no level waits is not counted by it.
+    world.rooms.rooms.get_mut(&1).unwrap().dirty = true;
+    assert_eq!(world.update_pending_rooms(&tuning, nothing), Ok(vec![]));
+    // Marking every room makes both levels wait.
+    world.mark_all_rooms();
+    assert_eq!(world.rooms.pending, 3);
+    assert!(world.rooms.rooms.values().all(|room| room.dirty));
+    assert_eq!(
+        world.update_pending_rooms(&tuning, nothing),
+        Ok(vec![0, 1, 1024])
+    );
+    assert_eq!(
+        world.update_rooms(&tuning, 3, nothing),
+        Err(RoomError::Level(3))
+    );
+}
+
+/// An object with nothing set but its ID.
+fn thing(id: u16) -> Object {
+    Object {
+        id,
+        guid: 1,
+        footprint: [0; 4],
+        position: [0; 3],
+        unknown_short: 0,
+        attributes: Vec::new(),
+        temps: vec![0; 8],
+        data: vec![0; 72],
+        obsolete_word: 0,
+        stack_capacity_bytes: 0,
+        stack: Vec::new(),
+        relationship_flag: -1,
+        relationships: Vec::new(),
+        slots: Vec::new(),
+        dynamic_sprites: Vec::new(),
+        multipart: None,
+        portal: None,
+        person: None,
+        registry_word: None,
+        last_result: false,
+        removal_skips_resets: false,
+        selected: false,
+    }
+}
+
+#[test]
+fn the_objects_on_a_rooms_tiles_are_counted() {
+    let mut world = counted_box();
+    // (data word, value) pairs for each object, and its type.
+    type Thing = (u16, i16, &'static [(usize, i16)]);
+    let things: [Thing; 9] = [
+        // A lamp: a light source with 40 of light and 5 of impact.
+        (1, 4, &[(40, 0x400), (51, 40), (7, 5), (39, 3)]),
+        // A window: its light is window light, and it is no light.
+        (2, 8, &[(40, 0x400), (51, 150)]),
+        // A light source that is off the lot adds no light.
+        (3, 4, &[(40, 0x400), (51, 99)]),
+        // A person. Trash: negative impact, so not a good thing.
+        (4, 2, &[]),
+        (5, 4, &[(7, -30)]),
+        // Categories 4 and 5 to 7.
+        (6, 4, &[(59, 4)]),
+        (7, 4, &[(59, 6)]),
+        // Skipped: data word 34 set, or a negative room.
+        (8, 4, &[(34, 1), (7, 100)]),
+        (9, 4, &[(29, -5), (7, 100)]),
+    ];
+    for (id, _, words) in things {
+        let mut object = thing(id);
+        for &(index, value) in words {
+            object.data[index] = value;
+        }
+        world.objects.insert(id, object);
+    }
+    // Everything stands on tile 2, 2 of level 1, which the room lists
+    // twice, and on tile 0, 0 outdoors.
+    let mut standing = |_: &mut World, tile: [u8; 3]| {
+        Ok(match tile {
+            [2, 2, 1] | [0, 0, 1] => things
+                .iter()
+                .map(|&(id, kind, _)| Standing {
+                    id,
+                    kind,
+                    on_lot: id != 3,
+                })
+                .collect(),
+            _ => Vec::new(),
+        })
+    };
+    world.mark_all_rooms();
+    let tuning = Tuning::default();
+    world.update_rooms(&tuning, 0, &mut standing).unwrap();
+    let room = &world.rooms.rooms[&1];
+    // Seven objects count, twice each.
+    assert_eq!(room.objects, 14);
+    assert_eq!((room.lights, room.people), (2, 2));
+    assert_eq!((room.window_light, room.lamp_light), (300, 80));
+    assert_eq!((room.category_4, room.category_5_to_7), (2, 2));
+    assert_eq!(room.word_39, 6);
+    assert_eq!(room.impact, 2 * (5 - 30));
+    assert_eq!(room.good, 12);
+    // Light: lamp 80 hundredths over 7 tiles times 30, plus the window
+    // light, which is no more than the daylight: 1 by day. Above 0.99 is 1.
+    assert_eq!(room.light, F32::from_f32(1.0));
+    // Outdoors only what takes away adds to the impact, and the score is
+    // the good things plus twice the impact. The light is the daylight.
+    // The outdoor room lists the corner tile three times.
+    let outside = &world.rooms.rooms[&0];
+    let times = outside.tiles.iter().filter(|t| **t == [0, 0, 1]).count();
+    assert_eq!(times, 3);
+    assert_eq!(
+        (outside.objects, outside.impact, outside.good),
+        (21, -90, 18)
+    );
+    assert_eq!(outside.score, F32::from_f32(18.0 - 180.0));
+    assert_eq!(outside.light, F32::from_f32(1.0));
+    // The lot's outdoor sum adds the upper level's empty room, and the
+    // outdoor score is a third of it, within -100 and 100.
+    assert_eq!(world.rooms.outdoor_sum, F32::from_f32(-162.0));
+    assert_eq!(world.rooms.outdoor_score, F32::from_f32(-54.0));
+    // An object the lot lacks stops the update.
+    let mut ghost = |_: &mut World, tile: [u8; 3]| {
+        Ok(match tile {
+            [2, 2, 1] => vec![Standing {
+                id: 77,
+                kind: 4,
+                on_lot: true,
+            }],
+            _ => Vec::new(),
+        })
+    };
+    world.mark_all_rooms();
+    assert_eq!(
+        world.update_rooms(&tuning, 0, &mut ghost),
+        Err(RoomError::Standing(77))
+    );
+}
+
+#[test]
+fn a_rooms_light_follows_the_time_of_day_and_its_change_marks_the_room() {
+    let mut world = counted_box();
+    let mut window = thing(1);
+    (window.data[40], window.data[51]) = (0x400, 10);
+    world.objects.insert(1, window);
+    let mut standing = |_: &mut World, tile: [u8; 3]| {
+        Ok(match tile {
+            [3, 2, 1] => vec![Standing {
+                id: 1,
+                kind: 8,
+                on_lot: true,
+            }],
+            _ => Vec::new(),
+        })
+    };
+    let tuning = Tuning::default();
+    let mut light = |world: &mut World, period: i16| {
+        world.globals[4] = period;
+        world.mark_all_rooms();
+        world.update_rooms(&tuning, 0, &mut standing).unwrap();
+        let room = &world.rooms.rooms[&1];
+        (room.light, room.dirty, world.rooms.pending)
+    };
+    // Tile 3, 2 is listed once: 10 hundredths over 7 tiles times 30, by
+    // day. The room had no light, so it is marked again, but its level
+    // does not wait: the update clears that last.
+    let by_day = F32::from_bits(0x3edb_6db6);
+    assert_eq!(light(&mut world, 0), (by_day, true, 0));
+    // The same light again leaves the room counted.
+    assert_eq!(light(&mut world, 0), (by_day, false, 0));
+    // Half the daylight at dawn and dusk, none at night.
+    let at_dawn = F32::from_bits(0x3e5b_6db6);
+    assert_eq!(light(&mut world, 1), (at_dawn, true, 0));
+    assert_eq!(light(&mut world, 3), (at_dawn, false, 0));
+    assert_eq!(light(&mut world, 2), (F32::ZERO, true, 0));
+    // The outdoor rooms take the daylight itself, and the lot's outdoor
+    // score the bonus of the time of day: -50 at night, -20 at dusk.
+    assert_eq!(world.rooms.rooms[&0].light, F32::ZERO);
+    assert_eq!(world.rooms.outdoor_score, F32::from_f32(-50.0));
+    light(&mut world, 3);
+    assert_eq!(world.rooms.rooms[&0].light, F32::from_f32(0.5));
+    assert_eq!(world.rooms.outdoor_score, F32::from_f32(-20.0));
+}
+
+#[test]
+fn a_rooms_score_is_rounded_after_every_operation() {
+    let tuning = Tuning::default();
+    let day = Tuning::daylight(0);
+    // 13 tiles, every floor and wall covered, one point of impact, and
+    // enough window light for a light of 1. The parts are 0 for the
+    // walls, 0 for the floor, 10 / 13 for the impact, 20 for the light
+    // and -17 for the area. Adding 10 / 13 to 20 rounds at the size of
+    // 20, which leaves the sum four units in the last place below the
+    // sum rounded once.
+    let room = Room {
+        half_tiles: 26,
+        covered_half_tiles: 26,
+        walls: 10,
+        covered_walls: 10,
+        impact: 1,
+        window_light: 1000,
+        ..Room::default()
+    };
+    let (light, score) = tuning.score(&room, day);
+    assert_eq!(light, F32::from_f32(1.0));
+    assert_eq!(score, F32::from_bits(SCORE_13));
+    assert_ne!(score, F32::from_f32(3.0 + 10.0 / 13.0));
+    // Lamp light: 30 hundredths over 45 tiles times 30. No walls at all
+    // divides zero by zero, which is not a number and scores as -100.
+    let room = Room {
+        half_tiles: 91,
+        lamp_light: 30,
+        ..Room::default()
+    };
+    let (light, score) = tuning.score(&room, day);
+    assert_eq!(light, F32::from_bits(0x3e4c_cccc));
+    assert_eq!(score, F32::from_f32(-100.0));
+    // Light below 0.01 is none.
+    let room = Room {
+        half_tiles: 91,
+        lamp_light: 1,
+        ..Room::default()
+    };
+    assert_eq!(tuning.score(&room, day).0, F32::ZERO);
+    // A room of no tiles divides by zero: its light is not a number and
+    // reads as none.
+    assert_eq!(tuning.score(&Room::default(), day).0, F32::ZERO);
+    // The score stays within -100 and 100.
+    let room = Room {
+        half_tiles: 20,
+        covered_half_tiles: 20,
+        walls: 4,
+        covered_walls: 4,
+        impact: 1000,
+        ..Room::default()
+    };
+    assert_eq!(tuning.score(&room, day).1, F32::from_f32(100.0));
+    // The constants are read by name, and a slope is the difference of
+    // two of them.
+    let tuned = Tuning::from_lookup(|name| match name {
+        "light score for 1.0" => Some(50.0),
+        "outdoor object divisor" => Some(4.0),
+        _ => None,
+    });
+    assert_eq!(tuned.light_slope, F32::from_f32(70.0));
+    assert_eq!(tuned.outdoor_divisor, F32::from_f32(4.0));
+    assert_eq!(tuned.area_slope, tuning.area_slope);
+    assert_eq!(
+        tuned.outdoor_score(F32::from_f32(10.0), 7),
+        F32::from_f32(2.5)
+    );
+    assert_eq!(
+        tuning.outdoor_score(F32::from_f32(900.0), 0),
+        F32::from_f32(100.0)
+    );
+}
+
+/// The score of the 13-tile room above, worked out by hand with every
+/// operation rounded to a float.
+const SCORE_13: u32 = 0x4071_3b10;
+
+#[test]
+fn a_dark_room_with_people_and_no_lights_is_not_ported() {
+    let dark = Room {
+        people: 1,
+        ..Room::default()
+    };
+    assert_eq!(dark.shown_light(4), Err(RoomError::Occupancy(4)));
+    // A light, no people, enough light or a pool settles it.
+    let lit = F32::from_f32(0.8);
+    let cases = [
+        (
+            Room {
+                lights: 1,
+                ..dark.clone()
+            },
+            F32::ZERO,
+        ),
+        (
+            Room {
+                people: 0,
+                ..dark.clone()
+            },
+            F32::ZERO,
+        ),
+        (
+            Room {
+                light: lit,
+                ..dark.clone()
+            },
+            lit,
+        ),
+        (
+            Room {
+                pool: true,
+                ..dark.clone()
+            },
+            lit,
+        ),
+        // An outdoor room never knows who is in it.
+        (
+            Room {
+                outdoors: true,
+                ..dark.clone()
+            },
+            F32::ZERO,
+        ),
+    ];
+    for (room, shown) in cases {
+        assert_eq!(room.shown_light(4), Ok(shown));
+    }
 }

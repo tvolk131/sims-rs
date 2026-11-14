@@ -47,11 +47,19 @@ Each step is a few PRs, and each PR leaves `main` green.
   builds the object catalog.
 - Step 2 is done: the Goth house reads into `World`, which has a state
   hash and REDB snapshots. `sims boot <install> <house>` prints the hash of
-  the state its load reaches. `--ticks` waits for step 3.
+  the state its load reaches.
 - Step 3 is in progress. The interpreter runs saved frames, creates
   objects through the original's factory, and puts them to sleep. The load
   sequence below tracks the load steps that must run before the first
-  tick; `sims boot` runs them through step 16.
+  tick. **The load is complete for the Goth house**: `sims boot` runs all
+  22 steps, and the state it ends in equals a trace of the original at
+  the entry of its first tick, in everything the trace holds of what we
+  keep. Six type attribute words are the exception: they belong to the
+  game that was running before the load.
+- Ticks are not implemented. `sims boot --ticks N` with N above 0 fails
+  and says so. "The first tick" below says what a tick is in the
+  original, what the first one needs here, and what there is to check it
+  against.
 
 ### Load sequence
 
@@ -62,10 +70,10 @@ changes the state the first tick sees.
 
 The order and the addresses come from the old prototype's research on the
 1.91 executable. Each step was checked there on its own, against the
-original's code run in isolation. Steps 1 to 6 and 8 to 16 are also
+original's code run in isolation. Steps 1 to 6 and 8 to 22 are also
 checked against captures of the running original (see each step), and
-three results of step 7 are (see step 7). Steps 17 to 22 are what a trace
-of the running original shows after step 16; they are not ported.
+three results of step 7 are (see step 7). Steps 16 to 22 were first read
+off a trace of the running original and then from the original's code.
 
 The original does not build a lot for a house. It keeps one lot for as long
 as it runs and loads each house into it. So a load starts from whatever
@@ -91,25 +99,25 @@ That starting lot is **unverified**; see the decision log.
 | 9 | Repair the ground level's object grid | `0x443cb3` | Done (`World::repair_grid`) |
 | 9a | Work out the lot's rooms from its walls | `0x479d9a` | Done (`World::rebuild_rooms`); not two crossing diagonal walls in one tile |
 | 10 | Give every object its room and ask its function 7 | `0x442659`, `0x433bc5` | Done (`Interpreter::assign_rooms`); a person's room is not told it is occupied |
-| 10a | Count the rooms | `0x467094`, `0x466c3c`, `0x467bb1` | Done for the walls and floors (`World::update_rooms`); the objects' share, light and scores are not modeled |
+| 10a | Count the rooms: size, objects, light and score. Twice, with every room marked in between | `0x466c3c`, `0x467bb1`, `0x467e05`, `0x467980`, `0x466ba3`, `0x467094` | Done (`Interpreter::update_rooms`, `World::mark_all_rooms`, `Interpreter::update_pending_rooms`); an indoor room that is dark, has no lights and has people in it fails |
 | 11 | Discard pending removals | `0x428679` | Done (`World::discard_removals`) |
 | 12 | Select the household | `0x428041`, `0x46d8dc` | Done (`World::select_family`) |
 | 13 | Visit every object in registration order | `0x43fc94`, `0x431e2e`, `0x459bf6` | Done (`Interpreter::visit_objects`); a person only if it is doing nothing. On the Goth house all 382 visits run |
 | 14 | Create the indicator objects unless the lot has them | `0x445e4a` | Done (`Interpreter::ensure_indicators`) |
 | 15 | Finish the household selection: delete people who do not belong, work out the visitors, update the lighting | `0x428041`, `0x42a2b4`, `0x4c4648` | Done for a lot whose people are all members of the household, where it changes nothing (`World::finish_selection`); the lighting is not modeled |
-| 16 | Announce the loaded house, which asks for the indicators again | `0x428652`, `0x44302e`, `0x445e4a` | Done (`Interpreter::ensure_indicators`) |
-| 17 | Clear the selected Sim (global 3) and set the funds again | `0x4f1ae9`, `0x46d8dc` | Not done |
-| 18 | Select a Sim: global 3, the Sim's selected mark, and the first indicator goes into the Sim's slot | `0x4e989b`, `0x445449` | Not done |
-| 19 | Go to live mode: every room waits to be counted, global 37 becomes 1, then global 19 becomes 0 | `0x4cea5d`, `0x416534`, `0x4ce44f` | Not done |
-| 20 | Count the family's friends | `0x427219`, `0x427bd7` | Not done; no state we hold changes |
-| 21 | Update the rooms: counts, light and scores | `0x466c3c` | Not done; needs the part of the room update that is not modeled |
-| 22 | The interface's wait check clears global 12 | `0x4764fe` | Not done |
+| 16 | Announce the loaded house: with no Sim selected, ask for the indicators again and clear global 3 | `0x428652`, `0x44302e`, `0x445e4a`, `0x46d2c2` | Done (`Interpreter::announce_house`) |
+| 17 | Set the funds again | `0x4f1ae9`, `0x46d8dc` | Done (`Interpreter::select_resident`) |
+| 18 | Select the family's first member: the Sim's selected mark, the first indicator into the Sim's slot, global 3 | `0x4e97dc`, `0x4e989b`, `0x445449`, `0x44664c` | Done for a lot where nobody is selected and the Sim has no date (`Interpreter::select_resident`) |
+| 19 | Go to live mode: every room waits to be counted, the lot's statistics set global 37, then global 19 becomes 0 | `0x4cea5d`, `0x416534`, `0x416085`, `0x4ce44f` | Done (`Interpreter::go_live`); of the statistics only globals 23 and 37 |
+| 20 | Count the family's friends | `0x427219`, `0x427bd7` | Nothing to do: no state we hold changes |
+| 21 | Count the rooms that wait | `0x467094`, `0x466c3c` | Done (`Interpreter::before_frame`) |
+| 22 | The interface's wait check clears global 12 | `0x4764fe` | Done (`Interpreter::before_frame`) |
 
-`sims boot` runs the steps in order and stops at the first thing that is
-not done, so it never prints the hash of a state the original could not be
-in. Today it stops after step 16. Steps 17 to 22 are driven by the
-original's interface, not by its loader; the first tick (`0x46d345`)
-comes after them.
+`sims boot` runs the steps in order and stops at the first thing that
+cannot be done, so it never prints the hash of a state the original could
+not be in. Steps 16 to 22 are driven by the original's interface, not by
+its loader; what is ported is what they do to the simulation's state. The
+first tick (`0x46d345`) comes after them.
 
 #### The steps
 
@@ -418,20 +426,64 @@ code run alone.
 Not modeled: the first pass also tells the room a person stands in that
 it is occupied, which lights it.
 
-**10a. Room count.** After step 10 and before step 11 the original updates
-its rooms. For each room not yet counted it adds up the listed tiles: two
-half tiles for a tile, or one for a tile with a diagonal wall in an indoor
-room; how many of them have a floor covering; and how many walls can take
-a covering and how many have one. Global 27, the lot's indoor area, is the
-sum over the indoor rooms of the half tiles divided by 2. For the Goth
-house the four counts of all 11 rooms and global 27 (204) equal the
-trace's at the entry of step 11.
+**10a. Room count.** After step 10 and before step 11 the original
+updates its rooms. The update (`0x466c3c`) takes each room that is marked
+as not counted, in ID order:
 
-The original's update does more for each room: it adds what the objects
-in the room contribute, works out the room's light and score and the
-lot's outdoor score, and lights the tiles. None of that is modeled. In the
-trace this update changes no object, no random stream and no global but
-27.
+1. It notes the light the room shows.
+2. It zeroes the room's counts and clears its mark.
+3. It counts each listed tile: two half tiles for a tile, or one for a
+   tile with a diagonal wall in an indoor room; how many of them have a
+   floor covering; and how many walls can take a covering and how many
+   have one.
+4. It counts each object standing on the tile, with everything it holds.
+   An object is skipped if its data word 34 is not 0 or its room word is
+   negative. A person counts as a person. A light source (flag 0x400 of
+   data word 40) that stands on the lot adds its data word 51 to the
+   room's window light if it is a window, and to its lamp light
+   otherwise. Data word 7 is the object's impact on the room's score.
+5. It works out the room's light and score. Outdoors the light is the
+   daylight, by the time of day in global 4. Indoors it is the lamp light
+   plus the window light, per tile of area, the window light scaled by
+   the daylight. The score of an indoor room adds up five parts: covered
+   walls, covered floor, impact, light and area.
+6. If the light the room shows now differs from the one noted, the room
+   is announced as changed (signal 0xf1), and the lot answers by marking
+   it as not counted again.
+
+Then the lot's indoor area goes to global 27, and the outdoor rooms'
+scores are added up into the lot's outdoor score. Last, the levels that
+were counted stop waiting, whatever step 6 marked. So a room whose light
+changed stays marked, with nothing waiting to count it, until something
+marks a room of its level.
+
+In a load the original does this twice. The first update follows step 10
+(signal 0xf0). Every room is new and has no light, so every room's light
+changes and every room is marked again. Then the end of the house read
+announces that the lighting changed (signal 0xdd), which marks every room
+and both levels (`0x466ba3`), and counts whatever waits (`0x467094`).
+That second count changes no light and leaves every room counted.
+
+The original's FPU runs the score arithmetic with single precision: each
+operation's result is rounded to 24 bits. The trace shows it. One room's
+score there is the sum of its parts rounded after each addition, three
+units in the last place away from the sum rounded once.
+
+For the Goth house everything the update writes was compared with the
+trace at the entry of step 11, for all 11 rooms: the twelve counts, the
+lights and people, the score and the light bit for bit, the marks, the
+waiting levels, the lot's outdoor sum and score, and global 27 (204). All
+equal. The trace has no stop between the two updates, so the state after
+the first is not compared.
+
+Not ported: whether an indoor room is lit because someone is in it
+(`0x468802`). A person tells its room as it enters and leaves; an outdoor
+room and a pool ignore that. The update fails for an indoor room where it
+would matter: no pool, no lights, people in it, light below 0.8. Not
+modeled, being presentation: the lights the update places in a room, the
+lighting of the tiles, and the redrawing. The constant the daylight is
+multiplied by is 1.0 in the trace and is taken to be 1.0: **unverified**.
+A lot with a pool is **unverified**: this house has none.
 
 **11. Removals.** The queue of objects waiting to be removed is emptied.
 The objects stay. In the trace the queue holds four IDs before and none
@@ -618,53 +670,159 @@ of step 13 and the return of the lighting update. The lighting is not
 modeled.
 
 **16. The house is announced.** The loader tells the rest of the game
-that a house is loaded (signal `0xf6`). The object registry answers by
-asking for the indicators again if no Sim is selected. In the trace that
-creates nothing, and the state at its return equals ours.
+that a house is loaded (signal `0xf6`). The object registry answers
+(`0x44302e`): if no Sim is selected, it asks for the indicators again and
+announces that nobody is selected (signal `0xe4` with 0), which the
+simulator answers by clearing global 3 (`0x46d2c2`). A house saves the
+selected Sim's ID in global 3 but not the Sim's selected mark, so after a
+load nobody is selected and global 3 is cleared. In the trace the
+indicators exist already, and global 3 goes from the saved 21 to 0.
 
-**17 to 22. The rest, which is not ported.** After step 16 the original's
-interface takes over. A trace of the Goth load stops at seven more places
-before the first tick, and this is what changes between them, of the
-state we hold:
+**17 and 18. Funds and selection.** After a residential house is loaded,
+the game's interface (the end of `0x4f1ae9`) sets the lot's funds from the
+family's money again, which changes nothing, and then selects a Sim. The
+rule: if a Sim is selected and belongs to a family (person data word 61
+is not 0), it stays. Otherwise the game selects the family's first member
+(`0x4e97dc`): the first object of that member's type. Looking that up
+makes the type's instance list. Whether the Sim may be selected depends
+on the lot (`0x4e989b`): on a residential lot only a Sim that lives there
+(person data word 32 is 0); on lots 21 to 30 any Sim whose word 32 is not
+2; on a community lot or lots 40 to 49 a Sim of the selected family or
+one whose word 32 is not 2.
 
-- *17.* Global 3, the selected Sim, goes from the saved 21 to 0. Then the
-  funds setter runs again and changes nothing.
-- *18.* A Sim is selected (`0x445449`, called from `0x4e989b`). An
-  instance list is made for the type of person 21, which is how the game
-  finds a person by type. Global 3 becomes 21 again, person 21 gets its
-  selected mark (object flag 2), and indicator 383 goes into person 21's
-  slot: its data words 2, 3, 14 and 26 become 21, 1, 2 and 21, and its
-  room and position become the person's. The indicator is asked function
-  10 twice and function 9 once, and person 21 function 9 once. How the
-  game picks the Sim is not known from the trace: it may be the Sim the
-  house saved in global 3, or the family's first member; both are person
-  21 here.
-- *19.* The mode changes (`0x4cea5d` twice). The three rooms that were
-  not waiting to be counted now wait too, global 37 goes from 0 to 1,
-  and then global 19 goes from 3 to 0: live mode.
-- *20.* The family's friends are counted. No state we hold changes.
-- *21.* The rooms are updated. The five outdoor rooms stop waiting and
-  the six indoor rooms still wait, with new light and score values. None
-  of the four counts we keep changes. This is the part of the room
-  update that is not modeled (step 10a).
-- *22.* The interface's wait check (`0x4764fe`) sets global 12 from 2009
-  to 0.
+Selecting a Sim (`0x445449`) sets the Sim's selected mark, moves the
+indicators for it (`0x44664c`), and announces the selection, which writes
+the Sim's ID to global 3. Moving the indicators: the first indicator is
+taken off the lot, then put into the Sim's slot 1. An object that leaves
+the lot is asked function 10, and the registry is told. The registry
+takes an indicator that left off the lot once more (`0x447d2b`,
+`0x4481eb`), so the indicator is asked function 10 twice. Put into the
+slot, it is asked function 9, and so is the Sim.
+
+In the trace: an instance list is made for the type of person 21, global
+3 becomes 21, person 21 gets the mark, and indicator 383's data words 2,
+3, 14 and 26 become 21, 1, 2 and 21, with the person's room and position.
+The callbacks are 383:10, 383:10, 383:9 and 21:9. All equal here. The
+second 383:10 was found by running the original's selection code on the
+trace's memory in an emulator, which showed its caller.
+
+Ported for a lot where nobody is selected yet. Deselecting a Sim fails,
+and so does a Sim with a date (the second indicator marks the date) and a
+Sim whose slot 1 holds something. Three things belong to the interface
+and are taken as the trace shows them, **unverified** otherwise: every
+family member is on the interface's list of portraits; a process-wide
+switch that lets any Sim be selected is off; and a slot of a person takes
+an indicator.
+
+**19. Live mode.** The mode changes (`0x4cea5d`). The lot's part
+(`0x416534`) marks every room as not counted and works out the lot's
+statistics (`0x416085`). Then the interface writes the mode, 0, to global
+19. The statistics pass sets global 37 from the categories of the lot's
+objects (data word 59), one bit for each kind of object, and global 23
+to the lot's size. It also writes global 22, the value of the lot's
+objects and architecture, and two flags of the family's record; those
+are not ported and stay as they are, which is **unverified**: in the
+trace they do not change, but they already hold what the house saved. In
+the trace the three rooms that were counted are marked, global 37 goes
+from 0 to 1, and global 19 from 3 to 0.
+
+**20. Friends.** The family's friends are counted. No state we hold
+changes.
+
+**21. Rooms.** Before it draws a frame the game counts the rooms that
+wait (`0x467094`), as in step 10a. All 11 rooms are counted. The five
+outdoor rooms end counted. The six indoor rooms end marked again: their
+light changed. At step 10a they were fully lit through their windows;
+step 13 reset the windows, which cleared the light each lets in, so now
+they are dark or lit by lamps only. This is what the earlier version of
+this file could not explain. In the trace every count, light and score of
+all 11 rooms equals ours, and so do the marks.
+
+**22. Wait check.** The interface's wait check (`0x4764fe`) writes what
+it found to global 12: the control a tutorial is waiting for, or 0. With
+no interface it is 0. In the trace global 12 goes from 2009 to 0.
 
 Then the trace stops at the entry of the first tick (`0x46d345`). No
 object's thread runs, the tick count stays at 88,444, and no random
-stream moves in any of steps 14 to 22. So the state after step 16 differs
-from the state at the first tick in this and nothing else we compare:
-indicator 383's five data words and position, one instance list, globals
-12, 19 and 37, and which rooms wait to be counted. Global 3 is 21 at both
-ends.
+stream moves in any of steps 14 to 22. Our state after step 22 equals the
+trace's there: all 386 objects, the people, the globals, the three random
+streams, the funds, the removal queue, the instance lists, the rooms and
+the lot arrays.
 
-What the next piece of work needs: a place in `World` for the selected
-Sim's mark, the selection itself with the indicator moving into a
-person's slot (the placement code can already put an object into a
-container), the rule for which Sim is selected, and the mode change's
-three writes. The room update's light and scores are a larger piece, and
-the first tick does not wait for them unless a script reads a room's
-score.
+### The first tick
+
+Not implemented. This is what a tick is in the original, read from its
+code, what the first one needs on the Goth house, and what there is to
+check it against.
+
+**One lot update** (`0x46d345`):
+
+1. The game's random stream is swapped for the lot's: the current state
+   is put aside and the lot's state installed (`0x46f447`, `0x46f44d`).
+2. The scheduler makes a pass over the objects (`0x46d553`).
+3. The stream's state is saved back as the lot's and the state put aside
+   is restored.
+4. If the pass was a full one: global 6 (seconds) goes up by 2 and the
+   tick count by 1. At 60 seconds global 5 (minutes) goes up. At 60
+   minutes global 0 (hours) goes up. At 24 hours the day (global 1) goes
+   up, with a pass over the registry and the neighborhood for the new
+   day, a shift of the budget's daily records, and the month and year
+   (globals 7 and 8, with the month's days in global 29).
+5. The registry carries out the removals that are queued (`0x4412d1`).
+6. If the hour changed and the time of day with it (global 4, from the
+   hour), the lighting is updated and every room is marked.
+
+**One scheduler pass** (`0x46d553`). The pass is partial if global 17 is
+not 0, or if global 19 and global 10 are both not 0. The cursor is an
+object ID: the pass goes through the registry's table of objects by ID,
+from the cursor (or 1) to the highest ID, not through the registration
+list. For each object: if its scheduler word has flag 4 and the object
+has an error, the pass stops there. An object without flag 1 is skipped,
+and in a partial pass so is one without flag 2. If its countdown, the low
+half of the word, is above 0, it is counted down by 1. Otherwise the
+object is ticked (its virtual function at 0x14: `0x4521f7`, or
+`0x45cc8c` for a person) with the tick count. If that returns false the
+pass stops with the cursor on that object. After the last object the
+cursor goes back to 0. The pass returns whether it was a full one.
+
+Not read yet: what an object's tick does around running its thread, what
+a person's tick adds (motives, the action queue), and how the queued
+removals are carried out.
+
+**What the first tick needs on the Goth house.** At the baseline 267
+objects have a countdown above 0 and 119 are ticked, the three people
+among them. A probe ran each of the 119 objects' threads for one turn
+with today's interpreter, each on a copy of the baseline: 114 run until
+they yield, and 5 controllers (objects 360 and 362 to 365) reach the
+Dialog primitive, which is not implemented. That probe says nothing
+about whether the 114 do what the original does; it only shows where the
+interpreter stops. Seven objects are queued for removal.
+
+**What there is to check a tick against.** All private, in the old
+checkout:
+
+- The trace used for the load ends at the entry of the first tick. It
+  holds no state after a tick. A dump of the guest's whole memory was
+  taken at that moment (1 GB, archived). The original's code can be run
+  on it in an emulator, as was done for the selection in step 18.
+- An earlier run of the original was captured at the entry of the lot
+  update at tick 88,445 and at the return of the next four, through tick
+  88,449, with a full state at each. It is another run, and its first
+  tick, from 88,444, was not captured as such. But its state at 88,445
+  differs from our baseline in what one tick would change and nothing
+  else that was compared: both game random streams are equal; one global
+  differs (the seconds, 46 where the baseline has 44); 9 objects are
+  gone, the 7 that are queued for removal here and 2 more; of the 377
+  others, 345 differ only in the scheduler word, 260 of them by a
+  countdown one lower; 32 differ in their frames, the three people and
+  the five controllers that reach Dialog among them; and one differs in
+  a data word. Compared for each object: the data words, temps,
+  attributes, scheduler word, frames and last result. Not compared yet:
+  the people's motives and actions, the lot arrays and the rooms. So
+  that capture is where a first tick can be checked, and its four later
+  states the next four. In that run dialogs were answered by hand before
+  the capture; what the Dialog primitive leaves behind has to agree with
+  it.
 
 ## Working rules
 

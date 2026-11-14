@@ -35,8 +35,8 @@ pub const CANONICAL_NAN_BITS: u32 = 0xffc0_0000;
 ///
 /// Equality and hashing compare bits, so `+0` and `-0` differ. That is right
 /// for state comparison and fingerprints. Numeric comparison goes through
-/// [`Ext`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// [`Ext`]. The default is `+0`.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(from = "u32", into = "u32")]
 pub struct F32(u32);
 
@@ -236,6 +236,42 @@ impl Ext {
                 biased as i32 - 150,
             ),
         }
+    }
+
+    /// Loads a stored 64-bit float (`FLD m64`, exact), given as its IEEE
+    /// double-precision bits. The original keeps a few constants as
+    /// doubles.
+    pub fn from_f64_bits(bits: u64) -> Self {
+        let negative = bits >> 63 != 0;
+        let biased = ((bits >> 52) & 0x7ff) as i32;
+        let fraction = bits & 0x000f_ffff_ffff_ffff;
+        match biased {
+            0x7ff if fraction == 0 => Self::infinity(negative),
+            0x7ff => Self::NAN,
+            0 => Self::finite(negative, u128::from(fraction), -1074),
+            _ => Self::finite(
+                negative,
+                u128::from(fraction | 0x0010_0000_0000_0000),
+                biased - 1075,
+            ),
+        }
+    }
+
+    /// The value rounded to a 24-bit significand: what an operation
+    /// leaves in a register while the FPU's precision control is set to
+    /// single precision, as Direct3D sets it. Apply it to the result of
+    /// each add, subtract, multiply or divide of code that runs in that
+    /// mode. Loads are exact in every mode and need no rounding.
+    ///
+    /// This rounds a result that [`Ext`]'s operators already rounded to
+    /// 64 bits. For operands of up to 32 significant bits that is the same
+    /// as rounding the exact result once: a sum or product of such values
+    /// is exact in 64 bits, and a quotient cannot lie within 2^-64 of a
+    /// 24-bit tie without being that tie. Outside the range of a float the
+    /// FPU keeps a wider exponent than this does; no game value gets
+    /// there.
+    pub fn single(self) -> Self {
+        self.to_f32().ext()
     }
 
     /// Stores to 32 bits (`FSTP m32`), rounding to nearest even. Overflow

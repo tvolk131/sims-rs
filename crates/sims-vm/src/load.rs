@@ -50,8 +50,8 @@ impl Interpreter<'_> {
     /// so a lot the game holds always has them. Their IDs go to
     /// [`World::indicators`] and are returned.
     ///
-    /// Only the creation is ported. The original also attaches the markers
-    /// to Sims later.
+    /// The first of the two is put over a Sim when the Sim is selected
+    /// (`selection.rs`).
     pub fn create_indicators(&self, world: &mut World) -> Result<[u16; 2], Fault> {
         let mut ids = [0; 2];
         for (id, guid) in ids.iter_mut().zip(INDICATORS) {

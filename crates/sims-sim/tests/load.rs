@@ -275,6 +275,7 @@ fn object_at(id: u16, position: [i32; 3]) -> sims_sim::Object {
         registry_word: None,
         last_result: false,
         removal_skips_resets: false,
+        selected: false,
     }
 }
 
@@ -302,6 +303,7 @@ fn the_scheduler_word_keeps_a_countdown_and_flags() {
         registry_word: None,
         last_result: false,
         removal_skips_resets: false,
+        selected: false,
     };
     // Without a word there is nothing to set.
     object.set_countdown(5);
@@ -843,4 +845,74 @@ fn the_selection_ends_quietly_on_a_lot_with_only_the_household() {
         LoadError::Selection("x".into()).to_string(),
         "x, which is not ported"
     );
+}
+
+/// A lot of 40 tiles whose objects have these categories (data word 59),
+/// in registration order.
+fn categorized(categories: &[i16]) -> World {
+    let mut world = lot(vec![0; 64]);
+    world.size = 40;
+    for (id, &category) in (1u16..).zip(categories) {
+        let mut object = object_at(id, [0; 3]);
+        object.data = vec![0; 72];
+        object.data[59] = category;
+        world.objects.insert(id, object);
+        world.order.push(id);
+    }
+    world
+}
+
+#[test]
+fn the_statistics_say_what_kinds_of_object_the_lot_has() {
+    let features = |categories: &[i16]| {
+        let mut world = categorized(categories);
+        world.globals[37] = -1;
+        world.update_statistics().unwrap();
+        assert_eq!(world.globals[23], 40);
+        world.globals[37]
+    };
+    assert_eq!(features(&[]), 0);
+    // One bit for each kind, whichever category of the kind it is.
+    for (bit, kinds) in [
+        (1, &[4, 46, 47, 48, 71][..]),
+        (2, &[25, 26, 50, 72]),
+        (4, &[73]),
+        (0x40, &[43, 49, 51, 77]),
+        (0x80, &[80]),
+        (0x100, &[84]),
+        (0x200, &[85]),
+        (0x400, &[83]),
+        (0x800, &[95]),
+        (0x1000, &[93, 94]),
+        (0x20, &[97]),
+    ] {
+        for &category in kinds {
+            assert_eq!(features(&[0, category, 3]), bit, "category {category}");
+            assert_eq!(sims_sim::load::feature(category), bit & !0x20);
+        }
+    }
+    assert_eq!(features(&[4, 73, 80, 93]), 0x1085);
+    // Three bits need category 10 and something else.
+    for (bit, kinds) in [
+        (8, &[17, 21, 22, 23, 24, 30, 39, 40, 58, 59, 74][..]),
+        (0x10, &[75]),
+        (0x20, &[76]),
+    ] {
+        for &category in kinds {
+            assert_eq!(features(&[category]), 0, "category {category}");
+            assert_eq!(features(&[category, 10]), bit, "category {category}");
+        }
+    }
+    assert_eq!(features(&[10]), 0);
+    // Categories next to the known ones set nothing.
+    assert_eq!(features(&[3, 5, 9, 20, 27, 45, 52, 70, 78, 92, 96]), 0);
+    // An object the registration list does not name is not looked at.
+    let mut world = categorized(&[73]);
+    world.order.clear();
+    world.update_statistics().unwrap();
+    assert_eq!(world.globals[37], 0);
+    // The statistics need all 64 globals.
+    let mut world = categorized(&[]);
+    world.globals.truncate(32);
+    assert_eq!(world.update_statistics(), Err(LoadError::NoContext));
 }

@@ -187,6 +187,7 @@ impl<'a> Machine<'a, '_> {
             registry_word: Some(0xffff),
             last_result: false,
             removal_skips_resets: false,
+            selected: false,
         };
         // Frames name the code they run by the lot's type table, which
         // the original only builds when it saves. A type the table lacks

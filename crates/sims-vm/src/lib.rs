@@ -24,7 +24,11 @@
 //! Visiting an object can rebuild it, which takes it off its tile and
 //! puts it back (`placement.rs`). Visiting a person gives it the fields
 //! its neighborhood record keeps and resets it in its own way
-//! (`people.rs`).
+//! (`people.rs`). [`Interpreter::update_rooms`] counts the rooms with the
+//! objects that stand in them (`rooms.rs`). The load ends with
+//! [`Interpreter::announce_house`], [`Interpreter::select_resident`],
+//! [`Interpreter::go_live`] and [`Interpreter::before_frame`]
+//! (`selection.rs`), which leave the lot as the first tick finds it.
 
 mod error;
 mod factory;
@@ -38,6 +42,8 @@ mod placement;
 mod primitives;
 mod program;
 mod removal;
+mod rooms;
+mod selection;
 mod visits;
 
 pub use error::Error;
@@ -50,6 +56,7 @@ pub use objects::SavedRead;
 pub use people::{curve_table, persistent_fields, reload_profile};
 pub use primitives::primitive_name;
 pub use program::{Callback, DEFINITION_WORDS, Library, Program, Tree};
+pub use selection::selected;
 pub use visits::Visited;
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -11,20 +11,24 @@
 //! [`World::rebuild_rooms`] is that function: the partition, and the pass
 //! over the tile flags that marks which tiles are outside every enclosure.
 //! [`World::room_at`] is the room an object at a position is in
-//! (0x433bc5). [`World::update_rooms`] counts each room's size and writes
-//! the lot's indoor area to global 27; it is the part of the original's
-//! room update (0x466c3c) that needs only the walls and floors.
+//! (0x433bc5). [`World::update_rooms`] is the room update (0x466c3c): it
+//! counts each room's tiles and the objects standing on them, works out
+//! the room's light and score, and writes the lot's indoor area to global
+//! 27. [`Tuning`] holds the constants and the arithmetic of the scores.
 //!
 //! Ported from the old prototype (legacy/crates/sims-sim/src/lot_rooms.rs,
 //! lot_flags.rs, lot_walls.rs, lot_geometry.rs, `room_outdoors` in
-//! spatial.rs and `Totals::add_tile` in lot_environment.rs), which
-//! compared each piece with the original's code run alone. For the Goth house the results were also compared with a
+//! spatial.rs, and lot_environment.rs with its `manager.rs` and
+//! `objects.rs`), which compared each piece with the original's code run
+//! alone. For the Goth house the results were also compared with a
 //! trace of the original loading it; see `docs/decisions.md`.
 
 use crate::load::{FLOORS, WALLS};
 use crate::{FULL_SIZE, World};
 use serde::{Deserialize, Serialize};
+use sims_core::{Ext, F32};
 use sims_formats::lot::Array;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 /// The room of an object that is in no room, and the map's mark for a tile
@@ -37,6 +41,9 @@ pub const UNSEEN: i16 = -1;
 
 /// Global 27: the area of the lot's indoor rooms, in tiles.
 const INDOOR_AREA: usize = 27;
+
+/// Global 4: the time of day. 0 is day, 1 dawn, 2 night and 3 dusk.
+const TIME_OF_DAY: usize = 4;
 
 /// The lot arrays the rooms are worked out from, besides the floors and
 /// walls: terrain heights, the tile flags, and the pool.
@@ -102,6 +109,15 @@ pub enum RoomError {
     NoRooms,
     /// A step that needs all 64 globals ran on fewer.
     NoContext,
+    /// The room update was told of an object the lot does not have, or
+    /// one that lacks a data word the update reads.
+    Standing(u16),
+    /// The objects on a tile could not be listed.
+    Tile { tile: [u8; 3], why: String },
+    /// A dark indoor room with people in it and no lights. Whether it is
+    /// lit for them depends on the room knowing it is occupied
+    /// (0x468802), which is not ported.
+    Occupancy(i16),
 }
 
 impl std::fmt::Display for RoomError {
@@ -133,6 +149,21 @@ impl std::fmt::Display for RoomError {
             Self::TooManyRooms { level } => write!(f, "more than 1024 rooms on level {level}"),
             Self::NoRooms => write!(f, "the lot's rooms have not been worked out"),
             Self::NoContext => write!(f, "the load context has not been applied"),
+            Self::Standing(object) => write!(
+                f,
+                "the room update was told of object {object}, which the lot lacks or which \
+                 lacks a data word the update reads"
+            ),
+            Self::Tile { tile, why } => write!(
+                f,
+                "the objects on tile {}, {} of level {} could not be listed: {why}",
+                tile[0], tile[1], tile[2]
+            ),
+            Self::Occupancy(room) => write!(
+                f,
+                "room {room} is dark, has no lights and has people in it; whether it is lit \
+                 for them depends on the room knowing it is occupied, which is not ported"
+            ),
         }
     }
 }
@@ -153,6 +184,18 @@ pub struct Rooms {
     pub halves: BTreeMap<[u8; 3], [Half; 2]>,
     /// The rooms by ID.
     pub rooms: BTreeMap<i16, Room>,
+    /// Which levels have a room waiting to be counted: bit 0 for the
+    /// ground level and bit 1 for the upper level (the original's room
+    /// manager, word 0x34). [`World::mark_room`] sets a bit and
+    /// [`World::update_rooms`] clears the bits of the levels it counted.
+    /// A room can stay marked with its level's bit clear; see
+    /// [`World::update_rooms`].
+    pub pending: u8,
+    /// The sum of the outdoor rooms' scores, and the lot's outdoor score
+    /// worked out from it (the room manager's words 0x40 and 0x3c). Zero
+    /// until the rooms are first counted.
+    pub outdoor_sum: F32,
+    pub outdoor_score: F32,
 }
 
 /// One triangle of a tile that a diagonal wall splits.
@@ -181,8 +224,10 @@ pub struct Room {
     /// answer. Here it is worked out with the rooms. Nothing between the
     /// two changes what it is worked out from.
     pub outdoors: bool,
-    /// Set when the room is made, cleared when [`World::update_rooms`] has
-    /// counted it.
+    /// The mark that the room is not counted: set when the room is made
+    /// and by [`World::mark_room`], cleared when [`World::update_rooms`]
+    /// counts the room, and set again at once if that changed the room's
+    /// light.
     pub dirty: bool,
     /// The room's size in half tiles, zero until it is counted. A listed
     /// tile counts 2, or 1 if it has a diagonal wall and the room is
@@ -194,6 +239,35 @@ pub struct Room {
     /// take a wall covering, and how many of them have one. Zero outdoors.
     pub walls: i32,
     pub covered_walls: i32,
+    /// The objects counted in the room: those standing on its listed
+    /// tiles, a tile listed twice counting twice.
+    pub objects: i32,
+    /// The sum of data word 51 of the windows that are light sources, and
+    /// of the other light sources.
+    pub window_light: i32,
+    pub lamp_light: i32,
+    /// The sum of the objects' data word 39. What it is for is not known.
+    pub word_39: i32,
+    /// The sum of the objects' data word 7: how much each adds to or
+    /// takes from the room's score. Outdoors only what takes away counts.
+    pub impact: i32,
+    /// The objects whose data word 7 is not negative, plus the listed
+    /// tiles that are pool.
+    pub good: i32,
+    /// The objects whose data word 59 is 4, and those where it is 5 to 7.
+    pub category_4: i32,
+    pub category_5_to_7: i32,
+    /// The light sources that stand on the lot and are not windows.
+    pub lights: i32,
+    /// The people.
+    pub people: i32,
+    /// The room's score, -100 to 100 indoors, zero until it is counted.
+    pub score: F32,
+    /// The room's light, 0 to 1. A new room has 0.
+    pub light: F32,
+    /// Whether the room is a pool: its first listed tile is on the ground
+    /// level and its pool cell is below 16.
+    pub pool: bool,
 }
 
 /// One level's arrays, checked to be 64 by 64 cells of the right size.
@@ -771,130 +845,612 @@ impl World {
         Ok(room)
     }
 
-    /// Marks a room as not counted, so the next [`World::update_rooms`]
-    /// counts it again (0x40760d with event 0xf3, and the Refresh
+    /// Marks a room as not counted, so a later [`World::update_rooms`]
+    /// counts it again, and notes that its level has a room waiting
+    /// (0x466b07, 0x466b55; signals 0xf3 and 0xf1, and the Refresh
     /// primitive). The room is named by an object's room word; a word that
     /// names no room does nothing.
     pub fn mark_room(&mut self, room: i16) {
-        if let Some(room) = self.rooms.rooms.get_mut(&room) {
-            room.dirty = true;
+        if let Some(found) = self.rooms.rooms.get_mut(&room) {
+            found.dirty = true;
+            match (room as u16 >> 10) & 3 {
+                0 => self.rooms.pending |= 1,
+                1 => self.rooms.pending |= 2,
+                _ => {}
+            }
         }
     }
 
-    /// Counts every room that has not been counted and writes the lot's
-    /// indoor area to global 27. This is the part of the original's room
-    /// update (0x467094, 0x466c3c) that needs only the walls and floors
-    /// (0x467bb1). Returns the IDs of the rooms counted.
+    /// Marks every room as not counted and both levels as waiting
+    /// (0x466c01, 0x466ba3). The original does this when the lighting
+    /// changes (signal 0xdd), which a load sends once the house is read,
+    /// and when the game goes to live mode (0x416534).
+    pub fn mark_all_rooms(&mut self) {
+        for room in self.rooms.rooms.values_mut() {
+            room.dirty = true;
+        }
+        self.rooms.pending = 3;
+    }
+
+    /// The room update: counts every room that is marked as not counted,
+    /// works out its light and its score, then the lot's outdoor score and
+    /// indoor area (0x466c3c). Returns the IDs of the rooms counted, in
+    /// the order they were counted.
     ///
-    /// For each listed tile of an uncounted room, repeats included: an
-    /// outdoor room counts 2 half tiles and nothing else. An indoor room
-    /// counts 2 half tiles for a tile with no diagonal wall, both covered
-    /// if the tile has a floor, and each of the tile's four walls whose
-    /// style can take a covering, with whether it has one. A tile with a
-    /// diagonal wall counts 1 half tile, covered if the wall cell's first
-    /// style or first pattern word is nonzero (they hold the two half
-    /// floors), and the diagonal wall itself.
+    /// `floor` is 0 for every room, or the level (1 or 2) whose rooms are
+    /// to be counted. `standing` lists the objects standing on a tile, in
+    /// the order the lot links them, everything they hold included
+    /// (0x43f331); `sims-vm` supplies it, because it holds the object
+    /// definitions.
     ///
-    /// The indoor area is the sum, over the indoor rooms, of the half
-    /// tiles divided by 2, rounding each room down.
+    /// For each marked room, in ID order:
     ///
-    /// In the load the original does this after every object has been
-    /// given its room (step 10) and before the removal queue is emptied
-    /// (step 11). For the Goth house the four counts of all 11 rooms and
-    /// global 27 were compared with a trace of the original at that
-    /// moment and were equal.
+    /// 1. The light the room shows is noted ([`Room::shown_light`]).
+    /// 2. Its counts are zeroed and its mark cleared (0x4678b7).
+    /// 3. Whether it is a pool is worked out from its first listed tile.
+    /// 4. Each listed tile is counted, repeats included (0x467bb1), and
+    ///    then each object standing on it (0x467e05).
+    /// 5. Its light and score are worked out ([`Tuning::score`],
+    ///    0x467980).
+    /// 6. If the light it shows now differs from the one noted, the room
+    ///    is announced as changed (signal 0xf1), and the lot answers by
+    ///    marking it as not counted again (0x466b55). So a room whose
+    ///    light changed leaves this update still marked.
     ///
-    /// Not modeled, though the original's update does it for each room it
-    /// counts: what the objects standing in the room add (their number,
-    /// their light and their effect on the room's score), the room's
-    /// light and score, the lot's outdoor score, the people in the room,
-    /// and the lighting of the tiles. The trace shows no object, global
-    /// or random stream changing in this update other than global 27.
-    pub fn update_rooms(&mut self) -> Result<Vec<i16>, RoomError> {
+    /// Then, over all rooms: global 27 takes the sum, over the indoor
+    /// rooms, of the half tiles divided by 2, rounding each room down; the
+    /// scores of the outdoor rooms are added up, and the lot's outdoor
+    /// score is that sum divided by a constant, plus a bonus for the time
+    /// of day (global 4), kept within -100 and 100. Last, the levels that
+    /// were counted stop waiting ([`Rooms::pending`]), whatever step 6
+    /// marked.
+    ///
+    /// A tile (0x467bb1): an outdoor room counts 2 half tiles and nothing
+    /// else. An indoor room counts 2 half tiles for a tile with no
+    /// diagonal wall, both covered if the tile has a floor, and each of
+    /// the tile's four walls whose style can take a covering, with whether
+    /// it has one. A tile with a diagonal wall counts 1 half tile, covered
+    /// if the wall cell's first style or first pattern word is nonzero
+    /// (they hold the two half floors), and the diagonal wall itself. A
+    /// tile whose pool cell (array 9) is below 16 adds one to the room's
+    /// count of good things.
+    ///
+    /// An object (0x467e05) is skipped if its data word 34 is not 0 or its
+    /// room word (29) is negative. Otherwise it is counted; by its data
+    /// word 59 it may count as one of two categories; a person
+    /// (definition type 2) counts as a person. If it is a light source
+    /// (flag 0x400 of data word 40) and stands on the lot, it counts as a
+    /// light unless it is a window (type 8), and its data word 51 is
+    /// added to the room's window light or lamp light. Its data word 39 is
+    /// added up. Its data word 7 is added to the room's impact, outdoors
+    /// only if it is negative, and an object whose word 7 is not negative
+    /// counts as a good thing.
+    ///
+    /// Ported from the old prototype
+    /// (legacy/crates/sims-sim/src/lot_environment.rs and
+    /// lot_environment/manager.rs, objects.rs), and read again from the
+    /// original's code. For the Goth house every count, the light and the
+    /// score of all 11 rooms, the lot's outdoor sum and score, global 27,
+    /// the marks and the waiting levels were compared with a trace of the
+    /// original at two moments and were equal; see `docs/decisions.md`.
+    ///
+    /// Not modeled, being presentation: the lights the update places in a
+    /// room, the lighting of the tiles, and the redrawing. Not ported:
+    /// whether an indoor room is lit because someone is in it (0x468802).
+    /// A room where that would matter fails with
+    /// [`RoomError::Occupancy`].
+    pub fn update_rooms(
+        &mut self,
+        tuning: &Tuning,
+        floor: u8,
+        standing: &mut ListStanding<'_>,
+    ) -> Result<Vec<i16>, RoomError> {
         if self.globals.len() != 64 {
             return Err(RoomError::NoContext);
         }
+        if floor > 2 {
+            return Err(RoomError::Level(i32::from(floor)));
+        }
+        let period = self.globals[TIME_OF_DAY];
+        let daylight = Tuning::daylight(period);
+        let ids: Vec<i16> = self.rooms.rooms.keys().copied().collect();
         let mut counted = Vec::new();
-        let mut totals = Vec::new();
-        for (&id, room) in &self.rooms.rooms {
-            if !room.dirty {
+        for id in ids {
+            let index = usize::from((id as u16 >> 10) & 3);
+            let room = &self.rooms.rooms[&id];
+            if (floor != 0 && index + 1 != usize::from(floor)) || !room.dirty {
                 continue;
             }
-            let index = usize::from((id as u16 >> 10) & 3);
             if index > 1 {
                 return Err(RoomError::Level(index as i32 + 1));
             }
-            let level = Level {
-                level: index as u8 + 1,
-                walls: array(&self.arrays, WALLS[index], WALL_CELL)?,
-                floors: array(&self.arrays, FLOORS[index], 2)?,
+            let before = room.shown_light(id)?;
+            let outdoors = room.outdoors;
+            let tiles = room.tiles.clone();
+            let mut count = Room {
+                outdoors,
+                ..Room::default()
             };
-            let mut total = [0i32; 4];
-            for tile in &room.tiles {
-                let (x, y) = (usize::from(tile[0]), usize::from(tile[1]));
-                let cell = at(x, y);
-                let segments = level.segments(cell);
-                let [half_tiles, covered, walls, covered_walls] = &mut total;
-                if room.outdoors {
-                    *half_tiles = half_tiles.wrapping_add(2);
-                } else if segments & wall::DIAGONAL == 0 {
-                    *half_tiles = half_tiles.wrapping_add(2);
-                    if level.floor(cell) != 0 {
-                        *covered = covered.wrapping_add(2);
-                    }
-                    for bit in [wall::WEST, wall::NORTH, wall::EAST, wall::SOUTH] {
-                        if segments & bit == 0 {
-                            continue;
-                        }
-                        let style = level.style(x, y, bit).ok_or(RoomError::Asymmetric {
-                            level: level.level,
-                            x,
-                            y,
-                        })?;
-                        if decorated(style) {
-                            *walls = walls.wrapping_add(1);
-                            if level.pattern(cell, bit) != 0 {
-                                *covered_walls = covered_walls.wrapping_add(1);
-                            }
-                        }
-                    }
-                } else {
-                    *half_tiles = half_tiles.wrapping_add(1);
-                    // A diagonal wall's style is the cell's second style
-                    // word, and its two sides are the last two pattern
-                    // words.
-                    if decorated(level.word(cell, 1)) {
-                        *walls = walls.wrapping_add(1);
-                        if level.word(cell, 4) != 0 || level.word(cell, 5) != 0 {
-                            *covered_walls = covered_walls.wrapping_add(1);
-                        }
-                    }
-                    if level.word(cell, 0) != 0 || level.word(cell, 2) != 0 {
-                        *covered = covered.wrapping_add(1);
+            // The pool array is optional in a house file. A lot without
+            // one has no pool.
+            let has_pool = self.arrays.contains_key(&POOL);
+            if let Some(first) = tiles.first().filter(|_| has_pool) {
+                let pool = array(&self.arrays, POOL, 1)?;
+                count.pool = first[2] == 1 && pool[at(first[0].into(), first[1].into())] < 16;
+            }
+            for tile in &tiles {
+                {
+                    let level = Level {
+                        level: index as u8 + 1,
+                        walls: array(&self.arrays, WALLS[index], WALL_CELL)?,
+                        floors: array(&self.arrays, FLOORS[index], 2)?,
+                    };
+                    let pool = match has_pool {
+                        true => Some(array(&self.arrays, POOL, 1)?),
+                        false => None,
+                    };
+                    count.count_tile(&level, pool, *tile)?;
+                }
+                for object in standing(self, *tile)? {
+                    let data = &self
+                        .objects
+                        .get(&object.id)
+                        .ok_or(RoomError::Standing(object.id))?
+                        .data;
+                    count.count_object(data, &object)?;
+                }
+            }
+            let (light, score) = tuning.score(&count, daylight);
+            count.light = light;
+            count.score = score;
+            let after = count.shown_light(id)?;
+            let room = self.rooms.rooms.get_mut(&id).ok_or(RoomError::NoRooms)?;
+            count.tiles = tiles;
+            *room = count;
+            counted.push(id);
+            // The original compares the two with FCOMP and skips the
+            // signal when they are equal or unordered.
+            if matches!(
+                before.ext().partial_cmp(&after.ext()),
+                Some(Ordering::Less | Ordering::Greater)
+            ) {
+                self.mark_room(id);
+            }
+        }
+        let mut indoor = 0i32;
+        let mut sum = F32::ZERO;
+        for room in self.rooms.rooms.values() {
+            if room.outdoors {
+                sum = add(room.score.ext(), sum.ext()).to_f32();
+            } else {
+                indoor = indoor.wrapping_add(room.half_tiles / 2);
+            }
+        }
+        self.rooms.outdoor_sum = sum;
+        self.rooms.outdoor_score = tuning.outdoor_score(sum, period);
+        self.globals[INDOOR_AREA] = indoor as i16;
+        match floor {
+            0 => self.rooms.pending = 0,
+            1 => self.rooms.pending &= !1,
+            _ => self.rooms.pending &= !2,
+        }
+        Ok(counted)
+    }
+
+    /// Runs the room update if any level has a room waiting (0x467094):
+    /// for one level if only that level waits, otherwise for every room.
+    /// The original does this before it draws a frame, and at the end of
+    /// reading a house. Returns the rooms counted.
+    pub fn update_pending_rooms(
+        &mut self,
+        tuning: &Tuning,
+        standing: &mut ListStanding<'_>,
+    ) -> Result<Vec<i16>, RoomError> {
+        match self.rooms.pending {
+            0 => Ok(Vec::new()),
+            1 => self.update_rooms(tuning, 1, standing),
+            2 => self.update_rooms(tuning, 2, standing),
+            3 => self.update_rooms(tuning, 0, standing),
+            // The original does nothing for any other value. Nothing here
+            // sets one.
+            _ => Ok(Vec::new()),
+        }
+    }
+}
+
+/// What lists the objects standing on a tile for the room update: given
+/// the lot and a tile as column, row and level, the objects on it in the
+/// order the lot links them. See [`World::update_rooms`].
+pub type ListStanding<'a> = dyn FnMut(&mut World, [u8; 3]) -> Result<Vec<Standing>, RoomError> + 'a;
+
+/// One object standing on a tile, as the room update is told of it. See
+/// [`World::update_rooms`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Standing {
+    pub id: u16,
+    /// The object's type: word 9 of its definition. 2 is a person and 8 a
+    /// window.
+    pub kind: i16,
+    /// Whether the object stands on the lot (0x432595). Only asked of a
+    /// light source, an object with flag 0x400 in data word 40; for any
+    /// other object the room update does not look at it.
+    pub on_lot: bool,
+}
+
+impl Room {
+    /// The light the room shows (0x4688bf, and inline in 0x466c3c): 0.8
+    /// for a pool, and for a dark room with no lights that knows someone
+    /// is in it; otherwise the room's light.
+    ///
+    /// A person tells its room as it enters and leaves (0x468802). An
+    /// outdoor room and a pool ignore that, so they never know. For an
+    /// indoor room it is not ported, and this fails for the one case
+    /// where the answer depends on it: an indoor room that is no pool,
+    /// has no lights, has people standing in it, and whose light is below
+    /// 0.8.
+    pub fn shown_light(&self, id: i16) -> Result<F32, RoomError> {
+        let lit = F32::from_bits(LIT);
+        if self.pool {
+            return Ok(lit);
+        }
+        if !self.outdoors
+            && self.lights == 0
+            && self.people > 0
+            && !matches!(
+                self.light.ext().partial_cmp(&lit.ext()),
+                Some(Ordering::Equal | Ordering::Greater)
+            )
+        {
+            return Err(RoomError::Occupancy(id));
+        }
+        Ok(self.light)
+    }
+
+    /// Counts one listed tile (0x467bb1).
+    fn count_tile(
+        &mut self,
+        level: &Level<'_>,
+        pool: Option<&[u8]>,
+        tile: [u8; 3],
+    ) -> Result<(), RoomError> {
+        let (x, y) = (usize::from(tile[0]), usize::from(tile[1]));
+        let cell = at(x, y);
+        if pool.is_some_and(|pool| pool[cell] < 16) {
+            self.good = self.good.wrapping_add(1);
+        }
+        let segments = level.segments(cell);
+        if self.outdoors {
+            self.half_tiles = self.half_tiles.wrapping_add(2);
+        } else if segments & wall::DIAGONAL == 0 {
+            self.half_tiles = self.half_tiles.wrapping_add(2);
+            if level.floor(cell) != 0 {
+                self.covered_half_tiles = self.covered_half_tiles.wrapping_add(2);
+            }
+            for bit in [wall::WEST, wall::NORTH, wall::EAST, wall::SOUTH] {
+                if segments & bit == 0 {
+                    continue;
+                }
+                let style = level.style(x, y, bit).ok_or(RoomError::Asymmetric {
+                    level: level.level,
+                    x,
+                    y,
+                })?;
+                if decorated(style) {
+                    self.walls = self.walls.wrapping_add(1);
+                    if level.pattern(cell, bit) != 0 {
+                        self.covered_walls = self.covered_walls.wrapping_add(1);
                     }
                 }
             }
-            counted.push(id);
-            totals.push(total);
-        }
-        for (id, total) in counted.iter().zip(totals) {
-            if let Some(room) = self.rooms.rooms.get_mut(id) {
-                [
-                    room.half_tiles,
-                    room.covered_half_tiles,
-                    room.walls,
-                    room.covered_walls,
-                ] = total;
-                room.dirty = false;
+        } else {
+            self.half_tiles = self.half_tiles.wrapping_add(1);
+            // A diagonal wall's style is the cell's second style word,
+            // and its two sides are the last two pattern words.
+            if decorated(level.word(cell, 1)) {
+                self.walls = self.walls.wrapping_add(1);
+                if level.word(cell, 4) != 0 || level.word(cell, 5) != 0 {
+                    self.covered_walls = self.covered_walls.wrapping_add(1);
+                }
+            }
+            if level.word(cell, 0) != 0 || level.word(cell, 2) != 0 {
+                self.covered_half_tiles = self.covered_half_tiles.wrapping_add(1);
             }
         }
-        let indoor = self
-            .rooms
-            .rooms
-            .values()
-            .filter(|room| !room.outdoors)
-            .fold(0i32, |sum, room| sum.wrapping_add(room.half_tiles / 2));
-        self.globals[INDOOR_AREA] = indoor as i16;
-        Ok(counted)
+        Ok(())
     }
+
+    /// Counts one object standing on a listed tile (0x467e05).
+    fn count_object(&mut self, data: &[i16], object: &Standing) -> Result<(), RoomError> {
+        let word = |index: usize| {
+            data.get(index)
+                .copied()
+                .ok_or(RoomError::Standing(object.id))
+        };
+        if word(34)? != 0 || word(29)? < 0 {
+            return Ok(());
+        }
+        self.objects = self.objects.wrapping_add(1);
+        match word(59)? {
+            4 => self.category_4 = self.category_4.wrapping_add(1),
+            5..=7 => self.category_5_to_7 = self.category_5_to_7.wrapping_add(1),
+            _ => {}
+        }
+        if object.kind == 2 {
+            self.people = self.people.wrapping_add(1);
+        }
+        if word(40)? as u16 & 0x400 != 0 && object.on_lot {
+            let window = object.kind == 8;
+            if !window {
+                self.lights = self.lights.wrapping_add(1);
+            }
+            let light = i32::from(word(51)?);
+            if window {
+                self.window_light = self.window_light.wrapping_add(light);
+            } else {
+                self.lamp_light = self.lamp_light.wrapping_add(light);
+            }
+        }
+        self.word_39 = self.word_39.wrapping_add(i32::from(word(39)?));
+        let impact = word(7)?;
+        if !self.outdoors || impact < 0 {
+            self.impact = self.impact.wrapping_add(i32::from(impact));
+        }
+        if impact >= 0 {
+            self.good = self.good.wrapping_add(1);
+        }
+        Ok(())
+    }
+}
+
+/// The constants the room scores are worked out with (0x4665d1). The
+/// original reads them by name from the tuning table 3 of the global
+/// file, with these defaults for a name the table lacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tuning {
+    pub object_light: F32,
+    pub area_clip: F32,
+    pub area_zero: F32,
+    pub area_slope: F32,
+    pub light_zero: F32,
+    pub light_slope: F32,
+    pub impact_area_min: F32,
+    pub impact_area_max: F32,
+    pub impact_multiplier: F32,
+    pub outdoor_impact: F32,
+    pub outdoor_good: F32,
+    pub outdoor_divisor: F32,
+    pub daylight_bonus: F32,
+    pub dawn_dusk_bonus: F32,
+    pub nighttime_bonus: F32,
+    pub floor_zero: F32,
+    pub floor_slope: F32,
+    pub wall_zero: F32,
+    pub wall_slope: F32,
+}
+
+impl Default for Tuning {
+    /// The original's defaults.
+    fn default() -> Self {
+        Self::from_lookup(|_| None)
+    }
+}
+
+/// 0.01, 0.5, 0.8 and 1.0 as floats, and 0.99 as a double: constants of
+/// the original's code.
+const HUNDREDTH: u32 = 0x3c23_d70a;
+const HALF: u32 = 0x3f00_0000;
+const LIT: u32 = 0x3f4c_cccd;
+const ONE: u32 = 0x3f80_0000;
+const NEARLY_ONE: u64 = 0x3fef_ae14_7ae1_47ae;
+
+/// The original subtracts two floats it has just read, in the FPU, and
+/// stores the difference as a float.
+fn slope(full: f32, zero: f32) -> F32 {
+    (F32::from_f32(full).ext() - F32::from_f32(zero).ext()).to_f32()
+}
+
+fn above(a: Ext, b: Ext) -> bool {
+    a.partial_cmp(&b) == Some(Ordering::Greater)
+}
+
+fn below_or_unordered(a: Ext, b: Ext) -> bool {
+    !matches!(a.partial_cmp(&b), Some(Ordering::Equal | Ordering::Greater))
+}
+
+impl Tuning {
+    /// Reads the constants by name. `lookup` gives the table's value for
+    /// a name, or None for a name the table lacks.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<f32>) -> Self {
+        let get = |name: &str, fallback: f32| lookup(name).unwrap_or(fallback);
+        let area_zero = get("area score for zero tiles", -30.0);
+        let light_zero = get("light score for 0.0", -20.0);
+        let floor_zero = get("floor score for 0%", -40.0);
+        let wall_zero = get("wall score for 0%", -40.0);
+        let f = F32::from_f32;
+        Self {
+            object_light: f(get("object light contribution factor", 30.0)),
+            area_clip: f(get("area clip to score", 60.0)),
+            area_zero: f(area_zero),
+            area_slope: slope(get("area score for clip tile", 30.0), area_zero),
+            light_zero: f(light_zero),
+            light_slope: slope(get("light score for 1.0", 20.0), light_zero),
+            impact_area_min: f(get("room impact effective area min", 10.0)),
+            impact_area_max: f(get("room impact effective area max", 45.0)),
+            impact_multiplier: f(get("room impact multiplier", 10.0)),
+            outdoor_impact: f(get("outdoor room impact factor", 2.0)),
+            outdoor_good: f(get("outdoor good object count factor", 1.0)),
+            outdoor_divisor: f(get("outdoor object divisor", 3.0)),
+            daylight_bonus: f(get("outdoor daylight bonus", 0.0)),
+            dawn_dusk_bonus: f(get("outdoor dawn dusk bonus", -20.0)),
+            nighttime_bonus: f(get("outdoor nighttime bonus", -50.0)),
+            floor_zero: f(floor_zero),
+            floor_slope: slope(get("floor score for 100%", 0.0), floor_zero),
+            wall_zero: f(wall_zero),
+            wall_slope: slope(get("wall score for 100%", 0.0), wall_zero),
+        }
+    }
+
+    /// How much daylight there is, by the time of day in global 4
+    /// (0x46740f): all of it by day (0), half at dawn and dusk (1 and 3),
+    /// none at night (2). The value stays in an FPU register.
+    ///
+    /// The original multiplies this by a setting that is 1.0 in a trace
+    /// of the running game. What changes that setting is not known, so it
+    /// is taken to be 1.0: **unverified**.
+    pub fn daylight(period: i16) -> Ext {
+        match period {
+            1 | 3 => F32::from_bits(HALF).ext(),
+            2 => Ext::ZERO,
+            _ => F32::from_bits(ONE).ext(),
+        }
+    }
+
+    /// A counted room's light and score (0x467980), in the original's
+    /// order of operations: every value it stores as a float on the way
+    /// is stored here too.
+    ///
+    /// The original's FPU runs this with its precision control set to
+    /// single precision, so every operation's result is rounded to 24
+    /// bits ([`Ext::single`]). A trace of the running game shows it: one
+    /// room's score there is the sum rounded after each addition, three
+    /// units in the last place away from the sum rounded once.
+    ///
+    /// The light of an outdoor room is the daylight. Indoors it is the
+    /// lamp light plus the window light, each as hundredths per tile of
+    /// area times a constant, the window light also times the daylight
+    /// and no more than the daylight. Below 0.01 it is 0, and above 0.99
+    /// it is 1.
+    ///
+    /// The score of an outdoor room is its good things and its impact,
+    /// each times a constant. Indoors it is the sum of five parts: the
+    /// share of the walls that are covered, the share of the floor that
+    /// is, the impact over the area (the area kept between two bounds),
+    /// the light, and the area up to a limit; all kept within -100 and
+    /// 100.
+    pub fn score(&self, room: &Room, daylight: Ext) -> (F32, F32) {
+        let int = Ext::from_i32;
+        let area = room.half_tiles / 2;
+        let hundredth = F32::from_bits(HUNDREDTH).ext();
+        let light = if room.outdoors {
+            daylight.to_f32()
+        } else {
+            let per_tile = |light: i32| div(mul(int(light), hundredth), int(area));
+            let lamp = mul(per_tile(room.lamp_light), self.object_light.ext()).to_f32();
+            let window = mul(
+                mul(per_tile(room.window_light), daylight),
+                self.object_light.ext(),
+            );
+            // The original stores the window light, then replaces the
+            // stored value with the daylight if the register is above it.
+            let window = if above(window, daylight) {
+                daylight.to_f32()
+            } else {
+                window.to_f32()
+            };
+            let value = add(window.ext(), lamp.ext());
+            if below_or_unordered(value, hundredth) {
+                F32::ZERO
+            } else if above(value, Ext::from_f64_bits(NEARLY_ONE)) {
+                F32::from_bits(ONE)
+            } else {
+                value.to_f32()
+            }
+        };
+        let score = if room.outdoors {
+            add(
+                mul(int(room.good), self.outdoor_good.ext()),
+                mul(int(room.impact), self.outdoor_impact.ext()),
+            )
+            .to_f32()
+        } else {
+            let area = int(area);
+            let clip = self.area_clip.ext();
+            let clipped = if above(area, clip) { clip } else { area };
+            let area_score = add(
+                mul(div(clipped, clip), self.area_slope.ext()),
+                self.area_zero.ext(),
+            )
+            .to_f32();
+            let light_score = add(
+                mul(light.ext(), self.light_slope.ext()),
+                self.light_zero.ext(),
+            )
+            .to_f32();
+            let (least, most) = (self.impact_area_min.ext(), self.impact_area_max.ext());
+            let effective = if below_or_unordered(area, least) {
+                least
+            } else if above(area, most) {
+                most
+            } else {
+                area
+            };
+            let walls = add(
+                mul(
+                    div(int(room.covered_walls), int(room.walls)),
+                    self.wall_slope.ext(),
+                ),
+                self.wall_zero.ext(),
+            );
+            let floors = add(
+                mul(
+                    div(int(room.covered_half_tiles), int(room.half_tiles)),
+                    self.floor_slope.ext(),
+                ),
+                self.floor_zero.ext(),
+            );
+            let impact = div(
+                mul(int(room.impact), self.impact_multiplier.ext()),
+                effective,
+            );
+            let value = add(
+                add(add(add(walls, floors), impact), light_score.ext()),
+                area_score.ext(),
+            );
+            if below_or_unordered(value, int(-100)) {
+                int(-100).to_f32()
+            } else if above(value, int(100)) {
+                int(100).to_f32()
+            } else {
+                value.to_f32()
+            }
+        };
+        (light, score)
+    }
+
+    /// The lot's outdoor score from the sum of the outdoor rooms' scores
+    /// (the end of 0x466c3c). The sum is divided by a constant and stored;
+    /// for a time of day 0 to 3 the bonus for it is added to the value
+    /// still in the register and the result stored over it. Then it is
+    /// kept within -100 and 100.
+    pub fn outdoor_score(&self, sum: F32, period: i16) -> F32 {
+        let share = div(sum.ext(), self.outdoor_divisor.ext());
+        let value = match period {
+            0 => add(share, self.daylight_bonus.ext()).to_f32(),
+            1 | 3 => add(share, self.dawn_dusk_bonus.ext()).to_f32(),
+            2 => add(share, self.nighttime_bonus.ext()).to_f32(),
+            _ => share.to_f32(),
+        };
+        let (least, most) = (Ext::from_i32(-100), Ext::from_i32(100));
+        if above(least, value.ext()) {
+            least.to_f32()
+        } else if above(value.ext(), most) {
+            most.to_f32()
+        } else {
+            value
+        }
+    }
+}
+
+/// The FPU's operations as the room code runs them: with single
+/// precision. See [`Tuning::score`].
+fn add(a: Ext, b: Ext) -> Ext {
+    (a + b).single()
+}
+
+fn mul(a: Ext, b: Ext) -> Ext {
+    (a * b).single()
+}
+
+fn div(a: Ext, b: Ext) -> Ext {
+    (a / b).single()
 }

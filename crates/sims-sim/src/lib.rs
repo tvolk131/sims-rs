@@ -10,7 +10,8 @@
 //! both random streams, the budget and the lot arrays. [`World::hash`]
 //! fingerprints the state, and [`Snapshots`] stores it in a REDB file.
 //! [`load`] holds the load steps that change state without running scripts,
-//! and [`rooms`] works out the lot's rooms from its walls.
+//! and [`rooms`] works out the lot's rooms from its walls and counts
+//! them: their size, what stands in them, their light and their score.
 //!
 //! The state holds every field the readers decode. Bytes the readers keep
 //! but do not understand (format tails, raw records) are left out: they are

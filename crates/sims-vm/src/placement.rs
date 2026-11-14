@@ -37,6 +37,7 @@
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
+use crate::load::INDICATORS;
 use crate::program::DEFINITION_WORDS;
 use crate::visits::function;
 use sims_sim::World;
@@ -103,6 +104,10 @@ const NOWHERE: Place = Place {
 /// Off the lot.
 const OFF_LOT: [i32; 3] = [-16, -16, 1];
 
+/// The type of the star marker the registry puts over a famous Sim
+/// (0x4481eb).
+const STAR: u32 = 0xe933_7020;
+
 fn missing() -> Trap {
     Trap::native(10, "missing object")
 }
@@ -149,7 +154,7 @@ fn tile(position: [i32; 3]) -> [i8; 3] {
 /// **Unverified** whether the original tests against the arrays' 64 tiles,
 /// as the old prototype does, or against the lot's size: no object of the
 /// house the trace loads stands between the two.
-fn on_lot(position: [i32; 2]) -> bool {
+pub(crate) fn on_lot(position: [i32; 2]) -> bool {
     let inside = |n: i32| {
         let n = i32::from((n >> 4) as i8);
         n > 0 && n < FULL - 1
@@ -391,6 +396,33 @@ impl Cursor {
     }
 }
 
+/// Whether an object stands on the lot (0x432595).
+pub(crate) fn stands_on_lot(world: &mut World, id: u16) -> Result<bool, Trap> {
+    Ok(capture(world, id)?.on_lot)
+}
+
+/// The objects standing on a tile, with everything they hold, in the
+/// order the lot links them (0x43f331, 0x43f379). The tile is given as
+/// the lot's rooms list it: column, row and level.
+pub(crate) fn standing_on(world: &World, at: [u8; 3]) -> Result<Vec<u16>, Trap> {
+    let Some(root) = head(world, [at[0] as i8, at[1] as i8, at[2] as i8]) else {
+        return Ok(Vec::new());
+    };
+    let mut cursor = Cursor {
+        root,
+        current: Some(root),
+    };
+    let mut chain = Vec::new();
+    while let Some(current) = cursor.current {
+        if chain.contains(&current) {
+            return Err(Trap::Invalid("the objects on a tile link in a loop".into()));
+        }
+        chain.push(current);
+        cursor.advance(world)?;
+    }
+    Ok(chain)
+}
+
 /// The first object on a tile inside the lot's size, for scripts (Set To
 /// Next mode 9).
 pub(crate) fn first_on(world: &World, at: [i32; 2], level: i8) -> Option<u16> {
@@ -504,6 +536,11 @@ impl Interpreter<'_> {
     }
 
     /// Whether an object's callback table names a tree for a function.
+    /// An object's type: word 9 of its definition.
+    pub(crate) fn kind(&self, world: &World, id: u16) -> Result<i16, Trap> {
+        Ok(self.words(world, id)?[word::TYPE])
+    }
+
     pub(crate) fn has_function(&self, world: &World, id: u16, function: usize) -> bool {
         world
             .objects
@@ -767,10 +804,43 @@ impl Interpreter<'_> {
         if words[word::PORTAL] == 6 {
             self.mark_portal(world, was, false).map_err(fail)?;
         }
-        // With `notify` the original tells the interface the object left
-        // (0x447d8b), which changes nothing the simulation holds.
-        let _ = notify;
+        if notify {
+            self.left_lot(world, id)?;
+        }
         Ok(())
+    }
+
+    /// What the object registry does when it is told an object left the
+    /// lot (0x447d2b, 0x4481eb): an indicator object is taken off the lot
+    /// once more, this time without telling the registry. So an indicator
+    /// that leaves is asked function 10 twice. Any other object changes
+    /// nothing, and neither does a person: the original looks up what the
+    /// person holds in its slot 1 and then goes by the person's own type.
+    ///
+    /// A star marker (GUID 0xE9337020) is also returned to the pool the
+    /// registry keeps of them, which is not ported and fails.
+    ///
+    /// The registry does this only while it is switched on (its byte
+    /// 0x11). In a trace of a load it is switched off only while the lot
+    /// is being cleared, which does not come through here.
+    fn left_lot(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
+        if object.guid == STAR {
+            return Err(fail(Trap::Unsupported(
+                "a star marker leaving the lot goes back to the registry's pool; that is not \
+                 ported"
+                    .into(),
+            )));
+        }
+        if !INDICATORS.contains(&object.guid) || object.person.is_some() {
+            return Ok(());
+        }
+        self.take_off_one(world, id, false)
     }
 
     /// One object is put at a place (0x433340).

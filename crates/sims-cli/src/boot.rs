@@ -1,5 +1,6 @@
-//! `sims boot`: run the lot load for a house as far as it is implemented
-//! and print the hash of the state it reaches.
+//! `sims boot`: run the lot load for a house and print the hash of the
+//! state it reaches. A load that completes ends at the state the
+//! original's first tick starts from. Ticks are not implemented.
 
 use sims_content::{Catalog, House, Index, Install, Neighborhood, People};
 use sims_sim::load::Context;
@@ -19,7 +20,11 @@ pub struct Options<'a> {
 
 pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     if options.ticks > 0 {
-        return Err("running ticks needs the script interpreter (roadmap step 3)".into());
+        return Err(
+            "running ticks is not implemented: the boot stops when the load is complete, at \
+             the state the first tick starts from (docs/roadmap.md)"
+                .into(),
+        );
     }
     let install = Install::detect(options.root)?;
     let directory = options
@@ -111,10 +116,14 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     // The original now works out the lot's rooms from the walls it has
     // read. That makes it give every object its room and ask each object's
     // function 7 (step 10), and then count the rooms, which sets the
-    // lot's indoor area.
+    // lot's indoor area (step 10a). The count changes every room's light,
+    // so the rooms are marked again. The end of the house read marks
+    // them all once more (signal 0xdd) and counts whatever waits.
     world.rebuild_rooms()?;
     let roomed = interpreter.assign_rooms(&mut world)?;
-    world.update_rooms()?;
+    interpreter.update_rooms(&mut world, 0)?;
+    world.mark_all_rooms();
+    interpreter.update_pending_rooms(&mut world)?;
     // 11: the removal queue is emptied. 12: the household that lives in
     // the house is selected.
     let dropped = world.discard_removals();
@@ -141,13 +150,20 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     // 14: the indicators are created if no visit made them. 15: the end
     // of the household selection, which has nothing to do on a lot whose
     // people are all members of the household. 16: the loaded house is
-    // announced, which asks for the indicators once more.
+    // announced, which asks for the indicators once more and clears the
+    // selected Sim. 17 and 18: the funds are set again and the family's
+    // first member is selected. 19: the game goes to live mode. 20
+    // changes nothing here. 21 and 22: the waiting rooms are counted and
+    // the interface's wait check clears global 12.
     let mut finished = None;
     if visited.stopped.is_none() {
         let made = interpreter.ensure_indicators(&mut world)?.is_some();
         world.finish_selection(record.flags)?;
-        let made_again = interpreter.ensure_indicators(&mut world)?.is_some();
-        finished = Some(made || made_again);
+        let made_again = interpreter.announce_house(&mut world)?.is_some();
+        let sim = interpreter.select_resident(&mut world, record.budget, &record.members)?;
+        interpreter.go_live(&mut world)?;
+        let counted = interpreter.before_frame(&mut world)?;
+        finished = Some((made || made_again, sim, counted.len()));
     }
     if let Some(path) = options.snapshot {
         Snapshots::open(path)?.save("boot", &world)?;
@@ -247,10 +263,11 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
             );
         }
         None => {
+            let (made, sim, counted) = finished.unwrap_or((false, None, 0));
             let _ = writeln!(
                 out,
                 "         indicators {}; household selection finished; house announced",
-                if finished == Some(true) {
+                if made {
                     "created"
                 } else {
                     "already on the lot"
@@ -258,8 +275,16 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
             );
             let _ = writeln!(
                 out,
-                "         stopped before the game selects a Sim and goes to live mode (step 17, \
-                 not implemented yet)"
+                "         {}; live mode; {counted} rooms counted, {} still marked",
+                match sim {
+                    Some(sim) => format!("Sim {sim} selected"),
+                    None => "no Sim selected".to_owned(),
+                },
+                world.rooms.rooms.values().filter(|room| room.dirty).count()
+            );
+            let _ = writeln!(
+                out,
+                "         load complete: this is the state the first tick starts from"
             );
         }
     }
