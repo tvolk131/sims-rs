@@ -1230,6 +1230,26 @@ from the original; the results equal what it stored.
 **Stops.** Tick 334: person 16's head follows its target (`0x5907c5`),
 which needs the places of its bones in the current pose (`0x5904d2`).
 
+## Track: drawing people (`crates/sims-people`)
+
+Draw the Sims from the original's files, posed by the simulation's
+animator state, which the crate reads and never changes. Milestone: the
+Goth family's three Sims drawn with correct meshes and skins, posed from
+a skeleton, playing an idle and a walk clip in an offscreen render and a
+small viewer, with one pose compared with a screenshot of the original.
+
+Progress:
+
+- Done: the person files are found by name across the base game and
+  expansions; a saved person's appearance strings choose the meshes and
+  skin textures; the skeleton is posed and the meshes skinned on the CPU;
+  a software rasterizer draws them offscreen. The three Goths draw in
+  their rest pose with the right meshes and textures (pinned by digest,
+  gated on `SIMS_INSTALL`).
+- Next: animation clips and their samples, the idle and walk clips posed
+  from the simulation's animator state, a viewer, and the comparison
+  with the original.
+
 ## Working rules
 
 - Work in branches, open PRs, and merge when CI is green on both platforms.
