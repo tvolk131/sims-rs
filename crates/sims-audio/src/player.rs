@@ -16,8 +16,9 @@
 //!   shared by every thread (`SimSpeed` is 100). A new thread's `patch`
 //!   register (50) holds its track's patch. When the track's arguments
 //!   are `kArgsIdVolPan` (2, nearly every track), `arg1` holds the object
-//!   that started it: routines pass it to `getsrcdatafield`. Every other
-//!   register starts at 0.
+//!   that started it: routines pass it to `getsrcdatafield`. The
+//!   registers in [`DEFAULTS`] start as the original's default register
+//!   bank holds them (read from its code); every other starts at 0.
 //! - `note_on` starts the patch in register 50 and writes the note's ID
 //!   to its operand; `wait_samp` waits until the thread's last note ends.
 //! - `end` returns from a `call`, or ends the thread when nothing called
@@ -33,11 +34,36 @@
 //! - `wait r` waits `r` milliseconds; the `wait` comparisons wait until
 //!   their condition holds.
 //!
+//! - Sequence groups and fades follow the original's code, read from a
+//!   memory image of the running game (not traced at run time). A group
+//!   is a slot holding the ID of the thread that last claimed it.
+//!   `seqgroup_return g` claims group `g` and ends its own thread if
+//!   another thread held it. `seqgroup_kill g` claims it too; if another
+//!   thread held it, that thread ends at once when its `extvol` is 0, and
+//!   otherwise starts fading `extvol` at speed 200 (unless it already is)
+//!   while this thread runs the instruction again 2 ms later. Slots are
+//!   never cleared when a thread ends (only [`SoundEvent::StopAll`] clears
+//!   them here). `seqgroup_trkid g, r` writes group `g`'s holder to `r`.
+//!   A fade moves its register once per block, before the thread's
+//!   instructions; how often the original updates is not known.
+//!
 //! **Unverified** against the original: all of the above, and what this
 //! player leaves out. Volume, pan, pitch, ducking, priorities and 3D
 //! position are not applied: every note plays at full volume, centred,
-//! at its own speed. The `seqgroup_*` instructions and `test1` to `test4`
-//! do nothing; `setll`, `setlt` and `settl` copy like `set`. How the
+//! at its own speed, so a fade changes registers but not the sound.
+//! `seqgroup_wait`, `add_to_group`, `remove_from_group` and `test1` to
+//! `test4` are not ported: a thread that reaches one ends with a fault.
+//! (The original does nothing for the first three; no program in the
+//! install uses them. The tests are debug routines.) `setll`, `setlt` and
+//! `settl` copy like `set`.
+//!
+//! Limits, so no script can hang or exhaust the host: one thread runs at
+//! most [`STEPS`] instructions per block and all threads together
+//! [`BLOCK_STEPS`] (threads a block does not reach run first in the
+//! next); at most [`THREADS`] threads, [`NOTES`] notes and [`SEQGROUPS`]
+//! sequence groups exist at once; calls nest at most [`CALL_DEPTH`] deep;
+//! a thread started by `play_trk` first runs in the next block; a patch
+//! that does not exist is not cached. How the
 //! original picks among duplicate events, patches and hit lists across
 //! modules is unknown; here the module whose name sorts first wins.
 
@@ -54,6 +80,22 @@ pub const BLOCK: usize = 64;
 /// Instructions one thread may run in one block before the player calls
 /// it stuck and ends it.
 pub const STEPS: usize = 10_000;
+/// Instructions all threads together may run in one block. When they are
+/// spent, the running thread stops where it is and it and every thread
+/// not yet run go on in the next block.
+pub const BLOCK_STEPS: usize = 100_000;
+/// Threads that may exist at once, those waiting to start included. A
+/// thread started beyond it is a fault.
+pub const THREADS: usize = 256;
+/// Notes that may play at once. A note started beyond it is a fault and
+/// does not play.
+pub const NOTES: usize = 1024;
+/// Faults the player records before it drops further ones.
+pub const FAULTS: usize = 1000;
+/// How deep `call`s may nest in one thread.
+pub const CALL_DEPTH: usize = 64;
+/// How many sequence groups may exist; slots are never freed.
+pub const SEQGROUPS: usize = 256;
 /// The first global register.
 pub const GLOBALS: u8 = 100;
 /// The register a new note's patch is read from.
@@ -61,6 +103,29 @@ pub const PATCH: u8 = 50;
 
 /// The track argument kind `kArgsIdVolPan`: `arg1` is the object.
 pub const ARGS_ID_VOL_PAN: i64 = 2;
+/// The `extvol` register, which `seqgroup_kill` fades out.
+pub const EXTVOL: u8 = 19;
+/// The fade registers: the value to reach, the register that moves, how
+/// far it moves per block, and whether it is moving.
+pub const FADE_DEST: u8 = 40;
+pub const FADE_VAR: u8 = 41;
+pub const FADE_SPEED: u8 = 42;
+pub const FADE_ON: u8 = 45;
+/// A new thread's registers that do not start at 0, as the original's
+/// default register bank holds them: `priority`, `vol`, `extvol`, `pan`,
+/// `pitch`, `MinDistance`, `MaxDistance` and `fade_dest`.
+pub const DEFAULTS: [(u8, i32); 8] = [
+    (17, 32),
+    (18, 1024),
+    (EXTVOL, 1024),
+    (20, 512),
+    (21, 3600),
+    (28, 100),
+    (29, 10000),
+    (FADE_DEST, 1),
+];
+/// How long `seqgroup_kill` waits after starting a fade, in milliseconds.
+const SEQGROUP_WAIT_MS: u64 = 2;
 
 /// Where the player gets a patch's samples.
 pub trait Samples {
@@ -144,6 +209,8 @@ enum Flow {
     /// Go to this address next block.
     JumpYield(u32),
     End,
+    /// End the thread, whatever called it, and stop its notes.
+    Kill,
 }
 
 /// The HIT VM and mixer.
@@ -156,6 +223,14 @@ pub struct Player<S> {
     cache: BTreeMap<u32, Option<Pcm>>,
     globals: [i32; 256 - GLOBALS as usize],
     threads: Vec<Thread>,
+    /// Threads started by `play_trk`, which first run in the next block.
+    pending: Vec<Thread>,
+    /// Whether a block has run out of instructions; reported once.
+    over_budget: bool,
+    /// Sequence groups: the group a register names, to the ID of the
+    /// thread that last claimed it with `seqgroup_kill` or
+    /// `seqgroup_return`. A slot keeps its ID after that thread ends.
+    seqgroups: BTreeMap<i32, u32>,
     notes: Vec<Note>,
     frame: u64,
     /// The frame at which the threads last ran.
@@ -163,7 +238,7 @@ pub struct Player<S> {
     next_id: u32,
     random: u64,
     /// What went wrong while running, in order: unknown events, missing
-    /// samples, threads ended for a bad instruction.
+    /// samples, threads ended for a bad instruction. At most [`FAULTS`].
     pub faults: Vec<String>,
 }
 
@@ -192,6 +267,9 @@ impl<S: Samples> Player<S> {
             cache: BTreeMap::new(),
             globals: [0; 256 - GLOBALS as usize],
             threads: Vec::new(),
+            pending: Vec::new(),
+            over_budget: false,
+            seqgroups: BTreeMap::new(),
             notes: Vec::new(),
             frame: 0,
             ran_at: None,
@@ -214,7 +292,7 @@ impl<S: Samples> Player<S> {
 
     /// Whether nothing is running or playing.
     pub fn is_idle(&self) -> bool {
-        self.threads.is_empty() && self.notes.is_empty()
+        self.threads.is_empty() && self.pending.is_empty() && self.notes.is_empty()
     }
 
     /// Acts on one event from the simulation.
@@ -223,57 +301,85 @@ impl<S: Samples> Player<S> {
             SoundEvent::Play { object, name } => self.play(*object, name),
             SoundEvent::StopObject { object } => {
                 self.threads.retain(|t| t.object != *object);
+                self.pending.retain(|t| t.object != *object);
                 self.notes.retain(|n| n.object != *object);
             }
             SoundEvent::StopAll => {
                 self.threads.clear();
+                self.pending.clear();
                 self.notes.clear();
+                self.seqgroups.clear();
             }
         }
     }
 
     fn play(&mut self, object: u32, name: &str) {
-        let found = self.modules.iter().enumerate().find_map(|(index, module)| {
-            let event = module.hot.event(name)?;
-            let kind = module.number(&event.kind);
-            let track = event.track.as_ref().and_then(|t| module.number(t));
-            Some((index, kind, track))
+        match (0..self.modules.len()).find(|&m| self.modules[m].hot.event(name).is_some()) {
+            Some(module) => self.play_from(module, object, name),
+            None => self.report(format!("no event {name}")),
+        }
+    }
+
+    /// Plays the event of that name as one module defines it, whether or
+    /// not an earlier module's definition would win in
+    /// [`SoundEvent::Play`]. The module is an index into the modules
+    /// given to [`Player::new`].
+    pub fn play_from(&mut self, module: usize, object: u32, name: &str) {
+        let found = self.modules.get(module).and_then(|owner| {
+            let event = owner.hot.event(name)?;
+            let kind = owner.number(&event.kind);
+            let track = event.track.as_ref().and_then(|t| owner.number(t));
+            Some((module, kind, track))
         });
         match found {
-            Some((module, Some(1), Some(track))) => self.start(object, module, track as u32),
-            Some((_, kind, _)) => self.faults.push(format!(
+            Some((module, Some(1), Some(track))) => {
+                self.start(object, module, track as u32, false);
+            }
+            Some((_, kind, _)) => self.report(format!(
                 "event {name}: kind {kind:?} is not one this player plays"
             )),
-            None => self.faults.push(format!("no event {name}")),
+            None => self.report(format!("no event {name}")),
         }
     }
 
     /// Starts a track's routine for an object. The module given is tried
-    /// first, then every other.
-    fn start(&mut self, object: u32, module: usize, track: u32) {
+    /// first, then every other. A deferred thread first runs in the next
+    /// block.
+    fn start(&mut self, object: u32, module: usize, track: u32, defer: bool) {
+        if self.threads.len() + self.pending.len() >= THREADS {
+            self.report(format!("track {track}: more than {THREADS} threads"));
+            return;
+        }
         let order = std::iter::once(module).chain(0..self.modules.len());
         let Some(module) = order
             .into_iter()
             .find(|&m| self.modules[m].hot.tracks.contains_key(&track))
         else {
-            self.faults.push(format!("no track {track}"));
+            self.report(format!("no track {track}"));
             return;
         };
         let owner = &self.modules[module];
         let Some(pc) = owner.entry(track).and_then(|entry| owner.address(entry)) else {
-            self.faults
-                .push(format!("track {track}: entry point not found"));
+            self.report(format!("track {track}: entry point not found"));
             return;
         };
         let fields = &owner.hot.tracks[&track];
         let patch = owner.number(&fields.patch).unwrap_or(0);
         let mut registers = [0; GLOBALS as usize];
+        for (register, value) in DEFAULTS {
+            registers[usize::from(register)] = value;
+        }
         registers[usize::from(PATCH)] = patch as i32;
         if owner.number(&fields.args) == Some(ARGS_ID_VOL_PAN) {
             registers[1] = object as i32;
         }
         let id = self.id();
-        self.threads.push(Thread {
+        let queue = if defer {
+            &mut self.pending
+        } else {
+            &mut self.threads
+        };
+        queue.push(Thread {
             id,
             object,
             module,
@@ -287,6 +393,14 @@ impl<S: Samples> Player<S> {
             last_note: 0,
             wake: 0,
         });
+    }
+
+    /// Records a fault, up to [`FAULTS`] of them; later ones are dropped,
+    /// so a script that faults every block cannot grow the list forever.
+    fn report(&mut self, message: String) {
+        if self.faults.len() < FAULTS {
+            self.faults.push(message);
+        }
     }
 
     fn id(&mut self) -> u32 {
@@ -342,7 +456,7 @@ impl<S: Samples> Player<S> {
 
     fn mix(&mut self, frames: usize, out: &mut Vec<i16>) {
         let start = out.len();
-        let mut sums = vec![0i32; frames];
+        let mut sums = vec![0i64; frames];
         let cache = &self.cache;
         self.notes.retain_mut(|note| {
             let Some(Some(pcm)) = cache.get(&note.patch) else {
@@ -369,8 +483,10 @@ impl<S: Samples> Player<S> {
                 } else {
                     first
                 };
-                let fraction = (note.position & 0xffff) as i32;
-                *slot += first + (((second - first) * fraction) >> 16);
+                // The difference of two samples times a 16-bit fraction
+                // needs more than 32 bits.
+                let fraction = i64::from((note.position & 0xffff) as u32);
+                *slot += i64::from(first) + ((i64::from(second - first) * fraction) >> 16);
                 note.position += note.step;
             }
             note.position >> 16 < length
@@ -380,10 +496,28 @@ impl<S: Samples> Player<S> {
     }
 
     fn run(&mut self, sources: &dyn Sources) {
+        let mut budget = BLOCK_STEPS;
         let mut index = 0;
         while index < self.threads.len() {
+            if budget == 0 {
+                if !self.over_budget {
+                    self.over_budget = true;
+                    self.report(format!(
+                        "threads ran {BLOCK_STEPS} instructions in one block; the rest wait"
+                    ));
+                }
+                // The threads not reached still fade, and run first next
+                // block, so busy threads cannot starve them.
+                for at in index..self.threads.len() {
+                    let mut thread = self.threads[at].clone();
+                    self.fade(&mut thread);
+                    self.threads[at] = thread;
+                }
+                self.threads.rotate_left(index);
+                break;
+            }
             let mut thread = self.threads[index].clone();
-            let alive = self.step(&mut thread, sources);
+            let alive = self.step(&mut thread, sources, &mut budget);
             // A thread may have stopped others (kill_trk) or started some
             // (play_trk); find this one again by ID.
             match self.threads.iter().position(|t| t.id == thread.id) {
@@ -398,14 +532,23 @@ impl<S: Samples> Player<S> {
                 None => {}
             }
         }
+        // Threads started this block run from the next one, so a track
+        // that starts itself cannot keep this loop going.
+        self.threads.append(&mut self.pending);
     }
 
-    /// Runs one thread until it waits or ends. False when it ended.
-    fn step(&mut self, thread: &mut Thread, sources: &dyn Sources) -> bool {
+    /// Runs one thread until it waits, ends, or the block's instructions
+    /// run out (`budget`). False when it ended.
+    fn step(&mut self, thread: &mut Thread, sources: &dyn Sources, budget: &mut usize) -> bool {
+        self.fade(thread);
         if thread.wake > self.frame {
             return true;
         }
         for _ in 0..STEPS {
+            if *budget == 0 {
+                return true;
+            }
+            *budget -= 1;
             let module = &self.modules[thread.module];
             let instruction = match module.program.decode(thread.pc, &|id| module.is_target(id)) {
                 Ok(instruction) => instruction,
@@ -428,15 +571,73 @@ impl<S: Samples> Player<S> {
                     Some(pc) => thread.pc = pc,
                     None => return false,
                 },
+                Ok(Flow::Kill) => {
+                    let id = thread.id;
+                    self.notes.retain(|n| n.thread != id);
+                    return false;
+                }
                 Err(message) => return self.fault(thread, &message),
             }
         }
         self.fault(thread, "ran too long without waiting")
     }
 
+    /// Moves a fading register one step, as the original's run loop does
+    /// before it runs a track's instructions: toward `fade_dest` by
+    /// `fade_speed`, whichever sign the speed has, stopping when it passes
+    /// the destination. A speed of 0 moves nothing and ends the fade.
+    /// (The original adds in 32 bits and can wrap past the destination;
+    /// here the sum is wide, so it stops there.)
+    fn fade(&mut self, thread: &mut Thread) {
+        let register = |r: u8| thread.registers[usize::from(r)];
+        if register(FADE_ON) == 0 {
+            return;
+        }
+        let (var, dest, speed) = (
+            i64::from(register(FADE_VAR)),
+            register(FADE_DEST),
+            register(FADE_SPEED),
+        );
+        if speed == 0 {
+            thread.registers[usize::from(FADE_ON)] = 0;
+        }
+        let value = self.read(thread, var);
+        let mut speed = i64::from(speed);
+        if (value < dest) != (speed > 0) {
+            speed = -speed;
+        }
+        let mut value = i64::from(value) + speed;
+        let dest = i64::from(dest);
+        if (speed > 0 && value > dest) || (speed < 0 && value < dest) {
+            value = dest;
+            thread.registers[usize::from(FADE_ON)] = 0;
+        }
+        // Short of the destination, the value lies between it and an i32.
+        self.write(thread, var, value as i32);
+    }
+
+    /// The group a `seqgroup_*` instruction names: the value of its
+    /// register operand, which must be 1 to 127. With `claim`, a group
+    /// with no slot yet is an error once [`SEQGROUPS`] exist.
+    fn seqgroup(
+        &self,
+        thread: &Thread,
+        instruction: &Instruction,
+        claim: bool,
+    ) -> Result<i32, String> {
+        let group = match instruction.values().first() {
+            Some(&r) if (1..=127).contains(&r) => self.read(thread, r),
+            _ => return Err(format!("{}: bad register", instruction.name())),
+        };
+        if claim && self.seqgroups.len() >= SEQGROUPS && !self.seqgroups.contains_key(&group) {
+            return Err(format!("more than {SEQGROUPS} sequence groups"));
+        }
+        Ok(group)
+    }
+
     fn fault(&mut self, thread: &Thread, message: &str) -> bool {
         let name = &self.modules[thread.module].name;
-        self.faults.push(format!(
+        self.report(format!(
             "track {} ({name}) at {:#x}: {message}",
             thread.track, thread.pc
         ));
@@ -472,14 +673,15 @@ impl<S: Samples> Player<S> {
                 Some(path) => {
                     let pcm = self.samples.load(&path);
                     if pcm.is_none() {
-                        self.faults
-                            .push(format!("patch {patch}: no sample at {path}"));
+                        self.report(format!("patch {patch}: no sample at {path}"));
                     }
                     pcm
                 }
                 None => {
-                    self.faults.push(format!("no patch {patch}"));
-                    None
+                    // Not cached: any number may name a missing patch,
+                    // so caching them would grow without bound.
+                    self.report(format!("no patch {patch}"));
+                    return 0;
                 }
             };
             self.cache.insert(patch, pcm);
@@ -487,6 +689,10 @@ impl<S: Samples> Player<S> {
         let Some(Some(pcm)) = self.cache.get(&patch) else {
             return 0;
         };
+        if self.notes.len() >= NOTES {
+            self.report(format!("patch {patch}: more than {NOTES} notes"));
+            return 0;
+        }
         let step = (u64::from(pcm.rate) << 16) / u64::from(RATE);
         let id = self.id();
         self.notes.push(Note {
@@ -555,6 +761,9 @@ impl<S: Samples> Player<S> {
                 Flow::Next
             }
             "call" => {
+                if thread.stack.len() >= CALL_DEPTH {
+                    return Err(format!("calls nested deeper than {CALL_DEPTH}"));
+                }
                 thread.stack.push(next);
                 Flow::Jump(self.target(thread, arg(0) as u32)?)
             }
@@ -582,8 +791,7 @@ impl<S: Samples> Player<S> {
                 thread.kept = i64::from(self.read(thread, arg(0)));
                 Flow::Next
             }
-            "nop" | "test1" | "test2" | "test3" | "test4" | "seqgroup_kill" | "seqgroup_wait"
-            | "seqgroup_return" => Flow::Next,
+            "nop" => Flow::Next,
             "add" | "sub" | "mul" | "div" => {
                 let (a, b) = (self.read(thread, arg(0)), self.read(thread, arg(1)));
                 let value = match instruction.name() {
@@ -632,7 +840,7 @@ impl<S: Samples> Player<S> {
             }
             "play_trk" => {
                 let track = self.read(thread, arg(0)) as u32;
-                self.start(thread.object, thread.module, track);
+                self.start(thread.object, thread.module, track, true);
                 Flow::Next
             }
             "kill_trk" => {
@@ -645,7 +853,60 @@ impl<S: Samples> Player<S> {
                     .map(|t| t.id)
                     .collect();
                 self.threads.retain(|t| !killed.contains(&t.id));
+                self.pending
+                    .retain(|t| !(t.object == object && t.track == track));
                 self.notes.retain(|n| !killed.contains(&n.thread));
+                Flow::Next
+            }
+            "seqgroup_kill" => {
+                let group = self.seqgroup(thread, instruction, true)?;
+                let me = thread.id;
+                let mut flow = Flow::Next;
+                let holder = self.seqgroups.get(&group).copied().unwrap_or(0);
+                // A holder that has ended is skipped (the original looks
+                // its ID up and does not check for none).
+                if holder != 0
+                    && holder != me
+                    && let Some(at) = self.threads.iter().position(|t| t.id == holder)
+                {
+                    let other = &mut self.threads[at].registers;
+                    let reg = |r: u8| usize::from(r);
+                    if other[reg(EXTVOL)] == 0 {
+                        self.threads.remove(at);
+                        self.notes.retain(|n| n.thread != holder);
+                    } else {
+                        let fading =
+                            other[reg(FADE_ON)] != 0 && other[reg(FADE_VAR)] == i32::from(EXTVOL);
+                        if !fading {
+                            other[reg(FADE_SPEED)] = 200;
+                            other[reg(FADE_VAR)] = i32::from(EXTVOL);
+                            other[reg(FADE_ON)] = 1;
+                        }
+                        // Run this instruction again shortly; by then
+                        // this thread holds the group.
+                        thread.wake =
+                            self.frame + (SEQGROUP_WAIT_MS * u64::from(RATE)).div_ceil(1000);
+                        flow = Flow::Block;
+                    }
+                }
+                self.seqgroups.insert(group, me);
+                flow
+            }
+            "seqgroup_return" => {
+                let group = self.seqgroup(thread, instruction, true)?;
+                let me = thread.id;
+                let holder = self.seqgroups.insert(group, me).unwrap_or(0);
+                if holder != 0 && holder != me {
+                    Flow::Kill
+                } else {
+                    Flow::Next
+                }
+            }
+            "seqgroup_trkid" => {
+                // The group's register first, then where its holder goes.
+                let group = self.seqgroup(thread, instruction, false)?;
+                let holder = self.seqgroups.get(&group).copied().unwrap_or(0);
+                self.write(thread, arg(1), holder as i32);
                 Flow::Next
             }
             "getsrcdatafield" => {
