@@ -328,3 +328,34 @@ fn a_resource_over_the_size_limit_fails_to_read() {
     let (_, huge) = index.named("Huge.iff").next().unwrap();
     assert!(huge.read().unwrap_err().to_string().contains("128 MiB"));
 }
+
+#[test]
+fn a_member_nested_too_deeply_is_left_out() {
+    let tree = Tree::new("deep-member");
+    base_game(&tree);
+    let deep = format!("{}x.iff", "a\\".repeat(33));
+    let shallow = format!("{}y.iff", "a\\".repeat(32));
+    tree.file(
+        "Downloads/pack.far",
+        &far(&[(&deep, b"deep"), (&shallow, b"shallow")]),
+    );
+    let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
+    assert_eq!(index.named(&shallow).count(), 1);
+    assert_eq!(index.named(&deep).count(), 0);
+    assert_eq!(index.diagnostics.len(), 1);
+    assert!(index.diagnostics[0].contains("in 33 directories"));
+}
+
+#[test]
+fn a_compressed_member_of_the_animation_archives_fails_the_load() {
+    let tree = Tree::new("compressed-animation");
+    base_game(&tree);
+    let mut archive = far(&[("clips.bcf", &[0; 8])]);
+    let manifest = u32::from_le_bytes(archive[12..16].try_into().unwrap()) as usize;
+    archive[manifest + 4..manifest + 8].copy_from_slice(&9u32.to_le_bytes());
+    tree.file("GameData/Animation/Animation.far", &archive);
+    let install = Install::detect(&tree.0).unwrap();
+    let index = Index::build(&install).unwrap();
+    let error = sims_content::Animations::load(&install, &index).unwrap_err();
+    assert!(error.to_string().contains("compressed member clips.bcf"));
+}

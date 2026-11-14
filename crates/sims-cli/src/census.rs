@@ -8,8 +8,11 @@ use sims_formats::{
     animation, avatar, behavior, career, execution, far, ffn, iff, lot, neighborhood, sprite,
     strings, tatt, tuning,
 };
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 #[derive(Default)]
@@ -80,6 +83,49 @@ fn extension(name: &str) -> String {
 
 type Outcome = sims_formats::Result<()>;
 
+/// Where an archive's bytes are: in memory, as a member of another
+/// archive, or in a file on disk of the given length.
+enum Archive<'a> {
+    Memory(&'a [u8]),
+    Disk(&'a mut File, u64),
+}
+
+impl Archive<'_> {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Memory(bytes) => bytes.len() as u64,
+            Self::Disk(_, len) => *len,
+        }
+    }
+
+    /// `len` bytes from `offset`, which the caller has checked lie inside
+    /// the archive. A read from disk is capped at [`far::MAX_MEMBER`].
+    fn read(&mut self, offset: u64, len: u64) -> sims_formats::Result<Cow<'_, [u8]>> {
+        let fail = |message: String| sims_formats::Error::new(offset as usize, message);
+        match self {
+            Self::Memory(bytes) => usize::try_from(offset)
+                .ok()
+                .zip(usize::try_from(len).ok())
+                .and_then(|(start, len)| bytes.get(start..start.checked_add(len)?))
+                .map(Cow::Borrowed)
+                .ok_or_else(|| fail("range outside archive".to_owned())),
+            Self::Disk(file, _) => {
+                if len > far::MAX_MEMBER {
+                    return Err(fail(format!("{len} bytes exceed the 128 MiB limit")));
+                }
+                let mut bytes = Vec::with_capacity(len as usize);
+                file.seek(SeekFrom::Start(offset))
+                    .and_then(|_| (&mut **file).take(len).read_to_end(&mut bytes))
+                    .map_err(|e| fail(e.to_string()))?;
+                if bytes.len() as u64 != len {
+                    return Err(fail("archive ends early".to_owned()));
+                }
+                Ok(Cow::Owned(bytes))
+            }
+        }
+    }
+}
+
 impl Census {
     fn record(&mut self, kind: &str, location: &str, outcome: Outcome) {
         let tally = self.tallies.entry(kind.to_owned()).or_default();
@@ -105,11 +151,35 @@ impl Census {
                 self.add_path(&entry)?;
             }
         } else if path.is_file() {
-            let bytes = std::fs::read(path)?;
-            self.budget = (bytes.len() as u64)
-                .saturating_mul(WORK_FACTOR)
-                .saturating_add(WORK_FLOOR);
-            self.file(&path.display().to_string(), &bytes, 0);
+            self.disk_file(path)?;
+        }
+        Ok(())
+    }
+
+    /// Visits a file on disk. An archive is read a member at a time, so
+    /// only its directory and one member are in memory at once; any other
+    /// file is read whole, up to [`far::MAX_MEMBER`].
+    fn disk_file(&mut self, path: &Path) -> std::io::Result<()> {
+        let location = path.display().to_string();
+        let mut file = File::open(path)?;
+        let len = file.metadata()?.len();
+        self.budget = len.saturating_mul(WORK_FACTOR).saturating_add(WORK_FLOOR);
+        let mut magic = [0; 8];
+        if len >= 8 {
+            file.read_exact(&mut magic)?;
+        }
+        if magic == *b"FAR!byAZ" {
+            self.files += 1;
+            self.far(&location, Archive::Disk(&mut file, len), 0);
+        } else if len > far::MAX_MEMBER {
+            self.files += 1;
+            let error = sims_formats::Error::new(0, "file exceeds the 128 MiB limit");
+            self.record("Oversized file", &location, Err(error));
+        } else {
+            file.rewind()?;
+            let mut bytes = Vec::with_capacity(len as usize);
+            file.take(len).read_to_end(&mut bytes)?;
+            self.file(&location, &bytes, 0);
         }
         Ok(())
     }
@@ -119,7 +189,7 @@ impl Census {
     fn file(&mut self, location: &str, bytes: &[u8], depth: u32) {
         self.files += 1;
         if bytes.starts_with(b"FAR!byAZ") {
-            self.far(location, bytes, depth);
+            self.far(location, Archive::Memory(bytes), depth);
         } else if bytes.starts_with(b"IFF FILE") {
             self.iff(location, bytes);
         } else {
@@ -146,8 +216,8 @@ impl Census {
         }
     }
 
-    fn far(&mut self, location: &str, bytes: &[u8], depth: u32) {
-        let entries = match self.members(bytes, depth) {
+    fn far(&mut self, location: &str, mut archive: Archive<'_>, depth: u32) {
+        let entries = match self.members(&mut archive, depth) {
             Ok(entries) => {
                 self.record("FAR archive", location, Ok(()));
                 entries
@@ -155,9 +225,14 @@ impl Census {
             Err(error) => return self.record("FAR archive", location, Err(error)),
         };
         for entry in entries {
-            let start = entry.offset as usize;
-            let member = &bytes[start..start + entry.stored_size as usize];
-            self.file(&format!("{location}/{}", entry.name), member, depth + 1);
+            let location = format!("{location}/{}", entry.name);
+            match archive.read(u64::from(entry.offset), u64::from(entry.stored_size)) {
+                Ok(member) => self.file(&location, &member, depth + 1),
+                Err(error) => {
+                    self.files += 1;
+                    self.record("FAR member", &location, Err(error));
+                }
+            }
         }
     }
 
@@ -165,16 +240,22 @@ impl Census {
     /// directory, so a member is never the archive itself and every
     /// archive inside one is smaller. Fails when the archive is nested too
     /// deeply or its members would exceed the work budget.
-    fn members(&mut self, bytes: &[u8], depth: u32) -> sims_formats::Result<Vec<far::Entry>> {
+    fn members(
+        &mut self,
+        archive: &mut Archive<'_>,
+        depth: u32,
+    ) -> sims_formats::Result<Vec<far::Entry>> {
         if depth >= MAX_NESTING {
             return Err(sims_formats::Error::new(
                 0,
                 format!("FAR archive nested more than {MAX_NESTING} deep"),
             ));
         }
-        let len = bytes.len() as u64;
-        let offset = far::manifest_offset(&bytes[..bytes.len().min(16)], len)?;
-        let entries = far::directory(&bytes[offset as usize..], len)?;
+        let len = archive.len();
+        let offset = far::manifest_offset(&archive.read(0, len.min(16))?, len)?;
+        let directory_len = far::directory_len(offset, len)?;
+        let directory = archive.read(u64::from(offset), directory_len as u64)?;
+        let entries = far::directory(&directory, len)?;
         if let Some(entry) = entries.iter().find(|e| !e.within_payload(offset)) {
             return Err(sims_formats::Error::new(
                 entry.offset as usize,
@@ -344,6 +425,29 @@ mod tests {
         let report = census("self", &bytes);
         assert!(report.contains("overlaps the archive header"), "{report}");
         assert!(report.contains("visited: 1\n"), "{report}");
+    }
+
+    #[test]
+    fn an_archive_on_disk_claiming_a_huge_directory_is_not_read() {
+        let path =
+            std::env::temp_dir().join(format!("sims-census-huge-{}.far", std::process::id()));
+        // The directory starts right after the header, so the whole sparse
+        // remainder would be the directory.
+        let mut bytes = b"FAR!byAZ".to_vec();
+        bytes.extend(1u32.to_le_bytes());
+        bytes.extend(16u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(sims_formats::far::MAX_DIRECTORY + 17)
+            .unwrap();
+        let mut census = Census::default();
+        census.add_path(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let report = census.report();
+        assert!(report.contains("64 MiB"), "{report}");
     }
 
     #[test]

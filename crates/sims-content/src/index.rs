@@ -358,13 +358,34 @@ pub(crate) fn sorted_entries(directory: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// The most directories an archive member's name may hold. Each one is a
+/// directory the index lists, so this bounds that work. The game's own
+/// members are at most four deep.
+const MAX_MEMBER_DEPTH: usize = 32;
+/// The longest archive member name the index takes, in bytes. The game's
+/// own are under 100 bytes.
+const MAX_MEMBER_NAME: usize = 1024;
+
+/// An archive's members, as [`far_members`] reads them, failing when any
+/// member is left out. For directories that hold only the game's own
+/// files, where a missing member would silently change what loads.
+pub(crate) fn all_far_members(path: &Path) -> Result<Vec<Member>> {
+    let (members, mut skipped) = far_members(path)?;
+    match skipped.pop() {
+        None => Ok(members),
+        Some(reason) => Err(Error::Unsupported(reason)),
+    }
+}
+
 /// An archive's members, and a diagnostic for each member left out.
 ///
 /// FAR 1a stores members as they are. A member whose unpacked size differs
 /// from its stored size is compressed; reading it as stored bytes would be
 /// wrong, and decompression is not implemented, so it is left out, as the
 /// prototype's reader refused it. Whether the original lists such a member
-/// is unverified: the game's own archives hold none.
+/// is unverified: the game's own archives hold none. A member whose name
+/// is longer than [`MAX_MEMBER_NAME`] or holds more than
+/// [`MAX_MEMBER_DEPTH`] directories is left out too.
 pub(crate) fn far_members(path: &Path) -> Result<(Vec<Member>, Vec<String>)> {
     let io = |e| Error::io(path, e);
     let mut file = File::open(path).map_err(io)?;
@@ -387,6 +408,19 @@ pub(crate) fn far_members(path: &Path) -> Result<(Vec<Member>, Vec<String>)> {
     let mut members = Vec::with_capacity(entries.len());
     let mut skipped = Vec::new();
     for entry in entries {
+        let depth = entry
+            .raw_name
+            .iter()
+            .filter(|&&b| b == b'\\' || b == b'/')
+            .count();
+        if depth > MAX_MEMBER_DEPTH || entry.raw_name.len() > MAX_MEMBER_NAME {
+            skipped.push(format!(
+                "{}: member name of {} bytes in {depth} directories is too long",
+                path.display(),
+                entry.raw_name.len(),
+            ));
+            continue;
+        }
         if entry.stored_size != entry.unpacked_size {
             skipped.push(format!(
                 "{}: compressed member {} ({} bytes stored, {} unpacked) is not supported",
