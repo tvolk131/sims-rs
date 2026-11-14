@@ -29,6 +29,11 @@ pub struct Part {
     /// The sprite's left edge and bottom, relative to the object's anchor.
     pub offset: [i32; 2],
     pub flip: bool,
+    /// The sprite's place in the world relative to the object, in tiles:
+    /// x and y in the object's own frame (before its facing turns it),
+    /// and z up. It moves the sprite's depth, not its screen position
+    /// (see the decisions log).
+    pub object: [f32; 3],
 }
 
 /// What the renderer needs from an object's definition.
@@ -286,6 +291,7 @@ fn load_group(iff: &Iff, group: u16, direction: u32, zoom: u32) -> Vec<Part> {
         parts.push(Part {
             offset: [s.x, s.y],
             flip: s.flags & 1 != 0,
+            object: s.object,
             sprite: id,
             image,
         });

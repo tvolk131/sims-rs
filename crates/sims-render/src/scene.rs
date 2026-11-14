@@ -1,7 +1,7 @@
 //! Draws a lot: terrain, floors, walls and objects, level by level.
 
 use crate::assets::{Assets, Definition};
-use crate::camera::{Camera, Walls, Zoom};
+use crate::camera::{self, Camera, Walls, Zoom};
 use crate::canvas::{Canvas, Image};
 use crate::depth;
 use crate::lot::{self, Lot, WallCell};
@@ -375,6 +375,12 @@ impl Painter<'_> {
             if o.person.is_some() || z != level || x < 0 || y < 0 {
                 continue;
             }
+            // A script can hide an object (data word 34); the original
+            // skips it when drawing, as the old prototype did
+            // (`legacy/crates/sims-render/src/lib.rs`).
+            if o.data.get(HIDDEN).is_some_and(|&w| w != 0) {
+                continue;
+            }
             let tile = [x >> 4, y >> 4];
             if !self.lot.contains(tile[0], tile[1]) {
                 continue;
@@ -418,14 +424,26 @@ impl Painter<'_> {
                 self.stats.missing_objects += 1;
                 continue;
             }
+            let facing = o.data.get(1).copied().unwrap_or(0);
+            let base = level_elevation(level) + ground;
             for part in parts {
                 if !sprite_visible(part.sprite, definition.dynamic_base, &o.dynamic_sprites) {
                     continue;
                 }
+                // Offsets come from the files and may be anything; the
+                // canvas clips whatever this gives.
+                let height = i32::try_from(part.image.height).unwrap_or(i32::MAX);
                 let at = [
-                    screen[0] + part.offset[0],
-                    screen[1] + part.offset[1] - part.image.height as i32,
+                    screen[0].saturating_add(part.offset[0]),
+                    screen[1]
+                        .saturating_add(part.offset[1])
+                        .saturating_sub(height),
                 ];
+                let anchor = if part.object == [0.0; 3] {
+                    anchor
+                } else {
+                    part_anchor(self.camera, o.position, facing, part.object, base)
+                };
                 self.canvas.draw(&part.image, at, part.flip, |_, _, byte| {
                     depth::sprite(anchor, byte)
                 });
@@ -433,6 +451,47 @@ impl Painter<'_> {
             self.stats.objects += 1;
         }
     }
+}
+
+/// An object's data word that hides it when not zero (the simulation's
+/// `HIDDEN`).
+const HIDDEN: usize = 34;
+
+/// Screen pixels at the near zoom per tile of height: a tile's side seen
+/// from the original's camera, `32 * sqrt(6)` (the old prototype's
+/// projection in `legacy/crates/sims-render/src/lib.rs`).
+const NEAR_PIXELS_PER_TILE_UP: f32 = 78.383_67;
+
+/// The depth anchor of a draw group sprite that sits `object` (tiles: x
+/// and y in the object's frame, z up) away from an object at `position`
+/// (fine units) facing `facing` (data word 1), on ground `base` near-zoom
+/// pixels up. The offset turns with the object, a quarter turn per two
+/// steps of facing, as the old prototype turned it. Offsets are clamped to
+/// a lot's width, so nonsense in a file cannot overflow the depth.
+fn part_anchor(
+    camera: &Camera,
+    position: [i32; 3],
+    facing: i16,
+    object: [f32; 3],
+    base: i32,
+) -> i32 {
+    let limit = camera::ARRAY_SIZE as f32;
+    let [mut x, mut y, z] = object.map(|v| {
+        if v.is_finite() {
+            v.clamp(-limit, limit)
+        } else {
+            0.0
+        }
+    });
+    for _ in 0..(i32::from(facing) / 2).rem_euclid(4) {
+        (x, y) = (-y, x);
+    }
+    let fine = [
+        position[0] + (x * 16.0).round() as i32,
+        position[1] + (y * 16.0).round() as i32,
+    ];
+    let up = (z * NEAR_PIXELS_PER_TILE_UP).round() as i32;
+    depth::point(camera.rotate_fine(fine), base + up)
 }
 
 /// The draw group view (one bit of 1, 4, 16 and 64) for an object facing
@@ -620,6 +679,38 @@ mod tests {
         assert_eq!(view_direction(0, &camera(1)), 4);
         assert_eq!(view_direction(6, &camera(1)), 1);
         assert_eq!(view_direction(4, &camera(3)), 4);
+    }
+
+    #[test]
+    fn sprite_world_offsets_move_depth_with_the_object_and_camera() {
+        let position = [100, 200, 1];
+        let base = 32;
+        let anchor = depth::point(camera(0).rotate_fine([100, 200]), base);
+        assert_eq!(part_anchor(&camera(0), position, 0, [0.0; 3], base), anchor);
+        // Up is nearer: one tile up is 78 near-zoom pixels.
+        assert_eq!(
+            part_anchor(&camera(0), position, 0, [0.0, 0.0, 1.0], base),
+            depth::point([100, 200], base + 78)
+        );
+        // An offset along x, facing 0 and facing 2 (a quarter turn: x
+        // becomes y).
+        assert_eq!(
+            part_anchor(&camera(0), position, 0, [1.0, 0.0, 0.0], base),
+            depth::point([116, 200], base)
+        );
+        assert_eq!(
+            part_anchor(&camera(0), position, 2, [1.0, 0.0, 0.0], base),
+            depth::point([100, 216], base)
+        );
+        // The camera's rotation turns the moved point like any other.
+        assert_eq!(
+            part_anchor(&camera(1), position, 2, [1.0, 0.0, 0.0], base),
+            depth::point(camera(1).rotate_fine([100, 216]), base)
+        );
+        // Nonsense in a file stays bounded.
+        for bad in [f32::NAN, f32::INFINITY, f32::MAX, f32::MIN] {
+            let _ = part_anchor(&camera(3), position, i16::MIN, [bad, bad, bad], base);
+        }
     }
 
     #[test]

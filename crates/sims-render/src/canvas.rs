@@ -105,9 +105,14 @@ impl Canvas {
     /// right if `flip`. `depth` gives each pixel's depth from its screen
     /// position and its depth byte (255 for an image without depth).
     ///
-    /// A fully opaque pixel that passes the depth test writes its color and
-    /// depth. A partly transparent one blends its color over what is there
-    /// and leaves the depth alone, so it never hides what is drawn later.
+    /// A pixel that is not fully transparent and passes the depth test
+    /// writes its depth. A fully opaque one also writes its color; a partly
+    /// transparent one blends its color over what is there. So a farther
+    /// pixel drawn later never shows through a nearer soft edge, as in the
+    /// old prototype's blitter (`legacy/crates/sims-render`).
+    ///
+    /// `at` may be anywhere: the image is clipped to the canvas with wide
+    /// arithmetic, so far-off positions draw nothing rather than overflow.
     pub fn draw(
         &mut self,
         image: &Image,
@@ -115,15 +120,25 @@ impl Canvas {
         flip: bool,
         depth: impl Fn(i32, i32, u8) -> i32,
     ) {
-        let (w, h) = (self.width as i32, self.height as i32);
-        let x0 = at[0].max(0);
-        let x1 = (at[0] + image.width as i32).min(w);
-        let y0 = at[1].max(0);
-        let y1 = (at[1] + image.height as i32).min(h);
-        for sy in y0..y1 {
-            let iy = (sy - at[1]) as usize;
-            for sx in x0..x1 {
-                let mut ix = (sx - at[0]) as usize;
+        // Clip in i64: the canvas and image sides fit, and so does any i32
+        // position plus a side. Inside the canvas everything fits in i32.
+        let span = |at: i32, size: usize, limit: usize| {
+            let (at, size, limit) = (i64::from(at), size as i64, limit as i64);
+            let low = at.clamp(0, limit);
+            let high = at.saturating_add(size).clamp(low, limit);
+            (low as usize, high as usize, at)
+        };
+        let (x0, x1, ax) = span(at[0], image.width, self.width);
+        let (y0, y1, ay) = span(at[1], image.height, self.height);
+        if image.rgba.len() < image.width * image.height * 4 {
+            return;
+        }
+        for py in y0..y1 {
+            let sy = py as i32;
+            let iy = (py as i64 - ay) as usize;
+            for px in x0..x1 {
+                let sx = px as i32;
+                let mut ix = (px as i64 - ax) as usize;
                 if flip {
                     ix = image.width - 1 - ix;
                 }
@@ -132,17 +147,20 @@ impl Canvas {
                 if a == 0 {
                     continue;
                 }
-                let byte = image.depth.as_ref().map_or(255, |d| d[source]);
+                let byte = image
+                    .depth
+                    .as_ref()
+                    .map_or(255, |d| d.get(source).copied().unwrap_or(255));
                 let d = depth(sx, sy, byte);
-                let target = sy as usize * self.width + sx as usize;
+                let target = py * self.width + px;
                 if d > self.depth[target] {
                     continue;
                 }
                 let rgb = &image.rgba[source * 4..source * 4 + 3];
                 let pixel = &mut self.color[target];
+                self.depth[target] = d;
                 if a == 255 {
                     pixel.copy_from_slice(rgb);
-                    self.depth[target] = d;
                 } else {
                     let a = u32::from(a);
                     for (c, &s) in pixel.iter_mut().zip(rgb) {
@@ -233,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_alpha_blends_without_writing_depth() {
+    fn partial_alpha_blends_and_hides_what_is_drawn_behind_later() {
         let mut c = Canvas::new(1, 1, [0, 0, 0]);
         c.draw(
             &image(1, 1, [255, 255, 255, 128], None),
@@ -242,7 +260,45 @@ mod tests {
             |_, _, _| 5,
         );
         assert_eq!(c.color[0], [128, 128, 128]);
-        assert_eq!(c.depth[0], EMPTY);
+        assert_eq!(c.depth[0], 5);
+        // Farther and opaque, drawn later: hidden by the soft edge.
+        c.draw(
+            &image(1, 1, [0, 255, 0, 255], None),
+            [0, 0],
+            false,
+            |_, _, _| 10,
+        );
+        assert_eq!(c.color[0], [128, 128, 128]);
+        // Nearer: drawn over it.
+        c.draw(
+            &image(1, 1, [0, 255, 0, 255], None),
+            [0, 0],
+            false,
+            |_, _, _| 1,
+        );
+        assert_eq!(c.color[0], [0, 255, 0]);
+    }
+
+    #[test]
+    fn far_off_positions_draw_nothing_and_do_not_overflow() {
+        let mut c = Canvas::new(2, 2, [0, 0, 0]);
+        let img = image(3, 3, [1, 2, 3, 255], None);
+        for at in [
+            [i32::MAX, 0],
+            [0, i32::MAX],
+            [i32::MIN, i32::MIN],
+            [i32::MAX, i32::MIN],
+            [i32::MAX - 1, i32::MAX - 2],
+        ] {
+            c.draw(&img, at, false, |_, _, _| 0);
+            c.draw(&img, at, true, |_, _, _| 0);
+        }
+        assert_eq!(c, Canvas::new(2, 2, [0, 0, 0]));
+        // An image whose pixels are fewer than its size says draws nothing.
+        let mut short = img.clone();
+        short.rgba.truncate(4);
+        c.draw(&short, [0, 0], false, |_, _, _| 0);
+        assert_eq!(c, Canvas::new(2, 2, [0, 0, 0]));
     }
 
     #[test]
