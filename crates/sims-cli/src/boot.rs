@@ -107,8 +107,36 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     // ground level's object grid.
     let reconciled = interpreter.reconcile_controllers(&mut world)?;
     let repaired = world.repair_grid()?;
-    // The load stops here. Next the original gives every object its room
-    // (step 10), which needs the lot's rooms. They are not ported.
+    let queued_again = world.removals.len();
+    // The original now works out the lot's rooms from the walls it has
+    // read. That makes it give every object its room and ask each object's
+    // function 7 (step 10), and then count the rooms, which sets the
+    // lot's indoor area.
+    world.rebuild_rooms()?;
+    let roomed = interpreter.assign_rooms(&mut world)?;
+    world.update_rooms()?;
+    // 11: the removal queue is emptied. 12: the household that lives in
+    // the house is selected.
+    let dropped = world.discard_removals();
+    let number = neighborhood
+        .houses()?
+        .into_iter()
+        .find(|(_, path)| path.file_name() == options.house.file_name())
+        .map(|(number, _)| number)
+        .ok_or("the house file's name does not give a house number")?;
+    let (family, record) = neighborhood.family_in(number).ok_or(
+        "no family lives in the house; selecting none is not checked against the original",
+    )?;
+    world.select_family(
+        i16::try_from(family)?,
+        i16::try_from(number)?,
+        record.budget,
+        record.magic_history()?,
+    )?;
+    // The load stops here. Next the original visits every object (step
+    // 13): people take their fields from the neighborhood, every object
+    // is put back in its place, and Load, Reset and Init trees run. That
+    // is not ported.
     if let Some(path) = options.snapshot {
         Snapshots::open(path)?.save("boot", &world)?;
     }
@@ -163,16 +191,38 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
          for removal",
         reconciled.created.len(),
         reconciled.removed.len(),
-        world.removals.len()
+        queued_again
     );
     let _ = writeln!(
         out,
         "         ground object grid checked, {} cells cleared",
         repaired.len()
     );
+    let rooms = &world.rooms.rooms;
     let _ = writeln!(
         out,
-        "         stopped before every object is given its room (step 10, not implemented yet)"
+        "         {} rooms worked out ({} indoors, {} tiles split by a diagonal wall); {} \
+         objects changed room, {} told the rooms changed",
+        rooms.len(),
+        rooms.values().filter(|room| !room.outdoors).count(),
+        world.rooms.halves.len(),
+        roomed.moved.len(),
+        roomed.asked.len()
+    );
+    let _ = writeln!(
+        out,
+        "         rooms counted, indoor area {} tiles; {} queued removals dropped",
+        world.globals[27],
+        dropped.len()
+    );
+    let _ = writeln!(
+        out,
+        "         family {family} selected for house {number}, funds {}",
+        world.budget.funds
+    );
+    let _ = writeln!(
+        out,
+        "         stopped before every object is visited (step 13, not implemented yet)"
     );
     let _ = writeln!(
         out,

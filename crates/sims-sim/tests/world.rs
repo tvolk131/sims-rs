@@ -2,6 +2,7 @@ use sims_content::{Catalog, House, Index, Install, Neighborhood};
 use sims_core::{CrtRng, GameRng};
 use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
+use sims_sim::rooms::{Half, Room, Rooms};
 use sims_sim::{Budget, MagicHistory, Object, Snapshots, TypeAttributes, World};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -88,6 +89,34 @@ fn world() -> World {
         changed_types: BTreeSet::from([0x2222]),
         next_parts: BTreeMap::from([(2, 5)]),
         skeleton_files: BTreeSet::from(["adult.bcf".to_owned()]),
+        rooms: Rooms {
+            map: [vec![0, -5, 1, -1], vec![1024]],
+            halves: BTreeMap::from([(
+                [1, 0, 1],
+                [
+                    Half {
+                        triangle: 4,
+                        room: 0,
+                    },
+                    Half {
+                        triangle: 2,
+                        room: -1,
+                    },
+                ],
+            )]),
+            rooms: BTreeMap::from([(
+                1,
+                Room {
+                    tiles: vec![[0, 2, 1], [0, 2, 1]],
+                    outdoors: false,
+                    dirty: true,
+                    half_tiles: 4,
+                    covered_half_tiles: 2,
+                    walls: 3,
+                    covered_walls: 1,
+                },
+            )]),
+        },
     }
 }
 
@@ -97,7 +126,7 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "322c9f0a86458f3f585c67f78d9b3932492cf8dbd58c339a38ac14b7bd2ac1ff";
+const PINNED: &str = "498a13a29d9b303caf4fd9f73cd6be36b418e4789580fbd46a8ec3852a01bcff";
 
 #[test]
 fn encoding_round_trips_bit_for_bit() {
@@ -132,6 +161,12 @@ fn any_field_change_changes_the_hash() {
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.skeleton_files.clear();
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.rooms.map[1][0] = 1025;
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.rooms.rooms.get_mut(&1).unwrap().dirty = false;
     assert_ne!(changed.hash(), base);
 }
 

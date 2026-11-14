@@ -1,10 +1,11 @@
 //! The load steps that run scripts. `docs/roadmap.md` lists every step of
 //! the original's lot load in order; the ones that only change state live
-//! in `sims_sim::load`.
+//! in `sims_sim::load` and `sims_sim::rooms`.
 
+use crate::factory::TURN_BUDGET;
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
-use crate::program::Callback;
+use crate::program::{Callback, Tree};
 use sims_formats::lot::{ObjectType, ObjectTypes};
 use sims_sim::World;
 use std::collections::BTreeMap;
@@ -20,6 +21,20 @@ const GLOBAL_WORD: usize = 42;
 
 /// Global 27: the area of the lot's indoor rooms, in tiles.
 const INDOOR_AREA: usize = 27;
+
+/// Data word 29: the room an object stands in.
+const ROOM: usize = 29;
+
+/// What [`Interpreter::assign_rooms`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Roomed {
+    /// The objects whose room word changed in the first pass, in
+    /// registration order: the ID, the old room and the new one.
+    pub moved: Vec<(u16, i16, i16)>,
+    /// The objects whose function 7 tree ran in the second pass, in the
+    /// order they ran.
+    pub asked: Vec<u16>,
+}
 
 /// What [`Interpreter::reconcile_controllers`] did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -69,8 +84,14 @@ impl Interpreter<'_> {
     /// [`World::arrays`], shrinking, with every object off the lot. Then
     /// there is nothing to shrink but [`World::size`], no object to
     /// delete, and no indoor room, so the rebuild leaves global 27 (the
-    /// lot's indoor area) at 0. Anything else fails. The rooms themselves
-    /// and their tile counts are not modeled.
+    /// lot's indoor area) at 0. Anything else fails.
+    ///
+    /// The bare lot's rooms are not built, because the lot has no arrays
+    /// to work them out from: [`World::rooms`] stays as it was until the
+    /// load works the rooms out from the house's walls
+    /// ([`World::rebuild_rooms`]). In a trace of the original the lot has
+    /// two rooms after this step, one for each level. No script that runs
+    /// before the load's own rebuild reads a room.
     pub fn resize(&self, world: &mut World) -> Result<Reconciled, Fault> {
         let fail = |message: &str| Fault {
             object: 0,
@@ -103,6 +124,96 @@ impl Interpreter<'_> {
         // (0x466c3c). A bare lot has no indoor room.
         world.globals[INDOOR_AREA] = 0;
         self.reconcile_controllers(world)
+    }
+
+    /// Load step 10: gives every object its room and then tells every
+    /// object that the rooms changed (0x442659). The original runs this
+    /// whenever the rooms have been worked out again
+    /// ([`World::rebuild_rooms`]), so call it after that.
+    ///
+    /// Two passes over the registration list. The first puts an object
+    /// whose level is 0 on level 1 and writes the room it stands in
+    /// ([`World::room_at`]) into its data word 29. The second runs each
+    /// object's function 7 tree, as a callback: synchronously, on top of
+    /// whatever the object's thread holds, with the object's temps as
+    /// arguments and no stack object. An object whose definition names no
+    /// such tree, or names one that is missing, runs nothing. A tree may
+    /// create objects, which go to the head of the list and are not
+    /// visited. If a tree removes the object being visited, the original
+    /// would follow a freed link; here that fails.
+    ///
+    /// For the Goth house this was compared with a trace of the original:
+    /// the original asks all 382 objects in registration order, the same
+    /// 62 have a tree here as change their thread there, no data word
+    /// changes in either pass, and the lot afterwards equals the trace's.
+    /// See `docs/decisions.md`.
+    ///
+    /// Not modeled: the first pass also tells the room a person stands in
+    /// that it is occupied, which lights the room. The original's level
+    /// argument, which limits both passes to one level, is not ported:
+    /// this is the call for both levels.
+    ///
+    /// Ported from the old prototype's `update_loaded_rooms`
+    /// (legacy/crates/sims-content/src/save_storage.rs).
+    pub fn assign_rooms(&self, world: &mut World) -> Result<Roomed, Fault> {
+        let fail = |object, trap| Fault {
+            object,
+            at: None,
+            trap,
+        };
+        let mut done = Roomed::default();
+        for id in world.order.clone() {
+            let Some(object) = world.objects.get(&id) else {
+                continue;
+            };
+            let mut position = object.position;
+            if position[2] == 0 {
+                position[2] = 1;
+            }
+            let room = world
+                .room_at(position)
+                .map_err(|error| fail(id, Trap::Unsupported(error.to_string())))?;
+            if let Some(object) = world.objects.get_mut(&id) {
+                object.position = position;
+                let word = object
+                    .data
+                    .get_mut(ROOM)
+                    .ok_or_else(|| fail(id, Trap::Invalid("object has no data word 29".into())))?;
+                if *word != room {
+                    done.moved.push((id, *word, room));
+                    *word = room;
+                }
+            }
+        }
+        let mut current = world.order.first().copied();
+        while let Some(id) = current {
+            let object = world
+                .objects
+                .get(&id)
+                .ok_or_else(|| fail(id, Trap::native(10, "missing object")))?;
+            let definition = self
+                .catalog
+                .object(object.guid)
+                .ok_or_else(|| fail(id, Trap::Invalid("object has no definition".into())))?;
+            let tree = self.program.callback(definition, Callback::RoomsChanged);
+            if tree != 0 && !matches!(self.program.tree(definition.resource, tree), Tree::Missing) {
+                let temps = object.temps.clone();
+                self.call(world, id, tree, 0, &temps, 8, TURN_BUDGET)?;
+                done.asked.push(id);
+            }
+            // The next object is read from the list after the tree ran.
+            let place = world.order.iter().position(|&other| other == id);
+            let place = place.ok_or_else(|| {
+                fail(
+                    id,
+                    Trap::Unsupported(
+                        "an object removed itself while it was told the rooms changed".into(),
+                    ),
+                )
+            })?;
+            current = world.order.get(place + 1).copied();
+        }
+        Ok(done)
     }
 
     /// Whether a saved type's scripts changed since the house was saved

@@ -12,6 +12,7 @@ mod objects;
 mod presentation;
 mod random;
 mod removal;
+mod rooms;
 mod services;
 mod set_to_next;
 mod sleep;

@@ -1,3 +1,4 @@
+use crate::rooms::Rooms;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -52,8 +53,7 @@ pub struct World {
     pub event_owner: u16,
     /// The magic history of the family the game has selected, or None
     /// while it has selected none (0x410af6). It belongs to the running
-    /// game, not to the lot. Nothing sets it yet: selecting a family
-    /// should.
+    /// game, not to the lot. [`World::select_family`] sets it.
     pub magic_history: Option<MagicHistory>,
     /// The two indicator objects the game keeps on the lot, or 0 for none:
     /// the marker over the selected Sim, then the one over a date
@@ -75,6 +75,10 @@ pub struct World {
     /// (0x598af7), so whether a file was read before is state. It belongs
     /// to the running game, not to the lot.
     pub skeleton_files: BTreeSet<String>,
+    /// The lot's rooms, worked out from its walls ([`World::rebuild_rooms`],
+    /// 0x479d9a). Empty on a lot whose rooms have not been worked out: the
+    /// rooms of the lot the game holds before a load are not modeled.
+    pub rooms: Rooms,
 }
 
 /// One type's shared words. See [`World::type_attributes`].
@@ -178,6 +182,7 @@ impl World {
             changed_types: BTreeSet::new(),
             next_parts: BTreeMap::new(),
             skeleton_files: BTreeSet::new(),
+            rooms: Rooms::default(),
         }
     }
 

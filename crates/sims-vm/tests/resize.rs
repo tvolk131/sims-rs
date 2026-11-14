@@ -1,7 +1,7 @@
 //! The lot resize at the start of a load, the clear that follows it, the
 //! lot arrays, the type table, the saved objects, the controllers among
-//! them and the object grid, on a real install when `SIMS_INSTALL` names
-//! one.
+//! them, the object grid, the rooms and the household, on a real install
+//! when `SIMS_INSTALL` names one.
 //! Game data is never committed, so CI skips this. The mechanics have
 //! synthetic tests in `tests/interpreter`.
 
@@ -60,6 +60,36 @@ fn with_goth_people(
     then(&house, &interpreter, &mut world, &created, &people);
 }
 
+/// The digest of a lot's encoding as snapshot format 5 wrote it. Format 6
+/// added the lot's rooms at the end of the encoding, and a lot whose rooms
+/// have not been worked out encodes them as four zero bytes. This checks
+/// that the lot ends in those and digests the rest, so a state pinned
+/// under format 5 can be shown to be the same state.
+fn format_5(world: &World) -> String {
+    let encoded = world.encode();
+    let (old, new) = encoded.split_at(encoded.len() - 4);
+    assert_eq!(new, [0; 4]);
+    digest(old)
+}
+
+/// The lot with the ground level's wall cells outside the lot's 52 tiles
+/// zeroed. That is what those cells held here when the digests of format
+/// 5 were pinned. They now hold a bare lot's bytes
+/// ([`sims_sim::load::BARE_GROUND_WALL`]), as the original's do. Used to
+/// show that a state pinned earlier differs from today's in those cells
+/// only.
+fn with_zeroed_outer_walls(world: &World) -> World {
+    let mut world = world.clone();
+    let walls = &mut world.arrays.get_mut(&2).unwrap().data;
+    for (cell, bytes) in walls.chunks_mut(14).enumerate() {
+        if cell / 64 >= 52 || cell % 64 >= 52 {
+            assert_eq!(bytes, sims_sim::load::BARE_GROUND_WALL);
+            bytes.fill(0);
+        }
+    }
+    world
+}
+
 /// The SHA-256 of `bytes`, as lowercase hex.
 fn digest(bytes: &[u8]) -> String {
     use sha2::Digest;
@@ -90,15 +120,18 @@ fn digest(bytes: &[u8]) -> String {
 /// start of the resize, the two indicators matched as well. The capture
 /// has nothing to compare `World`'s other fields with.
 ///
-/// The digest is of our own state, as built here. Snapshot format 5 added
-/// two fields at the end of the encoding (the multi-tile links and the
-/// skeleton files read), both empty here. Without those two bytes the
-/// encoding still hashes to the digest pinned under format 4, which in
+/// The digest is of our own state, as built here. Snapshot format 6 added
+/// the lot's rooms at the end of the encoding, which are empty here: four
+/// zero bytes. Without them the encoding hashes to the digest pinned under
+/// format 5. Format 5 had added two fields (the multi-tile links and the
+/// skeleton files read), both empty here; without those two bytes as well
+/// the encoding still hashes to the digest pinned under format 4, which in
 /// turn was the format 3 state that comparison was made on plus three
 /// bytes.
 #[test]
 fn the_goth_house_resize_creates_the_controllers() {
-    const PINNED: &str = "9e5cab3b2caf4e1915faf58b9a3ef5fe192495b44cfb09420b9396368947bd15";
+    const PINNED: &str = "5da903b012eb85ced13111300ed5fd6f125ba083eb7517bac76e5c342eae2d91";
+    const FORMAT_5: &str = "9e5cab3b2caf4e1915faf58b9a3ef5fe192495b44cfb09420b9396368947bd15";
     const FORMAT_4: &str = "06925c3997de50179b8bfe0dd5cdb751b8e0f449ce0280ffcc6269c4e4e7e72e";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
@@ -118,9 +151,10 @@ fn the_goth_house_resize_creates_the_controllers() {
         assert_eq!(object.flags() & 1, 1, "object {id}");
     }
     assert_eq!(world.hash_hex(), PINNED);
+    assert_eq!(format_5(&world), FORMAT_5);
     let encoded = world.encode();
-    let (old, new) = encoded.split_at(encoded.len() - 2);
-    assert_eq!((digest(old).as_str(), new), (FORMAT_4, &[0, 0][..]));
+    let (old, new) = encoded.split_at(encoded.len() - 6);
+    assert_eq!((digest(old).as_str(), new), (FORMAT_4, &[0; 6][..]));
     // The run is deterministic.
     let (again, _) = resized(std::path::Path::new(&root));
     assert_eq!(again.encode(), world.encode());
@@ -149,10 +183,12 @@ fn the_goth_house_resize_creates_the_controllers() {
 ///
 /// The digest is of our own state, as built here. It is the state pinned
 /// under snapshot format 4, the one that comparison was made on, plus the
-/// two bytes of format 5's new fields, which are empty here.
+/// two bytes of format 5's new fields and the four of format 6's, which
+/// are all empty here.
 #[test]
 fn the_goth_house_clear_removes_every_object() {
-    const PINNED: &str = "b97f264759c4f6be2b3a356bb7a55bbdb662f2b0fdd80f1e87f613522362cae0";
+    const PINNED: &str = "4f0b7439a1379c998d885eb10f2a12c0cb887c29d08524a6600d80da7c7486e7";
+    const FORMAT_5: &str = "b97f264759c4f6be2b3a356bb7a55bbdb662f2b0fdd80f1e87f613522362cae0";
     const FORMAT_4: &str = "ee03713bb263459d92b0359743f94c5c6c582951ae3eda24a2b066c0729ef906";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
@@ -177,9 +213,10 @@ fn the_goth_house_clear_removes_every_object() {
         assert_eq!((world.size, world.ticks), (52, 88444));
         assert!(world.instances.values().all(Vec::is_empty));
         assert_eq!(world.hash_hex(), PINNED);
+        assert_eq!(format_5(world), FORMAT_5);
         let encoded = world.encode();
-        let (old, new) = encoded.split_at(encoded.len() - 2);
-        assert_eq!((digest(old).as_str(), new), (FORMAT_4, &[0, 0][..]));
+        let (old, new) = encoded.split_at(encoded.len() - 6);
+        assert_eq!((digest(old).as_str(), new), (FORMAT_4, &[0; 6][..]));
         // The original clears the lot again before it reads the saved
         // objects. On an empty lot that does nothing.
         assert_eq!(interpreter.clear(world), Ok(vec![]));
@@ -200,12 +237,27 @@ fn the_goth_house_clear_removes_every_object() {
 /// 108, 9 and 10 here. So the renumbering changes nothing in this house,
 /// as it does here: both maps are empty and no cell holds an ID it covers.
 ///
-/// Not compared, because the capture does not hold them: arrays 4, 6 and
-/// 7 (ground and grass), and every cell outside the 52 tiles. The digest
-/// is of our own arrays.
+/// Outside the 52 tiles that capture holds nothing. A later trace of the
+/// same load saved pages of the game's memory at each stop. At the entry
+/// of load step 10 (0x442659), which is after these steps and after no
+/// step that writes these arrays, they hold every cell of both levels'
+/// flags, of the ground level's object grid, of the pool and of the
+/// water; the 688 to 1136 cells outside the 52 tiles of the heights, the
+/// floors, the upper level's object grid and both levels' walls; and at
+/// the end of the load every cell of both levels' walls. All of those
+/// were equal to the arrays here. One correction came of it: the ground
+/// level's walls outside the 52 tiles are not zero in the original. Each
+/// cell there has the bytes of a bare lot's cell, which the held lot had
+/// before the load and which is also what the house saved there.
+///
+/// Not compared, because neither holds them: arrays 4, 6 and 7 (ground
+/// and grass). The digest is of our own arrays. With the ground level's
+/// wall cells outside the 52 tiles zeroed, the arrays hash to the digest
+/// pinned before that correction.
 #[test]
 fn the_goth_house_arrays_are_read_and_nothing_is_renumbered() {
-    const PINNED: &str = "023361585d1b6644d33928f33039ef73c33e347e3c01c81cc3a8b0004ddcb1f3";
+    const PINNED: &str = "d21e8dd484bde265d6fa0bcc23e0da12f9aa3cc83910da49cc49fe5ac6cbc0dd";
+    const ZEROED: &str = "023361585d1b6644d33928f33039ef73c33e347e3c01c81cc3a8b0004ddcb1f3";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -222,7 +274,7 @@ fn the_goth_house_arrays_are_read_and_nothing_is_renumbered() {
                 let (saved, read) = (&house.arrays[&id], &world.arrays[&id]);
                 assert_eq!(read.stride, stride);
                 // A cell inside the lot's size holds the saved bytes,
-                // widened; one outside holds nothing.
+                // widened; one outside holds what a bare lot holds.
                 for (x, y) in [(0, 0), (26, 28), (51, 51), (52, 0), (63, 63)] {
                     let (saved, read) = (saved.cell(x, y).unwrap(), read.cell(x, y).unwrap());
                     // A floor byte becomes a word. A wall keeps its first
@@ -232,6 +284,11 @@ fn the_goth_house_arrays_are_read_and_nothing_is_renumbered() {
                     wide.extend(saved[keep..].iter().flat_map(|&byte| [byte, 0]));
                     if x < 52 && y < 52 {
                         assert_eq!(read, wide, "array {id}");
+                    } else if id == 2 {
+                        // The held lot's own cell, which is also what
+                        // the house saved there.
+                        assert_eq!(read, sims_sim::load::BARE_GROUND_WALL);
+                        assert_eq!(read, wide);
                     } else {
                         assert!(read.iter().all(|&byte| byte == 0), "array {id}");
                     }
@@ -248,13 +305,17 @@ fn the_goth_house_arrays_are_read_and_nothing_is_renumbered() {
             assert_eq!(world.arrays, before);
             // Each array's ID and cell size as two bytes each, then its
             // cells.
-            let mut arrays = Vec::new();
-            for (id, array) in &world.arrays {
-                arrays.extend(id.to_le_bytes());
-                arrays.extend((array.stride as u16).to_le_bytes());
-                arrays.extend(&array.data);
-            }
-            assert_eq!(digest(&arrays), PINNED);
+            let arrays = |world: &World| {
+                let mut arrays = Vec::new();
+                for (id, array) in &world.arrays {
+                    arrays.extend(id.to_le_bytes());
+                    arrays.extend((array.stride as u16).to_le_bytes());
+                    arrays.extend(&array.data);
+                }
+                digest(&arrays)
+            };
+            assert_eq!(arrays(world), PINNED);
+            assert_eq!(arrays(&with_zeroed_outer_walls(world)), ZEROED);
         },
     );
 }
@@ -342,10 +403,18 @@ fn the_goth_house_type_table_marks_the_changed_types() {
 /// slot contents, dynamic sprite flags, each person's motives, queue and
 /// animations, object flags, and [`World::skeleton_files`].
 ///
-/// The digest is of our own state, as built here.
+/// The digest is of our own state, as built here. It differs in two ways
+/// from the state pinned under snapshot format 5, the one that comparison
+/// was made on. Format 6 added the lot's rooms at the end of the
+/// encoding, which are empty here: four zero bytes. And the ground
+/// level's wall cells outside the lot's 52 tiles now hold a bare lot's
+/// bytes, as the original's do (see the arrays test above). With those
+/// cells zeroed and without the four bytes, the encoding hashes to the
+/// digest pinned under format 5.
 #[test]
 fn the_goth_house_objects_are_constructed_and_read() {
-    const PINNED: &str = "1034c34e3d93c040f31b0a56f9593e7e0ec7d8d319706b0afb591e8ac6f1531f";
+    const PINNED: &str = "bda1f8eee5deabee63609ec1a2a8ea1e027161c7390b19a830bf7ed4c346c81e";
+    const FORMAT_5: &str = "1034c34e3d93c040f31b0a56f9593e7e0ec7d8d319706b0afb591e8ac6f1531f";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -404,6 +473,7 @@ fn the_goth_house_objects_are_constructed_and_read() {
                 (before.global_rng, before.lot_rng)
             );
             assert_eq!(world.hash_hex(), PINNED);
+            assert_eq!(format_5(&with_zeroed_outer_walls(world)), FORMAT_5);
         },
     );
 }
@@ -449,10 +519,14 @@ fn the_goth_house_objects_are_constructed_and_read() {
 /// the other 166 objects; every cell outside the 52 tiles; and what the
 /// test above lists as not held.
 ///
-/// The digest is of our own state, as built here.
+/// The digest is of our own state, as built here. As in the test above,
+/// it is the state pinned under snapshot format 5, the one that comparison
+/// was made on, but for the ground level's wall cells outside the lot's
+/// 52 tiles and the four bytes of format 6's new field.
 #[test]
 fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
-    const PINNED: &str = "d014a3ce407d420fc6b69248f9e23282b0fdc348bac79afc5670629b60ed46b1";
+    const PINNED: &str = "2c000ad6962e840ece561db6b3a6ff572d8dd83815680c67a2a7eb861d3698b1";
+    const FORMAT_5: &str = "d014a3ce407d420fc6b69248f9e23282b0fdc348bac79afc5670629b60ed46b1";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -528,6 +602,161 @@ fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
             assert!(outside.iter().all(|r| r.tile[0] >= 52 || r.tile[1] >= 52));
             assert_eq!(world.objects.len(), 382);
             assert_eq!(world.hash_hex(), PINNED);
+            assert_eq!(format_5(&with_zeroed_outer_walls(world)), FORMAT_5);
         },
     );
+}
+
+/// The lot's rooms are worked out from its walls, and then load steps 10
+/// to 12 run: every object is given its room and asked its function 7,
+/// the rooms are counted, the removal queue is emptied, and the Goth
+/// family is selected.
+///
+/// A trace of the original loading this house, taken by the old
+/// prototype's harness, stops at the entry and the return of step 10
+/// (0x442659), at the entry and the return of step 11 (0x428679) and when
+/// step 12's funds setter (0x46d8dc) returns. Each stop was compared with
+/// this state at the same moment, outside the repository; the trace is
+/// private.
+///
+/// *The rooms.* Equal: the 11 room IDs; how many tiles each room lists;
+/// the listed tiles, in order, of the 8 rooms whose tile memory the trace
+/// holds (1, 2, 4, 1025 to 1029); the room of every tile of the upper
+/// level in the 32 columns the trace holds at the entry of step 10; the
+/// number of split tiles; whether each room is outdoors; and every cell
+/// of both levels' tile flags, which the rebuild leaves as the house
+/// saved them. The room of every tile of both levels,
+/// all 64 columns, was compared with the trace's memory at the end of the
+/// load and was equal; the trace's room list is the same there as at the
+/// entry of step 10, so the maps are taken to be the same too. An empty
+/// lot of 52 tiles partitions here into two rooms that list as many tiles
+/// as the two rooms the trace has before the rebuild.
+///
+/// *Step 10.* The trace asks function 7 of all 382 objects in
+/// registration order. The 62 whose thread it touches are the 62 that
+/// have a function 7 tree here, in the same order. No data word changes
+/// in the trace, and none here: the room worked out for each of the 382
+/// objects is the room the house saved. Afterwards all the fields listed
+/// for the test above are equal for all 382 objects, the last result
+/// included, and so are the globals, the random streams and the arrays.
+///
+/// *The room count.* Equal for all 11 rooms: the half tiles, the covered
+/// half tiles, the walls that can take a covering and those that have
+/// one. Equal: global 27, the indoor area, which is 204.
+///
+/// *Steps 11 and 12.* Equal after each: the same fields, the removal
+/// queue (empty), and after step 12 the globals (9 becomes 5 and 13
+/// becomes 2542), the funds, the selected family's ID and its six magic
+/// words.
+///
+/// What differed: object 19's second frame, as in the tests above. The C
+/// runtime stream and six type attribute words belong to the game that
+/// was running, and were equal once copied from the trace's start.
+///
+/// Not compared with the original, because the trace does not hold it:
+/// the listed tiles of rooms 0, 3 and 1024; which room each triangle of a
+/// split tile has; the room of an object on a split tile, which this
+/// house has none of; room fields 2 and 3 as scripts read them, which no
+/// tree reads here; and global 10 being written, since the house saved
+/// its own number there. Not modeled, so
+/// not compared: what objects add to a room's count, the rooms' light and
+/// scores, and which rooms have people in them.
+///
+/// The digests are of our own state, as built here.
+#[test]
+fn the_goth_house_gets_its_rooms_and_its_household() {
+    const COUNTED: &str = "d994b4eb25b6bb9b8ec8202bb1ede1f33ae40513f9cc2745298d76675ab6d476";
+    const SELECTED: &str = "6a9a7290da69b6e376c09a57295217df82ef28a8a7259eff97420d5c7c1e649d";
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = std::path::Path::new(&root);
+    let install = Install::detect(root).unwrap();
+    let neighborhood = Neighborhood::open(&install.file("UserData").unwrap()).unwrap();
+    with_goth_people(root, |house, interpreter, world, _, people| {
+        world.clear_family().unwrap();
+        interpreter.clear(world).unwrap();
+        world.read_arrays(&house.arrays, 62).unwrap();
+        world
+            .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+            .unwrap();
+        interpreter.read_types(world, &house.types).unwrap();
+        interpreter.clear(world).unwrap();
+        interpreter
+            .read_objects(world, &house.objects, people)
+            .unwrap();
+        interpreter.reconcile_controllers(world).unwrap();
+        world.repair_grid().unwrap();
+        // The rooms. The rebuild changes no array: the flags it works
+        // out are the flags the house saved, also outside the lot's size.
+        let before = world.clone();
+        world.rebuild_rooms().unwrap();
+        assert_eq!(world.arrays, before.arrays);
+        let rooms = &world.rooms;
+        let ids: Vec<i16> = rooms.rooms.keys().copied().collect();
+        assert_eq!(ids, [0, 1, 2, 3, 4, 1024, 1025, 1026, 1027, 1028, 1029]);
+        let outdoors: Vec<i16> = ids
+            .iter()
+            .copied()
+            .filter(|id| rooms.rooms[id].outdoors)
+            .collect();
+        // The three single triangles upstairs count as outdoors.
+        assert_eq!(outdoors, [0, 1024, 1027, 1028, 1029]);
+        assert_eq!(rooms.halves.len(), 7);
+        assert!(rooms.rooms.values().all(|room| room.dirty));
+        // Every tile inside the lot's size has a room or is split, and no
+        // tile outside it has.
+        for map in &rooms.map {
+            for (cell, &room) in map.iter().enumerate() {
+                let inside = cell / 64 < 52 && cell % 64 < 52;
+                assert_eq!(room != sims_sim::rooms::UNSEEN, inside);
+            }
+        }
+        let mut expected = before.clone();
+        expected.rooms = world.rooms.clone();
+        assert_eq!(world.encode(), expected.encode());
+        // Step 10. Every room is the one the house saved.
+        let roomed = world.clone();
+        let done = interpreter.assign_rooms(world).unwrap();
+        assert_eq!(done.moved, []);
+        assert_eq!(done.asked.len(), 62);
+        // The trees are those of doors and windows. Each returns true,
+        // which is all it leaves behind.
+        let mut expected = roomed.clone();
+        for id in &done.asked {
+            let object = expected.objects.get_mut(id).unwrap();
+            assert!(!object.last_result);
+            object.last_result = true;
+        }
+        assert_eq!(world.encode(), expected.encode());
+        // The room count.
+        let asked = world.clone();
+        assert_eq!(world.update_rooms().unwrap(), ids);
+        assert_eq!(world.globals[27], 204);
+        assert!(world.rooms.rooms.values().all(|room| !room.dirty));
+        let mut expected = asked.clone();
+        expected.globals[27] = 204;
+        expected.rooms = world.rooms.clone();
+        assert_eq!(world.encode(), expected.encode());
+        assert_eq!(world.hash_hex(), COUNTED);
+        // Step 11.
+        assert_eq!(world.discard_removals(), [42, 44, 278, 280]);
+        // Step 12.
+        let (id, family) = neighborhood.family_in(5).unwrap();
+        let magic = family.magic_history().unwrap();
+        assert_eq!((id, family.budget, magic), (5, 2542, Some([0; 6])));
+        let mut expected = world.clone();
+        world.select_family(5, 5, family.budget, magic).unwrap();
+        assert_eq!((asked.globals[9], asked.globals[10]), (0, 5));
+        assert_eq!((asked.globals[13], asked.budget.funds), (2515, 2515));
+        (expected.globals[9], expected.globals[13]) = (5, 2542);
+        expected.budget.funds = 2542;
+        expected.magic_history = Some(sims_sim::MagicHistory {
+            family: 5,
+            values: [0; 6],
+        });
+        assert_eq!(world.encode(), expected.encode());
+        assert_eq!(world.hash_hex(), SELECTED);
+    });
 }
