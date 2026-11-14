@@ -39,6 +39,20 @@ pub fn open_house(root: &Path, house: &Path) -> Result<Opened> {
     let version = file
         .version()
         .ok_or_else(|| Error::new("the house file has no HOUS 1 chunk"))?;
+    // The load shrinks the lot to the size the house asks for, in global
+    // 23 (0 asks for the full 64), before it reads the arrays (load step
+    // 3, `sims_vm::Interpreter::resize`). With no objects or arrays yet
+    // there is nothing else to shrink.
+    if let Some(&requested) = world.globals.get(23) {
+        let requested = if requested == 0 {
+            sims_sim::FULL_SIZE
+        } else {
+            requested
+        };
+        if (4..=sims_sim::FULL_SIZE).contains(&requested) {
+            world.size = requested;
+        }
+    }
     // `from_house` keeps the floor and wall arrays as saved; the load
     // widens them into the lot's own, which a fresh lot does not have yet.
     for id in sims_sim::load::FLOORS
