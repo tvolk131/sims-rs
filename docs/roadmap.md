@@ -60,9 +60,11 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 333 on the Goth house**: our
-  state after every one of ticks 1 to 333 equals the fourth capture of the
-  original (full state after every update) in everything compared. The
+  there, as three captures recorded). **K = 366 on the Goth house**: our
+  state after every one of ticks 1 to 366 equals the fourth capture of the
+  original (full state after every update) in everything compared, but
+  for the last place of one head field, which nothing reads (see "Ticks
+  334 to 366"). The
   other captures agree where they hold a state, but for fields that also
   differ between the original's own runs (see "Ticks 233 to 261").
   The simulation holds the neighborhood's people (their records, person
@@ -70,7 +72,7 @@ Each step is a few PRs, and each PR leaves `main` green.
   far as scripts read it. Find Location For (primitive 16) is ported for
   the modes the house reaches, and so is making a new person (Create New
   Object Instance mode 8, tick 6). Go To Routing Slot (primitive 45)
-  is ported for the routes the house takes to tick 333, with the
+  is ported for the routes the house takes to tick 366, with the
   planner, the search of places by distance, the animator's turn on the
   spot, its walk along the path and the end of the path, including the
   stop on a timer that needs the walk's strides (see "Ticks 262 to
@@ -81,9 +83,10 @@ Each step is a few PRs, and each PR leaves `main` green.
   (Go To Relative Position, primitive 27): the routing between rooms
   chooses a door, and the person walks through it. A person entering a
   room tells the room (it is lit as if it had a lamp), and each frame
-  counts the rooms that wait. Tick 334 stops loudly where person 16's
-  head follows a target, which is not ported, and the boot says so and at
-  which tick.
+  counts the rooms that wait. A person's head follows what it looks at
+  (see "Ticks 334 to 366"). Tick 367 stops loudly where person 18's
+  route finds a person in the way, which is not ported, and the boot says
+  so and at which tick.
 - Step 4 is in progress. `tools/harness/` runs the original under Wine
   in a QEMU guest and stops it at every lot update. It saves the state
   at the entry of the first tick and after each lot update: every
@@ -122,7 +125,7 @@ Each step is a few PRs, and each PR leaves `main` green.
   five differing records came from the first capture's guest files. The
   original first draws from the C runtime's stream in tick 6, 1,466
   times, when it makes a person; ours draws the same, and the stream is
-  equal after every tick to 333 (fourth capture).
+  equal after every tick to 366 (fourth capture).
 
 ### Load sequence
 
@@ -1229,6 +1232,69 @@ from the original; the results equal what it stored.
 
 **Stops.** Tick 334: person 16's head follows its target (`0x5907c5`),
 which needs the places of its bones in the current pose (`0x5904d2`).
+
+### Ticks 334 to 366
+
+**The head follows its target** (`0x590768`, `0x5907c5`). After Look
+Towards, each animator tick turns a person's head a little towards
+its target. Two angles are measured, seen from above, in eighths of a
+turn: the head's own heading, from the top of the head (the HEAD
+bone's "Top" anchor) to a point in front of it ("HeadFake"), and the
+target's heading, from the top of the head to the target. The turn
+moves by at most 0.2 towards their difference, and stops at 1.5 either
+way; then the script's word 42 changes. With the follow off, the turn
+shrinks by a fifth each tick. The angles are measured on the current
+pose (`0x5904d2`): the pose the foreground clip gives at its phase,
+with the head turned, placed in the lot by the person's direction and
+position (`0x592132`). The person stands at the height of the ground
+under it (`0x478dfe`): on a sloped tile, the height comes from the
+tile's four corners, on one of the two triangles its diagonal makes.
+`sims_sim::head` holds the arithmetic, and the animator now keeps the
+head's fields (animator `+0x210` to `+0x224`).
+
+**A walk that starts with a clip** (animator state 6, `0x58e125`).
+Person 18 plays clip `0x13`, which carries it one clip's distance
+straight ahead. The animator moves it along the clip until the clip's
+phase reaches 0.95.
+
+**Joining an interaction** (`0x41ee99`). When Find Best Interaction
+looks at a person whose running interaction may be joined, it also
+scores the joining entry of that interaction's object. The entry's
+check tree runs with a second argument of 1. An entry whose join
+interaction is missing is left out, as in the original.
+
+**Run Tree By Name, mode 1** (`0x44ba26`). The tree runs to its end on
+the stack object's own thread, with that object's temps, and its
+result picks the branch. Mode 0, on the running object's own thread,
+is not ported.
+
+**When a place is refused, why** (`0x48158c`). The place test now tells
+its refusals apart. A wall in the way answers 3. Another object in the
+way answers 5 when it is a person and 1 otherwise, and the route keeps
+which object it was (`+0x8c`). With no candidates, the planner gives up
+(`0x482462`), and the route to a slot then clears its candidates
+(`0x481898`).
+
+**Snapshot format 18** keeps the head's fields. The pins taken under
+format 17 still hold with them left out.
+
+**Compared with the original.** After every one of ticks 334 to 366,
+our state equals the fourth capture's in the same fields as before, now
+with the head's fields, with one exception. Person 16's target height
+(animator `+0x220`) is one unit in the last place lower in ours after
+ticks 335, 336, 338 to 340, 342, 343 and 353. Why is **unknown**: the
+height of the ground was checked exact, so the difference is likely in
+the pose, whose bones the captures do not hold. Nothing in the
+simulation reads that field; the headings use the other two.
+
+**Not verified.** The sine, cosine and arc tangent come from libm in
+double precision; the original's FPU instructions may round
+differently at some inputs. Run Tree By Name mode 1 returns false when
+the object's thread is in an error state; no object here is.
+
+**Stops.** Tick 367: person 18's route to a slot finds no way, because
+person 21 stands in it. Step 6 of the route tries again and asks the
+person in the way to move (`0x45b066`, `0x45ba28`); it is not ported.
 
 ## Track: drawing people (`crates/sims-people`)
 
