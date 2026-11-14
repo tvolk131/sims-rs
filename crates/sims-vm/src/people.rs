@@ -221,8 +221,11 @@ impl Interpreter<'_> {
     /// person whose data word 73 is set, whose footprint the original
     /// then works out again.
     ///
-    /// Not modeled: the person's animations, graphics and action icons,
-    /// and the guard against a reset inside a reset (object flag 0x800).
+    /// A person whose animator has ticked fails too: resetting the
+    /// animator (0x589220) is not ported.
+    ///
+    /// Not modeled: the person's graphics and action icons, and the guard
+    /// against a reset inside a reset (object flag 0x800).
     pub(crate) fn reset_person(
         &self,
         world: &mut World,
@@ -259,6 +262,13 @@ impl Interpreter<'_> {
         }
         if person.data.get(73).is_none_or(|&word| word != 0) {
             return Err(unsupported("whose data word 73 is set"));
+        }
+        // The reset also resets the person's animator (0x589220), which is
+        // not ported. Every reset seen so far is at the load, before the
+        // animator has ticked, where it is taken to give
+        // [`sims_sim::animator::LOADED`].
+        if world.animators.contains_key(&id) {
+            return Err(unsupported("whose animator has ticked"));
         }
         let profile = people.profiles.get(&guid).ok_or_else(|| {
             fail(Trap::Unsupported(format!(

@@ -3,7 +3,7 @@
 //! ends at the state the original's first tick starts from. A tick that
 //! reaches something not ported stops the boot, which says at which tick.
 
-use sims_content::{Catalog, House, Index, Install, Neighborhood, People};
+use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People};
 use sims_sim::load::Context;
 use sims_sim::{Snapshots, World};
 use sims_vm::{Answers, Callback, Interpreter, Program, Stream};
@@ -41,6 +41,7 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     // walks them all, so the whole catalog is linked.
     let mut program = Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid))?;
     program.zoning = neighborhood.zoning(context.expansions)?;
+    program.animations = Animations::load(&install, &index)?;
     let interpreter = Interpreter::new(&program, &catalog, Stream::Global);
     // The lot the game holds before the load: empty, with the
     // neighborhood's people, the type attributes the neighborhood saved

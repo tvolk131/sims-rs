@@ -1,5 +1,5 @@
 use crate::{Error, Result};
-use sims_content::{Catalog, Index, Object};
+use sims_content::{Animations, Catalog, Index, Object};
 use sims_formats::behavior::{Behavior, InteractionTable};
 use sims_formats::execution::{self, ObjectFunction, ObjectFunctions, Slots};
 use sims_formats::iff::Iff;
@@ -107,6 +107,10 @@ pub struct Program {
     /// comes from the neighborhood ([`sims_content::Neighborhood::zoning`]),
     /// so [`Program::link`] leaves it empty for the caller to fill.
     pub zoning: BTreeMap<i16, i32>,
+    /// The animation clips persons play, by name. They come from the
+    /// install's animation files ([`sims_content::Animations::load`]), so
+    /// [`Program::link`] leaves this empty for the caller to fill.
+    pub animations: Animations,
 }
 
 impl Program {
@@ -123,6 +127,7 @@ impl Program {
             semi_globals: BTreeMap::new(),
             careers: careers(index)?,
             zoning: BTreeMap::new(),
+            animations: Animations::default(),
         };
         program.load(index, catalog.global)?;
         for guid in guids {

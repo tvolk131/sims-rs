@@ -2,6 +2,7 @@
 //! interpreter. Each returns which branch to take. A primitive with no
 //! implementation fails with [`Trap::Unimplemented`], which names it.
 
+mod animate;
 mod create;
 pub(crate) mod dialog;
 mod distance;
@@ -112,6 +113,8 @@ impl Machine<'_, '_> {
             28 => self.run_named_tree(operands)?,
             31 => self.set_to_next(operands)?.into(),
             42 => self.create_object(operands)?.into(),
+            44 => self.animate_sim(operands)?,
+            48 => self.stop_all_sounds(operands)?.into(),
             32 => self.test_object_type(operands)?.into(),
             36 => self.dialog(operands)?,
             49 => self.notify()?.into(),

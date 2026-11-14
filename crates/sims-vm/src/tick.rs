@@ -22,9 +22,9 @@
 //!
 //! **Not modeled**, being presentation as far as the original's code
 //! shows: an object's animated sprites (the list at object 0x148, stepped
-//! after each thread run and redrawn), a person's animator (its virtual
-//! function 0x50, called each tick) and the graphics work every tenth
-//! tick (0x5a0932), and signal 0xf7, which a person's tick sends when the
+//! after each thread run and redrawn), the parts of a person's animator
+//! that only pose and draw the person (see [`crate::animator`]), the
+//! graphics work every tenth tick (0x5a0932), and signal 0xf7, which a person's tick sends when the
 //! selected Sim changes room and which only the house viewer takes
 //! (0x4a82db, 0x4ab992). That none of these changes simulation state is
 //! **unverified**. The lot's subscriber forwards each signal to a second
@@ -363,7 +363,9 @@ impl Interpreter<'_> {
     ///    0x810, 0 when the person is made), the decay tick is noted and,
     ///    if person data word 29 and data word 34 are 0, the motives decay
     ///    ([`Tuning::decay`], 0x45d145).
-    /// 3. The room the person was last seen in (person field 0xafc) is
+    /// 3. The person's animator ticks (its virtual function 0x50, 0x58dc72;
+    ///    see [`crate::animator`]).
+    /// 4. The room the person was last seen in (person field 0xafc) is
     ///    brought up to date from data word 29 (0x45e43d). When it changes
     ///    a person whose kind (person word 65) is at most 1 leaves the old
     ///    room, if no other person was last seen there (0x46886c), and
@@ -371,15 +373,15 @@ impl Interpreter<'_> {
     ///    Entering or leaving an indoor room (its occupied mark, its light
     ///    and signal 0xf1) is not ported and fails. The original then
     ///    sends signal 0xf7 for the selected Sim (not modeled).
-    /// 4. Unless the room is still unknown (-5), motive 13 takes the
+    /// 5. Unless the room is still unknown (-5), motive 13 takes the
     ///    room's score (0x45cef4): the lot's outdoor score for an outdoor
     ///    room, the room's own score for an indoor one, 0 for a room that
     ///    does not exist. In room 0 on a lot that is not residential a
     ///    score below 0 counts as 0.
-    /// 5. Person word 27 goes up by 1.
-    /// 6. The motive changes the person's actions set run once
+    /// 6. Person word 27 goes up by 1.
+    /// 7. The motive changes the person's actions set run once
     ///    ([`motives::apply_changes`], 0x45cdb3).
-    /// 7. Every tenth tick, for an awake member of the household who is
+    /// 8. Every tenth tick, for an awake member of the household who is
     ///    not hidden, the lot's 0x4165e3 runs; that is not ported and
     ///    fails. A nonzero person word 1 goes to 0x4a69aa and is cleared;
     ///    that is not ported and fails.
@@ -406,6 +408,24 @@ impl Interpreter<'_> {
             .get(&id)
             .copied()
             .unwrap_or(PersonTick::CONSTRUCTED);
+        {
+            let object = world
+                .objects
+                .get_mut(&id)
+                .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
+            let hidden = object.data.get(HIDDEN).copied().unwrap_or(0);
+            let person = object
+                .person
+                .as_mut()
+                .ok_or_else(|| fail(Trap::native(0x1c, "object is not a person")))?;
+            if tick >= state.last_decay.wrapping_add(60) {
+                state.last_decay = tick;
+                if person.data.get(person::NO_DECAY).copied().unwrap_or(0) == 0 && hidden == 0 {
+                    tuning.decay(person, hour);
+                }
+            }
+        }
+        self.tick_animator(world, id, tick).map_err(fail)?;
         let outdoor_score = world.rooms.outdoor_score;
         // The score of a room that exists (0x45cef4).
         let score = |room: &Room| {
@@ -447,12 +467,6 @@ impl Interpreter<'_> {
             .person
             .as_mut()
             .ok_or_else(|| fail(Trap::native(0x1c, "object is not a person")))?;
-        if tick >= state.last_decay.wrapping_add(60) {
-            state.last_decay = tick;
-            if word(&person.data, person::NO_DECAY) == 0 && hidden == 0 {
-                tuning.decay(person, hour);
-            }
-        }
         if room != state.room {
             let kind = word(&person.data, person::KIND);
             for (old, new) in [(state.room, false), (room, true)] {

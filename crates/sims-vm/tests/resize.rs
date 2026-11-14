@@ -5,7 +5,7 @@
 //! Game data is never committed, so CI skips this. The mechanics have
 //! synthetic tests in `tests/interpreter`.
 
-use sims_content::{Catalog, House, Index, Install, Neighborhood, People};
+use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People};
 use sims_sim::World;
 use sims_sim::load::Context;
 use sims_vm::{Interpreter, Program, Stream};
@@ -45,6 +45,7 @@ fn with_goth_people(
     let mut program =
         Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid)).unwrap();
     program.zoning = neighborhood.zoning(context.expansions).unwrap();
+    program.animations = Animations::load(&install, &index).unwrap();
     let interpreter = Interpreter::new(&program, &catalog, Stream::Global);
     let mut world = World::empty();
     let characters = catalog.objects.iter().filter(|o| o.kind == 2);
@@ -244,8 +245,21 @@ fn format_8_bytes(world: &World) -> Vec<u8> {
 fn format_9_bytes(world: &World) -> Vec<u8> {
     let mut old = world.clone();
     old.neighbors = sims_sim::neighbors::Neighbors::default();
-    let mut encoded = old.encode();
+    let mut encoded = format_10_bytes(&old);
     assert_eq!(encoded.split_off(encoded.len() - 3), [0; 3]);
+    encoded
+}
+
+/// A lot's encoding as snapshot format 10 wrote it. Format 11 added the
+/// persons' animators at the end of the encoding. This empties them,
+/// checks that the encoding then ends in the zero byte of an empty map,
+/// and drops it, so a state pinned under format 10 can be shown to be
+/// the same state but for the animators.
+fn format_10_bytes(world: &World) -> Vec<u8> {
+    let mut old = world.clone();
+    old.animators.clear();
+    let mut encoded = old.encode();
+    assert_eq!(encoded.split_off(encoded.len() - 1), [0]);
     encoded
 }
 
@@ -1315,10 +1329,13 @@ fn the_goth_house_objects_are_all_visited() {
 fn the_goth_house_load_ends_where_the_first_tick_starts() {
     // Pinned under snapshot format 8, the same state under format 9
     // ([`format_9_bytes`], without the neighborhood's records) and under
-    // format 10. See [`pinned`] for why the format 8 pin changed.
+    // format 10 ([`format_10_bytes`], without the animators, of which the
+    // load leaves none), and under format 11. See [`pinned`] for why the
+    // format 8 pin changed.
     const BASELINE: &str = "034d3b636d3529fa91826a5f5b759e4abba31d6c5be3b66732a1f1ef642ad9fb";
     const BASELINE_9: &str = "fe21f960b207ba0ced6a6a5dfe5628fcb101c12eb9571d49578ec65dfde459da";
     const BASELINE_10: &str = "29b4aec3debe353d77363e18cf3cbd263b30fe2fe4e1e03a5f309c08dd132168";
+    const BASELINE_11: &str = "90c52a0d5be39db0556c0f8fc9ea41088cdb36b5d024094b8073eaf1d3bb918a";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1413,7 +1430,9 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
         assert_eq!(world.crt_rng, before.crt_rng);
         assert_eq!(digest(&format_8_bytes(world)), BASELINE);
         assert_eq!(digest(&format_9_bytes(world)), BASELINE_9);
-        assert_eq!(world.hash_hex(), BASELINE_10);
+        assert_eq!(digest(&format_10_bytes(world)), BASELINE_10);
+        assert!(world.animators.is_empty());
+        assert_eq!(world.hash_hex(), BASELINE_11);
     });
 }
 
@@ -1448,12 +1467,22 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// registry byte 0x12, which that run has set and ours has not; what sets
 /// it during the original's load is not known.
 ///
-/// For tick 2, only where it stops was compared: object 16's frames,
-/// arguments and locals equal that run's after ticks 2 to 5.
+/// The three people's animators were compared too, from that run's
+/// memory pages: after this tick every field kept here that the pages
+/// hold is equal (58 readings; 23 fall on pages the run did not save).
+///
+/// Tick 2 does not finish: it stops at Find Location For on object 364,
+/// as asserted below. At that stop, compared with that run after its
+/// tick 2: the people's animators (72 readings, including object 16's
+/// foreground layer) and the 355 objects below 364 in data words and
+/// frames (the people also in person data and motives) are equal, except
+/// data word 29 of object 262, which object 364 has just made and is
+/// about to place. Object 16's frames, arguments and locals there equal
+/// that run's after ticks 2 to 5.
 ///
 /// Not compared, because the capture does not hold them in a form read
 /// there: the rooms, the lot arrays, the dialog records and the persons'
-/// tick state. That the five controllers' dialogs were answered with
+/// tick state other than the animators. That the five controllers' dialogs were answered with
 /// their only button is what the capture's later ticks show; the answers
 /// themselves were given before that run's observer attached.
 ///
@@ -1461,7 +1490,8 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 #[test]
 fn the_goth_house_first_tick_matches_the_original() {
     const TICK_1_9: &str = "62fc28f5e7689d166791a620dbed066fb8a7d707ea79017fbadf0eed3da5c937";
-    const TICK_1: &str = "bb55f7d5f656551708867b24779c2e0f019825459427858a27ad8c8874e7957b";
+    const TICK_1_10: &str = "bb55f7d5f656551708867b24779c2e0f019825459427858a27ad8c8874e7957b";
+    const TICK_1: &str = "c2fa1ed11813b8ab67214f7177e1bb27a2e25ae2ecef94c3c1172071d5682400";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1510,21 +1540,48 @@ fn the_goth_house_first_tick_matches_the_original() {
                 .all(|t| t.last_decay == before.ticks as i32)
         );
         assert_eq!(digest(&format_9_bytes(world)), TICK_1_9);
+        assert_eq!(digest(&format_10_bytes(world)), TICK_1_10);
         assert_eq!(world.hash_hex(), TICK_1);
         // The second tick gets past the neighborhood's people (Set To Next
         // modes 5 and 7, their person data, their relationships and
-        // inventories), Idle For Input and Get Distance To, and stops at
-        // the first Animate Sim, which is not ported. The capture shows
-        // that person at the same instruction after ticks 2 to 5, with
-        // the same frames; the 254 in its last local is a return's
-        // target left in the frame storage.
+        // inventories), Idle For Input and Get Distance To. Person 16
+        // starts a clip with Animate Sim and yields; the capture shows that
+        // person at the same instruction after ticks 2 to 5, with the same
+        // frames (the 254 in its last local is a return's target left in
+        // the frame storage). The controllers' answered dialogs go on to
+        // Stop All Sounds. The tick stops when controller 364 makes object
+        // 262 again and looks for a place for it (Find Location For, which
+        // is not ported).
         let second = interpreter.lot_update(world, &tuning, &mut player);
         match second {
             Err(sims_vm::TickError::Fault(fault)) => {
-                assert_eq!(fault.object, 16);
-                assert!(fault.to_string().contains("Animate Sim"), "{fault}");
+                assert_eq!(fault.object, 364);
+                assert!(fault.to_string().contains("Find Location For"), "{fault}");
             }
             other => panic!("{other:?}"),
+        }
+        // Person 16's clip started at the second tick's clock and its first
+        // update came at the same clock, so it has not moved; the
+        // foreground priority is raised once (0x592726).
+        let animator = &world.animators[&16];
+        let now = animator.clock_at(before.ticks as i32 + 1);
+        assert_eq!(
+            (animator.state, animator.playing, animator.clock),
+            (0, true, now)
+        );
+        let layer = animator.foreground.as_ref().unwrap();
+        assert_eq!(
+            (layer.priority, layer.current, layer.previous),
+            (6, now, now)
+        );
+        assert_eq!(
+            (layer.phase, layer.event_time, layer.interruptible),
+            (sims_core::F32::ZERO, 0, 1)
+        );
+        // The other two stand, as the capture shows them after the tick.
+        for id in [18, 21] {
+            assert_eq!(world.animators[&id].state, 3);
+            assert!(world.animators[&id].foreground.is_none());
         }
         let frames: Vec<_> = world.objects[&16]
             .stack

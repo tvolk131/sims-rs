@@ -30,6 +30,7 @@
 //! [`Interpreter::go_live`] and [`Interpreter::before_frame`]
 //! (`selection.rs`), which leave the lot as the first tick finds it.
 
+mod animator;
 mod error;
 mod factory;
 mod fault;

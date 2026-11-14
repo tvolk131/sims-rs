@@ -61,12 +61,15 @@ Each step is a few PRs, and each PR leaves `main` green.
   equals a capture of the original after its tick 1 in everything
   compared, the C runtime's random stream aside (see "The first tick").
   The simulation now holds the neighborhood's people (their records,
-  person data, relationships and inventories), and tick 2 gets past the
-  scripts that read them. It stops at Animate Sim (primitive 44) on
-  object 16, which needs a person's animator, and the boot says so and at
-  which tick. The capture shows object 16 waiting at that same place
-  after every tick from 2 to 5, so the stop is where the original is, but
-  K stays 1 until tick 2 runs to its end.
+  person data, relationships and inventories) and each person's
+  animator, as far as scripts read it. Tick 2 gets past the scripts that
+  read the people and past Animate Sim on object 16, whose animation the
+  capture shows still playing after tick 5. It stops at Find Location
+  For (primitive 16) on object 364, and the boot says so and at which
+  tick. Where it stops, the 355 objects whose turn has passed and the
+  three people's animators equal the capture after tick 2, except one word of
+  the object that Find Location For would place. K stays 1 until tick 2
+  runs to its end.
 
 ### Load sequence
 
@@ -852,15 +855,22 @@ during the original's load is not known.
 file that goes over the neighborhood's people and their relationships.
 It then waits for input (Idle For Input, `0x45db94`), measures distances
 (Get Distance To, `0x451f27`) and reaches Animate Sim (`0x58950b`). That
-primitive loads an animation into the person's animator and asks the
-animator, each tick, for its events and whether it is done. The
-animator's tick (`0x58dc72`) moves the person and runs the animation
-clock; it is not ported, so Animate Sim fails loudly. The capture shows
-object 16 at the same node, with the same arguments and locals, after
-ticks 2 to 5: the animation does not end in that time. What follows in
-the capture's ticks 2 to 5: object 15 asks a two-button dialog, answered
-with the second button; object 262 is made again; then 35 objects are
-removed and one is made. None of that is reached here yet.
+primitive starts a clip in the person's animator and asks it, each run,
+for its events and whether the clip is done. The animator's tick
+(`0x58dc72`) runs its clock, moves its speed, places a standing person
+and advances the clip; `crates/sims-sim/src/animator.rs` says what of it
+is kept and what is left out as presentation. The capture shows object
+16 at the same node, with the same arguments and locals, after ticks 2
+to 5: the clip does not end in that time, and here it is still playing
+too. After tick 1 and where tick 2 stops, the three people's animators
+equal the capture's in every field its memory pages hold.
+
+Later in tick 2, object 364 makes object 262 again and stops at Find
+Location For (`0x44b3c8`), which searches for a free place near another
+object (`0x4347f0`) and puts the object there. It is not ported. In the
+capture, object 262 ends tick 2 placed, and in ticks 3 to 5 object 15
+asks a two-button dialog, answered with the second button, and 35
+objects are removed and one is made. None of that is reached here yet.
 
 ## Working rules
 
