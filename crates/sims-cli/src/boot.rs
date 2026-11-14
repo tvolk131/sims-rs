@@ -45,18 +45,16 @@ pub struct Options<'a> {
 pub struct Frames {
     /// Ticks after which a frame is drawn.
     pub after: Vec<u32>,
-    /// A frame after this tick and after every `step`th tick from it.
-    pub from: Option<u32>,
-    /// The ticks between two of those frames, at least 1.
-    pub step: u32,
+    /// Repeating frames, as `(from, step)`: a frame after tick `from` and
+    /// after every `step`th tick from it. `step` is at least 1.
+    pub every: Vec<(u32, u32)>,
 }
 
 impl Default for Frames {
     fn default() -> Self {
         Self {
             after: vec![0, 1, 2, 3],
-            from: Some(33),
-            step: 30,
+            every: vec![(33, 30)],
         }
     }
 }
@@ -64,13 +62,12 @@ impl Default for Frames {
 impl Frames {
     /// Reads a list such as `0,33+30`: a tick number draws a frame after
     /// that tick (0: before the first), `N+` after every tick from N on,
-    /// and `N+S` after N and every S-th tick from there. `none` draws no
-    /// frame.
+    /// and `N+S` after N and every S-th tick from there. A list may hold
+    /// several of each. `none` draws no frame.
     pub fn parse(text: &str) -> Option<Self> {
         let mut frames = Self {
             after: Vec::new(),
-            from: None,
-            step: 1,
+            every: Vec::new(),
         };
         if text == "none" {
             return Some(frames);
@@ -78,12 +75,12 @@ impl Frames {
         for part in text.split(',') {
             match part.split_once('+') {
                 Some((from, step)) => {
-                    frames.from = Some(from.parse().ok()?);
-                    frames.step = if step.is_empty() {
+                    let step = if step.is_empty() {
                         1
                     } else {
                         step.parse().ok().filter(|&s| s > 0)?
                     };
+                    frames.every.push((from.parse().ok()?, step));
                 }
                 None => frames.after.push(part.parse().ok()?),
             }
@@ -95,8 +92,9 @@ impl Frames {
     pub fn after(&self, tick: u32) -> bool {
         self.after.contains(&tick)
             || self
-                .from
-                .is_some_and(|from| tick >= from && (tick - from).is_multiple_of(self.step))
+                .every
+                .iter()
+                .any(|&(from, step)| tick >= from && (tick - from).is_multiple_of(step))
     }
 }
 
@@ -490,12 +488,19 @@ mod tests {
         let every = Frames::parse("3+").unwrap();
         let drawn: Vec<u32> = (0..=6).filter(|&t| every.after(t)).collect();
         assert_eq!(drawn, [3, 4, 5, 6]);
-        assert_eq!(Frames::parse("none").unwrap().from, None);
+        assert_eq!(Frames::parse("none").unwrap().every, []);
         assert_eq!(Frames::parse("4+0"), None);
         assert_eq!(Frames::parse("x"), None);
         let default = Frames::default();
         let drawn: Vec<u32> = (0..=100).filter(|&t| default.after(t)).collect();
         assert_eq!(drawn, [0, 1, 2, 3, 33, 63, 93]);
         assert_eq!(Frames::parse("0,1,2,3,33+30"), Some(default));
+    }
+
+    #[test]
+    fn a_frame_list_keeps_every_repeating_schedule() {
+        let frames = Frames::parse("0+2,1+3").unwrap();
+        let drawn: Vec<u32> = (0..=10).filter(|&t| frames.after(t)).collect();
+        assert_eq!(drawn, [0, 1, 2, 4, 6, 7, 8, 10]);
     }
 }
