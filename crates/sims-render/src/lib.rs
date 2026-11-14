@@ -24,7 +24,7 @@ pub mod scene;
 pub use assets::Assets;
 pub use camera::{Camera, Walls, Zoom};
 pub use canvas::{Canvas, Image};
-pub use cutaway::Focus;
+pub use cutaway::{Focus, Selected};
 pub use light::Light;
 pub use lot::Lot;
 pub use open::{Opened, open_house};

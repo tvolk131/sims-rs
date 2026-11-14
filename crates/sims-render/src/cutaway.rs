@@ -17,14 +17,18 @@
 //! of them on screen whose walls, standing, would overlap it (0x468203).
 //! An outdoor room adds no tiles of its own. Instead, the selected Sim's
 //! outdoor tile adds a square of up to 4 by 4 tiles towards the camera.
-//! And if any of the rooms is outdoors, the pointer adds the 4 by 4 square
-//! behind it (0x4abdda).
+//! And if any of the rooms is outdoors, the pointer adds a 4 by 4 square
+//! of tiles around it (0x4abdda).
+//!
+//! When the pointer leaves the lot, the original empties the mask
+//! (0x4ac07b) but keeps the list: the pointer's rooms count again once it
+//! is back over the lot.
 //!
 //! The old prototype ported these in
-//! `legacy/crates/sims-sim/src/lot_presenter/{room_masks,visibility}.rs`
-//! and `walls/cutaway.rs`; this follows them. Where the pointer and the
-//! selected Sim are is input, given in [`Focus`]: the renderer only reads
-//! the world.
+//! `legacy/crates/sims-sim/src/lot_presenter/{room_masks,visibility,hover,
+//! inverse_projection}.rs` and `walls/cutaway.rs`; this follows them.
+//! Where the pointer and the selected Sim are is input, given in
+//! [`Focus`]: the renderer only reads the world.
 
 use crate::camera::{ARRAY_SIZE, Camera};
 use crate::lot::{self, Lot};
@@ -38,10 +42,24 @@ pub const ROOMS: usize = 3;
 pub struct Focus {
     /// The last rooms the pointer passed over, newest first.
     pub rooms: [Option<i16>; ROOMS],
-    /// The lot tile under the pointer, if it is over the lot.
+    /// The pointer left the lot: the rooms are kept but not looked at.
+    pub away: bool,
+    /// The pointer's screen point, if known.
     pub pointer: Option<[i32; 2]>,
-    /// The selected Sim's lot tile and level (1 or 2), in live mode.
-    pub selected: Option<[i32; 3]>,
+    /// The selected Sim, in live mode.
+    pub selected: Option<Selected>,
+}
+
+/// Where the selected Sim is, as the simulation keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selected {
+    /// Its lot tile.
+    pub tile: [i32; 2],
+    /// Its level, 1 or 2.
+    pub level: i32,
+    /// Its room. A Sim on a tile a diagonal wall splits is in one of the
+    /// two rooms, so this is not the tile's room.
+    pub room: i16,
 }
 
 impl Focus {
@@ -63,35 +81,39 @@ impl Focus {
 
     /// The pointer moved to screen point `at` (0x4ab7ee). Remembers the
     /// room under it and the first other room below it on screen, within
-    /// half a storey, looked for every half tile.
+    /// half a storey, looked for every half tile. Off the lot, the rooms
+    /// are kept but no longer looked at.
     pub fn point(&mut self, lot: &Lot, camera: &Camera, at: [i32; 2]) {
         // Points this far off are off the lot; the projection's arithmetic
         // is not meant for them.
-        let off = |i: usize| (i64::from(at[i]) - i64::from(camera.origin[i])).unsigned_abs();
-        if off(0) > FAR || off(1) > FAR {
+        if !near(camera, at) {
             self.pointer = None;
+            self.away = true;
             return;
         }
-        let level = camera.level.clamp(1, 2);
+        self.pointer = Some(at);
+        let view = View::new(lot, camera);
+        // The room under a screen point: none off the lot's inner tiles,
+        // and none (but on the lot) on a tile a diagonal splits.
         let room = |y: i32| -> Option<Option<i16>> {
-            let tile = ground_tile(camera, [at[0], y.saturating_add(lift(camera))]);
-            lot.contains(tile[0], tile[1])
-                .then(|| room_of(lot, (level - 1) as usize, tile))
+            let fine = view.fine([at[0], y])?;
+            let tile = fine.map(|f| f >> 4);
+            view.interior(tile).then(|| {
+                let [x, y] = camera.unrotate_tile(tile);
+                room_of(lot, view.level, [x, y])
+            })
         };
         let Some(first) = room(at[1]) else {
-            self.pointer = None;
+            self.away = true;
             return;
         };
-        self.pointer = Some(ground_tile(
-            camera,
-            [at[0], at[1].saturating_add(lift(camera))],
-        ));
+        self.away = false;
         let step = camera.zoom.tile_height() / 2;
         let mut below = first;
         let mut offset = step;
         while offset < camera.zoom.floor_height() / 2 {
             // A point off the lot keeps the room found so far.
-            if let Some(found) = room(at[1].saturating_add(offset)) {
+            if let Some(found) = room(at[1] + offset) {
                 below = found;
             }
             if below != first {
@@ -105,16 +127,17 @@ impl Focus {
     }
 }
 
-/// Screen points this far from the origin are treated as off the lot.
-const FAR: u64 = 1 << 24;
-
-/// Screen rows a level's floor sits above the ground's.
-fn lift(camera: &Camera) -> i32 {
-    camera.zoom.floor_height() * (camera.level.clamp(1, 2) - 1)
-}
-
-fn ground_tile(camera: &Camera, at: [i32; 2]) -> [i32; 2] {
-    camera.unproject_fine(at).map(|f| f.div_euclid(16))
+/// Whether screen point `at` is near enough the lot's origin to be on it,
+/// and both small enough that the projection's arithmetic cannot overflow.
+fn near(camera: &Camera, at: [i32; 2]) -> bool {
+    const SMALL: i32 = 1 << 28;
+    const FAR: i32 = 1 << 24;
+    (0..2).all(|i| {
+        let [a, o] = [at[i], camera.origin[i]];
+        (-SMALL..SMALL).contains(&a)
+            && (-SMALL..SMALL).contains(&o)
+            && (-FAR..FAR).contains(&(a - o))
+    })
 }
 
 /// The room of a whole tile, as 0x4899d5 gives it: none for a tile a
@@ -125,6 +148,12 @@ fn room_of(lot: &Lot, level: usize, [x, y]: [i32; 2]) -> Option<i16> {
     }
     let room = lot.levels[level].rooms.as_ref()?[Lot::cell(x as usize, y as usize)];
     (room >= 0).then_some(room)
+}
+
+/// The slope from screen point `b` to `a`, rise over run in 16.16, as the
+/// original divides (0x4a955d). None where the run is zero.
+fn ratio(a: [i32; 2], b: [i32; 2]) -> Option<i32> {
+    (a[1] - b[1]).wrapping_shl(16).checked_div(a[0] - b[0])
 }
 
 /// The view tiles the cutaway may cut walls between.
@@ -153,7 +182,23 @@ struct View<'a> {
     bounds: [i32; 4],
 }
 
+impl<'a> View<'a> {
+    fn new(lot: &'a Lot, camera: &'a Camera) -> Self {
+        Self {
+            lot,
+            camera,
+            level: (camera.level.clamp(1, 2) - 1) as usize,
+            bounds: bounds(lot, camera),
+        }
+    }
+}
+
 impl View<'_> {
+    /// The level shown, 1 or 2.
+    fn storey(&self) -> i32 {
+        self.level as i32 + 1
+    }
+
     fn inside(&self, [x, y]: [i32; 2]) -> bool {
         let b = self.bounds;
         x >= b[0] && x <= b[1] && y >= b[2] && y <= b[3]
@@ -164,16 +209,144 @@ impl View<'_> {
         x > b[0] && x < b[1] && y > b[2] && y < b[3]
     }
 
-    /// The height of a view tile's top corner, in terrain steps.
-    fn top(&self, view: [i32; 2]) -> i32 {
+    /// The heights of a view tile's corners, in terrain steps, in screen
+    /// order: top, left... as the view turns them (0x479567).
+    fn corners(&self, view: [i32; 2]) -> [i32; 4] {
         let [x, y] = self.camera.unrotate_tile(view);
         if !self.lot.contains(x, y) {
-            return 0;
+            return [0; 4];
         }
         let h = self.lot.heights[Lot::cell(x as usize, y as usize)];
-        // Corner 1 on screen is the stored corner (1 - rotation) mod 4
-        // (0x479567).
-        i32::from(h[(5 - usize::from(self.camera.rotation & 3)) & 3])
+        let rotation = usize::from(self.camera.rotation & 3);
+        std::array::from_fn(|n| i32::from(h[(n + 4 - rotation) & 3]))
+    }
+
+    /// The height of a view tile's top corner, in terrain steps.
+    fn top(&self, view: [i32; 2]) -> i32 {
+        self.corners(view)[1]
+    }
+
+    /// A view tile's top corner on screen on `level`, raised by the
+    /// terrain on the lot's inner tiles (0x4a9c50).
+    fn corner(&self, p: [i32; 2], level: i32) -> [i32; 2] {
+        let height = if self.interior(p) { self.top(p) } else { 0 };
+        self.camera.project(p, level, height)
+    }
+
+    /// The view tile under screen point `at` on the level shown, by the
+    /// original's search over the tiles' raised corners (0x4a955d). None
+    /// far off the lot, where the search would not end.
+    fn coarse(&self, at: [i32; 2]) -> Option<[i32; 2]> {
+        let camera = self.camera;
+        let level = self.storey();
+        let x = (at[0] - camera.origin[0]) / 2;
+        let y = at[1] - camera.origin[1];
+        let shift = camera.zoom.level() + 3;
+        let mut best = [(y + x) >> shift, (y - x) >> shift];
+        if best
+            .iter()
+            .any(|v| !(-ARRAY_SIZE..2 * ARRAY_SIZE).contains(v))
+        {
+            return None;
+        }
+        let project = |p: [i32; 2]| self.corner(p, level);
+        let mut parity = usize::from(project(best)[0] >= at[0]);
+        let mut scan = best;
+        let mut budget = 4096;
+        let mut spend = || {
+            budget -= 1;
+            (budget > 0).then_some(())
+        };
+        while scan[0] < 0 || scan[1] < 0 {
+            spend()?;
+            scan[parity & 1] += 1;
+            parity += 1;
+        }
+        let upper = [self.bounds[1] + 1, self.bounds[3] + 1];
+        if scan[0] < upper[0] && scan[1] < upper[1] {
+            loop {
+                spend()?;
+                let axis = parity & 1;
+                parity += 1;
+                scan[axis] += 1;
+                if scan[axis] >= upper[axis] {
+                    break;
+                }
+                if project(scan)[1] < at[1] {
+                    best = scan;
+                }
+            }
+        }
+        loop {
+            spend()?;
+            let p = project(best);
+            if at[0] < p[0] {
+                let edge = ratio(p, project([best[0], best[1] + 1]))?;
+                if ratio(p, at)? <= edge {
+                    break;
+                }
+                best[0] -= 1;
+            } else if at[0] == p[0] {
+                break;
+            } else {
+                let edge = ratio(p, project([best[0] + 1, best[1]]))?;
+                if edge <= ratio(p, at)? {
+                    break;
+                }
+                best[1] -= 1;
+            }
+        }
+        Some(best)
+    }
+
+    /// The fine view position (sixteenths of a tile) under screen point
+    /// `at` on the level shown: the tile from [`View::coarse`], then the
+    /// spot within it on the terrain's slope (0x4a97c3 with flag one).
+    fn fine(&self, at: [i32; 2]) -> Option<[i32; 2]> {
+        let tile = self.coarse(at)?;
+        let whole = tile.map(|t| t << 4);
+        if !self.interior(tile) {
+            return Some(whole);
+        }
+        let zoom = self.camera.zoom;
+        let h = self.corners(tile);
+        let center = self.corner(tile, 1);
+        let left = at[0] < center[0];
+        let width = zoom.tile_width() / 2;
+        let side_x = center[0] + if left { -width } else { width };
+        let raise = |steps: i32| steps << (zoom.level() + 1);
+        let side_y = center[1] + raise(h[1] - h[if left { 0 } else { 2 }] + 2);
+        let bottom_y = center[1] + raise(h[1] - h[3] + 4);
+        let denominator = f64::from(center[0] - side_x);
+        let first = f64::from(center[1] - side_y) / denominator;
+        let second = f64::from(bottom_y - side_y) / denominator;
+        let shifted_y = f64::from(at[1] + zoom.floor_height() * (self.storey() - 1));
+        let mouse_x = f64::from(at[0]);
+        let [side_x, side_y] = [side_x, side_y].map(f64::from);
+        // The original keeps one result in a float and one in a double.
+        let (stored, retained) = if first == second {
+            (mouse_x, mouse_x)
+        } else {
+            let delta = second - first;
+            (
+                f64::from(
+                    ((side_y - shifted_y - side_x * first + mouse_x * second) / delta) as f32,
+                ),
+                (shifted_y - side_y - mouse_x * first + side_x * second) / delta,
+            )
+        };
+        let center_x = f64::from(center[0]);
+        let width = f64::from(width);
+        let (a, b) = if left {
+            ((center_x - stored) / width, (retained - side_x) / width)
+        } else {
+            ((side_x - retained) / width, (stored - center_x) / width)
+        };
+        let part = |v: f64| {
+            let v = v * 16.0;
+            v.is_finite().then_some((v as i64 & 15) as i32)
+        };
+        Some([whole[0] | part(b)?, whole[1] | part(a)?])
     }
 
     /// A view tile's top corner on screen, without its height.
@@ -291,25 +464,27 @@ impl Mask {
     /// The mask for the floor the camera shows (0x4ab992).
     pub fn new(lot: &Lot, camera: &Camera) -> Self {
         let mut rows = [0u64; ARRAY_SIZE as usize];
-        let level = camera.level.clamp(1, 2);
-        let view = View {
-            lot,
-            camera,
-            level: (level - 1) as usize,
-            bounds: bounds(lot, camera),
-        };
+        let view = View::new(lot, camera);
         let focus = camera.focus;
         let mut outdoors = false;
-        for room in focus.rooms.into_iter().flatten() {
+        let looked_at = if focus.away {
+            &[][..]
+        } else {
+            &focus.rooms[..]
+        };
+        for &room in looked_at.iter().flatten() {
             view.room(room, &mut rows);
             outdoors |= lot.outdoor_rooms.contains(&room);
         }
-        if let Some([x, y, _]) = focus.selected.filter(|s| s[2] == level)
-            && let Some(room) = room_of(lot, view.level, [x, y])
+        // The original skips the room numbers that mark split tiles.
+        if let Some(s) = focus
+            .selected
+            .filter(|s| s.level == view.storey() && s.room >= 0)
         {
-            view.room(room, &mut rows);
+            view.room(s.room, &mut rows);
             let size = lot.size as i32;
-            if lot.outdoor_rooms.contains(&room) {
+            let [x, y] = s.tile;
+            if lot.outdoor_rooms.contains(&s.room) {
                 outdoors = true;
                 if x > 0 && x < size - 1 && y > 0 && y < size - 1 {
                     let start = camera.rotate_tile([x, y]);
@@ -322,8 +497,13 @@ impl Mask {
                 }
             }
         }
-        if outdoors && let Some(pointer) = focus.pointer.filter(|p| lot.contains(p[0], p[1])) {
-            let mut start = camera.rotate_tile(pointer);
+        // The pointer's square starts at the tile four tiles' height below
+        // it on screen and reaches four tiles back up, clipped to the lot.
+        if outdoors
+            && let Some(at) = focus.pointer.filter(|&at| near(camera, at))
+            && let Some(fine) = view.fine([at[0], at[1] + 4 * camera.zoom.tile_height()])
+        {
+            let mut start = fine.map(|f| f >> 4);
             let mut end = [start[0] - 4, start[1] - 4];
             while !view.inside(start) && start != end {
                 start = [start[0] - 1, start[1] - 1];
@@ -535,47 +715,123 @@ mod tests {
         }
     }
 
+    /// The screen point at the middle of a tile raised `height` steps.
+    fn middle(c: &Camera, tile: [i32; 2], height: i32) -> [i32; 2] {
+        let [x, y] = c.project(tile, 1, height);
+        [x, y + c.zoom.tile_height() / 2]
+    }
+
+    #[test]
+    fn the_pointer_finds_the_spot_it_is_over() {
+        let lot = house();
+        let c = camera(0);
+        let view = View::new(&lot, &c);
+        assert_eq!(view.fine(middle(&c, [9, 9], 0)), Some([152, 152]));
+        // Down and right along the tile's x edge is along x only; down and
+        // left is along y.
+        let [x, y] = middle(&c, [9, 9], 0);
+        assert_eq!(view.fine([x + 4, y + 2]), Some([156, 152]));
+        assert_eq!(view.fine([x - 6, y + 3]), Some([152, 158]));
+    }
+
     #[test]
     fn the_pointer_looks_at_its_room_and_the_room_below_it() {
         let lot = house();
         let c = camera(0);
-        let screen = |tile: [i32; 2]| {
-            let [x, y] = c.project(tile, 1, 0);
-            [x, y + c.zoom.tile_height() / 2]
-        };
         let mut focus = Focus::default();
-        focus.point(&lot, &c, screen([9, 9]));
+        focus.point(&lot, &c, middle(&c, [9, 9], 0));
         assert_eq!(focus.rooms, [Some(ROOM), None, None]);
-        assert_eq!(focus.pointer, Some([9, 9]));
+        assert_eq!(focus.pointer, Some(middle(&c, [9, 9], 0)));
+        assert!(!focus.away);
         // From the room's front corner, outdoors is half a tile down.
         let mut focus = Focus::default();
-        focus.point(&lot, &c, screen([11, 11]));
+        focus.point(&lot, &c, middle(&c, [11, 11], 0));
         assert_eq!(focus.rooms, [Some(OUTSIDE), Some(ROOM), None]);
-        // Off the lot nothing is remembered.
+        // Off the lot, or on its outer ring of tiles, the rooms are kept
+        // but not looked at, until the pointer comes back.
+        for off in [[-5000, -5000], middle(&c, [0, 9], 0)] {
+            let mut c = c;
+            c.focus = focus;
+            c.focus.point(&lot, &camera(0), off);
+            assert!(c.focus.away);
+            assert_eq!(c.focus.rooms, focus.rooms);
+            assert_eq!(Mask::new(&lot, &c), Mask::new(&lot, &camera(0)));
+            c.focus.point(&lot, &camera(0), middle(&c, [9, 9], 0));
+            assert!(!c.focus.away);
+            assert_ne!(Mask::new(&lot, &c), Mask::new(&lot, &camera(0)));
+        }
+    }
+
+    #[test]
+    fn the_pointer_picks_raised_tiles_where_they_are_drawn() {
+        let mut lot = house();
+        for x in 8..12 {
+            for y in 8..12 {
+                lot.heights[Lot::cell(x, y)] = [4; 4];
+            }
+        }
+        let c = camera(0);
+        // The room's back tile, raised a tile's height: the ground there
+        // would be outdoors.
+        let at = middle(&c, [8, 8], 4);
+        assert_eq!(View::new(&lot, &c).fine(at), Some([136, 136]));
         let mut focus = Focus::default();
-        focus.point(&lot, &c, [-5000, -5000]);
-        assert_eq!(focus, Focus::default());
+        focus.point(&lot, &c, at);
+        assert_eq!(focus.rooms, [Some(ROOM), None, None]);
     }
 
     #[test]
     fn an_outdoor_sim_and_the_pointer_mark_squares_of_tiles() {
         let lot = house();
         let mut c = camera(0);
-        c.focus.selected = Some([4, 4, 1]);
+        let outdoors = Selected {
+            tile: [4, 4],
+            level: 1,
+            room: OUTSIDE,
+        };
+        c.focus.selected = Some(outdoors);
         let mask = Mask::new(&lot, &c);
         assert!(mask.contains([4, 4]) && mask.contains([7, 7]));
         assert!(!mask.contains([8, 8]) && !mask.contains([3, 3]));
         // A Sim on the other floor marks nothing.
-        c.focus.selected = Some([4, 4, 2]);
+        c.focus.selected = Some(Selected {
+            level: 2,
+            ..outdoors
+        });
         assert!(!Mask::new(&lot, &c).contains([4, 4]));
-        // The pointer adds the square behind it once a room is outdoors.
+        // The pointer adds a square once a room is outdoors: from the tile
+        // four tiles' height below it, four tiles back.
         c.focus.selected = None;
-        c.focus.pointer = Some([15, 15]);
+        let [x, y] = middle(&c, [15, 15], 0);
+        c.focus.pointer = Some([x, y - 4 * c.zoom.tile_height()]);
         assert!(!Mask::new(&lot, &c).contains([12, 12]));
         c.focus.visit(OUTSIDE);
         let mask = Mask::new(&lot, &c);
         assert!(mask.contains([11, 11]) && mask.contains([14, 14]));
-        assert!(!mask.contains([15, 15]));
+        assert!(!mask.contains([15, 15]) && !mask.contains([10, 10]));
+    }
+
+    #[test]
+    fn the_selected_sim_counts_in_its_own_room() {
+        // The Sim's room is the simulation's, not its tile's: on a split
+        // tile they differ.
+        let lot = house();
+        let mut c = camera(0);
+        c.focus.selected = Some(Selected {
+            tile: [7, 9],
+            level: 1,
+            room: ROOM,
+        });
+        let mask = Mask::new(&lot, &c);
+        assert!(mask.contains([9, 9]) && !mask.contains([5, 5]));
+        assert!(mask.cuts(&c, [12, 9], lot::WEST));
+        // Split markers count for nothing.
+        c.focus.selected = Some(Selected {
+            tile: [7, 9],
+            level: 1,
+            room: -5,
+        });
+        assert_eq!(Mask::new(&lot, &c), Mask::new(&lot, &camera(0)));
     }
 
     #[test]
@@ -604,11 +860,28 @@ mod tests {
         c.focus.visit(ROOM);
         c.focus.visit(OUTSIDE);
         c.focus.pointer = Some([i32::MAX / 2, i32::MIN / 2]);
-        c.focus.selected = Some([-1, 70, 1]);
+        c.focus.selected = Some(Selected {
+            tile: [-1, 70],
+            level: 1,
+            room: OUTSIDE,
+        });
         let mask = Mask::new(&lot, &c);
         assert!(!mask.contains([-1, 0]) && !mask.contains([64, 64]));
         assert!(!mask.cuts(&c, [i32::MIN, i32::MAX], lot::ASCENDING));
         let mut focus = Focus::default();
         focus.point(&lot, &c, [i32::MAX, i32::MIN]);
+        assert!(focus.away && focus.pointer.is_none());
+        c.origin = [i32::MAX, i32::MIN];
+        focus.point(&lot, &c, [i32::MAX, i32::MIN]);
+        c.focus.pointer = Some([i32::MAX, i32::MIN]);
+        Mask::new(&lot, &c);
+        // Every screen point near the lot finds a spot or none, quickly.
+        let c = camera(1);
+        let view = View::new(&lot, &c);
+        for x in (-1200..2000).step_by(37) {
+            for y in (-800..1200).step_by(29) {
+                view.fine([x, y]);
+            }
+        }
     }
 }

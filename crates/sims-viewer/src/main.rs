@@ -300,15 +300,14 @@ impl ApplicationHandler for Viewer {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
-                if self.drag.is_none() {
-                    // The cutaway follows the rooms the pointer passes over.
+                // The cutaway follows the rooms the pointer passes over;
+                // the original looks only while the cutaway is on.
+                if self.drag.is_none() && self.view.camera.walls == Walls::Cutaway {
                     let scale = f64::from(self.scale.max(1));
                     let at = [position.x / scale, position.y / scale].map(|v| v as i32);
                     let camera = self.view.camera;
                     self.view.camera.focus.point(&self.lot, &camera, at);
-                    if self.view.camera.walls == Walls::Cutaway
-                        && self.view.camera.focus != camera.focus
-                    {
+                    if self.view.camera.focus != camera.focus {
                         self.dirty = true;
                         if let Some(w) = &self.window {
                             w.request_redraw();
