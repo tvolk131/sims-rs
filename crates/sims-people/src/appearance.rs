@@ -179,13 +179,85 @@ pub fn load_skeleton(assets: &Assets, name: &str) -> Result<Skeleton, String> {
         .ok_or_else(|| format!("{file} holds no skeleton named {name:?}"))
 }
 
-/// The appearance named `name`: from `<name>.cmx.bcf` or `<name>.cmx`
-/// when that file holds it, otherwise from the first catalog, in name
-/// order, that holds an appearance of that name. Career uniforms need the
-/// second way: `B629MAFitlgt_labtech` is in `b629ma_labtech.cmx`. The old
-/// prototype looked appearances up by their own names the same way
-/// (legacy/crates/sims-content/src/avatar.rs); which catalog the
-/// original takes when two hold the same name is **unverified**.
+/// The folders the original loads appearance catalogs from, in its order
+/// (0x5835ed, as the old prototype traced it:
+/// legacy/crates/sims-sim/src/pose/clothing/catalog_paths.rs). The game's
+/// own skins come first, then the shared expansion folders, then each
+/// expansion's from the newest back, then the first expansion's.
+const APPEARANCE_FOLDERS: &[&str] = &[
+    "gamedata/skins",
+    "gamedata/cmx",
+    "gamedata/cmx2",
+    "gamedata/cmx3",
+    "gamedata/cmx4",
+    "gamedata/cmx5",
+    "gamedata/cmx6",
+    "gamedata/cmx7",
+    "gamedata/cmx8",
+    "gamedata/cmx9",
+    "gamedata/cmx10",
+    "gamedata/cmxpreview",
+    "gamedata/people1",
+    "gamedata/people2",
+    "gamedata/accessories1",
+    "gamedata/accessories2",
+    "expansionshared/skins",
+    "expansionshared/skinsbuy",
+    "expansionshared/animations",
+    "expansionshared/skeletons",
+    "templatenpcs",
+    "expansionshared/accessories",
+    "expansionpack7/skins",
+    "expansionpack7/animations",
+    "expansionpack7/accessories",
+    "expansionpack6/skins",
+    "expansionpack6/animations",
+    "expansionpack6/accessories",
+    "expansionpack5/skins",
+    "expansionpack5/animations",
+    "expansionpack5/accessories",
+    "deluxe/skins",
+    "deluxe/animations",
+    "deluxe/accessories",
+    "expansionpack4/skins",
+    "expansionpack4/animations",
+    "expansionpack4/accessories",
+    "expansionpack3/skins",
+    "expansionpack3/animations",
+    "expansionpack3/accessories",
+    "expansionpack2/skins",
+    "expansionpack2/animations",
+    "expansionpack2/accessories",
+    "expansionpack",
+    "expansionpack/expansionpackassets",
+];
+
+/// Where a folder comes in the original's appearance search: its place in
+/// [`APPEARANCE_FOLDERS`], or after all of them for any other folder.
+fn appearance_rank(folder: &str) -> usize {
+    APPEARANCE_FOLDERS
+        .iter()
+        .position(|f| *f == folder)
+        .unwrap_or(APPEARANCE_FOLDERS.len())
+}
+
+/// The appearance named `name`.
+///
+/// The original loads every catalog in its search folders, in their order
+/// ([`APPEARANCE_FOLDERS`]), and keeps the first appearance of each name: a
+/// later record of a name already loaded is released (0x59f087, the
+/// records' loop, and 0x5954a5). So here the catalogs named after the
+/// appearance, `<name>.cmx.bcf` and `<name>.cmx`, are tried in that folder
+/// order, and the first that holds it wins. Within one folder the binary
+/// form is tried first; the original's order there is the file map's,
+/// which is not ported, and no folder of the install holds both.
+///
+/// Failing those, the first catalog in name order that holds an appearance
+/// of that name is used. Career uniforms need this: `B629MAFitlgt_labtech`
+/// is in `b629ma_labtech.cmx`. In the Complete Collection, the only
+/// appearance two catalogs give differently is `b200mafit_ctb`, and both
+/// are named after it, so that fallback order picks nothing the original
+/// would not.
 pub fn load_appearance(assets: &Assets, name: &str) -> Result<Appearance, String> {
     let find = |catalog: Catalog| {
         catalog
@@ -193,10 +265,21 @@ pub fn load_appearance(assets: &Assets, name: &str) -> Result<Appearance, String
             .into_iter()
             .find(|a| a.name.eq_ignore_ascii_case(name))
     };
+    let mut named = Vec::new();
     for file in [format!("{name}.cmx.bcf"), format!("{name}.cmx")] {
-        if assets.contains(&file)
-            && let Some(appearance) = find(read_catalog(assets, &file)?)
-        {
+        for resource in assets.sources(&file) {
+            named.push((
+                appearance_rank(&assets.folder(resource)),
+                file.clone(),
+                resource,
+            ));
+        }
+    }
+    // A stable sort: in one folder, the binary form stays first.
+    named.sort_by_key(|(rank, _, _)| *rank);
+    for (_, file, resource) in named {
+        let bytes = resource.read().map_err(|e| format!("{file}: {e}"))?;
+        if let Some(appearance) = find(parse_catalog(&file, &bytes)?) {
             return Ok(appearance);
         }
     }
@@ -220,11 +303,15 @@ pub fn load_appearance(assets: &Assets, name: &str) -> Result<Appearance, String
 
 /// A catalog file, binary (`.cmx.bcf`) or text (`.cmx`).
 fn read_catalog(assets: &Assets, file: &str) -> Result<Catalog, String> {
-    let bytes = assets.read(file)?;
+    parse_catalog(file, &assets.read(file)?)
+}
+
+/// The catalog `bytes` hold, read by the form `file`'s name gives.
+fn parse_catalog(file: &str, bytes: &[u8]) -> Result<Catalog, String> {
     if file.ends_with(".bcf") {
-        read_bcf(&bytes).map_err(|e| format!("{file}: {e}"))
+        read_bcf(bytes).map_err(|e| format!("{file}: {e}"))
     } else {
-        read_cmx(&bytes).map_err(|e| format!("{file}: {e}"))
+        read_cmx(bytes).map_err(|e| format!("{file}: {e}"))
     }
 }
 

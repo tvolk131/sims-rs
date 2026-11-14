@@ -4,6 +4,50 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-14: Which catalog wins when two hold the same name
+
+The original's code settles this for appearances and clips. Before
+loading, it builds a list of search folders (0x5835ed, as the old
+prototype traced it). It then reads every catalog in those folders, in
+that order (0x59f844 for appearances, 0x5a0212 for animations). For each
+record it looks the name up first. A name not yet known is added. A name
+already loaded keeps its record, and the new one is released (0x59f087,
+which calls 0x5954a5 for appearances and 0x59778a for clips). So **the
+first catalog loaded wins.**
+
+For appearances the folder order is the game's own skins
+(`GameData/Skins`), then the shared expansion folders
+(`ExpansionShared/Skins` and others), then each expansion's `Skins`,
+`Animations` and `Accessories`, from the newest expansion back, and the
+first expansion last. An archive's members count as being in the
+archive's folder plus the folder in the member's name: `Deluxe.far`'s
+`Skins\b200mafit_ctb.cmx.bcf` is in `deluxe/skins`.
+
+In the Complete Collection, one appearance is given differently by two
+catalogs: `b200mafit_ctb`. It is in `GameData/Skins` as text and in
+Deluxe's archive as binary, with different bindings. The original
+takes the `GameData/Skins` one. We used to try the binary file first and
+took Deluxe's. Now the catalogs named after an appearance are tried in
+the original's folder order, and a gated test checks this one.
+
+What is still open:
+
+- **Order within one folder: unverified.** It is the file map's, which is
+  not ported. No folder of the install holds two catalogs giving the same
+  name, so it does not matter yet. We try the binary form first.
+- **Clips.** The rule is the same, with `GameData/Animation` searched
+  first. No clip name is defined by two files in the install, so our
+  order (the first file in name order) never picks differently.
+- **Same-named files: unverified.** 47 file names exist in two sources
+  with different bytes: accessory textures such as `bottle.bmp`, some
+  animation files shared by the third expansion and `ExpansionShared`,
+  and a few meshes. Which copy the original reads depends on its file
+  map, which is not ported. Its texture search lists the expansions
+  before `GameData` (0x413ccc), the reverse of our order, and the
+  expansions' copies of the accessory textures are larger. So the
+  original may well prefer them. None of these files is drawn for the
+  Goth family. We keep our order and mark it unverified.
+
 ## 2026-11-14: People: transparent texels, shared edges, and people made after the load
 
 A review of `sims-people` found five defects. They are fixed as follows.
