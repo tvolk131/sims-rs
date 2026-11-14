@@ -479,3 +479,87 @@ fn the_first_module_defining_an_event_wins_and_play_from_picks_one() {
     player.play_from(2, 9, "e0");
     assert_eq!(player.faults, ["no event e0"]);
 }
+
+const ADD: u8 = 16;
+const WAIT: u8 = 9;
+const CALL: u8 = 7;
+const LOADL: u8 = 5;
+const SET_LOOP: u8 = 33;
+const LOOP: u8 = 32;
+const NOP: u8 = 15;
+
+#[test]
+fn sequence_groups_stop_at_the_group_limit() {
+    // Claim a new group every block: 1, 2, 3, ...
+    let mut routine = loadb(6, 1).to_vec();
+    routine.extend([SET_LOOP, ADD, 5, 6, SEQGROUP_RETURN, 5, LOOP]);
+    let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+    play(&mut player, "e0");
+    player.render(300 * BLOCK, &NoSources);
+    assert_eq!(player.faults.len(), 1, "{:?}", player.faults);
+    assert!(player.faults[0].contains("more than 256 sequence groups"));
+    assert!(player.is_idle());
+}
+
+#[test]
+fn calls_across_waits_stop_at_the_depth_limit() {
+    // wait 0 ms (register 7), then call this routine again.
+    let mut routine = vec![WAIT, 7, CALL];
+    routine.extend(long(0x100));
+    let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+    play(&mut player, "e0");
+    player.render(100 * BLOCK, &NoSources);
+    assert_eq!(player.faults.len(), 1, "{:?}", player.faults);
+    assert!(player.faults[0].contains("calls nested deeper than 64"));
+    assert!(player.is_idle());
+}
+
+#[test]
+fn a_missing_patch_is_not_cached() {
+    // Each block, play patch 77, which no table defines: each attempt is
+    // looked up (and reported) again, so nothing is kept for it.
+    let mut routine = loadb(50, 77).to_vec();
+    routine.extend([SET_LOOP, 2, 6, LOOP]);
+    let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+    play(&mut player, "e0");
+    player.render(3 * BLOCK, &NoSources);
+    assert_eq!(player.faults, ["no patch 77"; 3]);
+}
+
+#[test]
+fn threads_a_full_block_does_not_reach_run_first_in_the_next() {
+    // Ten threads that each spend 10,000 instructions a block use the
+    // whole block budget; an eleventh still gets to play its note.
+    let mut busy = vec![NOP; 9_999];
+    busy.push(LOOP);
+    let generic: &[u8] = &[NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, END];
+    let mut player = Player::new(vec![module(&[&busy, generic], 1)], samples(), 1);
+    for _ in 0..10 {
+        play(&mut player, "e0");
+    }
+    play(&mut player, "e1");
+    let out = player.render(3 * BLOCK, &NoSources);
+    assert_eq!(&out[BLOCK..BLOCK + 3], [1, 2, 3]);
+}
+
+#[test]
+fn a_fade_near_the_largest_value_stops_at_its_destination() {
+    // Fade register 7 from i32::MAX - 7 to i32::MAX at speed 200, then
+    // play patch 1 once it gets there.
+    let mut routine = vec![LOADL, 7];
+    routine.extend(long(i32::MAX as u32 - 7));
+    routine.extend([LOADL, 40]);
+    routine.extend(long(i32::MAX as u32));
+    routine.extend([LOADL, 8]);
+    routine.extend(long(i32::MAX as u32));
+    routine.extend([LOADL, 42]);
+    routine.extend(long(200));
+    routine.extend(loadb(41, 7));
+    routine.extend(loadb(45, 1));
+    routine.extend([WAITEQ, 7, 8, 2, 6, WAIT_SAMP, END]);
+    let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+    play(&mut player, "e0");
+    let out = player.render(3 * BLOCK, &NoSources);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    assert_eq!(&out[BLOCK..BLOCK + 3], [1, 2, 3]);
+}

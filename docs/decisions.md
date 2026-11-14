@@ -11,14 +11,18 @@ A review of `sims-audio` found seven defects. The fixes:
 - **Limits.** One block runs at most 100,000 instructions across all
   threads, and one thread at most 10,000. A thread started by
   `play_trk` first runs in the next block, so a track that starts itself
-  cannot keep a block going. At most 256 threads, 1,024 notes and 1,000
-  recorded faults exist at once. These numbers are ours. The original
-  reports an error after 101 instructions without a wait and carries on.
+  cannot keep a block going, and the threads a full block does not reach
+  run first in the next. At most 256 threads, 1,024 notes, 256 sequence
+  groups and 1,000 recorded faults exist at once, and calls nest at most
+  64 deep. A patch no table defines is not cached, since any number can
+  name one. These numbers are ours. The original reports an error after
+  101 instructions without a wait and carries on.
 - **Arithmetic and sizes.** Mixing and interpolation use 64 bits. An XA
   header's claimed size is checked against what its data can hold before
   any memory is reserved. FSC sizes use checked multiplication. Hit-list
   files may expand to at most 100,000 entries (the largest in the
-  install has 3,661); past that, parsing fails.
+  install has 3,661); past that, parsing fails. Writing a WAV whose
+  sizes do not fit 32 bits is an error, not an overflow.
 - **Unported instructions fault.** `seqgroup_wait`, `add_to_group`,
   `remove_from_group` and `test1` to `test4` end their thread with a
   fault. The original does nothing for the first three, and no program in
@@ -39,6 +43,8 @@ A review of `sims-audio` found seven defects. The fixes:
     a later `seqgroup_return` end. Only `StopAll` clears them here.
   - New threads start with the original's default register bank
     (`extvol` 1024, `fade_dest` 1, `pan` 512, `pitch` 3600 and others).
+  - A fade adds in 64 bits, so it stops at its destination where the
+    original's 32-bit sum could wrap past it.
   - **Unverified:** none of this was observed at run time, and how often
     the original updates fades is not known (here once per block). Volume
     is not applied yet, so a fade changes registers, not the sound.

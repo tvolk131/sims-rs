@@ -213,7 +213,7 @@ fn every_event_definition_runs_without_a_bad_instruction() {
     assert_eq!(
         format!("{faults:?}"),
         "{\"event names no track\": 2, \"event of a kind other than play\": 190, \
-         \"hit list not found\": 1, \"patch not found\": 1, \"track entry point not found\": 10}"
+         \"hit list not found\": 1, \"patch not found\": 3, \"track entry point not found\": 10}"
     );
 }
 

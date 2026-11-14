@@ -59,8 +59,11 @@
 //!
 //! Limits, so no script can hang or exhaust the host: one thread runs at
 //! most [`STEPS`] instructions per block and all threads together
-//! [`BLOCK_STEPS`]; at most [`THREADS`] threads and [`NOTES`] notes exist
-//! at once; a thread started by `play_trk` first runs in the next block. How the
+//! [`BLOCK_STEPS`] (threads a block does not reach run first in the
+//! next); at most [`THREADS`] threads, [`NOTES`] notes and [`SEQGROUPS`]
+//! sequence groups exist at once; calls nest at most [`CALL_DEPTH`] deep;
+//! a thread started by `play_trk` first runs in the next block; a patch
+//! that does not exist is not cached. How the
 //! original picks among duplicate events, patches and hit lists across
 //! modules is unknown; here the module whose name sorts first wins.
 
@@ -89,6 +92,10 @@ pub const THREADS: usize = 256;
 pub const NOTES: usize = 1024;
 /// Faults the player records before it drops further ones.
 pub const FAULTS: usize = 1000;
+/// How deep `call`s may nest in one thread.
+pub const CALL_DEPTH: usize = 64;
+/// How many sequence groups may exist; slots are never freed.
+pub const SEQGROUPS: usize = 256;
 /// The first global register.
 pub const GLOBALS: u8 = 100;
 /// The register a new note's patch is read from.
@@ -499,6 +506,14 @@ impl<S: Samples> Player<S> {
                         "threads ran {BLOCK_STEPS} instructions in one block; the rest wait"
                     ));
                 }
+                // The threads not reached still fade, and run first next
+                // block, so busy threads cannot starve them.
+                for at in index..self.threads.len() {
+                    let mut thread = self.threads[at].clone();
+                    self.fade(&mut thread);
+                    self.threads[at] = thread;
+                }
+                self.threads.rotate_left(index);
                 break;
             }
             let mut thread = self.threads[index].clone();
@@ -571,12 +586,14 @@ impl<S: Samples> Player<S> {
     /// before it runs a track's instructions: toward `fade_dest` by
     /// `fade_speed`, whichever sign the speed has, stopping when it passes
     /// the destination. A speed of 0 moves nothing and ends the fade.
+    /// (The original adds in 32 bits and can wrap past the destination;
+    /// here the sum is wide, so it stops there.)
     fn fade(&mut self, thread: &mut Thread) {
         let register = |r: u8| thread.registers[usize::from(r)];
         if register(FADE_ON) == 0 {
             return;
         }
-        let (var, dest, mut speed) = (
+        let (var, dest, speed) = (
             i64::from(register(FADE_VAR)),
             register(FADE_DEST),
             register(FADE_SPEED),
@@ -585,24 +602,37 @@ impl<S: Samples> Player<S> {
             thread.registers[usize::from(FADE_ON)] = 0;
         }
         let value = self.read(thread, var);
+        let mut speed = i64::from(speed);
         if (value < dest) != (speed > 0) {
-            speed = speed.wrapping_neg();
+            speed = -speed;
         }
-        let mut value = value.wrapping_add(speed);
+        let mut value = i64::from(value) + speed;
+        let dest = i64::from(dest);
         if (speed > 0 && value > dest) || (speed < 0 && value < dest) {
             value = dest;
             thread.registers[usize::from(FADE_ON)] = 0;
         }
-        self.write(thread, var, value);
+        // Short of the destination, the value lies between it and an i32.
+        self.write(thread, var, value as i32);
     }
 
     /// The group a `seqgroup_*` instruction names: the value of its
-    /// register operand, which must be 1 to 127.
-    fn seqgroup(&self, thread: &Thread, instruction: &Instruction) -> Result<i32, String> {
-        match instruction.values().first() {
-            Some(&r) if (1..=127).contains(&r) => Ok(self.read(thread, r)),
-            _ => Err(format!("{}: bad register", instruction.name())),
+    /// register operand, which must be 1 to 127. With `claim`, a group
+    /// with no slot yet is an error once [`SEQGROUPS`] exist.
+    fn seqgroup(
+        &self,
+        thread: &Thread,
+        instruction: &Instruction,
+        claim: bool,
+    ) -> Result<i32, String> {
+        let group = match instruction.values().first() {
+            Some(&r) if (1..=127).contains(&r) => self.read(thread, r),
+            _ => return Err(format!("{}: bad register", instruction.name())),
+        };
+        if claim && self.seqgroups.len() >= SEQGROUPS && !self.seqgroups.contains_key(&group) {
+            return Err(format!("more than {SEQGROUPS} sequence groups"));
         }
+        Ok(group)
     }
 
     fn fault(&mut self, thread: &Thread, message: &str) -> bool {
@@ -648,8 +678,10 @@ impl<S: Samples> Player<S> {
                     pcm
                 }
                 None => {
+                    // Not cached: any number may name a missing patch,
+                    // so caching them would grow without bound.
                     self.report(format!("no patch {patch}"));
-                    None
+                    return 0;
                 }
             };
             self.cache.insert(patch, pcm);
@@ -729,6 +761,9 @@ impl<S: Samples> Player<S> {
                 Flow::Next
             }
             "call" => {
+                if thread.stack.len() >= CALL_DEPTH {
+                    return Err(format!("calls nested deeper than {CALL_DEPTH}"));
+                }
                 thread.stack.push(next);
                 Flow::Jump(self.target(thread, arg(0) as u32)?)
             }
@@ -824,7 +859,7 @@ impl<S: Samples> Player<S> {
                 Flow::Next
             }
             "seqgroup_kill" => {
-                let group = self.seqgroup(thread, instruction)?;
+                let group = self.seqgroup(thread, instruction, true)?;
                 let me = thread.id;
                 let mut flow = Flow::Next;
                 let holder = self.seqgroups.get(&group).copied().unwrap_or(0);
@@ -858,7 +893,7 @@ impl<S: Samples> Player<S> {
                 flow
             }
             "seqgroup_return" => {
-                let group = self.seqgroup(thread, instruction)?;
+                let group = self.seqgroup(thread, instruction, true)?;
                 let me = thread.id;
                 let holder = self.seqgroups.insert(group, me).unwrap_or(0);
                 if holder != 0 && holder != me {
@@ -869,7 +904,7 @@ impl<S: Samples> Player<S> {
             }
             "seqgroup_trkid" => {
                 // The group's register first, then where its holder goes.
-                let group = self.seqgroup(thread, instruction)?;
+                let group = self.seqgroup(thread, instruction, false)?;
                 let holder = self.seqgroups.get(&group).copied().unwrap_or(0);
                 self.write(thread, arg(1), holder as i32);
                 Flow::Next
