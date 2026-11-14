@@ -261,12 +261,20 @@ fn routing() -> Routing {
                     byte_8e: false,
                     word_94: 0,
                     limit: 8,
+                    action: 4,
                 }],
                 path: vec![[24, 664], [76, 656], [408, 413]],
             },
         )]),
         slot_flags: BTreeMap::from([((2, 0), 0x4000)]),
         unknown_words: BTreeSet::from([(5, 37)]),
+        slots: BTreeMap::from([(
+            (7, 0),
+            RouteSlot {
+                flags: 0x2144,
+                ..slot
+            },
+        )]),
     }
 }
 
@@ -345,7 +353,15 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "52685edd0474b28f07deafcc89e3f8a34431542a20468adb23258ab344f0230b";
+const PINNED: &str = "e4a24ddfd65d8ccb54cc45b7d6f6c49ef4f1b06413842308c1977c72e13cd064";
+
+#[test]
+fn without_the_action_and_the_slot_records_the_encoding_is_format_18() {
+    // Snapshot format 19 added each route context's action asking a
+    // person to move (+0x90) and the slot records objects hold.
+    assert_eq!(digest(&format_18_bytes(&world())), PINNED_18);
+}
+const PINNED_18: &str = "52685edd0474b28f07deafcc89e3f8a34431542a20468adb23258ab344f0230b";
 
 /// An animator's encoding under snapshot format 17: without the head
 /// fields ([`Animator::head`]) that format 18 added at its end.
@@ -354,6 +370,61 @@ fn animator_17_bytes(animator: &Animator) -> Vec<u8> {
     let added = postcard::to_allocvec(&animator.head).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - added.len()), added);
     bytes
+}
+
+/// A route context's encoding under snapshot format 18: without the
+/// number of the action asking a person to move
+/// ([`sims_sim::route::Context::action`], context +0x90) that format 19
+/// added at its end.
+fn context_18_bytes(context: &sims_sim::route::Context) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(context).unwrap();
+    let added = postcard::to_allocvec(&context.action).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - added.len()), added);
+    bytes
+}
+
+/// The routing's encoding under snapshot format 18: each context as
+/// [`context_18_bytes`] writes it, and without the slot records
+/// ([`sims_sim::route::Routing::slots`]) that format 19 added at the end.
+fn routing_18_bytes(routing: &sims_sim::route::Routing) -> Vec<u8> {
+    let mut bytes = map_bytes(&routing.routes, |route| {
+        let mut bytes = postcard::to_allocvec(&(route.contexts.len() as u64)).unwrap();
+        for context in &route.contexts {
+            bytes.extend(context_18_bytes(context));
+        }
+        bytes.extend(postcard::to_allocvec(&route.path).unwrap());
+        bytes
+    });
+    bytes.extend(postcard::to_allocvec(&routing.slot_flags).unwrap());
+    bytes.extend(postcard::to_allocvec(&routing.unknown_words).unwrap());
+    bytes
+}
+
+/// A lot's encoding as snapshot format 18 wrote it. Format 19 added at
+/// the end of each route context the number of the action that asks a
+/// person to move out of the way, and at the end of the routing the slot
+/// records objects hold in place of their type's. This writes the
+/// routing again without them, so a state pinned under format 18 can be
+/// shown to be the same state but for those fields. The older formats'
+/// encodings start from this one.
+fn format_18_bytes(world: &World) -> Vec<u8> {
+    // The routing is found where a marker routing stands in the same
+    // lot's encoding: an empty routing's bytes can stand in many places.
+    let marker = sims_sim::route::Routing {
+        unknown_words: [(0xbeef, 0xdead_beef)].into(),
+        ..Default::default()
+    };
+    let blank = World {
+        routing: marker.clone(),
+        ..world.clone()
+    };
+    splice(
+        &world.encode(),
+        &blank.encode(),
+        &postcard::to_allocvec(&world.routing).unwrap(),
+        &postcard::to_allocvec(&marker).unwrap(),
+        &routing_18_bytes(&world.routing),
+    )
 }
 
 /// The encoding of `world` as snapshot format 17 wrote it. Format 18
@@ -365,8 +436,8 @@ fn format_17_bytes(world: &World) -> Vec<u8> {
         ..world.clone()
     };
     splice(
-        &world.encode(),
-        &blank.encode(),
+        &format_18_bytes(world),
+        &format_18_bytes(&blank),
         &postcard::to_allocvec(&world.animators).unwrap(),
         &[0],
         &map_bytes(&world.animators, animator_17_bytes),
@@ -496,8 +567,8 @@ fn format_16_bytes(world: &World) -> Vec<u8> {
         ..world.clone()
     };
     splice(
-        &world.encode(),
-        &blank.encode(),
+        &format_18_bytes(world),
+        &format_18_bytes(&blank),
         &postcard::to_allocvec(&world.animators).unwrap(),
         &[0],
         &map_bytes(&world.animators, |a| animator_old_bytes(a, motion_16_bytes)),
@@ -518,8 +589,8 @@ fn without_motion_steps(world: &World) -> Vec<u8> {
         ..world.clone()
     };
     splice(
-        &world.encode(),
-        &blank.encode(),
+        &format_18_bytes(world),
+        &format_18_bytes(&blank),
         &postcard::to_allocvec(&world.animators).unwrap(),
         &[0],
         &map_bytes(&world.animators, animator_15_bytes),
@@ -599,7 +670,7 @@ fn format_13_bytes(world: &World) -> Vec<u8> {
     old.animators.clear();
     let mut bytes = format_14_bytes(&old);
     let mut tail = postcard::to_allocvec(&world.usage).unwrap();
-    tail.extend(postcard::to_allocvec(&world.routing).unwrap());
+    tail.extend(routing_18_bytes(&world.routing));
     assert_eq!(bytes.split_off(bytes.len() - tail.len()), tail);
     assert_eq!(bytes.pop(), Some(0));
     bytes.extend(postcard::to_allocvec(&(world.animators.len() as u64)).unwrap());
