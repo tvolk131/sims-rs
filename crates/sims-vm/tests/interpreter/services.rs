@@ -54,12 +54,56 @@ fn generic_call_43_does_nothing_without_a_family_history() {
     let mut expected = fx.world.clone();
     expected.objects.get_mut(&LAMP).unwrap().last_result = true;
     assert_eq!(generic(&mut fx, 43), Ok(true));
-    assert_eq!(fx.world.hash(), expected.hash());
+    assert_eq!(hash_without_frames(&fx.world), expected.hash());
+}
+
+/// The magic controller's type, which routine 43 looks for.
+const MAGIC_CONTROLLER: u32 = 0xb6c9_0029;
+
+#[test]
+fn generic_call_43_raises_the_magic_controller_to_the_familys_history() {
+    let mut fx = Fixture::new();
     fx.world.magic_history = Some(MagicHistory {
         family: 5,
-        values: [0; 6],
+        values: [4, 0, -3, 9, 1, 2],
     });
-    assert!(matches!(trap(generic(&mut fx, 43)), Trap::Unsupported(_)));
+    (fx.world.globals[9], fx.world.globals[10]) = (5, 0);
+    // No controller on the lot: the type's instance list is made, empty.
+    assert_eq!(generic(&mut fx, 43), Ok(true));
+    assert_eq!(fx.world.instances[&MAGIC_CONTROLLER], []);
+    // With one, each of its first six attributes becomes the larger of
+    // itself and the family's word.
+    fx.world.instances.clear();
+    let mut controller = object(9, MAGIC_CONTROLLER);
+    controller.attributes = vec![1, 7, 0, 0, 5, 2, 11, 12];
+    fx.world.objects.insert(9, controller);
+    assert_eq!(generic(&mut fx, 43), Ok(true));
+    assert_eq!(fx.world.instances[&MAGIC_CONTROLLER], [9]);
+    assert_eq!(fx.world.objects[&9].attributes, [4, 7, 0, 9, 5, 2, 11, 12]);
+    // Another family in global 9, or a lot that is not residential, and
+    // nothing happens.
+    for (family, lot) in [(6, 0), (5, 3)] {
+        fx.world.objects.get_mut(&9).unwrap().attributes[0] = 1;
+        (fx.world.globals[9], fx.world.globals[10]) = (family, lot);
+        assert_eq!(generic(&mut fx, 43), Ok(true));
+        assert_eq!(fx.world.objects[&9].attributes[0], 1);
+    }
+    fx.program.zoning.insert(3, 1);
+    assert_eq!(generic(&mut fx, 43), Ok(true));
+    assert_eq!(fx.world.objects[&9].attributes[0], 4);
+}
+
+#[test]
+fn generic_calls_10_and_11_keep_the_list_of_fires() {
+    let mut fx = Fixture::new();
+    assert_eq!(generic(&mut fx, 11), Ok(true));
+    assert_eq!(fx.world.fires, []);
+    assert_eq!(generic(&mut fx, 10), Ok(true));
+    assert_eq!(generic(&mut fx, 10), Ok(true));
+    assert_eq!(fx.world.fires, [LAMP, LAMP]);
+    // Leaving takes one entry off.
+    assert_eq!(generic(&mut fx, 11), Ok(true));
+    assert_eq!(fx.world.fires, [LAMP]);
 }
 
 #[test]

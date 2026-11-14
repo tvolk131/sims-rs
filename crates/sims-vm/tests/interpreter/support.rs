@@ -289,6 +289,15 @@ fn program() -> Program {
     program
 }
 
+/// The lot's hash without its frame storage. Running any tree leaves
+/// words in the running object's frame storage; tests that say a
+/// primitive changes nothing else compare this.
+pub fn hash_without_frames(world: &World) -> [u8; 32] {
+    let mut world = world.clone();
+    world.frame_storage.clear();
+    world.hash()
+}
+
 pub struct Fixture {
     pub program: Program,
     pub catalog: Catalog,
@@ -366,6 +375,7 @@ impl Fixture {
     pub fn thread(&mut self, object: u16, tree: u16, parameters: &[i16]) {
         let guid = self.world.objects[&object].guid;
         let (&code_owner_type, _) = self.world.types.iter().find(|&(_, &g)| g == guid).unwrap();
+        self.world.frame_storage.remove(&object);
         self.world.objects.get_mut(&object).unwrap().stack = vec![Frame {
             stack_object: 0,
             tree,

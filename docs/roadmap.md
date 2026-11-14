@@ -71,7 +71,8 @@ ported and compared.
 The original does not build a lot for a house. It keeps one lot for as long
 as it runs and loads each house into it. So a load starts from whatever
 that lot holds: at least the two indicator objects, which every load
-creates at its end (step 14). `sims boot` has no earlier load, so it starts
+creates (in step 13 when the first object comes back onto the lot, or
+else in step 14). `sims boot` has no earlier load, so it starts
 from an empty lot (`World::empty`) and creates the two indicators on it.
 That starting lot is **unverified**; see the decision log.
 
@@ -94,12 +95,13 @@ That starting lot is **unverified**; see the decision log.
 | 10a | Count the rooms | `0x467094`, `0x466c3c`, `0x467bb1` | Done for the walls and floors (`World::update_rooms`); the objects' share, light and scores are not modeled |
 | 11 | Discard pending removals | `0x428679` | Done (`World::discard_removals`) |
 | 12 | Select the household | `0x428041`, `0x46d8dc` | Done (`World::select_family`) |
-| 13 | Visit every object in registration order | `0x43fc94`, `0x431e2e` | Not started; see below for what it needs |
-| 14 | Create the indicator objects and finish selection | `0x445e4a` | Creation done (`Interpreter::create_indicators`), used only for the starting lot |
+| 13 | Visit every object in registration order | `0x43fc94`, `0x431e2e` | Done for objects that are not people (`Interpreter::visit_objects`); the step stops at the first person. On the Goth house 201 of 382 visits run |
+| 14 | Create the indicator objects and finish selection | `0x445e4a` | Creation done (`Interpreter::create_indicators`), used for the starting lot and in step 13; the step itself is not called |
 
-`sims boot` runs the steps in order and stops at the first one that is not
-done, so it never prints the hash of a state the original could not be in.
-Today it stops after step 12.
+`sims boot` runs the steps in order and stops at the first thing that is
+not done, so it never prints the hash of a state the original could not be
+in. Today it stops inside step 13, between two visits: on the Goth house
+after visit 201 of 382, because visit 202 is the first person's.
 
 #### The steps
 
@@ -446,49 +448,101 @@ and a family record older than version 9 are **unverified**.
 
 1. A person takes its persistent fields from the neighborhood record
    (`0x4258a3`).
-2. Its position is restored, which also places the objects it contains
-   (`0x433e50`).
+2. Its position is restored (`0x433e50`): an object on level 0 goes to
+   level 1, and the object and everything it holds get their position,
+   footprint and room again.
 3. A non-person runs its Load function (2). A function whose tree is
    missing is skipped.
 4. If its type changed: every person drops references to it (`0x444306`),
    then it resets (`0x431fbe`). An object with a Reset function (3) runs
-   it and restarts Main. One without is taken off the lot, has its storage
-   reset (`0x431be1`), runs Init, and is put back. A person has its own
-   reset (`0x45e791`).
+   it and restarts Main. One without is rebuilt: taken off the lot, its
+   storage reset (`0x431be1`), Init and a first turn run, and put back. A
+   person has its own reset (`0x45e791`).
 5. If its type changed, it runs Init.
 6. Its scheduler flags are refreshed from data word 60 and its
    interaction table.
 7. A person updates its cached room and reloads its motive curves.
 
 Lot time does not advance, and no object's saved Main runs, during any of
-this.
+this. The next object is read from the list after each visit, so an object
+a visit creates, which goes to the head of the list, is not visited.
 
-Not ported. What the trace of the Goth load shows of this step, and what
-a trial run of the Load trees here stopped at, for whoever ports it:
+Ported for objects that are not people. A person's visit fails, and
+`Interpreter::visit_objects` then stops with the lot as the visit before
+left it. What the visits needed:
 
-- The original asks function 2 of every object that is not a person, 379
-  in all. For 191 objects that is the only thing it asks. 126 of the 379
-  have a Load tree.
+- *Taking an object off its tile and putting it back* (`0x433125`,
+  `0x433340`; `placement.rs`). The lot keeps, for each tile, the first
+  object on it (the object grid); each object's slot 0 names the next
+  object on its tile and its other slots the objects it holds; and data
+  words 26 and 14 name the object and slot that link to it. An object
+  taken off is asked function 10 first, and the object behind it takes its
+  place. An object put on a tile goes in front of whatever is there, and
+  is then asked function 9, and function 6 if the walls around it are not
+  what its data word 5 says. Whatever it sits in is asked function 9 too,
+  and a seat beside the tile sets a flag on everything standing there. A
+  multi-tile object moves as a group: all its tiles are asked function
+  10, all leave; all are placed, all are asked function 9.
+- *The lot's indicators.* When an object comes onto the lot from outside
+  and the lot has no indicators, the original's interface creates them
+  (`0x44752e`, `0x445e4a`). In a load that is the first rebuilt object
+  that stands on the lot: visit 140 in the Goth house. Step 14 then finds
+  them made.
+- *The frame storage* (`World::frame_storage`). The original keeps a
+  thread's frames in one block and never clears it, and a new frame's
+  locals start as whatever an earlier frame left there. A Main tree
+  restarted by a reset shows it: in the trace, object 12's new Main has
+  one local that holds 280, the tree ID of the frame that used to lie
+  there. A run of a callback writes an eight-word mark above the top
+  frame first. A local that lands on half of a pointer cannot be read
+  until it is written.
+- *Graphics draws.* An object with graphics of its own draws 32 numbers
+  from the C runtime's random stream when the factory makes it. The
+  indicators are such objects. The two on the starting lot account for
+  the stream's state at the start of the traced load: the initial state
+  advanced by 64 draws. So the stream now equals the trace's at every
+  stop of steps 3 to 13 without anything copied from the trace.
+- *Primitives.* Notify Stack Object out of Idle, Relationship and Old
+  Relationship (rows kept on the lot's objects), Create New Object
+  Instance (off the lot), Run Tree By Name (pushed on the running
+  thread), Set To Next modes 8 and 9 (the objects on a tile, and beside
+  one), Refresh modes 1 and 2 (mark a room as not counted), and Generic
+  Sims Call 10, 11 (the list of fires) and 43 (the family's magic
+  history).
+
+What the trace of the Goth load shows of this step:
+
+- 382 visits. Function 2 is asked of the 379 objects that are not people.
+  For 198 objects it is the only function asked.
 - 184 objects have a changed type. The 3 people and 23 others have a
-  Reset tree. The other 158 are reset the long way: taken off the lot,
-  storage reset, Init run, put back. In the trace that asks function 10
-  (leaving) and then function 9 (placing) of the object, and of every
-  tile of its group if it has several tiles, with Init between them and
-  Init once more after. 148 of those objects are on the lot and 120 are
-  tiles of a group. So the step needs taking an object off its tile and
-  putting it back: the object grid, the slots, containers and groups.
-- Run here in registration order on the lot as step 12 leaves it, with
-  nothing else of the step, 111 of the 126 Load trees finish. The others stop at Notify Stack Object out of Idle
-  (7 objects), Generic Sims Call 11 (1), Generic Sims Call 43 now that a
-  family is selected (1), and Refresh mode 2, which marks a room as
-  changed (6). In the trace the rooms are marked as not counted again
-  when the step returns.
-- Still to port for the people: taking their fields from the
-  neighborhood record, their own reset, their cached room and their
-  motive curves.
+  Reset tree. The other 158 are rebuilt; 148 of them stand on the lot and
+  120 are tiles of a group.
+- Two objects are created by a script (385 and 386), besides the two
+  indicators (383 and 384). Seven controllers ask to be removed.
+- When the step returns, 8 of the 11 rooms wait to be counted again.
+
+Checked against the trace for the 201 visits that run. The trace has a
+full state at the step's entry, in the middle of visit 140 where the
+indicators are created, and at the step's return, and for every visit
+each call of "run this object's function" (`0x422d46`). Equal: the object
+and the calls of every one of the 201 visits, in order; the whole state in
+the middle of visit 140, all 382 objects, globals, random streams,
+arrays, removal queue and rooms; the same when the indicators' creation
+returns; and, against the step's return, every compared field of the 201
+objects visited and the 4 created, but for the link words of 17 objects
+that a later visit relinks. The state between visit 140 and the step's
+return cannot be compared: the trace does not hold it. See the decision
+log.
+
+Still to port for the people: taking their fields from the neighborhood
+record, their own reset, their cached room and their motive curves. Then
+the 178 visits after them, which may need more primitives.
 
 **14. Indicators.** Two indicator objects are created through the factory
-and hidden, and the selected person is found.
+and hidden, unless the lot has them already, and the selected person is
+found. In the trace of the Goth load the function is entered once more
+after the last visit and creates nothing: the indicators were made in
+step 13.
 
 ## Working rules
 

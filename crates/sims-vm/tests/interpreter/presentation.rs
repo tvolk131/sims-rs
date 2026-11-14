@@ -30,7 +30,7 @@ fn refreshing_a_drawing_changes_nothing() {
     let before = hash_after_success(&fx);
     assert_eq!(refresh(&mut fx, 0, 0, SIM as i16), Ok(true));
     assert_eq!(refresh(&mut fx, 1, 0, SIM as i16), Ok(true));
-    assert_eq!(fx.world.hash(), before);
+    assert_eq!(hash_without_frames(&fx.world), before);
 }
 
 #[test]
@@ -44,19 +44,34 @@ fn an_object_in_no_room_has_no_room_to_mark() {
             assert_eq!(refresh(&mut fx, selector, mode, SIM as i16), Ok(true));
         }
     }
-    assert_eq!(fx.world.hash(), before);
+    assert_eq!(hash_without_frames(&fx.world), before);
 }
 
 #[test]
-fn marking_a_room_fails_loudly() {
-    let mut fx = Fixture::new();
-    fx.sim_mut().data[29] = 1025;
+fn modes_1_and_2_mark_the_objects_room_as_not_counted() {
     for mode in [1, 2] {
-        let text = trap(refresh(&mut fx, 1, mode, SIM as i16)).to_string();
-        assert!(
-            text.contains(&format!("Refresh mode {mode} marks room 1025 dirty")),
-            "{text}"
-        );
+        let mut fx = Fixture::new();
+        let room = |dirty| sims_sim::rooms::Room {
+            tiles: Vec::new(),
+            outdoors: false,
+            dirty,
+            half_tiles: 8,
+            covered_half_tiles: 0,
+            walls: 0,
+            covered_walls: 0,
+        };
+        fx.world.rooms.rooms.insert(1025, room(false));
+        fx.world.rooms.rooms.insert(3, room(false));
+        fx.sim_mut().data[29] = 1025;
+        assert_eq!(refresh(&mut fx, 1, mode, SIM as i16), Ok(true));
+        assert!(fx.world.rooms.rooms[&1025].dirty);
+        // The count itself stays until the next room update, and no other
+        // room is touched.
+        assert_eq!(fx.world.rooms.rooms[&1025].half_tiles, 8);
+        assert!(!fx.world.rooms.rooms[&3].dirty);
+        // A room word that names no room does nothing.
+        fx.sim_mut().data[29] = 77;
+        assert_eq!(refresh(&mut fx, 1, mode, SIM as i16), Ok(true));
     }
 }
 
@@ -93,5 +108,5 @@ fn play_sound_takes_the_true_branch_and_changes_nothing() {
         );
         assert_eq!(fx.run(), Ok(true));
     }
-    assert_eq!(fx.world.hash(), before);
+    assert_eq!(hash_without_frames(&fx.world), before);
 }

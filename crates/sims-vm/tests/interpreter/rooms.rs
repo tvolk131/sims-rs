@@ -10,7 +10,7 @@ use sims_vm::{Interpreter, Roomed, Trap};
 /// The widget's function 7 tree.
 const ROOMS_CHANGED: u16 = 4200;
 
-fn array(stride: usize, fill: u8) -> Array {
+pub fn array(stride: usize, fill: u8) -> Array {
     Array {
         width: 64,
         height: 64,
@@ -23,7 +23,7 @@ fn array(stride: usize, fill: u8) -> Array {
 /// Gives the lot six flat tiles a side, with walls around the tiles 2 and
 /// 3 in both directions, and works out its rooms: 0 outside the walls, 1
 /// inside, 1024 upstairs.
-fn build(fx: &mut Fixture) {
+pub fn build(fx: &mut Fixture) {
     let world = &mut fx.world;
     world.size = 6;
     world.arrays.insert(0, array(4, 0));

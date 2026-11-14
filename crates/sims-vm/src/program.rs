@@ -26,7 +26,16 @@ pub struct Library {
     /// How many slots of each SLOT chunk can hold an object (kind 0), by
     /// chunk ID.
     pub containers: BTreeMap<u16, usize>,
+    /// Each BHAV's name, by chunk ID: what Run Tree By Name looks trees up
+    /// by.
+    pub names: BTreeMap<u16, String>,
+    /// The names in string table 303, the table Run Tree By Name reads
+    /// tree names from: its entries in the first language, in order.
+    pub tree_names: Vec<String>,
 }
+
+/// The string table Run Tree By Name instructions name their trees in.
+pub const TREE_NAMES: u16 = 303;
 
 /// The words in a registered object definition: the original keeps every
 /// OBJD as a 216-byte record.
@@ -133,6 +142,17 @@ impl Program {
                     let behavior =
                         Behavior::parse(data).map_err(|e| format("BHAV", chunk.id, e))?;
                     library.behaviors.insert(chunk.id, behavior);
+                    library.names.insert(chunk.id, chunk.label.clone());
+                }
+                b"STR#" if chunk.id == TREE_NAMES => {
+                    let table = sims_formats::strings::StringTable::parse(data)
+                        .map_err(|e| format("STR#", chunk.id, e))?;
+                    library.tree_names = table
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.language == 1)
+                        .map(|entry| entry.text.clone())
+                        .collect();
                 }
                 b"BCON" => {
                     let constants =
@@ -332,6 +352,40 @@ impl Program {
             });
         }
         Ok(records)
+    }
+
+    /// The tree with a name, looked up for an object whose file is
+    /// `owner` (0x4021f2): in that file, then its semi-global file, then
+    /// the global file, first by the exact name and then ignoring case.
+    /// Returns the tree's ID, or None. Two trees with the name in one file
+    /// are an error: which one the original takes is not known.
+    pub fn named_tree(&self, owner: usize, name: &str) -> std::result::Result<Option<u16>, String> {
+        let files = [
+            Some(owner),
+            self.semi_globals.get(&owner).copied().flatten(),
+            Some(self.global),
+        ];
+        for exact in [true, false] {
+            for file in files.into_iter().flatten() {
+                let Some(library) = self.libraries.get(&file) else {
+                    continue;
+                };
+                let mut found = library.names.iter().filter(|(_, label)| {
+                    if exact {
+                        label.as_str() == name
+                    } else {
+                        label.eq_ignore_ascii_case(name)
+                    }
+                });
+                if let Some((&id, _)) = found.next() {
+                    if found.next().is_some() {
+                        return Err(format!("two trees are named {name:?} in one file"));
+                    }
+                    return Ok(Some(id));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// The tree an object's callback names, or 0 when it names none.

@@ -133,10 +133,11 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
         record.budget,
         record.magic_history()?,
     )?;
-    // The load stops here. Next the original visits every object (step
-    // 13): people take their fields from the neighborhood, every object
-    // is put back in its place, and Load, Reset and Init trees run. That
-    // is not ported.
+    // 13: every object is visited in registration order. The step stops
+    // at the first visit that is not ported, with the lot as the visit
+    // before it left it.
+    let to_visit = world.order.len();
+    let visited = interpreter.visit_objects(&mut world, &people);
     if let Some(path) = options.snapshot {
         Snapshots::open(path)?.save("boot", &world)?;
     }
@@ -222,8 +223,25 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     );
     let _ = writeln!(
         out,
-        "         stopped before every object is visited (step 13, not implemented yet)"
+        "         {} of {to_visit} objects visited, {} of them reset; {} IDs queued for removal",
+        visited.objects.len(),
+        visited.reset.len(),
+        world.removals.len()
     );
+    match &visited.stopped {
+        Some(fault) => {
+            let _ = writeln!(
+                out,
+                "         stopped in step 13 at the next visit: {fault}"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "         stopped before the indicators are created (step 14, not implemented yet)"
+            );
+        }
+    }
     let _ = writeln!(
         out,
         "Lot:     {} objects, tick {}",

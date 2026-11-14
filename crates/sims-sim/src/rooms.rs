@@ -771,6 +771,16 @@ impl World {
         Ok(room)
     }
 
+    /// Marks a room as not counted, so the next [`World::update_rooms`]
+    /// counts it again (0x40760d with event 0xf3, and the Refresh
+    /// primitive). The room is named by an object's room word; a word that
+    /// names no room does nothing.
+    pub fn mark_room(&mut self, room: i16) {
+        if let Some(room) = self.rooms.rooms.get_mut(&room) {
+            room.dirty = true;
+        }
+    }
+
     /// Counts every room that has not been counted and writes the lot's
     /// indoor area to global 27. This is the part of the original's room
     /// update (0x467094, 0x466c3c) that needs only the walls and floors

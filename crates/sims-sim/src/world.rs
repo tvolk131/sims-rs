@@ -79,6 +79,41 @@ pub struct World {
     /// 0x479d9a). Empty on a lot whose rooms have not been worked out: the
     /// rooms of the lot the game holds before a load are not modeled.
     pub rooms: Rooms,
+    /// The objects on the lot's list of burning fires, in the order they
+    /// joined it (Generic Sims Call routines 10 and 11).
+    pub fires: Vec<u16>,
+    /// Each object's frame storage, for the objects whose thread has
+    /// pushed or popped a frame since the object was made or read. See
+    /// [`FrameStorage`].
+    pub frame_storage: BTreeMap<u16, FrameStorage>,
+}
+
+/// The memory an object's script frames live in.
+///
+/// The original keeps a thread's frames in one block, each frame after
+/// the one that called it, and never clears the block. A frame is eight
+/// header words (tree, node, stack object, the local and parameter
+/// counts, two words of saved primitive state, and a pointer to the
+/// frame's code), then its parameters and its locals, padded to a
+/// multiple of four words. A new frame's locals are not zeroed: they hold
+/// whatever an earlier frame left at that place. So what popped frames
+/// left behind is state.
+///
+/// [`Object::stack`] holds the live frames. This holds the block as it
+/// was when a frame was last pushed or popped, and where each live frame
+/// starts in it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameStorage {
+    /// The block, in words. None is a word that holds half of a pointer,
+    /// whose value belongs to the running game's memory. A block that was
+    /// never written this far reads as zero.
+    pub words: Vec<Option<i16>>,
+    /// Where each live frame starts, in words, outermost first.
+    pub offsets: Vec<u32>,
+    /// The locals of live frames that started on half of a pointer and
+    /// have not been written since, as the frame's place in the stack and
+    /// the local's number. Reading one fails.
+    pub unknown: BTreeSet<(u32, u32)>,
 }
 
 /// One type's shared words. See [`World::type_attributes`].
@@ -183,6 +218,8 @@ impl World {
             next_parts: BTreeMap::new(),
             skeleton_files: BTreeSet::new(),
             rooms: Rooms::default(),
+            fires: Vec::new(),
+            frame_storage: BTreeMap::new(),
         }
     }
 

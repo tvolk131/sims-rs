@@ -2,7 +2,6 @@
 //! the original's lot load in order; the ones that only change state live
 //! in `sims_sim::load` and `sims_sim::rooms`.
 
-use crate::factory::TURN_BUDGET;
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
 use crate::program::{Callback, Tree};
@@ -196,9 +195,10 @@ impl Interpreter<'_> {
                 .object(object.guid)
                 .ok_or_else(|| fail(id, Trap::Invalid("object has no definition".into())))?;
             let tree = self.program.callback(definition, Callback::RoomsChanged);
-            if tree != 0 && !matches!(self.program.tree(definition.resource, tree), Tree::Missing) {
-                let temps = object.temps.clone();
-                self.call(world, id, tree, 0, &temps, 8, TURN_BUDGET)?;
+            let exists =
+                tree != 0 && !matches!(self.program.tree(definition.resource, tree), Tree::Missing);
+            self.callback(world, id, Callback::RoomsChanged as usize, 0)?;
+            if exists {
                 done.asked.push(id);
             }
             // The next object is read from the list after the tree ran.

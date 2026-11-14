@@ -449,7 +449,10 @@ impl Machine<'_, '_> {
                 .ok_or_else(|| Trap::Invalid(format!("no type attribute record {record}")))
                 .and_then(|r| get(&r.values, i)),
             Cell::Parameter(i) => get(&self.frame()?.parameters, i),
-            Cell::Local(i) => get(&self.frame()?.locals, i),
+            Cell::Local(i) => {
+                self.check_local(i)?;
+                get(&self.frame()?.locals, i)
+            }
             Cell::StackObject => Ok(self.frame()?.stack_object),
             Cell::Motive(id, i) => {
                 let value = self.motive(id, i)?;
@@ -499,6 +502,9 @@ impl Machine<'_, '_> {
     /// them: literals and motives.
     pub(crate) fn store(&mut self, cell: Cell, value: i16) -> Result<bool, Trap> {
         let me = self.me;
+        if let Cell::Local(local) = cell {
+            self.wrote_local(local);
+        }
         let world = &mut *self.world;
         let target = match cell {
             Cell::Literal(_) | Cell::Motive(..) => return Ok(false),

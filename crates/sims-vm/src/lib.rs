@@ -18,9 +18,11 @@
 //! [`Interpreter::remove_now`] and [`Interpreter::delete`] take an object
 //! off the lot and destroy it. [`Interpreter::resize`],
 //! [`Interpreter::clear`], [`Interpreter::read_types`],
-//! [`Interpreter::reconcile_controllers`], [`Interpreter::assign_rooms`]
-//! and [`Interpreter::create_indicators`] are the lot load's steps that
-//! run scripts or need the linked code.
+//! [`Interpreter::reconcile_controllers`], [`Interpreter::assign_rooms`],
+//! [`Interpreter::visit_objects`] and [`Interpreter::create_indicators`]
+//! are the lot load's steps that run scripts or need the linked code.
+//! Visiting an object can rebuild it, which takes it off its tile and
+//! puts it back (`placement.rs`).
 
 mod error;
 mod factory;
@@ -29,18 +31,21 @@ mod interpreter;
 mod load;
 mod memory;
 mod objects;
+mod placement;
 mod primitives;
 mod program;
 mod removal;
+mod visits;
 
 pub use error::Error;
 pub use factory::TURN_BUDGET;
 pub use fault::{Fault, Location, Trap};
-pub use interpreter::{Interpreter, MAX_STACK, Status, Stream};
+pub use interpreter::{Asked, Interpreter, MAX_STACK, Status, Stream};
 pub use load::{INDICATORS, Reconciled, Roomed};
 pub use memory::scope_name;
 pub use objects::SavedRead;
 pub use primitives::primitive_name;
 pub use program::{Callback, DEFINITION_WORDS, Library, Program, Tree};
+pub use visits::Visited;
 
 pub type Result<T> = std::result::Result<T, Error>;

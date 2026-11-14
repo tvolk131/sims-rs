@@ -24,6 +24,6 @@ mod world;
 
 pub use error::Error;
 pub use snapshot::Snapshots;
-pub use world::{Budget, FULL_SIZE, MagicHistory, Object, TypeAttributes, World};
+pub use world::{Budget, FULL_SIZE, FrameStorage, MagicHistory, Object, TypeAttributes, World};
 
 pub type Result<T> = std::result::Result<T, Error>;

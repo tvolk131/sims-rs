@@ -31,6 +31,13 @@ impl Machine<'_, '_> {
         let (destination, writable) = self.resolve(left_scope, left_index, write)?;
         // The left operand is read even when only assigned to, so an
         // unreadable destination faults for every operator.
+        if operator == 5
+            && let Cell::Local(local) = destination
+        {
+            // An assignment does not use what it reads, so a local that
+            // still holds what an earlier frame left is fine here.
+            self.wrote_local(local);
+        }
         let lhs = i32::from(self.value(destination)?);
 
         if let Cell::Motive(id, index) = destination {

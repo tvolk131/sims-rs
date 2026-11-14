@@ -3,7 +3,7 @@ use sims_core::{CrtRng, GameRng};
 use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
 use sims_sim::rooms::{Half, Room, Rooms};
-use sims_sim::{Budget, MagicHistory, Object, Snapshots, TypeAttributes, World};
+use sims_sim::{Budget, FrameStorage, MagicHistory, Object, Snapshots, TypeAttributes, World};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -117,6 +117,15 @@ fn world() -> World {
                 },
             )]),
         },
+        fires: vec![7],
+        frame_storage: BTreeMap::from([(
+            2,
+            FrameStorage {
+                words: vec![Some(4096), Some(-1), None, Some(0)],
+                offsets: vec![0],
+                unknown: BTreeSet::from([(0, 1)]),
+            },
+        )]),
     }
 }
 
@@ -126,7 +135,7 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "498a13a29d9b303caf4fd9f73cd6be36b418e4789580fbd46a8ec3852a01bcff";
+const PINNED: &str = "e5eef2ff7049b4a63eaaccd0f2fb732bca6ad86fbd39006c538004bd19e013c2";
 
 #[test]
 fn encoding_round_trips_bit_for_bit() {
