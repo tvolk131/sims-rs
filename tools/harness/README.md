@@ -204,9 +204,12 @@ How the checks work (the addresses are in `input.py`):
 - **Buy mode.** `expect-mode` reads the lot's mode word (lot `+0x36`: 0 in
   live mode, 2 in buy mode). In buy mode the lot update still returns,
   without advancing time, so the steps go on there. `expect-new-object`
-  compares the registry with the objects at the scenario's first update
-  return (or at the last `expect-new-object`). It logs each new object (ID,
-  type, position, level) and the budget (lot `+0x90`) before and after.
+  compares the registry's object pointers with those at the scenario's
+  first update return (or at the last `expect-new-object`), less the
+  objects removed since, so an object that reuses a sold object's ID or
+  memory still counts as new. It logs each new object (ID, type, position,
+  level, and the definition's bytes and the data words as the full state
+  has them) and the budget (lot `+0x90`) before and after.
 
 A failed step is logged and ends the scenario; the capture goes on. A
 dialog that opens while a step waits for update returns ends a command's

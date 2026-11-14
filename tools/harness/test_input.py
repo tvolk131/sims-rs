@@ -96,7 +96,7 @@ class Game:
     def add_object(self, oid, position, person=False, selected=False):
         m = self.m
         p = m.alloc(0xb10)
-        definition = m.alloc(0x40)
+        definition = m.alloc(0xa8)
         m.put(definition + 0x12, struct.pack('<H', 2 if person else 4))
         m.put_words(p + 0x118, definition)
         m.put(p + 0xf0, struct.pack('<H', oid))
@@ -107,6 +107,11 @@ class Game:
         m.put_words(self.registry + 0x1c, end + 4)
         self.objects[oid] = p
         return p
+
+    def remove_object(self, oid):
+        p = self.objects.pop(oid)
+        q = next(q for q in range(self.slots, self.m.word(self.registry + 0x1c), 4) if self.m.word(q) == p)
+        self.m.put_words(q, 0)
 
     def hover(self, oid):
         self.m.put(self.picker + 0x2e, struct.pack('<H', oid))
@@ -381,6 +386,19 @@ class RunnerTest(RunnerBase):
         self.assertIsNone(r.failed)
         placed = self.rows('placed')[0]
         self.assertEqual(([o['id'] for o in placed['objects']], placed['cost']), ([400], 300))
+        self.assertEqual(len(bytes.fromhex(placed['objects'][0]['definition'])), 0xa6)
+        self.assertEqual(len(placed['objects'][0]['data']), 72)
+
+    def test_a_purchase_reusing_a_sold_objects_id(self):
+        g = self.g
+        r = self.runner('wait 2\nexpect-new-object within 20')
+        self.tick(r)  # the registry is noted: the bench and the person
+        g.remove_object(173)  # sold
+        self.tick(r)
+        g.add_object(173, [0x300, 0x280])  # bought; the game gives it the free ID
+        self.tick_until(r, lambda: r.finished)
+        self.assertIsNone(r.failed)
+        self.assertEqual([o['id'] for o in self.rows('placed')[0]['objects']], [173])
 
     def test_expect_mode_times_out(self):
         r = self.runner('expect-mode buy within 3')

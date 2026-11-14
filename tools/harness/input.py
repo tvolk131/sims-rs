@@ -289,15 +289,24 @@ def find_object(m, sim, oid):
     return 0
 
 
-def object_ids(m, sim):
-    """{ID: pointer} for every object in the lot's registry."""
+def object_slots(m, sim):
+    """The object pointers in the lot's registry: one read of its slot
+    vector, cheap enough for every update return."""
     reg = m.word(sim + 0xb0)
-    out = {}
-    for q in range(m.word(reg + 0x18), m.word(reg + 0x1c), 4):
-        p = m.word(q)
-        if p:
-            out[m.object_id(p)] = p
-    return out
+    first, end = m.word(reg + 0x18), m.word(reg + 0x1c)
+    if not (first <= end and end - first <= 131072 and (end - first) % 4 == 0):
+        raise MemoryError(f'registry slots {first:#x}..{end:#x}')
+    return {p for p in m.words(first, (end - first) // 4) if p}
+
+
+def placed_object(m, p):
+    """What a replay needs to place object p: its ID, its type, its position
+    and level, its definition (0xa6 bytes) and its 72 data words, read as
+    capture.py's full state reads them, so a replay can decode them the same
+    way. Which bytes hold the GUID and the facing is not checked here."""
+    definition = m.word(p + 0x118)
+    return dict(id=m.object_id(p), pointer=p, type=m.half(definition + 0x12), position=object_position(m, p),
+                level=m.byte(p + 0xfe), definition=m.read(definition, 0xa6).hex(), data=m.words(p + 0x4a, 72, 2))
 
 
 def read_mode(m, sim):
@@ -482,7 +491,8 @@ class Runner:
                inside it (true). This is the record to replay: give the
                action to the person before update N.
       mode     expect-mode saw the mode.
-      placed   expect-new-object's new objects (ID, type, position, level)
+      placed   expect-new-object's new objects (ID, pointer, type, position,
+               level, the definition's 0xa6 bytes and the 72 data words)
                with the budget before and after and the cost.
       taken    expect-queued found the pushed action on the person: `where`
                is queue or active (the queue had already started it), with
@@ -511,7 +521,10 @@ class Runner:
         self.update = 0
         self.m = None
         self.sim = None
-        self.known = None  # object IDs and budget, for expect-new-object
+        # (object pointers, budget), for expect-new-object: the registry at the
+        # scenario's first update return or the last expect-new-object, less
+        # the objects removed since (so a pointer or ID used again is new).
+        self.known = None
 
     def close(self):
         if not self.finished:
@@ -575,8 +588,11 @@ class Runner:
         if self.finished:
             return
         try:
+            slots = object_slots(m, sim)
             if self.known is None:
-                self.known = (set(object_ids(m, sim)), read_budget(m, sim))
+                self.known = (slots, read_budget(m, sim))
+            else:
+                self.known = (self.known[0] & slots, self.known[1])
             self.tick(at_update=True)
         except Exception as e:  # a scenario must never end the capture
             self.fail(f'{type(e).__name__}: {e}')
@@ -742,19 +758,15 @@ class Runner:
         with the budget then and now."""
         yield Fresh()
         start = self.update
-        known, budget = self.known
         while True:
-            ids = object_ids(self.m, self.sim)
-            new = sorted(set(ids) - known)
+            known, budget = self.known
+            slots = object_slots(self.m, self.sim)
+            new = slots - known
             if new:
-                rows = []
-                for oid in new:
-                    p = ids[oid]
-                    rows.append(dict(id=oid, type=self.m.half(self.m.word(p + 0x118) + 0x12),
-                                     position=object_position(self.m, p), level=self.m.byte(p + 0xfe)))
+                rows = sorted((placed_object(self.m, p) for p in new), key=lambda o: o['id'])
                 now = read_budget(self.m, self.sim)
                 self.write(kind='placed', objects=rows, budget_before=budget, budget=now, cost=budget - now)
-                self.known = (set(ids), now)
+                self.known = (slots, now)
                 return
             if self.update - start >= within:
                 raise StepFailed(f'no new object within {within} updates')
