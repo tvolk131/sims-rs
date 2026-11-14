@@ -146,17 +146,17 @@ fn the_goth_family_stands_and_walks() {
         digests,
         [
             "16 base c2o-standing-loop",
-            "16 stand 0cbd5c0c09cac0fb1c52fb4898a57389c6e20b8b59c8dd95d3a7ed816ce8faaa",
-            "16 walk 27b5fc40721fba10e925f5f668d9146ff7d44eaf4370a3c18981fa8c49702b67",
-            "16 walk 227a5292da563092f019e4eca8e042211c8c1814f78f2377c3280d950a165627",
+            "16 stand 12849b69f44ac1bb51b826d18c77d74a2be6e464081cbad895d48ecb7070605d",
+            "16 walk d465a811a54a9cfd18d3c388fd4a167d9001b03b2b91cb622187b15ccebdce96",
+            "16 walk dc6f1842c3471c5c4946593df69efe3f89c25b825fc2fa0e4e9e0e21fdd55a1f",
             "18 base a2o-standing-loop",
-            "18 stand f8042fa82082bfb2c8643be588e2c653189a6e6848ce848fb45515ea70d5b860",
-            "18 walk c9a04545d88ef456b01189561ce60bd8e7387bff106b0ba888be10aebcfef763",
-            "18 walk f1971496278f446546f8bf5d3d0c89ad3019315c975560b2b0a13979146b3aa8",
+            "18 stand 76aced914fc2cacea9564e3f70b43fc4993795e3030159e488d9a25616265b54",
+            "18 walk 14f10ac08f52082013774d12c160df6a5d534ed994ca9f1b9fb4421b371f65b6",
+            "18 walk 0192bc04cd028c09f82d106695de8eb61754f60ea4901a9e356a431c417a7e59",
             "21 base a2o-standing-loop",
-            "21 stand 17cf36a247ad1fe0735decb23a969a5d32f80862078ac7c8c4eb9a7f804aca93",
-            "21 walk 6319e46ae723129255323ae38a642ee5f4754f95afb9265bcdfd486165c0c0d5",
-            "21 walk 84e541defda56ba7a9b852502955eb392fa0282b393f29945aec1926a0122a5e",
+            "21 stand bce43b91328161b4ce89fcf78df9c407c00b7992d367349d4c9eb666cc208915",
+            "21 walk 1278e08b1292f77ebbd93c7d68062f990da284f9c12fc76a0d44f584b50f6c6c",
+            "21 walk 7159f751d3cde3c91ca39c202f85e818b90690a082d4acd30460451706628720",
         ]
     );
 }

@@ -198,13 +198,16 @@ impl Canvas {
         for y in min_y..=max_y {
             for x in min_x..=max_x {
                 let q = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, 0.0);
-                let w0 = edge(p[1], p[2], q) / area;
-                let w1 = edge(p[2], p[0], q) / area;
-                let w2 = edge(p[0], p[1], q) / area;
+                let e = [
+                    side(p[1], p[2], q),
+                    side(p[2], p[0], q),
+                    side(p[0], p[1], q),
+                ];
                 let outside = |w: f32, owned: bool| w < 0.0 || (w == 0.0 && !owned);
-                if outside(w0, owns[0]) || outside(w1, owns[1]) || outside(w2, owns[2]) {
+                if outside(e[0], owns[0]) || outside(e[1], owns[1]) || outside(e[2], owns[2]) {
                     continue;
                 }
+                let [w0, w1, w2] = e.map(|e| e / area);
                 let z = w0 * p[0].z + w1 * p[1].z + w2 * p[2].z;
                 let i = (y as u32 * self.width + x as u32) as usize;
                 if z >= self.depth[i] {
@@ -233,12 +236,15 @@ impl Canvas {
                 // and leaves the depth alone, so it never hides what is
                 // drawn behind it later. (The game's skins are opaque or
                 // fully transparent; this only keeps other textures sane.)
+                // The canvas holds straight (not premultiplied) colour, as
+                // a PNG does, so what is below counts by its own alpha.
                 let a = f32::from(alpha) / 255.0;
+                let below = f32::from(self.rgba[i * 4 + 3]) / 255.0 * (1.0 - a);
+                let total = a + below;
                 for (out, &c) in self.rgba[i * 4..i * 4 + 3].iter_mut().zip(&texel) {
-                    *out = (lit(c) * a + f32::from(*out) * (1.0 - a)) as u8;
+                    *out = ((lit(c) * a + f32::from(*out) * below) / total).round() as u8;
                 }
-                let below = f32::from(self.rgba[i * 4 + 3]) / 255.0;
-                self.rgba[i * 4 + 3] = ((a + below * (1.0 - a)) * 255.0).round() as u8;
+                self.rgba[i * 4 + 3] = (total * 255.0).round() as u8;
             }
         }
     }
@@ -252,6 +258,18 @@ impl Canvas {
     /// The image as a PNG file (8-bit RGBA, stored without compression).
     pub fn png(&self) -> Vec<u8> {
         png(self.width, self.height, &self.rgba)
+    }
+}
+
+/// Which side of the edge from `a` to `b` the point `q` is on: [`edge`],
+/// always worked out from the same end of the edge, so the edge taken the
+/// other way gives exactly the negated value. Two triangles that share an
+/// edge then never both take, or both leave, a point on or near it.
+fn side(a: Vec3, b: Vec3, q: Vec3) -> f32 {
+    if (a.x, a.y) <= (b.x, b.y) {
+        edge(a, b, q)
+    } else {
+        -edge(b, a, q)
     }
 }
 
@@ -460,10 +478,60 @@ mod tests {
         assert_eq!(canvas.covered(), 400);
         let [r, g, _, _] = pixel(&canvas, 20, 20);
         assert!(r > 100 && g == 0);
-        // Over a transparent background the alpha adds up.
+        // Over a transparent background the alpha adds up, and the
+        // colour is the texel's own, not darkened by the empty pixel.
         let mut clear = Canvas::new(40, 40, [0, 0, 0, 0]);
         clear.draw_body(&front(), &glass, &world);
-        assert_eq!(pixel(&clear, 20, 20)[3], 128);
+        let [r, _, _, a] = pixel(&clear, 20, 20);
+        assert_eq!(a, 128);
+        assert!((f32::from(r) - full).abs() <= 1.0, "{r} {full}");
+    }
+
+    /// Draws the screen-space triangles `triangles` half transparent onto a
+    /// clear canvas.
+    fn translucent(triangles: &[[Vec3; 3]], size: u32) -> Canvas {
+        let (glass, _) = square(crate::texture::Texture::solid([255, 255, 255, 128]));
+        let mut canvas = Canvas::new(size, size, [0, 0, 0, 0]);
+        for t in triangles {
+            canvas.triangle(*t, [[0.5; 2]; 3], [1.0; 3], &glass.parts[0]);
+        }
+        canvas
+    }
+
+    #[test]
+    fn a_shared_edge_is_drawn_once_wherever_it_falls() {
+        // An edge whose ends are not on the pixel grid, with the pixel
+        // centre (1.5, 1.5) within rounding of it: one triangle or the
+        // other takes the pixel, never both and never neither.
+        let (a, b) = (
+            Vec3::new(1.258_336_7, 0.405_250_9, 0.5),
+            Vec3::new(1.718_175_8, 2.488_349, 0.5),
+        );
+        let left = Vec3::new(0.0, 2.0, 0.5);
+        let right = Vec3::new(3.0, 1.0, 0.5);
+        let canvas = translucent(&[[a, b, left], [b, a, right]], 4);
+        assert_eq!(pixel(&canvas, 1, 1)[3], 128);
+        // A fan of seven triangles around a point off the grid: every
+        // pixel is drawn at most once, and none inside is missed.
+        let centre = Vec3::new(10.37, 9.81, 0.5);
+        let rim: Vec<Vec3> = (0..7)
+            .map(|k| {
+                let [s, c] = crate::person::heading(k as f32 * 8.0 / 7.0 + 0.4);
+                centre + Vec3::new(8.0 * c, 8.0 * s, 0.0)
+            })
+            .collect();
+        let fan: Vec<[Vec3; 3]> = (0..7).map(|k| [centre, rim[k], rim[(k + 1) % 7]]).collect();
+        let canvas = translucent(&fan, 21);
+        for y in 0..21 {
+            for x in 0..21 {
+                let alpha = pixel(&canvas, x, y)[3];
+                assert!(alpha == 0 || alpha == 128, "({x}, {y}): {alpha}");
+                let (dx, dy) = (x as f32 + 0.5 - centre.x, y as f32 + 0.5 - centre.y);
+                if dx * dx + dy * dy < 36.0 {
+                    assert_eq!(alpha, 128, "({x}, {y})");
+                }
+            }
+        }
     }
 
     #[test]

@@ -65,6 +65,15 @@ pub fn read_bmp(data: &[u8]) -> Result<Texture, String> {
     if header < 40 {
         return Err(format!("unsupported bitmap header of {header} bytes"));
     }
+    // The whole header is in the file, so offsets past it cannot
+    // overflow, and the pixels do not start inside it.
+    let header_end = 14 + header;
+    if header_end > data.len() {
+        return Err("truncated bitmap header".into());
+    }
+    if pixels > data.len() {
+        return Err("bitmap pixels start past the end of the file".into());
+    }
     let width = u32_at(18)? as i32;
     let height = u32_at(22)? as i32;
     let bits = u16_at(28)?;
@@ -81,9 +90,9 @@ pub fn read_bmp(data: &[u8]) -> Result<Texture, String> {
     let width = width as u32;
     let palette = if bits <= 8 {
         let count = if used == 0 { 1 << bits } else { used as usize };
-        let start = 14 + header;
-        let bytes = data
-            .get(start..start + count * 4)
+        let bytes = count
+            .checked_mul(4)
+            .and_then(|n| data.get(header_end..header_end.checked_add(n)?))
             .ok_or("truncated bitmap palette")?;
         bytes
             .as_chunks::<4>()
@@ -111,6 +120,10 @@ pub fn read_bmp(data: &[u8]) -> Result<Texture, String> {
     // bytes or more also holds an alpha mask. Without one, texels are
     // opaque.
     let masks = if compression == 3 {
+        // After a 40-byte header the three masks take 12 more bytes.
+        if pixels < header_end.max(66) {
+            return Err("bitmap pixels overlap its colour masks".into());
+        }
         let alpha = if header >= 56 { u32_at(66)? } else { 0 };
         let masks = [u32_at(54)?, u32_at(58)?, u32_at(62)?, alpha];
         if masks[..3].contains(&0) {
@@ -118,16 +131,24 @@ pub fn read_bmp(data: &[u8]) -> Result<Texture, String> {
         }
         Some(masks.map(Channel::new))
     } else {
+        if pixels < header_end {
+            return Err("bitmap pixels overlap its header".into());
+        }
         None
+    };
+    // Where the uncompressed pixels of `stride` bytes a row are.
+    let body = |stride: usize| {
+        stride
+            .checked_mul(height as usize)
+            .and_then(|n| data.get(pixels..pixels.checked_add(n)?))
+            .ok_or("truncated bitmap pixels")
     };
     match (bits, compression) {
         (16 | 32, 3) => {
             let masks = masks.ok_or("bit-field bitmap without masks")?;
             let bytes = usize::from(bits) / 8;
             let stride = (width as usize * bytes).div_ceil(4) * 4;
-            let body = data
-                .get(pixels..pixels + stride * height as usize)
-                .ok_or("truncated bitmap pixels")?;
+            let body = body(stride)?;
             for row in 0..height {
                 let line = &body[row as usize * stride..];
                 for x in 0..width {
@@ -145,9 +166,7 @@ pub fn read_bmp(data: &[u8]) -> Result<Texture, String> {
         }
         (8 | 24 | 32, 0) => {
             let stride = (width as usize * usize::from(bits) / 8).div_ceil(4) * 4;
-            let body = data
-                .get(pixels..pixels + stride * height as usize)
-                .ok_or("truncated bitmap pixels")?;
+            let body = body(stride)?;
             for row in 0..height {
                 let line = &body[row as usize * stride..];
                 for x in 0..width {
@@ -363,5 +382,32 @@ mod tests {
         assert!(read_bmp(b"XX").is_err());
         assert!(read_bmp(&bitmap(1, 1, 16, 0, &[], &[0; 4])).is_err());
         assert!(read_bmp(&bitmap(0, 1, 24, 0, &[], &[0; 4])).is_err());
+    }
+
+    #[test]
+    fn a_bitmap_whose_parts_do_not_fit_fails() {
+        let good = bitfields([0xff, 0xff00, 0xff_0000], 0);
+        assert!(read_bmp(&good).is_ok());
+        // Pixels that start inside the colour masks.
+        let mut file = good.clone();
+        file[10..14].copy_from_slice(&54u32.to_le_bytes());
+        assert!(read_bmp(&file).is_err());
+        // A header longer than the file.
+        let mut file = good.clone();
+        file[14..18].copy_from_slice(&108u32.to_le_bytes());
+        assert!(read_bmp(&file).is_err());
+        // Pixels that start far past the end, or inside the header.
+        for offset in [u32::MAX, 20] {
+            let mut file = good.clone();
+            file[10..14].copy_from_slice(&offset.to_le_bytes());
+            assert!(read_bmp(&file).is_err(), "{offset}");
+            let mut file = bitmap(1, 1, 24, 0, &[], &[0; 4]);
+            file[10..14].copy_from_slice(&offset.to_le_bytes());
+            assert!(read_bmp(&file).is_err(), "{offset}");
+        }
+        // A palette too large to count.
+        let mut file = bitmap(1, 1, 8, 0, &[[0; 4]], &[0; 4]);
+        file[46..50].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(read_bmp(&file).is_err());
     }
 }

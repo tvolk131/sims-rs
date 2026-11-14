@@ -111,9 +111,9 @@ fn the_goth_family_draws_in_its_rest_pose() {
     assert_eq!(
         digests,
         [
-            "16 79b37b6db72878fb410d1b5168abe5a5b5ca247a767e03241137e4d623f4ceaf",
-            "18 c90dbc30ea920b25b28a579a9b1279c41510bf778a3260c0e2c2045db07c6742",
-            "21 6208df8c45e5ff80bea67cfd0e51af55fd9fd67881b6cefa75c54ed3c0fa12c7",
+            "16 137e57e6f67f646f4a75c6cbf03aaf02f4cbb70772de95e8438c583799ece9ac",
+            "18 be836e858836f8237f1005e74e3245c46b0f35ed6b6026bd360dcc58e02dc258",
+            "21 14115988e37bebe70ad23fe59f2590084c8da6a28ee922e60f5f7902bffd3b94",
         ]
     );
 }

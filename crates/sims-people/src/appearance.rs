@@ -60,7 +60,8 @@ impl Outfit {
     /// whose record names none (a person a script made, before anything
     /// chose its clothes): the body (row 1), left hand (row 17), right
     /// hand (row 18) and head (row 2), counting from 0, each written
-    /// `appearance,KEY=texture`. These are the rows the old prototype's
+    /// `appearance,KEY=texture`. A row may hold a second descriptor after
+    /// a `;`; the first is the everyday one. These are the rows the old prototype's
     /// port of the original's outfit choice (0x58a178) reads for a person
     /// in everyday clothes with open hands
     /// (legacy/crates/sims-sim/src/pose/appearance_selection.rs). Whether
@@ -70,9 +71,12 @@ impl Outfit {
         let mut parts: Vec<(String, String)> = [1, 17, 18, 2]
             .into_iter()
             .filter_map(|row| strings.get(row))
-            .map(|s| match s.split_once(',') {
-                Some((name, textures)) => (name.trim().to_owned(), textures.trim().to_owned()),
-                None => (s.trim().to_owned(), String::new()),
+            .map(|s| {
+                let first = s.split_once(';').map_or(s.as_str(), |(a, _)| a);
+                match first.split_once(',') {
+                    Some((name, textures)) => (name.trim().to_owned(), textures.trim().to_owned()),
+                    None => (first.trim().to_owned(), String::new()),
+                }
             })
             .collect();
         parts.retain(|(name, _)| !name.is_empty());
@@ -254,7 +258,7 @@ mod tests {
         strings[1] = "body_01,BODY=bodytex".into();
         strings[2] = "head_01,HEAD-HEAD=headtex".into();
         strings[17] = "HfLO,HAND=huaolgt".into();
-        strings[18] = "HfRO".into();
+        strings[18] = "HfRO;HfRG,HAND=other".into();
         let outfit = Outfit::from_body_strings(&strings);
         let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
         assert_eq!(
