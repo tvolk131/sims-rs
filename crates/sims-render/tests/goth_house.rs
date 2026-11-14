@@ -124,7 +124,13 @@ fn hidden_objects_are_not_drawn() {
         }
     }
     let mut hidden = Canvas::new(400, 300, [0, 0, 0]);
-    let after = draw(&opened.world, &lot, &mut opened.assets, &camera, &mut hidden);
+    let after = draw(
+        &opened.world,
+        &lot,
+        &mut opened.assets,
+        &camera,
+        &mut hidden,
+    );
     assert_eq!(after.objects, 0);
     assert_ne!(shown, hidden);
 }

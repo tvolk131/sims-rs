@@ -4,6 +4,49 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-14: Hidden objects, sprite world offsets and soft edges in the lot drawing
+
+A review of `crates/sims-render` found four defects. All four are fixed,
+with tests.
+
+- **Hidden objects are not drawn.** An object whose data word 34 is not
+  zero is hidden; the simulation (`HIDDEN` in `sims-vm`) and the old
+  prototype skip it, and now the renderer does too. Checked against the
+  original: the Goth house file hides 18 objects, and one of them, a
+  table on the road, showed in our far-zoom render but is not in the
+  original's screenshot. At that camera (far zoom, rotation 0, floor 1),
+  exact matches among non-grass pixels rose from 33.6% to 33.9% with
+  walls cut away and from 39.5% to 39.7% with walls up. Objects inside
+  other objects are not drawn at their slots yet, so a hidden container
+  does not hide its contents here.
+- **A draw group sprite's world offset moves its depth.** Each sprite of
+  a draw group (DGRP) carries a position relative to the object, in
+  tiles: x and y in the object's own frame and z up. It was dropped; now
+  it moves the depth the sprite is drawn at. It does not move the sprite
+  on screen. The reason is in the files: the same sprite keeps the same
+  screen offset across draw groups whose world offsets differ (sprite
+  111 of one Goth object sits at (-22, -12) both at z 0.10 and at z
+  0.41; sprite 128 of another keeps (-35, 15) while y runs from -0.43 to
+  -2.24). So the screen offset already places the sprite, and the world
+  offset only says where it is in depth. The offset turns with the
+  object's facing, a quarter turn per two steps (the old prototype's
+  rotation), and one tile of z is 78.4 near-zoom pixels (`32 * sqrt(6)`).
+  None of the groups the Goth house draws now has a nonzero offset, so
+  no render changed and this is **unverified** against the original.
+- **Soft edges write depth.** A sprite pixel that is partly transparent
+  now writes its depth as well as blending its colour, as the old
+  prototype's blitter did. Before, a farther pixel drawn later could
+  show through a nearer soft edge. This changed several pinned renders
+  slightly. The compared camera did not change at all.
+- **Sprite positions cannot overflow.** Draw group offsets are any
+  32-bit number. Placing and clipping a sprite now use wider or
+  saturating arithmetic, so a sprite far off the screen draws nothing
+  instead of panicking.
+
+What would reopen it: a camera where an object with a nonzero world
+offset can be compared with the original, or a reading of the
+original's blitter that treats soft edges differently.
+
 ## 2026-11-14: The lot viewer opens a window with winit and softbuffer
 
 `crates/sims-viewer` is a small program that shows a lot drawn by
