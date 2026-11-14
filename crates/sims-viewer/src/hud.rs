@@ -7,8 +7,9 @@
 //! command for it (choosing a Sim, the speed, a mode) is printed and
 //! dropped.
 //!
-//! A dialog the world is waiting on is drawn over the lot. Its answer is
-//! printed and dropped too, and the viewer stops showing that dialog.
+//! A dialog the world is waiting on is drawn over the lot and takes every
+//! press until it is answered, as the original's dialogs do. Its answer
+//! is printed and dropped too, and the viewer stops showing that dialog.
 
 use crate::view::{Command as ViewCommand, View};
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
@@ -144,12 +145,10 @@ impl Hud {
         canvas.color = frame.into_rgb();
     }
 
-    /// Whether the panel or the dialog covers `point` (canvas pixels).
+    /// Whether the panel covers `point` (canvas pixels), or a dialog is
+    /// shown and takes every press.
     pub fn covers(&self, point: [i32; 2]) -> bool {
-        self.dialog
-            .as_ref()
-            .is_some_and(|d| d.rect.contains(point[0], point[1]))
-            || hud::covers(&self.items, point)
+        self.dialog.is_some() || hud::covers(&self.items, point)
     }
 
     /// Moves the pointer; true if what it hovers changed.
@@ -173,9 +172,7 @@ impl Hud {
     /// A press at `point`: the view command to carry out, if any, and
     /// whether the panel changed.
     pub fn press(&mut self, point: [i32; 2]) -> (Option<ViewCommand>, bool) {
-        if let Some(layout) = &self.dialog
-            && layout.rect.contains(point[0], point[1])
-        {
+        if let Some(layout) = &self.dialog {
             let Some(command) = dialog::press(layout, point) else {
                 return (None, false);
             };

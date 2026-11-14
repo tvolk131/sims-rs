@@ -201,12 +201,12 @@ impl Font {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Two glyphs, `A` (2 by 2, rising one pixel above the line) and `B`
     /// (1 by 1), and a space.
-    fn font() -> Font {
+    pub(crate) fn font() -> Font {
         Font::new(ffn::Font {
             flags: 9,
             glyphs: vec![
