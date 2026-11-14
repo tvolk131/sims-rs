@@ -42,7 +42,7 @@ pub const TURN_BUDGET: usize = 100_000;
 const OFF_LOT: [i32; 3] = [-16, -16, 1];
 
 /// Scheduler flags, the high half of an object's registry word.
-mod flag {
+pub(crate) mod flag {
     /// Set once the factory has finished the object.
     pub const READY: u16 = 1;
     /// Data word 60 is nonzero.
@@ -357,18 +357,8 @@ impl<'a> Machine<'a, '_> {
     /// from the old prototype's `interaction_target`
     /// (legacy/crates/sims-vm/src/multitile.rs).
     fn advertises(&self) -> Result<bool, Trap> {
-        let me = self.me()?;
-        let words = self.definition_words(me.guid)?;
-        if words[word::GROUP] != 0 && words[8] > 0 && me.multipart.is_some() {
-            for part in self.interpreter().parts(self.world, self.me)? {
-                let guid = self.world.objects[&part].guid;
-                if self.definition_words(guid)?[8] == -words[8] {
-                    if part != self.me {
-                        return Ok(false);
-                    }
-                    break;
-                }
-            }
+        if self.interaction_target(self.me)? != self.me {
+            return Ok(false);
         }
         let definition = self.definition(self.me()?.guid)?;
         let table = self
@@ -381,6 +371,32 @@ impl<'a> Machine<'a, '_> {
                 .iter()
                 .any(|entry| (entry.autonomy as i32) < 100 && entry.flags & 128 == 0)
         }))
+    }
+}
+
+impl Machine<'_, '_> {
+    /// The object a Sim's interactions with `id` go to (0x435286): `id`
+    /// itself, unless it is a tile of a multi-tile object whose
+    /// definition's word 8 is a positive number. Then it is the first tile
+    /// of the group whose word 8 is the same number negated, if there is
+    /// one. Ported from the old prototype's `interaction_target`
+    /// (legacy/crates/sims-vm/src/multitile.rs).
+    pub(crate) fn interaction_target(&self, id: u16) -> Result<u16, Trap> {
+        let object = self
+            .world
+            .objects
+            .get(&id)
+            .ok_or(Trap::native(0x15, "missing object"))?;
+        let words = self.definition_words(object.guid)?;
+        if words[word::GROUP] != 0 && words[8] > 0 && object.multipart.is_some() {
+            for part in self.interpreter().parts(self.world, id)? {
+                let guid = self.world.objects[&part].guid;
+                if self.definition_words(guid)?[8] == -words[8] {
+                    return Ok(part);
+                }
+            }
+        }
+        Ok(id)
     }
 }
 

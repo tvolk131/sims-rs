@@ -2,6 +2,8 @@
 //! data.
 
 mod animate;
+mod autonomy;
+mod budget;
 mod calls;
 mod deletion;
 mod expression;

@@ -110,6 +110,13 @@ pub struct World {
     /// The people's routes and what routing changed elsewhere. See
     /// [`Routing`].
     pub routing: Routing,
+    /// The last unique number given to a person's running action
+    /// (0x6e4904). A new action with a target and no number takes the
+    /// next one (0x41f158). It belongs to the running game, not to the
+    /// lot: no save holds it. It is 0 in the game's memory before the
+    /// house is entered and at the start of the Goth house's tick 233,
+    /// the first that gives one, as captures of the original show.
+    pub action_serial: i32,
 }
 
 /// The house's usage counts: five earlier days and today, each a count of
@@ -348,6 +355,7 @@ impl World {
             animators: BTreeMap::new(),
             usage: HouseUsage::default(),
             routing: Routing::default(),
+            action_serial: 0,
         }
     }
 

@@ -2,16 +2,20 @@
 //! interpreter. Each returns which branch to take. A primitive with no
 //! implementation fails with [`Trap::Unimplemented`], which names it.
 
+mod action_string;
 mod animate;
+mod budget;
 mod create;
 pub(crate) mod dialog;
 mod distance;
 mod events;
 mod expression;
 mod find_location;
+mod found_action;
 mod generic;
 mod go_to_slot;
 mod idle;
+mod interacting;
 mod inventory;
 mod named_tree;
 mod notify;
@@ -105,6 +109,7 @@ impl Machine<'_, '_> {
             0 => self.sleep(operands)?,
             1 => self.generic_call(operands)?.into(),
             2 => self.expression(operands)?.into(),
+            3 => self.find_best_interaction()?,
             7 => self.refresh(operands)?.into(),
             8 => self.random(operands)?.into(),
             10 => self.own_events(operands)?.into(),
@@ -114,8 +119,11 @@ impl Machine<'_, '_> {
             18 => self.remove(operands)?,
             23 => self.play_sound(operands)?.into(),
             24 => self.old_relationship(operands)?.into(),
+            25 => self.alter_budget(operands)?.into(),
             26 => self.relationship(operands)?.into(),
+            27 => self.go_to_relative(operands)?,
             28 => self.run_named_tree(operands)?,
+            30 => self.gosub_found_action()?,
             31 => self.set_to_next(operands)?.into(),
             42 => self.create_object(operands)?.into(),
             44 => self.animate_sim(operands)?,
@@ -123,7 +131,9 @@ impl Machine<'_, '_> {
             48 => self.stop_all_sounds(operands)?.into(),
             32 => self.test_object_type(operands)?.into(),
             36 => self.dialog(operands)?,
+            37 => self.sim_interacting_with(operands)?.into(),
             49 => self.notify()?.into(),
+            50 => self.action_string()?.into(),
             51 => self.manage_inventory(operands)?.into(),
             opcode => return Err(Trap::Unimplemented { opcode }),
         })

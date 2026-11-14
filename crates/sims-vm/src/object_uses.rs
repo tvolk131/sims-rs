@@ -13,18 +13,25 @@
 //!   person's virtual function 8, 0x45e5fd), the last entry is looked at.
 //!   If its frame is gone, the entry is removed and the object's count
 //!   goes down. If that empties the list, the person's running action
-//!   ends (0x45e6cd). See [`Machine::release_use`].
+//!   ends: the empty action takes its place (0x45e6cd). See
+//!   [`Machine::release_use`].
+//! - Gosub Found Action makes the interaction Find Best Interaction chose
+//!   the running action, through the same function. See
+//!   [`Machine::set_action`].
 //!
 //! Ported from the old prototype's `push_target_tree_args` (the count),
 //! `pop_person_reset_frame` and `clear_person_action`
 //! (legacy/crates/sims-vm/src/person.rs, legacy/crates/sims-vm/src/action.rs),
 //! and checked against the code at the addresses given.
 //!
-//! Compared with the original: only the start of a use. In the Goth
-//! house's tick 14 person 259 starts using object 51; its list and object
-//! 51's count then equal the capture's. No use ends in the ticks that
-//! run, so the end of a use and of an action are **unverified**: they are
-//! checked only by the synthetic tests against our reading of the code.
+//! Compared with the original: the start of a use, and a new running
+//! action. In the Goth house's tick 14 person 259 starts using object 51,
+//! and in tick 233 person 21 starts using object 132 and gets a new
+//! running action with a unique number; the lists, the objects' counts,
+//! the running and last actions and the unique number then equal the
+//! capture's. No use ends in the ticks that run, so the end of a use and
+//! of an action are **unverified**: they are checked only by the
+//! synthetic tests against our reading of the code.
 
 use crate::fault::Trap;
 use crate::interpreter::Machine;
@@ -37,6 +44,8 @@ const USERS: usize = 62;
 mod person {
     /// Takes the new action's priority (0x45e745).
     pub const PRIORITY: usize = 33;
+    /// Cleared when the new action has a target (0x45e71c).
+    pub const STARTED: [usize; 2] = [38, 39];
     /// Cleared (0x45e77d).
     pub const CLEARED: [usize; 2] = [72, 71];
     /// If set, cleared, and the person's footprint is worked out again
@@ -153,38 +162,68 @@ impl Machine<'_, '_> {
     }
 
     /// The running person's action ends: it becomes the empty action
-    /// (0x45e6cd with the action 0x41ed43 makes).
+    /// (0x45e6cd with the action 0x41ed43 makes). See
+    /// [`Machine::set_action`].
+    pub(crate) fn end_action(&mut self, last_result: bool) -> Result<(), Trap> {
+        self.set_action(no_action(), last_result)
+    }
+
+    /// `action` becomes the running person's running action (0x45e6cd).
     ///
     /// 1. If the old action has a target, it becomes the last action, with
     ///    flag 0x20 set to `last_result` (person +0x20).
-    /// 2. The empty action becomes the running one. It has no target, so
-    ///    what the original does next for an action with one (clear
-    ///    person words 38 and 39, and 0x41f158) is skipped.
-    /// 3. Person word 33 takes the new action's priority, 0.
+    /// 2. The new action becomes the running one. If it has a target,
+    ///    person words 38 and 39 are cleared and, if it has no unique
+    ///    number yet, it takes the next one ([`World::action_serial`],
+    ///    0x41f158).
+    /// 3. Person word 33 takes the new action's priority.
     /// 4. The person's motive changes are all removed (0x46085a).
     /// 5. If person word 73 is set, it is cleared and the person's
     ///    footprint worked out again (0x433d16); that is not ported and
-    ///    fails.
+    ///    fails, before anything changes.
     /// 6. Person words 72 and 71 are cleared.
-    pub(crate) fn end_action(&mut self, last_result: bool) -> Result<(), Trap> {
+    ///
+    /// [`World::action_serial`]: sims_sim::World::action_serial
+    pub(crate) fn set_action(
+        &mut self,
+        mut action: Interaction,
+        last_result: bool,
+    ) -> Result<(), Trap> {
+        let wide = self
+            .me()?
+            .person
+            .as_ref()
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .data
+            .get(person::WIDE)
+            .copied();
+        if wide.is_none_or(|w| w != 0) {
+            return Err(Trap::Unsupported(
+                "a person's running action changes with person word 73 set, after which the \
+                 original works out its footprint again (0x433d16); not ported"
+                    .into(),
+            ));
+        }
+        if action.target != 0 && action.uid == 0 {
+            self.world.action_serial = self.world.action_serial.wrapping_add(1);
+            action.uid = self.world.action_serial;
+        }
         let person = self
             .me_mut()?
             .person
             .as_mut()
             .ok_or(Trap::native(0x1c, "object is not a person"))?;
-        if person.data.get(person::WIDE).is_none_or(|&w| w != 0) {
-            return Err(Trap::Unsupported(
-                "a person's action ends with person word 73 set, after which the original \
-                 works out its footprint again (0x433d16); not ported"
-                    .into(),
-            ));
-        }
         if person.active.target != 0 {
             let mut last = person.active.clone();
             last.flags = (last.flags & !0x20) | (u32::from(last_result) << 5);
             person.last = last;
         }
-        person.active = no_action();
+        if action.target != 0 {
+            for word in person::STARTED {
+                person.data[word] = 0;
+            }
+        }
+        person.active = action;
         person.data[person::PRIORITY] = person.active.priority as i16;
         person.motive_deltas.clear();
         for word in person::CLEARED {

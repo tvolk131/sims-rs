@@ -59,15 +59,16 @@ Each step is a few PRs, and each PR leaves `main` green.
 - Ticks run. `sims boot --ticks N` runs N lot updates after the load and
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
-  1, after ticks 1 to 3 and after every tick from 33 on). **K = 230 on the
+  1, after ticks 1 to 3 and after every tick from 33 on). **K = 232 on the
   Goth house**: our state after each of ticks 1 to 100, and after every
   tenth tick from 110 to 230, equals the 1000-tick capture of the original
   after the same update in everything compared, global 12 after tick 1
-  aside. The `updates.jsonl` line (tick count, the three random streams,
-  the scheduler cursor) is equal after every tick from 1 to 232. The
-  capture holds no full state after ticks 231 and 232, so K is 230 (see
-  step 4 below, "The first tick" and the sections after it, to "Ticks 34
-  to 232").
+  aside. A second capture holds the full state after ticks 1 to 5, 30 to
+  35 and 225 to 240, and ours equals it after each of those to 232, global
+  12 included. The `updates.jsonl` line (tick count, the three random
+  streams, the scheduler cursor) is equal after every tick from 1 to 232
+  in both (see step 4 below, "The first tick" and the sections after it,
+  to "Tick 233").
   The simulation holds the neighborhood's people (their records, person
   data, relationships and inventories) and each person's animator, as
   far as scripts read it. Find Location For (primitive 16) is ported for
@@ -75,9 +76,12 @@ Each step is a few PRs, and each PR leaves `main` green.
   Object Instance mode 8, tick 6). Go To Routing Slot (primitive 45)
   is ported for the route person 259 takes in tick 14, with the
   planner, the animator's turn on the spot and its walk along the path.
-  Clips' timed events are ported. Tick 233 stops where person 21 reaches
-  Find Best Interaction (primitive 3), which is not ported, and the boot
-  says so and at which tick.
+  Clips' timed events are ported. In tick 233 person 21 chooses an
+  interaction by itself (Find Best Interaction, primitive 3) and starts
+  it (Gosub Found Action, primitive 30); both are ported. Its tree then
+  routes to an object in another room (Go To Relative Position, primitive
+  27), which goes through a door. Routing between rooms is not ported, so
+  tick 233 stops there, and the boot says so and at which tick.
 - Step 4 is in progress. `tools/harness/` runs the original under Wine
   in a QEMU guest and stops it at every lot update. It saves the state
   at the entry of the first tick and after each lot update: every
@@ -95,6 +99,12 @@ Each step is a few PRs, and each PR leaves `main` green.
   writer's address and call chain (`tools/harness/README.md`). It found
   what writes person 259's direction and registry byte 0x12 (see "Ticks
   34 to 232").
+  A second run recorded 240 lot updates, with the full state after
+  updates 1 to 5, 30 to 35 and 225 to 240, a watchpoint on the house
+  view's draw guard (the frames), watchpoints on Find Best Interaction's
+  candidates, its choice and the action numbers, and a memory image at
+  the entry of update 233. The first run does not choose in tick 233;
+  the second does (see "Tick 233").
   With the install's UserData, the C runtime's random stream and all
   463 neighborhood records match as well. The 52-draw offset and the
   five differing records came from the first capture's guest files. The
@@ -1059,8 +1069,44 @@ the simulation reads. That nothing reads a layer's anchor fields but
 the pose. Why the original drew no frame after updates 4 to 32 is not
 known; it depends on the main loop's timing under the harness.
 
-**Stops.** Tick 233: person 21 (tree `0x2029`, node 1) reaches Find Best
-Interaction (primitive 3), which is not ported.
+### Tick 233
+
+**Find Best Interaction** (primitive 3, `0x45dd39`, `autonomy.rs`). Person
+21 scores the interaction table entries of the lot's objects against its
+motives, with its score curves, and picks one: six candidates, sorted with
+the C runtime's `qsort`, then one draw from the lot's random stream. It
+chooses menu entry 6 of object 132.
+
+**Gosub Found Action** (primitive 30, `0x45a859`, `found_action.rs`). The
+entry's action tree is pushed on the person's thread, the person starts
+using the object, and the interaction becomes its running action
+(`0x45e6cd`), with the first unique action number (`0x6e4904`, kept as
+`World::action_serial`; snapshot format 15).
+
+**Go To Relative Position** (primitive 27, `0x45c634`). The slot it routes
+to is built from the operands (`relative_slot`), and the route's steps are
+those of Go To Routing Slot. The object is in another room, so the route
+goes through a door that the routing between rooms chooses (`0x45c7c2`,
+`0x46390f`). That is not ported, and tick 233 stops at object 21, tree
+`0x1012`, node 0.
+
+**Compared with the original.** The second capture's watchpoints saw six
+candidates, the choice of menu 6 (`0x45e28b`) and the action number go
+from 0 to 1 (`0x41f15e`) in update 233. At the stop, the lot's random
+stream, the action number, person 21's running and last actions, its
+seven frames (the last one's primitive state aside), its use of object
+132 and object 132's user count equal the capture's after tick 233, and
+so does every object that ran before person 21 in that tick. Find Best
+Interaction's steps were also compared with the original's code run on
+a memory image at the entry of update 233.
+
+**Not verified.** The first capture's original made its one draw of
+ticks 233 and 234 in tick 234, not 233, from a state equal to ours after
+tick 232 as far as compared. Why is not known. Global 12 after tick 1 is
+0 in the second capture, as ours, and 17 in the first.
+
+**Stops.** Tick 233: object 21, tree `0x1012`, node 0, Go To Relative
+Position to object 132 in another room.
 
 ## Working rules
 
