@@ -2,7 +2,7 @@ use sims_content::{Catalog, House, Index, Install, Neighborhood};
 use sims_core::{CrtRng, F32, GameRng};
 use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
-use sims_sim::animator::{Animator, LOADED, Layer, Motion, UNSET};
+use sims_sim::animator::{Animator, Fade, LOADED, Layer, Motion, UNSET};
 use sims_sim::neighbors::{Inventory, Item, Neighbor, Neighbors, Row};
 use sims_sim::rooms::{Half, Room, Rooms};
 use sims_sim::route::{Candidate, Context, Route, RouteSlot, Routing};
@@ -269,9 +269,10 @@ fn routing() -> Routing {
     }
 }
 
-/// An animator playing a clip backward, with an event queued. The posture,
-/// base layer and destination are the values [`LOADED`] held before
-/// snapshot format 12, so that the format 11 digests still apply.
+/// An animator playing a clip backward, with an event queued, its walk
+/// timed to stop and its clip fading. The posture, base layer and
+/// destination are the values [`LOADED`] held before snapshot format 12,
+/// so that the format 11 digests still apply.
 fn animator() -> Animator {
     let mut layer = Layer::start(
         "clip",
@@ -285,6 +286,12 @@ fn animator() -> Animator {
     layer.phase = F32::from_bits(0x3d4d_0148);
     layer.event_time = 50;
     layer.interruptible = 0;
+    layer.fade = Fade {
+        start: 4_422_250,
+        length: 274,
+        from: F32::from_bits(0x3f80_0000),
+        to: F32::from_bits(0x3e9a_6c1c),
+    };
     Animator {
         clock: 4_422_300,
         rate: F32::from_bits(0x3fb3_3333),
@@ -315,6 +322,7 @@ fn animator() -> Animator {
             step: [F32::from_bits(0x3f00_0000), F32::from_bits(0xbe80_0000)],
             near_end: 1,
             finishing: 0,
+            timer: 4_437_050,
         },
         ..LOADED
     }
@@ -326,7 +334,7 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "794f72b969d9d0351f10ee7d8aca0b0177c29f5704bdb79e641c76ff2c8eaa6d";
+const PINNED: &str = "85b353ea24114679b2ff1796bcce33b558e8c41f511c199752a0e5b22858f875";
 
 /// `whole` with `part` replaced by `old`. `part` is found where `blank`
 /// stands in `whole_blank`, the same encoding with that one field (and
@@ -368,33 +376,96 @@ fn map_bytes<K: serde::Serialize, V>(
     bytes
 }
 
-/// An animator's encoding under snapshot format 15: its motion without
-/// the last step and the two end-of-path flags, which format 16 added at
-/// the end of [`Motion`].
-fn animator_15_bytes(animator: &Animator) -> Vec<u8> {
-    let part = postcard::to_allocvec(&animator.motion).unwrap();
-    let old = &motion_15_bytes(&animator.motion);
-    let blank = Animator {
-        motion: Motion::NONE,
-        ..animator.clone()
-    };
-    splice(
-        &postcard::to_allocvec(animator).unwrap(),
-        &postcard::to_allocvec(&blank).unwrap(),
-        &part,
-        &postcard::to_allocvec(&Motion::NONE).unwrap(),
-        old,
-    )
+/// A motion's encoding under snapshot format 16: without the timer
+/// ([`Motion::timer`]) that format 17 added at its end.
+fn motion_16_bytes(motion: &Motion) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(motion).unwrap();
+    let added = postcard::to_allocvec(&motion.timer).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - added.len()), added);
+    bytes
 }
 
-/// A motion's encoding under snapshot format 15: without the last step
-/// and the two end-of-path flags at its end.
+/// A motion's encoding under snapshot format 15: also without the last
+/// step and the two end-of-path flags at its end.
 fn motion_15_bytes(motion: &Motion) -> Vec<u8> {
-    let mut bytes = postcard::to_allocvec(motion).unwrap();
+    let mut bytes = motion_16_bytes(motion);
     let added = postcard::to_allocvec(&(motion.step, motion.near_end, motion.finishing)).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - added.len()), added);
     bytes
 }
+
+/// A foreground layer's encoding under snapshot format 16: without the
+/// fade ([`Layer::fade`]) that format 17 added at its end.
+fn layer_16_bytes(layer: &Option<Layer>) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(layer).unwrap();
+    if let Some(layer) = layer {
+        let added = postcard::to_allocvec(&layer.fade).unwrap();
+        assert_eq!(bytes.split_off(bytes.len() - added.len()), added);
+    }
+    bytes
+}
+
+/// An animator's encoding with its motion written by `motion` and its
+/// foreground layer by [`layer_16_bytes`].
+fn animator_old_bytes(animator: &Animator, motion: fn(&Motion) -> Vec<u8>) -> Vec<u8> {
+    let with_motion = |a: &Animator| {
+        let blank = Animator {
+            motion: Motion::NONE,
+            ..a.clone()
+        };
+        splice(
+            &postcard::to_allocvec(a).unwrap(),
+            &postcard::to_allocvec(&blank).unwrap(),
+            &postcard::to_allocvec(&a.motion).unwrap(),
+            &postcard::to_allocvec(&Motion::NONE).unwrap(),
+            &motion(&a.motion),
+        )
+    };
+    let blank = Animator {
+        foreground: None,
+        ..animator.clone()
+    };
+    splice(
+        &with_motion(animator),
+        &with_motion(&blank),
+        &postcard::to_allocvec(&animator.foreground).unwrap(),
+        &[0],
+        &layer_16_bytes(&animator.foreground),
+    )
+}
+
+/// An animator's encoding under snapshot format 15: its motion without
+/// the last step and the two end-of-path flags, which format 16 added at
+/// the end of [`Motion`], and without format 17's fields.
+fn animator_15_bytes(animator: &Animator) -> Vec<u8> {
+    animator_old_bytes(animator, motion_15_bytes)
+}
+
+/// The encoding of `world` as snapshot format 16 wrote it. Format 17
+/// added at the end of each animator's motion the timer of a walk that
+/// slows to a stop ([`Motion::timer`]) and at the end of each foreground
+/// layer its fade ([`Layer::fade`]). This writes the animators again
+/// without those bytes.
+fn format_16_bytes(world: &World) -> Vec<u8> {
+    let blank = World {
+        animators: BTreeMap::new(),
+        ..world.clone()
+    };
+    splice(
+        &world.encode(),
+        &blank.encode(),
+        &postcard::to_allocvec(&world.animators).unwrap(),
+        &[0],
+        &map_bytes(&world.animators, |a| animator_old_bytes(a, motion_16_bytes)),
+    )
+}
+
+#[test]
+fn without_the_timer_and_fades_the_encoding_is_format_16() {
+    // Snapshot format 17 added the motion's timer and the layer's fade.
+    assert_eq!(digest(&format_16_bytes(&world())), PINNED_16);
+}
+const PINNED_16: &str = "794f72b969d9d0351f10ee7d8aca0b0177c29f5704bdb79e641c76ff2c8eaa6d";
 
 /// The encoding of `world` with each animator as format 15 wrote it.
 fn without_motion_steps(world: &World) -> Vec<u8> {

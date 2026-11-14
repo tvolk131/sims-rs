@@ -84,10 +84,17 @@ Things to know:
 - **How long it takes.** A full state takes 4–7 seconds to read. An update
   that is not saved takes well under a second.
 - **A state it cannot read stops the run.** The full state checks that
-  every object a retained list names is in the registry. When one is not
-  (`unknown retained spatial-order object identity`, seen at update 609
-  of a run), the capture logs an `error` event, detaches and ends; the
-  updates before it are kept.
+  every object a retained list names is in the registry. When one is not,
+  the capture logs an `error` event, detaches and ends; the updates before
+  it are kept.
+- **The spatial-order cache can be stale.** The registry keeps a cache of
+  objects in drawing order (registry +0x4c). Removing an object (0x44383c)
+  only marks the cache dirty (0x443b65), and the draw rebuilds it before
+  reading it (0x440349, 0x440397). So a dirty cache can name an object that
+  is gone. The reader keeps a stale cache's pointers as read, with no
+  identities (`stale`, `ids: null`), and checks identities only in a
+  current cache. Before this, a run stopped at update 609 with `unknown
+  retained spatial-order object identity`.
 - **Stopping.** To end the capture, create the stop file. The capture then
   detaches, which resumes the game.
 - **Taking over a running capture.** Kill `capture.py` and its `docker exec`

@@ -17,6 +17,7 @@ mod go_to_slot;
 mod idle;
 mod interacting;
 mod inventory;
+mod look_towards;
 mod named_tree;
 mod notify;
 mod object_type;
@@ -117,6 +118,7 @@ impl Machine<'_, '_> {
             16 => self.find_location(operands)?.into(),
             17 => self.idle_for_input(operands)?,
             18 => self.remove(operands)?,
+            22 => self.look_towards(operands)?,
             23 => self.play_sound(operands)?.into(),
             24 => self.old_relationship(operands)?.into(),
             25 => self.alter_budget(operands)?.into(),

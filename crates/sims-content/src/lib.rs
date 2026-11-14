@@ -18,12 +18,12 @@ mod install;
 mod neighborhood;
 mod people;
 
-pub use animations::{Animations, Clip, Event, Track};
+pub use animations::{Animations, Channel, Clip, Event, Track};
 pub use catalog::{Catalog, Object};
 pub use error::Error;
 pub use index::{Index, Member, Resource};
 pub use install::{Expansions, Install, Layout, Mount};
 pub use neighborhood::{House, Neighborhood};
-pub use people::{People, Profile, Skeleton};
+pub use people::{Bone, People, Profile, Skeleton};
 
 pub type Result<T> = std::result::Result<T, Error>;

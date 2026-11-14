@@ -70,6 +70,7 @@ use crate::placement::{Place, on_lot, pool_tile};
 use sims_core::{Ext, F32};
 use sims_sim::World;
 use sims_sim::animator::{Animator, EPSILON, LOADED, Layer, UNSET};
+use sims_sim::pose;
 use std::cmp::Ordering;
 
 /// Person data words.
@@ -296,8 +297,9 @@ const SMALL_STEER: F32 = F32::from_bits(0x3d69_78d5);
 const THIRD: F32 = F32::from_bits(0x3eaa_aaab);
 const SIXTEEN: F32 = F32::from_bits(0x4180_0000);
 const TICK_MILLISECONDS: i32 = 42;
-/// The turn clip of half a turn the other way (0x58f4fa).
-const HALF_TURN: usize = 5;
+/// Bounds of the turn clips (0x6d07c4, 0x6d07c8; 3 is 0x6d07cc).
+const TURN_HALF: F32 = F32::from_bits(0x3f00_0000);
+const TURN_ONE_AND_HALF: F32 = F32::from_bits(0x3fc0_0000);
 /// Layer end modes (layer +0x40): stop at the end, or repeat.
 const STOP: i32 = 0;
 const REPEAT: i32 = 1;
@@ -314,6 +316,10 @@ const STOP_SCALE: F32 = F32::from_bits(0x3fc0_0000);
 /// Object data word 9: set, the end of a path stops at the stopping
 /// distance (0x58e7c9).
 const STOPS: usize = 9;
+/// 0x666a28: the least share of the stride a stop fades the walk to.
+const MIN_SHARE: F32 = F32::from_bits(0x3e4c_cccd);
+/// 0x6d07d4: the least time, in milliseconds, a stop takes.
+const MIN_STOP_TIME: i32 = 100;
 /// The walk clip with data word 17 set (state 10).
 const RUN: usize = 0x15;
 /// Object data word 22, which the animator's scale writes (0x59209f).
@@ -488,19 +494,40 @@ impl Interpreter<'_> {
         Ok(Next::Done)
     }
 
-    /// The start of a turn on the spot (0x58df01 to 0x58f5f9), for the
-    /// turn that is ported: more than 3 eighths the negative way, which
-    /// plays the posture's clip 5 (half a turn) and ends 4 eighths short
-    /// of the clip's start.
+    /// The start of a turn on the spot (0x58df01 to 0x58f5f9), for a turn
+    /// of at least a step either way.
     ///
     /// The turn d is the destination's direction less the position's, put
-    /// into -4 to 4 by whole turns. The smallest turn worth a clip is a
-    /// quarter of an eighth over the speed. The turn is noted (+0x1f0,
-    /// the clip's turn +0x1f4, the destination +0x1dc to +0x1e4, the
-    /// position +0x1d0 to +0x1d8); the destination's direction becomes the
-    /// position's plus d less the clip's turn; the clip starts in the
-    /// foreground (0x5926d7) at the animator's speed and priority 5
-    /// (0x59867f), and the animator turns (state 4).
+    /// into -4 to 4 by whole turns (0x58e013 to 0x58e041). The smallest
+    /// turn worth a clip, the step, is a quarter of an eighth over the
+    /// speed. The posture's clip and the turn it makes (0x58f4ee to
+    /// 0x58f674), with the bounds the original compares against (0x6d07c4
+    /// = 0.5, 0x6d07c8 = 1.5 and 0x6d07cc = 3):
+    ///
+    /// | d             | clip | turn |
+    /// |---------------|------|------|
+    /// | below -3      | 5    | -4   |
+    /// | -3 to -1.5    | 7    | -2   |
+    /// | -1.5 to -0.5  | 9    | -1   |
+    /// | -0.5 to 0.5   | 10   | 0    |
+    /// | 0.5 to 1.5    | 8    | 1    |
+    /// | 1.5 to 3      | 6    | 2    |
+    /// | above 3       | 4    | 4    |
+    ///
+    /// A bound belongs to the row nearer 0 (-1.5 and 1.5 to the rows of
+    /// clips 9 and 8, -0.5 and 0.5 to clip 10).
+    ///
+    /// The turn is noted (+0x1f0, the clip's turn +0x1f4, the destination
+    /// +0x1dc to +0x1e4, the position +0x1d0 to +0x1d8); the destination's
+    /// direction becomes the position's plus d less the clip's turn; the
+    /// clip starts in the foreground (0x5926d7) at the animator's speed
+    /// and priority 5 (0x59867f), and the animator turns (state 4). The
+    /// original also sets global 0x6f6d6c to 2, which is not kept.
+    ///
+    /// Fails for what is not ported: a turn of less than a step
+    /// (0x58dfc0), a person of kind above 1, whose bounds are scaled
+    /// (0x58df72), and a turn that is not a number, for which the original
+    /// would loop forever (0x58e039).
     fn start_turn(
         &self,
         world: &mut World,
@@ -510,30 +537,37 @@ impl Interpreter<'_> {
     ) -> Result<(), Trap> {
         let eight = EIGHT.ext();
         let mut d = (a.destination[2].ext() - a.position[2].ext()).single();
+        if d.is_nan() {
+            return Err(unsupported("0x58e039", "turns by what is not a number"));
+        }
         while d >= FOUR.ext() {
             d = (d - eight).single();
         }
-        if d < (-FOUR.ext()).single() {
-            return Err(unsupported(
-                "0x58e039",
-                "turns by less than half a turn back",
-            ));
+        while d < (-FOUR.ext()).single() {
+            d = (d + eight).single();
         }
         let step = ((ONE.ext() * QUARTER.ext()).single() / a.rate.ext()).single();
         if person_word(world, id, KIND)? > 1 {
             return Err(unsupported("0x58df72", "turns a person of kind above 1"));
         }
-        if d >= step {
-            return Err(unsupported("0x58f4ec", "turns the positive way"));
-        }
-        if d > -step {
+        if d < step && d > (-step).single() {
             return Err(unsupported("0x58dfc0", "turns by less than a step"));
         }
-        if d >= -THREE.ext() {
-            return Err(unsupported("0x58f510", "turns by 3 eighths or less"));
-        }
-        let selection = HALF_TURN;
-        let clip_turn = F32::from_bits(0xc080_0000);
+        let [half, one_and_half, three] = [TURN_HALF, TURN_ONE_AND_HALF, THREE].map(F32::ext);
+        let (selection, clip_turn) = if !at_least(d, (-three).single()) {
+            (5, -4.0)
+        } else if d > three {
+            (4, 4.0)
+        } else if d >= (-half).single() && d <= half {
+            (10, 0.0)
+        } else if d > half {
+            if d > one_and_half { (6, 2.0) } else { (8, 1.0) }
+        } else if d >= (-one_and_half).single() {
+            (9, -1.0)
+        } else {
+            (7, -2.0)
+        };
+        let clip_turn = F32::from_f32(clip_turn);
         let m = &mut a.motion;
         m.turn_wanted = d.to_f32();
         m.turn_destination = a.destination;
@@ -571,9 +605,12 @@ impl Interpreter<'_> {
     /// The layer's timed events are handled as it plays
     /// (`clip_events.rs`).
     ///
-    /// Fails for what is not ported: a foreground slot that holds a layer
-    /// (0x592878) and a clip that is not found (the original then reads
-    /// through a null pointer).
+    /// A layer the foreground slot already holds, of another clip, leaves
+    /// the skin first (virtual function 0x104, 0x592878, called at
+    /// 0x59275c), as in [`clear_foreground`].
+    ///
+    /// Fails for what is not ported: a clip that is not found (the
+    /// original then reads through a null pointer).
     fn start_clip(
         &self,
         world: &mut World,
@@ -597,14 +634,10 @@ impl Interpreter<'_> {
             .animations
             .clip(&name)
             .map_err(|e| unsupported("0x59dc32", &format!("finds no clip {name:?}: {e}")))?;
-        if let Some(layer) = &a.foreground {
-            return Err(unsupported(
-                "0x592878",
-                &format!(
-                    "clears the foreground clip {:?} to start another",
-                    layer.clip
-                ),
-            ));
+        // 0x59275c: a layer already in the slot is cleared first (virtual
+        // function 0x104, 0x592878; see [`clear_foreground`]).
+        if a.foreground.take().is_some() {
+            a.skin_dirty = true;
         }
         let mut layer = Layer::start(
             &name,
@@ -733,7 +766,8 @@ impl Interpreter<'_> {
                 .sqrt()
                 .single();
             if i64::from(segment) == count - 2 {
-                return self.end_of_path(world, id, a, p, now);
+                let last = point(segment + 1)?;
+                return self.end_of_path(world, id, a, p, last, now);
             }
             if a.foreground.as_ref().is_none_or(|l| l.interruptible != 0) {
                 a.state = if pace == 1 { 10 } else { 9 };
@@ -802,9 +836,9 @@ impl Interpreter<'_> {
     }
 
     /// The end of the path (0x58e740): the animator is heading for the
-    /// point before the path's last, `end`. The last point only gives the
-    /// direction to face at the end (0x58e77a), which the branch ported
-    /// here does not use.
+    /// point before the path's last, `end`. The last point, `last`, gives
+    /// the direction to face at the end: the angle from `end` to `last`
+    /// ([`heading`], as the walk's heading is worked out).
     ///
     /// For a person whose object data word 9 is set (0x58e7d2): while the
     /// animator has not come near the end yet (+0x288 clear) and is at
@@ -819,29 +853,26 @@ impl Interpreter<'_> {
     /// position, direction included (0x58f057). The state's code runs
     /// again (0x58f089).
     ///
+    /// For a person whose object data word 9 is clear the animator slows
+    /// to a stop on a timer ([`Interpreter::stop_on_timer`], 0x58e8be).
+    ///
     /// The original also sets global 0x6f6d68 to 13 and then 14, and a
     /// local byte from 0x6f6d70 that only matters when it is 1 (0x58f6eb);
     /// 0x6f6d70 is 0 in a memory image of the running game. Neither is
     /// kept.
     ///
-    /// Fails for what is not ported: a person whose data word 9 is clear
-    /// (0x58e8be: a timer and a stopping clip), and one whose word 64 is
-    /// set (0x58e83b and 0x58e93c).
+    /// Fails for what is not ported: a person whose word 64 is set
+    /// (0x58e83b and 0x58e93c).
+    #[allow(clippy::too_many_arguments)]
     fn end_of_path(
         &self,
         world: &mut World,
         id: u16,
         a: &mut Animator,
         end: [i32; 2],
+        last: [i32; 2],
         now: i32,
     ) -> Result<Next, Trap> {
-        if datum(world, id, STOPS)? == 0 {
-            return Err(unsupported(
-                "0x58e8be",
-                "comes to the end of its path with object data word 9 clear",
-            ));
-        }
-        let pace = datum(world, id, PACE)?;
         let [p0, p1] = end.map(Ext::from_i32);
         let dx = (p1 - a.position[0].ext()).single();
         let dy = (p0 - a.position[1].ext()).single();
@@ -849,6 +880,18 @@ impl Interpreter<'_> {
             .single()
             .sqrt()
             .single();
+        // 0x58e753 to 0x58e7c7: the direction to face at the end. Path
+        // points hold the second coordinate first.
+        let end_x = Ext::from_i32(end[1]).single();
+        let end_y = Ext::from_i32(end[0]).single();
+        let facing = heading(
+            (Ext::from_i32(last[1]) - end_x).single(),
+            (Ext::from_i32(last[0]) - end_y).single(),
+        );
+        if datum(world, id, STOPS)? == 0 {
+            return self.stop_on_timer(world, id, a, [end_x, end_y, facing], [dx, dy], left, now);
+        }
+        let pace = datum(world, id, PACE)?;
         let stop = if pace == 1 {
             STOP_RUN_DISTANCE
         } else {
@@ -884,6 +927,106 @@ impl Interpreter<'_> {
         Ok(Next::Again)
     }
 
+    /// The end of the path for a person whose object data word 9 is clear
+    /// (0x58e8be to 0x58eb03): the animator walks on while the walk clip
+    /// slows down, and stops on the end point when a timer (+0x1c0,
+    /// [`sims_sim::animator::Motion::timer`]) runs out. `end` is the end
+    /// point and the direction to face there, `dx` and `dy` how far the
+    /// end point is and `left` the distance ([`Interpreter::end_of_path`]).
+    ///
+    /// With no timer set (0):
+    ///
+    /// 1. The phase of the foreground clip (0 with none) picks the next
+    ///    footfall of the walk ([`Interpreter::footfalls`]): the first
+    ///    (+0x174) if the phase is from it up to the second (+0x170), else
+    ///    the second; and the stride that ends there (+0x17c for the first,
+    ///    +0x178 for the second). With data word 17 set and person word 64
+    ///    clear the stride is doubled.
+    /// 2. Further from the end than the stride, the animator walks on
+    ///    (0x58eb0a, [`Interpreter::head`]).
+    /// 3. Otherwise +0x288 is set. A foreground clip that may not be
+    ///    interrupted (layer +0x68 is 0) and is not done (0x586d41) walks
+    ///    on.
+    /// 4. Otherwise the timer is set: the share of the stride left (at
+    ///    least 0.2), and the part of the clip's cycle to the footfall
+    ///    (that phase less the clip's, plus 1 when below 1) times the
+    ///    clip's duration at the animator's speed, truncated (0x636128),
+    ///    at least 100: the timer is the clock plus that, and the clip's
+    ///    weight fades from what it is to the share in that time (0x597a3e).
+    ///    With no foreground clip the time is 100 and nothing fades. The
+    ///    animator walks on.
+    ///
+    /// With a timer set: if data word 17 is set, the end is nearer than 2,
+    /// or the clock has come to the timer, the timer becomes -1 and +0x28c
+    /// is cleared. A timer still above 0 walks on. A timer of -1 stops
+    /// the animator: the route result becomes -1, the position and the
+    /// destination the end point, the destination's direction the
+    /// direction to face, the timer 0, +0x28c clear, the progress 1, the
+    /// foreground clip is cleared (virtual function 0xfc, 0x586b63), and
+    /// it stands (state 3); the state's code runs again (0x58f089).
+    ///
+    /// The original also clears +0x290, which only code that is not
+    /// ported reads (see [`Interpreter::walk`]).
+    ///
+    /// Fails for what is not ported: a person whose word 64 is set
+    /// (0x58e936).
+    #[allow(clippy::too_many_arguments)]
+    fn stop_on_timer(
+        &self,
+        world: &mut World,
+        id: u16,
+        a: &mut Animator,
+        [end_x, end_y, facing]: [Ext; 3],
+        [dx, dy]: [Ext; 2],
+        left: Ext,
+        now: i32,
+    ) -> Result<Next, Trap> {
+        let pace = datum(world, id, PACE)?;
+        let special = person_word(world, id, SPECIAL)?;
+        let walk_on = |this: &Self, world: &mut World, a: &mut Animator| {
+            let square = ((dy * dy).single() + (dx * dx).single()).single();
+            this.head(world, id, a, [dx, dy], square, now)
+        };
+        if a.motion.timer == 0 {
+            // Whichever way the stride decides, the animator walks on with
+            // nothing else changed when +0x288 is already set, person word
+            // 64 is clear and a foreground clip that may not be interrupted
+            // has not finished (0x58e92a, 0x58e948). The footfalls are
+            // then not needed.
+            let walks_on = a.motion.near_end == 1
+                && special == 0
+                && a.foreground
+                    .as_ref()
+                    .is_some_and(|l| l.interruptible == 0 && !l.finished());
+            if !walks_on {
+                let feet = self.footfalls(world, id)?;
+                slow_down(a, &feet, left, special != 0, pace, now)?;
+            }
+            return walk_on(self, world, a);
+        }
+        if a.motion.timer > 0
+            && (pace == 1 || !at_least(left, STOP_DISTANCE.ext()) || now >= a.motion.timer)
+        {
+            a.motion.timer = -1;
+            a.motion.finishing = 0;
+        }
+        if a.motion.timer >= 0 {
+            return walk_on(self, world, a);
+        }
+        a.arrival = -1;
+        a.position[0] = end_x.to_f32();
+        a.destination[0] = a.position[0];
+        a.motion.timer = 0;
+        a.motion.finishing = 0;
+        a.position[1] = end_y.to_f32();
+        a.destination[1] = a.position[1];
+        a.destination[2] = facing.to_f32();
+        a.state = 3;
+        a.motion.progress = ONE;
+        clear_foreground(a);
+        Ok(Next::Again)
+    }
+
     /// The animator heads for a point ahead (0x58eb29), `dx` and `dy` away
     /// along its position's first and second coordinates, `distance` the
     /// square of the way there. An offset of no length (within
@@ -912,19 +1055,7 @@ impl Interpreter<'_> {
             return Ok(Next::Done);
         }
         let [dx, dy] = offset;
-        let mut angle = Ext::atan2(dy.to_f32(), dx.to_f32());
-        let turn = (PI.ext() + PI.ext()).single();
-        if !at_least(angle, Ext::ZERO) {
-            angle = (angle + turn).single();
-        }
-        let eight = Ext::from_i32(TURN);
-        let mut heading = (((angle * EIGHT.ext()).single() / turn).single() + TWO.ext()).single();
-        while !at_least(heading, Ext::ZERO) {
-            heading = (heading + eight).single();
-        }
-        while at_least(heading, eight) {
-            heading = (heading - eight).single();
-        }
+        let heading = heading(dx, dy);
         let mut d = (heading - a.position[2].ext()).single();
         while at_least(d, FOUR.ext()) {
             d = (d - EIGHT.ext()).single();
@@ -1264,6 +1395,152 @@ impl Interpreter<'_> {
         Ok((distance * k).single())
     }
 
+    /// The phases of the walk's footfalls, as the animator's constructor
+    /// (0x58831d) keeps them: the walk clip (the posture's clip 0x14) at
+    /// its events `anchor` = `1` (+0x170) and `anchor` = `2` (+0x174), each
+    /// event's time over the clip's duration (0x5885b6), in that order.
+    /// The events are found as virtual function 0x128 (0x588df8) finds
+    /// them ([`anchor_event`]).
+    ///
+    /// The values are worked out here when they are needed, not kept, as
+    /// [`Interpreter::stride`] is.
+    pub fn footfall_phases(&self, world: &World, id: u16) -> Result<[F32; 2], Trap> {
+        let name = self
+            .posture_clip(world, id, WALK)?
+            .ok_or_else(|| unsupported("0x58852c", &format!("has no name for its clip {WALK}")))?;
+        let clip = self.clip(&name)?;
+        let duration = F32::from_bits(clip.duration).ext();
+        let phase = |value: &str| {
+            let (_, time) = anchor_event(clip, value).ok_or_else(|| {
+                unsupported(
+                    "0x588df8",
+                    &format!("finds no event anchor = {value} in its walk clip {name:?}"),
+                )
+            })?;
+            Ok::<_, Trap>((Ext::from_i32(time) / duration).single().to_f32())
+        };
+        Ok([phase("1")?, phase("2")?])
+    }
+
+    /// The walk's footfalls ([`Footfalls`]): the phases
+    /// ([`Interpreter::footfall_phases`]) and the strides
+    /// ([`Interpreter::strides`]) that end at them.
+    fn footfalls(&self, world: &World, id: u16) -> Result<Footfalls, Trap> {
+        let [second, first] = self.footfall_phases(world, id)?;
+        let [first_stride, second_stride] = self.strides(world, id)?;
+        Ok(Footfalls {
+            first,
+            second,
+            first_stride,
+            second_stride,
+        })
+    }
+
+    /// The walk's strides: animator +0x17c, the one that ends at the
+    /// footfall of event `anchor` = `2`, then +0x178, the one that ends at
+    /// the footfall of `anchor` = `1`.
+    ///
+    /// The constructor (0x58852c to 0x58876a) poses the person's skeleton
+    /// with the walk clip alone, at weight 1, at each footfall's phase:
+    /// first `anchor` = `2`'s, then `anchor` = `1`'s (0x5885e8, 0x58869f;
+    /// [`sims_sim::pose`]). Each time it takes the origins of the two
+    /// anchor events' bones (0x595f32, 0x5c39a0), along their third
+    /// coordinate, times 16/3 (0x588418). With `one` and `two` those
+    /// products for the bones of `anchor` = `1` and `2`, +0x17c is `two`
+    /// less `one` at the first pose and +0x178 is `one` less `two` at the
+    /// second; `one` is stored as a float before the subtraction.
+    ///
+    /// The original works the strides out once, when it builds the
+    /// person, and keeps them. This works them out from the same clip and
+    /// skeleton each time they are needed, which is the same while the
+    /// person's walk clip and skeleton stay the same.
+    ///
+    /// The layer's time since its previous pose is taken as 0, so the
+    /// next frame is always blended in, and the clip as looping. Neither
+    /// is read from the original; the strides this gives equal the ones
+    /// it stored for every person in the capture (see
+    /// `crates/sims-vm/tests/resize.rs`).
+    pub fn strides(&self, world: &World, id: u16) -> Result<[F32; 2], Trap> {
+        let name = self
+            .posture_clip(world, id, WALK)?
+            .ok_or_else(|| unsupported("0x58852c", &format!("has no name for its clip {WALK}")))?;
+        let clip = self.clip(&name)?;
+        let guid = world
+            .objects
+            .get(&id)
+            .ok_or_else(|| Trap::native(10, "missing object"))?
+            .guid;
+        let skeleton = self.program.people.skeletons.get(&guid).ok_or_else(|| {
+            Trap::Unsupported(format!(
+                "no skeleton was supplied for the person type 0x{guid:08X}"
+            ))
+        })?;
+        let samples = self
+            .program
+            .animations
+            .samples(clip)
+            .map_err(|e| unsupported("0x5992b3", &format!("cannot read its samples: {e}")))?;
+        let floats3 = |v: &[f32; 3]| v.map(F32::from_f32);
+        let floats4 = |v: &[f32; 4]| v.map(F32::from_f32);
+        let translations: Vec<[F32; 3]> = samples.translations.iter().map(floats3).collect();
+        let rotations: Vec<[F32; 4]> = samples.rotations.iter().map(floats4).collect();
+        let place = |bone: &str| skeleton.bones.iter().position(|b| b.name == bone);
+        let anchor = |value: &str| {
+            let (bone, _) = anchor_event(clip, value).ok_or_else(|| {
+                unsupported(
+                    "0x588df8",
+                    &format!("finds no event anchor = {value} in its walk clip {name:?}"),
+                )
+            })?;
+            place(bone).ok_or_else(|| {
+                unsupported(
+                    "0x5990e0",
+                    &format!("finds no bone {bone:?} in the person's skeleton"),
+                )
+            })
+        };
+        let anchors = [anchor("1")?, anchor("2")?];
+        let parents: Vec<Option<usize>> = skeleton.bones.iter().map(|b| b.parent).collect();
+        let rest: Vec<pose::Bone> = skeleton
+            .bones
+            .iter()
+            .map(|b| pose::Bone {
+                translation: b.translation.map(F32::from_bits),
+                rotation: b.rotation.map(F32::from_bits),
+            })
+            .collect();
+        let bad = |e: pose::Error| unsupported("0x5992b3", &format!("cannot pose: {}", e.0));
+        let duration = F32::from_bits(clip.duration);
+        let k = (Ext::from_i32(16) / Ext::from_i32(3)).single();
+        let heights = |phase: F32| -> Result<[Ext; 2], Trap> {
+            let at =
+                pose::Selection::at(phase, clip.frames, duration, F32::ZERO, true).map_err(bad)?;
+            let mut locals = rest.clone();
+            for channel in &clip.channels {
+                let Some(bone) = place(&channel.bone) else {
+                    continue;
+                };
+                let from = |start: Option<u32>, len: usize| {
+                    start.map(|s| s as usize).filter(|&s| s <= len)
+                };
+                let motion = pose::Motion {
+                    translations: from(channel.translation, translations.len())
+                        .map(|s| &translations[s..]),
+                    rotations: from(channel.rotation, rotations.len()).map(|s| &rotations[s..]),
+                };
+                pose::sample(&mut locals[bone], motion, at).map_err(bad)?;
+            }
+            let placed = pose::absolute(&parents, &locals).map_err(bad)?;
+            Ok(anchors.map(|b| (placed[b].translation[2].ext() * k).single()))
+        };
+        let footfalls = self.footfall_phases(world, id)?;
+        let [one, two] = heights(footfalls[1])?;
+        let first = (two - one).single().to_f32();
+        let [one, two] = heights(footfalls[0])?;
+        let second = (one - two).single().to_f32();
+        Ok([first, second])
+    }
+
     /// A clip by name, as the animator looks it up (0x59dc32).
     fn clip(&self, name: &str) -> Result<&sims_content::Clip, Trap> {
         self.program
@@ -1309,7 +1586,8 @@ impl Interpreter<'_> {
 }
 
 /// State 4 (0x58e045): the animator turns on the spot as its foreground
-/// clip plays. While the clip is short of its end (layer +0x28 below 1),
+/// clip plays. First it stops walking ([`Animator::walking`] cleared, and
+/// +0x24, +0x28 and +0x290, which are not kept). While the clip is short of its end (layer +0x28 below 1),
 /// the direction and position go from where the turn started to the
 /// destination in step with it; the direction is written to object data
 /// word 1, rounded and put into 0 to 7 (0x5920e8, [`direction_word`]), and
@@ -1321,6 +1599,7 @@ impl Interpreter<'_> {
 /// Fails for no foreground clip, where the original reads through a null
 /// pointer.
 fn turn(world: &mut World, id: u16, a: &mut Animator) -> Result<Next, Trap> {
+    a.walking = false;
     let layer = a.foreground.as_ref().ok_or_else(|| {
         unsupported(
             "0x58e05a",
@@ -1389,7 +1668,8 @@ fn end_turn(world: &mut World, id: u16, a: &mut Animator) -> Result<(), Trap> {
 /// the segment -1, the destination the position, and the animator
 /// stands (state 3); the answer is true.
 ///
-/// The original also sets +0x1c0 to 0, +0x18c to 1 and the global
+/// The timer of a stop at the end of a path (+0x1c0) becomes 0 too
+/// (0x589e56). The original also sets +0x18c to 1 and the global
 /// 0x6f6d68 to 7. Nothing ported reads them, and they are not kept.
 pub(crate) fn stop_route(a: &mut Animator) -> bool {
     if matches!(a.arrival, 1 | -1) {
@@ -1397,9 +1677,153 @@ pub(crate) fn stop_route(a: &mut Animator) -> bool {
     }
     a.arrival = 0;
     a.motion.segment = -1;
+    a.motion.timer = 0;
     a.destination = a.position;
     a.state = 3;
     true
+}
+
+/// The start of a stop at the end of a path, with no timer set yet
+/// (0x58e8c9 to 0x58eaa4; see [`Interpreter::stop_on_timer`]): the next
+/// footfall and its stride, and, within the stride of the end, the timer
+/// and the fade. `left` is the distance to the end, `special` whether
+/// person word 64 is set, `pace` object data word 17. The animator walks
+/// on afterwards in every case.
+///
+/// Fails for what is not ported: a person whose word 64 is set, within
+/// the stride (0x58e936).
+pub(crate) fn slow_down(
+    a: &mut Animator,
+    feet: &Footfalls,
+    left: Ext,
+    special: bool,
+    pace: i16,
+    now: i32,
+) -> Result<(), Trap> {
+    let phase = a.foreground.as_ref().map_or(F32::ZERO, |l| l.phase).ext();
+    // 0x58e8e0: below the first footfall, from the second on, or not a
+    // number, the second is next.
+    let second = !at_least(phase, feet.first.ext()) || phase >= feet.second.ext();
+    let mut stride = if second {
+        feet.second_stride
+    } else {
+        feet.first_stride
+    }
+    .ext();
+    if !special && pace == 1 {
+        stride = (stride + stride).single();
+    }
+    if left > stride {
+        return Ok(());
+    }
+    if special {
+        return Err(unsupported(
+            "0x58e936",
+            "slows to a stop at the end of its path for a person whose word 64 is set",
+        ));
+    }
+    a.motion.near_end = 1;
+    if let Some(layer) = &a.foreground
+        && layer.interruptible == 0
+        && !layer.finished()
+    {
+        return Ok(());
+    }
+    let mut share = (left / stride).single();
+    if !at_least(share, MIN_SHARE.ext()) {
+        share = MIN_SHARE.ext();
+    }
+    let footfall = if second { feet.first } else { feet.second };
+    let mut cycle = (footfall.ext() - phase).single();
+    if !at_least(cycle, ONE.ext()) {
+        cycle = (cycle + ONE.ext()).single();
+    }
+    let length = match &a.foreground {
+        Some(layer) => (layer.clip_duration.ext() / a.rate.ext()).single(),
+        None => Ext::ZERO,
+    };
+    let time = (length * cycle)
+        .single()
+        .to_i32_truncate()
+        .max(MIN_STOP_TIME);
+    a.motion.timer = time.wrapping_add(now);
+    if let Some(layer) = a.foreground.as_mut() {
+        let weight = layer.weight;
+        layer.start_fade(now, time, weight, share.to_f32());
+    }
+    Ok(())
+}
+
+/// The heading of an offset `dx`, `dy` along the position's first and
+/// second coordinates (0x58eb47 to 0x58ebbe, and 0x58e76c to 0x58e7c7
+/// for the end of a path): the offset's angle (virtual function 0x98,
+/// 0x5920c6: the arctangent, plus a whole turn when below 0) in eighths
+/// of a turn, plus 2, put into 0 to 8 by whole turns. The offset is
+/// passed as two stored floats.
+fn heading(dx: Ext, dy: Ext) -> Ext {
+    let mut angle = Ext::atan2(dy.to_f32(), dx.to_f32());
+    let turn = (PI.ext() + PI.ext()).single();
+    if !at_least(angle, Ext::ZERO) {
+        angle = (angle + turn).single();
+    }
+    let eight = Ext::from_i32(TURN);
+    let mut heading = (((angle * EIGHT.ext()).single() / turn).single() + TWO.ext()).single();
+    while !at_least(heading, Ext::ZERO) {
+        heading = (heading + eight).single();
+    }
+    while at_least(heading, eight) {
+        heading = (heading - eight).single();
+    }
+    heading
+}
+
+/// The foreground clip is cleared (virtual function 0xfc, 0x586b63): a
+/// layer in the slot leaves the skin, which marks the skin's layers
+/// changed (virtual function 0x104, 0x592878, then 0x5a0a7b), and the
+/// clip's selection becomes -1.
+///
+/// 0x592878 would instead keep the layer to blend out when byte 0x6f6bd0
+/// is set. No code writes that byte, and it is 0 in the memory images of
+/// the running game taken at updates 14, 15, 47 and 580, so it is taken
+/// to be 0 (see [`end_turn`]).
+fn clear_foreground(a: &mut Animator) {
+    if a.foreground.take().is_some() {
+        a.skin_dirty = true;
+    }
+    a.selection = -1;
+}
+
+/// The walk's footfalls ([`Interpreter::footfalls`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Footfalls {
+    /// +0x174: the phase of the walk clip's event `anchor` = `2`.
+    pub first: F32,
+    /// +0x170: the phase of the walk clip's event `anchor` = `1`.
+    pub second: F32,
+    /// +0x17c: the stride that ends at the first footfall.
+    pub first_stride: F32,
+    /// +0x178: the stride that ends at the second footfall.
+    pub second_stride: F32,
+}
+
+/// The first event of a clip with the property `anchor` and the given
+/// value, as the animator's virtual function 0x128 (0x588df8) finds it:
+/// the clip's motions in order, each motion's events from the last, and
+/// each event's properties in order. The answer is the motion's bone and
+/// the event's time.
+fn anchor_event<'c>(clip: &'c sims_content::Clip, value: &str) -> Option<(&'c str, i32)> {
+    clip.tracks.iter().find_map(|track| {
+        track
+            .events
+            .iter()
+            .rev()
+            .find(|e| {
+                e.properties
+                    .iter()
+                    .any(|(k, v)| k == "anchor" && v == value)
+            })
+            .map(|e| (track.bone.as_str(), e.time))
+    })
 }
 
 /// A direction as object data word 1 holds it (0x5920e8): the direction
@@ -1562,5 +1986,71 @@ mod tests {
         assert!(stop_route(&mut a));
         assert_eq!((a.arrival, a.motion.segment, a.state), (0, -1, 3));
         assert_eq!(a.destination, a.position);
+    }
+
+    fn feet() -> Footfalls {
+        Footfalls {
+            first: F32::from_f32(0.25),
+            second: F32::from_f32(0.75),
+            first_stride: F32::from_f32(8.0),
+            second_stride: F32::from_f32(10.0),
+        }
+    }
+
+    fn walking(phase: f32, interruptible: i32) -> Animator {
+        let mut a = sims_sim::animator::LOADED;
+        let mut layer = Layer::start("walk", F32::from_f32(1000.0), 38, true, 0, true, 0);
+        layer.phase = F32::from_f32(phase);
+        layer.interruptible = interruptible;
+        a.foreground = Some(layer);
+        a
+    }
+
+    #[test]
+    fn a_walk_far_from_the_end_does_not_slow() {
+        // Phase 0.5 is between the footfalls: the stride is the first's, 8.
+        let mut a = walking(0.5, 1);
+        let before = a.clone();
+        let left = Ext::from_i32(9);
+        slow_down(&mut a, &feet(), left, false, 0, 50).unwrap();
+        assert_eq!(a, before);
+        // At pace 1 the stride is doubled, and 9 is within it.
+        slow_down(&mut a, &feet(), left, false, 1, 50).unwrap();
+        assert_eq!(a.motion.near_end, 1);
+    }
+
+    #[test]
+    fn a_walk_within_a_stride_times_its_stop() {
+        // Phase 0.5: the next footfall is the second, at 0.75, a quarter
+        // of the clip on; less than a whole clip, so a whole clip more.
+        // 1.25 times the clip's 1000 ms at speed 1 is 1250 ms. The fade
+        // takes the weight from 1 to the share of the stride left, 4 of 8.
+        let mut a = walking(0.5, 1);
+        slow_down(&mut a, &feet(), Ext::from_i32(4), false, 0, 50).unwrap();
+        assert_eq!((a.motion.near_end, a.motion.timer), (1, 1300));
+        let layer = a.foreground.as_ref().unwrap();
+        assert!(layer.fading);
+        assert_eq!(
+            (
+                layer.fade.start,
+                layer.fade.length,
+                layer.fade.from,
+                layer.fade.to
+            ),
+            (50, 1250, F32::from_f32(1.0), F32::from_f32(0.5))
+        );
+        // A clip that may not be interrupted and has not finished: only
+        // the flag is set.
+        let mut a = walking(0.5, 0);
+        slow_down(&mut a, &feet(), Ext::from_i32(4), false, 0, 50).unwrap();
+        assert_eq!((a.motion.near_end, a.motion.timer), (1, 0));
+        assert!(!a.foreground.unwrap().fading);
+        // With no clip the time is the least, 100 ms.
+        let mut a = sims_sim::animator::LOADED;
+        slow_down(&mut a, &feet(), Ext::from_i32(4), false, 0, 50).unwrap();
+        assert_eq!((a.motion.near_end, a.motion.timer), (1, 150));
+        // A person with word 64 set is not ported.
+        let mut a = walking(0.5, 1);
+        assert!(slow_down(&mut a, &feet(), Ext::from_i32(4), true, 0, 50).is_err());
     }
 }

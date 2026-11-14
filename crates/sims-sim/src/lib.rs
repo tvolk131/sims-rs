@@ -25,6 +25,7 @@ mod error;
 pub mod load;
 pub mod motives;
 pub mod neighbors;
+pub mod pose;
 pub mod rooms;
 pub mod route;
 mod snapshot;
