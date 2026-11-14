@@ -19,7 +19,7 @@ fn the_clock_runs_fifty_per_tick_or_forty_two_when_slow() {
 
 #[test]
 fn a_layer_advances_by_the_elapsed_share_of_its_duration() {
-    let mut layer = Layer::start("c", THOUSAND, 30, true, false, 1000);
+    let mut layer = Layer::start("c", THOUSAND, 30, true, 0, false, 1000);
     assert_eq!(layer.duration, THOUSAND);
     assert_eq!(layer.update(1000).unwrap(), Advance::Events);
     assert_eq!(layer.phase, F32::ZERO);
@@ -40,7 +40,7 @@ fn a_layer_advances_by_the_elapsed_share_of_its_duration() {
 
 #[test]
 fn a_clip_played_backward_ends_at_its_start() {
-    let mut layer = Layer::start("c", F32::from_bits(0x42c8_0000), 4, true, true, 0);
+    let mut layer = Layer::start("c", F32::from_bits(0x42c8_0000), 4, true, 0, true, 0);
     assert_eq!(layer.phase.to_bits(), 0x3f80_0000);
     assert_eq!(layer.speed.to_bits(), 0xbf80_0000);
     // The duration is made positive.
@@ -58,18 +58,18 @@ fn a_clip_played_backward_ends_at_its_start() {
 
 #[test]
 fn a_layer_with_nothing_bound_keeps_only_its_clock() {
-    let mut layer = Layer::start("c", THOUSAND, 30, false, false, 0);
+    let mut layer = Layer::start("c", THOUSAND, 30, false, 0, false, 0);
     assert_eq!(layer.update(50).unwrap(), Advance::Unbound);
     assert_eq!((layer.current, layer.previous), (50, 0));
     assert_eq!(layer.phase, F32::ZERO);
     // So does one whose first motion has no frames.
-    let mut layer = Layer::start("c", THOUSAND, 0, true, false, 0);
+    let mut layer = Layer::start("c", THOUSAND, 0, true, 0, false, 0);
     assert_eq!(layer.update(50).unwrap(), Advance::Unbound);
 }
 
 #[test]
 fn a_stopped_layer_has_no_duration_and_is_finished() {
-    let mut layer = Layer::start("c", THOUSAND, 30, true, false, 0);
+    let mut layer = Layer::start("c", THOUSAND, 30, true, 0, false, 0);
     layer.set_speed(F32::ZERO);
     assert_eq!(layer.duration, F32::ZERO);
     assert!(layer.finished());
@@ -79,17 +79,56 @@ fn a_stopped_layer_has_no_duration_and_is_finished() {
 
 #[test]
 fn a_weightless_layer_sends_no_events() {
-    let mut layer = Layer::start("c", THOUSAND, 30, true, false, 0);
+    let mut layer = Layer::start("c", THOUSAND, 30, true, 0, false, 0);
     layer.weight = F32::ZERO;
     assert_eq!(layer.update(50).unwrap(), Advance::Silent);
 }
 
 #[test]
-fn what_the_layer_update_does_not_port_fails() {
-    let mut layer = Layer::start("c", F32::from_bits(0x42c8_0000), 4, true, false, 0);
+fn a_repeating_clip_starts_over_past_its_end() {
+    // 0x597dca: end mode 1 keeps the speed and duration and takes the
+    // part of the phase past a whole number.
+    let hundred = F32::from_bits(0x42c8_0000);
+    let mut layer = Layer::start("c", hundred, 4, true, 0, false, 0);
     layer.mode = 1;
-    assert!(layer.update(200).unwrap_err().contains("end mode 1"));
-    let mut layer = Layer::start("c", THOUSAND, 4, true, false, 0);
+    layer.update(80).unwrap();
+    assert_eq!(layer.phase.to_bits(), 0x3f4c_cccd);
+    assert!(!layer.ended);
+    // 0.8 + 0.5 lies halfway between two singles and rounds to the even
+    // one, 1.29999995; less its floor, 0.29999995, so the event time
+    // truncates to 29.
+    layer.update(130).unwrap();
+    assert!(layer.ended);
+    assert_eq!(layer.phase.to_bits(), 0x3e99_9998);
+    assert_eq!(
+        (layer.speed, layer.duration),
+        (F32::from_bits(0x3f80_0000), hundred)
+    );
+    assert_eq!(layer.event_time, 29);
+    // A phase of exactly 1 is kept, and ends the clip too.
+    let mut layer = Layer::start("c", hundred, 4, true, 0, false, 0);
+    layer.mode = 1;
+    layer.update(100).unwrap();
+    assert!(layer.ended);
+    assert_eq!(layer.phase, F32::from_bits(0x3f80_0000));
+    // The next update goes on from there, past 1 again.
+    layer.update(150).unwrap();
+    assert!(layer.ended);
+    assert_eq!(layer.phase.to_bits(), 0x3f00_0000);
+    // Backward, a phase below 0 starts over from the top.
+    let mut layer = Layer::start("c", hundred, 4, true, 0, true, 0);
+    layer.mode = 1;
+    layer.update(125).unwrap();
+    assert!(layer.ended);
+    assert_eq!(layer.phase.to_bits(), 0x3f40_0000);
+}
+
+#[test]
+fn what_the_layer_update_does_not_port_fails() {
+    let mut layer = Layer::start("c", F32::from_bits(0x42c8_0000), 4, true, 0, false, 0);
+    layer.mode = 2;
+    assert!(layer.update(200).unwrap_err().contains("end mode 2"));
+    let mut layer = Layer::start("c", THOUSAND, 4, true, 0, false, 0);
     layer.fading = true;
     assert!(layer.update(50).unwrap_err().contains("fading"));
 }
@@ -153,7 +192,7 @@ fn a_reset_unplaces_the_animator_and_drops_its_posture() {
 #[test]
 fn a_reset_with_a_clip_playing_or_a_route_result_is_refused() {
     let mut a = Animator {
-        foreground: Some(Layer::start("c", THOUSAND, 30, true, false, 0)),
+        foreground: Some(Layer::start("c", THOUSAND, 30, true, 0, false, 0)),
         ..LOADED
     };
     assert!(a.reset().unwrap_err().contains("0x592878"));
@@ -162,4 +201,64 @@ fn a_reset_with_a_clip_playing_or_a_route_result_is_refused() {
         ..LOADED
     };
     assert!(a.reset().unwrap_err().contains("0x589e2d"));
+}
+
+/// A motion's events for [`Layer::due`]: (time, has a property). Index 3
+/// has no property; indices 0 and 6 lie outside 0 to 1040 (a clip of
+/// 1000 plus 40, 0x66d738).
+const EVENTS: [(i32, bool); 7] = [
+    (-5, true),
+    (0, true),
+    (100, true),
+    (200, false),
+    (300, true),
+    (1040, true),
+    (1041, true),
+];
+
+/// Sets the event times as an update would leave them.
+fn at(layer: &mut Layer, previous: i32, now: i32) {
+    layer.previous_event_time = previous;
+    layer.event_time = now;
+}
+
+#[test]
+fn forward_events_are_due_up_to_the_event_time_and_wrap_round() {
+    // 0x597ff9 to 0x598208, forward.
+    let mut layer = Layer::start("c", THOUSAND, 30, true, 1, false, 0);
+    assert_eq!(layer.cursors, [0]);
+    at(&mut layer, 0, 250);
+    // -5 is passed over; 200 has no property; the cursor stops at 300.
+    assert_eq!(layer.due(0, &EVENTS).unwrap(), [1, 2]);
+    assert_eq!(layer.cursors, [4]);
+    at(&mut layer, 250, 1040);
+    assert_eq!(layer.due(0, &EVENTS).unwrap(), [4, 5]);
+    assert_eq!(layer.cursors, [7]);
+    // Nothing more is due at the same time.
+    at(&mut layer, 1040, 1040);
+    assert!(layer.due(0, &EVENTS).unwrap().is_empty());
+    // The event time went back: from the cursor to the end, then from the
+    // first event.
+    layer.cursors[0] = 4;
+    at(&mut layer, 250, 10);
+    assert_eq!(layer.due(0, &EVENTS).unwrap(), [4, 5, 1]);
+    assert_eq!(layer.cursors, [2]);
+    // A motion the layer has no cursor for is refused.
+    assert!(layer.due(1, &EVENTS).unwrap_err().contains("no motion 1"));
+}
+
+#[test]
+fn backward_events_are_due_down_to_the_event_time_and_wrap_round() {
+    let mut layer = Layer::start("c", THOUSAND, 30, true, 1, true, 0);
+    layer.cursors[0] = 6;
+    at(&mut layer, 1040, 100);
+    // 1041 is passed over; 100 is due; the cursor stops at 0.
+    assert_eq!(layer.due(0, &EVENTS).unwrap(), [5, 4, 2]);
+    assert_eq!(layer.cursors, [1]);
+    // Going round backward, the cursor steps back before each event, so
+    // the one it pointed at is not handled (0x5947bb); then it goes to the
+    // last event (0x5947cc).
+    at(&mut layer, 100, 500);
+    assert_eq!(layer.due(0, &EVENTS).unwrap(), [5]);
+    assert_eq!(layer.cursors, [4]);
 }

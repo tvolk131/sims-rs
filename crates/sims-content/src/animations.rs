@@ -5,7 +5,7 @@
 //! (0x59dc32, through 0x5a03e4) and builds a layer from it (0x597a88). Of
 //! the clip the layer keeps its duration (clip +0x2c), the frame count of
 //! its first motion (layer +0x38), and one binding per motion (layer +8),
-//! each with a cursor over the motion's timed events. The samples (the
+//! each with a cursor over the motion's timed events ([`Track`]). The samples (the
 //! `.cfp` file named after the clip's skill) are only read to pose the
 //! skeleton, which is presentation; a clip whose samples are missing is
 //! still refused, since how the original copes with that is not ported.
@@ -30,17 +30,75 @@ pub struct Clip {
     /// file's single-precision float (clip +0x30, read by the animator's
     /// virtual function 0x120, 0x588ed7).
     pub distance: u32,
+    /// The file's flag after the distance (clip +0x34, read at 0x59703b):
+    /// the clip moves the person. A walk that starts its clip keeps the
+    /// phase of the clip playing before only when this is set (0x58edb6).
+    pub moving: bool,
     /// The frame count of the clip's first motion, or 0 for a clip
     /// without motions (layer +0x38, 0x597b01).
     pub frames: u32,
     /// How many motions the clip has.
     pub motions: usize,
-    /// Whether any motion has a timed event. The layer update dispatches
-    /// those (0x5912fd), which is not ported.
-    pub events: bool,
-    /// The names of the clip's timed events (the first of each event's
-    /// pairs, as "footstep"), each once, in order.
-    pub event_keys: Vec<String>,
+    /// The timed events of each motion that has any, in the order of the
+    /// motions. Each becomes a cursor of the layer's binding for that
+    /// motion (0x594778), and the layer update dispatches them (0x597c4c).
+    pub tracks: Vec<Track>,
+}
+
+/// One motion's timed events, as the original builds its list when it
+/// reads the clip (0x5946fc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Track {
+    /// The bone the motion moves. Its binding exists only if the person's
+    /// skeleton has the bone.
+    pub bone: String,
+    /// The events, ordered by time, at most one per time.
+    pub events: Vec<Event>,
+}
+
+/// One timed event: at a time into the clip, a list of properties.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Event {
+    /// Milliseconds into the clip. The file may hold any value; the layer
+    /// update skips one below 0 or more than 40 past the clip's end.
+    pub time: i32,
+    /// The properties, as key and value, in order.
+    pub properties: Vec<(String, String)>,
+}
+
+impl Track {
+    /// Builds a motion's list from the file's events, in file order:
+    ///
+    /// - Each event's properties are read into a new list (0x59431a,
+    ///   0x594390). A key is looked up as the file spells it; if the list
+    ///   holds it, its value is replaced, else the pair is added. Both are
+    ///   stored in lowercase (0x63822a, the C locale's), so two keys that
+    ///   differ only in case are both kept, in lowercase.
+    /// - The list is inserted by time (0x5946fc). An event at a time the
+    ///   list already holds replaces that event's whole list.
+    ///
+    /// The old prototype's `properties` and `ordered`
+    /// (legacy/crates/sims-sim/src/pose/events.rs) do the same.
+    pub fn build(bone: &str, events: &[sims_formats::animation::TimedProperty]) -> Self {
+        let mut by_time = BTreeMap::new();
+        for event in events {
+            let mut properties: Vec<(String, String)> = Vec::new();
+            for (key, value) in &event.pairs {
+                match properties.iter_mut().find(|(k, _)| k == key) {
+                    Some((_, old)) => *old = value.to_ascii_lowercase(),
+                    None => properties.push((key.to_ascii_lowercase(), value.to_ascii_lowercase())),
+                }
+            }
+            by_time.insert(event.time_ms, properties);
+        }
+        Self {
+            bone: bone.to_owned(),
+            events: by_time
+                .into_iter()
+                .map(|(time, properties)| Event { time, properties })
+                .collect(),
+        }
+    }
 }
 
 /// Every clip of the animation files, by name.
@@ -110,19 +168,15 @@ impl Animations {
                     skill: animation.skill,
                     duration: animation.duration_ms.to_bits(),
                     distance: animation.distance.to_bits(),
+                    moving: animation.moving,
                     frames: animation.motions.first().map_or(0, |m| m.frames),
                     motions: animation.motions.len(),
-                    events: animation
+                    tracks: animation
                         .motions
                         .iter()
-                        .any(|m| m.event_lists.iter().any(|list| !list.is_empty())),
-                    event_keys: animation
-                        .motions
-                        .iter()
-                        .flat_map(|m| m.event_lists.iter().flatten())
-                        .flat_map(|event| event.pairs.iter().map(|(key, _)| key.clone()))
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .into_iter()
+                        .flat_map(|m| m.event_lists.iter().map(|list| (&m.bone, list)))
+                        .filter(|(_, list)| !list.is_empty())
+                        .map(|(bone, list)| Track::build(bone, list))
                         .collect(),
                     name: animation.name,
                 };

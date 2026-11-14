@@ -25,6 +25,18 @@ full-state.json.gz (the registry, the neighborhood and the object pointers)
 and pages.json.gz (the memory pages of the people's animators);
 updates.jsonl (one line per lot update: tick, full pass or not, the three
 random streams); events.jsonl (dialogs and other stops); status.json.
+
+--watch NAME=EXPR[:SIZE] (repeatable) also sets a write watchpoint (GDB's Z2;
+nothing is written) on SIZE bytes (default 4) at the address EXPR names, as
+soon as EXPR can be worked out, and logs every write to watch.jsonl with the
+writer's registers, its frame-pointer chain and the top of its stack, the
+lot update it falls in and whether it falls inside the lot update's body.
+EXPR is a start, a hexadecimal address, object:<id> (the object with that
+ID) or person:<id> (the same, once it is a person), followed by steps: +HEX
+adds, @HEX reads the word at the address plus HEX. For example
+person:259@0xadc+0x88 is the direction of person 259's animator. With --watch
+the lot update's entry stays armed, so that each write can be placed inside
+or outside the update.
 """
 import argparse
 import gzip
@@ -194,6 +206,77 @@ class Memory:
         return state, full, pages
 
 
+class Watch:
+    """A write watchpoint given as NAME=EXPR[:SIZE] (see the module's doc)."""
+
+    def __init__(self, text):
+        self.name, _, rest = text.partition('=')
+        expr, _, size = rest.rpartition(':')
+        if not size.isdigit():
+            expr, size = rest, '4'
+        self.size = int(size)
+        assert self.name and expr and self.size in (1, 2, 4, 8), text
+        self.text = text
+        tokens = []
+        i = 0
+        while i < len(expr):
+            j = i + 1
+            while j < len(expr) and expr[j] not in '+@':
+                j += 1
+            tokens.append(expr[i:j])
+            i = j
+        start, self.steps = tokens[0], [(t[0], int(t[1:], 16)) for t in tokens[1:]]
+        assert all(op in '+@' for op, _ in self.steps), text
+        self.person = start.startswith('person:')
+        if start.startswith(('object:', 'person:')):
+            self.object, self.start = int(start[7:]), None
+        else:
+            self.object, self.start = None, int(start, 16)
+        self.address = None
+        self.value = None
+
+    def resolve(self, m, sim):
+        """The address, or None while a pointer on the way is 0 or the object does not exist."""
+        if self.object is None:
+            a = self.start
+        else:
+            if sim is None:
+                return None
+            reg = m.word(sim + 0xb0)
+            first, end = m.word(reg + 0x18), m.word(reg + 0x1c)
+            a = next((p for p in (m.word(q) for q in range(first, end, 4)) if p and m.object_id(p) == self.object), 0)
+            if not a or (self.person and m.half(m.word(a + 0x118) + 0x12) != 2):
+                return None
+        for op, n in self.steps:
+            if op == '+':
+                a = (a + n) & 0xffffffff
+            else:
+                a = m.word(a + n)
+                if a < 0x10000:
+                    return None
+        return a
+
+    def read(self, m):
+        return m.read(self.address, self.size).hex()
+
+
+def frame_chain(m, ebp, n=24):
+    """The return addresses along the frame-pointer chain from ebp (as far as it is readable)."""
+    out = []
+    for _ in range(n):
+        if ebp < 0x10000:
+            break
+        try:
+            out.append(m.word(ebp + 4))
+            nxt = m.word(ebp)
+        except MemoryError:
+            break
+        if nxt <= ebp:
+            break
+        ebp = nxt
+    return out
+
+
 def parse_set(text):
     """'1-100,110-1000/10' -> set of update numbers."""
     out = set()
@@ -250,6 +333,8 @@ def main():
                     'dumped (dump-NNNN/), e.g. 14,47; needs --guest-dir')
     ap.add_argument('--guest-dir', type=Path, help='the guest directory on the host (the container\'s /g), '
                     'where QEMU writes the dump before it is moved to the output')
+    ap.add_argument('--watch', action='append', default=[], type=Watch,
+                    help='NAME=EXPR[:SIZE]: log every write to these bytes to watch.jsonl (see above)')
     ap.add_argument('--resume', action='store_true',
                     help='take over a guest that an earlier run of this script left stopped at a breakpoint '
                          '(it was killed, not detached): continue its output directory and numbering')
@@ -261,6 +346,7 @@ def main():
     out = args.output
     out.mkdir(parents=True, exist_ok=args.resume)
     events = open(out / 'events.jsonl', 'a')
+    watch_log = open(out / 'watch.jsonl', 'a') if args.watch else None
     updates_log = open(out / 'updates.jsonl', 'a')
     status = dict(started=time.time(), updates=0, state='attaching', settings={k: str(v) for k, v in vars(args).items()})
 
@@ -289,6 +375,47 @@ def main():
             breaks.discard(a)
 
     sims_cr3 = None
+    sim = None
+    in_update = False
+    watches = args.watch
+    pending = list(watches)
+    armed_watches = {}
+
+    def arm_watches(m):
+        for w in list(pending):
+            try:
+                a = w.resolve(m, sim)
+                if a is not None:
+                    w.address = a
+                    w.value = w.read(m)
+            except MemoryError:
+                a = None
+            if a is None:
+                continue
+            remote.set_watch(a, w.size)
+            armed_watches[a] = w
+            pending.remove(w)
+            event(kind='watch_armed', name=w.name, expr=w.text, address=a, value=w.value, update=updates)
+
+    def watch_hit(reply, regs, m):
+        hit = int(reply.split('watch:')[1].split(';')[0], 16)
+        w = armed_watches.get(hit) or next((w for w in armed_watches.values()
+                                             if w.address <= hit < w.address + w.size), None)
+        row = dict(update=updates + (1 if in_update else 0), in_update=in_update, address=hit,
+                   name=w.name if w else None, registers=regs, eip=regs['eip'])
+        try:
+            row['tick'] = m.word(sim + 0x98) if sim else None
+            if w:
+                row['before'], w.value = w.value, w.read(m)
+                row['after'] = w.value
+            row['frames'] = frame_chain(m, regs['ebp'])
+            row['stack'] = m.read(regs['esp'], 0x400).hex()
+        except MemoryError as e:
+            row['error'] = str(e)
+        row['time'] = time.time()
+        watch_log.write(json.dumps(row) + '\n')
+        watch_log.flush()
+
     baseline = False
     updates = 0
     elsewhere = 0
@@ -306,6 +433,11 @@ def main():
                 remote.clear_break(a)
         for a in ((RETURN,) if baseline else (ENTRY,)) + (DIALOG_SHOW, DIALOG_RESULT, DIALOG_READ):
             arm(a)
+        if watches:
+            arm(ENTRY)
+            if args.resume:
+                # Whether the guest is inside a lot update is known again at its next entry or return.
+                in_update = None
         save_status(state='running', breaks=sorted(breaks))
         first = args.resume
         while updates < args.updates:
@@ -335,6 +467,9 @@ def main():
                 event(kind='took_over_at_return', last=last, now=now)
                 if all(last[k] == now[k] for k in now):
                     raise RuntimeError('took over at a return already recorded; refusing to guess')
+            if not took_over and 'watch:' in reply:
+                watch_hit(reply, regs, m)
+                continue
             if pc not in breaks:
                 event(kind='unexpected_stop', reply=reply, registers=regs)
                 raise RuntimeError(f'unexpected stop at {pc:#x}: {reply}')
@@ -348,6 +483,7 @@ def main():
             if foreign:
                 event(kind='foreign_stop', pc=pc, cr3=cr3)
             elif pc == ENTRY:
+                sim = regs['ecx']
                 if lot == args.lot and not baseline:
                     sims_cr3 = cr3
                     t0 = time.time()
@@ -360,19 +496,25 @@ def main():
                     baseline = True
                     event(kind='baseline', tick=state['tick'], lot=lot, cr3=cr3, teb=fs_base, seconds=time.time() - t0,
                           packets=remote.packets, sim=regs['ecx'])
-                    disarm(ENTRY)
+                    if not watches:
+                        disarm(ENTRY)
                     arm(RETURN)
-                elif lot == args.lot and updates + 1 in dump_set:
-                    t0 = time.time()
-                    n = dump(args.container, args.guest_dir, out / f'dump-{updates + 1:04d}', regs, raw)
-                    event(kind='dump', update=updates + 1, bytes=n, seconds=time.time() - t0)
-                    disarm(ENTRY)
+                    in_update = True
+                elif lot == args.lot and baseline:
+                    in_update = True
+                    if updates + 1 in dump_set:
+                        t0 = time.time()
+                        n = dump(args.container, args.guest_dir, out / f'dump-{updates + 1:04d}', regs, raw)
+                        event(kind='dump', update=updates + 1, bytes=n, seconds=time.time() - t0)
+                    if not watches:
+                        disarm(ENTRY)
                 else:
                     elsewhere += 1
                     if elsewhere in (1, 10, 100) or elsewhere % 1000 == 0:
                         event(kind='entry_elsewhere', lot=lot, cr3=cr3, count=elsewhere)
             elif pc == RETURN:
                 sim = regs['ebx']
+                in_update = False
                 if lot != args.lot:
                     event(kind='return_elsewhere', lot=lot)
                 else:
@@ -417,13 +559,21 @@ def main():
                 event(**row)
                 if pc == DIALOG_SHOW:
                     save_status(dialog=dict(update=updates + 1, record=record, shown=time.time()))
+            if not foreign and pending:
+                arm_watches(m)
             # Step past the breakpoint we stopped at (if it is still armed).
             armed = pc in breaks
             if armed:
                 remote.clear_break(pc)
-            remote.step()
+            reply = remote.step()
             if armed:
                 remote.set_break(pc)
+            if 'watch:' in reply:
+                # The instruction stepped over wrote a watched address.
+                regs, raw = remote.registers()
+                regs = {k: v for k, v in regs.items() if not k.startswith('_')}
+                regs.update(fs_base=struct.unpack_from('<I', raw, 64)[0], cr3=struct.unpack_from('<I', raw, 84)[0])
+                watch_hit(reply, regs, Memory(remote))
         event(kind='complete', updates=updates)
         save_status(state='complete')
     except BaseException as e:
@@ -436,6 +586,8 @@ def main():
                 remote.interrupt()
             for a in list(breaks):
                 remote.clear_break(a)
+            for a, w in armed_watches.items():
+                remote.clear_watch(a, w.size)
         finally:
             remote.detach()
 

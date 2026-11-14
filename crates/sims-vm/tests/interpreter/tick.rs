@@ -294,6 +294,27 @@ fn queued_removals_go_after_a_full_pass_only() {
 }
 
 #[test]
+fn registry_byte_0x12_is_cleared_on_a_tick_count_that_is_a_multiple_of_40() {
+    // 0x4424cb: after a full pass, once the update has counted its tick.
+    let mut fx = lot(sleeper());
+    fx.thread(LAMP, 4096, &[3]);
+    fx.world.neighbors.relationships_changed = true;
+    fx.world.ticks = 38;
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(fx.world.ticks, 39);
+    assert!(fx.world.neighbors.relationships_changed);
+    // A partial pass leaves it.
+    fx.world.globals[17] = 1;
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(fx.world.ticks, 39);
+    assert!(fx.world.neighbors.relationships_changed);
+    fx.world.globals[17] = 0;
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(fx.world.ticks, 40);
+    assert!(!fx.world.neighbors.relationships_changed);
+}
+
+#[test]
 fn no_selected_sim_fails_loudly() {
     let mut fx = lot(sleeper());
     fx.thread(LAMP, 4096, &[3]);

@@ -20,7 +20,71 @@ pub struct Options<'a> {
     /// dialog with one button takes none.
     pub answers: Vec<u8>,
     pub snapshot: Option<&'a Path>,
+    /// When the house view draws a frame ([`Frames`]).
+    pub frames: Frames,
 }
+
+/// When the house view draws a frame, as far as drawing writes the
+/// simulation's state (`sims_vm`'s `frame.rs`). The game's main loop and
+/// the window system decide that, not the simulation, so it is an input
+/// here. Tick 0 means before the first tick.
+///
+/// The default, `0,1,2,3,33+`, follows a capture of the original running
+/// the Goth house with no input but the dialog answers, with a hardware
+/// watchpoint on the house view's draw guard (`docs/decisions.md`): it
+/// drew before the first lot update, after updates 1, 2 and 3 (many
+/// times while a dialog waited), after update 33, and not after updates
+/// 4 to 32 or 34 to 45. The frames after 34 on are not in that capture;
+/// on this house they change nothing (the state after tick 232 is the
+/// same with and without them). Frames after 1 to 3 change nothing either.
+/// The one that matters is after 33: it draws person 259, made in tick 6,
+/// for the first time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frames {
+    /// Ticks after which a frame is drawn.
+    pub after: Vec<u32>,
+    /// A frame after every tick from this one on.
+    pub from: Option<u32>,
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self {
+            after: vec![0, 1, 2, 3],
+            from: Some(33),
+        }
+    }
+}
+
+impl Frames {
+    /// Reads a list such as `0,33+`: a tick number draws a frame after
+    /// that tick (0: before the first), and `N+` after every tick from N
+    /// on. `none` draws no frame.
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut frames = Self {
+            after: Vec::new(),
+            from: None,
+        };
+        if text == "none" {
+            return Some(frames);
+        }
+        for part in text.split(',') {
+            match part.strip_suffix('+') {
+                Some(n) => frames.from = Some(n.parse().ok()?),
+                None => frames.after.push(part.parse().ok()?),
+            }
+        }
+        Some(frames)
+    }
+
+    /// Whether a frame is drawn after tick `tick`.
+    pub fn after(&self, tick: u32) -> bool {
+        self.after.contains(&tick) || self.from.is_some_and(|from| tick >= from)
+    }
+}
+
+/// The level the house view shows: the ground.
+const VIEW_LEVEL: i8 = 1;
 
 pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     let install = Install::detect(options.root)?;
@@ -140,6 +204,7 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     // ground level's object grid.
     let reconciled = interpreter.reconcile_controllers(&mut world)?;
     let repaired = world.repair_grid()?;
+    world.finish_object_read();
     let queued_again = world.removals.len();
     // The original now works out the lot's rooms from the walls it has
     // read. That makes it give every object its room and ask each object's
@@ -193,7 +258,8 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
         let counted = interpreter.before_frame(&mut world)?;
         finished = Some((made || made_again, sim, counted.len()));
     }
-    // The ticks: one lot update each (sims_vm's `tick.rs`).
+    // The ticks: one lot update each (sims_vm's `tick.rs`), with the
+    // house view's frames between them.
     let start = world.ticks;
     let mut ticked = Vec::new();
     let mut failed = None;
@@ -205,7 +271,15 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
         let mut player = Answers {
             queue: options.answers.iter().copied().collect(),
         };
+        if options.frames.after(0)
+            && let Err(error) = interpreter.draw_frame(&mut world, VIEW_LEVEL)
+        {
+            failed = Some(format!("the frame before tick 1 failed: {error}"));
+        }
         for tick in 1..=options.ticks {
+            if failed.is_some() {
+                break;
+            }
             match interpreter.lot_update(&mut world, &tuning, &mut player) {
                 Ok(update) => ticked.push(update),
                 Err(error) => {
@@ -215,6 +289,11 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
                     ));
                     break;
                 }
+            }
+            if options.frames.after(tick)
+                && let Err(error) = interpreter.draw_frame(&mut world, VIEW_LEVEL)
+            {
+                failed = Some(format!("the frame after tick {tick} failed: {error}"));
             }
         }
     }

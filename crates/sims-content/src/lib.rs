@@ -18,7 +18,7 @@ mod install;
 mod neighborhood;
 mod people;
 
-pub use animations::{Animations, Clip};
+pub use animations::{Animations, Clip, Event, Track};
 pub use catalog::{Catalog, Object};
 pub use error::Error;
 pub use index::{Index, Member, Resource};

@@ -41,11 +41,10 @@ pub struct Neighbors {
     /// that has none (0x42a8a1).
     pub inventories: Vec<Inventory>,
     /// Registry byte 0x12, which a write to a relationship between
-    /// people sets (0x44485b).
-    ///
-    /// **Unverified** where it starts: the capture has it 0 at the resize
-    /// and 1 after the object read, which is not ported, so it is false
-    /// here until a script writes a relationship.
+    /// people sets (0x44485b). The end of the object read sets it too
+    /// ([`crate::World::finish_object_read`], 0x43fc89), and the end of a
+    /// full lot update clears it on a tick count that is a multiple of 40
+    /// (0x4424cb). Nothing else is known to read it but that clear.
     pub relationships_changed: bool,
 }
 

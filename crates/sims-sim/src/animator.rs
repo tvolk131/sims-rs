@@ -36,6 +36,9 @@ pub const UNSET: F32 = F32::from_bits(0xc479_c000);
 /// (0x67343c).
 pub const EPSILON: F32 = F32::from_bits(0x3586_37bd);
 
+/// How far past the clip's end an event may lie (0x66d738): 40.0.
+const EVENT_SLACK: F32 = F32::from_bits(0x4220_0000);
+
 /// What a layer is given as its duration when a clip that plays once has
 /// ended (0x597e11): 1e8.
 const ENDED_DURATION: F32 = F32::from_bits(0x4cbe_bc20);
@@ -63,6 +66,13 @@ const ENDED_DURATION: F32 = F32::from_bits(0x4cbe_bc20);
 /// The destination is the constructor's 0. The first tick finds the
 /// position unset and places the animator, which writes the destination
 /// too, so it never shows.
+///
+/// Byte +0xdb ([`Animator::undrawn`]) is the constructor's 1: the reset
+/// does not touch it. The house view's first frame clears it. In a
+/// capture of the original loading the Goth house, a watchpoint saw a
+/// frame drawn before the first lot update, and person 18's +0xd8 to
+/// +0xdb already held 0 then. The walking flag is the reset's 0
+/// (0x589262).
 pub const LOADED: Animator = Animator {
     clock: 0,
     rate: F32::from_bits(0x3f80_0000),
@@ -89,6 +99,8 @@ pub const LOADED: Animator = Animator {
     skin_dirty: false,
     profile_stale: true,
     motion: Motion::NONE,
+    undrawn: true,
+    walking: false,
 };
 
 /// A person's animator: the fields of the object at person +0xadc that
@@ -157,6 +169,19 @@ pub struct Animator {
     pub profile_stale: bool,
     /// Where the animator is along a route and through a turn.
     pub motion: Motion,
+    /// Byte +0xdb: the house view has not drawn the person yet. The
+    /// constructors set it (0x584766, 0x584dab) and nothing else does;
+    /// the first draw clears it, unsets the position and places the
+    /// animator again (`frame.rs` in sims-vm, 0x590c05). The animator's
+    /// bytes +0xd9 and +0xda, which the constructors also set and the
+    /// draw goes through after this one, are not kept: see there.
+    pub undrawn: bool,
+    /// +0x19c: the animator walks. Starting or going on with a walk sets
+    /// it (0x58ed72); a turn on the spot, its start (0x58df01), a new
+    /// animator (0x587de2) and the reset (0x589262) clear it. The walk's
+    /// start reads it (0x58ed1d): while it is set, a walk goes on without
+    /// asking whether to stop.
+    pub walking: bool,
 }
 
 /// What the animator keeps while it follows a route (states 3 to 10):
@@ -240,20 +265,27 @@ pub struct Layer {
     /// +0x44: fading in or out.
     pub fading: bool,
     /// +0x68: an interrupt ends the clip; -1 until Animate Sim sets it.
+    /// A timed event can set it too (0x5912fd).
     pub interruptible: i32,
+    /// For each motion of the clip that has timed events, in the order of
+    /// the motions, the index of the next event its binding's cursor
+    /// points at (binding +8, cursor +4). A new layer's cursors point at
+    /// the first event (0x594778).
+    pub cursors: Vec<i32>,
 }
 
 impl Layer {
     /// A new layer (0x5978ef, then 0x597a88 from 0x592726): priority 1,
     /// weight 1, at the clip's start or, backward, at its end, stopped
     /// at the end of the clip. `frames` is the frame count of the clip's
-    /// first motion, and `bound` says whether a motion binds to a bone of
-    /// the skeleton.
+    /// first motion, `bound` says whether a motion binds to a bone of
+    /// the skeleton, and `tracks` is how many motions have timed events.
     pub fn start(
         clip: &str,
         clip_duration: F32,
         frames: u32,
         bound: bool,
+        tracks: usize,
         reverse: bool,
         now: i32,
     ) -> Self {
@@ -275,6 +307,7 @@ impl Layer {
             mode: 0,
             fading: false,
             interruptible: -1,
+            cursors: vec![0; tracks],
         };
         layer.set_speed(F32::from_bits(if reverse {
             0xbf80_0000
@@ -314,13 +347,19 @@ impl Layer {
     /// the event times. Arithmetic is the FPU's under the game's control
     /// word (24-bit significands).
     ///
-    /// The layer's events are dispatched between the event times and
-    /// [`Layer::commit`] (0x5912fd, through the callback at 0x6f7690);
-    /// that is not ported, so the caller refuses a clip with events. The
-    /// pose the layer samples is presentation.
+    /// When it returns [`Advance::Events`], the caller asks [`Layer::due`]
+    /// for each motion's events and handles them (0x5912fd, through the
+    /// callback at 0x6f7690), then calls [`Layer::commit`]. The pose the
+    /// layer samples is presentation.
+    ///
+    /// At the clip's end the layer is marked ended. A clip that stops
+    /// (end mode 0) stops at its end: speed 0, the phase held to 0 to 1.
+    /// A clip that repeats (end mode 1) goes on at the same speed, from
+    /// the part of the phase past a whole number (0x597dca, through the C
+    /// runtime's floor, 0x636ac9) when the phase went below 0 or above 1.
     ///
     /// Fails for what is not ported: a layer fading in or out, and the
-    /// end of a clip that repeats, reverses or fades out.
+    /// end of a clip that reverses or fades out (end modes 2 and 3).
     pub fn update(&mut self, now: i32) -> Result<Advance, String> {
         self.previous = self.current;
         self.current = now;
@@ -351,7 +390,21 @@ impl Layer {
             } else {
                 !matches!(phase.partial_cmp(&zero), Some(Ordering::Greater))
             };
-            if self.ended {
+            if self.ended && self.mode == 1 {
+                // 0x597dca: a clip that repeats keeps its speed and
+                // starts over at the part of the phase past a whole
+                // number, when the phase is below 0 or above 1.
+                let fraction = (phase - phase.floor()).single();
+                // Below 0 or not a number: the comparison is not "at
+                // least 0".
+                let below = !matches!(
+                    phase.partial_cmp(&zero),
+                    Some(Ordering::Greater | Ordering::Equal)
+                );
+                if below || phase > one {
+                    self.phase = fraction.to_f32();
+                }
+            } else if self.ended {
                 if self.mode != 0 {
                     return Err(format!(
                         "a layer with end mode {} reached its clip's end (0x597d28), which is \
@@ -379,6 +432,101 @@ impl Layer {
         } else {
             Advance::Silent
         })
+    }
+
+    /// Which events of the clip's motion `track` are due in this update,
+    /// in the order they are handled, as indices into `events`, each
+    /// given as its time and whether it has any property. Moves the
+    /// motion's cursor past them (0x597ff9 to 0x598208).
+    ///
+    /// The original visits the layer's bindings in order and runs this
+    /// for each binding whose motion has events, whose bone's priority
+    /// (bone +0x68) is at most the layer's (+0x14). A bone's priority is
+    /// -10000 unless a layer that overrides it binds the bone (layer
+    /// +0x58, 0x5991fd), and no layer ported does, so every binding takes
+    /// part.
+    ///
+    /// An event is handled only if its time is from 0 to the clip's
+    /// duration plus 40 (0x66d738), truncated, and it has a property;
+    /// other events are passed over. Forward (a speed of at least 0):
+    ///
+    /// 1. If the event time went back since the update before, the clip
+    ///    went round: every event from the cursor to the end is handled,
+    ///    and the cursor goes back to the first event (0x5947c3).
+    /// 2. From the cursor, every event up to the event time is handled.
+    ///    The cursor stops at the first one after it.
+    ///
+    /// Backward the same with the directions swapped, with one
+    /// difference the code has: going round, the cursor steps back
+    /// (0x5947bb) before each event, not after, and then goes to the last
+    /// event (0x5947cc).
+    ///
+    /// The cursor steps after its event is handled, and the handler
+    /// (0x5912fd) never moves it, so working out the events first and
+    /// handling them after gives the same order.
+    pub fn due(&mut self, track: usize, events: &[(i32, bool)]) -> Result<Vec<usize>, String> {
+        let upper = (self.clip_duration.ext() + EVENT_SLACK.ext())
+            .single()
+            .to_i32_truncate();
+        let (event_time, previous) = (self.event_time, self.previous_event_time);
+        let forward = matches!(
+            self.speed.ext().partial_cmp(&Ext::ZERO),
+            Some(Ordering::Greater | Ordering::Equal)
+        );
+        let cursor = self
+            .cursors
+            .get_mut(track)
+            .ok_or_else(|| format!("the clip {:?} has no motion {track} with events", self.clip))?;
+        let valid = |c: i32| usize::try_from(c).ok().filter(|&c| c < events.len());
+        let handled = |(time, any): (i32, bool)| (0..=upper).contains(&time) && any;
+        let mut due = Vec::new();
+        if forward {
+            if event_time < previous {
+                while let Some(i) = valid(*cursor) {
+                    if handled(events[i]) {
+                        due.push(i);
+                    }
+                    *cursor += 1;
+                }
+                *cursor = 0;
+            }
+            while let Some(i) = valid(*cursor) {
+                let (time, _) = events[i];
+                if (0..=upper).contains(&time) {
+                    if time > event_time {
+                        break;
+                    }
+                    if handled(events[i]) {
+                        due.push(i);
+                    }
+                }
+                *cursor += 1;
+            }
+        } else {
+            if event_time > previous {
+                loop {
+                    *cursor -= 1;
+                    let Some(i) = valid(*cursor) else { break };
+                    if handled(events[i]) {
+                        due.push(i);
+                    }
+                }
+                *cursor = events.len() as i32 - 1;
+            }
+            while let Some(i) = valid(*cursor) {
+                let (time, _) = events[i];
+                if (0..=upper).contains(&time) {
+                    if time < event_time {
+                        break;
+                    }
+                    if handled(events[i]) {
+                        due.push(i);
+                    }
+                }
+                *cursor -= 1;
+            }
+        }
+        Ok(due)
     }
 
     /// The end of the update (0x59861f): the event time reached becomes the
@@ -431,8 +579,9 @@ impl Animator {
     ///   the destination stays.
     /// - The route's segment is -1 ([`Motion`]).
     /// - The posture is -1, the carry selection -1, the carry mode 0, the
-    ///   state 3 (standing), the next foreground clip's raised priority is
-    ///   set again, and the appearance is to be read again (+0xd8).
+    ///   state 3 (standing), the walk flag clear (+0x19c), the next
+    ///   foreground clip's raised priority is set again, and the
+    ///   appearance is to be read again (+0xd8).
     /// - The foreground clip is removed and the selection set to -1
     ///   (virtual function 0xfc, 0x586b63); the blend, carry and base
     ///   slots are emptied (0x592878). Removing a layer marks the skin's
@@ -466,6 +615,7 @@ impl Animator {
         self.promote = true;
         self.carry_mode = 0;
         self.state = 3;
+        self.walking = false;
         self.profile_stale = true;
         self.selection = -1;
         if self.base {

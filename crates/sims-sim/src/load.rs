@@ -506,6 +506,16 @@ impl World {
         ]
     }
 
+    /// The end of the object read (0x43fc02), after load steps 8 and 9:
+    /// registry byte 0x12 ([`crate::neighbors::Neighbors::relationships_changed`])
+    /// is set, whatever the steps found (0x43fc89). A hardware watchpoint
+    /// on the byte in a capture of the original loading the Goth house
+    /// stopped there, with the byte going from 0 to 1. The function also
+    /// clears registry byte 0x11 when it starts, which is not kept here.
+    pub fn finish_object_read(&mut self) {
+        self.neighbors.relationships_changed = true;
+    }
+
     /// Load step 9: clears every cell of the ground level's object grid
     /// that names an object which is not there (0x443cb3). Returns the
     /// cells cleared, in the order the original visits them.

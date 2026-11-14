@@ -42,10 +42,17 @@
 //!    19 are cleared. The finished layer stays in the foreground slot
 //!    until the next clip clears it.
 //!
+//! Clip number 0 stops the foreground clip instead (0x5897aa): the
+//! foreground slot is cleared as in step 1, the animator takes the state
+//! of the person's posture, the pickup flag and person word 19 are
+//! cleared, and the true branch is taken. It does not touch whether a
+//! clip plays (+0xa0), nor the base layer.
+//!
 //! **Not ported**, failing loudly: the base and carry slots (flag bits
-//! 0x01 and 0x10 alone), clip number 0 (which stops the clip), names
+//! 0x01 and 0x10 alone), names
 //! listed anywhere but the global animation tables (byte 4 other than 3),
-//! a clip that is missing or has timed events, and a person whose posture
+//! a clip that is missing, the timed events `clip_events.rs` does not
+//! port, and a person whose posture
 //! is 1 or 2 when its clip is done. The original also notes an unexpected
 //! event in its log when logging is on (0x6f2a44); that is not modeled.
 
@@ -111,17 +118,24 @@ impl Machine<'_, '_> {
             )));
         }
         if id == 0 {
-            return Err(Trap::Unsupported(
-                "Animate Sim with clip 0, which stops the foreground clip (0x592904), is not \
-                 ported"
-                    .into(),
-            ));
+            // 0x5897aa: the foreground slot is cleared as below (0x586b63),
+            // the animator takes the state of the person's posture
+            // (0x592904), and the pickup flag and person word 19 are
+            // cleared. Whether a clip plays (+0xa0) stays as it is.
+            if a.foreground.take().is_some() {
+                a.skin_dirty = true;
+            }
+            a.selection = -1;
+            self.posture_state(a)?;
+            a.pickup = 0;
+            self.clear_pickup_word()?;
+            return Ok(Flow::Branch(true));
         }
         if !a.playing {
             // 0x5893b3 first reads the person's appearance again if the
             // animator says so.
             read_appearance_if_stale(self.world, self.program, self.me, &mut a.profile_stale)?;
-            let (name, duration, frames, bound) = self.clip(operands, id)?;
+            let (name, duration, frames, bound, tracks) = self.clip(operands, id)?;
             a.events.clear();
             // 0x586b63: the foreground slot is cleared (0x592878) and the
             // selection set to -1. A layer there is removed from the skin
@@ -137,7 +151,7 @@ impl Machine<'_, '_> {
             a.selection = -1;
             a.slow = flags & 0x80 != 0;
             let now = a.clock_at(self.world.ticks as i32);
-            let mut layer = Layer::start(&name, duration, frames, bound, reverse, now);
+            let mut layer = Layer::start(&name, duration, frames, bound, tracks, reverse, now);
             // 0x592726: the foreground slot's layer takes the raised
             // priority once. The blend slot (+0x10) is never filled here.
             if a.promote {
@@ -191,19 +205,30 @@ impl Machine<'_, '_> {
         // 0x589c25: the clip is done. Nothing plays; the foreground layer
         // stays in its slot.
         a.playing = false;
-        // 0x592904: the state of the person's posture.
-        let posture = self.person_word(POSTURE)?;
-        match posture {
-            0 => a.state = 3,
-            1 => a.state = 1,
-            2 => a.state = 2,
-            _ => {}
-        }
+        self.posture_state(a)?;
         // Virtual function 0x58 (0x590430): the base layer.
         let interpreter = self.interpreter();
         let flags = interpreter.base_flags(self.world, self.me)?;
         interpreter.update_base(self.world, self.me, a, flags)?;
         a.pickup = 0;
+        self.clear_pickup_word()?;
+        Ok(Flow::Branch(true))
+    }
+
+    /// The state of the person's posture (0x592904): 3 standing, 1 or 2
+    /// for postures 1 and 2; any other posture leaves the state.
+    fn posture_state(&self, a: &mut Animator) -> Result<(), Trap> {
+        match self.person_word(POSTURE)? {
+            0 => a.state = 3,
+            1 => a.state = 1,
+            2 => a.state = 2,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Person word 19 cleared (person +0x5b2), as the end of a clip does.
+    fn clear_pickup_word(&mut self) -> Result<(), Trap> {
         let me = self.me;
         let words = &mut self
             .world
@@ -216,7 +241,7 @@ impl Machine<'_, '_> {
             .get_mut(PICKUP_WORD)
             .ok_or_else(|| Trap::Invalid(format!("person data has no word {PICKUP_WORD}")))? = 0;
         self.world.routing.unknown_words.remove(&(me, PICKUP_WORD));
-        Ok(Flow::Branch(true))
+        Ok(())
     }
 
     /// Returns 2: the thread yields. A tree that must finish without
@@ -256,8 +281,8 @@ impl Machine<'_, '_> {
     }
 
     /// The clip a number names (0x5893b3): its name, its duration, the
-    /// frame count of its first motion and whether a motion binds to a
-    /// bone.
+    /// frame count of its first motion, whether a motion binds to a bone,
+    /// and how many motions have timed events.
     ///
     /// Only names listed in the global animation tables (byte 4 is 3,
     /// 0x59dd16) are ported: the number counts from 1 into string table
@@ -268,7 +293,7 @@ impl Machine<'_, '_> {
         &self,
         operands: &[u8; 8],
         id: i16,
-    ) -> Result<(String, sims_core::F32, u32, bool), Trap> {
+    ) -> Result<(String, sims_core::F32, u32, bool, usize), Trap> {
         let source = operands[4] as i8;
         if source != 3 {
             return Err(Trap::Unsupported(format!(
@@ -305,16 +330,12 @@ impl Machine<'_, '_> {
             .animations
             .clip(name)
             .map_err(|e| Trap::Unsupported(format!("Animate Sim: {e}")))?;
-        if clip.events {
-            return Err(Trap::Unsupported(format!(
-                "the clip {name:?} has timed events; dispatching them (0x5912fd) is not ported"
-            )));
-        }
         Ok((
             name.clone(),
             sims_core::F32::from_bits(clip.duration),
             clip.frames,
             clip.motions > 0,
+            clip.tracks.len(),
         ))
     }
 }

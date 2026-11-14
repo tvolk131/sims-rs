@@ -355,6 +355,28 @@ impl Ext {
         }
     }
 
+    /// The C runtime's `floor` (0x636ac9): the largest integer not above
+    /// the value, exact. Zeros, infinities and NaN come back as they are;
+    /// a value between 0 and 1 gives +0, one between -1 and 0 gives -1.
+    /// The runtime takes a double; a value a double holds exactly, as any
+    /// stored float is, floors the same either way.
+    pub fn floor(self) -> Self {
+        if self.class != Class::Finite || self.exponent >= 0 {
+            return self;
+        }
+        let shift = (-i64::from(self.exponent)).min(64) as u32;
+        let (integer, fraction) = if shift >= 64 {
+            (0, self.mantissa != 0)
+        } else {
+            (
+                self.mantissa >> shift,
+                self.mantissa & ((1u64 << shift) - 1) != 0,
+            )
+        };
+        let magnitude = u128::from(integer) + u128::from(self.negative && fraction);
+        Self::finite(self.negative, magnitude, 0)
+    }
+
     /// `FSQRT`. Negative inputs give NaN; `-0` stays `-0`.
     pub fn sqrt(self) -> Self {
         match self.class {
