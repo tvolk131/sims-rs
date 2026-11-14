@@ -22,6 +22,16 @@ my $dst=fileno($fh)==fileno(STDIN)?$s:\*STDOUT;
 my $off=0; while($off<$n) { my $w=syswrite($dst,$buf,$n-$off,$off); die $! unless $w; $off+=$w; }
 }}'''
 
+class ProtocolError(RuntimeError):
+    """A reply the client cannot trust, or a request it must not send. These
+    checks are explicit (not asserts) so they hold under `python -O` too."""
+
+
+def check(ok, *what):
+    if not ok:
+        raise ProtocolError(*what)
+
+
 REGS = ['eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi', 'eip', 'eflags', 'cs', 'ss', 'ds', 'es', 'fs', 'gs']
 
 
@@ -36,7 +46,7 @@ class Remote:
 
     def send(self, payload):
         allowed = ('m', 'Z1,', 'z1,', 'Z2,', 'z2,', 'qXfer:features:read:', 'p')
-        assert payload in ('?', 'g', 'c', 's', 'D', 'qSupported') or payload.startswith(allowed), payload
+        check(payload in ('?', 'g', 'c', 's', 'D', 'qSupported') or payload.startswith(allowed), 'refused', payload)
         data = payload.encode()
         self.p.stdin.write(b'$' + data + b'#' + f'{sum(data) & 255:02x}'.encode())
         self.packets += 1
@@ -63,8 +73,13 @@ class Remote:
             if b == ord('#'):
                 break
             wire.append(b)
-        check = bytes([self._byte(deadline), self._byte(deadline)])
-        assert sum(wire) & 255 == int(check, 16), 'checksum'
+        digits = bytes([self._byte(deadline), self._byte(deadline)])
+        try:
+            expected = int(digits, 16)
+        except ValueError:
+            raise ProtocolError('bad checksum digits', digits) from None
+        if sum(wire) & 255 != expected:
+            raise ProtocolError(f'checksum {sum(wire) & 255:02x} != {expected:02x}', bytes(wire[:64]))
         self.p.stdin.write(b'+')
         out = bytearray()
         i = 0
@@ -90,7 +105,7 @@ class Remote:
 
     def stop_reply(self):
         r = self.command('?')
-        assert r[:1] in ('T', 'S'), r
+        check(r[:1] in ('T', 'S'), r)
         self.stopped = True
         return r
 
@@ -140,21 +155,21 @@ class Remote:
 
     def set_break(self, address):
         r = self.command(f'Z1,{address:x},1')
-        assert r == 'OK', (hex(address), r)
+        check(r == 'OK', hex(address), r)
 
     def clear_break(self, address):
         r = self.command(f'z1,{address:x},1')
-        assert r in ('OK', 'E22'), (hex(address), r)
+        check(r in ('OK', 'E22'), hex(address), r)
 
     def set_watch(self, address, size):
         """A write watchpoint (GDB's Z2). The guest stops after the writing instruction; the stop
         reply holds `watch:<address>`."""
         r = self.command(f'Z2,{address:x},{size:x}')
-        assert r == 'OK', (hex(address), size, r)
+        check(r == 'OK', hex(address), size, r)
 
     def clear_watch(self, address, size):
         r = self.command(f'z2,{address:x},{size:x}')
-        assert r in ('OK', 'E22'), (hex(address), size, r)
+        check(r in ('OK', 'E22'), hex(address), size, r)
 
     def detach(self):
         try:
