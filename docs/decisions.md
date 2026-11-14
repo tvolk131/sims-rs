@@ -132,6 +132,246 @@ roadmap section for what the simulation needs.
 What would reopen it: a second screenshot (another window size, buy
 mode, the afternoon) that disagrees.
 
+## 2026-11-14: People are no longer drawn mirrored, and the lot lies the right way round
+
+People were drawn as the mirror image of the original's. Now they are
+not, and they stand on the lot the way the lot drawing has it.
+
+**How the mirror was found.** Cassandra Goth (person 16) wears a shirt
+with a pocket protector on one side. Two screenshots of the original
+(House05, sitting on the porch bench and walking on the lawn, both seen
+from the front) show it on her own left. Our drawing put it on her
+right. So the image was mirrored.
+
+**Where it came from.** The file conversion mirrored the X axis
+(`[-x, y, z]`), to get a right-handed frame, as the old prototype's
+renderer did. But our camera reads its frame as the original's renderer
+does: x right, y up, z away from the viewer. So the mirror was never
+undone. A scratch check showed our bones were exactly the X-mirror of
+the original's own composition (0x59615b, ported as
+`sims_sim::pose::absolute`), at rest and mid-clip.
+
+**The fix.** Positions are kept as the files have them. A rotation
+`[x, y, z, w]` becomes `[-x, -y, -z, w]`: the original keeps a turn with
+x, y and z negated (its bone matrix, 0x595f32, negates them again). Each
+bone now lands exactly where the original's composition puts it. A test
+checks this on a chain of bones whose turns do not commute.
+
+**The lot's layout.** Our placement put sim x on model X and sim y on
+model Z. With the house view camera that drew sim +x up the screen. The
+lot drawing's projection (0x4b3c88, `sims_render::camera`), which was
+checked against the original's screen, draws sim +x right and down.
+The original's model matrix (0x592132) puts sim y on X and sim x on Z,
+and turns the skeleton by (direction + 6) eighths. Here the lot is that,
+turned half a turn about the vertical, so that our camera draws it as
+the lot drawing does:
+
+- sim x becomes model −Z and sim y model −X (3 units per tile, as
+  before);
+- a person is turned by θ + π/2 about the vertical, for θ its direction
+  times 45 degrees.
+
+A person still faces (sin θ, −cos θ) in sim x and y, which is the way
+the simulation walks them (the check of person 259 still holds).
+Direction 3 now faces the viewer, not direction 7. A test checks the
+screen directions of sim +x and +y and that direction 3 faces the
+camera.
+
+**What is verified and what is not.**
+
+- Verified against the original: which side is which (the pocket), and
+  that bones compose as the original's code does.
+- Checked only against the lot drawing's projection, not against a
+  person in a screenshot: that sim +x goes right and down. The lot
+  drawing was itself compared with the original.
+- **Unverified:** the pixel scale and offset of a person against the
+  lot, and the camera's exact angle for the 3D people.
+
+The pinned renders of the gated tests change, and so do the viewer's
+demonstration and the tests' facing (direction 3).
+
+## 2026-11-14: Booting a house is a library call: `sims_vm::boot::Lot`
+
+The drawing tracks asked for a way to run a lot one tick at a time and
+read its state in between. The load sequence and the tick loop were in
+`sims boot`. They now live in `sims_vm::boot`:
+
+- `Lot::load` runs the load and reports each step.
+- `Lot::step` runs one lot update, then the house view's frame when the
+  schedule (`Frames`) draws one.
+- `Lot::world` reads the state.
+
+A step that fails in its tick or a frame leaves the lot partway through
+that work, so the lot halts: every later step fails and changes nothing.
+The old CLI stopped there too. The motive constants are worked out at
+the first step rather than at the load, so a load that runs no tick
+doesn't need them, as before.
+
+`sims boot` prints what the library does, and its output is unchanged
+byte for byte: at K = 366 it gives the same hash, and at tick 367 the
+same stop.
+
+Why `sims-vm` and not a new crate: the boot needs the interpreter, the
+linked program and the content loaders, which `sims-vm` already depends
+on. A crate that depends on `sims-vm` reads the world through `&World`
+only, so presentation never writes simulation state.
+
+A frame that fails after its tick still reports that tick's update, as
+the CLI listed it before. Commands from players will enter through
+`Lot` when the command intake exists.
+
+## 2026-11-14: File names hash as Windows-1252 bytes; lookups match the last path component (unverified)
+
+The index places an archive member by the bytes of its name as the
+archive stores them, not by the name decoded to UTF-8: the original's
+file table hashes those bytes, so a decoded `café.iff` landed in the
+wrong bucket and could reverse load order, and so which GUID definition
+wins. A loose file's name is encoded to Windows-1252 before it is hashed
+(the code page a Western Windows hands the game), so a loose file and a
+member of one name stay one entry; a name that is not valid UTF-8 or
+has a character the code page lacks keeps the file system's bytes.
+**Unverified**: the install holds no name outside ASCII, and a
+non-Western code page would differ.
+
+`Index::named` compares a resource's last path component, so a GLOB link
+to `SofaGlobals.iff` finds an archive member `sub\SofaGlobals.iff`. A
+name that holds a directory still matches the whole member name, as
+before, and `Resource::name` keeps the whole name for reporting. Which of several
+such files the original picks stays unverified, as before.
+
+A string table whose leading word is not one of the four version words
+(0, -1, -2, -3) is a Mac `STR#` resource with a big-endian count, even
+when that word would be negative read as a version: 128 strings start
+`00 80`.
+
+On the install, resource order, semi-global links, the census and the
+gated digests are unchanged.
+
+## 2026-11-14: Buy mode is driven by panel presses and confirmed by the mode, the registry and the budget
+
+Scenarios can now use buy mode (`tools/harness/input.py`). There are three
+new steps: `press X Y`, `expect-mode` and `expect-new-object`.
+
+- **Presses on the game's panels work like dialog presses.** The pointer
+  rests, moves over the button, then presses. A plain click was taken late
+  or missed, as on dialogs.
+- **What is checked.** The mode word is lot `+0x36`, read in the running
+  game: 0 in live mode and 2 in buy mode. A purchase is confirmed by new IDs
+  in the lot's registry and by the budget (lot `+0x90`). In buy mode the lot
+  update still returns, with time not advancing, so the steps go on there.
+- **Checked in the original, from a fresh boot.** The scenario:
+  - entered buy mode (mode 2 at update 174);
+  - pressed Seating and took the catalog's first entry, the $80 Werkbunnst
+    chair;
+  - pressed a free lawn spot;
+  - went back to live mode (mode 0 at update 1078).
+
+  At update 878 the registry held a new object, ID 262, at (344, 632) in
+  sixteenths of a tile, level 1. The budget had gone from 2542 to 2462. The
+  screenshots show the chair on the lawn and $2,462.
+- **Unverified.**
+  - A second new object, ID 292 at (-16, -16), off the lot, appeared by the
+    same update. Whether the purchase made it is not checked.
+  - Build mode's number is not known.
+  - The catalog's contents depend on the panel's last state: after a fresh
+    boot, Seating opens on chairs, and in an earlier session it showed beds.
+    A press on an empty spot of the panel once sold an object. Scenarios
+    must start from a known panel state (a fresh boot).
+
+## 2026-11-14: Harness review fixes: the game's identity, watches and pages
+
+A review of `tools/harness` found eight defects in the harness, all fixed
+here, with tests that need no Docker (`tools/harness/test_capture.py`). A
+finding in `scripts/check_repository.py` is fixed separately.
+
+- **The game is pinned.** `guest/launch.sh` checks `Sims.exe` and
+  `version.dll` against their SHA-256 digests and stops for any other build.
+  It writes the verified digests to the share, and `capture.py` records them
+  in `status.json` and as a `game_identity` event. Captures made before this,
+  or of a game started some other way, show it as null. Reopen if the harness
+  has to run another build.
+- **Writes by other processes are not the game's.** QEMU's watchpoints are
+  on virtual addresses, so another process writing the same address stops
+  the guest too. Once the game's CR3 is known, such a write is a
+  `foreign_watch` event, not a row in `watch.jsonl`. This includes a write
+  found while stepping past a breakpoint. Before the first lot update the
+  game's CR3 is not known, so early writes are still not checked.
+- **Watches follow their pointers.** A watch through an object or a pointer
+  is worked out again at every stop in the game. When an animator is
+  replaced, the watchpoint moves to the new one (`watch_moved`), or waits if
+  there is none (`watch_lost`). Writes between the replacement and that stop
+  are missed. A watchpoint set at each change of the pointer itself would
+  catch them; that is not done. Watches that land on the same bytes share
+  one hardware watchpoint, which stays until the last of them leaves.
+- **Pages.** An animator or layer that ends on a page boundary made the
+  snapshot ask for the next page, which it had not read, and the capture
+  ended with a `KeyError`. The last page is now that of the last byte.
+  `pages.json.gz` no longer holds a page past the end of such a block.
+- **`--dump 1` works.** Update 1's entry is the baseline's stop, which never
+  dumped. A run taken over with `--resume` in the middle of a dump redoes it
+  (a dump is complete once its `registers.json` is written).
+- **The stub's checks hold under `python -O`.** The packet checksum and the
+  allowlists that keep `rsp.py` and `qmp.py` read-only were asserts. They are
+  now explicit checks.
+- **Guest jobs.** `guest.py` reserves each job number by creating its file
+  exclusively, so two processes no longer take the same number and lose a
+  job. `click` and `move` pass on the guest job's exit code, and `click`
+  stops if the pointer cannot be placed.
+
+## 2026-11-14: Sound volume, pan, pitch and ducking, from the original's code
+
+The sound player now applies volume, pan, pitch and ducking. Each
+formula was read from the original's code in a memory image of the
+running game (read only, never written); none was observed with sound
+playing. The formulas are in `crates/sims-audio/src/levels.rs`. The
+player's output is now stereo: `render_stereo`, with `render` as its mono
+mix.
+
+- **Volume** is `vol * extvol / 1024`, with `extvol` scaled by the
+  track group's volume (the options' sliders, set by the host) and
+  halved when `main_duckpri` is above the track's `duckpri`. The sound
+  layer turns it into a DirectSound attenuation (0 dB at 1024, -40 dB
+  just above 0, silent at 0), which we turn into a linear gain. A track
+  starts with the HOT track's volume and duck priority.
+- **Pan** is DirectSound's: 512 is the centre, and only the far channel
+  is attenuated. No script in the install writes it.
+- **Pitch** sets an absolute rate, `22050 * 2^((pitch - 3600) / 1200)`,
+  whatever the sample's own rate. Every patch in the install is 22,050
+  Hz, and the TV routines set pitch 2400 for 11,025 Hz files, which this
+  plays at their own rate. Before, samples played at their own rate; a
+  sample that is not 22,050 Hz now plays at the rate its pitch sets. The
+  original adds a second track's pitch and subtracts 3600; which track
+  that is was not found, and it is taken as 3600 (**unverified**).
+- **Ducking.** `main_duckpri` (global 123) holds the largest request of
+  any running thread; a thread's request goes when it ends, as the
+  original's kill routine drops it.
+- **Every register write sets the comparison flags**, as the original's
+  write routine does. Branches after a write (such as
+  `getsrcdatafield r; ifne`) now follow the value written. Before, they
+  followed the last `cmp` or `test`.
+- **`target` (53)** sends a thread's register reads and writes to the
+  newest running thread of the track it names, globals included, and
+  on through that thread's own `target`. A track with no running thread
+  means the thread itself, as the original's null lookup does. The
+  install's scripts use it to fade out and kill music and loops. How the
+  original picks among several threads of one track, and what it does
+  when the target has since ended, are not known.
+- **Sequence groups hold track numbers, not thread IDs.** The ID the
+  original stores in a slot is the one `target` looks up, and scripts
+  pass track numbers to `target`. So two threads of one track no longer
+  end each other. This corrects the previous entry.
+- Levels are applied to notes once per block, after the threads run,
+  and when a thread ends. The original applies them as registers
+  change. 3D position, the
+  second pitch and track priorities are left out.
+- The exponentials use only basic arithmetic, so gains are the same on
+  every platform. A track at full volume, centred, passes its samples
+  through unchanged, so the phone ring and footstep still match their
+  samples bit for bit.
+
+Reopen when a run with sound can be compared, or the second pitch's
+track is found.
+
 ## 2026-11-14: Directory listings are sorted, and paths are spelled as on disk
 
 From the back review of main:

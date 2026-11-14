@@ -27,9 +27,9 @@ the repository, and so do the captures.
 | `prepare_guest.sh` | Makes a new guest directory. It clones the disk, copies the UserData folders and their hashes, and installs `guest/sims-init.sh`. |
 | `guest/sims-init.sh` | PID 1 in the guest. It mounts the host share at `/research` and runs each `/research/cmd/<n>.sh` once. |
 | `guest/prepare_disk.sh` | Replaces `/sims-init.sh` on the cloned disk, using debugfs inside the image. |
-| `guest/launch.sh` | Guest job. It checks the executable's hash, puts the UserData copy in place and checks its hashes, then starts Xvfb (1024x768x16) and `Sims.exe -w -nosound`. |
+| `guest/launch.sh` | Guest job. It checks `Sims.exe` and `version.dll` against pinned SHA-256 digests (another build stops the launch) and writes the verified digests to the share (`game-identity.txt`), puts the UserData copy in place and checks its hashes, then starts Xvfb (1024x768x16) and `Sims.exe -w -nosound`. |
 | `start_vm.sh` | Starts the guest in a container named `sims-harness-vm`: TCG, one CPU, 1 GiB, no network. The GDB stub and QMP listen only on the container's loopback. |
-| `guest.py` | Drives the guest through the share: `run`, `shot` (PNG of the game window), `click` and `move`. |
+| `guest.py` | Drives the guest through the share: `run`, `shot` (PNG of the game window), `click` and `move`. Several processes can hand it jobs at once. `click` and `move` exit with the guest job's exit code, and `click` stops if the pointer cannot be placed. |
 | `answer.sh` | Presses a dialog button and logs the press to the capture's `input-log.txt`. |
 | `rsp.py` | A small GDB remote-protocol client, reached through `docker exec`. It reads memory and registers and sets hardware breakpoints. It never writes guest memory or registers. |
 | `capture.py` | The capture: the breakpoints, the state readers and the output format. |
@@ -38,6 +38,7 @@ the repository, and so do the captures.
 | `input.py` | Scripted input for a capture (`--scenario`): the scenario format, the memory readers for the pointer, the pie menu and the people's queues, and the runner. |
 | `guest/input-agent.sh` | Guest job that `input.py` starts. It runs the input commands the host drops in `/research/input`, in order, and polls often. |
 | `test_input.py` | Tests of `input.py` against a fake guest memory. They need no Docker. |
+| `test_capture.py` | Tests for `capture.py`, `guest.py` and `rsp.py` against a fake stub and fake memory, with no Docker: `python3 -B -m unittest discover -s tools/harness -p 'test_*.py'`. |
 
 ## Running a capture
 
@@ -103,10 +104,11 @@ Things to know:
 - **Taking over a running capture.** Kill `capture.py` and its `docker exec`
   relay while the guest is stopped, so the run never detaches. Then start
   `capture.py` again with the same arguments plus `--resume`. It continues the
-  same directory and numbering, and redoes the update it was in the middle of.
+  same directory and numbering, and redoes the update it was in the middle of
+  (and a dump it was in the middle of).
 - **Memory dumps.** `--dump 14,47 --guest-dir <guest dir>` also saves,
   at the entry of each listed lot update, every present user page of the
-  game's process (`dump-NNNN/`). QEMU writes each range into the guest
+  game's process (`dump-NNNN/`; update 1's entry is the baseline's stop). QEMU writes each range into the guest
   directory (the container's `/g`), and the script moves it to the output.
   A dump holds the whole game, about 320 MB, so keep the list short. The
   dumps let a routine of the original be run alone on real memory.
@@ -122,6 +124,16 @@ Things to know:
   outside an update. Each logged write holds the writer's registers, its
   return addresses along the frame-pointer chain, the bytes before and
   after, and the update it falls in.
+
+  Once the game's CR3 is known (at the first lot update), a write by another
+  process to the same virtual address, including one found while stepping
+  past a breakpoint, is logged as a `foreign_watch` event, not in
+  `watch.jsonl`. A watch through an object or a pointer is worked out again
+  at every stop in the game. If the address moved (an animator was
+  replaced), the watchpoint moves too (`watch_moved`). If it cannot be worked
+  out or read, it waits again (`watch_lost`). Writes between the change and
+  that stop are missed. Watches on the same bytes share a watchpoint, and a
+  write to them is logged once for each watch.
 
 ## Scripted input
 
@@ -144,6 +156,9 @@ click-object 173               # aim at object 173, click, keep the pie menu onl
 choose Sit                     # click the open pie menu's entry
 expect-queued 21 173 within 100  # fail unless the menu pushed an action on person 21 aimed at 173
 shot after                     # save the game window to input-shots/after.png (names are unique)
+press 93 458                   # press a button of the game's panels (rest, move over it, press)
+expect-mode buy within 300     # fail unless the lot's mode becomes buy (2); also live (0) or a number
+expect-new-object within 600   # fail unless an object appears in the registry; logs it and the budget
 ```
 
 For example, from a fresh boot (start the capture before entering the house,
@@ -160,6 +175,21 @@ wait 10
 click-object 173               # the porch bench
 choose Sit
 expect-queued 21 173 within 100
+```
+
+And to buy a chair, after the same six dialogs and `wait 10`:
+
+```
+press 93 458                   # the buy-mode button
+expect-mode buy within 300
+press 258 524                  # Seating (after a fresh boot it opens on chairs)
+wait 30
+press 437 523                  # the catalog's first entry, the $80 Werkbunnst chair
+wait 30
+press 480 380                  # a free spot on the lawn
+expect-new-object within 600
+press 36 445                   # the live-mode button
+expect-mode live within 300
 ```
 
 How the checks work (the addresses are in `input.py`):
@@ -183,6 +213,15 @@ How the checks work (the addresses are in `input.py`):
   `answer-dialog` runs on the dialog stops. It presses once, like
   `answer.sh`. If the game misses the press, the step waits until the dialog
   is answered some other way (for example with `answer.sh`).
+- **Buy mode.** `expect-mode` reads the lot's mode word (lot `+0x36`: 0 in
+  live mode, 2 in buy mode). In buy mode the lot update still returns,
+  without advancing time, so the steps go on there. `expect-new-object`
+  compares the registry's object pointers with those at the scenario's
+  first update return (or at the last `expect-new-object`), less the
+  objects removed since, so an object that reuses a sold object's ID or
+  memory still counts as new. It logs each new object (ID, type, position,
+  level, and the definition's bytes and the data words as the full state
+  has them) and the budget (lot `+0x90`) before and after.
 
 A failed step is logged and ends the scenario; the capture goes on. A
 dialog that opens while a step waits for update returns ends a command's
@@ -201,9 +240,12 @@ flags. The other rows log the steps, each guest command and when it ended,
 the hover readings and the pie menus.
 
 **Unverified.** The projection was checked only in the house's starting
-view (zoom 1, no rotation). Submenus, build and buy mode are not driven
-yet. The dialog button places are fixed in the scenario, not read from the
-dialog.
+view (zoom 1, no rotation). Submenus and build mode are not driven yet;
+build mode's mode number is not known. The dialog, panel and catalog places
+are fixed in the scenario, not read from the screen. What the catalog shows
+depends on the panel's last state: after a fresh boot, Seating opens on
+chairs. A press that lands on the wrong spot of the buy panel can sell an
+object.
 
 ```sh
 python3 -B -m unittest discover -s tools/harness -p 'test_*.py'
@@ -219,10 +261,10 @@ python3 -B -m unittest discover -s tools/harness -p 'test_*.py'
 | `full-state.json.gz` | In both kinds of directory: the registry, the neighborhood, and the object and animator pointers. |
 | `pages.json.gz` | In both kinds of directory: the memory pages of the people and their animators. |
 | `updates.jsonl` | One line per lot update: the tick, whether it was a full pass, the three random streams and the scheduler cursor. |
-| `events.jsonl` | The dialog functions passed (each record, its status and modal byte), the baseline, and other stops. |
+| `events.jsonl` | The dialog functions passed (each record, its status and modal byte), the baseline, other stops, the game's identity (`game_identity`) and the watch events. |
 | `dump-NNNN/` | With `--dump`: the user memory at the entry of lot update N. `ranges.json` lists the ranges (start, size, protection, file); `registers.json` holds the stop's registers and the stub's whole register packet. |
 | `watch.jsonl` | With `--watch`: one line per write to a watched address (see above). |
-| `status.json` | Progress. |
+| `status.json` | Progress, and `game_identity`: the digests `launch.sh` verified, or null if the game was not started by it. |
 | `input-log.txt` | Every press made, with its time (written by `answer.sh`). |
 | `input.jsonl` | With `--scenario`: the steps, the guest commands, the pie menus and every action the pie menu queued, each with its lot update (see Scripted input). |
 | `input-shots/` | With `--scenario`: the `shot` steps' screenshots. |

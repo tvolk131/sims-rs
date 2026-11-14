@@ -66,11 +66,11 @@ fn the_standing_loop_and_the_walk_load_with_their_samples() {
 }
 
 /// An animator placed at the origin facing the viewer of the house view
-/// (direction 7, seven eighths of a turn), with a base layer at `clock`
+/// (direction 3, three eighths of a turn), with a base layer at `clock`
 /// and, for a walk, the walking loop in front at `phase`.
 fn animator(clock: i32, walk: Option<(&str, f32)>, library: &Library, assets: &Assets) -> Animator {
     let mut animator = Animator::new(clock);
-    animator.position = [0.0, 0.0, 7.0].map(F32::from_f32);
+    animator.position = [0.0, 0.0, 3.0].map(F32::from_f32);
     animator.base = true;
     if let Some((clip, phase)) = walk {
         let loaded = library.load(assets, clip).unwrap();
@@ -146,17 +146,17 @@ fn the_goth_family_stands_and_walks() {
         digests,
         [
             "16 base c2o-standing-loop",
-            "16 stand 12849b69f44ac1bb51b826d18c77d74a2be6e464081cbad895d48ecb7070605d",
-            "16 walk d465a811a54a9cfd18d3c388fd4a167d9001b03b2b91cb622187b15ccebdce96",
-            "16 walk dc6f1842c3471c5c4946593df69efe3f89c25b825fc2fa0e4e9e0e21fdd55a1f",
+            "16 stand 2d4de1ff3cb04720af7bdb008ad7cde148d181f45b8402bc563cad845790b623",
+            "16 walk 670581ce241ecbae9520041e7c7a795a7faca6828c64c361244194d45fdaf5f8",
+            "16 walk ca1213f8b3e37670701430de369e246b733dfb9cef6c48f6067b12d578e7cc75",
             "18 base a2o-standing-loop",
-            "18 stand 76aced914fc2cacea9564e3f70b43fc4993795e3030159e488d9a25616265b54",
-            "18 walk 14f10ac08f52082013774d12c160df6a5d534ed994ca9f1b9fb4421b371f65b6",
-            "18 walk 0192bc04cd028c09f82d106695de8eb61754f60ea4901a9e356a431c417a7e59",
+            "18 stand 196e3318d16fb41c441ec1d27b72bdcb463414ee34cef082a751c8ea36d629da",
+            "18 walk 7a74b12eff6adb3b0f3d604693397e50cf312a94ad08ac6fecc5db8c818bc557",
+            "18 walk 4b925c0726708dfa2ab831ad256d41671daf61010cd6f4aa658bc8b0ca4086df",
             "21 base a2o-standing-loop",
-            "21 stand bce43b91328161b4ce89fcf78df9c407c00b7992d367349d4c9eb666cc208915",
-            "21 walk 1278e08b1292f77ebbd93c7d68062f990da284f9c12fc76a0d44f584b50f6c6c",
-            "21 walk 7159f751d3cde3c91ca39c202f85e818b90690a082d4acd30460451706628720",
+            "21 stand cb802749be0f3d212312d5a2540f8ac11102b36cd688448fae4d10dccc44dc31",
+            "21 walk dd8dda7165a993aa088cbf7970fcbc89c6e42f5d3079cfe8cd6142db4e7ad30c",
+            "21 walk c142d22ffc41627349475badbb628e67f7ac9390538cb8a0f0753bd0e3bb351b",
         ]
     );
 }
