@@ -184,7 +184,10 @@ How the checks work (the addresses are in `input.py`):
   `answer.sh`. If the game misses the press, the step waits until the dialog
   is answered some other way (for example with `answer.sh`).
 
-A failed step is logged and ends the scenario; the capture goes on.
+A failed step is logged and ends the scenario; the capture goes on. A
+dialog that opens while a step waits for update returns ends a command's
+settling, and steps that read memory wait for the next update return. A
+scenario cannot be resumed: `--scenario` with `--resume` is refused.
 
 `input.jsonl` is the record to replay. A `queued` row holds the update it
 falls in: `update` N with `in_update` false means the push came before lot

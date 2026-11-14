@@ -363,7 +363,15 @@ def main():
         ap.error('--dump needs --guest-dir')
     if args.scenario and not args.guest_dir:
         ap.error('--scenario needs --guest-dir')
-    steps = scenario_input.parse_scenario(args.scenario.read_text()) if args.scenario else None
+    if args.scenario and args.resume:
+        # A new runner would start the scenario again from its first step.
+        ap.error('--scenario cannot be resumed')
+    try:
+        steps = scenario_input.parse_scenario(args.scenario.read_text()) if args.scenario else None
+        if steps is not None:
+            scenario_input.check_window(args.window)
+    except scenario_input.ScenarioError as e:
+        ap.error(str(e))
     out = args.output
     out.mkdir(parents=True, exist_ok=args.resume)
     events = open(out / 'events.jsonl', 'a')

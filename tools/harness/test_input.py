@@ -3,8 +3,12 @@
   python3 -B -m unittest discover -s tools/harness -p 'test_*.py'
 """
 import json
+import os
 import struct
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -234,7 +238,7 @@ class ReadTest(unittest.TestCase):
         self.assertEqual([e['label'] for e in inp.read_entries(g.m)], ['Sit', 'Clean'])
 
 
-class RunnerTest(unittest.TestCase):
+class RunnerBase(unittest.TestCase):
     def setUp(self):
         self.g = Game()
         self.bench = self.g.add_object(173, [0x1a8, 0x198])
@@ -265,6 +269,18 @@ class RunnerTest(unittest.TestCase):
         rows = [json.loads(line) for line in self.log.read_text().splitlines()]
         return [r for r in rows if kind is None or r['kind'] == kind]
 
+    def tick_until(self, r, done, most=60):
+        for _ in range(most):
+            if done():
+                return
+            self.tick(r)
+        self.fail(f'never happened: {self.rows()}')
+
+    def last_command(self):
+        return self.agent.commands[-1] if self.agent.commands else ''
+
+
+class RunnerTest(RunnerBase):
     def test_waits(self):
         r = self.runner('until 3\nwait 2')
         self.tick(r, 3)
@@ -284,16 +300,6 @@ class RunnerTest(unittest.TestCase):
         self.tick(r, 3)
         self.assertEqual(len(self.agent.commands), 2)
         self.assertIn('mousedown 1', self.agent.commands[1])
-
-    def tick_until(self, r, done, most=60):
-        for _ in range(most):
-            if done():
-                return
-            self.tick(r)
-        self.fail(f'never happened: {self.rows()}')
-
-    def last_command(self):
-        return self.agent.commands[-1] if self.agent.commands else ''
 
     def test_click_object_choose_and_expect(self):
         g = self.g
@@ -387,6 +393,126 @@ class RunnerTest(unittest.TestCase):
         r = self.runner('click-object 999')
         self.tick(r)
         self.assertIn('no object 999', r.failed)
+
+
+class ReviewFindingsTest(RunnerBase):
+    """Cases from the review of the first version."""
+
+    def test_a_dialog_opened_by_a_click_does_not_deadlock(self):
+        r = self.runner('click 10 20\nanswer-dialog 400 400')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        # The press opens a modal dialog: no update returns until it is answered.
+        r.on_dialog('dialog_show', self.update + 1)
+        self.assertIn('400 400', self.last_command())
+        rows = self.rows('command_wait_ended')
+        self.assertEqual(rows[0]['reason'], 'dialog_show')
+        r.on_dialog('dialog_result', self.update + 1)
+        self.assertTrue(r.finished)
+        self.assertIsNone(r.failed)
+
+    def test_memory_steps_wait_for_an_update_return(self):
+        self.g.hover(173)
+        r = self.runner('answer-dialog 400 400\nclick-object 173')
+        r.on_dialog('dialog_show', 1)
+        r.on_dialog('dialog_result', 1)  # no memory has been read yet
+        self.assertIsNone(r.failed)
+        self.assertEqual(len(self.agent.commands), 1)
+        self.tick(r)
+        self.assertIsNone(r.failed)
+        self.assertIn('mousemove', self.last_command())
+
+    def push(self, r, routine):
+        a = self.g.m.alloc(0x44)
+        self.g.m.put_words(a + 4, self.person, self.bench)
+        self.g.m.put(a + 32, struct.pack('<H', routine))
+        r.on_queue_push(self.update + 1, False, self.g.m, dict(edi=self.person, esi=a))
+
+    def test_expect_queued_takes_pushes_in_order(self):
+        g = self.g
+        r = self.runner('expect-queued 21 173 within 5\nexpect-queued 21 173 within 5')
+        self.push(r, 8213)
+        self.push(r, 8214)
+        g.m.put_words(self.person + inp.ACTIVE_ACTION + 4, self.person, self.bench)
+        g.m.put(self.person + inp.ACTIVE_ACTION + 32, struct.pack('<H', 8213))
+        g.m.put_words(self.person + 0x820 + 4, self.person, self.bench)
+        g.m.put(self.person + 0x820 + 32, struct.pack('<H', 8214))
+        g.m.put_words(self.person + 0xa40, 0, 1)
+        self.tick(r, 2)
+        self.assertTrue(r.finished)
+        self.assertIsNone(r.failed)
+        self.assertEqual([(t['where'], t['pushed_update']) for t in self.rows('taken')], [('active', 1), ('queue', 1)])
+
+    def test_expect_queued_ignores_pushes_before_the_choice(self):
+        g = self.g
+        g.open_pie(['Sit'], target=self.bench, caller=self.person)
+        r = self.runner('choose Sit\nexpect-queued 21 173 within 5')
+        self.push(r, 9999)  # an older interaction, never held
+        g.highlight(0)
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        self.push(r, 8213)
+        g.m.put_words(self.person + inp.ACTIVE_ACTION + 4, self.person, self.bench)
+        g.m.put(self.person + inp.ACTIVE_ACTION + 32, struct.pack('<H', 8213))
+        self.tick_until(r, lambda: r.finished)
+        self.assertIsNone(r.failed)
+        self.assertEqual(self.rows('taken')[0]['active']['routine'], 8213)
+
+    def test_the_held_action_must_have_the_pushed_arguments(self):
+        a = dict(caller=21, target=173, routine=8213, menu=0, args=[2, 0, 0, 0])
+        self.assertFalse(inp.same_action(dict(a, args=[1, 0, 0, 0]), a))
+        self.assertFalse(inp.same_action(dict(a, menu=1), a))
+        self.assertTrue(inp.same_action(dict(a, uid=7, flags=0), a))
+
+    def test_an_unreadable_push_is_logged_not_raised(self):
+        r = self.runner('wait 1')
+        r.on_queue_push(1, True, self.g.m, dict(edi=0x10, esi=0x20))
+        self.assertEqual(self.rows('queued_unread')[0]['action_pointer'], 0x20)
+        self.assertEqual(r.pushes, [])
+
+    def test_window_ids_are_checked(self):
+        self.assertEqual(inp.check_window('0xe00013'), '0xe00013')
+        for bad in ('0x1; printf injected; #', '$(id)', '0x1 2', ''):
+            with self.assertRaises(inp.ScenarioError):
+                inp.check_window(bad)
+        with self.assertRaises(inp.ScenarioError):
+            inp.Agent(tempfile.mkdtemp(), '0x1;reboot')
+
+    def test_capture_refuses_to_resume_a_scenario(self):
+        d = Path(tempfile.mkdtemp())
+        (d / 's.txt').write_text('wait 1\n')
+        capture = Path(inp.__file__).with_name('capture.py')
+        for extra, message in ((['--resume'], 'cannot be resumed'), (['--window', '1;id'], 'not an X window')):
+            run = subprocess.run([sys.executable, '-B', str(capture), '--container', 'none', '--output', str(d / 'out'),
+                                  '--scenario', str(d / 's.txt'), '--guest-dir', str(d)] + extra,
+                                 capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, run.stderr)
+            self.assertIn(message, run.stderr)
+            self.assertFalse((d / 'out').exists())
+
+
+class AgentScriptTest(unittest.TestCase):
+    """The guest agent itself, run on the host with sh on a temporary folder."""
+
+    def test_two_agents_run_each_command_once(self):
+        d = Path(tempfile.mkdtemp())
+        script = Path(inp.__file__).with_name('guest') / 'input-agent.sh'
+        env = dict(os.environ, INPUT_DIR=str(d))
+        agents = [subprocess.Popen(['sh', str(script)], env=env) for _ in range(2)]
+        try:
+            agent = inp.Agent(d.parent, '0x1')
+            agent.dir = d
+            agent.n = agent.numbered()
+            ns = [agent.submit(f'echo {i} >> {d}/ran') for i in range(20)]
+            end = time.time() + 20
+            while time.time() < end and any(agent.result(n) is None for n in ns):
+                time.sleep(0.05)
+            self.assertEqual([agent.result(n) for n in ns], [0] * 20)
+            self.assertEqual(sorted(int(x) for x in (d / 'ran').read_text().split()), list(range(20)))
+            self.assertEqual(agent.numbered(), 20)
+            self.assertFalse(list(d.glob('*.cmd')))
+        finally:
+            for a in agents:
+                a.kill()
+                a.wait()
 
 
 if __name__ == '__main__':

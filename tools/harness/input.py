@@ -62,6 +62,7 @@ Ghidra on the decrypted image and checked in the running game):
   is the person, esi the action. capture.py stops there to record it.
 """
 import json
+import re
 import shlex
 import struct
 import time
@@ -79,6 +80,10 @@ STEPS = {
     'until': (1, 1), 'wait': (1, 1), 'move': (2, 2), 'click': (2, 2), 'answer-dialog': (2, 2),
     'key': (1, 1), 'click-object': (1, 1), 'choose': (1, 1), 'expect-queued': (1, 4), 'shot': (1, 1),
 }
+
+
+# Steps that read guest memory: they start or go on only at an update return.
+MEMORY_STEPS = {'click-object', 'choose', 'expect-queued'}
 
 
 class ScenarioError(ValueError):
@@ -279,8 +284,18 @@ def read_queue(m, person):
 
 
 def same_action(a, b):
-    """The same interaction (the uid is given only when the queue takes it)."""
-    return all(a.get(k) == b.get(k) for k in ('caller', 'target', 'routine'))
+    """The same interaction: the fields the pie menu's entry sets. The uid is
+    given only when the queue takes the action, and the flags and the
+    attenuation change as it runs."""
+    return all(a.get(k) == b.get(k) for k in ('caller', 'target', 'routine', 'menu', 'args'))
+
+
+def check_window(window):
+    """The window ID as xdotool takes it; anything else is refused, since it
+    goes into guest shell commands."""
+    if not re.fullmatch(r'0x[0-9a-fA-F]{1,8}|[0-9]{1,10}', str(window)):
+        raise ScenarioError(f'not an X window ID: {window!r}')
+    return str(window)
 
 
 def match_item(items, label):
@@ -300,13 +315,21 @@ class Agent:
     def __init__(self, share, window=WINDOW):
         self.share = Path(share)
         self.dir = self.share / 'input'
-        self.window = window
+        self.window = check_window(window)
         self.n = 0
 
+    def numbered(self):
+        """The highest command number used in the input folder (as .cmd,
+        claimed as .run, or ended as .done)."""
+        return max([int(p.stem) for p in self.dir.iterdir() if p.stem.isdigit()] + [0])
+
     def start(self):
-        """Start the agent in the guest, unless one already answers. Returns True if one was started."""
+        """Start the agent in the guest, unless one already answers. Returns
+        True if one was asked to start. A second agent is harmless: the agent
+        exits when a live one holds the folder, and each command is claimed by
+        a rename, so only one agent runs it."""
         self.dir.mkdir(exist_ok=True)
-        self.n = max([int(p.stem) for p in self.dir.glob('*.cmd')] + [0])
+        self.n = self.numbered()
         if (self.dir / 'agent.pid').exists() and self.alive():
             return False
         source = Path(__file__).parent / 'guest' / 'input-agent.sh'
@@ -409,6 +432,8 @@ class Runner:
         self.gen = None
         self.waiting = None  # ('job', n, settle, seen) or ('updates', left)
         self.pushes = []
+        self.push_cursor = 0  # pushes before it were matched by an expect-queued
+        self.fresh = False  # self.m was read at this update return (not at a dialog stop)
         self.dialogs = []
         self.finished = False
         self.failed = None
@@ -429,14 +454,29 @@ class Runner:
 
     def on_queue_push(self, update, in_update, m, regs):
         person, action = regs['edi'], regs['esi']
-        row = dict(kind='queued', update=update, in_update=in_update, person=m.object_id(person),
-                   action=m.action(action), action_pointer=action, step=self.index)
+        try:
+            row = dict(kind='queued', update=update, in_update=in_update, person=m.object_id(person),
+                       action=m.action(action), action_pointer=action, step=self.index)
+        except Exception as e:  # reading the push must never end the capture
+            self.write(kind='queued_unread', update=update, in_update=in_update, person_pointer=person,
+                       action_pointer=action, error=f'{type(e).__name__}: {e}')
+            return
         self.pushes.append(row)
         self.write(**row)
 
     def on_dialog(self, kind, update):
+        """A dialog stop. A modal dialog holds the lot update it shows in, so
+        no update returns until it is answered: a dialog that shows ends the
+        settling after a command (the command still runs in the guest, before
+        any later one), and only steps that read no memory go on here."""
         self.dialogs.append((kind, update))
-        if self.finished or (self.waiting and self.waiting[0] != 'event'):
+        self.fresh = False
+        if self.finished:
+            return
+        if kind == 'dialog_show' and self.waiting and self.waiting[0] == 'job':
+            self.write(kind='command_wait_ended', id=self.waiting[1], reason='dialog_show', in_update=update)
+            self.waiting = None
+        if self.waiting and self.waiting[0] != 'event':
             return
         try:
             self.tick()
@@ -448,6 +488,7 @@ class Runner:
 
     def on_update(self, update, m, sim):
         self.update, self.m, self.sim = update, m, sim
+        self.fresh = True
         if self.finished:
             return
         try:
@@ -488,11 +529,13 @@ class Runner:
 
     def advance(self):
         while not self.finished and not self.waiting:
+            if self.gen is None and self.index >= len(self.steps):
+                self.finished = True
+                self.write(kind='scenario', status='done')
+                return
+            if not self.fresh and self.steps[self.index]['op'] in MEMORY_STEPS:
+                return  # go on at the next update return, with memory read there
             if self.gen is None:
-                if self.index >= len(self.steps):
-                    self.finished = True
-                    self.write(kind='scenario', status='done')
-                    return
                 step = self.steps[self.index]
                 self.write(kind='step', status='start', index=self.index, line=step['line'], text=step['text'])
                 self.gen = getattr(self, 'step_' + step['op'].replace('-', '_'))(*step['args'])
@@ -654,6 +697,7 @@ class Runner:
         item = pie['items'][i]
         point = clamp((item['x'] + item['w'] // 2, item['y'] + item['h'] // 2))
         pushes = len(self.pushes)
+        self.push_cursor = pushes  # expect-queued looks only at what this choice pushes
         yield Job('move', move_command(*point, self.agent.window), x=point[0], y=point[1], entry=label)
         for _ in range(60):  # the game takes the move late
             pie = read_pie(self.m)
@@ -676,8 +720,11 @@ class Runner:
         push = None
         while True:
             if push is None:
-                push = next((r for r in self.pushes if r['person'] == person and
-                             (target is None or r['action']['target'] == target)), None)
+                for i in range(self.push_cursor, len(self.pushes)):
+                    r = self.pushes[i]
+                    if r['person'] == person and (target is None or r['action']['target'] == target):
+                        push, self.push_cursor = r, i + 1
+                        break
             p = push and find_object(self.m, self.sim, person)
             if p:
                 queue, active = read_queue(self.m, p), self.m.action(p + ACTIVE_ACTION)
