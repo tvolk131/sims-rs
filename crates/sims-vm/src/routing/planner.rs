@@ -39,7 +39,7 @@ use crate::interpreter::Interpreter;
 use crate::placement::capture;
 use sims_core::Ext;
 use sims_sim::World;
-use sims_sim::route::Context;
+use sims_sim::route::{Candidate, Context};
 
 /// Object data words.
 const FLAGS: usize = 8;
@@ -170,6 +170,10 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
+        // What comes before this in the original only sets flags for later.
+        if gives_up(&ctx.candidates, &mut ctx.result) {
+            return Ok(false);
+        }
         let me = world
             .objects
             .get(&person)
@@ -186,9 +190,6 @@ impl Interpreter<'_> {
         }
         if datum(world, person, PACE).map_err(fail)? != 0 {
             return Err(fail(unsupported("a person whose data word 17 is set")));
-        }
-        if ctx.candidates.is_empty() {
-            return Err(fail(unsupported("a context with no candidates")));
         }
         let room = datum(world, person, ROOM).map_err(fail)?;
         if datum(world, ctx.target, ROOM).map_err(fail)? != room {
@@ -318,9 +319,40 @@ fn bounded(objects: i32, half: i32) -> bool {
     !crowded && half / 2 >= 100
 }
 
+/// Whether the planner gives up at once (0x482462): with no candidates
+/// there is no path, and a result of 1 (no place found yet) becomes 7.
+fn gives_up(candidates: &[Candidate], result: &mut i32) -> bool {
+    if !candidates.is_empty() {
+        return false;
+    }
+    if *result == 1 {
+        *result = 7;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_no_candidates_the_planner_gives_up() {
+        let mut result = 1;
+        assert!(gives_up(&[], &mut result));
+        assert_eq!(result, 7);
+        let mut result = 4;
+        assert!(gives_up(&[], &mut result));
+        assert_eq!(result, 4);
+        let one = Candidate {
+            position: [8, 8],
+            score: 1,
+            word_c: 0,
+            word_e: None,
+        };
+        let mut result = 1;
+        assert!(!gives_up(&[one], &mut result));
+        assert_eq!(result, 1);
+    }
 
     #[test]
     fn an_obstacle_keeps_the_footprint_order_and_grows_when_costly() {

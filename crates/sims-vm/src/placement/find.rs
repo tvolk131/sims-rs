@@ -20,9 +20,10 @@
 //! the running game only where `docs/decisions.md` says so.
 //!
 //! The placement error the original writes on a refusal (global 0x6e4acc,
-//! and the object it collided with in 0x6e4ad0) is not kept: nothing the
-//! simulation holds reads it on these paths. The comments name it, so the
-//! reason for each refusal is on record.
+//! and the object it collided with in 0x6e4ad0) is kept only as far as a
+//! caller reads it: [`Refusal`] tells a wall in the way (7) and a
+//! collision (11, with the object hit if there is one) from the rest. The
+//! comments name each refusal's code, so the reason is on record.
 //!
 //! Only what an ordinary object or a person on the ground needs is
 //! ported. A person whose person word 84 has bit 0, a tile of a group, a
@@ -46,6 +47,24 @@ const WALL_CELL: usize = 14;
 /// The callback an object is asked whether another may overlap it, with
 /// the other object as the stack object (function 5).
 const ALLOW_OVERLAP: usize = 5;
+
+/// Why the place test refused a place: the placement error it leaves in
+/// global 0x6e4acc, as far as a caller tells the codes apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// Code 7: the footprint crosses a wall (0x433b7e).
+    Wall,
+    /// Code 11: another object is in the way. The object is the one whose
+    /// footprint overlaps (0x433b42, written to 0x6e4ad0); an exclusive
+    /// clash on the tile leaves 0x6e4ad0 as the caller set it (0x433b4a),
+    /// None here.
+    Collision(Option<u16>),
+    /// One of the other codes the steps of [`Interpreter::fits`] name.
+    Other,
+    /// A refusal whose code was not read from the original: the wall
+    /// rules of an object that is not a person (0x476f5a).
+    Unrecorded,
+}
 
 /// Data words of the object being placed.
 mod word {
@@ -456,6 +475,17 @@ impl Interpreter<'_> {
         position: [i32; 2],
         level: i32,
     ) -> Result<bool, Fault> {
+        Ok(self.place_test(world, id, position, level)?.is_ok())
+    }
+
+    /// [`Interpreter::fits`], with the reason for a refusal.
+    pub(crate) fn place_test(
+        &self,
+        world: &mut World,
+        id: u16,
+        position: [i32; 2],
+        level: i32,
+    ) -> Result<Result<(), Refusal>, Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -473,11 +503,13 @@ impl Interpreter<'_> {
         let placement = read(world, word::PLACEMENT)?;
         let levels = read(world, word::LEVELS)?;
         let [a, b, _] = World::tile([position[0], position[1], level]);
+        // Codes 1 and 2.
         if !inside(world, a, b) || !(0..=3).contains(&level) {
-            return Ok(false);
+            return Ok(Err(Refusal::Other));
         }
+        // Code 0x1f.
         if level > 1 && placement & 0x1000 != 0 {
-            return Ok(false);
+            return Ok(Err(Refusal::Other));
         }
         // A person skips the wall rules (0x432ac5).
         if !person
@@ -485,7 +517,7 @@ impl Interpreter<'_> {
                 .against_walls(world, [a, b], level, read(world, word::WALL_RULES)?)
                 .map_err(fail)?
         {
-            return Ok(false);
+            return Ok(Err(Refusal::Unrecorded));
         }
         let index = level_index(level).map_err(fail)?;
         if placement & 0x200 == 0 && level > 1 {
@@ -503,49 +535,60 @@ impl Interpreter<'_> {
                 for other in on_tile {
                     floats |= datum(world, other, word::FLAGS).map_err(fail)? as u16 & 0x1000 != 0;
                 }
+                // Code 0x1d.
                 if !floats {
-                    return Ok(false);
+                    return Ok(Err(Refusal::Other));
                 }
             }
         } else if placement & 0x2000 != 0 {
-            return Ok(false);
+            // Code 0x2f.
+            return Ok(Err(Refusal::Other));
         }
         let pool = array(world, POOL, 1).map_err(fail)?[at];
         if level == 1 {
+            // Codes 0x1d and 0x1e.
             if placement & 0x800 == 0 && pool < 0x10 {
-                return Ok(false);
+                return Ok(Err(Refusal::Other));
             }
             if placement & 0x1000 != 0 && pool >= 0x10 {
-                return Ok(false);
+                return Ok(Err(Refusal::Other));
             }
         }
         if placement & 0x100 == 0 {
             let heights = &array(world, HEIGHTS, 4).map_err(fail)?[at * 4..at * 4 + 4];
+            // Code 0x11.
             if heights.iter().any(|&h| h != heights[0]) {
-                return Ok(false);
+                return Ok(Err(Refusal::Other));
             }
         }
         let floor = {
             let floors = array(world, FLOORS[index], 2).map_err(fail)?;
             u16::from_le_bytes([floors[at * 2], floors[at * 2 + 1]])
         };
+        // Codes 0x13 and 0x2a, then 0x14.
         if placement & 1 == 0 && (floor != 0 || (level == 1 && pool == 0x10)) {
-            return Ok(false);
+            return Ok(Err(Refusal::Other));
         }
         if placement & 2 == 0 && level == 1 && floor == 0 {
-            return Ok(false);
+            return Ok(Err(Refusal::Other));
         }
         let rule = read(world, word::TILE_FLAG_RULE)?;
         if rule != 0 {
             let flag = array(world, FLAGS[index], 1).map_err(fail)?[at] & 4 != 0;
+            // Codes 9 and 0xa.
             if (rule == 1 && !flag) || (rule == 2 && flag) {
-                return Ok(false);
+                return Ok(Err(Refusal::Other));
             }
         }
-        if !self.clear_of_objects(world, id, position, level)? {
-            return Ok(false);
+        if let Some(refusal) = self.clear_of_objects(world, id, position, level)? {
+            return Ok(Err(refusal));
         }
-        Ok(levels & 1 != 0)
+        // Code 0x18.
+        Ok(if levels & 1 != 0 {
+            Ok(())
+        } else {
+            Err(Refusal::Other)
+        })
     }
 
     /// Whether the tile's diagonal wall suits an object's wall rules
@@ -575,7 +618,8 @@ impl Interpreter<'_> {
         )))
     }
 
-    /// Whether an object at a position collides with nothing (0x4337f6).
+    /// Whether an object at a position collides with something (0x4337f6),
+    /// and if so why.
     /// Its footprint there is worked out as the lot stores footprints. On
     /// its tile and the eight around it, every object linked from the
     /// tile's grid cell through slot 0 is looked at, the object itself
@@ -605,7 +649,7 @@ impl Interpreter<'_> {
         id: u16,
         position: [i32; 2],
         level: i32,
-    ) -> Result<bool, Fault> {
+    ) -> Result<Option<Refusal>, Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -622,7 +666,7 @@ impl Interpreter<'_> {
         if let Some(person) = &person {
             let bit = |index: usize| person.get(index).is_some_and(|w| w & 1 != 0);
             if bit(PERSON_NO_ROOM) {
-                return Ok(true);
+                return Ok(None);
             }
             if bit(PERSON_CARRIED) {
                 return Err(fail(Trap::Unsupported(
@@ -681,7 +725,7 @@ impl Interpreter<'_> {
                             && theirs[0] < bounds[2]
                             && theirs[2] > bounds[0];
                         if overlap {
-                            return Ok(false);
+                            return Ok(Some(Refusal::Collision(Some(other))));
                         }
                     }
                 } else if other != id
@@ -689,7 +733,7 @@ impl Interpreter<'_> {
                     && index == 8
                     && self.exclusive_clash(world, id, other, not_solid, exclusive)?
                 {
-                    return Ok(false);
+                    return Ok(Some(Refusal::Collision(None)));
                 }
                 current = slot(world, other, 0).map_err(fail)?;
             }
@@ -697,9 +741,9 @@ impl Interpreter<'_> {
         if me(world, word::PLACEMENT).map_err(fail)? & 0x400 == 0
             && crosses_wall(world, bounds, level).map_err(fail)?
         {
-            return Ok(false);
+            return Ok(Some(Refusal::Wall));
         }
-        Ok(true)
+        Ok(None)
     }
 
     /// Whether another object is in the way of the one being placed and
