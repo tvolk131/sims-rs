@@ -201,6 +201,10 @@ pub const TARGET: u8 = 53;
 pub const MAIN_DUCKPRI: u8 = 123;
 /// How long `seqgroup_kill` waits after starting a fade, in milliseconds.
 const SEQGROUP_WAIT_MS: u64 = 2;
+/// Frames one call renders at most: an hour.
+pub const RENDER_LIMIT: usize = 3600 * RATE as usize;
+/// Frames a resampled sound holds at most: half an hour.
+pub const RESAMPLE_LIMIT: usize = 1800 * RATE as usize;
 /// Patches chained to one note at most.
 pub const CHAIN: usize = 64;
 /// Object instances recorded at most; more are not recorded.
@@ -308,7 +312,11 @@ enum Target {
 #[derive(Debug, Clone)]
 struct Note {
     id: u32,
+    /// The thread that started it: 0 for one a kind 53 event started on
+    /// a track with no thread.
     thread: u32,
+    track: u32,
+    object: u32,
     patch: u32,
     /// Position in source frames, 16.16 fixed point.
     position: u64,
@@ -325,19 +333,23 @@ fn step(rate: u32) -> u64 {
 }
 
 /// A sound at another rate, by linear interpolation in integers, so every
-/// platform gets the same samples.
-pub fn resample(pcm: &Pcm, rate: u32) -> Pcm {
+/// platform gets the same samples. `None` when the result would hold more
+/// than [`RESAMPLE_LIMIT`] frames.
+pub fn resample(pcm: &Pcm, rate: u32) -> Option<Pcm> {
     let channels = usize::from(pcm.channels);
     let length = pcm.frames() as u64;
     if pcm.rate == rate || pcm.rate == 0 || rate == 0 || channels == 0 || length == 0 {
-        return Pcm {
+        return Some(Pcm {
             rate,
             ..pcm.clone()
-        };
+        });
     }
-    // Source frames per output frame, 32.32 fixed point.
+    // Source frames per output frame, 32.32 fixed point; at least 1 / 2^32,
+    // as the rates are below 2^32.
     let step = (u128::from(pcm.rate) << 32) / u128::from(rate);
-    let frames = ((u128::from(length) << 32).div_ceil(step)) as usize;
+    let frames = usize::try_from((u128::from(length) << 32).div_ceil(step.max(1)))
+        .ok()
+        .filter(|&f| f <= RESAMPLE_LIMIT)?;
     let mut samples = Vec::with_capacity(frames * channels);
     for frame in 0..frames {
         let position = step * frame as u128;
@@ -350,11 +362,11 @@ pub fn resample(pcm: &Pcm, rate: u32) -> Pcm {
             samples.push((first + (((second - first) * fraction) >> 32)) as i16);
         }
     }
-    Pcm {
+    Some(Pcm {
         rate,
         channels: pcm.channels,
         samples,
-    }
+    })
 }
 
 /// Spreads a seed over all 64 bits (splitmix64), so nearby seeds start
@@ -537,23 +549,33 @@ impl<S: Samples> Player<S> {
         let owner = &self.modules[module];
         let kind = owner.number(&event.kind);
         let track = event.track.as_ref().and_then(|t| owner.number(t));
-        let given = |at: usize| {
-            event
-                .rest
-                .get(at)
-                .and_then(|v| owner.number(v))
-                .filter(|&v| v != 0)
-        };
-        let args = [
-            given(0).map_or(object, |v| v as u32),
-            given(1).map_or(0, |v| v as u32),
-            given(2).map_or(0, |v| v as u32),
-        ];
+        let numbers: Vec<i64> = (0..3)
+            .map(|at| {
+                event
+                    .rest
+                    .get(at)
+                    .and_then(|v| owner.number(v))
+                    .unwrap_or(0)
+            })
+            .collect();
         let Some(kind) = kind else {
             self.report(format!("event {name}: its kind is not a number"));
             return;
         };
-        let track = track.unwrap_or(0) as u32;
+        // The original's fields are 32 bits; a number that fits neither
+        // signed nor unsigned 32 bits is a fault, not a wrapped value.
+        let fits = |v: i64| (i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&v);
+        let track = track.unwrap_or(0);
+        if !fits(track) || numbers.iter().any(|&v| !fits(v)) {
+            self.report(format!("event {name}: a number does not fit 32 bits"));
+            return;
+        }
+        let given = |at: usize, caller: u32| match numbers[at] {
+            0 => caller,
+            v => v as u32,
+        };
+        let args = [given(0, object), given(1, 0), given(2, 0)];
+        let track = track as u32;
         match kind {
             kind::PLAY => self.play_track(module, track, args),
             kind::FADE => self.fade_track(track, args),
@@ -572,12 +594,14 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// Kind 1: starts a track. *(code)* When no thread of the track runs,
-    /// the object instances recorded for it are dropped first; when the
+    /// Kind 1: starts a track. *(code)* When nothing of the track runs or
+    /// plays, the object instances recorded for it are dropped first; when the
     /// track's arguments are `kArgsIdVolPan` and the first is not 0, the
     /// track and that object are recorded as an instance.
     fn play_track(&mut self, module: usize, track: u32, args: [u32; 3]) {
-        if !self.threads.iter().any(|t| t.track == track) {
+        let alive = self.threads.iter().any(|t| t.track == track)
+            || self.notes.iter().any(|n| n.track == track);
+        if !alive {
             self.instances.retain(|&(t, _)| t != track);
         }
         if self.start(args[0], module, track, false)
@@ -725,7 +749,8 @@ impl<S: Samples> Player<S> {
     /// The original's fade-out-and-kill (0x57dca3) on a track's threads
     /// (only `object`'s, when given): a thread with a note playing fades
     /// its `extvol` to 0 at speed 100 and then ends; one without ends
-    /// now.
+    /// now. The track's notes whose thread has ended stop now (the
+    /// original would fade them; here they have no registers).
     fn fade_and_kill(&mut self, track: u32, object: Option<u32>) {
         let ids: Vec<u32> = self
             .threads
@@ -751,6 +776,13 @@ impl<S: Samples> Player<S> {
         }
         self.pending
             .retain(|t| !(t.track == track && object.is_none_or(|o| t.object == o)));
+        // Notes that outlived their thread have no registers to fade, and
+        // end at once.
+        let running: BTreeSet<u32> = self.threads.iter().map(|t| t.id).collect();
+        self.notes.retain(|n| {
+            running.contains(&n.thread)
+                || !(n.track == track && object.is_none_or(|o| n.object == o))
+        });
         self.forget_ended();
     }
 
@@ -775,7 +807,8 @@ impl<S: Samples> Player<S> {
     /// patch plays right after it; otherwise the thread's `patch`
     /// register takes it and a note starts. A track with no running
     /// thread plays the patch at its starting levels, as the original's
-    /// idle track object does.
+    /// idle track object does, chained to the patch an earlier such event
+    /// started if that still plays.
     fn sequence(&mut self, track: u32, hit_list: u32) {
         let Some(owner) = self.owner(0, track) else {
             return;
@@ -792,13 +825,7 @@ impl<S: Samples> Player<S> {
             Some(at) => {
                 let last = self.threads[at].last_note;
                 if let Some(note) = self.notes.iter().position(|n| n.id == last && last != 0) {
-                    if self.load_patch(patch) {
-                        if self.notes[note].chain.len() >= CHAIN {
-                            self.report(format!("track {track}: more than {CHAIN} chained"));
-                        } else {
-                            self.notes[note].chain.push(patch);
-                        }
-                    }
+                    self.chain(note, track, patch);
                 } else {
                     self.write_at(at, PATCH, patch as i32);
                     let thread = self.threads[at].clone();
@@ -807,12 +834,32 @@ impl<S: Samples> Player<S> {
                 }
             }
             None => {
-                if let Some(mut thread) = self.thread(0, owner, track) {
+                // The track's own note from an earlier kind 53, if it
+                // plays: the patch chains to it.
+                let idle = self
+                    .notes
+                    .iter()
+                    .rposition(|n| n.thread == 0 && n.track == track);
+                if let Some(note) = idle {
+                    self.chain(note, track, patch);
+                } else if let Some(mut thread) = self.thread(0, owner, track) {
                     thread.id = 0;
                     thread.registers[usize::from(PATCH)] = patch as i32;
                     self.note_on(&thread);
                 }
             }
+        }
+    }
+
+    /// Chains a patch to the note at `note`, to play when it ends.
+    fn chain(&mut self, note: usize, track: u32, patch: u32) {
+        if !self.load_patch(patch) {
+            return;
+        }
+        if self.notes[note].chain.len() >= CHAIN {
+            self.report(format!("track {track}: more than {CHAIN} chained"));
+        } else {
+            self.notes[note].chain.push(patch);
         }
     }
 
@@ -921,7 +968,7 @@ impl<S: Samples> Player<S> {
     /// Renders `frames` frames of interleaved stereo (left, then right):
     /// the player's own output. [`Player::render`] is its mono mix.
     pub fn render_stereo(&mut self, frames: usize, sources: &dyn Sources) -> Vec<i16> {
-        let Some(samples) = frames.checked_mul(2) else {
+        let Some(samples) = frames.checked_mul(2).filter(|_| frames <= RENDER_LIMIT) else {
             self.report(format!("cannot render {frames} frames at once"));
             return Vec::new();
         };
@@ -936,9 +983,11 @@ impl<S: Samples> Player<S> {
         out
     }
 
-    /// Renders until nothing runs or plays, at most `limit` frames. The
-    /// output ends with the block in which the last note ended.
+    /// Renders until nothing runs or plays, at most `limit` frames (and
+    /// at most [`RENDER_LIMIT`]). The output ends with the block in which
+    /// the last note ended.
     pub fn render_until_idle(&mut self, limit: usize, sources: &dyn Sources) -> Vec<i16> {
+        let limit = limit.min(RENDER_LIMIT);
         let mut out = Vec::new();
         while out.len() < limit {
             self.run_at_block_start(sources);
@@ -1363,7 +1412,16 @@ impl<S: Samples> Player<S> {
                         self.report(format!("patch {patch}: no sample at {path}"));
                     }
                     let mp3 = path.to_ascii_lowercase().ends_with(".mp3");
-                    pcm.map(|pcm| if mp3 { resample(&pcm, RATE) } else { pcm })
+                    match pcm {
+                        Some(pcm) if mp3 => {
+                            let resampled = resample(&pcm, RATE);
+                            if resampled.is_none() {
+                                self.report(format!("patch {patch}: too long at {RATE} Hz"));
+                            }
+                            resampled
+                        }
+                        pcm => pcm,
+                    }
                 }
                 None => {
                     // Not cached: any number may name a missing patch,
@@ -1391,6 +1449,8 @@ impl<S: Samples> Player<S> {
         self.notes.push(Note {
             id,
             thread: thread.id,
+            track: thread.track,
+            object: thread.object,
             patch,
             position: 0,
             step: step(levels.rate),

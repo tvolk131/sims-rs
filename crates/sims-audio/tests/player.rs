@@ -756,7 +756,15 @@ fn too_many_frames_at_once_is_a_fault_not_a_panic() {
     let mut player = Player::new(vec![module(&[&GENERIC], 1)], loud(4), 1);
     assert!(player.render_stereo(usize::MAX, &NoSources).is_empty());
     assert!(player.render(usize::MAX / 2 + 1, &NoSources).is_empty());
-    assert_eq!(player.faults.len(), 2, "{:?}", player.faults);
+    // More than an hour at once is refused too, whether or not it would
+    // fit in memory.
+    let over = sims_audio::player::RENDER_LIMIT + 1;
+    assert!(player.render_stereo(over, &NoSources).is_empty());
+    assert_eq!(player.faults.len(), 3, "{:?}", player.faults);
+    // Rendering until idle stops at the limit.
+    play(&mut player, "e0");
+    let out = player.render_until_idle(usize::MAX, &NoSources);
+    assert!(out.len() <= BLOCK);
 }
 
 /// Plays patch 1 over and over: `note_on v1; wait_samp; loop`.
@@ -983,7 +991,7 @@ fn mp3_patches_play_at_the_output_rate() {
         channels: 2,
         samples: vec![0, 10, 100, 110, 200, 210, 300, 310],
     };
-    let half = resample(&pcm, RATE);
+    let half = resample(&pcm, RATE).unwrap();
     assert_eq!(half.rate, RATE);
     assert_eq!(half.samples, [0, 10, 200, 210]);
     let up = resample(
@@ -993,9 +1001,19 @@ fn mp3_patches_play_at_the_output_rate() {
             samples: vec![0, 100],
         },
         2 * RATE,
-    );
+    )
+    .unwrap();
     assert_eq!(up.samples, [0, 50, 100, 100]);
-    assert!(resample(&Pcm::default(), RATE).samples.is_empty());
+    assert!(resample(&Pcm::default(), RATE).unwrap().samples.is_empty());
+    // A result past half an hour is refused, not allocated.
+    let slow = |frames: usize, rate| Pcm {
+        rate,
+        channels: 1,
+        samples: vec![0; frames],
+    };
+    assert_eq!(resample(&slow(1, 1), u32::MAX), None);
+    assert_eq!(resample(&slow(2000, 1), RATE), None);
+    assert!(resample(&slow(1799, 1), RATE).is_some());
     // A patch whose file is an MP3 is resampled when loaded.
     let mut hot = module_with(&[&GENERIC], 1, 10, "");
     hot.hot.patches.get_mut(&1).unwrap().path = "one.mp3".into();
@@ -1004,4 +1022,76 @@ fn mp3_patches_play_at_the_output_rate() {
     let mut player = Player::new(vec![hot], files, 1);
     play(&mut player, "e0");
     assert_eq!(player.render(3, &NoSources), [5, 205, 0]);
+}
+
+#[test]
+fn a_mp3_too_long_once_resampled_is_a_fault() {
+    let mut module = module_with(&[&GENERIC], 1, 10, "");
+    module.hot.patches.get_mut(&1).unwrap().path = "one.mp3".into();
+    let mut files = samples();
+    files.insert(
+        "one.mp3".into(),
+        Pcm {
+            rate: 1,
+            channels: 1,
+            samples: vec![1; 2000],
+        },
+    );
+    let mut player = Player::new(vec![module], files, 1);
+    play(&mut player, "e0");
+    player.render(BLOCK, &NoSources);
+    assert!(player.faults[0].contains("too long"), "{:?}", player.faults);
+    assert!(player.is_idle());
+}
+
+#[test]
+fn an_object_that_goes_stops_notes_its_ended_threads_left() {
+    // e0 starts a note and ends; the note plays on without its thread.
+    let routine: &[u8] = &[2, 5, END];
+    let module = module_with(&[routine], 1, 10, "");
+    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    play_for(&mut player, 1, "e0");
+    player.render(BLOCK, &NoSources);
+    // The track still plays, so object 1 stays its instance when object
+    // 2 plays it too.
+    play_for(&mut player, 2, "e0");
+    player.render(BLOCK, &NoSources);
+    assert_eq!(player.render(1, &NoSources), [20_000]);
+    player.handle(&SoundEvent::StopObject { object: 1 });
+    assert_eq!(player.render(1, &NoSources), [10_000]);
+    player.handle(&SoundEvent::StopObject { object: 2 });
+    assert!(player.is_idle());
+}
+
+#[test]
+fn sequenced_patches_on_a_track_with_no_thread_chain_to_each_other() {
+    let module = module_with(&[&GENERIC], 1, 10, "seq=53,10,0,6\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "seq");
+    play(&mut player, "seq");
+    assert_eq!(
+        player.render(7, &NoSources),
+        [2000, 4000, -2000, 2000, 4000, -2000, 0]
+    );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn event_numbers_past_32_bits_are_faults() {
+    let events = "seq=53,10,0,4294967302\nplay=1,4294967306\nok=53,10,0,-1\n";
+    let module = module_with(&[&GENERIC], 1, 10, events);
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "seq");
+    play(&mut player, "play");
+    assert!(player.is_idle());
+    assert_eq!(player.faults.len(), 2, "{:?}", player.faults);
+    assert!(
+        player
+            .faults
+            .iter()
+            .all(|f| f.contains("does not fit 32 bits"))
+    );
+    // -1 fits (as 0xffffffff): no such hit list.
+    play(&mut player, "ok");
+    assert!(player.faults[2].contains("no hit list 4294967295"));
 }

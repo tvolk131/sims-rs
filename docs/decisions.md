@@ -43,7 +43,8 @@ shared by everyone playing it; this player runs a thread per play and
 uses a track's newest thread where the original uses its one object.
 When an object lets go of a track others still have, the original
 re-evaluates the track (0x5746d9, not read); here that object's threads
-fade out.
+fade out. A note whose thread has ended has no registers left to fade,
+so it stops at once when its track is let go.
 
 Reopen when a run with sound can be compared, when the music modes are
 ported, or when the simulation needs pause.
