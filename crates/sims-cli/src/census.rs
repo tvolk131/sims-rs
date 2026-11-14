@@ -143,6 +143,8 @@ impl Census {
     /// Walks a file or directory in sorted order, so reports are stable.
     pub fn add_path(&mut self, path: &Path) -> std::io::Result<()> {
         if path.is_dir() {
+            // Sorted below.
+            #[allow(clippy::disallowed_methods)]
             let mut entries: Vec<_> = std::fs::read_dir(path)?
                 .map(|e| e.map(|e| e.path()))
                 .collect::<Result<_, _>>()?;

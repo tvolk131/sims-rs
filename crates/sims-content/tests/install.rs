@@ -248,6 +248,19 @@ fn paths_resolve_ignoring_case() {
 }
 
 #[test]
+fn a_resolved_path_is_spelled_as_on_disk() {
+    // On a case-insensitive filesystem the spelling asked for would also
+    // open; the result must still be the one on disk, the same on every
+    // machine.
+    let tree = Tree::new("spelling");
+    tree.file("gamedata/behavior.IFF", b"behavior")
+        .dir("gamedata/OBJECTS");
+    let install = Install::detect(&tree.0).unwrap();
+    let path = install.file("GameData/Behavior.iff").unwrap();
+    assert_eq!(path, tree.0.join("gamedata").join("behavior.IFF"));
+}
+
+#[test]
 fn unreadable_archives_are_skipped_with_a_diagnostic() {
     let tree = Tree::new("bad-far");
     base_game(&tree);

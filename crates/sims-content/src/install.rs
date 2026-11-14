@@ -1,3 +1,4 @@
+use crate::index::sorted_entries;
 use crate::{Error, Result};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -158,29 +159,36 @@ impl Install {
 /// Resolves a `/`-separated relative path one component at a time,
 /// preferring an exact match and otherwise matching ASCII case-insensitively,
 /// as Windows does. Returns None when any component is absent.
+///
+/// The result is always spelled as the directory listings spell it, and a
+/// case-insensitive match takes the first name in [`sorted_entries`]
+/// order. A case-insensitive filesystem would otherwise hand back the
+/// spelling asked for, and a case-sensitive one the spelling on disk, and
+/// paths reach saved and hashed state.
 pub(crate) fn resolve(root: &Path, relative: &str) -> Result<Option<PathBuf>> {
     let mut path = root.to_path_buf();
     for component in relative.split('/').filter(|c| !c.is_empty()) {
-        let exact = path.join(component);
-        if exact.symlink_metadata().is_ok() {
-            path = exact;
+        if component == "." || component == ".." {
+            path.push(component);
             continue;
         }
-        let entries = std::fs::read_dir(&path).map_err(|e| Error::io(&path, e))?;
-        let mut found = None;
-        for entry in entries {
-            let entry = entry.map_err(|e| Error::io(&path, e))?;
-            if entry
-                .file_name()
+        let entries = sorted_entries(&path)?;
+        let name = |p: &PathBuf| {
+            p.file_name()
+                .unwrap_or_default()
                 .as_encoded_bytes()
-                .eq_ignore_ascii_case(component.as_bytes())
-            {
-                found = Some(entry.path());
-                break;
-            }
-        }
+                .to_vec()
+        };
+        let found = entries
+            .iter()
+            .find(|p| name(p) == component.as_bytes())
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|p| name(p).eq_ignore_ascii_case(component.as_bytes()))
+            });
         match found {
-            Some(next) => path = next,
+            Some(next) => path = next.clone(),
             None => return Ok(None),
         }
     }
@@ -191,14 +199,8 @@ fn holds_archive(directory: &Path) -> Result<bool> {
     if !directory.is_dir() {
         return Ok(false);
     }
-    let entries = std::fs::read_dir(directory).map_err(|e| Error::io(directory, e))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| Error::io(directory, e))?;
-        let name = entry.file_name();
-        let name = name.as_encoded_bytes();
-        if name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(b".far") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(sorted_entries(directory)?.iter().any(|path| {
+        let name = path.file_name().unwrap_or_default().as_encoded_bytes();
+        name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(b".far")
+    }))
 }
