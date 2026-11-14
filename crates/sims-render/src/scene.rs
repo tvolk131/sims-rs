@@ -1,7 +1,7 @@
 //! Draws a lot: terrain, floors, walls and objects, level by level.
 
 use crate::assets::{Assets, Definition};
-use crate::camera::{Camera, Walls, Zoom};
+use crate::camera::{self, Camera, Walls, Zoom};
 use crate::canvas::{Canvas, Image};
 use crate::depth;
 use crate::lot::{self, Lot, WallCell};
@@ -339,12 +339,15 @@ impl Painter<'_> {
                         continue;
                     };
                     let (w, h) = (image.width as i32, image.height as i32);
+                    // The sprite's bottom row sits one pixel above the
+                    // corner's projected point (matched against the
+                    // original's screen, 2026-11-14).
                     let (foot, at) = match frame {
-                        0 | 2 => (left, [left[0], left[1] - (h - 1)]),
-                        1 => (left, [left[0], left[1] - (h - 1 - rise)]),
+                        0 | 2 => (left, [left[0], left[1] - h]),
+                        1 => (left, [left[0], left[1] - (h - rise)]),
                         _ => {
                             let bottom = if a[1] > b[1] { a } else { b };
-                            (bottom, [bottom[0] - w / 2, bottom[1] - (h - 1)])
+                            (bottom, [bottom[0] - w / 2, bottom[1] - h])
                         }
                     };
                     let elevation = base + self.corner_elevation(s.from);
@@ -370,6 +373,12 @@ impl Painter<'_> {
         for (&id, o) in &self.world.objects {
             let [x, y, z] = o.position;
             if o.person.is_some() || z != level || x < 0 || y < 0 {
+                continue;
+            }
+            // A script can hide an object (data word 34); the original
+            // skips it when drawing, as the old prototype did
+            // (`legacy/crates/sims-render/src/lib.rs`).
+            if o.data.get(HIDDEN).is_some_and(|&w| w != 0) {
                 continue;
             }
             let tile = [x >> 4, y >> 4];
@@ -415,14 +424,27 @@ impl Painter<'_> {
                 self.stats.missing_objects += 1;
                 continue;
             }
+            let facing = o.data.get(1).copied().unwrap_or(0);
+            let base = level_elevation(level) + ground;
             for part in parts {
                 if !sprite_visible(part.sprite, definition.dynamic_base, &o.dynamic_sprites) {
                     continue;
                 }
+                // Offsets come from the files and may be anything; the
+                // canvas clips whatever this gives.
+                let height = i32::try_from(part.image.height).unwrap_or(i32::MAX);
                 let at = [
-                    screen[0] + part.offset[0],
-                    screen[1] + part.offset[1] - part.image.height as i32,
+                    screen[0].saturating_add(part.offset[0]),
+                    screen[1]
+                        .saturating_add(part.offset[1])
+                        .saturating_sub(height)
+                        .saturating_sub(sprite_rise(part.object, self.camera.zoom)),
                 ];
+                let anchor = if part.object == [0.0; 3] {
+                    anchor
+                } else {
+                    part_anchor(self.camera, o.position, facing, part.object, base)
+                };
                 self.canvas.draw(&part.image, at, part.flip, |_, _, byte| {
                     depth::sprite(anchor, byte)
                 });
@@ -430,6 +452,65 @@ impl Painter<'_> {
             self.stats.objects += 1;
         }
     }
+}
+
+/// An object's data word that hides it when not zero (the simulation's
+/// `HIDDEN`).
+const HIDDEN: usize = 34;
+
+/// A draw group sprite's world offset (`object`), made safe: x and y in
+/// sixteenths of a tile, z in height units, finite and clamped to a lot's
+/// width so nonsense in a file cannot overflow anything.
+fn sprite_offset(object: [f32; 3]) -> [f32; 3] {
+    let limit = (camera::ARRAY_SIZE * 16) as f32;
+    object.map(|v| {
+        if v.is_finite() {
+            v.clamp(-limit, limit)
+        } else {
+            0.0
+        }
+    })
+}
+
+/// How many screen pixels a sprite rises for its world offset's height
+/// `z`: `z * (2 << zoom)`, rounded as the original's `__ftol` does (add a
+/// half, then truncate toward zero). This is the original's catalog
+/// preview (0x438ae4 to 0x438b58, read by the old prototype in
+/// `legacy/crates/sims-render/src/object_preview/software.rs`); that the
+/// lot view places sprites the same way is **unverified**.
+fn sprite_rise(object: [f32; 3], zoom: Zoom) -> i32 {
+    let z = sprite_offset(object)[2];
+    if z == 0.0 {
+        return 0;
+    }
+    (z * (2 << zoom.level()) as f32 + 0.5).trunc() as i32
+}
+
+/// The depth anchor of a draw group sprite that sits `object` away from
+/// an object at `position` (fine units) facing `facing` (data word 1), on
+/// ground `base` near-zoom pixels up. The offset's x and y are sixteenths
+/// of a tile in the object's own frame, and turn with it a quarter turn per
+/// two steps of facing, as the old prototype turned them; z is in height
+/// units of 16 near-zoom pixels (2 << 3, as [`sprite_rise`]). The old
+/// prototype read the same units (`legacy/crates/sims-render/src/lib.rs`
+/// divides x and y by 16 to get tiles).
+fn part_anchor(
+    camera: &Camera,
+    position: [i32; 3],
+    facing: i16,
+    object: [f32; 3],
+    base: i32,
+) -> i32 {
+    let [mut x, mut y, z] = sprite_offset(object);
+    for _ in 0..(i32::from(facing) / 2).rem_euclid(4) {
+        (x, y) = (-y, x);
+    }
+    let fine = [
+        position[0] + x.round() as i32,
+        position[1] + y.round() as i32,
+    ];
+    let up = (z * 16.0).round() as i32;
+    depth::point(camera.rotate_fine(fine), base + up)
 }
 
 /// The draw group view (one bit of 1, 4, 16 and 64) for an object facing
@@ -465,8 +546,16 @@ fn object_edge(position: [i32; 3], data: &[i16]) -> Option<Edge> {
     Some(edge(a, b))
 }
 
+/// The wall style whose cut-down shape a cut wall with a door or window in
+/// it takes.
+const PLAIN_STYLE: u16 = 1;
+
 /// A wall face: the pattern's frame cut to the shape's frame. A wall with
-/// style 22 or 23 takes its shape from the door or window in it.
+/// style 22 or 23 takes its shape from the door or window in it when it is
+/// up. Cut down, it is a plain wall's stub: the opening's own cut sprites
+/// are one small outline shared by every door and window, and the
+/// original shows the same stub under a window as beside it (screenshot
+/// comparison, 2026-11-14; which style's stub it takes is unverified).
 fn wall_image(
     assets: &mut Assets,
     pattern: u16,
@@ -477,8 +566,11 @@ fn wall_image(
     frame: usize,
 ) -> Option<Image> {
     let shape = match opening {
+        Some(_) if cut && matches!(style, 22 | 23) => {
+            assets.shape(PLAIN_STYLE, true, zoom)?[frame].clone()
+        }
         Some(definition) if matches!(style, 22 | 23) => {
-            assets.object_shape(definition, cut, zoom)?[frame].clone()
+            assets.object_shape(definition, false, zoom)?[frame].clone()
         }
         _ => assets.shape(style, cut, zoom)?[frame].clone(),
     };
@@ -606,6 +698,52 @@ mod tests {
         assert_eq!(view_direction(0, &camera(1)), 4);
         assert_eq!(view_direction(6, &camera(1)), 1);
         assert_eq!(view_direction(4, &camera(3)), 4);
+    }
+
+    #[test]
+    fn sprite_world_offsets_move_depth_with_the_object_and_camera() {
+        let position = [100, 200, 1];
+        let base = 32;
+        let anchor = depth::point(camera(0).rotate_fine([100, 200]), base);
+        assert_eq!(part_anchor(&camera(0), position, 0, [0.0; 3], base), anchor);
+        // One height unit up is 16 near-zoom pixels, and nearer.
+        assert_eq!(
+            part_anchor(&camera(0), position, 0, [0.0, 0.0, 1.0], base),
+            depth::point([100, 200], base + 16)
+        );
+        // Sixteen units along x is one tile, at facing 0; at facing 2 (a
+        // quarter turn) x becomes y.
+        assert_eq!(
+            part_anchor(&camera(0), position, 0, [16.0, 0.0, 0.0], base),
+            depth::point([116, 200], base)
+        );
+        assert_eq!(
+            part_anchor(&camera(0), position, 2, [16.0, 0.0, 0.0], base),
+            depth::point([100, 216], base)
+        );
+        // The camera's rotation turns the moved point like any other.
+        assert_eq!(
+            part_anchor(&camera(1), position, 2, [16.0, 0.0, 0.0], base),
+            depth::point(camera(1).rotate_fine([100, 216]), base)
+        );
+        // Nonsense in a file stays bounded.
+        for bad in [f32::NAN, f32::INFINITY, f32::MAX, f32::MIN] {
+            let _ = part_anchor(&camera(3), position, i16::MIN, [bad, bad, bad], base);
+            let _ = sprite_rise([bad, bad, bad], Zoom::Near);
+        }
+    }
+
+    #[test]
+    fn a_sprite_rises_by_its_height_at_each_zoom() {
+        // 2 << zoom pixels per height unit, rounded half up toward zero.
+        assert_eq!(sprite_rise([0.0, 0.0, 0.25], Zoom::Near), 4);
+        assert_eq!(sprite_rise([0.0, 0.0, 0.25], Zoom::Medium), 2);
+        assert_eq!(sprite_rise([0.0, 0.0, 0.25], Zoom::Far), 1);
+        assert_eq!(sprite_rise([0.0, 0.0, 0.4082483], Zoom::Near), 7);
+        assert_eq!(sprite_rise([5.0, -3.0, 0.0], Zoom::Near), 0);
+        // __ftol truncates after adding a half: -0.25 at the near zoom is
+        // -4 + 0.5 = -3.5, which truncates to -3.
+        assert_eq!(sprite_rise([0.0, 0.0, -0.25], Zoom::Near), -3);
     }
 
     #[test]

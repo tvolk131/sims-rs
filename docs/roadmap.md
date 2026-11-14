@@ -1251,10 +1251,18 @@ Progress:
   posture's standing loop; a person is placed and turned from the
   animator's position and direction. The Goths stand and walk offscreen
   (pinned by digest).
-- Next: a viewer, and the comparison with the original. The simulation
-  does not yet expose the base layer's clip and phase (a read-only
-  accessor is wanted; until then the saved record and the animator's
-  clock stand in).
+- Done: a small viewer (`people-viewer`, behind the `viewer` feature)
+  plays the house's people standing or walking, or draws them where a
+  simulation snapshot has them; it can also write one frame to a PNG.
+- Done: one pose compared with the original. Bella walking, seen from
+  behind in the emulator, matches in meshes, textures, proportions and
+  pose (see the decisions entry). Appearances are also found by their
+  own names across every catalog.
+- Next: settle whether the drawing is the original's mirror image (a
+  front view of a fixed asymmetric feature), and compare the standing
+  loop. The simulation does not yet expose the base layer's clip and
+  phase (a read-only accessor is wanted; until then the saved record and
+  the animator's clock stand in).
 
 ## Track: lot rendering (`crates/sims-render`)
 
@@ -1272,8 +1280,15 @@ Progress:
   doors and windows cut into them) and object sprites draw at every zoom
   and rotation, with walls up, cut away or down. The Goth house renders
   are pinned by digest, gated on `SIMS_INSTALL`.
-- Next: a viewer window, a screenshot of the original at the same camera
-  and the comparison, then what it shows needs fixing.
+- Done: `sims-viewer` shows a house (or a world saved by `sims boot
+  --snapshot`) in a window, with keys and the mouse for zoom, rotation,
+  floor, the three wall modes and scrolling, and saves frames as PNGs.
+- Done: one camera (far zoom, rotation 0, floor 1, cutaway) compared
+  with a screenshot of the original. The projection and outdoor sprites
+  match pixel for pixel, and two wall bugs it showed are fixed. See the
+  decisions log for what still differs.
+- Next: indoor lighting, the original's grass, the cut-wall cap, and
+  which rooms the cutaway cuts, each checked against the original.
 
 ## Track: sound (`crates/sims-audio`)
 

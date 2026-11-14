@@ -12,30 +12,30 @@ use std::path::PathBuf;
 /// SHA-256 prefixes of the 16-bit-color images, by zoom, rotation and wall
 /// mode.
 const DIGESTS: &[(u32, u8, &str, &str)] = &[
-    (1, 0, "up", "ed40a57d0ac891c2"),
-    (1, 0, "cutaway", "66835f49f48a9532"),
-    (1, 1, "up", "85bafcaa96b02dc0"),
-    (1, 1, "cutaway", "d64c2b39e4cfc77a"),
-    (1, 2, "up", "34c4a9587c2fbe28"),
-    (1, 2, "cutaway", "81e446a951472237"),
-    (1, 3, "up", "38441fa50f4beb72"),
-    (1, 3, "cutaway", "2724148364661a3e"),
-    (2, 0, "up", "3804d6e11de7cf64"),
-    (2, 0, "cutaway", "f8a111dfaa49d286"),
-    (2, 1, "up", "f987403c45affa58"),
-    (2, 1, "cutaway", "e0b70b9b4ac4f798"),
-    (2, 2, "up", "091e75a9247ccda3"),
-    (2, 2, "cutaway", "8a6085900a800d7a"),
-    (2, 3, "up", "7f8a8dbed7c66201"),
-    (2, 3, "cutaway", "814bdc50bcc0dd40"),
-    (3, 0, "up", "cb4aa1d98450514b"),
-    (3, 0, "cutaway", "b5881cc149557c89"),
-    (3, 1, "up", "29b2fc7ab265f7ba"),
-    (3, 1, "cutaway", "c6b676bc98c658e2"),
-    (3, 2, "up", "f353a9c767bc4acd"),
-    (3, 2, "cutaway", "64ccf77383ad7fbb"),
-    (3, 3, "up", "a6e5bb547ffc7b62"),
-    (3, 3, "cutaway", "b69fdcf6345f1e8d"),
+    (1, 0, "up", "d07459f872048a4b"),
+    (1, 0, "cutaway", "fbc4a91753a88036"),
+    (1, 1, "up", "3c422a55a7aee711"),
+    (1, 1, "cutaway", "b553127ed33f100b"),
+    (1, 2, "up", "06d020fa4f9401f9"),
+    (1, 2, "cutaway", "93ffcb6805e8ba82"),
+    (1, 3, "up", "49ee489d59a65978"),
+    (1, 3, "cutaway", "5f392bb5618445fc"),
+    (2, 0, "up", "e2c8316fd24d1a6d"),
+    (2, 0, "cutaway", "ac4f8683d45ab4bb"),
+    (2, 1, "up", "6081ad6788a96676"),
+    (2, 1, "cutaway", "c54c214f792cb01a"),
+    (2, 2, "up", "9365b02c70cab2da"),
+    (2, 2, "cutaway", "e47fcea0a1d216fe"),
+    (2, 3, "up", "b6bf2d5cc6f052d6"),
+    (2, 3, "cutaway", "6167445203b39a7a"),
+    (3, 0, "up", "a8d663bd2526bf7a"),
+    (3, 0, "cutaway", "d945a633c971540c"),
+    (3, 1, "up", "0a1df0437d4eb206"),
+    (3, 1, "cutaway", "e832602945625d60"),
+    (3, 2, "up", "944832ab16c63618"),
+    (3, 2, "cutaway", "220f3537fc041c67"),
+    (3, 3, "up", "dcca6eb990c55973"),
+    (3, 3, "cutaway", "7f9ad8f959576537"),
 ];
 
 fn install() -> Option<PathBuf> {
@@ -96,4 +96,41 @@ fn goth_house_renders_the_same_at_every_zoom_and_rotation() {
         .map(|&(z, r, n, h)| (z, r, n, h.to_string()))
         .collect();
     assert_eq!(found, expected);
+}
+
+#[test]
+fn hidden_objects_are_not_drawn() {
+    let Some(root) = install() else {
+        return;
+    };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut opened = open_house(&root, &house).unwrap();
+    let lot = Lot::from_world(&opened.world).unwrap();
+    let mut camera = Camera {
+        zoom: Zoom::Far,
+        rotation: 0,
+        level: 1,
+        origin: [0, 0],
+        walls: Walls::Up,
+    };
+    camera.center_on(lot.built_center(), [200, 150]);
+    let mut shown = Canvas::new(400, 300, [0, 0, 0]);
+    let before = draw(&opened.world, &lot, &mut opened.assets, &camera, &mut shown);
+    assert!(before.objects > 100);
+    // Data word 34 hides an object (the simulation's HIDDEN).
+    for object in opened.world.objects.values_mut() {
+        if object.data.len() > 34 {
+            object.data[34] = 1;
+        }
+    }
+    let mut hidden = Canvas::new(400, 300, [0, 0, 0]);
+    let after = draw(
+        &opened.world,
+        &lot,
+        &mut opened.assets,
+        &camera,
+        &mut hidden,
+    );
+    assert_eq!(after.objects, 0);
+    assert_ne!(shown, hidden);
 }

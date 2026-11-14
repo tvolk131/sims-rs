@@ -83,7 +83,11 @@ impl Lot {
             world
                 .arrays
                 .get(&id)
-                .filter(|a| a.width == FULL && a.height == FULL)
+                .filter(|a| {
+                    a.width == FULL
+                        && a.height == FULL
+                        && Some(a.data.len()) == (FULL * FULL).checked_mul(a.stride)
+                })
                 .ok_or_else(|| Error::new(format!("the lot has no 64 by 64 array {id}")))
         };
         let heights = {
@@ -221,5 +225,36 @@ fn check(ok: bool, id: u16) -> Result<()> {
         Err(Error::new(format!(
             "array {id} has an unexpected cell size"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sims_formats::lot::Array;
+
+    fn array(stride: usize, len: usize) -> Array {
+        Array {
+            width: FULL,
+            height: FULL,
+            stride,
+            encoding: 0,
+            data: vec![0; len],
+        }
+    }
+
+    #[test]
+    fn arrays_shorter_than_their_size_are_an_error() {
+        let mut world = World::empty();
+        let full = FULL * FULL;
+        for (id, stride) in [(0, 4), (1, 1), (2, 8), (101, 1), (102, 8)] {
+            world.arrays.insert(id, array(stride, full * stride));
+        }
+        let lot = Lot::from_world(&world).expect("full arrays read");
+        assert_eq!(lot.built_center(), [512, 512]);
+        world.arrays.insert(2, array(8, 0));
+        assert!(Lot::from_world(&world).is_err());
+        world.arrays.insert(2, array(8, full * 8 + 1));
+        assert!(Lot::from_world(&world).is_err());
     }
 }

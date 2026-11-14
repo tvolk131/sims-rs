@@ -67,6 +67,143 @@ running game.
   waits for the dialog to be answered by hand) are not handled.
 - Dialog button places are written in the scenario, not read from the
   dialog.
+
+## 2026-11-14: Hidden objects, sprite world offsets and soft edges in the lot drawing
+
+A review of `crates/sims-render` found four defects. All four are fixed,
+with tests.
+
+- **Hidden objects are not drawn.** An object whose data word 34 is not
+  zero is hidden; the simulation (`HIDDEN` in `sims-vm`) and the old
+  prototype skip it, and now the renderer does too. Checked against the
+  original: the Goth house file hides 18 objects, and one of them, a
+  table on the road, showed in our far-zoom render but is not in the
+  original's screenshot. At that camera (far zoom, rotation 0, floor 1),
+  exact matches among non-grass pixels rose from 33.6% to 33.9% with
+  walls cut away and from 39.5% to 39.7% with walls up. Objects inside
+  other objects are not drawn at their slots yet, so a hidden container
+  does not hide its contents here.
+- **A draw group sprite's world offset is kept.** Each sprite of a draw
+  group (DGRP) carries a position relative to the object. It was
+  dropped. Its units: x and y are sixteenths of a tile in the object's
+  own frame, and z is height, where one unit is `2 << zoom` screen
+  pixels (16 at the near zoom). The old prototype divided x and y by 16
+  to get tiles (`legacy/crates/sims-render/src/lib.rs`).
+  - z raises the sprite on screen by `z * (2 << zoom)` pixels, rounded
+    by adding a half and truncating, as the original's catalog preview
+    does (0x438ae4 to 0x438b58, read by the old prototype in
+    `legacy/crates/sims-render/src/object_preview/software.rs`). That
+    the lot view places sprites the same way is **unverified**.
+  - x, y and z all move the depth the sprite is drawn at. x and y turn
+    with the object's facing, a quarter turn per two steps (the old
+    prototype's rotation). The preview leaves x and y out of the
+    sprite's screen position, and so does this; that is **unverified**
+    for the lot view too.
+  - None of the groups the Goth house draws now has a nonzero offset,
+    so no render changed, and nothing here has been compared with the
+    original.
+- **Soft edges write depth.** A sprite pixel that is partly transparent
+  now writes its depth as well as blending its colour, as the old
+  prototype's blitter did. Before, a farther pixel drawn later could
+  show through a nearer soft edge. This changed several pinned renders
+  slightly. The compared camera did not change at all.
+- **Sprite positions cannot overflow.** Draw group offsets are any
+  32-bit number. Placing and clipping a sprite now use wider or
+  saturating arithmetic, so a sprite far off the screen draws nothing
+  instead of panicking. An image whose pixel count does not match its
+  size, or overflows, draws nothing.
+
+What would reopen it: a camera where an object with a nonzero world
+offset can be compared with the original, or a reading of the
+original's blitter that treats soft edges differently.
+
+## 2026-11-14: The lot viewer opens a window with winit and softbuffer
+
+`crates/sims-viewer` is a small program that shows a lot drawn by
+`sims-render` in a window. It opens the window with `winit` and copies
+the CPU-drawn frame into it with `softbuffer`; no GPU is involved. These
+two crates are dependencies of `sims-viewer` only. `sims-render` stays
+free of window code, so tests draw offscreen and `cargo test` never
+needs a display, and `sims-vm`, `sims-sim` and `sims-core` never see
+either crate.
+
+The frame is drawn at the original's pixel size and scaled up by whole
+pixels on high-DPI screens, so pixels stay sharp. The keys follow the
+original where it has one: three wall modes, quarter-turn rotations,
+three zooms and two floors. The viewer reads either a house file or a
+world saved by `sims boot --snapshot`, and only reads it.
+
+The two crates are the same versions the people viewer uses (see the
+entry below), so `Cargo.lock` gains no new packages. Unlike the people
+viewer, `sims-viewer` is not behind a feature: it is its own crate, and
+CI builds it. The Linux X11 and Wayland back ends load their system
+libraries at run time, so CI needs no new system packages.
+
+What would reopen it: the UI track needing a GPU, text or widgets that
+softbuffer cannot give, at which point the window code moves to wgpu
+or another toolkit, still outside `sims-render`.
+## 2026-11-14: Bella Goth compared with the original; the mirror is still open
+
+One pose was compared with the original game. The game ran in the
+emulator harness (`tools/harness/`, its own container and guest copy),
+with House05 loaded from the install and the house view at near zoom.
+Bella (person 18) was walking away from the camera, and a screenshot was
+taken from behind at about 27 pixels per model unit. `sims-people` then
+drew person 18 from the same saved outfit at the same scale, playing
+`a2o-walking-loop` at directions 3.5 to 4.5 and phases 0.05 to 0.8. The
+screenshots and renders stay private, outside the repository.
+
+What matches: the meshes (body, head, long hair, hands, shoes), the
+textures (the red dress with its open back, the skin tone, the hair), the
+proportions, and the hem's length. The pose falls inside the walk cycle:
+it looks like phases 0.05 to 0.3.
+
+What the comparison does not settle:
+
+- **Mirror image: unverified.** The drawing negates file X (see
+  `crate::rig`). A capture from behind has no fixed feature that is
+  different on the left and right. The hem looks like one, but drawn at
+  several phases its lower side flips with the stride, and the
+  screenshot's phase is not known. Settling it needs a fixed asymmetric
+  feature seen in the original: for example, a printed shirt or a hair
+  parting, seen from the front.
+- Light and shading: the renderer uses its own light, not the
+  original's.
+- Pixel positions: the camera was not matched to the original's pixel
+  for pixel.
+- The standing loop, Mortimer (person 21) and Cassandra (person 16, a
+  child): the capture showed neither of them in their saved outfits.
+
+Mortimer was also seen walking, in a work uniform (a lab coat). That
+outfit is not among his saved outfits and was not found in the install,
+so it was not compared. Looking for it showed that an appearance's own
+name does not always match its file's name (`B629MAFitlgt_labtech` is in
+`b629ma_labtech.cmx`). So appearances are now also found by their own
+names across every catalog, as the old prototype did
+(legacy/crates/sims-content/src/avatar.rs).
+
+## 2026-11-14: The people viewer is a feature-gated window
+
+`people-viewer` is a small window binary in `sims-people`. It uses
+`winit` (the window and its events) and `softbuffer` (copies the
+software rasterizer's image to the window). Both are optional
+dependencies behind the crate's `viewer` feature, and nothing else in
+the workspace enables it. So the default build, `cargo test` and CI
+never compile them. They add 187 packages to `Cargo.lock`, which CI does
+not download, and leave every existing package's version unchanged. The
+cost is that CI does not build the viewer; run
+`cargo clippy -p sims-people --features viewer --all-targets` after
+changing it.
+
+The viewer reads the wall clock to play clips in real time, so the
+binary allows the workspace's determinism lint. Nothing it computes
+reaches the simulation. It reads a simulation snapshot through
+`sims_sim::Snapshots` and makes its own `Animator` values for the
+standing and walking demonstration; it never changes simulation code.
+
+`--png <file>` draws one frame without a window, so the viewer's
+drawing can be checked headless.
+
 ## 2026-11-14: The HIT player runs real sound events into PCM (track 3, sound)
 
 `sims_audio::player::Player` is the HIT virtual machine, with a mixer.
@@ -257,6 +394,67 @@ How it was checked:
 
 Not checked against the original. The game's own XA decoder was not
 traced in the executable, and the harness runs with `-nosound`.
+
+## 2026-11-14: The lot drawing compared with the original's screen
+
+One camera was compared: the Goth house (House05) as the game opens it,
+far zoom, rotation 0, floor 1, walls cut away, with the window at 800 by
+600. The original ran in the comparison harness (its own guest and
+container); screenshots were taken with `xwd` and nothing was written to
+the guest's memory. The screenshots stay outside the repository.
+
+How: the render is drawn on a larger canvas, the screenshot's offset in
+it is found by search, and both are reduced to the original's 16-bit
+colour (5, 6 and 5 bits) before pixels are compared. Grass-green pixels
+of the render are left out of the search, because the grass is not the
+original's yet.
+
+What matches:
+
+- **The projection.** The original's camera is a pure translation of
+  ours: the same offset aligns the yard, the house and the road.
+- **Object sprites outdoors** (hedges, gravestones, trees, the fountain,
+  the mailbox) match pixel for pixel at that offset.
+- **The road and sidewalk**: 82% of pixels are exactly equal, most of
+  the rest one step off.
+- **Wall sprites**, once two bugs were fixed (below). With walls up,
+  27% of pixels in the compared area match exactly, up from 19%. Most
+  of the remaining difference is grass, lighting and the Sims.
+
+Fixed by the comparison:
+
+- Walls were drawn one pixel too low. The wall sprite's bottom row sits
+  one pixel above the corner's projected point, not on it.
+- A cut-down wall with a door or window in it showed the opening's cut
+  sprite, a small outline shared by every door and window. The original
+  draws the same short stub there as beside the opening, so it now takes
+  the stub of plain wall style 1. Which style the original takes is
+  **unverified**; the house only uses style 1 around its openings.
+
+What does not match yet:
+
+- **Lighting.** The original darkens floors, walls and objects indoors
+  by the room's light. Everything here is drawn at full brightness, so
+  most indoor pixels differ, though their shapes line up.
+- **Grass.** The original's grass is a smooth, shaded texture. Ours is a
+  made-up speckle, and lots whose grass value is low draw brown where
+  the original is green.
+- **The cap on a cut wall.** The original draws a three-row wood trim on
+  top of a cut-down wall's stub. Its source is not found yet (it is not
+  the wall pattern's top rows nor the 4096, 5120 and 6144 sprites of
+  `walls.iff`).
+- **Which walls cut away.** The original cuts walls room by room; its
+  view keeps a 64 by 64 tile mask per visible room (the old prototype's
+  reading in `legacy/crates/sims-sim/src/lot_presenter/room_masks.rs`).
+  Right after the house opened, every ground-floor wall was still up.
+  About a minute later most rooms were cut away, but the bathroom and
+  the front of the round living room were not. Our rule (cut a wall
+  unless it is a room's back wall) cuts them all.
+- **Sims** are not drawn here; the people track draws them.
+
+What would reopen it: a second camera (another zoom or rotation) that
+disagrees, or a reading of the original's lighting or cutaway room
+choice.
 
 ## 2026-11-14: Drawing the lot starts in its own crate, on the CPU
 
