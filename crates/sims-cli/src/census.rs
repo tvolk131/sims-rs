@@ -452,6 +452,21 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_link_inside_a_directory_is_skipped() {
+        let directory =
+            std::env::temp_dir().join(format!("sims-census-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::os::unix::fs::symlink(directory.join("gone"), directory.join("link")).unwrap();
+        let mut census = Census::default();
+        census.add_path(&directory).unwrap();
+        assert!(census.add_path(&directory.join("link")).is_err());
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(census.report().contains("visited: 0\n"));
+    }
+
     #[test]
     fn an_archive_on_disk_claiming_a_huge_directory_is_not_read() {
         let path =
