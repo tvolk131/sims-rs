@@ -33,25 +33,33 @@ const END: u8 = 12;
 /// track `10 + i` (with `kArgsIdVolPan` arguments) and event `e{i}`.
 /// Patches 1 and 2 are `one.xa` and `two.xa`; hit list 5 holds both.
 fn module(routines: &[&[u8]], patch: u32) -> Module {
+    module_with(routines, patch, 10, "")
+}
+
+/// [`module`], with tracks numbered from `first` (events still `e{i}`)
+/// and more lines in its `[EventMapping]` section. Hit list 6 holds
+/// patch 2 alone.
+fn module_with(routines: &[&[u8]], patch: u32, first: u32, events: &str) -> Module {
     let (hit, addresses) = assemble(routines);
     let mut hot = String::from("[EventMappingEquate]\nkSndobPlay=1\n[TrackData]\n");
     for (i, address) in addresses.iter().enumerate() {
         hot.push_str(&format!("{:#x}={address:#x}\n", 0x100 + i));
     }
     hot.push_str("[Patch]\n1=0,one,\"one.xa\"\n2=0,two,\"two.xa\"\n");
-    hot.push_str("[GlobalHitList]\n5=1,2\n[Track]\n");
+    hot.push_str("[GlobalHitList]\n5=1,2\n6=2\n[Track]\n");
     for i in 0..routines.len() {
         hot.push_str(&format!(
             "{}=0,t{i},1024,2,0,0,0,{:#x},{patch}\n",
-            10 + i,
+            first as usize + i,
             0x100 + i
         ));
     }
     hot.push_str("[EventMapping]\n");
     for i in 0..routines.len() {
-        hot.push_str(&format!("e{i}=kSndobPlay,{}\n", 10 + i));
+        hot.push_str(&format!("e{i}=kSndobPlay,{}\n", first as usize + i));
     }
     hot.push_str("other=7,10\n");
+    hot.push_str(events);
     Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap()
 }
 
@@ -267,7 +275,7 @@ fn unknown_events_and_bad_code_are_faults_not_panics() {
     player.render(BLOCK, &NoSources);
     assert_eq!(player.faults.len(), 4, "{:?}", player.faults);
     assert!(player.faults[0].contains("no event nothing"));
-    assert!(player.faults[1].contains("kind Some(7)"));
+    assert!(player.faults[1].contains("kind 7 is not one"));
     assert!(player.faults[2].contains("unknown opcode 26"));
     assert!(player.faults[3].contains("ran too long"));
     assert!(player.is_idle());
@@ -748,5 +756,342 @@ fn too_many_frames_at_once_is_a_fault_not_a_panic() {
     let mut player = Player::new(vec![module(&[&GENERIC], 1)], loud(4), 1);
     assert!(player.render_stereo(usize::MAX, &NoSources).is_empty());
     assert!(player.render(usize::MAX / 2 + 1, &NoSources).is_empty());
+    // More than an hour at once is refused too, whether or not it would
+    // fit in memory.
+    let over = sims_audio::player::RENDER_LIMIT + 1;
+    assert!(player.render_stereo(over, &NoSources).is_empty());
+    assert_eq!(player.faults.len(), 3, "{:?}", player.faults);
+    // Rendering until idle stops at the limit.
+    play(&mut player, "e0");
+    let out = player.render_until_idle(usize::MAX, &NoSources);
+    assert!(out.len() <= BLOCK);
+}
+
+/// Plays patch 1 over and over: `note_on v1; wait_samp; loop`.
+const LOOPING: [u8; 4] = [2, 5, WAIT_SAMP, LOOP];
+
+fn play_for(player: &mut Player<BTreeMap<String, Pcm>>, object: u32, name: &str) {
+    player.handle(&SoundEvent::Play {
+        object,
+        name: name.into(),
+    });
+}
+
+#[test]
+fn a_fade_event_fades_a_track_and_may_end_it() {
+    // kind 18 on track 10: the first argument is the speed, the caller's
+    // object when the event gives none, and 100 when that is 0 too; the
+    // third argument ends the track when the fade ends.
+    let events = "keep=18,10\nkill=18,10,0,0,1\nfast=18,10,512\n";
+    for (event, blocks) in [("keep", None), ("kill", Some(11)), ("fast", None)] {
+        let module = module_with(&[&LOOPING], 1, 10, events);
+        let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+        play(&mut player, "e0");
+        player.render(BLOCK, &NoSources);
+        play_for(&mut player, 0, event);
+        // extvol falls by the speed each block, from 1024.
+        let mut ended = None;
+        for block in 1..=20 {
+            player.render(BLOCK, &NoSources);
+            if player.is_idle() && ended.is_none() {
+                ended = Some(block);
+            }
+        }
+        assert!(player.faults.is_empty(), "{:?}", player.faults);
+        assert_eq!(ended, blocks, "{event}");
+        if blocks.is_none() {
+            // Faded to silence, still running.
+            assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+        }
+    }
+}
+
+#[test]
+fn a_fade_event_s_speed_is_the_object_when_it_gives_none() {
+    let module = module_with(&[&LOOPING], 1, 10, "kill=18,10,0,0,1\n");
+    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    play(&mut player, "e0");
+    player.render(BLOCK, &NoSources);
+    // Object 512: two blocks to 0.
+    play_for(&mut player, 512, "kill");
+    player.render(2 * BLOCK, &NoSources);
+    assert!(!player.is_idle());
+    player.render(BLOCK, &NoSources);
+    assert!(player.is_idle());
+}
+
+#[test]
+fn a_fade_event_for_a_track_not_running_does_nothing() {
+    let module = module_with(&[&LOOPING], 1, 10, "kill=18,10,0,0,1\n");
+    let mut player = Player::new(vec![module], loud(4), 1);
+    play(&mut player, "kill");
+    player.render(BLOCK, &NoSources);
+    assert!(player.faults.is_empty() && player.is_idle());
+}
+
+#[test]
+fn an_object_that_goes_fades_out_its_instances() {
+    // Objects 1 and 2 play track 10; object 1 goes. Its note fades by 100
+    // a block, from 1024, and ends; object 2's plays on.
+    let module = module_with(&[&LOOPING], 1, 10, "");
+    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    play_for(&mut player, 1, "e0");
+    play_for(&mut player, 2, "e0");
+    player.render(BLOCK, &NoSources);
+    player.handle(&SoundEvent::StopObject { object: 1 });
+    let first = player.render(BLOCK, &NoSources);
+    assert!(first[0] > 10_000 && first[0] < 20_000, "{}", first[0]);
+    player.render(11 * BLOCK, &NoSources);
+    assert_eq!(player.render(1, &NoSources), [10_000]);
+    // The last object going takes the track with it.
+    player.handle(&SoundEvent::StopObject { object: 2 });
+    player.render(12 * BLOCK, &NoSources);
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn an_object_that_goes_ends_its_silent_threads_at_once() {
+    // e0 waits for ever without a note.
+    let waiting: &[u8] = &[SET_LOOP, LOOP];
+    let module = module_with(&[waiting], 1, 10, "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play_for(&mut player, 1, "e0");
+    player.render(BLOCK, &NoSources);
+    player.handle(&SoundEvent::StopObject { object: 1 });
+    assert!(player.is_idle());
+}
+
+#[test]
+fn turning_on_a_tv_lets_go_of_what_it_had_playing() {
+    // kind 30 on tracks 10 and 11 for object 3, given as the event's
+    // first argument.
+    let events = "on0=30,10,3\non1=30,11,3\noff=31,10\n";
+    let module = module_with(&[&LOOPING, &LOOPING], 1, 10, events);
+    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    play(&mut player, "on0");
+    assert_eq!(player.render(1, &NoSources), [10_000]);
+    player.render(BLOCK - 1, &NoSources);
+    // kTurnOffTv does nothing (the scripts turn sets off themselves).
+    play(&mut player, "off");
+    assert_eq!(player.render(1, &NoSources), [10_000]);
+    player.render(BLOCK - 1, &NoSources);
+    // A new channel: track 10 fades out while track 11 plays.
+    play(&mut player, "on1");
+    let both = player.render(1, &NoSources)[0];
+    assert!(both > 10_000 && both < 20_000, "{both}");
+    player.render(12 * BLOCK, &NoSources);
+    assert_eq!(player.render(1, &NoSources), [10_000]);
+    // Object 3 going ends track 11 too.
+    player.handle(&SoundEvent::StopObject { object: 3 });
+    player.render(12 * BLOCK, &NoSources);
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_sequenced_patch_plays_right_after_the_track_s_note() {
+    // kind 53 on track 10 with hit list 6 (patch 2 alone).
+    let module = module_with(&[&GENERIC], 1, 10, "seq=53,10,0,6\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e0");
+    player.render(10, &NoSources);
+    play(&mut player, "seq");
+    let out = player.render_until_idle(10 * BLOCK, &NoSources);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    // One.xa's last 90 frames, then two.xa with no gap, as one note the
+    // thread waits for.
+    let mut expected: Vec<i16> = (11..=100).collect();
+    expected.extend([2000, 4000, -2000]);
+    assert_eq!(&out[..93], &expected);
+    assert!(out[93..].iter().all(|&s| s == 0));
+}
+
+#[test]
+fn a_sequenced_patch_with_no_note_playing_starts_one() {
+    // e0 waits for ever with no note; with no thread at all the patch
+    // plays alone.
+    let waiting: &[u8] = &[SET_LOOP, LOOP];
+    for run in [true, false] {
+        let module = module_with(&[waiting], 1, 10, "seq=53,10,0,6\n");
+        let mut player = Player::new(vec![module], samples(), 1);
+        if run {
+            play(&mut player, "e0");
+            player.render(BLOCK, &NoSources);
+        }
+        play(&mut player, "seq");
+        assert_eq!(player.render(4, &NoSources), [2000, 4000, -2000, 0]);
+        assert!(player.faults.is_empty(), "{:?}", player.faults);
+    }
+}
+
+#[test]
+fn radio_next_song_stops_each_station_s_note() {
+    // Tracks 260 (0x104) and 261; kind 19 stops 260's note, so its
+    // script goes on (here, to the end). 261 is not a radio track.
+    let module = module_with(&[&GENERIC, &GENERIC], 1, 260, "next=19,0\n");
+    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    play(&mut player, "e0");
+    play(&mut player, "e1");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "next");
+    assert_eq!(player.render(1, &NoSources), [10_000]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn kill_all_and_kill_object_sounds_events() {
+    let events = "all=20,0\nobjects=105,0\n";
+    let module = module_with(&[&LOOPING], 1, 10, events);
+    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    play_for(&mut player, 1, "e0");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "all");
+    assert!(player.is_idle());
+    // kind 105 fades out instances of objects above 0.
+    let module = module_with(&[&LOOPING], 1, 10, events);
+    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    play_for(&mut player, 1, "e0");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "objects");
+    player.render(12 * BLOCK, &NoSources);
+    assert!(player.is_idle());
+    // An object of 0 records no instance: its track plays on.
+    let module = module_with(&[&LOOPING], 1, 10, events);
+    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    play_for(&mut player, 0, "e0");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "objects");
+    player.render(12 * BLOCK, &NoSources);
+    assert_eq!(player.render(1, &NoSources), [10_000]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn kinds_that_do_nothing_and_kinds_not_ported() {
+    let events = "debug=44,0\nempty=29,10\nnone=1907,10\nmusic=36,0,1\npiano=43,10\n";
+    let module = module_with(&[&GENERIC], 1, 10, events);
+    let mut player = Player::new(vec![module], samples(), 1);
+    for name in ["debug", "empty", "none"] {
+        play(&mut player, name);
+    }
+    assert!(player.faults.is_empty() && player.is_idle());
+    play(&mut player, "music");
+    play(&mut player, "piano");
+    assert_eq!(player.faults.len(), 2);
+    assert!(player.faults[0].contains("kind 36 is not one"));
+    assert!(player.faults[1].contains("kind 43 is not one"));
+}
+
+#[test]
+fn mp3_patches_play_at_the_output_rate() {
+    use sims_audio::player::resample;
+    let pcm = Pcm {
+        rate: 2 * RATE,
+        channels: 2,
+        samples: vec![0, 10, 100, 110, 200, 210, 300, 310],
+    };
+    let half = resample(&pcm, RATE).unwrap();
+    assert_eq!(half.rate, RATE);
+    assert_eq!(half.samples, [0, 10, 200, 210]);
+    let up = resample(
+        &Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![0, 100],
+        },
+        2 * RATE,
+    )
+    .unwrap();
+    assert_eq!(up.samples, [0, 50, 100, 100]);
+    assert!(resample(&Pcm::default(), RATE).unwrap().samples.is_empty());
+    // A result past half an hour is refused, not allocated.
+    let slow = |frames: usize, rate| Pcm {
+        rate,
+        channels: 1,
+        samples: vec![0; frames],
+    };
+    assert_eq!(resample(&slow(1, 1), u32::MAX), None);
+    assert_eq!(resample(&slow(2000, 1), RATE), None);
+    assert!(resample(&slow(1799, 1), RATE).is_some());
+    // A patch whose file is an MP3 is resampled when loaded.
+    let mut hot = module_with(&[&GENERIC], 1, 10, "");
+    hot.hot.patches.get_mut(&1).unwrap().path = "one.mp3".into();
+    let mut files = samples();
+    files.insert("one.mp3".into(), pcm);
+    let mut player = Player::new(vec![hot], files, 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [5, 205, 0]);
+}
+
+#[test]
+fn a_mp3_too_long_once_resampled_is_a_fault() {
+    let mut module = module_with(&[&GENERIC], 1, 10, "");
+    module.hot.patches.get_mut(&1).unwrap().path = "one.mp3".into();
+    let mut files = samples();
+    files.insert(
+        "one.mp3".into(),
+        Pcm {
+            rate: 1,
+            channels: 1,
+            samples: vec![1; 2000],
+        },
+    );
+    let mut player = Player::new(vec![module], files, 1);
+    play(&mut player, "e0");
+    player.render(BLOCK, &NoSources);
+    assert!(player.faults[0].contains("too long"), "{:?}", player.faults);
+    assert!(player.is_idle());
+}
+
+#[test]
+fn an_object_that_goes_stops_notes_its_ended_threads_left() {
+    // e0 starts a note and ends; the note plays on without its thread.
+    let routine: &[u8] = &[2, 5, END];
+    let module = module_with(&[routine], 1, 10, "");
+    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    play_for(&mut player, 1, "e0");
+    player.render(BLOCK, &NoSources);
+    // The track still plays, so object 1 stays its instance when object
+    // 2 plays it too.
+    play_for(&mut player, 2, "e0");
+    player.render(BLOCK, &NoSources);
+    assert_eq!(player.render(1, &NoSources), [20_000]);
+    player.handle(&SoundEvent::StopObject { object: 1 });
+    assert_eq!(player.render(1, &NoSources), [10_000]);
+    player.handle(&SoundEvent::StopObject { object: 2 });
+    assert!(player.is_idle());
+}
+
+#[test]
+fn sequenced_patches_on_a_track_with_no_thread_chain_to_each_other() {
+    let module = module_with(&[&GENERIC], 1, 10, "seq=53,10,0,6\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "seq");
+    play(&mut player, "seq");
+    assert_eq!(
+        player.render(7, &NoSources),
+        [2000, 4000, -2000, 2000, 4000, -2000, 0]
+    );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn event_numbers_past_32_bits_are_faults() {
+    let events = "seq=53,10,0,4294967302\nplay=1,4294967306\nok=53,10,0,-1\n";
+    let module = module_with(&[&GENERIC], 1, 10, events);
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "seq");
+    play(&mut player, "play");
+    assert!(player.is_idle());
     assert_eq!(player.faults.len(), 2, "{:?}", player.faults);
+    assert!(
+        player
+            .faults
+            .iter()
+            .all(|f| f.contains("does not fit 32 bits"))
+    );
+    // -1 fits (as 0xffffffff): no such hit list.
+    play(&mut player, "ok");
+    assert!(player.faults[2].contains("no hit list 4294967295"));
 }

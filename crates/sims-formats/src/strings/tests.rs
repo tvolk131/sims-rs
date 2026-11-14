@@ -46,6 +46,12 @@ fn reads_mac_resources_with_a_big_endian_count() {
     let table = StringTable::parse(&bytes).unwrap();
     assert_eq!(table.format, Format::MacResource);
     assert_eq!(table.entries.len(), 256);
+    // 128 strings start 00 80, a negative word read as a version.
+    let mut bytes = vec![0x00, 0x80];
+    bytes.extend(std::iter::repeat_n(0, 128));
+    let table = StringTable::parse(&bytes).unwrap();
+    assert_eq!(table.format, Format::MacResource);
+    assert_eq!(table.entries.len(), 128);
 }
 
 #[test]
@@ -57,7 +63,8 @@ fn version_word_alone_is_an_empty_table() {
 }
 
 #[test]
-fn rejects_unknown_versions_and_truncation() {
+fn rejects_truncation() {
+    // Other leading words are Mac counts, here of strings that are absent.
     assert!(StringTable::parse(&(-4i16).to_le_bytes()).is_err());
     assert!(StringTable::parse(&i16::MIN.to_le_bytes()).is_err());
     assert!(StringTable::parse(b"").is_err());
