@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 pub struct Member {
     pub name: String,
     pub offset: u64,
+    /// The bytes the member takes in the archive, which are its contents:
+    /// a member whose unpacked size differs is compressed, which is not
+    /// supported, so `far_members` leaves it out.
     pub size: u64,
 }
 
@@ -60,18 +63,45 @@ impl Resource {
         }
     }
 
+    /// Reads the resource. A resource larger than [`far::MAX_MEMBER`] and a
+    /// member that no longer lies inside
+    /// its archive (the file changed since it was indexed) fail.
     pub fn read(&self) -> Result<Vec<u8>> {
         let io = |e| Error::io(&self.path, e);
-        match &self.member {
-            None => std::fs::read(&self.path).map_err(io),
+        let invalid = |message: String| {
+            Error::io(
+                &self.path,
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+            )
+        };
+        let mut file = File::open(&self.path).map_err(io)?;
+        let len = file.metadata().map_err(io)?.len();
+        let (offset, size) = match &self.member {
+            None => (0, len),
             Some(member) => {
-                let mut file = File::open(&self.path).map_err(io)?;
-                file.seek(SeekFrom::Start(member.offset)).map_err(io)?;
-                let mut bytes = vec![0; member.size as usize];
-                file.read_exact(&mut bytes).map_err(io)?;
-                Ok(bytes)
+                if member
+                    .offset
+                    .checked_add(member.size)
+                    .is_none_or(|end| end > len)
+                {
+                    return Err(invalid(format!("FAR member {} outside file", member.name)));
+                }
+                (member.offset, member.size)
             }
+        };
+        if size > far::MAX_MEMBER {
+            return Err(invalid(format!(
+                "{} exceeds the 128 MiB resource limit",
+                self.name()
+            )));
         }
+        file.seek(SeekFrom::Start(offset)).map_err(io)?;
+        let mut bytes = Vec::with_capacity(size as usize);
+        file.take(size).read_to_end(&mut bytes).map_err(io)?;
+        if bytes.len() as u64 != size {
+            return Err(invalid(format!("{} ends early", self.name())));
+        }
+        Ok(bytes)
     }
 }
 
@@ -193,7 +223,10 @@ impl Index {
                 // The original tests the last three letters, with no dot.
                 here.add(name, Entry::Archive);
                 match far_members(&path) {
-                    Ok(members) => mount_archive(directories, at, &path, members),
+                    Ok((members, skipped)) => {
+                        self.diagnostics.extend(skipped);
+                        mount_archive(directories, at, &path, members);
+                    }
                     // An unreadable archive is skipped, so one bad download
                     // does not stop the game loading.
                     Err(error) => self.diagnostics.push(error.to_string()),
@@ -338,7 +371,35 @@ pub(crate) fn sorted_entries(directory: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-pub(crate) fn far_members(path: &Path) -> Result<Vec<Member>> {
+/// The most directories an archive member's name may hold. Each one is a
+/// directory the index lists, so this bounds that work. The game's own
+/// members are at most four deep.
+const MAX_MEMBER_DEPTH: usize = 32;
+/// The longest archive member name the index takes, in bytes. The game's
+/// own are under 100 bytes.
+const MAX_MEMBER_NAME: usize = 1024;
+
+/// An archive's members, as [`far_members`] reads them, failing when any
+/// member is left out. For directories that hold only the game's own
+/// files, where a missing member would silently change what loads.
+pub(crate) fn all_far_members(path: &Path) -> Result<Vec<Member>> {
+    let (members, mut skipped) = far_members(path)?;
+    match skipped.pop() {
+        None => Ok(members),
+        Some(reason) => Err(Error::Unsupported(reason)),
+    }
+}
+
+/// An archive's members, and a diagnostic for each member left out.
+///
+/// FAR 1a stores members as they are. A member whose unpacked size differs
+/// from its stored size is compressed; reading it as stored bytes would be
+/// wrong, and decompression is not implemented, so it is left out, as the
+/// prototype's reader refused it. Whether the original lists such a member
+/// is unverified: the game's own archives hold none. A member whose name
+/// is longer than [`MAX_MEMBER_NAME`] or holds more than
+/// [`MAX_MEMBER_DEPTH`] directories is left out too.
+pub(crate) fn far_members(path: &Path) -> Result<(Vec<Member>, Vec<String>)> {
     let io = |e| Error::io(path, e);
     let mut file = File::open(path).map_err(io)?;
     let len = file.metadata().map_err(io)?.len();
@@ -351,16 +412,43 @@ pub(crate) fn far_members(path: &Path) -> Result<Vec<Member>> {
         )
     };
     let offset = far::manifest_offset(&header, len).map_err(invalid)?;
+    // Bounded before reading: a sparse file may claim gigabytes.
+    let directory_len = far::directory_len(offset, len).map_err(invalid)?;
     file.seek(SeekFrom::Start(u64::from(offset))).map_err(io)?;
-    let mut directory = Vec::new();
-    file.read_to_end(&mut directory).map_err(io)?;
+    let mut directory = vec![0; directory_len];
+    file.read_exact(&mut directory).map_err(io)?;
     let entries = far::directory(&directory, len).map_err(invalid)?;
-    Ok(entries
-        .into_iter()
-        .map(|entry| Member {
+    let mut members = Vec::with_capacity(entries.len());
+    let mut skipped = Vec::new();
+    for entry in entries {
+        let depth = entry
+            .raw_name
+            .iter()
+            .filter(|&&b| b == b'\\' || b == b'/')
+            .count();
+        if depth > MAX_MEMBER_DEPTH || entry.raw_name.len() > MAX_MEMBER_NAME {
+            skipped.push(format!(
+                "{}: member name of {} bytes in {depth} directories is too long",
+                path.display(),
+                entry.raw_name.len(),
+            ));
+            continue;
+        }
+        if entry.stored_size != entry.unpacked_size {
+            skipped.push(format!(
+                "{}: compressed member {} ({} bytes stored, {} unpacked) is not supported",
+                path.display(),
+                entry.name,
+                entry.stored_size,
+                entry.unpacked_size
+            ));
+            continue;
+        }
+        members.push(Member {
             name: entry.name,
             offset: u64::from(entry.offset),
             size: u64::from(entry.stored_size),
-        })
-        .collect())
+        });
+    }
+    Ok((members, skipped))
 }

@@ -2,6 +2,13 @@
 use crate::reader::{Reader, western};
 use crate::{Error, Result};
 
+/// The largest FAR directory a reader loads, as the frozen prototype's
+/// reader capped it. The game's own archives hold directories of a few
+/// megabytes at most.
+pub const MAX_DIRECTORY: u64 = 64 * 1024 * 1024;
+/// The largest archive member a reader loads, as the prototype capped it.
+pub const MAX_MEMBER: u64 = 128 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub name: String,
@@ -23,6 +30,29 @@ pub fn manifest_offset(header: &[u8], file_len: u64) -> Result<u32> {
         return r.fail("FAR directory outside file");
     }
     Ok(offset)
+}
+/// The length of the directory at `offset`: the rest of the file, which
+/// must not exceed [`MAX_DIRECTORY`]. Read this many bytes, not the rest
+/// of the file, so a sparse file claiming gigabytes is never loaded.
+pub fn directory_len(offset: u32, file_len: u64) -> Result<usize> {
+    let len = file_len.saturating_sub(u64::from(offset));
+    if len > MAX_DIRECTORY {
+        return Err(Error::new(
+            offset as usize,
+            "FAR directory exceeds the 64 MiB limit",
+        ));
+    }
+    Ok(len as usize)
+}
+impl Entry {
+    /// Whether the member's bytes lie after the header and before the
+    /// directory at `manifest_offset`. A member that covers the header
+    /// could be the archive itself, so a reader that opens archives inside
+    /// archives must reject it.
+    pub fn within_payload(&self, manifest_offset: u32) -> bool {
+        self.offset >= 16
+            && u64::from(self.offset) + u64::from(self.stored_size) <= u64::from(manifest_offset)
+    }
 }
 pub fn directory(data: &[u8], file_len: u64) -> Result<Vec<Entry>> {
     let mut r = Reader::new(data);

@@ -232,12 +232,22 @@ mod tests {
     fn a_weight_blends_from_the_pose_below() {
         let skeleton = rig::tests::skeleton();
         let clip = clip();
-        let mut pose = Pose::rest(&skeleton);
-        let below = pose.local[1].translation;
-        clip.apply(&skeleton, &mut pose, 0.0, false, 0.5);
-        assert_eq!(
-            pose.local[1].translation,
-            below.lerp(Vec3::new(0.0, 1.0, 0.0), 0.5)
-        );
+        // Halfway through a clip that does not repeat, the child bone is
+        // at the last frame, (0, 3, 0); at rest it is at (0, 1, 0).
+        let below = Pose::rest(&skeleton).local[1].translation;
+        assert_eq!(below, Vec3::new(0.0, 1.0, 0.0));
+        let at = |weight| {
+            let mut pose = Pose::rest(&skeleton);
+            clip.apply(&skeleton, &mut pose, 0.5, false, weight);
+            pose.local[1].translation
+        };
+        assert_eq!(at(0.0), below);
+        assert_eq!(at(0.5), Vec3::new(0.0, 2.0, 0.0));
+        assert_eq!(at(1.0), Vec3::new(0.0, 3.0, 0.0));
+        // A weight outside 0..=1 is clamped; one that is not a number
+        // counts as 1.
+        assert_eq!(at(2.0), Vec3::new(0.0, 3.0, 0.0));
+        assert_eq!(at(-1.0), below);
+        assert_eq!(at(f32::NAN), Vec3::new(0.0, 3.0, 0.0));
     }
 }

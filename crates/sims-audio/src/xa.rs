@@ -94,6 +94,21 @@ impl Header {
     }
 }
 
+/// How many samples a payload of `payload` bytes decodes to: 28 per
+/// channel for each whole frame of `15 * channels` bytes, and two per
+/// channel for each byte group of a partial last frame after its header.
+fn most_samples(payload: usize, channels: usize) -> usize {
+    let frame = 15 * channels;
+    let whole = (payload / frame).saturating_mul(28 * channels);
+    let rest = payload % frame;
+    let partial = if rest >= channels {
+        ((rest - channels) / channels).min(14) * 2 * channels
+    } else {
+        0
+    };
+    whole.saturating_add(partial)
+}
+
 /// Decodes an XA file into PCM.
 ///
 /// The loop is written with plain indexing and no helper calls: the
@@ -103,7 +118,17 @@ pub fn decode(bytes: &[u8]) -> Result<Pcm> {
     let header = Header::parse(bytes)?;
     let channels = usize::from(header.channels);
     let wanted = header.decoded_size as usize / 2;
-    let mut samples: Vec<i16> = Vec::with_capacity(wanted + 56);
+    // Check the claimed size against what the payload can hold before
+    // reserving memory for it: a header may claim up to 4 GiB.
+    let available = most_samples(bytes.len() - HEADER, channels);
+    if wanted > available {
+        return Err(Error::format(
+            "XA",
+            bytes.len(),
+            format!("data holds at most {available} of {wanted} samples"),
+        ));
+    }
+    let mut samples: Vec<i16> = Vec::with_capacity(wanted.saturating_add(56));
     // Per channel: the last output, the one before, the two weights and
     // the shift.
     let mut current = [0i32; 2];

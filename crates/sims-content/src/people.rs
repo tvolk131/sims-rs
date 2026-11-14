@@ -2,7 +2,7 @@
 //! records, to construct the people a house's saved objects include: their
 //! skeletons and the profiles their resets read.
 
-use crate::index::{far_members, sorted_entries};
+use crate::index::{all_far_members, sorted_entries};
 use crate::install::resolve;
 use crate::{Catalog, Error, Index, Install, Resource, Result};
 use sims_formats::avatar::read_bcf;
@@ -255,7 +255,7 @@ fn skeleton_files(install: &Install, index: &Index) -> Result<BTreeMap<String, S
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("far"));
             if is_archive && path.is_file() {
-                for member in far_members(&path)? {
+                for member in all_far_members(&path)? {
                     resources.push(Resource {
                         mount: 0,
                         path: path.clone(),

@@ -4,6 +4,136 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-14: Archive reads are bounded; compressed FAR members are left out (unverified)
+
+Archive readers in `sims-content` and the census now cap what they load,
+with the frozen prototype's limits: a FAR directory of at most 64 MiB
+(`far::MAX_DIRECTORY`) and a resource of at most 128 MiB
+(`far::MAX_MEMBER`). A member is checked against its archive again when
+it is read, because the file may have changed since indexing. The
+census opens archives inside archives at most four deep, rejects an
+archive whose member overlaps its header or directory (such a member can
+be the archive itself), and stops decoding members of one file on disk
+beyond four times its length plus 16 MiB; it reads an archive on disk a
+member at a time. An archive member whose name is longer than 1024 bytes
+or holds more than 32 directories is left out of the index with a
+diagnostic, since each directory in a member's name is one the index
+lists. The game's own files are far inside all of these limits (member
+names reach 96 bytes and four directories), and the install census is
+unchanged.
+
+A FAR 1a member whose unpacked size differs from its stored size is
+compressed. Decompression is not implemented, so such a member is left
+out of the index with a diagnostic, as the prototype refused it, and the
+rest of its archive mounts. In `GameData/Animation`, which holds only the
+game's own files and is read outside the index, such a member fails the
+load instead, so a clip or skeleton never goes missing silently.
+**Unverified**: whether the original lists
+such a member, and so whether it hides a later file of the same name.
+The game's own archives hold none. Keeping both sizes on
+`sims_content::Member` waits on `sims-people`, which builds that struct
+itself and also reads FAR directories without these caps.
+
+## 2026-11-14: People: transparent texels, shared edges, and people made after the load
+
+A review of `sims-people` found five defects. They are fixed as follows.
+
+- **Transparent texels.** A texel's alpha was ignored, so a texel a
+  run-length bitmap skips was drawn opaque black and hid what was behind
+  it. Now a texel with alpha 0 draws nothing and leaves the depth buffer
+  (the nearest depth drawn at each pixel) alone. A texel with alpha 255
+  is drawn and sets the depth. A texel in between is blended over the
+  pixel and leaves the depth alone. The canvas holds straight colour (not
+  multiplied by alpha), as a PNG does, so the blend weighs what is below
+  by its own alpha. The game's skins are either opaque or
+  fully transparent, so the in-between case only keeps other textures
+  sane. What the original does with partial alpha is **unverified**.
+- **Shared edges.** Testing the alpha fix showed a second fault. A pixel
+  exactly on the edge two triangles share was drawn by both. Now each
+  triangle owns only its top and left edges (the usual "top-left" fill
+  rule). Which side of an edge a pixel is on is always worked out from
+  the same end of the edge, so the two triangles get exactly opposite
+  answers even with rounding. A pixel near a shared edge is then drawn
+  by exactly one of them. This changed the pinned renders of the Goths:
+  7 to 43 edge pixels each, out of 8,000 to 16,000. No
+  pixel became empty or newly drawn, so none of the change comes from
+  transparency. The new digests were checked that way and then pinned.
+- **Bit-field bitmaps.** A bitmap of type `BI_BITFIELDS` was read as if
+  its colour masks were the usual ones. Now its masks are applied, for 16
+  and 32 bits per pixel. A bitmap with an empty colour mask is refused,
+  and so is one whose header does not fit in the file or whose pixels
+  start inside its header or masks.
+- **People made after the load.** With a snapshot, the viewer only drew
+  people who were in the saved house. Person 259, the travelling salesman
+  a script makes during the boot, was never drawn. Now the viewer draws
+  every person object the snapshot holds. A person whose record names no
+  clothes is drawn in its type's default outfit: the first descriptor
+  (before any `;`) of the body, hands and head rows of the type's body
+  strings (the string table its object
+  definition names). These are the rows the old prototype's port of the
+  original's outfit choice (0x58a178) reads. Whether the original draws a
+  newly made person in them is **unverified**; the simulation does not
+  keep the outfit it chose.
+- **Walk clip.** Pressing W took the first three letters of the base clip
+  as the walk clip's prefix, and panicked on a shorter name. Now the
+  prefix comes from the skeleton: `c2o` for a child, `a2o` otherwise.
+- **Weight test.** The test of a clip's weight started and ended at the
+  same pose, so it proved nothing. Now it blends towards a different pose
+  and checks weights 0, 0.5 and 1.
+
+## 2026-11-14: Sound player limits, and sequence groups from the original's code
+
+A review of `sims-audio` found seven defects. The fixes:
+
+- **Limits.** One block runs at most 100,000 instructions across all
+  threads, and one thread at most 10,000. A thread started by
+  `play_trk` first runs in the next block, so a track that starts itself
+  cannot keep a block going, and the threads a full block does not reach
+  run first in the next. At most 256 threads, 1,024 notes, 256 sequence
+  groups and 1,000 recorded faults exist at once, and calls nest at most
+  64 deep. A patch no table defines is not cached, since any number can
+  name one. These numbers are ours. The original reports an error after
+  101 instructions without a wait and carries on.
+- **Arithmetic and sizes.** Mixing and interpolation use 64 bits. An XA
+  header's claimed size is checked against what its data can hold before
+  any memory is reserved. FSC sizes use checked multiplication. Hit-list
+  files may expand to at most 100,000 entries (the largest in the
+  install has 3,661); past that, parsing fails. Writing a WAV whose
+  sizes do not fit 32 bits is an error, not an overflow.
+- **Unported instructions fault.** `seqgroup_wait`, `add_to_group`,
+  `remove_from_group` and `test1` to `test4` end their thread with a
+  fault. The original does nothing for the first three, and no program in
+  the install uses them; `test1` to `test4` are debug routines.
+- **Sequence groups are ported, not faulted.** The review asked for
+  `seqgroup_kill` and `seqgroup_return` to fault too, but 2,731 of the
+  4,494 event definitions reach `seqgroup_kill` (most voices), so a fault
+  would silence them. Instead they follow the original's code, read
+  (never written) from a memory image of the running game: a group slot
+  holds the ID of the thread that last claimed it.
+  - `seqgroup_return` claims the group and ends its own thread if another
+    held it.
+  - `seqgroup_kill` claims it; another holder ends at once when its
+    `extvol` is 0, and otherwise fades `extvol` toward `fade_dest` at
+    speed 200 while the caller waits 2 ms and runs the instruction again.
+  - `seqgroup_trkid` reads a group's holder.
+  - Slots are not cleared when a thread ends, so a stale ID still makes
+    a later `seqgroup_return` end. Only `StopAll` clears them here.
+  - New threads start with the original's default register bank
+    (`extvol` 1024, `fade_dest` 1, `pan` 512, `pitch` 3600 and others).
+  - A fade adds in 64 bits, so it stops at its destination where the
+    original's 32-bit sum could wrap past it.
+  - **Unverified:** none of this was observed at run time, and how often
+    the original updates fades is not known (here once per block). Volume
+    is not applied yet, so a fade changes registers, not the sound.
+- **Every definition is tested.** The install test runs each event
+  definition as its own module defines it, not by first match. A
+  separate test pins that 13 names are defined by more than one module
+  (5 of them differently), and that the module whose name sorts first
+  wins. How the original chooses is unknown.
+
+Reopen when a run with sound shows different group or fade behaviour.
+
+
 ## 2026-11-14: Hidden objects, sprite world offsets and soft edges in the lot drawing
 
 A review of `crates/sims-render` found four defects. All four are fixed,
@@ -53,6 +183,7 @@ What would reopen it: a camera where an object with a nonzero world
 offset can be compared with the original, or a reading of the
 original's blitter that treats soft edges differently.
 
+
 ## 2026-11-14: The lot viewer opens a window with winit and softbuffer
 
 `crates/sims-viewer` is a small program that shows a lot drawn by
@@ -78,6 +209,7 @@ libraries at run time, so CI needs no new system packages.
 What would reopen it: the UI track needing a GPU, text or widgets that
 softbuffer cannot give, at which point the window code moves to wgpu
 or another toolkit, still outside `sims-render`.
+
 ## 2026-11-14: Bella Goth compared with the original; the mirror is still open
 
 One pose was compared with the original game. The game ran in the
