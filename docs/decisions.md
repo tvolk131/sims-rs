@@ -44,6 +44,73 @@ finding in `scripts/check_repository.py` is fixed separately.
   job. `click` and `move` pass on the guest job's exit code, and `click`
   stops if the pointer cannot be placed.
 
+## 2026-11-14: Which catalog wins when two hold the same name
+
+The original's code settles this for appearances and clips. Before
+loading, it builds a list of search folders (0x5835ed, as the old
+prototype traced it). It then lists the catalog files in those folders
+(0x5c1a7d, as the old prototype ported it in
+`legacy/crates/sims-sim/src/pose/clothing/catalog_files.rs`):
+- every text catalog (`.cmx`) in every folder before any binary one
+  (`.bcf`);
+- each kind folder by folder;
+- a file name already listed from an earlier folder is skipped.
+
+It loads them in that order (0x59f844 for appearances, 0x5a0212 for
+animations). For each record it looks the name up first. A name not yet
+known is added. A name already loaded keeps its record, and the new one
+is released (0x59f087, which calls 0x5954a5 for appearances and
+0x59778a for clips). So **the first catalog loaded wins.**
+
+For appearances the folder order is:
+1. the game's own skins (`GameData/Skins`);
+2. the shared expansion folders (`ExpansionShared/Skins` and others);
+3. each expansion's `Skins`, `Animations` and `Accessories`, from the
+   newest expansion back;
+4. the first expansion.
+
+An archive's members count as being in the archive's folder plus the
+folder in the member's name. For example, `Deluxe.far`'s
+`Skins\b200mafit_ctb.cmx.bcf` is in `deluxe/skins`.
+
+`sims-people` now does the same. On first use it puts every catalog of
+the install in that order, reads each, and keeps the first catalog of
+each appearance name. A catalog it cannot read is skipped, as the
+original goes on after a file it cannot read. Reading them all takes
+under a second. This replaces the old lookup, which:
+- tried the binary file named after the appearance first, then the text
+  one;
+- then took the first catalog in name order.
+
+In the Complete Collection, one appearance is given differently by two
+catalogs: `b200mafit_ctb`. It is in `GameData/Skins` as text and in
+Deluxe's archive as binary, with different bindings. The original takes
+the `GameData/Skins` one, and the old lookup took Deluxe's. A gated test
+checks this one, and unit tests check the order and the first-wins rule
+without the install.
+
+What is still approximated or open:
+
+- **Order within one folder: unverified.** It is the original's file
+  map's, which is not ported; we use name order. No folder of the
+  install holds two catalogs giving the same name.
+- **Folders the original does not search.** Catalogs elsewhere (such as
+  an expansion's object folder) are loaded after all the others. The
+  original may not load them at all.
+- **Clips.** The rule is the same, with `GameData/Animation` searched
+  first. No clip name is defined by two files in the install, so our
+  order (the first file in name order) never picks differently.
+- **Same-named files other than catalogs: unverified.** 47 file names
+  exist in two sources with different bytes: accessory textures such as
+  `bottle.bmp`, some animation files shared by the third expansion and
+  `ExpansionShared`, and a few meshes. Which copy the original reads
+  depends on how it looks those files up, which is not ported. Its
+  texture search lists the expansions before `GameData` (0x413ccc), the
+  reverse of our order, and the expansions' copies of the accessory
+  textures are larger. So the original may well prefer them. None of
+  these files is drawn for the Goth family. We keep our order and mark
+  it unverified.
+
 ## 2026-11-14: Scripted input reaches the game through xdotool, and is confirmed in memory
 
 The harness can now drive the original from a scenario file while it
@@ -248,6 +315,7 @@ The game's own archives hold none. Keeping both sizes on
 `sims_content::Member` waits on `sims-people`, which builds that struct
 itself and also reads FAR directories without these caps.
 
+
 ## 2026-11-14: People: transparent texels, shared edges, and people made after the load
 
 A review of `sims-people` found five defects. They are fixed as follows.
@@ -423,6 +491,46 @@ libraries at run time, so CI needs no new system packages.
 What would reopen it: the UI track needing a GPU, text or widgets that
 softbuffer cannot give, at which point the window code moves to wgpu
 or another toolkit, still outside `sims-render`.
+## 2026-11-14: One table of IFF resources, with the prototype's rules (unverified)
+
+`Iff::get`, `Iff::all` and `Iff::resource_order` now read one table built
+when the file is parsed, as the original's IFFResFile3 keeps it. Before,
+`get` and `all` scanned the raw chunks: they returned deleted chunks, and
+`get` took the first of two chunks with one key even when the resource
+map named only the second. `Iff::chunks` still lists every chunk in file
+order, for readers that want them all.
+
+The rules follow the frozen prototype's port of the open
+(`legacy/crates/sims-sim/src/object_catalog/iff.rs`):
+
+- A resource's key is its type, its ID and the high byte of its flags.
+  `get` looks up the key whose high byte is 0, as the original's lookup
+  by ID does.
+- Without a resource map: live chunks in file order. A deleted chunk
+  (flag 4) is skipped. A later chunk with a taken key replaces the
+  earlier one in its place in the order.
+- With a version-0 map: the map's entries in its order. Of two entries
+  with one key, the first is kept and the second dropped unread. A map
+  listing a resource map with ID 0 is ignored and the chunks are read as
+  if there were none. An entry's chunk must be at its offset with its
+  type, ID and flags high byte; the low flag bits are the map's to state,
+  as in the prototype. (The prototype checks only the type, when it
+  loads the payload; requiring the ID keeps a resource's chunk agreeing
+  with the key it is found under. The game's own maps always agree.)
+- A resource map is never a resource itself.
+- When the map cannot be used, `resource_order` fails as before, and
+  `get` and `all` use the table built as if there were no map.
+
+**Unverified** against the original. What the game's own files hold
+bounds the effect: all 4,155 deleted chunks in the install are `XXXX`
+free space, none sharing a key with a live chunk; the only live chunks
+sharing a type and ID are nine `BMP_` chunks that the flags' high byte
+tells apart; and no map lists a map, a duplicate key, or leaves a live
+chunk out. The install census and the gated digests are unchanged.
+`sims-vm`'s `Program` still reads `Iff::chunks` directly (a later chunk
+of one ID wins there, deleted ones included); on the game's own files
+that agrees with the table.
+
 
 ## 2026-11-14: Bella Goth compared with the original; the mirror is still open
 
