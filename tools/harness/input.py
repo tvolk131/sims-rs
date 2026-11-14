@@ -335,12 +335,8 @@ class Agent:
             return False
         source = Path(__file__).parent / 'guest' / 'input-agent.sh'
         (self.share / 'input-agent.sh').write_text(source.read_text())
-        cmd = self.share / 'cmd'
-        cmd.mkdir(exist_ok=True)
-        n = max([int(p.stem) for p in cmd.glob('*.sh') if p.stem.isdigit()] + [0]) + 1
-        tmp = cmd / f'{n:05d}.tmp'
-        tmp.write_text('sh /research/input-agent.sh\n')
-        tmp.rename(cmd / f'{n:05d}.sh')
+        from guest import submit  # reserves the job number (other processes hand the guest jobs too)
+        submit(self.share, 'sh /research/input-agent.sh\n')
         return True
 
     def alive(self, seconds=5):

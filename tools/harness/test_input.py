@@ -636,6 +636,15 @@ class AgentScriptTest(unittest.TestCase):
             again.kill()
             again.wait()
 
+    def test_the_agent_is_started_as_a_reserved_guest_job(self):
+        share = Path(tempfile.mkdtemp())
+        (share / 'cmd').mkdir()
+        (share / 'cmd' / '00001.done').write_text('0\n')  # a number the guest would skip
+        self.assertTrue(inp.Agent(share, '0x1').start())
+        self.assertEqual([p.name for p in sorted((share / 'cmd').glob('*.sh'))], ['00002.sh'])
+        self.assertEqual((share / 'cmd' / '00002.sh').read_text(), 'sh /research/input-agent.sh\n')
+        self.assertTrue((share / 'input-agent.sh').exists())
+
     def test_two_agents_run_each_command_once(self):
         d = Path(tempfile.mkdtemp())
         # An ended command an older agent left as .cmd must not run again.

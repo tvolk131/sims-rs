@@ -31,12 +31,21 @@ nothing is written) on SIZE bytes (default 4) at the address EXPR names, as
 soon as EXPR can be worked out, and logs every write to watch.jsonl with the
 writer's registers, its frame-pointer chain and the top of its stack, the
 lot update it falls in and whether it falls inside the lot update's body.
+A write by another process (another CR3) is logged as a foreign_watch event,
+not in watch.jsonl (once the game's CR3 is known, at the first lot update).
 EXPR is a start, a hexadecimal address, object:<id> (the object with that
 ID) or person:<id> (the same, once it is a person), followed by steps: +HEX
 adds, @HEX reads the word at the address plus HEX. For example
 person:259@0xadc+0x88 is the direction of person 259's animator. With --watch
 the lot update's entry stays armed, so that each write can be placed inside
-or outside the update.
+or outside the update. A watch that goes through an object or a pointer is
+worked out again at every stop in the game; when the address moved (an
+animator was replaced), the watchpoint is moved (a watch_moved event), and
+when it cannot be worked out it waits again (watch_lost). Writes between the
+change and that stop are not seen.
+
+The executable digests that guest/launch.sh verified (share/game-identity.txt)
+are recorded in status.json and as a game_identity event.
 
 --scenario FILE (with --guest-dir) drives the game through a scripted input
 scenario (input.py has the format) and logs it to input.jsonl. It adds a
@@ -50,6 +59,7 @@ import gzip
 import json
 import os
 import struct
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -86,6 +96,11 @@ class Memory:
             p += take
             n -= take
         return bytes(out)
+
+    def span(self, p, n):
+        """Read n bytes at p; the pages they lie on (the last is that of p + n - 1)."""
+        self.read(p, n)
+        return set(range(p & ~4095, ((p + n - 1) & ~4095) + 1, 4096))
 
     def word(self, p):
         return struct.unpack('<I', self.read(p, 4))[0]
@@ -210,12 +225,10 @@ class Memory:
                 a = self.word(o['pointer'] + 0xadc)
                 wanted.add((o['pointer'] + 0xadc) & ~4095)
                 if a:
-                    self.read(a, 0x2a0)
-                    wanted |= {a & ~4095, (a + 0x2a0) & ~4095}
+                    wanted |= self.span(a, 0x2a0)
                     fg = self.word(a + 0xc)
                     if fg:
-                        self.read(fg, 0x70)
-                        wanted |= {fg & ~4095, (fg + 0x70) & ~4095}
+                        wanted |= self.span(fg, 0x70)
         pages = {str(k): self.pages[k].hex() for k in sorted(wanted)}
         return state, full, pages
 
@@ -248,6 +261,8 @@ class Watch:
             self.object, self.start = None, int(start, 16)
         self.address = None
         self.value = None
+        self.pointer = None  # the object's pointer when last worked out
+        self.moves = self.object is not None or any(op == '@' for op, _ in self.steps)
 
     def resolve(self, m, sim):
         """The address, or None while a pointer on the way is 0 or the object does not exist."""
@@ -258,7 +273,14 @@ class Watch:
                 return None
             reg = m.word(sim + 0xb0)
             first, end = m.word(reg + 0x18), m.word(reg + 0x1c)
-            a = next((p for p in (m.word(q) for q in range(first, end, 4)) if p and m.object_id(p) == self.object), 0)
+            if not (first <= end and end - first <= 131072):
+                return None
+            pointers = m.words(first, (end - first) // 4)
+            if self.pointer in pointers and m.object_id(self.pointer) == self.object:
+                a = self.pointer
+            else:
+                a = next((p for p in pointers if p and m.object_id(p) == self.object), 0)
+            self.pointer = a or None
             if not a or (self.person and m.half(m.word(a + 0x118) + 0x12) != 2):
                 return None
         for op, n in self.steps:
@@ -271,7 +293,10 @@ class Watch:
         return a
 
     def read(self, m):
-        return m.read(self.address, self.size).hex()
+        return self.read_at(m, self.address)
+
+    def read_at(self, m, address):
+        return m.read(address, self.size).hex()
 
 
 def frame_chain(m, ebp, n=24):
@@ -328,6 +353,25 @@ def dump(container, guest_dir, d, regs, raw):
         return total
     finally:
         q.close()
+
+
+def game_identity(container):
+    """The digests guest/launch.sh verified before it started the game
+    ({file: sha256}), read from the container's share, or None if the file is
+    not there (the game was started some other way)."""
+    try:
+        r = subprocess.run(['docker', 'exec', container, 'cat', '/g/share/game-identity.txt'],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode:
+        return None
+    files = {}
+    for line in r.stdout.splitlines():
+        digest, _, name = line.strip().partition('  ')
+        if len(digest) == 64 and name:
+            files[name] = digest
+    return files or None
 
 
 def write_gz(path, value):
@@ -390,6 +434,9 @@ def main():
         tmp.write_text(json.dumps(status, indent=1, default=str))
         tmp.rename(out / 'status.json')
 
+    identity = game_identity(args.container)
+    status['game_identity'] = identity
+    event(kind='game_identity', files=identity, verified=identity is not None)
     runner = None
     if steps is not None:
         agent = scenario_input.Agent(args.guest_dir / 'share', args.window)
@@ -414,42 +461,100 @@ def main():
     in_update = False
     watches = args.watch
     pending = list(watches)
-    armed_watches = {}
+    live_watches = []  # watches set, each at its .address
+    hardware = {}  # (address, size) -> how many armed watches use that watchpoint
+
+    def hardware_add(a, size):
+        if not hardware.get((a, size)):
+            remote.set_watch(a, size)
+        hardware[(a, size)] = hardware.get((a, size), 0) + 1
+
+    def hardware_remove(a, size):
+        hardware[(a, size)] -= 1
+        if not hardware[(a, size)]:
+            del hardware[(a, size)]
+            remote.clear_watch(a, size)
+
+    def locate(w, m):
+        """(address, value) for watch w now, or None if it cannot be worked out or read."""
+        try:
+            a = w.resolve(m, sim)
+            return None if a is None else (a, w.read_at(m, a))
+        except MemoryError:
+            return None
 
     def arm_watches(m):
         for w in list(pending):
-            try:
-                a = w.resolve(m, sim)
-                if a is not None:
-                    w.address = a
-                    w.value = w.read(m)
-            except MemoryError:
-                a = None
-            if a is None:
+            found = locate(w, m)
+            if found is None:
                 continue
-            remote.set_watch(a, w.size)
-            armed_watches[a] = w
+            w.address, w.value = found
+            hardware_add(w.address, w.size)
+            live_watches.append(w)
             pending.remove(w)
-            event(kind='watch_armed', name=w.name, expr=w.text, address=a, value=w.value, update=updates)
+            event(kind='watch_armed', name=w.name, expr=w.text, address=w.address, value=w.value, update=updates)
+
+    def check_watches(m):
+        """At a stop in the game, work out the moving watches again: move a
+        watchpoint whose address changed, and put one that cannot be worked
+        out (or read) back to wait."""
+        for w in list(live_watches):
+            if not w.moves:
+                continue
+            found = locate(w, m)
+            if found is not None and found[0] == w.address:
+                continue
+            old = w.address
+            hardware_remove(old, w.size)
+            if found is None:
+                live_watches.remove(w)
+                w.address = w.value = None
+                pending.append(w)
+                event(kind='watch_lost', name=w.name, expr=w.text, address=old, update=updates)
+                continue
+            w.address, w.value = found
+            hardware_add(w.address, w.size)
+            event(kind='watch_moved', name=w.name, expr=w.text, old_address=old, address=w.address, value=w.value,
+                  update=updates)
 
     def watch_hit(reply, regs, m):
         hit = int(reply.split('watch:')[1].split(';')[0], 16)
-        w = armed_watches.get(hit) or next((w for w in armed_watches.values()
-                                             if w.address <= hit < w.address + w.size), None)
-        row = dict(update=updates + (1 if in_update else 0), in_update=in_update, address=hit,
-                   name=w.name if w else None, registers=regs, eip=regs['eip'])
-        try:
-            row['tick'] = m.word(sim + 0x98) if sim else None
-            if w:
-                row['before'], w.value = w.value, w.read(m)
-                row['after'] = w.value
-            row['frames'] = frame_chain(m, regs['ebp'])
-            row['stack'] = m.read(regs['esp'], 0x400).hex()
-        except MemoryError as e:
-            row['error'] = str(e)
-        row['time'] = time.time()
-        watch_log.write(json.dumps(row) + '\n')
-        watch_log.flush()
+        if sims_cr3 is not None and regs['cr3'] != sims_cr3:
+            # The same virtual address in another process.
+            event(kind='foreign_watch', address=hit, pc=regs['eip'], cr3=regs['cr3'], update=updates)
+            return
+        # One row per watch on the written bytes (one with name null if none is).
+        hits = [w for w in live_watches if w.address == hit] or [w for w in live_watches if w.address <= hit < w.address + w.size]
+        for w in hits or [None]:
+            row = dict(update=updates + (1 if in_update else 0), in_update=in_update, address=hit,
+                       name=w.name if w else None, registers=regs, eip=regs['eip'])
+            try:
+                row['tick'] = m.word(sim + 0x98) if sim else None
+                if w:
+                    row['before'], w.value = w.value, w.read(m)
+                    row['after'] = w.value
+                row['frames'] = frame_chain(m, regs['ebp'])
+                row['stack'] = m.read(regs['esp'], 0x400).hex()
+            except MemoryError as e:
+                row['error'] = str(e)
+            row['time'] = time.time()
+            watch_log.write(json.dumps(row) + '\n')
+            watch_log.flush()
+
+    def save_dump(n, regs, raw):
+        d = out / f'dump-{n:04d}'
+        if d.exists():
+            # Left by the run this one took over from: done if its last file was written, else redone.
+            if (d / 'registers.json').exists():
+                event(kind='dump_done_already', update=n)
+                return
+            for f in d.iterdir():
+                f.unlink()
+            d.rmdir()
+            event(kind='redo_incomplete_dump', update=n)
+        t0 = time.time()
+        size = dump(args.container, args.guest_dir, d, regs, raw)
+        event(kind='dump', update=n, bytes=size, seconds=time.time() - t0)
 
     baseline = False
     updates = 0
@@ -468,6 +573,8 @@ def main():
                 remote.clear_break(a)
         for a in ((RETURN,) if baseline else (ENTRY,)) + (DIALOG_SHOW, DIALOG_RESULT, DIALOG_READ):
             arm(a)
+        if baseline and updates + 1 in dump_set:
+            arm(ENTRY)  # taken over before a dump at the next entry (or in the middle of it)
         if runner:
             arm(scenario_input.QUEUE_PUSH)
         if watches or runner:
@@ -533,6 +640,8 @@ def main():
                     baseline = True
                     event(kind='baseline', tick=state['tick'], lot=lot, cr3=cr3, teb=fs_base, seconds=time.time() - t0,
                           packets=remote.packets, sim=regs['ecx'])
+                    if 1 in dump_set:  # the baseline is the entry of lot update 1
+                        save_dump(1, regs, raw)
                     if not (watches or runner):
                         disarm(ENTRY)
                     arm(RETURN)
@@ -540,9 +649,7 @@ def main():
                 elif lot == args.lot and baseline:
                     in_update = True
                     if updates + 1 in dump_set:
-                        t0 = time.time()
-                        n = dump(args.container, args.guest_dir, out / f'dump-{updates + 1:04d}', regs, raw)
-                        event(kind='dump', update=updates + 1, bytes=n, seconds=time.time() - t0)
+                        save_dump(updates + 1, regs, raw)
                     if not (watches or runner):
                         disarm(ENTRY)
                 else:
@@ -602,6 +709,8 @@ def main():
                     runner.on_dialog(row['kind'], updates + 1)
                 if pc == DIALOG_SHOW:
                     save_status(dialog=dict(update=updates + 1, record=record, shown=time.time()))
+            if not foreign and live_watches:
+                check_watches(m)
             if not foreign and pending:
                 arm_watches(m)
             # Step past the breakpoint we stopped at (if it is still armed).
@@ -631,10 +740,15 @@ def main():
                 remote.interrupt()
             for a in list(breaks):
                 remote.clear_break(a)
-            for a, w in armed_watches.items():
-                remote.clear_watch(a, w.size)
+            for a, size in list(hardware):
+                remote.clear_watch(a, size)
         finally:
-            remote.detach()
+            try:
+                remote.detach()
+            finally:
+                for f in (events, watch_log, updates_log):
+                    if f:
+                        f.close()
 
 
 if __name__ == '__main__':
