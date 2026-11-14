@@ -67,8 +67,14 @@ control panel in the bottom-left corner.
 **Unverified:**
 
 - Other zooms (taller blades near) and rotations. In particular, whether
-  the blade map is read in view coordinates from the lot's least view
-  corner, as here; the pool test at 0x47c16d suggests it.
+  the blade map and the jitter loop count from the lot's least corner in
+  the view, as here; the pool test at 0x47c16d suggests view
+  coordinates. At rotation 0 that corner is 0 either way.
+- Depth on sloped ground. A tile's ground takes the depth of its lowest
+  corner. Following the slope would hide sprites behind hills better, but
+  floors take their top corner's elevation, and the grass then covered a
+  floor's edge where sloped ground meets it (0.1% fewer exact pixels).
+  One depth model for floors and ground would settle it.
 - Grass on a pool, which the original leaves bare. Pools are not looked
   at.
 - A floor tile split by a diagonal wall. The original keeps the blade

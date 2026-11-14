@@ -249,7 +249,18 @@ impl Painter<'_> {
         // The left corner, at height 0; columns start a row above it.
         let corner = self.camera.project([view[0], view[1] + 1], 1, 0);
         let zoom = self.camera.zoom.level();
+        let width = 16 << zoom;
+        // Skip a tile wholly off the canvas, even on the highest ground.
+        let reach = width + (255 << (zoom + 1));
+        let size = [self.canvas.width, self.canvas.height].map(|n| n as i32);
+        if (0..2).any(|i| corner[i] < -reach || corner[i] > size[i].saturating_add(reach)) {
+            return;
+        }
         let lit = self.light(0, [x * 16 + 8, y * 16 + 8]);
+        // The whole tile takes the depth of its lowest corner. Following
+        // the slope would be truer, but floors take their top corner's
+        // elevation, and where sloped ground meets a floor the grass would
+        // then cover the floor's edge, which the original does not.
         let elevation = (0..4)
             .map(|c| self.corner_elevation([x + (c & 1), y + (c >> 1)]))
             .min()
@@ -268,7 +279,7 @@ impl Painter<'_> {
             for (bx, foot, height, p) in self.grass.blades(view, &column, index) {
                 let depth = depth::ground(camera, foot, elevation);
                 let color = lit.apply(grass::widen(p));
-                for row in foot - height + 1..=foot {
+                for row in foot.saturating_sub(height - 1)..=foot {
                     self.canvas.plot(bx, row, depth, color);
                 }
             }

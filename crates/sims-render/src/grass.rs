@@ -321,12 +321,18 @@ impl Grass {
         let sw = |c: [i32; 4]| lookup(&table, c[0] - c[3], c[1] - c[0]);
         let ne = |c: [i32; 4]| lookup(&table, c[1] - c[2], c[3] - c[2]);
         // The vertices run 1 to the lot's size less one, x outer, each
-        // taking its jitter from one stream (0x4a4a43).
+        // taking its jitter from one stream (0x4a4a43). They count from
+        // the lot's least corner in the view, as the blade map does below;
+        // on a turned lot smaller than the arrays that is not 0 (which
+        // corner the original counts from there is unverified).
         let side = lot.size.clamp(1, N) as i32;
+        let last = side - 1;
+        let ends = [camera.rotate_tile([0, 0]), camera.rotate_tile([last, last])];
+        let least = [ends[0][0].min(ends[1][0]), ends[0][1].min(ends[1][1])];
         let mut random = Random(JITTER_SEED);
         let mut vertex = vec![0u8; N * N];
-        for x in 1..side {
-            for y in 1..side {
+        for x in least[0] + 1..least[0] + side {
+            for y in least[1] + 1..least[1] + side {
                 let p0 = heights(x, y);
                 let p1 = heights(x - 1, y);
                 let p2 = heights(x - 1, y - 1);
@@ -387,9 +393,6 @@ impl Grass {
         let side = side as usize;
         let mut random = Random(BLADE_SEED);
         let variation: Vec<u32> = (0..side * side).map(|_| random.next() % 0xffff).collect();
-        let last = side as i32 - 1;
-        let ends = [camera.rotate_tile([0, 0]), camera.rotate_tile([last, last])];
-        let least = [ends[0][0].min(ends[1][0]), ends[0][1].min(ends[1][1])];
         let zoom = camera.zoom.level();
         let mut blades = vec![(0, 0); N * N];
         let mut short = vec![false; N * N];
@@ -476,11 +479,12 @@ impl Grass {
                 if self.short[i] {
                     height = (height - 1).max(1);
                 }
-                let t = ((column.shade[1] * dy + column.shade[0]) >> 8) + b.shade;
-                let s = (column.color[1] * dy + column.color[0]) >> 8;
-                let t = t.clamp(0, MAX_SHADE) as usize;
-                let s = s.clamp(0, COLORS as i32 - 1) as usize;
-                (column.x + b.dx, column.y + dy, height, palette[s][t][0])
+                let t = (step(column.shade, dy) >> 8) + i64::from(b.shade);
+                let s = step(column.color, dy) >> 8;
+                let t = t.clamp(0, i64::from(MAX_SHADE)) as usize;
+                let s = s.clamp(0, COLORS as i64 - 1) as usize;
+                let (x, foot) = (column.x.saturating_add(b.dx), column.y.saturating_add(dy));
+                (x, foot, height, palette[s][t][0])
             })
             .collect()
     }
@@ -525,6 +529,13 @@ pub fn columns(
     colors: [u8; 4],
     zoom: u32,
 ) -> Vec<Column> {
+    // Nothing this far off any screen is drawn; skipping it keeps the
+    // arithmetic below in range.
+    const FAR: i32 = 1 << 24;
+    if !(-FAR..FAR).contains(&left) || !(-FAR..FAR).contains(&bottom) {
+        return Vec::new();
+    }
+    let zoom = zoom.clamp(1, 3);
     let h = heights.map(i32::from);
     let t = shades.map(i32::from);
     let a = colors.map(i32::from);
@@ -606,19 +617,24 @@ impl Column {
     /// four 5-6-5 pixels.
     pub fn rows(&self) -> impl Iterator<Item = (i32, [u16; 4])> + '_ {
         let palette = palette();
-        let end = self.y + self.height;
+        let end = i64::from(self.y) + i64::from(self.height);
         (0..self.height.max(0)).map(move |row| {
-            let t = (self.shade[0] + self.shade[1] * row) >> 8;
-            let s = (self.color[0] + self.color[1] * row) >> 8;
-            let t = t.clamp(0, MAX_SHADE) as usize;
-            let s = s.clamp(0, COLORS as i32 - 1) as usize;
-            let parity = ((end + row) & 1) as usize;
+            let t = step(self.shade, row) >> 8;
+            let s = step(self.color, row) >> 8;
+            let t = t.clamp(0, i64::from(MAX_SHADE)) as usize;
+            let s = s.clamp(0, COLORS as i64 - 1) as usize;
+            let parity = ((end + i64::from(row)) & 1) as usize;
             let block = &palette[s][t];
             let mut px = [0; 4];
             px.copy_from_slice(&block[parity * 4..parity * 4 + 4]);
-            (self.y + row, px)
+            (self.y.saturating_add(row), px)
         })
     }
+}
+
+/// A value and its step per row, `rows` rows on, without overflow.
+fn step([value, per_row]: [i32; 2], rows: i32) -> i64 {
+    i64::from(value) + i64::from(per_row) * i64::from(rows)
 }
 
 #[cfg(test)]
@@ -757,6 +773,50 @@ mod tests {
         floored.levels[0].floors[Lot::cell(10, 10)] = 1;
         let floored = Grass::new(&floored, &camera(crate::Zoom::Near));
         assert_eq!(floored.blades[10 * N + 10].0, 0);
+    }
+
+    #[test]
+    fn a_turned_small_lot_shades_every_tile_it_draws() {
+        let small = lot(52, 0);
+        for rotation in 0..4 {
+            let camera = Camera {
+                rotation,
+                ..camera(crate::Zoom::Far)
+            };
+            let grass = Grass::new(&small, &camera);
+            for x in 1..51 {
+                for y in 1..51 {
+                    let view = camera.rotate_tile([x, y]);
+                    let (shades, _) = grass.tile(view).unwrap_or_default();
+                    // Flat ground: 127 less 127 cos² of the sun's angle
+                    // from the zenith, within two shades of jitter.
+                    let flat = [13, 44, 84, 44][usize::from(rotation)];
+                    assert!(
+                        shades.iter().all(|&s| (i32::from(s) - flat).abs() <= 2),
+                        "{rotation} {view:?} {shades:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn columns_far_off_screen_or_at_the_edge_of_i32_do_not_panic() {
+        assert!(columns(0, i32::MAX - 10, [0; 4], [10; 4], [31; 4], 1).is_empty());
+        assert!(columns(i32::MIN, 0, [255; 4], [10; 4], [31; 4], 99).is_empty());
+        let wild = Column {
+            x: i32::MAX,
+            y: i32::MAX - 1,
+            height: 40,
+            shade: [i32::MAX; 2],
+            color: [i32::MIN; 2],
+        };
+        assert_eq!(wild.rows().count(), 40);
+        assert!(wild.rows().all(|(y, _)| y == i32::MAX || y == i32::MAX - 1));
+        let grass = Grass::new(&lot(64, 100), &camera(crate::Zoom::Near));
+        for (index, column) in [wild].iter().cycle().take(16).enumerate() {
+            let _ = grass.blades([10, 10], column, index);
+        }
     }
 
     #[test]
