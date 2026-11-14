@@ -39,6 +39,16 @@ impl Resource {
         }
     }
 
+    /// The last component of [`Resource::name`]: an archive member's name
+    /// may hold directories, separated by `\\` or `/`.
+    pub fn file_name(&self) -> String {
+        let name = self.name();
+        match name.rfind(['\\', '/']) {
+            Some(at) => name[at + 1..].to_owned(),
+            None => name,
+        }
+    }
+
     /// A readable location: the path relative to `root`, with `/member`
     /// appended for archive members.
     pub fn location(&self, root: &Path) -> String {
@@ -135,13 +145,16 @@ impl Index {
         Ok(())
     }
 
-    /// Resources whose own name matches, ignoring ASCII case, in load
-    /// order, with their positions in [`Index::resources`].
+    /// Resources whose file name matches, ignoring ASCII case, in load
+    /// order, with their positions in [`Index::resources`]. An archive
+    /// member's file name is the last component of its name, so
+    /// `sub\SofaGlobals.iff` is found as `SofaGlobals.iff`; its
+    /// [`Resource::name`] keeps the whole name.
     pub fn named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = (usize, &'a Resource)> {
         self.resources
             .iter()
             .enumerate()
-            .filter(move |(_, r)| r.name().eq_ignore_ascii_case(name))
+            .filter(move |(_, r)| r.file_name().eq_ignore_ascii_case(name))
     }
 
     /// Lists one mount: gathers its directories, then walks them.
