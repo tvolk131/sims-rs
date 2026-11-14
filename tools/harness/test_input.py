@@ -178,6 +178,13 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(steps[4]['args'], [21, None, 100])
         self.assertEqual(steps[0]['line'], 3)
 
+    def test_build_and_buy_steps(self):
+        steps = inp.parse_scenario('press 93 458\nexpect-mode buy within 50\nexpect-mode 1\n'
+                                   'expect-new-object\nexpect-new-object within 9')
+        self.assertEqual([s['args'] for s in steps], [[93, 458], [2, 50], [1, 200], [200], [9]])
+        with self.assertRaises(inp.ScenarioError):
+            inp.parse_scenario('expect-mode flying')
+
     def test_errors_name_the_line(self):
         for text, message in (('jump 3', 'line 1: unknown step'), ('wait', 'line 1: wait takes'),
                               ('\nclick 1', 'line 2: click takes'), ('wait x', 'line 1:'),
@@ -357,6 +364,28 @@ class RunnerTest(RunnerBase):
         self.tick(r)
         self.assertIsNone(r.failed)
         self.assertEqual(self.rows('taken')[0]['where'], 'queue')
+
+    def test_buy_mode_and_a_placed_object(self):
+        g = self.g
+        g.m.put_words(g.sim + 0x90, 2542)
+        r = self.runner('press 93 458\nexpect-mode buy within 20\nexpect-new-object within 20')
+        self.tick(r)
+        self.assertIn('mousedown 1', self.last_command())
+        g.m.put(g.sim + 0x36, b'\x02\x00')
+        self.tick_until(r, lambda: self.rows('mode'))
+        self.tick(r, 3)
+        self.assertFalse(r.finished)
+        g.add_object(400, [0x300, 0x280])
+        g.m.put_words(g.sim + 0x90, 2242)
+        self.tick_until(r, lambda: r.finished)
+        self.assertIsNone(r.failed)
+        placed = self.rows('placed')[0]
+        self.assertEqual(([o['id'] for o in placed['objects']], placed['cost']), ([400], 300))
+
+    def test_expect_mode_times_out(self):
+        r = self.runner('expect-mode buy within 3')
+        self.tick(r, 5)
+        self.assertIn('not 2', r.failed)
 
     def test_expect_queued_times_out(self):
         r = self.runner('expect-queued 21 within 3')
