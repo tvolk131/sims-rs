@@ -1293,9 +1293,12 @@ stop-sounds events.
   MP3 (141) from loose files and FAR archives, by the paths the sound
   tables use. XA and WAV match FFmpeg bit for bit on every file. No UTK
   file exists in the install.
-- **Next: the sound tables.** HIT programs, their HSM symbols, HOT
-  tables (events, tracks, patches, hit lists) and FSC ambient scores.
-- **Then: the HIT VM.** Run real events (a phone ring, a footstep) end
+- **Done: the sound tables.** All 27 modules (HIT programs, HSM
+  symbols, HOT tables) and the 4 FSC ambient scores parse. Every HIT
+  program disassembles, and every entry point and branch resolves. The
+  files' own loose ends (155 missing samples, among others) are counted
+  in a gated test. The phone ring and a footstep trace to their samples.
+- **Next: the HIT VM.** Run real events (a phone ring, a footstep) end
   to end into PCM, from a small event type the simulation can emit.
 
 ## Working rules
