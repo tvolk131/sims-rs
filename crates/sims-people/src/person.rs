@@ -142,7 +142,9 @@ impl<'a> Player<'a> {
     /// The pose of `skeleton` for `animator`: the rest pose, then the base
     /// clip `base` (when the animator has a base layer) repeating at the
     /// animator's clock, then the foreground layer at its phase and
-    /// weight. A foreground layer repeats when its end mode is 1.
+    /// weight. A foreground layer repeats when its end mode is 1. Last,
+    /// the head turns as the simulation's head fields say
+    /// ([`Pose::turn_head`]).
     pub fn pose(
         &mut self,
         skeleton: &Skeleton,
@@ -170,6 +172,7 @@ impl<'a> Player<'a> {
                 layer.weight.to_f32(),
             );
         }
+        pose.turn_head(skeleton, animator.head.turn);
         Ok(pose)
     }
 }
@@ -264,5 +267,23 @@ mod tests {
             (ahead - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-6,
             "{ahead:?}"
         );
+    }
+
+    #[test]
+    fn the_pose_turns_the_head_the_simulation_turned() {
+        let mut skeleton = crate::rig::tests::skeleton();
+        skeleton.bones[1].name = "HEAD".into();
+        let (assets, library) = (Assets::default(), Library::default());
+        let mut player = Player::new(&assets, &library);
+        // No base layer and no foreground: only the rest pose and the head.
+        let mut animator = Animator::new(0);
+        let still = player.pose(&skeleton, &animator, "unused").unwrap();
+        assert_eq!(still, Pose::rest(&skeleton));
+        animator.head.turn = F32::from_f32(1.0);
+        let turned = player.pose(&skeleton, &animator, "unused").unwrap();
+        let mut want = Pose::rest(&skeleton);
+        want.turn_head(&skeleton, animator.head.turn);
+        assert_eq!(turned, want);
+        assert_ne!(turned, still);
     }
 }
