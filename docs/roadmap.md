@@ -1298,8 +1298,19 @@ stop-sounds events.
   program disassembles, and every entry point and branch resolves. The
   files' own loose ends (155 missing samples, among others) are counted
   in a gated test. The phone ring and a footstep trace to their samples.
-- **Next: the HIT VM.** Run real events (a phone ring, a footstep) end
-  to end into PCM, from a small event type the simulation can emit.
+- **Done: the HIT VM.** `Player` takes `SoundEvent`s and renders PCM.
+  The phone ring and a soft footstep render their samples bit for bit,
+  and every event in the install runs without a bad instruction. The
+  `render_event` example writes events to a WAV file.
+- **Next:**
+  - The simulation emits `SoundEvent`s (the interface is in the
+    decisions log).
+  - Volume, pan and pitch.
+  - The 190 events of other kinds (music modes, TV, sequenced hit
+    lists).
+  - The FSC ambient player.
+  - Live playback behind a feature.
+  - Checking any of it against the original.
 
 ## Working rules
 
