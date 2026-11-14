@@ -376,8 +376,38 @@ fn layer_16_bytes(layer: &Option<sims_sim::animator::Layer>) -> Vec<u8> {
     bytes
 }
 
-/// An animator's encoding with its motion written by `motion` and its
-/// foreground layer by [`layer_16_bytes`].
+/// An animator's encoding under snapshot format 17: without the head
+/// fields ([`sims_sim::animator::Animator::head`], animator +0x210 to
+/// +0x224) that format 18 added at its end.
+fn animator_17_bytes(animator: &sims_sim::animator::Animator) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(animator).unwrap();
+    let added = postcard::to_allocvec(&animator.head).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - added.len()), added);
+    bytes
+}
+
+/// A lot's encoding as snapshot format 17 wrote it. Format 18 added at
+/// the end of each animator the head's angles, turn and target
+/// ([`sims_sim::animator::Animator::head`]). This writes the animators
+/// again without them, so a state pinned under format 17 can be shown to
+/// be the same state but for those fields.
+fn format_17_bytes(world: &World) -> Vec<u8> {
+    let blank = World {
+        animators: Default::default(),
+        ..world.clone()
+    };
+    splice(
+        &world.encode(),
+        &blank.encode(),
+        &postcard::to_allocvec(&world.animators).unwrap(),
+        &[0],
+        &map_bytes(&world.animators, animator_17_bytes),
+    )
+}
+
+/// An animator's encoding with the head left out ([`animator_17_bytes`]),
+/// its motion written by `motion` and its foreground layer by
+/// [`layer_16_bytes`].
 fn animator_old_bytes(
     animator: &sims_sim::animator::Animator,
     motion: fn(&sims_sim::animator::Motion) -> Vec<u8>,
@@ -389,8 +419,8 @@ fn animator_old_bytes(
             ..a.clone()
         };
         splice(
-            &postcard::to_allocvec(a).unwrap(),
-            &postcard::to_allocvec(&blank).unwrap(),
+            &animator_17_bytes(a),
+            &animator_17_bytes(&blank),
             &postcard::to_allocvec(&a.motion).unwrap(),
             &postcard::to_allocvec(&Motion::NONE).unwrap(),
             &motion(&a.motion),
@@ -1965,11 +1995,26 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// tick 321 it stands. In tick 322 it plays a clip from its own table
 /// (Animate Sim, source 0).
 ///
-/// Tick 334 then fails loudly: person 16 looks towards person 259 (Look
-/// Towards, mode 0), and its head then follows the target (0x5907c5),
-/// which needs the bones' places in the current pose (0x5904d2) and is not
-/// ported. Our state after each of ticks 1 to 333 equals the fourth capture
-/// (full state after every update), as compared outside this test.
+/// In tick 334 person 16 looks towards person 259 (Look Towards, mode 0),
+/// and its head follows the target (0x5907c5): the headings are measured
+/// from the bones' places in the current poses (0x5904d2). In tick 335
+/// person 18 starts a walk with clip 0x13, which carries it one clip's
+/// distance straight ahead (animator state 6, 0x58e125). From tick 336 on
+/// Find Best Interaction also scores the entry that joins person 18's
+/// running interaction (0x41ee99). In tick 353 object 282 runs a tree on
+/// person 259's own thread to its end (Run Tree By Name, mode 1). From
+/// tick 356 on person 259 stands on sloped tiles, whose height comes from
+/// the tile's corners (0x478dfe).
+///
+/// Tick 367 then fails loudly: person 18's route to a slot finds no way,
+/// because person 21 is in it (the place test's collision is now told
+/// apart, 0x48158c), and step 6 of the route, which tries again and asks
+/// a person in the way to move (0x45b066, 0x45ba28), is not ported. Our
+/// state after each of ticks 1 to 366 equals the fourth capture (full
+/// state after every update), as compared outside this test, but for one
+/// field: person 16's head target height (+0x220) is one unit in the last
+/// place lower on some ticks from 335 to 353, for a reason that is
+/// **unknown** (the bones' pages are not captured).
 ///
 /// The first capture does not choose in tick 233: its one draw from the
 /// lot's stream in ticks 233 and 234 comes in tick 234, and after tick
@@ -1997,8 +2042,12 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// that change. The states after ticks 1, 5, 13, 33, 232 and 261 were
 /// pinned under format 16 ([`format_16_bytes`]), before the motion's timer
 /// and the layer's fade were kept, and still hold; the state after tick
-/// 261 is pinned again under format 17 (`TICK_261_17`). The digests are of
-/// our own state, as built here.
+/// 261 is pinned again under format 17 (`TICK_261_17`). The states after
+/// ticks 261 and 333 were pinned under format 17, before the head's fields
+/// were kept, and still hold ([`format_17_bytes`]); the state after tick
+/// 333 is pinned again under format 18 (`TICK_333`), and so are the states
+/// after ticks 334 and 366. The digests are of our own state, as built
+/// here.
 #[test]
 fn the_goth_house_first_tick_matches_the_original() {
     const TICK_1_9: &str = "62fc28f5e7689d166791a620dbed066fb8a7d707ea79017fbadf0eed3da5c937";
@@ -2014,7 +2063,10 @@ fn the_goth_house_first_tick_matches_the_original() {
     const TICK_232: &str = "3e093fa4389e6ff31c8e9c976dfd03d7c1796b495d21b0e11bcb17d5d03111d7";
     const TICK_261: &str = "1b931d4492d3e02a8c72bcb658c55110e6b0f535cd20d99a937d09b6d62a420b";
     const TICK_261_17: &str = "2cc7b436d7f3e46f09b4801883c5d258d7d1e1e7411ba32e54eb1c8e52c419d4";
-    const TICK_333: &str = "d82f96a31cf3dfd69c64b0b7ea14c0f943feb566ed2ecf7abdc8bcf845200916";
+    const TICK_333_17: &str = "d82f96a31cf3dfd69c64b0b7ea14c0f943feb566ed2ecf7abdc8bcf845200916";
+    const TICK_333: &str = "8c1e86596e70a9d320c14794e7483c4a8a9304c36236c0b1d4f3257f4d69af95";
+    const TICK_334: &str = "85a315a4b435176ffe2e09ce08fb75880c792a0313743c94c21548f65653ef8b";
+    const TICK_366: &str = "d9bcf685db4e2c1186715bf7a674c640bd8c4cbd6cbed374644c370b242667f0";
     const USES_233: [(i16, i32); 2] = [(132, 5), (51, 8)];
     const TREES_233: [u16; 9] = [
         0x1000, 0x2001, 0x205b, 0x2029, 0x100e, 0x1014, 0x1012, 0x1009, 0x1010,
@@ -2333,7 +2385,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert_eq!((animator.state, animator.arrival), (3, 2));
         assert_eq!(world.objects[&21].position, POSITION_261);
         assert_eq!(digest(&format_16_bytes(world)), TICK_261);
-        assert_eq!(digest(&world.encode()), TICK_261_17);
+        assert_eq!(digest(&format_17_bytes(world)), TICK_261_17);
         // The walk's strides, worked out by posing each person's skeleton
         // with its walk clip, equal what the original's constructor stored
         // (animator +0x17c and +0x178, the same in the capture's updates
@@ -2382,16 +2434,75 @@ fn the_goth_house_first_tick_matches_the_original() {
             }
         }
         assert_eq!(world.ticks, before.ticks + 333);
+        assert_eq!(digest(&format_17_bytes(world)), TICK_333_17);
         assert_eq!(digest(&world.encode()), TICK_333);
-        // Tick 334 stops loudly: person 16 looks towards person 259 (Look
-        // Towards, mode 0, sets its person data words 41 to 45), and its
-        // head then follows the target (0x5907c5), which needs the bones'
-        // places in the current pose (0x5904d2) and is not ported.
+        // Tick 334: person 16 looks towards person 259 (Look Towards, mode
+        // 0, sets its person data words 41 to 45), and its head then
+        // follows it (0x590768, 0x5904d2): it measures the heading from
+        // the top of its head to the point in front of it, and to the top
+        // of person 259's head, from the bones of both in their current
+        // poses. The head fields equal the capture's update 334.
+        interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        assert_eq!(world.ticks, before.ticks + 334);
+        let head = world.animators[&16].head;
+        let bits = |f: sims_core::F32| f.to_bits();
+        assert_eq!(
+            (
+                bits(head.heading),
+                bits(head.target_heading),
+                bits(head.turn)
+            ),
+            (0x3cfd_e622, 0x3fa8_e863, 0)
+        );
+        assert_eq!(
+            head.target.map(|t| t.map(bits)),
+            Some([0x425a_088a, 0x40f0_d678, 0x42d0_f97e])
+        );
+        for id in [18, 21, 259] {
+            assert_eq!(world.animators[&id].head, sims_sim::head::Head::LOADED);
+        }
+        assert_eq!(digest(&world.encode()), TICK_334);
+        // Ticks 335 to 366, with a frame after tick 363.
+        for tick in 335..=366 {
+            interpreter.lot_update(world, &tuning, &mut player).unwrap();
+            if (tick - 33) % 30 == 0 {
+                interpreter.draw_frame(world, 1).unwrap();
+            }
+            let bits = |f: sims_core::F32| f.to_bits();
+            match tick {
+                // Person 18 starts its walk with clip 0x13 (state 6,
+                // 0x58e125): its destination is one clip's distance ahead,
+                // and at phase 0 it has not moved yet.
+                335 => {
+                    let a = &world.animators[&18];
+                    assert_eq!((a.state, a.selection, a.walking), (6, 0x13, false));
+                    assert_eq!(
+                        a.position[..2].iter().map(|&f| bits(f)).collect::<Vec<_>>(),
+                        [0x43dc_0000, 0x43cc_0000]
+                    );
+                    assert_eq!(bits(a.destination[0]), 0x43d7_ad0d);
+                }
+                // Person 16 looks at person 259 standing on a sloped
+                // tile: the target's height comes from the tile's corners
+                // (0x478dfe), as in the capture's update 357.
+                357 => assert_eq!(
+                    world.animators[&16].head.target.map(|t| t.map(bits)),
+                    Some([0x4266_6ec9, 0x40f7_8106, 0x42cb_1aba])
+                ),
+                _ => {}
+            }
+        }
+        assert_eq!(world.ticks, before.ticks + 366);
+        assert_eq!(digest(&world.encode()), TICK_366);
+        // Tick 367 stops loudly: person 18's route to a slot finds no way,
+        // because person 21 stands in it, and the step that tries again
+        // and asks a person in the way to move (0x45b066, 0x45ba28) is not
+        // ported.
         let error = interpreter
             .lot_update(world, &tuning, &mut player)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("object 16"), "{error}");
-        assert!(error.contains("0x5904d2"), "{error}");
+        assert!(error.contains("object 18"), "{error}");
+        assert!(error.contains("0x45b066"), "{error}");
     });
 }

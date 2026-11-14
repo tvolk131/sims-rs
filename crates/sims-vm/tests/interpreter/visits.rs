@@ -393,6 +393,7 @@ fn resident(fx: &mut Fixture) -> People {
                 age: Some(" 27 years".into()),
                 skin: Some("DRK".into()),
                 tones: ["unknown", "lgt", "med", "drk"].map(String::from).to_vec(),
+                rig: Default::default(),
             },
         )]
         .into(),
@@ -542,6 +543,7 @@ fn a_profile_string_that_is_missing_leaves_its_word() {
             age: age.map(String::from),
             skin: skin.map(String::from),
             tones: ["lgt", "lgt", "med"].map(String::from).to_vec(),
+            rig: Default::default(),
         };
     let reload = |profile: &sims_content::Profile| {
         let mut data: Vec<i16> = (0..256).collect();
