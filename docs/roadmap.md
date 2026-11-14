@@ -1272,8 +1272,11 @@ Progress:
   doors and windows cut into them) and object sprites draw at every zoom
   and rotation, with walls up, cut away or down. The Goth house renders
   are pinned by digest, gated on `SIMS_INSTALL`.
-- Next: a viewer window, a screenshot of the original at the same camera
-  and the comparison, then what it shows needs fixing.
+- Done: `sims-viewer` shows a house (or a world saved by `sims boot
+  --snapshot`) in a window, with keys and the mouse for zoom, rotation,
+  floor, the three wall modes and scrolling, and saves frames as PNGs.
+- Next: a screenshot of the original at the same camera and the
+  comparison, then what it shows needs fixing.
 
 ## Working rules
 

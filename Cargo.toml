@@ -9,6 +9,7 @@ members = [
     "crates/sims-formats",
     "crates/sims-people",
     "crates/sims-render",
+    "crates/sims-viewer",
     "crates/sims-sim",
     "crates/sims-vm",
 ]

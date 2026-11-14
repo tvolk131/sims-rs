@@ -1,0 +1,325 @@
+//! A window that shows a lot drawn by `sims-render`.
+//!
+//! ```text
+//! sims-viewer <install> <house file> [--snapshot <file.redb> [name]] [--save-dir <dir>]
+//! ```
+//!
+//! Without `--snapshot` the house file is read into a fresh world. With
+//! it, the world saved by `sims boot --snapshot` (named `boot` unless
+//! another name is given) is shown instead; the house file still names the
+//! neighborhood the art is read with.
+//!
+//! Keys: `+`/`-` or the wheel zoom, `[`/`]` or `,`/`.` rotate, Page Up and
+//! Page Down change the floor, `1`/`2`/`3` choose walls up, cutaway and
+//! down, the arrow keys or a left-button drag scroll, `S` saves the frame
+//! as a PNG, Escape quits.
+//!
+//! The window is drawn at the original's pixel size and scaled up by whole
+//! pixels on high-DPI screens, so it keeps the original's look.
+
+mod view;
+
+use sims_render::{Canvas, Lot, Walls, draw, open_house, png};
+use softbuffer::{Context, Surface};
+use std::num::NonZeroU32;
+use std::path::PathBuf;
+use std::rc::Rc;
+use view::{Command, View};
+use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{Key, NamedKey};
+use winit::window::{Window, WindowId};
+
+struct Options {
+    install: PathBuf,
+    house: PathBuf,
+    snapshot: Option<(PathBuf, String)>,
+    save_dir: PathBuf,
+}
+
+fn options() -> Result<Options, String> {
+    let usage = "usage: sims-viewer <install> <house file> [--snapshot <file.redb> [name]] [--save-dir <dir>]";
+    let mut args = std::env::args().skip(1);
+    let install = args.next().ok_or(usage)?.into();
+    let house = args.next().ok_or(usage)?.into();
+    let mut snapshot = None;
+    let mut save_dir = PathBuf::from(".");
+    let mut rest: Vec<String> = args.collect();
+    rest.reverse();
+    while let Some(arg) = rest.pop() {
+        match arg.as_str() {
+            "--snapshot" => {
+                let path = rest.pop().ok_or(usage)?;
+                let name = match rest.last() {
+                    Some(n) if !n.starts_with("--") => rest.pop().unwrap_or_default(),
+                    _ => "boot".to_string(),
+                };
+                snapshot = Some((PathBuf::from(path), name));
+            }
+            "--save-dir" => save_dir = rest.pop().ok_or(usage)?.into(),
+            _ => return Err(usage.to_string()),
+        }
+    }
+    Ok(Options {
+        install,
+        house,
+        snapshot,
+        save_dir,
+    })
+}
+
+struct Viewer {
+    world: sims_sim::World,
+    lot: Lot,
+    assets: sims_render::Assets,
+    view: View,
+    canvas: Canvas,
+    stats: sims_render::Stats,
+    dirty: bool,
+    save_dir: PathBuf,
+    saved: usize,
+    window: Option<Rc<Window>>,
+    surface: Option<Surface<Rc<Window>, Rc<Window>>>,
+    scale: u32,
+    drag: Option<PhysicalPosition<f64>>,
+    cursor: PhysicalPosition<f64>,
+}
+
+impl Viewer {
+    fn command(&mut self, command: Command) {
+        if command == Command::Save {
+            self.save();
+        } else if self.view.apply(command) {
+            self.dirty = true;
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+    }
+
+    fn save(&mut self) {
+        let c = &self.view.camera;
+        let name = format!(
+            "view-z{}-r{}-f{}-{}.png",
+            c.zoom.level(),
+            c.rotation,
+            c.level,
+            self.saved
+        );
+        let path = self.save_dir.join(name);
+        match std::fs::write(&path, png::encode(&self.canvas)) {
+            Ok(()) => eprintln!("saved {}", path.display()),
+            Err(e) => eprintln!("could not save {}: {e}", path.display()),
+        }
+        self.saved += 1;
+    }
+
+    fn key(&mut self, key: &Key) {
+        let step = 64;
+        let command = match key {
+            Key::Named(NamedKey::Escape) => return,
+            Key::Named(NamedKey::ArrowLeft) => Command::Scroll([step, 0]),
+            Key::Named(NamedKey::ArrowRight) => Command::Scroll([-step, 0]),
+            Key::Named(NamedKey::ArrowUp) => Command::Scroll([0, step]),
+            Key::Named(NamedKey::ArrowDown) => Command::Scroll([0, -step]),
+            Key::Named(NamedKey::PageUp) => Command::LevelUp,
+            Key::Named(NamedKey::PageDown) => Command::LevelDown,
+            Key::Character(c) => match c.as_str() {
+                "+" | "=" => Command::ZoomIn,
+                "-" | "_" => Command::ZoomOut,
+                "[" | "," => Command::Rotate(false),
+                "]" | "." => Command::Rotate(true),
+                "1" => Command::Walls(Walls::Up),
+                "2" => Command::Walls(Walls::Cutaway),
+                "3" => Command::Walls(Walls::Down),
+                "s" | "S" => Command::Save,
+                _ => return,
+            },
+            _ => return,
+        };
+        self.command(command);
+    }
+
+    fn redraw(&mut self) {
+        let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
+            return;
+        };
+        let size = window.inner_size();
+        let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
+            return;
+        };
+        let scale = self.scale.max(1);
+        let canvas_size = [(size.width / scale) as i32, (size.height / scale) as i32];
+        if canvas_size != self.view.size {
+            self.view.resize(canvas_size);
+            self.dirty = true;
+        }
+        if self.dirty {
+            let [cw, ch] = self.view.size.map(|n| n.max(1) as usize);
+            if (self.canvas.width, self.canvas.height) != (cw, ch) {
+                self.canvas = Canvas::new(cw, ch, [0, 0, 0]);
+            }
+            self.stats = draw(
+                &self.world,
+                &self.lot,
+                &mut self.assets,
+                &self.view.camera,
+                &mut self.canvas,
+            );
+            self.dirty = false;
+            window.set_title(&format!(
+                "sims-viewer: {} ({} floors, {} walls, {} objects)",
+                self.view.describe(),
+                self.stats.floors,
+                self.stats.walls,
+                self.stats.objects
+            ));
+        }
+        if surface.resize(w, h).is_err() {
+            return;
+        }
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return;
+        };
+        let (bw, bh) = (size.width as usize, size.height as usize);
+        let scale = scale as usize;
+        for y in 0..bh {
+            let cy = (y / scale).min(self.canvas.height.saturating_sub(1));
+            for x in 0..bw {
+                let cx = (x / scale).min(self.canvas.width.saturating_sub(1));
+                let [r, g, b] = self
+                    .canvas
+                    .color
+                    .get(cy * self.canvas.width + cx)
+                    .copied()
+                    .unwrap_or([0, 0, 0]);
+                buffer[y * bw + x] = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+            }
+        }
+        let _ = buffer.present();
+    }
+}
+
+impl ApplicationHandler for Viewer {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        let attributes = Window::default_attributes()
+            .with_title("sims-viewer")
+            .with_inner_size(LogicalSize::new(1024.0, 768.0));
+        let window = match event_loop.create_window(attributes) {
+            Ok(w) => Rc::new(w),
+            Err(e) => {
+                eprintln!("could not open a window: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
+        let surface =
+            Context::new(window.clone()).and_then(|context| Surface::new(&context, window.clone()));
+        match surface {
+            Ok(s) => self.surface = Some(s),
+            Err(e) => {
+                eprintln!("could not draw into the window: {e}");
+                event_loop.exit();
+                return;
+            }
+        }
+        self.scale = window.scale_factor().round().max(1.0) as u32;
+        self.window = Some(window.clone());
+        self.dirty = true;
+        window.request_redraw();
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::Resized(_) => {
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.scale = scale_factor.round().max(1.0) as u32;
+                self.dirty = true;
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if event.logical_key == Key::Named(NamedKey::Escape) {
+                    event_loop.exit();
+                } else {
+                    self.key(&event.logical_key);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let up = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y > 0.0,
+                    MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
+                };
+                self.command(if up {
+                    Command::ZoomIn
+                } else {
+                    Command::ZoomOut
+                });
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.drag = (state == ElementState::Pressed).then_some(self.cursor);
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = position;
+                if let Some(start) = self.drag {
+                    let scale = f64::from(self.scale.max(1));
+                    let dx = ((position.x - start.x) / scale) as i32;
+                    let dy = ((position.y - start.y) / scale) as i32;
+                    if dx != 0 || dy != 0 {
+                        self.drag = Some(PhysicalPosition::new(
+                            start.x + f64::from(dx) * scale,
+                            start.y + f64::from(dy) * scale,
+                        ));
+                        self.command(Command::Scroll([dx, dy]));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let options = options()?;
+    let opened = open_house(&options.install, &options.house)?;
+    let world = match &options.snapshot {
+        Some((path, name)) => sims_sim::Snapshots::open(path)?
+            .load(name)?
+            .ok_or_else(|| format!("{} holds no world named {name}", path.display()))?,
+        None => opened.world,
+    };
+    let lot = Lot::from_world(&world)?;
+    let view = View::new([1024, 768], lot.built_center(), opened.rotation);
+    let mut viewer = Viewer {
+        world,
+        lot,
+        assets: opened.assets,
+        view,
+        canvas: Canvas::new(1, 1, [0, 0, 0]),
+        stats: sims_render::Stats::default(),
+        dirty: true,
+        save_dir: options.save_dir,
+        saved: 0,
+        window: None,
+        surface: None,
+        scale: 1,
+        drag: None,
+        cursor: PhysicalPosition::new(0.0, 0.0),
+    };
+    let event_loop = EventLoop::new()?;
+    event_loop.run_app(&mut viewer)?;
+    Ok(())
+}
