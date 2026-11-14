@@ -8,7 +8,16 @@ mkdir -p /media/cdrom
 mountpoint -q /media/cdrom || mount -t iso9660 -o ro /dev/vdb /media/cdrom
 ls -l "$WINEPREFIX/dosdevices/"
 cd "$GAME"
-sha256sum Sims.exe version.dll
+# The build the harness was made for (Sims.exe 1.91, Complete Collection, and
+# its version.dll). Another build stops the launch here (set -e). The verified
+# digests go to the share, and capture.py records them.
+rm -f /research/game-identity.txt
+cat > /tmp/game-identity.txt <<'END'
+32857c25e00594a9bc5d700f7b373b6df59ab76ec51b36aa1d30f3dd973eff58  Sims.exe
+2e9ca4bb2c650dafe2556176aeeef2fb5c4d733e398b45e467fae10c3195035b  version.dll
+END
+sha256sum -c /tmp/game-identity.txt
+cp /tmp/game-identity.txt /research/game-identity.txt
 for d in UserData UserData2 UserData3 UserData4 UserData5 UserData6 UserData7 UserData8; do
     rm -rf "$d"
     cp -a "/research/userdata/$d" .
