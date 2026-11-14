@@ -1,7 +1,7 @@
 //! A window that shows a lot drawn by `sims-render`.
 //!
 //! ```text
-//! sims-viewer <install> <house file> [--snapshot <file.redb> [name]] [--save-dir <dir>]
+//! sims-viewer <install> <house file> [--snapshot <file.redb> [name]] [--save-dir <dir>] [--hud]
 //! ```
 //!
 //! Without `--snapshot` the house file is read into a fresh world. With
@@ -15,9 +15,14 @@
 //! as a PNG, Escape quits. As in the original, the cutaway cuts the walls
 //! in front of the last rooms the pointer passed over.
 //!
+//! `--hud` draws the original's live-mode control panel over the lot
+//! (`sims-ui`); its camera buttons work, and the commands it would send
+//! the simulation are printed instead.
+//!
 //! The window is drawn at the original's pixel size and scaled up by whole
 //! pixels on high-DPI screens, so it keeps the original's look.
 
+mod hud;
 mod view;
 
 use sims_render::{Canvas, Lot, Walls, draw, open_house, png};
@@ -39,16 +44,18 @@ struct Options {
     house: PathBuf,
     snapshot: Option<(PathBuf, String)>,
     save_dir: PathBuf,
+    hud: bool,
 }
 
 fn options() -> Result<Options, String> {
-    let usage = "usage: sims-viewer <install> <house file> [--snapshot <file.redb> [name]] [--save-dir <dir>]";
+    let usage = "usage: sims-viewer <install> <house file> [--snapshot <file.redb> [name]] [--save-dir <dir>] [--hud]";
     // Paths need not be Unicode; flags and snapshot names must be.
     let mut args = std::env::args_os().skip(1);
     let install = args.next().ok_or(usage)?.into();
     let house = args.next().ok_or(usage)?.into();
     let mut snapshot = None;
     let mut save_dir = PathBuf::from(".");
+    let mut hud = false;
     let mut rest: Vec<OsString> = args.collect();
     rest.reverse();
     while let Some(arg) = rest.pop() {
@@ -67,6 +74,7 @@ fn options() -> Result<Options, String> {
                 snapshot = Some((PathBuf::from(path), name));
             }
             Some("--save-dir") => save_dir = rest.pop().ok_or(usage)?.into(),
+            Some("--hud") => hud = true,
             _ => return Err(usage.to_string()),
         }
     }
@@ -75,6 +83,7 @@ fn options() -> Result<Options, String> {
         house,
         snapshot,
         save_dir,
+        hud,
     })
 }
 
@@ -93,6 +102,7 @@ struct Viewer {
     scale: u32,
     drag: Option<PhysicalPosition<f64>>,
     cursor: PhysicalPosition<f64>,
+    hud: Option<hud::Hud>,
 }
 
 impl Viewer {
@@ -169,6 +179,9 @@ impl Viewer {
             &self.view.camera,
             &mut self.canvas,
         );
+        if let Some(hud) = &mut self.hud {
+            hud.draw(&self.world, &self.view, &mut self.canvas);
+        }
         self.dirty = false;
         if let Some(window) = &self.window {
             window.set_title(&format!(
@@ -179,6 +192,33 @@ impl Viewer {
                 self.stats.objects
             ));
         }
+    }
+
+    /// The cursor in canvas pixels.
+    fn canvas_point(&self, position: PhysicalPosition<f64>) -> [i32; 2] {
+        let scale = f64::from(self.scale.max(1));
+        [(position.x / scale) as i32, (position.y / scale) as i32]
+    }
+
+    /// A left press: the panel's if it covers the point, else a drag.
+    fn left_press(&mut self) {
+        let point = self.canvas_point(self.cursor);
+        if let Some(hud) = &mut self.hud
+            && hud.covers(point)
+        {
+            let (command, changed) = hud.press(point);
+            if changed {
+                self.dirty = true;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            if let Some(command) = command {
+                self.command(command);
+            }
+            return;
+        }
+        self.drag = Some(self.cursor);
     }
 
     fn redraw(&mut self) {
@@ -296,22 +336,31 @@ impl ApplicationHandler for Viewer {
                 button: MouseButton::Left,
                 ..
             } => {
-                self.drag = (state == ElementState::Pressed).then_some(self.cursor);
+                self.drag = None;
+                if state == ElementState::Pressed {
+                    self.left_press();
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
+                let point = self.canvas_point(position);
+                let mut redraw = false;
+                if let Some(hud) = &mut self.hud
+                    && hud.hover(point)
+                {
+                    redraw = true;
+                }
                 // The cutaway follows the rooms the pointer passes over;
                 // the original looks only while the cutaway is on.
                 if self.drag.is_none() && self.view.camera.walls == Walls::Cutaway {
-                    let scale = f64::from(self.scale.max(1));
-                    let at = [position.x / scale, position.y / scale].map(|v| v as i32);
                     let camera = self.view.camera;
-                    self.view.camera.focus.point(&self.lot, &camera, at);
-                    if self.view.camera.focus != camera.focus {
-                        self.dirty = true;
-                        if let Some(w) = &self.window {
-                            w.request_redraw();
-                        }
+                    self.view.camera.focus.point(&self.lot, &camera, point);
+                    redraw |= self.view.camera.focus != camera.focus;
+                }
+                if redraw {
+                    self.dirty = true;
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
                     }
                 }
                 if let Some(start) = self.drag {
@@ -347,6 +396,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => opened.world,
     };
     let lot = Lot::from_world(&world)?;
+    let hud = if options.hud {
+        Some(hud::Hud::open(
+            &options.install,
+            &options.house,
+            &opened.assets,
+        )?)
+    } else {
+        None
+    };
     let view = View::new([1024, 768], lot.built_center(), opened.rotation);
     let mut viewer = Viewer {
         world,
@@ -363,6 +421,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         scale: 1,
         drag: None,
         cursor: PhysicalPosition::new(0.0, 0.0),
+        hud,
     };
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut viewer)?;

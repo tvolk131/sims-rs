@@ -1323,11 +1323,15 @@ Progress:
   behind in the emulator, matches in meshes, textures, proportions and
   pose (see the decisions entry). Appearances are also found by their
   own names across every catalog.
-- Next: settle whether the drawing is the original's mirror image (a
-  front view of a fixed asymmetric feature), and compare the standing
-  loop. The simulation does not yet expose the base layer's clip and
-  phase (a read-only accessor is wanted; until then the saved record and
-  the animator's clock stand in).
+- Done: the drawing is the original's image, not its mirror (Cassandra's
+  pocket protector, seen from the front); bones compose exactly as the
+  original's code does; the lot lies on the screen as the lot drawing has
+  it. Catalogs load in the original's order, and the head turns as the
+  simulation says.
+- Next: compare the standing loop; record the original's lighting (room
+  light, lamps, the standard light) and how far ours is from it. The base
+  layer's clip and phase are not simulation state yet, so the saved
+  record and the animator's clock stand in.
 
 ## Track: lot rendering (`crates/sims-render`)
 
@@ -1391,12 +1395,16 @@ stop-sounds events.
   Volume, pan, pitch and ducking follow the original's formulas, and
   the output is stereo. The `render_event` example writes events to a
   WAV file.
+- **Done: event kinds.** Fades, television and radio stations (built
+  from their directories, as the original does), sequenced hit lists,
+  `radio_next_song` and the kill events follow the original's
+  dispatcher. Of the 190 events that were not plays, 29 remain, counted
+  in a gated test: music modes (21), ambience modes (5), the piano,
+  pausing and reloading. 12 more name no track and do nothing.
 - **Next:**
   - The simulation emits `SoundEvent`s (the interface is in the
     decisions log).
-  - The 190 events of other kinds (music modes, TV, sequenced hit
-    lists).
-  - The FSC ambient player.
+  - The FSC ambient player (ambience modes).
   - Live playback behind a feature.
   - Checking any of it against the original.
 
@@ -1425,6 +1433,48 @@ Progress:
 - Next: build mode (its mode number), and a replay of the recorded push and
   the purchase in our simulation. The replay needs a way to queue an
   action on a person, and to place a bought object, before a tick.
+
+## Track: the interface (`crates/sims-ui`)
+
+Goal: the game's interface drawn from the original art: the live-mode
+control panel, dialogs, pie menus, and later the other panels and the
+catalogs. The art goes in the original's layout, adapted to any window
+size. The crate only reads the simulation. Every click becomes a
+`sims_ui::command::Command`, and the host decides what to do with it.
+Drawing goes into a CPU frame, so `cargo test` needs no window.
+
+- **Done: the interface's art.** `sims-formats` reads its BMP and TGA
+  files and `sims-content` reads its resource tables (#62).
+- **Done: the live control panel.** The cluster (modes, camera, speed,
+  clock and funds) and the strip (portraits, mood bars, the gadget and
+  the Needs panel) are drawn at any window size, from a loaded world.
+  Measured against a screenshot of the original at 800×600; the
+  numbers are in the decisions log. The Goths' panel is pinned by
+  digest at 800×600 and 1280×720, gated on `SIMS_INSTALL`. `sims-viewer
+  --hud` shows it over the lot. Camera buttons move the camera; the
+  other commands are printed, since the simulation cannot take them yet.
+- **Next:** a message dialog with buttons drawn from a real dialog
+  string; pie menus; the other live panels.
+- **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
+  - A command intake, for example `World::apply(&mut self, command:
+    sims_sim::Command) -> Result<(), CommandError>`, run between ticks,
+    taking: select a Sim (object ID), set the speed, pause or run, go
+    to a mode, answer a dialog (caller, button), and choose a pie menu
+    entry (Sim, object, interaction).
+  - A library form of the boot's household load (`sims boot` steps 17
+    and 18): `World::load_household(&mut self, family: &Family)` that
+    sets the funds and selects the first member. Today the CLI does it
+    and a host that opens a house gets the house file's funds and no
+    selection.
+  - The household's member order kept in the world, for example
+    `World::household(&self) -> &[u32]` (GUIDs), so the portraits do
+    not need the neighborhood file.
+  - The game speed, for example `World::speed(&self) -> u8`.
+  - A pending dialog's text resolved: `Dialog::text(&self, world:
+    &World) -> DialogText` with the message, the button labels and the
+    title, read from the caller's tree's string table.
+  - Each Sim's current action and its icon, for the icons over the
+    portraits.
 
 ## Working rules
 

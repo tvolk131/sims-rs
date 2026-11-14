@@ -7,7 +7,7 @@
 //! ordinary `f32`. [`assets`] finds the files, [`texture`] decodes skins,
 //! [`rig`] poses a skeleton, [`appearance`] resolves what a person wears,
 //! [`animation`] poses it from a clip, [`person`] places it and picks the
-//! clips from the simulation's animator, [`skin`] blends the mesh vertices
+//! clips from the simulation's animator, [`skin()`] blends the mesh vertices
 //! over the posed bones, and [`raster`] draws the result.
 
 // Drawing never feeds simulation state (see the workspace lint table).

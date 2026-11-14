@@ -1,0 +1,20 @@
+[package]
+name = "sims-ui"
+description = "The game's interface drawn from the original artwork: the live-mode control panel, dialogs and pie menus. Reads simulation state, draws into a pixel buffer and turns the player's clicks into commands; it never changes the simulation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+sims-content.workspace = true
+sims-formats.workspace = true
+sims-sim.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+
+[lints]
+workspace = true
