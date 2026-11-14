@@ -1383,11 +1383,15 @@ Progress:
   behind in the emulator, matches in meshes, textures, proportions and
   pose (see the decisions entry). Appearances are also found by their
   own names across every catalog.
-- Next: settle whether the drawing is the original's mirror image (a
-  front view of a fixed asymmetric feature), and compare the standing
-  loop. The simulation does not yet expose the base layer's clip and
-  phase (a read-only accessor is wanted; until then the saved record and
-  the animator's clock stand in).
+- Done: the drawing is the original's image, not its mirror (Cassandra's
+  pocket protector, seen from the front); bones compose exactly as the
+  original's code does; the lot lies on the screen as the lot drawing has
+  it. Catalogs load in the original's order, and the head turns as the
+  simulation says.
+- Next: compare the standing loop; record the original's lighting (room
+  light, lamps, the standard light) and how far ours is from it. The base
+  layer's clip and phase are not simulation state yet, so the saved
+  record and the animator's clock stand in.
 
 ## Track: lot rendering (`crates/sims-render`)
 

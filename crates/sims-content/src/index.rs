@@ -42,6 +42,16 @@ impl Resource {
         }
     }
 
+    /// The last component of [`Resource::name`]: an archive member's name
+    /// may hold directories, separated by `\\` or `/`.
+    pub fn file_name(&self) -> String {
+        let name = self.name();
+        match name.rfind(['\\', '/']) {
+            Some(at) => name[at + 1..].to_owned(),
+            None => name,
+        }
+    }
+
     /// A readable location: the path relative to `root`, with `/member`
     /// appended for archive members.
     pub fn location(&self, root: &Path) -> String {
@@ -165,13 +175,21 @@ impl Index {
         Ok(())
     }
 
-    /// Resources whose own name matches, ignoring ASCII case, in load
-    /// order, with their positions in [`Index::resources`].
+    /// Resources whose name matches, ignoring ASCII case, in load order,
+    /// with their positions in [`Index::resources`]. A name without a
+    /// directory matches a resource's file name, the last component of its
+    /// name, so `SofaGlobals.iff` finds the member `sub\SofaGlobals.iff`.
+    /// A name with a directory (`\` or `/`) matches the whole
+    /// [`Resource::name`], as before.
     pub fn named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = (usize, &'a Resource)> {
-        self.resources
-            .iter()
-            .enumerate()
-            .filter(move |(_, r)| r.name().eq_ignore_ascii_case(name))
+        let qualified = name.contains(['\\', '/']);
+        self.resources.iter().enumerate().filter(move |(_, r)| {
+            if qualified {
+                r.name().eq_ignore_ascii_case(name)
+            } else {
+                r.file_name().eq_ignore_ascii_case(name)
+            }
+        })
     }
 
     /// Lists one mount: gathers its directories, then walks them.
@@ -196,7 +214,7 @@ impl Index {
     ) -> Result<()> {
         directories.entry(at.to_vec()).or_default();
         for path in sorted_entries(directory)? {
-            let name = key(path.file_name().unwrap_or_default().as_encoded_bytes());
+            let name = key(&disk_name(path.file_name().unwrap_or_default()));
             let here = directories.get_mut(at).expect("inserted above");
             if path.is_dir() {
                 // A file or directory on disk replaces an archive member of
@@ -209,7 +227,7 @@ impl Index {
             } else if name.ends_with(b"far") {
                 // The original tests the last three letters, with no dot.
                 here.add(name, Entry::Archive);
-                match far_members(&path) {
+                match archive_members(&path) {
                     Ok((members, skipped)) => {
                         self.diagnostics.extend(skipped);
                         mount_archive(directories, at, &path, members);
@@ -310,10 +328,18 @@ enum Entry {
 /// which places it in a subdirectory of the archive's own directory `at`,
 /// whether or not that subdirectory exists on disk. A member never
 /// replaces an entry that is already there.
-fn mount_archive(directories: &mut Directories, at: &[u8], archive: &Path, members: Vec<Member>) {
+///
+/// A member's place comes from the bytes of its name as the archive stores
+/// them, not from the decoded name: the file table hashes those bytes.
+fn mount_archive(
+    directories: &mut Directories,
+    at: &[u8],
+    archive: &Path,
+    members: Vec<RawMember>,
+) {
     let split = |path: &[u8]| path.iter().rposition(|&b| b == b'\\').map_or(0, |n| n + 1);
-    for member in members {
-        let full = [at, &key(member.name.as_bytes())].concat();
+    for (member, raw_name) in members {
+        let full = [at, &key(&raw_name)].concat();
         let (directory, name) = full.split_at(split(&full));
         let entry = Entry::Member(archive.to_path_buf(), member);
         if !directories
@@ -336,6 +362,17 @@ fn mount_archive(directories: &mut Directories, at: &[u8], archive: &Path, membe
             child = parent;
         }
     }
+}
+
+/// The bytes of a name on disk as the original would see them: in the
+/// Windows-1252 code page, as archive member names are, so a loose file
+/// and a member of one name are one entry. A name that is not valid UTF-8
+/// or has a character the code page lacks keeps the file system's bytes.
+/// **Unverified**: the install holds no name outside ASCII.
+fn disk_name(name: &std::ffi::OsStr) -> Vec<u8> {
+    name.to_str()
+        .and_then(far::encode_name)
+        .unwrap_or_else(|| name.as_encoded_bytes().to_vec())
 }
 
 /// A directory's entries in NTFS name order: ASCII case folded to upper case
@@ -389,6 +426,18 @@ pub(crate) fn all_far_members(path: &Path) -> Result<Vec<Member>> {
 /// is longer than [`MAX_MEMBER_NAME`] or holds more than
 /// [`MAX_MEMBER_DEPTH`] directories is left out too.
 pub(crate) fn far_members(path: &Path) -> Result<(Vec<Member>, Vec<String>)> {
+    let (members, skipped) = archive_members(path)?;
+    Ok((
+        members.into_iter().map(|(member, _)| member).collect(),
+        skipped,
+    ))
+}
+
+/// An archive member with the bytes of its name as the archive stores them.
+type RawMember = (Member, Vec<u8>);
+
+/// [`far_members`], each with the bytes of its name.
+fn archive_members(path: &Path) -> Result<(Vec<RawMember>, Vec<String>)> {
     let io = |e| Error::io(path, e);
     let mut file = File::open(path).map_err(io)?;
     let len = file.metadata().map_err(io)?.len();
@@ -433,11 +482,14 @@ pub(crate) fn far_members(path: &Path) -> Result<(Vec<Member>, Vec<String>)> {
             ));
             continue;
         }
-        members.push(Member {
-            name: entry.name,
-            offset: u64::from(entry.offset),
-            size: u64::from(entry.stored_size),
-        });
+        members.push((
+            Member {
+                name: entry.name,
+                offset: u64::from(entry.offset),
+                size: u64::from(entry.stored_size),
+            },
+            entry.raw_name,
+        ));
     }
     Ok((members, skipped))
 }

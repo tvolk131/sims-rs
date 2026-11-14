@@ -1,16 +1,22 @@
 //! Poses a skeleton: each bone's place relative to its parent, and from
 //! those its place on the body.
 //!
-//! The files keep positions and rotations in the original's convention.
-//! [`from_file`] converts them once, at this boundary, to a right-handed
-//! frame with Y up and Hamilton quaternions: a position `[x, y, z]`
-//! becomes `[-x, y, z]`, and a rotation `[x, y, z, w]` becomes
-//! `[-x, y, z, w]`. That is a mirror of the X axis, applied to rotations
-//! that the original composes the other way round. The old prototype's
-//! renderer made the same conversion (legacy/crates/sims-render/src/pose.rs,
-//! `translation`, `rotation` and `presentation_matrix`). Whether the
-//! result is the original's image or its mirror image is **unverified**
-//! until it is compared with a screenshot of the original.
+//! The drawing frame is the files' own frame, Y up: a position `[x, y, z]`
+//! is kept as it is. The original keeps a turn with x, y and z negated
+//! relative to the Hamilton quaternions used here (its bone matrix,
+//! 0x595f32, negates them again), so [`from_file`] turns a rotation
+//! `[x, y, z, w]` into `[-x, -y, -z, w]`. With that, each bone lands
+//! exactly where the original's composition (0x59615b, ported as
+//! `sims_sim::pose::absolute`) puts it, as a test below checks.
+//!
+//! The camera ([`crate::raster::Camera`]) reads the frame as the
+//! original's renderer does: x right, y up, z away from the viewer. So
+//! the image is the original's, not its mirror image. That was checked
+//! against the original: Cassandra Goth's shirt has a pocket protector on
+//! her own left side in two screenshots of the original, and is drawn on
+//! her left here. The old prototype (and this crate before) mirrored the
+//! X axis (legacy/crates/sims-render/src/pose.rs), which drew it on her
+//! right.
 
 use crate::math::{Quat, Transform, Vec3};
 use sims_core::F32;
@@ -18,18 +24,18 @@ use sims_formats::avatar::Skeleton;
 
 /// A position from a file, in the drawing frame.
 pub fn position(v: [f32; 3]) -> Vec3 {
-    Vec3::new(-v[0], v[1], v[2])
+    Vec3::new(v[0], v[1], v[2])
 }
 
 /// A rotation from a file, in the drawing frame.
 pub fn rotation(q: [f32; 4]) -> Quat {
-    Quat::new(-q[0], q[1], q[2], q[3]).normalize()
+    Quat::new(-q[0], -q[1], -q[2], q[3]).normalize()
 }
 
 /// A rotation in the drawing frame, back in the files' convention: the
 /// inverse of [`rotation`].
 fn to_file(q: Quat) -> [f32; 4] {
-    [-q.x, q.y, q.z, q.w]
+    [-q.x, -q.y, -q.z, q.w]
 }
 
 /// A bone's place relative to its parent, from a file's position and
@@ -166,9 +172,10 @@ pub(crate) mod tests {
     fn the_rest_pose_chains_parents() {
         let s = skeleton();
         let world = Pose::rest(&s).world(&s, Transform::IDENTITY);
-        // A quarter turn about Z takes the child's +Y offset to -X.
+        // The root's quarter turn about the file's Z takes the child's +Y
+        // offset to +X, as the original composes it (see below).
         let p = world[1].point(Vec3::ZERO);
-        assert!((p - Vec3::new(-1.0, 0.0, 0.0)).length() < 1e-5, "{p:?}");
+        assert!((p - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5, "{p:?}");
         assert_eq!(bone(&s, "child"), Some(1));
     }
 
@@ -272,6 +279,48 @@ pub(crate) mod tests {
             translation: Vec3::new(5.0, 0.0, 0.0),
         };
         let world = Pose::rest(&s).world(&s, root);
-        assert!((world[1].point(Vec3::ZERO) - Vec3::new(4.0, 0.0, 0.0)).length() < 1e-5);
+        assert!((world[1].point(Vec3::ZERO) - Vec3::new(6.0, 0.0, 0.0)).length() < 1e-5);
+    }
+
+    #[test]
+    fn bones_are_placed_as_the_original_places_them() {
+        // A chain of three bones whose turns do not commute, placed here
+        // and by the simulation's port of the original's composition
+        // (0x59615b, `sims_sim::pose::absolute`), in the files' frame.
+        let mut s = skeleton();
+        let mut tip = s.bones[1].clone();
+        tip.name = "TIP".into();
+        tip.parent = Some(1);
+        tip.translation = [0.2, 0.7, -0.4];
+        tip.rotation = [0.5, 0.5, 0.5, 0.5];
+        s.bones[1].translation = [0.3, 1.0, 0.1];
+        s.bones[1].rotation = [0.1, 0.2, 0.3, 0.927_362];
+        s.bones.push(tip);
+        let ours = Pose::rest(&s).world(&s, Transform::IDENTITY);
+        let f = |v: &[f32]| v.iter().map(|&x| F32::from_f32(x)).collect::<Vec<_>>();
+        let locals: Vec<sims_sim::pose::Bone> = s
+            .bones
+            .iter()
+            .map(|b| sims_sim::pose::Bone {
+                translation: f(&b.translation).try_into().unwrap(),
+                rotation: f(&b.rotation).try_into().unwrap(),
+            })
+            .collect();
+        let parents: Vec<_> = s.bones.iter().map(|b| b.parent).collect();
+        let original = sims_sim::pose::absolute(&parents, &locals).unwrap();
+        for (o, w) in original.iter().zip(&ours) {
+            let t = o.translation.map(F32::to_f32);
+            let got = [w.translation.x, w.translation.y, w.translation.z];
+            for (a, b) in got.iter().zip(t) {
+                assert!((a - b).abs() < 1e-5, "{got:?} {t:?}");
+            }
+            // The same turn (q and -q are one rotation). The original keeps
+            // a placed bone's turn with x, y and z negated, as the drawing
+            // frame does; its bone matrix negates them again (0x595f32).
+            let q = o.rotation.map(F32::to_f32);
+            let r = [w.rotation.x, w.rotation.y, w.rotation.z, w.rotation.w];
+            let dot: f32 = q.iter().zip(r).map(|(a, b)| a * b).sum();
+            assert!(dot.abs() > 1.0 - 1e-5, "{q:?} {r:?}");
+        }
     }
 }

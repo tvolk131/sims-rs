@@ -6,16 +6,23 @@
 //! - **Where.** `Animator::position` holds x and y in sixteenths of a tile
 //!   and the direction in eighths of a turn. A tile is
 //!   [`UNITS_PER_TILE`] model units (the walk clip's own stride, see
-//!   below). Sim x becomes model X and sim y becomes model Z; the ground
-//!   is at Y = 0.
-//! - **Which way.** Person 259, walking through 82 ticks of the boot
-//!   (`sims boot` of House05, ticks 226 to 333), moves along
-//!   (sin θ, -cos θ) in sim x and y, for θ its direction times 45
-//!   degrees: the difference averages 0.2 degrees, while the direction
-//!   itself swings by up to 12 degrees from tick to tick. A skeleton at rest
-//!   faces +Z (its toes are at +Z), so it is turned by π - θ about the
-//!   vertical. The old prototype turned people the same way
-//!   (legacy/crates/sims-render/src/lib.rs, `actor_pose`).
+//!   below). The original's model matrix (0x592132, ported as
+//!   `sims_sim::head::placement`) puts sim y on model X and sim x on
+//!   model Z. Here both are negated as well, which is the original's lot
+//!   turned half a turn about the vertical: with the house view's camera
+//!   ([`crate::raster::Camera::house_view`]) sim +x then goes right and
+//!   down the screen and sim +y left and down, as the lot drawing's
+//!   projection has them (0x4b3c88, `sims_render::camera`). The ground is
+//!   at Y = 0.
+//! - **Which way.** The original turns the skeleton by (direction + 6)
+//!   eighths about the vertical (0x592132); with the half turn above,
+//!   that is θ + π/2 for θ the direction times 45 degrees. A skeleton at
+//!   rest faces +Z (its toes are at +Z), so a person faces
+//!   (sin θ, -cos θ) in sim x and y. That is the way the simulation walks
+//!   them: person 259, walking through 82 ticks of the boot (`sims boot`
+//!   of House05, ticks 226 to 333), moves along it with a mean difference
+//!   of 0.2 degrees, while the direction itself swings by up to 12
+//!   degrees from tick to tick. Direction 3 faces the viewer.
 //! - **What.** The foreground layer (`Animator::foreground`) is drawn
 //!   over the base layer, which plays the posture's loop. The simulation
 //!   keeps whether the base layer exists (`Animator::base`) but not its
@@ -23,8 +30,7 @@
 //!   phase from the animator's clock. Both are stand-ins until the
 //!   simulation exposes them.
 //!
-//! Whether the result is the original's image or its mirror image is
-//! **unverified** (see [`crate::rig`]).
+//! The image is the original's, not its mirror image: see [`crate::rig`].
 
 use crate::animation::{Clip, Library};
 use crate::assets::Assets;
@@ -75,10 +81,11 @@ pub fn placement(animator: &Animator) -> Option<Transform> {
         return None;
     }
     let [x, y, direction] = animator.position.map(|v| v.to_f32());
-    let [s, c] = heading(direction);
+    // θ + π/2: two eighths more than the direction.
+    let [s, c] = heading(direction + 2.0);
     Some(Transform {
-        rotation: Quat::about_y(s, -c),
-        translation: Vec3::new(x / 16.0 * UNITS_PER_TILE, 0.0, y / 16.0 * UNITS_PER_TILE),
+        rotation: Quat::about_y(s, c),
+        translation: Vec3::new(-y / 16.0 * UNITS_PER_TILE, 0.0, -x / 16.0 * UNITS_PER_TILE),
     })
 }
 
@@ -249,22 +256,23 @@ mod tests {
     fn a_placed_person_faces_the_way_it_walks() {
         let mut animator = Animator::new(0);
         assert_eq!(placement(&animator), None);
-        // Direction 2 (a quarter turn): walking towards +x.
+        // Sim x is model -Z, sim y model -X.
         animator.position = [32.0, 48.0, 2.0].map(F32::from_f32);
         let root = placement(&animator).unwrap();
-        assert_eq!(root.translation, Vec3::new(6.0, 0.0, 9.0));
+        assert_eq!(root.translation, Vec3::new(-9.0, 0.0, -6.0));
+        // Direction 2 (a quarter turn): walking towards +x, model -Z.
         let ahead = root.vector(Vec3::new(0.0, 0.0, 1.0));
         assert!(
-            (ahead - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-6,
+            (ahead - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-6,
             "{ahead:?}"
         );
-        // Direction 0: walking towards -y.
+        // Direction 0: walking towards -y, model +X.
         animator.position[2] = F32::ZERO;
         let ahead = placement(&animator)
             .unwrap()
             .vector(Vec3::new(0.0, 0.0, 1.0));
         assert!(
-            (ahead - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-6,
+            (ahead - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-6,
             "{ahead:?}"
         );
     }
@@ -285,5 +293,27 @@ mod tests {
         want.turn_head(&skeleton, animator.head.turn);
         assert_eq!(turned, want);
         assert_ne!(turned, still);
+    }
+
+    #[test]
+    fn the_lot_lies_on_the_screen_as_the_lot_drawing_has_it() {
+        // The lot drawing (0x4b3c88): a tile's screen x grows with
+        // x - y and its screen y (downwards) with x + y.
+        let camera = crate::raster::Camera::house_view(1.0, Vec3::ZERO);
+        let at = |x: f32, y: f32, direction: f32| {
+            let mut animator = Animator::new(0);
+            animator.position = [x, y, direction].map(F32::from_f32);
+            placement(&animator).unwrap()
+        };
+        let screen = |x: f32, y: f32| camera.view(at(x, y, 0.0).translation);
+        let (px, py) = (screen(16.0, 0.0), screen(0.0, 16.0));
+        assert!(px.x > 0.0 && px.y < 0.0, "+x goes right and down: {px:?}");
+        assert!(py.x < 0.0 && py.y < 0.0, "+y goes left and down: {py:?}");
+        assert!((px.x + py.x).abs() < 1e-5 && (px.y - py.y).abs() < 1e-5);
+        assert!((px.x + 2.0 * px.y).abs() < 1e-5, "twice as wide as deep");
+        // Direction 3 faces the viewer: the toes point out of the screen.
+        let toes = at(0.0, 0.0, 3.0).vector(Vec3::new(0.0, 0.0, 1.0));
+        let forward = camera.forward();
+        assert!(toes.dot(forward) < -0.8, "{toes:?} {forward:?}");
     }
 }
