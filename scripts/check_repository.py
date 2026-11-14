@@ -149,7 +149,7 @@ def decoded_candidates(content):
             continue
 
 
-def check_blob(root, policy, name, content, object_id=None):
+def check_blob(root, policy, name, content, object_id=None, history=False):
     violations = []
     reason = path_violation(name)
     if reason:
@@ -165,8 +165,13 @@ def check_blob(root, policy, name, content, object_id=None):
         except UnicodeDecodeError:
             violations.append(f"{name}: non-UTF-8 binary content is not admitted by the source-only policy")
     if PurePosixPath(name).suffix.lower() == ".json" and name != POLICY_PATH:
+        # In the tree being published, a review names the exact path. In
+        # history, provenance follows the bytes: a reviewed file that was
+        # later moved (as the re-founding moved files under legacy/) keeps
+        # its review at its old paths. Bytes never reviewed under any path
+        # are still rejected wherever they appear.
         admitted = any(
-            entry["path"] == name
+            (history or entry["path"] == name)
             and entry["bytes"] == len(content)
             and entry["sha256"] == hashlib.sha256(content).hexdigest()
             for entry in policy["reviewed_data"]
@@ -214,6 +219,14 @@ def index_entries(root):
 
 
 def history_entries(root, revision):
+    """Every blob reachable from `revision`, with every path it was ever stored at.
+
+    `rev-list --objects` names each blob once, so identical bytes stored under
+    two paths would be checked under only one of them, and the path-dependent
+    checks (JSON provenance, encoded-payload review, large-blob exceptions)
+    would miss the other. The raw log of every commit, with merges shown
+    against each parent, gives each (path, blob) pair that history holds.
+    """
     commit = git(
         root, "rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"
     ).decode().strip()
@@ -222,16 +235,38 @@ def history_entries(root, revision):
         root, "cat-file", "--batch-check=%(objecttype) %(objectname) %(objectsize) %(rest)",
         input_bytes=objects,
     )
-    entries = []
+    sizes = {}
+    names = {}
     for record in metadata.decode().splitlines():
         kind, object_id, size, *name = record.split(" ", 3)
         if kind == "blob":
-            entries.append((object_id, int(size), name[0] if name else ""))
-    names = git(
-        root, "log", "--format=", "--name-only", "-z", "--no-renames",
-        "--diff-filter=ACMR", commit, "--",
+            sizes[object_id] = int(size)
+            names.setdefault(object_id, set())
+            if name and name[0]:
+                names[object_id].add(name[0])
+    raw = git(
+        root, "log", "--format=", "--raw", "-z", "--root", "--diff-merges=separate",
+        "--no-renames", "--no-abbrev", "--diff-filter=ACMRT", commit, "--",
     )
-    paths = {os.fsdecode(name) for name in names.split(b"\0") if name}
+    paths = set()
+    tokens = iter(raw.split(b"\0"))
+    for token in tokens:
+        token = token.lstrip(b"\n")
+        if not token.startswith(b":"):
+            continue
+        fields = token[1:].split()
+        if token.startswith(b"::") or len(fields) != 5:
+            raise ValueError("unexpected git log --raw record")
+        path = os.fsdecode(next(tokens))
+        paths.add(path)
+        if fields[1] != b"160000":
+            object_id = fields[3].decode()
+            if object_id in sizes:
+                names[object_id].add(path)
+    entries = [
+        (object_id, sizes[object_id], sorted(names[object_id]) or [""])
+        for object_id in sorted(sizes)
+    ]
     return entries, paths
 
 
@@ -309,8 +344,13 @@ def audit(root, policy, arguments):
         if content is None:
             violations.append(f"{name}: nested Git checkout")
             continue
-        errors, large = check_blob(root, policy, name, content, object_id)
-        violations.extend(errors)
+        large = False
+        for each in name if isinstance(name, list) else [name]:
+            errors, large_here = check_blob(
+                root, policy, each, content, object_id, history=bool(arguments.history)
+            )
+            violations.extend(errors)
+            large = large or large_here
         count += 1
         total_bytes += len(content)
         large_count += large
