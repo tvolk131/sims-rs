@@ -39,9 +39,11 @@ class Qmp:
         return json.loads(line)
 
     def call(self, command, timeout=600, **arguments):
-        assert command in ('qmp_capabilities', 'human-monitor-command', 'memsave'), command
-        if command == 'human-monitor-command':
-            assert arguments['command-line'] in ('info mem',), arguments
+        # Explicit checks (not asserts), so the read-only allowlist holds under python -O too.
+        if command not in ('qmp_capabilities', 'human-monitor-command', 'memsave'):
+            raise RuntimeError(f'QMP command refused: {command}')
+        if command == 'human-monitor-command' and arguments.get('command-line') not in ('info mem',):
+            raise RuntimeError(f'monitor command refused: {arguments}')
         msg = {'execute': command}
         if arguments:
             msg['arguments'] = arguments

@@ -27,14 +27,15 @@ the repository, and so do the captures.
 | `prepare_guest.sh` | Makes a new guest directory. It clones the disk, copies the UserData folders and their hashes, and installs `guest/sims-init.sh`. |
 | `guest/sims-init.sh` | PID 1 in the guest. It mounts the host share at `/research` and runs each `/research/cmd/<n>.sh` once. |
 | `guest/prepare_disk.sh` | Replaces `/sims-init.sh` on the cloned disk, using debugfs inside the image. |
-| `guest/launch.sh` | Guest job. It checks the executable's hash, puts the UserData copy in place and checks its hashes, then starts Xvfb (1024x768x16) and `Sims.exe -w -nosound`. |
+| `guest/launch.sh` | Guest job. It checks `Sims.exe` and `version.dll` against pinned SHA-256 digests (another build stops the launch) and writes the verified digests to the share (`game-identity.txt`), puts the UserData copy in place and checks its hashes, then starts Xvfb (1024x768x16) and `Sims.exe -w -nosound`. |
 | `start_vm.sh` | Starts the guest in a container named `sims-harness-vm`: TCG, one CPU, 1 GiB, no network. The GDB stub and QMP listen only on the container's loopback. |
-| `guest.py` | Drives the guest through the share: `run`, `shot` (PNG of the game window), `click` and `move`. |
+| `guest.py` | Drives the guest through the share: `run`, `shot` (PNG of the game window), `click` and `move`. Several processes can hand it jobs at once. `click` and `move` exit with the guest job's exit code, and `click` stops if the pointer cannot be placed. |
 | `answer.sh` | Presses a dialog button and logs the press to the capture's `input-log.txt`. |
 | `rsp.py` | A small GDB remote-protocol client, reached through `docker exec`. It reads memory and registers and sets hardware breakpoints. It never writes guest memory or registers. |
 | `capture.py` | The capture: the breakpoints, the state readers and the output format. |
 | `qmp.py` | A small QMP client, reached through `docker exec`, for memory dumps. It sends only `info mem` and `memsave`, which read the guest. |
 | `qemu_retained_owners.py`, `qemu_neighborhood_owners.py` | The old prototype's readers for the registry and the neighborhood. |
+| `test_capture.py` | Tests for `capture.py`, `guest.py` and `rsp.py` against a fake stub and fake memory, with no Docker: `python3 -B -m unittest discover -s tools/harness -p 'test_*.py'`. |
 
 ## Running a capture
 
@@ -103,7 +104,7 @@ Things to know:
   same directory and numbering, and redoes the update it was in the middle of.
 - **Memory dumps.** `--dump 14,47 --guest-dir <guest dir>` also saves,
   at the entry of each listed lot update, every present user page of the
-  game's process (`dump-NNNN/`). QEMU writes each range into the guest
+  game's process (`dump-NNNN/`; update 1's entry is the baseline's stop). QEMU writes each range into the guest
   directory (the container's `/g`), and the script moves it to the output.
   A dump holds the whole game, about 320 MB, so keep the list short. The
   dumps let a routine of the original be run alone on real memory.
@@ -120,6 +121,15 @@ Things to know:
   return addresses along the frame-pointer chain, the bytes before and
   after, and the update it falls in.
 
+  Once the game's CR3 is known (at the first lot update), a write by another
+  process to the same virtual address, including one found while stepping
+  past a breakpoint, is logged as a `foreign_watch` event, not in
+  `watch.jsonl`. A watch through an object or a pointer is worked out again
+  at every stop in the game. If the address moved (an animator was
+  replaced), the watchpoint moves too (`watch_moved`). If it cannot be worked
+  out, it waits again (`watch_lost`). Writes between the change and that stop
+  are missed.
+
 ## Output
 
 | Path | Contents |
@@ -130,8 +140,8 @@ Things to know:
 | `full-state.json.gz` | In both kinds of directory: the registry, the neighborhood, and the object and animator pointers. |
 | `pages.json.gz` | In both kinds of directory: the memory pages of the people and their animators. |
 | `updates.jsonl` | One line per lot update: the tick, whether it was a full pass, the three random streams and the scheduler cursor. |
-| `events.jsonl` | The dialog functions passed (each record, its status and modal byte), the baseline, and other stops. |
+| `events.jsonl` | The dialog functions passed (each record, its status and modal byte), the baseline, other stops, the game's identity (`game_identity`) and the watch events. |
 | `dump-NNNN/` | With `--dump`: the user memory at the entry of lot update N. `ranges.json` lists the ranges (start, size, protection, file); `registers.json` holds the stop's registers and the stub's whole register packet. |
 | `watch.jsonl` | With `--watch`: one line per write to a watched address (see above). |
-| `status.json` | Progress. |
+| `status.json` | Progress, and `game_identity`: the digests `launch.sh` verified, or null if the game was not started by it. |
 | `input-log.txt` | Every press made, with its time (written by `answer.sh`). |
