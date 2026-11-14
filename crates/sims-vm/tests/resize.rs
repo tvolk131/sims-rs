@@ -306,6 +306,126 @@ fn format_12_bytes(world: &World) -> Vec<u8> {
     encoded
 }
 
+/// `whole` with `part` replaced by `old`. `part` is found where `blank`
+/// stands in `whole_blank`, the same encoding with that one field (and
+/// nothing else) at its default value: the bytes before and after it are
+/// the same in both, and it must be found in exactly one place.
+fn splice(whole: &[u8], whole_blank: &[u8], part: &[u8], blank: &[u8], old: &[u8]) -> Vec<u8> {
+    if part == old {
+        return whole.to_vec();
+    }
+    let common = |a: &mut dyn Iterator<Item = (&u8, &u8)>| a.take_while(|(x, y)| x == y).count();
+    let before = common(&mut whole.iter().zip(whole_blank));
+    let after = common(&mut whole.iter().rev().zip(whole_blank.iter().rev()));
+    let at: Vec<usize> = (0..=before.min(whole_blank.len() - blank.len()))
+        .filter(|&p| {
+            whole.get(p..p + part.len()) == Some(part)
+                && whole_blank[p..p + blank.len()] == *blank
+                && whole.len() - p - part.len() <= after
+                && whole_blank.len() - p - blank.len() <= after
+        })
+        .collect();
+    assert_eq!(at.len(), 1, "the field is not found in one place");
+    let p = at[0];
+    let mut bytes = whole[..p].to_vec();
+    bytes.extend(old);
+    bytes.extend(&whole[p + part.len()..]);
+    bytes
+}
+
+/// A map's encoding with each value written by `value`.
+fn map_bytes<K: serde::Serialize, V>(
+    map: &std::collections::BTreeMap<K, V>,
+    value: impl Fn(&V) -> Vec<u8>,
+) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(&(map.len() as u64)).unwrap();
+    for (key, item) in map {
+        bytes.extend(postcard::to_allocvec(key).unwrap());
+        bytes.extend(value(item));
+    }
+    bytes
+}
+
+/// A motion's encoding under snapshot format 15: without the last step
+/// and the two end-of-path flags that format 16 added at its end.
+fn motion_15_bytes(motion: &sims_sim::animator::Motion) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(motion).unwrap();
+    let added = postcard::to_allocvec(&(motion.step, motion.near_end, motion.finishing)).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - added.len()), added);
+    bytes
+}
+
+/// An animator's encoding under snapshot format 15, with its motion as
+/// [`motion_15_bytes`] writes it.
+fn animator_15_bytes(animator: &sims_sim::animator::Animator) -> Vec<u8> {
+    use sims_sim::animator::{Animator, Motion};
+    let blank = Animator {
+        motion: Motion::NONE,
+        ..animator.clone()
+    };
+    splice(
+        &postcard::to_allocvec(animator).unwrap(),
+        &postcard::to_allocvec(&blank).unwrap(),
+        &postcard::to_allocvec(&animator.motion).unwrap(),
+        &postcard::to_allocvec(&Motion::NONE).unwrap(),
+        &motion_15_bytes(&animator.motion),
+    )
+}
+
+/// A lot's encoding with each animator as format 15 wrote it.
+fn without_motion_steps(world: &World) -> Vec<u8> {
+    let blank = World {
+        animators: Default::default(),
+        ..world.clone()
+    };
+    splice(
+        &world.encode(),
+        &blank.encode(),
+        &postcard::to_allocvec(&world.animators).unwrap(),
+        &[0],
+        &map_bytes(&world.animators, animator_15_bytes),
+    )
+}
+
+/// A lot's encoding as snapshot format 15 wrote it. Format 16 added two
+/// things: at the end of each room whether it knows a person is in it
+/// ([`sims_sim::rooms::Room::occupied`]; the people's visits in the load
+/// now set it), and at the end of each animator's motion its last step
+/// and two end-of-path flags ([`sims_sim::animator::Motion`]). This
+/// writes the rooms and the animators again without those bytes, so a
+/// state pinned under format 15 can be shown to be the same state but for
+/// those fields.
+fn format_15_bytes(world: &World) -> Vec<u8> {
+    use sims_sim::rooms::Rooms;
+    let rooms = &world.rooms;
+    let blank_rooms = Rooms {
+        rooms: Default::default(),
+        ..rooms.clone()
+    };
+    let old_rooms = splice(
+        &postcard::to_allocvec(rooms).unwrap(),
+        &postcard::to_allocvec(&blank_rooms).unwrap(),
+        &postcard::to_allocvec(&rooms.rooms).unwrap(),
+        &[0],
+        &map_bytes(&rooms.rooms, |room| {
+            let mut bytes = postcard::to_allocvec(room).unwrap();
+            assert_eq!(bytes.pop(), Some(u8::from(room.occupied)));
+            bytes
+        }),
+    );
+    let blank = World {
+        rooms: Rooms::default(),
+        ..world.clone()
+    };
+    splice(
+        &without_motion_steps(world),
+        &without_motion_steps(&blank),
+        &postcard::to_allocvec(rooms).unwrap(),
+        &postcard::to_allocvec(&Rooms::default()).unwrap(),
+        &old_rooms,
+    )
+}
+
 /// A lot's encoding as snapshot format 14 wrote it. Format 15 added the
 /// last number given to a running action ([`World::action_serial`]) at
 /// the end. Before tick 233 no action has been given one, so it is 0 and
@@ -313,7 +433,7 @@ fn format_12_bytes(world: &World) -> Vec<u8> {
 /// pinned under format 14 can be shown to be the same state.
 fn format_14_bytes(world: &World) -> Vec<u8> {
     assert_eq!(world.action_serial, 0);
-    let mut encoded = world.encode();
+    let mut encoded = format_15_bytes(world);
     assert_eq!(encoded.pop(), Some(0));
     encoded
 }
@@ -352,16 +472,16 @@ fn format_13_bytes(world: &World) -> Vec<u8> {
 /// followed by the skin's clock and flag, the appearance flag and the
 /// motion.
 fn animator_13_bytes(animator: &sims_sim::animator::Animator) -> Vec<u8> {
-    let mut bytes = postcard::to_allocvec(animator).unwrap();
+    let mut bytes = animator_15_bytes(animator);
     assert_eq!(bytes.pop(), Some(u8::from(animator.walking)));
     assert_eq!(bytes.pop(), Some(u8::from(animator.undrawn)));
-    let after = postcard::to_allocvec(&(
+    let mut after = postcard::to_allocvec(&(
         animator.skin_clock,
         animator.skin_dirty,
         animator.profile_stale,
-        &animator.motion,
     ))
     .unwrap();
+    after.extend(motion_15_bytes(&animator.motion));
     assert_eq!(bytes.split_off(bytes.len() - after.len()), after);
     if let Some(layer) = &animator.foreground {
         let cursors = postcard::to_allocvec(&layer.cursors).unwrap();
@@ -369,6 +489,29 @@ fn animator_13_bytes(animator: &sims_sim::animator::Animator) -> Vec<u8> {
     }
     bytes.extend(after);
     bytes
+}
+
+/// The lot without the rooms its people's visits noted. Each person's
+/// visit now notes the room it stands in, as the original's does
+/// (0x45e43d, called at 0x459c22): its tick state
+/// ([`sims_sim::PersonTick`]) gets the room, and the room is marked as
+/// knowing someone is in it. Before, a person's first tick did that. This
+/// checks that each person's tick state is the constructed one with the
+/// room its data word 29 names, and removes them, so a state pinned
+/// before that change can be shown to be the same state but for those
+/// fields (the rooms' marks are dropped by [`format_15_bytes`]).
+fn without_room_notes(world: &World) -> World {
+    use sims_sim::PersonTick;
+    let mut old = world.clone();
+    for (id, tick) in std::mem::take(&mut old.person_ticks) {
+        let room = world.objects[&id].data[29];
+        let expected = PersonTick {
+            room,
+            ..PersonTick::CONSTRUCTED
+        };
+        assert_eq!(tick, expected, "person {id}");
+    }
+    old
 }
 
 /// The lot with registry byte 0x12
@@ -391,7 +534,7 @@ fn with_read_flag_clear(world: &World) -> World {
 fn animator_12_bytes(animator: &sims_sim::animator::Animator) -> Vec<u8> {
     use sims_sim::animator::Motion;
     assert_eq!(animator.motion, Motion::NONE);
-    let motion = postcard::to_allocvec(&Motion::NONE).unwrap();
+    let motion = motion_15_bytes(&Motion::NONE);
     assert_eq!(motion, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     let mut bytes = animator_13_bytes(animator);
     assert_eq!(bytes.split_off(bytes.len() - motion.len()), motion);
@@ -1372,6 +1515,9 @@ fn the_goth_house_objects_are_all_visited() {
     const VISIT_201_7: &str = "c8dee4827001dd91ab1a41482c0b1b0ce166a4bb005408d06269e5b1f55323d6";
     const VISITED: &str = "2558d1d97d6c006a495e185a86dda47d57891cb433bf40b909b1b6e891327521";
     const VISITED_7: &str = "d923a23687b3904c8427bc847433284509ac0becccf0f33b67cc6297bd99695c";
+    const VISITED_16: &str = "4ebbd61a9def06bc235ed33db27fb6c62a2dcd2b549443fb6c0b89fe945403cd";
+    const ROOMS: [(u16, i16); 3] = [(16, 0), (18, 0), (21, 0)];
+    const OCCUPIED: [i16; 0] = [];
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1452,13 +1598,30 @@ fn the_goth_house_objects_are_all_visited() {
         // Nothing here advances the clock or touches the lot's stream.
         assert_eq!((world.ticks, world.lot_rng), (before.ticks, before.lot_rng));
         assert_ne!(world.global_rng, before.global_rng);
-        pinned(world, VISITED, VISITED_7);
+        // Each person noted the room it stands in.
+        let rooms: Vec<(u16, i16)> = world
+            .person_ticks
+            .iter()
+            .map(|(&id, tick)| (id, tick.room))
+            .collect();
+        assert_eq!(rooms, ROOMS);
+        let occupied: Vec<i16> = world
+            .rooms
+            .rooms
+            .iter()
+            .filter(|(_, room)| room.occupied)
+            .map(|(&id, _)| id)
+            .collect();
+        assert_eq!(occupied, OCCUPIED);
+        assert_eq!(digest(&world.encode()), VISITED_16);
+        pinned(&without_room_notes(world), VISITED, VISITED_7);
         // Steps 14 and 15 change nothing on this lot, and neither does
         // asking for the indicators again in step 16.
         assert_eq!(interpreter.ensure_indicators(world), Ok(None));
         world.finish_selection(flags).unwrap();
         assert_eq!(interpreter.ensure_indicators(world), Ok(None));
-        pinned(world, VISITED, VISITED_7);
+        assert_eq!(digest(&world.encode()), VISITED_16);
+        pinned(&without_room_notes(world), VISITED, VISITED_7);
     });
 }
 
@@ -1503,8 +1666,10 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
     // ([`format_9_bytes`], without the neighborhood's records) and under
     // format 10 ([`format_10_bytes`], without the animators, of which the
     // load leaves none), and under formats 11, 12 and 13, the last three
-    // with registry byte 0x12 clear ([`with_read_flag_clear`]). See
-    // [`pinned`] for why the format 8 pin changed.
+    // with registry byte 0x12 clear ([`with_read_flag_clear`]), and
+    // under format 14. All of those are without the rooms the people's
+    // visits noted ([`without_room_notes`]); format 16 pins the state as
+    // it is. See [`pinned`] for why the format 8 pin changed.
     const BASELINE: &str = "034d3b636d3529fa91826a5f5b759e4abba31d6c5be3b66732a1f1ef642ad9fb";
     const BASELINE_9: &str = "fe21f960b207ba0ced6a6a5dfe5628fcb101c12eb9571d49578ec65dfde459da";
     const BASELINE_10: &str = "29b4aec3debe353d77363e18cf3cbd263b30fe2fe4e1e03a5f309c08dd132168";
@@ -1512,6 +1677,7 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
     const BASELINE_12: &str = "9954409afc678bcf8d6815446a86eadeddb46bf5b2785e5461f7b06af38d1687";
     const BASELINE_13: &str = "f844587de2d116d798645aea70ea5ea5f91c49c398c93fc414c3ab31657be32a";
     const BASELINE_14: &str = "45642fa774010ff05a65fbc1d9b23a0edb1af70884a81215495d6380bd599bb3";
+    const BASELINE_16: &str = "efdbb4764476cf9282889e94f52b91a337ddaf474a5b0cf8383bc636b4ec1e9d";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1604,160 +1770,178 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
         assert_eq!(world.global_rng, before.global_rng);
         assert_eq!(world.lot_rng, before.lot_rng);
         assert_eq!(world.crt_rng, before.crt_rng);
-        assert_eq!(digest(&format_8_bytes(world)), BASELINE);
-        assert_eq!(digest(&format_9_bytes(world)), BASELINE_9);
+        assert_eq!(digest(&world.encode()), BASELINE_16);
+        let noted = without_room_notes(world);
+        assert_eq!(digest(&format_8_bytes(&noted)), BASELINE);
+        assert_eq!(digest(&format_9_bytes(&noted)), BASELINE_9);
         assert!(world.animators.is_empty());
-        let old = with_read_flag_clear(world);
+        let old = with_read_flag_clear(&noted);
         assert_eq!(digest(&format_10_bytes(&old)), BASELINE_10);
         assert_eq!(digest(&format_11_bytes(&old)), BASELINE_11);
         assert_eq!(digest(&format_12_bytes(&old)), BASELINE_12);
         assert_eq!(digest(&format_13_bytes(&old)), BASELINE_13);
-        assert_eq!(digest(&format_14_bytes(world)), BASELINE_14);
+        assert_eq!(digest(&format_14_bytes(&noted)), BASELINE_14);
     });
 }
 
-/// The first 232 ticks on the Goth house, and tick 233 up to where it
-/// stops: the lot update (0x46d345) run
-/// from the state the load ends in, with the house view's frames between
-/// updates as far as they write the simulation's state (`frame.rs`): one
-/// before tick 1, one after each of ticks 1 to 3, and one after every
-/// tick from 33 on. That schedule is an input, not something the
-/// simulation decides; see the frame schedule in `docs/decisions.md`.
+/// The first 261 ticks on the Goth house, and tick 262 up to where it
+/// stops: the lot update (0x46d345) run from the state the load ends in,
+/// with the house view's frames between updates as far as they write the
+/// simulation's state (`frame.rs`). The frames come before tick 1, after
+/// each of ticks 1 to 3, after tick 33 and after every 30th tick from
+/// there (63, 93, ...). That schedule is an input, not something the
+/// simulation decides (`sims boot --frames`, `docs/decisions.md`).
 ///
-/// A private capture of the original on the same install and house,
-/// outside the repository (`docs/decisions.md`), holds the full state at
-/// the entry of tick 1, after each of the lot updates 1 to 100 and after
-/// every tenth update from 110 to 1000, and one line per lot update in
-/// `updates.jsonl` with the tick count, the lot's and the game's random
-/// streams, the C runtime's random stream and the scheduler cursor. That
-/// capture's game read the install's own neighborhood file. Our state was
-/// compared with the capture's, field by field, floats bit for bit:
+/// Four private captures of the original on the same install and house,
+/// outside the repository (`docs/decisions.md`), each read the install's
+/// own neighborhood file. Each holds one line per lot update in
+/// `updates.jsonl` (the tick count, the lot's and the game's random
+/// streams, the C runtime's random stream and the scheduler cursor) and
+/// the full state after some updates:
 ///
-/// - after every one of ticks 1 to 232: the `updates.jsonl` line, and
-///   that the update advanced the tick count by one (a full update);
-/// - after every one of ticks 1 to 100 and after ticks 110, 120 and every
-///   tenth to 230, also: the tick count, the three random streams, the
-///   scheduler cursor, the funds, all 64 globals, the removal queue, the
-///   registration order and the set of objects; the neighborhood's 463
-///   records (ID, GUID, revision, data, relationships, friends, stale
-///   mark), the inventories and registry byte 0x12; for each object its
-///   GUID, 72 data words, temps, attributes, scheduler word, last result,
-///   frames (tree, node, stack object, arguments, locals, saved primitive
-///   state), relationships, slot count, position and its removal and
-///   selected marks, and that no object of the capture holds a tree
-///   error; for each person also the 256 person data words, the motives
-///   and previous motives, the running and last actions, the queued
-///   actions, and the objects in use (object, stack depth, flag); the
-///   people's animators, every field kept here that the capture's memory
-///   pages hold, the route's fields ([`sims_sim::animator::Motion`]) and
-///   the walking flag included (the capture did not record where the
-///   animators are for updates 1 to 45, so the places recorded at update
-///   46 are used; the pages themselves are from the update compared); and
-///   each person's number of route contexts (person +0xaf0) where the
-///   capture saved that page.
+/// - the first: after updates 1 to 100 and every tenth to 1000;
+/// - the second: after updates 1 to 5, 30 to 35 and 225 to 240;
+/// - the third: after updates 1 to 100 and every tenth to 300;
+/// - the fourth: after every update from 1.
 ///
-/// All of it is equal, with one exception: global 12 after tick 1, which
-/// is 17 in the capture and 0 here (the interface's wait check, which is
-/// not run here). Its cause is **unverified**.
+/// The last three also recorded when the house view drew (a hardware
+/// watchpoint on its draw guard, 0x6f0f48). All three drew before update
+/// 1, after updates 1, 2 and 3 (many times while a dialog waited; how many
+/// times differs from run to run), after update 33 and after every 30th
+/// update from there, which is the schedule used here.
+///
+/// Our state was compared with each capture's after every tick where the
+/// capture holds one, field by field, floats bit for bit: the
+/// `updates.jsonl` line and that the update advanced the tick count by
+/// one; the tick count, the three random streams, the scheduler cursor,
+/// the funds, all 64 globals, the action counter, the removal queue, the
+/// registration order and the set of objects; the neighborhood's 463
+/// records (ID, GUID, revision, data, relationships, friends, stale
+/// mark), the inventories and registry byte 0x12; for each object its
+/// GUID, 72 data words, temps, attributes, scheduler word, last result,
+/// frames (tree, node, stack object, arguments, locals, saved primitive
+/// state), relationships, slot count, position and its removal and
+/// selected marks, and that no object of the capture holds a tree error;
+/// for each person also the 256 person data words, the motives and
+/// previous motives, the running and last actions, the queued actions and
+/// the objects in use (object, stack depth, flag); the people's
+/// animators, every field kept here that the capture's memory pages hold;
+/// and the people's route contexts and paths where the capture saved
+/// those pages. Results:
+///
+/// - The fourth capture: equal after every one of ticks 1 to 261.
+/// - The second: equal after every tick it holds (1 to 5, 30 to 35, 225
+///   to 240).
+/// - The third: equal but for two fields, which also differ between the
+///   original's own runs: global 12 after ticks 1 and 2 (17 there, 0 here
+///   and in the second and fourth captures; the interface's wait check)
+///   and one local of object 18's seventh frame after ticks 210 and 220
+///   (16104 there, 0 here and in the fourth).
+/// - The first: equal after every tick it holds to 230, and in the
+///   `updates.jsonl` line to 232, but for global 12 after tick 1 (17
+///   there). It does not choose in tick 233 and differs from there on;
+///   see below.
 ///
 /// Not compared: a frame local that we hold as unknown, because the
-/// original left half of a pointer in the frame storage there; and
-/// person 259's word 37 from tick 14 on, which the original copies from
-/// memory it never wrote (`sims_sim::route::Routing::unknown_words`; the
-/// capture has 3287 there). Also not compared, because the capture does
-/// not hold them in a form read there: the rooms, the lot arrays, the
-/// dialog records, the persons' tick state other than the animators, the
-/// house's usage counts, the route contexts' contents and the path. The
-/// state after ticks 101 to 109, 111 to 119 and so on is not in the
-/// capture; that it is equal there is **unverified** except for the
-/// `updates.jsonl` line.
+/// original left half of a pointer in the frame storage there; person
+/// 259's word 37 from tick 14 on, which the original copies from memory
+/// it never wrote (`sims_sim::route::Routing::unknown_words`); a route
+/// context's word +0x74, which the original leaves as the heap held it
+/// (0 here); and the context's door, which the original holds as a
+/// pointer and we hold as the object's ID (they were compared by mapping
+/// the pointer to its object). Also not compared, because no capture holds
+/// them in a form read there: the rooms, the lot arrays, the dialog
+/// records, the persons' tick state other than the animators, and the
+/// house's usage counts.
 ///
 /// In tick 6 object 382 makes a new person, 259 (Create New Object
 /// Instance mode 8), who runs from tick 7 on. In tick 14 it goes to slot
-/// 0 of object 51 (Go To Routing Slot); the route context, the planner's
-/// inputs, both of its searches and the path were also compared with the
-/// original's code run on the state of another capture at the entry of
-/// update 14 (an emulator of the original's update, outside the
-/// repository), and are equal. It then turns on the spot (animator state
-/// 4). The frame after tick 33 draws it for the first time, which places
-/// its animator again, facing its object's direction word (0, where the
-/// turn had 0.127): a hardware watchpoint on the original stopped at that
-/// write (0x584895) in the house view's draw. It turns again from there
-/// through tick 46; in tick 47 the turn ends and it walks along its path
-/// (state 9, the walk clip repeating), heading for the path's fourth
-/// point at tick 230. In tick 24 person 18's clip ends (0x589c25) and it
-/// starts the next; from tick 46 on, clips' timed events run
-/// (0x5912fd). In tick 36 the tick count is a multiple of 40 and the
-/// update clears registry byte 0x12 (0x442521).
+/// 0 of object 51 (Go To Routing Slot) and turns on the spot (animator
+/// state 4). The frame after tick 33 draws it for the first time, which
+/// places its animator again, facing its object's direction word
+/// (0x584895, in the house view's draw). In tick 47 it starts to walk
+/// (state 9). In tick 24 person 18's clip ends (0x589c25) and it starts
+/// the next; from tick 46 on, clips' timed events run (0x5912fd). In
+/// tick 36 the tick count is a multiple of 40 and the update clears
+/// registry byte 0x12 (0x442521). Every frame counts the rooms that wait
+/// to be counted (0x4a8895, `draw_frame`): the frame after tick 2 counts
+/// rooms 1 to 4, which a script marked in that tick.
 ///
-/// A second private capture of the original (`docs/decisions.md`) holds
-/// the full state after ticks 1 to 5, 30 to 35 and 225 to 240, and the
-/// `updates.jsonl` line after every tick. Its frames were recorded: one
-/// before tick 1 and one after ticks 1, 2, 3, 33 and every 30th from 63.
-/// Our run with those frames was compared with it in the same way as
-/// above, after every one of ticks 1 to 232 and at those states, and is
-/// equal but for the fields named above. Global 12 after tick 1 is 0 in
-/// this capture, as here. With a frame after every tick from 33 the state
-/// after tick 232 is the same (the digest below).
-///
-/// Tick 233 runs as far as it can and then fails loudly. Person 21 runs
-/// Find Best Interaction (primitive 3), which scores six interactions,
+/// In tick 233 person 21 runs Find Best Interaction (primitive 3), which
 /// chooses menu 6 of object 132 and draws once from the lot's random
-/// stream. Gosub Found Action (primitive 30) starts it: the person's
-/// running action gets the first unique number, 1, and the person starts
-/// using the object. The interaction's tree runs Go To Relative Position
-/// (primitive 27) to the object, which is in another room. That route
-/// goes through a door chosen by the routing between rooms (0x45c7c2,
-/// 0x46390f), which is not ported, so tick 233 stops at object 21, tree
-/// 0x1012 node 0. At that point the lot's random stream, the unique
-/// number, person 21's running and last actions, its objects in use,
-/// object 132's user count and person 21's seven frames were compared
-/// with the second capture's state after tick 233 and are equal, as are
-/// the objects that ran before person 21 in that tick, but for the
-/// seventh frame's primitive state. The original goes on where we stop:
-/// it sets that state to 2, numbers the person for the doors (object
-/// data word 6 becomes 1), pushes two frames of the door's (object 51)
-/// tree and puts the door in use. Person 21's object data word 9 and
-/// person data words 27 and 37 also differ there; that those steps write
-/// them is **unverified**.
+/// stream, and Gosub Found Action (primitive 30), which starts it. The
+/// interaction's tree goes to the object (Go To Relative Position), which
+/// is in another room: the routing between rooms (0x45c7c2, 0x46390f)
+/// chooses door 51 and numbers the person and the doors (object data
+/// word 6), and the person runs the door's trees, which walk it to the
+/// door and through it. In tick 246 it stands at the door (state 3, arrival
+/// 2; standing clears the walking flag, 0x58f117). In tick 255 it enters
+/// room 4, which is dark and has no lamp: the room is marked as knowing
+/// someone is in it (0x468802) and waits to be counted again. In tick 261
+/// it stands at the end of that walk.
+///
+/// Tick 262 then fails loudly: person 21's animator comes to the end of
+/// its next path with object data word 9 clear (0x58e8be), which is not
+/// ported. The fourth capture's state after tick 262 was compared with
+/// ours at the stop: the objects that ran before person 21, person 21's
+/// frames, data words, running action and objects in use, the action
+/// counter and object 132's user count are equal. Person 21's person
+/// word 27 is 40 here and 41 there, which the steps after the stop
+/// presumably write (**unverified**).
 ///
 /// The first capture does not choose in tick 233: its one draw from the
-/// lot's stream in ticks 233 and 234 comes in tick 234. Its state after
-/// tick 232 was equal to ours as far as compared. Why its original chose
-/// a tick later is **unknown**; the second capture, and the original's
-/// code run in an emulator on the first capture's state, choose in 233.
+/// lot's stream in ticks 233 and 234 comes in tick 234, and after tick
+/// 240 person 21 runs tree 0x208a and has no running action. Why is
+/// **unknown**; `docs/decisions.md` says what was ruled out. The other
+/// three captures, and the original's code run in an emulator on the
+/// first capture's state from update 47, choose in tick 233.
 ///
-/// Object 15's two-button dialog in tick 2 is answered with 3, the
-/// answer the capture's events show. People 18 and 21's clip in tick 3 is
-/// named "-Rstand" in the script and found only by ignoring case; the
-/// original plays the library's "-rstand" (`docs/decisions.md`). That
-/// the five controllers' dialogs in tick 1 were answered with their only
-/// button is what the capture shows.
+/// Object 15's two-button dialog in tick 2 is answered with 3, the answer
+/// the captures' events show. People 18 and 21's clip in tick 3 is named
+/// "-Rstand" in the script and found only by ignoring case; the original
+/// plays the library's "-rstand" (`docs/decisions.md`). That the five
+/// controllers' dialogs in tick 1 were answered with their only button is
+/// what the captures show.
 ///
 /// The digests suffixed with an older snapshot format were pinned under
-/// it ([`format_11_bytes`], [`format_12_bytes`], [`format_13_bytes`]),
-/// before frames were drawn and before the end of the object read set
-/// registry byte 0x12 ([`with_read_flag_clear`], for the state after
-/// tick 1); all still hold. The digests are of our own state, as built
-/// here.
+/// it ([`format_11_bytes`] to [`format_14_bytes`]), before frames were
+/// drawn and before the end of the object read set registry byte 0x12
+/// ([`with_read_flag_clear`], for the state after tick 1); all still
+/// hold. The states after ticks 5, 13, 33 and 232 were pinned before
+/// under format 14 and are pinned again: since then the frames count the
+/// rooms that wait, so from the frame after tick 2 on the rooms hold
+/// other values (before, rooms 1 to 4 waited for ever). The rooms are in
+/// no capture; everything the captures hold is equal before and after
+/// that change. The digests are of our own state, as built here.
 #[test]
 fn the_goth_house_first_tick_matches_the_original() {
     const TICK_1_9: &str = "62fc28f5e7689d166791a620dbed066fb8a7d707ea79017fbadf0eed3da5c937";
     const TICK_1_10: &str = "bb55f7d5f656551708867b24779c2e0f019825459427858a27ad8c8874e7957b";
     const TICK_1_11: &str = "c2fa1ed11813b8ab67214f7177e1bb27a2e25ae2ecef94c3c1172071d5682400";
-    const TICK_5_11: &str = "b1dfa48cff23e2b5ef92d4e2b9d2386d2fea55857210c0856c38275c19acea9e";
-    const TICK_1_13: &str = "f8fecfe693e419a642094715d879184b1d85268cbca22806ee31475b1aeb4dae";
     const TICK_1_12: &str = "bc16bff8543bbd815f609600eb087157307e07b9ee0b592d3b55a64d2bc740f9";
-    const TICK_5_13: &str = "3ab9e6083e9dd3850796b2942d077e826060ef4bc9c3e4427dc3801c6981f0a4";
-    const TICK_5_12: &str = "4e363f8930608d8beffb6c2e8731c62e61e86e8a1df83b253577fba7193f9bec";
-    const TICK_33_13: &str = "1a82b937d63ff830c23927551339a0d72af1cd5f4d12aba707bdfdd16c1b21e5";
-    const TICK_13_13: &str = "2b5d012c9b69df5fdddd6f538bde6fa5c18df3c9da97839390152a9472d0a10e";
-    const TICK_1: &str = "0e022d8a9e16c9ea2dcea3654c0e85259f623678e68db62ccc807e17d99ebac7";
-    const TICK_5: &str = "9f3ae51efc8572a08133f89ec6bc0569f279fb8c09383e628f04c14c94991433";
-    const TICK_13: &str = "5488ba5350a0344a379e87c69721bfdff7c4ef89eaf14ebcceb4f6dc48325063";
-    const TICK_33: &str = "94239fbd88efa657b98d2bec3d8b6602f3c5873ce626abacffb45428efdedf2d";
-    const TICK_232: &str = "3e8d2dd01e5d044e196fd9786468fe33bd18e85256db2d11560d2dbb6fa5be31";
-    const TICK_13_12: &str = "5ce718d449921600161f8d38144fa29bb4f9125b2e7d51d40dd103b02f321e96";
+    const TICK_1_13: &str = "f8fecfe693e419a642094715d879184b1d85268cbca22806ee31475b1aeb4dae";
+    const TICK_1_14: &str = "0e022d8a9e16c9ea2dcea3654c0e85259f623678e68db62ccc807e17d99ebac7";
+    const TICK_1: &str = "70a2c8fce9972dac5134eaf1f14295f6c4905318ed071224834684556354f338";
+    const TICK_5: &str = "b1ba88aeef2c392bdb499dc61d64e9294d2f70cb3075e358c39cce054699fc3f";
+    const TICK_13: &str = "ca6641d6917a3d13627fb3950989bc0bc9102782c973e0fd4447dfbf35b93eb5";
+    const TICK_33: &str = "993d4a392c989284ac46b24598bea898621ce2361c106b38d2e5d39d398f67f3";
+    const TICK_232: &str = "3e093fa4389e6ff31c8e9c976dfd03d7c1796b495d21b0e11bcb17d5d03111d7";
+    const TICK_261: &str = "1b931d4492d3e02a8c72bcb658c55110e6b0f535cd20d99a937d09b6d62a420b";
+    const USES_233: [(i16, i32); 2] = [(132, 5), (51, 8)];
+    const TREES_233: [u16; 9] = [
+        0x1000, 0x2001, 0x205b, 0x2029, 0x100e, 0x1014, 0x1012, 0x1009, 0x1010,
+    ];
+    const TREES_261: [u16; 9] = [
+        0x1000, 0x2001, 0x205b, 0x2029, 0x100e, 0x1014, 0x1012, 0x1009, 0x1011,
+    ];
+    const POSITION_261: [i32; 3] = [409, 408, 1];
+    let trees = |world: &World, id: u16| -> Vec<u16> {
+        world.objects[&id]
+            .stack
+            .iter()
+            .map(|frame| frame.tree)
+            .collect()
+    };
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1821,7 +2005,8 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert_eq!(digest(&format_11_bytes(&old)), TICK_1_11);
         assert_eq!(digest(&format_12_bytes(&old)), TICK_1_12);
         assert_eq!(digest(&format_13_bytes(&old)), TICK_1_13);
-        assert_eq!(digest(&format_14_bytes(world)), TICK_1);
+        assert_eq!(digest(&format_14_bytes(world)), TICK_1_14);
+        assert_eq!(digest(&world.encode()), TICK_1);
         // Ticks 2 to 5. Person 16 starts a clip with Animate Sim in tick 2
         // and yields; the capture shows that person at the same
         // instruction after ticks 2 to 5, with the same frames (the 254 in
@@ -1836,9 +2021,21 @@ fn the_goth_house_first_tick_matches_the_original() {
             let update = interpreter.lot_update(world, &tuning, &mut player).unwrap();
             assert!(update.full);
             if tick <= 3 {
-                // Frames after ticks 1 to 3, which change nothing here.
-                let drawn = world.clone();
+                // Frames after ticks 1 to 3. Each counts the rooms that
+                // wait to be counted, and changes nothing else.
+                let mut drawn = world.clone();
                 interpreter.draw_frame(world, 1).unwrap();
+                let counted: Vec<i16> = drawn
+                    .rooms
+                    .rooms
+                    .iter()
+                    .filter(|&(id, room)| world.rooms.rooms[id] != *room)
+                    .map(|(&id, _)| id)
+                    .collect();
+                let expected: &[i16] = if tick == 2 { &[1, 2, 3, 4] } else { &[] };
+                assert_eq!(counted, expected);
+                assert_eq!(world.rooms.pending, 0);
+                drawn.rooms = world.rooms.clone();
                 assert_eq!(world.encode(), drawn.encode());
             }
             shape.push((
@@ -1875,10 +2072,7 @@ fn the_goth_house_first_tick_matches_the_original() {
             ]
         );
         assert_eq!(world.objects[&16].stack[4].locals, [0, 3, 8222, 254]);
-        assert_eq!(digest(&format_11_bytes(world)), TICK_5_11);
-        assert_eq!(digest(&format_12_bytes(world)), TICK_5_12);
-        assert_eq!(digest(&format_13_bytes(world)), TICK_5_13);
-        assert_eq!(digest(&format_14_bytes(world)), TICK_5);
+        assert_eq!(digest(&world.encode()), TICK_5);
         // Ticks 6 to 13. In tick 6 object 382 makes a person of type
         // 0x44A86A6C (Create New Object Instance mode 8), who gets the
         // lowest unused ID, 259, and is put down where the pedestrian
@@ -1927,9 +2121,7 @@ fn the_goth_house_first_tick_matches_the_original() {
             .map(|f| (f.tree, f.node))
             .collect();
         assert_eq!(frames, [(0x1000, 9), (0x118, 0)]);
-        assert_eq!(digest(&format_12_bytes(world)), TICK_13_12);
-        assert_eq!(digest(&format_13_bytes(world)), TICK_13_13);
-        assert_eq!(digest(&format_14_bytes(world)), TICK_13);
+        assert_eq!(digest(&world.encode()), TICK_13);
         // Ticks 14 to 33. In tick 14 person 259 runs a tree of object 51
         // (Run Tree By Name), which starts using it, and in that tree goes
         // to the object's routing slot 0 (Go To Routing Slot): it plans a
@@ -1972,8 +2164,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert_eq!(animator.motion.progress.to_bits(), 0x3de9_8f51);
         assert_eq!(animator.destination[2].to_bits(), 0x3e57_5200);
         assert!(animator.undrawn);
-        assert_eq!(digest(&format_13_bytes(world)), TICK_33_13);
-        assert_eq!(digest(&format_14_bytes(world)), TICK_33);
+        assert_eq!(digest(&world.encode()), TICK_33);
         // The frame after tick 33 draws person 259 for the first time,
         // which unsets its animator's position and places it again on its
         // tile, facing its direction word: 0, where the turn had it at
@@ -1983,61 +2174,85 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert!(!animator.undrawn);
         assert_eq!(animator.position[2].to_bits(), 0);
         assert_eq!(animator.destination[2].to_bits(), 0);
-        // Ticks 34 to 232, with a frame after each.
-        for tick in 34..=232 {
+        // Ticks 34 to 261, with a frame after every 30th tick from 33 (63,
+        // 93, ...), as the captures recorded.
+        for tick in 34..=261 {
             interpreter.lot_update(world, &tuning, &mut player).unwrap();
-            interpreter.draw_frame(world, 1).unwrap();
+            if (tick - 33) % 30 == 0 {
+                interpreter.draw_frame(world, 1).unwrap();
+            }
             if tick == 36 {
                 // The tick count is a multiple of 40: the end of the update
                 // clears registry byte 0x12 (0x442521).
                 assert_eq!(world.ticks % 40, 0);
                 assert!(!world.neighbors.relationships_changed);
             }
+            if tick == 232 {
+                assert_eq!(digest(&world.encode()), TICK_232);
+                assert_eq!(world.action_serial, 0);
+            }
+            if tick == 233 {
+                // Person 21 runs Find Best Interaction, which chooses menu 6
+                // of object 132 and draws once from the lot's stream, and
+                // Gosub Found Action, which starts it. The interaction's
+                // tree goes to the object, in another room: the routing
+                // between rooms chooses door 51, and the person starts the
+                // door's tree (0x1009, 0x1010), which walks to it.
+                assert_eq!(world.lot_rng.state(), 2_459_469_755);
+                assert_eq!(world.action_serial, 1);
+                let person = world.objects[&21].person.as_ref().unwrap();
+                let action = &person.active;
+                assert_eq!(
+                    (action.uid, action.caller, action.target, action.icon),
+                    (1, 21, 132, 132)
+                );
+                assert_eq!(
+                    (action.table_index, action.priority, action.action),
+                    (6, 2, 0x100e)
+                );
+                assert_eq!(
+                    (action.attenuation.to_bits(), action.flags),
+                    (0x3f19_999a, 0)
+                );
+                let uses: Vec<_> = person
+                    .object_uses
+                    .iter()
+                    .map(|u| (u.target, u.stack_depth))
+                    .collect();
+                assert_eq!(uses, USES_233);
+                assert_eq!(world.objects[&132].data[62], 1);
+                assert_eq!(trees(world, 21), TREES_233);
+            }
+            if tick == 246 {
+                // Person 21 stands at the door: its animator is in state 3
+                // with arrival 2, and no longer walks.
+                let animator = &world.animators[&21];
+                assert_eq!((animator.state, animator.arrival), (3, 2));
+                assert!(!animator.walking);
+            }
+            if tick == 255 {
+                // It has gone through the door into room 4, which is dark
+                // and has no lamp: the room is marked as knowing someone is
+                // in it and waits to be counted again.
+                assert_eq!(world.person_ticks[&21].room, 4);
+                assert!(world.rooms.rooms[&4].occupied);
+                assert_eq!(world.rooms.pending, 1);
+            }
         }
-        assert_eq!(world.ticks, before.ticks + 232);
-        assert_eq!(digest(&format_14_bytes(world)), TICK_232);
-        assert_eq!(world.action_serial, 0);
-        // Tick 233: person 21 runs Find Best Interaction, which chooses
-        // menu 6 of object 132 and draws once from the lot's stream, and
-        // Gosub Found Action, which starts it. The interaction's tree then
-        // routes to the object, in another room, which is not ported.
+        assert_eq!(world.ticks, before.ticks + 261);
+        assert_eq!(trees(world, 21), TREES_261);
+        let animator = &world.animators[&21];
+        assert_eq!((animator.state, animator.arrival), (3, 2));
+        assert_eq!(world.objects[&21].position, POSITION_261);
+        assert_eq!(digest(&world.encode()), TICK_261);
+        // Tick 262 stops loudly: person 21's animator comes to the end of
+        // its next path with object data word 9 clear (0x58e8be), which is
+        // not ported.
         let error = interpreter
             .lot_update(world, &tuning, &mut player)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("object 21, tree 0x1012 node 0"), "{error}");
-        assert!(error.contains("another room"), "{error}");
-        assert_eq!(world.lot_rng.state(), 2_459_469_755);
-        assert_eq!(world.action_serial, 1);
-        let person = world.objects[&21].person.as_ref().unwrap();
-        let action = &person.active;
-        assert_eq!(
-            (action.uid, action.caller, action.target, action.icon),
-            (1, 21, 132, 132)
-        );
-        assert_eq!(
-            (action.table_index, action.priority, action.action),
-            (6, 2, 0x100e)
-        );
-        assert_eq!(
-            (action.attenuation.to_bits(), action.flags),
-            (0x3f19_999a, 0)
-        );
-        let uses: Vec<_> = person
-            .object_uses
-            .iter()
-            .map(|u| (u.target, u.stack_depth))
-            .collect();
-        assert_eq!(uses, [(132, 5)]);
-        assert_eq!(world.objects[&132].data[62], 1);
-        let trees: Vec<u16> = world.objects[&21]
-            .stack
-            .iter()
-            .map(|frame| frame.tree)
-            .collect();
-        assert_eq!(
-            trees,
-            [0x1000, 0x2001, 0x205b, 0x2029, 0x100e, 0x1014, 0x1012]
-        );
+        assert!(error.contains("object 21"), "{error}");
+        assert!(error.contains("0x58e8be"), "{error}");
     });
 }

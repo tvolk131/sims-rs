@@ -134,6 +134,7 @@ fn world() -> World {
                     score: F32::from_f32(-12.5),
                     light: F32::from_f32(0.25),
                     pool: true,
+                    occupied: true,
                 },
             )]),
             pending: 2,
@@ -311,6 +312,9 @@ fn animator() -> Animator {
             turn_destination: [UNSET; 3],
             turn_wanted: F32::from_bits(0xc060_0000),
             turn_clip: F32::from_bits(0xc080_0000),
+            step: [F32::from_bits(0x3f00_0000), F32::from_bits(0xbe80_0000)],
+            near_end: 1,
+            finishing: 0,
         },
         ..LOADED
     }
@@ -322,13 +326,140 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "f72290e87a9e96c2436bb657cdf83806bb38760885f45f9b0d6a53d1f12a19c3";
+const PINNED: &str = "794f72b969d9d0351f10ee7d8aca0b0177c29f5704bdb79e641c76ff2c8eaa6d";
+
+/// `whole` with `part` replaced by `old`. `part` is found where `blank`
+/// stands in `whole_blank`, the same encoding with that one field (and
+/// nothing else) at its default value: the bytes before and after it are
+/// the same in both.
+fn splice(whole: &[u8], whole_blank: &[u8], part: &[u8], blank: &[u8], old: &[u8]) -> Vec<u8> {
+    if part == old {
+        return whole.to_vec();
+    }
+    let common = |a: &mut dyn Iterator<Item = (&u8, &u8)>| a.take_while(|(x, y)| x == y).count();
+    let before = common(&mut whole.iter().zip(whole_blank));
+    let after = common(&mut whole.iter().rev().zip(whole_blank.iter().rev()));
+    let at: Vec<usize> = (0..=before.min(whole_blank.len() - blank.len()))
+        .filter(|&p| {
+            whole.get(p..p + part.len()) == Some(part)
+                && whole_blank[p..p + blank.len()] == *blank
+                && whole.len() - p - part.len() <= after
+                && whole_blank.len() - p - blank.len() <= after
+        })
+        .collect();
+    assert_eq!(at.len(), 1, "the field is not found in one place");
+    let p = at[0];
+    let mut bytes = whole[..p].to_vec();
+    bytes.extend(old);
+    bytes.extend(&whole[p + part.len()..]);
+    bytes
+}
+
+/// A map's encoding with each value written by `value`.
+fn map_bytes<K: serde::Serialize, V>(
+    map: &BTreeMap<K, V>,
+    value: impl Fn(&V) -> Vec<u8>,
+) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(&(map.len() as u64)).unwrap();
+    for (key, item) in map {
+        bytes.extend(postcard::to_allocvec(key).unwrap());
+        bytes.extend(value(item));
+    }
+    bytes
+}
+
+/// An animator's encoding under snapshot format 15: its motion without
+/// the last step and the two end-of-path flags, which format 16 added at
+/// the end of [`Motion`].
+fn animator_15_bytes(animator: &Animator) -> Vec<u8> {
+    let part = postcard::to_allocvec(&animator.motion).unwrap();
+    let old = &motion_15_bytes(&animator.motion);
+    let blank = Animator {
+        motion: Motion::NONE,
+        ..animator.clone()
+    };
+    splice(
+        &postcard::to_allocvec(animator).unwrap(),
+        &postcard::to_allocvec(&blank).unwrap(),
+        &part,
+        &postcard::to_allocvec(&Motion::NONE).unwrap(),
+        old,
+    )
+}
+
+/// A motion's encoding under snapshot format 15: without the last step
+/// and the two end-of-path flags at its end.
+fn motion_15_bytes(motion: &Motion) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(motion).unwrap();
+    let added = postcard::to_allocvec(&(motion.step, motion.near_end, motion.finishing)).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - added.len()), added);
+    bytes
+}
+
+/// The encoding of `world` with each animator as format 15 wrote it.
+fn without_motion_steps(world: &World) -> Vec<u8> {
+    let blank = World {
+        animators: BTreeMap::new(),
+        ..world.clone()
+    };
+    splice(
+        &world.encode(),
+        &blank.encode(),
+        &postcard::to_allocvec(&world.animators).unwrap(),
+        &[0],
+        &map_bytes(&world.animators, animator_15_bytes),
+    )
+}
+
+/// The encoding of `world` as snapshot format 15 wrote it. Format 16
+/// added two things: at the end of each room whether it knows a person is
+/// in it ([`Room::occupied`]), and at the end of each animator's motion
+/// its last step and two end-of-path flags ([`Motion::step`],
+/// [`Motion::near_end`], [`Motion::finishing`]). This writes them again
+/// without those bytes.
+fn format_15_bytes(world: &World) -> Vec<u8> {
+    let rooms = &world.rooms;
+    let blank_rooms = Rooms {
+        rooms: BTreeMap::new(),
+        ..rooms.clone()
+    };
+    let old_rooms = splice(
+        &postcard::to_allocvec(rooms).unwrap(),
+        &postcard::to_allocvec(&blank_rooms).unwrap(),
+        &postcard::to_allocvec(&rooms.rooms).unwrap(),
+        &[0],
+        &map_bytes(&rooms.rooms, |room| {
+            let mut bytes = postcard::to_allocvec(room).unwrap();
+            assert_eq!(bytes.pop(), Some(u8::from(room.occupied)));
+            bytes
+        }),
+    );
+    let blank = World {
+        rooms: Rooms::default(),
+        ..world.clone()
+    };
+    splice(
+        &without_motion_steps(world),
+        &without_motion_steps(&blank),
+        &postcard::to_allocvec(rooms).unwrap(),
+        &postcard::to_allocvec(&Rooms::default()).unwrap(),
+        &old_rooms,
+    )
+}
+
+#[test]
+fn without_room_marks_or_last_steps_the_encoding_is_format_15() {
+    // Snapshot format 16 added the room's mark that a person is in it and
+    // the animator's last step and end-of-path flags.
+    assert_eq!(digest(&format_15_bytes(&world())), PINNED_15);
+}
+const PINNED_15: &str = "f72290e87a9e96c2436bb657cdf83806bb38760885f45f9b0d6a53d1f12a19c3";
 
 /// The encoding of `world` as snapshot format 14 wrote it. Format 15
 /// added the last number given to a running action
 /// ([`World::action_serial`]) at the end. This drops its bytes.
 fn format_14_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_15_bytes(world);
     let serial = postcard::to_allocvec(&world.action_serial).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - serial.len()), serial);
     bytes
@@ -371,16 +502,16 @@ fn format_13_bytes(world: &World) -> Vec<u8> {
 /// which must be none. What follows the layer is the skin's clock and
 /// flag, the appearance flag and the motion.
 fn animator_13_bytes(animator: &Animator) -> Vec<u8> {
-    let mut bytes = postcard::to_allocvec(animator).unwrap();
+    let mut bytes = animator_15_bytes(animator);
     assert_eq!(bytes.pop(), Some(u8::from(animator.walking)));
     assert_eq!(bytes.pop(), Some(u8::from(animator.undrawn)));
-    let after = postcard::to_allocvec(&(
+    let mut after = postcard::to_allocvec(&(
         animator.skin_clock,
         animator.skin_dirty,
         animator.profile_stale,
-        &animator.motion,
     ))
     .unwrap();
+    after.extend(motion_15_bytes(&animator.motion));
     assert_eq!(bytes.split_off(bytes.len() - after.len()), after);
     if let Some(layer) = &animator.foreground {
         assert!(layer.cursors.is_empty());
@@ -410,7 +541,7 @@ fn format_12_bytes(mut world: World) -> Vec<u8> {
     let motion = match world.animators.values_mut().next() {
         Some(animator) => {
             animator.motion = Motion::NONE;
-            postcard::to_allocvec(&Motion::NONE).unwrap()
+            motion_15_bytes(&Motion::NONE)
         }
         None => Vec::new(),
     };

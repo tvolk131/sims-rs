@@ -177,8 +177,9 @@ pub struct Animator {
     /// draw goes through after this one, are not kept: see there.
     pub undrawn: bool,
     /// +0x19c: the animator walks. Starting or going on with a walk sets
-    /// it (0x58ed72); a turn on the spot, its start (0x58df01), a new
-    /// animator (0x587de2) and the reset (0x589262) clear it. The walk's
+    /// it (0x58ed72); a turn on the spot, its start (0x58df01), standing
+    /// at its destination (0x58f11d), a new animator (0x587de2) and the
+    /// reset (0x589262) clear it. The walk's
     /// start reads it (0x58ed1d): while it is set, a walk goes on without
     /// asking whether to stop.
     pub walking: bool,
@@ -192,9 +193,15 @@ pub struct Animator {
 /// 0, and a turn's start (0x58f559) writes the rest before the turn
 /// (state 4) reads them.
 ///
-/// The route start also writes +0x8c to +0x94, +0x18c, +0x284 and
-/// +0x288, and the turn +0x19c, +0x24, +0x28 and +0x290, all to 0;
-/// nothing ported reads those, and they are left out.
+/// The walk keeps its last step, and the end of a path sets two flags
+/// (+0x288, +0x28c). A new animator and the reset (0x589262) clear both
+/// flags; the route start clears the first.
+///
+/// The route start also writes +0x8c to +0x94, +0x18c and +0x284, and
+/// the turn +0x19c, +0x24, +0x28 and +0x290, all to 0. The walk sets
+/// +0x290 to 1, and only the end of a path for a person whose word 64 is
+/// set reads it (0x58ef8e), which is not ported. Nothing ported reads the
+/// others, and they are left out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Motion {
     /// +0x180: the index of the path point the animator is heading for.
@@ -211,6 +218,16 @@ pub struct Motion {
     pub turn_wanted: F32,
     /// +0x1f4: the turn the clip makes, in eighths of a turn.
     pub turn_clip: F32,
+    /// +0x294, +0x298: the walk's last step along the position's first
+    /// and second coordinates (0x58ee57, 0x58ee6c). The end of a path
+    /// takes it once more (0x58e897).
+    pub step: [F32; 2],
+    /// +0x288: the animator came within its stopping distance of the
+    /// path's end (0x58e85c). It then stops however far it still is.
+    pub near_end: i32,
+    /// +0x28c: the walk goes on without asking whether to stop (0x58e883,
+    /// read at 0x58ed15).
+    pub finishing: i32,
 }
 
 impl Motion {
@@ -223,6 +240,9 @@ impl Motion {
         turn_destination: [F32::ZERO; 3],
         turn_wanted: F32::ZERO,
         turn_clip: F32::ZERO,
+        step: [F32::ZERO; 2],
+        near_end: 0,
+        finishing: 0,
     };
 }
 
@@ -610,6 +630,8 @@ impl Animator {
         }
         self.position = [UNSET; 3];
         self.motion.segment = -1;
+        self.motion.near_end = 0;
+        self.motion.finishing = 0;
         self.posture = -1;
         self.carry_selection = -1;
         self.promote = true;

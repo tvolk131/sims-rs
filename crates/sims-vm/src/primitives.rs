@@ -7,7 +7,7 @@ mod animate;
 mod budget;
 mod create;
 pub(crate) mod dialog;
-mod distance;
+pub(crate) mod distance;
 mod events;
 mod expression;
 mod find_location;

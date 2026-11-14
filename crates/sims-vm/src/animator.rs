@@ -66,7 +66,7 @@
 use crate::fault::Trap;
 use crate::interpreter::Interpreter;
 use crate::people::read_appearance_if_stale;
-use crate::placement::{Place, on_lot};
+use crate::placement::{Place, on_lot, pool_tile};
 use sims_core::{Ext, F32};
 use sims_sim::World;
 use sims_sim::animator::{Animator, EPSILON, LOADED, Layer, UNSET};
@@ -306,6 +306,14 @@ const REPEAT: i32 = 1;
 /// data word 17 set).
 const STOP_WALK: usize = 0x13;
 const STOP_RUN: usize = 0x16;
+/// The stopping distance at the end of a path (0x6d07d8, or 0x6d07dc
+/// with data word 17 set), and what it is scaled by (0x668654).
+const STOP_DISTANCE: F32 = F32::from_bits(0x4000_0000);
+const STOP_RUN_DISTANCE: F32 = F32::from_bits(0x4040_0000);
+const STOP_SCALE: F32 = F32::from_bits(0x3fc0_0000);
+/// Object data word 9: set, the end of a path stops at the stopping
+/// distance (0x58e7c9).
+const STOPS: usize = 9;
 /// The walk clip with data word 17 set (state 10).
 const RUN: usize = 0x15;
 /// Object data word 22, which the animator's scale writes (0x59209f).
@@ -446,8 +454,10 @@ impl Interpreter<'_> {
     /// State 3 for a placed animator (0x58ddbf). Both directions are put
     /// into 0 to 8. An animator arrived and facing its destination's
     /// direction notes the route's end (+0x188: 0 stays 0; -1, 2 and 3
-    /// become 2), or, with any other route result, follows the route
-    /// (state 9). One arrived that has to turn starts a turn (0x58df01).
+    /// become 2, 0x58f135) and stops walking ([`Animator::walking`] and
+    /// +0x24, +0x28 and +0x290 cleared, 0x58f117), or, with any other
+    /// route result, follows the route (state 9). One arrived that has to
+    /// turn starts a turn (0x58df01).
     fn stand(&self, world: &mut World, id: u16, a: &mut Animator, now: i32) -> Result<Next, Trap> {
         a.destination[2] = wrap(a.destination[2]);
         a.position[2] = wrap(a.position[2]);
@@ -465,6 +475,7 @@ impl Interpreter<'_> {
                     return Ok(Next::Again);
                 }
             }
+            a.walking = false;
             return Ok(Next::Done);
         }
         if !arrived {
@@ -682,8 +693,11 @@ impl Interpreter<'_> {
     ///
     /// The position's projection is held to the segment.
     ///
-    /// Fails for what is not ported: the last segment (0x58e740) and a
-    /// person whose data word 17 is set (another look-ahead).
+    /// The point before the path's last is where the path ends; the last
+    /// point is only the way to face there ([`Interpreter::end_of_path`]).
+    ///
+    /// Fails for what is not ported: a person whose data word 17 is set
+    /// (another look-ahead).
     fn follow(&self, world: &mut World, id: u16, a: &mut Animator, now: i32) -> Result<Next, Trap> {
         let path = world
             .routing
@@ -719,10 +733,7 @@ impl Interpreter<'_> {
                 .sqrt()
                 .single();
             if i64::from(segment) == count - 2 {
-                return Err(unsupported(
-                    "0x58e740",
-                    "follows the last segment of its path",
-                ));
+                return self.end_of_path(world, id, a, p, now);
             }
             if a.foreground.as_ref().is_none_or(|l| l.interruptible != 0) {
                 a.state = if pace == 1 { 10 } else { 9 };
@@ -788,6 +799,89 @@ impl Interpreter<'_> {
             a.motion.segment = segment + 1;
         }
         Err(unsupported("0x58e50a", "found no point ahead on its path"))
+    }
+
+    /// The end of the path (0x58e740): the animator is heading for the
+    /// point before the path's last, `end`. The last point only gives the
+    /// direction to face at the end (0x58e77a), which the branch ported
+    /// here does not use.
+    ///
+    /// For a person whose object data word 9 is set (0x58e7d2): while the
+    /// animator has not come near the end yet (+0x288 clear) and is at
+    /// least the stopping distance from it (2, or 3 with data word 17 set,
+    /// times 1.5), it keeps walking, straight at the end point (state 9,
+    /// or 10 with data word 17 set; [`Interpreter::head`]). Otherwise, for
+    /// a person whose word 64 is clear (0x58e846): the destination becomes
+    /// the position, +0x288 and +0x28c are set, the route result becomes
+    /// -1, the progress 1, and the animator stands (state 3). With a
+    /// foreground clip it first takes its last step once more (0x58e897,
+    /// [`Interpreter::walk_step`]), and then the destination becomes the new
+    /// position, direction included (0x58f057). The state's code runs
+    /// again (0x58f089).
+    ///
+    /// The original also sets global 0x6f6d68 to 13 and then 14, and a
+    /// local byte from 0x6f6d70 that only matters when it is 1 (0x58f6eb);
+    /// 0x6f6d70 is 0 in a memory image of the running game. Neither is
+    /// kept.
+    ///
+    /// Fails for what is not ported: a person whose data word 9 is clear
+    /// (0x58e8be: a timer and a stopping clip), and one whose word 64 is
+    /// set (0x58e83b and 0x58e93c).
+    fn end_of_path(
+        &self,
+        world: &mut World,
+        id: u16,
+        a: &mut Animator,
+        end: [i32; 2],
+        now: i32,
+    ) -> Result<Next, Trap> {
+        if datum(world, id, STOPS)? == 0 {
+            return Err(unsupported(
+                "0x58e8be",
+                "comes to the end of its path with object data word 9 clear",
+            ));
+        }
+        let pace = datum(world, id, PACE)?;
+        let [p0, p1] = end.map(Ext::from_i32);
+        let dx = (p1 - a.position[0].ext()).single();
+        let dy = (p0 - a.position[1].ext()).single();
+        let left = ((dy * dy).single() + (dx * dx).single())
+            .single()
+            .sqrt()
+            .single();
+        let stop = if pace == 1 {
+            STOP_RUN_DISTANCE
+        } else {
+            STOP_DISTANCE
+        };
+        let stop = (stop.ext() * STOP_SCALE.ext()).single();
+        // 0x58e810: below the stopping distance, or not a number, stops.
+        if a.motion.near_end == 0 && at_least(left, stop) {
+            a.state = if pace == 1 { 10 } else { 9 };
+            let square = ((dy * dy).single() + (dx * dx).single()).single();
+            return self.head(world, id, a, [dx, dy], square, now);
+        }
+        if person_word(world, id, SPECIAL)? != 0 {
+            return Err(unsupported(
+                "0x58e83b",
+                "stops at the end of its path for a person whose word 64 is set",
+            ));
+        }
+        a.destination[0] = a.position[0];
+        a.destination[1] = a.position[1];
+        a.motion.near_end = 1;
+        a.arrival = -1;
+        a.state = 3;
+        a.motion.finishing = 1;
+        a.motion.progress = ONE;
+        if a.foreground.is_none() {
+            return Ok(Next::Again);
+        }
+        let [sx, sy] = a.motion.step.map(F32::ext);
+        let square = ((sy * sy).single() + (sx * sx).single()).single();
+        self.walk_step(world, id, a, [sx, sy], square)?;
+        a.destination = a.position;
+        Ok(Next::Again)
     }
 
     /// The animator heads for a point ahead (0x58eb29), `dx` and `dy` away
@@ -889,13 +983,12 @@ impl Interpreter<'_> {
     ///    0x45e43d) and the animator's position becomes the step's end,
     ///    unrounded.
     ///
-    /// The original keeps the step (+0x294, +0x298) and sets +0x290;
-    /// only code behind fields that nothing ported sets reads them
-    /// (+0x284, set by 0x5887b7 and 0x589e97, and the last segment of a
-    /// path, 0x58e897), so they are left out. With +0x28c set (only the
-    /// last segment sets it) the walk would also go on without asking
-    /// whether to stop. The original sets global 0x6f6d64 to 3, which is
-    /// not kept.
+    /// The step is kept (+0x294, +0x298) for the end of the path
+    /// ([`Interpreter::end_of_path`]). The original also sets +0x290,
+    /// which only code that is not ported reads (0x58ef8e). With +0x28c
+    /// set (the end of a path sets it) the walk goes on without asking
+    /// whether to stop (0x58ed15). The original sets global 0x6f6d64 to
+    /// 3, which is not kept.
     #[allow(clippy::too_many_arguments)]
     fn walk(
         &self,
@@ -927,7 +1020,10 @@ impl Interpreter<'_> {
         };
         a.position[2] = (d + a.position[2].ext()).single().to_f32();
         set_datum(world, id, DIRECTION, direction_word(a.position[2]))?;
-        let going = a.walking || a.selection == WALK as i32 || a.selection == RUN as i32;
+        let going = a.motion.finishing != 0
+            || a.walking
+            || a.selection == WALK as i32
+            || a.selection == RUN as i32;
         if !going {
             let stop = |clip| -> Result<bool, Trap> {
                 let stop = self.stride(world, id, clip, false)?;
@@ -966,7 +1062,32 @@ impl Interpreter<'_> {
         })?;
         layer.set_speed(rate);
         layer.phase = phase;
+        self.walk_step(world, id, a, offset, distance)?;
+        Ok(Next::Done)
+    }
 
+    /// One step of the walk (0x58edec to 0x58f04d): the clip's distance
+    /// times 16/3 over its duration at the layer's speed in ticks of 42
+    /// milliseconds, along `offset` made one long (`distance` is the
+    /// square of its length; one within [`EPSILON`] counts as 1). The
+    /// step is kept ([`sims_sim::animator::Motion::step`]). Its end,
+    /// rounded to whole units, is moved onto the person's path, the
+    /// person must fit there, and is put there; the animator's position
+    /// becomes the step's end, unrounded. See [`Interpreter::walk`].
+    fn walk_step(
+        &self,
+        world: &mut World,
+        id: u16,
+        a: &mut Animator,
+        offset: [Ext; 2],
+        distance: Ext,
+    ) -> Result<(), Trap> {
+        let layer = a.foreground.as_ref().ok_or_else(|| {
+            unsupported(
+                "0x58edf6",
+                "steps with no foreground clip: it reads through a null pointer",
+            )
+        })?;
         let clip = self.clip(&layer.clip)?;
         let duration = (F32::from_bits(clip.duration).ext() / layer.speed.ext()).single();
         let length =
@@ -982,6 +1103,7 @@ impl Interpreter<'_> {
         let [dx, dy] = offset;
         let step_x = ((speed * dx).single() / norm).single();
         let step_y = ((speed * dy).single() / norm).single();
+        a.motion.step = [step_x.to_f32(), step_y.to_f32()];
         let x = (step_x + a.position[0].ext()).single();
         let y = (step_y + a.position[1].ext()).single();
         let round = |v: Ext| (v + HALF.ext()).single().to_i32_truncate();
@@ -1005,6 +1127,24 @@ impl Interpreter<'_> {
         // What the placement runs may read the animator; it sees it as the
         // original's would be.
         world.animators.insert(id, a.clone());
+        self.put_person(world, id, to, level)?;
+        if let Some(now) = world.animators.get(&id) {
+            *a = now.clone();
+        }
+        a.position[0] = x.to_f32();
+        a.position[1] = y.to_f32();
+        Ok(())
+    }
+
+    /// A walking person put on a tile (the person's virtual function
+    /// 0x88, 0x45e4e9): the placement, then the room it is in noted.
+    pub(crate) fn put_person(
+        &self,
+        world: &mut World,
+        id: u16,
+        to: [i32; 2],
+        level: i32,
+    ) -> Result<(), Trap> {
         let place = Place {
             on_lot: on_lot(to),
             position: to,
@@ -1013,13 +1153,95 @@ impl Interpreter<'_> {
             level,
         };
         self.put(world, id, place, true).map_err(|f| f.trap)?;
-        self.note_room(world, id)?;
-        if let Some(now) = world.animators.get(&id) {
-            *a = now.clone();
+        self.note_room(world, id)
+    }
+
+    /// How the animator's route went (0x589d47), as the route's step 3
+    /// reads it: 2 while it is under way (the route's end, +0x188, is -1
+    /// or 1), 0 for an end of 0 or any end but 2.
+    ///
+    /// For an end of 2 (the animator reached the path's end) the person
+    /// is put where the animator stands, and the result is 1:
+    ///
+    /// 1. The direction goes to object data word 1 (0x5920e8).
+    /// 2. The position, each coordinate rounded half up and truncated,
+    ///    is moved onto the path ([`snap_to_path`], all its segments).
+    /// 3. If the person fits there (virtual function 0x54) it is put there
+    ///    (virtual function 0x88, [`Self::put_person`]). A person that does
+    ///    not fit would have the animator's position unset (virtual
+    ///    function 0x20) and be put back on its own tile with result 0;
+    ///    that fails loudly.
+    pub(crate) fn route_result(&self, world: &mut World, id: u16) -> Result<i32, Trap> {
+        let a = world
+            .animators
+            .get(&id)
+            .ok_or_else(|| Trap::Invalid(format!("person {id} has no animator")))?;
+        match a.arrival {
+            -1 | 1 => return Ok(2),
+            2 => {}
+            _ => return Ok(0),
         }
-        a.position[0] = x.to_f32();
-        a.position[1] = y.to_f32();
-        Ok(Next::Done)
+        let [x, y, direction] = a.position;
+        set_datum(world, id, DIRECTION, direction_word(direction))?;
+        let round = |v: F32| (v.ext() + HALF.ext()).single().to_i32_truncate();
+        let path = world
+            .routing
+            .routes
+            .get(&id)
+            .map(|r| r.path.clone())
+            .unwrap_or_default();
+        // Path points hold the second coordinate first.
+        let [second, first] = snap_to_path(&path, [round(y), round(x)], -1)?;
+        let level = world
+            .objects
+            .get(&id)
+            .ok_or_else(|| Trap::native(10, "missing object"))?
+            .position[2];
+        let to = [first, second];
+        if !self.fits(world, id, to, level).map_err(|f| f.trap)? {
+            return Err(unsupported(
+                "0x589dee",
+                "ends its route where its person does not fit",
+            ));
+        }
+        self.put_person(world, id, to, level)?;
+        Ok(1)
+    }
+
+    /// A person's virtual function 0x74 (0x45e519), which the end of a
+    /// route runs after it turns the person:
+    ///
+    /// 1. The animator's position is unset (its virtual function 0x24,
+    ///    0x5893a9, which runs virtual function 0x20 with 1, 0x589361):
+    ///    both coordinates and the direction become [`UNSET`], and byte
+    ///    +0xd9 is set. As in the frame's draw (`frame.rs`), +0xd9 is not
+    ///    kept; the animator's tick places an unset animator again.
+    /// 2. Person word 64 becomes 0, then 1 if the person stands on the lot
+    ///    (0x422632) on a pool tile (0x478f76).
+    pub(crate) fn refresh_person(&self, world: &mut World, id: u16) -> Result<(), Trap> {
+        let a = world
+            .animators
+            .get_mut(&id)
+            .ok_or_else(|| Trap::Invalid(format!("person {id} has no animator")))?;
+        a.position = [UNSET; 3];
+        let position = world
+            .objects
+            .get(&id)
+            .ok_or_else(|| Trap::native(10, "missing object"))?
+            .position;
+        let [a, b, _] = World::tile(position);
+        let pool = on_lot([position[0], position[1]]) && pool_tile(world, [a, b], position[2])?;
+        let word = world
+            .objects
+            .get_mut(&id)
+            .and_then(|o| o.person.as_mut())
+            .ok_or_else(|| Trap::native(0x1c, "object is not a person"))?
+            .data
+            .get_mut(SPECIAL)
+            .ok_or_else(|| Trap::Invalid(format!("person data has no word {SPECIAL}")))?;
+        *word = i16::from(pool);
+        world.routing.unknown_words.remove(&(id, SPECIAL));
+        Ok(())
     }
 
     /// One of the strides the animator's constructor (0x58831d) keeps: the
@@ -1079,6 +1301,7 @@ impl Interpreter<'_> {
         a.arrival = 1;
         a.motion.progress = F32::ZERO;
         a.motion.segment = 0;
+        a.motion.near_end = 0;
         a.state = 3;
         world.animators.insert(id, a);
         Ok(())
@@ -1157,6 +1380,26 @@ fn end_turn(world: &mut World, id: u16, a: &mut Animator) -> Result<(), Trap> {
     a.position[1] = to[1];
     a.destination[1] = to[1];
     Ok(())
+}
+
+/// The animator stops following its route (0x589e2d), as the route's
+/// steps 9 and 10 and its end ask. While the route is under way (its end,
+/// +0x188, is 1 or -1) nothing stops: +0x284 is set to 1, which nothing
+/// ported reads, and the answer is false. Otherwise the end becomes 0,
+/// the segment -1, the destination the position, and the animator
+/// stands (state 3); the answer is true.
+///
+/// The original also sets +0x1c0 to 0, +0x18c to 1 and the global
+/// 0x6f6d68 to 7. Nothing ported reads them, and they are not kept.
+pub(crate) fn stop_route(a: &mut Animator) -> bool {
+    if matches!(a.arrival, 1 | -1) {
+        return false;
+    }
+    a.arrival = 0;
+    a.motion.segment = -1;
+    a.destination = a.position;
+    a.state = 3;
+    true
 }
 
 /// A direction as object data word 1 holds it (0x5920e8): the direction
@@ -1295,4 +1538,29 @@ pub fn snap_to_path(path: &[[i32; 2]], point: [i32; 2], index: i32) -> Result<[i
         }
     }
     Ok(best)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_route_under_way_does_not_stop() {
+        let mut a = sims_sim::animator::LOADED;
+        a.position = [1.0, 2.0, 3.0].map(F32::from_f32);
+        a.destination = [5.0, 6.0, 7.0].map(F32::from_f32);
+        a.state = 9;
+        a.motion.segment = 2;
+        for arrival in [1, -1] {
+            a.arrival = arrival;
+            let before = a.clone();
+            assert!(!stop_route(&mut a));
+            assert_eq!(a, before);
+        }
+        // Any other end: the animator stands where it is.
+        a.arrival = 2;
+        assert!(stop_route(&mut a));
+        assert_eq!((a.arrival, a.motion.segment, a.state), (0, -1, 3));
+        assert_eq!(a.destination, a.position);
+    }
 }

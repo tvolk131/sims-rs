@@ -1,9 +1,9 @@
 //! The planner (0x4823fa): from a route context's candidates to the
 //! person's path.
 //!
-//! 1. The person's room is the room of the slot's object; the room must
-//!    be on the ground and outdoors here (a free rectangle found while
-//!    searching costs 3 there).
+//! 1. The person's room is the room of the slot's object. A free
+//!    rectangle found while searching costs 3 in a room outdoors on the
+//!    ground, else 0.
 //! 2. The obstacles of the objects in the room (0x482599 to 0x4827b9):
 //!    each object on the lot's list, but the person, one in another room
 //!    and one [`Interpreter::ignored`] skips, gives its footprint as a
@@ -16,11 +16,13 @@
 //!    rectangle at its position, costing 16 for each point below the best
 //!    score.
 //! 5. The search (0x482a31 to 0x482b2a): a room of at least 100 tiles
-//!    whose objects are at most a fifth of its half tiles searches with
-//!    rectangles at most 128 wide, and a step limit of the tiles times
-//!    the goals plus 50, at most 1000. A room of more than 256 tiles
-//!    first searches without the width limit; that pass must find a path
-//!    and is then thrown away.
+//!    whose objects are fewer than a fifth of its half tiles searches
+//!    with rectangles at most 128 wide ([`bounded`]: the ratio is rounded
+//!    to single precision, so exactly a fifth is too many); any other
+//!    room without that limit.
+//!    The step limit is the tiles times the goals plus 50, at most 1000.
+//!    A room with the width limit and more than 256 tiles first searches
+//!    without it; that pass must find a path and is then thrown away.
 //! 6. The chosen candidate is the goal reached (context +0x50), and the
 //!    path's points, coordinates swapped, are the person's path.
 //!
@@ -106,7 +108,8 @@ impl Interpreter<'_> {
     /// Whether the planner leaves an object out of its obstacles
     /// (0x4817e9): one in a container; one a person may pass by its data
     /// word 8 (with bit 2, when bit 1 is clear; else when bit 4 is set)
-    /// and whose data word 10 is 0; another person farther than 3 tiles,
+    /// and whose data word 10 is 0; another person farther than 3 tiles
+    /// (one nearer is an obstacle),
     /// or the one the context names; and any other object that answers
     /// its function 5 true with the person as the stack object.
     fn ignored(&self, world: &mut World, ctx: &Context, id: u16) -> Result<bool, Fault> {
@@ -148,10 +151,9 @@ impl Interpreter<'_> {
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?
             .position;
         let distance = crate::primitives::distance(from, object.position, false);
-        if distance > Ext::from_i32(NEAR) {
-            return Ok(true);
-        }
-        Err(fail(unsupported("another person within 3 tiles")))
+        // 0x48188a: a person within 3 tiles (or at a distance that is not
+        // a number) is in the way.
+        Ok(distance > Ext::from_i32(NEAR))
     }
 
     /// Plans the route of a context: fills `path` and the context's
@@ -196,12 +198,7 @@ impl Interpreter<'_> {
             Some(r) => (r.outdoors, r.half_tiles, r.objects),
             None => return Err(fail(unsupported("a person in no room"))),
         };
-        if super::rooms::room_level(room) != 1 || !outdoors {
-            return Err(fail(unsupported(
-                "a room that is not outdoors on the ground",
-            )));
-        }
-        let free_cost = 3;
+        let free_cost = free_cost(room, outdoors);
         let actor = me.footprint;
 
         // The objects' obstacles.
@@ -264,14 +261,8 @@ impl Interpreter<'_> {
             }
         }
 
-        let density = (Ext::from_i32(objects) / Ext::from_i32(half)).single();
-        if density > Ext::from_f64_bits(DENSE) {
-            return Err(fail(unsupported("a room crowded with objects")));
-        }
         let tiles = half / 2;
-        if tiles < 100 {
-            return Err(fail(unsupported("a room of fewer than 100 tiles")));
-        }
+        let bounded = bounded(objects, half);
         let limit = tiles
             .wrapping_mul(goals.len() as i32)
             .wrapping_add(50)
@@ -287,13 +278,13 @@ impl Interpreter<'_> {
             free_cost,
             steps,
         };
-        if tiles > 256 {
+        if tiles > 256 && bounded {
             let first = search(query(None)).map_err(fail)?;
             if first.points.is_empty() {
                 return Err(fail(unsupported("a first search that finds no path")));
             }
         }
-        let found = search(query(Some(128))).map_err(fail)?;
+        let found = search(query(bounded.then_some(128))).map_err(fail)?;
         let goal = found
             .goal
             .ok_or_else(|| fail(unsupported("a search that reaches no goal")))?;
@@ -304,6 +295,27 @@ impl Interpreter<'_> {
         path.extend(found.points.iter().map(|p| [p[1], p[0]]));
         Ok(true)
     }
+}
+
+/// What a free rectangle found while searching costs (0x4824d0 to
+/// 0x48253e): 3 in a room outdoors on the ground, else 0.
+fn free_cost(room: i16, outdoors: bool) -> i32 {
+    if super::rooms::room_level(room) == 1 && outdoors {
+        3
+    } else {
+        0
+    }
+}
+
+/// Whether the search keeps rectangles at most 128 wide (0x4828ba): not
+/// in a room crowded with objects (0x468103: the objects over the half
+/// tiles, rounded to single precision, above the double 0.2, so exactly
+/// a fifth is crowded; a ratio that is not a number is not) or of fewer
+/// than 100 tiles (0x46810a).
+fn bounded(objects: i32, half: i32) -> bool {
+    let density = (Ext::from_i32(objects) / Ext::from_i32(half)).single();
+    let crowded = density > Ext::from_f64_bits(DENSE);
+    !crowded && half / 2 >= 100
 }
 
 #[cfg(test)]
@@ -339,5 +351,28 @@ mod tests {
             obstacle([12, 0, 20, 20], HARD, 4, actor),
             Some(Region([9, -3, 23, 23, HARD]))
         );
+    }
+
+    #[test]
+    fn a_free_rectangle_costs_3_only_outdoors_on_the_ground() {
+        assert_eq!(free_cost(0, true), 3);
+        assert_eq!(free_cost(5, false), 0);
+        // Room 1024 is on the second level.
+        assert_eq!(free_cost(1024, true), 0);
+    }
+
+    #[test]
+    fn a_small_or_crowded_room_is_searched_without_the_width_limit() {
+        // 100 tiles (200 half tiles) with fewer than a fifth of them in
+        // objects. Exactly a fifth is crowded: the ratio is rounded to
+        // single precision, which is above the double 0.2 it is compared
+        // with.
+        assert!(bounded(39, 200));
+        assert!(!bounded(40, 200));
+        assert!(!bounded(0, 198));
+        // A room of no tiles is unbounded; 0/0 is not crowded but the
+        // room is too small.
+        assert!(!bounded(0, 0));
+        assert!(!bounded(1, 0));
     }
 }

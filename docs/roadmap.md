@@ -59,29 +59,28 @@ Each step is a few PRs, and each PR leaves `main` green.
 - Ticks run. `sims boot --ticks N` runs N lot updates after the load and
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
-  1, after ticks 1 to 3 and after every tick from 33 on). **K = 232 on the
-  Goth house**: our state after each of ticks 1 to 100, and after every
-  tenth tick from 110 to 230, equals the 1000-tick capture of the original
-  after the same update in everything compared, global 12 after tick 1
-  aside. A second capture holds the full state after ticks 1 to 5, 30 to
-  35 and 225 to 240, and ours equals it after each of those to 232, global
-  12 included. The `updates.jsonl` line (tick count, the three random
-  streams, the scheduler cursor) is equal after every tick from 1 to 232
-  in both (see step 4 below, "The first tick" and the sections after it,
-  to "Tick 233").
+  1, after ticks 1 to 3, after tick 33 and after every 30th tick from
+  there, as three captures recorded). **K = 261 on the Goth house**: our
+  state after every one of ticks 1 to 261 equals the fourth capture of the
+  original (full state after every update) in everything compared. The
+  other captures agree where they hold a state, but for fields that also
+  differ between the original's own runs (see "Ticks 233 to 261").
   The simulation holds the neighborhood's people (their records, person
   data, relationships and inventories) and each person's animator, as
   far as scripts read it. Find Location For (primitive 16) is ported for
   the modes the house reaches, and so is making a new person (Create New
   Object Instance mode 8, tick 6). Go To Routing Slot (primitive 45)
-  is ported for the route person 259 takes in tick 14, with the
-  planner, the animator's turn on the spot and its walk along the path.
-  Clips' timed events are ported. In tick 233 person 21 chooses an
-  interaction by itself (Find Best Interaction, primitive 3) and starts
-  it (Gosub Found Action, primitive 30); both are ported. Its tree then
-  routes to an object in another room (Go To Relative Position, primitive
-  27), which goes through a door. Routing between rooms is not ported, so
-  tick 233 stops there, and the boot says so and at which tick.
+  is ported for the routes the house takes to tick 261, with the
+  planner, the search of places by distance, the animator's turn on the
+  spot, its walk along the path and the end of the path. Clips' timed
+  events are ported. In tick 233 person 21 chooses an interaction by
+  itself (Find Best Interaction, primitive 3) and starts it (Gosub Found
+  Action, primitive 30). Its tree routes to an object in another room
+  (Go To Relative Position, primitive 27): the routing between rooms
+  chooses a door, and the person walks through it. A person entering a
+  room tells the room (it is lit as if it had a lamp), and each frame
+  counts the rooms that wait. Tick 262 stops loudly at the end of a path
+  that is not ported, and the boot says so and at which tick.
 - Step 4 is in progress. `tools/harness/` runs the original under Wine
   in a QEMU guest and stops it at every lot update. It saves the state
   at the entry of the first tick and after each lot update: every
@@ -103,14 +102,22 @@ Each step is a few PRs, and each PR leaves `main` green.
   updates 1 to 5, 30 to 35 and 225 to 240, a watchpoint on the house
   view's draw guard (the frames), watchpoints on Find Best Interaction's
   candidates, its choice and the action numbers, and a memory image at
-  the entry of update 233. The first run does not choose in tick 233;
-  the second does (see "Tick 233").
+  the entry of update 233. A third run recorded 300 lot updates (full
+  state after 1 to 100 and every tenth), and a fourth the full state
+  after every update to 608, both with the draw guard watched. The
+  fourth stopped at update 609: the harness found an object in a
+  retained list that the registry did not hold, and refuses to guess
+  (`tools/harness/README.md`). The first run does not choose in tick
+  233; the other three do (see "Tick 233"). Why is not known, and the
+  captures do not hold what would tell. The likely cause, unverified,
+  is the long pause the harness made in that run only; we follow the
+  other three runs (`docs/decisions.md`).
   With the install's UserData, the C runtime's random stream and all
   463 neighborhood records match as well. The 52-draw offset and the
   five differing records came from the first capture's guest files. The
   original first draws from the C runtime's stream in tick 6, 1,466
   times, when it makes a person; ours draws the same, and the stream is
-  equal after every tick to 232.
+  equal after every tick to 261 (fourth capture).
 
 ### Load sequence
 
@@ -1027,10 +1034,13 @@ updates 1, 2 and 3 (many times while a dialog waited), and after update
 16, 18 and 21, whose bytes `+0xd8` to `+0xdb` were already 0 before
 update 1. Person 259, made in tick 6, was first drawn after update 33.
 When the game draws is up to its main loop, not the simulation, so the
-frame schedule is an input (`sims boot --frames`). The default follows
-that run: `0,1,2,3,33+`. Frames after 1 to 3 and after 34 on change
-nothing on this house (the state after tick 232 is the same with and
-without them). Without the frame after 33, ticks 34 on differ.
+frame schedule is an input (`sims boot --frames`). Three later runs
+drew before update 1, after updates 1, 2 and 3 (how many times differs
+from run to run), after update 33 and after every 30th update from
+there. The default follows them: `0,1,2,3,33+30`. Each frame counts
+the rooms that wait (`0x4a8895`), so frames at other times give other
+room values: the frame after tick 2 counts rooms 1 to 4, which a script
+marked in that tick. Without the frame after 33, ticks 34 on differ.
 
 **What wrote registry byte 0x12.** The watchpoint on the byte stopped at
 `0x43fc8d`, in the end of the object read (`0x43fc02`), during the load,
@@ -1086,27 +1096,84 @@ using the object, and the interaction becomes its running action
 **Go To Relative Position** (primitive 27, `0x45c634`). The slot it routes
 to is built from the operands (`relative_slot`), and the route's steps are
 those of Go To Routing Slot. The object is in another room, so the route
-goes through a door that the routing between rooms chooses (`0x45c7c2`,
-`0x46390f`). That is not ported, and tick 233 stops at object 21, tree
-`0x1012`, node 0.
+goes through a door (step 2, `0x45afd0`).
 
 **Compared with the original.** The second capture's watchpoints saw six
 candidates, the choice of menu 6 (`0x45e28b`) and the action number go
-from 0 to 1 (`0x41f15e`) in update 233. At the stop, the lot's random
-stream, the action number, person 21's running and last actions, its
-seven frames (the last one's primitive state aside), its use of object
-132 and object 132's user count equal the capture's after tick 233, and
-so does every object that ran before person 21 in that tick. Find Best
-Interaction's steps were also compared with the original's code run on
-a memory image at the entry of update 233.
+from 0 to 1 (`0x41f15e`) in update 233. Ours does the same, and the
+state after tick 233 equals the second, third and fourth captures'.
+Find Best Interaction's steps were also compared with the original's
+code run on a memory image at the entry of update 233.
 
-**Not verified.** The first capture's original made its one draw of
-ticks 233 and 234 in tick 234, not 233, from a state equal to ours after
-tick 232 as far as compared. Why is not known. Global 12 after tick 1 is
-0 in the second capture, as ours, and 17 in the first.
+**The first capture.** Its original did not choose in tick 233. Its one
+draw from the lot's stream in ticks 233 and 234 comes in tick 234, and
+after tick 240 person 21 runs tree `0x208a` and has no running action.
+Its state after tick 230 equals ours as far as compared, and the
+original's code run in an emulator on its memory from update 47 chooses
+in 233. So something outside the lot updates, after update 47, changed
+the outcome in that run only. What it was is not known (see
+`docs/decisions.md`). We follow the three runs that agree.
 
-**Stops.** Tick 233: object 21, tree `0x1012`, node 0, Go To Relative
-Position to object 132 in another room.
+### Ticks 233 to 261
+
+**Routing between rooms** (`routing/portals.rs`). A door (an object of
+type 8 with a tree for function 15) is a portal from its room to the
+room of its other side. Each portal holds a vector of costs (object
+`+0x1ac`, saved with the house), one column per number handed out from a
+pool that people and portals share (object data word 6, `0x46381a`). A
+person's column holds the cost of reaching the target through each door
+of its room (`0x463c83`); a portal's column holds its shortest distance
+to every other portal (`0x46390f`). The route's step 2 (`0x45afd0`)
+picks the cheapest door, notes the try (`0x463e43`; a second try marks
+it failed, as does a door tree that returns false, `0x463e09`), and
+pushes the door's tree on the person's thread. That tree walks the
+person to the door and through it with Go To Routing Slot.
+
+**Slots searched by distance** (`0x483598`). A slot with flags in its low
+byte gives rows of places in each flagged direction. Each place is
+classified (`0x481439`): outside the lot, another room, closed off by a
+wall or an object (`0x4359ea`), on uneven ground, or free. The last
+step of a route to a slot follows the slot's facing (`0x45c516` to
+`0x45c5fb`). The planner now plans in a room indoors or upstairs (a
+free rectangle costs 0 there), and searches without the width limit in
+a room that is small or crowded.
+
+**The end of a path** (`0x58e740`). For a person whose object data word
+9 is set, the animator walks on toward the end point until it is near,
+then stands. Standing with the route's end noted clears the walking
+flag (`0x58f117`). The route then ends (`0x589d47`, `0x45b6ea`): the
+person is put on its tile, turns along the path's last segment, and the
+context is removed.
+
+**Rooms and people.** A person whose room changes tells the old room it
+left and the new room it is there (`0x468802`). A dark room with no
+lamp then shows the light of a room with one (0.8, `0x4688bf`), so its
+light changed and it waits to be counted again. In a load, each person's
+visit notes its room too (`0x45e43d` at `0x459c22`). Each frame counts
+the rooms that wait before it draws anything (`0x4a8895` at
+`0x4a8b03`). Without that count, motive 13 of a person differed from
+the capture after tick 260. Snapshot format 16 keeps the room's mark
+and the animator's last step.
+
+**Compared with the original.** After every one of ticks 1 to 261, our
+state equals the fourth capture's in every field listed in
+`the_goth_house_first_tick_matches_the_original`, the people's
+animators, route contexts and paths, the doors' portal costs, and the
+`updates.jsonl` line. Only the fourth capture holds the portal costs.
+The second capture is equal after every tick it holds (to 240). The third
+is equal but for global 12 after ticks 1 and 2 (17 there, 0 here and in
+the second and fourth) and one local of object 18's seventh frame after
+ticks 210 and 220 (16104 there, 0 here and in the fourth). Both differ
+between the original's own runs.
+
+**Not verified.** That the route context's word `+0x74`, which the
+original leaves as the heap held it, is never read. That nothing
+outside the compared fields depends on the frame schedule within
+updates 1 and 2.
+
+**Stops.** Tick 262: object 21, at the end of its next path with object
+data word 9 clear (`0x58e8be`: a timer and a stopping clip). Person 21's
+person word 27 is 40 at the stop and 41 in the capture after the tick.
 
 ## Working rules
 

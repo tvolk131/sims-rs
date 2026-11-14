@@ -70,6 +70,10 @@ using `events.jsonl` (`dialog_show`) and a screenshot to tell when one is up:
 
 After that the household runs on its own.
 
+The notices can close without a press. In one run (2026-11-14) only the
+second notice was pressed; every notice and the Help System dialog still
+logged a `dialog_result`, and the run went on as the others did.
+
 Things to know:
 
 - **Presses are handled late.** The game takes a press about 20 seconds after
@@ -79,6 +83,11 @@ Things to know:
   there with lot 0. Those stops are only counted, as `entry_elsewhere`.
 - **How long it takes.** A full state takes 4–7 seconds to read. An update
   that is not saved takes well under a second.
+- **A state it cannot read stops the run.** The full state checks that
+  every object a retained list names is in the registry. When one is not
+  (`unknown retained spatial-order object identity`, seen at update 609
+  of a run), the capture logs an `error` event, detaches and ends; the
+  updates before it are kept.
 - **Stopping.** To end the capture, create the stop file. The capture then
   detaches, which resumes the game.
 - **Taking over a running capture.** Kill `capture.py` and its `docker exec`
@@ -110,7 +119,7 @@ Things to know:
 | --- | --- |
 | `entry-0000/` | The state at the entry of the first lot update on the lot. This is the state the load ends in, before tick 1. |
 | `update-NNNN/` | The state at the end of lot update N, for the updates in `--full`. |
-| `state.json.gz` | In both kinds of directory: the scheduler, the three random streams, the 64 globals, and every object with its frames (people with person data, motives and actions). |
+| `state.json.gz` | In both kinds of directory: the scheduler, the three random streams, the 64 globals, and every object with its frames (people with person data, motives and actions; doors, objects of type 8, with their portal costs as float bit patterns, `portal_bits`). |
 | `full-state.json.gz` | In both kinds of directory: the registry, the neighborhood, and the object and animator pointers. |
 | `pages.json.gz` | In both kinds of directory: the memory pages of the people and their animators. |
 | `updates.jsonl` | One line per lot update: the tick, whether it was a full pass, the three random streams and the scheduler cursor. |

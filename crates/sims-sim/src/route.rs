@@ -80,10 +80,13 @@ pub struct Context {
     /// +0x60, +0x64: the person's object +0xf4 and +0xf8 when the context
     /// was made; also saved and put back around each step.
     pub saved: [i32; 2],
-    /// +0x68.
+    /// +0x68: the door the route goes through, 0 for none. The original
+    /// holds a pointer to the door's object; this holds the object's ID.
     pub word_68: i32,
     /// +0x6c, +0x70, +0x74: where the person starts (+0xf4, +0xf8) and
-    /// a third word set to 0 (0x4832d4).
+    /// a third word set to 0 (0x4832d4). The constructor (0x48163e) sets
+    /// the first two to 0 and leaves the third as the heap held it,
+    /// which is 0 here.
     pub start: [i32; 3],
     /// Byte +0x78.
     pub byte_78: bool,
@@ -120,7 +123,9 @@ pub struct RouteSlot {
     pub flags: i32,
     /// +0x20.
     pub snap_target: i32,
-    /// +0x24, +0x28, +0x2c: the minimum, optimal and maximum proximity.
+    /// +0x24, +0x28, +0x2c: the least, greatest and best distance from
+    /// the object to stand at (the slot search, 0x483598, reads them in
+    /// that order).
     pub proximity: [i32; 3],
     /// +0x30, as a float's bits.
     pub gradient: u32,

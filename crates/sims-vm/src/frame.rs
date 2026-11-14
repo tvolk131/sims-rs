@@ -2,7 +2,11 @@
 //!
 //! Between two lot updates the game may draw the lot. The house view's
 //! draw (vtable function 0x3c, 0x4a8935, from `DDDSimsView::Draw()`,
-//! 0x4d1b37) rebuilds its list of objects to draw (0x4aacb9: every object
+//! 0x4d1b37) first counts the rooms that wait (0x4a8895 at 0x4a8b03,
+//! which calls 0x467094; [`Interpreter::update_pending_rooms`]). Every
+//! path through the draw reaches that call. The rest of 0x4a8895 updates
+//! the view's levels and its graphics, which is presentation. The draw
+//! then rebuilds its list of objects to draw (0x4aacb9: every object
 //! in registration order whose word +0x8e is 0, which is not kept here;
 //! the capture holds 0 there for every person) and then draws each
 //! (0x4a9262, 0x4ab56d). An object is drawn if its tile is inside the lot
@@ -81,10 +85,12 @@ const DEFINITION_LISTS: usize = 101;
 
 impl Interpreter<'_> {
     /// One frame of the house view, as far as it writes the simulation's
-    /// state (the module documentation): each person the view draws, in
-    /// registration order, has its animator drawn. `level` is the level
-    /// the view shows (1 for the ground).
+    /// state (the module documentation): the rooms that wait are counted,
+    /// then each person the view draws, in registration order, has its
+    /// animator drawn. `level` is the level the view shows (1 for the
+    /// ground).
     pub fn draw_frame(&self, world: &mut World, level: i8) -> Result<(), Fault> {
+        self.update_pending_rooms(world)?;
         let people: Vec<u16> = world
             .order
             .iter()

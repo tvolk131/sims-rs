@@ -439,6 +439,26 @@ fn a_person_takes_its_lasting_fields_from_its_neighborhood_record() {
     assert_eq!(after.data[29], 1);
     // A person is 6 wide.
     assert_eq!(after.footprint, [53, 53, 59, 59]);
+    // It notes the room it is in (0x45e43d). A person of kind above 1
+    // (person word 65) does not tell the room.
+    assert_eq!(fx.world.person_ticks[&PERSON].room, 1);
+    assert!(!fx.world.rooms.rooms[&1].occupied);
+}
+
+#[test]
+fn a_visiting_person_tells_its_indoor_room_it_is_occupied() {
+    let (mut fx, _) = lot();
+    let people = resident(&mut fx);
+    let sim = fx.world.objects.get_mut(&PERSON).unwrap();
+    sim.person.as_mut().unwrap().data[65] = 0;
+    if let Some(record) = fx.world.neighbors.slots[0].as_mut() {
+        record.data[65] = 0;
+    }
+    assert!(!fx.world.person_ticks.contains_key(&PERSON));
+    visit_with(&mut fx, PERSON, &people);
+    assert_eq!(fx.world.person_ticks[&PERSON].room, 1);
+    let room = &fx.world.rooms.rooms[&1];
+    assert!(!room.outdoors && room.occupied);
 }
 
 #[test]

@@ -714,14 +714,16 @@ fn a_rooms_score_is_rounded_after_every_operation() {
 const SCORE_13: u32 = 0x4071_3b10;
 
 #[test]
-fn a_dark_room_with_people_and_no_lights_is_not_ported() {
+fn a_dark_room_that_knows_someone_is_in_it_shows_the_light_of_one_with_a_lamp() {
+    let lit = F32::from_f32(0.8);
     let dark = Room {
         people: 1,
+        occupied: true,
         ..Room::default()
     };
-    assert_eq!(dark.shown_light(4), Err(RoomError::Occupancy(4)));
-    // A light, no people, enough light or a pool settles it.
-    let lit = F32::from_f32(0.8);
+    assert_eq!(dark.shown_light(), lit);
+    // A light, no people counted, enough light of its own, or not
+    // knowing anyone is in it: the room's own light. A pool is always lit.
     let cases = [
         (
             Room {
@@ -739,28 +741,84 @@ fn a_dark_room_with_people_and_no_lights_is_not_ported() {
         ),
         (
             Room {
-                light: lit,
-                ..dark.clone()
-            },
-            lit,
-        ),
-        (
-            Room {
-                pool: true,
-                ..dark.clone()
-            },
-            lit,
-        ),
-        // An outdoor room never knows who is in it.
-        (
-            Room {
-                outdoors: true,
+                occupied: false,
                 ..dark.clone()
             },
             F32::ZERO,
         ),
+        (
+            Room {
+                light: F32::from_f32(0.9),
+                ..dark.clone()
+            },
+            F32::from_f32(0.9),
+        ),
+        (
+            Room {
+                pool: true,
+                occupied: false,
+                ..dark.clone()
+            },
+            lit,
+        ),
+        // A light that is not a number counts as below 0.8.
+        (
+            Room {
+                light: F32::from_bits(0x7fc0_0000),
+                ..dark.clone()
+            },
+            lit,
+        ),
     ];
     for (room, shown) in cases {
-        assert_eq!(room.shown_light(4), Ok(shown));
+        assert_eq!(room.shown_light(), shown);
     }
+}
+
+#[test]
+fn a_person_entering_a_dark_room_marks_it_to_be_counted_again() {
+    let mut world = lot(10);
+    let room = |outdoors, lights, light| Room {
+        outdoors,
+        lights,
+        light,
+        ..Room::default()
+    };
+    world.rooms.rooms.insert(0, room(true, 0, F32::ZERO));
+    world.rooms.rooms.insert(1, room(false, 0, F32::ZERO));
+    world.rooms.rooms.insert(2, room(false, 1, F32::ZERO));
+    world
+        .rooms
+        .rooms
+        .insert(3, room(false, 0, F32::from_f32(0.8)));
+    world.rooms.rooms.insert(1024, room(false, 0, F32::ZERO));
+    // An outdoor room ignores it.
+    world.note_occupant(0, true);
+    assert!(!world.rooms.rooms[&0].occupied);
+    assert_eq!(world.rooms.pending, 0);
+    // A dark room without lights takes the mark, and its light changes:
+    // it is marked as not counted, and so is its level.
+    world.note_occupant(1, true);
+    assert!(world.rooms.rooms[&1].occupied && world.rooms.rooms[&1].dirty);
+    assert_eq!(world.rooms.pending, 1);
+    // A room with a light, or with enough light, takes the mark only.
+    world.note_occupant(2, true);
+    world.note_occupant(3, true);
+    for id in [2, 3] {
+        assert!(world.rooms.rooms[&id].occupied && !world.rooms.rooms[&id].dirty);
+    }
+    // Telling a room what it knows does nothing; leaving clears the mark.
+    world.rooms.rooms.get_mut(&1).unwrap().dirty = false;
+    world.note_occupant(1, true);
+    assert!(!world.rooms.rooms[&1].dirty);
+    world.note_occupant(1, false);
+    assert!(!world.rooms.rooms[&1].occupied && world.rooms.rooms[&1].dirty);
+    // The upper level's rooms wait on bit 1; a pool and a missing room
+    // ignore it.
+    world.note_occupant(1024, true);
+    assert_eq!(world.rooms.pending, 3);
+    world.rooms.rooms.get_mut(&3).unwrap().pool = true;
+    world.note_occupant(3, false);
+    assert!(world.rooms.rooms[&3].occupied);
+    world.note_occupant(77, true);
 }

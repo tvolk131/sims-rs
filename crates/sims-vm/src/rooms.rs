@@ -72,9 +72,6 @@ fn room_fault(error: RoomError) -> Fault {
     Fault {
         object: 0,
         at: None,
-        trap: match error {
-            RoomError::Occupancy(_) => Trap::Unsupported(error.to_string()),
-            _ => Trap::Invalid(error.to_string()),
-        },
+        trap: Trap::Invalid(error.to_string()),
     }
 }

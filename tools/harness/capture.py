@@ -152,6 +152,12 @@ class Memory:
                 queue=[self.action(p + 0x820 + (i & 7) * 0x44) for i in range(first, end)],
                 uses=[[self.object_id(self.word(q)), self.word(q + 4), self.byte(q + 8)] for q in range(uses, uses_end, 12)],
                 last_decay=self.word(p + 0x810), room=struct.unpack('<h', self.read(p + 0xafc, 2))[0])
+        if self.half(definition + 0x12) == 8:
+            # A door's portal costs (+0x1ac, a vector of floats, one column per
+            # number in object data word 6), as their bit patterns.
+            first, end = self.word(p + 0x1ac), self.word(p + 0x1b0)
+            assert end >= first and (end - first) % 4 == 0 and end - first <= 4096
+            value['portal_bits'] = self.words(first, (end - first) // 4)
         return value
 
     def crt(self, teb):

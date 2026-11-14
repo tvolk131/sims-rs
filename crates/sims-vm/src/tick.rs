@@ -371,10 +371,9 @@ impl Interpreter<'_> {
     ///    so when it put the person down). When it changes
     ///    a person whose kind (person word 65) is at most 1 leaves the old
     ///    room, if no other person was last seen there (0x46886c), and
-    ///    enters the new one (0x468802). An outdoor room ignores both.
-    ///    Entering or leaving an indoor room (its occupied mark, its light
-    ///    and signal 0xf1) is not ported and fails. The original then
-    ///    sends signal 0xf7 for the selected Sim (not modeled).
+    ///    enters the new one ([`World::note_occupant`], 0x468802). The
+    ///    original then sends signal 0xf7 for the selected Sim (not
+    ///    modeled).
     /// 5. Unless the room is still unknown (-5), motive 13 takes the
     ///    room's score (0x45cef4): the lot's outdoor score for an outdoor
     ///    room, the room's own score for an indoor one, 0 for a room that
@@ -544,19 +543,20 @@ impl Interpreter<'_> {
                     == state.room
             })
             .count();
-        for (old, new) in [(state.room, false), (room, true)] {
-            let exists = !(-5..=-1).contains(&old);
-            let indoors =
-                exists && world_room(&world.rooms.rooms, old).is_some_and(|room| !room.outdoors);
-            if kind <= 1 && indoors && (new || others == 0) {
-                return Err(Trap::Unsupported(format!(
-                    "a person {} indoor room {old} (0x468802), which is not ported",
-                    if new { "entering" } else { "leaving" }
-                )));
-            }
-        }
+        // A room word from -5 to -1 names no room and is not looked up
+        // (0x45e463, an unsigned compare with 0xfffb).
+        let named = |room: i16| !(-5..=-1).contains(&room);
+        let old = state.room;
         state.room = room;
         world.person_ticks.insert(id, state);
+        if kind <= 1 {
+            if named(old) && others == 0 {
+                world.note_occupant(old, false);
+            }
+            if named(room) {
+                world.note_occupant(room, true);
+            }
+        }
         Ok(())
     }
 

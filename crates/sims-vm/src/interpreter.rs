@@ -891,6 +891,12 @@ impl<'a> Machine<'a, '_> {
                         // The frame's next step finishes the primitive.
                         return Ok(Status::Running);
                     }
+                    if state != 0 && matches!(self.current()?.opcode, 27 | 45) {
+                        // A route that ran a door's tree goes on from the
+                        // step its frame holds (0x474daa: a frame with a
+                        // primitive state runs its instruction again).
+                        return Ok(Status::Running);
+                    }
                     if state != 0 {
                         // A primitive that ran a tree (Idle For Input, Run
                         // Functional Tree and others) resumes instead of

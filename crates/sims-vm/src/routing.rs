@@ -15,6 +15,7 @@
 //! ported; every other branch fails loudly.
 
 mod planner;
+pub(crate) mod portals;
 mod regions;
 mod rooms;
 mod search;

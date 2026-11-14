@@ -45,6 +45,7 @@ use std::collections::BTreeSet;
 
 mod find;
 pub(crate) use find::Rules;
+pub(crate) use find::{closed_directions, pool_tile};
 
 /// The side of the lot's arrays.
 const FULL: i32 = 64;
