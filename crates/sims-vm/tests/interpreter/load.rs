@@ -4,7 +4,7 @@
 use crate::factory::{WIDGET, widgets};
 use crate::support::*;
 use sims_formats::lot::Array;
-use sims_vm::{INDICATORS, Interpreter, Trap};
+use sims_vm::{INDICATORS, Interpreter, Reconciled, Trap};
 
 /// Adds a type with word 42 (the global word) set as given, whose Main
 /// sleeps and which has no Init.
@@ -31,6 +31,14 @@ fn lot() -> Fixture {
     fx
 }
 
+/// A reconciliation that created these IDs and removed nothing.
+fn created(ids: &[u16]) -> Reconciled {
+    Reconciled {
+        created: ids.to_vec(),
+        removed: Vec::new(),
+    }
+}
+
 fn guids(fx: &Fixture) -> Vec<u32> {
     fx.world
         .order
@@ -45,7 +53,7 @@ fn missing_controllers_are_created_in_catalog_order() {
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     assert_eq!(
         interpreter.reconcile_controllers(&mut fx.world),
-        Ok(vec![1, 2])
+        Ok(created(&[1, 2]))
     );
     // The registration list has the newest first.
     assert_eq!(guids(&fx), [0xA2, 0xA1]);
@@ -53,7 +61,10 @@ fn missing_controllers_are_created_in_catalog_order() {
     assert!(fx.world.objects.values().all(|o| o.countdown() == Some(19)));
     // Nothing is missing now.
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    assert_eq!(interpreter.reconcile_controllers(&mut fx.world), Ok(vec![]));
+    assert_eq!(
+        interpreter.reconcile_controllers(&mut fx.world),
+        Ok(created(&[]))
+    );
     assert_eq!(fx.world.objects.len(), 2);
 }
 
@@ -64,22 +75,197 @@ fn an_existing_controller_is_kept() {
     let existing = interpreter.create(&mut fx.world, 0xA2).unwrap();
     assert_eq!(
         interpreter.reconcile_controllers(&mut fx.world),
-        Ok(vec![2])
+        Ok(created(&[2]))
     );
     assert_eq!(guids(&fx), [0xA1, 0xA2]);
     assert_eq!(existing, 1);
 }
 
+/// The Reset tree the tests give controller 0xA1: it adds 1 to global 36
+/// and stores the object's ID in global 34.
+const RESET: u16 = 4300;
+
+fn give_reset(fx: &mut Fixture, guid: u32, body: Vec<sims_formats::behavior::Instruction>) {
+    let file = fx.catalog.object(guid).unwrap().resource;
+    let table = fx
+        .program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .callbacks
+        .get_mut(&128)
+        .unwrap();
+    table.resize(
+        4,
+        sims_formats::execution::ObjectFunction {
+            condition: 0,
+            action: 0,
+        },
+    );
+    table[3].action = RESET;
+    fx.add(file, RESET, tree(body));
+}
+
+fn counting_reset() -> Vec<sims_formats::behavior::Instruction> {
+    vec![
+        assign(scope::GLOBAL, 34, scope::MY_DATA, 11, 1),
+        ins(
+            2,
+            RETURN_TRUE,
+            RETURN_TRUE,
+            expr(scope::GLOBAL, 36, op::ADD, scope::LITERAL, 1),
+        ),
+    ]
+}
+
 #[test]
-fn duplicates_need_deletion_which_is_not_ported() {
+fn later_duplicates_are_removed_and_the_first_is_kept() {
+    let mut fx = lot();
+    give_reset(&mut fx, 0xA1, counting_reset());
+    (fx.world.globals[34], fx.world.globals[36]) = (0, 0);
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    // Three of 0xA1 around one of 0xA2. The registration list has the
+    // newest first: 4 (A1), 3 (A2), 2 (A1), 1 (A1).
+    for guid in [0xA1, 0xA1, 0xA2, 0xA1] {
+        interpreter.create(&mut fx.world, guid).unwrap();
+    }
+    fx.world.removals = vec![2];
+    let before = fx.world.clone();
+    assert_eq!(
+        interpreter.reconcile_controllers(&mut fx.world),
+        Ok(Reconciled {
+            created: vec![],
+            removed: vec![2, 1],
+        })
+    );
+    // The first in the registration list stays, and so does the other
+    // controller. Each removed duplicate ran its Reset tree, 1 last.
+    assert_eq!(fx.world.order, [4, 3]);
+    assert_eq!((fx.world.globals[34], fx.world.globals[36]), (1, 2));
+    for id in [3, 4] {
+        assert_eq!(fx.world.objects[&id].data, before.objects[&id].data);
+        assert_eq!(fx.world.objects[&id].stack.len(), 2, "still asleep");
+    }
+    // The removal queue holds bare IDs and is not this step's to edit.
+    assert_eq!(fx.world.removals, [2]);
+    // A second pass finds nothing to do.
+    let settled = fx.world.clone();
+    assert_eq!(
+        interpreter.reconcile_controllers(&mut fx.world),
+        Ok(created(&[]))
+    );
+    assert_eq!(fx.world.encode(), settled.encode());
+}
+
+#[test]
+fn a_duplicate_is_removed_before_the_next_controller_is_created() {
+    let mut fx = lot();
+    give_reset(&mut fx, 0xA1, counting_reset());
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    for _ in 0..2 {
+        interpreter.create(&mut fx.world, 0xA1).unwrap();
+    }
+    // 0xA1 comes before 0xA2 in the catalog, so its duplicate (ID 1) goes
+    // first and the new 0xA2 takes the freed ID.
+    assert_eq!(
+        interpreter.reconcile_controllers(&mut fx.world),
+        Ok(Reconciled {
+            created: vec![1],
+            removed: vec![1],
+        })
+    );
+    assert_eq!(guids(&fx), [0xA2, 0xA1]);
+    assert_eq!(fx.world.order, [1, 2]);
+}
+
+#[test]
+fn objects_that_are_not_controllers_are_never_duplicates() {
     let mut fx = lot();
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    interpreter.create(&mut fx.world, 0xA1).unwrap();
-    interpreter.create(&mut fx.world, 0xA1).unwrap();
-    let fault = interpreter
-        .reconcile_controllers(&mut fx.world)
-        .unwrap_err();
-    assert!(fault.to_string().contains("duplicates"), "{fault}");
+    // 0xA0 has no global word and 0xA3 is not of type 7 or 12.
+    for guid in [0xA0, 0xA0, 0xA3, 0xA3, WIDGET, WIDGET] {
+        interpreter.create(&mut fx.world, guid).unwrap();
+    }
+    assert_eq!(
+        interpreter.reconcile_controllers(&mut fx.world),
+        Ok(created(&[7, 8]))
+    );
+    assert_eq!(fx.world.objects.len(), 8);
+}
+
+#[test]
+fn duplicates_are_removed_on_a_lot_with_people_who_do_not_refer_to_them() {
+    let mut fx = lot();
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    for _ in 0..2 {
+        interpreter.create(&mut fx.world, 0xA1).unwrap();
+    }
+    fx.add_sim(9);
+    let sim = fx.world.objects[&9].clone();
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let done = interpreter.reconcile_controllers(&mut fx.world).unwrap();
+    assert_eq!((done.removed, done.created), (vec![1], vec![1]));
+    // The person is as it was.
+    let mut lot = fx.world.clone();
+    lot.objects.insert(9, sim);
+    assert_eq!(lot.encode(), fx.world.encode());
+}
+
+#[test]
+fn a_duplicate_a_person_refers_to_fails_and_changes_nothing() {
+    type Refer = fn(&mut sims_formats::saved_objects::Person);
+    let cases: [Refer; 6] = [
+        |p| p.active.target = 1,
+        |p| p.active.icon = 1,
+        |p| p.last.target = 1,
+        |p| {
+            let mut queued = p.last.clone();
+            queued.target = 1;
+            p.queue.push(queued);
+        },
+        |p| {
+            let mut queued = p.last.clone();
+            queued.icon = 1;
+            p.queue.push(queued);
+        },
+        |p| {
+            p.object_uses.push(sims_formats::saved_objects::ObjectUse {
+                target: 1,
+                stack_depth: 2,
+                unknown: 0,
+            });
+        },
+    ];
+    for refer in cases {
+        let mut fx = lot();
+        give_reset(&mut fx, 0xA1, counting_reset());
+        let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        for _ in 0..2 {
+            interpreter.create(&mut fx.world, 0xA1).unwrap();
+        }
+        refer(fx.add_sim(9).person.as_mut().unwrap());
+        let before = fx.world.clone();
+        let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        let fault = interpreter
+            .reconcile_controllers(&mut fx.world)
+            .unwrap_err();
+        assert!(matches!(fault.trap, Trap::Unsupported(_)), "{fault}");
+        assert!(fault.to_string().contains("person 9 refers"), "{fault}");
+        assert_eq!(fx.world.encode(), before.encode(), "nothing ran");
+        // A reference to the instance that is kept is no obstacle.
+        let person = fx.world.objects.get_mut(&9).unwrap().person.as_mut();
+        *person.unwrap() = person_referring_to(2);
+        let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        let done = interpreter.reconcile_controllers(&mut fx.world).unwrap();
+        assert_eq!(done.removed, [1]);
+    }
+}
+
+/// A person whose running action targets `id`.
+fn person_referring_to(id: i16) -> sims_formats::saved_objects::Person {
+    let mut person = person();
+    person.active.target = id;
+    person
 }
 
 #[test]
@@ -96,7 +282,10 @@ fn every_catalog_definition_must_be_linked() {
 
 fn resize(fx: &mut Fixture) -> Result<Vec<u16>, sims_vm::Fault> {
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    interpreter.resize(&mut fx.world)
+    interpreter.resize(&mut fx.world).map(|done| {
+        assert_eq!(done.removed, []);
+        done.created
+    })
 }
 
 #[test]

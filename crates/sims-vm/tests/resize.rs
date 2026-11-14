@@ -1,6 +1,7 @@
 //! The lot resize at the start of a load, the clear that follows it, the
-//! lot arrays, the type table and the saved objects, on a real install
-//! when `SIMS_INSTALL` names one.
+//! lot arrays, the type table, the saved objects, the controllers among
+//! them and the object grid, on a real install when `SIMS_INSTALL` names
+//! one.
 //! Game data is never committed, so CI skips this. The mechanics have
 //! synthetic tests in `tests/interpreter`.
 
@@ -51,7 +52,9 @@ fn with_goth_people(
     assert_eq!(interpreter.create_indicators(&mut world), Ok([1, 2]));
     world.read_simulator(&house.simulator);
     world.apply_context(context).unwrap();
-    let created = interpreter.resize(&mut world).unwrap();
+    let resized = interpreter.resize(&mut world).unwrap();
+    assert_eq!(resized.removed, []);
+    let created = resized.created;
     let guids = house.objects.instances.values().map(|o| o.guid);
     let people = People::load(&install, &index, &catalog, &neighborhood, guids).unwrap();
     then(&house, &interpreter, &mut world, &created, &people);
@@ -400,6 +403,130 @@ fn the_goth_house_objects_are_constructed_and_read() {
                 (world.global_rng, world.lot_rng),
                 (before.global_rng, before.lot_rng)
             );
+            assert_eq!(world.hash_hex(), PINNED);
+        },
+    );
+}
+
+/// Load steps 8 and 9: the lot-wide controllers are reconciled among the
+/// 245 saved objects, which creates the 137 the house did not save, and
+/// the ground level's object grid is checked, which clears nothing.
+///
+/// A trace of the original loading this house, taken by the old
+/// prototype's harness, stops when the function that does both (0x43fc02)
+/// returns. That stop was compared with this state outside the repository;
+/// the trace is private. What was equal, for all 382 objects: the ID and
+/// GUID, the 72 data words, the temps, the attributes and their number,
+/// the scheduler word, the last result, every frame's node, stack object,
+/// arguments, locals and saved primitive state, the relationships, the
+/// number of slots, the position, the tile and level bytes the grid check
+/// reads (they are the position divided by 16), and the mark of an object
+/// that asked to be removed without resets; and for the three people the
+/// 256 words of person data. Also equal: the registration order, the
+/// tick, the lot size, the 64 globals, both game random streams, the four
+/// IDs queued for removal, the scheduler cursor, the funds, the indicator
+/// references, the one instance list, and inside the lot's 52 tiles the
+/// terrain heights, both levels' floors, walls, object grid and flags, the
+/// pool and the water. The trace's stop before these steps differs from
+/// this one in the 137 new objects, the global random stream and the
+/// removal queue, and in nothing else it holds: no saved object and no
+/// grid cell changes there either.
+///
+/// The object ID in each slot was compared for the 216 objects whose slot
+/// memory the trace holds at this stop or the one before, and was equal.
+/// Those hold 30 of the 32 links between objects here.
+///
+/// One thing differed, as after the object read, and is still not
+/// explained: object 19's second frame has tree ID 0x8118 in the trace and
+/// 0x118 here.
+///
+/// The C runtime stream and six type attribute words belong to the game
+/// that was running. With those copied from the trace's state at the
+/// start of the load they were equal too.
+///
+/// Not compared with the original: removing a duplicate controller and
+/// clearing a grid cell, neither of which this house needs; the slots of
+/// the other 166 objects; every cell outside the 52 tiles; and what the
+/// test above lists as not held.
+///
+/// The digest is of our own state, as built here.
+#[test]
+fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
+    const PINNED: &str = "d014a3ce407d420fc6b69248f9e23282b0fdc348bac79afc5670629b60ed46b1";
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    with_goth_people(
+        std::path::Path::new(&root),
+        |house, interpreter, world, _, people| {
+            world.clear_family().unwrap();
+            interpreter.clear(world).unwrap();
+            world.read_arrays(&house.arrays, 62).unwrap();
+            world
+                .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+                .unwrap();
+            interpreter.read_types(world, &house.types).unwrap();
+            interpreter.clear(world).unwrap();
+            interpreter
+                .read_objects(world, &house.objects, people)
+                .unwrap();
+            let before = world.clone();
+            // Step 8.
+            let done = interpreter.reconcile_controllers(world).unwrap();
+            assert_eq!(done.removed, []);
+            assert_eq!(done.created.len(), 137);
+            // New objects take the lowest unused IDs, so the first four
+            // fill the gaps the house left.
+            assert_eq!(done.created[..5], [4, 15, 76, 77, 247]);
+            assert_eq!(done.created[136], 382);
+            // Each goes to the head of the registration list.
+            let mut order: Vec<u16> = done.created.iter().rev().copied().collect();
+            order.extend(&before.order);
+            assert_eq!(world.order, order);
+            // The four controllers the house saved are kept as they are,
+            // and so is every other saved object.
+            let controllers = interpreter
+                .catalog
+                .objects
+                .iter()
+                .filter(|d| {
+                    let words = interpreter.program.definition(d.resource, d.chunk).unwrap();
+                    matches!(words[9], 7 | 12) && words[42] != 0
+                })
+                .count();
+            assert_eq!(controllers, 141);
+            for (id, saved) in &before.objects {
+                assert_eq!(format!("{:?}", world.objects[id]), format!("{saved:?}"));
+            }
+            // Two of the new controllers ask to be removed, as two did
+            // after the resize. The two older requests are still queued,
+            // and their IDs now name saved objects.
+            assert_eq!(before.removals, [42, 44]);
+            assert_eq!(world.removals, [42, 44, 278, 280]);
+            for id in [42, 44, 278, 280] {
+                assert_eq!(world.objects[&id].removal_skips_resets, id > 44);
+            }
+            assert_ne!(world.global_rng, before.global_rng);
+            assert_eq!(
+                (world.lot_rng, world.crt_rng),
+                (before.lot_rng, before.crt_rng)
+            );
+            assert_eq!(world.globals, before.globals);
+            assert_eq!(world.type_attributes, before.type_attributes);
+            assert_eq!(world.arrays, before.arrays);
+            // Step 9. The saved grid names objects that are elsewhere only
+            // outside the lot's 52 tiles, where the original does not
+            // look: scanning all 64 would clear eight cells.
+            let reconciled = world.clone();
+            assert_eq!(world.repair_grid(), Ok(vec![]));
+            assert_eq!(world.encode(), reconciled.encode());
+            let mut whole = world.clone();
+            whole.size = 64;
+            let outside = whole.repair_grid().unwrap();
+            assert_eq!(outside.len(), 8);
+            assert!(outside.iter().all(|r| r.tile[0] >= 52 || r.tile[1] >= 52));
+            assert_eq!(world.objects.len(), 382);
             assert_eq!(world.hash_hex(), PINNED);
         },
     );
