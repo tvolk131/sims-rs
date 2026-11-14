@@ -857,13 +857,11 @@ impl Interpreter<'_> {
 
     /// What the interface does when an object comes onto the lot from
     /// outside (0x44752e). If the lot has no indicator objects yet it
-    /// creates them ([`Interpreter::create_indicators`], 0x445e4a). For a
+    /// creates them ([`Interpreter::ensure_indicators`], 0x445e4a). For a
     /// person the original then moves the indicators to the selected Sim,
     /// which is not ported and fails.
     fn placed_from_outside(&self, world: &mut World, id: u16) -> Result<(), Fault> {
-        if world.indicators[0] == 0 {
-            self.create_indicators(world)?;
-        }
+        self.ensure_indicators(world)?;
         if world.objects.get(&id).is_some_and(|o| o.person.is_some()) {
             return Err(Fault {
                 object: id,

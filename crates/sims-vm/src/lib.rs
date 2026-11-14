@@ -22,7 +22,9 @@
 //! [`Interpreter::visit_objects`] and [`Interpreter::create_indicators`]
 //! are the lot load's steps that run scripts or need the linked code.
 //! Visiting an object can rebuild it, which takes it off its tile and
-//! puts it back (`placement.rs`).
+//! puts it back (`placement.rs`). Visiting a person gives it the fields
+//! its neighborhood record keeps and resets it in its own way
+//! (`people.rs`).
 
 mod error;
 mod factory;
@@ -31,6 +33,7 @@ mod interpreter;
 mod load;
 mod memory;
 mod objects;
+mod people;
 mod placement;
 mod primitives;
 mod program;
@@ -44,6 +47,7 @@ pub use interpreter::{Asked, Interpreter, MAX_STACK, Status, Stream};
 pub use load::{INDICATORS, Reconciled, Roomed};
 pub use memory::scope_name;
 pub use objects::SavedRead;
+pub use people::{curve_table, persistent_fields, reload_profile};
 pub use primitives::primitive_name;
 pub use program::{Callback, DEFINITION_WORDS, Library, Program, Tree};
 pub use visits::Visited;

@@ -287,7 +287,9 @@ impl Interpreter<'_> {
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
         if object.person.is_some() {
             return Err(fail(Trap::Unsupported(
-                "a person's reset is not ported".into(),
+                "a person resets in its own way (Interpreter::reset_person); this is an \
+                 object's reset"
+                    .into(),
             )));
         }
         if self.has_function(world, id, RESET) {

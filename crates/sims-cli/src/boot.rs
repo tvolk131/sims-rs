@@ -138,6 +138,17 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     // before it left it.
     let to_visit = world.order.len();
     let visited = interpreter.visit_objects(&mut world, &people);
+    // 14: the indicators are created if no visit made them. 15: the end
+    // of the household selection, which has nothing to do on a lot whose
+    // people are all members of the household. 16: the loaded house is
+    // announced, which asks for the indicators once more.
+    let mut finished = None;
+    if visited.stopped.is_none() {
+        let made = interpreter.ensure_indicators(&mut world)?.is_some();
+        world.finish_selection(record.flags)?;
+        let made_again = interpreter.ensure_indicators(&mut world)?.is_some();
+        finished = Some(made || made_again);
+    }
     if let Some(path) = options.snapshot {
         Snapshots::open(path)?.save("boot", &world)?;
     }
@@ -238,7 +249,17 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
         None => {
             let _ = writeln!(
                 out,
-                "         stopped before the indicators are created (step 14, not implemented yet)"
+                "         indicators {}; household selection finished; house announced",
+                if finished == Some(true) {
+                    "created"
+                } else {
+                    "already on the lot"
+                }
+            );
+            let _ = writeln!(
+                out,
+                "         stopped before the game selects a Sim and goes to live mode (step 17, \
+                 not implemented yet)"
             );
         }
     }

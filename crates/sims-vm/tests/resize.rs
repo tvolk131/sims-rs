@@ -1,7 +1,7 @@
 //! The lot resize at the start of a load, the clear that follows it, the
 //! lot arrays, the type table, the saved objects, the controllers among
-//! them, the object grid, the rooms and the household, on a real install
-//! when `SIMS_INSTALL` names one.
+//! them, the object grid, the rooms, the household and the object visits,
+//! on a real install when `SIMS_INSTALL` names one.
 //! Game data is never committed, so CI skips this. The mechanics have
 //! synthetic tests in `tests/interpreter`.
 
@@ -869,90 +869,126 @@ fn selected(root: &std::path::Path, then: impl FnOnce(&Interpreter, &mut World, 
     });
 }
 
-/// Load step 13 on the Goth house: the original visits all 382 objects in
-/// registration order. Here the first 201 visits run, and the step stops
-/// at visit 202, the first person's, which is not ported.
+/// Load steps 13 to 16 on the Goth house: the original visits all 382
+/// objects in registration order, asks for the indicators, finishes the
+/// household selection and announces the house. All of it runs here.
 ///
 /// A trace of the original loading this house, taken by the old
 /// prototype's harness, was compared with this run outside the
-/// repository; the trace is private. It holds a full state only at the
-/// step's entry, at the entry and the return of the indicators' creation
-/// (0x445e4a) in the middle of visit 140, and at the step's return. For
-/// every visit it holds each call of "run this object's function"
-/// (0x422d46).
+/// repository; the trace is private. It holds a full state at the step's
+/// entry, at the entry and the return of the indicators' creation
+/// (0x445e4a) in the middle of visit 140 and again after the last visit,
+/// at the step's return, at the return of the lighting update (0x4c4648)
+/// that ends the household selection, and at the return of the
+/// indicators' creation called when the house is announced. For every
+/// visit it holds each call of "run this object's function" (0x422d46).
 ///
 /// Equal to the trace:
 ///
-/// - For each of the 201 visits: the object visited, and the calls of
-///   0x422d46 the visit makes, as object and function, in order (525
-///   calls).
+/// - For each of the 382 visits: the object visited, and the calls of
+///   0x422d46 the visit makes, as object and function, in order (1,781
+///   calls). The three people (visits 202 to 204) are asked functions 3
+///   and 0 and nothing else.
 /// - In the middle of visit 140, at the moment the visit creates the
-///   indicators: for all 382 objects the GUID, the 72 data words, temps,
-///   attributes, scheduler word, last result, every frame's tree, node,
-///   stack object, parameters, locals and saved primitive state, the
-///   relationships, the number of slots, the position and the
-///   removal-without-resets mark, and the three people's data; the tick,
-///   the 64 globals, the three random streams, the funds, the removal
-///   queue, the registration order, the instance lists, which rooms wait
-///   to be counted, and the lot arrays inside the lot's size (terrain,
-///   floors, walls, object grids, tile flags, pool, water).
-/// - When the indicators' creation returns: the same, with the two new
-///   indicators, but for object 246, whose visit is not over then, and
-///   the global random stream, which the rest of that visit draws from.
-/// - After visit 201, against the trace at the step's return: the same
-///   object fields for the 201 objects visited and the 4 created (the two
-///   indicators and two objects a script creates). 17 of them differ from
-///   the trace only in their link words (data words 14 and 26), and each
-///   of those is linked there behind an object that is visited later:
-///   that object's rebuild puts it back in front.
+///   indicators, and when that creation returns: see the list below, with
+///   the exceptions the decision log gives.
+/// - At the step's return, and at each of the three later stops: for all
+///   386 objects the GUID, the 72 data words, temps, attributes,
+///   scheduler word, last result, every frame's tree, node, stack object,
+///   parameters, locals and saved primitive state, the relationships, the
+///   number of slots, the position and the removal-without-resets mark;
+///   for the three people the 256 person data words, the 16 motives and
+///   the 16 previous motives bit for bit, the running and the last action,
+///   the queued actions and the number of objects in use; the tick, the 64
+///   globals, the three random streams, the funds, the removal queue, the
+///   indicator references, the registration order, the instance lists,
+///   which rooms wait to be counted, and the lot arrays inside the lot's
+///   size (terrain, floors, walls, object grids, tile flags, pool,
+///   water). The trace changes none of this between the step's return and
+///   the last of those stops, and neither do steps 14 to 16 here.
 ///
 /// What differed: object 19's second frame has tree 0x8118 in the trace
-/// and 0x118 here and in the house file, as in the tests above, at the
-/// two stops of visit 140. Object 19 is visited after visit 201. Six
-/// type attribute words belong to the game that was running, and were
-/// equal once copied from the trace's start. The C runtime stream is
-/// equal as built here: the trace's stream starts the load 64 draws on
-/// from its initial state, which is the starting lot's two indicators.
+/// and 0x118 here and in the house file at the two stops of visit 140, as
+/// in the tests above. Its visit is number 206. It makes the same calls
+/// here as in the trace, and at the step's return the object is equal in
+/// every field compared: the reset replaced its thread. Six type attribute
+/// words belong to the game that was running, and were equal once copied
+/// from the trace's start.
 ///
-/// Not compared with the original, because the trace has no state
-/// between visit 140 and the step's return: the global random stream, the
-/// globals, the arrays, the removal queue and which rooms wait to be
-/// counted after visits 141 to 201, and the contents of the objects'
-/// slots and frame storage at any time (the trace holds neither; the
-/// frames' locals, which come out of the frame storage, are compared).
-/// Visits 202 to 382 do not run.
+/// Not compared with the original, because the trace does not hold it:
+/// the contents of the objects' slots and frame storage (the link words,
+/// the object grids and the frames' locals, which mirror them, are
+/// compared); a person's motive changes in progress, of which this house
+/// has none; and the state between two visits after visit 140. Of a
+/// person's reset the trace shows the restarted thread and what the Reset
+/// and Init trees write. The words the reset clears or reloads already
+/// hold those values in this house, so the trace shows them unchanged
+/// and cannot show them being written. The same goes for the fields a
+/// person takes from its neighborhood record, except words 46 to 55,
+/// which do change, and to the trace's values.
 ///
-/// The digest is of our own state, as built here.
+/// The digests are of our own state, as built here. The first is the
+/// state after visit 201, pinned when the step stopped there.
 #[test]
-fn the_goth_house_objects_are_visited_up_to_the_first_person() {
-    const VISITED: &str = "13ae49d59cfa5cc946e9b9522b2e7e8634ec060af08d3df31eadd566057d5717";
+fn the_goth_house_objects_are_all_visited() {
+    const VISIT_201: &str = "13ae49d59cfa5cc946e9b9522b2e7e8634ec060af08d3df31eadd566057d5717";
+    const VISITED: &str = "3986e39715b51dfe7d82f23d7644fc654fe1634c6e1b3e88da7aa891f0e5d73c";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
     };
-    selected(std::path::Path::new(&root), |interpreter, world, people| {
+    let root = std::path::Path::new(&root);
+    let install = Install::detect(root).unwrap();
+    let neighborhood = Neighborhood::open(&install.file("UserData").unwrap()).unwrap();
+    let flags = neighborhood.family_in(5).unwrap().1.flags;
+    selected(root, |interpreter, world, people| {
         let asked = std::cell::RefCell::new(Vec::new());
         let mut interpreter = *interpreter;
         interpreter.asked = Some(&asked);
         let before = world.clone();
+        // The first 201 visits, one at a time: the state pinned earlier.
+        let mut early = world.clone();
+        for &id in &before.order[..201] {
+            interpreter.visit(&mut early, id, people).unwrap();
+        }
+        assert_eq!(early.hash_hex(), VISIT_201);
+        asked.borrow_mut().clear();
         let done = interpreter.visit_objects(world, people);
-        assert_eq!(done.objects, before.order[..201]);
-        assert_eq!(done.reset.len(), 38);
-        let fault = done.stopped.unwrap();
-        assert_eq!(fault.object, 21);
-        assert!(before.objects[&21].person.is_some());
-        assert_eq!(
-            fault.to_string(),
-            "object 21: unsupported: the visit of a person is not ported"
-        );
-        // The calls of each function: Init, Load, walls changed, placed
-        // and leaving. The failed visit asked nothing.
+        assert_eq!(done.stopped, None);
+        assert_eq!(done.objects, before.order);
+        assert_eq!(done.reset.len(), 184);
+        // The calls of each function: Init, Load, Reset, walls changed,
+        // placed and leaving.
         let mut calls = std::collections::BTreeMap::new();
         for call in asked.borrow().iter() {
             *calls.entry(call.function).or_insert(0) += 1;
         }
         let calls: Vec<(usize, i32)> = calls.into_iter().collect();
-        assert_eq!(calls, [(0, 128), (2, 201), (6, 4), (9, 106), (10, 86)]);
+        assert_eq!(
+            calls,
+            [(0, 578), (2, 379), (3, 26), (6, 4), (9, 404), (10, 390)]
+        );
+        // The people are visits 202 to 204. Each is asked Reset and Init.
+        assert_eq!(before.order[201..204], [21, 18, 16]);
+        for id in [21, 18, 16] {
+            let mine: Vec<usize> = asked
+                .borrow()
+                .iter()
+                .filter(|call| call.object == id)
+                .map(|call| call.function)
+                .collect();
+            assert_eq!(mine, [3, 0]);
+            let person = world.objects[&id].person.as_ref().unwrap();
+            let old = before.objects[&id].person.as_ref().unwrap();
+            // Interests come from the neighborhood record.
+            assert_ne!(person.data[46..54], old.data[46..54]);
+            assert_eq!(person.data[..46], old.data[..46]);
+            // The age, skin tone and gender read from the type's body
+            // strings are the ones the house saved.
+            assert_eq!(person.data[56..], old.data[56..]);
+            assert!(people.profiles[&world.objects[&id].guid].tones.len() > 1);
+            assert_eq!(world.objects[&id].stack.len(), 1);
+        }
         // Visit 140 put the first rebuilt object back on the lot, which
         // made the two indicators. A script made two more objects. All
         // four went to the head of the registration list.
@@ -965,8 +1001,23 @@ fn the_goth_house_objects_are_visited_up_to_the_first_person() {
         // The magic controller was looked up for the selected family.
         assert_eq!(world.instances[&0xb6c9_0029], [376]);
         assert_eq!((before.globals[36], world.globals[36]), (0, 1));
+        // Eight of the eleven rooms wait to be counted again.
+        let waiting: Vec<i16> = world
+            .rooms
+            .rooms
+            .iter()
+            .filter(|(_, room)| room.dirty)
+            .map(|(&id, _)| id)
+            .collect();
+        assert_eq!(waiting, [0, 1, 2, 3, 4, 1024, 1025, 1026]);
         // Nothing here advances the clock or touches the lot's stream.
         assert_eq!((world.ticks, world.lot_rng), (before.ticks, before.lot_rng));
+        assert_ne!(world.global_rng, before.global_rng);
+        assert_eq!(world.hash_hex(), VISITED);
+        // Steps 14 to 16 change nothing on this lot.
+        assert_eq!(interpreter.ensure_indicators(world), Ok(None));
+        world.finish_selection(flags).unwrap();
+        assert_eq!(interpreter.ensure_indicators(world), Ok(None));
         assert_eq!(world.hash_hex(), VISITED);
     });
 }
