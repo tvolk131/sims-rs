@@ -22,7 +22,7 @@ pub mod ui_graphics;
 pub use animations::{Animations, Channel, Clip, Event, Track};
 pub use catalog::{Catalog, Object};
 pub use error::Error;
-pub use index::{Index, Member, Resource};
+pub use index::{Index, Member, Resource, far_members};
 pub use install::{Expansions, Install, Layout, Mount};
 pub use neighborhood::{House, Neighborhood};
 pub use people::{Bone, People, Profile, Skeleton};

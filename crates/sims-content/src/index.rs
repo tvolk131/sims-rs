@@ -425,7 +425,7 @@ pub(crate) fn all_far_members(path: &Path) -> Result<Vec<Member>> {
 /// is unverified: the game's own archives hold none. A member whose name
 /// is longer than [`MAX_MEMBER_NAME`] or holds more than
 /// [`MAX_MEMBER_DEPTH`] directories is left out too.
-pub(crate) fn far_members(path: &Path) -> Result<(Vec<Member>, Vec<String>)> {
+pub fn far_members(path: &Path) -> Result<(Vec<Member>, Vec<String>)> {
     let (members, skipped) = archive_members(path)?;
     Ok((
         members.into_iter().map(|(member, _)| member).collect(),
