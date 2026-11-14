@@ -1375,11 +1375,12 @@ stop-sounds events.
   and every event definition in the install (4,494, module by module)
   runs without a bad or unported instruction. Sequence groups and fades
   follow the original's code. Scripts cannot hang or exhaust the player.
-  The `render_event` example writes events to a WAV file.
+  Volume, pan, pitch and ducking follow the original's formulas, and
+  the output is stereo. The `render_event` example writes events to a
+  WAV file.
 - **Next:**
   - The simulation emits `SoundEvent`s (the interface is in the
     decisions log).
-  - Volume, pan and pitch.
   - The 190 events of other kinds (music modes, TV, sequenced hit
     lists).
   - The FSC ambient player.
@@ -1404,10 +1405,13 @@ Progress:
   push of Sit on bench 173 for person 21 was recorded before lot update
   178. The full state after update 200 holds it as person 21's active
   action.
-- Next: build and buy mode (the mode switch, the catalog and placing an
-  object, confirmed by the new object and the budget), then a replay of
-  the recorded push in our simulation. The replay needs a way to queue an
-  action on a person before a tick.
+- Done: buy mode. From a fresh boot, a scenario entered buy mode (mode 2,
+  read at update 174), took the $80 chair from Seating, put it on the lawn,
+  and went back to live mode (mode 0 at update 1078). The new object (ID
+  262) and the budget's fall from 2542 to 2462 were read at update 878.
+- Next: build mode (its mode number), and a replay of the recorded push and
+  the purchase in our simulation. The replay needs a way to queue an
+  action on a person, and to place a bought object, before a tick.
 
 ## Working rules
 
