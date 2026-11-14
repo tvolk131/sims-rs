@@ -51,7 +51,7 @@ Each step is a few PRs, and each PR leaves `main` green.
 - Step 3 is in progress. The interpreter runs saved frames, creates
   objects through the original's factory, and puts them to sleep. The load
   sequence below tracks the load steps that must run before the first
-  tick; `sims boot` runs them through step 9.
+  tick; `sims boot` runs them through step 12.
 
 ### Load sequence
 
@@ -62,8 +62,8 @@ changes the state the first tick sees.
 
 The order and the addresses come from the old prototype's research on the
 1.91 executable. Each step was checked there on its own, against the
-original's code run in isolation. Steps 1 to 6, 8 and 9 are also checked
-against captures of the running original (see steps 3, 5, 6, 8 and 9), and
+original's code run in isolation. Steps 1 to 6 and 8 to 12 are also
+checked against captures of the running original (see each step), and
 three results of step 7 are (see step 7). The rest of the sequence has not
 been compared with a running game, so it is **unverified** until it is
 ported and compared.
@@ -89,15 +89,17 @@ That starting lot is **unverified**; see the decision log.
 | 6e | Construct the house's objects on the cleared lot and read their saved fields | `0x449c5e`, `0x43fe0a` | Done (`Interpreter::read_objects`); a person's graphics only as far as they draw random numbers |
 | 8 | Reconcile the lot-wide controllers among the saved objects | `0x43fc02`, `0x442b9f` | Done (`Interpreter::reconcile_controllers`); removing a duplicate only if it is off the lot and no person refers to it |
 | 9 | Repair the ground level's object grid | `0x443cb3` | Done (`World::repair_grid`) |
-| 10 | Give every object its room | `0x442659` | Not started; needs the lot's rooms |
-| 11 | Discard pending removals | `0x428679` | State change done (`World::discard_removals`), not called yet |
-| 12 | Select the household | `0x428041`, `0x46d8dc` | State change done (`World::select_family`), not called yet |
-| 13 | Visit every object in registration order | `0x43fc94`, `0x431e2e` | Not started |
+| 9a | Work out the lot's rooms from its walls | `0x479d9a` | Done (`World::rebuild_rooms`); not two crossing diagonal walls in one tile |
+| 10 | Give every object its room and ask its function 7 | `0x442659`, `0x433bc5` | Done (`Interpreter::assign_rooms`); a person's room is not told it is occupied |
+| 10a | Count the rooms | `0x467094`, `0x466c3c`, `0x467bb1` | Done for the walls and floors (`World::update_rooms`); the objects' share, light and scores are not modeled |
+| 11 | Discard pending removals | `0x428679` | Done (`World::discard_removals`) |
+| 12 | Select the household | `0x428041`, `0x46d8dc` | Done (`World::select_family`) |
+| 13 | Visit every object in registration order | `0x43fc94`, `0x431e2e` | Not started; see below for what it needs |
 | 14 | Create the indicator objects and finish selection | `0x445e4a` | Creation done (`Interpreter::create_indicators`), used only for the starting lot |
 
 `sims boot` runs the steps in order and stops at the first one that is not
 done, so it never prints the hash of a state the original could not be in.
-Today it stops after step 9.
+Today it stops after step 12.
 
 #### The steps
 
@@ -145,8 +147,9 @@ what was compared.
 
 Only this case is ported: a bare lot, shrinking, with every object off the
 lot. Growing a lot, a lot with walls or floors, and objects standing on the
-lot all fail with an error that says so. The rooms themselves are not
-modeled.
+lot all fail with an error that says so. The bare lot's rooms are not
+built: the lot has no rooms until step 9a works them out. In the trace the
+bare lot has two, one for each level.
 
 **4. Family.** Global 9 is cleared. It is set again in step 12.
 
@@ -212,7 +215,15 @@ original taken after both. The house's maps are empty and none of its
 cells holds an ID the renumbering covers, so 6b changes nothing. Inside
 the lot's 52 tiles the capture's terrain heights, floors, walls, object
 grid, flags, pool and water equal ours. The capture does not hold arrays
-4, 6 and 7, or any cell outside the 52 tiles; those are **unverified**.
+4, 6 and 7, which are **unverified**. It does not hold the cells outside
+the 52 tiles either. Those were compared later with the memory a trace
+holds at the start of step 10: every such cell it holds equals ours, which
+is all of them for the walls, the flags, the ground level's object grid,
+the pool and the water. That comparison found one thing wrong. The ground
+level's wall cells outside the lot's size are not zero in the original.
+They hold a bare lot's cell (no segments, flags 0x0f, both styles 1),
+which the held lot had before the load. A lot here has no arrays before
+the load, so `World::read_arrays` now puts that cell there.
 The gated test `the_goth_house_arrays_are_read_and_nothing_is_renumbered`
 pins our arrays and says what was compared.
 
@@ -324,27 +335,112 @@ objects it holds), and the object read of step 6e already filled them. A
 controller created in step 8 has empty slots. The capture agrees for the
 objects whose slots it holds.
 
-**10. Rooms.** Two passes over the registration list. The first writes each
-object's room into data word 29, turning level 0 into level 1. The second
-runs each object's function 7.
+**9a. Rooms.** The original works the lot's rooms out from its walls
+whenever its architecture may have changed. In a load that is here: after
+the objects are read and the controllers reconciled, the loader announces
+that the lot changed, and the lot answers by rebuilding its rooms.
 
-Not ported: it needs the lot's rooms, which are worked out from the walls.
-What the capture of the Goth load shows of this step, for whoever ports
-it: the lot's rooms are built between the end of step 9 and the start of
-this step, 11 of them where the lot had 2. During the step no data word of
-any object changes, so every room the first pass writes is the one the
-house saved. Function 7 is asked of all 382 objects in registration
-order. The last result of 62 of them changes, and none of the other
-fields step 8 compares. After the step and before step 11, global 27 (the
-lot's indoor area) goes from 0 to 204.
+A room is a set of tiles that connect without crossing a wall. The tiles
+inside the lot's size are scanned column by column, and a tile no room has
+taken starts a new room, which spreads to its neighbours depth first. Only
+the wall bits count, not the wall styles, so a fence divides rooms. A
+diagonal wall cuts its tile into two triangles that may be in two rooms;
+the map then marks the tile as split (-5). Upstairs a floor and a hole are
+different rooms, and on the ground the edge of a pool divides rooms. The
+ground level's rooms are numbered from 0 and the upper level's from 1024.
+Each room keeps the list of its tiles in the order it reached them, and a
+tile reached again while it waits is listed again. The original counts
+with that list, repeats included, so it is kept as it is.
+
+The same function rebuilds the tile flags. Every cell keeps only bits 8
+and 0x20. A flood from the lot's corner marks the tiles outside every
+enclosure; a wall of a fence style does not stop it. Then each level tile
+inside the lot's border is marked as one that can be built on, upstairs
+only where something below supports it. A room is outdoors if its first
+whole tile is outside every enclosure. A room made only of triangles is
+outdoors if it lists exactly one tile.
+
+For the Goth house the result is checked against the trace at the entry of
+step 10: 11 rooms where the bare lot had 2, with the same IDs and the same
+number of listed tiles; the same listed tiles in the same order for the 8
+rooms whose tile memory the trace holds; the same room for every tile of
+the upper level in the 32 columns the trace holds; the same number of
+split tiles (7); and the same tile flags in every cell of both levels. The
+room of every tile of both levels was compared with the trace's memory at
+the end of the load and was equal. Whether each room is outdoors was
+compared at the entry of step 11, by when the original has worked it out
+for all 11. An empty lot of 52 tiles partitions here into two rooms that
+list 5,307 tiles each, as the trace's two rooms before the rebuild do.
+
+Not ported, and failing with an error that says so: two diagonal walls
+crossing in one tile, a wall that its neighbour does not mirror, an
+enclosing diagonal wall on the border of the arrays, and more than 1,024
+rooms on a level. Not modeled: two booleans about the upper level, the
+roofs, and the redrawing.
+
+**10. Rooms of objects.** When the rooms have been rebuilt, the object
+registry runs two passes over the registration list. The first puts an
+object whose level is 0 on level 1 and writes the room it stands in into
+its data word 29. The second runs each object's function 7 tree, as a
+callback on top of the object's thread.
+
+The room of an object is the room of its tile. A tile on the lot's
+outermost ring, or off the lot, is no room (-5). On a split tile the
+original does not look up the triangle the object is in. It takes the room
+of the next tile over, on the object's side of the diagonal.
+
+In the Goth house 62 objects have a function 7 tree: the doors and the
+windows. Each asks whether the room on its far side is outdoors and sets
+how much light it lets in. Reading that is the one thing these trees need
+that earlier steps did not: what a script can read about a room (whether
+it is outdoors, its level, its area).
+
+Checked against the trace at the return of step 10. The trace asks
+function 7 of all 382 objects in registration order, and touches the
+thread of the same 62 objects, in the same order, as have a tree here. No
+data word changes in the trace, and none here: every room worked out here
+is the room the house saved. All 382 objects, the globals, the random
+streams and the arrays are equal afterwards. None of the house's objects
+stands on a split tile, so that rule is **unverified** against the running
+game; it follows the old prototype, which compared it with the original's
+code run alone.
+
+Not modeled: the first pass also tells the room a person stands in that
+it is occupied, which lights it.
+
+**10a. Room count.** After step 10 and before step 11 the original updates
+its rooms. For each room not yet counted it adds up the listed tiles: two
+half tiles for a tile, or one for a tile with a diagonal wall in an indoor
+room; how many of them have a floor covering; and how many walls can take
+a covering and how many have one. Global 27, the lot's indoor area, is the
+sum over the indoor rooms of the half tiles divided by 2. For the Goth
+house the four counts of all 11 rooms and global 27 (204) equal the
+trace's at the entry of step 11.
+
+The original's update does more for each room: it adds what the objects
+in the room contribute, works out the room's light and score and the
+lot's outdoor score, and lights the tiles. None of that is modeled. In the
+trace this update changes no object, no random stream and no global but
+27.
 
 **11. Removals.** The queue of objects waiting to be removed is emptied.
-The objects stay. In the capture the queue holds four IDs before and none
-after, and no object changes.
+The objects stay. In the trace the queue holds four IDs before and none
+after, and nothing else it holds changes; the same is true here, and the
+state before and after equals the trace's.
 
-**12. Household.** Global 9 takes the family number, global 10 the house
+**12. Household.** Global 9 takes the family's ID, global 10 the house
 number, and the family's money becomes the lot's funds, split across
-globals 13 and 14.
+globals 13 and 14. The family's ID is the ID of its record in the
+neighborhood file, not the number inside the record: the Goths are family
+5 and their record says 6. The family also becomes the one the game has
+selected, which gives the lot its magic history.
+
+Checked against the trace when the funds setter returns: global 9 goes
+from 0 to 5, global 13 and the funds from 2,515 to 2,542, the selected
+family's ID is 5 and its six magic words are zero, and everything else
+compared in step 10 is unchanged and equal. The house saved its own number
+in global 10, so the trace does not show that write. A lot with no family
+and a family record older than version 9 are **unverified**.
 
 **13. Object visits.** For each object, in registration order:
 
@@ -366,6 +462,30 @@ globals 13 and 14.
 
 Lot time does not advance, and no object's saved Main runs, during any of
 this.
+
+Not ported. What the trace of the Goth load shows of this step, and what
+a trial run of the Load trees here stopped at, for whoever ports it:
+
+- The original asks function 2 of every object that is not a person, 379
+  in all. For 191 objects that is the only thing it asks. 126 of the 379
+  have a Load tree.
+- 184 objects have a changed type. The 3 people and 23 others have a
+  Reset tree. The other 158 are reset the long way: taken off the lot,
+  storage reset, Init run, put back. In the trace that asks function 10
+  (leaving) and then function 9 (placing) of the object, and of every
+  tile of its group if it has several tiles, with Init between them and
+  Init once more after. 148 of those objects are on the lot and 120 are
+  tiles of a group. So the step needs taking an object off its tile and
+  putting it back: the object grid, the slots, containers and groups.
+- Run here in registration order on the lot as step 12 leaves it, with
+  nothing else of the step, 111 of the 126 Load trees finish. The others stop at Notify Stack Object out of Idle
+  (7 objects), Generic Sims Call 11 (1), Generic Sims Call 43 now that a
+  family is selected (1), and Refresh mode 2, which marks a room as
+  changed (6). In the trace the rooms are marked as not counted again
+  when the step returns.
+- Still to port for the people: taking their fields from the
+  neighborhood record, their own reset, their cached room and their
+  motive curves.
 
 **14. Indicators.** Two indicator objects are created through the factory
 and hidden, and the selected person is found.

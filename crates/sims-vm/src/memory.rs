@@ -300,6 +300,37 @@ impl Machine<'_, '_> {
                 let i = bounded(index, frame.parameters.len(), 8)?;
                 attribute(stack_object, frame.parameters[i])?
             }
+            23 => {
+                // What a script can read about the room whose ID is in
+                // temp 0 (legacy/crates/sims-vm/src/memory.rs). No room
+                // (-5) reads as outdoors, level 0, area 0. An ID that
+                // names no room is native error 0x28.
+                let id = temp(0)?;
+                let room = match id {
+                    sims_sim::rooms::NO_ROOM => None,
+                    id => Some(
+                        self.world
+                            .rooms
+                            .rooms
+                            .get(&id)
+                            .ok_or(Trap::native(0x28, "missing room"))?,
+                    ),
+                };
+                Cell::Literal(match index {
+                    // Whether the room is outdoors.
+                    1 => room.is_none_or(|room| room.outdoors).into(),
+                    // Its level, which is part of its ID.
+                    2 => room.map_or(0, |_| (((id as u16 & 0xc00) >> 10) + 1) as i16),
+                    // Its area in tiles: zero until the room update has
+                    // counted the room.
+                    3 => room.map_or(0, |room| (room.half_tiles / 2) as i16),
+                    _ => {
+                        return Err(Trap::Unsupported(format!(
+                            "room field {index} is not ported"
+                        )));
+                    }
+                })
+            }
             25 => Cell::Local(bounded(index, frame.locals.len(), 8)?),
             26 => {
                 // Tables 0..64 are the owner's own BCONs, 64..128 its
@@ -369,10 +400,10 @@ impl Machine<'_, '_> {
                 let index = bounded(index, count, 0x40)?;
                 Cell::TypeAttribute(record.unwrap_or(0), index)
             }
-            // Tree advertisements (12, 28, 29), rooms (23), neighbors (24,
-            // 32), jobs (33), neighborhood data (34) and scope 38 need
-            // state the simulation doesn't hold yet.
-            12 | 23 | 24 | 28 | 29 | 32 | 33 | 34 | 38 => {
+            // Tree advertisements (12, 28, 29), neighbors (24, 32), jobs
+            // (33), neighborhood data (34) and scope 38 need state the
+            // simulation doesn't hold yet.
+            12 | 24 | 28 | 29 | 32 | 33 | 34 | 38 => {
                 return Err(unsupported(scope));
             }
             2 | 5 | 39..=255 => return Err(Trap::native(9, "invalid memory scope")),

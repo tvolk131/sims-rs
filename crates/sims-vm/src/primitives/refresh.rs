@@ -7,9 +7,10 @@
 //! (word 2). Mode 0 invalidates the drawing of the object's whole
 //! containment tree, which only the renderer sees, so it does nothing here.
 //! Modes 1 and 2 mark the room in the object's data word 29 dirty, unless
-//! that word is -5 (no room). A dirty room has its score and lighting
-//! rebuilt at the next room update (0x467094), which the simulation sees,
-//! but rooms are not modeled yet, so marking one fails loudly.
+//! that word is -5 (no room). A dirty room is counted again, and has its
+//! score and lighting rebuilt, at the next room update (0x467094). Marking
+//! a room is not ported: no load step that runs reaches it, so nothing
+//! shows what else the original does there. It fails loudly.
 
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
@@ -52,7 +53,7 @@ impl Machine<'_, '_> {
                     return Ok(true);
                 }
                 Err(Trap::Unsupported(format!(
-                    "Refresh mode {mode} marks room {} dirty; rooms are not modeled",
+                    "Refresh mode {mode} marks room {} dirty; that is not ported",
                     room as u16
                 )))
             }

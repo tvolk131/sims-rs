@@ -49,6 +49,9 @@ pub enum Tree<'a> {
 pub enum Callback {
     Init = 0,
     Main = 1,
+    /// Function 7: asked of an object when the lot's rooms have been
+    /// worked out again (0x442659).
+    RoomsChanged = 7,
 }
 
 /// When an OBJD has no OBJf table, the original reads its callbacks from

@@ -94,22 +94,38 @@ fn other_global_counts_are_rejected() {
 fn selecting_the_family_sets_its_globals_and_funds() {
     // A 32-word save has no budget mode global until the context is applied.
     let mut world = lot(vec![0; 32]);
-    assert_eq!(world.select_family(3, 5, 1), Err(LoadError::NoContext));
+    assert_eq!(
+        world.select_family(3, 5, 1, None),
+        Err(LoadError::NoContext)
+    );
     world.apply_context(CONTEXT).unwrap();
-    world.select_family(3, 5, 123_456).unwrap();
+    world.select_family(3, 5, 123_456, None).unwrap();
     assert_eq!(world.globals[9], 3);
     assert_eq!(world.globals[10], 5);
     assert_eq!(world.budget.funds, 123_456);
     assert_eq!((world.globals[14], world.globals[13]), (12, 3456));
+    // A family record with no magic history leaves none selected.
+    assert_eq!(world.magic_history, None);
+    world
+        .select_family(3, 5, 123_456, Some([1, 2, 3, 4, 5, 6]))
+        .unwrap();
+    assert_eq!(
+        world.magic_history,
+        Some(sims_sim::MagicHistory {
+            family: 3,
+            values: [1, 2, 3, 4, 5, 6]
+        })
+    );
 
     // Negative funds split toward zero.
     world.set_funds(-123_456).unwrap();
     assert_eq!((world.globals[14], world.globals[13]), (-12, -3456));
 
     // An empty lot has no money, whatever the family record says.
-    world.select_family(0, 5, 9999).unwrap();
+    world.select_family(0, 5, 9999, Some([9; 6])).unwrap();
     assert_eq!(world.budget.funds, 0);
     assert_eq!((world.globals[14], world.globals[13]), (0, 0));
+    assert_eq!(world.magic_history, None);
 }
 
 #[test]
@@ -117,7 +133,7 @@ fn funds_do_not_change_outside_budget_mode_zero() {
     let mut world = lot(vec![0; 64]);
     world.apply_context(CONTEXT).unwrap();
     world.globals[32] = 1;
-    world.select_family(3, 5, 500).unwrap();
+    world.select_family(3, 5, 500, None).unwrap();
     assert_eq!(world.globals[9], 3);
     assert_eq!(world.budget.funds, 777);
     assert_eq!(world.globals[13], 0);
@@ -436,7 +452,10 @@ fn saved_floors_and_walls_are_widened_inside_the_lot_size() {
         cell(wall, 51, 0),
         [2, 2, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0]
     );
-    assert_eq!(cell(wall, 60, 60), [0; 14]);
+    // Outside the size a lot without the array has a bare lot's cells:
+    // on the ground level's walls, flags 0x0f and both styles 1.
+    assert_eq!(cell(wall, 60, 60), sims_sim::load::BARE_GROUND_WALL);
+    assert_eq!(cell(&world.arrays[&102], 60, 60), [0; 14]);
     // The other arrays are taken whole.
     assert_eq!(cell(&world.arrays[&3], 63, 63), [3]);
 }

@@ -1,10 +1,11 @@
 //! The state-only steps of loading a lot: the globals the running game
-//! supplies, the lot arrays, the object grid's repair, and selecting the
-//! household. The load sequence in `docs/roadmap.md`
+//! supplies, the lot arrays, the object grid's repair, discarding the
+//! removal queue, and selecting the household. The lot's rooms are in
+//! [`crate::rooms`]. The load sequence in `docs/roadmap.md`
 //! lists every step of the original's lot load in order; the ones that run
 //! scripts live in `sims-vm`.
 
-use crate::{FULL_SIZE, World};
+use crate::{FULL_SIZE, MagicHistory, World};
 use serde::{Deserialize, Serialize};
 use sims_formats::lot::{Array, SurfaceMapping};
 use sims_formats::tatt::Tatt;
@@ -145,6 +146,15 @@ const FLOOR_CELL: usize = 2;
 const WALL_CELL: usize = 14;
 const SAVED_WALL_CELL: usize = 8;
 
+/// A ground-level wall cell of a lot nothing was built on: no segments,
+/// flags 0x0f, and both styles 1. The upper level's bare cell is all
+/// zeros, and so is a bare floor cell.
+///
+/// From a trace of the original loading the Goth house: every cell of the
+/// held lot's ground wall array has these bytes when the load starts, and
+/// the cells outside the lot's 52 tiles still have them when it ends.
+pub const BARE_GROUND_WALL: [u8; WALL_CELL] = [0, 0x0f, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
 /// Whether the renumbering looks a saved ID up (0x4a0e3b, 0x4c5d35).
 /// Floors 0 to 29 and walls 0 to 30 are built in and keep their IDs, as do
 /// 255 (a floor cut by a diagonal wall), wall IDs 248 to 255 and 65535.
@@ -241,16 +251,20 @@ impl World {
     /// the lot's own arrays, for the cells inside the lot's size only
     /// (0x478599): a floor byte becomes a 16-bit ID, and a wall's six
     /// bytes after the first two become six 16-bit words. Cells outside
-    /// the lot's size keep what the lot's array held. A lot with no such
-    /// array has zeros there, which is **unverified**: the original's lot
-    /// always has arrays, and what they hold outside the size is not
-    /// known.
+    /// the lot's size keep what the lot's array held. The original's lot
+    /// always has these arrays. A lot here may have none, and is then
+    /// taken to hold what the original's bare lot holds: zeros, and
+    /// [`BARE_GROUND_WALL`] in the ground level's walls.
     ///
     /// For the Goth house the cells inside the lot's size of arrays 0, 1,
     /// 2, 3, 8, 101, 102, 103, 108, 9 and 10 were compared with a capture
     /// of the original taken after this step and the renumbering; see
-    /// `docs/decisions.md`. Arrays 4, 6 and 7 and every cell outside the
-    /// size are **unverified**.
+    /// `docs/decisions.md`. Outside the size, the same arrays were
+    /// compared with the memory a later trace holds, at the start of load
+    /// step 10 and at the end of the load: every cell of both levels'
+    /// walls and flags, the ground level's object grid, the pool and the
+    /// water, and of the others the cells the trace holds, was equal.
+    /// Arrays 4, 6 and 7 are **unverified**.
     ///
     /// Two things differ from the original. It stops at the first array
     /// that fails to read and goes on with the load; here a missing array
@@ -310,6 +324,7 @@ impl World {
                         stride: held.stride,
                     });
                 }
+                None if id == WALLS[0] => BARE_GROUND_WALL.repeat(full * full),
                 None => vec![0; full * full * to],
             };
             for x in 0..active {
@@ -562,11 +577,10 @@ impl World {
     /// asked to be removed without resets
     /// ([`crate::Object::removal_skips_resets`]). Returns the IDs dropped.
     ///
-    /// Not called by the load yet: step 10 comes first and is not ported.
-    /// In a capture of the original loading the Goth house the queue holds
-    /// four IDs before this step and none after, and no object changes.
-    /// Our state at that moment was not compared, because the load does
-    /// not reach it.
+    /// In a trace of the original loading the Goth house the queue holds
+    /// four IDs before this step and none after, and nothing else the
+    /// trace holds changes. Our state before and after the step was
+    /// compared with the trace's and was equal; see `docs/decisions.md`.
     pub fn discard_removals(&mut self) -> Vec<u16> {
         std::mem::take(&mut self.removals)
     }
@@ -581,16 +595,41 @@ impl World {
         Ok(())
     }
 
-    /// Selects the household that lives on the lot (0x428041): global 9
-    /// takes its family number, global 10 the house number, and the
+    /// Load step 12: selects the household that lives on the lot
+    /// (0x428041). Global 9 takes the family's ID, which is the ID of its
+    /// record in the neighborhood file (the FAMI chunk's ID, not the
+    /// number inside the record). Global 10 takes the house number. The
     /// family's money becomes the lot's funds. `family` is 0 for an empty
     /// lot, which has no money.
+    ///
+    /// The family also becomes the one the game has selected (0x4282a2),
+    /// so its magic history becomes [`World::magic_history`]. `magic` is
+    /// the six words a family record of version 9 holds
+    /// (`sims_formats::neighborhood::Family::magic_history`), or None for
+    /// an older record or no family, which have no history to read.
     ///
     /// The funds setter (0x46d8dc) also queues signal 0xda for the
     /// interface. That is presentation, not simulation state, so it is not
     /// modeled.
-    pub fn select_family(&mut self, family: i16, house: i16, money: i32) -> Result<(), LoadError> {
+    ///
+    /// For the Goth house the globals, the funds, the family's ID and its
+    /// six magic words were compared with a trace of the original taken
+    /// when the funds setter returns, and were equal. The house saved its
+    /// own number in global 10, so the trace does not show that global
+    /// being written. Family 0 and a family record older than version 9
+    /// are **unverified**.
+    pub fn select_family(
+        &mut self,
+        family: i16,
+        house: i16,
+        money: i32,
+        magic: Option<[i16; 6]>,
+    ) -> Result<(), LoadError> {
         self.context_applied()?;
+        self.magic_history = magic.filter(|_| family != 0).map(|values| MagicHistory {
+            family: i32::from(family),
+            values,
+        });
         self.globals[9] = family;
         self.globals[10] = house;
         self.set_funds(if family == 0 { 0 } else { money })

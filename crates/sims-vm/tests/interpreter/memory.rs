@@ -368,8 +368,49 @@ fn stack_object_definition() {
 }
 
 #[test]
+fn the_room_in_temp_0() {
+    use sims_sim::rooms::Room;
+    let mut fx = Fixture::new();
+    let rooms = &mut fx.world.rooms.rooms;
+    rooms.insert(
+        3,
+        Room {
+            half_tiles: 19,
+            ..Room::default()
+        },
+    );
+    rooms.insert(
+        1025,
+        Room {
+            outdoors: true,
+            half_tiles: 8,
+            ..Room::default()
+        },
+    );
+    // Field 1 is whether the room is outdoors, 2 its level, 3 its area in
+    // tiles: the half tiles divided by 2, rounding down.
+    for (room, fields) in [(3, [0, 1, 9]), (1025, [1, 2, 4]), (-5, [1, 0, 0])] {
+        fx.lamp_mut().temps[0] = room;
+        for (field, expected) in (1..).zip(fields) {
+            assert!(reads(&mut fx, 23, field, expected), "room {room}");
+        }
+    }
+    // Room fields are read only.
+    assert_eq!(code(write(&mut fx, 23, 1, 1)), Some(0x13));
+    // An ID that names no room.
+    fx.lamp_mut().temps[0] = 4;
+    assert_eq!(code(read(&mut fx, 23, 1)), Some(0x28));
+    // The other fields are not ported, and say so.
+    fx.lamp_mut().temps[0] = 3;
+    for field in [0, 4, -1] {
+        let text = trap(read(&mut fx, 23, field)).to_string();
+        assert!(text.contains(&format!("room field {field}")), "{text}");
+    }
+}
+
+#[test]
 fn unsupported_scopes_name_themselves() {
-    for scope in [12, 23, 24, 28, 29, 32, 33, 34, 38] {
+    for scope in [12, 24, 28, 29, 32, 33, 34, 38] {
         let mut fx = Fixture::new();
         let fault = read(&mut fx, scope, 0).unwrap_err();
         assert_eq!(fault.trap, Trap::UnsupportedScope { scope });
