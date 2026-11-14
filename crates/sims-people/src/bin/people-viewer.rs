@@ -1,8 +1,8 @@
 //! A small window that plays the people of a saved house.
 //!
 //! ```text
-//! people-viewer <install> [house file] [--snapshot <file>] [--walk]
-//!               [--png <file> [--at <milliseconds>]]
+//! people-viewer <install> [house file] [--snapshot <file> | --boot
+//!               [--answers A,B,...]] [--walk] [--png <file> [--at <milliseconds>]]
 //! ```
 //!
 //! Without a snapshot, the house's people stand side by side, facing the
@@ -16,8 +16,18 @@
 //! none). The house file then only names the neighborhood whose characters
 //! are registered.
 //!
+//! With `--boot`, the simulation boots the house (`sims_vm::boot::Lot`)
+//! and runs it, one tick every 50 milliseconds (the animator clock's
+//! step), and the people are drawn as they are after each tick, as with
+//! a snapshot. `--answers` answers the dialogs that offer a choice, as
+//! with `sims boot` (the Goths' house takes `--answers 3`). When a step
+//! fails, the run ends there and the last state stays on screen; the
+//! failure is printed, since it is usually the first thing the
+//! simulation does not do yet. The viewer only reads the lot.
+//!
 //! `--png` draws one 800 by 600 frame, `--at` milliseconds in, to a PNG
-//! file instead of opening a window.
+//! file instead of opening a window. With `--boot`, that is after
+//! `--at` / 50 ticks.
 //!
 //! Keys: `W` walk or stand, left and right arrows turn the view by an
 //! eighth of a turn, `+` and `-` zoom, `Esc` quits.
@@ -38,6 +48,8 @@ use sims_people::{
 };
 use sims_sim::World;
 use sims_sim::animator::{Animator, Layer};
+use sims_vm::boot::{Frames, Lot};
+use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -51,6 +63,35 @@ use winit::window::{Window, WindowId};
 
 const BACKGROUND: [u8; 4] = [38, 40, 56, 255];
 
+/// Milliseconds a tick moves the animator clock by (it runs at 50 a
+/// tick, or 42 when slowed), so a booted lot runs a tick this often.
+const TICK_MS: u32 = 50;
+
+/// The most ticks one drawn frame catches up by, so a slow tick does not
+/// stall the window; the lot then runs slower than the clock.
+const CATCH_UP: u32 = 10;
+
+/// Where the people and their animators come from.
+enum Source {
+    /// The saved house: its people stand side by side.
+    Saved,
+    /// A simulation snapshot, as it was saved.
+    Snapshot(Box<World>),
+    /// A lot the simulation runs, until a step fails (`stopped`).
+    Lot { lot: Box<Lot>, stopped: bool },
+}
+
+impl Source {
+    /// The simulation state the people are drawn from, if any.
+    fn world(&self) -> Option<&World> {
+        match self {
+            Self::Saved => None,
+            Self::Snapshot(world) => Some(world),
+            Self::Lot { lot, .. } => Some(lot.world()),
+        }
+    }
+}
+
 struct Person {
     resident: Resident,
     body: Body,
@@ -61,8 +102,15 @@ struct Viewer {
     /// Loads each clip once. The assets and the clip library live as long
     /// as the program.
     player: Player<'static>,
+    assets: &'static Assets,
+    /// The person types and characters, to draw people the simulation
+    /// makes while it runs; with a snapshot or a lot only.
+    cast: Option<Cast>,
     people: Vec<Person>,
-    world: Option<World>,
+    /// Person IDs already loaded, or that failed to load, so each is
+    /// tried once.
+    tried: BTreeSet<u16>,
+    source: Source,
     start: Instant,
     walking: bool,
     /// Eighths of a turn the view is turned by.
@@ -84,12 +132,23 @@ fn run() -> Result<(), String> {
     let mut install = None;
     let mut house = None;
     let mut snapshot = None;
+    let mut boot = false;
+    let mut answers = Vec::new();
     let mut png = None;
     let mut at = 0;
     let mut walking = false;
     while let Some(arg) = args.next() {
         if arg == "--snapshot" {
             snapshot = Some(args.next().ok_or("--snapshot needs a file")?);
+        } else if arg == "--boot" {
+            boot = true;
+        } else if arg == "--answers" {
+            let list = args.next().ok_or("--answers needs a list")?;
+            answers = list
+                .split(',')
+                .map(str::parse)
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(|e| format!("--answers {list}: {e}"))?;
         } else if arg == "--png" {
             png = Some(args.next().ok_or("--png needs a file")?);
         } else if arg == "--at" {
@@ -105,46 +164,42 @@ fn run() -> Result<(), String> {
             return Err(format!("unexpected argument {arg:?}"));
         }
     }
-    let install = install.ok_or("usage: people-viewer <install> [house] [--snapshot <file>]")?;
+    let install = install.ok_or(
+        "usage: people-viewer <install> [house] [--snapshot <file> | --boot [--answers A,B,...]]",
+    )?;
+    if boot && snapshot.is_some() {
+        return Err("--boot and --snapshot each give the state; use one".into());
+    }
     let house = house.unwrap_or_else(|| install.join("UserData/Houses/House05.iff"));
     let assets: &'static Assets = Box::leak(Box::new(Assets::scan(&install)?));
     let library: &'static Library = Box::leak(Box::new(Library::scan(assets)?));
-    let world = match snapshot {
-        Some(file) => Some(
+    let source = match snapshot {
+        Some(file) => Source::Snapshot(Box::new(
             sims_sim::Snapshots::open(Path::new(&file))
                 .and_then(|s| s.load("boot"))
                 .map_err(|e| format!("{file}: {e}"))?
                 .ok_or_else(|| format!("{file} holds no snapshot named boot"))?,
-        ),
-        None => None,
+        )),
+        None if boot => Source::Lot {
+            lot: Box::new(
+                Lot::load(&install, &house, &answers, Frames::default())
+                    .map_err(|e| format!("{}: {e}", house.display()))?,
+            ),
+            stopped: false,
+        },
+        None => Source::Saved,
     };
-    // With a snapshot, the people it holds now, including those a script
-    // made after the load; otherwise the saved house's.
-    let found = match &world {
-        Some(world) => residents_of(&Cast::of_house(&install, &house)?, world)?,
-        None => residents(&install, &house)?,
+    let cast = match source {
+        Source::Saved => None,
+        _ => Some(Cast::of_house(&install, &house)?),
     };
-    let mut people = Vec::new();
-    for resident in found {
-        // One person whose files are missing does not stop the others.
-        let body = match Body::load(assets, &resident.skeleton, &resident.outfit) {
-            Ok(body) => body,
-            Err(e) => {
-                eprintln!("people-viewer: person {} is not drawn: {e}", resident.id);
-                continue;
-            }
-        };
-        let base = base_clip(&resident.person, &resident.skeleton);
-        people.push(Person {
-            resident,
-            body,
-            base,
-        });
-    }
     let mut viewer = Viewer {
         player: Player::new(assets, library),
-        people,
-        world,
+        assets,
+        cast,
+        people: Vec::new(),
+        tried: BTreeSet::new(),
+        source,
         start: Instant::now(),
         walking,
         turn: 0,
@@ -152,7 +207,14 @@ fn run() -> Result<(), String> {
         window: None,
         surface: None,
     };
+    // With a snapshot or a lot, the people it holds now, including those a
+    // script made after the load; otherwise the saved house's.
+    if viewer.cast.is_none() {
+        viewer.add(residents(&install, &house)?);
+    }
     if let Some(file) = png {
+        viewer.advance(u32::try_from(at).unwrap_or(0) / TICK_MS, u32::MAX);
+        viewer.refresh();
         let canvas = viewer.render(800, 600, at)?;
         return std::fs::write(&file, canvas.png()).map_err(|e| format!("{file}: {e}"));
     }
@@ -178,13 +240,80 @@ fn demonstration(x: f32, clock: i32, walk: Option<(&str, f32, u32)>) -> Animator
 }
 
 impl Viewer {
+    /// Loads the bodies of `found` that were not tried yet. One person
+    /// whose files are missing does not stop the others.
+    fn add(&mut self, found: Vec<Resident>) {
+        for resident in found {
+            if !self.tried.insert(resident.id) {
+                continue;
+            }
+            let body = match Body::load(self.assets, &resident.skeleton, &resident.outfit) {
+                Ok(body) => body,
+                Err(e) => {
+                    eprintln!("people-viewer: person {} is not drawn: {e}", resident.id);
+                    continue;
+                }
+            };
+            let base = base_clip(&resident.person, &resident.skeleton);
+            self.people.push(Person {
+                resident,
+                body,
+                base,
+            });
+        }
+    }
+
+    /// Loads the people the simulation state holds that were not tried
+    /// yet: at the start, and those a script makes while a lot runs.
+    fn refresh(&mut self) {
+        let (Some(cast), Some(world)) = (&self.cast, self.source.world()) else {
+            return;
+        };
+        let people: Vec<u16> = world
+            .objects
+            .iter()
+            .filter(|(_, o)| o.person.is_some())
+            .map(|(&id, _)| id)
+            .collect();
+        if people.iter().all(|id| self.tried.contains(id)) {
+            return;
+        }
+        match residents_of(cast, world) {
+            Ok(found) => self.add(found),
+            Err(e) => {
+                // Not tried again every frame.
+                eprintln!("people-viewer: the people are not read: {e}");
+                self.tried.extend(people);
+            }
+        }
+    }
+
+    /// Runs a booted lot to tick `ticks`, at most `limit` ticks at a time.
+    /// A failed step ends the run; the lot keeps the state it reached.
+    fn advance(&mut self, ticks: u32, limit: u32) {
+        let Source::Lot { lot, stopped } = &mut self.source else {
+            return;
+        };
+        let mut steps = 0;
+        while !*stopped && lot.ticks() < ticks && steps < limit {
+            steps += 1;
+            if let Err(e) = lot.step() {
+                eprintln!(
+                    "people-viewer: the lot stops after tick {}: {e}",
+                    lot.ticks()
+                );
+                *stopped = true;
+            }
+        }
+    }
+
     /// Draws the scene `clock` milliseconds in.
     fn render(&mut self, width: u32, height: u32, clock: i32) -> Result<Canvas, String> {
         let mut canvas = Canvas::new(width, height, BACKGROUND);
         let player = &mut self.player;
         // Each person's animator and the body it is drawn with.
         let mut scene: Vec<(&Person, Animator)> = Vec::new();
-        match &self.world {
+        match self.source.world() {
             Some(world) => {
                 for (id, animator) in &world.animators {
                     if let Some(person) = self.people.iter().find(|p| p.resident.id == *id) {
@@ -247,6 +376,8 @@ impl Viewer {
         let factor = (window.scale_factor().round() as u32).max(1);
         let (cw, ch) = ((w.get() / factor).max(1), (h.get() / factor).max(1));
         let clock = self.start.elapsed().as_millis().min(i32::MAX as u128) as i32;
+        self.advance(clock.unsigned_abs() / TICK_MS, CATCH_UP);
+        self.refresh();
         let canvas = self.render(cw, ch, clock)?;
         let surface = self.surface.as_mut().ok_or("no surface")?;
         surface.resize(w, h).map_err(|e| e.to_string())?;
