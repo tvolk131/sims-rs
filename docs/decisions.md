@@ -20,9 +20,11 @@ original where it has one: three wall modes, quarter-turn rotations,
 three zooms and two floors. The viewer reads either a house file or a
 world saved by `sims boot --snapshot`, and only reads it.
 
-The two crates add about 190 packages to `Cargo.lock`, most of them the
-Linux X11 and Wayland back ends, which load their system libraries at
-run time, so CI needs no new system packages.
+The two crates are the same versions the people viewer uses (see the
+entry below), so `Cargo.lock` gains no new packages. Unlike the people
+viewer, `sims-viewer` is not behind a feature: it is its own crate, and
+CI builds it. The Linux X11 and Wayland back ends load their system
+libraries at run time, so CI needs no new system packages.
 
 What would reopen it: the UI track needing a GPU, text or widgets that
 softbuffer cannot give, at which point the window code moves to wgpu
