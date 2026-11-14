@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use sims_people::appearance::load_appearance;
 use sims_people::math::{Transform, Vec3};
 use sims_people::raster::{Camera, Canvas};
-use sims_people::{Assets, Body, residents, rig};
+use sims_people::{Assets, Body, Cast, residents, rig};
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
@@ -111,9 +111,9 @@ fn the_goth_family_draws_in_its_rest_pose() {
     assert_eq!(
         digests,
         [
-            "16 88619b856df8c39dff6da51ceb8cca8f866fcdd05b6acc29bf37322ee0d5ad22",
-            "18 e1f677b7ea82d687fb1e5ce8c649b56b5757b5fec857f4ae15f8742134bd8493",
-            "21 97b69425658b9a63c4e1fdcb0d3b320fbb3aa91ba6ca5fe0f001321cc7abc7db",
+            "16 137e57e6f67f646f4a75c6cbf03aaf02f4cbb70772de95e8438c583799ece9ac",
+            "18 be836e858836f8237f1005e74e3245c46b0f35ed6b6026bd360dcc58e02dc258",
+            "21 14115988e37bebe70ad23fe59f2590084c8da6a28ee922e60f5f7902bffd3b94",
         ]
     );
 }
@@ -134,4 +134,88 @@ fn an_appearance_is_found_by_its_own_name() {
     assert_eq!(appearance.name, "b629mafitlgt_labtech");
     assert_eq!(meshes, ["xskin-B629MAFit_labtech-PELVIS-BODY"]);
     assert!(load_appearance(&assets, "no-such-appearance").is_err());
+}
+
+/// A person record with nothing in it, as a script makes one.
+fn blank_person() -> sims_formats::saved_objects::Person {
+    let idle = sims_formats::saved_objects::Interaction {
+        uid: 0,
+        caller: 0,
+        target: 0,
+        icon: 0,
+        table_index: -1,
+        args: [0; 4],
+        priority: 0,
+        action: 0,
+        attenuation: 0.0,
+        flags: 0,
+    };
+    sims_formats::saved_objects::Person {
+        animation_events: 0,
+        engaged: 0,
+        appearance: Default::default(),
+        accessories: Vec::new(),
+        animations: Default::default(),
+        routing_state: 0,
+        floats: [0.0; 9],
+        previous_motives: [0.0; 16],
+        motives: [0.0; 16],
+        data: Vec::new(),
+        routing_frames: 0,
+        active: idle.clone(),
+        last: idle,
+        queue: Vec::new(),
+        object_uses: Vec::new(),
+        motive_deltas: Vec::new(),
+    }
+}
+
+/// A person a script makes after the load is not among the saved house's
+/// residents, and its record names no clothes. Person 259 of the Goth
+/// boot is the traveling salesman (type 0x44a86a6c): it is drawn from its
+/// type's skeleton and default outfit.
+#[test]
+fn a_person_made_after_the_load_is_drawn_from_its_type() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    assert!(
+        !residents(&root, &house)
+            .unwrap()
+            .iter()
+            .any(|r| r.id == 259)
+    );
+    let cast = Cast::of_house(&root, &house).unwrap();
+    let person = blank_person();
+    let found = cast.residents([(259, 0x44a8_6a6c, &person)]).unwrap();
+    let [salesman] = found.as_slice() else {
+        panic!("{found:?}")
+    };
+    assert_eq!(salesman.skeleton, "adult");
+    let names: Vec<&str> = salesman
+        .outfit
+        .parts
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "SpellboundMAFat_TravelSales",
+            "HfLO",
+            "HfRO",
+            "CSpellboundMA_TravelSales"
+        ]
+    );
+    let assets = Assets::scan(&root).unwrap();
+    let body = Body::load(&assets, &salesman.skeleton, &salesman.outfit).unwrap();
+    let world = rig::Pose::rest(&body.skeleton).world(&body.skeleton, Transform::IDENTITY);
+    let mut canvas = Canvas::new(320, 400, [0, 0, 0, 0]);
+    canvas.draw_body(
+        &Camera::house_view(60.0, Vec3::new(0.0, 2.8, 0.0)),
+        &body,
+        &world,
+    );
+    assert!(canvas.covered() > 5000);
+    // A type that is not a person is refused, not drawn.
+    assert!(cast.residents([(1, 0, &person)]).is_err());
 }
