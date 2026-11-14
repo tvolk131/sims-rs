@@ -9,6 +9,7 @@ mod deletion;
 mod expression;
 mod factory;
 mod find_location;
+mod head;
 mod load;
 mod memory;
 mod neighbors;

@@ -3,6 +3,7 @@ use sims_core::{CrtRng, F32, GameRng};
 use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
 use sims_sim::animator::{Animator, Fade, LOADED, Layer, Motion, UNSET};
+use sims_sim::head::Head;
 use sims_sim::neighbors::{Inventory, Item, Neighbor, Neighbors, Row};
 use sims_sim::rooms::{Half, Room, Rooms};
 use sims_sim::route::{Candidate, Context, Route, RouteSlot, Routing};
@@ -324,6 +325,16 @@ fn animator() -> Animator {
             finishing: 0,
             timer: 4_437_050,
         },
+        head: Head {
+            heading: F32::from_bits(0x3e6d_fb3c),
+            target_heading: F32::from_bits(0x3fa8_c336),
+            turn: F32::from_bits(0xbe4c_cccd),
+            target: Some([
+                F32::from_bits(0x425a_4885),
+                F32::from_bits(0x40f2_77fc),
+                F32::from_bits(0x42d0_acac),
+            ]),
+        },
         ..LOADED
     }
 }
@@ -334,7 +345,40 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "85b353ea24114679b2ff1796bcce33b558e8c41f511c199752a0e5b22858f875";
+const PINNED: &str = "52685edd0474b28f07deafcc89e3f8a34431542a20468adb23258ab344f0230b";
+
+/// An animator's encoding under snapshot format 17: without the head
+/// fields ([`Animator::head`]) that format 18 added at its end.
+fn animator_17_bytes(animator: &Animator) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(animator).unwrap();
+    let added = postcard::to_allocvec(&animator.head).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - added.len()), added);
+    bytes
+}
+
+/// The encoding of `world` as snapshot format 17 wrote it. Format 18
+/// added at the end of each animator the head's fields
+/// ([`Animator::head`]). This writes the animators again without them.
+fn format_17_bytes(world: &World) -> Vec<u8> {
+    let blank = World {
+        animators: BTreeMap::new(),
+        ..world.clone()
+    };
+    splice(
+        &world.encode(),
+        &blank.encode(),
+        &postcard::to_allocvec(&world.animators).unwrap(),
+        &[0],
+        &map_bytes(&world.animators, animator_17_bytes),
+    )
+}
+
+#[test]
+fn without_the_head_the_encoding_is_format_17() {
+    // Snapshot format 18 added the head's angles, turn and target.
+    assert_eq!(digest(&format_17_bytes(&world())), PINNED_17);
+}
+const PINNED_17: &str = "85b353ea24114679b2ff1796bcce33b558e8c41f511c199752a0e5b22858f875";
 
 /// `whole` with `part` replaced by `old`. `part` is found where `blank`
 /// stands in `whole_blank`, the same encoding with that one field (and
@@ -414,8 +458,8 @@ fn animator_old_bytes(animator: &Animator, motion: fn(&Motion) -> Vec<u8>) -> Ve
             ..a.clone()
         };
         splice(
-            &postcard::to_allocvec(a).unwrap(),
-            &postcard::to_allocvec(&blank).unwrap(),
+            &animator_17_bytes(a),
+            &animator_17_bytes(&blank),
             &postcard::to_allocvec(&a.motion).unwrap(),
             &postcard::to_allocvec(&Motion::NONE).unwrap(),
             &motion(&a.motion),
@@ -766,6 +810,9 @@ fn any_field_change_changes_the_hash() {
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.animators.get_mut(&5).unwrap().walking = true;
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.animators.get_mut(&5).unwrap().head.target = None;
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     let animator = changed.animators.get_mut(&5).unwrap();
