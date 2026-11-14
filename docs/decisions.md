@@ -13,7 +13,8 @@ speed. It catches up by at most 10 ticks per drawn frame, so a slow
 tick slows the lot down instead of stalling the window. After each tick
 the people are drawn from the lot's state as they are from a snapshot.
 People a script makes while the lot runs are read from their objects
-when they first appear. `--answers` answers dialogs as `sims boot` does
+when they first appear, each on its own, so one person that cannot be
+read (a type missing from the install) does not hide the others. `--answers` answers dialogs as `sims boot` does
 (the Goths' house takes `--answers 3`). `--png` with `--at` runs `--at`
 / 50 ticks and then draws one frame.
 

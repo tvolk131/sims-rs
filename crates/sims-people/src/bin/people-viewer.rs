@@ -43,8 +43,7 @@ use sims_core::F32;
 use sims_people::math::Vec3;
 use sims_people::raster::{Camera, Canvas};
 use sims_people::{
-    Assets, Body, Cast, Library, Player, Resident, base_clip, placement, residents, residents_of,
-    walk_clip,
+    Assets, Body, Cast, Library, Player, Resident, base_clip, placement, residents, walk_clip,
 };
 use sims_sim::World;
 use sims_sim::animator::{Animator, Layer};
@@ -264,28 +263,30 @@ impl Viewer {
     }
 
     /// Loads the people the simulation state holds that were not tried
-    /// yet: at the start, and those a script makes while a lot runs.
+    /// yet: at the start, and those a script makes while a lot runs. Each
+    /// is read on its own, so one that cannot be read (a type missing
+    /// from the install) does not hide the others, and is tried once.
     fn refresh(&mut self) {
         let (Some(cast), Some(world)) = (&self.cast, self.source.world()) else {
             return;
         };
-        let people: Vec<u16> = world
-            .objects
-            .iter()
-            .filter(|(_, o)| o.person.is_some())
-            .map(|(&id, _)| id)
-            .collect();
-        if people.iter().all(|id| self.tried.contains(id)) {
-            return;
-        }
-        match residents_of(cast, world) {
-            Ok(found) => self.add(found),
-            Err(e) => {
-                // Not tried again every frame.
-                eprintln!("people-viewer: the people are not read: {e}");
-                self.tried.extend(people);
+        let mut found = Vec::new();
+        let mut attempted = Vec::new();
+        for (&id, object) in &world.objects {
+            let Some(person) = &object.person else {
+                continue;
+            };
+            if self.tried.contains(&id) {
+                continue;
+            }
+            attempted.push(id);
+            match cast.residents([(id, object.guid, person)]) {
+                Ok(resident) => found.extend(resident),
+                Err(e) => eprintln!("people-viewer: person {id} is not read: {e}"),
             }
         }
+        self.add(found);
+        self.tried.extend(attempted);
     }
 
     /// Runs a booted lot to tick `ticks`, at most `limit` ticks at a time.
