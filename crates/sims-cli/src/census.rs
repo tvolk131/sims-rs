@@ -141,14 +141,29 @@ impl Census {
     }
 
     /// Walks a file or directory in sorted order, so reports are stable.
+    /// Fails when the path does not exist or is neither a file nor a
+    /// directory.
     pub fn add_path(&mut self, path: &Path) -> std::io::Result<()> {
+        let kind = std::fs::metadata(path)?.file_type();
+        if !kind.is_dir() && !kind.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a file or directory",
+            ));
+        }
+        self.walk(path)
+    }
+
+    /// Inside a directory, entries that are neither files nor directories,
+    /// such as broken links, are skipped.
+    fn walk(&mut self, path: &Path) -> std::io::Result<()> {
         if path.is_dir() {
             let mut entries: Vec<_> = std::fs::read_dir(path)?
                 .map(|e| e.map(|e| e.path()))
                 .collect::<Result<_, _>>()?;
             entries.sort();
             for entry in entries {
-                self.add_path(&entry)?;
+                self.walk(&entry)?;
             }
         } else if path.is_file() {
             self.disk_file(path)?;
@@ -425,6 +440,16 @@ mod tests {
         let report = census("self", &bytes);
         assert!(report.contains("overlaps the archive header"), "{report}");
         assert!(report.contains("visited: 1\n"), "{report}");
+    }
+
+    #[test]
+    fn a_path_that_does_not_exist_fails() {
+        let path = std::env::temp_dir().join(format!(
+            "sims-census-missing-{}/nothing",
+            std::process::id()
+        ));
+        let error = Census::default().add_path(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
