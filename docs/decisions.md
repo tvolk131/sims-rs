@@ -114,6 +114,622 @@ Unverified:
 - Which code the place test's wall rules (step 3) leave for 0x48158c.
   They fail loudly when reached.
 
+## 2026-11-14: Sound player limits, and sequence groups from the original's code
+
+A review of `sims-audio` found seven defects. The fixes:
+
+- **Limits.** One block runs at most 100,000 instructions across all
+  threads, and one thread at most 10,000. A thread started by
+  `play_trk` first runs in the next block, so a track that starts itself
+  cannot keep a block going, and the threads a full block does not reach
+  run first in the next. At most 256 threads, 1,024 notes, 256 sequence
+  groups and 1,000 recorded faults exist at once, and calls nest at most
+  64 deep. A patch no table defines is not cached, since any number can
+  name one. These numbers are ours. The original reports an error after
+  101 instructions without a wait and carries on.
+- **Arithmetic and sizes.** Mixing and interpolation use 64 bits. An XA
+  header's claimed size is checked against what its data can hold before
+  any memory is reserved. FSC sizes use checked multiplication. Hit-list
+  files may expand to at most 100,000 entries (the largest in the
+  install has 3,661); past that, parsing fails. Writing a WAV whose
+  sizes do not fit 32 bits is an error, not an overflow.
+- **Unported instructions fault.** `seqgroup_wait`, `add_to_group`,
+  `remove_from_group` and `test1` to `test4` end their thread with a
+  fault. The original does nothing for the first three, and no program in
+  the install uses them; `test1` to `test4` are debug routines.
+- **Sequence groups are ported, not faulted.** The review asked for
+  `seqgroup_kill` and `seqgroup_return` to fault too, but 2,731 of the
+  4,494 event definitions reach `seqgroup_kill` (most voices), so a fault
+  would silence them. Instead they follow the original's code, read
+  (never written) from a memory image of the running game: a group slot
+  holds the ID of the thread that last claimed it.
+  - `seqgroup_return` claims the group and ends its own thread if another
+    held it.
+  - `seqgroup_kill` claims it; another holder ends at once when its
+    `extvol` is 0, and otherwise fades `extvol` toward `fade_dest` at
+    speed 200 while the caller waits 2 ms and runs the instruction again.
+  - `seqgroup_trkid` reads a group's holder.
+  - Slots are not cleared when a thread ends, so a stale ID still makes
+    a later `seqgroup_return` end. Only `StopAll` clears them here.
+  - New threads start with the original's default register bank
+    (`extvol` 1024, `fade_dest` 1, `pan` 512, `pitch` 3600 and others).
+  - A fade adds in 64 bits, so it stops at its destination where the
+    original's 32-bit sum could wrap past it.
+  - **Unverified:** none of this was observed at run time, and how often
+    the original updates fades is not known (here once per block). Volume
+    is not applied yet, so a fade changes registers, not the sound.
+- **Every definition is tested.** The install test runs each event
+  definition as its own module defines it, not by first match. A
+  separate test pins that 13 names are defined by more than one module
+  (5 of them differently), and that the module whose name sorts first
+  wins. How the original chooses is unknown.
+
+Reopen when a run with sound shows different group or fade behaviour.
+
+## 2026-11-14: Hidden objects, sprite world offsets and soft edges in the lot drawing
+
+A review of `crates/sims-render` found four defects. All four are fixed,
+with tests.
+
+- **Hidden objects are not drawn.** An object whose data word 34 is not
+  zero is hidden; the simulation (`HIDDEN` in `sims-vm`) and the old
+  prototype skip it, and now the renderer does too. Checked against the
+  original: the Goth house file hides 18 objects, and one of them, a
+  table on the road, showed in our far-zoom render but is not in the
+  original's screenshot. At that camera (far zoom, rotation 0, floor 1),
+  exact matches among non-grass pixels rose from 33.6% to 33.9% with
+  walls cut away and from 39.5% to 39.7% with walls up. Objects inside
+  other objects are not drawn at their slots yet, so a hidden container
+  does not hide its contents here.
+- **A draw group sprite's world offset is kept.** Each sprite of a draw
+  group (DGRP) carries a position relative to the object. It was
+  dropped. Its units: x and y are sixteenths of a tile in the object's
+  own frame, and z is height, where one unit is `2 << zoom` screen
+  pixels (16 at the near zoom). The old prototype divided x and y by 16
+  to get tiles (`legacy/crates/sims-render/src/lib.rs`).
+  - z raises the sprite on screen by `z * (2 << zoom)` pixels, rounded
+    by adding a half and truncating, as the original's catalog preview
+    does (0x438ae4 to 0x438b58, read by the old prototype in
+    `legacy/crates/sims-render/src/object_preview/software.rs`). That
+    the lot view places sprites the same way is **unverified**.
+  - x, y and z all move the depth the sprite is drawn at. x and y turn
+    with the object's facing, a quarter turn per two steps (the old
+    prototype's rotation). The preview leaves x and y out of the
+    sprite's screen position, and so does this; that is **unverified**
+    for the lot view too.
+  - None of the groups the Goth house draws now has a nonzero offset,
+    so no render changed, and nothing here has been compared with the
+    original.
+- **Soft edges write depth.** A sprite pixel that is partly transparent
+  now writes its depth as well as blending its colour, as the old
+  prototype's blitter did. Before, a farther pixel drawn later could
+  show through a nearer soft edge. This changed several pinned renders
+  slightly. The compared camera did not change at all.
+- **Sprite positions cannot overflow.** Draw group offsets are any
+  32-bit number. Placing and clipping a sprite now use wider or
+  saturating arithmetic, so a sprite far off the screen draws nothing
+  instead of panicking. An image whose pixel count does not match its
+  size, or overflows, draws nothing.
+
+What would reopen it: a camera where an object with a nonzero world
+offset can be compared with the original, or a reading of the
+original's blitter that treats soft edges differently.
+
+## 2026-11-14: The lot viewer opens a window with winit and softbuffer
+
+`crates/sims-viewer` is a small program that shows a lot drawn by
+`sims-render` in a window. It opens the window with `winit` and copies
+the CPU-drawn frame into it with `softbuffer`; no GPU is involved. These
+two crates are dependencies of `sims-viewer` only. `sims-render` stays
+free of window code, so tests draw offscreen and `cargo test` never
+needs a display, and `sims-vm`, `sims-sim` and `sims-core` never see
+either crate.
+
+The frame is drawn at the original's pixel size and scaled up by whole
+pixels on high-DPI screens, so pixels stay sharp. The keys follow the
+original where it has one: three wall modes, quarter-turn rotations,
+three zooms and two floors. The viewer reads either a house file or a
+world saved by `sims boot --snapshot`, and only reads it.
+
+The two crates are the same versions the people viewer uses (see the
+entry below), so `Cargo.lock` gains no new packages. Unlike the people
+viewer, `sims-viewer` is not behind a feature: it is its own crate, and
+CI builds it. The Linux X11 and Wayland back ends load their system
+libraries at run time, so CI needs no new system packages.
+
+What would reopen it: the UI track needing a GPU, text or widgets that
+softbuffer cannot give, at which point the window code moves to wgpu
+or another toolkit, still outside `sims-render`.
+
+## 2026-11-14: Bella Goth compared with the original; the mirror is still open
+
+One pose was compared with the original game. The game ran in the
+emulator harness (`tools/harness/`, its own container and guest copy),
+with House05 loaded from the install and the house view at near zoom.
+Bella (person 18) was walking away from the camera, and a screenshot was
+taken from behind at about 27 pixels per model unit. `sims-people` then
+drew person 18 from the same saved outfit at the same scale, playing
+`a2o-walking-loop` at directions 3.5 to 4.5 and phases 0.05 to 0.8. The
+screenshots and renders stay private, outside the repository.
+
+What matches: the meshes (body, head, long hair, hands, shoes), the
+textures (the red dress with its open back, the skin tone, the hair), the
+proportions, and the hem's length. The pose falls inside the walk cycle:
+it looks like phases 0.05 to 0.3.
+
+What the comparison does not settle:
+
+- **Mirror image: unverified.** The drawing negates file X (see
+  `crate::rig`). A capture from behind has no fixed feature that is
+  different on the left and right. The hem looks like one, but drawn at
+  several phases its lower side flips with the stride, and the
+  screenshot's phase is not known. Settling it needs a fixed asymmetric
+  feature seen in the original: for example, a printed shirt or a hair
+  parting, seen from the front.
+- Light and shading: the renderer uses its own light, not the
+  original's.
+- Pixel positions: the camera was not matched to the original's pixel
+  for pixel.
+- The standing loop, Mortimer (person 21) and Cassandra (person 16, a
+  child): the capture showed neither of them in their saved outfits.
+
+Mortimer was also seen walking, in a work uniform (a lab coat). That
+outfit is not among his saved outfits and was not found in the install,
+so it was not compared. Looking for it showed that an appearance's own
+name does not always match its file's name (`B629MAFitlgt_labtech` is in
+`b629ma_labtech.cmx`). So appearances are now also found by their own
+names across every catalog, as the old prototype did
+(legacy/crates/sims-content/src/avatar.rs).
+
+## 2026-11-14: The people viewer is a feature-gated window
+
+`people-viewer` is a small window binary in `sims-people`. It uses
+`winit` (the window and its events) and `softbuffer` (copies the
+software rasterizer's image to the window). Both are optional
+dependencies behind the crate's `viewer` feature, and nothing else in
+the workspace enables it. So the default build, `cargo test` and CI
+never compile them. They add 187 packages to `Cargo.lock`, which CI does
+not download, and leave every existing package's version unchanged. The
+cost is that CI does not build the viewer; run
+`cargo clippy -p sims-people --features viewer --all-targets` after
+changing it.
+
+The viewer reads the wall clock to play clips in real time, so the
+binary allows the workspace's determinism lint. Nothing it computes
+reaches the simulation. It reads a simulation snapshot through
+`sims_sim::Snapshots` and makes its own `Animator` values for the
+standing and walking demonstration; it never changes simulation code.
+
+`--png <file>` draws one frame without a window, so the viewer's
+drawing can be checked headless.
+
+## 2026-11-14: The HIT player runs real sound events into PCM (track 3, sound)
+
+`sims_audio::player::Player` is the HIT virtual machine, with a mixer.
+
+- It takes `SoundEvent`s: play the event named N for object O, stop
+  object O's sounds, or stop everything.
+- It renders mono 16-bit PCM at 22,050 Hz, the rate of nearly every
+  sample in the install.
+- Each event starts a thread that runs its track's HIT routine. Threads
+  run at the start of every 64-frame block; notes are mixed in between.
+- Random choices (hit lists, `rand`) use the player's own seeded
+  generator, so a seed always replays the same sound.
+
+What was checked:
+
+- **Phone ring.** `Phone_ring` renders exactly the decoded
+  `Phone_ring.xa`, bit for bit, then silence to the end of the block.
+- **Footstep.** `footstep_soft` with `SimSpeed` at 1 renders exactly one
+  of the five soft footstep samples. Eight seeds pick soft1, soft3 and
+  soft4. At `SimSpeed` 2 it renders nothing, as the routine says.
+- Both digests are pinned in a gated test.
+- **Every event.** All 4,494 events in the install were run for 20
+  blocks with stub samples, and no instruction failed. Two kinds of
+  fault remain:
+  - The files' own loose ends (14 faults).
+  - 190 events of kinds this player does not handle yet: music modes,
+    television, sequenced hit lists and others.
+- Synthetic tests cover calls, branches, waits, loops, hit lists,
+  resampling, clamping, questions to the simulation, and faults.
+
+How the instructions behave comes from the HSM register names, public
+notes (FreeSO, the Niotso wiki) and what the install's programs need:
+
+- **`end` returns from a call.** The install has 2,504 calls and no
+  `return`.
+- **`loop` without `set_loop` goes back to the routine's start.** The
+  looping generic routine relies on this.
+- **`loop` waits for the next block.** Otherwise a loop that starts no
+  note would spin forever.
+- **`arg1` holds the object** when a track's arguments are
+  `kArgsIdVolPan` (4,135 of 4,316 tracks). The routines pass `arg1` to
+  `getsrcdatafield`, the one way a script asks the simulation something.
+
+All of this is **unverified** against the original.
+
+Left out, also **unverified**:
+
+- Volume, pan, pitch, ducking, priority and 3D position: every note
+  plays at full volume, centred, at its own speed.
+- The `seqgroup_*` instructions and `test1` to `test4` do nothing.
+- `setll`, `setlt` and `settl` copy like `set`.
+- When modules define the same event, patch or hit list, the module
+  whose name sorts first wins.
+- Which value of `SimSpeed` the game uses at normal speed.
+
+The simulation does not emit these events yet, and `sims-vm` and
+`sims-sim` were not changed. What it would need:
+
+1. **Play Sound Event (primitive 23).** It names a sound by an FWAV
+   string ID. The event name is that string: looked up in the code
+   owner's file, then in `Global.iff`. The simulation sends
+   `SoundEvent::Play { object, name }` with the object's ID, plus the
+   primitive's flags (loop, volume) once the player uses them.
+2. **Stop All Sounds (primitive 48).** It sends
+   `SoundEvent::StopObject` for the object.
+3. **Animation clips.** Their `sound` and `footstep` events send
+   `Play` too. The footstep event names are the HOT names, such as
+   `footstep_soft`.
+4. **`getsrcdatafield`.** It needs a read-only view of the object's data
+   fields, through `sims_audio::player::Sources`. What each field
+   number means is unknown. The FM routines suggest field 0 picks
+   between male, female and child voices.
+
+## 2026-11-14: The sound tables read, and an event leads to its samples (track 3, sound)
+
+`sims-audio` now reads the sound scripts' files. A *module* is a HIT
+program (bytecode) with its HSM file (symbol names) and HOT file
+(tables). The install has 27 modules: two in the base game, one per
+expansion pack, and one per downloaded object that has its own sounds.
+The HOT tables map event names such as `Phone_ring` to tracks, tracks to
+HIT entry points and patches (sample files), and list the hit lists
+that scripts pick samples from. FSC files are the outdoor ambient
+scores, and all four parse.
+
+How the HIT bytecode is laid out:
+
+- Opcode names and numbers come from the HSM files. Operand layouts come
+  from public notes (the Niotso wiki, FreeSO's HIT player).
+- The install confirms them for every opcode it uses. All 27 programs
+  decode from their first byte to their last, and every one of the 4,363
+  HOT entry points lands on an instruction.
+- Branch, call and jump operands are not addresses. They are track data
+  IDs that the HOT file maps to addresses; every such operand in the
+  install resolves within its own module.
+- `jump` has two forms: a 4-byte ID, or a 1-byte register holding the
+  target. The opcode does not say which. We take the ID form when the 4
+  bytes are an ID of the program. That covers 399 of the 401 jumps; the
+  other two only decode as register jumps. **Unverified** how the
+  original decides. Opcodes the install never uses keep the public
+  layouts, also **unverified**.
+
+What the files themselves leave dangling:
+
+- 155 patches name sample files the install lacks. One path names a
+  build machine's `c:\` drive.
+- 14 events give an empty track.
+- 10 track entry points use a symbol that their own module's HSM file
+  does not define (`tkd_Generic`, `tkd_GenericInterrupt`). Other modules
+  do define them, so the original may look across modules.
+  **Unverified.**
+- 4 tracks name a patch that does not exist.
+- 6 hit list items are neither a number nor a range: four names and two
+  dotted pairs such as `2370.2376`. These are kept apart, unread.
+- The FSC scores mostly use samples in their own directory. The two big
+  scores also use 56 samples from the other ambient directories, and
+  six samples exist nowhere. Where the original looks for them is
+  **unverified**.
+
+The gated test pins all of these counts, so any change to the rules
+shows up in it.
+
+Traced by hand, then pinned in a test:
+
+- **Phone ring.** `Phone_ring` plays track 3479. That track runs the
+  generic routine (`note_on v1; wait_samp; end`) with the patch
+  `sounddata\phone\Phone_ring.xa`.
+- **Footstep.** `footstep_soft` runs a routine that sets `interrupt`,
+  compares 2 with the game speed (global register 100), and branches to
+  code that picks one of five soft footstep samples (hit list 217).
+
+When two modules define the same event, the module whose name sorts
+first wins (both events above are in the base game's generated module).
+The original's order is **unverified**.
+
+## 2026-11-14: Sound files decode (track 3, sound)
+
+A new crate, `sims-audio`, reads the game's sound files and decodes them
+to PCM (16-bit signed samples). The simulation does not depend on it.
+Every sound file in the Complete Collection install decodes.
+
+Terms used here. *XA* is Maxis's 4-bit ADPCM (adaptive differential PCM)
+sound format. A *FAR* archive is the game's file bundle.
+
+What was decided:
+
+- **Three formats, no others.** The install holds 18,155 XA files, 285
+  WAV files (all 16-bit PCM at 22,050 Hz) and 141 MP3 files (the radio
+  stations, MPEG-1 Layer III at 44,100 Hz, stereo). No file is UTK (The
+  Sims Online's codec) and no file starts with its magic number. Outside
+  those extensions, only the animation `.cfp` files start with bytes that
+  look like an MPEG frame header, by chance.
+- **XA is decoded from public notes.** The layout follows FFmpeg's Maxis
+  XA demuxer and decoder and the Niotso wiki: a 24-byte header, then
+  frames of 28 samples per channel in `15 * channels` bytes. The header's
+  bytes 2 and 3 hold 0, `J` or 0x12 and are not read. One stereo file
+  (`sting_crystalball.xa`) ends half way through a frame and needs that
+  half's samples to reach its stated size, so a partial last frame
+  decodes as far as it goes. Output is cut to the size in the header.
+- **MP3 uses the `symphonia` decoder** (pure Rust, MPL-2.0). Its output
+  is floating point converted to 16-bit, so its digest is pinned on one
+  machine only. Music is presentation; nothing in the simulation reads it.
+- **Sound files are found by install-relative path.** The sound tables
+  name files such as `sounddata\phone\Phone_ring.xa`; that file is the
+  member `Phone\Phone_Ring.XA` of `SoundData/SoundData.far`. An
+  archive's members count as files of the archive's directory, paths
+  ignore case, a loose file replaces a member, and the first of two
+  members with one path is kept, as in `sims_content::Index`.
+  **Unverified** that the sound manager resolves paths this way.
+
+How it was checked:
+
+- Synthetic tests: hand-computed XA samples (each predictor, clamping,
+  stereo order, a partial frame), an XA encoder written apart from the
+  decoder whose output decodes to exactly what it predicted, WAV chunk
+  walking, and silent MP3 frames.
+- A gated test (`SIMS_INSTALL`) decodes every sound file, shadowed
+  duplicates included, and pins counts per format and variant, total
+  frames, and an FNV-1a digest per format. It takes about 40 seconds in a
+  debug build. An ignored test decodes all eight hours of MP3 in full;
+  run once in a release build (24 seconds), every MP3 file decoded and
+  gave as many frames as its frame headers count.
+- **Against FFmpeg.** FFmpeg's `adpcm_ea_maxis_xa` and PCM decoders
+  (FFmpeg through PyAV 15.1.0, in a private virtual environment) decoded
+  all 17,915 distinct XA files and 285 WAV files. After cutting to the
+  size each XA header states, every file's PCM equals ours, bit for bit.
+  FFmpeg does not cut: for 17,129 files it returns the rest of the last
+  frame too.
+
+Not checked against the original. The game's own XA decoder was not
+traced in the executable, and the harness runs with `-nosound`.
+
+## 2026-11-14: The lot drawing compared with the original's screen
+
+One camera was compared: the Goth house (House05) as the game opens it,
+far zoom, rotation 0, floor 1, walls cut away, with the window at 800 by
+600. The original ran in the comparison harness (its own guest and
+container); screenshots were taken with `xwd` and nothing was written to
+the guest's memory. The screenshots stay outside the repository.
+
+How: the render is drawn on a larger canvas, the screenshot's offset in
+it is found by search, and both are reduced to the original's 16-bit
+colour (5, 6 and 5 bits) before pixels are compared. Grass-green pixels
+of the render are left out of the search, because the grass is not the
+original's yet.
+
+What matches:
+
+- **The projection.** The original's camera is a pure translation of
+  ours: the same offset aligns the yard, the house and the road.
+- **Object sprites outdoors** (hedges, gravestones, trees, the fountain,
+  the mailbox) match pixel for pixel at that offset.
+- **The road and sidewalk**: 82% of pixels are exactly equal, most of
+  the rest one step off.
+- **Wall sprites**, once two bugs were fixed (below). With walls up,
+  27% of pixels in the compared area match exactly, up from 19%. Most
+  of the remaining difference is grass, lighting and the Sims.
+
+Fixed by the comparison:
+
+- Walls were drawn one pixel too low. The wall sprite's bottom row sits
+  one pixel above the corner's projected point, not on it.
+- A cut-down wall with a door or window in it showed the opening's cut
+  sprite, a small outline shared by every door and window. The original
+  draws the same short stub there as beside the opening, so it now takes
+  the stub of plain wall style 1. Which style the original takes is
+  **unverified**; the house only uses style 1 around its openings.
+
+What does not match yet:
+
+- **Lighting.** The original darkens floors, walls and objects indoors
+  by the room's light. Everything here is drawn at full brightness, so
+  most indoor pixels differ, though their shapes line up.
+- **Grass.** The original's grass is a smooth, shaded texture. Ours is a
+  made-up speckle, and lots whose grass value is low draw brown where
+  the original is green.
+- **The cap on a cut wall.** The original draws a three-row wood trim on
+  top of a cut-down wall's stub. Its source is not found yet (it is not
+  the wall pattern's top rows nor the 4096, 5120 and 6144 sprites of
+  `walls.iff`).
+- **Which walls cut away.** The original cuts walls room by room; its
+  view keeps a 64 by 64 tile mask per visible room (the old prototype's
+  reading in `legacy/crates/sims-sim/src/lot_presenter/room_masks.rs`).
+  Right after the house opened, every ground-floor wall was still up.
+  About a minute later most rooms were cut away, but the bathroom and
+  the front of the round living room were not. Our rule (cut a wall
+  unless it is a room's back wall) cuts them all.
+- **Sims** are not drawn here; the people track draws them.
+
+What would reopen it: a second camera (another zoom or rotation) that
+disagrees, or a reading of the original's lighting or cutaway room
+choice.
+
+## 2026-11-14: Drawing the lot starts in its own crate, on the CPU
+
+The lot is drawn by a new crate, `sims-render`. It reads the world
+(`sims_sim::World`) and never changes it, and nothing in the simulation
+depends on it. It draws on the CPU, so tests need no window or GPU.
+
+Terms used here. A *sprite* is a pre-drawn picture from the game's files.
+An object's sprites (SPR2) carry a *depth byte* per pixel that says how
+far that pixel is from the camera. A *draw group* (DGRP) lists the sprites
+that make up one view of an object. A wall's *shape* is a mask that says
+which pixels of a wall exist (full wall, cut-down wall, fence); its
+*pattern* is the wallpaper. *Cutaway* is the original's middle wall mode,
+in which walls that would hide a room's inside are cut down.
+
+What was decided:
+
+- **The original's projection.** A tile's top corner is at
+  `((x - y) * (8 << zoom), (x + y) * (4 << zoom))` plus the camera's
+  origin, raised 58, 116 or 232 pixels per storey at zooms 1 to 3 and
+  `2 << zoom` pixels per terrain step. The four rotations use the
+  original's 64-tile rotation table. This is the old prototype's reading
+  of the original's code (`legacy/crates/sims-sim/src/lot_presenter/`).
+- **Depth is a number per pixel, smaller nearer, and a tie goes to the
+  later draw.** Its scale was fitted from the game's sprites, not read
+  from the original's code. For the lowest pixel of each sprite column,
+  which mostly touches the floor, the depth byte falls 1.5 per screen
+  pixel below the object's anchor at the near zoom, 3 at medium and 6
+  at far, and is about 200 level with the anchor. So one byte is a fixed
+  distance in the world. The renderer gives floors, walls and the
+  anchors of objects a depth on the same scale. Whether this matches the
+  original's depth tables is **unverified**.
+- **Where a sprite goes.** An object's anchor is the screen point of its
+  position on the floor. Each sprite of its draw group is drawn with its
+  left edge and bottom at the offsets the draw group gives (checked on
+  every near-zoom draw group of the Goth house's objects: the anchor sits
+  at the same point of each sprite's frame). A draw group sprite with
+  flag 1 is mirrored. Dynamic sprites hide when their word is zero
+  (0x437f99, from the old prototype).
+- **Floors** are `GameData/floors.iff` sprites `id`, `id + 256` and
+  `id + 512` for the three zooms, drawn with their middle column on the
+  tile's top corner. A tile a diagonal wall splits shows two floors from
+  its wall cell; which half takes which is **unverified**. Grass is a
+  brown-to-green mix by each tile's grass value, scattered in two
+  shades. The original draws grass blades from a seeded pattern, so
+  grass will not match pixel for pixel.
+- **Walls** are a pattern from `GameData/walls.iff` (`id` plus 1536,
+  1792 or 2048) masked by a shape (`style * 2 + cut` plus 0, 512 or
+  1024), one frame per wall direction. Each wall cell owns its low-x and
+  low-y walls and its diagonals; which side's wallpaper shows follows
+  the old prototype's `faces`, which was compared with the original's
+  wall records. A wall of style 22 or 23 takes its shape from the door
+  or window standing in it (the object's OBJD byte 0xa2), as the old
+  prototype did. Where a wall sprite sits on its edge was worked out
+  from the shapes' outlines and is **unverified** until compared with a
+  screenshot.
+- **Cutaway is simplified.** A wall stays up only if the room on the
+  camera's side is indoors and the other side is outdoors: the back
+  walls of the house. Doors and windows in a cut wall are hidden. The
+  original's cutaway (0x54059a and 0x4aa446) also depends on a mask it
+  builds per view; that is not ported, so this is **unverified**.
+- **Not drawn yet:** the Sims (the people track draws them), roofs,
+  shadows, lighting by time of day and room, objects in other objects'
+  slots raised to the slot's height, and terrain shading.
+- **A small loader** (`open_house`) builds a world from a house file,
+  widens its floor and wall arrays as the load does and works out the
+  rooms, so a house can be drawn without a full `sims boot`.
+
+How it was checked:
+
+- The Goth house renders at all three zooms and four rotations, with
+  every wall shape found. The renders were looked at: floors, walls,
+  fences, doors, windows and furniture sit where they should, and the
+  back walls stay up in cutaway. They are pinned by digest of the
+  16-bit-color image (`tests/goth_house.rs`, gated on `SIMS_INSTALL`).
+- Nothing has been compared with a screenshot of the original yet.
+
+What would reopen it: a screenshot comparison that disagrees, or a
+reading of the original's depth tables or cutaway mask.
+
+## 2026-11-14: People play the simulation's clips; placement and facing
+
+A person is drawn from the simulation's animator (`sims_sim::animator`),
+read only:
+
+- **Clips.** Every animation file (a `.bcf` that starts with eight zero
+  bytes) is read once, and its clips are known by name, ignoring case. A
+  clip's samples come from `<skill>.cfp`. A clip is posed at a phase from
+  0 to 1: the frame is `phase × frames`, blended with the next frame,
+  which wraps to the first only for a layer that repeats (end mode 1).
+  This is the old prototype's sampling (`legacy/crates/sims-sim/src/pose/sampling.rs`)
+  in ordinary `f32`. It is **unverified** against the original's frames.
+- **Layers.** The rest pose, then the base layer's clip, then the
+  foreground layer at its phase and weight. The simulation keeps only
+  whether a base layer exists, not its clip or phase. Until it exposes
+  them, the clip comes from the saved person record (the base descriptor,
+  for the Goths `a2o-standing-loop` and `c2o-standing-loop`) and the phase
+  from the animator's clock. Carry and blend layers are not drawn yet.
+- **Root travel.** The walking clip's root sways forward and back by
+  about 0.27 units, and returns; it does not travel. The simulation moves
+  the person. So the clip's root is kept as it is, unlike the old
+  prototype, which removed it.
+- **Place.** Sim x and y (sixteenths of a tile) become model X and Z, at
+  3 model units per tile. That figure comes from the walk step, which
+  moves a person by a clip's distance times 16/3 sixteenths. Floors above
+  the ground are not handled yet.
+- **Facing.** Checked against the simulation, not the original: person
+  259 walking for 82 ticks of `sims boot` on House05 moves along
+  (sin θ, −cos θ) in sim x and y, where θ is its direction (in eighths of
+  a turn) times 45 degrees. The mean difference is 0.2 degrees. Every
+  clip leaves the toes pointing at model +Z, so a person is turned by
+  π − θ about the vertical, as the old prototype did. The turn is computed
+  with additions, multiplications and square roots only, so pinned renders
+  hold on every machine.
+
+Whether the drawing is the original's image or its mirror image is still
+**unverified**, and so is which screen direction sim +x takes. Both wait
+on a screenshot of the original.
+
+## 2026-11-14: Drawing people starts in its own crate, on the CPU
+
+The Sims are drawn by a new crate, `sims-people`. It reads simulation
+state and never changes it, and nothing in the simulation depends on it.
+Its math is ordinary `f32`, and it may use the platform's `sin` and `cos`
+(it allows the workspace's float lint at its crate root).
+
+Terms used here. An *appearance* is a named set of meshes bound to bones
+(`b004fafit_01`, Bella Goth's body). A *texture string* is what a saved
+person keeps next to each appearance, such as `BODY=b004fafitmed_fatale01`.
+
+What was decided:
+
+- **Files are found by their own name.** Every `.bcf`, `.cmx`, `.bmf`,
+  `.skn`, `.bmp` and `.cfp` file, loose or in a FAR archive, is known by
+  its name without directory, ignoring case. The base game is searched
+  first, then the expansions in the order the original mounts their
+  object folders, then `Downloads`. The original's own avatar registry
+  is not ported, so this order is **unverified**. Every file the Goth
+  family is drawn from has one source or identical copies, so the order
+  does not change what they look like.
+- **What a person wears comes from its saved record.** The body, the
+  two hands, the head and the accessories each name an appearance and a
+  texture string. An appearance is read from `<name>.cmx.bcf`, or from
+  the text form `<name>.cmx`. A mesh is read from `<name>.bmf`, or from
+  `<name>.skn`.
+- **A texture string `KEY=texture` gives its texture to every mesh whose
+  name contains `KEY`.** Other meshes keep the texture their own file
+  names (Cassandra's glasses, `nerdspecs`). This is the old prototype's
+  reading of the original's code (0x599e87). It explains every part of
+  the three Goths.
+- **The pose is computed in a mirrored frame.** Positions and rotations
+  from the files have their first coordinate negated, as the old
+  prototype's renderer did. Whether this gives the original's image or
+  its mirror image is **unverified** until it is compared with a
+  screenshot of the original.
+- **Skinning follows the old prototype:** each vertex moves with its
+  bone, and a blended vertex moves part of the way towards its position
+  on a second bone. How close this is to the original's blend is
+  **unverified**.
+- **Rendering is a small software rasterizer for now.** Tests draw
+  offscreen with no window and no GPU. The camera keeps sines and
+  cosines, and the house view is built from square roots, so a render
+  gives the same bits on every machine and can be pinned by digest.
+- **The texture decoder (`.bmp`) lives in `sims-people`**, not in
+  `sims-formats`, to avoid conflicts with the rendering track. It can
+  move later.
+
+How it was checked:
+
+- The three Goths (Mortimer, Bella and Cassandra) load with the meshes
+  and textures listed in `tests/goth_family.rs`, and draw in their rest
+  pose. The renders were looked at: clothes, skin, hands and heads sit
+  where they should, and Cassandra wears her glasses. They are pinned by
+  digest, gated on `SIMS_INSTALL`.
+- Nothing is compared with the original yet.
+
 ## 2026-11-14: The end of a path on a timer, the walk's strides, and K = 333
 
 In tick 262 of the Goth house, person 21 comes to the end of a path

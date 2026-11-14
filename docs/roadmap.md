@@ -1296,6 +1296,97 @@ the object's thread is in an error state; no object here is.
 person 21 stands in it. Step 6 of the route tries again and asks the
 person in the way to move (`0x45b066`, `0x45ba28`); it is not ported.
 
+## Track: drawing people (`crates/sims-people`)
+
+Draw the Sims from the original's files, posed by the simulation's
+animator state, which the crate reads and never changes. Milestone: the
+Goth family's three Sims drawn with correct meshes and skins, posed from
+a skeleton, playing an idle and a walk clip in an offscreen render and a
+small viewer, with one pose compared with a screenshot of the original.
+
+Progress:
+
+- Done: the person files are found by name across the base game and
+  expansions; a saved person's appearance strings choose the meshes and
+  skin textures; the skeleton is posed and the meshes skinned on the CPU;
+  a software rasterizer draws them offscreen. The three Goths draw in
+  their rest pose with the right meshes and textures (pinned by digest,
+  gated on `SIMS_INSTALL`).
+- Done: animation clips and their samples load by name; a clip is posed
+  at the phase the simulation's foreground layer gives, over the
+  posture's standing loop; a person is placed and turned from the
+  animator's position and direction. The Goths stand and walk offscreen
+  (pinned by digest).
+- Done: a small viewer (`people-viewer`, behind the `viewer` feature)
+  plays the house's people standing or walking, or draws them where a
+  simulation snapshot has them; it can also write one frame to a PNG.
+- Done: one pose compared with the original. Bella walking, seen from
+  behind in the emulator, matches in meshes, textures, proportions and
+  pose (see the decisions entry). Appearances are also found by their
+  own names across every catalog.
+- Next: settle whether the drawing is the original's mirror image (a
+  front view of a fixed asymmetric feature), and compare the standing
+  loop. The simulation does not yet expose the base layer's clip and
+  phase (a read-only accessor is wanted; until then the saved record and
+  the animator's clock stand in).
+
+## Track: lot rendering (`crates/sims-render`)
+
+Draw a lot from the house file and the game's art: terrain, floors, walls
+and object sprites, at the three zooms and four rotations, in a window.
+The crate reads the simulation's world and never changes it. Milestone:
+the Goth house drawn in a window at every zoom and rotation, with floors,
+walls (with cutaway) and objects, and one camera compared with a
+screenshot of the original.
+
+Progress:
+
+- Done: the crate draws on the CPU into an image with a depth buffer,
+  using the original's projection. Floors, grass, walls (with the shapes
+  doors and windows cut into them) and object sprites draw at every zoom
+  and rotation, with walls up, cut away or down. The Goth house renders
+  are pinned by digest, gated on `SIMS_INSTALL`.
+- Done: `sims-viewer` shows a house (or a world saved by `sims boot
+  --snapshot`) in a window, with keys and the mouse for zoom, rotation,
+  floor, the three wall modes and scrolling, and saves frames as PNGs.
+- Done: one camera (far zoom, rotation 0, floor 1, cutaway) compared
+  with a screenshot of the original. The projection and outdoor sprites
+  match pixel for pixel, and two wall bugs it showed are fixed. See the
+  decisions log for what still differs.
+- Next: indoor lighting, the original's grass, the cut-wall cap, and
+  which rooms the cutaway cuts, each checked against the original.
+
+## Track: sound (`crates/sims-audio`)
+
+Goal: the game's sound, from files to PCM, in `crates/sims-audio`. The
+simulation never depends on it; its only link is the play-sound and
+stop-sounds events.
+
+- **Done: every sound file decodes.** XA (18,155 files), WAV (285) and
+  MP3 (141) from loose files and FAR archives, by the paths the sound
+  tables use. XA and WAV match FFmpeg bit for bit on every file. No UTK
+  file exists in the install.
+- **Done: the sound tables.** All 27 modules (HIT programs, HSM
+  symbols, HOT tables) and the 4 FSC ambient scores parse. Every HIT
+  program disassembles, and every entry point and branch resolves. The
+  files' own loose ends (155 missing samples, among others) are counted
+  in a gated test. The phone ring and a footstep trace to their samples.
+- **Done: the HIT VM.** `Player` takes `SoundEvent`s and renders PCM.
+  The phone ring and a soft footstep render their samples bit for bit,
+  and every event definition in the install (4,494, module by module)
+  runs without a bad or unported instruction. Sequence groups and fades
+  follow the original's code. Scripts cannot hang or exhaust the player.
+  The `render_event` example writes events to a WAV file.
+- **Next:**
+  - The simulation emits `SoundEvent`s (the interface is in the
+    decisions log).
+  - Volume, pan and pitch.
+  - The 190 events of other kinds (music modes, TV, sequenced hit
+    lists).
+  - The FSC ambient player.
+  - Live playback behind a feature.
+  - Checking any of it against the original.
+
 ## Working rules
 
 - Work in branches, open PRs, and merge when CI is green on both platforms.
