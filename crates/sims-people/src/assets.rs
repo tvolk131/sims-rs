@@ -214,8 +214,15 @@ fn resolve(root: &Path, relative: &str) -> Option<PathBuf> {
             path = exact;
             continue;
         }
-        let entries = std::fs::read_dir(&path).ok()?;
-        path = entries.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+        // The first match in name order, so the choice doesn't depend on
+        // the order the filesystem lists names in.
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&path)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        entries.sort();
+        path = entries.into_iter().find(|p| {
             p.file_name()
                 .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(part))
         })?;

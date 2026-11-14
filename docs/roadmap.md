@@ -542,11 +542,10 @@ waiting levels, the lot's outdoor sum and score, and global 27 (204). All
 equal. The trace has no stop between the two updates, so the state after
 the first is not compared.
 
-Not ported: whether an indoor room is lit because someone is in it
-(`0x468802`). A person tells its room as it enters and leaves; an outdoor
-room and a pool ignore that. The update fails for an indoor room where it
-would matter: no pool, no lights, people in it, light below 0.8. Not
-modeled, being presentation: the lights the update places in a room, the
+Whether an indoor room is lit because someone is in it (`0x468802`) was
+ported later (`World::note_occupant`, `Room::shown_light`): a person
+tells its room as it enters and leaves, and an outdoor room and a pool
+ignore that. Not modeled, being presentation: the lights the update places in a room, the
 lighting of the tiles, and the redrawing. The constant the daylight is
 multiplied by is 1.0 in the trace and is taken to be 1.0: **unverified**.
 A lot with a pool is **unverified**: this house has none.
@@ -1384,11 +1383,12 @@ stop-sounds events.
   and every event definition in the install (4,494, module by module)
   runs without a bad or unported instruction. Sequence groups and fades
   follow the original's code. Scripts cannot hang or exhaust the player.
-  The `render_event` example writes events to a WAV file.
+  Volume, pan, pitch and ducking follow the original's formulas, and
+  the output is stereo. The `render_event` example writes events to a
+  WAV file.
 - **Next:**
   - The simulation emits `SoundEvent`s (the interface is in the
     decisions log).
-  - Volume, pan and pitch.
   - The 190 events of other kinds (music modes, TV, sequenced hit
     lists).
   - The FSC ambient player.

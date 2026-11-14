@@ -17,6 +17,8 @@
 //!   (samples), and lists the hit lists scripts pick samples from.
 //! - [`module`]: one HIT program with its HSM and HOT files.
 //! - [`fsc`]: ambient sound scores.
+//! - [`levels`]: volume, pan and pitch, from registers to gains and a
+//!   playback rate.
 //! - [`player`]: the HIT virtual machine and a mixer. It takes
 //!   [`SoundEvent`]s, the simulation's only link to sound, and renders
 //!   PCM.
@@ -29,6 +31,7 @@ pub mod fsc;
 pub mod hit;
 pub mod hot;
 pub mod hsm;
+pub mod levels;
 pub mod module;
 pub mod mp3;
 mod pcm;
