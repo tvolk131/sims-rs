@@ -131,7 +131,9 @@
 //! duplicate events, patches and hit lists across modules is unknown;
 //! here the module whose name sorts first wins.
 
+use crate::ambience::{self, Fresh, Host, Key, Voice};
 use crate::files::SoundFiles;
+use crate::fsc::Score;
 use crate::hit::{Instruction, Operand};
 use crate::levels::{self, Inputs, Levels};
 use crate::module::Module;
@@ -238,9 +240,11 @@ pub mod kind {
         [27, 28, 29, 31, 44, 45, 46, 47, 48, 49, 50, 51, 101, 102];
     /// Kinds the original does something for that this player does not:
     /// reported when an event has one.
-    pub const NOT_PORTED: [i64; 36] = [
+    /// Kind 36 is listed though its ambience half is ported (see
+    /// `Player::set_music_mode`).
+    pub const NOT_PORTED: [i64; 35] = [
         2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 24, 25, 26, 32, 33, 34, 35,
-        36, 37, 38, 39, 40, 41, 42, 43, 52, 103, 104,
+        36, 37, 38, 39, 40, 41, 42, 43, 103, 104,
     ];
 }
 
@@ -325,7 +329,24 @@ struct Note {
     gains: [i32; 2],
     /// Patches to play after this one, without a gap, first first.
     chain: Vec<u32>,
+    /// Whether it starts again from its beginning when it ends (an
+    /// ambience cell's looping sample).
+    looping: bool,
 }
+
+/// An ambience cell's sound: its note, and the volume and pan it was
+/// given, to recompute its gains when the master volume changes.
+#[derive(Debug, Clone)]
+struct AmbientVoice {
+    key: Key,
+    volume: i32,
+    pan: i32,
+    note: Note,
+}
+
+/// The first number given to an ambience sample in the patch cache;
+/// stations count up from 1 << 30, far below.
+pub const AMBIENT_FIRST: u32 = 0xc000_0000;
 
 /// Source frames per output frame, 16.16 fixed point, at a playback rate.
 fn step(rate: u32) -> u64 {
@@ -367,6 +388,16 @@ pub fn resample(pcm: &Pcm, rate: u32) -> Option<Pcm> {
         channels: pcm.channels,
         samples,
     })
+}
+
+/// xorshift64*: the player's own random numbers, so a seed replays. A
+/// number below `below` (at least 1).
+fn xorshift(state: &mut u64, below: u32) -> u32 {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    let value = state.wrapping_mul(0x2545_f491_4f6c_dd1d);
+    ((value >> 32) % u64::from(below.max(1))) as u32
 }
 
 /// Spreads a seed over all 64 bits (splitmix64), so nearby seeds start
@@ -422,6 +453,18 @@ pub struct Player<S> {
     /// *(code)* Object instances: a track and an object it plays for, as
     /// the original records them (its map at manager +0xd4).
     instances: BTreeSet<(u32, u32)>,
+    /// The ambience scores, by mode (see [`crate::ambience`]).
+    scores: BTreeMap<u32, Fresh>,
+    /// *(code)* The current ambience (manager +0x100), by mode.
+    ambience: Option<u32>,
+    /// *(code)* The music mode (manager +0xe8, 4 at first), and whether
+    /// mode 3 has been set, after which modes are recorded (0x6f6428).
+    music_mode: i64,
+    music_started: bool,
+    /// The ambience cells' sounds.
+    voices: Vec<AmbientVoice>,
+    /// Ambience sample paths to their numbers in the patch cache.
+    ambient_patches: BTreeMap<String, u32>,
     frame: u64,
     /// The frame at which the threads last ran.
     ran_at: Option<u64>,
@@ -465,6 +508,12 @@ impl<S: Samples> Player<S> {
             master: 1024,
             notes: Vec::new(),
             instances: BTreeSet::new(),
+            scores: BTreeMap::new(),
+            ambience: None,
+            music_mode: 4,
+            music_started: false,
+            voices: Vec::new(),
+            ambient_patches: BTreeMap::new(),
             frame: 0,
             ran_at: None,
             next_id: 1,
@@ -481,13 +530,189 @@ impl<S: Samples> Player<S> {
 
     /// Sets a track group's volume, 0 to 1024 (the options' sliders):
     /// `kGroupSfx` 1, `kGroupMusic` 2, `kGroupVox` 3.
+    ///
+    /// *(code)* The effects group's volume is also every ambience
+    /// player's volume, as kind 37 sets both (to its slider's step,
+    /// table 0x67156c).
     pub fn set_group_volume(&mut self, group: i64, volume: i32) {
-        self.group_volumes.insert(group, volume.clamp(0, 1024));
+        let volume = volume.clamp(0, 1024);
+        self.group_volumes.insert(group, volume);
+        if group == 1 {
+            let modes: Vec<u32> = self.scores.keys().copied().collect();
+            for mode in modes {
+                self.with_score(mode, |score, host| score.set_volume(volume, host));
+            }
+        }
     }
 
     /// Sets the master volume, 0 to 1024.
     pub fn set_master_volume(&mut self, volume: i32) {
         self.master = volume.clamp(0, 1024);
+        for voice in &mut self.voices {
+            voice.note.gains = ambient_gains(voice.volume, voice.pan, self.master);
+        }
+    }
+
+    /// Adds an ambience score for a mode (see [`ambience::SCORES`]), its
+    /// samples in `directory`. False (reported) when the score is larger
+    /// than the original's grid.
+    pub fn add_score(&mut self, mode: u32, score: &Score, directory: &str) -> bool {
+        match Fresh::new(mode, score, directory, RATE) {
+            Some(fresh) => {
+                if let Some(mut old) = self.scores.insert(mode, fresh) {
+                    old.stop(&mut self.host());
+                }
+                true
+            }
+            None => {
+                self.report(format!("ambience {mode}: score larger than the grid"));
+                false
+            }
+        }
+    }
+
+    /// Adds every score of [`ambience::SCORES`] the install has; a score
+    /// that does not parse is reported.
+    pub fn add_scores(&mut self, files: &SoundFiles) {
+        for (mode, directory, file) in ambience::SCORES {
+            let Some(entry) = files.get(&format!("{directory}\\{file}")) else {
+                continue;
+            };
+            match entry.read().map(|bytes| Score::parse(&bytes)) {
+                Ok(Ok(score)) => {
+                    self.add_score(mode, &score, directory);
+                }
+                Ok(Err(error)) => self.report(format!("{}: {error}", entry.path)),
+                Err(error) => self.report(format!("{}: {error}", entry.path)),
+            }
+        }
+    }
+
+    /// The current ambience's player, if any.
+    pub fn ambience(&self) -> Option<&Fresh> {
+        self.ambience.and_then(|mode| self.scores.get(&mode))
+    }
+
+    /// *(code)* What the game's kind 33 does, it seems once a frame
+    /// (0x574157): moves the current ambience's cursor. `view` is a
+    /// value the original computes from the camera (0x570c3e, not read
+    /// further; below 30 counts as 0, as does any value while a flag of
+    /// the sound manager, not identified, is set): the row goes to `view
+    /// * 10` per mille. `hour` picks the column from [`ambience::HOUR_COLUMNS`]
+    /// (`column * 1000 / 13` per mille); an hour past 23 leaves it.
+    pub fn set_ambience_view(&mut self, view: i32, hour: u32) {
+        let Some(mode) = self.ambience else {
+            return;
+        };
+        let view = if view < 30 { 0 } else { view };
+        let column = ambience::HOUR_COLUMNS.get(hour as usize).copied();
+        if let Some(score) = self.scores.get_mut(&mode) {
+            score.set_x(view.wrapping_mul(10));
+            if let Some(column) = column {
+                score.set_y(column * 1000 / 13);
+            }
+        }
+    }
+
+    /// Runs `act` on a score's player with the rest of the player as its
+    /// host.
+    fn with_score(&mut self, mode: u32, act: impl FnOnce(&mut Fresh, &mut dyn Host)) {
+        let Some(mut score) = self.scores.remove(&mode) else {
+            return;
+        };
+        act(&mut score, &mut self.host());
+        self.scores.insert(mode, score);
+    }
+
+    fn host(&mut self) -> AmbientHost<'_, S> {
+        AmbientHost {
+            samples: &mut self.samples,
+            cache: &mut self.cache,
+            ambient_patches: &mut self.ambient_patches,
+            voices: &mut self.voices,
+            random: &mut self.random,
+            master: self.master,
+            faults: &mut self.faults,
+        }
+    }
+
+    /// *(code)* Kind 52 (0x573f7a): makes the score of a mode (the event's
+    /// track) the current ambience. Nothing happens when it already is;
+    /// otherwise the current one stops and the new one starts. (A mode
+    /// with no score crashes the original; here the current one stops
+    /// and none is current.)
+    fn set_ambience_mode(&mut self, mode: u32) {
+        let new = self.scores.contains_key(&mode).then_some(mode);
+        if new == self.ambience {
+            return;
+        }
+        if let Some(current) = self.ambience {
+            self.with_score(current, |score, host| score.stop(host));
+        }
+        self.ambience = new;
+        if let Some(new) = new {
+            let frame = self.frame;
+            self.with_score(new, |score, _| score.start(frame));
+        }
+    }
+
+    /// *(code)* The ambience half of kind 36 (0x573fe2): the music mode is
+    /// recorded (once mode 3 has been set) and then, in mode 0 (live),
+    /// the current ambience starts if it is stopped; in mode 3 (the
+    /// neighbourhood) the backyard score becomes current and starts, its
+    /// cursor first set to (1000, 500) per mille, which starting resets
+    /// when it was stopped; in any other mode the current ambience stops.
+    /// The music half is not ported.
+    fn set_music_mode(&mut self, mode: i64) {
+        if mode != self.music_mode {
+            if mode == 3 {
+                self.music_started = true;
+            }
+            if self.music_started {
+                self.music_mode = mode;
+            }
+        }
+        let frame = self.frame;
+        match self.music_mode {
+            0 => {
+                if let Some(current) = self.ambience {
+                    self.with_score(current, |score, _| score.start(frame));
+                }
+            }
+            3 => {
+                if !self.scores.contains_key(&0) {
+                    return;
+                }
+                if let Some(current) = self.ambience.filter(|&m| m != 0) {
+                    self.with_score(current, |score, host| score.stop(host));
+                }
+                self.ambience = Some(0);
+                self.with_score(0, |score, _| {
+                    score.set_x(1000);
+                    score.set_y(500);
+                    score.start(frame);
+                });
+            }
+            _ => {
+                if let Some(current) = self.ambience {
+                    self.with_score(current, |score, host| score.stop(host));
+                }
+            }
+        }
+    }
+
+    /// Updates every started ambience player, once per block.
+    fn update_ambience(&mut self) {
+        let modes: Vec<u32> = self
+            .scores
+            .iter()
+            .filter(|(_, s)| s.is_started())
+            .map(|(&m, _)| m)
+            .collect();
+        let frame = self.frame;
+        for mode in modes {
+            self.with_score(mode, |score, host| score.update(frame, host));
+        }
     }
 
     /// Frames mixed so far.
@@ -497,7 +722,11 @@ impl<S: Samples> Player<S> {
 
     /// Whether nothing is running or playing.
     pub fn is_idle(&self) -> bool {
-        self.threads.is_empty() && self.pending.is_empty() && self.notes.is_empty()
+        self.threads.is_empty()
+            && self.pending.is_empty()
+            && self.notes.is_empty()
+            && self.voices.is_empty()
+            && self.scores.values().all(|s| !s.is_started())
     }
 
     /// Adds the stations' hit lists and patches (see
@@ -582,6 +811,13 @@ impl<S: Samples> Player<S> {
             kind::CANCEL_NOTE => self.cancel_radio_notes(),
             kind::KILL_ALL => self.kill_all(),
             kind::KILL_INSTANCE => self.kill_instance(track),
+            kind::SET_AMBIENCE_MODE => self.set_ambience_mode(track),
+            kind::SET_MUSIC_MODE => {
+                self.set_music_mode(i64::from(track as i32));
+                self.report(format!(
+                    "event {name}: kind {kind} is not one this player plays (its music half)"
+                ));
+            }
             kind::TURN_ON_TV => self.turn_on_tv(module, track, args),
             kind::SEQUENCE_TRACK_HIT_LIST => self.sequence(track, args[1]),
             kind::KILL_OBJECT_SOUNDS => self.kill_object_sounds(),
@@ -697,15 +933,20 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// Kind 20: *(code)* ends every track at once and forgets every
-    /// object instance. (The original also stops its music stations,
-    /// which this player does not have.) Sequence groups are cleared too.
+    /// Kind 20: *(code)* ends every track at once, forgets every object
+    /// instance and stops every ambience player (the current one stays
+    /// current). (The original also stops its music stations, which this
+    /// player does not have.) Sequence groups are cleared too.
     fn kill_all(&mut self) {
         self.threads.clear();
         self.pending.clear();
         self.notes.clear();
         self.seqgroups.clear();
         self.instances.clear();
+        let modes: Vec<u32> = self.scores.keys().copied().collect();
+        for mode in modes {
+            self.with_score(mode, |score, host| score.stop(host));
+        }
         self.forget_ended();
     }
 
@@ -945,13 +1186,9 @@ impl<S: Samples> Player<S> {
         id
     }
 
-    /// xorshift64*: the player's own random numbers, so a seed replays.
+    /// A random number below `below`, from the player's own generator.
     fn random(&mut self, below: u32) -> u32 {
-        self.random ^= self.random >> 12;
-        self.random ^= self.random << 25;
-        self.random ^= self.random >> 27;
-        let value = self.random.wrapping_mul(0x2545_f491_4f6c_dd1d);
-        ((value >> 32) % u64::from(below.max(1))) as u32
+        xorshift(&mut self.random, below)
     }
 
     /// Runs the threads and mixes `frames` frames, in blocks of [`BLOCK`].
@@ -1005,61 +1242,20 @@ impl<S: Samples> Player<S> {
         if self.frame.is_multiple_of(BLOCK as u64) && self.ran_at != Some(self.frame) {
             self.ran_at = Some(self.frame);
             self.run(sources);
+            self.update_ambience();
         }
     }
 
-    /// Mixes `frames` stereo frames onto `out`. A mono sample plays on
-    /// both channels; a stereo one keeps its own. A note that reaches its
-    /// end goes on with the first patch chained to it, from where its
-    /// position passed the end, so nothing is left out between them.
+    /// Mixes `frames` stereo frames of the notes and the ambience
+    /// voices onto `out` (see [`mix_note`]).
     fn mix(&mut self, frames: usize, out: &mut Vec<i16>) {
         let start = out.len();
         let mut sums = vec![0i64; 2 * frames];
         let cache = &self.cache;
-        self.notes.retain_mut(|note| {
-            let mut slots = sums.as_chunks_mut::<2>().0.iter_mut();
-            loop {
-                let Some(Some(pcm)) = cache.get(&note.patch) else {
-                    return false;
-                };
-                let channels = usize::from(pcm.channels).max(1);
-                let length = pcm.frames() as u64;
-                if note.position >> 16 >= length {
-                    // Patches are loaded when chained, so each is cached.
-                    if note.chain.is_empty() {
-                        return false;
-                    }
-                    note.position -= length << 16;
-                    note.patch = note.chain.remove(0);
-                    continue;
-                }
-                let sample = |frame: usize, channel: usize| -> i64 {
-                    i64::from(pcm.samples[frame * channels + channel.min(channels - 1)])
-                };
-                let mut ended = false;
-                for slot in slots.by_ref() {
-                    let index = note.position >> 16;
-                    let at = index as usize;
-                    let after = if index + 1 < length { at + 1 } else { at };
-                    // A difference of two samples times a 16-bit fraction
-                    // needs more than 32 bits.
-                    let fraction = i64::from((note.position & 0xffff) as u32);
-                    for (channel, sum) in slot.iter_mut().enumerate() {
-                        let (first, second) = (sample(at, channel), sample(after, channel));
-                        let value = first + (((second - first) * fraction) >> 16);
-                        *sum += (value * i64::from(note.gains[channel])) >> 16;
-                    }
-                    note.position += note.step;
-                    if note.position >> 16 >= length {
-                        ended = true;
-                        break;
-                    }
-                }
-                if !ended {
-                    return true;
-                }
-            }
-        });
+        self.notes
+            .retain_mut(|note| mix_note(note, cache, &mut sums));
+        self.voices
+            .retain_mut(|voice| mix_note(&mut voice.note, cache, &mut sums));
         out.extend(sums.iter().map(|&s| s.clamp(-32768, 32767) as i16));
         debug_assert_eq!(out.len(), start + 2 * frames);
     }
@@ -1456,6 +1652,7 @@ impl<S: Samples> Player<S> {
             step: step(levels.rate),
             gains: levels.gains,
             chain: Vec::new(),
+            looping: false,
         });
         id
     }
@@ -1692,5 +1889,159 @@ impl<S: Samples> Player<S> {
             other => return Err(format!("{other} is not supported")),
         };
         Ok(flow)
+    }
+}
+
+/// Mixes a note onto `sums` (stereo frames): a mono sample plays on both
+/// channels; a stereo one keeps its own. A note that reaches its end goes
+/// on with the first patch chained to it, or from its start when it
+/// loops, from where its position passed the end, so nothing is left out
+/// between them. False when it has ended.
+fn mix_note(note: &mut Note, cache: &BTreeMap<u32, Option<Pcm>>, sums: &mut [i64]) -> bool {
+    let mut slots = sums.as_chunks_mut::<2>().0.iter_mut();
+    loop {
+        let Some(Some(pcm)) = cache.get(&note.patch) else {
+            return false;
+        };
+        let channels = usize::from(pcm.channels).max(1);
+        let length = pcm.frames() as u64;
+        if note.position >> 16 >= length {
+            if note.looping && length > 0 {
+                note.position %= length << 16;
+                continue;
+            }
+            // Patches are loaded when chained, so each is cached.
+            if note.chain.is_empty() {
+                return false;
+            }
+            note.position -= length << 16;
+            note.patch = note.chain.remove(0);
+            continue;
+        }
+        let sample = |frame: usize, channel: usize| -> i64 {
+            i64::from(pcm.samples[frame * channels + channel.min(channels - 1)])
+        };
+        let mut ended = false;
+        for slot in slots.by_ref() {
+            let index = note.position >> 16;
+            let at = index as usize;
+            let after = if index + 1 < length { at + 1 } else { at };
+            // A difference of two samples times a 16-bit fraction needs
+            // more than 32 bits.
+            let fraction = i64::from((note.position & 0xffff) as u32);
+            for (channel, sum) in slot.iter_mut().enumerate() {
+                let (first, second) = (sample(at, channel), sample(after, channel));
+                let value = first + (((second - first) * fraction) >> 16);
+                *sum += (value * i64::from(note.gains[channel])) >> 16;
+            }
+            note.position += note.step;
+            if note.position >> 16 >= length {
+                ended = true;
+                break;
+            }
+        }
+        if !ended {
+            return true;
+        }
+    }
+}
+
+/// An ambience voice's gains: its volume through the sound layer, as a
+/// track's (see [`crate::levels`]), and its pan.
+fn ambient_gains(volume: i32, pan: i32, master: i32) -> [i32; 2] {
+    levels::gains(
+        levels::attenuation(i64::from(volume), i64::from(master)),
+        levels::pan(pan),
+    )
+}
+
+/// The player's parts an ambience player works on.
+struct AmbientHost<'a, S> {
+    samples: &'a mut S,
+    cache: &'a mut BTreeMap<u32, Option<Pcm>>,
+    ambient_patches: &'a mut BTreeMap<String, u32>,
+    voices: &'a mut Vec<AmbientVoice>,
+    random: &'a mut u64,
+    master: i32,
+    faults: &'a mut Vec<String>,
+}
+
+impl<S: Samples> AmbientHost<'_, S> {
+    fn report(&mut self, message: String) {
+        if self.faults.len() < FAULTS {
+            self.faults.push(message);
+        }
+    }
+
+    /// The sample's number in the cache, loading it the first time.
+    fn patch(&mut self, path: &str) -> u32 {
+        if let Some(&patch) = self.ambient_patches.get(path) {
+            return patch;
+        }
+        let patch = AMBIENT_FIRST.wrapping_add(self.ambient_patches.len() as u32);
+        let pcm = self.samples.load(path);
+        if pcm.is_none() {
+            self.report(format!("ambience: no sample at {path}"));
+        }
+        let pcm = match pcm {
+            Some(pcm) if path.to_ascii_lowercase().ends_with(".mp3") => resample(&pcm, RATE),
+            pcm => pcm,
+        };
+        self.ambient_patches.insert(path.to_owned(), patch);
+        self.cache.insert(patch, pcm);
+        patch
+    }
+}
+
+impl<S: Samples> Host for AmbientHost<'_, S> {
+    fn rand(&mut self) -> i32 {
+        xorshift(self.random, 32_768) as i32
+    }
+
+    fn load(&mut self, path: &str) -> Option<u32> {
+        let patch = self.patch(path);
+        self.cache.get(&patch)?.as_ref().map(|pcm| pcm.rate)
+    }
+
+    fn play(&mut self, voice: Voice) {
+        self.voices.retain(|v| v.key != voice.key);
+        if self.voices.len() >= NOTES {
+            self.report(format!("ambience: more than {NOTES} voices"));
+            return;
+        }
+        let patch = self.patch(&voice.path);
+        self.voices.push(AmbientVoice {
+            key: voice.key,
+            volume: voice.volume,
+            pan: voice.pan,
+            note: Note {
+                id: 0,
+                thread: 0,
+                track: 0,
+                object: 0,
+                patch,
+                position: 0,
+                step: step(voice.rate),
+                gains: ambient_gains(voice.volume, voice.pan, self.master),
+                chain: Vec::new(),
+                looping: voice.looping,
+            },
+        });
+    }
+
+    fn set_volume(&mut self, key: Key, volume: i32) {
+        let master = self.master;
+        for voice in self.voices.iter_mut().filter(|v| v.key == key) {
+            voice.volume = volume;
+            voice.note.gains = ambient_gains(volume, voice.pan, master);
+        }
+    }
+
+    fn stop(&mut self, key: Key) {
+        self.voices.retain(|v| v.key != key);
+    }
+
+    fn playing(&self, key: Key) -> bool {
+        self.voices.iter().any(|v| v.key == key)
     }
 }

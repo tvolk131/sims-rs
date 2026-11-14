@@ -210,9 +210,10 @@ fn every_event_definition_runs_without_a_bad_instruction() {
     // No instruction is decoded wrong and none reached is unported. What
     // remains are the files' loose ends (see `install_tables.rs`), 12
     // events with an empty track field (the original's lookup of track 0
-    // finds nothing, as here) and the 29 events of kinds not ported:
-    // music modes (36), ambience modes (52, the ambient scores), the
-    // piano (43), pausing (103) and reloading (104). Of the 181 events
+    // finds nothing, as here) and the 24 events of kinds not ported:
+    // music modes (36, whose ambience half is ported), the piano (43),
+    // pausing (103) and reloading (104). The 5 ambience modes (52) start
+    // and stop scores, none of which this test loads. Of the 181 events
     // still running after 20 blocks, the 60 that turn on a television or
     // radio play their station for ever; 120 more loop (fires,
     // appliances, voices that loop) and one, `Grimreaper_loop_kill`,
@@ -223,11 +224,11 @@ fn every_event_definition_runs_without_a_bad_instruction() {
     assert_eq!((still_running, format!("{unported:?}")), (181, "{}".into()));
     assert_eq!(
         format!("{kinds:?}"),
-        "{36: 21, 43: 1, 52: 5, 103: 1, 104: 1}"
+        "{36: 21, 43: 1, 103: 1, 104: 1}"
     );
     assert_eq!(
         format!("{faults:?}"),
-        "{\"event names no track\": 14, \"event of a kind not ported\": 29, \
+        "{\"event names no track\": 14, \"event of a kind not ported\": 24, \
          \"hit list not found\": 1, \"patch not found\": 3, \"track entry point not found\": 10}"
     );
 }
