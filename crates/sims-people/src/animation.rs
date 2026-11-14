@@ -28,9 +28,13 @@ pub struct Library {
 impl Library {
     /// Reads every animation file (`.bcf` files whose skeleton and
     /// appearance counts are 0). A file that does not decode is skipped.
-    /// A name that two files define takes the first in search order, as
-    /// [`Assets::find`] does; whether the original's library keeps the
-    /// same one is **unverified**.
+    /// A name that two files define takes the first file in name order.
+    /// The original keeps the first clip of a name it loads (0x59f087
+    /// releases a later one), loading `GameData/Animation` before the
+    /// expansions' folders. No clip name is defined by two files in the
+    /// Complete Collection, so the two orders never disagree there. Each
+    /// file's bytes are the first source's ([`Assets::read`]); which copy
+    /// the original reads when two sources differ is **unverified**.
     pub fn scan(assets: &Assets) -> Result<Self, String> {
         let mut library = Self::default();
         for name in assets.names().filter(|n| n.ends_with(".bcf")) {

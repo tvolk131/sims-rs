@@ -346,6 +346,8 @@ fn mount_archive(directories: &mut Directories, at: &[u8], archive: &Path, membe
 /// **Unverified**: the capture the catalog order is checked against holds
 /// no such pair.
 pub(crate) fn sorted_entries(directory: &Path) -> Result<Vec<PathBuf>> {
+    // The one listing in this crate; it sorts what it reads.
+    #[allow(clippy::disallowed_methods)]
     let entries = std::fs::read_dir(directory).map_err(|e| Error::io(directory, e))?;
     let mut paths = Vec::new();
     for entry in entries {

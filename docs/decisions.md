@@ -4,6 +4,149 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-14: Sound volume, pan, pitch and ducking, from the original's code
+
+The sound player now applies volume, pan, pitch and ducking. Each
+formula was read from the original's code in a memory image of the
+running game (read only, never written); none was observed with sound
+playing. The formulas are in `crates/sims-audio/src/levels.rs`. The
+player's output is now stereo: `render_stereo`, with `render` as its mono
+mix.
+
+- **Volume** is `vol * extvol / 1024`, with `extvol` scaled by the
+  track group's volume (the options' sliders, set by the host) and
+  halved when `main_duckpri` is above the track's `duckpri`. The sound
+  layer turns it into a DirectSound attenuation (0 dB at 1024, -40 dB
+  just above 0, silent at 0), which we turn into a linear gain. A track
+  starts with the HOT track's volume and duck priority.
+- **Pan** is DirectSound's: 512 is the centre, and only the far channel
+  is attenuated. No script in the install writes it.
+- **Pitch** sets an absolute rate, `22050 * 2^((pitch - 3600) / 1200)`,
+  whatever the sample's own rate. Every patch in the install is 22,050
+  Hz, and the TV routines set pitch 2400 for 11,025 Hz files, which this
+  plays at their own rate. Before, samples played at their own rate; a
+  sample that is not 22,050 Hz now plays at the rate its pitch sets. The
+  original adds a second track's pitch and subtracts 3600; which track
+  that is was not found, and it is taken as 3600 (**unverified**).
+- **Ducking.** `main_duckpri` (global 123) holds the largest request of
+  any running thread; a thread's request goes when it ends, as the
+  original's kill routine drops it.
+- **Every register write sets the comparison flags**, as the original's
+  write routine does. Branches after a write (such as
+  `getsrcdatafield r; ifne`) now follow the value written. Before, they
+  followed the last `cmp` or `test`.
+- **`target` (53)** sends a thread's register reads and writes to the
+  newest running thread of the track it names, globals included, and
+  on through that thread's own `target`. A track with no running thread
+  means the thread itself, as the original's null lookup does. The
+  install's scripts use it to fade out and kill music and loops. How the
+  original picks among several threads of one track, and what it does
+  when the target has since ended, are not known.
+- **Sequence groups hold track numbers, not thread IDs.** The ID the
+  original stores in a slot is the one `target` looks up, and scripts
+  pass track numbers to `target`. So two threads of one track no longer
+  end each other. This corrects the previous entry.
+- Levels are applied to notes once per block, after the threads run,
+  and when a thread ends. The original applies them as registers
+  change. 3D position, the
+  second pitch and track priorities are left out.
+- The exponentials use only basic arithmetic, so gains are the same on
+  every platform. A track at full volume, centred, passes its samples
+  through unchanged, so the phone ring and footstep still match their
+  samples bit for bit.
+
+Reopen when a run with sound can be compared, or the second pitch's
+track is found.
+
+## 2026-11-14: Directory listings are sorted, and paths are spelled as on disk
+
+From the back review of main:
+
+- **Listings.** `std::fs::read_dir` joins the clippy bans, since the
+  order it lists names in depends on the filesystem. The few listings
+  left sort what they read and say so beside an `allow`.
+- **Spelling.** `sims_content::install::resolve` now always returns the
+  spelling the directory listing gives, and a case-insensitive match
+  takes the first name in sorted order. Before, a case-insensitive
+  filesystem (macOS) returned the spelling asked for and a
+  case-sensitive one the spelling on disk. Paths reach state (a
+  skeleton's file), so the same install could hash differently on two
+  machines. The people crate's lookup takes the first match in sorted
+  order too.
+- **Other bans.** The bans also cover `asinh`, `acosh` and `atanh` for
+  `f32` and `f64`, and `Instant::elapsed` and `SystemTime::elapsed`.
+- **Not banned: environment reads.** No library crate reads the
+  environment. Only tests (the `SIMS_INSTALL` gate) and tool entry
+  points do, and the install path enters as data. Reopen if a library
+  crate needs one.
+
+## 2026-11-14: Which catalog wins when two hold the same name
+
+The original's code settles this for appearances and clips. Before
+loading, it builds a list of search folders (0x5835ed, as the old
+prototype traced it). It then lists the catalog files in those folders
+(0x5c1a7d, as the old prototype ported it in
+`legacy/crates/sims-sim/src/pose/clothing/catalog_files.rs`):
+- every text catalog (`.cmx`) in every folder before any binary one
+  (`.bcf`);
+- each kind folder by folder;
+- a file name already listed from an earlier folder is skipped.
+
+It loads them in that order (0x59f844 for appearances, 0x5a0212 for
+animations). For each record it looks the name up first. A name not yet
+known is added. A name already loaded keeps its record, and the new one
+is released (0x59f087, which calls 0x5954a5 for appearances and
+0x59778a for clips). So **the first catalog loaded wins.**
+
+For appearances the folder order is:
+1. the game's own skins (`GameData/Skins`);
+2. the shared expansion folders (`ExpansionShared/Skins` and others);
+3. each expansion's `Skins`, `Animations` and `Accessories`, from the
+   newest expansion back;
+4. the first expansion.
+
+An archive's members count as being in the archive's folder plus the
+folder in the member's name. For example, `Deluxe.far`'s
+`Skins\b200mafit_ctb.cmx.bcf` is in `deluxe/skins`.
+
+`sims-people` now does the same. On first use it puts every catalog of
+the install in that order, reads each, and keeps the first catalog of
+each appearance name. A catalog it cannot read is skipped, as the
+original goes on after a file it cannot read. Reading them all takes
+under a second. This replaces the old lookup, which:
+- tried the binary file named after the appearance first, then the text
+  one;
+- then took the first catalog in name order.
+
+In the Complete Collection, one appearance is given differently by two
+catalogs: `b200mafit_ctb`. It is in `GameData/Skins` as text and in
+Deluxe's archive as binary, with different bindings. The original takes
+the `GameData/Skins` one, and the old lookup took Deluxe's. A gated test
+checks this one, and unit tests check the order and the first-wins rule
+without the install.
+
+What is still approximated or open:
+
+- **Order within one folder: unverified.** It is the original's file
+  map's, which is not ported; we use name order. No folder of the
+  install holds two catalogs giving the same name.
+- **Folders the original does not search.** Catalogs elsewhere (such as
+  an expansion's object folder) are loaded after all the others. The
+  original may not load them at all.
+- **Clips.** The rule is the same, with `GameData/Animation` searched
+  first. No clip name is defined by two files in the install, so our
+  order (the first file in name order) never picks differently.
+- **Same-named files other than catalogs: unverified.** 47 file names
+  exist in two sources with different bytes: accessory textures such as
+  `bottle.bmp`, some animation files shared by the third expansion and
+  `ExpansionShared`, and a few meshes. Which copy the original reads
+  depends on how it looks those files up, which is not ported. Its
+  texture search lists the expansions before `GameData` (0x413ccc), the
+  reverse of our order, and the expansions' copies of the accessory
+  textures are larger. So the original may well prefer them. None of
+  these files is drawn for the Goth family. We keep our order and mark
+  it unverified.
+
 ## 2026-11-14: Scripted input reaches the game through xdotool, and is confirmed in memory
 
 The harness can now drive the original from a scenario file while it
@@ -207,6 +350,7 @@ such a member, and so whether it hides a later file of the same name.
 The game's own archives hold none. Keeping both sizes on
 `sims_content::Member` waits on `sims-people`, which builds that struct
 itself and also reads FAR directories without these caps.
+
 
 ## 2026-11-14: People: transparent texels, shared edges, and people made after the load
 
