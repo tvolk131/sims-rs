@@ -11,6 +11,14 @@ pub enum Error {
         offset: usize,
         message: String,
     },
+    /// A line of a text file does not hold what the format needs.
+    Text {
+        format: &'static str,
+        line: usize,
+        message: String,
+    },
+    /// A sound module's files are missing or do not parse.
+    Module { name: String, message: String },
     /// A file could not be read.
     Io { path: PathBuf, message: String },
 }
@@ -20,6 +28,14 @@ impl Error {
         Self::Format {
             format,
             offset,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn text(format: &'static str, line: usize, message: impl Into<String>) -> Self {
+        Self::Text {
+            format,
+            line,
             message: message.into(),
         }
     }
@@ -40,6 +56,12 @@ impl fmt::Display for Error {
                 offset,
                 message,
             } => write!(f, "{format} at byte {offset}: {message}"),
+            Self::Text {
+                format,
+                line,
+                message,
+            } => write!(f, "{format} line {line}: {message}"),
+            Self::Module { name, message } => write!(f, "sound module {name}: {message}"),
             Self::Io { path, message } => write!(f, "{}: {message}", path.display()),
         }
     }
