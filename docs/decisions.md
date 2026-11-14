@@ -16,8 +16,10 @@ the three Goths standing in their saved outfits. Ours were drawn standing
   and about 61 in ours (within 4%). That also supports 3 model units per
   tile and the house view's 30-degree tilt.
 - **Mortimer** (person 21) and **Bella** (person 18) are seen from
-  behind. Outfits and proportions match. Mortimer holds a book, so he is
-  not playing the standing loop, and his loop is **not compared**.
+  behind. Outfits and proportions match. Mortimer holds a book: a carry
+  layer can play over the base layer's loop, so this does not show
+  which loop he plays. His carrying pose is not compared, and his base
+  clip is unknown, so his standing loop is **not compared**.
 - The phase of the original's loop is not known, so small differences in
   pose within the loop are not judged.
 
@@ -41,8 +43,9 @@ Direct3D's fixed-function lighting then adds the lights up per vertex.
   lighting record (+0x20).
 - **Ambient.** A grey of `round(255 × (low + (high − low) × level))`.
   `low` and `high` live in a static lighting object at 0x6f0150 and
-  start at 0 and 1 (its constructor, 0x4b457c), so the grey is
-  `round(255 × level)`.
+  start at 0 and 1 (its constructor, 0x4b457c). With these defaults the
+  grey is `round(255 × level)`. Whether anything changes them while the
+  game runs was not checked (**unverified**).
 - **The standard light.** One directional light from
   `GameData/Lights/stdlight.lgt`: white, intensity 1, direction
   (−0.644, −0.418, −0.641) in the files' frame. Each light of the record
@@ -60,8 +63,9 @@ on the viewer's left. They are different people facing different ways,
 so this only suggests that the light turns with the view.
 
 **What we do.** One light fixed in the lot, from above and the viewer's
-right (`raster::LIGHT`), with shade `0.45 + 0.55 × max(0, n · l)`. There
-is no level, no lamps and no fade.
+right (`raster::LIGHT`), with shade `0.45 + 0.55 × max(0, n · l)`,
+where `n` is the vertex's normal and `l` the unit vector towards the
+light. There is no level, no lamps and no fade.
 
 **What matching needs.**
 
