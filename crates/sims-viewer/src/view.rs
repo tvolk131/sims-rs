@@ -20,6 +20,15 @@ pub enum Command {
     Save,
 }
 
+/// How far the lot's origin may move from the screen's corner, in pixels.
+/// A 64-tile lot at the near zoom spans 8192 pixels across, so this leaves
+/// room to scroll anywhere near it, and keeps the projection's arithmetic
+/// far from overflowing whatever the commands.
+const ORIGIN_LIMIT: i32 = 1 << 16;
+
+/// The largest canvas side the viewer draws, in the original's pixels.
+const SIZE_LIMIT: i32 = 1 << 14;
+
 /// The viewer's camera and screen size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct View {
@@ -38,8 +47,19 @@ impl View {
             origin: [0, 0],
             walls: Walls::Cutaway,
         };
+        let size = size.map(|n| n.clamp(1, SIZE_LIMIT));
         camera.center_on(center, [size[0] / 2, size[1] / 2]);
-        Self { camera, size }
+        let mut view = Self { camera, size };
+        view.bound();
+        view
+    }
+
+    /// Keeps the origin within [`ORIGIN_LIMIT`].
+    fn bound(&mut self) {
+        self.camera.origin = self
+            .camera
+            .origin
+            .map(|n| n.clamp(-ORIGIN_LIMIT, ORIGIN_LIMIT));
     }
 
     fn middle(&self) -> [i32; 2] {
@@ -49,9 +69,10 @@ impl View {
     /// Resizes the canvas, keeping the lot point in the middle there.
     pub fn resize(&mut self, size: [i32; 2]) {
         let fine = self.camera.unproject_fine(self.middle());
-        self.size = size;
+        self.size = size.map(|n| n.clamp(1, SIZE_LIMIT));
         let middle = self.middle();
         self.camera.center_on(fine, middle);
+        self.bound();
     }
 
     /// Applies a command. Returns whether the picture changes.
@@ -70,11 +91,12 @@ impl View {
             Command::LevelDown => self.camera.level = (self.camera.level - 1).max(1),
             Command::Walls(walls) => self.camera.walls = walls,
             Command::Scroll([dx, dy]) => {
-                self.camera.origin[0] += dx;
-                self.camera.origin[1] += dy;
+                self.camera.origin[0] = self.camera.origin[0].saturating_add(dx);
+                self.camera.origin[1] = self.camera.origin[1].saturating_add(dy);
             }
             Command::Save => return false,
         }
+        self.bound();
         self.camera != before
     }
 
@@ -135,5 +157,26 @@ mod tests {
         assert_eq!(v.camera.origin, [origin[0] + 10, origin[1] - 5]);
         v.resize([400, 300]);
         assert_eq!(v.size, [400, 300]);
+    }
+
+    #[test]
+    fn extreme_scrolling_and_sizes_stay_bounded() {
+        let mut v = View::new([800, 600], [400, 400], 0);
+        for command in [
+            Command::Scroll([i32::MAX, i32::MIN]),
+            Command::Scroll([i32::MAX, i32::MIN]),
+            Command::ZoomIn,
+            Command::ZoomIn,
+            Command::Rotate(true),
+            Command::Scroll([i32::MIN, i32::MAX]),
+            Command::ZoomOut,
+        ] {
+            v.apply(command);
+            assert!(v.camera.origin.iter().all(|n| n.abs() <= ORIGIN_LIMIT));
+        }
+        v.resize([i32::MAX, 0]);
+        assert_eq!(v.size, [SIZE_LIMIT, 1]);
+        let v = View::new([0, i32::MIN], [400, 400], 7);
+        assert_eq!((v.size, v.camera.rotation), ([1, 1], 3));
     }
 }

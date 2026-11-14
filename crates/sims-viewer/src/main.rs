@@ -21,6 +21,7 @@ mod view;
 
 use sims_render::{Canvas, Lot, Walls, draw, open_house, png};
 use softbuffer::{Context, Surface};
+use std::ffi::OsString;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -41,24 +42,30 @@ struct Options {
 
 fn options() -> Result<Options, String> {
     let usage = "usage: sims-viewer <install> <house file> [--snapshot <file.redb> [name]] [--save-dir <dir>]";
-    let mut args = std::env::args().skip(1);
+    // Paths need not be Unicode; flags and snapshot names must be.
+    let mut args = std::env::args_os().skip(1);
     let install = args.next().ok_or(usage)?.into();
     let house = args.next().ok_or(usage)?.into();
     let mut snapshot = None;
     let mut save_dir = PathBuf::from(".");
-    let mut rest: Vec<String> = args.collect();
+    let mut rest: Vec<OsString> = args.collect();
     rest.reverse();
     while let Some(arg) = rest.pop() {
-        match arg.as_str() {
-            "--snapshot" => {
+        match arg.to_str() {
+            Some("--snapshot") => {
                 let path = rest.pop().ok_or(usage)?;
-                let name = match rest.last() {
-                    Some(n) if !n.starts_with("--") => rest.pop().unwrap_or_default(),
+                let name = match rest.last().map(|n| n.to_str()) {
+                    Some(Some(n)) if !n.starts_with("--") => {
+                        let name = n.to_string();
+                        rest.pop();
+                        name
+                    }
+                    Some(None) => return Err("a snapshot name must be Unicode".to_string()),
                     _ => "boot".to_string(),
                 };
                 snapshot = Some((PathBuf::from(path), name));
             }
-            "--save-dir" => save_dir = rest.pop().ok_or(usage)?.into(),
+            Some("--save-dir") => save_dir = rest.pop().ok_or(usage)?.into(),
             _ => return Err(usage.to_string()),
         }
     }
@@ -100,6 +107,8 @@ impl Viewer {
     }
 
     fn save(&mut self) {
+        // Keys can arrive before the redraw: draw what the name describes.
+        self.render();
         let c = &self.view.camera;
         let name = format!(
             "view-z{}-r{}-f{}-{}.png",
@@ -142,33 +151,25 @@ impl Viewer {
         self.command(command);
     }
 
-    fn redraw(&mut self) {
-        let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
+    /// Draws the lot into the canvas if the view changed since the last
+    /// drawing.
+    fn render(&mut self) {
+        if !self.dirty {
             return;
-        };
-        let size = window.inner_size();
-        let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
-            return;
-        };
-        let scale = self.scale.max(1);
-        let canvas_size = [(size.width / scale) as i32, (size.height / scale) as i32];
-        if canvas_size != self.view.size {
-            self.view.resize(canvas_size);
-            self.dirty = true;
         }
-        if self.dirty {
-            let [cw, ch] = self.view.size.map(|n| n.max(1) as usize);
-            if (self.canvas.width, self.canvas.height) != (cw, ch) {
-                self.canvas = Canvas::new(cw, ch, [0, 0, 0]);
-            }
-            self.stats = draw(
-                &self.world,
-                &self.lot,
-                &mut self.assets,
-                &self.view.camera,
-                &mut self.canvas,
-            );
-            self.dirty = false;
+        let [cw, ch] = self.view.size.map(|n| n.max(1) as usize);
+        if (self.canvas.width, self.canvas.height) != (cw, ch) {
+            self.canvas = Canvas::new(cw, ch, [0, 0, 0]);
+        }
+        self.stats = draw(
+            &self.world,
+            &self.lot,
+            &mut self.assets,
+            &self.view.camera,
+            &mut self.canvas,
+        );
+        self.dirty = false;
+        if let Some(window) = &self.window {
             window.set_title(&format!(
                 "sims-viewer: {} ({} floors, {} walls, {} objects)",
                 self.view.describe(),
@@ -177,6 +178,26 @@ impl Viewer {
                 self.stats.objects
             ));
         }
+    }
+
+    fn redraw(&mut self) {
+        let Some(size) = self.window.as_ref().map(|w| w.inner_size()) else {
+            return;
+        };
+        let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
+            return;
+        };
+        let scale = self.scale.max(1);
+        let canvas_size = [size.width / scale, size.height / scale]
+            .map(|n| i32::try_from(n).unwrap_or(i32::MAX).max(1));
+        if canvas_size != self.view.size {
+            self.view.resize(canvas_size);
+            self.dirty = true;
+        }
+        self.render();
+        let Some(surface) = &mut self.surface else {
+            return;
+        };
         if surface.resize(w, h).is_err() {
             return;
         }
@@ -246,6 +267,9 @@ impl ApplicationHandler for Viewer {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor.round().max(1.0) as u32;
                 self.dirty = true;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if event.logical_key == Key::Named(NamedKey::Escape) {
@@ -255,15 +279,16 @@ impl ApplicationHandler for Viewer {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let up = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y > 0.0,
-                    MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
+                let y = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+                    MouseScrollDelta::PixelDelta(p) => p.y,
                 };
-                self.command(if up {
-                    Command::ZoomIn
-                } else {
-                    Command::ZoomOut
-                });
+                // Sideways and empty wheel events leave the zoom alone.
+                if y > 0.0 {
+                    self.command(Command::ZoomIn);
+                } else if y < 0.0 {
+                    self.command(Command::ZoomOut);
+                }
             }
             WindowEvent::MouseInput {
                 state,
@@ -296,6 +321,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = options()?;
     let opened = open_house(&options.install, &options.house)?;
     let world = match &options.snapshot {
+        // Opening a snapshot store creates it if it is missing, so check
+        // first rather than leave an empty file behind a mistyped path.
+        Some((path, _)) if !path.is_file() => {
+            return Err(format!("no snapshot file at {}", path.display()).into());
+        }
         Some((path, name)) => sims_sim::Snapshots::open(path)?
             .load(name)?
             .ok_or_else(|| format!("{} holds no world named {name}", path.display()))?,
