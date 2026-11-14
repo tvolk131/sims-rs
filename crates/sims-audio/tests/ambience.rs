@@ -405,3 +405,80 @@ fn a_score_larger_than_the_grid_is_refused() {
     assert!(!player.add_score(0, &large, "amb"));
     assert_eq!(player.faults.len(), 1);
 }
+
+#[test]
+fn a_score_added_later_takes_the_effects_volume() {
+    let mut player = Player::new(vec![module()], samples(), 7);
+    player.set_group_volume(1, 512);
+    let one = score(header(1, 1, 1, 1, 0), &[Some(cell(20, "a.xa"))]);
+    assert!(player.add_score(0, &one, "amb"));
+    event(&mut player, "amb0");
+    let out = player.render_stereo(4 * RATE as usize, &NoSources);
+    let first = block_at(3000) * 2;
+    assert_eq!(&out[first..first + 2], &[99, 99]);
+}
+
+#[test]
+fn a_score_replacing_the_current_one_plays_on() {
+    let one = score(header(1, 1, 1, 1, 0), &[Some(cell(20, "a.xa"))]);
+    let mut player = player(&[(0, one.clone())]);
+    event(&mut player, "amb0");
+    player.render_stereo(RATE as usize, &NoSources);
+    assert!(player.add_score(0, &one, "amb"));
+    assert!(player.ambience().is_some_and(|a| a.is_started()));
+    let out = player.render_stereo(8 * RATE as usize, &NoSources);
+    assert!(!runs(&out, 0).is_empty());
+}
+
+#[test]
+fn a_looping_cell_whose_sound_is_dropped_frees_its_slot() {
+    let mut samples = samples();
+    samples.insert(
+        "amb\\empty.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: Vec::new(),
+        },
+    );
+    let mut looping = cell(20, "empty.xa");
+    looping.fields[10] = 1;
+    let one = score(header(1, 1, 1, 1, 0), &[Some(looping)]);
+    let mut player = Player::new(vec![module()], samples, 7);
+    assert!(player.add_score(0, &one, "amb"));
+    event(&mut player, "amb0");
+    let mut active = Vec::new();
+    for _ in 0..16 {
+        player.render_stereo(RATE as usize / 2, &NoSources);
+        active.push(player.ambience().unwrap().active());
+    }
+    // Chosen, loaded, played, then let go when its voice is gone.
+    let first = active.iter().position(|&a| a == 1).unwrap();
+    assert!(active[first..].contains(&0), "{active:?}");
+}
+
+#[test]
+fn an_update_far_in_the_future_does_not_overflow() {
+    use sims_audio::ambience::{Fresh, Host, Key, Voice};
+    struct Silent;
+    impl Host for Silent {
+        fn rand(&mut self) -> i32 {
+            0
+        }
+        fn load(&mut self, _: &str) -> Option<u32> {
+            None
+        }
+        fn play(&mut self, _: Voice) {}
+        fn set_volume(&mut self, _: Key, _: i32) {}
+        fn stop(&mut self, _: Key) {}
+        fn playing(&self, _: Key) -> bool {
+            false
+        }
+    }
+    let one = score(header(1, 1, 1, 1, 0), &[Some(cell(20, "a.xa"))]);
+    let mut fresh = Fresh::new(0, &one, "amb", RATE).unwrap();
+    fresh.start(0);
+    fresh.update(u64::MAX, &mut Silent);
+    fresh.update(u64::MAX, &mut Silent);
+    assert!(fresh.is_started());
+}

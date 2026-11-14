@@ -28,6 +28,10 @@ of it was heard, since the harness runs the game with `-nosound`.
   and that the second input is the hour; whether the sound system finds
   a cell's file outside the score's directory (the Magic Town score has
   50 such cells, which do not play here).
+- Two of the original's quirks are kept: the beat clock wraps after
+  about five hours of one score playing, and a beat can pick one cell
+  past the score's limit. One guard is not the original's: a looping
+  cell whose sound the mixer dropped frees its slot.
 - **Left out:** fade in and out, the fast counter, the delay,
   quantise, stereo and third random fields, tempo changes and pausing.
 

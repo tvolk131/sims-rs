@@ -353,10 +353,6 @@ struct AmbientVoice {
     note: Note,
 }
 
-/// The first number given to an ambience sample in the patch cache;
-/// stations count up from 1 << 30, far below.
-pub const AMBIENT_FIRST: u32 = 0xc000_0000;
-
 /// Source frames per output frame, 16.16 fixed point, at a playback rate.
 fn step(rate: u32) -> u64 {
     (u64::from(rate) << 16) / u64::from(RATE)
@@ -474,6 +470,9 @@ pub struct Player<S> {
     voices: Vec<AmbientVoice>,
     /// Ambience sample paths to their numbers in the patch cache.
     ambient_patches: BTreeMap<String, u32>,
+    /// The ambience samples, by their number in `ambient_patches`: kept
+    /// apart from `cache` so no HOT patch number can name one.
+    ambient_cache: BTreeMap<u32, Option<Pcm>>,
     frame: u64,
     /// The frame at which the threads last ran.
     ran_at: Option<u64>,
@@ -523,6 +522,7 @@ impl<S: Samples> Player<S> {
             music_started: false,
             voices: Vec::new(),
             ambient_patches: BTreeMap::new(),
+            ambient_cache: BTreeMap::new(),
             frame: 0,
             ran_at: None,
             next_id: 1,
@@ -564,13 +564,27 @@ impl<S: Samples> Player<S> {
 
     /// Adds an ambience score for a mode (see [`ambience::SCORES`]), its
     /// samples in `directory`. False (reported) when the score is larger
-    /// than the original's grid.
+    /// than the original's grid. The score takes the effects group's
+    /// volume if one was set (the original makes its players before the
+    /// options set it); one that replaces a started score starts.
     pub fn add_score(&mut self, mode: u32, score: &Score, directory: &str) -> bool {
         match Fresh::new(mode, score, directory, RATE) {
             Some(fresh) => {
+                let mut started = false;
                 if let Some(mut old) = self.scores.insert(mode, fresh) {
+                    started = old.is_started();
                     old.stop(&mut self.host());
                 }
+                let volume = self.group_volumes.get(&1).copied();
+                let frame = self.frame;
+                self.with_score(mode, |score, host| {
+                    if let Some(volume) = volume {
+                        score.set_volume(volume, host);
+                    }
+                    if started {
+                        score.start(frame);
+                    }
+                });
                 true
             }
             None => {
@@ -636,7 +650,7 @@ impl<S: Samples> Player<S> {
     fn host(&mut self) -> AmbientHost<'_, S> {
         AmbientHost {
             samples: &mut self.samples,
-            cache: &mut self.cache,
+            cache: &mut self.ambient_cache,
             ambient_patches: &mut self.ambient_patches,
             voices: &mut self.voices,
             random: &mut self.random,
@@ -1261,10 +1275,11 @@ impl<S: Samples> Player<S> {
         let start = out.len();
         let mut sums = vec![0i64; 2 * frames];
         let cache = &self.cache;
+        let ambient_cache = &self.ambient_cache;
         self.notes
             .retain_mut(|note| mix_note(note, cache, &mut sums));
         self.voices
-            .retain_mut(|voice| mix_note(&mut voice.note, cache, &mut sums));
+            .retain_mut(|voice| mix_note(&mut voice.note, ambient_cache, &mut sums));
         out.extend(sums.iter().map(|&s| s.clamp(-32768, 32767) as i16));
         debug_assert_eq!(out.len(), start + 2 * frames);
     }
@@ -1987,7 +2002,7 @@ impl<S: Samples> AmbientHost<'_, S> {
         if let Some(&patch) = self.ambient_patches.get(path) {
             return patch;
         }
-        let patch = AMBIENT_FIRST.wrapping_add(self.ambient_patches.len() as u32);
+        let patch = u32::try_from(self.ambient_patches.len()).unwrap_or(u32::MAX);
         let pcm = self.samples.load(path);
         if pcm.is_none() {
             self.report(format!("ambience: no sample at {path}"));

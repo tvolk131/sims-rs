@@ -482,13 +482,21 @@ impl Fresh {
     }
 
     /// *(code)* The update (vtable +0x14, 0x577ab9), at a frame.
+    ///
+    /// Two quirks are the original's and kept: the next beat's time is
+    /// `(beats - first) * 60000 / tempo` in 32 bits, which wraps after
+    /// about 35,800 beats (five hours at 120 beats a minute) and then
+    /// never falls due until the score is started again; and the second
+    /// pick compares the active count taken before the first, so a beat
+    /// can take the score one cell past its limit.
     pub fn update(&mut self, frame: u64, host: &mut dyn Host) {
         let target = self.target();
         let limit = self.limit();
         if !self.started {
             return;
         }
-        let elapsed = frame.saturating_sub(self.timer) * 1000 / u64::from(self.rate.max(1));
+        let elapsed =
+            frame.saturating_sub(self.timer).saturating_mul(1000) / u64::from(self.rate.max(1));
         let now = u32::try_from(elapsed).unwrap_or(u32::MAX);
         let due = if self.tempo == 0 {
             u32::MAX
@@ -758,6 +766,12 @@ impl Fresh {
                 }
             }
             State::Playing => {
+                // Not the original's: a looping sound never ends there,
+                // but the host may have dropped it (no room, no frames).
+                if !host.playing(key) {
+                    self.release(at, host);
+                    return;
+                }
                 let cell = &mut self.cells[at];
                 cell.loops_left = cell.loops_left.wrapping_sub(1);
                 let left = cell.loops_left;
