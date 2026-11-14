@@ -58,6 +58,300 @@ mix.
 Reopen when a run with sound can be compared, or the second pitch's
 track is found.
 
+## 2026-11-14: Directory listings are sorted, and paths are spelled as on disk
+
+From the back review of main:
+
+- **Listings.** `std::fs::read_dir` joins the clippy bans, since the
+  order it lists names in depends on the filesystem. The few listings
+  left sort what they read and say so beside an `allow`.
+- **Spelling.** `sims_content::install::resolve` now always returns the
+  spelling the directory listing gives, and a case-insensitive match
+  takes the first name in sorted order. Before, a case-insensitive
+  filesystem (macOS) returned the spelling asked for and a
+  case-sensitive one the spelling on disk. Paths reach state (a
+  skeleton's file), so the same install could hash differently on two
+  machines. The people crate's lookup takes the first match in sorted
+  order too.
+- **Other bans.** The bans also cover `asinh`, `acosh` and `atanh` for
+  `f32` and `f64`, and `Instant::elapsed` and `SystemTime::elapsed`.
+- **Not banned: environment reads.** No library crate reads the
+  environment. Only tests (the `SIMS_INSTALL` gate) and tool entry
+  points do, and the install path enters as data. Reopen if a library
+  crate needs one.
+
+## 2026-11-14: Which catalog wins when two hold the same name
+
+The original's code settles this for appearances and clips. Before
+loading, it builds a list of search folders (0x5835ed, as the old
+prototype traced it). It then lists the catalog files in those folders
+(0x5c1a7d, as the old prototype ported it in
+`legacy/crates/sims-sim/src/pose/clothing/catalog_files.rs`):
+- every text catalog (`.cmx`) in every folder before any binary one
+  (`.bcf`);
+- each kind folder by folder;
+- a file name already listed from an earlier folder is skipped.
+
+It loads them in that order (0x59f844 for appearances, 0x5a0212 for
+animations). For each record it looks the name up first. A name not yet
+known is added. A name already loaded keeps its record, and the new one
+is released (0x59f087, which calls 0x5954a5 for appearances and
+0x59778a for clips). So **the first catalog loaded wins.**
+
+For appearances the folder order is:
+1. the game's own skins (`GameData/Skins`);
+2. the shared expansion folders (`ExpansionShared/Skins` and others);
+3. each expansion's `Skins`, `Animations` and `Accessories`, from the
+   newest expansion back;
+4. the first expansion.
+
+An archive's members count as being in the archive's folder plus the
+folder in the member's name. For example, `Deluxe.far`'s
+`Skins\b200mafit_ctb.cmx.bcf` is in `deluxe/skins`.
+
+`sims-people` now does the same. On first use it puts every catalog of
+the install in that order, reads each, and keeps the first catalog of
+each appearance name. A catalog it cannot read is skipped, as the
+original goes on after a file it cannot read. Reading them all takes
+under a second. This replaces the old lookup, which:
+- tried the binary file named after the appearance first, then the text
+  one;
+- then took the first catalog in name order.
+
+In the Complete Collection, one appearance is given differently by two
+catalogs: `b200mafit_ctb`. It is in `GameData/Skins` as text and in
+Deluxe's archive as binary, with different bindings. The original takes
+the `GameData/Skins` one, and the old lookup took Deluxe's. A gated test
+checks this one, and unit tests check the order and the first-wins rule
+without the install.
+
+What is still approximated or open:
+
+- **Order within one folder: unverified.** It is the original's file
+  map's, which is not ported; we use name order. No folder of the
+  install holds two catalogs giving the same name.
+- **Folders the original does not search.** Catalogs elsewhere (such as
+  an expansion's object folder) are loaded after all the others. The
+  original may not load them at all.
+- **Clips.** The rule is the same, with `GameData/Animation` searched
+  first. No clip name is defined by two files in the install, so our
+  order (the first file in name order) never picks differently.
+- **Same-named files other than catalogs: unverified.** 47 file names
+  exist in two sources with different bytes: accessory textures such as
+  `bottle.bmp`, some animation files shared by the third expansion and
+  `ExpansionShared`, and a few meshes. Which copy the original reads
+  depends on how it looks those files up, which is not ported. Its
+  texture search lists the expansions before `GameData` (0x413ccc), the
+  reverse of our order, and the expansions' copies of the accessory
+  textures are larger. So the original may well prefer them. None of
+  these files is drawn for the Goth family. We keep our order and mark
+  it unverified.
+
+## 2026-11-14: Scripted input reaches the game through xdotool, and is confirmed in memory
+
+The harness can now drive the original from a scenario file while it
+captures (`capture.py --scenario`, `tools/harness/input.py`). This is how
+captures with player input are made, for our simulation to replay.
+
+What was decided:
+
+- **Input goes through xdotool in the guest, not QEMU.** QEMU's input
+  devices do not reach the game: the guest's X server is Xvfb, which reads
+  no device. A small guest job (`guest/input-agent.sh`) runs the commands
+  the host drops in the share, polling every 50 ms; the generic job runner
+  polls once a second. Guest memory is never written.
+- **What was clicked is read from the pie menu, not trusted.** The
+  picker tool's hovered object (picker `+0x2e`) lags the pointer by tens of
+  lot updates under TCG, because the game takes pointer moves late. Once it
+  named the bench while the pointer was over the porch floor, and the click
+  opened "Go Here". So the hover reading only says when to press, and the
+  pie menu's actions say what was clicked: a menu whose actions aim at
+  another object is closed with Escape and the next aim point tried.
+- **A chosen interaction is confirmed twice.** capture.py stops at
+  `0x48ddcb`, the call in the pie menu's select handler (`0x48dd67`) that
+  pushes the action on the person (`0x45d20b`, edi the person, esi the
+  action), and logs it with the update it falls before or in. Then
+  `expect-queued` waits for the person to hold that action, queued
+  (`+0x820`) or running (`+0xa48`).
+- **Dialogs are answered on the dialog stops.** A modal dialog holds the
+  lot update it shows in, so a step that waits for update returns would
+  never see it. `answer-dialog` presses once, as `answer.sh` does, and
+  waits for the dialog's result stop.
+
+**Checked against the original.** In a capture from a fresh boot
+(2026-11-14), the scenario answered the five welcome notices and the Help
+System dialog, aimed at bench 173 by projecting its position (hover
+confirmed on the second aim point), opened a pie menu with the one entry
+Sit (caller 21, target 173, routine 8213, priority 50), and chose it. The
+push came before lot update 178. At the return of update 180 the person's
+queue was already empty, and the full state after update 200 holds Sit on
+173 as its active action, with uid 1. (That run's check read only the
+queue; reading the running action too was added after it.) A second
+scenario on the same running lot hit the bench at the same aim point, got
+the same menu, recorded the push before update 168, and found Sit on 173
+in person 21's queue (uid 7) at the return of update 168, behind its
+running action. Screenshots showed the bench in the
+person's queue. The memory layout used (picker, pie menu, people panel,
+house view, queue) is listed in `input.py`; each part was read in the
+running game.
+
+**Unverified.**
+
+- The projection was checked only in the starting view (zoom 1, no
+  rotation), and it ignores the floor's height: the porch, on a
+  foundation, is hit about 30 pixels above its projected point, which the
+  aim points cover.
+- Hovering is not free of side effects: `0x48c834` sets and clears
+  highlight bits in the hovered object's flags (`+0x114`, through
+  `0x4320da`). Whether those bits reach anything our simulation compares
+  is not checked. A replay may need them, or a check that they are only
+  drawn.
+- Submenus, build and buy mode, and a missed dialog press (the step then
+  waits for the dialog to be answered by hand) are not handled.
+- Dialog button places are written in the scenario, not read from the
+  dialog.
+
+## 2026-11-14: The head follows its target, and K = 366
+
+In tick 334 of the Goth house, person 16's head starts to follow what
+it looks at. That is now ported, with what it needs: the places of the
+head's points in the current pose, and the height of the ground. Ticks
+335 to 366 then reach a few more mechanics, which are ported too. Our
+state after every one of ticks 1 to 366 equals the fourth capture, but
+for the last place of one head field. Tick 367 stops loudly. K goes
+from 333 to 366.
+
+Terms used here. A *heading* is an angle seen from above, in eighths of
+a turn from 0 to 8. An *anchor* is a named point fixed to a bone, such
+as the top of the head. The *current pose* is where every bone is when
+the foreground clip is played at its present phase. A *joining entry*
+is the interaction a person may start to take part in another person's
+running interaction.
+
+What was decided:
+
+- **The head's follow, relax and settle are ported** (0x590768,
+  0x5907c5), in `sims_sim::head`. The turn moves by at most 0.2 eighths
+  per tick towards the difference of the two headings, and stops at 1.5
+  either way, where word 42 changes. With the follow off it shrinks by
+  a fifth each tick. Look Towards (frame step 6) now feeds it.
+- **The headings are measured on the current pose** (0x5904d2). The
+  pose is built when needed from the foreground layer, as the strides
+  are, not kept. The HEAD bone is found by name and turned for the
+  measurement only, then turned back (0x590b27). The person's model
+  matrix (0x592132) turns the skeleton to its direction and lifts it to
+  the height of the ground. Every add, subtract, multiply, divide and
+  square root is rounded to single precision, as the game's FPU setting
+  does.
+- **The height of the ground follows the tile's corners** (0x478dfe).
+  The tile is cut along its diagonal into two triangles; the height is
+  taken on a plane through the triangle's corners. The original hands
+  the function the person's rounded second coordinate first, then the
+  first (0x592234, 0x592242). The old prototype's `Terrain::height`
+  (legacy/crates/sims-sim/src/pose/transform.rs) has the same shape.
+- **Snapshot format 18** keeps the head's fields (animator +0x210 to
+  +0x224). The target is None until something writes it: the original
+  leaves those words as memory held them. The pins taken under format
+  17 still hold with them left out (`format_17_bytes`).
+- **A walk can start with a clip** (animator state 6, 0x58e125). The
+  person moves one clip's distance straight ahead, following the clip
+  until its phase reaches 0.95.
+- **Find Best Interaction scores joining entries** (0x41ee99, called at
+  0x458aee). For a person whose running interaction may be joined
+  (flag 0x2), the entry is that interaction's joining index on the same
+  object. Its check tree runs with arguments 1, 1, 0, 0 instead of 1, 0,
+  0, 0 (0x458372). When the joining interaction is missing, the
+  original leaves the entry's target empty and 0x458319 returns before
+  any effect, so we leave the entry out.
+- **Run Tree By Name mode 1 is ported** (0x44ba26, 0x44bb4b). The tree
+  runs to its end on the stack object's thread, with that object's
+  temps (0x4749b5 with no arguments). No one is woken and no use is
+  counted. Mode 0 still fails loudly.
+- **The place test's refusal is told apart** (0x4337f6, read by
+  0x48158c). A wall crossing answers 3. An object in the way answers 6
+  when it is the route's own first object, else 5 for a person and 1
+  for any other, and its id goes to the route's +0x8c. An exclusive
+  clash with no object answers 6. Refusals the original marks with
+  other codes answer 0. A refusal whose code we have not read (the
+  wall rules of step 3) fails loudly at 0x48158c.
+- **The planner gives up with no candidates** (0x482462), setting its
+  result to 7 when it was 1. The route to a slot then clears its
+  candidates and both indices (0x481898) and answers 0. Go To Routing
+  Slot's step 6, which takes that answer, fails loudly at 0x45b066.
+
+How it was checked:
+
+- After every one of ticks 1 to 366, our state equals the fourth
+  capture's, floats bit for bit, in the same fields as before, now with
+  the head's fields (`tick_verify_long.py`, outside the repository).
+- The height of the ground: from tick 356 on, person 259 stands on
+  sloped tiles. The heights the capture implies at eleven points fit
+  only the corner order above with the coordinates handed over in that
+  order; the disassembly at 0x592234 confirms it.
+- The second and third captures still agree where they hold a state.
+- `the_goth_house_first_tick_matches_the_original` runs to tick 366,
+  checks person 18's walk start in tick 335 and person 16's head target
+  in tick 357, pins the states after ticks 333, 334 and 366, and checks
+  that tick 367 stops at 0x45b066.
+- The load comparison still gives its three known lines.
+- New synthetic tests: the follow, relax and turn limits; the headings;
+  the ground's height on each half of a tile; the walk start and its
+  end at phase 0.95; a joining entry's check arguments; the refusal
+  answers; and the planner giving up.
+
+What did not match, and why:
+
+- Person 16's head target height (+0x220) is one unit in the last place
+  lower in ours after ticks 335, 336, 338 to 340, 342, 343 and 353. The
+  height of the ground was checked exact on those ticks, so the
+  difference is likely in the pose of the top of the head. The captures
+  do not hold the bones, so it cannot be traced further now. Nothing in
+  the simulation reads this field.
+- Person data word 37 still comes from a candidate word the original
+  never writes; it is held as unknown and not compared, as before.
+
+Unverified:
+
+- The sine, cosine and arc tangent come from libm in double precision.
+  The original's FSIN, FCOS and FPATAN may round differently at some
+  inputs; no difference was seen.
+- That Run Tree By Name mode 1 answers false for an object whose thread
+  is in an error state (0x4749b5 reads +0x28). No object here is in
+  one.
+- Which code the place test's wall rules (step 3) leave for 0x48158c.
+  They fail loudly when reached.
+
+## 2026-11-14: Archive reads are bounded; compressed FAR members are left out (unverified)
+
+Archive readers in `sims-content` and the census now cap what they load,
+with the frozen prototype's limits: a FAR directory of at most 64 MiB
+(`far::MAX_DIRECTORY`) and a resource of at most 128 MiB
+(`far::MAX_MEMBER`). A member is checked against its archive again when
+it is read, because the file may have changed since indexing. The
+census opens archives inside archives at most four deep, rejects an
+archive whose member overlaps its header or directory (such a member can
+be the archive itself), and stops decoding members of one file on disk
+beyond four times its length plus 16 MiB; it reads an archive on disk a
+member at a time. An archive member whose name is longer than 1024 bytes
+or holds more than 32 directories is left out of the index with a
+diagnostic, since each directory in a member's name is one the index
+lists. The game's own files are far inside all of these limits (member
+names reach 96 bytes and four directories), and the install census is
+unchanged.
+
+A FAR 1a member whose unpacked size differs from its stored size is
+compressed. Decompression is not implemented, so such a member is left
+out of the index with a diagnostic, as the prototype refused it, and the
+rest of its archive mounts. In `GameData/Animation`, which holds only the
+game's own files and is read outside the index, such a member fails the
+load instead, so a clip or skeleton never goes missing silently.
+**Unverified**: whether the original lists
+such a member, and so whether it hides a later file of the same name.
+The game's own archives hold none. Keeping both sizes on
+`sims_content::Member` waits on `sims-people`, which builds that struct
+itself and also reads FAR directories without these caps.
+
+
 ## 2026-11-14: People: transparent texels, shared edges, and people made after the load
 
 A review of `sims-people` found five defects. They are fixed as follows.
@@ -233,6 +527,46 @@ libraries at run time, so CI needs no new system packages.
 What would reopen it: the UI track needing a GPU, text or widgets that
 softbuffer cannot give, at which point the window code moves to wgpu
 or another toolkit, still outside `sims-render`.
+## 2026-11-14: One table of IFF resources, with the prototype's rules (unverified)
+
+`Iff::get`, `Iff::all` and `Iff::resource_order` now read one table built
+when the file is parsed, as the original's IFFResFile3 keeps it. Before,
+`get` and `all` scanned the raw chunks: they returned deleted chunks, and
+`get` took the first of two chunks with one key even when the resource
+map named only the second. `Iff::chunks` still lists every chunk in file
+order, for readers that want them all.
+
+The rules follow the frozen prototype's port of the open
+(`legacy/crates/sims-sim/src/object_catalog/iff.rs`):
+
+- A resource's key is its type, its ID and the high byte of its flags.
+  `get` looks up the key whose high byte is 0, as the original's lookup
+  by ID does.
+- Without a resource map: live chunks in file order. A deleted chunk
+  (flag 4) is skipped. A later chunk with a taken key replaces the
+  earlier one in its place in the order.
+- With a version-0 map: the map's entries in its order. Of two entries
+  with one key, the first is kept and the second dropped unread. A map
+  listing a resource map with ID 0 is ignored and the chunks are read as
+  if there were none. An entry's chunk must be at its offset with its
+  type, ID and flags high byte; the low flag bits are the map's to state,
+  as in the prototype. (The prototype checks only the type, when it
+  loads the payload; requiring the ID keeps a resource's chunk agreeing
+  with the key it is found under. The game's own maps always agree.)
+- A resource map is never a resource itself.
+- When the map cannot be used, `resource_order` fails as before, and
+  `get` and `all` use the table built as if there were no map.
+
+**Unverified** against the original. What the game's own files hold
+bounds the effect: all 4,155 deleted chunks in the install are `XXXX`
+free space, none sharing a key with a live chunk; the only live chunks
+sharing a type and ID are nine `BMP_` chunks that the flags' high byte
+tells apart; and no map lists a map, a duplicate key, or leaves a live
+chunk out. The install census and the gated digests are unchanged.
+`sims-vm`'s `Program` still reads `Iff::chunks` directly (a later chunk
+of one ID wins there, deleted ones included); on the game's own files
+that agrees with the table.
+
 
 ## 2026-11-14: Bella Goth compared with the original; the mirror is still open
 

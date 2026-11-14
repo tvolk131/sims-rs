@@ -2,14 +2,19 @@
 //! `sims-formats` reader and tally what fails and what has no reader yet.
 //!
 //! This answers "does the formats crate handle real content?" with data, for
-//! the original install, expansion packs and custom content alike.
+//! the original install, expansion packs and custom content alike. It also
+//! counts the primitives the decoded trees use, by pack, so the VM's
+//! coverage can be weighed against what the content needs.
 
 use sims_formats::{
     animation, avatar, behavior, career, execution, far, ffn, iff, lot, neighborhood, sprite,
     strings, tatt, tuning,
 };
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 #[derive(Default)]
@@ -20,14 +25,61 @@ struct Tally {
     failures: BTreeMap<String, (u64, String)>,
 }
 
+/// How deep archives inside archives are opened. The game's own archives
+/// hold none.
+const MAX_NESTING: u32 = 4;
+/// How many member bytes one file on disk may lead the census to decode,
+/// as a multiple of its own length, plus [`WORK_FLOOR`]. Archive members
+/// may overlap, so without this a small archive could name the same large
+/// member many times over.
+const WORK_FACTOR: u64 = 4;
+const WORK_FLOOR: u64 = 16 * 1024 * 1024;
+
 #[derive(Default)]
 pub struct Census {
     files: u64,
+    /// Member bytes the current file on disk may still lead to.
+    budget: u64,
     tallies: BTreeMap<String, Tally>,
     /// IFF chunk tags with no reader, with counts.
     unread_tags: BTreeMap<String, u64>,
     /// Other file extensions seen but not decoded, with counts.
     unread_files: BTreeMap<String, u64>,
+    /// Decoded trees and their primitives, per pack.
+    packs: BTreeMap<String, Pack>,
+    /// The pack of the file on disk being visited; archive members
+    /// belong to their archive's pack.
+    pack: String,
+}
+
+/// One pack's decoded trees (BHAV chunks), and their primitive
+/// instructions by opcode (opcodes below 256; the rest call trees).
+struct Pack {
+    trees: u64,
+    primitives: [u64; 256],
+}
+
+/// The pack a file on disk belongs to, from its path below the scanned
+/// `root` (and the root's own name, when it is a directory): the first
+/// component naming an expansion pack (`ExpansionPack`, `ExpansionPack2`,
+/// ...) or user data (`UserData`, `UserData2`, ...), else "Base". Folders
+/// above the root never count.
+fn pack(root: &Path, path: &Path) -> String {
+    let own = root.is_dir().then(|| root.file_name()).flatten();
+    let below = path.strip_prefix(root).unwrap_or(Path::new(""));
+    own.into_iter()
+        .chain(below.components().map(|c| c.as_os_str()))
+        .find_map(|name| {
+            let name = name.to_string_lossy();
+            if name.starts_with("ExpansionPack") {
+                Some(name.into_owned())
+            } else if name.starts_with("UserData") {
+                Some("UserData".to_owned())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "Base".to_owned())
 }
 
 fn pattern(message: &str) -> String {
@@ -68,6 +120,49 @@ fn extension(name: &str) -> String {
 
 type Outcome = sims_formats::Result<()>;
 
+/// Where an archive's bytes are: in memory, as a member of another
+/// archive, or in a file on disk of the given length.
+enum Archive<'a> {
+    Memory(&'a [u8]),
+    Disk(&'a mut File, u64),
+}
+
+impl Archive<'_> {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Memory(bytes) => bytes.len() as u64,
+            Self::Disk(_, len) => *len,
+        }
+    }
+
+    /// `len` bytes from `offset`, which the caller has checked lie inside
+    /// the archive. A read from disk is capped at [`far::MAX_MEMBER`].
+    fn read(&mut self, offset: u64, len: u64) -> sims_formats::Result<Cow<'_, [u8]>> {
+        let fail = |message: String| sims_formats::Error::new(offset as usize, message);
+        match self {
+            Self::Memory(bytes) => usize::try_from(offset)
+                .ok()
+                .zip(usize::try_from(len).ok())
+                .and_then(|(start, len)| bytes.get(start..start.checked_add(len)?))
+                .map(Cow::Borrowed)
+                .ok_or_else(|| fail("range outside archive".to_owned())),
+            Self::Disk(file, _) => {
+                if len > far::MAX_MEMBER {
+                    return Err(fail(format!("{len} bytes exceed the 128 MiB limit")));
+                }
+                let mut bytes = Vec::with_capacity(len as usize);
+                file.seek(SeekFrom::Start(offset))
+                    .and_then(|_| (&mut **file).take(len).read_to_end(&mut bytes))
+                    .map_err(|e| fail(e.to_string()))?;
+                if bytes.len() as u64 != len {
+                    return Err(fail("archive ends early".to_owned()));
+                }
+                Ok(Cow::Owned(bytes))
+            }
+        }
+    }
+}
+
 impl Census {
     fn record(&mut self, kind: &str, location: &str, outcome: Outcome) {
         let tally = self.tallies.entry(kind.to_owned()).or_default();
@@ -84,25 +179,61 @@ impl Census {
 
     /// Walks a file or directory in sorted order, so reports are stable.
     pub fn add_path(&mut self, path: &Path) -> std::io::Result<()> {
+        self.walk(path, path)
+    }
+
+    fn walk(&mut self, root: &Path, path: &Path) -> std::io::Result<()> {
         if path.is_dir() {
+            // Sorted below.
+            #[allow(clippy::disallowed_methods)]
             let mut entries: Vec<_> = std::fs::read_dir(path)?
                 .map(|e| e.map(|e| e.path()))
                 .collect::<Result<_, _>>()?;
             entries.sort();
             for entry in entries {
-                self.add_path(&entry)?;
+                self.walk(root, &entry)?;
             }
         } else if path.is_file() {
-            let bytes = std::fs::read(path)?;
-            self.file(&path.display().to_string(), &bytes);
+            self.pack = pack(root, path);
+            self.disk_file(path)?;
         }
         Ok(())
     }
 
-    fn file(&mut self, location: &str, bytes: &[u8]) {
+    /// Visits a file on disk. An archive is read a member at a time, so
+    /// only its directory and one member are in memory at once; any other
+    /// file is read whole, up to [`far::MAX_MEMBER`].
+    fn disk_file(&mut self, path: &Path) -> std::io::Result<()> {
+        let location = path.display().to_string();
+        let mut file = File::open(path)?;
+        let len = file.metadata()?.len();
+        self.budget = len.saturating_mul(WORK_FACTOR).saturating_add(WORK_FLOOR);
+        let mut magic = [0; 8];
+        if len >= 8 {
+            file.read_exact(&mut magic)?;
+        }
+        if magic == *b"FAR!byAZ" {
+            self.files += 1;
+            self.far(&location, Archive::Disk(&mut file, len), 0);
+        } else if len > far::MAX_MEMBER {
+            self.files += 1;
+            let error = sims_formats::Error::new(0, "file exceeds the 128 MiB limit");
+            self.record("Oversized file", &location, Err(error));
+        } else {
+            file.rewind()?;
+            let mut bytes = Vec::with_capacity(len as usize);
+            file.take(len).read_to_end(&mut bytes)?;
+            self.file(&location, &bytes, 0);
+        }
+        Ok(())
+    }
+
+    /// Visits one file or archive member. `depth` counts the archives it
+    /// is inside.
+    fn file(&mut self, location: &str, bytes: &[u8], depth: u32) {
         self.files += 1;
         if bytes.starts_with(b"FAR!byAZ") {
-            self.far(location, bytes);
+            self.far(location, Archive::Memory(bytes), depth);
         } else if bytes.starts_with(b"IFF FILE") {
             self.iff(location, bytes);
         } else {
@@ -129,11 +260,8 @@ impl Census {
         }
     }
 
-    fn far(&mut self, location: &str, bytes: &[u8]) {
-        let len = bytes.len() as u64;
-        let directory = far::manifest_offset(&bytes[..bytes.len().min(16)], len)
-            .and_then(|offset| far::directory(&bytes[offset as usize..], len));
-        let entries = match directory {
+    fn far(&mut self, location: &str, mut archive: Archive<'_>, depth: u32) {
+        let entries = match self.members(&mut archive, depth) {
             Ok(entries) => {
                 self.record("FAR archive", location, Ok(()));
                 entries
@@ -141,10 +269,58 @@ impl Census {
             Err(error) => return self.record("FAR archive", location, Err(error)),
         };
         for entry in entries {
-            let start = entry.offset as usize;
-            let member = &bytes[start..start + entry.stored_size as usize];
-            self.file(&format!("{location}/{}", entry.name), member);
+            let location = format!("{location}/{}", entry.name);
+            match archive.read(u64::from(entry.offset), u64::from(entry.stored_size)) {
+                Ok(member) => self.file(&location, &member, depth + 1),
+                Err(error) => {
+                    self.files += 1;
+                    self.record("FAR member", &location, Err(error));
+                }
+            }
         }
+    }
+
+    /// An archive's members, each lying between the header and the
+    /// directory, so a member is never the archive itself and every
+    /// archive inside one is smaller. Fails when the archive is nested too
+    /// deeply or its members would exceed the work budget.
+    fn members(
+        &mut self,
+        archive: &mut Archive<'_>,
+        depth: u32,
+    ) -> sims_formats::Result<Vec<far::Entry>> {
+        if depth >= MAX_NESTING {
+            return Err(sims_formats::Error::new(
+                0,
+                format!("FAR archive nested more than {MAX_NESTING} deep"),
+            ));
+        }
+        let len = archive.len();
+        let offset = far::manifest_offset(&archive.read(0, len.min(16))?, len)?;
+        let directory_len = far::directory_len(offset, len)?;
+        let directory = archive.read(u64::from(offset), directory_len as u64)?;
+        let entries = far::directory(&directory, len)?;
+        if let Some(entry) = entries.iter().find(|e| !e.within_payload(offset)) {
+            return Err(sims_formats::Error::new(
+                entry.offset as usize,
+                format!(
+                    "FAR member {} overlaps the archive header or directory",
+                    entry.name
+                ),
+            ));
+        }
+        let work = entries
+            .iter()
+            .map(|e| u64::from(e.stored_size))
+            .fold(0u64, u64::saturating_add);
+        if work > self.budget {
+            return Err(sims_formats::Error::new(
+                offset as usize,
+                "FAR members exceed the census work budget",
+            ));
+        }
+        self.budget -= work;
+        Ok(entries)
     }
 
     fn iff(&mut self, location: &str, bytes: &[u8]) {
@@ -165,10 +341,70 @@ impl Census {
         for chunk in &file.chunks {
             let name = tag_name(&chunk.tag);
             let at = format!("{location} {name} #{} {:?}", chunk.id, chunk.label);
+            if &chunk.tag == b"BHAV" {
+                let outcome = behavior::Behavior::parse(file.data(chunk));
+                if let Ok(tree) = &outcome {
+                    self.count_primitives(tree);
+                }
+                self.record("BHAV chunk", &at, outcome.map(drop));
+                continue;
+            }
             match decode(&file, chunk) {
                 Some(outcome) => self.record(&format!("{name} chunk"), &at, outcome),
                 None => *self.unread_tags.entry(name).or_default() += 1,
             }
+        }
+    }
+
+    fn count_primitives(&mut self, tree: &behavior::Behavior) {
+        if !self.packs.contains_key(&self.pack) {
+            let pack = Pack {
+                trees: 0,
+                primitives: [0; 256],
+            };
+            self.packs.insert(self.pack.clone(), pack);
+        }
+        let Some(pack) = self.packs.get_mut(&self.pack) else {
+            return;
+        };
+        pack.trees += 1;
+        for instruction in &tree.instructions {
+            if let Some(count) = pack.primitives.get_mut(usize::from(instruction.opcode)) {
+                *count += 1;
+            }
+        }
+    }
+
+    /// The primitives table: one row per opcode used, one column per pack.
+    fn primitives_report(&self, out: &mut String) {
+        let packs: Vec<(&String, &Pack)> = self.packs.iter().collect();
+        let _ = writeln!(out, "\nPrimitives used by decoded trees, by pack:");
+        let _ = write!(out, "  {:<4} {:<36} {:>9}", "op", "name", "total");
+        for (name, _) in &packs {
+            let _ = write!(out, " {name:>15}");
+        }
+        let _ = write!(
+            out,
+            "\n  {:<4} {:<36} {:>9}",
+            "",
+            "trees",
+            packs.iter().map(|(_, p)| p.trees).sum::<u64>()
+        );
+        for (_, pack) in &packs {
+            let _ = write!(out, " {:>15}", pack.trees);
+        }
+        let _ = writeln!(out);
+        for opcode in 0..256 {
+            let total: u64 = packs.iter().map(|(_, p)| p.primitives[opcode]).sum();
+            if total == 0 {
+                continue;
+            }
+            let name = sims_vm::primitive_name(opcode as u16);
+            let _ = write!(out, "  {opcode:<4} {name:<36} {total:>9}");
+            for (_, pack) in &packs {
+                let _ = write!(out, " {:>15}", pack.primitives[opcode]);
+            }
+            let _ = writeln!(out);
         }
     }
 
@@ -199,6 +435,7 @@ impl Census {
         for (ext, count) in unread {
             let _ = writeln!(out, "  {ext:<8} {count}");
         }
+        self.primitives_report(&mut out);
         out
     }
 }
@@ -208,7 +445,8 @@ impl Census {
 fn decode(file: &iff::Iff, chunk: &iff::Chunk) -> Option<Outcome> {
     let data = file.data(chunk);
     let outcome = match &chunk.tag {
-        b"BHAV" => behavior::Behavior::parse(data).map(drop),
+        // BHAV chunks are decoded by `Census::iff`, which also counts
+        // their primitives.
         b"OBJD" => behavior::ObjectDefinition::parse(data).map(drop),
         b"TTAB" => behavior::InteractionTable::parse(data).map(drop),
         b"STR#" | b"CTSS" | b"TTAs" | b"FAMs" => strings::StringTable::parse(data).map(drop),
@@ -248,4 +486,165 @@ fn decode(file: &iff::Iff, chunk: &iff::Chunk) -> Option<Outcome> {
         _ => return None,
     };
     Some(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Census;
+
+    /// A FAR 1a archive with the given directory entries, as (offset,
+    /// size, name), after `payload`.
+    fn archive(payload: &[u8], entries: &[(u32, u32, &str)]) -> Vec<u8> {
+        let mut bytes = b"FAR!byAZ".to_vec();
+        bytes.extend(1u32.to_le_bytes());
+        bytes.extend((16 + payload.len() as u32).to_le_bytes());
+        bytes.extend(payload);
+        bytes.extend((entries.len() as u32).to_le_bytes());
+        for (offset, size, name) in entries {
+            for word in [*size, *size, *offset, name.len() as u32] {
+                bytes.extend(word.to_le_bytes());
+            }
+            bytes.extend(name.as_bytes());
+        }
+        bytes
+    }
+
+    fn census(name: &str, bytes: &[u8]) -> String {
+        let path =
+            std::env::temp_dir().join(format!("sims-census-{name}-{}.far", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let mut census = Census::default();
+        census.add_path(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        census.report()
+    }
+
+    /// An IFF file holding one BHAV per entry, each with the given
+    /// instruction opcodes.
+    fn trees(trees: &[&[u16]]) -> Vec<u8> {
+        let mut bytes = vec![0; 64];
+        bytes[..13].copy_from_slice(b"IFF FILE 2.5:");
+        for (id, opcodes) in trees.iter().enumerate() {
+            let mut data = 0x8002u16.to_le_bytes().to_vec();
+            data.extend((opcodes.len() as u16).to_le_bytes());
+            data.extend([0; 8]);
+            for &opcode in *opcodes {
+                data.extend(opcode.to_le_bytes());
+                data.extend([254, 255]);
+                data.extend([0; 8]);
+            }
+            bytes.extend(b"BHAV");
+            bytes.extend((76 + data.len() as u32).to_be_bytes());
+            bytes.extend((id as u16).to_be_bytes());
+            bytes.extend([0; 66]);
+            bytes.extend(data);
+        }
+        bytes
+    }
+
+    #[test]
+    fn primitives_are_counted_by_pack_and_tree_calls_are_not() {
+        // Folders above the scanned root, and archive member names, never
+        // name a pack.
+        let parent =
+            std::env::temp_dir().join(format!("ExpansionPackParent-census-{}", std::process::id()));
+        let dir = parent.join("install");
+        let expansion = dir.join("ExpansionPack3");
+        std::fs::create_dir_all(&expansion).unwrap();
+        std::fs::write(dir.join("base.iff"), trees(&[&[2, 2, 255, 256], &[44]])).unwrap();
+        let member = trees(&[&[44, 0x1000]]);
+        let far = archive(
+            &member,
+            &[(16, member.len() as u32, "ExpansionPack7\\hot.iff")],
+        );
+        std::fs::write(dir.join("base.far"), far).unwrap();
+        std::fs::write(expansion.join("hot.iff"), trees(&[&[2, 0x1000]])).unwrap();
+        let mut census = Census::default();
+        census.add_path(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&parent);
+        let report = census.report();
+        let table = &report[report.find("Primitives used").expect("table")..];
+        let rows: Vec<Vec<&str>> = table
+            .lines()
+            .skip(2)
+            .map(|l| l.split_whitespace().collect())
+            .collect();
+        let header: Vec<&str> = table.lines().nth(1).unwrap().split_whitespace().collect();
+        assert_eq!(header[3..], ["Base", "ExpansionPack3"], "{table}");
+        let row = |op: &str| {
+            let row = rows
+                .iter()
+                .find(|r| r[0] == op)
+                .unwrap_or_else(|| panic!("no row {op} in {table}"));
+            row[row.len() - 3..].to_vec()
+        };
+        assert_eq!(row("trees"), ["4", "3", "1"], "{table}");
+        assert_eq!(row("2"), ["3", "2", "1"], "{table}");
+        assert_eq!(row("44"), ["2", "2", "0"], "{table}");
+        assert_eq!(row("255"), ["1", "1", "0"], "{table}");
+        let opcodes: Vec<&str> = rows.iter().skip(1).map(|r| r[0]).collect();
+        assert_eq!(opcodes, ["2", "44", "255"], "{table}");
+        assert!(report.contains("BHAV chunk"), "{report}");
+    }
+
+    #[test]
+    fn an_archive_member_spanning_the_archive_is_rejected() {
+        // Its only member is the whole 37-byte archive: opening it again
+        // would recurse without end.
+        let mut bytes = b"FAR!byAZ".to_vec();
+        for n in [1u32, 16, 1, 37, 37, 0, 1] {
+            bytes.extend(n.to_le_bytes());
+        }
+        bytes.push(b'x');
+        let report = census("self", &bytes);
+        assert!(report.contains("overlaps the archive header"), "{report}");
+        assert!(report.contains("visited: 1\n"), "{report}");
+    }
+
+    #[test]
+    fn an_archive_on_disk_claiming_a_huge_directory_is_not_read() {
+        let path =
+            std::env::temp_dir().join(format!("sims-census-huge-{}.far", std::process::id()));
+        // The directory starts right after the header, so the whole sparse
+        // remainder would be the directory.
+        let mut bytes = b"FAR!byAZ".to_vec();
+        bytes.extend(1u32.to_le_bytes());
+        bytes.extend(16u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(sims_formats::far::MAX_DIRECTORY + 17)
+            .unwrap();
+        let mut census = Census::default();
+        census.add_path(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let report = census.report();
+        assert!(report.contains("64 MiB"), "{report}");
+    }
+
+    #[test]
+    fn archives_inside_archives_stop_at_the_nesting_limit() {
+        let mut bytes = archive(b"inner", &[(16, 5, "x.bin")]);
+        for _ in 0..5 {
+            let len = bytes.len() as u32;
+            bytes = archive(&bytes, &[(16, len, "n.far")]);
+        }
+        let report = census("nested", &bytes);
+        assert!(report.contains("nested more than 4 deep"), "{report}");
+        // The outer archive and the four inside it it opens.
+        assert!(report.contains("visited: 5\n"), "{report}");
+    }
+
+    #[test]
+    fn overlapping_members_cannot_exceed_the_work_budget() {
+        // Every entry names the same large member.
+        let payload = vec![0; 1 << 20];
+        let entries: Vec<_> = (0..100).map(|_| (16, 1 << 20, "same.bin")).collect();
+        let report = census("overlap", &archive(&payload, &entries));
+        assert!(report.contains("work budget"), "{report}");
+        let honest = census("honest", &archive(&payload, &entries[..1]));
+        assert!(honest.contains("visited: 2\n"), "{honest}");
+    }
 }

@@ -46,15 +46,15 @@
 //! 8. The tail: the skin's layers are updated once at the clock (0x5992b3,
 //!    from 0x5a0ef5 or from 0x58f8bf: the second call finds the skin
 //!    updated at the same clock and does nothing), the animator places
-//!    itself if it has not, and the head's countdown runs (0x590768):
-//!    person word 45 goes down by 1 when above 0, and reaching 0 sets
-//!    word 42 to 8. With bit 0 of word 42 set the head follows something
-//!    and may change word 41 (0x590768, 0x5904d2), which is not ported.
+//!    itself if it has not, and the head takes its step, measures where
+//!    it and its target are and takes its turn off again (0x590768,
+//!    0x5904d2, 0x590b27; see `crate::head`).
 //!
 //! Left out as presentation, as far as the original's code shows: the
-//! draw state (0x434101), the face (0x58faf6), the pose (0x5994c3,
-//! 0x5a15bc), what a carried object's position follows (0x590b27 and the
-//! tail of 0x58dc72), the head's turn, and the route's own position
+//! draw state (0x434101), the face (0x58faf6), the pose as kept (0x5994c3,
+//! 0x5a15bc; it is worked out when the head needs it), what a carried
+//! object's position follows (the tail of 0x58dc72), and the route's own
+//! position
 //! fields (+0x18 to +0x28) which only states 6 to 10 read. That none of
 //! this changes what the simulation reads is **unverified**.
 //!
@@ -75,8 +75,6 @@ use std::cmp::Ordering;
 
 /// Person data words.
 const POSTURE: usize = 0;
-const HEAD_MODE: usize = 42;
-const HEAD_COUNTDOWN: usize = 45;
 const KIND: usize = 65;
 /// Object data words.
 const DIRECTION: usize = 1;
@@ -188,29 +186,8 @@ impl Interpreter<'_> {
         }
         place(&mut a, position, direction);
 
-        // 0x590768: the head's countdown.
-        if a.head_clock != now {
-            let person = world
-                .objects
-                .get_mut(&id)
-                .and_then(|o| o.person.as_mut())
-                .ok_or_else(|| Trap::native(0x1c, "object is not a person"))?;
-            let countdown = person.data.get(HEAD_COUNTDOWN).copied().unwrap_or(0);
-            if countdown > 0 {
-                person.data[HEAD_COUNTDOWN] = countdown - 1;
-                if countdown == 1 {
-                    person.data[HEAD_MODE] = 8;
-                }
-            }
-            if person.data.get(HEAD_MODE).copied().unwrap_or(0) & 1 != 0 {
-                return Err(Trap::Unsupported(
-                    "person word 42 has bit 0 set: the head follows something (0x5907c5, \
-                     0x5904d2), which is not ported"
-                        .into(),
-                ));
-            }
-            a.head_clock = now;
-        }
+        // 0x590768, 0x5904d2 and 0x590b27: the head.
+        self.look(world, id, &mut a)?;
         world.animators.insert(id, a);
         Ok(())
     }
@@ -325,6 +302,14 @@ const RUN: usize = 0x15;
 /// Object data word 22, which the animator's scale writes (0x59209f).
 const SCALE_WORD: usize = 22;
 
+/// What state 6 works its direction's angle out with (0x666cbc,
+/// 0x667430, 0x66742c): 6, 45 and 1/180.
+const SIX: F32 = F32::from_bits(0x40c0_0000);
+const FORTY_FIVE: F32 = F32::from_bits(0x4234_0000);
+const DEGREE: F32 = F32::from_bits(0x3bb6_0b61);
+/// The phase of clip 0x13 at which state 6 ends (0x672020).
+const STOP_WALK_END: F32 = F32::from_bits(0x3f73_3333);
+
 /// Constants of the animator's code.
 const ONE: F32 = F32::from_bits(0x3f80_0000);
 const HALF: F32 = F32::from_bits(0x3f00_0000);
@@ -338,6 +323,49 @@ const SCALE_UNIT: F32 = F32::from_bits(0x4380_0000);
 /// 0.5 and 1.0 as doubles (0x667270, 0x667280).
 const HALF_DOUBLE: u64 = 0x3fe0_0000_0000_0000;
 const ONE_DOUBLE: u64 = 0x3ff0_0000_0000_0000;
+
+/// Where state 6 carries a person (0x58e125): from `position` (the
+/// direction third, in eighths of a turn) one clip's distance times a
+/// third times 16 straight ahead, at the angle (direction + 6) times 45
+/// times pi times 1/180. The cosine is stored as a float first; the sine
+/// is used as the FPU leaves it (here libm's double), which is
+/// **unverified** at rounding boundaries.
+fn stop_walk_destination(position: [F32; 3], clip_distance: F32) -> [F32; 2] {
+    let distance = ((clip_distance.ext() * THIRD.ext()).single() * SIXTEEN.ext()).single();
+    let angle = ((((position[2].ext() + SIX.ext()).single() * FORTY_FIVE.ext()).single()
+        * PI.ext())
+    .single()
+        * DEGREE.ext())
+    .single()
+    .to_f32();
+    let cosine = Ext::cos(angle).single();
+    let sine = Ext::sin(angle);
+    [
+        ((cosine * distance).single() + position[0].ext())
+            .single()
+            .to_f32(),
+        ((sine * distance).single() + position[1].ext())
+            .single()
+            .to_f32(),
+    ]
+}
+
+/// One tick of state 6 (0x58e1e4): while the clip's phase `t` is below
+/// 0.95 (not a number counts as below), the point (1 - t) times `from`
+/// plus t times `to`; None from 0.95 on, when the walk ends.
+fn stop_walk_step(from: [F32; 2], to: [F32; 2], t: F32) -> Option<[F32; 2]> {
+    let t = t.ext();
+    if at_least(t, STOP_WALK_END.ext()) {
+        return None;
+    }
+    let u = (ONE.ext() - t).single();
+    let mix = |from: F32, to: F32| {
+        ((u * from.ext()).single() + (t * to.ext()).single())
+            .single()
+            .to_f32()
+    };
+    Some([mix(from[0], to[0]), mix(from[1], to[1])])
+}
 
 fn unsupported(at: &str, what: &str) -> Trap {
     Trap::Unsupported(format!("the animator {what} ({at}), which is not ported"))
@@ -384,6 +412,7 @@ impl Interpreter<'_> {
                     }
                 }
                 4 => turn(world, id, a)?,
+                6 => self.stop_walk(world, id, a, now)?,
                 9 => self.follow(world, id, a, now)?,
                 state => {
                     return Err(Trap::Unsupported(format!(
@@ -665,7 +694,7 @@ impl Interpreter<'_> {
     /// word 65); then the global table 150. An empty name counts as none.
     /// The old prototype's `posture_name`
     /// (legacy/crates/sims-vm/src/animation.rs) reads the same tables.
-    fn posture_clip(
+    pub(crate) fn posture_clip(
         &self,
         world: &World,
         id: u16,
@@ -1083,6 +1112,84 @@ impl Interpreter<'_> {
         self.walk(world, id, a, d, offset, distance, now)
     }
 
+    /// State 6 (0x58e125): the person starts its walk with the posture's
+    /// clip 0x13, which carries it one clip's distance straight ahead.
+    ///
+    /// When that clip is not the selection yet, it starts (virtual
+    /// function 0xf8, [`Interpreter::start_clip`]) to stop at its end; the
+    /// speed and the speed wanted both become the speed wanted (0x588fa0,
+    /// [`wanted_rate`], in state 6) and the clip takes it (0x598636). The
+    /// start (+0x1d0, +0x1d4) becomes the position, and the destination
+    /// (+0x1c4, +0x1c8) the position plus the clip's distance times a
+    /// third times 16 (0x668390, 0x666a54) along the direction: its angle
+    /// is (direction + 6) times 45 times pi times 1/180, in radians. The
+    /// cosine is stored as a float first; the sine is used as the FPU
+    /// leaves it (here libm's double), which is **unverified** at
+    /// rounding boundaries.
+    ///
+    /// Then, each tick: the walk flag is cleared (and +0x290, not kept)
+    /// and the clip takes the animator's speed. While the clip's phase t
+    /// is below 0.95 (0x672020; not a number counts as below) the
+    /// position goes from the start to the destination in step with it,
+    /// (1 - t) times the start plus t times the destination. From 0.95 on
+    /// the clip is cleared (virtual function 0xfc), the position becomes
+    /// the destination, the destination's direction the position's, the
+    /// walk flag is set and the animator follows its route again (state
+    /// 9, whose code runs, 0x58e242). The original also sets global
+    /// 0x6f6d68 to 10, which is not kept.
+    fn stop_walk(
+        &self,
+        world: &mut World,
+        id: u16,
+        a: &mut Animator,
+        now: i32,
+    ) -> Result<Next, Trap> {
+        if a.selection != STOP_WALK as i32 {
+            self.start_clip(world, id, a, STOP_WALK, now, STOP)?;
+            let pace = datum(world, id, PACE)?;
+            let kind = person_word(world, id, KIND)?;
+            let wanted = wanted_rate(pace, a.state, kind).to_f32();
+            a.rate = wanted;
+            a.target = wanted;
+            let layer = a.foreground.as_mut().ok_or_else(|| {
+                unsupported(
+                    "0x58e15a",
+                    "starts its walk with no clip: it reads through a null pointer",
+                )
+            })?;
+            layer.set_speed(wanted);
+            let clip = self.clip(&layer.clip)?;
+            a.motion.turn_from[0] = a.position[0];
+            a.motion.turn_from[1] = a.position[1];
+            let [x, y] = stop_walk_destination(a.position, F32::from_bits(clip.distance));
+            a.destination[0] = x;
+            a.destination[1] = y;
+        }
+        a.walking = false;
+        let rate = a.rate;
+        let layer = a.foreground.as_mut().ok_or_else(|| {
+            unsupported(
+                "0x58e1e4",
+                "walks with no clip: it reads through a null pointer",
+            )
+        })?;
+        layer.set_speed(rate);
+        let from = [a.motion.turn_from[0], a.motion.turn_from[1]];
+        let to = [a.destination[0], a.destination[1]];
+        if let Some([x, y]) = stop_walk_step(from, to, layer.phase) {
+            a.position[0] = x;
+            a.position[1] = y;
+            return Ok(Next::Done);
+        }
+        clear_foreground(a);
+        a.position[0] = a.destination[0];
+        a.position[1] = a.destination[1];
+        a.destination[2] = a.position[2];
+        a.state = 9;
+        a.walking = true;
+        Ok(Next::Again)
+    }
+
     /// The walk (0x58ec8a to 0x58f089), one tick of it, turning by `d`
     /// towards the point ahead at `offset` (squared distance `distance`).
     ///
@@ -1094,8 +1201,9 @@ impl Interpreter<'_> {
     ///    selection not a walk clip, 0x14 or 0x15) whose turn was not
     ///    held stops instead when the point is further than the stopping
     ///    distance (+0x1f8, or +0x204 with data word 17 set), and so does
-    ///    any for a person whose word 64 is set (0x58ed52, states 6 and
-    ///    11). That is not ported and fails.
+    ///    any for a person whose word 64 is set: it goes to state 6, or
+    ///    11 with data word 17 set (0x58ed52), and that state's code runs
+    ///    ([`Interpreter::stop_walk`]). State 11 is not ported and fails.
     /// 3. The walk flag is set. The clip (0x14 in state 9, 0x15 in state
     ///    10, where data word 17 clear makes it state 9 first, else 0)
     ///    plays in the foreground, repeating ([`Interpreter::start_clip`]
@@ -1163,10 +1271,16 @@ impl Interpreter<'_> {
             if person_word(world, id, SPECIAL)? != 0
                 || (!held && stop(if pace == 1 { STOP_RUN } else { STOP_WALK })?)
             {
-                return Err(unsupported(
-                    "0x58ed52",
-                    "stops short of a point too far to walk to",
-                ));
+                // 0x58ed52: state 6, or 11 with data word 17 set; +0x24
+                // and +0x28 become 0 (not kept); that state's code runs.
+                if pace == 1 {
+                    return Err(unsupported(
+                        "0x58ed52",
+                        "goes to state 11 to start a walk with data word 17 set",
+                    ));
+                }
+                a.state = 6;
+                return Ok(Next::Again);
             }
         }
 
@@ -2004,6 +2118,33 @@ mod tests {
         layer.interruptible = interruptible;
         a.foreground = Some(layer);
         a
+    }
+
+    #[test]
+    fn the_walk_start_goes_one_clip_distance_ahead() {
+        let f = F32::from_f32;
+        // Direction 0 is (0 + 6) * 45 = 270 degrees: straight down the
+        // second coordinate. 0.75 / 3 * 16 is 4.
+        let to = stop_walk_destination([f(100.0), f(50.0), f(0.0)], f(0.75));
+        assert_eq!(to, [f(100.0), f(46.0)]);
+        // Direction 2 is a full turn: along the first coordinate.
+        let to = stop_walk_destination([f(100.0), f(50.0), f(2.0)], f(0.75));
+        assert_eq!(to[0], f(104.0));
+        assert!((to[1].to_f32() - 50.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn the_walk_start_follows_the_clip_until_its_phase_is_095() {
+        let f = F32::from_f32;
+        let from = [f(0.0), f(10.0)];
+        let to = [f(8.0), f(2.0)];
+        assert_eq!(stop_walk_step(from, to, f(0.0)), Some(from));
+        assert_eq!(stop_walk_step(from, to, f(0.5)), Some([f(4.0), f(6.0)]));
+        assert_eq!(stop_walk_step(from, to, STOP_WALK_END), None);
+        assert_eq!(stop_walk_step(from, to, f(1.0)), None);
+        // Just below the end it still mixes.
+        let below = F32::from_bits(STOP_WALK_END.to_bits() - 1);
+        assert!(stop_walk_step(from, to, below).is_some());
     }
 
     #[test]

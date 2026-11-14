@@ -248,6 +248,56 @@ fn paths_resolve_ignoring_case() {
 }
 
 #[test]
+fn a_resolved_path_is_spelled_as_on_disk() {
+    // On a case-insensitive filesystem the spelling asked for would also
+    // open; the result must still be the one on disk, the same on every
+    // machine.
+    let tree = Tree::new("spelling");
+    tree.file("gamedata/behavior.IFF", b"behavior")
+        .dir("gamedata/OBJECTS");
+    let install = Install::detect(&tree.0).unwrap();
+    let path = install.file("GameData/Behavior.iff").unwrap();
+    assert_eq!(path, tree.0.join("gamedata").join("behavior.IFF"));
+}
+
+#[test]
+fn dot_components_must_lead_somewhere() {
+    let tree = Tree::new("dots");
+    base_game(&tree);
+    let install = Install::detect(&tree.0).unwrap();
+    assert!(install.file("GameData/Behavior.iff/..").is_err());
+    assert!(install.file("GameData/./Behavior.iff").is_ok());
+}
+
+#[test]
+fn names_differing_only_in_case_resolve_the_same_everywhere() {
+    let tree = Tree::new("collide");
+    base_game(&tree);
+    tree.file("GameData/x.iff", b"lower")
+        .file("GameData/X.IFF", b"upper");
+    // Only counted, so the listing's order doesn't matter.
+    #[allow(clippy::disallowed_methods)]
+    let listed = std::fs::read_dir(tree.0.join("GameData"))
+        .unwrap()
+        .filter(|e| {
+            let name = e.as_ref().unwrap().file_name();
+            name.eq_ignore_ascii_case("x.iff")
+        })
+        .count();
+    if listed < 2 {
+        // A case-insensitive filesystem holds only one of them.
+        return;
+    }
+    let install = Install::detect(&tree.0).unwrap();
+    let read = |path: &str| std::fs::read(install.file(path).unwrap()).unwrap();
+    // An exact match wins; otherwise the first in sorted order, where
+    // "X.IFF" comes before "x.iff".
+    assert_eq!(read("GameData/x.iff"), b"lower");
+    assert_eq!(read("GameData/X.IFF"), b"upper");
+    assert_eq!(read("GameData/x.IFF"), b"upper");
+}
+
+#[test]
 fn unreadable_archives_are_skipped_with_a_diagnostic() {
     let tree = Tree::new("bad-far");
     base_game(&tree);
@@ -257,4 +307,105 @@ fn unreadable_archives_are_skipped_with_a_diagnostic() {
     assert_eq!(index.named("Good.iff").count(), 1);
     assert_eq!(index.diagnostics.len(), 1);
     assert!(index.diagnostics[0].contains("Broken.far"));
+}
+
+#[test]
+fn an_archive_claiming_a_huge_directory_is_skipped_unread() {
+    let tree = Tree::new("huge-directory");
+    base_game(&tree);
+    // The directory starts right after the header, so the whole sparse
+    // remainder would be the directory.
+    let mut header = b"FAR!byAZ".to_vec();
+    header.extend(1u32.to_le_bytes());
+    header.extend(16u32.to_le_bytes());
+    header.extend(1u32.to_le_bytes());
+    tree.file("Downloads/Huge.far", &header)
+        .file("Downloads/Good.iff", b"g");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(tree.0.join("Downloads/Huge.far"))
+        .unwrap()
+        .set_len(sims_formats::far::MAX_DIRECTORY + 17)
+        .unwrap();
+    let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
+    assert_eq!(index.named("Good.iff").count(), 1);
+    assert_eq!(index.diagnostics.len(), 1);
+    assert!(index.diagnostics[0].contains("64 MiB"));
+}
+
+#[test]
+fn a_compressed_member_is_left_out_with_a_diagnostic() {
+    let tree = Tree::new("compressed-member");
+    base_game(&tree);
+    let mut archive = far(&[("Packed.iff", &[7; 64]), ("Plain.iff", b"plain")]);
+    // The first member's unpacked size, the first word of its entry.
+    let manifest = u32::from_le_bytes(archive[12..16].try_into().unwrap()) as usize;
+    archive[manifest + 4..manifest + 8].copy_from_slice(&65u32.to_le_bytes());
+    tree.file("Downloads/pack.far", &archive);
+    let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
+    assert_eq!(index.named("Packed.iff").count(), 0);
+    let (_, plain) = index.named("Plain.iff").next().unwrap();
+    assert_eq!(plain.read().unwrap(), b"plain");
+    assert_eq!(index.diagnostics.len(), 1);
+    assert!(index.diagnostics[0].contains("compressed member Packed.iff"));
+}
+
+#[test]
+fn a_read_checks_the_member_against_the_archive_again() {
+    let tree = Tree::new("stale-member");
+    base_game(&tree);
+    tree.file("Downloads/pack.far", &far(&[("Gone.iff", b"payload")]));
+    let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
+    let (_, member) = index.named("Gone.iff").next().unwrap();
+    assert_eq!(member.read().unwrap(), b"payload");
+    // The archive shrinks after indexing.
+    tree.file("Downloads/pack.far", b"FAR!byAZ");
+    assert!(member.read().unwrap_err().to_string().contains("outside"));
+}
+
+#[test]
+fn a_resource_over_the_size_limit_fails_to_read() {
+    let tree = Tree::new("huge-resource");
+    base_game(&tree);
+    tree.file("Downloads/Huge.iff", b"");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(tree.0.join("Downloads/Huge.iff"))
+        .unwrap()
+        .set_len(sims_formats::far::MAX_MEMBER + 1)
+        .unwrap();
+    let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
+    let (_, huge) = index.named("Huge.iff").next().unwrap();
+    assert!(huge.read().unwrap_err().to_string().contains("128 MiB"));
+}
+
+#[test]
+fn a_member_nested_too_deeply_is_left_out() {
+    let tree = Tree::new("deep-member");
+    base_game(&tree);
+    let deep = format!("{}x.iff", "a\\".repeat(33));
+    let shallow = format!("{}y.iff", "a\\".repeat(32));
+    tree.file(
+        "Downloads/pack.far",
+        &far(&[(&deep, b"deep"), (&shallow, b"shallow")]),
+    );
+    let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
+    assert_eq!(index.named(&shallow).count(), 1);
+    assert_eq!(index.named(&deep).count(), 0);
+    assert_eq!(index.diagnostics.len(), 1);
+    assert!(index.diagnostics[0].contains("in 33 directories"));
+}
+
+#[test]
+fn a_compressed_member_of_the_animation_archives_fails_the_load() {
+    let tree = Tree::new("compressed-animation");
+    base_game(&tree);
+    let mut archive = far(&[("clips.bcf", &[0; 8])]);
+    let manifest = u32::from_le_bytes(archive[12..16].try_into().unwrap()) as usize;
+    archive[manifest + 4..manifest + 8].copy_from_slice(&9u32.to_le_bytes());
+    tree.file("GameData/Animation/Animation.far", &archive);
+    let install = Install::detect(&tree.0).unwrap();
+    let index = Index::build(&install).unwrap();
+    let error = sims_content::Animations::load(&install, &index).unwrap_err();
+    assert!(error.to_string().contains("compressed member clips.bcf"));
 }

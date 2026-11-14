@@ -12,7 +12,7 @@
 //! samples are missing is still refused, since how the original copes
 //! with that is not ported.
 
-use crate::index::{far_members, sorted_entries};
+use crate::index::{all_far_members, sorted_entries};
 use crate::install::resolve;
 use crate::{Error, Index, Install, Resource, Result};
 use sims_formats::animation::{Samples, read_bcf, read_cfp};
@@ -149,7 +149,7 @@ impl Animations {
                     .extension()
                     .is_some_and(|e| e.eq_ignore_ascii_case("far"));
                 if is_archive && path.is_file() {
-                    for member in far_members(&path)? {
+                    for member in all_far_members(&path)? {
                         resources.push(Resource {
                             mount: 0,
                             path: path.clone(),
