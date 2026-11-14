@@ -55,6 +55,29 @@ impl Outfit {
         parts.retain(|(name, _)| !name.is_empty());
         Self { parts }
     }
+
+    /// The default outfit a person type's body strings give, for a person
+    /// whose record names none (a person a script made, before anything
+    /// chose its clothes): the body (row 1), left hand (row 17), right
+    /// hand (row 18) and head (row 2), counting from 0, each written
+    /// `appearance,KEY=texture`. These are the rows the old prototype's
+    /// port of the original's outfit choice (0x58a178) reads for a person
+    /// in everyday clothes with open hands
+    /// (legacy/crates/sims-sim/src/pose/appearance_selection.rs). Whether
+    /// the original draws a newly made person in them is **unverified**;
+    /// the simulation does not yet keep the outfit it chose.
+    pub fn from_body_strings(strings: &[String]) -> Self {
+        let mut parts: Vec<(String, String)> = [1, 17, 18, 2]
+            .into_iter()
+            .filter_map(|row| strings.get(row))
+            .map(|s| match s.split_once(',') {
+                Some((name, textures)) => (name.trim().to_owned(), textures.trim().to_owned()),
+                None => (s.trim().to_owned(), String::new()),
+            })
+            .collect();
+        parts.retain(|(name, _)| !name.is_empty());
+        Self { parts }
+    }
 }
 
 /// One mesh to draw, bound to the skeleton.
@@ -223,6 +246,33 @@ pub fn load_texture(assets: &Assets, name: &str) -> Result<Texture, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_type_without_clothes_chosen_wears_its_default_rows() {
+        let mut strings = vec![String::new(); 35];
+        strings[0] = "adult".into();
+        strings[1] = "body_01,BODY=bodytex".into();
+        strings[2] = "head_01,HEAD-HEAD=headtex".into();
+        strings[17] = "HfLO,HAND=huaolgt".into();
+        strings[18] = "HfRO".into();
+        let outfit = Outfit::from_body_strings(&strings);
+        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(
+            outfit.parts,
+            [
+                pair("body_01", "BODY=bodytex"),
+                pair("HfLO", "HAND=huaolgt"),
+                pair("HfRO", ""),
+                pair("head_01", "HEAD-HEAD=headtex"),
+            ]
+        );
+        // Short or empty tables give what they have, and never panic.
+        assert!(Outfit::from_body_strings(&[]).parts.is_empty());
+        assert_eq!(
+            Outfit::from_body_strings(&strings[..2]).parts,
+            [pair("body_01", "BODY=bodytex")]
+        );
+    }
 
     #[test]
     fn a_texture_string_names_the_meshes_whose_names_hold_its_key() {

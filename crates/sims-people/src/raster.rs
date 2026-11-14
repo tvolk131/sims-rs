@@ -140,11 +140,37 @@ impl Canvas {
         }
     }
 
-    fn triangle(&mut self, p: [Vec3; 3], uv: [[f32; 2]; 3], shade: [f32; 3], part: &Part) {
-        let area = edge(p[0], p[1], p[2]);
-        if area.abs() < 1e-8 {
+    fn triangle(
+        &mut self,
+        mut p: [Vec3; 3],
+        mut uv: [[f32; 2]; 3],
+        mut shade: [f32; 3],
+        part: &Part,
+    ) {
+        let mut area = edge(p[0], p[1], p[2]);
+        if area.abs() < 1e-8 || !area.is_finite() {
             return;
         }
+        // Wind every triangle the same way, so the fill rule below can
+        // tell which side of each edge is inside.
+        if area < 0.0 {
+            p.swap(1, 2);
+            uv.swap(1, 2);
+            shade.swap(1, 2);
+            area = -area;
+        }
+        // The top-left rule: a pixel centre exactly on an edge belongs to
+        // the triangle only if that is its top or left edge, so a pixel on
+        // an edge two triangles share is drawn once, not twice.
+        let top_left = |a: Vec3, b: Vec3| {
+            let (dx, dy) = (b.x - a.x, b.y - a.y);
+            dy < 0.0 || (dy == 0.0 && dx > 0.0)
+        };
+        let owns = [
+            top_left(p[1], p[2]),
+            top_left(p[2], p[0]),
+            top_left(p[0], p[1]),
+        ];
         let min_x = p
             .iter()
             .map(|v| v.x)
@@ -175,7 +201,8 @@ impl Canvas {
                 let w0 = edge(p[1], p[2], q) / area;
                 let w1 = edge(p[2], p[0], q) / area;
                 let w2 = edge(p[0], p[1], q) / area;
-                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                let outside = |w: f32, owned: bool| w < 0.0 || (w == 0.0 && !owned);
+                if outside(w0, owns[0]) || outside(w1, owns[1]) || outside(w2, owns[2]) {
                     continue;
                 }
                 let z = w0 * p[0].z + w1 * p[1].z + w2 * p[2].z;
@@ -187,16 +214,37 @@ impl Canvas {
                 let v = w0 * uv[0][1] + w1 * uv[1][1] + w2 * uv[2][1];
                 let s = w0 * shade[0] + w1 * shade[1] + w2 * shade[2];
                 let texel = part.texture.sample(u, v);
-                self.depth[i] = z;
-                for (k, channel) in texel.iter().take(3).enumerate() {
-                    self.rgba[i * 4 + k] = (f32::from(*channel) * s).min(255.0) as u8;
+                let alpha = texel[3];
+                // A transparent texel (such as one a run-length bitmap
+                // skips) draws nothing and hides nothing.
+                if alpha == 0 {
+                    continue;
                 }
-                self.rgba[i * 4 + 3] = 255;
+                let lit = |c: u8| (f32::from(c) * s).min(255.0);
+                if alpha == 255 {
+                    self.depth[i] = z;
+                    for (out, &c) in self.rgba[i * 4..i * 4 + 3].iter_mut().zip(&texel) {
+                        *out = lit(c) as u8;
+                    }
+                    self.rgba[i * 4 + 3] = 255;
+                    continue;
+                }
+                // A partly transparent texel is blended over what is drawn
+                // and leaves the depth alone, so it never hides what is
+                // drawn behind it later. (The game's skins are opaque or
+                // fully transparent; this only keeps other textures sane.)
+                let a = f32::from(alpha) / 255.0;
+                for (out, &c) in self.rgba[i * 4..i * 4 + 3].iter_mut().zip(&texel) {
+                    *out = (lit(c) * a + f32::from(*out) * (1.0 - a)) as u8;
+                }
+                let below = f32::from(self.rgba[i * 4 + 3]) / 255.0;
+                self.rgba[i * 4 + 3] = ((a + below * (1.0 - a)) * 255.0).round() as u8;
             }
         }
     }
 
-    /// How many pixels something was drawn on.
+    /// How many pixels something opaque was drawn on (a pixel only partly
+    /// covered by a translucent texel is not counted).
     pub fn covered(&self) -> usize {
         self.depth.iter().filter(|d| d.is_finite()).count()
     }
@@ -280,6 +328,142 @@ mod tests {
         assert_eq!(&file[..8], b"\x89PNG\r\n\x1a\n");
         assert_eq!(&file[12..16], b"IHDR");
         assert_eq!(&file[file.len() - 8..file.len() - 4], b"IEND");
+    }
+
+    /// A one-bone body: a square one unit wide facing -Z, standing on the
+    /// origin, with `texture`.
+    fn square(texture: crate::texture::Texture) -> (Body, Vec<Transform>) {
+        use sims_formats::avatar::{Bone, Mesh, MeshBinding, Skeleton, Vertex, Wiggle};
+        let skeleton = Skeleton {
+            name: "test".into(),
+            bones: vec![Bone {
+                name: "ROOT".into(),
+                parent: None,
+                translation: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                properties: Vec::new(),
+                flags: [0; 3],
+                wiggle: Wiggle::default(),
+            }],
+        };
+        let vertex = |x: f32, y: f32| Vertex {
+            position: [x, y, 0.0],
+            normal: [0.0, 0.0, -1.0],
+            uv: [0.5, 0.5],
+            bone: 0,
+        };
+        let mesh = Mesh {
+            name: "square".into(),
+            texture: String::new(),
+            bones: vec!["ROOT".into()],
+            bindings: vec![MeshBinding {
+                bone: 0,
+                first_vertex: 0,
+                vertex_count: 4,
+                first_blend: 0,
+                blend_count: 0,
+            }],
+            triangles: vec![[0, 1, 2], [0, 2, 3]],
+            vertices: vec![
+                vertex(-0.5, 0.0),
+                vertex(0.5, 0.0),
+                vertex(0.5, 1.0),
+                vertex(-0.5, 1.0),
+            ],
+            blends: Vec::new(),
+        };
+        let body = Body {
+            skeleton,
+            parts: vec![Part {
+                appearance: "test".into(),
+                bone: 0,
+                bones: vec![0],
+                mesh,
+                texture_name: None,
+                texture,
+                censor: 0,
+            }],
+        };
+        let world =
+            crate::rig::Pose::rest(&body.skeleton).world(&body.skeleton, Transform::IDENTITY);
+        (body, world)
+    }
+
+    /// Looking straight along +Z at the square's middle, 20 pixels a unit.
+    fn front() -> Camera {
+        Camera {
+            yaw: [0.0, 1.0],
+            pitch: [0.0, 1.0],
+            scale: 20.0,
+            center: Vec3::new(0.0, 0.5, 0.0),
+        }
+    }
+
+    fn pixel(canvas: &Canvas, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * canvas.width + x) * 4) as usize;
+        [
+            canvas.rgba[i],
+            canvas.rgba[i + 1],
+            canvas.rgba[i + 2],
+            canvas.rgba[i + 3],
+        ]
+    }
+
+    #[test]
+    fn transparent_texels_draw_nothing_and_hide_nothing() {
+        use crate::texture::Texture;
+        let background = [1, 2, 3, 255];
+        let (clear, world) = square(Texture::solid([0, 0, 0, 0]));
+        let mut canvas = Canvas::new(40, 40, background);
+        canvas.draw_body(&front(), &clear, &world);
+        assert_eq!(canvas.covered(), 0);
+        assert_eq!(pixel(&canvas, 20, 20), background);
+        // An opaque square drawn behind it afterwards still shows.
+        let (red, _) = square(Texture::solid([255, 0, 0, 255]));
+        let behind = [Transform {
+            rotation: crate::math::Quat::IDENTITY,
+            translation: Vec3::new(0.0, 0.0, 1.0),
+        }];
+        canvas.draw_body(&front(), &red, &behind);
+        assert_eq!(canvas.covered(), 400);
+        assert_eq!(pixel(&canvas, 20, 20)[3], 255);
+        assert!(pixel(&canvas, 20, 20)[0] > 100);
+    }
+
+    #[test]
+    fn translucent_texels_blend_and_leave_the_depth_alone() {
+        use crate::texture::Texture;
+        // Half-transparent white over black: about half grey, and the
+        // pixel is not marked as covered.
+        let (glass, world) = square(Texture::solid([255, 255, 255, 128]));
+        let mut canvas = Canvas::new(40, 40, [0, 0, 0, 255]);
+        canvas.draw_body(&front(), &glass, &world);
+        assert_eq!(canvas.covered(), 0);
+        let (white, _) = square(Texture::solid([255, 255, 255, 255]));
+        let mut lit = Canvas::new(40, 40, [0, 0, 0, 255]);
+        lit.draw_body(&front(), &white, &world);
+        let full = f32::from(pixel(&lit, 20, 20)[0]);
+        let [r, g, b, a] = pixel(&canvas, 20, 20);
+        assert!(
+            (f32::from(r) - full * 128.0 / 255.0).abs() <= 1.0,
+            "{r} {full}"
+        );
+        assert!(r == g && g == b && r > 0);
+        assert_eq!(a, 255);
+        // An opaque square behind it, drawn later, is not hidden by it.
+        let (red, _) = square(Texture::solid([255, 0, 0, 255]));
+        let behind = [Transform {
+            rotation: crate::math::Quat::IDENTITY,
+            translation: Vec3::new(0.0, 0.0, 1.0),
+        }];
+        canvas.draw_body(&front(), &red, &behind);
+        assert_eq!(canvas.covered(), 400);
+        let [r, g, _, _] = pixel(&canvas, 20, 20);
+        assert!(r > 100 && g == 0);
+        // Over a transparent background the alpha adds up.
+        let mut clear = Canvas::new(40, 40, [0, 0, 0, 0]);
+        clear.draw_body(&front(), &glass, &world);
+        assert_eq!(pixel(&clear, 20, 20)[3], 128);
     }
 
     #[test]

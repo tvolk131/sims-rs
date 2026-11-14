@@ -41,8 +41,9 @@ impl Texture {
 /// The largest side accepted, in texels.
 const MAX_SIDE: u32 = 4096;
 
-/// Decodes an uncompressed bitmap with 8, 24 or 32 bits per pixel, or a
-/// run-length encoded one with 8 bits (BI_RLE8), bottom-up or top-down.
+/// Decodes an uncompressed bitmap with 8, 24 or 32 bits per pixel, a
+/// bit-field one (BI_BITFIELDS) with 16 or 32, or a run-length encoded one
+/// with 8 bits (BI_RLE8), bottom-up or top-down.
 /// Every texel is opaque, but for texels a run-length bitmap skips,
 /// which stay transparent black.
 pub fn read_bmp(data: &[u8]) -> Result<Texture, String> {
@@ -105,8 +106,44 @@ pub fn read_bmp(data: &[u8]) -> Result<Texture, String> {
         let i = ((y * width + x) * 4) as usize;
         rgba[i..i + 4].copy_from_slice(&texel);
     };
+    // BI_BITFIELDS: the red, green and blue masks follow a 40-byte header
+    // (and sit at the same place inside a longer one); a header of 56
+    // bytes or more also holds an alpha mask. Without one, texels are
+    // opaque.
+    let masks = if compression == 3 {
+        let alpha = if header >= 56 { u32_at(66)? } else { 0 };
+        let masks = [u32_at(54)?, u32_at(58)?, u32_at(62)?, alpha];
+        if masks[..3].contains(&0) {
+            return Err("a bit-field bitmap with an empty colour mask".into());
+        }
+        Some(masks.map(Channel::new))
+    } else {
+        None
+    };
     match (bits, compression) {
-        (8 | 24 | 32, 0) | (32, 3) => {
+        (16 | 32, 3) => {
+            let masks = masks.ok_or("bit-field bitmap without masks")?;
+            let bytes = usize::from(bits) / 8;
+            let stride = (width as usize * bytes).div_ceil(4) * 4;
+            let body = data
+                .get(pixels..pixels + stride * height as usize)
+                .ok_or("truncated bitmap pixels")?;
+            for row in 0..height {
+                let line = &body[row as usize * stride..];
+                for x in 0..width {
+                    let p = &line[x as usize * bytes..];
+                    let value = if bytes == 2 {
+                        u32::from(u16::from_le_bytes([p[0], p[1]]))
+                    } else {
+                        u32::from_le_bytes([p[0], p[1], p[2], p[3]])
+                    };
+                    let [r, g, b, a] = masks;
+                    let alpha = if a.mask == 0 { 255 } else { a.get(value) };
+                    put(x, row, [r.get(value), g.get(value), b.get(value), alpha]);
+                }
+            }
+        }
+        (8 | 24 | 32, 0) => {
             let stride = (width as usize * usize::from(bits) / 8).div_ceil(4) * 4;
             let body = data
                 .get(pixels..pixels + stride * height as usize)
@@ -186,6 +223,37 @@ pub fn read_bmp(data: &[u8]) -> Result<Texture, String> {
     })
 }
 
+/// One channel of a bit-field bitmap: its mask, and how to scale the bits
+/// it selects to 0..=255.
+#[derive(Debug, Clone, Copy)]
+struct Channel {
+    mask: u32,
+    shift: u32,
+    max: u32,
+}
+
+impl Channel {
+    fn new(mask: u32) -> Self {
+        let shift = if mask == 0 { 0 } else { mask.trailing_zeros() };
+        // The bits from the lowest set bit up to the highest; a mask with
+        // holes is read as if they were set.
+        let max = if mask == 0 {
+            0
+        } else {
+            u32::MAX >> (mask.leading_zeros() + shift)
+        };
+        Self { mask, shift, max }
+    }
+
+    fn get(self, value: u32) -> u8 {
+        if self.max == 0 {
+            return 0;
+        }
+        let v = u64::from((value & self.mask) >> self.shift);
+        ((v * 255 + u64::from(self.max) / 2) / u64::from(self.max)) as u8
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +327,35 @@ mod tests {
             .collect::<Vec<_>>();
         // Texels a run does not reach stay transparent black.
         assert_eq!(texels, [g, r, g, r, r, k]);
+    }
+
+    /// A 32-bit bit-field bitmap of one texel with these masks after a
+    /// 40-byte header.
+    fn bitfields(masks: [u32; 3], texel: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        for m in masks {
+            body.extend(m.to_le_bytes());
+        }
+        body.extend(texel.to_le_bytes());
+        let mut file = bitmap(1, 1, 32, 3, &[], &body);
+        // The pixels start after the masks.
+        file[10..14].copy_from_slice(&66u32.to_le_bytes());
+        file
+    }
+
+    #[test]
+    fn a_bit_field_bitmap_reads_its_masks() {
+        // Red in the low byte, green in the next, blue in the third.
+        let file = bitfields([0xff, 0xff00, 0xff_0000], 0x0003_02ff);
+        assert_eq!(read_bmp(&file).unwrap().rgba, [255, 2, 3, 255]);
+        // The usual order, blue lowest, reads the same texel differently.
+        let file = bitfields([0xff_0000, 0xff00, 0xff], 0x0003_02ff);
+        assert_eq!(read_bmp(&file).unwrap().rgba, [3, 2, 255, 255]);
+        // A narrow mask is scaled to the full range.
+        let file = bitfields([0b1111_1000_0000_0000, 0b111_1110_0000, 0b1_1111], 0xf800);
+        assert_eq!(read_bmp(&file).unwrap().rgba, [255, 0, 0, 255]);
+        // An empty colour mask is refused.
+        assert!(read_bmp(&bitfields([0, 0xff00, 0xff], 0)).is_err());
     }
 
     #[test]

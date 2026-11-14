@@ -4,6 +4,45 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-14: People: transparent texels, shared edges, and people made after the load
+
+A review of `sims-people` found five defects. They are fixed as follows.
+
+- **Transparent texels.** A texel's alpha was ignored, so a texel a
+  run-length bitmap skips was drawn opaque black and hid what was behind
+  it. Now a texel with alpha 0 draws nothing and leaves the depth buffer
+  (the nearest depth drawn at each pixel) alone. A texel with alpha 255
+  is drawn and sets the depth. A texel in between is blended over the
+  pixel and leaves the depth alone. The game's skins are either opaque or
+  fully transparent, so the in-between case only keeps other textures
+  sane. What the original does with partial alpha is **unverified**.
+- **Shared edges.** Testing the alpha fix showed a second fault. A pixel
+  exactly on the edge two triangles share was drawn by both. Now each
+  triangle owns only its top and left edges (the usual "top-left" fill
+  rule), so every pixel is drawn once. This changed the pinned renders
+  of the Goths: 13 to 65 edge pixels each, out of 8,000 to 16,000. No
+  pixel became empty or newly drawn, so none of the change comes from
+  transparency. The new digests were checked that way and then pinned.
+- **Bit-field bitmaps.** A bitmap of type `BI_BITFIELDS` was read as if
+  its colour masks were the usual ones. Now its masks are applied, for 16
+  and 32 bits per pixel. A bitmap with an empty colour mask is refused.
+- **People made after the load.** With a snapshot, the viewer only drew
+  people who were in the saved house. Person 259, the travelling salesman
+  a script makes during the boot, was never drawn. Now the viewer draws
+  every person object the snapshot holds. A person whose record names no
+  clothes is drawn in its type's default outfit: the body, hands and head
+  rows of the type's body strings (the string table its object
+  definition names). These are the rows the old prototype's port of the
+  original's outfit choice (0x58a178) reads. Whether the original draws a
+  newly made person in them is **unverified**; the simulation does not
+  keep the outfit it chose.
+- **Walk clip.** Pressing W took the first three letters of the base clip
+  as the walk clip's prefix, and panicked on a shorter name. Now the
+  prefix comes from the skeleton: `c2o` for a child, `a2o` otherwise.
+- **Weight test.** The test of a clip's weight started and ended at the
+  same pose, so it proved nothing. Now it blends towards a different pose
+  and checks weights 0, 0.5 and 1.
+
 ## 2026-11-14: The lot viewer opens a window with winit and softbuffer
 
 `crates/sims-viewer` is a small program that shows a lot drawn by
@@ -29,6 +68,7 @@ libraries at run time, so CI needs no new system packages.
 What would reopen it: the UI track needing a GPU, text or widgets that
 softbuffer cannot give, at which point the window code moves to wgpu
 or another toolkit, still outside `sims-render`.
+
 ## 2026-11-14: Bella Goth compared with the original; the mirror is still open
 
 One pose was compared with the original game. The game ran in the
