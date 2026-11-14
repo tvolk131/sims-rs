@@ -1275,8 +1275,12 @@ Progress:
 - Done: `sims-viewer` shows a house (or a world saved by `sims boot
   --snapshot`) in a window, with keys and the mouse for zoom, rotation,
   floor, the three wall modes and scrolling, and saves frames as PNGs.
-- Next: a screenshot of the original at the same camera and the
-  comparison, then what it shows needs fixing.
+- Done: one camera (far zoom, rotation 0, floor 1, cutaway) compared
+  with a screenshot of the original. The projection and outdoor sprites
+  match pixel for pixel, and two wall bugs it showed are fixed. See the
+  decisions log for what still differs.
+- Next: indoor lighting, the original's grass, the cut-wall cap, and
+  which rooms the cutaway cuts, each checked against the original.
 
 ## Track: sound (`crates/sims-audio`)
 
@@ -1293,8 +1297,19 @@ stop-sounds events.
   program disassembles, and every entry point and branch resolves. The
   files' own loose ends (155 missing samples, among others) are counted
   in a gated test. The phone ring and a footstep trace to their samples.
-- **Next: the HIT VM.** Run real events (a phone ring, a footstep) end
-  to end into PCM, from a small event type the simulation can emit.
+- **Done: the HIT VM.** `Player` takes `SoundEvent`s and renders PCM.
+  The phone ring and a soft footstep render their samples bit for bit,
+  and every event in the install runs without a bad instruction. The
+  `render_event` example writes events to a WAV file.
+- **Next:**
+  - The simulation emits `SoundEvent`s (the interface is in the
+    decisions log).
+  - Volume, pan and pitch.
+  - The 190 events of other kinds (music modes, TV, sequenced hit
+    lists).
+  - The FSC ambient player.
+  - Live playback behind a feature.
+  - Checking any of it against the original.
 
 ## Working rules
 
