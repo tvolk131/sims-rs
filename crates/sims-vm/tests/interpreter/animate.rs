@@ -870,6 +870,41 @@ fn a_step_is_moved_onto_the_path_where_it_is_nearer() {
     assert_eq!(sims_vm::snap_to_path(&path, [4, 3], 1).unwrap(), [4, 2]);
 }
 
+/// At the end of a path (0x58e740) a person with object data word 9 set
+/// keeps walking while it is far from the end point and has not come
+/// near it (+0x288 clear). Once near, it stands where it is (0x58e846):
+/// the destination becomes the position, +0x288 and +0x28c are set, and
+/// the state's code runs again as a standing animator, which stops
+/// walking.
+#[test]
+fn at_the_end_of_its_path_a_person_walks_on_then_stops() {
+    // Three points: the second segment is the last; the end point is
+    // 100 away, farther than the stopping distance (2 times 1.5).
+    let mut fx = routed();
+    fx.world.routing.routes.get_mut(&SIM).unwrap().path.pop();
+    fx.sim_mut().data[9] = 1;
+    assert!(tick(&mut fx).unwrap());
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.motion.segment, a.motion.near_end), (1, 0));
+    assert_ne!(a.state, 3);
+    // Marked as near the end: it stops on the spot.
+    let mut fx = routed();
+    fx.world.routing.routes.get_mut(&SIM).unwrap().path.pop();
+    fx.sim_mut().data[9] = 1;
+    let a = fx.world.animators.get_mut(&SIM).unwrap();
+    a.motion.near_end = 1;
+    a.walking = true;
+    assert!(tick(&mut fx).unwrap());
+    // Standing where it is, facing its destination's direction, with the
+    // route's end noted (2), it stops walking (0x58f117).
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.state, a.arrival), (3, 2));
+    assert_eq!((a.motion.near_end, a.motion.finishing), (1, 1));
+    assert_eq!(a.destination, a.position);
+    assert_eq!(a.position, [100.0, 200.0, 6.0].map(F32::from_f32));
+    assert!(!a.walking);
+}
+
 #[test]
 fn what_the_route_follow_does_not_port_fails_loudly() {
     // Facing the point ahead, a standing animator walks; but the point,
@@ -907,15 +942,20 @@ fn what_the_route_follow_does_not_port_fails_loudly() {
     fx.world.animators.get_mut(&SIM).unwrap().destination[2] = F32::from_f32(2.0);
     fx.sim_mut().data[42] = 0;
     assert!(tick(&mut fx).unwrap_err().to_string().contains("blocked"));
-    // A path whose second segment is its last.
+    // The end of a path for a person whose object data word 9 is clear
+    // (0x58e8be: a timer and a stopping clip).
     let mut fx = routed();
     fx.world.routing.routes.get_mut(&SIM).unwrap().path.pop();
-    assert!(
-        tick(&mut fx)
-            .unwrap_err()
-            .to_string()
-            .contains("last segment")
-    );
+    fx.sim_mut().data[9] = 0;
+    assert!(tick(&mut fx).unwrap_err().to_string().contains("0x58e8be"));
+    // Stopping at the end of a path for a person whose word 64 is set
+    // (0x58e83b).
+    let mut fx = routed();
+    fx.world.routing.routes.get_mut(&SIM).unwrap().path.pop();
+    fx.sim_mut().data[9] = 1;
+    fx.sim_mut().person.as_mut().unwrap().data[64] = 1;
+    fx.world.animators.get_mut(&SIM).unwrap().motion.near_end = 1;
+    assert!(tick(&mut fx).unwrap_err().to_string().contains("0x58e83b"));
     // No walk clip to set the look-ahead.
     let mut fx = routed();
     fx.program

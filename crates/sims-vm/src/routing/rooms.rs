@@ -63,7 +63,7 @@ impl Interpreter<'_> {
     /// The other side of a door (0x4636ae): the next part of the door's
     /// group, round the ring, that has the door function. Doors that pair
     /// by graphic (definition word 69 is 1) are not ported.
-    fn partner(&self, world: &World, door: u16) -> Result<u16, Trap> {
+    pub(crate) fn partner(&self, world: &World, door: u16) -> Result<u16, Trap> {
         if self.words(world, door)?[PAIRING] == 1 {
             return Err(Trap::Unsupported(
                 "a door that pairs with its other side by graphic (0x4636c5) is not ported".into(),

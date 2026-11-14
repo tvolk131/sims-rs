@@ -4,9 +4,9 @@
 
 use crate::support::*;
 use crate::visits::{lot, stand};
+use sims_core::F32;
 use sims_formats::saved_objects::Slot;
 use sims_formats::tuning::{Constant, Constants};
-use sims_sim::rooms::RoomError;
 use sims_vm::{Asked, INDICATORS, Interpreter, Trap, selected};
 use std::cell::RefCell;
 
@@ -299,14 +299,35 @@ fn going_live_marks_the_rooms_and_the_frame_counts_them() {
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     let world = &mut fx.world;
     let all = [0, 1, 1024];
-    // The person stands in room 1, which has no light: whether the room
-    // is lit for them is not ported.
-    let fault = interpreter.update_rooms(world, 0).unwrap_err();
-    assert_eq!(
-        fault.trap,
-        Trap::Unsupported(RoomError::Occupancy(1).to_string())
-    );
-    // Outside the walls a person is fine: room 0 has daylight.
+    // The person stands in room 1, which has no light. The room has not
+    // been told anyone is in it, so it shows its own light.
+    assert_eq!(interpreter.update_rooms(world, 0).unwrap(), all);
+    let dark = world.rooms.rooms[&1].clone();
+    assert!(dark.people > 0 && !dark.occupied && dark.lights == 0);
+    assert_eq!(dark.shown_light(), dark.light);
+    // (A first count can change a room's light and so mark it again.)
+    for room in world.rooms.rooms.values_mut() {
+        room.dirty = false;
+    }
+    world.rooms.pending = 0;
+    // Told, it shows 0.8 and is counted again once; the count does not
+    // change what it shows, so it is not marked again.
+    world.note_occupant(1, true);
+    assert_eq!(world.rooms.pending, 1);
+    assert_eq!(interpreter.update_pending_rooms(world).unwrap(), [1]);
+    assert_eq!(world.rooms.rooms[&1].shown_light(), F32::from_f32(0.8));
+    assert!(world.rooms.rooms.values().all(|room| !room.dirty));
+    // A frame of the house view counts the rooms that wait before it
+    // draws anyone (0x4a8895 at 0x4a8b03). Drawing this person fails, as
+    // the fixture supplies no appearance for it; its room has been
+    // counted by then.
+    world.note_occupant(1, false);
+    assert_eq!(world.rooms.pending, 1);
+    let fault = interpreter.draw_frame(world, 1).unwrap_err();
+    assert!(fault.to_string().contains("profile"), "{fault}");
+    assert_eq!(world.rooms.pending, 0);
+    assert!(world.rooms.rooms.values().all(|room| !room.dirty));
+    // Outside the walls: room 0 has daylight.
     let (mut fx, _) = lot();
     resident(&mut fx, PERSON, [1, 1]);
     // A lamp inside: a light source worth 30, with 5 of impact, and of a

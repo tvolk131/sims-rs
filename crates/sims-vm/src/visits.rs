@@ -16,21 +16,22 @@
 //! the object is rebuilt ([`Interpreter::rebuild`]): taken off the lot,
 //! its storage reset, Init and a first turn run, and put back.
 //!
-//! A person's visit (0x459bf6) differs in three ways (`people.rs`):
+//! A person's visit (0x459bf6) differs in four ways (`people.rs`):
 //!
 //! - Before anything else the person takes its lasting fields from its
 //!   neighborhood record (0x4258a3).
 //! - It is not asked its Load function.
 //! - It resets in its own way (0x45e791): its thread restarts at Main
 //!   first, and then its Reset function runs on top of that.
+//! - After its position is restored, and before a reset, it notes
+//!   the room it is in (0x45e43d at 0x459c22; [`Interpreter::note_room`]),
+//!   which may tell the room it is occupied. A capture of the original
+//!   loading the Goth house has each person's noted room (person field
+//!   0xafc) equal to its room word at the end of the load.
 //!
-//! After the visit the original also notes the room the person is in,
-//! which tells the room it is occupied, and loads the person's motive
-//! curves (0x45e43d, 0x459d23). Neither is kept here. An outdoor room
-//! ignores being told, and the room update fails for an indoor room
-//! where it would matter (`sims_sim::rooms::RoomError::Occupancy`).
-//! Nothing reads the curves until a person's motives are updated.
-//! [`crate::curve_table`] says which curves they would be.
+//! The original then loads the person's motive curves (0x459d23). That is
+//! not kept here. Nothing reads the curves until a person's motives are
+//! updated. [`crate::curve_table`] says which curves they would be.
 //!
 //! Ported from the old prototype's visit loop
 //! (legacy/crates/sims-content/src/house_loading.rs), `PostLoad`
@@ -191,7 +192,9 @@ impl Interpreter<'_> {
             position[2] = 1;
         }
         self.move_tree(world, id, position).map_err(fail)?;
-        if !person {
+        if person {
+            self.note_room(world, id).map_err(fail)?;
+        } else {
             self.callback(world, id, function::LOAD, 0)?;
         }
         if changed {

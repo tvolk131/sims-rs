@@ -29,22 +29,26 @@ pub struct Options<'a> {
 /// the window system decide that, not the simulation, so it is an input
 /// here. Tick 0 means before the first tick.
 ///
-/// The default, `0,1,2,3,33+`, follows a capture of the original running
-/// the Goth house with no input but the dialog answers, with a hardware
-/// watchpoint on the house view's draw guard (`docs/decisions.md`): it
-/// drew before the first lot update, after updates 1, 2 and 3 (many
-/// times while a dialog waited), after update 33, and not after updates
-/// 4 to 32 or 34 to 45. The frames after 34 on are not in that capture;
-/// on this house they change nothing (the state after tick 232 is the
-/// same with and without them). Frames after 1 to 3 change nothing either.
-/// The one that matters is after 33: it draws person 259, made in tick 6,
-/// for the first time.
+/// The default, `0,1,2,3,33+30`, is what three captures of the original
+/// running the Goth house recorded, with a hardware watchpoint on the
+/// house view's draw guard (`docs/decisions.md`): a frame before the
+/// first lot update, after updates 1, 2 and 3 (many times while a dialog
+/// waited), after update 33, and after every 30th update from there (63,
+/// 93, ...). Frames write two things: the first frame that draws a
+/// person places its animator (on this house, the frame after tick 33
+/// draws person 259, made in tick 6), and every frame counts the rooms
+/// that wait to be counted (0x4a8895). So the schedule changes the
+/// state: with a frame after every tick, the rooms are counted sooner.
+/// On this house that changes no state the captures hold through tick
+/// 261, but it changes the rooms' state in between.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frames {
     /// Ticks after which a frame is drawn.
     pub after: Vec<u32>,
-    /// A frame after every tick from this one on.
+    /// A frame after this tick and after every `step`th tick from it.
     pub from: Option<u32>,
+    /// The ticks between two of those frames, at least 1.
+    pub step: u32,
 }
 
 impl Default for Frames {
@@ -52,25 +56,35 @@ impl Default for Frames {
         Self {
             after: vec![0, 1, 2, 3],
             from: Some(33),
+            step: 30,
         }
     }
 }
 
 impl Frames {
-    /// Reads a list such as `0,33+`: a tick number draws a frame after
-    /// that tick (0: before the first), and `N+` after every tick from N
-    /// on. `none` draws no frame.
+    /// Reads a list such as `0,33+30`: a tick number draws a frame after
+    /// that tick (0: before the first), `N+` after every tick from N on,
+    /// and `N+S` after N and every S-th tick from there. `none` draws no
+    /// frame.
     pub fn parse(text: &str) -> Option<Self> {
         let mut frames = Self {
             after: Vec::new(),
             from: None,
+            step: 1,
         };
         if text == "none" {
             return Some(frames);
         }
         for part in text.split(',') {
-            match part.strip_suffix('+') {
-                Some(n) => frames.from = Some(n.parse().ok()?),
+            match part.split_once('+') {
+                Some((from, step)) => {
+                    frames.from = Some(from.parse().ok()?);
+                    frames.step = if step.is_empty() {
+                        1
+                    } else {
+                        step.parse().ok().filter(|&s| s > 0)?
+                    };
+                }
                 None => frames.after.push(part.parse().ok()?),
             }
         }
@@ -79,7 +93,10 @@ impl Frames {
 
     /// Whether a frame is drawn after tick `tick`.
     pub fn after(&self, tick: u32) -> bool {
-        self.after.contains(&tick) || self.from.is_some_and(|from| tick >= from)
+        self.after.contains(&tick)
+            || self
+                .from
+                .is_some_and(|from| tick >= from && (tick - from).is_multiple_of(self.step))
     }
 }
 
@@ -459,4 +476,26 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     );
     let _ = writeln!(out, "Hash:    {}", world.hash_hex());
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Frames;
+
+    #[test]
+    fn a_frame_list_reads_ticks_and_repeats() {
+        let frames = Frames::parse("0,2,10+5").unwrap();
+        let drawn: Vec<u32> = (0..=21).filter(|&t| frames.after(t)).collect();
+        assert_eq!(drawn, [0, 2, 10, 15, 20]);
+        let every = Frames::parse("3+").unwrap();
+        let drawn: Vec<u32> = (0..=6).filter(|&t| every.after(t)).collect();
+        assert_eq!(drawn, [3, 4, 5, 6]);
+        assert_eq!(Frames::parse("none").unwrap().from, None);
+        assert_eq!(Frames::parse("4+0"), None);
+        assert_eq!(Frames::parse("x"), None);
+        let default = Frames::default();
+        let drawn: Vec<u32> = (0..=100).filter(|&t| default.after(t)).collect();
+        assert_eq!(drawn, [0, 1, 2, 3, 33, 63, 93]);
+        assert_eq!(Frames::parse("0,1,2,3,33+30"), Some(default));
+    }
 }

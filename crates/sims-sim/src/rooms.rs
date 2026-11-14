@@ -114,10 +114,6 @@ pub enum RoomError {
     Standing(u16),
     /// The objects on a tile could not be listed.
     Tile { tile: [u8; 3], why: String },
-    /// A dark indoor room with people in it and no lights. Whether it is
-    /// lit for them depends on the room knowing it is occupied
-    /// (0x468802), which is not ported.
-    Occupancy(i16),
 }
 
 impl std::fmt::Display for RoomError {
@@ -158,11 +154,6 @@ impl std::fmt::Display for RoomError {
                 f,
                 "the objects on tile {}, {} of level {} could not be listed: {why}",
                 tile[0], tile[1], tile[2]
-            ),
-            Self::Occupancy(room) => write!(
-                f,
-                "room {room} is dark, has no lights and has people in it; whether it is lit \
-                 for them depends on the room knowing it is occupied, which is not ported"
             ),
         }
     }
@@ -268,6 +259,11 @@ pub struct Room {
     /// Whether the room is a pool: its first listed tile is on the ground
     /// level and its pool cell is below 16.
     pub pool: bool,
+    /// Whether the room knows a person is in it (room byte 0x73). A
+    /// person tells its room as it enters and leaves
+    /// ([`World::note_occupant`], 0x468802). A new room does not know. The
+    /// room update keeps the mark (0x4678b7 does not clear it).
+    pub occupied: bool,
 }
 
 /// One level's arrays, checked to be 64 by 64 cells of the right size.
@@ -861,6 +857,39 @@ impl World {
         }
     }
 
+    /// A person enters (`occupied` true) or leaves a room (0x468802). A
+    /// person's room step calls it ([`PersonTick::room`]). Nothing
+    /// happens if no room has the ID, the room is outdoors (0x46876f), it
+    /// already has that mark, or it is a pool. Otherwise:
+    ///
+    /// 1. The room takes the mark ([`Room::occupied`]).
+    /// 2. If the room has no lights and its light is below 0.8 (a light
+    ///    that is not a number counts as below), the light it shows has
+    ///    changed: the room is announced as changed (signal 0xf1, with
+    ///    the room's ID) and the lot answers by marking it as not counted
+    ///    ([`World::mark_room`], 0x466b55), as in [`World::update_rooms`].
+    ///    The original then lights the room's tiles with the new light
+    ///    (0x46772d); that is presentation and not modeled.
+    ///
+    /// Read from the original's code. That nothing but the lot's mark
+    /// answers signal 0xf1 is the reading [`World::update_rooms`] already
+    /// rests on.
+    ///
+    /// [`PersonTick::room`]: crate::world::PersonTick::room
+    pub fn note_occupant(&mut self, id: i16, occupied: bool) {
+        let Some(room) = self.rooms.rooms.get_mut(&id) else {
+            return;
+        };
+        if room.outdoors || room.occupied == occupied || room.pool {
+            return;
+        }
+        room.occupied = occupied;
+        if room.lights != 0 || !dim(room.light) {
+            return;
+        }
+        self.mark_room(id);
+    }
+
     /// Marks every room as not counted and both levels as waiting
     /// (0x466c01, 0x466ba3). The original does this when the lighting
     /// changes (signal 0xdd), which a load sends once the house is read,
@@ -935,10 +964,7 @@ impl World {
     /// original at two moments and were equal; see `docs/decisions.md`.
     ///
     /// Not modeled, being presentation: the lights the update places in a
-    /// room, the lighting of the tiles, and the redrawing. Not ported:
-    /// whether an indoor room is lit because someone is in it (0x468802).
-    /// A room where that would matter fails with
-    /// [`RoomError::Occupancy`].
+    /// room, the lighting of the tiles, and the redrawing.
     pub fn update_rooms(
         &mut self,
         tuning: &Tuning,
@@ -964,11 +990,12 @@ impl World {
             if index > 1 {
                 return Err(RoomError::Level(index as i32 + 1));
             }
-            let before = room.shown_light(id)?;
-            let outdoors = room.outdoors;
+            let before = room.shown_light();
+            let (outdoors, occupied) = (room.outdoors, room.occupied);
             let tiles = room.tiles.clone();
             let mut count = Room {
                 outdoors,
+                occupied,
                 ..Room::default()
             };
             // The pool array is optional in a house file. A lot without
@@ -1003,7 +1030,7 @@ impl World {
             let (light, score) = tuning.score(&count, daylight);
             count.light = light;
             count.score = score;
-            let after = count.shown_light(id)?;
+            let after = count.shown_light();
             let room = self.rooms.rooms.get_mut(&id).ok_or(RoomError::NoRooms)?;
             count.tiles = tiles;
             *room = count;
@@ -1079,31 +1106,19 @@ pub struct Standing {
 
 impl Room {
     /// The light the room shows (0x4688bf, and inline in 0x466c3c): 0.8
-    /// for a pool, and for a dark room with no lights that knows someone
-    /// is in it; otherwise the room's light.
+    /// for a pool, and for a room with no lights and people counted in it
+    /// that knows someone is in it ([`Room::occupied`]) and whose light is
+    /// below 0.8; otherwise the room's light. A light that is not a number
+    /// counts as below 0.8, as the original's FCOMP and JB make it.
     ///
-    /// A person tells its room as it enters and leaves (0x468802). An
-    /// outdoor room and a pool ignore that, so they never know. For an
-    /// indoor room it is not ported, and this fails for the one case
-    /// where the answer depends on it: an indoor room that is no pool,
-    /// has no lights, has people standing in it, and whose light is below
-    /// 0.8.
-    pub fn shown_light(&self, id: i16) -> Result<F32, RoomError> {
+    /// An outdoor room and a pool never know someone is in them
+    /// ([`World::note_occupant`]).
+    pub fn shown_light(&self) -> F32 {
         let lit = F32::from_bits(LIT);
-        if self.pool {
-            return Ok(lit);
+        if self.pool || (self.occupied && self.lights == 0 && self.people > 0 && dim(self.light)) {
+            return lit;
         }
-        if !self.outdoors
-            && self.lights == 0
-            && self.people > 0
-            && !matches!(
-                self.light.ext().partial_cmp(&lit.ext()),
-                Some(Ordering::Equal | Ordering::Greater)
-            )
-        {
-            return Err(RoomError::Occupancy(id));
-        }
-        Ok(self.light)
+        self.light
     }
 
     /// Counts one listed tile (0x467bb1).
@@ -1240,6 +1255,16 @@ impl Default for Tuning {
 const HUNDREDTH: u32 = 0x3c23_d70a;
 const HALF: u32 = 0x3f00_0000;
 const LIT: u32 = 0x3f4c_cccd;
+
+/// Whether a room's light is below 0.8 ([0x667638]) as FCOMP and a jump
+/// on carry see it: an unordered compare, a light that is not a number,
+/// counts as below.
+fn dim(light: F32) -> bool {
+    !matches!(
+        light.ext().partial_cmp(&F32::from_bits(LIT).ext()),
+        Some(Ordering::Equal | Ordering::Greater)
+    )
+}
 const ONE: u32 = 0x3f80_0000;
 const NEARLY_ONE: u64 = 0x3fef_ae14_7ae1_47ae;
 

@@ -447,7 +447,15 @@ fn what_a_person_tick_does_not_port_fails_loudly() {
         update(&mut fx, &mut answers(&[])),
         Err(TickError::Fault(f)) if f.to_string().contains("0x4a69aa")
     ));
-    // Entering an indoor room.
+}
+
+/// A person in an indoor room marks it as occupied (0x468802, called
+/// from the person's room step). A dark room with no lights then shows
+/// a changed light, so the lot marks it to be counted again
+/// (0x4688bf, 0x466b55): the room is dirty and its level, 0, waits
+/// (pending bit 1).
+#[test]
+fn a_person_marks_an_indoor_room_as_occupied() {
     let mut fx = lot(sleeper());
     fx.thread(LAMP, 4096, &[3]);
     fx.world
@@ -457,8 +465,10 @@ fn what_a_person_tick_does_not_port_fails_loudly() {
     let sim = fx.sim_mut();
     sim.data[29] = 3;
     sim.person.as_mut().unwrap().data[65] = 0;
-    assert!(matches!(
-        update(&mut fx, &mut answers(&[])),
-        Err(TickError::Fault(f)) if f.to_string().contains("0x468802")
-    ));
+    assert!(!fx.world.rooms.rooms[&3].occupied);
+    update(&mut fx, &mut answers(&[])).unwrap();
+    let room = &fx.world.rooms.rooms[&3];
+    assert!(room.occupied);
+    assert!(room.dirty);
+    assert_eq!(fx.world.rooms.pending, 1);
 }

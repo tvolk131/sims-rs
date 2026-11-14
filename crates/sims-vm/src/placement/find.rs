@@ -116,7 +116,67 @@ fn array(world: &World, id: u16, stride: usize) -> Result<&[u8], Trap> {
     Ok(&array.data)
 }
 
-/// The index of a tile's cell in the lot's 64 by 64 arrays.
+/// Whether a tile is a pool's (0x478f76): on the ground level of a lot
+/// with a pool array, a pool byte below 0x10.
+pub(crate) fn pool_tile(world: &World, [a, b]: [i8; 2], level: i32) -> Result<bool, Trap> {
+    if level != 1 || !world.arrays.contains_key(&POOL) {
+        return Ok(false);
+    }
+    Ok(array(world, POOL, 1)?[cell(a, b)?] < 0x10)
+}
+
+/// Object data word 53: the directions an object closes off, as eight
+/// bits for directions 0 to 7 relative to the object's facing.
+const CLOSED: usize = 53;
+
+/// The directions a tile is closed off in, by walls and by the objects
+/// on it, as eight bits for directions 0 to 7, turned so that bit 0 is
+/// direction `rot` (0x4359ea). The tile is column, row and level.
+///
+/// 1. A tile outside the lot's border (0x433087) has none.
+/// 2. Its wall segments (byte 0 of the wall cell, [`segments`]) give
+///    bit 0x40 for segment 1, bit 1 for segment 2, bit 4 for segment 4
+///    and bit 0x10 for segment 8.
+/// 3. Each object on the tile, with everything it holds
+///    ([`super::standing_on`]), adds its data word 53, sign-extended and
+///    turned left by the low byte of its direction (data word 1)
+///    (0x4359ce): the bits shifted past bit 7 come back at bit 0.
+/// 4. If `rot` is not 0, the bits are turned right by `rot` the same way.
+///
+/// Read from the original's code.
+pub(crate) fn closed_directions(world: &World, tile: [i8; 3], rot: i32) -> Result<i32, Trap> {
+    let [a, b, level] = tile;
+    if !inside(world, a, b) {
+        return Ok(0);
+    }
+    let walls = segments(world, a, b, i32::from(level))?;
+    let mut bits = 0i32;
+    for (segment, bit) in [(1, 0x40), (2, 1), (4, 4), (8, 0x10)] {
+        if walls & segment != 0 {
+            bits |= bit;
+        }
+    }
+    for id in super::standing_on(world, [a as u8, b as u8, level as u8])? {
+        let closed = i32::from(datum(world, id, CLOSED)?);
+        if closed != 0 {
+            let facing = datum(world, id, data::FACING)? as u8;
+            bits |= turn(closed, u32::from(facing));
+        }
+    }
+    if rot != 0 {
+        bits = turn(bits, 8u32.wrapping_sub(rot as u32));
+    }
+    Ok(bits)
+}
+
+/// A left shift as SHL does it (the count taken mod 32), then the byte
+/// above the lowest folded back into it: an eight-bit turn left for a
+/// count below 8.
+fn turn(bits: i32, count: u32) -> i32 {
+    let shifted = bits.wrapping_shl(count & 31);
+    (shifted & 0xff) | ((shifted >> 8) & 0xff)
+}
+
 fn cell(a: i8, b: i8) -> Result<usize, Trap> {
     let (a, b) = (i32::from(a), i32::from(b));
     if !(0..FULL).contains(&a) || !(0..FULL).contains(&b) {
@@ -348,13 +408,8 @@ impl Interpreter<'_> {
         if rules.same_room && room(world, a, b, level).map_err(fail)? != start_room {
             return Ok(false);
         }
-        // 0x478f76: a pool tile, on the ground level of a lot with a pool
-        // array.
-        if level == 1 && world.arrays.contains_key(&POOL) {
-            let pool = array(world, POOL, 1).map_err(fail)?;
-            if pool[cell(a, b).map_err(fail)?] < 0x10 {
-                return Ok(false);
-            }
+        if pool_tile(world, [a, b], level).map_err(fail)? {
+            return Ok(false);
         }
         if rules.unmarked {
             let flags = array(world, FLAGS[0], 1).map_err(fail)?;
@@ -744,7 +799,7 @@ impl Interpreter<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WALLS, crosses_wall, spiral_step};
+    use super::{WALLS, closed_directions, crosses_wall, spiral_step, turn};
     use sims_formats::lot::Array;
     use sims_sim::World;
 
@@ -842,5 +897,73 @@ mod tests {
         // A footprint on the tile wholly on one side of it does not.
         let world = walled(0x10, 1);
         assert_eq!(crosses_wall(&world, [32, 48, 40, 52], 1), Ok(false));
+    }
+
+    #[test]
+    fn a_turn_folds_the_bits_shifted_past_bit_7_back_to_bit_0() {
+        assert_eq!(turn(0x81, 1), 0x03);
+        assert_eq!(turn(0x41, 6), 0x50);
+        assert_eq!(turn(0x41, 0), 0x41);
+        // A word with its sign set fills the byte.
+        assert_eq!(turn(-1, 2), 0xff);
+    }
+
+    #[test]
+    fn a_tile_is_closed_off_by_its_walls_and_the_objects_on_it() {
+        let mut world = walled(1 | 2, 1);
+        world.size = 10;
+        // Segment 1 closes direction 6, segment 2 direction 0.
+        assert_eq!(closed_directions(&world, [2, 3, 1], 0), Ok(0x41));
+        // Turned to direction 2: bit 0 is then direction 2.
+        assert_eq!(closed_directions(&world, [2, 3, 1], 2), Ok(0x50));
+        // A tile outside the lot's border is closed off in none.
+        assert_eq!(closed_directions(&world, [0, 3, 1], 0), Ok(0));
+        // An object on the tile closes its data word 53's directions,
+        // turned by its direction (data word 1).
+        let mut grid = vec![0; 64 * 64 * 2];
+        grid[(2 * 64 + 3) * 2] = 5;
+        world.arrays.insert(
+            3,
+            Array {
+                width: 64,
+                height: 64,
+                stride: 2,
+                encoding: 0,
+                data: grid,
+            },
+        );
+        let mut data = vec![0; 72];
+        data[1] = 2;
+        data[53] = 1;
+        world.objects.insert(
+            5,
+            sims_sim::Object {
+                id: 5,
+                guid: 0,
+                footprint: [0; 4],
+                position: [32, 48, 1],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: Vec::new(),
+                data,
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: -1,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            },
+        );
+        assert_eq!(closed_directions(&world, [2, 3, 1], 0), Ok(0x45));
+        world.objects.get_mut(&5).unwrap().data[53] = -1;
+        assert_eq!(closed_directions(&world, [2, 3, 1], 0), Ok(0xff));
     }
 }

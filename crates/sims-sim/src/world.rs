@@ -204,8 +204,9 @@ impl PersonTick {
     /// The values the person constructor gives (0x459327 writes 0 to
     /// 0x810 at 0x45942a and -5 to 0xafc at 0x45948b). Nothing else
     /// writes either field but the person's tick (0x45cd32) and the room
-    /// step (0x45e492, in 0x45e43d), which the person's tick runs and so
-    /// does the placement of a walking person (0x45e4e9).
+    /// step (0x45e492, in 0x45e43d), which the person's tick runs, and so
+    /// do the person's visit in a load (0x459c22) and the placement of a
+    /// walking person (0x45e4e9).
     pub const CONSTRUCTED: Self = Self {
         last_decay: 0,
         room: -5,

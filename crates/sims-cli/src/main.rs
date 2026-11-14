@@ -25,8 +25,9 @@ const USAGE: &str = "usage: sims census <path>...
            choice takes the next of --answers (2 for the first button, 3
            the second, 4 the third). --frames says after which ticks the
            house view draws a frame: tick numbers (0 for before the first
-           tick), N+ for every tick from N on, or none; the default is
-           0,1,2,3,33+. --snapshot saves that state to a REDB file as \"boot\".";
+           tick), N+ for every tick from N on, N+S for N and every S-th
+           tick from there, or none; the default is 0,1,2,3,33+30.
+           --snapshot saves that state to a REDB file as \"boot\".";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
