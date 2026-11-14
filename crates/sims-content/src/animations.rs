@@ -149,7 +149,7 @@ impl Animations {
                     .extension()
                     .is_some_and(|e| e.eq_ignore_ascii_case("far"));
                 if is_archive && path.is_file() {
-                    for member in far_members(&path)? {
+                    for member in far_members(&path)?.0 {
                         resources.push(Resource {
                             mount: 0,
                             path: path.clone(),

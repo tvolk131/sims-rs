@@ -258,3 +258,73 @@ fn unreadable_archives_are_skipped_with_a_diagnostic() {
     assert_eq!(index.diagnostics.len(), 1);
     assert!(index.diagnostics[0].contains("Broken.far"));
 }
+
+#[test]
+fn an_archive_claiming_a_huge_directory_is_skipped_unread() {
+    let tree = Tree::new("huge-directory");
+    base_game(&tree);
+    // The directory starts right after the header, so the whole sparse
+    // remainder would be the directory.
+    let mut header = b"FAR!byAZ".to_vec();
+    header.extend(1u32.to_le_bytes());
+    header.extend(16u32.to_le_bytes());
+    header.extend(1u32.to_le_bytes());
+    tree.file("Downloads/Huge.far", &header)
+        .file("Downloads/Good.iff", b"g");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(tree.0.join("Downloads/Huge.far"))
+        .unwrap()
+        .set_len(sims_formats::far::MAX_DIRECTORY + 17)
+        .unwrap();
+    let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
+    assert_eq!(index.named("Good.iff").count(), 1);
+    assert_eq!(index.diagnostics.len(), 1);
+    assert!(index.diagnostics[0].contains("64 MiB"));
+}
+
+#[test]
+fn a_compressed_member_is_left_out_with_a_diagnostic() {
+    let tree = Tree::new("compressed-member");
+    base_game(&tree);
+    let mut archive = far(&[("Packed.iff", &[7; 64]), ("Plain.iff", b"plain")]);
+    // The first member's unpacked size, the first word of its entry.
+    let manifest = u32::from_le_bytes(archive[12..16].try_into().unwrap()) as usize;
+    archive[manifest + 4..manifest + 8].copy_from_slice(&65u32.to_le_bytes());
+    tree.file("Downloads/pack.far", &archive);
+    let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
+    assert_eq!(index.named("Packed.iff").count(), 0);
+    let (_, plain) = index.named("Plain.iff").next().unwrap();
+    assert_eq!(plain.read().unwrap(), b"plain");
+    assert_eq!(index.diagnostics.len(), 1);
+    assert!(index.diagnostics[0].contains("compressed member Packed.iff"));
+}
+
+#[test]
+fn a_read_checks_the_member_against_the_archive_again() {
+    let tree = Tree::new("stale-member");
+    base_game(&tree);
+    tree.file("Downloads/pack.far", &far(&[("Gone.iff", b"payload")]));
+    let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
+    let (_, member) = index.named("Gone.iff").next().unwrap();
+    assert_eq!(member.read().unwrap(), b"payload");
+    // The archive shrinks after indexing.
+    tree.file("Downloads/pack.far", b"FAR!byAZ");
+    assert!(member.read().unwrap_err().to_string().contains("outside"));
+}
+
+#[test]
+fn a_resource_over_the_size_limit_fails_to_read() {
+    let tree = Tree::new("huge-resource");
+    base_game(&tree);
+    tree.file("Downloads/Huge.iff", b"");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(tree.0.join("Downloads/Huge.iff"))
+        .unwrap()
+        .set_len(sims_formats::far::MAX_MEMBER + 1)
+        .unwrap();
+    let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
+    let (_, huge) = index.named("Huge.iff").next().unwrap();
+    assert!(huge.read().unwrap_err().to_string().contains("128 MiB"));
+}

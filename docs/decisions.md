@@ -4,6 +4,28 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-14: Archive reads are bounded; compressed FAR members are left out (unverified)
+
+Archive readers in `sims-content` and the census now cap what they load,
+with the frozen prototype's limits: a FAR directory of at most 64 MiB
+(`far::MAX_DIRECTORY`) and a resource of at most 128 MiB
+(`far::MAX_MEMBER`). A member is checked against its archive again when
+it is read, because the file may have changed since indexing. The
+census opens archives inside archives at most four deep, rejects an
+archive whose member overlaps its header or directory (such a member can
+be the archive itself), and stops decoding members of one file on disk
+beyond four times its length plus 16 MiB. The game's own files are far
+inside all of these limits, and the install census is unchanged.
+
+A FAR 1a member whose unpacked size differs from its stored size is
+compressed. Decompression is not implemented, so such a member is left
+out of the index with a diagnostic, as the prototype refused it, and the
+rest of its archive mounts. **Unverified**: whether the original lists
+such a member, and so whether it hides a later file of the same name.
+The game's own archives hold none. Keeping both sizes on
+`sims_content::Member` waits on `sims-people`, which builds that struct
+itself and also reads FAR directories without these caps.
+
 ## 2026-11-14: Bella Goth compared with the original; the mirror is still open
 
 One pose was compared with the original game. The game ran in the
