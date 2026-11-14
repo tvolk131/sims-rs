@@ -494,6 +494,9 @@ class AgentScriptTest(unittest.TestCase):
 
     def test_two_agents_run_each_command_once(self):
         d = Path(tempfile.mkdtemp())
+        # An ended command an older agent left as .cmd must not run again.
+        (d / '00000.cmd').write_text(f'echo stale >> {d}/ran\n')
+        (d / '00000.done').write_text('0\n')
         script = Path(inp.__file__).with_name('guest') / 'input-agent.sh'
         env = dict(os.environ, INPUT_DIR=str(d))
         agents = [subprocess.Popen(['sh', str(script)], env=env) for _ in range(2)]
@@ -508,7 +511,7 @@ class AgentScriptTest(unittest.TestCase):
             self.assertEqual([agent.result(n) for n in ns], [0] * 20)
             self.assertEqual(sorted(int(x) for x in (d / 'ran').read_text().split()), list(range(20)))
             self.assertEqual(agent.numbered(), 20)
-            self.assertFalse(list(d.glob('*.cmd')))
+            self.assertEqual([p.name for p in d.glob('*.cmd')], ['00000.cmd'])  # left alone
         finally:
             for a in agents:
                 a.kill()

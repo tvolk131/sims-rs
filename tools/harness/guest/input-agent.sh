@@ -21,6 +21,7 @@ while :; do
     for c in "$D"/*.cmd; do
         [ -e "$c" ] || continue
         base=${c%.cmd}
+        [ -e "$base.done" ] && continue  # ended (left as .cmd by an older agent)
         mv "$c" "$base.run" 2>/dev/null || continue
         /bin/sh "$base.run" > "$base.out" 2>&1
         echo "$?" > "$base.done"
