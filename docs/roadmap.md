@@ -1437,7 +1437,9 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   The frame's corners are close but not exact. "Magic Town" is pinned by
   layout and digest, gated on `SIMS_INSTALL`. `sims-viewer --hud` shows a
   waiting dialog, and its answer is printed.
-- **Next:** pie menus; a Yes/No dialog checked against the original (the
+- **Next:** open houses through `sims_vm::boot::Lot` (which now runs the
+  household load) in the tests and the viewer, in place of their
+  stand-in for steps 17 and 18; pie menus; a Yes/No dialog checked against the original (the
   "Help System" one at tick 2) for the layout of several buttons; text
   entry dialogs; the other live panels.
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
@@ -1446,11 +1448,6 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
     taking: select a Sim (object ID), set the speed, pause or run, go
     to a mode, answer a dialog (caller, button), and choose a pie menu
     entry (Sim, object, interaction).
-  - A library form of the boot's household load (`sims boot` steps 17
-    and 18): `World::load_household(&mut self, family: &Family)` that
-    sets the funds and selects the first member. Today the CLI does it
-    and a host that opens a house gets the house file's funds and no
-    selection.
   - The household's member order kept in the world, for example
     `World::household(&self) -> &[u32]` (GUIDs), so the portraits do
     not need the neighborhood file.

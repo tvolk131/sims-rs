@@ -70,6 +70,10 @@ panel's digests are re-pinned.
 - The icon modes other than 3.
 - Text entry dialogs and the special panels; these are not drawn, and
   `Message::read` returns None for them.
+- A message too long for the window. It is cut after the last line that
+  leaves the buttons on screen, so the dialog can always be answered.
+- The width for three buttons. The dialog is made wide enough for the
+  row of buttons, in the same steps of 10.
 
 What would reopen it: the Yes/No "Help System" dialog (tick 2) or any
 other dialog screenshot that disagrees.
