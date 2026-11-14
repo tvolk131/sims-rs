@@ -122,17 +122,22 @@ impl Canvas {
     ) {
         // Clip in i64: the canvas and image sides fit, and so does any i32
         // position plus a side. Inside the canvas everything fits in i32.
+        let pixels = image.width.checked_mul(image.height);
+        if pixels.and_then(|n| n.checked_mul(4)) != Some(image.rgba.len())
+            || pixels == Some(0)
+            || self.color.is_empty()
+        {
+            return;
+        }
+        let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
         let span = |at: i32, size: usize, limit: usize| {
-            let (at, size, limit) = (i64::from(at), size as i64, limit as i64);
+            let (at, limit) = (i64::from(at), wide(limit));
             let low = at.clamp(0, limit);
-            let high = at.saturating_add(size).clamp(low, limit);
+            let high = at.saturating_add(wide(size)).clamp(low, limit);
             (low as usize, high as usize, at)
         };
         let (x0, x1, ax) = span(at[0], image.width, self.width);
         let (y0, y1, ay) = span(at[1], image.height, self.height);
-        if image.rgba.len() < image.width * image.height * 4 {
-            return;
-        }
         for py in y0..y1 {
             let sy = py as i32;
             let iy = (py as i64 - ay) as usize;
@@ -294,11 +299,23 @@ mod tests {
             c.draw(&img, at, true, |_, _, _| 0);
         }
         assert_eq!(c, Canvas::new(2, 2, [0, 0, 0]));
-        // An image whose pixels are fewer than its size says draws nothing.
+        // An image whose pixels are fewer than its size says draws nothing,
+        // and so does one whose size overflows.
         let mut short = img.clone();
         short.rgba.truncate(4);
         c.draw(&short, [0, 0], false, |_, _, _| 0);
+        let huge = Image {
+            width: 1 << (usize::BITS - 2),
+            height: 1,
+            rgba: Vec::new(),
+            depth: None,
+        };
+        c.draw(&huge, [0, 0], false, |_, _, _| 0);
         assert_eq!(c, Canvas::new(2, 2, [0, 0, 0]));
+        // A canvas with no pixels takes any image.
+        let mut empty = Canvas::new(usize::MAX, 0, [0, 0, 0]);
+        empty.draw(&img, [0, 0], false, |_, _, _| 0);
+        empty.draw(&huge, [0, 0], false, |_, _, _| 0);
     }
 
     #[test]

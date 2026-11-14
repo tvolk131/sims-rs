@@ -437,7 +437,8 @@ impl Painter<'_> {
                     screen[0].saturating_add(part.offset[0]),
                     screen[1]
                         .saturating_add(part.offset[1])
-                        .saturating_sub(height),
+                        .saturating_sub(height)
+                        .saturating_sub(sprite_rise(part.object, self.camera.zoom)),
                 ];
                 let anchor = if part.object == [0.0; 3] {
                     anchor
@@ -457,17 +458,42 @@ impl Painter<'_> {
 /// `HIDDEN`).
 const HIDDEN: usize = 34;
 
-/// Screen pixels at the near zoom per tile of height: a tile's side seen
-/// from the original's camera, `32 * sqrt(6)` (the old prototype's
-/// projection in `legacy/crates/sims-render/src/lib.rs`).
-const NEAR_PIXELS_PER_TILE_UP: f32 = 78.383_67;
+/// A draw group sprite's world offset (`object`), made safe: x and y in
+/// sixteenths of a tile, z in height units, finite and clamped to a lot's
+/// width so nonsense in a file cannot overflow anything.
+fn sprite_offset(object: [f32; 3]) -> [f32; 3] {
+    let limit = (camera::ARRAY_SIZE * 16) as f32;
+    object.map(|v| {
+        if v.is_finite() {
+            v.clamp(-limit, limit)
+        } else {
+            0.0
+        }
+    })
+}
 
-/// The depth anchor of a draw group sprite that sits `object` (tiles: x
-/// and y in the object's frame, z up) away from an object at `position`
-/// (fine units) facing `facing` (data word 1), on ground `base` near-zoom
-/// pixels up. The offset turns with the object, a quarter turn per two
-/// steps of facing, as the old prototype turned it. Offsets are clamped to
-/// a lot's width, so nonsense in a file cannot overflow the depth.
+/// How many screen pixels a sprite rises for its world offset's height
+/// `z`: `z * (2 << zoom)`, rounded as the original's `__ftol` does (add a
+/// half, then truncate toward zero). This is the original's catalog
+/// preview (0x438ae4 to 0x438b58, read by the old prototype in
+/// `legacy/crates/sims-render/src/object_preview/software.rs`); that the
+/// lot view places sprites the same way is **unverified**.
+fn sprite_rise(object: [f32; 3], zoom: Zoom) -> i32 {
+    let z = sprite_offset(object)[2];
+    if z == 0.0 {
+        return 0;
+    }
+    (z * (2 << zoom.level()) as f32 + 0.5).trunc() as i32
+}
+
+/// The depth anchor of a draw group sprite that sits `object` away from
+/// an object at `position` (fine units) facing `facing` (data word 1), on
+/// ground `base` near-zoom pixels up. The offset's x and y are sixteenths
+/// of a tile in the object's own frame, and turn with it a quarter turn per
+/// two steps of facing, as the old prototype turned them; z is in height
+/// units of 16 near-zoom pixels (2 << 3, as [`sprite_rise`]). The old
+/// prototype read the same units (`legacy/crates/sims-render/src/lib.rs`
+/// divides x and y by 16 to get tiles).
 fn part_anchor(
     camera: &Camera,
     position: [i32; 3],
@@ -475,22 +501,15 @@ fn part_anchor(
     object: [f32; 3],
     base: i32,
 ) -> i32 {
-    let limit = camera::ARRAY_SIZE as f32;
-    let [mut x, mut y, z] = object.map(|v| {
-        if v.is_finite() {
-            v.clamp(-limit, limit)
-        } else {
-            0.0
-        }
-    });
+    let [mut x, mut y, z] = sprite_offset(object);
     for _ in 0..(i32::from(facing) / 2).rem_euclid(4) {
         (x, y) = (-y, x);
     }
     let fine = [
-        position[0] + (x * 16.0).round() as i32,
-        position[1] + (y * 16.0).round() as i32,
+        position[0] + x.round() as i32,
+        position[1] + y.round() as i32,
     ];
-    let up = (z * NEAR_PIXELS_PER_TILE_UP).round() as i32;
+    let up = (z * 16.0).round() as i32;
     depth::point(camera.rotate_fine(fine), base + up)
 }
 
@@ -687,30 +706,44 @@ mod tests {
         let base = 32;
         let anchor = depth::point(camera(0).rotate_fine([100, 200]), base);
         assert_eq!(part_anchor(&camera(0), position, 0, [0.0; 3], base), anchor);
-        // Up is nearer: one tile up is 78 near-zoom pixels.
+        // One height unit up is 16 near-zoom pixels, and nearer.
         assert_eq!(
             part_anchor(&camera(0), position, 0, [0.0, 0.0, 1.0], base),
-            depth::point([100, 200], base + 78)
+            depth::point([100, 200], base + 16)
         );
-        // An offset along x, facing 0 and facing 2 (a quarter turn: x
-        // becomes y).
+        // Sixteen units along x is one tile, at facing 0; at facing 2 (a
+        // quarter turn) x becomes y.
         assert_eq!(
-            part_anchor(&camera(0), position, 0, [1.0, 0.0, 0.0], base),
+            part_anchor(&camera(0), position, 0, [16.0, 0.0, 0.0], base),
             depth::point([116, 200], base)
         );
         assert_eq!(
-            part_anchor(&camera(0), position, 2, [1.0, 0.0, 0.0], base),
+            part_anchor(&camera(0), position, 2, [16.0, 0.0, 0.0], base),
             depth::point([100, 216], base)
         );
         // The camera's rotation turns the moved point like any other.
         assert_eq!(
-            part_anchor(&camera(1), position, 2, [1.0, 0.0, 0.0], base),
+            part_anchor(&camera(1), position, 2, [16.0, 0.0, 0.0], base),
             depth::point(camera(1).rotate_fine([100, 216]), base)
         );
         // Nonsense in a file stays bounded.
         for bad in [f32::NAN, f32::INFINITY, f32::MAX, f32::MIN] {
             let _ = part_anchor(&camera(3), position, i16::MIN, [bad, bad, bad], base);
+            let _ = sprite_rise([bad, bad, bad], Zoom::Near);
         }
+    }
+
+    #[test]
+    fn a_sprite_rises_by_its_height_at_each_zoom() {
+        // 2 << zoom pixels per height unit, rounded half up toward zero.
+        assert_eq!(sprite_rise([0.0, 0.0, 0.25], Zoom::Near), 4);
+        assert_eq!(sprite_rise([0.0, 0.0, 0.25], Zoom::Medium), 2);
+        assert_eq!(sprite_rise([0.0, 0.0, 0.25], Zoom::Far), 1);
+        assert_eq!(sprite_rise([0.0, 0.0, 0.4082483], Zoom::Near), 7);
+        assert_eq!(sprite_rise([5.0, -3.0, 0.0], Zoom::Near), 0);
+        // __ftol truncates after adding a half: -0.25 at the near zoom is
+        // -4 + 0.5 = -3.5, which truncates to -3.
+        assert_eq!(sprite_rise([0.0, 0.0, -0.25], Zoom::Near), -3);
     }
 
     #[test]

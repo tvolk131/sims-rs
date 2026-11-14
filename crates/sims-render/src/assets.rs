@@ -29,10 +29,11 @@ pub struct Part {
     /// The sprite's left edge and bottom, relative to the object's anchor.
     pub offset: [i32; 2],
     pub flip: bool,
-    /// The sprite's place in the world relative to the object, in tiles:
-    /// x and y in the object's own frame (before its facing turns it),
-    /// and z up. It moves the sprite's depth, not its screen position
-    /// (see the decisions log).
+    /// The sprite's place in the world relative to the object: x and y
+    /// in sixteenths of a tile in the object's own frame (before its
+    /// facing turns it), and z up in height units (2 << zoom pixels). z
+    /// raises the sprite on screen; all three move its depth (see the
+    /// decisions log).
     pub object: [f32; 3],
 }
 

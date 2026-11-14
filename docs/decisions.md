@@ -19,20 +19,25 @@ with tests.
   walls cut away and from 39.5% to 39.7% with walls up. Objects inside
   other objects are not drawn at their slots yet, so a hidden container
   does not hide its contents here.
-- **A draw group sprite's world offset moves its depth.** Each sprite of
-  a draw group (DGRP) carries a position relative to the object, in
-  tiles: x and y in the object's own frame and z up. It was dropped; now
-  it moves the depth the sprite is drawn at. It does not move the sprite
-  on screen. The reason is in the files: the same sprite keeps the same
-  screen offset across draw groups whose world offsets differ (sprite
-  111 of one Goth object sits at (-22, -12) both at z 0.10 and at z
-  0.41; sprite 128 of another keeps (-35, 15) while y runs from -0.43 to
-  -2.24). So the screen offset already places the sprite, and the world
-  offset only says where it is in depth. The offset turns with the
-  object's facing, a quarter turn per two steps (the old prototype's
-  rotation), and one tile of z is 78.4 near-zoom pixels (`32 * sqrt(6)`).
-  None of the groups the Goth house draws now has a nonzero offset, so
-  no render changed and this is **unverified** against the original.
+- **A draw group sprite's world offset is kept.** Each sprite of a draw
+  group (DGRP) carries a position relative to the object. It was
+  dropped. Its units: x and y are sixteenths of a tile in the object's
+  own frame, and z is height, where one unit is `2 << zoom` screen
+  pixels (16 at the near zoom). The old prototype divided x and y by 16
+  to get tiles (`legacy/crates/sims-render/src/lib.rs`).
+  - z raises the sprite on screen by `z * (2 << zoom)` pixels, rounded
+    by adding a half and truncating, as the original's catalog preview
+    does (0x438ae4 to 0x438b58, read by the old prototype in
+    `legacy/crates/sims-render/src/object_preview/software.rs`). That
+    the lot view places sprites the same way is **unverified**.
+  - x, y and z all move the depth the sprite is drawn at. x and y turn
+    with the object's facing, a quarter turn per two steps (the old
+    prototype's rotation). The preview leaves x and y out of the
+    sprite's screen position, and so does this; that is **unverified**
+    for the lot view too.
+  - None of the groups the Goth house draws now has a nonzero offset,
+    so no render changed, and nothing here has been compared with the
+    original.
 - **Soft edges write depth.** A sprite pixel that is partly transparent
   now writes its depth as well as blending its colour, as the old
   prototype's blitter did. Before, a farther pixel drawn later could
@@ -41,7 +46,8 @@ with tests.
 - **Sprite positions cannot overflow.** Draw group offsets are any
   32-bit number. Placing and clipping a sprite now use wider or
   saturating arithmetic, so a sprite far off the screen draws nothing
-  instead of panicking.
+  instead of panicking. An image whose pixel count does not match its
+  size, or overflows, draws nothing.
 
 What would reopen it: a camera where an object with a nonzero world
 offset can be compared with the original, or a reading of the
