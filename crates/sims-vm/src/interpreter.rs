@@ -170,27 +170,51 @@ impl<'a> Interpreter<'a> {
         most: usize,
         budget: usize,
     ) -> Result<bool, Fault> {
+        self.call_as(
+            world,
+            object,
+            object,
+            tree,
+            stack_object,
+            args,
+            most,
+            budget,
+            &mut None,
+        )
+    }
+
+    /// [`Interpreter::call`] for a tree of `owner`'s type run on
+    /// `object`'s stack: the frame's code owner is `owner`'s type, as when
+    /// a person runs an object's check tree (0x458505 calls 0x4749b5 with
+    /// the object's file).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn call_as(
+        &self,
+        world: &mut World,
+        object: u16,
+        owner: u16,
+        tree: u16,
+        stack_object: i16,
+        args: &[i16],
+        most: usize,
+        budget: usize,
+        advertisements: &mut Option<Advertisements>,
+    ) -> Result<bool, Fault> {
         let base = world.objects.get(&object).map_or(0, |o| o.stack.len());
         let mut machine = self.machine(world, object, base, true);
-        machine
-            .enter(tree, stack_object, args, most, true)
-            .map_err(|trap| Fault {
-                object,
-                at: Some(Location { tree, node: 0 }),
-                trap,
-            })?;
-        for _ in 0..budget {
-            match machine.step() {
-                Ok(Status::Running) => {}
-                Ok(Status::Returned(value)) => return Ok(value),
-                Ok(Status::Yielded) => {
-                    let trap = Trap::native(0x44f, "a synchronous tree yielded");
-                    return Err(machine.fault(trap));
-                }
-                Err(trap) => return Err(machine.fault(trap)),
-            }
-        }
-        Err(machine.fault(Trap::BudgetExhausted { budget }))
+        machine.advertisements = advertisements.take();
+        let result = run(
+            &mut machine,
+            object,
+            owner,
+            tree,
+            stack_object,
+            args,
+            most,
+            budget,
+        );
+        *advertisements = machine.advertisements.take();
+        result
     }
 
     pub(crate) fn machine<'w>(
@@ -209,8 +233,42 @@ impl<'a> Interpreter<'a> {
             asked: self.asked,
             base,
             synchronous,
+            advertisements: None,
         }
     }
+}
+
+/// Runs a tree synchronously for [`Interpreter::call_as`].
+#[allow(clippy::too_many_arguments)]
+fn run(
+    machine: &mut Machine<'_, '_>,
+    object: u16,
+    owner: u16,
+    tree: u16,
+    stack_object: i16,
+    args: &[i16],
+    most: usize,
+    budget: usize,
+) -> Result<bool, Fault> {
+    machine
+        .enter_as(owner, tree, stack_object, args, most, true)
+        .map_err(|trap| Fault {
+            object,
+            at: Some(Location { tree, node: 0 }),
+            trap,
+        })?;
+    for _ in 0..budget {
+        match machine.step() {
+            Ok(Status::Running) => {}
+            Ok(Status::Returned(value)) => return Ok(value),
+            Ok(Status::Yielded) => {
+                let trap = Trap::native(0x44f, "a synchronous tree yielded");
+                return Err(machine.fault(trap));
+            }
+            Err(trap) => return Err(machine.fault(trap)),
+        }
+    }
+    Err(machine.fault(Trap::BudgetExhausted { budget }))
 }
 
 /// One object's view of the world while its thread runs. "Me" is the object
@@ -229,7 +287,14 @@ pub(crate) struct Machine<'a, 'w> {
     pub base: usize,
     /// Whether the run must finish without yielding, as a callback does.
     pub synchronous: bool,
+    /// The advertisements Find Best Interaction copies for a check tree
+    /// (the record at [0x6c437c]), which scopes 12, 28 and 29 read and
+    /// write. None outside a check tree.
+    pub advertisements: Option<Advertisements>,
 }
+
+/// See [`Machine::advertisements`].
+pub(crate) type Advertisements = [crate::autonomy::Advertisement; crate::autonomy::ADVERTISEMENTS];
 
 impl<'a> Machine<'a, '_> {
     /// An interpreter over the same code, for services that run other
@@ -365,7 +430,25 @@ impl<'a> Machine<'a, '_> {
         most: usize,
         callback: bool,
     ) -> Result<(), Trap> {
-        let guid = self.me()?.guid;
+        self.enter_as(self.me, tree, stack_object, args, most, callback)
+    }
+
+    /// [`Machine::enter`] with the code of `owner`'s type.
+    pub(crate) fn enter_as(
+        &mut self,
+        owner: u16,
+        tree: u16,
+        stack_object: i16,
+        args: &[i16],
+        most: usize,
+        callback: bool,
+    ) -> Result<(), Trap> {
+        let guid = self
+            .world
+            .objects
+            .get(&owner)
+            .ok_or(Trap::native(0x15, "missing object"))?
+            .guid;
         let owner_type = self
             .world
             .types
@@ -686,9 +769,10 @@ impl<'a> Machine<'a, '_> {
                 instruction.on_false
             });
         }
-        // Go To Routing Slot keeps the step its route is at in the
-        // frame's primitive state and goes on from there (0x45abce).
-        if state != 0 && instruction.opcode != 45 {
+        // Go To Routing Slot and Go To Relative Position keep the step
+        // their route is at in the frame's primitive state and go on from
+        // there (0x45abce, 0x45c634).
+        if state != 0 && !matches!(instruction.opcode, 27 | 45) {
             return Err(Trap::Unsupported(format!(
                 "resuming primitive {} with saved state {state:#x}",
                 instruction.opcode

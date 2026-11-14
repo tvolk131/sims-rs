@@ -50,6 +50,9 @@ pub const TREE_NAMES: u16 = 303;
 /// The global file's tuning table that holds the room score constants.
 const ROOM_TUNING: u16 = 3;
 
+/// The global file's tuning table with Find Best Interaction's constants.
+const AUTONOMY_TUNING: u16 = 2;
+
 /// The global file's tuning tables with the motive decay rates of the
 /// three kinds of person, in kind order.
 const MOTIVE_TUNING: [u16; 3] = [1, 5, 6];
@@ -315,6 +318,91 @@ impl Program {
             adult_mood: curves(ADULT_MOOD)?,
             child_mood: curves(CHILD_MOOD)?,
         })
+    }
+
+    /// The constants Find Best Interaction works with
+    /// ([`crate::autonomy::Constants`]): the global file's tuning table 2,
+    /// read by name, with the original's default for each name the table
+    /// lacks.
+    ///
+    /// The original reads them once (0x459120): it looks each name up
+    /// ignoring the case of A to Z (0x4131f4), adds a missing one with its
+    /// default, and stores the values at 0x6c4384 to 0x6c4d94. The
+    /// random selection count is stored as a whole number, truncated
+    /// (`__ftol`). Names, addresses and defaults are the old prototype's
+    /// (legacy/crates/sims-vm/src/autonomy_constants.rs, `SPECS`). The
+    /// values read here were compared with the stored ones in a memory
+    /// image of the original (`docs/decisions.md`).
+    pub fn autonomy_constants(&self) -> crate::autonomy::Constants {
+        use crate::autonomy::Constants;
+        use sims_core::{Ext, F32};
+        let table = self
+            .libraries
+            .get(&self.global)
+            .and_then(|library| library.tuning.get(&AUTONOMY_TUNING));
+        let value = |name: &str, default: u32| {
+            table
+                .and_then(|table| {
+                    table
+                        .entries
+                        .iter()
+                        .find(|entry| entry.name.eq_ignore_ascii_case(name))
+                })
+                .map_or(F32::from_bits(default), |entry| F32::from_f32(entry.value))
+        };
+        Constants {
+            family_threshold: value("min autonomy score for family", 0x3e4c_cccd),
+            visitor_threshold: value("min autonomy score for visitors", 0x3d4c_cccd),
+            attenuation: [
+                value("low attenuation", 0x3b03_126f),
+                value("moderate attenuation", 0x3ca3_d70a),
+                value("high attenuation", 0x3dcc_cccd),
+            ],
+            visitor_attenuation: [
+                value("visitor low attenuation", 0x3b03_126f),
+                value("visitor moderate attenuation", 0x3ca3_d70a),
+                value("visitor high attenuation", 0x3dcc_cccd),
+            ],
+            sitting_threshold: value("min autonomy score for sitting", 0x3e4c_cccd),
+            random_count: Ext::from_f32(value("random selection count", 0x4120_0000))
+                .to_i32_truncate(),
+        }
+    }
+
+    /// A person's score curves: the curves Find Best Interaction weighs
+    /// its motives with. They are the entries of a string table, one per
+    /// motive in [`crate::autonomy::SCORE_MOTIVES`] order, each holding up
+    /// to four points ([`sims_sim::motives::Curve::parse`]). `global` and
+    /// `table` say which table ([`crate::curve_table`]); a table that is
+    /// not the global file's is the person's own file's, `resource`.
+    ///
+    /// The order and the four points are the old prototype's
+    /// (`Tuning::from_program` in legacy/crates/sims-vm/src/motives.rs).
+    /// The curves read here were compared, point for point, with people's
+    /// curves in a memory image of the original (`docs/decisions.md`).
+    pub fn score_curves(
+        &self,
+        global: bool,
+        resource: usize,
+        table: u16,
+    ) -> std::result::Result<Vec<sims_sim::motives::Curve>, String> {
+        use crate::autonomy::{SCORE_MOTIVES, SCORE_POINTS};
+        let file = if global { self.global } else { resource };
+        let strings = self
+            .libraries
+            .get(&file)
+            .and_then(|library| library.strings.get(&table))
+            .ok_or_else(|| format!("resource {file} has no string table {table}"))?;
+        SCORE_MOTIVES
+            .iter()
+            .enumerate()
+            .map(|(i, &motive)| {
+                let text = strings
+                    .get(i)
+                    .ok_or_else(|| format!("string table {table} has no entry {i}"))?;
+                Ok(sims_sim::motives::Curve::parse(motive, text, SCORE_POINTS))
+            })
+            .collect()
     }
 
     /// Resolves a tree ID for code running on behalf of the object whose

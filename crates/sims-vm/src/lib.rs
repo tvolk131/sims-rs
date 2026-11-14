@@ -31,6 +31,7 @@
 //! (`selection.rs`), which leave the lot as the first tick finds it.
 
 mod animator;
+mod autonomy;
 mod clip_events;
 mod error;
 mod factory;

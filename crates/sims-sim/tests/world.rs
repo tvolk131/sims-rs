@@ -211,6 +211,7 @@ fn world() -> World {
             },
         },
         routing: routing(),
+        action_serial: 9,
     }
 }
 
@@ -321,7 +322,24 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "0caafc6a30ff53da1bd3e8d59d36fc08216033a2c6c12304b89a32580939a1b5";
+const PINNED: &str = "f72290e87a9e96c2436bb657cdf83806bb38760885f45f9b0d6a53d1f12a19c3";
+
+/// The encoding of `world` as snapshot format 14 wrote it. Format 15
+/// added the last number given to a running action
+/// ([`World::action_serial`]) at the end. This drops its bytes.
+fn format_14_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let serial = postcard::to_allocvec(&world.action_serial).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - serial.len()), serial);
+    bytes
+}
+
+#[test]
+fn without_the_action_serial_the_encoding_is_format_14() {
+    // Snapshot format 15 added the last number given to a running action.
+    assert_eq!(digest(&format_14_bytes(&world())), PINNED_14);
+}
+const PINNED_14: &str = "0caafc6a30ff53da1bd3e8d59d36fc08216033a2c6c12304b89a32580939a1b5";
 
 /// The encoding of `world` as snapshot format 13 wrote it. Format 14
 /// added three fields: at the end of an animator whether the house view has
@@ -333,7 +351,7 @@ const PINNED: &str = "0caafc6a30ff53da1bd3e8d59d36fc08216033a2c6c12304b89a325809
 fn format_13_bytes(world: &World) -> Vec<u8> {
     let mut old = world.clone();
     old.animators.clear();
-    let mut bytes = old.encode();
+    let mut bytes = format_14_bytes(&old);
     let mut tail = postcard::to_allocvec(&world.usage).unwrap();
     tail.extend(postcard::to_allocvec(&world.routing).unwrap());
     assert_eq!(bytes.split_off(bytes.len() - tail.len()), tail);

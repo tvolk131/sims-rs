@@ -22,6 +22,10 @@
 //! works on the person's last context; its words +0x58, +0x60 and +0x64
 //! are put back as they were at the run's start when the run ends.
 //!
+//! Go To Relative Position (opcode 27, 0x45c634) runs the same steps
+//! with a slot record it makes from its operands instead of one of the
+//! object's slots ([`relative_slot`]).
+//!
 //! Ported from the original's code. What the Goth house's first route
 //! does not reach fails loudly: slots named any way but by a literal,
 //! a stack object that is missing or off the lot in a later step, a
@@ -33,6 +37,7 @@ use crate::fault::{Fault, Trap};
 use crate::interpreter::{Flow, Machine, word};
 use crate::placement::stands_on_lot;
 use crate::routing::slot::{new_context, route_slot};
+use sims_sim::route::RouteSlot;
 
 /// Object data words.
 const FLAGS: usize = 8;
@@ -55,8 +60,78 @@ const NO_ROOM_FLAG: i32 = 0x800;
 
 fn unsupported(at: &str, what: &str) -> Trap {
     Trap::Unsupported(format!(
-        "Go To Routing Slot {what} ({at}), which is not ported"
+        "a route (Go To Routing Slot or Go To Relative Position) {what} ({at}), which is \
+         not ported"
     ))
+}
+
+/// The slot record Go To Relative Position routes to (0x45c634), from its
+/// operands: byte 2 the location (a signed byte), byte 3 the direction
+/// to face, byte 6 options.
+///
+/// The record starts as the original's constructor makes it (0x46dd48):
+/// no offset, number -1, snap target -1, gradient 0.1875, facing -2,
+/// resolution 16. Then (0x46de84, 0x46de4b) it stands, and its minimum,
+/// optimal and maximum proximity are 16. The slot flags:
+///
+/// - 0x4000 (the route may end near the place) unless option bit 1 is
+///   set; 0x8000 if option bit 2 is set;
+/// - by the location: -2 none of the eight directions; 0, 2, 4 or 6
+///   that direction; 1, 3 or 5 the directions on either side; 7
+///   directions 6 and 0; any other location directions 0, 2, 4 and 6,
+///   with an optimal proximity of 32 (0x45c701).
+///
+/// The facing is the direction byte for 0 to 7, -2 for 0xfe and -3 for
+/// 0xff. Any other direction is an error the original reports (0x4544dc)
+/// before it takes the false branch; that fails loudly.
+pub(crate) fn relative_slot(operands: &[u8; 8]) -> Result<RouteSlot, Trap> {
+    const SIXTEENTH: i32 = 16;
+    let mut slot = RouteSlot {
+        offset: [0; 3],
+        number: -1,
+        standing: 1,
+        sitting: 0,
+        ground: 0,
+        flags: 0,
+        snap_target: -1,
+        proximity: [SIXTEENTH; 3],
+        gradient: 0x3e40_0000,
+        facing: -2,
+        resolution: SIXTEENTH,
+    };
+    let options = operands[6];
+    if options & 2 == 0 {
+        slot.flags |= NEAR;
+    }
+    if options & 4 != 0 {
+        slot.flags |= 0x8000;
+    }
+    let direction = |d: i32| 1 << d;
+    match operands[2] as i8 {
+        -2 => slot.flags &= !0xff,
+        location @ (0 | 2 | 4 | 6) => slot.flags |= direction(i32::from(location)),
+        location @ (1 | 3 | 5) => {
+            let location = i32::from(location);
+            slot.flags |= direction(location - 1) | direction(location + 1);
+        }
+        7 => slot.flags |= direction(6) | direction(0),
+        _ => {
+            slot.flags |= direction(0) | direction(2) | direction(4) | direction(6);
+            slot.proximity = [SIXTEENTH, 2 * SIXTEENTH, SIXTEENTH];
+        }
+    }
+    slot.facing = match operands[3] {
+        0xfe => -2,
+        0xff => -3,
+        facing @ 0..=7 => i32::from(facing),
+        other => {
+            return Err(Trap::Unsupported(format!(
+                "Go To Relative Position facing {other}, an error the original reports \
+                 (0x4544dc), which is not ported"
+            )));
+        }
+    };
+    Ok(slot)
 }
 
 impl Machine<'_, '_> {
@@ -107,6 +182,19 @@ impl Machine<'_, '_> {
             self.world.routing.slot_flags.insert(key, flags);
         }
         let slot = route_slot(&slots[index], index, Some(flags));
+        self.route_steps(Some(slot))
+    }
+
+    /// Go To Relative Position (opcode 27, 0x45c634): the route's steps
+    /// with the slot record [`relative_slot`] makes, on the first run.
+    pub(crate) fn go_to_relative(&mut self, operands: &[u8; 8]) -> Result<Flow, Trap> {
+        if self.frame()?.primitive_state != NEW {
+            return self.route_steps(None);
+        }
+        if self.me()?.person.is_none() {
+            return Err(unsupported("0x45c634", "on an object that is not a person"));
+        }
+        let slot = relative_slot(operands)?;
         self.route_steps(Some(slot))
     }
 
@@ -196,7 +284,11 @@ impl Machine<'_, '_> {
                                 .and_then(|o| o.data.get(ROOM).copied())
                         };
                         if room(ctx.target) != room(me) {
-                            return Err(unsupported("0x45b140", "to a slot in another room"));
+                            return Err(unsupported(
+                                "0x45b140, then 0x45afd0 and 0x45c7c2",
+                                "to an object in another room, which goes through a door the \
+                                 routing between rooms chooses (0x46390f)",
+                            ));
                         }
                     }
                     if self.wants_interrupt()? {
@@ -308,5 +400,55 @@ impl Machine<'_, '_> {
             .get(index)
             .copied()
             .ok_or_else(|| Trap::Invalid(format!("person data has no word {index}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The operands with location `location`, direction `facing` and
+    /// options `options`.
+    fn operands(location: u8, facing: u8, options: u8) -> [u8; 8] {
+        [0, 0, location, facing, 0, 0, options, 0]
+    }
+
+    #[test]
+    fn a_relative_slot_starts_as_the_constructor_makes_it() {
+        let slot = relative_slot(&operands(0, 0xfe, 0)).unwrap();
+        assert_eq!(slot.offset, [0; 3]);
+        assert_eq!((slot.number, slot.snap_target), (-1, -1));
+        assert_eq!((slot.standing, slot.sitting, slot.ground), (1, 0, 0));
+        assert_eq!(slot.proximity, [16; 3]);
+        assert_eq!((slot.gradient, slot.resolution), (0x3e40_0000, 16));
+        assert_eq!(slot.facing, -2);
+        assert_eq!(slot.flags, NEAR | 1);
+    }
+
+    #[test]
+    fn the_location_picks_the_directions() {
+        let flags = |location: u8| relative_slot(&operands(location, 0, 0)).unwrap().flags & 0xff;
+        assert_eq!(flags(0xfe), 0);
+        assert_eq!(flags(2), 1 << 2);
+        assert_eq!(flags(6), 1 << 6);
+        assert_eq!(flags(1), 0b101);
+        assert_eq!(flags(5), 0b101_0000);
+        assert_eq!(flags(7), 0b100_0001);
+        // Any other location: the four straight directions, with an
+        // optimal proximity of 32.
+        let slot = relative_slot(&operands(0xff, 0, 0)).unwrap();
+        assert_eq!(slot.flags & 0xff, 0b101_0101);
+        assert_eq!(slot.proximity, [16, 32, 16]);
+        assert_eq!(flags(8), 0b101_0101);
+    }
+
+    #[test]
+    fn the_options_and_the_facing() {
+        let slot = |facing: u8, options: u8| relative_slot(&operands(0xfe, facing, options));
+        assert_eq!(slot(0, 2).unwrap().flags, 0);
+        assert_eq!(slot(0, 4).unwrap().flags, NEAR | 0x8000);
+        assert_eq!(slot(0xff, 0).unwrap().facing, -3);
+        assert_eq!(slot(7, 0).unwrap().facing, 7);
+        assert!(slot(8, 0).is_err());
     }
 }

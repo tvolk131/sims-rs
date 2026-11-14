@@ -92,6 +92,9 @@ pub(crate) enum Cell {
     StackObject,
     /// A motive: a 32-bit float, not an integer word.
     Motive(u16, usize),
+    /// A field of a check tree's advertisement: the motive, then 0 for
+    /// the personality number, 1 for the minimum and 2 for the delta.
+    Advertisement(usize, usize),
 }
 
 fn bounded(index: i16, count: usize, code: u16) -> Result<usize, Trap> {
@@ -417,10 +420,28 @@ impl Machine<'_, '_> {
                     ))
                 })?)
             }
-            // Tree advertisements (12, 28, 29), neighbor fields (24), jobs
-            // (33), neighborhood data (34) and scope 38 need state the
-            // simulation doesn't hold yet.
-            12 | 24 | 28 | 29 | 33 | 34 | 38 => {
+            // The advertisements Find Best Interaction copied for the
+            // check tree that runs (0x453a09, 0x453a42, 0x453a7a): six
+            // bytes each, the personality number (28), the minimum (29)
+            // and the delta (12). An index outside them is native error
+            // 0x1a. Outside a check tree the record holds the last ones
+            // copied, which are not kept.
+            12 | 28 | 29 => {
+                let count = self
+                    .advertisements
+                    .as_ref()
+                    .ok_or(unsupported(scope))?
+                    .len();
+                let field = match scope {
+                    28 => 0,
+                    29 => 1,
+                    _ => 2,
+                };
+                Cell::Advertisement(bounded(index, count, 0x1a)?, field)
+            }
+            // Neighbor fields (24), jobs (33), neighborhood data (34) and
+            // scope 38 need state the simulation doesn't hold yet.
+            24 | 33 | 34 | 38 => {
                 return Err(unsupported(scope));
             }
             2 | 5 | 39..=255 => return Err(Trap::native(9, "invalid memory scope")),
@@ -479,6 +500,12 @@ impl Machine<'_, '_> {
                 get(&self.frame()?.locals, i)
             }
             Cell::StackObject => Ok(self.frame()?.stack_object),
+            Cell::Advertisement(i, field) => self
+                .advertisements
+                .as_ref()
+                .and_then(|ads| ads.get(i))
+                .map(|ad| ad.field(field))
+                .ok_or_else(|| Trap::Invalid("no advertisement".into())),
             Cell::Motive(id, i) => {
                 let value = self.motive(id, i)?;
                 let register = value.ext();
@@ -530,9 +557,19 @@ impl Machine<'_, '_> {
         if let Cell::Local(local) = cell {
             self.wrote_local(local);
         }
+        if let Cell::Advertisement(i, field) = cell {
+            let ad = self
+                .advertisements
+                .as_mut()
+                .and_then(|ads| ads.get_mut(i))
+                .ok_or_else(|| Trap::Invalid("no advertisement".into()))?;
+            *ad.field_mut(field) = value;
+            return Ok(true);
+        }
         let world = &mut *self.world;
         let target = match cell {
             Cell::Literal(_) | Cell::Motive(..) => return Ok(false),
+            Cell::Advertisement(..) => unreachable!("stored above"),
             Cell::Data(_, i @ (2 | 3 | 11)) => {
                 // Words 2 and 3 are the container and its slot, and 11 the
                 // object's ID; the original updates more than the word

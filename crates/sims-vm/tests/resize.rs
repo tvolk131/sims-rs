@@ -291,7 +291,7 @@ fn format_12_bytes(world: &World) -> Vec<u8> {
     assert_eq!(world.routing, sims_sim::route::Routing::default());
     let mut old = world.clone();
     old.animators.clear();
-    let mut encoded = old.encode();
+    let mut encoded = format_14_bytes(&old);
     assert_eq!(encoded.split_off(encoded.len() - 3), [0; 3]);
     let usage = postcard::to_allocvec(&world.usage).unwrap();
     assert_eq!(encoded.split_off(encoded.len() - usage.len()), usage);
@@ -303,6 +303,18 @@ fn format_12_bytes(world: &World) -> Vec<u8> {
         encoded.extend(animator_12_bytes(animator));
     }
     encoded.extend(usage);
+    encoded
+}
+
+/// A lot's encoding as snapshot format 14 wrote it. Format 15 added the
+/// last number given to a running action ([`World::action_serial`]) at
+/// the end. Before tick 233 no action has been given one, so it is 0 and
+/// encodes to one zero byte; this checks that and drops it, so a state
+/// pinned under format 14 can be shown to be the same state.
+fn format_14_bytes(world: &World) -> Vec<u8> {
+    assert_eq!(world.action_serial, 0);
+    let mut encoded = world.encode();
+    assert_eq!(encoded.pop(), Some(0));
     encoded
 }
 
@@ -319,7 +331,7 @@ fn format_12_bytes(world: &World) -> Vec<u8> {
 fn format_13_bytes(world: &World) -> Vec<u8> {
     let mut old = world.clone();
     old.animators.clear();
-    let mut encoded = old.encode();
+    let mut encoded = format_14_bytes(&old);
     let mut tail = postcard::to_allocvec(&world.usage).unwrap();
     tail.extend(postcard::to_allocvec(&world.routing).unwrap());
     assert_eq!(encoded.split_off(encoded.len() - tail.len()), tail);
@@ -1600,11 +1612,12 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
         assert_eq!(digest(&format_11_bytes(&old)), BASELINE_11);
         assert_eq!(digest(&format_12_bytes(&old)), BASELINE_12);
         assert_eq!(digest(&format_13_bytes(&old)), BASELINE_13);
-        assert_eq!(world.hash_hex(), BASELINE_14);
+        assert_eq!(digest(&format_14_bytes(world)), BASELINE_14);
     });
 }
 
-/// The first 232 ticks on the Goth house: the lot update (0x46d345) run
+/// The first 232 ticks on the Goth house, and tick 233 up to where it
+/// stops: the lot update (0x46d345) run
 /// from the state the load ends in, with the house view's frames between
 /// updates as far as they write the simulation's state (`frame.rs`): one
 /// before tick 1, one after each of ticks 1 to 3, and one after every
@@ -1677,8 +1690,42 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// (0x5912fd). In tick 36 the tick count is a multiple of 40 and the
 /// update clears registry byte 0x12 (0x442521).
 ///
-/// Tick 233 fails loudly: person 21 reaches Find Best Interaction
-/// (primitive 3), which is not ported.
+/// A second private capture of the original (`docs/decisions.md`) holds
+/// the full state after ticks 1 to 5, 30 to 35 and 225 to 240, and the
+/// `updates.jsonl` line after every tick. Its frames were recorded: one
+/// before tick 1 and one after ticks 1, 2, 3, 33 and every 30th from 63.
+/// Our run with those frames was compared with it in the same way as
+/// above, after every one of ticks 1 to 232 and at those states, and is
+/// equal but for the fields named above. Global 12 after tick 1 is 0 in
+/// this capture, as here. With a frame after every tick from 33 the state
+/// after tick 232 is the same (the digest below).
+///
+/// Tick 233 runs as far as it can and then fails loudly. Person 21 runs
+/// Find Best Interaction (primitive 3), which scores six interactions,
+/// chooses menu 6 of object 132 and draws once from the lot's random
+/// stream. Gosub Found Action (primitive 30) starts it: the person's
+/// running action gets the first unique number, 1, and the person starts
+/// using the object. The interaction's tree runs Go To Relative Position
+/// (primitive 27) to the object, which is in another room. That route
+/// goes through a door chosen by the routing between rooms (0x45c7c2,
+/// 0x46390f), which is not ported, so tick 233 stops at object 21, tree
+/// 0x1012 node 0. At that point the lot's random stream, the unique
+/// number, person 21's running and last actions, its objects in use,
+/// object 132's user count and person 21's seven frames were compared
+/// with the second capture's state after tick 233 and are equal, as are
+/// the objects that ran before person 21 in that tick, but for the
+/// seventh frame's primitive state. The original goes on where we stop:
+/// it sets that state to 2, numbers the person for the doors (object
+/// data word 6 becomes 1), pushes two frames of the door's (object 51)
+/// tree and puts the door in use. Person 21's object data word 9 and
+/// person data words 27 and 37 also differ there; that those steps write
+/// them is **unverified**.
+///
+/// The first capture does not choose in tick 233: its one draw from the
+/// lot's stream in ticks 233 and 234 comes in tick 234. Its state after
+/// tick 232 was equal to ours as far as compared. Why its original chose
+/// a tick later is **unknown**; the second capture, and the original's
+/// code run in an emulator on the first capture's state, choose in 233.
 ///
 /// Object 15's two-button dialog in tick 2 is answered with 3, the
 /// answer the capture's events show. People 18 and 21's clip in tick 3 is
@@ -1774,7 +1821,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert_eq!(digest(&format_11_bytes(&old)), TICK_1_11);
         assert_eq!(digest(&format_12_bytes(&old)), TICK_1_12);
         assert_eq!(digest(&format_13_bytes(&old)), TICK_1_13);
-        assert_eq!(world.hash_hex(), TICK_1);
+        assert_eq!(digest(&format_14_bytes(world)), TICK_1);
         // Ticks 2 to 5. Person 16 starts a clip with Animate Sim in tick 2
         // and yields; the capture shows that person at the same
         // instruction after ticks 2 to 5, with the same frames (the 254 in
@@ -1831,7 +1878,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert_eq!(digest(&format_11_bytes(world)), TICK_5_11);
         assert_eq!(digest(&format_12_bytes(world)), TICK_5_12);
         assert_eq!(digest(&format_13_bytes(world)), TICK_5_13);
-        assert_eq!(world.hash_hex(), TICK_5);
+        assert_eq!(digest(&format_14_bytes(world)), TICK_5);
         // Ticks 6 to 13. In tick 6 object 382 makes a person of type
         // 0x44A86A6C (Create New Object Instance mode 8), who gets the
         // lowest unused ID, 259, and is put down where the pedestrian
@@ -1882,7 +1929,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert_eq!(frames, [(0x1000, 9), (0x118, 0)]);
         assert_eq!(digest(&format_12_bytes(world)), TICK_13_12);
         assert_eq!(digest(&format_13_bytes(world)), TICK_13_13);
-        assert_eq!(world.hash_hex(), TICK_13);
+        assert_eq!(digest(&format_14_bytes(world)), TICK_13);
         // Ticks 14 to 33. In tick 14 person 259 runs a tree of object 51
         // (Run Tree By Name), which starts using it, and in that tree goes
         // to the object's routing slot 0 (Go To Routing Slot): it plans a
@@ -1926,7 +1973,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert_eq!(animator.destination[2].to_bits(), 0x3e57_5200);
         assert!(animator.undrawn);
         assert_eq!(digest(&format_13_bytes(world)), TICK_33_13);
-        assert_eq!(world.hash_hex(), TICK_33);
+        assert_eq!(digest(&format_14_bytes(world)), TICK_33);
         // The frame after tick 33 draws person 259 for the first time,
         // which unsets its animator's position and places it again on its
         // tile, facing its direction word: 0, where the turn had it at
@@ -1948,13 +1995,49 @@ fn the_goth_house_first_tick_matches_the_original() {
             }
         }
         assert_eq!(world.ticks, before.ticks + 232);
-        assert_eq!(world.hash_hex(), TICK_232);
-        // Tick 233 reaches Find Best Interaction, which is not ported.
+        assert_eq!(digest(&format_14_bytes(world)), TICK_232);
+        assert_eq!(world.action_serial, 0);
+        // Tick 233: person 21 runs Find Best Interaction, which chooses
+        // menu 6 of object 132 and draws once from the lot's stream, and
+        // Gosub Found Action, which starts it. The interaction's tree then
+        // routes to the object, in another room, which is not ported.
         let error = interpreter
             .lot_update(world, &tuning, &mut player)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("object 21, tree 0x2029 node 1"), "{error}");
-        assert!(error.contains("Find Best Interaction"), "{error}");
+        assert!(error.contains("object 21, tree 0x1012 node 0"), "{error}");
+        assert!(error.contains("another room"), "{error}");
+        assert_eq!(world.lot_rng.state(), 2_459_469_755);
+        assert_eq!(world.action_serial, 1);
+        let person = world.objects[&21].person.as_ref().unwrap();
+        let action = &person.active;
+        assert_eq!(
+            (action.uid, action.caller, action.target, action.icon),
+            (1, 21, 132, 132)
+        );
+        assert_eq!(
+            (action.table_index, action.priority, action.action),
+            (6, 2, 0x100e)
+        );
+        assert_eq!(
+            (action.attenuation.to_bits(), action.flags),
+            (0x3f19_999a, 0)
+        );
+        let uses: Vec<_> = person
+            .object_uses
+            .iter()
+            .map(|u| (u.target, u.stack_depth))
+            .collect();
+        assert_eq!(uses, [(132, 5)]);
+        assert_eq!(world.objects[&132].data[62], 1);
+        let trees: Vec<u16> = world.objects[&21]
+            .stack
+            .iter()
+            .map(|frame| frame.tree)
+            .collect();
+        assert_eq!(
+            trees,
+            [0x1000, 0x2001, 0x205b, 0x2029, 0x100e, 0x1014, 0x1012]
+        );
     });
 }
