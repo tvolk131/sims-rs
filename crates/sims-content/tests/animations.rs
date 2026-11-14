@@ -38,7 +38,12 @@ fn a_clip_that_cannot_be_told_is_refused() {
     assert!(refused(&animations, "walk").contains("samples"));
     animations.insert_samples("Skill");
     assert!(refused(&animations, "run").contains("no animation file"));
-    assert!(refused(&animations, "Walk").contains("ignores case"));
+    // A name that differs only in case finds the clip ...
+    assert_eq!(animations.clip("Walk").unwrap().name, "walk");
+    // ... unless two names do.
+    animations.insert("a.far", clip("WALK", 1));
+    assert!(refused(&animations, "Walk").contains("only in case"));
+    assert_eq!(animations.clip("WALK").unwrap().name, "WALK");
     animations.insert("b.far", clip("walk", 2));
     assert!(refused(&animations, "walk").contains("defined differently"));
 }

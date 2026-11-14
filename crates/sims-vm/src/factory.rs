@@ -50,7 +50,7 @@ mod flag {
 }
 
 /// Definition words the factory reads.
-mod word {
+pub(crate) mod word {
     pub const TYPE: usize = 9;
     pub const GROUP: usize = 10;
     pub const PRICE: usize = 18;

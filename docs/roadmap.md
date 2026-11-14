@@ -57,19 +57,17 @@ Each step is a few PRs, and each PR leaves `main` green.
   keep. Six type attribute words are the exception: they belong to the
   game that was running before the load.
 - Ticks run. `sims boot --ticks N` runs N lot updates after the load and
-  prints the hash. **K = 1 on the Goth house**: our state after tick 1
-  equals a capture of the original after its tick 1 in everything
-  compared, the C runtime's random stream aside (see "The first tick").
-  The simulation now holds the neighborhood's people (their records,
-  person data, relationships and inventories) and each person's
-  animator, as far as scripts read it. Tick 2 gets past the scripts that
-  read the people and past Animate Sim on object 16, whose animation the
-  capture shows still playing after tick 5. It stops at Find Location
-  For (primitive 16) on object 364, and the boot says so and at which
-  tick. Where it stops, the 355 objects whose turn has passed and the
-  three people's animators equal the capture after tick 2, except one word of
-  the object that Find Location For would place. K stays 1 until tick 2
-  runs to its end.
+  prints the hash. **K = 5 on the Goth house**: our state after each of
+  ticks 1 to 5 equals a capture of the original after the same tick in
+  everything compared, the C runtime's random stream aside (see "The
+  first tick" and "Ticks 2 to 5"). The simulation holds the
+  neighborhood's people (their records, person data, relationships and
+  inventories) and each person's animator, as far as scripts read it.
+  Find Location For (primitive 16) is ported for the modes the house
+  reaches. Tick 6 is beyond the capture, so nothing in it is checked. It
+  stops where object 382 asks for a new person with Create New Object
+  Instance (mode 8), which is not ported, and the boot says so and at
+  which tick.
 
 ### Load sequence
 
@@ -865,12 +863,48 @@ to 5: the clip does not end in that time, and here it is still playing
 too. After tick 1 and where tick 2 stops, the three people's animators
 equal the capture's in every field its memory pages hold.
 
-Later in tick 2, object 364 makes object 262 again and stops at Find
-Location For (`0x44b3c8`), which searches for a free place near another
-object (`0x4347f0`) and puts the object there. It is not ported. In the
-capture, object 262 ends tick 2 placed, and in ticks 3 to 5 object 15
-asks a two-button dialog, answered with the second button, and 35
-objects are removed and one is made. None of that is reached here yet.
+Later in tick 2, object 364 makes object 262 again and puts it near
+another object with Find Location For (`0x44b3c8`,
+`primitives/find_location.rs`). That searches the lot in a square spiral
+for a free tile in the same room, then anywhere (`0x4347f0`), tests the
+tile with the object's place test (`0x433311`, through `0x4329c1`,
+`0x476f5a`, `0x4337f6` and `0x476dbc`; `placement/find.rs`), and puts
+the object there. It draws no random numbers. Then object 15 asks a
+two-button dialog, answered with the second button (3), as the capture's
+events show. The state after tick 2 equals the capture's, object 15's
+frames included, so the dialog comes in tick 2; this file said ticks 3
+to 5 before.
+
+### Ticks 2 to 5
+
+In tick 3, people 18 and 21 start a 999 ms clip of 30 frames, and 35
+objects are removed. The script names the clip "-Rstand"; the
+animation library holds only "-rstand". The library's lookup
+(`0x5a27f2`) compares bytes exactly, yet the capture shows the original
+playing "-rstand", so somewhere the case is ignored. Where is not found.
+`Animations::clip` now falls back to the one name that differs only in
+case, and fails if there are two. Ticks 4 and 5 count down and run the
+same four objects.
+
+**Compared with the original.** After each of ticks 2 to 5 our state
+equals the capture's at the return of the same lot update, in every
+field listed for tick 1, floats bit for bit; also the people's animators
+(every field we keep that the capture's memory pages hold) and, read
+from the neighborhood file the capture's game read, all 463 records, the
+inventories and the registry byte that differed after tick 1. Not equal:
+the C runtime's random stream, still 52 draws further on in the capture;
+neither side drew from it in these ticks. Read from the install's
+neighborhood file, five records and one inventory differ, as after tick
+1, because the two files differ there.
+
+**Tick 6 (unverified).** It starts at tick count 88,449, beyond the
+capture. Object 382 asks for a new object of type 0x44A86A6C where the
+pedestrian portal (object 6) stands: Create New Object Instance mode 8
+with flag 0x20 (`0x44e0c8`). Mode 8 is ported for an ordinary object
+(`primitives/create.rs`), but this one is a person, whose creation and
+placing are not ported, so the tick fails loudly before anything is
+made. The lot's hour rollover and the lot service `0x4165e3` (first due
+at tick count 88,450) also wait further on.
 
 ## Working rules
 

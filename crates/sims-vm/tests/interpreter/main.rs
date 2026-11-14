@@ -6,6 +6,7 @@ mod calls;
 mod deletion;
 mod expression;
 mod factory;
+mod find_location;
 mod load;
 mod memory;
 mod neighbors;
