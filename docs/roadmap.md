@@ -1388,10 +1388,15 @@ stop-sounds events.
   dispatcher. Of the 190 events that were not plays, 29 remain, counted
   in a gated test: music modes (21), ambience modes (5), the piano,
   pausing and reloading. 12 more name no track and do nothing.
+- **Done: ambient scores.** The FSC scores play as the original's score
+  player does: cells picked by weight in a window around a cursor that
+  the camera and the hour move, on the score's beat. The ambience modes
+  (52) and the ambience half of the music modes (36) are ported, so 24
+  events remain.
 - **Next:**
   - The simulation emits `SoundEvent`s (the interface is in the
-    decisions log).
-  - The FSC ambient player (ambience modes).
+    decisions log), and gives the camera value and the hour for the
+    ambience's cursor.
   - Live playback behind a feature.
   - Checking any of it against the original.
 

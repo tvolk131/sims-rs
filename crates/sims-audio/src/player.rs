@@ -85,12 +85,22 @@
 //!   [`SoundEvent::StopObject`] does); 105, kill the instances of every
 //!   object above 0. Killing an instance lets go of its track: a track no
 //!   object still has fades out at speed 100 and ends, or ends at once
-//!   when it has no note playing (0x57dca3).
+//!   when it has no note playing (0x57dca3). Kill all also stops every
+//!   ambient score.
 //! - 30, `kTurnOnTv` (radios too): kills the object's instances, then
 //!   records the object as an instance of the track and starts it.
 //! - 53, `kSequenceTrackHitList`: picks a patch from a hit list and
 //!   chains it to the note the track is playing, to start with no gap
 //!   when that one ends; with no note playing, starts it.
+//! - 52, `kSetAmbienceMode`: makes a score current and starts it,
+//!   stopping the one before (see [`crate::ambience`] and
+//!   [`Player::add_scores`]); a mode with no score stops the current one.
+//! - 36, `kSetMusicMode`: only its ambience half (see
+//!   `Player::set_music_mode`); the music half is reported as a fault.
+//!
+//! The game's code also calls kind 33 to move the ambience's cursor from
+//! the camera and the hour: [`Player::set_ambience_view`]. The scores'
+//! voices mix with the notes, at the effects group's volume.
 //!
 //! The radio, television and music hit lists are built from directories
 //! (see [`crate::stations`] and [`Player::add_stations`]). An MP3 is
@@ -105,8 +115,7 @@
 //! thread where the original would use its one object. When an object
 //! lets go of a track others still have, the original re-evaluates the
 //! shared track (0x5746d9, not read); here that object's threads fade
-//! out and end. Kinds not ported (music modes, ambience modes, the
-//! piano, pausing, reloading, and the sound object calls only the game's
+//! out and end. Kinds not ported (the music, the piano, pausing, reloading, and the sound object calls only the game's
 //! code makes) are reported as faults; kinds whose case does nothing for
 //! sound are ignored.
 //!
