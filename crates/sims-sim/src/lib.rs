@@ -22,6 +22,7 @@
 
 pub mod animator;
 mod error;
+pub mod head;
 pub mod load;
 pub mod motives;
 pub mod neighbors;

@@ -419,6 +419,26 @@ impl Ext {
         Self::from_f64_bits(value.to_bits())
     }
 
+    /// `FCOS` of a stored float, in radians. Like `FPATAN` the instruction
+    /// ignores the precision control and keeps a 64-bit significand; the C
+    /// runtime's `cos` (0x637154) runs the same instruction.
+    ///
+    /// The value is libm's double-precision `cos`. The game stores each
+    /// cosine it takes as a float, which gives the FPU's value unless the
+    /// exact cosine lies within about 2^-52 of a rounding midpoint; that
+    /// the game's inputs never do is **unverified**.
+    pub fn cos(x: F32) -> Self {
+        let value = libm::cos(f64::from(x.to_f32()));
+        Self::from_f64_bits(value.to_bits())
+    }
+
+    /// `FSIN` of a stored float, in radians, as [`Ext::cos`] (the C
+    /// runtime's `sin` is 0x636de4), with the same **unverified** caveat.
+    pub fn sin(x: F32) -> Self {
+        let value = libm::sin(f64::from(x.to_f32()));
+        Self::from_f64_bits(value.to_bits())
+    }
+
     pub fn abs(self) -> Self {
         match self.class {
             Class::Nan => Self::NAN,
