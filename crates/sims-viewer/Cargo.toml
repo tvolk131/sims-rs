@@ -1,0 +1,18 @@
+[package]
+name = "sims-viewer"
+description = "A window that shows a lot drawn by sims-render, with the original's zoom, rotation, floor and wall controls."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+sims-render = { path = "../sims-render" }
+sims-sim.workspace = true
+softbuffer = "0.4.8"
+winit = "0.30.13"
+
+[lints]
+workspace = true

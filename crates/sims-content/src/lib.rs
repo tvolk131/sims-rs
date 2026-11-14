@@ -17,6 +17,7 @@ mod index;
 mod install;
 mod neighborhood;
 mod people;
+pub mod ui_graphics;
 
 pub use animations::{Animations, Channel, Clip, Event, Track};
 pub use catalog::{Catalog, Object};
