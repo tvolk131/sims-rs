@@ -4,17 +4,17 @@
 # command runs soon after the host writes it; the generic job runner
 # (/sims-init.sh) polls only once a second.
 #
-# Only one agent serves the folder: a new one exits while the agent named in
-# agent.pid still runs (the pid file outlives a guest restart, so the pid is
-# checked against the process's command line). And each command is claimed
-# by renaming it to <n>.run, which only one process can do, so even two
-# agents never run a command twice.
+# Only one agent runs in a guest: it holds an flock on a file on the guest's
+# own disk for its whole life (the kernel drops the lock when it dies or the
+# guest restarts), and a second agent exits. Each command is also claimed by
+# renaming it to <n>.run, which only one process can do.
 export DISPLAY=:98
-D=${INPUT_DIR:-/research/input}  # INPUT_DIR: for the host tests
+D=${INPUT_DIR:-/research/input}            # INPUT_DIR, INPUT_LOCK: for the host tests
+LOCK=${INPUT_LOCK:-/tmp/input-agent.lock}
 mkdir -p "$D"
-old=$(cat "$D/agent.pid" 2>/dev/null)
-if [ -n "$old" ] && [ "$old" != "$$" ] && tr '\0' ' ' 2>/dev/null < "/proc/$old/cmdline" | grep -q input-agent; then
-    exit 0
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK"
+    flock -n 9 || exit 0
 fi
 echo $$ > "$D/agent.pid"
 while :; do
@@ -23,7 +23,7 @@ while :; do
         base=${c%.cmd}
         [ -e "$base.done" ] && continue  # ended (left as .cmd by an older agent)
         mv "$c" "$base.run" 2>/dev/null || continue
-        /bin/sh "$base.run" > "$base.out" 2>&1
+        /bin/sh "$base.run" > "$base.out" 2>&1 9>&-
         echo "$?" > "$base.done"
     done
     sleep 0.05

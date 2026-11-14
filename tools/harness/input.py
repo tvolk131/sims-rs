@@ -82,10 +82,6 @@ STEPS = {
 }
 
 
-# Steps that read guest memory: they start or go on only at an update return.
-MEMORY_STEPS = {'click-object', 'choose', 'expect-queued'}
-
-
 class ScenarioError(ValueError):
     pass
 
@@ -389,6 +385,12 @@ class Event:
         self.kind, self.after = kind, after
 
 
+class Fresh:
+    """Yielded by a step before it reads guest memory: go on at once if the
+    runner's memory was read at this update return, else at the next one.
+    (At a dialog stop, the memory the runner holds is an older stop's.)"""
+
+
 class Updates:
     """Yielded by a step: let n more lot updates return."""
 
@@ -434,6 +436,7 @@ class Runner:
         self.pushes = []
         self.push_cursor = 0  # pushes before it were matched by an expect-queued
         self.fresh = False  # self.m was read at this update return (not at a dialog stop)
+        self.unchecked = []  # (n, row): commands whose exit code is still to be checked
         self.dialogs = []
         self.finished = False
         self.failed = None
@@ -466,20 +469,28 @@ class Runner:
 
     def on_dialog(self, kind, update):
         """A dialog stop. A modal dialog holds the lot update it shows in, so
-        no update returns until it is answered: a dialog that shows ends the
-        settling after a command (the command still runs in the guest, before
-        any later one), and only steps that read no memory go on here."""
+        no update returns until it is answered. So here a command's end is
+        checked but no settling is counted, and a dialog that shows while a
+        command settles ends the settling: if the command has not ended yet,
+        its exit code is checked at a later stop (the agent runs commands in
+        order, so a later press still comes after it; a shot's file is
+        converted then). Memory is not read here (see Fresh)."""
         self.dialogs.append((kind, update))
         self.fresh = False
         if self.finished:
             return
-        if kind == 'dialog_show' and self.waiting and self.waiting[0] == 'job':
-            self.write(kind='command_wait_ended', id=self.waiting[1], reason='dialog_show', in_update=update)
-            self.waiting = None
-        if self.waiting and self.waiting[0] != 'event':
-            return
         try:
-            self.tick()
+            if kind == 'dialog_show' and self.waiting and self.waiting[0] == 'job':
+                _, n, settle, seen, row = self.waiting
+                if seen is None and self.agent.result(n) is None:
+                    self.unchecked.append((n, row))
+                elif seen is None and not self.ended(n, row):
+                    return
+                self.write(kind='command_wait_ended', id=n, reason='dialog_show', in_update=update)
+                self.waiting = None
+            if self.waiting and self.waiting[0] not in ('event', 'job'):
+                return
+            self.tick(at_update=False)
         except Exception as e:
             self.fail(f'{type(e).__name__}: {e}')
 
@@ -492,30 +503,52 @@ class Runner:
         if self.finished:
             return
         try:
-            self.tick()
+            self.tick(at_update=True)
         except Exception as e:  # a scenario must never end the capture
             self.fail(f'{type(e).__name__}: {e}')
 
-    def tick(self):
+    def ended(self, n, row):
+        """Log command n's end; False (and the scenario failed) if it failed."""
+        code = self.agent.result(n)
+        self.write(kind='command_ended', id=n, code=code, what=row['what'])
+        if code:
+            self.fail(f'guest command {n} ({row["what"]}) failed with {code}')
+            return False
+        if row['what'] == 'shot':
+            local = self.agent.dir / f'shot-{row["name"]}.xwd'
+            self.shots_dir.mkdir(exist_ok=True)
+            from guest import xwd_to_png
+            xwd_to_png(local, self.shots_dir / f'{row["name"]}.png')
+            local.unlink()
+        return True
+
+    def tick(self, at_update=True):
+        for item in list(self.unchecked):
+            if self.agent.result(item[0]) is not None:
+                self.unchecked.remove(item)
+                if not self.ended(*item):
+                    return
         if self.waiting:
             kind = self.waiting[0]
             if kind == 'job':
                 _, n, settle, seen, row = self.waiting
                 if seen is None:
-                    code = self.agent.result(n)
-                    if code is None:
+                    if self.agent.result(n) is None:
                         return
-                    self.write(kind='command_ended', id=n, code=code, what=row['what'])
-                    if code:
-                        self.fail(f'guest command {n} failed with {code}')
+                    if not self.ended(n, row):
                         return
                     seen = 0
-                seen += 1
                 if seen < settle:
-                    self.waiting = ('job', n, settle, seen, row)
-                    return
+                    if at_update:
+                        seen += 1
+                    if seen < settle:
+                        self.waiting = ('job', n, settle, seen, row)
+                        return
             elif kind == 'event':
                 if self.count(self.waiting[1]) <= self.waiting[2]:
+                    return
+            elif kind == 'fresh':
+                if not self.fresh:
                     return
             else:
                 left = self.waiting[1] - 1
@@ -533,8 +566,6 @@ class Runner:
                 self.finished = True
                 self.write(kind='scenario', status='done')
                 return
-            if not self.fresh and self.steps[self.index]['op'] in MEMORY_STEPS:
-                return  # go on at the next update return, with memory read there
             if self.gen is None:
                 step = self.steps[self.index]
                 self.write(kind='step', status='start', index=self.index, line=step['line'], text=step['text'])
@@ -560,6 +591,9 @@ class Runner:
                     self.waiting = ('job', n, want.settle, None, row)
             elif isinstance(want, Event):
                 self.waiting = ('event', want.kind, want.after)
+            elif isinstance(want, Fresh):
+                if not self.fresh:
+                    self.waiting = ('fresh',)
             elif isinstance(want, Updates):
                 if want.n > 0:
                     self.waiting = ('updates', want.n)
@@ -610,12 +644,8 @@ class Runner:
         if not name.replace('-', '').replace('_', '').isalnum():
             raise StepFailed(f'bad shot name {name!r}')
         guest = f'{self.guest_share}/input/shot-{name}.xwd'
+        # The PNG is made when the command is seen to end (Runner.ended).
         yield Job('shot', shot_command(self.agent.window, guest), settle=1, name=name)
-        local = self.agent.dir / f'shot-{name}.xwd'
-        self.shots_dir.mkdir(exist_ok=True)
-        from guest import xwd_to_png
-        xwd_to_png(local, self.shots_dir / f'{name}.png')
-        local.unlink()
 
     def step_click_object(self, oid):
         """Aim, press, and accept the pie menu only if its actions are aimed at
@@ -625,6 +655,7 @@ class Runner:
         point tried."""
         tried = []
         for attempt in range(len(aim_points(0, 0, 0))):
+            yield Fresh()
             p = find_object(self.m, self.sim, oid)
             if not p:
                 raise StepFailed(f'no object {oid}')
@@ -633,12 +664,14 @@ class Runner:
             point = clamp(aim_points(*anchor, view['zoom'])[attempt])
             yield Job('move', move_command(*point, self.agent.window), x=point[0], y=point[1],
                       aim=oid, anchor=anchor)
+            yield Fresh()
             hover = yield from self.steady_hover()
             self.write(kind='hover', x=point[0], y=point[1], object=hover, want=oid)
             tried.append((point, hover))
             if hover != oid:
                 continue
             yield Job('press', press_command(), x=point[0], y=point[1], object=oid)
+            yield Fresh()
             entries = yield from self.wait_entries(200)
             if not entries:
                 raise StepFailed(f'no pie menu opened on object {oid}')
@@ -671,6 +704,7 @@ class Runner:
 
     def close_pie(self):
         yield Job('key', key_command('Escape'), key='Escape')
+        yield Fresh()
         for _ in range(200):
             if not read_entries(self.m):
                 return
@@ -688,6 +722,7 @@ class Runner:
         return {r['action']['target'] for r in rows if 'action' in r}
 
     def step_choose(self, label):
+        yield Fresh()
         pie = read_pie(self.m)
         if not pie or not read_entries(self.m):
             raise StepFailed('no pie menu is open')
@@ -699,6 +734,7 @@ class Runner:
         pushes = len(self.pushes)
         self.push_cursor = pushes  # expect-queued looks only at what this choice pushes
         yield Job('move', move_command(*point, self.agent.window), x=point[0], y=point[1], entry=label)
+        yield Fresh()
         for _ in range(60):  # the game takes the move late
             pie = read_pie(self.m)
             if pie and pie['highlighted'] == i:
@@ -708,7 +744,10 @@ class Runner:
             raise StepFailed(f'entry {label!r} ({i}) is not highlighted: {pie and pie["highlighted"]}')
         yield Job('press', press_command(), x=point[0], y=point[1], entry=label)
         for _ in range(200):
-            if len(self.pushes) > pushes or not read_entries(self.m):
+            if len(self.pushes) > pushes:  # known without reading memory (a dialog may be up)
+                return
+            yield Fresh()
+            if not read_entries(self.m):
                 return
             yield Updates(1)
         raise StepFailed(f'choosing {label!r} did nothing')
@@ -716,6 +755,7 @@ class Runner:
     def step_expect_queued(self, person, target, within):
         """Wait for a push on person (aimed at target), then for the person to
         hold that action, queued or already running."""
+        yield Fresh()
         start = self.update
         push = None
         while True:

@@ -151,7 +151,7 @@ class FakeAgent:
         return len(self.commands)
 
     def result(self, n):
-        return 0 if n in self.done else None
+        return getattr(self, 'codes', {}).get(n, 0) if n in self.done else None
 
     def finish_all(self):
         self.done |= set(range(1, len(self.commands) + 1))
@@ -468,6 +468,47 @@ class ReviewFindingsTest(RunnerBase):
         self.assertEqual(self.rows('queued_unread')[0]['action_pointer'], 0x20)
         self.assertEqual(r.pushes, [])
 
+    def test_a_dialog_opened_by_a_choice_does_not_deadlock(self):
+        g = self.g
+        g.open_pie(['Sit'], target=self.bench, caller=self.person)
+        g.highlight(0)
+        r = self.runner('choose Sit\nanswer-dialog 400 400')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        self.push(r, 8213)
+        r.on_dialog('dialog_show', self.update + 1)  # the press is still settling, or running
+        self.assertIn('400 400', self.last_command())
+        r.on_dialog('dialog_result', self.update + 1)
+        self.assertTrue(r.finished)
+        self.assertIsNone(r.failed)
+
+    def fake_xwd(self, path):
+        header = [100, 7, 2, 16, 2, 1] + [0] * 6 + [4] + [0] * 6 + [0] + [0] * 5
+        path.write_bytes(struct.pack('>25I', *header) + b'\x1f\x00\xe0\x07')
+
+    def test_a_shot_running_when_a_dialog_shows(self):
+        shots = Path(tempfile.mkdtemp())
+        r = inp.Runner(inp.parse_scenario('shot before\nanswer-dialog 400 400'), self.agent, self.log, shots_dir=shots)
+        self.runners.append(r)
+        self.tick(r, 1, finish=False)
+        r.on_dialog('dialog_show', self.update + 1)
+        self.assertIn('400 400', self.last_command())  # pressed while the shot still runs
+        self.fake_xwd(self.agent.dir / 'shot-before.xwd')
+        self.agent.finish_all()
+        r.on_dialog('dialog_result', self.update + 1)
+        self.assertTrue(r.finished)
+        self.assertIsNone(r.failed)
+        self.assertTrue((shots / 'before.png').read_bytes().startswith(b'\x89PNG'))
+        self.assertFalse((self.agent.dir / 'shot-before.xwd').exists())
+
+    def test_a_failure_seen_after_a_dialog_still_fails(self):
+        r = self.runner('click 10 20\nanswer-dialog 400 400')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        r.on_dialog('dialog_show', self.update + 1)  # the press has not ended yet
+        self.agent.codes = {2: 1}
+        self.agent.finish_all()
+        r.on_dialog('dialog_result', self.update + 1)
+        self.assertIn('failed with 1', r.failed)
+
     def test_window_ids_are_checked(self):
         self.assertEqual(inp.check_window('0xe00013'), '0xe00013')
         for bad in ('0x1; printf injected; #', '$(id)', '0x1 2', ''):
@@ -491,6 +532,46 @@ class ReviewFindingsTest(RunnerBase):
 
 class AgentScriptTest(unittest.TestCase):
     """The guest agent itself, run on the host with sh on a temporary folder."""
+
+    def env(self, d):
+        """The agent's folder and lock under d; on a host without flock (macOS),
+        a stand-in that takes the same lock on fd 9 with fcntl.flock."""
+        env = dict(os.environ, INPUT_DIR=str(d), INPUT_LOCK=str(d / 'agent.lock'))
+        bin_dir = d / 'bin'
+        bin_dir.mkdir()
+        stand_in = bin_dir / 'flock'
+        stand_in.write_text('#!/bin/sh\nexec "%s" -c "import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)" '
+                            '2>/dev/null\n' % sys.executable)
+        stand_in.chmod(0o755)
+        if not any((Path(x) / 'flock').exists() for x in os.environ.get('PATH', '').split(os.pathsep)):
+            env['PATH'] = f'{bin_dir}{os.pathsep}{env["PATH"]}'
+        return env
+
+    def test_a_second_agent_exits(self):
+        d = Path(tempfile.mkdtemp())
+        script = Path(inp.__file__).with_name('guest') / 'input-agent.sh'
+        env = self.env(d)
+        first = subprocess.Popen(['sh', str(script)], env=env)
+        try:
+            end = time.time() + 10
+            while not (d / 'agent.pid').exists() and time.time() < end:
+                time.sleep(0.05)
+            second = subprocess.run(['sh', str(script)], env=env, timeout=10)
+            self.assertEqual(second.returncode, 0)
+            self.assertEqual((d / 'agent.pid').read_text().strip(), str(first.pid))
+        finally:
+            first.kill()
+            first.wait()
+        # The lock goes with the process: a new agent starts.
+        again = subprocess.Popen(['sh', str(script)], env=env)
+        try:
+            end = time.time() + 10
+            while (d / 'agent.pid').read_text().strip() != str(again.pid) and time.time() < end:
+                time.sleep(0.05)
+            self.assertEqual((d / 'agent.pid').read_text().strip(), str(again.pid))
+        finally:
+            again.kill()
+            again.wait()
 
     def test_two_agents_run_each_command_once(self):
         d = Path(tempfile.mkdtemp())
