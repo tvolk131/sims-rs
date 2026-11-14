@@ -18,3 +18,5 @@ pub mod tuning;
 pub use reader::{Error, Result};
 pub mod animation;
 pub mod avatar;
+pub mod bitmap;
+pub mod ui_table;
