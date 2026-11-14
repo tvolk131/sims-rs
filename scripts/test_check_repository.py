@@ -201,6 +201,57 @@ class RepositoryHygieneTests(unittest.TestCase):
         second = self.snapshot(first)
         self.assert_fails("historical private fixture directory", "--history", second)
 
+    def test_history_rejects_unreviewed_json_whose_bytes_first_came_as_text(self):
+        content = b'{"synthetic": [1, 2, 3]}'
+        self.write("a-source.txt", content)
+        self.git("add", ".")
+        first = self.snapshot()
+        self.write("z-capture.json", content)
+        self.git("add", ".")
+        second = self.snapshot(first)
+        self.assert_fails("z-capture.json: JSON data requires", "--history", second)
+
+    def test_history_lets_reviewed_json_bytes_move_but_the_tree_needs_the_path(self):
+        content = b'{"synthetic": [1, 2, 3]}'
+        self.policy["reviewed_data"] = [{
+            "path": "legacy/a-reviewed.json", "bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "provenance": "Synthetic review input",
+        }]
+        self.save_policy()
+        self.write("a-reviewed.json", content)
+        self.git("add", ".")
+        first = self.snapshot()
+        self.git("rm", "--quiet", "--cached", "a-reviewed.json")
+        (self.root / "a-reviewed.json").unlink()
+        self.write("legacy/a-reviewed.json", content)
+        self.git("add", ".")
+        second = self.snapshot(first)
+        self.assert_passes("--history", second)
+        self.write("z-unreviewed.json", content)
+        self.git("add", ".")
+        self.assert_fails("z-unreviewed.json: JSON data requires", "--staged")
+
+    def test_history_checks_paths_added_only_by_a_merge(self):
+        self.write("base.txt", "base")
+        self.git("add", ".")
+        base = self.snapshot()
+        self.write("left.txt", "left")
+        self.git("add", ".")
+        left = self.snapshot(base)
+        self.git("rm", "--quiet", "--cached", "left.txt")
+        self.write("right.txt", "right")
+        self.git("add", "right.txt")
+        right = self.snapshot(base)
+        self.write("left.txt", "left")
+        self.write("merged.json", b'{"only": "in the merge"}')
+        self.git("add", ".")
+        tree = self.git("write-tree").decode().strip()
+        merge = self.git(
+            "commit-tree", tree, "-p", left, "-p", right, "-m", "merge"
+        ).decode().strip()
+        self.assert_fails("merged.json: JSON data requires", "--history", merge)
+
     def test_reference_corpus_and_research_cannot_be_forced_into_source_tree(self):
         for name in [
             "crates/example/tests/fixtures/reference.json",
