@@ -21,7 +21,7 @@ fn bmp(rgb: [u8; 3]) -> Vec<u8> {
 
 fn install(tree: &Tree, loose: bool) -> Install {
     let header = b"const Sint32 kA = 7;\nconst Sint32 kFrench = 3;\n";
-    let table = b"{INCLUDE,A.h}\n{BITMAP,kA,\"Dir\\A.bmp\"}\n{BITMAP,kA,\"Dir/AFr.bmp\",kFrench}\n";
+    let table = b"{INCLUDE,A.h}\n{BITMAP,kA,\"Dir\\A.bmp\"}\n{BITMAP,kA,\"Dir/AFr.bmp\",kFrench}\n{BITMAP,8,\"Dir/AFr.bmp\",kFrench}\n";
     let empty = b"{INCLUDE,A.h}\n";
     let a = bmp([1, 2, 3]);
     let french = bmp([4, 5, 6]);
@@ -53,7 +53,9 @@ fn install(tree: &Tree, loose: bool) -> Install {
 fn resource_ids_resolve_by_language_through_the_archive() {
     let tree = Tree::new("ui-archive");
     let ui = UiGraphics::open(&install(&tree, false)).unwrap();
-    assert_eq!(ui.len(), 2);
+    // A numeric ID with a language only the included header names.
+    assert_eq!(ui.len(), 3);
+    assert_eq!(ui.path(8, 3), Some("Dir/AFr.bmp"));
     assert_eq!(ui.path(7, US_ENGLISH), Some("Dir/A.bmp"));
     assert_eq!(ui.path(7, 3), Some("Dir/AFr.bmp"));
     assert_eq!(ui.path(8, US_ENGLISH), None);
@@ -65,6 +67,10 @@ fn resource_ids_resolve_by_language_through_the_archive() {
     );
     assert!(ui.bitmap(8, 1).unwrap().is_none());
     assert!(ui.read("Dir/Missing.bmp").is_err());
+    assert!(matches!(
+        ui.read("../GameData/Behavior.iff"),
+        Err(sims_content::Error::Unsupported(_))
+    ));
 }
 
 #[test]

@@ -27,12 +27,22 @@ pub struct Image {
 }
 
 impl Image {
-    /// The pixel at (x, y), or None outside the image.
-    pub fn pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+    /// The byte offset of pixel (x, y), or None outside the image or its
+    /// buffer.
+    fn at(&self, x: u32, y: u32) -> Option<usize> {
         if x >= self.width || y >= self.height {
             return None;
         }
-        let at = (y as usize * self.width as usize + x as usize) * 4;
+        let at = (y as usize)
+            .checked_mul(self.width as usize)?
+            .checked_add(x as usize)?
+            .checked_mul(4)?;
+        (at.checked_add(4)? <= self.rgba.len()).then_some(at)
+    }
+
+    /// The pixel at (x, y), or None outside the image.
+    pub fn pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+        let at = self.at(x, y)?;
         self.rgba.get(at..at + 4)?.try_into().ok()
     }
 
@@ -48,13 +58,21 @@ impl Image {
     /// The rectangle at (x, y) of the given size, or None when it is not
     /// inside the image.
     pub fn crop(&self, x: u32, y: u32, width: u32, height: u32) -> Option<Image> {
-        if x.checked_add(width)? > self.width || y.checked_add(height)? > self.height {
+        if width == 0 || height == 0 {
             return None;
         }
-        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
-        for row in y..y + height {
-            let start = (row as usize * self.width as usize + x as usize) * 4;
-            rgba.extend_from_slice(self.rgba.get(start..start + width as usize * 4)?);
+        let right = x.checked_add(width)?;
+        let bottom = y.checked_add(height)?;
+        if right > self.width || bottom > self.height {
+            return None;
+        }
+        // The last pixel must be in the buffer; then every row is.
+        self.at(right - 1, bottom - 1)?;
+        let row_bytes = width as usize * 4;
+        let mut rgba = Vec::with_capacity(row_bytes.checked_mul(height as usize)?);
+        for row in y..bottom {
+            let start = self.at(x, row)?;
+            rgba.extend_from_slice(self.rgba.get(start..start + row_bytes)?);
         }
         Some(Image {
             width,
@@ -80,6 +98,10 @@ fn pixels(width: i64, height: i64, at: usize) -> Result<(u32, u32)> {
 }
 
 /// Decodes a BMP file.
+///
+/// The decoder is strict: a palette index past the colors the file
+/// declares, an RLE8 run or jump that leaves the image, or pixel data that
+/// starts inside the headers is an error.
 pub fn bmp(data: &[u8]) -> Result<Image> {
     let mut r = Reader::new(data);
     if r.take(2)? != b"BM" {
@@ -87,7 +109,7 @@ pub fn bmp(data: &[u8]) -> Result<Image> {
     }
     r.skip(8)?;
     let offset = r.u32()? as usize;
-    let header = r.u32()?;
+    let header = r.u32()? as usize;
     if header < 40 {
         return r.fail(format!("unsupported BMP header of {header} bytes"));
     }
@@ -103,39 +125,55 @@ pub fn bmp(data: &[u8]) -> Result<Image> {
     }
     let top_down = raw_height < 0;
     let (width, height) = pixels(i64::from(width), i64::from(raw_height).abs(), 18)?;
-    let palette = if depth == 8 {
+    // The headers: the 14-byte file header, then the info header.
+    let headers_end = 14usize
+        .checked_add(header)
+        .filter(|&end| end <= data.len())
+        .ok_or_else(|| Error::new(14, "BMP header runs past the file"))?;
+    let mut palette = Vec::new();
+    if depth == 8 {
         let count = if used == 0 { 256 } else { used as usize };
         if count > 256 {
             return r.fail(format!("BMP palette of {count} colors"));
         }
-        let at = 14 + header as usize;
         let table = data
-            .get(at..)
-            .and_then(|rest| rest.get(..count * 4))
-            .ok_or_else(|| Error::new(at, "BMP palette outside file"))?;
-        let mut palette = [[0u8; 3]; 256];
-        for (entry, bgr) in palette.iter_mut().zip(table.as_chunks::<4>().0) {
-            *entry = [bgr[2], bgr[1], bgr[0]];
-        }
-        palette
-    } else {
-        [[0; 3]; 256]
-    };
+            .get(headers_end..headers_end + count * 4)
+            .ok_or_else(|| Error::new(headers_end, "BMP palette outside file"))?;
+        palette = table
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bgr| [bgr[2], bgr[1], bgr[0]])
+            .collect();
+    }
+    let palette_end = headers_end + palette.len() * 4;
+    if offset < palette_end {
+        return Err(Error::new(10, "BMP pixel data starts inside the headers"));
+    }
     let body = data
         .get(offset..)
         .ok_or_else(|| Error::new(10, "BMP pixel data outside file"))?;
+    let color = |index: u8, at: usize| -> Result<[u8; 3]> {
+        palette.get(usize::from(index)).copied().ok_or_else(|| {
+            Error::new(
+                at,
+                format!("palette index {index} past the {} colors", palette.len()),
+            )
+        })
+    };
     let (w, h) = (width as usize, height as usize);
-    // Rows as stored: bottom-up unless the height is negative.
+    // Rows top-down; a stored row is bottom-up unless the height is negative.
     let mut rows = vec![0u8; w * h * 3];
-    let mut put = |x: usize, stored_row: usize, rgb: [u8; 3]| {
-        if x < w && stored_row < h {
-            let y = if top_down {
-                stored_row
-            } else {
-                h - 1 - stored_row
-            };
-            rows[(y * w + x) * 3..(y * w + x) * 3 + 3].copy_from_slice(&rgb);
+    let row_of = |stored_row: usize| {
+        if top_down {
+            stored_row
+        } else {
+            h - 1 - stored_row
         }
+    };
+    let mut put = |x: usize, stored_row: usize, rgb: [u8; 3]| {
+        let at = (row_of(stored_row) * w + x) * 3;
+        rows[at..at + 3].copy_from_slice(&rgb);
     };
     match (depth, compression) {
         (8, 0) | (24, 0) => {
@@ -145,10 +183,11 @@ pub fn bmp(data: &[u8]) -> Result<Image> {
                 return Err(Error::new(offset, "BMP pixel data is short"));
             }
             for stored_row in 0..h {
-                let line = &body[stored_row * stride..stored_row * stride + w * bytes];
+                let start = stored_row * stride;
+                let line = &body[start..start + w * bytes];
                 for x in 0..w {
                     let rgb = if depth == 8 {
-                        palette[usize::from(line[x])]
+                        color(line[x], offset + start + x)?
                     } else {
                         let p = &line[x * 3..x * 3 + 3];
                         [p[2], p[1], p[0]]
@@ -162,25 +201,37 @@ pub fn bmp(data: &[u8]) -> Result<Image> {
                 return Err(Error::new(22, "top-down RLE8 BMP"));
             }
             // Pixels a run never reaches keep palette color 0.
+            let background = color(0, headers_end)?;
             for stored_row in 0..h {
                 for x in 0..w {
-                    put(x, stored_row, palette[0]);
+                    put(x, stored_row, background);
                 }
             }
             let mut r = Reader::new(body);
             let (mut x, mut y) = (0usize, 0usize);
+            // Whether (x, y) can take `n` more pixels on its row.
+            let fits = |x: usize, y: usize, n: usize| y < h && x + n <= w;
             loop {
-                let count = r.u8()?;
+                let count = usize::from(r.u8()?);
                 let value = r.u8()?;
                 if count > 0 {
+                    if !fits(x, y, count) {
+                        return r.fail("RLE8 run leaves the image");
+                    }
+                    let rgb = color(value, offset + r.pos)?;
                     for _ in 0..count {
-                        put(x, y, palette[usize::from(value)]);
+                        put(x, y, rgb);
                         x += 1;
                     }
                     continue;
                 }
                 match value {
+                    // End of line. The last row's may come just before the
+                    // end of the bitmap.
                     0 => {
+                        if y >= h {
+                            return r.fail("RLE8 end of line past the image");
+                        }
                         x = 0;
                         y += 1;
                     }
@@ -188,20 +239,25 @@ pub fn bmp(data: &[u8]) -> Result<Image> {
                     2 => {
                         x += usize::from(r.u8()?);
                         y += usize::from(r.u8()?);
+                        if !fits(x, y, 0) {
+                            return r.fail("RLE8 jump leaves the image");
+                        }
                     }
                     n => {
-                        let run = r.take(usize::from(n))?;
-                        for &index in run {
-                            put(x, y, palette[usize::from(index)]);
+                        let n = usize::from(n);
+                        if !fits(x, y, n) {
+                            return r.fail("RLE8 run leaves the image");
+                        }
+                        let at = offset + r.pos;
+                        let run = r.take(n)?;
+                        for (i, &index) in run.iter().enumerate() {
+                            put(x, y, color(index, at + i)?);
                             x += 1;
                         }
                         if n % 2 == 1 {
                             r.skip(1)?;
                         }
                     }
-                }
-                if y > h {
-                    return r.fail("RLE8 data runs past the image");
                 }
             }
         }
@@ -242,6 +298,9 @@ pub fn tga(data: &[u8]) -> Result<Image> {
     }
     if descriptor & 0x10 != 0 {
         return r.fail("right-to-left TGA");
+    }
+    if descriptor & 0xc0 != 0 {
+        return r.fail("interleaved TGA");
     }
     let (width, height) = pixels(i64::from(width), i64::from(height), 12)?;
     r.skip(usize::from(id_length))?;
@@ -317,9 +376,10 @@ mod tests {
     #[test]
     fn rle8_runs_escapes_and_absolute_mode() {
         let mut b = header(4, 2, 8, 1, &[RED, BLUE]);
-        // Bottom row: two BLUE, then an absolute run of 3 (padded) clipped
-        // at the edge; end of line. Top row: delta right 2, one BLUE, end.
-        b.extend([2, 1, 0, 3, 0, 1, 0, 0, 0, 0, 0, 2, 2, 0, 1, 1, 0, 1]);
+        // Bottom row: one BLUE, then an absolute run of 3 (padded to a
+        // word); end of line. Top row: delta right 2, one BLUE, end of
+        // line, end of bitmap.
+        b.extend([1, 1, 0, 3, 1, 0, 1, 0, 0, 0, 0, 2, 2, 0, 1, 1, 0, 0, 0, 1]);
         let image = bmp(&b).unwrap();
         let row = |y| {
             (0..4)
@@ -328,6 +388,39 @@ mod tests {
         };
         assert_eq!(row(1), [255, 255, 0, 255]);
         assert_eq!(row(0), [0, 0, 255, 0]);
+    }
+
+    #[test]
+    fn rle8_that_leaves_the_image_is_an_error() {
+        for bad in [
+            &[5, 0, 0, 1][..],               // run past the row
+            &[0, 5, 0, 0, 0, 0, 0, 0, 0, 1], // absolute run past the row
+            &[0, 2, 0, 2, 1, 0, 0, 1],       // jump below the image
+            &[0, 0, 0, 0, 0, 0, 1, 0, 0, 1], // end of line past the image
+            &[1, 7, 0, 1],                   // palette index not declared
+        ] {
+            let mut b = header(4, 2, 8, 1, &[RED, BLUE]);
+            b.extend(bad);
+            assert!(bmp(&b).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn headers_and_palette_are_checked() {
+        // Pixel data starting inside the headers.
+        let mut b = header(1, 1, 24, 0, &[]);
+        b.extend([1, 2, 3, 0]);
+        b[10..14].copy_from_slice(&0u32.to_le_bytes());
+        assert!(bmp(&b).is_err());
+        // An info header longer than the file.
+        let mut b = header(1, 1, 24, 0, &[]);
+        b.extend([1, 2, 3, 0]);
+        b[14..18].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(bmp(&b).is_err());
+        // A plain 8-bit pixel past the declared colors.
+        let mut b = header(1, 1, 8, 0, &[RED]);
+        b.extend([3, 0, 0, 0]);
+        assert!(bmp(&b).is_err());
     }
 
     #[test]
@@ -340,7 +433,7 @@ mod tests {
     #[test]
     fn malformed_bmp_never_panics() {
         let mut b = header(4, 2, 8, 1, &[RED, BLUE]);
-        b.extend([2, 1, 0, 3, 0, 1, 0, 0, 0, 0, 0, 2, 2, 0, 1, 1, 0, 1]);
+        b.extend([1, 1, 0, 3, 1, 0, 1, 0, 0, 0, 0, 2, 2, 0, 1, 1, 0, 0, 0, 1]);
         for end in 0..b.len() {
             let _ = bmp(&b[..end]);
         }
@@ -363,6 +456,9 @@ mod tests {
         for end in 0..b.len() {
             assert!(tga(&b[..end]).is_err());
         }
+        let mut interleaved = b.clone();
+        interleaved[17] = 0x48;
+        assert!(tga(&interleaved).is_err());
     }
 
     #[test]
@@ -381,5 +477,13 @@ mod tests {
         assert_eq!(cell.rgba, [1, 1, 1, 255, 255, 0, 255, 0]);
         assert!(image.crop(1, 1, 2, 1).is_none());
         assert!(image.crop(u32::MAX, 0, 2, 1).is_none());
+        // An image whose fields disagree with its buffer never panics.
+        let odd = Image {
+            width: u32::MAX,
+            height: u32::MAX,
+            rgba: Vec::new(),
+        };
+        assert!(odd.pixel(5, 5).is_none());
+        assert!(odd.crop(0, 0, u32::MAX, u32::MAX).is_none());
     }
 }

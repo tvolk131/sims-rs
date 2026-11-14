@@ -78,6 +78,37 @@ pub fn constants(text: &str, constants: &mut BTreeMap<String, i32>) -> Result<()
     Ok(())
 }
 
+/// A relative path below `UIGraphics`: not empty, not absolute, with no
+/// empty or `..` component.
+pub fn valid_path(path: &str) -> bool {
+    !path.is_empty()
+        && path
+            .split(['/', '\\'])
+            .all(|part| !part.is_empty() && part != ".." && !part.contains(':'))
+}
+
+fn include(line: usize, header: &str) -> Result<String> {
+    if !valid_path(header) {
+        return fail(line, format!("bad include {header}"));
+    }
+    Ok(header.to_owned())
+}
+
+/// The headers a table includes, in order, without reading its other
+/// rows: their names can only be resolved once the headers are read.
+pub fn includes(text: &str) -> Result<Vec<String>> {
+    let mut includes = Vec::new();
+    for (n, line) in lines(text) {
+        if let Some(header) = line
+            .strip_prefix("{INCLUDE,")
+            .and_then(|l| l.strip_suffix('}'))
+        {
+            includes.push(include(n, header.trim())?);
+        }
+    }
+    Ok(includes)
+}
+
 /// Reads a table, resolving names with `constants`. The caller reads the
 /// headers the table includes first.
 pub fn table(text: &str, constants: &BTreeMap<String, i32>) -> Result<Table> {
@@ -88,7 +119,7 @@ pub fn table(text: &str, constants: &BTreeMap<String, i32>) -> Result<Table> {
         };
         let fields: Vec<&str> = inner.split(',').map(str::trim).collect();
         match fields.as_slice() {
-            ["INCLUDE", header] => table.includes.push((*header).to_owned()),
+            ["INCLUDE", header] => table.includes.push(include(n, header)?),
             [kind @ ("BITMAP" | "RLEBMP"), name, path, rest @ ..] if rest.len() <= 1 => {
                 let number =
                     |name: &str| constants.get(name).copied().or_else(|| name.parse().ok());
@@ -107,7 +138,7 @@ pub fn table(text: &str, constants: &BTreeMap<String, i32>) -> Result<Table> {
                     return fail(n, "the path is not quoted");
                 };
                 let path = path.replace('\\', "/");
-                if path.is_empty() || path.starts_with('/') || path.split('/').any(|p| p == "..") {
+                if !valid_path(&path) {
                     return fail(n, format!("bad path {path}"));
                 }
                 table.rows.push(Row {
@@ -160,6 +191,11 @@ mod tests {
             ]
         );
         assert_eq!(t.unresolved, ["kGone"]);
+        assert_eq!(
+            includes("{INCLUDE, A.h}\n{BITMAP,kA,\"a.bmp\",kFrench}").unwrap(),
+            ["A.h"]
+        );
+        assert!(includes("{INCLUDE,..\\x.h}").is_err());
     }
 
     #[test]
@@ -175,6 +211,9 @@ mod tests {
             "{BITMAP,1,\"../a.bmp\"}",
             "{BITMAP,1,\"a.bmp\",kNoLanguage}",
             "{BITMAP,1,\"a.bmp\",1,2}",
+            "{BITMAP,1,\"/a.bmp\"}",
+            "{BITMAP,1,\"C:a.bmp\"}",
+            "{INCLUDE,../../outside.h}",
         ] {
             assert!(table(bad, &values).is_err(), "{bad}");
         }

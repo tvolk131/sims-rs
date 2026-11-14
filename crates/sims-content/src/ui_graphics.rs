@@ -28,6 +28,10 @@ pub const TABLES: [&str; 4] = [
     "Res_Other.RT",
 ];
 
+/// The largest file read, and the largest archive directory: well above
+/// the largest in the install (a 1024 by 768 loading screen of 769 KB).
+const MAX_FILE: u64 = 32 << 20;
+
 /// US English, the language the tests run in (`Res_Languages.h`).
 pub const US_ENGLISH: u8 = 1;
 
@@ -74,9 +78,8 @@ impl UiGraphics {
             let text = ui.text(name)?;
             let location = |e| Error::format(&format!("UIGraphics/{name}"), e);
             // Each table resolves names with the headers it includes.
-            let includes = ui_table::table(&text, &BTreeMap::new()).map_err(location)?;
             let mut constants = BTreeMap::new();
-            for header in &includes.includes {
+            for header in &ui_table::includes(&text).map_err(location)? {
                 ui_table::constants(&ui.text(header)?, &mut constants)
                     .map_err(|e| Error::format(&format!("UIGraphics/{header}"), e))?;
             }
@@ -108,7 +111,9 @@ impl UiGraphics {
         let offset = far::manifest_offset(&header, length).map_err(location)?;
         file.seek(SeekFrom::Start(u64::from(offset))).map_err(io)?;
         let mut directory = Vec::new();
-        file.read_to_end(&mut directory).map_err(io)?;
+        file.take(MAX_FILE)
+            .read_to_end(&mut directory)
+            .map_err(io)?;
         for entry in far::directory(&directory, length).map_err(location)? {
             // The first member of a name wins, as in a lookup that stops
             // at the first match.
@@ -122,12 +127,28 @@ impl UiGraphics {
     }
 
     /// Reads a file by its path below `UIGraphics`.
+    ///
+    /// The path must stay below `UIGraphics` (no `..`, no absolute path),
+    /// and the file must be at most 32 MiB.
     pub fn read(&self, path: &str) -> Result<Vec<u8>> {
         let relative = format!("UIGraphics/{}", path.replace('\\', "/"));
+        if !ui_table::valid_path(path) {
+            return Err(Error::Unsupported(format!(
+                "{relative} is not a path below UIGraphics"
+            )));
+        }
+        let too_large = || Error::Unsupported(format!("{relative} is larger than 32 MiB"));
         if let Some(loose) = resolve(&self.root, &relative)?
             && loose.is_file()
         {
-            return std::fs::read(&loose).map_err(|e| Error::io(&loose, e));
+            let io = |e| Error::io(&loose, e);
+            let file = File::open(&loose).map_err(io)?;
+            if file.metadata().map_err(io)?.len() > MAX_FILE {
+                return Err(too_large());
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_FILE).read_to_end(&mut bytes).map_err(io)?;
+            return Ok(bytes);
         }
         let missing = || Error::Missing {
             root: self.root.clone(),
@@ -138,8 +159,10 @@ impl UiGraphics {
         let io = |e| Error::io(archive, e);
         let mut file = File::open(archive).map_err(io)?;
         file.seek(SeekFrom::Start(stored.offset)).map_err(io)?;
-        let size = usize::try_from(stored.size)
-            .map_err(|_| Error::Unsupported(format!("{relative} is too large")))?;
+        if stored.size > MAX_FILE {
+            return Err(too_large());
+        }
+        let size = stored.size as usize;
         let mut bytes = vec![0; size];
         file.read_exact(&mut bytes).map_err(io)?;
         Ok(bytes)
