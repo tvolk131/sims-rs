@@ -9,8 +9,10 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+sims-content.workspace = true
 sims-render = { path = "../sims-render" }
 sims-sim.workspace = true
+sims-ui = { path = "../sims-ui" }
 softbuffer = "0.4.8"
 winit = "0.30.13"
 
