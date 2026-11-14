@@ -3,6 +3,7 @@
 //! game is kept: the tests pin names and SHA-256 digests only.
 
 use sha2::{Digest, Sha256};
+use sims_people::appearance::load_appearance;
 use sims_people::math::{Transform, Vec3};
 use sims_people::raster::{Camera, Canvas};
 use sims_people::{Assets, Body, residents, rig};
@@ -115,4 +116,22 @@ fn the_goth_family_draws_in_its_rest_pose() {
             "21 97b69425658b9a63c4e1fdcb0d3b320fbb3aa91ba6ca5fe0f001321cc7abc7db",
         ]
     );
+}
+
+/// An appearance is found by its own name when its file is named
+/// otherwise: the lab technician's uniform `B629MAFitlgt_labtech` is held
+/// by `b629ma_labtech.cmx`.
+#[test]
+fn an_appearance_is_found_by_its_own_name() {
+    let Some(root) = install() else { return };
+    let assets = Assets::scan(&root).unwrap();
+    let appearance = load_appearance(&assets, "b629mafitlgt_labtech").unwrap();
+    let meshes: Vec<&str> = appearance
+        .bindings
+        .iter()
+        .map(|b| b.mesh.as_str())
+        .collect();
+    assert_eq!(appearance.name, "b629mafitlgt_labtech");
+    assert_eq!(meshes, ["xskin-B629MAFit_labtech-PELVIS-BODY"]);
+    assert!(load_appearance(&assets, "no-such-appearance").is_err());
 }

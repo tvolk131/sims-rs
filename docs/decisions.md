@@ -4,6 +4,68 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-14: Bella Goth compared with the original; the mirror is still open
+
+One pose was compared with the original game. The game ran in the
+emulator harness (`tools/harness/`, its own container and guest copy),
+with House05 loaded from the install and the house view at near zoom.
+Bella (person 18) was walking away from the camera, and a screenshot was
+taken from behind at about 27 pixels per model unit. `sims-people` then
+drew person 18 from the same saved outfit at the same scale, playing
+`a2o-walking-loop` at directions 3.5 to 4.5 and phases 0.05 to 0.8. The
+screenshots and renders stay private, outside the repository.
+
+What matches: the meshes (body, head, long hair, hands, shoes), the
+textures (the red dress with its open back, the skin tone, the hair), the
+proportions, and the hem's length. The pose falls inside the walk cycle:
+it looks like phases 0.05 to 0.3.
+
+What the comparison does not settle:
+
+- **Mirror image: unverified.** The drawing negates file X (see
+  `crate::rig`). A capture from behind has no fixed feature that is
+  different on the left and right. The hem looks like one, but drawn at
+  several phases its lower side flips with the stride, and the
+  screenshot's phase is not known. Settling it needs a fixed asymmetric
+  feature seen in the original: for example, a printed shirt or a hair
+  parting, seen from the front.
+- Light and shading: the renderer uses its own light, not the
+  original's.
+- Pixel positions: the camera was not matched to the original's pixel
+  for pixel.
+- The standing loop, Mortimer (person 21) and Cassandra (person 16, a
+  child): the capture showed neither of them in their saved outfits.
+
+Mortimer was also seen walking, in a work uniform (a lab coat). That
+outfit is not among his saved outfits and was not found in the install,
+so it was not compared. Looking for it showed that an appearance's own
+name does not always match its file's name (`B629MAFitlgt_labtech` is in
+`b629ma_labtech.cmx`). So appearances are now also found by their own
+names across every catalog, as the old prototype did
+(legacy/crates/sims-content/src/avatar.rs).
+
+## 2026-11-14: The people viewer is a feature-gated window
+
+`people-viewer` is a small window binary in `sims-people`. It uses
+`winit` (the window and its events) and `softbuffer` (copies the
+software rasterizer's image to the window). Both are optional
+dependencies behind the crate's `viewer` feature, and nothing else in
+the workspace enables it. So the default build, `cargo test` and CI
+never compile them. They add 187 packages to `Cargo.lock`, which CI does
+not download, and leave every existing package's version unchanged. The
+cost is that CI does not build the viewer; run
+`cargo clippy -p sims-people --features viewer --all-targets` after
+changing it.
+
+The viewer reads the wall clock to play clips in real time, so the
+binary allows the workspace's determinism lint. Nothing it computes
+reaches the simulation. It reads a simulation snapshot through
+`sims_sim::Snapshots` and makes its own `Animator` values for the
+standing and walking demonstration; it never changes simulation code.
+
+`--png <file>` draws one frame without a window, so the viewer's
+drawing can be checked headless.
+
 ## 2026-11-14: The HIT player runs real sound events into PCM (track 3, sound)
 
 `sims_audio::player::Player` is the HIT virtual machine, with a mixer.

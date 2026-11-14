@@ -1251,10 +1251,18 @@ Progress:
   posture's standing loop; a person is placed and turned from the
   animator's position and direction. The Goths stand and walk offscreen
   (pinned by digest).
-- Next: a viewer, and the comparison with the original. The simulation
-  does not yet expose the base layer's clip and phase (a read-only
-  accessor is wanted; until then the saved record and the animator's
-  clock stand in).
+- Done: a small viewer (`people-viewer`, behind the `viewer` feature)
+  plays the house's people standing or walking, or draws them where a
+  simulation snapshot has them; it can also write one frame to a PNG.
+- Done: one pose compared with the original. Bella walking, seen from
+  behind in the emulator, matches in meshes, textures, proportions and
+  pose (see the decisions entry). Appearances are also found by their
+  own names across every catalog.
+- Next: settle whether the drawing is the original's mirror image (a
+  front view of a fixed asymmetric feature), and compare the standing
+  loop. The simulation does not yet expose the base layer's clip and
+  phase (a read-only accessor is wanted; until then the saved record and
+  the animator's clock stand in).
 
 ## Track: lot rendering (`crates/sims-render`)
 
