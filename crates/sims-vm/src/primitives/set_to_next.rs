@@ -28,8 +28,18 @@
 //!   modes, a next ID of zero still takes the true branch.
 //! - 12: the next member of the cursor's family (0x44f0d9).
 //!
+//! - 8: the next object on the cursor's tile, going round: the objects
+//!   that stand on the tile and everything they hold, in the order the
+//!   lot links them ([`crate::placement::on_tile`]). A cursor that stands
+//!   on no tile is the false branch.
+//! - 9: the first object on the next tile beside the object a local
+//!   names (byte 6), if it is in that object's room. The tiles go east,
+//!   south, west, north in the first two coordinates (+1 in the first,
+//!   +1 in the second, -1, -1), starting after the tile the cursor stands
+//!   on. No such object is the false branch.
+//!
 //! The others fail loudly: 5 and 7 need the neighborhood's person
-//! directory, 8 and 9 the tile chains and 11 the neighborhood's lot order.
+//! directory and 11 the neighborhood's lot order.
 //!
 //! [`World::order`]: sims_sim::World::order
 
@@ -73,7 +83,14 @@ impl Machine<'_, '_> {
                 }
             }
             5 | 7 => return Err(missing(mode, "the neighborhood's person directory")),
-            8 | 9 => return Err(missing(mode, "the lot's tile chains")),
+            8 => match self.next_on_tile(current)? {
+                Some(next) => Some(next),
+                None => return Ok(false),
+            },
+            9 => match self.next_beside(current, usize::from(operands[6]))? {
+                Some(next) => Some(next),
+                None => return Ok(false),
+            },
             10 => {
                 let careers = self
                     .program
@@ -297,6 +314,68 @@ impl Machine<'_, '_> {
         let mut order = self.registration_order()?;
         order.retain(|(_, o)| o.person.is_some());
         Ok(order)
+    }
+}
+
+impl Machine<'_, '_> {
+    /// Mode 8.
+    fn next_on_tile(&self, current: i16) -> Result<Option<i16>, Trap> {
+        let Some(id) = u16::try_from(current)
+            .ok()
+            .filter(|id| self.world.objects.contains_key(id))
+        else {
+            return Ok(None);
+        };
+        let Some(chain) = crate::placement::on_tile(self.world, id)? else {
+            return Ok(None);
+        };
+        let place = chain.iter().position(|&other| other == id);
+        Ok(place.map(|i| chain[(i + 1) % chain.len()] as i16))
+    }
+
+    /// Mode 9.
+    fn next_beside(&self, current: i16, local: usize) -> Result<Option<i16>, Trap> {
+        let reference = *self
+            .frame()?
+            .locals
+            .get(local)
+            .ok_or(Trap::native(8, "Set To Next local out of bounds"))?;
+        self.check_local(local)?;
+        let object = u16::try_from(reference)
+            .ok()
+            .and_then(|id| self.world.objects.get(&id))
+            .ok_or(Trap::native(10, "Set To Next reference object is missing"))?;
+        let origin = sims_sim::World::tile(object.position);
+        let cursor = u16::try_from(current)
+            .ok()
+            .and_then(|id| self.world.objects.get(&id))
+            .map(|o| sims_sim::World::tile(o.position))
+            .map(|at| [at[0].wrapping_sub(origin[0]), at[1].wrapping_sub(origin[1])]);
+        let mut delta = cursor.unwrap_or([1, 0]);
+        let mut first = cursor.is_none();
+        loop {
+            if !first {
+                delta = if delta[0] >= 1 {
+                    [0, 1]
+                } else if delta[0] < 0 {
+                    [0, -1]
+                } else if delta[1] >= 1 {
+                    [-1, 0]
+                } else {
+                    return Ok(None);
+                };
+            }
+            first = false;
+            let at = [
+                i32::from(origin[0]) + i32::from(delta[0]),
+                i32::from(origin[1]) + i32::from(delta[1]),
+            ];
+            if let Some(found) = crate::placement::first_on(self.world, at, origin[2])
+                && self.world.objects[&found].data.get(29) == object.data.get(29)
+            {
+                return Ok(Some(found as i16));
+            }
+        }
     }
 }
 

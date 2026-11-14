@@ -25,7 +25,7 @@
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Machine};
 use crate::memory::LOCKOUT;
-use crate::program::{Callback, DEFINITION_WORDS, Tree};
+use crate::program::{Callback, DEFINITION_WORDS};
 use sims_formats::saved_objects::Slot;
 use sims_sim::{Object, World};
 
@@ -58,6 +58,8 @@ mod word {
     pub const DATA_58: usize = 49;
     pub const ATTRIBUTES: usize = 58;
     pub const DYNAMIC_SPRITES: usize = 65;
+    /// Bit 0: the object has graphics of its own (OBJD byte 0xcc).
+    pub const GRAPHICS: usize = 102;
 }
 
 impl Interpreter<'_> {
@@ -95,27 +97,10 @@ impl Interpreter<'_> {
     /// thread holds. Init gets the object's temps as its arguments and no
     /// stack object. A definition that names no Init, or one whose tree is
     /// missing, runs nothing. Init's result is ignored.
-    fn init(&self, world: &mut World, id: u16) -> Result<(), Fault> {
-        let fail = |trap| Fault {
-            object: id,
-            at: None,
-            trap,
-        };
-        let object = world
-            .objects
-            .get(&id)
-            .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
-        let definition = self
-            .catalog
-            .object(object.guid)
-            .ok_or_else(|| fail(Trap::Invalid("object has no definition".into())))?;
-        let init = self.program.callback(definition, Callback::Init);
-        if init == 0 || matches!(self.program.tree(definition.resource, init), Tree::Missing) {
-            return Ok(());
-        }
-        let temps = object.temps.clone();
-        // The original copies Init's arguments out of the eight temps.
-        self.call(world, id, init, 0, &temps, 8, TURN_BUDGET)?;
+    pub(crate) fn init(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        // The original copies Init's arguments out of the eight temps
+        // ([`Interpreter::callback`], 0x422d46).
+        self.callback(world, id, Callback::Init as usize, 0)?;
         Ok(())
     }
 }
@@ -203,6 +188,33 @@ impl<'a> Machine<'a, '_> {
             last_result: false,
             removal_skips_resets: false,
         };
+        // Frames name the code they run by the lot's type table, which
+        // the original only builds when it saves. A type the table lacks
+        // takes the lowest unused ID.
+        let new_type = if self.world.types.values().any(|&g| g == guid) {
+            None
+        } else {
+            Some(
+                (1..=i16::MAX as u16)
+                    .find(|id| !self.world.types.contains_key(id))
+                    .ok_or_else(|| Trap::Unsupported("no unused type ID".into()))?,
+            )
+        };
+        if words[word::GRAPHICS] & 1 != 0 {
+            // An object with graphics of its own builds their root here,
+            // which gets the noise records of one bone: 32 draws from the
+            // C runtime's random stream (0x595d65). The graphics are not
+            // modeled, so only the draws are kept. From the old
+            // prototype's notes on the indicators' graphics
+            // (legacy/docs/original-households.md, "Root construction
+            // consumes 32 CRT draws per instance"). A trace of the
+            // original agrees: its stream starts a load 64 draws on from
+            // its initial state, the two indicators' worth, and is 64
+            // further on again when a load has made two more.
+            for _ in 0..32 {
+                self.world.crt_rng.next_u15();
+            }
+        }
         self.world.objects.insert(id, object);
         // New objects go to the head of the registration list, and to the
         // end of their type's instance list if it has been made.
@@ -210,13 +222,7 @@ impl<'a> Machine<'a, '_> {
         if let Some(instances) = self.world.instances.get_mut(&guid) {
             instances.push(id);
         }
-        if !self.world.types.values().any(|&g| g == guid) {
-            // Frames name the code they run by the lot's type table, which
-            // the original only builds when it saves. A type the table
-            // lacks takes the lowest unused ID.
-            let type_id = (1..=i16::MAX as u16)
-                .find(|id| !self.world.types.contains_key(id))
-                .ok_or_else(|| Trap::Unsupported("no unused type ID".into()))?;
+        if let Some(type_id) = new_type {
             self.world.types.insert(type_id, guid);
         }
         Ok(words)
@@ -226,7 +232,7 @@ impl<'a> Machine<'a, '_> {
     /// attributes and temps, keeping the words that describe where and
     /// when it was made. Returns whether Init runs: it does not for a tile
     /// of a multi-tile object, whose group resets as a whole.
-    fn reset(&mut self, words: &[i16; DEFINITION_WORDS]) -> Result<bool, Trap> {
+    pub(crate) fn reset(&mut self, words: &[i16; DEFINITION_WORDS]) -> Result<bool, Trap> {
         let id = self.me;
         let globals = &self.world.globals;
         let (year, month, day) = (globals[8], globals[7], globals[1]);
@@ -271,22 +277,38 @@ impl<'a> Machine<'a, '_> {
                 "an object whose definition names no Main tree".into(),
             ));
         }
-        self.me_mut()?.stack.clear();
-        self.enter(main, 0, &[0; 4], 4)
+        self.clear_frames()?;
+        self.enter(main, 0, &[0; 4], 4, false)
     }
 
     /// Step 7 (0x4521f7, 0x4457ef, 0x440e44).
     fn finish(&mut self, words: &[i16; DEFINITION_WORDS]) -> Result<(), Trap> {
-        let advertises = self.advertises()?;
+        self.end_turn()?;
+        self.refresh_flags()?;
         let object = self.me_mut()?;
-        // The tail of an object's turn counts the lockout word down.
+        object.data[41] = words[word::PRICE];
+        object.set_flags(flag::READY, true);
+        Ok(())
+    }
+
+    /// The tail of an object's turn (0x4521f7): the lockout word counts
+    /// down.
+    pub(crate) fn end_turn(&mut self) -> Result<(), Trap> {
+        let object = self.me_mut()?;
         if object.data[LOCKOUT] != 0 {
             object.data[LOCKOUT] = object.data[LOCKOUT].wrapping_sub(1);
         }
+        Ok(())
+    }
+
+    /// Refreshes two scheduler flags (0x4457ef): whether data word 60 is
+    /// nonzero, and whether the object offers something Sims choose by
+    /// themselves. The countdown and the other flags stay.
+    pub(crate) fn refresh_flags(&mut self) -> Result<(), Trap> {
+        let advertises = self.advertises()?;
+        let object = self.me_mut()?;
         object.set_flags(flag::QUEUED, object.data[60] != 0);
         object.set_flags(flag::ADVERTISES, advertises);
-        object.data[41] = words[word::PRICE];
-        object.set_flags(flag::READY, true);
         Ok(())
     }
 
@@ -295,9 +317,25 @@ impl<'a> Machine<'a, '_> {
     /// compared as a signed number, and whose flag bit 7 is clear.
     ///
     /// A tile of a multi-tile object advertises only if it is the tile
-    /// interactions go to; the factory makes no such object, so that test
-    /// is not ported.
+    /// its group's interactions go to (0x435286): when its definition's
+    /// word 8 is a positive number, that is the first tile of the group
+    /// whose word 8 is the same number negated, if there is one. Ported
+    /// from the old prototype's `interaction_target`
+    /// (legacy/crates/sims-vm/src/multitile.rs).
     fn advertises(&self) -> Result<bool, Trap> {
+        let me = self.me()?;
+        let words = self.definition_words(me.guid)?;
+        if words[word::GROUP] != 0 && words[8] > 0 && me.multipart.is_some() {
+            for part in self.interpreter().parts(self.world, self.me)? {
+                let guid = self.world.objects[&part].guid;
+                if self.definition_words(guid)?[8] == -words[8] {
+                    if part != self.me {
+                        return Ok(false);
+                    }
+                    break;
+                }
+            }
+        }
         let definition = self.definition(self.me()?.guid)?;
         let table = self
             .program

@@ -60,13 +60,54 @@ fn with_goth_people(
     then(&house, &interpreter, &mut world, &created, &people);
 }
 
+/// A lot's encoding as snapshot format 6 wrote it, for a state reached
+/// before load step 13. Two things changed since:
+///
+/// - Format 7 added two fields at the end of the encoding: the list of
+///   fires, and each object's frame storage. This empties both, checks
+///   that the encoding then ends in their two zero bytes, and drops them.
+///   The frame storage is not empty in these states: it holds what the
+///   trees that ran left behind. Format 6 did not record that.
+/// - The factory now draws 32 numbers from the C runtime's random stream
+///   for an object with graphics of its own. The two indicators the lot
+///   starts with are such objects, so the stream is 64 draws further on
+///   before the house's people are constructed. Their constructors draw
+///   until a drawn value fits, so from another state they draw another
+///   number of times: 7,084 where they drew 7,074. Nothing they draw is
+///   kept. This puts the stream back in the state it had under format 6:
+///   its initial state 1 advanced by `draws` numbers.
+///
+/// So a state pinned under format 6 can be shown to be the same state but
+/// for the frame storage and the stream.
+fn format_6_bytes(world: &World, draws: u32) -> Vec<u8> {
+    let mut old = world.clone();
+    old.fires.clear();
+    old.frame_storage.clear();
+    old.crt_rng = sims_core::CrtRng::from_state(1);
+    for _ in 0..draws {
+        old.crt_rng.next_u15();
+    }
+    let mut encoded = old.encode();
+    assert_eq!(encoded.split_off(encoded.len() - 2), [0; 2]);
+    encoded
+}
+
+/// The digest of [`format_6_bytes`].
+fn format_6(world: &World, draws: u32) -> String {
+    digest(&format_6_bytes(world, draws))
+}
+
+/// How many numbers the C runtime's random stream had drawn, under
+/// format 6, once the Goth house's people were constructed.
+const DRAWS_6: u32 = 7074;
+
 /// The digest of a lot's encoding as snapshot format 5 wrote it. Format 6
 /// added the lot's rooms at the end of the encoding, and a lot whose rooms
 /// have not been worked out encodes them as four zero bytes. This checks
-/// that the lot ends in those and digests the rest, so a state pinned
-/// under format 5 can be shown to be the same state.
-fn format_5(world: &World) -> String {
-    let encoded = world.encode();
+/// that the format 6 encoding ends in those and digests the rest, so a
+/// state pinned under format 5 can be shown to be the same state.
+fn format_5(world: &World, draws: u32) -> String {
+    let encoded = format_6_bytes(world, draws);
     let (old, new) = encoded.split_at(encoded.len() - 4);
     assert_eq!(new, [0; 4]);
     digest(old)
@@ -120,7 +161,11 @@ fn digest(bytes: &[u8]) -> String {
 /// start of the resize, the two indicators matched as well. The capture
 /// has nothing to compare `World`'s other fields with.
 ///
-/// The digest is of our own state, as built here. Snapshot format 6 added
+/// The digest is of our own state, as built here. Snapshot format 7 added
+/// the frame storage and the list of fires, and the indicators the lot
+/// starts with now draw from the C runtime stream; `format_6_bytes` says
+/// how the encoding is shown to be the state pinned under format 6
+/// otherwise. Snapshot format 6 added
 /// the lot's rooms at the end of the encoding, which are empty here: four
 /// zero bytes. Without them the encoding hashes to the digest pinned under
 /// format 5. Format 5 had added two fields (the multi-tile links and the
@@ -130,7 +175,9 @@ fn digest(bytes: &[u8]) -> String {
 /// bytes.
 #[test]
 fn the_goth_house_resize_creates_the_controllers() {
-    const PINNED: &str = "5da903b012eb85ced13111300ed5fd6f125ba083eb7517bac76e5c342eae2d91";
+    const PINNED: &str = "540a7a822c65b08918239a93d0accb9d46f26c5ab16400573e8d30e88f3cba90";
+
+    const FORMAT_6: &str = "5da903b012eb85ced13111300ed5fd6f125ba083eb7517bac76e5c342eae2d91";
     const FORMAT_5: &str = "9e5cab3b2caf4e1915faf58b9a3ef5fe192495b44cfb09420b9396368947bd15";
     const FORMAT_4: &str = "06925c3997de50179b8bfe0dd5cdb751b8e0f449ce0280ffcc6269c4e4e7e72e";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
@@ -151,8 +198,9 @@ fn the_goth_house_resize_creates_the_controllers() {
         assert_eq!(object.flags() & 1, 1, "object {id}");
     }
     assert_eq!(world.hash_hex(), PINNED);
-    assert_eq!(format_5(&world), FORMAT_5);
-    let encoded = world.encode();
+    assert_eq!(format_6(&world, 0), FORMAT_6);
+    assert_eq!(format_5(&world, 0), FORMAT_5);
+    let encoded = format_6_bytes(&world, 0);
     let (old, new) = encoded.split_at(encoded.len() - 6);
     assert_eq!((digest(old).as_str(), new), (FORMAT_4, &[0; 6][..]));
     // The run is deterministic.
@@ -181,13 +229,18 @@ fn the_goth_house_resize_creates_the_controllers() {
 /// capture has nothing to compare `World`'s other fields with, the
 /// leftover type table among them.
 ///
+/// Snapshot format 7 changed the encoding again; `format_6_bytes` says how
+/// this state is shown to be the one pinned under format 6.
+///
 /// The digest is of our own state, as built here. It is the state pinned
 /// under snapshot format 4, the one that comparison was made on, plus the
 /// two bytes of format 5's new fields and the four of format 6's, which
 /// are all empty here.
 #[test]
 fn the_goth_house_clear_removes_every_object() {
-    const PINNED: &str = "4f0b7439a1379c998d885eb10f2a12c0cb887c29d08524a6600d80da7c7486e7";
+    const PINNED: &str = "1c0600774ae59cb72770086809c94d54b65fd747e09fb5ddf79b7b62b675e8a6";
+
+    const FORMAT_6: &str = "4f0b7439a1379c998d885eb10f2a12c0cb887c29d08524a6600d80da7c7486e7";
     const FORMAT_5: &str = "b97f264759c4f6be2b3a356bb7a55bbdb662f2b0fdd80f1e87f613522362cae0";
     const FORMAT_4: &str = "ee03713bb263459d92b0359743f94c5c6c582951ae3eda24a2b066c0729ef906";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
@@ -213,8 +266,9 @@ fn the_goth_house_clear_removes_every_object() {
         assert_eq!((world.size, world.ticks), (52, 88444));
         assert!(world.instances.values().all(Vec::is_empty));
         assert_eq!(world.hash_hex(), PINNED);
-        assert_eq!(format_5(world), FORMAT_5);
-        let encoded = world.encode();
+        assert_eq!(format_6(world, 0), FORMAT_6);
+        assert_eq!(format_5(world, 0), FORMAT_5);
+        let encoded = format_6_bytes(world, 0);
         let (old, new) = encoded.split_at(encoded.len() - 6);
         assert_eq!((digest(old).as_str(), new), (FORMAT_4, &[0; 6][..]));
         // The original clears the lot again before it reads the saved
@@ -403,6 +457,9 @@ fn the_goth_house_type_table_marks_the_changed_types() {
 /// slot contents, dynamic sprite flags, each person's motives, queue and
 /// animations, object flags, and [`World::skeleton_files`].
 ///
+/// Snapshot format 7 changed the encoding again; `format_6_bytes` says how
+/// this state is shown to be the one pinned under format 6.
+///
 /// The digest is of our own state, as built here. It differs in two ways
 /// from the state pinned under snapshot format 5, the one that comparison
 /// was made on. Format 6 added the lot's rooms at the end of the
@@ -413,7 +470,9 @@ fn the_goth_house_type_table_marks_the_changed_types() {
 /// digest pinned under format 5.
 #[test]
 fn the_goth_house_objects_are_constructed_and_read() {
-    const PINNED: &str = "bda1f8eee5deabee63609ec1a2a8ea1e027161c7390b19a830bf7ed4c346c81e";
+    const PINNED: &str = "d6b094744f72f7bd3dfbc76c30e500dbaff86350487bf6306d2c2c2c5f4467d3";
+
+    const FORMAT_6: &str = "bda1f8eee5deabee63609ec1a2a8ea1e027161c7390b19a830bf7ed4c346c81e";
     const FORMAT_5: &str = "1034c34e3d93c040f31b0a56f9593e7e0ec7d8d319706b0afb591e8ac6f1531f";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
@@ -439,9 +498,11 @@ fn the_goth_house_objects_are_constructed_and_read() {
             assert_eq!(world.objects.len(), 245);
             // Two adults and a child: both skeleton files are read, of 29
             // bones each at 48 draws a bone, and three copies built. The
-            // rest are the three people's default interests.
+            // rest are the three people's default interests, which draw
+            // until a value fits: 124 times from the state the stream is
+            // in here, 64 draws on from its initial state.
             assert_eq!(world.skeleton_files.len(), 2);
-            assert_eq!(read.draws, 5 * 29 * 48 + 114);
+            assert_eq!(read.draws, 5 * 29 * 48 + 124);
             let mut stream = before.crt_rng;
             for _ in 0..read.draws {
                 stream.next_u15();
@@ -473,7 +534,8 @@ fn the_goth_house_objects_are_constructed_and_read() {
                 (before.global_rng, before.lot_rng)
             );
             assert_eq!(world.hash_hex(), PINNED);
-            assert_eq!(format_5(&with_zeroed_outer_walls(world)), FORMAT_5);
+            assert_eq!(format_6(world, DRAWS_6), FORMAT_6);
+            assert_eq!(format_5(&with_zeroed_outer_walls(world), DRAWS_6), FORMAT_5);
         },
     );
 }
@@ -519,13 +581,18 @@ fn the_goth_house_objects_are_constructed_and_read() {
 /// the other 166 objects; every cell outside the 52 tiles; and what the
 /// test above lists as not held.
 ///
+/// Snapshot format 7 changed the encoding again; `format_6_bytes` says how
+/// this state is shown to be the one pinned under format 6.
+///
 /// The digest is of our own state, as built here. As in the test above,
 /// it is the state pinned under snapshot format 5, the one that comparison
 /// was made on, but for the ground level's wall cells outside the lot's
 /// 52 tiles and the four bytes of format 6's new field.
 #[test]
 fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
-    const PINNED: &str = "2c000ad6962e840ece561db6b3a6ff572d8dd83815680c67a2a7eb861d3698b1";
+    const PINNED: &str = "3724e0d6e307e13a398a6a8c47e7523e1fe4f7f83cb575c4ec6cb4a6aceabdd1";
+
+    const FORMAT_6: &str = "2c000ad6962e840ece561db6b3a6ff572d8dd83815680c67a2a7eb861d3698b1";
     const FORMAT_5: &str = "d014a3ce407d420fc6b69248f9e23282b0fdc348bac79afc5670629b60ed46b1";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
@@ -602,7 +669,8 @@ fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
             assert!(outside.iter().all(|r| r.tile[0] >= 52 || r.tile[1] >= 52));
             assert_eq!(world.objects.len(), 382);
             assert_eq!(world.hash_hex(), PINNED);
-            assert_eq!(format_5(&with_zeroed_outer_walls(world)), FORMAT_5);
+            assert_eq!(format_6(world, DRAWS_6), FORMAT_6);
+            assert_eq!(format_5(&with_zeroed_outer_walls(world), DRAWS_6), FORMAT_5);
         },
     );
 }
@@ -662,11 +730,16 @@ fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
 /// not compared: what objects add to a room's count, the rooms' light and
 /// scores, and which rooms have people in them.
 ///
+/// Snapshot format 7 changed the encoding again; `format_6_bytes` says how
+/// this state is shown to be the one pinned under format 6.
+///
 /// The digests are of our own state, as built here.
 #[test]
 fn the_goth_house_gets_its_rooms_and_its_household() {
-    const COUNTED: &str = "d994b4eb25b6bb9b8ec8202bb1ede1f33ae40513f9cc2745298d76675ab6d476";
-    const SELECTED: &str = "6a9a7290da69b6e376c09a57295217df82ef28a8a7259eff97420d5c7c1e649d";
+    const COUNTED: &str = "c4c4bba18e2f07090e33ce5c823692498d3cfeac2b50d0652d2315f7ed040829";
+    const SELECTED: &str = "09fcefc61a7bc468bee455e8e7e6ce0e551e9847bf6c6d67b3d773022140609e";
+    const COUNTED_6: &str = "d994b4eb25b6bb9b8ec8202bb1ede1f33ae40513f9cc2745298d76675ab6d476";
+    const SELECTED_6: &str = "6a9a7290da69b6e376c09a57295217df82ef28a8a7259eff97420d5c7c1e649d";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -729,6 +802,8 @@ fn the_goth_house_gets_its_rooms_and_its_household() {
             assert!(!object.last_result);
             object.last_result = true;
         }
+        // ... and what they left in the frame storage.
+        expected.frame_storage = world.frame_storage.clone();
         assert_eq!(world.encode(), expected.encode());
         // The room count.
         let asked = world.clone();
@@ -740,6 +815,7 @@ fn the_goth_house_gets_its_rooms_and_its_household() {
         expected.rooms = world.rooms.clone();
         assert_eq!(world.encode(), expected.encode());
         assert_eq!(world.hash_hex(), COUNTED);
+        assert_eq!(format_6(world, DRAWS_6), COUNTED_6);
         // Step 11.
         assert_eq!(world.discard_removals(), [42, 44, 278, 280]);
         // Step 12.
@@ -758,5 +834,139 @@ fn the_goth_house_gets_its_rooms_and_its_household() {
         });
         assert_eq!(world.encode(), expected.encode());
         assert_eq!(world.hash_hex(), SELECTED);
+        assert_eq!(format_6(world, DRAWS_6), SELECTED_6);
+    });
+}
+
+/// The lot after load step 12, built the way `sims boot` builds it.
+fn selected(root: &std::path::Path, then: impl FnOnce(&Interpreter, &mut World, &People)) {
+    let install = Install::detect(root).unwrap();
+    let neighborhood = Neighborhood::open(&install.file("UserData").unwrap()).unwrap();
+    with_goth_people(root, |house, interpreter, world, _, people| {
+        world.clear_family().unwrap();
+        interpreter.clear(world).unwrap();
+        world.read_arrays(&house.arrays, 62).unwrap();
+        world
+            .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+            .unwrap();
+        interpreter.read_types(world, &house.types).unwrap();
+        interpreter.clear(world).unwrap();
+        interpreter
+            .read_objects(world, &house.objects, people)
+            .unwrap();
+        interpreter.reconcile_controllers(world).unwrap();
+        world.repair_grid().unwrap();
+        world.rebuild_rooms().unwrap();
+        interpreter.assign_rooms(world).unwrap();
+        world.update_rooms().unwrap();
+        world.discard_removals();
+        let (id, family) = neighborhood.family_in(5).unwrap();
+        let magic = family.magic_history().unwrap();
+        world
+            .select_family(id as i16, 5, family.budget, magic)
+            .unwrap();
+        then(interpreter, world, people);
+    });
+}
+
+/// Load step 13 on the Goth house: the original visits all 382 objects in
+/// registration order. Here the first 201 visits run, and the step stops
+/// at visit 202, the first person's, which is not ported.
+///
+/// A trace of the original loading this house, taken by the old
+/// prototype's harness, was compared with this run outside the
+/// repository; the trace is private. It holds a full state only at the
+/// step's entry, at the entry and the return of the indicators' creation
+/// (0x445e4a) in the middle of visit 140, and at the step's return. For
+/// every visit it holds each call of "run this object's function"
+/// (0x422d46).
+///
+/// Equal to the trace:
+///
+/// - For each of the 201 visits: the object visited, and the calls of
+///   0x422d46 the visit makes, as object and function, in order (525
+///   calls).
+/// - In the middle of visit 140, at the moment the visit creates the
+///   indicators: for all 382 objects the GUID, the 72 data words, temps,
+///   attributes, scheduler word, last result, every frame's tree, node,
+///   stack object, parameters, locals and saved primitive state, the
+///   relationships, the number of slots, the position and the
+///   removal-without-resets mark, and the three people's data; the tick,
+///   the 64 globals, the three random streams, the funds, the removal
+///   queue, the registration order, the instance lists, which rooms wait
+///   to be counted, and the lot arrays inside the lot's size (terrain,
+///   floors, walls, object grids, tile flags, pool, water).
+/// - When the indicators' creation returns: the same, with the two new
+///   indicators, but for object 246, whose visit is not over then, and
+///   the global random stream, which the rest of that visit draws from.
+/// - After visit 201, against the trace at the step's return: the same
+///   object fields for the 201 objects visited and the 4 created (the two
+///   indicators and two objects a script creates). 17 of them differ from
+///   the trace only in their link words (data words 14 and 26), and each
+///   of those is linked there behind an object that is visited later:
+///   that object's rebuild puts it back in front.
+///
+/// What differed: object 19's second frame has tree 0x8118 in the trace
+/// and 0x118 here and in the house file, as in the tests above, at the
+/// two stops of visit 140. Object 19 is visited after visit 201. Six
+/// type attribute words belong to the game that was running, and were
+/// equal once copied from the trace's start. The C runtime stream is
+/// equal as built here: the trace's stream starts the load 64 draws on
+/// from its initial state, which is the starting lot's two indicators.
+///
+/// Not compared with the original, because the trace has no state
+/// between visit 140 and the step's return: the global random stream, the
+/// globals, the arrays, the removal queue and which rooms wait to be
+/// counted after visits 141 to 201, and the contents of the objects'
+/// slots and frame storage at any time (the trace holds neither; the
+/// frames' locals, which come out of the frame storage, are compared).
+/// Visits 202 to 382 do not run.
+///
+/// The digest is of our own state, as built here.
+#[test]
+fn the_goth_house_objects_are_visited_up_to_the_first_person() {
+    const VISITED: &str = "13ae49d59cfa5cc946e9b9522b2e7e8634ec060af08d3df31eadd566057d5717";
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    selected(std::path::Path::new(&root), |interpreter, world, people| {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut interpreter = *interpreter;
+        interpreter.asked = Some(&asked);
+        let before = world.clone();
+        let done = interpreter.visit_objects(world, people);
+        assert_eq!(done.objects, before.order[..201]);
+        assert_eq!(done.reset.len(), 38);
+        let fault = done.stopped.unwrap();
+        assert_eq!(fault.object, 21);
+        assert!(before.objects[&21].person.is_some());
+        assert_eq!(
+            fault.to_string(),
+            "object 21: unsupported: the visit of a person is not ported"
+        );
+        // The calls of each function: Init, Load, walls changed, placed
+        // and leaving. The failed visit asked nothing.
+        let mut calls = std::collections::BTreeMap::new();
+        for call in asked.borrow().iter() {
+            *calls.entry(call.function).or_insert(0) += 1;
+        }
+        let calls: Vec<(usize, i32)> = calls.into_iter().collect();
+        assert_eq!(calls, [(0, 128), (2, 201), (6, 4), (9, 106), (10, 86)]);
+        // Visit 140 put the first rebuilt object back on the lot, which
+        // made the two indicators. A script made two more objects. All
+        // four went to the head of the registration list.
+        assert_eq!(world.indicators, [383, 384]);
+        assert_eq!(world.order[..4], [386, 385, 384, 383]);
+        assert_eq!(world.order[4..], before.order[..]);
+        assert_eq!(world.instances[&0xfd4f_b8e4], [385, 386]);
+        // Seven controllers asked to be removed in their Load trees.
+        assert_eq!(world.removals, [355, 352, 350, 313, 312, 305, 292]);
+        // The magic controller was looked up for the selected family.
+        assert_eq!(world.instances[&0xb6c9_0029], [376]);
+        assert_eq!((before.globals[36], world.globals[36]), (0, 1));
+        // Nothing here advances the clock or touches the lot's stream.
+        assert_eq!((world.ticks, world.lot_rng), (before.ticks, before.lot_rng));
+        assert_eq!(world.hash_hex(), VISITED);
     });
 }

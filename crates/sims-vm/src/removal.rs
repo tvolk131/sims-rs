@@ -28,10 +28,8 @@
 //! that no person on the lot refers to. Anything else fails with an error
 //! that says what is missing.
 
-use crate::factory::TURN_BUDGET;
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Machine};
-use crate::program::Tree;
 use sims_formats::saved_objects::Person;
 use sims_sim::World;
 
@@ -112,7 +110,7 @@ impl Machine<'_, '_> {
 /// object; here the saved list of uses stands for them. When the object is
 /// itself a person the notification also drops route references to it;
 /// deleting a person is not ported at all.
-fn refers_to(person: &Person, id: u16) -> bool {
+pub(crate) fn refers_to(person: &Person, id: u16) -> bool {
     let names = |action: &sims_formats::saved_objects::Interaction| {
         [action.target, action.icon].contains(&(id as i16))
     };
@@ -250,6 +248,8 @@ impl Interpreter<'_> {
             )));
         }
         world.objects.remove(&id);
+        world.frame_storage.remove(&id);
+        world.fires.retain(|&other| other != id);
         world.order.retain(|&other| other != id);
         // A type's instance list outlives its instances (0x44383c).
         for instances in world.instances.values_mut() {
@@ -265,10 +265,10 @@ impl Interpreter<'_> {
     /// its arguments. Then flag 0x20 of data word 8 and data word 62 are
     /// cleared and the thread restarts at Main.
     ///
-    /// Without one, the object is taken off the lot. If it is being
-    /// deleted that is all. Otherwise its storage is rebuilt, its Init
-    /// runs, and it is put back where it was; that needs placement and is
-    /// not ported, so it fails.
+    /// Without one, an object that is being deleted is taken off the lot
+    /// and that is all. Any other is rebuilt ([`Interpreter::rebuild`]):
+    /// taken off the lot, its storage reset, its Init and a first turn
+    /// run, and put back where it was.
     ///
     /// Either way the scheduler's countdown for the object is dropped and
     /// the object gives up the ownership of interface events.
@@ -290,22 +290,8 @@ impl Interpreter<'_> {
                 "a person's reset is not ported".into(),
             )));
         }
-        let definition = self
-            .catalog
-            .object(object.guid)
-            .ok_or_else(|| fail(Trap::Invalid("object has no definition".into())))?;
-        let tree = self
-            .program
-            .libraries
-            .get(&definition.resource)
-            .and_then(|l| l.callbacks.get(&definition.chunk))
-            .and_then(|table| table.get(RESET))
-            .map_or(0, |f| f.action);
-        if tree != 0 {
-            if !matches!(self.program.tree(definition.resource, tree), Tree::Missing) {
-                let temps = object.temps.clone();
-                self.call(world, id, tree, 0, &temps, 8, TURN_BUDGET)?;
-            }
+        if self.has_function(world, id, RESET) {
+            self.callback(world, id, RESET, 0)?;
             let mut machine = self.machine(world, id, 0, false);
             let object = machine.me_mut().map_err(fail)?;
             object.data[8] &= !0x20;
@@ -316,11 +302,7 @@ impl Interpreter<'_> {
                 .leave_lot(id)
                 .map_err(fail)?;
         } else {
-            return Err(fail(Trap::Unsupported(
-                "resetting an object with no Reset tree rebuilds and replaces it; \
-                 that is not ported"
-                    .into(),
-            )));
+            self.rebuild(world, id)?;
         }
         if let Some(object) = world.objects.get_mut(&id) {
             object.set_countdown(-1);

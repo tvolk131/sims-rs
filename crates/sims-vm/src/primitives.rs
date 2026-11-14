@@ -2,12 +2,16 @@
 //! interpreter. Each returns which branch to take. A primitive with no
 //! implementation fails with [`Trap::Unimplemented`], which names it.
 
+mod create;
 mod events;
 mod expression;
 mod generic;
+mod named_tree;
+mod notify;
 mod object_type;
 mod random;
 mod refresh;
+mod relationship;
 mod remove;
 mod set_to_next;
 mod sleep;
@@ -97,8 +101,13 @@ impl Machine<'_, '_> {
             10 => self.own_events(operands)?.into(),
             18 => self.remove(operands)?,
             23 => self.play_sound(operands)?.into(),
+            24 => self.old_relationship(operands)?.into(),
+            26 => self.relationship(operands)?.into(),
+            28 => self.run_named_tree(operands)?,
             31 => self.set_to_next(operands)?.into(),
+            42 => self.create_object(operands)?.into(),
             32 => self.test_object_type(operands)?.into(),
+            49 => self.notify()?.into(),
             opcode => return Err(Trap::Unimplemented { opcode }),
         })
     }
