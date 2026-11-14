@@ -10,7 +10,7 @@ use sims_ui::hud::{self, Controls};
 
 fn digest(frame: &Frame) -> String {
     let mut hash = Sha256::new();
-    for pixel in &frame.rgb {
+    for pixel in frame.rgb() {
         hash.update(pixel);
     }
     format!("{:x}", hash.finalize())

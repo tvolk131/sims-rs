@@ -40,24 +40,60 @@ impl Rect {
     }
 }
 
-/// An RGB image, row by row from the top.
+/// The largest frame side.
+pub const MAX_SIDE: u32 = 16384;
+
+/// An RGB image, row by row from the top. The buffer always holds exactly
+/// `width * height` pixels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
-    pub width: u32,
-    pub height: u32,
-    pub rgb: Vec<[u8; 3]>,
+    width: u32,
+    height: u32,
+    rgb: Vec<[u8; 3]>,
 }
 
 impl Frame {
     /// A frame of `width` by `height` filled with `background`. A size
-    /// above 16384 on a side is clamped to it.
+    /// above [`MAX_SIDE`] is clamped to it.
     pub fn new(width: u32, height: u32, background: [u8; 3]) -> Self {
-        let (width, height) = (width.min(16384), height.min(16384));
+        let (width, height) = (width.min(MAX_SIDE), height.min(MAX_SIDE));
         Self {
             width,
             height,
             rgb: vec![background; width as usize * height as usize],
         }
+    }
+
+    /// A frame over an existing buffer, as a host's canvas. The buffer is
+    /// handed back if its length is not `width * height` or a side is
+    /// above [`MAX_SIDE`].
+    pub fn from_rgb(
+        width: u32,
+        height: u32,
+        rgb: Vec<[u8; 3]>,
+    ) -> std::result::Result<Self, Vec<[u8; 3]>> {
+        if width > MAX_SIDE || height > MAX_SIDE || rgb.len() != width as usize * height as usize {
+            return Err(rgb);
+        }
+        Ok(Self { width, height, rgb })
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// The pixels, row by row from the top.
+    pub fn rgb(&self) -> &[[u8; 3]] {
+        &self.rgb
+    }
+
+    /// The buffer, handed back to the host.
+    pub fn into_rgb(self) -> Vec<[u8; 3]> {
+        self.rgb
     }
 
     fn index(&self, x: i32, y: i32) -> Option<usize> {
@@ -284,7 +320,7 @@ mod tests {
         let mut f = Frame::new(2, 1, [0, 0, 0]);
         f.fill(Rect::new(1, 0, 1, 1), [255, 255, 7]);
         let big = f.upscale(2);
-        assert_eq!((big.width, big.height), (4, 2));
+        assert_eq!((big.width(), big.height()), (4, 2));
         assert_eq!(big.pixel(3, 1), Some([255, 255, 7]));
         assert_eq!(f.quantized().pixel(1, 0), Some([255, 255, 0]));
         let png = f.png();
@@ -298,5 +334,17 @@ mod tests {
         assert!(r.contains(i32::MAX, 0));
         assert!(!r.contains(0, 0));
         assert_eq!(Rect::new(0, 0, -3, 2).width, 0);
+    }
+
+    #[test]
+    fn a_buffer_of_the_wrong_length_is_handed_back() {
+        assert_eq!(Frame::from_rgb(1, 1, vec![]), Err(vec![]));
+        assert_eq!(
+            Frame::from_rgb(MAX_SIDE + 1, 0, vec![]),
+            Err(Vec::<[u8; 3]>::new())
+        );
+        let f = Frame::from_rgb(2, 1, vec![[1, 2, 3]; 2]).unwrap();
+        assert_eq!(f.pixel(1, 0), Some([1, 2, 3]));
+        assert_eq!(f.into_rgb().len(), 2);
     }
 }

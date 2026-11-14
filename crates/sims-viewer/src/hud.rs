@@ -80,10 +80,17 @@ impl Hud {
         };
         let snapshot = Snapshot::read(world, &self.members);
         self.items = hud::layout(view.size, &snapshot, &self.controls);
-        let mut frame = Frame {
-            width: canvas.width as u32,
-            height: canvas.height as u32,
-            rgb: std::mem::take(&mut canvas.color),
+        let (width, height) = (
+            u32::try_from(canvas.width).unwrap_or(u32::MAX),
+            u32::try_from(canvas.height).unwrap_or(u32::MAX),
+        );
+        let mut frame = match Frame::from_rgb(width, height, std::mem::take(&mut canvas.color)) {
+            Ok(frame) => frame,
+            // A canvas the frame cannot take: leave it as drawn.
+            Err(rgb) => {
+                canvas.color = rgb;
+                return;
+            }
         };
         hud::draw(
             &mut frame,
@@ -92,7 +99,7 @@ impl Hud {
             &self.items,
             &self.controls,
         );
-        canvas.color = frame.rgb;
+        canvas.color = frame.into_rgb();
     }
 
     /// Whether the panel covers `point` (canvas pixels).

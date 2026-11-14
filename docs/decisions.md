@@ -44,6 +44,9 @@ its larger sizes is **unverified**.
 - the counter beside the mood face (its source is not found; it may be
   an expansion pack's coins), and the help button;
 - the activity icons over the portraits and the motive trend arrows;
+- a family too large for one row: portraits wrap into a second row
+  before the gadget (four columns at 800×600, so eight fit), and anyone
+  past two rows is left out;
 - which rotate button turns which way in the simulation's terms;
 - the clock in the afternoon and the funds when negative.
 

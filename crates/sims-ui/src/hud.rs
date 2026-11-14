@@ -458,13 +458,22 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
 /// The live-mode strip: portraits at the left, the gadget and the needs
 /// at the right.
 fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls: &Controls) {
+    let gadget = Rect::new(strip.x + strip.width - NEEDS_WIDTH, strip.y, 108, STRIP);
     // The portraits, 45 by 45 from (9, 5) in a strip (the old prototype's
-    // padding).
+    // padding), in as many columns as fit before the gadget and two rows:
+    // four columns at 800 by 600, so a family of eight fits. The second
+    // row is **unverified**; people past the two rows are left out.
+    let columns = ((gadget.x - strip.x - 9) / 45).max(1);
     for (n, resident) in snapshot.residents.iter().enumerate() {
-        let x = strip.x + 9 + 45 * n as i32;
+        let n = i32::try_from(n).unwrap_or(i32::MAX);
+        if n >= columns.saturating_mul(2) {
+            break;
+        }
+        let x = strip.x + 9 + 45 * (n % columns);
+        let y = strip.y + 5 + 45 * (n / columns);
         let selected = snapshot.selected == Some(resident.object);
         items.push(Item {
-            rect: Rect::new(x, strip.y + 5, 45, 45),
+            rect: Rect::new(x, y, 45, 45),
             kind: Kind::Portrait {
                 guid: resident.guid,
                 selected,
@@ -474,7 +483,6 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             }),
         });
     }
-    let gadget = Rect::new(strip.x + strip.width - NEEDS_WIDTH, strip.y, 108, STRIP);
     items.push(Item {
         rect: gadget,
         kind: Kind::Image(id::GAUGE),
@@ -652,9 +660,13 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                     let w = i32::try_from(image.width).unwrap_or(0);
                     let h = i32::try_from(image.height).unwrap_or(0);
                     frame.draw(image, Rect::new(0, 0, w.min(r.width), h), [r.x, r.y]);
-                    let end = r.width.min(i32::try_from(frame.width).unwrap_or(0) - r.x);
-                    for x in w..end {
-                        frame.draw(image, Rect::new(w - 1, 0, 1, h), [r.x + x, r.y]);
+                    // The last column repeated across the part of the
+                    // item that is inside the frame.
+                    let left = i64::from(r.x);
+                    let start = i64::from(w).max(-left);
+                    let end = i64::from(r.width).min(i64::from(frame.width()) - left);
+                    for x in start..end {
+                        frame.draw(image, Rect::new(w - 1, 0, 1, h), [(left + x) as i32, r.y]);
                     }
                 }
             }
@@ -666,10 +678,10 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                 let hover = controls.pointer.is_some_and(|[x, y]| r.contains(x, y));
                 let cell = if *selected {
                     Cell::Selected
-                } else if hover {
-                    Cell::Hover
                 } else if item.command.is_none() {
                     Cell::Disabled
+                } else if hover {
+                    Cell::Hover
                 } else {
                     Cell::Normal
                 };
@@ -705,14 +717,19 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                 align,
             } => {
                 if let Some(font) = art.font(*size) {
-                    let w = font.width(text);
+                    let (x, width, w) = (
+                        i64::from(r.x),
+                        i64::from(r.width),
+                        i64::from(font.width(text)),
+                    );
                     let x = match align {
-                        Align::Left => r.x,
+                        Align::Left => x,
                         // Odd space is split with the extra pixel on the
                         // left, as the original's labels are.
-                        Align::Center => r.x + (r.width - w + 1).div_euclid(2),
-                        Align::Right => r.x + r.width - w,
+                        Align::Center => x + (width - w + 1).div_euclid(2),
+                        Align::Right => x + width - w,
                     };
+                    let x = x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
                     font.draw(frame, text, [x, r.y], *rgb);
                 }
             }
@@ -722,21 +739,38 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                 frame.fill(r.with_size(width, r.height), left);
                 // 0x51376e draws the divider only with two pixels left.
                 if width > 0 && 60 - width > 1 {
-                    frame.fill(Rect::new(r.x + width - 1, r.y, 1, r.height), [0, 0, 0]);
+                    let x = r.x.saturating_add(width - 1);
+                    frame.fill(Rect::new(x, r.y, 1, r.height), [0, 0, 0]);
                 }
             }
         }
     }
 }
 
-/// What a press at `point` asks for: the topmost item there with a
-/// command.
-pub fn press(items: &[Item], point: [i32; 2]) -> Option<Command> {
+impl Item {
+    /// Whether the item stops a press from reaching what is under it.
+    /// Text, mood bars and meters are drawn over the art and let presses
+    /// through; art and buttons, disabled ones too, stop them.
+    fn takes_presses(&self) -> bool {
+        self.command.is_some()
+            || !matches!(
+                self.kind,
+                Kind::Text { .. } | Kind::Bars { .. } | Kind::Meter(_)
+            )
+    }
+}
+
+/// The topmost item at `point` that takes presses.
+fn topmost(items: &[Item], [x, y]: [i32; 2]) -> Option<usize> {
     items
         .iter()
-        .rev()
-        .find(|i| i.command.is_some() && i.rect.contains(point[0], point[1]))
-        .and_then(|i| i.command.clone())
+        .rposition(|i| i.takes_presses() && i.rect.contains(x, y))
+}
+
+/// What a press at `point` asks for: the command of the topmost item
+/// there, if it has one. An item drawn over a button hides it.
+pub fn press(items: &[Item], point: [i32; 2]) -> Option<Command> {
+    items.get(topmost(items, point)?)?.command.clone()
 }
 
 /// Whether the panel covers `point`, so a press there is the panel's and
@@ -747,16 +781,15 @@ pub fn covers(items: &[Item], point: [i32; 2]) -> bool {
 
 /// The item under `point` that a press would act on, for hover changes.
 pub fn hovered(items: &[Item], point: Option<[i32; 2]>) -> Option<usize> {
-    let [x, y] = point?;
-    items
-        .iter()
-        .rposition(|i| i.command.is_some() && i.rect.contains(x, y))
+    let n = topmost(items, point?)?;
+    items[n].command.is_some().then_some(n)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::household::Resident;
+    use sims_formats::bitmap::Image;
 
     fn snapshot() -> Snapshot {
         Snapshot {
@@ -812,6 +845,115 @@ mod tests {
             press(&wide, [1280 - 388 + 50, 720 - 100 + 15]),
             Some(Command::OpenPanel(Panel::Interests))
         );
+        // In a narrow window the cluster covers the gadget, and a press
+        // there does not reach the gadget's buttons under it.
+        let narrow = layout([400, 600], &snapshot(), &controls);
+        assert_eq!(press(&narrow, [60, 530]), None);
+        assert_eq!(hovered(&narrow, Some([60, 530])), None);
+    }
+
+    #[test]
+    fn a_large_family_wraps_before_the_gadget() {
+        let mut big = snapshot();
+        big.residents = (1..=9)
+            .map(|object| Resident {
+                object,
+                guid: u32::from(object),
+                motives: [0.; 16],
+            })
+            .collect();
+        let controls = Controls {
+            expanded: true,
+            ..Controls::default()
+        };
+        let items = layout([800, 600], &big, &controls);
+        let portraits: Vec<Rect> = items
+            .iter()
+            .filter(|i| matches!(i.kind, Kind::Portrait { .. }))
+            .map(|i| i.rect)
+            .collect();
+        // Four columns and two rows; the ninth is left out.
+        assert_eq!(portraits.len(), 8);
+        assert_eq!(portraits[4], Rect::new(229, 550, 45, 45));
+        assert!(portraits.iter().all(|r| r.x + r.width <= 800 - 387));
+    }
+
+    #[test]
+    fn a_disabled_button_shows_its_disabled_cell_under_the_pointer() {
+        let mut art = Art::default();
+        // Four 1-pixel cells: normal, selected, hover, disabled.
+        art.insert(
+            id::ZOOM_OUT,
+            Image {
+                width: 4,
+                height: 1,
+                rgba: [
+                    [1, 0, 0, 255],
+                    [2, 0, 0, 255],
+                    [3, 0, 0, 255],
+                    [4, 0, 0, 255],
+                ]
+                .concat(),
+            },
+        );
+        let item = Item {
+            rect: Rect::new(0, 0, 1, 1),
+            kind: Kind::Button {
+                id: id::ZOOM_OUT,
+                cells: 4,
+                selected: false,
+            },
+            command: None,
+        };
+        let controls = Controls {
+            pointer: Some([0, 0]),
+            ..Controls::default()
+        };
+        let mut frame = Frame::new(1, 1, [0; 3]);
+        draw(&mut frame, &art, &Faces::default(), &[item], &controls);
+        assert_eq!(frame.pixel(0, 0), Some([4, 0, 0]));
+    }
+
+    #[test]
+    fn items_at_the_edges_of_i32_do_not_overflow() {
+        let mut art = Art::default();
+        art.insert(
+            id::STRIP,
+            Image {
+                width: 1,
+                height: 1,
+                rgba: vec![9, 9, 9, 255],
+            },
+        );
+        let mut frame = Frame::new(2, 2, [0; 3]);
+        let items: Vec<Item> = [i32::MIN, i32::MAX]
+            .into_iter()
+            .flat_map(|x| {
+                [
+                    Kind::Stretched(id::STRIP),
+                    Kind::Meter(50.),
+                    Kind::Text {
+                        text: "x".into(),
+                        size: 8,
+                        rgb: GREEN,
+                        align: Align::Right,
+                    },
+                ]
+                .map(|kind| Item {
+                    rect: Rect::new(x, 0, i32::MAX, 1),
+                    kind,
+                    command: None,
+                })
+            })
+            .collect();
+        draw(
+            &mut frame,
+            &art,
+            &Faces::default(),
+            &items,
+            &Controls::default(),
+        );
+        assert_eq!(frame.pixel(1, 1), Some([0; 3]));
     }
 
     #[test]
