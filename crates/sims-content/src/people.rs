@@ -2,7 +2,7 @@
 //! records, to construct the people a house's saved objects include: their
 //! skeletons and the profiles their resets read.
 
-use crate::index::{far_members, sorted_entries};
+use crate::index::{all_far_members, sorted_entries};
 use crate::install::resolve;
 use crate::{Catalog, Error, Index, Install, Resource, Result};
 use sims_formats::avatar::read_bcf;
@@ -54,6 +54,12 @@ pub struct Profile {
     /// The skin tone names: string table 8192 of the type's semi-global
     /// file, in order. Empty when the file or the table is missing.
     pub tones: Vec<String>,
+    /// Strings 3 to 6 of the type's body strings, counting from 0, which
+    /// the animator binds its anchors to (0x5924a4): the bone that holds
+    /// the head's point ("HEAD"), that point's name ("Top"), the bone that
+    /// holds the hand's ("R_HAND") and that point's name ("Palm"). None
+    /// is a string the table does not have.
+    pub rig: [Option<String>; 4],
 }
 
 /// The skeletons and profiles of a set of person types.
@@ -74,6 +80,9 @@ const BODY_STRINGS: usize = 19 * 2;
 const GENDER: usize = 12;
 const AGE: usize = 13;
 const SKIN: usize = 14;
+/// The first of the four body strings the animator's anchors read
+/// (0x5924a4), counting from 0.
+const RIG: usize = 3;
 
 /// The string table of a semi-global file that names the skin tones.
 const SKIN_TONES: u16 = 8192;
@@ -138,6 +147,7 @@ impl People {
                     age: row(AGE),
                     skin: row(SKIN),
                     tones,
+                    rig: std::array::from_fn(|i| row(RIG + i)),
                 },
             );
             let location = resource.location(&index.root);
@@ -255,7 +265,7 @@ fn skeleton_files(install: &Install, index: &Index) -> Result<BTreeMap<String, S
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("far"));
             if is_archive && path.is_file() {
-                for member in far_members(&path)? {
+                for member in all_far_members(&path)? {
                     resources.push(Resource {
                         mount: 0,
                         path: path.clone(),

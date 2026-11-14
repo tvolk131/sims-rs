@@ -46,6 +46,13 @@ change and that stop are not seen.
 
 The executable digests that guest/launch.sh verified (share/game-identity.txt)
 are recorded in status.json and as a game_identity event.
+
+--scenario FILE (with --guest-dir) drives the game through a scripted input
+scenario (input.py has the format) and logs it to input.jsonl. It adds a
+breakpoint at 0x48ddcb, where the pie menu pushes the chosen action on a
+person, and keeps the lot update's entry armed, so each push is placed
+before or inside a lot update. Input reaches the game only as pointer moves,
+button presses and keys; nothing is written to guest memory.
 """
 import argparse
 import gzip
@@ -62,6 +69,7 @@ from rsp import Remote  # noqa: E402
 from qmp import Qmp  # noqa: E402
 import qemu_retained_owners  # noqa: E402
 import qemu_neighborhood_owners as neighborhood_owners  # noqa: E402
+import input as scenario_input  # noqa: E402
 
 ENTRY, RETURN = 0x46d345, 0x46d51d
 DIALOG_SHOW, DIALOG_RESULT, DIALOG_READ = 0x436da0, 0x4370be, 0x43718f
@@ -385,6 +393,10 @@ def main():
                     'where QEMU writes the dump before it is moved to the output')
     ap.add_argument('--watch', action='append', default=[], type=Watch,
                     help='NAME=EXPR[:SIZE]: log every write to these bytes to watch.jsonl (see above)')
+    ap.add_argument('--scenario', type=Path, help='run this input scenario (see input.py); needs --guest-dir. '
+                    'Logged to input.jsonl')
+    ap.add_argument('--window', default=os.environ.get('SIMS_WINDOW', scenario_input.WINDOW),
+                    help='the game window in the guest, for --scenario')
     ap.add_argument('--resume', action='store_true',
                     help='take over a guest that an earlier run of this script left stopped at a breakpoint '
                          '(it was killed, not detached): continue its output directory and numbering')
@@ -393,6 +405,17 @@ def main():
     dump_set = parse_set(args.dump)
     if dump_set and not args.guest_dir:
         ap.error('--dump needs --guest-dir')
+    if args.scenario and not args.guest_dir:
+        ap.error('--scenario needs --guest-dir')
+    if args.scenario and args.resume:
+        # A new runner would start the scenario again from its first step.
+        ap.error('--scenario cannot be resumed')
+    try:
+        steps = scenario_input.parse_scenario(args.scenario.read_text()) if args.scenario else None
+        if steps is not None:
+            scenario_input.check_window(args.window)
+    except scenario_input.ScenarioError as e:
+        ap.error(str(e))
     out = args.output
     out.mkdir(parents=True, exist_ok=args.resume)
     events = open(out / 'events.jsonl', 'a')
@@ -414,6 +437,12 @@ def main():
     identity = game_identity(args.container)
     status['game_identity'] = identity
     event(kind='game_identity', files=identity, verified=identity is not None)
+    runner = None
+    if steps is not None:
+        agent = scenario_input.Agent(args.guest_dir / 'share', args.window)
+        runner = scenario_input.Runner(steps, agent, out / 'input.jsonl', shots_dir=out / 'input-shots')
+        runner.write(kind='scenario', status='loaded', file=str(args.scenario), steps=len(steps),
+                     agent_started=agent.start())
     remote = Remote(args.container)
     breaks = set()
 
@@ -538,7 +567,7 @@ def main():
     try:
         reply = remote.stop_reply()
         event(kind='attach', reply=reply, resume=args.resume, updates=updates)
-        for a in (ENTRY, RETURN, DIALOG_SHOW, DIALOG_RESULT, DIALOG_READ, 0x415eff):
+        for a in (ENTRY, RETURN, DIALOG_SHOW, DIALOG_RESULT, DIALOG_READ, 0x415eff, scenario_input.QUEUE_PUSH):
             remote.clear_break(a)
             if args.resume:
                 remote.clear_break(a)
@@ -546,7 +575,9 @@ def main():
             arm(a)
         if baseline and updates + 1 in dump_set:
             arm(ENTRY)  # taken over before a dump at the next entry (or in the middle of it)
-        if watches:
+        if runner:
+            arm(scenario_input.QUEUE_PUSH)
+        if watches or runner:
             arm(ENTRY)
             if args.resume:
                 # Whether the guest is inside a lot update is known again at its next entry or return.
@@ -611,7 +642,7 @@ def main():
                           packets=remote.packets, sim=regs['ecx'])
                     if 1 in dump_set:  # the baseline is the entry of lot update 1
                         save_dump(1, regs, raw)
-                    if not watches:
+                    if not (watches or runner):
                         disarm(ENTRY)
                     arm(RETURN)
                     in_update = True
@@ -619,7 +650,7 @@ def main():
                     in_update = True
                     if updates + 1 in dump_set:
                         save_dump(updates + 1, regs, raw)
-                    if not watches:
+                    if not (watches or runner):
                         disarm(ENTRY)
                 else:
                     elsewhere += 1
@@ -654,8 +685,12 @@ def main():
                     updates_log.write(json.dumps(row) + '\n')
                     updates_log.flush()
                     save_status(updates=updates, last=row)
+                    if runner and baseline:
+                        runner.on_update(updates, m, sim)
                     if updates + 1 in dump_set:
                         arm(ENTRY)
+            elif runner and pc == scenario_input.QUEUE_PUSH:
+                runner.on_queue_push(updates + 1, bool(in_update), m, regs)
             else:
                 # A dialog function. ecx is the dialog record (0x436da0 keeps it in esi).
                 record = regs['ecx']
@@ -670,6 +705,8 @@ def main():
                 except MemoryError as e:
                     row['error'] = str(e)
                 event(**row)
+                if runner:
+                    runner.on_dialog(row['kind'], updates + 1)
                 if pc == DIALOG_SHOW:
                     save_status(dialog=dict(update=updates + 1, record=record, shown=time.time()))
             if not foreign and live_watches:
@@ -696,6 +733,8 @@ def main():
         save_status(state='error', error=repr(e))
         raise
     finally:
+        if runner:
+            runner.close()
         try:
             if not remote.stopped:
                 remote.interrupt()
