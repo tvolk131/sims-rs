@@ -48,8 +48,9 @@ How it was checked:
 - A gated test (`SIMS_INSTALL`) decodes every sound file, shadowed
   duplicates included, and pins counts per format and variant, total
   frames, and an FNV-1a digest per format. It takes about 40 seconds in a
-  debug build. A slower ignored test decodes all eight hours of MP3 in
-  full.
+  debug build. An ignored test decodes all eight hours of MP3 in full;
+  run once in a release build (24 seconds), every MP3 file decoded and
+  gave as many frames as its frame headers count.
 - **Against FFmpeg.** FFmpeg's `adpcm_ea_maxis_xa` and PCM decoders
   (FFmpeg through PyAV 15.1.0, in a private virtual environment) decoded
   all 17,915 distinct XA files and 285 WAV files. After cutting to the
