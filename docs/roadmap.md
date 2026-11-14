@@ -1319,6 +1319,48 @@ stop-sounds events.
   - Live playback behind a feature.
   - Checking any of it against the original.
 
+## Track: the interface (`crates/sims-ui`)
+
+Goal: the game's interface drawn from the original art: the live-mode
+control panel, dialogs, pie menus, and later the other panels and the
+catalogs. The art goes in the original's layout, adapted to any window
+size. The crate only reads the simulation. Every click becomes a
+`sims_ui::command::Command`, and the host decides what to do with it.
+Drawing goes into a CPU frame, so `cargo test` needs no window.
+
+- **Done: the interface's art.** `sims-formats` reads its BMP and TGA
+  files and `sims-content` reads its resource tables (#62).
+- **Done: the live control panel.** The cluster (modes, camera, speed,
+  clock and funds) and the strip (portraits, mood bars, the gadget and
+  the Needs panel) are drawn at any window size, from a loaded world.
+  Measured against a screenshot of the original at 800×600; the
+  numbers are in the decisions log. The Goths' panel is pinned by
+  digest at 800×600 and 1280×720, gated on `SIMS_INSTALL`. `sims-viewer
+  --hud` shows it over the lot. Camera buttons move the camera; the
+  other commands are printed, since the simulation cannot take them yet.
+- **Next:** a message dialog with buttons drawn from a real dialog
+  string; pie menus; the other live panels.
+- **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
+  - A command intake, for example `World::apply(&mut self, command:
+    sims_sim::Command) -> Result<(), CommandError>`, run between ticks,
+    taking: select a Sim (object ID), set the speed, pause or run, go
+    to a mode, answer a dialog (caller, button), and choose a pie menu
+    entry (Sim, object, interaction).
+  - A library form of the boot's household load (`sims boot` steps 17
+    and 18): `World::load_household(&mut self, family: &Family)` that
+    sets the funds and selects the first member. Today the CLI does it
+    and a host that opens a house gets the house file's funds and no
+    selection.
+  - The household's member order kept in the world, for example
+    `World::household(&self) -> &[u32]` (GUIDs), so the portraits do
+    not need the neighborhood file.
+  - The game speed, for example `World::speed(&self) -> u8`.
+  - A pending dialog's text resolved: `Dialog::text(&self, world:
+    &World) -> DialogText` with the message, the button labels and the
+    title, read from the caller's tree's string table.
+  - Each Sim's current action and its icon, for the icons over the
+    portraits.
+
 ## Working rules
 
 - Work in branches, open PRs, and merge when CI is green on both platforms.
