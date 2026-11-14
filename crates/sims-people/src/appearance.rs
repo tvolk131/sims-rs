@@ -25,7 +25,9 @@
 use crate::assets::Assets;
 use crate::rig;
 use crate::texture::{Texture, read_bmp};
-use sims_formats::avatar::{Appearance, Mesh, Skeleton, read_bcf, read_bmf, read_cmx, read_skn};
+use sims_formats::avatar::{
+    Appearance, Catalog, Mesh, Skeleton, read_bcf, read_bmf, read_cmx, read_skn,
+};
 use sims_formats::saved_objects::Person;
 
 /// The appearances a person wears, each with its texture string.
@@ -150,22 +152,53 @@ pub fn load_skeleton(assets: &Assets, name: &str) -> Result<Skeleton, String> {
         .ok_or_else(|| format!("{file} holds no skeleton named {name:?}"))
 }
 
-/// The appearance named `name`, from `<name>.cmx.bcf` or `<name>.cmx`.
+/// The appearance named `name`: from `<name>.cmx.bcf` or `<name>.cmx`
+/// when that file holds it, otherwise from the first catalog, in name
+/// order, that holds an appearance of that name. Career uniforms need the
+/// second way: `B629MAFitlgt_labtech` is in `b629ma_labtech.cmx`. The old
+/// prototype looked appearances up by their own names the same way
+/// (legacy/crates/sims-content/src/avatar.rs); which catalog the
+/// original takes when two hold the same name is **unverified**.
 pub fn load_appearance(assets: &Assets, name: &str) -> Result<Appearance, String> {
-    let binary = format!("{name}.cmx.bcf");
-    let text = format!("{name}.cmx");
-    let catalog = if assets.contains(&binary) {
-        read_bcf(&assets.read(&binary)?).map_err(|e| format!("{binary}: {e}"))?
-    } else if assets.contains(&text) {
-        read_cmx(&assets.read(&text)?).map_err(|e| format!("{text}: {e}"))?
-    } else {
-        return Err(format!("no catalog holds the appearance {name:?}"));
+    let find = |catalog: Catalog| {
+        catalog
+            .appearances
+            .into_iter()
+            .find(|a| a.name.eq_ignore_ascii_case(name))
     };
-    catalog
-        .appearances
-        .into_iter()
-        .find(|a| a.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| format!("the catalog of {name:?} does not hold it"))
+    for file in [format!("{name}.cmx.bcf"), format!("{name}.cmx")] {
+        if assets.contains(&file)
+            && let Some(appearance) = find(read_catalog(assets, &file)?)
+        {
+            return Ok(appearance);
+        }
+    }
+    for file in assets
+        .names()
+        .filter(|n| n.ends_with(".cmx") || n.ends_with(".cmx.bcf"))
+    {
+        // Skeleton and animation files are not appearance catalogs.
+        if file.ends_with("-skeleton.cmx.bcf") {
+            continue;
+        }
+        let Ok(catalog) = read_catalog(assets, file) else {
+            continue;
+        };
+        if let Some(appearance) = find(catalog) {
+            return Ok(appearance);
+        }
+    }
+    Err(format!("no catalog holds the appearance {name:?}"))
+}
+
+/// A catalog file, binary (`.cmx.bcf`) or text (`.cmx`).
+fn read_catalog(assets: &Assets, file: &str) -> Result<Catalog, String> {
+    let bytes = assets.read(file)?;
+    if file.ends_with(".bcf") {
+        read_bcf(&bytes).map_err(|e| format!("{file}: {e}"))
+    } else {
+        read_cmx(&bytes).map_err(|e| format!("{file}: {e}"))
+    }
 }
 
 /// The mesh named `name`, from `<name>.bmf` or `<name>.skn`.
