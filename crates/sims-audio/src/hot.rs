@@ -37,6 +37,11 @@ use crate::hsm::Symbols;
 use crate::{Error, Result};
 use std::collections::BTreeMap;
 
+/// The most hit list entries one HOT file may hold, ranges expanded. The
+/// install's largest holds 3,661; the cap keeps a hostile file from
+/// expanding a few bytes of ranges into gigabytes.
+pub const MAX_HIT_LIST_ENTRIES: usize = 100_000;
+
 fn fail<T>(line: usize, message: impl Into<String>) -> Result<T> {
     Err(Error::text("HOT", line, message))
 }
@@ -136,6 +141,8 @@ impl Hot {
         let text: String = bytes.iter().map(|&b| char::from(b)).collect();
         let mut hot = Self::default();
         let mut section = String::new();
+        // Hit list entries so far, ranges expanded.
+        let mut entries = 0usize;
         for (index, line) in text.split('\n').enumerate() {
             let line = line.trim_end_matches('\r');
             let number_of = index + 1;
@@ -194,13 +201,24 @@ impl Hot {
                         let range = item
                             .split_once('-')
                             .and_then(|(low, high)| Some((read(low)?, read(high)?)));
-                        match (read(item), range) {
-                            (Some(patch), _) => patches.push(patch),
+                        let more = match (read(item), range) {
+                            (Some(patch), _) => vec![patch],
                             (None, Some((low, high))) if low <= high && high - low <= 10_000 => {
-                                patches.extend(low..=high);
+                                (low..=high).collect()
                             }
-                            _ => hot.hit_list_unread.push((list, item.trim().to_owned())),
+                            _ => {
+                                hot.hit_list_unread.push((list, item.trim().to_owned()));
+                                continue;
+                            }
+                        };
+                        entries += more.len();
+                        if entries > MAX_HIT_LIST_ENTRIES {
+                            return fail(
+                                number_of,
+                                format!("hit lists hold more than {MAX_HIT_LIST_ENTRIES} entries"),
+                            );
                         }
+                        patches.extend(more);
                     }
                     hot.hit_lists.insert(list, patches);
                 }
