@@ -1328,10 +1328,15 @@ Progress:
   original's code does; the lot lies on the screen as the lot drawing has
   it. Catalogs load in the original's order, and the head turns as the
   simulation says.
-- Next: compare the standing loop; record the original's lighting (room
-  light, lamps, the standard light) and how far ours is from it. The base
-  layer's clip and phase are not simulation state yet, so the saved
-  record and the animator's clock stand in.
+- Done: the viewer runs a booted lot (`people-viewer --boot`, through
+  `sims_vm::boot::Lot`) and draws its people after each tick, including
+  people a script makes; it only reads the lot. A gated test runs the
+  Goths' lot to its end (tick 366 today) and draws everyone placed every
+  30 ticks.
+- Next: match the original's lighting (see its decisions entry); compare
+  Mortimer standing without his book. The base layer's clip and phase are
+  not simulation state yet, so the saved record and the animator's clock
+  stand in.
 
 ## Track: lot rendering (`crates/sims-render`)
 
@@ -1382,12 +1387,16 @@ stop-sounds events.
   Volume, pan, pitch and ducking follow the original's formulas, and
   the output is stereo. The `render_event` example writes events to a
   WAV file.
+- **Done: event kinds.** Fades, television and radio stations (built
+  from their directories, as the original does), sequenced hit lists,
+  `radio_next_song` and the kill events follow the original's
+  dispatcher. Of the 190 events that were not plays, 29 remain, counted
+  in a gated test: music modes (21), ambience modes (5), the piano,
+  pausing and reloading. 12 more name no track and do nothing.
 - **Next:**
   - The simulation emits `SoundEvent`s (the interface is in the
     decisions log).
-  - The 190 events of other kinds (music modes, TV, sequenced hit
-    lists).
-  - The FSC ambient player.
+  - The FSC ambient player (ambience modes).
   - Live playback behind a feature.
   - Checking any of it against the original.
 
