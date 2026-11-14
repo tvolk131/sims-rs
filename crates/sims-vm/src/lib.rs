@@ -37,6 +37,7 @@ mod error;
 mod factory;
 mod fault;
 mod frame;
+mod head;
 mod interpreter;
 mod load;
 mod memory;

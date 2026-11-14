@@ -218,13 +218,25 @@ impl Advertisement {
 
 /// An entry the scan looks at (0x41f00e): the interaction target, the
 /// entry's menu number (its TTAB string index), its attenuation and
-/// whether its flag bit 8 is set.
+/// whether its flag bit 8 is set. `join` marks the entry that joins a
+/// person's running interaction (0x41ee99), whose word +0 is 1 rather
+/// than 0; the check (0x458372) reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Entry {
     target: u16,
     menu: u32,
     attenuation: F32,
     first: bool,
+    join: bool,
+}
+
+/// The arguments of an entry's check tree (0x458354 to 0x458385): 1 (the
+/// scan's flag), then 1 for the entry that joins a running interaction
+/// and 0 for any other, then the join entry's word +0x18, which 0x41ee99
+/// clears, and 0; then the tree's ID, the word that follows the four in
+/// the original's memory.
+fn check_arguments(join: bool, tree: u16) -> [i16; 5] {
+    [1, i16::from(join), 0, 0, tree as i16]
 }
 
 /// A candidate (16 bytes at person +0x814): the object, the menu entry,
@@ -658,9 +670,20 @@ impl Machine<'_, '_> {
     ///   word 34 is 0 and the target is in a room.
     ///
     /// A target whose type is 7 has no entries for a person that is not a
-    /// pet. For a person target whose running interaction may be joined,
-    /// the original adds an entry to join it (0x41ee99); that is not
-    /// ported and fails.
+    /// pet.
+    ///
+    /// A person target (type 2) whose running interaction has the flag
+    /// 0x2 (joinable) in its own table gets one more entry, after the
+    /// others (0x458aee, 0x41ee99). That entry goes to the interaction
+    /// target of the running interaction's target. Its menu number is the
+    /// joining index of that target's first entry with the running
+    /// interaction's menu number. The attenuation and flag bit 8 come as
+    /// for any entry. If that first entry is missing, or the joining
+    /// index is -1, or no entry has the joining index, the original
+    /// leaves the entry without a target; the check (0x458319) then
+    /// returns at once, before any side effect, so the entry is left out
+    /// here. The rest of the entry is copied from the running action;
+    /// the scan reads none of it but word +0 (see [`Entry`]).
     fn autonomy_entries(&self, chooser: &Chooser, target: u16) -> Result<Vec<Entry>, Trap> {
         let object = &self.world.objects[&target];
         let kind = self.definition_words(object.guid)?[TYPE];
@@ -721,10 +744,18 @@ impl Machine<'_, '_> {
                 .and_then(|table| find(table, active.table_index as u32))
                 .is_some_and(|record| record.flags & entry::JOINABLE != 0);
             if joinable {
-                return Err(Trap::Unsupported(format!(
-                    "person {target}'s running interaction may be joined; the entry to join it \
-                     (0x41ee99) is not ported"
-                )));
+                // `joinable` holds only if the target exists.
+                let goes_to = self.interaction_target(active.target as u16)?;
+                if let Some(table) = self.table(goes_to)?
+                    && let Some(running) = find(table, active.table_index as u32)
+                    && running.joining_index != -1
+                    && find(table, running.joining_index as u32).is_some()
+                {
+                    let menu = running.joining_index as u32;
+                    let mut entry = self.autonomy_entry(chooser, goes_to, table, menu);
+                    entry.join = true;
+                    entries.push(entry);
+                }
             }
         }
         Ok(entries)
@@ -755,6 +786,7 @@ impl Machine<'_, '_> {
             menu,
             attenuation,
             first,
+            join: false,
         }
     }
 
@@ -774,7 +806,8 @@ impl Machine<'_, '_> {
     /// An entry still allowed has its advertisements copied, and its check
     /// tree, if it has one, decides: the tree of the target's type runs
     /// synchronously on the person's stack (0x4749b5), with the target as
-    /// its stack object and the arguments 1, 0, 0, 0 and the tree's ID
+    /// its stack object and the arguments 1, 0, 0, 0 (1, 1, 0, 0 for a
+    /// join entry) and the tree's ID
     /// (the word that follows the original's four in memory). The
     /// person's temps are saved before the first check tree of the scan.
     /// Last, if the target is in another room than the person, the room
@@ -866,7 +899,7 @@ impl Machine<'_, '_> {
                 *saved = Some(self.me()?.temps.clone());
             }
             let tree = record.test;
-            let args = [1, 0, 0, 0, tree as i16];
+            let args = check_arguments(entry.join, tree);
             let mut scratch = Some(ads);
             let result = self
                 .interpreter()
@@ -924,4 +957,15 @@ pub(crate) fn find(table: &InteractionTable, menu: u32) -> Option<&Interaction> 
         .interactions
         .iter()
         .find(|interaction| interaction.string_index == menu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_join_entry_runs_its_check_with_a_second_argument_of_1() {
+        assert_eq!(check_arguments(false, 0x1234), [1, 0, 0, 0, 0x1234]);
+        assert_eq!(check_arguments(true, 0x1234), [1, 1, 0, 0, 0x1234]);
+    }
 }

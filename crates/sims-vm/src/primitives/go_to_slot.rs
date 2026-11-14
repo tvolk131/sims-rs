@@ -19,7 +19,8 @@
 //!   chosen (`routing/portals.rs`), and its door tree is pushed on the
 //!   person's thread; the step stays 2 while that tree runs.
 //! - **18**: the route there is planned (0x45c38e); with a route ready
-//!   (2), the next step is 12.
+//!   (2), the next step is 12. With no way found (0) the next step is 6,
+//!   which is not ported.
 //! - **12**: the animator starts the route (0x589c85); the next step is 3
 //!   and the thread yields.
 //! - **3**, on the ticks after: while the animator's route is under way
@@ -356,6 +357,16 @@ impl Machine<'_, '_> {
                         .route_to_slot(self.world, &mut ctx, &mut path)
                         .map_err(inner)?;
                     result = planned;
+                    if planned == 0 {
+                        // 0x45b2ab: no way; step 6 (0x45b066) tries again,
+                        // and asks a person in the way to move (0x45ba28,
+                        // step 14).
+                        return Err(unsupported(
+                            "0x45b066",
+                            "whose planning found no way: step 6, which tries again and asks \
+                             a person in the way to move (0x45ba28)",
+                        ));
+                    }
                     if planned != 2 {
                         return Err(unsupported(
                             "0x45b285",

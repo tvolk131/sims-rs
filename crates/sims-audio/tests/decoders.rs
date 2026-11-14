@@ -10,7 +10,7 @@ fn xa_file(channels: u16, rate: u32, decoded_bytes: u32, body: &[u8]) -> Vec<u8>
     out.extend(1u16.to_le_bytes());
     out.extend(channels.to_le_bytes());
     out.extend(rate.to_le_bytes());
-    out.extend((rate * 2 * u32::from(channels)).to_le_bytes());
+    out.extend(rate.wrapping_mul(2 * u32::from(channels)).to_le_bytes());
     out.extend((2 * channels).to_le_bytes());
     out.extend(16u16.to_le_bytes());
     out.extend(body);
@@ -229,7 +229,7 @@ fn wav_reads_pcm_and_skips_padded_chunks() {
     assert_eq!(pcm.frames(), 2);
     assert_eq!(wav::format(&bytes).unwrap().bits, 16);
     // Our own writer reads back.
-    assert_eq!(wav::decode(&pcm.to_wav()).unwrap(), pcm);
+    assert_eq!(wav::decode(&pcm.to_wav().unwrap()).unwrap(), pcm);
 }
 
 #[test]
@@ -294,7 +294,9 @@ fn kinds_are_sniffed_from_magic_numbers() {
         samples: vec![5, -5],
     };
     assert_eq!(
-        sims_audio::decode::decode(&pcm.to_wav()).unwrap().unwrap(),
+        sims_audio::decode::decode(&pcm.to_wav().unwrap())
+            .unwrap()
+            .unwrap(),
         pcm
     );
 }
@@ -354,4 +356,30 @@ fn sound_files_mount_archives_in_their_directory() {
     assert_eq!(shadowed.len(), 2);
     assert!(files.problems.is_empty());
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn xa_checks_the_claimed_size_against_the_payload_before_allocating() {
+    // A bare header claiming 0xfffffffc bytes holds no samples; it fails
+    // without reserving memory for the claim.
+    let error = xa::decode(&xa_file(1, 22050, 0xffff_fffc, &[])).unwrap_err();
+    assert!(error.to_string().contains("at most 0 of"), "{error}");
+    // Stereo: one whole frame (30 bytes) holds 56 samples.
+    assert!(xa::decode(&xa_file(2, 22050, 56 * 2, &[0; 30])).is_ok());
+    let error = xa::decode(&xa_file(2, 22050, 58 * 2, &[0; 30])).unwrap_err();
+    assert!(error.to_string().contains("at most 56 of 58"), "{error}");
+}
+
+#[test]
+fn writing_a_wav_whose_sizes_overflow_is_an_error() {
+    // An XA file may claim any rate; its byte rate does not fit a WAV.
+    let pcm = xa::decode(&xa_file(1, u32::MAX, 2, &[0; 15])).unwrap();
+    let error = pcm.to_wav().unwrap_err();
+    assert!(error.to_string().contains("byte rate"), "{error}");
+    let silent = Pcm {
+        rate: 22050,
+        channels: 0,
+        samples: Vec::new(),
+    };
+    assert!(silent.to_wav().is_err());
 }
