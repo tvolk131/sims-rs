@@ -31,9 +31,11 @@
 //! (`selection.rs`), which leave the lot as the first tick finds it.
 
 mod animator;
+mod clip_events;
 mod error;
 mod factory;
 mod fault;
+mod frame;
 mod interpreter;
 mod load;
 mod memory;
@@ -51,6 +53,7 @@ mod selection;
 mod tick;
 mod visits;
 
+pub use animator::snap_to_path;
 pub use error::Error;
 pub use factory::TURN_BUDGET;
 pub use fault::{Fault, Location, Trap};

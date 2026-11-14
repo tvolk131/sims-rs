@@ -2,7 +2,8 @@
 
 The stub listens on the container's loopback; a perl relay started with
 `docker exec -i` carries the bytes. Only reads, hardware breakpoints,
-continue and detach are sent: nothing writes guest memory or registers.
+write watchpoints, continue, step and detach are sent: nothing writes guest
+memory or registers.
 """
 import os
 import select
@@ -34,7 +35,7 @@ class Remote:
         self.packets = 0
 
     def send(self, payload):
-        allowed = ('m', 'Z1,', 'z1,', 'qXfer:features:read:', 'p')
+        allowed = ('m', 'Z1,', 'z1,', 'Z2,', 'z2,', 'qXfer:features:read:', 'p')
         assert payload in ('?', 'g', 'c', 's', 'D', 'qSupported') or payload.startswith(allowed), payload
         data = payload.encode()
         self.p.stdin.write(b'$' + data + b'#' + f'{sum(data) & 255:02x}'.encode())
@@ -144,6 +145,16 @@ class Remote:
     def clear_break(self, address):
         r = self.command(f'z1,{address:x},1')
         assert r in ('OK', 'E22'), (hex(address), r)
+
+    def set_watch(self, address, size):
+        """A write watchpoint (GDB's Z2). The guest stops after the writing instruction; the stop
+        reply holds `watch:<address>`."""
+        r = self.command(f'Z2,{address:x},{size:x}')
+        assert r == 'OK', (hex(address), size, r)
+
+    def clear_watch(self, address, size):
+        r = self.command(f'z2,{address:x},{size:x}')
+        assert r in ('OK', 'E22'), (hex(address), size, r)
 
     def detach(self):
         try:

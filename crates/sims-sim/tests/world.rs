@@ -276,6 +276,7 @@ fn animator() -> Animator {
         F32::from_bits(0x4479_c000),
         30,
         true,
+        0,
         true,
         4_422_300,
     );
@@ -320,7 +321,65 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "67f6d55218dde3333e03d82ef2b1648f59e3b6ec3d67fb63477f96358039baec";
+const PINNED: &str = "0caafc6a30ff53da1bd3e8d59d36fc08216033a2c6c12304b89a32580939a1b5";
+
+/// The encoding of `world` as snapshot format 13 wrote it. Format 14
+/// added three fields: at the end of an animator whether the house view has
+/// drawn its person yet ([`Animator::undrawn`]) and whether it walks
+/// ([`Animator::walking`]), and at the end of a layer
+/// where its clip's timed events stand ([`Layer::cursors`], one zero byte
+/// when there are none). The animators come last but for the usage counts
+/// and the routing. This writes them again without those bytes.
+fn format_13_bytes(world: &World) -> Vec<u8> {
+    let mut old = world.clone();
+    old.animators.clear();
+    let mut bytes = old.encode();
+    let mut tail = postcard::to_allocvec(&world.usage).unwrap();
+    tail.extend(postcard::to_allocvec(&world.routing).unwrap());
+    assert_eq!(bytes.split_off(bytes.len() - tail.len()), tail);
+    assert_eq!(bytes.pop(), Some(0));
+    bytes.extend(postcard::to_allocvec(&(world.animators.len() as u64)).unwrap());
+    for (id, animator) in &world.animators {
+        bytes.extend(postcard::to_allocvec(id).unwrap());
+        bytes.extend(animator_13_bytes(animator));
+    }
+    bytes.extend(tail);
+    bytes
+}
+
+/// An animator's encoding under snapshot format 13 ([`format_13_bytes`]):
+/// without its last two bytes, `undrawn` and `walking`, and without its
+/// layer's cursors,
+/// which must be none. What follows the layer is the skin's clock and
+/// flag, the appearance flag and the motion.
+fn animator_13_bytes(animator: &Animator) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(animator).unwrap();
+    assert_eq!(bytes.pop(), Some(u8::from(animator.walking)));
+    assert_eq!(bytes.pop(), Some(u8::from(animator.undrawn)));
+    let after = postcard::to_allocvec(&(
+        animator.skin_clock,
+        animator.skin_dirty,
+        animator.profile_stale,
+        &animator.motion,
+    ))
+    .unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - after.len()), after);
+    if let Some(layer) = &animator.foreground {
+        assert!(layer.cursors.is_empty());
+        assert_eq!(bytes.pop(), Some(0));
+    }
+    bytes.extend(after);
+    bytes
+}
+
+#[test]
+fn without_drawing_or_timed_events_the_encoding_is_format_13() {
+    // Snapshot format 14 added the animator's flags that its person has
+    // not been drawn and that it walks, and the layer's timed event
+    // cursors.
+    assert_eq!(digest(&format_13_bytes(&world())), PINNED_13);
+}
+const PINNED_13: &str = "67f6d55218dde3333e03d82ef2b1648f59e3b6ec3d67fb63477f96358039baec";
 
 /// The encoding of `world` with no routing and its one animator with no
 /// route ([`Motion::NONE`]), minus the bytes those encode to: what
@@ -338,7 +397,7 @@ fn format_12_bytes(mut world: World) -> Vec<u8> {
         None => Vec::new(),
     };
     let usage = postcard::to_allocvec(&world.usage).unwrap();
-    let mut bytes = world.encode();
+    let mut bytes = format_13_bytes(&world);
     assert_eq!(bytes.split_off(bytes.len() - 3), [0; 3]);
     let usage_bytes = bytes.split_off(bytes.len() - usage.len());
     assert_eq!(usage_bytes, usage);
@@ -483,6 +542,16 @@ fn any_field_change_changes_the_hash() {
     changed.animators.get_mut(&5).unwrap().motion.segment = 2;
     assert_ne!(changed.hash(), base);
     let mut changed = world();
+    changed.animators.get_mut(&5).unwrap().undrawn = false;
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.animators.get_mut(&5).unwrap().walking = true;
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    let animator = changed.animators.get_mut(&5).unwrap();
+    animator.foreground.as_mut().unwrap().cursors.push(0);
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
     changed.routing.routes.get_mut(&5).unwrap().path.pop();
     assert_ne!(changed.hash(), base);
     let mut changed = world();
@@ -617,4 +686,13 @@ fn the_house_model_gives_the_usage_counts() {
             routing: 11
         }
     );
+}
+
+#[test]
+fn the_end_of_the_object_read_sets_registry_byte_0x12() {
+    // 0x43fc89, whatever load steps 8 and 9 found.
+    let mut world = World::empty();
+    assert!(!world.neighbors.relationships_changed);
+    world.finish_object_read();
+    assert!(world.neighbors.relationships_changed);
 }

@@ -366,7 +366,9 @@ impl Interpreter<'_> {
     /// 3. The person's animator ticks (its virtual function 0x50, 0x58dc72;
     ///    see [`crate::animator`]).
     /// 4. The room the person was last seen in (person field 0xafc) is
-    ///    brought up to date from data word 29 (0x45e43d). When it changes
+    ///    brought up to date from data word 29 (0x45e43d,
+    ///    [`Interpreter::note_room`]; a walking animator has already done
+    ///    so when it put the person down). When it changes
     ///    a person whose kind (person word 65) is at most 1 leaves the old
     ///    room, if no other person was last seen there (0x46886c), and
     ///    enters the new one (0x468802). An outdoor room ignores both.
@@ -426,7 +428,16 @@ impl Interpreter<'_> {
                 }
             }
         }
+        // The animator's walk notes the room too (0x45e4e9), so the state
+        // goes back before it ticks.
+        world.person_ticks.insert(id, state);
         self.tick_animator(world, id).map_err(fail)?;
+        self.note_room(world, id).map_err(fail)?;
+        let state = world
+            .person_ticks
+            .get(&id)
+            .copied()
+            .unwrap_or(PersonTick::CONSTRUCTED);
         let outdoor_score = world.rooms.outdoor_score;
         // The score of a room that exists (0x45cef4).
         let score = |room: &Room| {
@@ -436,53 +447,16 @@ impl Interpreter<'_> {
                 room.score
             }
         };
-        // 0x46886c: how many other people were last seen in the old
-        // room, leaving out those with bit 0 of person word 84 or 68
-        // set (0x4351ef). A person not ticked yet has the
-        // constructor's -5.
-        let others = world
-            .objects
-            .iter()
-            .filter(|&(&other, _)| other != id)
-            .filter_map(|(other, o)| Some((other, o.person.as_ref()?)))
-            .filter(|(_, p)| {
-                let bit = |index: usize| p.data.get(index).is_some_and(|w| w & 1 != 0);
-                !bit(84) && !bit(68)
-            })
-            .filter(|(other, _)| {
-                world
-                    .person_ticks
-                    .get(other)
-                    .map_or(PersonTick::CONSTRUCTED.room, |t| t.room)
-                    == state.room
-            })
-            .count();
         let object = world
             .objects
             .get_mut(&id)
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
         let word = |data: &[i16], index: usize| data.get(index).copied().unwrap_or(0);
         let hidden = word(&object.data, HIDDEN);
-        let room = word(&object.data, ROOM);
         let person = object
             .person
             .as_mut()
             .ok_or_else(|| fail(Trap::native(0x1c, "object is not a person")))?;
-        if room != state.room {
-            let kind = word(&person.data, person::KIND);
-            for (old, new) in [(state.room, false), (room, true)] {
-                let exists = !(-5..=-1).contains(&old);
-                let indoors = exists
-                    && world_room(&world.rooms.rooms, old).is_some_and(|room| !room.outdoors);
-                if kind <= 1 && indoors && (new || others == 0) {
-                    return Err(fail(Trap::Unsupported(format!(
-                        "a person {} indoor room {old} (0x468802), which is not ported",
-                        if new { "entering" } else { "leaving" }
-                    ))));
-                }
-            }
-            state.room = room;
-        }
         if state.room != -5 {
             let mut value =
                 world_room(&world.rooms.rooms, state.room).map_or(sims_core::F32::ZERO, score);
@@ -522,6 +496,70 @@ impl Interpreter<'_> {
         Ok(true)
     }
 
+    /// The room a person was last seen in (person field 0xafc) brought up
+    /// to date from its data word 29 (0x45e43d; [`Interpreter::tick_person`],
+    /// step 4). The person's tick runs this, and so does the placement of
+    /// a walking person (virtual function 0x88, 0x45e4e9).
+    pub(crate) fn note_room(&self, world: &mut World, id: u16) -> Result<(), Trap> {
+        let mut state = world
+            .person_ticks
+            .get(&id)
+            .copied()
+            .unwrap_or(PersonTick::CONSTRUCTED);
+        let object = world
+            .objects
+            .get(&id)
+            .ok_or_else(|| Trap::native(10, "missing object"))?;
+        let word = |data: &[i16], index: usize| data.get(index).copied().unwrap_or(0);
+        let room = word(&object.data, ROOM);
+        if room == state.room {
+            return Ok(());
+        }
+        let kind = word(
+            &object
+                .person
+                .as_ref()
+                .ok_or_else(|| Trap::native(0x1c, "object is not a person"))?
+                .data,
+            person::KIND,
+        );
+        // 0x46886c: how many other people were last seen in the old
+        // room, leaving out those with bit 0 of person word 84 or 68
+        // set (0x4351ef). A person not ticked yet has the
+        // constructor's -5.
+        let others = world
+            .objects
+            .iter()
+            .filter(|&(&other, _)| other != id)
+            .filter_map(|(other, o)| Some((other, o.person.as_ref()?)))
+            .filter(|(_, p)| {
+                let bit = |index: usize| p.data.get(index).is_some_and(|w| w & 1 != 0);
+                !bit(84) && !bit(68)
+            })
+            .filter(|(other, _)| {
+                world
+                    .person_ticks
+                    .get(other)
+                    .map_or(PersonTick::CONSTRUCTED.room, |t| t.room)
+                    == state.room
+            })
+            .count();
+        for (old, new) in [(state.room, false), (room, true)] {
+            let exists = !(-5..=-1).contains(&old);
+            let indoors =
+                exists && world_room(&world.rooms.rooms, old).is_some_and(|room| !room.outdoors);
+            if kind <= 1 && indoors && (new || others == 0) {
+                return Err(Trap::Unsupported(format!(
+                    "a person {} indoor room {old} (0x468802), which is not ported",
+                    if new { "entering" } else { "leaving" }
+                )));
+            }
+        }
+        state.room = room;
+        world.person_ticks.insert(id, state);
+        Ok(())
+    }
+
     /// The registry's pass at the end of a lot update (0x4412d1):
     ///
     /// 1. The dialogs, from the first record, starting over after each
@@ -532,7 +570,11 @@ impl Interpreter<'_> {
     ///    taken off the queue and, if it still names an object, the
     ///    object is removed at once ([`Interpreter::remove_now`],
     ///    0x44123f). A tile of a multi-tile object is not ported.
-    /// 3. If no Sim is selected, or the selected one is a visitor on a
+    /// 3. Also after a full pass, on a tick count (already counted for this
+    ///    update) that is a multiple of 40, registry byte 0x12
+    ///    ([`sims_sim::neighbors::Neighbors::relationships_changed`]) is cleared
+    ///    (0x4424cb).
+    /// 4. If no Sim is selected, or the selected one is a visitor on a
     ///    residential lot, the game selects another (0x445501), which is
     ///    not ported and fails.
     pub fn end_of_update(
@@ -617,6 +659,12 @@ impl Interpreter<'_> {
                 }
                 self.remove_now(world, id)?;
                 update.removed.push(id);
+            }
+            // 0x4424cb: on a tick count that is a multiple of 40, registry
+            // byte 0x12 is cleared, after a call that only returns
+            // (0x46fb64).
+            if world.neighbors.relationships_changed && (world.ticks as i32) % 40 == 0 {
+                world.neighbors.relationships_changed = false;
             }
         }
         let lot = global(world, LOT)?;

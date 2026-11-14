@@ -334,3 +334,26 @@ fn atan2_quadrants() {
     );
     assert!(Ext::atan2(f(-1.0), f(-1.0)).is_negative());
 }
+
+#[test]
+fn floor_matches_f64_floor() {
+    let mut rng = Inputs(0x5eed_f100);
+    for _ in 0..20_000 {
+        let bits = rng.f32_bits();
+        let x = f32::from_bits(bits);
+        let ours = f(bits).ext().floor();
+        let expected = (x as f64).floor();
+        if expected.is_nan() {
+            assert!(ours.is_nan());
+            continue;
+        }
+        assert_eq!(ours.to_f32().to_bits(), (expected as f32).to_bits(), "{x}");
+    }
+    let floor = |bits: u32| f(bits).ext().floor().to_f32().to_bits();
+    // 1.5, -0.5, 0.25, -0.0, 2.0.
+    assert_eq!(floor(0x3fc0_0000), 0x3f80_0000);
+    assert_eq!(floor(0xbf00_0000), 0xbf80_0000);
+    assert_eq!(floor(0x3e80_0000), 0);
+    assert_eq!(floor(0x8000_0000), 0x8000_0000);
+    assert_eq!(floor(0x4000_0000), 0x4000_0000);
+}

@@ -1,6 +1,7 @@
 //! Looking a clip up by name. Synthetic; no game data.
 
-use sims_content::{Animations, Clip, Error};
+use sims_content::{Animations, Clip, Error, Event, Track};
+use sims_formats::animation::TimedProperty;
 
 fn clip(name: &str, duration: u32) -> Clip {
     Clip {
@@ -8,10 +9,10 @@ fn clip(name: &str, duration: u32) -> Clip {
         skill: "Skill".into(),
         duration,
         distance: 0,
+        moving: false,
         frames: 4,
         motions: 1,
-        events: false,
-        event_keys: Vec::new(),
+        tracks: Vec::new(),
     }
 }
 
@@ -48,4 +49,42 @@ fn a_clip_that_cannot_be_told_is_refused() {
     assert_eq!(animations.clip("WALK").unwrap().name, "WALK");
     animations.insert("b.far", clip("walk", 2));
     assert!(refused(&animations, "walk").contains("defined differently"));
+}
+
+fn timed(time_ms: i32, pairs: &[(&str, &str)]) -> TimedProperty {
+    TimedProperty {
+        time_ms,
+        bone: "ROOT".into(),
+        pairs: pairs.iter().map(|&(k, v)| (k.into(), v.into())).collect(),
+    }
+}
+
+#[test]
+fn a_motions_events_are_ordered_by_time_with_lowercase_properties() {
+    // 0x59431a and 0x594390: a key is looked up as spelled and stored in
+    // lowercase, so "XEVT" then "XEVT" adds two pairs, while "xevt" after
+    // a stored "xevt" replaces its value. 0x5946fc: a second event at
+    // the same time replaces the first's list.
+    let track = Track::build(
+        "ROOT",
+        &[
+            timed(30, &[("Sound", "Foo")]),
+            timed(10, &[("XEVT", "1"), ("XEVT", "2")]),
+            timed(20, &[("xevt", "1"), ("xevt", "3")]),
+            timed(30, &[("LeftHand", "4")]),
+        ],
+    );
+    let event = |time: i32, pairs: &[(&str, &str)]| Event {
+        time,
+        properties: pairs.iter().map(|&(k, v)| (k.into(), v.into())).collect(),
+    };
+    assert_eq!(track.bone, "ROOT");
+    assert_eq!(
+        track.events,
+        [
+            event(10, &[("xevt", "1"), ("xevt", "2")]),
+            event(20, &[("xevt", "3")]),
+            event(30, &[("lefthand", "4")]),
+        ]
+    );
 }

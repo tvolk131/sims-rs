@@ -306,6 +306,74 @@ fn format_12_bytes(world: &World) -> Vec<u8> {
     encoded
 }
 
+/// A lot's encoding as snapshot format 13 wrote it. Format 14 added three
+/// fields: at the end of each animator whether the house view has drawn
+/// its person yet ([`sims_sim::animator::Animator::undrawn`]) and whether
+/// it walks ([`sims_sim::animator::Animator::walking`]), and at the end of
+/// each layer where its clip's timed events stand
+/// ([`sims_sim::animator::Layer::cursors`]; one zero byte when there are
+/// none). The animators come last but for the usage counts and the
+/// routing. This writes them again without those bytes
+/// ([`animator_13_bytes`]), so a state pinned under format 13 can be shown
+/// to be the same state but for those fields.
+fn format_13_bytes(world: &World) -> Vec<u8> {
+    let mut old = world.clone();
+    old.animators.clear();
+    let mut encoded = old.encode();
+    let mut tail = postcard::to_allocvec(&world.usage).unwrap();
+    tail.extend(postcard::to_allocvec(&world.routing).unwrap());
+    assert_eq!(encoded.split_off(encoded.len() - tail.len()), tail);
+    assert_eq!(encoded.pop(), Some(0));
+    let count = world.animators.len() as u64;
+    encoded.extend(postcard::to_allocvec(&count).unwrap());
+    for (id, animator) in &world.animators {
+        encoded.extend(postcard::to_allocvec(id).unwrap());
+        encoded.extend(animator_13_bytes(animator));
+    }
+    encoded.extend(tail);
+    encoded
+}
+
+/// An animator's encoding under snapshot format 13 ([`format_13_bytes`]):
+/// without its last two bytes, `undrawn` and `walking`, and without its
+/// foreground layer's cursors, the layer's last field. The layer is
+/// followed by the skin's clock and flag, the appearance flag and the
+/// motion.
+fn animator_13_bytes(animator: &sims_sim::animator::Animator) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(animator).unwrap();
+    assert_eq!(bytes.pop(), Some(u8::from(animator.walking)));
+    assert_eq!(bytes.pop(), Some(u8::from(animator.undrawn)));
+    let after = postcard::to_allocvec(&(
+        animator.skin_clock,
+        animator.skin_dirty,
+        animator.profile_stale,
+        &animator.motion,
+    ))
+    .unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - after.len()), after);
+    if let Some(layer) = &animator.foreground {
+        let cursors = postcard::to_allocvec(&layer.cursors).unwrap();
+        assert_eq!(bytes.split_off(bytes.len() - cursors.len()), cursors);
+    }
+    bytes.extend(after);
+    bytes
+}
+
+/// The lot with registry byte 0x12
+/// ([`sims_sim::neighbors::Neighbors::relationships_changed`]) clear. The
+/// end of the object read now sets it ([`World::finish_object_read`]), as
+/// a hardware watchpoint on the original showed. Before, it stayed clear
+/// until a script wrote a relationship, which on the Goth house is in
+/// tick 2. The states pinned before that, at the load's end and after
+/// tick 1, were pinned with it clear; this checks it is set and clears
+/// it, so they can be shown to be the same state but for that byte.
+fn with_read_flag_clear(world: &World) -> World {
+    assert!(world.neighbors.relationships_changed);
+    let mut old = world.clone();
+    old.neighbors.relationships_changed = false;
+    old
+}
+
 /// An animator's encoding under snapshot format 12: without its motion,
 /// which must be that of no route ([`format_12_bytes`]).
 fn animator_12_bytes(animator: &sims_sim::animator::Animator) -> Vec<u8> {
@@ -313,7 +381,7 @@ fn animator_12_bytes(animator: &sims_sim::animator::Animator) -> Vec<u8> {
     assert_eq!(animator.motion, Motion::NONE);
     let motion = postcard::to_allocvec(&Motion::NONE).unwrap();
     assert_eq!(motion, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    let mut bytes = postcard::to_allocvec(animator).unwrap();
+    let mut bytes = animator_13_bytes(animator);
     assert_eq!(bytes.split_off(bytes.len() - motion.len()), motion);
     bytes
 }
@@ -1090,6 +1158,7 @@ fn the_goth_house_gets_its_rooms_and_its_household() {
             .unwrap();
         interpreter.reconcile_controllers(world).unwrap();
         world.repair_grid().unwrap();
+        world.finish_object_read();
         // The rooms. The rebuild changes no array: the flags it works
         // out are the flags the house saved, also outside the lot's size.
         let before = world.clone();
@@ -1207,6 +1276,7 @@ fn selected(root: &std::path::Path, then: impl FnOnce(&Interpreter, &mut World, 
             .unwrap();
         interpreter.reconcile_controllers(world).unwrap();
         world.repair_grid().unwrap();
+        world.finish_object_read();
         world.rebuild_rooms().unwrap();
         interpreter.assign_rooms(world).unwrap();
         interpreter.update_rooms(world, 0).unwrap();
@@ -1420,14 +1490,16 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
     // Pinned under snapshot format 8, the same state under format 9
     // ([`format_9_bytes`], without the neighborhood's records) and under
     // format 10 ([`format_10_bytes`], without the animators, of which the
-    // load leaves none), and under formats 11 and 12. See [`pinned`] for
-    // why the format 8 pin changed.
+    // load leaves none), and under formats 11, 12 and 13, the last three
+    // with registry byte 0x12 clear ([`with_read_flag_clear`]). See
+    // [`pinned`] for why the format 8 pin changed.
     const BASELINE: &str = "034d3b636d3529fa91826a5f5b759e4abba31d6c5be3b66732a1f1ef642ad9fb";
     const BASELINE_9: &str = "fe21f960b207ba0ced6a6a5dfe5628fcb101c12eb9571d49578ec65dfde459da";
     const BASELINE_10: &str = "29b4aec3debe353d77363e18cf3cbd263b30fe2fe4e1e03a5f309c08dd132168";
     const BASELINE_11: &str = "90c52a0d5be39db0556c0f8fc9ea41088cdb36b5d024094b8073eaf1d3bb918a";
     const BASELINE_12: &str = "9954409afc678bcf8d6815446a86eadeddb46bf5b2785e5461f7b06af38d1687";
     const BASELINE_13: &str = "f844587de2d116d798645aea70ea5ea5f91c49c398c93fc414c3ab31657be32a";
+    const BASELINE_14: &str = "45642fa774010ff05a65fbc1d9b23a0edb1af70884a81215495d6380bd599bb3";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1522,57 +1594,58 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
         assert_eq!(world.crt_rng, before.crt_rng);
         assert_eq!(digest(&format_8_bytes(world)), BASELINE);
         assert_eq!(digest(&format_9_bytes(world)), BASELINE_9);
-        assert_eq!(digest(&format_10_bytes(world)), BASELINE_10);
         assert!(world.animators.is_empty());
-        assert_eq!(digest(&format_11_bytes(world)), BASELINE_11);
-        assert_eq!(digest(&format_12_bytes(world)), BASELINE_12);
-        assert_eq!(world.hash_hex(), BASELINE_13);
+        let old = with_read_flag_clear(world);
+        assert_eq!(digest(&format_10_bytes(&old)), BASELINE_10);
+        assert_eq!(digest(&format_11_bytes(&old)), BASELINE_11);
+        assert_eq!(digest(&format_12_bytes(&old)), BASELINE_12);
+        assert_eq!(digest(&format_13_bytes(&old)), BASELINE_13);
+        assert_eq!(world.hash_hex(), BASELINE_14);
     });
 }
 
-/// The first 33 ticks on the Goth house: the lot update (0x46d345) run
-/// from the state the load ends in.
+/// The first 232 ticks on the Goth house: the lot update (0x46d345) run
+/// from the state the load ends in, with the house view's frames between
+/// updates as far as they write the simulation's state (`frame.rs`): one
+/// before tick 1, one after each of ticks 1 to 3, and one after every
+/// tick from 33 on. That schedule is an input, not something the
+/// simulation decides; see the frame schedule in `docs/decisions.md`.
 ///
 /// A private capture of the original on the same install and house,
 /// outside the repository (`docs/decisions.md`), holds the full state at
-/// the entry of tick 1 and after each of the lot updates 1 to 100, and
-/// one line per lot update in `updates.jsonl` with the tick count, the
-/// lot's and the game's random streams, the C runtime's random stream and
-/// the scheduler cursor. That capture's game read the install's own
-/// neighborhood file. Our state after each of ticks 1 to 33 was compared
-/// with the capture's after the same lot update, field by field, floats
-/// bit for bit:
+/// the entry of tick 1, after each of the lot updates 1 to 100 and after
+/// every tenth update from 110 to 1000, and one line per lot update in
+/// `updates.jsonl` with the tick count, the lot's and the game's random
+/// streams, the C runtime's random stream and the scheduler cursor. That
+/// capture's game read the install's own neighborhood file. Our state was
+/// compared with the capture's, field by field, floats bit for bit:
 ///
-/// - the `updates.jsonl` line, and that the update was a full one;
-/// - the tick count, the three random streams, the scheduler cursor, the
-///   funds, all 64 globals, the removal queue, the registration order and
-///   the set of objects;
-/// - the neighborhood's 463 records (ID, GUID, revision, data,
-///   relationships, friends, stale mark), the inventories and registry
-///   byte 0x12;
-/// - for each object its GUID, 72 data words, temps, attributes,
-///   scheduler word, last result, frames (tree, node, stack object,
-///   arguments, locals, saved primitive state), relationships, slot
-///   count, position and its removal and selected marks; and that no
-///   object of the capture holds a tree error;
-/// - for each person also the 256 person data words, the motives and
-///   previous motives, the running and last actions, the queued actions,
-///   and the objects in use (object, stack depth, flag);
-/// - the people's animators: every field kept here that the capture's
-///   memory pages hold, the route's fields
-///   ([`sims_sim::animator::Motion`]) included. The capture did not
-///   record where the animators are for updates 1 to 45, so the places
-///   recorded at update 46 are used; the pages themselves are from the
-///   update compared.
-/// - each person's number of route contexts (person +0xaf0). The
-///   contexts' contents and the path (person +0xae0) are on pages the
-///   capture did not save.
+/// - after every one of ticks 1 to 232: the `updates.jsonl` line, and
+///   that the update advanced the tick count by one (a full update);
+/// - after every one of ticks 1 to 100 and after ticks 110, 120 and every
+///   tenth to 230, also: the tick count, the three random streams, the
+///   scheduler cursor, the funds, all 64 globals, the removal queue, the
+///   registration order and the set of objects; the neighborhood's 463
+///   records (ID, GUID, revision, data, relationships, friends, stale
+///   mark), the inventories and registry byte 0x12; for each object its
+///   GUID, 72 data words, temps, attributes, scheduler word, last result,
+///   frames (tree, node, stack object, arguments, locals, saved primitive
+///   state), relationships, slot count, position and its removal and
+///   selected marks, and that no object of the capture holds a tree
+///   error; for each person also the 256 person data words, the motives
+///   and previous motives, the running and last actions, the queued
+///   actions, and the objects in use (object, stack depth, flag); the
+///   people's animators, every field kept here that the capture's memory
+///   pages hold, the route's fields ([`sims_sim::animator::Motion`]) and
+///   the walking flag included (the capture did not record where the
+///   animators are for updates 1 to 45, so the places recorded at update
+///   46 are used; the pages themselves are from the update compared); and
+///   each person's number of route contexts (person +0xaf0) where the
+///   capture saved that page.
 ///
-/// Equal after every one of ticks 1 to 33, with two exceptions, both
-/// after tick 1 and neither in ticks 2 to 33: global 12, which is 17 in
-/// the capture and 0 here (the interface's wait check, which is not run
-/// here); and registry byte 0x12, which the capture has set from the
-/// load on and ours sets in tick 2. The cause of either is **unverified**.
+/// All of it is equal, with one exception: global 12 after tick 1, which
+/// is 17 in the capture and 0 here (the interface's wait check, which is
+/// not run here). Its cause is **unverified**.
 ///
 /// Not compared: a frame local that we hold as unknown, because the
 /// original left half of a pointer in the frame storage there; and
@@ -1580,30 +1653,32 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// memory it never wrote (`sims_sim::route::Routing::unknown_words`; the
 /// capture has 3287 there). Also not compared, because the capture does
 /// not hold them in a form read there: the rooms, the lot arrays, the
-/// dialog records, the persons' tick state other than the animators, and
-/// the house's usage counts.
+/// dialog records, the persons' tick state other than the animators, the
+/// house's usage counts, the route contexts' contents and the path. The
+/// state after ticks 101 to 109, 111 to 119 and so on is not in the
+/// capture; that it is equal there is **unverified** except for the
+/// `updates.jsonl` line.
 ///
 /// In tick 6 object 382 makes a new person, 259 (Create New Object
-/// Instance mode 8). From tick 7 on that person runs. Its state is
-/// compared in every tick from 6 on as above, and is equal.
+/// Instance mode 8), who runs from tick 7 on. In tick 14 it goes to slot
+/// 0 of object 51 (Go To Routing Slot); the route context, the planner's
+/// inputs, both of its searches and the path were also compared with the
+/// original's code run on the state of another capture at the entry of
+/// update 14 (an emulator of the original's update, outside the
+/// repository), and are equal. It then turns on the spot (animator state
+/// 4). The frame after tick 33 draws it for the first time, which places
+/// its animator again, facing its object's direction word (0, where the
+/// turn had 0.127): a hardware watchpoint on the original stopped at that
+/// write (0x584895) in the house view's draw. It turns again from there
+/// through tick 46; in tick 47 the turn ends and it walks along its path
+/// (state 9, the walk clip repeating), heading for the path's fourth
+/// point at tick 230. In tick 24 person 18's clip ends (0x589c25) and it
+/// starts the next; from tick 46 on, clips' timed events run
+/// (0x5912fd). In tick 36 the tick count is a multiple of 40 and the
+/// update clears registry byte 0x12 (0x442521).
 ///
-/// In tick 14 person 259 goes to slot 0 of object 51 (Go To Routing
-/// Slot). The route context, the planner's inputs (obstacles, room
-/// rectangles, goal), both of its searches and the path were also
-/// compared with the original's code run on the state of another capture
-/// at the entry of update 14 (an emulator of the original's update,
-/// outside the repository), and are equal. The person then turns on the
-/// spot (animator state 4) through tick 33. In tick 24 person 18's clip
-/// ends (0x589c25) and it starts the next.
-///
-/// After tick 34 the capture's animator of person 259 holds 0 as its
-/// direction and its destination's direction, where ours holds the turn's
-/// (0.127 and 0.210); every other field compared is equal. The original's
-/// update, run in that emulator from its state at update 14, writes the
-/// same direction as ours in update 34, so the 0 is written outside the
-/// lot update. What writes it is **unverified**. Ticks 34 to 45 run here
-/// without failing; tick 46 fails, at person 18's clip with timed events
-/// (0x5912fd).
+/// Tick 233 fails loudly: person 21 reaches Find Best Interaction
+/// (primitive 3), which is not ported.
 ///
 /// Object 15's two-button dialog in tick 2 is answered with 3, the
 /// answer the capture's events show. People 18 and 21's clip in tick 3 is
@@ -1612,23 +1687,29 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// the five controllers' dialogs in tick 1 were answered with their only
 /// button is what the capture shows.
 ///
-/// The format 11 digests ([`format_11_bytes`]) were pinned before the
-/// house's usage counts and the animator's appearance flag were added,
-/// and the format 12 digests ([`format_12_bytes`]) before the routing and
-/// the animator's route fields were; both still hold. The digests are of
-/// our own state, as built here.
+/// The digests suffixed with an older snapshot format were pinned under
+/// it ([`format_11_bytes`], [`format_12_bytes`], [`format_13_bytes`]),
+/// before frames were drawn and before the end of the object read set
+/// registry byte 0x12 ([`with_read_flag_clear`], for the state after
+/// tick 1); all still hold. The digests are of our own state, as built
+/// here.
 #[test]
 fn the_goth_house_first_tick_matches_the_original() {
     const TICK_1_9: &str = "62fc28f5e7689d166791a620dbed066fb8a7d707ea79017fbadf0eed3da5c937";
     const TICK_1_10: &str = "bb55f7d5f656551708867b24779c2e0f019825459427858a27ad8c8874e7957b";
     const TICK_1_11: &str = "c2fa1ed11813b8ab67214f7177e1bb27a2e25ae2ecef94c3c1172071d5682400";
     const TICK_5_11: &str = "b1dfa48cff23e2b5ef92d4e2b9d2386d2fea55857210c0856c38275c19acea9e";
-    const TICK_1: &str = "f8fecfe693e419a642094715d879184b1d85268cbca22806ee31475b1aeb4dae";
+    const TICK_1_13: &str = "f8fecfe693e419a642094715d879184b1d85268cbca22806ee31475b1aeb4dae";
     const TICK_1_12: &str = "bc16bff8543bbd815f609600eb087157307e07b9ee0b592d3b55a64d2bc740f9";
-    const TICK_5: &str = "3ab9e6083e9dd3850796b2942d077e826060ef4bc9c3e4427dc3801c6981f0a4";
+    const TICK_5_13: &str = "3ab9e6083e9dd3850796b2942d077e826060ef4bc9c3e4427dc3801c6981f0a4";
     const TICK_5_12: &str = "4e363f8930608d8beffb6c2e8731c62e61e86e8a1df83b253577fba7193f9bec";
-    const TICK_33: &str = "1a82b937d63ff830c23927551339a0d72af1cd5f4d12aba707bdfdd16c1b21e5";
-    const TICK_13: &str = "2b5d012c9b69df5fdddd6f538bde6fa5c18df3c9da97839390152a9472d0a10e";
+    const TICK_33_13: &str = "1a82b937d63ff830c23927551339a0d72af1cd5f4d12aba707bdfdd16c1b21e5";
+    const TICK_13_13: &str = "2b5d012c9b69df5fdddd6f538bde6fa5c18df3c9da97839390152a9472d0a10e";
+    const TICK_1: &str = "0e022d8a9e16c9ea2dcea3654c0e85259f623678e68db62ccc807e17d99ebac7";
+    const TICK_5: &str = "9f3ae51efc8572a08133f89ec6bc0569f279fb8c09383e628f04c14c94991433";
+    const TICK_13: &str = "5488ba5350a0344a379e87c69721bfdff7c4ef89eaf14ebcceb4f6dc48325063";
+    const TICK_33: &str = "94239fbd88efa657b98d2bec3d8b6602f3c5873ce626abacffb45428efdedf2d";
+    const TICK_232: &str = "3e8d2dd01e5d044e196fd9786468fe33bd18e85256db2d11560d2dbb6fa5be31";
     const TICK_13_12: &str = "5ce718d449921600161f8d38144fa29bb4f9125b2e7d51d40dd103b02f321e96";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
@@ -1649,6 +1730,16 @@ fn the_goth_house_first_tick_matches_the_original() {
         interpreter.go_live(world).unwrap();
         interpreter.before_frame(world).unwrap();
         let before = world.clone();
+        // The house view draws a frame before the first lot update, which
+        // draws the three people for the first time: each gets its
+        // animator, placed on its tile (`frame.rs`).
+        interpreter.draw_frame(world, 1).unwrap();
+        let drawn: Vec<(u16, bool)> = world
+            .animators
+            .iter()
+            .map(|(&id, a)| (id, a.undrawn))
+            .collect();
+        assert_eq!(drawn, [(16, false), (18, false), (21, false)]);
         let tuning = interpreter.program.motive_tuning().unwrap();
         let mut player = sims_vm::Answers::default();
         let update = interpreter.lot_update(world, &tuning, &mut player).unwrap();
@@ -1678,9 +1769,11 @@ fn the_goth_house_first_tick_matches_the_original() {
                 .all(|t| t.last_decay == before.ticks as i32)
         );
         assert_eq!(digest(&format_9_bytes(world)), TICK_1_9);
-        assert_eq!(digest(&format_10_bytes(world)), TICK_1_10);
-        assert_eq!(digest(&format_11_bytes(world)), TICK_1_11);
-        assert_eq!(digest(&format_12_bytes(world)), TICK_1_12);
+        let old = with_read_flag_clear(world);
+        assert_eq!(digest(&format_10_bytes(&old)), TICK_1_10);
+        assert_eq!(digest(&format_11_bytes(&old)), TICK_1_11);
+        assert_eq!(digest(&format_12_bytes(&old)), TICK_1_12);
+        assert_eq!(digest(&format_13_bytes(&old)), TICK_1_13);
         assert_eq!(world.hash_hex(), TICK_1);
         // Ticks 2 to 5. Person 16 starts a clip with Animate Sim in tick 2
         // and yields; the capture shows that person at the same
@@ -1692,9 +1785,15 @@ fn the_goth_house_first_tick_matches_the_original() {
         // a clip and 35 objects are queued for removal.
         let mut player = sims_vm::Answers { queue: [3].into() };
         let mut shape = vec![];
-        for _ in 2..=5 {
+        for tick in 2..=5 {
             let update = interpreter.lot_update(world, &tuning, &mut player).unwrap();
             assert!(update.full);
+            if tick <= 3 {
+                // Frames after ticks 1 to 3, which change nothing here.
+                let drawn = world.clone();
+                interpreter.draw_frame(world, 1).unwrap();
+                assert_eq!(world.encode(), drawn.encode());
+            }
             shape.push((
                 update.counted.len(),
                 update.ticked.len(),
@@ -1731,6 +1830,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert_eq!(world.objects[&16].stack[4].locals, [0, 3, 8222, 254]);
         assert_eq!(digest(&format_11_bytes(world)), TICK_5_11);
         assert_eq!(digest(&format_12_bytes(world)), TICK_5_12);
+        assert_eq!(digest(&format_13_bytes(world)), TICK_5_13);
         assert_eq!(world.hash_hex(), TICK_5);
         // Ticks 6 to 13. In tick 6 object 382 makes a person of type
         // 0x44A86A6C (Create New Object Instance mode 8), who gets the
@@ -1781,6 +1881,7 @@ fn the_goth_house_first_tick_matches_the_original() {
             .collect();
         assert_eq!(frames, [(0x1000, 9), (0x118, 0)]);
         assert_eq!(digest(&format_12_bytes(world)), TICK_13_12);
+        assert_eq!(digest(&format_13_bytes(world)), TICK_13_13);
         assert_eq!(world.hash_hex(), TICK_13);
         // Ticks 14 to 33. In tick 14 person 259 runs a tree of object 51
         // (Run Tree By Name), which starts using it, and in that tree goes
@@ -1823,6 +1924,37 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert_eq!(animator.motion.segment, 1);
         assert_eq!(animator.motion.progress.to_bits(), 0x3de9_8f51);
         assert_eq!(animator.destination[2].to_bits(), 0x3e57_5200);
+        assert!(animator.undrawn);
+        assert_eq!(digest(&format_13_bytes(world)), TICK_33_13);
         assert_eq!(world.hash_hex(), TICK_33);
+        // The frame after tick 33 draws person 259 for the first time,
+        // which unsets its animator's position and places it again on its
+        // tile, facing its direction word: 0, where the turn had it at
+        // 0.127 (the destination's direction too).
+        interpreter.draw_frame(world, 1).unwrap();
+        let animator = &world.animators[&259];
+        assert!(!animator.undrawn);
+        assert_eq!(animator.position[2].to_bits(), 0);
+        assert_eq!(animator.destination[2].to_bits(), 0);
+        // Ticks 34 to 232, with a frame after each.
+        for tick in 34..=232 {
+            interpreter.lot_update(world, &tuning, &mut player).unwrap();
+            interpreter.draw_frame(world, 1).unwrap();
+            if tick == 36 {
+                // The tick count is a multiple of 40: the end of the update
+                // clears registry byte 0x12 (0x442521).
+                assert_eq!(world.ticks % 40, 0);
+                assert!(!world.neighbors.relationships_changed);
+            }
+        }
+        assert_eq!(world.ticks, before.ticks + 232);
+        assert_eq!(world.hash_hex(), TICK_232);
+        // Tick 233 reaches Find Best Interaction, which is not ported.
+        let error = interpreter
+            .lot_update(world, &tuning, &mut player)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("object 21, tree 0x2029 node 1"), "{error}");
+        assert!(error.contains("Find Best Interaction"), "{error}");
     });
 }

@@ -91,6 +91,18 @@ Things to know:
   directory (the container's `/g`), and the script moves it to the output.
   A dump holds the whole game, about 320 MB, so keep the list short. The
   dumps let a routine of the original be run alone on real memory.
+- **Write watchpoints.** `--watch NAME=EXPR[:SIZE]` (repeatable) sets a
+  hardware write watchpoint on SIZE bytes (1, 2, 4 or 8; default 4) and logs
+  every write to them to `watch.jsonl`. EXPR starts with a hexadecimal
+  address, `object:<id>` (the object with that ID) or `person:<id>` (the
+  same, once it is a person), followed by steps: `+HEX` adds, `@HEX` reads
+  the word at the address plus HEX. For example `dir=person:259@0xadc+0x88`
+  watches the direction of person 259's animator. The watchpoint is set as
+  soon as the address can be worked out. With `--watch` the lot update's
+  entry and return stay armed, so each write can be placed inside or
+  outside an update. Each logged write holds the writer's registers, its
+  return addresses along the frame-pointer chain, the bytes before and
+  after, and the update it falls in.
 
 ## Output
 
@@ -104,5 +116,6 @@ Things to know:
 | `updates.jsonl` | One line per lot update: the tick, whether it was a full pass, the three random streams and the scheduler cursor. |
 | `events.jsonl` | The dialog functions passed (each record, its status and modal byte), the baseline, and other stops. |
 | `dump-NNNN/` | With `--dump`: the user memory at the entry of lot update N. `ranges.json` lists the ranges (start, size, protection, file); `registers.json` holds the stop's registers and the stub's whole register packet. |
+| `watch.jsonl` | With `--watch`: one line per write to a watched address (see above). |
 | `status.json` | Progress. |
 | `input-log.txt` | Every press made, with its time (written by `answer.sh`). |

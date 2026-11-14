@@ -57,22 +57,27 @@ Each step is a few PRs, and each PR leaves `main` green.
   keep. Six type attribute words are the exception: they belong to the
   game that was running before the load.
 - Ticks run. `sims boot --ticks N` runs N lot updates after the load and
-  prints the hash. **K = 33 on the Goth house**: our state after each of
-  ticks 1 to 33 equals the 1000-tick capture of the original after the
-  same tick in everything compared, two lines after tick 1 aside (see
-  step 4 below, "The first tick", "Ticks 2 to 5", "Ticks 6 to 13" and
-  "Ticks 14 to 33").
+  prints the hash. Between updates it draws the house view's frames as far
+  as they write the simulation's state (`--frames`, by default before tick
+  1, after ticks 1 to 3 and after every tick from 33 on). **K = 230 on the
+  Goth house**: our state after each of ticks 1 to 100, and after every
+  tenth tick from 110 to 230, equals the 1000-tick capture of the original
+  after the same update in everything compared, global 12 after tick 1
+  aside. The `updates.jsonl` line (tick count, the three random streams,
+  the scheduler cursor) is equal after every tick from 1 to 232. The
+  capture holds no full state after ticks 231 and 232, so K is 230 (see
+  step 4 below, "The first tick" and the sections after it, to "Ticks 34
+  to 232").
   The simulation holds the neighborhood's people (their records, person
   data, relationships and inventories) and each person's animator, as
   far as scripts read it. Find Location For (primitive 16) is ported for
   the modes the house reaches, and so is making a new person (Create New
   Object Instance mode 8, tick 6). Go To Routing Slot (primitive 45)
   is ported for the route person 259 takes in tick 14, with the
-  planner and the animator's turn on the spot. After tick 34 the
-  capture's direction of person 259's animator is 0 and ours is not
-  (see "Ticks 14 to 33"). Ticks 34 to 45 run; tick 46 stops where
-  person 18 plays a clip with timed events (0x5912fd), which is not
-  ported, and the boot says so and at which tick.
+  planner, the animator's turn on the spot and its walk along the path.
+  Clips' timed events are ported. Tick 233 stops where person 21 reaches
+  Find Best Interaction (primitive 3), which is not ported, and the boot
+  says so and at which tick.
 - Step 4 is in progress. `tools/harness/` runs the original under Wine
   in a QEMU guest and stops it at every lot update. It saves the state
   at the entry of the first tick and after each lot update: every
@@ -81,19 +86,21 @@ Each step is a few PRs, and each PR leaves `main` green.
   the install's own UserData. Its
   dialogs were answered as in the first capture: OK to the five notices
   in tick 1, and No to the Help System in tick 2. Compared with that
-  run, our state at the entry of tick 1 and after each of ticks 1 to 33
-  matches in everything compared, three lines aside:
-  - Registry byte 0x12 is already 1 when the original's load ends. Ours
-    sets it in tick 2. This accounts for two of the three lines.
+  run, our state at the entry of tick 1 and after each compared tick to
+  230 matches in everything compared, one line aside:
   - After tick 1, global 12 is 17 in the original. It is the interface's
     wait check, which we do not run.
   - **Unverified:** that global 12 comes from the open dialog.
+  `--watch` sets hardware write watchpoints and logs each write with the
+  writer's address and call chain (`tools/harness/README.md`). It found
+  what writes person 259's direction and registry byte 0x12 (see "Ticks
+  34 to 232").
   With the install's UserData, the C runtime's random stream and all
   463 neighborhood records match as well. The 52-draw offset and the
   five differing records came from the first capture's guest files. The
   original first draws from the C runtime's stream in tick 6, 1,466
   times, when it makes a person; ours draws the same, and the stream is
-  equal after every tick to 45.
+  equal after every tick to 232.
 
 ### Load sequence
 
@@ -987,11 +994,73 @@ an emulator on a memory dump of the original at the entry of update 14,
 and are equal. Person 259's word 37 is not compared: the original copies
 it from memory it never wrote (`0x45c418`).
 
-**Not equal after tick 34.** The capture's animator of person 259 has 0
-as its direction and its destination's direction; ours has the turn's.
-The emulated update writes the same direction as ours, so the 0 comes
-from outside the lot update. What writes it is **unverified**. From
-tick 36 registry byte 0x12 differs too (ours 1, the capture 0).
+### Ticks 34 to 232
+
+**What wrote person 259's direction.** A run of the original with a
+hardware write watchpoint on the direction of person 259's animator
+(`+0x88`) stopped outside the lot update, between updates 33 and 34, at
+`0x584895`. The call chain was `0x45e36b` (the person's draw, virtual
+function `0x20`), `0x4ab67d` and `0x4a945d` (the house view drawing its
+objects), `0x4a8deb` (the house view's draw), `0x4d1bbb` and `0x4d0dea`
+(`DDDSimsView::Draw()`), `0x5dcffe` (the main loop). It is the animator's
+first draw (`0x590c05`): byte `+0xdb`, set when the animator is made, is
+cleared, the position is unset (`0x589361`), and the animator is placed
+again on its person's tile, facing the person's direction word, which is
+0 (`0x592132`). The destination follows. This is presentation, but it
+writes state the simulation reads, so `sims_vm::Interpreter::draw_frame`
+models it (`frame.rs`).
+
+A second run watched the house view's draw guard (`0x4d1b60` sets it,
+`0x4d1be7` clears it). The view drew before the first update, after
+updates 1, 2 and 3 (many times while a dialog waited), and after update
+33; not after updates 4 to 32 or 34 to 45. The first frame drew people
+16, 18 and 21, whose bytes `+0xd8` to `+0xdb` were already 0 before
+update 1. Person 259, made in tick 6, was first drawn after update 33.
+When the game draws is up to its main loop, not the simulation, so the
+frame schedule is an input (`sims boot --frames`). The default follows
+that run: `0,1,2,3,33+`. Frames after 1 to 3 and after 34 on change
+nothing on this house (the state after tick 232 is the same with and
+without them). Without the frame after 33, ticks 34 on differ.
+
+**What wrote registry byte 0x12.** The watchpoint on the byte stopped at
+`0x43fc8d`, in the end of the object read (`0x43fc02`), during the load,
+going from 0 to 1 (`World::finish_object_read`). It stopped again at
+`0x442521`, in the end of a full lot update (`0x4424cb`), going to 0 in
+update 36: the update clears the byte when the tick count is a multiple
+of 40. Both are simulation and are modeled.
+
+**The walk.** After the first draw, person 259 turns again from
+direction 0 and ends the turn in tick 47. It then heads for the point
+ahead and walks (`0x58eb29` to `0x58f089`): the walk clip repeats in the
+foreground (end mode 1, `0x597dca`); each tick moves the animator by the
+clip's distance times 16/3, divided by the clip's duration at the
+animator's speed counted in ticks of 42 milliseconds; the step is moved onto the path where that is nearer
+(`0x48313e`, `0x45ed5f`), the person is put on the step's tile with the
+place test, and its room is noted (`0x45e43d`). The path's segments are
+followed (`0x58e57d`).
+
+**Timed events.** From tick 46, clips reach their timed events
+(`0x5912fd`, `clip_events.rs`): `xevt`, `interruptible`, the hands and
+the censor words. Sounds are not modeled. `anchor` feeds only code
+behind byte `0x6f6d70`, which nothing writes and which is 0 in a memory
+capture of the running game, so it is not kept. `dress` and `undress`
+fail. Animate Sim's clip 0 stops the foreground clip (`0x5897aa`).
+
+**Compared with the original.** After each of ticks 34 to 100, and after
+ticks 110, 120 and every tenth to 230, our state equals the capture's in
+every field listed for tick 1, the four people's animators (walking flag
+included) and each person's number of route contexts. The
+`updates.jsonl` line is equal after every tick to 232.
+
+**Not verified.** The state after ticks 101 to 109, 111 to 119 and so on
+is not in the capture. That the draw's other writes (the pose, the draw
+bounds, the screen rectangle, the skin's censor update) change nothing
+the simulation reads. That nothing reads a layer's anchor fields but
+the pose. Why the original drew no frame after updates 4 to 32 is not
+known; it depends on the main loop's timing under the harness.
+
+**Stops.** Tick 233: person 21 (tree `0x2029`, node 1) reaches Find Best
+Interaction (primitive 3), which is not ported.
 
 ## Working rules
 
