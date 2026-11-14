@@ -143,7 +143,7 @@ key Escape                     # press a key (an xdotool key name)
 click-object 173               # aim at object 173, click, keep the pie menu only if it is for 173
 choose Sit                     # click the open pie menu's entry
 expect-queued 21 173 within 100  # fail unless the menu pushed an action on person 21 aimed at 173
-shot after                     # save the game window to input-shots/after.png
+shot after                     # save the game window to input-shots/after.png (names are unique)
 ```
 
 For example, from a fresh boot (start the capture before entering the house,

@@ -93,6 +93,7 @@ class StepFailed(RuntimeError):
 def parse_scenario(text):
     """The steps of a scenario: [dict(line=, text=, op=, args=[...])]."""
     steps = []
+    shots = set()
     for n, raw in enumerate(text.splitlines(), 1):
         words = shlex.split(raw, comments=True)
         if not words:
@@ -125,6 +126,10 @@ def parse_scenario(text):
             if isinstance(e, ScenarioError):
                 raise
             raise ScenarioError(f'line {n}: {e}') from None
+        if op == 'shot':  # each shot has its own file in the guest and in the capture
+            if args[0] in shots:
+                raise ScenarioError(f'line {n}: a shot named {args[0]!r} is taken already')
+            shots.add(args[0])
         steps.append(step)
     return steps
 
@@ -616,6 +621,8 @@ class Runner:
                 self.write(**row)
                 if want.wait:
                     self.waiting = ('job', n, want.settle, None, row)
+                else:  # not waited on, but its exit code is still checked
+                    self.unchecked.append((n, row))
             elif isinstance(want, Event):
                 self.waiting = ('event', want.kind, want.after)
             elif isinstance(want, Fresh):

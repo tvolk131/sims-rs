@@ -386,6 +386,7 @@ class RunnerTest(RunnerBase):
         self.assertEqual(self.agent.commands, [])
         self.tick(r)
         self.assertEqual(len(self.agent.commands), 1)
+        self.agent.finish_all()
         r.on_dialog('dialog_result', 2)
         self.assertTrue(r.finished)
 
@@ -494,6 +495,7 @@ class ReviewFindingsTest(RunnerBase):
         self.push(r, 8213)
         r.on_dialog('dialog_show', self.update + 1)  # no update returns from here
         self.assertIn('400 400', self.last_command())
+        self.agent.finish_all()
         r.on_dialog('dialog_result', self.update + 1)
         self.assertTrue(r.finished)
         self.assertIsNone(r.failed)
@@ -520,6 +522,20 @@ class ReviewFindingsTest(RunnerBase):
         self.agent.codes = {2: 1}
         self.tick(r)
         self.assertIn('failed with 1', r.failed)
+
+    def test_a_dialog_press_failing_after_the_dialog_closed_still_fails(self):
+        r = self.runner('answer-dialog 400 400')
+        r.on_dialog('dialog_show', 1)
+        self.assertIn('400 400', self.last_command())
+        r.on_dialog('dialog_result', 1)  # closed before the press's end was seen
+        self.assertFalse(r.finished)
+        self.agent.codes = {1: 1}
+        self.tick(r)
+        self.assertIn('failed with 1', r.failed)
+
+    def test_shot_names_are_unique(self):
+        with self.assertRaisesRegex(inp.ScenarioError, 'line 2: a shot named'):
+            inp.parse_scenario('shot same\nshot same')
 
     def test_an_unfinished_scenario_is_logged_at_close(self):
         r = self.runner('wait 5')
