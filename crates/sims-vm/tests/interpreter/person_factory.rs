@@ -61,6 +61,7 @@ pub fn equip(fx: &mut Fixture, guid: u32, name: &str, record_word: i16) {
             file: format!("{name}.bcf"),
             place: 0,
             scales: vec![vec![1]],
+            bones: Vec::new(),
         },
     );
     fx.program.people.profiles.insert(

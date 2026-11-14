@@ -1,4 +1,4 @@
-use sims_formats::animation::{read_bcf, read_cfp};
+use sims_formats::animation::{read_bcf, read_cfp, sample_deltas};
 
 fn word(out: &mut Vec<u8>, v: u32) {
     out.extend(v.to_le_bytes());
@@ -115,11 +115,31 @@ fn cfp_literal_delta_repeat_and_component_reset_preserve_native_coordinates() {
     assert_eq!(s.translations[0][0], 2.0);
     assert_eq!(s.translations[2][0], 2.0);
     assert_eq!(s.translations[0][1], 0.0);
-    assert_eq!(s.translations[0][2], 3.9676e-10f32);
+    assert_eq!(s.translations[0][2].to_bits(), 0x2fda_2038);
     assert_eq!(s.translations[0], s.translations[2]);
     for n in 0..data.len() {
         assert!(read_cfp(&data[..n], 3, 0).is_err());
     }
+}
+/// The table of changes equals the one the original builds (0x5975d4)
+/// in a dump of the running game's memory at 0x6f7188: its FNV-1a 64
+/// digest over the entries' little-endian bytes, and a few entries.
+#[test]
+fn cfp_changes_are_the_originals() {
+    let table = sample_deltas();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in table.iter().flat_map(|v| v.to_bits().to_le_bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    assert_eq!(hash, 0x38df_6758_2366_e4ca);
+    let bits = |i: usize| table[i].to_bits();
+    assert_eq!(bits(0), 0xbdcc_cccd);
+    assert_eq!(bits(1), 0xbdc6_6019);
+    assert_eq!(bits(125), 0xafda_1cdd);
+    assert_eq!(bits(126), 0);
+    assert_eq!(bits(127), 0x2fda_2038);
+    assert_eq!(bits(252), 0x3dcc_cccd);
 }
 #[test]
 fn cfp_rejects_boundary_crossing_nonfinite_reserved_and_oversized_streams() {

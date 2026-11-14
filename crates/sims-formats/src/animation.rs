@@ -205,6 +205,30 @@ pub(crate) fn read_animation(r: &mut Reader<'_>) -> Result<Animation> {
     })
 }
 
+/// The change each byte below 253 of a sample stream makes, as the
+/// original builds its table (0x5975d4, into 0x6f7188) the first time it
+/// reads a sample file: for byte `i`, `t = 2 * i * (1 / 252) - 1`, and the
+/// change is `t` to the fourth power, with `t`'s sign, times 0.1. Each
+/// step is rounded to single precision, as the game's FPU does at 24-bit
+/// precision; the table this gives equals the original's in memory, bit
+/// for bit, for all 253 bytes (checked against a dump of the running
+/// game; the digest is pinned in `tests/avatar_codecs/animation.rs`).
+///
+/// The old prototype took the change as `3.9676e-10 * x^4` in double
+/// precision (x the byte less 126), which differs from the original's
+/// in the last bits of every nonzero entry.
+pub fn sample_deltas() -> [f32; 253] {
+    // 1/252 and 0.1 as the original stores them (0x6720e4, 0x666a38).
+    let step = f32::from_bits(0x3b82_0821);
+    let tenth = f32::from_bits(0x3dcc_cccd);
+    std::array::from_fn(|i| {
+        let t = i as f32 * step;
+        let t = t + t - 1.0;
+        let sign = if t < 0.0 { -1.0 } else { 1.0 };
+        sign * t * t * t * t * tenth
+    })
+}
+
 pub fn read_cfp(data: &[u8], translations: u32, rotations: u32) -> Result<Samples> {
     if translations as usize > MAX_SAMPLES || rotations as usize > MAX_SAMPLES {
         return Err(crate::reader::Error::new(
@@ -213,7 +237,8 @@ pub fn read_cfp(data: &[u8], translations: u32, rotations: u32) -> Result<Sample
         ));
     }
     let mut r = Reader::new(data);
-    fn channel(r: &mut Reader<'_>, n: usize) -> Result<Vec<f32>> {
+    let deltas = sample_deltas();
+    let channel = |r: &mut Reader<'_>, n: usize| -> Result<Vec<f32>> {
         let mut out = Vec::with_capacity(n);
         let mut last = 0.0f32;
         while out.len() < n {
@@ -231,9 +256,9 @@ pub fn read_cfp(data: &[u8], translations: u32, rotations: u32) -> Result<Sample
                 }
                 253 => return r.fail("reserved CFP opcode 0xFD"),
                 value => {
-                    let x = i64::from(value) - 126;
-                    let delta = (3.9676e-10_f64 * (x * x * x * x.abs()) as f64) as f32;
-                    last += delta;
+                    // 0x59758e: the running value plus the byte's change,
+                    // stored as a float.
+                    last += deltas[usize::from(value)];
                     if !last.is_finite() {
                         return r.fail("non-finite CFP delta result");
                     }
@@ -242,7 +267,7 @@ pub fn read_cfp(data: &[u8], translations: u32, rotations: u32) -> Result<Sample
             out.push(last);
         }
         Ok(out)
-    }
+    };
     let mut result = Samples {
         translations: vec![[0.0; 3]; translations as usize],
         rotations: vec![[0.0; 4]; rotations as usize],

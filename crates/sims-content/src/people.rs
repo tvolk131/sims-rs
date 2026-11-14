@@ -22,6 +22,23 @@ pub struct Skeleton {
     /// For every skeleton of the file, in the file's order, the wiggle
     /// scale of each bone (the integer at bone offset 0x78).
     pub scales: Vec<Vec<i32>>,
+    /// The skeleton's bones, in the file's order, as far as posing reads
+    /// them: what the walk's strides are worked out from (0x58831d).
+    pub bones: Vec<Bone>,
+}
+
+/// One bone of a skeleton, as posing reads it. Floats are kept as the
+/// bits of the file's single-precision values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bone {
+    /// The bone's name, which a clip's motion names it by.
+    pub name: String,
+    /// The bone it hangs from, by place; None for the root.
+    pub parent: Option<usize>,
+    /// Its rest position relative to its parent.
+    pub translation: [u32; 3],
+    /// Its rest rotation relative to its parent, a quaternion.
+    pub rotation: [u32; 4],
 }
 
 /// What a person's reset reads from the person type's files when it
@@ -143,7 +160,7 @@ impl People {
                     skeletons
                         .iter()
                         .enumerate()
-                        .filter(|(_, (n, _))| n.eq_ignore_ascii_case(&name))
+                        .filter(|(_, (n, ..))| n.eq_ignore_ascii_case(&name))
                         .map(move |(place, _)| (file, place, skeletons))
                 });
                 let Some((file, place, all)) = found.next() else {
@@ -170,7 +187,8 @@ impl People {
                         name,
                         file: file.clone(),
                         place,
-                        scales: all.iter().map(|(_, scales)| scales.clone()).collect(),
+                        scales: all.iter().map(|(_, scales, _)| scales.clone()).collect(),
+                        bones: all[place].2.clone(),
                     },
                 );
             }
@@ -224,8 +242,8 @@ fn skin_tones(index: &Index, resource: &Resource) -> Result<Vec<String>> {
         .collect())
 }
 
-/// A skeleton file's skeletons: each one's name and bone scales.
-type Skeletons = Vec<(String, Vec<i32>)>;
+/// A skeleton file's skeletons: each one's name, bone scales and bones.
+type Skeletons = Vec<(String, Vec<i32>, Vec<Bone>)>;
 
 /// Every skeleton file the lookup searches, by path relative to the
 /// install, in path order.
@@ -268,7 +286,17 @@ fn skeleton_files(install: &Install, index: &Index) -> Result<BTreeMap<String, S
             .into_iter()
             .map(|s| {
                 let scales = s.bones.iter().map(|b| b.wiggle.gradient_scale).collect();
-                (s.name, scales)
+                let bones = s
+                    .bones
+                    .into_iter()
+                    .map(|b| Bone {
+                        name: b.name,
+                        parent: b.parent,
+                        translation: b.translation.map(f32::to_bits),
+                        rotation: b.rotation.map(f32::to_bits),
+                    })
+                    .collect();
+                (s.name, scales, bones)
             })
             .collect();
         files.insert(location, skeletons);

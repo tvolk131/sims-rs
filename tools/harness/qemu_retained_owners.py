@@ -7,7 +7,7 @@ and provider identity remain a separate, unresolved observation contract.
 import struct
 
 
-SCHEMA = 1
+SCHEMA = 2
 FIELDS = {
     'resource_globals', 'motive_continuations', 'physical_placement',
     'registry_storage_and_order', 'object_native_flags', 'object_definition_identity',
@@ -77,24 +77,35 @@ def spatial_order(m, registry, by_pointer):
     """Read440349's actual registry cache; do not rebuild or sort it.
 
     Dirty and rotation belong to this owner, independently of the live camera.
-    An unresolved cached pointer is missing identity evidence, not an empty
-    entry or permission to substitute the current registry enumeration.
+    The game reads the cache only through 440349, which rebuilds it first
+    (440397) when the dirty byte is set or its rotation is not the camera's
+    ([6e5528]+84). Removing an object from the registry (44383c) sets the
+    dirty byte (443b65) and leaves the cache alone, so a stale cache can name
+    an object that is gone, or a newer object at a reused address. A stale
+    cache's pointers are therefore kept as read and given no identities. A
+    current cache must name only registered objects: an unresolved pointer
+    there is missing identity evidence, not an empty entry or permission to
+    substitute the current registry enumeration.
     """
     dirty = m.byte(registry + 0x44)
     rotation = m.word(registry + 0x48)
     if dirty not in (0, 1) or rotation > 3:
         raise ValueError('invalid retained spatial-order dirty/rotation')
+    camera = m.word(m.word(0x6e5528) + 0x84)
     first, end, capacity = vector(m, registry + 0x4c, 4, 32767)
     pointers = m.words(first, (end-first)//4)
-    ids = []
-    for pointer in pointers:
-        if pointer not in by_pointer:
-            raise ValueError('unknown retained spatial-order object identity')
-        ids.append(by_pointer[pointer])
-    if len(set(ids)) != len(ids):
-        raise ValueError('duplicate retained spatial-order object identity')
-    return dict(dirty=dirty, rotation=rotation, begin=first, end=end,
-                capacity=capacity, pointers=pointers, ids=ids)
+    stale = dirty != 0 or rotation != camera
+    ids = None
+    if not stale:
+        ids = []
+        for pointer in pointers:
+            if pointer not in by_pointer:
+                raise ValueError('unknown retained spatial-order object identity')
+            ids.append(by_pointer[pointer])
+        if len(set(ids)) != len(ids):
+            raise ValueError('duplicate retained spatial-order object identity')
+    return dict(dirty=dirty, rotation=rotation, camera_rotation=camera, stale=stale,
+                begin=first, end=end, capacity=capacity, pointers=pointers, ids=ids)
 
 
 def capture(m, state, sim, registry):

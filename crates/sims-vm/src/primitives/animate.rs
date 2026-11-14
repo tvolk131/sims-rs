@@ -50,7 +50,8 @@
 //!
 //! **Not ported**, failing loudly: the base and carry slots (flag bits
 //! 0x01 and 0x10 alone), names
-//! listed anywhere but the global animation tables (byte 4 other than 3),
+//! listed anywhere but the global animation tables and an object's own
+//! (byte 4 other than 3 and 0),
 //! a clip that is missing, the timed events `clip_events.rs` does not
 //! port, and a person whose posture
 //! is 1 or 2 when its clip is done. The original also notes an unexpected
@@ -74,6 +75,17 @@ const CHILD_CLIPS: u16 = 157;
 
 /// Person word 58: the person's age.
 const AGE: usize = 58;
+
+/// An object's own tables of clip names (0x59dd6d, through 0x457b60,
+/// 0x457ba8, 0x457bcc and 0x457bf0): an adult's, a child's, an adult's
+/// with a child, and a child's with an adult.
+const OWN_CLIPS: u16 = 129;
+const OWN_CHILD_CLIPS: u16 = 130;
+const OWN_CLIPS_WITH_CHILD: u16 = 131;
+const OWN_CHILD_CLIPS_WITH_ADULT: u16 = 132;
+
+/// The type of a person (definition +0x12).
+const PERSON_TYPE: i16 = 2;
 
 impl Machine<'_, '_> {
     pub(crate) fn animate_sim(&mut self, operands: &[u8; 8]) -> Result<Flow, Trap> {
@@ -284,45 +296,114 @@ impl Machine<'_, '_> {
     /// frame count of its first motion, whether a motion binds to a bone,
     /// and how many motions have timed events.
     ///
-    /// Only names listed in the global animation tables (byte 4 is 3,
-    /// 0x59dd16) are ported: the number counts from 1 into string table
-    /// 156, or 157 for a person of age 17 or less. That every motion of the
-    /// clip binds to a bone of the person's skeleton is **unverified**; a
-    /// clip with motions is taken to bind at least one.
+    /// Byte 4 says where the name is listed. The number counts from 1 into
+    /// a string table:
+    ///
+    /// - 3, the global animation tables (0x59dd16): table 156, or 157 for
+    ///   a person of age 17 or less (word 58).
+    /// - 0, an object's own tables (0x59dd6d). The object is the stack
+    ///   object when the number comes from a parameter (flag 0x04), else
+    ///   the object the person used last (the last entry of person
+    ///   +0xb00, 0x5894e2), or the person itself when it uses none; none
+    ///   at all is native error 0x17. The table is 129, or 130 for a
+    ///   person of age 17 or less. For a clip in the foreground slot
+    ///   without a pickup, when the object is the target of the person's
+    ///   running action (person +0xa50) and that action's icon (+0xa54) is
+    ///   a person (type 2), the icon person's age picks instead: 131 for
+    ///   an adult with a child, 132 for a child with an adult.
+    ///
+    /// That every motion of the clip binds to a bone of the person's
+    /// skeleton is **unverified**; a clip with motions is taken to bind at
+    /// least one.
+    ///
+    /// Fails for what is not ported: the other sources (1 and 2,
+    /// 0x59defc and 0x59deb4), and a name that is not listed (the original
+    /// reports a missing animation and plays its stand-in, 0x4f6e5b).
     fn clip(
         &self,
         operands: &[u8; 8],
         id: i16,
     ) -> Result<(String, sims_core::F32, u32, bool, usize), Trap> {
         let source = operands[4] as i8;
-        if source != 3 {
-            return Err(Trap::Unsupported(format!(
-                "Animate Sim naming its clip from source {source} (0x58944b), which is not \
-                 ported"
-            )));
-        }
-        let age = self
-            .me()?
-            .person
-            .as_ref()
-            .and_then(|p| p.data.get(AGE).copied())
-            .unwrap_or(0);
-        let table = if age <= 17 { CHILD_CLIPS } else { ADULT_CLIPS };
+        let child = |object: u16| -> Result<bool, Trap> {
+            let age = self
+                .world
+                .objects
+                .get(&object)
+                .and_then(|o| o.person.as_ref())
+                .and_then(|p| p.data.get(AGE).copied())
+                .unwrap_or(0);
+            Ok(age <= 17)
+        };
+        let me_child = child(self.me)?;
+        let (resource, table) = match source {
+            3 => (
+                self.program.global,
+                if me_child { CHILD_CLIPS } else { ADULT_CLIPS },
+            ),
+            0 => {
+                let object = self.own_clip_object(operands)?;
+                let mut other_child = me_child;
+                let foreground = operands[5] & 0x11 == 0;
+                let active = self.me()?.person.as_ref().map(|p| &p.active);
+                if foreground
+                    && let Some(action) = active
+                    && action.target != 0
+                    && i32::from(action.target) == i32::from(object)
+                    && action.icon != 0
+                    && let Ok(icon) = u16::try_from(action.icon)
+                    && self.interpreter().kind(self.world, icon)? == PERSON_TYPE
+                    && self
+                        .world
+                        .objects
+                        .get(&icon)
+                        .is_some_and(|o| o.person.is_some())
+                {
+                    other_child = child(icon)?;
+                }
+                let table = match (me_child, other_child) {
+                    (false, false) => OWN_CLIPS,
+                    (true, true) => OWN_CHILD_CLIPS,
+                    (false, true) => OWN_CLIPS_WITH_CHILD,
+                    (true, false) => OWN_CHILD_CLIPS_WITH_ADULT,
+                };
+                let guid = self
+                    .world
+                    .objects
+                    .get(&object)
+                    .ok_or(Trap::native(
+                        0x17,
+                        "Animate Sim has no object to name its clip",
+                    ))?
+                    .guid;
+                let definition = self
+                    .catalog
+                    .object(guid)
+                    .ok_or_else(|| Trap::Invalid(format!("no definition for GUID 0x{guid:08X}")))?;
+                (definition.resource, table)
+            }
+            _ => {
+                return Err(Trap::Unsupported(format!(
+                    "Animate Sim naming its clip from source {source} (0x58944b), which is not \
+                     ported"
+                )));
+            }
+        };
         let name = usize::try_from(id)
             .ok()
             .and_then(|i| {
                 self.program
                     .libraries
-                    .get(&self.program.global)
+                    .get(&resource)
                     .and_then(|g| g.strings.get(&table))
                     .and_then(|s| s.get(i))
             })
             .filter(|name| !name.is_empty())
             .ok_or_else(|| {
                 Trap::Unsupported(format!(
-                    "clip {id} is not listed in the global file's string table {table}: the \
-                     original reports a missing animation and plays its stand-in (0x5898b6), \
-                     which is not ported"
+                    "clip {id} is not listed in string table {table} of its source {source}: \
+                     the original reports a missing animation and plays its stand-in \
+                     (0x4f6e5b), which is not ported"
                 ))
             })?;
         let clip = self
@@ -337,5 +418,32 @@ impl Machine<'_, '_> {
             clip.motions > 0,
             clip.tracks.len(),
         ))
+    }
+
+    /// The object whose own tables name a clip (0x5893e7 to 0x589448):
+    /// the stack object when the number comes from a parameter (flag
+    /// 0x04), else the target of the person's last object use (0x5894e2),
+    /// or the person itself when it uses none.
+    fn own_clip_object(&self, operands: &[u8; 8]) -> Result<u16, Trap> {
+        if operands[5] & 0x04 != 0 {
+            let object = self.frame()?.stack_object;
+            return u16::try_from(object)
+                .ok()
+                .filter(|id| self.world.objects.contains_key(id))
+                .ok_or(Trap::native(
+                    0x17,
+                    "Animate Sim has no object to name its clip",
+                ));
+        }
+        let person = self
+            .me()?
+            .person
+            .as_ref()
+            .ok_or(Trap::native(0x1c, "object is not a person"))?;
+        Ok(match person.object_uses.last() {
+            Some(last) => u16::try_from(last.target)
+                .map_err(|_| Trap::Invalid(format!("an object use of object {}", last.target)))?,
+            None => self.me,
+        })
     }
 }

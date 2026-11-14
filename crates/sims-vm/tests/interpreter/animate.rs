@@ -1,5 +1,6 @@
-//! Animate Sim (opcode 44, 0x58950b) and a person's animator tick
-//! (0x58dc72). Synthetic; no game data.
+//! Animate Sim (opcode 44, 0x58950b), Look Towards (opcode 22,
+//! 0x45a98e) and a person's animator tick (0x58dc72). Synthetic; no game
+//! data.
 
 use crate::support::*;
 use sims_content::{Clip, Event, Profile, Track};
@@ -59,6 +60,8 @@ fn sim_animates(operands: [u8; 8]) -> Fixture {
             frames: 4,
             motions: 1,
             tracks: Vec::new(),
+            channels: Vec::new(),
+            samples: [0, 0],
         },
     );
     fx.program.animations.insert_samples(SKILL);
@@ -290,7 +293,7 @@ fn what_animate_sim_does_not_port_fails_loudly() {
     for (operands, what) in [
         (animate(1, 3, 0x01, 0, 0), "base slot"),
         (animate(1, 3, 0x10, 0, 0), "carry slot"),
-        (animate(1, 0, 0, 0, 0), "source 0"),
+        (animate(1, 1, 0, 0, 0), "source 1"),
         (animate(2, 3, 0, 0, 0), "not listed"),
     ] {
         let mut fx = sim_animates(operands);
@@ -312,6 +315,8 @@ fn what_animate_sim_does_not_port_fails_loudly() {
             frames: 4,
             motions: 1,
             tracks: Vec::new(),
+            channels: Vec::new(),
+            samples: [0, 0],
         },
     );
     assert!(unsupported(turn(&mut fx)).contains("samples"));
@@ -327,6 +332,8 @@ fn what_animate_sim_does_not_port_fails_loudly() {
             frames: 4,
             motions: 1,
             tracks: vec![track(&[(0, &[("xevt", "1")])])],
+            channels: Vec::new(),
+            samples: [0, 0],
         },
     );
     assert!(unsupported(turn(&mut fx)).contains("defined differently"));
@@ -364,6 +371,93 @@ fn a_parameter_can_name_the_clip_and_a_bad_one_is_error_8() {
     assert_eq!(turn(&mut fx).unwrap(), Status::Yielded);
     let mut fx = sim_animates(animate(3, 3, 0x04, 0, 0));
     assert_eq!(code(turn(&mut fx).map(|_| true)), Some(8));
+}
+
+/// Source 0 (0x59dd6d): an object's own tables name the clip. With no
+/// parameter and no object in use, the object is the person itself.
+#[test]
+fn a_clip_can_be_named_by_an_objects_own_table() {
+    let own = |fx: &mut Fixture, table: u16| {
+        fx.program
+            .libraries
+            .get_mut(&SIM_FILE)
+            .unwrap()
+            .strings
+            .insert(table, vec![String::new(), CLIP.into()]);
+    };
+    // An adult reads table 129.
+    let mut fx = sim_animates(animate(1, 0, 0, 0, 0));
+    own(&mut fx, 129);
+    assert_eq!(turn(&mut fx).unwrap(), Status::Yielded);
+    assert_eq!(
+        fx.world.animators[&SIM].foreground.as_ref().unwrap().clip,
+        CLIP
+    );
+    // A child (age 17 or less, word 58) reads table 130, not 129.
+    let mut fx = sim_animates(animate(1, 0, 0, 0, 0));
+    fx.sim_mut().person.as_mut().unwrap().data[58] = 8;
+    own(&mut fx, 129);
+    assert!(unsupported(turn(&mut fx)).contains("string table 130"));
+    let mut fx = sim_animates(animate(1, 0, 0, 0, 0));
+    fx.sim_mut().person.as_mut().unwrap().data[58] = 8;
+    own(&mut fx, 130);
+    assert_eq!(turn(&mut fx).unwrap(), Status::Yielded);
+}
+
+/// Look Towards (opcode 22, 0x45a98e) in mode 0: the head follows the
+/// stack object, through person data words 41 to 45 (0x58a035).
+#[test]
+fn look_towards_mode_0_sets_the_heads_target() {
+    let look = |mode: i16| {
+        let mut fx = Fixture::new();
+        let [a, b] = mode.to_le_bytes();
+        fx.add(
+            SIM_FILE,
+            4096,
+            tree(vec![ins(
+                22,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [a, b, 0, 0, 0, 0, 0, 0],
+            )]),
+        );
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![ins(
+                22,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [a, b, 0, 0, 0, 0, 0, 0],
+            )]),
+        );
+        fx
+    };
+    let mut fx = look(0);
+    fx.sim_mut().person.as_mut().unwrap().data[41..46].copy_from_slice(&[9, 9, 9, 9, 9]);
+    assert!(fx.run_with(SIM, 4096, LAMP as i16, &[], 10).unwrap());
+    let data = &fx.sim().person.as_ref().unwrap().data;
+    assert_eq!(data[41..46], [LAMP as i16, 1, 0, 1, 0]);
+    // With no stack object, word 42 is 0.
+    let mut fx = look(0);
+    assert!(fx.run_with(SIM, 4096, 0, &[], 10).unwrap());
+    assert_eq!(
+        fx.sim().person.as_ref().unwrap().data[41..46],
+        [0, 0, 0, 1, 0]
+    );
+    // Modes 1 to 3 turn the person on the spot, which is not ported;
+    // any other mode is error 0x27; an object that is not a person fails.
+    let fails = |fx: &mut Fixture, object: u16| {
+        fx.run_with(object, 4096, LAMP as i16, &[], 10)
+            .unwrap_err()
+            .to_string()
+    };
+    assert!(fails(&mut look(2), SIM).contains("mode 2"));
+    assert_eq!(
+        code(look(4).run_with(SIM, 4096, LAMP as i16, &[], 10)),
+        Some(0x27)
+    );
+    assert!(fails(&mut look(0), LAMP).contains("not a person"));
 }
 
 #[test]
@@ -577,6 +671,8 @@ fn with_events(tracks: Vec<Track>) -> Fixture {
             frames: 4,
             motions: 2,
             tracks,
+            channels: Vec::new(),
+            samples: [0, 0],
         },
     );
     fx.thread(SIM, 4096, &[-7]);
@@ -717,6 +813,8 @@ fn routed() -> Fixture {
                 frames: 4,
                 motions: 1,
                 tracks: Vec::new(),
+                channels: Vec::new(),
+                samples: [0, 0],
             },
         );
     }
@@ -925,6 +1023,8 @@ fn what_the_route_follow_does_not_port_fails_loudly() {
             frames: 4,
             motions: 1,
             tracks: Vec::new(),
+            channels: Vec::new(),
+            samples: [0, 0],
         },
     );
     assert!(
@@ -943,11 +1043,12 @@ fn what_the_route_follow_does_not_port_fails_loudly() {
     fx.sim_mut().data[42] = 0;
     assert!(tick(&mut fx).unwrap_err().to_string().contains("blocked"));
     // The end of a path for a person whose object data word 9 is clear
-    // (0x58e8be: a timer and a stopping clip).
+    // (0x58e8be) needs the walk's footfalls, which this walk clip has no
+    // events for (0x588df8).
     let mut fx = routed();
     fx.world.routing.routes.get_mut(&SIM).unwrap().path.pop();
     fx.sim_mut().data[9] = 0;
-    assert!(tick(&mut fx).unwrap_err().to_string().contains("0x58e8be"));
+    assert!(tick(&mut fx).unwrap_err().to_string().contains("0x588df8"));
     // Stopping at the end of a path for a person whose word 64 is set
     // (0x58e83b).
     let mut fx = routed();

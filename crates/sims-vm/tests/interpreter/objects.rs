@@ -255,6 +255,7 @@ fn people() -> People {
                     place: 1,
                     // A scale of 1 costs a bone 32 draws, any other 48.
                     scales: vec![vec![1], vec![1, 7, 0]],
+                    bones: Vec::new(),
                 },
             ),
             (
@@ -264,6 +265,7 @@ fn people() -> People {
                     file: "c.bcf".into(),
                     place: 0,
                     scales: vec![vec![5]],
+                    bones: Vec::new(),
                 },
             ),
         ]),

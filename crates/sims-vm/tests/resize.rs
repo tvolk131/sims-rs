@@ -346,29 +346,100 @@ fn map_bytes<K: serde::Serialize, V>(
     bytes
 }
 
-/// A motion's encoding under snapshot format 15: without the last step
-/// and the two end-of-path flags that format 16 added at its end.
-fn motion_15_bytes(motion: &sims_sim::animator::Motion) -> Vec<u8> {
+/// A motion's encoding under snapshot format 16: without the timer
+/// ([`sims_sim::animator::Motion::timer`]) that format 17 added at its end.
+fn motion_16_bytes(motion: &sims_sim::animator::Motion) -> Vec<u8> {
     let mut bytes = postcard::to_allocvec(motion).unwrap();
+    let added = postcard::to_allocvec(&motion.timer).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - added.len()), added);
+    bytes
+}
+
+/// A motion's encoding under snapshot format 15: also without the last
+/// step and the two end-of-path flags that format 16 added at its end.
+fn motion_15_bytes(motion: &sims_sim::animator::Motion) -> Vec<u8> {
+    let mut bytes = motion_16_bytes(motion);
     let added = postcard::to_allocvec(&(motion.step, motion.near_end, motion.finishing)).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - added.len()), added);
     bytes
 }
 
-/// An animator's encoding under snapshot format 15, with its motion as
-/// [`motion_15_bytes`] writes it.
-fn animator_15_bytes(animator: &sims_sim::animator::Animator) -> Vec<u8> {
+/// A foreground layer's encoding under snapshot format 16: without the
+/// fade ([`sims_sim::animator::Layer::fade`]) that format 17 added at its
+/// end.
+fn layer_16_bytes(layer: &Option<sims_sim::animator::Layer>) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(layer).unwrap();
+    if let Some(layer) = layer {
+        let added = postcard::to_allocvec(&layer.fade).unwrap();
+        assert_eq!(bytes.split_off(bytes.len() - added.len()), added);
+    }
+    bytes
+}
+
+/// An animator's encoding with its motion written by `motion` and its
+/// foreground layer by [`layer_16_bytes`].
+fn animator_old_bytes(
+    animator: &sims_sim::animator::Animator,
+    motion: fn(&sims_sim::animator::Motion) -> Vec<u8>,
+) -> Vec<u8> {
     use sims_sim::animator::{Animator, Motion};
+    let with_motion = |a: &Animator| {
+        let blank = Animator {
+            motion: Motion::NONE,
+            ..a.clone()
+        };
+        splice(
+            &postcard::to_allocvec(a).unwrap(),
+            &postcard::to_allocvec(&blank).unwrap(),
+            &postcard::to_allocvec(&a.motion).unwrap(),
+            &postcard::to_allocvec(&Motion::NONE).unwrap(),
+            &motion(&a.motion),
+        )
+    };
     let blank = Animator {
-        motion: Motion::NONE,
+        foreground: None,
         ..animator.clone()
     };
     splice(
-        &postcard::to_allocvec(animator).unwrap(),
-        &postcard::to_allocvec(&blank).unwrap(),
-        &postcard::to_allocvec(&animator.motion).unwrap(),
-        &postcard::to_allocvec(&Motion::NONE).unwrap(),
-        &motion_15_bytes(&animator.motion),
+        &with_motion(animator),
+        &with_motion(&blank),
+        &postcard::to_allocvec(&animator.foreground).unwrap(),
+        &[0],
+        &layer_16_bytes(&animator.foreground),
+    )
+}
+
+/// An animator's encoding under snapshot format 16 ([`motion_16_bytes`],
+/// [`layer_16_bytes`]).
+fn animator_16_bytes(animator: &sims_sim::animator::Animator) -> Vec<u8> {
+    animator_old_bytes(animator, motion_16_bytes)
+}
+
+/// An animator's encoding under snapshot format 15, with its motion as
+/// [`motion_15_bytes`] writes it.
+fn animator_15_bytes(animator: &sims_sim::animator::Animator) -> Vec<u8> {
+    animator_old_bytes(animator, motion_15_bytes)
+}
+
+/// A lot's encoding as snapshot format 16 wrote it. Format 17 added two
+/// things: at the end of each animator's motion the timer of a walk that
+/// slows to a stop ([`sims_sim::animator::Motion::timer`], animator
+/// +0x1c0), and at the end of each foreground layer its fade
+/// ([`sims_sim::animator::Layer::fade`], layer +0x48 to +0x54). This
+/// writes the animators again without those bytes, so a state pinned
+/// under format 16 can be shown to be the same state but for those
+/// fields.
+fn format_16_bytes(world: &World) -> Vec<u8> {
+    let blank = World {
+        animators: Default::default(),
+        ..world.clone()
+    };
+    splice(
+        &world.encode(),
+        &blank.encode(),
+        &postcard::to_allocvec(&world.animators).unwrap(),
+        &[0],
+        &map_bytes(&world.animators, animator_16_bytes),
     )
 }
 
@@ -1613,14 +1684,14 @@ fn the_goth_house_objects_are_all_visited() {
             .map(|(&id, _)| id)
             .collect();
         assert_eq!(occupied, OCCUPIED);
-        assert_eq!(digest(&world.encode()), VISITED_16);
+        assert_eq!(digest(&format_16_bytes(world)), VISITED_16);
         pinned(&without_room_notes(world), VISITED, VISITED_7);
         // Steps 14 and 15 change nothing on this lot, and neither does
         // asking for the indicators again in step 16.
         assert_eq!(interpreter.ensure_indicators(world), Ok(None));
         world.finish_selection(flags).unwrap();
         assert_eq!(interpreter.ensure_indicators(world), Ok(None));
-        assert_eq!(digest(&world.encode()), VISITED_16);
+        assert_eq!(digest(&format_16_bytes(world)), VISITED_16);
         pinned(&without_room_notes(world), VISITED, VISITED_7);
     });
 }
@@ -1770,7 +1841,7 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
         assert_eq!(world.global_rng, before.global_rng);
         assert_eq!(world.lot_rng, before.lot_rng);
         assert_eq!(world.crt_rng, before.crt_rng);
-        assert_eq!(digest(&world.encode()), BASELINE_16);
+        assert_eq!(digest(&format_16_bytes(world)), BASELINE_16);
         let noted = without_room_notes(world);
         assert_eq!(digest(&format_8_bytes(&noted)), BASELINE);
         assert_eq!(digest(&format_9_bytes(&noted)), BASELINE_9);
@@ -1880,14 +1951,25 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// someone is in it (0x468802) and waits to be counted again. In tick 261
 /// it stands at the end of that walk.
 ///
-/// Tick 262 then fails loudly: person 21's animator comes to the end of
-/// its next path with object data word 9 clear (0x58e8be), which is not
-/// ported. The fourth capture's state after tick 262 was compared with
-/// ours at the stop: the objects that ran before person 21, person 21's
-/// frames, data words, running action and objects in use, the action
-/// counter and object 132's user count are equal. Person 21's person
-/// word 27 is 40 here and 41 there, which the steps after the stop
-/// presumably write (**unverified**).
+/// In tick 262 person 21's animator comes to the last point of its next
+/// path with object data word 9 clear (0x58e8be): its foreground clip may
+/// not be interrupted and has not finished, so it only marks the motion as
+/// near its end and walks on. The walk's strides (animator +0x17c and
+/// +0x178), which that code reads, are worked out by posing the person's
+/// skeleton with the walk clip at the clip's two footfalls, as the
+/// person's constructor does (0x58831d); they equal the stored values in
+/// the fourth capture's updates 1, 300 and 600. In tick 263 it turns on the
+/// spot. In tick 296, at the end of its next path and within a stride of
+/// it, it sets a timer to stop (motion timer, 0x58e8be) and fades the walk
+/// clip's weight; in tick 297 the timer stops it and it turns, and in
+/// tick 321 it stands. In tick 322 it plays a clip from its own table
+/// (Animate Sim, source 0).
+///
+/// Tick 334 then fails loudly: person 16 looks towards person 259 (Look
+/// Towards, mode 0), and its head then follows the target (0x5907c5),
+/// which needs the bones' places in the current pose (0x5904d2) and is not
+/// ported. Our state after each of ticks 1 to 333 equals the fourth capture
+/// (full state after every update), as compared outside this test.
 ///
 /// The first capture does not choose in tick 233: its one draw from the
 /// lot's stream in ticks 233 and 234 comes in tick 234, and after tick
@@ -1912,7 +1994,11 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// rooms that wait, so from the frame after tick 2 on the rooms hold
 /// other values (before, rooms 1 to 4 waited for ever). The rooms are in
 /// no capture; everything the captures hold is equal before and after
-/// that change. The digests are of our own state, as built here.
+/// that change. The states after ticks 1, 5, 13, 33, 232 and 261 were
+/// pinned under format 16 ([`format_16_bytes`]), before the motion's timer
+/// and the layer's fade were kept, and still hold; the state after tick
+/// 261 is pinned again under format 17 (`TICK_261_17`). The digests are of
+/// our own state, as built here.
 #[test]
 fn the_goth_house_first_tick_matches_the_original() {
     const TICK_1_9: &str = "62fc28f5e7689d166791a620dbed066fb8a7d707ea79017fbadf0eed3da5c937";
@@ -1927,6 +2013,8 @@ fn the_goth_house_first_tick_matches_the_original() {
     const TICK_33: &str = "993d4a392c989284ac46b24598bea898621ce2361c106b38d2e5d39d398f67f3";
     const TICK_232: &str = "3e093fa4389e6ff31c8e9c976dfd03d7c1796b495d21b0e11bcb17d5d03111d7";
     const TICK_261: &str = "1b931d4492d3e02a8c72bcb658c55110e6b0f535cd20d99a937d09b6d62a420b";
+    const TICK_261_17: &str = "2cc7b436d7f3e46f09b4801883c5d258d7d1e1e7411ba32e54eb1c8e52c419d4";
+    const TICK_333: &str = "d82f96a31cf3dfd69c64b0b7ea14c0f943feb566ed2ecf7abdc8bcf845200916";
     const USES_233: [(i16, i32); 2] = [(132, 5), (51, 8)];
     const TREES_233: [u16; 9] = [
         0x1000, 0x2001, 0x205b, 0x2029, 0x100e, 0x1014, 0x1012, 0x1009, 0x1010,
@@ -2006,7 +2094,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert_eq!(digest(&format_12_bytes(&old)), TICK_1_12);
         assert_eq!(digest(&format_13_bytes(&old)), TICK_1_13);
         assert_eq!(digest(&format_14_bytes(world)), TICK_1_14);
-        assert_eq!(digest(&world.encode()), TICK_1);
+        assert_eq!(digest(&format_16_bytes(world)), TICK_1);
         // Ticks 2 to 5. Person 16 starts a clip with Animate Sim in tick 2
         // and yields; the capture shows that person at the same
         // instruction after ticks 2 to 5, with the same frames (the 254 in
@@ -2072,7 +2160,7 @@ fn the_goth_house_first_tick_matches_the_original() {
             ]
         );
         assert_eq!(world.objects[&16].stack[4].locals, [0, 3, 8222, 254]);
-        assert_eq!(digest(&world.encode()), TICK_5);
+        assert_eq!(digest(&format_16_bytes(world)), TICK_5);
         // Ticks 6 to 13. In tick 6 object 382 makes a person of type
         // 0x44A86A6C (Create New Object Instance mode 8), who gets the
         // lowest unused ID, 259, and is put down where the pedestrian
@@ -2121,7 +2209,7 @@ fn the_goth_house_first_tick_matches_the_original() {
             .map(|f| (f.tree, f.node))
             .collect();
         assert_eq!(frames, [(0x1000, 9), (0x118, 0)]);
-        assert_eq!(digest(&world.encode()), TICK_13);
+        assert_eq!(digest(&format_16_bytes(world)), TICK_13);
         // Ticks 14 to 33. In tick 14 person 259 runs a tree of object 51
         // (Run Tree By Name), which starts using it, and in that tree goes
         // to the object's routing slot 0 (Go To Routing Slot): it plans a
@@ -2164,7 +2252,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert_eq!(animator.motion.progress.to_bits(), 0x3de9_8f51);
         assert_eq!(animator.destination[2].to_bits(), 0x3e57_5200);
         assert!(animator.undrawn);
-        assert_eq!(digest(&world.encode()), TICK_33);
+        assert_eq!(digest(&format_16_bytes(world)), TICK_33);
         // The frame after tick 33 draws person 259 for the first time,
         // which unsets its animator's position and places it again on its
         // tile, facing its direction word: 0, where the turn had it at
@@ -2188,7 +2276,7 @@ fn the_goth_house_first_tick_matches_the_original() {
                 assert!(!world.neighbors.relationships_changed);
             }
             if tick == 232 {
-                assert_eq!(digest(&world.encode()), TICK_232);
+                assert_eq!(digest(&format_16_bytes(world)), TICK_232);
                 assert_eq!(world.action_serial, 0);
             }
             if tick == 233 {
@@ -2244,15 +2332,66 @@ fn the_goth_house_first_tick_matches_the_original() {
         let animator = &world.animators[&21];
         assert_eq!((animator.state, animator.arrival), (3, 2));
         assert_eq!(world.objects[&21].position, POSITION_261);
-        assert_eq!(digest(&world.encode()), TICK_261);
-        // Tick 262 stops loudly: person 21's animator comes to the end of
-        // its next path with object data word 9 clear (0x58e8be), which is
-        // not ported.
+        assert_eq!(digest(&format_16_bytes(world)), TICK_261);
+        assert_eq!(digest(&world.encode()), TICK_261_17);
+        // The walk's strides, worked out by posing each person's skeleton
+        // with its walk clip, equal what the original's constructor stored
+        // (animator +0x17c and +0x178, the same in the capture's updates
+        // 1, 300 and 600).
+        let strides = |id| interpreter.strides(world, id).unwrap().map(|f| f.to_bits());
+        assert_eq!(strides(16), [0x40d8_93f8, 0x40bc_ad30]);
+        assert_eq!(strides(18), [0x412c_5b86, 0x412a_0544]);
+        assert_eq!(strides(21), [0x412c_5b86, 0x412a_0544]);
+        // Ticks 262 to 333, with frames after ticks 273, 303 and 333.
+        for tick in 262..=333 {
+            interpreter.lot_update(world, &tuning, &mut player).unwrap();
+            if (tick - 33) % 30 == 0 {
+                interpreter.draw_frame(world, 1).unwrap();
+            }
+            let animator = &world.animators[&21];
+            let motion = &animator.motion;
+            let fields = (
+                animator.state,
+                animator.arrival,
+                animator.selection,
+                animator.walking,
+                motion.near_end,
+                motion.finishing,
+                motion.timer,
+            );
+            match tick {
+                // Person 21 walks the last point of its path with data word
+                // 9 clear: the foreground clip may not be interrupted and
+                // has not finished, so it walks on without a timer.
+                262 => assert_eq!(fields, (9, 1, 20, true, 1, 1, 0)),
+                // It stops at the end of the path and turns on the spot.
+                263 => assert_eq!(fields, (4, 1, 5, false, 1, 1, 0)),
+                // At the end of its next path, within a stride of it with
+                // no foreground clip, it sets the timer to stop.
+                296 => assert_eq!(fields, (9, 1, 20, true, 1, 1, 4_437_050)),
+                // The timer stops it there, and it turns: three eighths or
+                // less, the clip of a quarter turn.
+                297 => assert_eq!(fields, (4, -1, 7, true, 1, 0, 0)),
+                // Turning clears the walking flag.
+                298 => assert_eq!(fields, (4, -1, 7, false, 1, 0, 0)),
+                // It stands, then plays a clip from its own table (Animate
+                // Sim, source 0).
+                321 => assert_eq!(fields, (3, 2, -1, false, 1, 0, 0)),
+                322 => assert_eq!(fields, (0, 0, -1, false, 1, 0, 0)),
+                _ => {}
+            }
+        }
+        assert_eq!(world.ticks, before.ticks + 333);
+        assert_eq!(digest(&world.encode()), TICK_333);
+        // Tick 334 stops loudly: person 16 looks towards person 259 (Look
+        // Towards, mode 0, sets its person data words 41 to 45), and its
+        // head then follows the target (0x5907c5), which needs the bones'
+        // places in the current pose (0x5904d2) and is not ported.
         let error = interpreter
             .lot_update(world, &tuning, &mut player)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("object 21"), "{error}");
-        assert!(error.contains("0x58e8be"), "{error}");
+        assert!(error.contains("object 16"), "{error}");
+        assert!(error.contains("0x5904d2"), "{error}");
     });
 }

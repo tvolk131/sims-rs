@@ -128,9 +128,40 @@ fn what_the_layer_update_does_not_port_fails() {
     let mut layer = Layer::start("c", F32::from_bits(0x42c8_0000), 4, true, 0, false, 0);
     layer.mode = 2;
     assert!(layer.update(200).unwrap_err().contains("end mode 2"));
+}
+
+#[test]
+fn a_fading_layer_moves_its_weight_towards_the_end_then_stops() {
+    // 0x597a3e starts the fade; 0x597e3c steps it at the layer's clock.
     let mut layer = Layer::start("c", THOUSAND, 4, true, 0, false, 0);
-    layer.fading = true;
-    assert!(layer.update(50).unwrap_err().contains("fading"));
+    layer.start_fade(0, 200, F32::from_bits(0x3f80_0000), F32::ZERO);
+    assert!(layer.fading);
+    // A quarter of the way: 1 + (0 - 1) * 0.25.
+    layer.update(50).unwrap();
+    assert!(layer.fading);
+    assert_eq!(layer.weight.to_bits(), 0x3f40_0000);
+    // At the length itself the fade is not yet over.
+    layer.update(200).unwrap();
+    assert!(layer.fading);
+    assert_eq!(layer.weight, F32::ZERO);
+    // Past it the weight is the end and the fade is over.
+    let mut layer = Layer::start("c", THOUSAND, 4, true, 0, false, 0);
+    layer.start_fade(
+        0,
+        200,
+        F32::from_bits(0x3f80_0000),
+        F32::from_bits(0x3e80_0000),
+    );
+    layer.update(250).unwrap();
+    assert!(!layer.fading);
+    assert_eq!(layer.weight.to_bits(), 0x3e80_0000);
+    // A fade of no length has no share done (0 over 0 is not a number):
+    // the weight stays at the start until the clock passes it.
+    let mut layer = Layer::start("c", THOUSAND, 4, true, 0, false, 0);
+    layer.start_fade(0, 0, F32::from_bits(0x3f00_0000), F32::ZERO);
+    layer.update(0).unwrap();
+    assert!(layer.fading);
+    assert_eq!(layer.weight.to_bits(), 0x3f00_0000);
 }
 
 #[test]
