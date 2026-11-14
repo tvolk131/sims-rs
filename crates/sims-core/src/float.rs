@@ -380,6 +380,23 @@ impl Ext {
         }
     }
 
+    /// `FPATAN` on two stored floats: the angle of the point (`x`, `y`)
+    /// from the positive x axis, in radians from -pi to pi. The
+    /// instruction computes with the register's full 64-bit significand
+    /// whatever the precision control says (the control only rounds add,
+    /// subtract, multiply, divide and square root), so the result is kept
+    /// as an [`Ext`].
+    ///
+    /// The value is libm's double-precision `atan2`, which is correct to
+    /// within one unit in the last place of a double. Code that rounds the
+    /// result to 24 bits, as every use in the game does, gets the FPU's
+    /// value unless the exact angle lies within about 2^-52 of a rounding
+    /// midpoint; that the game's inputs never do is **unverified**.
+    pub fn atan2(y: F32, x: F32) -> Self {
+        let value = libm::atan2(f64::from(y.to_f32()), f64::from(x.to_f32()));
+        Self::from_f64_bits(value.to_bits())
+    }
+
     pub fn abs(self) -> Self {
         match self.class {
             Class::Nan => Self::NAN,

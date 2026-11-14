@@ -37,6 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rsp import Remote  # noqa: E402
+from qmp import Qmp  # noqa: E402
 import qemu_retained_owners  # noqa: E402
 import qemu_neighborhood_owners as neighborhood_owners  # noqa: E402
 
@@ -206,6 +207,32 @@ def parse_set(text):
     return out
 
 
+def dump(container, guest_dir, d, regs, raw):
+    """Write every present user page of the stopped process: d/ranges.json ([start, size, protection, file]),
+    d/registers.json (the stop's registers and the stub's whole register packet, which holds the segment
+    bases and the FPU state), and one file per range. QEMU writes into the guest directory; the files are
+    then moved to d. Returns the number of bytes."""
+    q = Qmp(container)
+    try:
+        ranges = q.user_ranges()
+        tmp = guest_dir / 'dump-tmp'
+        tmp.mkdir(exist_ok=True)
+        d.mkdir()
+        rows, total = [], 0
+        for a, size, prot in ranges:
+            name = f'{a:08x}.bin'
+            q.call('memsave', val=a, size=size, filename=f'/g/dump-tmp/{name}')
+            os.replace(tmp / name, d / name)
+            rows.append([a, size, prot, name])
+            total += size
+        tmp.rmdir()
+        (d / 'ranges.json').write_text(json.dumps(rows))
+        (d / 'registers.json').write_text(json.dumps(dict(registers=regs, packet=raw.hex())))
+        return total
+    finally:
+        q.close()
+
+
 def write_gz(path, value):
     with gzip.open(path, 'wt', compresslevel=6) as f:
         json.dump(value, f, separators=(',', ':'))
@@ -219,11 +246,18 @@ def main():
     ap.add_argument('--updates', type=int, default=100, help='stop after this many lot updates on the lot')
     ap.add_argument('--full', default='1-100', help='lot updates whose full state is saved, e.g. 1-100,110-1000/10')
     ap.add_argument('--stop-file', type=Path, help='end the capture when this file appears')
+    ap.add_argument('--dump', default='', help='lot updates at whose entry the whole user memory of the game is '
+                    'dumped (dump-NNNN/), e.g. 14,47; needs --guest-dir')
+    ap.add_argument('--guest-dir', type=Path, help='the guest directory on the host (the container\'s /g), '
+                    'where QEMU writes the dump before it is moved to the output')
     ap.add_argument('--resume', action='store_true',
                     help='take over a guest that an earlier run of this script left stopped at a breakpoint '
                          '(it was killed, not detached): continue its output directory and numbering')
     args = ap.parse_args()
     full_set = parse_set(args.full)
+    dump_set = parse_set(args.dump)
+    if dump_set and not args.guest_dir:
+        ap.error('--dump needs --guest-dir')
     out = args.output
     out.mkdir(parents=True, exist_ok=args.resume)
     events = open(out / 'events.jsonl', 'a')
@@ -328,6 +362,11 @@ def main():
                           packets=remote.packets, sim=regs['ecx'])
                     disarm(ENTRY)
                     arm(RETURN)
+                elif lot == args.lot and updates + 1 in dump_set:
+                    t0 = time.time()
+                    n = dump(args.container, args.guest_dir, out / f'dump-{updates + 1:04d}', regs, raw)
+                    event(kind='dump', update=updates + 1, bytes=n, seconds=time.time() - t0)
+                    disarm(ENTRY)
                 else:
                     elsewhere += 1
                     if elsewhere in (1, 10, 100) or elsewhere % 1000 == 0:
@@ -360,6 +399,8 @@ def main():
                     updates_log.write(json.dumps(row) + '\n')
                     updates_log.flush()
                     save_status(updates=updates, last=row)
+                    if updates + 1 in dump_set:
+                        arm(ENTRY)
             else:
                 # A dialog function. ecx is the dialog record (0x436da0 keeps it in esi).
                 record = regs['ecx']

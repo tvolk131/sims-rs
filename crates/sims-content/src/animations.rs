@@ -26,6 +26,10 @@ pub struct Clip {
     /// The clip's duration in milliseconds, as the bits of the file's
     /// single-precision float (clip +0x2c).
     pub duration: u32,
+    /// How far the clip moves the person, in tiles, as the bits of the
+    /// file's single-precision float (clip +0x30, read by the animator's
+    /// virtual function 0x120, 0x588ed7).
+    pub distance: u32,
     /// The frame count of the clip's first motion, or 0 for a clip
     /// without motions (layer +0x38, 0x597b01).
     pub frames: u32,
@@ -34,6 +38,9 @@ pub struct Clip {
     /// Whether any motion has a timed event. The layer update dispatches
     /// those (0x5912fd), which is not ported.
     pub events: bool,
+    /// The names of the clip's timed events (the first of each event's
+    /// pairs, as "footstep"), each once, in order.
+    pub event_keys: Vec<String>,
 }
 
 /// Every clip of the animation files, by name.
@@ -102,12 +109,21 @@ impl Animations {
                 let clip = Clip {
                     skill: animation.skill,
                     duration: animation.duration_ms.to_bits(),
+                    distance: animation.distance.to_bits(),
                     frames: animation.motions.first().map_or(0, |m| m.frames),
                     motions: animation.motions.len(),
                     events: animation
                         .motions
                         .iter()
                         .any(|m| m.event_lists.iter().any(|list| !list.is_empty())),
+                    event_keys: animation
+                        .motions
+                        .iter()
+                        .flat_map(|m| m.event_lists.iter().flatten())
+                        .flat_map(|event| event.pairs.iter().map(|(key, _)| key.clone()))
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
                     name: animation.name,
                 };
                 animations

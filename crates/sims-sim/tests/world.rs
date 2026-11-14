@@ -2,9 +2,10 @@ use sims_content::{Catalog, House, Index, Install, Neighborhood};
 use sims_core::{CrtRng, F32, GameRng};
 use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
-use sims_sim::animator::{Animator, LOADED, Layer, UNSET};
+use sims_sim::animator::{Animator, LOADED, Layer, Motion, UNSET};
 use sims_sim::neighbors::{Inventory, Item, Neighbor, Neighbors, Row};
 use sims_sim::rooms::{Half, Room, Rooms};
+use sims_sim::route::{Candidate, Context, Route, RouteSlot, Routing};
 use sims_sim::{
     Budget, Dialog, Dialogs, FrameStorage, HouseUsage, MagicHistory, Object, PersonTick, Snapshots,
     TypeAttributes, Usage, World,
@@ -209,6 +210,60 @@ fn world() -> World {
                 routing: 3,
             },
         },
+        routing: routing(),
+    }
+}
+
+/// A route of person 5 to slot 0 of object 2, part way through.
+fn routing() -> Routing {
+    let slot = RouteSlot {
+        offset: [0, 0xc0b6_6666, 0],
+        number: 1,
+        standing: 10,
+        sitting: 0,
+        ground: 0,
+        flags: 0x800,
+        snap_target: -1,
+        proximity: [16, 16, 16],
+        gradient: 0x3e40_0000,
+        facing: -2,
+        resolution: 16,
+    };
+    Routing {
+        routes: BTreeMap::from([(
+            5,
+            Route {
+                contexts: vec![Context {
+                    candidates: vec![Candidate {
+                        position: [408, 429],
+                        score: 100,
+                        word_c: 0,
+                        word_e: None,
+                    }],
+                    slot,
+                    target: 2,
+                    person: 5,
+                    chosen: 0,
+                    best: 100,
+                    word_58: 0,
+                    time: 0,
+                    saved: [24, 664],
+                    word_68: 0,
+                    start: [24, 664, 0],
+                    byte_78: true,
+                    objects: [0; 2],
+                    byte_84: false,
+                    result: 0,
+                    word_8c: 0,
+                    byte_8e: false,
+                    word_94: 0,
+                    limit: 8,
+                }],
+                path: vec![[24, 664], [76, 656], [408, 413]],
+            },
+        )]),
+        slot_flags: BTreeMap::from([((2, 0), 0x4000)]),
+        unknown_words: BTreeSet::from([(5, 37)]),
     }
 }
 
@@ -243,6 +298,18 @@ fn animator() -> Animator {
         events: vec![7, -2],
         foreground: Some(layer),
         playing: true,
+        motion: Motion {
+            segment: 1,
+            progress: F32::from_bits(0x3c9c_0000),
+            turn_from: [
+                F32::from_bits(0x4426_0000),
+                F32::from_bits(0x41c0_0000),
+                F32::ZERO,
+            ],
+            turn_destination: [UNSET; 3],
+            turn_wanted: F32::from_bits(0xc060_0000),
+            turn_clip: F32::from_bits(0xc080_0000),
+        },
         ..LOADED
     }
 }
@@ -253,13 +320,47 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "ec8aa330243910a992600b661de18c6fe08a438af7e4058ccd8c7ae67332780c";
+const PINNED: &str = "67f6d55218dde3333e03d82ef2b1648f59e3b6ec3d67fb63477f96358039baec";
 
-/// The encoding of `world` with its usage counts all 0, minus the twelve
-/// zero bytes they encode to. Snapshot format 12 added them at the end.
+/// The encoding of `world` with no routing and its one animator with no
+/// route ([`Motion::NONE`]), minus the bytes those encode to: what
+/// snapshot format 12 encoded. Format 13 added the routing at the end of the world (three
+/// zero bytes when empty) and the route's fields at the end of an
+/// animator, the last thing encoded before the usage counts.
+fn format_12_bytes(mut world: World) -> Vec<u8> {
+    world.routing = Routing::default();
+    assert!(world.animators.len() <= 1);
+    let motion = match world.animators.values_mut().next() {
+        Some(animator) => {
+            animator.motion = Motion::NONE;
+            postcard::to_allocvec(&Motion::NONE).unwrap()
+        }
+        None => Vec::new(),
+    };
+    let usage = postcard::to_allocvec(&world.usage).unwrap();
+    let mut bytes = world.encode();
+    assert_eq!(bytes.split_off(bytes.len() - 3), [0; 3]);
+    let usage_bytes = bytes.split_off(bytes.len() - usage.len());
+    assert_eq!(usage_bytes, usage);
+    assert_eq!(bytes.split_off(bytes.len() - motion.len()), motion);
+    bytes.extend(usage);
+    bytes
+}
+
+#[test]
+fn without_routing_the_encoding_is_format_12() {
+    // Snapshot format 13 added the lot's routing and the animator's
+    // route fields.
+    assert_eq!(digest(&format_12_bytes(world())), PINNED_12);
+}
+const PINNED_12: &str = "ec8aa330243910a992600b661de18c6fe08a438af7e4058ccd8c7ae67332780c";
+
+/// The encoding of `world` with its usage counts all 0 and without what
+/// format 13 added, minus the twelve zero bytes the counts encode to.
+/// Snapshot format 12 added them at the end.
 fn without_usage(mut world: World) -> Vec<u8> {
     world.usage = HouseUsage::default();
-    let mut bytes = world.encode();
+    let mut bytes = format_12_bytes(world);
     assert_eq!(bytes.split_off(bytes.len() - 12), [0; 12]);
     bytes
 }
@@ -377,6 +478,15 @@ fn any_field_change_changes_the_hash() {
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.animators.get_mut(&5).unwrap().profile_stale = false;
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.animators.get_mut(&5).unwrap().motion.segment = 2;
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.routing.routes.get_mut(&5).unwrap().path.pop();
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.routing.unknown_words.clear();
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.lot_rng.next_u32();

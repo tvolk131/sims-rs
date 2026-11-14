@@ -234,6 +234,20 @@ impl Interpreter<'_> {
                 ))));
             }
         }
+        // A route context holds a pointer to its slot's object
+        // (context +0x48); what the original does with it when the object
+        // goes is not known.
+        if let Some((&other, _)) = world
+            .routing
+            .routes
+            .iter()
+            .find(|(_, r)| r.contexts.iter().any(|c| c.target == id))
+        {
+            return Err(fail(Trap::Unsupported(format!(
+                "person {other} has a route to object {id}; deleting an object a route \
+                 leads to is not ported"
+            ))));
+        }
         if world.event_owner == id {
             world.event_owner = 0;
         }
@@ -249,6 +263,11 @@ impl Interpreter<'_> {
         }
         world.objects.remove(&id);
         world.frame_storage.remove(&id);
+        // The object's slot table goes with it.
+        world
+            .routing
+            .slot_flags
+            .retain(|&(object, _), _| object != id);
         world.fires.retain(|&other| other != id);
         world.order.retain(|&other| other != id);
         // A type's instance list outlives its instances (0x44383c).

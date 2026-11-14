@@ -686,7 +686,9 @@ impl<'a> Machine<'a, '_> {
                 instruction.on_false
             });
         }
-        if state != 0 {
+        // Go To Routing Slot keeps the step its route is at in the
+        // frame's primitive state and goes on from there (0x45abce).
+        if state != 0 && instruction.opcode != 45 {
             return Err(Trap::Unsupported(format!(
                 "resuming primitive {} with saved state {state:#x}",
                 instruction.opcode

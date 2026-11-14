@@ -330,7 +330,13 @@ impl Interpreter<'_> {
         if person.active.target != 0 {
             return Err(unsupported("whose running action has a target"));
         }
-        if person.routing_frames != 0 {
+        if person.routing_frames != 0
+            || world
+                .routing
+                .routes
+                .get(&id)
+                .is_some_and(|r| !r.contexts.is_empty())
+        {
             return Err(unsupported("in the middle of a route"));
         }
         if person.data.get(73).is_none_or(|&word| word != 0) {

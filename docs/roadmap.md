@@ -57,17 +57,22 @@ Each step is a few PRs, and each PR leaves `main` green.
   keep. Six type attribute words are the exception: they belong to the
   game that was running before the load.
 - Ticks run. `sims boot --ticks N` runs N lot updates after the load and
-  prints the hash. **K = 13 on the Goth house**: our state after each of
-  ticks 1 to 13 equals the 1000-tick capture of the original after the
+  prints the hash. **K = 33 on the Goth house**: our state after each of
+  ticks 1 to 33 equals the 1000-tick capture of the original after the
   same tick in everything compared, two lines after tick 1 aside (see
-  step 4 below, "The first tick", "Ticks 2 to 5" and "Ticks 6 to 13").
+  step 4 below, "The first tick", "Ticks 2 to 5", "Ticks 6 to 13" and
+  "Ticks 14 to 33").
   The simulation holds the neighborhood's people (their records, person
   data, relationships and inventories) and each person's animator, as
   far as scripts read it. Find Location For (primitive 16) is ported for
   the modes the house reaches, and so is making a new person (Create New
-  Object Instance mode 8, tick 6). Tick 14 stops where the new person,
-  259, reaches Go To Routing Slot (primitive 45), which is not ported,
-  and the boot says so and at which tick.
+  Object Instance mode 8, tick 6). Go To Routing Slot (primitive 45)
+  is ported for the route person 259 takes in tick 14, with the
+  planner and the animator's turn on the spot. After tick 34 the
+  capture's direction of person 259's animator is 0 and ours is not
+  (see "Ticks 14 to 33"). Ticks 34 to 45 run; tick 46 stops where
+  person 18 plays a clip with timed events (0x5912fd), which is not
+  ported, and the boot says so and at which tick.
 - Step 4 is in progress. `tools/harness/` runs the original under Wine
   in a QEMU guest and stops it at every lot update. It saves the state
   at the entry of the first tick and after each lot update: every
@@ -76,7 +81,7 @@ Each step is a few PRs, and each PR leaves `main` green.
   the install's own UserData. Its
   dialogs were answered as in the first capture: OK to the five notices
   in tick 1, and No to the Help System in tick 2. Compared with that
-  run, our state at the entry of tick 1 and after each of ticks 1 to 13
+  run, our state at the entry of tick 1 and after each of ticks 1 to 33
   matches in everything compared, three lines aside:
   - Registry byte 0x12 is already 1 when the original's load ends. Ours
     sets it in tick 2. This accounts for two of the three lines.
@@ -88,7 +93,7 @@ Each step is a few PRs, and each PR leaves `main` green.
   five differing records came from the first capture's guest files. The
   original first draws from the C runtime's stream in tick 6, 1,466
   times, when it makes a person; ours draws the same, and the stream is
-  equal after every tick to 13.
+  equal after every tick to 45.
 
 ### Load sequence
 
@@ -940,19 +945,53 @@ From tick 7 the person runs its own scripts and sleeps.
 equals the 1000-tick capture's in every field listed for tick 1, the C
 runtime's stream included, and the four people's animators.
 
-### Tick 14
+### Ticks 14 to 33
 
-Person 259 runs a tree of object 51 with Run Tree By Name, which starts
-its use of that object (`0x45e59b`, `Machine::count_use`): an entry in
-its list of objects in use and one more in object 51's data word 62. In
-that tree it reaches Go To Routing Slot (primitive 45, `0x45abce`), the
-start of routing, which is not ported, so the tick fails loudly. Where
-it stops, person 259's frames and objects in use, and the 258 objects
-before it in the tick, equal the capture's after tick 14. One local of
-person 259's third frame holds half of a pointer in the original (2623)
-and is unknown here; it is not compared. The end of a use and of the
-running action (`0x45e5fd`, `0x45e6cd`) are ported but never reached in
-these ticks, so they are **unverified**.
+In tick 14 person 259 runs a tree of object 51 with Run Tree By Name,
+which starts its use of that object (`0x45e59b`, `Machine::count_use`):
+an entry in its list of objects in use and one more in object 51's data
+word 62. In that tree it reaches Go To Routing Slot (primitive 45,
+`0x45abce`, `primitives/go_to_slot.rs`), which is now ported for that
+route:
+
+- The route context (`0x48163e`) is pushed on the person's contexts
+  (person `+0xaf0`, `sims_sim::route`).
+- The places the person could stand are found (`0x48235a`,
+  `0x483414`, `routing/slot.rs`).
+- The route is planned (`0x45c38e`, `0x4823fa`, `routing/planner.rs`):
+  the obstacles of the room's objects, the room's own rectangles
+  (`0x4818af`, `routing/rooms.rs`), and the search over free rectangles
+  (`0x469b26` to `0x46a8e1`, `routing/regions.rs`, `routing/search.rs`).
+  The path has 11 points.
+- The animator starts the route (`0x589c85`) and the thread waits while
+  it is under way.
+
+The animator then follows the path (state 9, `0x58e4e0`), finds that
+the first point ahead is half a turn behind it (`0x58eb29`) and turns on
+the spot with the posture's half-turn clip (states 3 and 4, `0x58df01`,
+`0x58e045`). It is still turning after tick 33.
+
+In tick 24 person 18's clip ends. The end of a clip in Animate Sim is
+now ported (`0x589c25`): the animator stops playing, takes its state
+from the posture (`0x592904`) and brings its base layer up to date
+(`0x590430`). Starting the next clip clears the finished one from the
+foreground slot at once (`0x586b63`).
+
+**Compared with the original.** After each of ticks 14 to 33 our state
+equals the 1000-tick capture's in every field listed for tick 1, the C
+runtime's stream included, the four people's animators with their route
+fields, and each person's number of route contexts. The context, the
+planner's inputs, both of its searches and the path are not on the
+capture's pages. They were compared with the original's own code run in
+an emulator on a memory dump of the original at the entry of update 14,
+and are equal. Person 259's word 37 is not compared: the original copies
+it from memory it never wrote (`0x45c418`).
+
+**Not equal after tick 34.** The capture's animator of person 259 has 0
+as its direction and its destination's direction; ours has the turn's.
+The emulated update writes the same direction as ours, so the 0 comes
+from outside the lot update. What writes it is **unverified**. From
+tick 36 registry byte 0x12 differs too (ours 1, the capture 0).
 
 ## Working rules
 

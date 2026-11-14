@@ -321,3 +321,16 @@ fn a_double_loads_exactly() {
     // as zero.
     assert_eq!(Ext::from_f64_bits(1).to_f32(), F32::ZERO);
 }
+
+#[test]
+fn atan2_quadrants() {
+    let f = |v: f32| F32::from_f32(v);
+    let quarter = Ext::atan2(f(1.0), f(0.0)).to_f32();
+    assert_eq!(quarter, F32::from_bits(0x3fc9_0fdb));
+    assert_eq!(Ext::atan2(f(0.0), f(1.0)), Ext::ZERO);
+    assert_eq!(
+        Ext::atan2(f(0.0), f(-1.0)).to_f32(),
+        F32::from_bits(0x4049_0fdb)
+    );
+    assert!(Ext::atan2(f(-1.0), f(-1.0)).is_negative());
+}

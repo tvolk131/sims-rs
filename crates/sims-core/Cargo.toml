@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+libm.workspace = true
 serde.workspace = true
 
 [dev-dependencies]

@@ -62,19 +62,25 @@ impl Machine<'_, '_> {
         };
         let from = object(from)?;
         let to = object(self.frame()?.stack_object)?;
-        let distance = if self.definition_words(to.guid)?[OBJECT_TYPE] == NO_DISTANCE_TYPE {
-            Ext::ZERO
-        } else {
-            let [ax, ay, alevel] = from.position;
-            let [bx, by, blevel] = to.position;
-            let (dx, dy) = (ax.wrapping_sub(bx), ay.wrapping_sub(by));
-            let squares = dx.wrapping_mul(dx).wrapping_add(dy.wrapping_mul(dy));
-            let rise = Ext::from_i32(blevel.wrapping_sub(alevel).wrapping_mul(20));
-            let flat = (Ext::from_i32(squares) * F32::from_f32(SIXTEENTHS_SQUARED).ext()).single();
-            (flat + (rise * rise).single()).single().sqrt().single()
-        };
+        let zero = self.definition_words(to.guid)?[OBJECT_TYPE] == NO_DISTANCE_TYPE;
+        let distance = distance(from.position, to.position, zero);
         let value = distance.to_i32_truncate() as i16;
         self.me_mut()?.temps[temp] = value;
         Ok(true)
     }
+}
+
+/// The distance from one position to another in tiles (0x434148), or 0
+/// when `zero` (the second object's type is 7).
+pub(crate) fn distance(from: [i32; 3], to: [i32; 3], zero: bool) -> Ext {
+    if zero {
+        return Ext::ZERO;
+    }
+    let [ax, ay, alevel] = from;
+    let [bx, by, blevel] = to;
+    let (dx, dy) = (ax.wrapping_sub(bx), ay.wrapping_sub(by));
+    let squares = dx.wrapping_mul(dx).wrapping_add(dy.wrapping_mul(dy));
+    let rise = Ext::from_i32(blevel.wrapping_sub(alevel).wrapping_mul(20));
+    let flat = (Ext::from_i32(squares) * F32::from_f32(SIXTEENTHS_SQUARED).ext()).single();
+    (flat + (rise * rise).single()).single().sqrt().single()
 }

@@ -46,6 +46,7 @@ mod primitives;
 mod program;
 mod removal;
 mod rooms;
+mod routing;
 mod selection;
 mod tick;
 mod visits;

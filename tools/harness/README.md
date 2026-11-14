@@ -33,6 +33,7 @@ the repository, and so do the captures.
 | `answer.sh` | Presses a dialog button and logs the press to the capture's `input-log.txt`. |
 | `rsp.py` | A small GDB remote-protocol client, reached through `docker exec`. It reads memory and registers and sets hardware breakpoints. It never writes guest memory or registers. |
 | `capture.py` | The capture: the breakpoints, the state readers and the output format. |
+| `qmp.py` | A small QMP client, reached through `docker exec`, for memory dumps. It sends only `info mem` and `memsave`, which read the guest. |
 | `qemu_retained_owners.py`, `qemu_neighborhood_owners.py` | The old prototype's readers for the registry and the neighborhood. |
 
 ## Running a capture
@@ -84,6 +85,12 @@ Things to know:
   relay while the guest is stopped, so the run never detaches. Then start
   `capture.py` again with the same arguments plus `--resume`. It continues the
   same directory and numbering, and redoes the update it was in the middle of.
+- **Memory dumps.** `--dump 14,47 --guest-dir <guest dir>` also saves,
+  at the entry of each listed lot update, every present user page of the
+  game's process (`dump-NNNN/`). QEMU writes each range into the guest
+  directory (the container's `/g`), and the script moves it to the output.
+  A dump holds the whole game, about 320 MB, so keep the list short. The
+  dumps let a routine of the original be run alone on real memory.
 
 ## Output
 
@@ -96,5 +103,6 @@ Things to know:
 | `pages.json.gz` | In both kinds of directory: the memory pages of the people and their animators. |
 | `updates.jsonl` | One line per lot update: the tick, whether it was a full pass, the three random streams and the scheduler cursor. |
 | `events.jsonl` | The dialog functions passed (each record, its status and modal byte), the baseline, and other stops. |
+| `dump-NNNN/` | With `--dump`: the user memory at the entry of lot update N. `ranges.json` lists the ranges (start, size, protection, file); `registers.json` holds the stop's registers and the stub's whole register packet. |
 | `status.json` | Progress. |
 | `input-log.txt` | Every press made, with its time (written by `answer.sh`). |

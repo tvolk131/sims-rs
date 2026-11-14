@@ -12,7 +12,7 @@
 //! [`load`] holds the load steps that change state without running scripts,
 //! and [`rooms`] works out the lot's rooms from its walls and counts
 //! them: their size, what stands in them, their light and their score.
-//! [`motives`] decays a person's motives and works out the mood.
+//! [`route`] holds the people's routes. [`motives`] decays a person's motives and works out the mood.
 //! [`neighbors`] holds the neighborhood's people, and [`animator`] what
 //! each person's animator keeps.
 //!
@@ -26,6 +26,7 @@ pub mod load;
 pub mod motives;
 pub mod neighbors;
 pub mod rooms;
+pub mod route;
 mod snapshot;
 mod world;
 

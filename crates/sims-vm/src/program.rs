@@ -27,6 +27,10 @@ pub struct Library {
     /// How many slots of each SLOT chunk can hold an object (kind 0), by
     /// chunk ID.
     pub containers: BTreeMap<u16, usize>,
+    /// Each SLOT chunk's entries, by chunk ID: what an object of a type
+    /// whose word 20 names the chunk copies into its slot table (object
+    /// +0x13c) and Go To Routing Slot reads.
+    pub slots: BTreeMap<u16, Vec<sims_formats::execution::Slot>>,
     /// Each BHAV's name, by chunk ID: what Run Tree By Name looks trees up
     /// by.
     pub names: BTreeMap<u16, String>,
@@ -206,6 +210,7 @@ impl Program {
                     let slots = Slots::parse(data).map_err(|e| format("SLOT", chunk.id, e))?;
                     let count = slots.entries.iter().filter(|s| s.kind == 0).count();
                     library.containers.insert(chunk.id, count);
+                    library.slots.insert(chunk.id, slots.entries);
                 }
                 _ => {}
             }
@@ -424,6 +429,18 @@ impl Program {
             .and_then(|words| library.containers.get(&(words[20] as u16)))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// The SLOT entries an object definition's word 20 names, or none when
+    /// the file has no such chunk.
+    pub fn slots(&self, resource: usize, chunk: u16) -> &[sims_formats::execution::Slot] {
+        self.libraries
+            .get(&resource)
+            .and_then(|library| {
+                let words = library.definitions.get(&chunk)?;
+                library.slots.get(&(words[20] as u16))
+            })
+            .map_or(&[], Vec::as_slice)
     }
 
     /// The type attribute records the catalog makes, all zero: one for

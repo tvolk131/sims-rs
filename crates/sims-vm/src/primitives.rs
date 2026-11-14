@@ -10,6 +10,7 @@ mod events;
 mod expression;
 mod find_location;
 mod generic;
+mod go_to_slot;
 mod idle;
 mod inventory;
 mod named_tree;
@@ -22,6 +23,8 @@ mod remove;
 mod set_to_next;
 mod sleep;
 mod sound;
+
+pub(crate) use distance::distance;
 
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine};
@@ -116,6 +119,7 @@ impl Machine<'_, '_> {
             31 => self.set_to_next(operands)?.into(),
             42 => self.create_object(operands)?.into(),
             44 => self.animate_sim(operands)?,
+            45 => self.go_to_slot(operands)?,
             48 => self.stop_all_sounds(operands)?.into(),
             32 => self.test_object_type(operands)?.into(),
             36 => self.dialog(operands)?,

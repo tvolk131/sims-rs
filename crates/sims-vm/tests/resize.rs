@@ -278,14 +278,54 @@ fn format_10_bytes(world: &World) -> Vec<u8> {
     encoded
 }
 
+/// A lot's encoding as snapshot format 12 wrote it. Format 13 added two
+/// things: the lot's routing at the end of the encoding, and at the end
+/// of each animator where it is along a route ([`sims_sim::animator::Motion`]).
+/// Before the first route there is neither: the routing encodes to three
+/// zero bytes (two empty maps and an empty set) and each animator's
+/// motion ([`sims_sim::animator::Motion::NONE`]) to ten bytes, the
+/// segment's -1 (1 as postcard writes it) and nine zeros. This checks
+/// both and drops them, so a state pinned under format 12 can be shown
+/// to be the same state.
+fn format_12_bytes(world: &World) -> Vec<u8> {
+    assert_eq!(world.routing, sims_sim::route::Routing::default());
+    let mut old = world.clone();
+    old.animators.clear();
+    let mut encoded = old.encode();
+    assert_eq!(encoded.split_off(encoded.len() - 3), [0; 3]);
+    let usage = postcard::to_allocvec(&world.usage).unwrap();
+    assert_eq!(encoded.split_off(encoded.len() - usage.len()), usage);
+    assert_eq!(encoded.pop(), Some(0));
+    let count = world.animators.len() as u64;
+    encoded.extend(postcard::to_allocvec(&count).unwrap());
+    for (id, animator) in &world.animators {
+        encoded.extend(postcard::to_allocvec(id).unwrap());
+        encoded.extend(animator_12_bytes(animator));
+    }
+    encoded.extend(usage);
+    encoded
+}
+
+/// An animator's encoding under snapshot format 12: without its motion,
+/// which must be that of no route ([`format_12_bytes`]).
+fn animator_12_bytes(animator: &sims_sim::animator::Animator) -> Vec<u8> {
+    use sims_sim::animator::Motion;
+    assert_eq!(animator.motion, Motion::NONE);
+    let motion = postcard::to_allocvec(&Motion::NONE).unwrap();
+    assert_eq!(motion, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let mut bytes = postcard::to_allocvec(animator).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - motion.len()), motion);
+    bytes
+}
+
 /// A lot's encoding without the house's usage counts, which snapshot
 /// format 12 added at its end: twelve numbers, one zero byte each once
 /// they are cleared. This clears them, checks the twelve zero bytes and
-/// drops them.
+/// drops them, from the format 12 encoding ([`format_12_bytes`]).
 fn without_usage(world: &World) -> Vec<u8> {
     let mut old = world.clone();
     old.usage = sims_sim::HouseUsage::default();
-    let mut encoded = old.encode();
+    let mut encoded = format_12_bytes(&old);
     assert_eq!(encoded.split_off(encoded.len() - 12), [0; 12]);
     encoded
 }
@@ -306,7 +346,7 @@ fn format_11_bytes(world: &World) -> Vec<u8> {
     encoded.extend(postcard::to_allocvec(&count).unwrap());
     for (id, animator) in &world.animators {
         encoded.extend(postcard::to_allocvec(id).unwrap());
-        let mut bytes = postcard::to_allocvec(animator).unwrap();
+        let mut bytes = animator_12_bytes(animator);
         assert_eq!(bytes.pop(), Some(u8::from(animator.profile_stale)));
         encoded.extend(bytes);
     }
@@ -1380,13 +1420,14 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
     // Pinned under snapshot format 8, the same state under format 9
     // ([`format_9_bytes`], without the neighborhood's records) and under
     // format 10 ([`format_10_bytes`], without the animators, of which the
-    // load leaves none), and under format 11. See [`pinned`] for why the
-    // format 8 pin changed.
+    // load leaves none), and under formats 11 and 12. See [`pinned`] for
+    // why the format 8 pin changed.
     const BASELINE: &str = "034d3b636d3529fa91826a5f5b759e4abba31d6c5be3b66732a1f1ef642ad9fb";
     const BASELINE_9: &str = "fe21f960b207ba0ced6a6a5dfe5628fcb101c12eb9571d49578ec65dfde459da";
     const BASELINE_10: &str = "29b4aec3debe353d77363e18cf3cbd263b30fe2fe4e1e03a5f309c08dd132168";
     const BASELINE_11: &str = "90c52a0d5be39db0556c0f8fc9ea41088cdb36b5d024094b8073eaf1d3bb918a";
     const BASELINE_12: &str = "9954409afc678bcf8d6815446a86eadeddb46bf5b2785e5461f7b06af38d1687";
+    const BASELINE_13: &str = "f844587de2d116d798645aea70ea5ea5f91c49c398c93fc414c3ab31657be32a";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1484,12 +1525,13 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
         assert_eq!(digest(&format_10_bytes(world)), BASELINE_10);
         assert!(world.animators.is_empty());
         assert_eq!(digest(&format_11_bytes(world)), BASELINE_11);
-        assert_eq!(world.hash_hex(), BASELINE_12);
+        assert_eq!(digest(&format_12_bytes(world)), BASELINE_12);
+        assert_eq!(world.hash_hex(), BASELINE_13);
     });
 }
 
-/// The first 13 ticks on the Goth house: the lot update (0x46d345) run
-/// from the state the load ends in, and the 14th up to where it stops.
+/// The first 33 ticks on the Goth house: the lot update (0x46d345) run
+/// from the state the load ends in.
 ///
 /// A private capture of the original on the same install and house,
 /// outside the repository (`docs/decisions.md`), holds the full state at
@@ -1497,7 +1539,7 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// one line per lot update in `updates.jsonl` with the tick count, the
 /// lot's and the game's random streams, the C runtime's random stream and
 /// the scheduler cursor. That capture's game read the install's own
-/// neighborhood file. Our state after each of ticks 1 to 13 was compared
+/// neighborhood file. Our state after each of ticks 1 to 33 was compared
 /// with the capture's after the same lot update, field by field, floats
 /// bit for bit:
 ///
@@ -1517,36 +1559,51 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 ///   previous motives, the running and last actions, the queued actions,
 ///   and the objects in use (object, stack depth, flag);
 /// - the people's animators: every field kept here that the capture's
-///   memory pages hold. The capture did not record where the animators
-///   are for updates 1 to 45, so the places recorded at update 46 are
-///   used; the pages themselves are from the update compared.
+///   memory pages hold, the route's fields
+///   ([`sims_sim::animator::Motion`]) included. The capture did not
+///   record where the animators are for updates 1 to 45, so the places
+///   recorded at update 46 are used; the pages themselves are from the
+///   update compared.
+/// - each person's number of route contexts (person +0xaf0). The
+///   contexts' contents and the path (person +0xae0) are on pages the
+///   capture did not save.
 ///
-/// Equal after every one of ticks 1 to 13, with two exceptions, both
-/// after tick 1 and neither in later ticks: global 12, which is 17 in the
-/// capture and 0 here (the interface's wait check, which is not run
+/// Equal after every one of ticks 1 to 33, with two exceptions, both
+/// after tick 1 and neither in ticks 2 to 33: global 12, which is 17 in
+/// the capture and 0 here (the interface's wait check, which is not run
 /// here); and registry byte 0x12, which the capture has set from the
 /// load on and ours sets in tick 2. The cause of either is **unverified**.
 ///
 /// Not compared: a frame local that we hold as unknown, because the
-/// original left half of a pointer in the frame storage there. None of
-/// the frames compared after ticks 1 to 13 holds one. Also not compared,
-/// because the capture does not hold them in a form read there: the
-/// rooms, the lot arrays, the dialog records, the persons' tick state
-/// other than the animators, and the house's usage counts.
+/// original left half of a pointer in the frame storage there; and
+/// person 259's word 37 from tick 14 on, which the original copies from
+/// memory it never wrote (`sims_sim::route::Routing::unknown_words`; the
+/// capture has 3287 there). Also not compared, because the capture does
+/// not hold them in a form read there: the rooms, the lot arrays, the
+/// dialog records, the persons' tick state other than the animators, and
+/// the house's usage counts.
 ///
 /// In tick 6 object 382 makes a new person, 259 (Create New Object
 /// Instance mode 8). From tick 7 on that person runs. Its state is
 /// compared in every tick from 6 on as above, and is equal.
 ///
-/// Tick 14 stops where person 259 reaches Go To Routing Slot (primitive
-/// 45), which is not ported. At that point the capture's state after tick
-/// 14 was compared with ours as far as it is final: person 259's frames
-/// and objects in use, and the 258 objects before 259 in the tick (data
-/// words and frames, and for people the person data and motives). All are
-/// equal, but for one local of person 259's third frame that we hold as
-/// unknown (the capture has 2623 there), which is not compared. The
-/// animators of the people before 259 are equal too. Later objects of the
-/// tick could still change all of this, which this run cannot show.
+/// In tick 14 person 259 goes to slot 0 of object 51 (Go To Routing
+/// Slot). The route context, the planner's inputs (obstacles, room
+/// rectangles, goal), both of its searches and the path were also
+/// compared with the original's code run on the state of another capture
+/// at the entry of update 14 (an emulator of the original's update,
+/// outside the repository), and are equal. The person then turns on the
+/// spot (animator state 4) through tick 33. In tick 24 person 18's clip
+/// ends (0x589c25) and it starts the next.
+///
+/// After tick 34 the capture's animator of person 259 holds 0 as its
+/// direction and its destination's direction, where ours holds the turn's
+/// (0.127 and 0.210); every other field compared is equal. The original's
+/// update, run in that emulator from its state at update 14, writes the
+/// same direction as ours in update 34, so the 0 is written outside the
+/// lot update. What writes it is **unverified**. Ticks 34 to 45 run here
+/// without failing; tick 46 fails, at person 18's clip with timed events
+/// (0x5912fd).
 ///
 /// Object 15's two-button dialog in tick 2 is answered with 3, the
 /// answer the capture's events show. People 18 and 21's clip in tick 3 is
@@ -1557,16 +1614,22 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 ///
 /// The format 11 digests ([`format_11_bytes`]) were pinned before the
 /// house's usage counts and the animator's appearance flag were added,
-/// and still hold. The digests are of our own state, as built here.
+/// and the format 12 digests ([`format_12_bytes`]) before the routing and
+/// the animator's route fields were; both still hold. The digests are of
+/// our own state, as built here.
 #[test]
 fn the_goth_house_first_tick_matches_the_original() {
     const TICK_1_9: &str = "62fc28f5e7689d166791a620dbed066fb8a7d707ea79017fbadf0eed3da5c937";
     const TICK_1_10: &str = "bb55f7d5f656551708867b24779c2e0f019825459427858a27ad8c8874e7957b";
     const TICK_1_11: &str = "c2fa1ed11813b8ab67214f7177e1bb27a2e25ae2ecef94c3c1172071d5682400";
     const TICK_5_11: &str = "b1dfa48cff23e2b5ef92d4e2b9d2386d2fea55857210c0856c38275c19acea9e";
-    const TICK_1: &str = "bc16bff8543bbd815f609600eb087157307e07b9ee0b592d3b55a64d2bc740f9";
-    const TICK_5: &str = "4e363f8930608d8beffb6c2e8731c62e61e86e8a1df83b253577fba7193f9bec";
-    const TICK_13: &str = "5ce718d449921600161f8d38144fa29bb4f9125b2e7d51d40dd103b02f321e96";
+    const TICK_1: &str = "f8fecfe693e419a642094715d879184b1d85268cbca22806ee31475b1aeb4dae";
+    const TICK_1_12: &str = "bc16bff8543bbd815f609600eb087157307e07b9ee0b592d3b55a64d2bc740f9";
+    const TICK_5: &str = "3ab9e6083e9dd3850796b2942d077e826060ef4bc9c3e4427dc3801c6981f0a4";
+    const TICK_5_12: &str = "4e363f8930608d8beffb6c2e8731c62e61e86e8a1df83b253577fba7193f9bec";
+    const TICK_33: &str = "1a82b937d63ff830c23927551339a0d72af1cd5f4d12aba707bdfdd16c1b21e5";
+    const TICK_13: &str = "2b5d012c9b69df5fdddd6f538bde6fa5c18df3c9da97839390152a9472d0a10e";
+    const TICK_13_12: &str = "5ce718d449921600161f8d38144fa29bb4f9125b2e7d51d40dd103b02f321e96";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1617,6 +1680,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert_eq!(digest(&format_9_bytes(world)), TICK_1_9);
         assert_eq!(digest(&format_10_bytes(world)), TICK_1_10);
         assert_eq!(digest(&format_11_bytes(world)), TICK_1_11);
+        assert_eq!(digest(&format_12_bytes(world)), TICK_1_12);
         assert_eq!(world.hash_hex(), TICK_1);
         // Ticks 2 to 5. Person 16 starts a clip with Animate Sim in tick 2
         // and yields; the capture shows that person at the same
@@ -1666,6 +1730,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         );
         assert_eq!(world.objects[&16].stack[4].locals, [0, 3, 8222, 254]);
         assert_eq!(digest(&format_11_bytes(world)), TICK_5_11);
+        assert_eq!(digest(&format_12_bytes(world)), TICK_5_12);
         assert_eq!(world.hash_hex(), TICK_5);
         // Ticks 6 to 13. In tick 6 object 382 makes a person of type
         // 0x44A86A6C (Create New Object Instance mode 8), who gets the
@@ -1715,21 +1780,49 @@ fn the_goth_house_first_tick_matches_the_original() {
             .map(|f| (f.tree, f.node))
             .collect();
         assert_eq!(frames, [(0x1000, 9), (0x118, 0)]);
+        assert_eq!(digest(&format_12_bytes(world)), TICK_13_12);
         assert_eq!(world.hash_hex(), TICK_13);
-        // Tick 14: person 259 runs a tree of object 51 (Run Tree By Name),
-        // which starts using it, and in that tree reaches Go To Routing
-        // Slot, which is not ported. The persons before it in the tick
-        // ran as the capture shows.
-        match interpreter.lot_update(world, &tuning, &mut player) {
-            Err(sims_vm::TickError::Fault(fault)) => {
-                assert_eq!(fault.object, 259);
-                assert!(fault.to_string().contains("Go To Routing Slot"), "{fault}");
-            }
-            other => panic!("{other:?}"),
+        // Ticks 14 to 33. In tick 14 person 259 runs a tree of object 51
+        // (Run Tree By Name), which starts using it, and in that tree goes
+        // to the object's routing slot 0 (Go To Routing Slot): it plans a
+        // path of 11 points and its animator starts the route, then turns
+        // on the spot (state 4) through ticks 15 to 33 while the thread
+        // yields. In tick 24 person 18's clip ends and it starts another.
+        let mut shape = vec![];
+        for _ in 14..=33 {
+            let update = interpreter.lot_update(world, &tuning, &mut player).unwrap();
+            assert!(update.full);
+            shape.push((update.counted.len(), update.ticked.len()));
         }
+        // Ticks 14 to 33, in order.
+        let mut expected = vec![(341, 4); 20];
+        expected[8] = (340, 5);
+        expected[9] = (339, 6);
+        expected[16] = (339, 6);
+        expected[17] = (332, 13);
+        expected[18] = (339, 6);
+        expected[19] = (338, 7);
+        assert_eq!(shape, expected);
+        assert_eq!(world.ticks, before.ticks + 33);
         let uses = &world.objects[&259].person.as_ref().unwrap().object_uses;
         let uses: Vec<_> = uses.iter().map(|u| (u.target, u.stack_depth)).collect();
         assert_eq!(uses, [(51, 4)]);
         assert_eq!(world.objects[&51].data[62], 1);
+        let route = &world.routing.routes[&259];
+        assert_eq!(route.path.len(), 11);
+        assert_eq!(route.path[..3], [[24, 664], [76, 656], [204, 606]]);
+        assert_eq!(route.path[10], [408, 413]);
+        assert_eq!(route.contexts.len(), 1);
+        assert_eq!(
+            (route.contexts[0].target, route.contexts[0].chosen),
+            (51, 0)
+        );
+        assert!(world.routing.unknown_words.contains(&(259, 37)));
+        let animator = &world.animators[&259];
+        assert_eq!((animator.state, animator.arrival), (4, 1));
+        assert_eq!(animator.motion.segment, 1);
+        assert_eq!(animator.motion.progress.to_bits(), 0x3de9_8f51);
+        assert_eq!(animator.destination[2].to_bits(), 0x3e57_5200);
+        assert_eq!(world.hash_hex(), TICK_33);
     });
 }
