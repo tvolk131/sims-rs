@@ -22,8 +22,9 @@ pub enum Format {
     Localized,
     /// A classic Mac OS `STR#` resource: no version word, a big-endian count,
     /// then length-prefixed strings. Base-game `Behavior.iff` and many
-    /// downloads carry these. Any leading word that is not a known version
-    /// is read this way.
+    /// downloads carry these. Any leading word that is not one of the four
+    /// version words is read this way, including those that would be
+    /// negative read as versions: 128 strings start `00 80`.
     MacResource,
 }
 #[derive(Debug, Clone)]
@@ -40,7 +41,6 @@ impl StringTable {
             -1 => Format::Terminated,
             -2 => Format::Commented,
             -3 => Format::Localized,
-            v if v < 0 => return r.fail(format!("unsupported string-table version {v}")),
             _ => Format::MacResource,
         };
         let count = match format {
