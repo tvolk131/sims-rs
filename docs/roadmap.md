@@ -1251,10 +1251,13 @@ Progress:
   posture's standing loop; a person is placed and turned from the
   animator's position and direction. The Goths stand and walk offscreen
   (pinned by digest).
-- Next: a viewer, and the comparison with the original. The simulation
-  does not yet expose the base layer's clip and phase (a read-only
-  accessor is wanted; until then the saved record and the animator's
-  clock stand in).
+- Done: a small viewer (`people-viewer`, behind the `viewer` feature)
+  plays the house's people standing or walking, or draws them where a
+  simulation snapshot has them; it can also write one frame to a PNG.
+- Next: the comparison with the original. The simulation does not yet
+  expose the base layer's clip and phase (a read-only accessor is
+  wanted; until then the saved record and the animator's clock stand
+  in).
 
 ## Working rules
 
