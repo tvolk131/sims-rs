@@ -156,6 +156,9 @@ click-object 173               # aim at object 173, click, keep the pie menu onl
 choose Sit                     # click the open pie menu's entry
 expect-queued 21 173 within 100  # fail unless the menu pushed an action on person 21 aimed at 173
 shot after                     # save the game window to input-shots/after.png (names are unique)
+press 93 458                   # press a button of the game's panels (rest, move over it, press)
+expect-mode buy within 300     # fail unless the lot's mode becomes buy (2); also live (0) or a number
+expect-new-object within 600   # fail unless an object appears in the registry; logs it and the budget
 ```
 
 For example, from a fresh boot (start the capture before entering the house,
@@ -172,6 +175,21 @@ wait 10
 click-object 173               # the porch bench
 choose Sit
 expect-queued 21 173 within 100
+```
+
+And to buy a chair, after the same six dialogs and `wait 10`:
+
+```
+press 93 458                   # the buy-mode button
+expect-mode buy within 300
+press 258 524                  # Seating (after a fresh boot it opens on chairs)
+wait 30
+press 437 523                  # the catalog's first entry, the $80 Werkbunnst chair
+wait 30
+press 480 380                  # a free spot on the lawn
+expect-new-object within 600
+press 36 445                   # the live-mode button
+expect-mode live within 300
 ```
 
 How the checks work (the addresses are in `input.py`):
@@ -195,6 +213,15 @@ How the checks work (the addresses are in `input.py`):
   `answer-dialog` runs on the dialog stops. It presses once, like
   `answer.sh`. If the game misses the press, the step waits until the dialog
   is answered some other way (for example with `answer.sh`).
+- **Buy mode.** `expect-mode` reads the lot's mode word (lot `+0x36`: 0 in
+  live mode, 2 in buy mode). In buy mode the lot update still returns,
+  without advancing time, so the steps go on there. `expect-new-object`
+  compares the registry's object pointers with those at the scenario's
+  first update return (or at the last `expect-new-object`), less the
+  objects removed since, so an object that reuses a sold object's ID or
+  memory still counts as new. It logs each new object (ID, type, position,
+  level, and the definition's bytes and the data words as the full state
+  has them) and the budget (lot `+0x90`) before and after.
 
 A failed step is logged and ends the scenario; the capture goes on. A
 dialog that opens while a step waits for update returns ends a command's
@@ -213,9 +240,12 @@ flags. The other rows log the steps, each guest command and when it ended,
 the hover readings and the pie menus.
 
 **Unverified.** The projection was checked only in the house's starting
-view (zoom 1, no rotation). Submenus, build and buy mode are not driven
-yet. The dialog button places are fixed in the scenario, not read from the
-dialog.
+view (zoom 1, no rotation). Submenus and build mode are not driven yet;
+build mode's mode number is not known. The dialog, panel and catalog places
+are fixed in the scenario, not read from the screen. What the catalog shows
+depends on the panel's last state: after a fresh boot, Seating opens on
+chairs. A press that lands on the wrong spot of the buy panel can sell an
+object.
 
 ```sh
 python3 -B -m unittest discover -s tools/harness -p 'test_*.py'
