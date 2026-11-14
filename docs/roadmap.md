@@ -1375,11 +1375,12 @@ stop-sounds events.
   and every event definition in the install (4,494, module by module)
   runs without a bad or unported instruction. Sequence groups and fades
   follow the original's code. Scripts cannot hang or exhaust the player.
-  The `render_event` example writes events to a WAV file.
+  Volume, pan, pitch and ducking follow the original's formulas, and
+  the output is stereo. The `render_event` example writes events to a
+  WAV file.
 - **Next:**
   - The simulation emits `SoundEvent`s (the interface is in the
     decisions log).
-  - Volume, pan and pitch.
   - The 190 events of other kinds (music modes, TV, sequenced hit
     lists).
   - The FSC ambient player.
