@@ -400,10 +400,27 @@ impl Machine<'_, '_> {
                 let index = bounded(index, count, 0x40)?;
                 Cell::TypeAttribute(record.unwrap_or(0), index)
             }
-            // Tree advertisements (12, 28, 29), neighbors (24, 32), jobs
+            32 => {
+                // A word of the person data of the neighborhood record
+                // the stack object names (0x4537e3): its value, with no
+                // word pointer. No such record is native error 0x37.
+                let record = self
+                    .world
+                    .neighbors
+                    .get(stack_object)
+                    .ok_or(Trap::native(0x37, "missing neighbor"))?;
+                let index = bounded(index, 256, 0x21)?;
+                Cell::Literal(*record.data.get(index).ok_or_else(|| {
+                    Trap::Invalid(format!(
+                        "neighbor {stack_object} has {} person data words",
+                        record.data.len()
+                    ))
+                })?)
+            }
+            // Tree advertisements (12, 28, 29), neighbor fields (24), jobs
             // (33), neighborhood data (34) and scope 38 need state the
             // simulation doesn't hold yet.
-            12 | 24 | 28 | 29 | 32 | 33 | 34 | 38 => {
+            12 | 24 | 28 | 29 | 33 | 34 | 38 => {
                 return Err(unsupported(scope));
             }
             2 | 5 | 39..=255 => return Err(Trap::native(9, "invalid memory scope")),

@@ -53,6 +53,9 @@ impl Context {
 /// Errors from the load steps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadError {
+    /// The neighborhood's records cannot be read as the original reads
+    /// them, or reading them needs something not ported.
+    Neighborhood(String),
     /// The saved globals are neither 32 nor 64 words.
     GlobalCount(usize),
     /// A step that needs all 64 globals ran on fewer, so before
@@ -85,6 +88,7 @@ pub enum LoadError {
 impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Neighborhood(message) => write!(f, "neighborhood: {message}"),
             Self::GlobalCount(n) => write!(f, "{n} saved globals; expected 32 or 64"),
             Self::NoContext => write!(f, "the load context has not been applied"),
             Self::MissingArray(array) => write!(f, "the house has no lot array {array}"),

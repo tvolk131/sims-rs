@@ -8,7 +8,7 @@ use crate::support::*;
 use sims_content::People;
 use sims_formats::execution::ObjectFunction;
 use sims_formats::saved_objects::Multipart;
-use sims_vm::{Asked, INDICATORS, Interpreter, Status, Trap};
+use sims_vm::{Asked, INDICATORS, Interpreter, Status};
 use std::cell::RefCell;
 
 const BUDGET: usize = 1000;
@@ -376,13 +376,16 @@ fn resident(fx: &mut Fixture) -> People {
     let cell = (3 * 64 + 3) * 2;
     let grid = &mut fx.world.arrays.get_mut(&3).unwrap().data;
     grid[cell..cell + 2].copy_from_slice(&PERSON.to_le_bytes());
+    fx.world.neighbors.slots = vec![Some(sims_sim::neighbors::Neighbor {
+        id: 9,
+        guid: RESIDENT,
+        revision: 10,
+        data: (0..256).map(|n| 1000 + n).collect(),
+        relationships: Vec::new(),
+        friends: 0,
+        stale: true,
+    })];
     People {
-        records: vec![sims_content::Record {
-            id: 9,
-            guid: RESIDENT,
-            revision: 10,
-            data: (0..256).map(|n| 1000 + n).collect(),
-        }],
         profiles: [(
             RESIDENT,
             sims_content::Profile {
@@ -556,16 +559,19 @@ fn a_person_the_reset_would_do_more_for_stops_its_visit() {
     let people = resident(&mut fx);
     fx.world.changed_types.insert(RESIDENT);
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    let fails = |change: &dyn Fn(&mut sims_sim::Object), people: &People| {
+    let lot_fails = |change: &dyn Fn(&mut sims_sim::World)| {
         let mut world = fx.world.clone();
-        change(world.objects.get_mut(&PERSON).unwrap());
+        change(&mut world);
         interpreter
-            .visit(&mut world, PERSON, people)
+            .visit(&mut world, PERSON, &people)
             .unwrap_err()
             .to_string()
     };
+    let fails = |change: &dyn Fn(&mut sims_sim::Object)| {
+        lot_fails(&|w| change(w.objects.get_mut(&PERSON).unwrap()))
+    };
     let person = |change: &dyn Fn(&mut sims_formats::saved_objects::Person)| {
-        fails(&|object| change(object.person.as_mut().unwrap()), &people)
+        fails(&|object| change(object.person.as_mut().unwrap()))
     };
     let using = person(&|p| {
         p.object_uses.push(sims_formats::saved_objects::ObjectUse {
@@ -584,15 +590,13 @@ fn a_person_the_reset_would_do_more_for_stops_its_visit() {
     assert!(routing.contains("in the middle of a route"), "{routing}");
     let wide = person(&|p| p.data[73] = 1);
     assert!(wide.contains("whose data word 73 is set"), "{wide}");
-    let away = fails(&|object| object.position = [-16, -16, 1], &people);
+    let away = fails(&|object| object.position = [-16, -16, 1]);
     assert!(away.contains("inside an object or off the lot"), "{away}");
     // Without a neighborhood record, or with one that holds no person
     // data, the visit fails before anything else.
-    let nobody = fails(&|_| {}, &People::default());
+    let nobody = lot_fails(&|world| world.neighbors.slots.clear());
     assert!(nobody.contains("has no neighborhood record"), "{nobody}");
-    let mut bare = people.clone();
-    bare.records[0].revision = 0;
-    let bare = fails(&|_| {}, &bare);
+    let bare = lot_fails(&|world| world.neighbors.slots[0].as_mut().unwrap().revision = 0);
     assert!(bare.contains("holds no person data"), "{bare}");
     // The lot was not touched by any of it.
     assert!(fx.world.objects[&PERSON].stack.len() == 1);
@@ -617,11 +621,10 @@ fn the_step_visits_people_in_their_turn_and_stops_at_a_visit_it_cannot_make() {
     // Without it the step stops at the person, with the lot as the first
     // visit left it. The indicators that visit made are not visited:
     // they went to the head of the list.
+    fx.world.neighbors.slots.clear();
     let mut expected = fx.world.clone();
-    interpreter
-        .visit(&mut expected, first, &People::default())
-        .unwrap();
-    let done = interpreter.visit_objects(&mut fx.world, &People::default());
+    interpreter.visit(&mut expected, first, &people).unwrap();
+    let done = interpreter.visit_objects(&mut fx.world, &people);
     assert_eq!((done.objects, done.reset), (vec![first], vec![first]));
     let fault = done.stopped.unwrap();
     assert_eq!(fault.object, PERSON);
@@ -837,11 +840,12 @@ fn relationship_reads_and_writes_rows_kept_on_the_object() {
     );
     let row = &fx.world.objects[&3].relationships[0];
     assert_eq!((row.target, row.values.as_slice()), (3, &[0][..]));
-    // The neighborhood's records are not ported.
-    assert!(matches!(
-        trap(relationship(&mut fx, 26, [0, 0, 2, 0, 7, 0, 0, 0])),
-        Trap::Unsupported(_)
-    ));
+    // Between neighbors' records (flags byte 2), the caller must be a
+    // person: the lamp is not, which is native error 0x1c.
+    assert_eq!(
+        code(relationship(&mut fx, 26, [0, 0, 2, 0, 7, 0, 0, 0])),
+        Some(0x1c)
+    );
     assert_eq!(
         code(relationship(&mut fx, 26, [0, 4, 0, 0, 7, 0, 0, 0])),
         Some(0x15)

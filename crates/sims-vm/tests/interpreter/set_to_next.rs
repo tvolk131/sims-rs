@@ -2,7 +2,81 @@
 //! destination, and the modes that fail loudly. The lamp runs.
 
 use crate::support::*;
+use sims_sim::neighbors::{Neighbor, Neighbors};
 use sims_vm::{Fault, Trap};
+
+/// A neighborhood whose record vector holds `guids` in order; None is an
+/// empty slot. Each record's ID is its place plus one.
+fn neighborhood(guids: &[Option<u32>]) -> Neighbors {
+    Neighbors {
+        slots: guids
+            .iter()
+            .enumerate()
+            .map(|(place, guid)| {
+                guid.map(|guid| Neighbor {
+                    id: place as i16 + 1,
+                    guid,
+                    revision: 5,
+                    data: vec![0; 256],
+                    relationships: Vec::new(),
+                    friends: 0,
+                    stale: true,
+                })
+            })
+            .collect(),
+        ..Neighbors::default()
+    }
+}
+
+/// Mode 5 (0x425b15): the next occupied slot after the cursor, by place
+/// plus one, skipping empty slots. A cursor that is negative or past the
+/// last slot gives 0, which is the false branch with 0 stored.
+#[test]
+fn mode_5_walks_the_neighborhood_records() {
+    let mut fx = Fixture::new();
+    fx.world.neighbors = neighborhood(&[Some(LAMP_GUID), None, Some(SIM_GUID), Some(0x5555)]);
+    assert_eq!(scan(&mut fx, 5), (vec![1, 3, 4], 0));
+    for cursor in [-1, 4, 40] {
+        assert_eq!(step(&mut fx, 5, cursor), Ok(false));
+        assert_eq!(fx.lamp().temps[0], 0);
+    }
+}
+
+/// Mode 7: the next record, as mode 5 walks them, whose type has the
+/// operands' GUID. Each record passed is stored on the way; running out
+/// stores 0 and takes the false branch.
+#[test]
+fn mode_7_walks_the_records_of_one_person_type() {
+    let guid = SIM_GUID.to_le_bytes();
+    let operands = [
+        guid[0],
+        guid[1],
+        guid[2],
+        guid[3],
+        0x80 | 7,
+        scope::TEMPS,
+        0,
+        0,
+    ];
+    let mut fx = Fixture::new();
+    fx.world.neighbors = neighborhood(&[Some(SIM_GUID), Some(LAMP_GUID), None, Some(SIM_GUID)]);
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(31, RETURN_TRUE, RETURN_FALSE, operands)]),
+    );
+    let mut visited = Vec::new();
+    fx.lamp_mut().temps[0] = 0;
+    while fx.run().unwrap() {
+        visited.push(fx.lamp().temps[0]);
+    }
+    assert_eq!((visited, fx.lamp().temps[0]), (vec![1, 4], 0));
+    // A record whose GUID no definition has is not compared: the original
+    // compares the GUID of the definition the record is linked to.
+    fx.world.neighbors = neighborhood(&[Some(0x5555), Some(SIM_GUID)]);
+    fx.lamp_mut().temps[0] = 0;
+    assert!(matches!(trap(fx.run()), Trap::Unsupported(_)));
+}
 
 /// Operands with the cursor in temp `temp`.
 fn in_temp(mode: u8, temp: u8) -> [u8; 8] {
@@ -208,7 +282,7 @@ fn the_destination_must_take_a_write() {
 #[test]
 fn modes_over_state_the_lot_lacks_fail_loudly() {
     // Mode 10 is here because the fixture's program has no career list.
-    for mode in [5, 7, 10, 11, 13, 127] {
+    for mode in [10, 11, 13, 127] {
         let mut fx = Fixture::new();
         let text = trap(step(&mut fx, mode, 0)).to_string();
         assert!(

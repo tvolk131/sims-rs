@@ -14,7 +14,7 @@
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
 use crate::placement::capture;
-use sims_content::{People, Profile, Record};
+use sims_content::{People, Profile};
 use sims_sim::World;
 
 /// The callback table's entries a person's reset asks.
@@ -158,12 +158,7 @@ impl Interpreter<'_> {
     /// order. A person with no record, and a record whose revision is
     /// below 1, fail: the original makes a record for the one and copies
     /// only the family for the other, and neither was seen.
-    pub(crate) fn attach_neighbor(
-        &self,
-        world: &mut World,
-        id: u16,
-        people: &People,
-    ) -> Result<(), Trap> {
+    pub(crate) fn attach_neighbor(&self, world: &mut World, id: u16) -> Result<(), Trap> {
         let object = world
             .objects
             .get_mut(&id)
@@ -173,16 +168,12 @@ impl Interpreter<'_> {
             .person
             .as_mut()
             .ok_or(Trap::native(0x1c, "object is not a person"))?;
-        let record: &Record = people
-            .records
-            .iter()
-            .find(|record| record.guid == guid)
-            .ok_or_else(|| {
-                Trap::Unsupported(format!(
-                    "the person type 0x{guid:08X} has no neighborhood record; making one \
-                     during a load is not ported"
-                ))
-            })?;
+        let record = world.neighbors.first_of(guid).ok_or_else(|| {
+            Trap::Unsupported(format!(
+                "the person type 0x{guid:08X} has no neighborhood record; making one \
+                 during a load is not ported"
+            ))
+        })?;
         if record.revision < 1 {
             return Err(Trap::Unsupported(format!(
                 "neighborhood record {} holds no person data (revision {}); attaching it is \

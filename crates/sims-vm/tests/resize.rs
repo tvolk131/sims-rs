@@ -47,6 +47,10 @@ fn with_goth_people(
     program.zoning = neighborhood.zoning(context.expansions).unwrap();
     let interpreter = Interpreter::new(&program, &catalog, Stream::Global);
     let mut world = World::empty();
+    let characters = catalog.objects.iter().filter(|o| o.kind == 2);
+    world
+        .read_neighbors(&neighborhood, characters.map(|o| o.guid))
+        .unwrap();
     world.type_attributes = program.type_attributes(&catalog).unwrap();
     world.read_type_attributes(neighborhood.type_attributes.as_ref().unwrap());
     assert_eq!(interpreter.create_indicators(&mut world), Ok([1, 2]));
@@ -56,7 +60,7 @@ fn with_goth_people(
     assert_eq!(resized.removed, []);
     let created = resized.created;
     let guids = house.objects.instances.values().map(|o| o.guid);
-    let people = People::load(&install, &index, &catalog, &neighborhood, guids).unwrap();
+    let people = People::load(&install, &index, &catalog, guids).unwrap();
     then(&house, &interpreter, &mut world, &created, &people);
 }
 
@@ -226,7 +230,21 @@ fn format_7_bytes(world: &World) -> Vec<u8> {
 /// encoding ends in those three bytes and drops them, so a state pinned
 /// under format 8 can be shown to be the same state.
 fn format_8_bytes(world: &World) -> Vec<u8> {
-    let mut encoded = world.encode();
+    let mut encoded = format_9_bytes(world);
+    assert_eq!(encoded.split_off(encoded.len() - 3), [0; 3]);
+    encoded
+}
+
+/// A lot's encoding as snapshot format 9 wrote it. Format 10 added the
+/// neighborhood's records at the end of the encoding. This empties them,
+/// checks that the encoding then ends in their three zero bytes (empty
+/// lists of slots and inventories and a clear registry byte), and drops those, so a state
+/// pinned under format 9 can be shown to be the same state but for the
+/// records. The records are compared with the original apart from this.
+fn format_9_bytes(world: &World) -> Vec<u8> {
+    let mut old = world.clone();
+    old.neighbors = sims_sim::neighbors::Neighbors::default();
+    let mut encoded = old.encode();
     assert_eq!(encoded.split_off(encoded.len() - 3), [0; 3]);
     encoded
 }
@@ -234,6 +252,19 @@ fn format_8_bytes(world: &World) -> Vec<u8> {
 /// Checks a state against the digest pinned for it under snapshot format
 /// 8 ([`format_8_bytes`]) and under format 7 ([`format_7_bytes`]). Its
 /// format 9 encoding is the format 8 one and three zero bytes.
+///
+/// Every pin in this file that holds a script's frames changed once with
+/// format 10, for one reason: the original writes a return's target (0xfe
+/// or 0xff) into the frame's node word before it pops the frame (0x474cea,
+/// 0x474d1b), so the frame storage keeps that, not the node the frame
+/// last ran. Before the pins were changed, each pinned state was dumped
+/// under the old and the new interpreter and compared outside the
+/// repository: everything but the frame storage was equal, the frame
+/// storage's frame starts and unknown words were equal, and every word
+/// that differed sits at a frame's node word (one past a multiple of
+/// four) and now holds 0xfe or 0xff where it held a node of at most 250.
+/// A later frame's local can land on such a word and start with it; the
+/// capture of the Goth house's second tick shows one doing so.
 fn pinned(world: &World, format_8: &str, format_7: &str) {
     assert_eq!(digest(&format_8_bytes(world)), format_8);
     assert_eq!(digest(&format_7_bytes(world)), format_7);
@@ -357,8 +388,8 @@ fn digest(bytes: &[u8]) -> String {
 /// bytes.
 #[test]
 fn the_goth_house_resize_creates_the_controllers() {
-    const PINNED: &str = "a1b9ee0fce4ac7efc57ff249f932ad0eee2d609e545a639b0f1bd62b7b27dbf4";
-    const PINNED_7: &str = "540a7a822c65b08918239a93d0accb9d46f26c5ab16400573e8d30e88f3cba90";
+    const PINNED: &str = "3eaa7756a082ffc951a121739693c4cbe23eed354b877498e8e42da0d065fbef";
+    const PINNED_7: &str = "2ed7303150a4b04d4f2e77a87068b4dc068f817a9e133d842b6cbc5dec22104e";
 
     const FORMAT_6: &str = "5da903b012eb85ced13111300ed5fd6f125ba083eb7517bac76e5c342eae2d91";
     const FORMAT_5: &str = "9e5cab3b2caf4e1915faf58b9a3ef5fe192495b44cfb09420b9396368947bd15";
@@ -775,8 +806,8 @@ fn the_goth_house_objects_are_constructed_and_read() {
 /// 52 tiles and the four bytes of format 6's new field.
 #[test]
 fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
-    const PINNED: &str = "91d8845e2a929e3c9fd7b4b26f691b56ddf26e444d1f38e83ad1a27b6bf1b140";
-    const PINNED_7: &str = "3724e0d6e307e13a398a6a8c47e7523e1fe4f7f83cb575c4ec6cb4a6aceabdd1";
+    const PINNED: &str = "b9c40a8b5a539faa96d1697f068f4e91be53eb57211dee41854ce9240414a6e6";
+    const PINNED_7: &str = "4e84404aa396e329c0c58d4ffbffa7744f1074f8b201b5907d713a17c94eb43e";
 
     const FORMAT_6: &str = "2c000ad6962e840ece561db6b3a6ff572d8dd83815680c67a2a7eb861d3698b1";
     const FORMAT_5: &str = "d014a3ce407d420fc6b69248f9e23282b0fdc348bac79afc5670629b60ed46b1";
@@ -928,10 +959,10 @@ fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
 /// The digests are of our own state, as built here.
 #[test]
 fn the_goth_house_gets_its_rooms_and_its_household() {
-    const COUNTED: &str = "c1c8a7ad538c67dd4f5dd23ce46e45f95992a05fcb2b7dba5c58d81ca8cb75c2";
-    const COUNTED_7: &str = "c4c4bba18e2f07090e33ce5c823692498d3cfeac2b50d0652d2315f7ed040829";
-    const SELECTED: &str = "3199667febb0a83088ee468c3f5d6713a037e03d0961547fdf41e7a20719b0a5";
-    const SELECTED_7: &str = "09fcefc61a7bc468bee455e8e7e6ce0e551e9847bf6c6d67b3d773022140609e";
+    const COUNTED: &str = "d43f1bc85e6196f4942860186e6e86a447e0debd8688688854eba860acb0eb29";
+    const COUNTED_7: &str = "fe0ce22c868f9d294105766ed86fe1767389e31a8c4f00971115bc6d71196ff2";
+    const SELECTED: &str = "c1fe23f51196c7858503040b65cbb6431a7402412e1bf0190a691a829ced37fd";
+    const SELECTED_7: &str = "7eeda38aba85a2ace8a4c52ecdbe4eab7c97cb9ae89edaa98d3d0752124591b9";
     const COUNTED_6: &str = "d994b4eb25b6bb9b8ec8202bb1ede1f33ae40513f9cc2745298d76675ab6d476";
     const SELECTED_6: &str = "6a9a7290da69b6e376c09a57295217df82ef28a8a7259eff97420d5c7c1e649d";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
@@ -1151,10 +1182,10 @@ fn selected(root: &std::path::Path, then: impl FnOnce(&Interpreter, &mut World, 
 /// state after visit 201, pinned when the step stopped there.
 #[test]
 fn the_goth_house_objects_are_all_visited() {
-    const VISIT_201: &str = "fe7546148470609e9fd73a30dd2b0a79d306d1556e0bbb3b536098adf42f27c8";
-    const VISIT_201_7: &str = "13ae49d59cfa5cc946e9b9522b2e7e8634ec060af08d3df31eadd566057d5717";
-    const VISITED: &str = "2374a83ff7cad09db1a9252328948ba39d798f1ead256c6239d4c9429a295de8";
-    const VISITED_7: &str = "3986e39715b51dfe7d82f23d7644fc654fe1634c6e1b3e88da7aa891f0e5d73c";
+    const VISIT_201: &str = "680e6caf3382eff8f069b64920efdc6bd49de3c7458733f9df65076cdf22e02d";
+    const VISIT_201_7: &str = "c8dee4827001dd91ab1a41482c0b1b0ce166a4bb005408d06269e5b1f55323d6";
+    const VISITED: &str = "2558d1d97d6c006a495e185a86dda47d57891cb433bf40b909b1b6e891327521";
+    const VISITED_7: &str = "d923a23687b3904c8427bc847433284509ac0becccf0f33b67cc6297bd99695c";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1282,10 +1313,12 @@ fn the_goth_house_objects_are_all_visited() {
 /// The digest is of our own state, as built here.
 #[test]
 fn the_goth_house_load_ends_where_the_first_tick_starts() {
-    // Pinned under snapshot format 8, and the same state under format 9
-    // ([`format_8_bytes`]).
-    const BASELINE: &str = "13dd5b8ee042ed292266090ef1b7b650b2a6576531279c27db9af23e9c108648";
-    const BASELINE_9: &str = "5fb6edc68d0e15edee0b17af9f72ebbabc65efc0169b06621f4b30f32f8250f0";
+    // Pinned under snapshot format 8, the same state under format 9
+    // ([`format_9_bytes`], without the neighborhood's records) and under
+    // format 10. See [`pinned`] for why the format 8 pin changed.
+    const BASELINE: &str = "034d3b636d3529fa91826a5f5b759e4abba31d6c5be3b66732a1f1ef642ad9fb";
+    const BASELINE_9: &str = "fe21f960b207ba0ced6a6a5dfe5628fcb101c12eb9571d49578ec65dfde459da";
+    const BASELINE_10: &str = "29b4aec3debe353d77363e18cf3cbd263b30fe2fe4e1e03a5f309c08dd132168";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1379,7 +1412,8 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
         assert_eq!(world.lot_rng, before.lot_rng);
         assert_eq!(world.crt_rng, before.crt_rng);
         assert_eq!(digest(&format_8_bytes(world)), BASELINE);
-        assert_eq!(world.hash_hex(), BASELINE_9);
+        assert_eq!(digest(&format_9_bytes(world)), BASELINE_9);
+        assert_eq!(world.hash_hex(), BASELINE_10);
     });
 }
 
@@ -1405,6 +1439,18 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// run's game drew 52 more numbers before its load is the likely cause and
 /// is **unverified**.
 ///
+/// The neighborhood's 463 records and inventories were compared too, and
+/// are equal when ours are read from the neighborhood file that run's
+/// game read. This test reads the install's file, which differs from
+/// that one in records 47, 48, 301, 344 and 351 (and 301's inventory).
+/// Read from either file, the rest of our state is the same after this
+/// tick and where the next one stops. Not equal:
+/// registry byte 0x12, which that run has set and ours has not; what sets
+/// it during the original's load is not known.
+///
+/// For tick 2, only where it stops was compared: object 16's frames,
+/// arguments and locals equal that run's after ticks 2 to 5.
+///
 /// Not compared, because the capture does not hold them in a form read
 /// there: the rooms, the lot arrays, the dialog records and the persons'
 /// tick state. That the five controllers' dialogs were answered with
@@ -1414,7 +1460,8 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// The digest is of our own state, as built here.
 #[test]
 fn the_goth_house_first_tick_matches_the_original() {
-    const TICK_1: &str = "bcba5caa00ef99241cf4917a6e69499d52b4db630232049dcfe6e6fd79a580e3";
+    const TICK_1_9: &str = "62fc28f5e7689d166791a620dbed066fb8a7d707ea79017fbadf0eed3da5c937";
+    const TICK_1: &str = "bb55f7d5f656551708867b24779c2e0f019825459427858a27ad8c8874e7957b";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1462,16 +1509,38 @@ fn the_goth_house_first_tick_matches_the_original() {
                 .values()
                 .all(|t| t.last_decay == before.ticks as i32)
         );
+        assert_eq!(digest(&format_9_bytes(world)), TICK_1_9);
         assert_eq!(world.hash_hex(), TICK_1);
-        // The second tick reaches Set To Next over the neighborhood's
-        // people (mode 5), which is not ported.
+        // The second tick gets past the neighborhood's people (Set To Next
+        // modes 5 and 7, their person data, their relationships and
+        // inventories), Idle For Input and Get Distance To, and stops at
+        // the first Animate Sim, which is not ported. The capture shows
+        // that person at the same instruction after ticks 2 to 5, with
+        // the same frames; the 254 in its last local is a return's
+        // target left in the frame storage.
         let second = interpreter.lot_update(world, &tuning, &mut player);
         match second {
             Err(sims_vm::TickError::Fault(fault)) => {
                 assert_eq!(fault.object, 16);
-                assert!(fault.to_string().contains("Set To Next mode 5"));
+                assert!(fault.to_string().contains("Animate Sim"), "{fault}");
             }
             other => panic!("{other:?}"),
         }
+        let frames: Vec<_> = world.objects[&16]
+            .stack
+            .iter()
+            .map(|f| (f.tree, f.node))
+            .collect();
+        assert_eq!(
+            frames,
+            [
+                (0x1000, 1),
+                (0x2001, 4),
+                (0x205b, 13),
+                (0x206f, 0),
+                (0x2025, 18)
+            ]
+        );
+        assert_eq!(world.objects[&16].stack[4].locals, [0, 3, 8222, 254]);
     });
 }

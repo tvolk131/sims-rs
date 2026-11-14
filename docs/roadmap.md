@@ -60,8 +60,13 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. **K = 1 on the Goth house**: our state after tick 1
   equals a capture of the original after its tick 1 in everything
   compared, the C runtime's random stream aside (see "The first tick").
-  Tick 2 stops at Set To Next over the neighborhood's people (mode 5),
-  which is not ported, and the boot says so and at which tick.
+  The simulation now holds the neighborhood's people (their records,
+  person data, relationships and inventories), and tick 2 gets past the
+  scripts that read them. It stops at Animate Sim (primitive 44) on
+  object 16, which needs a person's animator, and the boot says so and at
+  which tick. The capture shows object 16 waiting at that same place
+  after every tick from 2 to 5, so the stop is where the original is, but
+  K stays 1 until tick 2 runs to its end.
 
 ### Load sequence
 
@@ -825,12 +830,37 @@ load, but that is unverified. Not compared: rooms, lot arrays, dialog
 records and the persons' tick state, which that capture does not hold in a
 form we read.
 
-**What tick 2 needs.** Object 16, a person, runs a tree of the people's
-semi-global file that goes over the neighborhood's people (Set To Next
-mode 5) and their relationships. The simulation does not hold the
-neighborhood's people yet. The capture shows what follows in ticks 2 to
-5: object 15 asks a two-button dialog, answered with the second button;
-object 262 is made again; then 35 objects are removed and one is made.
+**The neighborhood's people** (`crates/sims-sim/src/neighbors.rs`). A
+*record* is the original's 628-byte entry for one person of the
+neighborhood: an ID, the GUID of the person's type, 256 words of person
+data, and relationship rows. The game reads them from the neighborhood
+file (NBRS, `0x42feb2`) and rebuilds the family word of each when the
+neighborhood reloads (`0x424806`), before any lot loads; the inventories
+come from the NGBH chunk (`0x4254f6`). `World::read_neighbors` does both.
+A script names a record by its place in the list plus one (`0x4256f4`).
+What reads and writes them: Set To Next modes 5 and 7 (`0x425b15`),
+expression scope 32 (a record's person data, `0x4537e3`), Relationship
+with flag 2 or between two people (`0x44d17c`), and Manage Inventory
+operation 3 (`0x4552f8`). After tick 1 all 463 records and the
+inventories equal the capture's, when ours reads the same neighborhood
+file as the capture's game; the install's file differs from that one in
+five records (see `docs/decisions.md`). One registry byte that a
+relationship write sets is 1 in the capture and 0 here; what sets it
+during the original's load is not known.
+
+**Tick 2.** Object 16, a person, runs a tree of the people's semi-global
+file that goes over the neighborhood's people and their relationships.
+It then waits for input (Idle For Input, `0x45db94`), measures distances
+(Get Distance To, `0x451f27`) and reaches Animate Sim (`0x58950b`). That
+primitive loads an animation into the person's animator and asks the
+animator, each tick, for its events and whether it is done. The
+animator's tick (`0x58dc72`) moves the person and runs the animation
+clock; it is not ported, so Animate Sim fails loudly. The capture shows
+object 16 at the same node, with the same arguments and locals, after
+ticks 2 to 5: the animation does not end in that time. What follows in
+the capture's ticks 2 to 5: object 15 asks a two-button dialog, answered
+with the second button; object 262 is made again; then 35 objects are
+removed and one is made. None of that is reached here yet.
 
 ## Working rules
 

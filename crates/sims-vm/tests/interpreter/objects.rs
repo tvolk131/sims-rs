@@ -1,9 +1,10 @@
 //! Load step 6e: saved objects are constructed, then read.
 
 use crate::support::*;
-use sims_content::{People, Record, Skeleton};
+use sims_content::{People, Skeleton};
 use sims_core::CrtRng;
 use sims_formats::saved_objects::{Instance, Multipart, Objects, Slot};
+use sims_sim::neighbors::{Neighbor, Neighbors};
 use sims_vm::{Fault, SavedRead, Trap};
 use std::collections::BTreeMap;
 
@@ -25,7 +26,26 @@ fn lot() -> Fixture {
     fx.add_type(ADULT, 2, 0, 4097);
     fx.add_type(CHILD, 2, 0, 4097);
     fx.add_type(STOOL, 4, 0, 4097);
+    fx.world.neighbors = records(11);
     fx
+}
+
+/// The neighborhood's records of the two person types, every person data
+/// word `interest`.
+fn records(interest: i16) -> Neighbors {
+    let record = |id, guid| Neighbor {
+        id,
+        guid,
+        revision: 5,
+        data: vec![interest; 256],
+        relationships: Vec::new(),
+        friends: 0,
+        stale: true,
+    };
+    Neighbors {
+        slots: vec![Some(record(31, ADULT)), Some(record(32, CHILD))],
+        ..Neighbors::default()
+    }
 }
 
 fn saved(id: u16, guid: u32) -> Instance {
@@ -223,20 +243,9 @@ fn sim(id: u16, guid: u32) -> Instance {
 
 /// Two skeleton files: one with two skeletons, of which adults use the
 /// second, and one with the child's.
-fn people(interest: i16) -> People {
-    let record = |id, guid, revision| Record {
-        id,
-        guid,
-        revision,
-        data: if revision >= 1 {
-            vec![interest; 256]
-        } else {
-            Vec::new()
-        },
-    };
+fn people() -> People {
     People {
         profiles: BTreeMap::new(),
-        records: vec![record(31, ADULT, 5), record(32, CHILD, 5)],
         skeletons: BTreeMap::from([
             (
                 ADULT,
@@ -280,7 +289,7 @@ fn constructing_people_draws_for_their_skeletons() {
         sim(5, ADULT),
     ]);
     // Interests of 11 or more in the records: no defaults are made.
-    let done = read(&mut fx, &objects, &people(11)).unwrap();
+    let done = read(&mut fx, &objects, &people()).unwrap();
     // The first adult reads a.bcf (32 + 128) and builds its own copy
     // (128). The child reads c.bcf (48) and builds its copy (48). The
     // second adult only builds its copy (128).
@@ -303,7 +312,7 @@ fn constructing_people_draws_for_their_skeletons() {
     // A game that has read a.bcf already does not read it again.
     let mut fx = lot();
     fx.world.skeleton_files.insert("a.bcf".into());
-    let done = read(&mut fx, &file(vec![sim(3, ADULT)]), &people(11)).unwrap();
+    let done = read(&mut fx, &file(vec![sim(3, ADULT)]), &people()).unwrap();
     assert_eq!(done.draws, 128);
 }
 
@@ -313,9 +322,10 @@ fn a_person_with_low_interests_gets_defaults_that_only_cost_draws() {
     // until one has room, then a value. So 30 draws at least.
     for interest in [0, 10] {
         let mut fx = lot();
+        fx.world.neighbors = records(interest);
         fx.world.crt_rng = CrtRng::from_state(99);
         let start = fx.world.crt_rng;
-        let done = read(&mut fx, &file(vec![sim(3, ADULT)]), &people(interest)).unwrap();
+        let done = read(&mut fx, &file(vec![sim(3, ADULT)]), &people()).unwrap();
         let defaults = done.draws - 160 - 128;
         assert!((30..200).contains(&defaults), "{defaults}");
         assert_eq!(fx.world.crt_rng, advanced(start, done.draws));
@@ -328,16 +338,18 @@ fn a_person_with_low_interests_gets_defaults_that_only_cost_draws() {
     // `default_traits`.
     for (state, draws) in [(99, DEFAULTS_FROM_99), (1, DEFAULTS_FROM_1)] {
         let mut fx = lot();
+        fx.world.neighbors = records(0);
         fx.world.crt_rng = CrtRng::from_state(state);
-        let done = read(&mut fx, &file(vec![sim(3, ADULT)]), &people(0)).unwrap();
+        let done = read(&mut fx, &file(vec![sim(3, ADULT)]), &people()).unwrap();
         assert_eq!(done.draws - 288, draws, "from state {state}");
     }
     // A record without person data leaves the interests at zero.
     let mut fx = lot();
-    let mut without = people(500);
-    without.records[0].revision = 0;
-    without.records[0].data.clear();
-    let done = read(&mut fx, &file(vec![sim(3, ADULT)]), &without).unwrap();
+    fx.world.neighbors = records(500);
+    let record = fx.world.neighbors.slots[0].as_mut().unwrap();
+    record.revision = 0;
+    record.data.fill(0);
+    let done = read(&mut fx, &file(vec![sim(3, ADULT)]), &people()).unwrap();
     assert!(done.draws >= 288 + 30);
 }
 const DEFAULTS_FROM_99: u32 = 35;
@@ -348,27 +360,31 @@ fn people_the_read_cannot_construct_fail_loudly() {
     // No skeleton for the type.
     let mut fx = lot();
     let before = fx.world.clone();
-    let mut missing = people(11);
+    let mut missing = people();
     missing.skeletons.remove(&CHILD);
     let objects = file(vec![sim(3, ADULT), sim(2, CHILD)]);
     let (object, cause) = trap(read(&mut fx, &objects, &missing));
     assert_eq!(object, 2);
     assert!(matches!(cause, Trap::Unsupported(_)), "{cause:?}");
     // No neighborhood record: the original makes one.
-    let mut missing = people(11);
-    missing.records.remove(0);
-    let (object, cause) = trap(read(&mut fx, &objects, &missing));
+    fx.world.neighbors.slots[0] = None;
+    let (object, cause) = trap(read(&mut fx, &objects, &people()));
     assert_eq!(object, 3);
     assert!(matches!(cause, Trap::Unsupported(_)), "{cause:?}");
     // A record too short to hold the interests.
-    let mut short = people(11);
-    short.records[0].data.truncate(50);
-    let (_, cause) = trap(read(&mut fx, &objects, &short));
+    fx.world.neighbors = records(11);
+    fx.world.neighbors.slots[0]
+        .as_mut()
+        .unwrap()
+        .data
+        .truncate(50);
+    let (_, cause) = trap(read(&mut fx, &objects, &people()));
     assert!(matches!(cause, Trap::Invalid(_)), "{cause:?}");
+    fx.world.neighbors = records(11);
     // The save says person and the definition does not, or the reverse.
-    let (_, cause) = trap(read(&mut fx, &file(vec![sim(3, CHAIR)]), &people(11)));
+    let (_, cause) = trap(read(&mut fx, &file(vec![sim(3, CHAIR)]), &people()));
     assert!(matches!(cause, Trap::Invalid(_)), "{cause:?}");
-    let (_, cause) = trap(read(&mut fx, &file(vec![saved(3, ADULT)]), &people(11)));
+    let (_, cause) = trap(read(&mut fx, &file(vec![saved(3, ADULT)]), &people()));
     assert!(matches!(cause, Trap::Invalid(_)), "{cause:?}");
     // The stream and the files read are as they were.
     assert_eq!(fx.world.encode(), before.encode());

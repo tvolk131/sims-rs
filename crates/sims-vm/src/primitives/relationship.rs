@@ -17,13 +17,18 @@
 //! the order they were first used. A row or column that is missing is
 //! made, as zeros, unless flag 1 is set.
 //!
-//! Only relationships kept on the lot's objects are ported. Two people
-//! keep theirs in the neighborhood's records, as does flag 2; both fail
-//! loudly.
+//! With flag 2 the rows are the neighborhood's records': the source and
+//! target are neighbor IDs (for directions 0 and 1, mine is my person
+//! data word 31), the source's record keeps the row, and the row's key is
+//! the target record's own ID. Two people on the lot keep theirs there
+//! too, without the flag: the source person's record, under the target
+//! person's word 31. Either way a record that is missing is native error
+//! 0x15, and a write marks the two records first (`mark_relationships`).
 
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
 use sims_formats::saved_objects::Relationship;
+use sims_sim::neighbors::Row;
 
 impl Machine<'_, '_> {
     pub(crate) fn relationship(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
@@ -78,65 +83,95 @@ impl Machine<'_, '_> {
         } else {
             0
         };
-        if operands[2] & 2 != 0 {
-            return Err(Trap::Unsupported(
-                "Relationship on the neighborhood's records".into(),
-            ));
-        }
         let me = self.me as i16;
-        let (source, target) = match direction {
-            0 => (me, stack_object),
-            1 => (stack_object, me),
-            2 => (stack_object, named),
-            3 => (named, stack_object),
-            _ => return Err(Trap::native(0x15, "invalid Relationship direction")),
-        };
-        let find = |id: i16| {
-            u16::try_from(id)
-                .ok()
-                .and_then(|id| self.world.objects.get(&id))
-                .ok_or(Trap::native(0x15, "missing Relationship object"))
-        };
-        let (from, to) = (find(source)?, find(target)?);
-        if from.person.is_some() && to.person.is_some() {
-            return Err(Trap::Unsupported(
-                "Relationship between two people, which the neighborhood keeps".into(),
-            ));
-        }
-        let source = source as u16;
         let writing = operands[2] & 4 != 0;
+        let (table, key) = if operands[2] & 2 != 0 {
+            // Directions 0 and 1 name me by my neighbor ID (person data
+            // word 31); the stack object and the local are neighbor IDs.
+            let neighbor = |id: i16| -> Result<i16, Trap> {
+                let object = u16::try_from(id)
+                    .ok()
+                    .and_then(|id| self.world.objects.get(&id))
+                    .ok_or(Trap::native(0x15, "missing Relationship object"))?;
+                let person = object
+                    .person
+                    .as_ref()
+                    .ok_or(Trap::native(0x1c, "Relationship caller is not a person"))?;
+                person
+                    .data
+                    .get(NEIGHBOR)
+                    .copied()
+                    .ok_or_else(|| Trap::Invalid("the person has no neighbor ID".into()))
+            };
+            let (source, target) = match direction {
+                0 => (neighbor(me)?, stack_object),
+                1 => (stack_object, neighbor(me)?),
+                2 => (stack_object, named),
+                3 => (named, stack_object),
+                _ => return Err(Trap::native(0x15, "invalid Relationship direction")),
+            };
+            let key = self.records(source, target)?;
+            if writing {
+                self.mark_relationships(source, target);
+            }
+            (Table::Neighbor(source), key)
+        } else {
+            let (source, target) = match direction {
+                0 => (me, stack_object),
+                1 => (stack_object, me),
+                2 => (stack_object, named),
+                3 => (named, stack_object),
+                _ => return Err(Trap::native(0x15, "invalid Relationship direction")),
+            };
+            let find = |id: i16| {
+                u16::try_from(id)
+                    .ok()
+                    .and_then(|id| self.world.objects.get(&id))
+                    .ok_or(Trap::native(0x15, "missing Relationship object"))
+            };
+            let (from, to) = (find(source)?, find(target)?);
+            match (&from.person, &to.person) {
+                (Some(from), Some(to)) => {
+                    // Two people keep theirs in the source's record, under
+                    // the target's neighbor ID.
+                    let word = |p: &sims_formats::saved_objects::Person| {
+                        p.data
+                            .get(NEIGHBOR)
+                            .copied()
+                            .ok_or_else(|| Trap::Invalid("the person has no neighbor ID".into()))
+                    };
+                    let (source, target) = (word(from)?, word(to)?);
+                    self.records(source, target)?;
+                    if writing {
+                        self.mark_relationships(source, target);
+                    }
+                    (Table::Neighbor(source), i32::from(target))
+                }
+                _ => (Table::Object(source as u16), i32::from(target)),
+            }
+        };
         let column = usize::from(operands[0]);
-        let row = from
-            .relationships
-            .iter()
-            .position(|r| r.present != 0 && r.target == i32::from(target));
-        if row.is_none_or(|row| from.relationships[row].values.len() <= column) {
+        if values(self.world, table, key).is_none_or(|values| values.len() <= column) {
             if operands[2] & 1 != 0 {
                 return Ok(false);
             }
-            let rows = &mut self
-                .world
-                .objects
-                .get_mut(&source)
-                .ok_or(Trap::native(0x15, "missing Relationship object"))?
-                .relationships;
-            let row = row.unwrap_or_else(|| {
-                rows.push(Relationship {
-                    present: 1,
-                    target: i32::from(target),
-                    values: Vec::new(),
-                });
-                rows.len() - 1
-            });
-            rows[row].values.resize(column + 1, 0);
+            add_row(self.world, table, key)?;
+            values(self.world, table, key)
+                .ok_or_else(|| Trap::Invalid("a relationship row vanished".into()))?
+                .resize(column + 1, 0);
         }
         // The operand is resolved for writing in both directions.
         let (cell, writable) = self.resolve(operands[4], word(operands, 6), true)?;
+        let vanished = || Trap::Invalid("a relationship row vanished".into());
         if writing {
             let value = self.value(cell)?;
-            *cell_of(self.world, source, target, column)? = i32::from(value);
+            *values(self.world, table, key)
+                .and_then(|v| v.get_mut(column))
+                .ok_or_else(vanished)? = i32::from(value);
         } else {
-            let old = *cell_of(self.world, source, target, column)? as i16;
+            let old = *values(self.world, table, key)
+                .and_then(|v| v.get_mut(column))
+                .ok_or_else(vanished)? as i16;
             if !writable || !self.store(cell, old)? {
                 return Err(Trap::native(
                     0x13,
@@ -146,22 +181,91 @@ impl Machine<'_, '_> {
         }
         Ok(true)
     }
+
+    /// Checks that both neighbor IDs name records, as the original needs
+    /// both (native error 0x15), and gives the key the source's row for
+    /// the target has: the target record's own ID.
+    fn records(&self, source: i16, target: i16) -> Result<i32, Trap> {
+        let neighbors = &self.world.neighbors;
+        let missing = || Trap::native(0x15, "missing Relationship neighbor");
+        neighbors.get(source).ok_or_else(missing)?;
+        Ok(i32::from(neighbors.get(target).ok_or_else(missing)?.id))
+    }
+
+    /// What a write to a relationship between people marks (0x44485b),
+    /// before the column is looked at, so even when it is absent: both
+    /// records' friend counts as out of date (0x4246b9), and the
+    /// registry's byte 0x12.
+    ///
+    /// Not modeled: 0x4246b9 also marks the friend count of the family
+    /// whose chunk ID is the record's person data word 61 (family +0x124).
+    /// The neighborhood's families are not kept; nothing ported reads
+    /// that count.
+    fn mark_relationships(&mut self, source: i16, target: i16) {
+        for id in [source, target] {
+            if let Some(record) = self.world.neighbors.get_mut(id) {
+                record.stale = true;
+            }
+        }
+        self.world.neighbors.relationships_changed = true;
+    }
 }
 
-fn cell_of(
-    world: &mut sims_sim::World,
-    source: u16,
-    target: i16,
-    column: usize,
-) -> Result<&mut i32, Trap> {
-    world
-        .objects
-        .get_mut(&source)
-        .and_then(|o| {
-            o.relationships
-                .iter_mut()
-                .find(|r| r.present != 0 && r.target == i32::from(target))
-        })
-        .and_then(|r| r.values.get_mut(column))
-        .ok_or_else(|| Trap::Invalid("a relationship row vanished".into()))
+/// Person data word 31: a person's neighbor ID.
+const NEIGHBOR: usize = 31;
+
+/// Where a relationship's rows are kept.
+#[derive(Debug, Clone, Copy)]
+enum Table {
+    /// On a lot object, by its ID.
+    Object(u16),
+    /// In a neighborhood record, by its neighbor ID.
+    Neighbor(i16),
+}
+
+/// The values of the row for `key`, if the table has one.
+fn values(world: &mut sims_sim::World, table: Table, key: i32) -> Option<&mut Vec<i32>> {
+    match table {
+        Table::Object(id) => world
+            .objects
+            .get_mut(&id)?
+            .relationships
+            .iter_mut()
+            .find(|r| r.present != 0 && r.target == key)
+            .map(|r| &mut r.values),
+        Table::Neighbor(id) => world
+            .neighbors
+            .get_mut(id)?
+            .row_mut(key)
+            .map(|r| &mut r.values),
+    }
+}
+
+/// Adds an empty row for `key` at the end of the table, unless it has one.
+fn add_row(world: &mut sims_sim::World, table: Table, key: i32) -> Result<(), Trap> {
+    if values(world, table, key).is_some() {
+        return Ok(());
+    }
+    match table {
+        Table::Object(id) => world
+            .objects
+            .get_mut(&id)
+            .ok_or(Trap::native(0x15, "missing Relationship object"))?
+            .relationships
+            .push(Relationship {
+                present: 1,
+                target: key,
+                values: Vec::new(),
+            }),
+        Table::Neighbor(id) => world
+            .neighbors
+            .get_mut(id)
+            .ok_or(Trap::native(0x15, "missing Relationship neighbor"))?
+            .relationships
+            .push(Row {
+                target: key,
+                values: Vec::new(),
+            }),
+    }
+    Ok(())
 }

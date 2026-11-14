@@ -7,6 +7,7 @@ mod expression;
 mod factory;
 mod load;
 mod memory;
+mod neighbors;
 mod object_type;
 mod objects;
 mod presentation;

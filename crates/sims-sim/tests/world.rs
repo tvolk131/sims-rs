@@ -2,6 +2,7 @@ use sims_content::{Catalog, House, Index, Install, Neighborhood};
 use sims_core::{CrtRng, F32, GameRng};
 use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
+use sims_sim::neighbors::{Inventory, Item, Neighbor, Neighbors, Row};
 use sims_sim::rooms::{Half, Room, Rooms};
 use sims_sim::{
     Budget, Dialog, Dialogs, FrameStorage, MagicHistory, Object, PersonTick, Snapshots,
@@ -161,6 +162,32 @@ fn world() -> World {
                 room: 0,
             },
         )]),
+        neighbors: Neighbors {
+            slots: vec![
+                None,
+                Some(Neighbor {
+                    id: 2,
+                    guid: 0x2222,
+                    revision: 9,
+                    data: (0..256).map(|n| n - 100).collect(),
+                    relationships: vec![Row {
+                        target: -7,
+                        values: vec![50, -3],
+                    }],
+                    friends: 1,
+                    stale: true,
+                }),
+            ],
+            inventories: vec![Inventory {
+                neighbor: 2,
+                items: vec![Item {
+                    kind: 6,
+                    guid: 0x4e56_2938,
+                    count: 3,
+                }],
+            }],
+            relationships_changed: true,
+        },
     }
 }
 
@@ -170,7 +197,24 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "2efd25eeadfef4e5f72cdc7f4fd89cf2889fdc57d892f8be3d4b78916c50d470";
+const PINNED: &str = "fd61775798ab1e3a152bc9875852ca2e51da1600fe802e90b5d711205c58fd68";
+
+/// The digest of [`world`] without its neighbors, minus the three zero
+/// bytes they encode to: what snapshot format 9 pinned.
+fn format_9_digest(mut world: World) -> String {
+    world.neighbors = Neighbors::default();
+    let mut bytes = world.encode();
+    assert_eq!(bytes.split_off(bytes.len() - 3), [0; 3]);
+    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&bytes).into();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn without_neighbors_the_encoding_is_format_9_and_three_zero_bytes() {
+    // Snapshot format 10 added the neighborhood's records at the end.
+    assert_eq!(format_9_digest(world()), PINNED_9);
+}
+const PINNED_9: &str = "2efd25eeadfef4e5f72cdc7f4fd89cf2889fdc57d892f8be3d4b78916c50d470";
 
 #[test]
 fn without_dialogs_or_person_ticks_the_encoding_is_format_8_and_three_zero_bytes() {
@@ -180,8 +224,9 @@ fn without_dialogs_or_person_ticks_the_encoding_is_format_8_and_three_zero_bytes
     let mut world = world();
     world.dialogs = Dialogs::default();
     world.person_ticks.clear();
+    world.neighbors = Neighbors::default();
     let mut bytes = world.encode();
-    assert_eq!(bytes.split_off(bytes.len() - 3), [0; 3]);
+    assert_eq!(bytes.split_off(bytes.len() - 6), [0; 6]);
     let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&bytes).into();
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(hex, PINNED_8);
