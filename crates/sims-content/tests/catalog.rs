@@ -105,6 +105,29 @@ fn a_semi_global_inside_an_archive_directory_is_found_by_file_name() {
 }
 
 #[test]
+fn a_qualified_semi_global_link_matches_the_whole_member_name() {
+    let tree = Tree::new("links-qualified");
+    let globals = iff(&[]);
+    base(
+        &tree,
+        &[
+            ("a\\SofaGlobals.iff", &globals),
+            ("sub\\SofaGlobals.iff", &globals),
+        ],
+    );
+    let sofa = iff(&[
+        (b"OBJD", 128, &objd(1)),
+        (b"GLOB", 128, b"\x0fsub\\SofaGlobals"),
+    ]);
+    tree.file("Downloads/Sofa.iff", &sofa);
+    let (index, catalog) = catalog(&tree);
+    let (sofa, _) = index.named("Sofa.iff").next().unwrap();
+    let target = catalog.semi_globals[&sofa].unwrap();
+    assert_eq!(name(&index, target), "sub\\SofaGlobals.iff");
+    assert_eq!(index.named("SofaGlobals.iff").count(), 2);
+}
+
+#[test]
 fn bad_files_and_definitions_become_diagnostics() {
     let tree = Tree::new("bad");
     base(&tree, &[]);

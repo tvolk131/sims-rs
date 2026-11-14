@@ -18,8 +18,9 @@ has a character the code page lacks keeps the file system's bytes.
 non-Western code page would differ.
 
 `Index::named` compares a resource's last path component, so a GLOB link
-to `SofaGlobals.iff` finds an archive member `sub\SofaGlobals.iff`;
-`Resource::name` keeps the whole name for reporting. Which of several
+to `SofaGlobals.iff` finds an archive member `sub\SofaGlobals.iff`. A
+name that holds a directory still matches the whole member name, as
+before, and `Resource::name` keeps the whole name for reporting. Which of several
 such files the original picks stays unverified, as before.
 
 A string table whose leading word is not one of the four version words

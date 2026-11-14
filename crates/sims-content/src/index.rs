@@ -175,16 +175,21 @@ impl Index {
         Ok(())
     }
 
-    /// Resources whose file name matches, ignoring ASCII case, in load
-    /// order, with their positions in [`Index::resources`]. An archive
-    /// member's file name is the last component of its name, so
-    /// `sub\SofaGlobals.iff` is found as `SofaGlobals.iff`; its
-    /// [`Resource::name`] keeps the whole name.
+    /// Resources whose name matches, ignoring ASCII case, in load order,
+    /// with their positions in [`Index::resources`]. A name without a
+    /// directory matches a resource's file name, the last component of its
+    /// name, so `SofaGlobals.iff` finds the member `sub\SofaGlobals.iff`.
+    /// A name with a directory (`\` or `/`) matches the whole
+    /// [`Resource::name`], as before.
     pub fn named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = (usize, &'a Resource)> {
-        self.resources
-            .iter()
-            .enumerate()
-            .filter(move |(_, r)| r.file_name().eq_ignore_ascii_case(name))
+        let qualified = name.contains(['\\', '/']);
+        self.resources.iter().enumerate().filter(move |(_, r)| {
+            if qualified {
+                r.name().eq_ignore_ascii_case(name)
+            } else {
+                r.file_name().eq_ignore_ascii_case(name)
+            }
+        })
     }
 
     /// Lists one mount: gathers its directories, then walks them.
