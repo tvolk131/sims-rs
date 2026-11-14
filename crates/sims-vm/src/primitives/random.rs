@@ -19,8 +19,11 @@ impl Machine<'_, '_> {
         };
         let (destination, writable) = self.resolve(scope(2)?, word(operands, 0), true)?;
         // Resolution also reads the old value, so an unreadable destination
-        // faults before the range is read or a number drawn.
-        self.value(destination)?;
+        // faults before the range is read or a number drawn. The value
+        // itself is never used, so a local still holding half of a
+        // pointer (which reads as unknown here) is fine: the original
+        // reads its bits and overwrites them.
+        self.probe(destination)?;
         let (range_cell, range_pointer) = self.resolve(scope(6)?, word(operands, 4), false)?;
         let range = self.value(range_cell)?;
         if range == 0 {
@@ -40,10 +43,15 @@ impl Machine<'_, '_> {
                 "Random Number destination is not writable",
             ));
         }
-        // Check that the store will succeed before consuming a draw.
-        if !matches!(destination, Cell::Motive(..)) {
-            let old = self.value(destination)?;
-            self.store(destination, old)?;
+        // Check that the store will succeed before consuming a draw. A
+        // local in range always takes the store.
+        match destination {
+            Cell::Motive(..) => {}
+            Cell::Local(_) => self.probe(destination)?,
+            _ => {
+                let old = self.value(destination)?;
+                self.store(destination, old)?;
+            }
         }
         let rng = match self.stream {
             Stream::Lot => &mut self.world.lot_rng,
@@ -58,5 +66,19 @@ impl Machine<'_, '_> {
             self.store(destination, value as i16)?;
         }
         Ok(true)
+    }
+
+    /// Reads a cell only to fault where the original's read would: a
+    /// local is checked for range, not for what it holds.
+    fn probe(&self, cell: Cell) -> Result<(), Trap> {
+        match cell {
+            Cell::Local(i) => self
+                .frame()?
+                .locals
+                .get(i)
+                .map(drop)
+                .ok_or_else(|| Trap::Invalid(format!("word {i} out of range"))),
+            _ => self.value(cell).map(drop),
+        }
     }
 }

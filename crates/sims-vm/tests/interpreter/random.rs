@@ -136,3 +136,59 @@ fn a_motive_takes_the_draw_as_a_float() {
         (expected.next_u32() % 1000) as f32
     );
 }
+
+#[test]
+fn a_local_holding_half_a_pointer_takes_the_draw() {
+    let mut fx = Fixture::new();
+    // The first child's code pointer is left at frame storage words 26
+    // and 27.
+    fx.add(
+        LAMP_FILE,
+        4100,
+        shaped(
+            0x8002,
+            0,
+            0,
+            4,
+            vec![ins(4101, RETURN_TRUE, RETURN_FALSE, [0; 8])],
+        ),
+    );
+    fx.add(
+        LAMP_FILE,
+        4101,
+        shaped(
+            0x8002,
+            0,
+            0,
+            0,
+            vec![expression(scope::LITERAL, 1, op::EQUAL, scope::LITERAL, 1)],
+        ),
+    );
+    assert_eq!(fx.run_with(LAMP, 4100, 0, &[], 100), Ok(true));
+    assert_eq!(fx.world.frame_storage[&LAMP].words[26], None);
+    // A smaller caller and two parameters put the next child's local 0
+    // over that word; Random Number overwrites it without using it.
+    fx.add(
+        LAMP_FILE,
+        4200,
+        shaped(
+            0x8002,
+            0,
+            0,
+            0,
+            vec![ins(4201, RETURN_TRUE, RETURN_FALSE, [0; 8])],
+        ),
+    );
+    fx.add(
+        LAMP_FILE,
+        4201,
+        shaped(
+            0x8002,
+            0,
+            2,
+            1,
+            vec![ins(8, RETURN_TRUE, RETURN_FALSE, operands(25, 0, 7, 10))],
+        ),
+    );
+    assert_eq!(fx.run_with(LAMP, 4200, 0, &[], 100), Ok(true));
+}
