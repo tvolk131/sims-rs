@@ -251,9 +251,9 @@ fn appearance_rank(folder: &str) -> usize {
 /// Its file list (0x5c1a7d, as the old prototype ported it:
 /// legacy/crates/sims-sim/src/pose/clothing/catalog_files.rs) takes every
 /// text catalog (`.cmx`) in every folder before any binary one (`.bcf`),
-/// the folders in [`APPEARANCE_FOLDERS`] order, and skips a file name
-/// already listed from an earlier folder. [`load_order`] puts the
-/// install's catalogs in that order and [`index`] keeps the first of each
+/// the folders in `APPEARANCE_FOLDERS` order, and skips a file name
+/// already listed from an earlier folder. `load_order` puts the
+/// install's catalogs in that order and `index` keeps the first of each
 /// name, so `B629MAFitlgt_labtech` is found in `b629ma_labtech.cmx` and
 /// `b200mafit_ctb` in `GameData/Skins`, as in the original.
 ///
