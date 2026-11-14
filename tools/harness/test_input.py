@@ -96,7 +96,7 @@ class Game:
     def add_object(self, oid, position, person=False, selected=False):
         m = self.m
         p = m.alloc(0xb10)
-        definition = m.alloc(0x40)
+        definition = m.alloc(0xa8)
         m.put(definition + 0x12, struct.pack('<H', 2 if person else 4))
         m.put_words(p + 0x118, definition)
         m.put(p + 0xf0, struct.pack('<H', oid))
@@ -107,6 +107,11 @@ class Game:
         m.put_words(self.registry + 0x1c, end + 4)
         self.objects[oid] = p
         return p
+
+    def remove_object(self, oid):
+        p = self.objects.pop(oid)
+        q = next(q for q in range(self.slots, self.m.word(self.registry + 0x1c), 4) if self.m.word(q) == p)
+        self.m.put_words(q, 0)
 
     def hover(self, oid):
         self.m.put(self.picker + 0x2e, struct.pack('<H', oid))
@@ -177,6 +182,13 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(steps[3]['args'], [21, 173, 50])
         self.assertEqual(steps[4]['args'], [21, None, 100])
         self.assertEqual(steps[0]['line'], 3)
+
+    def test_build_and_buy_steps(self):
+        steps = inp.parse_scenario('press 93 458\nexpect-mode buy within 50\nexpect-mode 1\n'
+                                   'expect-new-object\nexpect-new-object within 9')
+        self.assertEqual([s['args'] for s in steps], [[93, 458], [2, 50], [1, 200], [200], [9]])
+        with self.assertRaises(inp.ScenarioError):
+            inp.parse_scenario('expect-mode flying')
 
     def test_errors_name_the_line(self):
         for text, message in (('jump 3', 'line 1: unknown step'), ('wait', 'line 1: wait takes'),
@@ -357,6 +369,41 @@ class RunnerTest(RunnerBase):
         self.tick(r)
         self.assertIsNone(r.failed)
         self.assertEqual(self.rows('taken')[0]['where'], 'queue')
+
+    def test_buy_mode_and_a_placed_object(self):
+        g = self.g
+        g.m.put_words(g.sim + 0x90, 2542)
+        r = self.runner('press 93 458\nexpect-mode buy within 20\nexpect-new-object within 20')
+        self.tick(r)
+        self.assertIn('mousedown 1', self.last_command())
+        g.m.put(g.sim + 0x36, b'\x02\x00')
+        self.tick_until(r, lambda: self.rows('mode'))
+        self.tick(r, 3)
+        self.assertFalse(r.finished)
+        g.add_object(400, [0x300, 0x280])
+        g.m.put_words(g.sim + 0x90, 2242)
+        self.tick_until(r, lambda: r.finished)
+        self.assertIsNone(r.failed)
+        placed = self.rows('placed')[0]
+        self.assertEqual(([o['id'] for o in placed['objects']], placed['cost']), ([400], 300))
+        self.assertEqual(len(bytes.fromhex(placed['objects'][0]['definition'])), 0xa6)
+        self.assertEqual(len(placed['objects'][0]['data']), 72)
+
+    def test_a_purchase_reusing_a_sold_objects_id(self):
+        g = self.g
+        r = self.runner('wait 2\nexpect-new-object within 20')
+        self.tick(r)  # the registry is noted: the bench and the person
+        g.remove_object(173)  # sold
+        self.tick(r)
+        g.add_object(173, [0x300, 0x280])  # bought; the game gives it the free ID
+        self.tick_until(r, lambda: r.finished)
+        self.assertIsNone(r.failed)
+        self.assertEqual([o['id'] for o in self.rows('placed')[0]['objects']], [173])
+
+    def test_expect_mode_times_out(self):
+        r = self.runner('expect-mode buy within 3')
+        self.tick(r, 5)
+        self.assertIn('not 2', r.failed)
 
     def test_expect_queued_times_out(self):
         r = self.runner('expect-queued 21 within 3')

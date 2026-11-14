@@ -85,6 +85,64 @@ layer (`Animator::base`). Which clip the original puts there needs more
 reverse engineering on the simulation side. Until then the clip comes
 from the saved person record and the phase from the animator's clock.
 
+## 2026-11-14: File names hash as Windows-1252 bytes; lookups match the last path component (unverified)
+
+The index places an archive member by the bytes of its name as the
+archive stores them, not by the name decoded to UTF-8: the original's
+file table hashes those bytes, so a decoded `café.iff` landed in the
+wrong bucket and could reverse load order, and so which GUID definition
+wins. A loose file's name is encoded to Windows-1252 before it is hashed
+(the code page a Western Windows hands the game), so a loose file and a
+member of one name stay one entry; a name that is not valid UTF-8 or
+has a character the code page lacks keeps the file system's bytes.
+**Unverified**: the install holds no name outside ASCII, and a
+non-Western code page would differ.
+
+`Index::named` compares a resource's last path component, so a GLOB link
+to `SofaGlobals.iff` finds an archive member `sub\SofaGlobals.iff`. A
+name that holds a directory still matches the whole member name, as
+before, and `Resource::name` keeps the whole name for reporting. Which of several
+such files the original picks stays unverified, as before.
+
+A string table whose leading word is not one of the four version words
+(0, -1, -2, -3) is a Mac `STR#` resource with a big-endian count, even
+when that word would be negative read as a version: 128 strings start
+`00 80`.
+
+On the install, resource order, semi-global links, the census and the
+gated digests are unchanged.
+
+## 2026-11-14: Buy mode is driven by panel presses and confirmed by the mode, the registry and the budget
+
+Scenarios can now use buy mode (`tools/harness/input.py`). There are three
+new steps: `press X Y`, `expect-mode` and `expect-new-object`.
+
+- **Presses on the game's panels work like dialog presses.** The pointer
+  rests, moves over the button, then presses. A plain click was taken late
+  or missed, as on dialogs.
+- **What is checked.** The mode word is lot `+0x36`, read in the running
+  game: 0 in live mode and 2 in buy mode. A purchase is confirmed by new IDs
+  in the lot's registry and by the budget (lot `+0x90`). In buy mode the lot
+  update still returns, with time not advancing, so the steps go on there.
+- **Checked in the original, from a fresh boot.** The scenario:
+  - entered buy mode (mode 2 at update 174);
+  - pressed Seating and took the catalog's first entry, the $80 Werkbunnst
+    chair;
+  - pressed a free lawn spot;
+  - went back to live mode (mode 0 at update 1078).
+
+  At update 878 the registry held a new object, ID 262, at (344, 632) in
+  sixteenths of a tile, level 1. The budget had gone from 2542 to 2462. The
+  screenshots show the chair on the lawn and $2,462.
+- **Unverified.**
+  - A second new object, ID 292 at (-16, -16), off the lot, appeared by the
+    same update. Whether the purchase made it is not checked.
+  - Build mode's number is not known.
+  - The catalog's contents depend on the panel's last state: after a fresh
+    boot, Seating opens on chairs, and in an earlier session it showed beds.
+    A press on an empty spot of the panel once sold an object. Scenarios
+    must start from a known panel state (a fresh boot).
+
 ## 2026-11-14: Harness review fixes: the game's identity, watches and pages
 
 A review of `tools/harness` found eight defects in the harness, all fixed
