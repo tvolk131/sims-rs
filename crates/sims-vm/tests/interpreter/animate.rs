@@ -54,9 +54,11 @@ fn sim_animates(operands: [u8; 8]) -> Fixture {
             name: CLIP.into(),
             skill: SKILL.into(),
             duration: HUNDRED,
+            distance: 0,
             frames: 4,
             motions: 1,
             events: false,
+            event_keys: Vec::new(),
         },
     );
     fx.program.animations.insert_samples(SKILL);
@@ -181,7 +183,7 @@ fn an_event_can_go_to_a_local() {
 }
 
 #[test]
-fn a_finished_clip_sends_the_events_it_missed_then_its_end_fails_loudly() {
+fn a_finished_clip_sends_the_events_it_missed_then_ends() {
     // Backward, three numbered events: they count down from 2.
     let mut fx = sim_animates(animate(1, 3, 0x02, 3, 0));
     turn(&mut fx).unwrap();
@@ -201,8 +203,56 @@ fn a_finished_clip_sends_the_events_it_missed_then_its_end_fails_loudly() {
         assert_eq!(turn(&mut fx).unwrap(), Status::Returned(false));
         assert_eq!(fx.world.animators[&SIM].seen, 3 - expected);
     }
+    // The end (0x589c25): the true branch. The animator stops playing,
+    // takes its state from the posture (0x592904: standing gives 3) and
+    // puts the base layer back (0x590430); the pickup and person word 19
+    // are cleared. The finished layer stays in the foreground slot.
+    {
+        let sim = fx.sim_mut();
+        sim.person.as_mut().unwrap().data[19] = 7;
+    }
+    fx.world.animators.get_mut(&SIM).unwrap().pickup = 5;
+    // Bit 2 of the type's definition word 102 would keep the base layer
+    // off; the fixture's word (1102) has it.
+    sim_definition(&mut fx)[102] = 0;
     fx.thread(SIM, 4096, &[-7]);
-    assert!(unsupported(turn(&mut fx)).contains("0x592904"));
+    assert_eq!(turn(&mut fx).unwrap(), Status::Returned(true));
+    let a = &fx.world.animators[&SIM];
+    assert!(!a.playing && a.base);
+    assert_eq!((a.state, a.pickup), (3, 0));
+    assert!(a.foreground.as_ref().is_some_and(|l| l.finished()));
+    assert_eq!(fx.sim().person.as_ref().unwrap().data[19], 0);
+    // With bit 2 set, the base layer stays off.
+    let mut fx = sim_animates(animate(1, 3, 0, 0, 0));
+    turn(&mut fx).unwrap();
+    end_clip(&mut fx);
+    assert_eq!(turn(&mut fx).unwrap(), Status::Returned(true));
+    let a = &fx.world.animators[&SIM];
+    assert!(!a.playing && !a.base);
+    assert_eq!(a.state, 3);
+}
+
+/// The Sim type's definition words.
+fn sim_definition(fx: &mut Fixture) -> &mut [i16; sims_vm::DEFINITION_WORDS] {
+    fx.program
+        .libraries
+        .get_mut(&SIM_FILE)
+        .unwrap()
+        .definitions
+        .get_mut(&128)
+        .unwrap()
+}
+
+/// Marks the clip in the foreground slot as ended.
+fn end_clip(fx: &mut Fixture) {
+    fx.world
+        .animators
+        .get_mut(&SIM)
+        .unwrap()
+        .foreground
+        .as_mut()
+        .unwrap()
+        .ended = true;
 }
 
 #[test]
@@ -227,9 +277,11 @@ fn what_animate_sim_does_not_port_fails_loudly() {
             name: CLIP.into(),
             skill: SKILL.into(),
             duration: HUNDRED,
+            distance: 0,
             frames: 4,
             motions: 1,
             events: false,
+            event_keys: Vec::new(),
         },
     );
     assert!(unsupported(turn(&mut fx)).contains("samples"));
@@ -240,17 +292,39 @@ fn what_animate_sim_does_not_port_fails_loudly() {
             name: CLIP.into(),
             skill: SKILL.into(),
             duration: HUNDRED,
+            distance: 0,
             frames: 4,
             motions: 1,
             events: true,
+            event_keys: Vec::new(),
         },
     );
     assert!(unsupported(turn(&mut fx)).contains("defined differently"));
-    // Starting a clip over one already in the foreground slot.
+    // A clip that ends with the person sitting (0x590497).
     let mut fx = sim_animates(animate(1, 3, 0, 0, 0));
     turn(&mut fx).unwrap();
-    fx.world.animators.get_mut(&SIM).unwrap().playing = false;
-    assert!(unsupported(turn(&mut fx)).contains("0x586b63"));
+    end_clip(&mut fx);
+    sim_definition(&mut fx)[102] = 0;
+    fx.sim_mut().person.as_mut().unwrap().data[0] = 1;
+    assert!(unsupported(turn(&mut fx)).contains("0x590497"));
+}
+
+#[test]
+fn a_new_clip_replaces_the_one_in_the_foreground() {
+    // 0x586b63: the slot is cleared at once (byte 0x6f6bd0 is 0 in a
+    // running game), so the skin is redrawn, and the selection is -1.
+    let mut fx = sim_animates(animate(1, 3, 0, 0, 0));
+    turn(&mut fx).unwrap();
+    let a = fx.world.animators.get_mut(&SIM).unwrap();
+    a.playing = false;
+    a.skin_dirty = false;
+    a.selection = 4;
+    a.foreground.as_mut().unwrap().current = 1;
+    assert_eq!(turn(&mut fx).unwrap(), Status::Yielded);
+    let a = &fx.world.animators[&SIM];
+    assert!(a.playing && a.skin_dirty);
+    assert_eq!(a.selection, -1);
+    assert_eq!(a.foreground.as_ref().unwrap().current, 500);
 }
 
 #[test]
@@ -404,8 +478,14 @@ fn the_clip_advances_with_the_clock_and_stops_at_its_end() {
         (layer.speed, layer.duration.to_bits()),
         (F32::ZERO, 0x4cbe_bc20)
     );
-    // The thread's next run finds the clip done; ending it is not ported.
-    assert!(tick(&mut fx).unwrap_err().to_string().contains("0x592904"));
+    // The thread's next run finds the clip done and ends it: the animator
+    // stops playing and stands (state 3). The tree then returns from its
+    // only frame, which is not ported.
+    let message = tick(&mut fx).unwrap_err().to_string();
+    assert!(message.contains("outermost frame"), "{message}");
+    let a = &fx.world.animators[&SIM];
+    assert!(!a.playing);
+    assert_eq!(a.state, 3);
 }
 
 #[test]
@@ -470,11 +550,150 @@ fn what_the_animator_tick_does_not_port_fails_loudly() {
         tick(&mut fx)
             .unwrap_err()
             .to_string()
-            .contains("turn or walk")
+            .contains("walks to its destination")
     );
     let mut fx = standing();
     fx.world
         .animators
         .insert(SIM, sims_sim::animator::Animator { state: 6, ..LOADED });
     assert!(tick(&mut fx).unwrap_err().to_string().contains("state 6"));
+}
+
+/// The standing Sim with a route to follow: the animator as the route's
+/// start leaves it (0x589c85: result 1, segment 0, standing on the
+/// person's tile and direction), facing direction 6, and a path east
+/// along the first coordinate. Global clip table 150 names the walk
+/// (clip 0x14, whose distance sets the look-ahead) and the half turn
+/// (clip 5).
+fn routed() -> Fixture {
+    let mut fx = standing();
+    fx.sim_mut().data[1] = 6;
+    // Data word 17 picks another look-ahead (0x58e6d5).
+    fx.sim_mut().data[17] = 0;
+    // An adult (word 58) of kind 0 (word 65), with no special clip
+    // tables (word 64).
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    person.data[58] = 20;
+    person.data[64] = 0;
+    person.data[65] = 0;
+    let names = (0..=0x14)
+        .map(|i| match i {
+            5 => "test-half-turn".to_string(),
+            0x14 => "test-walk".to_string(),
+            _ => String::new(),
+        })
+        .collect();
+    fx.program
+        .libraries
+        .get_mut(&GLOBAL)
+        .unwrap()
+        .strings
+        .insert(150, names);
+    for (name, distance) in [("test-half-turn", 0), ("test-walk", 0x4180_0000)] {
+        fx.program.animations.insert(
+            "walk.far",
+            Clip {
+                name: name.into(),
+                skill: SKILL.into(),
+                duration: HUNDRED,
+                distance,
+                frames: 4,
+                motions: 1,
+                events: false,
+                event_keys: Vec::new(),
+            },
+        );
+    }
+    let at = [100.0, 200.0, 6.0].map(F32::from_f32);
+    let mut animator = LOADED;
+    animator.position = at;
+    animator.destination = at;
+    animator.arrival = 1;
+    animator.state = 3;
+    animator.motion.segment = 0;
+    animator.motion.progress = F32::ZERO;
+    fx.world.animators.insert(SIM, animator);
+    fx.world.routing.routes.insert(
+        SIM,
+        sims_sim::route::Route {
+            contexts: Vec::new(),
+            path: vec![[200, 100], [200, 300], [200, 400], [200, 500]],
+        },
+    );
+    fx
+}
+
+#[test]
+fn a_route_is_followed_and_a_turn_back_is_made_on_the_spot() {
+    let mut fx = routed();
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    // State 3 finds the route's result 1 and follows (state 9). Segment 0
+    // has no length, so the animator moves to segment 1 and looks ahead
+    // along it from 0 in steps of 1/200, to the first point at least the
+    // look-ahead away: half the walk's distance (16), times 16/3, halved,
+    // 21.33; squared 455.1, reached 22 units on (progress 0.11, summed in
+    // single precision). That point lies in
+    // direction 2, 4 eighths back from 6: the animator stands to turn
+    // (state 3), and the turn starts the half turn clip (state 4).
+    assert_eq!(a.motion.segment, 1);
+    assert_eq!(a.state, 4);
+    assert_eq!(a.motion.turn_wanted.to_bits(), 0xc080_0000);
+    assert_eq!(a.motion.turn_clip.to_bits(), 0xc080_0000);
+    assert_eq!(a.motion.turn_destination[2].to_bits(), 0x4000_0000);
+    assert_eq!(a.motion.turn_from[2].to_bits(), 0x40c0_0000);
+    // The destination's direction is the position's plus the turn less
+    // the clip's turn: 6 again.
+    assert_eq!(a.destination[2].to_bits(), 0x40c0_0000);
+    let layer = a.foreground.as_ref().unwrap();
+    assert_eq!((layer.clip.as_str(), layer.priority), ("test-half-turn", 5));
+    assert_eq!(layer.speed, a.rate);
+    assert_eq!(a.motion.progress.to_bits(), 0x3de1_47b0);
+    // State 4 plays the turn; its end is not ported.
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!(a.state, 4);
+    assert_eq!(fx.sim().data[1], 6);
+    let mut result = Ok(true);
+    for _ in 0..4 {
+        result = tick(&mut fx);
+        if result.is_err() {
+            break;
+        }
+    }
+    assert!(result.unwrap_err().to_string().contains("0x58e06f"));
+}
+
+#[test]
+fn what_the_route_follow_does_not_port_fails_loudly() {
+    // A turn of less than 2 eighths back walks.
+    let mut fx = routed();
+    fx.sim_mut().data[1] = 2;
+    fx.world.animators.get_mut(&SIM).unwrap().position[2] = F32::from_f32(2.0);
+    fx.world.animators.get_mut(&SIM).unwrap().destination[2] = F32::from_f32(2.0);
+    assert!(
+        tick(&mut fx)
+            .unwrap_err()
+            .to_string()
+            .contains("starts walking")
+    );
+    // A path whose second segment is its last.
+    let mut fx = routed();
+    fx.world.routing.routes.get_mut(&SIM).unwrap().path.pop();
+    assert!(
+        tick(&mut fx)
+            .unwrap_err()
+            .to_string()
+            .contains("last segment")
+    );
+    // No walk clip to set the look-ahead.
+    let mut fx = routed();
+    fx.program
+        .libraries
+        .get_mut(&GLOBAL)
+        .unwrap()
+        .strings
+        .get_mut(&150)
+        .unwrap()[0x14] = String::new();
+    assert!(tick(&mut fx).unwrap_err().to_string().contains("walk clip"));
 }

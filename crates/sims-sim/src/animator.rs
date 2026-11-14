@@ -88,6 +88,7 @@ pub const LOADED: Animator = Animator {
     skin_clock: 0,
     skin_dirty: false,
     profile_stale: true,
+    motion: Motion::NONE,
 };
 
 /// A person's animator: the fields of the object at person +0xadc that
@@ -154,6 +155,50 @@ pub struct Animator {
     /// 0x592625, for the posture's clip) reads the appearance and clears
     /// it.
     pub profile_stale: bool,
+    /// Where the animator is along a route and through a turn.
+    pub motion: Motion,
+}
+
+/// What the animator keeps while it follows a route (states 3 to 10):
+/// where it is along the person's path and where a turn started. A new
+/// animator (0x587d2c) holds -1 in the segment and 0 in the rest
+/// ([`Motion::NONE`]), and its reset (0x589220) sets the segment to -1
+/// again; a route's start (0x589c85) sets the segment and the progress to
+/// 0, and a turn's start (0x58f559) writes the rest before the turn
+/// (state 4) reads them.
+///
+/// The route start also writes +0x8c to +0x94, +0x18c, +0x284 and
+/// +0x288, and the turn +0x19c, +0x24, +0x28 and +0x290, all to 0;
+/// nothing ported reads those, and they are left out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Motion {
+    /// +0x180: the index of the path point the animator is heading for.
+    pub segment: i32,
+    /// +0x1ec: how far along the segment the animator looks ahead, from 0
+    /// (the path point before) to 1 (the point it heads for).
+    pub progress: F32,
+    /// +0x1d0, +0x1d4, +0x1d8: the position and direction when the turn
+    /// started.
+    pub turn_from: [F32; 3],
+    /// +0x1dc, +0x1e0, +0x1e4: the destination when the turn started.
+    pub turn_destination: [F32; 3],
+    /// +0x1f0: the turn wanted, in eighths of a turn.
+    pub turn_wanted: F32,
+    /// +0x1f4: the turn the clip makes, in eighths of a turn.
+    pub turn_clip: F32,
+}
+
+impl Motion {
+    /// No route, as a new animator holds it (0x587d2c): the segment -1
+    /// and every other field 0.
+    pub const NONE: Self = Self {
+        segment: -1,
+        progress: F32::ZERO,
+        turn_from: [F32::ZERO; 3],
+        turn_destination: [F32::ZERO; 3],
+        turn_wanted: F32::ZERO,
+        turn_clip: F32::ZERO,
+    };
 }
 
 /// What a layer (0x5978ef, 0x597a88) keeps that decides when its clip
@@ -384,6 +429,7 @@ impl Animator {
     ///
     /// - The position is unset again (virtual function 0x20, 0x589361);
     ///   the destination stays.
+    /// - The route's segment is -1 ([`Motion`]).
     /// - The posture is -1, the carry selection -1, the carry mode 0, the
     ///   state 3 (standing), the next foreground clip's raised priority is
     ///   set again, and the appearance is to be read again (+0xd8).
@@ -414,6 +460,7 @@ impl Animator {
             ));
         }
         self.position = [UNSET; 3];
+        self.motion.segment = -1;
         self.posture = -1;
         self.carry_selection = -1;
         self.promote = true;

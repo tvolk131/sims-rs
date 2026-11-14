@@ -1,6 +1,7 @@
 use crate::animator::Animator;
 use crate::neighbors::Neighbors;
 use crate::rooms::Rooms;
+use crate::route::Routing;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -106,6 +107,9 @@ pub struct World {
     pub animators: BTreeMap<u16, Animator>,
     /// How often the household was counted on the lot. See [`HouseUsage`].
     pub usage: HouseUsage,
+    /// The people's routes and what routing changed elsewhere. See
+    /// [`Routing`].
+    pub routing: Routing,
 }
 
 /// The house's usage counts: five earlier days and today, each a count of
@@ -341,6 +345,7 @@ impl World {
             neighbors: Neighbors::default(),
             animators: BTreeMap::new(),
             usage: HouseUsage::default(),
+            routing: Routing::default(),
         }
     }
 

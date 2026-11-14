@@ -7,9 +7,11 @@ fn clip(name: &str, duration: u32) -> Clip {
         name: name.into(),
         skill: "Skill".into(),
         duration,
+        distance: 0,
         frames: 4,
         motions: 1,
         events: false,
+        event_keys: Vec::new(),
     }
 }
 

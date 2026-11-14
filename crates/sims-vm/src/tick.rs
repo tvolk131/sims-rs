@@ -502,10 +502,15 @@ impl Interpreter<'_> {
         let awake = !below_zero(sims_core::F32::from_f32(person.motives[ALERTNESS]));
         if tick % 10 == 0 && word(&person.data, person::VISITOR) == 0 && hidden == 0 && awake {
             // 0x45c349: the person's last route context, if it has any.
-            // Only the routing primitives (Go To Routing Slot, 0x45abce;
-            // Go To Relative Position, 0x45c634) push and pop them, and
-            // they are not ported, so the count is the one the load read.
-            let routing = person.routing_frames != 0;
+            // The routing primitives push and pop them (Go To Routing
+            // Slot, 0x45abce, pushes); the count the load read is kept
+            // too, as no ported primitive pops the contexts it stands for.
+            let routing = person.routing_frames != 0
+                || world
+                    .routing
+                    .routes
+                    .get(&id)
+                    .is_some_and(|r| !r.contexts.is_empty());
             world.usage.sample(routing);
         }
         if word(&person.data, person::REQUEST) != 0 {

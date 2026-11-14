@@ -455,7 +455,15 @@ impl Machine<'_, '_> {
             Cell::Literal(value) => Ok(value),
             Cell::Attribute(id, i) => get(&object(id)?.attributes, i),
             Cell::Data(id, i) => get(&object(id)?.data, i),
-            Cell::Person(id, i) => get(&person_data(object(id)?)?.data, i),
+            Cell::Person(id, i) => {
+                if self.world.routing.unknown_words.contains(&(id, i)) {
+                    return Err(Trap::Unsupported(format!(
+                        "reading person word {i} of object {id}, which Go To Routing Slot set \
+                         from a word the original never wrote (0x45c418)"
+                    )));
+                }
+                get(&person_data(object(id)?)?.data, i)
+            }
             Cell::Temp(id, i) => get(&object(id)?.temps, i),
             Cell::DynamicSprite(id, i) => get(&object(id)?.dynamic_sprites, i),
             Cell::Global(i) => get(&self.world.globals, i),
@@ -538,12 +546,15 @@ impl Machine<'_, '_> {
             // Writes to person data words 68, 74 and 84 invalidate cached
             // portraits, and 77 and 81 notify indicators (legacy
             // memory.rs:634-654). Both are presentation only.
-            Cell::Person(id, i) => object_mut(world, id)?
-                .person
-                .as_mut()
-                .ok_or(Trap::native(0x1c, "object is not a person"))?
-                .data
-                .get_mut(i),
+            Cell::Person(id, i) => {
+                world.routing.unknown_words.remove(&(id, i));
+                object_mut(world, id)?
+                    .person
+                    .as_mut()
+                    .ok_or(Trap::native(0x1c, "object is not a person"))?
+                    .data
+                    .get_mut(i)
+            }
             Cell::Temp(id, i) => object_mut(world, id)?.temps.get_mut(i),
             Cell::DynamicSprite(id, i) => object_mut(world, id)?.dynamic_sprites.get_mut(i),
             Cell::Global(i) => world.globals.get_mut(i),

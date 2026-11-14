@@ -21,8 +21,9 @@
 //! 1. If no clip is playing (animator +0xa0), the clip is looked up
 //!    (0x5893b3, which first reads the person's appearance again if the
 //!    animator says so: [`sims_sim::animator::Animator::profile_stale`]),
-//!    the event queue emptied, the foreground slot cleared
-//!    and the clip started there (0x592726) at the animator's clock. The
+//!    the event queue emptied, the foreground slot cleared (0x586b63: a
+//!    finished clip left there is removed at once) and the clip started
+//!    there (0x592726) at the animator's clock. The
 //!    animator's state becomes 0, Animate Sim's count of events seen 0.
 //! 2. An event waiting in the queue (virtual function 0x80) is taken. A
 //!    numbered event (below 100) must be the next one expected, counting
@@ -33,21 +34,30 @@
 //!    [`Machine::wants_interrupt`]).
 //! 4. A finished or interrupted clip first sends, one per run, the
 //!    numbered events it did not send, each stored with the false branch.
-//!    Then the clip is done (0x592904 and the base layer), with the true
-//!    branch.
+//!    Then the clip is done (0x589c25), with the true branch: nothing
+//!    plays, the animator takes the state of the person's posture
+//!    (0x592904: 3 standing, 1 or 2 for postures 1 and 2), the base layer
+//!    is brought up to date (virtual function 0x58, 0x590430, as the
+//!    animator's tick does), and the pickup flag (+0x1a4) and person word
+//!    19 are cleared. The finished layer stays in the foreground slot
+//!    until the next clip clears it.
 //!
 //! **Not ported**, failing loudly: the base and carry slots (flag bits
 //! 0x01 and 0x10 alone), clip number 0 (which stops the clip), names
 //! listed anywhere but the global animation tables (byte 4 other than 3),
-//! a clip that is missing or has timed events, clearing a foreground slot
-//! that holds a layer (0x586b63), and the end of a clip (0x592904). The
-//! original also notes an unexpected event in its log when logging is on
-//! (0x6f2a44); that is not modeled.
+//! a clip that is missing or has timed events, and a person whose posture
+//! is 1 or 2 when its clip is done. The original also notes an unexpected
+//! event in its log when logging is on (0x6f2a44); that is not modeled.
 
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine, word};
 use crate::people::read_appearance_if_stale;
 use sims_sim::animator::{Animator, LOADED, Layer};
+
+/// Person data words: the posture, and word 19 (person +0x5b2), which
+/// the end of a clip clears with the animator's pickup flag.
+const POSTURE: usize = 0;
+const PICKUP_WORD: usize = 19;
 
 /// The global file's tables of clip names (0x59dd16): an adult's, and a
 /// child's (person word 58 at most 17). The original indexes its table of
@@ -113,12 +123,18 @@ impl Machine<'_, '_> {
             read_appearance_if_stale(self.world, self.program, self.me, &mut a.profile_stale)?;
             let (name, duration, frames, bound) = self.clip(operands, id)?;
             a.events.clear();
-            if let Some(layer) = &a.foreground {
-                return Err(Trap::Unsupported(format!(
-                    "clearing the foreground clip {:?} to start another (0x586b63) is not ported",
-                    layer.clip
-                )));
+            // 0x586b63: the foreground slot is cleared (0x592878) and the
+            // selection set to -1. A layer there is removed from the skin
+            // at once (0x5a0a7b), which marks the skin's layers changed.
+            // The original fades it out through the blend slot instead
+            // when its byte 0x6f6bd0 is set; that byte holds 0 in the
+            // memory image of a running game, and the capture shows the
+            // blend slot empty after person 18 starts its second clip in
+            // tick 24. The fade is not ported.
+            if a.foreground.take().is_some() {
+                a.skin_dirty = true;
             }
+            a.selection = -1;
             a.slow = flags & 0x80 != 0;
             let now = a.clock_at(self.world.ticks as i32);
             let mut layer = Layer::start(&name, duration, frames, bound, reverse, now);
@@ -172,11 +188,35 @@ impl Machine<'_, '_> {
             a.seen += 1;
             return Ok(Flow::Branch(false));
         }
-        Err(Trap::Unsupported(
-            "a clip Animate Sim plays is done: ending it (0x592904) and starting the posture's \
-             clip again (virtual function 0x58) is not ported"
-                .into(),
-        ))
+        // 0x589c25: the clip is done. Nothing plays; the foreground layer
+        // stays in its slot.
+        a.playing = false;
+        // 0x592904: the state of the person's posture.
+        let posture = self.person_word(POSTURE)?;
+        match posture {
+            0 => a.state = 3,
+            1 => a.state = 1,
+            2 => a.state = 2,
+            _ => {}
+        }
+        // Virtual function 0x58 (0x590430): the base layer.
+        let interpreter = self.interpreter();
+        let flags = interpreter.base_flags(self.world, self.me)?;
+        interpreter.update_base(self.world, self.me, a, flags)?;
+        a.pickup = 0;
+        let me = self.me;
+        let words = &mut self
+            .world
+            .objects
+            .get_mut(&me)
+            .and_then(|o| o.person.as_mut())
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .data;
+        *words
+            .get_mut(PICKUP_WORD)
+            .ok_or_else(|| Trap::Invalid(format!("person data has no word {PICKUP_WORD}")))? = 0;
+        self.world.routing.unknown_words.remove(&(me, PICKUP_WORD));
+        Ok(Flow::Branch(true))
     }
 
     /// Returns 2: the thread yields. A tree that must finish without
