@@ -77,6 +77,9 @@ pub enum LoadError {
     /// The renumbering would rewrite this wall cell, or cannot read its
     /// segments. Writing a wall cell is not ported.
     SurfaceRewrite { level: u8, x: usize, y: usize },
+    /// The end of the household selection would do something that is not
+    /// ported. See [`World::finish_selection`].
+    Selection(String),
 }
 
 impl std::fmt::Display for LoadError {
@@ -106,6 +109,7 @@ impl std::fmt::Display for LoadError {
                 "the house maps saved floor or wall IDs to pattern files; resolving them is \
                  not ported"
             ),
+            Self::Selection(what) => write!(f, "{what}, which is not ported"),
             Self::SurfaceRewrite { level, x, y } => write!(
                 f,
                 "renumbering would rewrite the wall cell at {x}, {y} on level {level}; that is \
@@ -647,6 +651,69 @@ impl World {
         self.budget.funds = funds;
         self.globals[14] = (funds / 10000) as i16;
         self.globals[13] = (funds % 10000) as i16;
+        Ok(())
+    }
+
+    /// Load step 15: what the household selection (0x428041) does once
+    /// every object has been visited, for a lot it has nothing to do on.
+    /// It changes nothing. The original, in this order:
+    ///
+    /// 1. Deletes each person that belongs to no family and is on another
+    ///    lot's list (person data words 61 and 67).
+    /// 2. In some game modes, creates a controller object (GUID
+    ///    0xC3249A1D) if global 26 is not 0.
+    /// 3. If the family's record asks for it (flag 4), resets the budget,
+    ///    the statistics, the globals and the lot.
+    /// 4. Works out again which people are visitors (0x42a2b4).
+    /// 5. Deletes each person that lived here before the visits and is
+    ///    now a visitor (person data word 32).
+    /// 6. Updates the lot's lighting (0x4c4648), which is not modeled.
+    ///
+    /// None of 1 to 5 is ported. This fails if any could do something:
+    /// a person whose family (word 61) is not the selected one, or whose
+    /// visitor word (32) is set; global 26 not 0; or `family_flags` with
+    /// flag 4. `family_flags` is the selected family record's flags.
+    ///
+    /// The order and the conditions are the old prototype's
+    /// (legacy/crates/sims-vm/src/load_completion.rs), which compared
+    /// them with the original's code run alone. In a trace of the
+    /// original loading the Goth house nothing compared changes between
+    /// the return of step 13 and the return of the lighting update: no
+    /// object, global, random stream, array, queue or room mark. The
+    /// rule for step 4 is not known beyond that; a household whose
+    /// people are all its own members is taken to have no visitors.
+    pub fn finish_selection(&self, family_flags: u32) -> Result<(), LoadError> {
+        self.context_applied()?;
+        let family = self.globals[9];
+        for (&id, object) in &self.objects {
+            let Some(person) = &object.person else {
+                continue;
+            };
+            let word = |index: usize| person.data.get(index).copied().unwrap_or(0);
+            if word(61) != family {
+                return Err(LoadError::Selection(format!(
+                    "person {id} is of family {}, not the selected family {family}; a person \
+                     of another family on the lot may be a visitor or be deleted",
+                    word(61)
+                )));
+            }
+            if word(32) != 0 {
+                return Err(LoadError::Selection(format!(
+                    "person {id} is a visitor (person data word 32); a member of the \
+                     household who is a visitor is deleted"
+                )));
+            }
+        }
+        if self.globals[26] != 0 {
+            return Err(LoadError::Selection(
+                "global 26 is set; the load then may create a controller object".into(),
+            ));
+        }
+        if family_flags & 4 != 0 {
+            return Err(LoadError::Selection(
+                "the family's record asks for the lot to be reset (flag 4)".into(),
+            ));
+        }
         Ok(())
     }
 

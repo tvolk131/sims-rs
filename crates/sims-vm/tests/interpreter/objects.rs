@@ -235,6 +235,7 @@ fn people(interest: i16) -> People {
         },
     };
     People {
+        profiles: BTreeMap::new(),
         records: vec![record(31, ADULT, 5), record(32, CHILD, 5)],
         skeletons: BTreeMap::from([
             (

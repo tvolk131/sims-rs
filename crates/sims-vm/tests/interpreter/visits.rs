@@ -335,19 +335,288 @@ fn a_person_referring_to_a_changed_object_stops_its_visit() {
     );
 }
 
-#[test]
-fn the_step_stops_at_the_first_person_and_keeps_the_visits_before_it() {
-    let (mut fx, _) = lot();
-    let first = stand(&mut fx, [2, 2]);
-    let mut sim = object(PERSON, SIM_GUID);
-    sim.person = Some(person());
+/// The GUID of the person type some tests add, and its trees.
+const RESIDENT: u32 = 0x7777;
+const RESIDENT_INIT: u16 = 4300;
+const RESIDENT_MAIN: u16 = 4301;
+const RESIDENT_RESET: u16 = 4302;
+const RESIDENT_LOAD: u16 = 4303;
+const CANCELLED: u16 = 4204;
+
+/// Adds a person type with Init, Main, Load and Reset trees, a person of
+/// it standing on tile (3, 3), and what a visit needs of the neighborhood:
+/// record 9 of revision 10, whose person data word n holds 1000 + n, and
+/// the type's profile. Init writes 5 to the lamp's attribute 4, Reset
+/// writes 6 to its attribute 5, and Load would write 7 to its attribute 6.
+fn resident(fx: &mut Fixture) -> People {
+    let file = fx.add_type(RESIDENT, 2, RESIDENT_INIT, RESIDENT_MAIN);
+    fx.add(file, RESIDENT_INIT, note(4, scope::LITERAL, 5));
+    fx.add(
+        file,
+        RESIDENT_MAIN,
+        tree(vec![ins(256, 0, ERROR, [20, 0, 0, 0, 0, 0, 0, 0])]),
+    );
+    fx.add(file, RESIDENT_RESET, note(5, scope::LITERAL, 6));
+    fx.add(file, RESIDENT_LOAD, note(6, scope::LITERAL, 7));
+    function(fx, file, 2, RESIDENT_LOAD);
+    function(fx, file, 3, RESIDENT_RESET);
+    fx.world.types.insert(30, RESIDENT);
+    let mut sim = object(PERSON, RESIDENT);
+    let mut data = person();
+    data.data[73] = 0;
+    sim.person = Some(data);
+    sim.position = [56, 56, 1];
+    sim.data[1] = 0;
+    (sim.data[2], sim.data[3], sim.data[14], sim.data[26]) = (0, -1, -1, 0);
+    sim.slots.iter_mut().for_each(|slot| slot.object = 0);
+    sim.registry_word = Some(0xffff);
     fx.world.objects.insert(PERSON, sim);
     fx.world.order.push(PERSON);
-    let last = stand(&mut fx, [3, 3]);
+    fx.thread(PERSON, RESIDENT_MAIN, &[0; 4]);
+    let cell = (3 * 64 + 3) * 2;
+    let grid = &mut fx.world.arrays.get_mut(&3).unwrap().data;
+    grid[cell..cell + 2].copy_from_slice(&PERSON.to_le_bytes());
+    People {
+        records: vec![sims_content::Record {
+            id: 9,
+            guid: RESIDENT,
+            revision: 10,
+            data: (0..256).map(|n| 1000 + n).collect(),
+        }],
+        profiles: [(
+            RESIDENT,
+            sims_content::Profile {
+                gender: Some("Female".into()),
+                age: Some(" 27 years".into()),
+                skin: Some("DRK".into()),
+                tones: ["unknown", "lgt", "med", "drk"].map(String::from).to_vec(),
+            },
+        )]
+        .into(),
+        ..People::default()
+    }
+}
+
+fn visit_with(fx: &mut Fixture, id: u16, people: &People) -> Vec<(u16, usize)> {
+    let asked = RefCell::new(Vec::new());
+    let mut interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.asked = Some(&asked);
+    interpreter.visit(&mut fx.world, id, people).unwrap();
+    asked
+        .into_inner()
+        .into_iter()
+        .map(|Asked { object, function }| (object, function))
+        .collect()
+}
+
+#[test]
+fn a_person_takes_its_lasting_fields_from_its_neighborhood_record() {
+    let (mut fx, _) = lot();
+    let people = resident(&mut fx);
+    let before = fx.world.objects[&PERSON].clone();
+    // Its type did not change: no function is asked, not even Load.
+    assert_eq!(visit_with(&mut fx, PERSON, &people), []);
+    let after = &fx.world.objects[&PERSON];
+    let (old, new) = (
+        &before.person.as_ref().unwrap().data,
+        &after.person.as_ref().unwrap().data,
+    );
+    let kept = sims_vm::persistent_fields(10);
+    assert_eq!(kept.len(), 48);
+    for (word, (&new, &old)) in new.iter().zip(old).enumerate() {
+        let expected = match word {
+            31 => 9,
+            word if kept.contains(&word) => 1000 + word as i16,
+            _ => old,
+        };
+        assert_eq!(new, expected, "person data word {word}");
+    }
+    assert_eq!(after.stack.len(), before.stack.len());
+    assert_eq!(after.stack[0].node, before.stack[0].node);
+    assert_eq!(after.data[29], 1);
+    // A person is 6 wide.
+    assert_eq!(after.footprint, [53, 53, 59, 59]);
+}
+
+#[test]
+fn a_record_keeps_more_fields_from_each_revision_on() {
+    assert_eq!(sims_vm::persistent_fields(0), []);
+    assert_eq!(sims_vm::persistent_fields(1).len(), 29);
+    assert_eq!(sims_vm::persistent_fields(1)[..3], [2, 3, 4]);
+    assert_eq!(sims_vm::persistent_fields(1)[26..], [58, 60, 61]);
+    assert_eq!(sims_vm::persistent_fields(2)[29..], [56, 57, 63]);
+    assert_eq!(sims_vm::persistent_fields(7)[37..], [54, 55, 75, 76]);
+    assert_eq!(
+        sims_vm::persistent_fields(99),
+        sims_vm::persistent_fields(10)
+    );
+}
+
+#[test]
+fn a_changed_person_resets_in_its_own_way_and_then_runs_init() {
+    let (mut fx, file) = lot();
+    let people = resident(&mut fx);
+    let widget = stand(&mut fx, [2, 2]);
+    // The widget notes who cancelled an action queued on it.
+    fx.add(file, CANCELLED, note(7, scope::STACK_OBJECT, 0));
+    function(&mut fx, file, 4, CANCELLED);
+    fx.world.changed_types.insert(RESIDENT);
+    let sim = fx.world.objects.get_mut(&PERSON).unwrap();
+    (sim.data[9], sim.data[34]) = (3, 4);
+    let person = sim.person.as_mut().unwrap();
+    let mut queued = person.last.clone();
+    queued.target = widget as i16;
+    let mut idle = person.last.clone();
+    idle.target = 0;
+    person.queue = vec![idle, queued];
+    person
+        .motive_deltas
+        .push(sims_formats::saved_objects::MotiveDelta {
+            motive: 5,
+            delta: 1.0,
+            stop_at: 50.0,
+        });
+    let motives = person.motives;
+    // Reset, the cancelled action's target, then Init. Never Load.
+    assert_eq!(
+        visit_with(&mut fx, PERSON, &people),
+        [(PERSON, 3), (widget, 4), (PERSON, 0)]
+    );
+    let noted = &fx.lamp().attributes;
+    // The note tree leaves the lamp as its stack object, so function 4
+    // wrote the lamp's own ID; what matters is that it ran.
+    assert_eq!((noted[4], noted[5], noted[6]), (5, 6, 0));
+    assert_ne!(noted[7], 0);
+    let sim = &fx.world.objects[&PERSON];
+    let person = sim.person.as_ref().unwrap();
+    for word in [0, 22, 23, 30, 33, 40, 59, 71, 72, 73] {
+        assert_eq!(person.data[word], 0, "person data word {word}");
+    }
+    // The profile: female, 27, the third tone.
+    assert_eq!(
+        (person.data[65], person.data[58], person.data[60]),
+        (1, 27, 3)
+    );
+    assert_eq!((sim.data[9], sim.data[34]), (0, 0));
+    assert!(person.queue.is_empty() && person.motive_deltas.is_empty());
+    assert_eq!(person.motives, motives);
+    // The thread restarted at Main, with no stack object.
+    assert_eq!(sim.stack.len(), 1);
+    let frame = &sim.stack[0];
+    assert_eq!(
+        (frame.tree, frame.node, frame.stack_object),
+        (RESIDENT_MAIN, 0, 0)
+    );
+    assert_eq!(sim.position, [56, 56, 1]);
+    assert_eq!(grid(&fx, [3, 3]), PERSON);
+}
+
+#[test]
+fn a_profile_string_that_is_missing_leaves_its_word() {
+    let profile =
+        |gender: Option<&str>, age: Option<&str>, skin: Option<&str>| sims_content::Profile {
+            gender: gender.map(String::from),
+            age: age.map(String::from),
+            skin: skin.map(String::from),
+            tones: ["lgt", "lgt", "med"].map(String::from).to_vec(),
+        };
+    let reload = |profile: &sims_content::Profile| {
+        let mut data: Vec<i16> = (0..256).collect();
+        sims_vm::reload_profile(&mut data, profile).unwrap();
+        (data[65], data[58], data[60], data[22], data[23])
+    };
+    assert_eq!(reload(&profile(None, None, None)), (65, 58, 60, 0, 0));
+    // An unknown gender keeps the word; an unknown tone gives 0; an
+    // empty age is 0.
+    assert_eq!(
+        reload(&profile(Some("robot"), Some(""), Some("blue"))),
+        (65, 0, 0, 0, 0)
+    );
+    // The first tone name is never matched, so "lgt" is tone 1.
+    assert_eq!(
+        reload(&profile(Some("CATMALE"), Some("-3x"), Some("lgt"))),
+        (4, -3, 1, 0, 0)
+    );
+    assert_eq!(reload(&profile(None, Some("+70000"), None)).1, 4464);
+}
+
+#[test]
+fn a_persons_motive_curves_come_from_its_definition_or_its_age() {
+    assert_eq!(sims_vm::curve_table(27, 0), (true, 501));
+    assert_eq!(sims_vm::curve_table(18, 0), (true, 501));
+    assert_eq!(sims_vm::curve_table(0, 0), (true, 501));
+    assert_eq!(sims_vm::curve_table(9, 0), (true, 503));
+    assert_eq!(sims_vm::curve_table(-1, 0), (true, 503));
+    assert_eq!(sims_vm::curve_table(9, 4100), (false, 4100));
+}
+
+#[test]
+fn a_person_the_reset_would_do_more_for_stops_its_visit() {
+    let (mut fx, _) = lot();
+    let people = resident(&mut fx);
+    fx.world.changed_types.insert(RESIDENT);
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let fails = |change: &dyn Fn(&mut sims_sim::Object), people: &People| {
+        let mut world = fx.world.clone();
+        change(world.objects.get_mut(&PERSON).unwrap());
+        interpreter
+            .visit(&mut world, PERSON, people)
+            .unwrap_err()
+            .to_string()
+    };
+    let person = |change: &dyn Fn(&mut sims_formats::saved_objects::Person)| {
+        fails(&|object| change(object.person.as_mut().unwrap()), &people)
+    };
+    let using = person(&|p| {
+        p.object_uses.push(sims_formats::saved_objects::ObjectUse {
+            target: 1,
+            stack_depth: 1,
+            unknown: 0,
+        })
+    });
+    assert!(using.contains("that is using an object"), "{using}");
+    let acting = person(&|p| p.active.target = 77);
+    assert!(
+        acting.contains("whose running action has a target"),
+        "{acting}"
+    );
+    let routing = person(&|p| p.routing_frames = 1);
+    assert!(routing.contains("in the middle of a route"), "{routing}");
+    let wide = person(&|p| p.data[73] = 1);
+    assert!(wide.contains("whose data word 73 is set"), "{wide}");
+    let away = fails(&|object| object.position = [-16, -16, 1], &people);
+    assert!(away.contains("inside an object or off the lot"), "{away}");
+    // Without a neighborhood record, or with one that holds no person
+    // data, the visit fails before anything else.
+    let nobody = fails(&|_| {}, &People::default());
+    assert!(nobody.contains("has no neighborhood record"), "{nobody}");
+    let mut bare = people.clone();
+    bare.records[0].revision = 0;
+    let bare = fails(&|_| {}, &bare);
+    assert!(bare.contains("holds no person data"), "{bare}");
+    // The lot was not touched by any of it.
+    assert!(fx.world.objects[&PERSON].stack.len() == 1);
+}
+
+#[test]
+fn the_step_visits_people_in_their_turn_and_stops_at_a_visit_it_cannot_make() {
+    let (mut fx, _) = lot();
+    let first = stand(&mut fx, [2, 2]);
+    let people = resident(&mut fx);
+    let last = stand(&mut fx, [2, 3]);
     fx.world.order.retain(|&id| id != last);
     fx.world.order.push(last);
     fx.world.changed_types.insert(WIDGET);
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    // With the person's record, all three are visited.
+    let mut whole = fx.world.clone();
+    let done = interpreter.visit_objects(&mut whole, &people);
+    assert_eq!(done.stopped, None);
+    assert_eq!(done.objects, [first, PERSON, last]);
+    assert_eq!(done.reset, [first, last]);
+    // Without it the step stops at the person, with the lot as the first
+    // visit left it. The indicators that visit made are not visited:
+    // they went to the head of the list.
     let mut expected = fx.world.clone();
     interpreter
         .visit(&mut expected, first, &People::default())
@@ -357,13 +626,23 @@ fn the_step_stops_at_the_first_person_and_keeps_the_visits_before_it() {
     let fault = done.stopped.unwrap();
     assert_eq!(fault.object, PERSON);
     assert!(
-        fault.to_string().contains("the visit of a person"),
+        fault.to_string().contains("has no neighborhood record"),
         "{fault}"
     );
-    // The lot is as the first visit left it. The indicators that visit
-    // made are not visited: they went to the head of the list.
     assert_eq!(fx.world.encode(), expected.encode());
     assert_eq!(fx.world.order.len(), 5);
+}
+
+#[test]
+fn the_indicators_are_made_once() {
+    let (mut fx, _) = lot();
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let made = interpreter.ensure_indicators(&mut fx.world).unwrap();
+    assert_eq!(made, Some(fx.world.indicators));
+    assert_ne!(fx.world.indicators[0], 0);
+    let before = fx.world.encode();
+    assert_eq!(interpreter.ensure_indicators(&mut fx.world), Ok(None));
+    assert_eq!(fx.world.encode(), before);
 }
 
 #[test]

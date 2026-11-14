@@ -16,9 +16,19 @@
 //! the object is rebuilt ([`Interpreter::rebuild`]): taken off the lot,
 //! its storage reset, Init and a first turn run, and put back.
 //!
-//! A person's visit (0x459bf6) is not ported and fails: it also takes the
-//! person's fields from the neighborhood record, resets the person in its
-//! own way (0x45e791), and updates its room and motive curves.
+//! A person's visit (0x459bf6) differs in three ways (`people.rs`):
+//!
+//! - Before anything else the person takes its lasting fields from its
+//!   neighborhood record (0x4258a3).
+//! - It is not asked its Load function.
+//! - It resets in its own way (0x45e791): its thread restarts at Main
+//!   first, and then its Reset function runs on top of that.
+//!
+//! After the visit the original also notes the room the person is in, for
+//! the room's lighting, and loads the person's motive curves (0x45e43d,
+//! 0x459d23). Neither is kept here: the lighting is not modeled, and
+//! nothing reads the curves until a person's motives are updated.
+//! [`crate::curve_table`] says which curves they would be.
 //!
 //! Ported from the old prototype's visit loop
 //! (legacy/crates/sims-content/src/house_loading.rs), `PostLoad`
@@ -117,7 +127,9 @@ impl Interpreter<'_> {
     /// A visit that fails stops the step. The lot is left as the last
     /// complete visit left it, which is a state the original is in between
     /// two visits, and [`Visited::stopped`] says which visit failed and
-    /// why. Today that is the first person's.
+    /// why.
+    ///
+    /// `people` supplies each person's neighborhood record and profile.
     pub fn visit_objects(&self, world: &mut World, people: &People) -> Visited {
         let mut done = Visited::default();
         let mut current = world.order.first().copied();
@@ -155,8 +167,9 @@ impl Interpreter<'_> {
         done
     }
 
-    /// Visits one object (0x431e2e). See the module documentation.
-    pub fn visit(&self, world: &mut World, id: u16, _people: &People) -> Result<(), Fault> {
+    /// Visits one object (0x431e2e), or one person (0x459bf6). See the
+    /// module documentation.
+    pub fn visit(&self, world: &mut World, id: u16, people: &People) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -167,20 +180,25 @@ impl Interpreter<'_> {
             .get(&id)
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
         let changed = world.changed_types.contains(&object.guid);
-        if object.person.is_some() {
-            return Err(fail(Trap::Unsupported(
-                "the visit of a person is not ported".into(),
-            )));
-        }
+        let person = object.person.is_some();
         let mut position = object.position;
+        if person {
+            self.attach_neighbor(world, id, people).map_err(fail)?;
+        }
         if position[2] == 0 {
             position[2] = 1;
         }
         self.move_tree(world, id, position).map_err(fail)?;
-        self.callback(world, id, function::LOAD, 0)?;
+        if !person {
+            self.callback(world, id, function::LOAD, 0)?;
+        }
         if changed {
             self.drop_references(world, id)?;
-            self.reset(world, id, false)?;
+            if person {
+                self.reset_person(world, id, people)?;
+            } else {
+                self.reset(world, id, false)?;
+            }
             self.callback(world, id, function::INIT, 0)?;
         }
         self.machine(world, id, 0, false)

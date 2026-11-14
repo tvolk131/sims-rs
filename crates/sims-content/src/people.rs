@@ -39,6 +39,21 @@ pub struct Skeleton {
     pub scales: Vec<Vec<i32>>,
 }
 
+/// What a person's reset reads from the person type's files when it
+/// reloads the person's appearance (0x5888d3).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Profile {
+    /// Strings 12, 13 and 14 of the type's body strings, counting from 0:
+    /// the gender, the age and the skin tone. None is a string the table
+    /// does not have; an empty string is still a string.
+    pub gender: Option<String>,
+    pub age: Option<String>,
+    pub skin: Option<String>,
+    /// The skin tone names: string table 8192 of the type's semi-global
+    /// file, in order. Empty when the file or the table is missing.
+    pub tones: Vec<String>,
+}
+
 /// The neighborhood records and skeletons of a set of person types.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct People {
@@ -46,12 +61,22 @@ pub struct People {
     pub records: Vec<Record>,
     /// Each person type's skeleton, by the type's GUID.
     pub skeletons: BTreeMap<u32, Skeleton>,
+    /// Each person type's profile, by the type's GUID.
+    pub profiles: BTreeMap<u32, Profile>,
 }
 
 /// The string table an object definition of type 2 names its body in: the
 /// definition's word 19 (0x457f60). Its first string is the skeleton's
 /// name.
 const BODY_STRINGS: usize = 19 * 2;
+
+/// The body strings a reset reads (0x5888d3), counting from 0.
+const GENDER: usize = 12;
+const AGE: usize = 13;
+const SKIN: usize = 14;
+
+/// The string table of a semi-global file that names the skin tones.
+const SKIN_TONES: u16 = 8192;
 
 impl People {
     /// Finds the skeleton of each person type in `guids`, and lists the
@@ -84,6 +109,7 @@ impl People {
             })
             .collect();
         let mut names = BTreeMap::new();
+        let mut profiles = BTreeMap::new();
         for guid in guids {
             let Some(object) = catalog.object(guid) else {
                 continue;
@@ -92,7 +118,32 @@ impl People {
                 continue;
             }
             let resource = &index.resources[object.resource];
-            names.insert(guid, body_skeleton(index, resource, object.chunk)?);
+            let body = body_strings(index, resource, object.chunk)?;
+            let row = |n: usize| body.get(n, 1).map(str::to_owned);
+            let tones = match catalog.semi_globals.get(&object.resource) {
+                Some(&Some(semi_global)) => skin_tones(index, &index.resources[semi_global])?,
+                _ => Vec::new(),
+            };
+            profiles.insert(
+                guid,
+                Profile {
+                    gender: row(GENDER),
+                    age: row(AGE),
+                    skin: row(SKIN),
+                    tones,
+                },
+            );
+            let location = resource.location(&index.root);
+            let name = body
+                .get(0, 1)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "{location}: the person's body strings name no skeleton"
+                    ))
+                })?;
+            names.insert(guid, name);
         }
         let mut skeletons = BTreeMap::new();
         if !names.is_empty() {
@@ -127,13 +178,17 @@ impl People {
                 );
             }
         }
-        Ok(Self { records, skeletons })
+        Ok(Self {
+            records,
+            skeletons,
+            profiles,
+        })
     }
 }
 
-/// The skeleton name in the body strings of the person definition `chunk`
-/// of a character file.
-fn body_skeleton(index: &Index, resource: &Resource, chunk: u16) -> Result<String> {
+/// The body strings of the person definition `chunk` of a character
+/// file.
+fn body_strings(index: &Index, resource: &Resource, chunk: u16) -> Result<StringTable> {
     let location = resource.location(&index.root);
     let iff = Iff::parse(resource.read()?).map_err(|e| Error::format(&location, e))?;
     let missing = |what: &str| Error::Unsupported(format!("{location}: {what}"));
@@ -148,13 +203,25 @@ fn body_skeleton(index: &Index, resource: &Resource, chunk: u16) -> Result<Strin
     let strings = iff
         .get(b"STR#", table)
         .ok_or_else(|| missing("the person's body strings are missing"))?;
-    let strings = StringTable::parse(iff.data(strings))
-        .map_err(|e| Error::format(&format!("{location} STR# #{table}"), e))?;
-    strings
-        .get(0, 1)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| missing("the person's body strings name no skeleton"))
+    StringTable::parse(iff.data(strings))
+        .map_err(|e| Error::format(&format!("{location} STR# #{table}"), e))
+}
+
+/// The skin tone names of a semi-global file: its string table 8192.
+fn skin_tones(index: &Index, resource: &Resource) -> Result<Vec<String>> {
+    let location = resource.location(&index.root);
+    let iff = Iff::parse(resource.read()?).map_err(|e| Error::format(&location, e))?;
+    let Some(chunk) = iff.get(b"STR#", SKIN_TONES) else {
+        return Ok(Vec::new());
+    };
+    let table = StringTable::parse(iff.data(chunk))
+        .map_err(|e| Error::format(&format!("{location} STR# #{SKIN_TONES}"), e))?;
+    Ok(table
+        .entries
+        .iter()
+        .filter(|entry| entry.language == 1)
+        .map(|entry| entry.text.clone())
+        .collect())
 }
 
 /// A skeleton file's skeletons: each one's name and bone scales.

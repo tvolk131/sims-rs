@@ -51,7 +51,7 @@ Each step is a few PRs, and each PR leaves `main` green.
 - Step 3 is in progress. The interpreter runs saved frames, creates
   objects through the original's factory, and puts them to sleep. The load
   sequence below tracks the load steps that must run before the first
-  tick; `sims boot` runs them through step 12.
+  tick; `sims boot` runs them through step 16.
 
 ### Load sequence
 
@@ -62,17 +62,16 @@ changes the state the first tick sees.
 
 The order and the addresses come from the old prototype's research on the
 1.91 executable. Each step was checked there on its own, against the
-original's code run in isolation. Steps 1 to 6 and 8 to 12 are also
+original's code run in isolation. Steps 1 to 6 and 8 to 16 are also
 checked against captures of the running original (see each step), and
-three results of step 7 are (see step 7). The rest of the sequence has not
-been compared with a running game, so it is **unverified** until it is
-ported and compared.
+three results of step 7 are (see step 7). Steps 17 to 22 are what a trace
+of the running original shows after step 16; they are not ported.
 
 The original does not build a lot for a house. It keeps one lot for as long
 as it runs and loads each house into it. So a load starts from whatever
 that lot holds: at least the two indicator objects, which every load
 creates (in step 13 when the first object comes back onto the lot, or
-else in step 14). `sims boot` has no earlier load, so it starts
+else in step 14 or 16). `sims boot` has no earlier load, so it starts
 from an empty lot (`World::empty`) and creates the two indicators on it.
 That starting lot is **unverified**; see the decision log.
 
@@ -95,13 +94,22 @@ That starting lot is **unverified**; see the decision log.
 | 10a | Count the rooms | `0x467094`, `0x466c3c`, `0x467bb1` | Done for the walls and floors (`World::update_rooms`); the objects' share, light and scores are not modeled |
 | 11 | Discard pending removals | `0x428679` | Done (`World::discard_removals`) |
 | 12 | Select the household | `0x428041`, `0x46d8dc` | Done (`World::select_family`) |
-| 13 | Visit every object in registration order | `0x43fc94`, `0x431e2e` | Done for objects that are not people (`Interpreter::visit_objects`); the step stops at the first person. On the Goth house 201 of 382 visits run |
-| 14 | Create the indicator objects and finish selection | `0x445e4a` | Creation done (`Interpreter::create_indicators`), used for the starting lot and in step 13; the step itself is not called |
+| 13 | Visit every object in registration order | `0x43fc94`, `0x431e2e`, `0x459bf6` | Done (`Interpreter::visit_objects`); a person only if it is doing nothing. On the Goth house all 382 visits run |
+| 14 | Create the indicator objects unless the lot has them | `0x445e4a` | Done (`Interpreter::ensure_indicators`) |
+| 15 | Finish the household selection: delete people who do not belong, work out the visitors, update the lighting | `0x428041`, `0x42a2b4`, `0x4c4648` | Done for a lot whose people are all members of the household, where it changes nothing (`World::finish_selection`); the lighting is not modeled |
+| 16 | Announce the loaded house, which asks for the indicators again | `0x428652`, `0x44302e`, `0x445e4a` | Done (`Interpreter::ensure_indicators`) |
+| 17 | Clear the selected Sim (global 3) and set the funds again | `0x4f1ae9`, `0x46d8dc` | Not done |
+| 18 | Select a Sim: global 3, the Sim's selected mark, and the first indicator goes into the Sim's slot | `0x4e989b`, `0x445449` | Not done |
+| 19 | Go to live mode: every room waits to be counted, global 37 becomes 1, then global 19 becomes 0 | `0x4cea5d`, `0x416534`, `0x4ce44f` | Not done |
+| 20 | Count the family's friends | `0x427219`, `0x427bd7` | Not done; no state we hold changes |
+| 21 | Update the rooms: counts, light and scores | `0x466c3c` | Not done; needs the part of the room update that is not modeled |
+| 22 | The interface's wait check clears global 12 | `0x4764fe` | Not done |
 
 `sims boot` runs the steps in order and stops at the first thing that is
 not done, so it never prints the hash of a state the original could not be
-in. Today it stops inside step 13, between two visits: on the Goth house
-after visit 201 of 382, because visit 202 is the first person's.
+in. Today it stops after step 16. Steps 17 to 22 are driven by the
+original's interface, not by its loader; the first tick (`0x46d345`)
+comes after them.
 
 #### The steps
 
@@ -463,13 +471,45 @@ and a family record older than version 9 are **unverified**.
    interaction table.
 7. A person updates its cached room and reloads its motive curves.
 
+*A person's fields.* The neighborhood file keeps a record for each person
+with 256 person data words. The record's ID goes into the person's data
+word 31. Then the words the record keeps for the person are copied from
+it: 29 words for a record of revision 1 and more for each later revision,
+48 at revision 10. They are the person's lasting traits: personality,
+interests, skills, age, skin, gender, family, career. The record is the
+first of the person's type.
+
+*A person's reset*, for a person that is doing nothing:
+
+1. Person data word 30 is cleared.
+2. The appearance is reloaded from the body strings of the person's type:
+   person data words 22 and 23 are cleared, and the gender (65), the age
+   (58) and the skin tone (60) are read again.
+3. The thread restarts at Main. Then the Reset function runs on top of
+   it. (An object runs Reset first and restarts afterwards.)
+4. Person data words 0, 40 and 59 and data words 34 and 9 are cleared,
+   with the motive changes an action left running and person data words
+   33, 71, 72 and 73.
+5. Each queued action is dropped, and its target is asked function 4.
+
+A person that is using an object, has a running action with a target, is
+in the middle of a route, is inside another object or off the lot, or
+has data word 73 set fails: the original does more for each, and none was
+seen.
+
+*The cached room and the motive curves* are not kept. The cached room
+drives the room's lighting, which is not modeled. The curves turn a
+motive's level into its share of the mood; nothing reads them until a
+person's motives are updated in a tick. `curve_table` says which string
+table they come from: the one the person's definition names, or the
+global table 501 for an adult and 503 for a child.
+
 Lot time does not advance, and no object's saved Main runs, during any of
 this. The next object is read from the list after each visit, so an object
 a visit creates, which goes to the head of the list, is not visited.
 
-Ported for objects that are not people. A person's visit fails, and
-`Interpreter::visit_objects` then stops with the lot as the visit before
-left it. What the visits needed:
+A visit that cannot be made fails, and `Interpreter::visit_objects` then
+stops with the lot as the visit before left it. What the visits needed:
 
 - *Taking an object off its tile and putting it back* (`0x433125`,
   `0x433340`; `placement.rs`). The lot keeps, for each tile, the first
@@ -513,7 +553,8 @@ left it. What the visits needed:
 What the trace of the Goth load shows of this step:
 
 - 382 visits. Function 2 is asked of the 379 objects that are not people.
-  For 198 objects it is the only function asked.
+  For 198 objects it is the only function asked. The three people are
+  visits 202 to 204, and each is asked functions 3 and 0.
 - 184 objects have a changed type. The 3 people and 23 others have a
   Reset tree. The other 158 are rebuilt; 148 of them stand on the lot and
   120 are tiles of a group.
@@ -521,28 +562,109 @@ What the trace of the Goth load shows of this step:
   indicators (383 and 384). Seven controllers ask to be removed.
 - When the step returns, 8 of the 11 rooms wait to be counted again.
 
-Checked against the trace for the 201 visits that run. The trace has a
-full state at the step's entry, in the middle of visit 140 where the
-indicators are created, and at the step's return, and for every visit
-each call of "run this object's function" (`0x422d46`). Equal: the object
-and the calls of every one of the 201 visits, in order; the whole state in
-the middle of visit 140, all 382 objects, globals, random streams,
-arrays, removal queue and rooms; the same when the indicators' creation
-returns; and, against the step's return, every compared field of the 201
-objects visited and the 4 created, but for the link words of 17 objects
-that a later visit relinks. The state between visit 140 and the step's
-return cannot be compared: the trace does not hold it. See the decision
-log.
+Checked against the trace for all 382 visits. The trace has a full state
+at the step's entry, in the middle of visit 140 where the indicators are
+created, and at the step's return, and for every visit each call of "run
+this object's function" (`0x422d46`). Equal: the object and the calls of
+every one of the 382 visits, in order (1,781 calls); the whole state in
+the middle of visit 140 and when the indicators' creation returns; and
+the whole state at the step's return. That last one is all 386 objects
+field for field, the three people's data, motives and actions, the 64
+globals, the three random streams, the funds, the removal queue, the
+registration order, the instance lists, the rooms waiting to be counted
+and the lot arrays with the object grids. It is the first check of
+everything that is not an object field after visit 140.
 
-Still to port for the people: taking their fields from the neighborhood
-record, their own reset, their cached room and their motive curves. Then
-the 178 visits after them, which may need more primitives.
+What the trace shows of a person's visit: words 46 to 55 of each person's
+data change to the record's values, the thread is one new Main frame, the
+last result is true, and the Reset and Init trees set seven motives. All
+equal here, the motives bit for bit. Everything else the visit writes already holds
+the value written in this house, so the trace shows it unchanged. See the
+decision log.
+
+One difference seen since step 6e is settled as harmless. Object 19's
+second frame has tree ID 0x8118 in the trace and 0x118 here until its
+visit, number 206. The visit makes the same calls here as in the trace
+and replaces the thread, and afterwards the object is equal in every
+field. What sets the bit is still not known.
 
 **14. Indicators.** Two indicator objects are created through the factory
-and hidden, unless the lot has them already, and the selected person is
-found. In the trace of the Goth load the function is entered once more
-after the last visit and creates nothing: the indicators were made in
-step 13.
+and hidden, unless the lot has them already. In the trace of the Goth
+load the function is entered once more after the last visit and creates
+nothing: the indicators were made in step 13. The state at its return and
+at the return of step 13's function equals ours.
+
+**15. The end of the household selection.** The function that selected
+the household in step 12 (`0x428041`) goes on after the visits:
+
+1. It deletes each person that belongs to no family and is on another
+   lot's list.
+2. In some game modes it creates a tutorial controller object (GUID
+   `0xC3249A1D`) if global 26 is not 0.
+3. If the family's record asks for it (flag 4), it resets the budget, the
+   statistics, the globals and the lot.
+4. It works out again which people are visitors (`0x42a2b4`).
+5. It deletes each person that lived here before the visits and is now a
+   visitor.
+6. It updates the lot's lighting (`0x4c4648`).
+
+None of 1 to 5 is ported. `World::finish_selection` fails if any of them
+could do something: a person whose family is not the selected one or who
+is marked as a visitor, global 26 set, or a family record with flag 4.
+Otherwise it changes nothing. The order and the conditions are the old
+prototype's, which compared them with the original's code run alone. In
+the trace of the Goth load nothing we compare changes between the return
+of step 13 and the return of the lighting update. The lighting is not
+modeled.
+
+**16. The house is announced.** The loader tells the rest of the game
+that a house is loaded (signal `0xf6`). The object registry answers by
+asking for the indicators again if no Sim is selected. In the trace that
+creates nothing, and the state at its return equals ours.
+
+**17 to 22. The rest, which is not ported.** After step 16 the original's
+interface takes over. A trace of the Goth load stops at seven more places
+before the first tick, and this is what changes between them, of the
+state we hold:
+
+- *17.* Global 3, the selected Sim, goes from the saved 21 to 0. Then the
+  funds setter runs again and changes nothing.
+- *18.* A Sim is selected (`0x445449`, called from `0x4e989b`). An
+  instance list is made for the type of person 21, which is how the game
+  finds a person by type. Global 3 becomes 21 again, person 21 gets its
+  selected mark (object flag 2), and indicator 383 goes into person 21's
+  slot: its data words 2, 3, 14 and 26 become 21, 1, 2 and 21, and its
+  room and position become the person's. The indicator is asked function
+  10 twice and function 9 once, and person 21 function 9 once. How the
+  game picks the Sim is not known from the trace: it may be the Sim the
+  house saved in global 3, or the family's first member; both are person
+  21 here.
+- *19.* The mode changes (`0x4cea5d` twice). The three rooms that were
+  not waiting to be counted now wait too, global 37 goes from 0 to 1,
+  and then global 19 goes from 3 to 0: live mode.
+- *20.* The family's friends are counted. No state we hold changes.
+- *21.* The rooms are updated. The five outdoor rooms stop waiting and
+  the six indoor rooms still wait, with new light and score values. None
+  of the four counts we keep changes. This is the part of the room
+  update that is not modeled (step 10a).
+- *22.* The interface's wait check (`0x4764fe`) sets global 12 from 2009
+  to 0.
+
+Then the trace stops at the entry of the first tick (`0x46d345`). No
+object's thread runs, the tick count stays at 88,444, and no random
+stream moves in any of steps 14 to 22. So the state after step 16 differs
+from the state at the first tick in this and nothing else we compare:
+indicator 383's five data words and position, one instance list, globals
+12, 19 and 37, and which rooms wait to be counted. Global 3 is 21 at both
+ends.
+
+What the next piece of work needs: a place in `World` for the selected
+Sim's mark, the selection itself with the indicator moving into a
+person's slot (the placement code can already put an object into a
+container), the rule for which Sim is selected, and the mode change's
+three writes. The room update's light and scores are a larger piece, and
+the first tick does not wait for them unless a script reads a room's
+score.
 
 ## Working rules
 

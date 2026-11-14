@@ -763,3 +763,84 @@ fn discarding_the_removals_empties_the_queue_and_touches_no_object() {
     assert_eq!(world.encode(), same.encode());
     assert_eq!(world.discard_removals(), []);
 }
+
+/// A person whose person data word 61 (its family) and 32 (whether it is
+/// a visitor) are given.
+fn person_of(id: u16, family: i16, visitor: i16) -> sims_sim::Object {
+    use sims_formats::saved_objects::{Interaction, Person};
+    let idle = Interaction {
+        uid: 0,
+        caller: 0,
+        target: 0,
+        icon: 0,
+        table_index: 0,
+        args: [0; 4],
+        priority: 0,
+        action: 0,
+        attenuation: 0.0,
+        flags: 0,
+    };
+    let mut data = vec![0; 256];
+    (data[61], data[32]) = (family, visitor);
+    let mut object = object_at(id, [8, 8, 1]);
+    object.person = Some(Person {
+        animation_events: 0,
+        engaged: 0,
+        appearance: Default::default(),
+        accessories: Vec::new(),
+        animations: Default::default(),
+        routing_state: 0,
+        floats: [0.0; 9],
+        previous_motives: [0.0; 16],
+        motives: [0.0; 16],
+        data,
+        routing_frames: 0,
+        active: idle.clone(),
+        last: idle,
+        queue: Vec::new(),
+        object_uses: Vec::new(),
+        motive_deltas: Vec::new(),
+    });
+    object
+}
+
+#[test]
+fn the_selection_ends_quietly_on_a_lot_with_only_the_household() {
+    let mut world = lot(vec![0; 64]);
+    assert_eq!(
+        lot(vec![0; 32]).finish_selection(0),
+        Err(LoadError::NoContext)
+    );
+    world.apply_context(CONTEXT).unwrap();
+    world.select_family(3, 5, 500, None).unwrap();
+    world.objects.insert(1, object_at(1, [8, 8, 1]));
+    world.objects.insert(2, person_of(2, 3, 0));
+    let before = world.encode();
+    assert_eq!(world.finish_selection(0), Ok(()));
+    // Other flags of the family's record do not matter.
+    assert_eq!(world.finish_selection(!4), Ok(()));
+    assert_eq!(world.encode(), before);
+
+    // Each thing the original would act on is refused, and names itself.
+    let refused = |world: &World, flags: u32| match world.finish_selection(flags) {
+        Err(LoadError::Selection(what)) => what,
+        other => panic!("{other:?}"),
+    };
+    assert!(refused(&world, 4).contains("asks for the lot to be reset"));
+    let mut tutorial = world.clone();
+    tutorial.globals[26] = 1;
+    assert!(refused(&tutorial, 0).contains("global 26"));
+    let mut guest = world.clone();
+    guest.objects.insert(3, person_of(3, 7, 0));
+    assert!(refused(&guest, 0).contains("person 3 is of family 7"));
+    let mut homeless = world.clone();
+    homeless.objects.insert(3, person_of(3, 0, 0));
+    assert!(refused(&homeless, 0).contains("person 3 is of family 0"));
+    let mut visiting = world.clone();
+    visiting.objects.insert(3, person_of(3, 3, 1));
+    assert!(refused(&visiting, 0).contains("person 3 is a visitor"));
+    assert_eq!(
+        LoadError::Selection("x".into()).to_string(),
+        "x, which is not ported"
+    );
+}

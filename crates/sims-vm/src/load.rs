@@ -65,6 +65,22 @@ impl Interpreter<'_> {
         Ok(ids)
     }
 
+    /// Creates the two indicator objects unless the lot has them
+    /// (0x445e4a): the original looks only at the first of the two
+    /// references it keeps. Returns the IDs if it created them.
+    ///
+    /// The original calls this when a load has visited every object (load
+    /// step 14), again when the loaded house is announced (step 16), and
+    /// when an object comes onto the lot from outside. In a trace of the
+    /// original loading the Goth house the indicators are made in the
+    /// middle of step 13, and the calls of steps 14 and 16 change nothing.
+    pub fn ensure_indicators(&self, world: &mut World) -> Result<Option<[u16; 2]>, Fault> {
+        if world.indicators[0] != 0 {
+            return Ok(None);
+        }
+        self.create_indicators(world).map(Some)
+    }
+
     /// Resizes the lot the game is holding to the size the house asks for
     /// in global 23, where 0 means the full 64 tiles (0x415e20). Call it
     /// after the house's simulator state is read and the context applied,
