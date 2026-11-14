@@ -1250,6 +1250,25 @@ Progress:
   from the simulation's animator state, a viewer, and the comparison
   with the original.
 
+## Track: lot rendering (`crates/sims-render`)
+
+Draw a lot from the house file and the game's art: terrain, floors, walls
+and object sprites, at the three zooms and four rotations, in a window.
+The crate reads the simulation's world and never changes it. Milestone:
+the Goth house drawn in a window at every zoom and rotation, with floors,
+walls (with cutaway) and objects, and one camera compared with a
+screenshot of the original.
+
+Progress:
+
+- Done: the crate draws on the CPU into an image with a depth buffer,
+  using the original's projection. Floors, grass, walls (with the shapes
+  doors and windows cut into them) and object sprites draw at every zoom
+  and rotation, with walls up, cut away or down. The Goth house renders
+  are pinned by digest, gated on `SIMS_INSTALL`.
+- Next: a viewer window, a screenshot of the original at the same camera
+  and the comparison, then what it shows needs fixing.
+
 ## Working rules
 
 - Work in branches, open PRs, and merge when CI is green on both platforms.
