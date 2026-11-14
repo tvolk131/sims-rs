@@ -1382,12 +1382,16 @@ stop-sounds events.
   Volume, pan, pitch and ducking follow the original's formulas, and
   the output is stereo. The `render_event` example writes events to a
   WAV file.
+- **Done: event kinds.** Fades, television and radio stations (built
+  from their directories, as the original does), sequenced hit lists,
+  `radio_next_song` and the kill events follow the original's
+  dispatcher. Of the 190 events that were not plays, 29 remain, counted
+  in a gated test: music modes (21), ambience modes (5), the piano,
+  pausing and reloading. 12 more name no track and do nothing.
 - **Next:**
   - The simulation emits `SoundEvent`s (the interface is in the
     decisions log).
-  - The 190 events of other kinds (music modes, TV, sequenced hit
-    lists).
-  - The FSC ambient player.
+  - The FSC ambient player (ambience modes).
   - Live playback behind a feature.
   - Checking any of it against the original.
 
