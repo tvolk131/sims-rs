@@ -38,6 +38,50 @@ pub struct Font {
     decoded: ffn::Font,
 }
 
+/// The weight, out of 32, each coverage level from 1 to 14 gives the
+/// text's color, measured on the original's screen: every edge pixel of
+/// the two dialogs compared (about 20,000) fits this table and no other.
+/// What is under the text gets `32 - ALPHA` and one more at odd levels:
+/// the extra weight is needed by the button labels (blue under, the only
+/// place the two differ) and changes nothing elsewhere. Fitted to two
+/// backgrounds; others are **unverified**.
+const ALPHA: [u32; 15] = [0, 3, 5, 7, 9, 11, 13, 15, 18, 20, 22, 24, 26, 29, 30];
+
+/// One pixel of text. The original blends text in 15-bit color (5 bits a
+/// channel, rounding down) and shows it on a 16-bit screen, so green
+/// keeps only its top five bits; a fully covered pixel takes the color
+/// as it is.
+fn ink(frame: &mut Frame, x: i32, y: i32, rgb: [u8; 3], coverage: u8) {
+    let c = usize::from(coverage.min(15));
+    if c == 0 {
+        return;
+    }
+    if c == 15 {
+        frame.blend(x, y, rgb, 255);
+        return;
+    }
+    let Some(under) = frame.pixel(x, y) else {
+        return;
+    };
+    let a = ALPHA[c];
+    let under_weight = 32 - a + (c as u32 & 1);
+    let mix = |f: u8, b: u8| {
+        ((u32::from(f >> 3) * a + u32::from(b >> 3) * under_weight) >> 5).min(31) as u8
+    };
+    let [r, g, b] = [0, 1, 2].map(|i| mix(rgb[i], under[i]));
+    let g = g << 1;
+    frame.blend(
+        x,
+        y,
+        [
+            (r << 3) | (r >> 2),
+            (g << 2) | (g >> 4),
+            (b << 3) | (b >> 2),
+        ],
+        255,
+    );
+}
+
 impl Font {
     /// Sets up a parsed font. Glyph codes above 255 are ignored: the
     /// interface's fonts are single-byte.
@@ -118,11 +162,12 @@ impl Font {
                 for gx in 0..w {
                     let i = (ay + gy) * usize::from(self.decoded.width) + ax + gx;
                     let coverage = self.decoded.coverage.get(i).copied().unwrap_or(0);
-                    frame.blend(
+                    ink(
+                        frame,
                         x.saturating_add(m.bearing[0]).saturating_add(gx as i32),
                         at[1].saturating_add(m.bearing[1]).saturating_add(gy as i32),
                         rgb,
-                        coverage.min(15) * 17,
+                        coverage,
                     );
                 }
             }

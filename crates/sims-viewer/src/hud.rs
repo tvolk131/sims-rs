@@ -6,12 +6,16 @@
 //! the open panel). The simulation has no command intake yet, so a
 //! command for it (choosing a Sim, the speed, a mode) is printed and
 //! dropped.
+//!
+//! A dialog the world is waiting on is drawn over the lot. Its answer is
+//! printed and dropped too, and the viewer stops showing that dialog.
 
 use crate::view::{Command as ViewCommand, View};
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_content::{Install, Neighborhood};
 use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_ui::command::{Camera, Command, Walls as UiWalls};
+use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::Frame;
 use sims_ui::household::{Faces, Snapshot};
 use sims_ui::hud::{self, Controls, Item};
@@ -24,16 +28,39 @@ pub struct Hud {
     members: Vec<u32>,
     pub controls: Controls,
     items: Vec<Item>,
+    /// The dialog the world waits on, until it is answered here.
+    message: Option<Message>,
+    dialog: Option<dialog::Layout>,
 }
 
 impl Hud {
-    /// Reads the art, and the household of `house` from its
-    /// neighborhood, with the portraits from the people's files.
-    pub fn open(install: &Path, house: &Path, assets: &Assets) -> Result<Self, String> {
+    /// Reads the art, the household of `house` from its neighborhood,
+    /// with the portraits from the people's files, and the dialog
+    /// `world` waits on. The viewer never runs the world, so the dialog
+    /// is read once.
+    pub fn open(
+        install: &Path,
+        house: &Path,
+        assets: &Assets,
+        world: &sims_sim::World,
+    ) -> Result<Self, String> {
         let install = Install::detect(install).map_err(|e| e.to_string())?;
         let ui = UiGraphics::open(&install).map_err(|e| e.to_string())?;
+        let resources: Vec<i32> = hud::RESOURCES
+            .iter()
+            .chain(&dialog::RESOURCES)
+            .copied()
+            .collect();
         let art =
-            sims_ui::art::Art::load(&ui, US_ENGLISH, &hud::RESOURCES).map_err(|e| e.to_string())?;
+            sims_ui::art::Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
+        let message = match dialog::pending(world) {
+            Some(pending) => {
+                let labels = Labels::load(&install).map_err(|e| e.to_string())?;
+                Message::read(world, assets.index(), assets.catalog(), &labels, pending)
+                    .map_err(|e| e.to_string())?
+            }
+            None => None,
+        };
         let neighborhood = house
             .parent()
             .and_then(Path::parent)
@@ -61,6 +88,8 @@ impl Hud {
                 ..Controls::default()
             },
             items: Vec::new(),
+            message,
+            dialog: None,
         })
     }
 
@@ -99,24 +128,62 @@ impl Hud {
             &self.items,
             &self.controls,
         );
+        self.dialog = self
+            .message
+            .as_ref()
+            .and_then(|m| dialog::layout(view.size, m, &self.art));
+        if let (Some(message), Some(layout)) = (&self.message, &self.dialog) {
+            dialog::draw(
+                &mut frame,
+                &self.art,
+                message,
+                layout,
+                self.controls.pointer,
+            );
+        }
         canvas.color = frame.into_rgb();
     }
 
-    /// Whether the panel covers `point` (canvas pixels).
+    /// Whether the panel or the dialog covers `point` (canvas pixels).
     pub fn covers(&self, point: [i32; 2]) -> bool {
-        hud::covers(&self.items, point)
+        self.dialog
+            .as_ref()
+            .is_some_and(|d| d.rect.contains(point[0], point[1]))
+            || hud::covers(&self.items, point)
     }
 
     /// Moves the pointer; true if what it hovers changed.
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
-        let before = hud::hovered(&self.items, self.controls.pointer);
+        let button = |pointer: Option<[i32; 2]>| {
+            let layout = self.dialog.as_ref()?;
+            let [x, y] = pointer?;
+            layout.buttons.iter().position(|b| b.contains(x, y))
+        };
+        let before = (
+            hud::hovered(&self.items, self.controls.pointer),
+            button(self.controls.pointer),
+        );
         self.controls.pointer = Some(point);
-        hud::hovered(&self.items, self.controls.pointer) != before
+        (
+            hud::hovered(&self.items, self.controls.pointer),
+            button(self.controls.pointer),
+        ) != before
     }
 
     /// A press at `point`: the view command to carry out, if any, and
     /// whether the panel changed.
     pub fn press(&mut self, point: [i32; 2]) -> (Option<ViewCommand>, bool) {
+        if let Some(layout) = &self.dialog
+            && layout.rect.contains(point[0], point[1])
+        {
+            let Some(command) = dialog::press(layout, point) else {
+                return (None, false);
+            };
+            eprintln!("not carried out, the simulation takes no commands yet: {command:?}");
+            self.message = None;
+            self.dialog = None;
+            return (None, true);
+        }
         let Some(command) = hud::press(&self.items, point) else {
             return (None, false);
         };
