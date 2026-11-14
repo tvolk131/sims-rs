@@ -58,6 +58,159 @@ roadmap section for what the simulation needs.
 What would reopen it: a second screenshot (another window size, buy
 mode, the afternoon) that disagrees.
 
+## 2026-11-14: Directory listings are sorted, and paths are spelled as on disk
+
+From the back review of main:
+
+- **Listings.** `std::fs::read_dir` joins the clippy bans, since the
+  order it lists names in depends on the filesystem. The few listings
+  left sort what they read and say so beside an `allow`.
+- **Spelling.** `sims_content::install::resolve` now always returns the
+  spelling the directory listing gives, and a case-insensitive match
+  takes the first name in sorted order. Before, a case-insensitive
+  filesystem (macOS) returned the spelling asked for and a
+  case-sensitive one the spelling on disk. Paths reach state (a
+  skeleton's file), so the same install could hash differently on two
+  machines. The people crate's lookup takes the first match in sorted
+  order too.
+- **Other bans.** The bans also cover `asinh`, `acosh` and `atanh` for
+  `f32` and `f64`, and `Instant::elapsed` and `SystemTime::elapsed`.
+- **Not banned: environment reads.** No library crate reads the
+  environment. Only tests (the `SIMS_INSTALL` gate) and tool entry
+  points do, and the install path enters as data. Reopen if a library
+  crate needs one.
+
+## 2026-11-14: Which catalog wins when two hold the same name
+
+The original's code settles this for appearances and clips. Before
+loading, it builds a list of search folders (0x5835ed, as the old
+prototype traced it). It then lists the catalog files in those folders
+(0x5c1a7d, as the old prototype ported it in
+`legacy/crates/sims-sim/src/pose/clothing/catalog_files.rs`):
+- every text catalog (`.cmx`) in every folder before any binary one
+  (`.bcf`);
+- each kind folder by folder;
+- a file name already listed from an earlier folder is skipped.
+
+It loads them in that order (0x59f844 for appearances, 0x5a0212 for
+animations). For each record it looks the name up first. A name not yet
+known is added. A name already loaded keeps its record, and the new one
+is released (0x59f087, which calls 0x5954a5 for appearances and
+0x59778a for clips). So **the first catalog loaded wins.**
+
+For appearances the folder order is:
+1. the game's own skins (`GameData/Skins`);
+2. the shared expansion folders (`ExpansionShared/Skins` and others);
+3. each expansion's `Skins`, `Animations` and `Accessories`, from the
+   newest expansion back;
+4. the first expansion.
+
+An archive's members count as being in the archive's folder plus the
+folder in the member's name. For example, `Deluxe.far`'s
+`Skins\b200mafit_ctb.cmx.bcf` is in `deluxe/skins`.
+
+`sims-people` now does the same. On first use it puts every catalog of
+the install in that order, reads each, and keeps the first catalog of
+each appearance name. A catalog it cannot read is skipped, as the
+original goes on after a file it cannot read. Reading them all takes
+under a second. This replaces the old lookup, which:
+- tried the binary file named after the appearance first, then the text
+  one;
+- then took the first catalog in name order.
+
+In the Complete Collection, one appearance is given differently by two
+catalogs: `b200mafit_ctb`. It is in `GameData/Skins` as text and in
+Deluxe's archive as binary, with different bindings. The original takes
+the `GameData/Skins` one, and the old lookup took Deluxe's. A gated test
+checks this one, and unit tests check the order and the first-wins rule
+without the install.
+
+What is still approximated or open:
+
+- **Order within one folder: unverified.** It is the original's file
+  map's, which is not ported; we use name order. No folder of the
+  install holds two catalogs giving the same name.
+- **Folders the original does not search.** Catalogs elsewhere (such as
+  an expansion's object folder) are loaded after all the others. The
+  original may not load them at all.
+- **Clips.** The rule is the same, with `GameData/Animation` searched
+  first. No clip name is defined by two files in the install, so our
+  order (the first file in name order) never picks differently.
+- **Same-named files other than catalogs: unverified.** 47 file names
+  exist in two sources with different bytes: accessory textures such as
+  `bottle.bmp`, some animation files shared by the third expansion and
+  `ExpansionShared`, and a few meshes. Which copy the original reads
+  depends on how it looks those files up, which is not ported. Its
+  texture search lists the expansions before `GameData` (0x413ccc), the
+  reverse of our order, and the expansions' copies of the accessory
+  textures are larger. So the original may well prefer them. None of
+  these files is drawn for the Goth family. We keep our order and mark
+  it unverified.
+
+## 2026-11-14: Scripted input reaches the game through xdotool, and is confirmed in memory
+
+The harness can now drive the original from a scenario file while it
+captures (`capture.py --scenario`, `tools/harness/input.py`). This is how
+captures with player input are made, for our simulation to replay.
+
+What was decided:
+
+- **Input goes through xdotool in the guest, not QEMU.** QEMU's input
+  devices do not reach the game: the guest's X server is Xvfb, which reads
+  no device. A small guest job (`guest/input-agent.sh`) runs the commands
+  the host drops in the share, polling every 50 ms; the generic job runner
+  polls once a second. Guest memory is never written.
+- **What was clicked is read from the pie menu, not trusted.** The
+  picker tool's hovered object (picker `+0x2e`) lags the pointer by tens of
+  lot updates under TCG, because the game takes pointer moves late. Once it
+  named the bench while the pointer was over the porch floor, and the click
+  opened "Go Here". So the hover reading only says when to press, and the
+  pie menu's actions say what was clicked: a menu whose actions aim at
+  another object is closed with Escape and the next aim point tried.
+- **A chosen interaction is confirmed twice.** capture.py stops at
+  `0x48ddcb`, the call in the pie menu's select handler (`0x48dd67`) that
+  pushes the action on the person (`0x45d20b`, edi the person, esi the
+  action), and logs it with the update it falls before or in. Then
+  `expect-queued` waits for the person to hold that action, queued
+  (`+0x820`) or running (`+0xa48`).
+- **Dialogs are answered on the dialog stops.** A modal dialog holds the
+  lot update it shows in, so a step that waits for update returns would
+  never see it. `answer-dialog` presses once, as `answer.sh` does, and
+  waits for the dialog's result stop.
+
+**Checked against the original.** In a capture from a fresh boot
+(2026-11-14), the scenario answered the five welcome notices and the Help
+System dialog, aimed at bench 173 by projecting its position (hover
+confirmed on the second aim point), opened a pie menu with the one entry
+Sit (caller 21, target 173, routine 8213, priority 50), and chose it. The
+push came before lot update 178. At the return of update 180 the person's
+queue was already empty, and the full state after update 200 holds Sit on
+173 as its active action, with uid 1. (That run's check read only the
+queue; reading the running action too was added after it.) A second
+scenario on the same running lot hit the bench at the same aim point, got
+the same menu, recorded the push before update 168, and found Sit on 173
+in person 21's queue (uid 7) at the return of update 168, behind its
+running action. Screenshots showed the bench in the
+person's queue. The memory layout used (picker, pie menu, people panel,
+house view, queue) is listed in `input.py`; each part was read in the
+running game.
+
+**Unverified.**
+
+- The projection was checked only in the starting view (zoom 1, no
+  rotation), and it ignores the floor's height: the porch, on a
+  foundation, is hit about 30 pixels above its projected point, which the
+  aim points cover.
+- Hovering is not free of side effects: `0x48c834` sets and clears
+  highlight bits in the hovered object's flags (`+0x114`, through
+  `0x4320da`). Whether those bits reach anything our simulation compares
+  is not checked. A replay may need them, or a check that they are only
+  drawn.
+- Submenus, build and buy mode, and a missed dialog press (the step then
+  waits for the dialog to be answered by hand) are not handled.
+- Dialog button places are written in the scenario, not read from the
+  dialog.
+
 ## 2026-11-14: The head follows its target, and K = 366
 
 In tick 334 of the Goth house, person 16's head starts to follow what
@@ -197,6 +350,7 @@ such a member, and so whether it hides a later file of the same name.
 The game's own archives hold none. Keeping both sizes on
 `sims_content::Member` waits on `sims-people`, which builds that struct
 itself and also reads FAR directories without these caps.
+
 
 ## 2026-11-14: People: transparent texels, shared edges, and people made after the load
 
@@ -372,6 +526,46 @@ libraries at run time, so CI needs no new system packages.
 What would reopen it: the UI track needing a GPU, text or widgets that
 softbuffer cannot give, at which point the window code moves to wgpu
 or another toolkit, still outside `sims-render`.
+## 2026-11-14: One table of IFF resources, with the prototype's rules (unverified)
+
+`Iff::get`, `Iff::all` and `Iff::resource_order` now read one table built
+when the file is parsed, as the original's IFFResFile3 keeps it. Before,
+`get` and `all` scanned the raw chunks: they returned deleted chunks, and
+`get` took the first of two chunks with one key even when the resource
+map named only the second. `Iff::chunks` still lists every chunk in file
+order, for readers that want them all.
+
+The rules follow the frozen prototype's port of the open
+(`legacy/crates/sims-sim/src/object_catalog/iff.rs`):
+
+- A resource's key is its type, its ID and the high byte of its flags.
+  `get` looks up the key whose high byte is 0, as the original's lookup
+  by ID does.
+- Without a resource map: live chunks in file order. A deleted chunk
+  (flag 4) is skipped. A later chunk with a taken key replaces the
+  earlier one in its place in the order.
+- With a version-0 map: the map's entries in its order. Of two entries
+  with one key, the first is kept and the second dropped unread. A map
+  listing a resource map with ID 0 is ignored and the chunks are read as
+  if there were none. An entry's chunk must be at its offset with its
+  type, ID and flags high byte; the low flag bits are the map's to state,
+  as in the prototype. (The prototype checks only the type, when it
+  loads the payload; requiring the ID keeps a resource's chunk agreeing
+  with the key it is found under. The game's own maps always agree.)
+- A resource map is never a resource itself.
+- When the map cannot be used, `resource_order` fails as before, and
+  `get` and `all` use the table built as if there were no map.
+
+**Unverified** against the original. What the game's own files hold
+bounds the effect: all 4,155 deleted chunks in the install are `XXXX`
+free space, none sharing a key with a live chunk; the only live chunks
+sharing a type and ID are nine `BMP_` chunks that the flags' high byte
+tells apart; and no map lists a map, a duplicate key, or leaves a live
+chunk out. The install census and the gated digests are unchanged.
+`sims-vm`'s `Program` still reads `Iff::chunks` directly (a later chunk
+of one ID wins there, deleted ones included); on the game's own files
+that agrees with the table.
+
 
 ## 2026-11-14: Bella Goth compared with the original; the mirror is still open
 

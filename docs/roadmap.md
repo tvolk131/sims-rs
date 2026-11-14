@@ -542,11 +542,10 @@ waiting levels, the lot's outdoor sum and score, and global 27 (204). All
 equal. The trace has no stop between the two updates, so the state after
 the first is not compared.
 
-Not ported: whether an indoor room is lit because someone is in it
-(`0x468802`). A person tells its room as it enters and leaves; an outdoor
-room and a pool ignore that. The update fails for an indoor room where it
-would matter: no pool, no lights, people in it, light below 0.8. Not
-modeled, being presentation: the lights the update places in a room, the
+Whether an indoor room is lit because someone is in it (`0x468802`) was
+ported later (`World::note_occupant`, `Room::shown_light`): a person
+tells its room as it enters and leaves, and an outdoor room and a pool
+ignore that. Not modeled, being presentation: the lights the update places in a room, the
 lighting of the tiles, and the redrawing. The constant the daylight is
 multiplied by is 1.0 in the trace and is taken to be 1.0: **unverified**.
 A lot with a pool is **unverified**: this house has none.
@@ -1386,6 +1385,29 @@ stop-sounds events.
   - The FSC ambient player.
   - Live playback behind a feature.
   - Checking any of it against the original.
+
+## Track: recording tool input (`tools/harness`)
+
+Drive the original from a script while it is captured: click objects,
+choose pie-menu entries, enter and use build and buy modes, confirm each
+input from guest memory, and record it with the lot update it falls in,
+so our simulation can replay it. Milestone: a capture where a scripted
+input makes a Goth Sim do a chosen interaction, confirmed from memory and
+recorded with its update; then buy mode and placing one object.
+
+Progress:
+
+- Done: `capture.py --scenario` runs a scenario file (`tools/harness/input.py`,
+  documented in the harness README). Input is xdotool in the guest; the
+  game's state is only read. From a fresh boot, a scenario answered the six
+  welcome dialogs, clicked the porch bench, chose Sit, and the pie menu's
+  push of Sit on bench 173 for person 21 was recorded before lot update
+  178. The full state after update 200 holds it as person 21's active
+  action.
+- Next: build and buy mode (the mode switch, the catalog and placing an
+  object, confirmed by the new object and the budget), then a replay of
+  the recorded push in our simulation. The replay needs a way to queue an
+  action on a person before a tick.
 
 ## Track: the interface (`crates/sims-ui`)
 

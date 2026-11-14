@@ -147,6 +147,8 @@ fn visit(
     entries: &mut Vec<Entry>,
     problems: &mut Vec<String>,
 ) -> Result<()> {
+    // Sorted below.
+    #[allow(clippy::disallowed_methods)]
     let listing = std::fs::read_dir(directory).map_err(|e| Error::io(directory, e))?;
     let mut paths = Vec::new();
     for entry in listing {
