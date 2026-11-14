@@ -2,11 +2,11 @@
 //! for, and print the hash of the state it reaches. A load that completes
 //! ends at the state the original's first tick starts from. A tick that
 //! reaches something not ported stops the boot, which says at which tick.
+//! The work is `sims_vm::boot`; this prints it.
 
-use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People};
-use sims_sim::load::Context;
-use sims_sim::{Snapshots, World};
-use sims_vm::{Answers, Callback, Interpreter, Program, Stream};
+use sims_sim::Snapshots;
+pub use sims_vm::boot::Frames;
+use sims_vm::boot::{Lot, StepError};
 use std::error::Error;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -24,358 +24,95 @@ pub struct Options<'a> {
     pub frames: Frames,
 }
 
-/// When the house view draws a frame, as far as drawing writes the
-/// simulation's state (`sims_vm`'s `frame.rs`). The game's main loop and
-/// the window system decide that, not the simulation, so it is an input
-/// here. Tick 0 means before the first tick.
-///
-/// The default, `0,1,2,3,33+30`, is what three captures of the original
-/// running the Goth house recorded, with a hardware watchpoint on the
-/// house view's draw guard (`docs/decisions.md`): a frame before the
-/// first lot update, after updates 1, 2 and 3 (many times while a dialog
-/// waited), after update 33, and after every 30th update from there (63,
-/// 93, ...). Frames write two things: the first frame that draws a
-/// person places its animator (on this house, the frame after tick 33
-/// draws person 259, made in tick 6), and every frame counts the rooms
-/// that wait to be counted (0x4a8895). So the schedule changes the
-/// state: with a frame after every tick, the rooms are counted sooner.
-/// On this house that changes no state the captures hold through tick
-/// 261, but it changes the rooms' state in between.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Frames {
-    /// Ticks after which a frame is drawn.
-    pub after: Vec<u32>,
-    /// A frame after this tick and after every `step`th tick from it.
-    pub from: Option<u32>,
-    /// The ticks between two of those frames, at least 1.
-    pub step: u32,
-}
-
-impl Default for Frames {
-    fn default() -> Self {
-        Self {
-            after: vec![0, 1, 2, 3],
-            from: Some(33),
-            step: 30,
-        }
-    }
-}
-
-impl Frames {
-    /// Reads a list such as `0,33+30`: a tick number draws a frame after
-    /// that tick (0: before the first), `N+` after every tick from N on,
-    /// and `N+S` after N and every S-th tick from there. `none` draws no
-    /// frame.
-    pub fn parse(text: &str) -> Option<Self> {
-        let mut frames = Self {
-            after: Vec::new(),
-            from: None,
-            step: 1,
-        };
-        if text == "none" {
-            return Some(frames);
-        }
-        for part in text.split(',') {
-            match part.split_once('+') {
-                Some((from, step)) => {
-                    frames.from = Some(from.parse().ok()?);
-                    frames.step = if step.is_empty() {
-                        1
-                    } else {
-                        step.parse().ok().filter(|&s| s > 0)?
-                    };
-                }
-                None => frames.after.push(part.parse().ok()?),
-            }
-        }
-        Some(frames)
-    }
-
-    /// Whether a frame is drawn after tick `tick`.
-    pub fn after(&self, tick: u32) -> bool {
-        self.after.contains(&tick)
-            || self
-                .from
-                .is_some_and(|from| tick >= from && (tick - from).is_multiple_of(self.step))
-    }
-}
-
-/// The level the house view shows: the ground.
-const VIEW_LEVEL: i8 = 1;
-
 pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
-    let install = Install::detect(options.root)?;
-    let directory = options
-        .house
-        .parent()
-        .and_then(Path::parent)
-        .ok_or("the house file must be inside a neighborhood's Houses directory")?;
-    let neighborhood = Neighborhood::open(directory)?;
-    let mut index = Index::build(&install)?;
-    if let Some(characters) = neighborhood.characters()? {
-        index.add_characters(&characters)?;
-    }
-    let catalog = Catalog::build(&index)?;
-    let house = House::load(options.house, &catalog)?;
-    let context = Context::COMPLETE_COLLECTION;
-    // The original has every definition registered, and the resize step
-    // walks them all, so the whole catalog is linked.
-    let mut program = Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid))?;
-    program.zoning = neighborhood.zoning(context.expansions)?;
-    program.animations = Animations::load(&install, &index)?;
-    // Every person type's skeleton and appearance, for the people a script
-    // makes. A type whose skeleton cannot be chosen is left out; making a
-    // person of it fails.
-    program.people = People::load_each(
-        &install,
-        &index,
-        &catalog,
-        catalog
-            .objects
-            .iter()
-            .filter(|o| o.kind == 2)
-            .map(|o| o.guid),
-    )?
-    .0;
-    let interpreter = Interpreter::new(&program, &catalog, Stream::Global);
-    // The lot the game holds before the load: empty, with the
-    // neighborhood's people, the type attributes the neighborhood saved
-    // and the two indicator objects.
-    let mut world = World::empty();
-    world.read_neighbors(
-        &neighborhood,
-        catalog
-            .objects
-            .iter()
-            .filter(|o| o.kind == 2)
-            .map(|o| o.guid),
-    )?;
-    world.type_attributes = program.type_attributes(&catalog)?;
-    if let Some(saved) = &neighborhood.type_attributes {
-        world.read_type_attributes(saved);
-    }
-    interpreter.create_indicators(&mut world)?;
-    // The load steps, in the original's order (docs/roadmap.md, load sequence). The
-    // boot stops at the first one not implemented yet.
-    world.read_simulator(&house.simulator);
-    // With the simulator state, the house file's model gives the house's
-    // usage counts (0x416568).
-    world.read_house_model(
-        house
-            .model
-            .as_ref()
-            .ok_or("the house file has no HOUS 1 chunk, which holds its model")?,
-    );
-    world.apply_context(context)?;
-    let created = interpreter.resize(&mut world)?.created;
-    world.clear_family()?;
-    let queued = world.removals.len();
-    let removed = interpreter.clear(&mut world)?;
-    // 6a and 6b: the lot arrays, then the saved floor and wall IDs.
-    let version = house
-        .version()
-        .ok_or("the house file has no HOUS 1 chunk, which holds its version")?;
-    world.read_arrays(&house.arrays, version)?;
-    let renumbered =
-        world.renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())?;
-    // 6c and 7: the type table, which marks the types whose scripts
-    // changed. The listing below says which and why.
-    if house.guid_table {
-        return Err("the house has a GUID translation table (Gtab), which is not ported".into());
-    }
-    let types = &house.types.entries;
-    let mut mismatches = Vec::new();
-    for entry in types {
-        let object = catalog
-            .object(entry.guid)
-            .ok_or_else(|| format!("type {} has no definition", entry.id))?;
-        if interpreter.type_changed(entry) == Some(true) {
-            let current = [Callback::Init, Callback::Main]
-                .map(|c| program.signature(object.resource, program.callback(object, c)));
-            mismatches.push(format!(
-                "  type {} {:?} (0x{:08X}): saved {:08x}/{:08x}, linked {:08x}/{:08x}",
-                entry.id,
-                entry.name,
-                entry.guid,
-                entry.init_signature,
-                entry.main_signature,
-                current[0],
-                current[1]
-            ));
-        }
-    }
-    let changed = interpreter.read_types(&mut world, &house.types)?;
-    if changed.len() != mismatches.len() {
-        return Err("the type table read and its listing disagree".into());
-    }
-    // 6d: the second clear, then 6e: the saved objects.
-    let cleared_again = interpreter.clear(&mut world)?;
-    let people = People::load(
-        &install,
-        &index,
-        &catalog,
-        house.objects.instances.values().map(|o| o.guid),
-    )?;
-    let read = interpreter.read_objects(&mut world, &house.objects, &people)?;
-    // 8: the lot-wide controllers, now among the saved objects. 9: the
-    // ground level's object grid.
-    let reconciled = interpreter.reconcile_controllers(&mut world)?;
-    let repaired = world.repair_grid()?;
-    world.finish_object_read();
-    let queued_again = world.removals.len();
-    // The original now works out the lot's rooms from the walls it has
-    // read. That makes it give every object its room and ask each object's
-    // function 7 (step 10), and then count the rooms, which sets the
-    // lot's indoor area (step 10a). The count changes every room's light,
-    // so the rooms are marked again. The end of the house read marks
-    // them all once more (signal 0xdd) and counts whatever waits.
-    world.rebuild_rooms()?;
-    let roomed = interpreter.assign_rooms(&mut world)?;
-    interpreter.update_rooms(&mut world, 0)?;
-    world.mark_all_rooms();
-    interpreter.update_pending_rooms(&mut world)?;
-    // 11: the removal queue is emptied. 12: the household that lives in
-    // the house is selected.
-    let dropped = world.discard_removals();
-    let number = neighborhood
-        .houses()?
-        .into_iter()
-        .find(|(_, path)| path.file_name() == options.house.file_name())
-        .map(|(number, _)| number)
-        .ok_or("the house file's name does not give a house number")?;
-    let (family, record) = neighborhood.family_in(number).ok_or(
-        "no family lives in the house; selecting none is not checked against the original",
-    )?;
-    world.select_family(
-        i16::try_from(family)?,
-        i16::try_from(number)?,
-        record.budget,
-        record.magic_history()?,
-    )?;
-    // 13: every object is visited in registration order. The step stops
-    // at the first visit that is not ported, with the lot as the visit
-    // before it left it.
-    let to_visit = world.order.len();
-    let visited = interpreter.visit_objects(&mut world, &people);
-    // 14: the indicators are created if no visit made them. 15: the end
-    // of the household selection, which has nothing to do on a lot whose
-    // people are all members of the household. 16: the loaded house is
-    // announced, which asks for the indicators once more and clears the
-    // selected Sim. 17 and 18: the funds are set again and the family's
-    // first member is selected. 19: the game goes to live mode. 20
-    // changes nothing here. 21 and 22: the waiting rooms are counted and
-    // the interface's wait check clears global 12.
-    let mut finished = None;
-    if visited.stopped.is_none() {
-        let made = interpreter.ensure_indicators(&mut world)?.is_some();
-        world.finish_selection(record.flags)?;
-        let made_again = interpreter.announce_house(&mut world)?.is_some();
-        let sim = interpreter.select_resident(&mut world, record.budget, &record.members)?;
-        interpreter.go_live(&mut world)?;
-        let counted = interpreter.before_frame(&mut world)?;
-        finished = Some((made || made_again, sim, counted.len()));
-    }
-    // The ticks: one lot update each (sims_vm's `tick.rs`), with the
-    // house view's frames between them.
-    let start = world.ticks;
+    let mut lot = Lot::load(
+        options.root,
+        options.house,
+        &options.answers,
+        options.frames.clone(),
+    )
+    .map_err(|error| -> Box<dyn Error> { error })?;
+    // The ticks: one lot update each, with the house view's frames
+    // between them.
     let mut ticked = Vec::new();
     let mut failed = None;
-    if options.ticks > 0 {
-        if finished.is_none() {
-            return Err("ticks were asked for, but the load did not complete".into());
-        }
-        let tuning = program.motive_tuning()?;
-        let mut player = Answers {
-            queue: options.answers.iter().copied().collect(),
-        };
-        if options.frames.after(0)
-            && let Err(error) = interpreter.draw_frame(&mut world, VIEW_LEVEL)
-        {
-            failed = Some(format!("the frame before tick 1 failed: {error}"));
-        }
-        for tick in 1..=options.ticks {
-            if failed.is_some() {
-                break;
-            }
-            match interpreter.lot_update(&mut world, &tuning, &mut player) {
-                Ok(update) => ticked.push(update),
-                Err(error) => {
-                    failed = Some(format!(
-                        "tick {tick}, the lot update that starts at tick count {}, failed: {error}",
-                        start.wrapping_add(tick - 1)
-                    ));
-                    break;
+    if options.ticks > 0 && lot.load_report().finished.is_none() {
+        return Err("ticks were asked for, but the load did not complete".into());
+    }
+    for _ in 0..options.ticks {
+        match lot.step() {
+            Ok(update) => ticked.push(update),
+            Err(error) => {
+                // A frame that fails after its tick still counts the tick.
+                if let StepError::Frame {
+                    update: Some(update),
+                    ..
+                } = &error
+                {
+                    ticked.push((**update).clone());
                 }
-            }
-            if options.frames.after(tick)
-                && let Err(error) = interpreter.draw_frame(&mut world, VIEW_LEVEL)
-            {
-                failed = Some(format!("the frame after tick {tick} failed: {error}"));
+                failed = Some(error.to_string());
+                break;
             }
         }
     }
     if let Some(path) = options.snapshot
         && failed.is_none()
     {
-        Snapshots::open(path)?.save("boot", &world)?;
+        Snapshots::open(path)?.save("boot", lot.world())?;
     }
-    let saved = &house.objects.instances;
-    let people = saved.values().filter(|o| o.person.is_some()).count();
+    let world = lot.world();
+    let load = lot.load_report();
     let mut out = String::new();
     let _ = writeln!(out, "House:   {}", options.house.display());
     let _ = writeln!(
         out,
-        "Saved:   {} objects ({people} people), tick {}",
-        saved.len(),
-        house.simulator.ticks
+        "Saved:   {} objects ({} people), tick {}",
+        load.saved_objects, load.saved_people, load.saved_ticks
     );
     let _ = writeln!(
         out,
         "Linked:  {} files; {} of {} object types match their saved signatures",
-        program.libraries.len(),
-        types.len() - mismatches.len(),
-        types.len()
+        load.libraries,
+        load.types - load.mismatches.len(),
+        load.types
     );
-    for line in &mismatches {
+    for line in &load.mismatches {
         let _ = writeln!(out, "{line}");
     }
     let _ = writeln!(
         out,
-        "Load:    lot resized to {} tiles, {} controllers created, {queued} queued for removal",
-        world.size,
-        created.len(),
+        "Load:    lot resized to {} tiles, {} controllers created, {} queued for removal",
+        world.size, load.created, load.queued,
     );
     let _ = writeln!(
         out,
-        "         lot cleared, {} objects removed; {} lot arrays read, {renumbered} floor \
+        "         lot cleared, {} objects removed; {} lot arrays read, {} floor \
          cells renumbered",
-        removed.len(),
-        world.arrays.len()
+        load.removed,
+        world.arrays.len(),
+        load.renumbered
     );
     let _ = writeln!(
         out,
         "         type table read, {} types changed; lot cleared again, {} objects removed",
-        changed.len(),
-        cleared_again.len()
+        load.changed, load.cleared_again
     );
     let _ = writeln!(
         out,
         "         {} saved objects read; their constructors drew {} C runtime random numbers",
-        read.objects.len(),
-        read.draws
+        load.read, load.draws
     );
     let _ = writeln!(
         out,
         "         {} controllers created among them, {} duplicates removed; {} IDs queued \
          for removal",
-        reconciled.created.len(),
-        reconciled.removed.len(),
-        queued_again
+        load.reconciled_created, load.reconciled_removed, load.queued_again
     );
     let _ = writeln!(
         out,
         "         ground object grid checked, {} cells cleared",
-        repaired.len()
+        load.repaired
     );
     let rooms = &world.rooms.rooms;
     let _ = writeln!(
@@ -385,28 +122,28 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
         rooms.len(),
         rooms.values().filter(|room| !room.outdoors).count(),
         world.rooms.halves.len(),
-        roomed.moved.len(),
-        roomed.asked.len()
+        load.moved,
+        load.asked
     );
     let _ = writeln!(
         out,
         "         rooms counted, indoor area {} tiles; {} queued removals dropped",
-        world.globals[27],
-        dropped.len()
+        world.globals[27], load.dropped
     );
     let _ = writeln!(
         out,
-        "         family {family} selected for house {number}, funds {}",
-        world.budget.funds
+        "         family {} selected for house {}, funds {}",
+        load.family, load.house, world.budget.funds
     );
     let _ = writeln!(
         out,
-        "         {} of {to_visit} objects visited, {} of them reset; {} IDs queued for removal",
-        visited.objects.len(),
-        visited.reset.len(),
+        "         {} of {} objects visited, {} of them reset; {} IDs queued for removal",
+        load.visited,
+        load.to_visit,
+        load.reset,
         world.removals.len()
     );
-    match &visited.stopped {
+    match &load.stopped {
         Some(fault) => {
             let _ = writeln!(
                 out,
@@ -414,7 +151,9 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
             );
         }
         None => {
-            let (made, sim, counted) = finished.unwrap_or((false, None, 0));
+            let (made, sim, counted) = load
+                .finished
+                .map_or((false, None, 0), |f| (f.indicators_made, f.sim, f.counted));
             let _ = writeln!(
                 out,
                 "         indicators {}; household selection finished; house announced",
@@ -476,26 +215,4 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     );
     let _ = writeln!(out, "Hash:    {}", world.hash_hex());
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Frames;
-
-    #[test]
-    fn a_frame_list_reads_ticks_and_repeats() {
-        let frames = Frames::parse("0,2,10+5").unwrap();
-        let drawn: Vec<u32> = (0..=21).filter(|&t| frames.after(t)).collect();
-        assert_eq!(drawn, [0, 2, 10, 15, 20]);
-        let every = Frames::parse("3+").unwrap();
-        let drawn: Vec<u32> = (0..=6).filter(|&t| every.after(t)).collect();
-        assert_eq!(drawn, [3, 4, 5, 6]);
-        assert_eq!(Frames::parse("none").unwrap().from, None);
-        assert_eq!(Frames::parse("4+0"), None);
-        assert_eq!(Frames::parse("x"), None);
-        let default = Frames::default();
-        let drawn: Vec<u32> = (0..=100).filter(|&t| default.after(t)).collect();
-        assert_eq!(drawn, [0, 1, 2, 3, 33, 63, 93]);
-        assert_eq!(Frames::parse("0,1,2,3,33+30"), Some(default));
-    }
 }
