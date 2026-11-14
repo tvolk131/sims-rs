@@ -38,6 +38,6 @@ fn main() {
         channels: 1,
         samples,
     };
-    std::fs::write(&out, pcm.to_wav()).expect("write the WAV file");
+    std::fs::write(&out, pcm.to_wav().expect("make the WAV file")).expect("write the WAV file");
     eprintln!("{out}: {} frames", pcm.frames());
 }

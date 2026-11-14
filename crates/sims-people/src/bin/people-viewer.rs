@@ -10,7 +10,11 @@
 //! With a snapshot (a `sims_sim::Snapshots` file, such as the one
 //! `sims boot --snapshot` writes, read under the name `boot`),
 //! each person the simulation has placed is drawn where it is, playing the
-//! clips its animator holds at that moment.
+//! clips its animator holds at that moment. The people come from the
+//! snapshot's own person objects, so people a script made after the load
+//! are drawn too (in their type's default outfit while their record names
+//! none). The house file then only names the neighborhood whose characters
+//! are registered.
 //!
 //! `--png` draws one 800 by 600 frame, `--at` milliseconds in, to a PNG
 //! file instead of opening a window.
@@ -28,7 +32,10 @@
 use sims_core::F32;
 use sims_people::math::Vec3;
 use sims_people::raster::{Camera, Canvas};
-use sims_people::{Assets, Body, Library, Player, Resident, base_clip, placement, residents};
+use sims_people::{
+    Assets, Body, Cast, Library, Player, Resident, base_clip, placement, residents, residents_of,
+    walk_clip,
+};
 use sims_sim::World;
 use sims_sim::animator::{Animator, Layer};
 use std::num::NonZeroU32;
@@ -102,16 +109,6 @@ fn run() -> Result<(), String> {
     let house = house.unwrap_or_else(|| install.join("UserData/Houses/House05.iff"));
     let assets: &'static Assets = Box::leak(Box::new(Assets::scan(&install)?));
     let library: &'static Library = Box::leak(Box::new(Library::scan(assets)?));
-    let mut people = Vec::new();
-    for resident in residents(&install, &house)? {
-        let body = Body::load(assets, &resident.skeleton, &resident.outfit)?;
-        let base = base_clip(&resident.person, &resident.skeleton);
-        people.push(Person {
-            resident,
-            body,
-            base,
-        });
-    }
     let world = match snapshot {
         Some(file) => Some(
             sims_sim::Snapshots::open(Path::new(&file))
@@ -121,6 +118,29 @@ fn run() -> Result<(), String> {
         ),
         None => None,
     };
+    // With a snapshot, the people it holds now, including those a script
+    // made after the load; otherwise the saved house's.
+    let found = match &world {
+        Some(world) => residents_of(&Cast::of_house(&install, &house)?, world)?,
+        None => residents(&install, &house)?,
+    };
+    let mut people = Vec::new();
+    for resident in found {
+        // One person whose files are missing does not stop the others.
+        let body = match Body::load(assets, &resident.skeleton, &resident.outfit) {
+            Ok(body) => body,
+            Err(e) => {
+                eprintln!("people-viewer: person {} is not drawn: {e}", resident.id);
+                continue;
+            }
+        };
+        let base = base_clip(&resident.person, &resident.skeleton);
+        people.push(Person {
+            resident,
+            body,
+            base,
+        });
+    }
     let mut viewer = Viewer {
         player: Player::new(assets, library),
         people,
@@ -178,7 +198,7 @@ impl Viewer {
                     // apart, in sixteenths of a tile.
                     let x = (i as f32 - (n - 1.0) / 2.0) * 16.0 / 1.5 / 2f32.sqrt();
                     let walk = if self.walking {
-                        let name = format!("{}-walking-loop", &person.base[..3]);
+                        let name = walk_clip(&person.resident.skeleton);
                         let clip = player.clip(&name)?;
                         Some((name, clip.animation.duration_ms, clip.animation.frames))
                     } else {

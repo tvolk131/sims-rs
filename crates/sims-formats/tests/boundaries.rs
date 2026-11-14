@@ -98,6 +98,9 @@ fn far_directory_rejects_bad_ranges_and_hostile_counts() {
     h.extend(1u32.to_le_bytes());
     h.extend(99u32.to_le_bytes());
     assert!(far::manifest_offset(&h, 100).is_err());
+    // The directory is the rest of the file, within the cap.
+    assert_eq!(far::directory_len(16, 116).unwrap(), 100);
+    assert!(far::directory_len(16, 16 + far::MAX_DIRECTORY + 1).is_err());
 }
 #[test]
 fn sprite_preserves_color_depth_and_transparent_tail() {
@@ -355,6 +358,7 @@ fn slot_versions_offsets_and_truncations() {
     }
 }
 
+<<<<<<< HEAD
 fn add_flagged(b: &mut Vec<u8>, tag: &[u8; 4], id: u16, flags: u16, data: &[u8]) -> u32 {
     let offset = b.len() as u32;
     b.extend(tag);
@@ -504,4 +508,21 @@ fn lookup_survives_a_resource_map_that_cannot_be_used() {
     assert!(iff.resource_order(b"STR#").is_err());
     assert_eq!(iff.data(iff.get(b"STR#", 1).unwrap()), b"live");
     assert_eq!(iff.all(b"STR#").count(), 1);
+=======
+#[test]
+fn far_members_must_lie_between_the_header_and_the_directory() {
+    let entry = |offset, stored_size| far::Entry {
+        name: "x".into(),
+        raw_name: b"x".to_vec(),
+        offset,
+        stored_size,
+        unpacked_size: stored_size,
+    };
+    assert!(entry(16, 10).within_payload(26));
+    // Over the header, as an archive that holds itself would be.
+    assert!(!entry(0, 26).within_payload(26));
+    // Into the directory.
+    assert!(!entry(16, 11).within_payload(26));
+    assert!(!entry(u32::MAX, u32::MAX).within_payload(u32::MAX));
+>>>>>>> origin/main
 }
