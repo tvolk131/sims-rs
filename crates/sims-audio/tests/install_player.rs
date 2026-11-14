@@ -206,10 +206,12 @@ fn every_event_definition_runs_without_a_bad_instruction() {
     // No instruction is decoded wrong and none reached is unported. What
     // remains are the files' loose ends (see `install_tables.rs`) and the
     // 190 events of other kinds (music modes, television, sequenced hit
-    // lists and more). The 121 events still running after 20 blocks loop
-    // (fires, appliances, voices that loop).
+    // lists and more). Of the 122 events still running after 20 blocks,
+    // 121 loop (fires, appliances, voices that loop) and one,
+    // `Grimreaper_loop_kill`, fades its own vol for 21 blocks: the loop
+    // track it targets is not running, so `target` is itself.
     assert_eq!(definitions.len(), 4494);
-    assert_eq!((still_running, format!("{unported:?}")), (121, "{}".into()));
+    assert_eq!((still_running, format!("{unported:?}")), (122, "{}".into()));
     assert_eq!(
         format!("{faults:?}"),
         "{\"event names no track\": 2, \"event of a kind other than play\": 190, \

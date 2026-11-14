@@ -35,6 +35,82 @@ new steps: `press X Y`, `expect-mode` and `expect-new-object`.
     A press on an empty spot of the panel once sold an object. Scenarios
     must start from a known panel state (a fresh boot).
 
+## 2026-11-14: Sound volume, pan, pitch and ducking, from the original's code
+
+The sound player now applies volume, pan, pitch and ducking. Each
+formula was read from the original's code in a memory image of the
+running game (read only, never written); none was observed with sound
+playing. The formulas are in `crates/sims-audio/src/levels.rs`. The
+player's output is now stereo: `render_stereo`, with `render` as its mono
+mix.
+
+- **Volume** is `vol * extvol / 1024`, with `extvol` scaled by the
+  track group's volume (the options' sliders, set by the host) and
+  halved when `main_duckpri` is above the track's `duckpri`. The sound
+  layer turns it into a DirectSound attenuation (0 dB at 1024, -40 dB
+  just above 0, silent at 0), which we turn into a linear gain. A track
+  starts with the HOT track's volume and duck priority.
+- **Pan** is DirectSound's: 512 is the centre, and only the far channel
+  is attenuated. No script in the install writes it.
+- **Pitch** sets an absolute rate, `22050 * 2^((pitch - 3600) / 1200)`,
+  whatever the sample's own rate. Every patch in the install is 22,050
+  Hz, and the TV routines set pitch 2400 for 11,025 Hz files, which this
+  plays at their own rate. Before, samples played at their own rate; a
+  sample that is not 22,050 Hz now plays at the rate its pitch sets. The
+  original adds a second track's pitch and subtracts 3600; which track
+  that is was not found, and it is taken as 3600 (**unverified**).
+- **Ducking.** `main_duckpri` (global 123) holds the largest request of
+  any running thread; a thread's request goes when it ends, as the
+  original's kill routine drops it.
+- **Every register write sets the comparison flags**, as the original's
+  write routine does. Branches after a write (such as
+  `getsrcdatafield r; ifne`) now follow the value written. Before, they
+  followed the last `cmp` or `test`.
+- **`target` (53)** sends a thread's register reads and writes to the
+  newest running thread of the track it names, globals included, and
+  on through that thread's own `target`. A track with no running thread
+  means the thread itself, as the original's null lookup does. The
+  install's scripts use it to fade out and kill music and loops. How the
+  original picks among several threads of one track, and what it does
+  when the target has since ended, are not known.
+- **Sequence groups hold track numbers, not thread IDs.** The ID the
+  original stores in a slot is the one `target` looks up, and scripts
+  pass track numbers to `target`. So two threads of one track no longer
+  end each other. This corrects the previous entry.
+- Levels are applied to notes once per block, after the threads run,
+  and when a thread ends. The original applies them as registers
+  change. 3D position, the
+  second pitch and track priorities are left out.
+- The exponentials use only basic arithmetic, so gains are the same on
+  every platform. A track at full volume, centred, passes its samples
+  through unchanged, so the phone ring and footstep still match their
+  samples bit for bit.
+
+Reopen when a run with sound can be compared, or the second pitch's
+track is found.
+
+## 2026-11-14: Directory listings are sorted, and paths are spelled as on disk
+
+From the back review of main:
+
+- **Listings.** `std::fs::read_dir` joins the clippy bans, since the
+  order it lists names in depends on the filesystem. The few listings
+  left sort what they read and say so beside an `allow`.
+- **Spelling.** `sims_content::install::resolve` now always returns the
+  spelling the directory listing gives, and a case-insensitive match
+  takes the first name in sorted order. Before, a case-insensitive
+  filesystem (macOS) returned the spelling asked for and a
+  case-sensitive one the spelling on disk. Paths reach state (a
+  skeleton's file), so the same install could hash differently on two
+  machines. The people crate's lookup takes the first match in sorted
+  order too.
+- **Other bans.** The bans also cover `asinh`, `acosh` and `atanh` for
+  `f32` and `f64`, and `Instant::elapsed` and `SystemTime::elapsed`.
+- **Not banned: environment reads.** No library crate reads the
+  environment. Only tests (the `SIMS_INSTALL` gate) and tool entry
+  points do, and the install path enters as data. Reopen if a library
+  crate needs one.
+
 ## 2026-11-14: Which catalog wins when two hold the same name
 
 The original's code settles this for appearances and clips. Before
