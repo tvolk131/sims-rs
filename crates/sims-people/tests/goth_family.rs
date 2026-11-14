@@ -219,3 +219,37 @@ fn a_person_made_after_the_load_is_drawn_from_its_type() {
     // A type that is not a person is refused, not drawn.
     assert!(cast.residents([(1, 0, &person)]).is_err());
 }
+
+#[test]
+fn an_appearance_in_two_catalogs_comes_from_the_first_folder_searched() {
+    let Some(root) = install() else { return };
+    let assets = Assets::scan(&root).unwrap();
+    // `b200mafit_ctb` is in GameData/Skins as text and in Deluxe's archive
+    // as binary, bound differently. The original searches GameData/Skins
+    // first and keeps the first it loads.
+    let text = assets.sources("b200mafit_ctb.cmx");
+    let binary = assets.sources("b200mafit_ctb.cmx.bcf");
+    assert_eq!(text.len(), 1);
+    assert_eq!(binary.len(), 1);
+    assert_eq!(assets.folder(&text[0]), "gamedata/skins");
+    assert_eq!(assets.folder(&binary[0]), "deluxe/skins");
+    let read = |bytes: Vec<u8>, binary: bool| {
+        let catalog = if binary {
+            sims_formats::avatar::read_bcf(&bytes).unwrap()
+        } else {
+            sims_formats::avatar::read_cmx(&bytes).unwrap()
+        };
+        catalog
+            .appearances
+            .into_iter()
+            .find(|a| a.name.eq_ignore_ascii_case("b200mafit_ctb"))
+            .unwrap()
+    };
+    let from_text = read(text[0].read().unwrap(), false);
+    let from_binary = read(binary[0].read().unwrap(), true);
+    // Bindings have no equality of their own; their printed forms do.
+    let bindings = |a: &sims_formats::avatar::Appearance| format!("{:?}", a.bindings);
+    assert_ne!(bindings(&from_text), bindings(&from_binary));
+    let chosen = load_appearance(&assets, "B200MAFit_CTB").unwrap();
+    assert_eq!(bindings(&chosen), bindings(&from_text));
+}
