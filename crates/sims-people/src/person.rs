@@ -89,14 +89,25 @@ pub fn placement(animator: &Animator) -> Option<Transform> {
 pub fn base_clip(person: &Person, skeleton: &str) -> String {
     let saved = person.animations[2].split(';').next().unwrap_or("").trim();
     if saved.is_empty() {
-        let age = if skeleton.eq_ignore_ascii_case("child") {
-            "c2o"
-        } else {
-            "a2o"
-        };
-        format!("{age}-standing-loop")
+        format!("{}-standing-loop", age_prefix(skeleton))
     } else {
         saved.to_owned()
+    }
+}
+
+/// The walking loop of the skeleton's age: `c2o-walking-loop` for a
+/// child, `a2o-walking-loop` otherwise.
+pub fn walk_clip(skeleton: &str) -> String {
+    format!("{}-walking-loop", age_prefix(skeleton))
+}
+
+/// The prefix clip names give an age: `c2o` for a child's skeleton,
+/// `a2o` for any other.
+fn age_prefix(skeleton: &str) -> &'static str {
+    if skeleton.eq_ignore_ascii_case("child") {
+        "c2o"
+    } else {
+        "a2o"
     }
 }
 
@@ -168,6 +179,40 @@ mod tests {
     use super::*;
     use sims_core::F32;
 
+    /// A person record with nothing in it.
+    fn blank_person() -> Person {
+        let idle = sims_formats::saved_objects::Interaction {
+            uid: 0,
+            caller: 0,
+            target: 0,
+            icon: 0,
+            table_index: -1,
+            args: [0; 4],
+            priority: 0,
+            action: 0,
+            attenuation: 0.0,
+            flags: 0,
+        };
+        Person {
+            animation_events: 0,
+            engaged: 0,
+            appearance: Default::default(),
+            accessories: Vec::new(),
+            animations: Default::default(),
+            routing_state: 0,
+            floats: [0.0; 9],
+            previous_motives: [0.0; 16],
+            motives: [0.0; 16],
+            data: Vec::new(),
+            routing_frames: 0,
+            active: idle.clone(),
+            last: idle,
+            queue: Vec::new(),
+            object_uses: Vec::new(),
+            motive_deltas: Vec::new(),
+        }
+    }
+
     fn close(a: [f32; 2], b: [f32; 2]) -> bool {
         (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6
     }
@@ -182,6 +227,19 @@ mod tests {
         let h = 0.5f32.sqrt();
         assert_eq!(heading(3.0), [h, -h]);
         assert_eq!(heading(-2.0), [-1.0, 0.0]);
+    }
+
+    #[test]
+    fn clips_follow_the_skeletons_age() {
+        assert_eq!(walk_clip("adult"), "a2o-walking-loop");
+        assert_eq!(walk_clip("Child"), "c2o-walking-loop");
+        // Any other name, however short, is taken as an adult's.
+        assert_eq!(walk_clip(""), "a2o-walking-loop");
+        assert_eq!(walk_clip("a"), "a2o-walking-loop");
+        let mut person = blank_person();
+        assert_eq!(base_clip(&person, "child"), "c2o-standing-loop");
+        person.animations[2] = "a;-10;1000".into();
+        assert_eq!(base_clip(&person, "adult"), "a");
     }
 
     #[test]
