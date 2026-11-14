@@ -1485,6 +1485,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sims-viewer"
+version = "0.1.0"
+dependencies = [
+ "sims-render",
+ "sims-sim",
+ "softbuffer",
+ "winit",
+]
+
+[[package]]
 name = "sims-vm"
 version = "0.1.0"
 dependencies = [
