@@ -263,3 +263,219 @@ fn unknown_events_and_bad_code_are_faults_not_panics() {
     assert!(player.is_idle());
     player.handle(&SoundEvent::StopAll);
 }
+
+const LOADB_V1: u8 = 4;
+const PLAY_TRK: u8 = 50;
+
+#[test]
+fn a_track_that_restarts_itself_runs_once_per_block() {
+    // Track 10: v1 = 10; play_trk v1; end. Each run starts its own
+    // replacement, which first runs in the next block, so `render`
+    // returns and one thread is left at a time.
+    let respawn: &[u8] = &[LOADB_V1, 5, 10, PLAY_TRK, 5, END];
+    let mut player = Player::new(vec![module(&[respawn], 0)], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(1, &NoSources), [0]);
+    assert_eq!(player.render(20 * BLOCK, &NoSources).len(), 20 * BLOCK);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    assert!(!player.is_idle());
+    player.handle(&SoundEvent::StopAll);
+    assert!(player.is_idle());
+}
+
+#[test]
+fn threads_that_multiply_stop_at_the_thread_limit() {
+    // Each run starts two copies of itself: 1, 2, 4, ... threads.
+    let fork: &[u8] = &[LOADB_V1, 5, 10, PLAY_TRK, 5, PLAY_TRK, 5, END];
+    let mut player = Player::new(vec![module(&[fork], 0)], samples(), 1);
+    play(&mut player, "e0");
+    player.render(40 * BLOCK, &NoSources);
+    assert!(
+        player
+            .faults
+            .iter()
+            .all(|f| f.contains("more than 256 threads")),
+        "{:?}",
+        player.faults
+    );
+    assert!(!player.faults.is_empty());
+    assert!(player.faults.len() <= sims_audio::player::FAULTS);
+}
+
+#[test]
+fn all_threads_share_one_instruction_budget_per_block() {
+    // Twelve threads that jump to themselves forever. Ten use up the
+    // block's 100,000 instructions and end as stuck; the other two wait
+    // for the next block, where they end the same way.
+    let spin: &[u8] = &[13, 0, 1, 0, 0]; // jump 0x100: itself
+    let mut player = Player::new(vec![module(&[spin], 0)], samples(), 1);
+    for _ in 0..12 {
+        play(&mut player, "e0");
+    }
+    player.render(1, &NoSources);
+    assert_eq!(player.faults.len(), 11, "{:?}", player.faults);
+    assert!(player.faults[10].contains("100000 instructions in one block"));
+    assert!(!player.is_idle());
+    player.render(BLOCK, &NoSources);
+    let stuck = player.faults.iter().filter(|f| f.contains("ran too long"));
+    assert_eq!(stuck.count(), 12);
+    assert!(player.is_idle());
+}
+
+#[test]
+fn interpolating_between_full_scale_samples_does_not_overflow() {
+    let mut map = samples();
+    map.insert(
+        "one.xa".into(),
+        Pcm {
+            rate: 16_000,
+            channels: 1,
+            samples: vec![i16::MIN, i16::MAX],
+        },
+    );
+    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
+    let mut player = Player::new(vec![module(&[generic], 1)], map, 1);
+    play(&mut player, "e0");
+    // Frame 1 is 16000/22050 of the way from -32768 to 32767.
+    let step = (16_000u64 << 16) / u64::from(RATE);
+    let expected = (-32768 + ((65_535 * step as i64) >> 16)) as i16;
+    assert_eq!(player.render(2, &NoSources), [i16::MIN, expected]);
+}
+
+#[test]
+fn unported_instructions_are_faults() {
+    // test1 to test4 take no operand; seqgroup_wait takes one register,
+    // the group instructions three. A seqgroup instruction whose register
+    // is 0 is an error, as in the original.
+    let cases: [(&[u8], &str); 8] = [
+        (&[58], "test1 is not supported"),
+        (&[59], "test2 is not supported"),
+        (&[60], "test3 is not supported"),
+        (&[61], "test4 is not supported"),
+        (&[70, 5], "seqgroup_wait is not supported"),
+        (&[29, 5, 6, 7], "add_to_group is not supported"),
+        (&[30, 5, 6, 7], "remove_from_group is not supported"),
+        (&[SEQGROUP_KILL, 0], "seqgroup_kill: bad register"),
+    ];
+    for (code, message) in cases {
+        let mut routine = code.to_vec();
+        routine.extend([NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, END]);
+        let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+        play(&mut player, "e0");
+        let out = player.render(4, &NoSources);
+        assert_eq!(player.faults.len(), 1, "{message}: {:?}", player.faults);
+        assert!(player.faults[0].contains(message), "{:?}", player.faults);
+        // The thread ended before its note.
+        assert_eq!(out, [0; 4]);
+        assert!(player.is_idle());
+    }
+}
+
+const SEQGROUP_KILL: u8 = 69;
+const SEQGROUP_RETURN: u8 = 71;
+const SEQGROUP_TRKID: u8 = 73;
+const WAITEQ: u8 = 77;
+const TEST: u8 = 14;
+const IFEQ: u8 = 62;
+/// `loadb r, value`.
+fn loadb(register: u8, value: u8) -> [u8; 3] {
+    [LOADB_V1, register, value]
+}
+
+#[test]
+fn seqgroup_return_ends_its_thread_when_another_holds_the_group() {
+    // Claim group 1 (register 5 holds it), then play patch 1.
+    let mut routine = loadb(5, 1).to_vec();
+    routine.extend([SEQGROUP_RETURN, 5, 2, 6, WAIT_SAMP, END]);
+    let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+    play(&mut player, "e0");
+    play(&mut player, "e0");
+    let out = player.render_until_idle(10 * BLOCK, &NoSources);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    // The second thread found the first holding the group and ended:
+    // the sample plays once, not twice as loud.
+    assert_eq!(&out[..100], &(1..=100).collect::<Vec<i16>>());
+    // The slot keeps the second thread's ID after it ended, so a third
+    // thread ends too, until StopAll clears the slots.
+    play(&mut player, "e0");
+    let out = player.render_until_idle(10 * BLOCK, &NoSources);
+    assert!(out.iter().all(|&s| s == 0));
+    player.handle(&SoundEvent::StopAll);
+    play(&mut player, "e0");
+    let out = player.render_until_idle(10 * BLOCK, &NoSources);
+    // From the next block.
+    assert_eq!(&out[BLOCK..BLOCK + 100], &(1..=100).collect::<Vec<i16>>());
+}
+
+#[test]
+fn seqgroup_kill_stops_a_holder_whose_extvol_is_0_at_once() {
+    // e0 sets its extvol (19) to 0, claims group 1 and plays patch 1.
+    let mut holder = loadb(19, 0).to_vec();
+    holder.extend(loadb(5, 1));
+    holder.extend([SEQGROUP_RETURN, 5, 2, 6, WAIT_SAMP, END]);
+    // e1 takes group 1, then plays only if the group has a holder (which
+    // it should: itself), using patch 2.
+    let mut killer = loadb(5, 1).to_vec();
+    killer.extend([SEQGROUP_KILL, 5, SEQGROUP_TRKID, 5, 9, TEST, 9, IFEQ]);
+    killer.extend(long(0x102));
+    killer.extend(loadb(50, 2));
+    killer.extend([2, 6, WAIT_SAMP, END]);
+    let done: &[u8] = &[END];
+    let mut player = Player::new(vec![module(&[&holder, &killer, done], 1)], samples(), 1);
+    play(&mut player, "e0");
+    let mut out = player.render(32, &NoSources);
+    play(&mut player, "e1");
+    out.extend(player.render_until_idle(10 * BLOCK, &NoSources));
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    // Patch 1 until the next block, when e1 stops it; then patch 2.
+    assert_eq!(&out[..BLOCK], &(1..=BLOCK as i16).collect::<Vec<i16>>());
+    assert_eq!(&out[BLOCK..BLOCK + 2], [2000, 3000]);
+    assert!(player.is_idle());
+}
+
+#[test]
+fn seqgroup_kill_fades_out_the_holder_then_runs_on() {
+    // e0 claims group 1, waits until its extvol (19) reaches fade_dest
+    // (1, register 8 here), then plays patch 1.
+    let mut holder = loadb(5, 1).to_vec();
+    holder.extend([SEQGROUP_RETURN, 5]);
+    holder.extend(loadb(8, 1));
+    holder.extend([WAITEQ, 19, 8, 2, 6, WAIT_SAMP, END]);
+    // e1 takes group 1 and plays patch 2.
+    let mut killer = loadb(5, 1).to_vec();
+    killer.extend([SEQGROUP_KILL, 5]);
+    killer.extend(loadb(50, 2));
+    killer.extend([2, 6, WAIT_SAMP, END]);
+    let mut player = Player::new(vec![module(&[&holder, &killer], 1)], samples(), 1);
+    play(&mut player, "e0");
+    play(&mut player, "e1");
+    let out = player.render_until_idle(20 * BLOCK, &NoSources);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    // e1 waits 2 ms, so it plays from the second block. e0's extvol falls
+    // by 200 a block from 1024, reaching 1 in the seventh block.
+    assert!(out[..BLOCK].iter().all(|&s| s == 0));
+    assert_eq!(&out[BLOCK..BLOCK + 2], [2000, 3000]);
+    assert!(out[BLOCK + 6..6 * BLOCK].iter().all(|&s| s == 0));
+    assert_eq!(
+        &out[6 * BLOCK..6 * BLOCK + 100],
+        &(1..=100).collect::<Vec<i16>>()
+    );
+    assert!(player.is_idle());
+}
+
+#[test]
+fn the_first_module_defining_an_event_wins_and_play_from_picks_one() {
+    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
+    let first = module(&[generic], 1);
+    let second = module(&[generic], 2);
+    let mut player = Player::new(vec![first, second], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    player.handle(&SoundEvent::StopAll);
+    player.play_from(1, 9, "e0");
+    player.render(BLOCK - 3, &NoSources);
+    assert_eq!(player.render(3, &NoSources), [2000, 3000, 4000]);
+    player.handle(&SoundEvent::StopAll);
+    player.play_from(2, 9, "e0");
+    assert_eq!(player.faults, ["no event e0"]);
+}

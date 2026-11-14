@@ -355,3 +355,15 @@ fn sound_files_mount_archives_in_their_directory() {
     assert!(files.problems.is_empty());
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+#[test]
+fn xa_checks_the_claimed_size_against_the_payload_before_allocating() {
+    // A bare header claiming 0xfffffffc bytes holds no samples; it fails
+    // without reserving memory for the claim.
+    let error = xa::decode(&xa_file(1, 22050, 0xffff_fffc, &[])).unwrap_err();
+    assert!(error.to_string().contains("at most 0 of"), "{error}");
+    // Stereo: one whole frame (30 bytes) holds 56 samples.
+    assert!(xa::decode(&xa_file(2, 22050, 56 * 2, &[0; 30])).is_ok());
+    let error = xa::decode(&xa_file(2, 22050, 58 * 2, &[0; 30])).unwrap_err();
+    assert!(error.to_string().contains("at most 56 of 58"), "{error}");
+}

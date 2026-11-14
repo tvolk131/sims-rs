@@ -1304,8 +1304,10 @@ stop-sounds events.
   in a gated test. The phone ring and a footstep trace to their samples.
 - **Done: the HIT VM.** `Player` takes `SoundEvent`s and renders PCM.
   The phone ring and a soft footstep render their samples bit for bit,
-  and every event in the install runs without a bad instruction. The
-  `render_event` example writes events to a WAV file.
+  and every event definition in the install (4,494, module by module)
+  runs without a bad or unported instruction. Sequence groups and fades
+  follow the original's code. Scripts cannot hang or exhaust the player.
+  The `render_event` example writes events to a WAV file.
 - **Next:**
   - The simulation emits `SoundEvent`s (the interface is in the
     decisions log).
