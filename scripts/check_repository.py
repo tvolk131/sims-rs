@@ -245,8 +245,8 @@ def history_entries(root, revision):
             if name and name[0]:
                 names[object_id].add(name[0])
     raw = git(
-        root, "log", "--format=", "--raw", "-z", "-m", "--no-renames", "--no-abbrev",
-        "--diff-filter=ACMRT", commit, "--",
+        root, "log", "--format=", "--raw", "-z", "--root", "--diff-merges=separate",
+        "--no-renames", "--no-abbrev", "--diff-filter=ACMRT", commit, "--",
     )
     paths = set()
     tokens = iter(raw.split(b"\0"))
@@ -255,9 +255,11 @@ def history_entries(root, revision):
         if not token.startswith(b":"):
             continue
         fields = token[1:].split()
+        if token.startswith(b"::") or len(fields) != 5:
+            raise ValueError("unexpected git log --raw record")
         path = os.fsdecode(next(tokens))
         paths.add(path)
-        if len(fields) >= 4 and fields[1] != b"160000":
+        if fields[1] != b"160000":
             object_id = fields[3].decode()
             if object_id in sizes:
                 names[object_id].add(path)

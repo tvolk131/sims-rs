@@ -233,7 +233,8 @@ class RepositoryHygieneTests(unittest.TestCase):
         self.assert_fails("z-unreviewed.json: JSON data requires", "--staged")
 
     def test_history_checks_paths_added_only_by_a_merge(self):
-        self.write("base.txt", "base")
+        content = b'{"only": "aliased in the merge"}'
+        self.write("base.txt", content)
         self.git("add", ".")
         base = self.snapshot()
         self.write("left.txt", "left")
@@ -244,13 +245,24 @@ class RepositoryHygieneTests(unittest.TestCase):
         self.git("add", "right.txt")
         right = self.snapshot(base)
         self.write("left.txt", "left")
-        self.write("merged.json", b'{"only": "in the merge"}')
+        self.write("merged.json", content)
         self.git("add", ".")
         tree = self.git("write-tree").decode().strip()
         merge = self.git(
             "commit-tree", tree, "-p", left, "-p", right, "-m", "merge"
         ).decode().strip()
-        self.assert_fails("merged.json: JSON data requires", "--history", merge)
+        for setting in ("separate", "combined", "off"):
+            self.git("config", "log.diffMerges", setting)
+            self.assert_fails("merged.json: JSON data requires", "--history", merge)
+
+    def test_history_checks_every_path_of_a_root_commit(self):
+        content = b'{"root": "alias"}'
+        self.write("a.txt", content)
+        self.write("z.json", content)
+        self.git("add", ".")
+        root = self.snapshot()
+        self.git("config", "log.showRoot", "false")
+        self.assert_fails("z.json: JSON data requires", "--history", root)
 
     def test_reference_corpus_and_research_cannot_be_forced_into_source_tree(self):
         for name in [
