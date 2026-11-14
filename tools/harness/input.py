@@ -25,6 +25,12 @@ A scenario is a text file, one step per line, words split as in a shell,
                                fail unless the pie menu pushed an action on
                                PERSON (aimed at object TARGET) within N updates
   shot NAME                    save the game window as <capture>/input-shots/NAME.png
+  press X Y                    press a button of the game's panels (the buy-mode
+                               button, a catalog entry): rest, move over it, press
+  expect-mode live|buy|N [within N]
+                               fail unless the lot's mode word becomes N
+  expect-new-object [within N] fail unless an object appears in the registry
+                               (logs it and the budget's change)
 
 Each step starts at a lot-update return, after the previous step ended. A
 step that fails is logged, and the scenario stops there; the capture goes
@@ -57,6 +63,10 @@ Ghidra on the decrypted image and checked in the running game):
   in sixteenths of a tile; a = (+0xf8) / 16, b = (+0xf4) / 16.
   **Unverified:** rotation. The formula was checked only in the house's
   starting view; aiming always confirms through the picker.
+- The lot (the lot update's ecx at entry, ebx at return): +0x36 the mode
+  (0 live, 2 buy), +0x90 the budget, signed, +0xb0 the registry, whose
+  +0x18..+0x1c are the object slots. In buy mode the lot update still runs
+  (without advancing time), so the runner goes on there.
 - 0x48ddcb is the call in the pie menu's select handler (0x48dd67) that
   pushes the chosen action onto the person's queue (0x45d20b): edi (= ecx)
   is the person, esi the action. capture.py stops there to record it.
@@ -79,7 +89,12 @@ WINDOW = '0xe00013'
 STEPS = {
     'until': (1, 1), 'wait': (1, 1), 'move': (2, 2), 'click': (2, 2), 'answer-dialog': (2, 2),
     'key': (1, 1), 'click-object': (1, 1), 'choose': (1, 1), 'expect-queued': (1, 4), 'shot': (1, 1),
+    'press': (2, 2), 'expect-mode': (1, 3), 'expect-new-object': (0, 2),
 }
+# The lot's mode word (sim +0x36), as read in the running game: 0 in live
+# mode, 2 after the buy-mode button. Build mode's number is not checked yet;
+# expect-mode takes a number too.
+MODES = {'live': 0, 'buy': 2}
 
 
 class ScenarioError(ValueError):
@@ -108,7 +123,7 @@ def parse_scenario(text):
         try:
             if op in ('until', 'wait', 'click-object'):
                 step['args'] = [int(args[0])]
-            elif op in ('move', 'click', 'answer-dialog'):
+            elif op in ('move', 'click', 'answer-dialog', 'press'):
                 step['args'] = [int(args[0]), int(args[1])]
             elif op == 'expect-queued':
                 person, target, within = int(args[0]), None, 100
@@ -120,6 +135,17 @@ def parse_scenario(text):
                         raise ScenarioError(f'line {n}: expect-queued PERSON [TARGET] [within N]')
                     within = int(rest[1])
                 step['args'] = [person, target, within]
+            elif op in ('expect-mode', 'expect-new-object'):
+                rest, args_out = list(args), []
+                if op == 'expect-mode':
+                    name = rest.pop(0)
+                    args_out.append(MODES[name] if name in MODES else int(name))
+                within = 200
+                if rest:
+                    if len(rest) != 2 or rest[0] != 'within':
+                        raise ScenarioError(f'line {n}: {op} ... [within N]')
+                    within = int(rest[1])
+                step['args'] = args_out + [within]
             else:
                 step['args'] = [args[0]]
         except ValueError as e:
@@ -263,6 +289,34 @@ def find_object(m, sim, oid):
     return 0
 
 
+def object_slots(m, sim):
+    """The object pointers in the lot's registry: one read of its slot
+    vector, cheap enough for every update return."""
+    reg = m.word(sim + 0xb0)
+    first, end = m.word(reg + 0x18), m.word(reg + 0x1c)
+    if not (first <= end and end - first <= 131072 and (end - first) % 4 == 0):
+        raise MemoryError(f'registry slots {first:#x}..{end:#x}')
+    return {p for p in m.words(first, (end - first) // 4) if p}
+
+
+def placed_object(m, p):
+    """What a replay needs to place object p: its ID, its type, its position
+    and level, its definition (0xa6 bytes) and its 72 data words, read as
+    capture.py's full state reads them, so a replay can decode them the same
+    way. Which bytes hold the GUID and the facing is not checked here."""
+    definition = m.word(p + 0x118)
+    return dict(id=m.object_id(p), pointer=p, type=m.half(definition + 0x12), position=object_position(m, p),
+                level=m.byte(p + 0xfe), definition=m.read(definition, 0xa6).hex(), data=m.words(p + 0x4a, 72, 2))
+
+
+def read_mode(m, sim):
+    return m.half(sim + 0x36)
+
+
+def read_budget(m, sim):
+    return signed(m.word(sim + 0x90))
+
+
 def object_position(m, p):
     return [signed(v) for v in m.words(p + 0xf4, 2)]
 
@@ -335,12 +389,8 @@ class Agent:
             return False
         source = Path(__file__).parent / 'guest' / 'input-agent.sh'
         (self.share / 'input-agent.sh').write_text(source.read_text())
-        cmd = self.share / 'cmd'
-        cmd.mkdir(exist_ok=True)
-        n = max([int(p.stem) for p in cmd.glob('*.sh') if p.stem.isdigit()] + [0]) + 1
-        tmp = cmd / f'{n:05d}.tmp'
-        tmp.write_text('sh /research/input-agent.sh\n')
-        tmp.rename(cmd / f'{n:05d}.sh')
+        from guest import submit  # reserves the job number (other processes hand the guest jobs too)
+        submit(self.share, 'sh /research/input-agent.sh\n')
         return True
 
     def alive(self, seconds=5):
@@ -436,6 +486,10 @@ class Runner:
                `update` N means before lot update N (`in_update` false) or
                inside it (true). This is the record to replay: give the
                action to the person before update N.
+      mode     expect-mode saw the mode.
+      placed   expect-new-object's new objects (ID, pointer, type, position,
+               level, the definition's 0xa6 bytes and the 72 data words)
+               with the budget before and after and the cost.
       taken    expect-queued found the pushed action on the person: `where`
                is queue or active (the queue had already started it), with
                the person's active action and queue at that update return.
@@ -463,6 +517,10 @@ class Runner:
         self.update = 0
         self.m = None
         self.sim = None
+        # (object pointers, budget), for expect-new-object: the registry at the
+        # scenario's first update return or the last expect-new-object, less
+        # the objects removed since (so a pointer or ID used again is new).
+        self.known = None
 
     def close(self):
         if not self.finished:
@@ -526,6 +584,11 @@ class Runner:
         if self.finished:
             return
         try:
+            slots = object_slots(m, sim)
+            if self.known is None:
+                self.known = (slots, read_budget(m, sim))
+            else:
+                self.known = (self.known[0] & slots, self.known[1])
             self.tick(at_update=True)
         except Exception as e:  # a scenario must never end the capture
             self.fail(f'{type(e).__name__}: {e}')
@@ -671,6 +734,39 @@ class Runner:
         results = self.count('dialog_result')
         yield Job('press', dialog_press_command(x, y, self.agent.window), wait=False, x=x, y=y)
         yield Event('dialog_result', results)
+
+    def step_press(self, x, y):
+        """A press on a button of the game's panels (as on a dialog's)."""
+        yield Job('press', dialog_press_command(x, y, self.agent.window), x=x, y=y)
+
+    def step_expect_mode(self, mode, within):
+        yield Fresh()
+        start = self.update
+        while read_mode(self.m, self.sim) != mode:
+            if self.update - start >= within:
+                raise StepFailed(f'mode is {read_mode(self.m, self.sim)}, not {mode}, after {within} updates')
+            yield Updates(1)
+        self.write(kind='mode', mode=mode)
+
+    def step_expect_new_object(self, within):
+        """Wait for objects that were not in the registry at the scenario's
+        first update return (or the last expect-new-object), and log them
+        with the budget then and now."""
+        yield Fresh()
+        start = self.update
+        while True:
+            known, budget = self.known
+            slots = object_slots(self.m, self.sim)
+            new = slots - known
+            if new:
+                rows = sorted((placed_object(self.m, p) for p in new), key=lambda o: o['id'])
+                now = read_budget(self.m, self.sim)
+                self.write(kind='placed', objects=rows, budget_before=budget, budget=now, cost=budget - now)
+                self.known = (slots, now)
+                return
+            if self.update - start >= within:
+                raise StepFailed(f'no new object within {within} updates')
+            yield Updates(1)
 
     def step_key(self, keysym):
         yield Job('key', key_command(keysym), key=keysym)

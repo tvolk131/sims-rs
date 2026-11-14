@@ -178,10 +178,21 @@ impl Census {
     }
 
     /// Walks a file or directory in sorted order, so reports are stable.
+    /// Fails when the path does not exist or is neither a file nor a
+    /// directory.
     pub fn add_path(&mut self, path: &Path) -> std::io::Result<()> {
+        let kind = std::fs::metadata(path)?.file_type();
+        if !kind.is_dir() && !kind.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a file or directory",
+            ));
+        }
         self.walk(path, path)
     }
 
+    /// Inside a directory, entries that are neither files nor directories,
+    /// such as broken links, are skipped.
     fn walk(&mut self, root: &Path, path: &Path) -> std::io::Result<()> {
         if path.is_dir() {
             // Sorted below.
@@ -599,6 +610,31 @@ mod tests {
         let report = census("self", &bytes);
         assert!(report.contains("overlaps the archive header"), "{report}");
         assert!(report.contains("visited: 1\n"), "{report}");
+    }
+
+    #[test]
+    fn a_path_that_does_not_exist_fails() {
+        let path = std::env::temp_dir().join(format!(
+            "sims-census-missing-{}/nothing",
+            std::process::id()
+        ));
+        let error = Census::default().add_path(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_link_inside_a_directory_is_skipped() {
+        let directory =
+            std::env::temp_dir().join(format!("sims-census-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::os::unix::fs::symlink(directory.join("gone"), directory.join("link")).unwrap();
+        let mut census = Census::default();
+        census.add_path(&directory).unwrap();
+        assert!(census.add_path(&directory.join("link")).is_err());
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(census.report().contains("visited: 0\n"));
     }
 
     #[test]

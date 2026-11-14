@@ -29,9 +29,13 @@
 //! [`Interpreter::announce_house`], [`Interpreter::select_resident`],
 //! [`Interpreter::go_live`] and [`Interpreter::before_frame`]
 //! (`selection.rs`), which leave the lot as the first tick finds it.
+//!
+//! [`boot::Lot`] runs all of that for a house file, then one tick at a
+//! time: what `sims boot` prints and what presentation crates watch.
 
 mod animator;
 mod autonomy;
+pub mod boot;
 mod clip_events;
 mod error;
 mod factory;
