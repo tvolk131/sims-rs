@@ -2,7 +2,9 @@
 //! `sims-formats` reader and tally what fails and what has no reader yet.
 //!
 //! This answers "does the formats crate handle real content?" with data, for
-//! the original install, expansion packs and custom content alike.
+//! the original install, expansion packs and custom content alike. It also
+//! counts the primitives the decoded trees use, by pack, so the VM's
+//! coverage can be weighed against what the content needs.
 
 use sims_formats::{
     animation, avatar, behavior, career, execution, far, ffn, iff, lot, neighborhood, sprite,
@@ -43,6 +45,30 @@ pub struct Census {
     unread_tags: BTreeMap<String, u64>,
     /// Other file extensions seen but not decoded, with counts.
     unread_files: BTreeMap<String, u64>,
+    /// Decoded trees (BHAV chunks) per pack.
+    trees: BTreeMap<String, u64>,
+    /// Primitive instructions (opcodes below 256; the rest call trees)
+    /// by opcode, then pack.
+    primitives: BTreeMap<u16, BTreeMap<String, u64>>,
+}
+
+/// The pack a resource belongs to, from its path: the first component
+/// naming an expansion pack (`ExpansionPack`, `ExpansionPack2`, ...) or
+/// user data (`UserData`, `UserData2`, ...), else "Base".
+fn pack(location: &str) -> String {
+    Path::new(location)
+        .components()
+        .find_map(|c| {
+            let name = c.as_os_str().to_string_lossy();
+            if name.starts_with("ExpansionPack") {
+                Some(name.into_owned())
+            } else if name.starts_with("UserData") {
+                Some("UserData".to_owned())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "Base".to_owned())
 }
 
 fn pattern(message: &str) -> String {
@@ -297,10 +323,61 @@ impl Census {
         for chunk in &file.chunks {
             let name = tag_name(&chunk.tag);
             let at = format!("{location} {name} #{} {:?}", chunk.id, chunk.label);
+            if &chunk.tag == b"BHAV" {
+                let outcome = behavior::Behavior::parse(file.data(chunk));
+                if let Ok(tree) = &outcome {
+                    self.count_primitives(location, tree);
+                }
+                self.record("BHAV chunk", &at, outcome.map(drop));
+                continue;
+            }
             match decode(&file, chunk) {
                 Some(outcome) => self.record(&format!("{name} chunk"), &at, outcome),
                 None => *self.unread_tags.entry(name).or_default() += 1,
             }
+        }
+    }
+
+    fn count_primitives(&mut self, location: &str, tree: &behavior::Behavior) {
+        let pack = pack(location);
+        *self.trees.entry(pack.clone()).or_default() += 1;
+        for instruction in tree.instructions.iter().filter(|i| i.opcode < 256) {
+            *self
+                .primitives
+                .entry(instruction.opcode)
+                .or_default()
+                .entry(pack.clone())
+                .or_default() += 1;
+        }
+    }
+
+    /// The primitives table: one row per opcode used, one column per pack.
+    fn primitives_report(&self, out: &mut String) {
+        let packs: Vec<&String> = self.trees.keys().collect();
+        let _ = writeln!(out, "\nPrimitives used by decoded trees, by pack:");
+        let _ = write!(out, "  {:<4} {:<36} {:>9}", "op", "name", "total");
+        for pack in &packs {
+            let _ = write!(out, " {:>15}", pack);
+        }
+        let _ = write!(
+            out,
+            "\n  {:<4} {:<36} {:>9}",
+            "",
+            "trees",
+            self.trees.values().sum::<u64>()
+        );
+        for pack in &packs {
+            let _ = write!(out, " {:>15}", self.trees[*pack]);
+        }
+        let _ = writeln!(out);
+        for (opcode, by_pack) in &self.primitives {
+            let name = sims_vm::primitive_name(*opcode);
+            let total: u64 = by_pack.values().sum();
+            let _ = write!(out, "  {opcode:<4} {name:<36} {total:>9}");
+            for pack in &packs {
+                let _ = write!(out, " {:>15}", by_pack.get(*pack).copied().unwrap_or(0));
+            }
+            let _ = writeln!(out);
         }
     }
 
@@ -331,6 +408,7 @@ impl Census {
         for (ext, count) in unread {
             let _ = writeln!(out, "  {ext:<8} {count}");
         }
+        self.primitives_report(&mut out);
         out
     }
 }
@@ -340,7 +418,8 @@ impl Census {
 fn decode(file: &iff::Iff, chunk: &iff::Chunk) -> Option<Outcome> {
     let data = file.data(chunk);
     let outcome = match &chunk.tag {
-        b"BHAV" => behavior::Behavior::parse(data).map(drop),
+        // BHAV chunks are decoded by `Census::iff`, which also counts
+        // their primitives.
         b"OBJD" => behavior::ObjectDefinition::parse(data).map(drop),
         b"TTAB" => behavior::InteractionTable::parse(data).map(drop),
         b"STR#" | b"CTSS" | b"TTAs" | b"FAMs" => strings::StringTable::parse(data).map(drop),
@@ -411,6 +490,65 @@ mod tests {
         census.add_path(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         census.report()
+    }
+
+    /// An IFF file holding one BHAV per entry, each with the given
+    /// instruction opcodes.
+    fn trees(trees: &[&[u16]]) -> Vec<u8> {
+        let mut bytes = vec![0; 64];
+        bytes[..13].copy_from_slice(b"IFF FILE 2.5:");
+        for (id, opcodes) in trees.iter().enumerate() {
+            let mut data = 0x8002u16.to_le_bytes().to_vec();
+            data.extend((opcodes.len() as u16).to_le_bytes());
+            data.extend([0; 8]);
+            for &opcode in *opcodes {
+                data.extend(opcode.to_le_bytes());
+                data.extend([254, 255]);
+                data.extend([0; 8]);
+            }
+            bytes.extend(b"BHAV");
+            bytes.extend((76 + data.len() as u32).to_be_bytes());
+            bytes.extend((id as u16).to_be_bytes());
+            bytes.extend([0; 66]);
+            bytes.extend(data);
+        }
+        bytes
+    }
+
+    #[test]
+    fn primitives_are_counted_by_pack_and_tree_calls_are_not() {
+        let dir = std::env::temp_dir().join(format!("sims-census-prims-{}", std::process::id()));
+        let expansion = dir.join("ExpansionPack3");
+        std::fs::create_dir_all(&expansion).unwrap();
+        std::fs::write(dir.join("base.iff"), trees(&[&[2, 2, 0x100], &[44]])).unwrap();
+        std::fs::write(expansion.join("hot.iff"), trees(&[&[2, 0x1000]])).unwrap();
+        let mut census = Census::default();
+        census.add_path(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let report = census.report();
+        let table = &report[report.find("Primitives used").expect("table")..];
+        let row = |op: &str| {
+            table
+                .lines()
+                .find(|l| l.split_whitespace().next() == Some(op))
+                .unwrap_or_else(|| panic!("no row {op} in {table}"))
+                .split_whitespace()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(row("trees")[1..], ["3", "2", "1"], "{table}");
+        let expression = row("2");
+        assert_eq!(
+            expression[expression.len() - 3..],
+            ["3", "2", "1"],
+            "{table}"
+        );
+        let animate = row("44");
+        assert_eq!(animate[animate.len() - 3..], ["1", "1", "0"], "{table}");
+        assert!(
+            !table.lines().any(|l| l.trim_start().starts_with("256 ")),
+            "{table}"
+        );
+        assert!(report.contains("BHAV chunk"), "{report}");
     }
 
     #[test]
