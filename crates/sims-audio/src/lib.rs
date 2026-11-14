@@ -19,6 +19,8 @@
 //! - [`fsc`]: ambient sound scores.
 //! - [`levels`]: volume, pan and pitch, from registers to gains and a
 //!   playback rate.
+//! - [`stations`]: the radio, television and music hit lists the
+//!   original builds from directories.
 //! - [`player`]: the HIT virtual machine and a mixer. It takes
 //!   [`SoundEvent`]s, the simulation's only link to sound, and renders
 //!   PCM.
@@ -36,6 +38,7 @@ pub mod module;
 pub mod mp3;
 mod pcm;
 pub mod player;
+pub mod stations;
 pub mod wav;
 pub mod xa;
 

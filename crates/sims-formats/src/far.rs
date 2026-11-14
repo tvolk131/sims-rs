@@ -54,6 +54,14 @@ impl Entry {
             && u64::from(self.offset) + u64::from(self.stored_size) <= u64::from(manifest_offset)
     }
 }
+/// A file name as the original sees it, in the Windows-1252 code page that
+/// archive member names are in, or None when the name has a character that
+/// code page lacks. On Windows the game gets disk names in the system code
+/// page; for a Western install that is this one.
+pub fn encode_name(name: &str) -> Option<Vec<u8>> {
+    let (bytes, _, unmappable) = encoding_rs::WINDOWS_1252.encode(name);
+    (!unmappable).then(|| bytes.into_owned())
+}
 pub fn directory(data: &[u8], file_len: u64) -> Result<Vec<Entry>> {
     let mut r = Reader::new(data);
     let n = r.u32()? as usize;
