@@ -1,29 +1,14 @@
-//! What the original needs, besides a house file, to construct the people
-//! a house's saved objects include: their neighborhood records and their
-//! skeletons.
+//! What the original needs, besides a house file and the neighborhood's
+//! records, to construct the people a house's saved objects include: their
+//! skeletons and the profiles their resets read.
 
 use crate::index::{far_members, sorted_entries};
 use crate::install::resolve;
-use crate::{Catalog, Error, Index, Install, Neighborhood, Resource, Result};
+use crate::{Catalog, Error, Index, Install, Resource, Result};
 use sims_formats::avatar::read_bcf;
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
 use std::collections::BTreeMap;
-
-/// A person's record in the neighborhood file, as far as constructing the
-/// person reads it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Record {
-    /// The neighbor ID.
-    pub id: i16,
-    /// The GUID of the person's type.
-    pub guid: u32,
-    /// The revision of the record's person data. Below 1 the record holds
-    /// none.
-    pub revision: i32,
-    /// The record's person data: 80 or 256 words, or none.
-    pub data: Vec<i16>,
-}
 
 /// The skeleton a type of person is built on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,11 +39,9 @@ pub struct Profile {
     pub tones: Vec<String>,
 }
 
-/// The neighborhood records and skeletons of a set of person types.
+/// The skeletons and profiles of a set of person types.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct People {
-    /// The neighborhood's records, in the file's slot order.
-    pub records: Vec<Record>,
     /// Each person type's skeleton, by the type's GUID.
     pub skeletons: BTreeMap<u32, Skeleton>,
     /// Each person type's profile, by the type's GUID.
@@ -79,9 +62,8 @@ const SKIN: usize = 14;
 const SKIN_TONES: u16 = 8192;
 
 impl People {
-    /// Finds the skeleton of each person type in `guids`, and lists the
-    /// neighborhood's records. A GUID that is not a person type (OBJD type
-    /// 2) is skipped.
+    /// Finds the skeleton and profile of each person type in `guids`. A
+    /// GUID that is not a person type (OBJD type 2) is skipped.
     ///
     /// A skeleton is looked up by name among the skeleton files (`.bcf`
     /// members with at least one skeleton) of the archives in
@@ -95,19 +77,8 @@ impl People {
         install: &Install,
         index: &Index,
         catalog: &Catalog,
-        neighborhood: &Neighborhood,
         guids: impl IntoIterator<Item = u32>,
     ) -> Result<Self> {
-        let records = neighborhood
-            .neighbors
-            .iter()
-            .map(|n| Record {
-                id: n.id,
-                guid: n.guid,
-                revision: n.person_mode,
-                data: n.person_data.clone(),
-            })
-            .collect();
         let mut names = BTreeMap::new();
         let mut profiles = BTreeMap::new();
         for guid in guids {
@@ -179,7 +150,6 @@ impl People {
             }
         }
         Ok(Self {
-            records,
             skeletons,
             profiles,
         })

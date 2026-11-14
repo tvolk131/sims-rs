@@ -21,6 +21,6 @@ pub use error::Error;
 pub use index::{Index, Member, Resource};
 pub use install::{Expansions, Install, Layout, Mount};
 pub use neighborhood::{House, Neighborhood};
-pub use people::{People, Profile, Record, Skeleton};
+pub use people::{People, Profile, Skeleton};
 
 pub type Result<T> = std::result::Result<T, Error>;

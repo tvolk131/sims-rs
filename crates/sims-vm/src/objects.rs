@@ -37,6 +37,7 @@ use crate::interpreter::Interpreter;
 use sims_content::{People, Skeleton};
 use sims_core::CrtRng;
 use sims_formats::saved_objects::{Instance, Objects, Slot};
+use sims_sim::neighbors::Neighbors;
 use sims_sim::{Object, World};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -196,7 +197,7 @@ impl Interpreter<'_> {
                 continue;
             };
             let object = self
-                .construct_saved(instance, people, &mut draws, &mut files)
+                .construct_saved(instance, people, &world.neighbors, &mut draws, &mut files)
                 .map_err(|trap| fail(id, trap))?;
             if objects.insert(id, object).is_some() {
                 return Err(fail(id, Trap::Invalid("a saved ID is listed twice".into())));
@@ -226,6 +227,7 @@ impl Interpreter<'_> {
         &self,
         saved: &Instance,
         people: &People,
+        neighbors: &Neighbors,
         draws: &mut Draws<'_>,
         files: &mut BTreeSet<String>,
     ) -> Result<Object, Trap> {
@@ -268,7 +270,7 @@ impl Interpreter<'_> {
             .containers(definition.resource, definition.chunk);
         let slots = 1 + containers + if person { PERSON_SLOTS } else { 0 };
         if person {
-            construct_person(saved.guid, people, draws, files)?;
+            construct_person(saved.guid, people, neighbors, draws, files)?;
         }
         // The read (the object's function at vtable offset 0x7c).
         if saved.attributes.len() > attributes {
@@ -327,6 +329,7 @@ impl Interpreter<'_> {
 fn construct_person(
     guid: u32,
     people: &People,
+    neighbors: &Neighbors,
     draws: &mut Draws<'_>,
     files: &mut BTreeSet<String>,
 ) -> Result<(), Trap> {
@@ -350,16 +353,12 @@ fn construct_person(
     // The person's own copy (0x598da3).
     draws.skeleton(own);
     // The first record of the person's type, in slot order.
-    let record = people
-        .records
-        .iter()
-        .find(|record| record.guid == guid)
-        .ok_or_else(|| {
-            Trap::Unsupported(format!(
-                "the person type 0x{guid:08X} has no neighborhood record; making one during \
-                 a load is not ported"
-            ))
-        })?;
+    let record = neighbors.first_of(guid).ok_or_else(|| {
+        Trap::Unsupported(format!(
+            "the person type 0x{guid:08X} has no neighborhood record; making one during a \
+             load is not ported"
+        ))
+    })?;
     // A record with person data gives the new person its interests (the
     // table at 0x423827 lists them from revision 1). Without, they stay 0.
     let mut defaults = true;

@@ -772,6 +772,13 @@ impl<'a> Machine<'a, '_> {
                     // A return counts as the thread's last result too
                     // (legacy lib.rs:1714).
                     self.me_mut()?.last_result = value;
+                    // The original writes every branch target, a return
+                    // too, into the frame's node word before it acts on it
+                    // (0x474cea, 0x474d1b), so a popped frame leaves 0xfe or
+                    // 0xff there in the frame storage. The capture of the
+                    // Goth house's second tick shows it: a person's new
+                    // frame finds 254 in a local that lands on such a word.
+                    self.frame_mut()?.node = u16::from(target);
                     self.pop_frame()?;
                     let stack = &self.me()?.stack;
                     if stack.len() <= base {

@@ -3,7 +3,8 @@ use crate::install::resolve;
 use crate::{Catalog, Error, Result};
 use sims_formats::iff::Iff;
 use sims_formats::lot::{self, Array, HouseView, ObjectTypes, Simulator, SurfaceMapping};
-use sims_formats::neighborhood::{Family, Neighbor, Neighbors};
+use sims_formats::neighborhood::Neighborhood as Header;
+use sims_formats::neighborhood::{Family, Inventory, Neighbor, Neighbors};
 use sims_formats::saved_objects::Objects;
 use sims_formats::strings::StringTable;
 use sims_formats::tatt::Tatt;
@@ -20,8 +21,14 @@ pub struct Neighborhood {
     /// The saved type attributes (TATT #1), when the file has them.
     pub type_attributes: Option<Tatt>,
     /// The records of the neighborhood's people (NBRS), in the file's slot
-    /// order, empty slots left out.
-    pub neighbors: Vec<Neighbor>,
+    /// order, with its empty slots: the original keeps the empty slots in
+    /// its record vector (0x42feb2), and a script names a record by its
+    /// place.
+    pub neighbors: Vec<Option<Neighbor>>,
+    /// The neighbors' inventories (the NGBH chunk's, read by 0x4254f6), in
+    /// the file's order, with its empty slots. Empty when the file has no
+    /// NGBH chunk or an older one without inventories.
+    pub inventories: Vec<Option<Inventory>>,
 }
 
 impl Neighborhood {
@@ -48,13 +55,24 @@ impl Neighborhood {
         for chunk in iff.all(b"NBRS") {
             let parsed = Neighbors::parse(iff.data(chunk))
                 .map_err(|e| Error::format(&format!("{} NBRS #{}", path.display(), chunk.id), e))?;
-            neighbors.extend(parsed.entries.into_iter().flatten());
+            neighbors.extend(parsed.entries);
         }
+        let inventories = match iff.all(b"NGBH").next() {
+            Some(chunk) => {
+                Header::parse(iff.data(chunk))
+                    .map_err(|e| {
+                        Error::format(&format!("{} NGBH #{}", path.display(), chunk.id), e)
+                    })?
+                    .inventories
+            }
+            None => Vec::new(),
+        };
         Ok(Self {
             directory: directory.to_path_buf(),
             families,
             type_attributes,
             neighbors,
+            inventories,
         })
     }
 

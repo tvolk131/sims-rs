@@ -38,8 +38,20 @@
 //!   +1 in the second, -1, -1), starting after the tile the cursor stands
 //!   on. No such object is the false branch.
 //!
-//! The others fail loudly: 5 and 7 need the neighborhood's person
-//! directory and 11 the neighborhood's lot order.
+//! - 5: the next of the neighborhood's records
+//!   ([`sims_sim::neighbors::Neighbors::next`], 0x425b15): the ID of the
+//!   first occupied slot after the cursor's. A cursor that is negative or
+//!   not below the number of slots gives 0. The destination takes the
+//!   next ID, zero included, and the branch is whether it is nonzero
+//!   (0x44ece2).
+//! - 7: the same walk, until a record of the person type the GUID names
+//!   (0x44ed07). Each ID the walk reaches is stored as it goes; the
+//!   original compares the GUID of the definition the record is linked to
+//!   (0x4572af on record +8), which is the definition of the record's
+//!   own GUID. A record whose GUID has no definition fails: what the
+//!   original's comparison does without a link was not seen.
+//!
+//! Mode 11 fails loudly: it needs the neighborhood's lot order.
 //!
 //! [`World::order`]: sims_sim::World::order
 
@@ -82,7 +94,11 @@ impl Machine<'_, '_> {
                     None => return Ok(false),
                 }
             }
-            5 | 7 => return Err(missing(mode, "the neighborhood's person directory")),
+            5 => Some(self.world.neighbors.next(current)),
+            7 => {
+                let guid = u32::from_le_bytes([operands[0], operands[1], operands[2], operands[3]]);
+                return self.next_neighbor_of(guid, destination, current);
+            }
             8 => match self.next_on_tile(current)? {
                 Some(next) => Some(next),
                 None => return Ok(false),
@@ -121,6 +137,38 @@ impl Machine<'_, '_> {
         };
         self.store(destination, next)?;
         Ok(next != 0)
+    }
+
+    /// Mode 7: walks the neighborhood's records from `current`, storing
+    /// each ID it reaches, until one of the person type `guid` (true) or
+    /// the end (false, with zero stored).
+    fn next_neighbor_of(
+        &mut self,
+        guid: u32,
+        destination: crate::memory::Cell,
+        mut current: i16,
+    ) -> Result<bool, Trap> {
+        loop {
+            let next = self.world.neighbors.next(current);
+            self.store(destination, next)?;
+            if next == 0 {
+                return Ok(false);
+            }
+            if let Some(record) = self.world.neighbors.get(next) {
+                if self.catalog.object(record.guid).is_none() {
+                    return Err(Trap::Unsupported(format!(
+                        "Set To Next mode 7: neighbor {next} has the GUID 0x{:08X}, which no \
+                         definition has; the original compares the GUID of the definition the \
+                         record is linked to",
+                        record.guid
+                    )));
+                }
+                if record.guid == guid {
+                    return Ok(true);
+                }
+            }
+            current = next;
+        }
     }
 
     /// Mode 4: the instance after `current` in the GUID's list, or the

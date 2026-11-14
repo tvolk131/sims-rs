@@ -4,9 +4,12 @@
 
 mod create;
 pub(crate) mod dialog;
+mod distance;
 mod events;
 mod expression;
 mod generic;
+mod idle;
+mod inventory;
 mod named_tree;
 mod notify;
 mod object_type;
@@ -100,6 +103,8 @@ impl Machine<'_, '_> {
             7 => self.refresh(operands)?.into(),
             8 => self.random(operands)?.into(),
             10 => self.own_events(operands)?.into(),
+            11 => self.get_distance_to(operands)?.into(),
+            17 => self.idle_for_input(operands)?,
             18 => self.remove(operands)?,
             23 => self.play_sound(operands)?.into(),
             24 => self.old_relationship(operands)?.into(),
@@ -110,6 +115,7 @@ impl Machine<'_, '_> {
             32 => self.test_object_type(operands)?.into(),
             36 => self.dialog(operands)?,
             49 => self.notify()?.into(),
+            51 => self.manage_inventory(operands)?.into(),
             opcode => return Err(Trap::Unimplemented { opcode }),
         })
     }

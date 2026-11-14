@@ -185,7 +185,7 @@ impl Interpreter<'_> {
         let person = object.person.is_some();
         let mut position = object.position;
         if person {
-            self.attach_neighbor(world, id, people).map_err(fail)?;
+            self.attach_neighbor(world, id).map_err(fail)?;
         }
         if position[2] == 0 {
             position[2] = 1;

@@ -1,3 +1,4 @@
+use crate::neighbors::Neighbors;
 use crate::rooms::Rooms;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -96,6 +97,8 @@ pub struct World {
     /// save holds. A person with no entry has the values its constructor
     /// gives (0x459327); see [`PersonTick`].
     pub person_ticks: BTreeMap<u16, PersonTick>,
+    /// The neighborhood's people. See [`Neighbors`].
+    pub neighbors: Neighbors,
 }
 
 /// The registry's list of dialogs (registry words 0x64 to 0x68), and the
@@ -288,6 +291,7 @@ impl World {
             frame_storage: BTreeMap::new(),
             dialogs: Dialogs::default(),
             person_ticks: BTreeMap::new(),
+            neighbors: Neighbors::default(),
         }
     }
 

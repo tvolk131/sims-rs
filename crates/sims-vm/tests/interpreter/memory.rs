@@ -410,7 +410,7 @@ fn the_room_in_temp_0() {
 
 #[test]
 fn unsupported_scopes_name_themselves() {
-    for scope in [12, 24, 28, 29, 32, 33, 34, 38] {
+    for scope in [12, 24, 28, 29, 33, 34, 38] {
         let mut fx = Fixture::new();
         let fault = read(&mut fx, scope, 0).unwrap_err();
         assert_eq!(fault.trap, Trap::UnsupportedScope { scope });

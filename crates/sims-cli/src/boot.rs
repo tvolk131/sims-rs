@@ -42,9 +42,18 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     let mut program = Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid))?;
     program.zoning = neighborhood.zoning(context.expansions)?;
     let interpreter = Interpreter::new(&program, &catalog, Stream::Global);
-    // The lot the game holds before the load: empty, with the type
-    // attributes the neighborhood saved and the two indicator objects.
+    // The lot the game holds before the load: empty, with the
+    // neighborhood's people, the type attributes the neighborhood saved
+    // and the two indicator objects.
     let mut world = World::empty();
+    world.read_neighbors(
+        &neighborhood,
+        catalog
+            .objects
+            .iter()
+            .filter(|o| o.kind == 2)
+            .map(|o| o.guid),
+    )?;
     world.type_attributes = program.type_attributes(&catalog)?;
     if let Some(saved) = &neighborhood.type_attributes {
         world.read_type_attributes(saved);
@@ -101,7 +110,6 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
         &install,
         &index,
         &catalog,
-        &neighborhood,
         house.objects.instances.values().map(|o| o.guid),
     )?;
     let read = interpreter.read_objects(&mut world, &house.objects, &people)?;
