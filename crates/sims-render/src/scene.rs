@@ -94,6 +94,13 @@ fn segments(x: i32, y: i32) -> [Segment; 4] {
     ]
 }
 
+/// A fine position just beside a wall segment's middle, on its normal's
+/// side (side 0) or the other (side 1).
+fn wall_side(s: &Segment, side: usize) -> [i32; 2] {
+    let sign = if side == 0 { 2 } else { -2 };
+    [0, 1].map(|i| (s.from[i] + s.to[i]) * 8 + sign * s.normal[i])
+}
+
 struct Painter<'a> {
     world: &'a World,
     lot: &'a Lot,
@@ -368,9 +375,9 @@ impl Painter<'_> {
                     };
                     let elevation = base + self.corner_elevation(s.from);
                     // The side that shows takes the light of the room on
-                    // that side.
-                    let near = tiles[front];
-                    let light = self.light(index, [near[0] * 16 + 8, near[1] * 16 + 8]);
+                    // that side: sampled just beside the wall's middle, so
+                    // a split tile gives the triangle touching the wall.
+                    let light = self.light(index, wall_side(&s, front));
                     let camera = self.camera;
                     self.canvas.draw_lit(&image, at, false, light, |sx, sy, _| {
                         let row = match frame {
@@ -716,6 +723,20 @@ mod tests {
             origin: [0, 0],
             walls: Walls::Up,
         }
+    }
+
+    #[test]
+    fn a_wall_takes_light_from_the_triangle_touching_it() {
+        // Sample points land inside the tile, in the triangle that holds
+        // the wall's side (1 SW, 2 SE, 3 NE, 4 NW; see `Lot::room_at`).
+        let [west, north, descending, ascending] = segments(3, 5);
+        assert_eq!(wall_side(&west, 0), [50, 88]);
+        assert_eq!(wall_side(&west, 1), [46, 88]);
+        assert_eq!(wall_side(&north, 0), [56, 82]);
+        assert_eq!(wall_side(&descending, 0), [58, 90]);
+        assert_eq!(wall_side(&descending, 1), [54, 86]);
+        assert_eq!(wall_side(&ascending, 0), [58, 86]);
+        assert_eq!(wall_side(&ascending, 1), [54, 90]);
     }
 
     #[test]

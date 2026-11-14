@@ -18,9 +18,10 @@ the original draws them.
   room shows at half brightness. Outdoor rooms the light pass never
   counted are drawn at full light.
 - **Where it is read.** A floor half takes the light of the room under
-  it; a split tile's two triangles each take their own room's. Walls use
-  the room of the tile in front of them. An object uses the room at its
-  position. Terrain uses floor 0's room at the tile centre.
+  it; a split tile's two triangles each take their own room's. A wall
+  takes the room just beside its middle on the side that shows, so a
+  split tile gives the triangle touching the wall. An object uses the
+  room at its position. Terrain uses floor 0's room at the tile centre.
 - **How it darkens a pixel: fitted, not read from code.** The original
   draws in 16-bit color. Dividing its pixels by ours in the Goth house
   gave a sharp peak at 0.517 indoors and 1.0 outdoors. The booted
@@ -44,8 +45,8 @@ the original draws them.
   probably from the falloff tables in `lightMap.dat`; they are not
   modelled.
 - **Unverified.** Every light level other than the 0.5 clamp and full
-  light. Night outdoors. Whether walls take the front tile's room or
-  something else. Lamp pools. Any of these would reopen the formula.
+  light. Night outdoors. Whether the original lights a wall by the room
+  on its visible side. Lamp pools. Any of these would reopen the formula.
 
 ## 2026-11-14: Hidden objects, sprite world offsets and soft edges in the lot drawing
 

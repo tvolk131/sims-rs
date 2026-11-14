@@ -298,11 +298,14 @@ impl Lot {
 /// times 255, plus a half, truncated, keeping the low byte (0x46772d, the
 /// old prototype's `light_byte` in
 /// `legacy/crates/sims-sim/src/lot_environment/lighting.rs`). A light
-/// that is not a number gives 0.
+/// that is not a number, or too large for a 64-bit integer, gives 0, the
+/// low byte of the x87's "integer indefinite" result.
 pub fn light_byte(light: f32) -> u8 {
-    let value = f64::from(light) * 255.0 + 0.5;
-    if value.is_finite() {
-        (value.trunc() as i64) as u8
+    let value = (f64::from(light) * 255.0 + 0.5).trunc();
+    // 2^63: the first value a 64-bit integer cannot hold.
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    if value.is_finite() && (-LIMIT..LIMIT).contains(&value) {
+        (value as i64) as u8
     } else {
         0
     }
@@ -393,6 +396,10 @@ mod tests {
         assert_eq!(light_byte(0.5), 128);
         assert_eq!(light_byte(0.127_118_65), 32);
         assert_eq!(light_byte(f32::NAN), 0);
+        // Out of range wraps to the low byte, or gives 0 past 64 bits.
+        assert_eq!(light_byte(2.0), 254);
+        assert_eq!(light_byte(f32::MAX), 0);
+        assert_eq!(light_byte(f32::MIN), 0);
     }
 
     #[test]
