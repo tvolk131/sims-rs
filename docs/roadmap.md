@@ -68,6 +68,26 @@ Each step is a few PRs, and each PR leaves `main` green.
   stops where object 382 asks for a new person with Create New Object
   Instance (mode 8), which is not ported, and the boot says so and at
   which tick.
+- Step 4 is in progress. `tools/harness/` runs the original under Wine
+  in a QEMU guest and stops it at every lot update. It saves the state
+  at the entry of the first tick and after each lot update: every
+  update to 100, then every tenth. A run on the Goth house recorded
+  1000 lot updates (tick counts 88445 to 89444), with the game reading
+  the install's own UserData. Its
+  dialogs were answered as in the first capture: OK to the five notices
+  in tick 1, and No to the Help System in tick 2. Compared with that
+  run, our state at the entry of tick 1 and after each of ticks 1 to 5
+  matches in everything compared, three lines aside:
+  - Registry byte 0x12 is already 1 when the original's load ends. Ours
+    sets it in tick 2. This accounts for two of the three lines.
+  - After tick 1, global 12 is 17 in the original. It is the interface's
+    wait check, which we do not run.
+  - **Unverified:** that global 12 comes from the open dialog.
+  With the install's UserData, the C runtime's random stream and all
+  463 neighborhood records match as well. The 52-draw offset and the
+  five differing records came from the first capture's guest files. The
+  original first draws from the C runtime's stream in tick 6, 1,466
+  times.
 
 ### Load sequence
 
