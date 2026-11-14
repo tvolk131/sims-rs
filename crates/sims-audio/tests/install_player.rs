@@ -158,34 +158,40 @@ impl Samples for Stub {
 }
 
 #[test]
-fn every_event_runs_without_a_bad_instruction() {
+fn every_event_definition_runs_without_a_bad_instruction() {
     let Some(root) = install() else { return };
     let files = SoundFiles::scan(&root).unwrap();
     let modules = Module::load_all(&files).unwrap();
-    let names: Vec<String> = modules
+    // Every definition, module by module: a name several modules define
+    // is run once per module, not only as the module that wins.
+    let definitions: Vec<(usize, String)> = modules
         .iter()
-        .flat_map(|m| m.hot.events.iter().map(|(n, _)| n.clone()))
+        .enumerate()
+        .flat_map(|(index, m)| m.hot.events.iter().map(move |(n, _)| (index, n.clone())))
         .collect();
     let mut player = Player::new(modules, Stub, 1);
     let mut faults: BTreeMap<String, usize> = BTreeMap::new();
+    let mut unported: BTreeMap<String, usize> = BTreeMap::new();
     let mut still_running = 0;
-    for name in &names {
+    for (module, name) in &definitions {
         player.handle(&SoundEvent::StopAll);
         player.faults.clear();
-        player.handle(&SoundEvent::Play {
-            object: 1,
-            name: name.clone(),
-        });
+        player.play_from(*module, 1, name);
         player.render(20 * BLOCK, &NoSources);
         if !player.is_idle() {
             still_running += 1;
         }
         for fault in &player.faults {
+            if let Some(at) = fault.find(" is not supported") {
+                let instruction = fault[..at].rsplit(' ').next().unwrap();
+                *unported.entry(instruction.to_owned()).or_default() += 1;
+            }
             let kind = [
                 (
                     "is not one this player plays",
                     "event of a kind other than play",
                 ),
+                ("is not supported", "instruction not ported"),
                 ("entry point not found", "track entry point not found"),
                 ("no track", "event names no track"),
                 ("no hit list", "hit list not found"),
@@ -197,17 +203,48 @@ fn every_event_runs_without_a_bad_instruction() {
             *faults.entry(kind.to_owned()).or_default() += 1;
         }
     }
-    // No instruction fails. What remains are the files' loose ends (see
-    // `install_tables.rs`) and the 190 events of other kinds (music mode,
-    // television, sequenced hit lists and more), which this player does
-    // not handle yet. The 121 events still running after 20 blocks loop.
-    assert_eq!(names.len(), 4494);
-    assert_eq!(still_running, 121);
+    // No instruction is decoded wrong and none reached is unported. What
+    // remains are the files' loose ends (see `install_tables.rs`) and the
+    // 190 events of other kinds (music modes, television, sequenced hit
+    // lists and more). The 121 events still running after 20 blocks loop
+    // (fires, appliances, voices that loop).
+    assert_eq!(definitions.len(), 4494);
+    assert_eq!((still_running, format!("{unported:?}")), (121, "{}".into()));
     assert_eq!(
         format!("{faults:?}"),
-        concat!(
-            r#"{"event names no track": 2, "event of a kind other than play": 190, "#,
-            r#""hit list not found": 1, "patch not found": 1, "track entry point not found": 10}"#
-        )
+        "{\"event names no track\": 2, \"event of a kind other than play\": 190, \
+         \"hit list not found\": 1, \"patch not found\": 3, \"track entry point not found\": 10}"
     );
+}
+
+#[test]
+fn the_first_module_defining_an_event_name_wins() {
+    let Some(root) = install() else { return };
+    let files = SoundFiles::scan(&root).unwrap();
+    let modules = Module::load_all(&files).unwrap();
+    // Names (ignoring case) defined by more than one module, and how many
+    // of the shadowed definitions differ from the one that wins.
+    let mut first: BTreeMap<String, (usize, &sims_audio::hot::Event)> = BTreeMap::new();
+    let mut shadowed = Vec::new();
+    let mut differ = 0;
+    for (index, module) in modules.iter().enumerate() {
+        for (name, event) in &module.hot.events {
+            let key = name.to_ascii_lowercase();
+            match first.get(&key) {
+                Some(&(winner, wins)) => {
+                    shadowed.push(format!(
+                        "{key}: {} over {}",
+                        modules[winner].name, module.name
+                    ));
+                    if wins != event {
+                        differ += 1;
+                    }
+                }
+                None => {
+                    first.insert(key, (index, event));
+                }
+            }
+        }
+    }
+    assert_eq!((shadowed.len(), differ), (13, 5), "{shadowed:#?}");
 }

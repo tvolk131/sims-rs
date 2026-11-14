@@ -82,14 +82,14 @@ impl Score {
         let (Ok(rows), Ok(columns)) = (usize::try_from(rows), usize::try_from(columns)) else {
             return fail(3, "negative size");
         };
-        if rows * columns > 65_536 {
+        let Some(count) = rows.checked_mul(columns).filter(|&n| n <= 65_536) else {
             return fail(3, "score too large");
-        }
+        };
         if !lines.get(3).is_some_and(|l| l.starts_with('#')) {
             return fail(4, "no cell header row");
         }
-        let mut cells = Vec::with_capacity(rows * columns);
-        for index in 0..rows * columns {
+        let mut cells = Vec::with_capacity(count);
+        for index in 0..count {
             let line = 4 + index;
             let Some(text) = lines.get(line) else {
                 return fail(line + 1, "fewer cells than rows times columns");
