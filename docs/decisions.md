@@ -72,6 +72,186 @@ What would reopen it: a capture where a slot search with flag 0x2000
 draws a different number of times, or a house with two people in a
 route's way.
 
+## 2026-11-14: The standing Goths compared with the original
+
+A screenshot of the original (House05, early morning, medium zoom) shows
+the three Goths standing in their saved outfits. Ours were drawn standing
+(the standing loop) at the same scale and compared by eye.
+
+- **Cassandra** (person 16, a child) faces the viewer. Outfit, glasses,
+  pigtails, proportions and pose match: arms hanging, feet together, the
+  pocket protector on her left. Her height is 59 pixels in the original
+  and about 61 in ours (within 4%). That also supports 3 model units per
+  tile and the house view's 30-degree tilt.
+- **Mortimer** (person 21) and **Bella** (person 18) are seen from
+  behind. Outfits and proportions match. Mortimer holds a book: a carry
+  layer can play over the base layer's loop, so this does not show
+  which loop he plays. His carrying pose is not compared, and his base
+  clip is unknown, so his standing loop is **not compared**.
+- The phase of the original's loop is not known, so small differences in
+  pose within the loop are not judged.
+
+## 2026-11-14: How the original lights a person, and how far ours is from it
+
+People are still drawn with our own light. This entry records what the
+original does, read from its code, and what matching it would need.
+
+**What the original does.** Before it draws a person (0x590c05), it
+sets the lights (0x4b49c7), and puts them back afterwards (0x4b4cf5).
+Direct3D's fixed-function lighting then adds the lights up per vertex.
+
+- **A level from 0 to 1.** The draw reads a level from a lighting
+  object it is given (0x4b4499): 1 when that object's byte +0x34 is set,
+  otherwise its float +0x48, which a setter clamps (0x4b4525). The
+  level is 1 when the person's object has bit 0 of its flags +0x114
+  set. The person keeps its own copy (+0xe0). A new level starts a fade
+  of 250 ms from the old one (0x5929ff, through the person's own
+  method at vtable +0xe8). Reading it during the fade interpolates and
+  clamps it to 0..1 (0x586dce, vtable +0xe4). The result goes to the
+  lighting record (+0x20).
+- **Ambient.** A grey of `round(255 × (low + (high − low) × level))`.
+  `low` and `high` live in a static lighting object at 0x6f0150 and
+  start at 0 and 1 (its constructor, 0x4b457c). With these defaults the
+  grey is `round(255 × level)`. Whether anything changes them while the
+  game runs was not checked (**unverified**).
+- **The standard light.** One directional light from
+  `GameData/Lights/stdlight.lgt`: white, intensity 1, direction
+  (−0.644, −0.418, −0.641) in the files' frame. Each light of the record
+  is turned by a matrix the game's view object gives (0x415711, +0x130)
+  before it is set. Its strength is the same level.
+- **Room lamps.** For each light of the room the person stands in, within
+  a squared distance of 400 (20 units; which units these positions use is
+  not pinned down), a directional light goes from the lamp towards the
+  person. It is at full strength up to a squared distance of 225, then
+  `1 / ((d² − 225) / 2 + 1)`. Its colour is (1.0, 0.984, 0.819).
+
+**What a screenshot shows.** In two screenshots of the original, a
+quarter turn of the view apart, a person facing the viewer is brighter
+on the viewer's left. They are different people facing different ways,
+so this only suggests that the light turns with the view.
+
+**What we do.** One light fixed in the lot, from above and the viewer's
+right (`raster::LIGHT`), with shade `0.45 + 0.55 × max(0, n · l)`,
+where `n` is the vertex's normal and `l` the unit vector towards the
+light. There is no level, no lamps and no fade.
+
+**What matching needs.**
+
+- The level. The simulation keeps each room's light from 0 to 1
+  (`Room::light`, and which room a tile is in, on `World.rooms`), and the
+  drawing can read it directly. That the original's level is the room's
+  light is **unverified**: the lighting object passed to the draw, and
+  what writes its +0x48, are not read yet.
+- Which frame the view matrix (+0x130) is in. If it is the camera's, the
+  light turns with the view, as the screenshots suggest.
+- The materials' ambient and diffuse colours, which are not read.
+- The room's lamps: their positions, from the simulation's objects.
+
+**Stand-ins kept.** The base layer's clip and phase are not simulation
+state yet. The animator only records whether the base slot holds a
+layer (`Animator::base`). Which clip the original puts there needs more
+reverse engineering on the simulation side. Until then the clip comes
+from the saved person record and the phase from the animator's clock.
+
+## 2026-11-14: Sound event kinds follow the original's dispatcher
+
+The player now acts on an event by its kind, as the original's event
+dispatcher does (read from its code in a memory image, never written).
+Each event gives a track and three arguments; an argument the event
+leaves at 0 takes the caller's value, which is the object for the
+first. So a fade event, which never gives a speed in the install, fades
+at the object's number, or at 100 for no object. That is what the code
+does, odd as it looks.
+
+Ported: play (1), fade (18), `radio_next_song` (19), kill all (20),
+kill an object's instances (23), turn on a television or radio (30),
+sequence a hit list (53) and kill every object's sounds (105). Kinds
+whose case does nothing for sound are ignored. Not ported, and counted
+in a gated test: music modes (36, 21 events), ambience modes (52, 5
+events, the ambient scores), the piano (43), pausing (103) and
+reloading (104). Twelve play events have an empty track and do nothing.
+
+The radio, television and music hit lists come from directories, as the
+original builds them when it starts: one sub list per subdirectory, one
+patch per file. Their numbers are made up (from 2^30), since the
+original's come from a counter. Files are taken in sorted order; the
+original takes them as the file system lists them.
+
+`SoundEvent::StopObject` is now kind 23: tracks the object was recorded
+as playing for fade out at speed 100 and end, or end at once when
+silent. Threads the object started without being recorded (tracks whose
+arguments are not `kArgsIdVolPan`) keep running, as in the original.
+
+MP3s are resampled to 22,050 Hz when loaded. The original sets every
+sound buffer's rate from `pitch` (22,050 Hz at 3600), and its MP3s are
+44.1 kHz, so it must hand DirectSound 22,050 Hz from its MP3 data
+source, or play songs an octave low. Which it does is **unverified**.
+
+Model limits: the original has one track object per track number,
+shared by everyone playing it; this player runs a thread per play and
+uses a track's newest thread where the original uses its one object.
+When an object lets go of a track others still have, the original
+re-evaluates the track (0x5746d9, not read); here that object's threads
+fade out. A note whose thread has ended has no registers left to fade,
+so it stops at once when its track is let go.
+
+Reopen when a run with sound can be compared, when the music modes are
+ported, or when the simulation needs pause.
+
+## 2026-11-14: The live control panel, placed by measuring the original
+
+`crates/sims-ui` draws the live-mode control panel from the original's
+art (`UIGraphics`, ids from its control panel header) into a CPU frame.
+The layout was taken from the old prototype
+(`legacy/crates/sims-app/src/original_hud.rs`) and then checked against
+a screenshot of the original at 800×600 (Goth house, live mode, Needs
+open), by finding each bitmap in the screenshot.
+
+What was checked:
+
+- The cluster sits at the bottom left, 220 by 183. Every button's cell
+  and position matched the screenshot exactly. Of its 28,244 pixels,
+  255 differ, all on the translucent edge of the cluster or in the parts
+  left out of the comparison (the clock line, the counter beside the
+  mood face and the help button).
+- The strip runs from x = 220 to the right edge, 100 high, its last
+  column stretched to fill a wider window. Outside the meters, mood
+  bars and portraits, 0 of 46,600 pixels differ.
+- Portrait frames: 11 of 1,770 pixels differ, all under the activity
+  icons, which are not drawn.
+- The clock (font 8) and the funds (font 10) are drawn in green
+  (565 value 0x2F2B) and match the screenshot's text. The Needs title,
+  labels and meters match in place and color.
+
+Three things in the prototype were wrong and are fixed here: the two
+rotate buttons were swapped, the gadget sits 387 pixels from the right
+edge (not 388), and at load the Live, normal speed, floor-down and
+cutaway buttons show their selected cell and zoom-out its disabled cell.
+
+The panel is placed against the bottom-left and bottom-right corners
+at any window size, so a wider window shows more of the strip and the
+lot. Only 800×600 was compared; how the original places the panel at
+its larger sizes is **unverified**.
+
+**Unverified or not drawn:**
+
+- the counter beside the mood face (its source is not found; it may be
+  an expansion pack's coins), and the help button;
+- the activity icons over the portraits and the motive trend arrows;
+- a family too large for one row: portraits wrap into a second row
+  before the gadget (four columns at 800×600, so eight fit), and anyone
+  past two rows is left out;
+- which rotate button turns which way in the simulation's terms;
+- the clock in the afternoon and the funds when negative.
+
+Funds and the selected Sim come from the boot's household load (`sims
+boot` steps 17 and 18), which the simulation does not offer as a
+library call yet. The tests do the same two steps themselves; see the
+roadmap section for what the simulation needs.
+
+What would reopen it: a second screenshot (another window size, buy
+mode, the afternoon) that disagrees.
+
 ## 2026-11-14: People are no longer drawn mirrored, and the lot lies the right way round
 
 People were drawn as the mirror image of the original's. Now they are
@@ -754,7 +934,6 @@ with tests.
 What would reopen it: a camera where an object with a nonzero world
 offset can be compared with the original, or a reading of the
 original's blitter that treats soft edges differently.
-
 
 ## 2026-11-14: The lot viewer opens a window with winit and softbuffer
 
