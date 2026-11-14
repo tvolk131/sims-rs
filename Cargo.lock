@@ -285,6 +285,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sims-render"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "sims-content",
+ "sims-formats",
+ "sims-sim",
+]
+
+[[package]]
 name = "sims-sim"
 version = "0.1.0"
 dependencies = [
