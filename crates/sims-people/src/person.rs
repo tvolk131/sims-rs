@@ -268,4 +268,22 @@ mod tests {
             "{ahead:?}"
         );
     }
+
+    #[test]
+    fn the_pose_turns_the_head_the_simulation_turned() {
+        let mut skeleton = crate::rig::tests::skeleton();
+        skeleton.bones[1].name = "HEAD".into();
+        let (assets, library) = (Assets::default(), Library::default());
+        let mut player = Player::new(&assets, &library);
+        // No base layer and no foreground: only the rest pose and the head.
+        let mut animator = Animator::new(0);
+        let still = player.pose(&skeleton, &animator, "unused").unwrap();
+        assert_eq!(still, Pose::rest(&skeleton));
+        animator.head.turn = F32::from_f32(1.0);
+        let turned = player.pose(&skeleton, &animator, "unused").unwrap();
+        let mut want = Pose::rest(&skeleton);
+        want.turn_head(&skeleton, animator.head.turn);
+        assert_eq!(turned, want);
+        assert_ne!(turned, still);
+    }
 }

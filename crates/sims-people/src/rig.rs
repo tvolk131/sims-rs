@@ -65,17 +65,36 @@ impl Pose {
     /// and [`sims_sim::head::turned`] works out the bone's rotation, in the
     /// files' convention, with the original's arithmetic. A turn of 0, or
     /// a skeleton without a `HEAD` bone, leaves the pose as it is. Only
-    /// that bone turns relative to its parent; bones hanging from it
-    /// follow it (the original's skeletons have none).
+    /// that bone turns: the original places it again and leaves the bones
+    /// below it where they were (0x590a3c), so each bone hanging from it
+    /// is given the turn back. The original's skeletons have none.
     pub fn turn_head(&mut self, skeleton: &Skeleton, turn: F32) {
         if turn == F32::ZERO {
             return;
         }
-        let Some(local) = bone(skeleton, "HEAD").and_then(|i| self.local.get_mut(i)) else {
+        let Some(head) = bone(skeleton, "HEAD") else {
             return;
         };
-        let q = to_file(local.rotation).map(F32::from_f32);
-        local.rotation = rotation(sims_sim::head::turned(q, turn).map(F32::to_f32));
+        let Some(local) = self.local.get_mut(head) else {
+            return;
+        };
+        let before = local.rotation;
+        let q = to_file(before).map(F32::from_f32);
+        let after = rotation(sims_sim::head::turned(q, turn).map(F32::to_f32));
+        local.rotation = after;
+        // A child's place on the body is head * child; keep it by taking
+        // the turn off: child' = after⁻¹ * before * child.
+        let undo = Transform {
+            rotation: (Quat::new(-after.x, -after.y, -after.z, after.w) * before).normalize(),
+            translation: Vec3::ZERO,
+        };
+        for (i, b) in skeleton.bones.iter().enumerate() {
+            if b.parent == Some(head)
+                && let Some(child) = self.local.get_mut(i)
+            {
+                *child = undo * *child;
+            }
+        }
     }
 
     /// Each bone's place on the body, with the root placed by `root`.
@@ -196,6 +215,53 @@ pub(crate) mod tests {
         let mut pose = Pose::rest(&plain);
         pose.turn_head(&plain, F32::from_f32(1.0));
         assert_eq!(pose, Pose::rest(&plain));
+    }
+
+    #[test]
+    fn the_turn_is_multiplied_in_the_originals_order() {
+        // HEAD at rest a sixth of a turn about the file's Z axis, which
+        // does not commute with the turn about X. (A quarter turn would
+        // put the angle `turned` reads at its arc tangent's edge, where
+        // rounding decides between 0 and pi.)
+        let mut s = skeleton();
+        s.bones[1].name = "HEAD".into();
+        let sixth = [0.0, 0.0, 0.5, 0.866_025_4];
+        s.bones[1].rotation = sixth;
+        let mut pose = Pose::rest(&s);
+        pose.turn_head(&s, F32::from_f32(1.0));
+        let q = sixth.map(F32::from_f32);
+        let r = [0.382_683_43, 0.0, 0.0, 0.923_879_5].map(F32::from_f32);
+        let want = sims_sim::head::multiply(r, q).map(F32::to_f32);
+        let other = sims_sim::head::multiply(q, r).map(F32::to_f32);
+        let got = to_file(pose.local[1].rotation);
+        let near = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-6);
+        assert!(near(got, want), "{got:?} {want:?}");
+        assert!(!near(got, other), "the order matters here");
+    }
+
+    #[test]
+    fn bones_below_the_head_stay_where_they_were() {
+        let mut s = skeleton();
+        s.bones[1].name = "HEAD".into();
+        let mut hat = s.bones[1].clone();
+        hat.name = "HAT".into();
+        hat.parent = Some(1);
+        hat.translation = [0.3, 0.5, -0.2];
+        hat.rotation = [0.1, 0.2, 0.3, 0.927_362];
+        s.bones.push(hat);
+        let rest = Pose::rest(&s);
+        let mut pose = rest.clone();
+        pose.turn_head(&s, F32::from_f32(1.0));
+        assert_ne!(pose.local[1], rest.local[1]);
+        let (a, b) = (
+            rest.world(&s, Transform::IDENTITY)[2],
+            pose.world(&s, Transform::IDENTITY)[2],
+        );
+        assert!(
+            (a.translation - b.translation).length() < 1e-5,
+            "{a:?} {b:?}"
+        );
+        assert!(a.rotation.dot(b.rotation).abs() > 1.0 - 1e-6, "{a:?} {b:?}");
     }
 
     #[test]
