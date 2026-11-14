@@ -1,4 +1,4 @@
-//! The game's sound: file decoders and the sound scripts' tables.
+//! The game's sound: file decoders, the sound scripts and their player.
 //!
 //! The simulation never depends on this crate. It reads game files and
 //! turns them into PCM (16-bit signed samples); playing them on a device
@@ -17,9 +17,13 @@
 //!   (samples), and lists the hit lists scripts pick samples from.
 //! - [`module`]: one HIT program with its HSM and HOT files.
 //! - [`fsc`]: ambient sound scores.
+//! - [`player`]: the HIT virtual machine and a mixer. It takes
+//!   [`SoundEvent`]s, the simulation's only link to sound, and renders
+//!   PCM.
 
 pub mod decode;
 mod error;
+mod event;
 pub mod files;
 pub mod fsc;
 pub mod hit;
@@ -28,10 +32,12 @@ pub mod hsm;
 pub mod module;
 pub mod mp3;
 mod pcm;
+pub mod player;
 pub mod wav;
 pub mod xa;
 
 pub use error::Error;
+pub use event::SoundEvent;
 pub use pcm::Pcm;
 
 pub type Result<T> = std::result::Result<T, Error>;
