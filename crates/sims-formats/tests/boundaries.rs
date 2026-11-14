@@ -98,6 +98,9 @@ fn far_directory_rejects_bad_ranges_and_hostile_counts() {
     h.extend(1u32.to_le_bytes());
     h.extend(99u32.to_le_bytes());
     assert!(far::manifest_offset(&h, 100).is_err());
+    // The directory is the rest of the file, within the cap.
+    assert_eq!(far::directory_len(16, 116).unwrap(), 100);
+    assert!(far::directory_len(16, 16 + far::MAX_DIRECTORY + 1).is_err());
 }
 #[test]
 fn sprite_preserves_color_depth_and_transparent_tail() {
@@ -353,4 +356,171 @@ fn slot_versions_offsets_and_truncations() {
         b[18..22].copy_from_slice(&f32::NAN.to_le_bytes());
         assert!(Slots::parse(&b).is_err());
     }
+}
+
+fn add_flagged(b: &mut Vec<u8>, tag: &[u8; 4], id: u16, flags: u16, data: &[u8]) -> u32 {
+    let offset = b.len() as u32;
+    b.extend(tag);
+    b.extend(((76 + data.len()) as u32).to_be_bytes());
+    b.extend(id.to_be_bytes());
+    b.extend(flags.to_be_bytes());
+    b.extend([0; 64]);
+    b.extend(data);
+    offset
+}
+/// Appends a version-0 resource map listing `entries` as (tag, offset,
+/// id, flags), each with an empty name, and points the header at it.
+fn add_map(b: &mut Vec<u8>, entries: &[(&[u8; 4], u32, u16, u16)]) {
+    let mut types: Vec<&[u8; 4]> = entries.iter().map(|e| e.0).collect();
+    types.dedup();
+    let mut map = vec![0; 8];
+    map.extend(b"pmsr");
+    map.extend(0u32.to_le_bytes());
+    map.extend((types.len() as u32).to_le_bytes());
+    for tag in types {
+        let listed: Vec<_> = entries.iter().filter(|e| e.0 == tag).collect();
+        map.extend(u32::from_be_bytes(*tag).to_le_bytes());
+        map.extend((listed.len() as u32).to_le_bytes());
+        for (_, offset, id, flags) in listed {
+            map.extend(offset.to_le_bytes());
+            map.extend(id.to_le_bytes());
+            map.extend(flags.to_le_bytes());
+            // An empty name, padded to an even length.
+            map.extend([0, 0]);
+        }
+    }
+    let at = add_flagged(b, b"rsmp", 0, 0, &map);
+    b[60..64].copy_from_slice(&at.to_be_bytes());
+}
+fn payloads<'a>(iff: &'a Iff, tag: &'a [u8; 4]) -> Vec<&'a [u8]> {
+    let all: Vec<_> = iff.all(tag).map(|c| iff.data(c)).collect();
+    let ordered: Vec<_> = iff
+        .resource_order(tag)
+        .unwrap()
+        .into_iter()
+        .map(|c| iff.data(c))
+        .collect();
+    assert_eq!(all, ordered);
+    all
+}
+#[test]
+fn deleted_chunks_are_not_resources() {
+    let mut b = header();
+    add_flagged(&mut b, b"STR#", 1, 4, b"dead");
+    add_flagged(&mut b, b"STR#", 1, 0, b"live");
+    add_flagged(&mut b, b"STR#", 2, 4, b"gone");
+    let iff = Iff::parse(b).unwrap();
+    assert_eq!(iff.data(iff.get(b"STR#", 1).unwrap()), b"live");
+    assert!(iff.get(b"STR#", 2).is_none());
+    assert_eq!(payloads(&iff, b"STR#"), [b"live"]);
+    // The chunks themselves are all still there.
+    assert_eq!(iff.chunks.len(), 3);
+}
+#[test]
+fn a_later_chunk_replaces_an_earlier_one_in_its_place() {
+    let mut b = header();
+    add_flagged(&mut b, b"STR#", 1, 0, b"old");
+    add_flagged(&mut b, b"STR#", 2, 0, b"two");
+    add_flagged(&mut b, b"STR#", 1, 0, b"new");
+    let iff = Iff::parse(b).unwrap();
+    assert_eq!(iff.data(iff.get(b"STR#", 1).unwrap()), b"new");
+    assert_eq!(payloads(&iff, b"STR#"), [&b"new"[..], b"two"]);
+}
+#[test]
+fn the_flags_high_byte_is_part_of_a_resource_key() {
+    let mut b = header();
+    add_flagged(&mut b, b"BMP_", 7, 0x0410, b"high");
+    add_flagged(&mut b, b"BMP_", 7, 0x0010, b"plain");
+    add_flagged(&mut b, b"BMP_", 8, 0x0100, b"only high");
+    let iff = Iff::parse(b).unwrap();
+    assert_eq!(iff.data(iff.get(b"BMP_", 7).unwrap()), b"plain");
+    assert!(iff.get(b"BMP_", 8).is_none());
+    assert_eq!(
+        payloads(&iff, b"BMP_"),
+        [&b"high"[..], b"plain", b"only high"]
+    );
+}
+#[test]
+fn a_resource_map_decides_lookup_as_well_as_order() {
+    let mut b = header();
+    let old = add_flagged(&mut b, b"STR#", 1, 0, b"old");
+    let new = add_flagged(&mut b, b"STR#", 1, 0, b"new");
+    let other = add_flagged(&mut b, b"STR#", 2, 0, b"two");
+    // The map lists 2 first, then the replacement, then the old chunk
+    // again under the same key, which the first entry keeps.
+    add_map(
+        &mut b,
+        &[
+            (b"STR#", other, 2, 0),
+            (b"STR#", new, 1, 0),
+            (b"STR#", old, 1, 0),
+        ],
+    );
+    let iff = Iff::parse(b).unwrap();
+    assert_eq!(iff.data(iff.get(b"STR#", 1).unwrap()), b"new");
+    assert_eq!(payloads(&iff, b"STR#"), [&b"two"[..], b"new"]);
+}
+#[test]
+fn a_resource_map_can_choose_the_earlier_chunk() {
+    let mut b = header();
+    let old = add_flagged(&mut b, b"STR#", 1, 0, b"old");
+    add_flagged(&mut b, b"STR#", 1, 0, b"new");
+    add_flagged(&mut b, b"STR#", 2, 0, b"unlisted");
+    let low = add_flagged(&mut b, b"STR#", 3, 0x10, b"low bits");
+    // A later entry for a listed key is dropped without being checked,
+    // and the low flag bits are the map's to state.
+    add_map(
+        &mut b,
+        &[
+            (b"STR#", old, 1, 0),
+            (b"STR#", 9999, 1, 0),
+            (b"STR#", low, 3, 0),
+        ],
+    );
+    let iff = Iff::parse(b).unwrap();
+    // Without the map, the later chunk would replace the earlier one.
+    assert_eq!(iff.data(iff.get(b"STR#", 1).unwrap()), b"old");
+    assert!(iff.get(b"STR#", 2).is_none());
+    assert_eq!(payloads(&iff, b"STR#"), [&b"old"[..], b"low bits"]);
+}
+#[test]
+fn a_map_listing_a_map_is_ignored() {
+    let mut b = header();
+    let first = add_flagged(&mut b, b"STR#", 1, 0, b"one");
+    add_flagged(&mut b, b"STR#", 2, 0, b"two");
+    // Offset 0 is no chunk: the map is not checked once it lists a map.
+    add_map(&mut b, &[(b"STR#", first, 1, 0), (b"rsmp", 0, 0, 0)]);
+    let iff = Iff::parse(b).unwrap();
+    assert_eq!(payloads(&iff, b"STR#"), [&b"one"[..], b"two"]);
+    // Nor is a map ever a resource.
+    assert!(iff.get(b"rsmp", 0).is_none());
+    assert_eq!(iff.all(b"rsmp").count(), 0);
+}
+#[test]
+fn lookup_survives_a_resource_map_that_cannot_be_used() {
+    let mut b = header();
+    add_flagged(&mut b, b"STR#", 1, 4, b"dead");
+    add_flagged(&mut b, b"STR#", 1, 0, b"live");
+    // The map's entry names a chunk that is not there.
+    add_map(&mut b, &[(b"STR#", 9999, 1, 0)]);
+    let iff = Iff::parse(b).unwrap();
+    assert!(iff.resource_order(b"STR#").is_err());
+    assert_eq!(iff.data(iff.get(b"STR#", 1).unwrap()), b"live");
+    assert_eq!(iff.all(b"STR#").count(), 1);
+}
+#[test]
+fn far_members_must_lie_between_the_header_and_the_directory() {
+    let entry = |offset, stored_size| far::Entry {
+        name: "x".into(),
+        raw_name: b"x".to_vec(),
+        offset,
+        stored_size,
+        unpacked_size: stored_size,
+    };
+    assert!(entry(16, 10).within_payload(26));
+    // Over the header, as an archive that holds itself would be.
+    assert!(!entry(0, 26).within_payload(26));
+    // Into the directory.
+    assert!(!entry(16, 11).within_payload(26));
+    assert!(!entry(u32::MAX, u32::MAX).within_payload(u32::MAX));
 }

@@ -16,14 +16,19 @@
 //! whether the person's appearance is to be read again before the next
 //! clip.
 //!
+//! The head's fields are kept too ([`Head`]): while the head follows
+//! something, the angles it measures decide when it stops (person word
+//! 42), which scripts read.
+//!
 //! What is left out is presentation as far as the original's code shows:
-//! the posed bones and the skin (0x5994c3, 0x5a15bc, 0x5a0ef5), the head's
-//! turn (0x590768 past the countdown it keeps in person words 42 and 45),
-//! the draw state (0x434101), the face (0x58faf6), what a carried object's
-//! position follows (0x590b27 and the tail of 0x58dc72), and the base
-//! layer's own clock, whose clip has no events. That nothing the
-//! simulation reads depends on these is **unverified**.
+//! the posed bones and the skin as stored state (0x5994c3, 0x5a15bc,
+//! 0x5a0ef5; the head's measurement poses the bones it needs from the
+//! layers each time instead), the draw state (0x434101), the face
+//! (0x58faf6), what a carried object's position follows (the tail of
+//! 0x58dc72), and the base layer's own clock, whose clip has no events.
+//! That nothing the simulation reads depends on these is **unverified**.
 
+use crate::head::Head;
 use serde::{Deserialize, Serialize};
 use sims_core::{Ext, F32};
 use std::cmp::Ordering;
@@ -101,6 +106,7 @@ pub const LOADED: Animator = Animator {
     motion: Motion::NONE,
     undrawn: true,
     walking: false,
+    head: Head::LOADED,
 };
 
 /// A person's animator: the fields of the object at person +0xadc that
@@ -183,6 +189,9 @@ pub struct Animator {
     /// start reads it (0x58ed1d): while it is set, a walk goes on without
     /// asking whether to stop.
     pub walking: bool,
+    /// +0x210 to +0x224: where the head looks and how far it is turned
+    /// ([`crate::head`]).
+    pub head: Head,
 }
 
 /// What the animator keeps while it follows a route (states 3 to 10):

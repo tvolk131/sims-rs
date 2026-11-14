@@ -28,9 +28,13 @@ pub struct Library {
 impl Library {
     /// Reads every animation file (`.bcf` files whose skeleton and
     /// appearance counts are 0). A file that does not decode is skipped.
-    /// A name that two files define takes the first in search order, as
-    /// [`Assets::find`] does; whether the original's library keeps the
-    /// same one is **unverified**.
+    /// A name that two files define takes the first file in name order.
+    /// The original keeps the first clip of a name it loads (0x59f087
+    /// releases a later one), loading `GameData/Animation` before the
+    /// expansions' folders. No clip name is defined by two files in the
+    /// Complete Collection, so the two orders never disagree there. Each
+    /// file's bytes are the first source's ([`Assets::read`]); which copy
+    /// the original reads when two sources differ is **unverified**.
     pub fn scan(assets: &Assets) -> Result<Self, String> {
         let mut library = Self::default();
         for name in assets.names().filter(|n| n.ends_with(".bcf")) {
@@ -232,12 +236,22 @@ mod tests {
     fn a_weight_blends_from_the_pose_below() {
         let skeleton = rig::tests::skeleton();
         let clip = clip();
-        let mut pose = Pose::rest(&skeleton);
-        let below = pose.local[1].translation;
-        clip.apply(&skeleton, &mut pose, 0.0, false, 0.5);
-        assert_eq!(
-            pose.local[1].translation,
-            below.lerp(Vec3::new(0.0, 1.0, 0.0), 0.5)
-        );
+        // Halfway through a clip that does not repeat, the child bone is
+        // at the last frame, (0, 3, 0); at rest it is at (0, 1, 0).
+        let below = Pose::rest(&skeleton).local[1].translation;
+        assert_eq!(below, Vec3::new(0.0, 1.0, 0.0));
+        let at = |weight| {
+            let mut pose = Pose::rest(&skeleton);
+            clip.apply(&skeleton, &mut pose, 0.5, false, weight);
+            pose.local[1].translation
+        };
+        assert_eq!(at(0.0), below);
+        assert_eq!(at(0.5), Vec3::new(0.0, 2.0, 0.0));
+        assert_eq!(at(1.0), Vec3::new(0.0, 3.0, 0.0));
+        // A weight outside 0..=1 is clamped; one that is not a number
+        // counts as 1.
+        assert_eq!(at(2.0), Vec3::new(0.0, 3.0, 0.0));
+        assert_eq!(at(-1.0), below);
+        assert_eq!(at(f32::NAN), Vec3::new(0.0, 3.0, 0.0));
     }
 }
