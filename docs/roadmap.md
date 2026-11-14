@@ -1275,6 +1275,21 @@ Progress:
 - Next: a viewer window, a screenshot of the original at the same camera
   and the comparison, then what it shows needs fixing.
 
+## Track: sound (`crates/sims-audio`)
+
+Goal: the game's sound, from files to PCM, in `crates/sims-audio`. The
+simulation never depends on it; its only link is the play-sound and
+stop-sounds events.
+
+- **Done: every sound file decodes.** XA (18,155 files), WAV (285) and
+  MP3 (141) from loose files and FAR archives, by the paths the sound
+  tables use. XA and WAV match FFmpeg bit for bit on every file. No UTK
+  file exists in the install.
+- **Next: the sound tables.** HIT programs, their HSM symbols, HOT
+  tables (events, tracks, patches, hit lists) and FSC ambient scores.
+- **Then: the HIT VM.** Run real events (a phone ring, a footstep) end
+  to end into PCM, from a small event type the simulation can emit.
+
 ## Working rules
 
 - Work in branches, open PRs, and merge when CI is green on both platforms.
