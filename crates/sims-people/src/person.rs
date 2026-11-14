@@ -142,7 +142,9 @@ impl<'a> Player<'a> {
     /// The pose of `skeleton` for `animator`: the rest pose, then the base
     /// clip `base` (when the animator has a base layer) repeating at the
     /// animator's clock, then the foreground layer at its phase and
-    /// weight. A foreground layer repeats when its end mode is 1.
+    /// weight. A foreground layer repeats when its end mode is 1. Last,
+    /// the head turns as the simulation's head fields say
+    /// ([`Pose::turn_head`]).
     pub fn pose(
         &mut self,
         skeleton: &Skeleton,
@@ -170,6 +172,7 @@ impl<'a> Player<'a> {
                 layer.weight.to_f32(),
             );
         }
+        pose.turn_head(skeleton, animator.head.turn);
         Ok(pose)
     }
 }
