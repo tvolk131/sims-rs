@@ -42,6 +42,9 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     for _ in 0..options.ticks {
         match lot.step() {
             Ok(update) => ticked.push(update),
+            // Missing motive constants stop the run before any tick, with
+            // no report, as before the library.
+            Err(StepError::Tuning(error)) => return Err(error.into()),
             Err(error) => {
                 // A frame that fails after its tick still counts the tick.
                 if let StepError::Frame {

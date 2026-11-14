@@ -15,6 +15,12 @@ read its state in between. The load sequence and the tick loop were in
   schedule (`Frames`) draws one.
 - `Lot::world` reads the state.
 
+A step that fails in its tick or a frame leaves the lot partway through
+that work, so the lot halts: every later step fails and changes nothing.
+The old CLI stopped there too. The motive constants are worked out at
+the first step rather than at the load, so a load that runs no tick
+doesn't need them, as before.
+
 `sims boot` prints what the library does, and its output is unchanged
 byte for byte: at K = 366 it gives the same hash, and at tick 367 the
 same stop.

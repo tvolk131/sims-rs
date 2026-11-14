@@ -171,6 +171,8 @@ pub struct Lot {
     program: Program,
     catalog: Catalog,
     world: World,
+    /// The motive constants, worked out at the first step: a load that
+    /// runs no tick does not need them.
     tuning: Option<Tuning>,
     player: Answers,
     frames: Frames,
@@ -178,6 +180,9 @@ pub struct Lot {
     ticks: u32,
     start: u32,
     load: LoadReport,
+    /// Set when a tick or a frame failed. The lot is then as the failure
+    /// left it, partway through a tick or a frame, so no later step runs.
+    halted: bool,
 }
 
 /// Why a step could not run, or stopped partway.
@@ -185,6 +190,11 @@ pub struct Lot {
 pub enum StepError {
     /// The load did not complete, so no tick can run.
     Incomplete,
+    /// The install lacks the motive constants a tick needs.
+    Tuning(String),
+    /// An earlier step failed, leaving the lot partway through a tick or a
+    /// frame; the lot is unchanged since.
+    Halted,
     /// The lot update of tick `tick` failed; the lot is as the failure
     /// left it.
     Tick {
@@ -205,6 +215,8 @@ impl std::fmt::Display for StepError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Incomplete => write!(f, "ticks were asked for, but the load did not complete"),
+            Self::Tuning(error) => write!(f, "{error}"),
+            Self::Halted => write!(f, "an earlier step failed, so no more ticks run"),
             Self::Tick { tick, start, error } => write!(
                 f,
                 "tick {tick}, the lot update that starts at tick count {start}, failed: {error}"
@@ -418,16 +430,12 @@ impl Lot {
         load.saved_people = saved.values().filter(|o| o.person.is_some()).count();
         load.saved_ticks = file.simulator.ticks;
         load.libraries = program.libraries.len();
-        let tuning = match load.finished {
-            Some(_) => Some(program.motive_tuning()?),
-            None => None,
-        };
         let start = world.ticks;
         Ok(Self {
             program,
             catalog,
             world,
-            tuning,
+            tuning: None,
             player: Answers {
                 queue: answers.iter().copied().collect(),
             },
@@ -435,13 +443,41 @@ impl Lot {
             ticks: 0,
             start,
             load,
+            halted: false,
         })
     }
 
     /// Runs the next tick: the lot update, then the house view's frame if
     /// one is drawn after it. The first step first draws the frame before
     /// the first tick, if one is drawn there.
+    ///
+    /// After a step fails in its tick or a frame, every later step fails
+    /// with [`StepError::Halted`] and changes nothing. A step that fails
+    /// before it starts ([`StepError::Incomplete`], [`StepError::Tuning`])
+    /// changes nothing either.
     pub fn step(&mut self) -> Result<Update, StepError> {
+        if self.halted {
+            return Err(StepError::Halted);
+        }
+        if self.load.finished.is_none() {
+            return Err(StepError::Incomplete);
+        }
+        if self.tuning.is_none() {
+            let tuning = self
+                .program
+                .motive_tuning()
+                .map_err(|error| StepError::Tuning(error.to_string()))?;
+            self.tuning = Some(tuning);
+        }
+        let result = self.advance();
+        if result.is_err() {
+            self.halted = true;
+        }
+        result
+    }
+
+    /// The tick and its frames, for a lot that can step.
+    fn advance(&mut self) -> Result<Update, StepError> {
         let tuning = self.tuning.as_ref().ok_or(StepError::Incomplete)?;
         let interpreter = Interpreter::new(&self.program, &self.catalog, Stream::Global);
         if self.ticks == 0 && self.frames.after(0) {
@@ -501,7 +537,104 @@ impl Lot {
 
 #[cfg(test)]
 mod tests {
-    use super::Frames;
+    use super::{Answers, Finished, Frames, LoadReport, Lot, StepError};
+    use crate::Program;
+    use sims_content::Catalog;
+    use sims_sim::World;
+    use sims_sim::motives::{Curve, Rates, Tuning};
+    use std::collections::BTreeMap;
+
+    /// A lot with no code, whose load finished (or not), drawing frames
+    /// as `frames` says.
+    fn lot(world: World, finished: bool, frames: Frames) -> Lot {
+        let load = LoadReport {
+            finished: finished.then_some(Finished {
+                indicators_made: false,
+                sim: None,
+                counted: 0,
+            }),
+            ..LoadReport::default()
+        };
+        let start = world.ticks;
+        Lot {
+            program: Program {
+                global: 0,
+                libraries: BTreeMap::new(),
+                semi_globals: BTreeMap::new(),
+                careers: None,
+                zoning: BTreeMap::new(),
+                animations: Default::default(),
+                people: Default::default(),
+            },
+            catalog: Catalog {
+                global: 0,
+                objects: Vec::new(),
+                by_guid: BTreeMap::new(),
+                semi_globals: BTreeMap::new(),
+                diagnostics: Vec::new(),
+            },
+            world,
+            tuning: None,
+            player: Answers::default(),
+            frames,
+            ticks: 0,
+            start,
+            load,
+            halted: false,
+        }
+    }
+
+    fn tuning() -> Tuning {
+        let rates = || Rates::from_lookup(0, |_| None);
+        let curve = |motive| Curve::parse(motive, "(-100;1)(100;1)", 8);
+        Tuning {
+            rates: [rates(), rates(), rates()],
+            adult_mood: vec![curve(7)],
+            child_mood: vec![curve(7)],
+        }
+    }
+
+    #[test]
+    fn a_failed_tick_halts_the_lot() {
+        // An empty lot has no selected Sim at the end of its update, which
+        // stops the tick partway.
+        let mut lot = lot(World::empty(), true, Frames::default());
+        lot.tuning = Some(tuning());
+        let Err(StepError::Tick { tick: 1, .. }) = lot.step() else {
+            panic!("the tick should fail");
+        };
+        let failed = lot.world().hash_hex();
+        for _ in 0..3 {
+            assert_eq!(lot.step().unwrap_err(), StepError::Halted);
+        }
+        assert_eq!(lot.world().hash_hex(), failed);
+        assert_eq!(lot.ticks(), 0);
+    }
+
+    #[test]
+    fn missing_motive_constants_fail_only_a_step() {
+        // The load does not need them; the step says so, changes nothing,
+        // and does not halt (a later step fails the same way).
+        let mut lot = lot(World::empty(), true, Frames::default());
+        let before = lot.world().hash_hex();
+        for _ in 0..2 {
+            let Err(StepError::Tuning(error)) = lot.step() else {
+                panic!("the step should want the motive constants");
+            };
+            assert!(error.contains("tuning table"), "{error}");
+        }
+        assert_eq!(lot.world().hash_hex(), before);
+        assert!(!lot.halted);
+    }
+
+    #[test]
+    fn an_incomplete_load_runs_no_tick() {
+        let mut lot = lot(World::empty(), false, Frames::default());
+        lot.tuning = Some(tuning());
+        let before = lot.world().hash_hex();
+        assert_eq!(lot.step().unwrap_err(), StepError::Incomplete);
+        assert_eq!(lot.world().hash_hex(), before);
+    }
 
     #[test]
     fn a_frame_list_reads_ticks_and_repeats() {
