@@ -60,24 +60,32 @@ mod word {
 
 /// The slots a person has besides its tile slot and its definition's own:
 /// a carried object, the head, and three more (0x45962b).
-const PERSON_SLOTS: usize = 5;
+pub(crate) const PERSON_SLOTS: usize = 5;
 
 /// The words of a person's data. Saves before ObjM version 0x47 hold the
 /// first 80.
-const PERSON_WORDS: usize = 256;
+pub(crate) const PERSON_WORDS: usize = 256;
 
 /// The person data words that hold interests, which decide whether the
 /// constructor makes defaults (0x45962b).
-const INTERESTS: std::ops::RangeInclusive<usize> = 46..=53;
+pub(crate) const INTERESTS: std::ops::RangeInclusive<usize> = 46..=53;
 
 /// A registry word with countdown -1 and no flags: what registration
 /// gives a new object (0x4434cd).
 const REGISTERED: i32 = 0xffff;
 
+/// The person data words a new person's default interests and
+/// personality go into, in the order they are made, with how many of each
+/// category (low, middle, high) the words of a group may take (0x459a9c).
+const TRAITS: [(&[usize], [u8; 3]); 2] = [
+    (&[46, 47, 48, 49, 50, 51, 52, 53, 54, 55], [4, 3, 3]),
+    (&[13, 14, 16, 20, 26], [1, 2, 2]),
+];
+
 /// A counting view of the C runtime's random stream.
-struct Draws<'a> {
-    stream: &'a mut CrtRng,
-    count: u32,
+pub(crate) struct Draws<'a> {
+    pub stream: &'a mut CrtRng,
+    pub count: u32,
 }
 
 impl Draws<'_> {
@@ -101,23 +109,36 @@ impl Draws<'_> {
     }
 
     /// A new person's default interests and personality (0x459a9c): ten
-    /// interest words, then five personality words. Each takes a category
-    /// (low, middle or high) that still has room, drawing again while the
-    /// drawn one is full, and then one more draw for its value. The saved
-    /// person data replaces the values, so they are not kept.
-    fn default_traits(&mut self) {
-        for (fields, mut room) in [(10, [4, 3, 3]), (5, [1, 2, 2])] {
-            for _ in 0..fields {
-                loop {
+    /// interest words, then five personality words ([`TRAITS`]). Each
+    /// takes a category (low, middle or high) that still has room,
+    /// drawing again while the drawn one is full, and then one more draw
+    /// for its value: 0 to 3 for low, 4 to 6 for middle, 7 to 10 for high,
+    /// times 100. Returns each word with its value, in order.
+    ///
+    /// Ported from the old prototype's `default_traits`
+    /// (legacy/crates/sims-vm/src/person_factory.rs), which compared it
+    /// with the original's code run alone.
+    pub(crate) fn default_traits(&mut self) -> Vec<(usize, i16)> {
+        let mut traits = Vec::new();
+        for (fields, mut room) in TRAITS {
+            for &field in fields {
+                let category = loop {
                     let category = usize::from(self.next() % 3);
                     if room[category] > 0 {
                         room[category] -= 1;
-                        break;
+                        break category;
                     }
-                }
-                self.next();
+                };
+                let draw = self.next();
+                let value = match category {
+                    0 => draw % 4,
+                    1 => draw % 3 + 4,
+                    _ => draw % 4 + 7,
+                };
+                traits.push((field, (value * 100) as i16));
             }
         }
+        traits
     }
 }
 
@@ -333,25 +354,7 @@ fn construct_person(
     draws: &mut Draws<'_>,
     files: &mut BTreeSet<String>,
 ) -> Result<(), Trap> {
-    let skeleton: &Skeleton = people.skeletons.get(&guid).ok_or_else(|| {
-        Trap::Unsupported(format!(
-            "no skeleton was supplied for the person type 0x{guid:08X}"
-        ))
-    })?;
-    let own = skeleton.scales.get(skeleton.place).ok_or_else(|| {
-        Trap::Invalid(format!(
-            "the skeleton {:?} is not in its file",
-            skeleton.name
-        ))
-    })?;
-    // Reading a skeleton file builds every skeleton in it (0x598af7).
-    if files.insert(skeleton.file.clone()) {
-        for scales in &skeleton.scales {
-            draws.skeleton(scales);
-        }
-    }
-    // The person's own copy (0x598da3).
-    draws.skeleton(own);
+    build_skeleton(guid, people, draws, files)?;
     // The first record of the person's type, in slot order.
     let record = neighbors.first_of(guid).ok_or_else(|| {
         Trap::Unsupported(format!(
@@ -376,6 +379,39 @@ fn construct_person(
     if defaults {
         draws.default_traits();
     }
+    Ok(())
+}
+
+/// A person's skeleton, as far as building it draws random numbers (in
+/// 0x588dcb): the skeleton's file is read if the game has not read it yet
+/// (`files`), which builds every skeleton in the file (0x598af7), and then
+/// the person's own copy is built (0x598da3). A person type with no
+/// skeleton in `people` fails.
+pub(crate) fn build_skeleton(
+    guid: u32,
+    people: &People,
+    draws: &mut Draws<'_>,
+    files: &mut BTreeSet<String>,
+) -> Result<(), Trap> {
+    let skeleton: &Skeleton = people.skeletons.get(&guid).ok_or_else(|| {
+        Trap::Unsupported(format!(
+            "no skeleton was supplied for the person type 0x{guid:08X}"
+        ))
+    })?;
+    let own = skeleton.scales.get(skeleton.place).ok_or_else(|| {
+        Trap::Invalid(format!(
+            "the skeleton {:?} is not in its file",
+            skeleton.name
+        ))
+    })?;
+    // Reading a skeleton file builds every skeleton in it (0x598af7).
+    if files.insert(skeleton.file.clone()) {
+        for scales in &skeleton.scales {
+            draws.skeleton(scales);
+        }
+    }
+    // The person's own copy (0x598da3).
+    draws.skeleton(own);
     Ok(())
 }
 

@@ -2,7 +2,7 @@
 //! (0x58dc72). Synthetic; no game data.
 
 use crate::support::*;
-use sims_content::Clip;
+use sims_content::{Clip, Profile};
 use sims_core::F32;
 use sims_sim::animator::{LOADED, UNSET};
 use sims_sim::motives::{Curve, Rates, Tuning};
@@ -61,6 +61,18 @@ fn sim_animates(operands: [u8; 8]) -> Fixture {
     );
     fx.program.animations.insert_samples(SKILL);
     fx.world.types.insert(8, SIM_GUID);
+    // The animator the load leaves is to read the person's appearance
+    // again, which the first clip does. This profile changes only person
+    // words 22 and 23.
+    fx.program.people.profiles.insert(
+        SIM_GUID,
+        Profile {
+            gender: None,
+            age: None,
+            skin: None,
+            tones: Vec::new(),
+        },
+    );
     fx.thread(SIM, 4096, &[-7]);
     fx.sim_mut().stack[0].locals = vec![0, 0];
     fx
@@ -79,6 +91,24 @@ fn unsupported(result: Result<Status, sims_vm::Fault>) -> String {
         },
         Ok(status) => panic!("{status:?}"),
     }
+}
+
+#[test]
+fn the_first_clip_reads_the_appearance_again() {
+    // 0x5893b3: looking the clip up reads the appearance if the animator
+    // says to (+0xd8) and clears the flag.
+    // A person's animator starts as LOADED, with the flag set.
+    let loaded = LOADED;
+    assert!(loaded.profile_stale);
+    let mut fx = sim_animates(animate(1, 3, 0x08 | 0x40, 2, 0));
+    fx.sim_mut().person.as_mut().unwrap().data[22] = 9;
+    turn(&mut fx).unwrap();
+    assert!(!fx.world.animators[&SIM].profile_stale);
+    assert_eq!(fx.sim().person.as_ref().unwrap().data[22], 0);
+    // Without a profile for the person's type, that fails.
+    let mut fx = sim_animates(animate(1, 3, 0x08 | 0x40, 2, 0));
+    fx.program.people.profiles.clear();
+    assert!(unsupported(turn(&mut fx)).contains("no profile was supplied"));
 }
 
 #[test]

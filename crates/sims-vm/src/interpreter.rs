@@ -589,7 +589,9 @@ impl<'a> Machine<'a, '_> {
         Ok(())
     }
 
-    /// Pops the top frame. What it held stays in the frame storage.
+    /// Pops the top frame (0x4752f6). What it held stays in the frame
+    /// storage. Then, for a person, the objects it uses are looked at (the
+    /// object's virtual function 8; [`Machine::release_use`]).
     fn pop_frame(&mut self) -> Result<(), Trap> {
         self.sync_frames()?;
         let me = self.me;
@@ -599,11 +601,24 @@ impl<'a> Machine<'a, '_> {
             let depth = storage.offsets.len() as u32;
             storage.unknown.retain(|&(frame, _)| frame != depth);
         }
-        Ok(())
+        let last_result = self.me()?.last_result;
+        self.release_use(last_result)
     }
 
-    /// Drops every frame. What they held stays in the frame storage.
+    /// Drops every frame. What they held stays in the frame storage. A
+    /// person using an object fails: how the original ends those uses
+    /// here is not known.
     pub(crate) fn clear_frames(&mut self) -> Result<(), Trap> {
+        if self
+            .me()?
+            .person
+            .as_ref()
+            .is_some_and(|p| !p.object_uses.is_empty())
+        {
+            return Err(Trap::Unsupported(
+                "dropping the frames of a person that is using an object".into(),
+            ));
+        }
         self.sync_frames()?;
         let me = self.me;
         self.me_mut()?.stack.clear();
@@ -769,9 +784,6 @@ impl<'a> Machine<'a, '_> {
                 ERROR => return Err(Trap::ErrorBranch),
                 RETURN_TRUE | RETURN_FALSE => {
                     let value = target == RETURN_TRUE;
-                    // A return counts as the thread's last result too
-                    // (legacy lib.rs:1714).
-                    self.me_mut()?.last_result = value;
                     // The original writes every branch target, a return
                     // too, into the frame's node word before it acts on it
                     // (0x474cea, 0x474d1b), so a popped frame leaves 0xfe or
@@ -780,6 +792,10 @@ impl<'a> Machine<'a, '_> {
                     // frame finds 254 in a local that lands on such a word.
                     self.frame_mut()?.node = u16::from(target);
                     self.pop_frame()?;
+                    // A return counts as the thread's last result too
+                    // (legacy lib.rs:1714), written once the frame is
+                    // popped and a person's uses looked at (0x474da0).
+                    self.me_mut()?.last_result = value;
                     let stack = &self.me()?.stack;
                     if stack.len() <= base {
                         return Ok(Status::Returned(value));

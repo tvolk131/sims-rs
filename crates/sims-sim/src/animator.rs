@@ -12,7 +12,9 @@
 //! the animator's clock, the speed it plays at, its state, whether it has
 //! placed itself on the person's tile, the posture and carry bookkeeping,
 //! Animate Sim's progress through a clip's events, the queue of events,
-//! and the foreground layer's clock, from which "done" is decided.
+//! the foreground layer's clock, from which "done" is decided, and
+//! whether the person's appearance is to be read again before the next
+//! clip.
 //!
 //! What is left out is presentation as far as the original's code shows:
 //! the posed bones and the skin (0x5994c3, 0x5a15bc, 0x5a0ef5), the head's
@@ -39,38 +41,28 @@ pub const EPSILON: F32 = F32::from_bits(0x3586_37bd);
 const ENDED_DURATION: F32 = F32::from_bits(0x4cbe_bc20);
 
 /// The animator's state when the load leaves it (person +0xadc, vtable
-/// 0x671ee4), before the person's first tick.
+/// 0x671ee4), before the person's first tick: a new animator
+/// ([`Animator::new`]) after the person's reset in load step 13 has reset
+/// it ([`Animator::reset`], 0x589220, called from the person's reset
+/// 0x45e791).
 ///
-/// **Inferred**, not captured: the capture's first look at the animator
-/// is after the first tick. Each value is the one that tick leaves as it
-/// is, or the one that, run through the first tick, gives what the
-/// capture holds after it:
+/// What the load does to the animator between the two (reading the saved
+/// animations, from 0x45cf2d) is not modeled; the reset clears what it
+/// could have left that the simulation reads: the clips, the posture, the
+/// position and the event queue. Three values are **inferred** instead:
 ///
-/// - The clock and the head's clock are overwritten by the first tick.
-/// - The speed was 1.0, and the target 1.0: the first tick sets the target
-///   to 1.4 and moves the speed up by at most 0.2, and the capture holds
-///   1.2.
-/// - The state is 3 and the arrival result 0 (0x188): the capture holds
-///   both after the first tick, which writes neither on the path where the
-///   animator places itself.
-/// - The position is unset: the first tick places the animator on the
-///   person's tile and direction (virtual function 0x60, 0x592132). Had it
-///   been placed already, the tick would have found it arrived and changed
-///   nothing the capture shows either.
-/// - The posture is 0 and the base layer is there: the load's reset
-///   writes 0 to person word 0, and the capture holds a base layer and
-///   posture 0. Had the reset cleared the base layer (0x589220 writes -1
-///   to +0x198), the first tick would have started it again, which
-///   changes only presentation and leaves the same values.
-/// - The flag that raises the next foreground layer's priority (+0x1a0)
-///   is 1, as the capture holds after the first tick, which does not write
-///   it; the foreground layer each Goth starts later has priority 6, which
-///   it gives.
-/// - The carry selection is -1, the carry mode and pickup 0, the
-///   selection -1, nothing plays, no event is queued and the foreground
-///   and carry slots are empty, as the capture holds after the first tick.
-/// - The skin's clock is 0: the first tick updates the skin whatever it
-///   holds, since its clock is not 0.
+/// - The clock is 0. The constructor reads the clock when the person is
+///   made, and the first tick overwrites it whatever it holds.
+/// - The speed and its target are 1.0, as the constructor leaves them: the
+///   first tick sets the target to 1.4 and moves the speed up by at most
+///   0.2, and the capture holds 1.2 after it.
+/// - The skin was updated at clock 0 and nothing changed it since. The
+///   first tick updates the skin whatever these hold, since its clock is
+///   not 0.
+///
+/// The destination is the constructor's 0. The first tick finds the
+/// position unset and places the animator, which writes the destination
+/// too, so it never shows.
 pub const LOADED: Animator = Animator {
     clock: 0,
     rate: F32::from_bits(0x3f80_0000),
@@ -78,10 +70,10 @@ pub const LOADED: Animator = Animator {
     state: 3,
     arrival: 0,
     position: [UNSET; 3],
-    destination: [UNSET; 3],
+    destination: [F32::ZERO; 3],
     head_clock: 0,
-    posture: 0,
-    base: true,
+    posture: -1,
+    base: false,
     pickup: 0,
     carry_mode: 0,
     carry_selection: -1,
@@ -95,6 +87,7 @@ pub const LOADED: Animator = Animator {
     foreground: None,
     skin_clock: 0,
     skin_dirty: false,
+    profile_stale: true,
 };
 
 /// A person's animator: the fields of the object at person +0xadc that
@@ -154,6 +147,13 @@ pub struct Animator {
     pub skin_clock: i32,
     /// Skin +0x94: the layers changed since the skin's last update.
     pub skin_dirty: bool,
+    /// Byte +0xd8: the person's appearance has to be read again from its
+    /// type's body strings (virtual function 0x14, 0x5888d3) before the
+    /// next clip is looked up. A new animator and a reset set it; looking
+    /// up a clip (0x5893b3 for Animate Sim, virtual function 0xf4,
+    /// 0x592625, for the posture's clip) reads the appearance and clears
+    /// it.
+    pub profile_stale: bool,
 }
 
 /// What a layer (0x5978ef, 0x597a88) keeps that decides when its clip
@@ -357,6 +357,79 @@ pub enum Advance {
 }
 
 impl Animator {
+    /// A new animator (0x587d2c, after its base 0x58464f), made with its
+    /// person, at clock `clock` (the clock when the person is made,
+    /// 0x585483).
+    ///
+    /// Speed and target 1.0, standing (state 3), not placed (the position
+    /// unset, 0x671d64), the destination 0, no posture (-1), no clips, the
+    /// selections -1, nothing playing and the appearance to be read. The
+    /// constructors write every field kept here but the carry selection
+    /// (+0x1ac); that is taken to be -1: the person's first tick sets it
+    /// to -1 whatever it holds unless the person carries something, and
+    /// the reset that follows the first tick sets it to -1 too. The skin is
+    /// made later (0x588dcb) and its clock is not read here; it is taken
+    /// as 0. The person's first tick updates the skin whatever its clock
+    /// holds, since the posture's clip it starts marks the skin changed.
+    pub fn new(clock: i32) -> Self {
+        Self {
+            clock,
+            promote: false,
+            ..LOADED
+        }
+    }
+
+    /// The animator's reset (virtual function 0xc, 0x589220), as far as it
+    /// writes what is kept here:
+    ///
+    /// - The position is unset again (virtual function 0x20, 0x589361);
+    ///   the destination stays.
+    /// - The posture is -1, the carry selection -1, the carry mode 0, the
+    ///   state 3 (standing), the next foreground clip's raised priority is
+    ///   set again, and the appearance is to be read again (+0xd8).
+    /// - The foreground clip is removed and the selection set to -1
+    ///   (virtual function 0xfc, 0x586b63); the blend, carry and base
+    ///   slots are emptied (0x592878). Removing a layer marks the skin's
+    ///   layers changed.
+    /// - The event queue is emptied and nothing plays (+0xa0).
+    ///
+    /// The speed, its target, the clocks, the pickup flag, the count of
+    /// events seen and the slow and follow flags stay as they are.
+    ///
+    /// Fails for what is not ported: a route result other than 0 (0x589e2d
+    /// then ends the route) and a foreground clip, whose removal can fade
+    /// it out through the blend slot (0x592887).
+    pub fn reset(&mut self) -> Result<(), String> {
+        if self.arrival != 0 {
+            return Err(format!(
+                "resetting an animator whose route ended with {} (0x589e2d) is not ported",
+                self.arrival
+            ));
+        }
+        if let Some(layer) = &self.foreground {
+            return Err(format!(
+                "resetting an animator that plays the clip {:?}: removing it (0x592878) can \
+                 fade it out, which is not ported",
+                layer.clip
+            ));
+        }
+        self.position = [UNSET; 3];
+        self.posture = -1;
+        self.carry_selection = -1;
+        self.promote = true;
+        self.carry_mode = 0;
+        self.state = 3;
+        self.profile_stale = true;
+        self.selection = -1;
+        if self.base {
+            self.base = false;
+            self.skin_dirty = true;
+        }
+        self.events.clear();
+        self.playing = false;
+        Ok(())
+    }
+
     /// How far the clock runs per tick (0x585483): 42 times 1.2, truncated,
     /// or 42 when slow.
     pub fn per_tick(&self) -> i32 {

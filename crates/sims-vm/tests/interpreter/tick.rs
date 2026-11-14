@@ -5,7 +5,7 @@
 use crate::support::*;
 use sims_core::F32;
 use sims_sim::motives::{Curve, Rates, Tuning};
-use sims_sim::{Dialog, PersonTick};
+use sims_sim::{Dialog, HouseUsage, PersonTick, Usage};
 use sims_vm::{Answers, Player, Shown, TickError, Update};
 
 /// Dialog (opcode 36) operands of `kind`, waiting for an answer, with the
@@ -351,19 +351,73 @@ fn a_person_with_no_room_yet_keeps_motive_13() {
     assert_eq!(fx.world.person_ticks[&SIM].room, -5);
 }
 
-#[test]
-fn what_a_person_tick_does_not_port_fails_loudly() {
-    // Every tenth tick an awake member of the household asks the lot.
+/// The house's usage counts after one update at tick count `ticks` of a
+/// person with person word 32 `visitor`, alertness `alertness` and
+/// `routes` route contexts, starting from today's counts 7 and 3.
+fn usage_after(ticks: u32, visitor: i16, alertness: f32, routes: i32) -> Usage {
     let mut fx = lot(sleeper());
     fx.thread(LAMP, 4096, &[3]);
-    fx.world.ticks = 10;
+    fx.world.ticks = ticks;
+    fx.world.usage.today = Usage {
+        total: 7,
+        routing: 3,
+    };
     let person = fx.sim_mut().person.as_mut().unwrap();
-    person.data[32] = 0;
-    person.motives[11] = 0.0;
-    assert!(matches!(
-        update(&mut fx, &mut answers(&[])),
-        Err(TickError::Fault(f)) if f.to_string().contains("0x4165e3")
-    ));
+    person.data[32] = visitor;
+    person.motives[11] = alertness;
+    person.routing_frames = routes;
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(fx.world.usage.history, [Usage::default(); 5]);
+    fx.world.usage.today
+}
+
+#[test]
+fn every_tenth_tick_an_awake_member_of_the_household_is_counted() {
+    // 0x45ce0d to 0x45ce5c, and 0x4165e3.
+    let counted = Usage {
+        total: 8,
+        routing: 3,
+    };
+    let unchanged = Usage {
+        total: 7,
+        routing: 3,
+    };
+    assert_eq!(usage_after(10, 0, 0.0, 0), counted);
+    // With a route context the routing count goes up too.
+    assert_eq!(
+        usage_after(10, 0, 0.0, 1),
+        Usage {
+            total: 8,
+            routing: 4
+        }
+    );
+    // Not on other ticks, nor for a visitor or a person who is asleep.
+    assert_eq!(usage_after(11, 0, 0.0, 0), unchanged);
+    assert_eq!(usage_after(10, 1, 0.0, 0), unchanged);
+    assert_eq!(usage_after(10, 0, -1.0, 0), unchanged);
+}
+
+#[test]
+fn the_usage_counts_wrap() {
+    let mut usage = HouseUsage {
+        today: Usage {
+            total: i32::MAX,
+            routing: i32::MAX,
+        },
+        ..HouseUsage::default()
+    };
+    usage.sample(true);
+    assert_eq!(
+        usage.today,
+        Usage {
+            total: i32::MIN,
+            routing: i32::MIN
+        }
+    );
+}
+
+#[test]
+fn what_a_person_tick_does_not_port_fails_loudly() {
     // Person word 1.
     let mut fx = lot(sleeper());
     fx.thread(LAMP, 4096, &[3]);

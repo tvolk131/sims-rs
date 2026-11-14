@@ -19,8 +19,9 @@
 //! object's temps as its arguments. When it returns, the instruction takes
 //! the branch of its result. Before the push the running object is woken
 //! (its scheduler countdown goes back into the Sleep it waits in). A
-//! person that runs a tree this way also counts a use of the stack object,
-//! which is not ported and fails. Modes 0 and 1, which run the tree
+//! person that runs a tree this way also starts using the stack object
+//! (the person's virtual function 0x34, 0x45e59b;
+//! [`Machine::count_use`]), which its return ends. Modes 0 and 1, which run the tree
 //! synchronously or on the stack object's own thread, fail loudly, as does
 //! a string table other than 303.
 
@@ -77,15 +78,13 @@ impl Machine<'_, '_> {
                 operands[5]
             )));
         }
-        if self.me()?.person.is_some() {
-            return Err(Trap::Unsupported(
-                "Run Tree By Name by a person, which counts a use of the object".into(),
-            ));
-        }
         let temps = self.me()?.temps.clone();
         self.wake(self.me)?;
         self.frame_mut()?.primitive_state = RAN_TREE;
         self.enter_on(target as u16, tree, &temps)?;
+        if self.me()?.person.is_some() {
+            self.count_use(target as u16)?;
+        }
         Ok(Flow::Pushed)
     }
 }

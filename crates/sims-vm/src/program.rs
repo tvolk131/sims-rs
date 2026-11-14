@@ -1,5 +1,5 @@
 use crate::{Error, Result};
-use sims_content::{Animations, Catalog, Index, Object};
+use sims_content::{Animations, Catalog, Index, Object, People};
 use sims_formats::behavior::{Behavior, InteractionTable};
 use sims_formats::execution::{self, ObjectFunction, ObjectFunctions, Slots};
 use sims_formats::iff::Iff;
@@ -111,6 +111,12 @@ pub struct Program {
     /// install's animation files ([`sims_content::Animations::load`]), so
     /// [`Program::link`] leaves this empty for the caller to fill.
     pub animations: Animations,
+    /// The skeletons and profiles of the person types the lot may make or
+    /// reset: what a new person's constructor builds and what reading a
+    /// person's appearance again reads (0x5888d3). They come from the
+    /// install ([`sims_content::People::load`]), so [`Program::link`]
+    /// leaves this empty for the caller to fill.
+    pub people: People,
 }
 
 impl Program {
@@ -128,6 +134,7 @@ impl Program {
             careers: careers(index)?,
             zoning: BTreeMap::new(),
             animations: Animations::default(),
+            people: People::default(),
         };
         program.load(index, catalog.global)?;
         for guid in guids {

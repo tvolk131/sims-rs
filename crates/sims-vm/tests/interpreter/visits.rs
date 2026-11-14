@@ -592,12 +592,12 @@ fn a_person_the_reset_would_do_more_for_stops_its_visit() {
     assert!(wide.contains("whose data word 73 is set"), "{wide}");
     let away = fails(&|object| object.position = [-16, -16, 1]);
     assert!(away.contains("inside an object or off the lot"), "{away}");
-    // Without a neighborhood record, or with one that holds no person
-    // data, the visit fails before anything else.
+    // Without a neighborhood record, or with one whose revision is below
+    // 0, the visit fails before anything else.
     let nobody = lot_fails(&|world| world.neighbors.slots.clear());
     assert!(nobody.contains("has no neighborhood record"), "{nobody}");
-    let bare = lot_fails(&|world| world.neighbors.slots[0].as_mut().unwrap().revision = 0);
-    assert!(bare.contains("holds no person data"), "{bare}");
+    let bare = lot_fails(&|world| world.neighbors.slots[0].as_mut().unwrap().revision = -1);
+    assert!(bare.contains("has revision -1"), "{bare}");
     // The lot was not touched by any of it.
     assert!(fx.world.objects[&PERSON].stack.len() == 1);
 }

@@ -42,6 +42,20 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     let mut program = Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid))?;
     program.zoning = neighborhood.zoning(context.expansions)?;
     program.animations = Animations::load(&install, &index)?;
+    // Every person type's skeleton and appearance, for the people a script
+    // makes. A type whose skeleton cannot be chosen is left out; making a
+    // person of it fails.
+    program.people = People::load_each(
+        &install,
+        &index,
+        &catalog,
+        catalog
+            .objects
+            .iter()
+            .filter(|o| o.kind == 2)
+            .map(|o| o.guid),
+    )?
+    .0;
     let interpreter = Interpreter::new(&program, &catalog, Stream::Global);
     // The lot the game holds before the load: empty, with the
     // neighborhood's people, the type attributes the neighborhood saved
@@ -63,6 +77,14 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     // The load steps, in the original's order (docs/roadmap.md, load sequence). The
     // boot stops at the first one not implemented yet.
     world.read_simulator(&house.simulator);
+    // With the simulator state, the house file's model gives the house's
+    // usage counts (0x416568).
+    world.read_house_model(
+        house
+            .model
+            .as_ref()
+            .ok_or("the house file has no HOUS 1 chunk, which holds its model")?,
+    );
     world.apply_context(context)?;
     let created = interpreter.resize(&mut world)?.created;
     world.clear_family()?;

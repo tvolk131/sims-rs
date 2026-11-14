@@ -931,20 +931,49 @@ impl Interpreter<'_> {
     /// What the interface does when an object comes onto the lot from
     /// outside (0x44752e). If the lot has no indicator objects yet it
     /// creates them ([`Interpreter::ensure_indicators`], 0x445e4a). For a
-    /// person the original then moves the indicators to the selected Sim,
-    /// which is not ported and fails.
+    /// person it then does more in three cases, none of them ported, which
+    /// fail:
+    ///
+    /// - the person is the selected Sim: the first indicator moves to it
+    ///   (0x4475d2);
+    /// - person word 77 names an object (is above 0): the second
+    ///   indicator moves to that object (0x4477fb);
+    /// - the person is not selected and person word 81 is 10 or more:
+    ///   with bit 0x40 of the installed-expansions mask (application field
+    ///   +0x66, set on a Complete Collection install and not modeled), a
+    ///   pooled object moves to the person (0x447a82). This fails whatever
+    ///   the mask.
+    ///
+    /// Otherwise nothing more happens. A person word 77 below 0 names no
+    /// object and does nothing.
     fn placed_from_outside(&self, world: &mut World, id: u16) -> Result<(), Fault> {
         self.ensure_indicators(world)?;
-        if world.objects.get(&id).is_some_and(|o| o.person.is_some()) {
-            return Err(Fault {
+        let Some(object) = world.objects.get(&id) else {
+            return Ok(());
+        };
+        let Some(person) = &object.person else {
+            return Ok(());
+        };
+        let word = |index: usize| person.data.get(index).copied().unwrap_or(0);
+        let case = if object.selected {
+            Some("the selected Sim coming onto the lot moves the first indicator to it (0x4475d2)")
+        } else if word(77) > 0 {
+            Some(
+                "a person whose person word 77 names an object moves the second indicator there (0x4477fb)",
+            )
+        } else if word(81) >= 10 {
+            Some("a person whose person word 81 is 10 or more takes a pooled object (0x447a82)")
+        } else {
+            None
+        };
+        match case {
+            Some(what) => Err(Fault {
                 object: id,
                 at: None,
-                trap: Trap::Unsupported(
-                    "a person coming onto the lot moves the indicators; that is not ported".into(),
-                ),
-            });
+                trap: Trap::Unsupported(format!("{what}; not ported")),
+            }),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// The tiles of the group an object belongs to, lead tile first, or

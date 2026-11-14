@@ -1,8 +1,8 @@
 //! A person's animator clock and a layer's clock (0x585483, 0x597a88,
 //! 0x598636, 0x597c4c). Synthetic; no game data.
 
-use sims_core::F32;
-use sims_sim::animator::{Advance, LOADED, Layer};
+use sims_core::{Ext, F32};
+use sims_sim::animator::{Advance, Animator, LOADED, Layer, UNSET};
 
 const THOUSAND: F32 = F32::from_bits(0x447a_0000);
 
@@ -92,4 +92,74 @@ fn what_the_layer_update_does_not_port_fails() {
     let mut layer = Layer::start("c", THOUSAND, 4, true, false, 0);
     layer.fading = true;
     assert!(layer.update(50).unwrap_err().contains("fading"));
+}
+
+#[test]
+fn a_new_animator_stands_unplaced_with_no_posture() {
+    // 0x587d2c and 0x58464f.
+    let a = Animator::new(4_422_450);
+    assert_eq!(a.clock, 4_422_450);
+    assert_eq!(
+        (a.rate.to_bits(), a.target.to_bits()),
+        (0x3f80_0000, 0x3f80_0000)
+    );
+    assert_eq!((a.state, a.arrival, a.posture), (3, 0, -1));
+    assert_eq!(a.position, [UNSET; 3]);
+    assert_eq!(a.destination, [F32::ZERO; 3]);
+    assert!(!a.base && a.foreground.is_none() && !a.playing);
+    assert_eq!((a.selection, a.carry_selection, a.carry_mode), (-1, -1, 0));
+    // Only a reset raises the next foreground clip's priority.
+    assert!(!a.promote);
+    assert!(a.profile_stale);
+}
+
+#[test]
+fn a_reset_unplaces_the_animator_and_drops_its_posture() {
+    // 0x589220: what the person's tick leaves after it starts the
+    // posture's clip and places the animator off the lot.
+    let off_lot = Ext::from_i32(-16).single().to_f32();
+    let mut a = Animator {
+        rate: F32::from_bits(0x3f99_999a),
+        target: F32::from_bits(0x3fb3_3333),
+        position: [off_lot, off_lot, F32::ZERO],
+        destination: [off_lot, off_lot, F32::ZERO],
+        posture: 0,
+        base: true,
+        carry_mode: 1,
+        state: 0,
+        events: vec![3],
+        playing: true,
+        profile_stale: false,
+        ..Animator::new(4_422_450)
+    };
+    a.reset().unwrap();
+    assert_eq!(a.position, [UNSET; 3]);
+    // The destination and the speeds stay.
+    assert_eq!(a.destination, [off_lot, off_lot, F32::ZERO]);
+    assert_eq!(a.rate.to_bits(), 0x3f99_999a);
+    assert_eq!(
+        (a.posture, a.carry_mode, a.carry_selection, a.state),
+        (-1, 0, -1, 3)
+    );
+    assert!(!a.base && a.skin_dirty);
+    assert!(a.events.is_empty() && !a.playing);
+    assert!(a.promote && a.profile_stale);
+    // The load's state is a new animator reset.
+    let mut loaded = Animator::new(0);
+    loaded.reset().unwrap();
+    assert_eq!(loaded, LOADED);
+}
+
+#[test]
+fn a_reset_with_a_clip_playing_or_a_route_result_is_refused() {
+    let mut a = Animator {
+        foreground: Some(Layer::start("c", THOUSAND, 30, true, false, 0)),
+        ..LOADED
+    };
+    assert!(a.reset().unwrap_err().contains("0x592878"));
+    let mut a = Animator {
+        arrival: 2,
+        ..LOADED
+    };
+    assert!(a.reset().unwrap_err().contains("0x589e2d"));
 }
