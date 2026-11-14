@@ -43,7 +43,7 @@ pub struct Animations {
     /// location relative to the install.
     clips: BTreeMap<String, BTreeMap<String, Clip>>,
     /// The names of the sample files (`.cfp`), in lowercase, without the
-    /// extension.
+    /// extension or any directory an archive member's name holds.
     samples: BTreeSet<String>,
 }
 
@@ -80,7 +80,11 @@ impl Animations {
         for resource in resources {
             let name = resource.name().to_ascii_lowercase();
             if let Some(stem) = name.strip_suffix(".cfp") {
-                animations.samples.insert(stem.to_owned());
+                // An archive member's name can hold a directory, as
+                // ExpansionShared.far's "Animations\xskill-....cfp" does;
+                // the sample file is known by its own name.
+                let file = stem.rsplit(['\\', '/']).next().unwrap_or(stem);
+                animations.samples.insert(file.to_owned());
                 continue;
             }
             if !name.ends_with(".bcf") {
@@ -136,21 +140,44 @@ impl Animations {
 
     /// The clip named `name`, or why it cannot be told.
     ///
-    /// Fails when no file defines the name; when only a name that differs
-    /// in case does (whether the original's library ignores case is not
-    /// known); when two files define it differently (which one the library
-    /// keeps depends on its load order, which is not ported); and when the
-    /// clip's sample file is missing.
+    /// A name no file spells exactly is looked up without regard to ASCII
+    /// case. In the trace of the original's ticks, a script asks in tick
+    /// 3 for "a2o-idle-neutral-trans-stand-Rstand" (as the global file's
+    /// table spells it), the only file defines
+    /// "a2o-idle-neutral-trans-stand-rstand", and the original loads that
+    /// clip's samples during the tick and plays a clip of its duration
+    /// and frame count. Where its code ignores the case is not found: the
+    /// library's own table compares names byte for byte (0x5a27f2). So
+    /// this rule is taken from what the original did, and a name that
+    /// matches two names that differ only in case is refused.
+    ///
+    /// Also fails when no file defines the name; when two files define it
+    /// differently (which one the library keeps depends on its load
+    /// order, which is not ported); and when the clip's sample file is
+    /// missing.
     pub fn clip(&self, name: &str) -> std::result::Result<&Clip, Error> {
         let unsupported = |message: String| Err(Error::Unsupported(message));
-        let Some(definitions) = self.clips.get(name) else {
-            if let Some(other) = self.clips.keys().find(|k| k.eq_ignore_ascii_case(name)) {
-                return unsupported(format!(
-                    "no animation file defines the clip {name:?}, but one defines {other:?}; \
-                     whether the original's animation library ignores case is not known"
-                ));
+        let definitions = match self.clips.get(name) {
+            Some(definitions) => definitions,
+            None => {
+                let mut others = self
+                    .clips
+                    .iter()
+                    .filter(|(k, _)| k.eq_ignore_ascii_case(name));
+                match (others.next(), others.next()) {
+                    (Some((_, definitions)), None) => definitions,
+                    (Some((first, _)), Some((second, _))) => {
+                        return unsupported(format!(
+                            "no animation file defines the clip {name:?}, but files define \
+                             {first:?} and {second:?}, which differ from it only in case; \
+                             which one the original would play is not known"
+                        ));
+                    }
+                    _ => {
+                        return unsupported(format!("no animation file defines the clip {name:?}"));
+                    }
+                }
             }
-            return unsupported(format!("no animation file defines the clip {name:?}"));
         };
         let mut clips = definitions.iter();
         let Some((file, clip)) = clips.next() else {

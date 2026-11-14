@@ -43,6 +43,9 @@ use crate::visits::function;
 use sims_sim::World;
 use std::collections::BTreeSet;
 
+mod find;
+pub(crate) use find::Rules;
+
 /// The side of the lot's arrays.
 const FULL: i32 = 64;
 /// The object grids of the two levels.

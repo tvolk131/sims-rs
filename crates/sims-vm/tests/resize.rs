@@ -1436,7 +1436,7 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
     });
 }
 
-/// The first tick on the Goth house: the lot update (0x46d345) run once
+/// The first five ticks on the Goth house: the lot update (0x46d345) run
 /// from the state the load ends in.
 ///
 /// A second run of the original on the same install and house, private
@@ -1462,23 +1462,35 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// are equal when ours are read from the neighborhood file that run's
 /// game read. This test reads the install's file, which differs from
 /// that one in records 47, 48, 301, 344 and 351 (and 301's inventory).
-/// Read from either file, the rest of our state is the same after this
-/// tick and where the next one stops. Not equal:
-/// registry byte 0x12, which that run has set and ours has not; what sets
-/// it during the original's load is not known.
+/// Read from either file, the rest of our state is the same after each
+/// of the five ticks. Not equal after this tick: registry byte 0x12,
+/// which that run has set and ours sets only in tick 2; what sets it
+/// earlier in the original is not known.
 ///
 /// The three people's animators were compared too, from that run's
 /// memory pages: after this tick every field kept here that the pages
 /// hold is equal (58 readings; 23 fall on pages the run did not save).
 ///
-/// Tick 2 does not finish: it stops at Find Location For on object 364,
-/// as asserted below. At that stop, compared with that run after its
-/// tick 2: the people's animators (72 readings, including object 16's
-/// foreground layer) and the 355 objects below 364 in data words and
-/// frames (the people also in person data and motives) are equal, except
-/// data word 29 of object 262, which object 364 has just made and is
-/// about to place. Object 16's frames, arguments and locals there equal
-/// that run's after ticks 2 to 5.
+/// Ticks 2 to 5 run too. The same run holds the full state at the return
+/// of its lot updates 2 to 5, and each was compared with ours after the
+/// same tick, outside the repository, in the same fields as above and
+/// with floats bit for bit. Equal, after each of the four: everything
+/// listed for tick 1, the people's animators (every field kept here that
+/// the run's pages hold), and, read from that run's neighborhood file,
+/// the neighborhood. Not equal: the C runtime's random stream, 52 draws on
+/// in that run as after tick 1; neither side drew from it in these ticks.
+/// Read from the install's file, the neighborhood records named above
+/// differ as they do after tick 1, and nothing else.
+///
+/// Object 15's two-button dialog in tick 2 is answered with 3, the
+/// answer the capture's events show; how the run's player gave it is not
+/// held. People 18 and 21's clip in tick 3 is named "-Rstand" in the
+/// script and found only by ignoring case; the run shows the original
+/// playing the library's "-rstand" (`docs/decisions.md`).
+///
+/// Tick 6 is beyond the capture and **unverified**. It stops, as
+/// asserted below, where object 382 asks for a new person (Create New
+/// Object Instance mode 8), which is not ported.
 ///
 /// Not compared, because the capture does not hold them in a form read
 /// there: the rooms, the lot arrays, the dialog records and the persons'
@@ -1492,6 +1504,7 @@ fn the_goth_house_first_tick_matches_the_original() {
     const TICK_1_9: &str = "62fc28f5e7689d166791a620dbed066fb8a7d707ea79017fbadf0eed3da5c937";
     const TICK_1_10: &str = "bb55f7d5f656551708867b24779c2e0f019825459427858a27ad8c8874e7957b";
     const TICK_1: &str = "c2fa1ed11813b8ab67214f7177e1bb27a2e25ae2ecef94c3c1172071d5682400";
+    const TICK_5: &str = "b1dfa48cff23e2b5ef92d4e2b9d2386d2fea55857210c0856c38275c19acea9e";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1542,47 +1555,37 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert_eq!(digest(&format_9_bytes(world)), TICK_1_9);
         assert_eq!(digest(&format_10_bytes(world)), TICK_1_10);
         assert_eq!(world.hash_hex(), TICK_1);
-        // The second tick gets past the neighborhood's people (Set To Next
-        // modes 5 and 7, their person data, their relationships and
-        // inventories), Idle For Input and Get Distance To. Person 16
-        // starts a clip with Animate Sim and yields; the capture shows that
-        // person at the same instruction after ticks 2 to 5, with the same
-        // frames (the 254 in its last local is a return's target left in
-        // the frame storage). The controllers' answered dialogs go on to
-        // Stop All Sounds. The tick stops when controller 364 makes object
-        // 262 again and looks for a place for it (Find Location For, which
-        // is not ported).
-        let second = interpreter.lot_update(world, &tuning, &mut player);
-        match second {
-            Err(sims_vm::TickError::Fault(fault)) => {
-                assert_eq!(fault.object, 364);
-                assert!(fault.to_string().contains("Find Location For"), "{fault}");
-            }
-            other => panic!("{other:?}"),
+        // Ticks 2 to 5. Person 16 starts a clip with Animate Sim in tick 2
+        // and yields; the capture shows that person at the same
+        // instruction after ticks 2 to 5, with the same frames (the 254 in
+        // its last local is a return's target left in the frame storage).
+        // Controller 364 makes object 262 again and puts it down with Find
+        // Location For. Object 15 asks a two-button dialog, answered with
+        // 3 as the capture's events show. In tick 3 people 18 and 21 start
+        // a clip and 35 objects are queued for removal.
+        let mut player = sims_vm::Answers { queue: [3].into() };
+        let mut shape = vec![];
+        for _ in 2..=5 {
+            let update = interpreter.lot_update(world, &tuning, &mut player).unwrap();
+            assert!(update.full);
+            shape.push((
+                update.counted.len(),
+                update.ticked.len(),
+                update.answered.clone(),
+                update.removed.len(),
+            ));
         }
-        // Person 16's clip started at the second tick's clock and its first
-        // update came at the same clock, so it has not moved; the
-        // foreground priority is raised once (0x592726).
-        let animator = &world.animators[&16];
-        let now = animator.clock_at(before.ticks as i32 + 1);
         assert_eq!(
-            (animator.state, animator.playing, animator.clock),
-            (0, true, now)
+            shape,
+            [
+                (357, 20, vec![(15, 3)], 0),
+                (276, 103, vec![], 35),
+                (340, 4, vec![], 0),
+                (340, 4, vec![], 0),
+            ]
         );
-        let layer = animator.foreground.as_ref().unwrap();
-        assert_eq!(
-            (layer.priority, layer.current, layer.previous),
-            (6, now, now)
-        );
-        assert_eq!(
-            (layer.phase, layer.event_time, layer.interruptible),
-            (sims_core::F32::ZERO, 0, 1)
-        );
-        // The other two stand, as the capture shows them after the tick.
-        for id in [18, 21] {
-            assert_eq!(world.animators[&id].state, 3);
-            assert!(world.animators[&id].foreground.is_none());
-        }
+        assert_eq!(world.ticks, before.ticks + 5);
+        assert_eq!(world.crt_rng, before.crt_rng);
         let frames: Vec<_> = world.objects[&16]
             .stack
             .iter()
@@ -1599,5 +1602,16 @@ fn the_goth_house_first_tick_matches_the_original() {
             ]
         );
         assert_eq!(world.objects[&16].stack[4].locals, [0, 3, 8222, 254]);
+        assert_eq!(world.hash_hex(), TICK_5);
+        // Tick 6, beyond the capture: object 382 asks for a new person
+        // where the pedestrian portal stands (Create New Object Instance
+        // mode 8), which is not ported.
+        match interpreter.lot_update(world, &tuning, &mut player) {
+            Err(sims_vm::TickError::Fault(fault)) => {
+                assert_eq!(fault.object, 382);
+                assert!(fault.to_string().contains("new person"), "{fault}");
+            }
+            other => panic!("{other:?}"),
+        }
     });
 }
