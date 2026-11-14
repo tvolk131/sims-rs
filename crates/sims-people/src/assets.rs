@@ -16,14 +16,15 @@
 //! (0x413ccc), the reverse of this order. The Complete Collection has 47
 //! such names (accessory textures, a few animation and mesh files); on the
 //! Goth family every file it reads either has one source or identical
-//! copies (see the gated tests). Appearances do follow the original's
-//! order (see [`crate::appearance::load_appearance`]).
+//! copies (see the gated tests). Appearance catalogs are loaded in the
+//! original's own order instead (see [`crate::appearance::load_appearance`]).
 
 use sims_content::{Member, Resource};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Where person files are searched, in order, relative to the install.
 /// A directory is listed (with its subdirectories); every FAR archive in
@@ -53,6 +54,10 @@ pub struct Assets {
     /// The install the files were found under.
     root: PathBuf,
     files: BTreeMap<String, Vec<Resource>>,
+    /// Where each appearance is loaded from, by lowercase name: the
+    /// catalog's file name and source. Built on first use
+    /// ([`crate::appearance::load_appearance`]).
+    appearances: OnceLock<BTreeMap<String, (String, Resource)>>,
 }
 
 impl Assets {
@@ -165,6 +170,15 @@ impl Assets {
         folder.to_ascii_lowercase()
     }
 
+    /// The appearance index, built by `build` the first time it is asked
+    /// for.
+    pub(crate) fn appearances(
+        &self,
+        build: impl FnOnce() -> BTreeMap<String, (String, Resource)>,
+    ) -> &BTreeMap<String, (String, Resource)> {
+        self.appearances.get_or_init(build)
+    }
+
     /// Whether the sources of `name` disagree: two of them hold different
     /// bytes. Reads every source.
     pub fn conflicts(&self, name: &str) -> Result<bool, String> {
@@ -268,7 +282,7 @@ mod tests {
     fn a_file_is_in_its_folder_and_a_member_in_its_archives() {
         let assets = Assets {
             root: PathBuf::from("/install"),
-            files: BTreeMap::new(),
+            ..Assets::default()
         };
         let resource = |path: &str, member: Option<&str>| Resource {
             mount: 0,

@@ -29,6 +29,7 @@ use sims_formats::avatar::{
     Appearance, Catalog, Mesh, Skeleton, read_bcf, read_bmf, read_cmx, read_skn,
 };
 use sims_formats::saved_objects::Person;
+use std::collections::BTreeMap;
 
 /// The appearances a person wears, each with its texture string.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,72 +242,97 @@ fn appearance_rank(folder: &str) -> usize {
         .unwrap_or(APPEARANCE_FOLDERS.len())
 }
 
-/// The appearance named `name`.
+/// The appearance named `name`, from the catalog the original takes it
+/// from.
 ///
-/// The original loads every catalog in its search folders, in their order
-/// ([`APPEARANCE_FOLDERS`]), and keeps the first appearance of each name: a
-/// later record of a name already loaded is released (0x59f087, the
-/// records' loop, and 0x5954a5). So here the catalogs named after the
-/// appearance, `<name>.cmx.bcf` and `<name>.cmx`, are tried in that folder
-/// order, and the first that holds it wins. Within one folder the binary
-/// form is tried first; the original's order there is the file map's,
-/// which is not ported, and no folder of the install holds both.
+/// The original loads every catalog in its search folders at startup and
+/// keeps the first appearance of each name: a later record of a name
+/// already loaded is released (0x59f087, the records' loop, and 0x5954a5).
+/// Its file list (0x5c1a7d, as the old prototype ported it:
+/// legacy/crates/sims-sim/src/pose/clothing/catalog_files.rs) takes every
+/// text catalog (`.cmx`) in every folder before any binary one (`.bcf`),
+/// the folders in [`APPEARANCE_FOLDERS`] order, and skips a file name
+/// already listed from an earlier folder. [`load_order`] puts the
+/// install's catalogs in that order and [`index`] keeps the first of each
+/// name, so `B629MAFitlgt_labtech` is found in `b629ma_labtech.cmx` and
+/// `b200mafit_ctb` in `GameData/Skins`, as in the original.
 ///
-/// Failing those, the first catalog in name order that holds an appearance
-/// of that name is used. Career uniforms need this: `B629MAFitlgt_labtech`
-/// is in `b629ma_labtech.cmx`. In the Complete Collection, the only
-/// appearance two catalogs give differently is `b200mafit_ctb`, and both
-/// are named after it, so that fallback order picks nothing the original
-/// would not.
+/// Two things are approximated. Files in one folder are taken in name
+/// order; the original's order there is its file map's, which is not
+/// ported, and no folder of the install holds two catalogs that give the
+/// same appearance. And catalogs in folders the original does not search
+/// (such as an expansion's object folder) are loaded after all the others,
+/// where the original may not load them at all.
 pub fn load_appearance(assets: &Assets, name: &str) -> Result<Appearance, String> {
-    let find = |catalog: Catalog| {
-        catalog
-            .appearances
-            .into_iter()
-            .find(|a| a.name.eq_ignore_ascii_case(name))
-    };
-    let mut named = Vec::new();
-    for file in [format!("{name}.cmx.bcf"), format!("{name}.cmx")] {
-        for resource in assets.sources(&file) {
-            named.push((
-                appearance_rank(&assets.folder(resource)),
-                file.clone(),
-                resource,
-            ));
+    let index = assets.appearances(|| {
+        let mut files = Vec::new();
+        for file in assets.names().filter(|n| is_catalog(n)) {
+            for resource in assets.sources(file) {
+                files.push((file.to_owned(), assets.folder(resource), resource.clone()));
+            }
         }
-    }
-    // A stable sort: in one folder, the binary form stays first.
-    named.sort_by_key(|(rank, _, _)| *rank);
-    for (_, file, resource) in named {
-        let bytes = resource.read().map_err(|e| format!("{file}: {e}"))?;
-        if let Some(appearance) = find(parse_catalog(&file, &bytes)?) {
-            return Ok(appearance);
-        }
-    }
-    for file in assets
-        .names()
-        .filter(|n| n.ends_with(".cmx") || n.ends_with(".cmx.bcf"))
-    {
-        // Skeleton and animation files are not appearance catalogs.
-        if file.ends_with("-skeleton.cmx.bcf") {
-            continue;
-        }
-        let Ok(catalog) = read_catalog(assets, file) else {
-            continue;
-        };
-        if let Some(appearance) = find(catalog) {
-            return Ok(appearance);
-        }
-    }
-    Err(format!("no catalog holds the appearance {name:?}"))
+        index(load_order(files).into_iter().map(|(file, resource)| {
+            let catalog = resource
+                .read()
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| parse_catalog(&file, &bytes));
+            ((file, resource), catalog)
+        }))
+    });
+    let (file, resource) = index
+        .get(&name.to_ascii_lowercase())
+        .ok_or_else(|| format!("no catalog holds the appearance {name:?}"))?;
+    let bytes = resource.read().map_err(|e| format!("{file}: {e}"))?;
+    parse_catalog(file, &bytes)?
+        .appearances
+        .into_iter()
+        .find(|a| a.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| format!("{file} no longer holds the appearance {name:?}"))
 }
 
-/// A catalog file, binary (`.cmx.bcf`) or text (`.cmx`).
-fn read_catalog(assets: &Assets, file: &str) -> Result<Catalog, String> {
-    parse_catalog(file, &assets.read(file)?)
+/// Whether the file `name` (lowercase) is an appearance catalog: a text or
+/// binary catalog that is not a skeleton's.
+fn is_catalog(name: &str) -> bool {
+    (name.ends_with(".cmx") || name.ends_with(".cmx.bcf")) && !name.ends_with("-skeleton.cmx.bcf")
 }
 
-/// The catalog `bytes` hold, read by the form `file`'s name gives.
+/// Catalog files, each with its lowercase file name and folder
+/// ([`Assets::folder`]), in the order the original loads them: every text
+/// catalog before any binary one, each kind by folder
+/// ([`APPEARANCE_FOLDERS`], other folders last), and in one folder by the
+/// order given. A file name already taken from an earlier folder is
+/// dropped.
+fn load_order<T>(mut files: Vec<(String, String, T)>) -> Vec<(String, T)> {
+    files.sort_by_key(|(file, folder, _)| (file.ends_with(".bcf"), appearance_rank(folder)));
+    let mut seen = std::collections::BTreeSet::new();
+    files
+        .into_iter()
+        .filter(|(file, _, _)| seen.insert(file.clone()))
+        .map(|(file, _, item)| (file, item))
+        .collect()
+}
+
+/// For each appearance name (lowercase), the first catalog in `catalogs`
+/// that holds it. A catalog that could not be read is skipped, as the
+/// original goes on after a file it cannot read.
+fn index<T>(catalogs: impl IntoIterator<Item = (T, Result<Catalog, String>)>) -> BTreeMap<String, T>
+where
+    T: Clone,
+{
+    let mut index = BTreeMap::new();
+    for (location, catalog) in catalogs {
+        let Ok(catalog) = catalog else { continue };
+        for appearance in catalog.appearances {
+            index
+                .entry(appearance.name.to_ascii_lowercase())
+                .or_insert_with(|| location.clone());
+        }
+    }
+    index
+}
+
+/// The catalog `bytes` hold: binary for a `.bcf` file name, text
+/// otherwise.
 fn parse_catalog(file: &str, bytes: &[u8]) -> Result<Catalog, String> {
     if file.ends_with(".bcf") {
         read_bcf(bytes).map_err(|e| format!("{file}: {e}"))
@@ -363,6 +389,53 @@ mod tests {
             Outfit::from_body_strings(&strings[..2]).parts,
             [pair("body_01", "BODY=bodytex")]
         );
+    }
+
+    #[test]
+    fn catalogs_load_text_first_then_by_folder() {
+        let file = |name: &str, folder: &str, id: u32| (name.to_owned(), folder.to_owned(), id);
+        let order = load_order(vec![
+            file("a.cmx.bcf", "gamedata/skins", 1),
+            file("a.cmx", "deluxe/skins", 2),
+            file("b.cmx", "somewhere/else", 3),
+            file("b.cmx", "expansionpack7/skins", 4),
+            file("c.cmx", "gamedata/skins", 5),
+            file("b.cmx", "gamedata/skins", 6),
+            file("d.cmx.bcf", "expansionshared/skins", 7),
+        ]);
+        let ids: Vec<u32> = order.iter().map(|(_, id)| *id).collect();
+        // Text before binary, however early the binary's folder; by folder
+        // within each; a name already taken from an earlier folder is
+        // dropped (3 and 4 lose to 6); one folder keeps the order given.
+        assert_eq!(ids, [5, 6, 2, 1, 7]);
+        assert_eq!(order[0].0, "c.cmx");
+    }
+
+    #[test]
+    fn the_first_catalog_that_holds_a_name_keeps_it() {
+        let catalog = |names: &[&str]| {
+            let appearances = names
+                .iter()
+                .map(|name| Appearance {
+                    name: (*name).into(),
+                    kind: 0,
+                    bindings: Vec::new(),
+                })
+                .collect();
+            Ok(Catalog {
+                skeletons: Vec::new(),
+                appearances,
+            })
+        };
+        let index = index([
+            (1, catalog(&["Shirt"])),
+            (2, Err("unreadable".to_owned())),
+            (3, catalog(&["shirt", "Hat"])),
+        ]);
+        assert_eq!(index.get("shirt"), Some(&1));
+        // A catalog that cannot be read does not stop the ones after it.
+        assert_eq!(index.get("hat"), Some(&3));
+        assert_eq!(index.len(), 2);
     }
 
     #[test]
