@@ -113,6 +113,8 @@ class FakeMemory:
         return 1
 
     def read(self, p, n):
+        if p == self.remote.current.get('unreadable'):
+            raise MemoryError(f'read {p:#x}')
         return bytes(n)
 
     def summary(self, sim, teb):
@@ -123,10 +125,13 @@ class FakeMemory:
 
 
 class CaptureTest(unittest.TestCase):
-    def run_capture(self, stops, extra):
+    def run_capture(self, stops, extra, prepare=None):
         temporary = tempfile.TemporaryDirectory(prefix='sims-capture-test-')
         self.addCleanup(temporary.cleanup)
         output = Path(temporary.name) / 'capture'
+        if prepare:
+            output.mkdir()
+            prepare(output)
         remote = FakeRemote(stops)
         dump_calls = []
         with patch.object(capture, 'Remote', return_value=remote), \
@@ -181,6 +186,60 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual([r['address'] for r in lost], [0x80088])  # no animator: it waits again
         armed = self.events(output, 'watch_armed')
         self.assertEqual([r['address'] for r in armed], [0x70088, 0x90088])
+
+    def test_two_watches_can_share_a_watchpoint(self):
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=capture.ENTRY, animator=0x80000),  # direction moves onto x's address
+            dict(pc=0x123456, animator=0x80000, reply='T05watch:80088;'),
+            dict(pc=capture.RETURN, animator=0x80000),
+            dict(pc=capture.ENTRY, animator=0x90000),  # and off it again
+            dict(pc=capture.RETURN, animator=0x90000)],
+            ['--updates', '3', '--watch', 'x=0x80088', '--watch', 'direction=person:259@0xadc+0x88'])
+        self.assertEqual(remote.watch_calls, [(0x80088, 4), (0x70088, 4), (0x90088, 4)])
+        # x's watchpoint stays until the end; only then is everything cleared.
+        self.assertEqual(remote.cleared_watches, [(0x70088, 4), (0x80088, 4), (0x90088, 4)])
+        rows = self.rows(output / 'watch.jsonl')
+        self.assertEqual(sorted(r['name'] for r in rows), ['direction', 'x'])
+
+    def test_an_unreadable_new_address_puts_the_watch_back_to_wait(self):
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=capture.ENTRY, animator=0xa0000, unreadable=0xa0088),
+            dict(pc=capture.RETURN, animator=0xa0000)],
+            ['--updates', '2', '--watch', 'direction=person:259@0xadc+0x88'])
+        self.assertEqual([r['address'] for r in self.events(output, 'watch_lost')], [0x70088])
+        self.assertEqual([r['address'] for r in self.events(output, 'watch_armed')], [0x70088, 0xa0088])
+        self.assertEqual(json.loads((output / 'status.json').read_text())['state'], 'complete')
+
+    def resumed_at_entry(self, done):
+        def prepare(output):
+            (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
+            (output / 'updates.jsonl').write_text('')
+            d = output / 'dump-0001'
+            d.mkdir()
+            (d / '00010000.bin').write_bytes(b'partial')
+            if done:
+                (d / 'registers.json').write_text('{}')
+        return prepare
+
+    def test_a_dump_cut_short_is_redone_on_resume(self):
+        # The earlier run was killed while dumping at update 1's entry; the guest is still stopped there.
+        remote, output, calls = self.run_capture(
+            [dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '1', '--dump', '1', '--guest-dir', '/tmp/synthetic-guest', '--resume'],
+            prepare=self.resumed_at_entry(done=False))
+        self.assertEqual([c[2].name for c in calls], ['dump-0001'])
+        self.assertEqual(len(self.events(output, 'redo_incomplete_dump')), 1)
+        self.assertFalse((output / 'dump-0001' / '00010000.bin').exists())
+
+    def test_a_finished_dump_is_kept_on_resume(self):
+        remote, output, calls = self.run_capture(
+            [dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '1', '--dump', '1', '--guest-dir', '/tmp/synthetic-guest', '--resume'],
+            prepare=self.resumed_at_entry(done=True))
+        self.assertEqual(calls, [])
+        self.assertEqual(len(self.events(output, 'dump_done_already')), 1)
 
     def test_a_fixed_address_watch_is_not_moved(self):
         remote, output, _ = self.run_capture([

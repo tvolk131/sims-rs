@@ -285,7 +285,10 @@ class Watch:
         return a
 
     def read(self, m):
-        return m.read(self.address, self.size).hex()
+        return self.read_at(m, self.address)
+
+    def read_at(self, m, address):
+        return m.read(address, self.size).hex()
 
 
 def frame_chain(m, ebp, n=24):
@@ -429,49 +432,60 @@ def main():
     in_update = False
     watches = args.watch
     pending = list(watches)
-    armed_watches = {}
+    live_watches = []  # watches set, each at its .address
+    hardware = {}  # (address, size) -> how many armed watches use that watchpoint
+
+    def hardware_add(a, size):
+        if not hardware.get((a, size)):
+            remote.set_watch(a, size)
+        hardware[(a, size)] = hardware.get((a, size), 0) + 1
+
+    def hardware_remove(a, size):
+        hardware[(a, size)] -= 1
+        if not hardware[(a, size)]:
+            del hardware[(a, size)]
+            remote.clear_watch(a, size)
+
+    def locate(w, m):
+        """(address, value) for watch w now, or None if it cannot be worked out or read."""
+        try:
+            a = w.resolve(m, sim)
+            return None if a is None else (a, w.read_at(m, a))
+        except MemoryError:
+            return None
 
     def arm_watches(m):
         for w in list(pending):
-            try:
-                a = w.resolve(m, sim)
-                if a is not None:
-                    w.address = a
-                    w.value = w.read(m)
-            except MemoryError:
-                a = None
-            if a is None:
+            found = locate(w, m)
+            if found is None:
                 continue
-            remote.set_watch(a, w.size)
-            armed_watches[a] = w
+            w.address, w.value = found
+            hardware_add(w.address, w.size)
+            live_watches.append(w)
             pending.remove(w)
-            event(kind='watch_armed', name=w.name, expr=w.text, address=a, value=w.value, update=updates)
+            event(kind='watch_armed', name=w.name, expr=w.text, address=w.address, value=w.value, update=updates)
 
     def check_watches(m):
         """At a stop in the game, work out the moving watches again: move a
         watchpoint whose address changed, and put one that cannot be worked
-        out back to wait."""
-        for a, w in list(armed_watches.items()):
+        out (or read) back to wait."""
+        for w in list(live_watches):
             if not w.moves:
                 continue
-            try:
-                now = w.resolve(m, sim)
-            except MemoryError:
-                now = None
-            if now == a:
+            found = locate(w, m)
+            if found is not None and found[0] == w.address:
                 continue
-            remote.clear_watch(a, w.size)
-            del armed_watches[a]
-            if now is None:
+            old = w.address
+            hardware_remove(old, w.size)
+            if found is None:
+                live_watches.remove(w)
                 w.address = w.value = None
                 pending.append(w)
-                event(kind='watch_lost', name=w.name, expr=w.text, address=a, update=updates)
+                event(kind='watch_lost', name=w.name, expr=w.text, address=old, update=updates)
                 continue
-            remote.set_watch(now, w.size)
-            armed_watches[now] = w
-            w.address = now
-            w.value = w.read(m)
-            event(kind='watch_moved', name=w.name, expr=w.text, old_address=a, address=now, value=w.value,
+            w.address, w.value = found
+            hardware_add(w.address, w.size)
+            event(kind='watch_moved', name=w.name, expr=w.text, old_address=old, address=w.address, value=w.value,
                   update=updates)
 
     def watch_hit(reply, regs, m):
@@ -480,26 +494,37 @@ def main():
             # The same virtual address in another process.
             event(kind='foreign_watch', address=hit, pc=regs['eip'], cr3=regs['cr3'], update=updates)
             return
-        w = armed_watches.get(hit) or next((w for w in armed_watches.values()
-                                             if w.address <= hit < w.address + w.size), None)
-        row = dict(update=updates + (1 if in_update else 0), in_update=in_update, address=hit,
-                   name=w.name if w else None, registers=regs, eip=regs['eip'])
-        try:
-            row['tick'] = m.word(sim + 0x98) if sim else None
-            if w:
-                row['before'], w.value = w.value, w.read(m)
-                row['after'] = w.value
-            row['frames'] = frame_chain(m, regs['ebp'])
-            row['stack'] = m.read(regs['esp'], 0x400).hex()
-        except MemoryError as e:
-            row['error'] = str(e)
-        row['time'] = time.time()
-        watch_log.write(json.dumps(row) + '\n')
-        watch_log.flush()
+        # One row per watch on the written bytes (one with name null if none is).
+        hits = [w for w in live_watches if w.address == hit] or [w for w in live_watches if w.address <= hit < w.address + w.size]
+        for w in hits or [None]:
+            row = dict(update=updates + (1 if in_update else 0), in_update=in_update, address=hit,
+                       name=w.name if w else None, registers=regs, eip=regs['eip'])
+            try:
+                row['tick'] = m.word(sim + 0x98) if sim else None
+                if w:
+                    row['before'], w.value = w.value, w.read(m)
+                    row['after'] = w.value
+                row['frames'] = frame_chain(m, regs['ebp'])
+                row['stack'] = m.read(regs['esp'], 0x400).hex()
+            except MemoryError as e:
+                row['error'] = str(e)
+            row['time'] = time.time()
+            watch_log.write(json.dumps(row) + '\n')
+            watch_log.flush()
 
     def save_dump(n, regs, raw):
+        d = out / f'dump-{n:04d}'
+        if d.exists():
+            # Left by the run this one took over from: done if its last file was written, else redone.
+            if (d / 'registers.json').exists():
+                event(kind='dump_done_already', update=n)
+                return
+            for f in d.iterdir():
+                f.unlink()
+            d.rmdir()
+            event(kind='redo_incomplete_dump', update=n)
         t0 = time.time()
-        size = dump(args.container, args.guest_dir, out / f'dump-{n:04d}', regs, raw)
+        size = dump(args.container, args.guest_dir, d, regs, raw)
         event(kind='dump', update=n, bytes=size, seconds=time.time() - t0)
 
     baseline = False
@@ -519,6 +544,8 @@ def main():
                 remote.clear_break(a)
         for a in ((RETURN,) if baseline else (ENTRY,)) + (DIALOG_SHOW, DIALOG_RESULT, DIALOG_READ):
             arm(a)
+        if baseline and updates + 1 in dump_set:
+            arm(ENTRY)  # taken over before a dump at the next entry (or in the middle of it)
         if watches:
             arm(ENTRY)
             if args.resume:
@@ -645,7 +672,7 @@ def main():
                 event(**row)
                 if pc == DIALOG_SHOW:
                     save_status(dialog=dict(update=updates + 1, record=record, shown=time.time()))
-            if not foreign and armed_watches:
+            if not foreign and live_watches:
                 check_watches(m)
             if not foreign and pending:
                 arm_watches(m)
@@ -674,8 +701,8 @@ def main():
                 remote.interrupt()
             for a in list(breaks):
                 remote.clear_break(a)
-            for a, w in armed_watches.items():
-                remote.clear_watch(a, w.size)
+            for a, size in list(hardware):
+                remote.clear_watch(a, size)
         finally:
             try:
                 remote.detach()

@@ -27,13 +27,15 @@ finding in `scripts/check_repository.py` is fixed separately.
   replaced, the watchpoint moves to the new one (`watch_moved`), or waits if
   there is none (`watch_lost`). Writes between the replacement and that stop
   are missed. A watchpoint set at each change of the pointer itself would
-  catch them; that is not done.
+  catch them; that is not done. Watches that land on the same bytes share
+  one hardware watchpoint, which stays until the last of them leaves.
 - **Pages.** An animator or layer that ends on a page boundary made the
   snapshot ask for the next page, which it had not read, and the capture
   ended with a `KeyError`. The last page is now that of the last byte.
   `pages.json.gz` no longer holds a page past the end of such a block.
 - **`--dump 1` works.** Update 1's entry is the baseline's stop, which never
-  dumped.
+  dumped. A run taken over with `--resume` in the middle of a dump redoes it
+  (a dump is complete once its `registers.json` is written).
 - **The stub's checks hold under `python -O`.** The packet checksum and the
   allowlists that keep `rsp.py` and `qmp.py` read-only were asserts. They are
   now explicit checks.

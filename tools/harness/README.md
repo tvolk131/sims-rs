@@ -101,7 +101,8 @@ Things to know:
 - **Taking over a running capture.** Kill `capture.py` and its `docker exec`
   relay while the guest is stopped, so the run never detaches. Then start
   `capture.py` again with the same arguments plus `--resume`. It continues the
-  same directory and numbering, and redoes the update it was in the middle of.
+  same directory and numbering, and redoes the update it was in the middle of
+  (and a dump it was in the middle of).
 - **Memory dumps.** `--dump 14,47 --guest-dir <guest dir>` also saves,
   at the entry of each listed lot update, every present user page of the
   game's process (`dump-NNNN/`; update 1's entry is the baseline's stop). QEMU writes each range into the guest
@@ -127,8 +128,9 @@ Things to know:
   `watch.jsonl`. A watch through an object or a pointer is worked out again
   at every stop in the game. If the address moved (an animator was
   replaced), the watchpoint moves too (`watch_moved`). If it cannot be worked
-  out, it waits again (`watch_lost`). Writes between the change and that stop
-  are missed.
+  out or read, it waits again (`watch_lost`). Writes between the change and
+  that stop are missed. Watches on the same bytes share a watchpoint, and a
+  write to them is logged once for each watch.
 
 ## Output
 
