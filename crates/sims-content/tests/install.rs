@@ -340,8 +340,9 @@ fn a_member_nested_too_deeply_is_left_out() {
         &far(&[(&deep, b"deep"), (&shallow, b"shallow")]),
     );
     let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
-    assert_eq!(index.named(&shallow).count(), 1);
-    assert_eq!(index.named(&deep).count(), 0);
+    let listed = |name: &str| index.resources.iter().any(|r| r.name() == name);
+    assert!(listed(&shallow));
+    assert!(!listed(&deep));
     assert_eq!(index.diagnostics.len(), 1);
     assert!(index.diagnostics[0].contains("in 33 directories"));
 }
@@ -358,4 +359,59 @@ fn a_compressed_member_of_the_animation_archives_fails_the_load() {
     let index = Index::build(&install).unwrap();
     let error = sims_content::Animations::load(&install, &index).unwrap_err();
     assert!(error.to_string().contains("compressed member clips.bcf"));
+}
+
+/// A FAR whose member names are given as raw bytes.
+fn far_raw(members: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let named: Vec<(String, &[u8])> = members
+        .iter()
+        .map(|(name, data)| ("x".repeat(name.len()), *data))
+        .collect();
+    let named: Vec<(&str, &[u8])> = named.iter().map(|(n, d)| (n.as_str(), *d)).collect();
+    let mut bytes = far(&named);
+    // Each placeholder name is as long as its raw name, so the directory
+    // keeps its layout; overwrite the names in order.
+    let mut at = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize + 4;
+    for (name, _) in members {
+        at += 16;
+        bytes[at..at + name.len()].copy_from_slice(name);
+        at += name.len();
+    }
+    bytes
+}
+
+#[test]
+fn archive_member_names_hash_as_stored_bytes() {
+    let tree = Tree::new("member-code-page");
+    base_game(&tree);
+    // "café.iff" in Windows-1252, as an archive stores it. Its bytes hash
+    // to bucket 158 of 193, after obj0.iff's 43; the name's UTF-8 bytes
+    // would hash to bucket 0 and list it first.
+    tree.file(
+        "Downloads/p.far",
+        &far_raw(&[(b"obj0.iff", b"ascii"), (b"caf\xe9.iff", b"archive")]),
+    );
+    let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
+    let names: Vec<_> = index
+        .resources
+        .iter()
+        .filter(|r| r.mount == 3)
+        .map(|r| r.name())
+        .collect();
+    assert_eq!(names, ["obj0.iff", "café.iff"]);
+}
+
+#[test]
+fn a_loose_file_replaces_the_member_its_name_encodes_to() {
+    let tree = Tree::new("loose-code-page");
+    base_game(&tree);
+    // The member's name is Windows-1252; the loose file's, on disk, UTF-8.
+    tree.file("Downloads/p.far", &far_raw(&[(b"Caf\xe9.iff", b"archive")]))
+        .file("Downloads/Café.iff", b"loose");
+    let index = Index::build(&Install::detect(&tree.0).unwrap()).unwrap();
+    let found: Vec<_> = index
+        .named("Café.iff")
+        .map(|(_, r)| r.read().unwrap())
+        .collect();
+    assert_eq!(found, [b"loose".to_vec()]);
 }
