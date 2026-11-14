@@ -12,8 +12,10 @@ pub enum SoundEvent {
     /// object. `object` is the simulation's object ID; scripts read it
     /// back through [`crate::player::Sources`].
     Play { object: u32, name: String },
-    /// Stop every sound one object started.
+    /// An object goes: what the game does with kind 23. Each track the
+    /// object is recorded as playing for fades out and ends, unless
+    /// another object still has it (see [`crate::player`]).
     StopObject { object: u32 },
-    /// Stop every sound.
+    /// Stop every sound at once (kind 20).
     StopAll,
 }
