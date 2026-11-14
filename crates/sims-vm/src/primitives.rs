@@ -3,6 +3,7 @@
 //! implementation fails with [`Trap::Unimplemented`], which names it.
 
 mod create;
+pub(crate) mod dialog;
 mod events;
 mod expression;
 mod generic;
@@ -107,6 +108,7 @@ impl Machine<'_, '_> {
             31 => self.set_to_next(operands)?.into(),
             42 => self.create_object(operands)?.into(),
             32 => self.test_object_type(operands)?.into(),
+            36 => self.dialog(operands)?,
             49 => self.notify()?.into(),
             opcode => return Err(Trap::Unimplemented { opcode }),
         })

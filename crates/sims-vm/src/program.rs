@@ -35,6 +35,9 @@ pub struct Library {
     pub tree_names: Vec<String>,
     /// Named tuning tables (FCNS) by chunk ID.
     pub tuning: BTreeMap<u16, sims_formats::tuning::Constants>,
+    /// Each string table (STR#) by chunk ID: its entries in the first
+    /// language, in order.
+    pub strings: BTreeMap<u16, Vec<String>>,
 }
 
 /// The string table Run Tree By Name instructions name their trees in.
@@ -42,6 +45,15 @@ pub const TREE_NAMES: u16 = 303;
 
 /// The global file's tuning table that holds the room score constants.
 const ROOM_TUNING: u16 = 3;
+
+/// The global file's tuning tables with the motive decay rates of the
+/// three kinds of person, in kind order.
+const MOTIVE_TUNING: [u16; 3] = [1, 5, 6];
+
+/// The global file's string tables with the curves that weigh an adult's
+/// and a child's motives in the mood.
+const ADULT_MOOD: u16 = 502;
+const CHILD_MOOD: u16 = 504;
 
 /// The words in a registered object definition: the original keeps every
 /// OBJD as a 216-byte record.
@@ -150,15 +162,19 @@ impl Program {
                     library.behaviors.insert(chunk.id, behavior);
                     library.names.insert(chunk.id, chunk.label.clone());
                 }
-                b"STR#" if chunk.id == TREE_NAMES => {
+                b"STR#" => {
                     let table = sims_formats::strings::StringTable::parse(data)
                         .map_err(|e| format("STR#", chunk.id, e))?;
-                    library.tree_names = table
+                    let entries: Vec<String> = table
                         .entries
                         .iter()
                         .filter(|entry| entry.language == 1)
                         .map(|entry| entry.text.clone())
                         .collect();
+                    if chunk.id == TREE_NAMES {
+                        library.tree_names.clone_from(&entries);
+                    }
+                    library.strings.insert(chunk.id, entries);
                 }
                 b"BCON" => {
                     let constants =
@@ -227,6 +243,61 @@ impl Program {
             .get(&self.global)
             .and_then(|library| library.tuning.get(&ROOM_TUNING));
         Tuning::from_lookup(|name| table.and_then(|table| table.get(name)))
+    }
+
+    /// The constants a person's motives are updated with
+    /// ([`sims_sim::motives::Tuning`]): the decay rates from the global
+    /// file's tuning tables 1, 5 and 6, read by name, and the mood curves
+    /// from its string tables 502 (adult) and 504 (child), one curve per
+    /// entry for the motives in [`sims_sim::motives::MOOD_MOTIVES`] order.
+    ///
+    /// Ported from the old prototype's `Tuning::from_program`
+    /// (legacy/crates/sims-vm/src/motives.rs). The original loads these
+    /// when the game starts (rates: 0x420c36). That the curves come from
+    /// these tables in this order is the prototype's finding, compared
+    /// there with the original's tables at 0x6e51f8 and 0x6e5160 in a
+    /// memory image; here it is checked only through the mood a decay
+    /// works out, which equals the original's (`docs/decisions.md`).
+    pub fn motive_tuning(&self) -> Result<sims_sim::motives::Tuning> {
+        use sims_sim::motives::{Curve, MOOD_MOTIVES, MOOD_POINTS, Rates, Tuning};
+        let global = self.libraries.get(&self.global);
+        let rates = MOTIVE_TUNING.map(|id| {
+            let table = global.and_then(|library| library.tuning.get(&id));
+            (id, table)
+        });
+        if let Some((id, _)) = rates.iter().find(|(_, table)| table.is_none()) {
+            return Err(Error::Unsupported(format!(
+                "the global file has no tuning table {id} with motive rates"
+            )));
+        }
+        let curves = |id: u16| -> Result<Vec<Curve>> {
+            let strings = global
+                .and_then(|library| library.strings.get(&id))
+                .ok_or_else(|| {
+                    Error::Unsupported(format!("the global file has no string table {id}"))
+                })?;
+            MOOD_MOTIVES
+                .iter()
+                .enumerate()
+                .map(|(i, &motive)| {
+                    let text = strings.get(i).ok_or_else(|| {
+                        Error::Unsupported(format!("string table {id} has no entry {i}"))
+                    })?;
+                    Ok(Curve::parse(motive, text, MOOD_POINTS))
+                })
+                .collect()
+        };
+        let mut profile = 0;
+        let rates = rates.map(|(_, table)| {
+            let made = Rates::from_lookup(profile, |name| table.and_then(|t| t.get(name)));
+            profile += 1;
+            made
+        });
+        Ok(Tuning {
+            rates,
+            adult_mood: curves(ADULT_MOOD)?,
+            child_mood: curves(CHILD_MOOD)?,
+        })
     }
 
     /// Resolves a tree ID for code running on behalf of the object whose

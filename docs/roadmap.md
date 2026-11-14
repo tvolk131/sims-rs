@@ -56,10 +56,12 @@ Each step is a few PRs, and each PR leaves `main` green.
   the entry of its first tick, in everything the trace holds of what we
   keep. Six type attribute words are the exception: they belong to the
   game that was running before the load.
-- Ticks are not implemented. `sims boot --ticks N` with N above 0 fails
-  and says so. "The first tick" below says what a tick is in the
-  original, what the first one needs here, and what there is to check it
-  against.
+- Ticks run. `sims boot --ticks N` runs N lot updates after the load and
+  prints the hash. **K = 1 on the Goth house**: our state after tick 1
+  equals a capture of the original after its tick 1 in everything
+  compared, the C runtime's random stream aside (see "The first tick").
+  Tick 2 stops at Set To Next over the neighborhood's people (mode 5),
+  which is not ported, and the boot says so and at which tick.
 
 ### Load sequence
 
@@ -751,78 +753,84 @@ the lot arrays.
 
 ### The first tick
 
-Not implemented. This is what a tick is in the original, read from its
-code, what the first one needs on the Goth house, and what there is to
-check it against.
+`crates/sims-vm/src/tick.rs` runs ticks. Each piece below was read from
+the original's code. "Matches" means compared with a capture of the
+original and found equal.
 
-**One lot update** (`0x46d345`):
+**One lot update** (`0x46d345`, `Interpreter::lot_update`):
 
-1. The game's random stream is swapped for the lot's: the current state
-   is put aside and the lot's state installed (`0x46f447`, `0x46f44d`).
-2. The scheduler makes a pass over the objects (`0x46d553`).
-3. The stream's state is saved back as the lot's and the state put aside
-   is restored.
-4. If the pass was a full one: global 6 (seconds) goes up by 2 and the
-   tick count by 1. At 60 seconds global 5 (minutes) goes up. At 60
-   minutes global 0 (hours) goes up. At 24 hours the day (global 1) goes
-   up, with a pass over the registry and the neighborhood for the new
-   day, a shift of the budget's daily records, and the month and year
-   (globals 7 and 8, with the month's days in global 29).
-5. The registry carries out the removals that are queued (`0x4412d1`).
-6. If the hour changed and the time of day with it (global 4, from the
-   hour), the lighting is updated and every room is marked.
+1. The game's random stream is swapped for the lot's (`0x46f447`,
+   `0x46f44d`), the scheduler makes a pass over the objects (`0x46d553`),
+   and the stream is swapped back.
+2. If the pass was a full one, global 6 (seconds) goes up by 2 and the
+   tick count by 1. At 60 seconds global 5 (minutes) goes up and signal
+   0xdb is sent. Ported up to here. At 60 minutes the hour turns (global
+   0), and with it the time of day, the lighting, every room's mark and,
+   at 24 hours, the new day. That is not ported and fails loudly.
+3. The registry's pass at the end of the update (`0x4412d1`,
+   `Interpreter::end_of_update`). It is not only the removals, as this
+   file said before. In order: the dialogs (a new one is shown, and a
+   modal one is answered there and then; a finished one is destroyed);
+   the game's special panels, which no ported primitive asks for; after a
+   full pass, the queued removals, oldest first (`Interpreter::remove_now`
+   for each, `0x44123f`); and a check that a Sim of the household is
+   selected (selecting another, `0x445501`, is not ported and fails).
+4. Signal 0xdb goes to the game's eight subscribers. Only the interface
+   takes it (a sound on the hour), so it changes nothing here.
 
-**One scheduler pass** (`0x46d553`). The pass is partial if global 17 is
-not 0, or if global 19 and global 10 are both not 0. The cursor is an
-object ID: the pass goes through the registry's table of objects by ID,
-from the cursor (or 1) to the highest ID, not through the registration
-list. For each object: if its scheduler word has flag 4 and the object
-has an error, the pass stops there. An object without flag 1 is skipped,
-and in a partial pass so is one without flag 2. If its countdown, the low
-half of the word, is above 0, it is counted down by 1. Otherwise the
-object is ticked (its virtual function at 0x14: `0x4521f7`, or
-`0x45cc8c` for a person) with the tick count. If that returns false the
-pass stops with the cursor on that object. After the last object the
-cursor goes back to 0. The pass returns whether it was a full one.
+**One scheduler pass** (`0x46d553`, `Interpreter::scheduler_pass`). The
+pass is partial if global 17 is not 0, or globals 19 and 10 both are not.
+It goes by object ID from the cursor (or 1) to the highest ID at the
+start. An object without flag 1 is skipped, and in a partial pass so is
+one without flag 2. A countdown above 0 is counted down by 1; otherwise
+the object is ticked with the tick count. A tick that returns false
+stops the pass with the cursor kept; no ported primitive makes one
+return false, so that fails loudly.
 
-Not read yet: what an object's tick does around running its thread, what
-a person's tick adds (motives, the action queue), and how the queued
-removals are carried out.
+**An object's tick** (`0x4521f7`, `Interpreter::tick_object`): its thread
+runs until it yields, and data word 25 counts down. A thread that returns
+from its outermost frame (error 0x3e9) or runs past the instruction limit
+(error 0x44d) fails loudly; the original's error handler is not ported.
 
-**What the first tick needs on the Goth house.** At the baseline 267
-objects have a countdown above 0 and 119 are ticked, the three people
-among them. A probe ran each of the 119 objects' threads for one turn
-with today's interpreter, each on a copy of the baseline: 114 run until
-they yield, and 5 controllers (objects 360 and 362 to 365) reach the
-Dialog primitive, which is not implemented. That probe says nothing
-about whether the 114 do what the original does; it only shows where the
-interpreter stops. Seven objects are queued for removal.
+**A person's tick** (`0x45cc8c`, `Interpreter::tick_person`): the object's
+tick; every 60 ticks a decay of the motives (`0x420fb6`, in single
+precision, with the mood); the room the person was last seen in, and
+motive 13 from that room's score; person word 27 counted up; the motive
+changes of the running action (`0x45cdb3`). Every tenth tick an awake
+household member asks the lot something (`0x4165e3`), which is not
+ported; on the Goth house that is first reached at tick count 88,450.
 
-**What there is to check a tick against.** All private, in the old
-checkout:
+**Dialog** (primitive 36, `primitives/dialog.rs`, `0x451552`): the first
+time it makes a record and yields. The registry shows the record at the
+end of the update and the player's answer goes into it. The next time the
+primitive reads the answer: the first button is the true branch, the
+second and third the false one. The player is `sims_vm::Player`; `sims
+boot` answers a one-button dialog with its button and a dialog with a
+choice from `--answers`, and fails if none is left.
 
-- The trace used for the load ends at the entry of the first tick. It
-  holds no state after a tick. A dump of the guest's whole memory was
-  taken at that moment (1 GB, archived). The original's code can be run
-  on it in an emulator, as was done for the selection in step 18.
-- An earlier run of the original was captured at the entry of the lot
-  update at tick 88,445 and at the return of the next four, through tick
-  88,449, with a full state at each. It is another run, and its first
-  tick, from 88,444, was not captured as such. But its state at 88,445
-  differs from our baseline in what one tick would change and nothing
-  else that was compared: both game random streams are equal; one global
-  differs (the seconds, 46 where the baseline has 44); 9 objects are
-  gone, the 7 that are queued for removal here and 2 more; of the 377
-  others, 345 differ only in the scheduler word, 260 of them by a
-  countdown one lower; 32 differ in their frames, the three people and
-  the five controllers that reach Dialog among them; and one differs in
-  a data word. Compared for each object: the data words, temps,
-  attributes, scheduler word, frames and last result. Not compared yet:
-  the people's motives and actions, the lot arrays and the rooms. So
-  that capture is where a first tick can be checked, and its four later
-  states the next four. In that run dialogs were answered by hand before
-  the capture; what the Dialog primitive leaves behind has to agree with
-  it.
+**Compared with the original.** A second run of the original on the same
+install and house (private) holds the state at the entry of its second
+lot update, which is the state after its first tick, and the states after
+ticks 2 to 5. Our state after tick 1 equals it in: the tick count, the
+lot's and the game's random streams, the scheduler cursor, the funds, all
+64 globals, the removal queue, the registration order, the set of objects
+(the nine removed are the same), and for each of the 377 objects its
+GUID, data words, temps, attributes, scheduler word, last result, frames,
+relationships, slot count, position and two marks; for the three people
+their person data, motives and previous motives bit for bit, actions,
+queues and objects in use. The C runtime's random stream is 52 draws
+further on in that run, before and after every tick it holds; nothing in
+tick 1 draws from it here. The likely cause is that run's game before its
+load, but that is unverified. Not compared: rooms, lot arrays, dialog
+records and the persons' tick state, which that capture does not hold in a
+form we read.
+
+**What tick 2 needs.** Object 16, a person, runs a tree of the people's
+semi-global file that goes over the neighborhood's people (Set To Next
+mode 5) and their relationships. The simulation does not hold the
+neighborhood's people yet. The capture shows what follows in ticks 2 to
+5: object 15 asks a two-button dialog, answered with the second button;
+object 262 is made again; then 35 objects are removed and one is made.
 
 ## Working rules
 

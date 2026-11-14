@@ -44,6 +44,7 @@ mod program;
 mod removal;
 mod rooms;
 mod selection;
+mod tick;
 mod visits;
 
 pub use error::Error;
@@ -57,6 +58,7 @@ pub use people::{curve_table, persistent_fields, reload_profile};
 pub use primitives::primitive_name;
 pub use program::{Callback, DEFINITION_WORDS, Library, Program, Tree};
 pub use selection::selected;
+pub use tick::{Answers, Player, Shown, TICK_BUDGET, TickError, Update};
 pub use visits::Visited;
 
 pub type Result<T> = std::result::Result<T, Error>;
