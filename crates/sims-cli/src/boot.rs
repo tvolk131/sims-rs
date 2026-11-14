@@ -1,11 +1,12 @@
-//! `sims boot`: run the lot load for a house and print the hash of the
-//! state it reaches. A load that completes ends at the state the
-//! original's first tick starts from. Ticks are not implemented.
+//! `sims boot`: run the lot load for a house, then as many ticks as asked
+//! for, and print the hash of the state it reaches. A load that completes
+//! ends at the state the original's first tick starts from. A tick that
+//! reaches something not ported stops the boot, which says at which tick.
 
 use sims_content::{Catalog, House, Index, Install, Neighborhood, People};
 use sims_sim::load::Context;
 use sims_sim::{Snapshots, World};
-use sims_vm::{Callback, Interpreter, Program, Stream};
+use sims_vm::{Answers, Callback, Interpreter, Program, Stream};
 use std::error::Error;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -15,17 +16,13 @@ pub struct Options<'a> {
     /// A house file inside a neighborhood's `Houses` directory.
     pub house: &'a Path,
     pub ticks: u32,
+    /// The answers to give, in order, to dialogs that offer a choice. A
+    /// dialog with one button takes none.
+    pub answers: Vec<u8>,
     pub snapshot: Option<&'a Path>,
 }
 
 pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
-    if options.ticks > 0 {
-        return Err(
-            "running ticks is not implemented: the boot stops when the load is complete, at \
-             the state the first tick starts from (docs/roadmap.md)"
-                .into(),
-        );
-    }
     let install = Install::detect(options.root)?;
     let directory = options
         .house
@@ -165,7 +162,34 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
         let counted = interpreter.before_frame(&mut world)?;
         finished = Some((made || made_again, sim, counted.len()));
     }
-    if let Some(path) = options.snapshot {
+    // The ticks: one lot update each (sims_vm's `tick.rs`).
+    let start = world.ticks;
+    let mut ticked = Vec::new();
+    let mut failed = None;
+    if options.ticks > 0 {
+        if finished.is_none() {
+            return Err("ticks were asked for, but the load did not complete".into());
+        }
+        let tuning = program.motive_tuning()?;
+        let mut player = Answers {
+            queue: options.answers.iter().copied().collect(),
+        };
+        for tick in 1..=options.ticks {
+            match interpreter.lot_update(&mut world, &tuning, &mut player) {
+                Ok(update) => ticked.push(update),
+                Err(error) => {
+                    failed = Some(format!(
+                        "tick {tick}, the lot update that starts at tick count {}, failed: {error}",
+                        start.wrapping_add(tick - 1)
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(path) = options.snapshot
+        && failed.is_none()
+    {
         Snapshots::open(path)?.save("boot", &world)?;
     }
     let saved = &house.objects.instances;
@@ -287,6 +311,35 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
                 "         load complete: this is the state the first tick starts from"
             );
         }
+    }
+    for (tick, update) in ticked.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "Tick {}:  {} pass; {} counted down, {} ticked; {} dialogs answered{}; {} removed",
+            tick + 1,
+            if update.full { "full" } else { "partial" },
+            update.counted.len(),
+            update.ticked.len(),
+            update.answered.len(),
+            if update.answered.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({})",
+                    update
+                        .answered
+                        .iter()
+                        .map(|(object, answer)| format!("{object}: {answer}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
+            update.removed.len()
+        );
+    }
+    if let Some(failed) = failed {
+        let _ = writeln!(out, "Stopped: {failed}");
+        return Err(out.into());
     }
     let _ = writeln!(
         out,

@@ -598,7 +598,7 @@ fn unimplemented_primitives_name_themselves() {
     );
     for (opcode, name) in [
         (3, "Find Best Interaction"),
-        (36, "Dialog"),
+        (13, "Push Interaction"),
         (44, "Animate Sim"),
     ] {
         let mut fx = Fixture::new();

@@ -89,6 +89,64 @@ pub struct World {
     /// pushed or popped a frame since the object was made or read. See
     /// [`FrameStorage`].
     pub frame_storage: BTreeMap<u16, FrameStorage>,
+    /// The dialogs objects have asked for and the registry still holds.
+    /// See [`Dialogs`].
+    pub dialogs: Dialogs,
+    /// For each person whose tick has run, what the tick keeps that no
+    /// save holds. A person with no entry has the values its constructor
+    /// gives (0x459327); see [`PersonTick`].
+    pub person_ticks: BTreeMap<u16, PersonTick>,
+}
+
+/// The registry's list of dialogs (registry words 0x64 to 0x68), and the
+/// one registry word the ordinary dialogs write.
+///
+/// The Dialog primitive (0x451552) adds a record and later reads back how
+/// it was answered. The registry's pass at the end of a lot update
+/// (0x4412d1) shows each new record and destroys the ones that are done.
+/// What a dialog says and shows is presentation and is not kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dialogs {
+    /// The records in the order they were made.
+    pub records: Vec<Dialog>,
+    /// Registry word 0x100. An ordinary dialog sets it to -1 when its
+    /// second button is pressed (0x451a49). Only a kind of dialog that is
+    /// not ported reads it.
+    pub declined: i16,
+}
+
+/// One dialog record (0x4443ab makes it; the original's record is far
+/// larger, the rest being its text and pictures).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dialog {
+    /// The object that asked for it.
+    pub caller: u16,
+    /// The Dialog instruction's operands, which say what kind of dialog it
+    /// is and how it is answered.
+    pub operands: [u8; 8],
+    /// Record word 0x74: 0 new, 1 shown, 2 to 4 answered with the first,
+    /// second or third button, 5 done.
+    pub status: u8,
+}
+
+/// What a person's tick keeps that no save holds (person fields 0x810 and
+/// 0xafc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonTick {
+    /// The tick at which the motives last decayed.
+    pub last_decay: i32,
+    /// The room the person was last seen in, or -5 for none yet.
+    pub room: i16,
+}
+
+impl PersonTick {
+    /// The values the person constructor gives (0x459327 writes 0 to
+    /// 0x810 at 0x45942a and -5 to 0xafc at 0x45948b). Nothing else
+    /// writes either field but the person's tick (0x45cd32, 0x45e492).
+    pub const CONSTRUCTED: Self = Self {
+        last_decay: 0,
+        room: -5,
+    };
 }
 
 /// The memory an object's script frames live in.
@@ -228,6 +286,8 @@ impl World {
             rooms: Rooms::default(),
             fires: Vec::new(),
             frame_storage: BTreeMap::new(),
+            dialogs: Dialogs::default(),
+            person_ticks: BTreeMap::new(),
         }
     }
 

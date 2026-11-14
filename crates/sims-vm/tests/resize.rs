@@ -217,11 +217,25 @@ fn format_7_bytes(world: &World) -> Vec<u8> {
     postcard::to_allocvec(&old).unwrap()
 }
 
-/// Checks a state against its digest under today's snapshot format and
-/// against the digest pinned for it under format 7
-/// ([`format_7_bytes`]).
-fn pinned(world: &World, now: &str, format_7: &str) {
-    assert_eq!(world.hash_hex(), now);
+/// A lot's encoding as snapshot format 8 wrote it. Format 9 added two
+/// fields at the end of the encoding: the dialog records with the
+/// registry's word 0x100, and each person's tick state (the tick of the
+/// last decay and the room last seen in). Before the first tick there is
+/// no record, the word is 0 and no person has been ticked: an empty list,
+/// a zero and an empty map, one zero byte each. This checks that the
+/// encoding ends in those three bytes and drops them, so a state pinned
+/// under format 8 can be shown to be the same state.
+fn format_8_bytes(world: &World) -> Vec<u8> {
+    let mut encoded = world.encode();
+    assert_eq!(encoded.split_off(encoded.len() - 3), [0; 3]);
+    encoded
+}
+
+/// Checks a state against the digest pinned for it under snapshot format
+/// 8 ([`format_8_bytes`]) and under format 7 ([`format_7_bytes`]). Its
+/// format 9 encoding is the format 8 one and three zero bytes.
+fn pinned(world: &World, format_8: &str, format_7: &str) {
+    assert_eq!(digest(&format_8_bytes(world)), format_8);
     assert_eq!(digest(&format_7_bytes(world)), format_7);
 }
 
@@ -1268,7 +1282,10 @@ fn the_goth_house_objects_are_all_visited() {
 /// The digest is of our own state, as built here.
 #[test]
 fn the_goth_house_load_ends_where_the_first_tick_starts() {
+    // Pinned under snapshot format 8, and the same state under format 9
+    // ([`format_8_bytes`]).
     const BASELINE: &str = "13dd5b8ee042ed292266090ef1b7b650b2a6576531279c27db9af23e9c108648";
+    const BASELINE_9: &str = "5fb6edc68d0e15edee0b17af9f72ebbabc65efc0169b06621f4b30f32f8250f0";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1361,6 +1378,100 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
         assert_eq!(world.global_rng, before.global_rng);
         assert_eq!(world.lot_rng, before.lot_rng);
         assert_eq!(world.crt_rng, before.crt_rng);
-        assert_eq!(world.hash_hex(), BASELINE);
+        assert_eq!(digest(&format_8_bytes(world)), BASELINE);
+        assert_eq!(world.hash_hex(), BASELINE_9);
+    });
+}
+
+/// The first tick on the Goth house: the lot update (0x46d345) run once
+/// from the state the load ends in.
+///
+/// A second run of the original on the same install and house, private
+/// and outside the repository, holds the full state at the entry of its
+/// second lot update, which is the state after its first tick. That run
+/// was compared with this one outside the repository
+/// (`docs/decisions.md`). Equal: the tick count, the lot's and the
+/// game's random streams, the scheduler cursor, the funds, all 64
+/// globals, the removal queue, the registration order and the set of
+/// objects; and for each of the 377 objects its GUID, data words, temps,
+/// attributes, scheduler word, last result, frames (with their saved
+/// primitive state), relationships, slot count, position and the removal
+/// and selected marks; for the three people also their 256 person data
+/// words, their motives and previous motives bit for bit, their running
+/// and last actions, their queues and their number of objects in use.
+/// Not equal: the C runtime's random stream, which is 52 draws further on
+/// in that run at every tick it holds. Nothing in this tick draws from it
+/// here, and it does not move in that run's later ticks either; that the
+/// run's game drew 52 more numbers before its load is the likely cause and
+/// is **unverified**.
+///
+/// Not compared, because the capture does not hold them in a form read
+/// there: the rooms, the lot arrays, the dialog records and the persons'
+/// tick state. That the five controllers' dialogs were answered with
+/// their only button is what the capture's later ticks show; the answers
+/// themselves were given before that run's observer attached.
+///
+/// The digest is of our own state, as built here.
+#[test]
+fn the_goth_house_first_tick_matches_the_original() {
+    const TICK_1: &str = "bcba5caa00ef99241cf4917a6e69499d52b4db630232049dcfe6e6fd79a580e3";
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = std::path::Path::new(&root);
+    let install = Install::detect(root).unwrap();
+    let neighborhood = Neighborhood::open(&install.file("UserData").unwrap()).unwrap();
+    let family = neighborhood.family_in(5).unwrap().1.clone();
+    selected(root, |interpreter, world, people| {
+        assert_eq!(interpreter.visit_objects(world, people).stopped, None);
+        interpreter.ensure_indicators(world).unwrap();
+        world.finish_selection(family.flags).unwrap();
+        interpreter.announce_house(world).unwrap();
+        interpreter
+            .select_resident(world, family.budget, &family.members)
+            .unwrap();
+        interpreter.go_live(world).unwrap();
+        interpreter.before_frame(world).unwrap();
+        let before = world.clone();
+        let tuning = interpreter.program.motive_tuning().unwrap();
+        let mut player = sims_vm::Answers::default();
+        let update = interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        assert!(update.full);
+        assert_eq!((update.counted.len(), update.ticked.len()), (267, 119));
+        // The five controllers ask a one-button dialog and yield; the
+        // registry shows each and it is answered.
+        assert_eq!(
+            update.answered,
+            [(360, 2), (362, 2), (363, 2), (364, 2), (365, 2)]
+        );
+        // The seven IDs the load left queued, then two that the tick
+        // queued.
+        assert_eq!(
+            update.removed,
+            [355, 352, 350, 313, 312, 305, 292, 262, 351]
+        );
+        assert_eq!(world.ticks, before.ticks + 1);
+        assert_eq!(world.globals[6], before.globals[6] + 2);
+        assert_eq!(world.crt_rng, before.crt_rng);
+        // Each person's motives decayed once.
+        assert_eq!(world.person_ticks.len(), 3);
+        assert!(
+            world
+                .person_ticks
+                .values()
+                .all(|t| t.last_decay == before.ticks as i32)
+        );
+        assert_eq!(world.hash_hex(), TICK_1);
+        // The second tick reaches Set To Next over the neighborhood's
+        // people (mode 5), which is not ported.
+        let second = interpreter.lot_update(world, &tuning, &mut player);
+        match second {
+            Err(sims_vm::TickError::Fault(fault)) => {
+                assert_eq!(fault.object, 16);
+                assert!(fault.to_string().contains("Set To Next mode 5"));
+            }
+            other => panic!("{other:?}"),
+        }
     });
 }

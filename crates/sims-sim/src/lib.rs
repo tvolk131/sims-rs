@@ -12,6 +12,7 @@
 //! [`load`] holds the load steps that change state without running scripts,
 //! and [`rooms`] works out the lot's rooms from its walls and counts
 //! them: their size, what stands in them, their light and their score.
+//! [`motives`] decays a person's motives and works out the mood.
 //!
 //! The state holds every field the readers decode. Bytes the readers keep
 //! but do not understand (format tails, raw records) are left out: they are
@@ -19,12 +20,16 @@
 
 mod error;
 pub mod load;
+pub mod motives;
 pub mod rooms;
 mod snapshot;
 mod world;
 
 pub use error::Error;
 pub use snapshot::Snapshots;
-pub use world::{Budget, FULL_SIZE, FrameStorage, MagicHistory, Object, TypeAttributes, World};
+pub use world::{
+    Budget, Dialog, Dialogs, FULL_SIZE, FrameStorage, MagicHistory, Object, PersonTick,
+    TypeAttributes, World,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;

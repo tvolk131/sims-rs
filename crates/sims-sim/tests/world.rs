@@ -3,7 +3,10 @@ use sims_core::{CrtRng, F32, GameRng};
 use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
 use sims_sim::rooms::{Half, Room, Rooms};
-use sims_sim::{Budget, FrameStorage, MagicHistory, Object, Snapshots, TypeAttributes, World};
+use sims_sim::{
+    Budget, Dialog, Dialogs, FrameStorage, MagicHistory, Object, PersonTick, Snapshots,
+    TypeAttributes, World,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -143,6 +146,21 @@ fn world() -> World {
                 unknown: BTreeSet::from([(0, 1)]),
             },
         )]),
+        dialogs: Dialogs {
+            records: vec![Dialog {
+                caller: 5,
+                operands: [0, 0, 0, 0, 0, 1, 0, 0x10],
+                status: 2,
+            }],
+            declined: -1,
+        },
+        person_ticks: BTreeMap::from([(
+            5,
+            PersonTick {
+                last_decay: 88440,
+                room: 0,
+            },
+        )]),
     }
 }
 
@@ -152,7 +170,23 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "c30d0c3a346a5580c68f56b2e3101730b34a69357685be38a071c7b8f47250e0";
+const PINNED: &str = "2efd25eeadfef4e5f72cdc7f4fd89cf2889fdc57d892f8be3d4b78916c50d470";
+
+#[test]
+fn without_dialogs_or_person_ticks_the_encoding_is_format_8_and_three_zero_bytes() {
+    // Snapshot format 9 added the dialog records and the persons' tick
+    // state at the end. Emptied, they are three zero bytes, and the rest
+    // hashes to the digest pinned under format 8.
+    let mut world = world();
+    world.dialogs = Dialogs::default();
+    world.person_ticks.clear();
+    let mut bytes = world.encode();
+    assert_eq!(bytes.split_off(bytes.len() - 3), [0; 3]);
+    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&bytes).into();
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(hex, PINNED_8);
+}
+const PINNED_8: &str = "c30d0c3a346a5580c68f56b2e3101730b34a69357685be38a071c7b8f47250e0";
 
 #[test]
 fn encoding_round_trips_bit_for_bit() {
@@ -170,6 +204,15 @@ fn encoding_round_trips_bit_for_bit() {
 #[test]
 fn any_field_change_changes_the_hash() {
     let base = world().hash();
+    let mut changed = world();
+    changed.dialogs.records[0].status = 5;
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.dialogs.declined = 0;
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.person_ticks.get_mut(&5).unwrap().room = -5;
+    assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.lot_rng.next_u32();
     assert_ne!(changed.hash(), base);

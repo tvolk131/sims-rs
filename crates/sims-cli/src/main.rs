@@ -11,7 +11,8 @@ use std::process::ExitCode;
 const USAGE: &str = "usage: sims census <path>...
        sims install <install-root>
        sims houses <install-root> <neighborhood-dir>
-       sims boot <install-root> <house-file> [--ticks N] [--snapshot FILE]
+       sims boot <install-root> <house-file> [--ticks N] [--answers A,B,...]
+                 [--snapshot FILE]
 
   census   Decode every resource under the given files or directories and
            report failures and resource types that have no reader yet.
@@ -19,9 +20,11 @@ const USAGE: &str = "usage: sims census <path>...
            the original's load order.
   houses   Load every house in a neighborhood (such as UserData) against an
            install, with the neighborhood's characters registered.
-  boot     Run a house's lot load as far as it is implemented and print the
-           hash of the state it reaches. --snapshot saves that state to a
-           REDB file as \"boot\".";
+  boot     Run a house's lot load as far as it is implemented, then N ticks,
+           and print the hash of the state it reaches. A dialog with a
+           choice takes the next of --answers (2 for the first button, 3
+           the second, 4 the third). --snapshot saves that state to a REDB
+           file as \"boot\".";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -68,6 +71,7 @@ fn main() -> ExitCode {
                 root: root.as_ref(),
                 house: house.as_ref(),
                 ticks: 0,
+                answers: Vec::new(),
                 snapshot: None,
             };
             let mut rest = rest.iter();
@@ -75,6 +79,15 @@ fn main() -> ExitCode {
                 match (flag.as_str(), rest.next()) {
                     ("--ticks", Some(n)) if n.parse::<u32>().is_ok() => {
                         options.ticks = n.parse().unwrap_or_default();
+                    }
+                    ("--answers", Some(list)) => {
+                        match list.split(',').map(str::parse::<u8>).collect() {
+                            Ok(answers) => options.answers = answers,
+                            Err(_) => {
+                                eprintln!("{USAGE}");
+                                return ExitCode::from(2);
+                            }
+                        }
                     }
                     ("--snapshot", Some(path)) => options.snapshot = Some(path.as_ref()),
                     _ => {
