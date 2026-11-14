@@ -4,9 +4,9 @@ use crate::rooms::Rooms;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sims_content::{Catalog, House};
+use sims_content::{Catalog, House as HouseFile};
 use sims_core::{CrtRng, GameRng};
-use sims_formats::lot::{Array, Simulator};
+use sims_formats::lot::{Array, House, Simulator};
 use sims_formats::saved_objects::{Frame, Instance, Multipart, Person, Relationship, Slot};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -104,6 +104,48 @@ pub struct World {
     /// with no entry has the animator the load leaves; see
     /// [`crate::animator::LOADED`].
     pub animators: BTreeMap<u16, Animator>,
+    /// How often the household was counted on the lot. See [`HouseUsage`].
+    pub usage: HouseUsage,
+}
+
+/// The house's usage counts: five earlier days and today, each a count of
+/// samples and of the samples in which the person was following a route.
+///
+/// The original keeps them in the house model (HOUS 1), which the house
+/// file holds and the load reads (0x416568; read with
+/// [`World::read_house_model`]). In memory they are the six pairs at +0x38
+/// of the object the application's first field points to, today's at
+/// +0x60. Every tenth tick, each awake member of the household who is not
+/// hidden adds a sample (0x4165e3, from the person's tick). The day's
+/// rollover moves today into the history (0x41637f), which is not ported.
+///
+/// Nothing that is ported reads them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HouseUsage {
+    /// The five earlier days, the most recent first.
+    pub history: [Usage; 5],
+    /// Today's.
+    pub today: Usage,
+}
+
+/// One day's usage counts. Both wrap at 32 bits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    /// Samples (the pair's word at +0).
+    pub total: i32,
+    /// Samples in which the person had a route context (+4).
+    pub routing: i32,
+}
+
+impl HouseUsage {
+    /// One sample (0x4165e3): `routing` adds to that count first, then the
+    /// total goes up.
+    pub fn sample(&mut self, routing: bool) {
+        if routing {
+            self.today.routing = self.today.routing.wrapping_add(1);
+        }
+        self.today.total = self.today.total.wrapping_add(1);
+    }
 }
 
 /// The registry's list of dialogs (registry words 0x64 to 0x68), and the
@@ -298,7 +340,22 @@ impl World {
             person_ticks: BTreeMap::new(),
             neighbors: Neighbors::default(),
             animators: BTreeMap::new(),
+            usage: HouseUsage::default(),
         }
+    }
+
+    /// Reads a house's usage counts from its house model (HOUS 1;
+    /// 0x416568). The file stores each pair as the routing count, then
+    /// the total; the five earlier days first, today last. A model of a
+    /// version below 0x26 has none, and the original then clears them
+    /// (0x4165f3); [`sims_formats::lot::House::parse`] refuses such a
+    /// model.
+    pub fn read_house_model(&mut self, model: &House) {
+        let usage = model.pairs.map(|[routing, total]| Usage { total, routing });
+        self.usage = HouseUsage {
+            history: [usage[0], usage[1], usage[2], usage[3], usage[4]],
+            today: usage[5],
+        };
     }
 
     /// Reads a house's simulator state (SIMI) into the lot the game is
@@ -334,9 +391,12 @@ impl World {
     /// it is holding (`docs/roadmap.md`, load sequence). It also constructs
     /// each object before it reads the saved fields into it, which this
     /// does not. This is for looking at a house file, not for loading one.
-    pub fn from_house(house: &House, catalog: &Catalog) -> Result<Self> {
+    pub fn from_house(house: &HouseFile, catalog: &Catalog) -> Result<Self> {
         let mut world = Self::empty();
         world.read_simulator(&house.simulator);
+        if let Some(model) = &house.model {
+            world.read_house_model(model);
+        }
         world.arrays = house.arrays.clone();
         world.types = house.types.entries.iter().map(|t| (t.id, t.guid)).collect();
         // Every object the file describes, whether or not its registration

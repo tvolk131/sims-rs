@@ -57,17 +57,17 @@ Each step is a few PRs, and each PR leaves `main` green.
   keep. Six type attribute words are the exception: they belong to the
   game that was running before the load.
 - Ticks run. `sims boot --ticks N` runs N lot updates after the load and
-  prints the hash. **K = 5 on the Goth house**: our state after each of
-  ticks 1 to 5 equals a capture of the original after the same tick in
-  everything compared, the C runtime's random stream aside (see "The
-  first tick" and "Ticks 2 to 5"). The simulation holds the
-  neighborhood's people (their records, person data, relationships and
-  inventories) and each person's animator, as far as scripts read it.
-  Find Location For (primitive 16) is ported for the modes the house
-  reaches. Tick 6 is beyond the capture, so nothing in it is checked. It
-  stops where object 382 asks for a new person with Create New Object
-  Instance (mode 8), which is not ported, and the boot says so and at
-  which tick.
+  prints the hash. **K = 13 on the Goth house**: our state after each of
+  ticks 1 to 13 equals the 1000-tick capture of the original after the
+  same tick in everything compared, two lines after tick 1 aside (see
+  step 4 below, "The first tick", "Ticks 2 to 5" and "Ticks 6 to 13").
+  The simulation holds the neighborhood's people (their records, person
+  data, relationships and inventories) and each person's animator, as
+  far as scripts read it. Find Location For (primitive 16) is ported for
+  the modes the house reaches, and so is making a new person (Create New
+  Object Instance mode 8, tick 6). Tick 14 stops where the new person,
+  259, reaches Go To Routing Slot (primitive 45), which is not ported,
+  and the boot says so and at which tick.
 - Step 4 is in progress. `tools/harness/` runs the original under Wine
   in a QEMU guest and stops it at every lot update. It saves the state
   at the entry of the first tick and after each lot update: every
@@ -76,7 +76,7 @@ Each step is a few PRs, and each PR leaves `main` green.
   the install's own UserData. Its
   dialogs were answered as in the first capture: OK to the five notices
   in tick 1, and No to the Help System in tick 2. Compared with that
-  run, our state at the entry of tick 1 and after each of ticks 1 to 5
+  run, our state at the entry of tick 1 and after each of ticks 1 to 13
   matches in everything compared, three lines aside:
   - Registry byte 0x12 is already 1 when the original's load ends. Ours
     sets it in tick 2. This accounts for two of the three lines.
@@ -87,7 +87,8 @@ Each step is a few PRs, and each PR leaves `main` green.
   463 neighborhood records match as well. The 52-draw offset and the
   five differing records came from the first capture's guest files. The
   original first draws from the C runtime's stream in tick 6, 1,466
-  times.
+  times, when it makes a person; ours draws the same, and the stream is
+  equal after every tick to 13.
 
 ### Load sequence
 
@@ -113,7 +114,7 @@ That starting lot is **unverified**; see the decision log.
 
 | # | Step | Original | Status |
 |---|------|----------|--------|
-| 1 | Read the house's simulator state into the lot the game is holding | `0x46cfb3` | Done (`World::read_simulator`) |
+| 1 | Read the house's simulator state into the lot the game is holding, and its model's usage counts | `0x46cfb3`, `0x416568` | Done (`World::read_simulator`, `World::read_house_model`) |
 | 2 | Set the globals the running game supplies | `0x46cdc6`, `0x46cfb3`, `0x415eff` | Done (`World::apply_context`) |
 | 3 | Resize the held lot, which creates the lot-wide controllers | `0x415e20`, `0x442b9f` | Done for a bare lot that shrinks (`Interpreter::resize`) |
 | 4 | Clear the family global | `0x415eff` | Done (`World::clear_family`) |
@@ -823,8 +824,12 @@ tick; every 60 ticks a decay of the motives (`0x420fb6`, in single
 precision, with the mood); the room the person was last seen in, and
 motive 13 from that room's score; person word 27 counted up; the motive
 changes of the running action (`0x45cdb3`). Every tenth tick an awake
-household member asks the lot something (`0x4165e3`), which is not
-ported; on the Goth house that is first reached at tick count 88,450.
+household member is counted in the house's usage counts (`0x4165e3`,
+`HouseUsage::sample`): the day's total, and the day's routing count if
+the person is in the middle of a route. The counts come from the house
+file's model (HOUS 1, `0x416568`). This file said before that the person
+asks the lot something there; it does not. The capture does not hold the
+counts, so they are **unverified**; nothing ported reads them.
 
 **Dialog** (primitive 36, `primitives/dialog.rs`, `0x451552`): the first
 time it makes a record and yields. The registry shows the record at the
@@ -917,14 +922,37 @@ neither side drew from it in these ticks. Read from the install's
 neighborhood file, five records and one inventory differ, as after tick
 1, because the two files differ there.
 
-**Tick 6 (unverified).** It starts at tick count 88,449, beyond the
-capture. Object 382 asks for a new object of type 0x44A86A6C where the
+### Ticks 6 to 13
+
+In tick 6 object 382 makes a new person of type 0x44A86A6C where the
 pedestrian portal (object 6) stands: Create New Object Instance mode 8
-with flag 0x20 (`0x44e0c8`). Mode 8 is ported for an ordinary object
-(`primitives/create.rs`), but this one is a person, whose creation and
-placing are not ported, so the tick fails loudly before anything is
-made. The lot's hour rollover and the lot service `0x4165e3` (first due
-at tick count 88,450) also wait further on.
+with flag 0x20 (`0x44e0c8`). The person path of the factory (`0x440b2d`
+from `0x440d63`, `Interpreter::create_person`) gives it the lowest unused
+ID, 259; builds its skeleton, drawing from the C runtime's stream;
+attaches it to its neighborhood record; runs its construction reset
+(`0x4598e8`), which runs its Init twice and its first update once; and
+sets its price and ready flag. Mode 8 then gives it the record's
+interests and personality (`0x425930`), the stack object's facing whole,
+and places it with the place test of a person (`0x4337f6`, `0x433975`).
+From tick 7 the person runs its own scripts and sleeps.
+
+**Compared with the original.** After each of ticks 6 to 13 our state
+equals the 1000-tick capture's in every field listed for tick 1, the C
+runtime's stream included, and the four people's animators.
+
+### Tick 14
+
+Person 259 runs a tree of object 51 with Run Tree By Name, which starts
+its use of that object (`0x45e59b`, `Machine::count_use`): an entry in
+its list of objects in use and one more in object 51's data word 62. In
+that tree it reaches Go To Routing Slot (primitive 45, `0x45abce`), the
+start of routing, which is not ported, so the tick fails loudly. Where
+it stops, person 259's frames and objects in use, and the 258 objects
+before it in the tick, equal the capture's after tick 14. One local of
+person 259's third frame holds half of a pointer in the original (2623)
+and is unknown here; it is not compared. The end of a use and of the
+running action (`0x45e5fd`, `0x45e6cd`) are ported but never reached in
+these ticks, so they are **unverified**.
 
 ## Working rules
 

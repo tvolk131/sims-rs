@@ -130,6 +130,41 @@ pub fn reload_profile(data: &mut [i16], profile: &Profile) -> Result<(), Trap> {
     Ok(())
 }
 
+/// Reads person `id`'s appearance again if its animator says it is to be
+/// read (`stale`, animator byte +0xd8), as looking up a clip does
+/// (0x5893b3, 0x592625): the flag is cleared and the appearance read from
+/// the person type's profile in [`crate::Program::people`]
+/// ([`reload_profile`], the animator's virtual function 0x14).
+///
+/// A person type with no profile there fails.
+pub(crate) fn read_appearance_if_stale(
+    world: &mut World,
+    program: &crate::Program,
+    id: u16,
+    stale: &mut bool,
+) -> Result<(), Trap> {
+    if !*stale {
+        return Ok(());
+    }
+    let object = world
+        .objects
+        .get_mut(&id)
+        .ok_or(Trap::native(10, "missing object"))?;
+    let guid = object.guid;
+    let person = object
+        .person
+        .as_mut()
+        .ok_or(Trap::native(0x1c, "object is not a person"))?;
+    let profile = program.people.profiles.get(&guid).ok_or_else(|| {
+        Trap::Unsupported(format!(
+            "no profile was supplied for the person type 0x{guid:08X}, whose appearance is to \
+             be read again"
+        ))
+    })?;
+    *stale = false;
+    reload_profile(&mut person.data, profile)
+}
+
 /// Which string table holds a person's motive curves (0x459d23), as
 /// whether it is one of the global file's and its ID: the table the
 /// person's definition names in word 51 if that is not 0, and otherwise
@@ -150,15 +185,50 @@ pub fn curve_table(age: i16, custom: u16) -> (bool, u16) {
 
 impl Interpreter<'_> {
     /// Gives a person the fields its neighborhood record keeps for it
-    /// (0x4258a3): the record's ID goes into person data word 31, and
-    /// then each word [`persistent_fields`] lists for the record's
-    /// revision is copied from the record.
+    /// (0x4258a3): the record's ID goes into person data word 31; then, if
+    /// the record's revision is not 0, each word [`persistent_fields`]
+    /// lists for the revision is copied from the record; last, the
+    /// record's word 61 is copied whatever the revision (record +0xee).
     ///
     /// The record is the first of the person's type, in the file's slot
-    /// order. A person with no record, and a record whose revision is
-    /// below 1, fail: the original makes a record for the one and copies
-    /// only the family for the other, and neither was seen.
+    /// order (0x425770). These fail: a person with no record, for which
+    /// the original makes one (0x4257a5), and a record whose revision is
+    /// below 0, which the original looks up in its table of fields
+    /// (0x423827) past its start.
     pub(crate) fn attach_neighbor(&self, world: &mut World, id: u16) -> Result<(), Trap> {
+        self.attach_record(world, id, |revision| {
+            let mut fields = persistent_fields(revision);
+            if !fields.contains(&61) {
+                fields.push(61);
+            }
+            fields
+        })
+    }
+
+    /// Gives a person the interests and personality its neighborhood
+    /// record keeps (0x425930): the record's ID goes into person data word
+    /// 31, and a record of revision 7 or later gives words 46 to 53, 13,
+    /// 14, 16, 20, 26, 54 and 55. The record is found and refused as
+    /// [`Interpreter::attach_neighbor`] finds and refuses it.
+    pub(crate) fn attach_traits(&self, world: &mut World, id: u16) -> Result<(), Trap> {
+        self.attach_record(world, id, |revision| {
+            if revision >= 7 {
+                vec![46, 47, 48, 49, 50, 51, 52, 53, 13, 14, 16, 20, 26, 54, 55]
+            } else {
+                Vec::new()
+            }
+        })
+    }
+
+    /// Sets person data word 31 to the ID of the first neighborhood record
+    /// of the person's type and copies the words `fields` lists for the
+    /// record's revision.
+    fn attach_record(
+        &self,
+        world: &mut World,
+        id: u16,
+        fields: impl Fn(i32) -> Vec<usize>,
+    ) -> Result<(), Trap> {
         let object = world
             .objects
             .get_mut(&id)
@@ -171,17 +241,16 @@ impl Interpreter<'_> {
         let record = world.neighbors.first_of(guid).ok_or_else(|| {
             Trap::Unsupported(format!(
                 "the person type 0x{guid:08X} has no neighborhood record; making one \
-                 during a load is not ported"
+                 (0x4257a5) is not ported"
             ))
         })?;
-        if record.revision < 1 {
+        if record.revision < 0 {
             return Err(Trap::Unsupported(format!(
-                "neighborhood record {} holds no person data (revision {}); attaching it is \
-                 unverified",
+                "neighborhood record {} has revision {}; which fields it keeps is unknown",
                 record.id, record.revision
             )));
         }
-        let fields = persistent_fields(record.revision);
+        let fields = fields(record.revision);
         let mut values = Vec::with_capacity(fields.len());
         for &word in &fields {
             if word >= person.data.len() {
@@ -204,8 +273,12 @@ impl Interpreter<'_> {
     /// A person's reset (0x45e791 with no object named), for a person
     /// that is doing nothing:
     ///
-    /// 1. Person data word 30 is cleared.
-    /// 2. The person's appearance is reloaded ([`reload_profile`]).
+    /// 1. Person data word 30 is cleared (0x59297d).
+    /// 2. The person's animator is reset
+    ///    ([`sims_sim::animator::Animator::reset`], 0x589220) and the
+    ///    person's appearance reloaded ([`reload_profile`]). The reset
+    ///    leaves the animator noting that the appearance is to be read
+    ///    again, which the reload directly after does not clear.
     /// 3. Its thread restarts at Main, and its Reset function (3) runs on
     ///    top of that.
     /// 4. Person data words 0, 40 and 59 and data words 34 and 9 are
@@ -221,8 +294,8 @@ impl Interpreter<'_> {
     /// person whose data word 73 is set, whose footprint the original
     /// then works out again.
     ///
-    /// A person whose animator has ticked fails too: resetting the
-    /// animator (0x589220) is not ported.
+    /// So does an animator the reset cannot handle (see
+    /// [`sims_sim::animator::Animator::reset`]).
     ///
     /// Not modeled: the person's graphics and action icons, and the guard
     /// against a reset inside a reset (object flag 0x800).
@@ -263,13 +336,6 @@ impl Interpreter<'_> {
         if person.data.get(73).is_none_or(|&word| word != 0) {
             return Err(unsupported("whose data word 73 is set"));
         }
-        // The reset also resets the person's animator (0x589220), which is
-        // not ported. Every reset seen so far is at the load, before the
-        // animator has ticked, where it is taken to give
-        // [`sims_sim::animator::LOADED`].
-        if world.animators.contains_key(&id) {
-            return Err(unsupported("whose animator has ticked"));
-        }
         let profile = people.profiles.get(&guid).ok_or_else(|| {
             fail(Trap::Unsupported(format!(
                 "no profile was supplied for the person type 0x{guid:08X}"
@@ -285,6 +351,16 @@ impl Interpreter<'_> {
             .and_then(|o| o.person.as_mut())
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
         person.data[30] = 0;
+        // An animator that has not ticked is in the state a reset leaves
+        // ([`sims_sim::animator::LOADED`]); one that has is reset.
+        if let Some(animator) = world.animators.get_mut(&id) {
+            animator.reset().map_err(|e| fail(Trap::Unsupported(e)))?;
+        }
+        let person = world
+            .objects
+            .get_mut(&id)
+            .and_then(|o| o.person.as_mut())
+            .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
         reload_profile(&mut person.data, profile).map_err(fail)?;
         self.machine(world, id, 0, false)
             .install_main()

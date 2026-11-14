@@ -8,6 +8,7 @@
 //! 42).
 
 use crate::factory::{WIDGET, widgets};
+use crate::person_factory::equip;
 use crate::rooms::{array, build};
 use crate::support::*;
 use sims_vm::Trap;
@@ -235,14 +236,109 @@ fn flag_0x20_turns_the_new_object_only_when_it_already_faces_right() {
 }
 
 #[test]
-fn mode_8_with_other_flags_or_a_person_fails_loudly() {
+fn mode_8_with_other_flags_or_a_person_it_cannot_make_fails_loudly() {
     let (mut fx, _) = placeable();
     fx.lamp_mut().position = [40, 40, 1];
     let result = create(&mut fx, 0, 0x04, SIM as i16);
     assert!(matches!(trap(result), Trap::Unsupported(_)));
+    // A person type with no skeleton supplied.
     let (mut fx, file) = placeable();
     fx.lamp_mut().position = [40, 40, 1];
     fx.words(file)[9] = 2;
     let result = create(&mut fx, 0, 0, SIM as i16);
-    assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("person")));
+    assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("skeleton")));
+}
+
+/// The widget as a person type, [`equip`]ped, with records whose words
+/// are all 12 (bits 0 and 1 clear).
+fn person_widget() -> Fixture {
+    let (mut fx, file) = placeable();
+    fx.words(file)[9] = 2;
+    equip(&mut fx, WIDGET, "widget", 12);
+    fx.lamp_mut().position = [40, 40, 1];
+    fx
+}
+
+#[test]
+fn mode_8_makes_a_person_that_takes_the_stack_objects_facing_whole() {
+    let mut fx = person_widget();
+    let before: Vec<u16> = fx.world.objects.keys().copied().collect();
+    // The stack object faces 3. An object would turn to 2 (not ported); a
+    // person takes 3 as it is.
+    fx.sim_mut().data[1] = 3;
+    assert_eq!(create(&mut fx, 0, 0x20, SIM as i16), Ok(true));
+    let id = *fx
+        .world
+        .objects
+        .keys()
+        .find(|id| !before.contains(id))
+        .unwrap();
+    let person = &fx.world.objects[&id];
+    assert!(person.person.is_some());
+    assert_eq!(person.data[1], 3);
+    assert_eq!(person.position, [40, 40, 1]);
+    // The record's interests.
+    assert_eq!(person.person.as_ref().unwrap().data[46..54], [12; 8]);
+}
+
+#[test]
+fn a_person_is_kept_off_a_tile_by_a_solid_object_without_flag_0x10() {
+    let mut fx = person_widget();
+    let before: Vec<u16> = fx.world.objects.keys().copied().collect();
+    assert_eq!(create(&mut fx, 0, 0, SIM as i16), Ok(true));
+    let first = *fx
+        .world
+        .objects
+        .keys()
+        .find(|id| !before.contains(id))
+        .unwrap();
+    // The first person stands on the tile, solid (data word 8 flag 4
+    // clear) and without flag 0x10: it is in the second's way. The place
+    // test refuses, and removing the new person is not ported.
+    assert_eq!(fx.world.objects[&first].data[8] & 0x14, 0);
+    let placed = fx.world.clone();
+    let result = create(&mut fx, 0, 0, SIM as i16);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("removing object")));
+    // With flag 0x10 it is not in the way.
+    fx.world = placed.clone();
+    fx.world.objects.get_mut(&first).unwrap().data[8] |= 0x10;
+    assert_eq!(create(&mut fx, 0, 0, SIM as i16), Ok(true));
+    // Not solid (flag 4), it is in the way only with flag 2.
+    fx.world = placed.clone();
+    fx.world.objects.get_mut(&first).unwrap().data[8] = 4;
+    assert_eq!(create(&mut fx, 0, 0, SIM as i16), Ok(true));
+    fx.world = placed;
+    fx.world.objects.get_mut(&first).unwrap().data[8] = 4 | 2;
+    let result = create(&mut fx, 0, 0, SIM as i16);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("removing object")));
+}
+
+#[test]
+fn what_placing_a_new_person_does_not_port_fails_loudly() {
+    // Person word 68, 74 or 84 (from the record) sends the original
+    // through 0x45810c. Person word 81 of 10 or more, once the person is
+    // on the lot, has the interface move a pooled object to it (0x447a82).
+    for (word, value, address) in [
+        (68, 1, "0x45810c"),
+        (74, 2, "0x45810c"),
+        (84, 1, "0x45810c"),
+        (81, 10, "0x447a82"),
+    ] {
+        let mut fx = person_widget();
+        let record = fx
+            .world
+            .neighbors
+            .slots
+            .last_mut()
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        record.revision = 10;
+        record.data[word] = value;
+        let result = create(&mut fx, 0, 0, SIM as i16);
+        assert!(
+            matches!(trap(result), Trap::Unsupported(ref m) if m.contains(address)),
+            "word {word}"
+        );
+    }
 }

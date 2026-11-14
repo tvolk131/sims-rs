@@ -382,9 +382,10 @@ impl Interpreter<'_> {
     /// 7. The motive changes the person's actions set run once
     ///    ([`motives::apply_changes`], 0x45cdb3).
     /// 8. Every tenth tick, for an awake member of the household who is
-    ///    not hidden, the lot's 0x4165e3 runs; that is not ported and
-    ///    fails. A nonzero person word 1 goes to 0x4a69aa and is cleared;
-    ///    that is not ported and fails.
+    ///    not hidden, the house's usage counts take a sample (0x4165e3,
+    ///    [`sims_sim::HouseUsage::sample`]), which counts whether the
+    ///    person has a route context (0x45c349). A nonzero person word 1
+    ///    goes to 0x4a69aa and is cleared; that is not ported and fails.
     pub fn tick_person(
         &self,
         world: &mut World,
@@ -425,7 +426,7 @@ impl Interpreter<'_> {
                 }
             }
         }
-        self.tick_animator(world, id, tick).map_err(fail)?;
+        self.tick_animator(world, id).map_err(fail)?;
         let outdoor_score = world.rooms.outdoor_score;
         // The score of a room that exists (0x45cef4).
         let score = |room: &Room| {
@@ -500,11 +501,12 @@ impl Interpreter<'_> {
         // counts as asleep.
         let awake = !below_zero(sims_core::F32::from_f32(person.motives[ALERTNESS]));
         if tick % 10 == 0 && word(&person.data, person::VISITOR) == 0 && hidden == 0 && awake {
-            return Err(fail(Trap::Unsupported(
-                "every tenth tick an awake household member's tick runs the lot's 0x4165e3 \
-                 (with 0x45c349), which is not ported"
-                    .into(),
-            )));
+            // 0x45c349: the person's last route context, if it has any.
+            // Only the routing primitives (Go To Routing Slot, 0x45abce;
+            // Go To Relative Position, 0x45c634) push and pop them, and
+            // they are not ported, so the count is the one the load read.
+            let routing = person.routing_frames != 0;
+            world.usage.sample(routing);
         }
         if word(&person.data, person::REQUEST) != 0 {
             return Err(fail(Trap::Unsupported(

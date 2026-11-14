@@ -2,12 +2,12 @@ use sims_content::{Catalog, House, Index, Install, Neighborhood};
 use sims_core::{CrtRng, F32, GameRng};
 use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
-use sims_sim::animator::{Animator, LOADED, Layer};
+use sims_sim::animator::{Animator, LOADED, Layer, UNSET};
 use sims_sim::neighbors::{Inventory, Item, Neighbor, Neighbors, Row};
 use sims_sim::rooms::{Half, Room, Rooms};
 use sims_sim::{
-    Budget, Dialog, Dialogs, FrameStorage, MagicHistory, Object, PersonTick, Snapshots,
-    TypeAttributes, World,
+    Budget, Dialog, Dialogs, FrameStorage, HouseUsage, MagicHistory, Object, PersonTick, Snapshots,
+    TypeAttributes, Usage, World,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -190,10 +190,31 @@ fn world() -> World {
             relationships_changed: true,
         },
         animators: BTreeMap::from([(5, animator())]),
+        usage: HouseUsage {
+            history: [
+                Usage {
+                    total: 1200,
+                    routing: 40,
+                },
+                Usage::default(),
+                Usage::default(),
+                Usage {
+                    total: -1,
+                    routing: i32::MIN,
+                },
+                Usage::default(),
+            ],
+            today: Usage {
+                total: 70000,
+                routing: 3,
+            },
+        },
     }
 }
 
-/// An animator playing a clip backward, with an event queued.
+/// An animator playing a clip backward, with an event queued. The posture,
+/// base layer and destination are the values [`LOADED`] held before
+/// snapshot format 12, so that the format 11 digests still apply.
 fn animator() -> Animator {
     let mut layer = Layer::start(
         "clip",
@@ -216,6 +237,9 @@ fn animator() -> Animator {
             F32::from_bits(0x43b4_0000),
             F32::ZERO,
         ],
+        destination: [UNSET; 3],
+        posture: 0,
+        base: true,
         events: vec![7, -2],
         foreground: Some(layer),
         playing: true,
@@ -229,13 +253,43 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "db098963b435573f4282f5706b20ed599ef95c395951934dc0ef917d1c5aac1b";
+const PINNED: &str = "ec8aa330243910a992600b661de18c6fe08a438af7e4058ccd8c7ae67332780c";
 
-/// The encoding of `world` without its animators, minus the zero byte
-/// they encode to: what snapshot format 10 encoded.
+/// The encoding of `world` with its usage counts all 0, minus the twelve
+/// zero bytes they encode to. Snapshot format 12 added them at the end.
+fn without_usage(mut world: World) -> Vec<u8> {
+    world.usage = HouseUsage::default();
+    let mut bytes = world.encode();
+    assert_eq!(bytes.split_off(bytes.len() - 12), [0; 12]);
+    bytes
+}
+
+/// The encoding of `world`, which holds one animator, without the usage
+/// counts and without the flag snapshot format 12 added at the end of an
+/// animator: what snapshot format 11 encoded. The animator is the last
+/// thing encoded before the usage counts, and the flag its last field.
+fn format_11_bytes(world: &World) -> Vec<u8> {
+    assert_eq!(world.animators.len(), 1);
+    let stale = world.animators.values().next().unwrap().profile_stale;
+    let mut bytes = without_usage(world.clone());
+    assert_eq!(bytes.split_off(bytes.len() - 1), [u8::from(stale)]);
+    bytes
+}
+
+#[test]
+fn without_the_appearance_flag_the_encoding_is_format_11() {
+    // Snapshot format 12 added the animator's flag that the person's
+    // appearance is to be read again (+0xd8), and the house's usage
+    // counts at the end.
+    assert_eq!(digest(&format_11_bytes(&world())), PINNED_11);
+}
+const PINNED_11: &str = "db098963b435573f4282f5706b20ed599ef95c395951934dc0ef917d1c5aac1b";
+
+/// The encoding of `world` without its animators or usage counts, minus
+/// the bytes they encode to: what snapshot format 10 encoded.
 fn format_10_bytes(mut world: World) -> Vec<u8> {
     world.animators.clear();
-    let mut bytes = world.encode();
+    let mut bytes = without_usage(world);
     assert_eq!(bytes.split_off(bytes.len() - 1), [0]);
     bytes
 }
@@ -303,6 +357,9 @@ fn any_field_change_changes_the_hash() {
     changed.dialogs.records[0].status = 5;
     assert_ne!(changed.hash(), base);
     let mut changed = world();
+    changed.usage.sample(false);
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
     changed.dialogs.declined = 0;
     assert_ne!(changed.hash(), base);
     let mut changed = world();
@@ -317,6 +374,9 @@ fn any_field_change_changes_the_hash() {
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.animators.get_mut(&5).unwrap().rate = F32::from_bits(0x3fb3_3334);
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.animators.get_mut(&5).unwrap().profile_stale = false;
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.lot_rng.next_u32();
@@ -422,5 +482,29 @@ fn boots_the_goth_house() {
     assert_eq!(
         store.load("boot").unwrap().unwrap().encode(),
         world.encode()
+    );
+}
+
+#[test]
+fn the_house_model_gives_the_usage_counts() {
+    // 0x416568 reads each pair's routing count (+4) before its total (+0).
+    let model = sims_formats::lot::House {
+        version: 0x49,
+        name: String::new(),
+        pairs: [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10], [11, 12]],
+        tail: Vec::new(),
+    };
+    let mut world = World::empty();
+    world.read_house_model(&model);
+    assert_eq!(
+        world.usage.history.map(|u| (u.total, u.routing)),
+        [(2, 1), (4, 3), (6, 5), (8, 7), (10, 9)]
+    );
+    assert_eq!(
+        world.usage.today,
+        Usage {
+            total: 12,
+            routing: 11
+        }
     );
 }

@@ -14,14 +14,18 @@
 //!   object the local names stands (the jump table at 0x44e92e sends
 //!   mode 8 to 0x44e430). See `Machine::create_at_local`.
 //!
-//! The object is made by [`crate::Interpreter::create`] (0x440b2d), so its
-//! Init and first turn have run before it is placed. It becomes the stack
-//! object and the true branch is taken. Every other mode and flag fails
-//! loudly.
+//! The object is made by [`crate::Interpreter::create`] (0x440b2d), or a
+//! person by [`crate::Interpreter::create_person`], so its Init and first
+//! turn have run before it is placed. It becomes the stack object and the
+//! true branch is taken. Every other mode and flag fails loudly.
 //!
-//! **Unverified**: a GUID with no definition takes the false branch here.
-//! Mode 8 is first reached after the five ticks the capture holds, so
-//! nothing of it has been compared with the original.
+//! Mode 8 making a person is what the Goth house's tick 6 does (object
+//! 382 makes person 259). The state after it, and after ticks 7 to 13 in
+//! which that person runs, equals the capture's (`docs/decisions.md`).
+//! **Unverified**: a GUID with no definition takes the false branch here;
+//! mode 8 making an object that is not a person, and the paths of a
+//! person that tick 6 does not take, are checked only by the synthetic
+//! tests.
 
 use crate::factory::word::{GROUP, TYPE};
 use crate::fault::Trap;
@@ -67,6 +71,26 @@ impl Machine<'_, '_> {
             })
     }
 
+    /// Makes a person (0x440b2d, [`crate::Interpreter::create_person`])
+    /// and gives it its neighborhood record's interests and personality
+    /// (0x425930), as 0x44e0c8 does for any new person (0x44e608).
+    fn make_person(&mut self, guid: u32) -> Result<u16, Trap> {
+        let interpreter = self.interpreter();
+        let unsupported =
+            |fault| Trap::Unsupported(format!("creating a person of type 0x{guid:08X}: {fault}"));
+        let id = interpreter
+            .create_person(self.world, guid)
+            .map_err(unsupported)?;
+        interpreter.attach_traits(self.world, id).map_err(|trap| {
+            unsupported(crate::fault::Fault {
+                object: id,
+                at: None,
+                trap,
+            })
+        })?;
+        Ok(id)
+    }
+
     /// Mode 8 of 0x44e0c8, in the order the original runs it:
     ///
     /// 1. The local must be one the frame has (native error 8). The object
@@ -74,23 +98,29 @@ impl Machine<'_, '_> {
     ///    takes the false branch before anything is made.
     /// 2. A position off the lot (0x422632: a tile byte below 1 or at
     ///    least the lot's size less 1) takes the false branch.
-    /// 3. The object is made (0x440b2d).
-    /// 4. With flag 0x20 the new object turns to the stack object's facing
+    /// 3. The object is made (0x440b2d). A new person is made by its own
+    ///    path and then takes its record's interests and personality
+    ///    ([`Machine::make_person`]).
+    /// 4. With flag 0x20 a new person takes the stack object's data word 1
+    ///    whole. Any other new object turns to the stack object's facing
     ///    with its lowest bit cleared: up to four calls of virtual function
     ///    0x4c, one step each. Nothing turns when the stack object names no
     ///    object. Only the case with nothing to turn is ported; a turn
     ///    (0x433f75, which redraws, updates seats and the walls beside)
     ///    fails loudly.
-    /// 5. The place test (virtual function 0x54, with no container) at the
+    /// 5. A new person with bit 0 of person word 84 or 68 set, or bit 0 or
+    ///    1 of word 74, goes through 0x45810c, which is not ported and
+    ///    fails.
+    /// 6. The place test (virtual function 0x54, with no container) at the
     ///    exact position. If it refuses, the new object is removed at once
-    ///    (0x44123f) and the false branch is taken.
-    /// 6. The object is put there with the lot told (virtual function
+    ///    (0x44123f) and the false branch is taken. Removing a person is
+    ///    not ported and fails.
+    /// 7. The object is put there with the lot told (virtual function
     ///    0x58).
     ///
-    /// A new person (which copies the facing and has steps of its own),
-    /// and an object whose definition names a group (word 10, which sends
-    /// the original through a group's own steps), fail loudly before
-    /// anything is made. Flags 1, 2, 4, 8, 0x10 and 0x40, which this mode
+    /// An object whose definition names a group (word 10, which sends the
+    /// original through a group's own steps) fails loudly before anything
+    /// is made. Flags 1, 2, 4, 8, 0x10 and 0x40, which this mode
     /// can also carry, are refused by the caller.
     fn create_at_local(&mut self, guid: u32, flags: u8, local: i8) -> Result<bool, Trap> {
         let frame = self.frame()?;
@@ -121,18 +151,18 @@ impl Machine<'_, '_> {
             return Ok(false);
         }
         let words = self.definition_words(guid)?;
-        if words[TYPE] == PERSON {
-            return Err(Trap::Unsupported(
-                "Create New Object Instance placing a new person is not ported".into(),
-            ));
-        }
+        let person = words[TYPE] == PERSON;
         if words[GROUP] != 0 {
             return Err(Trap::Unsupported(format!(
                 "Create New Object Instance placing an object of type 0x{guid:08X}, \
                  which belongs to a group, is not ported"
             )));
         }
-        let created = self.make(guid)?;
+        let created = if person {
+            self.make_person(guid)?
+        } else {
+            self.make(guid)?
+        };
         if flags & FACE_AS_STACK_OBJECT != 0 {
             let source = self.frame()?.stack_object;
             if let Some(source) = u16::try_from(source)
@@ -140,6 +170,17 @@ impl Machine<'_, '_> {
                 .filter(|id| *id > 0)
                 .and_then(|id| self.world.objects.get(&id))
             {
+                if person {
+                    // A person takes the stack object's data word 1 whole
+                    // and does not turn (0x44e684).
+                    let facing = source.data[1];
+                    self.world
+                        .objects
+                        .get_mut(&created)
+                        .ok_or(Trap::native(10, "missing object"))?
+                        .data[1] = facing;
+                    return self.place_new(created, position, level);
+                }
                 let wanted = source.data[1] & 6;
                 let facing = self.world.objects[&created].data[1];
                 if facing != wanted {
@@ -148,6 +189,28 @@ impl Machine<'_, '_> {
                          {facing} to {wanted}: turning (0x433f75) is not ported"
                     )));
                 }
+            }
+        }
+        self.place_new(created, position, level)
+    }
+
+    /// Steps 5 to 7 of mode 8 (from 0x44e6b6) for the object `created`
+    /// just made: a person with bit 0 of person word 84 or 68 set, or bit
+    /// 0 or 1 of word 74, goes through 0x45810c, which is not ported and
+    /// fails. Then the place test and the put.
+    fn place_new(&mut self, created: u16, position: [i32; 2], level: i32) -> Result<bool, Trap> {
+        if let Some(person) = self
+            .world
+            .objects
+            .get(&created)
+            .and_then(|o| o.person.as_ref())
+        {
+            let word = |index: usize| person.data.get(index).copied().unwrap_or(0);
+            if word(84) & 1 != 0 || word(68) & 1 != 0 || word(74) & 3 != 0 {
+                return Err(Trap::Unsupported(format!(
+                    "Create New Object Instance placing person {created}, whose person word 84, \
+                     68 or 74 is set: 0x45810c is not ported"
+                )));
             }
         }
         let interpreter = self.interpreter();

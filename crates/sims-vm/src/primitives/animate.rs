@@ -19,7 +19,9 @@
 //! nothing to report. Otherwise, in order:
 //!
 //! 1. If no clip is playing (animator +0xa0), the clip is looked up
-//!    (0x5893b3), the event queue emptied, the foreground slot cleared
+//!    (0x5893b3, which first reads the person's appearance again if the
+//!    animator says so: [`sims_sim::animator::Animator::profile_stale`]),
+//!    the event queue emptied, the foreground slot cleared
 //!    and the clip started there (0x592726) at the animator's clock. The
 //!    animator's state becomes 0, Animate Sim's count of events seen 0.
 //! 2. An event waiting in the queue (virtual function 0x80) is taken. A
@@ -44,6 +46,7 @@
 
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine, word};
+use crate::people::read_appearance_if_stale;
 use sims_sim::animator::{Animator, LOADED, Layer};
 
 /// The global file's tables of clip names (0x59dd16): an adult's, and a
@@ -105,6 +108,9 @@ impl Machine<'_, '_> {
             ));
         }
         if !a.playing {
+            // 0x5893b3 first reads the person's appearance again if the
+            // animator says so.
+            read_appearance_if_stale(self.world, self.program, self.me, &mut a.profile_stale)?;
             let (name, duration, frames, bound) = self.clip(operands, id)?;
             a.events.clear();
             if let Some(layer) = &a.foreground {

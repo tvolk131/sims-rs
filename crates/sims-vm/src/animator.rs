@@ -5,7 +5,10 @@
 //! room. In order:
 //!
 //! 1. The clock (0x585483, [`Animator::clock_at`]) is read and kept
-//!    (+0xb4).
+//!    (+0xb4). It comes from the lot's tick count (virtual function 0x38
+//!    of the lot), not from the tick the person's tick is given: the
+//!    person's first tick, which a new person gets with tick 0 while it
+//!    is made, reads the current tick count.
 //! 2. A blend layer (+0x10) with no weight is removed. Nothing ported
 //!    fills that slot, so it is always empty here.
 //! 3. The carry clip is chosen (0x5903a3). Unless a script's carry clip
@@ -19,7 +22,15 @@
 //!    it; then, unless the definition's word 102 has bit 2 set, or the
 //!    layer is there and the person's kind (word 65) is at most 1, the
 //!    posture is noted and, for postures 0 to 2, the posture's clip
-//!    started. Starting it is not ported.
+//!    started. Starting it first looks the clip up (virtual function
+//!    0xf4, 0x592625), which reads the person's appearance again if the
+//!    animator says so ([`Animator::profile_stale`]); then the clip goes
+//!    into the base slot (0x592726) to repeat at priority -10, which
+//!    marks the skin's layers changed. Only posture 0 is ported: its clip
+//!    was found every time the capture shows (a base layer after each
+//!    start), while the clips of postures 1 and 2 and a clip the lookup
+//!    does not find (0x59db2f, which leaves the slot empty) were never
+//!    seen and fail.
 //! 5. The speed moves towards the speed wanted (0x588fa0) by at most 0.2
 //!    up; down it moves at once.
 //! 6. An animator whose person stands off the lot (0x422632) does nothing
@@ -54,6 +65,7 @@
 
 use crate::fault::Trap;
 use crate::interpreter::Interpreter;
+use crate::people::read_appearance_if_stale;
 use crate::placement::on_lot;
 use sims_core::{Ext, F32};
 use sims_sim::World;
@@ -84,9 +96,9 @@ const SCALE_BELOW: F32 = F32::from_bits(0x3ecc_cccd);
 const TURN: i32 = 8;
 
 impl Interpreter<'_> {
-    /// Person `id`'s animator tick at lot tick count `tick` (0x58dc72).
+    /// Person `id`'s animator tick (0x58dc72), at the lot's tick count.
     /// See the module documentation.
-    pub(crate) fn tick_animator(&self, world: &mut World, id: u16, tick: i32) -> Result<(), Trap> {
+    pub(crate) fn tick_animator(&self, world: &mut World, id: u16) -> Result<(), Trap> {
         let object = world
             .objects
             .get(&id)
@@ -116,7 +128,7 @@ impl Interpreter<'_> {
         let flags = self.machine(world, id, 0, false).definition_words(guid)?[DEFINITION_FLAGS];
 
         let mut a = world.animators.get(&id).cloned().unwrap_or(LOADED);
-        let now = a.clock_at(tick);
+        let now = a.clock_at(world.ticks as i32);
         a.clock = now;
 
         // 0x5903a3: the carry clip.
@@ -149,15 +161,31 @@ impl Interpreter<'_> {
         }
         if flags & 4 == 0 && !(a.base && kind <= 1) {
             a.posture = posture;
-            if (0..=2).contains(&posture) {
-                return Err(Trap::Unsupported(format!(
-                    "the animator starts the base clip of posture {posture} (0x59049f), which \
-                     is not ported"
-                )));
+            match posture {
+                0 => {
+                    read_appearance_if_stale(world, self.program, id, &mut a.profile_stale)?;
+                    // 0x592726 empties the slot first (it is empty here)
+                    // and adds the new layer to the skin.
+                    a.base = true;
+                    a.skin_dirty = true;
+                }
+                1 | 2 => {
+                    return Err(Trap::Unsupported(format!(
+                        "the animator starts the base clip of posture {posture} (0x590497), \
+                         which has not been seen; not ported"
+                    )));
+                }
+                _ => {}
             }
         }
 
-        // 0x588fa0 and 0x58dd03: the speed.
+        // 0x588fa0 and 0x58dd03: the speed. Reading the appearance may
+        // have changed the kind.
+        let kind = world
+            .objects
+            .get(&id)
+            .and_then(|o| o.person.as_ref())
+            .map_or(kind, |p| word(&p.data, KIND));
         let target = wanted_rate(pace, a.state, kind);
         a.target = target.to_f32();
         let rate = a.rate.ext();

@@ -24,10 +24,11 @@
 //! simulation holds reads it on these paths. The comments name it, so the
 //! reason for each refusal is on record.
 //!
-//! Only what an ordinary object on the ground needs is ported. A person, a
-//! tile of a group, a place inside a container, the upper level's floor
-//! test, an object that must stand against a wall (data word 13 nonzero)
-//! and two objects that are both not solid on the same tile fail loudly.
+//! Only what an ordinary object or a person on the ground needs is
+//! ported. A person whose person word 84 has bit 0, a tile of a group, a
+//! place inside a container, the upper level's floor test, an object that
+//! must stand against a wall (data word 13 nonzero) and two objects that
+//! are both not solid on the same tile fail loudly.
 
 use super::{FLAGS, FULL, GRIDS, data, datum, footprint, missing, registered, slot};
 use crate::fault::{Fault, Trap};
@@ -68,6 +69,10 @@ mod word {
 
 /// Person data word 68; bit 0 set means the person takes no room.
 const PERSON_NO_ROOM: usize = 68;
+
+/// Person data word 84; bit 0 sends the collision test through steps
+/// that are not ported.
+const PERSON_CARRIED: usize = 84;
 
 /// The tiles around a tile that the collision test visits, as offsets of
 /// the first and second coordinates, the tile itself last (the tables at
@@ -370,7 +375,7 @@ impl Interpreter<'_> {
     ///    (2).
     /// 2. Above the ground level, placement flag 0x1000 is clear (0x1f).
     /// 3. The tile's diagonal wall is one the object may stand against
-    ///    ([`Self::against_walls`], 0x476f5a).
+    ///    ([`Self::against_walls`], 0x476f5a). A person skips this.
     /// 4. Above the ground level without placement flag 0x200: the upper
     ///    level's floor test, which is not ported.
     /// 5. On water (the ground level, water byte not 0xff) without
@@ -402,11 +407,7 @@ impl Interpreter<'_> {
             trap,
         };
         let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
-        if object.person.is_some() {
-            return Err(fail(Trap::Unsupported(
-                "the place test of a person is not ported".into(),
-            )));
-        }
+        let person = object.person.is_some();
         if object.multipart.is_some() {
             return Err(fail(Trap::Unsupported(
                 "the place test of a tile of a group (0x422abb) is not ported".into(),
@@ -423,9 +424,11 @@ impl Interpreter<'_> {
         if level > 1 && placement & 0x1000 != 0 {
             return Ok(false);
         }
-        if !self
-            .against_walls(world, [a, b], level, read(world, word::WALL_RULES)?)
-            .map_err(fail)?
+        // A person skips the wall rules (0x432ac5).
+        if !person
+            && !self
+                .against_walls(world, [a, b], level, read(world, word::WALL_RULES)?)
+                .map_err(fail)?
         {
             return Ok(false);
         }
@@ -517,11 +520,17 @@ impl Interpreter<'_> {
         )))
     }
 
-    /// Whether an object at a position collides with nothing (0x4337f6,
-    /// for an object that is not a person). Its footprint there is worked
-    /// out as the lot stores footprints. On its tile and the eight around
-    /// it, every object linked from the tile's grid cell through slot 0 is
-    /// looked at, the object itself skipped:
+    /// Whether an object at a position collides with nothing (0x4337f6).
+    /// Its footprint there is worked out as the lot stores footprints. On
+    /// its tile and the eight around it, every object linked from the
+    /// tile's grid cell through slot 0 is looked at, the object itself
+    /// skipped.
+    ///
+    /// For a person being placed: one whose person data word 68 has bit 0
+    /// collides with nothing; one whose word 84 has bit 0 goes on to steps
+    /// that are not ported and fails. Any other object is in the way as
+    /// [`Self::in_way_of_person`] says, and there is no test of data word
+    /// 63. For any other object:
     ///
     /// - A person whose person data word 68 has bit 0 is skipped. Any
     ///   other person is in the way only when the object is solid and has
@@ -548,13 +557,38 @@ impl Interpreter<'_> {
             trap,
         };
         let me = |world: &World, index: usize| datum(world, id, index).map(|w| w as u16);
+        let person = world
+            .objects
+            .get(&id)
+            .ok_or_else(|| fail(missing()))?
+            .person
+            .as_ref()
+            .map(|p| p.data.clone());
+        if let Some(person) = &person {
+            let bit = |index: usize| person.get(index).is_some_and(|w| w & 1 != 0);
+            if bit(PERSON_NO_ROOM) {
+                return Ok(true);
+            }
+            if bit(PERSON_CARRIED) {
+                return Err(fail(Trap::Unsupported(
+                    "the collision test of a person whose person word 84 has bit 0 (0x43383f) \
+                     is not ported"
+                        .into(),
+                )));
+            }
+        }
         let flags = me(world, word::FLAGS).map_err(fail)?;
         let not_solid = flags & 4 != 0;
         let exclusive = me(world, word::EXCLUSIVE).map_err(fail)?;
         let facing = datum(world, id, data::FACING).map_err(fail)?;
         let words = self.words(world, id).map_err(fail)?;
-        let bounds =
-            footprint([position[0], position[1], level], words, facing, None).map_err(fail)?;
+        let bounds = footprint(
+            [position[0], position[1], level],
+            words,
+            facing,
+            person.as_deref(),
+        )
+        .map_err(fail)?;
         let tile = World::tile([position[0], position[1], level]);
         for (index, (da, db)) in AROUND.iter().enumerate() {
             let a = tile[0].wrapping_add(*da);
@@ -571,7 +605,12 @@ impl Interpreter<'_> {
                         "the objects on a tile link in a loop".into(),
                     )));
                 }
-                if other != id && self.in_way(world, id, other, not_solid, flags)? {
+                let in_way = if person.is_some() {
+                    self.in_way_of_person(world, id, other)?
+                } else {
+                    self.in_way(world, id, other, not_solid, flags)?
+                };
+                if other != id && in_way {
                     if !self.callback(world, id, ALLOW_OVERLAP, other as i16)?
                         && !self.callback(world, other, ALLOW_OVERLAP, id as i16)?
                     {
@@ -591,6 +630,7 @@ impl Interpreter<'_> {
                         }
                     }
                 } else if other != id
+                    && person.is_none()
                     && index == 8
                     && self.exclusive_clash(world, id, other, not_solid, exclusive)?
                 {
@@ -642,6 +682,23 @@ impl Interpreter<'_> {
         }
         let other_not_solid = datum(world, other, word::FLAGS).map_err(fail)? as u16 & 4 != 0;
         Ok(!not_solid && !other_not_solid)
+    }
+
+    /// Whether another object is in the way of a person being placed
+    /// (0x433975): when it is not solid, if it has data word 8 flag 2;
+    /// when it is solid, if it has no flag 0x10. Another person is tested
+    /// by the same flags.
+    fn in_way_of_person(&self, world: &World, id: u16, other: u16) -> Result<bool, Fault> {
+        let flags = datum(world, other, word::FLAGS).map_err(|trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        })? as u16;
+        Ok(if flags & 4 != 0 {
+            flags & 2 != 0
+        } else {
+            flags & 0x10 == 0
+        })
     }
 
     /// The test of an object on the placed object's own tile when one of

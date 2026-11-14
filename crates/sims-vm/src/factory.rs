@@ -18,15 +18,18 @@
 //! Ported from the old prototype's `begin_object_factory`,
 //! `reset_base_storage`, `install_lifecycle` and `finish_object_factory`
 //! (legacy/crates/sims-vm/src/construction.rs, lifecycle.rs and
-//! registry_flags.rs), without its threads, hosts and frame arena. People (type 2), the cursor
-//! types (8 and 9) and multi-tile objects have their own factories, which
-//! are not ported: asking for one fails.
+//! registry_flags.rs), without its threads, hosts and frame arena. People
+//! (type 2) have their own path ([`Interpreter::create_person`]). The
+//! cursor types (8 and 9) and multi-tile objects have their own factories,
+//! which are not ported: asking for one fails.
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Machine};
 use crate::memory::LOCKOUT;
+use crate::objects::{PERSON_SLOTS, PERSON_WORDS};
 use crate::program::{Callback, DEFINITION_WORDS};
-use sims_formats::saved_objects::Slot;
+use sims_formats::saved_objects::{Interaction, Person, Slot};
+use sims_sim::animator::{Animator, LOADED};
 use sims_sim::{Object, World};
 
 /// How many instructions a new object's Init and first turn may each run.
@@ -78,7 +81,9 @@ impl Interpreter<'_> {
             .find(|id| !world.objects.contains_key(id))
             .ok_or_else(|| fail(0, Trap::Unsupported("no unused object ID".into())))?;
         let mut machine = self.machine(world, id, 0, false);
-        let words = machine.construct(guid).map_err(|trap| fail(id, trap))?;
+        let words = machine
+            .construct(guid, false)
+            .map_err(|trap| fail(id, trap))?;
         let run_init = machine
             .reset(words)
             .and_then(|run_init| machine.install_main().map(|()| run_init))
@@ -108,11 +113,31 @@ impl Interpreter<'_> {
 impl<'a> Machine<'a, '_> {
     /// Steps 1 to 3: storage, registration and the date stamp. Returns the
     /// definition's words.
-    fn construct(&mut self, guid: u32) -> Result<&'a [i16; DEFINITION_WORDS], Trap> {
+    ///
+    /// With `person` the definition must be a person's (type 2), and the
+    /// storage is a person's (the constructor 0x459327 and the
+    /// post-constructor 0x45962b, as far as they make storage): five more
+    /// slots, with data word 67 the number of slots less one; 256 zero
+    /// person data words; no actions (a menu index of -1); no tick yet
+    /// (the last decay at 0 and the room unknown, [`sims_sim::PersonTick::CONSTRUCTED`])
+    /// and a new animator ([`Animator::new`], 0x587d2c) at the current
+    /// clock. A person has no graphics root of its own: its skeleton draws
+    /// instead (see [`Interpreter::create_person`]).
+    pub(crate) fn construct(
+        &mut self,
+        guid: u32,
+        person: bool,
+    ) -> Result<&'a [i16; DEFINITION_WORDS], Trap> {
         let id = self.me;
         let definition = self.definition(guid)?;
         let words = self.definition_words(guid)?;
-        if matches!(words[word::TYPE], 2 | 8 | 9) {
+        if person && words[word::TYPE] != 2 {
+            return Err(Trap::Invalid(format!(
+                "0x{guid:08X} is not a person type (type {})",
+                words[word::TYPE]
+            )));
+        }
+        if !person && matches!(words[word::TYPE], 2 | 8 | 9) {
             return Err(Trap::Unsupported(format!(
                 "the factory for object type {} is not ported",
                 words[word::TYPE]
@@ -135,13 +160,14 @@ impl<'a> Machine<'a, '_> {
         let containers = self
             .program
             .containers(definition.resource, definition.chunk);
+        let slots = containers + 1 + if person { PERSON_SLOTS } else { 0 };
         let mut data = vec![0i16; 72];
         data[11] = id as i16;
         // No slot, no room, and the number of objects it can hold
-        // (0x431aaf).
+        // (0x431aaf; for a person 0x45962b counts its own slots too).
         data[14] = -1;
         data[29] = -5;
-        data[67] = containers as i16;
+        data[67] = (slots - 1) as i16;
         // The date stamp: year, month, day, then hour and minute.
         let globals = &self.world.globals;
         if globals.len() < 9 {
@@ -171,18 +197,19 @@ impl<'a> Machine<'a, '_> {
             stack: Vec::new(),
             relationship_flag: -1,
             relationships: Vec::new(),
-            // Saved slot 0 is the tile chain; the containers follow.
+            // Saved slot 0 is the tile chain; the containers follow, and a
+            // person's own slots after them.
             slots: vec![
                 Slot {
                     unknown: 0,
                     object: 0,
                 };
-                containers + 1
+                slots
             ],
             dynamic_sprites: vec![0; sprites],
             multipart: None,
             portal: None,
-            person: None,
+            person: person.then(new_person),
             // Countdown -1 and no flags.
             registry_word: Some(0xffff),
             last_result: false,
@@ -201,7 +228,7 @@ impl<'a> Machine<'a, '_> {
                     .ok_or_else(|| Trap::Unsupported("no unused type ID".into()))?,
             )
         };
-        if words[word::GRAPHICS] & 1 != 0 {
+        if !person && words[word::GRAPHICS] & 1 != 0 {
             // An object with graphics of its own builds their root here,
             // which gets the noise records of one bone: 32 draws from the
             // C runtime's random stream (0x595d65). The graphics are not
@@ -225,6 +252,12 @@ impl<'a> Machine<'a, '_> {
         }
         if let Some(type_id) = new_type {
             self.world.types.insert(type_id, guid);
+        }
+        self.world.person_ticks.remove(&id);
+        self.world.animators.remove(&id);
+        if person {
+            let clock = LOADED.clock_at(self.world.ticks as i32);
+            self.world.animators.insert(id, Animator::new(clock));
         }
         Ok(words)
     }
@@ -348,5 +381,49 @@ impl<'a> Machine<'a, '_> {
                 .iter()
                 .any(|entry| (entry.autonomy as i32) < 100 && entry.flags & 128 == 0)
         }))
+    }
+}
+
+/// A new person's own storage (0x459327): no appearance or clips yet, 256
+/// zero data words, and no actions. An empty action has menu index -1, as
+/// the capture of a new person shows.
+///
+/// The motives are what their constructor (0x420f6a) leaves: all 0 but
+/// energy (motive 5), 70 (the constant at 0x666a5c), and hunger (motive
+/// 7), -40 (0xc2200000). Of the values the last decay left, energy is 70
+/// too and the rest 0.
+fn new_person() -> Person {
+    let mut motives = [0.0; 16];
+    let mut previous_motives = [0.0; 16];
+    (motives[5], motives[7], previous_motives[5]) = (70.0, -40.0, 70.0);
+    let idle = Interaction {
+        uid: 0,
+        caller: 0,
+        target: 0,
+        icon: 0,
+        table_index: -1,
+        args: [0; 4],
+        priority: 0,
+        action: 0,
+        attenuation: 0.0,
+        flags: 0,
+    };
+    Person {
+        animation_events: 0,
+        engaged: 0,
+        appearance: Default::default(),
+        accessories: Vec::new(),
+        animations: Default::default(),
+        routing_state: 0,
+        floats: [0.0; 9],
+        previous_motives,
+        motives,
+        data: vec![0; PERSON_WORDS],
+        routing_frames: 0,
+        active: idle.clone(),
+        last: idle,
+        queue: Vec::new(),
+        object_uses: Vec::new(),
+        motive_deltas: Vec::new(),
     }
 }

@@ -79,6 +79,25 @@ impl People {
         catalog: &Catalog,
         guids: impl IntoIterator<Item = u32>,
     ) -> Result<Self> {
+        let (people, mut unresolved) = Self::load_each(install, index, catalog, guids)?;
+        match unresolved.pop_first() {
+            Some((_, reason)) => Err(Error::Unsupported(reason)),
+            None => Ok(people),
+        }
+    }
+
+    /// As [`People::load`], but a person type whose skeleton cannot be
+    /// chosen (no skeleton file defines it, or two do) is left out of
+    /// both maps instead of failing the whole load. Returns the types left
+    /// out, by GUID, with the reason. Making a person of a type left out
+    /// fails, as it would with no entry at all.
+    pub fn load_each(
+        install: &Install,
+        index: &Index,
+        catalog: &Catalog,
+        guids: impl IntoIterator<Item = u32>,
+    ) -> Result<(Self, BTreeMap<u32, String>)> {
+        let mut unresolved = BTreeMap::new();
         let mut names = BTreeMap::new();
         let mut profiles = BTreeMap::new();
         for guid in guids {
@@ -128,15 +147,22 @@ impl People {
                         .map(move |(place, _)| (file, place, skeletons))
                 });
                 let Some((file, place, all)) = found.next() else {
-                    return Err(Error::Unsupported(format!(
-                        "no skeleton file defines the skeleton {name:?}"
-                    )));
+                    unresolved.insert(
+                        guid,
+                        format!("no skeleton file defines the skeleton {name:?}"),
+                    );
+                    continue;
                 };
                 if let Some((other, ..)) = found.next() {
-                    return Err(Error::Unsupported(format!(
-                        "the skeleton {name:?} is defined by {file} and by {other}; choosing \
-                         between them needs the original's avatar registry, which is not ported"
-                    )));
+                    unresolved.insert(
+                        guid,
+                        format!(
+                            "the skeleton {name:?} is defined by {file} and by {other}; \
+                             choosing between them needs the original's avatar registry, \
+                             which is not ported"
+                        ),
+                    );
+                    continue;
                 }
                 skeletons.insert(
                     guid,
@@ -149,10 +175,14 @@ impl People {
                 );
             }
         }
-        Ok(Self {
-            skeletons,
-            profiles,
-        })
+        profiles.retain(|guid, _| !unresolved.contains_key(guid));
+        Ok((
+            Self {
+                skeletons,
+                profiles,
+            },
+            unresolved,
+        ))
     }
 }
 
