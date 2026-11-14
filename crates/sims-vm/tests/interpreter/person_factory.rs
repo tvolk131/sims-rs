@@ -71,6 +71,7 @@ pub fn equip(fx: &mut Fixture, guid: u32, name: &str, record_word: i16) {
             age: None,
             skin: None,
             tones: Vec::new(),
+            rig: Default::default(),
         },
     );
     let global = fx.program.libraries.get_mut(&GLOBAL).unwrap();
