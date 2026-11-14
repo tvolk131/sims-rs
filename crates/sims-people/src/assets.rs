@@ -11,15 +11,20 @@
 //! game first, then the expansions in the order the original mounts their
 //! object directories, then `Downloads`. A name two sources hold with
 //! different bytes takes the first, and [`Assets::conflicts`] lists it.
-//! That this order picks what the original draws is **unverified**; on the
+//! That this order picks what the original draws is **unverified**: the
+//! original's texture search puts the expansions before the base game
+//! (0x413ccc), the reverse of this order. The Complete Collection has 47
+//! such names (accessory textures, a few animation and mesh files); on the
 //! Goth family every file it reads either has one source or identical
-//! copies (see the gated tests).
+//! copies (see the gated tests). Appearance catalogs are loaded in the
+//! original's own order instead (see [`crate::appearance::load_appearance`]).
 
 use sims_content::{Member, Resource};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Where person files are searched, in order, relative to the install.
 /// A directory is listed (with its subdirectories); every FAR archive in
@@ -46,14 +51,23 @@ const KINDS: &[&str] = &[".bcf", ".cmx", ".bmf", ".skn", ".bmp", ".cfp"];
 /// Every person file of an install, by lowercase name.
 #[derive(Debug, Clone, Default)]
 pub struct Assets {
+    /// The install the files were found under.
+    root: PathBuf,
     files: BTreeMap<String, Vec<Resource>>,
+    /// Where each appearance is loaded from, by lowercase name: the
+    /// catalog's file name and source. Built on first use
+    /// ([`crate::appearance::load_appearance`]).
+    appearances: OnceLock<BTreeMap<String, (String, Resource)>>,
 }
 
 impl Assets {
     /// Lists the person files under `root` ([`SOURCES`]). A source that is
     /// missing adds nothing; an archive that cannot be read is an error.
     pub fn scan(root: &Path) -> Result<Self, String> {
-        let mut assets = Self::default();
+        let mut assets = Self {
+            root: root.to_path_buf(),
+            ..Self::default()
+        };
         for (mount, source) in SOURCES.iter().enumerate() {
             let Some(directory) = resolve(root, source) else {
                 continue;
@@ -130,6 +144,41 @@ impl Assets {
         self.files.get(&key(name)).map_or(&[], Vec::as_slice)
     }
 
+    /// The folder `resource` is in as the original sees it: its directory
+    /// under the install, and for an archive member the directory its name
+    /// holds, added to the archive's own directory (an archive's members
+    /// are mounted where the archive is). In lowercase, with `/` between
+    /// the parts: `gamedata/skins` for `GameData/Skins/b.cmx`,
+    /// `deluxe/skins` for `Deluxe/Deluxe.far`'s `Skins\b.cmx.bcf`.
+    pub fn folder(&self, resource: &Resource) -> String {
+        let directory = resource
+            .path
+            .parent()
+            .and_then(|p| p.strip_prefix(&self.root).ok())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let inner = resource
+            .member
+            .as_ref()
+            .and_then(|m| m.name.rsplit_once(['\\', '/']))
+            .map(|(dir, _)| dir.replace('\\', "/"));
+        let folder = match inner {
+            Some(inner) if directory.is_empty() => inner,
+            Some(inner) => format!("{directory}/{inner}"),
+            None => directory,
+        };
+        folder.to_ascii_lowercase()
+    }
+
+    /// The appearance index, built by `build` the first time it is asked
+    /// for.
+    pub(crate) fn appearances(
+        &self,
+        build: impl FnOnce() -> BTreeMap<String, (String, Resource)>,
+    ) -> &BTreeMap<String, (String, Resource)> {
+        self.appearances.get_or_init(build)
+    }
+
     /// Whether the sources of `name` disagree: two of them hold different
     /// bytes. Reads every source.
     pub fn conflicts(&self, name: &str) -> Result<bool, String> {
@@ -165,8 +214,15 @@ fn resolve(root: &Path, relative: &str) -> Option<PathBuf> {
             path = exact;
             continue;
         }
-        let entries = std::fs::read_dir(&path).ok()?;
-        path = entries.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+        // The first match in name order, so the choice doesn't depend on
+        // the order the filesystem lists names in.
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&path)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        entries.sort();
+        path = entries.into_iter().find(|p| {
             p.file_name()
                 .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(part))
         })?;
@@ -220,12 +276,48 @@ fn far_members(path: &Path) -> Result<Vec<Member>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::key;
+    use super::*;
 
     #[test]
     fn a_key_drops_the_member_directory_and_case() {
         assert_eq!(key("Skins\\B009FCChd_01.cmx.bcf"), "b009fcchd_01.cmx.bcf");
         assert_eq!(key("adult-skeleton.cmx.bcf"), "adult-skeleton.cmx.bcf");
         assert_eq!(key("a/B.BMP"), "b.bmp");
+    }
+
+    #[test]
+    fn a_file_is_in_its_folder_and_a_member_in_its_archives() {
+        let assets = Assets {
+            root: PathBuf::from("/install"),
+            ..Assets::default()
+        };
+        let resource = |path: &str, member: Option<&str>| Resource {
+            mount: 0,
+            path: PathBuf::from(path),
+            member: member.map(|name| Member {
+                name: name.into(),
+                offset: 0,
+                size: 0,
+            }),
+        };
+        let folder = |path, member| assets.folder(&resource(path, member));
+        assert_eq!(
+            folder("/install/GameData/Skins/B.cmx", None),
+            "gamedata/skins"
+        );
+        assert_eq!(
+            folder("/install/Deluxe/Deluxe.far", Some("Skins\\b.cmx.bcf")),
+            "deluxe/skins"
+        );
+        assert_eq!(
+            folder(
+                "/install/GameData/Textures/Textures.far",
+                Some("bottle.bmp")
+            ),
+            "gamedata/textures"
+        );
+        assert_eq!(folder("/install/x.far", Some("A/B\\c.bmp")), "a/b");
+        // A file outside the install has no folder but its own.
+        assert_eq!(folder("/elsewhere/x.far", Some("Skins\\c.bmp")), "skins");
     }
 }
