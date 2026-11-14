@@ -236,20 +236,6 @@ impl Lot {
     pub fn contains(&self, x: i32, y: i32) -> bool {
         x >= 0 && y >= 0 && (x as usize) < self.size && (y as usize) < self.size
     }
-
-    /// Whether the room of tile (x, y) on a level is outdoors. Tiles off
-    /// the lot, tiles in no room, and lots whose rooms are not worked out
-    /// count as outdoors.
-    pub fn outdoors(&self, level: usize, x: i32, y: i32) -> bool {
-        if !self.contains(x, y) {
-            return true;
-        }
-        let Some(rooms) = &self.levels[level].rooms else {
-            return true;
-        };
-        let room = rooms[Self::cell(x as usize, y as usize)];
-        room <= 0 || self.outdoor_rooms.contains(&room)
-    }
 }
 
 impl Lot {

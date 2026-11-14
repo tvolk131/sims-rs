@@ -12,7 +12,8 @@
 //! Keys: `+`/`-` or the wheel zoom, `[`/`]` or `,`/`.` rotate, Page Up and
 //! Page Down change the floor, `1`/`2`/`3` choose walls up, cutaway and
 //! down, the arrow keys or a left-button drag scroll, `S` saves the frame
-//! as a PNG, Escape quits.
+//! as a PNG, Escape quits. As in the original, the cutaway cuts the walls
+//! in front of the last rooms the pointer passed over.
 //!
 //! The window is drawn at the original's pixel size and scaled up by whole
 //! pixels on high-DPI screens, so it keeps the original's look.
@@ -299,6 +300,21 @@ impl ApplicationHandler for Viewer {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
+                if self.drag.is_none() {
+                    // The cutaway follows the rooms the pointer passes over.
+                    let scale = f64::from(self.scale.max(1));
+                    let at = [position.x / scale, position.y / scale].map(|v| v as i32);
+                    let camera = self.view.camera;
+                    self.view.camera.focus.point(&self.lot, &camera, at);
+                    if self.view.camera.walls == Walls::Cutaway
+                        && self.view.camera.focus != camera.focus
+                    {
+                        self.dirty = true;
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                }
                 if let Some(start) = self.drag {
                     let scale = f64::from(self.scale.max(1));
                     let dx = ((position.x - start.x) / scale) as i32;

@@ -15,6 +15,8 @@
 //! terrain raising the corner by its height times `2 << zoom`. Zoom 1 is
 //! the far view (tiles 32 pixels wide), zoom 3 the near one (128 pixels).
 
+use crate::cutaway::Focus;
+
 /// One of the original's three zooms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Zoom {
@@ -101,6 +103,8 @@ pub struct Camera {
     /// rotation.
     pub origin: [i32; 2],
     pub walls: Walls,
+    /// What the cutaway looks at: the pointer's rooms and the selected Sim.
+    pub focus: Focus,
 }
 
 impl Camera {
@@ -224,6 +228,7 @@ mod tests {
             level: 1,
             origin: [400, 100],
             walls: Walls::Up,
+            focus: Focus::default(),
         }
     }
 
