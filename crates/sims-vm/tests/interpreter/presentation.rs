@@ -59,12 +59,15 @@ fn modes_1_and_2_mark_the_objects_room_as_not_counted() {
             covered_half_tiles: 0,
             walls: 0,
             covered_walls: 0,
+            ..Default::default()
         };
         fx.world.rooms.rooms.insert(1025, room(false));
         fx.world.rooms.rooms.insert(3, room(false));
         fx.sim_mut().data[29] = 1025;
         assert_eq!(refresh(&mut fx, 1, mode, SIM as i16), Ok(true));
         assert!(fx.world.rooms.rooms[&1025].dirty);
+        // The room's level now has a room waiting: the upper level's bit.
+        assert_eq!(fx.world.rooms.pending, 2);
         // The count itself stays until the next room update, and no other
         // room is touched.
         assert_eq!(fx.world.rooms.rooms[&1025].half_tiles, 8);

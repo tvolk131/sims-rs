@@ -8,7 +8,7 @@ const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots"
 
 /// Bumped whenever [`World`]'s encoding changes, so an old snapshot is
 /// refused instead of misread.
-pub const FORMAT: u32 = 7;
+pub const FORMAT: u32 = 8;
 
 /// A REDB file of named world snapshots.
 pub struct Snapshots {

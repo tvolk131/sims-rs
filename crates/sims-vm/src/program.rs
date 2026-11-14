@@ -4,6 +4,7 @@ use sims_formats::behavior::{Behavior, InteractionTable};
 use sims_formats::execution::{self, ObjectFunction, ObjectFunctions, Slots};
 use sims_formats::iff::Iff;
 use sims_sim::TypeAttributes;
+use sims_sim::rooms::Tuning;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The code and constants one IFF file provides.
@@ -32,10 +33,15 @@ pub struct Library {
     /// The names in string table 303, the table Run Tree By Name reads
     /// tree names from: its entries in the first language, in order.
     pub tree_names: Vec<String>,
+    /// Named tuning tables (FCNS) by chunk ID.
+    pub tuning: BTreeMap<u16, sims_formats::tuning::Constants>,
 }
 
 /// The string table Run Tree By Name instructions name their trees in.
 pub const TREE_NAMES: u16 = 303;
+
+/// The global file's tuning table that holds the room score constants.
+const ROOM_TUNING: u16 = 3;
 
 /// The words in a registered object definition: the original keeps every
 /// OBJD as a 216-byte record.
@@ -159,6 +165,11 @@ impl Program {
                         execution::constants(data).map_err(|e| format("BCON", chunk.id, e))?;
                     library.constants.insert(chunk.id, constants);
                 }
+                b"FCNS" => {
+                    let table = sims_formats::tuning::Constants::parse(data)
+                        .map_err(|e| format("FCNS", chunk.id, e))?;
+                    library.tuning.insert(chunk.id, table);
+                }
                 b"TTAB" => {
                     let table = InteractionTable::parse(data).ok();
                     library.interactions.insert(chunk.id, table);
@@ -202,6 +213,20 @@ impl Program {
         }
         self.libraries.insert(resource, library);
         Ok(())
+    }
+
+    /// The constants the room scores are worked out with (0x4665d1): the
+    /// global file's tuning table 3, read by name, with the original's
+    /// default for each name the table lacks.
+    ///
+    /// Ported from the old prototype's `Tuning::from_program`
+    /// (legacy/crates/sims-sim/src/lot_environment.rs).
+    pub fn room_tuning(&self) -> Tuning {
+        let table = self
+            .libraries
+            .get(&self.global)
+            .and_then(|library| library.tuning.get(&ROOM_TUNING));
+        Tuning::from_lookup(|name| table.and_then(|table| table.get(name)))
     }
 
     /// Resolves a tree ID for code running on behalf of the object whose

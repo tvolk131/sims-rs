@@ -160,6 +160,7 @@ pub fn object(id: u16, guid: u32) -> Object {
         registry_word: None,
         last_result: false,
         removal_skips_resets: false,
+        selected: false,
     }
 }
 

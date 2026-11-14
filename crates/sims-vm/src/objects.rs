@@ -299,6 +299,7 @@ impl Interpreter<'_> {
             registry_word: Some(saved.registry_word.unwrap_or(REGISTERED)),
             last_result: false,
             removal_skips_resets: false,
+            selected: false,
         };
         object.attributes.resize(attributes, 0);
         if object.slots.len() < slots {

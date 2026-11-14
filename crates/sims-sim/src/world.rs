@@ -15,7 +15,8 @@ pub struct World {
     pub ticks: u32,
     /// Simulator globals (32 words before SIMI 0x41, 64 from it).
     pub globals: Vec<i16>,
-    /// The scheduler's position in [`World::order`]: zero starts a new pass.
+    /// The scheduler's position in a pass over the objects: the ID of the
+    /// object it looks at next, or zero for a new pass (0x46d553).
     pub scheduler_cursor: i16,
     /// The lot's random stream.
     pub lot_rng: GameRng,
@@ -28,7 +29,9 @@ pub struct World {
     /// 64 whatever this is (0x4778fc).
     pub size: i16,
     pub budget: Budget,
-    /// Object IDs in registration order, the order the scheduler visits.
+    /// Object IDs in registration order: the order of the original's
+    /// list of objects, which the load's passes walk. The scheduler does
+    /// not use it: it goes by ID (0x46d553).
     pub order: Vec<u16>,
     /// The lot's object type table (objt): type ID to GUID. Script frames
     /// name the object whose code they run by type ID.
@@ -175,6 +178,11 @@ pub struct Object {
     /// reset the objects that depend on it (the original's object flag
     /// 0x1000). No save holds it.
     pub removal_skips_resets: bool,
+    /// Set on the Sim the player has selected (the original's object flag
+    /// 2, which 0x4456e4 looks for among the people). No save holds it:
+    /// after a load nobody is selected until the game selects a Sim
+    /// (0x445449).
+    pub selected: bool,
 }
 
 /// The side of a lot's arrays, and of a lot nothing has resized.
@@ -352,6 +360,7 @@ impl Object {
             registry_word: instance.registry_word,
             last_result: false,
             removal_skips_resets: false,
+            selected: false,
         }
     }
 }

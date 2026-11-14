@@ -19,7 +19,7 @@ const LEAVING: u16 = 4202;
 const RESET: u16 = 4203;
 
 /// Makes `tree` the function at `place` of the one type in `file`.
-fn function(fx: &mut Fixture, file: usize, place: usize, tree: u16) {
+pub fn function(fx: &mut Fixture, file: usize, place: usize, tree: u16) {
     let callbacks = fx
         .program
         .libraries
@@ -46,7 +46,7 @@ fn function(fx: &mut Fixture, file: usize, place: usize, tree: u16) {
 /// the lamp's attribute 0 to 2, its function 10 tree copies its room to
 /// the lamp's attribute 1, and its function 9 tree copies its room to the
 /// lamp's attribute 2.
-fn lot() -> (Fixture, usize) {
+pub fn lot() -> (Fixture, usize) {
     let (mut fx, file) = widgets();
     build(&mut fx);
     for grid in [3, 103] {
@@ -98,7 +98,7 @@ const PERSON: u16 = 50;
 
 /// Creates a widget and stands it on a tile of level 1, in front of
 /// whatever stands there.
-fn stand(fx: &mut Fixture, tile: [i32; 2]) -> u16 {
+pub fn stand(fx: &mut Fixture, tile: [i32; 2]) -> u16 {
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     let id = interpreter.create(&mut fx.world, WIDGET).unwrap();
     let cell = ((tile[0] * 64 + tile[1]) * 2) as usize;

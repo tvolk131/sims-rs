@@ -24,10 +24,12 @@
 //! - It resets in its own way (0x45e791): its thread restarts at Main
 //!   first, and then its Reset function runs on top of that.
 //!
-//! After the visit the original also notes the room the person is in, for
-//! the room's lighting, and loads the person's motive curves (0x45e43d,
-//! 0x459d23). Neither is kept here: the lighting is not modeled, and
-//! nothing reads the curves until a person's motives are updated.
+//! After the visit the original also notes the room the person is in,
+//! which tells the room it is occupied, and loads the person's motive
+//! curves (0x45e43d, 0x459d23). Neither is kept here. An outdoor room
+//! ignores being told, and the room update fails for an indoor room
+//! where it would matter (`sims_sim::rooms::RoomError::Occupancy`).
+//! Nothing reads the curves until a person's motives are updated.
 //! [`crate::curve_table`] says which curves they would be.
 //!
 //! Ported from the old prototype's visit loop

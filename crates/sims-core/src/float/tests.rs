@@ -286,3 +286,38 @@ fn sums_round_correctly_at_register_precision() {
         );
     }
 }
+
+#[test]
+fn a_double_loads_exactly() {
+    // Every float is a double: loading the widened bits gives the same
+    // register value as loading the float.
+    let mut inputs = Inputs(7);
+    for _ in 0..100_000 {
+        let float = F32::from_bits(inputs.next() as u32);
+        if float.is_nan() {
+            continue;
+        }
+        let double = f64::from(float.to_f32()).to_bits();
+        let (a, b) = (Ext::from_f64_bits(double), float.ext());
+        assert!(
+            a.class == b.class
+                && a.negative == b.negative
+                && a.mantissa == b.mantissa
+                && a.exponent == b.exponent,
+            "{float:?}: {a:?} != {b:?}"
+        );
+    }
+    // 0.99 as a double lies between the floats on either side of it.
+    let double = Ext::from_f64_bits(0x3fef_ae14_7ae1_47ae);
+    assert!(F32::from_bits(0x3f7d_70a3).ext() < double);
+    assert!(double < F32::from_bits(0x3f7d_70a4).ext());
+    assert!(Ext::from_f64_bits(0x7ff8_0000_0000_0000).is_nan());
+    assert!(Ext::from_f64_bits(0x8000_0000_0000_0000).is_zero());
+    assert_eq!(
+        Ext::from_f64_bits(0x7ff0_0000_0000_0000).to_f32(),
+        F32::from_bits(0x7f80_0000)
+    );
+    // The smallest subnormal double is far below the floats: it stores
+    // as zero.
+    assert_eq!(Ext::from_f64_bits(1).to_f32(), F32::ZERO);
+}

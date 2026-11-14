@@ -717,11 +717,88 @@ impl World {
         Ok(())
     }
 
+    /// Works out the lot's statistics from its objects (0x416085,
+    /// 0x444cb9), as far as that is ported: global 37, which says what
+    /// kinds of object the lot has, and global 23, the lot's size. The
+    /// original does this when the game goes to live mode, among other
+    /// times.
+    ///
+    /// Global 37 is a set of bits. Each object on the registration list
+    /// adds the bit of its category (data word 59, [`feature`]). Three
+    /// more bits need two objects: bit 8 if the lot has an object of
+    /// category 10 and one of categories 17, 21 to 24, 30, 39, 40, 58, 59
+    /// or 74; bit 0x10 if it has category 10 and category 75; bit 0x20 if
+    /// it has category 10 and category 76, or has category 97.
+    ///
+    /// Not ported, though the same pass of the original writes them:
+    /// global 22, the value of the lot's objects and of its architecture
+    /// ([`crate::Budget`]), and two flags in the family's record. They
+    /// stay as they are. **Unverified**: in a trace of a Goth load this
+    /// pass changes global 37 and none of the others, but the others
+    /// already hold what the house saved, so the trace cannot show them
+    /// being written.
+    pub fn update_statistics(&mut self) -> Result<(), LoadError> {
+        self.context_applied()?;
+        let mut mask = 0i16;
+        let (mut pair, mut with_10, mut with_75, mut with_76, mut alone) =
+            (false, false, false, false, false);
+        for id in &self.order {
+            let Some(&category) = self.objects.get(id).and_then(|o| o.data.get(CATEGORY)) else {
+                continue;
+            };
+            mask |= feature(category);
+            match category {
+                10 => with_10 = true,
+                17 | 21..=24 | 30 | 39 | 40 | 58 | 59 | 74 => pair = true,
+                75 => with_75 = true,
+                76 => with_76 = true,
+                97 => alone = true,
+                _ => {}
+            }
+        }
+        if pair && with_10 {
+            mask |= 8;
+        }
+        if with_75 && with_10 {
+            mask |= 0x10;
+        }
+        if (with_76 && with_10) || alone {
+            mask |= 0x20;
+        }
+        self.globals[LOT_SIZE] = self.size;
+        self.globals[LOT_FEATURES] = mask;
+        Ok(())
+    }
+
     fn context_applied(&self) -> Result<(), LoadError> {
         if self.globals.len() == 64 {
             Ok(())
         } else {
             Err(LoadError::NoContext)
         }
+    }
+}
+
+/// Data word 59: an object's category.
+const CATEGORY: usize = 59;
+/// Globals 23 and 37: the lot's size, and what kinds of object it has.
+const LOT_SIZE: usize = 23;
+const LOT_FEATURES: usize = 37;
+
+/// The bit of global 37 that an object of a category sets by itself
+/// (0x444cb9), or 0. See [`World::update_statistics`].
+pub fn feature(category: i16) -> i16 {
+    match category {
+        4 | 46..=48 | 71 => 1,
+        25 | 26 | 50 | 72 => 2,
+        73 => 4,
+        43 | 49 | 51 | 77 => 0x40,
+        80 => 0x80,
+        84 => 0x100,
+        85 => 0x200,
+        83 => 0x400,
+        95 => 0x800,
+        93 | 94 => 0x1000,
+        _ => 0,
     }
 }

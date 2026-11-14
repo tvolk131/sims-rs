@@ -283,6 +283,8 @@ dependencies = [
 name = "sims-vm"
 version = "0.1.0"
 dependencies = [
+ "postcard",
+ "serde",
  "sha2",
  "sims-content",
  "sims-core",
