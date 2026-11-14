@@ -35,6 +35,9 @@ the repository, and so do the captures.
 | `capture.py` | The capture: the breakpoints, the state readers and the output format. |
 | `qmp.py` | A small QMP client, reached through `docker exec`, for memory dumps. It sends only `info mem` and `memsave`, which read the guest. |
 | `qemu_retained_owners.py`, `qemu_neighborhood_owners.py` | The old prototype's readers for the registry and the neighborhood. |
+| `input.py` | Scripted input for a capture (`--scenario`): the scenario format, the memory readers for the pointer, the pie menu and the people's queues, and the runner. |
+| `guest/input-agent.sh` | Guest job that `input.py` starts. It runs the input commands the host drops in `/research/input`, in order, and polls often. |
+| `test_input.py` | Tests of `input.py` against a fake guest memory. They need no Docker. |
 
 ## Running a capture
 
@@ -120,6 +123,85 @@ Things to know:
   return addresses along the frame-pointer chain, the bytes before and
   after, and the update it falls in.
 
+## Scripted input
+
+`capture.py --scenario FILE --guest-dir <guest dir>` drives the game from a
+scenario while it captures. The game only gets pointer moves, button presses
+and keys, made with xdotool in the guest (QEMU's input devices do not reach
+Xvfb). Each step's effect is checked in guest memory at a lot-update stop.
+Nothing is written to guest memory.
+
+A scenario has one step per line; `#` starts a comment:
+
+```
+answer-dialog 400 400          # wait for a dialog, press (400,400), wait for its result
+until 20                       # wait until lot update 20 has returned
+wait 10                        # let 10 more updates return
+move 300 200                   # move the pointer
+click 300 200                  # move, rest, press and release
+key Escape                     # press a key (an xdotool key name)
+click-object 173               # aim at object 173, click, keep the pie menu only if it is for 173
+choose Sit                     # click the open pie menu's entry
+expect-queued 21 173 within 100  # fail unless the menu pushed an action on person 21 aimed at 173
+shot after                     # save the game window to input-shots/after.png
+```
+
+For example, from a fresh boot (start the capture before entering the house,
+as above):
+
+```
+answer-dialog 400 400
+answer-dialog 400 378
+answer-dialog 400 378
+answer-dialog 400 400
+answer-dialog 400 400
+answer-dialog 490 378          # the Help System: No
+wait 10
+click-object 173               # the porch bench
+choose Sit
+expect-queued 21 173 within 100
+```
+
+How the checks work (the addresses are in `input.py`):
+
+- **Aiming.** `click-object` puts the object's position through the house
+  view's projection, moves the pointer above that point, and reads the ID of
+  the object under the pointer from the picker tool. It presses when that
+  reads the object three updates in a row. The game takes pointer moves
+  late (tens of updates under TCG), so that reading can be stale. The pie
+  menu that opens is the real check: if its actions are aimed at another
+  object, Escape closes it and the next aim point is tried.
+- **Choosing.** `choose` reads the pie menu's items and their places on the
+  screen, moves to the entry, waits until the menu shows it highlighted,
+  and presses.
+- **Confirming.** capture.py stops at `0x48ddcb`, where the pie menu pushes
+  the chosen action on the person's queue, and logs the person and the
+  action. `expect-queued` waits for that record, then for the person to hold
+  the action, in its queue (`+0x820`) or as its running action (`+0xa48`),
+  and logs where it found it.
+- **Dialogs.** A modal dialog holds the update it shows in, so
+  `answer-dialog` runs on the dialog stops. It presses once, like
+  `answer.sh`. If the game misses the press, the step waits until the dialog
+  is answered some other way (for example with `answer.sh`).
+
+A failed step is logged and ends the scenario; the capture goes on.
+
+`input.jsonl` is the record to replay. A `queued` row holds the update it
+falls in: `update` N with `in_update` false means the push came before lot
+update N, after update N-1 returned. Its `action` holds the caller, the
+target, the routine, the priority, the menu number, the arguments and the
+flags. The other rows log the steps, each guest command and when it ended,
+the hover readings and the pie menus.
+
+**Unverified.** The projection was checked only in the house's starting
+view (zoom 1, no rotation). Submenus, build and buy mode are not driven
+yet. The dialog button places are fixed in the scenario, not read from the
+dialog.
+
+```sh
+python3 -B -m unittest discover -s tools/harness -p 'test_*.py'
+```
+
 ## Output
 
 | Path | Contents |
@@ -135,3 +217,5 @@ Things to know:
 | `watch.jsonl` | With `--watch`: one line per write to a watched address (see above). |
 | `status.json` | Progress. |
 | `input-log.txt` | Every press made, with its time (written by `answer.sh`). |
+| `input.jsonl` | With `--scenario`: the steps, the guest commands, the pie menus and every action the pie menu queued, each with its lot update (see Scripted input). |
+| `input-shots/` | With `--scenario`: the `shot` steps' screenshots. |

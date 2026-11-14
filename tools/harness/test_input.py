@@ -1,0 +1,393 @@
+"""Tests of input.py's pure parts, with a fake guest memory. No Docker needed:
+
+  python3 -B -m unittest discover -s tools/harness -p 'test_*.py'
+"""
+import json
+import struct
+import tempfile
+import unittest
+from pathlib import Path
+
+import input as inp
+
+
+class FakeMemory:
+    """Little-endian memory built from writes; reads of unwritten bytes fail."""
+
+    def __init__(self):
+        self.bytes = {}
+        self.next = 0x100000
+
+    def put(self, p, data):
+        for i, b in enumerate(data):
+            self.bytes[p + i] = b
+
+    def put_words(self, p, *words):
+        self.put(p, struct.pack('<' + 'I' * len(words), *(w & 0xffffffff for w in words)))
+
+    def alloc(self, n):
+        p = self.next
+        self.next += (n + 15) & ~15
+        self.put(p, bytes(n))
+        return p
+
+    def string(self, text):
+        data = text.encode('latin-1')
+        p = self.alloc(len(data) + 1)
+        self.put(p, data + b'\0')
+        return p, p + len(data)
+
+    def read(self, p, n):
+        try:
+            return bytes(self.bytes[p + i] for i in range(n))
+        except KeyError:
+            raise MemoryError(f'unmapped {p:#x}') from None
+
+    def word(self, p):
+        return struct.unpack('<I', self.read(p, 4))[0]
+
+    def half(self, p):
+        return struct.unpack('<H', self.read(p, 2))[0]
+
+    def byte(self, p):
+        return self.read(p, 1)[0]
+
+    def words(self, p, n, width=4):
+        return list(struct.unpack('<' + ('H' if width == 2 else 'I') * n, self.read(p, n * width))) if n else []
+
+    def object_id(self, p):
+        return self.half(p + 0xf0) if p else 0
+
+    def action(self, p):
+        return dict(caller=self.object_id(self.word(p + 4)), target=self.object_id(self.word(p + 8)),
+                    routine=self.half(p + 32), priority=self.word(p + 28))
+
+
+class Game:
+    """A fake game: a lot with objects, the view, the picker and the people panel."""
+
+    def __init__(self):
+        m = self.m = FakeMemory()
+        self.sim = m.alloc(0x200)
+        self.registry = m.alloc(0x40)
+        m.put_words(self.sim + 0xb0, self.registry)
+        self.slots = m.alloc(4 * 16)
+        m.put_words(self.registry + 0x18, self.slots, self.slots)
+        self.objects = {}
+        game = m.alloc(0x40)
+        m.put_words(inp.GAME, game)
+        manager = m.alloc(8)
+        m.put_words(game + 0x18, manager)
+        tools = m.alloc(4 * 12)
+        m.put_words(manager, tools)
+        self.picker = m.alloc(0x80)
+        m.put_words(tools + 4 * inp.PICKER_TOOL, self.picker)
+        self.panel = m.alloc(0x100)
+        m.put_words(inp.PEOPLE_PANEL, self.panel)
+        self.pies = [m.alloc(0x1a0), m.alloc(0x1a0)]
+        m.put_words(self.panel + 0xdc, *self.pies)
+        m.put_words(inp.VIEW_ZOOM, 1)
+        m.put_words(inp.VIEW_X0, 368, -130)
+
+    def add_object(self, oid, position, person=False, selected=False):
+        m = self.m
+        p = m.alloc(0xb10)
+        definition = m.alloc(0x40)
+        m.put(definition + 0x12, struct.pack('<H', 2 if person else 4))
+        m.put_words(p + 0x118, definition)
+        m.put(p + 0xf0, struct.pack('<H', oid))
+        m.put_words(p + 0xf4, *position)
+        m.put_words(p + 0x114, 2 if selected else 0)
+        end = m.word(self.registry + 0x1c)
+        m.put_words(end, p)
+        m.put_words(self.registry + 0x1c, end + 4)
+        self.objects[oid] = p
+        return p
+
+    def hover(self, oid):
+        self.m.put(self.picker + 0x2e, struct.pack('<H', oid))
+
+    def open_pie(self, labels, origin=(309, 110), target=None, caller=None):
+        m = self.m
+        entries = m.alloc(0x28 * len(labels))
+        items = m.alloc(0x28 * len(labels))
+        for i, label in enumerate(labels):
+            b, e = m.string(label)
+            action = m.alloc(0x44)
+            m.put_words(action + 4, caller or 0, target or 0)
+            m.put_words(entries + 0x28 * i, b, e, e + 1)
+            m.put_words(entries + 0x28 * i + 0x24, action)
+            m.put_words(items + 0x28 * i, b, e, e + 1)
+            m.put(items + 0x28 * i + 0x10, b'\x01')
+            m.put_words(items + 0x28 * i + 0x18, 10 + 40 * i, 20, 30, 20)
+        vec = m.alloc(12)
+        m.put_words(vec, entries, entries + 0x28 * len(labels), entries + 0x28 * len(labels))
+        m.put_words(self.picker + 0x58, vec)
+        pie = self.pies[0]
+        m.put_words(pie + 0x190, items, items + 0x28 * len(labels))
+        m.put_words(pie + 0x13c, *origin)
+        m.put_words(pie + 0xd4, -1)
+
+    def highlight(self, i):
+        self.m.put_words(self.pies[0] + 0xd4, i)
+
+    def close_pie(self):
+        self.m.put_words(self.picker + 0x58, 0)
+
+
+class FakeAgent:
+    def __init__(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.window = '0x1'
+        self.commands = []
+        self.done = set()
+
+    def submit(self, command):
+        self.commands.append(command)
+        return len(self.commands)
+
+    def result(self, n):
+        return 0 if n in self.done else None
+
+    def finish_all(self):
+        self.done |= set(range(1, len(self.commands) + 1))
+
+
+class ParseTest(unittest.TestCase):
+    def test_steps_and_arguments(self):
+        steps = inp.parse_scenario('''
+            # Mortimer sits on the bench
+            until 40
+            click-object 173      # the bench
+            choose "Sit"
+            expect-queued 21 173 within 50
+            expect-queued 21
+            key F2
+            answer-dialog 400 378
+            shot after-sit
+        ''')
+        self.assertEqual([s['op'] for s in steps], ['until', 'click-object', 'choose', 'expect-queued',
+                                                     'expect-queued', 'key', 'answer-dialog', 'shot'])
+        self.assertEqual(steps[0]['args'], [40])
+        self.assertEqual(steps[2]['args'], ['Sit'])
+        self.assertEqual(steps[3]['args'], [21, 173, 50])
+        self.assertEqual(steps[4]['args'], [21, None, 100])
+        self.assertEqual(steps[0]['line'], 3)
+
+    def test_errors_name_the_line(self):
+        for text, message in (('jump 3', 'line 1: unknown step'), ('wait', 'line 1: wait takes'),
+                              ('\nclick 1', 'line 2: click takes'), ('wait x', 'line 1:'),
+                              ('expect-queued 21 5 after 3', 'line 1: expect-queued')):
+            with self.assertRaises(inp.ScenarioError) as e:
+                inp.parse_scenario(text)
+            self.assertIn(message, str(e.exception))
+
+
+class GeometryTest(unittest.TestCase):
+    def test_project_matches_the_original_formula(self):
+        view = dict(zoom=1, x0=368, y0=-130)
+        # The mailbox of the Goth house, position (0x2a8, 0x2b8) words (+0xf4, +0xf8).
+        self.assertEqual(inp.project([0x2a8, 0x2b8], view), (368 + 16 * (43.5 - 42.5), -130 + 8 * 86))
+        self.assertEqual(inp.project([16, 16], dict(zoom=2, x0=0, y0=0)), (0, 32))
+
+    def test_aim_points_start_above_the_anchor_and_scale_with_zoom(self):
+        near = inp.aim_points(100, 200, 1)
+        self.assertEqual(near[0], (100, 192))
+        self.assertTrue(all(y <= 200 for _, y in near[:7]))
+        self.assertEqual(inp.aim_points(100, 200, 2)[0], (100, 184))
+        self.assertEqual(len(set(near)), len(near))
+
+    def test_clamp(self):
+        self.assertEqual(inp.clamp((-5, 700)), (1, 598))
+
+    def test_commands(self):
+        self.assertIn('mousemove --window 0x1 9 5 sleep', inp.move_command(10, 5, '0x1'))
+        self.assertTrue(inp.move_command(10, 5, '0x1').endswith('mousemove --window 0x1 10 5'))
+        self.assertEqual(inp.key_command('F2'), 'xdotool key F2')
+        with self.assertRaises(inp.ScenarioError):
+            inp.key_command('F2; rm -rf /')
+
+    def test_match_item(self):
+        items = [dict(label='Sit'), dict(label='Watch TV ')]
+        self.assertEqual(inp.match_item(items, 'watch tv'), 1)
+        self.assertIsNone(inp.match_item(items, 'Sleep'))
+
+
+class ReadTest(unittest.TestCase):
+    def test_reads(self):
+        g = Game()
+        bench = g.add_object(173, [0x1a8, 0x198])
+        g.add_object(21, [0x198, 0x198], person=True, selected=True)
+        g.hover(173)
+        self.assertEqual(inp.read_hover(g.m), 173)
+        self.assertEqual(inp.read_view(g.m), dict(zoom=1, x0=368, y0=-130))
+        self.assertEqual(inp.find_object(g.m, g.sim, 173), bench)
+        self.assertEqual(inp.find_object(g.m, g.sim, 5), 0)
+        self.assertEqual(inp.object_position(g.m, bench), [0x1a8, 0x198])
+        self.assertEqual(inp.selected_person(g.m, g.sim), 21)
+        self.assertEqual(inp.read_entries(g.m), [])
+        g.open_pie(['Sit', 'Clean'])
+        pie = inp.read_pie(g.m)
+        self.assertEqual([i['label'] for i in pie['items']], ['Sit', 'Clean'])
+        self.assertEqual((pie['items'][1]['x'], pie['items'][1]['y']), (309 + 50, 130))
+        self.assertEqual(pie['highlighted'], -1)
+        self.assertEqual([e['label'] for e in inp.read_entries(g.m)], ['Sit', 'Clean'])
+
+
+class RunnerTest(unittest.TestCase):
+    def setUp(self):
+        self.g = Game()
+        self.bench = self.g.add_object(173, [0x1a8, 0x198])
+        self.person = self.g.add_object(21, [0x198, 0x198], person=True)
+        self.g.m.put_words(self.person + 0xa40, 0, 0)
+        self.agent = FakeAgent()
+        self.log = Path(tempfile.mkdtemp()) / 'input.jsonl'
+        self.update = 0
+        self.runners = []
+
+    def tearDown(self):
+        for r in self.runners:
+            r.close()
+
+    def runner(self, text):
+        r = inp.Runner(inp.parse_scenario(text), self.agent, self.log)
+        self.runners.append(r)
+        return r
+
+    def tick(self, runner, n=1, finish=True):
+        for _ in range(n):
+            if finish:
+                self.agent.finish_all()
+            self.update += 1
+            runner.on_update(self.update, self.g.m, self.g.sim)
+
+    def rows(self, kind=None):
+        rows = [json.loads(line) for line in self.log.read_text().splitlines()]
+        return [r for r in rows if kind is None or r['kind'] == kind]
+
+    def test_waits(self):
+        r = self.runner('until 3\nwait 2')
+        self.tick(r, 3)
+        self.assertEqual(r.index, 1)
+        self.tick(r, 2)
+        self.assertTrue(r.finished)
+        self.assertIsNone(r.failed)
+        self.assertEqual([(x['status'], x['update']) for x in self.rows('step')],
+                         [('start', 1), ('done', 3), ('start', 3), ('done', 5)])
+
+    def test_a_command_waits_for_the_guest_and_settles(self):
+        r = self.runner('click 10 20')
+        self.tick(r, 1, finish=False)
+        self.assertEqual(len(self.agent.commands), 1)
+        self.tick(r, 2, finish=False)
+        self.assertEqual(len(self.agent.commands), 1)  # the move has not ended
+        self.tick(r, 3)
+        self.assertEqual(len(self.agent.commands), 2)
+        self.assertIn('mousedown 1', self.agent.commands[1])
+
+    def tick_until(self, r, done, most=60):
+        for _ in range(most):
+            if done():
+                return
+            self.tick(r)
+        self.fail(f'never happened: {self.rows()}')
+
+    def last_command(self):
+        return self.agent.commands[-1] if self.agent.commands else ''
+
+    def test_click_object_choose_and_expect(self):
+        g = self.g
+        floor = g.add_object(29, [0, 0])
+        r = self.runner('click-object 173\nchoose Sit\nexpect-queued 21 173 within 5')
+        self.tick_until(r, lambda: self.rows('hover'))
+        self.assertEqual(self.rows('hover')[-1]['object'], 0)  # missed: aim again
+        self.assertIn('mousemove', self.last_command())
+        g.hover(173)
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        # The press opened a menu for something else: it is closed, and the
+        # bench aimed at again.
+        g.open_pie(['Go Here'], target=floor, caller=self.person)
+        self.tick_until(r, lambda: 'Escape' in self.last_command())
+        self.assertEqual(self.rows('wrong_menu')[0]['targets'], [29])
+        g.close_pie()
+        presses = sum('mousedown' in c for c in self.agent.commands)
+        self.tick_until(r, lambda: sum('mousedown' in c for c in self.agent.commands) > presses)
+        g.open_pie(['Sit'], target=self.bench, caller=self.person)
+        self.tick_until(r, lambda: self.last_command().split()[-2:] == ['334', '140'])
+        self.assertEqual(self.rows('pie')[-1]['entries'][0]['label'], 'Sit')
+        self.tick(r, 5)
+        self.assertNotIn('mousedown', self.last_command())  # not highlighted yet
+        g.highlight(0)
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        action = g.m.alloc(0x44)
+        g.m.put_words(action + 4, self.person, self.bench)
+        r.on_queue_push(self.update + 1, False, g.m, dict(edi=self.person, esi=action))
+        self.tick(r, 4)
+        self.assertFalse(r.finished)  # pushed, but the person does not hold it yet
+        g.m.put_words(self.person + inp.ACTIVE_ACTION + 4, self.person, self.bench)
+        self.tick_until(r, lambda: r.finished)
+        self.assertIsNone(r.failed)
+        queued = self.rows('queued')
+        self.assertEqual((queued[0]['person'], queued[0]['action']['target']), (21, 173))
+        taken = self.rows('taken')[0]
+        self.assertEqual((taken['person'], taken['where'], taken['active']['target']), (21, 'active', 173))
+
+    def test_a_missing_entry_fails_without_raising(self):
+        self.g.open_pie(['Sit'])
+        r = self.runner('choose Dance\nwait 1')
+        self.tick(r)
+        self.assertTrue(r.finished)
+        self.assertIn("no entry 'Dance'", r.failed)
+        self.assertEqual(self.rows('step')[-1]['status'], 'failed')
+
+    def test_expect_queued_finds_the_action_in_the_queue(self):
+        g = self.g
+        action = g.m.alloc(0x44)
+        g.m.put_words(action + 4, self.person, self.bench)
+        g.m.put_words(self.person + 0x820 + 0x44 + 4, self.person, self.bench)
+        g.m.put_words(self.person + 0xa40, 1, 2)
+        r = self.runner('expect-queued 21')
+        r.on_queue_push(1, True, g.m, dict(edi=self.person, esi=action))
+        self.tick(r)
+        self.assertIsNone(r.failed)
+        self.assertEqual(self.rows('taken')[0]['where'], 'queue')
+
+    def test_expect_queued_times_out(self):
+        r = self.runner('expect-queued 21 within 3')
+        self.tick(r, 5)
+        self.assertIn('within 3', r.failed)
+
+    def test_answer_dialog_is_driven_by_the_dialog_stops(self):
+        # The welcome notices show inside lot update 1, before any update
+        # returns, and hold it: the runner must start and go on at dialog stops.
+        r = self.runner('answer-dialog 400 400\nanswer-dialog 400 378\nwait 1')
+        r.on_dialog('dialog_show', 1)
+        self.assertEqual(len(self.agent.commands), 1)
+        self.assertIn('400 400', self.agent.commands[0])
+        r.on_dialog('dialog_result', 1)
+        self.assertEqual(len(self.agent.commands), 1)  # the next dialog is not up yet
+        r.on_dialog('dialog_show', 1)
+        self.assertIn('400 378', self.agent.commands[1])
+        r.on_dialog('dialog_result', 1)
+        self.assertFalse(r.finished)
+        self.tick(r)
+        self.assertTrue(r.finished)
+        self.assertIsNone(r.failed)
+
+    def test_answer_dialog_presses_a_dialog_already_up(self):
+        r = self.runner('wait 1\nanswer-dialog 490 378')
+        r.on_dialog('dialog_show', 2)  # during the wait: not pressed yet
+        self.assertEqual(self.agent.commands, [])
+        self.tick(r)
+        self.assertEqual(len(self.agent.commands), 1)
+        r.on_dialog('dialog_result', 2)
+        self.assertTrue(r.finished)
+
+    def test_memory_errors_fail_the_step(self):
+        r = self.runner('click-object 999')
+        self.tick(r)
+        self.assertIn('no object 999', r.failed)
+
+
+if __name__ == '__main__':
+    unittest.main()
