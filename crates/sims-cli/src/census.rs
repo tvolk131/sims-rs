@@ -45,21 +45,32 @@ pub struct Census {
     unread_tags: BTreeMap<String, u64>,
     /// Other file extensions seen but not decoded, with counts.
     unread_files: BTreeMap<String, u64>,
-    /// Decoded trees (BHAV chunks) per pack.
-    trees: BTreeMap<String, u64>,
-    /// Primitive instructions (opcodes below 256; the rest call trees)
-    /// by opcode, then pack.
-    primitives: BTreeMap<u16, BTreeMap<String, u64>>,
+    /// Decoded trees and their primitives, per pack.
+    packs: BTreeMap<String, Pack>,
+    /// The pack of the file on disk being visited; archive members
+    /// belong to their archive's pack.
+    pack: String,
 }
 
-/// The pack a resource belongs to, from its path: the first component
-/// naming an expansion pack (`ExpansionPack`, `ExpansionPack2`, ...) or
-/// user data (`UserData`, `UserData2`, ...), else "Base".
-fn pack(location: &str) -> String {
-    Path::new(location)
-        .components()
-        .find_map(|c| {
-            let name = c.as_os_str().to_string_lossy();
+/// One pack's decoded trees (BHAV chunks), and their primitive
+/// instructions by opcode (opcodes below 256; the rest call trees).
+struct Pack {
+    trees: u64,
+    primitives: [u64; 256],
+}
+
+/// The pack a file on disk belongs to, from its path below the scanned
+/// `root` (and the root's own name, when it is a directory): the first
+/// component naming an expansion pack (`ExpansionPack`, `ExpansionPack2`,
+/// ...) or user data (`UserData`, `UserData2`, ...), else "Base". Folders
+/// above the root never count.
+fn pack(root: &Path, path: &Path) -> String {
+    let own = root.is_dir().then(|| root.file_name()).flatten();
+    let below = path.strip_prefix(root).unwrap_or(Path::new(""));
+    own.into_iter()
+        .chain(below.components().map(|c| c.as_os_str()))
+        .find_map(|name| {
+            let name = name.to_string_lossy();
             if name.starts_with("ExpansionPack") {
                 Some(name.into_owned())
             } else if name.starts_with("UserData") {
@@ -168,15 +179,20 @@ impl Census {
 
     /// Walks a file or directory in sorted order, so reports are stable.
     pub fn add_path(&mut self, path: &Path) -> std::io::Result<()> {
+        self.walk(path, path)
+    }
+
+    fn walk(&mut self, root: &Path, path: &Path) -> std::io::Result<()> {
         if path.is_dir() {
             let mut entries: Vec<_> = std::fs::read_dir(path)?
                 .map(|e| e.map(|e| e.path()))
                 .collect::<Result<_, _>>()?;
             entries.sort();
             for entry in entries {
-                self.add_path(&entry)?;
+                self.walk(root, &entry)?;
             }
         } else if path.is_file() {
+            self.pack = pack(root, path);
             self.disk_file(path)?;
         }
         Ok(())
@@ -326,7 +342,7 @@ impl Census {
             if &chunk.tag == b"BHAV" {
                 let outcome = behavior::Behavior::parse(file.data(chunk));
                 if let Ok(tree) = &outcome {
-                    self.count_primitives(location, tree);
+                    self.count_primitives(tree);
                 }
                 self.record("BHAV chunk", &at, outcome.map(drop));
                 continue;
@@ -338,44 +354,53 @@ impl Census {
         }
     }
 
-    fn count_primitives(&mut self, location: &str, tree: &behavior::Behavior) {
-        let pack = pack(location);
-        *self.trees.entry(pack.clone()).or_default() += 1;
-        for instruction in tree.instructions.iter().filter(|i| i.opcode < 256) {
-            *self
-                .primitives
-                .entry(instruction.opcode)
-                .or_default()
-                .entry(pack.clone())
-                .or_default() += 1;
+    fn count_primitives(&mut self, tree: &behavior::Behavior) {
+        if !self.packs.contains_key(&self.pack) {
+            let pack = Pack {
+                trees: 0,
+                primitives: [0; 256],
+            };
+            self.packs.insert(self.pack.clone(), pack);
+        }
+        let Some(pack) = self.packs.get_mut(&self.pack) else {
+            return;
+        };
+        pack.trees += 1;
+        for instruction in &tree.instructions {
+            if let Some(count) = pack.primitives.get_mut(usize::from(instruction.opcode)) {
+                *count += 1;
+            }
         }
     }
 
     /// The primitives table: one row per opcode used, one column per pack.
     fn primitives_report(&self, out: &mut String) {
-        let packs: Vec<&String> = self.trees.keys().collect();
+        let packs: Vec<(&String, &Pack)> = self.packs.iter().collect();
         let _ = writeln!(out, "\nPrimitives used by decoded trees, by pack:");
         let _ = write!(out, "  {:<4} {:<36} {:>9}", "op", "name", "total");
-        for pack in &packs {
-            let _ = write!(out, " {:>15}", pack);
+        for (name, _) in &packs {
+            let _ = write!(out, " {name:>15}");
         }
         let _ = write!(
             out,
             "\n  {:<4} {:<36} {:>9}",
             "",
             "trees",
-            self.trees.values().sum::<u64>()
+            packs.iter().map(|(_, p)| p.trees).sum::<u64>()
         );
-        for pack in &packs {
-            let _ = write!(out, " {:>15}", self.trees[*pack]);
+        for (_, pack) in &packs {
+            let _ = write!(out, " {:>15}", pack.trees);
         }
         let _ = writeln!(out);
-        for (opcode, by_pack) in &self.primitives {
-            let name = sims_vm::primitive_name(*opcode);
-            let total: u64 = by_pack.values().sum();
+        for opcode in 0..256 {
+            let total: u64 = packs.iter().map(|(_, p)| p.primitives[opcode]).sum();
+            if total == 0 {
+                continue;
+            }
+            let name = sims_vm::primitive_name(opcode as u16);
             let _ = write!(out, "  {opcode:<4} {name:<36} {total:>9}");
-            for pack in &packs {
-                let _ = write!(out, " {:>15}", by_pack.get(*pack).copied().unwrap_or(0));
+            for (_, pack) in &packs {
+                let _ = write!(out, " {:>15}", pack.primitives[opcode]);
             }
             let _ = writeln!(out);
         }
@@ -517,37 +542,46 @@ mod tests {
 
     #[test]
     fn primitives_are_counted_by_pack_and_tree_calls_are_not() {
-        let dir = std::env::temp_dir().join(format!("sims-census-prims-{}", std::process::id()));
+        // Folders above the scanned root, and archive member names, never
+        // name a pack.
+        let parent =
+            std::env::temp_dir().join(format!("ExpansionPackParent-census-{}", std::process::id()));
+        let dir = parent.join("install");
         let expansion = dir.join("ExpansionPack3");
         std::fs::create_dir_all(&expansion).unwrap();
-        std::fs::write(dir.join("base.iff"), trees(&[&[2, 2, 0x100], &[44]])).unwrap();
+        std::fs::write(dir.join("base.iff"), trees(&[&[2, 2, 255, 256], &[44]])).unwrap();
+        let member = trees(&[&[44, 0x1000]]);
+        let far = archive(
+            &member,
+            &[(16, member.len() as u32, "ExpansionPack7\\hot.iff")],
+        );
+        std::fs::write(dir.join("base.far"), far).unwrap();
         std::fs::write(expansion.join("hot.iff"), trees(&[&[2, 0x1000]])).unwrap();
         let mut census = Census::default();
         census.add_path(&dir).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&parent);
         let report = census.report();
         let table = &report[report.find("Primitives used").expect("table")..];
+        let rows: Vec<Vec<&str>> = table
+            .lines()
+            .skip(2)
+            .map(|l| l.split_whitespace().collect())
+            .collect();
+        let header: Vec<&str> = table.lines().nth(1).unwrap().split_whitespace().collect();
+        assert_eq!(header[3..], ["Base", "ExpansionPack3"], "{table}");
         let row = |op: &str| {
-            table
-                .lines()
-                .find(|l| l.split_whitespace().next() == Some(op))
-                .unwrap_or_else(|| panic!("no row {op} in {table}"))
-                .split_whitespace()
-                .collect::<Vec<_>>()
+            let row = rows
+                .iter()
+                .find(|r| r[0] == op)
+                .unwrap_or_else(|| panic!("no row {op} in {table}"));
+            row[row.len() - 3..].to_vec()
         };
-        assert_eq!(row("trees")[1..], ["3", "2", "1"], "{table}");
-        let expression = row("2");
-        assert_eq!(
-            expression[expression.len() - 3..],
-            ["3", "2", "1"],
-            "{table}"
-        );
-        let animate = row("44");
-        assert_eq!(animate[animate.len() - 3..], ["1", "1", "0"], "{table}");
-        assert!(
-            !table.lines().any(|l| l.trim_start().starts_with("256 ")),
-            "{table}"
-        );
+        assert_eq!(row("trees"), ["4", "3", "1"], "{table}");
+        assert_eq!(row("2"), ["3", "2", "1"], "{table}");
+        assert_eq!(row("44"), ["2", "2", "0"], "{table}");
+        assert_eq!(row("255"), ["1", "1", "0"], "{table}");
+        let opcodes: Vec<&str> = rows.iter().skip(1).map(|r| r[0]).collect();
+        assert_eq!(opcodes, ["2", "44", "255"], "{table}");
         assert!(report.contains("BHAV chunk"), "{report}");
     }
 
