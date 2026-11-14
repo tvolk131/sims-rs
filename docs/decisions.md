@@ -54,6 +54,20 @@ What was decided:
   person's place to itself and then to the target (mirrored through the
   person in mode 3). Mode 1 reads the camera and fails loudly.
 
+Not yet reached by a capture comparison: step 14's waiting tree, the
+third and fourth retries, step 16 and the end-of-route release. They
+are ported from the disassembly. The capture shows the waiting tree at
+update 409 and the route ending at 489, so they are checked as K passes
+those ticks.
+
+The Sol review raised two findings, both rejected:
+- *Function 4 should run after the action leaves the queue.* The
+  original runs it with the queue intact (0x45d697 to 0x45d70b; see
+  `release_action`).
+- *Format 19 should still decode format 18.* Snapshots refuse any
+  other format by design (`FORMAT`), as for formats 15 to 18. Saves
+  with migrations are a separate format.
+
 What would reopen it: a capture where a slot search with flag 0x2000
 draws a different number of times, or a house with two people in a
 route's way.

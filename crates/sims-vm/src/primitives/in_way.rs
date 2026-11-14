@@ -467,6 +467,13 @@ impl Machine<'_, '_> {
     /// function 4 with the person as the stack object. Returns whether
     /// one was dropped.
     ///
+    /// Every function 4 runs while the whole queue, the dropped actions
+    /// included, is still in place: the original walks the live queue
+    /// (0x45d697), calling function 4 for each match and copying the rest
+    /// aside (0x45f744), and only swaps the copy in after the walk
+    /// (0x45d70b). Other cancellations remove the action first; this one
+    /// does not.
+    ///
     /// When the action is the person's running one, the original instead
     /// lowers its priority and may queue the person's own interaction 0x21;
     /// that fails loudly. So does a function 4 that changes the queue.
