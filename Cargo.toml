@@ -3,6 +3,7 @@
 # not part of this workspace and is never built. See docs/vision.md and
 # docs/salvage-audit.md.
 members = [
+    "crates/sims-audio",
     "crates/sims-cli",
     "crates/sims-content",
     "crates/sims-core",

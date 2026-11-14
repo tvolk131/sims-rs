@@ -1275,6 +1275,35 @@ Progress:
 - Next: a viewer window, a screenshot of the original at the same camera
   and the comparison, then what it shows needs fixing.
 
+## Track: sound (`crates/sims-audio`)
+
+Goal: the game's sound, from files to PCM, in `crates/sims-audio`. The
+simulation never depends on it; its only link is the play-sound and
+stop-sounds events.
+
+- **Done: every sound file decodes.** XA (18,155 files), WAV (285) and
+  MP3 (141) from loose files and FAR archives, by the paths the sound
+  tables use. XA and WAV match FFmpeg bit for bit on every file. No UTK
+  file exists in the install.
+- **Done: the sound tables.** All 27 modules (HIT programs, HSM
+  symbols, HOT tables) and the 4 FSC ambient scores parse. Every HIT
+  program disassembles, and every entry point and branch resolves. The
+  files' own loose ends (155 missing samples, among others) are counted
+  in a gated test. The phone ring and a footstep trace to their samples.
+- **Done: the HIT VM.** `Player` takes `SoundEvent`s and renders PCM.
+  The phone ring and a soft footstep render their samples bit for bit,
+  and every event in the install runs without a bad instruction. The
+  `render_event` example writes events to a WAV file.
+- **Next:**
+  - The simulation emits `SoundEvent`s (the interface is in the
+    decisions log).
+  - Volume, pan and pitch.
+  - The 190 events of other kinds (music modes, TV, sequenced hit
+    lists).
+  - The FSC ambient player.
+  - Live playback behind a feature.
+  - Checking any of it against the original.
+
 ## Track: recording tool input (`tools/harness`)
 
 Drive the original from a script while it is captured: click objects,
