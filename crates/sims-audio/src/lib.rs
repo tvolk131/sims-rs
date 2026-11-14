@@ -1,4 +1,4 @@
-//! The game's sound: file decoders and, later, the sound scripts.
+//! The game's sound: file decoders and the sound scripts' tables.
 //!
 //! The simulation never depends on this crate. It reads game files and
 //! turns them into PCM (16-bit signed samples); playing them on a device
@@ -11,10 +11,21 @@
 //! - [`files`]: every sound file of an install, loose or in a FAR
 //!   archive, by the path the sound tables name it with.
 //! - [`decode`]: picks the decoder from a file's first bytes.
+//! - [`hit`], [`hsm`], [`hot`]: the sound scripts. A HIT program is
+//!   bytecode; its HSM file names the program's symbols and its HOT file
+//!   maps event names to tracks, tracks to entry points and patches
+//!   (samples), and lists the hit lists scripts pick samples from.
+//! - [`module`]: one HIT program with its HSM and HOT files.
+//! - [`fsc`]: ambient sound scores.
 
 pub mod decode;
 mod error;
 pub mod files;
+pub mod fsc;
+pub mod hit;
+pub mod hot;
+pub mod hsm;
+pub mod module;
 pub mod mp3;
 mod pcm;
 pub mod wav;
