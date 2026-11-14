@@ -406,6 +406,7 @@ class ReviewFindingsTest(RunnerBase):
         self.assertIn('400 400', self.last_command())
         rows = self.rows('command_wait_ended')
         self.assertEqual(rows[0]['reason'], 'dialog_show')
+        self.agent.finish_all()  # the guest ran both presses before the dialog closed
         r.on_dialog('dialog_result', self.update + 1)
         self.assertTrue(r.finished)
         self.assertIsNone(r.failed)
@@ -477,9 +478,55 @@ class ReviewFindingsTest(RunnerBase):
         self.push(r, 8213)
         r.on_dialog('dialog_show', self.update + 1)  # the press is still settling, or running
         self.assertIn('400 400', self.last_command())
+        self.agent.finish_all()
         r.on_dialog('dialog_result', self.update + 1)
         self.assertTrue(r.finished)
         self.assertIsNone(r.failed)
+
+    def test_a_late_push_then_a_dialog_does_not_deadlock(self):
+        g = self.g
+        g.open_pie(['Sit'], target=self.bench, caller=self.person)
+        g.highlight(0)
+        r = self.runner('choose Sit\nanswer-dialog 400 400')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        self.tick(r, 3)  # the press has ended and settled; the game has not taken it yet
+        self.assertEqual(r.waiting[0], 'push')
+        self.push(r, 8213)
+        r.on_dialog('dialog_show', self.update + 1)  # no update returns from here
+        self.assertIn('400 400', self.last_command())
+        r.on_dialog('dialog_result', self.update + 1)
+        self.assertTrue(r.finished)
+        self.assertIsNone(r.failed)
+
+    def test_a_last_shot_cut_short_by_a_dialog_is_still_converted(self):
+        shots = Path(tempfile.mkdtemp())
+        r = inp.Runner(inp.parse_scenario('shot last'), self.agent, self.log, shots_dir=shots)
+        self.runners.append(r)
+        self.tick(r, 1, finish=False)
+        r.on_dialog('dialog_show', self.update + 1)
+        self.assertFalse(r.finished)  # the shot's end is still to be seen
+        self.fake_xwd(self.agent.dir / 'shot-last.xwd')
+        self.agent.finish_all()
+        r.on_dialog('dialog_result', self.update + 1)
+        self.assertTrue(r.finished)
+        self.assertIsNone(r.failed)
+        self.assertTrue((shots / 'last.png').exists())
+
+    def test_a_last_command_failing_after_a_dialog_still_fails(self):
+        r = self.runner('click 10 20')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        r.on_dialog('dialog_show', self.update + 1)
+        self.assertFalse(r.finished)
+        self.agent.codes = {2: 1}
+        self.tick(r)
+        self.assertIn('failed with 1', r.failed)
+
+    def test_an_unfinished_scenario_is_logged_at_close(self):
+        r = self.runner('wait 5')
+        self.tick(r)
+        r.close()
+        self.runners.remove(r)
+        self.assertEqual(self.rows('scenario')[-1]['status'], 'unfinished')
 
     def fake_xwd(self, path):
         header = [100, 7, 2, 16, 2, 1] + [0] * 6 + [4] + [0] * 6 + [0] + [0] * 5

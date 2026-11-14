@@ -7,7 +7,8 @@
 # Only one agent runs in a guest: it holds an flock on a file on the guest's
 # own disk for its whole life (the kernel drops the lock when it dies or the
 # guest restarts), and a second agent exits. Each command is also claimed by
-# renaming it to <n>.run, which only one process can do.
+# renaming it to <n>.run, which only one process can do. Programs the agent
+# starts get fd 9 closed, so none outlives a killed agent holding its lock.
 export DISPLAY=:98
 D=${INPUT_DIR:-/research/input}            # INPUT_DIR, INPUT_LOCK: for the host tests
 LOCK=${INPUT_LOCK:-/tmp/input-agent.lock}
@@ -22,9 +23,9 @@ while :; do
         [ -e "$c" ] || continue
         base=${c%.cmd}
         [ -e "$base.done" ] && continue  # ended (left as .cmd by an older agent)
-        mv "$c" "$base.run" 2>/dev/null || continue
+        mv "$c" "$base.run" 2>/dev/null 9>&- || continue
         /bin/sh "$base.run" > "$base.out" 2>&1 9>&-
         echo "$?" > "$base.done"
     done
-    sleep 0.05
+    sleep 0.05 9>&-
 done

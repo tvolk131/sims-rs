@@ -186,7 +186,11 @@ How the checks work (the addresses are in `input.py`):
 
 A failed step is logged and ends the scenario; the capture goes on. A
 dialog that opens while a step waits for update returns ends a command's
-settling, and steps that read memory wait for the next update return. A
+settling; the command's exit code (and a shot's conversion) is checked at a
+later stop, and the scenario is done only when every command has ended (a
+`scenario` row with `status` done, or unfinished if the capture ends first).
+A choice that pushes an action and then opens a dialog ends at the dialog
+stop. Steps that read memory wait for the next update return. A
 scenario cannot be resumed: `--scenario` with `--resume` is refused.
 
 `input.jsonl` is the record to replay. A `queued` row holds the update it

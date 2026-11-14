@@ -398,6 +398,16 @@ class Updates:
         self.n = n
 
 
+class UntilPush:
+    """Yielded by a step: go on at the next update return, or at the first
+    stop of any kind (a dialog stop too) once more than `pushes` queue pushes
+    have been seen. A choice can push and then open a modal dialog, which
+    stops update returns."""
+
+    def __init__(self, pushes):
+        self.pushes = pushes
+
+
 class Runner:
     """Runs a scenario from capture.py's stops.
 
@@ -410,8 +420,10 @@ class Runner:
     input.jsonl rows (each has `kind`, `update` and `time`):
       step     a step started, ended (`status` done) or failed (`error`).
       command  a command handed to the guest: `what` (move, press, key, shot),
-               `x`, `y` or `key`, the command, and `done_update`, the first
-               update return at which it had ended (a second row, `ended`).
+               `x`, `y` or `key`, and the command.
+      command_ended  the stop at which its end was seen, with its exit `code`.
+      command_wait_ended  a dialog showed while the step waited on the
+               command: the step went on (its end is still checked later).
       hover    the object under the pointer after a move during aiming.
       pie      the pie menu after it opened or before a choice: its items
                and the picker's entries (label, submenu, action).
@@ -422,6 +434,8 @@ class Runner:
       taken    expect-queued found the pushed action on the person: `where`
                is queue or active (the queue had already started it), with
                the person's active action and queue at that update return.
+      scenario `status` done (every step and command ended) or unfinished
+               (the capture ended first, with the commands still unchecked).
     """
 
     def __init__(self, steps, agent, log_path, shots_dir=None, guest_share='/research'):
@@ -432,7 +446,8 @@ class Runner:
         self.guest_share = guest_share
         self.index = 0
         self.gen = None
-        self.waiting = None  # ('job', n, settle, seen) or ('updates', left)
+        self.waiting = None  # ('job', n, settle, seen, row), ('updates', left), ('event', kind, after),
+        #                      ('fresh',), ('push', pushes) or ('drain',)
         self.pushes = []
         self.push_cursor = 0  # pushes before it were matched by an expect-queued
         self.fresh = False  # self.m was read at this update return (not at a dialog stop)
@@ -445,6 +460,9 @@ class Runner:
         self.sim = None
 
     def close(self):
+        if not self.finished:
+            self.write(kind='scenario', status='unfinished', index=self.index,
+                       unchecked=[n for n, _ in self.unchecked])
         self.log.close()
 
     def write(self, **row):
@@ -488,7 +506,7 @@ class Runner:
                     return
                 self.write(kind='command_wait_ended', id=n, reason='dialog_show', in_update=update)
                 self.waiting = None
-            if self.waiting and self.waiting[0] not in ('event', 'job'):
+            if self.waiting and self.waiting[0] not in ('event', 'job', 'push', 'drain'):
                 return
             self.tick(at_update=False)
         except Exception as e:
@@ -550,6 +568,12 @@ class Runner:
             elif kind == 'fresh':
                 if not self.fresh:
                     return
+            elif kind == 'push':
+                if not at_update and len(self.pushes) <= self.waiting[1]:
+                    return
+            elif kind == 'drain':
+                if self.unchecked:
+                    return
             else:
                 left = self.waiting[1] - 1
                 if left > 0:
@@ -563,6 +587,9 @@ class Runner:
     def advance(self):
         while not self.finished and not self.waiting:
             if self.gen is None and self.index >= len(self.steps):
+                if self.unchecked:  # a dialog cut a command's wait short: see its end first
+                    self.waiting = ('drain',)
+                    return
                 self.finished = True
                 self.write(kind='scenario', status='done')
                 return
@@ -597,6 +624,9 @@ class Runner:
             elif isinstance(want, Updates):
                 if want.n > 0:
                     self.waiting = ('updates', want.n)
+            elif isinstance(want, UntilPush):
+                if len(self.pushes) <= want.pushes:
+                    self.waiting = ('push', want.pushes)
             else:
                 raise TypeError(want)
 
@@ -749,7 +779,7 @@ class Runner:
             yield Fresh()
             if not read_entries(self.m):
                 return
-            yield Updates(1)
+            yield UntilPush(pushes)
         raise StepFailed(f'choosing {label!r} did nothing')
 
     def step_expect_queued(self, person, target, within):
