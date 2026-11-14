@@ -4,6 +4,39 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-14: Change Suit/Accessory, and K = 408
+
+Tick 368 of the Goth house stopped on Change Suit/Accessory (opcode 6,
+`0x45d962`). It is ported in `primitives/change_suit.rs`, with the
+animator's "dress" and "undress" (virtual functions 0xd8 and 0xdc,
+`0x58d88f` and `0x58d919`) as functions on the person's accessory list,
+which the world already keeps from the saved file. Our state then
+equals the fourth capture through tick 408. K goes from 367 to 408.
+
+What was decided:
+
+- **The bind is taken to succeed.** The original adds the entry, then
+  looks the accessory's suit up by name and binds it to the skeleton
+  (`0x583559`, through `0x5a044d` and `0x599427`), storing the name and
+  binding only when that works. An entry that fails stays with an empty
+  name. The simulation has no suit registry (the people track's lookup
+  is presentation code), so every accessory with a name is taken to
+  bind. **Unverified**: the capture shows the entry count (one, from
+  update 368), not the entry.
+- **Clip events "dress" and "undress" still fail loudly.** They call the
+  same functions, but how the event's value becomes a name and binding
+  (`0x5912fd`) is not read yet.
+- **The variant draws use the active stream** (`0x46f457`, as Find Best
+  Interaction's draws), so `Machine::draw` is now shared.
+
+What would reopen it: an accessory whose suit no file defines (the
+original would keep an empty name), or a capture page holding the
+entry.
+
+The first difference is in tick 409, where person 18's route plays its
+waiting tree and looks at another person than the original does. It is
+silent, not a stop, and is the next step.
+
 ## 2026-11-14: A route asks a person in the way to move, and K = 367
 
 In tick 367 of the Goth house, person 18's route finds person 21 in its

@@ -60,8 +60,8 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 367 on the Goth house**: our
-  state after every one of ticks 1 to 367 equals the fourth capture of the
+  there, as three captures recorded). **K = 408 on the Goth house**: our
+  state after every one of ticks 1 to 408 equals the fourth capture of the
   original (full state after every update) in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
@@ -1353,7 +1353,38 @@ not reached by tick 367; the capture shows them later (the waiting
 tree from update 409, the route's end and the queue cleared at 489).
 
 **Stops.** Tick 368: person 21's tree `0x1012` changes its suit (Change
-Suit/Accessory, opcode 6), which is not ported.
+Suit/Accessory, opcode 6), which is not ported. (Ported since; see
+"Ticks 368 to 408".)
+
+### Ticks 368 to 408
+
+**Change Suit/Accessory** (opcode 6, `0x45d962`). In tick 368 person 21
+takes a book from the bookcase, whose tree puts on the accessory named
+by string 0 of its table 304, "suit-book101", lowered in ASCII. Putting
+an accessory on (`0x58d88f`) takes off any of that name and adds one at
+the end with an empty binding; taking it off (`0x58d919`) drops every
+exact match. The suit form (operand 1 = 1) sets the suit (person word
+8) and a variant (word 21), drawn from the active stream for suits from
+8 on; the Goth house does not reach it.
+
+**Compared with the original.** After every one of ticks 368 to 408 our
+state equals the fourth capture's in every field compared, with the
+same head-height exception. The capture shows person 21 wearing one
+accessory from update 368 on; the entry itself is on a page the capture
+lacks.
+
+**Not verified.** The original keeps an accessory's name only when its
+suit is found and binds to the skeleton (`0x583559`); otherwise the
+entry stays with an empty name. The suit registry is not ported, so the
+bind is taken to succeed. The suit form and taking an accessory off are
+ported from the code but not reached.
+
+**Differs.** Tick 409: person 18's route plays "route waiting
+animation" (step 14), and person 18 looks at person 16 where the
+capture has it look at person 259 (person word 41 and the head's
+target). This is the first tick that differs, and it is silent: the
+route step it comes from was ported in "Ticks 367 to 367" but first
+runs here.
 
 ## Track: drawing people (`crates/sims-people`)
 
