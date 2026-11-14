@@ -1,5 +1,6 @@
 //! The HIT player on hand-built modules and samples.
 
+use sims_audio::levels;
 use sims_audio::module::Module;
 use sims_audio::player::{BLOCK, NoSources, Player, RATE, Sources};
 use sims_audio::{Pcm, SoundEvent};
@@ -41,7 +42,7 @@ fn module(routines: &[&[u8]], patch: u32) -> Module {
     hot.push_str("[GlobalHitList]\n5=1,2\n[Track]\n");
     for i in 0..routines.len() {
         hot.push_str(&format!(
-            "{}=0,t{i},16,2,0,0,0,{:#x},{patch}\n",
+            "{}=0,t{i},1024,2,0,0,0,{:#x},{patch}\n",
             10 + i,
             0x100 + i
         ));
@@ -98,13 +99,22 @@ fn a_note_plays_its_patch_and_the_thread_waits_for_it() {
 }
 
 #[test]
-fn slower_stereo_samples_are_mixed_down_and_interpolated() {
+fn samples_play_at_the_pitch_rate_whatever_their_own() {
+    // two.xa is 11,025 Hz stereo: (1000, 3000), (3000, 5000),
+    // (-2000, -2000). At pitch 3600 it plays at 22,050 Hz all the same.
     let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
     let mut player = Player::new(vec![module(&[generic], 2)], samples(), 1);
     play(&mut player, "e0");
+    let out = player.render_stereo(4, &NoSources);
+    assert_eq!(out, [1000, 3000, 3000, 5000, -2000, -2000, 0, 0]);
+    // Pitch 2400 is an octave down: 11,025 Hz. Every other output frame
+    // is halfway between two; the last frame holds. Mono is the mean.
+    let mut routine = vec![LOADL, 21];
+    routine.extend(long(2400));
+    routine.extend(generic);
+    let mut player = Player::new(vec![module(&[&routine], 2)], samples(), 1);
+    play(&mut player, "e0");
     let out = player.render(8, &NoSources);
-    // Frames 2000, 4000, -2000 at half the rate: every other output frame
-    // is halfway between two; the last frame holds.
     assert_eq!(out, [2000, 3000, 4000, 1000, -2000, -2000, 0, 0]);
 }
 
@@ -333,13 +343,13 @@ fn interpolating_between_full_scale_samples_does_not_overflow() {
             samples: vec![i16::MIN, i16::MAX],
         },
     );
-    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
-    let mut player = Player::new(vec![module(&[generic], 1)], map, 1);
+    // Pitch 2400 plays at half speed: frame 1 is halfway.
+    let mut routine = vec![LOADL, 21];
+    routine.extend(long(2400));
+    routine.extend([2, 5, WAIT_SAMP, END]);
+    let mut player = Player::new(vec![module(&[&routine], 1)], map, 1);
     play(&mut player, "e0");
-    // Frame 1 is 16000/22050 of the way from -32768 to 32767.
-    let step = (16_000u64 << 16) / u64::from(RATE);
-    let expected = (-32768 + ((65_535 * step as i64) >> 16)) as i16;
-    assert_eq!(player.render(2, &NoSources), [i16::MIN, expected]);
+    assert_eq!(player.render(2, &NoSources), [i16::MIN, -1]);
 }
 
 #[test]
@@ -387,16 +397,16 @@ fn seqgroup_return_ends_its_thread_when_another_holds_the_group() {
     // Claim group 1 (register 5 holds it), then play patch 1.
     let mut routine = loadb(5, 1).to_vec();
     routine.extend([SEQGROUP_RETURN, 5, 2, 6, WAIT_SAMP, END]);
-    let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+    let mut player = Player::new(vec![module(&[&routine, &routine], 1)], samples(), 1);
     play(&mut player, "e0");
-    play(&mut player, "e0");
+    play(&mut player, "e1");
     let out = player.render_until_idle(10 * BLOCK, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
-    // The second thread found the first holding the group and ended:
-    // the sample plays once, not twice as loud.
+    // e1's thread found e0's track holding the group and ended: the
+    // sample plays once, not twice as loud.
     assert_eq!(&out[..100], &(1..=100).collect::<Vec<i16>>());
-    // The slot keeps the second thread's ID after it ended, so a third
-    // thread ends too, until StopAll clears the slots.
+    // The slot keeps e1's track after its thread ended, so e0 now ends
+    // too, until StopAll clears the slots.
     play(&mut player, "e0");
     let out = player.render_until_idle(10 * BLOCK, &NoSources);
     assert!(out.iter().all(|&s| s == 0));
@@ -405,14 +415,21 @@ fn seqgroup_return_ends_its_thread_when_another_holds_the_group() {
     let out = player.render_until_idle(10 * BLOCK, &NoSources);
     // From the next block.
     assert_eq!(&out[BLOCK..BLOCK + 100], &(1..=100).collect::<Vec<i16>>());
+    // Two threads of one track do not end each other: a group holds a
+    // track number. Both play.
+    player.handle(&SoundEvent::StopAll);
+    play(&mut player, "e1");
+    play(&mut player, "e1");
+    let out = player.render_until_idle(10 * BLOCK, &NoSources);
+    assert_eq!(out.iter().find(|&&s| s != 0), Some(&2));
 }
 
 #[test]
 fn seqgroup_kill_stops_a_holder_whose_extvol_is_0_at_once() {
-    // e0 sets its extvol (19) to 0, claims group 1 and plays patch 1.
+    // e0 sets its extvol (19) to 0, claims group 1 and runs forever.
     let mut holder = loadb(19, 0).to_vec();
     holder.extend(loadb(5, 1));
-    holder.extend([SEQGROUP_RETURN, 5, 2, 6, WAIT_SAMP, END]);
+    holder.extend([SEQGROUP_RETURN, 5, SET_LOOP, LOOP]);
     // e1 takes group 1, then plays only if the group has a holder (which
     // it should: itself), using patch 2.
     let mut killer = loadb(5, 1).to_vec();
@@ -427,9 +444,10 @@ fn seqgroup_kill_stops_a_holder_whose_extvol_is_0_at_once() {
     play(&mut player, "e1");
     out.extend(player.render_until_idle(10 * BLOCK, &NoSources));
     assert!(player.faults.is_empty(), "{:?}", player.faults);
-    // Patch 1 until the next block, when e1 stops it; then patch 2.
-    assert_eq!(&out[..BLOCK], &(1..=BLOCK as i16).collect::<Vec<i16>>());
-    assert_eq!(&out[BLOCK..BLOCK + 2], [2000, 3000]);
+    // e1 ended e0 in the next block and played patch 2 (two.xa's frames
+    // at 22,050 Hz); then nothing was left running.
+    assert!(out[..BLOCK].iter().all(|&s| s == 0));
+    assert_eq!(&out[BLOCK..BLOCK + 3], [2000, 4000, -2000]);
     assert!(player.is_idle());
 }
 
@@ -452,14 +470,15 @@ fn seqgroup_kill_fades_out_the_holder_then_runs_on() {
     let out = player.render_until_idle(20 * BLOCK, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     // e1 waits 2 ms, so it plays from the second block. e0's extvol falls
-    // by 200 a block from 1024, reaching 1 in the seventh block.
+    // by 200 a block from 1024, reaching 1 in the seventh block; then its
+    // note plays at extvol 1 of 1024: -39.97 dB, about a hundredth.
     assert!(out[..BLOCK].iter().all(|&s| s == 0));
-    assert_eq!(&out[BLOCK..BLOCK + 2], [2000, 3000]);
-    assert!(out[BLOCK + 6..6 * BLOCK].iter().all(|&s| s == 0));
-    assert_eq!(
-        &out[6 * BLOCK..6 * BLOCK + 100],
-        &(1..=100).collect::<Vec<i16>>()
-    );
+    assert_eq!(&out[BLOCK..BLOCK + 3], [2000, 4000, -2000]);
+    assert!(out[BLOCK + 3..6 * BLOCK].iter().all(|&s| s == 0));
+    let gain = i64::from(levels::gain(levels::attenuation(1, 1024)));
+    assert_eq!(levels::attenuation(1, 1024), -3997);
+    let faint: Vec<i16> = (1..=100).map(|s| ((s * gain) >> 16) as i16).collect();
+    assert_eq!(&out[6 * BLOCK..6 * BLOCK + 100], &faint);
     assert!(player.is_idle());
 }
 
@@ -474,7 +493,7 @@ fn the_first_module_defining_an_event_wins_and_play_from_picks_one() {
     player.handle(&SoundEvent::StopAll);
     player.play_from(1, 9, "e0");
     player.render(BLOCK - 3, &NoSources);
-    assert_eq!(player.render(3, &NoSources), [2000, 3000, 4000]);
+    assert_eq!(player.render(3, &NoSources), [2000, 4000, -2000]);
     player.handle(&SoundEvent::StopAll);
     player.play_from(2, 9, "e0");
     assert_eq!(player.faults, ["no event e0"]);
@@ -562,4 +581,104 @@ fn a_fade_near_the_largest_value_stops_at_its_destination() {
     let out = player.render(3 * BLOCK, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     assert_eq!(&out[BLOCK..BLOCK + 3], [1, 2, 3]);
+}
+
+const IFNE: u8 = 63;
+
+/// The test samples with patch 1 replaced by `frames` frames of 10,000.
+fn loud(frames: usize) -> BTreeMap<String, Pcm> {
+    let mut map = samples();
+    map.insert(
+        "one.xa".into(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![10_000; frames],
+        },
+    );
+    map
+}
+
+/// `loadl r, value`.
+fn loadl(register: u8, value: i32) -> Vec<u8> {
+    let mut code = vec![LOADL, register];
+    code.extend(long(value as u32));
+    code
+}
+
+const GENERIC: [u8; 4] = [2, 5, WAIT_SAMP, END];
+
+#[test]
+fn vol_pan_group_and_master_volumes_scale_notes() {
+    // vol 512 of 1024: -20 dB, a tenth (6553 / 65536).
+    let mut routine = loadl(18, 512);
+    routine.extend(GENERIC);
+    let mut player = Player::new(vec![module(&[&routine], 1)], loud(4), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(2, &NoSources), [999, 999]);
+    // pan 0: all left.
+    let mut routine = loadl(20, 0);
+    routine.extend(GENERIC);
+    let mut player = Player::new(vec![module(&[&routine], 1)], loud(4), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render_stereo(2, &NoSources), [10_000, 0, 10_000, 0]);
+    // The group's volume (the test tracks are group 0) and the master
+    // volume scale it the same way.
+    let mut player = Player::new(vec![module(&[&GENERIC], 1)], loud(4), 1);
+    player.set_group_volume(0, 512);
+    play(&mut player, "e0");
+    assert_eq!(player.render(2, &NoSources), [999, 999]);
+    let mut player = Player::new(vec![module(&[&GENERIC], 1)], loud(4), 1);
+    player.set_master_volume(512);
+    play(&mut player, "e0");
+    assert_eq!(player.render(2, &NoSources), [999, 999]);
+}
+
+#[test]
+fn main_duckpri_halves_tracks_below_it_until_its_thread_ends() {
+    // e0 asks for main_duckpri 30 and waits for ever; e1 (duck priority
+    // 0) plays.
+    let mut ducker = loadl(123, 30);
+    ducker.extend([SET_LOOP, LOOP]);
+    let mut player = Player::new(vec![module(&[&ducker, &GENERIC], 1)], loud(4), 1);
+    player.handle(&SoundEvent::Play {
+        object: 1,
+        name: "e0".into(),
+    });
+    play(&mut player, "e1");
+    assert_eq!(player.render(2, &NoSources), [999, 999]);
+    player.render(BLOCK - 2, &NoSources);
+    // When the ducking thread stops, its request goes with it.
+    player.handle(&SoundEvent::StopObject { object: 1 });
+    play(&mut player, "e1");
+    assert_eq!(player.render(2, &NoSources), [10_000, 10_000]);
+}
+
+#[test]
+fn target_sends_register_writes_to_another_track() {
+    // e1 sets track 10's (e0's) vol to 512 through target, then restores
+    // its own target. Both start in the same block, e0 first.
+    let mut setter = loadl(53, 10);
+    setter.extend(loadl(18, 512));
+    setter.extend(loadl(53, 0));
+    setter.extend(loadl(18, 7));
+    setter.push(END);
+    let mut player = Player::new(vec![module(&[&GENERIC, &setter], 1)], loud(1000), 1);
+    play(&mut player, "e0");
+    play(&mut player, "e1");
+    assert_eq!(player.render(2, &NoSources), [999, 999]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn every_register_write_sets_the_flags() {
+    // loadb 5, 1 then ifne: the write leaves "not equal", so the branch
+    // to routine 1 (a note) is taken.
+    let mut routine = loadb(5, 1).to_vec();
+    routine.push(IFNE);
+    routine.extend(long(0x101));
+    routine.push(END);
+    let mut player = Player::new(vec![module(&[&routine, &GENERIC], 1)], loud(4), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(2, &NoSources), [10_000, 10_000]);
 }

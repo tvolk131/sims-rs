@@ -6,51 +6,69 @@
 //! notes (samples of a patch) and waits for them, for a time, or for a
 //! register condition. The player runs every thread that is not waiting
 //! at the start of each block of [`BLOCK`] frames, then mixes the playing
-//! notes into mono 16-bit PCM at [`RATE`].
+//! notes into stereo 16-bit PCM at [`RATE`] ([`Player::render`] gives its
+//! mono mix).
 //!
-//! Where the instructions' meanings come from: the register names are the
-//! HSM files' own; the rest follows public notes (FreeSO's HIT player, the
-//! Niotso wiki) and what the install's programs need:
+//! Where the instructions' meanings come from. Marked *(code)*: the
+//! original's own code, read from a memory image of the running game
+//! (never written, not traced at run time). The register names are the
+//! HSM files' own. The rest follows public notes (FreeSO's HIT player,
+//! the Niotso wiki) and what the install's programs need.
 //!
 //! - Registers below 100 belong to a thread; 100 and above are globals
 //!   shared by every thread (`SimSpeed` is 100). A new thread's `patch`
 //!   register (50) holds its track's patch. When the track's arguments
 //!   are `kArgsIdVolPan` (2, nearly every track), `arg1` holds the object
-//!   that started it: routines pass it to `getsrcdatafield`. The
-//!   registers in [`DEFAULTS`] start as the original's default register
-//!   bank holds them (read from its code); every other starts at 0.
+//!   that started it: routines pass it to `getsrcdatafield`.
+//! - *(code)* The registers in [`DEFAULTS`] start as the original's
+//!   default register bank holds them, then `vol` (18) and `duckpri` (25)
+//!   take the HOT track's volume and duck priority; every other starts
+//!   at 0.
+//! - *(code)* Every register write sets the written thread's comparison
+//!   flags from the value; `cmp a, b` sets them from `a - b` and `test r`
+//!   from `r`. The `if` branches test them.
+//! - *(code)* Writing `target` (53) with a track number sends this
+//!   thread's later reads and writes of registers below 100 (other than
+//!   53) to the newest running thread of that track; 0 sends them back
+//!   here. How the original picks among several threads of one track is
+//!   not known. A target that has ended reads 0 and drops writes.
+//! - *(code)* `main_duckpri` (123) is a request per thread: the global
+//!   holds the largest, and a thread's request goes when it ends.
+//! - *(code)* Volume, pan and pitch: see [`crate::levels`]. Each note
+//!   plays at its thread's levels, updated after the threads run in each
+//!   block (the original updates them as registers change). A note whose
+//!   thread has ended keeps its last levels. A sample plays at the rate
+//!   its pitch sets, whatever its own rate.
 //! - `note_on` starts the patch in register 50 and writes the note's ID
 //!   to its operand; `wait_samp` waits until the thread's last note ends.
 //! - `end` returns from a `call`, or ends the thread when nothing called
 //!   it. (No program in the install has a `return`, against 2,504 calls.)
-//! - `cmp a, b` keeps `a - b`; `test r` keeps `r`; the `if` branches test
-//!   what was kept. `set_loop` marks the next instruction; `loop` goes
-//!   back to it, or to the routine's start when nothing was marked (the
-//!   looping generic routine is `note_on v1; wait_samp; loop`). The
-//!   thread then waits for the next block, so a loop that starts no note
-//!   cannot spin.
+//! - `set_loop` marks the next instruction; `loop` goes back to it, or to
+//!   the routine's start when nothing was marked (the looping generic
+//!   routine is `note_on v1; wait_samp; loop`). The thread then waits for
+//!   the next block, so a loop that starts no note cannot spin.
 //! - `smart_setlist` picks a hit list; `smart_choose` writes one of its
 //!   patches, chosen uniformly with the player's own random numbers.
 //! - `wait r` waits `r` milliseconds; the `wait` comparisons wait until
 //!   their condition holds.
+//! - *(code)* Sequence groups. A group is a slot holding the track number
+//!   that last claimed it. `seqgroup_return g` claims group `g` and ends
+//!   its own thread if another track held it. `seqgroup_kill g` claims it
+//!   too; if another track held it, that track's newest thread ends at
+//!   once when its `extvol` is 0, and otherwise starts fading `extvol` at
+//!   speed 200 (unless it already is) while this thread runs the
+//!   instruction again 2 ms later. Slots are never cleared when a thread
+//!   ends (only [`SoundEvent::StopAll`] clears them here). `seqgroup_trkid
+//!   g, r` writes group `g`'s holder to `r`.
+//! - *(code)* A fade moves register `fade_var` toward `fade_dest` by
+//!   `fade_speed` once per block, before the thread's instructions, and
+//!   reads and writes it through `target`; how often the original updates
+//!   is not known.
 //!
-//! - Sequence groups and fades follow the original's code, read from a
-//!   memory image of the running game (not traced at run time). A group
-//!   is a slot holding the ID of the thread that last claimed it.
-//!   `seqgroup_return g` claims group `g` and ends its own thread if
-//!   another thread held it. `seqgroup_kill g` claims it too; if another
-//!   thread held it, that thread ends at once when its `extvol` is 0, and
-//!   otherwise starts fading `extvol` at speed 200 (unless it already is)
-//!   while this thread runs the instruction again 2 ms later. Slots are
-//!   never cleared when a thread ends (only [`SoundEvent::StopAll`] clears
-//!   them here). `seqgroup_trkid g, r` writes group `g`'s holder to `r`.
-//!   A fade moves its register once per block, before the thread's
-//!   instructions; how often the original updates is not known.
-//!
-//! **Unverified** against the original: all of the above, and what this
-//! player leaves out. Volume, pan, pitch, ducking, priorities and 3D
-//! position are not applied: every note plays at full volume, centred,
-//! at its own speed, so a fade changes registers but not the sound.
+//! **Unverified** against the original at run time: all of the above.
+//! Left out: priorities, 3D position (a 3D track is centred), the track
+//! group's own volume beyond the host's [`Player::set_group_volume`], and
+//! the second pitch the original adds (taken as 3600).
 //! `seqgroup_wait`, `add_to_group`, `remove_from_group` and `test1` to
 //! `test4` are not ported: a thread that reaches one ends with a fault.
 //! (The original does nothing for the first three; no program in the
@@ -63,12 +81,13 @@
 //! next); at most [`THREADS`] threads, [`NOTES`] notes and [`SEQGROUPS`]
 //! sequence groups exist at once; calls nest at most [`CALL_DEPTH`] deep;
 //! a thread started by `play_trk` first runs in the next block; a patch
-//! that does not exist is not cached. How the
-//! original picks among duplicate events, patches and hit lists across
-//! modules is unknown; here the module whose name sorts first wins.
+//! that does not exist is not cached. How the original picks among
+//! duplicate events, patches and hit lists across modules is unknown;
+//! here the module whose name sorts first wins.
 
 use crate::files::SoundFiles;
 use crate::hit::{Instruction, Operand};
+use crate::levels::{self, Inputs, Levels};
 use crate::module::Module;
 use crate::{Pcm, SoundEvent};
 use std::collections::BTreeMap;
@@ -124,6 +143,15 @@ pub const DEFAULTS: [(u8, i32); 8] = [
     (29, 10000),
     (FADE_DEST, 1),
 ];
+/// Registers with side effects: `vol`, `duckpri`, 3D, `target` and the
+/// global `main_duckpri`.
+pub const VOL: u8 = 18;
+pub const PAN: u8 = 20;
+pub const PITCH: u8 = 21;
+pub const DUCKPRI: u8 = 25;
+pub const THREE_D: u8 = 26;
+pub const TARGET: u8 = 53;
+pub const MAIN_DUCKPRI: u8 = 123;
 /// How long `seqgroup_kill` waits after starting a fade, in milliseconds.
 const SEQGROUP_WAIT_MS: u64 = 2;
 
@@ -176,6 +204,19 @@ struct Thread {
     hit_list: Vec<u32>,
     last_note: u32,
     wake: u64,
+    /// The track's HOT group (`kGroupSfx` 1, `kGroupMusic` 2, `kGroupVox`
+    /// 3), whose volume scales its own.
+    group: i64,
+    /// Where register reads and writes go: this thread, or the thread
+    /// register 53 named. A named thread that has ended reads as 0.
+    target: Target,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Own,
+    Thread(u32),
+    None,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +228,13 @@ struct Note {
     /// Position in source frames, 16.16 fixed point.
     position: u64,
     step: u64,
+    /// Left and right gains, 16.16 fixed point.
+    gains: [i32; 2],
+}
+
+/// Source frames per output frame, 16.16 fixed point, at a playback rate.
+fn step(rate: u32) -> u64 {
+    (u64::from(rate) << 16) / u64::from(RATE)
 }
 
 /// Spreads a seed over all 64 bits (splitmix64), so nearby seeds start
@@ -231,6 +279,13 @@ pub struct Player<S> {
     /// thread that last claimed it with `seqgroup_kill` or
     /// `seqgroup_return`. A slot keeps its ID after that thread ends.
     seqgroups: BTreeMap<i32, u32>,
+    /// `main_duckpri` requests by thread; the global holds the largest.
+    duck: BTreeMap<u32, i32>,
+    /// Group volumes set by the host (the options' sliders), 1024 when
+    /// not set.
+    group_volumes: BTreeMap<i64, i32>,
+    /// The master volume, 0 to 1024.
+    master: i32,
     notes: Vec<Note>,
     frame: u64,
     /// The frame at which the threads last ran.
@@ -270,6 +325,9 @@ impl<S: Samples> Player<S> {
             pending: Vec::new(),
             over_budget: false,
             seqgroups: BTreeMap::new(),
+            duck: BTreeMap::new(),
+            group_volumes: BTreeMap::new(),
+            master: 1024,
             notes: Vec::new(),
             frame: 0,
             ran_at: None,
@@ -283,6 +341,17 @@ impl<S: Samples> Player<S> {
     pub fn set_global(&mut self, register: u8, value: i32) {
         assert!(register >= GLOBALS, "register {register} is not global");
         self.globals[usize::from(register - GLOBALS)] = value;
+    }
+
+    /// Sets a track group's volume, 0 to 1024 (the options' sliders):
+    /// `kGroupSfx` 1, `kGroupMusic` 2, `kGroupVox` 3.
+    pub fn set_group_volume(&mut self, group: i64, volume: i32) {
+        self.group_volumes.insert(group, volume.clamp(0, 1024));
+    }
+
+    /// Sets the master volume, 0 to 1024.
+    pub fn set_master_volume(&mut self, volume: i32) {
+        self.master = volume.clamp(0, 1024);
     }
 
     /// Frames mixed so far.
@@ -303,12 +372,14 @@ impl<S: Samples> Player<S> {
                 self.threads.retain(|t| t.object != *object);
                 self.pending.retain(|t| t.object != *object);
                 self.notes.retain(|n| n.object != *object);
+                self.forget_ended();
             }
             SoundEvent::StopAll => {
                 self.threads.clear();
                 self.pending.clear();
                 self.notes.clear();
                 self.seqgroups.clear();
+                self.forget_ended();
             }
         }
     }
@@ -369,6 +440,13 @@ impl<S: Samples> Player<S> {
         for (register, value) in DEFAULTS {
             registers[usize::from(register)] = value;
         }
+        // The original's track constructor writes the HOT track's volume
+        // and duck priority.
+        if let Some(volume) = owner.number(&fields.volume) {
+            registers[usize::from(VOL)] = volume as i32;
+        }
+        registers[usize::from(DUCKPRI)] = owner.number(&fields.duck_priority).unwrap_or(0) as i32;
+        let group = owner.number(&fields.group).unwrap_or(0);
         registers[usize::from(PATCH)] = patch as i32;
         if owner.number(&fields.args) == Some(ARGS_ID_VOL_PAN) {
             registers[1] = object as i32;
@@ -392,6 +470,8 @@ impl<S: Samples> Player<S> {
             hit_list: Vec::new(),
             last_note: 0,
             wake: 0,
+            group,
+            target: Target::Own,
         });
     }
 
@@ -420,11 +500,23 @@ impl<S: Samples> Player<S> {
 
     /// Runs the threads and mixes `frames` frames, in blocks of [`BLOCK`].
     pub fn render(&mut self, frames: usize, sources: &dyn Sources) -> Vec<i16> {
-        let mut out = Vec::with_capacity(frames);
-        while out.len() < frames {
+        let stereo = self.render_stereo(frames, sources);
+        stereo
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[left, right]| ((i32::from(*left) + i32::from(*right)) / 2) as i16)
+            .collect()
+    }
+
+    /// Renders `frames` frames of interleaved stereo (left, then right):
+    /// the player's own output. [`Player::render`] is its mono mix.
+    pub fn render_stereo(&mut self, frames: usize, sources: &dyn Sources) -> Vec<i16> {
+        let mut out = Vec::with_capacity(2 * frames);
+        while out.len() < 2 * frames {
             self.run_at_block_start(sources);
             let until_block = BLOCK - (self.frame % BLOCK as u64) as usize;
-            let count = until_block.min(frames - out.len());
+            let count = until_block.min(frames - out.len() / 2);
             self.mix(count, &mut out);
             self.frame += count as u64;
         }
@@ -454,45 +546,98 @@ impl<S: Samples> Player<S> {
         }
     }
 
+    /// Mixes `frames` stereo frames onto `out`. A mono sample plays on
+    /// both channels; a stereo one keeps its own.
     fn mix(&mut self, frames: usize, out: &mut Vec<i16>) {
         let start = out.len();
-        let mut sums = vec![0i64; frames];
+        let mut sums = vec![0i64; 2 * frames];
         let cache = &self.cache;
         self.notes.retain_mut(|note| {
             let Some(Some(pcm)) = cache.get(&note.patch) else {
                 return false;
             };
-            let channels = usize::from(pcm.channels);
+            let channels = usize::from(pcm.channels).max(1);
             let length = pcm.frames() as u64;
-            let sample = |frame: usize| -> i32 {
-                let at = frame * channels;
-                let sum: i32 = pcm.samples[at..at + channels]
-                    .iter()
-                    .map(|&s| i32::from(s))
-                    .sum();
-                sum / channels as i32
+            let sample = |frame: usize, channel: usize| -> i64 {
+                i64::from(pcm.samples[frame * channels + channel.min(channels - 1)])
             };
-            for slot in &mut sums {
+            for slot in sums.as_chunks_mut::<2>().0 {
                 let index = note.position >> 16;
                 if index >= length {
                     return false;
                 }
-                let first = sample(index as usize);
-                let second = if index + 1 < length {
-                    sample(index as usize + 1)
-                } else {
-                    first
-                };
-                // The difference of two samples times a 16-bit fraction
+                let at = index as usize;
+                let after = if index + 1 < length { at + 1 } else { at };
+                // A difference of two samples times a 16-bit fraction
                 // needs more than 32 bits.
                 let fraction = i64::from((note.position & 0xffff) as u32);
-                *slot += i64::from(first) + ((i64::from(second - first) * fraction) >> 16);
+                for (channel, sum) in slot.iter_mut().enumerate() {
+                    let (first, second) = (sample(at, channel), sample(after, channel));
+                    let value = first + (((second - first) * fraction) >> 16);
+                    *sum += (value * i64::from(note.gains[channel])) >> 16;
+                }
                 note.position += note.step;
             }
             note.position >> 16 < length
         });
         out.extend(sums.iter().map(|&s| s.clamp(-32768, 32767) as i16));
-        debug_assert_eq!(out.len(), start + frames);
+        debug_assert_eq!(out.len(), start + 2 * frames);
+    }
+
+    /// A thread's levels from its registers and the player's settings.
+    fn levels(&self, thread: &Thread) -> Levels {
+        let register = |r: u8| thread.registers[usize::from(r)];
+        levels::levels(&Inputs {
+            vol: register(VOL),
+            extvol: register(EXTVOL),
+            pan: register(PAN),
+            pitch: register(PITCH),
+            duck_priority: register(DUCKPRI),
+            three_d: register(THREE_D) != 0,
+            group_volume: self
+                .group_volumes
+                .get(&thread.group)
+                .copied()
+                .unwrap_or(1024),
+            main_duck_priority: self.globals[usize::from(MAIN_DUCKPRI - GLOBALS)],
+            master: self.master,
+        })
+    }
+
+    /// Gives every note of a running thread that thread's levels. (The
+    /// original sets them as registers change; here once per block, after
+    /// the threads run.) A note whose thread has ended keeps its last.
+    fn apply_levels(&mut self) {
+        let levels: BTreeMap<u32, Levels> = self
+            .threads
+            .iter()
+            .map(|t| (t.id, self.levels(t)))
+            .collect();
+        for note in &mut self.notes {
+            if let Some(levels) = levels.get(&note.thread) {
+                note.gains = levels.gains;
+                note.step = step(levels.rate);
+            }
+        }
+    }
+
+    /// Drops the ducking requests of threads that have ended (the
+    /// original drops a track's request when it is killed) and sets
+    /// `main_duckpri` to the largest left, or 0.
+    fn forget_ended(&mut self) {
+        let alive: Vec<u32> = self
+            .threads
+            .iter()
+            .chain(&self.pending)
+            .map(|t| t.id)
+            .collect();
+        self.duck.retain(|id, _| alive.contains(id));
+        self.update_main_duckpri();
+    }
+
+    fn update_main_duckpri(&mut self) {
+        let largest = self.duck.values().copied().fold(0, i32::max);
+        self.globals[usize::from(MAIN_DUCKPRI - GLOBALS)] = largest;
     }
 
     fn run(&mut self, sources: &dyn Sources) {
@@ -535,6 +680,8 @@ impl<S: Samples> Player<S> {
         // Threads started this block run from the next one, so a track
         // that starts itself cannot keep this loop going.
         self.threads.append(&mut self.pending);
+        self.forget_ended();
+        self.apply_levels();
     }
 
     /// Runs one thread until it waits, ends, or the block's instructions
@@ -644,19 +791,86 @@ impl<S: Samples> Player<S> {
         false
     }
 
+    /// Reads a register. Registers below 100 other than `target` (53)
+    /// come from the thread `target` names, as in the original.
     fn read(&self, thread: &Thread, register: i64) -> i32 {
-        match u8::try_from(register) {
-            Ok(r) if r < GLOBALS => thread.registers[usize::from(r)],
-            Ok(r) => self.globals[usize::from(r - GLOBALS)],
-            Err(_) => 0,
+        let Ok(r) = u8::try_from(register) else {
+            return 0;
+        };
+        if r >= GLOBALS {
+            return self.globals[usize::from(r - GLOBALS)];
+        }
+        if r == TARGET {
+            return thread.registers[usize::from(r)];
+        }
+        match thread.target {
+            Target::Own => thread.registers[usize::from(r)],
+            Target::Thread(id) if id == thread.id => thread.registers[usize::from(r)],
+            Target::Thread(id) => self
+                .threads
+                .iter()
+                .chain(&self.pending)
+                .find(|t| t.id == id)
+                .map_or(0, |t| t.registers[usize::from(r)]),
+            Target::None => 0,
         }
     }
 
+    /// Writes a register, with the original's side effects: every write
+    /// sets the written thread's comparison flags from the value; `target`
+    /// (53) picks the newest running thread of the track it names (0: this
+    /// thread); `main_duckpri` (123) records this thread's request and
+    /// holds the largest. Registers below 100 other than 53 go to the
+    /// thread `target` names; a write to an ended target is dropped.
     fn write(&mut self, thread: &mut Thread, register: i64, value: i32) {
-        match u8::try_from(register) {
-            Ok(r) if r < GLOBALS => thread.registers[usize::from(r)] = value,
-            Ok(r) => self.globals[usize::from(r - GLOBALS)] = value,
-            Err(_) => {}
+        let Ok(r) = u8::try_from(register) else {
+            return;
+        };
+        if r == TARGET {
+            thread.registers[usize::from(r)] = value;
+            thread.kept = i64::from(value);
+            thread.target = if value == 0 {
+                Target::Own
+            } else {
+                self.threads
+                    .iter()
+                    .chain(&self.pending)
+                    .filter(|t| t.track == value as u32)
+                    .map(|t| t.id)
+                    .max()
+                    .map_or(Target::None, Target::Thread)
+            };
+            return;
+        }
+        let me = thread.id;
+        let written = match thread.target {
+            Target::Thread(id) if id != me => {
+                match self
+                    .threads
+                    .iter_mut()
+                    .chain(&mut self.pending)
+                    .find(|t| t.id == id)
+                {
+                    Some(other) => other,
+                    None => return,
+                }
+            }
+            Target::None => return,
+            _ => thread,
+        };
+        written.kept = i64::from(value);
+        let id = written.id;
+        if r < GLOBALS {
+            written.registers[usize::from(r)] = value;
+        } else if r == MAIN_DUCKPRI {
+            if value == 0 {
+                self.duck.remove(&id);
+            } else {
+                self.duck.insert(id, value);
+            }
+            self.update_main_duckpri();
+        } else {
+            self.globals[usize::from(r - GLOBALS)] = value;
         }
     }
 
@@ -686,14 +900,14 @@ impl<S: Samples> Player<S> {
             };
             self.cache.insert(patch, pcm);
         }
-        let Some(Some(pcm)) = self.cache.get(&patch) else {
+        if !matches!(self.cache.get(&patch), Some(Some(_))) {
             return 0;
-        };
+        }
         if self.notes.len() >= NOTES {
             self.report(format!("patch {patch}: more than {NOTES} notes"));
             return 0;
         }
-        let step = (u64::from(pcm.rate) << 16) / u64::from(RATE);
+        let levels = self.levels(thread);
         let id = self.id();
         self.notes.push(Note {
             id,
@@ -701,7 +915,8 @@ impl<S: Samples> Player<S> {
             thread: thread.id,
             patch,
             position: 0,
-            step,
+            step: step(levels.rate),
+            gains: levels.gains,
         });
         id
     }
@@ -860,27 +1075,39 @@ impl<S: Samples> Player<S> {
             }
             "seqgroup_kill" => {
                 let group = self.seqgroup(thread, instruction, true)?;
-                let me = thread.id;
+                let me = thread.track;
                 let mut flow = Flow::Next;
                 let holder = self.seqgroups.get(&group).copied().unwrap_or(0);
-                // A holder that has ended is skipped (the original looks
-                // its ID up and does not check for none).
+                // The holder is a track number; its newest running thread
+                // is the one acted on. A track with none running is
+                // skipped (the original looks it up and does not check).
+                let newest = self
+                    .threads
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.track == holder)
+                    .max_by_key(|(_, t)| t.id)
+                    .map(|(at, _)| at);
                 if holder != 0
                     && holder != me
-                    && let Some(at) = self.threads.iter().position(|t| t.id == holder)
+                    && let Some(at) = newest
                 {
-                    let other = &mut self.threads[at].registers;
+                    let other_id = self.threads[at].id;
+                    let other = &mut self.threads[at];
                     let reg = |r: u8| usize::from(r);
-                    if other[reg(EXTVOL)] == 0 {
+                    if other.registers[reg(EXTVOL)] == 0 {
                         self.threads.remove(at);
-                        self.notes.retain(|n| n.thread != holder);
+                        self.notes.retain(|n| n.thread != other_id);
                     } else {
+                        let other_kept = &mut other.kept;
+                        let other = &mut other.registers;
                         let fading =
                             other[reg(FADE_ON)] != 0 && other[reg(FADE_VAR)] == i32::from(EXTVOL);
                         if !fading {
                             other[reg(FADE_SPEED)] = 200;
                             other[reg(FADE_VAR)] = i32::from(EXTVOL);
                             other[reg(FADE_ON)] = 1;
+                            *other_kept = 1;
                         }
                         // Run this instruction again shortly; by then
                         // this thread holds the group.
@@ -894,7 +1121,7 @@ impl<S: Samples> Player<S> {
             }
             "seqgroup_return" => {
                 let group = self.seqgroup(thread, instruction, true)?;
-                let me = thread.id;
+                let me = thread.track;
                 let holder = self.seqgroups.insert(group, me).unwrap_or(0);
                 if holder != 0 && holder != me {
                     Flow::Kill
