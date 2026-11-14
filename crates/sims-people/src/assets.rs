@@ -102,6 +102,11 @@ impl Assets {
         self.files.is_empty()
     }
 
+    /// Every known name, in lowercase and sorted.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(String::as_str)
+    }
+
     /// Whether a file of this name is known.
     pub fn contains(&self, name: &str) -> bool {
         self.files.contains_key(&key(name))

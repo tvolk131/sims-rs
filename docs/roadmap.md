@@ -1246,9 +1246,15 @@ Progress:
   a software rasterizer draws them offscreen. The three Goths draw in
   their rest pose with the right meshes and textures (pinned by digest,
   gated on `SIMS_INSTALL`).
-- Next: animation clips and their samples, the idle and walk clips posed
-  from the simulation's animator state, a viewer, and the comparison
-  with the original.
+- Done: animation clips and their samples load by name; a clip is posed
+  at the phase the simulation's foreground layer gives, over the
+  posture's standing loop; a person is placed and turned from the
+  animator's position and direction. The Goths stand and walk offscreen
+  (pinned by digest).
+- Next: a viewer, and the comparison with the original. The simulation
+  does not yet expose the base layer's clip and phase (a read-only
+  accessor is wanted; until then the saved record and the animator's
+  clock stand in).
 
 ## Track: lot rendering (`crates/sims-render`)
 
