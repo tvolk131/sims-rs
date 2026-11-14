@@ -1272,8 +1272,12 @@ Progress:
   doors and windows cut into them) and object sprites draw at every zoom
   and rotation, with walls up, cut away or down. The Goth house renders
   are pinned by digest, gated on `SIMS_INSTALL`.
-- Next: a viewer window, a screenshot of the original at the same camera
-  and the comparison, then what it shows needs fixing.
+- Done: one camera (far zoom, rotation 0, floor 1, cutaway) compared
+  with a screenshot of the original. The projection and outdoor sprites
+  match pixel for pixel, and two wall bugs it showed are fixed. See the
+  decisions log for what still differs.
+- Next: indoor lighting, the original's grass, the cut-wall cap, and
+  which rooms the cutaway cuts, each checked against the original.
 
 ## Track: sound (`crates/sims-audio`)
 
