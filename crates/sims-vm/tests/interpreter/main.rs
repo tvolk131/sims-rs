@@ -1,6 +1,7 @@
 //! The interpreter against synthetic trees and a synthetic lot. No game
 //! data.
 
+mod animate;
 mod calls;
 mod deletion;
 mod expression;

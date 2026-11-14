@@ -13,12 +13,14 @@
 //! and [`rooms`] works out the lot's rooms from its walls and counts
 //! them: their size, what stands in them, their light and their score.
 //! [`motives`] decays a person's motives and works out the mood.
-//! [`neighbors`] holds the neighborhood's people.
+//! [`neighbors`] holds the neighborhood's people, and [`animator`] what
+//! each person's animator keeps.
 //!
 //! The state holds every field the readers decode. Bytes the readers keep
 //! but do not understand (format tails, raw records) are left out: they are
 //! not state anything here can act on.
 
+pub mod animator;
 mod error;
 pub mod load;
 pub mod motives;

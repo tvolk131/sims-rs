@@ -1,3 +1,4 @@
+use crate::animator::Animator;
 use crate::neighbors::Neighbors;
 use crate::rooms::Rooms;
 use crate::{Error, Result};
@@ -99,6 +100,10 @@ pub struct World {
     pub person_ticks: BTreeMap<u16, PersonTick>,
     /// The neighborhood's people. See [`Neighbors`].
     pub neighbors: Neighbors,
+    /// For each person whose animator has run, what it keeps. A person
+    /// with no entry has the animator the load leaves; see
+    /// [`crate::animator::LOADED`].
+    pub animators: BTreeMap<u16, Animator>,
 }
 
 /// The registry's list of dialogs (registry words 0x64 to 0x68), and the
@@ -292,6 +297,7 @@ impl World {
             dialogs: Dialogs::default(),
             person_ticks: BTreeMap::new(),
             neighbors: Neighbors::default(),
+            animators: BTreeMap::new(),
         }
     }
 

@@ -2,6 +2,7 @@ use sims_content::{Catalog, House, Index, Install, Neighborhood};
 use sims_core::{CrtRng, F32, GameRng};
 use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
+use sims_sim::animator::{Animator, LOADED, Layer};
 use sims_sim::neighbors::{Inventory, Item, Neighbor, Neighbors, Row};
 use sims_sim::rooms::{Half, Room, Rooms};
 use sims_sim::{
@@ -188,6 +189,37 @@ fn world() -> World {
             }],
             relationships_changed: true,
         },
+        animators: BTreeMap::from([(5, animator())]),
+    }
+}
+
+/// An animator playing a clip backward, with an event queued.
+fn animator() -> Animator {
+    let mut layer = Layer::start(
+        "clip",
+        F32::from_bits(0x4479_c000),
+        30,
+        true,
+        true,
+        4_422_300,
+    );
+    layer.phase = F32::from_bits(0x3d4d_0148);
+    layer.event_time = 50;
+    layer.interruptible = 0;
+    Animator {
+        clock: 4_422_300,
+        rate: F32::from_bits(0x3fb3_3333),
+        state: 0,
+        arrival: -1,
+        position: [
+            F32::from_bits(0x43dc_0000),
+            F32::from_bits(0x43b4_0000),
+            F32::ZERO,
+        ],
+        events: vec![7, -2],
+        foreground: Some(layer),
+        playing: true,
+        ..LOADED
     }
 }
 
@@ -197,16 +229,36 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "fd61775798ab1e3a152bc9875852ca2e51da1600fe802e90b5d711205c58fd68";
+const PINNED: &str = "db098963b435573f4282f5706b20ed599ef95c395951934dc0ef917d1c5aac1b";
 
-/// The digest of [`world`] without its neighbors, minus the three zero
+/// The encoding of `world` without its animators, minus the zero byte
+/// they encode to: what snapshot format 10 encoded.
+fn format_10_bytes(mut world: World) -> Vec<u8> {
+    world.animators.clear();
+    let mut bytes = world.encode();
+    assert_eq!(bytes.split_off(bytes.len() - 1), [0]);
+    bytes
+}
+
+fn digest(bytes: &[u8]) -> String {
+    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(bytes).into();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn without_animators_the_encoding_is_format_10_and_a_zero_byte() {
+    // Snapshot format 11 added the persons' animators at the end.
+    assert_eq!(digest(&format_10_bytes(world())), PINNED_10);
+}
+const PINNED_10: &str = "fd61775798ab1e3a152bc9875852ca2e51da1600fe802e90b5d711205c58fd68";
+
+/// The digest of [`world`] without its neighbors or animators, minus the
 /// bytes they encode to: what snapshot format 9 pinned.
 fn format_9_digest(mut world: World) -> String {
     world.neighbors = Neighbors::default();
-    let mut bytes = world.encode();
+    let mut bytes = format_10_bytes(world);
     assert_eq!(bytes.split_off(bytes.len() - 3), [0; 3]);
-    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&bytes).into();
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    digest(&bytes)
 }
 
 #[test]
@@ -225,11 +277,9 @@ fn without_dialogs_or_person_ticks_the_encoding_is_format_8_and_three_zero_bytes
     world.dialogs = Dialogs::default();
     world.person_ticks.clear();
     world.neighbors = Neighbors::default();
-    let mut bytes = world.encode();
+    let mut bytes = format_10_bytes(world);
     assert_eq!(bytes.split_off(bytes.len() - 6), [0; 6]);
-    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&bytes).into();
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    assert_eq!(hex, PINNED_8);
+    assert_eq!(digest(&bytes), PINNED_8);
 }
 const PINNED_8: &str = "c30d0c3a346a5580c68f56b2e3101730b34a69357685be38a071c7b8f47250e0";
 
@@ -257,6 +307,16 @@ fn any_field_change_changes_the_hash() {
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.person_ticks.get_mut(&5).unwrap().room = -5;
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.animators.get_mut(&5).unwrap().events.pop();
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    let animator = changed.animators.get_mut(&5).unwrap();
+    animator.foreground.as_mut().unwrap().phase = F32::from_bits(0x3d4d_0149);
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.animators.get_mut(&5).unwrap().rate = F32::from_bits(0x3fb3_3334);
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.lot_rng.next_u32();

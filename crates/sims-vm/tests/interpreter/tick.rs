@@ -44,6 +44,8 @@ fn lot(tree: sims_formats::behavior::Behavior) -> Fixture {
     sim.data[25] = 0;
     sim.data[29] = -5;
     sim.data[34] = 0;
+    // Its hands are empty, so its animator chooses no carry clip.
+    sim.slots[1].object = 0;
     let person = sim.person.as_mut().unwrap();
     person.data[1] = 0;
     person.data[29] = 1;
