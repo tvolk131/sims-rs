@@ -61,6 +61,292 @@ How it was checked:
 Not checked against the original. The game's own XA decoder was not
 traced in the executable, and the harness runs with `-nosound`.
 
+## 2026-11-14: Drawing the lot starts in its own crate, on the CPU
+
+The lot is drawn by a new crate, `sims-render`. It reads the world
+(`sims_sim::World`) and never changes it, and nothing in the simulation
+depends on it. It draws on the CPU, so tests need no window or GPU.
+
+Terms used here. A *sprite* is a pre-drawn picture from the game's files.
+An object's sprites (SPR2) carry a *depth byte* per pixel that says how
+far that pixel is from the camera. A *draw group* (DGRP) lists the sprites
+that make up one view of an object. A wall's *shape* is a mask that says
+which pixels of a wall exist (full wall, cut-down wall, fence); its
+*pattern* is the wallpaper. *Cutaway* is the original's middle wall mode,
+in which walls that would hide a room's inside are cut down.
+
+What was decided:
+
+- **The original's projection.** A tile's top corner is at
+  `((x - y) * (8 << zoom), (x + y) * (4 << zoom))` plus the camera's
+  origin, raised 58, 116 or 232 pixels per storey at zooms 1 to 3 and
+  `2 << zoom` pixels per terrain step. The four rotations use the
+  original's 64-tile rotation table. This is the old prototype's reading
+  of the original's code (`legacy/crates/sims-sim/src/lot_presenter/`).
+- **Depth is a number per pixel, smaller nearer, and a tie goes to the
+  later draw.** Its scale was fitted from the game's sprites, not read
+  from the original's code. For the lowest pixel of each sprite column,
+  which mostly touches the floor, the depth byte falls 1.5 per screen
+  pixel below the object's anchor at the near zoom, 3 at medium and 6
+  at far, and is about 200 level with the anchor. So one byte is a fixed
+  distance in the world. The renderer gives floors, walls and the
+  anchors of objects a depth on the same scale. Whether this matches the
+  original's depth tables is **unverified**.
+- **Where a sprite goes.** An object's anchor is the screen point of its
+  position on the floor. Each sprite of its draw group is drawn with its
+  left edge and bottom at the offsets the draw group gives (checked on
+  every near-zoom draw group of the Goth house's objects: the anchor sits
+  at the same point of each sprite's frame). A draw group sprite with
+  flag 1 is mirrored. Dynamic sprites hide when their word is zero
+  (0x437f99, from the old prototype).
+- **Floors** are `GameData/floors.iff` sprites `id`, `id + 256` and
+  `id + 512` for the three zooms, drawn with their middle column on the
+  tile's top corner. A tile a diagonal wall splits shows two floors from
+  its wall cell; which half takes which is **unverified**. Grass is a
+  brown-to-green mix by each tile's grass value, scattered in two
+  shades. The original draws grass blades from a seeded pattern, so
+  grass will not match pixel for pixel.
+- **Walls** are a pattern from `GameData/walls.iff` (`id` plus 1536,
+  1792 or 2048) masked by a shape (`style * 2 + cut` plus 0, 512 or
+  1024), one frame per wall direction. Each wall cell owns its low-x and
+  low-y walls and its diagonals; which side's wallpaper shows follows
+  the old prototype's `faces`, which was compared with the original's
+  wall records. A wall of style 22 or 23 takes its shape from the door
+  or window standing in it (the object's OBJD byte 0xa2), as the old
+  prototype did. Where a wall sprite sits on its edge was worked out
+  from the shapes' outlines and is **unverified** until compared with a
+  screenshot.
+- **Cutaway is simplified.** A wall stays up only if the room on the
+  camera's side is indoors and the other side is outdoors: the back
+  walls of the house. Doors and windows in a cut wall are hidden. The
+  original's cutaway (0x54059a and 0x4aa446) also depends on a mask it
+  builds per view; that is not ported, so this is **unverified**.
+- **Not drawn yet:** the Sims (the people track draws them), roofs,
+  shadows, lighting by time of day and room, objects in other objects'
+  slots raised to the slot's height, and terrain shading.
+- **A small loader** (`open_house`) builds a world from a house file,
+  widens its floor and wall arrays as the load does and works out the
+  rooms, so a house can be drawn without a full `sims boot`.
+
+How it was checked:
+
+- The Goth house renders at all three zooms and four rotations, with
+  every wall shape found. The renders were looked at: floors, walls,
+  fences, doors, windows and furniture sit where they should, and the
+  back walls stay up in cutaway. They are pinned by digest of the
+  16-bit-color image (`tests/goth_house.rs`, gated on `SIMS_INSTALL`).
+- Nothing has been compared with a screenshot of the original yet.
+
+What would reopen it: a screenshot comparison that disagrees, or a
+reading of the original's depth tables or cutaway mask.
+
+## 2026-11-14: People play the simulation's clips; placement and facing
+
+A person is drawn from the simulation's animator (`sims_sim::animator`),
+read only:
+
+- **Clips.** Every animation file (a `.bcf` that starts with eight zero
+  bytes) is read once, and its clips are known by name, ignoring case. A
+  clip's samples come from `<skill>.cfp`. A clip is posed at a phase from
+  0 to 1: the frame is `phase × frames`, blended with the next frame,
+  which wraps to the first only for a layer that repeats (end mode 1).
+  This is the old prototype's sampling (`legacy/crates/sims-sim/src/pose/sampling.rs`)
+  in ordinary `f32`. It is **unverified** against the original's frames.
+- **Layers.** The rest pose, then the base layer's clip, then the
+  foreground layer at its phase and weight. The simulation keeps only
+  whether a base layer exists, not its clip or phase. Until it exposes
+  them, the clip comes from the saved person record (the base descriptor,
+  for the Goths `a2o-standing-loop` and `c2o-standing-loop`) and the phase
+  from the animator's clock. Carry and blend layers are not drawn yet.
+- **Root travel.** The walking clip's root sways forward and back by
+  about 0.27 units, and returns; it does not travel. The simulation moves
+  the person. So the clip's root is kept as it is, unlike the old
+  prototype, which removed it.
+- **Place.** Sim x and y (sixteenths of a tile) become model X and Z, at
+  3 model units per tile. That figure comes from the walk step, which
+  moves a person by a clip's distance times 16/3 sixteenths. Floors above
+  the ground are not handled yet.
+- **Facing.** Checked against the simulation, not the original: person
+  259 walking for 82 ticks of `sims boot` on House05 moves along
+  (sin θ, −cos θ) in sim x and y, where θ is its direction (in eighths of
+  a turn) times 45 degrees. The mean difference is 0.2 degrees. Every
+  clip leaves the toes pointing at model +Z, so a person is turned by
+  π − θ about the vertical, as the old prototype did. The turn is computed
+  with additions, multiplications and square roots only, so pinned renders
+  hold on every machine.
+
+Whether the drawing is the original's image or its mirror image is still
+**unverified**, and so is which screen direction sim +x takes. Both wait
+on a screenshot of the original.
+
+## 2026-11-14: Drawing people starts in its own crate, on the CPU
+
+The Sims are drawn by a new crate, `sims-people`. It reads simulation
+state and never changes it, and nothing in the simulation depends on it.
+Its math is ordinary `f32`, and it may use the platform's `sin` and `cos`
+(it allows the workspace's float lint at its crate root).
+
+Terms used here. An *appearance* is a named set of meshes bound to bones
+(`b004fafit_01`, Bella Goth's body). A *texture string* is what a saved
+person keeps next to each appearance, such as `BODY=b004fafitmed_fatale01`.
+
+What was decided:
+
+- **Files are found by their own name.** Every `.bcf`, `.cmx`, `.bmf`,
+  `.skn`, `.bmp` and `.cfp` file, loose or in a FAR archive, is known by
+  its name without directory, ignoring case. The base game is searched
+  first, then the expansions in the order the original mounts their
+  object folders, then `Downloads`. The original's own avatar registry
+  is not ported, so this order is **unverified**. Every file the Goth
+  family is drawn from has one source or identical copies, so the order
+  does not change what they look like.
+- **What a person wears comes from its saved record.** The body, the
+  two hands, the head and the accessories each name an appearance and a
+  texture string. An appearance is read from `<name>.cmx.bcf`, or from
+  the text form `<name>.cmx`. A mesh is read from `<name>.bmf`, or from
+  `<name>.skn`.
+- **A texture string `KEY=texture` gives its texture to every mesh whose
+  name contains `KEY`.** Other meshes keep the texture their own file
+  names (Cassandra's glasses, `nerdspecs`). This is the old prototype's
+  reading of the original's code (0x599e87). It explains every part of
+  the three Goths.
+- **The pose is computed in a mirrored frame.** Positions and rotations
+  from the files have their first coordinate negated, as the old
+  prototype's renderer did. Whether this gives the original's image or
+  its mirror image is **unverified** until it is compared with a
+  screenshot of the original.
+- **Skinning follows the old prototype:** each vertex moves with its
+  bone, and a blended vertex moves part of the way towards its position
+  on a second bone. How close this is to the original's blend is
+  **unverified**.
+- **Rendering is a small software rasterizer for now.** Tests draw
+  offscreen with no window and no GPU. The camera keeps sines and
+  cosines, and the house view is built from square roots, so a render
+  gives the same bits on every machine and can be pinned by digest.
+- **The texture decoder (`.bmp`) lives in `sims-people`**, not in
+  `sims-formats`, to avoid conflicts with the rendering track. It can
+  move later.
+
+How it was checked:
+
+- The three Goths (Mortimer, Bella and Cassandra) load with the meshes
+  and textures listed in `tests/goth_family.rs`, and draw in their rest
+  pose. The renders were looked at: clothes, skin, hands and heads sit
+  where they should, and Cassandra wears her glasses. They are pinned by
+  digest, gated on `SIMS_INSTALL`.
+- Nothing is compared with the original yet.
+
+## 2026-11-14: The end of a path on a timer, the walk's strides, and K = 333
+
+In tick 262 of the Goth house, person 21 comes to the end of a path
+with object data word 9 clear. That case is now ported, with what it
+needs: the walk's strides, worked out by posing the person's skeleton.
+Ticks 262 to 333 then reach a few more mechanics, which are ported too.
+Our state after every one of ticks 1 to 333 equals the fourth capture.
+Tick 334 stops loudly. K goes from 261 to 333.
+
+Terms used here. A *stride* is how far apart a person's feet are, along
+one axis, at a footfall of the walk clip; the animator keeps two
+(+0x17c and +0x178). A *footfall* is a phase of the walk clip marked by
+an `anchor` event. A *pose* is where every bone of a skeleton is when a
+clip is played at a phase. A *sample* is a bone's position or rotation
+at one frame of a clip, stored compressed in a CFP file.
+
+What was decided:
+
+- **The end of a path with data word 9 clear is ported** (0x58e8be to
+  0x58eb03). The phase of the walk clip picks the next footfall and the
+  stride that ends there. Within that stride of the end, the animator
+  sets a timer (+0x1c0) and fades the clip's weight to the share of the
+  stride left (0x597a3e). A clip that may not be interrupted and has not
+  finished only sets the near-end flag. When the timer runs out, the
+  person stands on the end point, facing along the path's last segment.
+- **A layer's fade is ported** (0x597e3c to 0x597e9b). The old test that
+  expected a fading layer to fail now checks the fade instead.
+- **The strides are worked out when needed, not kept.** The original
+  works them out once, in the person's constructor (0x58831d), and keeps
+  them. We work them out from the same walk clip and skeleton each time
+  (`Interpreter::strides`). The result is the same while the clip and
+  skeleton stay the same, and the snapshot does not grow. The pose code
+  is new (`sims_sim::pose`). It follows the old prototype's 24-bit
+  variants (`Selection::at_position` and `motion_with_control` in
+  legacy/crates/sims-sim/src/pose/sampling.rs;
+  `blend_quaternion_with_control` and `compose_bone_with_control` in
+  legacy/crates/sims-sim/src/pose.rs). Content now reads each
+  skeleton's bones and each clip's channels and raw samples.
+- **The sample decoder uses the original's table.** The original turns
+  each compressed sample byte into a change through a table of 253
+  floats that it builds at 0x5975d4 (stored at 0x6f7188). Each entry is
+  worked out in steps, each rounded to single precision. Our decoder
+  used a closed formula in double precision, which differed in the last
+  bits of most entries. That moved the strides by 70 to 400 units in the
+  last place. `sample_deltas` now builds the table as the original does.
+- **The turn on the spot takes every turn clip** (0x58f4ee to 0x58f688),
+  not only the half turn. A clip already in the foreground is cleared
+  first (0x592878).
+- **Animate Sim names a clip from an object's own tables** (source 0,
+  0x59dd6d): string tables 129 to 132, by the ages of the person and of
+  the person its interaction is with.
+- **Look Towards mode 0 is ported** (primitive 22, 0x45a98e, 0x58a035):
+  person data words 41 to 45 hold the head's target. Modes 1 to 3 fail
+  loudly.
+- **Snapshot format 17** keeps the motion's timer (+0x1c0) and each
+  layer's fade (+0x48 to +0x54). The pins taken under format 16 still
+  hold with these left out (`format_16_bytes`).
+- **The harness reads a stale spatial-order cache without failing.** The
+  fourth capture stopped at update 609 with `unknown retained
+  spatial-order object identity`. The registry keeps a cache of objects
+  in drawing order (registry +0x4c). The only reader (0x440349) rebuilds
+  it first (0x440397) when its dirty byte (+0x44) is set or its rotation
+  is not the camera's. Removing an object (0x44383c) sets the dirty byte
+  (0x443b65) and leaves the cache as it was. So a dirty cache can hold
+  the address of an object that is gone. The harness now keeps a stale
+  cache's addresses as read, with no identities, and still fails on an
+  unknown address in a current cache. Its output schema is now 2.
+
+How it was checked:
+
+- After every one of ticks 1 to 333, our state equals the fourth
+  capture's, floats bit for bit, in the same fields as before, now with
+  the timer and the fade, and the `updates.jsonl` line.
+- The second capture is equal at every tick it holds (to 240). The third
+  is equal to 300 but for the two known lines (global 12 after ticks 1
+  and 2; one local of object 18 after ticks 210 and 220).
+- Our strides equal the stored ones bit for bit, for all three people
+  (child 16: 0x40d893f8 and 0x40bcad30; adults 18 and 21: 0x412c5b86
+  and 0x412a0544). The capture holds the same values after updates 1,
+  300 and 600.
+- Our table of 253 changes equals the one in a memory image of the
+  original at 0x6f7188, entry for entry. In double precision, 225
+  entries differ.
+- `the_goth_house_first_tick_matches_the_original` runs to tick 333,
+  checks the end of the paths in ticks 262 to 322 and the strides, pins
+  the state, and checks that tick 334 stops at 0x5904d2.
+- The load comparison still gives its three known lines.
+- New synthetic tests: the frame choice, sampling, blending and
+  composing of a pose; the fade; the start of a stop on a timer; the
+  table's digest; Animate Sim's own tables; and Look Towards mode 0.
+- The harness change was checked only on made-up memory. No capture
+  has been run with it.
+
+What did not match, and why:
+
+- Nothing new. At the stop in tick 334, person 16's person word 27 is
+  12 in ours and 13 in the capture after the tick. The steps after the
+  stop presumably write it, as at the stop in tick 262.
+- The first capture still differs from tick 233 on, as before.
+
+Unverified:
+
+- To pose the skeleton for the strides, the layer's time since its last
+  pose is taken as 0 (so the next frame is always blended in) and the
+  clip as looping. Neither is read from the original. The strides this
+  gives equal the stored ones.
+- That a removed object was what stopped the fourth capture at update
+  609. The code says a dirty cache can hold one, and the dirty byte was
+  set after every update the capture saved; the memory at update 609
+  was not saved.
+
 ## 2026-11-14: A person walks through a door, and K = 261
 
 In tick 233 of the Goth house, person 21 routes to an object in another

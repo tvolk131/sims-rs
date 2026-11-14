@@ -13,6 +13,8 @@ fn clip(name: &str, duration: u32) -> Clip {
         frames: 4,
         motions: 1,
         tracks: Vec::new(),
+        channels: Vec::new(),
+        samples: [0, 0],
     }
 }
 

@@ -6,14 +6,16 @@
 //! the clip the layer keeps its duration (clip +0x2c), the frame count of
 //! its first motion (layer +0x38), and one binding per motion (layer +8),
 //! each with a cursor over the motion's timed events ([`Track`]). The samples (the
-//! `.cfp` file named after the clip's skill) are only read to pose the
-//! skeleton, which is presentation; a clip whose samples are missing is
-//! still refused, since how the original copes with that is not ported.
+//! `.cfp` file named after the clip's skill) pose the skeleton. The
+//! simulation reads a pose only where the person's constructor measures
+//! the walk's strides (0x58831d); the rest is presentation. A clip whose
+//! samples are missing is still refused, since how the original copes
+//! with that is not ported.
 
 use crate::index::{far_members, sorted_entries};
 use crate::install::resolve;
 use crate::{Error, Index, Install, Resource, Result};
-use sims_formats::animation::read_bcf;
+use sims_formats::animation::{Samples, read_bcf, read_cfp};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What the animator reads of one clip.
@@ -43,6 +45,22 @@ pub struct Clip {
     /// motions. Each becomes a cursor of the layer's binding for that
     /// motion (0x594778), and the layer update dispatches them (0x597c4c).
     pub tracks: Vec<Track>,
+    /// Each motion's samples, in the order of the motions.
+    pub channels: Vec<Channel>,
+    /// How many positions and rotations the sample file holds for the
+    /// clip, which reading it needs.
+    pub samples: [u32; 2],
+}
+
+/// Where one motion's samples are in its clip's sample file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Channel {
+    /// The bone the motion moves.
+    pub bone: String,
+    /// The index of the motion's first position, if it has positions.
+    pub translation: Option<u32>,
+    /// The index of the motion's first rotation, if it has rotations.
+    pub rotation: Option<u32>,
 }
 
 /// One motion's timed events, as the original builds its list when it
@@ -107,9 +125,10 @@ pub struct Animations {
     /// Each name's definitions, one per file that defines it, by the file's
     /// location relative to the install.
     clips: BTreeMap<String, BTreeMap<String, Clip>>,
-    /// The names of the sample files (`.cfp`), in lowercase, without the
-    /// extension or any directory an archive member's name holds.
-    samples: BTreeSet<String>,
+    /// The sample files (`.cfp`), by name in lowercase, without the
+    /// extension or any directory an archive member's name holds: each
+    /// distinct content a file of that name has.
+    samples: BTreeMap<String, BTreeSet<Vec<u8>>>,
 }
 
 impl Animations {
@@ -149,7 +168,12 @@ impl Animations {
                 // ExpansionShared.far's "Animations\xskill-....cfp" does;
                 // the sample file is known by its own name.
                 let file = stem.rsplit(['\\', '/']).next().unwrap_or(stem);
-                animations.samples.insert(file.to_owned());
+                let bytes = resource.read()?;
+                animations
+                    .samples
+                    .entry(file.to_owned())
+                    .or_default()
+                    .insert(bytes);
                 continue;
             }
             if !name.ends_with(".bcf") {
@@ -178,6 +202,16 @@ impl Animations {
                         .filter(|(_, list)| !list.is_empty())
                         .map(|(bone, list)| Track::build(bone, list))
                         .collect(),
+                    channels: animation
+                        .motions
+                        .iter()
+                        .map(|m| Channel {
+                            bone: m.bone.clone(),
+                            translation: m.translation,
+                            rotation: m.rotation,
+                        })
+                        .collect(),
+                    samples: [animation.translation_count, animation.rotation_count],
                     name: animation.name,
                 };
                 animations
@@ -200,7 +234,42 @@ impl Animations {
 
     /// Notes a sample file, by its name without the extension. For tests.
     pub fn insert_samples(&mut self, skill: &str) {
-        self.samples.insert(skill.to_ascii_lowercase());
+        self.samples.entry(skill.to_ascii_lowercase()).or_default();
+    }
+
+    /// Adds a sample file's content, by its name without the extension.
+    /// For tests.
+    pub fn insert_sample_file(&mut self, skill: &str, bytes: Vec<u8>) {
+        self.samples
+            .entry(skill.to_ascii_lowercase())
+            .or_default()
+            .insert(bytes);
+    }
+
+    /// The positions and rotations of `clip`, from its sample file.
+    ///
+    /// Fails when no sample file has the clip's skill as its name, when
+    /// two such files differ (which one the original would read is not
+    /// known), and when the file does not decode.
+    pub fn samples(&self, clip: &Clip) -> std::result::Result<Samples, Error> {
+        let unsupported = |message: String| Err(Error::Unsupported(message));
+        let mut files = self
+            .samples
+            .get(&clip.skill.to_ascii_lowercase())
+            .into_iter()
+            .flatten();
+        let (Some(bytes), None) = (files.next(), files.next()) else {
+            return unsupported(format!(
+                "there is not exactly one sample file for the skill {:?}",
+                clip.skill
+            ));
+        };
+        read_cfp(bytes, clip.samples[0], clip.samples[1]).or_else(|e| {
+            unsupported(format!(
+                "the sample file of the skill {:?} does not decode: {e}",
+                clip.skill
+            ))
+        })
     }
 
     /// Whether no clip is known.
@@ -259,7 +328,7 @@ impl Animations {
                  between them needs the original's animation library, which is not ported"
             ));
         }
-        if !self.samples.contains(&clip.skill.to_ascii_lowercase()) {
+        if !self.samples.contains_key(&clip.skill.to_ascii_lowercase()) {
             return unsupported(format!(
                 "the samples of the clip {name:?} ({}.cfp) are missing",
                 clip.skill

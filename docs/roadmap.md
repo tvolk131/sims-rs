@@ -60,8 +60,8 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 261 on the Goth house**: our
-  state after every one of ticks 1 to 261 equals the fourth capture of the
+  there, as three captures recorded). **K = 333 on the Goth house**: our
+  state after every one of ticks 1 to 333 equals the fourth capture of the
   original (full state after every update) in everything compared. The
   other captures agree where they hold a state, but for fields that also
   differ between the original's own runs (see "Ticks 233 to 261").
@@ -70,17 +70,20 @@ Each step is a few PRs, and each PR leaves `main` green.
   far as scripts read it. Find Location For (primitive 16) is ported for
   the modes the house reaches, and so is making a new person (Create New
   Object Instance mode 8, tick 6). Go To Routing Slot (primitive 45)
-  is ported for the routes the house takes to tick 261, with the
+  is ported for the routes the house takes to tick 333, with the
   planner, the search of places by distance, the animator's turn on the
-  spot, its walk along the path and the end of the path. Clips' timed
+  spot, its walk along the path and the end of the path, including the
+  stop on a timer that needs the walk's strides (see "Ticks 262 to
+  333"). Clips' timed
   events are ported. In tick 233 person 21 chooses an interaction by
   itself (Find Best Interaction, primitive 3) and starts it (Gosub Found
   Action, primitive 30). Its tree routes to an object in another room
   (Go To Relative Position, primitive 27): the routing between rooms
   chooses a door, and the person walks through it. A person entering a
   room tells the room (it is lit as if it had a lamp), and each frame
-  counts the rooms that wait. Tick 262 stops loudly at the end of a path
-  that is not ported, and the boot says so and at which tick.
+  counts the rooms that wait. Tick 334 stops loudly where person 16's
+  head follows a target, which is not ported, and the boot says so and at
+  which tick.
 - Step 4 is in progress. `tools/harness/` runs the original under Wine
   in a QEMU guest and stops it at every lot update. It saves the state
   at the entry of the first tick and after each lot update: every
@@ -106,8 +109,10 @@ Each step is a few PRs, and each PR leaves `main` green.
   state after 1 to 100 and every tenth), and a fourth the full state
   after every update to 608, both with the draw guard watched. The
   fourth stopped at update 609: the harness found an object in a
-  retained list that the registry did not hold, and refuses to guess
-  (`tools/harness/README.md`). The first run does not choose in tick
+  retained list that the registry did not hold. The list is a cache the
+  game rebuilds before reading it when it is marked dirty, and removing
+  an object marks it dirty without editing it; the reader now keeps a
+  dirty cache's pointers without identities (`tools/harness/README.md`). The first run does not choose in tick
   233; the other three do (see "Tick 233"). Why is not known, and the
   captures do not hold what would tell. The likely cause, unverified,
   is the long pause the harness made in that run only; we follow the
@@ -117,7 +122,7 @@ Each step is a few PRs, and each PR leaves `main` green.
   five differing records came from the first capture's guest files. The
   original first draws from the C runtime's stream in tick 6, 1,466
   times, when it makes a person; ours draws the same, and the stream is
-  equal after every tick to 261 (fourth capture).
+  equal after every tick to 333 (fourth capture).
 
 ### Load sequence
 
@@ -1171,11 +1176,106 @@ original leaves as the heap held it, is never read. That nothing
 outside the compared fields depends on the frame schedule within
 updates 1 and 2.
 
-**Stops.** Tick 262: object 21, at the end of its next path with object
-data word 9 clear (`0x58e8be`: a timer and a stopping clip). Person 21's
-person word 27 is 40 at the stop and 41 in the capture after the tick.
+**Stops.** Tick 262 stopped here, at the end of a path with object
+data word 9 clear (`0x58e8be`); see "Ticks 262 to 333".
 
-## Track 3: sound
+### Ticks 262 to 333
+
+**The end of a path with data word 9 clear** (`0x58e8be` to
+`0x58eb03`). The person walks on and slows down, and a timer (animator
+`+0x1c0`) says when it stops. With no timer set, the phase of the walk
+clip picks the next footfall, and with it the stride that ends there.
+Within that stride of the end, the timer is set to the time left to
+the footfall, and the clip's weight fades to the share of the stride
+left (`0x597a3e`; a layer's fade, `0x597e3c`, is now ported). A clip
+that may not be interrupted and has not finished only marks the
+motion as near its end. When the timer runs out, the person is put on
+the end point, faces along the path's last segment, and stands. The
+turn on the spot now takes every turn clip, not only the half turn
+(`0x58f4ee` to `0x58f688`).
+
+**The walk's strides.** The person's constructor (`0x58831d`) poses
+the skeleton with the walk clip at each of the clip's two footfalls
+(its `anchor` events) and keeps how far apart the feet are along one
+axis (animator `+0x17c` and `+0x178`). We work them out the same way
+when they are needed (`sims_sim::pose`, `Interpreter::strides`): the
+skeleton's bones and the clip's samples are now read, and the pose is
+taken in single precision, as the old prototype's 24-bit variants do.
+Our strides equal the ones the original stored, bit for bit, for all
+three people. Getting there needed a fix to the sample decoder: the
+original decodes a sample's changes through a table it builds at
+`0x5975d4`, each step rounded to single precision. Ours now builds the
+same table; the old formula, in double precision, differed in the last
+bits of most entries.
+
+**Animate Sim names a clip from an object's own tables** (source 0,
+`0x59dd6d`): string table 129, 130 for a child, and 131 or 132 when the
+clip is for an interaction with a person of the other age.
+
+**Look Towards, mode 0** (primitive 22, `0x45a98e`): the head follows
+the stack object, through person data words 41 to 45 (`0x58a035`).
+Modes 1 to 3 turn the person on the spot and are not ported.
+
+**Snapshot format 17** keeps the motion's timer and each layer's fade.
+The pins taken under format 16 still hold with them left out.
+
+**Compared with the original.** After every one of ticks 1 to 333, our
+state equals the fourth capture's in the same fields as before, now
+with the timer and the fade, and the `updates.jsonl` line.
+
+**Not verified.** The strides are worked out with the layer's time since
+its last pose taken as 0 and the clip taken as looping. Neither is read
+from the original; the results equal what it stored.
+
+**Stops.** Tick 334: person 16's head follows its target (`0x5907c5`),
+which needs the places of its bones in the current pose (`0x5904d2`).
+
+## Track: drawing people (`crates/sims-people`)
+
+Draw the Sims from the original's files, posed by the simulation's
+animator state, which the crate reads and never changes. Milestone: the
+Goth family's three Sims drawn with correct meshes and skins, posed from
+a skeleton, playing an idle and a walk clip in an offscreen render and a
+small viewer, with one pose compared with a screenshot of the original.
+
+Progress:
+
+- Done: the person files are found by name across the base game and
+  expansions; a saved person's appearance strings choose the meshes and
+  skin textures; the skeleton is posed and the meshes skinned on the CPU;
+  a software rasterizer draws them offscreen. The three Goths draw in
+  their rest pose with the right meshes and textures (pinned by digest,
+  gated on `SIMS_INSTALL`).
+- Done: animation clips and their samples load by name; a clip is posed
+  at the phase the simulation's foreground layer gives, over the
+  posture's standing loop; a person is placed and turned from the
+  animator's position and direction. The Goths stand and walk offscreen
+  (pinned by digest).
+- Next: a viewer, and the comparison with the original. The simulation
+  does not yet expose the base layer's clip and phase (a read-only
+  accessor is wanted; until then the saved record and the animator's
+  clock stand in).
+
+## Track: lot rendering (`crates/sims-render`)
+
+Draw a lot from the house file and the game's art: terrain, floors, walls
+and object sprites, at the three zooms and four rotations, in a window.
+The crate reads the simulation's world and never changes it. Milestone:
+the Goth house drawn in a window at every zoom and rotation, with floors,
+walls (with cutaway) and objects, and one camera compared with a
+screenshot of the original.
+
+Progress:
+
+- Done: the crate draws on the CPU into an image with a depth buffer,
+  using the original's projection. Floors, grass, walls (with the shapes
+  doors and windows cut into them) and object sprites draw at every zoom
+  and rotation, with walls up, cut away or down. The Goth house renders
+  are pinned by digest, gated on `SIMS_INSTALL`.
+- Next: a viewer window, a screenshot of the original at the same camera
+  and the comparison, then what it shows needs fixing.
+
+## Track: sound (`crates/sims-audio`)
 
 Goal: the game's sound, from files to PCM, in `crates/sims-audio`. The
 simulation never depends on it; its only link is the play-sound and

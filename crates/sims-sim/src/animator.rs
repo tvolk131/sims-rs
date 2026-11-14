@@ -228,6 +228,12 @@ pub struct Motion {
     /// +0x28c: the walk goes on without asking whether to stop (0x58e883,
     /// read at 0x58ed15).
     pub finishing: i32,
+    /// +0x1c0: when a person whose object data word 9 is clear stops at
+    /// the end of its path (0x58e8be). 0 until the end of the path sets
+    /// it to the clock at which to stop; -1 for at once. A new animator
+    /// (0x587e14), its reset (0x589292), the stop itself (0x58eac5) and
+    /// a route's stop (0x589e56) set it to 0.
+    pub timer: i32,
 }
 
 impl Motion {
@@ -243,6 +249,7 @@ impl Motion {
         step: [F32::ZERO; 2],
         near_end: 0,
         finishing: 0,
+        timer: 0,
     };
 }
 
@@ -292,6 +299,35 @@ pub struct Layer {
     /// points at (binding +8, cursor +4). A new layer's cursors point at
     /// the first event (0x594778).
     pub cursors: Vec<i32>,
+    /// The fade of the weight while [`Layer::fading`] is set (0x597a3e):
+    /// the clock it started at (+0x48), how many milliseconds it takes
+    /// (+0x4c), and the weight it goes from (+0x50) and to (+0x54). A new
+    /// layer holds 0, 500, 1 and 0 (0x5978ef, 0x597a88).
+    pub fade: Fade,
+}
+
+/// A layer's fade of its weight (layer +0x48 to +0x54).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fade {
+    /// +0x48: the clock when the fade started.
+    pub start: i32,
+    /// +0x4c: how long the fade takes, in milliseconds.
+    pub length: i32,
+    /// +0x50: the weight at the start.
+    pub from: F32,
+    /// +0x54: the weight at the end.
+    pub to: F32,
+}
+
+impl Fade {
+    /// What a new layer holds (0x5978ef; 0x597a88 writes the weights
+    /// again).
+    pub const NEW: Self = Self {
+        start: 0,
+        length: 500,
+        from: F32::from_bits(0x3f80_0000),
+        to: F32::ZERO,
+    };
 }
 
 impl Layer {
@@ -328,6 +364,7 @@ impl Layer {
             fading: false,
             interruptible: -1,
             cursors: vec![0; tracks],
+            fade: Fade::NEW,
         };
         layer.set_speed(F32::from_bits(if reverse {
             0xbf80_0000
@@ -378,8 +415,11 @@ impl Layer {
     /// the part of the phase past a whole number (0x597dca, through the C
     /// runtime's floor, 0x636ac9) when the phase went below 0 or above 1.
     ///
-    /// Fails for what is not ported: a layer fading in or out, and the
-    /// end of a clip that reverses or fades out (end modes 2 and 3).
+    /// A layer that fades its weight takes the fade's next step
+    /// ([`Layer::start_fade`]).
+    ///
+    /// Fails for what is not ported: the end of a clip that reverses or
+    /// fades out (end modes 2 and 3).
     pub fn update(&mut self, now: i32) -> Result<Advance, String> {
         self.previous = self.current;
         self.current = now;
@@ -442,7 +482,7 @@ impl Layer {
             }
         }
         if self.fading {
-            return Err("a layer fading in or out (0x597e3c) is not ported".into());
+            self.fade_step();
         }
         self.event_time = (self.clip_duration.ext() * self.phase.ext())
             .single()
@@ -452,6 +492,48 @@ impl Layer {
         } else {
             Advance::Silent
         })
+    }
+
+    /// Starts a fade of the weight (0x597a3e): from `from` to `to` over
+    /// `length` milliseconds from clock `now`.
+    pub fn start_fade(&mut self, now: i32, length: i32, from: F32, to: F32) {
+        self.fading = true;
+        self.fade = Fade {
+            start: now,
+            length,
+            from,
+            to,
+        };
+    }
+
+    /// One step of the fade (0x597e3c to 0x597e9b), at the layer's clock.
+    /// The share done is the time since the fade started over its length,
+    /// held to 0 to 1. Once the time is past the length the weight is the
+    /// fade's end and the fade is over; until then it is the start plus
+    /// the share of the way to the end. Times are whole milliseconds
+    /// stored as floats; arithmetic is the FPU's under the game's control
+    /// word.
+    fn fade_step(&mut self) {
+        let zero = Ext::ZERO;
+        let one = Ext::from_i32(1);
+        let elapsed = Ext::from_i32(self.current.wrapping_sub(self.fade.start)).single();
+        let length = Ext::from_i32(self.fade.length).single();
+        let mut share = (elapsed / length).single();
+        // Above 1 it is 1; below 0, or not a number, it is 0.
+        if share > one {
+            share = one;
+        } else if share < zero || share.is_nan() {
+            share = zero;
+        }
+        if elapsed > length {
+            self.fading = false;
+            self.weight = self.fade.to;
+        } else {
+            let (from, to) = (self.fade.from.ext(), self.fade.to.ext());
+            self.weight = (((to - from).single() * share).single() + from)
+                .single()
+                .to_f32();
+        }
     }
 
     /// Which events of the clip's motion `track` are due in this update,
@@ -632,6 +714,7 @@ impl Animator {
         self.motion.segment = -1;
         self.motion.near_end = 0;
         self.motion.finishing = 0;
+        self.motion.timer = 0;
         self.posture = -1;
         self.carry_selection = -1;
         self.promote = true;

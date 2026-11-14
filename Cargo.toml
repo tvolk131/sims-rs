@@ -8,6 +8,8 @@ members = [
     "crates/sims-content",
     "crates/sims-core",
     "crates/sims-formats",
+    "crates/sims-people",
+    "crates/sims-render",
     "crates/sims-sim",
     "crates/sims-vm",
 ]

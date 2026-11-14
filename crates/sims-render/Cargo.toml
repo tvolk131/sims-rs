@@ -1,0 +1,20 @@
+[package]
+name = "sims-render"
+description = "Draws a lot from the house file and the game's content: terrain, floors, walls and object sprites."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+sims-content.workspace = true
+sims-formats.workspace = true
+sims-sim.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+
+[lints]
+workspace = true
