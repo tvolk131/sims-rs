@@ -164,7 +164,8 @@ fn run() -> Result<(), String> {
 /// viewer of the house view, standing or walking on the spot.
 fn demonstration(x: f32, clock: i32, walk: Option<(&str, f32, u32)>) -> Animator {
     let mut animator = Animator::new(clock);
-    animator.position = [x, -x, 7.0].map(F32::from_f32);
+    // Direction 3 faces the viewer.
+    animator.position = [x, -x, 3.0].map(F32::from_f32);
     animator.base = true;
     if let Some((clip, duration, frames)) = walk {
         let mut layer = Layer::start(clip, F32::from_f32(duration), frames, true, 0, false, clock);
