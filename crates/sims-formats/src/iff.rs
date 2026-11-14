@@ -1,6 +1,10 @@
 use crate::Result;
 use crate::reader::{Reader, western};
+use std::collections::BTreeMap;
 use std::ops::Range;
+
+/// A chunk flag: the chunk is deleted, free space to be reused.
+pub const DELETED: u16 = 4;
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -19,7 +23,140 @@ impl Chunk {
 #[derive(Debug, Clone)]
 pub struct Iff {
     pub bytes: Vec<u8>,
+    /// Every chunk in file order, deleted and replaced ones included. The
+    /// game's resources are [`Iff::get`], [`Iff::all`] and
+    /// [`Iff::resource_order`].
     pub chunks: Vec<Chunk>,
+    resources: Resources,
+}
+
+/// The resources an IFF file holds, as the original's IFFResFile3 table
+/// keeps them (`legacy/crates/sims-sim/src/object_catalog/iff.rs`, from
+/// 0x41c252 and 0x41be90). A resource's key is its type, its ID and the
+/// high byte of its flags.
+///
+/// - Without a resource map, the live chunks in file order. Deleted chunks
+///   are skipped. A chunk whose key an earlier chunk has replaces it and
+///   takes its place in the order.
+/// - With a version-0 resource map, the map's entries in its order. Of two
+///   entries with one key, the first is kept. A live chunk the map does
+///   not list is not a resource. A map that lists a resource map with ID 0
+///   is ignored, and the chunks are read as if there were none.
+///
+/// **Unverified** against the original: deleted chunks with a live twin,
+/// replaced chunks and maps listing a map. These rules follow the frozen
+/// prototype's reader. The game's own files hold no deleted chunk sharing
+/// a key with a live one, and their only chunks sharing a type and ID are
+/// `BMP_` chunks told apart by the flags' high byte.
+#[derive(Debug, Clone, Default)]
+struct Resources {
+    /// Indices into [`Iff::chunks`] by type, in resource order.
+    order: BTreeMap<[u8; 4], Vec<usize>>,
+    /// Indices into [`Iff::chunks`] by key.
+    by_key: BTreeMap<([u8; 4], u16, u8), usize>,
+    /// Why the resource map could not be used. The table is then the
+    /// chunks read as if there were no map, so lookups still work, but
+    /// [`Iff::resource_order`] fails.
+    map_error: Option<crate::Error>,
+}
+
+impl Resources {
+    /// Adds a resource, or replaces the one with its key where it stands.
+    /// With `first_wins`, a resource whose key is taken is dropped instead.
+    fn add(&mut self, chunks: &[Chunk], index: usize, first_wins: bool) {
+        let chunk = &chunks[index];
+        let key = (chunk.tag, chunk.id, (chunk.flags >> 8) as u8);
+        let order = self.order.entry(chunk.tag).or_default();
+        match self.by_key.insert(key, index) {
+            None => order.push(index),
+            Some(old) if first_wins => {
+                self.by_key.insert(key, old);
+            }
+            Some(old) => {
+                let at = order.iter().position(|&i| i == old).expect("listed");
+                order[at] = index;
+            }
+        }
+    }
+
+    fn physical(chunks: &[Chunk]) -> Self {
+        let mut resources = Self::default();
+        for (index, chunk) in chunks.iter().enumerate() {
+            if chunk.flags & DELETED == 0 {
+                resources.add(chunks, index, false);
+            }
+        }
+        resources
+    }
+
+    /// The table for `bytes`: from its resource map if it has one. A
+    /// resource map is never a resource itself: the open removes its type.
+    fn build(bytes: &[u8], chunks: &[Chunk]) -> Self {
+        let mut resources = Self::with_map(bytes, chunks);
+        resources.order.remove(b"rsmp");
+        resources.by_key.retain(|key, _| key.0 != *b"rsmp");
+        resources
+    }
+
+    fn with_map(bytes: &[u8], chunks: &[Chunk]) -> Self {
+        // Only 2.5 headers carry a map offset, in bytes 60..64. In 2.0
+        // headers those bytes are the end of the signature text
+        // ("...MAXIS 1996\0").
+        let offset = if bytes.starts_with(b"IFF FILE 2.5:") {
+            u32::from_be_bytes(bytes[60..64].try_into().unwrap()) as usize
+        } else {
+            0
+        };
+        if offset == 0 {
+            return Self::physical(chunks);
+        }
+        match Self::mapped(bytes, chunks, offset) {
+            Ok(Some(resources)) => resources,
+            Ok(None) => Self::physical(chunks),
+            Err(error) => Self {
+                map_error: Some(error),
+                ..Self::physical(chunks)
+            },
+        }
+    }
+
+    /// The table from the resource map at `offset`, or None when the map
+    /// lists a map with ID 0.
+    fn mapped(bytes: &[u8], chunks: &[Chunk], offset: usize) -> Result<Option<Self>> {
+        let map = chunks
+            .iter()
+            .find(|c| c.offset == offset && c.tag == *b"rsmp" && c.flags & DELETED == 0)
+            .ok_or_else(|| crate::Error::new(offset, "IFF resource map not found"))?;
+        let map = ResourceMap::parse(&bytes[map.payload.clone()])?;
+        if map
+            .types
+            .get(b"rsmp")
+            .is_some_and(|entries| entries.iter().any(|e| e.id == 0 && e.flags >> 8 == 0))
+        {
+            return Ok(None);
+        }
+        let mut resources = Self::default();
+        for (tag, entries) in &map.types {
+            for entry in entries {
+                let index = chunks
+                    .iter()
+                    .position(|c| {
+                        c.offset == entry.offset as usize
+                            && c.tag == *tag
+                            && c.id == entry.id
+                            && c.flags == entry.flags
+                    })
+                    .ok_or_else(|| {
+                        crate::Error::new(
+                            entry.offset as usize,
+                            "resource map entry disagrees with chunk header",
+                        )
+                    })?;
+                resources.add(chunks, index, true);
+            }
+        }
+        Ok(Some(resources))
+    }
 }
 impl Iff {
     pub fn parse(bytes: Vec<u8>) -> Result<Self> {
@@ -52,62 +189,50 @@ impl Iff {
                 payload: start..r.pos,
             });
         }
-        Ok(Self { bytes, chunks })
+        let resources = Resources::build(&bytes, &chunks);
+        Ok(Self {
+            bytes,
+            chunks,
+            resources,
+        })
     }
     pub fn data(&self, chunk: &Chunk) -> &[u8] {
         &self.bytes[chunk.payload.clone()]
     }
+    /// The resource of type `tag` with ID `id` (and flags whose high byte
+    /// is 0), as the original looks one up (see [`Resources`]).
     pub fn get(&self, tag: &[u8; 4], id: u16) -> Option<&Chunk> {
-        self.chunks.iter().find(|c| &c.tag == tag && c.id == id)
+        self.resources
+            .by_key
+            .get(&(*tag, id, 0))
+            .map(|&i| &self.chunks[i])
     }
+    /// The resources of type `tag` in the original's order. When the
+    /// resource map cannot be used, the chunks as if there were no map.
     pub fn all<'a>(&'a self, tag: &'a [u8; 4]) -> impl Iterator<Item = &'a Chunk> {
-        self.chunks.iter().filter(move |c| &c.tag == tag)
+        self.resources
+            .order
+            .get(tag)
+            .into_iter()
+            .flatten()
+            .map(|&i| &self.chunks[i])
     }
     /// Native IFFResFile3 enumeration. A version-0 resource map supplies its
     /// own per-type order (0x41be90/0x41bbc5); without a map, 0x41c252 appends
     /// live chunks in physical file order. Resource IDs are not sort keys.
-    ///
-    /// Only 2.5 headers carry a map offset, in bytes 60..64. In 2.0 headers
-    /// those bytes are the end of the signature text ("...MAXIS 1996\0").
+    /// Fails when the file names a resource map that cannot be used.
     pub fn resource_order(&self, tag: &[u8; 4]) -> Result<Vec<&Chunk>> {
-        let offset = if self.bytes.starts_with(b"IFF FILE 2.5:") {
-            u32::from_be_bytes(self.bytes[60..64].try_into().unwrap()) as usize
-        } else {
-            0
-        };
-        if offset == 0 {
-            return Ok(self
-                .chunks
-                .iter()
-                .filter(|c| c.tag == *tag && c.flags & 4 == 0)
-                .collect());
+        match &self.resources.map_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(self
+                .resources
+                .order
+                .get(tag)
+                .into_iter()
+                .flatten()
+                .map(|&i| &self.chunks[i])
+                .collect()),
         }
-        let map = self
-            .chunks
-            .iter()
-            .find(|c| c.offset == offset && c.tag == *b"rsmp" && c.flags & 4 == 0)
-            .ok_or_else(|| crate::Error::new(offset, "IFF resource map not found"))?;
-        let map = ResourceMap::parse(self.data(map))?;
-        let mut result = vec![];
-        for entry in map.types.get(tag).into_iter().flatten() {
-            let chunk = self
-                .chunks
-                .iter()
-                .find(|c| {
-                    c.offset == entry.offset as usize
-                        && c.tag == *tag
-                        && c.id == entry.id
-                        && c.flags == entry.flags
-                })
-                .ok_or_else(|| {
-                    crate::Error::new(
-                        entry.offset as usize,
-                        "resource map entry disagrees with chunk header",
-                    )
-                })?;
-            result.push(chunk);
-        }
-        Ok(result)
     }
 }
 
