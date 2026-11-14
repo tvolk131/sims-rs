@@ -1,0 +1,22 @@
+[package]
+name = "sims-people"
+description = "Draws the Sims: skeletons, appearances, meshes, skins, skinning and animation playback. Presentation only; reads simulation state and never changes it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+sims-content.workspace = true
+sims-formats.workspace = true
+sims-core.workspace = true
+sims-sim.workspace = true
+
+
+[dev-dependencies]
+sha2.workspace = true
+
+[lints]
+workspace = true
