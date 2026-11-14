@@ -6,19 +6,47 @@
   guest.py <share> click X Y [hold_seconds]     (left button, coordinates in the game window $SIMS_WINDOW)
   guest.py <share> move X Y
 The guest's /sims-init.sh runs /research/cmd/<n>.sh and writes <n>.out, <n>.done.
+click and move exit with the guest job's exit code; click stops if the pointer cannot be placed.
 """
-import itertools, os, struct, sys, time, zlib, binascii
+import os, re, struct, sys, time, zlib, binascii
 from pathlib import Path
+
+WINDOW = re.compile(r'0x[0-9a-fA-F]{1,8}|[0-9]{1,10}')
+NUMBER = re.compile(r'-?[0-9]{1,6}')
+SECONDS = re.compile(r'[0-9]{1,3}(\.[0-9]{1,3})?')
+
+
+def submit(share, script):
+    """Hand a shell job to the guest and return its number. Safe when several
+    processes submit at once: a number is reserved by creating its .tmp file
+    exclusively, and used only if no job file for it exists yet (a .done left
+    without its .sh would make the guest skip the job)."""
+    cmd = Path(share) / 'cmd'
+    cmd.mkdir(exist_ok=True)
+    n = len(list(cmd.glob('*.sh'))) + 1
+    while True:
+        tmp = cmd / f'{n:05d}.tmp'
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            n += 1
+            continue
+        if any((cmd / f'{n:05d}{suffix}').exists() for suffix in ('.sh', '.started', '.out', '.done')):
+            os.close(fd)
+            tmp.unlink()
+            n += 1
+            continue
+        with os.fdopen(fd, 'w') as f:
+            f.write(script)
+        tmp.rename(cmd / f'{n:05d}.sh')  # only the holder of n.tmp writes n.sh
+        return n
 
 
 def run(share, script, timeout=600):
+    """Run a shell job in the guest; (exit code, output)."""
+    n = submit(share, 'set -u\nexport DISPLAY=:98\n' + script + '\n')
     cmd = Path(share) / 'cmd'
-    cmd.mkdir(exist_ok=True)
-    n = next(i for i in itertools.count(len(list(cmd.glob('*.sh'))) + 1) if not (cmd / f'{i:05d}.sh').exists())
     job = cmd / f'{n:05d}.sh'
-    tmp = cmd / f'{n:05d}.tmp'
-    tmp.write_text('set -u\nexport DISPLAY=:98\n' + script + '\n')
-    tmp.rename(job)
     deadline = time.time() + timeout
     done = cmd / f'{n:05d}.done'
     while not done.exists():
@@ -53,6 +81,12 @@ def xwd_to_png(src, dst):
                           + chunk(b'IDAT', zlib.compress(bytes(scan))) + chunk(b'IEND', b''))
 
 
+def checked(pattern, value, what):
+    if not pattern.fullmatch(value):
+        sys.exit(f'bad {what}: {value!r}')
+    return value
+
+
 def main():
     share, what, *rest = sys.argv[1:]
     if what == 'run':
@@ -61,7 +95,7 @@ def main():
         sys.exit(code)
     if what == 'shot':
         name = f'shot-{time.time():.0f}.xwd'
-        win = os.environ.get('SIMS_WINDOW', '0xe00013')
+        win = checked(WINDOW, os.environ.get('SIMS_WINDOW', '0xe00013'), 'window')
         code, out = run(share, f'xwd -id {win} -silent -out /research/{name}', 300)
         if code:
             sys.exit(out)
@@ -69,17 +103,19 @@ def main():
         os.remove(Path(share) / name)
         print(rest[0])
         return
-    if what == 'move':
-        x, y = rest[:2]
-        win = os.environ.get('SIMS_WINDOW', '0xe00013')
-        print(run(share, f'xdotool mousemove --window {win} {x} {y}', 120)[1])
-        return
-    if what == 'click':
-        x, y = rest[:2]
-        hold = rest[2] if len(rest) > 2 else '3'
-        win = os.environ.get('SIMS_WINDOW', '0xe00013')
-        print(run(share, f'xdotool mousemove --window {win} {x} {y}; sleep 1; xdotool mousedown 1; sleep {hold}; xdotool mouseup 1', 300)[1])
-        return
+    if what in ('move', 'click'):
+        x, y = (checked(NUMBER, v, 'coordinate') for v in rest[:2])
+        win = checked(WINDOW, os.environ.get('SIMS_WINDOW', '0xe00013'), 'window')
+        move = f'xdotool mousemove --window {win} {x} {y}'
+        if what == 'move':
+            code, out = run(share, move, 120)
+        else:
+            hold = checked(SECONDS, rest[2] if len(rest) > 2 else '3', 'hold')
+            # Stop if the pointer cannot be placed; once the button is down, always let it go.
+            code, out = run(share, f'{move} || exit $?\nsleep 1\nxdotool mousedown 1 || exit $?\n'
+                                   f'sleep {hold}\nxdotool mouseup 1', 300)
+        sys.stdout.write(out)
+        sys.exit(code)
     sys.exit(__doc__)
 
 
