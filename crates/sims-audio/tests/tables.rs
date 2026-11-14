@@ -212,3 +212,32 @@ fn fsc_scores_read_the_score_and_its_cells() {
     assert!(Score::parse(b"vers 7\n").is_err());
     assert!(Score::parse(score(&[full, "\t1\t2\tbird.xa"]).as_bytes()).is_err());
 }
+
+#[test]
+fn hit_list_ranges_stop_at_the_entry_cap() {
+    // A hundred ranges of 10,001 IDs are a million entries from 800 bytes.
+    let text = format!("[GlobalHitList]\n1={}\n", "1-10001,".repeat(100));
+    let error = Hot::parse(text.as_bytes()).unwrap_err();
+    assert!(error.to_string().contains("more than 100000"), "{error}");
+    // Spread over several lists, the cap still counts the whole file.
+    let mut text = String::from("[GlobalHitList]\n");
+    for list in 0..10 {
+        text.push_str(&format!("{list}=1-10001\n"));
+    }
+    assert!(Hot::parse(text.as_bytes()).is_err());
+    // Just under it is fine.
+    let text = format!("[GlobalHitList]\n1={}\n", "1-10000,".repeat(10));
+    assert_eq!(
+        Hot::parse(text.as_bytes()).unwrap().hit_lists[&1].len(),
+        100_000
+    );
+}
+
+#[test]
+fn fsc_sizes_that_overflow_are_errors() {
+    let text = "version\t7\n# fields\n1\t1\t1\t1\t4294967296\t4294967296\n# cells\n";
+    let error = Score::parse(text.as_bytes()).unwrap_err();
+    assert!(error.to_string().contains("too large"), "{error}");
+    let text = "version\t7\n# fields\n1\t1\t1\t1\t257\t256\n# cells\n";
+    assert!(Score::parse(text.as_bytes()).is_err());
+}
