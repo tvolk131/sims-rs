@@ -646,14 +646,6 @@ fn what_the_pie_menu_does_not_port_fails_loudly() {
     let mut fx = menu_lot(vec![entry(3, 0)]);
     fx.sim_mut().person.as_mut().unwrap().data[65] = 2;
     unsupported(&mut fx, LAMP, "0x4585b1");
-    // Nothing offered: the objects on the tile are listed instead.
-    let mut fx = menu_lot(vec![with_test(3, 0, 4301)]);
-    fx.add(
-        LAMP_FILE,
-        4301,
-        tree(vec![ins(0, RETURN_FALSE, RETURN_FALSE, [0; 8])]),
-    );
-    unsupported(&mut fx, LAMP, "0x48d423");
     // Another person, while my running interaction may be joined.
     let mut fx = menu_lot(vec![entry(3, 2)]);
     fx.add_sim(7);
@@ -749,4 +741,100 @@ fn an_action_string_while_the_menu_is_listed_fails_loudly_and_temps_come_back() 
         "{fault}"
     );
     assert_eq!(fx.sim().temps[0], 11);
+}
+
+/// A menu lot whose lamp heads tile (2, 2) of level 1, with a second
+/// lamp (object 3) linked from its slot 0. Menu 5's check passes for the
+/// lamp as stack object 3 only, and only while temp 0 is 99; menu 6's
+/// sets temp 0 to 99 and refuses.
+fn tile_lot() -> Fixture {
+    let mut fx = menu_lot(vec![with_test(5, 0, 4302), with_test(6, 0, 4303)]);
+    fx.add(
+        LAMP_FILE,
+        4302,
+        tree(vec![
+            ins(
+                2,
+                1,
+                RETURN_FALSE,
+                expr(scope::TEMPS, 0, op::EQUAL, scope::LITERAL, 99),
+            ),
+            ins(
+                2,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                expr(scope::STACK_DATA, 11, op::EQUAL, scope::LITERAL, 3),
+            ),
+        ]),
+    );
+    fx.add(
+        LAMP_FILE,
+        4303,
+        tree(vec![
+            assign(scope::TEMPS, 0, scope::LITERAL, 99, 1),
+            ins(0, RETURN_FALSE, RETURN_FALSE, [0; 8]),
+        ]),
+    );
+    let mut grid = vec![0; 64 * 64 * 2];
+    grid[(2 * 64 + 2) * 2..][..2].copy_from_slice(&(LAMP as i16).to_le_bytes());
+    fx.world.arrays.insert(
+        3,
+        sims_formats::lot::Array {
+            width: 64,
+            height: 64,
+            stride: 2,
+            encoding: 0,
+            data: grid,
+        },
+    );
+    let lamp = fx.lamp_mut();
+    lamp.position = [40, 40, 1];
+    lamp.data[14] = -1;
+    lamp.data[26] = 0;
+    lamp.slots = vec![sims_formats::saved_objects::Slot {
+        unknown: 0,
+        object: 3,
+    }];
+    let mut other = fx.lamp().clone();
+    other.id = 3;
+    other.data[11] = 3;
+    other.data[14] = 0;
+    other.data[26] = LAMP as i16;
+    other.slots.clear();
+    fx.world.objects.insert(3, other);
+    fx.world.order.push(3);
+    fx.sim_mut().temps[0] = 11;
+    fx
+}
+
+#[test]
+fn a_menu_that_offers_nothing_lists_the_other_objects_on_the_tile() {
+    let mut fx = tile_lot();
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let listed = interpreter
+        .pie_menu(&mut fx.world, SIM, LAMP)
+        .unwrap_or_else(|f| panic!("{f}"));
+    // The lamp offers nothing; object 3's menu 5 passes, because the
+    // lamp's own temps are not yet put back when object 3 is listed.
+    let shown: Vec<_> = listed.iter().map(|a| (a.target, a.table_index)).collect();
+    assert_eq!(shown, [(3, 5)]);
+    // All the temps are put back in the end.
+    assert_eq!(fx.sim().temps[0], 11);
+    // Listed from object 3 directly, it offers nothing: menu 5 sees temp
+    // 0 as 11 and the lamp on its tile is refused too. The menu is empty.
+    let mut fx = tile_lot();
+    let listed = interpreter.pie_menu(&mut fx.world, SIM, 3).unwrap();
+    assert!(listed.is_empty());
+    assert_eq!(fx.sim().temps[0], 11);
+}
+
+#[test]
+fn the_tiles_listing_leaves_out_type_8_and_objects_without_word_91_bit_0() {
+    for (word, value) in [(9, 8), (91, 0x0442)] {
+        let mut fx = tile_lot();
+        fx.words(LAMP_FILE)[word] = value;
+        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        let listed = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap();
+        assert!(listed.is_empty(), "word {word}: {listed:?}");
+    }
 }

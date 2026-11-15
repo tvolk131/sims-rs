@@ -4,6 +4,21 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: A pie menu that offers nothing lists the other objects on the tile
+
+When the listing on an object offers nothing, the original lists each
+other object on that object's tile in turn (0x48d423, walking the tile
+with 0x43f331 and 0x43f379) and adds what they offer. It leaves out an
+object of type 8 and one whose definition word 91 lacks bit 0. Each of
+those listings saves and restores the person's temps itself, and the
+first listing's temps go back last. A menu that still offers nothing
+is an empty menu, not a failure. The tile is the one the object's
+position is on; for an object held in a slot, whether the original's
+object +0xfc names the same tile is **unverified**. On the Goth house
+283 objects now give an empty menu instead of failing, 75 offer
+actions, and 19 fail in check trees on Add/Change Action String,
+Manage Inventory operation 4, and scopes 24 and 12.
+
 ## 2026-11-15: An empty interaction table keeps its version and loads
 
 A TTAB chunk with no entries was read as version 0, which the
