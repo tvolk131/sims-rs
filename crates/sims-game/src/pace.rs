@@ -56,6 +56,11 @@ impl Pace {
         self.speed = speed;
     }
 
+    /// Starts the time owed again.
+    pub fn restart(&mut self) {
+        self.owed = 0;
+    }
+
     /// Pauses, or runs again. Time paused is never owed.
     pub fn toggle_pause(&mut self) {
         self.paused = !self.paused;
