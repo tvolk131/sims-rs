@@ -37,6 +37,7 @@ How the original gives a person's mesh its depth is **unverified**:
 the dumps show where people are not, not their own depth. Reopen it
 with a frame in which a person is partly hidden, comparing the hidden
 pixels with `Depth::point`.
+
 ## 2026-11-15: People join the lot renderer's view through a depth hook
 
 sims-people draws a live lot's people in sims-render's camera rather
