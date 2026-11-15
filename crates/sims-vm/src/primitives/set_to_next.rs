@@ -121,12 +121,12 @@ impl Machine<'_, '_> {
                 // IDs; the next ID is cut to a word.
                 let start = careers
                     .iter()
-                    .position(|&id| id == i32::from(current))
+                    .position(|career| career.id == i32::from(current))
                     .map_or(0, |i| i + 1);
-                let Some(&next) = careers.get(start) else {
+                let Some(next) = careers.get(start) else {
                     return Ok(false);
                 };
-                self.store(destination, next as i16)?;
+                self.store(destination, next.id as i16)?;
                 return Ok(true);
             }
             11 => return Err(missing(mode, "the neighborhood's lot order")),
