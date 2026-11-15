@@ -48,22 +48,21 @@
 //! cleared, and the true branch is taken. It does not touch whether a
 //! clip plays (+0xa0), nor the base layer.
 //!
-//! The carry slot (flag bit 0x10 alone) plays its clip on its own, as
-//! `Machine::animate_carry` describes.
+//! The carry slot (flag bit 0x10 alone) and the base slot (flag bit 0x01
+//! alone) play their clips on their own, as `Machine::animate_carry` and
+//! `Machine::animate_base` describe.
 //!
-//! **Not ported**, failing loudly: the base slot (flag bit 0x01 alone),
-//! names
-//! listed anywhere but the global animation tables and an object's own
-//! (byte 4 other than 3 and 0),
-//! a clip that is missing, the timed events `clip_events.rs` does not
-//! port, and a person whose posture
+//! **Not ported**, failing loudly: names listed anywhere but the global
+//! animation tables and an object's own (byte 4 other than 3 and 0), a
+//! clip that is missing, the timed events `clip_events.rs` does not port,
+//! a clip with timed events in the base slot, and a person whose posture
 //! is 1 or 2 when its clip is done. The original also notes an unexpected
 //! event in its log when logging is on (0x6f2a44); that is not modeled.
 
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine, word};
 use crate::people::read_appearance_if_stale;
-use sims_sim::animator::{Animator, LOADED, Layer};
+use sims_sim::animator::{Animator, Base, LOADED, Layer};
 
 /// Person data words: the posture, and word 19 (person +0x5b2), which
 /// the end of a clip clears with the animator's pickup flag.
@@ -127,9 +126,7 @@ impl Machine<'_, '_> {
         }
         let slot = (flags & 0x01) | if flags & 0x10 != 0 { 2 } else { 0 };
         if slot == 1 {
-            return Err(Trap::Unsupported(
-                "Animate Sim on the base slot (0x58957e), which is not ported".into(),
-            ));
+            return self.animate_base(a, operands, id);
         }
         if slot == 2 {
             return self.animate_carry(a, operands, id);
@@ -389,6 +386,69 @@ impl Machine<'_, '_> {
             a.carry_mode = 6;
         }
         a.carry_selection = -1;
+        Ok(Flow::Branch(true))
+    }
+
+    /// Animate Sim on the base slot (flag 0x01 alone, 0x58957e), the
+    /// carry slot's twin. It never yields and always takes the true branch
+    /// (0x589c4e); the script's events are not followed.
+    ///
+    /// Clip number 0 clears the base slot (virtual function 0x104,
+    /// 0x592878: the base slot's layer is removed at once, even where
+    /// other slots would fade, 0x592890; a removal marks the skin's layers
+    /// changed). Nothing else changes: the posture the base layer was
+    /// started for (+0x198) stays, so the animator's next base update
+    /// (0x590430) starts the posture's clip again.
+    ///
+    /// Any other clip is looked up as for the foreground (virtual function
+    /// 0x12c, 0x5893b3), the animator's clock slowed or not by flag 0x80
+    /// (+0xa8), and the clip started in the base slot (virtual function
+    /// 0x100, 0x592726), backward with flag 0x02: the slot is cleared and
+    /// the layer made at the animator's clock and put in the skin's list.
+    /// Then the layer repeats (+0x40 = 1) at priority -10 (0x59867f, which
+    /// marks the skin's layers changed), as the posture's clip does. The
+    /// carry mode and selection stay as they are, and so do the posture
+    /// noted (+0x198) and whether a clip plays (+0xa0). How the animator's
+    /// base update treats the layer afterwards is told at [`Base`].
+    ///
+    /// The original goes on when the clip is not found (0x592726 then
+    /// fails, and 0x452bed reports it); here a clip that is not found
+    /// fails, as it does for the foreground. A clip with timed events
+    /// fails too (0x5992b3): the skin's update would handle them, at a
+    /// place in the skin's list that is not kept, from a layer whose clock
+    /// is not kept.
+    fn animate_base(
+        &mut self,
+        a: &mut Animator,
+        operands: &[u8; 8],
+        id: i16,
+    ) -> Result<Flow, Trap> {
+        let flags = operands[5];
+        if id == 0 {
+            if a.base.is_filled() {
+                a.base = Base::Empty;
+                a.skin_dirty = true;
+            }
+            return Ok(Flow::Branch(true));
+        }
+        read_appearance_if_stale(self.world, self.program, self.me, &mut a.profile_stale)?;
+        let (name, _, _, _, tracks) = self.clip(operands, id)?;
+        if tracks > 0 {
+            return Err(Trap::Unsupported(format!(
+                "Animate Sim plays clip {name:?} in the base slot, which has timed events the \
+                 skin's update would handle (0x5992b3); the base layer's clock and place in \
+                 the skin are not kept"
+            )));
+        }
+        a.slow = flags & 0x80 != 0;
+        // 0x592726 clears the slot first (0x592878, at once) and puts the
+        // new layer in the skin; either marks the skin's layers changed.
+        a.base = Base::Script {
+            clip: name,
+            reverse: flags & 0x02 != 0,
+            start: a.clock_at(self.world.ticks as i32),
+        };
+        a.skin_dirty = true;
         Ok(Flow::Branch(true))
     }
 
