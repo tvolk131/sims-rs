@@ -4,22 +4,20 @@ use crate::assets::{Assets, Definition};
 use crate::camera::{self, Camera, Walls, Zoom};
 use crate::canvas::{Canvas, Image};
 use crate::depth;
+use crate::grass::{self, Grass};
 use crate::light::Light;
 use crate::lot::{self, Lot, WallCell};
 use sims_sim::World;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Grass colours: the original blends from brown to green in 32 steps by
-/// each tile's grass value, a light and a dark shade (the old prototype's
-/// `legacy/crates/sims-render/src/grass.rs`). The original draws blades
-/// from a seeded pattern; this draws a fixed scatter of the two shades.
-const LIGHT_BROWN: [u8; 3] = [157, 117, 65];
-const LIGHT_GREEN: [u8; 3] = [80, 116, 59];
-const DARK_BROWN: [u8; 3] = [81, 60, 18];
-const DARK_GREEN: [u8; 3] = [14, 53, 8];
+/// Rows between a tile's left corner and the top of its first grass
+/// column (matched against the original's screen).
+const GRASS_ROW: i32 = 0;
+const GRASS_COLUMN: i32 = 1;
 
-/// What the window shows outside the lot.
-pub const BACKGROUND: [u8; 3] = [0, 0, 0];
+/// What the window shows outside the lot: the original's grey (5-6-5
+/// red 14, green 28, blue 14), widened to 8 bits a channel.
+pub const BACKGROUND: [u8; 3] = [115, 113, 115];
 
 /// Counts of what one frame drew, for tests and the viewer's status line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -48,6 +46,7 @@ pub fn draw(
         camera,
         assets,
         canvas,
+        grass: Grass::new(lot, camera),
         stats: Stats::default(),
     };
     for level in 1..=camera.level.clamp(1, 2) {
@@ -107,6 +106,7 @@ struct Painter<'a> {
     camera: &'a Camera,
     assets: &'a mut Assets,
     canvas: &'a mut Canvas,
+    grass: Grass,
     stats: Stats,
 }
 
@@ -165,17 +165,25 @@ impl Painter<'_> {
     }
 
     fn floors(&mut self, level: i32) {
+        // The ground shows wherever a floor leaves it uncovered, such as
+        // half of a split tile. All of it goes first: a grass column can
+        // reach a pixel or two into the next tile, and floors win there.
+        // The original draws no ground on the lot's outermost tiles
+        // (0x49cecc).
+        if level == 1 {
+            let inner = 1..self.lot.size as i32 - 1;
+            for x in inner.clone() {
+                for y in inner.clone() {
+                    self.terrain([x, y]);
+                }
+            }
+        }
         let index = (level - 1) as usize;
         let zoom = self.camera.zoom.index();
         let base = level_elevation(level);
         for x in 0..self.lot.size as i32 {
             for y in 0..self.lot.size as i32 {
                 let cell = Lot::cell(x as usize, y as usize);
-                // The ground shows wherever a floor leaves it uncovered,
-                // such as half of a split tile.
-                if level == 1 {
-                    self.terrain([x, y]);
-                }
                 let floor = self.lot.levels[index].floors[cell];
                 if floor == 0 {
                     continue;
@@ -228,28 +236,53 @@ impl Painter<'_> {
         }
     }
 
-    /// Fills a grass tile as two triangles between its corners.
+    /// Draws a grass tile in the original's four-pixel columns (see
+    /// [`crate::grass`]).
     fn terrain(&mut self, [x, y]: [i32; 2]) {
-        let g = i32::from(self.lot.grass[Lot::cell(x as usize, y as usize)]).clamp(0, 31);
-        let light = lerp(LIGHT_BROWN, LIGHT_GREEN, g);
-        let dark = lerp(DARK_BROWN, DARK_GREEN, g);
-        let points = [[x, y], [x + 1, y], [x + 1, y + 1], [x, y + 1]].map(|c| {
-            let v = self.rotate_corner(c);
-            (
-                self.corner_screen(c, 1),
-                depth::point([v[0] * 16, v[1] * 16], self.corner_elevation(c)),
-            )
-        });
-        let origin = self.camera.origin;
+        let view = self.camera.rotate_tile([x, y]);
+        let Some((shades, colors)) = self.grass.tile(view) else {
+            return;
+        };
+        let rotation = usize::from(self.camera.rotation & 3);
+        let h = self.lot.heights[Lot::cell(x as usize, y as usize)];
+        let heights: [u8; 4] = std::array::from_fn(|n| h[(n + 4 - rotation) & 3]);
+        // The left corner, at height 0; columns start a row above it.
+        let corner = self.camera.project([view[0], view[1] + 1], 1, 0);
+        let zoom = self.camera.zoom.level();
+        let width = 16 << zoom;
+        // Skip a tile wholly off the canvas, even on the highest ground.
+        let reach = width + (255 << (zoom + 1));
+        let size = [self.canvas.width, self.canvas.height].map(|n| n as i32);
+        if (0..2).any(|i| corner[i] < -reach || corner[i] > size[i].saturating_add(reach)) {
+            return;
+        }
         let lit = self.light(0, [x * 16 + 8, y * 16 + 8]);
-        for [a, b, c] in [[0, 1, 2], [0, 2, 3]] {
-            fill_triangle(self.canvas, points[a], points[b], points[c], |x, y| {
-                lit.apply(if speckle(x - origin[0], y - origin[1]) {
-                    dark
-                } else {
-                    light
-                })
-            });
+        // The whole tile takes the depth of its lowest corner. Following
+        // the slope would be truer, but floors take their top corner's
+        // elevation, and where sloped ground meets a floor the grass would
+        // then cover the floor's edge, which the original does not.
+        let elevation = (0..4)
+            .map(|c| self.corner_elevation([x + (c & 1), y + (c >> 1)]))
+            .min()
+            .unwrap_or(0);
+        let camera = self.camera;
+        let left = corner[0] + GRASS_COLUMN;
+        for column in grass::columns(left, corner[1] + GRASS_ROW, heights, shades, colors, zoom) {
+            for (row, pixels) in column.rows() {
+                let depth = depth::ground(camera, row, elevation);
+                for (i, &p) in pixels.iter().enumerate() {
+                    self.canvas
+                        .plot(column.x + i as i32, row, depth, lit.apply(grass::widen(p)));
+                }
+            }
+            let index = ((column.x - left) / 4) as usize;
+            for (bx, foot, height, p) in self.grass.blades(view, &column, index) {
+                let depth = depth::ground(camera, foot, elevation);
+                let color = lit.apply(grass::widen(p));
+                for row in foot.saturating_sub(height - 1)..=foot {
+                    self.canvas.plot(bx, row, depth, color);
+                }
+            }
         }
     }
 
@@ -648,57 +681,6 @@ fn unrotate_local(camera: &Camera, [x, y]: [i32; 2]) -> [i32; 2] {
     }
 }
 
-fn lerp(a: [u8; 3], b: [u8; 3], t: i32) -> [u8; 3] {
-    std::array::from_fn(|i| (i32::from(a[i]) + (i32::from(b[i]) - i32::from(a[i])) * t / 31) as u8)
-}
-
-/// A fixed scatter of dark grass pixels, about one in four, tied to the
-/// lot so it moves with it.
-fn speckle(x: i32, y: i32) -> bool {
-    let mut n = (x as u32).wrapping_mul(0x9E37_79B1) ^ (y as u32).wrapping_mul(0x85EB_CA77);
-    n ^= n >> 15;
-    n = n.wrapping_mul(0x2C1B_3C6D);
-    n ^= n >> 12;
-    n & 3 == 0
-}
-
-/// Fills a triangle, interpolating depth, with a colour per pixel. Pixels
-/// on an edge two triangles share are filled by both; the depth test keeps
-/// that harmless.
-fn fill_triangle(
-    canvas: &mut Canvas,
-    (a, da): ([i32; 2], i32),
-    (b, db): ([i32; 2], i32),
-    (c, dc): ([i32; 2], i32),
-    color: impl Fn(i32, i32) -> [u8; 3],
-) {
-    let area = i64::from((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]));
-    if area == 0 {
-        return;
-    }
-    let x0 = a[0].min(b[0]).min(c[0]).max(0);
-    let x1 = a[0].max(b[0]).max(c[0]).min(canvas.width as i32 - 1);
-    let y0 = a[1].min(b[1]).min(c[1]).max(0);
-    let y1 = a[1].max(b[1]).max(c[1]).min(canvas.height as i32 - 1);
-    let side = |p: [i32; 2], q: [i32; 2], x: i32, y: i32| {
-        i64::from((q[0] - p[0]) * (y - p[1]) - (q[1] - p[1]) * (x - p[0]))
-    };
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            let w = [side(b, c, x, y), side(c, a, x, y), side(a, b, x, y)];
-            let inside = if area > 0 {
-                w.iter().all(|&w| w >= 0)
-            } else {
-                w.iter().all(|&w| w <= 0)
-            };
-            if inside {
-                let d = (w[0] * i64::from(da) + w[1] * i64::from(db) + w[2] * i64::from(dc)) / area;
-                canvas.plot(x, y, d as i32, color(x, y));
-            }
-        }
-    }
-}
-
 /// Whether a dynamic sprite shows: an object keeps one word per dynamic
 /// sprite, counted from its definition's first dynamic sprite ID, and a
 /// sprite outside that range always shows (the original's 0x437f99, read
@@ -840,20 +822,5 @@ mod tests {
                 assert!(opaque(&a) > 127 * 16 && opaque(&b) > 127 * 16);
             }
         }
-    }
-
-    #[test]
-    fn triangles_fill_inside_with_interpolated_depth() {
-        let mut canvas = Canvas::new(10, 10, [0, 0, 0]);
-        fill_triangle(
-            &mut canvas,
-            ([0, 0], 0),
-            ([9, 0], 90),
-            ([0, 9], 0),
-            |_, _| [1, 1, 1],
-        );
-        assert_eq!(canvas.color[0], [1, 1, 1]);
-        assert_eq!(canvas.depth[5], 50);
-        assert_eq!(canvas.color[99], [0, 0, 0]);
     }
 }

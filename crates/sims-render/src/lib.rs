@@ -13,6 +13,7 @@ pub mod assets;
 pub mod camera;
 pub mod canvas;
 pub mod depth;
+pub mod grass;
 pub mod light;
 pub mod lot;
 pub mod open;

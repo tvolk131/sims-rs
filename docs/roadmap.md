@@ -1498,8 +1498,12 @@ Progress:
   compared camera, exact non-grass matches rose from 34% to 42% (cutaway)
   and from 40% to 47% (walls up). Lamp pools and light levels other than
   the half-light floor are unverified.
-- Next: the original's grass, the cut-wall cap, which rooms the cutaway
-  cuts, and two more cameras, each checked against the original.
+- Done: the original's grass, shading and blades read from its code;
+  open grass matches the original pixel for pixel at the compared
+  camera, and exact matches over the whole screen rose from 18% to 84%
+  (walls up). Other zooms and rotations are unverified.
+- Next: the cut-wall cap, which rooms the cutaway cuts, and two more
+  cameras, each checked against the original.
 
 ## Track: sound (`crates/sims-audio`)
 

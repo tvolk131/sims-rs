@@ -12,30 +12,30 @@ use std::path::PathBuf;
 /// SHA-256 prefixes of the 16-bit-color images, by zoom, rotation and wall
 /// mode.
 const DIGESTS: &[(u32, u8, &str, &str)] = &[
-    (1, 0, "up", "3a6a3cfce2739636"),
-    (1, 0, "cutaway", "fdf3f67bbe2244a3"),
-    (1, 1, "up", "b728247b0dfd6395"),
-    (1, 1, "cutaway", "b6f1d3dc3ca55bf0"),
-    (1, 2, "up", "4bc004f0090e6e6f"),
-    (1, 2, "cutaway", "16d1f0e323df8326"),
-    (1, 3, "up", "bbea6b34b10baee5"),
-    (1, 3, "cutaway", "a48edc4061bbe183"),
-    (2, 0, "up", "82042a233516e5ae"),
-    (2, 0, "cutaway", "511f4caaff6e0a1e"),
-    (2, 1, "up", "c16263bfe21b452f"),
-    (2, 1, "cutaway", "011a83b7ecca5dff"),
-    (2, 2, "up", "26d119e8ad484883"),
-    (2, 2, "cutaway", "b7de14db63e3cdcb"),
-    (2, 3, "up", "76b46ee7ab728f05"),
-    (2, 3, "cutaway", "09c7e73f38cf4bf7"),
-    (3, 0, "up", "64657df6585f54db"),
-    (3, 0, "cutaway", "309650467603989b"),
-    (3, 1, "up", "0f78c7c527e4f1e1"),
-    (3, 1, "cutaway", "23415eb9a68707d1"),
-    (3, 2, "up", "705ebabefdc8c327"),
-    (3, 2, "cutaway", "74a3f68983e814d2"),
-    (3, 3, "up", "cd26782769c9a9b4"),
-    (3, 3, "cutaway", "74e1b97cbc263bb2"),
+    (1, 0, "up", "d48d3a69fd383377"),
+    (1, 0, "cutaway", "8f98c8eeeeceec58"),
+    (1, 1, "up", "e36969d769c16d34"),
+    (1, 1, "cutaway", "4f6f1efa7c9e545d"),
+    (1, 2, "up", "f23cc6603a376c9c"),
+    (1, 2, "cutaway", "dbf59f31e00aca5d"),
+    (1, 3, "up", "36b4f09f4f99b055"),
+    (1, 3, "cutaway", "0ff19815d9afbe0e"),
+    (2, 0, "up", "3c29c97799a9c138"),
+    (2, 0, "cutaway", "bbba05ed409f82c9"),
+    (2, 1, "up", "91376466a563ef56"),
+    (2, 1, "cutaway", "fe9be6e4a3bc0e33"),
+    (2, 2, "up", "1e38c589c59a45c2"),
+    (2, 2, "cutaway", "41c2cb25c070d04a"),
+    (2, 3, "up", "983eec1e9e8f8428"),
+    (2, 3, "cutaway", "e47b84e58e9c54cc"),
+    (3, 0, "up", "737d2bd955a5a6a6"),
+    (3, 0, "cutaway", "e498cb0f7788a172"),
+    (3, 1, "up", "a4aef4fbf390b2c3"),
+    (3, 1, "cutaway", "5b6808251a09fba6"),
+    (3, 2, "up", "48e2c6ae88a10133"),
+    (3, 2, "cutaway", "cc33ce60a0641dbd"),
+    (3, 3, "up", "e2ba3e02f260fe4d"),
+    (3, 3, "cutaway", "ef99a0cace3a3714"),
 ];
 
 fn install() -> Option<PathBuf> {
@@ -55,6 +55,9 @@ fn goth_house_renders_the_same_at_every_zoom_and_rotation() {
     };
     let house = root.join("UserData/Houses/House05.iff");
     let mut opened = open_house(&root, &house).unwrap();
+    // The house asks for a lot 52 tiles on a side; the grass's random
+    // streams depend on it.
+    assert_eq!(opened.world.size, 52);
     let lot = Lot::from_world(&opened.world).unwrap();
     let before = opened.world.hash();
     let mut found = Vec::new();
