@@ -1,8 +1,8 @@
 //! The HIT player on hand-built modules and samples.
 
-use sims_audio::levels;
 use sims_audio::module::Module;
-use sims_audio::player::{BLOCK, NoSources, Player, RATE, Sources};
+use sims_audio::placement::Projection;
+use sims_audio::player::{BLOCK, MIDDLE, NoSources, Player, RATE, Sources};
 use sims_audio::sources::Snapshot;
 use sims_audio::{Pcm, SoundEvent};
 use std::collections::BTreeMap;
@@ -86,10 +86,13 @@ fn samples() -> BTreeMap<String, Pcm> {
 }
 
 fn play(player: &mut Player<BTreeMap<String, Pcm>>, name: &str) {
-    player.handle(&SoundEvent::Play {
-        object: 9,
-        name: name.into(),
-    });
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: name.into(),
+        },
+        &NoSources,
+    );
 }
 
 #[test]
@@ -197,7 +200,7 @@ fn waits_count_milliseconds_and_loops_wait_a_block() {
         "the loop waited again: {second}"
     );
     assert!(!player.is_idle());
-    player.handle(&SoundEvent::StopObject { object: 9 });
+    player.handle(&SoundEvent::StopObject { object: 9 }, &NoSources);
     assert!(player.is_idle());
 }
 
@@ -238,6 +241,14 @@ impl Sources for Gender {
     fn field(&self, source: i32, field: i32) -> Option<i32> {
         assert_eq!((source, field), (9, 3));
         Some(self.0)
+    }
+
+    fn position(&self, _: i32) -> Option<[i32; 3]> {
+        Some([1, 1, 1])
+    }
+
+    fn projection(&self, _: i32) -> Option<Projection> {
+        Some(MIDDLE)
     }
 }
 
@@ -283,6 +294,8 @@ fn a_refused_field_leaves_the_register_and_is_a_fault() {
     };
     let mut snapshot = Snapshot::default();
     snapshot.objects.insert(9, [5; sims_audio::sources::FIELDS]);
+    snapshot.positions.insert(9, [1, 1, 1]);
+    snapshot.screen.insert(9, MIDDLE);
     for (field, plays, faults) in [(21, true, 1), (20, false, 0)] {
         let code = routine(field);
         let mut player = Player::new(vec![module(&[&code, &[END]], 1)], samples(), 1);
@@ -324,12 +337,12 @@ fn a_pause_holds_a_playing_note_where_it_is() {
         player.render(40, &NoSources),
         (1..=40).collect::<Vec<i16>>()
     );
-    player.handle(&SoundEvent::Pause);
+    player.handle(&SoundEvent::Pause, &NoSources);
     assert!(player.is_paused());
     // Held: silent, and the thread waits, however long.
     assert!(player.render(3 * BLOCK, &NoSources).iter().all(|&s| s == 0));
     assert!(!player.is_idle());
-    player.handle(&SoundEvent::Unpause);
+    player.handle(&SoundEvent::Unpause, &NoSources);
     assert!(!player.is_paused());
     // It goes on from where it was.
     assert_eq!(
@@ -358,11 +371,11 @@ fn an_unpause_ends_a_wait_held_by_the_pause() {
     let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
     play(&mut player, "e0");
     assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
-    player.handle(&SoundEvent::Pause);
+    player.handle(&SoundEvent::Pause, &NoSources);
     assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
     // Letting the track go moves its deadline to now (0x57dc8e): the
     // thread runs at the next block, long before its second is up.
-    player.handle(&SoundEvent::Unpause);
+    player.handle(&SoundEvent::Unpause, &NoSources);
     assert_eq!(
         player.render(10, &NoSources),
         (1..=10).collect::<Vec<i16>>()
@@ -376,7 +389,7 @@ fn an_unpause_without_a_pause_ends_every_wait() {
     let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
     play(&mut player, "e0");
     assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
-    player.handle(&SoundEvent::Unpause);
+    player.handle(&SoundEvent::Unpause, &NoSources);
     assert_eq!(
         player.render(10, &NoSources),
         (1..=10).collect::<Vec<i16>>()
@@ -396,7 +409,7 @@ fn a_pause_spares_the_interface_and_lets_new_sounds_play() {
     play(&mut player, "e1");
     let both: Vec<i16> = (1..=10).map(|v| 2 * v).collect();
     assert_eq!(player.render(10, &NoSources), both);
-    player.handle(&SoundEvent::Pause);
+    player.handle(&SoundEvent::Pause, &NoSources);
     assert_eq!(
         player.render(10, &NoSources),
         (11..=20).collect::<Vec<i16>>()
@@ -414,7 +427,7 @@ fn a_pause_spares_the_interface_and_lets_new_sounds_play() {
         })
         .collect();
     assert_eq!(out, resumed);
-    player.handle(&SoundEvent::Unpause);
+    player.handle(&SoundEvent::Unpause, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
@@ -426,6 +439,14 @@ impl Sources for Asked {
     fn field(&self, source: i32, field: i32) -> Option<i32> {
         self.0.borrow_mut().push((source, field));
         Some(0)
+    }
+
+    fn position(&self, _: i32) -> Option<[i32; 3]> {
+        Some([1, 1, 1])
+    }
+
+    fn projection(&self, _: i32) -> Option<Projection> {
+        Some(MIDDLE)
     }
 }
 
@@ -446,7 +467,7 @@ fn starting_a_held_track_gives_its_script_the_new_arguments_and_ends_its_wait() 
     let asked = Asked::default();
     play(&mut player, "e0");
     player.render(BLOCK, &asked);
-    player.handle(&SoundEvent::Pause);
+    player.handle(&SoundEvent::Pause, &NoSources);
     // Started again for object 4 while held: the same script goes on,
     // with arguments 4, 0 and 0 (0x57d9cb to 0x57d9eb), at the next
     // block, its second's wait cut short (0x57dc8e).
@@ -465,7 +486,7 @@ fn starting_a_held_track_needs_no_free_thread() {
         play(&mut player, "e1");
     }
     player.render(BLOCK, &NoSources);
-    player.handle(&SoundEvent::Pause);
+    player.handle(&SoundEvent::Pause, &NoSources);
     // Every thread is taken, but the held e0 is let go, not started.
     play(&mut player, "e0");
     assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -485,7 +506,7 @@ fn a_held_track_with_no_script_left_starts_anew() {
         player.render(10, &NoSources),
         (1..=10).collect::<Vec<i16>>()
     );
-    player.handle(&SoundEvent::Pause);
+    player.handle(&SoundEvent::Pause, &NoSources);
     assert!(player.render(10, &NoSources).iter().all(|&s| s == 0));
     // Starting it clears the hold, so the old note goes on at once, and
     // a new thread starts a second note at the next block (frame 64).
@@ -533,7 +554,7 @@ fn unknown_events_and_bad_code_are_faults_not_panics() {
     assert!(player.faults[2].contains("unknown opcode 26"));
     assert!(player.faults[3].contains("ran too long"));
     assert!(player.is_idle());
-    player.handle(&SoundEvent::StopAll);
+    player.handle(&SoundEvent::StopAll, &NoSources);
 }
 
 const LOADB_V1: u8 = 4;
@@ -551,7 +572,7 @@ fn a_track_that_restarts_itself_runs_once_per_block() {
     assert_eq!(player.render(20 * BLOCK, &NoSources).len(), 20 * BLOCK);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     assert!(!player.is_idle());
-    player.handle(&SoundEvent::StopAll);
+    player.handle(&SoundEvent::StopAll, &NoSources);
     assert!(player.is_idle());
 }
 
@@ -672,14 +693,14 @@ fn seqgroup_return_ends_its_thread_when_another_holds_the_group() {
     play(&mut player, "e0");
     let out = player.render_until_idle(10 * BLOCK, &NoSources);
     assert!(out.iter().all(|&s| s == 0));
-    player.handle(&SoundEvent::StopAll);
+    player.handle(&SoundEvent::StopAll, &NoSources);
     play(&mut player, "e0");
     let out = player.render_until_idle(10 * BLOCK, &NoSources);
     // From the next block.
     assert_eq!(&out[BLOCK..BLOCK + 100], &(1..=100).collect::<Vec<i16>>());
     // Two threads of one track do not end each other: a group holds a
     // track number. Both play.
-    player.handle(&SoundEvent::StopAll);
+    player.handle(&SoundEvent::StopAll, &NoSources);
     play(&mut player, "e1");
     play(&mut player, "e1");
     let out = player.render_until_idle(10 * BLOCK, &NoSources);
@@ -715,8 +736,8 @@ fn seqgroup_kill_stops_a_holder_whose_extvol_is_0_at_once() {
 
 #[test]
 fn seqgroup_kill_fades_out_the_holder_then_runs_on() {
-    // e0 claims group 1, waits until its extvol (19) reaches fade_dest
-    // (1, register 8 here), then plays patch 1.
+    // e0 claims group 1, waits until its extvol (19) is 1 (register 8
+    // here), then plays patch 1.
     let mut holder = loadb(5, 1).to_vec();
     holder.extend([SEQGROUP_RETURN, 5]);
     holder.extend(loadb(8, 1));
@@ -732,16 +753,14 @@ fn seqgroup_kill_fades_out_the_holder_then_runs_on() {
     let out = player.render_until_idle(20 * BLOCK, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     // e1 waits 2 ms, so it plays from the second block. e0's extvol falls
-    // by 200 a block from 1024, reaching 1 in the seventh block; then its
-    // note plays at extvol 1 of 1024: -39.97 dB, about a hundredth.
+    // by 200 a block from 1024 to fade_dest, which starts at 0, passing
+    // over 1. e1's second try (0x57eef3) finds the group its own and runs
+    // on, so nothing ends e0: it stays, silent, waiting for an extvol it
+    // has passed.
     assert!(out[..BLOCK].iter().all(|&s| s == 0));
     assert_eq!(&out[BLOCK..BLOCK + 3], [2000, 4000, -2000]);
-    assert!(out[BLOCK + 3..6 * BLOCK].iter().all(|&s| s == 0));
-    let gain = i64::from(levels::gain(levels::attenuation(1, 1024)));
-    assert_eq!(levels::attenuation(1, 1024), -3997);
-    let faint: Vec<i16> = (1..=100).map(|s| ((s * gain) >> 16) as i16).collect();
-    assert_eq!(&out[6 * BLOCK..6 * BLOCK + 100], &faint);
-    assert!(player.is_idle());
+    assert!(out[BLOCK + 3..].iter().all(|&s| s == 0));
+    assert!(!player.is_idle());
 }
 
 #[test]
@@ -752,12 +771,12 @@ fn the_first_module_defining_an_event_wins_and_play_from_picks_one() {
     let mut player = Player::new(vec![first, second], samples(), 1);
     play(&mut player, "e0");
     assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
-    player.handle(&SoundEvent::StopAll);
-    player.play_from(1, 9, "e0");
+    player.handle(&SoundEvent::StopAll, &NoSources);
+    player.play_from(1, 9, "e0", &NoSources);
     player.render(BLOCK - 3, &NoSources);
     assert_eq!(player.render(3, &NoSources), [2000, 4000, -2000]);
-    player.handle(&SoundEvent::StopAll);
-    player.play_from(2, 9, "e0");
+    player.handle(&SoundEvent::StopAll, &NoSources);
+    player.play_from(2, 9, "e0", &NoSources);
     assert_eq!(player.faults, ["no event e0"]);
 }
 
@@ -903,15 +922,18 @@ fn main_duckpri_halves_tracks_below_it_until_its_thread_ends() {
     let mut ducker = loadl(123, 30);
     ducker.extend([SET_LOOP, LOOP]);
     let mut player = Player::new(vec![module(&[&ducker, &GENERIC], 1)], loud(4), 1);
-    player.handle(&SoundEvent::Play {
-        object: 1,
-        name: "e0".into(),
-    });
+    player.handle(
+        &SoundEvent::Play {
+            object: 1,
+            name: "e0".into(),
+        },
+        &NoSources,
+    );
     play(&mut player, "e1");
     assert_eq!(player.render(2, &NoSources), [999, 999]);
     player.render(BLOCK - 2, &NoSources);
     // When the ducking thread stops, its request goes with it.
-    player.handle(&SoundEvent::StopObject { object: 1 });
+    player.handle(&SoundEvent::StopObject { object: 1 }, &NoSources);
     play(&mut player, "e1");
     assert_eq!(player.render(2, &NoSources), [10_000, 10_000]);
 }
@@ -1025,10 +1047,13 @@ fn too_many_frames_at_once_is_a_fault_not_a_panic() {
 const LOOPING: [u8; 4] = [2, 5, WAIT_SAMP, LOOP];
 
 fn play_for(player: &mut Player<BTreeMap<String, Pcm>>, object: u32, name: &str) {
-    player.handle(&SoundEvent::Play {
-        object,
-        name: name.into(),
-    });
+    player.handle(
+        &SoundEvent::Play {
+            object,
+            name: name.into(),
+        },
+        &NoSources,
+    );
 }
 
 #[test]
@@ -1092,13 +1117,13 @@ fn an_object_that_goes_fades_out_its_instances() {
     play_for(&mut player, 1, "e0");
     play_for(&mut player, 2, "e0");
     player.render(BLOCK, &NoSources);
-    player.handle(&SoundEvent::StopObject { object: 1 });
+    player.handle(&SoundEvent::StopObject { object: 1 }, &NoSources);
     let first = player.render(BLOCK, &NoSources);
     assert!(first[0] > 10_000 && first[0] < 20_000, "{}", first[0]);
     player.render(11 * BLOCK, &NoSources);
     assert_eq!(player.render(1, &NoSources), [10_000]);
     // The last object going takes the track with it.
-    player.handle(&SoundEvent::StopObject { object: 2 });
+    player.handle(&SoundEvent::StopObject { object: 2 }, &NoSources);
     player.render(12 * BLOCK, &NoSources);
     assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -1112,7 +1137,7 @@ fn an_object_that_goes_ends_its_silent_threads_at_once() {
     let mut player = Player::new(vec![module], samples(), 1);
     play_for(&mut player, 1, "e0");
     player.render(BLOCK, &NoSources);
-    player.handle(&SoundEvent::StopObject { object: 1 });
+    player.handle(&SoundEvent::StopObject { object: 1 }, &NoSources);
     assert!(player.is_idle());
 }
 
@@ -1137,7 +1162,7 @@ fn turning_on_a_tv_lets_go_of_what_it_had_playing() {
     player.render(12 * BLOCK, &NoSources);
     assert_eq!(player.render(1, &NoSources), [10_000]);
     // Object 3 going ends track 11 too.
-    player.handle(&SoundEvent::StopObject { object: 3 });
+    player.handle(&SoundEvent::StopObject { object: 3 }, &NoSources);
     player.render(12 * BLOCK, &NoSources);
     assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -1195,7 +1220,7 @@ fn radio_next_song_stops_each_station_s_note() {
 
 #[test]
 fn kill_all_and_kill_object_sounds_events() {
-    let events = "all=20,0\nobjects=105,0\n";
+    let events = "all=20,0\nobjects=105,0\non=30,10\n";
     let module = module_with(&[&LOOPING], 1, 10, events);
     let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
     play_for(&mut player, 1, "e0");
@@ -1210,10 +1235,13 @@ fn kill_all_and_kill_object_sounds_events() {
     play(&mut player, "objects");
     player.render(12 * BLOCK, &NoSources);
     assert!(player.is_idle());
-    // An object of 0 records no instance: its track plays on.
+    // Kind 1 starts nothing for an object of 0 (0x57375b). Kind 30
+    // records it, but kind 105 leaves it: its track plays on.
     let module = module_with(&[&LOOPING], 1, 10, events);
     let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
     play_for(&mut player, 0, "e0");
+    assert!(player.is_idle());
+    play_for(&mut player, 0, "on");
     player.render(BLOCK, &NoSources);
     play(&mut player, "objects");
     player.render(12 * BLOCK, &NoSources);
@@ -1481,9 +1509,9 @@ fn an_object_that_goes_stops_notes_its_ended_threads_left() {
     play_for(&mut player, 2, "e0");
     player.render(BLOCK, &NoSources);
     assert_eq!(player.render(1, &NoSources), [20_000]);
-    player.handle(&SoundEvent::StopObject { object: 1 });
+    player.handle(&SoundEvent::StopObject { object: 1 }, &NoSources);
     assert_eq!(player.render(1, &NoSources), [10_000]);
-    player.handle(&SoundEvent::StopObject { object: 2 });
+    player.handle(&SoundEvent::StopObject { object: 2 }, &NoSources);
     assert!(player.is_idle());
 }
 
@@ -1545,12 +1573,189 @@ fn a_television_turned_on_during_a_pause_waits_for_the_unpause() {
     let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
     let module = module_with(&[generic], 1, 10, "on=30,10,3\n");
     let mut player = Player::new(vec![module], samples(), 1);
-    player.handle(&SoundEvent::Pause);
+    player.handle(&SoundEvent::Pause, &NoSources);
     play(&mut player, "on");
     assert!(player.render(2 * BLOCK, &NoSources).iter().all(|&s| s == 0));
-    player.handle(&SoundEvent::Unpause);
+    player.handle(&SoundEvent::Unpause, &NoSources);
     let out = player.render(2 * BLOCK, &NoSources);
     let first = out.iter().position(|&s| s != 0).expect("the note plays");
     assert_eq!(&out[first..first + 5], [1, 2, 3, 4, 5]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+/// A snapshot with these objects on the lot, each on the screen at
+/// `x` across an 800 by 600 screen, halfway down, at the near zoom.
+fn on_lot(objects: &[(i32, i32)]) -> Snapshot {
+    let mut snapshot = Snapshot::default();
+    for &(object, x) in objects {
+        snapshot.positions.insert(object, [40, 56, 1]);
+        snapshot.screen.insert(
+            object,
+            Projection {
+                at: [x, 300],
+                ..MIDDLE
+            },
+        );
+    }
+    snapshot
+}
+
+fn play_on(player: &mut Player<BTreeMap<String, Pcm>>, object: u32, lot: &Snapshot) {
+    player.handle(
+        &SoundEvent::Play {
+            object,
+            name: "e0".into(),
+        },
+        lot,
+    );
+}
+
+#[test]
+fn a_sound_is_panned_toward_where_its_object_is_on_the_screen() {
+    // At the right edge the pan is 542 and the volume 750 (0x5730b6);
+    // in the middle, 512 and full. An object not on the lot leaves the
+    // sum's start, a heap address for the volume, which outweighs the
+    // pan's 0 to the centre.
+    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
+    for (lot, right) in [
+        (on_lot(&[(9, 800)]), true),
+        (on_lot(&[(9, 400)]), false),
+        (on_lot(&[]), false),
+    ] {
+        let mut player = Player::new(vec![module(&[generic], 1)], samples(), 1);
+        play_on(&mut player, 9, &lot);
+        let out = player.render_stereo(100, &lot);
+        let [left, right_side] = [out[198], out[199]];
+        assert!(left != 0, "{out:?}");
+        assert_eq!(right_side > left, right, "{left} {right_side}");
+        assert!(right || right_side == left, "{left} {right_side}");
+        assert!(player.faults.is_empty(), "{:?}", player.faults);
+    }
+}
+
+/// A lot that also notes each field asked, as (object, field).
+struct Probe {
+    lot: Snapshot,
+    asked: std::cell::RefCell<Vec<(i32, i32)>>,
+}
+
+impl Sources for Probe {
+    fn field(&self, source: i32, field: i32) -> Option<i32> {
+        self.asked.borrow_mut().push((source, field));
+        Some(0)
+    }
+
+    fn position(&self, object: i32) -> Option<[i32; 3]> {
+        self.lot.position(object)
+    }
+
+    fn projection(&self, object: i32) -> Option<Projection> {
+        self.lot.projection(object)
+    }
+}
+
+#[test]
+fn a_track_s_objects_go_first_recorded_then_newest_first() {
+    // Object 5 is in the middle of the screen and 4 is not on the lot,
+    // so 4 takes the values of the object before it (0x57473b), or the
+    // sum's stale start (a heap address for the volume) when it is
+    // first. The script asks for the field its extvol names.
+    let generic: &[u8] = &[72, 6, 1, 19, END]; // getsrcdatafield v2, arg1, extvol
+    let stale = sims_audio::placement::STALE_VOL;
+    for (order, extvol) in [([5, 4], 1024), ([4, 5], stale)] {
+        let probe = Probe {
+            lot: on_lot(&[(5, 400)]),
+            asked: Default::default(),
+        };
+        let mut player = Player::new(vec![module(&[generic], 1)], samples(), 1);
+        for object in order {
+            player.handle(
+                &SoundEvent::Play {
+                    object,
+                    name: "e0".into(),
+                },
+                &probe,
+            );
+        }
+        player.render(BLOCK, &probe);
+        // The second start's objects go first recorded, then the new
+        // one (0x5761c2).
+        let second = i32::from(order[1] as u8);
+        assert!(
+            probe.asked.borrow().contains(&(second, extvol)),
+            "{:?}",
+            probe.asked.borrow()
+        );
+    }
+    // Recorded 5 (at the right edge: 750 at 542), 6 (in the middle) and
+    // 4 (not on the lot), they go 5, 4, 6, and 4 takes 5's values: the
+    // pan is 512 + 2 * 30 * 750 / 2524. In the order recorded, 4 would
+    // take 6's, and the pan be 520.
+    let generic: &[u8] = &[72, 6, 1, 20, END]; // getsrcdatafield v2, arg1, pan
+    let probe = Probe {
+        lot: on_lot(&[(5, 800), (6, 400)]),
+        asked: Default::default(),
+    };
+    let mut player = Player::new(vec![module(&[generic], 1)], samples(), 1);
+    for object in [5, 6, 4] {
+        player.handle(
+            &SoundEvent::Play {
+                object,
+                name: "e0".into(),
+            },
+            &probe,
+        );
+    }
+    player.render(BLOCK, &probe);
+    assert!(
+        probe.asked.borrow().contains(&(4, 529)),
+        "{:?}",
+        probe.asked.borrow()
+    );
+}
+
+#[test]
+fn the_placement_s_pan_sets_the_comparison_flags_when_the_event_comes() {
+    // The script sets Spl to 10001 (whose volume never falls below 800)
+    // and waits a second; the pause holds it. Started again, it is
+    // placed with that Spl when the event comes (0x573795 to 0x5737a4):
+    // far off the left of the screen, the pan is 0 and the flags with
+    // it, and the script's `ifle` goes to the silent routine 0x101; in
+    // the middle, the pan is 512 and the script asks about its object. A
+    // kind 53 after it writes the patch, and the flags are that.
+    let mut branches = vec![LOADL, 57];
+    branches.extend(long(10_001));
+    branches.extend([LOADL, 5]);
+    branches.extend(long(1000));
+    branches.extend([WAIT, 5, IFLE]);
+    branches.extend(long(0x101));
+    branches.extend([72, 6, 1, 2, END]); // getsrcdatafield v2, arg1, arg2
+    let silent: &[u8] = &[END];
+    for (x, sequenced, asks) in [
+        (400, false, true),
+        (-7000, false, false),
+        (-7000, true, true),
+    ] {
+        let probe = Probe {
+            lot: on_lot(&[(9, x)]),
+            asked: Default::default(),
+        };
+        let module = module_with(&[&branches, silent], 1, 10, "seq=53,10,0,6\n");
+        let mut player = Player::new(vec![module], samples(), 1);
+        let event = |name: &str| SoundEvent::Play {
+            object: 9,
+            name: name.into(),
+        };
+        player.handle(&event("e0"), &probe);
+        player.render(BLOCK, &probe);
+        player.handle(&SoundEvent::Pause, &probe);
+        player.handle(&event("e0"), &probe);
+        if sequenced {
+            player.handle(&event("seq"), &probe);
+        }
+        player.handle(&SoundEvent::Unpause, &probe);
+        player.render(2 * BLOCK, &probe);
+        assert_eq!(!probe.asked.borrow().is_empty(), asks, "{x}");
+        assert!(player.faults.is_empty(), "{:?}", player.faults);
+    }
 }

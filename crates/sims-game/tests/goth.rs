@@ -8,6 +8,8 @@ use sims_game::pick;
 use sims_game::view::View;
 use sims_game::{Game, Options};
 use sims_render::{Canvas, open_house};
+use sims_ui::household::Snapshot;
+use sims_ui::hud::Kind;
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
@@ -42,11 +44,35 @@ fn the_goths_play_and_are_drawn() {
     game.resize([800, 600]);
     let canvas = game.render();
     assert_eq!((canvas.width, canvas.height), (800, 600));
-    // Paused, the lot owes no ticks however long it waits.
-    game.pace.toggle_pause();
-    assert_eq!(game.advance(10_000_000), 0);
-    game.pace.toggle_pause();
+    // A tick every 42 ms at normal speed.
     assert_eq!(game.advance(100_000), 2);
+    // Paused, the lot goes on ticking, but its clock stands.
+    let clock = |game: &Game| {
+        let world = game.lot().world();
+        (world.ticks, world.globals[5], world.globals[6])
+    };
+    let before = clock(&game);
+    game.toggle_pause();
+    assert!(game.paused());
+    assert_eq!(game.advance(420_000), 10);
+    assert_eq!(clock(&game), before);
+    game.toggle_pause();
+    assert!(!game.paused());
+    // Ultra speed is a tick every 2 ms, and the simulation's speed is 994.
+    game.set_speed(sims_ui::command::Speed::Ultra);
+    assert_eq!(game.lot().world().speed(), 994);
+    assert_eq!(game.advance(20_000), 10);
+    assert_eq!(game.lot().world().ticks, before.0.wrapping_add(10));
+    // A speed button runs a paused game again.
+    game.toggle_pause();
+    game.set_speed(sims_ui::command::Speed::Fast);
+    assert!(!game.paused());
+    assert_eq!(game.lot().world().speed(), 924);
+    // The button of the speed the game has does not start the time again.
+    assert_eq!(game.advance(13_000), 0);
+    game.set_speed(sims_ui::command::Speed::Fast);
+    assert_eq!(game.advance(1_000), 1);
+    assert_eq!(game.stopped(), None);
 }
 
 #[test]
@@ -498,6 +524,84 @@ fn a_snack_is_chosen_from_the_fridges_pie() {
     assert!(game.menu().is_none(), "choosing closes the pie");
     // Have A Snack, not another of the fridge's entries, is queued.
     assert_eq!(queued(&game), before + 1);
+    // The panel follows the lot as it runs: Mortimer pays 5 for the snack
+    // (at tick 820) and eats it, and the clock moves on.
+    game.render();
+    let start = panel(&game, person);
+    assert_eq!(start.money, "$2,542");
+    assert_eq!(game.run(850), 850);
+    game.render();
+    let fed = panel(&game, person);
+    assert_eq!(fed.money, "$2,537");
+    assert_ne!(fed.clock, start.clock);
+    assert_ne!(fed.hunger, start.hunger);
+    // The pointer on Mortimer's portrait shows his name over it.
+    let (portrait, guid) = game
+        .panel()
+        .iter()
+        .find_map(|i| match i.kind {
+            Kind::Portrait {
+                guid,
+                selected: true,
+            } => Some((i.rect, guid)),
+            _ => None,
+        })
+        .expect("the selected Sim's portrait");
+    assert_eq!(guid, game.lot().world().objects[&person].guid);
+    assert_eq!(game.name(guid), Some("Mortimer"));
+    game.hover([portrait.x + 20, portrait.y + 20]);
+    game.render();
+    assert!(
+        game.panel().iter().any(|i| i.kind == Kind::Name { guid }),
+        "no name over the portrait"
+    );
+    // The pointer leaving the window takes the name away.
+    assert!(game.leave(), "leaving does not redraw");
+    game.render();
+    assert!(
+        !game.panel().iter().any(|i| i.kind == Kind::Name { guid }),
+        "the name stays after the pointer left"
+    );
+}
+
+/// What the panel shows of the lot, as text, and the selected Sim's
+/// hunger meter, which must be what the world holds.
+struct Shown {
+    clock: String,
+    money: String,
+    hunger: f32,
+}
+
+fn panel(game: &Game, person: u16) -> Shown {
+    let world = game.lot().world();
+    let texts: Vec<&str> = game
+        .panel()
+        .iter()
+        .filter_map(|i| match &i.kind {
+            Kind::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let snapshot = Snapshot::read(world, &[]);
+    let (clock, money) = (snapshot.clock(), snapshot.money());
+    assert!(texts.contains(&clock.as_str()), "{texts:?}");
+    assert!(texts.contains(&money.as_str()), "{texts:?}");
+    let hunger = world.objects[&person].person.as_ref().unwrap().motives[7];
+    // Hunger is the needs panel's first meter.
+    let meters: Vec<f32> = game
+        .panel()
+        .iter()
+        .filter_map(|i| match i.kind {
+            Kind::Meter(value) => Some(value),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(meters.first(), Some(&hunger), "{meters:?}");
+    Shown {
+        clock,
+        money,
+        hunger,
+    }
 }
 
 #[test]
@@ -588,6 +692,71 @@ fn the_sound_scripts_learn_about_the_goths() {
     assert_eq!(snapshot.field(-3, 4), Some(hour));
     assert_eq!(snapshot.field(70_000, 0), Some(0));
     assert_eq!(snapshot.field(16, 21), None);
+    // Every object is where the lot has it, for its sounds' placement;
+    // an ID that names nothing is nowhere.
+    for (&id, object) in &world.objects {
+        assert_eq!(snapshot.position(i32::from(id)), Some(object.position));
+    }
+    assert_eq!(snapshot.position(70_000), None);
+}
+
+#[test]
+fn the_sound_scripts_see_the_goths_where_the_camera_shows_them() {
+    use sims_audio::placement;
+    use sims_audio::player::{SPL_NORMAL, Sources};
+    use sims_game::view::Move;
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    while game.view.camera.rotation != 0 {
+        game.apply(Move::Rotate(true));
+    }
+    let snapshot = game.sound_sources();
+    let camera = game.view.camera;
+    let world = game.lot().world();
+    let objects: Vec<(u16, &sims_sim::Object)> = world
+        .objects
+        .iter()
+        .filter(|(id, _)| **id > 0)
+        .map(|(&id, o)| (id, o))
+        .collect();
+    assert_eq!(snapshot.screen.len(), objects.len());
+    // Unturned, the sound's projection is the original view's for the
+    // object's place on the floor, which is the drawing's or a pixel off
+    // it.
+    for &(id, object) in &objects {
+        let [x, y, level] = object.position.map(i32::from);
+        let view = snapshot.projection(i32::from(id)).unwrap();
+        assert_eq!(
+            view.at,
+            sims_game::sound::fine_point(&camera, [x, y], level),
+            "object {id}"
+        );
+        let drawn = camera.project_fine([x, y], level, 0);
+        assert!(
+            (0..2).all(|i| (view.at[i] - drawn[i]).abs() <= 1),
+            "object {id}: {:?} {drawn:?}",
+            view.at
+        );
+        assert_eq!(view.screen, [800, 600]);
+        assert_eq!(view.zoom, camera.zoom.level() as i32);
+        assert_eq!(view.shown_level, camera.level);
+    }
+    // The Goths are on the screen at the far zoom the house opens at,
+    // where a track's sounds lose 560 of their 1024; nearer, less.
+    let people: Vec<u32> = objects
+        .iter()
+        .filter(|(_, o)| o.person.is_some())
+        .map(|&(id, _)| u32::from(id))
+        .collect();
+    let far = placement::combine(&people, SPL_NORMAL, &snapshot).unwrap();
+    assert!(far.0 <= 1024 - 560, "{far:?}");
+    assert!((0..=1024).contains(&far.1), "{far:?}");
+    game.apply(Move::ZoomIn);
+    let medium = placement::combine(&people, SPL_NORMAL, &game.sound_sources()).unwrap();
+    assert!(medium.0 > far.0, "{medium:?} {far:?}");
 }
 
 #[test]

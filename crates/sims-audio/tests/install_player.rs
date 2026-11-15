@@ -64,10 +64,13 @@ fn the_phone_rings() {
     let Some(root) = install() else { return };
     let files = SoundFiles::scan(&root).unwrap();
     let mut player = player(&root, 1);
-    player.handle(&SoundEvent::Play {
-        object: 7,
-        name: "Phone_ring".into(),
-    });
+    player.handle(
+        &SoundEvent::Play {
+            object: 7,
+            name: "Phone_ring".into(),
+        },
+        &NoSources,
+    );
     let out = player.render_until_idle(10 * RATE as usize, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     assert!(player.is_idle());
@@ -94,10 +97,13 @@ fn a_sim_takes_a_soft_footstep() {
         let mut player = player(&root, seed);
         // `SimSpeed` (global 100) at 1: the routine goes on to play.
         player.set_global(100, 1);
-        player.handle(&SoundEvent::Play {
-            object: 3,
-            name: "footstep_soft".into(),
-        });
+        player.handle(
+            &SoundEvent::Play {
+                object: 3,
+                name: "footstep_soft".into(),
+            },
+            &NoSources,
+        );
         let out = player.render_until_idle(5 * RATE as usize, &NoSources);
         assert!(player.faults.is_empty(), "{:?}", player.faults);
         let trimmed = out.len() - out.iter().rev().take_while(|&&s| s == 0).count();
@@ -135,10 +141,13 @@ fn a_sim_takes_a_soft_footstep() {
     // At `SimSpeed` 2 the routine ends without a note.
     let mut player = player(&root, 1);
     player.set_global(100, 2);
-    player.handle(&SoundEvent::Play {
-        object: 3,
-        name: "footstep_soft".into(),
-    });
+    player.handle(
+        &SoundEvent::Play {
+            object: 3,
+            name: "footstep_soft".into(),
+        },
+        &NoSources,
+    );
     let out = player.render_until_idle(RATE as usize, &NoSources);
     assert!(player.is_idle() && player.faults.is_empty());
     assert!(out.is_empty());
@@ -177,9 +186,9 @@ fn every_event_definition_runs_without_a_bad_instruction() {
     let mut kinds: BTreeMap<i64, usize> = BTreeMap::new();
     let mut still_running = 0;
     for (module, name) in &definitions {
-        player.handle(&SoundEvent::StopAll);
+        player.handle(&SoundEvent::StopAll, &NoSources);
         player.faults.clear();
-        player.play_from(*module, 1, name);
+        player.play_from(*module, 1, name, &NoSources);
         player.render(20 * BLOCK, &NoSources);
         if !player.is_idle() {
             still_running += 1;
@@ -314,10 +323,13 @@ fn a_television_plays_its_station() {
     let files = SoundFiles::scan(&root).unwrap();
     let mut player = player(&root, 1);
     player.add_stations(&StationLists::build(&files));
-    player.handle(&SoundEvent::Play {
-        object: 5,
-        name: "tv_action_cheap".into(),
-    });
+    player.handle(
+        &SoundEvent::Play {
+            object: 5,
+            name: "tv_action_cheap".into(),
+        },
+        &NoSources,
+    );
     let out = player.render(2 * RATE as usize, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     assert!(out.iter().any(|&s| s != 0));
@@ -326,7 +338,7 @@ fn a_television_plays_its_station() {
         "97ff325be5165800ba4cd9fc40679eb52741fb2cf9e2ddfe06f0d2eaaec5e9c1"
     );
     // The set going off ends it.
-    player.handle(&SoundEvent::StopObject { object: 5 });
+    player.handle(&SoundEvent::StopObject { object: 5 }, &NoSources);
     player.render(RATE as usize, &NoSources);
     assert!(player.is_idle());
 }
@@ -342,10 +354,13 @@ fn the_backyard_ambience_plays() {
     // As on entering a lot from the neighbourhood: the music modes are
     // recorded only once the neighbourhood's has been set.
     for name in ["bkground_nhood1", "setambience_backyard", "bkground_live"] {
-        player.handle(&SoundEvent::Play {
-            object: 0,
-            name: name.into(),
-        });
+        player.handle(
+            &SoundEvent::Play {
+                object: 0,
+                name: name.into(),
+            },
+            &NoSources,
+        );
     }
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     // Noon, with the camera's value at 50: row 500 per mille.
