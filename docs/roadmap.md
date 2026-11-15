@@ -92,10 +92,14 @@ events, and what it asks for after them) come first.
   what the original reads for it is not ported.
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
-  read their arrays whole (Arry 11, 12, 111 and 112). UserData2's
-  houses 1 and 9 then stop at their floor and wall maps
-  (`World::renumber_surfaces`), and the houses with no family stop at
-  the household selection. The templates' `Patch` families are not
+  read their arrays whole (Arry 11, 12, 111 and 112). Their floor
+  and wall maps are renumbered through the game's pattern catalogs
+  (`sims_content::Surfaces`, `World::renumber_surfaces`). UserData2's
+  house 9 then stops at the first frame (a bone last turned by a layer
+  no longer playing, 0x5992b3), the houses with no family stop at the
+  household selection, and the community lots (UserData's houses 40 to
+  48) where Create New Object Instance mode 6 makes a person (0x44e60e).
+  Four types grow their attribute arrays to the saved count (0x4342ae). The templates' `Patch` families are not
   imported (see `docs/decisions.md`).
 
 ## Met goal: a headless lot boot that matches the original
@@ -161,7 +165,7 @@ That starting lot is **unverified**; see the decision log.
 | 4 | Clear the family global | `0x415eff` | Done (`World::clear_family`) |
 | 5 | Clear the lot: remove every object on it | `0x44279a`, `0x445f84`, `0x44123f`, `0x440eeb` | Done for objects that are off the lot (`Interpreter::clear`) |
 | 6a | Read the house's lot arrays | `0x478599` | Done for house versions 53 to 62 (`World::read_arrays`) |
-| 6b | Renumber the saved floor and wall IDs | `0x4a0e3b`, `0x4c5d35` | Done for a house whose maps are empty (`World::renumber_surfaces`) |
+| 6b | Renumber the saved floor and wall IDs | `0x4a0e3b`, `0x4c5d35` | Done but for a pattern matched by colour (0x4a0bbd) (`World::renumber_surfaces`, `sims_content::Surfaces`) |
 | 6c, 7 | Read the house's type table, marking the object types whose scripts changed since the save | `0x43dd76`, `0x43a516` | Done (`Interpreter::read_types`) |
 | 6d | Clear the lot again | `0x445f84`, `0x44279a` | Done (step 5) |
 | 6e | Construct the house's objects on the cleared lot and read their saved fields | `0x449c5e`, `0x43fe0a` | Done (`Interpreter::read_objects`); a person's graphics only as far as they draw random numbers |
