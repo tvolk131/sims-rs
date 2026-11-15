@@ -13,6 +13,7 @@
 
 use crate::art::Art;
 use crate::command::{Camera, Command, Mode, Panel, Speed, Walls};
+use crate::font::Font;
 use crate::frame::{Frame, Rect};
 use crate::household::{Faces, Snapshot};
 
@@ -217,6 +218,9 @@ pub enum Kind {
     },
     /// A motive meter.
     Meter(f32),
+    /// The first name of the person of type `guid`, in a box centered
+    /// over `rect`'s bottom edge, while the pointer is on their portrait.
+    Name { guid: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,6 +468,7 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
     // four columns at 800 by 600, so a family of eight fits. The second
     // row is **unverified**; people past the two rows are left out.
     let columns = ((gadget.x - strip.x - 9) / 45).max(1);
+    let mut named = None;
     for (n, resident) in snapshot.residents.iter().enumerate() {
         let n = i32::try_from(n).unwrap_or(i32::MAX);
         if n >= columns.saturating_mul(2) {
@@ -472,8 +477,15 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         let x = strip.x + 9 + 45 * (n % columns);
         let y = strip.y + 5 + 45 * (n / columns);
         let selected = snapshot.selected == Some(resident.object);
+        let rect = Rect::new(x, y, 45, 45);
+        if controls
+            .pointer
+            .is_some_and(|[px, py]| rect.contains(px, py))
+        {
+            named = Some((rect, resident.guid));
+        }
         items.push(Item {
-            rect: Rect::new(x, y, 45, 45),
+            rect,
             kind: Kind::Portrait {
                 guid: resident.guid,
                 selected,
@@ -551,7 +563,26 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             });
         }
     }
+    // The name of the person whose portrait the pointer is on, over the
+    // strip above the portrait. Ours: where and how the original shows a
+    // name there is **unverified**.
+    if let Some((rect, guid)) = named {
+        items.push(Item {
+            rect: Rect::new(rect.x, strip.y - NAME_HEIGHT - 2, rect.width, NAME_HEIGHT),
+            kind: Kind::Name { guid },
+            command: None,
+        });
+    }
 }
+
+/// The name item's height, the font size, the room around the name in
+/// its box (across, then down), and the box's colors: the needs panel's label color on
+/// black. The box drawn is as tall as the font's line needs; its bottom
+/// is the item's.
+const NAME_HEIGHT: i32 = 16;
+const NAME_SIZE: u8 = 8;
+const NAME_PAD: [i32; 2] = [4, 2];
+const NAME_BACK: [u8; 3] = [0, 0, 0];
 
 /// The needs in the panel's order, left column first, with their motive
 /// numbers (`crates/sims-sim/src/motives.rs`). The order is the
@@ -733,6 +764,11 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                     font.draw(frame, text, [x, r.y], *rgb);
                 }
             }
+            Kind::Name { guid } => {
+                if let (Some(name), Some(font)) = (faces.name(*guid), art.font(NAME_SIZE)) {
+                    draw_name(frame, font, name, r);
+                }
+            }
             Kind::Meter(value) => {
                 let (width, left, right) = meter(*value);
                 frame.fill(r, right);
@@ -747,6 +783,33 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
     }
 }
 
+/// Draws `name` in a box centred over `r`, its bottom on `r`'s bottom,
+/// as tall as the font's line with [`NAME_PAD`] around it, and kept
+/// inside the frame; a name wider than the frame is cut short.
+fn draw_name(frame: &mut Frame, font: &Font, name: &str, r: Rect) {
+    let (right, bottom) = (i64::from(frame.width()), i64::from(frame.height()));
+    let [pad_x, pad_y] = NAME_PAD.map(i64::from);
+    let room = right - 2 * pad_x;
+    if room <= 0 {
+        return;
+    }
+    let mut text = name.to_owned();
+    while i64::from(font.width(&text)) > room {
+        text.pop();
+    }
+    let width = i64::from(font.width(&text)) + 2 * pad_x;
+    let height = i64::from(font.line_height.max(0)) + 2 * pad_y;
+    let x = i64::from(r.x) + (i64::from(r.width) - width).div_euclid(2);
+    let y = i64::from(r.y) + i64::from(r.height) - height;
+    let x = x.clamp(0, (right - width).max(0));
+    let y = y.clamp(0, (bottom - height).max(0));
+    // Inside the frame now, so each fits.
+    let [x, y, width, height] = [x, y, width, height].map(|v| i32::try_from(v).unwrap_or(i32::MAX));
+    frame.fill(Rect::new(x, y, width, height), LABEL);
+    frame.fill(Rect::new(x + 1, y + 1, width - 2, height - 2), NAME_BACK);
+    font.draw(frame, &text, [x + NAME_PAD[0], y + NAME_PAD[1]], LABEL);
+}
+
 impl Item {
     /// Whether the item stops a press from reaching what is under it.
     /// Text, mood bars and meters are drawn over the art and let presses
@@ -755,7 +818,7 @@ impl Item {
         self.command.is_some()
             || !matches!(
                 self.kind,
-                Kind::Text { .. } | Kind::Bars { .. } | Kind::Meter(_)
+                Kind::Text { .. } | Kind::Bars { .. } | Kind::Meter(_) | Kind::Name { .. }
             )
     }
 }
@@ -776,7 +839,10 @@ pub fn press(items: &[Item], point: [i32; 2]) -> Option<Command> {
 /// Whether the panel covers `point`, so a press there is the panel's and
 /// not the lot's.
 pub fn covers(items: &[Item], point: [i32; 2]) -> bool {
-    items.iter().any(|i| i.rect.contains(point[0], point[1]))
+    // A name box floats over the lot and takes nothing from it.
+    items
+        .iter()
+        .any(|i| !matches!(i.kind, Kind::Name { .. }) && i.rect.contains(point[0], point[1]))
 }
 
 /// The item under `point` that a press would act on, for hover changes.
@@ -850,6 +916,34 @@ mod tests {
         let narrow = layout([400, 600], &snapshot(), &controls);
         assert_eq!(press(&narrow, [60, 530]), None);
         assert_eq!(hovered(&narrow, Some([60, 530])), None);
+    }
+
+    #[test]
+    fn the_pointer_on_a_portrait_shows_that_persons_name_over_it() {
+        let on = |pointer| Controls {
+            expanded: true,
+            pointer: Some(pointer),
+            ..Controls::default()
+        };
+        let names = |items: &[Item]| -> Vec<(Rect, u32)> {
+            items
+                .iter()
+                .filter_map(|i| match i.kind {
+                    Kind::Name { guid } => Some((i.rect, guid)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The second portrait, from x 274: its name over the strip.
+        let items = layout([800, 600], &snapshot(), &on([280, 520]));
+        assert_eq!(names(&items), [(Rect::new(274, 482, 45, 16), 18)]);
+        // The box takes nothing from the lot under it.
+        assert!(!covers(&items, [290, 490]));
+        assert_eq!(press(&items, [290, 490]), None);
+        // Off the portraits, no name.
+        for pointer in [[400, 300], [90, 555], [320, 560]] {
+            assert!(names(&layout([800, 600], &snapshot(), &on(pointer))).is_empty());
+        }
     }
 
     #[test]
@@ -954,6 +1048,74 @@ mod tests {
             &Controls::default(),
         );
         assert_eq!(frame.pixel(1, 1), Some([0; 3]));
+    }
+
+    /// Art with an 8-point font of one glyph, "M": 3 by 4, solid.
+    fn art_with_a_font() -> Art {
+        let mut art = Art::default();
+        art.insert_font(
+            NAME_SIZE,
+            Font::new(sims_formats::ffn::Font {
+                flags: 0,
+                glyphs: vec![sims_formats::ffn::Glyph {
+                    code: u16::from(b'M'),
+                    width: 3,
+                    height: 4,
+                    atlas_x: 0,
+                    atlas_y: 0,
+                    first_bearing: 0,
+                    bearing_x: 0,
+                    bearing_y: 0,
+                }],
+                width: 3,
+                height: 4,
+                coverage: vec![15; 12],
+            }),
+        );
+        art
+    }
+
+    #[test]
+    fn a_name_keeps_inside_its_box_and_the_frame() {
+        let art = art_with_a_font();
+        let mut faces = Faces::default();
+        faces.insert_name(1, &"M".repeat(24));
+        let name = |rect| Item {
+            rect,
+            kind: Kind::Name { guid: 1 },
+            command: None,
+        };
+        // Above the top and wider than the frame: the box comes down to
+        // the top and the name is cut to the frame's width.
+        let mut frame = Frame::new(40, 30, [9; 3]);
+        let item = name(Rect::new(30, -50, 45, NAME_HEIGHT));
+        draw(&mut frame, &art, &faces, &[item], &Controls::default());
+        // The box: the line's 4 rows and 2 above and below, and the ten
+        // glyphs that fit (30 pixels) with 4 each side, from x 2.
+        for (x, y) in [(2, 0), (39, 0), (2, 7), (39, 7)] {
+            assert_eq!(frame.pixel(x, y), Some(LABEL), "({x}, {y})");
+        }
+        assert_eq!(frame.pixel(3, 1), Some(NAME_BACK));
+        assert_eq!(frame.pixel(6, 2), Some(LABEL));
+        assert_eq!(frame.pixel(6, 5), Some(LABEL));
+        assert_eq!(frame.pixel(6, 6), Some(NAME_BACK));
+        assert_eq!(frame.pixel(36, 2), Some(NAME_BACK));
+        assert_eq!(frame.pixel(1, 0), Some([9; 3]));
+        assert_eq!(frame.pixel(20, 8), Some([9; 3]));
+        // At the edges of i32, nothing overflows.
+        let mut frame = Frame::new(2, 2, [0; 3]);
+        let items: Vec<Item> = [i32::MIN, i32::MAX]
+            .into_iter()
+            .flat_map(|v| {
+                [
+                    Rect::new(v, 0, i32::MAX, 1),
+                    Rect::new(0, v, 1, i32::MAX),
+                    Rect::new(v, v, i32::MAX, i32::MAX),
+                ]
+            })
+            .map(name)
+            .collect();
+        draw(&mut frame, &art, &faces, &items, &Controls::default());
     }
 
     #[test]

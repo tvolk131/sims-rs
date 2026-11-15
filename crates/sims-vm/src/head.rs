@@ -246,7 +246,9 @@ impl Interpreter<'_> {
         };
         let a = world.animators.get(&id).ok_or_else(|| {
             Trap::Unsupported(format!(
-                "person {id} is looked at before it has an animator: not ported"
+                "person {id}'s head is measured before its animator was ever ticked or drawn: \
+                 the original reads the anchor's bone matrices as the skin's construction at \
+                 load left them (0x59640d, 0x59638f), which is not ported"
             ))
         })?;
         let bones = self.posed(world, id, a, &[top.0], None)?;

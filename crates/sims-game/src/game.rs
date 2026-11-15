@@ -17,6 +17,7 @@ use crate::menu::{self, Listing, Menu};
 use crate::pace::{self, Pace};
 use crate::people::People;
 use crate::pick;
+use crate::sound;
 use crate::view::{Move, View};
 use sims_render::{Canvas, Selected, Walls, open_house};
 use sims_ui::command::{Camera as UiCamera, Command, Speed, Walls as UiWalls};
@@ -179,6 +180,16 @@ impl Game {
             let tile = camera.unrotate_tile(tile.map(i32::from));
             world.outside(level, tile).unwrap_or(false)
         })
+    }
+
+    /// What the sound scripts may ask about the lot's objects, with where
+    /// each is on the screen as the camera shows it now
+    /// ([`sound::sources`], [`sound::screen`]).
+    pub fn sound_sources(&self) -> sims_audio::sources::Snapshot {
+        let world = self.lot.world();
+        let mut snapshot = sound::sources(world);
+        snapshot.screen = sound::screen(world, &self.view.camera, self.view.size);
+        snapshot
     }
 
     /// Why the lot stopped, if it has.
@@ -510,10 +521,13 @@ impl Game {
         if self.hud.covers(point) {
             // The menu, whose entries a choice is an index into.
             let menu = self.hud.menu.clone();
-            return match self.hud.press(point) {
+            let outcome = match self.hud.press(point) {
                 Some(command) => self.command(command, menu.as_ref()),
                 None => Outcome::redraw(),
             };
+            let sounds = self.hud.take_sounds();
+            self.keep_sounds(sounds);
+            return outcome;
         }
         let Some(target) = self.under(point) else {
             return Outcome {
@@ -525,10 +539,12 @@ impl Game {
         Outcome::redraw()
     }
 
-    /// The pointer left the window: it is on no object.
-    pub fn leave(&mut self) {
+    /// The pointer left the window: it is on no object, button or
+    /// portrait. True if the frame changes.
+    pub fn leave(&mut self) -> bool {
         self.pointer = None;
-        self.follow();
+        let redraw = self.hud.leave();
+        self.follow() || redraw
     }
 
     /// Follows the object under the pointer in the frame last drawn: when
@@ -628,6 +644,17 @@ impl Game {
         }
     }
 
+    /// The control panel as it was last laid out, from the world as it
+    /// was when the frame was drawn ([`Game::render`]).
+    pub fn panel(&self) -> &[sims_ui::hud::Item] {
+        self.hud.items()
+    }
+
+    /// The first name the panel shows for people of type `guid`.
+    pub fn name(&self, guid: u32) -> Option<&str> {
+        self.hud.name(guid)
+    }
+
     /// The pie menu, while one is open. Its labels are placed when the
     /// game is rendered.
     pub fn menu(&self) -> Option<&Menu> {
@@ -661,6 +688,39 @@ impl Game {
             Ok(None) => format!("Person {person}'s queue is full; \"{label}\" was not queued."),
             Err(e) => format!("\"{label}\" was not queued: {e}"),
         });
+    }
+
+    /// Cancels `sim`'s action numbered `action`, as a press on its icon
+    /// does (`Lot::cancel`, 0x4ea3e3), keeping the sounds the trees made,
+    /// then plays `UI_queue_delete` if the press counts and `UI_error` if
+    /// not (0x4cb16e). A cancel the lot refuses, or a stopped lot, leaves
+    /// the icon to take another press.
+    fn cancel(&mut self, sim: u16, action: i32) {
+        if self.stopped.is_some() {
+            self.note = Some("The lot has stopped, so it takes no orders.".into());
+            self.hud.release(action);
+            return;
+        }
+        match self.lot.cancel(sim, action) {
+            Ok(cancelled) => {
+                self.keep_sounds(cancelled.sounds);
+                self.hud.play(if cancelled.counts {
+                    crate::hud::QUEUE_DELETE
+                } else {
+                    crate::hud::ERROR
+                });
+            }
+            Err(e) => {
+                // The lot is as it was, so the icon takes another press.
+                self.hud.release(action);
+                self.note = Some(format!("The action was not cancelled: {e}"));
+            }
+        }
+    }
+
+    /// The selected Sim's actions as the frame last drawn showed them.
+    pub fn queue(&self) -> &sims_ui::queue::Queue {
+        self.hud.queue()
     }
 
     /// Answers the dialog `caller` shows with its button `button` (0 the
@@ -773,6 +833,10 @@ impl Game {
             }
             Command::Select { sim } => {
                 self.select(sim);
+                Outcome::redraw()
+            }
+            Command::CancelAction { sim, action } => {
+                self.cancel(sim, action);
                 Outcome::redraw()
             }
             Command::AnswerDialog { caller, button } => {

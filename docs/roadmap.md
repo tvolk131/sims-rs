@@ -56,19 +56,40 @@ events, and what it asks for after them) come first.
   (#131), the pie menu and picking from it (#132), and Go To Routing
   Slot's parameter and global slots (#134), which a player's snack order
   reached.
-- Strict mode on the Goth house runs to tick 3432, 08:25 on the first
+- Strict mode on the Goth house runs to tick 3602, 08:30 on the first
   day. One tick is two game seconds, so a day is 43,200 ticks (measured
   from the clock globals). The carpool makes the school bus at tick 2703
   (the multi-tile factory is ported). The base layer is kept and the
   pose composed from it, and a person may take itself off the lot in
-  its own tick. At tick 3433, Snap of a multi-tile object that does not
-  fit (object 334; the collided object of 0x454e82) is not ported. Step
-  2 continues from there.
+  its own tick. A multi-tile object may snap where it does not fit
+  (0x454e82), and a group is deleted (0x440f37): at tick 3434 the car
+  junk's 18 tiles go. At tick 3603 object 354 uses Create New Object
+  Instance mode 6 with flag 0x4, which is not ported (the same stop as
+  the snack order's). Step 2 continues from there.
 - Of the base neighborhood's houses only the Goths' and the Newbies'
   (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
+  tick 1802; a route that gives up on a slot it may end near runs the
+  Route failure feedback tree (tick 1473). Against the recording of the
+  house (updates 0 to 935), every update's random streams, scheduler
+  cursor, action serial, globals and objects, and each object's data,
+  temps, attributes, frames and person data match, except the words the
+  original left from memory it never set (person word 37, locals on half
+  a pointer) and global 12 at updates 1 and 3 (the interface's tutorial
+  wait). At tick 1803 object 290 needs Create New Object Instance mode 6
+  with flag 0x4, which track 3 is porting for the Goths' snack order.
+
   tick 1472, with no recording to compare yet; at tick 1473 object 105
   gives up a route and needs the route-failure feedback tree (0x45af2a),
   which is not ported.
+- The Pleasants (`House06.iff` as the original saved it after moving
+  them in, with the Traveling Salesman on the lot) load to the state the
+  first tick starts from: the end of the household selection works out
+  again who is a visitor, and reading the people raises the action
+  serial. Their load equals the capture's but for one person's data word
+  50 and last result, which something in the original's load sets and
+  which is not found yet. The first frame then stops: person 242's head
+  follows person 241, whose animator has never been ticked or drawn, and
+  what the original reads for it is not ported.
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
   read their arrays whole (Arry 11, 12, 111 and 112). UserData2's
@@ -1934,12 +1955,16 @@ Progress:
   rose from 85.2% to 86.1% exact and far zoom at rotation 2 from 89.9%
   to 90.1%. Pools on walls (the file's wall tables) are read in part,
   not ported.
+- Done: lamp pools on straight walls, from `lightMap.dat`'s wall
+  tables (grass takes none in the original). Far zoom at rotation 2
+  rose from 90.1% to 90.3% exact; of the pixels they change, 70% now
+  match exactly and the rest are mostly a step off.
 - Done: a floor tile split by a diagonal wall takes the blade count of
   the tile drawn before it, as the original carries it from tile to
   tile. Near zoom rose from 86.5% to 87.0% exact; of the 2,402 pixels it
   changes, 2,115 now match.
 - Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
-  grass and a light sprite in the original); lamp pools on walls; the
+  grass and a light sprite in the original); the
   edge-on texel offset and side; a screenshot with a marked edge-on
   diagonal; upper-level depth.
 
@@ -1992,9 +2017,23 @@ stop-sounds events.
   original's answers (0x570e61: a person's voice, age, skills,
   personality and motive 3, the hour, the size of the object's room),
   read from the lot between ticks (`sims_game::sound::sources`).
+- **Done: where a sound's objects are.** Kinds 1 and 30 set a track's
+  volume and pan from where its objects are on the screen (0x5730b6,
+  0x57473b, 0x570e09), which the game sends with the answers, from its
+  camera.
+- **Done: the music modes** (36). A change of mode starts and stops the
+  music tracks as the original's sound manager does (0x575170): the
+  buy, build and neighbourhood lists, the expansions', the credits', the
+  river loops and the slow fade into live mode. `play_trk` hands on the
+  caller's arguments and `source`, and `kill_trk` ends the whole track.
+  3 events of kinds not ported remain: the piano (43), and 103 and 104,
+  which are debug commands.
 - **Next:**
-  - Positions for 3D sound, the piano (43) and the music half of the
-    music modes (36). 103 and 104 are debug commands.
+  - The piano (43).
+  - Placing the tracks again when the camera moves (kind 33), once the
+    game sends it only then.
+  - Tracks and fades step once a block (64 frames, about 2.9 ms); the
+    original's sound manager steps them once a millisecond (0x57cf37).
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)
@@ -2110,8 +2149,8 @@ through their public interfaces only; the simulation never depends on it.
   play mode does not catch stops it. In play mode the Goths' house runs
   12,000 ticks (ten minutes at normal speed) without stopping, through
   about a dozen different caught errors; in strict mode it stops after
-  tick 3432 (at tick 3433 a multi-tile Snap that does not fit, 0x454e82,
-  is not ported).
+  tick 3602 (at tick 3603 Create New Object Instance mode 6 is not
+  ported).
   `--png <file>
   --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
@@ -2154,6 +2193,8 @@ through their public interfaces only; the simulation never depends on it.
   on to other things (object 71 at tick 1497, object 132 at 2292).
   Strict mode now runs the order through step 3602 and stops at step
   3603 (object 354 uses Create New Object Instance mode 6 with flag 0x4,
+  not ported); without an order it stops there too.
+
   not ported); without an order it runs to tick 3432.
 - **Done: the speed and the pause.** The panel's speed buttons set the
   simulation's speed as the original's setter does (`0x46d697`, globals
@@ -2188,6 +2229,19 @@ through their public interfaces only; the simulation never depends on it.
   tick 2, answered No from the window, gives the lot `--answers 3`
   gives, hash for hash, through tick 200. `--answers` still answers
   first, and `--png` answers No to the Help System by default.
+- **Done: the panel follows the lot.** Every frame the panel reads the
+  world as it is: the clock (globals 0 and 5), the household's funds,
+  the portraits with the selected Sim's lit, and the selected Sim's mood
+  bars and needs meters. A Goth test queues the snack and runs 850 ticks:
+  the funds go from $2,542 to $2,537 when Mortimer pays, the clock moves,
+  and the hunger meter is his hunger. The pointer on a portrait shows
+  that person's first name (catalog strings, `OBJD` word 41) in a box
+  over it; that box is ours (**unverified**).
+- **Done: the action queue.** The selected Sim's running and queued
+  actions show as icons in the top left, framed as the original frames
+  them, and a press cancels one (`Lot::cancel`, 0x45d5f8) with the
+  original's sound. Objects' catalog pictures are not made yet (a grey
+  square stands in), and the icons do not slide into place.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
     on Manage Inventory operation 4 and scope 12. A check tree's fault
@@ -2201,12 +2255,6 @@ through their public interfaces only; the simulation never depends on it.
   - `sims-people`: the selected Sim's head as an image, which the
     original renders live into the pie's face bitmap; the middle of the
     pie is empty until then.
-  - `sims-audio`: the inputs the game cannot give yet (the camera
-    value of the ambience's cursor, 0x570c3e, is ported, #160): what
-    the sound scripts' `getsrcdatafield` fields are (`sims-game`
-    answers 0 to every one; an object's place on screen, for its pan,
-    is presumably among them, unread), and what pausing the game does
-    to the sounds playing (the pause events are not ported).
 
 ## Working rules
 

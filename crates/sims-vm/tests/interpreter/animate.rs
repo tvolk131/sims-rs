@@ -2111,6 +2111,61 @@ fn a_person_holding_something_in_its_hand_taking_itself_off_fails_loudly() {
 }
 
 #[test]
+fn what_the_take_offs_callbacks_put_in_the_hand_is_checked_after_them() {
+    // The person's function 10 (leaving the lot) grabs the lamp into its
+    // hand. The hand was empty before the callbacks; the check after them
+    // (as the refresh comes after them) still fails.
+    let mut fx = taking_itself_off(sleep());
+    for slot in &mut fx.lamp_mut().slots {
+        slot.object = 0;
+    }
+    // Its tile slot and the five a person adds (0x45962b), all empty.
+    let empty = fx.sim().slots[1].clone();
+    fx.sim_mut().slots.resize(6, empty);
+    // Live mode (global 19), and the lamp may be carried (data word 4
+    // bit 5).
+    fx.world.globals[19] = 0;
+    fx.lamp_mut().data[4] |= 0x20;
+    let library = fx.program.libraries.get_mut(&SIM_FILE).unwrap();
+    let table = library.callbacks.get_mut(&128).unwrap();
+    table.resize_with(11, || sims_formats::execution::ObjectFunction {
+        condition: 0,
+        action: 0,
+    });
+    table[10].action = 4099;
+    fx.add(
+        SIM_FILE,
+        4099,
+        tree(vec![
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, LAMP as i16, 1),
+            ins(4, RETURN_TRUE, RETURN_FALSE, [0; 8]),
+        ]),
+    );
+    let fault = tick(&mut fx).unwrap_err().to_string();
+    assert!(fault.contains("0x58dae5"), "{fault}");
+    assert_eq!(fx.sim().slots[1].object, LAMP as i16);
+}
+
+#[test]
+fn a_tile_of_a_group_in_the_head_slot_taking_itself_off_fails_loudly() {
+    let mut fx = taking_itself_off(sleep());
+    for slot in &mut fx.lamp_mut().slots {
+        slot.object = 0;
+    }
+    fx.lamp_mut().multipart = Some(sims_formats::saved_objects::Multipart {
+        offset: [0; 3],
+        group: [0; 3],
+        parent: 0,
+    });
+    fx.sim_mut().slots[2].object = LAMP as i16;
+    let fault = tick(&mut fx).unwrap_err().to_string();
+    assert!(
+        fault.contains("0x58dc08") && fault.contains("the group tile 1"),
+        "{fault}"
+    );
+}
+
+#[test]
 fn an_ordinary_object_in_the_head_slot_is_redrawn_as_presentation() {
     // The refresh reads the container entry at begin + 0x48, our slot 2,
     // and redraws what it holds (0x58dae5 to 0x58dc55): for an ordinary
