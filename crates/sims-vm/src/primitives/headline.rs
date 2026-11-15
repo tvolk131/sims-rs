@@ -27,7 +27,8 @@
 //!    is (without the temp): 0, the stack object's; 2, the object a local
 //!    names, the local being operand word 0 shifted right by one, signed
 //!    (native error 0x33 when it is not below the frame's local count,
-//!    frame byte 6); 1, a neighbor's (0x4256f4, record +8), which is not
+//!    frame byte 6; a local still holding half of an old pointer fails
+//!    loudly); 1, a neighbor's (0x4256f4, record +8), which is not
 //!    ported and fails, since whether the record holds a picture is
 //!    presentation we do not model. An object ID that names nothing on
 //!    the lot (not positive, or a null entry of the lot's table), or any
@@ -186,8 +187,8 @@ impl Machine<'_, '_> {
             }
             2 => {
                 let local = word(operands, 0) >> 1;
-                let locals = &self.frame()?.locals;
-                if usize::try_from(local).is_ok_and(|l| l >= locals.len()) {
+                let count = self.frame()?.locals.len();
+                if usize::try_from(local).is_ok_and(|l| l >= count) {
                     return Err(Trap::native(0x33, "local out of range"));
                 }
                 let Ok(local) = usize::try_from(local) else {
@@ -196,7 +197,10 @@ impl Machine<'_, '_> {
                          local reads before the frame's locals"
                     )));
                 };
-                i32::from(locals[local])
+                // The original reads the frame storage's word as it is,
+                // which may be half of an old pointer.
+                self.check_local(local)?;
+                i32::from(self.frame()?.locals[local])
             }
             _ => return Ok(false),
         };

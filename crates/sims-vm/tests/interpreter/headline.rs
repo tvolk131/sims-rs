@@ -328,6 +328,23 @@ fn a_catalog_picture_of_a_locals_object() {
 }
 
 #[test]
+fn a_catalog_picture_of_a_local_left_half_a_pointer_fails_loudly() {
+    // The original reads the frame storage's word as it is (0x44b84b).
+    let mut fx = Fixture::new();
+    let mut storage = sims_sim::FrameStorage::default();
+    storage.unknown.insert((0, 3));
+    fx.world.frame_storage.insert(SIM, storage);
+    let mut operands = icon(false, 7, 2, 10, 0);
+    operands[0] = 3 << 1;
+    let fault = run(&mut fx, SIM, 0, operands).unwrap_err();
+    assert!(
+        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("half of a pointer")),
+        "{fault}"
+    );
+    assert!(fx.world.headlines.is_empty());
+}
+
+#[test]
 fn the_tick_counts_a_positive_duration_down() {
     let mut fx = fixture();
     fx.add(SIM_FILE, 4097, sleeper());

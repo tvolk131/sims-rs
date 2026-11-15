@@ -30,7 +30,9 @@ adds (the code keeps both at 0x44b7d6 and adds the temp to one):
 - 2: the object a local names, the local being operand word 0 shifted
   right by one, signed; not below the frame's local count (frame byte
   6) is native error 0x33, and a negative local fails loudly, as the
-  original would read before the locals;
+  original would read before the locals; so does a local that still
+  holds half of an old pointer in the frame storage, which the original
+  reads as it is;
 - 1: a neighbor's (0x4256f4, the neighborhood record's +8), which is
   **not ported** and fails loudly: whether a record holds its picture
   is presentation we do not model;
