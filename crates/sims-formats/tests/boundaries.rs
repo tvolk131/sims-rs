@@ -286,6 +286,14 @@ fn compressed_ttab_signed_field_widths_and_truncation() {
     assert!(InteractionTable::parse(&b[..b.len() - 1]).is_err());
 }
 #[test]
+fn an_empty_interaction_table_keeps_its_version_or_9() {
+    for (bytes, version) in [(&[0, 0, 8, 0][..], 8), (&[0, 0, 9, 0, 0], 9), (&[0, 0], 9)] {
+        let table = InteractionTable::parse(bytes).unwrap();
+        assert_eq!(table.version, version);
+        assert!(table.interactions.is_empty());
+    }
+}
+#[test]
 fn arbitrary_bytes_do_not_panic_or_trigger_unbounded_allocations() {
     let mut seed = 12345u32;
     for n in 0..400 {

@@ -196,8 +196,12 @@ impl InteractionTable {
         let mut r = Reader::new(data);
         let count = r.u16()? as usize;
         if count == 0 {
+            // The original's reader (0x475cc0) reads the version whatever
+            // the count, and keeps 9 when the chunk ends first. An empty
+            // table loads, with no entries.
+            let version = if data.len() >= 4 { r.u16()? } else { 9 };
             return Ok(Self {
-                version: 0,
+                version,
                 interactions: Vec::new(),
             });
         }
