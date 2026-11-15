@@ -13,8 +13,9 @@
 //!
 //! It always takes the true branch.
 //!
-//! Only a check tree that Find Best Interaction runs is ported. There no
-//! menu is being built (the three pointers were 0 in a memory image of
+//! Only a check tree that Find Best Interaction runs outside the pie
+//! menu's listing ([`Machine::building_menu`]) is ported. There no menu
+//! is being built (the three pointers were 0 in a memory image of
 //! the original at its first call), and the synchronous run (0x4749b5)
 //! clears 0x6c4d6c, so the string is dropped. Whether the formatting can
 //! fail on some strings is **unverified**; it is not run. Anywhere else
@@ -27,11 +28,17 @@ use crate::interpreter::Machine;
 
 impl Machine<'_, '_> {
     pub(crate) fn action_string(&mut self) -> Result<bool, Trap> {
+        if self.building_menu {
+            return Err(Trap::Unsupported(
+                "Add/Change Action String while the pie menu is listed, where it adds an entry \
+                 to the menu (0x458789)"
+                    .into(),
+            ));
+        }
         if self.advertisements.is_none() {
             return Err(Trap::Unsupported(
                 "Add/Change Action String outside autonomy's check trees, where it names the \
-                 running interaction (0x41f1ae) or adds an entry to the menu being built \
-                 (0x458789)"
+                 running interaction (0x41f1ae)"
                     .into(),
             ));
         }

@@ -128,7 +128,8 @@ impl Interpreter<'_> {
 
     /// Queues on `person` an action [`Self::pie_menu`] offered, unchanged,
     /// as picking it does (0x48dd67, 0x45d20b). Returns the action's
-    /// number, or None when the queue took nothing (it is full). What the
+    /// number, or None when the queue took nothing: it is full, or the
+    /// target's table no longer has the action's entry. What the
     /// queue does not port fails loudly, as for [`Self::order`].
     pub fn pick(
         &self,
@@ -142,11 +143,12 @@ impl Interpreter<'_> {
                 .ok()
                 .filter(|t| *t != 0)
                 .ok_or_else(|| Trap::Invalid("a picked action has no target".into()))?;
+            // No entry: the action is not queued (0x45d22a).
             let at_once = machine
                 .table(target)?
                 .and_then(|table| find(table, action.table_index as u32))
-                .is_some_and(|record| record.flags & AT_ONCE != 0);
-            machine.queue_action(person, action, Some(at_once))
+                .map(|record| record.flags & AT_ONCE != 0);
+            machine.queue_action(person, action, at_once)
         })();
         result.map_err(|trap| machine.fault(trap))
     }
@@ -219,14 +221,15 @@ impl Machine<'_, '_> {
                 "a pet's pie menu, which reads interface state (0x6e4f68, 0x4585b1)".into(),
             ));
         }
-        let visitor = word(person::VISITOR) != 0;
         let target = self.interaction_target(object)?;
         let menus: Vec<u32> = self
             .table(target)?
             .map(|table| table.interactions.iter().map(|e| e.string_index).collect())
             .unwrap_or_default();
         let mut saved = None;
-        let listed = self.list_entries(target, &menus, visitor, &mut saved);
+        let outer = std::mem::replace(&mut self.building_menu, true);
+        let listed = self.list_entries(target, &menus, &mut saved);
+        self.building_menu = outer;
         if let Some(temps) = saved {
             self.me_mut()?.temps = temps;
         }
@@ -245,12 +248,19 @@ impl Machine<'_, '_> {
         &mut self,
         target: u16,
         menus: &[u32],
-        visitor: bool,
         saved: &mut Option<Vec<i16>>,
     ) -> Result<Vec<Interaction>, Trap> {
         let me = self.me;
         let mut listed = Vec::new();
         for &menu in menus {
+            // Read for each action, after the checks before it (0x41f08b).
+            let visitor = self
+                .me()?
+                .person
+                .as_ref()
+                .and_then(|p| p.data.get(person::VISITOR).copied())
+                .unwrap_or(0)
+                != 0;
             let Some((mut action, _)) = self.menu_action(me, target, menu, visitor)? else {
                 continue;
             };

@@ -666,3 +666,87 @@ fn what_the_pie_menu_does_not_port_fails_loudly() {
     let fault = interpreter.pie_menu(&mut fx.world, LAMP, LAMP).unwrap_err();
     assert!(matches!(fault.trap, Trap::Invalid(_)), "{fault}");
 }
+
+#[test]
+fn a_picked_action_whose_entry_is_gone_is_not_queued() {
+    let mut fx = menu_lot(vec![entry(3, 0x100)]);
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let listed = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap();
+    // Its menu number is no longer in the table, or its target has no
+    // table: nothing is queued and no number is used (0x45d22a).
+    let mut renumbered = listed[0].clone();
+    renumbered.table_index = 9;
+    let mut on_sim = listed[0].clone();
+    on_sim.target = SIM as i16;
+    for action in [renumbered, on_sim] {
+        assert_eq!(interpreter.pick(&mut fx.world, SIM, action), Ok(None));
+    }
+    assert!(fx.sim().person.as_ref().unwrap().queue.is_empty());
+    assert_eq!(fx.world.action_serial, 0);
+}
+
+#[test]
+fn each_listed_action_reads_whether_i_am_a_visitor_after_the_checks_before_it() {
+    // Low attenuation (code 2) differs for visitors. Menu 3's check makes
+    // me a visitor (person data word 32); menu 4, allowed to visitors
+    // (flag 1), is then made with the visitors' attenuation.
+    let low = |name: &str, value| sims_formats::tuning::Constant {
+        name: name.into(),
+        value,
+        comment: String::new(),
+    };
+    let coded = |menu, flags, test| Interaction {
+        attenuation_code: 2,
+        ..with_test(menu, flags, test)
+    };
+    let mut fx = menu_lot(vec![coded(3, 0, 4300), coded(4, 1, 0)]);
+    let global = fx.program.global;
+    fx.program
+        .libraries
+        .get_mut(&global)
+        .unwrap()
+        .tuning
+        .insert(
+            2,
+            sims_formats::tuning::Constants {
+                version: 0,
+                entries: vec![
+                    low("low attenuation", 0.25),
+                    low("visitor low attenuation", 0.75),
+                ],
+            },
+        );
+    fx.add(
+        LAMP_FILE,
+        4300,
+        tree(vec![assign(18, 32, scope::LITERAL, 1, RETURN_TRUE)]),
+    );
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let listed = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap();
+    let made: Vec<_> = listed
+        .iter()
+        .map(|a| (a.table_index, a.attenuation))
+        .collect();
+    assert_eq!(made, [(3, 0.25), (4, 0.75)]);
+}
+
+#[test]
+fn an_action_string_while_the_menu_is_listed_fails_loudly_and_temps_come_back() {
+    // Menu 3's check writes temp 0, then menu 4's runs Add/Change Action
+    // String, which would add an entry to the menu (0x458789).
+    let mut fx = menu_lot(vec![with_test(3, 0, 4300), with_test(4, 0, 4302)]);
+    temp_writing_check(&mut fx);
+    fx.add(
+        LAMP_FILE,
+        4302,
+        tree(vec![ins(50, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
+    );
+    fx.sim_mut().temps[0] = 11;
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let fault = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap_err();
+    assert!(
+        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x458789")),
+        "{fault}"
+    );
+    assert_eq!(fx.sim().temps[0], 11);
+}
