@@ -60,8 +60,8 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 417 on the Goth house**: our
-  state after every one of ticks 1 to 417 equals the fourth capture of the
+  there, as three captures recorded). **K = 436 on the Goth house**: our
+  state after every one of ticks 1 to 436 equals the fourth capture of the
   original (full state after every update) in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
@@ -1450,11 +1450,31 @@ everything compared, but for the head field of "Ticks 334 to 366".
 **Not verified.** The carry layer's fields: the capture holds that the
 slot is filled, but not the page its layer is on.
 
-**Stops.** Tick 418: person 21's thread (tree 4113 of object 52)
-routes with two people in the way, whose order on the lot's list of
-people is not modeled (`0x45bb04`). The capture never enters tree 4113
-there: it goes on in tree 4112, with object 92 as the stack object.
-Finding why the two part ways is the next step.
+**Then.** Tick 418 stopped where person 21's thread (tree 4113 of
+object 52) routes with two people in the way; see "Ticks 418 to 436".
+
+### Ticks 418 to 436
+
+**Who is in the way, in the list's order** (`0x45ba28`, `in_way.rs`).
+A trace of tick 418 shows door 52's tree 4105 going to Go To Routing
+Slot (tree 4113) in our run. The capture's door 52 holds the same
+graphic as ours, so the original takes that branch too. The route then
+asks who is in the way of person 21, and two people qualify. The
+candidates come from the lot's person vector (`[person +0xdc] +0x84`),
+the one Set To Next walks, which the world already keeps as
+`World::people`. So they are now taken in that order, and more than one
+no longer fails. In tick 418 person 18 has a way but is not asked,
+because 18's own route waits on person 21, and person 16 has no way.
+Nobody is in the way, the route goes through, and the walk goes on to
+door 92, as the capture shows.
+
+**K = 436.** Our state after every tick from 418 to 436 equals the
+fourth capture in everything compared, but for the head fields of
+"Ticks 334 to 366".
+
+**Stops.** Tick 437: person 16's animator finds its next step blocked
+(`0x58f682`), which is not ported. Person 16's frames at the stop equal
+the capture's.
 
 ## Track: drawing people (`crates/sims-people`)
 
