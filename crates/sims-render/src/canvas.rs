@@ -7,6 +7,8 @@
 //!
 //! The unit is a sixteenth of a sprite depth byte. See [`crate::depth`].
 
+use crate::light::Light;
+
 /// Depth of a pixel nothing was drawn on.
 pub const EMPTY: i32 = i32::MAX;
 
@@ -120,6 +122,19 @@ impl Canvas {
         flip: bool,
         depth: impl Fn(i32, i32, u8) -> i32,
     ) {
+        self.draw_lit(image, at, flip, Light::FULL, depth);
+    }
+
+    /// [`Canvas::draw`] under a light: each pixel's color is darkened by
+    /// `light` before it is written or blended.
+    pub fn draw_lit(
+        &mut self,
+        image: &Image,
+        at: [i32; 2],
+        flip: bool,
+        light: Light,
+        depth: impl Fn(i32, i32, u8) -> i32,
+    ) {
         // Clip in i64: the canvas and image sides fit, and so does any i32
         // position plus a side. Inside the canvas everything fits in i32.
         let pixels = image.width.checked_mul(image.height);
@@ -161,14 +176,15 @@ impl Canvas {
                 if d > self.depth[target] {
                     continue;
                 }
-                let rgb = &image.rgba[source * 4..source * 4 + 3];
+                let s = &image.rgba[source * 4..source * 4 + 3];
+                let rgb = light.apply([s[0], s[1], s[2]]);
                 let pixel = &mut self.color[target];
                 self.depth[target] = d;
                 if a == 255 {
-                    pixel.copy_from_slice(rgb);
+                    *pixel = rgb;
                 } else {
                     let a = u32::from(a);
-                    for (c, &s) in pixel.iter_mut().zip(rgb) {
+                    for (c, &s) in pixel.iter_mut().zip(&rgb) {
                         *c = ((u32::from(s) * a + u32::from(*c) * (255 - a) + 127) / 255) as u8;
                     }
                 }

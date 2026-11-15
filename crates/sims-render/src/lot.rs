@@ -8,6 +8,7 @@
 
 use crate::{Error, Result};
 use sims_sim::World;
+use std::collections::BTreeMap;
 
 /// The side of the lot's arrays.
 pub const FULL: usize = 64;
@@ -71,6 +72,14 @@ pub struct Lot {
     pub levels: [Level; 2],
     /// The rooms that are outdoors, by ID.
     pub outdoor_rooms: std::collections::BTreeSet<i16>,
+    /// The light byte of each room, by ID: the light the room shows
+    /// ([`sims_sim::rooms::Room::shown_light`]) times 255, as the original
+    /// stores it for the room's tiles (0x46772d).
+    pub room_lights: BTreeMap<i16, u8>,
+    /// The two triangles of each tile a diagonal wall splits, by level (1
+    /// or 2), column and row: which triangle (by the corner it holds: 1
+    /// south-west, 2 south-east, 3 north-east, 4 north-west) and its room.
+    pub halves: BTreeMap<[u8; 3], [(u8, i16); 2]>,
 }
 
 impl Lot {
@@ -164,12 +173,37 @@ impl Lot {
             .filter(|(_, r)| r.outdoors)
             .map(|(&id, _)| id)
             .collect();
+        let room_lights = world
+            .rooms
+            .rooms
+            .iter()
+            .map(|(&id, r)| {
+                // A room the room update has never counted has no light
+                // yet (every counted room has at least one tile). Draw
+                // the outdoors in daylight then, so a house read without
+                // a load still shows; indoors keeps its light of 0.
+                let light = if r.half_tiles == 0 && r.outdoors {
+                    1.0
+                } else {
+                    r.shown_light().to_f32()
+                };
+                (id, light_byte(light))
+            })
+            .collect();
+        let halves = world
+            .rooms
+            .halves
+            .iter()
+            .map(|(&tile, h)| (tile, h.map(|h| (h.triangle, h.room))))
+            .collect();
         Ok(Self {
             size,
             heights,
             grass,
             levels: [level(0)?, level(1)?],
             outdoor_rooms,
+            room_lights,
+            halves,
         })
     }
 
@@ -202,19 +236,64 @@ impl Lot {
     pub fn contains(&self, x: i32, y: i32) -> bool {
         x >= 0 && y >= 0 && (x as usize) < self.size && (y as usize) < self.size
     }
+}
 
-    /// Whether the room of tile (x, y) on a level is outdoors. Tiles off
-    /// the lot, tiles in no room, and lots whose rooms are not worked out
-    /// count as outdoors.
-    pub fn outdoors(&self, level: usize, x: i32, y: i32) -> bool {
+impl Lot {
+    /// The room at fine position `fine` (sixteenths of a tile) on a level
+    /// (0 or 1): the tile's room, or on a tile a diagonal wall splits, the
+    /// room of the triangle the point is in. None off the lot, outside
+    /// every room, or if the rooms are not worked out.
+    pub fn room_at(&self, level: usize, fine: [i32; 2]) -> Option<i16> {
+        let [x, y] = fine.map(|f| f.div_euclid(16));
         if !self.contains(x, y) {
-            return true;
+            return None;
         }
-        let Some(rooms) = &self.levels[level].rooms else {
-            return true;
-        };
+        let rooms = self.levels.get(level)?.rooms.as_ref()?;
         let room = rooms[Self::cell(x as usize, y as usize)];
-        room <= 0 || self.outdoor_rooms.contains(&room)
+        if room == sims_sim::rooms::NO_ROOM {
+            let key = [level as u8 + 1, x as u8, y as u8];
+            let halves = self.halves.get(&key)?;
+            let [fx, fy] = fine.map(|f| f.rem_euclid(16));
+            // The corner each triangle holds: 1 is (0, 1), 2 is (1, 1),
+            // 3 is (1, 0) and 4 is (0, 0), with x east and y south.
+            let inside = |triangle: u8| match triangle {
+                1 => fy > fx,
+                2 => fx + fy > 16,
+                3 => fx > fy,
+                _ => fx + fy < 16,
+            };
+            let half = halves
+                .iter()
+                .find(|(t, _)| inside(*t))
+                .unwrap_or(&halves[0]);
+            return (half.1 >= 0).then_some(half.1);
+        }
+        (room >= 0).then_some(room)
+    }
+
+    /// The light byte at a fine position on a level (0 or 1): its room's
+    /// light. Off the lot and outside every room it is full light.
+    pub fn light_at(&self, level: usize, fine: [i32; 2]) -> u8 {
+        self.room_at(level, fine)
+            .and_then(|room| self.room_lights.get(&room).copied())
+            .unwrap_or(255)
+    }
+}
+
+/// A room's light as the byte the original stores for its tiles: the light
+/// times 255, plus a half, truncated, keeping the low byte (0x46772d, the
+/// old prototype's `light_byte` in
+/// `legacy/crates/sims-sim/src/lot_environment/lighting.rs`). A light
+/// that is not a number, or too large for a 64-bit integer, gives 0, the
+/// low byte of the x87's "integer indefinite" result.
+pub fn light_byte(light: f32) -> u8 {
+    let value = (f64::from(light) * 255.0 + 0.5).trunc();
+    // 2^63: the first value a 64-bit integer cannot hold.
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    if value.is_finite() && (-LIMIT..LIMIT).contains(&value) {
+        (value as i64) as u8
+    } else {
+        0
     }
 }
 
@@ -241,6 +320,72 @@ mod tests {
             encoding: 0,
             data: vec![0; len],
         }
+    }
+
+    #[test]
+    fn rooms_give_their_light_and_split_tiles_each_half_its_own() {
+        use sims_sim::rooms::{Half, NO_ROOM, Room};
+        let mut world = World::empty();
+        let full = FULL * FULL;
+        for (id, stride) in [(0, 4), (1, 1), (2, 8), (101, 1), (102, 8)] {
+            world.arrays.insert(id, array(stride, full * stride));
+        }
+        let mut map = vec![0i16; full];
+        map[Lot::cell(1, 1)] = 1;
+        map[Lot::cell(2, 2)] = NO_ROOM;
+        world.rooms.map = [map, vec![0; full]];
+        let room = |outdoors: bool, half_tiles: i32, light: f32| Room {
+            outdoors,
+            half_tiles,
+            light: sims_core::F32::from_f32(light),
+            ..Room::default()
+        };
+        world.rooms.rooms.insert(0, room(true, 2, 1.0));
+        world.rooms.rooms.insert(1, room(false, 2, 0.25));
+        world.rooms.rooms.insert(2, room(false, 2, 0.5));
+        // A descending wall: triangle 4 holds corner (0, 0), 2 holds (1, 1).
+        world.rooms.halves.insert(
+            [1, 2, 2],
+            [
+                Half {
+                    triangle: 4,
+                    room: 1,
+                },
+                Half {
+                    triangle: 2,
+                    room: 2,
+                },
+            ],
+        );
+        let lot = Lot::from_world(&world).unwrap();
+        assert_eq!(lot.light_at(0, [8, 8]), 255);
+        assert_eq!(lot.light_at(0, [24, 24]), 64);
+        assert_eq!(lot.light_at(0, [36, 36]), 64);
+        assert_eq!(lot.light_at(0, [44, 44]), 128);
+        assert_eq!(lot.room_at(0, [44, 44]), Some(2));
+        // Off the lot is full light.
+        assert_eq!(lot.light_at(0, [-1, 8]), 255);
+        assert_eq!(lot.light_at(0, [8, 64 * 16]), 255);
+        // An outdoor room never counted shows daylight; an indoor one its
+        // light of 0.
+        world.rooms.rooms.insert(0, room(true, 0, 0.0));
+        world.rooms.rooms.insert(1, room(false, 0, 0.0));
+        let lot = Lot::from_world(&world).unwrap();
+        assert_eq!(lot.light_at(0, [8, 8]), 255);
+        assert_eq!(lot.light_at(0, [24, 24]), 0);
+    }
+
+    #[test]
+    fn light_bytes_round_half_up_and_keep_the_low_byte() {
+        assert_eq!(light_byte(0.0), 0);
+        assert_eq!(light_byte(1.0), 255);
+        assert_eq!(light_byte(0.5), 128);
+        assert_eq!(light_byte(0.127_118_65), 32);
+        assert_eq!(light_byte(f32::NAN), 0);
+        // Out of range wraps to the low byte, or gives 0 past 64 bits.
+        assert_eq!(light_byte(2.0), 254);
+        assert_eq!(light_byte(f32::MAX), 0);
+        assert_eq!(light_byte(f32::MIN), 0);
     }
 
     #[test]

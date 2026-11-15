@@ -1,7 +1,7 @@
 //! What the viewer shows and how keys change it. No window here, so it is
 //! tested headless.
 
-use sims_render::{Camera, Walls, Zoom};
+use sims_render::{Camera, Focus, Walls, Zoom};
 
 /// A command from the keyboard or mouse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +46,7 @@ impl View {
             level: 1,
             origin: [0, 0],
             walls: Walls::Cutaway,
+            focus: Focus::default(),
         };
         let size = size.map(|n| n.clamp(1, SIZE_LIMIT));
         camera.center_on(center, [size[0] / 2, size[1] / 2]);
@@ -95,6 +96,10 @@ impl View {
                 self.camera.origin[1] = self.camera.origin[1].saturating_add(dy);
             }
             Command::Save => return false,
+        }
+        // The original forgets the pointer's rooms when the floor changes.
+        if self.camera.level != before.level {
+            self.camera.focus.forget();
         }
         self.bound();
         self.camera != before

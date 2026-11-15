@@ -3,22 +3,22 @@
 use crate::assets::{Assets, Definition};
 use crate::camera::{self, Camera, Walls, Zoom};
 use crate::canvas::{Canvas, Image};
+use crate::cutaway::{self, Mask};
 use crate::depth;
+use crate::grass::{self, Grass};
+use crate::light::Light;
 use crate::lot::{self, Lot, WallCell};
 use sims_sim::World;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-/// Grass colours: the original blends from brown to green in 32 steps by
-/// each tile's grass value, a light and a dark shade (the old prototype's
-/// `legacy/crates/sims-render/src/grass.rs`). The original draws blades
-/// from a seeded pattern; this draws a fixed scatter of the two shades.
-const LIGHT_BROWN: [u8; 3] = [157, 117, 65];
-const LIGHT_GREEN: [u8; 3] = [80, 116, 59];
-const DARK_BROWN: [u8; 3] = [81, 60, 18];
-const DARK_GREEN: [u8; 3] = [14, 53, 8];
+/// Rows between a tile's left corner and the top of its first grass
+/// column (matched against the original's screen).
+const GRASS_ROW: i32 = 0;
+const GRASS_COLUMN: i32 = 1;
 
-/// What the window shows outside the lot.
-pub const BACKGROUND: [u8; 3] = [0, 0, 0];
+/// What the window shows outside the lot: the original's grey (5-6-5
+/// red 14, green 28, blue 14), widened to 8 bits a channel.
+pub const BACKGROUND: [u8; 3] = [115, 113, 115];
 
 /// Counts of what one frame drew, for tests and the viewer's status line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -47,14 +47,34 @@ pub fn draw(
         camera,
         assets,
         canvas,
+        grass: Grass::new(lot, camera),
         stats: Stats::default(),
     };
-    for level in 1..=camera.level.clamp(1, 2) {
+    let top = camera.level.clamp(1, 2);
+    for level in 1..=top {
         painter.floors(level);
-        let cut = painter.walls(level);
+        // Only the top floor shown is cut away; the floors below it stand
+        // (0x4a8895, the old prototype's `wall_view.rs`).
+        let cut = if level < top {
+            Cut::None
+        } else {
+            match camera.walls {
+                Walls::Up => Cut::None,
+                Walls::Down => Cut::All,
+                Walls::Cutaway => Cut::Mask(Box::new(Mask::new(lot, camera))),
+            }
+        };
+        painter.walls(level, &cut);
         painter.objects(level, &cut);
     }
     painter.stats
+}
+
+/// Which walls of a level are cut down, and which objects hide with them.
+enum Cut {
+    None,
+    All,
+    Mask(Box<Mask>),
 }
 
 /// A wall segment by its two lot corners, the lower first.
@@ -93,12 +113,20 @@ fn segments(x: i32, y: i32) -> [Segment; 4] {
     ]
 }
 
+/// A fine position just beside a wall segment's middle, on its normal's
+/// side (side 0) or the other (side 1).
+fn wall_side(s: &Segment, side: usize) -> [i32; 2] {
+    let sign = if side == 0 { 2 } else { -2 };
+    [0, 1].map(|i| (s.from[i] + s.to[i]) * 8 + sign * s.normal[i])
+}
+
 struct Painter<'a> {
     world: &'a World,
     lot: &'a Lot,
     camera: &'a Camera,
     assets: &'a mut Assets,
     canvas: &'a mut Canvas,
+    grass: Grass,
     stats: Stats,
 }
 
@@ -118,6 +146,11 @@ impl Painter<'_> {
             _ => 3,
         };
         i32::from(h[corner]) * 16
+    }
+
+    /// The light at a fine position on a level (0 or 1).
+    fn light(&self, level: usize, fine: [i32; 2]) -> Light {
+        Light::from_byte(self.lot.light_at(level, fine))
     }
 
     /// Rotates a lot corner (0 to 64) into the view.
@@ -152,17 +185,25 @@ impl Painter<'_> {
     }
 
     fn floors(&mut self, level: i32) {
+        // The ground shows wherever a floor leaves it uncovered, such as
+        // half of a split tile. All of it goes first: a grass column can
+        // reach a pixel or two into the next tile, and floors win there.
+        // The original draws no ground on the lot's outermost tiles
+        // (0x49cecc).
+        if level == 1 {
+            let inner = 1..self.lot.size as i32 - 1;
+            for x in inner.clone() {
+                for y in inner.clone() {
+                    self.terrain([x, y]);
+                }
+            }
+        }
         let index = (level - 1) as usize;
         let zoom = self.camera.zoom.index();
         let base = level_elevation(level);
         for x in 0..self.lot.size as i32 {
             for y in 0..self.lot.size as i32 {
                 let cell = Lot::cell(x as usize, y as usize);
-                // The ground shows wherever a floor leaves it uncovered,
-                // such as half of a split tile.
-                if level == 1 {
-                    self.terrain([x, y]);
-                }
                 let floor = self.lot.levels[index].floors[cell];
                 if floor == 0 {
                     continue;
@@ -196,8 +237,17 @@ impl Painter<'_> {
                     } else {
                         image.clone()
                     };
+                    // A point inside the half, for its room's light.
+                    let inside = match (floor == lot::SPLIT_FLOOR, wall.segments, half) {
+                        (false, _, _) => [8, 8],
+                        (true, s, 0) if s & lot::DESCENDING != 0 => [4, 4],
+                        (true, s, _) if s & lot::DESCENDING != 0 => [12, 12],
+                        (true, _, 0) => [4, 12],
+                        (true, _, _) => [12, 4],
+                    };
+                    let light = self.light(index, [x * 16 + inside[0], y * 16 + inside[1]]);
                     let camera = self.camera;
-                    self.canvas.draw(&image, at, false, |_, y, _| {
+                    self.canvas.draw_lit(&image, at, false, light, |_, y, _| {
                         depth::ground(camera, y, elevation)
                     });
                     self.stats.floors += 1;
@@ -206,35 +256,61 @@ impl Painter<'_> {
         }
     }
 
-    /// Fills a grass tile as two triangles between its corners.
+    /// Draws a grass tile in the original's four-pixel columns (see
+    /// [`crate::grass`]).
     fn terrain(&mut self, [x, y]: [i32; 2]) {
-        let g = i32::from(self.lot.grass[Lot::cell(x as usize, y as usize)]).clamp(0, 31);
-        let light = lerp(LIGHT_BROWN, LIGHT_GREEN, g);
-        let dark = lerp(DARK_BROWN, DARK_GREEN, g);
-        let points = [[x, y], [x + 1, y], [x + 1, y + 1], [x, y + 1]].map(|c| {
-            let v = self.rotate_corner(c);
-            (
-                self.corner_screen(c, 1),
-                depth::point([v[0] * 16, v[1] * 16], self.corner_elevation(c)),
-            )
-        });
-        let origin = self.camera.origin;
-        for [a, b, c] in [[0, 1, 2], [0, 2, 3]] {
-            fill_triangle(self.canvas, points[a], points[b], points[c], |x, y| {
-                if speckle(x - origin[0], y - origin[1]) {
-                    dark
-                } else {
-                    light
+        let view = self.camera.rotate_tile([x, y]);
+        let Some((shades, colors)) = self.grass.tile(view) else {
+            return;
+        };
+        let rotation = usize::from(self.camera.rotation & 3);
+        let h = self.lot.heights[Lot::cell(x as usize, y as usize)];
+        let heights: [u8; 4] = std::array::from_fn(|n| h[(n + 4 - rotation) & 3]);
+        // The left corner, at height 0; columns start a row above it.
+        let corner = self.camera.project([view[0], view[1] + 1], 1, 0);
+        let zoom = self.camera.zoom.level();
+        let width = 16 << zoom;
+        // Skip a tile wholly off the canvas, even on the highest ground.
+        let reach = width + (255 << (zoom + 1));
+        let size = [self.canvas.width, self.canvas.height].map(|n| n as i32);
+        if (0..2).any(|i| corner[i] < -reach || corner[i] > size[i].saturating_add(reach)) {
+            return;
+        }
+        let lit = self.light(0, [x * 16 + 8, y * 16 + 8]);
+        // The whole tile takes the depth of its lowest corner. Following
+        // the slope would be truer, but floors take their top corner's
+        // elevation, and where sloped ground meets a floor the grass would
+        // then cover the floor's edge, which the original does not.
+        let elevation = (0..4)
+            .map(|c| self.corner_elevation([x + (c & 1), y + (c >> 1)]))
+            .min()
+            .unwrap_or(0);
+        let camera = self.camera;
+        let left = corner[0] + GRASS_COLUMN;
+        for column in grass::columns(left, corner[1] + GRASS_ROW, heights, shades, colors, zoom) {
+            for (row, pixels) in column.rows() {
+                let depth = depth::ground(camera, row, elevation);
+                for (i, &p) in pixels.iter().enumerate() {
+                    self.canvas
+                        .plot(column.x + i as i32, row, depth, lit.apply(grass::widen(p)));
                 }
-            });
+            }
+            let index = ((column.x - left) / 4) as usize;
+            for (bx, foot, height, p) in self.grass.blades(view, &column, index) {
+                let depth = depth::ground(camera, foot, elevation);
+                let color = lit.apply(grass::widen(p));
+                for row in foot.saturating_sub(height - 1)..=foot {
+                    self.canvas.plot(bx, row, depth, color);
+                }
+            }
         }
     }
 
-    /// The wallpaper on each side of a wall (first along its normal), and
-    /// the tile on each side (the old prototype's `faces` in
+    /// The wallpaper on each side of a wall, first along its normal (the
+    /// old prototype's `faces` in
     /// `legacy/crates/sims-render/src/walls.rs`, checked there against the
     /// original's wall records).
-    fn sides(&self, level: usize, x: i32, y: i32, bit: u8) -> ([u16; 2], [[i32; 2]; 2]) {
+    fn sides(&self, level: usize, x: i32, y: i32, bit: u8) -> [u16; 2] {
         let walls = &self.lot.levels[level].walls;
         let cell = |x: i32, y: i32| -> WallCell {
             if self.lot.contains(x, y) {
@@ -245,15 +321,9 @@ impl Painter<'_> {
         };
         let t = cell(x, y);
         match bit {
-            lot::WEST => (
-                [t.patterns[0], cell(x - 1, y).patterns[3]],
-                [[x, y], [x - 1, y]],
-            ),
-            lot::NORTH => (
-                [t.patterns[1], cell(x, y - 1).patterns[2]],
-                [[x, y], [x, y - 1]],
-            ),
-            _ => ([t.patterns[3], t.patterns[2]], [[x + 1, y], [x - 1, y]]),
+            lot::WEST => [t.patterns[0], cell(x - 1, y).patterns[3]],
+            lot::NORTH => [t.patterns[1], cell(x, y - 1).patterns[2]],
+            _ => [t.patterns[3], t.patterns[2]],
         }
     }
 
@@ -276,13 +346,12 @@ impl Painter<'_> {
         found
     }
 
-    /// Draws a level's walls and returns the ones drawn cut down.
-    fn walls(&mut self, level: i32) -> BTreeSet<Edge> {
+    /// Draws a level's walls.
+    fn walls(&mut self, level: i32, cut: &Cut) {
         let index = (level - 1) as usize;
         let zoom = self.camera.zoom.index();
         let base = level_elevation(level);
         let rise = 4 << self.camera.zoom.level();
-        let mut cut_edges = BTreeSet::new();
         let openings = self.wall_objects(level);
         for x in 0..self.lot.size as i32 {
             for y in 0..self.lot.size as i32 {
@@ -296,24 +365,16 @@ impl Painter<'_> {
                     } else {
                         wall.styles[1]
                     };
-                    let (patterns, tiles) = self.sides(index, x, y, s.bit);
+                    let patterns = self.sides(index, x, y, s.bit);
                     let n = self.rotate_direction(s.normal);
                     let front = usize::from(n[0] + n[1] < 0);
-                    let cut = match self.camera.walls {
-                        Walls::Up => false,
-                        Walls::Down => true,
-                        // Up only if it is the back wall of a room: indoors on
-                        // the camera's side and outdoors behind.
-                        Walls::Cutaway => {
-                            let [near, far] = [tiles[front], tiles[1 - front]];
-                            self.lot.outdoors(index, near[0], near[1])
-                                || !self.lot.outdoors(index, far[0], far[1])
-                        }
-                    };
+                    let cut = solid(style)
+                        && match cut {
+                            Cut::None => false,
+                            Cut::All => true,
+                            Cut::Mask(mask) => mask.cuts(self.camera, [x, y], s.bit),
+                        };
                     let key = edge(s.from, s.to);
-                    if cut {
-                        cut_edges.insert(key);
-                    }
                     // The frame from the wall's direction on screen.
                     let a = self.corner_screen(s.from, level);
                     let b = self.corner_screen(s.to, level);
@@ -351,8 +412,12 @@ impl Painter<'_> {
                         }
                     };
                     let elevation = base + self.corner_elevation(s.from);
+                    // The side that shows takes the light of the room on
+                    // that side: sampled just beside the wall's middle, so
+                    // a split tile gives the triangle touching the wall.
+                    let light = self.light(index, wall_side(&s, front));
                     let camera = self.camera;
-                    self.canvas.draw(&image, at, false, |sx, sy, _| {
+                    self.canvas.draw_lit(&image, at, false, light, |sx, sy, _| {
                         let row = match frame {
                             0 => foot[1] - (sx - foot[0]) / 2,
                             1 => foot[1] + (sx - foot[0]) / 2,
@@ -364,10 +429,9 @@ impl Painter<'_> {
                 }
             }
         }
-        cut_edges
     }
 
-    fn objects(&mut self, level: i32, cut: &BTreeSet<Edge>) {
+    fn objects(&mut self, level: i32, cut: &Cut) {
         let zoom = self.camera.zoom.index();
         let mut list = Vec::new();
         for (&id, o) in &self.world.objects {
@@ -402,12 +466,19 @@ impl Painter<'_> {
                 self.stats.missing_objects += 1;
                 continue;
             };
-            // Doors and windows hide with their wall when it is cut down
-            // (simplified from the original's 0x4aa446; see the decisions
-            // log).
-            if definition.shapes_wall()
-                && object_edge(o.position, &o.data).is_some_and(|e| cut.contains(&e))
-            {
+            // Doors, windows and the like hide where the walls are cut
+            // (0x4aa446). Their scripts mark them when the lot loads; in a
+            // house read without running those, the objects that shape a
+            // wall still hide.
+            let tile = [o.position[0] >> 4, o.position[1] >> 4];
+            let walled = cutaway::hides_with_walls(&o.data) || definition.shapes_wall();
+            let hidden = walled
+                && match cut {
+                    Cut::None => false,
+                    Cut::All => true,
+                    Cut::Mask(mask) => mask.hides(self.camera, tile, &o.data),
+                };
+            if hidden {
                 continue;
             }
             let Some(group) = u16::try_from(o.data.first().copied().unwrap_or(0))
@@ -426,6 +497,12 @@ impl Painter<'_> {
             }
             let facing = o.data.get(1).copied().unwrap_or(0);
             let base = level_elevation(level) + ground;
+            // An object takes the light of the room at its position (the
+            // original samples the tile light map there, 0x467482).
+            let light = Light::from_byte(
+                self.lot
+                    .light_at((level - 1) as usize, [o.position[0], o.position[1]]),
+            );
             for part in parts {
                 if !sprite_visible(part.sprite, definition.dynamic_base, &o.dynamic_sprites) {
                     continue;
@@ -445,9 +522,10 @@ impl Painter<'_> {
                 } else {
                     part_anchor(self.camera, o.position, facing, part.object, base)
                 };
-                self.canvas.draw(&part.image, at, part.flip, |_, _, byte| {
-                    depth::sprite(anchor, byte)
-                });
+                self.canvas
+                    .draw_lit(&part.image, at, part.flip, light, |_, _, byte| {
+                        depth::sprite(anchor, byte)
+                    });
             }
             self.stats.objects += 1;
         }
@@ -546,16 +624,24 @@ fn object_edge(position: [i32; 3], data: &[i16]) -> Option<Edge> {
     Some(edge(a, b))
 }
 
+/// Whether a wall style can be cut down: not a fence, railing or the
+/// like (styles 2, 12, 13, 14 and 255; 0x54059a).
+fn solid(style: u16) -> bool {
+    !matches!(style, 2 | 12 | 13 | 14 | 255)
+}
+
 /// The wall style whose cut-down shape a cut wall with a door or window in
 /// it takes.
 const PLAIN_STYLE: u16 = 1;
 
 /// A wall face: the pattern's frame cut to the shape's frame. A wall with
 /// style 22 or 23 takes its shape from the door or window in it when it is
-/// up. Cut down, it is a plain wall's stub: the opening's own cut sprites
-/// are one small outline shared by every door and window, and the
-/// original shows the same stub under a window as beside it (screenshot
-/// comparison, 2026-11-14; which style's stub it takes is unverified).
+/// up. Cut down, a wall of style 3, 5, 6, 15, 22 or 23 (the styles the
+/// original marks with bit 8 when it cuts them, 0x54059a; doors stand in
+/// style 3) is a plain wall's stub: the openings' own cut sprites are one
+/// small outline, and the original shows the same stub under a window or
+/// door as beside it (screenshot comparison, 2026-11-14; which style's
+/// stub it takes is unverified).
 fn wall_image(
     assets: &mut Assets,
     pattern: u16,
@@ -566,7 +652,7 @@ fn wall_image(
     frame: usize,
 ) -> Option<Image> {
     let shape = match opening {
-        Some(_) if cut && matches!(style, 22 | 23) => {
+        _ if cut && matches!(style, 3 | 5 | 6 | 15 | 22 | 23) => {
             assets.shape(PLAIN_STYLE, true, zoom)?[frame].clone()
         }
         Some(definition) if matches!(style, 22 | 23) => {
@@ -614,57 +700,6 @@ fn unrotate_local(camera: &Camera, [x, y]: [i32; 2]) -> [i32; 2] {
     }
 }
 
-fn lerp(a: [u8; 3], b: [u8; 3], t: i32) -> [u8; 3] {
-    std::array::from_fn(|i| (i32::from(a[i]) + (i32::from(b[i]) - i32::from(a[i])) * t / 31) as u8)
-}
-
-/// A fixed scatter of dark grass pixels, about one in four, tied to the
-/// lot so it moves with it.
-fn speckle(x: i32, y: i32) -> bool {
-    let mut n = (x as u32).wrapping_mul(0x9E37_79B1) ^ (y as u32).wrapping_mul(0x85EB_CA77);
-    n ^= n >> 15;
-    n = n.wrapping_mul(0x2C1B_3C6D);
-    n ^= n >> 12;
-    n & 3 == 0
-}
-
-/// Fills a triangle, interpolating depth, with a colour per pixel. Pixels
-/// on an edge two triangles share are filled by both; the depth test keeps
-/// that harmless.
-fn fill_triangle(
-    canvas: &mut Canvas,
-    (a, da): ([i32; 2], i32),
-    (b, db): ([i32; 2], i32),
-    (c, dc): ([i32; 2], i32),
-    color: impl Fn(i32, i32) -> [u8; 3],
-) {
-    let area = i64::from((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]));
-    if area == 0 {
-        return;
-    }
-    let x0 = a[0].min(b[0]).min(c[0]).max(0);
-    let x1 = a[0].max(b[0]).max(c[0]).min(canvas.width as i32 - 1);
-    let y0 = a[1].min(b[1]).min(c[1]).max(0);
-    let y1 = a[1].max(b[1]).max(c[1]).min(canvas.height as i32 - 1);
-    let side = |p: [i32; 2], q: [i32; 2], x: i32, y: i32| {
-        i64::from((q[0] - p[0]) * (y - p[1]) - (q[1] - p[1]) * (x - p[0]))
-    };
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            let w = [side(b, c, x, y), side(c, a, x, y), side(a, b, x, y)];
-            let inside = if area > 0 {
-                w.iter().all(|&w| w >= 0)
-            } else {
-                w.iter().all(|&w| w <= 0)
-            };
-            if inside {
-                let d = (w[0] * i64::from(da) + w[1] * i64::from(db) + w[2] * i64::from(dc)) / area;
-                canvas.plot(x, y, d as i32, color(x, y));
-            }
-        }
-    }
-}
-
 /// Whether a dynamic sprite shows: an object keeps one word per dynamic
 /// sprite, counted from its definition's first dynamic sprite ID, and a
 /// sprite outside that range always shows (the original's 0x437f99, read
@@ -688,7 +723,22 @@ mod tests {
             level: 1,
             origin: [0, 0],
             walls: Walls::Up,
+            focus: crate::Focus::default(),
         }
+    }
+
+    #[test]
+    fn a_wall_takes_light_from_the_triangle_touching_it() {
+        // Sample points land inside the tile, in the triangle that holds
+        // the wall's side (1 SW, 2 SE, 3 NE, 4 NW; see `Lot::room_at`).
+        let [west, north, descending, ascending] = segments(3, 5);
+        assert_eq!(wall_side(&west, 0), [50, 88]);
+        assert_eq!(wall_side(&west, 1), [46, 88]);
+        assert_eq!(wall_side(&north, 0), [56, 82]);
+        assert_eq!(wall_side(&descending, 0), [58, 90]);
+        assert_eq!(wall_side(&descending, 1), [54, 86]);
+        assert_eq!(wall_side(&ascending, 0), [58, 86]);
+        assert_eq!(wall_side(&ascending, 1), [54, 90]);
     }
 
     #[test]
@@ -792,20 +842,5 @@ mod tests {
                 assert!(opaque(&a) > 127 * 16 && opaque(&b) > 127 * 16);
             }
         }
-    }
-
-    #[test]
-    fn triangles_fill_inside_with_interpolated_depth() {
-        let mut canvas = Canvas::new(10, 10, [0, 0, 0]);
-        fill_triangle(
-            &mut canvas,
-            ([0, 0], 0),
-            ([9, 0], 90),
-            ([0, 9], 0),
-            |_, _| [1, 1, 1],
-        );
-        assert_eq!(canvas.color[0], [1, 1, 1]);
-        assert_eq!(canvas.depth[5], 50);
-        assert_eq!(canvas.color[99], [0, 0, 0]);
     }
 }

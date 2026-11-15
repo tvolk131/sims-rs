@@ -47,6 +47,202 @@ carry slot (animator +0x13c). The original's path is `0x589683`.
 Reopen if a capture shows the carry layer elsewhere in the skin's list,
 or a carry clip that is not found and still plays.
 
+## 2026-11-14: The cutaway cuts the rooms the original is looking at
+
+Until now the cutaway cut every wall with a room on the camera's side.
+The original cuts far fewer, and the rule is now read from its code (the
+memory capture, as for the grass), following the old prototype's ports
+in `legacy/crates/sims-sim/src/lot_presenter/`.
+
+- **Which rooms.** The view keeps a list of three rooms, newest first,
+  that never holds a room twice (0x49e923; its size is set at 0x4a6d96).
+  Each pointer move in the cutaway adds the room under the pointer, then
+  the first other room straight below it on screen, looked for every
+  half tile down to half a storey (0x4ab7ee). The pointer is placed on
+  the terrain as drawn, by the original's tile search (0x4a955d, 0x4a97c3).
+  Off the lot, or on its outer ring of tiles, the mask is emptied
+  (0x4ac07b) but the list is kept for the pointer's return. A change of
+  floor empties the list (0x4a80c7). In live mode the selected Sim's room
+  is added too, when the Sim is on the floor shown (0x4ab992). That is the
+  room the simulation keeps for the Sim, which on a split tile is not the
+  tile's. So the choice depends on the pointer and on who is selected: it
+  is input, not lot state. `Camera::focus` carries it, and `Focus::point`
+  does the pointer's part.
+- **The mask.** Those rooms become a mask of view tiles (0x468203). Each
+  of a room's tiles is in it, and so is every tile below one of them on
+  screen whose standing walls would overlap it. An outdoor room adds no
+  tiles of its own. An outdoor selected Sim adds a square of up to 4 by
+  4 tiles towards the camera. If any of the rooms is outdoors, the
+  pointer adds a 4 by 4 square: from the tile four tiles' height below it
+  on screen, four tiles back up.
+- **Which walls.** A wall is cut where the mask holds the tiles on both
+  sides of it (0x54059a; diagonals have their own offsets). Fences and
+  the like (styles 2, 12, 13, 14, 255) are never cut. Only the top floor
+  shown is cut; the floors below stand (0x4a8895). Walls-down now follows
+  the same floor rule.
+- **Objects.** An object that hides with the walls hides when the mask
+  holds its tile and the tile its facing side looks onto (0x4aa446). The
+  mark is flag 0x400 of data word 8. Doors and windows set it in their
+  own scripts as the lot loads, so a house read without a load lacks it.
+  There, objects that cut their shape into a wall still hide, as before.
+- **Cut doors.** A cut wall of style 3, 5, 6, 15, 22 or 23 draws a plain
+  wall's stub. The original marks those styles with bit 8 when it cuts
+  them. Doors stand in style 3 walls, whose own cut sprite is an outline.
+
+**Result at the compared camera** (far zoom, rotation 0, floor 1, the
+settled cutaway screenshot). Which rooms the original had in its list
+cannot be read from the screenshot. The best fit is the kitchen (room 1)
+from the pointer, plus the bedroom, where the selected Sim stands.
+Adding the living room or the bathroom lowers the match. The foyer and
+the bathroom now stand, as in the original. Exact matches:
+
+- Box around the house (x 120 to 500, y 100 to 320): 61.0% before.
+  65.6% now, with the house read as before; 67.1% with the world after
+  one tick of `sims boot`, whose doors and windows carry their flag.
+- Whole screen: 81.2% before, 82.0% now, and 82.4% after a boot.
+
+**What still differs:** the trim along the top of cut walls, the Sims,
+and the light on a few walls. The bedroom's west wall, with its door,
+is cut in the original but stands here. The hall behind it, under the
+stairs, is outdoors in our rooms, and no mask from an indoor room
+reaches west of a room. So either the original counts that hall as a
+room, or its list held something else.
+
+**Unverified:**
+
+- Rotations, other zooms and the upper floor. The tests check that a
+  looked-at room loses exactly its front walls at every rotation.
+- Diagonal walls. The offsets follow the old port, and the house has
+  none in a cut room.
+- The pointer's 4 by 4 square, and the terrain-aware pointer, against
+  the original: this house's lot is flat where it was compared.
+- Whether the list also empties on a rotation or a zoom. Other callers
+  of the clear (0x4a81a1, 0x4a8517, 0x4a85fa, 0x4a86c2) were not read.
+
+## 2026-11-14: The grass is drawn as the original draws it
+
+The speckled grass is gone. The ground is now drawn the way the original
+draws it, read from its code. The installed game is encrypted, so the code
+was read from a memory capture of the running game in the harness's
+private cache; nothing from it is in the repository. The addresses below
+are in that image.
+
+- **Palette** (0x49c8d3, 0x49e6cf). 32 grass colors run from brown to
+  green. Each has 128 shades from light to dark. The light end blends the
+  light brown 0x9d7541 into the light green 0x50743b; the dark end blends
+  0x513c12 into 0x0e3508. A shade is a 4 by 2 block: two of its pixels
+  are 8 and 6 shades lighter, and the second row is mirrored. Channels
+  are truncated, then cut to 16-bit color.
+- **Shade at each vertex** (0x4a4994, 0x4a4783, 0x4c47f7). The light on
+  each of the six triangles around a vertex is the squared cosine between
+  the sun and the slope. A tile is 2√6 height units wide (0x434df6). The
+  sun stands π/10 from the zenith at rotation 0. Rotations 1 to 3 use 2,
+  3 and 2 tenths. The mean becomes a shade, 127 − ⌊127·mean⌋. A jitter of
+  up to two shades is added from the game's generator, seeded 0x40de9. A
+  wall on the tile's far edge darkens that edge by 64 shades.
+- **Grass color** (0x49cd43). Each corner averages the grass values of
+  its four tiles and scales them to 0 to 31.
+- **Columns** (0x49dacd, 0x49da21). A tile is drawn in four-pixel
+  columns. Shade and color are interpolated down each column in 256ths.
+- **Blades** (0x49dfbd, 0x49d79d, 0x49d8fb, 0x49cf9f). 4800 blades are
+  scattered over a tile's shape from seed 0x4aa47b44. Each has a rank, a
+  column, a depth down it, a shade 0 to 60 darker than the ground and a
+  height (one pixel at the two far zooms, three or four near). A tile
+  draws the blades whose ranks fall in a window. The window's size
+  follows the tile's grass value: 500 to 1200 blades, a quarter of that
+  at far zoom, none on a floor. Its start comes from a random map seeded
+  0x4aa47b44.
+- **The lot's size matters.** The blade map and the jitter loop both run
+  over the lot's own size, not the arrays' 64 (0x49c9c7, 0x4a4a43). The
+  Goth house is 52 tiles. That size sets which random draw each tile and
+  vertex gets. `open_house` now applies the size the house asks for in
+  global 23, as the load's resize does (`Interpreter::resize`). Before
+  this, fitting single tiles found the blade counts right and the starts
+  wrong. The starts matched the map at 52 entries a row. Fixing the
+  jitter loop took the grass box from 84% to 100%.
+- **Edges.** Ground is drawn only from tile 1 to the lot's size less 2
+  (0x49cecc). Beyond the lot the window shows the original's grey, 16-bit
+  (14, 28, 14), which is now `BACKGROUND`.
+
+**Result at the compared camera** (far zoom, rotation 0, floor 1, 800x600,
+the screenshots of the lighting entry below). Exact matches:
+
+- In a box of open grass (x 530 to 640, y 335 to 365): 0% to 100%,
+  in both wall modes.
+- The whole screen: 18.1% to 83.6% with walls up, and 16.1% to 81.2%
+  with walls cut away.
+- The box around the house (x 120 to 500, y 100 to 320): 72.2% with
+  walls up and 61.0% cut away. It was 37.5% and 26.3%.
+
+Nearly every open grass tile now matches at least 90%. **What still
+differs:** the house and its objects (lamp pools, the cut-wall cap,
+some gravestone sprites), Sims, which are not drawn, and the game's
+control panel in the bottom-left corner.
+
+**Unverified:**
+
+- Other zooms (taller blades near) and rotations. In particular, whether
+  the blade map and the jitter loop count from the lot's least corner in
+  the view, as here; the pool test at 0x47c16d suggests view
+  coordinates. At rotation 0 that corner is 0 either way.
+- Depth on sloped ground. A tile's ground takes the depth of its lowest
+  corner. Following the slope would hide sprites behind hills better, but
+  floors take their top corner's elevation, and the grass then covered a
+  floor's edge where sloped ground meets it (0.1% fewer exact pixels).
+  One depth model for floors and ground would settle it.
+- Grass on a pool, which the original leaves bare. Pools are not looked
+  at.
+- A floor tile split by a diagonal wall. The original keeps the blade
+  count of whichever tile it drew before; here it counts by its own
+  grass.
+- Seasons, which swap the blade-height tables (0x6c629c, 0x6c62a8).
+- A flag at 0x8d that blanks the colors of tiles on the lot's edge. It
+  is off in this capture and not modelled.
+
+## 2026-11-14: Rooms darken by their light in the lot drawing
+
+Floors, walls, terrain and objects are now drawn darker in a dim room, as
+the original draws them.
+
+- **Which light.** Each room's shown light comes from the simulation
+  (`Room::shown_light`, read only). As in the original (0x46772d), it
+  becomes a byte, `light * 255` rounded half up. Drawing reads the byte
+  back as a fraction and keeps it between 0.5 and 1; that clamp is the
+  old prototype's reading of the drawing context
+  (`legacy/crates/sims-vm/.../draw/context/light.rs`). So even an unlit
+  room shows at half brightness. Outdoor rooms the light pass never
+  counted are drawn at full light.
+- **Where it is read.** A floor half takes the light of the room under
+  it; a split tile's two triangles each take their own room's. A wall
+  takes the room just beside its middle on the side that shows, so a
+  split tile gives the triangle touching the wall. An object uses the
+  room at its position. Terrain uses floor 0's room at the tile centre.
+- **How it darkens a pixel: fitted, not read from code.** The original
+  draws in 16-bit color. Dividing its pixels by ours in the Goth house
+  gave a sharp peak at 0.517 indoors and 1.0 outdoors. The booted
+  snapshot's indoor rooms all have light at most 0.127, so they sit at
+  the 0.5 clamp. Fitting each 16-bit channel gave
+  `(v * k + 255) >> 8` with k = light in 256ths for red and green and
+  one more for blue. That reproduces 69% of the indoor pixels exactly.
+  The other 31% are mostly one step off.
+- **Result at the compared camera** (far zoom, rotation 0, floor 1,
+  800x600). Exact matches among non-grass pixels:
+  - walls cut away: 33.9% to 42.2%;
+  - walls up: 39.7% to 47.3%.
+
+  In the box around the house (x 120 to 500, y 100 to 320), exact
+  matches rose from 6.8% to 26.3% with walls cut away and from 20.5% to
+  37.5% with walls up.
+- **What still differs.** The grass (ours is speckled; the original's is
+  smooth and shaded) and the wood cap on cut-down walls. Some gravestone
+  sprites differ, and Sims are not drawn. Some pixels in the house are
+  lit between 0.6 and 0.9 of ours. They look like pools of lamp light,
+  probably from the falloff tables in `lightMap.dat`; they are not
+  modelled.
+- **Unverified.** Every light level other than the 0.5 clamp and full
+  light. Night outdoors. Whether the original lights a wall by the room
+  on its visible side. Lamp pools. Any of these would reopen the formula.
+
 ## 2026-11-14: Find Best Object for Function
 
 Tick 417 of the Goth house stopped on Find Best Object for Function
@@ -1139,7 +1335,6 @@ The game's own archives hold none. Keeping both sizes on
 `sims_content::Member` waits on `sims-people`, which builds that struct
 itself and also reads FAR directories without these caps.
 
-
 ## 2026-11-14: People: transparent texels, shared edges, and people made after the load
 
 A review of `sims-people` found five defects. They are fixed as follows.
@@ -1238,7 +1433,6 @@ A review of `sims-audio` found seven defects. The fixes:
   wins. How the original chooses is unknown.
 
 Reopen when a run with sound shows different group or fade behaviour.
-
 
 ## 2026-11-14: Hidden objects, sprite world offsets and soft edges in the lot drawing
 
@@ -1353,7 +1547,6 @@ chunk out. The install census and the gated digests are unchanged.
 `sims-vm`'s `Program` still reads `Iff::chunks` directly (a later chunk
 of one ID wins there, deleted ones included); on the game's own files
 that agrees with the table.
-
 
 ## 2026-11-14: Bella Goth compared with the original; the mirror is still open
 

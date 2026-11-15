@@ -12,7 +12,8 @@
 //! Keys: `+`/`-` or the wheel zoom, `[`/`]` or `,`/`.` rotate, Page Up and
 //! Page Down change the floor, `1`/`2`/`3` choose walls up, cutaway and
 //! down, the arrow keys or a left-button drag scroll, `S` saves the frame
-//! as a PNG, Escape quits.
+//! as a PNG, Escape quits. As in the original, the cutaway cuts the walls
+//! in front of the last rooms the pointer passed over.
 //!
 //! `--hud` draws the original's live-mode control panel over the lot
 //! (`sims-ui`), and the dialog the world waits on if there is one (a
@@ -344,9 +345,22 @@ impl ApplicationHandler for Viewer {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
                 let point = self.canvas_point(position);
+                let mut redraw = false;
                 if let Some(hud) = &mut self.hud
                     && hud.hover(point)
                 {
+                    redraw = true;
+                }
+                // The cutaway follows the rooms the pointer passes over;
+                // the original looks only while the cutaway is on, and
+                // only over the lot's view, not its panel.
+                let over_panel = self.hud.as_ref().is_some_and(|h| h.covers(point));
+                if self.drag.is_none() && !over_panel && self.view.camera.walls == Walls::Cutaway {
+                    let camera = self.view.camera;
+                    self.view.camera.focus.point(&self.lot, &camera, point);
+                    redraw |= self.view.camera.focus != camera.focus;
+                }
+                if redraw {
                     self.dirty = true;
                     if let Some(w) = &self.window {
                         w.request_redraw();

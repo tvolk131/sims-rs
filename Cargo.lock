@@ -1633,8 +1633,10 @@ dependencies = [
 name = "sims-render"
 version = "0.1.0"
 dependencies = [
+ "libm",
  "sha2",
  "sims-content",
+ "sims-core",
  "sims-formats",
  "sims-sim",
 ]
