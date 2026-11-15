@@ -43,3 +43,61 @@ fn a_step_before_a_complete_load_says_so() {
     };
     assert_eq!(frame.to_string(), "the frame before tick 1 failed: x");
 }
+
+#[test]
+fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    let sim = lot.load_report().finished.unwrap().sim.unwrap();
+    lot.step().unwrap();
+    let queue = |lot: &Lot| {
+        lot.world().objects[&sim]
+            .person
+            .as_ref()
+            .unwrap()
+            .queue
+            .clone()
+    };
+
+    // Object 18's listing runs check trees and fails partway, at a scope
+    // not ported, and the lot is as it was.
+    let before = lot.world().hash();
+    let refused = lot.pie_menu(sim, 18).unwrap_err().to_string();
+    assert!(refused.contains("scope 12"), "{refused}");
+    assert_eq!(lot.world().hash(), before);
+
+    // Person 16: listing changes the lot (its check trees' work), and
+    // the change is kept.
+    let before = lot.world().hash();
+    let menu = lot.pie_menu(sim, 16).unwrap_or_else(|e| panic!("{e}"));
+    assert_ne!(lot.world().hash(), before);
+
+    // Every entry routes through a queued action that runs at
+    // once (0x45d240), which is not ported, and each refusal leaves the
+    // lot as it was.
+    assert!(!menu.actions.is_empty());
+    assert!(
+        menu.actions
+            .iter()
+            .all(|a| a.caller == sim as i16 && a.uid == 0)
+    );
+    let before = lot.world().hash();
+    for action in menu.actions {
+        let refused = lot.pick(sim, action).unwrap_err().to_string();
+        assert!(refused.contains("0x45d240"), "{refused}");
+        assert_eq!(lot.world().hash(), before);
+    }
+
+    // Object 1's first entry is queued.
+    let menu = lot.pie_menu(sim, 1).unwrap_or_else(|e| panic!("{e}"));
+    let action = menu.actions[0].clone();
+    let queued = lot.pick(sim, action).unwrap();
+    assert!(queued.is_some());
+    assert_eq!(queue(&lot).last().map(|a| a.uid), queued);
+    lot.step().unwrap();
+}
