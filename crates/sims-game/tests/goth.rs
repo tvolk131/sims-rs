@@ -1322,3 +1322,57 @@ fn the_job_panel_shows_what_the_next_level_needs() {
     data[18] = 200;
     assert_eq!(needs(&world), [0, 0, 100, 0, 300, 0]);
 }
+
+/// A press on the selected Sim's portrait centres the view on him even
+/// after the view has been scrolled further than 16 bits of screen hold:
+/// where the drawing puts him then is the middle of the screen, a little
+/// above his feet.
+#[test]
+fn a_press_on_the_selected_goths_portrait_centres_him_after_a_long_scroll() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(50), 50);
+    game.resize([800, 600]);
+    game.render();
+    let mortimer = game.lot().world().selected().expect("a Sim is selected");
+    let portrait = game
+        .panel()
+        .iter()
+        .find(|item| item.command == Some(sims_ui::command::Command::Select { sim: mortimer }))
+        .expect("his portrait")
+        .rect;
+    let press = [
+        portrait.x + portrait.width / 2,
+        portrait.y + portrait.height / 2,
+    ];
+    for scroll in [[40_000, 0], [-40_000, 50_000], [0, -60_000]] {
+        let origin = game.view.camera.origin;
+        game.view.apply(sims_game::view::Move::Scroll(scroll));
+        assert!(
+            game.view
+                .camera
+                .origin
+                .iter()
+                .zip(origin)
+                .any(|(n, o)| (n - o).abs() > 1 << 15),
+            "{:?}",
+            game.view.camera.origin
+        );
+        game.press(press);
+        let camera = game.view.camera;
+        let position = game.lot().world().objects[&mortimer].position;
+        let drawn = camera.project_fine(
+            camera.rotate_fine([position[0], position[1]]),
+            position[2],
+            0,
+        );
+        let rise = [19, 39, 78][camera.zoom.level() as usize - 1];
+        assert!(
+            (drawn[0] - 400).abs() <= 1 && (drawn[1] - rise - 300).abs() <= 1,
+            "{scroll:?}: drawn at {drawn:?}"
+        );
+    }
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}

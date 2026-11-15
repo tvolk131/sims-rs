@@ -19,7 +19,7 @@ use crate::people::People;
 use crate::pick;
 use crate::sound;
 use crate::view::{Move, View};
-use sims_render::{Canvas, Selected, Walls, open_house};
+use sims_render::{Camera, Canvas, Selected, Walls, open_house};
 use sims_ui::command::{Camera as UiCamera, Command, Speed, Walls as UiWalls};
 use sims_vm::SoundEvent;
 use sims_vm::boot::{Frames, Lot, StepError};
@@ -848,7 +848,7 @@ impl Game {
         let position = object.position;
         let level = position[2];
         if object.person.is_some() && level == self.view.camera.level {
-            let mut at = sound::object_point(&self.view.camera, position);
+            let mut at = lot_point(&self.view.camera, position);
             at[1] -= person_rise(self.view.camera.zoom.level());
             self.view.apply(Move::Centre(at));
             return;
@@ -859,7 +859,7 @@ impl Game {
         if position[..2].iter().any(|&n| !(0..64 * 16).contains(&n)) {
             return;
         }
-        let at = sound::object_point(&self.view.camera, position);
+        let at = lot_point(&self.view.camera, position);
         self.view.apply(Move::Centre(at));
     }
 
@@ -1064,6 +1064,22 @@ pub fn goth_house(root: &Path) -> PathBuf {
 /// How far above its feet a centred person is (0x434d64 to 0x434da7):
 /// 2 √6 (single precision, 0x434df6) times 2.0 (1/3 times 6, single)
 /// times 2 to the power of the zoom plus one, cut toward zero, halved.
+/// The screen point of a fine lot position ([`sound::object_point`]),
+/// worked out from the lot's own corner and then moved by the origin:
+/// the original cuts the point to 16 bits, and its scroll limits
+/// (0x4a9fa9) keep its origin small enough for that, where the window's
+/// origin may go much further.
+fn lot_point(camera: &Camera, position: [i32; 3]) -> [i32; 2] {
+    let at = sound::object_point(
+        &Camera {
+            origin: [0, 0],
+            ..*camera
+        },
+        position,
+    );
+    [at[0] + camera.origin[0], at[1] + camera.origin[1]]
+}
+
 fn person_rise(zoom: u32) -> i32 {
     let rise = (2.0 * 6f64.sqrt()) as f32 * 2.0 * (1u32 << (zoom + 1)) as f32;
     rise as i32 / 2

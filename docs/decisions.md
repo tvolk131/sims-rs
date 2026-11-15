@@ -44,7 +44,10 @@ below). Both are gone: the refresh is ported (`Interpreter::deselect`).
   screen point is the sound code's (0x47bc1f about 1023, 0x4a9dc7,
   `sound::object_point`). The original slides the view there
   (0x4c9a27); the window jumps. It also clamps to the scroll limits
-  (0x4a9fa9), which the window does not have. Anything else, or a person
+  (0x4a9fa9), which the window does not have. Those limits keep the
+  original's origin small enough for the point's 16-bit cut; the
+  window's origin can go further, so it works the point out from the
+  lot's corner and adds the origin after. Anything else, or a person
   on another floor, shows its floor (0x4a80c7) and is centred without
   the rise unless off the lot (0x4a7af0).
 - **Verified**: the Goth house in strict mode selects another Goth, back
