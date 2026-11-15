@@ -90,23 +90,23 @@ mod tests {
         let [r, g, b] = half.apply(c);
         assert_eq!((r >> 3, g >> 2, b >> 3), (11, 20, 11));
         assert_eq!(Light::FULL.apply([1, 2, 3]), [1, 2, 3]);
-        // Blue takes one step more: black shows blue 1, and even blues go
-        // up (the screenshot: 0 -> 1, 2 -> 2, 4 -> 3).
+        // Blue takes one step more than red's rule would give: blues 0, 2
+        // and 4 become 1, 2 and 3 (red's rule: 0, 1 and 2).
         let blue = |v: u8| half.apply([0, 0, v << 3])[2] >> 3;
         assert_eq!(
             [blue(0), blue(1), blue(2), blue(3), blue(4)],
             [1, 1, 2, 2, 3]
         );
-        let [r, g, b] = half.apply([255, 255, 255]);
-        assert_eq!((r >> 3, g >> 2, b >> 3), (16, 32, 16));
+        // White, expanded back to eight bits by repeating the top bits.
+        assert_eq!(half.apply([255, 255, 255]), [132, 130, 132]);
     }
 
     #[test]
     fn nearly_full_light_still_shifts_blue() {
-        // Level 31 keeps red and green but takes blue's level 30.
+        // Level 31 keeps red, takes green down a step (63 to 62), and
+        // gives blue level 30, whose extra 1.5 rounds it back to 31.
         let light = Light::from_byte(254);
-        let [r, g, b] = light.apply([31 << 3, 63 << 2, 31 << 3]);
-        assert_eq!((r >> 3, g >> 2, b >> 3), (31, 62, 31));
+        assert_eq!(light.apply([255, 255, 255]), [255, 251, 255]);
         assert_eq!(light.apply([0, 0, 0])[2] >> 3, 1);
     }
 }

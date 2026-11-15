@@ -52,7 +52,9 @@ left jamb. Two findings, from the original's code:
   (22 and 23) the original finds the object on the wall's tile
   (0x43595b) and draws the wall in that object's opening shape: its
   wall shape plus 3 times the cut level plus zoom minus 1 (0x53d525).
-  We already do this. The opening shapes carry no depth.
+  We do the same for standing walls; a cut wall at a door or window is
+  drawn as a plain stub instead (the cutaway hides the door with it).
+  The opening shapes carry no depth.
 - **The jamb loses on depth.** In our depth space the wall is 4 bytes in
   front of the jamb's part at that column. The original's wall depth
   comes from per-zoom tables (a row curve plus a column table, about 6
