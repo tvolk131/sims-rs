@@ -9,7 +9,10 @@ use std::path::PathBuf;
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 33 --answers 3`
 /// gives this hash with the default frames (snapshot format 27).
-const TICK_33: &str = "db1ce596748d8f9c5a39ba4197203ad261f354d545cc71a4ef8897d92bafba7d";
+const TICK_33: &str = "29d120a9a63fc70de5e8f289a8b0c18d6504eeb3f0cc4b572eb0c45ff7a0ae3b";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) at the end.
+const TICK_33_27: &str = "db1ce596748d8f9c5a39ba4197203ad261f354d545cc71a4ef8897d92bafba7d";
 /// The same state's hash under snapshot format 26, which had no
 /// neighborhood data words ([`sims_sim::World::neighborhood_data`]) at
 /// the end.
@@ -30,7 +33,10 @@ const TICK_33_22: &str = "041181badfd4d6953814b6c46612398df1004fa583b1d2aa5bd11c
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 1103 --answers
 /// 3` gives this hash, the tick before the salesman leaves.
-const TICK_1103: &str = "f5330f8aed627dda3529a1132e90fc15feb7584ae2757133b3d95074b1084f7a";
+const TICK_1103: &str = "a861be104b4a1e4dca81473b4e611d6dfb08241ab8c7c232c8dcd77320ffa67f";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) at the end.
+const TICK_1103_27: &str = "f5330f8aed627dda3529a1132e90fc15feb7584ae2757133b3d95074b1084f7a";
 /// The same state's hash under snapshot format 26.
 const TICK_1103_26: &str = "ce627e5ef44b7133e74322f8d5dcf1929821114529b846a4c1e442475470399a";
 /// The same state's hash under snapshot format 25.
@@ -46,12 +52,23 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The lot's encoding as snapshot format 27 wrote it: without the poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) that
+/// format 28 added at the end, so a state pinned under format 27 can be
+/// shown to be the same state but for them.
+fn format_27_bytes(lot: &Lot) -> Vec<u8> {
+    let mut bytes = lot.world().encode();
+    let held = postcard::to_allocvec(&lot.world().held_poses).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - held.len()), held);
+    bytes
+}
+
 /// The lot's encoding as snapshot format 26 wrote it: without the
 /// neighborhood's data words ([`sims_sim::World::neighborhood_data`]) that
 /// format 27 added at the end, so a state pinned under format 26 can be
 /// shown to be the same state but for them.
 fn format_26_bytes(lot: &Lot) -> Vec<u8> {
-    let mut bytes = lot.world().encode();
+    let mut bytes = format_27_bytes(lot);
     let data = postcard::to_allocvec(&lot.world().neighborhood_data).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - data.len()), data);
     bytes
@@ -106,6 +123,7 @@ fn the_goth_house_steps_to_tick_33() {
     // No headline shows.
     assert!(lot.world().headlines.is_empty());
     assert_eq!(lot.world().hash_hex(), TICK_33);
+    assert_eq!(digest(&format_27_bytes(&lot)), TICK_33_27);
     assert_eq!(digest(&format_26_bytes(&lot)), TICK_33_26);
     assert_eq!(digest(&format_25_bytes(&lot)), TICK_33_25);
     let mut bytes = format_24_bytes(&lot);
@@ -471,6 +489,7 @@ fn strict_mode_takes_the_salesman_off_the_lot_at_tick_1104() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_1103);
+    assert_eq!(digest(&format_27_bytes(&lot)), TICK_1103_27);
     assert_eq!(digest(&format_26_bytes(&lot)), TICK_1103_26);
     assert_eq!(digest(&format_25_bytes(&lot)), TICK_1103_25);
     assert_eq!(digest(&format_24_bytes(&lot)), TICK_1103_24);
@@ -538,7 +557,10 @@ fn the_player_selects_another_goth() {
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 2881
 /// --answers 3` gives this hash.
-const TICK_2881: &str = "e727213029f1e8560551ab8a4f8526994f21d862e167b3106f877ac3b70ff03b";
+const TICK_2881: &str = "252cf7c1ce589ae90566f533b7ab7294a3e19a7ef644279c703e86ed950871c1";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) at the end.
+const TICK_2881_27: &str = "e727213029f1e8560551ab8a4f8526994f21d862e167b3106f877ac3b70ff03b";
 /// The same state's hash under snapshot format 26.
 const TICK_2881_26: &str = "16c83a8e5f49c088dce71c67874ba7ccbb367c952b4fde8a4b3d7c78ad7a081f";
 /// The same state's hash under snapshot format 25.
@@ -548,7 +570,10 @@ const TICK_2881_24: &str = "cdd5b72c0ed8481f4db525817d1145f5445b6d2562c2ea4abfbf
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 3432
 /// --answers 3` gives this hash.
-const TICK_3432: &str = "59dc53999c14e69ba5e83f556ff1135c75c60baa92b4701d844a5879ce983acc";
+const TICK_3432: &str = "83d20367c9d5e8fb866f515bc359e8ff19baaaafb543b51dd56674012af86003";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) at the end.
+const TICK_3432_27: &str = "59dc53999c14e69ba5e83f556ff1135c75c60baa92b4701d844a5879ce983acc";
 /// The same state's hash under snapshot format 26.
 const TICK_3432_26: &str = "359095d7d0e8a141ac07a3662a3aec4de888d755c663754aa624e057a6596f5b";
 /// The same state's hash under snapshot format 25.
@@ -558,7 +583,10 @@ const TICK_3432_24: &str = "c8d4fccd905caec7a03bb6d2872d83ba0ce462ffbc6c3e0bc143
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 3602
 /// --answers 3` gives this hash.
-const TICK_3602: &str = "d20b5848afafab4f927b77f6762af0e2152e7a90c61325a807398c77868a1741";
+const TICK_3602: &str = "54a982be2cb30de370ef7168231dfdc6fc9f8c251fb93e8a38f01e872a07f7b6";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) at the end.
+const TICK_3602_27: &str = "d20b5848afafab4f927b77f6762af0e2152e7a90c61325a807398c77868a1741";
 /// The same state's hash under snapshot format 26.
 const TICK_3602_26: &str = "07ce1fc95d4c26d2b5466524759ddaa0d9cf6fbcde3c631c9b60e907c8bbe6a0";
 const TICK_3603: &str = "95156650bf0372faec254d37e4002e3c7341a67a71fbbd82254fbc28baa9b2e9";
@@ -594,6 +622,7 @@ fn strict_mode_runs_to_tick_9906_past_noon() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_2881);
+    assert_eq!(digest(&format_27_bytes(&lot)), TICK_2881_27);
     assert_eq!(digest(&format_26_bytes(&lot)), TICK_2881_26);
     assert_eq!(digest(&format_25_bytes(&lot)), TICK_2881_25);
     assert_eq!(digest(&format_24_bytes(&lot)), TICK_2881_24);
@@ -604,6 +633,7 @@ fn strict_mode_runs_to_tick_9906_past_noon() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_3432);
+    assert_eq!(digest(&format_27_bytes(&lot)), TICK_3432_27);
     assert_eq!(digest(&format_26_bytes(&lot)), TICK_3432_26);
     assert_eq!(digest(&format_25_bytes(&lot)), TICK_3432_25);
     assert_eq!(digest(&format_24_bytes(&lot)), TICK_3432_24);
@@ -625,6 +655,7 @@ fn strict_mode_runs_to_tick_9906_past_noon() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_3602);
+    assert_eq!(digest(&format_27_bytes(&lot)), TICK_3602_27);
     assert_eq!(digest(&format_26_bytes(&lot)), TICK_3602_26);
     assert_eq!(clock(&lot), (8, 30, 48));
     // Tick 3603: object 354 (tree 0x1022) picks two neighbor records at
@@ -667,7 +698,10 @@ fn strict_mode_runs_to_tick_9906_past_noon() {
 }
 
 /// The Newbies' house (House07) after 1802 updates, with `--answers 3`.
-const NEWBIE_1802: &str = "561330e47a0f5f0a1553e4382c16c87a15ff8878fff533fd375a36f24fbf177b";
+const NEWBIE_1802: &str = "f00a666e4f6eb21b4e29de26e1d3a192fa9e53a7bc792e371b60cc5f2fc97eca";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) at the end.
+const NEWBIE_1802_27: &str = "561330e47a0f5f0a1553e4382c16c87a15ff8878fff533fd375a36f24fbf177b";
 /// The same state's hash under snapshot format 26.
 const NEWBIE_1802_26: &str = "d7980d86529f1b84be10c103d0d522e5484fc54ee2484859beba71b74c8c1d58";
 /// The Newbies' house after 4052 updates, the last whose frame strict
@@ -707,6 +741,7 @@ fn a_newbie_gives_up_on_a_route_with_its_failure_feedback() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), NEWBIE_1802);
+    assert_eq!(digest(&format_27_bytes(&lot)), NEWBIE_1802_27);
     assert_eq!(digest(&format_26_bytes(&lot)), NEWBIE_1802_26);
     // Tick 1803: object 290 (tree 0x1022) makes two neighbors' people off
     // the lot (Create New Object Instance mode 6, flag 0x4) and removes

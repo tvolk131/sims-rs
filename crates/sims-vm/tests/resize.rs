@@ -418,11 +418,21 @@ fn routing_18_bytes(routing: &sims_sim::route::Routing) -> Vec<u8> {
     bytes
 }
 
+/// The encoding of `world` as snapshot format 27 wrote it: without the
+/// poses the load left in the skins ([`World::held_poses`]) that format 28
+/// added at the end. The older formats' encodings start from this one.
+fn format_27_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let held = postcard::to_allocvec(&world.held_poses).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - held.len()), held);
+    bytes
+}
+
 /// A lot's encoding as snapshot format 26 wrote it: without the
 /// neighborhood's data words ([`World::neighborhood_data`]) that format 27
 /// added at the end. The older formats' encodings start from this one.
 fn format_26_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_27_bytes(world);
     let data = postcard::to_allocvec(&world.neighborhood_data).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - data.len()), data);
     bytes
