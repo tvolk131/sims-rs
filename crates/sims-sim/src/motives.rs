@@ -18,7 +18,7 @@
 //! add, subtract, multiply and divide is rounded to 24 bits. The state of
 //! the FPU in a capture of the running game shows that (control word
 //! 0x003f at the entry of a lot update), and so does the room arithmetic
-//! (`rooms.rs`). `docs/decisions.md` says what was compared with the
+//! (`rooms.rs`). `docs/decisions/` says what was compared with the
 //! original bit for bit.
 
 use serde::{Deserialize, Serialize};

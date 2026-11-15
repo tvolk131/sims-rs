@@ -11,7 +11,7 @@
 //! ([`crate::pick`]). People on a level above the camera's are not drawn,
 //! so with the camera on the second floor its floor hides everyone
 //! downstairs, as it hides the rooms there. How the original gives a
-//! person's mesh its depth is **unverified** (see `docs/decisions.md`,
+//! person's mesh its depth is **unverified** (see `docs/decisions/`,
 //! "People's meshes go into the lot renderer's canvas").
 
 use sims_formats::bitmap::Image;
