@@ -390,12 +390,15 @@ class DialogAnswerer:
         self.open = {}  # record -> dict(serial, update, timer, jobs) of a dialog waiting for a result
         self.serial = 0
 
-    def shown(self, update, record=None):
+    def shown(self, update, record=None, jobs=()):
+        """A dialog was shown. `jobs`: the press jobs an earlier run already handed to the guest for it (a
+        resumed run), which its result cancels too; the presses go on from there."""
         with self.lock:
             self._end(record, 'shown_again')
             self.serial += 1
-            self.open[record] = dict(serial=self.serial, update=update, timer=None, jobs=[])
-            self._schedule(record, 1)
+            self.open[record] = dict(serial=self.serial, update=update, timer=None, jobs=list(jobs))
+            if len(jobs) < self.tries:
+                self._schedule(record, len(jobs) + 1)
 
     def answered(self, record=None):
         with self.lock:
@@ -426,7 +429,7 @@ class DialogAnswerer:
                 return
             update = entry['update']
             command = f'xdotool windowfocus --sync {self.window} sleep 1 key Return'
-            script = (f'set -u\nexport DISPLAY=:98\nxdotool windowfocus --sync {self.window} sleep 1\n'
+            script = (f'set -u\nexport DISPLAY=:98\nxdotool windowfocus --sync {self.window} sleep 1 || exit 4\n'
                       '[ -e "${0%.sh}.cancel" ] && { echo cancelled; exit 3; }\nxdotool key Return\n')
             job = guest_jobs.submit(self.share, script)
             entry['jobs'].append(job)
@@ -446,20 +449,23 @@ class DialogAnswerer:
 
 
 def open_dialogs(rows):
-    """{record: update} of the dialogs shown in these events and given no result yet."""
+    """{record: (update, [job])} of the dialogs shown in these events and given no result yet, with the press
+    jobs handed to the guest for each (and not cancelled)."""
     out = {}
     for r in rows:
         if r['kind'] == 'dialog_show':
-            out[r.get('record')] = r['update']
+            out[r.get('record')] = (r['update'], [])
         elif r['kind'] == 'dialog_result':
             out.pop(r.get('record'), None)
+        elif r['kind'] == 'dialog_auto_answer' and 'record' in r and r['record'] in out:
+            out[r['record']][1].append(r['job'])
     return out
 
 
-def drop_redone_events(path, updates):
-    """Before a resume: drop the events a lot update's return produced (hour_turned, objects_changed) for an
-    update after the last recorded row. The resumed run redoes that return and writes them again. Returns
-    the dropped rows."""
+def drop_redone_events(path, updates, kinds):
+    """Before a resume: drop the events of these kinds (of hour_turned and objects_changed, the ones the
+    resumed run can write again) that a lot update's return produced for an update after the last recorded
+    row. The resumed run redoes that return and writes them again. Returns the dropped rows."""
     if not path.exists():
         return []
     keep, dropped = [], []
@@ -467,8 +473,7 @@ def drop_redone_events(path, updates):
         if not line.strip():
             continue
         r = json.loads(line)
-        (dropped if r['kind'] in ('hour_turned', 'objects_changed') and r.get('update', 0) > updates
-         else keep).append(line)
+        (dropped if r['kind'] in kinds and r.get('update', 0) > updates else keep).append(line)
     if dropped:
         tmp = path.with_suffix('.jsonl.tmp')
         tmp.write_text(''.join(line + '\n' for line in keep))
@@ -584,8 +589,15 @@ def main():
             prior_status = json.loads((out / 'status.json').read_text())
         except (OSError, ValueError):
             pass
-        recorded = len((out / 'updates.jsonl').read_text().splitlines()) if (out / 'updates.jsonl').exists() else 0
-        dropped = drop_redone_events(out / 'events.jsonl', recorded)
+        lines = (out / 'updates.jsonl').read_text().splitlines() if (out / 'updates.jsonl').exists() else []
+        # Only what the redone return can write again: an hour turn needs the last row's clock, an object
+        # change the registry saved with the last row.
+        kinds = []
+        if lines and 'clock' in json.loads(lines[-1]):
+            kinds.append('hour_turned')
+        if args.around and prior_status.get('registry_update') == len(lines) and prior_status.get('registry') is not None:
+            kinds.append('objects_changed')
+        dropped = drop_redone_events(out / 'events.jsonl', len(lines), kinds)
     events = open(out / 'events.jsonl', 'a')
     watch_log = open(out / 'watch.jsonl', 'a') if args.watch else None
     updates_log = open(out / 'updates.jsonl', 'a')
@@ -752,6 +764,8 @@ def main():
             # The registry at the last recorded return, saved with it in status.json.
             if prior_status.get('registry_update') == updates and prior_status.get('registry') is not None:
                 last_objects = {p: i for p, i in prior_status['registry']}
+                # Kept in the new status.json too, in case this run is taken over before its first return.
+                status.update(registry=prior_status['registry'], registry_update=updates)
             else:
                 event(kind='registry_unknown', updates=updates, registry_update=prior_status.get('registry_update'))
         if dropped:
@@ -760,11 +774,11 @@ def main():
         dialog_pending = any(r['kind'] == 'dialog_show' and r['update'] > updates for r in rows)
         waiting = open_dialogs(rows)
         if waiting:
-            event(kind='resume_open_dialogs', dialogs=[dict(record=k, update=v) for k, v in waiting.items()])
+            event(kind='resume_open_dialogs', dialogs=[dict(record=k, update=u, jobs=j) for k, (u, j) in waiting.items()])
         if answerer:
-            for record, shown_in in waiting.items():
+            for record, (shown_in, jobs) in waiting.items():
                 if shown_in >= args.answer_from:
-                    answerer.shown(shown_in, record)
+                    answerer.shown(shown_in, record, jobs)
     try:
         reply = remote.stop_reply()
         event(kind='attach', reply=reply, resume=args.resume, updates=updates)

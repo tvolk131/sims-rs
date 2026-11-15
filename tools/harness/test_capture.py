@@ -408,24 +408,39 @@ class SparseTest(CaptureTest):
         self.assertEqual((status['registry'], status['registry_update']), ([[0x50000, 259], [0x51000, 7]], 2))
 
     def test_a_registry_from_another_update_is_not_used(self):
+        # An older run's change in the update being redone is kept: this run cannot write it again.
+        change = dict(kind='objects_changed', update=2, tick=100, added=[dict(id=7, pointer=0x51000)], removed=[],
+                      count=2, time=1)
         _, output, _ = self.run_capture(
             [dict(pc=capture.RETURN, objects=[0x50000, 0x51000], ids={0x50000: 259, 0x51000: 7})],
             ['--updates', '2', '--around', '1', '--resume'],
-            prepare=self.resumed_after(dict(registry=[], registry_update=0)))
-        self.assertEqual(self.events(output, 'objects_changed'), [])
+            prepare=self.resumed_after(dict(registry=[], registry_update=0), [change]))
+        self.assertEqual([e['update'] for e in self.events(output, 'objects_changed')], [2])
+        self.assertEqual(self.events(output, 'resume_dropped'), [])
         self.assertEqual(len(self.events(output, 'registry_unknown')), 1)
+
+    def test_a_resumed_run_keeps_the_registry_it_was_given(self):
+        # Taken over again before its first return, the next run still finds the registry.
+        _, output, _ = self.run_capture(
+            [dict(pc=capture.RETURN)], ['--updates', '1', '--around', '1', '--resume'],
+            prepare=self.resumed_after(dict(registry=[[0x50000, 259]], registry_update=1)))
+        status = json.loads((output / 'status.json').read_text())
+        self.assertEqual((status['registry'], status['registry_update']), ([[0x50000, 259]], 1))
 
     def test_a_resumed_run_knows_the_open_dialog(self):
         shown = dict(kind='dialog_show', update=2, record=0x4000, time=1)
+        pressed = dict(kind='dialog_auto_answer', update=2, record=0x4000, press=1, job=7, time=2)
         with tempfile.TemporaryDirectory(prefix='sims-guest-test-') as guest_dir, \
                 patch.object(capture, 'DialogAnswerer') as answerer:
             _, output, _ = self.run_capture(
                 [dict(pc=capture.RETURN, clock=[6, 59, 58])],
                 ['--updates', '2', '--around', '1', '--resume', '--answer-stuck', '100', '--answer-from', '2',
                  '--guest-dir', guest_dir],
-                prepare=self.resumed_after(dict(registry=[[0x50000, 259]], registry_update=1), [shown]))
-        answerer.return_value.shown.assert_called_once_with(2, 0x4000)
-        self.assertEqual(self.events(output, 'resume_open_dialogs')[0]['dialogs'], [dict(record=0x4000, update=2)])
+                prepare=self.resumed_after(dict(registry=[[0x50000, 259]], registry_update=1), [shown, pressed]))
+        # The press the earlier run handed to the guest goes with it, so the dialog's result cancels it.
+        answerer.return_value.shown.assert_called_once_with(2, 0x4000, [7])
+        self.assertEqual(self.events(output, 'resume_open_dialogs')[0]['dialogs'],
+                         [dict(record=0x4000, update=2, jobs=[7])])
         self.assertEqual(self.saved(self.rows(output / 'updates.jsonl')), {2: ['dialog']})
 
     def test_negative_windows_are_refused(self):
@@ -505,6 +520,35 @@ class DialogAnswererTest(unittest.TestCase):
         cancel.unlink()
         subprocess.run(['/bin/sh', str(job)], env=env, check=True)
         self.assertIn('key Return', (a.share / 'xdotool.log').read_text())
+
+    def test_the_jobs_of_an_earlier_run_are_cancelled_and_counted(self):
+        a, events, jobs, _ = self.answerer(after=0.05)
+        (a.share / 'cmd').mkdir()
+        a.shown(5, 0xa, [3, 4])  # two of the two tries made already
+        time.sleep(0.15)
+        a.answered(0xa)
+        self.assertEqual(jobs, [])
+        self.assertTrue((a.share / 'cmd' / '00003.cancel').exists() and (a.share / 'cmd' / '00004.cancel').exists())
+        self.assertEqual(events[-1]['jobs'], [3, 4])
+
+    def test_no_return_when_the_window_cannot_be_focused(self):
+        a, events, jobs, _ = self.answerer(after=0.05)
+        a.shown(5, 0xa)
+        deadline = time.time() + 5
+        while not jobs and time.time() < deadline:
+            time.sleep(0.01)
+        a.close()
+        bin_ = a.share / 'bin'
+        bin_.mkdir()
+        (bin_ / 'xdotool').write_text('#!/bin/sh\necho "$@" >> "$XDOTOOL_LOG"\n[ "$1" != windowfocus ]\n')
+        (bin_ / 'xdotool').chmod(0o755)
+        job = a.share / 'cmd' / '00001.sh'
+        job.write_text(jobs[0])
+        log = a.share / 'xdotool.log'
+        env = dict(os.environ, PATH=f'{bin_}:{os.environ["PATH"]}', XDOTOOL_LOG=str(log))
+        r = subprocess.run(['/bin/sh', str(job)], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 4)
+        self.assertNotIn('key Return', log.read_text())
 
     def test_only_the_open_dialog_is_pressed(self):
         a, events, jobs, _ = self.answerer(after=0.1)

@@ -129,7 +129,8 @@ Things to know:
   (`dialog_auto_answer`, and `input-log.txt`). The dialogs are told apart
   by their record: a result ends its own dialog's presses, and a press job
   the guest has not run yet is cancelled (`dialog_auto_answer_cancelled`;
-  the job checks its `.cancel` file right before it presses). The result
+  the job checks its `.cancel` file right before it presses, and presses
+  nothing if the game window cannot be focused). The result
   is `dialog_result`'s `result`, the function's argument: the stop is at
   its entry, where the record's `status` still holds the old value. Answer the first dialogs (updates 1 and 2) by hand as above:
   Return may not be the answer wanted there.
@@ -143,10 +144,12 @@ Things to know:
   `capture.py` again with the same arguments plus `--resume`. It continues the
   same directory and numbering, and redoes the update it was in the middle of
   (and a dump it was in the middle of). The events that update's return wrote
-  are dropped first and written again (`resume_dropped`). The registry of the
-  last recorded return comes from `status.json` (`registry_unknown` if it is
-  of another update), and the dialogs still waiting for a result are taken
-  up again (`resume_open_dialogs`).
+  are dropped first and written again (`resume_dropped`), when the run can
+  write them again: an hour turn needs the last row's clock, an object
+  change the registry of the last recorded return, which comes from
+  `status.json` (`registry_unknown` if it is of another update). The
+  dialogs still waiting for a result are taken up again, with the presses
+  already handed to the guest (`resume_open_dialogs`).
 - **Memory dumps.** `--dump 14,47 --guest-dir <guest dir>` also saves,
   at the entry of each listed lot update, every present user page of the
   game's process (`dump-NNNN/`; update 1's entry is the baseline's stop). QEMU writes each range into the guest
