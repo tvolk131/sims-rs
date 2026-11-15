@@ -45,6 +45,7 @@ ambience again though the music does not change.
   runs without a bad instruction. 5 more of them leave music or a river
   playing, and the backyard's ambience test now also plays the
   neighbourhood's music, which shares the player's random draws.
+
 ## 2026-11-15: A route that gives up near its slot runs the failure feedback tree
 
 Go To Routing Slot and Go To Relative Position share the route steps of
