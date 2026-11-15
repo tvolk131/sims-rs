@@ -2135,7 +2135,9 @@ through their public interfaces only; the simulation never depends on it.
   The menu is drawn as the original's pie, with `sims_ui::pie` (#157):
   the labels around the click, a name with a `/` in a submenu, at most
   12 shown; a test clicks the fridge and chooses Have A Snack from its
-  pie. The simulation lists the fridge itself: in the morning the house
+  pie. In its middle is the head of the Sim the menu is for, as posed
+  now, drawn by `sims-people`'s rasterizer from in front (its camera,
+  light and size are ours, not compared with the original's). The simulation lists the fridge itself: in the morning the house
   loads in, Have A Snack, Have Quick Breakfast, Have Breakfast and
   Serve Breakfast.
 - **Done: a Sim doing what he is told.** Have A Snack queued on the
@@ -2156,6 +2158,8 @@ through their public interfaces only; the simulation never depends on it.
   (0x58da12), which is not ported, so in strict mode (`Lot::select`)
   switching Sims fails and changes nothing; play mode
   (`Lot::select_play`) leaves the refresh out.
+- **Next:** answering a dialog from the window.
+
 - Done: a click picks what the frame shows at the pixel
   (`Canvas::id_at`, `sims_game::pick`): the person shown there or
   nearest within two pixels, else the object shown there. A tile of a

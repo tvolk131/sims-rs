@@ -37,6 +37,7 @@
 //! the labels and the fallback.
 
 use sims_formats::behavior::InteractionTable;
+use sims_formats::bitmap::Image;
 use sims_formats::iff::Iff;
 use sims_formats::saved_objects::Interaction;
 use sims_formats::strings::StringTable;
@@ -397,6 +398,9 @@ pub struct Menu {
     /// Where the pointer is to be moved, as the original moves it, until
     /// the host takes it.
     pointer: Option<[i32; 2]>,
+    /// The head of the Sim the menu is for, drawn in each menu's middle
+    /// (`People::head`), if it was rendered.
+    pub head: Option<Image>,
 }
 
 /// What a press on an open [`Menu`] did.
@@ -437,6 +441,7 @@ impl Menu {
             layouts: Vec::new(),
             size,
             pointer: None,
+            head: None,
         };
         menu.layout(art, size);
         menu.pointer = menu.layouts.first().filter(|l| l.moved).map(|l| l.center);
@@ -494,10 +499,27 @@ impl Menu {
             .unwrap_or_default()
     }
 
-    /// Draws the menus as last laid out. The middle shows the face
-    /// bitmap without the selected Sim's head, which is not rendered yet.
+    /// The size of the face in each menu's middle, which the head is
+    /// drawn to fill: the face bitmap's.
+    pub fn face_size(&self) -> [u32; 2] {
+        let face = self
+            .layouts
+            .first()
+            .map_or(pie::FACE_SIZE, |l| [l.face.width, l.face.height]);
+        face.map(|n| u32::try_from(n).unwrap_or(0))
+    }
+
+    /// Draws the menus as last laid out, with [`Menu::head`] over the face
+    /// bitmap in the middle.
     pub fn draw(&self, frame: &mut Frame, art: &Art, pointer: Option<[i32; 2]>) {
-        Pie::draw(frame, art, &self.layouts, None, pointer, false);
+        Pie::draw(
+            frame,
+            art,
+            &self.layouts,
+            self.head.as_ref(),
+            pointer,
+            false,
+        );
     }
 }
 

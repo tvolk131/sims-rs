@@ -348,6 +348,17 @@ impl Game {
             &mut self.canvas,
         );
         self.people.draw(world, &self.view.camera, &mut self.canvas);
+        // The pie menu shows the head of the Sim it is for, as posed now.
+        if let Some(menu) = &mut self.hud.menu {
+            menu.head = match self.people.head(world, menu.person, menu.face_size()) {
+                Ok(head) => Some(head),
+                Err(e) => {
+                    self.people
+                        .note(vec![format!("the pie menu has no head: {e}")]);
+                    None
+                }
+            };
+        }
         let status = self.status();
         // A dialog the lot waits on is in the lot as the tick left it when
         // it was shown.

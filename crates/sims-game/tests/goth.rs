@@ -648,3 +648,42 @@ fn a_press_on_a_portrait_selects_that_goth() {
     game.select(mortimer);
     assert_eq!(game.lot().world().selected(), Some(mortimer));
 }
+
+#[test]
+fn the_pie_shows_the_selected_goths_head() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    game.render();
+    let selected = game.lot().world().selected().expect("a Sim is selected");
+    let points: Vec<[i32; 2]> = (0..600)
+        .step_by(6)
+        .flat_map(|y| (0..800).step_by(6).map(move |x| [x, y]))
+        .filter(|&p| !game.over_panel(p))
+        .collect();
+    for point in points {
+        game.leave();
+        game.hover(point);
+        game.press(point);
+        if game.menu().is_some() {
+            break;
+        }
+    }
+    game.render();
+    let menu = game.menu().expect("the menu stays open");
+    assert_eq!(menu.person, selected);
+    let head = menu.head.as_ref().expect("the head is drawn");
+    assert_eq!([head.width, head.height], menu.face_size());
+    // The head fills much of the face, and is clear around it.
+    let opaque = head.rgba.chunks(4).filter(|p| p[3] == 255).count();
+    let area = (head.width * head.height) as usize;
+    assert!(
+        opaque > area / 5 && opaque < area * 4 / 5,
+        "{opaque} of {area}"
+    );
+    assert_eq!(head.rgba[3], 0);
+    assert!(game.problems().is_empty(), "{:?}", game.problems());
+}
