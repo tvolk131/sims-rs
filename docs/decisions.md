@@ -29,13 +29,18 @@ clears it (0x46e042). Otherwise, from 0x44b7ed:
   multiplied by the frame count and by 12 (0x46e050).
 - The object is redrawn (0x434101, presentation) and woken (0x44574b).
 
-The sprite cache (0x4c8e0d) looks for an SPR# and then an SPR2 of the
-ID. The count it hands on (0x4c8deb) is 0 below version 500, halved for
-versions 501 and 503, and divided by five for 506 (0x4c154e).
-`sims_vm::icon_frames` reads every count once at boot into
-`Program::icon_frames`. The byte order of an SPR# header is not read
-from code: we take the one that gives a version below 0x10000, and fail
-if neither does (**inferred**; all 195 in Sprites.iff read big-endian).
+The sprite cache (0x4c8e0d) looks up an SPR# and then an SPR2 of the
+ID as resources (live chunks of the default variant, through the
+resource map when there is one), not the file's raw chunks. The count it
+hands on (0x4c8deb) is 0 below version 500, halved for versions 501 and
+503, and divided by five for 506 (0x4c154e). `sims_vm::icon_frames`
+reads every count once at boot into `Program::icon_frames`. An SPR#
+header is swapped by the resource layer's callback (0x4c8f63) unless the
+resource's conversion flag 0x10 is set (0x41d3a7): big-endian without
+it, little-endian with it. We read the flag from the chunk header;
+whether a resource map's entry can carry different flags is
+**unverified**. All 195 SPR# in Sprites.iff have flags 0 and read
+big-endian.
 
 What the simulation reads of the record is kept in `World::headlines`
 (appended; snapshot format 24): priority and duration, while the
@@ -88,8 +93,8 @@ which is not ported. That is where the next port starts.
 
 The old prototype's `headline.rs` agrees on the kept fields and the
 countdown. Reopen if a capture shows a headline's duration counting
-differently, a drawn bound reaching the simulation, or an SPR# header
-in the other byte order.
+differently, a drawn bound reaching the simulation, or a resource
+map whose SPR# entry has flags other than its chunk's.
 
 ## 2026-11-15: A turn of less than a step is made at once; Run Functional Tree's flag names the action's icon; Find Location For mode 1
 

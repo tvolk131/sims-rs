@@ -742,19 +742,21 @@ pub fn icon_frames(install: &sims_content::Install) -> Result<Option<BTreeMap<u1
 /// `iff`, by sprite ID, as 0x4c8deb hands it on: 0 unless the header's
 /// version (sprite +0x20) is at least 500.
 ///
-/// The cache looks for an SPR# of the ID first and an SPR2 only when
-/// there is none. For an SPR# the sprite (0x4c154e) takes the version and
-/// the count from the header's first two words, then halves the count for
-/// versions 501 and 503 and divides it by five for 506 (0x4c1604 to
-/// 0x4c1631). An SPR2's are its first two words as they stand
-/// (0x4c1757).
+/// The cache looks up the resources by ID ([`Iff::get`]: live chunks of
+/// the default variant, through the resource map when there is one), an
+/// SPR# of the ID first and an SPR2 only when there is none. For an SPR#
+/// the sprite (0x4c154e) takes the version and the count from the
+/// header's first two words, then halves the count for versions 501 and
+/// 503 and divides it by five for 506 (0x4c1604 to 0x4c1631). An SPR2's
+/// are its first two words as they stand (0x4c1757).
 ///
-/// The SPR# are read through a callback that swaps the header's bytes
-/// (0x4c8f63). Which chunks the resource layer hands it is not traced, so
-/// the byte order is taken as the one in which the version is below
-/// 0x10000 (**inferred**; the install's SPR# in `Sprites.iff` are all
-/// version 502, written big-endian). A header that reads so in neither
-/// order fails.
+/// The resource layer hands an SPR# to a callback that swaps the header's
+/// bytes (0x4c8f63) unless the resource's conversion flag, 0x10, is set
+/// (0x41d3a7): the header is big-endian without the flag and
+/// little-endian with it. The flag is read from the chunk's header; with
+/// a resource map, whether the map's entry can carry different flags is
+/// **unverified**. The install's SPR# in `Sprites.iff` all have flags 0
+/// and version 502 written big-endian.
 pub fn sprite_frames(iff: &Iff) -> Result<BTreeMap<u16, i32>> {
     let header = |data: &[u8]| -> Option<[[u8; 4]; 2]> {
         Some([
@@ -762,19 +764,18 @@ pub fn sprite_frames(iff: &Iff) -> Result<BTreeMap<u16, i32>> {
             *data.get(4..8)?.first_chunk::<4>()?,
         ])
     };
+    let resources = |tag: &'static [u8; 4]| {
+        let ids: std::collections::BTreeSet<u16> = iff.all(tag).map(|c| c.id).collect();
+        ids.into_iter().filter_map(move |id| iff.get(tag, id))
+    };
     let mut frames = BTreeMap::new();
-    for chunk in &iff.chunks {
-        if &chunk.tag != b"SPR#" {
-            continue;
-        }
-        let bad = || Error::Unsupported(format!("SPR# #{} has a header no order reads", chunk.id));
-        let [version, count] = header(iff.data(chunk)).ok_or_else(bad)?;
-        let (version, count) = if u32::from_le_bytes(version) < 0x10000 {
+    for chunk in resources(b"SPR#") {
+        let [version, count] = header(iff.data(chunk))
+            .ok_or_else(|| Error::Unsupported(format!("SPR# #{} has no header", chunk.id)))?;
+        let (version, count) = if chunk.flags & 0x10 != 0 {
             (i32::from_le_bytes(version), i32::from_le_bytes(count))
-        } else if u32::from_be_bytes(version) < 0x10000 {
-            (i32::from_be_bytes(version), i32::from_be_bytes(count))
         } else {
-            return Err(bad());
+            (i32::from_be_bytes(version), i32::from_be_bytes(count))
         };
         let count = match version {
             0x1f5 | 0x1f7 => count / 2,
@@ -783,8 +784,8 @@ pub fn sprite_frames(iff: &Iff) -> Result<BTreeMap<u16, i32>> {
         };
         frames.insert(chunk.id, if version >= 500 { count } else { 0 });
     }
-    for chunk in &iff.chunks {
-        if &chunk.tag != b"SPR2" || frames.contains_key(&chunk.id) {
+    for chunk in resources(b"SPR2") {
+        if frames.contains_key(&chunk.id) {
             continue;
         }
         let [version, count] = header(iff.data(chunk))
