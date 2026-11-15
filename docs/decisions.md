@@ -21,7 +21,9 @@ kept in `routing.slot_flags` under object ID 0, which no object has,
 rather than in a new world field, so the world's encoding and hash stay
 as they are. The original's bound check on a parameter number (0x45ac34)
 never fails, and a number past the frame's parameters reads whatever
-follows; that fails loudly here.
+follows; that fails loudly here. Signal 0x10b clears the lot's table and
+parses it again (0x443090 to 0x4430e9), restoring the file's flags; it is
+not ported, and a port must drop the `(0, _)` entries.
 
 A player's order for a snack reached source 2 at tick 154, in tree
 0x2156; the Goth house's first 1000 ticks do not use it and are
