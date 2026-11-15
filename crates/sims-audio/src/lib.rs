@@ -2,7 +2,8 @@
 //!
 //! The simulation never depends on this crate. It reads game files and
 //! turns them into PCM (16-bit signed samples); playing them on a device
-//! is left to a host binary.
+//! is left to a host binary. The `play` example is one, behind the
+//! `playback` feature (off by default).
 //!
 //! - [`xa`]: Maxis XA, the 4-bit ADPCM that holds nearly every sound
 //!   effect and voice.
