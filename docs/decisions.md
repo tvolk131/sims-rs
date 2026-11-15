@@ -93,6 +93,11 @@ at 0x44e60e, where before it would have skipped the person's traits.
 The snack order removes 259 at step 1104 and stops at the same school
 bus at step 2703 (tick 91146).
 
+After the Goth social (the pie-menu run in `boot.rs`), the salesman
+leaves at tick 597 while his animator plays "A2O-door-knock". The reset
+that deletes him would remove that clip, which can fade it out
+(0x592878), and that run stops there.
+
 ## 2026-11-15: A headline icon keeps its priority and duration; the social ends
 
 **Unverified.** No captured update shows a headline: the Goth captures

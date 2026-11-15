@@ -19,7 +19,7 @@ const TICK_33_22: &str = "041181badfd4d6953814b6c46612398df1004fa583b1d2aa5bd11c
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 1103 --answers
 /// 3` gives this hash, the tick before the salesman leaves.
-const TICK_1103: &str = "1849f00c425470f78b8a47d95244e615d77e10356bd7d61a84052bdf65f02c58";
+const TICK_1103: &str = "714496702b0ff2dbda94c299c217e2ae7414172e6a71775950901b0cfa6222b5";
 
 #[test]
 fn the_goth_house_steps_to_tick_33() {
@@ -193,9 +193,11 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     assert_eq!(lot.world().headlines, BTreeMap::from([(16, shown(1))]));
     lot.step().unwrap_or_else(|e| panic!("{e}"));
     assert!(lot.world().headlines.is_empty());
-    // The lot runs on until person 259's route to a slot fails, as it
-    // wants to be interrupted (0x45b18b), and its tree takes it off the
-    // lot, which is not ported.
+    // The lot runs on until person 259 (the salesman), whose route to a
+    // slot failed as it wants to be interrupted (0x45b18b), is taken off
+    // the lot while its animator plays a door knock: the reset that
+    // deletes it would remove that clip, which can fade it out, and that
+    // is not ported.
     let mut steps = 359;
     let stopped = loop {
         steps += 1;
@@ -207,8 +209,9 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     assert_eq!(steps, 595, "{stopped}");
     for part in [
         "tick 597,",
-        "object 259, tree 0x0176 node 27",
-        "taking a person off the lot is not ported",
+        "object 259",
+        "A2O-door-knock",
+        "0x592878",
     ] {
         assert!(stopped.contains(part), "{stopped}");
     }
