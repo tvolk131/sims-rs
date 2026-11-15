@@ -4,6 +4,34 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: The player selects another Sim; the Sim selected before is deselected
+
+Selecting a Sim (0x445449) now deselects the Sim selected before instead
+of failing. Read from the original's code (0x445449, and 0x44664c from
+0x4468c3 for a Sim without the mark), with the old prototype as a guide
+(legacy/crates/sims-vm/src/selection.rs and selection_indicators.rs):
+the old Sim's mark is taken off, and with nobody selected the first
+indicator and then the second are taken off the lot (each one's virtual
+function 0x50 with 1, as `Interpreter::take_off` takes an indicator).
+A Sim with person word 81 at 10 or more would take a Superstar star
+marker (0x446c15); that fails loudly, whatever the expansion mask, as
+the placement of a person from outside does. The redraws (0x434101 and
+the person's graphic) are presentation and not modeled. Then the new
+Sim is selected as from nobody, as before.
+
+`Lot::select(person)` runs it between ticks, as a press on a portrait
+does; a selection that fails changes nothing. `sims-game` carries out
+the panel's `Command::Select` with it, and the panel, the motives shown
+and the pie menus follow the new Sim. Which people the original's
+portrait press lets the player select, and whether it does more than
+0x445449 (the camera following the Sim, for one), is not read: the
+panel shows only the household's portraits.
+
+**Unverified**: no recording selects a Sim. Strict `sims boot` of the
+Goth house is unchanged (1102 ticks, output identical); a removal of the
+selected Sim (0x44123f) reaches the new path, and the Goth run removes
+no selected Sim. Reopen when a recording of play selects a Sim.
+
 ## 2026-11-15: The game lists the pie menu on the lot when the pointer reaches an object
 
 When the pointer first reaches an object or a person on the lot, the

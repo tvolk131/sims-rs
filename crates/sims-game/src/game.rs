@@ -497,6 +497,18 @@ impl Game {
         });
     }
 
+    /// Selects the Sim `sim`, as a press on its portrait does
+    /// (`Lot::select`, 0x445449), keeping the sounds that made. A menu
+    /// listed for the Sim selected before is dropped.
+    pub fn select(&mut self, sim: u16) {
+        match self.lot.select(sim) {
+            Ok(sounds) => self.keep_sounds(sounds),
+            Err(e) => self.note = Some(format!("Person {sim} was not selected: {e}")),
+        }
+        self.listed = None;
+        self.reached = None;
+    }
+
     /// Carries out a panel command. `menu` is the pie menu that was open
     /// when it was pressed.
     fn command(&mut self, command: Command, menu: Option<&Menu>) -> Outcome {
@@ -550,10 +562,14 @@ impl Game {
                 }
                 Outcome::redraw()
             }
+            Command::Select { sim } => {
+                self.select(sim);
+                Outcome::redraw()
+            }
             Command::TogglePanel | Command::OpenPanel(_) => Outcome::redraw(),
             other => {
                 self.note = Some(format!(
-                    "Not carried out, the simulation takes no orders yet: {other:?}"
+                    "Not carried out yet: {other:?}"
                 ));
                 Outcome::redraw()
             }

@@ -375,3 +375,51 @@ fn strict_mode_takes_the_salesman_off_the_lot_at_tick_1104() {
     assert_eq!(update.removed, [259]);
     assert_gone(&lot, 259);
 }
+
+#[test]
+fn the_player_selects_another_goth() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    for _ in 0..10 {
+        lot.step().unwrap();
+    }
+    let mortimer = lot.world().selected().unwrap();
+    let [first, _] = lot.world().indicators;
+    // Another person who lives on the lot (person word 32 is 0) and is of
+    // the Goths' family (word 61).
+    let family = lot.world().objects[&mortimer].person.as_ref().unwrap().data[61];
+    let other = lot
+        .world()
+        .people
+        .iter()
+        .copied()
+        .find(|&id| {
+            let data = &lot.world().objects[&id].person.as_ref().unwrap().data;
+            id != mortimer && data[32] == 0 && data[61] == family
+        })
+        .unwrap();
+    lot.select(other).unwrap();
+    let world = lot.world();
+    assert_eq!(world.selected(), Some(other));
+    assert!(!world.objects[&mortimer].selected);
+    assert_eq!(world.globals[3], other as i16);
+    assert_eq!(world.objects[&first].data[2], other as i16);
+    assert_eq!(world.objects[&other].slots[2].object, first as i16);
+    assert_eq!(world.objects[&mortimer].slots[2].object, 0);
+    // Selecting him back gives the indicator back.
+    lot.select(mortimer).unwrap();
+    assert_eq!(lot.world().selected(), Some(mortimer));
+    assert_eq!(lot.world().objects[&first].data[2], mortimer as i16);
+    // A selection that fails changes nothing.
+    let before = lot.world().hash();
+    assert!(lot.select(first).is_err());
+    assert_eq!(lot.world().hash(), before);
+    for _ in 0..50 {
+        lot.step().unwrap();
+    }
+}

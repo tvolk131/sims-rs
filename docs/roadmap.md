@@ -2082,23 +2082,31 @@ through their public interfaces only; the simulation never depends on it.
   selected Sim's menu on it with `Lot::pie_menu`, which changes the lot
   as the original's listing does; a click opens it. The entries are
   those whose check passes, named as the check tree named them or else
-  by the TTAs strings of the table they came from, with "*" before an entry with flag 0x80; choosing one
-  queues the offered action with `Lot::pick`. Where the simulation has
+  by the TTAs strings of the table they came from, with "*" before an
+  entry with flag 0x80; choosing one queues the offered action with
+  `Lot::pick`. Where the simulation has
   not ported something the listing needs, the menu falls back to every
   entry of the table, queued by menu number, and the note across the
   top says why; any other failure shows no menu. Escape closes the menu.
   The simulation lists the fridge itself: in the morning the house
   loads in, Have A Snack, Have Quick Breakfast, Have Breakfast and
   Serve Breakfast.
-- **Blocked: a Sim doing what he is told.** Have A Snack queued on the
-  fridge at tick 51 leaves the queue by tick 151. Strict mode stops at
-  tick 154: another person (object 16, tree 0x2156 node 5) runs a slot
-  search with seats (0x4835f0). Play mode runs 20,000 ticks after the
-  order without stopping, but at tick 634 Mortimer's snack fails on
-  Create New Object Instance mode 4 with flags 0x1 (tree 0x1019 node 1)
-  and he is parked ("dropping the frames of a person that is using an
-  object"); at tick 20051 his running interaction is still the snack.
-  Without an order, strict mode runs to tick 2702.
+- **Done: a Sim doing what he is told.** Have A Snack queued on the
+  fridge at tick 51 (the snack order, run 2026-11-15 on main d46c93ab,
+  in play mode and in strict mode alike): Mortimer takes the order at
+  tick 150, the fridge makes the snack (object 263) at tick 615, he
+  takes it at 748, pays 5 at 820 and eats it (menu 2 on the snack) while
+  his hunger goes from 94.5 to 100.0 (tick 936); at 1088 the snack goes
+  off the lot and at 1136 it is deleted, and he is free again. He goes
+  on to other things (object 71 at tick 1497, object 132 at 2292).
+  Strict mode then stops at tick 2703 on the school bus, as it does
+  without an order; play mode goes on, through caught errors (Snap to a
+  place where the object does not fit, 0x454e09; Create New Object
+  Instance mode 6 with flags 0x4; scopes 34 and 24).
+- **Done: selecting a Sim.** A press on a portrait selects that Sim
+  (`Lot::select`, 0x445449, between ticks): the Sim selected before is
+  deselected, the indicators move, and the panel and the pie menus
+  follow the new Sim.
 - **Next:** a real pie.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
@@ -2106,8 +2114,6 @@ through their public interfaces only; the simulation never depends on it.
     entry on another person is refused at 0x45d240. A check tree's fault
     should keep its trap rather than become `Unsupported` text, which
     `sims-game` reads to tell unported from failed.
-  - `sims-vm`: a slot search with seats (0x4835f0), and Create New
-    Object Instance mode 4 with flags 0x1, which the snack makes.
   - `sims-render`: which object drew each pixel (an object ID buffer
     beside the depth), so a click picks the object under it. Today
     `sims-game` guesses from each object's tile.
@@ -2121,6 +2127,13 @@ through their public interfaces only; the simulation never depends on it.
     to find the person a click lands on.
   - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
     and dialogs are. `sims-game` draws a plain list until then.
+  - `sims-audio`: the inputs the game cannot give yet: the camera value
+    of the ambience's cursor (0x570c3e; `sims-game` passes a fixed 50),
+    what the sound scripts' `getsrcdatafield` fields are (`sims-game`
+    answers 0 to every one; an object's place on screen, for its pan,
+    is presumably among them, unread), and what
+    pausing the game does to the sounds playing (the pause events are
+    not ported).
 
 ## Working rules
 

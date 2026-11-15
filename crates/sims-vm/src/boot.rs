@@ -673,6 +673,30 @@ impl Lot {
         Ok(queued)
     }
 
+    /// Selects the Sim `person` as the player does from a portrait,
+    /// between steps ([`Interpreter::select`], 0x445449): the Sim
+    /// selected before is deselected, and the indicators move. Returns
+    /// the requests to the sound system the indicators' trees made.
+    ///
+    /// A selection that fails changes nothing, as for
+    /// [`Lot::queue_interaction`]. Only a person can be selected; which
+    /// people the interface lets the player select (the portraits of the
+    /// household) is the caller's to decide.
+    pub fn select(&mut self, person: u16) -> Result<Vec<crate::SoundEvent>, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        interpreter
+            .select(&mut world, Some(person))
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        Ok(sounds.into_inner())
+    }
+
     /// Whether the lot takes a player's input.
     fn ready(&self) -> Result<(), OrderError> {
         if self.halted {
