@@ -242,7 +242,9 @@ fn a_tile_offers_the_menu_of_the_tile_its_orders_go_to() {
         .expect("the house opens")
         .assets;
     let person = lot.world().selected().expect("a Sim is selected");
-    let mut redirected = Vec::new();
+    let mut redirected = 0;
+    // The redirected tiles that offer something, with the first entry.
+    let mut offered = Vec::new();
     let ids: Vec<u16> = lot.world().objects.keys().copied().collect();
     // The menu numbers and labels a listing shows, or its error.
     let shown = |listing: &Result<sims_game::menu::Listing, String>| {
@@ -263,17 +265,22 @@ fn a_tile_offers_the_menu_of_the_tile_its_orders_go_to() {
             shown(&sims_game::menu::entries(&mut lot, &assets, person, target)),
             "object {id} and its target {target}"
         );
-        if target != id
-            && let Ok(listing) = listing
-            && let Some(entry) = listing.entries.first()
-        {
-            redirected.push((id, target, entry.clone()));
+        if target != id {
+            redirected += 1;
+            if let Ok(listing) = listing
+                && let Some(entry) = listing.entries.first()
+            {
+                offered.push((id, target, entry.clone()));
+            }
         }
     }
     // The beds' and the guitar's other tiles send their orders on.
-    assert!(redirected.len() >= 8, "{}", redirected.len());
+    assert!(redirected >= 8, "{redirected}");
     // An order on such a tile goes where the menu said it would.
-    let (tile, target, entry) = redirected[0].clone();
+    let (tile, target, entry) = offered
+        .first()
+        .expect("a tile that offers something")
+        .clone();
     let queued = match entry.action.clone() {
         Some(action) => lot.pick(person, action),
         None => lot.queue_interaction(person, tile, entry.menu),

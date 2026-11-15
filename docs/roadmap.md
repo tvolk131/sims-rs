@@ -2094,10 +2094,11 @@ through their public interfaces only; the simulation never depends on it.
 - **Next:** a real pie.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today: the fridge (Add/Change Action
-    String in check tree 0x1012, 0x458789); objects offering nothing
-    (0x48d423); 32 objects whose interaction table is version 0; check
-    trees 0x2071 (objects 4, 10, 253) and 0x2035 (object 18, scope 12).
-    Every entry on another person is refused at 0x45d240.
+    String in check tree 0x1012, 0x458789, in review); check trees
+    0x2071 (objects 4, 10, 253) and 0x2035 (object 18, scope 12). Every
+    entry on another person is refused at 0x45d240. A check tree's fault
+    should keep its trap rather than become `Unsupported` text, which
+    `sims-game` reads to tell unported from failed.
   - `sims-vm`: a slot search with seats (0x4835f0), and Create New
     Object Instance mode 4 with flags 0x1, which the snack makes.
   - `sims-render`: which object drew each pixel (an object ID buffer
