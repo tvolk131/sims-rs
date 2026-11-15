@@ -18,7 +18,8 @@
 //!    that is more. The array is changed in place, so a tile grown earlier
 //!    in the sweep counts for the tiles after it.
 //! 4. It then sends signal 0x83, and the handler sends 0x86 and 0x83 after
-//!    it. Only the house viewer (0x4a82db) takes those two, to redraw.
+//!    it, which the interface's panels (0x4c3ea5, a refresh flag on 0x86)
+//!    and the house viewer (0x4a82db, a redraw on 0x83) take.
 
 use crate::World;
 
@@ -74,7 +75,8 @@ impl World {
                     at(&grass.data, height, nx, ny) == at(&target.data, target_height, nx, ny)
                 });
                 if grown {
-                    let next = (i32::from(g) + step).min(i32::from(t));
+                    // The original adds in 32 bits, which wrap.
+                    let next = i32::from(g).wrapping_add(step).min(i32::from(t));
                     grass.data[x * height + y] = next as i8 as u8;
                 }
             }
@@ -152,9 +154,36 @@ mod tests {
         // is at its target when the sweep reaches it, and (2, 3) grows
         // only later, so it stays.
         assert_eq!(cell(&world, 1, 2), 0);
+        // The sweep goes along x within each y. (1, 3)'s diagonal (2, 2)
+        // grew on row 2, before it; (3, 1)'s did not grow until after it,
+        // on row 2. With the loops the other way round these swap.
+        assert_eq!(cell(&world, 1, 3), 20);
+        assert_eq!(cell(&world, 3, 1), 0);
         // The border stays as it was.
         assert_eq!(cell(&world, 0, 0), 0);
         assert_eq!(cell(&world, 5, 5), 0);
+    }
+
+    #[test]
+    fn the_bytes_are_signed_and_the_addition_wraps() {
+        // Grass −100 below a target of −50 grows by 20; a grass of 100
+        // is above a target of −1 (0xff), so it does not grow.
+        let mut world = lot(
+            6,
+            array(6, &[((1, 1), -50), ((3, 3), 100)], -100),
+            array(6, &[((3, 3), -1)], -50),
+        );
+        world.grow_grass(5).unwrap();
+        assert_eq!(cell(&world, 2, 2), -80);
+        assert_eq!(cell(&world, 3, 3), 100);
+        // An amount whose step wraps past i32::MAX gives the wrapped sum.
+        let mut world = lot(
+            6,
+            array(6, &[((1, 1), 120), ((2, 2), 100)], 0),
+            array(6, &[], 120),
+        );
+        world.grow_grass(536_870_911).unwrap();
+        assert_eq!(cell(&world, 2, 2), 96);
     }
 
     #[test]

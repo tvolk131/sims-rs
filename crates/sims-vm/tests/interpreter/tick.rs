@@ -317,13 +317,16 @@ fn a_new_time_of_day_grows_the_lawn_when_global_36_is_set() {
     fx.world.globals[36] = 1;
     update(&mut fx, &mut answers(&[])).unwrap();
     assert_eq!(cell(&fx, 2, 2), 0);
-    // A lot without the arrays fails loudly.
+    // A lot without the arrays fails loudly, before the time of day or
+    // the rooms change.
     let mut fx = before_the_hour(17, 0);
     fx.world.globals[36] = 1;
     assert!(matches!(
         update(&mut fx, &mut answers(&[])),
         Err(TickError::Unsupported(m)) if m.contains("the lawn grows")
     ));
+    assert_eq!(fx.world.globals[4], 0);
+    assert!(!fx.world.rooms.rooms[&1].dirty);
 }
 
 #[test]
