@@ -22,16 +22,21 @@
 //! legacy/crates/sims-vm/src/loading.rs), without its suspension points:
 //! here each removal runs to its end.
 //!
-//! Only the case the lot-wide controllers and the indicators need is
-//! ported: an object that is off the lot, one tile, not a person, holding
-//! nothing and held by nothing, with no callbacks for leaving the lot, and
-//! that no person on the lot refers to. Anything else fails with an error
-//! that says what is missing.
+//! Two cases are ported. One is what the lot-wide controllers and the
+//! indicators need: an object that is off the lot, one tile, not a
+//! person, held by nothing, with no callbacks for leaving the lot, and
+//! that no person on the lot is using. The other is a person on its way
+//! out (Remove Object Instance on itself, then the removal at the end of
+//! the lot update), which leaves through the lot's placement
+//! (`Interpreter::take_off_to_remove`) and resets in its own way
+//! (`Interpreter::reset_person_to_delete`). Anything else fails with an
+//! error that says what is missing.
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Machine};
 use crate::sounds::SoundEvent;
 use sims_sim::World;
+use sims_sim::rooms::RoomError;
 
 /// Off the lot: where the factory puts a new object.
 const OFF_LOT: i32 = -16;
@@ -143,49 +148,96 @@ impl Interpreter<'_> {
         Ok(removed)
     }
 
-    /// Removes an object at once (0x44123f): it leaves the lot and is then
-    /// deleted.
+    /// Removes an object at once (0x44123f): it leaves the lot (its
+    /// virtual function 0x50 with 1, 0x4412a4) and is then deleted.
+    ///
+    /// An object that is not a person leaves the narrow way of
+    /// [`Machine::leave_lot`], which the load was compared through. A
+    /// person leaves through [`Interpreter::take_off_to_remove`], which
+    /// needs the lot's rooms worked out; before the load has done so it
+    /// fails.
     ///
     /// The original remembers the room of an object that lights it (data
-    /// word 7 nonzero) and marks that room for redrawing afterwards, and
-    /// first drops the interface's references to the object (0x447d8b).
-    /// Rooms and the interface are not modeled.
+    /// word 7 nonzero) and marks that room for redrawing afterwards
+    /// (signal 0xf3), and first drops the interface's references to the
+    /// object (0x447d8b). Both are presentation.
     pub fn remove_now(&self, world: &mut World, id: u16) -> Result<(), Fault> {
-        let mut machine = self.machine(world, id, 0, false);
-        machine.leave_lot(id).map_err(|trap| Fault {
+        let fail = |trap| Fault {
             object: id,
             at: None,
             trap,
-        })?;
+        };
+        let person = world.objects.get(&id).is_some_and(|o| o.person.is_some());
+        if person {
+            if matches!(
+                world.room_at([OFF_LOT, OFF_LOT, 1]),
+                Err(RoomError::NoRooms)
+            ) {
+                return Err(fail(Trap::Unsupported(
+                    "removing a person before the load has worked the lot's rooms out is not \
+                     ported"
+                        .into(),
+                )));
+            }
+            self.take_off_to_remove(world, id, true)?;
+        } else {
+            let mut machine = self.machine(world, id, 0, false);
+            machine.leave_lot(id).map_err(fail)?;
+        }
         self.delete(world, id)
     }
 
     /// Deletes an object that is off the lot (0x440eeb):
     ///
-    /// 1. It gives up the ownership of interface events.
-    /// 2. Every person lets go of it ([`crate::forget`], 0x444306).
-    /// 3. It resets one last time ([`Interpreter::reset`]), which runs its
-    ///    Reset tree if it has one.
-    /// 4. The objects it holds are removed.
-    /// 5. Its sounds are stopped (0x4323c9, [`crate::sounds`]), and it is
-    ///    unlinked from the registration list and from its type's
-    ///    instance list, and its storage is freed.
+    /// 1. It gives up the ownership of interface events (registry +0xa8,
+    ///    0x444bc8 with 0).
+    /// 2. If it is the selected Sim, nobody is selected (0x445449 with 0,
+    ///    [`Interpreter::select`]), which is not ported and fails.
+    /// 3. Every person lets go of it ([`crate::forget`], 0x444306).
+    /// 4. It resets one last time (its virtual function 0x38 with 0): an
+    ///    object through [`Interpreter::reset`], which runs its Reset tree
+    ///    if it has one; a person through
+    ///    [`Interpreter::reset_person_to_delete`] (0x45e791), with the
+    ///    deletion mark (object flag 0x40) that keeps it off the lot.
+    /// 5. Each object it holds, slot 1 on as scripts count them, is
+    ///    removed at once ([`Interpreter::remove_now`], 0x441196): each
+    ///    slot is read again as the walk reaches it, over the slots it had
+    ///    when the walk began.
+    /// 6. Its sounds are stopped (the base destructor 0x432331 calling
+    ///    0x4323c9, [`crate::sounds`]), and it is unlinked from the
+    ///    registration list and from its type's instance list (0x44383c),
+    ///    and its storage is freed. A person's destructor (0x459511) also
+    ///    frees its route (+0xaec), its animator (+0xadc, 0x588080), its
+    ///    uses (+0xb00), route contexts (+0xaf0), path (+0xae0) and queue
+    ///    (+0x820), so what [`World`] keeps for them by the person's ID
+    ///    goes: its animator, route, tick state and unknown data words. It
+    ///    also leaves the lot's list of people (lot +0x84).
     ///
-    /// A person using the object fails in step 2 (`crate::forget`). A
+    /// A person using the object fails in step 3 (`crate::forget`). A
     /// route aimed at the object fails before anything changes: the
-    /// original leaves the route a pointer to the freed object. Step 4 is
-    /// not ported: an object holding
-    /// another fails. A person and a tile of a multi-tile object have their
-    /// own deletion, which fails too.
+    /// original leaves the route a pointer to the freed object. A tile of
+    /// a multi-tile object has its own deletion (0x440f37, through the
+    /// group), which fails.
     ///
     /// The ID stays in [`World::removals`] if it is queued there. The
     /// original's queue holds bare IDs and whoever drains it skips the ones
     /// that name no object.
     ///
-    /// Not modeled, being presentation: the signal to the interface
-    /// (0x87), the object's redraw, and the release of its indicator. The
-    /// original also sets the object's deletion mark (object flag 0x40),
-    /// which only a person's reset reads.
+    /// Nothing here writes a neighborhood record, a relationship or a
+    /// family: a person's record keeps what it held, and other objects'
+    /// relationships and frames that name the ID keep it. Neither does
+    /// the deletion touch the rooms: the room a person was last seen in
+    /// keeps its mark that a person is in it, which the next person to
+    /// leave it clears.
+    ///
+    /// Not modeled, being presentation: the signals to the interface
+    /// (0x87, 0x88), the object's redraw (0x434101), the registry's
+    /// interface hooks (0x4481eb, which changes nothing for a person or
+    /// any object but an indicator or a star marker, and the list at
+    /// registry +0x30, 0x464fa2), the interface object of GUID 0x3EEC206C
+    /// (registry +0x80), and the release of its indicator. The original
+    /// also sets the object's deletion mark (object flag 0x40), which only
+    /// a person's reset reads.
     pub fn delete(&self, world: &mut World, id: u16) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: id,
@@ -196,11 +248,13 @@ impl Interpreter<'_> {
             .objects
             .get(&id)
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
-        if object.person.is_some() || object.multipart.is_some() {
+        if object.multipart.is_some() {
             return Err(fail(Trap::Unsupported(
-                "deleting a person or a multi-tile object is not ported".into(),
+                "deleting a tile of a multi-tile object (0x440f37) is not ported".into(),
             )));
         }
+        let person = object.person.is_some();
+        let selected = object.selected;
         // A route context holds a pointer to its slot's object
         // (context +0x48); what the original does with it when the object
         // goes is not known.
@@ -218,16 +272,34 @@ impl Interpreter<'_> {
         if world.event_owner == id {
             world.event_owner = 0;
         }
+        if selected {
+            self.select(world, None)?;
+        }
         self.drop_references(world, id)?;
-        self.reset(world, id, true)?;
+        if person {
+            self.reset_person_to_delete(world, id)?;
+        } else {
+            self.reset(world, id, true)?;
+        }
         let object = world
             .objects
             .get(&id)
             .ok_or_else(|| fail(Trap::Invalid("the object's Reset deleted it".into())))?;
-        if object.slots.iter().skip(1).any(|slot| slot.object != 0) {
-            return Err(fail(Trap::Unsupported(
-                "deleting an object that holds another is not ported".into(),
-            )));
+        // 0x4410e7: the count is taken once; each slot is read as the walk
+        // reaches it.
+        for slot in 1..object.slots.len() {
+            let held = world
+                .objects
+                .get(&id)
+                .and_then(|o| o.slots.get(slot))
+                .map_or(0, |s| s.object);
+            // 0x44123f does nothing for an ID that names no object.
+            if let Ok(held) = u16::try_from(held)
+                && held != 0
+                && world.objects.contains_key(&held)
+            {
+                self.remove_now(world, held)?;
+            }
         }
         // The object's destructor stops its sounds (0x4323c9).
         self.sound(SoundEvent::Stop { object: id as i16 });
@@ -250,6 +322,16 @@ impl Interpreter<'_> {
         // A type's instance list outlives its instances (0x44383c).
         for instances in world.instances.values_mut() {
             instances.retain(|&other| other != id);
+        }
+        if person {
+            // The person's destructor (0x459511).
+            world.animators.remove(&id);
+            world.routing.routes.remove(&id);
+            world.person_ticks.remove(&id);
+            world
+                .routing
+                .unknown_words
+                .retain(|&(other, _)| other != id);
         }
         Ok(())
     }

@@ -19,8 +19,9 @@
 //! (`Interpreter::take_off`, the object's virtual function 0x50), except
 //! while the load has not worked the rooms out, when `Machine::leave_lot`
 //! in `removal.rs` takes an object already off the lot and fails loudly
-//! for one that is not simple. A tile of a group and a person fail
-//! loudly.
+//! for one that is not simple. A tile of a group fails loudly. A person
+//! leaves through `Interpreter::take_off_to_remove`, the one way a person
+//! leaves the lot that is ported.
 //!
 //! Flag bit 1 asks that removing the object does not reset
 //! the objects that depend on it; it is recorded on the object for
@@ -68,7 +69,8 @@ impl Machine<'_, '_> {
     ///    them is queued, nothing happens.
     /// 3. If the object itself is queued, nothing happens.
     /// 4. It leaves the lot (its virtual function 0x50, 0x433125, asked to
-    ///    tell the registry: `Interpreter::take_off`). While the load has
+    ///    tell the registry: `Interpreter::take_off_to_remove`, which for a
+    ///    person also covers its animator's refresh). While the load has
     ///    not worked the lot's rooms out yet, that way cannot find the
     ///    room of the off-lot place, so an object then goes the narrower
     ///    way of `Machine::leave_lot`, which the load was compared
@@ -116,7 +118,7 @@ impl Machine<'_, '_> {
         } else {
             let me = self.me;
             self.interpreter()
-                .take_off(self.world, id, true)
+                .take_off_to_remove(self.world, id, true)
                 .map_err(|fault| fault.nested(me))?;
         }
         let object = self

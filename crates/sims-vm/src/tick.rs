@@ -833,7 +833,11 @@ impl Interpreter<'_> {
     /// 2. After a full pass, the queued removals, oldest first: each ID is
     ///    taken off the queue and, if it still names an object, the
     ///    object is removed at once ([`Interpreter::remove_now`],
-    ///    0x44123f). A tile of a multi-tile object is not ported.
+    ///    0x44123f). A tile of a multi-tile object is not ported. A partial
+    ///    pass leaves the queue as it is; one that leaves a person queued
+    ///    fails, since that person's animator would live on past the
+    ///    refresh its take-off skipped
+    ///    ([`Interpreter::take_off_to_remove`]).
     /// 3. Also after a full pass, on a tick count (already counted for this
     ///    update) that is a multiple of 40, registry byte 0x12
     ///    ([`sims_sim::neighbors::Neighbors::relationships_changed`]) is cleared
@@ -896,6 +900,20 @@ impl Interpreter<'_> {
                 answer
             };
             update.answered.push((record.caller, answer));
+        }
+        if partial
+            && let Some(&id) = world.removals.iter().find(|id| {
+                world
+                    .objects
+                    .get(id)
+                    .is_some_and(|object| object.person.is_some())
+            })
+        {
+            return Err(TickError::Unsupported(format!(
+                "person {id} stays queued for removal after a partial pass; its animator's \
+                 refresh as it left the lot (0x58da12) depends on whether the view drew it \
+                 (animator byte +0x109), which is not kept"
+            )));
         }
         if !partial {
             while !world.removals.is_empty() {

@@ -796,19 +796,21 @@ impl Animator {
     ///   holds 0 in the memory image of a running game.
     /// - The event queue is emptied and nothing plays (+0xa0).
     ///
+    /// - A route result (+0x188) that is not 0 stops the route
+    ///   (0x5892dd, calling 0x589e2d) and becomes 0 (0x5892e4). The stop
+    ///   comes after the position was unset, so for a result other than 1
+    ///   or -1 the destination becomes the unset position too (0x589e5d).
+    ///   Its other writes (the segment -1, the timer of a stop 0, the
+    ///   state 3) the reset makes anyway. For 1 or -1, a route under way,
+    ///   the stop only sets +0x284, which is not kept. It also sets +0x18c
+    ///   and global 0x6f6d68, which nothing ported reads.
+    ///
     /// The speed, its target, the clocks, the pickup flag, the count of
     /// events seen and the slow and follow flags stay as they are.
     ///
-    /// Fails for what is not ported: a route result other than 0 (0x589e2d
-    /// then ends the route) and a foreground clip, whose removal can fade
-    /// it out through the blend slot (0x592887).
+    /// Fails for what is not ported: a foreground clip, whose removal can
+    /// fade it out through the blend slot (0x592887).
     pub fn reset(&mut self) -> Result<(), String> {
-        if self.arrival != 0 {
-            return Err(format!(
-                "resetting an animator whose route ended with {} (0x589e2d) is not ported",
-                self.arrival
-            ));
-        }
         if let Some(layer) = &self.foreground {
             return Err(format!(
                 "resetting an animator that plays the clip {:?}: removing it (0x592878) can \
@@ -821,6 +823,12 @@ impl Animator {
         self.motion.near_end = 0;
         self.motion.finishing = 0;
         self.motion.timer = 0;
+        if self.arrival != 0 {
+            if !matches!(self.arrival, 1 | -1) {
+                self.destination = self.position;
+            }
+            self.arrival = 0;
+        }
         self.posture = -1;
         self.carry_selection = -1;
         self.promote = true;

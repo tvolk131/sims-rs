@@ -1113,7 +1113,8 @@ impl Interpreter<'_> {
     /// its whole group off (0x422d86): every tile is asked function 10,
     /// then every tile leaves.
     ///
-    /// A person is refused: its own way of leaving is not ported.
+    /// A person is refused here: only a person on its way to removal is
+    /// ported ([`Interpreter::take_off_to_remove`]).
     pub(crate) fn take_off(&self, world: &mut World, id: u16, notify: bool) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: id,
@@ -1123,7 +1124,11 @@ impl Interpreter<'_> {
         let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
         if object.person.is_some() {
             return Err(fail(Trap::Unsupported(
-                "taking a person off the lot is not ported".into(),
+                "taking a person off the lot other than to remove it is not ported: its \
+                 animator is then refreshed (0x58da12, from 0x4332ed) if the house view found \
+                 it on screen at its last draw (animator byte +0x109, 0x590b8b), which is not \
+                 kept"
+                    .into(),
             )));
         }
         if object.multipart.is_none() {
@@ -1137,6 +1142,60 @@ impl Interpreter<'_> {
             self.take_off_one(world, part, notify)?;
         }
         Ok(())
+    }
+
+    /// Takes an object off the lot on its way to removal: from the removal
+    /// queue (0x442d70) or the removal itself (0x44123f), both of which
+    /// call its virtual function 0x50 with 1. An object that is not a
+    /// person goes as [`Interpreter::take_off`] takes it.
+    ///
+    /// A person (one tile; vtable 0x667378 shares 0x433125 with an
+    /// ordinary object) leaves as an object does ([`Interpreter::take_off`]'s
+    /// one-tile path), with one step more: its virtual function 0x2c gives
+    /// its animator (person +0xadc, 0x4594de), whose virtual function 0x54
+    /// is called with 1 (0x4332e0 to 0x4332ed, 0x58da12). That refresh
+    /// returns at once unless animator byte +0x109 is set (0x58da2c): the
+    /// result of the draw bounds' test of the house view's last draw
+    /// (virtual function 0x6c, 0x590b8b), which is presentation and not
+    /// kept. When it is set, the refresh reads the animator's clock again
+    /// (virtual function 0x34), forces the skin's update at it (0x5992b3
+    /// with 1), places the animator (virtual function 0x60), runs the
+    /// head's step, measurement and restoration (0x590768, 0x5904d2,
+    /// 0x590b27), and redraws what the person carries in its slot 1.
+    ///
+    /// Here the refresh returns at once, as for a person the view did not
+    /// draw: **unverified**. Either way it writes only the person's own
+    /// animator and data words, and the drawing of what it carries, and
+    /// the removal at the end of the same lot update destroys the
+    /// animator and the person. Before that, the person's own tick (after
+    /// its thread yields at Remove Object Instance) brings the skin up to
+    /// date at the same clock as the refresh would have, and runs the
+    /// head's step. What could still differ is read only by another
+    /// person's head that looks at this one (`crate::head`, 0x59293d) or
+    /// by a person still queued after the update ([`Interpreter::end_of_update`]);
+    /// both fail loudly.
+    pub(crate) fn take_off_to_remove(
+        &self,
+        world: &mut World,
+        id: u16,
+        notify: bool,
+    ) -> Result<(), Fault> {
+        let object = world.objects.get(&id).ok_or_else(|| Fault {
+            object: id,
+            at: None,
+            trap: missing(),
+        })?;
+        if object.person.is_none() {
+            return self.take_off(world, id, notify);
+        }
+        if object.multipart.is_some() {
+            return Err(Fault {
+                object: id,
+                at: None,
+                trap: Trap::Invalid("a person with several tiles".into()),
+            });
+        }
+        self.take_off_one(world, id, notify)
     }
 
     /// Puts an object at a place. A multi-tile object puts its whole
