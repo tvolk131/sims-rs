@@ -50,17 +50,39 @@
 //!    original also hides every entry while an interface flag (0x6f2a54)
 //!    is set; only interface code writes it, so it is taken to be clear.
 //! 4. What is not ported fails loudly: a check tree adding an entry
-//!    (Add/Change Action String, 0x458789); the entry to join another
+//!    (Add/Change Action String, 0x458789); and the entry to join another
 //!    person's interaction, which the original adds when the person's
 //!    running interaction may be joined and the object is another person
-//!    (0x45866d); and an object that offers nothing, for which the
-//!    original lists the objects on its tile instead (0x48d423).
+//!    (0x45866d).
+//! 5. When the listing offers nothing (0x48d423), each object on the
+//!    clicked object's tile (object +0xfc, read through 0x43f331 and
+//!    0x43f379, in the order the lot links them, the links read again
+//!    after each listing; none outside the lot's size or off levels 1
+//!    and 2) is listed in turn, steps 1 to 4, the pet's check included,
+//!    and what it offers is added to the menu. The clicked object
+//!    is left out, and so are an object of type 8 (definition word 9) and
+//!    one whose definition word 91 (+0xb6) lacks bit 0. Each of these
+//!    listings has its own temps: saved before its first check tree and
+//!    put back when it ends (0x4582dd), before the next object's; the
+//!    first listing's are put back last. A menu that still offers
+//!    nothing is empty. The tile is the one the object's position is on;
+//!    for an object held in a slot that is **unverified**.
 
 use crate::autonomy::{attenuation, checked, entry, find, person};
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Machine};
+use crate::placement::Cursor;
 use sims_formats::saved_objects::Interaction;
 use sims_sim::World;
+
+/// Definition word 9, the object's type; an object of type 8 is left out
+/// of the tile's listing (0x48d44c).
+const TYPE: usize = 9;
+const TILE_SKIPPED: i16 = 8;
+/// Definition word 91 (+0xb6): with bit 0 set, the object is listed when
+/// an object on its tile offers nothing (0x48d453).
+const MENU_WORD: usize = 91;
+const ON_TILE: i16 = 1;
 
 /// The priority of an action the pie menu makes (0x458633).
 pub const MENU_PRIORITY: i32 = 50;
@@ -208,6 +230,70 @@ impl Machine<'_, '_> {
     /// Lists the pie menu on `object` for the running person (0x48d392;
     /// see the module's documentation).
     pub(crate) fn pie_menu(&mut self, object: u16) -> Result<Vec<Interaction>, Trap> {
+        let mut saved = None;
+        let listed = self.list_with_tile(object, &mut saved);
+        // The first listing's temps go back last (0x48d492), after the
+        // tile's.
+        if let Some(temps) = saved {
+            self.me_mut()?.temps = temps;
+        }
+        listed
+    }
+
+    /// The listing on `object`, then, when it offers nothing, the listing
+    /// on each other object on its tile (0x48d423; step 5 of the module's
+    /// documentation).
+    fn list_with_tile(
+        &mut self,
+        object: u16,
+        saved: &mut Option<Vec<i16>>,
+    ) -> Result<Vec<Interaction>, Trap> {
+        let mut listed = self.listing(object, saved)?;
+        if !listed.is_empty() {
+            return Ok(listed);
+        }
+        let position = self
+            .world
+            .objects
+            .get(&object)
+            .ok_or(Trap::native(0x15, "missing object"))?
+            .position;
+        // The walk reads the tile's links again after each listing, so a
+        // check tree that moves or deletes an object changes what follows.
+        let mut cursor = Cursor::on_tile(self.world, World::tile(position));
+        while let Some(other) = cursor.current() {
+            if other != object {
+                let guid = self
+                    .world
+                    .objects
+                    .get(&other)
+                    .ok_or(Trap::native(0x15, "missing object"))?
+                    .guid;
+                let words = self.definition_words(guid)?;
+                if words[TYPE] != TILE_SKIPPED && words[MENU_WORD] & ON_TILE != 0 {
+                    // Each object's own listing puts its temps back when it
+                    // ends (0x4582dd).
+                    let mut own = None;
+                    let more = self.listing(other, &mut own);
+                    if let Some(temps) = own {
+                        self.me_mut()?.temps = temps;
+                    }
+                    listed.extend(more?);
+                }
+            }
+            cursor.advance(self.world)?;
+        }
+        Ok(listed)
+    }
+
+    /// One listing (0x4582ad, 0x458583): the entries of the table of
+    /// `object`'s interaction target.
+    fn listing(
+        &mut self,
+        object: u16,
+        saved: &mut Option<Vec<i16>>,
+    ) -> Result<Vec<Interaction>, Trap> {
+        // Read for each listing, after the checks of any before it.
         let me = self.me;
         let data = &self
             .me()?
@@ -226,21 +312,10 @@ impl Machine<'_, '_> {
             .table(target)?
             .map(|table| table.interactions.iter().map(|e| e.string_index).collect())
             .unwrap_or_default();
-        let mut saved = None;
         let outer = std::mem::replace(&mut self.building_menu, true);
-        let listed = self.list_entries(target, &menus, &mut saved);
+        let listed = self.list_entries(target, &menus, saved);
         self.building_menu = outer;
-        if let Some(temps) = saved {
-            self.me_mut()?.temps = temps;
-        }
-        let listed = listed?;
-        if listed.is_empty() {
-            return Err(Trap::Unsupported(format!(
-                "the pie menu on object {target}, which offers nothing, where the original lists \
-                 the objects on its tile (0x48d423)"
-            )));
-        }
-        Ok(listed)
+        listed
     }
 
     /// Steps 2 to 4 of the listing (0x45859c).
