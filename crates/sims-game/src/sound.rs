@@ -29,6 +29,10 @@ const SPEED_REGISTER: u8 = 100;
 /// The ambience's view input (see the module documentation).
 pub const VIEW: i32 = 50;
 
+/// The most distinct faults reported. Later ones are dropped unseen, so
+/// a long game's missing sounds do not grow without end.
+const REPORTED: usize = 256;
+
 /// The player's seed. The sound's randomness never reaches the
 /// simulation, so any fixed seed does.
 const SEED: u64 = 1;
@@ -101,13 +105,20 @@ impl Mixer {
         self.player.render_stereo(frames, &NoSources)
     }
 
-    /// Faults not reported yet, each once. The player's list is emptied,
-    /// so it does not grow over a long game.
+    /// Faults not reported yet, each once, up to [`REPORTED`] of them; a
+    /// last line says when more are no longer shown. The player's list is
+    /// emptied each time, so neither it nor this one grows without end.
     pub fn new_faults(&mut self) -> Vec<String> {
         let mut out = Vec::new();
         for fault in self.player.faults.drain(..) {
+            if self.reported.len() >= REPORTED {
+                continue;
+            }
             if self.reported.insert(fault.clone()) {
                 out.push(fault);
+                if self.reported.len() == REPORTED {
+                    out.push("further sound faults are not shown".into());
+                }
             }
         }
         out
