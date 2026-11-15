@@ -4,6 +4,49 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: A route interrupted under way asks its animator to stop and waits
+
+**Unverified** against a recording: no capture has a route interrupted
+while its animator walks. Track 1 found it by cancelling the snack order
+while Mortimer walks; a player order given while he walks on an action
+of his own (priority 2, below the order's 50) reaches it the same way.
+
+Go To Routing Slot's step 3 tests for an interruption before it reads
+the animator's route (0x45b2b7), so step 11 (0x45b3c2) can find the
+animator still under way (its route end, +0x188, 1 or -1). The stop
+(0x589e2d) then stops nothing: it sets animator +0x284 to 1 and returns
+false, and the step jumps to the run's common exit (0x45b9a0), which
+keeps step 11, writes the context back and returns the run's result,
+still the 2 it started with, so the thread yields. Steps 9 and 10 come
+after a route result of 1 or 0, which an animator under way never gives,
+so only step 11 reaches this; any other step fails loudly. The end of a
+route (0x45b6ea) and Look Towards stop the same way, and now note the
+request too.
+
+The animator reads +0x284 in the walk's step, after the person is put on
+the next tile (0x58eeeb): when it is set, the route end is still 1 and
+the foreground clip may be interrupted (layer +0x68), a person whose
+word 64 is 0 has the route end set to 3, blocked (0x58ef29 to 0x58f682),
+and the update goes to its tail. On the next tick step 11 stops the
+animator, plays `end_route` and fails the route with result 4. A person
+whose word 64 is set instead plays the stop clip (state 7, clip 0x13,
+0x58f010), which is not ported and fails loudly. Starting a route clears
++0x284 (0x589d38).
+
+- +0x284 is kept as `World::stop_requests`, a set of people, added at
+  the end of the World (snapshot format 27) so that format 26 encodings
+  stay a prefix. The animator's constructor sets +0x284 to 1 (0x5887b7),
+  but only a walk after a route starts reads it, and the start clears it,
+  so a new animator is left out of the set.
+- Every pinned state (the Goth ticks 33, 1103, 2881, 3432 and 3602, and
+  the Newbies' 1802) is the format 26 state plus an empty set: the
+  strict runs never stop a route under way.
+- Track 1's test of the cancelled snack order (`game/second-order`)
+  expects the old loud failure at step 182; it changes to the route
+  failing with result 4 once both are merged.
+- Reopen if a recording interrupts a route under way and the original
+  takes another tick, or none, to stop.
+
 ## 2026-11-15: A route that gives up near its slot runs the failure feedback tree
 
 Go To Routing Slot and Go To Relative Position share the route steps of

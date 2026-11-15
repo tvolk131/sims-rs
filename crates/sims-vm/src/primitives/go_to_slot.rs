@@ -74,7 +74,10 @@
 //! - **10**: the animator stops short of the path's end, as when its
 //!   next step was blocked (0x45b371); the next step is 6.
 //! - **11**, interrupted on the way (0x45b3c2): the animator stops; the
-//!   next step is 7.
+//!   next step is 7. An animator still under way does not stop: the stop
+//!   is only asked for ([`crate::animator::stop_route`]), and the run
+//!   ends keeping step 11, so the thread yields and stops again on the
+//!   next tick, once the walk's next step has ended the animator's route.
 //! - **8**: the route ends ([`Machine::end_route`]): the result is true.
 //!
 //! The steps run one after another in a run until one yields or pushes a
@@ -650,16 +653,27 @@ impl Machine<'_, '_> {
                 ARRIVED | STOPPED | INTERRUPTED => {
                     // 0x45b3de, 0x45b371, 0x45b3c2: the animator stops
                     // (0x589e2d).
-                    let animator = self
-                        .world
+                    let world = &mut *self.world;
+                    let animator = world
                         .animators
                         .get_mut(&me)
                         .ok_or_else(|| Trap::Invalid(format!("person {me} has no animator")))?;
-                    if !stop_route(animator) {
-                        return Err(unsupported(
-                            "0x45b3eb",
-                            "whose animator is still under way when it is to stop",
-                        ));
+                    if !stop_route(animator, &mut world.stop_requests, me) {
+                        // Still under way: the stop is asked for, and the
+                        // run ends at 0x45b9a0 keeping this step, to stop
+                        // again on the next tick, after the walk's next
+                        // step has ended the route. Only an interrupted
+                        // route gets here under way: steps 9 and 10 follow
+                        // a route result of 1 or 0, which an animator
+                        // under way does not give. The run's result is
+                        // still the 2 it started with, so the thread
+                        // yields.
+                        if state != INTERRUPTED || result != 2 {
+                            return Err(Trap::Invalid(format!(
+                                "the animator is under way at route step {state}"
+                            )));
+                        }
+                        break;
                     }
                     // 0x45b3a0: "end_route" plays for me. A route that
                     // stopped short of the path's end (a blocked step)
@@ -899,10 +913,12 @@ impl Machine<'_, '_> {
                 }
             }
         }
-        if let Some(animator) = self.world.animators.get_mut(&me)
+        let world = &mut *self.world;
+        if let Some(animator) = world.animators.get_mut(&me)
             && animator.arrival != 0
         {
-            stop_route(animator);
+            // Under way, this only asks for the stop.
+            stop_route(animator, &mut world.stop_requests, me);
         }
         let result = if state == FAILED {
             if ctx.result == 0 {

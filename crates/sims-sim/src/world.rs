@@ -162,6 +162,16 @@ pub struct World {
     /// from the animator so that the encodings of the states before it
     /// was kept stay a prefix of the new ones.
     pub translated_bones: BTreeMap<u16, BTreeSet<String>>,
+    /// The people whose animator was asked to stop its route while the
+    /// route was under way (animator +0x284): the stop (0x589e2d) then
+    /// stops nothing and only notes the request, and the walk's next step
+    /// ends the route blocked once the person is put
+    /// (0x58eeeb). Starting a route forgets it (0x589d38). A new animator
+    /// has it set (0x5887b7), but nothing reads it before a route starts,
+    /// so a person is in this set only from a stop under way to the next
+    /// start. Kept apart from the animator so that the encodings of the
+    /// states before it was kept stay a prefix of the new ones.
+    pub stop_requests: BTreeSet<u16>,
 }
 
 /// How many advertisements the record of [`World::advertisement_record`]
@@ -500,6 +510,7 @@ impl World {
             headlines: BTreeMap::new(),
             base_layers: BTreeMap::new(),
             translated_bones: BTreeMap::new(),
+            stop_requests: BTreeSet::new(),
         }
     }
 

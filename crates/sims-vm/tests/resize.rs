@@ -417,11 +417,21 @@ fn routing_18_bytes(routing: &sims_sim::route::Routing) -> Vec<u8> {
     bytes
 }
 
+/// A lot's encoding as snapshot format 26 wrote it: without the stop
+/// requests ([`World::stop_requests`]) that format 27 added at the end.
+/// The older formats' encodings start from this one.
+fn format_26_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let requests = postcard::to_allocvec(&world.stop_requests).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - requests.len()), requests);
+    bytes
+}
+
 /// A lot's encoding as snapshot format 25 wrote it: without the record of
 /// the bones the skins moved ([`World::translated_bones`]) that format 26
-/// added at the end. The older formats' encodings start from this one.
+/// added at the end either. It starts from [`format_26_bytes`].
 fn format_25_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_26_bytes(world);
     let moved = postcard::to_allocvec(&world.translated_bones).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - moved.len()), moved);
     bytes

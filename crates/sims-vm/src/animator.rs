@@ -93,6 +93,7 @@ use sims_sim::animator::{Animator, Base, EPSILON, LOADED, Layer, UNSET};
 use sims_sim::pose;
 use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 /// Person data words.
 const POSTURE: usize = 0;
@@ -1804,6 +1805,25 @@ impl Interpreter<'_> {
         }
         a.position[0] = x.to_f32();
         a.position[1] = y.to_f32();
+        // 0x58eeeb: a stop asked for while the route was under way
+        // ([`stop_route`]) ends it here, once the person is put, if the
+        // route is still on its way to the end (+0x188 is 1) and the
+        // foreground clip may be interrupted (layer +0x68).
+        if world.stop_requests.contains(&id)
+            && a.arrival == 1
+            && a.foreground.as_ref().is_none_or(|l| l.interruptible != 0)
+        {
+            if person_word(world, id, SPECIAL)? != 0 {
+                return Err(unsupported(
+                    "0x58ef2f",
+                    "stops a route asked to stop under way for a person whose word 64 is set \
+                     (state 7 and the stop clip 0x13, 0x58f010)",
+                ));
+            }
+            // 0x58ef29 to 0x58f682: the route ends blocked (3), and the
+            // update goes to its tail.
+            a.arrival = BLOCKED;
+        }
         Ok(true)
     }
 
@@ -2121,6 +2141,8 @@ impl Interpreter<'_> {
         a.motion.near_end = 0;
         a.state = 3;
         world.animators.insert(id, a);
+        // 0x589d38: a stop asked for before is forgotten.
+        world.stop_requests.remove(&id);
         Ok(())
     }
 }
@@ -2201,18 +2223,21 @@ fn end_turn(world: &mut World, id: u16, a: &mut Animator) -> Result<(), Trap> {
     Ok(())
 }
 
-/// The animator stops following its route (0x589e2d), as the route's
-/// steps 9 and 10 and its end ask. While the route is under way (its end,
-/// +0x188, is 1 or -1) nothing stops: +0x284 is set to 1, which nothing
-/// ported reads, and the answer is false. Otherwise the end becomes 0,
-/// the segment -1, the destination the position, and the animator
-/// stands (state 3); the answer is true.
+/// Person `id`'s animator stops following its route (0x589e2d), as the
+/// route's steps 9, 10 and 11 and its end ask. While the route is under
+/// way (its end, +0x188, is 1 or -1) nothing stops: the stop is only
+/// asked for (+0x284 = 1, kept in `requests`, [`World::stop_requests`])
+/// and the answer is false; the walk's next step ends the route
+/// ([`Interpreter::walk_step`]). Otherwise the end becomes 0, the segment
+/// -1, the destination the position, and the animator stands (state 3);
+/// the answer is true.
 ///
 /// The timer of a stop at the end of a path (+0x1c0) becomes 0 too
 /// (0x589e56). The original also sets +0x18c to 1 and the global
 /// 0x6f6d68 to 7. Nothing ported reads them, and they are not kept.
-pub(crate) fn stop_route(a: &mut Animator) -> bool {
+pub(crate) fn stop_route(a: &mut Animator, requests: &mut BTreeSet<u16>, id: u16) -> bool {
     if matches!(a.arrival, 1 | -1) {
+        requests.insert(id);
         return false;
     }
     a.arrival = 0;
@@ -2545,12 +2570,18 @@ mod tests {
         for arrival in [1, -1] {
             a.arrival = arrival;
             let before = a.clone();
-            assert!(!stop_route(&mut a));
+            let mut requests = BTreeSet::new();
+            assert!(!stop_route(&mut a, &mut requests, 7));
             assert_eq!(a, before);
+            // The stop is asked for.
+            assert_eq!(requests, BTreeSet::from([7]));
         }
-        // Any other end: the animator stands where it is.
+        // Any other end: the animator stands where it is, and no stop is
+        // asked for.
         a.arrival = 2;
-        assert!(stop_route(&mut a));
+        let mut requests = BTreeSet::new();
+        assert!(stop_route(&mut a, &mut requests, 7));
+        assert!(requests.is_empty());
         assert_eq!((a.arrival, a.motion.segment, a.state), (0, -1, 3));
         assert_eq!(a.destination, a.position);
     }

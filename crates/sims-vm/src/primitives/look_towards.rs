@@ -110,12 +110,12 @@ impl Machine<'_, '_> {
             result = 1;
         }
         if result != 2 {
-            let animator = self
-                .world
+            let world = &mut *self.world;
+            let animator = world
                 .animators
                 .get_mut(&me)
                 .ok_or_else(|| Trap::Invalid(format!("person {me} has no animator")))?;
-            if !stop_route(animator) {
+            if !stop_route(animator, &mut world.stop_requests, me) {
                 result = 2;
             }
         }

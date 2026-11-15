@@ -55,7 +55,9 @@ events, and what it asks for after them) come first.
   (#121), sound events (#122), Idle For Input starting a queued action
   (#131), the pie menu and picking from it (#132), and Go To Routing
   Slot's parameter and global slots (#134), which a player's snack order
-  reached.
+  reached. A route interrupted while its animator is under way (an order
+  given or cancelled mid-walk) asks the animator to stop and waits a
+  tick, as the original does (0x45b3c2, 0x58eeeb).
 - Strict mode on the Goth house runs to tick 3602, 08:30 on the first
   day. One tick is two game seconds, so a day is 43,200 ticks (measured
   from the clock globals). The carpool makes the school bus at tick 2703
