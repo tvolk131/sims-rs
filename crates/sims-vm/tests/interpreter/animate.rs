@@ -2102,12 +2102,17 @@ fn after_taking_itself_off_only_what_reads_no_animator_may_run() {
 }
 
 #[test]
-fn a_person_carrying_something_taking_itself_off_fails_loudly() {
-    // The refresh redraws what it carries (0x58dae5).
-    let mut fx = taking_itself_off(sleep());
-    fx.sim_mut().slots[1].object = LAMP as i16;
-    let fault = tick(&mut fx).unwrap_err().to_string();
-    assert!(fault.contains("0x58dae5"), "{fault}");
+fn a_person_holding_something_taking_itself_off_fails_loudly() {
+    // The refresh reads the container entry at begin + 0x48, our slot 2,
+    // and redraws what it holds (0x58dae5 to 0x58dc52). A held hand
+    // (slot 1) fails too.
+    for slot in [1, 2] {
+        let mut fx = taking_itself_off(sleep());
+        assert!(fx.sim().slots.len() > slot, "slot {slot}");
+        fx.sim_mut().slots[slot].object = LAMP as i16;
+        let fault = tick(&mut fx).unwrap_err().to_string();
+        assert!(fault.contains("0x58dae5"), "slot {slot}: {fault}");
+    }
 }
 
 #[test]

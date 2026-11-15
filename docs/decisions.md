@@ -126,7 +126,8 @@ fails, since the original reads outside its table.
 The view's rotation (the scene at 0x6e5528, +0x84, passed at 0x44fdb8)
 is the player's, not the lot's, but the simulation reads it, so it is an
 input of `Lot` like an order: `Lot::set_view_rotation`, between steps.
-Every interpreter `Lot` builds (load, step, orders, pie menu) passes it.
+Every interpreter `Lot` builds (load, step, orders, pie menu, selection)
+passes it.
 The game window sets it whenever its camera turns, from the panel or the
 keys. **A recording of play must log each change** with the tick it came
 before. The load starts it at the camera direction the house file saved
@@ -182,8 +183,11 @@ What this does not cover: anything the refresh does that the port
 leaves out (the draw state, the face, the pose). In the tick itself the
 sounds of timed events are still not modeled, in both branches.
 
-The tick alone is kept. A person carrying something (slot 1) fails
-(0x58dae5 redraws it), and so does a multi-tile person. The draw state
+The tick alone is kept. A person holding something fails: the refresh
+reads the container entry at begin + 0x48, our slot 2 (the head's
+attachment), and redraws what it holds (0x58dae5 to 0x58dc52); it is
+checked before and after the take-off's callbacks. A held hand (slot 1)
+fails too, which can only add stops. A multi-tile person fails. The draw state
 (0x434101) and the face (0x58faf6) are taken as presentation, as in the
 tick; that is unverified. Person 21 passes all four checks at tick 3356.
 

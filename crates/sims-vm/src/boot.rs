@@ -739,6 +739,7 @@ impl Lot {
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();

@@ -1276,18 +1276,33 @@ impl Interpreter<'_> {
         if object.multipart.is_some() {
             return Err(fail(Trap::Invalid("a person with several tiles".into())));
         }
-        if object.slots.get(1).is_some_and(|slot| slot.object != 0) {
-            return Err(fail(Trap::Unsupported(
-                "a person that carries something taking itself off the lot: its animator's \
-                 refresh, if the house view drew it, redraws what it carries (0x58dae5 to \
-                 0x58dc52), which is not ported"
-                    .into(),
-            )));
-        }
+        // At the refresh (0x58dae5 to 0x58db0e) the animator reads the
+        // container entry at begin + 0x48, our slot 2 (the head's
+        // attachment, logical slot 1), and redraws what it holds
+        // (0x58dc08 to 0x58dc52), which is not ported. The refresh comes
+        // after the callbacks below, so the slot is read there; it is
+        // read before them too, which can only add stops. A person whose
+        // hand holds something (slot 1) also fails: what its refresh does
+        // with that is not read.
+        let holding = |world: &World| {
+            let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
+            let held = |n: usize| object.slots.get(n).is_some_and(|slot| slot.object != 0);
+            if held(2) || held(1) {
+                return Err(fail(Trap::Unsupported(
+                    "a person holding something taking itself off the lot: its animator's \
+                     refresh, if the house view drew it, redraws what its head slot holds \
+                     (0x58dae5 to 0x58dc52), which is not ported"
+                        .into(),
+                )));
+            }
+            Ok(())
+        };
+        holding(world)?;
         // 0x4332e0 to 0x4332ed: the refresh comes after the holder's
         // function 9 and the portal's tiles, before the registry is told,
         // which changes nothing for a person (`left_lot`).
         self.take_off_one(world, id, false)?;
+        holding(world)?;
         let pending = self.refresh_at_take_off(world, id).map_err(fail)?;
         self.left_lot(world, id)?;
         refreshing.borrow_mut().pending = Some(pending);
