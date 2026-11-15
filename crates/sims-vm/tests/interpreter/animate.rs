@@ -433,13 +433,15 @@ fn what_animate_sim_does_not_port_fails_loudly() {
         },
     );
     assert!(unsupported(turn(&mut fx)).contains("defined differently"));
-    // A clip that ends with the person sitting (0x590497).
+    // A clip that ends with the person sitting starts posture 1's base
+    // clip, whose name this person's word 64 makes the lookup take from
+    // the special tables (0x59db44).
     let mut fx = sim_animates(animate(1, 3, 0, 0, 0));
     turn(&mut fx).unwrap();
     end_clip(&mut fx);
     sim_definition(&mut fx)[102] = 0;
     fx.sim_mut().person.as_mut().unwrap().data[0] = 1;
-    assert!(unsupported(turn(&mut fx)).contains("0x590497"));
+    assert!(unsupported(turn(&mut fx)).contains("0x59db44"));
 }
 
 #[test]
@@ -948,17 +950,6 @@ fn what_the_animator_tick_does_not_port_fails_loudly() {
     let mut fx = standing();
     fx.sim_mut().slots[1].object = 1;
     assert!(tick(&mut fx).unwrap_err().to_string().contains("carry"));
-    // A posture whose base clip would start.
-    let mut fx = standing();
-    fx.program
-        .libraries
-        .get_mut(&SIM_FILE)
-        .unwrap()
-        .definitions
-        .get_mut(&128)
-        .unwrap()[102] = 0;
-    fx.sim_mut().person.as_mut().unwrap().data[0] = 1;
-    assert!(tick(&mut fx).unwrap_err().to_string().contains("base clip"));
     // The head following something is ported (0x5907c5): with the target
     // an eighth of a turn away the turn moves by its most, 0.2. This
     // person type binds no head anchors, so nothing is measured.
@@ -1461,4 +1452,65 @@ fn what_a_draw_does_not_port_fails_loudly() {
     let mut fx = turning();
     sim_definition(&mut fx)[101] |= 2;
     assert!(failed(&mut fx).contains("second list"));
+}
+
+/// The standing Sim sitting (posture 1) with its base layer free to start:
+/// definition word 102 clear, person word 64 clear, and an adult, so its
+/// clips are named by the global file's adult tables (152 and 153).
+fn sitting(name: &str) -> Fixture {
+    let mut fx = standing();
+    fx.program
+        .libraries
+        .get_mut(&SIM_FILE)
+        .unwrap()
+        .definitions
+        .get_mut(&128)
+        .unwrap()[102] = 0;
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    person.data[0] = 1;
+    person.data[58] = 30;
+    person.data[64] = 0;
+    for table in [152, 153] {
+        fx.program
+            .libraries
+            .get_mut(&GLOBAL)
+            .unwrap()
+            .strings
+            .insert(table, vec![String::new(), name.into()]);
+    }
+    fx
+}
+
+#[test]
+fn postures_1_and_2_start_their_base_clip_once_it_is_found() {
+    // Posture 1's base clip is its clip 1, found without timed events: the
+    // base layer starts.
+    let mut fx = sitting(CLIP);
+    assert!(fx.world.animators.get(&SIM).is_none_or(|a| !a.base));
+    tick(&mut fx).unwrap();
+    let animator = &fx.world.animators[&SIM];
+    assert_eq!((animator.posture, animator.base), (1, true));
+    // A clip with no name (0x5904af), or a name no file holds (0x59dc32),
+    // fails loudly, as does a clip with timed events (0x5992b3).
+    let mut fx = sitting("");
+    assert!(tick(&mut fx).unwrap_err().to_string().contains("0x5904af"));
+    let mut fx = sitting("a-clip-no-file-holds");
+    assert!(tick(&mut fx).unwrap_err().to_string().contains("0x59dc32"));
+    let mut fx = sitting(CLIP);
+    fx.program.animations.insert(
+        "test.far",
+        Clip {
+            name: CLIP.into(),
+            skill: SKILL.into(),
+            duration: HUNDRED,
+            distance: 0,
+            moving: false,
+            frames: 4,
+            motions: 1,
+            tracks: vec![track(&[(0, &[("xevt", "1")])])],
+            channels: Vec::new(),
+            samples: [0, 0],
+        },
+    );
+    assert!(tick(&mut fx).unwrap_err().to_string().contains("0x5992b3"));
 }

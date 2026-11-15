@@ -27,9 +27,9 @@
 //!
 //! Only what an ordinary object or a person on the ground needs is
 //! ported. A person whose person word 84 has bit 0, a tile of a group, a
-//! place inside a container, an object that
-//! must stand against a wall (data word 13 nonzero) and two objects that
-//! are both not solid on the same tile fail loudly.
+//! place inside a person, an object that must stand against a wall (data
+//! word 13 nonzero) and two objects that are both not solid on the same
+//! tile fail loudly.
 
 use super::{FLAGS, FULL, GRIDS, data, datum, footprint, missing, registered, slot};
 use crate::fault::{Fault, Trap};
@@ -84,6 +84,27 @@ mod word {
     pub const PLACEMENT: usize = 42;
     /// Bit 0, in both objects: they cannot share a tile.
     pub const EXCLUSIVE: usize = 63;
+    /// Its weight, and what a container may hold (+0x80, +0x82).
+    pub const WEIGHT: usize = 27;
+    pub const CAPACITY: usize = 28;
+}
+
+/// The SLOT entry kind of a container slot.
+const CONTAINER: u16 = 0;
+
+/// The global the place test reads as the game's mode (the simulator's
+/// +0x36, which a capture of the original names its mode; 0 in live
+/// mode).
+const MODE: usize = 19;
+
+/// A container slot as the place test reads it (a record of 0x24 bytes).
+struct Held {
+    /// Whether its offset is 0 across (record +0 and +4).
+    centre: bool,
+    /// Its height (record +0x14).
+    height: i32,
+    /// The object it holds, or 0 (record +0x10).
+    occupant: i16,
 }
 
 /// Person data word 68; bit 0 set means the person takes no room.
@@ -478,6 +499,28 @@ impl Interpreter<'_> {
         Ok(self.place_test(world, id, position, level)?.is_ok())
     }
 
+    /// Whether an object may go into slot `slot` (as scripts count it) of
+    /// object `container`, which stands at `position` on `level` (the same
+    /// virtual function, 0x433311, with a container in the record
+    /// 0x432679 builds). The steps of [`Interpreter::fits`] run with the
+    /// container's position, except that steps 7 to 11 are skipped, and
+    /// step 3 refuses nothing (0x432aeb; it is skipped here, as its answer
+    /// is not read). In place of steps 11 and 12 come the container's own
+    /// ([`Self::fits_container`]).
+    pub(crate) fn fits_in(
+        &self,
+        world: &mut World,
+        id: u16,
+        container: u16,
+        slot: i32,
+        position: [i32; 2],
+        level: i32,
+    ) -> Result<bool, Fault> {
+        Ok(self
+            .test_place(world, id, position, level, Some((container, slot)))?
+            .is_ok())
+    }
+
     /// [`Interpreter::fits`], with the reason for a refusal.
     pub(crate) fn place_test(
         &self,
@@ -485,6 +528,18 @@ impl Interpreter<'_> {
         id: u16,
         position: [i32; 2],
         level: i32,
+    ) -> Result<Result<(), Refusal>, Fault> {
+        self.test_place(world, id, position, level, None)
+    }
+
+    /// The place test on the ground, or in a container's slot.
+    fn test_place(
+        &self,
+        world: &mut World,
+        id: u16,
+        position: [i32; 2],
+        level: i32,
+        container: Option<(u16, i32)>,
     ) -> Result<Result<(), Refusal>, Fault> {
         let fail = |trap| Fault {
             object: id,
@@ -511,8 +566,10 @@ impl Interpreter<'_> {
         if level > 1 && placement & 0x1000 != 0 {
             return Ok(Err(Refusal::Other));
         }
-        // A person skips the wall rules (0x432ac5).
+        // A person skips the wall rules (0x432ac5), and a place in a
+        // container is not refused by them (0x432aeb).
         if !person
+            && container.is_none()
             && !self
                 .against_walls(world, [a, b], level, read(world, word::WALL_RULES)?)
                 .map_err(fail)?
@@ -558,6 +615,11 @@ impl Interpreter<'_> {
                 return Ok(Err(Refusal::Other));
             }
         }
+        if let Some((container, slot)) = container {
+            return self
+                .fits_container(world, id, container, slot)
+                .map_err(fail);
+        }
         if placement & 0x100 == 0 {
             let heights = &array(world, HEIGHTS, 4).map_err(fail)?[at * 4..at * 4 + 4];
             // Code 0x11.
@@ -590,6 +652,169 @@ impl Interpreter<'_> {
         } else {
             Err(Refusal::Other)
         })
+    }
+
+    /// The place test's own steps for a place in slot `slot` (as scripts
+    /// count it) of object `container` (0x432d62 to 0x432fb8). In order,
+    /// refusing at the first that fails (the placement error is in
+    /// brackets):
+    ///
+    /// 1. Neither the object nor the container has data word 8 flag 4
+    ///    (0xc).
+    /// 2. The container has the slot (0xd).
+    /// 3. The slot holds nothing, or the object itself (11).
+    /// 4. In mode 2 (global 19, the simulator's +0x36), an object that is
+    ///    not a person and has no data word 8 flag 0x2000 needs a slot at
+    ///    the container's centre (an offset of 0 across), or a container
+    ///    with only that slot (3).
+    /// 5. A person as the container takes nothing outside mode 0 (0xd).
+    /// 6. For each slot at the same height holding another object, from
+    ///    the last slot to the first, unless the object is a person: if
+    ///    that slot is at the centre, its object needs data word 8 flag
+    ///    0x2000 (11); and if the slot asked for is at the centre, the
+    ///    object needs that flag itself (11).
+    /// 7. The container's data word 28 is at least the object's data word
+    ///    27 (0xe).
+    /// 8. The object is not the container, nor anything the container is
+    ///    in, however deep ([`super::capture`], 0x4325b5; 11).
+    /// 9. The slot's height is not 0 and the object's data word 4 has the
+    ///    bit for it, bit height minus 1 (0x18).
+    ///
+    /// A slot's offset and height come from the container's definition
+    /// ([`Self::container_slots`]) and what it holds from the container's
+    /// slots. Step 3 names no object it collided with (0x6e4ad0 is left
+    /// as it was), so neither does any refusal here.
+    fn fits_container(
+        &self,
+        world: &mut World,
+        id: u16,
+        container: u16,
+        slot: i32,
+    ) -> Result<Result<(), Refusal>, Trap> {
+        let flags = datum(world, id, word::FLAGS)? as u16;
+        let person = world.objects.get(&id).ok_or_else(missing)?.person.is_some();
+        // Code 0xc.
+        if flags & 4 != 0 || datum(world, container, word::FLAGS)? as u16 & 4 != 0 {
+            return Ok(Err(Refusal::Other));
+        }
+        let slots = self.container_slots(world, container)?;
+        // Code 0xd.
+        let Some(target) = usize::try_from(slot).ok().and_then(|i| slots.get(i)) else {
+            return Ok(Err(Refusal::Other));
+        };
+        // Code 11.
+        if target.occupant != 0 && target.occupant != id as i16 {
+            return Ok(Err(Refusal::Collision(None)));
+        }
+        let unlinked = flags & 0x2000 == 0;
+        let mode = *world
+            .globals
+            .get(MODE)
+            .ok_or_else(|| Trap::Invalid(format!("the simulator has no global {MODE}")))?;
+        // Code 3.
+        if !person && unlinked && mode == 2 && !target.centre && slots.len() > 1 {
+            return Ok(Err(Refusal::Other));
+        }
+        // Step 5 cannot refuse: a person as the container has already
+        // failed loudly in reading its slots.
+        for other in slots.iter().rev() {
+            if other.height != target.height || other.occupant == 0 || other.occupant == id as i16 {
+                continue;
+            }
+            if other.centre && !person {
+                let occupant = u16::try_from(other.occupant)
+                    .ok()
+                    .filter(|o| world.objects.contains_key(o))
+                    .ok_or_else(|| {
+                        Trap::Invalid(format!(
+                            "a slot of object {container} holds object {}, which is not there",
+                            other.occupant
+                        ))
+                    })?;
+                // Code 11.
+                if datum(world, occupant, word::FLAGS)? as u16 & 0x2000 == 0 {
+                    return Ok(Err(Refusal::Collision(None)));
+                }
+            }
+            // Code 11.
+            if target.centre && !person && unlinked {
+                return Ok(Err(Refusal::Collision(None)));
+            }
+        }
+        // Code 0xe.
+        if datum(world, container, word::CAPACITY)? < datum(world, id, word::WEIGHT)? {
+            return Ok(Err(Refusal::Other));
+        }
+        let mut around = Some(container);
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(holder) = around {
+            // Code 11.
+            if holder == id {
+                return Ok(Err(Refusal::Collision(None)));
+            }
+            if !seen.insert(holder) {
+                return Err(Trap::Invalid(format!(
+                    "the containers around object {container} form a loop"
+                )));
+            }
+            around = super::capture(world, holder)?.container;
+        }
+        // Code 0x18. The shift takes the low five bits, as the original's.
+        let levels = i32::from(datum(world, id, word::LEVELS)?) as u32;
+        let bit = 1u32.wrapping_shl(target.height.wrapping_sub(1) as u32);
+        Ok(if target.height != 0 && levels & bit != 0 {
+            Ok(())
+        } else {
+            Err(Refusal::Other)
+        })
+    }
+
+    /// An object's container slots as scripts count them (object +0x130,
+    /// past its first record, which is the tile's chain): one for each
+    /// SLOT entry of kind 0 of its definition, in order (0x46e2d1), each
+    /// with the entry's offset and height (0x46debb), and the object the
+    /// object's slot one further on holds. A height of 0 becomes 1 for an
+    /// entry at height 0 and 5 for any other (0x46def8). A person's
+    /// slots also count those its post-constructor adds (0x459630), which
+    /// are not ported, so a person as the container fails loudly.
+    fn container_slots(&self, world: &World, container: u16) -> Result<Vec<Held>, Trap> {
+        let object = world.objects.get(&container).ok_or_else(missing)?;
+        if object.person.is_some() {
+            return Err(Trap::Unsupported(format!(
+                "the place test of a place in person {container}, whose slots include those its \
+                 post-constructor adds (0x459630), is not ported"
+            )));
+        }
+        let definition = self
+            .catalog
+            .object(object.guid)
+            .ok_or_else(|| Trap::Invalid("object has no definition".into()))?;
+        let entries: Vec<_> = self
+            .program
+            .slots(definition.resource, definition.chunk)
+            .iter()
+            .filter(|entry| entry.kind == CONTAINER)
+            .collect();
+        if entries.len() + 1 != object.slots.len() {
+            return Err(Trap::Invalid(format!(
+                "object {container} keeps {} slots, but its SLOT has {} containers",
+                object.slots.len(),
+                entries.len()
+            )));
+        }
+        Ok(entries
+            .iter()
+            .zip(&object.slots[1..])
+            .map(|(entry, held)| Held {
+                centre: entry.offset[0] == 0.0 && entry.offset[1] == 0.0,
+                height: match entry.height {
+                    0 if entry.offset[2] == 0.0 => 1,
+                    0 => 5,
+                    height => height,
+                },
+                occupant: held.object,
+            })
+            .collect())
     }
 
     /// Whether the tile's diagonal wall suits an object's wall rules
