@@ -23,8 +23,19 @@
 //!    count (+0x28) become 0 (0x46e042).
 //! 4. Any other duration shows an icon (from 0x44b7ed). The index is
 //!    byte 2, plus my temp 0 (object +0x3a) when option bit 12 is set.
-//!    Kind 7 shows the catalog picture of an object, a neighbor or a local
-//!    (0x44b811), which is not ported and fails. Any other kind names a
+//!    Kind 7 shows a catalog picture (0x44b811), picked by byte 2 as it
+//!    is (without the temp): 0, the stack object's; 2, the object a local
+//!    names, the local being operand word 0 shifted right by one, signed
+//!    (native error 0x33 when it is not below the frame's local count,
+//!    frame byte 6; a local still holding half of an old pointer fails
+//!    loudly); 1, a neighbor's (0x4256f4, record +8), which is not
+//!    ported and fails, since whether the record holds a picture is
+//!    presentation we do not model. An object ID that names nothing on
+//!    the lot (not positive, or a null entry of the lot's table), or any
+//!    other byte 2, ends the call. The picture is the object's
+//!    definition's (+0x11c), loaded into its cache (+0x8c, 0x45728d) when
+//!    first asked for, and the record's frame count becomes 1 (0x46dfe9);
+//!    the backdrop and what follows are as below. Any other kind names a
 //!    sprite ([`icon_sprite`], 0x416a0c and 0x416a6f); with none (0) the
 //!    call ends here. The sprite's frame count, from the headlines'
 //!    sprite cache ([`crate::Program::icon_frames`], 0x4c8deb), divided by
@@ -131,35 +142,18 @@ impl Machine<'_, '_> {
                 .ok_or_else(|| Trap::Invalid("the running object has no temp 0".into()))?;
             index += i32::from(temp);
         }
-        if kind == PICTURE {
-            return Err(Trap::Unsupported(format!(
-                "Set Balloon/Headline showing a catalog picture (kind 7, index {index}) on \
-                 object {target} (0x44b811), which is not ported"
-            )));
-        }
-        let sprite = icon_sprite(kind, index);
-        if sprite == 0 {
-            return Ok(true);
-        }
-        let frames = self
-            .program
-            .icon_frames
-            .as_ref()
-            .ok_or_else(|| {
-                Trap::Unsupported(format!(
-                    "Set Balloon/Headline showing sprite {sprite}, but the headlines' \
-                     sprites ({ICON_FILE}) were not read"
-                ))
-            })?
-            .get(&u16::try_from(sprite).map_err(|_| {
-                Trap::Unsupported(format!(
-                    "Set Balloon/Headline showing sprite {sprite}: looking up a negative \
-                     sprite ID (0x4c8deb) is not ported"
-                ))
-            })?)
-            .copied()
-            .unwrap_or(0)
-            / 3;
+        let frames = if kind == PICTURE {
+            if !self.has_picture(operands, target)? {
+                return Ok(true);
+            }
+            1
+        } else {
+            let sprite = icon_sprite(kind, index);
+            if sprite == 0 {
+                return Ok(true);
+            }
+            self.sprite_frames(sprite)?
+        };
         if frames == 0 {
             return Ok(true);
         }
@@ -177,6 +171,64 @@ impl Machine<'_, '_> {
         }
         self.wake(target)?;
         Ok(true)
+    }
+
+    /// Whether kind 7 finds a catalog picture to show (0x44b811 to
+    /// 0x44b8d8), by byte 2: the stack object's (0), a neighbor's (1, not
+    /// ported) or a local's object's (2).
+    fn has_picture(&self, operands: &[u8; 8], target: u16) -> Result<bool, Trap> {
+        let id = match operands[2] {
+            0 => i32::from(self.frame()?.stack_object),
+            1 => {
+                return Err(Trap::Unsupported(format!(
+                    "Set Balloon/Headline showing a neighbor's picture (kind 7, mode 1) on \
+                     object {target} (0x44b862), which is not ported"
+                )));
+            }
+            2 => {
+                let local = word(operands, 0) >> 1;
+                let count = self.frame()?.locals.len();
+                if usize::try_from(local).is_ok_and(|l| l >= count) {
+                    return Err(Trap::native(0x33, "local out of range"));
+                }
+                let Ok(local) = usize::try_from(local) else {
+                    return Err(Trap::Unsupported(format!(
+                        "Set Balloon/Headline reading local {local} (0x44b84b): a negative \
+                         local reads before the frame's locals"
+                    )));
+                };
+                // The original reads the frame storage's word as it is,
+                // which may be half of an old pointer.
+                self.check_local(local)?;
+                i32::from(self.frame()?.locals[local])
+            }
+            _ => return Ok(false),
+        };
+        Ok(u16::try_from(id).is_ok_and(|id| id != 0 && self.world.objects.contains_key(&id)))
+    }
+
+    /// The frame count of headline sprite `sprite`: its count in the
+    /// headlines' sprite cache (0x4c8deb), divided by three.
+    fn sprite_frames(&self, sprite: i16) -> Result<i32, Trap> {
+        Ok(self
+            .program
+            .icon_frames
+            .as_ref()
+            .ok_or_else(|| {
+                Trap::Unsupported(format!(
+                    "Set Balloon/Headline showing sprite {sprite}, but the headlines' \
+                     sprites ({ICON_FILE}) were not read"
+                ))
+            })?
+            .get(&u16::try_from(sprite).map_err(|_| {
+                Trap::Unsupported(format!(
+                    "Set Balloon/Headline showing sprite {sprite}: looking up a negative \
+                     sprite ID (0x4c8deb) is not ported"
+                ))
+            })?)
+            .copied()
+            .unwrap_or(0)
+            / 3)
     }
 
     /// The tail of an object's tick (0x4521f7) for its first headline
