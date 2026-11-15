@@ -210,22 +210,23 @@ fn every_event_definition_runs_without_a_bad_instruction() {
     // No instruction is decoded wrong and none reached is unported. What
     // remains are the files' loose ends (see `install_tables.rs`), 12
     // events with an empty track field (the original's lookup of track 0
-    // finds nothing, as here) and the 24 events of kinds not ported:
-    // music modes (36, whose ambience half is ported), the piano (43),
-    // pausing (103) and reloading (104). The 5 ambience modes (52) start
-    // and stop scores, none of which this test loads. Of the 181 events
-    // still running after 20 blocks, the 60 that turn on a television or
+    // finds nothing, as here) and the 3 events of kinds not ported: the
+    // piano (43), pausing (103) and reloading (104). The 5 ambience modes
+    // (52) start and stop scores, none of which this test loads. Of the
+    // 186 events still running after 20 blocks, 5 change the music mode
+    // (36) and start music or a river loop, or a slow fade of the music,
+    // that runs on; the 60 that turn on a television or
     // radio play their station for ever; 120 more loop (fires,
     // appliances, voices that loop) and one, `Grimreaper_loop_kill`,
     // fades its own vol for 21 blocks: the loop track it targets is not
     // running, so `target` is itself. (`shoo_tub_inside_vox` waits a
     // random time, which the station scripts' draws make short here.)
     assert_eq!(definitions.len(), 4494);
-    assert_eq!((still_running, format!("{unported:?}")), (181, "{}".into()));
-    assert_eq!(format!("{kinds:?}"), "{36: 21, 43: 1, 103: 1, 104: 1}");
+    assert_eq!((still_running, format!("{unported:?}")), (186, "{}".into()));
+    assert_eq!(format!("{kinds:?}"), "{43: 1, 103: 1, 104: 1}");
     assert_eq!(
         format!("{faults:?}"),
-        "{\"event names no track\": 14, \"event of a kind not ported\": 24, \
+        "{\"event names no track\": 14, \"event of a kind not ported\": 3, \
          \"hit list not found\": 1, \"patch not found\": 3, \"track entry point not found\": 10}"
     );
 }
@@ -336,6 +337,7 @@ fn the_backyard_ambience_plays() {
     let files = SoundFiles::scan(&root).unwrap();
     let mut player = player(&root, 3);
     player.add_scores(&files);
+    player.add_stations(&sims_audio::stations::StationLists::build(&files));
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     // As on entering a lot from the neighbourhood: the music modes are
     // recorded only once the neighbourhood's has been set.
@@ -345,9 +347,7 @@ fn the_backyard_ambience_plays() {
             name: name.into(),
         });
     }
-    // The music halves of the two kind 36 events.
-    assert_eq!(player.faults.len(), 2, "{:?}", player.faults);
-    player.faults.clear();
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
     // Noon, with the camera's value at 50: row 500 per mille.
     player.set_ambience_view(50, 12);
     let ambience = player.ambience().unwrap();
@@ -355,8 +355,11 @@ fn the_backyard_ambience_plays() {
     let out = player.render_stereo(60 * RATE as usize, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     let ambience = player.ambience().unwrap();
+    // The neighbourhood's music starts and live's fades it out within a
+    // second; its scripts draw on the random numbers the ambience's
+    // cells are picked with.
     let loud = out.iter().filter(|s| s.unsigned_abs() > 64).count();
-    assert!(loud > out.len() / 10, "{loud} of {}", out.len());
+    assert!(loud > out.len() / 20, "{loud} of {}", out.len());
     assert_eq!(
         format!(
             "{:?} {} {} {}",
@@ -365,6 +368,6 @@ fn the_backyard_ambience_plays() {
             out.len(),
             digest(&out)
         ),
-        "(13, 6) 2 2646000 f5ef8e68bac7cba7758d2a196de792133b29c4ad97d3dfc01b27e1c66b42abb6"
+        "(13, 6) 3 2646000 43a4d0f5cfcb9688209f7f1760202de8ddbe276b450fbd6b35484c700e24f055"
     );
 }

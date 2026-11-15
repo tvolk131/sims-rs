@@ -1988,9 +1988,17 @@ stop-sounds events.
   original's answers (0x570e61: a person's voice, age, skills,
   personality and motive 3, the hour, the size of the object's room),
   read from the lot between ticks (`sims_game::sound::sources`).
+- **Done: the music modes** (36). A change of mode starts and stops the
+  music tracks as the original's sound manager does (0x575170): the
+  buy, build and neighbourhood lists, the expansions', the credits', the
+  river loops and the slow fade into live mode. `play_trk` hands on the
+  caller's arguments and `source`, and `kill_trk` ends the whole track.
+  3 events of kinds not ported remain: the piano (43), and 103 and 104,
+  which are debug commands.
 - **Next:**
-  - Positions for 3D sound, the piano (43) and the music half of the
-    music modes (36). 103 and 104 are debug commands.
+  - Positions for 3D sound, then the piano (43).
+  - Tracks and fades step once a block (64 frames, about 2.9 ms); the
+    original's sound manager steps them once a millisecond (0x57cf37).
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)
