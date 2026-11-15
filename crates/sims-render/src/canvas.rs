@@ -144,7 +144,20 @@ impl Canvas {
         light: Light,
         depth: impl Fn(i32, i32, u8) -> Option<i32>,
     ) {
-        self.blit(image, at, flip, light, 0, depth);
+        self.blit(image, at, flip, |_, _| light, 0, depth);
+    }
+
+    /// Draws an image whose light changes from pixel to pixel: `light`
+    /// gives it for each image pixel (column, row), as a lamp's pool does
+    /// on a floor. Otherwise as [`Canvas::draw_lit`], unflipped.
+    pub fn draw_shaded(
+        &mut self,
+        image: &Image,
+        at: [i32; 2],
+        light: impl Fn(usize, usize) -> Light,
+        depth: impl Fn(i32, i32, u8) -> Option<i32>,
+    ) {
+        self.blit(image, at, false, light, 0, depth);
     }
 
     /// Draws a wall: as [`Canvas::draw_lit`], but a pixel up to one unit
@@ -157,7 +170,14 @@ impl Canvas {
         light: Light,
         depth: impl Fn(i32, i32) -> i32,
     ) {
-        self.blit(image, at, false, light, 1, |x, y, _| Some(depth(x, y)));
+        self.blit(
+            image,
+            at,
+            false,
+            |_, _| light,
+            1,
+            |x, y, _| Some(depth(x, y)),
+        );
     }
 
     fn blit(
@@ -165,7 +185,7 @@ impl Canvas {
         image: &Image,
         at: [i32; 2],
         flip: bool,
-        light: Light,
+        light: impl Fn(usize, usize) -> Light,
         slack: i32,
         depth: impl Fn(i32, i32, u8) -> Option<i32>,
     ) {
@@ -213,7 +233,7 @@ impl Canvas {
                     continue;
                 }
                 let s = &image.rgba[source * 4..source * 4 + 3];
-                let rgb = light.apply([s[0], s[1], s[2]]);
+                let rgb = light(ix, iy).apply([s[0], s[1], s[2]]);
                 self.write(target, rgb, a, d);
             }
         }
@@ -508,6 +528,23 @@ mod tests {
             |_, _, _| 0,
         );
         assert_eq!(c.color, vec![[1, 2, 3], [1, 2, 3], [0, 0, 0], [0, 0, 0]]);
+    }
+
+    /// Each pixel's light comes from its place in the image, also where
+    /// the image is clipped.
+    #[test]
+    fn shaded_pixels_take_the_light_of_their_place_in_the_image() {
+        let mut c = Canvas::new(2, 1, [0, 0, 0]);
+        let dark = Light::from_byte(0);
+        c.draw_shaded(
+            &image(3, 1, [200, 200, 200, 255], None),
+            [-1, 0],
+            |x, y| if (x, y) == (2, 0) { Light::FULL } else { dark },
+            |_, _, _| Some(0),
+        );
+        assert_eq!(c.color[0], dark.apply([200; 3]));
+        assert_eq!(c.color[1], [200; 3]);
+        assert_ne!(c.color[0], c.color[1]);
     }
 
     #[test]

@@ -1921,8 +1921,14 @@ Progress:
   shows the side facing view (−1, 1) (0x53f6c1, 0x53d93a); ours shows
   the same lot side at every rotation. The one column where the wall
   shows matches neither side until its texel offset is read.
+- Done: the pools of light lit lamps throw on the floor, from the
+  game's `lightMap.dat`, and lit lamps drawn in full light, as the
+  original does. With the world at the screenshots' time, near zoom
+  rose from 85.2% to 86.1% exact and far zoom at rotation 2 from 89.9%
+  to 90.1%. Pools on walls (the file's wall tables) are read in part,
+  not ported.
 - Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
-  grass and a light sprite in the original); window light; the
+  grass and a light sprite in the original); lamp pools on walls; the
   edge-on texel offset and side; a screenshot with a marked edge-on
   diagonal; upper-level depth.
 
