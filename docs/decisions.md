@@ -34,6 +34,129 @@ buffer, as here, or otherwise) is not read; this is ours, and what it
 names should be compared with the original's choice of object at the
 same pixel once the harness can click.
 
+## 2026-11-15: A lit lamp throws a pool of light on the floor around it
+
+The bay's floor was lit in graded pools the renderer did not draw. They
+come from the lamps, not the windows: in the original a lit lamp marks
+the tiles around it, and each floor tile it reaches adds a pool map from
+`GameData/lightMap.dat` to its light. `sims_render::pools` reads the
+maps, `Lot::lamps` keeps each tile's lamps, and the floor draw adds the
+pools. A lit lamp's own sprite is drawn in full light.
+
+**Read from the code.**
+
+- The marks (0x467e05, 0x4b4e8b, 0x4b5037). As the room update counts
+  an object, one that is a light source (data word 40 flag 0x400), gives
+  light (word 51 not 0) and has word 16 set to 1 takes its marks off and
+  marks again: every tile within 4 tiles each way (12 / 3, rounded), on
+  the lot's inner tiles and in the lamp tile's room (for a split tile,
+  either half's), takes the offset from the lamp. A tile keeps two: a
+  third lamp nearer than the first replaces the first (which is lost,
+  not moved down), else one nearer than the second replaces it.
+- The pools (0x4c811f, 0x4c8049, 0x4b6c17, 0x4b61b2). A floor tile whose
+  room light is not 1 (after the 0.5 to 1 clamp) draws with each lamp
+  within 3 tiles each way (the map's reach, 0x4a3805), the view-rotated
+  offset choosing where in the map the tile's image lies (0x4a3813). A
+  pixel's light byte is `fraction * 255 + 0.5`, truncated, plus each
+  lamp's map byte, capped at 255; its top five bits pick the level as
+  usual, so the brightest pool is level 31, never full light.
+- The file (0x4b5700). Four light fields, then the wall tables, then a
+  pool map per zoom. The light radius of 12 gives the field and table
+  sizes (0x49bdf6, 0x49be1f, 0x4bb7c5), and the parts then add up to the
+  file's 2,271,104 bytes exactly. That is how the maps' sizes were
+  found: 7 tiles across and half that high at each zoom.
+- A light source other than a window (type 8) with light (word 51) draws
+  in full light (0x437f7d, 0x4b455f).
+
+**Compared** with the world at the screenshots' time (a snapshot at tick
+570, 6:49): near zoom rose from 85.2% to 86.1% exact (non-green 90.9% to
+92.0%), and far zoom at rotation 2 from 89.9% to 90.1%. Far zoom at
+rotation 1 and medium zoom do not change: no pool shows in them. The
+floors in the bay now match; what differs there is the edge-on wall
+(fixed in #159) and the shrub's shadow.
+
+**Not verified.** The original builds its marks up as it counts rooms,
+in its own order, and only takes a lamp's marks off when it next counts
+it dark; we work them out afresh, lamps in object order. They could
+differ where three or more lamps reach a tile or a lamp went dark; no
+screenshot shows either. Which way the record turns with the view
+(0x4aedc2) is not read: we turn each offset as the camera turns the
+lot, so a pool stays centred on its lamp. Turned the other way, a tile
+off the lamp's axes would show its gradient reversed; rotation 2 cannot
+tell the two apart, and no screenshot at rotation 1 or 3 shows a pool. When
+the file is missing the original computes the maps (0x4bb5bc); we draw
+no pools. Data word 16's meaning is not known.
+
+**Not ported.** Pools on walls (0x4c78c5: the file's wall tables, by
+the lamp's distance from the wall and its offset along it, blitted by
+0x4b7630 and 0x4b780d), on grass, and the full light a draw group's
+sprite gets when a word of its record is 7 (0x437adb).
+
+## 2026-11-15: From house version 63 the floors and walls are read whole from Arry 11, 12, 111 and 112
+
+The lot array loader (0x478599) tests the house's version once per level
+(0x478617): from 63 on, it reads the lot's floor array from Arry chunk
+level base + 11 and its wall array from base + 12 (0x47861d to
+0x478652), and skips the widening of chunks 1 and 2 that older versions
+need. The read (0x431005) replaces the whole array, taking the chunk's
+size and cell size, as for every other array. So a version-63 house's
+floors and walls are 2-byte and 14-byte cells as the lot holds them,
+every cell of them, not just those inside the lot's size. `World::read_arrays`
+now does that (`load::WIDE_SURFACES`). The loader's other version tests
+are all below 53, so this covers every later version too (the expansion
+lots are 69 to 73).
+
+Every shipped house of version 63 or later has these arrays at 64 by 64,
+with 2-byte floor and 14-byte wall cells, and the port requires that: any
+other size or cell size fails here. The original's read takes any size
+(its resize, 0x4312ff to 0x431388, has no 64-by-64 requirement), and what
+follows with another shape is not known. Arrays 1, 2, 101 and 102 left in such a file are not read, as in
+the original.
+
+The floor and wall maps already followed the version (chunk 1 and word IDs
+from 63, `House::load`).
+
+**Verified:** the Goth house (version 62) is byte-identical through tick
+2881, hash included (`eed688a0...`). Booted together with the records
+change, UserData3's house 2 (version 63) gets through the arrays and the
+renumbering and stops at the household selection (it has no family).
+**Unverified:** a version-63 lot's arrays against a capture.
+
+Next for the template houses: UserData2's houses 1 and 9 have floor and
+wall maps with entries, and resolving those to the game's loaded patterns
+is not ported (`World::renumber_surfaces`).
+
+## 2026-11-15: Sound scripts ask about an object as the original answers
+
+`getsrcdatafield` passes the values of both its source registers, the
+object's ID and a field, to the game's callback (0x57f2e8 calls 0x571127).
+We had passed the thread's own object as well and answered 0; the
+`Sources` trait now takes the two values and may refuse. A field of 21 or
+more is refused, as the original refuses it: the destination keeps its
+value and "Illegal source parameter request" is a fault. Any other field
+gets the original's object query (0x570e61), listed in
+`sims_audio::sources`: field 0 is the voice (1000 for person data word 74
+bits 2 or 3, 2 for a child, else the gender word 65), 1 the age, 2, 3,
+5 to 7, 11, 12 and 15 to 20 person data words over 10 (skills and
+personality), 8 to 10 zero, 14 motive 3 over 10, 4 the hour (global
+0: the record at `[0x6e48bc]+0x1c` is the globals block, since its +0x24
+is global 10, the lot), 13 the size in tiles of the object's room, or 100.
+
+The original asks the live simulation; the sound here runs on its own
+thread. So `sims_game::sound::sources` reads every object's answers from
+the world into a `Snapshot` each time the window runs the lot, and sends
+it to the mixer before that run's sound events when it changed. A script
+can hear a later state than the one its sound was asked in (the window
+may run several ticks at once) or an earlier one (the mixer's timing);
+nothing in the sound is known to depend on the difference. It only reads the world, so strict output is unchanged.
+On the Goth house the answers are what the save holds: Cassandra 2,
+Bella 1 and Mortimer 0 for the voice, and their personalities.
+
+**Unverified:** none of the answers has been compared with the running
+game, and the meanings of the fields beyond what the code reads (voice,
+gender) are guesses from the person data words. Reopen when a capture
+of the sound manager's queries can be compared.
+
 ## 2026-11-15: The reload makes a record for each person type without one; UserData2 to 8 load
 
 The houses of UserData2 to UserData8 failed before any tick: "the person

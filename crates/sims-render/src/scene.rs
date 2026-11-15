@@ -9,6 +9,7 @@ use crate::depth::{Anchor, Depth};
 use crate::grass::{self, Grass};
 use crate::light::Light;
 use crate::lot::{self, Lot, WallCell};
+use crate::pools::{self, Pools};
 use sims_sim::{Object, World};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -236,6 +237,24 @@ impl Painter<'_> {
         Light::from_byte(self.lot.light_at(level, fine))
     }
 
+    /// The lamps whose pools reach tile (`x`, `y`) of a level, as view
+    /// offsets from the lamp to the tile: those of the tile's record
+    /// within the pool map's reach each way (0x4c8049).
+    fn lamps(&self, level: usize, [x, y]: [i32; 2]) -> [Option<[i32; 2]>; 2] {
+        let record = usize::try_from(x)
+            .ok()
+            .zip(usize::try_from(y).ok())
+            .and_then(|(x, y)| self.lot.lamps[level].get(Lot::cell(x, y)).copied())
+            .unwrap_or_default();
+        record.0.map(|lamp| {
+            let offset = lamp?.map(i32::from);
+            offset
+                .iter()
+                .all(|n| n.abs() <= pools::REACH)
+                .then(|| self.rotate_direction(offset))
+        })
+    }
+
     /// Rotates a lot corner (0 to 64) into the view.
     fn rotate_corner(&self, [x, y]: [i32; 2]) -> [i32; 2] {
         let m = lot::FULL as i32;
@@ -248,13 +267,8 @@ impl Painter<'_> {
     }
 
     /// Rotates a lot direction into the view.
-    fn rotate_direction(&self, [x, y]: [i32; 2]) -> [i32; 2] {
-        match self.camera.rotation & 3 {
-            1 => [-y, x],
-            2 => [-x, -y],
-            3 => [y, -x],
-            _ => [x, y],
-        }
+    fn rotate_direction(&self, direction: [i32; 2]) -> [i32; 2] {
+        rotate_direction(self.camera.rotation, direction)
     }
 
     /// The screen point of a lot corner on a level, at its terrain height.
@@ -327,11 +341,31 @@ impl Painter<'_> {
                         (true, _, 0) => [4, 12],
                         (true, _, _) => [12, 4],
                     };
-                    let light = self.light(index, [x * 16 + inside[0], y * 16 + inside[1]]);
+                    let byte = self
+                        .lot
+                        .light_at(index, [x * 16 + inside[0], y * 16 + inside[1]]);
+                    let lamps = self.lamps(index, [x, y]);
                     let depth = &self.depth;
-                    self.canvas.draw_lit(&image, at, false, light, |_, y, _| {
-                        Some(depth.floor(view, height, level, at[1], y))
-                    });
+                    let depth = |_, y, _| Some(depth.floor(view, height, level, at[1], y));
+                    match (Light::drawn_byte(byte), self.assets.pools()) {
+                        // A room in full light shows no pools (0x4c83d4).
+                        (Some(base), Some(pools)) if lamps.iter().any(Option::is_some) => {
+                            let tile = self.camera.zoom.tile_width();
+                            let origins = lamps.map(|lamp| lamp.map(|a| Pools::origin(tile, a)));
+                            let light = |ix: usize, iy: usize| {
+                                let pool = |o: [i32; 2]| {
+                                    u32::from(pools.at(zoom, o[0] + ix as i32, o[1] + iy as i32))
+                                };
+                                Light::from_sum(
+                                    base + origins.iter().flatten().map(|&o| pool(o)).sum::<u32>(),
+                                )
+                            };
+                            self.canvas.draw_shaded(&image, at, light, depth);
+                        }
+                        _ => self
+                            .canvas
+                            .draw_lit(&image, at, false, Light::from_byte(byte), depth),
+                    }
                     self.stats.floors += 1;
                 }
             }
@@ -838,11 +872,18 @@ impl Painter<'_> {
             let facing = o.data.get(1).copied().unwrap_or(0);
             let base = ground as f32 / 16.0;
             // An object takes the light of the room at its position (the
-            // original samples the tile light map there, 0x467482).
-            let light = Light::from_byte(
-                self.lot
-                    .light_at((level - 1) as usize, [o.position[0], o.position[1]]),
-            );
+            // original samples the tile light map there, 0x467482). One
+            // that gives light (data word 51), other than a window, shows
+            // in full light (0x437f7d, 0x4b455f).
+            let glows = o.data.get(LIGHT).is_some_and(|&w| w != 0) && definition.kind != WINDOW;
+            let light = if glows {
+                Light::FULL
+            } else {
+                Light::from_byte(
+                    self.lot
+                        .light_at((level - 1) as usize, [o.position[0], o.position[1]]),
+                )
+            };
             // Each pixel the object draws names it, for a click
             // (`Canvas::id_at`).
             self.canvas.set_id(Some(id));
@@ -892,9 +933,26 @@ impl Painter<'_> {
     }
 }
 
+/// Rotates a lot direction into the view at `rotation`, as
+/// [`Camera::rotate_fine`] turns positions.
+fn rotate_direction(rotation: u8, [x, y]: [i32; 2]) -> [i32; 2] {
+    match rotation & 3 {
+        1 => [-y, x],
+        2 => [-x, -y],
+        3 => [y, -x],
+        _ => [x, y],
+    }
+}
+
 /// An object's data word that hides it when not zero (the simulation's
 /// `HIDDEN`).
 const HIDDEN: usize = 34;
+
+/// An object's data word holding the light it gives.
+const LIGHT: usize = 51;
+
+/// The object type of a window (OBJD word 9).
+const WINDOW: i16 = 8;
 
 /// The data words naming the object that holds this one and which of
 /// its slots it is in.
@@ -1242,6 +1300,22 @@ mod tests {
         assert_eq!(wall_side(&descending, 1), [54, 86]);
         assert_eq!(wall_side(&ascending, 0), [58, 86]);
         assert_eq!(wall_side(&ascending, 1), [54, 90]);
+    }
+
+    /// A lamp's offset to a tile turns as the camera turns their
+    /// positions, so its pool stays centred on it in every view, the
+    /// off-axis tiles' gradients too.
+    #[test]
+    fn lamp_offsets_turn_as_the_camera_turns_positions() {
+        for rotation in 0..4 {
+            let camera = camera(rotation);
+            for (lamp, offset) in [([10, 20], [3, 0]), ([10, 20], [-2, 1]), ([40, 5], [1, -3])] {
+                let tile = [lamp[0] + offset[0], lamp[1] + offset[1]];
+                let [a, b] = [tile, lamp].map(|t| camera.rotate_fine(t.map(|n| n * 16)));
+                let turned = rotate_direction(rotation, offset).map(|n| n * 16);
+                assert_eq!([a[0] - b[0], a[1] - b[1]], turned, "{rotation} {offset:?}");
+            }
+        }
     }
 
     #[test]

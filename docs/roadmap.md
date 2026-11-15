@@ -69,9 +69,11 @@ events, and what it asks for after them) come first.
   ported.
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
-  stop at the arrays, and the version-62 ones have no family. The
-  templates' `Patch` families are not imported (see
-  `docs/decisions.md`).
+  read their arrays whole (Arry 11, 12, 111 and 112). UserData2's
+  houses 1 and 9 then stop at their floor and wall maps
+  (`World::renumber_surfaces`), and the houses with no family stop at
+  the household selection. The templates' `Patch` families are not
+  imported (see `docs/decisions.md`).
 
 ## Met goal: a headless lot boot that matches the original
 
@@ -1924,8 +1926,14 @@ Progress:
   Objects name themselves, people their object ID, and terrain, floors
   and walls nobody. The game window can pick by it instead of by tile.
   How the original finds what a click hit is not read.
+- Done: the pools of light lit lamps throw on the floor, from the
+  game's `lightMap.dat`, and lit lamps drawn in full light, as the
+  original does. With the world at the screenshots' time, near zoom
+  rose from 85.2% to 86.1% exact and far zoom at rotation 2 from 89.9%
+  to 90.1%. Pools on walls (the file's wall tables) are read in part,
+  not ported.
 - Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
-  grass and a light sprite in the original); window light; the
+  grass and a light sprite in the original); lamp pools on walls; the
   edge-on texel offset and side; a screenshot with a marked edge-on
   diagonal; upper-level depth.
 
@@ -1971,9 +1979,14 @@ stop-sounds events.
   value the ambience's row follows is ported (`ambience::view`, from
   0x570c3e: the share of the screen's tiles that are outdoors, read
   through `World::outside`), and the hour is the clock's.
+- **Done: what scripts ask about an object.** `getsrcdatafield` gets the
+  original's answers (0x570e61: a person's voice, age, skills,
+  personality and motive 3, the hour, the size of the object's room),
+  read from the lot between ticks (`sims_game::sound::sources`).
 - **Next:**
-  - Positions for 3D sound, pause and unpause (103), reload (104), the
-    piano (43) and the music half of the music modes (36).
+  - Positions for 3D sound, pause and unpause (21 and 22; 103 and 104
+    are debug commands), the piano (43) and the music half of the music
+    modes (36).
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)
