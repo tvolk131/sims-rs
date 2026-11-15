@@ -39,8 +39,11 @@
 //! Modes 3 and 4 search along a line through the object the local names,
 //! following its facing (see `Machine::find_in_line`).
 //!
-//! Mode 2 (in front of the object) and 5 (a search from a random start,
-//! which draws random numbers) fail loudly.
+//! Mode 5 is mode 0 with the search's random start (search record byte
+//! 0x17, set at 0x44b5a5; see `Machine::random_start`): each of the two
+//! searches first moves its start by a random number of tiles.
+//!
+//! Mode 2 (in front of the object) fails loudly.
 
 use crate::factory::word::{GRAPHICS, GROUP};
 use crate::fault::Trap;
@@ -116,21 +119,35 @@ impl Machine<'_, '_> {
         if mode == 3 || mode == 4 {
             return self.find_in_line(target, mode, flags, local, from, level, rules);
         }
-        if (2..=5).contains(&mode) {
+        if mode == 2 {
             return Err(Trap::Unsupported(format!(
                 "Find Location For mode {mode} is not ported"
             )));
         }
+        // Mode 5 differs from mode 0 only in the search record's byte 0x17
+        // (0x44b5a5), so each search draws its own start from the same
+        // `from` (0x434921).
+        let random = mode == 5;
+        let start = if random {
+            self.random_start(from)?
+        } else {
+            from
+        };
         let mut found = interpreter
-            .search(self.world, target, from, level, rules)
+            .search(self.world, target, start, level, rules)
             .map_err(unsupported)?;
         if found.is_none() {
             let anywhere = Rules {
                 same_room: false,
                 ..rules
             };
+            let start = if random {
+                self.random_start(from)?
+            } else {
+                from
+            };
             found = interpreter
-                .search(self.world, target, from, level, anywhere)
+                .search(self.world, target, start, level, anywhere)
                 .map_err(unsupported)?;
         }
         let Some(position) = found else {
@@ -167,6 +184,58 @@ impl Machine<'_, '_> {
             )));
         }
         Ok(true)
+    }
+
+    /// The search's random start (search record byte 0x17, 0x434921 to
+    /// 0x4349e5), the point the spiral then starts from, clamped as ever.
+    /// `from` is the record's start point (+4, +8).
+    ///
+    /// 1. A start of exactly (1, 1) is replaced by two draws from the
+    ///    active random stream (0x46f457), each modulo the lot's size: the
+    ///    first is the second coordinate, the second the first (0x434ab3).
+    ///    They are points, not tiles.
+    /// 2. Otherwise, two draws modulo 10, less 5, are added as tile
+    ///    offsets, each the middle of its tile (`(n << 4) | 8`, 0x434c98):
+    ///    the first to the second coordinate, the second to the first.
+    ///    This repeats, adding to the point already moved, until its tile
+    ///    (each coordinate shifted right 4 and cut to a byte, 0x433067) is
+    ///    inside the lot's bounds less a tile at each side (0x434cb7). The
+    ///    bounds (the world's +0x70 to +0x7c) are the box round the lot's
+    ///    four corner tiles, turned by the world's rotation (0x478fef,
+    ///    0x4791a6, and the resize at 0x478026), so tiles 1 to size - 2,
+    ///    whatever the rotation.
+    /// 3. Either way the point is turned within a square of 1024 (0x47bc1f)
+    ///    by the inverse of the view's rotation (the world's +0x84, negated
+    ///    modulo 4; [`crate::Interpreter::view_rotation`]).
+    ///
+    /// A lot smaller than three tiles has no tile inside its bounds, so
+    /// the original's loop never ends, and a lot of size 0 divides by zero:
+    /// both fail.
+    fn random_start(&mut self, from: [i32; 2]) -> Result<[i32; 2], Trap> {
+        let size = i32::from(self.world.size);
+        if size < 3 {
+            return Err(Trap::Unsupported(format!(
+                "Find Location For mode 5 on a lot {size} tiles wide: no tile is inside its \
+                 bounds, so the random start never ends (0x434951)"
+            )));
+        }
+        let [mut x, mut y] = from;
+        if [x, y] == [1, 1] {
+            y = (self.draw() % size as u32) as i32;
+            x = (self.draw() % size as u32) as i32;
+        } else {
+            let inside = |n: i32| (1..=size - 2).contains(&i32::from((n >> 4) as i8));
+            loop {
+                let first = (self.draw() % 10) as i32 - 5;
+                let second = (self.draw() % 10) as i32 - 5;
+                y = y.wrapping_add((first << 4) | 8);
+                x = x.wrapping_add((second << 4) | 8);
+                if inside(y) && inside(x) {
+                    break;
+                }
+            }
+        }
+        Ok(turn([x, y], self.view_rotation))
     }
 
     /// Modes 3 and 4 (0x44b676 to 0x44b716): a search along a line
@@ -243,5 +312,41 @@ impl Machine<'_, '_> {
             )
             .map_err(unsupported)?;
         Ok(true)
+    }
+}
+
+/// The largest coordinate of the square 0x47bc1f turns points in (its
+/// size, 0x400, less 1).
+const SPAN: i32 = 0x3ff;
+
+/// A point turned within the square of [`SPAN`] by the inverse of the
+/// view's `rotation` (0x47bc1f with (-rotation) & 3).
+fn turn([x, y]: [i32; 2], rotation: u8) -> [i32; 2] {
+    match (4 - i32::from(rotation & 3)) & 3 {
+        1 => [y, SPAN.wrapping_sub(x)],
+        2 => [SPAN.wrapping_sub(x), SPAN.wrapping_sub(y)],
+        3 => [SPAN.wrapping_sub(y), x],
+        _ => [x, y],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_point_is_turned_by_the_inverse_of_the_view() {
+        // 0x47bc1f with its first argument the second coordinate: a
+        // quarter turn (view 3) gives y' = 1023 - x and x' = y.
+        assert_eq!(turn([40, 100], 0), [40, 100]);
+        assert_eq!(turn([40, 100], 3), [100, 983]);
+        assert_eq!(turn([40, 100], 2), [983, 923]);
+        assert_eq!(turn([40, 100], 1), [923, 40]);
+        // Four quarter turns give the point back.
+        let mut p = [40, 100];
+        for _ in 0..4 {
+            p = turn(p, 1);
+        }
+        assert_eq!(p, [40, 100]);
     }
 }
