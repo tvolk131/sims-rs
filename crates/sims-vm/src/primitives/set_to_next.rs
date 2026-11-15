@@ -358,8 +358,9 @@ impl Machine<'_, '_> {
             .collect()
     }
 
-    /// The native person vector ([`sims_sim::World::people`]).
-    fn person_order(&self) -> Result<Vec<(i16, &Object)>, Trap> {
+    /// The native person vector ([`sims_sim::World::people`]), which
+    /// Set To Next and the search for a person in a route's way walk.
+    pub(super) fn person_order(&self) -> Result<Vec<(i16, &Object)>, Trap> {
         if let Some(id) = self.making_person {
             return Err(Trap::Unsupported(format!(
                 "a walk of the person vector while the factory makes person {id}; when in \
