@@ -418,7 +418,7 @@ fn seat_in_row(at: [i32; 2], row: i32, last: i32) -> bool {
 /// direction is taken modulo 8, and a tile is 16 units. Direction 0 is
 /// toward a smaller first coordinate and the directions turn toward a
 /// larger second coordinate.
-fn step(dir: i32) -> [i32; 2] {
+pub(crate) fn step(dir: i32) -> [i32; 2] {
     let [x, y] = match dir & 7 {
         0 => [-1, 0],
         1 => [-1, 1],

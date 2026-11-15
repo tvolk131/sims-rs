@@ -219,23 +219,24 @@ fn every_event_definition_runs_without_a_bad_instruction() {
     // No instruction is decoded wrong and none reached is unported. What
     // remains are the files' loose ends (see `install_tables.rs`), 12
     // events with an empty track field (the original's lookup of track 0
-    // finds nothing, as here) and the 3 events of kinds not ported: the
-    // piano (43), pausing (103) and reloading (104). The 5 ambience modes
-    // (52) start and stop scores, none of which this test loads. Of the
-    // 186 events still running after 20 blocks, 5 change the music mode
-    // (36) and start music or a river loop, or a slow fade of the music,
-    // that runs on; the 60 that turn on a television or
+    // finds nothing, as here) and the 2 events of kinds not ported:
+    // pausing (103) and reloading (104). The 5 ambience modes (52) start
+    // and stop scores, none of which this test loads. Of the 187 events
+    // still running after 20 blocks, 5 change the music mode (36) and
+    // start music or a river loop, or a slow fade of the music, that runs
+    // on; the piano (43) plays notes for ever; the 60 that turn on a
+    // television or
     // radio play their station for ever; 120 more loop (fires,
     // appliances, voices that loop) and one, `Grimreaper_loop_kill`,
     // fades its own vol for 21 blocks: the loop track it targets is not
     // running, so `target` is itself. (`shoo_tub_inside_vox` waits a
     // random time, which the station scripts' draws make short here.)
     assert_eq!(definitions.len(), 4494);
-    assert_eq!((still_running, format!("{unported:?}")), (186, "{}".into()));
-    assert_eq!(format!("{kinds:?}"), "{43: 1, 103: 1, 104: 1}");
+    assert_eq!((still_running, format!("{unported:?}")), (187, "{}".into()));
+    assert_eq!(format!("{kinds:?}"), "{103: 1, 104: 1}");
     assert_eq!(
         format!("{faults:?}"),
-        "{\"event names no track\": 14, \"event of a kind not ported\": 3, \
+        "{\"event names no track\": 14, \"event of a kind not ported\": 2, \
          \"hit list not found\": 1, \"patch not found\": 3, \"track entry point not found\": 10}"
     );
 }
