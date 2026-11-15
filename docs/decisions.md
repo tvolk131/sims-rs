@@ -10,18 +10,21 @@ A click on an object or a person lists its menu with
 `Interpreter::pie_menu` (0x48d392): only the entries whose check passes
 for the selected Sim, in the original's order. Each is named by the
 TTAs strings with the ID of the TTAB the simulation reads, by its menu
-number, with "*" before it when the entry has flag 0x80. `Lot` offers
-no way to run the listing on its own world, so the game lists on a copy
-and drops the copy's changes, although the original's check trees change
-the lot (person word 50 is left as the last check left it), and it lists
-on the click, where the original lists when the pointer reaches the
-object (0x48c834). Choosing an entry still queues it by its menu number
-(`Lot::queue_interaction`), not the offered action itself
-(`Interpreter::pick`). Where the simulation cannot list a menu yet (the
-fridge's check tree adds an entry; an object offers nothing; a version 0
-table), the menu shows every entry of the table without checks, debug
-entries hidden, and the note says why. Reopen when `Lot` lists the menu
-and picks from it on its own world.
+number, with "*" before it when the entry has flag 0x80. The listing
+runs on a copy of the lot's world and the copy's changes are dropped, as
+`docs/vision.md` requires of menu checks (they may draw random numbers,
+and run per player), although the original's check trees change the lot
+(person word 50 is left as the last check left it). Choosing an entry
+still queues it by its menu number (`Lot::queue_interaction`), which
+builds the action again from the lot's world, not the offered action
+itself (`Interpreter::pick`); where an earlier check on the copy made the
+person a visitor, the queued action's attenuation differs from the
+offered one's. Where the simulation has not ported something the listing
+needs (a trap of an unsupported kind, scope or primitive: the fridge's
+check tree adds an entry; an object offers nothing; a version 0 table),
+the menu shows every entry of the table without checks, debug entries
+hidden, and the note says why. Any other failure shows no menu. Reopen
+when `Lot` can queue an offered action.
 
 ## 2026-11-15: The game draws people into the lot with sims-people's depth test
 

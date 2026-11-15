@@ -2116,10 +2116,11 @@ through their public interfaces only; the simulation never depends on it.
   object or a person opens the entries `Interpreter::pie_menu` offers
   the selected Sim (each entry's check run, named by the TTAs strings of
   the table it came from, with "*" before an entry with flag 0x80). The
-  listing runs on a copy of the lot, as `Lot` lends its world only to
-  read, so its changes are dropped. Where the simulation cannot list a
-  menu yet, the menu falls back to every entry of the table (the
-  stopgap of #126) and the note across the top says why. Choosing an
+  listing runs on a copy of the lot and its changes are dropped, as
+  `docs/vision.md` requires of menu checks. Where the simulation has not
+  ported something the listing needs, the menu falls back to every
+  entry of the table (the stopgap of #126) and the note across the top
+  says why; any other failure shows no menu. Choosing an
   entry queues it for the selected Sim with `Lot::queue_interaction`.
   Escape closes the menu. The fridge (fallback) lists Have A Snack and
   the meals; the bookshelf lists Read a Book and the studies.
@@ -2131,12 +2132,12 @@ through their public interfaces only; the simulation never depends on it.
   stops the lot in strict mode. Without an order, strict mode runs to
   tick 1102. Play mode with the order reaches tick 834, where a person
   must drop an object being deleted (0x444306).
-- **Next:** list the menu on hover and queue the offered action with
-  `pick`, once `Lot` can do both on its own world; then a real pie.
+- **Next:** queue the offered action itself with `pick` once `Lot` can;
+  then a real pie.
 - **Needs from other crates:**
-  - `sims-vm`: `Lot::pie_menu(person, object)` and `Lot::pick(person,
-    action)`, so the listing changes the lot as the original's does
-    (and a recording can note it). The listing fails today for the
+  - `sims-vm`: `Lot::pick(person, action)`, to queue the action the
+    menu offered (listed on a copy) rather than one built again from the
+    lot's world, which can differ from it. The listing fails today for the
     fridge (Add/Change Action String in check tree 0x1012, 0x458789),
     for objects offering nothing such as beds and walls (0x48d423), for
     32 objects whose interaction table is version 0, and for object 18

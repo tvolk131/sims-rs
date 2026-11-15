@@ -11,21 +11,31 @@
 //! person's menu is mostly numbers, as where the original reads the rest
 //! is not found yet.
 //!
-//! **Still a stopgap in two ways.** Listing the menu runs the entries'
-//! check trees, which change the lot, and the original lists it when the
-//! pointer reaches an object (0x48c834). `Lot` offers no way to list it
-//! on its own world yet, so the game lists it on a copy when the object
-//! is clicked, and the copy's changes are dropped. Choosing an entry
-//! queues it by its menu number (`Lot::queue_interaction`), which makes
-//! the same action again without its check. And the menu is a plain list
-//! at the pointer, in columns when it is taller than the view, not the
+//! **Listed on a copy.** Listing the menu runs the entries' check trees,
+//! which change the lot and may draw random numbers. The project's rule
+//! (`docs/vision.md`, "Other rules") runs them against a throwaway copy
+//! of the state, never the shared simulation, so the game lists the menu
+//! on a copy of the lot's world when the object is clicked and drops the
+//! copy's changes.
+//!
+//! **Still a stopgap in two ways.** Choosing an entry queues it by its
+//! menu number (`Lot::queue_interaction`), which builds the action again
+//! from the lot's own world without its check: where an earlier check on
+//! the copy changed what an action is built from (whether the person is
+//! a visitor, which sets its attenuation), the queued action differs from
+//! the one offered. `Lot` has no way yet to queue the offered action
+//! itself (`Interpreter::pick`). And the menu is a plain list at the
+//! pointer, in columns when it is taller than the view, not the
 //! original's pie.
 //!
 //! Where the simulation cannot list a menu yet (it fails loudly on what
 //! it has not ported: a check tree adding an entry, as the fridge's does;
-//! an object that offers nothing; a version 0 table; a pet; joining),
-//! the menu falls back to every entry of the table without checks
-//! (`every_entry`), and [`Listing::unchecked`] says why.
+//! an object that offers nothing; a version 0 table; a pet; joining; an
+//! unported scope or primitive), the menu falls back to every entry of
+//! the table without checks (`every_entry`), and [`Listing::unchecked`]
+//! says why. Any other failure (a person who is not one, a check tree
+//! taking its error branch or running out of instructions) is an error:
+//! no menu is shown.
 //!
 //! Which TTAB an object's entries come from, and which tile of a
 //! multi-tile object they go to, the simulation decides in code it keeps
@@ -35,6 +45,7 @@
 
 use sims_formats::behavior::InteractionTable;
 use sims_formats::iff::Iff;
+use sims_formats::saved_objects::Interaction;
 use sims_formats::strings::StringTable;
 use sims_render::Assets;
 use sims_sim::World;
@@ -42,7 +53,7 @@ use sims_ui::font::Font;
 use sims_ui::frame::{Frame, Rect};
 use sims_vm::DEFINITION_WORDS;
 use sims_vm::boot::Lot;
-use sims_vm::{Interpreter, Stream};
+use sims_vm::{Interpreter, Stream, Trap};
 use std::collections::BTreeMap;
 
 /// The language the labels are read in (US English).
@@ -72,28 +83,35 @@ pub struct Listing {
 
 /// What the pie menu offers `person` on `object`: the simulation's
 /// listing (see the module documentation), listed on a copy of the lot's
-/// world so the lot is not changed; or, where the simulation cannot list
-/// it yet, every entry of the table, with the reason.
+/// world so the lot is not changed; or, where the simulation has not
+/// ported something the listing needs, every entry of the table, with
+/// the reason. Any other failure of the listing is an error.
 pub fn entries(lot: &Lot, assets: &Assets, person: u16, object: u16) -> Result<Listing, String> {
-    match offered(lot, assets, person, object) {
-        Ok(entries) => Ok(Listing {
-            entries,
+    let interpreter = Interpreter::new(lot.program(), lot.catalog(), Stream::Global);
+    match interpreter.pie_menu(&mut lot.world().clone(), person, object) {
+        Ok(offered) => Ok(Listing {
+            entries: named(lot, assets, offered)?,
             unchecked: None,
         }),
-        Err(reason) => Ok(Listing {
+        Err(fault) if unported(&fault.trap) => Ok(Listing {
             entries: every_entry(lot, assets, object)?,
-            unchecked: Some(reason),
+            unchecked: Some(fault.to_string()),
         }),
+        Err(fault) => Err(fault.to_string()),
     }
 }
 
-/// What the simulation's pie menu offers `person` on `object`, named.
-fn offered(lot: &Lot, assets: &Assets, person: u16, object: u16) -> Result<Vec<Entry>, String> {
-    let interpreter = Interpreter::new(lot.program(), lot.catalog(), Stream::Global);
-    let mut world = lot.world().clone();
-    let offered = interpreter
-        .pie_menu(&mut world, person, object)
-        .map_err(|fault| fault.to_string())?;
+/// Whether `trap` is something the simulation has not ported, rather
+/// than a failure of the script or a wrong caller.
+fn unported(trap: &Trap) -> bool {
+    matches!(
+        trap,
+        Trap::Unsupported(_) | Trap::UnsupportedScope { .. } | Trap::Unimplemented { .. }
+    )
+}
+
+/// The entries the simulation's pie menu offered, named.
+fn named(lot: &Lot, assets: &Assets, offered: Vec<Interaction>) -> Result<Vec<Entry>, String> {
     let mut labels: BTreeMap<u16, Option<StringTable>> = BTreeMap::new();
     let mut out = Vec::new();
     for action in offered {
@@ -453,6 +471,22 @@ mod tests {
         Entry {
             menu,
             label: format!("entry {menu}"),
+        }
+    }
+
+    #[test]
+    fn only_what_is_not_ported_falls_back_to_every_entry() {
+        assert!(unported(&Trap::Unsupported("a pet's pie menu".into())));
+        assert!(unported(&Trap::UnsupportedScope { scope: 12 }));
+        assert!(unported(&Trap::Unimplemented { opcode: 0x50 }));
+        for trap in [
+            Trap::ErrorBranch,
+            Trap::BudgetExhausted { budget: 1 },
+            Trap::Invalid("object 5 is not a person".into()),
+            Trap::MissingTree { id: 0x1012 },
+            Trap::StackOverflow,
+        ] {
+            assert!(!unported(&trap), "{trap:?}");
         }
     }
 

@@ -224,3 +224,73 @@ fn the_fridge_and_the_bookshelf_offer_their_interactions() {
         "{queue:?}"
     );
 }
+
+#[test]
+fn a_tile_offers_the_menu_of_the_tile_its_orders_go_to() {
+    let Some(install) = install() else {
+        return;
+    };
+    let house = goth_house(&install);
+    let mut lot =
+        sims_vm::boot::Lot::load(&install, &house, &[3], sims_vm::boot::Frames::default())
+            .expect("the Goth house boots");
+    let assets = open_house(&install, &house)
+        .expect("the house opens")
+        .assets;
+    let person = lot.world().selected().expect("a Sim is selected");
+    let mut redirected = Vec::new();
+    for &id in lot.world().objects.keys() {
+        let target = sims_game::menu::target(&lot, id).expect("a target");
+        let listing = sims_game::menu::entries(&lot, &assets, person, id);
+        assert_eq!(
+            listing,
+            sims_game::menu::entries(&lot, &assets, person, target),
+            "object {id} and its target {target}"
+        );
+        if target != id
+            && let Ok(listing) = listing
+            && let Some(entry) = listing.entries.first()
+        {
+            redirected.push((id, target, entry.clone()));
+        }
+    }
+    // The beds' and the guitar's other tiles send their orders on.
+    assert!(redirected.len() >= 8, "{}", redirected.len());
+    // An order on such a tile goes where the menu said it would.
+    let (tile, target, entry) = redirected[0].clone();
+    assert!(matches!(
+        lot.queue_interaction(person, tile, entry.menu),
+        Ok(Some(_))
+    ));
+    let queue = &lot.world().objects[&person].person.as_ref().unwrap().queue;
+    assert!(
+        queue
+            .iter()
+            .any(|a| a.target == target as i16 && a.table_index == entry.menu as i32),
+        "tile {tile}, target {target}: {queue:?}"
+    );
+}
+
+#[test]
+fn a_menu_for_someone_who_is_not_a_person_is_an_error() {
+    let Some(install) = install() else {
+        return;
+    };
+    let house = goth_house(&install);
+    let lot = sims_vm::boot::Lot::load(&install, &house, &[3], sims_vm::boot::Frames::default())
+        .expect("the Goth house boots");
+    let assets = open_house(&install, &house)
+        .expect("the house opens")
+        .assets;
+    let person = lot.world().selected().expect("a Sim is selected");
+    let thing = *lot
+        .world()
+        .objects
+        .iter()
+        .find(|(_, o)| o.person.is_none())
+        .expect("an object that is not a person")
+        .0;
+    // Not something unported: no fallback menu is shown.
+    let listing = sims_game::menu::entries(&lot, &assets, thing, person);
+    assert!(listing.is_err(), "{listing:?}");
+}
