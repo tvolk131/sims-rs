@@ -1616,6 +1616,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sims-game"
+version = "0.1.0"
+dependencies = [
+ "sims-audio",
+ "sims-content",
+ "sims-people",
+ "sims-render",
+ "sims-sim",
+ "sims-ui",
+ "sims-vm",
+ "softbuffer",
+ "winit",
+]
+
+[[package]]
 name = "sims-people"
 version = "0.1.0"
 dependencies = [

@@ -39,6 +39,33 @@ How the original gives a person's mesh its depth is **unverified**; reopen
 when it is read. Until the renderer takes people, an app draws them over
 the lot, and they overlap walls and furniture wrongly.
 
+## 2026-11-15: The game draws people over the lot with a matching 3D camera
+
+`sims-game` draws the people with `sims-people`'s orthographic camera,
+built from the lot camera so that a ground point lands on the pixel the
+lot's 2:1 projection gives it (within the lot camera's rounding, at every
+zoom and rotation; pinned by a test). Heights take the scale a
+horizontal length gets; a person upstairs is raised one storey's
+screen height, and every person by the terrain under them (the tile's
+corners blended by where in the tile they stand). The people are drawn into their own image and laid over
+the lot whole, so walls and furniture in front of a person do not hide
+it yet; occlusion belongs to the render and people tracks. That the
+original draws its people at this scale is **unverified**.
+
+## 2026-11-15: The game paces the lot itself, and runs it strictly
+
+A tick runs every 50 ms at normal speed, the animator clock's step.
+Fast and ultra run three and ten times as often (**unverified**: the
+original's are not measured). At most 20 ticks run for one wake of the
+window; time beyond that is dropped, so a stall never makes the lot
+race. Pause stops stepping the lot; the panel's pause button shows it.
+The speed and pause stay outside the simulation until it takes player
+orders. The lot runs in strict mode with the captured frame schedule
+(`Frames::default()`), so it plays exactly the states the captures
+check; the first failure stops it and is shown on screen. Clicks pick
+objects by their tile until `sims-render` can say which object drew a
+pixel. Reopen when the play-mode step and player orders land.
+
 ## 2026-11-14: No headline state until a headline can show, and K = 877
 
 Set Balloon/Headline is ported only as far as clearing (0x44b724). An
