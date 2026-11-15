@@ -356,6 +356,19 @@ impl std::fmt::Display for OrderError {
 
 impl std::error::Error for OrderError {}
 
+/// Whether the lot is residential, as the idle loop asks (`0x40745f`):
+/// its zoning (`0x42b9e3`, by the lot number in global 10; lot 0 is 1)
+/// is 1.
+fn residential(world: &World, program: &Program) -> bool {
+    let lot = world.globals.get(10).copied().unwrap_or(0);
+    let zoning = if lot == 0 {
+        1
+    } else {
+        program.zoning.get(&lot).copied().unwrap_or(0)
+    };
+    zoning == 1
+}
+
 /// The rotation a house opens at: the camera direction its file saved
 /// (the HOUS chunk), as the render track opens the view
 /// (`sims_render::open_house`). That the original's load turns the scene
@@ -708,6 +721,10 @@ impl Lot {
             first_frame = Some(error.to_string());
         }
         let tick = self.ticks + 1;
+        // The idle loop sets a speed of its own before it runs the update
+        // (0x46d9d6, `World::idle_speed`).
+        let residential = residential(&self.world, &self.program);
+        self.world.idle_speed(residential);
         let update = interpreter
             .lot_update_with(
                 &mut self.world,
@@ -852,6 +869,45 @@ impl Lot {
     /// household) is the caller's to decide.
     pub fn select(&mut self, person: u16) -> Result<Vec<crate::SoundEvent>, OrderError> {
         self.select_with(person, crate::Refresh::Fail)
+    }
+
+    /// Sets the idle loop's own speed between ticks (`0x46d9d6`,
+    /// [`World::idle_speed`]), as the original's idle loop does on each
+    /// pass, whether an update is due or not and paused or not. Each step
+    /// does it too, before its update, so a host that only steps gets the
+    /// same ticks; a host with a clock calls this on each pass of its own,
+    /// so that a speed set between ticks meets the idle loop's as the
+    /// original's does. Returns whether it called the setter, which
+    /// restarts the original's clocks, even when the speed stays the same.
+    pub fn idle_speed(&mut self) -> Result<bool, OrderError> {
+        self.ready()?;
+        let residential = residential(&self.world, &self.program);
+        Ok(self.world.idle_speed(residential))
+    }
+
+    /// Sets the game's speed between ticks, as the panel's speed buttons
+    /// do ([`sims_sim::speed`], `0x46d697`): globals 16 and 18. Returns
+    /// the milliseconds the original waits between two lot updates at
+    /// that speed; when to step is the caller's.
+    pub fn set_speed(&mut self, speed: i32) -> Result<u32, OrderError> {
+        self.ready()?;
+        Ok(self.world.set_speed(speed))
+    }
+
+    /// Pauses the game between ticks (`0x46d813`): global 17 is set, and
+    /// each step from now on is a partial pass in which the clock stands.
+    /// The original goes on updating the lot while paused, so the caller
+    /// should go on stepping it. Returns whether the game was running.
+    pub fn pause(&mut self) -> Result<bool, OrderError> {
+        self.ready()?;
+        Ok(self.world.pause())
+    }
+
+    /// Runs the game again between ticks (`0x46d83a`): global 17 is
+    /// cleared. Returns whether the game was paused.
+    pub fn unpause(&mut self) -> Result<bool, OrderError> {
+        self.ready()?;
+        Ok(self.world.unpause())
     }
 
     /// [`Lot::select`] for play mode: the deselected Sim's animator
@@ -1038,6 +1094,44 @@ mod tests {
             adult_mood: vec![curve(7)],
             child_mood: vec![curve(7)],
         }
+    }
+
+    #[test]
+    fn the_idle_loop_runs_a_residential_lot_nobody_lives_on_at_1000() {
+        let mut world = World::empty();
+        world.globals[16] = 760;
+        world.globals[18] = -1;
+        let mut lot = lot(world, true, Frames::default());
+        lot.tuning = Some(tuning());
+        assert!(super::residential(&lot.world, &lot.program));
+        // The update itself fails on an empty lot, after the idle loop
+        // set its speed.
+        assert!(matches!(lot.step(), Err(StepError::Tick { tick: 1, .. })));
+        assert_eq!(lot.world.speed(), 1000);
+        assert_eq!(lot.world.globals[18], 760);
+        // A lot with no zoning is not residential: the idle loop leaves
+        // its speed alone.
+        lot.world.globals[10] = 7;
+        assert!(!super::residential(&lot.world, &lot.program));
+    }
+
+    #[test]
+    fn the_idle_loops_speed_is_set_between_ticks_and_a_speed_set_after_stands() {
+        let mut world = World::empty();
+        world.globals[16] = 760;
+        world.globals[18] = -1;
+        let mut lot = lot(world, true, Frames::default());
+        // Between ticks, before any is due: 1000, once.
+        assert_eq!(lot.idle_speed(), Ok(true));
+        assert_eq!((lot.world.speed(), lot.world.globals[18]), (1000, 760));
+        assert_eq!(lot.idle_speed(), Ok(false));
+        // The player's speed set after it stands.
+        assert_eq!(lot.set_speed(924), Ok(14));
+        assert_eq!(lot.idle_speed(), Ok(false));
+        assert_eq!((lot.world.speed(), lot.world.globals[18]), (924, 924));
+        // A halted lot takes none.
+        lot.halted = true;
+        assert_eq!(lot.idle_speed(), Err(OrderError::Halted));
     }
 
     #[test]
