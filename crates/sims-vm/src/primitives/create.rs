@@ -9,7 +9,7 @@
 //! Operands: the GUID (bytes 0..4), where the object goes (byte 4), flags
 //! (byte 5) and a local (byte 6). The jump table at 0x44e92e picks where
 //! the object goes; every mode then runs one common tail (0x44e4c5) that
-//! tests the place, makes the object and puts it there. Five modes are
+//! tests the place, makes the object and puts it there. Six modes are
 //! ported:
 //!
 //! - Mode 2 (0x44e22f), with no flag or any of 0x1, 0x4 and 0x10: the new
@@ -27,6 +27,9 @@
 //! - Mode 8 (0x44e430), with no flag or any of 0x1, 0x4, 0x10 and 0x20: the new
 //!   object goes where the object the local names stands. See
 //!   `Machine::create_at_local`.
+//! - Mode 9 (0x44e157), with the same flags: the new object goes on the
+//!   tile in front of me, turned by a local, unless that tile is closed
+//!   off towards me. See `Machine::create_in_front`.
 //!
 //! Flag 0x4 does two things. At the start (0x44e0e6) the type is not the
 //! GUID operand's but that of the neighbor record the stack object names
@@ -86,7 +89,7 @@ use crate::factory::TURN_BUDGET;
 use crate::factory::word::{GROUP, TYPE};
 use crate::fault::Trap;
 use crate::interpreter::Machine;
-use crate::placement::{Place, on_lot, standing_on};
+use crate::placement::{Place, closed_directions, on_lot, standing_on};
 use crate::visits::function;
 use sims_sim::World;
 use sims_sim::rooms::NO_ROOM;
@@ -120,6 +123,9 @@ const PERSON: i16 = 2;
 /// Data word 29: the room an object is in (object +0x84).
 const ROOM: usize = 29;
 
+/// The scope mode 9 reads its turn from (0x44e164): a local.
+const LOCAL_SCOPE: u8 = 0x19;
+
 /// Where mode 6 leaves the new object (0x44e4b5): off the lot, on level 1.
 const OFF_LOT: ([i32; 2], i32) = ([-16, -16], 1);
 
@@ -129,7 +135,7 @@ impl Machine<'_, '_> {
         let (mode, flags) = (operands[4], operands[5]);
         let supported = match mode {
             2 | 4 => flags & !(NOT_BESIDE_ITS_TYPE | FROM_RECORD | TEMP_0_TO_NEW) == 0,
-            5 | 6 | 8 => {
+            5 | 6 | 8 | 9 => {
                 flags & !(NOT_BESIDE_ITS_TYPE | FACE_AS_STACK_OBJECT | FROM_RECORD | TEMP_0_TO_NEW)
                     == 0
             }
@@ -160,9 +166,10 @@ impl Machine<'_, '_> {
             5 => {
                 // 0x44e3e9: where I stand, on my level (+0x110, 0x44e132).
                 let [p0, p1, level] = self.me()?.position;
-                self.create_at(guid, flags, [p0, p1], level)
+                self.create_at(guid, flags, [p0, p1], level, None)
             }
             8 => self.create_at_local(guid, flags, operands[6] as i8),
+            9 => self.create_in_front(guid, flags, operands[6] as i8),
             _ => self.create_off_lot(guid, flags),
         }
     }
@@ -531,7 +538,42 @@ impl Machine<'_, '_> {
             return Ok(false);
         };
         let [p0, p1, level] = reference.position;
-        self.create_at(guid, flags, [p0, p1], level)
+        self.create_at(guid, flags, [p0, p1], level, None)
+    }
+
+    /// Mode 9 of 0x44e0c8 (0x44e157, then the common tail): the tile in
+    /// front of me, turned by a local.
+    ///
+    /// 1. The turn is local `local` (0x453141 with scope 0x19, the byte
+    ///    sign-extended); the direction is my data word 1 (+0x4c) plus the
+    ///    turn, taken mod 8 (a signed remainder masked with 7).
+    /// 2. Directions 0, 2, 4 and 6 move the place one tile (0x422022, 16
+    ///    units) from where I stand, on my level (+0x110): to my position
+    ///    word 1 less 16, word 0 plus 16, word 1 plus 16 and word 0 less
+    ///    16. An odd direction does not move it.
+    /// 3. The facing the tail tests (`[ebp-0x1c]`) is my facing plus the
+    ///    turn plus 4, as a signed remainder of 8, so it may be negative:
+    ///    the way back towards me. The new object does not take it.
+    /// 4. The tail is mode 5's ([`Machine::create_at`]), with one more
+    ///    test after the place is found on the lot (0x44e5ae): if the
+    ///    tile is closed off in that facing (bit 0 of
+    ///    [`crate::placement::closed_directions`], 0x4359ea), nothing is
+    ///    made and the false branch is taken.
+    fn create_in_front(&mut self, guid: u32, flags: u8, local: i8) -> Result<bool, Trap> {
+        let turn = i32::from(self.read(LOCAL_SCOPE, i16::from(local))?);
+        let me = self.me()?;
+        let [p0, p1, level] = me.position;
+        let direction = i32::from(me.data[1]) + turn;
+        let (step0, step1) = match (direction % 8) & 7 {
+            0 => (0, -1),
+            2 => (1, 0),
+            4 => (0, 1),
+            6 => (-1, 0),
+            _ => (0, 0),
+        };
+        let position = [p0.wrapping_add(step0 * 16), p1.wrapping_add(step1 * 16)];
+        let facing = (direction + 4) % 8;
+        self.create_at(guid, flags, position, level, Some(facing))
     }
 
     /// Modes 5 and 8 of 0x44e0c8 from the position and level the mode
@@ -542,12 +584,23 @@ impl Machine<'_, '_> {
         flags: u8,
         position: [i32; 2],
         level: i32,
+        facing: Option<i32>,
     ) -> Result<bool, Trap> {
         if flags & NOT_BESIDE_ITS_TYPE != 0 && self.same_type_on_tile(guid, position, level)? {
             return Ok(false);
         }
         if self.off_lot(position) {
             return Ok(false);
+        }
+        if let Some(facing) = facing {
+            let tile = [
+                (position[0] >> 4) as i8,
+                (position[1] >> 4) as i8,
+                level as i8,
+            ];
+            if closed_directions(self.world, tile, facing)? & 1 != 0 {
+                return Ok(false);
+            }
         }
         let words = self.definition_words(guid)?;
         let person = words[TYPE] == PERSON;
