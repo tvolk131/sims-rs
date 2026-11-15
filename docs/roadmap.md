@@ -2082,8 +2082,9 @@ through their public interfaces only; the simulation never depends on it.
   selected Sim's menu on it with `Lot::pie_menu`, which changes the lot
   as the original's listing does; a click opens it. The entries are
   those whose check passes, named as the check tree named them or else
-  by the TTAs strings of the table they came from, with "*" before an entry with flag 0x80; choosing one
-  queues the offered action with `Lot::pick`. Where the simulation has
+  by the TTAs strings of the table they came from, with "*" before such
+  an entry with flag 0x80; choosing one queues the offered action with
+  `Lot::pick`. Where the simulation has
   not ported something the listing needs, the menu falls back to every
   entry of the table, queued by menu number, and the note across the
   top says why; any other failure shows no menu. Escape closes the menu.
