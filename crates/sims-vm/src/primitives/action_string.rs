@@ -29,8 +29,9 @@ impl Machine<'_, '_> {
     pub(crate) fn action_string(&mut self) -> Result<bool, Trap> {
         if self.advertisements.is_none() {
             return Err(Trap::Unsupported(
-                "Add/Change Action String outside a check tree, which names the running \
-                 interaction (0x41f1ae)"
+                "Add/Change Action String outside autonomy's check trees, where it names the \
+                 running interaction (0x41f1ae) or adds an entry to the menu being built \
+                 (0x458789)"
                     .into(),
             ));
         }
