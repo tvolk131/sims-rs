@@ -23,9 +23,17 @@
 //! if no tile is found or the second test fails nothing moves and the
 //! false branch is taken.
 //!
-//! Mode 1 (take the object off the lot), 2 (in front of the object), 3
-//! and 4 (searches in one line) and 5 (a search from a random start,
-//! which draws random numbers) fail loudly.
+//! Mode 1 takes the object off the lot (0x44b519 to 0x44b565): its virtual
+//! function 0x50 runs, asked to tell the registry (as Remove Object
+//! Instance's queue does, [`crate::Interpreter::take_off`]), and the true
+//! branch is taken. The original first tests a tile of a group (definition
+//! +0x14 set) with 0x42344e and may then call 0x42346a on it. That is not
+//! decoded, so a tile of a group fails loudly, as it does for Remove
+//! Object Instance.
+//!
+//! Mode 2 (in front of the object), 3 and 4 (searches in one line) and 5
+//! (a search from a random start, which draws random numbers) fail
+//! loudly.
 
 use crate::factory::word::GRAPHICS;
 use crate::fault::Trap;
@@ -64,7 +72,21 @@ impl Machine<'_, '_> {
             from = [p[0], p[1]];
             level = p[2];
         }
-        if (1..=5).contains(&mode) {
+        if mode == 1 {
+            if self.world.objects[&target].multipart.is_some() {
+                return Err(Trap::Unsupported(
+                    "Find Location For mode 1 on a tile of a group, which the original tests \
+                     first (0x44b52a, 0x42344e)"
+                        .into(),
+                ));
+            }
+            let me = self.me;
+            self.interpreter()
+                .take_off(self.world, target, true)
+                .map_err(|fault| fault.nested(me))?;
+            return Ok(true);
+        }
+        if (2..=5).contains(&mode) {
             return Err(Trap::Unsupported(format!(
                 "Find Location For mode {mode} is not ported"
             )));

@@ -11,6 +11,7 @@ use crate::factory::{WIDGET, widgets};
 use crate::person_factory::equip;
 use crate::rooms::{array, build};
 use crate::support::*;
+use sims_formats::saved_objects::Multipart;
 use sims_vm::Trap;
 
 /// The opcodes under test.
@@ -149,10 +150,38 @@ fn find_location_needs_its_objects() {
 }
 
 #[test]
+fn mode_1_takes_the_object_off_the_lot() {
+    let (mut fx, _) = placeable();
+    let id = widget(&mut fx);
+    assert_eq!(find(&mut fx, 0, id, 0), Ok(true));
+    assert_eq!(fx.world.objects[&id].position, [24, 24, 1]);
+    // Its virtual function 0x50 (0x44b55f): off the lot, and the true
+    // branch.
+    let mode_1 =
+        |fx: &mut Fixture, target: i16| run(fx, 0, target, FIND_LOCATION, [1, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(mode_1(&mut fx, id as i16), Ok(true));
+    assert_eq!(fx.world.objects[&id].position, [-16, -16, 1]);
+    // The tile is free again.
+    let other = widget(&mut fx);
+    assert_eq!(find(&mut fx, 0, other, 0), Ok(true));
+    assert_eq!(fx.world.objects[&other].position, [24, 24, 1]);
+    // A tile of a group, which the original tests first (0x42344e), fails
+    // loudly.
+    fx.world.objects.get_mut(&other).unwrap().multipart = Some(Multipart {
+        offset: [0; 3],
+        group: [0; 3],
+        parent: 0,
+    });
+    let result = mode_1(&mut fx, other as i16);
+    assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("0x44b52a")));
+    assert_eq!(fx.world.objects[&other].position, [24, 24, 1]);
+}
+
+#[test]
 fn other_find_location_modes_fail_loudly() {
     let (mut fx, _) = placeable();
     let id = widget(&mut fx);
-    for mode in 1..=5 {
+    for mode in 2..=5 {
         let result = run(
             &mut fx,
             0,
@@ -294,11 +323,19 @@ fn a_person_is_kept_off_a_tile_by_a_solid_object_without_flag_0x10() {
         .unwrap();
     // The first person stands on the tile, solid (data word 8 flag 4
     // clear) and without flag 0x10: it is in the second's way. The place
-    // test refuses, and removing the new person is not ported.
+    // test refuses, the new person is removed at once (0x44123f) and the
+    // false branch is taken.
     assert_eq!(fx.world.objects[&first].data[8] & 0x14, 0);
     let placed = fx.world.clone();
-    let result = create(&mut fx, 0, 0, SIM as i16);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("removing object")));
+    let refused = |fx: &mut Fixture| {
+        assert_eq!(create(fx, 0, 0, SIM as i16), Ok(false));
+        let ids: Vec<u16> = fx.world.objects.keys().copied().collect();
+        assert_eq!(ids, placed.objects.keys().copied().collect::<Vec<_>>());
+        assert_eq!(fx.world.people, placed.people);
+        assert_eq!(fx.world.order, placed.order);
+        assert!(fx.world.animators.keys().all(|id| ids.contains(id)));
+    };
+    refused(&mut fx);
     // With flag 0x10 it is not in the way.
     fx.world = placed.clone();
     fx.world.objects.get_mut(&first).unwrap().data[8] |= 0x10;
@@ -307,10 +344,9 @@ fn a_person_is_kept_off_a_tile_by_a_solid_object_without_flag_0x10() {
     fx.world = placed.clone();
     fx.world.objects.get_mut(&first).unwrap().data[8] = 4;
     assert_eq!(create(&mut fx, 0, 0, SIM as i16), Ok(true));
-    fx.world = placed;
+    fx.world = placed.clone();
     fx.world.objects.get_mut(&first).unwrap().data[8] = 4 | 2;
-    let result = create(&mut fx, 0, 0, SIM as i16);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("removing object")));
+    refused(&mut fx);
 }
 
 #[test]
@@ -341,4 +377,28 @@ fn what_placing_a_new_person_does_not_port_fails_loudly() {
             "word {word}"
         );
     }
+}
+
+#[test]
+fn mode_1_on_a_person_fails_loudly() {
+    // Taking a person off the lot other than to remove it refreshes its
+    // animator if it was on screen (0x58da12), which is not kept.
+    let mut fx = person_widget();
+    let before: Vec<u16> = fx.world.objects.keys().copied().collect();
+    assert_eq!(create(&mut fx, 0, 0, SIM as i16), Ok(true));
+    let id = *fx
+        .world
+        .objects
+        .keys()
+        .find(|id| !before.contains(id))
+        .unwrap();
+    let result = run(
+        &mut fx,
+        0,
+        id as i16,
+        FIND_LOCATION,
+        [1, 0, 0, 0, 0, 0, 0, 0],
+    );
+    assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("0x58da12")));
+    assert_eq!(fx.world.objects[&id].position, [40, 40, 1]);
 }

@@ -161,18 +161,96 @@ fn what_is_missing_is_a_native_error() {
 
 #[test]
 fn what_the_queue_does_not_port_fails_loudly() {
-    // An entry that runs at once.
+    // An entry that runs at once, queued by an object other than the
+    // person.
     let mut fx = lot([4, 0, 1, 0, 0, 0, 0, 0]);
     assert!(matches!(
         trap(push(&mut fx, &[LAMP as i16])),
-        sims_vm::Trap::Unsupported(m) if m.contains("0x45d240")
+        sims_vm::Trap::Unsupported(m) if m.contains("0x45d240") && m.contains("another person")
     ));
-    // The queue's front.
-    let mut fx = lot([3, 0, 1, 4, 0, 0, 0, 0]);
-    assert!(matches!(
-        trap(push(&mut fx, &[LAMP as i16])),
-        sims_vm::Trap::Unsupported(m) if m.contains("0x45d322")
-    ));
+}
+
+/// The numbers and flags of the Sim's queued actions.
+fn queued(fx: &Fixture) -> Vec<(i32, u32)> {
+    let queue = &fx.sim().person.as_ref().unwrap().queue;
+    queue.iter().map(|a| (a.uid, a.flags)).collect()
+}
+
+#[test]
+fn an_action_pushed_to_the_front_goes_before_the_queue() {
+    // Two actions of priority 100, then one of priority 50 with operand
+    // flag bit 2: it goes first, whatever its priority (0x45d322), and
+    // takes the next number.
+    let mut fx = lot([3, 0, 1, 0, 0, 0, 0, 0]);
+    for _ in 0..2 {
+        assert_eq!(push(&mut fx, &[LAMP as i16]), Ok(true));
+    }
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(
+            13,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [3, 0, 3, 4, 0, 0, 0, 0],
+        )]),
+    );
+    assert_eq!(push(&mut fx, &[LAMP as i16]), Ok(true));
+    assert_eq!(queued(&fx), [(3, 3), (1, 1), (2, 1)]);
+    let queue = &fx.sim().person.as_ref().unwrap().queue;
+    assert_eq!(
+        queue.iter().map(|a| a.priority).collect::<Vec<_>>(),
+        [50, 100, 100]
+    );
+    assert_eq!(fx.world.action_serial, 3);
+}
+
+#[test]
+fn a_full_queue_keeps_the_action_pushed_to_the_front_and_six_more() {
+    // Eight queued, numbers 1 to 8. The front's own queue takes the new
+    // action and the first seven, and gives back only seven: the last two
+    // queued are dropped (0x45d391 to 0x45d3e4).
+    let mut fx = lot([3, 0, 1, 0, 0, 0, 0, 0]);
+    for _ in 0..8 {
+        assert_eq!(push(&mut fx, &[LAMP as i16]), Ok(true));
+    }
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(
+            13,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [3, 0, 1, 4, 0, 0, 0, 0],
+        )]),
+    );
+    assert_eq!(push(&mut fx, &[LAMP as i16]), Ok(true));
+    let uids: Vec<i32> = queued(&fx).iter().map(|q| q.0).collect();
+    assert_eq!(uids, [9, 1, 2, 3, 4, 5, 6]);
+    // Seven queued is not full: the next goes before all seven.
+    assert_eq!(push(&mut fx, &[LAMP as i16]), Ok(true));
+    let uids: Vec<i32> = queued(&fx).iter().map(|q| q.0).collect();
+    assert_eq!(uids, [10, 9, 1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn flag_0x40_at_the_front_clears_the_running_actions_flag_0x80() {
+    // Operand flag bit 3 sets the action's flag 0x40, which at the front
+    // clears flag 0x80 of the running action (0x41f167); without it the
+    // running action is left alone. Taking the running action's name
+    // sets the pushed action's own flag 0x80 (0x41f1ae).
+    // The pushed action's flags: bit 0 from the entry, 2, 0x40 and 0x80.
+    for (operand, expected, pushed) in [(4, 0x84, 0x03), (4 | 8, 0x04, 0xc3)] {
+        let mut fx = lot([3, 0, 1, operand, 0, 0, 0, 0]);
+        fx.sim_mut().person.as_mut().unwrap().active.flags = 0x84;
+        assert_eq!(push(&mut fx, &[LAMP as i16]), Ok(true));
+        assert_eq!(
+            fx.sim().person.as_ref().unwrap().active.flags,
+            expected,
+            "operand flags {operand:#x}"
+        );
+        assert_eq!(queued(&fx), [(1, pushed)]);
+    }
 }
 
 /// A player's order queues the action the pie menu makes: priority 50,
@@ -217,11 +295,6 @@ fn an_order_for_no_entry_or_no_person_is_refused() {
             })
         ));
     }
-    // An entry that runs at once is not ported.
-    assert!(matches!(
-        interpreter.order(&mut fx.world, SIM, LAMP, 4),
-        Err(sims_vm::Fault { trap: sims_vm::Trap::Unsupported(m), .. }) if m.contains("0x45d240")
-    ));
     assert_eq!(fx.world.action_serial, 0);
 }
 
@@ -575,8 +648,10 @@ fn the_pie_menu_lists_each_entry_whose_check_passes_in_order() {
     let listed = interpreter
         .pie_menu(&mut fx.world, SIM, LAMP)
         .unwrap_or_else(|f| panic!("{f}"));
+    assert!(listed.iter().all(|e| e.name.is_none()));
     let shown: Vec<_> = listed
         .iter()
+        .map(|e| &e.action)
         .map(|a| (a.table_index, a.flags, a.action, a.uid, a.priority))
         .collect();
     assert_eq!(
@@ -600,14 +675,14 @@ fn a_picked_action_is_queued_as_listed() {
     let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     let listed = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap();
     assert_eq!(
-        interpreter.pick(&mut fx.world, SIM, listed[0].clone()),
+        interpreter.pick(&mut fx.world, SIM, listed[0].action.clone()),
         Ok(Some(1))
     );
     let queue = &fx.sim().person.as_ref().unwrap().queue;
     let [queued] = queue.as_slice() else {
         panic!("{queue:?}");
     };
-    let mut expected = listed[0].clone();
+    let mut expected = listed[0].action.clone();
     expected.uid = 1;
     assert_eq!(format!("{queued:?}"), format!("{expected:?}"));
     // The same as an order for the entry.
@@ -620,14 +695,13 @@ fn a_picked_action_is_queued_as_listed() {
         format!("{:?}", ordered.sim().person.as_ref().unwrap().queue),
         format!("{queue:?}")
     );
-    // An entry that runs at once is not ported.
-    let fault = interpreter
-        .pick(&mut fx.world, SIM, listed[1].clone())
-        .unwrap_err();
-    assert!(
-        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x45d240")),
-        "{fault}"
+    // An entry that runs at once is run, not queued: it takes the next
+    // number.
+    assert_eq!(
+        interpreter.pick(&mut fx.world, SIM, listed[1].action.clone()),
+        Ok(Some(2))
     );
+    assert_eq!(fx.sim().person.as_ref().unwrap().queue.len(), 1);
 }
 
 #[test]
@@ -666,9 +740,9 @@ fn a_picked_action_whose_entry_is_gone_is_not_queued() {
     let listed = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap();
     // Its menu number is no longer in the table, or its target has no
     // table: nothing is queued and no number is used (0x45d22a).
-    let mut renumbered = listed[0].clone();
+    let mut renumbered = listed[0].action.clone();
     renumbered.table_index = 9;
-    let mut on_sim = listed[0].clone();
+    let mut on_sim = listed[0].action.clone();
     on_sim.target = SIM as i16;
     for action in [renumbered, on_sim] {
         assert_eq!(interpreter.pick(&mut fx.world, SIM, action), Ok(None));
@@ -717,30 +791,120 @@ fn each_listed_action_reads_whether_i_am_a_visitor_after_the_checks_before_it() 
     let listed = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap();
     let made: Vec<_> = listed
         .iter()
-        .map(|a| (a.table_index, a.attenuation))
+        .map(|e| (e.action.table_index, e.action.attenuation))
         .collect();
     assert_eq!(made, [(3, 0.25), (4, 0.75)]);
 }
 
+/// Add/Change Action String's operands: string `index` (from 1) of the
+/// string table 300.
+fn action_string(index: u8) -> [u8; 8] {
+    let mut operands = [0; 8];
+    operands[..2].copy_from_slice(&300u16.to_le_bytes());
+    operands[4] = index;
+    operands
+}
+
+/// A menu lot whose lamp's file has string table 300 with `strings`.
+fn named_menu_lot(entries: Vec<Interaction>, strings: &[&str]) -> Fixture {
+    let mut fx = menu_lot(entries);
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .strings
+        .insert(300, strings.iter().map(|s| s.to_string()).collect());
+    fx
+}
+
 #[test]
-fn an_action_string_while_the_menu_is_listed_fails_loudly_and_temps_come_back() {
-    // Menu 3's check writes temp 0, then menu 4's runs Add/Change Action
-    // String, which would add an entry to the menu (0x458789).
-    let mut fx = menu_lot(vec![with_test(3, 0, 4300), with_test(4, 0, 4302)]);
-    temp_writing_check(&mut fx);
+fn a_check_tree_adds_named_entries_in_place_of_its_action() {
+    // Menu 3's check names two entries and passes; menu 4's names one and
+    // refuses; menu 5 has no check tree. Menu 3's check writes temp 0.
+    let mut fx = named_menu_lot(
+        vec![
+            with_test(3, 0x100, 4302),
+            with_test(4, 0, 4303),
+            entry(5, 0),
+        ],
+        &["Have Snack", "Serve Dinner", "Grab Juice"],
+    );
     fx.add(
         LAMP_FILE,
         4302,
-        tree(vec![ins(50, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
+        tree(vec![
+            assign(scope::TEMPS, 0, scope::LITERAL, 99, 1),
+            ins(50, 2, RETURN_FALSE, action_string(1)),
+            ins(50, RETURN_TRUE, RETURN_FALSE, action_string(2)),
+        ]),
+    );
+    fx.add(
+        LAMP_FILE,
+        4303,
+        tree(vec![
+            ins(50, 1, RETURN_FALSE, action_string(3)),
+            ins(0, RETURN_FALSE, RETURN_FALSE, [0; 8]),
+        ]),
     );
     fx.sim_mut().temps[0] = 11;
     let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    let fault = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap_err();
-    assert!(
-        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x458789")),
-        "{fault}"
+    let listed = interpreter
+        .pie_menu(&mut fx.world, SIM, LAMP)
+        .unwrap_or_else(|f| panic!("{f}"));
+    let shown: Vec<_> = listed
+        .iter()
+        .map(|e| {
+            let a = &e.action;
+            (e.name.as_deref(), a.table_index, a.flags, a.args, a.target)
+        })
+        .collect();
+    // Each named entry is a copy of the action being checked, with flags
+    // 4 and 8, the stack object (the lamp) as its first argument; the
+    // action itself is left out whether or not its check passed.
+    let lamp = LAMP as i16;
+    assert_eq!(
+        shown,
+        [
+            (Some("Have Snack"), 3, 0xd, [lamp, 0, 0, 0], lamp),
+            (Some("Serve Dinner"), 3, 0xd, [lamp, 0, 0, 0], lamp),
+            (Some("Grab Juice"), 4, 0xc, [lamp, 0, 0, 0], lamp),
+            (None, 5, 0xc, [0; 4], lamp),
+        ]
     );
+    assert!(listed.iter().all(|e| e.action.priority == 50));
     assert_eq!(fx.sim().temps[0], 11);
+    // Picking a named entry queues its action, arguments and all.
+    assert_eq!(
+        interpreter.pick(&mut fx.world, SIM, listed[1].action.clone()),
+        Ok(Some(1))
+    );
+    let queued = &fx.sim().person.as_ref().unwrap().queue[0];
+    assert_eq!((queued.table_index, queued.args), (3, [lamp, 0, 0, 0]));
+}
+
+#[test]
+fn an_entrys_string_with_a_token_or_missing_fails_loudly() {
+    // Index 2 has a token the formatter would replace; 0 and 3 are not in
+    // the table.
+    for (index, address) in [(2, "0x44bf1a"), (0, "0x4704fa"), (3, "0x4704fa")] {
+        let mut fx = named_menu_lot(vec![with_test(4, 0, 4302)], &["Eat", "Eat $Object"]);
+        fx.add(
+            LAMP_FILE,
+            4302,
+            tree(vec![ins(
+                50,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                action_string(index),
+            )]),
+        );
+        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        let fault = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap_err();
+        assert!(
+            matches!(&fault.trap, Trap::Unsupported(m) if m.contains(address)),
+            "{index}: {fault}"
+        );
+    }
 }
 
 /// A menu lot whose lamp heads tile (2, 2) of level 1, with a second
@@ -817,7 +981,10 @@ fn a_menu_that_offers_nothing_lists_the_other_objects_on_the_tile() {
         .unwrap_or_else(|f| panic!("{f}"));
     // The lamp offers nothing; object 3's menu 5 passes, because the
     // lamp's own temps are not yet put back when object 3 is listed.
-    let shown: Vec<_> = listed.iter().map(|a| (a.target, a.table_index)).collect();
+    let shown: Vec<_> = listed
+        .iter()
+        .map(|e| (e.action.target, e.action.table_index))
+        .collect();
     assert_eq!(shown, [(3, 5)]);
     // All the temps are put back in the end.
     assert_eq!(fx.sim().temps[0], 11);
@@ -870,4 +1037,224 @@ fn each_listing_on_the_tile_checks_again_for_a_pet() {
         matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x4585b1")),
         "{fault}"
     );
+}
+
+/// The lamp's action tree records, in the lamp's object data words 20 to 23, my person
+/// data word 33 (my priority) and its parameters 4 to 6 (the priority's
+/// two halves and the tree), and writes my temp 0.
+fn recording_action(fx: &mut Fixture) {
+    const MY_PERSON_DATA: u8 = 18;
+    fx.add(
+        LAMP_FILE,
+        ACTION,
+        // Seven parameters, as the original passes.
+        shaped(
+            0x8002,
+            0,
+            7,
+            4,
+            vec![
+                assign(scope::STACK_DATA, 20, MY_PERSON_DATA, 33, 1),
+                assign(scope::STACK_DATA, 21, scope::PARAMETERS, 4, 2),
+                assign(scope::STACK_DATA, 22, scope::PARAMETERS, 5, 3),
+                assign(scope::STACK_DATA, 23, scope::PARAMETERS, 6, 4),
+                assign(scope::TEMPS, 0, scope::LITERAL, 99, RETURN_TRUE),
+            ],
+        ),
+    );
+}
+
+/// An order for an entry that runs at once (0x45d240) runs its action
+/// tree there and then, with my priority set to the action's for the run;
+/// nothing is queued, and the action takes the next number afterwards.
+#[test]
+fn an_action_that_runs_at_once_runs_its_tree_with_its_priority() {
+    let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    recording_action(&mut fx);
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 4), Ok(Some(1)));
+    assert_eq!(fx.world.action_serial, 1);
+    let lamp = &fx.world.objects[&LAMP];
+    assert_eq!(&lamp.data[20..24], &[50, 50, 0, ACTION as i16]);
+    let person = fx.sim().person.as_ref().unwrap();
+    assert!(person.queue.is_empty());
+    // My priority is back, and with no check tree run my temps are not
+    // restored.
+    assert_eq!(person.data[33], 7);
+    assert_eq!(fx.sim().temps[0], 99);
+}
+
+/// A check tree that ran saves my temps, and they are restored after the
+/// action ran (0x4582dd); a check that fails runs nothing and uses no
+/// number.
+#[test]
+fn an_action_run_at_once_restores_my_temps_after_its_check() {
+    let mut fx = menu_lot(vec![with_test(4, 4, 4300)]);
+    recording_action(&mut fx);
+    fx.add(
+        LAMP_FILE,
+        4300,
+        tree(vec![ins(0, RETURN_TRUE, RETURN_TRUE, [0; 8])]),
+    );
+    fx.sim_mut().temps[0] = 11;
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 4), Ok(Some(1)));
+    assert_eq!(fx.world.objects[&LAMP].data[23], ACTION as i16);
+    assert_eq!(fx.sim().temps[0], 11);
+
+    let mut fx = menu_lot(vec![with_test(4, 4, 4300)]);
+    recording_action(&mut fx);
+    fx.add(
+        LAMP_FILE,
+        4300,
+        tree(vec![ins(0, RETURN_FALSE, RETURN_FALSE, [0; 8])]),
+    );
+    let before = fx.world.objects[&LAMP].data.clone();
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 4), Ok(None));
+    assert_eq!(fx.world.objects[&LAMP].data, before);
+    assert_eq!(fx.world.action_serial, 0);
+}
+
+/// While an action runs at once, another one for the same person runs
+/// nothing (the pointer at 0x6e5294 is taken).
+#[test]
+fn an_action_run_at_once_does_not_nest() {
+    // Menu 4's tree pushes menu 4 again on me (the stack object, made
+    // me), then records in my temp 1 that it went on.
+    let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    fx.add(
+        LAMP_FILE,
+        ACTION,
+        tree(vec![
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, SIM as i16, 1),
+            assign(scope::LOCALS, 0, scope::LITERAL, LAMP as i16, 2),
+            ins(13, 3, 3, [4, 0, 1, 2, 0, 0, 0, 0]),
+            assign(scope::TEMPS, 1, scope::LITERAL, 1, RETURN_TRUE),
+        ]),
+    );
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 4), Ok(Some(1)));
+    assert_eq!(fx.sim().temps[1], 1);
+    assert_eq!(fx.world.action_serial, 1);
+    assert!(fx.sim().person.as_ref().unwrap().queue.is_empty());
+}
+
+/// An action queued on the person whose action runs at once, while it
+/// runs, is copied over the running action and queued as well (0x45d5a5):
+/// the run returns the queued action's number and takes none of its own.
+#[test]
+fn an_action_queued_while_one_runs_at_once_takes_its_place() {
+    // Menu 4's tree queues menu 3 on me, at priority 100.
+    let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    fx.add(
+        LAMP_FILE,
+        ACTION,
+        tree(vec![
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, SIM as i16, 1),
+            assign(scope::LOCALS, 0, scope::LITERAL, LAMP as i16, 2),
+            ins(13, RETURN_TRUE, RETURN_TRUE, [3, 0, 1, 2, 0, 0, 0, 0]),
+        ]),
+    );
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 4), Ok(Some(1)));
+    assert_eq!(fx.world.action_serial, 1);
+    let queue = &fx.sim().person.as_ref().unwrap().queue;
+    let [queued] = queue.as_slice() else {
+        panic!("{queue:?}");
+    };
+    assert_eq!(
+        (queued.uid, queued.table_index, queued.priority),
+        (1, 3, 100)
+    );
+    assert_eq!(queued.flags, 1);
+
+    // With flag 0x40 (Push Interaction's flag bit 3) the queued action
+    // takes the running action's name, which sets its flag 0x80
+    // (0x41f1ae).
+    let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    fx.add(
+        LAMP_FILE,
+        ACTION,
+        tree(vec![
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, SIM as i16, 1),
+            assign(scope::LOCALS, 0, scope::LITERAL, LAMP as i16, 2),
+            ins(13, RETURN_TRUE, RETURN_TRUE, [3, 0, 1, 10, 0, 0, 0, 0]),
+        ]),
+    );
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 4), Ok(Some(1)));
+    assert_eq!(fx.sim().person.as_ref().unwrap().queue[0].flags, 0xc1);
+
+    // A full queue takes nothing, but the action is still copied over the
+    // running one, so its number is returned.
+    let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    fx.add(
+        LAMP_FILE,
+        ACTION,
+        tree(vec![
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, SIM as i16, 1),
+            assign(scope::LOCALS, 0, scope::LITERAL, LAMP as i16, 2),
+            ins(13, RETURN_TRUE, RETURN_TRUE, [3, 0, 1, 2, 0, 0, 0, 0]),
+        ]),
+    );
+    let mut full = fx.sim().person.as_ref().unwrap().active.clone();
+    full.priority = 100;
+    fx.sim_mut().person.as_mut().unwrap().queue = vec![full; 8];
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 4), Ok(Some(1)));
+    assert_eq!(fx.sim().person.as_ref().unwrap().queue.len(), 8);
+}
+
+/// An action pushed to the front while my action runs at once is queued:
+/// the front's branch never reaches 0x45d5a5.
+#[test]
+fn an_action_pushed_to_the_front_while_one_runs_at_once_is_queued() {
+    let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    fx.add(
+        LAMP_FILE,
+        ACTION,
+        tree(vec![
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, SIM as i16, 1),
+            assign(scope::LOCALS, 0, scope::LITERAL, LAMP as i16, 2),
+            ins(13, RETURN_TRUE, RETURN_TRUE, [3, 0, 1, 2 | 4, 0, 0, 0, 0]),
+        ]),
+    );
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    // The pushed action takes number 1; the action run at once, which
+    // had none, takes 2 afterwards.
+    assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 4), Ok(Some(2)));
+    assert_eq!(queued(&fx), [(1, 3)]);
+}
+
+/// An action run at once whose tree fails puts my priority back.
+#[test]
+fn an_action_run_at_once_that_fails_puts_my_priority_back() {
+    let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    // The tree names a primitive.
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .interactions
+        .get_mut(&TABLE)
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .interactions[1]
+        .action = 4;
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert!(interpreter.order(&mut fx.world, SIM, LAMP, 4).is_err());
+    assert_eq!(fx.sim().person.as_ref().unwrap().data[33], 7);
+
+    // The tree ends in an error.
+    let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    fx.add(
+        LAMP_FILE,
+        ACTION,
+        tree(vec![assign(scope::TEMPS, 0, scope::LITERAL, 1, ERROR)]),
+    );
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert!(interpreter.order(&mut fx.world, SIM, LAMP, 4).is_err());
+    assert_eq!(fx.sim().person.as_ref().unwrap().data[33], 7);
 }

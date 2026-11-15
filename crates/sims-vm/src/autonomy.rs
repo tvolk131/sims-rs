@@ -88,6 +88,11 @@ pub struct Constants {
     /// How much each tile of distance takes from an object's score in
     /// Find Best Object for Function (0x6c4394).
     pub distance_attenuation: F32,
+    /// The least value both of two people's relationship rows need for
+    /// them to be friends (0x6c4398), stored as a whole number,
+    /// truncated. Not read by Find Best Interaction: a family's friend
+    /// count reads it ([`sims_sim::World::count_family_friends`]).
+    pub friendship_threshold: i32,
 }
 
 /// The attenuation of an entry whose code is none of 0 to 4 (0x667368).
@@ -99,9 +104,7 @@ const THOUSANDTH: u32 = 0x3a83_126f;
 /// The comparison's tolerance (0x66734c).
 const EPSILON: u32 = 0x33d6_bf95;
 
-/// How many advertisements the scratch record the original copies an
-/// entry's into holds ([0x6c437c] +4).
-pub(crate) const ADVERTISEMENTS: usize = 16;
+pub(crate) use sims_sim::ADVERTISEMENTS;
 
 /// Object data words.
 pub(crate) mod data {
@@ -192,32 +195,7 @@ const PERSONALITY: [(usize, bool); 22] = [
     (18, false),
 ];
 
-/// One advertisement as the original holds it: a personality number, a
-/// minimum and an amount scaled by the personality.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Advertisement {
-    pub personality: i16,
-    pub minimum: i16,
-    pub delta: i16,
-}
-
-impl Advertisement {
-    /// A field by its place in the original's six bytes: 0 the
-    /// personality number, 1 the minimum, 2 the delta.
-    pub(crate) fn field(&self, field: usize) -> i16 {
-        *[self.personality, self.minimum, self.delta]
-            .get(field)
-            .unwrap_or(&self.delta)
-    }
-
-    pub(crate) fn field_mut(&mut self, field: usize) -> &mut i16 {
-        match field {
-            0 => &mut self.personality,
-            1 => &mut self.minimum,
-            _ => &mut self.delta,
-        }
-    }
-}
+pub use sims_sim::Advertisement;
 
 /// An entry the scan looks at (0x41f00e): the interaction target, the
 /// entry's menu number (its TTAB string index), its attenuation and
@@ -384,7 +362,6 @@ struct Chooser {
     cat: bool,
     pets_outside: bool,
     autonomy: i16,
-    room: i16,
     residential: bool,
     constants: Constants,
 }
@@ -473,7 +450,6 @@ impl Machine<'_, '_> {
             cat,
             pets_outside: word(person::PETS_OUTSIDE) != 0,
             autonomy: word(person::AUTONOMY),
-            room: object.data.get(data::ROOM).copied().unwrap_or(0),
             residential: zoning == 1,
             constants,
         };
@@ -806,15 +782,19 @@ impl Machine<'_, '_> {
     ///   not ported and fails);
     /// - by the person's age and kind, as [`Machine::autonomy_entries`].
     ///
-    /// An entry still allowed has its advertisements copied, and its check
-    /// tree, if it has one, decides: the tree of the target's type runs
+    /// An entry still allowed has its advertisements copied over the one
+    /// record ([`sims_sim::World::advertisement_record`], 0x4763c5: as
+    /// many as it has, the rest staying), and its check tree, if it has
+    /// one, decides: the tree of the target's type runs
     /// synchronously on the person's stack (0x4749b5), with the target as
     /// its stack object and the arguments 1, 0, 0, 0 (1, 1, 0, 0 for a
     /// join entry) and the tree's ID
     /// (the word that follows the original's four in memory). The
     /// person's temps are saved before the first check tree of the scan.
-    /// Last, if the target is in another room than the person, the room
-    /// motive's delta becomes its minimum negated.
+    /// Last, whatever the check returned, if the target is in another room
+    /// than the person, the record's room motive delta becomes its
+    /// minimum negated (0x45853f). The record is returned when the entry
+    /// is allowed.
     fn autonomy_allows(
         &mut self,
         chooser: &Chooser,
@@ -861,15 +841,19 @@ impl Machine<'_, '_> {
         if !fits || !allowed {
             return Ok(None);
         }
-        let room = target_data(data::ROOM);
-        if record.motives.len() < ADVERTISEMENTS {
-            return Err(Trap::Unsupported(format!(
-                "an interaction with {} advertisements: the original copies them over the \
-                 last entry's, which are not kept",
-                record.motives.len()
-            )));
-        }
-        let mut ads = [Advertisement::default(); ADVERTISEMENTS];
+        // 0x4763c5 copies as many as both have (the record always has
+        // sixteen), so the rest stay as the last copy left them.
+        let mut ads = match self.world.advertisement_record {
+            Some(ads) => ads,
+            None if record.motives.len() < ADVERTISEMENTS => {
+                return Err(Trap::Unsupported(format!(
+                    "an interaction with {} advertisements copied before any other: the \
+                     rest of the record (0x6e5100) holds what the game's start left",
+                    record.motives.len()
+                )));
+            }
+            None => [Advertisement::default(); ADVERTISEMENTS],
+        };
         for (ad, motive) in ads.iter_mut().zip(&record.motives) {
             *ad = Advertisement {
                 personality: motive.personality as i16,
@@ -877,6 +861,9 @@ impl Machine<'_, '_> {
                 delta: motive.delta,
             };
         }
+        // The entry is copied over the one record (0x4763c5) before its
+        // check tree runs.
+        self.world.advertisement_record = Some(ads);
         let resource = self
             .definition(self.world.objects[&entry.target].guid)?
             .resource;
@@ -905,9 +892,7 @@ impl Machine<'_, '_> {
             }
             let tree = record.test;
             let args = check_arguments(entry.join, tree);
-            let mut scratch = Some(ads);
-            let result = self
-                .interpreter()
+            self.interpreter()
                 .call_as(
                     self.world,
                     me,
@@ -917,24 +902,36 @@ impl Machine<'_, '_> {
                     &args,
                     args.len(),
                     TURN_BUDGET,
-                    &mut scratch,
+                    true,
                 )
                 .map_err(|fault| {
                     Trap::Unsupported(format!(
                         "check tree {tree:#06x} of object {}: {fault}",
                         entry.target
                     ))
-                })?;
-            if let Some(scratch) = scratch {
-                ads = scratch;
-            }
-            result
+                })?
         } else {
             true
         };
-        if room != chooser.room {
+        // The check tree may have moved either object: both rooms are read
+        // after it (0x45852f, 0x458536), and the record itself is adjusted
+        // (0x45853f).
+        let room_of = |world: &sims_sim::World, id: u16| {
+            world
+                .objects
+                .get(&id)
+                .map(|o| o.data.get(data::ROOM).copied().unwrap_or(0))
+                .ok_or_else(|| {
+                    Trap::Unsupported(format!(
+                        "object {id} deleted by a check tree, whose room 0x45852f reads after it"
+                    ))
+                })
+        };
+        let mut ads = self.world.advertisement_record.unwrap_or(ads);
+        if room_of(self.world, entry.target)? != room_of(self.world, me)? {
             ads[13].delta = ads[13].minimum.wrapping_neg();
         }
+        self.world.advertisement_record = Some(ads);
         Ok(allowed.then_some(ads))
     }
 }
@@ -1001,6 +998,11 @@ impl Machine<'_, '_> {
     /// 6. Flag 8 is set if it passed, and flag 0x10 is set or cleared by
     ///    whether the person's object data word 50 is set.
     ///
+    /// With `menu`, the check is the pie menu's listing's: the check tree
+    /// runs with the listing's state ([`crate::Interpreter`]'s `menu`),
+    /// holding the action as step 1 left it, and the entries the tree adds
+    /// (Add/Change Action String, 0x458789) are added to `menu`.
+    ///
     /// A queued action here is taken not to join another (its word +0,
     /// which the save does not keep, 0); 0x41f00e, which makes the pie
     /// menu's actions, writes 0 there.
@@ -1008,6 +1010,7 @@ impl Machine<'_, '_> {
         &mut self,
         action: &mut sims_formats::saved_objects::Interaction,
         saved: &mut Option<Vec<i16>>,
+        menu: Option<&mut Vec<crate::orders::MenuEntry>>,
     ) -> Result<(), Trap> {
         action.flags = (action.flags & !checked::PASSED) | checked::RAN;
         let Some(target) = u16::try_from(action.target).ok().filter(|&t| t != 0) else {
@@ -1089,7 +1092,18 @@ impl Machine<'_, '_> {
                     let tree = record.test;
                     let args = [0, 0, 0, 0, tree as i16];
                     let me = self.me;
-                    self.interpreter()
+                    let checking = menu.is_some().then(|| {
+                        std::cell::RefCell::new(crate::orders::Checking {
+                            action: action.clone(),
+                            added: Vec::new(),
+                        })
+                    });
+                    let outer = self.interpreter();
+                    let interpreter = crate::Interpreter {
+                        menu: checking.as_ref().or(outer.menu),
+                        ..outer
+                    };
+                    let passed = interpreter
                         .call_as(
                             self.world,
                             me,
@@ -1099,13 +1113,17 @@ impl Machine<'_, '_> {
                             &args,
                             args.len(),
                             TURN_BUDGET,
-                            &mut None,
+                            false,
                         )
                         .map_err(|fault| {
                             Trap::Unsupported(format!(
                                 "check tree {tree:#06x} of object {target}: {fault}"
                             ))
-                        })?
+                        })?;
+                    if let (Some(menu), Some(checking)) = (menu, checking) {
+                        menu.extend(checking.into_inner().added);
+                    }
+                    passed
                 }
             }
         };

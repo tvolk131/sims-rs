@@ -2,13 +2,13 @@ use sims_content::{Catalog, House, Index, Install, Neighborhood};
 use sims_core::{CrtRng, F32, GameRng};
 use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
-use sims_sim::animator::{Animator, Fade, LOADED, Layer, Motion, UNSET};
+use sims_sim::animator::{Animator, Base, Fade, LOADED, Layer, Motion, UNSET};
 use sims_sim::head::Head;
-use sims_sim::neighbors::{Inventory, Item, Neighbor, Neighbors, Row};
+use sims_sim::neighbors::{Family, Inventory, Item, Neighbor, Neighbors, Row};
 use sims_sim::rooms::{Half, Room, Rooms};
 use sims_sim::route::{Candidate, Context, Route, RouteSlot, Routing};
 use sims_sim::{
-    Budget, Dialog, Dialogs, FrameStorage, HouseUsage, MagicHistory, Object, PersonTick,
+    Budget, Dialog, Dialogs, FrameStorage, Headline, HouseUsage, MagicHistory, Object, PersonTick,
     ReadOnlySnapshots, Snapshots, TypeAttributes, Usage, Whereabouts, World,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -193,6 +193,34 @@ fn world() -> World {
             }],
             relationships_changed: true,
         },
+        advertisement_record: Some(std::array::from_fn(|i| sims_sim::Advertisement {
+            personality: i as i16,
+            minimum: -(i as i16),
+            delta: 100 + i as i16,
+        })),
+        families: vec![
+            Family {
+                id: 5,
+                house: 5,
+                members: vec![0x1234_5678, 0x9abc_def0],
+                friends: 3,
+                stale: false,
+            },
+            Family {
+                id: 0,
+                house: 0,
+                members: Vec::new(),
+                friends: -1,
+                stale: true,
+            },
+        ],
+        headlines: BTreeMap::from([(
+            5,
+            Headline {
+                priority: 2,
+                duration: -1,
+            },
+        )]),
         animators: BTreeMap::from([(5, animator())]),
         usage: HouseUsage {
             history: [
@@ -328,7 +356,7 @@ fn animator() -> Animator {
         ],
         destination: [UNSET; 3],
         posture: 0,
-        base: true,
+        base: Base::Posture,
         events: vec![7, -2],
         foreground: Some(layer),
         playing: true,
@@ -368,7 +396,85 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "23e9f53ef9c6129ef25795acb31d097cce39ddb0401b852212b4a4f96e49cdcd";
+const PINNED: &str = "992789f0d0ba45f0e3a203b4cdff77c9b180f5a1da7b99061e521ca5ae5b3d38";
+
+#[test]
+fn without_the_headlines_the_encoding_is_format_23() {
+    // Snapshot format 24 added the headlines at the end.
+    assert_eq!(digest(&format_23_bytes(&world())), PINNED_23);
+}
+const PINNED_23: &str = "d73a66741337b2527a28c856d5d94f1a91a6f7137a7ee199fcfc289bd21dcadb";
+
+/// The encoding of `world` as snapshot format 23 wrote it: without the
+/// headlines ([`World::headlines`]) that format 24 added at the end. The
+/// older formats' encodings start from this one.
+fn format_23_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let headlines = postcard::to_allocvec(&world.headlines).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - headlines.len()), headlines);
+    bytes
+}
+
+#[test]
+fn without_the_families_the_encoding_is_format_22() {
+    // Snapshot format 23 added the families at the end.
+    assert_eq!(digest(&format_22_bytes(&world())), PINNED_22);
+}
+const PINNED_22: &str = "a4e74a05e62ae6eaff009cb2b32fe752b07cc739492dc1d964c585d53e0d2d65";
+
+/// The encoding of `world` as snapshot format 22 wrote it: without the
+/// families ([`World::families`]) that format 23 added at the end. It
+/// starts from [`format_23_bytes`], and the older formats' encodings from
+/// this one.
+fn format_22_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = format_23_bytes(world);
+    let families = postcard::to_allocvec(&world.families).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - families.len()), families);
+    bytes
+}
+
+#[test]
+fn without_the_advertisement_record_the_encoding_is_format_21() {
+    // Snapshot format 22 added the advertisement record at the end.
+    assert_eq!(digest(&format_21_bytes(&world())), PINNED_21);
+}
+const PINNED_21: &str = "23e9f53ef9c6129ef25795acb31d097cce39ddb0401b852212b4a4f96e49cdcd";
+
+/// The encoding of `world` as snapshot format 21 wrote it: without the
+/// advertisement record ([`World::advertisement_record`]) that format 22
+/// added at the end. It starts from [`format_22_bytes`], and the older
+/// formats' encodings from this one.
+fn format_21_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = format_22_bytes(world);
+    let record = postcard::to_allocvec(&world.advertisement_record).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - record.len()), record);
+    bytes
+}
+
+#[test]
+fn the_base_slot_encodes_as_the_flag_it_was_unless_a_script_fills_it() {
+    // An empty slot and the posture's clip encode as false and true did,
+    // so format 21 needs no new version for them.
+    let bytes = |result: Result<Vec<u8>, postcard::Error>| result.unwrap();
+    assert_eq!(
+        bytes(postcard::to_allocvec(&Base::Empty)),
+        bytes(postcard::to_allocvec(&false))
+    );
+    assert_eq!(
+        bytes(postcard::to_allocvec(&Base::Posture)),
+        bytes(postcard::to_allocvec(&true))
+    );
+    // A script's clip comes back as it went.
+    let mut world = world();
+    world.animators.get_mut(&5).unwrap().base = Base::Script {
+        clip: "a2o-base".into(),
+        reverse: true,
+        start: 1234,
+    };
+    let back = World::decode(&world.encode()).unwrap();
+    assert_eq!(back.animators, world.animators);
+    assert_eq!(back.hash(), world.hash());
+}
 
 #[test]
 fn without_the_carry_layer_the_encoding_is_format_20() {
@@ -389,16 +495,16 @@ fn animator_20_bytes(animator: &Animator) -> Vec<u8> {
 }
 
 /// The encoding of `world` as snapshot format 20 wrote it: each animator
-/// as [`animator_20_bytes`] writes it. The older formats' encodings start
-/// from this one.
+/// as [`animator_20_bytes`] writes it. It starts from
+/// [`format_21_bytes`], and the older formats' encodings from this one.
 fn format_20_bytes(world: &World) -> Vec<u8> {
     let blank = World {
         animators: BTreeMap::new(),
         ..world.clone()
     };
     splice(
-        &world.encode(),
-        &blank.encode(),
+        &format_21_bytes(world),
+        &format_21_bytes(&blank),
         &postcard::to_allocvec(&world.animators).unwrap(),
         &[0],
         &map_bytes(&world.animators, animator_20_bytes),

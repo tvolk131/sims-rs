@@ -550,15 +550,31 @@ fn the_usage_counts_wrap() {
 }
 
 #[test]
+fn person_word_1_goes_to_the_interface_and_is_cleared() {
+    // 0x4a69aa shows the value over the person, as money from -10000 up,
+    // as text below -20000; the tick then clears it (0x45ce7e).
+    for value in [5, -5, -10000, i16::MAX, -20001, i16::MIN] {
+        let mut fx = lot(sleeper());
+        fx.thread(LAMP, 4096, &[3]);
+        fx.sim_mut().person.as_mut().unwrap().data[1] = value;
+        update(&mut fx, &mut answers(&[])).unwrap();
+        assert_eq!(fx.sim().person.as_ref().unwrap().data[1], 0, "{value}");
+    }
+}
+
+#[test]
 fn what_a_person_tick_does_not_port_fails_loudly() {
-    // Person word 1.
-    let mut fx = lot(sleeper());
-    fx.thread(LAMP, 4096, &[3]);
-    fx.sim_mut().person.as_mut().unwrap().data[1] = 1;
-    assert!(matches!(
-        update(&mut fx, &mut answers(&[])),
-        Err(TickError::Fault(f)) if f.to_string().contains("0x4a69aa")
-    ));
+    // Person word 1 from -20000 up to -10000, which plays a sound as it is
+    // shown.
+    for value in [-20000, -10001] {
+        let mut fx = lot(sleeper());
+        fx.thread(LAMP, 4096, &[3]);
+        fx.sim_mut().person.as_mut().unwrap().data[1] = value;
+        assert!(matches!(
+            update(&mut fx, &mut answers(&[])),
+            Err(TickError::Fault(f)) if f.to_string().contains("0x4a69aa")
+        ));
+    }
 }
 
 /// A person in an indoor room marks it as occupied (0x468802, called
@@ -678,7 +694,7 @@ fn play_mode_resets_an_object_after_its_error_and_parks_one_that_repeats_it() {
 fn play_mode_catches_a_fault_in_the_rest_of_a_persons_tick() {
     let mut fx = lot(sleeper());
     fx.thread(LAMP, 4096, &[3]);
-    fx.sim_mut().person.as_mut().unwrap().data[1] = 1;
+    fx.sim_mut().person.as_mut().unwrap().data[1] = -15000;
     let mut play = Play::default();
     let update = play_update(&mut fx, &mut play);
     assert!(!update.full);
@@ -730,7 +746,7 @@ fn play_mode_keeps_a_thread_fault_that_a_later_one_follows() {
         tree(vec![ins(0, RETURN_TRUE, RETURN_TRUE, [0; 8])]),
     );
     fx.thread(SIM, 4097, &[0]);
-    fx.sim_mut().person.as_mut().unwrap().data[1] = 1;
+    fx.sim_mut().person.as_mut().unwrap().data[1] = -15000;
     let mut play = Play::default();
     let update = play_update(&mut fx, &mut play);
     let [error] = update.errors.as_slice() else {
@@ -816,5 +832,24 @@ fn an_update_returns_its_sound_events_in_order_without_changing_the_lot() {
         [SoundEvent::Stop {
             object: LAMP as i16
         }]
+    );
+}
+
+#[test]
+fn a_person_queued_for_removal_after_a_partial_pass_fails_loudly() {
+    // The queue waits for a full pass, and the person's animator is not
+    // refreshed meanwhile (0x58da12), which depends on whether the view
+    // drew it.
+    let mut fx = lot(sleeper());
+    fx.thread(LAMP, 4096, &[3]);
+    fx.world.globals[17] = 1;
+    fx.lamp_mut().registry_word = Some(0x0003_ffff);
+    fx.world.removals.push(SIM);
+    let error = update(&mut fx, &mut answers(&[])).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("stays queued for removal after a partial pass"),
+        "{error}"
     );
 }

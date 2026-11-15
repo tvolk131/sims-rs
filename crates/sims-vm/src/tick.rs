@@ -47,12 +47,13 @@
 //! graphics work every tenth tick (0x5a0932), and signal 0xf7, which a person's tick sends when the
 //! selected Sim changes room and which only the house viewer takes
 //! (0x4a82db, 0x4ab992). That none of these changes simulation state is
-//! **unverified**. The lot's subscriber forwards each signal to a second
-//! subscriber at lot 0x10 (0x416393) before its own cases; what that one
-//! is, and what it does with 0xdb and 0xf7, is **unverified**, and so is
-//! whether the panels' and the house viewer's handling of these signals
-//! (taken as presentation) changes anything the simulation keeps; the
-//! house viewer's handler was not read in full. The
+//! **unverified**. The lot's subscriber passes each signal to the object
+//! at lot 0x10 (0x416393) before its own cases, but by a direct call to
+//! the subscribers' empty handler (0x41639e calls 0x407607, which returns
+//! 0), so that does nothing. Whether the panels' and the house viewer's
+//! handling of these signals (taken as presentation) changes anything the
+//! simulation keeps is **unverified**; the house viewer's handler was not
+//! read in full. The
 //! registry's pass also opens the game's special panels (registry words
 //! 0xe8 to 0x108) when a script asked for one; no ported primitive asks,
 //! so they never open here. When the pass showed a modal dialog the lot
@@ -122,9 +123,16 @@ const CHECK_ERROR: u16 = 4;
 const ROOM: usize = 29;
 const HIDDEN: usize = 34;
 
+/// The bounds of person word 1's kinds (0x4a69aa): from -20000 up to
+/// -10000 the interface plays a sound as it shows the value; below or
+/// above, it only shows it.
+const STING: i16 = -20000;
+const MONEY: i16 = -10000;
+
 /// Person data words.
 mod person {
-    /// Something for the interface to act on (0x4a69aa), cleared after.
+    /// Something for the interface to show over the person (0x4a69aa),
+    /// cleared after.
     pub const REQUEST: usize = 1;
     /// Counted up every tick.
     pub const TICKS: usize = 27;
@@ -474,8 +482,10 @@ impl Interpreter<'_> {
 
     /// An object's tick (0x4521f7): its thread runs (0x474e88) until it
     /// yields. If that returns true, data word 25 is counted down when it
-    /// is not 0, and the object's animated sprites step (not modeled; see
-    /// the module's documentation).
+    /// is not 0, and the object's headlines step (0x46e004): the first
+    /// one's duration counts down ([`sims_sim::World::headlines`]); its
+    /// animation, which only decides when the object is redrawn, is not
+    /// modeled.
     ///
     /// The thread returns true when it yields. Returning from its
     /// outermost frame is error 0x3e9 in the original, which the object's
@@ -560,8 +570,16 @@ impl Interpreter<'_> {
     /// 8. Every tenth tick, for an awake member of the household who is
     ///    not hidden, the house's usage counts take a sample (0x4165e3,
     ///    [`sims_sim::HouseUsage::sample`]), which counts whether the
-    ///    person has a route context (0x45c349). A nonzero person word 1
-    ///    goes to 0x4a69aa and is cleared; that is not ported and fails.
+    ///    person has a route context (0x45c349).
+    /// 9. A nonzero person word 1 goes to the interface (0x4a69aa) and is
+    ///    cleared (0x45ce7e). Below -20000 the interface shows -20000 less
+    ///    the value; from -20000 up to -10000 it plays the sound
+    ///    "sting_char_winner" for the person (0x57a54c) and shows -10000
+    ///    less the value; from -10000 up it shows the value as money.
+    ///    Each is shown only while the interface's object
+    ///    (\[0x6f2a58\]+0x84) is there. The showing is presentation (text
+    ///    drawn over the person, 0x4d322c), so only the clearing is
+    ///    modeled; the sound is not ported and fails.
     pub fn tick_person(
         &self,
         world: &mut World,
@@ -674,10 +692,17 @@ impl Interpreter<'_> {
                     .is_some_and(|r| !r.contexts.is_empty());
             world.usage.sample(routing);
         }
-        if word(&person.data, person::REQUEST) != 0 {
-            return Err(fail(Trap::Unsupported(
-                "person word 1 is set, which a person's tick hands to 0x4a69aa; not ported".into(),
-            )));
+        // 0x45ce61: a nonzero person word 1 goes to the interface
+        // (0x4a69aa) and is cleared.
+        let request = word(&person.data, person::REQUEST);
+        if request != 0 {
+            if (STING..MONEY).contains(&request) {
+                return Err(fail(Trap::Unsupported(format!(
+                    "person word 1 is {request}, which 0x4a69aa shows with the sound \
+                     \"sting_char_winner\" (0x4a6a56); not ported"
+                ))));
+            }
+            person.data[person::REQUEST] = 0;
         }
         world.person_ticks.insert(id, state);
         Ok(true)
@@ -802,11 +827,17 @@ impl Interpreter<'_> {
     /// 1. The dialogs, from the first record, starting over after each
     ///    one it acts on: a new record is shown (0x436da0: status 1) and,
     ///    if it stops the game, answered by the player then and there; a
-    ///    finished one (status 5) is destroyed (0x448663).
+    ///    finished one (status 5) is destroyed (0x448663). While a dialog
+    ///    waits, the family panel is redrawn
+    ///    ([`Interpreter::refresh_family_panel`]).
     /// 2. After a full pass, the queued removals, oldest first: each ID is
     ///    taken off the queue and, if it still names an object, the
     ///    object is removed at once ([`Interpreter::remove_now`],
-    ///    0x44123f). A tile of a multi-tile object is not ported.
+    ///    0x44123f). A tile of a multi-tile object is not ported. A partial
+    ///    pass leaves the queue as it is; one that leaves a person queued
+    ///    fails, since that person's animator would live on past the
+    ///    refresh its take-off skipped
+    ///    ([`Interpreter::take_off_to_remove`]).
     /// 3. Also after a full pass, on a tick count (already counted for this
     ///    update) that is a multiple of 40, registry byte 0x12
     ///    ([`sims_sim::neighbors::Neighbors::relationships_changed`]) is cleared
@@ -853,10 +884,14 @@ impl Interpreter<'_> {
                 object: record.caller,
                 answers,
             };
+            // While the dialog waits, the game handles its messages, which
+            // redraws the family panel.
+            self.refresh_family_panel(world);
             let given = player.answer(&shown);
             let Some(answer) = given.filter(|answer| answers.contains(answer)) else {
                 return Err(TickError::Unanswered { shown, given });
             };
+            let record = &mut world.dialogs.records[index];
             // 0x4370be: the button's result, or done at once for a dialog
             // that only informs.
             record.status = if dialog::informs(&record.operands) {
@@ -865,6 +900,20 @@ impl Interpreter<'_> {
                 answer
             };
             update.answered.push((record.caller, answer));
+        }
+        if partial
+            && let Some(&id) = world.removals.iter().find(|id| {
+                world
+                    .objects
+                    .get(id)
+                    .is_some_and(|object| object.person.is_some())
+            })
+        {
+            return Err(TickError::Unsupported(format!(
+                "person {id} stays queued for removal after a partial pass; its animator's \
+                 refresh as it left the lot (0x58da12) depends on whether the view drew it \
+                 (animator byte +0x109), which is not kept"
+            )));
         }
         if !partial {
             while !world.removals.is_empty() {

@@ -14,7 +14,7 @@ use sims_vm::Trap;
 
 const SNAP: u16 = 46;
 /// The person's tree that runs Snap.
-const TREE: u16 = 4200;
+pub(crate) const TREE: u16 = 4200;
 /// The lamp's SLOT chunk.
 const SLOTS: u16 = 300;
 /// Slot flags: the placement skips its checks, the direction follows the
@@ -23,7 +23,7 @@ const SKIP_CHECKS: u32 = 0x800;
 const TURNED: u32 = 0x1000;
 
 /// A routing slot at the object, with the given flags.
-fn slot(flags: u32) -> Slot {
+pub(crate) fn slot(flags: u32) -> Slot {
     Slot {
         kind: 3,
         offset: [0.0; 3],
@@ -44,7 +44,7 @@ fn slot(flags: u32) -> Slot {
 
 /// The person, made on the lamp's tile (2, 2) in room 1, facing 3, and
 /// the widget's file. The lamp has one routing slot with `flags`.
-fn snapper(flags: u32) -> (Fixture, u16) {
+pub(crate) fn snapper(flags: u32) -> (Fixture, u16) {
     let mut fx = person_widget();
     let before: Vec<u16> = fx.world.objects.keys().copied().collect();
     assert_eq!(create(&mut fx, 0, 0, SIM as i16), Ok(true));
@@ -64,7 +64,7 @@ fn snapper(flags: u32) -> (Fixture, u16) {
     (fx, me)
 }
 
-fn set_slots(fx: &mut Fixture, slots: Vec<Slot>) {
+pub(crate) fn set_slots(fx: &mut Fixture, slots: Vec<Slot>) {
     fx.program
         .libraries
         .get_mut(&LAMP_FILE)
@@ -371,7 +371,7 @@ fn snap_checks_its_object_mode_and_slot() {
     assert_eq!(code(snap(&mut fx, me, LAMP as i16, 0, 5, 0)), Some(0x24));
     assert_eq!(code(snap(&mut fx, me, LAMP as i16, 1, 3, 0)), Some(0x1b));
     assert_eq!(code(snap(&mut fx, me, LAMP as i16, -1, 3, 0)), Some(0x1b));
-    for mode in [0, 1, 2, 4] {
+    for mode in [0, 1, 2] {
         let result = snap(&mut fx, me, LAMP as i16, 0, mode, 0);
         assert!(
             matches!(trap(result), Trap::Unsupported(ref m) if m.contains("mode")),
@@ -381,45 +381,161 @@ fn snap_checks_its_object_mode_and_slot() {
     assert_eq!(unmoved(&fx, me), start);
 }
 
+/// Sets the global file's SLOT 100, whose kind 3 entries are the lot's
+/// global routing slots.
+fn set_global_slots(fx: &mut Fixture, slots: Vec<Slot>) {
+    let global = fx.program.global;
+    fx.program
+        .libraries
+        .get_mut(&global)
+        .unwrap()
+        .slots
+        .insert(100, slots);
+}
+
+/// The snapper, with the lamp's one routing slot keeping my facing and
+/// the lot's global routing slots: a container entry, then routing
+/// slots turning by 1 (flag bit 1) and by 4 (bit 4) with the lamp. The
+/// lamp faces 5.
+fn global_snapper() -> (Fixture, u16) {
+    let (mut fx, me) = snapper(SKIP_CHECKS);
+    fx.lamp_mut().position = [56, 24, 1];
+    fx.lamp_mut().data[1] = 5;
+    set_global_slots(
+        &mut fx,
+        vec![
+            Slot { kind: 0, ..slot(0) },
+            slot(SKIP_CHECKS | TURNED | 2),
+            slot(SKIP_CHECKS | TURNED | 0x10),
+        ],
+    );
+    (fx, me)
+}
+
+#[test]
+fn mode_4_names_one_of_the_lots_global_routing_slots() {
+    // Mode 4 reads the lot's table (0x454ab6: the stack object's lot,
+    // +0x9c), counting only its routing entries: slot 0 turns me by 1
+    // from the lamp's facing, slot 1 by 4. The place is still the stack
+    // object's.
+    for (index, facing) in [(0, 6), (1, 1)] {
+        let (mut fx, me) = global_snapper();
+        assert_eq!(snap(&mut fx, me, LAMP as i16, index, 4, 0), Ok(true));
+        let person = &fx.world.objects[&me];
+        assert_eq!(person.position, [56, 24, 1], "slot {index}");
+        assert_eq!(person.data[1], facing, "slot {index}");
+        assert_eq!(person.data[52], 0);
+    }
+    // Mode 3 with the same index reads the lamp's own slot: my facing.
+    let (mut fx, me) = global_snapper();
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+    assert_eq!(fx.world.objects[&me].data[1], 3);
+}
+
+#[test]
+fn mode_4_reads_the_lots_flags_for_its_slot_not_the_objects() {
+    // The flags the lot's table holds in place of the type's are kept
+    // under object 0; the lamp's own for the same index are not read.
+    let (mut fx, me) = global_snapper();
+    fx.world
+        .routing
+        .slot_flags
+        .insert((LAMP, 0), (SKIP_CHECKS | TURNED | 8) as i32);
+    fx.world
+        .routing
+        .slot_flags
+        .insert((0, 0), (SKIP_CHECKS | TURNED | 4) as i32);
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 4, 0), Ok(true));
+    assert_eq!(fx.world.objects[&me].data[1], 7);
+}
+
+#[test]
+fn mode_4_past_the_lots_table_is_native_error_0x1b() {
+    // Two global routing slots, and the lamp's table is not looked at.
+    let (mut fx, me) = global_snapper();
+    set_slots(&mut fx, vec![slot(0), slot(0), slot(0)]);
+    let start = unmoved(&fx, me);
+    for index in [2, -1] {
+        assert_eq!(
+            code(snap(&mut fx, me, LAMP as i16, index, 4, 0)),
+            Some(0x1b),
+            "slot {index}"
+        );
+    }
+    // A lot with no global slots at all.
+    set_global_slots(&mut fx, Vec::new());
+    assert_eq!(code(snap(&mut fx, me, LAMP as i16, 0, 4, 0)), Some(0x1b));
+    assert_eq!(unmoved(&fx, me), start);
+}
+
+#[test]
+fn mode_4_on_myself_turns_me_where_i_stand() {
+    // As the snack order does: I am the stack object, and the global slot
+    // (flags 0x1010, with no 0x800) turns me by 4 from my own facing. The
+    // place is where I stand, so the walls are not looked at.
+    let (mut fx, me) = snapper(SKIP_CHECKS);
+    set_global_slots(&mut fx, vec![slot(TURNED | 0x10)]);
+    wall(&mut fx, [2, 2], 0xf);
+    assert_eq!(snap(&mut fx, me, me as i16, 0, 4, 0), Ok(true));
+    let person = &fx.world.objects[&me];
+    assert_eq!(person.position, [40, 40, 1]);
+    assert_eq!(person.data[1], 7);
+    assert_eq!(person.data[52], 0);
+}
+
+#[test]
+fn an_offset_turns_with_the_objects_facing() {
+    // The offset's first coordinate goes along the second of the
+    // position, its second along the first, turned by the lamp's facing
+    // through a matrix in world units and rounded back half away from
+    // zero (0x454b93 to 0x454c54).
+    // The lamp stands where I do, in the middle of tile (2, 2).
+    let cases: [([f32; 2], i16, [i32; 2]); 7] = [
+        ([4.0, 0.0], 0, [40, 44]),
+        ([4.0, 0.0], 2, [44, 40]),
+        ([4.0, 0.0], 4, [40, 36]),
+        ([4.0, 0.0], 6, [36, 40]),
+        // 0.75 times the root of a half, 0.53033, on 7.5 in world units:
+        // 42.828 back in the lot's.
+        ([4.0, 0.0], 1, [43, 43]),
+        ([0.0, -2.0], 0, [38, 40]),
+        // The facing is the raw data word: 10 turns as 2 does.
+        ([4.0, 0.0], 10, [44, 40]),
+    ];
+    for (offset, facing, place) in cases {
+        let (mut fx, me) = snapper(SKIP_CHECKS);
+        fx.lamp_mut().position = [40, 40, 1];
+        fx.lamp_mut().data[1] = facing;
+        set_slots(
+            &mut fx,
+            vec![Slot {
+                offset: [offset[0], offset[1], 5.0],
+                ..slot(SKIP_CHECKS)
+            }],
+        );
+        assert_eq!(
+            snap(&mut fx, me, LAMP as i16, 0, 3, 0),
+            Ok(true),
+            "{offset:?} {facing}"
+        );
+        let person = &fx.world.objects[&me];
+        assert_eq!(
+            person.position,
+            [place[0], place[1], 1],
+            "{offset:?} {facing}"
+        );
+    }
+}
+
 #[test]
 fn what_snap_does_not_port_fails_loudly() {
-    let cases: [(Slot, u8, &str); 3] = [
-        (
-            Slot {
-                offset: [8.0, 0.0, 0.0],
-                ..slot(SKIP_CHECKS)
-            },
-            0,
-            "0x455070",
-        ),
-        (
-            Slot {
-                offset: [0.0, -2.0, 0.0],
-                ..slot(SKIP_CHECKS)
-            },
-            0,
-            "0x455070",
-        ),
-        (slot(SKIP_CHECKS), 1, "0x454c7a"),
-    ];
-    for (entry, flags, address) in cases {
-        let (mut fx, me) = snapper(SKIP_CHECKS);
-        fx.lamp_mut().position = [56, 24, 1];
-        set_slots(&mut fx, vec![entry]);
-        let start = unmoved(&fx, me);
-        let result = snap(&mut fx, me, LAMP as i16, 0, 3, flags);
-        assert!(
-            matches!(trap(result), Trap::Unsupported(ref m) if m.contains(address)),
-            "{address}"
-        );
-        assert_eq!(unmoved(&fx, me), start, "{address}");
-    }
-    // A position further out than the round trip through world units is
-    // known to keep.
     let (mut fx, me) = snapper(SKIP_CHECKS);
-    fx.lamp_mut().position = [0x8001, 24, 1];
-    let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454fb9")));
+    fx.lamp_mut().position = [56, 24, 1];
+    set_slots(&mut fx, vec![slot(SKIP_CHECKS)]);
+    let start = unmoved(&fx, me);
+    let result = snap(&mut fx, me, LAMP as i16, 0, 3, 1);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454c7a")));
+    assert_eq!(unmoved(&fx, me), start);
 }
 
 #[test]

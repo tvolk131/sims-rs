@@ -15,9 +15,10 @@
 //!    plays (+0x1a8 is 6), or a clip that picks something up plays
 //!    (+0x1a4), the person carries something when its first contained
 //!    slot holds an object (0x589fce); then the carry clip is 0, else -1.
-//!    A change clears the carry slot, which holds a layer only while a
-//!    script's carry clip plays and so is empty here, and a change to
-//!    clip 0 starts its clip (0x26), which is not ported.
+//!    A change clears the carry slot at once, and a change to clip 0
+//!    starts the posture's clip 0x26 there, forward, to stop at its end,
+//!    at priority 10 ([`Interpreter::start_carry`]). The layer is updated
+//!    with the skin's others in the tail.
 //! 4. The base layer is brought up to date (virtual function 0x58,
 //!    0x590430): a posture other than the one it was started for clears
 //!    it; then, unless the definition's word 102 has bit 2 set, or the
@@ -46,7 +47,9 @@
 //!    2). Any other state, and an animator in state 3 that has to turn or
 //!    walk, is not ported.
 //! 8. The tail: the skin's layers are updated once at the clock, in the
-//!    skin's order ([`Animator::carry_first`]; 0x5992b3, from 0x5a0ef5 or
+//!    skin's order: by priority, which a changed skin sorts its layers by
+//!    first (0x5991fd), then [`Animator::carry_first`] (0x5992b3, from
+//!    0x5a0ef5 or
 //!    from 0x58f8bf: the second call finds the skin updated at the same
 //!    clock and does nothing), the animator places
 //!    itself if it has not, and the head takes its step, measures where
@@ -72,7 +75,7 @@ use crate::people::read_appearance_if_stale;
 use crate::placement::{Place, on_lot, pool_tile};
 use sims_core::{Ext, F32};
 use sims_sim::World;
-use sims_sim::animator::{Animator, EPSILON, LOADED, Layer, UNSET};
+use sims_sim::animator::{Animator, Base, EPSILON, LOADED, Layer, UNSET};
 use sims_sim::pose;
 use std::cmp::Ordering;
 
@@ -142,20 +145,14 @@ impl Interpreter<'_> {
                 }
             }
             if next != a.carry_selection {
-                // A change clears the carry slot (virtual function 0x104),
-                // which holds a layer only while a script's carry clip
-                // plays, with the carry mode 6.
-                if a.carry.is_some() {
-                    return Err(Trap::Invalid(
-                        "the carry slot holds a layer while the carry mode is not 6".into(),
-                    ));
+                // A change clears the carry slot (virtual function 0x104,
+                // 0x592878: at once, which marks the skin's layers
+                // changed).
+                if a.carry.take().is_some() {
+                    a.skin_dirty = true;
                 }
                 if next == 0 {
-                    return Err(Trap::Unsupported(
-                        "a person starts carrying: its carry clip (0x26, 0x5903fc) is not \
-                         ported"
-                            .into(),
-                    ));
+                    self.start_carry(world, id, &mut a, now)?;
                 }
                 a.carry_selection = next;
             }
@@ -187,9 +184,21 @@ impl Interpreter<'_> {
 
         // 0x5992b3: the skin's update.
         if a.skin_dirty || now != a.skin_clock {
+            // 0x5991fd: a changed skin first sorts its layers by priority,
+            // lowest first, keeping the order of layers of the same
+            // priority. Every change marks the skin changed, so the layers
+            // are always in that order when they update: the list's own
+            // order (Animator::carry_first) decides only a tie.
+            let carry_first = match (&a.carry, &a.foreground) {
+                (Some(carry), Some(foreground)) => match carry.priority.cmp(&foreground.priority) {
+                    Ordering::Less => true,
+                    Ordering::Greater => false,
+                    Ordering::Equal => a.carry_first,
+                },
+                _ => a.carry_first,
+            };
             a.skin_dirty = false;
-            // The layers in the skin's order (Animator::carry_first).
-            if a.carry_first {
+            if carry_first {
                 self.update_carry(world, id, &mut a, now)?;
                 self.update_foreground(world, id, &mut a, now)?;
             } else {
@@ -311,6 +320,8 @@ const SPECIAL: usize = 64;
 /// The posture clip whose distance gives the walk's look-ahead (0x58831d,
 /// virtual function 0x120 with 0x14).
 const WALK: usize = 0x14;
+/// The posture clip the animator carries with (0x5903fe).
+const CARRY: usize = 0x26;
 /// The largest turn made walking, for a person of kind above 1
 /// (0x667454); otherwise it is 2 (0x6d07b4).
 const SMALL_TURN: F32 = F32::from_bits(0x3f4c_cccd);
@@ -513,13 +524,17 @@ impl Interpreter<'_> {
             .data;
         let posture = i32::from(words.get(POSTURE).copied().unwrap_or(0));
         let kind = words.get(KIND).copied().unwrap_or(0);
-        if a.posture != posture && a.base {
+        if a.posture != posture && a.base.is_filled() {
             // 0x592878 removes the base slot's layer at once (0x5a0a7b),
-            // which marks the skin's layers changed (0x5991d4).
-            a.base = false;
+            // which marks the skin's layers changed (0x5991d4). A clip
+            // Animate Sim put there goes the same way.
+            a.base = Base::Empty;
             a.skin_dirty = true;
         }
-        if flags & 4 == 0 && !(a.base && kind <= 1) {
+        // A layer in the slot stays for a person of kind at most 1,
+        // whoever started it; for any other kind the posture's clip
+        // replaces it, a clip Animate Sim put there included.
+        if flags & 4 == 0 && !(a.base.is_filled() && kind <= 1) {
             a.posture = posture;
             if let Some(selection) = base_selection(posture) {
                 read_appearance_if_stale(world, self.program, id, &mut a.profile_stale)?;
@@ -530,9 +545,10 @@ impl Interpreter<'_> {
                 if posture != 0 {
                     self.check_base_clip(world, id, posture, selection)?;
                 }
-                // 0x592726 empties the slot first (it is empty here) and
-                // adds the new layer to the skin.
-                a.base = true;
+                // 0x592726 empties the slot first (0x592878, at once) and
+                // adds the new layer to the skin; either marks the skin's
+                // layers changed.
+                a.base = Base::Posture;
                 a.skin_dirty = true;
             }
         }
@@ -586,7 +602,8 @@ impl Interpreter<'_> {
     /// become 2, 0x58f135) and stops walking ([`Animator::walking`] and
     /// +0x24, +0x28 and +0x290 cleared, 0x58f117), or, with any other
     /// route result, follows the route (state 9). One arrived that has to
-    /// turn starts a turn (0x58df01).
+    /// turn starts a turn, or turns at once by less than a step (0x58df01,
+    /// [`Interpreter::start_turn`]).
     fn stand(&self, world: &mut World, id: u16, a: &mut Animator, now: i32) -> Result<Next, Trap> {
         a.destination[2] = wrap(a.destination[2]);
         a.position[2] = wrap(a.position[2]);
@@ -613,12 +630,11 @@ impl Interpreter<'_> {
                 "in state 3 walks to its destination",
             ));
         }
-        self.start_turn(world, id, a, now)?;
-        Ok(Next::Done)
+        self.start_turn(world, id, a, now)
     }
 
-    /// The start of a turn on the spot (0x58df01 to 0x58f5f9), for a turn
-    /// of at least a step either way.
+    /// The start of a turn on the spot (0x58df01 to 0x58f5f9), for an
+    /// animator that has arrived.
     ///
     /// The turn d is the destination's direction less the position's, put
     /// into -4 to 4 by whole turns (0x58e013 to 0x58e041). The smallest
@@ -640,6 +656,21 @@ impl Interpreter<'_> {
     /// A bound belongs to the row nearer 0 (-1.5 and 1.5 to the rows of
     /// clips 9 and 8, -0.5 and 0.5 to clip 10).
     ///
+    /// A turn of less than a step either way is made at once (0x58dfc0).
+    /// The distance to the destination, 0 for an animator that has
+    /// arrived (0x58df1a), is below 0.5 (0x6d07e4), so the animator is put
+    /// at its destination (0x58dfcf): the position takes the
+    /// destination's two coordinates, and the direction takes the
+    /// destination's (virtual function 0xd0, 0x58488b), which goes to
+    /// object data word 1 (0x5920e8, [`direction_word`]). The state stays
+    /// 3 and its code runs again (0x58f089), which finds the animator
+    /// arrived and facing its destination's direction
+    /// ([`Interpreter::stand`]). No clip plays. The original also sets
+    /// global 0x6f6d64 to 4, which is not kept. Only an animator that has
+    /// not arrived can be 0.5 or more away. It would take a step by
+    /// heading (0x58f312) or turn with a clip (0x58f4ee), and its state 3
+    /// fails at 0x58df1e.
+    ///
     /// The turn is noted (+0x1f0, the clip's turn +0x1f4, the destination
     /// +0x1dc to +0x1e4, the position +0x1d0 to +0x1d8); the destination's
     /// direction becomes the position's plus d less the clip's turn; the
@@ -647,17 +678,16 @@ impl Interpreter<'_> {
     /// and priority 5 (0x59867f), and the animator turns (state 4). The
     /// original also sets global 0x6f6d6c to 2, which is not kept.
     ///
-    /// Fails for what is not ported: a turn of less than a step
-    /// (0x58dfc0), a person of kind above 1, whose bounds are scaled
-    /// (0x58df72), and a turn that is not a number, for which the original
-    /// would loop forever (0x58e039).
+    /// Fails for what is not ported: a person of kind above 1, whose
+    /// bounds are scaled (0x58df72), and a turn that is not a number, for
+    /// which the original would loop forever (0x58e039).
     fn start_turn(
         &self,
         world: &mut World,
         id: u16,
         a: &mut Animator,
         now: i32,
-    ) -> Result<(), Trap> {
+    ) -> Result<Next, Trap> {
         let eight = EIGHT.ext();
         let mut d = (a.destination[2].ext() - a.position[2].ext()).single();
         if d.is_nan() {
@@ -674,7 +704,12 @@ impl Interpreter<'_> {
             return Err(unsupported("0x58df72", "turns a person of kind above 1"));
         }
         if d < step && d > (-step).single() {
-            return Err(unsupported("0x58dfc0", "turns by less than a step"));
+            // 0x58dfc0: arrived, so 0 away, below 0.5 (0x6d07e4).
+            a.position[0] = a.destination[0];
+            a.position[1] = a.destination[1];
+            a.position[2] = a.destination[2];
+            set_datum(world, id, DIRECTION, direction_word(a.position[2]))?;
+            return Ok(Next::Again);
         }
         let [half, one_and_half, three] = [TURN_HALF, TURN_ONE_AND_HALF, THREE].map(F32::ext);
         let (selection, clip_turn) = if !at_least(d, (-three).single()) {
@@ -712,7 +747,7 @@ impl Interpreter<'_> {
         layer.priority = 5;
         a.skin_dirty = true;
         a.state = 4;
-        Ok(())
+        Ok(Next::Done)
     }
 
     /// Plays one of the posture's clips in the foreground (virtual
@@ -780,6 +815,55 @@ impl Interpreter<'_> {
         a.foreground = Some(layer);
         // A new layer goes in before the carry layer (priority 10).
         a.carry_first = false;
+        Ok(())
+    }
+
+    /// Starts the animator's own carry clip in the carry slot, the slot
+    /// already empty (0x5903fc to 0x590421). The posture's clip 0x26 is
+    /// looked up (virtual function 0xf4, 0x592625, which first reads the
+    /// person's appearance again if the animator says so) and started in
+    /// the slot (virtual function 0x100, 0x592726) at the clock, forward,
+    /// at speed 1, to stop at its end (end mode 0, 0x592823): made at
+    /// priority 1, it goes in before the first layer of the skin whose
+    /// priority is above that (0x599128). Then it takes priority 10
+    /// (0x59867f), which marks the skin's layers changed. Unlike a
+    /// script's carry clip, the carry mode stays as the tick set it, so
+    /// the next tick chooses again.
+    ///
+    /// Fails for what is not ported: a clip that is not found. The
+    /// original leaves the slot empty then (0x59040a, or 0x592726 failing
+    /// at 0x59274a) and still notes the carry clip chosen.
+    fn start_carry(
+        &self,
+        world: &mut World,
+        id: u16,
+        a: &mut Animator,
+        now: i32,
+    ) -> Result<(), Trap> {
+        read_appearance_if_stale(world, self.program, id, &mut a.profile_stale)?;
+        let name = self.posture_clip(world, id, CARRY)?.ok_or_else(|| {
+            unsupported(
+                "0x59db2f",
+                &format!("has no name for its carry clip {CARRY:#x}"),
+            )
+        })?;
+        let clip =
+            self.program.animations.clip(&name).map_err(|e| {
+                unsupported("0x59dc32", &format!("finds no carry clip {name:?}: {e}"))
+            })?;
+        let mut layer = Layer::start(
+            &name,
+            F32::from_bits(clip.duration),
+            clip.frames,
+            clip.motions > 0,
+            clip.tracks.len(),
+            false,
+            now,
+        );
+        a.carry_first = a.foreground.as_ref().is_some_and(|l| l.priority > 1);
+        layer.priority = 10;
+        a.skin_dirty = true;
+        a.carry = Some(layer);
         Ok(())
     }
 

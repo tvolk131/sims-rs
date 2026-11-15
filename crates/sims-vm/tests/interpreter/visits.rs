@@ -610,11 +610,17 @@ fn a_person_the_reset_would_do_more_for_stops_its_visit() {
         "{acting}"
     );
     let routing = person(&|p| p.routing_frames = 1);
-    assert!(routing.contains("in the middle of a route"), "{routing}");
+    assert!(
+        routing.contains("whose routing frame count is not 0"),
+        "{routing}"
+    );
     let wide = person(&|p| p.data[73] = 1);
     assert!(wide.contains("whose data word 73 is set"), "{wide}");
     let away = fails(&|object| object.position = [-16, -16, 1]);
-    assert!(away.contains("inside an object or off the lot"), "{away}");
+    assert!(
+        away.contains("off the lot") && away.contains("0x45e977"),
+        "{away}"
+    );
     // Without a neighborhood record, or with one whose revision is below
     // 0, the visit fails before anything else.
     let nobody = lot_fails(&|world| world.neighbors.slots.clear());
@@ -992,4 +998,137 @@ fn a_new_object_can_be_created_off_the_lot_and_run_a_tree_by_name() {
     );
     let text = trap(fx.run()).to_string();
     assert!(text.contains("Create New Object Instance mode 0"), "{text}");
+}
+
+/// A route context of `person` to slot 0 of the lamp.
+fn context(person: u16) -> sims_sim::route::Context {
+    sims_sim::route::Context {
+        candidates: Vec::new(),
+        slot: sims_sim::route::RouteSlot {
+            offset: [0; 3],
+            number: 1,
+            standing: 10,
+            sitting: 0,
+            ground: 0,
+            flags: 0x800,
+            snap_target: -1,
+            proximity: [16; 3],
+            gradient: 0x3e40_0000,
+            facing: -2,
+            resolution: 16,
+        },
+        target: LAMP,
+        person,
+        chosen: 0,
+        best: 100,
+        word_58: 0,
+        time: 0,
+        saved: [0; 2],
+        word_68: 0,
+        start: [56, 56, 1],
+        byte_78: false,
+        objects: [0; 2],
+        byte_84: false,
+        result: 0,
+        word_8c: 0,
+        byte_8e: false,
+        word_94: 0,
+        limit: 8,
+        action: 4,
+    }
+}
+
+#[test]
+fn a_persons_reset_erases_its_route_contexts_and_keeps_its_path() {
+    // 0x45e8aa: the contexts go (0x45fad7); the path (+0xae0) stays.
+    let (mut fx, _) = lot();
+    let people = resident(&mut fx);
+    fx.world.changed_types.insert(RESIDENT);
+    fx.world.routing.routes.insert(
+        PERSON,
+        sims_sim::route::Route {
+            contexts: vec![context(PERSON), context(PERSON)],
+            path: vec![[56, 56], [40, 40]],
+        },
+    );
+    visit_with(&mut fx, PERSON, &people);
+    let route = &fx.world.routing.routes[&PERSON];
+    assert!(route.contexts.is_empty());
+    assert_eq!(route.path, [[56, 56], [40, 40]]);
+}
+
+/// Removes `id` at once (0x44123f), with `people` as the program's.
+fn remove_now(fx: &mut Fixture, id: u16, people: &People) -> Result<(), sims_vm::Fault> {
+    fx.program.people = people.clone();
+    Interpreter::new(&fx.program, &fx.catalog, fx.stream).remove_now(&mut fx.world, id)
+}
+
+#[test]
+fn a_person_removed_at_once_leaves_the_lot_and_every_list_of_it() {
+    let (mut fx, _) = lot();
+    let people = resident(&mut fx);
+    visit_with(&mut fx, PERSON, &people);
+    fx.world.routing.routes.insert(
+        PERSON,
+        sims_sim::route::Route {
+            contexts: vec![context(PERSON)],
+            path: vec![[56, 56]],
+        },
+    );
+    fx.world.routing.unknown_words.insert((PERSON, 37));
+    fx.world
+        .animators
+        .insert(PERSON, sims_sim::animator::LOADED);
+    assert!(fx.world.person_ticks.contains_key(&PERSON));
+    assert_eq!(grid(&fx, [3, 3]), PERSON);
+    assert_eq!(remove_now(&mut fx, PERSON, &people), Ok(()));
+    let world = &fx.world;
+    assert!(!world.objects.contains_key(&PERSON));
+    assert!(!world.people.contains(&PERSON));
+    assert!(!world.order.contains(&PERSON));
+    assert!(!world.animators.contains_key(&PERSON));
+    assert!(!world.routing.routes.contains_key(&PERSON));
+    assert!(!world.person_ticks.contains_key(&PERSON));
+    assert!(world.routing.unknown_words.is_empty());
+    // Off its tile.
+    assert_eq!(grid(&fx, [3, 3]), 0);
+}
+
+#[test]
+fn what_removing_a_person_does_not_port_fails_loudly() {
+    let (mut fx, _) = lot();
+    let people = resident(&mut fx);
+    visit_with(&mut fx, PERSON, &people);
+    let visited = fx.world.clone();
+    let mut fails = |change: &dyn Fn(&mut sims_sim::World)| {
+        fx.world = visited.clone();
+        change(&mut fx.world);
+        let fault = remove_now(&mut fx, PERSON, &people).unwrap_err();
+        assert!(fx.world.objects.contains_key(&PERSON));
+        fault.to_string()
+    };
+    // A last reset the original does more for.
+    let routing = fails(&|w| {
+        let person = w.objects.get_mut(&PERSON).unwrap();
+        person.person.as_mut().unwrap().routing_frames = 1;
+    });
+    assert!(
+        routing.contains("whose routing frame count is not 0"),
+        "{routing}"
+    );
+    // Before the load has worked the lot's rooms out.
+    let early = fails(&|w| w.rooms = Default::default());
+    assert!(early.contains("rooms out"), "{early}");
+    // A person standing on several tiles.
+    let wide = fails(&|w| {
+        w.objects.get_mut(&PERSON).unwrap().multipart = Some(Multipart {
+            offset: [0; 3],
+            group: [0; 3],
+            parent: 0,
+        })
+    });
+    assert!(
+        wide.contains("several tiles") || wide.contains("multi"),
+        "{wide}"
+    );
 }

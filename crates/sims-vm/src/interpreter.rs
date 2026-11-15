@@ -79,6 +79,15 @@ impl From<bool> for Flow {
 /// Runs object scripts against a lot. It holds only what doesn't change
 /// while scripts run: the linked code, the catalog, and the active random
 /// stream.
+/// An action running at once: the person whose queue it was put on, and
+/// the action, which an action queued on that person while it runs is
+/// copied over (0x45d5a5).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AtOnce<'a> {
+    pub person: u16,
+    pub action: &'a RefCell<sims_formats::saved_objects::Interaction>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Interpreter<'a> {
     pub program: &'a Program,
@@ -98,11 +107,16 @@ pub struct Interpreter<'a> {
     /// the making the original appends a person to the person vector is
     /// not read, so a walk of the vector meanwhile is refused.
     pub(crate) making_person: Option<u16>,
-    /// Whether the player's pie menu is being listed (the original's three
-    /// pointers at 0x6e5130, 0x6e50fc and 0x6e50f8 are set), through every
-    /// tree that the listing runs, nested ones included. Add/Change Action
-    /// String reads it.
-    pub(crate) building_menu: bool,
+    /// The pie menu's listing, while it checks an action (the original's
+    /// three pointers at 0x6e5130, 0x6e50fc and 0x6e50f8 are set), through
+    /// every tree the check runs, nested ones included: the action being
+    /// checked, and the entries the check adds to the menu. None
+    /// otherwise. Add/Change Action String reads and writes it.
+    pub(crate) menu: Option<&'a RefCell<crate::orders::Checking>>,
+    /// The person whose queued action runs at once, and that action, while
+    /// its tree runs (the original's 0x6e5298 and 0x6e5294), through every
+    /// tree it runs. None otherwise. See [`Machine::queue_action`].
+    pub(crate) running_at_once: Option<AtOnce<'a>>,
     /// The people in the middle of letting go of an object (object flag
     /// 0x800, [`crate::forget`]), whom a broadcast it sets off skips. None
     /// outside one.
@@ -129,7 +143,8 @@ impl<'a> Interpreter<'a> {
             deleted: None,
             sounds: None,
             making_person: None,
-            building_menu: false,
+            menu: None,
+            running_at_once: None,
             letting_go: None,
         }
     }
@@ -212,7 +227,7 @@ impl<'a> Interpreter<'a> {
             args,
             most,
             budget,
-            &mut None,
+            false,
         )
     }
 
@@ -231,12 +246,12 @@ impl<'a> Interpreter<'a> {
         args: &[i16],
         most: usize,
         budget: usize,
-        advertisements: &mut Option<Advertisements>,
+        checking: bool,
     ) -> Result<bool, Fault> {
         let base = world.objects.get(&object).map_or(0, |o| o.stack.len());
         let mut machine = self.machine(world, object, base, true);
-        machine.advertisements = advertisements.take();
-        let result = run(
+        machine.checking = checking;
+        run(
             &mut machine,
             object,
             owner,
@@ -245,9 +260,7 @@ impl<'a> Interpreter<'a> {
             args,
             most,
             budget,
-        );
-        *advertisements = machine.advertisements.take();
-        result
+        )
     }
 
     pub(crate) fn machine<'w>(
@@ -269,9 +282,10 @@ impl<'a> Interpreter<'a> {
             base,
             synchronous,
             making_person: self.making_person,
-            building_menu: self.building_menu,
+            menu: self.menu,
+            running_at_once: self.running_at_once,
             letting_go: self.letting_go,
-            advertisements: None,
+            checking: false,
         }
     }
 }
@@ -328,20 +342,19 @@ pub(crate) struct Machine<'a, 'w> {
     pub base: usize,
     /// Whether the run must finish without yielding, as a callback does.
     pub synchronous: bool,
-    /// The advertisements Find Best Interaction copies for a check tree
-    /// (the record at [0x6c437c]), which scopes 12, 28 and 29 read and
-    /// write. None outside a check tree.
-    pub advertisements: Option<Advertisements>,
+    /// Whether the run is a check tree Find Best Interaction runs (or a
+    /// tree such a check runs by name), where Add/Change Action String
+    /// names the interaction being checked (0x41f1ae).
+    pub checking: bool,
     /// See [`Interpreter::making_person`].
     pub making_person: Option<u16>,
-    /// See [`Interpreter::building_menu`].
-    pub building_menu: bool,
+    /// See [`Interpreter::menu`].
+    pub menu: Option<&'a RefCell<crate::orders::Checking>>,
+    /// See [`Interpreter::running_at_once`].
+    pub running_at_once: Option<AtOnce<'a>>,
     /// See [`Interpreter::letting_go`].
     pub letting_go: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
 }
-
-/// See [`Machine::advertisements`].
-pub(crate) type Advertisements = [crate::autonomy::Advertisement; crate::autonomy::ADVERTISEMENTS];
 
 impl<'a> Machine<'a, '_> {
     /// An interpreter over the same code, for services that run other
@@ -355,7 +368,8 @@ impl<'a> Machine<'a, '_> {
             deleted: self.deleted,
             sounds: self.sounds,
             making_person: self.making_person,
-            building_menu: self.building_menu,
+            menu: self.menu,
+            running_at_once: self.running_at_once,
             letting_go: self.letting_go,
         }
     }

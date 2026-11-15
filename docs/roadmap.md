@@ -56,8 +56,9 @@ events, and what it asks for after them) come first.
   (#131), the pie menu and picking from it (#132), and Go To Routing
   Slot's parameter and global slots (#134), which a player's snack order
   reached.
-- Strict mode on the Goth house runs to tick 1102, where the animator
-  turns by less than a step (0x58dfc0, not ported). Step 2 starts there.
+- Strict mode on the Goth house runs to tick 2702. At tick 2703 the
+  carpool (object 8) makes the school bus, and the factory for
+  multi-tile objects is not ported. Step 2 starts there.
 
 ## Met goal: a headless lot boot that matches the original
 
@@ -140,7 +141,7 @@ That starting lot is **unverified**; see the decision log.
 | 17 | Set the funds again | `0x4f1ae9`, `0x46d8dc` | Done (`Interpreter::select_resident`) |
 | 18 | Select the family's first member: the Sim's selected mark, the first indicator into the Sim's slot, global 3 | `0x4e97dc`, `0x4e989b`, `0x445449`, `0x44664c` | Done for a lot where nobody is selected and the Sim has no date (`Interpreter::select_resident`) |
 | 19 | Go to live mode: every room waits to be counted, the lot's statistics set global 37, then global 19 becomes 0 | `0x4cea5d`, `0x416534`, `0x416085`, `0x4ce44f` | Done (`Interpreter::go_live`); of the statistics only globals 23 and 37 |
-| 20 | Count the family's friends | `0x427219`, `0x427bd7` | Nothing to do: no state we hold changes |
+| 20 | Count the family's friends | `0x4cfcdb`, `0x427219`, `0x427bd7` | Done (`Interpreter::before_frame`, `World::family_friends`); an empty lot counts nothing (unverified) |
 | 21 | Count the rooms that wait | `0x467094`, `0x466c3c` | Done (`Interpreter::before_frame`) |
 | 22 | The interface's wait check clears global 12 | `0x4764fe` | Done (`Interpreter::before_frame`) |
 
@@ -756,8 +757,11 @@ trace they do not change, but they already hold what the house saved. In
 the trace the three rooms that were counted are marked, global 37 goes
 from 0 to 1, and global 19 from 3 to 0.
 
-**20. Friends.** The family's friends are counted. No state we hold
-changes.
+**20. Friends.** The interface's family panel shows the selected
+family's friend count, which works the count out again: every family's
+count is out of date from the neighborhood's read. In the capture the
+Goth family's count is 0 and up to date, and every other family's is
+out of date, as ours are.
 
 **21. Rooms.** Before it draws a frame the game counts the rooms that
 wait (`0x467094`), as in step 10a. All 11 rooms are counted. The five
@@ -2058,7 +2062,8 @@ through their public interfaces only; the simulation never depends on it.
   play mode does not catch stops it. In play mode the Goths' house runs
   12,000 ticks (ten minutes at normal speed) without stopping, through
   about a dozen different caught errors; in strict mode it stops after
-  tick 1102 (the animator turning by less than a step, 0x58dfc0).
+  tick 2702 (at tick 2703 the carpool makes the school bus, and the
+  factory for multi-tile objects is not ported).
   `--png <file>
   --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
@@ -2091,6 +2096,7 @@ through their public interfaces only; the simulation never depends on it.
   Create New Object Instance mode 4 with flags 0x1 (tree 0x1019 node 1)
   and he is parked ("dropping the frames of a person that is using an
   object"); at tick 20051 his running interaction is still the snack.
+  Without an order, strict mode runs to tick 2702.
 - **Next:** a real pie.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today: the fridge (Add/Change Action

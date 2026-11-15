@@ -90,7 +90,7 @@ pub const LOADED: Animator = Animator {
     destination: [F32::ZERO; 3],
     head_clock: 0,
     posture: -1,
-    base: false,
+    base: Base::Empty,
     pickup: 0,
     carry_mode: 0,
     carry_selection: -1,
@@ -139,8 +139,8 @@ pub struct Animator {
     pub head_clock: i32,
     /// +0x198: the posture the base layer was started for.
     pub posture: i32,
-    /// Whether the base slot (+0x14) holds a layer.
-    pub base: bool,
+    /// What the base slot (+0x14) holds ([`Base`]).
+    pub base: Base,
     /// +0x1a4: set while a clip that picks something up plays, which keeps
     /// the carry selection as it is.
     pub pickup: i32,
@@ -198,8 +198,9 @@ pub struct Animator {
     pub head: Head,
     /// The carry slot (+0x13c): a clip Animate Sim plays there (flag 0x10
     /// alone, 0x589683), repeating at priority 10 while
-    /// [`Animator::carry_mode`] is 6. The carry clip the animator's tick
-    /// chooses (0x5903a3) would start here too; that is not ported.
+    /// [`Animator::carry_mode`] is 6, or the carry clip the animator's
+    /// tick chooses (0x5903a3), the posture's clip 0x26, which stops at
+    /// its end, at priority 10, while the carry selection is 0.
     pub carry: Option<Layer>,
     /// Whether the carry layer comes before the foreground layer in the
     /// skin's list (skin +0x7c), which the skin's update goes through in
@@ -209,9 +210,67 @@ pub struct Animator {
     /// priority 1 and sets its own priority after). So a carry layer goes
     /// before a foreground layer of raised priority (6) and after one of
     /// priority 1, and a new foreground layer always goes before the
-    /// carry layer (priority 10). The base layer, whose clip has no
-    /// events, is left out of this.
+    /// carry layer (priority 10). This is the order the layers were put
+    /// in. Before it updates any layer, a skin whose layers changed sorts
+    /// them by priority, lowest first, keeping the order of layers of the
+    /// same priority (0x5991fd, a bubble sort). Every change marks the
+    /// skin changed, so the layers always update by priority, and this
+    /// order decides only between layers of the same priority. (The
+    /// original's list keeps the sorted order. That differs from this one
+    /// only for layers whose priorities differed at a sort and are the
+    /// same later, which nothing ported makes: foreground layers take
+    /// priority 1, 5 or 6, carry layers 10.) The base layer, whose clip
+    /// has no events, is left out of this.
     pub carry_first: bool,
+}
+
+/// What the base slot (+0x14) holds. Its layer repeats at priority -10
+/// whoever started it. Its clock is not kept beyond a script's start: a
+/// base clip with timed events, which the skin's update would handle
+/// (0x5992b3), fails before it is started, so nothing the simulation
+/// reads depends on it.
+///
+/// Where the layer goes in the skin's list (skin +0x7c) is not kept
+/// either. Every start makes the layer at priority 1 and puts it before
+/// the first layer whose priority is above 1 (0x599128), then gives it
+/// -10 (0x59867f). It may then come before or after the foreground
+/// layer, depending on that layer's priority, and comes before the carry
+/// layer. The skin's update (0x5992b3) first sorts its layers by
+/// priority (0x5991fd), so the base layer updates before the foreground
+/// either way. With no timed events, its place changes nothing that is
+/// handled.
+///
+/// The encoding of `Empty` and `Posture` is that of `false` and `true`,
+/// which this slot was before a script could fill it, so states and
+/// snapshots that hold neither of the others encode as they did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Base {
+    /// The slot is empty.
+    Empty,
+    /// The clip of the posture [`Animator::posture`] names, which the
+    /// animator's base update starts (virtual function 0x58, 0x590430).
+    Posture,
+    /// A clip Animate Sim started there (flag 0x01 alone, 0x58957e),
+    /// backward when `reverse` is set. The base update leaves it until the
+    /// person's posture changes, or replaces it with the posture's clip
+    /// for a person of kind (word 65) above 1.
+    Script {
+        /// The clip's name.
+        clip: String,
+        /// Whether the clip plays backward (speed -1, from the end).
+        reverse: bool,
+        /// The animator's clock when the clip started, which the layer's
+        /// clock starts at, with its phase 0, or 1 backward (0x597a88,
+        /// 0x59281b). Only drawing reads it.
+        start: i32,
+    },
+}
+
+impl Base {
+    /// Whether the slot holds a layer.
+    pub fn is_filled(&self) -> bool {
+        !matches!(self, Base::Empty)
+    }
 }
 
 /// What the animator keeps while it follows a route (states 3 to 10):
@@ -681,6 +740,22 @@ pub enum Advance {
 }
 
 impl Animator {
+    /// Whether what the animator is doing may be stopped for an interrupt
+    /// (virtual function 0x30, 0x589ead), by its state (+0x190): while it
+    /// plays a script's clip (0) or in states 9 and 10, whatever the
+    /// foreground layer (+0xc) says at +0x68, or yes with none; in states
+    /// 1 to 3, yes; in any other, no.
+    pub fn interruptible(&self) -> bool {
+        match self.state {
+            0 | 9 | 10 => self
+                .foreground
+                .as_ref()
+                .is_none_or(|layer| layer.interruptible != 0),
+            1..=3 => true,
+            _ => false,
+        }
+    }
+
     /// A new animator (0x587d2c, after its base 0x58464f), made with its
     /// person, at clock `clock` (the clock when the person is made,
     /// 0x585483).
@@ -721,19 +796,21 @@ impl Animator {
     ///   holds 0 in the memory image of a running game.
     /// - The event queue is emptied and nothing plays (+0xa0).
     ///
+    /// - A route result (+0x188) that is not 0 stops the route
+    ///   (0x5892dd, calling 0x589e2d) and becomes 0 (0x5892e4). The stop
+    ///   comes after the position was unset, so for a result other than 1
+    ///   or -1 the destination becomes the unset position too (0x589e5d).
+    ///   Its other writes (the segment -1, the timer of a stop 0, the
+    ///   state 3) the reset makes anyway. For 1 or -1, a route under way,
+    ///   the stop only sets +0x284, which is not kept. It also sets +0x18c
+    ///   and global 0x6f6d68, which nothing ported reads.
+    ///
     /// The speed, its target, the clocks, the pickup flag, the count of
     /// events seen and the slow and follow flags stay as they are.
     ///
-    /// Fails for what is not ported: a route result other than 0 (0x589e2d
-    /// then ends the route) and a foreground clip, whose removal can fade
-    /// it out through the blend slot (0x592887).
+    /// Fails for what is not ported: a foreground clip, whose removal can
+    /// fade it out through the blend slot (0x592887).
     pub fn reset(&mut self) -> Result<(), String> {
-        if self.arrival != 0 {
-            return Err(format!(
-                "resetting an animator whose route ended with {} (0x589e2d) is not ported",
-                self.arrival
-            ));
-        }
         if let Some(layer) = &self.foreground {
             return Err(format!(
                 "resetting an animator that plays the clip {:?}: removing it (0x592878) can \
@@ -746,6 +823,12 @@ impl Animator {
         self.motion.near_end = 0;
         self.motion.finishing = 0;
         self.motion.timer = 0;
+        if self.arrival != 0 {
+            if !matches!(self.arrival, 1 | -1) {
+                self.destination = self.position;
+            }
+            self.arrival = 0;
+        }
         self.posture = -1;
         self.carry_selection = -1;
         self.promote = true;
@@ -754,8 +837,8 @@ impl Animator {
         self.walking = false;
         self.profile_stale = true;
         self.selection = -1;
-        if self.base {
-            self.base = false;
+        if self.base.is_filled() {
+            self.base = Base::Empty;
             self.skin_dirty = true;
         }
         if self.carry.take().is_some() {

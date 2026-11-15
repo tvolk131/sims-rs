@@ -36,6 +36,879 @@ player. The original does it on the lot in single player, and #138 made
 settled there. Reopen when multiplayer lists menus, or when a recording
 shows a listing at another moment.
 
+## 2026-11-15: A person is taken off the lot and deleted; Snap turns a slot's offset; Create mode 6 takes flag 0x20
+
+**Unverified.** No capture covers any of it. The Goth captures end at
+update 1000; the removal is at tick 1104, the turned Snap at 2515 and
+the new Create at 2703. Strict mode's output for ticks 1 to 1102 is
+unchanged line for line, hash 9b09ff4f… included, and the K=1000 pins
+are unchanged.
+
+**Who leaves.** Person 259 is the traveling salesman
+(`npc_travelingsalesman`, GUID 0x44A86A6C, neighborhood record 301).
+Object 382 makes him at the pedestrian portal in tick 6. At tick 1104 he
+walks to the portal and removes himself (global tree 0x0176: Go To
+Relative Position, then Remove Object Instance on himself, node 27).
+
+**Taking a person off the lot** (virtual function 0x50 with 1, 0x433125,
+shared by the person's vtable 0x667378 with an object's) is the one-tile
+take-off an object gets, plus one call: the person's animator (virtual
+function 0x2c, 0x4594de) is refreshed (its function 0x54 with 1,
+0x58da12). The refresh returns at once unless animator byte +0x109 is
+set (0x58da2c), which is whether the house view's last draw found the
+person on screen (0x590b8b). That is presentation and not kept, and the
+animator's tick writes it too. It is not always set for a drawn person:
+in the captures the salesman has 1 at update 900 and 0 at updates 950
+to 1000. We take the "not drawn" branch, which is **unverified**. When
+it is set, the head's step (0x590768) advances the head's clock and
+counts person word 45 down, which a script can read. So only the cases
+where that cannot be read first are taken:
+
+- Remove Object Instance takes a person only when it removes itself and
+  yields (not with flag bit 0, not in a synchronous tree). Its own tick
+  follows at once and runs the head's step at the same clock, and the
+  removal at the end of the update destroys it.
+- Removal at once (0x44123f, which the end of the update also runs for
+  the queued person, refreshing it a second time) deletes the person
+  right after, so only the deletion's last reset could read what the
+  refresh wrote. That it does not is **unverified**.
+
+Every other way of taking a person off fails loudly, naming 0x58da12.
+Whether the head's step done twice at one clock (refresh, then tick)
+counts word 45 down once or twice is not read; a reader before the end
+of the update is the only way to tell. What could still differ is also
+read by a head looking at the queued person (0x59293d) or by a person
+still queued after a partial pass, and both fail loudly.
+
+**Deleting a person** (0x440eeb) runs in this order:
+
+1. It gives up the interface events (0x444bc8).
+2. A selected person would be deselected (0x445449), which is not
+   ported and fails.
+3. Every person lets go of it (0x444306).
+4. Its last reset runs (virtual function 0x38, 0x45e791) with the
+   deletion mark (object flag 0x40). The mark skips the move back onto
+   the lot (0x45e95d). The reset also erases the person's route
+   contexts (0x45e8aa, 0x45fad7) and keeps its path. That erase holds
+   for every person reset, which before failed on any context.
+5. Each object it holds is removed at once (0x441196).
+6. Its sounds stop, and it leaves the object list and its type's
+   instance list (0x44383c). The person's destructor (0x459511) frees
+   the route, the animator, the uses, the contexts, the path and the
+   queue. So the World drops its animator, route, tick state and unknown
+   data words, and the lot's list of people loses it.
+
+The deletion writes no neighborhood record, relationship, family or
+room. Other objects' frames and relationships that name the ID keep it,
+as in the original. The animator's reset now stops a route
+(0x5892dd → 0x589e2d, result to 0 at 0x5892e4). For a result other than
+1 or -1, the destination becomes the unset position (0x589e5d). A
+removal before the load has worked out the lot's rooms, a person with
+a routing frame count, and a person on several tiles all fail loudly.
+A removed person's room keeps its occupied mark, which is the
+original's behaviour. Create mode 8's removal of a new person that does
+not fit now goes through the same path and takes the false branch.
+
+**Snap with an offset** (0x454b93 to 0x454c54) works in world units:
+
+1. The object's position becomes `[3/16 x, 0, 3/16 y]` (0x454f5c).
+2. The slot's offset becomes `[3/16 o1, 0, 3/16 o0]` (0x454ecc).
+3. The offset is turned by the matrix of the raw facing word (0x455070,
+   0x5c3a20 axis 1; 0x5c4510 with every term in the original's order).
+4. Each turned coordinate is added to the position and stored.
+5. The sums are rounded back half away from zero (0x454fb9).
+
+The cosine and sine come from libm, with the caveat `Ext::cos` already
+gives. Routing slots use the same helpers. The bound on how far out a
+position may be is gone, since the round trip is now computed.
+
+**Create New Object Instance mode 6 with flag 0x20** turns the new
+object to the stack object's facing with bit 0 cleared (0x44e640). This
+is mode 8's code, shared. A turn (0x433f75) still fails. Mode 6 never
+places the object (0x44e72c). Mode 6 making a person now fails loudly
+at 0x44e60e, where before it would have skipped the person's traits.
+
+**On Goth.** Strict mode runs through tick 2702, hash 8b89f19d….
+
+- At tick 1104 the salesman is removed (hash at 1103:
+  1849f00c…).
+- At tick 2515 object 21's Snap (tree 0x2018) turns its slot's offset.
+- At tick 2703 the carpool (object 8, tree 0x1017 node 4) makes the
+  school bus (GUID 0x50AC15BF), a multi-tile object, and the factory
+  for multi-tile objects is not ported. That is big, so strict mode
+  stops there.
+
+The snack order removes 259 at step 1104 and stops at the same school
+bus at step 2703 (tick 91146).
+
+After the Goth social (the pie-menu run in `boot.rs`), the salesman
+leaves at tick 597 while his animator plays "A2O-door-knock". The reset
+that deletes him would remove that clip, which can fade it out
+(0x592878), and that run stops there.
+
+## 2026-11-15: A headline icon keeps its priority and duration; the social ends
+
+**Unverified.** No captured update shows a headline: the Goth captures
+stop before the social. The port is read from the original's code.
+
+Set Balloon/Headline (0x44b724) now shows an icon, kind 6 among them.
+It touches only the object's first headline record (object +0x148,
+0x3c bytes each), so only one per object matters. The priority is 2 for
+kind 4 and 1 otherwise. A record still showing with a higher priority
+is left alone; otherwise its priority (+0x34) is written first, even
+when the call then ends without showing anything. A duration of 0
+clears it (0x46e042). Otherwise, from 0x44b7ed:
+
+- The index is byte 2, plus my temp 0 (object +0x3a) with option bit
+  12. Kind 7 is a catalog picture (0x44b811) and still fails loudly.
+- The sprite is the kind's first sprite plus the index (the table at
+  0x6c1f98, 0x416a0c): kind 6 is 600 and up. Kind 0 has its own table
+  (0x666758), and kinds above 10 have none. No sprite ends the call.
+- The frame count is the sprite's, from the headline sprite cache
+  ([0x6f0c08], made at 0x4144c4 from `GameData/Sprites.iff`), divided
+  by three (0x46dfb5). If that is 0 the call ends.
+- The duration is kept as given, -1 included. With option bit 11 it is
+  multiplied by the frame count and by 12 (0x46e050).
+- The object is redrawn (0x434101, presentation) and woken (0x44574b).
+
+The sprite cache (0x4c8e0d) looks up an SPR# and then an SPR2 of the
+ID as resources (live chunks of the default variant, through the
+resource map when there is one), not the file's raw chunks. The count it
+hands on (0x4c8deb) is 0 below version 500, halved for versions 501 and
+503, and divided by five for 506 (0x4c154e). `sims_vm::icon_frames`
+reads every count once at boot into `Program::icon_frames`. An SPR#
+header is swapped by the resource layer's callback (0x4c8f63) unless the
+resource's conversion flag 0x10 is set (0x41d3a7): big-endian without
+it, little-endian with it. We read the flag from the chunk header;
+whether a resource map's entry can carry different flags is
+**unverified**. All 195 SPR# in Sprites.iff have flags 0 and read
+big-endian.
+
+What the simulation reads of the record is kept in `World::headlines`
+(appended; snapshot format 24): priority and duration, while the
+duration is not 0. Its readers are:
+
+- Sleep's passive test (0x44aa57), which needs no showing headline.
+- The tail of an object's tick (0x4521f7 → 0x46e004), which counts a
+  positive duration down.
+- A person's reset (0x45e8af) and the destructor (0x4323ce), which
+  clear it.
+
+The sprite, the animation frame, the backdrop, the overlay and the
+flag (+0x14 to +0x28, +0x2c, +0x30, +0x38) are only drawn and are left
+out. That the drawn bounds (0x437ce8, 0x45a07b) feed nothing the
+simulation reads is **unverified**.
+
+Two small stops after it are ported too:
+
+- **set_action with person word 73 set** (0x45e756): the word is
+  cleared and the person's footprint worked out again, 0x433d16 with
+  +0xf4 and +0x100. This is the same call Generic Sims Call routine 15
+  makes (0x44fe9e), so it reuses that port. A facing the footprint does
+  not handle fails before the action changes.
+- **Go To Routing Slot, wanting to be interrupted** (0x45b18b, the
+  test before the search for places): if the animator may stop
+  (virtual function 0x30, 0x589ead), the route fails with result 4.
+  The animator may stop in states 1 to 3; in states 0, 9 and 10 the
+  foreground layer's +0x68 decides, or it may with none; in any other
+  state it may not (`Animator::interruptible`). The same test at a
+  door, on the way and while waiting (0x45afd2, 0x45b2c2, 0x45b480)
+  still fails loudly.
+
+Strict mode: through tick 1102 every line of `sims boot` matches main
+except the final hash, now
+3b539cc1f0cfddbfdc8e12a0e864e90528333317095306cf9463c9b7de5a6f1e. The
+headlines stay empty in all those ticks. An empty map encodes as one 0
+byte, and the encoding without that byte digests to the old
+9b09ff4f78d81be329ef6d64a062bd6d1e4f72a530b977a3df83c57220cf5b18. The
+tick-33 pin is re-pinned at format 24; its format 23 and 22 digests are
+the old pins. The K=1000 tick pins in `resize.rs` hold unchanged.
+
+**On Goth.** At tick 261 tree 0x200e shows "+ " (kind 6, index 16:
+sprite 616, 9 frames, so 3) over person 21 for 100 ticks, and at tick
+262 over person 16. The social ends at tick 264: word 73 is cleared and
+the footprint worked out again. Both icons count down and stop showing
+by tick 361. The lot then runs to tick 597, where person 259 (GUID
+0x44A8C46C) fails its route with result 4 because it
+wants to be interrupted. Tree 0x0176 node 27 then takes it off the lot,
+which is not ported. That is where the next port starts.
+
+The old prototype's `headline.rs` agrees on the kept fields and the
+countdown. Reopen if a capture shows a headline's duration counting
+differently, a drawn bound reaching the simulation, or a resource
+map whose SPR# entry has flags other than its chunk's.
+
+## 2026-11-15: A turn of less than a step is made at once; Run Functional Tree's flag names the action's icon; Find Location For mode 1
+
+**Unverified.** No capture covers any of the three. In the Goth captures
+(updates 1 to 1000) no person ends an update in state 3 short of its
+destination's direction, and no direction moves by less than a step
+without a turn clip.
+
+**The small turn.** State 3 compares the turn d with the step (a quarter
+over the speed) and then the distance to the destination (0x58dfc0). An
+animator that has arrived is 0 away (0x58df1a). Below 0.5 (0x6d07e4) the
+animator is put at its destination at once (0x58dfcf): the position
+takes the destination's two coordinates, the direction the destination's
+(virtual function 0xd0, 0x58488b), and data word 1 the direction
+(0x5920e8). Then state 3 runs again (0x58f089), which finds it arrived and
+aligned. No clip plays. Global 0x6f6d64 becomes 4, which is not kept.
+
+The step clip by heading (0x58f312, the jump table at 0x58fad6) and the
+clip turn with a distance (0x58f4ee) come only after an animator that has
+not arrived. From 0.5 up to 3.1 (0x6d07b0) away it takes the step, and
+from 3.1 up it turns with a clip. State 3 short of its destination still
+fails at 0x58df1e, so neither is reachable and neither is ported.
+
+**Run Functional Tree's flag.** The person's virtual function 0x34
+(0x45e59b) takes a flag as its fourth argument. With it set, the object
+becomes person +0xa54, the icon of the running action at +0xa48
+(0x45e5d4). The use entry keeps the flag (entry +8). When a use ends with
+its frame (0x45e64c), each entry with the flag, first to last, writes its
+object there again (0x45e65d to 0x45e665), so the last one's stays. An
+entry ended by a shallower return writes nothing (0x45e678). Of the
+ported callers only Run Functional Tree passes a flag. Run Tree By Name,
+Idle For Input (0x45dca2), Gosub Found Action (0x45a920) and the route's
+pushes pass 0.
+
+**Find Location For mode 1** (0x44b519 to 0x44b565) takes the stack object
+off the lot: its virtual function 0x50 with 1, as the removal queue
+calls it, then the true branch. A tile of a group (definition +0x14 set)
+is first tested with 0x42344e and may go to 0x42346a. That is not
+decoded, so it fails loudly, as Remove Object Instance does.
+
+**On Goth.** In the snack order Mortimer's animator is 5.7e-6 short of its
+direction at step 836 (tick 89279) and faces it at once. At step 1035 his
+tree 0x1050 runs object 121's function with flag 1, and object 121
+becomes his action's icon. At step 1088 his tree 0x1002 takes the snack
+(object 263, in his hand) off the lot. Person 259 makes a small turn at
+step 1103 (-0.025). At step 1104 (tick 89547) it removes itself (Remove
+Object Instance in tree 0x0176), and taking a person off the lot (the
+person's virtual function 0x50) is not ported. That is big, so the order stops
+there.
+
+Strict mode on the Goth house gives the same output for 1102 ticks. It
+now runs through tick 1103 (person 259's small turn) and stops at tick
+1104 on the same removal. The K=1000 pins are unchanged.
+
+## 2026-11-15: Scope 24 reads neighbor fields; field 9 is the family friend count, cached in the family
+
+**Partly verified** (the load's count and the threshold, against the
+capture of the Goth house's first tick; the reads during the social pick
+are **unverified**).
+
+Scope 24, "neighbor in stack object" (0x453389), hands the stack object
+and the field to the neighborhood's 0x425b5d. That finds the record by
+its place plus one (0x4256f4), as scope 32 and Set To Next do. No
+record gives 0 for every field, where scope 32 throws 0x37. The field
+switch (0x425d41) has ten cases; above 9, or negative (compared
+unsigned), is 0. The value has no word pointer: with write intent the
+caller's pointer is cleared (0x425b8e), so a write is native 0x13 after
+the field is read.
+
+- **2** is person data word 58 (+0xe8); **3** and **4** are 0.
+- **6** walks the families (neighborhood +0x154) for the first whose
+  members (+0x12c, 0x4101f2) hold the record's GUID, and gives its house
+  (+0x110), whatever the record's word 61 says.
+- **9** finds the first family whose ID (+0x10c) is word 61 (0 gives 0)
+  and, with or without a house (0x425cfa does not read +0x110; the house
+  checks are fields 7 and 8's), returns 0x410260 → 0x427219: the
+  family's cached count (+0x120), worked out again first by 0x427bd7
+  when the stale byte (+0x124) is set.
+- **0**, **1** and **5** read the record's +8 (a pointer to the person's
+  type data: 0x423f30 reads +0xb4 from it, 0x4572af +0x60). **7** and
+  **8** read the family's flags (+0x138), whose bit 1 the statistics
+  pass rewrites (0x4160f9), which is not ported. All five fail loudly,
+  naming their address.
+
+The count (0x427bd7) walks the records in slot order. It skips a record
+whose GUID is a member's, or whose word 61 is 0. For each member GUID it
+takes the first record of that GUID (0x42571f, none for GUID 0). The
+record counts once, at the first member it is friends with both ways
+(0x4271c5: each has a row for the other with at least one value, and
+both first values are at least the friendship threshold), if its kind
+(word 65) is at most 1. The threshold is 0x6c4398: the autonomy tuning's
+"friendship threshold" (default 25.0), stored truncated (`__ftol`,
+0x459120). The capture holds 50 there, and our tuning reads 50. Then the
+stale byte is cleared and the count stored.
+
+The family's constructor (0x41003c) sets the stale byte. The FAMI reader
+(0x4104ce) stores the saved count but leaves the byte. It is set again
+only by 0x4246b9, which a relationship write calls for both records
+(0x44485b): it marks the record (+0x24) and the first family whose ID is
+the record's word 61. (Family moves, 0x425f66 and 0x42601e, set it too.
+They are reached only from Generic Sims Call routines that are not
+ported, and from the interface.) The count is not a function of the
+current state: a change to anything else it reads (word 61, word 65, a
+GUID, membership) leaves the old count until a relationship write marks
+the family.
+
+So the World now keeps the families (`World::families`, appended;
+snapshot format 23): ID, house, members, count and stale flag, in the
+reload's order. The members are filtered to GUIDs some record has, as
+the reload's first step already said. Budget, number, flags and the rest
+of the record are not kept, since nothing ported reads them. The
+relationship write now marks the family, which the earlier port left
+out.
+
+Load step 20 is the interface's family panel (0x4cfcdb) showing the
+count, so the load works out the selected family's (global 9) count.
+In the capture at the first tick the Goth family (5) has count 0 and is
+up to date, and the other 25 families have the file's 0 and are out of
+date. Our state matches, and `resize.rs` pins it. For an empty lot
+nothing is counted (unverified).
+
+**The panel's redraw.** The panel shows the count again whenever the
+game updates its windows. The redraw is slot +0x17c of the
+`cWinViewControl` vtable at 0x66f220 (stored at 0x66f39c), 0x53a01f,
+which the generic window update 0x5dce19 calls at 0x5dd0de. It builds
+the label through 0x4cfcdb → 0x410260 → 0x427219, which works the count
+out again if it is out of date. The game updates its windows as it
+handles its messages: between lot updates, and inside the pump that
+waits for a dialog that stops the game (0x436da0 → 0x4f6b95 →
+0x5dab4b). So `Interpreter::refresh_family_panel` counts the selected
+family again after each of `Lot`'s lot updates and as the registry
+shows each such dialog.
+
+This matters for more than the stale flag. A count is cached until a
+relationship write marks the family, and a relationship read makes
+missing rows (zero values) without marking it. With a threshold of 0, a
+write, then a redraw that counts 0, then a read that makes rows, then a
+read of field 9 gives the cached 0 in the original, where a family left
+out of date would count 1. A test covers the cache across a redraw.
+
+**Partly verified.** In all 608 captured updates of the Goth house,
+family 5 is up to date after the update; only update 2 changes
+relationships (record 32's row for 34, from [50] to [50, 0, 50], which
+marks family 5), and update 2 shows a dialog. The snapshots do not show
+which redraw cleared the mark. Whether the window update redraws the
+panel on every pass, or only when the panel is marked, is
+**unverified**. Redrawing more or less often differs only when a
+relationship write and a read of field 9 fall between the same two
+redraws while something else the count reads changes. The tick pins
+leave the families out, so they are unaffected.
+
+Strict mode: through tick 1102 every line of `sims boot` matches main
+except the final hash. That hash covers the new families field; without
+it the state equals main's. The tick-33 pin shows the same: its format
+22 digest is the old pin. The K=1000 tick pins in `resize.rs` hold
+unchanged.
+
+**On Goth.** The social pick reads field 9 at tick 261 for record 34
+(word 61 = 5, the Goths). The social's relationship writes to records
+32 to 34 had marked family 5 again, so it counts again: 0. The social
+then stops in the same tick on object 21, tree 0x200e node 21: Set
+Balloon/Headline with an icon of kind 6 (0x44b7ed), which is not
+ported.
+
+The old prototype's `family_friends.rs` agreed on the count, the cache
+and the marks. It also kept the family flags and a per-family dirty
+plan. Reopen if a capture of a relationship write shows the family's
+stale byte untouched, or a capture shows a redraw at a point other than
+between lot updates and a dialog's wait.
+
+## 2026-11-15: Person word 1 goes to the interface and is cleared
+
+**Unverified.** No capture has a nonzero person word 1.
+
+The person's tick hands a nonzero person word 1 to 0x4a69aa and then
+clears the word (0x45ce61 to 0x45ce7e). 0x4a69aa shows the value over
+the person, in one of three ways:
+
+- Below -20000 it shows -20000 less the value as text (0x4d356a).
+- From -20000 up to -10000 it plays the sound "sting_char_winner" for
+  the person (0x57a54c) and shows -10000 less the value (0x4d3516).
+- From -10000 up it shows the value as money (0x4d34f7).
+
+Each is shown only while the interface's object ([0x6f2a58]+0x84) is
+there. Showing means drawing text into a bitmap over the person
+(0x4d322c), which is presentation. So the tick now only clears the word.
+The middle range still fails loudly. Its sound could be a
+`SoundEvent::Play`, but nothing shows whether the interface object
+exists in a run with no view, and the snack order does not reach it.
+
+The play-mode tests that set word 1 to 1 to get a fault outside the
+thread now set -15000.
+
+**On Goth.** In the snack order, Mortimer's word 1 holds 5 after step
+820's scripts, the amount he just spent. That step now finishes (tick
+89264). His carry clip
+reaches its end two steps later and stops. At step 836 (tick 89279),
+walking with the snack, his animator turns by less than a step
+(0x58dfc0), which is not ported. Person 259 stopped at the same place,
+at step 1104, while Mortimer was parked. That path decides between a step and a walk by distance
+(0x58dfc0, 0x58f312) and picks a step clip by heading (the jump table at
+0x58fad6), so it is not small. Strict mode on the Goth house (1102
+ticks) and the K=1000 pins are unchanged.
+
+## 2026-11-15: The animator's own carry clip starts in the carry slot; a changed skin sorts its layers by priority
+
+**Unverified.** No capture has a person carrying with the carry clip the
+tick chooses. In the Goth captures (updates 1 to 1000) only person 21
+has a carry layer, a script's (carry mode 6, from update 417), and the
+captures hold no layer pages.
+
+The animator's tick chooses the carry clip at 0x5903a3. A change of
+choice clears the carry slot at once (virtual function 0x104,
+0x592878). It no longer fails when a layer is there, since the tick's
+own carry layer is one. A change to clip 0 starts the clip at once
+(0x5903fc to 0x590421):
+
+- It looks up the posture's clip 0x26 (virtual function 0xf4, 0x592625,
+  which reads the appearance again when stale, then 0x59db2f).
+- It starts that clip in the carry slot (virtual function 0x100,
+  0x592726) with flag 0: forward, speed 1, end mode 0 (0x592823), so the
+  clip stops at its end. 0x592726 sets end mode 0 for every slot. Only
+  Animate Sim's carry path then sets 1 (0x58977c).
+- It gives the layer priority 10 (0x59867f), which marks the skin
+  changed.
+- The carry mode stays 1, not 6, so each tick chooses again. Empty hands
+  or a pickup clip (+0x1a4) choose -1, which removes the layer.
+- Later updates are those of any carry layer: the skin's update, with
+  timed events handled.
+
+The skin's update sorts its layers by priority before it updates any of
+them (0x5991fd, called first by 0x5992b3). The sort is a bubble sort,
+lowest priority first, and runs only when the skin has changed (skin
++0x94). Layers of the same priority keep their order. Every change of
+layer or priority marks the skin changed, so the layers always update by
+priority. The 2026-11-14 carry entry kept only the insertion order
+(0x599128). So a carry layer (10) now updates after a foreground layer
+of raised priority (6), not before it.
+
+`Animator::carry_first` stays the insertion order and is not written by
+the sort. It decides only a tie. The original's list keeps the sorted
+order instead. The two differ only when two layers had different
+priorities at a sort and the same priority later, and nothing ported
+does that: foreground layers take priority 1, 5 or 6, carry layers 10.
+Keeping the field as it was leaves snapshots and the K=1000 pins
+unchanged. Writing the sorted order into it changed the tick 417 digest,
+where person 21's script carry layer plays with a foreground, though
+nothing else differed. No format bump is needed.
+
+Still failing loudly: a carry clip with no name (0x59db2f) or one no
+file holds (0x59dc32). The original leaves the slot empty then and
+still notes clip 0 as chosen.
+
+**On Goth.** The snack order's step 820 (tick 89263) now starts
+Mortimer's carry clip, `a2o-rarm-carry-loop`, at priority 10. The rest
+of his tick stops on person word 1 (5, the money just spent), which the
+person's tick hands to the interface (0x4a69aa). Strict mode on the Goth
+house (1102 ticks) is unchanged. Reopen when a capture holds a carry
+layer the tick chose, or the skin's layer list.
+
+## 2026-11-15: Alter Budget spends into today's budget entry; a thread's Add/Change Action String names the running action
+
+**Unverified.** No capture covers the snack order.
+
+Alter Budget (0x44eade) now spends: when bit 0 of byte 4 is clear and the
+amount is covered, it calls 0x46d91c with the category and the amount.
+That routine does nothing in budget mode 1 (global 32). In any other mode
+it takes the amount from the funds (simulator +0x90), adds it to the
+category's word of today's entry (+0x184), both in 32 bits that wrap, and
+writes globals 14 and 13 as the funds setter (0x46d8dc) does: the funds
+split at 10,000 by signed division, cut to 16 bits. The setter writes only
+in mode 0; this writes in mode 2 too. Then it sends signal 0xda with the
+funds (0x40760d).
+
+Today's entry is the first of `Budget::days`. The simulator keeps six days of
+eight words: today at +0x184, yesterday at +0xe4, and the four before it
+at +0x104 to +0x164. The load (0x46d1e4) reads the save's first day into
++0x184 and the next five into +0xe4 on, so the save's order is the one
+`days` already had. Per day the save holds a flag word, then eight words
+if the flag is not 0, or seven if it is (0x46d270). The game always writes
+the flag as 1, since the same code writes and reads (0x464970). The
+parser reads no words for a flag of 0, so a today with flag 0 fails
+loudly. So do category 8, which the primitive allows (0x44eb10) but which
+adds to +0x1a4, the head of a list that the constructor allocates
+(0x46ce0c), and a lot with no days read from a save. Each fails before
+anything changes. The Goth save's days are today
+[20, 0, 0, 0, 0, 0, 15060, 33654] and five days of zeros.
+
+Signal 0xda is presentation. The game has eight subscribers (the
+constructors that call 0x407577): the lot (0x41637f), 0x43c0e4, 0x44302e,
+the simulator (0x46d2c2), the architecture (0x47b22a), the house viewer
+(0x4a82db), the panels (0x4c3ea5) and the interface (0x4f65bf). Only the
+interface has a case for 0xda. It marks the control panel's funds with
+0x4000 and redraws it (0x4ce41b), which formats the funds as text
+(0x4ce81c, 0x4cecf5). The lot's handler first passes the signal to lot
++0x10, but by a direct call to the empty base handler (0x41639e calls
+0x407607, which returns 0), so it does nothing for any signal. That was
+unknown before (see `tick.rs`).
+
+The day's turn (0x46d417) is still not ported. When it is: it moves the
+days with a forward copy that overlaps, so +0x104 to +0x164 all end up
+with yesterday's old words before today moves to +0xe4 and is cleared.
+A save of version below 0x34 is reset after it is read (0x46d211 calls
+0x46d97a: every day cleared, and global 28, the day count, set to 0). The
+load does not do that yet. It matters only for the base game's version
+0x33 template houses.
+
+Add/Change Action String (0x44cc07) in a thread's run now names the
+person's running action instead of failing. Outside a pie menu's listing
+it checks the byte 0x6c4d6c, which starts as 1. Only the synchronous run
+(0x4749b5) changes it: it clears it for the run and puts it back after
+(0x474a37, 0x474ad0). With the byte set and the object a person
+(0x635abe), 0x41f1ae stores the string as the action's name (+0x28) and
+sets its flag 0x80 (+0x40). As before for 0x41f1ae, only the flag is
+kept. In every run, the string is looked up (0x4704fa) and formatted
+(0x44bf1a) before 0x44cc9a asks where it goes. A formatting pass can
+raise an error; one raises native error 0x1c for a non-person
+(0x44c57b). So a missing string, or one with a "$" token, now fails
+loudly in every run, autonomy's check trees included. Before, it failed
+only in a pie menu's listing (a Sol review finding). A string without
+tokens is not formatted: only the name would hold the result. Another
+object's thread does only the lookup. Autonomy's check trees then drop
+the string. Other runs at once still fail loudly, because the port's runs
+at once have not been matched one by one to 0x4749b5's callers (0x422d7d,
+0x44bc1b, 0x44f593, 0x452c37, 0x458505, 0x474b0b).
+
+In play mode, after the Have A Snack order (50 steps, then the fridge's
+menu 1), Mortimer's tree 0x1007 spends 5 in category 3 at step 820 (world
+tick 89263): funds 2542 to 2537, today's category 3 from 0 to 5, global
+13 to 2537. In the same tick tree 0x104a names his running action. His
+animator then stops on the carry clip: "a person starts carrying: its
+carry clip (0x26, 0x5903fc) is not ported". An install test pins this.
+Strict mode on the Goth house is unchanged. Reopen when a recording of
+the snack order disagrees, or when a script spends in category 8.
+
+## 2026-11-15: Generic Sims Call routine 15 copies temp 0 into person word 72; the footprint is worked out after word 73 is cleared
+
+**Unverified.**
+
+Routine 15 (0x44fe3c; the Generic Sims Call jump table at 0x45143a)
+casts the running object to a person (0x635abe; a failed cast throws,
+native error 0x1c). It copies temp 0 (object +0x3a, the word routine 28
+reads its lot from) into person data word 72 (+0x61c) and clears word 73
+(+0x61e). When temp 0 is 0 it then works out the person's footprint
+again where it stands (0x433d16 with +0xf4 and +0x100, its width through
+0x43519f). That reuses the footprint that placement already ports. Word
+73 is cleared first, so the footprint never takes the even-facing
+extension from it. When temp 0 is set the footprint is kept, whatever
+word 73 held before.
+
+The port works the footprint out before it writes anything, from the
+person's words as they will be, so a footprint that fails loudly (a
+facing outside 0 to 7) leaves the person as it was. The original cannot
+fail there.
+
+The Goth house's social pick runs it once, at tick 48, on person 21 with
+temp 0 at 8, so only the copy and the clear are reached. The footprint
+branch is checked only by the synthetic tests. No capture covers the
+pick. The social now runs to tick 261, where it stops on scope 24 field
+9 (a neighbor's family's friend count, through the family friend-count
+cache). That needs state the World does not hold yet. Reopen if a
+capture of the pick disagrees.
+
+## 2026-11-15: Animate Sim on the base slot is the carry slot's twin; a script's base clip stays until the posture changes
+
+**Unverified.**
+
+Animate Sim with flag bit 0x01 alone (0x58957e; the slot picker 0x47ec4c
+returns 1) works on the base slot (animator +0x14) the way flag 0x10
+works on the carry slot. It never yields and always takes the true branch
+(0x589c4e). Clip 0 clears the slot (virtual function 0x104, 0x592878).
+The base slot's layer is always removed at once, even where the other
+slots could fade (0x592890). Any other clip is looked up (virtual
+function 0x12c, 0x5893b3), the slow flag (+0xa8) set from flag 0x80, and
+the clip started in the base slot (virtual function 0x100, 0x592726),
+backward with flag 0x02, to repeat at priority -10 (0x59867f). That is
+what the posture's own base clip gets. Unlike the carry slot, no mode or
+selection is written.
+
+The base slot used to be a flag, since only the posture's clip went
+there. It is now `Base`: empty, the posture's clip, or a clip a script
+started, with its name, direction and the animator's clock at its
+start. Drawing plays it from that start (0x597a88: the layer's clock
+starts at the animator's, its phase at 0, or 1 backward), not from the
+clock's zero. `Empty` and `Posture` encode as
+`false` and `true` did, so existing states and snapshots hash and decode
+as before. The animator's base update (0x590430) treats a script's layer
+like any other: a change of posture clears it. Otherwise it stays for a
+person of kind (word 65) at most 1, and for any other kind the posture's
+clip replaces it, unless bit 2 of definition word 102 is set. Animate Sim
+does not touch the posture noted (+0x198), so after clip 0 the next base
+update starts the posture's clip again. The head's measurement checks a
+script's base clip against the foreground as it checks the posture's.
+
+Beyond a script's start, the base layer's clock and its place in the
+skin's list are still not kept. A new layer goes in before the first
+layer above priority 1 (0x599128) and only then takes -10, so it may
+come before or after the foreground layer; the skin's update sorts its
+layers by priority first (0x5991fd), so the base updates first anyway. That matters only for timed events, so a script's base
+clip with timed events fails loudly (0x5992b3), as the posture's does.
+The original goes on past a clip it cannot find (0x452bed reports it);
+here that fails, as it does for the other slots.
+
+**On Goth.** The social person 16 picks clears object 16's base slot
+(clip 0, source byte 2, which clip 0 never reads) in the next update.
+The lot then runs 46 updates and stops at tick 48 on object 21, tree
+0x2025 node 13, Generic Sims Call routine 15 (0x44fe3c). Strict mode on
+the Goth house is unchanged. Reopen when the harness records a social,
+or when a script plays a base clip with timed events.
+
+## 2026-11-15: Snap mode 4 snaps to one of the lot's global routing slots; an action pushed to the front goes first
+
+**Unverified.** Snap (opcode 46) mode 4 (0x454ab6) names its slot by
+word 0 in the lot's global routing slots, the table Go To Routing Slot's
+source 2 reads (the stack object's lot, +0xdc, at +0x9c: the kind 3
+entries of the global file's SLOT 100). From 0x454ac5 on it is mode 3's
+code, so the place is still the stack object's and every later step is
+the same. The flags are the lot's one copy, kept under object 0 as Go To
+Routing Slot keeps them. An index outside the table, a negative one
+included, is native error 0x1b. Modes 0 to 2 still fail loudly.
+
+Queueing an action with flag 2 (0x45d322 to 0x45d47f) no longer fails.
+The action has already taken its number. With flag 0x40, the person's
+running action (+0xa48) loses its flag 0x80 (0x41f167), and the new
+action takes that action's name (0x41f1ae). Taking the name sets the new
+action's flag 0x80, which is ported; the name itself is not, since the
+queue does not keep names. A queue
+of the routine's own takes the new action and then the queued ones in
+order, and the person's queue is given them back. A full queue passes
+only its first seven, and only seven are given back, so the new action
+goes in with the first six and the last two are dropped, with no object
+told. The action is always queued, and the branch never looks at an
+action running at once (0x45d5a5), so a push to the front from inside one
+is queued too.
+
+In play mode, after the Have A Snack order (50 steps, then the order),
+Mortimer (object 21) snaps to himself with global slot 5 at step 820
+(tree 0x0127 node 2). Its flags are 0x1010, so he turns by 4 where he
+stands, from facing 6 to 2. In the same tick the fridge's tree 0x1018
+(node 10) pushes his action 4170 on the snack (object 263) to the front
+of his empty queue. He now stops in that tick at Alter Budget spending 5
+in category 3 (0x46d91c, tree 0x1007 node 2). Strict mode on the Goth
+house is unchanged. Reopen when a recording of the snack order disagrees,
+or when a push to the front meets a full queue.
+
+## 2026-11-15: The advertisement record outlives Find Best Interaction's checks
+
+**Unverified.** The captures do not hold the record's page.
+
+The original keeps one advertisement record. It is the static record at
+0x6e5100, and [0x6c437c] always points to it. The frozen memory image
+shows the pointer and a count of 16; the advertisements themselves are on
+the heap. The check 0x458319 copies an entry's advertisements over the
+record (0x4763c5) only when its caller passes somewhere to keep them.
+Find Best Interaction does (0x45dc8b); the pie menu (0x45871f) and the
+at-once queue (0x45d259) pass 0 and copy nothing.
+
+The order inside 0x458319 is:
+
+1. An entry ruled out by the target's flags, the visitor rules or the
+   person's age and kind returns before the copy (0x458497).
+2. The copy.
+3. The check tree, if the entry has one. With no tree the check passes
+   (0x458524).
+4. When the target is in another room than the person, the room motive's
+   delta becomes its minimum negated, in the record (0x45853f). This
+   happens whatever the check returned. Both rooms are read after the
+   check tree (0x45852f, 0x458536), so a check that moves either object
+   counts. Before, the port compared the rooms from before the scan.
+
+Scopes 12, 28 and 29 (0x453a09, 0x453a42, 0x453a7a) read [0x6c437c] in
+any tree, so a check tree the pie menu runs reads and writes whatever the
+last Find Best Interaction check left. The record is now a World field,
+`advertisement_record`, and the scopes use it everywhere. Their index is
+bounded by 16 (native error 0x1a), as before. This replaces the
+check-tree-only advertisements and the loud failure outside a check tree.
+
+0x4763c5 copies as many advertisements as both the entry and the record
+have, and the record's count stays 16. So an entry with fewer than 16
+leaves the rest as the last copy left them. That case used to fail
+loudly and is now ported.
+
+Before the first copy, the scopes and a copy of fewer than 16 still
+fail loudly: the record then
+holds what the game's start left on the heap, which nothing here reads.
+On Goth, object 18's pie menu at tick 1 stops there, before autonomy
+first runs (tick 232). Reopen when a capture holds the record's page, or
+when a recording picks from a menu that reads it before the first copy.
+
+Snapshot format 22 adds the record at the end of the World. Each pin of
+the Goth ticks 417 to 1000 now reads through format 21 and holds as it
+was.
+
+## 2026-11-15: Run Tree By Name modes 0 and 1 on my thread; an action queued during an at-once run takes its place
+
+**Unverified.**
+
+**Run Tree By Name.** Mode 0 (0x44bb75) runs the named tree of the stack
+object's type on the running object's own thread. I stay me, the stack
+object stays its stack object, and my temps are the arguments. Mode 1
+runs it on the stack object's thread, so mode 1 with myself as the stack
+object is the same run. The tree runs at once, to its end, and its result
+is the branch. 0x4749b5 treats the running thread like any other: it
+pushes a stop frame and the tree's frame above my frames, runs until the
+stop frame, and then puts back the thread word it cleared. The port runs
+the tree above my frames in the same way.
+
+**Queueing during an at-once run.** While a person's action runs at
+once, an action queued on that person is copied over the running action,
+including its number and flags (0x45d5a5, 0x41edbf). It is also queued,
+unless the queue is full. The at-once run then returns the queued
+action's number and takes none of its own. This replaces the loud
+refusal recorded in the at-once entry below.
+
+With flag 0x40, the original also gives the queued action the running
+action's name (0x41f167, 0x41f1ae), which sets its flag 0x80. The flag is
+set here, but queued actions' names are not kept.
+
+In modes 0 and 1 a check tree's advertisements (the global record at
+0x6c437c) stay the same record through the named run.
+
+**On Goth.** The first pick on person 16 now queues the social through
+the object its tree made, and returns that action's number. The next
+step stops on Animate Sim on the base slot (0x58957e). Reopen when the
+harness records a social pick.
+
+## 2026-11-15: Grab puts the stack object in my first slot; a person's slots include its own five
+
+Grab (opcode 4, 0x451dda) ignores its operands. It looks the stack
+object up in the registry (0x40743b) and takes the false branch when it
+names none. Then it asks the stack object's place test (virtual function
+0x54) for my slot 0 as scripts count it, at my position and level, and
+on a refusal takes the false branch with nothing changed. Otherwise it
+puts the object there with the lot told (virtual function 0x58) and
+takes the true branch. Only three classes of object exist, found from
+the three callers of the base constructor 0x43189d. An ordinary object
+(vtable 0x666d34) and a person (0x667378) share 0x433311 and 0x433340,
+so `fits_in` and `put` serve both. A tile of a group (0x666c20) has
+0x422abb, which refuses any container at once (0x422ac8, code 0x10), so
+Grab takes the false branch for it; its test on the ground still fails
+loudly. A put that fails partway puts the lot back as it was before the
+Grab.
+
+A person's container slots, which the place test reads, are its
+definition's (0x431aaf) followed by five records its post-constructor
+adds (0x45962b). Each is made by 0x46de93, which gives an offset of 0
+and a height of 0, and only the height or the flags are then changed.
+None goes through the SLOT converter that turns a height of 0 into 1 or
+5. In order: height 6, the slot a person carries in; height 0 with flag
+2 and the name "HEAD" (0x6c4528); then three at height 1. The place
+test's step for a person as the container (0x432e57) is ported with
+them. A container whose definition type is 2 takes nothing unless the
+simulator's mode (global 19) is 0 (error 0xd). With the slots ported,
+Create New Object Instance mode 4 no longer refuses a person as the
+container.
+
+The snack order's fridge tree 0x100d (node 9) runs Grab for Mortimer on
+the snack (object 263) the fridge made. In play mode, after the Have A
+Snack order at tick 51, he takes it into his carry slot (saved slot 1)
+at tick 748. The snack's data word 4 is 189, which has the bit for height 6. He
+now stops at tick 839, on Snap mode 4 (0x4549c7, tree 0x0127 node 2).
+Strict mode on the Goth house is unchanged. **Unverified**: no capture
+covers a Grab, and nothing has compared a person's slot records with the
+original's memory. Reopen when a recording of the snack order
+disagrees.
+
+## 2026-11-15: An action whose entry runs at once is checked and run there and then
+
+**Unverified.** Queueing an action whose interaction has flag 4 (0x45d20b,
+the branch at 0x45d240) no longer fails. When the person queues it on
+themselves, its check runs (0x458319). If the check passes and no action
+is already running at once (the pointer at 0x6e5294 is clear), the action
+tree runs straight away. It runs on the target object, with the target as
+stack object, and takes seven parameters: the four arguments, the two
+halves of the priority, and the tree. While it runs, the person's priority
+(person data word 33) is the action's. Afterwards the priority is put back.
+An action with no number then takes the next one. The person's temps are
+restored if the check saved them (0x4582dd). Nothing is queued, and a
+failed check, or a nested run, returns no number.
+
+Two cases still fail loudly, because the original does something the port
+does not model:
+
+- an object other than the person queues such an action on the person;
+- an action is queued on the person whose action runs at once. The
+  original copies it over the running action (0x45d5a5).
+
+A fault inside the tree becomes Unsupported. Every pick on Goth's person
+16 now gets past this point and stops at Run Tree By Name mode 0 on
+another object (0x44ba26). Reopen when the harness shows a pick that runs
+at once.
+
+## 2026-11-15: A route to a slot with a sitting weight looks for seats, and a diagonal slot turns through a matrix
+
+**Unverified.** The search by distance (0x483598) now handles a slot with
+a sitting weight. It tries each place as indices -1 to 8: first the place
+itself, when standing weighs at least as much as sitting; then a seat one
+tile away in each of the eight directions (0x4838e7, 0x422632, 0x43244d);
+and last the place itself again, when standing weighs less. A seat must
+offer Sit (function 26), face back toward the place, and have that
+direction's bit in definition word 66. If someone else holds the seat,
+result 9 is noted and the holder goes in context word +0x8c. A candidate
+beside a seat ends the route with the seat's Sit tree, not a walk
+(0x45c430, 0x45b96b), and the route then waits for that tree's return
+(step 4, 0x45b3fa).
+
+A slot place turned by a direction other than 0, 2, 4 or 6 goes through
+the original's rotation matrix in world units (0x483d7c, 0x455070,
+0x5c4510, 0x454fb9). The cosine and sine come from libm, so they may
+differ from the x87 `fsin`/`fcos` in the last bit of a float. Seats for a
+person of kind above 1 still fail loudly (0x46de84), as does a slot with
+flag 0x10000.
+
+This moves a player's snack order on the Goth house from tick 154 to
+tick 615. There it stops at Create New Object Instance mode 4. Its seat
+search picks a place to stand, so the Sit route is covered only by
+synthetic tests. Reopen when a capture of a route that sits disagrees,
+or when a rounding at x.5 after the matrix lands on the other side.
+
+## 2026-11-15: Create New Object Instance mode 4 makes the object in the stack object's first slot; flag 0x1 skips a tile with its type
+
+Mode 4 of opcode 42 (0x44e3a2) takes the stack object as the container,
+and its position, level and room (data word 29). The new object goes
+into the container's first container slot (slot 0 as scripts count it).
+Before it is made, the common tail (0x44e4c5) runs three tests, any of
+which takes the false branch:
+
+- with flag 0x1 (0x44e4e1), an object of the same type stands on the
+  container's tile, or is held there however deep (0x43f331, 0x43f379);
+- the position is off the lot (0x422632);
+- the container's room is not -5, and the lot's room map gives its tile
+  another room (0x44e582).
+
+Then come the slot's place test (`fits_in`), the removal of an object
+the slot refuses, and the put. Flag 0x1 is the same tail code for every
+mode, so it is ported for modes 6 and 8 too. Mode 6's tile is off the
+arrays, where it finds nothing. Mode 8 keeps the room filter at -5, so
+its room test never runs. Making a person, a type that belongs to a
+group, a person as the container, and a container that the new object's
+Init removes still fail loudly, as do the other modes and flags.
+
+The fridge's snack tree (0x1019 node 1) runs mode 4 with flag 0x1 on
+the fridge. In play mode, after a player's Have A Snack order at tick
+51, Mortimer now puts the snack in the fridge at tick 634. He stops at
+tick 748, on Grab (primitive 4, tree 0x100d node 9). Strict mode on the
+Goth house is unchanged. **Unverified**: no capture covers a mode 4
+creation. Reopen when a recording of the snack order disagrees.
+
+## 2026-11-15: A check tree names pie menu entries with Add/Change Action String
+
+While the pie menu's listing checks an action, Add/Change Action String
+adds an entry to the menu (0x458789): a copy of the action being checked,
+with flags 4 and 8 set and 0x10 clear, the string as its name, and the
+string's four arguments, the first being the frame's stack object when
+the formatter left it 0 (0x44cca3). The entry goes into the menu at once,
+whether or not the check passes, and the action itself is then left out
+(0x458724 compares the list's length). The menu's entries are now
+`MenuEntry` values, an action and an optional name; picking one queues
+its action. The queue does not keep the name, which the original keeps in
+the action (+0x28) for the interface.
+
+The string's formatter (0x44bf1a) is not ported. Each of its passes looks
+for a token starting with "$" and does nothing without one, so a string
+with no "$" comes out unchanged and so do the arguments; a string with
+"$" fails loudly. A string the running code's file lacks also fails
+loudly, since what the original does with the null string 0x4704fa
+returns for it is not read. On the Goth house the fridge now offers "Have
+Quick Breakfast", "Have Breakfast" and "Serve Breakfast", and each
+staircase "Go Upstairs"; 85 objects offer entries, and 9 fail in check
+trees on Manage Inventory operation 4 and scopes 24 and 12. Reopen when a
+string with a token is reached.
+
 ## 2026-11-15: A pie menu that offers nothing lists the other objects on the tile
 
 When the listing on an object offers nothing, the original lists each

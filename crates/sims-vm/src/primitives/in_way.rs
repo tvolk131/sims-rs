@@ -80,6 +80,11 @@ const ENTRY_FLAG: u32 = 0x100;
 const TO_FRONT: u32 = 2;
 /// How many actions a person's queue holds (+0x820, 0x45f744).
 const QUEUE: usize = 8;
+/// The action flag that gives an action put at the front the running
+/// action's name (0x45d322), and the running action's flag that 0x41f167
+/// clears (0x41f1a4).
+const NAME_FROM_RUNNING: u32 = 0x40;
+const NAMED: u32 = 0x80;
 /// The function an object runs when an action on it is cancelled.
 const CANCELLED: usize = 4;
 
@@ -401,12 +406,42 @@ impl Machine<'_, '_> {
     ///
     /// The action takes the next number ([`sims_sim::World::action_serial`],
     /// 0x41f158) and goes after every queued action of at least its
-    /// priority. A full queue takes nothing. An entry that runs at once,
-    /// an action put at the front (flag 2), and one that goes before
-    /// queued actions (which are dropped, each object told with its
-    /// function 4) fail loudly. The original's branch for an action queued
-    /// while one runs at once (0x6e5294) is never taken here, as running
-    /// at once is not ported.
+    /// priority. A full queue takes nothing. An action with flag 2 goes
+    /// at the front instead ([`Machine::queue_at_front`]). One that goes
+    /// before queued actions (which are dropped, each object told with its
+    /// function 4) fails loudly.
+    ///
+    /// An action queued, not at the front, on the person whose action runs
+    /// at once, while it runs, is copied over the running action (0x45d5a5,
+    /// 0x41edbf: every field, its number and flags too), and is queued as
+    /// well, or not when the queue is full. With the new action's flag
+    /// 0x40, the original first gives it the running action's name
+    /// (0x41f167, 0x41f1ae), which sets its flag 0x80; the flag is set
+    /// here, but the names of queued actions are not kept.
+    ///
+    /// An entry that runs at once is not queued (0x45d240):
+    ///
+    /// 1. The action is checked as the player's pie menu checks it
+    ///    (0x4582ad, 0x458319; [`Machine::check_chosen`]). One that fails
+    ///    is not run, and None is returned.
+    /// 2. While another action runs at once (0x6e5294 is set), None is
+    ///    returned.
+    /// 3. The person's data word 33 (+0x5ce) takes the action's priority,
+    ///    and the action's tree, of the target's file, runs synchronously
+    ///    on the person's stack (0x474afb, 0x4749b5) with the target as its
+    ///    stack object. Its arguments are the words of the action from
+    ///    +0x14: the action's four arguments, then its priority's two
+    ///    halves and its tree. What it returns is not read; a tree the
+    ///    file lacks writes the synchronous run's mark and runs nothing.
+    ///    Data word 33 is then put back.
+    /// 4. An action without a number then takes one (0x45d2ef), which is
+    ///    returned. An action the tree queued on the person was copied over
+    ///    it, so it has that action's number.
+    /// 5. The person's temps, if the check's tree saved them, are put
+    ///    back (0x4582dd).
+    ///
+    /// Only the running person's own actions are run at once here: an
+    /// entry that runs at once queued on another person fails loudly.
     pub(crate) fn queue_action(
         &mut self,
         id: u16,
@@ -415,21 +450,13 @@ impl Machine<'_, '_> {
     ) -> Result<Option<i32>, Trap> {
         match at_once {
             None => return Ok(None),
-            Some(true) => {
-                return Err(unsupported(
-                    "0x45d240",
-                    "queueing an action that runs at once",
-                ));
-            }
+            Some(true) => return self.run_at_once(id, action),
             Some(false) => {}
         }
         self.world.action_serial = self.world.action_serial.wrapping_add(1);
         action.uid = self.world.action_serial;
         if action.flags & TO_FRONT != 0 {
-            return Err(unsupported(
-                "0x45d322",
-                "queueing an action at the queue's front",
-            ));
+            return self.queue_at_front(id, action);
         }
         let queue = &mut self
             .world
@@ -448,12 +475,209 @@ impl Machine<'_, '_> {
                 "queueing an action before others, which are dropped",
             ));
         }
+        // While the person's action runs at once, the new action is copied
+        // over it, number and all, and is queued as well (0x45d5a5).
+        if let Some(running) = self.running_at_once.filter(|r| r.person == id) {
+            // With flag 0x40 the action first takes the running action's
+            // name, which sets its flag 0x80 (0x41f1ae).
+            if action.flags & 0x40 != 0 {
+                action.flags |= 0x80;
+            }
+            *running.action.borrow_mut() = action.clone();
+        }
         if queue.len() >= QUEUE {
             return Ok(None);
         }
         let uid = action.uid;
         queue.push(action);
         Ok(Some(uid))
+    }
+
+    /// Puts an action, already numbered, at the front of a person's queue
+    /// (0x45d322 to 0x45d47f; see [`Machine::queue_action`]) and returns
+    /// its number.
+    ///
+    /// 1. With action flag 0x40, the person's running action (+0xa48) has
+    ///    its flag 0x80 cleared, and the new action takes its name
+    ///    (0x41f167, 0x41f1ae), which sets the new action's flag 0x80. The queue keeps no names, so only the flag
+    ///    is ported; 0x41f167 makes the running action's name first if it
+    ///    has none, which changes nothing else.
+    /// 2. A queue of its own (0x45f71b) takes the new action, then the
+    ///    person's queued actions in order (0x45f744), and the person's
+    ///    queue is emptied and given that queue's actions in order.
+    /// 3. A full queue (eight actions) passes only its first seven, and
+    ///    only the first seven of the eight are given back (0x45d391 to
+    ///    0x45d3e4): the new action and the first six queued. The last two
+    ///    are dropped, with no object told.
+    ///
+    /// The action is always queued, and nothing here looks at an action
+    /// running at once (the branch to 0x45d5a5 is not taken).
+    fn queue_at_front(&mut self, id: u16, mut action: Interaction) -> Result<Option<i32>, Trap> {
+        let uid = action.uid;
+        let person = self
+            .world
+            .objects
+            .get_mut(&id)
+            .and_then(|o| o.person.as_mut())
+            .ok_or(Trap::native(0x1c, "object is not a person"))?;
+        if action.flags & NAME_FROM_RUNNING != 0 {
+            person.active.flags &= !NAMED;
+            // Taking the running action's name sets the new action's flag
+            // 0x80 (0x41f1ae, 0x41f1bd).
+            action.flags |= NAMED;
+        }
+        let kept = if person.queue.len() >= QUEUE {
+            QUEUE - 2
+        } else {
+            person.queue.len()
+        };
+        let mut queue = Vec::with_capacity(kept + 1);
+        queue.push(action);
+        queue.extend(person.queue.drain(..).take(kept));
+        person.queue = queue;
+        Ok(Some(uid))
+    }
+
+    /// Runs an action whose entry runs at once (0x45d240; see
+    /// [`Machine::queue_action`]).
+    fn run_at_once(&mut self, id: u16, mut action: Interaction) -> Result<Option<i32>, Trap> {
+        if id != self.me {
+            return Err(unsupported(
+                "0x45d240",
+                "running at once an action queued on another person",
+            ));
+        }
+        let mut saved = None;
+        let result = self.check_and_run_at_once(id, &mut action, &mut saved);
+        if let Some(temps) = saved {
+            self.me_mut()?.temps = temps;
+        }
+        result
+    }
+
+    /// Steps 1 to 4 of running an action at once.
+    fn check_and_run_at_once(
+        &mut self,
+        id: u16,
+        action: &mut Interaction,
+        saved: &mut Option<Vec<i16>>,
+    ) -> Result<Option<i32>, Trap> {
+        self.check_chosen(action, saved, None)?;
+        if action.flags & crate::autonomy::checked::PASSED == 0 || self.running_at_once.is_some() {
+            return Ok(None);
+        }
+        let target = u16::try_from(action.target)
+            .ok()
+            .filter(|t| self.world.objects.contains_key(t))
+            .ok_or_else(|| {
+                Trap::Invalid(format!(
+                    "an action run at once has no target object ({})",
+                    action.target
+                ))
+            })?;
+        let resource = self.definition(self.world.objects[&target].guid)?.resource;
+        let kept = self.person_data(id, PRIORITY)?;
+        self.set_person_data(id, PRIORITY, action.priority as i16)?;
+        // The priority is put back however the run ends.
+        let ran = self.run_tree_at_once(id, target, resource, action);
+        self.set_person_data(id, PRIORITY, kept)?;
+        ran?;
+        if action.uid == 0 {
+            self.world.action_serial = self.world.action_serial.wrapping_add(1);
+            action.uid = self.world.action_serial;
+        }
+        Ok(Some(action.uid))
+    }
+
+    /// Runs the action tree of an action run at once on its target, with
+    /// the four arguments, the priority's two halves and the tree as its
+    /// parameters (0x474afb, 0x4749b5).
+    fn run_tree_at_once(
+        &mut self,
+        id: u16,
+        target: u16,
+        resource: usize,
+        action: &mut Interaction,
+    ) -> Result<(), Trap> {
+        let tree = action.action;
+        match self.program.tree(resource, tree) {
+            crate::program::Tree::Missing => {
+                self.write_mark()?;
+            }
+            crate::program::Tree::Primitive(id) => {
+                return Err(Trap::Unsupported(format!(
+                    "an action run at once whose tree {id:#06x} names a primitive"
+                )));
+            }
+            crate::program::Tree::Behavior(..) => {
+                let [a, b, c, d] = action.args;
+                let priority = action.priority as u32;
+                let args = [
+                    a,
+                    b,
+                    c,
+                    d,
+                    priority as u16 as i16,
+                    (priority >> 16) as u16 as i16,
+                    tree as i16,
+                ];
+                let running = std::cell::RefCell::new(action.clone());
+                let interpreter = crate::Interpreter {
+                    running_at_once: Some(crate::interpreter::AtOnce {
+                        person: id,
+                        action: &running,
+                    }),
+                    ..self.interpreter()
+                };
+                interpreter
+                    .call_as(
+                        self.world,
+                        id,
+                        target,
+                        tree,
+                        target as i16,
+                        &args,
+                        args.len(),
+                        crate::TURN_BUDGET,
+                        false,
+                    )
+                    .map_err(|fault| {
+                        Trap::Unsupported(format!(
+                            "the tree {tree:#06x} of object {target}, run at once: {fault}"
+                        ))
+                    })?;
+                *action = running.into_inner();
+            }
+        }
+        Ok(())
+    }
+
+    /// Person data word `index` of person `id`.
+    fn person_data(&self, id: u16, index: usize) -> Result<i16, Trap> {
+        self.world
+            .objects
+            .get(&id)
+            .and_then(|o| o.person.as_ref())
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .data
+            .get(index)
+            .copied()
+            .ok_or_else(|| Trap::Invalid(format!("person data has no word {index}")))
+    }
+
+    /// Sets person data word `index` of person `id`.
+    fn set_person_data(&mut self, id: u16, index: usize, value: i16) -> Result<(), Trap> {
+        let word = self
+            .world
+            .objects
+            .get_mut(&id)
+            .and_then(|o| o.person.as_mut())
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .data
+            .get_mut(index)
+            .ok_or_else(|| Trap::Invalid(format!("person data has no word {index}")))?;
+        *word = value;
+        Ok(())
     }
 
     /// Takes the action numbered `uid` off a person's queue (0x45d5f8),

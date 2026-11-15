@@ -167,7 +167,7 @@ fn an_action_without_a_target_does_not_become_the_last_action() {
 fn a_use_ends_only_when_its_frame_is_gone() {
     let mut fx = using();
     // A use noted deeper than the thread is: it is ended by the first
-    // return, without the noting at person +0xa54.
+    // return, without the noting at person +0xa54 (0x45e678).
     let person = fx.sim_mut().person.as_mut().unwrap();
     person.object_uses = vec![
         ObjectUse {
@@ -204,23 +204,56 @@ fn a_use_ends_only_when_its_frame_is_gone() {
 }
 
 #[test]
+fn the_end_of_a_use_notes_the_last_flagged_object_as_the_icon() {
+    // Two flagged uses under the Sim's own: when the lamp's use ends with
+    // its frame (one frame left, the use made at 2), each flagged entry's
+    // object in turn becomes the running action's icon (person +0xa54,
+    // 0x45e65d to 0x45e665), so the later one's stays.
+    let mut fx = using();
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    person.object_uses = vec![
+        ObjectUse {
+            target: 40,
+            stack_depth: 0,
+            unknown: 1,
+        },
+        ObjectUse {
+            target: 41,
+            stack_depth: 0,
+            unknown: 1,
+        },
+        ObjectUse {
+            target: 42,
+            stack_depth: 0,
+            unknown: 0,
+        },
+    ];
+    assert_eq!(turn(&mut fx), Status::Yielded);
+    assert_eq!(fx.sim().person.as_ref().unwrap().active.icon, 3);
+    assert_eq!(turn(&mut fx), Status::Returned(true));
+    let person = fx.sim().person.as_ref().unwrap();
+    assert_eq!(person.object_uses.len(), 3);
+    assert_eq!(person.active.icon, 41);
+    assert_eq!(person.active.table_index, 4);
+    // Ended by a later return, deeper than the thread is, a flagged use
+    // notes nothing (0x45e678).
+    let mut fx = using();
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    person.object_uses = vec![ObjectUse {
+        target: LAMP as i16,
+        stack_depth: 9,
+        unknown: 1,
+    }];
+    assert_eq!(turn(&mut fx), Status::Yielded);
+    fx.sim_mut().person.as_mut().unwrap().object_uses.remove(1);
+    assert_eq!(turn(&mut fx), Status::Returned(true));
+    let person = fx.sim().person.as_ref().unwrap();
+    assert_eq!(person.object_uses.len(), 0);
+    assert_eq!(person.last.icon, 3);
+}
+
+#[test]
 fn what_the_end_of_a_use_does_not_port_fails_loudly() {
-    // A use with its flag set: the original would note its object at
-    // person +0xa54.
-    let mut fx = using();
-    assert_eq!(turn(&mut fx), Status::Yielded);
-    fx.sim_mut().person.as_mut().unwrap().object_uses[0].unknown = 1;
-    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
-    assert!(fault.to_string().contains("+0xa54"), "{fault}");
-    // Person word 73 set when the action ends: the original works out the
-    // person's footprint again (0x433d16).
-    let mut fx = using();
-    assert_eq!(turn(&mut fx), Status::Yielded);
-    fx.sim_mut().person.as_mut().unwrap().data[73] = 1;
-    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
-    assert!(fault.to_string().contains("0x433d16"), "{fault}");
     // A used object that is gone.
     let mut fx = using();
     assert_eq!(turn(&mut fx), Status::Yielded);
@@ -228,6 +261,41 @@ fn what_the_end_of_a_use_does_not_port_fails_loudly() {
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
     assert!(fault.to_string().contains("is gone"), "{fault}");
+}
+
+/// [`using`], after its first turn, with the Sim at (56, 56) facing 2,
+/// its definition insetting each side by 1, and person word 73 set.
+fn wide() -> Fixture {
+    let mut fx = using();
+    assert_eq!(turn(&mut fx), Status::Yielded);
+    fx.words(SIM_FILE)[0x9a / 2] = 0x1111;
+    let sim = fx.sim_mut();
+    (sim.position, sim.footprint, sim.data[1]) = ([56, 56, 1], [1, 2, 3, 4], 2);
+    sim.person.as_mut().unwrap().data[73] = 1;
+    fx
+}
+
+#[test]
+fn a_new_action_works_the_footprint_out_again_while_person_word_73_is_set() {
+    // 0x45e756: word 73 is cleared and the footprint worked out again
+    // (0x433d16), with the word already clear, so the insets count.
+    let mut fx = wide();
+    assert_eq!(turn(&mut fx), Status::Returned(true));
+    let sim = fx.sim();
+    assert_eq!(sim.footprint, [54, 54, 58, 58]);
+    let person = sim.person.as_ref().unwrap();
+    assert_eq!((person.data[73], person.active.target), (0, 0));
+    // A facing the footprint does not handle fails before the action
+    // changes.
+    let mut fx = wide();
+    fx.sim_mut().data[1] = 9;
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
+    assert!(fault.to_string().contains("facing 9"), "{fault}");
+    let sim = fx.sim();
+    assert_eq!(sim.footprint, [1, 2, 3, 4]);
+    let person = sim.person.as_ref().unwrap();
+    assert_eq!((person.data[73], person.active.target), (1, LAMP as i16));
 }
 
 #[test]

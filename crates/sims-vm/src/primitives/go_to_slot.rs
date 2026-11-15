@@ -11,8 +11,11 @@
 //!   the person's contexts (+0xaf0); the next step is 1.
 //! - **1**: when the slot's object is in another room than the person
 //!   (and bit 0 of person word 68 is clear), the next step is 2.
-//!   Otherwise the places the person could stand are found (0x48235a);
-//!   the next step is 18.
+//!   Otherwise, a person who wants to be interrupted (0x45d7c0) and whose
+//!   animator may stop ([`sims_sim::animator::Animator::interruptible`],
+//!   0x589ead) fails with result 4, the next step 7 (0x45b18b). Else the
+//!   places the person could stand are found (0x48235a); the next step is
+//!   18.
 //! - **2**, the way through a door (0x45afd0): once the person is in
 //!   the object's room, back to step 1. Otherwise a door tree that
 //!   returned false marks its door failed, the door to go through is
@@ -20,6 +23,13 @@
 //!   person's thread; the step stays 2 while that tree runs.
 //! - **18**: the route there is planned (0x45c38e); with a route ready
 //!   (2), the next step is 12. With no way found (0) the next step is 6.
+//!   With the person already in the chosen seat (1) the next step is 8.
+//!   For a place beside a seat, the seat's Sit tree is pushed on the
+//!   person's thread with the seat as its stack object (0x45b96b); the
+//!   next step is 4.
+//! - **4**, sitting (0x45b3fa): the Sit tree returned true and the next
+//!   step is 8; else the context's result becomes person word 62, or 5
+//!   when that is 0, and the next step is 16.
 //! - **6**, trying again (0x45b066), by the context's retry count
 //!   (+0x58, as a 16-bit number): at 0 the person's place is compared
 //!   with the one noted (+0x60, +0x64) and noted in its place; moved
@@ -86,7 +96,8 @@
 //! update 438 do not reach fails loudly: a parameter number past the
 //! frame's parameters, a stack object that is missing or off the lot in a later
 //! step, a person with bit 0 of word 68 set or other contexts, a person
-//! who wants to be interrupted, a person sitting (posture 1), no door to
+//! who wants to be interrupted at a door, on the way or while waiting
+//! for a person asked (steps 2, 3 and 14), a person sitting (posture 1), no door to
 //! go through, giving up on a slot the route may end near (the failure
 //! feedback tree, 0x45af2a), ending a route while the asked person runs
 //! the action (0x45d5f8), every other step and every other result of the
@@ -96,8 +107,9 @@ use crate::animator::stop_route;
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Flow, Machine, word};
 use crate::placement::stands_on_lot;
-use crate::routing::slot::{direction, new_context, route_slot};
+use crate::routing::slot::{SlotRoute, direction, new_context, route_slot};
 use crate::sounds::SoundEvent;
+use sims_sim::animator::LOADED;
 use sims_sim::route::RouteSlot;
 
 /// The object ID under which the slot flags of the lot's global routing
@@ -128,6 +140,7 @@ const NEW: i32 = 0;
 const CANDIDATES: i32 = 1;
 const PORTAL: i32 = 2;
 const UNDER_WAY: i32 = 3;
+const SITTING: i32 = 4;
 const RETRY: i32 = 6;
 const FAILED: i32 = 7;
 const SUCCEEDED: i32 = 8;
@@ -451,11 +464,20 @@ impl Machine<'_, '_> {
                         state = PORTAL;
                         continue;
                     }
-                    if self.wants_interrupt()? {
-                        return Err(unsupported(
-                            "0x45b196",
-                            "for a person who wants to be interrupted",
-                        ));
+                    // 0x45b18b: a person who wants to be interrupted, and
+                    // whose animator may stop (0x589ead), fails with
+                    // context +0x88 = 4.
+                    if self.wants_interrupt()?
+                        && self
+                            .world
+                            .animators
+                            .get(&me)
+                            .unwrap_or(&LOADED)
+                            .interruptible()
+                    {
+                        ctx.result = 4;
+                        state = FAILED;
+                        continue;
                     }
                     interpreter
                         .find_candidates(self.world, &mut ctx)
@@ -469,19 +491,73 @@ impl Machine<'_, '_> {
                     let planned = interpreter
                         .route_to_slot(self.world, &mut ctx, &mut path)
                         .map_err(inner)?;
-                    result = planned;
-                    if planned == 0 {
-                        // 0x45b2ab: no way.
-                        state = RETRY;
-                        continue;
+                    match planned {
+                        SlotRoute::Answer(0) => {
+                            // 0x45b2ab: no way.
+                            result = 0;
+                            state = RETRY;
+                            continue;
+                        }
+                        // 0x45b1e3: already in the seat.
+                        SlotRoute::Answer(1) => {
+                            result = 1;
+                            state = SUCCEEDED;
+                        }
+                        SlotRoute::Answer(2) => {
+                            result = 2;
+                            state = START;
+                        }
+                        SlotRoute::Answer(other) => {
+                            return Err(unsupported(
+                                "0x45b285",
+                                &format!("whose planning gave {other}"),
+                            ));
+                        }
+                        SlotRoute::Sit { seat, tree } => {
+                            // 0x45b96b: the route waits at step 4 while the
+                            // seat's Sit tree runs, and person word 72 is
+                            // cleared (0x45b962). The step and the
+                            // context's saved words are written before the
+                            // tree is pushed, as the frame changes with it.
+                            // A Sit tree that cannot be pushed fails loudly,
+                            // so what was written for it is put back first.
+                            let kept = (
+                                self.me()?.clone(),
+                                self.world.routing.routes.get(&me).cloned(),
+                            );
+                            ctx.word_58 = i32::from(retry as i16);
+                            ctx.saved = spot;
+                            self.store_route(&ctx, &path);
+                            self.frame_mut()?.primitive_state = SITTING;
+                            if let Err(trap) = self.sit(seat, tree) {
+                                let (object, route) = kept;
+                                self.world.objects.insert(me, object);
+                                match route {
+                                    Some(route) => self.world.routing.routes.insert(me, route),
+                                    None => self.world.routing.routes.remove(&me),
+                                };
+                                return Err(trap);
+                            }
+                            self.set_person_word(WORD_72, 0)?;
+                            return Ok(Flow::Pushed);
+                        }
                     }
-                    if planned != 2 {
-                        return Err(unsupported(
-                            "0x45b285",
-                            &format!("whose planning gave {planned}"),
-                        ));
+                }
+                SITTING => {
+                    // 0x45b3fa: the Sit tree returned true (person +0x1c
+                    // is 0xfe, the target of the return's branch, so the
+                    // same as the last result) and the route succeeded;
+                    // else it gives up with person word 62 as its result,
+                    // or 5 for none.
+                    if self.me()?.last_result {
+                        state = SUCCEEDED;
+                    } else {
+                        state = GIVE_UP;
+                        ctx.result = match self.person_word(ROUTE_RESULT)? {
+                            0 => 5,
+                            word => i32::from(word),
+                        };
                     }
-                    state = START;
                 }
                 PORTAL => {
                     // 0x45afd0.
@@ -885,7 +961,26 @@ impl Machine<'_, '_> {
                  original goes on without the door (0x45c827): {fault}"
             ))
         })?;
-        self.count_use(door)
+        self.count_use(door, false)
+    }
+
+    /// Runs a seat's Sit tree on the person's thread, as the person's
+    /// virtual function 0x34 does (0x45e59b) with no arguments given and
+    /// no flag (0x45c49d): the person is woken, the tree of the seat's
+    /// type is pushed with the seat as its stack object and the person's
+    /// temps as its arguments, and the person starts using the seat. A
+    /// tree that cannot be pushed, where the original's route gives the
+    /// context's result 5 and plans again (0x45c4a8), fails loudly.
+    fn sit(&mut self, seat: u16, tree: u16) -> Result<(), Trap> {
+        let temps = self.me()?.temps.clone();
+        self.wake(self.me)?;
+        self.enter_on(seat, tree, &temps).map_err(|fault| {
+            Trap::Unsupported(format!(
+                "a Sit tree {tree:#06x} of seat {seat} that cannot be pushed, where the \
+                 original's route gives result 5 (0x45c4a8): {fault}"
+            ))
+        })?;
+        self.count_use(seat, false)
     }
 
     /// Plays a tree of the person's own on its thread, as its virtual
@@ -905,7 +1000,7 @@ impl Machine<'_, '_> {
                  to step 6 (0x45b51e): {fault}"
             ))
         })?;
-        self.count_use(me)?;
+        self.count_use(me, false)?;
         if let Some(id) = stack_object {
             self.frame_mut()?.stack_object = id as i16;
         }

@@ -5,7 +5,7 @@
 use crate::support::*;
 use sims_content::{Clip, Event, Profile, Track};
 use sims_core::F32;
-use sims_sim::animator::{LOADED, UNSET};
+use sims_sim::animator::{Base, LOADED, UNSET};
 use sims_sim::motives::{Curve, Rates, Tuning};
 use sims_vm::{Status, Trap};
 
@@ -222,7 +222,7 @@ fn a_finished_clip_sends_the_events_it_missed_then_ends() {
     fx.thread(SIM, 4096, &[-7]);
     assert_eq!(turn(&mut fx).unwrap(), Status::Returned(true));
     let a = &fx.world.animators[&SIM];
-    assert!(!a.playing && a.base);
+    assert!(!a.playing && a.base == Base::Posture);
     assert_eq!((a.state, a.pickup), (3, 0));
     assert!(a.foreground.as_ref().is_some_and(|l| l.finished()));
     assert_eq!(fx.sim().person.as_ref().unwrap().data[19], 0);
@@ -232,7 +232,7 @@ fn a_finished_clip_sends_the_events_it_missed_then_ends() {
     end_clip(&mut fx);
     assert_eq!(turn(&mut fx).unwrap(), Status::Returned(true));
     let a = &fx.world.animators[&SIM];
-    assert!(!a.playing && !a.base);
+    assert!(!a.playing && a.base == Base::Empty);
     assert_eq!(a.state, 3);
 }
 
@@ -373,6 +373,90 @@ fn clip_0_clears_the_carry_slot_and_a_pickup_clears_it_too() {
     assert_eq!((a.carry_mode, a.carry_selection), (0, -1));
 }
 
+#[test]
+fn a_clip_starts_in_the_base_slot_and_repeats() {
+    // 0x58957e: the clip is looked up (reading the appearance again), the
+    // clock slowed by flag 0x80, and the clip started in the base slot
+    // (0x592726), backward with flag 0x02, replacing the posture's clip
+    // there. The true branch is taken at once.
+    let mut fx = sim_animates(animate(1, 3, 0x01 | 0x80 | 0x02, 2, 0));
+    fx.world.animators.insert(
+        SIM,
+        sims_sim::animator::Animator {
+            posture: 0,
+            base: Base::Posture,
+            carry_selection: 3,
+            ..LOADED
+        },
+    );
+    assert_eq!(turn(&mut fx).unwrap(), Status::Returned(true));
+    let a = &fx.world.animators[&SIM];
+    assert_eq!(
+        a.base,
+        Base::Script {
+            clip: CLIP.into(),
+            reverse: true,
+            start: a.clock_at(fx.world.ticks as i32),
+        }
+    );
+    assert!(a.slow && a.skin_dirty && !a.profile_stale);
+    // Nothing else changes: the posture noted, the carry bookkeeping, no
+    // foreground clip, nothing playing, and the next foreground layer
+    // still takes the raised priority.
+    assert_eq!((a.posture, a.carry_mode, a.carry_selection), (0, 0, 3));
+    assert!(a.foreground.is_none() && a.carry.is_none() && !a.playing && a.promote);
+    assert_eq!((a.state, a.selection, a.seen), (3, -1, 0));
+    // Forward without flag 0x80.
+    let mut fx = sim_animates(animate(1, 3, 0x01, 0, 0));
+    assert_eq!(turn(&mut fx).unwrap(), Status::Returned(true));
+    let a = &fx.world.animators[&SIM];
+    assert_eq!(
+        a.base,
+        Base::Script {
+            clip: CLIP.into(),
+            reverse: false,
+            start: a.clock_at(fx.world.ticks as i32),
+        }
+    );
+    assert!(!a.slow);
+}
+
+#[test]
+fn clip_0_clears_the_base_slot() {
+    // 0x589585: the slot is cleared (0x592878), which marks the skin's
+    // layers changed, and the true branch is taken. The posture noted
+    // stays, so the next base update starts the posture's clip again.
+    for base in [
+        Base::Posture,
+        Base::Script {
+            clip: CLIP.into(),
+            reverse: false,
+            start: 0,
+        },
+    ] {
+        let mut fx = sim_animates(animate(0, 3, 0x01, 0, 0));
+        fx.world.animators.insert(
+            SIM,
+            sims_sim::animator::Animator {
+                posture: 0,
+                base,
+                carry_selection: 3,
+                ..LOADED
+            },
+        );
+        assert_eq!(turn(&mut fx).unwrap(), Status::Returned(true));
+        let a = &fx.world.animators[&SIM];
+        assert_eq!(a.base, Base::Empty);
+        assert!(a.skin_dirty);
+        assert_eq!((a.posture, a.state, a.carry_selection), (0, 3, 3));
+    }
+    // An empty slot stays empty, and nothing is marked.
+    let mut fx = sim_animates(animate(0, 3, 0x01, 0, 0));
+    assert_eq!(turn(&mut fx).unwrap(), Status::Returned(true));
+    let a = &fx.world.animators[&SIM];
+    assert!(a.base == Base::Empty && !a.skin_dirty);
+}
+
 /// Marks the clip in the foreground slot as ended.
 fn end_clip(fx: &mut Fixture) {
     fx.world
@@ -388,7 +472,6 @@ fn end_clip(fx: &mut Fixture) {
 #[test]
 fn what_animate_sim_does_not_port_fails_loudly() {
     for (operands, what) in [
-        (animate(1, 3, 0x01, 0, 0), "base slot"),
         (animate(1, 1, 0, 0, 0), "source 1"),
         (animate(2, 3, 0, 0, 0), "not listed"),
     ] {
@@ -433,6 +516,30 @@ fn what_animate_sim_does_not_port_fails_loudly() {
         },
     );
     assert!(unsupported(turn(&mut fx)).contains("defined differently"));
+    // A clip with timed events in the base slot (0x5992b3).
+    let mut fx = sim_animates(animate(1, 3, 0x01, 0, 0));
+    fx.program.animations = Default::default();
+    fx.program.animations.insert(
+        "test.far",
+        Clip {
+            name: CLIP.into(),
+            skill: SKILL.into(),
+            duration: HUNDRED,
+            distance: 0,
+            moving: false,
+            frames: 4,
+            motions: 1,
+            tracks: vec![track(&[(0, &[("xevt", "1")])])],
+            channels: Vec::new(),
+            samples: [0, 0],
+        },
+    );
+    fx.program.animations.insert_samples(SKILL);
+    let message = unsupported(turn(&mut fx));
+    assert!(
+        message.contains("base slot") && message.contains("0x5992b3"),
+        "{message}"
+    );
     // A clip that ends with the person sitting starts posture 1's base
     // clip, whose name this person's word 64 makes the lookup take from
     // the special tables (0x59db44).
@@ -713,6 +820,62 @@ fn an_arrival_after_a_route_is_noted_and_directions_wrap() {
 }
 
 #[test]
+fn a_turn_of_less_than_a_step_faces_the_destination_at_once() {
+    // Arrived, an eighth of a direction short of the destination's: less
+    // than a step (a quarter over the speed), and within the epsilon of
+    // its destination's coordinates. The animator is put at its
+    // destination (0x58dfcf), the direction goes to data word 1, and state
+    // 3 runs again, which notes the route's end. No clip plays. The person
+    // is of kind 0 (word 65), whose bounds are not scaled.
+    let mut fx = standing();
+    fx.sim_mut().person.as_mut().unwrap().data[65] = 0;
+    let [half, quarter] = [0x3f00_0000, 0x3e80_0000].map(F32::from_bits);
+    fx.world.animators.insert(
+        SIM,
+        sims_sim::animator::Animator {
+            arrival: -1,
+            position: [
+                F32::from_bits(0x3f00_0005),
+                F32::from_bits(0x3e80_0003),
+                F32::from_f32(2.4375),
+            ],
+            destination: [half, quarter, F32::from_f32(2.5625)],
+            ..LOADED
+        },
+    );
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.state, a.arrival, a.selection), (3, 2, -1));
+    assert!(a.foreground.is_none());
+    let bits = |v: [F32; 3]| v.map(F32::to_bits);
+    assert_eq!(bits(a.position), [0x3f00_0000, 0x3e80_0000, 0x4024_0000]);
+    assert_eq!(bits(a.destination), bits(a.position));
+    assert_eq!(fx.sim().data[1], 3);
+    // Half a direction is a step at least: a turn with a clip, which this
+    // Sim's tables do not name (an adult, word 58, with no special
+    // tables, word 64).
+    let mut fx = standing();
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    person.data[58] = 20;
+    person.data[64] = 0;
+    person.data[65] = 0;
+    fx.world.animators.insert(
+        SIM,
+        sims_sim::animator::Animator {
+            position: [half, quarter, F32::from_f32(2.0)],
+            destination: [half, quarter, F32::from_f32(2.5)],
+            ..LOADED
+        },
+    );
+    assert!(
+        tick(&mut fx)
+            .unwrap_err()
+            .to_string()
+            .contains("has no name for its clip 10")
+    );
+}
+
+#[test]
 fn off_the_lot_the_animator_only_places_itself() {
     let mut fx = standing();
     fx.sim_mut().position = [-16, -16, 1];
@@ -866,9 +1029,11 @@ fn a_clips_timed_events_are_handled_as_it_plays() {
 
 #[test]
 fn the_carry_layer_plays_with_the_foreground_in_the_skins_order() {
-    // 0x5992b3 updates the skin's layers in its list's order, so the
-    // events of the layer that comes first are queued first. The carry
-    // layer repeats at its end (end mode 1).
+    // 0x5992b3 updates the skin's layers in its list's order, sorted by
+    // priority (0x5991fd), so the events of the layer that comes first
+    // are queued first. Of two layers of the same priority, the one put in
+    // the list first comes first. The carry layer repeats at its end (end
+    // mode 1).
     for (carry_first, queued) in [(false, [1, 2]), (true, [2, 1])] {
         let mut fx = standing();
         fx.program.animations.insert(
@@ -907,10 +1072,12 @@ fn the_carry_layer_plays_with_the_foreground_in_the_skins_order() {
         let mut carry = start("carry-clip", 500);
         carry.mode = 1;
         carry.priority = 10;
+        let mut foreground = start(CLIP, 500);
+        foreground.priority = 10;
         fx.world.animators.insert(
             SIM,
             sims_sim::animator::Animator {
-                foreground: Some(start(CLIP, 500)),
+                foreground: Some(foreground),
                 carry: Some(carry),
                 carry_mode: 6,
                 carry_first,
@@ -932,6 +1099,210 @@ fn the_carry_layer_plays_with_the_foreground_in_the_skins_order() {
     }
 }
 
+/// The standing Sim with something in its hands, the global adult
+/// tables naming `name` as the posture's clip 0x26, the carry clip.
+fn carrying(name: &str) -> Fixture {
+    let mut fx = standing();
+    fx.sim_mut().slots[1].object = 1;
+    fx.sim_mut().person.as_mut().unwrap().data[64] = 0;
+    let mut names = vec![String::new(); 0x27];
+    names[0x26] = name.into();
+    for table in [152, 153] {
+        fx.program
+            .libraries
+            .get_mut(&GLOBAL)
+            .unwrap()
+            .strings
+            .insert(table, names.clone());
+    }
+    fx
+}
+
+#[test]
+fn a_person_carrying_starts_the_carry_clip_until_its_hands_are_empty() {
+    // 0x5903a3: something in the first contained slot sets the carry mode
+    // to 1 and chooses carry clip 0, which starts the posture's clip 0x26
+    // in the carry slot (0x5903fc): forward, stopping at its end (end mode
+    // 0), at priority 10, read with the appearance read again first.
+    let mut fx = carrying(CLIP);
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.carry_mode, a.carry_selection), (1, 0));
+    assert!(!a.profile_stale && !a.carry_first && !a.skin_dirty);
+    let carry = a.carry.as_ref().unwrap();
+    assert_eq!(carry.clip, CLIP);
+    assert_eq!(
+        (carry.priority, carry.mode, carry.interruptible),
+        (10, 0, -1)
+    );
+    assert_eq!((carry.current, carry.previous), (500, 500));
+    assert_eq!(
+        (carry.speed.to_bits(), carry.phase.to_bits()),
+        (0x3f80_0000, 0)
+    );
+    // The carry clip stays chosen: the layer is not started again, and
+    // the skin's update takes it through the clip (50 per tick over 100
+    // ms) to its end, where it stops.
+    tick(&mut fx).unwrap();
+    let carry = fx.world.animators[&SIM].carry.clone().unwrap();
+    assert_eq!((carry.current, carry.previous), (550, 500));
+    assert_eq!(carry.phase.to_bits(), 0x3f00_0000);
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    let carry = a.carry.as_ref().unwrap();
+    assert!(carry.ended && carry.finished());
+    assert_eq!(
+        (carry.speed.to_bits(), carry.phase.to_bits()),
+        (0, 0x3f80_0000)
+    );
+    assert_eq!((a.carry_mode, a.carry_selection), (1, 0));
+    // Empty hands choose -1, which clears the slot at once.
+    fx.sim_mut().slots[1].object = 0;
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.carry_mode, a.carry_selection), (0, -1));
+    assert!(a.carry.is_none());
+    // While a clip that picks something up plays (+0x1a4), -1 is chosen
+    // whatever the hands hold, and the carry mode stays.
+    let mut fx = carrying(CLIP);
+    tick(&mut fx).unwrap();
+    fx.world.animators.get_mut(&SIM).unwrap().pickup = 1;
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.carry_mode, a.carry_selection), (1, -1));
+    assert!(a.carry.is_none());
+}
+
+#[test]
+fn the_skin_updates_its_layers_by_priority() {
+    // The carry clip goes in before a foreground layer of raised priority
+    // (0x599128), but the skin's update first sorts its layers by
+    // priority (0x5991fd), so the foreground's events come first. A
+    // foreground of higher priority than the carry layer's 10 stays after
+    // it, and one of the same priority keeps its place in the list.
+    for (priority, queued) in [(6, [1, 2]), (11, [2, 1]), (10, [2, 1])] {
+        let mut fx = carrying("carry-clip");
+        fx.program.animations.insert(
+            "test.far",
+            Clip {
+                name: CLIP.into(),
+                skill: SKILL.into(),
+                duration: HUNDRED,
+                distance: 0,
+                moving: false,
+                frames: 4,
+                motions: 1,
+                tracks: vec![track(&[(0, &[("xevt", "1")])])],
+                channels: Vec::new(),
+                samples: [0, 0],
+            },
+        );
+        fx.program.animations.insert(
+            "carry.far",
+            Clip {
+                name: "carry-clip".into(),
+                skill: SKILL.into(),
+                duration: HUNDRED,
+                distance: 0,
+                moving: false,
+                frames: 4,
+                motions: 1,
+                tracks: vec![track(&[(0, &[("xevt", "2")])])],
+                channels: Vec::new(),
+                samples: [0, 0],
+            },
+        );
+        let mut foreground =
+            sims_sim::animator::Layer::start(CLIP, F32::from_bits(HUNDRED), 4, true, 1, false, 450);
+        foreground.priority = priority;
+        fx.world.animators.insert(
+            SIM,
+            sims_sim::animator::Animator {
+                foreground: Some(foreground),
+                profile_stale: false,
+                ..LOADED
+            },
+        );
+        tick(&mut fx).unwrap();
+        let a = &fx.world.animators[&SIM];
+        assert_eq!(a.events, queued, "foreground priority {priority}");
+        // The order the layers were put in is kept.
+        assert!(a.carry_first);
+    }
+    // A carry layer put in after a foreground layer whose priority is
+    // above its own updates first, whether or not the skin has changed
+    // since the last update, whose sort left that order.
+    for dirty in [true, false] {
+        let queued = [2, 1];
+        let mut fx = standing();
+        fx.program.animations.insert(
+            "test.far",
+            Clip {
+                name: CLIP.into(),
+                skill: SKILL.into(),
+                duration: HUNDRED,
+                distance: 0,
+                moving: false,
+                frames: 4,
+                motions: 1,
+                tracks: vec![track(&[(0, &[("xevt", "1")])])],
+                channels: Vec::new(),
+                samples: [0, 0],
+            },
+        );
+        fx.program.animations.insert(
+            "carry.far",
+            Clip {
+                name: "carry-clip".into(),
+                skill: SKILL.into(),
+                duration: HUNDRED,
+                distance: 0,
+                moving: false,
+                frames: 4,
+                motions: 1,
+                tracks: vec![track(&[(0, &[("xevt", "2")])])],
+                channels: Vec::new(),
+                samples: [0, 0],
+            },
+        );
+        let start = |clip: &str| {
+            sims_sim::animator::Layer::start(clip, F32::from_bits(HUNDRED), 4, true, 1, false, 450)
+        };
+        let mut foreground = start(CLIP);
+        foreground.priority = 11;
+        let mut carry = start("carry-clip");
+        carry.priority = 10;
+        carry.mode = 1;
+        fx.world.animators.insert(
+            SIM,
+            sims_sim::animator::Animator {
+                foreground: Some(foreground),
+                carry: Some(carry),
+                carry_mode: 6,
+                skin_dirty: dirty,
+                skin_clock: 450,
+                profile_stale: false,
+                ..LOADED
+            },
+        );
+        tick(&mut fx).unwrap();
+        let a = &fx.world.animators[&SIM];
+        assert_eq!(a.events, queued, "skin changed: {dirty}");
+        assert!(!a.carry_first);
+    }
+}
+
+#[test]
+fn a_carry_clip_not_found_fails_loudly() {
+    // The original leaves the slot empty and still notes clip 0 chosen.
+    let mut fx = carrying("");
+    let message = tick(&mut fx).unwrap_err().to_string();
+    assert!(message.contains("0x59db2f"), "{message}");
+    let mut fx = carrying("a-clip-no-file-holds");
+    let message = tick(&mut fx).unwrap_err().to_string();
+    assert!(message.contains("0x59dc32"), "{message}");
+}
+
 #[test]
 fn a_timed_event_not_ported_fails_loudly() {
     for key in ["dress", "undress"] {
@@ -946,10 +1317,6 @@ fn a_timed_event_not_ported_fails_loudly() {
 
 #[test]
 fn what_the_animator_tick_does_not_port_fails_loudly() {
-    // Something in the Sim's hands.
-    let mut fx = standing();
-    fx.sim_mut().slots[1].object = 1;
-    assert!(tick(&mut fx).unwrap_err().to_string().contains("carry"));
     // The head following something is ported (0x5907c5): with the target
     // an eighth of a turn away the turn moves by its most, 0.2. This
     // person type binds no head anchors, so nothing is measured.
@@ -1482,14 +1849,65 @@ fn sitting(name: &str) -> Fixture {
 }
 
 #[test]
+fn the_base_update_keeps_a_scripts_clip_until_the_posture_changes() {
+    // 0x590430 for a standing Sim whose definition word 102 lets the base
+    // layer start, with a clip Animate Sim put in the base slot.
+    let script = || Base::Script {
+        clip: CLIP.into(),
+        reverse: false,
+        start: 0,
+    };
+    let base_after = |kind: i16, noted: i32, flags: i16| {
+        let mut fx = standing();
+        sim_definition(&mut fx)[102] = flags;
+        fx.sim_mut().person.as_mut().unwrap().data[65] = kind;
+        fx.world.animators.insert(
+            SIM,
+            sims_sim::animator::Animator {
+                posture: noted,
+                base: script(),
+                ..LOADED
+            },
+        );
+        tick(&mut fx).unwrap();
+        let a = &fx.world.animators[&SIM];
+        (a.base.clone(), a.posture)
+    };
+    // A person of kind at most 1 keeps it while the posture is the one
+    // noted.
+    assert_eq!(base_after(0, 0, 0), (script(), 0));
+    assert_eq!(base_after(1, 0, 0), (script(), 0));
+    // Any other kind has it replaced by the posture's clip.
+    assert_eq!(base_after(2, 0, 0), (Base::Posture, 0));
+    // Another posture noted clears it, and the posture's clip starts.
+    assert_eq!(base_after(0, 1, 0), (Base::Posture, 0));
+    // With bit 2 of word 102 set, it is cleared and nothing starts; with
+    // the posture unchanged, it stays whatever the kind.
+    assert_eq!(base_after(0, 1, 4), (Base::Empty, 1));
+    assert_eq!(base_after(2, 0, 4), (script(), 0));
+    // The reset (0x589220) empties the slot too.
+    let mut a = sims_sim::animator::Animator {
+        base: script(),
+        ..LOADED
+    };
+    a.reset().unwrap();
+    assert!(a.base == Base::Empty && a.skin_dirty);
+}
+
+#[test]
 fn postures_1_and_2_start_their_base_clip_once_it_is_found() {
     // Posture 1's base clip is its clip 1, found without timed events: the
     // base layer starts.
     let mut fx = sitting(CLIP);
-    assert!(fx.world.animators.get(&SIM).is_none_or(|a| !a.base));
+    assert!(
+        fx.world
+            .animators
+            .get(&SIM)
+            .is_none_or(|a| a.base == Base::Empty)
+    );
     tick(&mut fx).unwrap();
     let animator = &fx.world.animators[&SIM];
-    assert_eq!((animator.posture, animator.base), (1, true));
+    assert_eq!((animator.posture, &animator.base), (1, &Base::Posture));
     // A clip with no name (0x5904af), or a name no file holds (0x59dc32),
     // fails loudly, as does a clip with timed events (0x5992b3).
     let mut fx = sitting("");
@@ -1530,7 +1948,7 @@ fn postures_1_and_2_start_their_base_clip_once_it_is_found() {
         if found {
             tick(&mut fx).unwrap();
             let animator = &fx.world.animators[&SIM];
-            assert_eq!((animator.posture, animator.base), (2, true));
+            assert_eq!((animator.posture, &animator.base), (2, &Base::Posture));
         } else {
             assert!(tick(&mut fx).unwrap_err().to_string().contains("0x5904af"));
         }

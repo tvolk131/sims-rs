@@ -36,9 +36,9 @@
 //! A local that still holds half of a pointer the original left in the
 //! frame storage fails loudly, as every local read does.
 //!
-//! What the queue does not port fails loudly there: an entry that runs at
-//! once (its flag 4), an action put at the queue's front, and one that
-//! goes before queued actions.
+//! What the queue does not port fails loudly there: an action that goes
+//! before queued actions, and one queued, not at the front, on the person
+//! whose action runs at once.
 //!
 //! Ported from the original's code (above). The old prototype's port
 //! (legacy/crates/sims-vm/src/action.rs) agrees on the steps.

@@ -284,6 +284,7 @@ fn program() -> Program {
         zoning: BTreeMap::new(),
         animations: Default::default(),
         people: Default::default(),
+        icon_frames: None,
     };
     for (resource, guid, kind) in [(LAMP_FILE, LAMP_GUID, 4), (SIM_FILE, SIM_GUID, 2)] {
         let library = program.libraries.get_mut(&resource).unwrap();

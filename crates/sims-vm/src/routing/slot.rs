@@ -3,25 +3,29 @@
 //! there (0x45c38e).
 //!
 //! Ported from the original's code. Only what the Goth house's routes to
-//! update 261 reach is ported:
+//! update 261, and a player's snack order, reach is ported:
 //!
 //! - a slot with no flags in its low byte: one place, the slot's offset
-//!   turned by the object's direction (0, 2, 4 or 6; [`transform`]);
-//! - a slot with flags in its low byte, for a person standing: rows of
-//!   places searched by distance in each flagged direction
+//!   turned by the object's direction ([`transform`]; the diagonals
+//!   through a rotation matrix, [`turn_by_matrix`]);
+//! - a slot with flags in its low byte: rows of places searched by
+//!   distance in each flagged direction
 //!   ([`Interpreter::search_by_distance`]), each classified
-//!   ([`Interpreter::classify`]);
+//!   ([`Interpreter::classify`]), and with a sitting weight the seats
+//!   beside each place ([`Interpreter::seat_beside`]);
 //! - the last step of the route: toward the slot's object (facing -2),
 //!   away from it (-1), on along the path (-3), or one tile in the
-//!   object's direction turned by a set facing (0 to 7).
+//!   object's direction turned by a set facing (0 to 7);
+//! - for a place chosen beside a seat, the seat's Sit tree instead
+//!   ([`SlotRoute::Sit`]).
 //!
-//! Every other branch fails loudly: seats, a random part of a score,
-//! more places than the context's limit, a diagonal turn of a place,
-//! and a place the person does not fit at (whose answer depends on why).
+//! Every other branch fails loudly: a slot with flag 0x10000, a person of
+//! a kind above 1, and a refusal of the place test whose placement error
+//! was not read.
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Stream};
-use crate::placement::{Refusal, capture, closed_directions};
+use crate::placement::{Refusal, capture, closed_directions, first_kept_on};
 use sims_core::{Ext, F32};
 use sims_formats::execution::Slot;
 use sims_sim::World;
@@ -46,6 +50,26 @@ const JITTER: i32 = 0x2000;
 /// 16 as a float (0x666a54) and 1/16 (0x667278).
 const SIXTEEN: F32 = F32::from_bits(0x4180_0000);
 const SIXTEENTH: F32 = F32::from_bits(0x3d80_0000);
+/// The resolution of a search with seats: one tile (0x4836bf).
+const TILE: i32 = 16;
+/// The object function a seat has: Sit (callback 0x1a).
+const SIT: usize = 26;
+/// The object definition word whose bits say from which of the eight
+/// places around it a seat may be sat in (OBJD +0x84).
+const SEAT_ENTRIES: usize = 66;
+/// Where each seat index looks for a seat from a place (jump table
+/// 0x483d2b): the change to the place's first and second coordinates,
+/// before the place is turned to its direction.
+const SEAT_STEP: [[i32; 2]; 8] = [
+    [0, -16],
+    [16, -16],
+    [16, 0],
+    [16, 16],
+    [0, 16],
+    [-16, 16],
+    [-16, 0],
+    [-16, -16],
+];
 
 fn unsupported(at: &str, what: &str) -> Trap {
     Trap::Unsupported(format!("{what} ({at}), which is not ported"))
@@ -199,11 +223,11 @@ pub(crate) fn direction(from: [i32; 2], to: [i32; 2]) -> i32 {
 /// A slot's place: the point `[a, b]` from the slot's object at `pos`,
 /// turned by the direction `dir` (0x483d4b). Direction 2 truncates `a`
 /// and gives `[-b, a]`; 4 gives `[-a, -b]`; 6 truncates `a` and gives
-/// `[b, -a]`. The second coordinate of `pos` plus the first of the turned
-/// point, and the first of `pos` plus the second, are each rounded to
-/// single precision and truncated. The diagonals (a rotation matrix,
-/// 0x455070) are not ported.
-pub(crate) fn transform(pos: [i32; 2], a: F32, b: F32, dir: i32) -> Result<[i32; 2], Trap> {
+/// `[b, -a]`; any other turns through a matrix ([`turn_by_matrix`]). The
+/// second coordinate of `pos` plus the first of the turned point, and the
+/// first of `pos` plus the second, are each rounded to single precision
+/// and truncated.
+pub(crate) fn transform(pos: [i32; 2], a: F32, b: F32, dir: i32) -> [i32; 2] {
     let (a, b) = match dir {
         0 => (a.ext(), b.ext()),
         2 => (
@@ -215,16 +239,88 @@ pub(crate) fn transform(pos: [i32; 2], a: F32, b: F32, dir: i32) -> Result<[i32;
             b.ext(),
             Ext::from_i32(a.ext().to_i32_truncate().wrapping_neg()),
         ),
-        _ => {
-            return Err(unsupported(
-                "0x483d7c",
-                &format!("a slot place turned by direction {dir}"),
-            ));
-        }
+        _ => turn_by_matrix(a, b, dir),
     };
     let second = (Ext::from_i32(pos[1]) + a).single();
     let first = (b + Ext::from_i32(pos[0])).single();
-    Ok([first.to_i32_truncate(), second.to_i32_truncate()])
+    [first.to_i32_truncate(), second.to_i32_truncate()]
+}
+
+/// A slot place's point turned by a direction other than 0, 2, 4 and 6
+/// (0x483d7c), as the original turns it, in world units through a
+/// rotation matrix:
+///
+/// 1. The angle is `dir` times pi (0x673438) times 1/4 (0x666a48),
+///    stored as a float (0x455070). Its cosine `c` and sine `s` are
+///    stored as floats, and the matrix (0x5c3a20, axis 1) has the rows
+///    `[c, 0, -s, 0]`, `[0, 1, 0, 0]`, `[s, 0, c, 0]` and `[0, 0, 0, 1]`.
+/// 2. The point goes to world units (0x454ecc): the vector `[k b, h, k
+///    a]` with `k` 3/16 (3 times 1/16, stored) and the height `h` 0.
+/// 3. The vector times the matrix (0x5c39a0, 0x5c4510), divided by its
+///    fourth coordinate (1 here): the first coordinate is `s` times the
+///    third plus `c` times the first, the third is `-s` times the first
+///    plus `c` times the third. The terms with the height and the
+///    matrix's zeros add nothing to the value.
+/// 4. Back to the lot's units (0x454fb9): each of the third and first
+///    coordinates times 16/3 (stored), rounded half away from zero (0.5
+///    added and floored, 0x636ac9, or taken away and ceiled, 0x636b98),
+///    gives the new `a` and `b`.
+///
+/// Every add, multiply and divide is rounded to single precision.
+fn turn_by_matrix(a: F32, b: F32, dir: i32) -> (Ext, Ext) {
+    let (c, s) = facing_cos_sin(dir);
+    // 0x454ecc.
+    let v0 = to_world_units(b.ext());
+    let v2 = to_world_units(a.ext());
+    // 0x5c4510: the fourth coordinate is 1, so its reciprocal is 1.
+    let first = ((s * v2).single() + (v0 * c).single()).single();
+    let third = ((-s * v0).single() + (c * v2).single()).single();
+    // 0x454fb9.
+    (
+        Ext::from_i32(to_lot_units(third)),
+        Ext::from_i32(to_lot_units(first)),
+    )
+}
+
+/// The cosine and sine of a facing `dir` as the original's rotation
+/// matrix holds them (0x455070, 0x5c3a20 axis 1): the angle is `dir`
+/// times pi (0x673438) times 1/4 (0x666a48), stored as a float, and its
+/// cosine and sine are stored as floats. They come from libm (see
+/// [`Ext::cos`] for the **unverified** caveat).
+pub(crate) fn facing_cos_sin(dir: i32) -> (Ext, Ext) {
+    const PI: F32 = F32::from_bits(0x4049_0fdb);
+    const QUARTER: F32 = F32::from_bits(0x3e80_0000);
+    let angle = ((Ext::from_i32(dir) * PI.ext()).single() * QUARTER.ext()).to_f32();
+    (
+        Ext::cos(angle).to_f32().ext(),
+        Ext::sin(angle).to_f32().ext(),
+    )
+}
+
+/// A coordinate in the lot's units (16 to a tile) in world units, as
+/// 0x454ecc and 0x454f5c take it: times 3/16 (3 times 1/16, stored once
+/// at 0x703f34 and 0x703f24), rounded to single precision and stored.
+pub(crate) fn to_world_units(n: Ext) -> Ext {
+    const THREE: F32 = F32::from_bits(0x4040_0000);
+    let k = (THREE.ext() * SIXTEENTH.ext()).to_f32().ext();
+    (k * n).to_f32().ext()
+}
+
+/// A coordinate in world units back in the lot's units (0x454fb9): times
+/// 16/3 (stored once at 0x703f1c), rounded half away from zero (0.5
+/// added and floored, 0x636ac9, or taken away and ceiled, 0x636b98) and
+/// truncated to an integer (0x636128).
+pub(crate) fn to_lot_units(v: Ext) -> i32 {
+    const THREE: F32 = F32::from_bits(0x4040_0000);
+    const HALF: F32 = F32::from_bits(0x3f00_0000);
+    let scale = (SIXTEEN.ext() / THREE.ext()).to_f32().ext();
+    let v = (scale * v).single();
+    let whole = if v >= Ext::from_i32(0) {
+        (v + HALF.ext()).single().floor()
+    } else {
+        -(-(v - HALF.ext()).single()).floor()
+    };
+    whole.to_i32_truncate()
 }
 
 /// The person turns for a slot place (0x483e63): with no flags in the
@@ -265,9 +361,14 @@ impl Refusals {
         self.0[byte] = true;
     }
 
-    /// The context's result when no place was found (0x483eb7). Bytes 0
-    /// and 1, which only the search with seats sets, are kept for the
-    /// order.
+    /// Byte 1: a seat was taken by someone else (0x483a3a).
+    fn note_taken(&mut self) {
+        self.0[1] = true;
+    }
+
+    /// The context's result when no place was found (0x483eb7). Byte 0
+    /// starts set for a search with seats and no standing weight
+    /// (0x4836d8); byte 1 notes a seat taken by another.
     fn result(&self) -> i32 {
         let b = self.0;
         if b[1] {
@@ -285,6 +386,43 @@ impl Refusals {
         } else {
             0
         }
+    }
+}
+
+/// What a seat index finds beside a place (0x48391f to 0x483a51).
+#[derive(Debug, PartialEq, Eq)]
+enum Beside {
+    /// No seat that may be sat in from the place.
+    Nothing,
+    /// A seat someone else is in: that person or object.
+    Taken(u16),
+    /// A free seat, or the person's own.
+    Seat(u16),
+}
+
+/// Whether a point is off the lot's inner tiles (0x422632): either
+/// coordinate's tile, as a signed byte, below 1 or not below the lot's
+/// size less 1.
+fn off_lot(world: &World, point: [i32; 2]) -> bool {
+    let size = i32::from(world.size);
+    let ok = |c: i32| {
+        let n = i32::from((c >> 4) as i8);
+        n >= 1 && n < size - 1
+    };
+    !ok(point[0]) || !ok(point[1])
+}
+
+/// Whether a seat index's point (`at`, before turning, in the search's
+/// row and column units) lies inside the part of the search the row
+/// covers (0x4838e7): on the row's own tile row, from the row to `last`;
+/// on a row nearer the object, strictly between them; any row further
+/// out passes.
+fn seat_in_row(at: [i32; 2], row: i32, last: i32) -> bool {
+    let (column, line) = (at[0] >> 4, at[1] >> 4);
+    match line.cmp(&row) {
+        std::cmp::Ordering::Equal => row <= column && column <= last,
+        std::cmp::Ordering::Greater => row < column && column < last,
+        std::cmp::Ordering::Less => true,
     }
 }
 
@@ -449,10 +587,7 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        // 0x481898.
-        ctx.candidates.clear();
-        ctx.chosen = -1;
-        ctx.best = -1;
+        drop_candidates(ctx);
         let flags = ctx.slot.flags;
         let mut rot = i32::from(datum(world, ctx.target, DIRECTION).map_err(fail)?);
         if flags & 0x200 != 0 {
@@ -471,7 +606,7 @@ impl Interpreter<'_> {
             return self.search_by_distance(world, ctx, rot, pos);
         }
         let [ox, oy, _] = ctx.slot.offset.map(F32::from_bits);
-        let out = transform(pos, ox, oy, rot).map_err(fail)?;
+        let out = transform(pos, ox, oy, rot);
         // 0x4834c8: a place on another tile is approached from the
         // object's side.
         let same_tile =
@@ -497,36 +632,113 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    /// The search by distance (0x483598), for a person standing. For each
-    /// of the eight directions whose bit is set in the slot flags' low
-    /// byte, taken from the slot's object's direction `rot`:
+    /// The seat at a point, for a place approached from direction `dir`
+    /// with seat index `index` (0x48391f to 0x483a51):
+    ///
+    /// 1. A point off the lot's inner tiles ([`off_lot`]) has none.
+    /// 2. The object there is the first on its tile, at the level of the
+    ///    slot's object (+0x110), that is not passed over
+    ///    ([`first_kept_on`]).
+    /// 3. It is a seat to sit in from the place if it has a Sit function
+    ///    (callback 0x1a), faces back toward the place (its data word 1 is
+    ///    `dir` + 4, modulo 8), and bit `index` of its definition's word 66
+    ///    is set. (A test of the absolute value of 0 against 1 follows,
+    ///    0x4839c9, and never refuses.)
+    /// 4. The seat's first container slot (object +0x130, its second
+    ///    record) holding an object other than the person makes it taken
+    ///    by that object.
+    fn seat_beside(
+        &self,
+        world: &World,
+        ctx: &Context,
+        point: [i32; 2],
+        dir: i32,
+        index: usize,
+    ) -> Result<Beside, Trap> {
+        if off_lot(world, point) {
+            return Ok(Beside::Nothing);
+        }
+        let level = world
+            .objects
+            .get(&ctx.target)
+            .ok_or_else(|| Trap::native(10, "missing object"))?
+            .position[2];
+        let Some(seat) = first_kept_on(world, [point[1], point[0]], level)? else {
+            return Ok(Beside::Nothing);
+        };
+        if !self.has_function(world, seat, SIT) {
+            return Ok(Beside::Nothing);
+        }
+        if i32::from(datum(world, seat, DIRECTION)?) != dir.wrapping_add(4) % 8 {
+            return Ok(Beside::Nothing);
+        }
+        let object = world
+            .objects
+            .get(&seat)
+            .ok_or_else(|| Trap::native(10, "missing object"))?;
+        let entries = self
+            .catalog
+            .object(object.guid)
+            .and_then(|d| self.program.definition(d.resource, d.chunk))
+            .ok_or_else(|| Trap::Invalid(format!("seat {seat} has no definition")))?[SEAT_ENTRIES]
+            as u16;
+        if entries & (1 << index) == 0 {
+            return Ok(Beside::Nothing);
+        }
+        let occupant = object
+            .slots
+            .get(1)
+            .and_then(|held| u16::try_from(held.object).ok())
+            .filter(|id| *id > 0 && world.objects.contains_key(id));
+        Ok(match occupant {
+            Some(other) if other != ctx.person => Beside::Taken(other),
+            _ => Beside::Seat(seat),
+        })
+    }
+
+    /// The search by distance (0x483598). The sitting weight is 10 times
+    /// slot +0x14 when the call's argument (person word 65 at most 1,
+    /// 0x4823d0) is set, which it always is here, as kinds above 1 fail
+    /// loudly before ([`Self::find_candidates`]); the standing weight is
+    /// 10 times the greater of slot +0x10 and +0x18. With a sitting
+    /// weight the search goes tile by tile (resolution 16, not slot
+    /// +0x38), and one row further in and out (0x48378b; the nearest row
+    /// is at least one in). For each of the eight directions whose bit is
+    /// set in the slot flags' low byte, taken from the slot's object's
+    /// direction `rot`:
     ///
     /// 0. Without slot flag 0x800, a direction the object's tile is
     ///    closed off in ([`closed_directions`], turned to `rot`) is
     ///    refused as answer 3 would refuse it, and skipped.
     /// 1. The person turns for the direction ([`face`]).
-    /// 2. Rows of points, one resolution (slot +0x38) apart, go from the
-    ///    nearest row inside the least distance (slot +0x24) out to the
-    ///    farthest inside the greatest (slot +0x28). A row at distance
-    ///    `r` (counted in resolutions) spans from `-r` to `r`, one less at
+    /// 2. Rows of places, one resolution apart, go from the nearest row
+    ///    inside the least distance (slot +0x24) out to the farthest
+    ///    inside the greatest (slot +0x28). A row at distance `r`
+    ///    (counted in resolutions) spans from `-r` to `r`, one less at
     ///    the end when the direction two further on is also in the flags.
-    /// 3. A point whose distance from the object is outside the least and
-    ///    greatest is skipped. Otherwise it scores 100 plus 10 times the
-    ///    greater of the standing and ground weights (slot +0x10, +0x18),
-    ///    less the distance from the best (slot +0x2c, rounded down) times
-    ///    the gradient (slot +0x30); 25 more when neither the direction
-    ///    nor the one on either side of it is closed off (always with
-    ///    flag 0x800), and 20 more when the place is where the person
-    ///    starts.
-    /// 4. The point is classified ([`Self::classify`]). A place the person
-    ///    may stand at becomes a candidate, its word +0xe the direction's
-    ///    bit; then the next point. Answer 3 ends the direction at the end
-    ///    of the row.
-    ///
-    /// Each point is scored and classified once (0x483a5d: the loop over
-    /// the standing place, the eight seats and the standing place again
-    /// takes the place at the first or the last index, whichever weight is
-    /// the larger; seats fail loudly, so the sitting weight is 0).
+    /// 3. Each place is tried as index -1 to 8 (0x48386e), until one
+    ///    gives a candidate:
+    ///    - index -1 when the standing weight is at least the sitting
+    ///      weight, else index 8: the place itself, with the standing
+    ///      weight, its word +0xc 0 and its word +0xe the direction's bit
+    ///      (0x483a5d);
+    ///    - indices 0 to 7, with a sitting weight: the point one tile from
+    ///      the place by [`SEAT_STEP`], if it lies in the row's part of
+    ///      the search ([`seat_in_row`]), and a seat there
+    ///      ([`Self::seat_beside`]) gives the sitting weight, word +0xc the
+    ///      seat and word +0xe the index's bit. A seat taken by another
+    ///      notes byte 1 of the refusals and the other in the context's
+    ///      word +0x8c.
+    /// 4. With a weight, the point tried (for a seat, the seat's point)
+    ///    must lie between the least and greatest distances from the
+    ///    object. It scores 100 plus the weight, less the distance from
+    ///    the best (slot +0x2c, rounded down) times the gradient (slot
+    ///    +0x30); 25 more when neither the direction nor the one on either
+    ///    side of it is closed off (always with flag 0x800), and 20 more
+    ///    when the point is where the person starts.
+    /// 5. The place itself is classified ([`Self::classify`]). One the
+    ///    person may stand at becomes a candidate, and the next place
+    ///    follows. Answer 3 ends the direction at the end of the row.
     ///
     /// With slot flag 0x2000, each score also takes a draw from the active
     /// random stream (0x46f457) modulo 20, less 10, before the additions
@@ -534,8 +746,6 @@ impl Interpreter<'_> {
     ///
     /// More candidates than the context's limit leave a random choice of
     /// them ([`choose_at_random`]).
-    ///
-    /// Fails loudly for a slot with a sitting weight (seats).
     fn search_by_distance(
         &self,
         world: &mut World,
@@ -559,9 +769,9 @@ impl Interpreter<'_> {
         {
             return Ok(());
         }
-        if slot.sitting.wrapping_mul(10) != 0 {
-            return Err(fail(unsupported("0x4835f0", "a slot search with seats")));
-        }
+        // 0x4835f0: the weights.
+        let sitting = slot.sitting.wrapping_mul(10);
+        let weight = slot.standing.max(slot.ground).wrapping_mul(10);
         // 0x483660: the directions the target's tile is closed off in,
         // turned to the target's facing, and those beside them.
         let closed = if slot.flags & 0x800 == 0 {
@@ -581,8 +791,8 @@ impl Interpreter<'_> {
             }
         }
         let jitter = slot.flags & JITTER != 0;
-        let weight = slot.standing.max(slot.ground).wrapping_mul(10);
-        let resolution = slot.resolution;
+        // 0x4836b4: a search with seats goes tile by tile.
+        let resolution = if sitting != 0 { TILE } else { slot.resolution };
         let gradient = F32::from_bits(slot.gradient);
         // 16 / resolution, in single precision (0x666a54).
         let scale = (SIXTEEN.ext() / Ext::from_i32(resolution)).single();
@@ -591,8 +801,19 @@ impl Interpreter<'_> {
                 .single()
                 .to_i32_truncate()
         };
-        let (low, high) = (row_of(far), row_of(near));
+        let (mut low, mut high) = (row_of(far), row_of(near));
+        // 0x48378b: with seats, a row further out, and one further in that
+        // is still at least one row in.
+        if sitting > 0 {
+            low = low.wrapping_sub(1);
+            high = high.wrapping_add(1);
+            if high >= 0 {
+                high = -1;
+            }
+        }
+        // 0x4836d8: byte 0 starts set for seats with no standing weight.
         let mut refusals = Refusals::default();
+        refusals.0[0] = sitting > 0 && weight == 0;
         for rel in 0..8 {
             let bit = 1 << rel;
             if slot.flags & bit == 0 {
@@ -615,62 +836,101 @@ impl Interpreter<'_> {
                     let x = Ext::from_i32(column.wrapping_mul(resolution)).to_f32();
                     let a = (x.ext() + F32::from_bits(slot.offset[0]).ext()).single();
                     let b = (y.ext() + F32::from_bits(slot.offset[1]).ext()).single();
-                    let place = transform(pos, a.to_f32(), b.to_f32(), dir).map_err(fail)?;
+                    let place = transform(pos, a.to_f32(), b.to_f32(), dir);
                     let (xi, yi) = (a.to_i32_truncate(), b.to_i32_truncate());
-                    // 0x483a5d: the place is scored once, as the standing
-                    // place (index -1) or, when the sitting weight is the
-                    // larger, after the seats (index 8). Seats fail loudly
-                    // above, so the sitting weight is 0 and either index
-                    // gives the same single pass.
-                    if weight == 0 {
-                        continue;
-                    }
-                    let squared = xi.wrapping_mul(xi).wrapping_add(yi.wrapping_mul(yi));
-                    if squared > far.wrapping_mul(far) || squared < near.wrapping_mul(near) {
-                        continue;
-                    }
-                    let radial = Ext::from_i32(squared).sqrt().single().to_i32_truncate();
-                    let off = radial.wrapping_sub(best).wrapping_abs();
-                    let penalty = (Ext::from_i32(off) * gradient.ext())
-                        .single()
-                        .to_i32_truncate();
-                    let mut score = weight.wrapping_add(FREE).wrapping_sub(penalty);
-                    if jitter {
-                        // 0x483b02: a draw from the active stream, as -10
-                        // to 9.
-                        let draw = match self.stream {
-                            Stream::Lot => world.lot_rng.next_u32(),
-                            Stream::Global => world.global_rng.next_u32(),
+                    // 0x48386e: the standing place at index -1 or 8, the
+                    // seats at 0 to 7; the first candidate ends the place.
+                    let standing_at = if weight >= sitting { -1 } else { 8 };
+                    for index in -1..=8i32 {
+                        let (tried, weight, word_c, word_e) = if index == -1 || index == 8 {
+                            // 0x483a5d.
+                            if index != standing_at {
+                                continue;
+                            }
+                            ([xi, yi], weight, 0, bit)
+                        } else {
+                            if sitting == 0 {
+                                continue;
+                            }
+                            let index = index as usize;
+                            let [dx, dy] = SEAT_STEP[index];
+                            let at = [xi.wrapping_add(dx), yi.wrapping_add(dy)];
+                            if !seat_in_row(at, row, last) {
+                                continue;
+                            }
+                            let point = transform(
+                                pos,
+                                Ext::from_i32(at[0]).to_f32(),
+                                Ext::from_i32(at[1]).to_f32(),
+                                dir,
+                            );
+                            match self
+                                .seat_beside(world, ctx, point, dir, index)
+                                .map_err(fail)?
+                            {
+                                Beside::Nothing => continue,
+                                Beside::Taken(other) => {
+                                    // 0x483a3a.
+                                    refusals.note_taken();
+                                    ctx.word_8c = other as i16;
+                                    continue;
+                                }
+                                Beside::Seat(seat) => (at, sitting, seat as i16, 1 << index),
+                            }
                         };
-                        score = score.wrapping_add((draw % 20) as i32 - 10);
-                    }
-                    if beside & bit == 0 {
-                        score = score.wrapping_add(25);
-                    }
-                    let there = transform(
-                        pos,
-                        Ext::from_i32(xi).to_f32(),
-                        Ext::from_i32(yi).to_f32(),
-                        dir,
-                    )
-                    .map_err(fail)?;
-                    if there == [ctx.start[0], ctx.start[1]] {
-                        score = score.wrapping_add(20);
-                    }
-                    let answer = self.classify(world, ctx, place, dir)?;
-                    refusals.note(answer);
-                    if answer == 3 {
-                        stop = true;
-                    }
-                    if answer == 6 {
-                        ctx.candidates.push(Candidate {
-                            position: place,
-                            score,
-                            word_c: 0,
-                            word_e: Some(bit as i16),
-                        });
-                        if score > ctx.best {
-                            ctx.best = score;
+                        if weight == 0 {
+                            continue;
+                        }
+                        // 0x483a8d: the distances, compared as floats, are
+                        // whole numbers well inside a float's precision.
+                        let [ti, tj] = tried;
+                        let squared = ti.wrapping_mul(ti).wrapping_add(tj.wrapping_mul(tj));
+                        if squared > far.wrapping_mul(far) || squared < near.wrapping_mul(near) {
+                            continue;
+                        }
+                        let radial = Ext::from_i32(squared).sqrt().single().to_i32_truncate();
+                        let off = radial.wrapping_sub(best).wrapping_abs();
+                        let penalty = (Ext::from_i32(off) * gradient.ext())
+                            .single()
+                            .to_i32_truncate();
+                        let mut score = weight.wrapping_add(FREE).wrapping_sub(penalty);
+                        if jitter {
+                            // 0x483b02: a draw from the active stream, as
+                            // -10 to 9.
+                            let draw = match self.stream {
+                                Stream::Lot => world.lot_rng.next_u32(),
+                                Stream::Global => world.global_rng.next_u32(),
+                            };
+                            score = score.wrapping_add((draw % 20) as i32 - 10);
+                        }
+                        if beside & bit == 0 {
+                            score = score.wrapping_add(25);
+                        }
+                        let there = transform(
+                            pos,
+                            Ext::from_i32(ti).to_f32(),
+                            Ext::from_i32(tj).to_f32(),
+                            dir,
+                        );
+                        if there == [ctx.start[0], ctx.start[1]] {
+                            score = score.wrapping_add(20);
+                        }
+                        let answer = self.classify(world, ctx, place, dir)?;
+                        refusals.note(answer);
+                        if answer == 3 {
+                            stop = true;
+                        }
+                        if answer == 6 {
+                            ctx.candidates.push(Candidate {
+                                position: place,
+                                score,
+                                word_c,
+                                word_e: Some(word_e as i16),
+                            });
+                            if score > ctx.best {
+                                ctx.best = score;
+                            }
+                            break;
                         }
                     }
                 }
@@ -740,23 +1000,44 @@ impl Interpreter<'_> {
     }
 
     /// Plans the route to the chosen candidate and adds the last step to
-    /// the slot (0x45c38e). Returns 2: the route is ready; or 0 when the
-    /// planner finds no way, with the candidates dropped and the chosen
-    /// and best candidates -1 (0x45c4c7, 0x481898).
+    /// the slot (0x45c38e):
+    ///
+    /// 1. A slot with a sitting weight, for a person of a kind above 1
+    ///    (person word 65), loses its seats first (0x46de84); that fails
+    ///    loudly.
+    /// 2. The route is planned. With no way found the answer is 0
+    ///    (0x45c4c7).
+    /// 3. Person word 37 takes the chosen candidate's word +0xe.
+    /// 4. A candidate beside a seat (word +0xc, the seat's ID): a seat that
+    ///    is gone or has no Sit function (callback 0x1a), or a person of a
+    ///    kind above 1, sets the context's result to 5 and the answer is 0
+    ///    (0x45c4a8). A person already in the seat (its container,
+    ///    0x43265e) gives 1. Otherwise the seat's Sit tree is to be pushed
+    ///    on the person's thread ([`SlotRoute::Sit`]).
+    /// 5. Otherwise the last step is added to the path: the answer is 2,
+    ///    or 0 when that step is the path's end itself.
+    ///
+    /// Every answer but 2 drops the candidates, with the chosen and best
+    /// candidates -1 (0x45c4c9, 0x481898).
     pub(crate) fn route_to_slot(
         &self,
         world: &mut World,
         ctx: &mut Context,
         path: &mut Vec<[i32; 2]>,
-    ) -> Result<i32, Fault> {
+    ) -> Result<SlotRoute, Fault> {
         let person = ctx.person;
         let fail = |trap| Fault {
             object: person,
             at: None,
             trap,
         };
-        if ctx.slot.sitting != 0 {
-            return Err(fail(unsupported("0x45c3a4", "a route to a slot to sit in")));
+        // 0x45c3a4: the slot's seats are dropped for a kind above 1.
+        let kind = person_word(world, person, KIND).map_err(fail)?;
+        if ctx.slot.sitting != 0 && kind > 1 {
+            return Err(fail(unsupported(
+                "0x45c3c5",
+                "dropping the seats of a slot for a person of kind above 1 (0x46de84)",
+            )));
         }
         let room = datum(world, person, ROOM).map_err(fail)?;
         if !world.rooms.rooms.contains_key(&room) {
@@ -766,10 +1047,8 @@ impl Interpreter<'_> {
         if !self.plan(world, ctx, path)? {
             // 0x45c4c7: no way; the candidates are dropped (0x481898) and
             // the answer is 0.
-            ctx.candidates.clear();
-            ctx.chosen = -1;
-            ctx.best = -1;
-            return Ok(0);
+            drop_candidates(ctx);
+            return Ok(SlotRoute::Answer(0));
         }
         let chosen = usize::try_from(ctx.chosen)
             .ok()
@@ -789,10 +1068,15 @@ impl Interpreter<'_> {
             }
         }
         if chosen.word_c != 0 {
-            return Err(fail(unsupported(
-                "0x45c425",
-                "a candidate with word +0xc set",
-            )));
+            // 0x45c430: the seat beside the place.
+            let answer = self
+                .sit_in(world, person, chosen.word_c, kind)
+                .map_err(fail)?;
+            drop_candidates(ctx);
+            if answer == SlotRoute::Answer(0) {
+                ctx.result = 5;
+            }
+            return Ok(answer);
         }
         let Some(&last) = path.last().filter(|_| path.len() >= 2) else {
             return Err(fail(unsupported(
@@ -822,7 +1106,7 @@ impl Interpreter<'_> {
                         last[0].wrapping_add(along[0]),
                         last[1].wrapping_add(along[1]),
                     ];
-                    return Ok(finish(path, last, next));
+                    return Ok(SlotRoute::Answer(finish(path, last, next)));
                 }
                 i32::from(datum(world, person, DIRECTION).map_err(fail)?)
             }
@@ -831,7 +1115,7 @@ impl Interpreter<'_> {
             // own place.
             -1 | -2 => {
                 let toward = if low_flags && ctx.slot.flags & 0x100 != 0 {
-                    return Ok(finish(path, last, to));
+                    return Ok(SlotRoute::Answer(finish(path, last, to)));
                 } else if !low_flags && to == last {
                     i32::from(datum(world, ctx.target, DIRECTION).map_err(fail)?)
                 } else {
@@ -852,12 +1136,62 @@ impl Interpreter<'_> {
         // 0x45c5fb: the last step is one tile from the path's end in that
         // direction (0x42228a).
         let [dx, dy] = step(dir);
-        Ok(finish(
+        Ok(SlotRoute::Answer(finish(
             path,
             last,
             [last[0].wrapping_add(dx), last[1].wrapping_add(dy)],
-        ))
+        )))
     }
+
+    /// The answer for a candidate beside a seat (0x45c430 to 0x45c4a6),
+    /// before the candidates are dropped. See [`Self::route_to_slot`].
+    fn sit_in(
+        &self,
+        world: &mut World,
+        person: u16,
+        seat: i16,
+        kind: i16,
+    ) -> Result<SlotRoute, Trap> {
+        // 0x40743b: the seat by its ID.
+        let Some(seat) = u16::try_from(seat)
+            .ok()
+            .filter(|id| *id > 0 && world.objects.contains_key(id))
+        else {
+            return Ok(SlotRoute::Answer(0));
+        };
+        let tree = self.function_tree(world, seat, SIT);
+        if tree == 0 {
+            return Ok(SlotRoute::Answer(0));
+        }
+        if capture(world, person)?.container == Some(seat) {
+            return Ok(SlotRoute::Answer(1));
+        }
+        if kind > 1 {
+            return Ok(SlotRoute::Answer(0));
+        }
+        Ok(SlotRoute::Sit { seat, tree })
+    }
+}
+
+/// What planning a route to a slot asks of the route
+/// ([`Interpreter::route_to_slot`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotRoute {
+    /// The answer: 0 for no way, 1 for a person already in the chosen
+    /// seat, 2 for a route ready to walk.
+    Answer(i32),
+    /// The person is to sit in `seat`: its Sit tree `tree` is pushed on
+    /// the person's thread, as the person's virtual function 0x34 does
+    /// with no arguments and no flag (0x45c49d). Pushed, the answer is 3;
+    /// a push that fails gives the context's result 5 and the answer 0.
+    Sit { seat: u16, tree: u16 },
+}
+
+/// Drops a context's candidates; the chosen and best become -1 (0x481898).
+fn drop_candidates(ctx: &mut Context) {
+    ctx.candidates.clear();
+    ctx.chosen = -1;
+    ctx.best = -1;
 }
 
 /// The end of planning a route to a slot (0x45c60e): a last point other
@@ -994,15 +1328,22 @@ mod tests {
         let pos = [100, 200];
         // Direction 0 adds the point as it is: the first coordinate to
         // the second of the position.
-        assert_eq!(transform(pos, f(3.0), f(5.0), 0), Ok([105, 203]));
+        assert_eq!(transform(pos, f(3.0), f(5.0), 0), [105, 203]);
         // 2 gives [-b, a], with a truncated.
-        assert_eq!(transform(pos, f(3.7), f(5.0), 2), Ok([103, 195]));
-        assert_eq!(transform(pos, f(3.0), f(5.0), 4), Ok([95, 197]));
-        assert_eq!(transform(pos, f(3.7), f(5.0), 6), Ok([97, 205]));
+        assert_eq!(transform(pos, f(3.7), f(5.0), 2), [103, 195]);
+        assert_eq!(transform(pos, f(3.0), f(5.0), 4), [95, 197]);
+        assert_eq!(transform(pos, f(3.7), f(5.0), 6), [97, 205]);
         // The sums are truncated toward zero.
-        assert_eq!(transform(pos, f(-0.5), f(0.5), 0), Ok([100, 199]));
-        // A diagonal fails loudly.
-        assert!(transform(pos, f(3.0), f(5.0), 1).is_err());
+        assert_eq!(transform(pos, f(-0.5), f(0.5), 0), [100, 199]);
+        // A diagonal turns through the matrix in world units and rounds
+        // half away from zero: (3, 5) by an eighth of a turn is about
+        // (-1.41, 5.66), so (-1, 6).
+        assert_eq!(transform(pos, f(3.0), f(5.0), 1), [106, 199]);
+        assert_eq!(transform(pos, f(3.0), f(5.0), 3), [99, 194]);
+        assert_eq!(transform(pos, f(3.0), f(5.0), -1), [101, 206]);
+        // A tile along the first axis, turned an eighth, is about
+        // (11.31, 11.31).
+        assert_eq!(transform([0, 0], f(16.0), f(0.0), 1), [11, 11]);
     }
 
     #[test]

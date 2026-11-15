@@ -106,6 +106,87 @@ fn generic_calls_10_and_11_keep_the_list_of_fires() {
     assert_eq!(fx.world.fires, [LAMP]);
 }
 
+/// Runs Generic Sims Call routine 15 as the Sim, with temp 0 at `temp`.
+fn generic_15(fx: &mut Fixture, temp: i16) -> Result<bool, sims_vm::Fault> {
+    fx.sim_mut().temps[0] = temp;
+    fx.add(
+        SIM_FILE,
+        4096,
+        tree(vec![ins(
+            1,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [15, 0, 0, 0, 0, 0, 0, 0],
+        )]),
+    );
+    fx.run_with(SIM, 4096, 0, &[], 10)
+}
+
+/// A Sim at (56, 56) facing 2, its definition insetting no side, and
+/// person word 73 set.
+fn standing_sim() -> Fixture {
+    let mut fx = Fixture::new();
+    fx.words(SIM_FILE)[0x9a / 2] = 0;
+    let sim = fx.sim_mut();
+    (sim.position, sim.footprint, sim.data[1]) = ([56, 56, 1], [1, 2, 3, 4], 2);
+    sim.person.as_mut().unwrap().data[73] = 0x0102;
+    fx
+}
+
+#[test]
+fn generic_call_15_copies_temp_0_into_person_word_72() {
+    let mut fx = standing_sim();
+    let mut expected = fx.world.clone();
+    let sim = expected.objects.get_mut(&SIM).unwrap();
+    sim.temps[0] = 9;
+    sim.last_result = true;
+    let data = &mut sim.person.as_mut().unwrap().data;
+    (data[72], data[73]) = (9, 0);
+    // Word 73 is cleared, and with temp 0 set the footprint is kept.
+    assert_eq!(generic_15(&mut fx, 9), Ok(true));
+    assert_eq!(hash_without_frames(&fx.world), expected.hash());
+}
+
+#[test]
+fn generic_call_15_with_temp_0_clear_works_the_footprint_out_again() {
+    let mut fx = standing_sim();
+    let mut expected = fx.world.clone();
+    let sim = expected.objects.get_mut(&SIM).unwrap();
+    sim.last_result = true;
+    sim.footprint = [53, 53, 59, 59];
+    let data = &mut sim.person.as_mut().unwrap().data;
+    (data[72], data[73]) = (0, 0);
+    assert_eq!(generic_15(&mut fx, 0), Ok(true));
+    assert_eq!(hash_without_frames(&fx.world), expected.hash());
+
+    // The footprint is worked out after word 73 is cleared: on an even
+    // facing the word would otherwise take from the definition's insets.
+    let mut fx = standing_sim();
+    fx.words(SIM_FILE)[0x9a / 2] = 0x1111;
+    assert_eq!(generic_15(&mut fx, 0), Ok(true));
+    assert_eq!(fx.sim().footprint, [54, 54, 58, 58]);
+}
+
+#[test]
+fn generic_call_15_needs_a_person_and_a_footprint_it_can_work_out() {
+    // The lamp is not a person: native error 0x1c.
+    let mut fx = standing_sim();
+    assert_eq!(trap(generic(&mut fx, 15)).code(), Some(0x1c));
+    assert!(fx.lamp().person.is_none());
+    let sim = fx.sim();
+    assert_eq!(sim.person.as_ref().unwrap().data[72..74], [216, 0x0102]);
+    assert_eq!(sim.footprint, [1, 2, 3, 4]);
+    // A facing the footprint does not handle fails before anything
+    // changes.
+    let mut fx = standing_sim();
+    fx.sim_mut().data[1] = 9;
+    let text = trap(generic_15(&mut fx, 0)).to_string();
+    assert!(text.contains("facing 9"), "{text}");
+    let sim = fx.sim();
+    assert_eq!(sim.person.as_ref().unwrap().data[72..74], [216, 0x0102]);
+    assert_eq!(sim.footprint, [1, 2, 3, 4]);
+}
+
 #[test]
 fn other_generic_calls_name_themselves() {
     let mut fx = Fixture::new();

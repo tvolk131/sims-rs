@@ -172,7 +172,7 @@ impl Machine<'_, '_> {
         saved: &mut Option<Vec<i16>>,
     ) -> Result<Flow, Trap> {
         let me = self.me;
-        self.check_chosen(&mut action, saved)?;
+        self.check_chosen(&mut action, saved, None)?;
         let flow = if action.flags & checked::PASSED != 0 && action.action != 0 {
             let frame = self.me()?.stack.len() - 1;
             let tree = action.action;
@@ -183,7 +183,7 @@ impl Machine<'_, '_> {
                      the original cancels the action: {fault}"
                 ))
             })?;
-            self.count_use(target)?;
+            self.count_use(target, false)?;
             let last_result = self.me()?.last_result;
             self.set_action(action, last_result)?;
             let object = self.me_mut()?;

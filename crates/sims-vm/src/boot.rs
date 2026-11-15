@@ -236,11 +236,12 @@ impl std::fmt::Display for StepError {
 
 impl std::error::Error for StepError {}
 
-/// What [`Lot::pie_menu`] lists: the actions offered, in the menu's
+/// What [`Lot::pie_menu`] lists: the entries offered, in the menu's
 /// order, and the requests to the sound system the check trees made.
+/// Picking an entry queues its action ([`Lot::pick`]).
 #[derive(Debug, Clone)]
 pub struct Menu {
-    pub actions: Vec<sims_formats::saved_objects::Interaction>,
+    pub entries: Vec<crate::orders::MenuEntry>,
     pub sounds: Vec<crate::SoundEvent>,
 }
 
@@ -310,6 +311,7 @@ impl Lot {
         // script makes. A type whose skeleton cannot be chosen is left
         // out; making a person of it fails.
         program.people = People::load_each(&install, &index, &catalog, person_types())?.0;
+        program.icon_frames = crate::program::icon_frames(&install)?;
         let mut world = World::empty();
         let mut load = LoadReport::default();
         {
@@ -573,6 +575,9 @@ impl Lot {
             ..update
         };
         self.ticks = tick;
+        // Between lot updates the game handles its messages, which
+        // redraws the family panel.
+        interpreter.refresh_family_panel(&mut self.world);
         let frame = if self.frames.after(tick) {
             interpreter.draw_frame(&mut self.world, VIEW_LEVEL).err()
         } else {
@@ -638,18 +643,18 @@ impl Lot {
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
-        let actions = interpreter
+        let entries = interpreter
             .pie_menu(&mut world, person, object)
             .map_err(OrderError::Refused)?;
         self.world = world;
         Ok(Menu {
-            actions,
+            entries,
             sounds: sounds.into_inner(),
         })
     }
 
-    /// Queues on `person` an action [`Lot::pie_menu`] listed, as picking it
-    /// does ([`Interpreter::pick`]). Returns the action's number, or None
+    /// Queues on `person` the action of an entry [`Lot::pie_menu`] listed,
+    /// as picking it does ([`Interpreter::pick`]). Returns the action's number, or None
     /// when the queue took nothing (it is full, or the action's entry is
     /// gone). An order that fails changes nothing, as for
     /// [`Lot::queue_interaction`].
@@ -735,6 +740,7 @@ mod tests {
                 zoning: BTreeMap::new(),
                 animations: Default::default(),
                 people: Default::default(),
+                icon_frames: None,
             },
             catalog: Catalog {
                 global: 0,

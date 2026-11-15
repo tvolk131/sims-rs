@@ -2,7 +2,7 @@
 //! 0x598636, 0x597c4c). Synthetic; no game data.
 
 use sims_core::{Ext, F32};
-use sims_sim::animator::{Advance, Animator, LOADED, Layer, UNSET};
+use sims_sim::animator::{Advance, Animator, Base, LOADED, Layer, UNSET};
 
 const THOUSAND: F32 = F32::from_bits(0x447a_0000);
 
@@ -176,7 +176,7 @@ fn a_new_animator_stands_unplaced_with_no_posture() {
     assert_eq!((a.state, a.arrival, a.posture), (3, 0, -1));
     assert_eq!(a.position, [UNSET; 3]);
     assert_eq!(a.destination, [F32::ZERO; 3]);
-    assert!(!a.base && a.foreground.is_none() && !a.playing);
+    assert!(!a.base.is_filled() && a.foreground.is_none() && !a.playing);
     assert_eq!((a.selection, a.carry_selection, a.carry_mode), (-1, -1, 0));
     // Only a reset raises the next foreground clip's priority.
     assert!(!a.promote);
@@ -194,7 +194,7 @@ fn a_reset_unplaces_the_animator_and_drops_its_posture() {
         position: [off_lot, off_lot, F32::ZERO],
         destination: [off_lot, off_lot, F32::ZERO],
         posture: 0,
-        base: true,
+        base: Base::Posture,
         carry_mode: 1,
         state: 0,
         events: vec![3],
@@ -211,7 +211,7 @@ fn a_reset_unplaces_the_animator_and_drops_its_posture() {
         (a.posture, a.carry_mode, a.carry_selection, a.state),
         (-1, 0, -1, 3)
     );
-    assert!(!a.base && a.skin_dirty);
+    assert!(!a.base.is_filled() && a.skin_dirty);
     assert!(a.events.is_empty() && !a.playing);
     assert!(a.promote && a.profile_stale);
     // The load's state is a new animator reset.
@@ -221,17 +221,36 @@ fn a_reset_unplaces_the_animator_and_drops_its_posture() {
 }
 
 #[test]
-fn a_reset_with_a_clip_playing_or_a_route_result_is_refused() {
+fn a_reset_with_a_clip_playing_is_refused() {
     let mut a = Animator {
         foreground: Some(Layer::start("c", THOUSAND, 30, true, 0, false, 0)),
         ..LOADED
     };
     assert!(a.reset().unwrap_err().contains("0x592878"));
-    let mut a = Animator {
-        arrival: 2,
-        ..LOADED
-    };
-    assert!(a.reset().unwrap_err().contains("0x589e2d"));
+}
+
+#[test]
+fn a_reset_stops_a_route_after_unsetting_the_position() {
+    // 0x5892dd: the stop (0x589e2d) comes after the position is unset
+    // (0x589361), so an ended route's destination becomes unset too.
+    let to = [1.0, 2.0, 3.0].map(F32::from_f32);
+    let at = [4.0, 5.0, 6.0].map(F32::from_f32);
+    for (arrival, destination) in [(2, [UNSET; 3]), (3, [UNSET; 3]), (1, to), (-1, to)] {
+        let mut a = Animator {
+            arrival,
+            position: at,
+            destination: to,
+            state: 9,
+            ..LOADED
+        };
+        a.motion.segment = 4;
+        a.motion.timer = 7;
+        a.reset().unwrap();
+        assert_eq!(a.arrival, 0, "{arrival}");
+        assert_eq!(a.destination, destination, "{arrival}");
+        assert_eq!(a.position, [UNSET; 3]);
+        assert_eq!((a.state, a.motion.segment, a.motion.timer), (3, -1, 0));
+    }
 }
 
 /// A motion's events for [`Layer::due`]: (time, has a property). Index 3
@@ -292,4 +311,29 @@ fn backward_events_are_due_down_to_the_event_time_and_wrap_round() {
     at(&mut layer, 100, 500);
     assert_eq!(layer.due(0, &EVENTS).unwrap(), [5]);
     assert_eq!(layer.cursors, [4]);
+}
+
+#[test]
+fn whether_a_route_may_be_interrupted_follows_the_animators_state() {
+    // 0x589ead: states 1 to 3 may; 0, 9 and 10 ask the foreground layer,
+    // or may with none; any other state may not.
+    let at = |state, foreground: Option<i32>| Animator {
+        state,
+        foreground: foreground.map(|interruptible| Layer {
+            interruptible,
+            ..Layer::start("c", THOUSAND, 30, true, 0, false, 1000)
+        }),
+        ..LOADED
+    };
+    for state in [1, 2, 3] {
+        assert!(at(state, Some(0)).interruptible(), "state {state}");
+    }
+    for state in [0, 9, 10] {
+        assert!(at(state, None).interruptible(), "state {state}");
+        assert!(at(state, Some(-1)).interruptible(), "state {state}");
+        assert!(!at(state, Some(0)).interruptible(), "state {state}");
+    }
+    for state in [-1, 4, 5, 6, 7, 8, 11, 12, 13] {
+        assert!(!at(state, Some(1)).interruptible(), "state {state}");
+    }
 }

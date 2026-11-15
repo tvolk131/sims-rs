@@ -1,21 +1,25 @@
 //! The interpreter against synthetic trees and a synthetic lot. No game
 //! data.
 
+mod action_string;
 mod animate;
 mod autonomy;
 mod budget;
 mod calls;
 mod change_suit;
+mod create;
 mod deletion;
 mod expression;
 mod factory;
 mod find_best_object;
 mod find_location;
+mod grab;
 mod head;
 mod headline;
 mod load;
 mod memory;
 mod motive_change;
+mod named_tree;
 mod neighbors;
 mod object_type;
 mod object_uses;
@@ -27,6 +31,7 @@ mod random;
 mod removal;
 mod rooms;
 mod run_functional_tree;
+mod seat;
 mod selection;
 mod services;
 mod set_to_next;

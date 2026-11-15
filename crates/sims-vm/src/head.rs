@@ -60,7 +60,7 @@ use crate::fault::Trap;
 use crate::interpreter::Interpreter;
 use sims_core::{Ext, F32};
 use sims_sim::World;
-use sims_sim::animator::Animator;
+use sims_sim::animator::{Animator, Base};
 use sims_sim::head::{self, Anchor, Matrix};
 use sims_sim::pose;
 
@@ -223,7 +223,19 @@ impl Interpreter<'_> {
     /// The point on top of person `id`'s head in the lot (0x59293d with
     /// 1: its +0x144 anchor, 0x59640d), from its animator as the world
     /// holds it; None when it has no such anchor.
+    ///
+    /// A person queued for removal fails: it left the lot without its
+    /// animator's refresh, which the original makes only if the view drew
+    /// it (`Interpreter::take_off_to_remove`, 0x58da12), so its pose may
+    /// differ from the original's.
     fn top_of(&self, world: &World, id: u16) -> Result<Option<[F32; 3]>, Trap> {
+        if world.removals.contains(&id) {
+            return Err(Trap::Unsupported(format!(
+                "a head looks at person {id}, which is queued for removal: its animator's \
+                 refresh as it left the lot (0x58da12) depends on whether the view drew it \
+                 (animator byte +0x109), which is not kept"
+            )));
+        }
         let Some(top) = self.anchors(world, id)?.top else {
             return Ok(None);
         };
@@ -378,8 +390,11 @@ impl Interpreter<'_> {
                 }
             }
         }
-        if a.base {
-            let name = self.base_clip(world, id, a.posture)?;
+        if a.base.is_filled() {
+            let name = match &a.base {
+                Base::Script { clip, .. } => clip.clone(),
+                _ => self.base_clip(world, id, a.posture)?,
+            };
             let base =
                 self.program.animations.clip(&name).map_err(|e| {
                     unsupported("0x59dc32", &format!("finds no clip {name:?}: {e}"))

@@ -1,5 +1,5 @@
 use crate::animator::Animator;
-use crate::neighbors::Neighbors;
+use crate::neighbors::{Family, Neighbors};
 use crate::rooms::Rooms;
 use crate::route::Routing;
 use crate::{Error, Result};
@@ -122,6 +122,57 @@ pub struct World {
     /// house is entered and at the start of the Goth house's tick 233,
     /// the first that gives one, as captures of the original show.
     pub action_serial: i32,
+    /// The advertisements of the interaction entry the original keeps
+    /// one copy of (the record at 0x6e5100, which 0x6c437c points to).
+    /// Find Best Interaction copies each entry it may choose over it
+    /// (0x4763c5, from the check 0x458319), the entry's check tree reads
+    /// and writes it (scopes 12, 28 and 29), and the check then adjusts
+    /// it for the room. Nothing else copies over it, so a check tree the
+    /// pie menu runs finds what the last one left. The record always has
+    /// sixteen. None before the first copy: what the record holds then is
+    /// not read. It belongs to the running game, not to the lot.
+    pub advertisement_record: Option<[Advertisement; ADVERTISEMENTS]>,
+    /// The neighborhood's families, in the order the neighborhood's
+    /// reload sorts them. See [`Family`]. Like the neighborhood's
+    /// people, they belong to the running game, not to the lot.
+    pub families: Vec<Family>,
+    /// The first headline of each object that shows one. See
+    /// [`Headline`]. An object with no entry shows none: its first
+    /// headline, if it has any, has a duration of 0.
+    pub headlines: BTreeMap<u16, Headline>,
+}
+
+/// How many advertisements the record of [`World::advertisement_record`]
+/// holds: its count (+4) is 16 in a memory image of the running game, and
+/// the copy (0x4763c5) never changes it.
+pub const ADVERTISEMENTS: usize = 16;
+
+/// One advertisement as the original holds it, in six bytes: a
+/// personality number, a minimum and an amount scaled by the personality.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Advertisement {
+    pub personality: i16,
+    pub minimum: i16,
+    pub delta: i16,
+}
+
+impl Advertisement {
+    /// A field by its place in the original's six bytes: 0 the
+    /// personality number, 1 the minimum, 2 the delta.
+    pub fn field(&self, field: usize) -> i16 {
+        *[self.personality, self.minimum, self.delta]
+            .get(field)
+            .unwrap_or(&self.delta)
+    }
+
+    /// A field to write, by its place as for [`Advertisement::field`].
+    pub fn field_mut(&mut self, field: usize) -> &mut i16 {
+        match field {
+            0 => &mut self.personality,
+            1 => &mut self.minimum,
+            _ => &mut self.delta,
+        }
+    }
 }
 
 /// The house's usage counts: five earlier days and today, each a count of
@@ -193,6 +244,31 @@ pub struct Dialog {
     /// Record word 0x74: 0 new, 1 shown, 2 to 4 answered with the first,
     /// second or third button, 5 done.
     pub status: u8,
+}
+
+/// What the simulation reads of an object's first headline (object
+/// +0x148, a record of 0x3c bytes) while it shows: Set Balloon/Headline
+/// sets it (0x44b724), the tail of the object's tick counts it down
+/// (0x4521f7, 0x46e004), Sleep keeps a showing object out of the
+/// scheduler's hands (0x44aa57), and a person's reset clears it
+/// (0x45e8af). No save holds it.
+///
+/// The record's other fields are presentation: the sprite, its frame
+/// count and the frame shown, with the step and the tick count that move
+/// it (+0x14 to +0x28, which only decide when the object is redrawn,
+/// 0x434101), the backdrop and the overlay (+0x2c, +0x30) and the flag
+/// (+0x38, which the person's drawn bounds read, 0x45a092). So does the
+/// priority while the duration is 0: every call that reads it while a
+/// headline shows, and every call that shows one writes it first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Headline {
+    /// The priority (+0x34): 2 for an icon of kind 4, 1 for any other. A
+    /// headline of a higher priority than a new one keeps showing.
+    pub priority: i32,
+    /// The duration (+0x10), never 0: the ticks left, or a negative
+    /// number for a headline that shows until it is cleared (the tick
+    /// counts down only a positive duration).
+    pub duration: i32,
 }
 
 /// What a person's tick keeps that no save holds (person fields 0x810 and
@@ -268,7 +344,12 @@ pub struct Budget {
     pub lot_value: i32,
     pub objects_value: i32,
     pub architecture_value: i32,
-    /// Recent days' budget entries; None marks a day with no entry.
+    /// The daily budget entries, eight categories each, in the save's
+    /// order, which the load keeps (0x46d1e4): today's first (simulator
+    /// +0x184, which spending adds to, 0x46d91c), then yesterday and the
+    /// four days before it (+0xe4 on). None is a day the save marked with
+    /// flag 0; the original then reads seven words for it (0x46d270),
+    /// which the parser does not. Empty until a save is read.
     pub days: Vec<Option<[i32; 8]>>,
 }
 
@@ -392,6 +473,9 @@ impl World {
             usage: HouseUsage::default(),
             routing: Routing::default(),
             action_serial: 0,
+            advertisement_record: None,
+            families: Vec::new(),
+            headlines: BTreeMap::new(),
         }
     }
 

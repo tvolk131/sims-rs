@@ -49,10 +49,15 @@
 //!    no entry of its own (0x458724); there is no greyed-out entry. The
 //!    original also hides every entry while an interface flag (0x6f2a54)
 //!    is set; only interface code writes it, so it is taken to be clear.
-//! 4. What is not ported fails loudly: a check tree adding an entry
-//!    (Add/Change Action String, 0x458789); and the entry to join another
-//!    person's interaction, which the original adds when the person's
-//!    running interaction may be joined and the object is another person
+//!    The check tree adds an entry with Add/Change Action String
+//!    (0x458789): a copy of the action being checked, as the check has
+//!    left it so far, with flags 4 and 8 set and 0x10 clear, the string
+//!    as its name and the string's four arguments as its own. It is added
+//!    to the menu then, whether or not the check passes, and the action
+//!    itself is not.
+//! 4. What is not ported fails loudly: the entry to join another person's
+//!    interaction, which the original adds when the person's running
+//!    interaction may be joined and the object is another person
 //!    (0x45866d).
 //! 5. When the listing offers nothing (0x48d423), each object on the
 //!    clicked object's tile (object +0xfc, read through 0x43f331 and
@@ -74,6 +79,30 @@ use crate::interpreter::{Interpreter, Machine};
 use crate::placement::Cursor;
 use sims_formats::saved_objects::Interaction;
 use sims_sim::World;
+
+/// An entry the pie menu offers: the action picking it queues, and the
+/// name a check tree gave it (Add/Change Action String, 0x458789). An
+/// entry without a name shows its interaction table entry's.
+///
+/// The original keeps the name in the action (+0x28) and queues it with
+/// the action; the queue here keeps actions only, so a picked entry's
+/// name is not kept.
+#[derive(Debug, Clone)]
+pub struct MenuEntry {
+    pub action: Interaction,
+    pub name: Option<String>,
+}
+
+/// The listing's state while it checks an action (the original's
+/// pointers 0x6e5130 and 0x6e50fc, the menu being built, and 0x6e50f8,
+/// the action being checked): see [`crate::Interpreter`]'s `menu`.
+#[derive(Debug)]
+pub(crate) struct Checking {
+    /// The action being checked, as the check has left it so far.
+    pub action: Interaction,
+    /// The entries the check has added.
+    pub added: Vec<MenuEntry>,
+}
 
 /// Definition word 9, the object's type; an object of type 8 is left out
 /// of the tile's listing (0x48d44c).
@@ -143,12 +172,13 @@ impl Interpreter<'_> {
         world: &mut World,
         person: u16,
         object: u16,
-    ) -> Result<Vec<Interaction>, Fault> {
+    ) -> Result<Vec<MenuEntry>, Fault> {
         let mut machine = self.machine(world, person, 0, false);
         machine.pie_menu(object).map_err(|trap| machine.fault(trap))
     }
 
-    /// Queues on `person` an action [`Self::pie_menu`] offered, unchanged,
+    /// Queues on `person` the action of an entry [`Self::pie_menu`]
+    /// offered, unchanged,
     /// as picking it does (0x48dd67, 0x45d20b). Returns the action's
     /// number, or None when the queue took nothing: it is full, or the
     /// target's table no longer has the action's entry. What the
@@ -229,7 +259,7 @@ impl Machine<'_, '_> {
 
     /// Lists the pie menu on `object` for the running person (0x48d392;
     /// see the module's documentation).
-    pub(crate) fn pie_menu(&mut self, object: u16) -> Result<Vec<Interaction>, Trap> {
+    pub(crate) fn pie_menu(&mut self, object: u16) -> Result<Vec<MenuEntry>, Trap> {
         let mut saved = None;
         let listed = self.list_with_tile(object, &mut saved);
         // The first listing's temps go back last (0x48d492), after the
@@ -247,7 +277,7 @@ impl Machine<'_, '_> {
         &mut self,
         object: u16,
         saved: &mut Option<Vec<i16>>,
-    ) -> Result<Vec<Interaction>, Trap> {
+    ) -> Result<Vec<MenuEntry>, Trap> {
         let mut listed = self.listing(object, saved)?;
         if !listed.is_empty() {
             return Ok(listed);
@@ -292,7 +322,7 @@ impl Machine<'_, '_> {
         &mut self,
         object: u16,
         saved: &mut Option<Vec<i16>>,
-    ) -> Result<Vec<Interaction>, Trap> {
+    ) -> Result<Vec<MenuEntry>, Trap> {
         // Read for each listing, after the checks of any before it.
         let me = self.me;
         let data = &self
@@ -312,10 +342,7 @@ impl Machine<'_, '_> {
             .table(target)?
             .map(|table| table.interactions.iter().map(|e| e.string_index).collect())
             .unwrap_or_default();
-        let outer = std::mem::replace(&mut self.building_menu, true);
-        let listed = self.list_entries(target, &menus, saved);
-        self.building_menu = outer;
-        listed
+        self.list_entries(target, &menus, saved)
     }
 
     /// Steps 2 to 4 of the listing (0x45859c).
@@ -324,7 +351,7 @@ impl Machine<'_, '_> {
         target: u16,
         menus: &[u32],
         saved: &mut Option<Vec<i16>>,
-    ) -> Result<Vec<Interaction>, Trap> {
+    ) -> Result<Vec<MenuEntry>, Trap> {
         let me = self.me;
         let mut listed = Vec::new();
         for &menu in menus {
@@ -339,9 +366,14 @@ impl Machine<'_, '_> {
             let Some((mut action, _)) = self.menu_action(me, target, menu, visitor)? else {
                 continue;
             };
-            self.check_chosen(&mut action, saved)?;
-            if action.flags & checked::PASSED != 0 && action.flags & checked::MARKED == 0 {
-                listed.push(action);
+            let before = listed.len();
+            self.check_chosen(&mut action, saved, Some(&mut listed))?;
+            // Only when the check tree added no entry (0x458724).
+            if listed.len() == before
+                && action.flags & checked::PASSED != 0
+                && action.flags & checked::MARKED == 0
+            {
+                listed.push(MenuEntry { action, name: None });
             }
         }
         let running = self

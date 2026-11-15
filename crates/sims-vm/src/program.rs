@@ -134,6 +134,13 @@ pub struct Program {
     /// install ([`sims_content::People::load`]), so [`Program::link`]
     /// leaves this empty for the caller to fill.
     pub people: People,
+    /// What the sprite cache the headlines draw from (\[0x6f0c08\],
+    /// made at 0x4144c4 from `GameData/Sprites.iff`) gives as each
+    /// sprite's frame count (0x4c8deb), by sprite ID: see
+    /// [`icon_frames`]. A sprite the file does not have has 0 frames.
+    /// None when it was not read: showing an icon then fails.
+    /// [`Program::link`] leaves it None for the caller to fill.
+    pub icon_frames: Option<BTreeMap<u16, i32>>,
 }
 
 impl Program {
@@ -152,6 +159,7 @@ impl Program {
             zoning: BTreeMap::new(),
             animations: Animations::default(),
             people: People::default(),
+            icon_frames: None,
         };
         program.load(index, catalog.global)?;
         for guid in guids {
@@ -382,6 +390,8 @@ impl Program {
             random_count: Ext::from_f32(value("random selection count", 0x4120_0000))
                 .to_i32_truncate(),
             distance_attenuation: value("functional distance attenuation", 0x4040_0000),
+            friendship_threshold: Ext::from_f32(value("friendship threshold", 0x41c8_0000))
+                .to_i32_truncate(),
         }
     }
 
@@ -706,6 +716,86 @@ pub struct Career {
 
 /// The careers of `work.iff`, or None when the table cannot be had from
 /// it. See [`Program::careers`].
+/// The file the headlines' sprite cache reads: the game data directory
+/// (0x415336 entry 0) and "sprites" (entry 1), joined at 0x4ee8fe.
+pub const ICON_FILE: &str = "GameData/Sprites.iff";
+
+/// Reads the frame count the headlines' sprite cache gives each sprite of
+/// [`ICON_FILE`] (0x4c8deb), by sprite ID. None when the install has no
+/// such file.
+pub fn icon_frames(install: &sims_content::Install) -> Result<Option<BTreeMap<u16, i32>>> {
+    let path = match install.file(ICON_FILE) {
+        Ok(path) => path,
+        Err(sims_content::Error::Missing { .. }) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let bytes = std::fs::read(&path).map_err(|source| sims_content::Error::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let location = path.display().to_string();
+    let iff = Iff::parse(bytes).map_err(|e| sims_content::Error::format(&location, e))?;
+    sprite_frames(&iff).map(Some)
+}
+
+/// The frame count the sprite cache (0x4c8e0d) gives each sprite of
+/// `iff`, by sprite ID, as 0x4c8deb hands it on: 0 unless the header's
+/// version (sprite +0x20) is at least 500.
+///
+/// The cache looks up the resources by ID ([`Iff::get`]: live chunks of
+/// the default variant, through the resource map when there is one), an
+/// SPR# of the ID first and an SPR2 only when there is none. For an SPR#
+/// the sprite (0x4c154e) takes the version and the count from the
+/// header's first two words, then halves the count for versions 501 and
+/// 503 and divides it by five for 506 (0x4c1604 to 0x4c1631). An SPR2's
+/// are its first two words as they stand (0x4c1757).
+///
+/// The resource layer hands an SPR# to a callback that swaps the header's
+/// bytes (0x4c8f63) unless the resource's conversion flag, 0x10, is set
+/// (0x41d3a7): the header is big-endian without the flag and
+/// little-endian with it. The flag is read from the chunk's header; with
+/// a resource map, whether the map's entry can carry different flags is
+/// **unverified**. The install's SPR# in `Sprites.iff` all have flags 0
+/// and version 502 written big-endian.
+pub fn sprite_frames(iff: &Iff) -> Result<BTreeMap<u16, i32>> {
+    let header = |data: &[u8]| -> Option<[[u8; 4]; 2]> {
+        Some([
+            *data.first_chunk::<4>()?,
+            *data.get(4..8)?.first_chunk::<4>()?,
+        ])
+    };
+    let resources = |tag: &'static [u8; 4]| {
+        let ids: std::collections::BTreeSet<u16> = iff.all(tag).map(|c| c.id).collect();
+        ids.into_iter().filter_map(move |id| iff.get(tag, id))
+    };
+    let mut frames = BTreeMap::new();
+    for chunk in resources(b"SPR#") {
+        let [version, count] = header(iff.data(chunk))
+            .ok_or_else(|| Error::Unsupported(format!("SPR# #{} has no header", chunk.id)))?;
+        let (version, count) = if chunk.flags & 0x10 != 0 {
+            (i32::from_le_bytes(version), i32::from_le_bytes(count))
+        } else {
+            (i32::from_be_bytes(version), i32::from_be_bytes(count))
+        };
+        let count = match version {
+            0x1f5 | 0x1f7 => count / 2,
+            0x1fa => count / 5,
+            _ => count,
+        };
+        frames.insert(chunk.id, if version >= 500 { count } else { 0 });
+    }
+    for chunk in resources(b"SPR2") {
+        if frames.contains_key(&chunk.id) {
+            continue;
+        }
+        let [version, count] = header(iff.data(chunk))
+            .ok_or_else(|| Error::Unsupported(format!("SPR2 #{} has no header", chunk.id)))?;
+        let (version, count) = (i32::from_le_bytes(version), i32::from_le_bytes(count));
+        frames.insert(chunk.id, if version >= 500 { count } else { 0 });
+    }
+    Ok(frames)
+}
+
 fn careers(index: &Index) -> Result<Option<Vec<Career>>> {
     if index.named("Careers.txt").next().is_some() {
         return Ok(None);

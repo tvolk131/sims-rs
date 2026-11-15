@@ -7,14 +7,21 @@
 //!
 //! The modes (0x4549c7 on): 2 is the tile in front of the object, 1 the
 //! object itself, 0 the routing slot a local names, 3 the routing slot
-//! word 0 names, and 4 one of the lot's own slots; any other is native
-//! error 0x24. Only mode 3 is ported:
+//! word 0 names, and 4 the lot's global routing slot word 0 names; any
+//! other is native error 0x24. Modes 3 and 4 are ported, and share all
+//! but the table (both reach 0x454ac5):
 //!
-//! 1. The routing slot is the stack object's (its routing slot table,
-//!    object +0x13c, which holds only the SLOT entries of kind 3, as Go
-//!    To Routing Slot reads it: a record written over or the type's entry
-//!    with the flags the table now has). An index outside the table is
-//!    native error 0x1b.
+//! 1. The routing slot is the stack object's in mode 3 (its routing slot
+//!    table, object +0x13c, which holds only the SLOT entries of kind 3,
+//!    as Go To Routing Slot reads it: a record written over or the type's
+//!    entry with the flags the table now has). In mode 4 it is the lot's
+//!    (0x454ab6: the stack object's lot, +0xdc, at +0x9c), the kind 3
+//!    entries of the global file's SLOT 100
+//!    ([`crate::Program::global_routing_slot`]), with the flags the lot's
+//!    one copy now has ([`GLOBAL_SLOTS`]), as Go To Routing Slot's source
+//!    2 reads it. Either way the place is still the stack object's. An
+//!    index outside the table (a negative one included) is native error
+//!    0x1b.
 //! 2. The direction: with slot flag 0x1000, the object's facing (data
 //!    word 1) turned by the number of the lowest of the flag's bits 0 to
 //!    6 that is set (0 for none); without it, my own facing. It is kept
@@ -24,20 +31,15 @@
 //!    one past the last is native error 0x20 (the object's container
 //!    records, object +0x130, count its tile's chain first). The place is
 //!    the object's position and level (+0x110), and the place test is the
-//!    one for a slot of the object (`Interpreter::fits_in`). Otherwise the
-//!    place is the
-//!    object's position and level with the slot's offset turned to the
-//!    object's facing and added (0x454b93): the position goes to world
-//!    units (times 3/16, 0x454f5c), the offset's first two coordinates
-//!    too (0x454ecc), the offset is turned by a matrix of the object's
-//!    facing (0x455070, 0x5c39a0) and added, and the sum comes back to
-//!    the lot's units (times 16/3, each coordinate rounded half away from
-//!    zero, 0x454fb9). For an offset of zero the place is the object's
-//!    own position, which the round trip keeps (a coordinate times 3/16
-//!    is exact in a float, and the error of 16/3 as a float moves it by
-//!    far less than a half for any position up to [`FAR`]). An offset
-//!    that is not zero turns through a sine and a cosine and fails
-//!    loudly, as does a position further out than [`FAR`].
+//!    one for a slot of the object (`Interpreter::fits_in`). Otherwise
+//!    the place is the object's position with the slot's offset turned
+//!    to the object's facing and added (0x454b93): the position goes to
+//!    world units (times 3/16, 0x454f5c), the offset's first two
+//!    coordinates too (0x454ecc), the offset is turned by a matrix of
+//!    the object's facing (0x455070, 0x5c39a0) and added, and the sum
+//!    comes back to the lot's units (times 16/3, each coordinate rounded
+//!    half away from zero, 0x454fb9); see [`place_by_offset`]. The level
+//!    is the object's.
 //! 4. Without slot flag 0x800 the placement first checks the place
 //!    itself (0x4550d8 to 0x4551e9), in this order:
 //!    - its tile must be inside the lot's border (both tile coordinates
@@ -88,7 +90,9 @@ use crate::animator::place;
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
 use crate::placement::{Place, closed_directions, on_lot};
-use crate::routing::slot::{direction, route_slot};
+use crate::primitives::go_to_slot::GLOBAL_SLOTS;
+use crate::routing::slot::{direction, facing_cos_sin, route_slot, to_lot_units, to_world_units};
+use sims_core::{Ext, F32};
 use sims_sim::animator::{Animator, LOADED, UNSET};
 
 /// The SLOT entry kind of a container slot.
@@ -96,6 +100,8 @@ const CONTAINER: u16 = 0;
 
 /// The mode that names a routing slot of the stack object by word 0.
 const SLOT: i16 = 3;
+/// The mode that names one of the lot's global routing slots by word 0.
+const GLOBAL: i16 = 4;
 /// Slot flags: the direction follows the object's facing (0x454aeb),
 /// and the placement skips its own checks (0x454b83).
 const TURNED: i32 = 0x1000;
@@ -105,9 +111,70 @@ const FACING: usize = 1;
 const WORD_52: usize = 52;
 /// Object data word 29: the room the object is in (+0x84).
 const ROOM: usize = 29;
-/// How far out a coordinate may be for the round trip through world
-/// units to keep it.
-const FAR: i32 = 0x8000;
+
+/// The place of a slot that puts me into no container slot (0x454b93 to
+/// 0x454c54): the object's `position` with the slot's `offset` across
+/// (its first two coordinates, as float bits) turned to the object's
+/// facing `dir` and added, in world units:
+///
+/// 1. The matrix of the facing (0x455070, the raw data word, not kept in
+///    0 to 7): its rows are `[c, 0, -s, 0]`, `[0, 1, 0, 0]`, `[s, 0, c,
+///    0]` and `[0, 0, 0, 1]` ([`facing_cos_sin`]).
+/// 2. The position in world units (0x454f5c): `[k x, 0, k y]`, `k` being
+///    3/16 ([`to_world_units`]); the height is 0 as the level passed is
+///    0.
+/// 3. The offset in world units (0x454ecc): `[k o1, 0, k o0]`, the
+///    offset's second coordinate first; its third is not read.
+/// 4. The offset times the matrix (0x5c39a0, a general matrix, so
+///    0x5c4510), each coordinate divided by the fourth (1).
+/// 5. The two added, coordinate by coordinate, each sum stored (0x454c0a
+///    to 0x454c37), and the first and third back in the lot's units
+///    ([`to_lot_units`], 0x454fb9) give the place.
+///
+/// Every term is kept, zeros included, in the original's order. Every
+/// add, multiply and divide is rounded to single precision.
+pub(crate) fn place_by_offset(position: [i32; 2], offset: [u32; 2], dir: i32) -> [i32; 2] {
+    let (c, s) = facing_cos_sin(dir);
+    let zero = Ext::from_i32(0);
+    let one = Ext::from_i32(1);
+    // 0x454f5c.
+    let p = [
+        to_world_units(Ext::from_i32(position[0])),
+        zero,
+        to_world_units(Ext::from_i32(position[1])),
+    ];
+    // 0x454ecc.
+    let v = [
+        to_world_units(F32::from_bits(offset[1]).ext()),
+        zero,
+        to_world_units(F32::from_bits(offset[0]).ext()),
+    ];
+    // 0x5c4510, with m[r][c] the matrix's row r, column c.
+    let m = [
+        [c, zero, -s, zero],
+        [zero, one, zero, zero],
+        [s, zero, c, zero],
+        [zero, zero, zero, one],
+    ];
+    let w = ((((m[0][3] * v[0]).single() + (m[2][3] * v[2]).single()).single()
+        + (m[1][3] * v[1]).single())
+    .single()
+        + m[3][3])
+        .single();
+    let reciprocal = (one / w).single();
+    // The first coordinate adds the third term to the second, then the
+    // first; the third coordinate adds the first term to the third, then
+    // the second.
+    let sum = ((m[2][0] * v[2]).single() + (m[1][0] * v[1]).single()).single();
+    let sum = (sum + (v[0] * m[0][0]).single()).single();
+    let out0 = ((sum + m[3][0]).single() * reciprocal).to_f32().ext();
+    let sum = ((m[0][2] * v[0]).single() + (m[2][2] * v[2]).single()).single();
+    let sum = (sum + (m[1][2] * v[1]).single()).single();
+    let out2 = ((sum + m[3][2]).single() * reciprocal).to_f32().ext();
+    let first = (out0 + p[0]).to_f32().ext();
+    let third = (p[2] + out2).to_f32().ext();
+    [to_lot_units(first), to_lot_units(third)]
+}
 
 fn unsupported(at: &str, what: &str) -> Trap {
     Trap::Unsupported(format!("Snap {what} ({at}), which is not ported"))
@@ -121,23 +188,27 @@ impl Machine<'_, '_> {
             .filter(|id| self.world.objects.contains_key(id))
             .ok_or(Trap::native(0x15, "Snap has no stack object"))?;
         let mode = word(operands, 2);
-        match mode {
-            0..=2 | 4 => {
+        let owner = match mode {
+            0..=2 => {
                 return Err(unsupported("0x4549c7", &format!("in mode {mode}")));
             }
-            SLOT => {}
+            SLOT => target,
+            GLOBAL => GLOBAL_SLOTS,
             _ => return Err(Trap::native(0x24, "Snap has an unknown mode")),
-        }
+        };
         let guid = self.world.objects[&target].guid;
         let definition = self.definition(guid)?;
-        let (entry, type_slot) = usize::try_from(word(operands, 0))
-            .ok()
-            .and_then(|i| {
+        let index = usize::try_from(word(operands, 0)).ok();
+        let (entry, type_slot) = if owner == GLOBAL_SLOTS {
+            index.and_then(|i| self.program.global_routing_slot(i))
+        } else {
+            index.and_then(|i| {
                 self.program
                     .routing_slot(definition.resource, definition.chunk, i)
             })
-            .ok_or(Trap::native(0x1b, "Snap names no slot"))?;
-        let key = (target, word(operands, 0) as u16);
+        }
+        .ok_or(Trap::native(0x1b, "Snap names no slot"))?;
+        let key = (owner, word(operands, 0) as u16);
         let slot = match self.world.routing.slots.get(&key) {
             Some(record) => *record,
             None => route_slot(
@@ -195,16 +266,17 @@ impl Machine<'_, '_> {
             }
             Some((target, slot.snap_target))
         } else {
-            if slot.offset[0] & 0x7fff_ffff != 0 || slot.offset[1] & 0x7fff_ffff != 0 {
-                return Err(unsupported(
-                    "0x455070",
-                    "to a slot whose offset turns with the object's facing",
-                ));
-            }
-            if position[..2].iter().any(|n| n.unsigned_abs() > FAR as u32) {
-                return Err(unsupported("0x454fb9", "from a position this far out"));
-            }
             None
+        };
+        let position = if container.is_none() {
+            let [x, y] = place_by_offset(
+                [position[0], position[1]],
+                [slot.offset[0], slot.offset[1]],
+                facing(self, target)?,
+            );
+            [x, y, position[2]]
+        } else {
+            position
         };
         if operands[4] & 1 != 0 {
             return Err(unsupported(
@@ -296,5 +368,24 @@ impl Machine<'_, '_> {
     /// ([`LOADED`]), which is written here as the entry.
     fn animator(&mut self) -> &mut Animator {
         self.world.animators.entry(self.me).or_insert(LOADED)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_half_rounds_away_from_zero_either_way() {
+        // Half a unit in the lot's is 0.09375 in world units, which comes
+        // back as exactly 0.5.
+        let half = |n: f32| [0, n.to_bits()];
+        assert_eq!(place_by_offset([0, 0], half(0.5), 0), [1, 0]);
+        assert_eq!(place_by_offset([0, 0], half(-0.5), 0), [-1, 0]);
+        assert_eq!(place_by_offset([0, 0], half(0.25), 0), [0, 0]);
+        // With no offset a position comes back as it was.
+        for n in [0, 1, -1, 17, -17, 1023, 0x7fff, -0x8000] {
+            assert_eq!(place_by_offset([n, -n], [0, 0], 3), [n, -n], "{n}");
+        }
     }
 }

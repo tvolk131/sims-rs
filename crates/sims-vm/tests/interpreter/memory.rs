@@ -510,8 +510,38 @@ fn job_data_without_a_career_table_names_the_loader() {
 }
 
 #[test]
+fn the_advertisement_record_is_the_one_find_best_interaction_last_copied() {
+    // Before the first copy the record holds what the game's start left
+    // there, which is not read.
+    for scope in [12, 28, 29] {
+        let fault = read(&mut Fixture::new(), scope, 0).unwrap_err();
+        let Trap::Unsupported(text) = &fault.trap else {
+            panic!("{fault}");
+        };
+        assert!(text.contains("0x6e5100"), "{text}");
+    }
+    // After it, any tree reads and writes the record: the personality
+    // number (28), the minimum (29) and the delta (12), sixteen of them.
+    let mut fx = Fixture::new();
+    fx.world.advertisement_record = Some(std::array::from_fn(|i| sims_sim::Advertisement {
+        personality: i as i16,
+        minimum: 10 + i as i16,
+        delta: 20 + i as i16,
+    }));
+    assert!(reads(&mut fx, 28, 3, 3));
+    assert!(reads(&mut fx, 29, 3, 13));
+    assert!(reads(&mut fx, 12, 15, 35));
+    assert_eq!(write(&mut fx, 12, 2, -4), Ok(true));
+    assert_eq!(fx.world.advertisement_record.unwrap()[2].delta, -4);
+    for scope in [12, 28, 29] {
+        assert_eq!(code(read(&mut fx, scope, 16)), Some(0x1a));
+        assert_eq!(code(read(&mut fx, scope, -1)), Some(0x1a));
+    }
+}
+
+#[test]
 fn unsupported_scopes_name_themselves() {
-    for scope in [12, 24, 28, 29, 34, 38] {
+    for scope in [34, 38] {
         let mut fx = Fixture::new();
         let fault = read(&mut fx, scope, 0).unwrap_err();
         assert_eq!(fault.trap, Trap::UnsupportedScope { scope });
