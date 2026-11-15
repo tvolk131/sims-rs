@@ -41,11 +41,126 @@ use crate::load::INDICATORS;
 use crate::program::DEFINITION_WORDS;
 use crate::visits::function;
 use sims_sim::World;
+use sims_sim::animator::{Animator, Layer};
 use std::collections::BTreeSet;
 
 mod find;
 pub(crate) use find::Rules;
 pub(crate) use find::{Refusal, closed_directions, pool_tile};
+
+/// A person's own tick while its thread runs: the person, and the
+/// animator refresh its taking itself off the lot left pending
+/// ([`Interpreter::take_self_off`]).
+#[derive(Debug)]
+pub(crate) struct Refreshing {
+    pub person: u16,
+    pub pending: Option<Pending>,
+}
+
+/// A person's animator refresh at its taking itself off the lot, worked
+/// out then (`Interpreter::refresh_at_take_off`): the animator and base
+/// layer the take-off left, and those the refresh would have left
+/// instead. The refresh writes nothing else.
+#[derive(Debug)]
+pub(crate) struct Pending {
+    pub left: Kept,
+    pub refreshed: Kept,
+}
+
+/// A person's animator, base layer and the bones its skin has moved
+/// ([`World::translated_bones`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Kept {
+    pub animator: Option<Animator>,
+    pub base: Option<Layer>,
+    pub translated: Option<BTreeSet<String>>,
+}
+
+impl Kept {
+    pub(crate) fn of(world: &World, id: u16) -> Self {
+        Self {
+            animator: world.animators.get(&id).cloned(),
+            base: world.base_layers.get(&id).cloned(),
+            translated: world.translated_bones.get(&id).cloned(),
+        }
+    }
+
+    /// Puts them back as person `id`'s.
+    pub(crate) fn restore(&self, world: &mut World, id: u16) {
+        match &self.animator {
+            Some(a) => world.animators.insert(id, a.clone()),
+            None => world.animators.remove(&id),
+        };
+        match &self.base {
+            Some(layer) => world.base_layers.insert(id, layer.clone()),
+            None => world.base_layers.remove(&id),
+        };
+        match &self.translated {
+            Some(bones) => world.translated_bones.insert(id, bones.clone()),
+            None => world.translated_bones.remove(&id),
+        };
+    }
+}
+
+/// What a person's animator refresh at its taking itself off the lot
+/// does with its head slot (0x58dae5 to 0x58dc55), when the house view
+/// drew the person ([`Interpreter::take_self_off`]). The refresh reads the
+/// person's container entry at begin + 0x48 when there are more than two
+/// (our slot 2, the head's attachment; it holds the marker over the
+/// selected Sim, GUID 0x2F726FFF). Unless the entry names no bone (+0x20)
+/// or its object (+0x10) is not found, it takes the object's graphic
+/// (virtual function 0x2c; 0x4215c3 for an ordinary object, +0x120), sets
+/// the graphic's transform to the bone's place in the person's frame
+/// (0x5990e0, 0x462aab; the graphic's virtual functions 0xac, 0x64 with
+/// 1 and 0xb8), sets the graphic's +0x100 to the person's motive 3
+/// truncated (0x45d117 with 3, +0x798; 0x636128 is the C runtime's float
+/// to integer), and calls the object's virtual function 0x78 with (0, 0),
+/// which for an ordinary object (vtable 0x666d34) is 0x51d372, a bare
+/// `ret 4`.
+///
+/// So for an ordinary object it writes only the graphic, which nothing
+/// the simulation keeps holds. The animator's tick, which follows in the
+/// same tick, makes the same calls on the same graphic in its tail
+/// (0x58f908 to 0x58fa7f, ending with the graphic's virtual function 0x50
+/// instead), and that redraw is left out as presentation (`crate::animator`);
+/// this one is too, which is as unverified. A person or a tile of a group
+/// in the slot has another class (0x667378, 0x666c20), whose functions
+/// there are not read, so it fails.
+fn head_slot_redraw(world: &World, id: u16) -> Result<(), Trap> {
+    let person = world.objects.get(&id).ok_or_else(missing)?;
+    let Some(slot) = person.slots.get(2).filter(|slot| slot.object > 0) else {
+        return Ok(());
+    };
+    let Some(held) = world.objects.get(&(slot.object as u16)) else {
+        return Ok(());
+    };
+    if held.person.is_some() || held.multipart.is_some() {
+        return Err(Trap::Unsupported(format!(
+            "person {id} takes itself off the lot with {} {} in its head slot: its animator's \
+             refresh, if the house view drew it, redraws it through that class's functions \
+             (0x58dc08 to 0x58dc52), which are not read",
+            if held.person.is_some() {
+                "the person"
+            } else {
+                "the group tile"
+            },
+            slot.object
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a primitive reads nothing of any animator, so it may run while
+/// an animator refresh is pending ([`Interpreter::take_self_off`]): Sleep,
+/// Expression, Change Suit/Accessory on a suit (operand 1 = 1, which
+/// writes person words 8 and 21 only), Set Motive Change and Set To Next.
+pub(crate) fn reads_no_animator(opcode: u16, operands: &[u8; 8]) -> bool {
+    match opcode {
+        0 | 2 | 29 | 31 => true,
+        6 => operands[1] == 1,
+        _ => false,
+    }
+}
 
 /// The side of the lot's arrays.
 const FULL: i32 = 64;
@@ -1155,6 +1270,87 @@ impl Interpreter<'_> {
         for &part in &parts {
             self.take_off_one(world, part, notify)?;
         }
+        Ok(())
+    }
+
+    /// Person `id` takes itself off the lot, while its own tick runs its
+    /// thread (Find Location For mode 1 on itself, 0x44b519). The take-off
+    /// is the one-tile path of [`Interpreter::take_off`] (0x433125, which
+    /// a person's vtable 0x667378 shares), and at its end (0x4332e0 to
+    /// 0x4332ed, before the registry is told) the person's animator is
+    /// refreshed (its virtual function 0x54 with 1, 0x58da12), which does
+    /// nothing unless animator byte +0x109 is set (0x58da2c).
+    ///
+    /// That byte is what the house view's last draw found (virtual
+    /// function 0x6c, 0x590b8b): byte +0xd9, or else whether the person's
+    /// bounds were on screen (0x5a0a8a). It is presentation and not kept.
+    /// When it is set, the refresh does in small what the animator's tick
+    /// does (0x58dc72), at the same clock: it reads the clock (+0xb4),
+    /// removes a blend layer with no weight (+0x10; none is made here),
+    /// updates the draw state and the face (0x434101, 0x58faf6, left out
+    /// as in the tick), forces the skin's update at the clock (0x5992b3
+    /// with 1; its second argument only gates the pose, 0x59820a), places
+    /// the animator (virtual function 0x60), and runs the head's step,
+    /// measurement and restoration (0x590768, 0x5904d2, 0x590b27). Then it
+    /// redraws what the person's head slot holds (0x58dae5 to 0x58dc55;
+    /// [`head_slot_redraw`]).
+    ///
+    /// Whether the byte was set is not known, so both branches are kept
+    /// apart until they meet. The refresh is worked out here, on a copy
+    /// of the lot as the take-off leaves it
+    /// (`Interpreter::refresh_at_take_off`), and fails unless it writes
+    /// nothing but the person's animator and base layer and plays no
+    /// sound. The lot goes on without it. The person's own animator tick
+    /// follows in the same tick, at the same clock, after its thread
+    /// yields; until then only primitives that read nothing of an
+    /// animator may run ([`reads_no_animator`]), so they cannot tell the
+    /// branches apart. The tick settles it
+    /// (`Interpreter::tick_animator_after_take_off`). A person whose head
+    /// slot holds a person or a tile of a group fails
+    /// ([`head_slot_redraw`]), and so does one whose hand (slot 1) holds
+    /// anything, and a take-off outside the person's own tick.
+    pub(crate) fn take_self_off(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let refreshing = self
+            .refreshing
+            .filter(|r| r.borrow().person == id && r.borrow().pending.is_none());
+        let Some(refreshing) = refreshing else {
+            return self.take_off(world, id, true);
+        };
+        let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
+        if object.multipart.is_some() {
+            return Err(fail(Trap::Invalid("a person with several tiles".into())));
+        }
+        // The refresh comes after the callbacks below, so its head slot
+        // redraw reads the slot there ([`head_slot_redraw`]); it is read
+        // before them too, which can only add stops. A person whose hand
+        // holds something (slot 1) also fails, which can only add stops:
+        // the refresh reads no other container entry.
+        let holding = |world: &World| {
+            let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
+            if object.slots.get(1).is_some_and(|slot| slot.object != 0) {
+                return Err(fail(Trap::Unsupported(
+                    "a person whose hand holds something taking itself off the lot: its \
+                     animator's refresh, if the house view drew it, is taken to read only its \
+                     head slot (0x58dae5 to 0x58dc55)"
+                        .into(),
+                )));
+            }
+            head_slot_redraw(world, id).map_err(fail)
+        };
+        holding(world)?;
+        // 0x4332e0 to 0x4332ed: the refresh comes after the holder's
+        // function 9 and the portal's tiles, before the registry is told,
+        // which changes nothing for a person (`left_lot`).
+        self.take_off_one(world, id, false)?;
+        holding(world)?;
+        let pending = self.refresh_at_take_off(world, id).map_err(fail)?;
+        self.left_lot(world, id)?;
+        refreshing.borrow_mut().pending = Some(pending);
         Ok(())
     }
 

@@ -93,6 +93,324 @@ disassembly; none of it is checked against a run.
   loop's speed never changes on the Goths through tick 1102, so the
   output is unchanged.
 
+## 2026-11-15: The base layer kept; a person takes itself off; strict mode to tick 3432
+
+**Unverified.** No capture covers any of it: everything here is from
+tick 2837 on, and the Goth captures end at update 1000. Strict mode now
+runs through tick 3432 (08:25:08, hash 359095d7…; fbb3d668… in format
+25) and stops at tick 3433.
+
+**Hashes.** Snapshot format 25 appends `World::base_layers`, and format
+26 then `World::translated_bones`, so every pinned hash changes. The
+format-25 encoding is a prefix of the format-26 one, and `boot.rs` and
+`resize.rs` pin both (`format_25_bytes`): every format-25 hash this
+entry first pinned (ticks 33, 1103, 2881 and 3432) still holds. The
+format-24 encoding is a prefix of the format-25 one, and `boot.rs` pins
+both (`format_24_bytes`): ticks 33 and 1103 keep
+their format-24 hashes, and the state at tick 2836 is byte for byte the
+one the previous commit (1bacd2d3) reaches (format 24, f74e31af…).
+At tick 2881 the format-24 hash changes from eed688a0… to cdd5b72c…,
+which is the head fix below; ticks up to 2836 are unchanged. Every
+summary line of `sims boot … --ticks 2881` is unchanged. The K=1000
+pins in `resize.rs` hold.
+
+**The head looks at an object with its coordinates the right way
+round** (0x59058f, 0x454f5c). The measurement passes native +0xf4 first,
+which is our second lot coordinate, so the target is [3/16 ·
+position[1], 0, 3/16 · position[0]]. #156 had them swapped. Track 4
+found this and a review agreed.
+
+**The base layer and the pose** (stop at tick 2882, 0x5992b3). The base
+slot's playback is kept in `World::base_layers` and updated with the
+skin's other layers in the animator's tail, timed events included. The
+pose samples the layers by priority (0x5991fd): the base layer (-10)
+first, then the foreground and the carry layer in the skin's order.
+Each layer at weight 1 or more replaces what the bones held:
+
+- A layer with nothing bound, no frames or no weight samples nothing.
+- One below weight 1 blends (0x597c4c), which fails.
+- The skin never puts the bones back at rest. A rotation on the way to
+  a measured bone that no layer playing now writes is what an earlier
+  layer left, which is not kept, so that fails.
+- A translation is kept too: a motion with no positions leaves it as
+  it was (0x598226, 0x598450). `World::translated_bones` (snapshot
+  format 26) records, per person, every bone whose translation a layer
+  the skin's update could sample has written since the person was made
+  or loaded. A bone on the way to a measured bone that no layer playing
+  now moves fails if it is in that record, and is at rest otherwise. The
+  record counts every layer that could sample, without the update's
+  "pose" argument (0x59820a) or the sample count, so it may hold more
+  bones than the original moved; that only makes more cases fail. That
+  a skin starts at rest at load is unverified. Of 7,950 clips, 7,947
+  move ROOT and 7,577 PELVIS; SPINE is moved by 32.
+
+A posture whose clip has no name starts nothing and leaves the slot as
+it was (0x5904af, from the disassembly; retried next tick). Animate Sim
+in the base slot now plays clips with timed events.
+
+**Generic Sims Call 12** (stop at tick 2930, 0x44fd4b). Temp 0 becomes
+minus the sum of the stack object's tile coordinates, turned by the
+house view's rotation (0x434f58, the table 0x407704 builds), as a
+16-bit word. A coordinate outside 0 to 63 at a rotation other than 0
+fails, since the original reads outside its table.
+
+The view's rotation (the scene at 0x6e5528, +0x84, passed at 0x44fdb8)
+is the player's, not the lot's, but the simulation reads it, so it is an
+input of `Lot` like an order: `Lot::set_view_rotation`, between steps.
+Every interpreter `Lot` builds (load, step, orders, pie menu, selection)
+passes it.
+The game window sets it whenever its camera turns, from the panel or the
+keys. **A recording of play must log each change** with the tick it came
+before. The load starts it at the camera direction the house file saved
+(HOUS, `boot::opening_rotation`), as the render track opens the view.
+That the original's load turns the scene to it is not traced (its HOUS
+read goes through 0x4b4263 and 0x4b42ba). The Goth and Newbie houses
+both saved 0, and the comparison harness saw the Goth house open at
+rotation 0, so strict boots of both run at 0. Which way the panel's two
+buttons turn the original's scene is unverified.
+
+**Generic Sims Call 2** (stop at tick 3356, 0x44fb51). It names the
+running action's icon. #158 ported the same routine on main with the
+same meaning, so the rebase keeps main's.
+
+**A person takes itself off the lot in its own tick** (stop at tick
+3356; Find Location mode 1 with the person as target). 0x433125
+refreshes the person's animator before the registry hears of it
+(0x4332e0, virtual function 0x54 with 1, 0x58da12), but only if animator
+byte +0x109 is set. That byte is the house view's last draw test
+(0x590b8b), which is presentation and is not kept. The refresh is a
+small animator tick: the clock, the blend slot, the skin forced, the
+place, and the head's step, measurement and restoration. Instead of
+choosing a branch, both must agree. This is exactly what is checked:
+
+1. At the take-off, the refresh is worked out on a copy of the lot as
+   the take-off leaves it (after the holder's function 9 and the
+   portal's tiles, before the registry, which does nothing for a
+   person). The copy, with the person's animator, base layer and record
+   of moved bones (`World::translated_bones`) put back, must encode byte
+   for byte as the lot does, and the refresh must play no sound into the
+   sound list. So the refresh writes nothing but those three, judged on
+   the state it would really have read. A running head countdown (word 45) fails here, and so does a
+   timed event that writes a hand or the censor word to a new value.
+   The sound list does not hear the sounds of timed events, which are
+   not modeled. So a timed event due in the refresh with a sound key
+   ("sound", "selectedsound", "deselectedsound", "footstep") fails
+   too: for a selected person "selectedsound" plays (0x59158c, 0x59175e,
+   0x57a54c), and when the original plays nothing is not worked out.
+   The lot goes on without the refresh.
+2. Until the animator's tick, the person's thread may run only Sleep,
+   Expression, Set Motive Change, Set To Next, and Change Suit with
+   operand 1 set to 1. Anything else fails, naming 0x58da12. That these
+   read no animator and no base layer is from their ports, not proven
+   for the original.
+3. At the animator's tick, the animator, its base layer and the record
+   of moved bones must be those the take-off left (compared field by
+   field).
+4. The tick from the refreshed three, on the lot as it is then, must
+   reach the same encoded world, and append the same sounds, as the
+   tick alone.
+
+What this does not cover: anything the refresh does that the port
+leaves out (the draw state, the face, the pose, the head slot's
+redraw). In the tick itself the sounds of timed events are still not
+modeled, in both branches.
+
+The tick alone is kept. The refresh then redraws what the head slot
+holds (0x58dae5 to 0x58dc55): the container entry at begin + 0x48, our
+slot 2, read when the person has more than two entries. For an ordinary
+object (vtable 0x666d34) every write lands on its graphic ([obj+0x120],
+from vtable +0x2c, 0x4215c3): the head bone's transform (animator +0xac,
+0x5990e0, times animator +0xb0) through graphic +0xac, +0x64 and +0xb8,
+and graphic +0x100 = the person's motive 3 as an integer (0x45d117 reads
++0x78c + 3 * 4; 0x636128 is the C runtime's `_ftol`, not a clock or a
+random draw). Its +0x78 call is 0x51d372, `ret 4`. The animator tick's
+tail (0x58f908 to 0x58fa7f) makes the same redraw every tick, which the
+port already leaves out as presentation, so the take-off's redraw is
+left out too; that is unverified. A person or a tile of a group in the
+head slot fails, since their classes' functions (0x58dc08 to 0x58dc52)
+are not read; this is checked before and after the take-off's
+callbacks. A held hand (slot 1) fails too, though the refresh does not
+read it, which can only add stops. A multi-tile person fails. The draw
+state (0x434101) and the face (0x58faf6) are taken as presentation, as
+in the tick; that is unverified. At tick 3356 person 21's head slot
+holds its plumb bob (object 383, GUID 0x2F726FFF), an ordinary object;
+person 21 then passes all four checks.
+
+**Go To Routing Slot's interrupt tests** (stop at tick 3370):
+
+- the door step (0x45afd0) and the asking step (0x45b475) fail with
+  result 4, as step 1 does;
+- the walk under way (0x45b2b7) takes result 4 to step 11, which stops
+  the animator, plays `end_route` and fails (0x45b3c2).
+
+These are on track 4's list; strict mode on the Goth house needed them,
+so they are ported here. Only the door step has a synthetic test. The
+other two use the same interrupt check and are tested only by the boot.
+
+**Where it stops.** In strict mode, at tick 3433. Object 334 (tree
+0x200d node 5) snaps a multi-tile object to a place where it does not
+fit, and which object its group's test leaves as collided with is not
+ported (0x454e82). The snack order (play mode) now runs without a caught
+error until step 3603. There, object 354 (tree 0x1022 node 29) uses
+Create New Object Instance mode 6 with flag 0x4, which is not ported.
+With this and #158, strict mode on the Newbie house (`House07.iff`) runs
+through tick 1472 (no recording to compare); at tick 1473 object 105
+(tree 0x1017 node 0) gives up a route and needs the route-failure
+feedback tree (0x45af2a), which is not ported.
+
+## 2026-11-15: The canvas notes which object or person drew each pixel
+
+For the game window's clicks, `sims_render::Canvas` keeps an ID per
+pixel beside its colour and depth. Whatever draws sets a pen
+(`Canvas::set_id`); every pixel the canvas takes after that, by its
+usual rule (passing the depth test, not fainter than `FAINT`, blended
+or not), takes the pen's ID. `Canvas::id_at(x, y)` gives it back:
+`Option<u16>`, the key in `World::objects`. `sims_render::draw` clears
+every ID and gives object sprites their object's ID and terrain,
+floors, walls, trims and caps none. `sims_people::People::draw_on_lot`
+(and `People::draw` into any `Target` that keeps IDs, through the new
+`Target::set_id`, a no-op by default) gives each person's pixels the
+person's object ID. So after the lot and its people are drawn, `id_at`
+names what is shown at a pixel; an object or person hidden behind a
+wall is named nowhere, and a pixel a soft edge blended over names the
+edge's owner. Each tile of a multi-tile object is its own object and
+names itself; finding its lead object is the caller's. Nothing changes
+what is drawn: the Goth house digests are unchanged.
+
+For `sims-game` (track 1): its people loop (`Marked`, `shown` in
+`src/people.rs`) can set the canvas's pen per person (or call
+`draw_on_lot`) and read `Canvas::id_at`, and `src/pick.rs` can pick
+objects by it instead of by tile. Whether to search nearby pixels when
+the pixel itself names nobody (`REACH` today) is the game's choice.
+
+How the original resolves a click to an object or a Sim (by an ID
+buffer, as here, or otherwise) is not read; this is ours, and what it
+names should be compared with the original's choice of object at the
+same pixel once the harness can click.
+
+## 2026-11-15: A lit lamp throws a pool of light on the floor around it
+
+The bay's floor was lit in graded pools the renderer did not draw. They
+come from the lamps, not the windows: in the original a lit lamp marks
+the tiles around it, and each floor tile it reaches adds a pool map from
+`GameData/lightMap.dat` to its light. `sims_render::pools` reads the
+maps, `Lot::lamps` keeps each tile's lamps, and the floor draw adds the
+pools. A lit lamp's own sprite is drawn in full light.
+
+**Read from the code.**
+
+- The marks (0x467e05, 0x4b4e8b, 0x4b5037). As the room update counts
+  an object, one that is a light source (data word 40 flag 0x400), gives
+  light (word 51 not 0) and has word 16 set to 1 takes its marks off and
+  marks again: every tile within 4 tiles each way (12 / 3, rounded), on
+  the lot's inner tiles and in the lamp tile's room (for a split tile,
+  either half's), takes the offset from the lamp. A tile keeps two: a
+  third lamp nearer than the first replaces the first (which is lost,
+  not moved down), else one nearer than the second replaces it.
+- The pools (0x4c811f, 0x4c8049, 0x4b6c17, 0x4b61b2). A floor tile whose
+  room light is not 1 (after the 0.5 to 1 clamp) draws with each lamp
+  within 3 tiles each way (the map's reach, 0x4a3805), the view-rotated
+  offset choosing where in the map the tile's image lies (0x4a3813). A
+  pixel's light byte is `fraction * 255 + 0.5`, truncated, plus each
+  lamp's map byte, capped at 255; its top five bits pick the level as
+  usual, so the brightest pool is level 31, never full light.
+- The file (0x4b5700). Four light fields, then the wall tables, then a
+  pool map per zoom. The light radius of 12 gives the field and table
+  sizes (0x49bdf6, 0x49be1f, 0x4bb7c5), and the parts then add up to the
+  file's 2,271,104 bytes exactly. That is how the maps' sizes were
+  found: 7 tiles across and half that high at each zoom.
+- A light source other than a window (type 8) with light (word 51) draws
+  in full light (0x437f7d, 0x4b455f).
+
+**Compared** with the world at the screenshots' time (a snapshot at tick
+570, 6:49): near zoom rose from 85.2% to 86.1% exact (non-green 90.9% to
+92.0%), and far zoom at rotation 2 from 89.9% to 90.1%. Far zoom at
+rotation 1 and medium zoom do not change: no pool shows in them. The
+floors in the bay now match; what differs there is the edge-on wall
+(fixed in #159) and the shrub's shadow.
+
+**Not verified.** The original builds its marks up as it counts rooms,
+in its own order, and only takes a lamp's marks off when it next counts
+it dark; we work them out afresh, lamps in object order. They could
+differ where three or more lamps reach a tile or a lamp went dark; no
+screenshot shows either. Which way the record turns with the view
+(0x4aedc2) is not read: we turn each offset as the camera turns the
+lot, so a pool stays centred on its lamp. Turned the other way, a tile
+off the lamp's axes would show its gradient reversed; rotation 2 cannot
+tell the two apart, and no screenshot at rotation 1 or 3 shows a pool. When
+the file is missing the original computes the maps (0x4bb5bc); we draw
+no pools. Data word 16's meaning is not known.
+
+**Not ported.** Pools on walls (0x4c78c5: the file's wall tables, by
+the lamp's distance from the wall and its offset along it, blitted by
+0x4b7630 and 0x4b780d), on grass, and the full light a draw group's
+sprite gets when a word of its record is 7 (0x437adb).
+
+## 2026-11-15: From house version 63 the floors and walls are read whole from Arry 11, 12, 111 and 112
+
+The lot array loader (0x478599) tests the house's version once per level
+(0x478617): from 63 on, it reads the lot's floor array from Arry chunk
+level base + 11 and its wall array from base + 12 (0x47861d to
+0x478652), and skips the widening of chunks 1 and 2 that older versions
+need. The read (0x431005) replaces the whole array, taking the chunk's
+size and cell size, as for every other array. So a version-63 house's
+floors and walls are 2-byte and 14-byte cells as the lot holds them,
+every cell of them, not just those inside the lot's size. `World::read_arrays`
+now does that (`load::WIDE_SURFACES`). The loader's other version tests
+are all below 53, so this covers every later version too (the expansion
+lots are 69 to 73).
+
+Every shipped house of version 63 or later has these arrays at 64 by 64,
+with 2-byte floor and 14-byte wall cells, and the port requires that: any
+other size or cell size fails here. The original's read takes any size
+(its resize, 0x4312ff to 0x431388, has no 64-by-64 requirement), and what
+follows with another shape is not known. Arrays 1, 2, 101 and 102 left in such a file are not read, as in
+the original.
+
+The floor and wall maps already followed the version (chunk 1 and word IDs
+from 63, `House::load`).
+
+**Verified:** the Goth house (version 62) is byte-identical through tick
+2881, hash included (`eed688a0...`). Booted together with the records
+change, UserData3's house 2 (version 63) gets through the arrays and the
+renumbering and stops at the household selection (it has no family).
+**Unverified:** a version-63 lot's arrays against a capture.
+
+Next for the template houses: UserData2's houses 1 and 9 have floor and
+wall maps with entries, and resolving those to the game's loaded patterns
+is not ported (`World::renumber_surfaces`).
+
+## 2026-11-15: Sound scripts ask about an object as the original answers
+
+`getsrcdatafield` passes the values of both its source registers, the
+object's ID and a field, to the game's callback (0x57f2e8 calls 0x571127).
+We had passed the thread's own object as well and answered 0; the
+`Sources` trait now takes the two values and may refuse. A field of 21 or
+more is refused, as the original refuses it: the destination keeps its
+value and "Illegal source parameter request" is a fault. Any other field
+gets the original's object query (0x570e61), listed in
+`sims_audio::sources`: field 0 is the voice (1000 for person data word 74
+bits 2 or 3, 2 for a child, else the gender word 65), 1 the age, 2, 3,
+5 to 7, 11, 12 and 15 to 20 person data words over 10 (skills and
+personality), 8 to 10 zero, 14 motive 3 over 10, 4 the hour (global
+0: the record at `[0x6e48bc]+0x1c` is the globals block, since its +0x24
+is global 10, the lot), 13 the size in tiles of the object's room, or 100.
+
+The original asks the live simulation; the sound here runs on its own
+thread. So `sims_game::sound::sources` reads every object's answers from
+the world into a `Snapshot` each time the window runs the lot, and sends
+it to the mixer before that run's sound events when it changed. A script
+can hear a later state than the one its sound was asked in (the window
+may run several ticks at once) or an earlier one (the mixer's timing);
+nothing in the sound is known to depend on the difference. It only reads the world, so strict output is unchanged.
+On the Goth house the answers are what the save holds: Cassandra 2,
+Bella 1 and Mortimer 0 for the voice, and their personalities.
+
+**Unverified:** none of the answers has been compared with the running
+game, and the meanings of the fields beyond what the code reads (voice,
+gender) are guesses from the person data words. Reopen when a capture
+of the sound manager's queries can be compared.
+
 ## 2026-11-15: The reload makes a record for each person type without one; UserData2 to 8 load
 
 The houses of UserData2 to UserData8 failed before any tick: "the person

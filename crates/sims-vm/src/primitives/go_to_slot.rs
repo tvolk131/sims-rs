@@ -16,8 +16,10 @@
 //!   0x589ead) fails with result 4, the next step 7 (0x45b18b). Else the
 //!   places the person could stand are found (0x48235a); the next step is
 //!   18.
-//! - **2**, the way through a door (0x45afd0): once the person is in
-//!   the object's room, back to step 1. Otherwise a door tree that
+//! - **2**, the way through a door (0x45afd0): a person who wants to be
+//!   interrupted and whose animator may stop fails with result 4, the
+//!   next step 7, as in step 1. Once the person is in the object's room,
+//!   back to step 1. Otherwise a door tree that
 //!   returned false marks its door failed, the door to go through is
 //!   chosen (`routing/portals.rs`), and its door tree is pushed on the
 //!   person's thread; the step stays 2 while that tree runs.
@@ -40,7 +42,9 @@
 //!   (`primitives/in_way.rs`): asked, the next step is 14, else 16. At 2
 //!   the count becomes 3 and the next step is 1; at 3 the next step is
 //!   16; any other count goes to step 7.
-//! - **14**, waiting for the person asked (0x45b475): with none asked
+//! - **14**, waiting for the person asked (0x45b475): a person who
+//!   wants to be interrupted and whose animator may stop fails with
+//!   result 4, the next step 7, as in step 1. With none asked
 //!   the next step is 1 (and the count goes back to 0 when the asked
 //!   person moved, context byte +0x84). Else, the first time, "route ask
 //!   to move animation" is pushed on the thread with the person asked as
@@ -53,12 +57,16 @@
 //! - **7**: the route ends as failed ([`Machine::end_route`]).
 //! - **12**: the animator starts the route (0x589c85); the next step is 3
 //!   and the thread yields.
-//! - **3**, on the ticks after: while the animator's route is under way
+//! - **3**, on the ticks after (0x45b2b7): a person who wants to be
+//!   interrupted and whose animator may stop takes result 4 and the next
+//!   step is 11. Otherwise, while the animator's route is under way
 //!   (0x589d47 gives 2), the thread yields. When it reached the path's
 //!   end (1) the next step is 9, else 10.
 //! - **9**: the animator stops (0x589e2d); the next step is 8.
 //! - **10**: the animator stops short of the path's end, as when its
 //!   next step was blocked (0x45b371); the next step is 6.
+//! - **11**, interrupted on the way (0x45b3c2): the animator stops; the
+//!   next step is 7.
 //! - **8**: the route ends ([`Machine::end_route`]): the result is true.
 //!
 //! The steps run one after another in a run until one yields or pushes a
@@ -96,8 +104,7 @@
 //! update 438 do not reach fails loudly: a parameter number past the
 //! frame's parameters, a stack object that is missing or off the lot in a later
 //! step, a person with bit 0 of word 68 set or other contexts, a person
-//! who wants to be interrupted at a door, on the way or while waiting
-//! for a person asked (steps 2, 3 and 14), a person sitting (posture 1), no door to
+//! sitting (posture 1), no door to
 //! go through, giving up on a slot the route may end near (the failure
 //! feedback tree, 0x45af2a), ending a route while the asked person runs
 //! the action (0x45d5f8), every other step and every other result of the
@@ -146,6 +153,7 @@ const FAILED: i32 = 7;
 const SUCCEEDED: i32 = 8;
 const ARRIVED: i32 = 9;
 const STOPPED: i32 = 10;
+const INTERRUPTED: i32 = 11;
 const START: i32 = 12;
 
 /// The sound events a route plays as it starts and after it stops
@@ -467,14 +475,7 @@ impl Machine<'_, '_> {
                     // 0x45b18b: a person who wants to be interrupted, and
                     // whose animator may stop (0x589ead), fails with
                     // context +0x88 = 4.
-                    if self.wants_interrupt()?
-                        && self
-                            .world
-                            .animators
-                            .get(&me)
-                            .unwrap_or(&LOADED)
-                            .interruptible()
-                    {
+                    if self.interrupted()? {
                         ctx.result = 4;
                         state = FAILED;
                         continue;
@@ -560,12 +561,13 @@ impl Machine<'_, '_> {
                     }
                 }
                 PORTAL => {
-                    // 0x45afd0.
-                    if self.wants_interrupt()? {
-                        return Err(unsupported(
-                            "0x45afd2",
-                            "for a person who wants to be interrupted",
-                        ));
+                    // 0x45afd0: a person who wants to be interrupted, and
+                    // whose animator may stop, fails with result 4
+                    // (0x45afea), as in step 1.
+                    if self.interrupted()? {
+                        ctx.result = 4;
+                        state = FAILED;
+                        continue;
                     }
                     if self.room(ctx.target)? == self.room(me)? {
                         // Through: person word 72 goes back to what it was
@@ -612,11 +614,13 @@ impl Machine<'_, '_> {
                     break;
                 }
                 UNDER_WAY => {
-                    if self.wants_interrupt()? {
-                        return Err(unsupported(
-                            "0x45b2c2",
-                            "for a person who wants to be interrupted",
-                        ));
+                    // 0x45b2b7: a person who wants to be interrupted, and
+                    // whose animator may stop, stops with result 4
+                    // (0x45b1ac) and step 11.
+                    if self.interrupted()? {
+                        ctx.result = 4;
+                        state = INTERRUPTED;
+                        continue;
                     }
                     if path.is_empty() {
                         return Err(unsupported("0x45b2f7", "with no path"));
@@ -632,8 +636,9 @@ impl Machine<'_, '_> {
                         _ => state = STOPPED,
                     }
                 }
-                ARRIVED | STOPPED => {
-                    // 0x45b3de, 0x45b371: the animator stops (0x589e2d).
+                ARRIVED | STOPPED | INTERRUPTED => {
+                    // 0x45b3de, 0x45b371, 0x45b3c2: the animator stops
+                    // (0x589e2d).
                     let animator = self
                         .world
                         .animators
@@ -647,12 +652,17 @@ impl Machine<'_, '_> {
                     }
                     // 0x45b3a0: "end_route" plays for me. A route that
                     // stopped short of the path's end (a blocked step)
-                    // tries again (0x45b384).
+                    // tries again (0x45b384); one interrupted fails
+                    // (0x45b3d5).
                     self.sound(SoundEvent::Play {
                         object: me as i16,
                         name: END_ROUTE.into(),
                     });
-                    state = if state == STOPPED { RETRY } else { SUCCEEDED };
+                    state = match state {
+                        STOPPED => RETRY,
+                        INTERRUPTED => FAILED,
+                        _ => SUCCEEDED,
+                    };
                 }
                 RETRY => match retry as i16 {
                     // 0x45b066: once the person has moved more than 8
@@ -687,12 +697,13 @@ impl Machine<'_, '_> {
                     _ => state = FAILED,
                 },
                 ASK => {
-                    // 0x45b475.
-                    if self.wants_interrupt()? {
-                        return Err(unsupported(
-                            "0x45b480",
-                            "for a person who wants to be interrupted",
-                        ));
+                    // 0x45b475: a person who wants to be interrupted, and
+                    // whose animator may stop, fails with result 4
+                    // (0x45b48d to 0x45afea), as in step 1.
+                    if self.interrupted()? {
+                        ctx.result = 4;
+                        state = FAILED;
+                        continue;
                     }
                     if ctx.objects[1] == 0 {
                         // Released by the person asked (0x45b8f4).
@@ -916,6 +927,19 @@ impl Machine<'_, '_> {
     }
 
     /// An object's room: its data word 29.
+    /// The route's interrupt test (0x45b18b, 0x45afd0, 0x45b2b7,
+    /// 0x45b475): the person wants to be interrupted (0x45d7c0) and its
+    /// animator may stop (virtual function 0x30, 0x589ead).
+    fn interrupted(&self) -> Result<bool, Trap> {
+        Ok(self.wants_interrupt()?
+            && self
+                .world
+                .animators
+                .get(&self.me)
+                .unwrap_or(&LOADED)
+                .interruptible())
+    }
+
     fn room(&self, id: u16) -> Result<i16, Trap> {
         self.world
             .objects

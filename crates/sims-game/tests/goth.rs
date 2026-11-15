@@ -499,6 +499,60 @@ fn the_ambience_follows_the_outdoor_share_of_the_screen() {
 }
 
 #[test]
+fn the_sound_scripts_learn_about_the_goths() {
+    use sims_audio::player::Sources;
+    let Some(install) = install() else {
+        return;
+    };
+    let game = Game::open(&options(install)).expect("the Goth house opens");
+    let world = game.lot().world();
+    let snapshot = sims_game::sound::sources(world);
+    let hour = i32::from(world.globals[0]);
+    // Cassandra is a child (field 0 is 2 below age 12), Bella a woman
+    // and Mortimer a man (person data word 65); field 1 is the age, and
+    // 15 to 20 the personality over 10. Skills are 0 in the save.
+    let people: Vec<(i32, [i32; 3], [i32; 6])> = world
+        .objects
+        .iter()
+        .filter(|(_, o)| o.person.is_some())
+        .map(|(&id, _)| {
+            let a = snapshot.objects[&i32::from(id)];
+            (a[0], [a[1], a[2], a[11]], a[15..].try_into().unwrap())
+        })
+        .collect();
+    assert_eq!(
+        people,
+        [
+            (2, [9, 0, 0], [40, 50, 0, 70, 20, 70]),
+            (1, [27, 0, 0], [70, 50, 0, 30, 30, 70]),
+            (0, [27, 0, 0], [40, 40, 0, 70, 60, 40]),
+        ]
+    );
+    for (&id, object) in &world.objects {
+        let answers = snapshot.objects[&i32::from(id)];
+        // Any object hears the hour and its room's size in tiles.
+        assert_eq!(answers[4], hour);
+        let room = object.data.get(29).and_then(|r| world.rooms.rooms.get(r));
+        assert_eq!(answers[13], room.map_or(100, |r| r.half_tiles / 2));
+        match &object.person {
+            // Motive 3 over 10, truncated.
+            Some(person) => assert_eq!(answers[14], sims_game::sound::tenth(person.motives[3])),
+            None => {
+                let mut rest = answers;
+                (rest[4], rest[13]) = (0, 0);
+                assert_eq!(rest, [0; 21], "object {id}");
+            }
+        }
+    }
+    // An ID that names nothing is outside every room; field 21 on is
+    // refused.
+    assert_eq!(snapshot.field(0, 13), Some(100));
+    assert_eq!(snapshot.field(-3, 4), Some(hour));
+    assert_eq!(snapshot.field(70_000, 0), Some(0));
+    assert_eq!(snapshot.field(16, 21), None);
+}
+
+#[test]
 fn a_press_on_a_portrait_selects_that_goth() {
     let Some(install) = install() else {
         return;

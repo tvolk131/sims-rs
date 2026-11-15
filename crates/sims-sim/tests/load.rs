@@ -401,12 +401,10 @@ fn the_saved_lot_arrays_replace_the_lots() {
     );
     // Nor does a house version with another array layout.
     let saved = saved_arrays();
-    for version in [52, 63] {
-        assert_eq!(
-            world.read_arrays(&saved, version),
-            Err(LoadError::ArrayVersion(version))
-        );
-    }
+    assert_eq!(
+        world.read_arrays(&saved, 52),
+        Err(LoadError::ArrayVersion(52))
+    );
     // Or a floor saved wide, which only later versions do.
     let mut wide = saved.clone();
     wide.insert(1, array(64, 2, 1));
@@ -460,6 +458,76 @@ fn saved_floors_and_walls_are_widened_inside_the_lot_size() {
     assert_eq!(cell(&world.arrays[&102], 60, 60), [0; 14]);
     // The other arrays are taken whole.
     assert_eq!(cell(&world.arrays[&3], 63, 63), [3]);
+}
+
+/// A house's arrays as versions from 63 save them: floors and walls
+/// wide under their own IDs, every array filled with its own ID, and the
+/// narrow floors and walls of an older version left in the file.
+fn wide_arrays() -> std::collections::BTreeMap<u16, sims_formats::lot::Array> {
+    use sims_sim::load::WIDE_SURFACES;
+    let mut saved = saved_arrays();
+    for (lot, chunk) in WIDE_SURFACES {
+        let stride = if sims_sim::load::FLOORS.contains(&lot) {
+            2
+        } else {
+            14
+        };
+        saved.insert(chunk, array(64, stride, chunk as u8));
+    }
+    saved
+}
+
+#[test]
+fn from_version_63_floors_and_walls_are_read_whole_from_their_own_ids() {
+    let mut saved = wide_arrays();
+    let floor = saved.get_mut(&11).unwrap();
+    floor.data[(3 * 64 + 5) * 2..][..2].copy_from_slice(&300u16.to_le_bytes());
+    let mut world = lot(vec![0; 64]);
+    world.size = 52;
+    world.arrays.insert(101, array(64, 2, 0xee));
+    let before = world.clone();
+    for version in [63, 73] {
+        let mut world = before.clone();
+        world.read_arrays(&saved, version).unwrap();
+        let floor = &world.arrays[&1];
+        assert_eq!(cell(floor, 3, 5), 300u16.to_le_bytes());
+        // Whole: outside the lot's size too.
+        assert_eq!(cell(floor, 63, 63), [11, 11]);
+        assert_eq!(cell(&world.arrays[&101], 60, 0), [111, 111]);
+        assert_eq!(cell(&world.arrays[&2], 60, 60), [12; 14]);
+        assert_eq!(cell(&world.arrays[&102], 0, 0), [112; 14]);
+        assert_eq!(cell(&world.arrays[&3], 63, 63), [3]);
+        // The chunks are not arrays of the lot.
+        assert!(!world.arrays.contains_key(&11));
+    }
+    // A missing wide array, or one with narrow cells, changes nothing,
+    // and the narrow chunks do not stand in for it.
+    let mut world = before.clone();
+    let mut narrow = saved.clone();
+    narrow.remove(&112);
+    assert_eq!(
+        world.read_arrays(&narrow, 63),
+        Err(LoadError::MissingArray(112))
+    );
+    narrow.insert(112, array(64, 8, 0));
+    assert_eq!(
+        world.read_arrays(&narrow, 63),
+        Err(LoadError::ArrayStride {
+            array: 112,
+            stride: 8
+        })
+    );
+    narrow.insert(112, array(64, 14, 0));
+    narrow.insert(11, array(32, 2, 0));
+    assert_eq!(
+        world.read_arrays(&narrow, 63),
+        Err(LoadError::ArraySize {
+            array: 11,
+            width: 32,
+            height: 32
+        })
+    );
+    assert_eq!(world.encode(), before.encode());
 }
 
 /// A lot of size 8 with empty floors and walls, already wide.

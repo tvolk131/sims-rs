@@ -8,10 +8,17 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 33 --answers 3`
-/// gives this hash with the default frames (snapshot format 24).
-const TICK_33: &str = "da80de5807a89da3fdae78c8759d3e411bdd87c5dc7aae0bafceec963cf59796";
+/// gives this hash with the default frames (snapshot format 26).
+const TICK_33: &str = "915a9af271f2d48b191c3c1d7f4d0add337aef4c5a5899fae0a1ba02c5657e11";
+/// The same state's hash under snapshot format 25, which had no record of
+/// the bones the skins moved ([`sims_sim::World::translated_bones`]) at
+/// the end.
+const TICK_33_25: &str = "3900ae00e04dd717ef5d4a03d9e7629f7843f95d22e54c97733349d16cd147f3";
+/// The same state's hash under snapshot format 24, which had no base
+/// layers ([`sims_sim::World::base_layers`]) either.
+const TICK_33_24: &str = "da80de5807a89da3fdae78c8759d3e411bdd87c5dc7aae0bafceec963cf59796";
 /// The same state's hash under snapshot format 23, which had no headlines
-/// ([`sims_sim::World::headlines`]) at the end.
+/// ([`sims_sim::World::headlines`]) either.
 const TICK_33_23: &str = "9d5a04c006c0e77b014642afe9113d5b5ec7c250787caf001b6ede4a16bc9e99";
 /// The same state's hash under snapshot format 22, which had no families
 /// ([`sims_sim::World::families`]) either.
@@ -19,7 +26,40 @@ const TICK_33_22: &str = "041181badfd4d6953814b6c46612398df1004fa583b1d2aa5bd11c
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 1103 --answers
 /// 3` gives this hash, the tick before the salesman leaves.
-const TICK_1103: &str = "714496702b0ff2dbda94c299c217e2ae7414172e6a71775950901b0cfa6222b5";
+const TICK_1103: &str = "ce627e5ef44b7133e74322f8d5dcf1929821114529b846a4c1e442475470399a";
+/// The same state's hash under snapshot format 25.
+const TICK_1103_25: &str = "54a5adc12bd7ae9641a7029acb435272121c6678fc938ac95036f788b6b5bc86";
+/// The same state's hash under snapshot format 24.
+const TICK_1103_24: &str = "714496702b0ff2dbda94c299c217e2ae7414172e6a71775950901b0cfa6222b5";
+
+fn digest(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The lot's encoding as snapshot format 25 wrote it: without the record
+/// of the bones the skins moved ([`sims_sim::World::translated_bones`])
+/// that format 26 added at the end, so a state pinned under format 25 can
+/// be shown to be the same state but for it.
+fn format_25_bytes(lot: &Lot) -> Vec<u8> {
+    let mut bytes = lot.world().encode();
+    let moved = postcard::to_allocvec(&lot.world().translated_bones).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - moved.len()), moved);
+    bytes
+}
+
+/// The lot's encoding as snapshot format 24 wrote it: without the base
+/// layers ([`sims_sim::World::base_layers`]) that format 25 added at the
+/// end either. It starts from [`format_25_bytes`].
+fn format_24_bytes(lot: &Lot) -> Vec<u8> {
+    let mut bytes = format_25_bytes(lot);
+    let layers = postcard::to_allocvec(&lot.world().base_layers).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - layers.len()), layers);
+    bytes
+}
 
 #[test]
 fn the_goth_house_steps_to_tick_33() {
@@ -32,6 +72,9 @@ fn the_goth_house_steps_to_tick_33() {
     let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
     assert!(lot.load_report().stopped.is_none());
     assert!(lot.load_report().finished.is_some());
+    // The house saved camera direction 0, and the comparison harness saw
+    // it open at rotation 0; Generic Sims Call 12 reads it.
+    assert_eq!(lot.view_rotation(), 0);
     let start = lot.world().ticks;
     for tick in 1..=33 {
         lot.step().unwrap();
@@ -45,14 +88,9 @@ fn the_goth_house_steps_to_tick_33() {
     // No headline shows.
     assert!(lot.world().headlines.is_empty());
     assert_eq!(lot.world().hash_hex(), TICK_33);
-    use sha2::Digest;
-    let digest = |bytes: &[u8]| -> String {
-        sha2::Sha256::digest(bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
-    };
-    let mut bytes = lot.world().encode();
+    assert_eq!(digest(&format_25_bytes(&lot)), TICK_33_25);
+    let mut bytes = format_24_bytes(&lot);
+    assert_eq!(digest(&bytes), TICK_33_24);
     let headlines = postcard::to_allocvec(&lot.world().headlines).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - headlines.len()), headlines);
     assert_eq!(digest(&bytes), TICK_33_23);
@@ -335,20 +373,20 @@ fn the_snack_order_pays_for_the_snack() {
     let update = lot.step_play().unwrap();
     assert!(update.errors.is_empty(), "{:?}", update.errors);
     assert_school_bus(&lot);
-    for step in 2704..3401 {
+    for step in 2704..3603 {
         let update = lot.step_play().unwrap();
         assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
     }
-    // Step 3401: person 16 routes for an action that wants to be
-    // interrupted, which is not ported.
+    // Step 3603: object 354 makes an object with Create New Object
+    // Instance's flag 0x4, which is not ported.
     let update = lot.step_play().unwrap();
     let [error] = &update.errors[..] else {
         panic!("{:?}", update.errors);
     };
-    assert_eq!(error.object, 16);
+    assert_eq!(error.object, 354);
     let fault = error.fault.to_string();
     assert!(
-        fault.contains("tree 0x1013 node 1") && fault.contains("0x45afd2"),
+        fault.contains("tree 0x1022 node 29") && fault.contains("mode 6 with flags 0x4"),
         "{fault}"
     );
 }
@@ -404,6 +442,8 @@ fn strict_mode_takes_the_salesman_off_the_lot_at_tick_1104() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_1103);
+    assert_eq!(digest(&format_25_bytes(&lot)), TICK_1103_25);
+    assert_eq!(digest(&format_24_bytes(&lot)), TICK_1103_24);
     // The salesman (GUID 0x44A86A6C, made by object 382 at tick 6).
     assert_eq!(lot.world().objects[&259].guid, 0x44A8_6A6C);
     let update = lot.step().unwrap();
@@ -468,10 +508,22 @@ fn the_player_selects_another_goth() {
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 2881
 /// --answers 3` gives this hash.
-const TICK_2881: &str = "eed688a01a1720100e2d11b8f97f903c258837025276036a33436f05a9100f92";
+const TICK_2881: &str = "16c83a8e5f49c088dce71c67874ba7ccbb367c952b4fde8a4b3d7c78ad7a081f";
+/// The same state's hash under snapshot format 25.
+const TICK_2881_25: &str = "677bfb1d0fef771671a6b2881729604bb50d3fd2dc6ea18ca829d6cca7861aef";
+/// The same state's hash under snapshot format 24.
+const TICK_2881_24: &str = "cdd5b72c0ed8481f4db525817d1145f5445b6d2562c2ea4abfbfbfcfae4e26bf";
+
+/// `sims boot <install> UserData/Houses/House05.iff --ticks 3432
+/// --answers 3` gives this hash.
+const TICK_3432: &str = "359095d7d0e8a141ac07a3662a3aec4de888d755c663754aa624e057a6596f5b";
+/// The same state's hash under snapshot format 25.
+const TICK_3432_25: &str = "fbb3d6685e20066970fce710ca97e397b921bad0384876d05a6bcb530a62d9a9";
+/// The same state's hash under snapshot format 24.
+const TICK_3432_24: &str = "c8d4fccd905caec7a03bb6d2872d83ba0ce462ffbc6c3e0bc1432034dade3f9a";
 
 #[test]
-fn strict_mode_runs_to_tick_2881_past_the_school_bus() {
+fn strict_mode_runs_to_tick_3432_past_the_school_bus() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -493,13 +545,23 @@ fn strict_mode_runs_to_tick_2881_past_the_school_bus() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_2881);
+    assert_eq!(digest(&format_25_bytes(&lot)), TICK_2881_25);
+    assert_eq!(digest(&format_24_bytes(&lot)), TICK_2881_24);
     // Each update is two game seconds, 30 a game minute, so a day is
     // 43,200 updates.
     assert_eq!(clock(&lot), (8, 6, 46));
-    // Tick 2882: person 16, who stood up from the sofa, has a pose with no
-    // foreground layer, which is not ported.
+    for _ in 2882..=3432 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.world().hash_hex(), TICK_3432);
+    assert_eq!(digest(&format_25_bytes(&lot)), TICK_3432_25);
+    assert_eq!(digest(&format_24_bytes(&lot)), TICK_3432_24);
+    assert_eq!(clock(&lot), (8, 25, 8));
+    // Tick 3433: object 334 snaps a multi-tile object to a place where it
+    // does not fit, and which object its group's test leaves as collided
+    // with is not ported.
     let stopped = lot.step().unwrap_err().to_string();
-    for part in ["tick 2882,", "object 16", "0x5992b3"] {
+    for part in ["tick 3433,", "object 334", "0x454e82"] {
         assert!(stopped.contains(part), "{stopped}");
     }
 }

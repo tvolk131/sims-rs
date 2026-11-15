@@ -20,6 +20,7 @@ pub mod light;
 pub mod lot;
 pub mod open;
 pub mod png;
+pub mod pools;
 pub mod scene;
 
 pub use assets::Assets;
