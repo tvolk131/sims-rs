@@ -21,7 +21,7 @@
 //! spatial.rs, and lot_environment.rs with its `manager.rs` and
 //! `objects.rs`), which compared each piece with the original's code run
 //! alone. For the Goth house the results were also compared with a
-//! trace of the original loading it; see `docs/decisions.md`.
+//! trace of the original loading it; see `docs/decisions/`.
 
 use crate::load::{FLOORS, WALLS};
 use crate::{FULL_SIZE, World};
@@ -713,7 +713,7 @@ impl World {
     /// the trace holds, the upper level's map in the columns the trace
     /// holds at that moment and both levels' maps at the end of the load,
     /// whether each room is outdoors, and every cell of both levels'
-    /// flags. See `docs/decisions.md` for what the trace does not hold.
+    /// flags. See `docs/decisions/` for what the trace does not hold.
     ///
     /// Not modeled: two booleans the original keeps about the upper level
     /// (whether it holds anything, and whether anything on it is
@@ -980,7 +980,7 @@ impl World {
     /// original's code. For the Goth house every count, the light and the
     /// score of all 11 rooms, the lot's outdoor sum and score, global 27,
     /// the marks and the waiting levels were compared with a trace of the
-    /// original at two moments and were equal; see `docs/decisions.md`.
+    /// original at two moments and were equal; see `docs/decisions/`.
     ///
     /// Not modeled, being presentation: the lights the update places in a
     /// room, the lighting of the tiles, and the redrawing.

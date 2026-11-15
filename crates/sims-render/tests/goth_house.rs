@@ -3,7 +3,7 @@
 //! shows up. Needs the game: set `SIMS_INSTALL` to the install folder.
 //!
 //! The digests pin this renderer's output, not the original's. What was
-//! compared with the original is in `docs/decisions.md`.
+//! compared with the original is in `docs/decisions/`.
 
 use sha2::{Digest, Sha256};
 use sims_render::{Camera, Canvas, Focus, Lot, Walls, Zoom, draw, open_house};
