@@ -1646,9 +1646,13 @@ Progress:
   standing one keeps a full-height stub with a trim edge. At the
   cutaway camera the house box rose from 84% to 86% exact; the walls-up
   cameras rose by up to half a point.
-- Next: the door frame's left jamb, which our wall covers at medium
-  zoom; the window frames' one-step light difference; near zoom and
-  rotations 1 and 2, which have no screenshot yet.
+- Done: light levels use the original's colour tables, which shift blue
+  by a step; at the compared cameras the house box rose by 0.7 to 1.3
+  points (medium zoom 90.4%, cutaway 87.1%).
+- Found: the door's left jamb loses a depth contest with the wall; a fix
+  needs the original's per-zoom depth tables.
+- Next: near zoom and rotations 1 and 2, which have no screenshot yet;
+  the diagonal caps.
 
 ## Track: sound (`crates/sims-audio`)
 

@@ -6,32 +6,42 @@
 //! the drawing context, `legacy/crates/sims-vm/src/scheduler/clock/draw/
 //! context/light.rs`): even an unlit room shows at half brightness.
 //!
-//! How that fraction darkens a pixel was fitted to a screenshot of the
-//! original, not read from its code. The original draws in 16-bit color
-//! (5 bits red, 6 green, 5 blue). Each channel is multiplied by a factor in
-//! 256ths and rounded up; blue's factor is one 256th higher than red's and
-//! green's. At half light this gives 69% of the indoor pixels of the
-//! Goth house exactly (see `docs/decisions.md`). Other light levels are
-//! **unverified**.
+//! How that fraction darkens a pixel is read from the original's code.
+//! The original draws in 16-bit color (5 bits red, 6 green, 5 blue). A
+//! fraction of exactly 1 draws the colors as they are (0x4c7c59). Any
+//! other fraction becomes a light byte, `fraction * 255 + 0.5` truncated
+//! (0x4b76a8), and its top five bits pick one of 32 levels `l`. Each
+//! channel is then looked up in a table the game fills at start-up
+//! (0x49eea8, read through 0x438e6d), every entry truncated after adding
+//! the constant shown:
+//!
+//! ```text
+//! red   = l * red / 31 + 0.5
+//! green = 2 * l * green / 63 + 0.5
+//! blue  = (max(l, 1) - 1) * blue / 31 + 1.5
+//! ```
+//!
+//! Blue takes the level below and one step more, so black under any light
+//! shows a little blue.
 
-/// A light to draw with: a factor per channel, in 256ths.
+/// A light to draw with: one of the original's 32 light levels, or full
+/// light.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Light([u32; 3]);
+pub struct Light(Option<u8>);
 
 impl Light {
     /// Full light: colors are drawn as they are.
-    pub const FULL: Light = Light([256; 3]);
+    pub const FULL: Light = Light(None);
 
     /// The light for a tile's light byte.
     pub fn from_byte(byte: u8) -> Self {
         // The drawing context keeps the fraction between 0.5 and 1.
-        let level = (f32::from(byte) / 255.0).clamp(0.5, 1.0);
-        let k = (level * 256.0).round() as u32;
-        if k >= 256 {
-            Self::FULL
-        } else {
-            Light([k, k, k + 1])
+        let fraction = (f32::from(byte) / 255.0).clamp(0.5, 1.0);
+        if (fraction - 1.0).abs() < 1e-6 {
+            return Self::FULL;
         }
+        let byte = (f64::from(fraction) * 255.0 + 0.5) as u32;
+        Light(Some((byte.min(255) >> 3) as u8))
     }
 
     pub fn is_full(self) -> bool {
@@ -41,15 +51,15 @@ impl Light {
     /// A color under this light. Full light leaves it as it is; any other
     /// light gives a 16-bit color, widened back to 8 bits a channel.
     pub fn apply(self, [r, g, b]: [u8; 3]) -> [u8; 3] {
-        if self.is_full() {
+        let Some(level) = self.0 else {
             return [r, g, b];
-        }
-        let scale = |v: u8, k: u32| ((u32::from(v) * k + 255) >> 8).min(255) as u8;
-        let (r, g, b) = (
-            scale(r >> 3, self.0[0]),
-            scale(g >> 2, self.0[1]),
-            scale(b >> 3, self.0[2]),
-        );
+        };
+        let l = f64::from(level);
+        let entry = |x: f64| x as u8;
+        let r = entry(l * f64::from(r >> 3) * f64::from(1.0f32 / 31.0) + 0.5);
+        let g = entry(2.0 * l * f64::from(g >> 2) * f64::from(1.0f32 / 63.0) + 0.5);
+        let b = entry((l.max(1.0) - 1.0) * f64::from(b >> 3) * f64::from(1.0f32 / 31.0) + 1.5);
+        let (r, g, b) = (r.min(31), g.min(63), b.min(31));
         [
             (r << 3) | (r >> 2),
             (g << 2) | (g >> 4),
@@ -64,22 +74,39 @@ mod tests {
 
     #[test]
     fn light_is_kept_between_half_and_full() {
-        assert_eq!(Light::from_byte(0), Light([128, 128, 129]));
-        assert_eq!(Light::from_byte(127), Light([128, 128, 129]));
+        assert_eq!(Light::from_byte(0), Light(Some(16)));
+        assert_eq!(Light::from_byte(127), Light(Some(16)));
         assert_eq!(Light::from_byte(255), Light::FULL);
-        assert_eq!(Light::from_byte(204), Light([205, 205, 206]));
+        // 204 / 255 * 255 + 0.5 truncates to 204, level 25.
+        assert_eq!(Light::from_byte(204), Light(Some(25)));
+        assert_eq!(Light::from_byte(254), Light(Some(31)));
     }
 
     #[test]
-    fn half_light_halves_each_channel_rounding_up_blue_a_little_more() {
+    fn half_light_matches_the_original_tables() {
         let half = Light::from_byte(0);
         // Red 21 of 31, green 40 of 63, blue 20 of 31.
         let c = [21 << 3, 40 << 2, 20 << 3];
         let [r, g, b] = half.apply(c);
         assert_eq!((r >> 3, g >> 2, b >> 3), (11, 20, 11));
         assert_eq!(Light::FULL.apply([1, 2, 3]), [1, 2, 3]);
-        assert_eq!(half.apply([0, 0, 0]), [0, 0, 0]);
-        let [r, g, b] = half.apply([255, 255, 255]);
-        assert_eq!((r >> 3, g >> 2, b >> 3), (16, 32, 16));
+        // Blue takes one step more than red's rule would give: blues 0, 2
+        // and 4 become 1, 2 and 3 (red's rule: 0, 1 and 2).
+        let blue = |v: u8| half.apply([0, 0, v << 3])[2] >> 3;
+        assert_eq!(
+            [blue(0), blue(1), blue(2), blue(3), blue(4)],
+            [1, 1, 2, 2, 3]
+        );
+        // White, expanded back to eight bits by repeating the top bits.
+        assert_eq!(half.apply([255, 255, 255]), [132, 130, 132]);
+    }
+
+    #[test]
+    fn nearly_full_light_still_shifts_blue() {
+        // Level 31 keeps red, takes green down a step (63 to 62), and
+        // gives blue level 30, whose extra 1.5 rounds it back to 31.
+        let light = Light::from_byte(254);
+        assert_eq!(light.apply([255, 255, 255]), [255, 251, 255]);
+        assert_eq!(light.apply([0, 0, 0])[2] >> 3, 1);
     }
 }
