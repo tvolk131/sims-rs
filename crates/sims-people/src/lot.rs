@@ -582,8 +582,11 @@ mod tests {
         let half = Lighting::standard(STANDARD_LIGHT, 0.5);
         assert_eq!(half.shade(-towards), 128.0 / 255.0);
         assert_eq!(half.shade(towards), 1.0);
-        // At an angle, the light adds its strength times the cosine.
+        // At an angle, the light adds its strength times the cosine: at
+        // 60° from the light, half its strength.
         let side = Vec3::new(towards.z, 0.0, -towards.x).normalize();
-        assert!((half.shade(side) - 128.0 / 255.0 - 0.5 * side.dot(towards).max(0.0)).abs() < 1e-6);
+        let tilted = (towards * 0.5 + side * (3.0f32.sqrt() / 2.0)).normalize();
+        assert!((tilted.dot(towards) - 0.5).abs() < 1e-6);
+        assert!((half.shade(tilted) - (128.0 / 255.0 + 0.25)).abs() < 1e-6);
     }
 }

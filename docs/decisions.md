@@ -26,8 +26,8 @@ what changed and what settled it.
   direction towards the light is therefore (0.644, 0.418, 0.641). The
   drawing frame is the files' frame, so this needs no change of axes.
   At rotation 0 the house camera's eye is along (0.61, 0.5, 0.61), so
-  the light is above and behind the viewer, a little higher than the
-  eye.
+  the light is above and behind the viewer, a little lower than the eye
+  (about 25° above the ground to the eye's 30°).
 - **The level.** The person's level is their room's light, as the lot
   renderer stores it for the room's tiles (`sims_render::lot::room_light`,
   the room's shown light), over 255, held between 0.5 and 1. The
