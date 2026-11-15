@@ -20,6 +20,7 @@ fn lot() -> Fixture {
     let mut fx = Fixture::new();
     fx.world.objects.clear();
     fx.world.order.clear();
+    fx.world.people.clear();
     let chair = fx.add_type(CHAIR, 4, 0, 4097);
     fx.words(chair)[58] = 12;
     fx.words(chair)[65] = 3;

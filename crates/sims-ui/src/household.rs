@@ -85,7 +85,8 @@ impl Snapshot {
 
     /// The clock as the panel writes it: `AM 6:30`. Midnight and noon
     /// are 12. Checked against the original at 6:30 and 10:10 in the
-    /// morning; the afternoon is **unverified**.
+    /// morning and 7:31 and 7:55 in the evening (`PM 7:31`); midnight
+    /// and noon are **unverified**.
     pub fn clock(&self) -> String {
         let hour = self.hour.rem_euclid(24);
         let twelve = match hour % 12 {

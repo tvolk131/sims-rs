@@ -112,10 +112,21 @@ impl Interpreter<'_> {
         let id = (1..=i16::MAX as u16)
             .find(|id| !world.objects.contains_key(id))
             .ok_or_else(|| fail(0, Trap::Unsupported("no unused object ID".into())))?;
-        let words = self
+        let factory = Interpreter {
+            making_person: Some(id),
+            ..*self
+        };
+        let words = factory
             .machine(world, id, 0, false)
             .construct(guid, true)
             .map_err(|trap| fail(id, trap))?;
+        // The person joins the end of the person vector. A load's people
+        // keep its order, and Set To Next in tick 409 of the Goth house
+        // shows a person made at run time coming after them; when in the
+        // making the original appends it is not read, so while the
+        // factory runs scripts a walk of the vector traps
+        // ([`Interpreter::making_person`]).
+        world.people.push(id);
         // The post-constructor.
         let mut draws = Draws {
             stream: &mut world.crt_rng,
@@ -128,11 +139,13 @@ impl Interpreter<'_> {
             &mut world.skeleton_files,
         )
         .map_err(|trap| fail(id, trap))?;
-        self.attach_neighbor(world, id)
+        factory
+            .attach_neighbor(world, id)
             .map_err(|trap| fail(id, trap))?;
-        self.default_traits_if_low(world, id)
+        factory
+            .default_traits_if_low(world, id)
             .map_err(|trap| fail(id, trap))?;
-        self.construction_reset(world, id, words)?;
+        factory.construction_reset(world, id, words)?;
         let object = world
             .objects
             .get_mut(&id)

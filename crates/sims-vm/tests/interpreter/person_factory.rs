@@ -18,8 +18,14 @@ const MAIN: u16 = 4097;
 /// and a dog. The adult's Main sets its first argument to 100 and sleeps
 /// on it.
 fn lot(record_word: i16) -> Fixture {
+    lot_with_init(record_word, 0).0
+}
+
+/// [`lot`], with the adult's Init callback naming tree `init`. Gives the
+/// adult's file too.
+fn lot_with_init(record_word: i16, init: u16) -> (Fixture, usize) {
     let mut fx = Fixture::new();
-    let file = fx.add_type(ADULT, 2, 0, MAIN);
+    let file = fx.add_type(ADULT, 2, init, MAIN);
     fx.words(file)[word::PRICE] = 250;
     fx.add(
         file,
@@ -34,7 +40,7 @@ fn lot(record_word: i16) -> Fixture {
     equip(&mut fx, ADULT, "adult", record_word);
     equip(&mut fx, DOG, "Dog", record_word);
     fx.world.crt_rng = CrtRng::from_state(77);
-    fx
+    (fx, file)
 }
 
 /// Gives a fixture what making a person of type `guid` needs beyond its
@@ -91,6 +97,34 @@ pub fn equip(fx: &mut Fixture, guid: u32, name: &str, record_word: i16) {
     }
 }
 
+#[test]
+fn a_walk_of_the_person_vector_while_a_person_is_made_traps() {
+    // When in the making the original appends the person to the vector
+    // is not read, so an Init that walks it (Set To Next mode 1) is
+    // refused rather than shown the person or not.
+    const INIT: u16 = 4098;
+    let (mut fx, file) = lot_with_init(11, INIT);
+    fx.add(
+        file,
+        INIT,
+        tree(vec![ins(
+            31,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, 0, 0, 0x81, scope::TEMPS, 0, 0],
+        )]),
+    );
+    let fault = create(&mut fx, ADULT).unwrap_err();
+    assert!(
+        matches!(fault.trap, Trap::Unsupported(ref m) if m.contains("person vector")),
+        "{fault}"
+    );
+    // A walk once the person is made sees it at the end.
+    let mut fx = lot(11);
+    let id = create(&mut fx, ADULT).unwrap();
+    assert_eq!(fx.world.people.last(), Some(&id));
+}
+
 mod word {
     /// The definition word that holds the price.
     pub const PRICE: usize = 18;
@@ -107,8 +141,11 @@ fn a_new_person_gets_the_lowest_unused_id_and_runs_its_init_and_first_update() {
     let start = fx.world.crt_rng;
     let id = create(&mut fx, ADULT).unwrap();
     assert_eq!(id, 3);
-    // Registered at the head of the list.
+    // Registered at the head of the list, and at the end of the person
+    // vector.
     assert_eq!(fx.world.order[0], 3);
+    assert_eq!(fx.world.people.last(), Some(&3));
+    assert_eq!(fx.world.people.iter().filter(|&&p| p == 3).count(), 1);
     let object = &fx.world.objects[&3];
     assert_eq!(object.guid, ADULT);
     // The price, and the scheduler's ready flag.

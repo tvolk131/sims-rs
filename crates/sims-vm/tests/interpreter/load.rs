@@ -24,6 +24,7 @@ fn lot() -> Fixture {
     let (mut fx, _) = widgets();
     fx.world.objects.clear();
     fx.world.order.clear();
+    fx.world.people.clear();
     add(&mut fx, 0xA0, 7, 0); // no global word
     add(&mut fx, 0xA1, 7, 1);
     add(&mut fx, 0xA3, 4, 1); // not type 7 or 12
@@ -389,6 +390,7 @@ fn signed() -> (Fixture, u32, u32) {
     let (mut fx, file) = widgets();
     fx.world.objects.clear();
     fx.world.order.clear();
+    fx.world.people.clear();
     let library = fx.program.libraries.get_mut(&file).unwrap();
     library.behaviors.get_mut(&4096).unwrap().revision = 3;
     library.behaviors.get_mut(&4097).unwrap().revision = 5;
