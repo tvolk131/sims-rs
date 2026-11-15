@@ -86,6 +86,10 @@ pub struct Interpreter<'a> {
     /// Where to note each callback the lot asks of an object, or None to
     /// note nothing. See [`Asked`].
     pub asked: Option<&'a RefCell<Vec<Asked>>>,
+    /// Where to note the ID of each object deleted, or None to note
+    /// nothing. Play mode reads it to tell an object reset from a later
+    /// one given the same ID ([`crate::play`]).
+    pub deleted: Option<&'a RefCell<Vec<u16>>>,
     /// The person the factory is making, while its scripts run. When in
     /// the making the original appends a person to the person vector is
     /// not read, so a walk of the vector meanwhile is refused.
@@ -109,6 +113,7 @@ impl<'a> Interpreter<'a> {
             catalog,
             stream,
             asked: None,
+            deleted: None,
             making_person: None,
         }
     }
@@ -236,6 +241,7 @@ impl<'a> Interpreter<'a> {
             me,
             stream: self.stream,
             asked: self.asked,
+            deleted: self.deleted,
             base,
             synchronous,
             making_person: self.making_person,
@@ -287,6 +293,8 @@ pub(crate) struct Machine<'a, 'w> {
     pub me: u16,
     pub stream: Stream,
     pub asked: Option<&'a RefCell<Vec<Asked>>>,
+    /// See [`Interpreter::deleted`].
+    pub deleted: Option<&'a RefCell<Vec<u16>>>,
     /// The stack depth below the frames this run owns. When a return pops
     /// the stack down to it, the run is over and the frame below is not
     /// branched.
@@ -313,6 +321,7 @@ impl<'a> Machine<'a, '_> {
             catalog: self.catalog,
             stream: self.stream,
             asked: self.asked,
+            deleted: self.deleted,
             making_person: self.making_person,
         }
     }

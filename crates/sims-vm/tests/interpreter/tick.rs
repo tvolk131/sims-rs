@@ -6,6 +6,7 @@ use crate::support::*;
 use sims_core::F32;
 use sims_sim::motives::{Curve, Rates, Tuning};
 use sims_sim::{Dialog, HouseUsage, PersonTick, Usage};
+use sims_vm::play::{Play, Recovery};
 use sims_vm::{Answers, Player, Shown, TickError, Update};
 
 /// Dialog (opcode 36) operands of `kind`, waiting for an answer, with the
@@ -471,4 +472,181 @@ fn a_person_marks_an_indoor_room_as_occupied() {
     assert!(room.occupied);
     assert!(room.dirty);
     assert_eq!(fx.world.rooms.pending, 1);
+}
+
+fn play_update(fx: &mut Fixture, play: &mut Play) -> Update {
+    let tuning = tuning();
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter
+        .lot_update_with(&mut fx.world, &tuning, &mut answers(&[]), Some(play))
+        .expect("play mode carries on past an object's error")
+}
+
+/// Play mode catches the error a thread that returns raises (0x3e9),
+/// resets the object and stops the pass with the cursor on it, as the
+/// original's scheduler does after its error handler (0x439a6f). An
+/// object that faults again on its first tick after the reset is parked.
+/// A lot whose lamp's Main returns, and whose lamp's Reset (function 3)
+/// stores 7 in data word 0.
+fn returning_lamp() -> Fixture {
+    let mut fx = lot(tree(vec![ins(0, RETURN_TRUE, RETURN_TRUE, [0; 8])]));
+    // The lamp's Main is the tree that returns, and its Reset (function
+    // 3) stores 7 in data word 0.
+    fx.add(
+        LAMP_FILE,
+        4097,
+        tree(vec![assign(
+            scope::MY_DATA,
+            0,
+            scope::LITERAL,
+            7,
+            RETURN_TRUE,
+        )]),
+    );
+    let callbacks = [4096, 4096, 0, 4097].map(|action| sims_formats::execution::ObjectFunction {
+        condition: 0,
+        action,
+    });
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .callbacks
+        .insert(128, callbacks.to_vec());
+    fx.thread(LAMP, 4096, &[0]);
+    fx
+}
+
+#[test]
+fn play_mode_resets_an_object_after_its_error_and_parks_one_that_repeats_it() {
+    let mut fx = returning_lamp();
+    let mut play = Play::default();
+    let first = play_update(&mut fx, &mut play);
+    assert!(!first.full);
+    assert_eq!(first.ticked, vec![LAMP]);
+    let [error] = first.errors.as_slice() else {
+        panic!("{:?}", first.errors);
+    };
+    assert_eq!((error.object, error.in_thread, error.tick), (LAMP, true, 1));
+    assert!(matches!(
+        error.fault.trap,
+        sims_vm::Trap::Native { code: 0x3e9, .. }
+    ));
+    // The original's handling: the Reset tree ran, and the thread
+    // restarted at Main.
+    assert_eq!(error.recovery, Recovery::Reset);
+    assert_eq!(fx.lamp().data[0], 7);
+    assert_eq!(fx.lamp().stack.len(), 1);
+    assert_eq!(fx.lamp().stack[0].tree, 4096);
+    // Flag 4 (the original's virtual function 4) is set, the clock waits
+    // and the cursor stays on the lamp.
+    assert_eq!(fx.lamp().flags() & 4, 4);
+    assert_eq!((fx.world.ticks, fx.world.globals[6]), (1, 0));
+    assert_eq!(fx.world.scheduler_cursor, LAMP as i16);
+
+    // The next pass starts at the lamp, clears flag 4 and ticks it; it
+    // returns again, so it is parked.
+    let second = play_update(&mut fx, &mut play);
+    assert_eq!(second.ticked, vec![LAMP]);
+    assert!(matches!(
+        second.errors.as_slice(),
+        [e] if e.recovery == Recovery::Parked(None)
+    ));
+    assert_eq!(fx.lamp().flags() & 1, 0);
+
+    // A parked object is skipped, and the lot goes on.
+    let third = play_update(&mut fx, &mut play);
+    assert!(third.full && third.errors.is_empty());
+    assert_eq!(third.ticked, vec![SIM]);
+    assert_eq!(fx.world.ticks, 2);
+}
+
+/// A fault in the rest of a person's tick, outside its thread, is caught
+/// too (an approximation: the original has no such error).
+#[test]
+fn play_mode_catches_a_fault_in_the_rest_of_a_persons_tick() {
+    let mut fx = lot(sleeper());
+    fx.thread(LAMP, 4096, &[3]);
+    fx.sim_mut().person.as_mut().unwrap().data[1] = 1;
+    let mut play = Play::default();
+    let update = play_update(&mut fx, &mut play);
+    assert!(!update.full);
+    let [error] = update.errors.as_slice() else {
+        panic!("{:?}", update.errors);
+    };
+    assert_eq!((error.object, error.in_thread), (SIM, false));
+    assert!(error.fault.to_string().contains("0x4a69aa"));
+}
+
+/// An object deleted after play mode reset it is no longer the fresh one,
+/// so a later object given its ID is not parked for its first error.
+#[test]
+fn play_mode_forgets_a_reset_object_once_it_is_deleted() {
+    let mut fx = returning_lamp();
+    let mut play = Play::default();
+    let first = play_update(&mut fx, &mut play);
+    assert_eq!(first.errors[0].recovery, Recovery::Reset);
+    // The lamp now waits on a countdown, so it is not ticked again, and
+    // is queued for removal, which the removal ported so far can take
+    // once it holds nothing and is off the lot.
+    let lamp = fx.lamp_mut();
+    lamp.set_countdown(5);
+    lamp.data[2] = 0;
+    lamp.slots.truncate(1);
+    lamp.position = [-16, -16, 1];
+    fx.world.removals = vec![LAMP];
+    let second = play_update(&mut fx, &mut play);
+    assert!(second.full && second.errors.is_empty());
+    assert_eq!(second.counted, vec![LAMP]);
+    assert_eq!(second.removed, vec![LAMP]);
+    assert_eq!(play, Play::default());
+    // A new object with the lamp's ID that returns is reset, not parked.
+    let mut fx2 = returning_lamp();
+    fx2.world.ticks = fx.world.ticks;
+    let third = play_update(&mut fx2, &mut play);
+    assert_eq!(third.errors[0].recovery, Recovery::Reset);
+}
+
+/// A fault in the rest of a person's tick after one caught in its thread
+/// is noted with it, and the person is dealt with once.
+#[test]
+fn play_mode_keeps_a_thread_fault_that_a_later_one_follows() {
+    let mut fx = lot(sleeper());
+    fx.thread(LAMP, 4096, &[3]);
+    fx.add(
+        SIM_FILE,
+        4097,
+        tree(vec![ins(0, RETURN_TRUE, RETURN_TRUE, [0; 8])]),
+    );
+    fx.thread(SIM, 4097, &[0]);
+    fx.sim_mut().person.as_mut().unwrap().data[1] = 1;
+    let mut play = Play::default();
+    let update = play_update(&mut fx, &mut play);
+    let [error] = update.errors.as_slice() else {
+        panic!("{:?}", update.errors);
+    };
+    assert_eq!((error.object, error.in_thread), (SIM, true));
+    assert!(matches!(
+        error.fault.trap,
+        sims_vm::Trap::Native { code: 0x3e9, .. }
+    ));
+    let then = error.then.as_ref().expect("the later fault is kept");
+    assert!(then.to_string().contains("0x4a69aa"), "{then}");
+}
+
+/// Without an error, play mode's update is strict mode's, and so is the
+/// lot it leaves.
+#[test]
+fn play_mode_without_an_error_is_strict_mode() {
+    let mut strict = lot(sleeper());
+    strict.thread(LAMP, 4096, &[3]);
+    let mut played = lot(sleeper());
+    played.thread(LAMP, 4096, &[3]);
+    let mut play = Play::default();
+    for _ in 0..3 {
+        let a = update(&mut strict, &mut answers(&[])).unwrap();
+        let b = play_update(&mut played, &mut play);
+        assert_eq!(a, b);
+    }
+    assert_eq!(strict.world.hash_hex(), played.world.hash_hex());
 }

@@ -50,6 +50,7 @@ mod objects;
 mod people;
 mod person_factory;
 mod placement;
+pub mod play;
 mod primitives;
 mod program;
 mod removal;
