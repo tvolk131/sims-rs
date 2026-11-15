@@ -472,6 +472,7 @@ mod tests {
             animations: Default::default(),
             people: Default::default(),
             icon_frames: None,
+            expansions: 0,
         }
     }
 

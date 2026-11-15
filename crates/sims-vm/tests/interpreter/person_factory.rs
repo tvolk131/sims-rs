@@ -15,7 +15,7 @@ const MAIN: u16 = 4097;
 
 /// A lot with the lamp and the Sim (IDs 1 and 2), and two person types
 /// [`equip`]ped with records whose words are all `record_word`: an adult
-/// and a dog. The adult's Main sets its first argument to 100 and sleeps
+/// and a dog. Each one's Main sets its first argument to 100 and sleeps
 /// on it.
 fn lot(record_word: i16) -> Fixture {
     lot_with_init(record_word, 0).0
@@ -36,7 +36,14 @@ fn lot_with_init(record_word: i16, init: u16) -> (Fixture, usize) {
         ]),
     );
     let dog = fx.add_type(DOG, 2, 0, MAIN);
-    fx.add(dog, MAIN, tree(vec![ins(0, 0, 0, [0; 8])]));
+    fx.add(
+        dog,
+        MAIN,
+        tree(vec![
+            assign(scope::PARAMETERS, 0, scope::LITERAL, 100, 1),
+            ins(0, 0, 0, [0; 8]),
+        ]),
+    );
     equip(&mut fx, ADULT, "adult", record_word);
     equip(&mut fx, DOG, "Dog", record_word);
     fx.world.crt_rng = CrtRng::from_state(77);
@@ -185,13 +192,30 @@ fn a_new_person_gets_the_lowest_unused_id_and_runs_its_init_and_first_update() {
 }
 
 #[test]
+fn a_pet_is_made_when_unleashed_or_makin_magic_is_installed() {
+    // 0x440d8b: with bit 0x20 (Unleashed) or 0x80 (Makin' Magic) of the
+    // application's word +0x66 set, a person whose skeleton is "dog" (any
+    // case) is made like any other.
+    for expansions in [0x20, 0x80, 0xa0, 0xffff] {
+        let mut fx = lot(11);
+        fx.program.expansions = expansions;
+        assert_eq!(create(&mut fx, DOG), Ok(3), "mask {expansions:#x}");
+        assert_eq!(fx.world.objects[&3].guid, DOG);
+    }
+}
+
+#[test]
 fn what_the_person_factory_does_not_port_fails_loudly() {
-    // A pet: whether the factory makes it depends on the
-    // installed-expansions mask.
-    let mut fx = lot(11);
-    let fault = create(&mut fx, DOG).unwrap_err();
-    assert!(fault.to_string().contains("pet"), "{fault}");
-    assert_eq!(fx.world.objects.len(), 2);
+    // A pet the installed-expansions mask does not allow: the factory
+    // makes no person (0x440dd5), and what its caller does then is not
+    // ported. Bits other than 0x20 and 0x80 do not allow one.
+    for expansions in [0, 0x5f] {
+        let mut fx = lot(11);
+        fx.program.expansions = expansions;
+        let fault = create(&mut fx, DOG).unwrap_err();
+        assert!(fault.to_string().contains("0x440dd5"), "{fault}");
+        assert_eq!(fx.world.objects.len(), 2);
+    }
     // No skeleton.
     let mut fx = lot(11);
     fx.program.people.skeletons.remove(&ADULT);

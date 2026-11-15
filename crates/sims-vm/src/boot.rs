@@ -419,6 +419,7 @@ impl Lot {
         // step walks them all, so the whole catalog is linked.
         let mut program = Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid))?;
         program.zoning = neighborhood.zoning(context.expansions)?;
+        program.expansions = context.expansions;
         program.animations = Animations::load(&install, &index)?;
         let person_types = || {
             catalog
@@ -1119,6 +1120,7 @@ mod tests {
                 animations: Default::default(),
                 people: Default::default(),
                 icon_frames: None,
+                expansions: 0,
             },
             catalog: Catalog {
                 global: 0,

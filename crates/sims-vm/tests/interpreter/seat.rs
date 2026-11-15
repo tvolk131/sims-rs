@@ -453,3 +453,151 @@ fn a_feedback_tree_that_cannot_be_pushed_fails_loudly() {
     assert_eq!(routing.tree, TREE);
     assert_eq!(routing.primitive_state, 4);
 }
+
+#[test]
+fn a_pet_looks_for_no_seat() {
+    // 0x4823d0: a person of kind above 1 searches with seats off
+    // (0x483414's argument; the sitting weight counts as 0 at 0x4835f8).
+    // Before that only a person of kind 0 or 1 searched. A slot with only
+    // a standing weight is searched as for anyone else.
+    let standing = |kind: i16| {
+        let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+        set_slots(
+            &mut fx,
+            vec![Slot {
+                standing: 5,
+                sitting: 0,
+                ..seats_slot()
+            }],
+        );
+        let person = fx
+            .world
+            .objects
+            .get_mut(&me)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        person.data[KIND] = kind;
+        // The search plans a route and the person sets off, which a
+        // synchronous run cannot wait for.
+        let result = go_to(&mut fx, me);
+        assert_eq!(code(result), Some(0x44f), "kind {kind}");
+        format!("{:?}", fx.world.routing.routes[&me])
+    };
+    assert_eq!(standing(2), standing(0));
+    // With a sitting weight, the route then drops the slot's seats for
+    // the pet (0x46de84), which is not ported.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    let person = fx
+        .world
+        .objects
+        .get_mut(&me)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person.data[KIND] = 2;
+    let result = go_to(&mut fx, me);
+    assert!(matches!(trap(result), sims_vm::Trap::Unsupported(ref m) if m.contains("0x46de84")),);
+    assert!(!sat(&fx));
+}
+
+/// The seat's Stand tree (function 27).
+const STAND_TREE: u16 = 0x1102;
+const STAND: usize = 27;
+/// Scope 18: my person data.
+const MY_PERSON_DATA: u8 = 18;
+
+/// Sits the person in the seat (posture 1, person word 0), held in its
+/// container slot, with `returns` the seat's Stand tree's branch, or no
+/// Stand function. The Stand tree writes its first argument into the
+/// seat's data word 61, and stands the person (posture 0).
+fn seated(fx: &mut Fixture, me: u16, stand: Option<u8>) {
+    let person = fx.world.objects.get_mut(&me).unwrap();
+    (person.data[14], person.data[26]) = (1, SEAT as i16);
+    person.person.as_mut().unwrap().data[0] = 1;
+    fx.world.objects.get_mut(&SEAT).unwrap().slots[1].object = me as i16;
+    let Some(returns) = stand else {
+        return;
+    };
+    let file = fx.catalog.object(SEAT_GUID).unwrap().resource;
+    let table = fx
+        .program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .callbacks
+        .get_mut(&128)
+        .unwrap();
+    table.resize(
+        STAND + 1,
+        ObjectFunction {
+            condition: 0,
+            action: 0,
+        },
+    );
+    table[STAND].action = STAND_TREE;
+    fx.add(
+        file,
+        STAND_TREE,
+        tree(vec![
+            assign(scope::STACK_DATA, 61, scope::PARAMETERS, 0, 1),
+            assign(MY_PERSON_DATA, 0, scope::LITERAL, 0, returns),
+        ]),
+    );
+}
+
+/// The person's posture, person word 0.
+fn posture(fx: &Fixture, me: u16) -> i16 {
+    fx.world.objects[&me].person.as_ref().unwrap().data[0]
+}
+
+#[test]
+fn a_person_already_in_the_seat_beside_a_place_is_there() {
+    // 0x45b1d7, 0x48177b: the person sits in the seat a candidate names,
+    // so the route succeeds without the Sit tree running again.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    seated(&mut fx, me, None);
+    assert_eq!(go_to(&mut fx, me), Ok(true));
+    assert!(!sat(&fx));
+    assert_eq!(posture(&fx, me), 1);
+}
+
+#[test]
+fn a_seated_person_stands_up_through_the_seats_stand_tree_first() {
+    // 0x45b1ef: the seat faces away, so no candidate names it; the
+    // person runs its Stand tree (0x45b6d4) with the seat as stack
+    // object, and when it returns true with the person standing
+    // (0x45b439) the candidates are found again. There are none, so the
+    // route gives up with result 10.
+    let (mut fx, me) = lot([56, 40], 0, 1 << 2);
+    seated(&mut fx, me, Some(RETURN_TRUE));
+    fx.world.objects.get_mut(&SEAT).unwrap().data[61] = -99;
+    assert!(gives_up(go_to(&mut fx, me)));
+    assert_ne!(fx.world.objects[&SEAT].data[61], -99);
+    assert_eq!(posture(&fx, me), 0);
+    assert_eq!(route_result(&fx, me), 10);
+    // A Stand tree that returns false gives up with result 6.
+    let (mut fx, me) = lot([56, 40], 0, 1 << 2);
+    seated(&mut fx, me, Some(RETURN_FALSE));
+    assert!(gives_up(go_to(&mut fx, me)));
+    assert_eq!(route_result(&fx, me), 6);
+    // A seat with no Stand function fails the route at once.
+    let (mut fx, me) = lot([56, 40], 0, 1 << 2);
+    seated(&mut fx, me, None);
+    assert_eq!(go_to(&mut fx, me), Ok(false));
+    assert_eq!(posture(&fx, me), 1);
+}
+
+#[test]
+fn with_no_door_to_go_through_the_route_gives_up_with_result_2() {
+    // The lamp is in room 2, so the route goes through a door (step 2);
+    // the lot has none to choose (0x45c7c2 is false), so it gives up
+    // with result 2 (0x45b036).
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    fx.lamp_mut().data[29] = 2;
+    assert!(gives_up(go_to(&mut fx, me)));
+    assert!(!sat(&fx));
+    assert_eq!(route_result(&fx, me), 2);
+}

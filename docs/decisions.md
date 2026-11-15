@@ -4,6 +4,163 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: A seated route, Drop, pets, runs and the route-failure feedback; strict mode to tick 9906
+
+**Unverified.** No capture covers any of it: the Goth captures end at
+update 1000. Strict mode now runs through tick 9906 (12:00:56, hash
+643bf9dd…) and stops at tick 9907, where object 5 (tree 0x1005 node 5)
+runs Set To Next mode 11. The snack order stops on the same at step
+9907. Snapshot format 27 appends the neighborhood's data words
+(`World::neighborhood_data`); every pinned state up to tick 3912 is the
+same state, which the format-26 hashes kept beside the new ones show.
+The Newbie house, which stopped at tick 1803 on the same Create flag
+0x4, now runs to tick 4052 (its tick-1802 state unchanged under format
+26); the frame drawn after tick 4053 finds person 140's skin waiting
+for its update (0x590d26).
+
+**Ported on the way, in the order the run reached them:**
+
+- **A seated person's route** (tick 3913, 0x4832d4, 0x45b1d7). A person
+  in a container with a Sit function starts its route from the best
+  place beside the seat (the seat's entry bits, definition word 66). If
+  it already sits in a seat a candidate names (0x48177b) it is there;
+  otherwise its seat's Stand tree runs first (step 5, 0x45b6d4) and, if
+  that returns true with the person standing, the candidates are found
+  again (0x45b439); otherwise the route gives up with result 6.
+- **Neighborhood data** (scope 34, 0x4531bf): words 1 to 15 of the
+  neighborhood's sixteen, read only, from the NGBH chunk. Others are
+  native error 0x3c.
+- **Create New Object Instance modes 2 and 5, and flag 0x10.** Mode 2
+  (0x44e22f) puts the new object in the running object's first
+  container slot, mode 5 (0x44e3e9) where the running object stands.
+  Flag 0x10 is read only with flag 0x2 (0x44e88c), so alone it does
+  nothing.
+- **Drop** (opcode 5, 0x454430): what my first container slot holds
+  goes one tile in front of me, after its place test.
+- **A person's reset ends its object uses first** (0x45e814): frames
+  are popped down to each use's count, and the object used resets.
+- **The route-failure feedback tree** (step 17, 0x45af2a): this branch
+  had ported it too; #181's port (the entry below), checked against the
+  Newbie recording, is kept in place of it.
+- **Pets** (tick 6756). The person factory's pet guard (0x440d63) makes
+  a "dog" or "kat" only with bit 0x20 (Unleashed) or 0x80 (Makin'
+  Magic) of the application's word +0x66; `Program::expansions` now
+  holds the installed mask the lot's zoning already used. The Complete
+  Collection has both. From tick 6760 the pet searches for places with
+  seats off (0x4823d0: person word 65 above 1, so the sitting weight is
+  0 at 0x4835f8); with data word 17 (its pace) set the planner's free
+  cost is 0 (0x482505) and a level-1 outdoor room's fixed rectangles
+  leave out terrain (0x4827f6); and it turns by a sixteenth of a step
+  over the rate, not a quarter (0x58df67). Dropping the seats of a slot
+  with a sitting weight for a pet (0x46de84) is still not ported.
+- **Running** (tick 6784, 8215). With pace 1 a walk starts in animator
+  state 11 (0x58ed52), state 6 with the stop-from-run clip 0x16, which
+  ends in state 10 (0x58e377), and the look-ahead uses the run clip's
+  stride (+0x1fc) when the pace is not 0 (0x58e6cb).
+- **Manage Inventory operation 0** (tick 7702, 0x4556f4): adds 1, or
+  temp `(flags >> 2) & 3` with flag 0x2, to the first token of the kind
+  and GUID (capped at 0x7fff), or adds a token at the end unless the
+  inventory holds 0x7fff.
+- **No door** (tick 9337, 0x45b036): a route that must go through a
+  door and has none gives up with result 2.
+
+**Set To Next mode 11** (stop at tick 9907, 0x44f08d) walks the
+vector of lot numbers at neighborhood +0x11c: cursor 0 gives the
+first, otherwise the one after the cursor; none, or the last, is the
+false branch. The lot load (0x428041, at 0x428350) builds it from lots
+1 to the length of the 8-byte (x, y) table at neighborhood +0x110 less
+one, leaving out the current lot, sorted (0x42ffce) by squared distance
+(0x427fb9). What fills the +0x110 table was not found:
+`LotLocations.iff` (STR# rows of "lot, x, y") is read only by a
+single-lot lookup for the interface (0x4e1f3a) and written by the
+editors (0x54d8b7, 0x555b46), and the zoning vector (+0x174) is a
+different one. Until that table is found, mode 11 fails loudly.
+
+## 2026-11-15: Neighbors' people made off the lot and removed; strict mode to tick 3912
+
+**Unverified.** No capture covers any of it: the Goth captures end at
+update 1000. Strict mode now runs through tick 3912 (08:41:08, hash
+41652f2f…) and stops at tick 3913, where object 16 (tree 0x1010 node
+6) asks for a route from inside a container (0x4832d4). The snack order
+runs through step 4224 and stops on the same at step 4225. The snapshot
+format does not change, and every summary line of `sims boot …
+--ticks 3602` and every pinned hash up to tick 3602 is unchanged.
+
+**Create New Object Instance's flag 0x4** (stop at tick 3603). The
+flag was read as acting only at the end of the tail. It also picks the
+type (0x44e0e6): with it, the definition is not the GUID operand's
+(0x43ac10) but the one linked to the neighbor record the stack object
+names (0x425afe: slot `id − 1` of the record vector, 0x4256f4, then
+record +8, the definition its GUID resolves to). A stack object that
+names no record leaves a null definition, and the false branch is
+taken before anything is made (0x44e117). At the end of the tail
+(0x44e7dd to 0x44e877) a new person that is a visitor (person word 32,
++0x5cc) runs the tree its file names "init visitor" (string 0x6c4120,
+looked up by 0x4021f2) at once on its own thread: 0x474afb calls the
+synchronous run 0x4749b5 with the person as its stack object and a null
+arguments pointer, so its arguments are its own temps, as Run Tree By
+Name's mode 1 runs. What it returns is not read.
+
+**Mode 6 making a person.** Mode 6 clears the byte that asks for the
+off-lot and room tests and the place (0x44e4b5, `[ebp-0x15]`), so a
+person goes the tail's person steps and stays where the factory left
+it: it takes its record's interests and personality (0x425930), flag
+0x20 turns it, and the person-word test (84, 68, 74 → 0x45810c, not
+ported) runs, as in mode 8.
+
+At tick 3603 object 354 (GUID 0x20E32C3C, tree 0x1022) counts the
+neighbor records, picks two at random, makes each one's person off
+the lot (objects 334 and 336; node 29 and 31), writes their person
+words 80 and 81, and removes both (nodes 33 and 34). The Goth lot is
+residential, so neither is a visitor and no "init visitor" tree runs;
+that step is checked only by the synthetic tests.
+
+**Removing a person for another object.** A person's take-off
+(0x433125) refreshes its animator (0x58da12) only if animator byte
++0x109 is set. The animator's tick writes that byte from the house
+view's on-screen test (0x58f69f to 0x58f6e4: 1 after 0x5a0ef5 when the
+test passes, 0 after 0x5a0ffd when it fails; the person's tick passes
+1, 0x45cd39), and so does the view's draw (0x590b8b). It is not kept.
+Until now Remove Object Instance took a person only when it removed
+itself and yielded. Now any other removal of a person works the refresh
+out on a copy of the lot as the take-off leaves it, as a person that
+takes itself off does (`Interpreter::refresh_before_removal`). The
+refresh must write nothing but the person's animator and base layer and
+play no sound, and the person's hand must be empty. The lot goes on
+without the refresh. Here it would place the never-placed animator at
+the off-lot position and clear its skin's update mark.
+
+The branches then differ only in that animator, which the deletion at
+the end of the update destroys. Nothing may read it before then:
+
+- A person with an ID above the remover's has its tick in the same
+  pass (the scheduler walks IDs in order). The refresh is held for that
+  tick (`Interpreter::taken_off`, kept for the pass) and settled as for
+  a person that takes itself off. Until its animator's tick, its thread
+  may run only primitives that read no animator. The refresh then the
+  tick must reach what the tick alone does.
+- A queued person whose tick starts with no refresh held, or whose
+  thread runs a primitive that reads an animator, fails.
+- A head that looks at it fails, as before.
+- A person left queued after a partial pass fails, as before.
+
+That the deletion's last reset reads none of it is **unverified**, as
+for every removal of a person. In strict mode the two people are 334
+and 336, below 354, so neither ticks again. In the snack order they are
+374 and 375, so both tick while queued, and the branches agree.
+
+**Tests.** `create_person` covers:
+
+- the record lookup and its misses;
+- mode 6 making a person;
+- the "init visitor" run, and the cases where it does not run;
+- the loud failures;
+- the removal by another, with each guard;
+- the pass in which the removed person ticks.
+
+The old tests that pinned flag 0x4 and a mode-6 person as unported now
+pin what still fails.
+
 ## 2026-11-15: A route that gives up near its slot runs the failure feedback tree
 
 Go To Routing Slot and Go To Relative Position share the route steps of
@@ -182,6 +339,7 @@ is the band's, even where a wrapped note covers an icon. A cancel that
 never reaches the simulation (the lot refuses it, or has stopped) leaves
 the icon to take another press. In the original a cancel cannot fail,
 and it has no such band.
+
 ## 2026-11-15: A sound's volume and pan come from where its objects are on the screen
 
 Kinds 1 (for a `kArgsIdVolPan` track) and 30 now set the track's

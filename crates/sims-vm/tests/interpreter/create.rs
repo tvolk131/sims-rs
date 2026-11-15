@@ -315,9 +315,71 @@ fn mode_4_into_a_person_uses_the_slot_it_carries_in() {
 }
 
 #[test]
+fn mode_2_puts_the_new_object_in_the_running_objects_first_container_slot() {
+    // 0x44e22f: the running object (the lamp) is the container, with no
+    // stack object needed; the room filter stays at -5 (0x44e13c), so a
+    // container whose room word names another room still takes it.
+    for room in [1, 0] {
+        let (mut fx, _) = container();
+        fx.lamp_mut().data[29] = room;
+        let before = ids(&fx);
+        assert_eq!(create(&mut fx, 2, 0, 0), Ok(true), "room {room}");
+        let id = new_object(&fx, &before);
+        let widget = &fx.world.objects[&id];
+        assert_eq!(widget.position, [40, 40, 1]);
+        assert_eq!((widget.data[2], widget.data[3]), (LAMP as i16, 0));
+        let held: Vec<i16> = fx.lamp().slots[1..].iter().map(|s| s.object).collect();
+        assert_eq!(held, [id as i16, 0]);
+    }
+    // Off the lot, nothing is made.
+    let (mut fx, _) = container();
+    fx.lamp_mut().position = [-16, -16, 1];
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 2, 0, 0), Ok(false));
+    assert_eq!(ids(&fx), before);
+}
+
+#[test]
+fn mode_5_puts_the_new_object_where_the_running_object_stands() {
+    // 0x44e3e9: the running object's position and level, then as mode 8:
+    // on the floor, in no container.
+    let (mut fx, _) = container();
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 5, 0, 0), Ok(true));
+    let id = new_object(&fx, &before);
+    let widget = &fx.world.objects[&id];
+    assert_eq!(widget.position, [40, 40, 1]);
+    assert_eq!(widget.data[2], 0);
+    assert!(fx.lamp().slots[1..].iter().all(|s| s.object == 0));
+    // Off the lot, nothing is made.
+    let (mut fx, _) = container();
+    fx.lamp_mut().position = [-16, -16, 1];
+    assert_eq!(create(&mut fx, 5, 0, 0), Ok(false));
+    assert_eq!(ids(&fx), before);
+}
+
+#[test]
+fn flag_0x10_without_0x2_does_nothing() {
+    // 0x44e88c reads flag 0x10 only with 0x2.
+    for mode in [2, 4, 5, 6] {
+        let (mut fx, _) = container();
+        let before = ids(&fx);
+        assert_eq!(
+            create(&mut fx, mode, 0x10, LAMP as i16),
+            Ok(true),
+            "mode {mode}"
+        );
+        new_object(&fx, &before);
+        let (mut plain, _) = container();
+        assert_eq!(create(&mut plain, mode, 0, LAMP as i16), Ok(true));
+        assert_eq!(fx.world.hash(), plain.world.hash(), "mode {mode}");
+    }
+}
+
+#[test]
 fn what_mode_4_does_not_port_fails_loudly() {
-    // Flags other than 0x1.
-    for flags in [0x2, 0x4, 0x8, 0x10, 0x20, 0x40, 0x21] {
+    // Flags other than 0x1, 0x4 and 0x10.
+    for flags in [0x2, 0x8, 0x20, 0x40, 0x21] {
         let (mut fx, _) = container();
         let result = create(&mut fx, 4, flags, LAMP as i16);
         assert!(
@@ -338,7 +400,7 @@ fn what_mode_4_does_not_port_fails_loudly() {
         assert_eq!(ids(&fx), before, "word {word}");
     }
     // The modes not ported.
-    for mode in [0, 1, 2, 3, 5, 7, 9, 15] {
+    for mode in [0, 1, 3, 7, 9, 15] {
         let (mut fx, _) = container();
         let result = create(&mut fx, mode, 0, LAMP as i16);
         assert!(
@@ -371,20 +433,25 @@ fn what_mode_6_does_not_port_fails_loudly() {
     fx.lamp_mut().data[1] = 2;
     let result = create(&mut fx, 6, 0x20, LAMP as i16);
     assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x433f75")));
-    // A person (0x44e60e): nothing is made.
-    let (mut fx, file) = container();
-    fx.words(file)[9] = 2;
-    let before = ids(&fx);
-    let result = create(&mut fx, 6, 0, LAMP as i16);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x44e60e")));
-    assert_eq!(ids(&fx), before);
-    // Other flags.
-    for flags in [0x2, 0x4, 0x8, 0x10, 0x40] {
+    // Other flags. (A person, and flag 0x4: `create_person`.)
+    for flags in [0x2, 0x8, 0x40] {
         let (mut fx, _) = container();
         let result = create(&mut fx, 6, flags, LAMP as i16);
         assert!(
             matches!(trap(result), Trap::Unsupported(ref m) if m.contains("mode 6")),
             "flags {flags:#x}"
         );
+    }
+}
+
+#[test]
+fn flag_0x4_with_a_stack_object_that_names_no_record_makes_nothing() {
+    // Flag 0x4 takes the type from the neighbor record the stack object
+    // names (0x44e0e6), not from the GUID: the lamp's ID names none here.
+    for mode in [4, 6] {
+        let (mut fx, _) = container();
+        let before = ids(&fx);
+        assert_eq!(create(&mut fx, mode, 0x4, LAMP as i16), Ok(false));
+        assert_eq!(ids(&fx), before);
     }
 }
