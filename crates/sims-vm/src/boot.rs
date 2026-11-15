@@ -270,49 +270,17 @@ impl std::fmt::Display for OrderError {
 
 impl std::error::Error for OrderError {}
 
-/// The idle loop's own speed (`0x46d9d6`), checked before each update.
-/// On a residential lot (`0x40745f`: zoning 1, `0x42b9e3`) the original
-/// sets a speed of 1000 for a while (`0x46d790`, keeping the speed to go
-/// back to in global 18) when none of the registry's people passes
-/// `0x442f9b`, and goes back (`0x46d7db`) when one does. A person passes
-/// when their object word `+0x8e` is 0, their person data word 65
-/// (`+0x60e`) is at most 1, the float at `+0x7b8` is not below 0
-/// (`0x45edc5`), and person data word 32 (`+0x5cc`) is 0, that is, they
-/// live on the lot.
-///
-/// The override is not ported. Words 32 and 65 are kept, `+0x8e` and
-/// `+0x7b8` are not, so only part of it is seen: when no person passes
-/// on the words kept, the original certainly sets the speed, and this
-/// fails. When someone does, the original may still set it, if `+0x8e`
-/// or `+0x7b8` turns them all away; that is **not** detected. The
-/// capture holds `+0x8e` 0 for every person (`frame.rs`).
-fn idle_speed(world: &World, program: &Program) -> Result<(), String> {
+/// Whether the lot is residential, as the idle loop asks (`0x40745f`):
+/// its zoning (`0x42b9e3`, by the lot number in global 10; lot 0 is 1)
+/// is 1.
+fn residential(world: &World, program: &Program) -> bool {
     let lot = world.globals.get(10).copied().unwrap_or(0);
     let zoning = if lot == 0 {
         1
     } else {
         program.zoning.get(&lot).copied().unwrap_or(0)
     };
-    if zoning != 1 {
-        return Ok(());
-    }
-    let passes = world.people.iter().any(|id| {
-        world
-            .objects
-            .get(id)
-            .and_then(|o| o.person.as_ref())
-            .is_some_and(|p| p.data.get(32) == Some(&0) && p.data.get(65).is_some_and(|&k| k <= 1))
-    });
-    if passes {
-        return Ok(());
-    }
-    Err(format!(
-        "none of the {} people on this residential lot lives there (person \
-         word 32 is 0) with person word 65 at most 1, so the original's idle \
-         loop runs it at a speed of 1000 (0x46d9d6, 0x442f9b, 0x46d790), \
-         which is not ported",
-        world.people.len()
-    ))
+    zoning == 1
 }
 
 impl Lot {
@@ -607,11 +575,10 @@ impl Lot {
             first_frame = Some(error.to_string());
         }
         let tick = self.ticks + 1;
-        idle_speed(&self.world, &self.program).map_err(|error| StepError::Tick {
-            tick,
-            start: self.start.wrapping_add(self.ticks),
-            error,
-        })?;
+        // The idle loop sets a speed of its own before it runs the update
+        // (0x46d9d6, `World::idle_speed`).
+        let residential = residential(&self.world, &self.program);
+        self.world.idle_speed(residential);
         let update = interpreter
             .lot_update_with(
                 &mut self.world,
@@ -897,21 +864,28 @@ mod tests {
     }
 
     #[test]
-    fn a_residential_lot_nobody_lives_on_fails_on_the_idle_loops_speed() {
-        let lot = lot(World::empty(), true, Frames::default());
-        let error = super::idle_speed(&lot.world, &lot.program).unwrap_err();
-        assert!(error.contains("0x442f9b"), "{error}");
+    fn the_idle_loop_runs_a_residential_lot_nobody_lives_on_at_1000() {
+        let mut world = World::empty();
+        world.globals[16] = 760;
+        world.globals[18] = -1;
+        let mut lot = lot(world, true, Frames::default());
+        lot.tuning = Some(tuning());
+        assert!(super::residential(&lot.world, &lot.program));
+        // The update itself fails on an empty lot, after the idle loop
+        // set its speed.
+        assert!(matches!(lot.step(), Err(StepError::Tick { tick: 1, .. })));
+        assert_eq!(lot.world.speed(), 1000);
+        assert_eq!(lot.world.globals[18], 760);
         // A lot with no zoning is not residential: the idle loop leaves
         // its speed alone.
-        let mut world = World::empty();
-        world.globals[10] = 7;
-        assert_eq!(super::idle_speed(&world, &lot.program), Ok(()));
+        lot.world.globals[10] = 7;
+        assert!(!super::residential(&lot.world, &lot.program));
     }
 
     #[test]
     fn a_failed_tick_halts_the_lot() {
-        // Nobody lives on an empty residential lot, which the idle loop's
-        // speed (not ported) stops at before the tick.
+        // An empty lot has no selected Sim at the end of its update, which
+        // stops the tick partway.
         let mut lot = lot(World::empty(), true, Frames::default());
         lot.tuning = Some(tuning());
         let Err(StepError::Tick { tick: 1, .. }) = lot.step() else {

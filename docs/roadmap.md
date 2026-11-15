@@ -2134,12 +2134,11 @@ through their public interfaces only; the simulation never depends on it.
   and space set global 17 (`0x46d813`, `0x46d83a`), and the lot goes on
   ticking with its clock standing, as the original's does: every pass is
   a partial one. The Goths' house runs 200 such ticks in strict mode.
-  Not ported: the speed of 1000 the idle loop (`0x46d9d6`) sets on a
-  residential lot while none of its people passes `0x442f9b`, which
-  presumably means everyone is away or asleep. The full Goth day will
-  need it. A step fails loudly where the person words we keep already
-  show it (nobody lives on the lot with person word 65 at most 1). It
-  does not see a Sim the unkept `+0x8e` or `+0x7b8` turns away.
+  The idle loop's own speed is ported too (`0x46d9d6`,
+  `World::idle_speed`). On a residential lot where nobody holds the
+  speed (`0x442f9b`, presumably everyone away or asleep), it runs at
+  1000 and keeps the speed to go back to in global 18. It goes back once
+  someone holds it. The window follows: 1 ms a tick at 1000.
 - **Done in play mode: selecting a Sim.** A press on a portrait selects
   that Sim (0x445449, between ticks): the Sim selected before is
   deselected, the indicators move, and the panel and the pie menus

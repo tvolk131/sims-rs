@@ -17,6 +17,10 @@
 //! but each pass is a partial one ([`World::paused`]): the clock does not
 //! move and only objects that run while paused are ticked.
 //!
+//! On a residential lot the idle loop also runs the game at a speed of
+//! its own while nobody holds it to the player's ([`World::idle_speed`]):
+//! 1000, a period of 1 millisecond, while everyone is asleep or away.
+//!
 //! What the setter does besides is not the simulation's: it restarts the
 //! idle loop's two clocks (`+0xb8`, `+0xbc` and `0x4732d4`), keeps two
 //! numbers made from the period (`+0xd8`, `+0xdc`) and sends message
@@ -34,6 +38,21 @@ pub const ULTRA: i16 = 994;
 const SPEED: usize = 16;
 const PAUSED: usize = 17;
 const RETURN_SPEED: usize = 18;
+
+/// The speed the idle loop runs the game at while nobody holds it
+/// (`0x46d9d6` pushes 1000).
+pub const IDLE: i16 = 1000;
+
+/// Object data word 34 (`+0x8e`): nonzero, the person is hidden.
+const HIDDEN: usize = 34;
+/// Person data word 32 (`+0x5cc`): nonzero, the person does not live on
+/// the lot.
+const VISITOR: usize = 32;
+/// Person data word 65 (`+0x60e`).
+const WORD_65: usize = 65;
+/// Motive 11 (`+0x7b8`; motives at `+0x78c`): below 0, the person does
+/// not hold the speed (`0x45edc5`). Which motive it is was not looked up.
+const MOTIVE_11: usize = 11;
 
 /// Milliseconds between two lot updates at `speed` (0 to 1000), as the
 /// setter (`0x46d697`) makes them, in the x87's precision: the factor
@@ -66,6 +85,61 @@ impl World {
             *slot = speed;
         }
         period_ms(speed)
+    }
+
+    /// Whether someone on the lot holds the game to the player's speed
+    /// (`0x442f9b`): a person in the registry's list, in order, whose
+    /// object data word 34 is 0 (not hidden), whose person data word 65
+    /// is at most 1, whose motive 11 is not below 0 (`0x45edc5`: a NaN
+    /// counts as below, as the x87 compare branches) and whose person data
+    /// word 32 is 0 (they live on the lot).
+    pub fn speed_held(&self) -> bool {
+        self.people.iter().any(|id| {
+            let Some(object) = self.objects.get(id) else {
+                return false;
+            };
+            let Some(person) = object.person.as_ref() else {
+                return false;
+            };
+            object.data.get(HIDDEN) == Some(&0)
+                && person.data.get(WORD_65).is_some_and(|&w| w <= 1)
+                && person.motives[MOTIVE_11] >= 0.0
+                && person.data.get(VISITOR) == Some(&0)
+        })
+    }
+
+    /// The speed the idle loop sets of its own before it runs an update
+    /// (the head of `0x46d9d6`), on a `residential` lot (`0x40745f`: the
+    /// lot's zoning is 1, `0x42b9e3`); on any other it does nothing.
+    ///
+    /// - While nobody holds the speed ([`World::speed_held`]) and global
+    ///   18 is negative, the game runs at [`IDLE`] (`0x46d790`): the
+    ///   setter makes the speed 1000, then global 18 keeps the speed it
+    ///   was. While global 18 is not negative this does nothing, so a
+    ///   speed the player sets meanwhile stands.
+    /// - While someone holds it and global 18 is not negative, the game
+    ///   goes back (`0x46d7db`): the setter makes the speed global 18's,
+    ///   then global 18 becomes -1.
+    ///
+    /// Both also restart the idle loop's clocks and send message 0x109
+    /// (with 1 going to 1000, 0 going back) to the interface, which is
+    /// not the simulation's. Returns whether the speed was set.
+    pub fn idle_speed(&mut self, residential: bool) -> bool {
+        if !residential {
+            return false;
+        }
+        let back = self.globals.get(RETURN_SPEED).copied().unwrap_or(-1);
+        let held = self.speed_held();
+        let (speed, kept) = match (held, back >= 0) {
+            (false, false) => (IDLE, self.speed()),
+            (true, true) => (back, -1),
+            _ => return false,
+        };
+        self.set_speed(i32::from(speed));
+        if let Some(slot) = self.globals.get_mut(RETURN_SPEED) {
+            *slot = kept;
+        }
+        true
     }
 
     /// Whether the game is paused (global 17): the scheduler's passes are
@@ -127,6 +201,123 @@ mod tests {
         assert_eq!(world.set_speed(-3), 172);
         assert_eq!(world.speed(), 0);
         assert_eq!(world.globals[RETURN_SPEED], 0);
+    }
+
+    /// A world whose registry lists one person, object 5, who holds the
+    /// speed, with the speed at normal and global 18 at -1.
+    fn one_person() -> World {
+        use sims_formats::saved_objects::{Interaction, Person};
+        let idle = Interaction {
+            uid: 0,
+            caller: 0,
+            target: 0,
+            icon: 0,
+            table_index: -1,
+            args: [0; 4],
+            priority: 0,
+            action: 0,
+            attenuation: 0.0,
+            flags: 0,
+        };
+        let person = Person {
+            animation_events: 0,
+            engaged: 0,
+            appearance: Default::default(),
+            accessories: Vec::new(),
+            animations: Default::default(),
+            routing_state: 0,
+            floats: [0.0; 9],
+            previous_motives: [0.0; 16],
+            motives: [0.0; 16],
+            data: vec![0; 256],
+            routing_frames: 0,
+            active: idle.clone(),
+            last: idle,
+            queue: Vec::new(),
+            object_uses: Vec::new(),
+            motive_deltas: Vec::new(),
+        };
+        let object = crate::Object {
+            id: 5,
+            guid: 0,
+            footprint: [0; 4],
+            position: [0; 3],
+            unknown_short: 0,
+            attributes: Vec::new(),
+            temps: Vec::new(),
+            data: vec![0; 128],
+            obsolete_word: 0,
+            stack_capacity_bytes: 0,
+            stack: Vec::new(),
+            relationship_flag: 0,
+            relationships: Vec::new(),
+            slots: Vec::new(),
+            dynamic_sprites: Vec::new(),
+            multipart: None,
+            portal: None,
+            person: Some(person),
+            registry_word: None,
+            last_result: false,
+            removal_skips_resets: false,
+            selected: false,
+        };
+        let mut world = World::empty();
+        world.objects.insert(5, object);
+        world.people.push(5);
+        world.globals[SPEED] = NORMAL;
+        world.globals[RETURN_SPEED] = -1;
+        world
+    }
+
+    fn person(world: &mut World) -> &mut sims_formats::saved_objects::Person {
+        world.objects.get_mut(&5).unwrap().person.as_mut().unwrap()
+    }
+
+    #[test]
+    fn each_of_four_words_lets_a_person_go_from_holding_the_speed() {
+        assert!(one_person().speed_held());
+        let changes: [fn(&mut World); 6] = [
+            |w| w.objects.get_mut(&5).unwrap().data[HIDDEN] = 1,
+            |w| person(w).data[WORD_65] = 2,
+            |w| person(w).motives[MOTIVE_11] = -0.5,
+            |w| person(w).motives[MOTIVE_11] = f32::NAN,
+            |w| person(w).data[VISITOR] = 1,
+            |w| w.people.clear(),
+        ];
+        for (i, change) in changes.iter().enumerate() {
+            let mut world = one_person();
+            change(&mut world);
+            assert!(!world.speed_held(), "change {i}");
+        }
+        // Word 65 at 1 or below, or motive 11 at 0, still holds it.
+        let mut world = one_person();
+        person(&mut world).data[WORD_65] = -3;
+        person(&mut world).motives[MOTIVE_11] = 0.0;
+        assert!(world.speed_held());
+    }
+
+    #[test]
+    fn with_nobody_holding_it_the_game_runs_at_1000_until_someone_does() {
+        let mut world = one_person();
+        // Not residential: nothing.
+        person(&mut world).data[VISITOR] = 1;
+        assert!(!world.idle_speed(false));
+        assert_eq!((world.speed(), world.globals[RETURN_SPEED]), (NORMAL, -1));
+        // Nobody holds it: 1000, and normal kept to go back to, once.
+        assert!(world.idle_speed(true));
+        assert_eq!((world.speed(), world.globals[RETURN_SPEED]), (1000, NORMAL));
+        assert!(!world.idle_speed(true));
+        assert_eq!(world.speed(), 1000);
+        // A speed set meanwhile updates the one to go back to and stands.
+        world.set_speed(i32::from(FAST));
+        assert!(!world.idle_speed(true));
+        assert_eq!((world.speed(), world.globals[RETURN_SPEED]), (FAST, FAST));
+        // Someone holds it again: back to it, and global 18 is -1.
+        person(&mut world).data[VISITOR] = 0;
+        assert!(world.idle_speed(true));
+        assert_eq!((world.speed(), world.globals[RETURN_SPEED]), (FAST, -1));
+        assert!(!world.idle_speed(true));
+        assert_eq!(world.speed(), FAST);
     }
 
     #[test]

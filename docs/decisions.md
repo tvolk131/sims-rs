@@ -49,34 +49,49 @@ disassembly; none of it is checked against a run.
     our cap of 20 ticks a call.
   - Message 0xc2, which the setter and the pause send to the interface,
     and its effect on the sounds, are not ported.
-- **Not ported, and failing loudly where it is seen:** the idle loop's
-  own speed.
-  - What it does: before its updates, on a residential lot (`0x40745f`:
-    zoning 1, `0x42b9e3`), the idle loop sets a speed of 1000 for a
-    while (`0x46d790`, keeping the speed to go back to in global 18).
-    It does so whenever none of the registry's people passes
-    `0x442f9b`, and goes back (`0x46d7db`) once one does.
-  - Who passes: a person whose object word `+0x8e` is 0, whose person
-    data word 65 (`+0x60e`) is at most 1, whose float at `+0x7b8` is not
-    below 0 (`0x45edc5`), and whose person data word 32 (`+0x5cc`) is 0,
-    meaning they live on the lot.
-  - What `+0x8e` and `+0x7b8` are was not found, and neither is kept.
-    The capture has `+0x8e` at 0 for every person. They presumably mark
-    a Sim who is away or asleep: the full Goth day will need this when
-    the household goes to work, to school or to bed.
-  - What fails: `Lot::step` checks before every tick, in strict and
-    play mode. When nobody passes on words 32 and 65 alone, the original
-    certainly runs at 1000, and the step fails, saying so. When someone
-    passes on those words, `+0x8e` or `+0x7b8` may still turn them all
-    away. That is **not** detected, and the lot goes on at the player's
-    speed where the original's globals 16 and 18 would differ.
-  - Whether the Goths' morning sets the speed in the original was not
-    checked. On our side the Goths always pass on words 32 and 65 through
-    tick 2881, so nothing that ran before fails now. An empty residential
-    lot now stops at its first tick for this reason, before anything
-    else.
+- **Ported: the idle loop's own speed** (`World::idle_speed`, run by
+  `Lot::step` before every update, in strict and play mode).
+  - On a residential lot (`0x40745f`: zoning 1, `0x42b9e3`), before
+    its updates, the idle loop asks whether anyone holds the game to the
+    player's speed (`0x442f9b`, `World::speed_held`). A person in the
+    registry's list holds it when all of these are true:
+    - object data word 34 (`+0x8e`) is 0;
+    - person data word 65 (`+0x60e`) is at most 1;
+    - motive 11 (`+0x7b8`; motives start at `+0x78c`) is not below 0.0
+      (`0x45edc5`, against the 0.0 at `0x66657c`; a NaN counts as
+      below, as the x87 compare branches);
+    - person data word 32 (`+0x5cc`) is 0.
+  - While nobody holds it and global 18 is negative, the idle loop goes
+    to 1000 (`0x46d790`): the setter makes the speed 1000, then global
+    18 keeps the speed it was. While global 18 is not negative,
+    `0x46d790` does nothing (`0x46d795`). So a speed the player sets
+    meanwhile (the setter writes global 18 too) stands, not 1000.
+  - While someone holds it and global 18 is not negative, the idle loop
+    goes back (`0x46d7db`): the setter makes the speed global 18's,
+    then global 18 becomes -1.
+  - Both also restart the idle loop's clocks and send message 0x109 to
+    the interface (1 going to 1000, 0 going back). That is not ported.
+  - **Unverified:**
+    - What word 34, word 65 and motive 11 mean. They presumably mark a
+      Sim who is hidden (away at work or school) and one who is asleep.
+      The full Goth day will exercise this when the household leaves or
+      goes to bed.
+    - Whether the original's speed changes on the Goths' house in the
+      ticks we compare. The strict boot (House05, 1102 ticks) is
+      unchanged by the port, so through it someone always holds the
+      speed and global 18 stays -1.
+  - The window follows the simulation's speed: ticks are owed at the
+    period of global 16 (1 ms at 1000). A tick that changes the speed
+    ends the batch of ticks owed, and the time owed starts again, as the
+    setter restarts the clocks. The panel's buttons still show the
+    player's choice.
+  - Sol's review found the guard that stood here before was wrong both
+    ways. It failed where `0x46d790` keeps global 18's speed. It missed
+    hidden and sleeping Sims, whose words it took to be unkept. Porting
+    the whole head of the idle loop replaced it.
 - Strict `sims boot` never calls the speed or pause hooks. The idle
-  loop's check never fails for the Goths, so the output is unchanged.
+  loop's speed never changes on the Goths through tick 1102, so the
+  output is unchanged.
 
 ## 2026-11-15: The reload makes a record for each person type without one; UserData2 to 8 load
 

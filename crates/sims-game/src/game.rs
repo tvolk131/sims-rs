@@ -255,17 +255,37 @@ impl Game {
         }
     }
 
-    /// Runs the ticks owed after `elapsed_us` more microseconds. Returns
-    /// how many ran.
+    /// Runs the ticks owed after `elapsed_us` more microseconds at the
+    /// simulation's speed. Returns how many ran. When a tick changes the
+    /// speed (the idle loop's own, [`sims_sim::World::idle_speed`]), the
+    /// ticks owed stop there and the time owed starts again, as the
+    /// original's setter restarts its clocks; the tick that changed it
+    /// runs at once, where the original waits a period of the new speed
+    /// first (the window's timing, not the simulation's).
     pub fn advance(&mut self, elapsed_us: u64) -> u32 {
-        let due = self.pace.due(elapsed_us);
-        self.run(due)
+        let speed = self.lot.world().speed();
+        let due = self.pace.due(elapsed_us, speed);
+        let ran = self.run_while(due, Some(speed));
+        if self.lot.world().speed() != speed {
+            self.pace.restart();
+        }
+        ran
     }
 
     /// Runs up to `ticks` ticks, stopping at the first that fails.
     pub fn run(&mut self, ticks: u32) -> u32 {
+        self.run_while(ticks, None)
+    }
+
+    /// Runs up to `ticks` ticks, stopping at the first that fails, and,
+    /// given a `speed`, after the first that leaves the simulation's speed
+    /// other than it.
+    fn run_while(&mut self, ticks: u32, speed: Option<i16>) -> u32 {
         let mut ran = 0;
-        while ran < ticks && self.stopped.is_none() {
+        while ran < ticks
+            && self.stopped.is_none()
+            && speed.is_none_or(|s| s == self.lot.world().speed())
+        {
             let step = if self.play {
                 self.lot.step_play()
             } else {
