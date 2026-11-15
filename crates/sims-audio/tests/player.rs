@@ -1251,16 +1251,103 @@ fn kill_all_and_kill_object_sounds_events() {
 
 #[test]
 fn kinds_that_do_nothing_and_kinds_not_ported() {
-    let events = "debug=44,0\nempty=29,10\nnone=1907,10\npiano=43,10\n";
+    let events = "debug=44,0\nempty=29,10\nnone=1907,10\nreload=104,10\n";
     let module = module_with(&[&GENERIC], 1, 10, events);
     let mut player = Player::new(vec![module], samples(), 1);
     for name in ["debug", "empty", "none"] {
         play(&mut player, name);
     }
     assert!(player.faults.is_empty() && player.is_idle());
-    play(&mut player, "piano");
+    play(&mut player, "reload");
     assert_eq!(player.faults.len(), 1);
-    assert!(player.faults[0].contains("kind 43 is not one"));
+    assert!(player.faults[0].contains("kind 104 is not one"));
+}
+
+/// Object 9 is on the screen right of the middle; every object's field 5
+/// is 42. Records what is asked, as [`Asked`] does.
+#[derive(Default)]
+struct PianoRoom(std::cell::RefCell<Vec<(i32, i32)>>);
+
+impl Sources for PianoRoom {
+    fn field(&self, source: i32, field: i32) -> Option<i32> {
+        self.0.borrow_mut().push((source, field));
+        Some(if field == 5 { 42 } else { 0 })
+    }
+
+    fn position(&self, object: i32) -> Option<[i32; 3]> {
+        (object == 9).then_some([40, 56, 1])
+    }
+
+    fn projection(&self, object: i32) -> Option<Projection> {
+        (object == 9).then_some(Projection {
+            at: [600, 300],
+            screen: [800, 600],
+            zoom: 1,
+            shown_level: 1,
+        })
+    }
+}
+
+#[test]
+fn the_piano_plays_where_its_object_is_and_sets_the_skill() {
+    use sims_audio::player::{PIANO, PIANO_SKILL};
+    // Both tracks ask about their first argument, as the fields their
+    // `extvol` and `pan`: the piano every block, the skill once.
+    let mut piano = vec![SET_LOOP];
+    piano.extend([GETSRCDATAFIELD, 6, 1, 19, GETSRCDATAFIELD, 6, 1, 20, LOOP]);
+    let skill = [GETSRCDATAFIELD, 6, 1, 19, GETSRCDATAFIELD, 6, 1, 20, END];
+    let events = "piano=43,0\nunplaced=43,0,8,300,600\nkill9=23,9\nkill8=23,8\n";
+    let module = module_of_tracks(&[(PIANO, &piano), (PIANO_SKILL, &skill)], events);
+    let mut player = Player::new(vec![module], samples(), 1);
+    let room = PianoRoom::default();
+    let asked = || {
+        let mut asked = std::mem::take(&mut *room.0.borrow_mut());
+        asked.sort();
+        asked
+    };
+    // Object 9 is placed with the piano's `Spl` (20): 464 at 527. The
+    // skill (its field 5, asked at once) starts the skill track, whose
+    // levels are its (0) second and third arguments.
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "piano".into(),
+        },
+        &room,
+    );
+    assert_eq!(asked(), [(9, 5)]);
+    player.render(BLOCK, &room);
+    assert_eq!(asked(), [(9, 464), (9, 527), (42, 0), (42, 0)]);
+    // Object 8 is not on the lot: the event's levels stay. The piano's
+    // one instance is now 8, so letting go of 9 leaves it playing.
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "unplaced".into(),
+        },
+        &room,
+    );
+    assert_eq!(asked(), [(8, 5)]);
+    player.render(BLOCK, &room);
+    assert_eq!(
+        asked(),
+        [(8, 300), (8, 600), (9, 464), (9, 527), (42, 0), (42, 0)]
+    );
+    play(&mut player, "kill9");
+    player.render(12 * BLOCK, &room);
+    assert!(!player.is_idle());
+    play(&mut player, "kill8");
+    player.render(12 * BLOCK, &room);
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn the_piano_without_its_track_does_nothing() {
+    let module = module_with(&[&GENERIC], 1, 10, "piano=43,10\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "piano");
+    assert!(player.faults.is_empty() && player.is_idle());
 }
 
 const GETSRCDATAFIELD: u8 = 72;

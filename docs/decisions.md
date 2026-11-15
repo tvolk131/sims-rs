@@ -4,6 +4,43 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: The piano plays where its object is, and a start sets a track's levels
+
+Kind 43 (`kPlayPiano`) is ported from the sound manager's case for it
+(0x573e5a). The event's own track is not used: the piano is track 1906
+(`Piano`, in `SimsGeneratedHitSource`), and nothing happens without it.
+
+- **The piano's start:** the object (the first argument) is placed as
+  one object with the piano's `Spl` (0x5730b6, as kinds 1 and 30 place
+  each of their objects), into the second and third arguments. When it
+  is not placed they keep the event's values. The piano then starts and
+  is let go (vtable +0x2c), as kind 1 starts a track.
+- **Its instances:** all of the piano's recorded objects are dropped
+  (0x581f8e on the map at +0xd4) and the one object its start left on
+  the track (vtable +0x24, the field at +0xb0) is recorded. A start sets
+  that field only for a `kArgsIdVolPan` track, which the piano is; for
+  any other the object recorded is taken as none (0), which is
+  **unverified** (the field keeps the track's last value there).
+- **The skill:** track 1907 (`SetPianoSkill`), when it exists, starts
+  with the object's source field 5 as its first argument (0x570e61).
+  Its script writes it into the piano's register 5.
+- **A start sets the track's levels** (0x57db01): a fresh start writes
+  `extvol` and `pan` from the arguments, as the track's `args` field
+  says: the first two for `kArgsVolPan` (the stations), the second and
+  third for `kArgsIdVolPan`. The player left them at their defaults.
+  Kinds 1 and 30 place the track after its start, so for them only an
+  object that cannot be placed now keeps the event's levels; `play_trk`
+  now hands a started `kArgsIdVolPan` track the caller's registers 2
+  and 3 as its levels. A held track let go by a start, and the idle
+  track kind 53 plays on, keep theirs, as in the original.
+- **Model limit:** the original has one piano track object, so a second
+  piano event restarts it; here it runs a second thread (as for every
+  track; see the entry on the sound player's model).
+- **Tests:** a hand-built module checks the placement, the event's
+  levels kept, the skill's start and the instances replaced. On the
+  install every event still runs without a bad instruction, and
+  `piano_play` now plays notes for ever.
+
 ## 2026-11-15: The music modes start and stop the music tracks
 
 Kind 36's music half is ported from the sound manager's mode change
