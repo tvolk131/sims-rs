@@ -71,6 +71,84 @@ What the houses do now (`sims boot`, 1000 ticks, no answers):
 Reopen if a capture of a house with map entries renumbers a cell
 differently, or another install lists two pattern files in one bucket.
 
+## 2026-11-15: A person's base layer is drawn as the simulation keeps it
+
+`sims_people` now poses a person's base layer from the simulation's
+playback of it (`World::base_layers`, the layer in the animator's base
+slot): its clip, its phase, its end mode and its weight. Before, the
+simulation did not keep the layer, so the drawing stood in with the
+saved person record's base clip (the standing loop, for each Goth)
+repeating at the animator's clock, or a script's clip from when it
+started. A seated person was posed on the standing loop under the
+foreground clip.
+
+Sampled every 50 ticks over the Goths' first 3,400 ticks (strict mode),
+a person sits in 94 of 226 samples; the base clip is `a2o-sit-loop`
+there, and `a2o-standing-loop` or `c2o-standing-loop` otherwise. The
+child sits on the adult's sit loop too: that is the clip the posture's
+tables name for him (`posture_clip`), which the drawing takes as it is.
+In every one of those samples a foreground clip plays at full weight,
+and those clips move every bone, so the drawn day hardly changes: at
+ticks 500, 1100, 1300, 2900 and 3050 (medium zoom, the porch and the
+living room) the people are the same pixel for pixel. The change counts
+where a foreground clip is partial, fading or absent, and it removes a
+stand-in.
+
+**Checked** only in part. Against the original at medium zoom (Mortimer
+and Alexander reading on the porch bench at 7:38), both sit as the
+original's do, but they did before too: the reading clip drives every
+bone. No screenshot of the original yet shows a seated person whose
+foreground leaves bones to the base layer. The original's people are
+drawn lighter than ours, and it shows the plumb bob over the selected
+Sim, which is not drawn here; neither is about the base layer.
+
+A caller that has no layers for a person (passes None) gets the
+stand-in as before. A state kept before the simulation held the layer
+(encodings before format 25) is refused when loaded, not migrated.
+
+## 2026-11-15: The personality panel draws its bars as the original's bar maker lays them out
+
+The live panel's Personality button now opens the selected Sim's
+personality in the subpanel, where Needs opens the needs
+(`sims_ui::hud`, `Kind::Personality`). Without a selected Sim the
+subpanel is empty, as for the needs.
+
+- **Where the numbers come from** (no screenshot of this panel was
+  available, so it is read from the exe):
+  - The panel builder (0x518665) makes five bars with 0x51df31, for
+    person data words 7, 6, 3, 5 and 2 (the table at 0x66c600): Neat,
+    Outgoing, Active, Playful and Nice.
+  - Every bar's label is as wide as the widest label plus 3 (0x52144a),
+    and its bar starts 3 past that (0x521491).
+  - The bar's gadget is 3 wider than the bar, and the gadgets are
+    stacked right-aligned at x 202 of the subpanel, from y 8, 18 apart
+    (0x519cc8). The CJK languages use 15 and 25, which are not ported.
+  - The shorter of the label's line and the bar is centred on the
+    other.
+- **A bar** (0x5211bd) draws the empty bar (4903, 40 by 14), then the
+  full one (4900, 40 by 16) cut to 4 pixels a point and a pixel higher
+  (0x5212b2). A trait is the data word over 100, clamped to 0 to 10.
+- **Labels and fonts:** the labels are font 8 (0x6f2ae4) and the title
+  is font 11 at the needs title's place. The labels are English, as the
+  needs' are (Live.iff STR# 131 has them).
+- **The subpanel** is the needs' rectangle. The layout table at
+  0x6f3a28 puts it at x 300 of the strip, one left of the 301 the needs
+  were measured at. That pixel is left as measured.
+- **Unverified:**
+  - the labels' color (the needs labels' is taken) and their alignment
+    (right, against the bar);
+  - which of the font's heights the centring compares (its line height
+    is taken).
+- **Not drawn yet:** the zodiac sign and its text under the bars (a
+  text gadget in font 12, filled from UIText.iff STR# 165).
+- **Tests:** a unit test checks the layout, presses passing through,
+  each bar's fill and its rows with stand-in art, and that coordinates
+  at the edge of `i32` do not panic. The Goths' panel is pinned by
+  digest, gated on `SIMS_INSTALL`, with Mortimer's, Bella's and
+  Cassandra's traits read from the house.
+
+Reopen with a screenshot of the original's personality panel.
+
 ## 2026-11-15: Drop is ported; a second order waits, and a press cancels either, in the window
 
 **Drop** (opcode 5, 0x454430, from the general table at 0x45246a) is
