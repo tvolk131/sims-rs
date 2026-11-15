@@ -25,6 +25,7 @@ fn options(install: PathBuf) -> Options {
         house: goth_house(&install),
         install,
         answers: vec![3],
+        play: false,
     }
 }
 
@@ -102,4 +103,138 @@ fn people_stand_where_a_click_finds_them() {
         }
     }
     assert!(found > 0, "no person stands in view");
+}
+
+#[test]
+fn play_mode_runs_the_goths_past_the_hour() {
+    let Some(install) = install() else {
+        return;
+    };
+    let options = Options {
+        play: true,
+        ..options(install)
+    };
+    let mut game = Game::open(&options).expect("the Goth house opens");
+    // Past the hour turning at tick 878, through the errors play mode
+    // catches.
+    assert_eq!(game.run(3000), 3000);
+    assert_eq!(game.stopped(), None);
+    assert!(game.errors().len() as u64 <= game.caught());
+}
+
+#[test]
+fn the_fridge_and_the_bookshelf_offer_their_interactions() {
+    let Some(install) = install() else {
+        return;
+    };
+    let house = goth_house(&install);
+    let mut lot =
+        sims_vm::boot::Lot::load(&install, &house, &[3], sims_vm::boot::Frames::default())
+            .expect("the Goth house boots");
+    let assets = open_house(&install, &house)
+        .expect("the house opens")
+        .assets;
+    let person = lot.world().selected().expect("a Sim is selected");
+    let labels = |lot: &sims_vm::boot::Lot, id: u16| -> Vec<String> {
+        sims_game::menu::entries(lot, &assets, id)
+            .expect("the menu is read")
+            .into_iter()
+            .map(|e| e.label)
+            .collect()
+    };
+    let find = |label: &str| {
+        lot.world()
+            .objects
+            .keys()
+            .copied()
+            .find(|&id| labels(&lot, id).iter().any(|l| l == label))
+            .unwrap_or_else(|| panic!("nothing offers {label}"))
+    };
+    let fridge = find("Have A Snack");
+    let shelf = find("Read a Book");
+    let fridge_menu = labels(&lot, fridge);
+    assert!(
+        fridge_menu.iter().any(|l| l == "Have A Meal"),
+        "{fridge_menu:?}"
+    );
+    assert!(
+        !fridge_menu.iter().any(|l| l.starts_with("Debug")),
+        "{fridge_menu:?}"
+    );
+    let entry = sims_game::menu::entries(&lot, &assets, shelf)
+        .expect("the menu is read")
+        .into_iter()
+        .find(|e| e.label == "Read a Book")
+        .expect("Read a Book");
+    assert!(matches!(
+        lot.queue_interaction(person, shelf, entry.menu),
+        Ok(Some(_))
+    ));
+    let queue = &lot.world().objects[&person].person.as_ref().unwrap().queue;
+    assert!(
+        queue
+            .iter()
+            .any(|a| a.target == shelf as i16 && a.table_index == entry.menu as i32),
+        "{queue:?}"
+    );
+}
+
+#[test]
+fn a_tile_offers_the_menu_of_the_tile_its_orders_go_to() {
+    let Some(install) = install() else {
+        return;
+    };
+    let house = goth_house(&install);
+    let lot = sims_vm::boot::Lot::load(&install, &house, &[3], sims_vm::boot::Frames::default())
+        .expect("the Goth house boots");
+    let assets = open_house(&install, &house)
+        .expect("the house opens")
+        .assets;
+    let mut redirected = 0;
+    for &id in lot.world().objects.keys() {
+        let target = sims_game::menu::target(&lot, id).expect("a target");
+        let entries = sims_game::menu::entries(&lot, &assets, id).expect("the menu is read");
+        assert_eq!(
+            entries,
+            sims_game::menu::entries(&lot, &assets, target).expect("the menu is read"),
+            "object {id} and its target {target}"
+        );
+        if target != id {
+            redirected += 1;
+            assert!(
+                entries.iter().all(|e| !e.label.starts_with("Interaction ")
+                    || e.label.starts_with("Interaction - ")),
+                "object {id}: {entries:?}"
+            );
+        }
+    }
+    // The beds' and the guitar's other tiles send their orders on.
+    assert!(redirected >= 8, "{redirected}");
+    // An order on such a tile goes where the menu said it would.
+    let (tile, target, entry) = lot
+        .world()
+        .objects
+        .keys()
+        .find_map(|&id| {
+            let target = sims_game::menu::target(&lot, id).ok()?;
+            let entry = sims_game::menu::entries(&lot, &assets, id)
+                .ok()?
+                .first()?
+                .clone();
+            (target != id).then_some((id, target, entry))
+        })
+        .expect("a tile whose orders go to another");
+    let mut lot = lot;
+    let person = lot.world().selected().expect("a Sim is selected");
+    assert!(matches!(
+        lot.queue_interaction(person, tile, entry.menu),
+        Ok(Some(_))
+    ));
+    let queue = &lot.world().objects[&person].person.as_ref().unwrap().queue;
+    assert!(
+        queue
+            .iter()
+            .any(|a| a.target == target as i16 && a.table_index == entry.menu as i32),
+        "tile {tile}, target {target}: {queue:?}"
+    );
 }

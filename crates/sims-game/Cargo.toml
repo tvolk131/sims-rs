@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 sims-audio = { path = "../sims-audio" }
 sims-content.workspace = true
+sims-formats.workspace = true
 sims-people = { path = "../sims-people" }
 sims-render = { path = "../sims-render" }
 sims-sim.workspace = true
