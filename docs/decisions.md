@@ -46,6 +46,144 @@ under the title (`household::zodiac`, `Resident::zodiac`, drawn by
   - the Goths' saved signs agree with the ones their traits give, and
     the panel's digest is pinned again.
 
+## 2026-11-15: The three more houses recorded are the Newbies, the Pleasants in 6 Sim Lane and the Roomies in 10 Sim Lane
+
+The roadmap's step 3 asks for 1000-update recordings of three more
+base-game houses, picked for code the Goths do not reach. In the
+install's base neighborhood (`UserData`) only the Goths (House05) and
+the Newbies (House07) live in a house; the other eight base houses are
+empty, and the three base families without a house (the Pleasants,
+the Roomies, the Bachelor) wait in the family bin. The houses in
+`UserData2` to `UserData8` belong to neighborhoods the game has not
+opened yet (their families are imported on the first visit) and do not
+load in strict mode yet. So two of the three are moves into empty base
+houses, made in the original and saved once before the recording.
+
+**The Newbies (House07).** The other resident base family: two adults,
+no job yet, a different lot, and objects the Goth house does not hold
+(by object file: `ShowerC`, `MedicineCabinet`, `Stereos`, `TVs`,
+`flamingo`, `lampgarden`, `comeandsee`, `HelpSystem`). No save is
+needed; the recording reads the install's own `UserData`.
+
+**The Pleasants in 6 Sim Lane (House06).** Two adults and two
+children. The Goths have one child (Cassandra). With two, the school
+bus can take two children, and child-to-child interactions and the
+siblings' relationship can run, which a one-child house never starts.
+**Unverified**: the 1000 updates cover 7:10 to 7:43 in the morning, and
+whether they reach this code has not been checked.
+House06 is the furnished empty base house the family can afford
+(§10,206 of their §20,000), with a bed, fridge, shower, toilet and
+phone; its objects are base game only. The move-in is a player action
+in the neighborhood view, made once (steps in the capture's
+`movein-input-log.txt`), then the game was saved and the whole
+`UserData` folder frozen next to the capture.
+
+**The Roomies in 10 Sim Lane (House10).** Two unrelated adults (no
+couple, no child), in a house with a fireplace (`Fireplaces.iff`, which no Goth
+object uses) and a different floor plan and lot. The Roomies bought it
+for §14,143 of their §20,000 and kept §5,856; the two larger empty
+houses (2 Sim Lane with the pool at §50,776 and 3 Sim Lane at §24,793)
+cost more than any family in the bin has. The Bachelor, the other
+family left, is one adult, which runs less than two. Moved in and saved
+in the original the same way as the Pleasants (steps in the capture's
+`movein-input-log.txt`); the save writes the house with SIMI version
+0x49.
+
+**What the save holds that is not lot content.** The Complete
+Collection adds the expansion packs' controller objects to every lot on
+load (the Goth house goes from 245 saved objects to 377 at update 1),
+and a save writes them into the house file: the saved House06 names
+objects from every expansion pack and from Downloads (controllers,
+phone plugins, inventory tokens such as gifts and collars) beside its
+103 base objects. A boot from the frozen snapshot has to load those
+definitions, as a load of an unsaved house makes them.
+
+**What our side reaches on them** (strict mode; for the Pleasants and
+the Roomies, with the frozen save as the neighborhood). The Newbies run
+all 1000 updates. Their first differences: the globals at two of updates
+1 to 3, the animators from update 1, positions from update 32 and
+motives from update 154. One neighborhood record differs from update 629
+on, in a record where the two neighborhood files themselves differ. The
+Roomies load equal to the original. The Pleasants also load equal, but
+for object 243 (data word 50 and its last result) and object 241's frame
+(tree 0x2029, against the original's 0xa029). Both stop in update 1 at
+the same place: a person's route with no route context (tree 0x0176 node
+26, 0x45ae65), which is not ported. At that stop, person word 27 is one
+behind the original's completed update 1, because that person's turn has
+not finished.
+
+**Reopen** if a house in `UserData2` to `UserData8` loads in strict mode
+and offers more unreached code than a move-in does.
+
+## 2026-11-15: A person is lit by the original's standard light, at their room's level
+
+People on a lot were drawn with our own light: a shade from 0.45 in
+shadow to 1 facing a light from the viewer's right. They are now lit as
+the original lights them, as far as it is read (`raster::Lighting`,
+`lot::level`, `lot::STANDARD_LIGHT`). The entry "How the original
+lights a person" (2026-11-14) has what was read before. This entry says
+what changed and what settled it.
+
+- **The light keeps its place relative to the viewer.** Before setting
+  the standard light, the original turns it by the view object's matrix
+  at +0x130 (0x4b49f5). That matrix is a turn about the vertical by
+  `((−rotation) & 3) × π/2`, built with the house camera (0x49b60e to
+  0x49b642). The camera turns by the same quarter turns, so the light
+  stays where it is relative to the viewer. Ours already did that.
+- **Its direction.** `stdlight.lgt` gives the light a position (6.79,
+  9.55, 6.79) and a direction (−0.644, −0.418, −0.641). The direction
+  points from that position towards the middle, so it is the way the
+  light shines, as Direct3D takes a directional light's direction. The
+  direction towards the light is therefore (0.644, 0.418, 0.641). The
+  drawing frame is the files' frame, so this needs no change of axes.
+  At rotation 0 the house camera's eye is along (0.61, 0.5, 0.61), so
+  the light is above and behind the viewer, a little lower than the eye
+  (about 25° above the ground to the eye's 30°).
+- **The level.** The person's level is their room's light, as the lot
+  renderer stores it for the room's tiles (`sims_render::lot::room_light`,
+  the room's shown light), over 255, held between 0.5 and 1. The
+  original reads the level from the drawing's lighting record
+  (0x4b4499). That record's only setter (0x4b4525) holds it between 0.5
+  (0x6c7420) and the brightest a lit tile may be (0x6c741c, 1 by day).
+  The lot's objects set it from the tile light map, the light byte over
+  255 (0x467482, 0x4b0e24). That a person's record is set the same way,
+  from the tile they stand on, is **unverified**.
+- **The shade.** The original sets the ambient light to the grey
+  `round(255 × level)` and the standard light's strength to the level,
+  and Direct3D adds them up per vertex, held to 1. So the shade is
+  `min(1, round(255 × level) / 255 + level × max(0, n · l))`. The
+  material is taken to be white: a person at full light matches the
+  screenshot below only if the ambient part is near 1.
+
+**What a screenshot shows.** The original's screenshot of Mortimer on
+the porch at medium zoom (outdoors, by day, so level 1) was compared
+with ours drawn at full light everywhere. Over his 768 pixels the
+original is 0.93 of ours at the median. The lot around him is 0.97,
+from colour depth and filtering. The ratio does not follow any light
+direction tried (eight signs of the standard light and five others; the
+largest correlation is 0.15). So the original draws him with no visible
+light side, as level 1 gives. Our old light drew his shadow side at
+0.45 and was visibly darker.
+
+**Unverified.**
+- That the vector is the way the light shines. A person at full light
+  shows no side, so only a person in a dim room in a screenshot can
+  settle it. A screenshot of Bella indoors (2026-11-14) is brighter on
+  the viewer's left, but she was walking at an unknown phase and was
+  not drawn to match.
+- The person's level coming from their tile.
+- The material's colours.
+
+**Not ported.**
+- The room's lamps: a light from each lamp of the room within 20
+  units, at full strength to 15.
+- The level's fade over 250 ms.
+- The cap of 0.8 after dark (the lot renderer does not have it either).
+- The person's flag (+0x114 bit 0) that draws them at full light.
+
+`Canvas::draw`, the offscreen renderer and the pie menu's head, keeps
+our own light, unchanged to the bit.
+
 ## 2026-11-15: The queue's icons show their objects' catalog pictures
 
 An object's icon in the action queue now shows its type's catalog
