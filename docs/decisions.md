@@ -15,9 +15,14 @@ On screen a tile's diagonal runs level, through its left and right
 corners, or upright, through its top and bottom ones. For a level cut
 one half is drawn with the top raised to the corners' row (0x4af70a) and
 the other with the bottom lowered to it (0x4af924); for an upright cut
-the right edge is lowered to the tile's middle column (0x4afcf5) and the
-left raised to it (0x4afef6). The corners' row and the middle column go
-to the lower and right halves.
+the right edge is lowered to the tile's x (0x4afcf5) and the left raised
+to it (0x4afef6). The corners' row goes to the lower half and the cut's
+column to the right half. The sprite is drawn at that x less half a tile
+(the view's field +0x5c, `8 << zoom`, set at 0x4a6cfa), so the cut is
+16, 32 or 64 pixels into the image. The sprites are a pixel narrower
+than the tile (31, 63 and 127 wide) with their top and bottom corners on
+the middle column, so the cut falls one column right of the corners,
+not on them.
 
 Before, each pixel was placed in the tile and tested against the
 diagonal, with the position rounded toward zero. On the level cut's row

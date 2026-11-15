@@ -21,7 +21,7 @@ const DIGESTS: &[(u32, u8, &str, &str)] = &[
     (1, 3, "up", "1e608a1c0933921d"),
     (1, 3, "cutaway", "e21049627b31f9d4"),
     (2, 0, "up", "a0fab8d6f4b7c502"),
-    (2, 0, "cutaway", "95e24e224c90bb74"),
+    (2, 0, "cutaway", "6cb933eafc4d5748"),
     (2, 1, "up", "70fc3e40129f44d0"),
     (2, 1, "cutaway", "58d9e465a05976ed"),
     (2, 2, "up", "c66fb79fbaacc88a"),

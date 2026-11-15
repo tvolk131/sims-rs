@@ -1935,7 +1935,7 @@ Progress:
   to 90.1%. Pools on walls (the file's wall tables) are read in part,
   not ported.
 - Done: a split floor's halves are cut straight along the corners' row
-  or the middle column, as the original's clip rectangle cuts them; the
+  or half a tile in, as the original's clip rectangle cuts them; the
   dashed row along a porch's diagonal edge is gone.
 - Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
   grass and a light sprite in the original); lamp pools on walls; the

@@ -1206,11 +1206,15 @@ fn within(image: &Image, x: i32, [from, to]: [i32; 2]) -> Option<(Image, i32)> {
 /// screen's clip rectangle narrowed to that half's side of the cut
 /// (0x4af70a and 0x4af924 for a level cut, 0x4afcf5 and 0x4afef6 for an
 /// upright one). The upper half ends above the corners' row and the lower
-/// half starts on it; the left half ends before the middle column and the
-/// right half starts on it.
+/// half starts on it. The original places the sprite at the cut's column
+/// less half a tile (`8 << zoom`, the view's field +0x5c set at 0x4a6cfa),
+/// so the left half ends before column `8 << zoom` of the image and the
+/// right half starts on it. The sprites are a pixel narrower than the tile
+/// (31, 63 and 127 wide) with their top and bottom corners on the middle
+/// column, one left of the cut, so that column goes to the left half.
 fn split_half(camera: &Camera, image: &Image, segments: u8, half: usize) -> Image {
     let half_h = (4 << camera.zoom.level()) as usize;
-    let middle = image.width / 2;
+    let corner = (8 << camera.zoom.level()) as usize;
     // In the view the cut is level when the wall descends there.
     let level = (segments & lot::DESCENDING != 0) != (camera.rotation & 1 == 1);
     // Whether half 0 is the upper (or left) one: test a point well inside
@@ -1225,7 +1229,7 @@ fn split_half(camera: &Camera, image: &Image, segments: u8, half: usize) -> Imag
     let mut out = image.clone();
     for py in 0..image.height {
         for px in 0..image.width {
-            let before = if level { py < half_h } else { px < middle };
+            let before = if level { py < half_h } else { px < corner };
             if before != upper {
                 out.rgba[(py * image.width + px) * 4 + 3] = 0;
             }
@@ -1539,11 +1543,13 @@ mod tests {
     }
 
     #[test]
-    fn a_split_floor_is_cut_straight_along_the_corners_row_or_the_middle_column() {
+    fn a_split_floor_is_cut_straight_along_the_corners_row_or_half_a_tile_in() {
+        // As wide as the game's near floor sprites, a pixel short of the
+        // tile.
         let image = Image {
-            width: 128,
+            width: 127,
             height: 64,
-            rgba: [9, 9, 9, 255].repeat(128 * 64),
+            rgba: [9, 9, 9, 255].repeat(127 * 64),
             depth: None,
         };
         let shows = |i: &Image, [x, y]: [usize; 2]| i.rgba[(y * i.width + x) * 4 + 3] != 0;
@@ -1564,8 +1570,8 @@ mod tests {
                     3 => [inside[1], 16 - inside[0]],
                     _ => inside,
                 };
-                // View sixteenths to pixels: 128 wide, 64 tall, top corner
-                // at column 64.
+                // View sixteenths to pixels: a tile 128 wide and 64 tall
+                // placed half a tile left of its top corner.
                 let px = [64 + (view[0] - view[1]) * 4, (view[0] + view[1]) * 2];
                 let px = px.map(|n| n as usize);
                 assert!(
@@ -1584,13 +1590,14 @@ mod tests {
                 } else {
                     (&halves[1], &halves[0])
                 };
-                for n in 0..128 {
+                for n in 0..127 {
                     if level {
                         // The corners' row is wholly the lower half's.
                         assert!(!shows(upper, [n, 32]) && shows(lower, [n, 32]));
                         assert!(shows(upper, [n, 31]) && !shows(lower, [n, 31]));
                     } else if n < 64 {
-                        // The middle column is wholly the right half's.
+                        // Column 64, half a tile in, is wholly the right
+                        // half's; the sprite's middle column 63 the left's.
                         assert!(!shows(upper, [64, n]) && shows(lower, [64, n]));
                         assert!(shows(upper, [63, n]) && !shows(lower, [63, n]));
                     }
