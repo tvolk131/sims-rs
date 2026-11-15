@@ -97,8 +97,9 @@ events, and what it asks for after them) come first.
   (`sims_content::Surfaces`, `World::renumber_surfaces`). UserData2's
   house 9 then stops at the first frame (a bone last turned by a layer
   no longer playing, 0x5992b3), the houses with no family stop at the
-  household selection, and most others at an object with more saved
-  attributes than its constructor allocates. The templates' `Patch` families are not
+  household selection, and the community lots (UserData's houses 40 to
+  48) where Create New Object Instance mode 6 makes a person (0x44e60e).
+  Four types grow their attribute arrays to the saved count (0x4342ae). The templates' `Patch` families are not
   imported (see `docs/decisions.md`).
 
 ## Met goal: a headless lot boot that matches the original
