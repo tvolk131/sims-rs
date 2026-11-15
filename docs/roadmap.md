@@ -21,7 +21,7 @@ Done when, in strict mode (the default, unchanged):
   through the player-order API;
 - every one of the 49 primitives the install's trees use (`sims census`)
   is ported, for the cases recordings or targeted scenarios reach;
-- one expansion-pack lot agrees for its first 1000 ticks.
+- one expansion-pack lot agrees with recordings of the original.
 
 ### Steps
 
@@ -82,10 +82,13 @@ How it was reached:
    in a QEMU guest, stopped at every lot update, saving the state at the
    entry of the first tick and after chosen updates, with write
    watchpoints (`--watch`) and memory images. The captures are private.
-   Five runs of the Goth house were recorded. The first does not choose
-   in tick 233 and the other four do; we follow those
+   Five runs of the Goth house were recorded; the first covered 1000 lot
+   updates, tick counts 88445 to 89444. The first does not choose in
+   tick 233 and the other four do; we follow those
    (`docs/decisions.md`). With the install's own UserData, the C
    runtime's random stream and all 463 neighborhood records match too.
+   The original first draws from the C runtime's stream in tick 6, 1,466
+   times, when it makes a person; ours draws the same.
 5. **Matching**: the sections below record, load step by load step and
    tick range by tick range, what each needed and what was found.
 

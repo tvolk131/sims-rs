@@ -2,7 +2,9 @@
 
 Runs the original game (`Sims.exe` 1.91 from the Complete Collection) under
 Wine in an i386 QEMU guest, stops it at every lot update, and saves the state
-we compare with our simulation. Roadmap step 4.
+we compare with our simulation. Step 4 of the roadmap's met goal (a headless
+lot boot that matches the original); the current goal's recordings use it
+too.
 
 Nothing here holds game data. The inputs below are private and stay out of
 the repository, and so do the captures.
