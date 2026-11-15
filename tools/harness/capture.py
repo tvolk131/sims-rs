@@ -60,7 +60,9 @@ a saved update's line says why it was saved (saved_for). --answer-stuck S
 (with --guest-dir and --window) presses Return in the game window when a
 dialog shown in update --answer-from or later has had no result for S
 seconds, and again every S seconds (at most three times); each press is
-logged (dialog_auto_answer, and input-log.txt).
+logged (dialog_auto_answer, and input-log.txt), and a result cancels its own
+dialog's presses not yet made. dialog_result's result is the function's
+argument (the record's status at that stop is the old value).
 
 --scenario FILE (with --guest-dir) drives the game through a scripted input
 scenario (input.py has the format) and logs it to input.jsonl. It adds a
@@ -371,52 +373,107 @@ class DialogAnswerer:
     """Presses Return in the game window when a dialog has had no result for
     `after` seconds, and again every `after` seconds, at most `tries` times. It
     only writes guest jobs to the share (the guest runs while a modal dialog is
-    up); the capture's stops tell it when a dialog is shown and answered."""
+    up); the capture's stops tell it when a dialog is shown and answered. The
+    dialogs are told apart by their record, so a result ends only its own
+    dialog's presses.
+
+    A press job checks for its own `.cancel` file right before it presses, and
+    a result writes that file for every job of its dialog. The capture reports
+    a result while the guest is stopped, so a job that has not reached its
+    check by then never presses. One already past its check when the result
+    stop came (the press that may have made the result) still lands."""
 
     def __init__(self, share, window, after, log, input_log, tries=3):
         self.share, self.window, self.after, self.log, self.input_log = share, window, after, log, input_log
         self.tries = tries
         self.lock = threading.Lock()
-        self.open = None  # (serial, update) of the dialog waiting for a result
+        self.open = {}  # record -> dict(serial, update, timer, jobs) of a dialog waiting for a result
         self.serial = 0
-        self.timer = None
 
-    def shown(self, update):
+    def shown(self, update, record=None):
         with self.lock:
+            self._end(record, 'shown_again')
             self.serial += 1
-            self.open = (self.serial, update)
-            self._schedule(self.serial, 1)
+            self.open[record] = dict(serial=self.serial, update=update, timer=None, jobs=[])
+            self._schedule(record, 1)
 
-    def answered(self):
+    def answered(self, record=None):
         with self.lock:
-            self.open = None
-            if self.timer:
-                self.timer.cancel()
-                self.timer = None
+            self._end(record, 'answered')
 
-    def _schedule(self, serial, n):
-        if self.timer:
-            self.timer.cancel()
-        self.timer = threading.Timer(self.after, self._press, (serial, n))
-        self.timer.daemon = True
-        self.timer.start()
+    def _end(self, record, why):
+        entry = self.open.pop(record, None)
+        if not entry:
+            return
+        if entry['timer']:
+            entry['timer'].cancel()
+        for job in entry['jobs']:
+            (Path(self.share) / 'cmd' / f'{job:05d}.cancel').write_text(why + '\n')
+        if entry['jobs']:
+            self.log(kind='dialog_auto_answer_cancelled', update=entry['update'], record=record, jobs=entry['jobs'],
+                     why=why)
 
-    def _press(self, serial, n):
+    def _schedule(self, record, n):
+        entry = self.open[record]
+        entry['timer'] = threading.Timer(self.after, self._press, (record, entry['serial'], n))
+        entry['timer'].daemon = True
+        entry['timer'].start()
+
+    def _press(self, record, serial, n):
         with self.lock:
-            if not self.open or self.open[0] != serial:
+            entry = self.open.get(record)
+            if not entry or entry['serial'] != serial:
                 return
-            update = self.open[1]
+            update = entry['update']
             command = f'xdotool windowfocus --sync {self.window} sleep 1 key Return'
-            job = guest_jobs.submit(self.share, 'set -u\nexport DISPLAY=:98\n' + command + '\n')
+            script = (f'set -u\nexport DISPLAY=:98\nxdotool windowfocus --sync {self.window} sleep 1\n'
+                      '[ -e "${0%.sh}.cancel" ] && { echo cancelled; exit 3; }\nxdotool key Return\n')
+            job = guest_jobs.submit(self.share, script)
+            entry['jobs'].append(job)
             with open(self.input_log, 'a') as f:
                 f.write(f'{time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}\n'
                         f'auto answer (dialog of update {update}, press {n}): {command}\n')
-            self.log(kind='dialog_auto_answer', update=update, press=n, job=job, command=command)
+            self.log(kind='dialog_auto_answer', update=update, record=record, press=n, job=job, command=command)
             if n < self.tries:
-                self._schedule(serial, n + 1)
+                self._schedule(record, n + 1)
 
     def close(self):
-        self.answered()
+        with self.lock:
+            for entry in self.open.values():
+                if entry['timer']:
+                    entry['timer'].cancel()
+            self.open.clear()
+
+
+def open_dialogs(rows):
+    """{record: update} of the dialogs shown in these events and given no result yet."""
+    out = {}
+    for r in rows:
+        if r['kind'] == 'dialog_show':
+            out[r.get('record')] = r['update']
+        elif r['kind'] == 'dialog_result':
+            out.pop(r.get('record'), None)
+    return out
+
+
+def drop_redone_events(path, updates):
+    """Before a resume: drop the events a lot update's return produced (hour_turned, objects_changed) for an
+    update after the last recorded row. The resumed run redoes that return and writes them again. Returns
+    the dropped rows."""
+    if not path.exists():
+        return []
+    keep, dropped = [], []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        (dropped if r['kind'] in ('hour_turned', 'objects_changed') and r.get('update', 0) > updates
+         else keep).append(line)
+    if dropped:
+        tmp = path.with_suffix('.jsonl.tmp')
+        tmp.write_text(''.join(line + '\n' for line in keep))
+        tmp.rename(path)
+    return [json.loads(line) for line in dropped]
 
 
 def dump(container, guest_dir, d, regs, raw):
@@ -521,6 +578,14 @@ def main():
         ap.error(str(e))
     out = args.output
     out.mkdir(parents=True, exist_ok=args.resume)
+    prior_status, dropped = {}, []
+    if args.resume:
+        try:
+            prior_status = json.loads((out / 'status.json').read_text())
+        except (OSError, ValueError):
+            pass
+        recorded = len((out / 'updates.jsonl').read_text().splitlines()) if (out / 'updates.jsonl').exists() else 0
+        dropped = drop_redone_events(out / 'events.jsonl', recorded)
     events = open(out / 'events.jsonl', 'a')
     watch_log = open(out / 'watch.jsonl', 'a') if args.watch else None
     updates_log = open(out / 'updates.jsonl', 'a')
@@ -683,6 +748,23 @@ def main():
             last = json.loads(lines[-1])
             around_until = last.get('around_until', 0)
             last_clock = last.get('clock')
+        if args.around:
+            # The registry at the last recorded return, saved with it in status.json.
+            if prior_status.get('registry_update') == updates and prior_status.get('registry') is not None:
+                last_objects = {p: i for p, i in prior_status['registry']}
+            else:
+                event(kind='registry_unknown', updates=updates, registry_update=prior_status.get('registry_update'))
+        if dropped:
+            event(kind='resume_dropped', events=[dict(kind=r['kind'], update=r['update']) for r in dropped])
+        # A dialog shown since the last recorded return, and the dialogs still waiting for a result.
+        dialog_pending = any(r['kind'] == 'dialog_show' and r['update'] > updates for r in rows)
+        waiting = open_dialogs(rows)
+        if waiting:
+            event(kind='resume_open_dialogs', dialogs=[dict(record=k, update=v) for k, v in waiting.items()])
+        if answerer:
+            for record, shown_in in waiting.items():
+                if shown_in >= args.answer_from:
+                    answerer.shown(shown_in, record)
     try:
         reply = remote.stop_reply()
         event(kind='attach', reply=reply, resume=args.resume, updates=updates)
@@ -757,6 +839,11 @@ def main():
                     write_gz(d / 'full-state.json.gz', full)
                     write_gz(d / 'pages.json.gz', pages)
                     baseline = True
+                    # The registry and the clock at update 1's entry, so a change in update 1 is seen.
+                    if args.around or args.before_hour:
+                        last_clock = m.clock(sim)[0]
+                    if args.around:
+                        last_objects = {p: m.object_id(p) for p in m.registry(sim)}
                     event(kind='baseline', tick=state['tick'], lot=lot, cr3=cr3, teb=fs_base, seconds=time.time() - t0,
                           packets=remote.packets, sim=regs['ecx'])
                     if 1 in dump_set:  # the baseline is the entry of lot update 1
@@ -792,12 +879,14 @@ def main():
                         triggers = []
                         now = None
                         if args.around:
-                            # The IDs are read only for pointers not seen at the last return (one page each).
-                            known = last_objects or {}
-                            now = {p: known[p] if p in known else m.object_id(p) for p in pointers}
-                        if last_objects is not None and now is not None and list(now) != list(last_objects):
-                            added = [dict(id=now[p], pointer=p) for p in pointers if p not in last_objects]
-                            removed = [dict(id=i, pointer=p) for p, i in last_objects.items() if p not in now]
+                            # Every ID is read again: an object made at a freed object's address is
+                            # another object. The IDs lie on about one page for every four objects.
+                            now = {p: m.object_id(p) for p in pointers}
+                        if last_objects is not None and now is not None and \
+                                list(now.items()) != list(last_objects.items()):
+                            before, after = set(last_objects.items()), set(now.items())
+                            added = [dict(id=i, pointer=p) for p, i in now.items() if (p, i) not in before]
+                            removed = [dict(id=i, pointer=p) for p, i in last_objects.items() if (p, i) not in after]
                             event(kind='objects_changed', update=updates, tick=row['tick'], added=added,
                                   removed=removed, count=len(pointers))
                             triggers.append('objects')
@@ -838,7 +927,11 @@ def main():
                         row['seconds'] = round(time.time() - t0, 2)
                     updates_log.write(json.dumps(row) + '\n')
                     updates_log.flush()
-                    save_status(updates=updates, last=row)
+                    if args.around and last_objects is not None:
+                        save_status(updates=updates, last=row, registry=list(last_objects.items()),
+                                    registry_update=updates)
+                    else:
+                        save_status(updates=updates, last=row)
                     if runner and baseline:
                         runner.on_update(updates, m, sim)
                     if updates + 1 in dump_set:
@@ -856,6 +949,10 @@ def main():
                     row['status'] = m.word(record + 0x74)
                     row['modal'] = m.byte(record + 0x69)
                     row['stack'] = m.read(regs['esp'], 0x20).hex()
+                    if pc == DIALOG_RESULT:
+                        # The stop is at the function's entry: the result is its argument, and the
+                        # record's status still holds the old value.
+                        row['result'] = m.word(regs['esp'] + 4)
                 except MemoryError as e:
                     row['error'] = str(e)
                 event(**row)
@@ -864,9 +961,9 @@ def main():
                 if pc == DIALOG_SHOW:
                     dialog_pending = True
                     if answerer and updates + 1 >= args.answer_from:
-                        answerer.shown(updates + 1)
+                        answerer.shown(updates + 1, record)
                 elif pc == DIALOG_RESULT and answerer:
-                    answerer.answered()
+                    answerer.answered(record)
                 if pc == DIALOG_SHOW:
                     save_status(dialog=dict(update=updates + 1, record=record, shown=time.time()))
             if not foreign and live_watches:

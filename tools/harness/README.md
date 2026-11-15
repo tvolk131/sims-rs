@@ -108,7 +108,11 @@ Things to know:
   `--full 1-20,30-44000/10 --around 20 --before-hour 10`. `--around N`
   saves the update in which an object appears on or leaves the registry, a
   dialog is shown, or the hour turns, and the N updates after it
-  (`objects_changed` and `hour_turned` events name what happened).
+  (`objects_changed` and `hour_turned` events name what happened). The
+  registry and the clock are compared from update 1's entry on, and every
+  object's ID is read again at each return (an object made at a freed
+  object's address is another object; the IDs of about 330 objects lie on
+  about 80 pages).
   `--before-hour B` saves the last B updates before each hour turns. With
   either, every line of `updates.jsonl` also has the clock (`clock`:
   globals 0, 5 and 6), the date globals 1 to 3, 7 and 8 (`date`) and the
@@ -122,8 +126,12 @@ Things to know:
   seconds, and again every 150 seconds, three times at most. Many notices
   close on their own (one at 7:00 did, in update 901 of the Goth house);
   this only keeps a run from waiting forever. Each press is logged
-  (`dialog_auto_answer`, and `input-log.txt`), and `dialog_result` has the
-  answer. Answer the first dialogs (updates 1 and 2) by hand as above:
+  (`dialog_auto_answer`, and `input-log.txt`). The dialogs are told apart
+  by their record: a result ends its own dialog's presses, and a press job
+  the guest has not run yet is cancelled (`dialog_auto_answer_cancelled`;
+  the job checks its `.cancel` file right before it presses). The result
+  is `dialog_result`'s `result`, the function's argument: the stop is at
+  its entry, where the record's `status` still holds the old value. Answer the first dialogs (updates 1 and 2) by hand as above:
   Return may not be the answer wanted there.
 - **Manifest.** `python3 tools/harness/manifest.py <capture dir> --house
   'UserData/Houses/House05.iff (the Goths)' --note '...'` writes
@@ -134,7 +142,11 @@ Things to know:
   relay while the guest is stopped, so the run never detaches. Then start
   `capture.py` again with the same arguments plus `--resume`. It continues the
   same directory and numbering, and redoes the update it was in the middle of
-  (and a dump it was in the middle of).
+  (and a dump it was in the middle of). The events that update's return wrote
+  are dropped first and written again (`resume_dropped`). The registry of the
+  last recorded return comes from `status.json` (`registry_unknown` if it is
+  of another update), and the dialogs still waiting for a result are taken
+  up again (`resume_open_dialogs`).
 - **Memory dumps.** `--dump 14,47 --guest-dir <guest dir>` also saves,
   at the entry of each listed lot update, every present user page of the
   game's process (`dump-NNNN/`; update 1's entry is the baseline's stop). QEMU writes each range into the guest
@@ -290,7 +302,7 @@ python3 -B -m unittest discover -s tools/harness -p 'test_*.py'
 | `full-state.json.gz` | In both kinds of directory: the registry, the neighborhood, and the object and animator pointers. |
 | `pages.json.gz` | In both kinds of directory: the memory pages of the people and their animators. |
 | `updates.jsonl` | One line per lot update: the tick, whether it was a full pass, the three random streams and the scheduler cursor; with `--around` or `--before-hour` also the clock, the date and the object count, and for a saved update why it was saved. |
-| `events.jsonl` | The dialog functions passed (each record, its status and modal byte), the baseline, other stops, the game's identity (`game_identity`), the watch events, and with `--around` the objects that appeared or left (`objects_changed`), the hours turned (`hour_turned`) and the presses of `--answer-stuck` (`dialog_auto_answer`). |
+| `events.jsonl` | The dialog functions passed (each record, its status and modal byte; a result also has `result`), the baseline, other stops, the game's identity (`game_identity`), the watch events, and with `--around` the objects that appeared or left (`objects_changed`), the hours turned (`hour_turned`) and the presses of `--answer-stuck` (`dialog_auto_answer`). |
 | `dump-NNNN/` | With `--dump`: the user memory at the entry of lot update N. `ranges.json` lists the ranges (start, size, protection, file); `registers.json` holds the stop's registers and the stub's whole register packet. |
 | `watch.jsonl` | With `--watch`: one line per write to a watched address (see above). |
 | `status.json` | Progress, and `game_identity`: the digests `launch.sh` verified, or null if the game was not started by it. |

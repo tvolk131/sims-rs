@@ -54,7 +54,8 @@ class BuildTest(unittest.TestCase):
                 dict(kind='baseline', tick=99, lot=5, time=1),
                 dict(kind='dialog_show', update=1, record=7, time=10),
                 dict(kind='dialog_auto_answer', update=1, press=1, time=20),
-                dict(kind='dialog_result', update=1, status=1, time=30.5),
+                dict(kind='dialog_result', update=1, record=7, status=1, stack='795d4300' + '03000000' + '00' * 24,
+                     time=30.5),
                 dict(kind='hour_turned', update=2, tick=101, clock=[7, 0, 0], date=[1, 2, 3, 4, 5], time=40),
                 dict(kind='objects_changed', update=2, tick=101, added=[dict(id=8, pointer=1)], removed=[],
                      count=3, time=41)])
@@ -67,12 +68,33 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(m['full_state']['updates'], '1,2')
         self.assertEqual(m['full_state']['by_reason'], {'dialog': '1', 'full': '1', 'hour': '2'})
         self.assertTrue(m['full_state']['entry_0000'])
-        self.assertEqual(m['dialogs'], [dict(update=1, record=7, result=1, result_update=1, auto_presses=1,
-                                             seconds_open=20.5)])
+        # The result is the argument on the stack (3), not the record's status before the call (1).
+        self.assertEqual(m['dialogs'], [dict(update=1, record=7, result=3, result_update=1, auto_presses=1,
+                                             cancelled_presses=0, seconds_open=20.5)])
         self.assertEqual(m['objects_changed'], [dict(update=2, tick=101, added=[8], removed=[], count=3)])
         self.assertEqual(m['presses'], [dict(time='2026-11-15T14:37:47Z', label='enter goth',
                                              command='click 658 214 15')])
         self.assertEqual((m['house'], m['notes'], m['baseline']), ('House05', ['a note'], dict(tick=99, lot=5)))
+
+
+class DialogsTest(unittest.TestCase):
+    def test_overlapping_dialogs_are_paired_by_record(self):
+        events = [dict(kind='dialog_show', update=1, record=0xa, time=0),
+                  dict(kind='dialog_show', update=2, record=0xb, time=5),
+                  dict(kind='dialog_auto_answer', update=1, record=0xa, press=1, time=6),
+                  dict(kind='dialog_result', update=3, record=0xa, result=2, time=10),
+                  dict(kind='dialog_auto_answer_cancelled', update=2, record=0xb, jobs=[4, 5], time=11),
+                  dict(kind='dialog_result', update=4, record=0xb, result=3, time=20)]
+        self.assertEqual(manifest.dialog_rows(events), [
+            dict(update=1, record=0xa, result=2, result_update=3, auto_presses=1, cancelled_presses=0,
+                 seconds_open=10),
+            dict(update=2, record=0xb, result=3, result_update=4, auto_presses=0, cancelled_presses=2,
+                 seconds_open=15)])
+
+    def test_a_turn_written_twice_is_counted_once(self):
+        hours = [dict(update=10, tick=100, clock=[7, 0, 0]), dict(update=10, tick=100, clock=[7, 0, 0]),
+                 dict(update=43210, tick=43300, clock=[7, 0, 0])]
+        self.assertEqual(manifest.day_length(hours)['ticks'], 43200)
 
 
 if __name__ == '__main__':

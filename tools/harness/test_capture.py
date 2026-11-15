@@ -98,7 +98,7 @@ class FakeMemory:
     def word(self, p):
         words = {0x20000 + 0xb0: 0x30000, 0x30000 + 0x18: 0x40000, 0x30000 + 0x1c: 0x40004, 0x40000: 0x50000,
                  0x50000 + 0x118: 0x60000, 0x50000 + 0xadc: self.remote.current.get('animator', 0x70000),
-                 0x20000 + 0x98: 100}
+                 0x20000 + 0x98: 100, 0x90010 + 4: self.remote.current.get('result', 0)}
         return words.get(p, 0)
 
     def words(self, p, n, width=4):
@@ -108,7 +108,8 @@ class FakeMemory:
         return 2
 
     def object_id(self, p):
-        return 259 if p == 0x50000 else 0
+        ids = self.remote.current.get('ids', {0x50000: 259})
+        return ids.get(p, 0)
 
     def byte(self, p):
         return 1
@@ -289,8 +290,11 @@ class CaptureTest(unittest.TestCase):
 class SparseTest(CaptureTest):
     """--around and --before-hour: which updates are saved, and why."""
 
-    def updates(self, stops, extra):
-        _, output, _ = self.run_capture([dict(pc=0), dict(pc=capture.ENTRY)] + stops, extra)
+    def updates(self, stops, extra, entry=None):
+        # By default update 1's entry has the first return's objects and clock (nothing changes in update 1).
+        if entry is None:
+            entry = {k: stops[0][k] for k in ('objects', 'clock', 'ids') if k in stops[0]}
+        _, output, _ = self.run_capture([dict(pc=0), dict(pc=capture.ENTRY, **entry)] + stops, extra)
         return output, self.rows(output / 'updates.jsonl')
 
     def saved(self, rows):
@@ -352,6 +356,78 @@ class SparseTest(CaptureTest):
         rows = self.rows(output / 'updates.jsonl')[1:]
         self.assertEqual(self.saved(rows), {2: ['around'], 3: ['around']})
 
+    def test_an_object_made_at_a_freed_objects_address_is_another_object(self):
+        stops = [dict(pc=capture.RETURN, objects=[0x50000, 0x51000], ids={0x50000: 259, 0x51000: 7}),
+                 dict(pc=capture.RETURN, objects=[0x50000, 0x51000], ids={0x50000: 999, 0x51000: 7}),
+                 dict(pc=capture.RETURN, objects=[0x51000], ids={0x51000: 7})]
+        output, rows = self.updates(stops, ['--updates', '3', '--around', '1'])
+        changed = [(e['update'], e['added'], e['removed']) for e in self.events(output, 'objects_changed')]
+        self.assertEqual(changed, [(2, [dict(id=999, pointer=0x50000)], [dict(id=259, pointer=0x50000)]),
+                                   (3, [], [dict(id=999, pointer=0x50000)])])
+        self.assertEqual(self.saved(rows), {2: ['objects'], 3: ['objects']})
+
+    def test_a_change_in_update_1_is_seen(self):
+        stops = [dict(pc=capture.RETURN, objects=[0x50000], clock=[7, 0, 0])]
+        output, rows = self.updates(stops, ['--updates', '1', '--around', '1'],
+                                    entry=dict(objects=[0x50000, 0x51000], ids={0x50000: 259, 0x51000: 7},
+                                               clock=[6, 59, 58]))
+        self.assertEqual([e['removed'] for e in self.events(output, 'objects_changed')],
+                         [[dict(id=7, pointer=0x51000)]])
+        self.assertEqual([e['update'] for e in self.events(output, 'hour_turned')], [1])
+        self.assertEqual(self.saved(rows), {1: ['objects', 'hour']})
+
+    def test_the_result_is_the_argument(self):
+        _, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.DIALOG_SHOW),
+            dict(pc=capture.DIALOG_RESULT, result=3), dict(pc=capture.RETURN)], ['--updates', '1'])
+        self.assertEqual([e['result'] for e in self.events(output, 'dialog_result')], [3])
+        self.assertNotIn('result', self.events(output, 'dialog_show')[0])
+
+    def resumed_after(self, status, events=()):
+        """An earlier run recorded update 1 (registry [0x50000] -> 259) and was killed in update 2."""
+        def prepare(output):
+            rows = [dict(kind='baseline', cr3=GAME_CR3)] + list(events)
+            (output / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+            (output / 'updates.jsonl').write_text(json.dumps(dict(
+                update=1, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0, clock=[6, 59, 58])) + '\n')
+            (output / 'status.json').write_text(json.dumps(status))
+        return prepare
+
+    def test_a_resumed_run_knows_the_registry_and_redoes_the_return(self):
+        # Killed in update 2's return after its hour event was written: the event is dropped and written again.
+        hour = dict(kind='hour_turned', update=2, tick=100, clock=[7, 0, 0], previous=[6, 59, 58], time=1)
+        _, output, _ = self.run_capture(
+            [dict(pc=capture.RETURN, objects=[0x50000, 0x51000], ids={0x50000: 259, 0x51000: 7}, clock=[7, 0, 0])],
+            ['--updates', '2', '--around', '1', '--resume'],
+            prepare=self.resumed_after(dict(registry=[[0x50000, 259]], registry_update=1), [hour]))
+        self.assertEqual([e['update'] for e in self.events(output, 'hour_turned')], [2])
+        self.assertEqual([e['added'] for e in self.events(output, 'objects_changed')],
+                         [[dict(id=7, pointer=0x51000)]])
+        self.assertEqual(self.events(output, 'resume_dropped')[0]['events'], [dict(kind='hour_turned', update=2)])
+        status = json.loads((output / 'status.json').read_text())
+        self.assertEqual((status['registry'], status['registry_update']), ([[0x50000, 259], [0x51000, 7]], 2))
+
+    def test_a_registry_from_another_update_is_not_used(self):
+        _, output, _ = self.run_capture(
+            [dict(pc=capture.RETURN, objects=[0x50000, 0x51000], ids={0x50000: 259, 0x51000: 7})],
+            ['--updates', '2', '--around', '1', '--resume'],
+            prepare=self.resumed_after(dict(registry=[], registry_update=0)))
+        self.assertEqual(self.events(output, 'objects_changed'), [])
+        self.assertEqual(len(self.events(output, 'registry_unknown')), 1)
+
+    def test_a_resumed_run_knows_the_open_dialog(self):
+        shown = dict(kind='dialog_show', update=2, record=0x4000, time=1)
+        with tempfile.TemporaryDirectory(prefix='sims-guest-test-') as guest_dir, \
+                patch.object(capture, 'DialogAnswerer') as answerer:
+            _, output, _ = self.run_capture(
+                [dict(pc=capture.RETURN, clock=[6, 59, 58])],
+                ['--updates', '2', '--around', '1', '--resume', '--answer-stuck', '100', '--answer-from', '2',
+                 '--guest-dir', guest_dir],
+                prepare=self.resumed_after(dict(registry=[[0x50000, 259]], registry_update=1), [shown]))
+        answerer.return_value.shown.assert_called_once_with(2, 0x4000)
+        self.assertEqual(self.events(output, 'resume_open_dialogs')[0]['dialogs'], [dict(record=0x4000, update=2)])
+        self.assertEqual(self.saved(self.rows(output / 'updates.jsonl')), {2: ['dialog']})
+
     def test_negative_windows_are_refused(self):
         with self.assertRaises(SystemExit), patch.object(sys, 'stderr', io.StringIO()):
             self.run_capture([dict(pc=0)], ['--around', '-1'])
@@ -365,7 +441,11 @@ class DialogAnswererTest(unittest.TestCase):
         a = capture.DialogAnswerer(Path(temporary.name), '0xe00013', after, lambda **r: events.append(r),
                                    Path(temporary.name) / 'input-log.txt', tries=2)
         self.addCleanup(a.close)
-        patcher = patch.object(capture.guest_jobs, 'submit', side_effect=lambda share, s: jobs.append(s) or len(jobs))
+        def submit(share, script):
+            (share / 'cmd').mkdir(exist_ok=True)
+            jobs.append(script)
+            return len(jobs)
+        patcher = patch.object(capture.guest_jobs, 'submit', side_effect=submit)
         patcher.start()
         self.addCleanup(patcher.stop)
         return a, events, jobs, Path(temporary.name) / 'input-log.txt'
@@ -389,6 +469,43 @@ class DialogAnswererTest(unittest.TestCase):
         time.sleep(0.3)
         self.assertEqual((events, jobs), ([], []))
 
+    def test_a_result_ends_only_its_own_dialogs_presses(self):
+        a, events, jobs, _ = self.answerer(after=0.1)
+        a.shown(5, 0xa)
+        a.shown(6, 0xb)
+        a.answered(0xb)
+        time.sleep(0.15)
+        a.answered(0xa)
+        time.sleep(0.2)
+        self.assertEqual([(e['kind'], e['update'], e['record']) for e in events],
+                         [('dialog_auto_answer', 5, 0xa), ('dialog_auto_answer_cancelled', 5, 0xa)])
+
+    def test_a_result_cancels_a_press_already_handed_to_the_guest(self):
+        a, events, jobs, _ = self.answerer(after=0.05)
+        a.shown(5, 0xa)
+        deadline = time.time() + 5
+        while not jobs and time.time() < deadline:
+            time.sleep(0.01)
+        a.answered(0xa)
+        cancel = a.share / 'cmd' / '00001.cancel'
+        self.assertTrue(cancel.exists())
+        self.assertEqual(events[-1]['jobs'], [1])
+        # The job itself: with its .cancel file present it stops before the press.
+        bin_ = a.share / 'bin'
+        bin_.mkdir()
+        fake = bin_ / 'xdotool'
+        fake.write_text('#!/bin/sh\necho "$@" >> "$XDOTOOL_LOG"\n')
+        fake.chmod(0o755)
+        job = a.share / 'cmd' / '00001.sh'
+        job.write_text(jobs[0])
+        env = dict(os.environ, PATH=f'{bin_}:{os.environ["PATH"]}', XDOTOOL_LOG=str(a.share / 'xdotool.log'))
+        r = subprocess.run(['/bin/sh', str(job)], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 3)
+        self.assertNotIn('key Return', (a.share / 'xdotool.log').read_text())
+        cancel.unlink()
+        subprocess.run(['/bin/sh', str(job)], env=env, check=True)
+        self.assertIn('key Return', (a.share / 'xdotool.log').read_text())
+
     def test_only_the_open_dialog_is_pressed(self):
         a, events, jobs, _ = self.answerer(after=0.1)
         a.shown(5)
@@ -397,7 +514,8 @@ class DialogAnswererTest(unittest.TestCase):
         time.sleep(0.15)
         a.answered()
         time.sleep(0.2)
-        self.assertEqual([e['update'] for e in events], [6])
+        self.assertEqual([e['update'] for e in events if e['kind'] == 'dialog_auto_answer'], [6])
+        self.assertEqual([e['update'] for e in events if e['kind'] == 'dialog_auto_answer_cancelled'], [6])
 
 
 class PagesTest(unittest.TestCase):
