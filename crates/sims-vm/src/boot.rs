@@ -695,6 +695,31 @@ impl Lot {
         self.select_with(person, crate::Refresh::Fail)
     }
 
+    /// Sets the game's speed between ticks, as the panel's speed buttons
+    /// do ([`sims_sim::speed`], `0x46d697`): globals 16 and 18. Returns
+    /// the milliseconds the original waits between two lot updates at
+    /// that speed; when to step is the caller's.
+    pub fn set_speed(&mut self, speed: i32) -> Result<u32, OrderError> {
+        self.ready()?;
+        Ok(self.world.set_speed(speed))
+    }
+
+    /// Pauses the game between ticks (`0x46d813`): global 17 is set, and
+    /// each step from now on is a partial pass in which the clock stands.
+    /// The original goes on updating the lot while paused, so the caller
+    /// should go on stepping it. Returns whether the game was running.
+    pub fn pause(&mut self) -> Result<bool, OrderError> {
+        self.ready()?;
+        Ok(self.world.pause())
+    }
+
+    /// Runs the game again between ticks (`0x46d83a`): global 17 is
+    /// cleared. Returns whether the game was paused.
+    pub fn unpause(&mut self) -> Result<bool, OrderError> {
+        self.ready()?;
+        Ok(self.world.unpause())
+    }
+
     /// [`Lot::select`] for play mode: the deselected Sim's animator
     /// refresh, which is not ported, is left out
     /// ([`crate::Refresh::Skip`]), so its animator, head and person words

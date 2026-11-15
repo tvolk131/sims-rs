@@ -41,11 +41,26 @@ fn the_goths_play_and_are_drawn() {
     game.resize([800, 600]);
     let canvas = game.render();
     assert_eq!((canvas.width, canvas.height), (800, 600));
-    // Paused, the lot owes no ticks however long it waits.
-    game.pace.toggle_pause();
-    assert_eq!(game.advance(10_000_000), 0);
-    game.pace.toggle_pause();
+    // A tick every 42 ms at normal speed.
     assert_eq!(game.advance(100_000), 2);
+    // Paused, the lot goes on ticking, but its clock stands.
+    let clock = |game: &Game| {
+        let world = game.lot().world();
+        (world.ticks, world.globals[5], world.globals[6])
+    };
+    let before = clock(&game);
+    game.toggle_pause();
+    assert!(game.paused());
+    assert_eq!(game.advance(420_000), 10);
+    assert_eq!(clock(&game), before);
+    game.toggle_pause();
+    assert!(!game.paused());
+    // Ultra speed is a tick every 2 ms, and the simulation's speed is 994.
+    game.set_speed(sims_ui::command::Speed::Ultra);
+    assert_eq!(game.lot().world().speed(), 994);
+    assert_eq!(game.advance(20_000), 10);
+    assert_eq!(game.lot().world().ticks, before.0.wrapping_add(10));
+    assert_eq!(game.stopped(), None);
 }
 
 #[test]

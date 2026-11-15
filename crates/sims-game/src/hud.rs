@@ -115,7 +115,7 @@ impl Hud {
     }
 
     /// Draws the panel over the lot in `canvas`, from `world` as it is
-    /// now, with the speed and pause of `pace`, and `status` (a line
+    /// now, with the speed of `pace`, and `status` (a line
     /// across the top) if there is one.
     pub fn draw(
         &mut self,
@@ -139,9 +139,8 @@ impl Hud {
             zoom_out: camera.zoom != Zoom::Far,
         };
         self.controls.speed = pace.speed;
-        let mut snapshot = Snapshot::read(world, &self.members);
-        // The game pauses by not stepping the lot; the button shows it.
-        snapshot.paused |= pace.paused;
+        // The pause button shows global 17, which the game's pause sets.
+        let snapshot = Snapshot::read(world, &self.members);
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         self.read_dialog(world, assets);
         let (width, height) = (

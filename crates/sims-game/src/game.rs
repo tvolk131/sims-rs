@@ -14,12 +14,12 @@
 
 use crate::hud::Hud;
 use crate::menu::{self, Listing, Menu};
-use crate::pace::Pace;
+use crate::pace::{self, Pace};
 use crate::people::People;
 use crate::pick;
 use crate::view::{Move, View};
 use sims_render::{Canvas, Selected, Walls, open_house};
-use sims_ui::command::{Camera as UiCamera, Command, Walls as UiWalls};
+use sims_ui::command::{Camera as UiCamera, Command, Speed, Walls as UiWalls};
 use sims_vm::SoundEvent;
 use sims_vm::boot::{Frames, Lot, StepError};
 use sims_vm::play::{Recovery, ScriptError};
@@ -205,6 +205,36 @@ impl Game {
     /// Problems drawing the people, one line each.
     pub fn problems(&self) -> &[String] {
         &self.people.problems
+    }
+
+    /// Sets the game's speed, as the panel's speed buttons do: the
+    /// simulation's speed ([`Lot::set_speed`]) and the time between ticks
+    /// with it. A lot that cannot take it keeps its speed, and the note
+    /// across the top says why.
+    pub fn set_speed(&mut self, speed: Speed) {
+        match self.lot.set_speed(i32::from(pace::level(speed))) {
+            Ok(_) => self.pace.set_speed(speed),
+            Err(e) => self.note = Some(format!("The speed was not changed: {e}")),
+        }
+    }
+
+    /// Whether the game is paused (global 17).
+    pub fn paused(&self) -> bool {
+        self.lot.world().paused()
+    }
+
+    /// Pauses the game, or runs it again, as the panel's pause button
+    /// does. A paused lot goes on ticking, with its clock standing
+    /// ([`Lot::pause`]).
+    pub fn toggle_pause(&mut self) {
+        let result = if self.paused() {
+            self.lot.unpause().map(|_| self.pace.restart())
+        } else {
+            self.lot.pause().map(|_| ())
+        };
+        if let Err(e) = result {
+            self.note = Some(format!("The pause was not changed: {e}"));
+        }
     }
 
     /// Runs the ticks owed after `elapsed_us` more microseconds. Returns
@@ -569,11 +599,11 @@ impl Game {
         };
         match command {
             Command::SetSpeed(speed) => {
-                self.pace.set_speed(speed);
+                self.set_speed(speed);
                 Outcome::redraw()
             }
             Command::TogglePause => {
-                self.pace.toggle_pause();
+                self.toggle_pause();
                 Outcome::redraw()
             }
             Command::Camera(camera) => match camera {

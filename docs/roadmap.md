@@ -2073,11 +2073,10 @@ through their public interfaces only; the simulation never depends on it.
 
 - **Done: the window.** `cargo run --release -p sims-game` boots the
   Goths' house (`SIMS_INSTALL`, `House05.iff`, answering No to the Help
-  System) and runs it in strict mode, a tick every 50 ms at normal
-  speed. The lot, its people (hidden by the walls, furniture and floors
+  System) and runs it in strict mode at the original's pace (below).
+  The lot, its people (hidden by the walls, furniture and floors
   in front of them) and the panel over both are drawn every tick; the clock, funds and needs on the panel are the live
-  world's. The panel's speed, pause and camera buttons work (the game
-  paces the lot; the simulation's own speed global is not touched).
+  world's. The panel's speed, pause and camera buttons work.
   The first error stops the lot, which stays on screen as it was with
   the failure across the top. `--play` runs it in play mode instead: an
   object whose tick fails is reset and the lot goes on, and each new
@@ -2128,6 +2127,16 @@ through their public interfaces only; the simulation never depends on it.
   Since #156 strict mode runs the order through step 3400 and stops at
   step 3401 (person 16 routes for an action that wants to be
   interrupted, 0x45afd2); without an order it runs to tick 2881.
+- **Done: the speed and the pause.** The panel's speed buttons set the
+  simulation's speed as the original's setter does (`0x46d697`, globals
+  16 and 18, `sims_sim::speed`): 760, 924 and 994. The window ticks at
+  the setter's period for that speed: 42, 14 and 2 ms. The pause button
+  and space set global 17 (`0x46d813`, `0x46d83a`), and the lot goes on
+  ticking with its clock standing, as the original's does: every pass is
+  a partial one. The Goths' house runs 200 such ticks in strict mode.
+  Not ported: the speed of 1000 the idle loop (`0x46d9d6`) sets for a
+  while on the household's home lot when a check over its people
+  (`0x442f9b`) fails, and goes back from when it passes.
 - **Done in play mode: selecting a Sim.** A press on a portrait selects
   that Sim (0x445449, between ticks): the Sim selected before is
   deselected, the indicators move, and the panel and the pie menus
@@ -2146,8 +2155,8 @@ through their public interfaces only; the simulation never depends on it.
     beside the depth), so a click picks the object under it. Today
     `sims-game` guesses from each object's tile.
   - `sims-vm`: a way to answer a dialog from the window (the `Lot`'s
-    player is a fixed answer list given at load), and to change the
-    game's speed global. A play-mode step that fails should still hand
+    player is a fixed answer list given at load). A play-mode step that
+    fails should still hand
     back the errors it caught before failing, and say which frame
     (before or after the tick) was skipped.
   - `sims-people`: which person drew each pixel (`draw_on_lot` with an

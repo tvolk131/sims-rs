@@ -4,6 +4,54 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: The game's speed and pause are the simulation's globals
+
+The window paced the lot by itself: a tick every 50 ms at normal speed,
+a third and a tenth of that faster, and no ticks while paused. The
+simulation's globals were not touched. The original's code says
+otherwise, so the window now does what its buttons do. Read from the
+disassembly; none of it is checked against a run.
+
+- The speed buttons call the setter (`0x46d697`) with 760 (normal,
+  `0x4425a2`), 924 (fast, `0x46d264`) or 994 (ultra, `0x46d26a`). The
+  setter clamps the speed to 0 to 1000 and keeps it in global 16. While
+  global 18 is not negative, it keeps it there too. The time between
+  two lot updates is 172 − speed × 0.001 × 171 ms, plus 0.5 and
+  truncated (constants at `0x666a24`, `0x667720`, `0x66771c` and
+  `0x667270`). That is 42, 14 and 2 ms. `sims_sim::speed` ports this,
+  and `Lot::set_speed` takes it between ticks.
+- The idle loop (`0x46d9d6`) runs an update each time a period has
+  passed. The update (`0x46d345`) never reads the speed. The speed
+  reaches the simulation only as globals 16 and 18. What reads them
+  there was not looked for.
+- Pausing (`0x46d813`) sets global 17, and running again (`0x46d83a`)
+  clears it. The idle loop does not look at it, so a paused game goes
+  on updating the lot. Each pass is then a partial one (`0x46d553`,
+  already ported): only objects with scheduler flag 2 run,
+  and the clock stands. `Lot::pause` and `Lot::unpause` do this. The
+  window goes on stepping a paused lot. Strict mode on the Goths' house
+  runs 200 paused ticks, and its clock stands through them.
+- **Unverified:**
+  - The pause is refused while a field of the interface
+    (`[0x6f2a58]+0x7c`) is not 0. Here it is never refused.
+  - The setter and running again restart the idle loop's clocks
+    (`+0xb8`, `+0xbc`), after which an update may be due at once. Here
+    the time owed starts again from 0.
+  - The original also caps how far it catches up (`0x4732de`). We keep
+    our cap of 20 ticks a call.
+  - Message 0xc2, which the setter and the pause send to the interface,
+    and its effect on the sounds, are not ported.
+- **Not ported:** on the household's home lot (`0x40745f`), the idle
+  loop sets a speed of 1000 for a while (`0x46d790`, keeping the speed
+  to go back to in global 18) whenever a check over the registry's
+  people (`0x442f9b`) fails. It goes back (`0x46d7db`) when the check
+  passes. What the check asks was not read in full. It reads people's
+  `+0x8e` and `+0x60e` and calls `0x45edc5`, which looks like asking
+  whether everyone is asleep or away. The Goths' morning never sets it,
+  since global 18 stays −1. A full day might.
+- Strict `sims boot` never calls any of these, so its output is
+  unchanged.
+
 ## 2026-11-15: The reload makes a record for each person type without one; UserData2 to 8 load
 
 The houses of UserData2 to UserData8 failed before any tick: "the person
