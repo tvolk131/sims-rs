@@ -21,6 +21,7 @@ use crate::camera::Zoom;
 use crate::canvas::Image;
 use crate::{Error, Result};
 use sims_content::{Catalog, Index, Install};
+use sims_formats::execution::Slots;
 use sims_formats::iff::Iff;
 use sims_formats::sprite::{DrawGroup, LegacySpriteSet, Palette, SpriteSet};
 use std::collections::BTreeMap;
@@ -58,6 +59,11 @@ pub struct Definition {
     /// The first SPR# of that shape (OBJD byte 0xa2): full walls at
     /// `+ 0, 1, 2` by zoom, cut walls at `+ 3, 4, 5`.
     pub wall_shape: u16,
+    /// Where the object holds what it contains: its SLOT entries of kind
+    /// 0, in order (an object's data word 3 picks one). x and y are in
+    /// sixteenths of a tile in the object's own frame, z is the height
+    /// the entry's category sets, in height units (see [`slot_height`]).
+    pub slots: Vec<[f32; 3]>,
 }
 
 impl Definition {
@@ -221,6 +227,17 @@ impl Assets {
             data.get(n * 2..n * 2 + 2)
                 .map_or(0, |b| i16::from_le_bytes([b[0], b[1]]))
         };
+        let slots = iff
+            .get(b"SLOT", word(20) as u16)
+            .and_then(|c| Slots::parse(iff.data(c)).ok())
+            .map(|s| {
+                s.entries
+                    .iter()
+                    .filter(|e| e.kind == 0)
+                    .map(|e| [e.offset[0], e.offset[1], slot_height(e.height, e.offset[2])])
+                    .collect()
+            })
+            .unwrap_or_default();
         Some(Definition {
             resource: object.resource,
             graphic: word(3) as u16,
@@ -228,6 +245,7 @@ impl Assets {
             dynamic_base: word(0x80 / 2),
             wall_style: word(0x5c / 2),
             wall_shape: word(0xa2 / 2) as u16,
+            slots,
         })
     }
 
@@ -291,6 +309,22 @@ impl Assets {
             self.object_shapes.insert(key, shape);
         }
         self.object_shapes[&key].as_ref()
+    }
+}
+
+/// The height a SLOT entry holds its object at, in height units: set by
+/// the entry's height category (low table 2.5, table and end table 4,
+/// counter 4.05), or the entry's own z for the categories that keep it.
+/// This is the original's conversion as the old prototype read it and
+/// checked against the original's values
+/// (`legacy/crates/sims-vm/src/routing.rs`, `containment_height`).
+pub fn slot_height(category: i32, z: f32) -> f32 {
+    match category {
+        1 => 0.0,
+        2 => 2.5,
+        3 | 8 => 4.0,
+        4 => f32::from_bits(0x4081_999a),
+        _ => z,
     }
 }
 

@@ -629,18 +629,22 @@ impl Painter<'_> {
             if !self.lot.contains(tile[0], tile[1]) {
                 continue;
             }
+            let Some(([x, y], lift)) = held(self.world, self.assets, id) else {
+                continue;
+            };
             let view = self.camera.rotate_fine([x, y]);
             // The ground under the object: the mean of its tile's corners.
             let ground = (0..4)
                 .map(|c| self.corner_elevation([tile[0] + (c & 1), tile[1] + (c >> 1)]))
                 .sum::<i32>()
                 / 4;
-            let anchor = depth::point(view, level_elevation(level) + ground);
-            list.push((anchor, id, view, ground));
+            let up = (lift * 16.0).round() as i32;
+            let anchor = depth::point(view, level_elevation(level) + ground + up);
+            list.push((anchor, id, view, ground, [x, y], lift));
         }
         // Far objects first, so soft edges blend over what is behind them.
-        list.sort_by_key(|&(d, id, _, _)| (std::cmp::Reverse(d), id));
-        for (anchor, id, view, ground) in list {
+        list.sort_by_key(|&(d, id, ..)| (std::cmp::Reverse(d), id));
+        for (anchor, id, view, ground, place, lift) in list {
             let o = &self.world.objects[&id];
             let Some(definition) = self.assets.definition(o.guid) else {
                 self.stats.missing_objects += 1;
@@ -690,6 +694,9 @@ impl Painter<'_> {
                 // Offsets come from the files and may be anything; the
                 // canvas clips whatever this gives.
                 let height = i32::try_from(part.image.height).unwrap_or(i32::MAX);
+                // A held object stands on its holder's slot: the slot's
+                // height adds to the sprite's own.
+                let object = [part.object[0], part.object[1], part.object[2] + lift];
                 let at = [
                     screen[0]
                         .saturating_add(part.offset[0])
@@ -697,12 +704,12 @@ impl Painter<'_> {
                     screen[1]
                         .saturating_add(part.offset[1])
                         .saturating_sub(height)
-                        .saturating_sub(sprite_rise(part.object, self.camera.zoom)),
+                        .saturating_sub(sprite_rise(object, self.camera.zoom)),
                 ];
                 let anchor = if part.object == [0.0; 3] {
                     anchor
                 } else {
-                    part_anchor(self.camera, o.position, facing, part.object, base)
+                    part_anchor(self.camera, [place[0], place[1], 0], facing, object, base)
                 };
                 self.canvas
                     .draw_lit(&part.image, at, part.flip, light, |_, _, byte| {
@@ -717,6 +724,54 @@ impl Painter<'_> {
 /// An object's data word that hides it when not zero (the simulation's
 /// `HIDDEN`).
 const HIDDEN: usize = 34;
+
+/// The data words naming the object that holds this one and which of
+/// its slots it is in.
+const CONTAINER: usize = 2;
+const CONTAINER_SLOT: usize = 3;
+
+/// Where an object stands: its fine position and how far it is lifted,
+/// in height units. An object another holds (a lamp on an end table, a
+/// sink in a counter) stands at its holder's place plus the slot's
+/// offset, turned by the holder's facing, and up by the slot's height;
+/// the original adds these while it draws the holder's contents
+/// (0x437fdd, read by the old prototype in
+/// `legacy/crates/sims-render/src/lib.rs`). None when a holder is hidden.
+/// Objects a Sim holds stay at their own position.
+fn held(world: &World, assets: &mut Assets, id: u16) -> Option<([i32; 2], f32)> {
+    let mut cursor = world.objects.get(&id)?;
+    let mut offset = [0.0f32; 3];
+    // A chain longer than the lot has objects is a loop.
+    for _ in 0..world.objects.len() {
+        let container = cursor.data.get(CONTAINER).copied().unwrap_or(0);
+        let Some(holder) = u16::try_from(container)
+            .ok()
+            .filter(|&c| c != 0)
+            .and_then(|c| world.objects.get(&c))
+            .filter(|h| h.person.is_none())
+        else {
+            break;
+        };
+        if holder.data.get(HIDDEN).is_some_and(|&w| w != 0) {
+            return None;
+        }
+        let slot = usize::try_from(cursor.data.get(CONTAINER_SLOT).copied().unwrap_or(-1))
+            .ok()
+            .and_then(|i| assets.definition(holder.guid)?.slots.get(i).copied())
+            .unwrap_or_default();
+        let [mut x, mut y, z] = sprite_offset(slot);
+        for _ in 0..(i32::from(holder.data.get(1).copied().unwrap_or(0)) / 2).rem_euclid(4) {
+            (x, y) = (-y, x);
+        }
+        offset = [offset[0] + x, offset[1] + y, offset[2] + z];
+        cursor = holder;
+    }
+    let [x, y, _] = cursor.position;
+    Some((
+        [x + offset[0].round() as i32, y + offset[1].round() as i32],
+        offset[2],
+    ))
+}
 
 /// A draw group sprite's world offset (`object`), made safe: x and y in
 /// sixteenths of a tile, z in height units, finite and clamped to a lot's
