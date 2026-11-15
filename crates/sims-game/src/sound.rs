@@ -141,3 +141,30 @@ impl Mixer {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_requests_object_is_widened_without_its_sign() {
+        let play = event(sims_vm::SoundEvent::Play {
+            object: -1,
+            name: "door_open".into(),
+        });
+        assert!(
+            matches!(&play, SoundEvent::Play { object: 65535, name } if name == "door_open"),
+            "{play:?}"
+        );
+        let stop = event(sims_vm::SoundEvent::Stop { object: -32768 });
+        assert!(
+            matches!(stop, SoundEvent::StopObject { object: 32768 }),
+            "{stop:?}"
+        );
+        let stop = event(sims_vm::SoundEvent::Stop { object: 12 });
+        assert!(
+            matches!(stop, SoundEvent::StopObject { object: 12 }),
+            "{stop:?}"
+        );
+    }
+}

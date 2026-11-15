@@ -2072,8 +2072,10 @@ through their public interfaces only; the simulation never depends on it.
   `end_route` have no event in the install's sound files and play
   nothing.
 - **Done: a stopgap pie menu.** Clicking an object or a person opens a
-  list of its interactions at the pointer (each menu number once, named
-  by the object's TTAs strings, debug entries hidden); choosing one
+  list of the interactions an order on it is queued from (those of the
+  tile the simulation sends a multi-tile object's orders to; each menu
+  number once, named by that table's TTAs strings, debug entries
+  hidden); choosing one
   queues it for the selected Sim with `Lot::queue_interaction`, and the
   note across the top says whether it was queued. Escape closes the
   menu. The fridge lists Have A Snack, Have Lite Meal, Have A Meal,
@@ -2098,7 +2100,10 @@ through their public interfaces only; the simulation never depends on it.
   - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
     and dialogs are. `sims-game` draws a plain list until then.
   - `sims-vm`: Idle For Input starting a queued action (0x45dc14), and
-    the entries the pie menu offers a person on an object.
+    the entries the pie menu offers a person on an object, with their
+    labels' table. Until then, the tile an order on an object goes to
+    (`interaction_target`) and the ID and file of the TTAB it is queued
+    from, which `sims-game` now repeats from the program's data.
 
 ## Working rules
 

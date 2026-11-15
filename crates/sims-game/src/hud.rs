@@ -161,6 +161,11 @@ impl Hud {
             .message
             .as_ref()
             .and_then(|(m, _)| dialog::layout(view.size, m, &self.art));
+        // A dialog takes every press until it is answered, so a menu open
+        // under it is closed rather than left to be chosen from after.
+        if self.dialog.is_some() {
+            self.menu = None;
+        }
         if let (Some((message, _)), Some(layout)) = (&self.message, &self.dialog) {
             dialog::draw(
                 &mut frame,
@@ -211,7 +216,7 @@ impl Hud {
         };
         let entry = |pointer: Option<[i32; 2]>| {
             let menu = self.menu.as_ref()?;
-            menu.press(pointer?)
+            menu.row(pointer?)
         };
         let before = (
             hud::hovered(&self.items, self.controls.pointer),
@@ -233,8 +238,10 @@ impl Hud {
             return dialog::press(layout, point);
         }
         // A press anywhere closes the menu; one on an entry chooses it.
+        // `interaction` is the entry's index in the menu; the game reads
+        // its menu number from the menu it had open.
         if let Some(menu) = self.menu.take() {
-            let interaction = u16::try_from(menu.press(point)?).ok()?;
+            let interaction = u16::try_from(menu.row(point)?).ok()?;
             return Some(Command::ChooseInteraction {
                 sim: menu.person,
                 object: menu.object,

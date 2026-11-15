@@ -233,9 +233,7 @@ impl Game {
     /// Keeps a step's sound requests for the host, at most
     /// [`SOUNDS_KEPT`], the oldest dropped first.
     fn keep_sounds(&mut self, sounds: Vec<SoundEvent>) {
-        self.sounds.extend(sounds);
-        let over = self.sounds.len().saturating_sub(SOUNDS_KEPT);
-        self.sounds.drain(..over);
+        keep(&mut self.sounds, sounds, SOUNDS_KEPT);
     }
 
     fn stop(&mut self, error: &StepError) {
@@ -338,7 +336,7 @@ impl Game {
     pub fn press(&mut self, point: [i32; 2]) -> Outcome {
         let cleared = self.note.take().is_some();
         if self.hud.covers(point) {
-            // The menu's labels, to say what a choice queued.
+            // The menu, whose entries a choice is an index into.
             let menu = self.hud.menu.clone();
             return match self.hud.press(point) {
                 Some(command) => self.command(command, menu.as_ref()),
@@ -435,11 +433,14 @@ impl Game {
                 object,
                 interaction,
             } => {
-                let menu_number = u32::from(interaction);
-                let label = menu
-                    .and_then(|m| m.entries.iter().find(|e| e.menu == menu_number))
-                    .map_or_else(|| format!("interaction {interaction}"), |e| e.label.clone());
-                self.order(sim, object, menu_number, &label);
+                // `interaction` is the entry's index in the open menu.
+                match menu.and_then(|m| m.entries.get(usize::from(interaction))) {
+                    Some(entry) => {
+                        let (menu, label) = (entry.menu, entry.label.clone());
+                        self.order(sim, object, menu, &label);
+                    }
+                    None => self.note = Some(format!("No menu entry {interaction} to choose.")),
+                }
                 Outcome::redraw()
             }
             Command::TogglePanel | Command::OpenPanel(_) => Outcome::redraw(),
@@ -506,6 +507,14 @@ impl Errors {
         };
         Some(format!("Error caught{count}: {line}"))
     }
+}
+
+/// Adds `sounds` to the requests the host has yet to take, keeping at
+/// most `kept`: the oldest go first.
+fn keep(queue: &mut VecDeque<SoundEvent>, sounds: Vec<SoundEvent>, kept: usize) {
+    queue.extend(sounds);
+    let over = queue.len().saturating_sub(kept);
+    queue.drain(..over);
 }
 
 /// The lines for one update's caught errors, in the order they happened.
@@ -688,5 +697,27 @@ mod tests {
         assert_eq!(errors.count, count + 1);
         assert_eq!(errors.recent(400 + SHOWN_TICKS), None);
         assert_eq!(errors.lines.len(), LOGGED + 1);
+    }
+
+    #[test]
+    fn the_sound_queue_keeps_the_newest_and_hands_them_over_once() {
+        let play = |object: i16| SoundEvent::Play {
+            object,
+            name: format!("sound {object}"),
+        };
+        let mut queue = VecDeque::new();
+        keep(&mut queue, (0..3).map(play).collect(), 4);
+        keep(&mut queue, (3..6).map(play).collect(), 4);
+        // The two oldest are dropped; the rest stay in order.
+        assert_eq!(
+            Vec::from(queue.clone()),
+            (2..6).map(play).collect::<Vec<_>>()
+        );
+        keep(&mut queue, Vec::new(), 4);
+        assert_eq!(queue.len(), 4);
+        // Taking them empties the queue, as `Game::take_sounds` does.
+        let taken: Vec<_> = queue.drain(..).collect();
+        assert_eq!(taken.len(), 4);
+        assert!(queue.is_empty());
     }
 }

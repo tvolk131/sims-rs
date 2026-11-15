@@ -16,6 +16,11 @@
 //! floor, `1`/`2`/`3` walls up, cutaway and down, the arrows or a
 //! right-button drag scroll, space pauses, Escape quits.
 //!
+//! A left click on a person or an object opens its menu for the selected
+//! Sim; a click on an entry queues it, and a click anywhere else, or
+//! Escape, closes the menu. Escape quits only when no menu is open, and a
+//! held Escape's repeats do nothing.
+//!
 //! The lot runs in strict mode: the first error stops it, and the error
 //! is written across the top. `--play` runs it in play mode instead: an
 //! object whose tick fails is reset and the lot goes on, and each new
@@ -392,8 +397,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if event.logical_key == Key::Named(NamedKey::Escape) {
-                    // Escape closes the pie menu, else quits.
-                    if self.game.close_menu() {
+                    // Escape closes the pie menu, else quits. A repeat
+                    // does neither, so holding Escape to close a menu does
+                    // not quit.
+                    if event.repeat {
+                    } else if self.game.close_menu() {
                         self.changed(true);
                     } else {
                         event_loop.exit();

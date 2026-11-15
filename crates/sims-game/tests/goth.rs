@@ -178,3 +178,63 @@ fn the_fridge_and_the_bookshelf_offer_their_interactions() {
         "{queue:?}"
     );
 }
+
+#[test]
+fn a_tile_offers_the_menu_of_the_tile_its_orders_go_to() {
+    let Some(install) = install() else {
+        return;
+    };
+    let house = goth_house(&install);
+    let lot = sims_vm::boot::Lot::load(&install, &house, &[3], sims_vm::boot::Frames::default())
+        .expect("the Goth house boots");
+    let assets = open_house(&install, &house)
+        .expect("the house opens")
+        .assets;
+    let mut redirected = 0;
+    for &id in lot.world().objects.keys() {
+        let target = sims_game::menu::target(&lot, id).expect("a target");
+        let entries = sims_game::menu::entries(&lot, &assets, id).expect("the menu is read");
+        assert_eq!(
+            entries,
+            sims_game::menu::entries(&lot, &assets, target).expect("the menu is read"),
+            "object {id} and its target {target}"
+        );
+        if target != id {
+            redirected += 1;
+            assert!(
+                entries.iter().all(|e| !e.label.starts_with("Interaction ")
+                    || e.label.starts_with("Interaction - ")),
+                "object {id}: {entries:?}"
+            );
+        }
+    }
+    // The beds' and the guitar's other tiles send their orders on.
+    assert!(redirected >= 8, "{redirected}");
+    // An order on such a tile goes where the menu said it would.
+    let (tile, target, entry) = lot
+        .world()
+        .objects
+        .keys()
+        .find_map(|&id| {
+            let target = sims_game::menu::target(&lot, id).ok()?;
+            let entry = sims_game::menu::entries(&lot, &assets, id)
+                .ok()?
+                .first()?
+                .clone();
+            (target != id).then_some((id, target, entry))
+        })
+        .expect("a tile whose orders go to another");
+    let mut lot = lot;
+    let person = lot.world().selected().expect("a Sim is selected");
+    assert!(matches!(
+        lot.queue_interaction(person, tile, entry.menu),
+        Ok(Some(_))
+    ));
+    let queue = &lot.world().objects[&person].person.as_ref().unwrap().queue;
+    assert!(
+        queue
+            .iter()
+            .any(|a| a.target == target as i16 && a.table_index == entry.menu as i32),
+        "tile {tile}, target {target}: {queue:?}"
+    );
+}

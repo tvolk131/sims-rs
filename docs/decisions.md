@@ -6,27 +6,37 @@ says what was decided, why, and what would reopen it. Entries marked
 
 ## 2026-11-15: The game's pie menu is a list of the table's entries until the simulation offers them
 
-Clicking an object (or a person) in `sims-game` lists the entries of its
-interaction table, the table `Lot::queue_interaction` queues from
-(`Program::interactions`), each menu number once in table order, named
-by the TTAs string table with the TTAB's ID in the same file (found by
-matching the TTAB that reads as the simulation's table, in the object's
-file or its semi-global file). The original offers only the entries
-whose check passes for the selected Sim; that check is not run, so the
-list can hold entries the original would not offer, and choosing one
-queues it anyway. Entries with flag 0x80 are hidden: every Debug and
-Force entry of the Goths' house has it and nothing a player is offered
-there does (**unverified** as the original's debug flag). The menu is a
-plain list at the pointer, in columns when taller than the view, not
-the original's pie. Reopen when the simulation can list the entries it
+Clicking an object (or a person) in `sims-game` lists the entries of
+the interaction table `Lot::queue_interaction` queues from: that of the
+tile the simulation sends the order to (a multi-tile object's tile whose
+definition's word 8 is positive sends it to the tile whose word 8 is
+that number negated, as `interaction_target`, 0x435286, does), read with
+`Program::interactions`. Each menu number is listed once, in table
+order, named by the TTAs string table with the same ID as that TTAB, in
+the file that holds it. The game repeats the simulation's choice of
+tile and of TTAB ID from the program's public data, because the
+simulation keeps both private; it names the entries only when the table
+it finds is the very one `Program::interactions` returns.
+
+The original offers only the entries whose check passes for the selected
+Sim; that check is not run, so the list can hold entries the original
+would not offer, and choosing one queues it anyway. Entries with flag
+0x80 are hidden: every Debug and Force entry of the Goths' house has it
+and nothing a player is offered there does (**unverified** as the
+original's debug flag). The menu is a plain list at the pointer, not the
+original's pie: in columns when taller than the view, and as many
+columns as fit, the last row then saying how many entries are not shown.
+A dialog closes it. Reopen when the simulation can list the entries it
 would offer, or `sims-ui` draws the pie.
 
 ## 2026-11-15: The game plays the lot's sound requests as it wakes
 
 `sims-game` takes each step's `Update::sounds` and hands them, in
-order, to `sims-audio`'s player the next time the window wakes (every
-few milliseconds), so a sound starts within a wake of its tick; in strict mode, a step
-whose frame fails after its tick still hands its sounds over. `Play`
+order, to `sims-audio`'s player in the same wake of the window that ran
+the step (it wakes every few milliseconds). What is heard comes later by
+the output the player has already rendered, up to about 0.2 s. In strict
+mode, a step whose frame fails after its tick still hands its sounds
+over. `Play`
 is `Play` and `Stop` is `StopObject`. The simulation's 16-bit object ID
 is widened without its sign (**unverified**: what the original passes
 for a negative ID). Until the host takes them, the game keeps at most
