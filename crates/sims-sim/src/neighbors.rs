@@ -3,7 +3,7 @@
 //! The original keeps one record per neighbor in the neighborhood object
 //! (`[[0x6e48bc]+0x24]`), in a vector of record pointers at +0x148. It
 //! builds them when it reads the neighborhood file (NBRS, read by
-//! 0x42feb2) and rebuilds part of them each time it reloads the
+//! 0x430ad6, each record by 0x423e08) and rebuilds part of them each time it reloads the
 //! neighborhood (0x424806), before any lot loads. A lot's scripts read
 //! and write them: Set To Next walks them (modes 5 and 7), an expression
 //! reads a record's person data (scope 32), and Relationship keeps the
@@ -126,7 +126,7 @@ pub struct Item {
 }
 
 impl Neighbor {
-    /// A record as the reader (0x42feb2) leaves it.
+    /// A record as the reader (0x423e08) leaves it.
     pub fn read(saved: &Saved) -> Self {
         let mut data = vec![0; PERSON_WORDS];
         let saved_words = saved.person_data.len().min(PERSON_WORDS);
@@ -220,24 +220,52 @@ pub struct Registered {
     pub resolves: bool,
 }
 
-/// The registry of a catalog, in registration order.
-pub fn registry(catalog: &sims_content::Catalog) -> Vec<Registered> {
-    catalog
+/// The registry as the reload sees it, from the catalog built from
+/// `index`.
+///
+/// The catalog registers a neighborhood's characters where the index
+/// mounts them, before `Downloads` ([`sims_content::Index::add_characters`]).
+/// The reload reregisters them first (0x43c228, at 0x424a8b): it takes
+/// the old characters' definitions out and registers the new ones, which
+/// appends them to the vector and makes them the map's for their GUIDs. So
+/// here the definitions from the `Characters` mount come after every
+/// other, in their own order, and a GUID resolves to the last definition
+/// of it in that order.
+///
+/// Checked against a capture of the original's registry in the base
+/// neighborhood (the Newbie house's startup): the 463 definitions of
+/// [`RECORDED_KINDS`] come in the same order. Its whole vector differs
+/// from the catalog's in other places, which this does not use.
+pub fn registry(index: &sims_content::Index, catalog: &sims_content::Catalog) -> Vec<Registered> {
+    let character = |object: &&sims_content::Object| {
+        index.mounts[index.resources[object.resource].mount].path == "Characters"
+    };
+    let ordered: Vec<&sims_content::Object> = catalog
         .objects
         .iter()
+        .filter(|o| !character(o))
+        .chain(catalog.objects.iter().filter(|o| character(o)))
+        .collect();
+    let mut last = BTreeMap::new();
+    for (place, object) in ordered.iter().enumerate() {
+        last.insert(object.guid, place);
+    }
+    ordered
+        .iter()
         .enumerate()
-        .map(|(number, object)| Registered {
+        .map(|(place, object)| Registered {
             guid: object.guid,
             kind: object.kind,
-            resolves: catalog.by_guid.get(&object.guid) == Some(&number),
+            resolves: last[&object.guid] == place,
         })
         .collect()
 }
 
 impl World {
-    /// Reads the neighborhood's records (NBRS, 0x42feb2) and inventories
-    /// (NGBH, 0x4254f6), and does what the neighborhood's reload (0x424806)
-    /// does to the records before a lot loads. `registry` is every
+    /// Reads the neighborhood's records (NBRS, 0x430ad6) and inventories
+    /// (NGBH, 0x4254f6, which reads them with 0x42feb2), and does what the
+    /// neighborhood's reload (0x424806) does to the records before a lot
+    /// loads. `registry` is every
     /// definition the game has registered, in order ([`registry`]).
     ///
     /// An empty slot in the file's inventory vector fails: the original
@@ -254,7 +282,7 @@ impl World {
     ///    descending (0x425209), with an empty family 0 of number -1
     ///    added when the file has none;
     /// 4. makes a record for each registered definition, in registration
-    ///    order, of a type in [`RECORDED_KINDS`] that no record is linked
+    ///    order (the neighborhood's characters last, see [`registry`]), of a type in [`RECORDED_KINDS`] that no record is linked
     ///    to (0x424d40 to 0x424e82): a record is linked to the definition
     ///    its GUID resolves to, so a definition another of its GUID
     ///    replaced gets one too. The record (0x4257a5 with no slot asked
@@ -268,10 +296,16 @@ impl World {
     ///
     /// The record's name (+0x28, from the definition by 0x457e0e) is
     /// presentation and is not kept. Its friend count and whether that is
-    /// out of date (+0x20, +0x24) are left as the allocator returned them;
-    /// nothing reads them before a relationship write marks the count out
-    /// of date, and here they are 0 and out of date, as for a record read
-    /// from the file.
+    /// out of date (+0x20, +0x24) are left as the allocator returned them.
+    /// The original can read them before a relationship write marks the
+    /// count out of date: scope 24 field 5 (0x425c19, 0x427148) returns
+    /// the count as it is when the flag byte is 0. Here they are 0 and
+    /// out of date, as for a record read from the file, and that field is
+    /// not ported (it fails loudly), so nothing reads them.
+    ///
+    /// The original reads the records only when the neighborhood file has
+    /// an NGBH chunk (0x424a90; without one it makes every record). Here
+    /// they are read either way. Every shipped neighborhood has one.
     ///
     /// Steps 2, 3 and 5 are ported from the old prototype
     /// (legacy/crates/sims-vm/src/neighborhood.rs, `prepare_family_reload`

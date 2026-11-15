@@ -63,7 +63,10 @@ fn with_goth_people(
     let interpreter = Interpreter::new(&program, &catalog, Stream::Global);
     let mut world = World::empty();
     world
-        .read_neighbors(&neighborhood, &sims_sim::neighbors::registry(&catalog))
+        .read_neighbors(
+            &neighborhood,
+            &sims_sim::neighbors::registry(&index, &catalog),
+        )
         .unwrap();
     world.drop_empty_families().unwrap();
     world.type_attributes = program.type_attributes(&catalog).unwrap();
