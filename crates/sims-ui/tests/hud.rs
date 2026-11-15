@@ -44,7 +44,7 @@ fn the_goths_panel_from_the_original_art() {
         expanded: true,
         ..Controls::default()
     };
-    // The digests pin the drawing; docs/decisions.md says how it compares
+    // The digests pin the drawing; docs/decisions/ says how it compares
     // with the original's screen.
     let cases = [
         ([800, 600], Controls::default(), "closed 800x600"),
@@ -135,7 +135,7 @@ fn the_goths_personality_panel() {
     let items = hud::layout([800, 600], &opened.snapshot, &controls);
     hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
     // Pins the drawing; it has not been compared with the original's
-    // screen (see docs/decisions.md).
+    // screen (see docs/decisions/).
     assert_eq!(
         digest(&frame),
         "2414e88dac8a620c6185b589d9bfa479073f314686f4c607bc6cbd09379ce669"
@@ -178,7 +178,7 @@ fn the_goths_job_panel() {
         digest(&frame)
     };
     // Pins the drawing; it has not been compared with the original's
-    // screen (see docs/decisions.md).
+    // screen (see docs/decisions/).
     assert_eq!(
         draw(&opened.snapshot),
         "3332eada844f300442b413d9994c5aab8b198314ec41292cd584e9261b6fed64"
@@ -238,7 +238,7 @@ fn the_goths_relationship_panel() {
     let items = hud::layout([800, 600], &opened.snapshot, &controls);
     hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
     // Pins the drawing; it has not been compared with the original's
-    // screen (see docs/decisions.md).
+    // screen (see docs/decisions/).
     assert_eq!(
         digest(&frame),
         "4b764150a46580163fb484f70c5eac2db568672649d2e2bf8d05af09c2667c4c"
