@@ -60,8 +60,8 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 366 on the Goth house**: our
-  state after every one of ticks 1 to 366 equals the fourth capture of the
+  there, as three captures recorded). **K = 408 on the Goth house**: our
+  state after every one of ticks 1 to 408 equals the fourth capture of the
   original (full state after every update) in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
@@ -1294,6 +1294,99 @@ the object's thread is in an error state; no object here is.
 **Stops.** Tick 367: person 18's route to a slot finds no way, because
 person 21 stands in it. Step 6 of the route tries again and asks the
 person in the way to move (`0x45b066`, `0x45ba28`); it is not ported.
+(Ported since; see "Ticks 367 to 367".)
+
+### Ticks 367 to 367
+
+**A route tries again** (route step 6, `0x45b066`). When the planner
+finds no way, the route counts its tries in the context (`+0x58`). On
+the first try it compares the person's place with the one it noted
+(`+0x60`): a person that moved more than 8 units starts over from the
+places to stand. On the second, it looks for a person in the way and
+asks it to move. The third starts over once more; the fourth gives up
+(step 16: the result becomes 1 and the route ends as failed).
+
+**Asking a person in the way to move** (`0x45ba28`, `0x45bf2e`). The
+other people near the route are the candidates. The route is planned
+once leaving each candidate out; when none gives a way, it is planned
+leaving nobody out, and the path is sampled once per unit of its longer
+side. The first candidate whose footprint holds a sampled point is
+asked, unless it is already asked to move or its own route waits on
+someone. A marker object (`0x7c4`) is made where the asked person
+stands, with a move slot of its own (`world.routing.slots`): to either
+side of the way the asking person goes, 16 to 80 units away. The slot
+search for that slot adds a random part to each score (slot flag
+`0x2000`, `0x483b02`), one draw from the lot's stream per place in
+range. The asked person is given an action on the marker (its
+interaction 3, at the asking person's running priority), queued behind
+every action of at least that priority (`0x45d20b`); the action's
+number goes into the context (`+0x90`, snapshot format 19).
+
+**Waiting for the person asked** (route step 14, `0x45b475`). The
+asking person plays "route ask to move animation" with the asked
+person as stack object, then "route waiting animation" for up to 100
+ticks, then tries again. When a route ends, other routes waiting on
+that person forget it, and the action it asked for is taken out of the
+asked person's queue (`0x45b89b`, `0x45d5f8`).
+
+**Look Towards turns on the spot** (modes 2 and 3, `0x45a9c1`). The
+person's animator runs a route from its own place to its own place and
+then to the stack object's place, or the place mirrored through its
+own in mode 3. Mode 1, towards the camera, is not ported.
+
+**One pass per place in the slot search** (`0x483a5d`). The search's
+loop over the standing place, the eight seats and the standing place
+again scores each place once, at the first or the last index, whichever
+weight is larger. We scored a refused place twice, which only showed
+once each score drew a random number.
+
+**Compared with the original.** After tick 367 our state equals the
+fourth capture's in every field compared, including the lot's stream
+(72 draws), the marker, person 21's queue and the action serial, with
+the same head-height exception (now also after tick 367).
+
+**Not verified.** Only the paths the Goth house takes are exercised:
+the first try's place comparison, the second try asking, and step 14's
+first push. Steps 14's waiting tree, the third and fourth tries, giving
+up and the release at the end of a route are ported from the code but
+not reached by tick 367; the capture shows them later (the waiting
+tree from update 409, the route's end and the queue cleared at 489).
+
+**Stops.** Tick 368: person 21's tree `0x1012` changes its suit (Change
+Suit/Accessory, opcode 6), which is not ported. (Ported since; see
+"Ticks 368 to 408".)
+
+### Ticks 368 to 408
+
+**Change Suit/Accessory** (opcode 6, `0x45d962`). In tick 368 person 21
+takes a book from the bookcase, whose tree puts on the accessory named
+by string 0 of its table 304, "suit-book101", lowered in ASCII. Putting
+an accessory on (`0x58d88f`) takes off any of that name and adds one at
+the end with an empty binding; taking it off (`0x58d919`) drops every
+exact match. The suit form (operand 1 = 1) sets the suit (person word
+8) and a variant (word 21), drawn from the active stream for suits from
+8 on; the Goth house does not reach it.
+
+**Compared with the original.** After every one of ticks 368 to 408 our
+state equals the fourth capture's in every field compared, with the
+same head-height exception. The capture shows person 21 wearing one
+accessory from update 368 on; the entry itself is on a page the capture
+lacks.
+
+**Not verified.** The original keeps an accessory's name only when its
+suit is found and binds to the skeleton (`0x583559`); otherwise the
+entry stays with an empty name. Ours refuses, loudly, a name that no
+decoded avatar file defines (`People::suits`) and takes any other to
+bind; that this matches the original's registry is not verified. The suit
+form and taking an accessory off are ported from the code but not
+reached.
+
+**Differs.** Tick 409: person 18's route plays "route waiting
+animation" (step 14), and person 18 looks at person 16 where the
+capture has it look at person 259 (person word 41 and the head's
+target). This is the first tick that differs, and it is silent: the
+route step it comes from was ported in "Ticks 367 to 367" but first
+runs here.
 
 ## Track: drawing people (`crates/sims-people`)
 
@@ -1397,10 +1490,15 @@ stop-sounds events.
   dispatcher. Of the 190 events that were not plays, 29 remain, counted
   in a gated test: music modes (21), ambience modes (5), the piano,
   pausing and reloading. 12 more name no track and do nothing.
+- **Done: ambient scores.** The FSC scores play as the original's score
+  player does: cells picked by weight in a window around a cursor that
+  the camera and the hour move, on the score's beat. The ambience modes
+  (52) and the ambience half of the music modes (36) are ported, so 24
+  events remain.
 - **Next:**
   - The simulation emits `SoundEvent`s (the interface is in the
-    decisions log).
-  - The FSC ambient player (ambience modes).
+    decisions log), and gives the camera value and the hour for the
+    ambience's cursor.
   - Live playback behind a feature.
   - Checking any of it against the original.
 

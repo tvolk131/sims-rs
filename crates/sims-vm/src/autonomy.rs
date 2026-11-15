@@ -540,7 +540,7 @@ impl Machine<'_, '_> {
     }
 
     /// One draw from the active random stream (0x46f457).
-    fn draw(&mut self) -> u32 {
+    pub(crate) fn draw(&mut self) -> u32 {
         match self.stream {
             crate::interpreter::Stream::Lot => self.world.lot_rng.next_u32(),
             crate::interpreter::Stream::Global => self.world.global_rng.next_u32(),

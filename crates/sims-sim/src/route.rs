@@ -29,6 +29,10 @@ pub struct Routing {
     /// never sets, into person word 37 (0x45c418). They hold 0 here; a
     /// script that reads one fails, and a write makes it known again.
     pub unknown_words: BTreeSet<(u16, usize)>,
+    /// Slot records an object's slot table holds in place of its type's,
+    /// by object ID and slot index. A person asked to move out of the way
+    /// gets a marker object whose first slot the asker writes (0x45c2ab).
+    pub slots: BTreeMap<(u16, u16), RouteSlot>,
 }
 
 /// A person's route: its contexts and its path.
@@ -72,13 +76,16 @@ pub struct Context {
     pub chosen: i32,
     /// +0x54: the best candidate score, or -1.
     pub best: i32,
-    /// +0x58: saved before each step of the primitive and put back,
-    /// sign-extended from its low word, after it.
+    /// +0x58: the retry count of route step 6, read at the start of each
+    /// run of the route's steps and written back, sign-extended from its
+    /// low word, when the run ends.
     pub word_58: i32,
-    /// +0x5c.
+    /// +0x5c: the tick at which route step 14 first asked a person to
+    /// move, 0 for none.
     pub time: i32,
     /// +0x60, +0x64: the person's object +0xf4 and +0xf8 when the context
-    /// was made; also saved and put back around each step.
+    /// was made; route step 6 notes the person's place here. Read and
+    /// written back around each run, as the retry count.
     pub saved: [i32; 2],
     /// +0x68: the door the route goes through, 0 for none. The original
     /// holds a pointer to the door's object; this holds the object's ID.
@@ -92,7 +99,8 @@ pub struct Context {
     pub byte_78: bool,
     /// +0x7c, +0x80: two objects the context names, 0 for none.
     pub objects: [u16; 2],
-    /// Byte +0x84.
+    /// Byte +0x84: whether the route of the person asked to move was under
+    /// way (state 8) when that person's route ended.
     pub byte_84: bool,
     /// +0x88.
     pub result: i32,
@@ -104,6 +112,9 @@ pub struct Context {
     pub word_94: i16,
     /// +0x98: 0x30, or 8 in a room of more than 250 tiles.
     pub limit: i32,
+    /// +0x90: the number of the action that asks the person at +0x80 to
+    /// move out of the way (0x45c31f), 0 for none.
+    pub action: i32,
 }
 
 /// A slot record as an object's slot table holds it in memory (sixty
