@@ -47,12 +47,13 @@
 //! graphics work every tenth tick (0x5a0932), and signal 0xf7, which a person's tick sends when the
 //! selected Sim changes room and which only the house viewer takes
 //! (0x4a82db, 0x4ab992). That none of these changes simulation state is
-//! **unverified**. The lot's subscriber forwards each signal to a second
-//! subscriber at lot 0x10 (0x416393) before its own cases; what that one
-//! is, and what it does with 0xdb and 0xf7, is **unverified**, and so is
-//! whether the panels' and the house viewer's handling of these signals
-//! (taken as presentation) changes anything the simulation keeps; the
-//! house viewer's handler was not read in full. The
+//! **unverified**. The lot's subscriber passes each signal to the object
+//! at lot 0x10 (0x416393) before its own cases, but by a direct call to
+//! the subscribers' empty handler (0x41639e calls 0x407607, which returns
+//! 0), so that does nothing. Whether the panels' and the house viewer's
+//! handling of these signals (taken as presentation) changes anything the
+//! simulation keeps is **unverified**; the house viewer's handler was not
+//! read in full. The
 //! registry's pass also opens the game's special panels (registry words
 //! 0xe8 to 0x108) when a script asked for one; no ported primitive asks,
 //! so they never open here. When the pass showed a modal dialog the lot

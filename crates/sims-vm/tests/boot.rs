@@ -141,3 +141,52 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
         assert!(stopped.contains(part), "{stopped}");
     }
 }
+
+#[test]
+fn the_snack_order_pays_for_the_snack() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    let sim = lot.load_report().finished.unwrap().sim.unwrap();
+    assert_eq!(sim, 21);
+    // The save's first day is today's entry (0x46d1e4).
+    let today = |lot: &Lot| lot.world().budget.days[0].unwrap();
+    assert_eq!(lot.world().budget.funds, 2542);
+    assert_eq!(today(&lot), [20, 0, 0, 0, 0, 0, 15060, 33654]);
+    for _ in 0..50 {
+        assert!(lot.step_play().unwrap().errors.is_empty());
+    }
+    // The fridge's Have A Snack (menu 1).
+    assert!(lot.queue_interaction(sim, 118, 1).unwrap().is_some());
+    for step in 51..820 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+        assert_eq!(lot.world().budget.funds, 2542, "step {step}");
+    }
+    // Step 820: Mortimer's tree 0x1007 spends 5 in category 3, and tree
+    // 0x104a names his running action. His animator then stops where he
+    // starts to carry the snack.
+    let update = lot.step_play().unwrap();
+    assert_eq!(lot.world().ticks, 89263);
+    assert_eq!(lot.world().budget.funds, 2537);
+    assert_eq!(today(&lot), [20, 0, 0, 5, 0, 0, 15060, 33654]);
+    assert_eq!(
+        (lot.world().globals[14], lot.world().globals[13]),
+        (0, 2537)
+    );
+    let person = lot.world().objects[&sim].person.as_ref().unwrap();
+    assert_ne!(person.active.flags & 0x80, 0);
+    let [error] = &update.errors[..] else {
+        panic!("{:?}", update.errors);
+    };
+    assert_eq!(error.object, sim);
+    assert!(
+        error.fault.to_string().contains("0x5903fc"),
+        "{}",
+        error.fault
+    );
+}

@@ -351,12 +351,20 @@ fn a_check_tree_may_change_its_entry_s_advertisements() {
     // tree), asks whether the Sim uses the lamp (it does not), and raises
     // its energy advertisement's delta (scope 12, motive 5) to 30000. Menu
     // 3 is then the best, and with flag 0x100 it is taken without a draw.
+    // The string (table 300, string 1) is looked up and formatted even
+    // there (0x4704fa, 0x44bf1a).
     let mut fx = lot(0x100);
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .strings
+        .insert(300, vec!["Eat".to_owned()]);
     fx.add(
         LAMP_FILE,
         CHECK,
         tree(vec![
-            ins(50, 1, 1, [0; 8]),
+            ins(50, 1, 1, [0x2c, 0x01, 0, 0, 1, 0, 0, 0]),
             ins(37, RETURN_FALSE, 2, [0; 8]),
             assign(12, 5, scope::LITERAL, 30000, RETURN_TRUE),
         ]),
@@ -442,20 +450,10 @@ fn a_named_tree_a_check_tree_runs_may_change_its_advertisements() {
 }
 
 #[test]
-fn the_primitives_check_trees_use_fail_loudly_elsewhere() {
-    // Add/Change Action String outside a check tree names the running
-    // interaction, which is not ported.
-    let mut fx = lot(0x100);
-    fx.add(
-        SIM_FILE,
-        CHOOSE,
-        tree(vec![ins(50, RETURN_TRUE, RETURN_TRUE, [0; 8])]),
-    );
-    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
-    assert!(fault.to_string().contains("0x41f1ae"), "{fault}");
+fn the_advertisement_scopes_fail_loudly_before_the_first_copy() {
     // The advertisement scopes before Find Best Interaction first copies
-    // into the record.
+    // into the record. (Add/Change Action String outside a check tree is
+    // in action_string.rs.)
     let mut fx = lot(0x100);
     fx.add(
         SIM_FILE,
