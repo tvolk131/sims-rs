@@ -10,10 +10,59 @@ use crate::skin::{Skinned, skin};
 
 /// The direction the light comes from in the offscreen renders: above,
 /// a little to the side and behind the viewer of the house view. This is
-/// our own light, not the original's. The original lights a person by a
-/// level from 0 to 1, the standard light turned by the view, and the room's
-/// lamps (see the decisions entry "How the original lights a person").
+/// our own light, not the original's; a person on a lot is lit as the
+/// original lights them ([`Lighting::standard`]).
 pub const LIGHT: Vec3 = Vec3::new(0.3, 1.0, -0.5);
+
+/// How a part is lit: a light from `towards` (a direction towards the
+/// light), and per vertex a shade of `ambient + diffuse × max(0, n · l)`,
+/// where `n` is the vertex's normal and `l` the unit direction; the
+/// original's light holds it to 1, as Direct3D holds a vertex's colour.
+/// A texel's colour is multiplied by its shade.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Lighting {
+    pub towards: Vec3,
+    pub ambient: f32,
+    pub diffuse: f32,
+    /// Whether the shade is held to 1. Our own light is not, so the
+    /// offscreen renders pinned before it existed keep their bits.
+    pub held: bool,
+}
+
+impl Lighting {
+    /// Our own light for offscreen renders: a shade from 0.45 in shadow
+    /// to 1 facing the light.
+    pub fn ours(towards: Vec3) -> Self {
+        Self {
+            towards,
+            ambient: 0.45,
+            diffuse: 0.55,
+            held: false,
+        }
+    }
+
+    /// The original's light for a person at `level` (0.5 to 1; see
+    /// [`crate::lot::level`]), with the standard light from `towards`.
+    /// The original sets the ambient light to the grey
+    /// `round(255 × level)` and the standard light's strength to the level
+    /// (0x4b49c7), and Direct3D adds them up per vertex. The material is
+    /// taken to be white (decisions entry "A person is lit by the
+    /// original's standard light, at their room's level").
+    pub fn standard(towards: Vec3, level: f32) -> Self {
+        Self {
+            towards,
+            ambient: (255.0 * level).round() / 255.0,
+            diffuse: level,
+            held: true,
+        }
+    }
+
+    /// A vertex's shade, for its unit normal.
+    pub fn shade(&self, normal: Vec3) -> f32 {
+        let shade = self.ambient + self.diffuse * normal.dot(self.towards.normalize()).max(0.0);
+        if self.held { shade.min(1.0) } else { shade }
+    }
+}
 
 /// An orthographic camera. The view turns about the vertical axis by an
 /// angle given as its sine and cosine (`yaw`), then tilts down by another
@@ -101,7 +150,7 @@ impl Canvas {
     /// towards the light) with some ambient light.
     pub fn draw(&mut self, camera: &Camera, part: &Part, skinned: &Skinned, light: Vec3) {
         let (w, h) = (self.width as f32, self.height as f32);
-        draw_part(self, part, skinned, light, |p| {
+        draw_part(self, part, skinned, Lighting::ours(light), |p| {
             let v = camera.view(p);
             Vec3::new(
                 w * 0.5 + v.x * camera.scale,
@@ -144,8 +193,8 @@ pub trait Target {
     /// of what is there. Asked before the texture is sampled, so a hidden
     /// pixel costs little; [`Target::write`] may still test again.
     fn passes(&self, x: u32, y: u32, z: f32) -> bool;
-    /// Writes a texel that passed: its colour times `shade` (from 0.45 in
-    /// shadow to 1 facing the light). Its alpha is never 0.
+    /// Writes a texel that passed: its colour times `shade` (0 to 1, see
+    /// [`Lighting`]). Its alpha is never 0.
     fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32);
     /// Says whose pixels are written from now on: a person's object ID,
     /// or None once they are drawn. A target that keeps, per pixel, what
@@ -191,24 +240,18 @@ impl Target for Canvas {
     }
 }
 
-/// Draws one skinned part into `target`, lit by a light from `light` (a
-/// direction towards the light) with some ambient light. `project` takes a
-/// world point to the target: x and y in pixels, z its depth in the
-/// target's units.
+/// Draws one skinned part into `target`, lit by `lighting`. `project`
+/// takes a world point to the target: x and y in pixels, z its depth in
+/// the target's units.
 pub fn draw_part<T: Target + ?Sized>(
     target: &mut T,
     part: &Part,
     skinned: &Skinned,
-    light: Vec3,
+    lighting: Lighting,
     project: impl Fn(Vec3) -> Vec3,
 ) {
-    let light = light.normalize();
     let screen: Vec<Vec3> = skinned.positions.iter().map(|&p| project(p)).collect();
-    let shade: Vec<f32> = skinned
-        .normals
-        .iter()
-        .map(|n| 0.45 + 0.55 * n.dot(light).max(0.0))
-        .collect();
+    let shade: Vec<f32> = skinned.normals.iter().map(|&n| lighting.shade(n)).collect();
     for t in &part.mesh.triangles {
         let [a, b, c] = t.map(|i| i as usize);
         // A mesh whose triangles name vertices it lacks draws nothing
