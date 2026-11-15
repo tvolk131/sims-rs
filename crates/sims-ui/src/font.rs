@@ -152,6 +152,29 @@ impl Font {
 
     /// Draws `text` on one line with its top-left corner at `at`.
     pub fn draw(&self, frame: &mut Frame, text: &str, at: [i32; 2], rgb: [u8; 3]) {
+        self.draw_line(frame, text, at, rgb, false);
+    }
+
+    /// Draws `text` as [`Font::draw`] does, underlined as the original
+    /// does with its font flag 4 (0x60c136): under each character, from
+    /// where it starts to one pixel past its advance, a line in the
+    /// text's color on the row just under an `A` (the row 0x60b927
+    /// gives: `A`'s y bearing plus its height), drawn only where that
+    /// row is inside the line.
+    pub fn draw_underlined(&self, frame: &mut Frame, text: &str, at: [i32; 2], rgb: [u8; 3]) {
+        self.draw_line(frame, text, at, rgb, true);
+    }
+
+    fn draw_line(
+        &self,
+        frame: &mut Frame,
+        text: &str,
+        at: [i32; 2],
+        rgb: [u8; 3],
+        underline: bool,
+    ) {
+        let a = &self.metrics[usize::from(b'A')];
+        let below = a.bearing[1] + i32::from(a.atlas[3]);
         let mut x = at[0];
         for ch in text.chars() {
             let Some(m) = self.metric(ch) else {
@@ -170,6 +193,17 @@ impl Font {
                         coverage,
                     );
                 }
+            }
+            if underline && below < self.line_height {
+                frame.fill(
+                    crate::frame::Rect::new(
+                        x,
+                        at[1].saturating_add(below),
+                        m.advance.saturating_add(1),
+                        1,
+                    ),
+                    rgb,
+                );
             }
             x = x.saturating_add(m.advance);
         }
@@ -247,6 +281,23 @@ pub(crate) mod tests {
         })
     }
 
+    /// [`font`] with a `g`, 1 by 2, hanging two pixels below `A`'s top,
+    /// so the line is 4 high and a row is left under `A`.
+    pub(crate) fn hanging_font() -> Font {
+        let mut decoded = font().decoded;
+        decoded.glyphs.push(ffn::Glyph {
+            code: 103,
+            width: 1,
+            height: 2,
+            atlas_x: 0,
+            atlas_y: 0,
+            first_bearing: 0,
+            bearing_x: 0,
+            bearing_y: 1,
+        });
+        Font::new(decoded)
+    }
+
     #[test]
     fn metrics_follow_the_original_rules() {
         let f = font();
@@ -257,6 +308,34 @@ pub(crate) mod tests {
         // The space: half the mean ink width (1.5 / 2), rounded.
         assert_eq!(f.width(" "), 1);
         assert_eq!(f.width("A\u{1F600}"), 3);
+    }
+
+    #[test]
+    fn an_underline_runs_under_each_character_on_the_row_under_an_a() {
+        // The test font's `A` reaches the line's bottom: no row is left
+        // under it, so nothing is underlined.
+        let f = font();
+        let mut plain = Frame::new(6, 3, [0, 0, 0]);
+        f.draw(&mut plain, "AB", [0, 0], [255, 255, 255]);
+        let mut under = Frame::new(6, 3, [0, 0, 0]);
+        f.draw_underlined(&mut under, "AB", [0, 0], [255, 255, 255]);
+        assert_eq!(under.rgb(), plain.rgb());
+        // A `g` hanging two pixels lower leaves room: the line is the row
+        // under `A`, from each character's start to a pixel past its
+        // advance (A's 3, B's 1).
+        let f = hanging_font();
+        assert_eq!(f.line_height, 4);
+        let mut frame = Frame::new(8, 5, [0, 0, 0]);
+        f.draw_underlined(&mut frame, "AB", [1, 1], [9, 9, 9]);
+        let row: Vec<_> = (0..8).map(|x| frame.pixel(x, 3).unwrap()).collect();
+        assert_eq!(
+            row,
+            [
+                [0; 3], [9; 3], [9; 3], [9; 3], [9; 3], [9; 3], [0; 3], [0; 3]
+            ]
+        );
+        // Far coordinates do not overflow.
+        f.draw_underlined(&mut frame, "AB", [i32::MAX - 1, i32::MAX - 2], [1; 3]);
     }
 
     #[test]
