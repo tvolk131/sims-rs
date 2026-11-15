@@ -267,6 +267,7 @@ impl Interpreter<'_> {
                 .restore_animator(
                     id,
                     &objects[&id],
+                    world.ticks,
                     world.changed_types.contains(&objects[&id].guid),
                 )
                 .map_err(|trap| fail(id, trap))?;

@@ -29,9 +29,11 @@
 //! measures (0x5904d2) and is restored (0x590b27). The person's data words
 //! are read after the animator, so that step sees the constructor's zero
 //! words: bit 0 of word 42 is clear, so the measurement does not run. The
-//! head clock (+0x164) the constructor set equals the clock just read, so
-//! the step neither counts word 45 down nor relaxes the turn (0x590788);
-//! the turn only settles. The animator's refresh
+//! constructor zeroed the head clock (+0x164, 0x587d80) and set the
+//! animator's clock (+0xb4) to the clock at the load's tick count
+//! (0x585483), so unless that is 0 the step runs (0x590788): word 45 is
+//! 0, so nothing counts down, and the turn relaxes once (x0.8); then it
+//! settles. The animator's refresh
 //! (virtual function 0x54 with 0, 0x58da12) reads the same clock again
 //! and changes nothing the simulation keeps.
 //!
@@ -147,6 +149,7 @@ impl Interpreter<'_> {
         &self,
         id: u16,
         object: &Object,
+        ticks: u32,
         reset: bool,
     ) -> Result<Restored, Trap> {
         let Some(person) = object.person.as_ref() else {
@@ -225,9 +228,15 @@ impl Interpreter<'_> {
         a.head.target_heading = F32::from_f32(floats[1]);
         a.head.turn = F32::from_f32(floats[2]);
         a.head.target = Some([3, 4, 5].map(|i| F32::from_f32(floats[i])));
-        // 0x590768: the head clock (+0x164) the constructor set equals the
-        // clock the restore read (+0xb4), so the step skips the countdown
-        // and the relaxing (0x590788) and only settles.
+        // 0x590768: the constructor zeroed the head clock (+0x164,
+        // 0x587d80) and set the animator's clock (+0xb4) to the clock at
+        // the load's tick count (0x585483, from 0x587f5a). The step runs
+        // when the two differ (0x590788): word 45 is 0, so nothing counts
+        // down, and bit 0 of word 42 is clear, so the turn relaxes. At
+        // tick 0 they are the same and it only settles.
+        if LOADED.clock_at(ticks as i32) != LOADED.head_clock {
+            a.head.relax();
+        }
         a.head.settle();
         Ok(Restored {
             animator: (a != LOADED).then_some(a),

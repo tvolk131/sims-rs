@@ -209,9 +209,10 @@ as the simulation reads it:
   target point are restored (a measurement whose target object is gone
   reads the point, 0x5906bc). The load's head step sees the
   constructor's zero data words (the person's data is read after its
-  animator), so the measurement does not run, and the constructor's head
-  clock equals the clock the restore read, so the turn is not relaxed
-  (0x590788); it only settles. The events seen (+0xa4) are kept; the
+  animator), so the measurement does not run. The constructor zeroed
+  the head clock (+0x164) and set the animator's clock to the clock at
+  the load's tick count (0x585483), so the step runs unless that clock
+  is 0 (0x590788): the turn relaxes once (x0.8) and settles. The events seen (+0xa4) are kept; the
   reset clears +0xa0.
 
 **Only after a reset.** Everything above assumes the person is reset

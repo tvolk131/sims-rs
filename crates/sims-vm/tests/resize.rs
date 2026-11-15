@@ -2023,7 +2023,7 @@ fn the_goth_house_objects_are_all_visited() {
             .map(|(&id, _)| id)
             .collect();
         assert_eq!(occupied, OCCUPIED);
-        let old = without_saved_targets(world, world);
+        let old = without_saved_targets(world, &before);
         assert_eq!(digest(&format_16_bytes(&old)), VISITED_16);
         pinned(&without_room_notes(&old), VISITED, VISITED_7);
         // Steps 14 and 15 change nothing on this lot, and neither does
@@ -2031,7 +2031,7 @@ fn the_goth_house_objects_are_all_visited() {
         assert_eq!(interpreter.ensure_indicators(world), Ok(None));
         finish_goth_selection(world, &family);
         assert_eq!(interpreter.ensure_indicators(world), Ok(None));
-        let old = without_saved_targets(world, world);
+        let old = without_saved_targets(world, &before);
         assert_eq!(digest(&format_16_bytes(&old)), VISITED_16);
         pinned(&without_room_notes(&old), VISITED, VISITED_7);
     });
@@ -2101,6 +2101,9 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
     selected(root, |interpreter, world, people| {
         let asked = std::cell::RefCell::new(Vec::new());
         let mut interpreter = *interpreter;
+        // The people's animators as the load's read of the objects left
+        // them, with their saved head targets.
+        let loaded = world.clone();
         assert_eq!(interpreter.visit_objects(world, people).stopped, None);
         interpreter.ensure_indicators(world).unwrap();
         finish_goth_selection(world, &family);
@@ -2233,7 +2236,7 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
         assert_eq!(world.global_rng, before.global_rng);
         assert_eq!(world.lot_rng, before.lot_rng);
         assert_eq!(world.crt_rng, before.crt_rng);
-        let untargeted = without_saved_targets(world, world);
+        let untargeted = without_saved_targets(world, &loaded);
         assert_eq!(digest(&format_16_bytes(&untargeted)), BASELINE_16);
         let noted = without_room_notes(&untargeted);
         assert_eq!(digest(&format_8_bytes(&noted)), BASELINE);
