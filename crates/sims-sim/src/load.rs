@@ -562,7 +562,7 @@ impl World {
     /// For the Goth house the cells inside the lot's size of arrays 0, 1,
     /// 2, 3, 8, 101, 102, 103, 108, 9 and 10 were compared with a capture
     /// of the original taken after this step and the renumbering; see
-    /// `docs/decisions.md`. Outside the size, the same arrays were
+    /// `docs/decisions/`. Outside the size, the same arrays were
     /// compared with the memory a later trace holds, at the start of load
     /// step 10 and at the end of the load: every cell of both levels'
     /// walls and flags, the ground level's object grid, the pool and the
@@ -946,7 +946,7 @@ impl World {
     /// In a trace of the original loading the Goth house the queue holds
     /// four IDs before this step and none after, and nothing else the
     /// trace holds changes. Our state before and after the step was
-    /// compared with the trace's and was equal; see `docs/decisions.md`.
+    /// compared with the trace's and was equal; see `docs/decisions/`.
     pub fn discard_removals(&mut self) -> Vec<u16> {
         std::mem::take(&mut self.removals)
     }

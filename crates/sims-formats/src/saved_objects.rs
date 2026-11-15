@@ -220,7 +220,7 @@ pub struct Instance {
     /// None when the record ends first, as every `*Placeholder` record in the
     /// shipped and played houses does (0 to 7 padding bits remain, against
     /// 24 or more for every other object). Why the original omits it is not
-    /// known yet; see `docs/decisions.md`.
+    /// known yet; see `docs/decisions/`.
     pub registry_word: Option<i32>,
     pub consumed_bits: usize,
     /// Retain raw bytes, including unrecognized trailing fields and bit padding.

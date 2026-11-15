@@ -111,10 +111,8 @@ events, and what it asks for after them) come first.
   no longer playing, 0x5992b3), the houses with no family stop at the
   household selection, and the community lots (UserData's houses 40 to
   48) where Create New Object Instance mode 6 makes a person (0x44e60e).
-  Four types grow their attribute arrays to the saved count (0x4342ae).
-  Two objects that are not solid share a tile unless both stand against
-  the same wall (0x433a7f). The templates' `Patch` families are not
-  imported (see `docs/decisions.md`).
+  Four types grow their attribute arrays to the saved count (0x4342ae). The templates' `Patch` families are not
+  imported (see `docs/decisions/`).
 
 ## Met goal: a headless lot boot that matches the original
 
@@ -142,7 +140,7 @@ How it was reached:
    Five runs of the Goth house were recorded; the first covered 1000 lot
    updates, tick counts 88445 to 89444. The first does not choose in
    tick 233 and the other four do; we follow those
-   (`docs/decisions.md`). With the install's own UserData, the C
+   (`docs/decisions/`). With the install's own UserData, the C
    runtime's random stream and all 463 neighborhood records match too.
    The original first draws from the C runtime's stream in tick 6, 1,466
    times, when it makes a person; ours draws the same.
@@ -933,7 +931,7 @@ with flag 2 or between two people (`0x44d17c`), and Manage Inventory
 operation 3 (`0x4552f8`). After tick 1 all 463 records and the
 inventories equal the capture's, when ours reads the same neighborhood
 file as the capture's game; the install's file differs from that one in
-five records (see `docs/decisions.md`). One registry byte that a
+five records (see `docs/decisions/`). One registry byte that a
 relationship write sets is 1 in the capture and 0 here; what sets it
 during the original's load is not known.
 
@@ -1146,7 +1144,7 @@ Its state after tick 230 equals ours as far as compared, and the
 original's code run in an emulator on its memory from update 47 chooses
 in 233. So something outside the lot updates, after update 47, changed
 the outcome in that run only. What it was is not known (see
-`docs/decisions.md`). We follow the three runs that agree.
+`docs/decisions/`). We follow the three runs that agree.
 
 ### Ticks 233 to 261
 
@@ -1865,6 +1863,12 @@ Progress:
   the Goths' people alone over their lot every 120 ticks at four
   rotations and checks that something hides them at times, that their
   feet show in most views, and that nobody is hidden throughout.
+- Done: people are lit by the original's standard light at their room's
+  level (`Lighting::standard`, `sims_people::lot::level`): a person in
+  full light is drawn at full light all over, as the original draws
+  Mortimer on the porch in a screenshot, and one in a dim room shows the
+  side towards the light, which stays behind the viewer as the view
+  turns. Room lamps, the level's fade and the night cap are not ported.
 - Done: the plumb bob (`sims_people::bob`) over the person whose head
   slot holds it: the original's `head-arrow` mesh, three units over the
   head bone, spinning half a turn a second by a clock the app gives
@@ -2140,8 +2144,10 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   selected Sim's five trait bars (Neat, Outgoing, Active, Playful,
   Nice) in the subpanel, laid out as the original's bar maker does
   (0x51df31). The Goths' panel is pinned by digest, gated on
-  `SIMS_INSTALL`; it is not yet compared with a screenshot, and the
-  zodiac sign under the bars is not drawn. In the window, the
+  `SIMS_INSTALL`; it is not yet compared with a screenshot. The sign of
+  the zodiac shows at the panel's bottom left: the one saved in the
+  person's data, or else the one nearest their traits (0x4841fc). In
+  the window, the
   personality, needs, job and relationship panels show the selected
   Sim's live person data, motives, skills and relationship rows, and
   follow a press on another portrait; the needs are also checked to
@@ -2174,8 +2180,8 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   stand-in for steps 17 and 18; a screenshot of an open pie menu; a
   Yes/No dialog checked
   against the original (the "Help System" one at tick 2) for the layout
-  of several buttons; text entry dialogs; the personality panel's
-  zodiac sign; the job panel's left column (the career's icon and
+  of several buttons; text entry dialogs; the sign's help balloon
+  (its compatible signs); the job panel's left column (the career's icon and
   title, the salary, the performance and the friends needed); the
   relationship panel's Superstar filter and which people the original
   leaves out; the other live panels.
@@ -2328,8 +2334,9 @@ through their public interfaces only; the simulation never depends on it.
 - **Done: the action queue.** The selected Sim's running and queued
   actions show as icons in the top left, framed as the original frames
   them, and a press cancels one (`Lot::cancel`, 0x45d5f8) with the
-  original's sound. Objects' catalog pictures are not made yet (a grey
-  square stands in), and the icons do not slide into place.
+  original's sound. An object's icon shows its type's catalog picture,
+  from the thumbnail its file ships; the original's render of a missing
+  thumbnail (0x4e57a6) is not ported. The icons do not slide into place.
 - **Done in play mode: a second order, and cancelling either.** Through
   the window, the snack from the fridge's pie and then Water from a
   plant's: the water waits behind the snack, its icon second. A press on
@@ -2363,8 +2370,12 @@ through their public interfaces only; the simulation never depends on it.
 - Nothing from the original game is committed. Fixtures that need game data
   stay private and are skipped when the data is absent.
 - Choices about format details, unverified guesses, and the order of work
-  are made in the PR and recorded in `docs/decisions.md`. Guesses are
-  marked unverified in the code until the harness confirms them.
+  are made in the PR and recorded as a new file under `docs/decisions/`
+  (see its README). Guesses are marked unverified in the code until the
+  harness confirms them.
+- Only the coordinator edits this roadmap. A track's PR does not touch it;
+  its body ends with a **Roadmap** section saying which lines should change.
+  After merging, the coordinator applies those changes in one docs commit.
 - Stop and ask the maintainer only when:
   - something only they can provide is needed (a login, or files not on
     this machine);

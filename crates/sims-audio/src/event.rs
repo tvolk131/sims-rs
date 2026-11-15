@@ -3,7 +3,7 @@
 //! The simulation's only link to sound is a stream of these events. It
 //! never reads anything back, so sound cannot change what the simulation
 //! does. The simulation crates do not emit them yet; the interface they
-//! would need is in the track's report and `docs/decisions.md`.
+//! would need is in the track's report and `docs/decisions/`.
 
 /// One request from the simulation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
