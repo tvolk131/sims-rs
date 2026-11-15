@@ -28,12 +28,17 @@ What was decided:
   registration order (as before, from the old prototype's reading of
   the load), each person the factory makes appended after it is
   constructed, and a removed object taken out. A name in it with no
-  object is `Trap::Invalid`, not skipped.
+  object, or an object that is not a person, is `Trap::Invalid`, not
+  skipped.
 - **Unverified**: the code that appends to the vector was not found (the
   person code passes it to `0x4258a3`, which does not use it), so the
   end is read from tick 409's draws, and when in the making the person
   joins is not known. No capture page holds the vector. Any order with
-  person 16 before person 259 fits tick 409.
+  person 16 before person 259 fits tick 409. Because of that, a walk of
+  the vector while the factory is running a new person's scripts traps
+  `Unsupported` rather than showing the person or hiding it. Two people
+  made at run time are taken to join in the order they are made, as a
+  vector's append gives.
 
 What would reopen it: a capture or trace of the vector, or a tick where
 two people made at run time are walked.

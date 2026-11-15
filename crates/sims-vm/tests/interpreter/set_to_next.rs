@@ -173,9 +173,21 @@ fn modes_1_and_12_walk_the_person_vector_not_registration_order() {
     }
     assert_eq!(step(&mut fx, 12, 6), Ok(true));
     assert_eq!(fx.lamp().temps[0], 2);
-    // A vector naming an object that is gone is invalid, not skipped.
+    // A vector naming an object that is not a person, or one that is
+    // gone, is invalid, not skipped.
+    fx.world.people.push(1);
+    let fault = step(&mut fx, 1, 0).unwrap_err();
+    assert!(
+        matches!(fault.trap, Trap::Invalid(ref m) if m.contains("not a person")),
+        "{fault}"
+    );
+    fx.world.people.pop();
     fx.world.people.push(9);
-    assert!(step(&mut fx, 1, 0).is_err());
+    let fault = step(&mut fx, 1, 0).unwrap_err();
+    assert!(
+        matches!(fault.trap, Trap::Invalid(ref m) if m.contains("gone")),
+        "{fault}"
+    );
 }
 
 #[test]

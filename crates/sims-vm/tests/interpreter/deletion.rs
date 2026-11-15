@@ -34,6 +34,7 @@ fn lot(count: u16, reset: bool) -> (Fixture, usize) {
     let (mut fx, file) = widgets();
     fx.world.objects.clear();
     fx.world.order.clear();
+    fx.world.people.clear();
     (fx.world.globals[34], fx.world.globals[36]) = (0, 0);
     if reset {
         callback(&mut fx, file, 3, RESET);

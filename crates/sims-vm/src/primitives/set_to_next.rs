@@ -360,6 +360,12 @@ impl Machine<'_, '_> {
 
     /// The native person vector ([`sims_sim::World::people`]).
     fn person_order(&self) -> Result<Vec<(i16, &Object)>, Trap> {
+        if let Some(id) = self.making_person {
+            return Err(Trap::Unsupported(format!(
+                "a walk of the person vector while the factory makes person {id}; when in \
+                 the making the original appends a person is not read"
+            )));
+        }
         self.world
             .people
             .iter()
@@ -367,6 +373,11 @@ impl Machine<'_, '_> {
                 let object = self.world.objects.get(&id).ok_or_else(|| {
                     Trap::Invalid(format!("person vector names object {id}, which is gone"))
                 })?;
+                if object.person.is_none() {
+                    return Err(Trap::Invalid(format!(
+                        "person vector names object {id}, which is not a person"
+                    )));
+                }
                 let id = i16::try_from(id).map_err(|_| {
                     Trap::Invalid(format!("object ID {id} does not fit a script word"))
                 })?;
