@@ -325,13 +325,19 @@ pub struct Whereabouts {
     /// level (1 the ground floor, 2 upstairs).
     pub position: [i32; 3],
     /// The tile and level the position is on, as [`World::tile`] gives
-    /// them (-1, -1 off the lot).
+    /// them: each coordinate divided by 16, rounding down, and cut to a
+    /// signed byte. Nothing is clamped: an object taken off the lot is at
+    /// -1, -1 (position -16, -16), but a position outside the lot any other
+    /// way gives whatever tile the division does.
     pub tile: [i8; 3],
     /// The level, `position[2]`.
     pub level: i32,
-    /// Its room word (object data word 29), the room the placement wrote
-    /// when the Sim was last put somewhere (the room map's number for the
-    /// tile, see [`World::room_at`]). None if the object has no word 29.
+    /// Its room word (object data word 29) as the state holds it: the
+    /// room map's number for its tile ([`World::room_at`]), which the
+    /// placement writes when the Sim is put somewhere and the room
+    /// assignment rewrites when the rooms are worked out again. -5 means no
+    /// room: a new object, or one taken off the lot. None only if the object
+    /// has no word 29.
     pub room: Option<i16>,
 }
 

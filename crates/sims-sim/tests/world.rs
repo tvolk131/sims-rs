@@ -1143,6 +1143,24 @@ fn read_only_snapshots_never_write_the_file() {
         assert!(other.load("boot").unwrap().is_some());
     }
     assert_eq!(std::fs::read(&file.0).unwrap(), before);
+    // A program holding the file to write refuses the reader on platforms
+    // that lock files, and the reader leaves nothing beside the file.
+    let writer = Snapshots::open(&file.0).unwrap();
+    if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
+        assert!(ReadOnlySnapshots::open(&file.0).is_err());
+    }
+    drop(writer);
+    let directory = file.0.parent().unwrap();
+    let name = file.0.file_name().unwrap().to_string_lossy().into_owned();
+    // Only emptiness is checked, so the listing's order does not matter.
+    #[allow(clippy::disallowed_methods)]
+    let beside: Vec<_> = std::fs::read_dir(directory)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|other| other != &name && other.starts_with(&name))
+        .collect();
+    assert!(beside.is_empty(), "files beside the snapshot: {beside:?}");
 }
 
 /// Boots the target house from a real install when `SIMS_INSTALL` names
