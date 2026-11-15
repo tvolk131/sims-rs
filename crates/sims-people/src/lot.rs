@@ -22,8 +22,9 @@
 //! first, and one column right as the lot renderer draws objects (its
 //! `OBJECT_COLUMN`; unchecked for people).
 //!
-//! A person stands on the terrain under it ([`ground_height`]: the tile's
-//! altitude where its position falls, as the original finds it, 0x478dfe).
+//! A person stands on the terrain under it (`sims_sim::head::ground_height`:
+//! the tile's altitude where its position falls, as the original finds it,
+//! 0x478dfe).
 //! On a level above the ground the original adds an offset from the
 //! view's table, which is not ported: such a person stands at the level's
 //! floor.
@@ -66,12 +67,6 @@ const ARRAY_FINE: f32 = sims_render::camera::ARRAY_SIZE as f32 * 16.0;
 /// The lot renderer draws objects one column right of the projected point
 /// (its `OBJECT_COLUMN`); people are drawn the same way, unchecked.
 const OBJECT_COLUMN: f32 = 1.0;
-
-/// The lot's altitude array: one byte per tile corner, four to a tile.
-const ALTITUDE: u16 = 0;
-
-/// The side of the lot's arrays in tiles, whatever the lot's size.
-const FULL: usize = sims_render::lot::FULL;
 
 /// How the lot renderer's camera sees the people's world.
 #[derive(Debug, Clone, Copy)]
@@ -134,37 +129,6 @@ fn rotate(rotation: u8, [x, y]: [f32; 2], size: f32) -> [f32; 2] {
         3 => [y, size - x],
         _ => [x, y],
     }
-}
-
-/// The terrain's height, in units, under fine position `position` on the
-/// ground level, as the original places a person (0x478dfe, 0x59226f, as
-/// `sims_vm`'s head model does it): the position rounded to the nearest
-/// sixteenth, then the altitude of its tile's two triangles there. `None`
-/// off the lot, or when the lot has no altitude array.
-pub fn ground_height(world: &World, position: [f32; 2]) -> Option<f32> {
-    // Rounded as the original does: add a half, round to single
-    // precision, truncate.
-    let point = position.map(|v| (v + 0.5).trunc());
-    if point.iter().any(|v| !v.is_finite() || *v < 0.0) {
-        return None;
-    }
-    let point = point.map(|v| v as i32);
-    // The arrays are always FULL tiles on a side, whatever the lot's size.
-    let size = i32::from(world.size).min(FULL as i32);
-    let [first, second] = point.map(|p| p >> 4);
-    if !(0..size).contains(&first) || !(0..size).contains(&second) {
-        return None;
-    }
-    let full = FULL;
-    let altitude = world
-        .arrays
-        .get(&ALTITUDE)
-        .filter(|a| a.stride == 4 && a.data.len() == full * full * 4)?;
-    let at = (first as usize * full + second as usize) * 4;
-    let corners = [0, 1, 2, 3].map(|i| altitude.data[at + i]);
-    // The first offset the altitude takes is the second coordinate's.
-    let altitude = sims_sim::head::altitude_at(corners, point[1] & 15, point[0] & 15);
-    Some(sims_sim::head::terrain_height(altitude).to_f32())
 }
 
 /// What makes a person's body: their type, and the appearances and
@@ -323,8 +287,10 @@ impl People {
                 continue;
             }
             if level <= 1 {
-                let at = [animator.position[0], animator.position[1]].map(F32::to_f32);
-                root.translation.y = ground_height(world, at).unwrap_or(0.0);
+                let at = [animator.position[0], animator.position[1]];
+                root.translation.y = sims_sim::head::ground_height(world, at)
+                    .map(F32::to_f32)
+                    .unwrap_or(0.0);
             }
             let base = base_clip(person, skeleton);
             match player.pose(&body.skeleton, animator, &base) {
@@ -466,41 +432,5 @@ mod tests {
             assert_eq!(y, first.1);
         }
         assert_eq!(View::new(&camera(Zoom::Far, 0)).light(), LIGHT);
-    }
-
-    fn lot_with_altitude(corners: [u8; 4]) -> World {
-        let mut world = World::empty();
-        let full = FULL;
-        let data = corners.repeat(full * full);
-        world.arrays.insert(
-            ALTITUDE,
-            sims_formats::lot::Array {
-                width: full,
-                height: full,
-                stride: 4,
-                encoding: 0,
-                data,
-            },
-        );
-        world
-    }
-
-    #[test]
-    fn a_person_stands_on_the_terrain() {
-        let world = lot_with_altitude([3, 3, 3, 3]);
-        let three = sims_sim::head::terrain_height(F32::from_f32(3.0)).to_f32();
-        assert_eq!(ground_height(&world, [40.0, 70.4]), Some(three));
-        // Rounded as the original rounds: half a sixteenth below the lot
-        // is still on it.
-        assert_eq!(ground_height(&world, [-0.5, 0.0]), Some(three));
-        // Off the lot, or with no altitude, there is no ground.
-        assert_eq!(ground_height(&world, [-20.0, 0.0]), None);
-        assert_eq!(ground_height(&world, [64.0 * 16.0, 0.0]), None);
-        assert_eq!(ground_height(&world, [f32::NAN, 0.0]), None);
-        assert_eq!(ground_height(&World::empty(), [40.0, 40.0]), None);
-        // A size beyond the arrays does not reach past them.
-        let mut wide = world.clone();
-        wide.size = 65;
-        assert_eq!(ground_height(&wide, [64.0 * 16.0, 0.0]), None);
     }
 }
