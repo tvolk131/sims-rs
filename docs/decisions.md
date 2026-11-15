@@ -60,6 +60,287 @@ draw by the first (0x4c4907). The original reads a record whose first
 lamp is empty as having none even if its second is set (0x4aec97 counts,
 then 0x4c78c5 reads from the first); ours never builds such a record.
 
+## 2026-11-15: The game's speed and pause are the simulation's globals
+
+The window paced the lot by itself: a tick every 50 ms at normal speed,
+a third and a tenth of that faster, and no ticks while paused. The
+simulation's globals were not touched. The original's code says
+otherwise, so the window now does what its buttons do. Read from the
+disassembly; none of it is checked against a run.
+
+- The speed buttons call the setter (`0x46d697`) with 760 (normal,
+  `0x4425a2`), 924 (fast, `0x46d264`) or 994 (ultra, `0x46d26a`). The
+  setter clamps the speed to 0 to 1000 and keeps it in global 16. While
+  global 18 is not negative, it keeps it there too. The time between
+  two lot updates is 172 − speed × 0.001 × 171 ms, plus 0.5 and
+  truncated (constants at `0x666a24`, `0x667720`, `0x66771c` and
+  `0x667270`). That is 42, 14 and 2 ms. `sims_sim::speed` ports this,
+  and `Lot::set_speed` takes it between ticks.
+- The idle loop (`0x46d9d6`) runs an update each time a period has
+  passed. The update (`0x46d345`) never reads the speed. The speed
+  reaches the simulation only as globals 16 and 18. What reads them
+  there was not looked for.
+- Pausing (`0x46d813`) sets global 17, and running again (`0x46d83a`)
+  clears it. The idle loop does not look at it, so a paused game goes
+  on updating the lot. Each pass is then a partial one (`0x46d553`,
+  already ported): only objects with scheduler flag 2 run,
+  and the clock stands. `Lot::pause` and `Lot::unpause` do this. The
+  window goes on stepping a paused lot. Strict mode on the Goths' house
+  runs 200 paused ticks, and its clock stands through them.
+- In live mode the speed buttons (`0x53a62a`, `0x53a6ad`, `0x53a728`)
+  also run a paused game again. They ask the interface for it
+  (`0x4cee4a`), which applies the speed first and then the unpause
+  (`0x4ce5cc`, `0x46d83a`). `Game::set_speed` does the two the other
+  way round. Both clear the same clocks with no tick between, so the
+  order makes no difference. A button for the speed the game already
+  has does not call the setter (`0x4ce588`), so the time owed carries
+  on. Sol's review found both.
+- **Unverified:**
+  - The pause is refused while a field of the interface
+    (`[0x6f2a58]+0x7c`) is not 0. Here it is never refused.
+  - The setter and running again restart the idle loop's clocks
+    (`+0xb8`, `+0xbc`), after which an update may be due at once. Here
+    the time owed starts again from 0.
+  - The original also caps how far it catches up (`0x4732de`). We keep
+    our cap of 20 ticks a call.
+  - Message 0xc2, which the setter and the pause send to the interface,
+    and its effect on the sounds, are not ported.
+- **Ported: the idle loop's own speed** (`World::idle_speed`, run by
+  `Lot::step` before every update, in strict and play mode).
+  - On a residential lot (`0x40745f`: zoning 1, `0x42b9e3`), before
+    its updates, the idle loop asks whether anyone holds the game to the
+    player's speed (`0x442f9b`, `World::speed_held`). A person in the
+    registry's list holds it when all of these are true:
+    - object data word 34 (`+0x8e`) is 0;
+    - person data word 65 (`+0x60e`) is at most 1;
+    - motive 11 (`+0x7b8`; motives start at `+0x78c`) is not below 0.0
+      (`0x45edc5`, against the 0.0 at `0x66657c`; a NaN counts as
+      below, as the x87 compare branches);
+    - person data word 32 (`+0x5cc`) is 0.
+  - While nobody holds it and global 18 is negative, the idle loop goes
+    to 1000 (`0x46d790`): the setter makes the speed 1000, then global
+    18 keeps the speed it was. While global 18 is not negative,
+    `0x46d790` does nothing (`0x46d795`). So a speed the player sets
+    meanwhile (the setter writes global 18 too) stands, not 1000.
+  - While someone holds it and global 18 is not negative, the idle loop
+    goes back (`0x46d7db`): the setter makes the speed global 18's,
+    then global 18 becomes -1.
+  - Both also restart the idle loop's clocks and send message 0x109 to
+    the interface (1 going to 1000, 0 going back). That is not ported.
+  - **Unverified:**
+    - What word 34, word 65 and motive 11 mean. They presumably mark a
+      Sim who is hidden (away at work or school) and one who is asleep.
+      The full Goth day will exercise this when the household leaves or
+      goes to bed.
+    - Whether the original's speed changes on the Goths' house in the
+      ticks we compare. The strict boot (House05, 1102 ticks) is
+      unchanged by the port, so through it someone always holds the
+      speed and global 18 stays -1.
+  - `Lot::step` runs it before every update. The original's idle loop
+    runs it on every pass, whether an update is due or not and paused
+    or not, so `Lot::idle_speed` runs it between ticks too, and the
+    window calls that on every pass of its own. A speed the player
+    picks after the switch to 1000 then stands, as in the original. The
+    check is idempotent: a second call in the same state does nothing.
+  - The window follows the simulation's speed: ticks are owed at the
+    period of global 16 (1 ms at 1000). Whenever the check calls the
+    setter, even for the speed the game already has (going back to it),
+    the time owed starts again and that pass runs no more ticks, as the
+    setter restarts the clocks. The original may run an update at once
+    then, if its second clock (`0x4732de`) is ready (`0x46da1b`); here
+    the next tick waits a period of the new speed (**unverified**,
+    window timing only). The panel's buttons still show the player's
+    choice.
+  - Sol's reviews found the guard that stood here before was wrong both
+    ways, and that the check has to run between ticks as well. It failed where `0x46d790` keeps global 18's speed. It missed
+    hidden and sleeping Sims, whose words it took to be unkept. Porting
+    the whole head of the idle loop replaced it.
+- Strict `sims boot` never calls the speed or pause hooks. The idle
+  loop's speed never changes on the Goths through tick 1102, so the
+  output is unchanged.
+- **With the dialogs (#171).** While a dialog waits for the player, the
+  window owes no time and does not run the idle loop's check: the lot
+  takes nothing between ticks then (`Lot::idle_speed` is refused, as
+  orders are). Once the dialog is answered, the time owed starts again.
+  Whether the original's idle loop sets its speed while a dialog is up
+  is **unverified**.
+
+## 2026-11-15: The pie menu shows the Sim's head, drawn from in front
+
+The original renders the selected Sim's head live into the middle of the
+pie, in the blank face bitmap (`sims_ui::pie`, kPieFaceBkg, 201 by 201).
+`sims-game` now does the same with `sims-people`'s public parts
+(`People::head`). The Sim is posed as for the lot (`People::posed`). The
+parts bound to the `HEAD` bone are skinned, which gives the head with its
+hair, and glasses where a Sim wears them. The software rasterizer draws
+them into a clear image the size of the face bitmap.
+
+- The camera looks the face in the eye, 10 degrees from above. It is
+  centred on the head and scaled so the head fills 80% of the face
+  across or down. The light comes from the front and above. All of this
+  is our choice. The original's camera, light, size and any animation
+  of the head there (does it follow the pointer, or talk?) were not
+  read, so the head is **not** compared with the original's.
+- The face looks along the root's local +Z. This was found by drawing
+  Mortimer: with +X his right side showed.
+- The head is drawn again with every frame while the menu is open, from
+  the pose of the moment. That poses everyone on the lot a second time
+  for the frame. It only happens while a menu is open.
+- A Sim who cannot be posed (not placed, no `HEAD` bone) gets no head.
+  The face bitmap shows alone, and the problem is listed once among the
+  people's problems.
+
+## 2026-11-15: Manage Inventory walks an inventory; the advertisement record starts zeroed; scope 24 fields 0 and 1
+
+Track 1's pie menus on the Goth house failed in check trees on these.
+Listing every object's menu on the loaded house, 9 failed: 5 on Manage
+Inventory operation 4, 1 on scope 12 and 3 on scope 24 field 0. Now 6
+list. The other 3 (the phones) go on to scope 24 field 1, which is now
+ported too, and then stop at Add/Change Action String's formatter
+(0x44bf1a) on "Call Cab.../Go to Magic Town - $$Local:1", which is
+track 1's.
+
+**Manage Inventory operation 4** (0x455462, with 0x41f69c and 0x41f746)
+finds the next token of a kind after the place in the caller's temp
+`(flags >> 8) & 3`. With flag 0x1 it compares the GUID too; without it,
+any GUID matches. Temp `(flags >> 5) & 3` takes the count and then temp
+`(flags >> 11) & 3` the place. With none they take 0 and -1 and the
+branch is false. Unlike operation 3, a token with a count of 0 is found.
+The search starts at the place plus one as a word, so after 0x7fff it
+wraps negative and finds nothing. The place written is the token's index
+cut to a word, with no check (0x41f6d5 to 0x41f6e1; operation 3's
+0x41f677 to 0x41f684 likewise, where this used to fail). A token at
+index 65535 is written as place -1, and the branch, which tests the
+place, is false. As for every operation, the owner's
+inventory is made if it has none, and with GUID 0 the stack object's is
+read first, whether or not the flag uses it. Setting the interface's
+inventory flag on success is presentation.
+
+**The advertisement record before the first copy.** The earlier entry
+left it unread, failing loudly. It is now ported from the code: the
+record's constructor (0x475e23) allocates its sixteen advertisements and
+zeroes each one, and it runs from the static initializer 0x458271, which
+is in the start-up table at 0x6c0154. Nothing else references the
+record: 0x6e5100 appears only in that initializer, its destructor and
+the pointer 0x6c437c. The pointer is read only by the three scopes and
+the copy 0x4763c5. So until the first copy, scopes 12, 28 and 29 read 0,
+and a copy of fewer than sixteen leaves zeros in the rest. In the World,
+`advertisement_record` stays None until something writes it, and None
+stands for those zeros, so the encoding and every hash are unchanged.
+This holds for a game that has not run a lot since it started, as every
+capture has.
+
+**Scope 24 field 0** (0x425baa) is the ID (object +0xf0) of the first
+person in the lot's list of people (lot +0x84, `World::people`) whose
+definition (+0x11c) is the one the record is linked to (+8). It is 0 if
+none matches. We compare GUIDs. When more than one definition has the
+record's GUID, the reload can link a record it made to a replaced one,
+which the World does not keep; that fails loudly.
+
+**Scope 24 field 1** (0x425be2) is 1 if the selected family's members
+(+0x12c, 0x4101f2) include the GUID of the record's linked definition,
+which is the record's own (0x4572af); else 0. With no family selected it
+is 0. The original reads the selected family's pointer (game +0x10).
+Every setter of global 9 to a family's ID stores that family's pointer
+with it (0x4f2218 with 0x4f222b, 0x4282b7 with 0x428317), and scripts
+cannot write global 9. So a global 9 other than 0 names the selected
+family. A global 9 of 0 does not:
+
+- 0x415fc6 and 0x4164f6 clear it and select family 0 (0x415fd7,
+  0x416509);
+- 0x4278f6 clears it and leaves the pointer;
+- the game's start and end set the pointer alone (0x415bd2, 0x415d21,
+  0x415ecd).
+
+The World keeps no pointer, so with global 9 at 0 the field fails loudly
+(Sol's review found that reading it as no family was wrong when family 0
+is selected). A global 9 that names no family is `Trap::Invalid`. A record of a GUID with no definition fails, as the
+original would read through a null pointer.
+
+**Verified:** the Goth house is byte-identical through tick 2881, hash
+included (`eed688a0...`). The rest is checked against the code only: no
+capture lists a menu.
+
+## 2026-11-15: A click picks what the frame shows at the pixel
+
+The game window picks from the per-pixel IDs the lot and its people
+were drawn with (`Canvas::id_at`, previous entry), replacing its guess
+from each object's tile and its own copy of the people's drawing loop
+(`sims-game` now draws people with `draw_on_lot`, pixel for pixel as
+before; the Goth test checks it against `sims-people`'s own call).
+`sims_game::pick::at` takes, in the frame last drawn:
+
+1. the person shown at the pixel, or the one shown nearest within two
+   pixels (`REACH`, as before: people are thin);
+2. else the object shown at the pixel itself, with no search around it.
+
+So a person or object behind a wall or a bookcase takes no click meant
+for what hides it, and a short object in front of a tall one no longer
+takes clicks on the tall one's upper part. A click near a person still
+picks the person over the object under the pointer, as before.
+
+**A tile of a multi-tile object is picked as itself, not mapped to its
+group's lead.** Each tile is its own object in the world, and the pie
+menu is listed for the tile (`Lot::pie_menu`); the simulation then
+sends a tile's interactions on to the tile that takes them, as the
+original's `interaction_target` (0x435286) does (`menu::target`): the
+first tile of the group whose definition word 8 is the clicked tile's
+negated, when that is positive. Mapping every tile to the lead here
+would skip that rule, which picks a tile other than the lead for some
+groups. This is what the tile guess did too. **Unverified:** how the
+original turns a click into an object (an ID buffer as here, or
+otherwise), and whether it passes the tile or its lead to the pie
+menu, are not read; compare the object the original lists at the same
+pixel once the harness can click. Reopen if it maps to the lead.
+
+## 2026-11-15: The player answers a dialog from the window
+
+`sims_vm::boot::Lot` could only answer from a fixed list given at load,
+so in the window the Goths' house had to say No to the Help System
+before it opened. A lot can now wait instead (`Lot::wait_for_answers`).
+When a tick shows a dialog with a choice and no answer is left, the
+step does not fail. The lot goes back to how it was before the tick:
+world, play-mode state, tick count and player. The dialog
+(`Asking::shown`) and the world as the tick left it (`Asking::world`,
+where the dialog's record is) are kept. Steps say `StepError::Asking`
+and orders are refused until `Lot::answer` gives one of the dialog's
+answers. The next step then runs the tick again from the start with
+that answer queued. Until it has, orders are still refused: the lot is
+as it was before the tick, and a listing or an order then would change
+it where the original's never was (Sol's review found the window
+listing a menu there). The simulation is deterministic, so the tick runs
+as it would have with the answer listed at load. The test checks this:
+the Goths' lot answered from the window gives the same world hash,
+dialogs answered and sounds as `--answers 3`, tick for tick, through
+tick 200.
+
+Why the tick runs again rather than resuming: the dialog is shown in the
+registry's pass at the end of the update (`0x4412d1`). That pass is
+deep in the tick, and our interpreter cannot stop there and go on later.
+
+- Strict boot never waits, so it is unchanged. `sims boot --answers 3`
+  on the Goths' house to tick 1102 prints the same as main's, byte for
+  byte. A lot that does not wait still halts at an unanswered dialog,
+  as before.
+- The cost is a copy of the world before every step of a waiting lot:
+  0.1 to 0.4 ms on the Goths' house, measured with a step of 0.15 to
+  0.6 ms. A tick at ultra speed has 5 ms here (`sims-game`'s pace).
+- **Unverified:**
+  - A sound the tick makes before the dialog is requested when the tick
+    runs again, after the answer. The original presumably plays it
+    before the dialog.
+  - The original drew the house view many times while the Help System's
+    dialog waited (`docs/roadmap.md`, the draw guard). We draw no frame
+    of the simulation while waiting. A drawn frame writes animator state
+    (`draw_frame`), so the frames are an input that may matter.
+- The window (`sims-game`) always waits. A press on a button gives the
+  answer the button stands for: 2, 3 or 4 for the first to the third
+  (`Shown::answers`), and the tick runs again at once. While the dialog
+  waits, the time owed to the lot is dropped, remainder and all, so the
+  lot does not race to catch up after the answer.
+  `--answers` still answers first. `--png` has nobody to answer, so for
+  the Goths' house it still defaults to `3`.
+
 ## 2026-11-15: Pausing holds the sounds playing, as the original's sound manager does
 
 The sound's pause and unpause, kinds 21 and 22, are ported from the
