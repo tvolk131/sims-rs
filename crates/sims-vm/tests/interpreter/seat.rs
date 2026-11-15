@@ -285,30 +285,33 @@ fn a_sit_tree_that_cannot_be_pushed_fails_loudly_and_leaves_the_route_as_it_was(
     assert!(!sat(&fx));
 }
 
+/// Puts an action at the front of `me`'s queue (flag 2), so that it wants
+/// to be interrupted (0x45d7c0).
+fn interrupting(fx: &mut Fixture, me: u16) {
+    let person = fx
+        .world
+        .objects
+        .get_mut(&me)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person.data[71] = 0;
+    person.queue.insert(
+        0,
+        sims_formats::saved_objects::Interaction {
+            flags: 2,
+            ..person.active.clone()
+        },
+    );
+}
+
 #[test]
 fn a_person_who_wants_to_be_interrupted_fails_with_result_4_if_its_animator_may_stop() {
     // 0x45b18b: an action pushed to the front of the queue (flag 2)
     // interrupts (0x45d7c0). With no animator, the loaded one's state (3)
     // may stop (0x589ead): the route fails with result 4 before any
     // search, and no failure feedback runs.
-    let interrupting = |fx: &mut Fixture, me: u16| {
-        let person = fx
-            .world
-            .objects
-            .get_mut(&me)
-            .unwrap()
-            .person
-            .as_mut()
-            .unwrap();
-        person.data[71] = 0;
-        person.queue.insert(
-            0,
-            sims_formats::saved_objects::Interaction {
-                flags: 2,
-                ..person.active.clone()
-            },
-        );
-    };
     let (mut fx, me) = lot([56, 40], 4, 1 << 2);
     interrupting(&mut fx, me);
     assert_eq!(go_to(&mut fx, me), Ok(false));
@@ -326,4 +329,17 @@ fn a_person_who_wants_to_be_interrupted_fails_with_result_4_if_its_animator_may_
     );
     assert_eq!(go_to(&mut fx, me), Ok(true));
     assert!(sat(&fx));
+}
+
+#[test]
+fn on_the_way_to_a_door_an_interrupted_person_fails_with_result_4() {
+    // The lamp is in room 2 (data word 29), so the route goes through a
+    // door (step 2, 0x45afd0), which first tests for an interruption as
+    // step 1 does: the route fails with result 4 before any door is
+    // chosen.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    fx.lamp_mut().data[29] = 2;
+    interrupting(&mut fx, me);
+    assert_eq!(go_to(&mut fx, me), Ok(false));
+    assert_eq!(route_result(&fx, me), 4);
 }
