@@ -1262,12 +1262,13 @@ impl Interpreter<'_> {
                             return Ok(Some(Refusal::Collision(Some(other))));
                         }
                     }
-                } else if !itself && person.is_none() && index == 8 {
-                    if let Some(refusal) =
+                } else if !itself
+                    && person.is_none()
+                    && index == 8
+                    && let Some(refusal) =
                         self.tile_clash(world, id, other, not_solid, exclusive)?
-                    {
-                        return Ok(Some(refusal));
-                    }
+                {
+                    return Ok(Some(refusal));
                 }
                 current = slot(world, other, 0).map_err(fail)?;
             }
