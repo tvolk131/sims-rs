@@ -299,11 +299,87 @@ fn not_fitting_sets_words_52_and_54_from_the_placement_error() {
     let data = &fx.world.objects[&me].data;
     assert_eq!((data[52], data[54]), (0, other as i16));
     assert_eq!(fx.world.objects[&me].position, [40, 40, 1]);
-    // With flag bit 1, whether that person lets me through (0x45bd5e) is
-    // not ported.
+    // With flag bit 1 that person would be asked to make way (0x45bd5e),
+    // but the catalog has no marker type (0x43ac10): not asked.
+    fx.world = start.clone();
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 2), Ok(false));
+    let data = &fx.world.objects[&me].data;
+    assert_eq!((data[52], data[54]), (0, other as i16));
+    // With the marker type, whose menu entry 3 moves the person.
+    let marker_file = fx.add_type(0x7c4, 4, 0, 0x1006);
+    fx.add(
+        marker_file,
+        0x1006,
+        tree(vec![
+            assign(scope::PARAMETERS, 0, scope::LITERAL, 100, 1),
+            ins(0, 0, 0, [0; 8]),
+        ]),
+    );
+    let library = fx.program.libraries.get_mut(&marker_file).unwrap();
+    library.definitions.get_mut(&128).unwrap()[7] = 1007;
+    let entry = sims_formats::behavior::Interaction {
+        action: 4302,
+        test: 0,
+        string_index: 3,
+        flags: 0,
+        autonomy: 50,
+        attenuation_code: 0,
+        attenuation: 0.0,
+        joining_index: -1,
+        motives: Vec::new(),
+        flags2: 0,
+    };
+    library.interactions.insert(
+        1007,
+        Some(sims_formats::behavior::InteractionTable {
+            version: 7,
+            interactions: vec![entry; 4],
+        }),
+    );
     fx.world = start;
-    let result = snap(&mut fx, me, LAMP as i16, 0, 3, 2);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454e54")));
+    fx.world
+        .objects
+        .get_mut(&me)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .active
+        .priority = 77;
+    let before: Vec<u16> = fx.world.objects.keys().copied().collect();
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 2), Ok(false));
+    let data = &fx.world.objects[&me].data;
+    assert_eq!((data[52], data[54]), (1, other as i16));
+    // A marker stands where the other person does, its slot written
+    // over: the four straight directions, resolution 16.
+    let marker = *fx
+        .world
+        .objects
+        .keys()
+        .find(|id| !before.contains(id))
+        .unwrap();
+    assert_eq!(fx.world.objects[&marker].guid, 0x7c4);
+    assert_eq!(fx.world.objects[&marker].position, [56, 56, 1]);
+    let slot = fx.world.routing.slots[&(marker, 0)];
+    assert_eq!(slot.flags, 0x55 | 0x100 | 0x2000);
+    assert_eq!((slot.proximity, slot.resolution), ([16, 80, 16], 16));
+    // The other person has the marker's move action, at my running
+    // action's priority.
+    let queue = &fx.world.objects[&other].person.as_ref().unwrap().queue;
+    assert!(
+        queue.iter().any(|a| a.target == marker as i16
+            && a.table_index == 3
+            && a.priority == 77
+            && a.action == 4302),
+        "{queue:?}"
+    );
+    // Asked once, the person is not asked again.
+    let data = fx.world.objects.get_mut(&me).unwrap();
+    data.data[52] = 9;
+    let count = fx.world.objects.len();
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 2), Ok(false));
+    assert_eq!(fx.world.objects[&me].data[52], 0);
+    assert_eq!(fx.world.objects.len(), count);
 }
 
 /// Sets wall segments on a tile of the ground level (lot array 2, 14

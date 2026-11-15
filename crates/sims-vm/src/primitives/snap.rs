@@ -499,8 +499,9 @@ impl Machine<'_, '_> {
     /// 1. Object data word 52 (+0xb2) becomes 0.
     /// 2. If I am a person, flag bit 1 (`blocked_by_person`) is set, and
     ///    another person is in the way (code 11), word 52 becomes 1 when
-    ///    0x45bd5e says so of that person with mine at person +0xa64;
-    ///    that test is not ported and fails loudly.
+    ///    that person is asked to make way (0x45bd5e,
+    ///    [`Machine::ask_to_make_way`]) at my running action's priority
+    ///    (person +0xa64).
     /// 3. If word 52 is still 0 and the error is 1 (off the lot), it
     ///    becomes 2.
     /// 4. Word 54 (+0xb6) becomes the ID of the object collided with, or
@@ -530,22 +531,24 @@ impl Machine<'_, '_> {
         };
         let code = code.unwrap_or(0);
         self.set_datum(WORD_52, 0)?;
-        if self.me()?.person.is_some()
+        let mut asked = false;
+        if let Some(me) = self.me()?.person.as_ref()
             && blocked_by_person
             && code == 11
-            && collided.is_some_and(|id| {
+            && let Some(other) = collided.filter(|id| {
                 self.world
                     .objects
-                    .get(&id)
+                    .get(id)
                     .is_some_and(|o| o.person.is_some())
             })
         {
-            return Err(unsupported(
-                "0x454e54",
-                "to a place another person is in, with flag bit 1, which asks 0x45bd5e",
-            ));
+            let priority = me.active.priority;
+            asked = self.ask_to_make_way(other, priority)?;
+            if asked {
+                self.set_datum(WORD_52, 1)?;
+            }
         }
-        if code == 1 {
+        if !asked && code == 1 {
             self.set_datum(WORD_52, 2)?;
         }
         self.set_datum(WORD_54, collided.map_or(0, |id| id as i16))?;
