@@ -4,6 +4,7 @@
 
 use sims_game::game::goth_house;
 use sims_game::people::People;
+use sims_game::pick;
 use sims_game::view::View;
 use sims_game::{Game, Options};
 use sims_render::{Canvas, open_house};
@@ -71,7 +72,7 @@ fn people_stand_where_a_click_finds_them() {
     let view = View::new([800, 600], shape.built_center(), opened.rotation);
     let mut canvas = Canvas::new(800, 600, [0, 0, 0]);
     sims_render::draw(world, &shape, &mut opened.assets, &view.camera, &mut canvas);
-    let bare = canvas.color.clone();
+    let bare = canvas.clone();
     let mut theirs = canvas.clone();
     let mut people = People::open(&install, &house).expect("the people's files");
     people.refresh(world);
@@ -83,48 +84,64 @@ fn people_stand_where_a_click_finds_them() {
     let drawn = reference.draw_on_lot(world, &view.camera, &mut theirs);
     assert!(drawn.people > 0 && drawn.problems.is_empty(), "{drawn:?}");
     assert!(theirs.color == canvas.color && theirs.depth == canvas.depth);
-    let drawn = bare
+    let points: Vec<[i32; 2]> = (0..600)
+        .flat_map(|y| (0..800).map(move |x| [x, y]))
+        .collect();
+    let changed: Vec<[i32; 2]> = points
         .iter()
-        .zip(&canvas.color)
-        .filter(|(a, b)| a != b)
-        .count();
-    assert!(drawn > 200, "only {drawn} pixels of people drawn");
+        .copied()
+        .filter(|&[x, y]| {
+            let i = y as usize * 800 + x as usize;
+            bare.color[i] != canvas.color[i]
+        })
+        .collect();
+    assert!(
+        changed.len() > 200,
+        "only {} pixels of people drawn",
+        changed.len()
+    );
     // A click on a pixel a person was drawn in finds a person; one far
     // from every person finds none.
     let mut found = std::collections::BTreeSet::new();
-    let changed: Vec<usize> = (0..bare.len())
-        .filter(|&i| bare[i] != canvas.color[i])
-        .collect();
-    for &i in &changed {
-        let point = [(i % 800) as i32, (i / 800) as i32];
-        let id = people
-            .at(world, point)
+    for &point in &changed {
+        let id = pick::person(world, &canvas, point)
             .unwrap_or_else(|| panic!("nobody at {point:?}, which a person was drawn in"));
         assert!(world.objects[&id].person.is_some(), "object {id}");
         found.insert(id);
     }
     assert!(!found.is_empty(), "no drawn person is found by a click");
-    let far = (0..bare.len())
-        .find(|&i| {
-            let [x, y] = [(i % 800) as i32, (i / 800) as i32];
-            changed.iter().all(|&j| {
-                let [cx, cy] = [(j % 800) as i32, (j / 800) as i32];
-                (cx - x).abs() > 20 || (cy - y).abs() > 20
-            })
-        })
+    let far = |&[x, y]: &[i32; 2]| {
+        changed
+            .iter()
+            .all(|&[cx, cy]| (cx - x).abs() > 20 || (cy - y).abs() > 20)
+    };
+    let far_point = *points
+        .iter()
+        .find(|p| far(p))
         .expect("a pixel far from every person");
-    assert_eq!(
-        people.at(world, [(far % 800) as i32, (far / 800) as i32]),
-        None
-    );
+    assert_eq!(pick::person(world, &canvas, far_point), None);
+    // Far from everyone, a click finds the object shown at the pixel, as
+    // the lot alone shows it: each object on the lot that shows a pixel
+    // there is found by a click on it.
+    let mut objects = std::collections::BTreeSet::new();
+    for point in points.iter().filter(|p| far(p)) {
+        let shown = bare.id_at(point[0], point[1]);
+        assert_eq!(canvas.id_at(point[0], point[1]), shown, "{point:?}");
+        let picked = pick::at(world, &canvas, *point);
+        assert_eq!(picked, shown, "{point:?}");
+        if let Some(id) = picked {
+            assert!(world.objects[&id].person.is_none(), "object {id}");
+            objects.insert(id);
+        }
+    }
+    assert!(objects.len() > 20, "only {} objects found", objects.len());
     // Behind a lot nearer than everyone, nobody is drawn, and a click
     // where they stand finds nobody.
     let mut covered = Canvas::new(800, 600, [0, 0, 0]);
     covered.depth.fill(i32::MIN);
     people.draw(world, &view.camera, &mut covered);
-    for &i in changed.iter().step_by(7) {
-        let point = [(i % 800) as i32, (i / 800) as i32];
-        assert_eq!(people.at(world, point), None, "{point:?}");
+    for &point in changed.iter().step_by(7) {
+        assert_eq!(pick::at(world, &covered, point), None, "{point:?}");
     }
 }
 

@@ -1924,7 +1924,7 @@ Progress:
 - Done: which object or person drew each pixel, for clicks:
   `Canvas::id_at` after `sims_render::draw` and `People::draw_on_lot`.
   Objects name themselves, people their object ID, and terrain, floors
-  and walls nobody. The game window can pick by it instead of by tile.
+  and walls nobody. The game window picks by it.
   How the original finds what a click hit is not read.
 - Done: the pools of light lit lamps throw on the floor, from the
   game's `lightMap.dat`, and lit lamps drawn in full light, as the
@@ -2153,6 +2153,12 @@ through their public interfaces only; the simulation never depends on it.
   (0x58da12), which is not ported, so in strict mode (`Lot::select`)
   switching Sims fails and changes nothing; play mode
   (`Lot::select_play`) leaves the refresh out.
+- Done: a click picks what the frame shows at the pixel
+  (`Canvas::id_at`, `sims_game::pick`): the person shown there or
+  nearest within two pixels, else the object shown there. A tile of a
+  multi-tile object is picked as itself; the simulation sends its
+  interactions on (0x435286). How the original finds what a click hit
+  is not read.
 - **Next:** the selected Sim's head in the middle of the pie; answering
   a dialog from the window.
 - **Needs from other crates:**
@@ -2160,17 +2166,11 @@ through their public interfaces only; the simulation never depends on it.
     on Manage Inventory operation 4 and scope 12. A check tree's fault
     should keep its trap rather than become `Unsupported` text, which
     `sims-game` reads to tell unported from failed.
-  - `sims-render`: which object drew each pixel (an object ID buffer
-    beside the depth), so a click picks the object under it. Today
-    `sims-game` guesses from each object's tile.
   - `sims-vm`: a way to answer a dialog from the window (the `Lot`'s
     player is a fixed answer list given at load), and to change the
     game's speed global. A play-mode step that fails should still hand
     back the errors it caught before failing, and say which frame
     (before or after the tick) was skipped.
-  - `sims-people`: which person drew each pixel (`draw_on_lot` with an
-    owner per pixel), so `sims-game` need not repeat its drawing loop
-    to find the person a click lands on.
   - `sims-vm`: the animator's refresh (0x58da12), which deselecting a
     Sim makes, so strict mode can switch Sims.
   - `sims-people`: the selected Sim's head as an image, which the
