@@ -401,12 +401,35 @@ impl Machine<'_, '_> {
     ///
     /// The action takes the next number ([`sims_sim::World::action_serial`],
     /// 0x41f158) and goes after every queued action of at least its
-    /// priority. A full queue takes nothing. An entry that runs at once,
-    /// an action put at the front (flag 2), and one that goes before
-    /// queued actions (which are dropped, each object told with its
-    /// function 4) fail loudly. The original's branch for an action queued
-    /// while one runs at once (0x6e5294) is never taken here, as running
-    /// at once is not ported.
+    /// priority. A full queue takes nothing. An action put at the front
+    /// (flag 2), and one that goes before queued actions (which are
+    /// dropped, each object told with its function 4) fail loudly. So does
+    /// an action queued on the person whose action runs at once, while it
+    /// runs: the original then copies the new action over the running one
+    /// (0x45d5a5).
+    ///
+    /// An entry that runs at once is not queued (0x45d240):
+    ///
+    /// 1. The action is checked as the player's pie menu checks it
+    ///    (0x4582ad, 0x458319; [`Machine::check_chosen`]). One that fails
+    ///    is not run, and None is returned.
+    /// 2. While another action runs at once (0x6e5294 is set), None is
+    ///    returned.
+    /// 3. The person's data word 33 (+0x5ce) takes the action's priority,
+    ///    and the action's tree, of the target's file, runs synchronously
+    ///    on the person's stack (0x474afb, 0x4749b5) with the target as its
+    ///    stack object. Its arguments are the words of the action from
+    ///    +0x14: the action's four arguments, then its priority's two
+    ///    halves and its tree. What it returns is not read; a tree the
+    ///    file lacks writes the synchronous run's mark and runs nothing.
+    ///    Data word 33 is then put back.
+    /// 4. An action without a number then takes one (0x45d2ef), which is
+    ///    returned.
+    /// 5. The person's temps, if the check's tree saved them, are put
+    ///    back (0x4582dd).
+    ///
+    /// Only the running person's own actions are run at once here: an
+    /// entry that runs at once queued on another person fails loudly.
     pub(crate) fn queue_action(
         &mut self,
         id: u16,
@@ -415,13 +438,15 @@ impl Machine<'_, '_> {
     ) -> Result<Option<i32>, Trap> {
         match at_once {
             None => return Ok(None),
-            Some(true) => {
-                return Err(unsupported(
-                    "0x45d240",
-                    "queueing an action that runs at once",
-                ));
-            }
+            Some(true) => return self.run_at_once(id, action),
             Some(false) => {}
+        }
+        if self.running_at_once == Some(id) {
+            return Err(unsupported(
+                "0x45d5a5",
+                "queueing an action on the person whose action runs at once, which the \
+                 original copies over the running one",
+            ));
         }
         self.world.action_serial = self.world.action_serial.wrapping_add(1);
         action.uid = self.world.action_serial;
@@ -454,6 +479,143 @@ impl Machine<'_, '_> {
         let uid = action.uid;
         queue.push(action);
         Ok(Some(uid))
+    }
+
+    /// Runs an action whose entry runs at once (0x45d240; see
+    /// [`Machine::queue_action`]).
+    fn run_at_once(&mut self, id: u16, mut action: Interaction) -> Result<Option<i32>, Trap> {
+        if id != self.me {
+            return Err(unsupported(
+                "0x45d240",
+                "running at once an action queued on another person",
+            ));
+        }
+        let mut saved = None;
+        let result = self.check_and_run_at_once(id, &mut action, &mut saved);
+        if let Some(temps) = saved {
+            self.me_mut()?.temps = temps;
+        }
+        result
+    }
+
+    /// Steps 1 to 4 of running an action at once.
+    fn check_and_run_at_once(
+        &mut self,
+        id: u16,
+        action: &mut Interaction,
+        saved: &mut Option<Vec<i16>>,
+    ) -> Result<Option<i32>, Trap> {
+        self.check_chosen(action, saved, None)?;
+        if action.flags & crate::autonomy::checked::PASSED == 0 || self.running_at_once.is_some() {
+            return Ok(None);
+        }
+        let target = u16::try_from(action.target)
+            .ok()
+            .filter(|t| self.world.objects.contains_key(t))
+            .ok_or_else(|| {
+                Trap::Invalid(format!(
+                    "an action run at once has no target object ({})",
+                    action.target
+                ))
+            })?;
+        let resource = self.definition(self.world.objects[&target].guid)?.resource;
+        let kept = self.person_data(id, PRIORITY)?;
+        self.set_person_data(id, PRIORITY, action.priority as i16)?;
+        // The priority is put back however the run ends.
+        let ran = self.run_tree_at_once(id, target, resource, action);
+        self.set_person_data(id, PRIORITY, kept)?;
+        ran?;
+        if action.uid == 0 {
+            self.world.action_serial = self.world.action_serial.wrapping_add(1);
+            action.uid = self.world.action_serial;
+        }
+        Ok(Some(action.uid))
+    }
+
+    /// Runs the action tree of an action run at once on its target, with
+    /// the four arguments, the priority's two halves and the tree as its
+    /// parameters (0x474afb, 0x4749b5).
+    fn run_tree_at_once(
+        &mut self,
+        id: u16,
+        target: u16,
+        resource: usize,
+        action: &Interaction,
+    ) -> Result<(), Trap> {
+        let tree = action.action;
+        match self.program.tree(resource, tree) {
+            crate::program::Tree::Missing => {
+                self.write_mark()?;
+            }
+            crate::program::Tree::Primitive(id) => {
+                return Err(Trap::Unsupported(format!(
+                    "an action run at once whose tree {id:#06x} names a primitive"
+                )));
+            }
+            crate::program::Tree::Behavior(..) => {
+                let [a, b, c, d] = action.args;
+                let priority = action.priority as u32;
+                let args = [
+                    a,
+                    b,
+                    c,
+                    d,
+                    priority as u16 as i16,
+                    (priority >> 16) as u16 as i16,
+                    tree as i16,
+                ];
+                let interpreter = crate::Interpreter {
+                    running_at_once: Some(id),
+                    ..self.interpreter()
+                };
+                interpreter
+                    .call_as(
+                        self.world,
+                        id,
+                        target,
+                        tree,
+                        target as i16,
+                        &args,
+                        args.len(),
+                        crate::TURN_BUDGET,
+                        &mut None,
+                    )
+                    .map_err(|fault| {
+                        Trap::Unsupported(format!(
+                            "the tree {tree:#06x} of object {target}, run at once: {fault}"
+                        ))
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Person data word `index` of person `id`.
+    fn person_data(&self, id: u16, index: usize) -> Result<i16, Trap> {
+        self.world
+            .objects
+            .get(&id)
+            .and_then(|o| o.person.as_ref())
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .data
+            .get(index)
+            .copied()
+            .ok_or_else(|| Trap::Invalid(format!("person data has no word {index}")))
+    }
+
+    /// Sets person data word `index` of person `id`.
+    fn set_person_data(&mut self, id: u16, index: usize, value: i16) -> Result<(), Trap> {
+        let word = self
+            .world
+            .objects
+            .get_mut(&id)
+            .and_then(|o| o.person.as_mut())
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .data
+            .get_mut(index)
+            .ok_or_else(|| Trap::Invalid(format!("person data has no word {index}")))?;
+        *word = value;
+        Ok(())
     }
 
     /// Takes the action numbered `uid` off a person's queue (0x45d5f8),
