@@ -278,8 +278,11 @@ fn a_multi_tile_object_is_rebuilt_as_a_group() {
     let (mut fx, file) = lot();
     let lead = stand(&mut fx, [2, 2]);
     let tile = stand(&mut fx, [3, 2]);
-    // The definition is in a group (word 10).
+    // The definition is in a group (word 10), and is the group's master
+    // (word 11 -1, 0x43adf7): the door test on taking a tile off reads
+    // the master (0x45728d).
     fx.words(file)[10] = 5;
+    fx.words(file)[11] = -1;
     for (id, parent, place) in [(lead, 0, 0), (tile, lead as i16, 1)] {
         fx.world.objects.get_mut(&id).unwrap().multipart = Some(Multipart {
             offset: [place, 0, 0],
