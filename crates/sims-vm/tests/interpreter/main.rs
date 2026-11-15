@@ -18,6 +18,7 @@ mod headline;
 mod load;
 mod memory;
 mod motive_change;
+mod named_tree;
 mod neighbors;
 mod object_type;
 mod object_uses;

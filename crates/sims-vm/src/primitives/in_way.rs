@@ -409,10 +409,15 @@ impl Machine<'_, '_> {
     /// priority. A full queue takes nothing. An action with flag 2 goes
     /// at the front instead ([`Machine::queue_at_front`]). One that goes
     /// before queued actions (which are dropped, each object told with its
-    /// function 4) fails loudly. So does an action queued, not at the
-    /// front, on the person whose action runs at once, while it runs: the
-    /// original then copies the new action over the running one
-    /// (0x45d5a5).
+    /// function 4) fails loudly.
+    ///
+    /// An action queued, not at the front, on the person whose action runs
+    /// at once, while it runs, is copied over the running action (0x45d5a5,
+    /// 0x41edbf: every field, its number and flags too), and is queued as
+    /// well, or not when the queue is full. With the new action's flag
+    /// 0x40, the original first gives it the running action's name
+    /// (0x41f167, 0x41f1ae), which sets its flag 0x80; the flag is set
+    /// here, but the names of queued actions are not kept.
     ///
     /// An entry that runs at once is not queued (0x45d240):
     ///
@@ -430,7 +435,8 @@ impl Machine<'_, '_> {
     ///    file lacks writes the synchronous run's mark and runs nothing.
     ///    Data word 33 is then put back.
     /// 4. An action without a number then takes one (0x45d2ef), which is
-    ///    returned.
+    ///    returned. An action the tree queued on the person was copied over
+    ///    it, so it has that action's number.
     /// 5. The person's temps, if the check's tree saved them, are put
     ///    back (0x4582dd).
     ///
@@ -452,13 +458,6 @@ impl Machine<'_, '_> {
         if action.flags & TO_FRONT != 0 {
             return self.queue_at_front(id, action);
         }
-        if self.running_at_once == Some(id) {
-            return Err(unsupported(
-                "0x45d5a5",
-                "queueing an action on the person whose action runs at once, which the \
-                 original copies over the running one",
-            ));
-        }
         let queue = &mut self
             .world
             .objects
@@ -475,6 +474,16 @@ impl Machine<'_, '_> {
                 "0x45d4c8",
                 "queueing an action before others, which are dropped",
             ));
+        }
+        // While the person's action runs at once, the new action is copied
+        // over it, number and all, and is queued as well (0x45d5a5).
+        if let Some(running) = self.running_at_once.filter(|r| r.person == id) {
+            // With flag 0x40 the action first takes the running action's
+            // name, which sets its flag 0x80 (0x41f1ae).
+            if action.flags & 0x40 != 0 {
+                action.flags |= 0x80;
+            }
+            *running.action.borrow_mut() = action.clone();
         }
         if queue.len() >= QUEUE {
             return Ok(None);
@@ -585,7 +594,7 @@ impl Machine<'_, '_> {
         id: u16,
         target: u16,
         resource: usize,
-        action: &Interaction,
+        action: &mut Interaction,
     ) -> Result<(), Trap> {
         let tree = action.action;
         match self.program.tree(resource, tree) {
@@ -609,8 +618,12 @@ impl Machine<'_, '_> {
                     (priority >> 16) as u16 as i16,
                     tree as i16,
                 ];
+                let running = std::cell::RefCell::new(action.clone());
                 let interpreter = crate::Interpreter {
-                    running_at_once: Some(id),
+                    running_at_once: Some(crate::interpreter::AtOnce {
+                        person: id,
+                        action: &running,
+                    }),
                     ..self.interpreter()
                 };
                 interpreter
@@ -630,6 +643,7 @@ impl Machine<'_, '_> {
                             "the tree {tree:#06x} of object {target}, run at once: {fault}"
                         ))
                     })?;
+                *action = running.into_inner();
             }
         }
         Ok(())

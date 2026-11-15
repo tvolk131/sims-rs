@@ -37,6 +37,39 @@ in category 3 (0x46d91c, tree 0x1007 node 2). Strict mode on the Goth
 house is unchanged. Reopen when a recording of the snack order disagrees,
 or when a push to the front meets a full queue.
 
+## 2026-11-15: Run Tree By Name modes 0 and 1 on my thread; an action queued during an at-once run takes its place
+
+**Unverified.**
+
+**Run Tree By Name.** Mode 0 (0x44bb75) runs the named tree of the stack
+object's type on the running object's own thread. I stay me, the stack
+object stays its stack object, and my temps are the arguments. Mode 1
+runs it on the stack object's thread, so mode 1 with myself as the stack
+object is the same run. The tree runs at once, to its end, and its result
+is the branch. 0x4749b5 treats the running thread like any other: it
+pushes a stop frame and the tree's frame above my frames, runs until the
+stop frame, and then puts back the thread word it cleared. The port runs
+the tree above my frames in the same way.
+
+**Queueing during an at-once run.** While a person's action runs at
+once, an action queued on that person is copied over the running action,
+including its number and flags (0x45d5a5, 0x41edbf). It is also queued,
+unless the queue is full. The at-once run then returns the queued
+action's number and takes none of its own. This replaces the loud
+refusal recorded in the at-once entry below.
+
+With flag 0x40, the original also gives the queued action the running
+action's name (0x41f167, 0x41f1ae), which sets its flag 0x80. The flag is
+set here, but queued actions' names are not kept.
+
+In modes 0 and 1 a check tree's advertisements (the global record at
+0x6c437c) stay the same record through the named run.
+
+**On Goth.** The first pick on person 16 now queues the social through
+the object its tree made, and returns that action's number. The next
+step stops on Animate Sim on the base slot (0x58957e). Reopen when the
+harness records a social pick.
+
 ## 2026-11-15: Grab puts the stack object in my first slot; a person's slots include its own five
 
 Grab (opcode 4, 0x451dda) ignores its operands. It looks the stack
