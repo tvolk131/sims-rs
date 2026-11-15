@@ -1963,6 +1963,10 @@ Progress:
   tables (grass takes none in the original). Far zoom at rotation 2
   rose from 90.1% to 90.3% exact; of the pixels they change, 70% now
   match exactly and the rest are mostly a step off.
+- Done: a floor tile split by a diagonal wall takes the blade count of
+  the tile drawn before it, as the original carries it from tile to
+  tile. Near zoom rose from 86.5% to 87.0% exact; of the 2,402 pixels it
+  changes, 2,115 now match.
 - Done: the soft shadows objects cast on the floor and grass under
   them, as the original works them out and draws them. Near zoom rose
   from 86.3% to 87.6% exact, and nine in ten of the pixels the shadows
