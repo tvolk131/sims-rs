@@ -21,6 +21,7 @@
 //! bookcase is shown nowhere, so it does not take a click meant for the
 //! bookcase.
 
+use sims_formats::bitmap::Image;
 use sims_people::View;
 use sims_people::raster::{Target, draw_part};
 use sims_people::{math::Vec3, skin};
@@ -29,6 +30,79 @@ use sims_render::depth::Depth;
 use sims_render::{Camera, Canvas};
 use sims_sim::World;
 use std::path::Path;
+
+/// How much of the pie's face the head fills, across or down, whichever
+/// is reached first.
+pub const HEAD_FILL: f32 = 0.8;
+
+/// The direction a skeleton's face looks, in the root's frame: the root
+/// turns it to the person's direction ([`sims_people::placement`]).
+const FACE_FORWARD: Vec3 = Vec3::new(0.0, 0.0, 1.0);
+
+/// How far down the pie's camera looks at the head: sin and cos of 10
+/// degrees, this crate's choice.
+const HEAD_PITCH: [f32; 2] = [0.173_648_18, 0.984_807_7];
+
+/// `posed`'s head (the person `person`) drawn as [`People::head`] says.
+fn head(
+    posed: Option<&sims_people::lot::Posed>,
+    person: u16,
+    [width, height]: [u32; 2],
+) -> Result<Image, String> {
+    let posed = posed.ok_or_else(|| format!("person {person} is not posed on the lot"))?;
+    let bone = sims_people::rig::bone(&posed.body.skeleton, "HEAD")
+        .ok_or_else(|| format!("person {person}'s skeleton has no HEAD bone"))?;
+    let parts: Vec<_> = posed
+        .body
+        .parts
+        .iter()
+        .filter(|p| p.censor == 0 && p.bone == bone)
+        .map(|p| (p, skin(p, &posed.bones)))
+        .collect();
+    let count: usize = parts.iter().map(|(_, s)| s.positions.len()).sum();
+    if count == 0 {
+        return Err(format!("person {person} has no head to draw"));
+    }
+    // The camera looks the face in the eye: along the face's direction,
+    // turned back.
+    let face = posed.root.rotation.rotate(FACE_FORWARD);
+    let flat = Vec3::new(face.x, 0.0, face.z).normalize();
+    let mut camera = sims_people::raster::Camera {
+        yaw: [-flat.x, -flat.z],
+        pitch: HEAD_PITCH,
+        scale: 1.0,
+        center: Vec3::ZERO,
+    };
+    // Centred on the head as the camera sees it, and scaled to fill.
+    let (mut low, mut high) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for (_, skinned) in &parts {
+        for &p in &skinned.positions {
+            let v = camera.view(p);
+            low = [low[0].min(v.x), low[1].min(v.y)];
+            high = [high[0].max(v.x), high[1].max(v.y)];
+        }
+    }
+    let middle = [(low[0] + high[0]) / 2.0, (low[1] + high[1]) / 2.0];
+    // A view-space point back in the world: the camera's right and up.
+    let [sy, cy] = camera.yaw;
+    let [sp, cp] = camera.pitch;
+    let right = Vec3::new(cy, 0.0, -sy);
+    let up = Vec3::new(sy * sp, cp, cy * sp);
+    camera.center = right * middle[0] + up * middle[1];
+    let extent = [(high[0] - low[0]).max(1e-6), (high[1] - low[1]).max(1e-6)];
+    camera.scale = HEAD_FILL * (width as f32 / extent[0]).min(height as f32 / extent[1]);
+    let mut canvas = sims_people::raster::Canvas::new(width, height, [0; 4]);
+    let forward = camera.forward();
+    let light = Vec3::new(-forward.x, 1.0, -forward.z);
+    for (part, skinned) in &parts {
+        canvas.draw(&camera, part, skinned, light);
+    }
+    Ok(Image {
+        width,
+        height,
+        rgba: canvas.rgba,
+    })
+}
 
 /// How many different problems are kept; later ones are dropped.
 const KEPT: usize = 256;
@@ -167,6 +241,23 @@ impl People {
     pub fn at(&self, world: &World, point: [i32; 2]) -> Option<u16> {
         shown_near(&self.shown, self.size, point)
             .filter(|id| world.objects.get(id).is_some_and(|o| o.person.is_some()))
+    }
+
+    /// The head of `person` as posed now, seen from in front, for the
+    /// middle of the pie menu: an image of `size` pixels, clear where the
+    /// head is not. The parts bound to the `HEAD` bone are drawn (the head
+    /// with its hair, and glasses and the like), filling [`HEAD_FILL`] of
+    /// the image, lit from the front and above.
+    ///
+    /// The original renders the head live into the face bitmap; its camera,
+    /// light and size there are not ported, and the head here is **not**
+    /// compared with the original's.
+    pub fn head(&mut self, world: &World, person: u16, size: [u32; 2]) -> Result<Image, String> {
+        let (posed, problems) = self.people.posed(world, i32::MAX);
+        let result = head(posed.iter().find(|p| p.id == person), person, size);
+        drop(posed);
+        self.note(problems);
+        result
     }
 
     /// Keeps the problems not kept yet, up to `KEPT` (256).
