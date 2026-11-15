@@ -11,7 +11,7 @@
 //!
 //! Read from the original's code, with the old prototype as a guide
 //! (legacy/crates/sims-vm/src/selection.rs, selection_indicators.rs and
-//! interface/person_selection.rs). `docs/decisions.md` says what a trace
+//! interface/person_selection.rs). `docs/decisions/` says what a trace
 //! of the running game confirms.
 
 use crate::fault::{Fault, Trap};

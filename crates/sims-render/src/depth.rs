@@ -30,7 +30,7 @@
 //! needs one fix-up, at 116, where the original's matrix maths comes out
 //! one lower than the formula. Negative heights are not in the dump. The
 //! formulas for the anchors, walls, ground and sprites were checked
-//! against the game's depth buffer (`docs/decisions.md`, 2026-11-14).
+//! against the game's depth buffer (`docs/decisions/`, 2026-11-14).
 
 use crate::camera::Camera;
 
