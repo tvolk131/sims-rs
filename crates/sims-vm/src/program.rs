@@ -8,6 +8,9 @@ use sims_sim::TypeAttributes;
 use sims_sim::rooms::Tuning;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The SLOT entry kind that makes a routing slot (0x46e3a0).
+const ROUTING_SLOT: u16 = 3;
+
 /// The code and constants one IFF file provides.
 #[derive(Debug, Clone, Default)]
 pub struct Library {
@@ -530,6 +533,24 @@ impl Program {
                 library.slots.get(&(words[20] as u16))
             })
             .map_or(&[], Vec::as_slice)
+    }
+
+    /// Routing slot `index` of an object definition, with its index in the
+    /// SLOT chunk: an object's routing slot table (+0x13c) holds the
+    /// chunk's entries of kind 3, in order, each with its index plus one
+    /// as its number (the SLOT parse at construction, 0x46e2d1). None
+    /// when there is no such entry.
+    pub fn routing_slot(
+        &self,
+        resource: usize,
+        chunk: u16,
+        index: usize,
+    ) -> Option<(usize, &sims_formats::execution::Slot)> {
+        self.slots(resource, chunk)
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.kind == ROUTING_SLOT)
+            .nth(index)
     }
 
     /// The type attribute records the catalog makes, all zero: one for

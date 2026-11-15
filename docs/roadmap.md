@@ -1735,9 +1735,26 @@ not the simulation: comparisons with the fifth capture past tick 901 draw
 equals the fifth capture in everything compared, but for the head fields
 of "Ticks 334 to 366".
 
-**Stops.** Tick 992: object 21 snaps (tree 0x2017 node 5) to a slot
-without flag 0x800, whose placement checks the lot's border, the room
-and the walls in the way (`0x4550d8`), which is not ported.
+**Routing slots are the SLOT entries of kind 3.** An object's routing
+slot table (`+0x13c`) holds only its SLOT chunk's entries of kind 3, in
+order, each numbered by its index in the chunk plus one (the parse at
+construction, `0x46e2d1`, which sends kind 0 to the containers and kind
+1 to the headlines). Go To Routing Slot and Snap named a slot by its
+index in the whole chunk, which is the same for every object the Goth
+house's routes reached before; they now count among the kind 3 entries
+(`Program::routing_slot`). Object 174's routing slot 0 is its SLOT
+entry 1, which snaps into the object.
+
+**Snap's checks of the place** (`0x4550d8` to `0x4551e9`, `snap.rs`).
+Without slot flag 0x800 the placement first checks the place: its tile
+inside the lot's border (else placement error 1), the room its tile's
+cell names the same as mine (object data word 29), and, when I stand
+inside the border and elsewhere, the direction to it open from my tile
+and the way back open from its tile (`0x4359ea`). A refusal fails loudly
+with the rest of not fitting.
+
+**Stops.** Tick 992: object 21 snaps (tree 0x2017 node 5) into slot 0
+of object 174 (`0x454b19`), which is not ported.
 
 ## Track: drawing people (`crates/sims-people`)
 
