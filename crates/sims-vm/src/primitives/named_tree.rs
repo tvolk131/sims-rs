@@ -33,9 +33,16 @@
 //!   would wait fails, as in the original (native error 0x44f). The
 //!   original returns false at once if the stack object's thread is in an
 //!   error state (0x4749cc); objects here are never in one.
-//! - Mode 0 runs the tree the same way on the running object's own thread;
-//!   it is not ported and fails loudly, as does mode 1 when the stack
-//!   object is the running object, and a string table other than 303.
+//! - Mode 0 runs the tree the same way, but on the running object's own
+//!   thread (0x44bb75 picks it): I stay me, the stack object is still its
+//!   stack object, and the arguments are my temps. 0x4749b5 treats the
+//!   running thread like any other: it pushes a stop frame (tree -1) and
+//!   the tree's frame above the frames already there, runs until the stop
+//!   frame is reached, and puts back the thread's +4 word it cleared. So
+//!   the tree runs above my frames and they are untouched. Mode 1 when the
+//!   stack object is me is the same run.
+//!
+//! A string table other than 303 fails loudly.
 
 use crate::factory::TURN_BUDGET;
 use crate::fault::Trap;
@@ -86,13 +93,15 @@ impl Machine<'_, '_> {
             return Ok(Flow::Branch(false));
         };
         let target = target as u16;
-        if operands[5] == 1 && target != self.me {
-            let temps = self.world.objects[&target].temps.clone();
+        if operands[5] != 2 {
+            // Mode 0 runs on my thread and mode 1 on the stack object's.
+            let thread = if operands[5] == 0 { self.me } else { target };
+            let temps = self.world.objects[&thread].temps.clone();
             let result = self
                 .interpreter()
                 .call_as(
                     self.world,
-                    target,
+                    thread,
                     target,
                     tree,
                     target as i16,
@@ -103,22 +112,12 @@ impl Machine<'_, '_> {
                 )
                 .map_err(|fault| {
                     Trap::Unsupported(format!(
-                        "Run Tree By Name mode 1: tree {tree:#06x} on object {target}'s \
-                         thread: {fault}"
+                        "Run Tree By Name mode {}: tree {tree:#06x} of object {target} on \
+                         object {thread}'s thread: {fault}",
+                        operands[5]
                     ))
                 })?;
             return Ok(Flow::Branch(result));
-        }
-        if operands[5] != 2 {
-            return Err(Trap::Unsupported(format!(
-                "Run Tree By Name mode {} on {} (0x44ba26)",
-                operands[5],
-                if target == self.me {
-                    "the running object's own thread"
-                } else {
-                    "another object"
-                }
-            )));
         }
         let temps = self.me()?.temps.clone();
         self.wake(self.me)?;

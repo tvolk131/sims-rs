@@ -1040,9 +1040,7 @@ fn an_action_run_at_once_restores_my_temps_after_its_check() {
 }
 
 /// While an action runs at once, another one for the same person runs
-/// nothing (the pointer at 0x6e5294 is taken), and queueing one on that
-/// person, which the original copies over the running action (0x45d5a5),
-/// fails loudly.
+/// nothing (the pointer at 0x6e5294 is taken).
 #[test]
 fn an_action_run_at_once_does_not_nest() {
     // Menu 4's tree pushes menu 4 again on me (the stack object, made
@@ -1063,8 +1061,14 @@ fn an_action_run_at_once_does_not_nest() {
     assert_eq!(fx.sim().temps[1], 1);
     assert_eq!(fx.world.action_serial, 1);
     assert!(fx.sim().person.as_ref().unwrap().queue.is_empty());
+}
 
-    // Menu 4's tree queues menu 3 on me.
+/// An action queued on the person whose action runs at once, while it
+/// runs, is copied over the running action and queued as well (0x45d5a5):
+/// the run returns the queued action's number and takes none of its own.
+#[test]
+fn an_action_queued_while_one_runs_at_once_takes_its_place() {
+    // Menu 4's tree queues menu 3 on me, at priority 100.
     let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
     fx.add(
         LAMP_FILE,
@@ -1076,11 +1080,35 @@ fn an_action_run_at_once_does_not_nest() {
         ]),
     );
     let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    let fault = interpreter.order(&mut fx.world, SIM, LAMP, 4).unwrap_err();
-    assert!(
-        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x45d5a5")),
-        "{fault}"
+    assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 4), Ok(Some(1)));
+    assert_eq!(fx.world.action_serial, 1);
+    let queue = &fx.sim().person.as_ref().unwrap().queue;
+    let [queued] = queue.as_slice() else {
+        panic!("{queue:?}");
+    };
+    assert_eq!(
+        (queued.uid, queued.table_index, queued.priority),
+        (1, 3, 100)
     );
+
+    // A full queue takes nothing, but the action is still copied over the
+    // running one, so its number is returned.
+    let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    fx.add(
+        LAMP_FILE,
+        ACTION,
+        tree(vec![
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, SIM as i16, 1),
+            assign(scope::LOCALS, 0, scope::LITERAL, LAMP as i16, 2),
+            ins(13, RETURN_TRUE, RETURN_TRUE, [3, 0, 1, 2, 0, 0, 0, 0]),
+        ]),
+    );
+    let mut full = fx.sim().person.as_ref().unwrap().active.clone();
+    full.priority = 100;
+    fx.sim_mut().person.as_mut().unwrap().queue = vec![full; 8];
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 4), Ok(Some(1)));
+    assert_eq!(fx.sim().person.as_ref().unwrap().queue.len(), 8);
 }
 
 /// An action run at once whose tree fails puts my priority back.
@@ -1103,16 +1131,12 @@ fn an_action_run_at_once_that_fails_puts_my_priority_back() {
     assert!(interpreter.order(&mut fx.world, SIM, LAMP, 4).is_err());
     assert_eq!(fx.sim().person.as_ref().unwrap().data[33], 7);
 
-    // The tree queues an action on me while it runs.
+    // The tree ends in an error.
     let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
     fx.add(
         LAMP_FILE,
         ACTION,
-        tree(vec![
-            assign(scope::STACK_OBJECT, 0, scope::LITERAL, SIM as i16, 1),
-            assign(scope::LOCALS, 0, scope::LITERAL, LAMP as i16, 2),
-            ins(13, RETURN_TRUE, RETURN_TRUE, [3, 0, 1, 2, 0, 0, 0, 0]),
-        ]),
+        tree(vec![assign(scope::TEMPS, 0, scope::LITERAL, 1, ERROR)]),
     );
     let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     assert!(interpreter.order(&mut fx.world, SIM, LAMP, 4).is_err());
