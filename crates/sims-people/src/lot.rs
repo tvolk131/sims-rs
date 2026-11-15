@@ -29,11 +29,15 @@
 //! view's table, which is not ported: such a person stands at the level's
 //! floor.
 //!
-//! **Depth** is the target's. The caller gives a function from a point's
-//! fine view position, elevation and level to its depth, the signature of
-//! the lot renderer's planned `Depth::point`, and the rasterizer
-//! interpolates it linearly across each triangle. How the original gives a
-//! person's mesh its depth is **unverified**.
+//! **Depth.** [`People::draw_on_lot`] draws over a lot `sims_render` has
+//! drawn, as the original does: the lot first, then the people, each
+//! pixel tested against the lot's depth but never part of what the lot
+//! drew. Each vertex takes the lot renderer's [`Depth::point`] (its fine
+//! view position, elevation and level, in the original's depth space),
+//! which the rasterizer interpolates linearly across each triangle.
+//! [`People::draw`] takes any depth function of that shape and any
+//! [`Target`]. How the original gives a person's mesh its depth is
+//! **unverified**.
 //!
 //! **Light** is our own ([`crate::raster::LIGHT`]), held fixed relative
 //! to the viewer as the view turns, as the original's standard light is
@@ -50,6 +54,7 @@ use crate::raster::{LIGHT, Target, draw_part};
 use crate::skin::skin;
 use sims_core::F32;
 use sims_render::Camera;
+use sims_render::depth::Depth;
 use sims_sim::World;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -92,20 +97,12 @@ impl View {
     }
 
     /// The screen position of a fine view position on `level`, raised
-    /// `elevation` near-zoom pixels: the lot renderer's `project_fine`
-    /// without its rounding, one column right as objects are drawn. The
-    /// pixel a point falls in is the floor of each coordinate.
-    pub fn screen(&self, [x, y]: [f32; 2], elevation: f32, level: i32) -> [f32; 2] {
-        let camera = &self.camera;
-        let shift = camera.zoom.level();
-        let scale = camera.zoom.near_scale() as f32;
-        let floor = camera.zoom.floor_height() as f32;
-        [
-            (x - y) * (8 << shift) as f32 / 16.0 + camera.origin[0] as f32 + OBJECT_COLUMN,
-            (x + y) * (4 << shift) as f32 / 16.0 + camera.origin[1] as f32
-                - floor * (level - 1) as f32
-                - elevation / scale,
-        ]
+    /// `elevation` near-zoom pixels: the lot renderer's
+    /// [`Camera::project_fine_f32`], one column right as objects are
+    /// drawn. The pixel a point falls in is the floor of each coordinate.
+    pub fn screen(&self, fine: [f32; 2], elevation: f32, level: i32) -> [f32; 2] {
+        let [x, y] = self.camera.project_fine_f32(fine, level, elevation);
+        [x + OBJECT_COLUMN, y]
     }
 
     /// The direction towards the light: [`LIGHT`] as it is at rotation 0,
@@ -117,6 +114,27 @@ impl View {
         let fine = [-LIGHT.z, -LIGHT.x];
         let back = rotate((4 - (self.camera.rotation & 3)) & 3, fine, 0.0);
         Vec3::new(-back[1], LIGHT.y, -back[0])
+    }
+}
+
+/// The lot renderer's canvas takes people pixel by pixel, by its sprite
+/// rule: a depth no farther than what is there wins (ties too), a pixel
+/// fainter than its `FAINT` is left out, a soft one blends, and every
+/// pixel drawn writes its depth. Depths are cut to whole units toward
+/// zero.
+impl Target for sims_render::Canvas {
+    fn size(&self) -> (u32, u32) {
+        (self.width as u32, self.height as u32)
+    }
+
+    fn passes(&self, x: u32, y: u32, z: f32) -> bool {
+        sims_render::Canvas::passes(self, x as i32, y as i32, z as i32)
+    }
+
+    fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32) {
+        let lit = |c: u8| (f32::from(c) * shade).min(255.0) as u8;
+        let [r, g, b, a] = texel;
+        self.put(x as i32, y as i32, [lit(r), lit(g), lit(b), a], z as i32);
     }
 }
 
@@ -308,10 +326,28 @@ impl People {
         (posed, problems)
     }
 
+    /// Draws every placed person on the camera's levels over a lot the lot
+    /// renderer has drawn into `canvas` (`sims_render::draw` first), each
+    /// pixel tested against the lot's depth: walls, furniture and floors
+    /// in front of a person hide them. Depth is the lot renderer's
+    /// [`Depth::point`]; the pixels go in by its sprite rule
+    /// ([`sims_render::Canvas::put`]).
+    pub fn draw_on_lot(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        canvas: &mut sims_render::Canvas,
+    ) -> Drawn {
+        let depth = Depth::new(camera);
+        self.draw(world, camera, canvas, |fine, elevation, level| {
+            depth.point(fine, elevation, level)
+        })
+    }
+
     /// Draws every placed person on the camera's levels into `target`,
     /// far to near. `depth` gives the target's depth for a point: its fine
     /// view position, its elevation above its level in near-zoom pixels,
-    /// and the level (the lot renderer's `Depth::point`). Call
+    /// and the level (the lot renderer's [`Depth::point`]). Call
     /// [`People::update`] first.
     pub fn draw<T: Target + ?Sized>(
         &mut self,
@@ -411,6 +447,31 @@ mod tests {
         let step = sims_sim::head::terrain_height(F32::from_f32(1.0)).to_f32();
         let (_, elevation) = view.place(Vec3::new(0.0, step, 0.0));
         assert!((elevation - 16.0).abs() < 1e-3, "{elevation}");
+    }
+
+    /// A person's pixel goes into the lot renderer's canvas by its sprite
+    /// rule: a tie or nearer wins and writes its depth, farther loses, a
+    /// faint texel is left out, and the shade darkens the colour.
+    #[test]
+    fn the_lot_canvas_takes_a_persons_pixels_by_the_sprite_rule() {
+        use sims_render::Canvas as LotCanvas;
+        let mut canvas = LotCanvas::new(2, 1, [0, 0, 0]);
+        canvas.plot(0, 0, 100, [9, 9, 9]);
+        let target: &mut dyn Target = &mut canvas;
+        assert_eq!(target.size(), (2, 1));
+        assert!(!target.passes(0, 0, 101.0));
+        // Cut toward zero: 100.9 is 100, a tie.
+        assert!(target.passes(0, 0, 100.9));
+        target.write(0, 0, 100.9, [200, 100, 50, 255], 0.5);
+        target.write(
+            1,
+            0,
+            -3.5,
+            [200, 100, 50, sims_render::canvas::FAINT - 1],
+            1.0,
+        );
+        assert_eq!(canvas.color, vec![[100, 50, 25], [0, 0, 0]]);
+        assert_eq!(canvas.depth, vec![100, sims_render::depth::EMPTY]);
     }
 
     /// The light keeps its place relative to the viewer as the view
