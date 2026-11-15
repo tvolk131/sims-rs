@@ -253,7 +253,113 @@ fn the_slot_tables_own_record_and_flags_come_first() {
     };
     fx.world.routing.slots.insert((LAMP, 0), record);
     let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x4550d8")));
+    assert!(refused(result));
+}
+
+/// Whether Snap failed loudly because its own checks refused the place.
+fn refused(result: Result<bool, sims_vm::Fault>) -> bool {
+    matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x4550f9"))
+}
+
+/// Sets wall segments on a tile of the ground level (lot array 2, 14
+/// bytes a cell, the segments in byte 0).
+fn wall(fx: &mut Fixture, tile: [usize; 2], segments: u8) {
+    let walls = fx.world.arrays.get_mut(&2).unwrap();
+    walls.data[(tile[0] * 64 + tile[1]) * 14] |= segments;
+}
+
+#[test]
+fn without_flag_0x800_the_place_must_be_inside_the_border_and_my_room() {
+    // Tile (3, 3) is in my room, with no wall between: I am put there.
+    let (mut fx, me) = snapper(0);
+    fx.lamp_mut().position = [56, 56, 1];
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+    assert_eq!(fx.world.objects[&me].position, [56, 56, 1]);
+    // Tile (3, 1) is in room 0, and tile (0, 2) on the lot's border.
+    for place in [[56, 24, 1], [8, 40, 1]] {
+        let (mut fx, me) = snapper(0);
+        fx.lamp_mut().position = place;
+        let start = unmoved(&fx, me);
+        assert!(
+            refused(snap(&mut fx, me, LAMP as i16, 0, 3, 0)),
+            "{place:?}"
+        );
+        assert_eq!(unmoved(&fx, me), start);
+    }
+}
+
+#[test]
+fn without_flag_0x800_no_wall_may_close_the_way() {
+    // From (2, 2) to (2, 3) is direction 4 (the second tile coordinate is
+    // the original's first): segment 8 of my tile closes it, and segment
+    // 2 of the place's tile closes direction 0 back.
+    for (tile, segments) in [([2, 2], 8), ([2, 3], 2)] {
+        let (mut fx, me) = snapper(0);
+        fx.lamp_mut().position = [40, 56, 1];
+        wall(&mut fx, tile, segments);
+        assert!(refused(snap(&mut fx, me, LAMP as i16, 0, 3, 0)), "{tile:?}");
+    }
+    // Another segment closes nothing that way.
+    let (mut fx, me) = snapper(0);
+    fx.lamp_mut().position = [40, 56, 1];
+    wall(&mut fx, [2, 2], 4);
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+    // A place where I stand is not looked at for walls.
+    let (mut fx, me) = snapper(0);
+    fx.lamp_mut().position = [40, 40, 1];
+    wall(&mut fx, [2, 2], 0xf);
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+}
+
+#[test]
+fn the_room_is_read_at_the_places_tile_not_its_mirror() {
+    // Tile (3, 2) is in room 9 and tile (2, 3) in mine: a lookup with the
+    // coordinates swapped would answer the other way.
+    let room_at = |fx: &mut Fixture, tile: [usize; 2], room: i16| {
+        fx.world.rooms.map[0][tile[0] * 64 + tile[1]] = room;
+    };
+    let (mut fx, me) = snapper(0);
+    room_at(&mut fx, [3, 2], 9);
+    room_at(&mut fx, [2, 3], 1);
+    fx.lamp_mut().position = [56, 40, 1];
+    assert!(refused(snap(&mut fx, me, LAMP as i16, 0, 3, 0)));
+    let (mut fx, me) = snapper(0);
+    room_at(&mut fx, [3, 2], 9);
+    room_at(&mut fx, [2, 3], 1);
+    fx.lamp_mut().position = [40, 56, 1];
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+}
+
+#[test]
+fn the_walls_back_from_the_place_are_read_on_my_level() {
+    // The place is tile (2, 3) on level 2, in my room there, and the
+    // person needs no floor (placement flag 0x200). The wall back from
+    // it (direction 0, segment 2) is looked for on my level, 1: on level
+    // 2 (lot array 102) it closes nothing.
+    let upstairs = |walls: u16| {
+        let (mut fx, me) = snapper(0);
+        fx.world.rooms.map[1][2 * 64 + 3] = 1;
+        fx.world.objects.get_mut(&me).unwrap().data[42] |= 0x200;
+        fx.lamp_mut().position = [40, 56, 2];
+        fx.world.arrays.get_mut(&walls).unwrap().data[(2 * 64 + 3) * 14] |= 2;
+        snap(&mut fx, me, LAMP as i16, 0, 3, 0)
+    };
+    assert_eq!(upstairs(102), Ok(true));
+    assert!(refused(upstairs(2)));
+}
+
+#[test]
+fn routing_slots_are_counted_among_the_routing_entries_only() {
+    // The SLOT chunk's first entry holds objects (kind 0), so routing
+    // slot 0 is its second entry, and there is no routing slot 1.
+    let (mut fx, me) = snapper(SKIP_CHECKS);
+    fx.lamp_mut().position = [56, 24, 1];
+    fx.lamp_mut().data[1] = 6;
+    let container = Slot { kind: 0, ..slot(0) };
+    set_slots(&mut fx, vec![container, slot(SKIP_CHECKS | TURNED)]);
+    assert_eq!(code(snap(&mut fx, me, LAMP as i16, 1, 3, 0)), Some(0x1b));
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+    assert_eq!(fx.world.objects[&me].data[1], 6);
 }
 
 #[test]
@@ -277,7 +383,7 @@ fn snap_checks_its_object_mode_and_slot() {
 
 #[test]
 fn what_snap_does_not_port_fails_loudly() {
-    let cases: [(Slot, u8, &str); 5] = [
+    let cases: [(Slot, u8, &str); 4] = [
         (
             Slot {
                 snap_target: 0,
@@ -303,7 +409,6 @@ fn what_snap_does_not_port_fails_loudly() {
             "0x455070",
         ),
         (slot(SKIP_CHECKS), 1, "0x454c7a"),
-        (slot(0), 0, "0x4550d8"),
     ];
     for (entry, flags, address) in cases {
         let (mut fx, me) = snapper(SKIP_CHECKS);

@@ -274,7 +274,7 @@ fn interaction_tables_and_slots_are_found_through_the_definition() {
         &iff(&[
             (b"OBJD", 128, lamp),
             (b"GLOB", 128, b"\x0bLampGlobals".to_vec()),
-            (b"SLOT", 300, slot(&[0, 3, 0, 1])),
+            (b"SLOT", 300, slot(&[0, 3, 0, 1, 3])),
         ]),
     )
     .file(
@@ -309,6 +309,20 @@ fn interaction_tables_and_slots_are_found_through_the_definition() {
     assert_eq!(program.containers(lamp.resource, lamp.chunk), 2);
     assert_eq!(program.containers(desk.resource, desk.chunk), 0);
     assert_eq!(program.containers(chair.resource, chair.chunk), 0);
+    // Only kind 3 entries are routing slots, counted among themselves:
+    // the lamp's two are its SLOT entries 1 and 4, past a container and a
+    // headline.
+    let routing = |i| program.routing_slot(lamp.resource, lamp.chunk, i);
+    assert_eq!(
+        routing(0).map(|(entry, slot)| (entry, slot.kind)),
+        Some((1, 3))
+    );
+    assert_eq!(
+        routing(1).map(|(entry, slot)| (entry, slot.kind)),
+        Some((4, 3))
+    );
+    assert!(routing(2).is_none());
+    assert!(program.routing_slot(desk.resource, desk.chunk, 0).is_none());
     // A SLOT chunk that does not decode stops the link.
     dir.file(
         "GameData/Objects/Desk.iff",
