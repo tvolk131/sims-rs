@@ -4,7 +4,7 @@
 
 use crate::support::*;
 use sims_formats::behavior::{Interaction, InteractionTable};
-use sims_vm::Status;
+use sims_vm::{Status, Trap};
 
 /// The lamp's interaction table (definition word 7, which counts up from
 /// 1000 in the synthetic definitions).
@@ -429,4 +429,96 @@ fn a_refused_order_is_cancelled_on_its_target() {
     assert_eq!(status, Status::Yielded);
     assert!(asked.is_empty());
     assert!(fx.sim().person.as_ref().unwrap().queue.is_empty());
+}
+
+/// Gives the lamp's menu 3 the check tree `test` and the action tree
+/// `action` (an action already queued keeps the tree it was made with).
+fn entry_trees(fx: &mut Fixture, test: u16, action: u16) {
+    let table = fx
+        .program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .interactions
+        .get_mut(&TABLE)
+        .unwrap()
+        .as_mut()
+        .unwrap();
+    (table.interactions[0].test, table.interactions[0].action) = (test, action);
+}
+
+/// A check tree that writes 99 to temp 0 and passes.
+fn temp_writing_check(fx: &mut Fixture) {
+    fx.add(
+        LAMP_FILE,
+        4300,
+        tree(vec![assign(
+            scope::TEMPS,
+            0,
+            scope::LITERAL,
+            99,
+            RETURN_TRUE,
+        )]),
+    );
+}
+
+#[test]
+fn the_temps_the_check_tree_changes_are_put_back() {
+    // After a start.
+    let mut fx = ordered();
+    temp_writing_check(&mut fx);
+    entry_trees(&mut fx, 4300, ACTION);
+    fx.sim_mut().person.as_mut().unwrap().queue[0].args = [2, 0, 0, 0];
+    fx.sim_mut().temps[0] = 11;
+    assert_eq!(idle_turn(&mut fx).0, Status::Yielded);
+    assert_eq!(fx.sim().stack.len(), 2);
+    assert_eq!(fx.sim().temps[0], 11);
+    // And when the start then fails: an action tree the file lacks.
+    let mut fx = ordered();
+    temp_writing_check(&mut fx);
+    entry_trees(&mut fx, 4300, ACTION);
+    fx.sim_mut().person.as_mut().unwrap().queue[0].action = 4999;
+    fx.sim_mut().temps[0] = 11;
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
+    assert!(matches!(fault.trap, Trap::Unsupported(_)), "{fault}");
+    assert_eq!(fx.sim().temps[0], 11);
+}
+
+#[test]
+fn a_missing_check_tree_refuses_after_writing_the_synchronous_mark() {
+    let mut fx = ordered();
+    entry_trees(&mut fx, 4998, ACTION);
+    let (status, asked) = idle_turn(&mut fx);
+    assert_eq!(status, Status::Yielded);
+    let functions: Vec<_> = asked.iter().map(|a| (a.object, a.function)).collect();
+    assert_eq!(functions, [(LAMP, 4)]);
+    let words = &fx.world.frame_storage[&SIM].words;
+    let mark = [-1, 0, 0, 0, 1, 0, 0, 0].map(Some);
+    assert!(words.windows(8).any(|w| w == mark), "{words:?}");
+}
+
+#[test]
+fn idle_for_input_keeps_its_state_when_it_yields() {
+    // The first action sleeps a turn. Meanwhile a target-0 action pushed
+    // to the front and an ordinary one, both of priority 60, are queued.
+    let mut fx = ordered();
+    fx.sim_mut().person.as_mut().unwrap().queue[0].args = [1, 0, 0, 0];
+    assert_eq!(idle_turn(&mut fx).0, Status::Yielded);
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    let mut dropped = person.active.clone();
+    (dropped.uid, dropped.flags, dropped.priority, dropped.target) = (0, 0xf, 60, 0);
+    let mut ordinary = dropped.clone();
+    (ordinary.flags, ordinary.target) = (0xd, LAMP as i16);
+    person.queue.extend([dropped, ordinary]);
+    // The action returns; the target-0 one is started, dropped, and the
+    // thread yields with Idle For Input's state still 1.
+    assert_eq!(idle_turn(&mut fx).0, Status::Yielded);
+    assert_eq!(fx.sim().stack.len(), 1);
+    assert_eq!(fx.sim().stack[0].primitive_state, 1);
+    assert_eq!(fx.sim().person.as_ref().unwrap().queue.len(), 1);
+    // Next turn the ordinary one interrupts but was not pushed to the
+    // front, so it stays queued and the wait is over.
+    assert_eq!(idle_turn(&mut fx).0, Status::Returned(true));
+    assert_eq!(fx.sim().person.as_ref().unwrap().queue.len(), 1);
 }

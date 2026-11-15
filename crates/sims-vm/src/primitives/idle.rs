@@ -133,8 +133,7 @@ impl Machine<'_, '_> {
     /// Starts the front queued action (0x45dc14 to 0x45dd1f; see the
     /// module's documentation). `index` is the count parameter's.
     fn start_queued(&mut self, index: usize) -> Result<Flow, Trap> {
-        let me = self.me;
-        let mut action = self
+        let action = self
             .me_mut()?
             .person
             .as_mut()
@@ -154,7 +153,26 @@ impl Machine<'_, '_> {
                 ))
             })?;
         let mut saved = None;
-        self.check_chosen(&mut action, &mut saved)?;
+        let flow = self.check_and_start(action, target, index, &mut saved);
+        // The temps go back however the start ended (0x4582dd, also on
+        // the original's unwinding, 0x64e050).
+        if let Some(temps) = saved {
+            self.me_mut()?.temps = temps;
+        }
+        flow
+    }
+
+    /// Checks the action taken off the queue and starts or cancels it
+    /// (0x45dc74 to 0x45dd00).
+    fn check_and_start(
+        &mut self,
+        mut action: sims_formats::saved_objects::Interaction,
+        target: u16,
+        index: usize,
+        saved: &mut Option<Vec<i16>>,
+    ) -> Result<Flow, Trap> {
+        let me = self.me;
+        self.check_chosen(&mut action, saved)?;
         let flow = if action.flags & checked::PASSED != 0 && action.action != 0 {
             let frame = self.me()?.stack.len() - 1;
             let tree = action.action;
@@ -187,9 +205,6 @@ impl Machine<'_, '_> {
                 })?;
             Flow::Yield
         };
-        if let Some(temps) = saved {
-            self.me_mut()?.temps = temps;
-        }
         Ok(flow)
     }
 

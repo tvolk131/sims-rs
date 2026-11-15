@@ -891,11 +891,13 @@ impl Machine<'_, '_> {
                 }
             };
         let allowed = if record.test != 0 && !found {
-            // The synchronous run fails to push a tree the file lacks
-            // (0x47484a), and returns false (0x474ada).
+            // The synchronous run writes its mark above the top frame
+            // (0x4749d9), fails to push a tree the file lacks (0x47484a),
+            // and returns false (0x474ada).
             if saved.is_none() {
                 *saved = Some(self.me()?.temps.clone());
             }
+            self.write_mark()?;
             false
         } else if record.test != 0 {
             if saved.is_none() {
@@ -1071,9 +1073,13 @@ impl Machine<'_, '_> {
             }
             let resource = self.definition(self.world.objects[&target].guid)?.resource;
             match self.program.tree(resource, record.test) {
-                // The synchronous run fails to push a tree the file lacks
+                // The synchronous run writes its mark above the top frame
+                // (0x4749d9), fails to push a tree the file lacks
                 // (0x47484a), and returns false.
-                crate::program::Tree::Missing => false,
+                crate::program::Tree::Missing => {
+                    self.write_mark()?;
+                    false
+                }
                 crate::program::Tree::Primitive(id) => {
                     return Err(Trap::Unsupported(format!(
                         "check tree {id:#06x}, which names a primitive"
