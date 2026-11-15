@@ -4,12 +4,12 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
-## 2026-11-15: The Newbie house to tick 562: Generic Sims Call 2, a catalog picture headline, a head looking at an object; Breakpoint and Show String
+## 2026-11-15: The Newbie house to tick 562: Generic Sims Call 2, a catalog picture headline; Breakpoint and Show String
 
 **Unverified.** No capture of the Newbie house (`House07.iff`) exists
 yet; each piece is ported from the original's code and checked by
-synthetic tests. The Goth house's strict output through tick 2702 is
-unchanged line for line, hash c5803e84… included.
+synthetic tests. The Goth house's strict output is unchanged line
+for line through tick 2881, hash eed688a0… included.
 
 The base neighborhood has two families, the Goths (House05) and the
 Newbies (House07); its other houses hold none. In strict mode the
@@ -47,14 +47,20 @@ bit 11 makes the duration 12 ticks a loop. The rest is the other kinds'
 path: backdrop, overlay, flag, duration, redraw, wake.
 
 **A head looking at an object that is not a person** (0x59058f to
-0x5905d0). The target is the object's position in world units at
-height 0: 0x454f5c on its +0xf4 and +0xf8 (our second and first
-coordinates) with level 0.0, so the first coordinate is 3/16 of our
-second, the third 3/16 of our first, each rounded to single precision,
-and the height is 0 (0x454f29 scales the level). The level test after
-it is the person's. The person test is the object's type (+0x118
-+0x12) being 2; ours tests that the object is a person, the same thing
-on every lot we load.
+0x5905d0) was ported here and, at the same time, by #156 for the Goth
+house's tick 2837; #156's port is kept. The two disagree on the order
+of the coordinates, and **the disassembly reads as the opposite of
+#156's**: the caller copies the object's +0xf4, then +0xf8, into the
+point it hands 0x454f5c, which stores 3/16 of the first word (`fild
+[esi]`) as the target's first coordinate and 3/16 of the second (`fild
+[esi+4]`) as its third. +0xf4 is our second coordinate (`animator::place`,
+`direction.rs`, `route.rs`), so the target would be `[3/16 y, 0, 3/16
+x]`, as for a person's model matrix (`head::placement`), where #156
+writes `[3/16 x, 0, 3/16 y]`. The swap changes the Goth house's hash at
+tick 2881 (eed688a0… becomes cdd5b72c…; every tick's line is the same,
+so only the animator's head state differs so far). It is left as #156
+has it, and the strict output is unchanged; **reopen** with track 3,
+and with a capture past tick 2837, which would settle it.
 
 **Breakpoint and Show String** (opcodes 15 and 21), which `sims
 census` counts 1,489 and 27 times in the install's trees, are ported
