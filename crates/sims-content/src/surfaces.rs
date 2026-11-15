@@ -185,7 +185,7 @@ impl SurfaceCatalog {
             }
         }
         Ok(Some(SurfaceFile {
-            name: String::from_utf8_lossy(&name).into_owned(),
+            name: sims_formats::far::decode_name(&name),
             location,
             keys,
         }))

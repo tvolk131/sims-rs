@@ -17,7 +17,10 @@ the way the original builds them at start-up (floors 0x4a01cb, walls
   `WallsAndFloors/` (in edition-bit order), then
   `ExpansionShared/WallsAndFloors/` (edition above 3), then
   `GameData/Floors/` or `GameData/Walls/`. Each directory is listed in
-  its file-table order.
+  its file-table order, going into each subdirectory where its name
+  falls (0x412699; the catalog scan asks for every directory, 0x412863).
+  A file is known by its file name alone, read in Windows-1252 as a
+  house's map names it.
 - A file's pattern count is a third of its `SPR2` (floors) or `SPR#`
   (walls) chunks, and a file with none is left out.
 - Each pattern takes the next key from a free list seeded with

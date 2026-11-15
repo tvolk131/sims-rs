@@ -1,4 +1,31 @@
+mod common;
+
+use common::{Tree, iff};
 use sims_content::{Install, Surfaces};
+
+/// A pattern file in a subdirectory is in the catalog (the scan goes into
+/// every directory, 0x412699), under its file name alone, and a name with
+/// a character outside ASCII is read in Windows-1252, as a house's map
+/// names it.
+#[test]
+fn a_catalog_holds_nested_files_under_their_windows_1252_names() {
+    let pattern = iff(&[(b"SPR2", 1, b""), (b"SPR2", 2, b""), (b"SPR2", 3, b"")]);
+    let tree = Tree::new("surfaces-nested");
+    tree.file("GameData/Behavior.iff", b"")
+        .dir("GameData/Objects")
+        .file("GameData/Floors/custom/deeper/tile.flr", &pattern)
+        .file("GameData/Floors/caf\u{e9}.flr", &pattern);
+    let install = Install::detect(&tree.0).unwrap();
+    let surfaces = Surfaces::build(&install).unwrap();
+    let floors = &surfaces.floors;
+    assert_eq!(floors.files.len(), 3);
+    let tile = floors.file("TILE.FLR").expect("the nested file");
+    let cafe = floors.file("CAF\u{e9}.FLR").expect("the Windows-1252 name");
+    assert_eq!(floors.files[cafe].name, "caf\u{e9}.flr");
+    let mut keys = [floors.key(tile, 1), floors.key(cafe, 1)];
+    keys.sort();
+    assert_eq!(keys, [Some(256), Some(257)]);
+}
 
 /// Needs the game: set `SIMS_INSTALL` to the install folder.
 ///

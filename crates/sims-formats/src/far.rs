@@ -62,6 +62,11 @@ pub fn encode_name(name: &str) -> Option<Vec<u8>> {
     let (bytes, _, unmappable) = encoding_rs::WINDOWS_1252.encode(name);
     (!unmappable).then(|| bytes.into_owned())
 }
+/// The reverse of [`encode_name`]: a name the original holds, read in the
+/// Windows-1252 code page.
+pub fn decode_name(name: &[u8]) -> String {
+    encoding_rs::WINDOWS_1252.decode(name).0.into_owned()
+}
 pub fn directory(data: &[u8], file_len: u64) -> Result<Vec<Entry>> {
     let mut r = Reader::new(data);
     let n = r.u32()? as usize;
