@@ -187,6 +187,51 @@ fn generic_call_15_needs_a_person_and_a_footprint_it_can_work_out() {
     assert_eq!(sim.footprint, [1, 2, 3, 4]);
 }
 
+/// Runs Generic Sims Call routine 2 as `me`, with `stack` the stack
+/// object.
+fn generic_2(fx: &mut Fixture, me: u16, stack: i16) -> Result<bool, sims_vm::Fault> {
+    let file = if me == SIM { SIM_FILE } else { LAMP_FILE };
+    fx.add(
+        file,
+        4096,
+        tree(vec![ins(
+            1,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [2, 0, 0, 0, 0, 0, 0, 0],
+        )]),
+    );
+    fx.run_with(me, 4096, stack, &[], 10)
+}
+
+#[test]
+fn generic_call_2_makes_the_stack_object_the_running_actions_icon() {
+    let mut fx = Fixture::new();
+    // With no running action (person +0xa84 is 0) nothing changes.
+    assert_eq!(generic_2(&mut fx, SIM, LAMP as i16), Ok(true));
+    assert_eq!(fx.sim().person.as_ref().unwrap().active.icon, 0);
+    fx.sim_mut().person.as_mut().unwrap().active.uid = 7;
+    assert_eq!(generic_2(&mut fx, SIM, LAMP as i16), Ok(true));
+    assert_eq!(fx.sim().person.as_ref().unwrap().active.icon, LAMP as i16);
+}
+
+#[test]
+fn generic_call_2_needs_a_stack_object_then_a_person() {
+    let mut fx = Fixture::new();
+    fx.sim_mut().person.as_mut().unwrap().active.uid = 7;
+    // A stack object not on the lot: native error 0xa, checked first.
+    for stack in [0, -3, 999] {
+        assert_eq!(trap(generic_2(&mut fx, SIM, stack)).code(), Some(0xa));
+        assert_eq!(trap(generic_2(&mut fx, LAMP, stack)).code(), Some(0xa));
+    }
+    // The lamp is not a person: native error 0x1c.
+    assert_eq!(
+        trap(generic_2(&mut fx, LAMP, SIM as i16)).code(),
+        Some(0x1c)
+    );
+    assert_eq!(fx.sim().person.as_ref().unwrap().active.icon, 0);
+}
+
 #[test]
 fn other_generic_calls_name_themselves() {
     let mut fx = Fixture::new();
