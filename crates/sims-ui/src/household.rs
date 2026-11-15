@@ -1,11 +1,12 @@
 //! What the control panel shows, read from the simulation, and the
-//! portraits of the household's people.
+//! portraits and first names of the household's people.
 
 use crate::art::Art;
 use crate::{Error, Result};
 use sims_content::{Catalog, Index};
 use sims_formats::bitmap::{self, Image};
 use sims_formats::iff::Iff;
+use sims_formats::strings::StringTable;
 use sims_sim::World;
 use std::collections::BTreeMap;
 
@@ -124,18 +125,26 @@ pub const TEMPLATE: i32 = 4600;
 /// `Thumbnails`, `[45, 45, 5, 2, 35, 41]`).
 const FACE: [u32; 4] = [5, 2, 35, 41];
 
-/// The faces of people, by the GUID of their type.
+/// The definition word that names a type's catalog strings (`CTSS`):
+/// word 41 of its `OBJD`. A person's first name is the table's first
+/// string; Mortimer's file has 2000 there, and `CTSS` 2000 starts with
+/// "Mortimer".
+const CATALOG_STRINGS: usize = 41;
+
+/// The faces and first names of people, by the GUID of their type.
 #[derive(Debug, Clone, Default)]
 pub struct Faces {
     faces: BTreeMap<u32, Image>,
+    names: BTreeMap<u32, String>,
 }
 
 impl Faces {
-    /// Reads the face of each of `guids` from its character file. A type
-    /// with no file or no faces is left out; a face that does not decode
-    /// is an error.
+    /// Reads the face and the first name of each of `guids` from its
+    /// character file. A type with no file, no faces or no name is left
+    /// out of what it lacks; a face that does not decode is an error.
     pub fn load(index: &Index, catalog: &Catalog, guids: &[u32]) -> Result<Self> {
         let mut faces = BTreeMap::new();
+        let mut names = BTreeMap::new();
         for &guid in guids {
             let Some(object) = catalog.object(guid) else {
                 continue;
@@ -145,6 +154,9 @@ impl Faces {
             };
             let iff =
                 Iff::parse(resource.read().map_err(Error::Content)?).map_err(Error::Format)?;
+            if let Some(name) = first_name(&iff, object.chunk) {
+                names.insert(guid, name);
+            }
             let Some(chunk) = iff.get(b"BMP_", FACES) else {
                 continue;
             };
@@ -158,7 +170,16 @@ impl Faces {
                 faces.insert(guid, face);
             }
         }
-        Ok(Self { faces })
+        Ok(Self { faces, names })
+    }
+
+    /// The first name of `guid`'s people, if their file gives one.
+    pub fn name(&self, guid: u32) -> Option<&str> {
+        self.names.get(&guid).map(String::as_str)
+    }
+
+    pub fn insert_name(&mut self, guid: u32, name: &str) {
+        self.names.insert(guid, name.to_owned());
     }
 
     pub fn insert(&mut self, guid: u32, face: Image) {
@@ -192,6 +213,18 @@ impl Faces {
         }
         Some(portrait)
     }
+}
+
+/// The first string, in US English, of the catalog strings that the
+/// definition `OBJD` `chunk` of `iff` names. None if any of it is missing
+/// or the string is empty.
+fn first_name(iff: &Iff, chunk: u16) -> Option<String> {
+    let definition = iff.data(iff.get(b"OBJD", chunk)?);
+    let at = CATALOG_STRINGS * 2;
+    let id = u16::from_le_bytes(definition.get(at..at + 2)?.try_into().ok()?);
+    let table = StringTable::parse(iff.data(iff.get(b"CTSS", id)?)).ok()?;
+    let name = table.get(0, sims_content::ui_graphics::US_ENGLISH)?;
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 #[cfg(test)]

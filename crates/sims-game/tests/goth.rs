@@ -8,6 +8,8 @@ use sims_game::pick;
 use sims_game::view::View;
 use sims_game::{Game, Options};
 use sims_render::{Canvas, open_house};
+use sims_ui::household::Snapshot;
+use sims_ui::hud::Kind;
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
@@ -522,6 +524,84 @@ fn a_snack_is_chosen_from_the_fridges_pie() {
     assert!(game.menu().is_none(), "choosing closes the pie");
     // Have A Snack, not another of the fridge's entries, is queued.
     assert_eq!(queued(&game), before + 1);
+    // The panel follows the lot as it runs: Mortimer pays 5 for the snack
+    // (at tick 820) and eats it, and the clock moves on.
+    game.render();
+    let start = panel(&game, person);
+    assert_eq!(start.money, "$2,542");
+    assert_eq!(game.run(850), 850);
+    game.render();
+    let fed = panel(&game, person);
+    assert_eq!(fed.money, "$2,537");
+    assert_ne!(fed.clock, start.clock);
+    assert_ne!(fed.hunger, start.hunger);
+    // The pointer on Mortimer's portrait shows his name over it.
+    let (portrait, guid) = game
+        .panel()
+        .iter()
+        .find_map(|i| match i.kind {
+            Kind::Portrait {
+                guid,
+                selected: true,
+            } => Some((i.rect, guid)),
+            _ => None,
+        })
+        .expect("the selected Sim's portrait");
+    assert_eq!(guid, game.lot().world().objects[&person].guid);
+    assert_eq!(game.name(guid), Some("Mortimer"));
+    game.hover([portrait.x + 20, portrait.y + 20]);
+    game.render();
+    assert!(
+        game.panel().iter().any(|i| i.kind == Kind::Name { guid }),
+        "no name over the portrait"
+    );
+    // The pointer leaving the window takes the name away.
+    assert!(game.leave(), "leaving does not redraw");
+    game.render();
+    assert!(
+        !game.panel().iter().any(|i| i.kind == Kind::Name { guid }),
+        "the name stays after the pointer left"
+    );
+}
+
+/// What the panel shows of the lot, as text, and the selected Sim's
+/// hunger meter, which must be what the world holds.
+struct Shown {
+    clock: String,
+    money: String,
+    hunger: f32,
+}
+
+fn panel(game: &Game, person: u16) -> Shown {
+    let world = game.lot().world();
+    let texts: Vec<&str> = game
+        .panel()
+        .iter()
+        .filter_map(|i| match &i.kind {
+            Kind::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let snapshot = Snapshot::read(world, &[]);
+    let (clock, money) = (snapshot.clock(), snapshot.money());
+    assert!(texts.contains(&clock.as_str()), "{texts:?}");
+    assert!(texts.contains(&money.as_str()), "{texts:?}");
+    let hunger = world.objects[&person].person.as_ref().unwrap().motives[7];
+    // Hunger is the needs panel's first meter.
+    let meters: Vec<f32> = game
+        .panel()
+        .iter()
+        .filter_map(|i| match i.kind {
+            Kind::Meter(value) => Some(value),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(meters.first(), Some(&hunger), "{meters:?}");
+    Shown {
+        clock,
+        money,
+        hunger,
+    }
 }
 
 #[test]
