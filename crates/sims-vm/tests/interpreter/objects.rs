@@ -15,7 +15,8 @@ const STOOL: u32 = 0x5004;
 
 /// A cleared lot whose catalog has a chair (12 attributes, 3 dynamic
 /// sprites), two person types, and a stool whose definition asks for
-/// nothing.
+/// nothing. Both person types' scripts changed since the save, so load
+/// step 13 resets their people.
 fn lot() -> Fixture {
     let mut fx = Fixture::new();
     fx.world.objects.clear();
@@ -28,6 +29,7 @@ fn lot() -> Fixture {
     fx.add_type(CHILD, 2, 0, 4097);
     fx.add_type(STOOL, 4, 0, 4097);
     fx.world.neighbors = records(11);
+    fx.world.changed_types = [ADULT, CHILD].into();
     fx
 }
 
@@ -440,4 +442,61 @@ fn people_the_read_cannot_construct_fail_loudly() {
     assert!(matches!(cause, Trap::Invalid(_)), "{cause:?}");
     // The stream and the files read are as they were.
     assert_eq!(fx.world.encode(), before.encode());
+}
+
+#[test]
+fn a_person_the_load_does_not_reset_fails() {
+    // Load step 13 resets a person only when its type's scripts changed
+    // since the save; otherwise its animator keeps what the restore read,
+    // which is not ported.
+    let mut fx = lot();
+    fx.world.changed_types.remove(&CHILD);
+    let before = fx.world.clone();
+    let objects = file(vec![sim(3, ADULT), sim(2, CHILD)]);
+    let (object, cause) = trap(read(&mut fx, &objects, &people()));
+    assert_eq!(object, 2);
+    assert!(
+        matches!(&cause, Trap::Unsupported(text) if text.contains("not reset by the load")),
+        "{cause:?}"
+    );
+    assert_eq!(fx.world.encode(), before.encode());
+}
+
+#[test]
+fn the_load_restores_the_head_as_saved_and_relaxes_its_turn_after_tick_0() {
+    // The saved heading, target heading, turn and target point (0x5918ba).
+    // The target point is kept: a measurement whose target is gone reads
+    // it (0x5906bc). The constructor zeroed the head clock and set the
+    // animator's clock to the clock at the load's tick count, so the
+    // head's step relaxes the turn unless that is 0 (0x590788).
+    let bits = |f: sims_core::F32| f.to_bits();
+    for (ticks, relaxed) in [(0, false), (88444, true)] {
+        let mut fx = lot();
+        fx.world.ticks = ticks;
+        let mut adult = sim(3, ADULT);
+        adult.person.as_mut().unwrap().floats = [1.0, 2.0, 1.0, 70.0, 16.0, 80.0, 0.0, 0.0, 0.0];
+        read(&mut fx, &file(vec![adult]), &people()).unwrap();
+        let head = fx.world.animators[&3].head;
+        let mut turn = sims_sim::head::Head {
+            turn: sims_core::F32::from_f32(1.0),
+            ..sims_sim::head::Head::LOADED
+        };
+        if relaxed {
+            turn.relax();
+        }
+        assert_ne!(turn.turn.to_bits(), 0);
+        assert_eq!(
+            (
+                bits(head.heading),
+                bits(head.target_heading),
+                bits(head.turn)
+            ),
+            (1.0f32.to_bits(), 2.0f32.to_bits(), bits(turn.turn)),
+            "tick {ticks}"
+        );
+        assert_eq!(
+            head.target.map(|t| t.map(bits)),
+            Some([70.0f32, 16.0, 80.0].map(f32::to_bits))
+        );
+    }
 }

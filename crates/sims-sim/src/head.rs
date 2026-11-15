@@ -54,10 +54,10 @@ pub struct Head {
     /// -1.5 to 1.5.
     pub turn: F32,
     /// +0x21c, +0x220, +0x224: where the target is in the lot, or None
-    /// while nothing has written it since the load. The original leaves
-    /// these words as the memory held them (a capture shows 0 for two
-    /// people and leftover bytes for a third); the measurement only reads
-    /// them once a target has written them, and reading them before fails.
+    /// while nothing has written it. The load restores the saved point
+    /// (0x5918ba); a person made in play has the constructor's, which
+    /// leaves these words as the memory held them, so reading them before
+    /// a target has written them fails.
     pub target: Option<[F32; 3]>,
 }
 

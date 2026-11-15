@@ -41,7 +41,7 @@ use crate::load::INDICATORS;
 use crate::program::DEFINITION_WORDS;
 use crate::visits::function;
 use sims_sim::World;
-use sims_sim::animator::{Animator, Layer};
+use sims_sim::animator::{Animator, HeldPose, Layer};
 use std::collections::BTreeSet;
 
 mod find;
@@ -67,13 +67,15 @@ pub(crate) struct Pending {
     pub refreshed: Kept,
 }
 
-/// A person's animator, base layer and the bones its skin has moved
-/// ([`World::translated_bones`]).
+/// A person's animator, base layer, the bones its skin has moved
+/// ([`World::translated_bones`]) and the pose the load left in it
+/// ([`World::held_poses`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Kept {
     pub animator: Option<Animator>,
     pub base: Option<Layer>,
     pub translated: Option<BTreeSet<String>>,
+    pub held: Option<HeldPose>,
 }
 
 impl Kept {
@@ -82,6 +84,7 @@ impl Kept {
             animator: world.animators.get(&id).cloned(),
             base: world.base_layers.get(&id).cloned(),
             translated: world.translated_bones.get(&id).cloned(),
+            held: world.held_poses.get(&id).cloned(),
         }
     }
 
@@ -98,6 +101,10 @@ impl Kept {
         match &self.translated {
             Some(bones) => world.translated_bones.insert(id, bones.clone()),
             None => world.translated_bones.remove(&id),
+        };
+        match &self.held {
+            Some(held) => world.held_poses.insert(id, held.clone()),
+            None => world.held_poses.remove(&id),
         };
     }
 }
