@@ -568,9 +568,7 @@ impl Game {
             }
             Command::TogglePanel | Command::OpenPanel(_) => Outcome::redraw(),
             other => {
-                self.note = Some(format!(
-                    "Not carried out yet: {other:?}"
-                ));
+                self.note = Some(format!("Not carried out yet: {other:?}"));
                 Outcome::redraw()
             }
         }

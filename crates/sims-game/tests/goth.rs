@@ -415,7 +415,10 @@ fn a_press_on_a_portrait_selects_that_goth() {
         .find(|item| item.command == Some(sims_ui::command::Command::Select { sim: other }))
         .expect("the other Goth's portrait")
         .rect;
-    game.press([portrait.x + portrait.width / 2, portrait.y + portrait.height / 2]);
+    game.press([
+        portrait.x + portrait.width / 2,
+        portrait.y + portrait.height / 2,
+    ]);
     assert_eq!(game.lot().world().selected(), Some(other));
     assert_eq!(game.lot().world().globals[3], other as i16);
     // The lot goes on with the new selection.
