@@ -207,9 +207,10 @@ impl Machine<'_, '_> {
     ///   0x4101f2), whatever the record's word 61 says; 0 if none.
     /// - 9: the friend count ([`sims_sim::World::family_friends`],
     ///   0x410260, 0x427219) of the first family whose ID is the record's
-    ///   word 61, if that word is not 0 and the family lives in a house
-    ///   (+0x110); else 0. Reading it works the count out again when it
-    ///   is out of date, so it can change the family.
+    ///   word 61, with or without a house (0x425cfa does not read
+    ///   +0x110), if that word is not 0; else 0. Reading it works the
+    ///   count out again when it is out of date, so it can change the
+    ///   family.
     ///
     /// Fields 0, 1 and 5 read what the record's +8 points to, and 7 and 8
     /// the family's flags (+0x138), which the simulation does not hold;
@@ -222,10 +223,7 @@ impl Machine<'_, '_> {
         let families = &self.world.families;
         let family = || {
             let id = i32::from(record.data[sims_sim::neighbors::FAMILY]);
-            families
-                .iter()
-                .position(|f| id != 0 && f.id == id)
-                .filter(|&place| families[place].house != 0)
+            families.iter().position(|f| id != 0 && f.id == id)
         };
         let unsupported = |address: u32, what: &str| {
             Err(Trap::Unsupported(format!(

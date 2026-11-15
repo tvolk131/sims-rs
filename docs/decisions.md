@@ -23,10 +23,11 @@ the field is read.
 - **6** walks the families (neighborhood +0x154) for the first whose
   members (+0x12c, 0x4101f2) hold the record's GUID, and gives its house
   (+0x110), whatever the record's word 61 says.
-- **9** finds the first family whose ID (+0x10c) is word 61 (0 gives 0).
-  If it has a house, it returns 0x410260 → 0x427219: the family's cached
-  count (+0x120), worked out again first by 0x427bd7 when the stale byte
-  (+0x124) is set.
+- **9** finds the first family whose ID (+0x10c) is word 61 (0 gives 0)
+  and, with or without a house (0x425cfa does not read +0x110; the house
+  checks are fields 7 and 8's), returns 0x410260 → 0x427219: the
+  family's cached count (+0x120), worked out again first by 0x427bd7
+  when the stale byte (+0x124) is set.
 - **0**, **1** and **5** read the record's +8 (a pointer to the person's
   type data: 0x423f30 reads +0xb4 from it, 0x4572af +0x60). **7** and
   **8** read the family's flags (+0x138), whose bit 1 the statistics
@@ -70,17 +71,34 @@ up to date, and the other 25 families have the file's 0 and are out of
 date. Our state matches, and `resize.rs` pins it. For an empty lot
 nothing is counted (unverified).
 
-**Known difference: the panel's redraw.** The panel shows the count
-again whenever it redraws, which is not modeled. The redraw is a
-virtual method (0x53a01f, no direct callers) that builds the label
-through 0x4cfcdb and sets it only if the text changed. The capture
-shows it runs during play: update 2 writes record 32's row for 34
-(from [50] to [50, 0, 50]), which marks family 5, yet family 5 is up to
-date after every captured update. In our strict run family 5 is marked
-at tick 1 and stays out of date through tick 1102. Only the stale flag
-differs. A later read works the count out the same way, so a read
-differs only when something the count reads changes, without a
-relationship write, between the redraw and the read. The tick pins
+**The panel's redraw.** The panel shows the count again whenever the
+game updates its windows. The redraw is slot +0x17c of the
+`cWinViewControl` vtable at 0x66f220 (stored at 0x66f39c), 0x53a01f,
+which the generic window update 0x5dce19 calls at 0x5dd0de. It builds
+the label through 0x4cfcdb → 0x410260 → 0x427219, which works the count
+out again if it is out of date. The game updates its windows as it
+handles its messages: between lot updates, and inside the pump that
+waits for a dialog that stops the game (0x436da0 → 0x4f6b95 →
+0x5dab4b). So `Interpreter::refresh_family_panel` counts the selected
+family again after each of `Lot`'s lot updates and as the registry
+shows each such dialog.
+
+This matters for more than the stale flag. A count is cached until a
+relationship write marks the family, and a relationship read makes
+missing rows (zero values) without marking it. With a threshold of 0, a
+write, then a redraw that counts 0, then a read that makes rows, then a
+read of field 9 gives the cached 0 in the original, where a family left
+out of date would count 1. A test covers the cache across a redraw.
+
+**Partly verified.** In all 608 captured updates of the Goth house,
+family 5 is up to date after the update; only update 2 changes
+relationships (record 32's row for 34, from [50] to [50, 0, 50], which
+marks family 5), and update 2 shows a dialog. The snapshots do not show
+which redraw cleared the mark. Whether the window update redraws the
+panel on every pass, or only when the panel is marked, is
+**unverified**. Redrawing more or less often differs only when a
+relationship write and a read of field 9 fall between the same two
+redraws while something else the count reads changes. The tick pins
 leave the families out, so they are unaffected.
 
 Strict mode: through tick 1102 every line of `sims boot` matches main
@@ -99,8 +117,8 @@ ported.
 The old prototype's `family_friends.rs` agreed on the count, the cache
 and the marks. It also kept the family flags and a per-family dirty
 plan. Reopen if a capture of a relationship write shows the family's
-stale byte untouched, or if the panel's redraw turns out to read a
-count at a point that matters.
+stale byte untouched, or a capture shows a redraw at a point other than
+between lot updates and a dialog's wait.
 
 ## 2026-11-15: Person word 1 goes to the interface and is cleared
 

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 33 --answers 3`
 /// gives this hash with the default frames (snapshot format 23).
-const TICK_33: &str = "1b29b0a0c793e9b4457b21d72c61016498811f27c4d926c73e5c52ee11d30e34";
+const TICK_33: &str = "9d5a04c006c0e77b014642afe9113d5b5ec7c250787caf001b6ede4a16bc9e99";
 /// The same state's hash under snapshot format 22, which had no families
 /// ([`sims_sim::World::families`]) at the end.
 const TICK_33_22: &str = "041181badfd4d6953814b6c46612398df1004fa583b1d2aa5bd11c59715d65c0";
@@ -29,6 +29,10 @@ fn the_goth_house_steps_to_tick_33() {
         assert_eq!(lot.ticks(), tick);
         assert_eq!(lot.world().ticks, start.wrapping_add(tick));
     }
+    // The family panel redraws after each update, so the Goth family's
+    // friend count is up to date, as in every capture of the original.
+    let goths = lot.world().families.iter().find(|f| f.id == 5).unwrap();
+    assert_eq!((goths.friends, goths.stale), (0, false));
     assert_eq!(lot.world().hash_hex(), TICK_33);
     use sha2::Digest;
     let mut bytes = lot.world().encode();

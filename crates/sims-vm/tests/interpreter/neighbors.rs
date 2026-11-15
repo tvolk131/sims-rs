@@ -10,7 +10,7 @@
 
 use crate::support::*;
 use sims_sim::neighbors::{FAMILY, Family, Inventory, Item, KIND, Neighbor, Row};
-use sims_vm::{Status, Trap};
+use sims_vm::{Interpreter, Status, Trap};
 
 const BUDGET: usize = 100;
 
@@ -228,27 +228,65 @@ fn scope_24_field_9_reads_the_friendship_threshold_truncated() {
 }
 
 #[test]
-fn scope_24_field_9_is_0_without_a_family_with_a_house() {
-    // A family with no house: 0, and its count is not worked out.
+fn scope_24_field_9_reads_the_first_family_of_the_records_id() {
+    // A family with no house is counted all the same (0x425cfa does not
+    // read the house).
     let mut fx = friends();
     fx.world.families[1].house = 0;
-    assert_eq!(field(&mut fx, 9), 0);
-    assert!(fx.world.families[1].stale);
+    assert_eq!(field(&mut fx, 9), 3);
+    assert!(!fx.world.families[1].stale);
     // The record's word 61 names no family.
     let mut fx = friends();
     fx.world.neighbors.get_mut(2).unwrap().data[FAMILY] = 6;
     assert_eq!(field(&mut fx, 9), 0);
-    // Word 61 is 0, even with a family 0 that has a house.
+    // Word 61 is 0, even with a family 0.
     let mut fx = friends();
     fx.world.families.push(family(0, 3, &[]));
     fx.world.neighbors.get_mut(2).unwrap().data[FAMILY] = 0;
     assert_eq!(field(&mut fx, 9), 0);
     assert!(fx.world.families[2].stale);
-    // The first family of an ID is the one read.
+    // The first family of an ID is the one read, with or without a house.
     let mut fx = friends();
     fx.world.families.insert(0, family(5, 0, &[ANNE, BOB]));
-    assert_eq!(field(&mut fx, 9), 0);
+    assert_eq!(field(&mut fx, 9), 3);
+    assert!(!fx.world.families[0].stale);
     assert!(fx.world.families[2].stale);
+}
+
+#[test]
+fn the_family_panel_caches_the_selected_familys_count_for_later_reads() {
+    // The Goths (family 5) are the selected family.
+    let mut fx = friends();
+    fx.world.globals[9] = 5;
+    let refresh = |fx: &mut Fixture| {
+        Interpreter::new(&fx.program, &fx.catalog, fx.stream).refresh_family_panel(&mut fx.world)
+    };
+    refresh(&mut fx);
+    assert_eq!(
+        (fx.world.families[1].friends, fx.world.families[1].stale),
+        (3, false)
+    );
+    // The other family is not counted.
+    assert!(fx.world.families[0].stale);
+    // A change the count reads that is not a relationship write (as a row
+    // a relationship read makes) leaves the count the panel worked out.
+    like(&mut fx, 1, 3, 0);
+    assert_eq!(field(&mut fx, 9), 3);
+    // A relationship write puts it out of date; the panel counts again,
+    // and a later change is not seen.
+    fx.world.families[1].stale = true;
+    refresh(&mut fx);
+    assert_eq!(
+        (fx.world.families[1].friends, fx.world.families[1].stale),
+        (2, false)
+    );
+    like(&mut fx, 1, 3, 90);
+    assert_eq!(field(&mut fx, 9), 2);
+    // An empty lot counts nothing.
+    fx.world.globals[9] = 0;
+    fx.world.families[1].stale = true;
+    refresh(&mut fx);
+    assert!(fx.world.families[1].stale);
 }
 
 #[test]

@@ -306,11 +306,9 @@ impl Interpreter<'_> {
     /// before it draws a frame and runs a tick.
     ///
     /// 20. The interface's family panel shows the selected family's
-    ///     friend count (0x4cfcdb, 0x410260, 0x427219), which works the
-    ///     count out again, as it is out of date since the neighborhood
-    ///     was read ([`sims_sim::World::family_friends`]). The family is
-    ///     the one in global 9; for an empty lot (0) nothing is counted,
-    ///     which is **unverified**.
+    ///     friend count ([`Interpreter::refresh_family_panel`]), which
+    ///     works the count out again, as it is out of date since the
+    ///     neighborhood was read.
     /// 21. The rooms that wait are counted
     ///     ([`Interpreter::update_pending_rooms`], 0x467094).
     /// 22. The interface's wait check (0x4764fe) writes what it found to
@@ -320,16 +318,39 @@ impl Interpreter<'_> {
     /// Returns the rooms counted. In a capture of the original at the
     /// Goth house's first tick, the Goth family's count is up to date
     /// and every other family's is not.
-    ///
-    /// Not modeled: the panel shows the count again whenever the
-    /// interface redraws it, working it out again if a relationship write
-    /// put it out of date since. A count read later works it out the
-    /// same way, so this matters only when something it reads changes
-    /// without putting it out of date in between. The redraw is the
-    /// virtual method 0x53a01f; in a capture the Goth family's count is
-    /// up to date after every update, where ours stays out of date after
-    /// the first relationship write.
     pub fn before_frame(&self, world: &mut World) -> Result<Vec<i16>, Fault> {
+        self.refresh_family_panel(world);
+        let counted = self.update_pending_rooms(world)?;
+        set_global(world, WAITED_FOR, 0)?;
+        Ok(counted)
+    }
+
+    /// The interface's family panel shows the selected family's friend
+    /// count again (0x53a01f, slot +0x17c of the `cWinViewControl`
+    /// vtable at 0x66f220, which the generic window update 0x5dce19 calls
+    /// at 0x5dd0de): 0x4cfcdb → 0x410260 → 0x427219, which works the
+    /// count out again if a relationship write put it out of date
+    /// ([`sims_sim::World::family_friends`]). The family is the first
+    /// whose ID is global 9, with or without a house; on an empty lot (0)
+    /// nothing is counted, which is **unverified**.
+    ///
+    /// The game updates its windows whenever it handles its messages:
+    /// between lot updates, and while a dialog that stops the game waits
+    /// for its answer (0x436da0 → 0x4f6b95 → 0x5dab4b). [`crate::Lot`]
+    /// calls this after each lot update and the registry's dialog pass
+    /// calls it as it shows each such dialog. A count is cached until the
+    /// family is put out of date, so a refresh can change what a later
+    /// read of scope 24 field 9 gives: a change the count reads that is
+    /// not a relationship write (such as a row a relationship read makes)
+    /// leaves the count the refresh worked out.
+    ///
+    /// In every capture of the Goth house (608 updates) the Goth family's
+    /// count is up to date after the update. Whether the original redraws
+    /// the panel on every pass of its messages, or only when the panel is
+    /// marked, is **unverified**; the count is worked out only when it is
+    /// out of date, so the two differ only if a relationship write and a
+    /// read of the count fall between the same two redraws.
+    pub fn refresh_family_panel(&self, world: &mut World) {
         let family = i32::from(world.globals.get(9).copied().unwrap_or(0));
         if family != 0
             && let Some(place) = world.families.iter().position(|f| f.id == family)
@@ -337,9 +358,6 @@ impl Interpreter<'_> {
             let threshold = self.program.autonomy_constants().friendship_threshold;
             world.family_friends(place, threshold);
         }
-        let counted = self.update_pending_rooms(world)?;
-        set_global(world, WAITED_FOR, 0)?;
-        Ok(counted)
     }
 }
 
