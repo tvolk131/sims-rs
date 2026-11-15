@@ -294,8 +294,10 @@ impl World {
     ///
     /// Two things differ from the original. It stops at the first array
     /// that fails to read and goes on with the load; here a missing array
-    /// is an error. And every array must be 64 by 64, as the original's are
-    /// whatever the lot's size. The lot's lighting, which the original
+    /// is an error. And every array must be 64 by 64: the original takes
+    /// any size (0x431005, whose resize at 0x4312ff to 0x431388 has no such
+    /// requirement), but every shipped house's arrays are 64 by 64, whatever
+    /// the lot's size. The lot's lighting, which the original
     /// resets here, is not modeled.
     ///
     /// The widening follows the old prototype's reading of the code
