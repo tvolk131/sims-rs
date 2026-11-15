@@ -17,9 +17,12 @@ it is mode 3: the stack object's routing slot table (+0x13c), the same
 range check (native error 0x1b), the same placement (0x454ac5 on). The
 slot's own record and flags are looked up by that number too.
 
-With it, and the catalogs, grown attributes and animator restore of the
-open branches, the house runs to tick 451 and stops on scope 34, the
-neighborhood's data, which track 3's strict day branch ports. Modes 1 and
+With it, and the animator restore of the open branch, the house runs to
+tick 241 and stops on object 140's tree 0x1003: objects 140 and 75 are
+both not solid on one tile, and the test that follows (0x4358c3,
+0x45728d) is not ported. (Read as a local, as a first version did, the
+same Snap took another slot and the house ran on to tick 451; that was
+wrong.) Modes 1 and
 2 (the object itself, the tile in front of it) still fail loudly.
 
 ## 2026-11-15: The plumb bob is the original's mesh, coloured and lit as the original does
