@@ -54,7 +54,19 @@
 //!   own GUID. A record whose GUID has no definition fails: what the
 //!   original's comparison does without a link was not seen.
 //!
-//! Mode 11 fails loudly: it needs the neighborhood's lot order.
+//! Mode 11 fails loudly: it needs the neighborhood's lot order. The
+//! original (0x44f08d) walks a vector of 32-bit lot numbers at
+//! neighborhood +0x11c: a cursor of 0 gives the first, any other the one
+//! after it; a cursor not in the vector, or the last, is the false
+//! branch (0x44eccf). The lot load (0x428041, at 0x428350) fills the
+//! vector with every lot number from 1 to below the length of the
+//! neighborhood's table of lot positions (+0x110, 8 bytes a lot, read by
+//! 0x42886e) but the lot being loaded, and sorts it (std::sort,
+//! 0x42ffce) by the squared distance of each lot's position from the
+//! loaded lot's (0x427fb9). The positions look like the screen
+//! coordinates of the neighborhood's `LotLocations.iff` (STR# rows
+//! `lot, x, y`), but what fills +0x110 was not found, so the order is not
+//! modeled.
 //!
 //! [`World::order`]: sims_sim::World::order
 //! [`World::people`]: sims_sim::World::people
@@ -129,7 +141,12 @@ impl Machine<'_, '_> {
                 self.store(destination, next.id as i16)?;
                 return Ok(true);
             }
-            11 => return Err(missing(mode, "the neighborhood's lot order")),
+            11 => {
+                return Err(missing(
+                    mode,
+                    "the neighborhood's lot order (neighborhood +0x11c, 0x44f08d)",
+                ));
+            }
             _ => {
                 return Err(Trap::Unsupported(format!(
                     "Set To Next mode {mode} is not known"

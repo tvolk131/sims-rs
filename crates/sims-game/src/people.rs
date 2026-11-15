@@ -121,6 +121,12 @@ impl People {
         self.note(problems);
     }
 
+    /// Sets the clock, in milliseconds, that spins the plumb bob
+    /// ([`sims_people::People::set_clock`]).
+    pub fn set_clock(&mut self, milliseconds: u32) {
+        self.people.set_clock(milliseconds);
+    }
+
     /// Draws every placed person on the levels `camera` shows into
     /// `canvas`, which holds the lot `sims_render::draw` drew with the
     /// same camera, each pixel naming the person drawn in it.
