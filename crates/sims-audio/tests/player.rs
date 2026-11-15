@@ -1350,14 +1350,14 @@ fn event_numbers_past_32_bits_are_faults() {
     assert!(player.faults[2].contains("no hit list 4294967295"));
 }
 
-const IFLT: u8 = 65;
+const IFLE: u8 = 67;
 
 #[test]
 fn a_fresh_start_leaves_positive_flags_whatever_its_third_argument() {
-    // Branch to the silent routine 0x101 if the flags are negative; the
+    // Branch to the silent routine 0x101 unless the flags are positive; the
     // event's third argument is -1. A fresh start writes isplaying (46)
     // last (0x57dbc5), so the flags are positive and the note plays.
-    let mut branches = vec![IFLT];
+    let mut branches = vec![IFLE];
     branches.extend(long(0x101));
     branches.extend([2, 5, WAIT_SAMP, END]);
     let silent: &[u8] = &[END];
