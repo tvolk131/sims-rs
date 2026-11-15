@@ -156,7 +156,7 @@ impl Machine<'_, '_> {
         // write nothing but its animator. Its own thread may then read no
         // animator until its animator's tick settles the refresh; another
         // object reading that animator before the deletion is not checked
-        // (docs/decisions.md).
+        // (docs/decisions/).
         let person = self
             .world
             .objects

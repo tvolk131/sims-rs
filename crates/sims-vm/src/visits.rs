@@ -36,7 +36,7 @@
 //! Ported from the old prototype's visit loop
 //! (legacy/crates/sims-content/src/house_loading.rs), `PostLoad`
 //! (legacy/crates/sims-vm/src/loading.rs) and `Reset`
-//! (legacy/crates/sims-sim/src/lot_reset.rs). `docs/decisions.md` says
+//! (legacy/crates/sims-sim/src/lot_reset.rs). `docs/decisions/` says
 //! what a trace of the original loading the Goth house confirms.
 
 use crate::factory::TURN_BUDGET;

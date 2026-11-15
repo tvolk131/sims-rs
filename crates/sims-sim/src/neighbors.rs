@@ -319,7 +319,7 @@ impl World {
     /// file, every record's word 61 equals the capture's at the Goth
     /// house's first tick. The capture's game read another neighborhood
     /// file, which differs from the install's in five records (47, 48,
-    /// 301, 344 and 351); see `docs/decisions.md`. So do the families'
+    /// 301, 344 and 351); see `docs/decisions/`. So do the families'
     /// IDs, houses, members and order, and every friend count but the
     /// Goth family's, which the load counts again (load step 20). That
     /// neighborhood has a record for every registered definition, so step

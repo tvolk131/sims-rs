@@ -314,7 +314,7 @@ impl Program {
     /// these tables in this order is the prototype's finding, compared
     /// there with the original's tables at 0x6e51f8 and 0x6e5160 in a
     /// memory image; here it is checked only through the mood a decay
-    /// works out, which equals the original's (`docs/decisions.md`).
+    /// works out, which equals the original's (`docs/decisions/`).
     pub fn motive_tuning(&self) -> Result<sims_sim::motives::Tuning> {
         use sims_sim::motives::{Curve, MOOD_MOTIVES, MOOD_POINTS, Rates, Tuning};
         let global = self.libraries.get(&self.global);
@@ -369,7 +369,7 @@ impl Program {
     /// (`__ftol`). Names, addresses and defaults are the old prototype's
     /// (legacy/crates/sims-vm/src/autonomy_constants.rs, `SPECS`). The
     /// values read here were compared with the stored ones in a memory
-    /// image of the original (`docs/decisions.md`).
+    /// image of the original (`docs/decisions/`).
     pub fn autonomy_constants(&self) -> crate::autonomy::Constants {
         use crate::autonomy::Constants;
         use sims_core::{Ext, F32};
@@ -419,7 +419,7 @@ impl Program {
     /// The order and the four points are the old prototype's
     /// (`Tuning::from_program` in legacy/crates/sims-vm/src/motives.rs).
     /// The curves read here were compared, point for point, with people's
-    /// curves in a memory image of the original (`docs/decisions.md`).
+    /// curves in a memory image of the original (`docs/decisions/`).
     pub fn score_curves(
         &self,
         global: bool,

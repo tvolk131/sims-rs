@@ -62,8 +62,8 @@ events, and what it asks for after them) come first.
   (#131), the pie menu and picking from it (#132), and Go To Routing
   Slot's parameter and global slots (#134), which a player's snack order
   reached.
-- Strict mode on the Goth house runs a whole day, 43,200 ticks, from
-  the load to 06:30:44 the next morning, with no stop. One tick is two game seconds, so a day is 43,200 ticks (measured
+- Strict mode on the Goth house runs to tick 9906, 12:00 on the first
+  day. One tick is two game seconds, so a day is 43,200 ticks (measured
   from the clock globals). The carpool makes the school bus at tick 2703
   (the multi-tile factory is ported). The base layer is kept and the
   pose composed from it, and a person may take itself off the lot in
@@ -75,19 +75,11 @@ events, and what it asks for after them) come first.
   first; at tick 6756 a pet is made (the expansions installed allow
   pets) and walks, runs and turns at its own pace; an inventory count
   goes up at 7702 and a route with no door gives up at 9337. Past tick
-  1000 this is unverified: there is no capture. Then, also unverified:
-  at tick 9907 object 5 walks the neighborhood's lots in order of
-  distance (Set To Next mode 11) over an empty list, as in every
-  capture. A puddle's group is placed at 10719. The selected Sim takes
-  the indicator into its head slot at 15296. A route asked to stop under
-  way stops at the walk's next step (25500). At 30320 a person is made
-  who goes through everything. The day turns at tick 31478: the date,
-  the objects' age and value, the budget, and signal 0xdc. Later a Snap
-  asks a person to make way (34719), a balloon shows a neighbor's
-  picture (35102), a puddle joins the group beside it (37426), and an
-  action dropping queued ones tells their targets (40935). The snack
-  order stops at step 13199 on Burn (opcode 9, not ported). Step 2
-  continues from comparing this day with a capture.
+  1000 this is unverified: there is no capture. At tick 9907 object 5
+  walks the neighborhood's lots in order of distance (Set To Next mode
+  11), which needs a lot-position table the simulation does not hold
+  (the snack order stops on it at the same step). Step 2 continues from
+  there.
 - Of the base neighborhood's houses only the Goths' and the Newbies'
   (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
   tick 4052; a route that gives up on a slot it may end near runs the
@@ -120,7 +112,7 @@ events, and what it asks for after them) come first.
   household selection, and the community lots (UserData's houses 40 to
   48) where Create New Object Instance mode 6 makes a person (0x44e60e).
   Four types grow their attribute arrays to the saved count (0x4342ae). The templates' `Patch` families are not
-  imported (see `docs/decisions.md`).
+  imported (see `docs/decisions/`).
 
 ## Met goal: a headless lot boot that matches the original
 
@@ -148,7 +140,7 @@ How it was reached:
    Five runs of the Goth house were recorded; the first covered 1000 lot
    updates, tick counts 88445 to 89444. The first does not choose in
    tick 233 and the other four do; we follow those
-   (`docs/decisions.md`). With the install's own UserData, the C
+   (`docs/decisions/`). With the install's own UserData, the C
    runtime's random stream and all 463 neighborhood records match too.
    The original first draws from the C runtime's stream in tick 6, 1,466
    times, when it makes a person; ours draws the same.
@@ -939,7 +931,7 @@ with flag 2 or between two people (`0x44d17c`), and Manage Inventory
 operation 3 (`0x4552f8`). After tick 1 all 463 records and the
 inventories equal the capture's, when ours reads the same neighborhood
 file as the capture's game; the install's file differs from that one in
-five records (see `docs/decisions.md`). One registry byte that a
+five records (see `docs/decisions/`). One registry byte that a
 relationship write sets is 1 in the capture and 0 here; what sets it
 during the original's load is not known.
 
@@ -1152,7 +1144,7 @@ Its state after tick 230 equals ours as far as compared, and the
 original's code run in an emulator on its memory from update 47 chooses
 in 233. So something outside the lot updates, after update 47, changed
 the outcome in that run only. What it was is not known (see
-`docs/decisions.md`). We follow the three runs that agree.
+`docs/decisions/`). We follow the three runs that agree.
 
 ### Ticks 233 to 261
 
@@ -2239,8 +2231,9 @@ through their public interfaces only; the simulation never depends on it.
   error is printed and shown across the top for a while; only a failure
   play mode does not catch stops it. In play mode the Goths' house runs
   12,000 ticks (ten minutes at normal speed) without stopping, through
-  about a dozen different caught errors; in strict mode it runs a whole
-  day, 43,200 ticks, without stopping (unverified past tick 1000).
+  about a dozen different caught errors; in strict mode it stops after
+  tick 9906 (at tick 9907 Set To Next mode 11 needs the neighborhood's
+  lot order).
   `--png <file>
   --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
@@ -2281,9 +2274,9 @@ through their public interfaces only; the simulation never depends on it.
   his hunger goes from 94.5 to 100.0 (tick 936); at 1088 the snack goes
   off the lot and at 1136 it is deleted, and he is free again. He goes
   on to other things (object 71 at tick 1497, object 132 at 2292).
-  Strict mode now runs the order through step 13198 and stops at step
-  13199, where object 18 runs Burn (opcode 9, not ported); without an
-  order it runs the whole day (unverified past tick 1000).
+  Strict mode now runs the order through step 9906 and stops at step
+  9907 (Set To Next mode 11 needs the neighborhood's lot order); without
+  an order it stops on the same at tick 9907.
 - **Done: a player's order from the window, in play mode.** With
   `--play`, the pointer on the fridge lists its pie, a click opens it,
   and Have A Snack queues the action the listing offered. A Goth test
@@ -2377,8 +2370,12 @@ through their public interfaces only; the simulation never depends on it.
 - Nothing from the original game is committed. Fixtures that need game data
   stay private and are skipped when the data is absent.
 - Choices about format details, unverified guesses, and the order of work
-  are made in the PR and recorded in `docs/decisions.md`. Guesses are
-  marked unverified in the code until the harness confirms them.
+  are made in the PR and recorded as a new file under `docs/decisions/`
+  (see its README). Guesses are marked unverified in the code until the
+  harness confirms them.
+- Only the coordinator edits this roadmap. A track's PR does not touch it;
+  its body ends with a **Roadmap** section saying which lines should change.
+  After merging, the coordinator applies those changes in one docs commit.
 - Stop and ask the maintainer only when:
   - something only they can provide is needed (a login, or files not on
     this machine);

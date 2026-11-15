@@ -17,7 +17,7 @@
 //! `search_tile_allowed`; legacy/crates/sims-sim/src/lot_acceptance.rs)
 //! and compared them with the original's code run alone; the ports here
 //! were written from the original's code and checked against a trace of
-//! the running game only where `docs/decisions.md` says so.
+//! the running game only where `docs/decisions/` says so.
 //!
 //! The placement error the original writes on a refusal (global 0x6e4acc,
 //! and the object it collided with in 0x6e4ad0) is kept only as far as a

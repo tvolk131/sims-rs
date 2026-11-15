@@ -41,7 +41,7 @@
 //! 8. A person whose person data word 0 is not 0 refuses a candidate below
 //!    the sitting threshold; the primitive then fails.
 //!
-//! The FPU runs in single precision here (`docs/decisions.md`): every add,
+//! The FPU runs in single precision here (`docs/decisions/`): every add,
 //! subtract, multiply and divide rounds to 24 bits.
 //!
 //! Ported from the original's code at the addresses given, with the old
@@ -51,7 +51,7 @@
 //! (legacy/crates/sims-vm/src/motives.rs) as guides. Every step was
 //! compared with the original's code run on a memory image of the Goth
 //! house at the entry of its update 233, where person 21 runs it
-//! (`docs/decisions.md`).
+//! (`docs/decisions/`).
 
 use crate::factory::{TURN_BUDGET, flag};
 use crate::fault::Trap;
