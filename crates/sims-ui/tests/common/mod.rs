@@ -44,6 +44,14 @@ pub fn open(root: &Path, house: &str) -> Opened {
     let catalog = Catalog::build(&index).unwrap();
     let file = House::load(&house, &catalog).unwrap();
     let mut world = sims_sim::World::from_house(&file, &catalog).unwrap();
+    // The neighborhood's people, as the load holds them before the lot
+    // (crates/sims-vm/src/boot.rs), for the relationship panel.
+    world
+        .read_neighbors(
+            &neighborhood,
+            &sims_sim::neighbors::registry(&index, &catalog),
+        )
+        .unwrap();
     let number = neighborhood
         .houses()
         .unwrap()
@@ -62,7 +70,10 @@ pub fn open(root: &Path, house: &str) -> Opened {
         object.selected = true;
     }
     let careers = Careers::load(&index).unwrap();
-    let snapshot = Snapshot::read(&world, &family.members).with_careers(&careers);
+    // The friendship threshold the original's tuning gives (0x6c4398).
+    let snapshot = Snapshot::read(&world, &family.members)
+        .with_careers(&careers)
+        .with_relations(&world, &family.members, 50);
     let ui = UiGraphics::open(&install).unwrap();
     let art = Art::load(&ui, US_ENGLISH, &sims_ui::hud::RESOURCES).unwrap();
     let faces = Faces::load(&index, &catalog, &family.members).unwrap();
