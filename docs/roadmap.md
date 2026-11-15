@@ -2017,10 +2017,19 @@ stop-sounds events.
   volume and pan from where its objects are on the screen (0x5730b6,
   0x57473b, 0x570e09), which the game sends with the answers, from its
   camera.
+- **Done: the music modes** (36). A change of mode starts and stops the
+  music tracks as the original's sound manager does (0x575170): the
+  buy, build and neighbourhood lists, the expansions', the credits', the
+  river loops and the slow fade into live mode. `play_trk` hands on the
+  caller's arguments and `source`, and `kill_trk` ends the whole track.
+  3 events of kinds not ported remain: the piano (43), and 103 and 104,
+  which are debug commands.
 - **Next:**
-  - The piano (43) and the music half of the music modes (36). 103 and
-    104 are debug commands. Placing the tracks again when the camera
-    moves (kind 33), once the game sends it only then.
+  - The piano (43).
+  - Placing the tracks again when the camera moves (kind 33), once the
+    game sends it only then.
+  - Tracks and fades step once a block (64 frames, about 2.9 ms); the
+    original's sound manager steps them once a millisecond (0x57cf37).
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)
