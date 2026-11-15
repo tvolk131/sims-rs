@@ -1510,8 +1510,13 @@ Progress:
 - Done: the wood trim along the tops of standing and cut walls; at the
   compared camera the house box rose from 72% to 76% exact (walls up)
   and from 67% to 69% (cutaway).
-- Next: the cap where a cut wall meets a standing one, and two more
-  cameras, each checked against the original.
+- Done: two more cameras compared with the original. At medium zoom
+  (rotation 0) open grass matches 96% and the house 74%; objects set
+  into walls are a pixel or two off. At far zoom, rotation 3, the house
+  lines up but the grass matches only 13%; why is not known yet.
+- Next: the grass at rotations other than 0; object placement and depth
+  at medium zoom; lamps, which are not drawn; the cap where a cut wall
+  meets a standing one.
 
 ## Track: sound (`crates/sims-audio`)
 
