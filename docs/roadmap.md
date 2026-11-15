@@ -1847,6 +1847,13 @@ Progress:
   the Goths' people alone over their lot every 120 ticks at four
   rotations and checks that something hides them at times, that their
   feet show in most views, and that nobody is hidden throughout.
+- Done: the plumb bob (`sims_people::bob`) over the person whose head
+  slot holds it: the original's `head-arrow` mesh, three units over the
+  head bone, spinning half a turn a second by a clock the app gives
+  (`People::set_clock`), coloured by the person's mood and lit by the
+  original's own light for it. A gated test checks it covers the pixels
+  the original's does in a screenshot, within a pixel. The date and star
+  bobs are not drawn, and only rotation 0 was compared.
 - Next: compare a person behind furniture with the original; a person on
   an upper level stands at the floor, without the original's offset.
   Match the original's lighting (see its decisions entry); compare
