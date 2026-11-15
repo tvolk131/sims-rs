@@ -8,7 +8,8 @@
 //! - [`game`]: the game without its window, so it is tested headless.
 //! - [`pace`]: the speed and pause, as ticks owed for the time passed.
 //! - [`view`]: the house view's camera.
-//! - [`people`]: the people drawn over the lot.
+//! - [`people`]: the people drawn into the lot, behind what is in front
+//!   of them.
 //! - [`hud`]: the control panel and dialogs over the lot.
 //! - [`pick`]: which object or person a click lands on.
 //! - [`sound`]: the simulation's sound events, mixed by `sims-audio`;

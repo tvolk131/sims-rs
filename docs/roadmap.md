@@ -2087,8 +2087,8 @@ through their public interfaces only; the simulation never depends on it.
 - **Done: the window.** `cargo run --release -p sims-game` boots the
   Goths' house (`SIMS_INSTALL`, `House05.iff`, answering No to the Help
   System) and runs it in strict mode, a tick every 50 ms at normal
-  speed. The lot, the people over it and the panel over both are drawn
-  every tick; the clock, funds and needs on the panel are the live
+  speed. The lot, its people (hidden by the walls, furniture and floors
+  in front of them) and the panel over both are drawn every tick; the clock, funds and needs on the panel are the live
   world's. The panel's speed, pause and camera buttons work (the game
   paces the lot; the simulation's own speed global is not touched).
   The first error stops the lot, which stays on screen as it was with
@@ -2121,11 +2121,13 @@ through their public interfaces only; the simulation never depends on it.
   note across the top says whether it was queued. Escape closes the
   menu. The fridge lists Have A Snack, Have Lite Meal, Have A Meal,
   Serve Meal; the bookshelf lists Read a Book and the studies.
-- **Blocked: Mortimer doing what he is told.** The order is queued, but
-  on his next tick Idle For Input fails on starting the queued action
-  (0x45dc14, not ported). In strict mode that stops the lot; in play
-  mode he is reset and the queue empties.
-  That is the simulation's next step toward the done criterion.
+- **Blocked: a Sim doing what he is told.** Idle For Input now starts
+  a queued order (#131): Have A Snack queued on the fridge at tick 51
+  leaves the queue by tick 151. Three ticks later, another person
+  (object 16) fails a route that names its slot from source 2 (tree
+  0x2156 node 5; 0x45ac2e, not ported), which stops the lot in strict
+  mode. Without an order, strict mode runs to tick 1102. That route is
+  the simulation's next step toward the done criterion.
 - **Next:** the menu from the simulation's pie-menu entries (the check
   each entry runs, which the stopgap skips) once that accessor lands;
   then a real pie.
@@ -2138,9 +2140,12 @@ through their public interfaces only; the simulation never depends on it.
     game's speed global. A play-mode step that fails should still hand
     back the errors it caught before failing, and say which frame
     (before or after the tick) was skipped.
+  - `sims-people`: which person drew each pixel (`draw_on_lot` with an
+    owner per pixel), so `sims-game` need not repeat its drawing loop
+    to find the person a click lands on.
   - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
     and dialogs are. `sims-game` draws a plain list until then.
-  - `sims-vm`: Idle For Input starting a queued action (0x45dc14), and
+  - `sims-vm`: a route naming its slot from source 2 (0x45ac2e), and
     the entries the pie menu offers a person on an object, with their
     labels' table. Until then, the tile an order on an object goes to
     (`interaction_target`) and the ID and file of the TTAB it is queued

@@ -38,6 +38,8 @@ pub struct Hud {
     dialog: Option<dialog::Layout>,
     /// The pie menu, while one is open.
     pub menu: Option<Menu>,
+    /// The status band across the top, as last drawn.
+    band: Option<Rect>,
 }
 
 impl Hud {
@@ -84,6 +86,7 @@ impl Hud {
             message: None,
             dialog: None,
             menu: None,
+            band: None,
         })
     }
 
@@ -179,32 +182,33 @@ impl Hud {
             menu.layout(font, view.size);
             menu.draw(&mut frame, font, self.controls.pointer);
         }
-        if let Some(status) = status {
-            self.status(&mut frame, status);
-        }
+        self.band = status.and_then(|status| self.status(&mut frame, status));
         canvas.color = frame.into_rgb();
     }
 
-    /// A line of text on a band across the top of the frame.
-    fn status(&self, frame: &mut Frame, text: &str) {
-        let Some(font) = self.art.font(STATUS_SIZE) else {
-            return;
-        };
+    /// A line of text on a band across the top of the frame; the band.
+    fn status(&self, frame: &mut Frame, text: &str) -> Option<Rect> {
+        let font = self.art.font(STATUS_SIZE)?;
         let width = i32::try_from(frame.width()).unwrap_or(i32::MAX);
         let lines = font.wrap(text, (width - 16).max(16));
         let line_height = i32::from(STATUS_SIZE) + 4;
         let height = line_height * i32::try_from(lines.len()).unwrap_or(1) + 8;
-        frame.fill(Rect::new(0, 0, width, height), STATUS_BACK);
+        let band = Rect::new(0, 0, width, height);
+        frame.fill(band, STATUS_BACK);
         for (i, line) in lines.iter().enumerate() {
             let y = 4 + line_height * i32::try_from(i).unwrap_or(0);
             font.draw(frame, line, [8, y], STATUS_TEXT);
         }
+        Some(band)
     }
 
-    /// Whether the panel covers `point` (canvas pixels), or a dialog or a
-    /// pie menu is shown and takes every press.
+    /// Whether the panel or the status band covers `point` (canvas
+    /// pixels), or a dialog or a pie menu is shown and takes every press.
     pub fn covers(&self, point: [i32; 2]) -> bool {
-        self.dialog.is_some() || self.menu.is_some() || hud::covers(&self.items, point)
+        self.dialog.is_some()
+            || self.menu.is_some()
+            || self.band.is_some_and(|b| b.contains(point[0], point[1]))
+            || hud::covers(&self.items, point)
     }
 
     /// Moves the pointer; true if what it hovers changed.

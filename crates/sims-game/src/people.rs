@@ -1,240 +1,179 @@
-//! The people, drawn by `sims-people` over the lot `sims-render` drew.
+//! The people, drawn with `sims-people` into the canvas `sims-render` drew
+//! the lot in, and found again by a click.
 //!
-//! The people's renderer draws 3D bodies with an orthographic camera; the
-//! lot is drawn with the original's 2:1 projection. [`camera`] builds the
-//! 3D camera that puts a point on the ground where the lot's camera puts
-//! it, at every zoom and rotation, so a person stands on the tile the
-//! simulation says. Heights are drawn at the scale that projection gives
-//! a horizontal length; that the original draws people at that scale is
-//! **unverified**.
+//! [`sims_people::People`] places and poses each person; each is drawn
+//! as `sims_people::People::draw_on_lot` draws them, far to near, every
+//! pixel tested against the lot's depth (`Depth::point`, by the canvas's
+//! sprite rule), so walls, furniture and the floor above hide the people
+//! behind them. A pixel of a person that is drawn writes its depth into
+//! the canvas, so a nearer part of the mesh drawn later covers it. People
+//! on a level above the camera's are not drawn, so with the camera on the
+//! second floor its floor hides everyone downstairs, as it hides the
+//! rooms there. How the original gives a person's mesh its depth is
+//! **unverified** (see `docs/decisions.md`, "People's meshes go into the
+//! lot renderer's canvas").
 //!
-//! The people are drawn into their own image and laid over the lot
-//! whole: a wall or a counter in front of a person does not hide them yet.
-//! Hiding people behind what is in front of them belongs to the render
-//! and people tracks.
+//! The loop is `draw_on_lot`'s, repeated here from `sims-people`'s public
+//! parts because it does not say which person drew a pixel. Drawing it
+//! here notes, for each pixel of the frame, the person whose pixel the
+//! canvas took last: the one shown there. A click finds that person (or
+//! the one shown nearest within [`REACH`]); a person hidden behind a
+//! bookcase is shown nowhere, so it does not take a click meant for the
+//! bookcase.
 
-use sims_people::math::{Transform, Vec3};
-use sims_people::person::UNITS_PER_TILE;
-use sims_people::raster::{self, Camera as PeopleCamera};
-use sims_people::{Assets, Body, Cast, Library, Player, Resident, base_clip, placement};
-use sims_render::{Camera, Canvas, Lot};
+use sims_people::View;
+use sims_people::raster::{Target, draw_part};
+use sims_people::{math::Vec3, skin};
+use sims_render::canvas::FAINT;
+use sims_render::depth::Depth;
+use sims_render::{Camera, Canvas};
 use sims_sim::World;
-use std::collections::BTreeSet;
 use std::path::Path;
 
-/// Model units per sixteenth of a tile.
-const UNITS_PER_FINE: f32 = UNITS_PER_TILE / 16.0;
+/// How many different problems are kept; later ones are dropped.
+const KEPT: usize = 256;
 
-/// The side of the lot's arrays in sixteenths of a tile, which the
-/// lot camera's rotation turns about.
-const ARRAY_FINE: f32 = (sims_render::camera::ARRAY_SIZE * 16) as f32;
+/// How far from a pixel a person is shown in a click still finds them,
+/// in pixels.
+pub const REACH: i32 = 2;
 
-/// The 3D camera that draws a ground point where `camera` draws it, on a
-/// canvas of `size` pixels.
-pub fn camera(camera: &Camera, size: [usize; 2]) -> PeopleCamera {
-    let zoom = camera.zoom.level();
-    // Screen pixels across per sixteenth of a tile, along the view's x
-    // minus y: the lot camera's `(x - y) * (8 << zoom) / 16`.
-    let across = (8u32 << zoom) as f32 / 16.0;
-    // A sixteenth of a tile along x is UNITS_PER_FINE / sqrt 2 across the
-    // 3D view, which turns an eighth of a turn.
-    let scale = across * std::f32::consts::SQRT_2 / UNITS_PER_FINE;
-    let half = std::f32::consts::FRAC_1_SQRT_2;
-    // The lot camera's rotation turns the view a quarter turn each; the
-    // 3D view turns the other way about its vertical axis.
-    let yaw = match camera.rotation & 3 {
-        0 => [half, half],
-        1 => [-half, half],
-        2 => [-half, -half],
-        _ => [half, -half],
-    };
-    // The fine view position (after rotation) under the canvas's middle,
-    // inverting the lot camera's projection without rounding.
-    let [w, h] = size.map(|n| n as f32);
-    let d = (w / 2.0 - camera.origin[0] as f32) / across;
-    let s = (h / 2.0 - camera.origin[1] as f32) / (across / 2.0);
-    let (vx, vy) = ((s + d) / 2.0, (s - d) / 2.0);
-    let m = ARRAY_FINE;
-    let [x, y] = match camera.rotation & 3 {
-        1 => [vy, m - vx],
-        2 => [m - vx, m - vy],
-        3 => [m - vy, vx],
-        _ => [vx, vy],
-    };
-    PeopleCamera {
-        yaw,
-        pitch: [0.5, 0.75f32.sqrt()],
-        scale,
-        center: ground(x, y),
-    }
-}
-
-/// The 3D point of the fine ground position `x`, `y`, as
-/// [`sims_people::placement`] places a person.
-fn ground(x: f32, y: f32) -> Vec3 {
-    Vec3::new(-y * UNITS_PER_FINE, 0.0, -x * UNITS_PER_FINE)
-}
-
-/// Model units a person is raised to stand on level `level`, `ground`
-/// near-zoom pixels of terrain above the lot's base, so its feet are
-/// drawn where the lot draws that floor.
-fn level_height(camera: &PeopleCamera, lot: &Camera, level: i32, ground: f32) -> f32 {
-    let pixels =
-        (lot.zoom.floor_height() * (level - 1)) as f32 + ground / lot.zoom.near_scale() as f32;
-    // A unit up is drawn cos 30° * scale pixels up.
-    pixels / (camera.pitch[1] * camera.scale)
-}
-
-/// The terrain's height under the fine position `fine`, in near-zoom
-/// pixels (16 a terrain step, as `sims-render` raises the ground):
-/// the tile's four corners, blended by where in the tile the position
-/// is. Off the lot it is 0.
-pub fn terrain(lot: &Lot, fine: [f32; 2]) -> f32 {
-    let [x, y] = fine.map(|v| v / 16.0);
-    let (tx, ty) = (x.floor(), y.floor());
-    let size = lot.size as f32;
-    if !(0.0..size).contains(&tx) || !(0.0..size).contains(&ty) {
-        return 0.0;
-    }
-    let (fx, fy) = (x - tx, y - ty);
-    // A tile's heights are its corners (0, 1), (0, 0), (1, 0) and (1, 1),
-    // in that order (`sims_render::scene`).
-    let h = lot.heights[Lot::cell(tx as usize, ty as usize)].map(f32::from);
-    let height = h[1] * (1.0 - fx) * (1.0 - fy)
-        + h[2] * fx * (1.0 - fy)
-        + h[0] * (1.0 - fx) * fy
-        + h[3] * fx * fy;
-    height * 16.0
-}
-
-struct Drawn {
-    resident: Resident,
-    body: Body,
-    base: String,
-}
-
-/// The people of a lot: their bodies, loaded as they appear.
+/// The people of a lot, where each was shown in the last frame, and what
+/// went wrong drawing them.
 pub struct People {
-    player: Player<'static>,
-    assets: &'static Assets,
-    cast: Cast,
-    drawn: Vec<Drawn>,
-    /// Person IDs already loaded, or that failed, so each is tried once.
-    tried: BTreeSet<u16>,
-    /// What went wrong, one line each, for the host to show.
+    people: sims_people::People,
+    /// The last frame's size, and for each of its pixels the person shown
+    /// there.
+    size: [usize; 2],
+    shown: Vec<Option<u16>>,
+    /// What went wrong, one line each, each said once, for the host to
+    /// show.
     pub problems: Vec<String>,
+}
+
+/// A canvas that notes, for each pixel it takes, whose it is.
+struct Marked<'a> {
+    canvas: &'a mut Canvas,
+    shown: &'a mut [Option<u16>],
+    /// The person being drawn.
+    person: u16,
+}
+
+impl Target for Marked<'_> {
+    fn size(&self) -> (u32, u32) {
+        Target::size(&*self.canvas)
+    }
+
+    fn passes(&self, x: u32, y: u32, z: f32) -> bool {
+        Target::passes(&*self.canvas, x, y, z)
+    }
+
+    fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32) {
+        // The canvas's rule (`Canvas::put`): a pixel fainter than FAINT or
+        // farther than what is there is left out; any other is taken, a
+        // tie too.
+        let taken = texel[3] >= FAINT && Target::passes(&*self.canvas, x, y, z);
+        Target::write(&mut *self.canvas, x, y, z, texel, shade);
+        let i = y as usize * self.canvas.width + x as usize;
+        if taken && let Some(shown) = self.shown.get_mut(i) {
+            *shown = Some(self.person);
+        }
+    }
+}
+
+/// The person shown at `point` in a frame of `size` whose pixels show
+/// `shown`, or else the one shown nearest to it within [`REACH`] (the
+/// first in row order among the nearest).
+fn shown_near(shown: &[Option<u16>], size: [usize; 2], [x, y]: [i32; 2]) -> Option<u16> {
+    let [w, h] = size.map(|n| i32::try_from(n).unwrap_or(i32::MAX));
+    let mut best: Option<(i32, u16)> = None;
+    for py in y - REACH..=y + REACH {
+        for px in x - REACH..=x + REACH {
+            if !(0..w).contains(&px) || !(0..h).contains(&py) {
+                continue;
+            }
+            let Some(Some(id)) = shown.get((py * w + px) as usize) else {
+                continue;
+            };
+            let distance = (px - x).pow(2) + (py - y).pow(2);
+            if best.is_none_or(|(d, _)| distance < d) {
+                best = Some((distance, *id));
+            }
+        }
+    }
+    best.map(|(_, id)| id)
 }
 
 impl People {
     /// Reads the people's files from the install at `root`, and the cast
-    /// of the neighborhood `house` is in. The files and the clips live as
-    /// long as the program, as the people's player needs.
+    /// of the neighborhood `house` is in.
     pub fn open(root: &Path, house: &Path) -> Result<Self, String> {
-        let assets: &'static Assets = Box::leak(Box::new(Assets::scan(root)?));
-        let library: &'static Library = Box::leak(Box::new(Library::scan(assets)?));
         Ok(Self {
-            player: Player::new(assets, library),
-            assets,
-            cast: Cast::of_house(root, house)?,
-            drawn: Vec::new(),
-            tried: BTreeSet::new(),
+            people: sims_people::People::open(root, house)?,
+            size: [0, 0],
+            shown: Vec::new(),
             problems: Vec::new(),
         })
     }
 
-    /// Loads the people `world` holds that were not tried yet: at the
-    /// start, and those a script makes while the lot runs.
+    /// Follows `world`: loads the people who appeared or changed clothes
+    /// and forgets those who left.
     pub fn refresh(&mut self, world: &World) {
-        for (&id, object) in &world.objects {
-            let Some(person) = &object.person else {
-                continue;
-            };
-            if !self.tried.insert(id) {
-                continue;
-            }
-            let resident = match self.cast.residents([(id, object.guid, person)]) {
-                Ok(mut found) if !found.is_empty() => found.remove(0),
-                Ok(_) => continue,
-                Err(e) => {
-                    self.problems.push(format!("person {id} is not read: {e}"));
-                    continue;
-                }
-            };
-            match Body::load(self.assets, &resident.skeleton, &resident.outfit) {
-                Ok(body) => {
-                    let base = base_clip(&resident.person, &resident.skeleton);
-                    self.drawn.push(Drawn {
-                        resident,
-                        body,
-                        base,
-                    });
-                }
-                Err(e) => self.problems.push(format!("person {id} is not drawn: {e}")),
-            }
-        }
+        let problems = self.people.update(world);
+        self.note(problems);
     }
 
-    /// Draws every placed person on the levels `camera` shows over the
-    /// lot in `canvas`.
-    pub fn draw(&mut self, world: &World, lot: &Lot, camera: &Camera, canvas: &mut Canvas) {
-        let size = [canvas.width, canvas.height];
-        let view = self::camera(camera, size);
-        let mut image = raster::Canvas::new(
-            u32::try_from(size[0]).unwrap_or(0),
-            u32::try_from(size[1]).unwrap_or(0),
-            [0, 0, 0, 0],
-        );
-        let mut any = false;
-        for drawn in &self.drawn {
-            let id = drawn.resident.id;
-            let (Some(animator), Some(object)) = (world.animators.get(&id), world.objects.get(&id))
-            else {
-                continue;
-            };
-            let level = object.position[2].max(1);
-            if level > camera.level {
-                continue;
+    /// Draws every placed person on the levels `camera` shows into
+    /// `canvas`, which holds the lot `sims_render::draw` drew with the
+    /// same camera, noting who is shown in each pixel.
+    pub fn draw(&mut self, world: &World, camera: &Camera, canvas: &mut Canvas) {
+        self.size = [canvas.width, canvas.height];
+        self.shown.clear();
+        self.shown.resize(canvas.width * canvas.height, None);
+        let view = View::new(camera);
+        let light = view.light();
+        let depth = Depth::new(camera);
+        let (mut posed, problems) = self.people.posed(world, camera.level);
+        // Far to near by the root's depth, then by ID, as `draw_on_lot`
+        // orders them.
+        let far = |p: &sims_people::lot::Posed| {
+            let (fine, elevation) = view.place(p.root.translation);
+            depth.point(fine, elevation, p.level)
+        };
+        posed.sort_by(|a, b| far(b).total_cmp(&far(a)).then(a.id.cmp(&b.id)));
+        let mut marked = Marked {
+            canvas,
+            shown: &mut self.shown,
+            person: 0,
+        };
+        for person in &posed {
+            marked.person = person.id;
+            for part in person.body.parts.iter().filter(|p| p.censor == 0) {
+                let skinned = skin(part, &person.bones);
+                draw_part(&mut marked, part, &skinned, light, |p| {
+                    let (fine, elevation) = view.place(p);
+                    let [x, y] = view.screen(fine, elevation, person.level);
+                    Vec3::new(x, y, depth.point(fine, elevation, person.level))
+                });
             }
-            let Some(mut root) = placement(animator) else {
-                continue;
-            };
-            let fine = [animator.position[0].to_f32(), animator.position[1].to_f32()];
-            root.translation.y += level_height(&view, camera, level, terrain(lot, fine));
-            let pose = match self
-                .player
-                .pose(&drawn.body.skeleton, animator, &drawn.base)
-            {
-                Ok(pose) => pose,
-                Err(e) => {
-                    let line = format!("person {id} is not posed: {e}");
-                    if !self.problems.contains(&line) {
-                        self.problems.push(line);
-                    }
-                    continue;
-                }
-            };
-            let bones: Vec<Transform> = pose.world(&drawn.body.skeleton, root);
-            image.draw_body(&view, &drawn.body, &bones);
-            any = true;
         }
-        if any {
-            overlay(&image, canvas);
-        }
+        drop(posed);
+        self.note(problems);
     }
-}
 
-/// Lays the people's image over the lot: opaque pixels replace the lot's,
-/// partly transparent ones blend over it.
-fn overlay(image: &raster::Canvas, canvas: &mut Canvas) {
-    for (out, rgba) in canvas.color.iter_mut().zip(image.rgba.as_chunks::<4>().0) {
-        match rgba[3] {
-            0 => {}
-            255 => *out = [rgba[0], rgba[1], rgba[2]],
-            a => {
-                let a = u16::from(a);
-                for (o, &c) in out.iter_mut().zip(&rgba[..3]) {
-                    *o = ((u16::from(c) * a + u16::from(*o) * (255 - a)) / 255) as u8;
-                }
+    /// The person a press at `point` (canvas pixels) lands on: the one
+    /// shown there in the last frame drawn, which is the frame on screen,
+    /// or the one shown nearest within [`REACH`], if `world` still holds
+    /// them as a person.
+    pub fn at(&self, world: &World, point: [i32; 2]) -> Option<u16> {
+        shown_near(&self.shown, self.size, point)
+            .filter(|id| world.objects.get(id).is_some_and(|o| o.person.is_some()))
+    }
+
+    /// Keeps the problems not kept yet, up to [`KEPT`].
+    pub fn note(&mut self, problems: Vec<String>) {
+        for line in problems {
+            if self.problems.len() < KEPT && !self.problems.contains(&line) {
+                self.problems.push(line);
             }
         }
     }
@@ -243,64 +182,47 @@ fn overlay(image: &raster::Canvas, canvas: &mut Canvas) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sims_render::{Focus, Walls, Zoom};
-
-    /// Where the 3D camera draws a 3D point, as the people's rasterizer
-    /// places it.
-    fn screen(camera: &PeopleCamera, size: [usize; 2], p: Vec3) -> [f32; 2] {
-        let v = camera.view(p);
-        [
-            size[0] as f32 * 0.5 + v.x * camera.scale,
-            size[1] as f32 * 0.5 - v.y * camera.scale,
-        ]
-    }
 
     #[test]
-    fn the_ground_lands_where_the_lot_draws_it() {
-        let size = [801, 600];
-        for zoom in Zoom::ALL {
-            for rotation in 0..4 {
-                let lot = Camera {
-                    zoom,
-                    rotation,
-                    level: 1,
-                    origin: [137, -211],
-                    walls: Walls::Cutaway,
-                    focus: Focus::default(),
-                };
-                let people = camera(&lot, size);
-                for fine in [[0, 0], [16, 0], [0, 16], [400, 250], [1000, 37]] {
-                    let expected = lot.project_fine(lot.rotate_fine(fine), 1, 0);
-                    let [x, y] = screen(&people, size, ground(fine[0] as f32, fine[1] as f32));
-                    // The lot camera rounds down to whole pixels.
-                    assert!(
-                        (x - expected[0] as f32).abs() <= 1.01
-                            && (y - expected[1] as f32).abs() <= 1.01,
-                        "zoom {zoom:?} rotation {rotation} fine {fine:?}: \
-                         {x},{y} for {expected:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn upstairs_people_stand_on_the_second_floor() {
-        let lot = Camera {
-            zoom: Zoom::Medium,
-            rotation: 0,
-            level: 2,
-            origin: [0, 0],
-            walls: Walls::Cutaway,
-            focus: Focus::default(),
+    fn each_pixel_shows_the_person_the_canvas_took_last() {
+        let mut canvas = Canvas::new(4, 3, [0, 0, 0]);
+        let mut shown = vec![None; 12];
+        let mut marked = Marked {
+            canvas: &mut canvas,
+            shown: &mut shown,
+            person: 7,
         };
-        let size = [640, 480];
-        let people = camera(&lot, size);
-        let raised =
-            ground(300.0, 200.0) + Vec3::new(0.0, level_height(&people, &lot, 2, 32.0), 0.0);
-        let expected = lot.project_fine(lot.rotate_fine([300, 200]), 2, 32);
-        let [x, y] = screen(&people, size, raised);
-        assert!((x - expected[0] as f32).abs() <= 1.01, "{x} {expected:?}");
-        assert!((y - expected[1] as f32).abs() <= 1.01, "{y} {expected:?}");
+        let opaque = [200, 100, 50, 255];
+        marked.write(1, 2, 10.0, opaque, 1.0);
+        // Too faint to be taken.
+        marked.write(2, 0, 10.0, [200, 100, 50, FAINT - 1], 1.0);
+        // A nearer person takes the pixel; a farther one does not.
+        marked.person = 8;
+        marked.write(1, 2, 5.0, opaque, 1.0);
+        marked.person = 9;
+        marked.write(1, 2, 6.0, opaque, 1.0);
+        // A tie is taken, even when it changes nothing in the canvas.
+        marked.person = 10;
+        marked.write(1, 2, 5.0, opaque, 1.0);
+        let taken: Vec<(usize, u16)> = (0..shown.len())
+            .filter_map(|i| shown[i].map(|id| (i, id)))
+            .collect();
+        assert_eq!(taken, vec![(2 * 4 + 1, 10)]);
+    }
+
+    #[test]
+    fn a_click_finds_the_person_shown_there_or_nearest() {
+        let size = [10, 10];
+        let mut shown = vec![None; 100];
+        shown[5 * 10 + 5] = Some(3);
+        shown[5 * 10 + 6] = Some(4);
+        shown[5 * 10 + 8] = Some(5);
+        assert_eq!(shown_near(&shown, size, [5, 5]), Some(3));
+        assert_eq!(shown_near(&shown, size, [6, 5]), Some(4));
+        assert_eq!(shown_near(&shown, size, [8, 7]), Some(5));
+        // Beyond REACH of every shown pixel, or off the frame.
+        assert_eq!(shown_near(&shown, size, [1, 1]), None);
+        assert_eq!(shown_near(&shown, size, [-50, 5]), None);
+        assert_eq!(shown_near(&[], [0, 0], [0, 0]), None);
     }
 }
