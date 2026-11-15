@@ -1893,7 +1893,19 @@ Progress:
   buffer holds the lot without its people. The game does not use it
   yet, and how the original gives a person's mesh its depth is
   unverified.
-- Next: the edge-on diagonal's texels; a screenshot with a marked
+- Found, not ported: an edge-on diagonal wall shows the wrong side, not
+  only the wrong texels. At near zoom the original shows the outside
+  shingles at both edge-on ends of the bay; we show the inside
+  wallpaper at the left end. Both walls face the same way, but the
+  outside lies on opposite sides of them, so no rule by the wall's
+  facing matches both. Code at 0x53f8ce copies two wall-cell records
+  (the cell's, and its neighbour's or the same cell's again) and reads
+  a word from each at an index from the wall's direction and a stack
+  value (`[ebp-0x2c]`, through 0x43517c). What that value means, and
+  how those words map to our wallpaper per side, are not read yet; the
+  port waits on both.
+- Next: trace that stack value and map the words to the wallpaper per
+  side (0x53f8ce), then the edge-on texels; a screenshot with a marked
   edge-on diagonal; upper-level depth.
 
 ## Track: sound (`crates/sims-audio`)
