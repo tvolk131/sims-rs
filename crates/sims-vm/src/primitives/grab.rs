@@ -17,8 +17,12 @@
 //! There are three classes of object, each with its own virtual
 //! functions: an ordinary object (0x666d34) and a person (0x667378) share
 //! the place test 0x433311 and the put 0x433340; a tile of a multi-tile
-//! group (0x666c20) has 0x422abb and 0x422c2f. The group's place test is
-//! not ported and fails loudly in [`crate::Interpreter::fits_in`].
+//! group (0x666c20) has 0x422abb and 0x422c2f. The group's place test
+//! refuses any container at once (0x422ac8, code 0x10), so a tile of a
+//! group is never grabbed: the false branch is taken.
+//!
+//! A put that fails partway (on what the port does not model) leaves the
+//! lot as it was before the Grab, so the fault reports a consistent lot.
 //!
 //! My slot 0 is my first container slot: for a person with no SLOT
 //! containers of its own definition, the slot it carries in, at height 6
@@ -63,20 +67,23 @@ impl Machine<'_, '_> {
         {
             return Ok(false);
         }
-        interpreter
-            .put(
-                self.world,
-                target,
-                Place {
-                    on_lot: on_lot(position),
-                    position,
-                    container: Some(me),
-                    slot: 0,
-                    level,
-                },
-                true,
-            )
-            .map_err(unsupported)?;
+        let before = self.world.clone();
+        let put = interpreter.put(
+            self.world,
+            target,
+            Place {
+                on_lot: on_lot(position),
+                position,
+                container: Some(me),
+                slot: 0,
+                level,
+            },
+            true,
+        );
+        if let Err(fault) = put {
+            *self.world = before;
+            return Err(unsupported(fault));
+        }
         Ok(true)
     }
 }

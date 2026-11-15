@@ -213,14 +213,39 @@ fn grab_takes_an_object_out_of_the_container_that_holds_it() {
     assert_eq!((widget.data[2], widget.data[26]), (SIM as i16, SIM as i16));
 }
 
+/// A tile of a group refuses any container at once (0x422ac8, code
+/// 0x10): the false branch, and nothing changes.
 #[test]
-fn grabbing_a_tile_of_a_group_fails_loudly() {
+fn a_tile_of_a_group_is_never_grabbed() {
     let (mut fx, id) = lot(false);
     fx.world.objects.get_mut(&id).unwrap().multipart = Some(Multipart {
         offset: [0; 3],
         group: [0; 3],
         parent: 0,
     });
-    let result = grab(&mut fx, LAMP, id as i16);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x422abb")));
+    let before = hash_without_frames(&fx.world);
+    assert_eq!(grab(&mut fx, LAMP, id as i16), Ok(false));
+    assert_eq!(hash_without_frames(&fx.world), before);
+}
+
+/// A put that fails partway, on what the port does not model (here an
+/// object facing 8, whose footprint is not worked out), leaves the lot as
+/// it was: the widget stays in the lamp.
+#[test]
+fn a_grab_whose_put_fails_leaves_the_lot_as_it_was() {
+    let (mut fx, id) = lot(true);
+    assert_eq!(grab(&mut fx, LAMP, id as i16), Ok(true));
+    fx.world.objects.get_mut(&id).unwrap().data[1] = 8;
+    // The failed run leaves its own frame on my stack.
+    let lot_hash = |world: &sims_sim::World| {
+        let mut world = world.clone();
+        for object in world.objects.values_mut() {
+            object.stack.clear();
+        }
+        hash_without_frames(&world)
+    };
+    let before = lot_hash(&fx.world);
+    let result = grab(&mut fx, SIM, id as i16);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("facing 8")));
+    assert_eq!(lot_hash(&fx.world), before);
 }

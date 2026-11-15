@@ -16,7 +16,10 @@ takes the true branch. Only three classes of object exist, found from
 the three callers of the base constructor 0x43189d. An ordinary object
 (vtable 0x666d34) and a person (0x667378) share 0x433311 and 0x433340,
 so `fits_in` and `put` serve both. A tile of a group (0x666c20) has
-0x422abb, which still fails loudly.
+0x422abb, which refuses any container at once (0x422ac8, code 0x10), so
+Grab takes the false branch for it; its test on the ground still fails
+loudly. A put that fails partway puts the lot back as it was before the
+Grab.
 
 A person's container slots, which the place test reads, are its
 definition's (0x431aaf) followed by five records its post-constructor

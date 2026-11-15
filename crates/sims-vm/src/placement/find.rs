@@ -557,8 +557,13 @@ impl Interpreter<'_> {
         let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
         let person = object.person.is_some();
         if object.multipart.is_some() {
+            // A tile of a group refuses any container at once (0x422ac8,
+            // code 0x10).
+            if container.is_some() {
+                return Ok(Err(Refusal::Other));
+            }
             return Err(fail(Trap::Unsupported(
-                "the place test of a tile of a group (0x422abb) is not ported".into(),
+                "the place test of a tile of a group on the ground (0x422abb) is not ported".into(),
             )));
         }
         let read =
