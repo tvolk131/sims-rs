@@ -26,13 +26,16 @@ is unpaused, while its cells' sounds play on. Starting a track
 (0x57d960) clears its hold, so a sound started while paused plays (the
 buy mode's clicks do). An unpause (0x574904) lets every track go
 (0x57cd2c, vtable +0x5c on each) and unpauses the current ambience
-player, whatever the music mode.
+player, whatever the music mode. Letting a track go also sets its wait
+deadline (+0x198, which `wait` sets at 0x57e453 and the update reads at
+0x57d8b3) to the manager's time, so every running script's wait ends at
+the next update: a thread waiting a second when the game pauses goes on
+as soon as it is unpaused, and an unpause without a pause cuts every
+wait short too. Here every thread's wake is set to now.
 
 Not ported: the day and night loop (0x574978), which the pause stops and
 the unpause restarts, and the music the unpause restarts (0x575155); this
-player has neither. The original stamps a resumed track with the manager's
-time (+0x198); what reads the stamp is not known, and nothing here
-replaces it. Where the original keeps one object per track, a track here
+player has neither. Where the original keeps one object per track, a track here
 can have several threads, and the hold is per track, so starting a
 track while paused lets its older threads go on as well.
 

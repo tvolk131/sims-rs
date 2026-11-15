@@ -341,6 +341,48 @@ fn a_pause_holds_a_playing_note_where_it_is() {
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
+/// Waits a second (loadl v1, 1000; wait v1), then plays.
+fn waits_a_second() -> Vec<u8> {
+    [
+        &[LOADL, 5][..],
+        &long(1000),
+        &[WAIT, 5],
+        &[2, 5, WAIT_SAMP, END],
+    ]
+    .concat()
+}
+
+#[test]
+fn an_unpause_ends_a_wait_held_by_the_pause() {
+    let routine = waits_a_second();
+    let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+    play(&mut player, "e0");
+    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    player.handle(&SoundEvent::Pause);
+    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    // Letting the track go moves its deadline to now (0x57dc8e): the
+    // thread runs at the next block, long before its second is up.
+    player.handle(&SoundEvent::Unpause);
+    assert_eq!(
+        player.render(10, &NoSources),
+        (1..=10).collect::<Vec<i16>>()
+    );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn an_unpause_without_a_pause_ends_every_wait() {
+    let routine = waits_a_second();
+    let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+    play(&mut player, "e0");
+    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    player.handle(&SoundEvent::Unpause);
+    assert_eq!(
+        player.render(10, &NoSources),
+        (1..=10).collect::<Vec<i16>>()
+    );
+}
+
 #[test]
 fn a_pause_spares_the_interface_and_lets_new_sounds_play() {
     // Tracks 0x604 and 0x605 (`ui_click`, which a pause spares).

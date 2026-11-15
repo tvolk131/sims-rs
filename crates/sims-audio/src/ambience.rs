@@ -63,9 +63,13 @@
 //! (`fin`, `fout`: a cell plays and stops at once), the `fast?` cells'
 //! beat counter, and the delays and quantising fields (`dly`, `quant`,
 //! the third `rand?`, `stereo?`). The player's own fade (vtable +0x28)
-//! and tempo change (+0x74), pausing (which follows the game's pause,
-//! kinds 21 and 22, not ported), and the second cursor fields of the
-//! score data (+0x3c, +0x40, always 0) are left out too.
+//! and tempo change (+0x74) and the second cursor fields of the score
+//! data (+0x3c, +0x40, always 0) are left out too.
+//!
+//! Pausing follows the game's pause (kinds 21 and 22, see
+//! [`crate::player::Player::pause`]): a paused player (+0x40a8, set
+//! through vtable +0x7c, 0x5773af) picks no cells (0x577af9) until it is
+//! unpaused, while the sounds of cells it already picked play on.
 
 use crate::fsc::Score;
 use sims_core::{Ext, F32};

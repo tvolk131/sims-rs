@@ -1017,7 +1017,11 @@ impl<S: Samples> Player<S> {
 
     /// Kind 22: *(code)* unpauses the sound (0x573c44, 0x574904): every
     /// track is let go (0x57cd2c) and the current ambience player, in
-    /// any music mode, unpaused. (The original does this only while the
+    /// any music mode, unpaused. Letting a track go (vtable +0x5c,
+    /// 0x57dc63) also moves its wait deadline (+0x198, which `wait`
+    /// sets at 0x57e453) to now, so every running thread's wait ends at
+    /// the next update, whether or not it was held, and whether or not
+    /// the sound was paused. (The original does this only while the
     /// sound is on, manager +0xc, which this player always is; it also
     /// restarts its day and night loop and its music, 0x575155, which
     /// this player does not have.) `main_duckpri` stays as the pause
@@ -1025,6 +1029,10 @@ impl<S: Samples> Player<S> {
     pub fn unpause(&mut self) {
         self.paused = false;
         self.held.clear();
+        let now = self.frame;
+        for thread in self.threads.iter_mut().chain(&mut self.pending) {
+            thread.wake = now;
+        }
         if let Some(current) = self.ambience {
             self.with_score(current, |score, _| score.set_paused(false));
         }
