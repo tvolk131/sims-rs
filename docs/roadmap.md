@@ -2094,8 +2094,7 @@ for several minutes without the lot stopping. The crate joins the others
 through their public interfaces only; the simulation never depends on it.
 
 - **Done: the window.** `cargo run --release -p sims-game` boots the
-  Goths' house (`SIMS_INSTALL`, `House05.iff`, answering No to the Help
-  System) and runs it in strict mode, a tick every 50 ms at normal
+  Goths' house (`SIMS_INSTALL`, `House05.iff`) and runs it in strict mode, a tick every 50 ms at normal
   speed. The lot, its people (hidden by the walls, furniture and floors
   in front of them) and the panel over both are drawn every tick; the clock, funds and needs on the panel are the live
   world's. The panel's speed, pause and camera buttons work (the game
@@ -2165,6 +2164,16 @@ through their public interfaces only; the simulation never depends on it.
   is not read.
 - **Next:** the selected Sim's head in the middle of the pie; answering
   a dialog from the window.
+
+- **Done: answering a dialog from the window.** A dialog with a choice
+  waits for the player: the lot stops before the tick that shows it,
+  the dialog is drawn from the world as that tick left it, and a press
+  on a button answers it and the tick runs again with the answer
+  (`Lot::wait_for_answers`, `Lot::answer`). The Help System's dialog at
+  tick 2, answered No from the window, gives the lot `--answers 3`
+  gives, hash for hash, through tick 200. `--answers` still answers
+  first, and `--png` answers No to the Help System by default.
+- **Next:** the selected Sim's head in the middle of the pie.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
     on Manage Inventory operation 4 and scope 12. A check tree's fault
@@ -2173,6 +2182,12 @@ through their public interfaces only; the simulation never depends on it.
   - `sims-vm`: a way to answer a dialog from the window (the `Lot`'s
     player is a fixed answer list given at load), and to change the
     game's speed global. A play-mode step that fails should still hand
+
+  - `sims-render`: which object drew each pixel (an object ID buffer
+    beside the depth), so a click picks the object under it. Today
+    `sims-game` guesses from each object's tile.
+  - `sims-vm`: a way to change the game's speed global. A play-mode
+    step that fails should still hand
     back the errors it caught before failing, and say which frame
     (before or after the tick) was skipped.
   - `sims-vm`: the animator's refresh (0x58da12), which deselecting a

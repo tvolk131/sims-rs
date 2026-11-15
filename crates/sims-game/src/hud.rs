@@ -92,8 +92,10 @@ impl Hud {
         })
     }
 
-    /// Reads the dialog `world` waits on, if it changed.
-    fn read_dialog(&mut self, world: &World, assets: &Assets) {
+    /// Reads the dialog `world` waits on, if it changed. The lot's world,
+    /// or, while the lot waits for the player, the world as the tick left
+    /// it when it showed the dialog.
+    pub fn read_dialog(&mut self, world: &World, assets: &Assets) {
         let Some(pending) = dialog::pending(world) else {
             self.message = None;
             return;
@@ -116,11 +118,11 @@ impl Hud {
 
     /// Draws the panel over the lot in `canvas`, from `world` as it is
     /// now, with the speed and pause of `pace`, and `status` (a line
-    /// across the top) if there is one.
+    /// across the top) if there is one; the dialog is the one
+    /// [`Hud::read_dialog`] last read.
     pub fn draw(
         &mut self,
         world: &World,
-        assets: &Assets,
         view: &View,
         pace: &Pace,
         status: Option<&str>,
@@ -143,7 +145,6 @@ impl Hud {
         // The game pauses by not stepping the lot; the button shows it.
         snapshot.paused |= pace.paused;
         self.items = hud::layout(view.size, &snapshot, &self.controls);
-        self.read_dialog(world, assets);
         let (width, height) = (
             u32::try_from(canvas.width).unwrap_or(u32::MAX),
             u32::try_from(canvas.height).unwrap_or(u32::MAX),
@@ -202,6 +203,11 @@ impl Hud {
             font.draw(frame, line, [8, y], STATUS_TEXT);
         }
         Some(band)
+    }
+
+    /// Where the dialog drawn last is, and its buttons.
+    pub fn dialog(&self) -> Option<&dialog::Layout> {
+        self.dialog.as_ref()
     }
 
     /// Whether the panel or the status band covers `point` (canvas
