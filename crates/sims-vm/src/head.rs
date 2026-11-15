@@ -45,7 +45,11 @@
 //! motions replace the bones' rest values. A base layer whose clip moves
 //! a part of a bone the foreground leaves alone, on the way from the root
 //! to a bone measured or turned, would show through and is not ported;
-//! nor is a carry layer, a foreground below weight 1, or none. The bones
+//! nor is a foreground below weight 1, or none. A carry layer (a
+//! script's carry clip, priority 10) that moves no bone on those ways
+//! leaves them as the foreground put them, so it is passed over; one that
+//! moves such a bone, and a carry clip chosen with no carry layer, are
+//! not ported. The bones
 //! are then placed from the root (0x5994c3), which stands at the origin.
 //!
 //! The person's model matrix (0x592132) turns the skeleton to the
@@ -312,10 +316,12 @@ impl Interpreter<'_> {
             .ok_or_else(|| Trap::native(10, "missing object"))?
             .guid;
         let skeleton = self.skeleton(guid)?;
-        if a.carry_selection != -1 || a.carry.is_some() {
+        // A carry clip chosen whose layer has not started yet is not
+        // ported; a playing one is checked against the bones read below.
+        if a.carry_selection != -1 && a.carry.is_none() {
             return Err(unsupported(
                 "0x5992b3",
-                &format!("person {id}'s pose with a carry layer"),
+                &format!("person {id}'s pose with a carry clip but no carry layer"),
             ));
         }
         let layer = a.foreground.as_ref().ok_or_else(|| {
@@ -402,6 +408,26 @@ impl Interpreter<'_> {
                         ),
                     ));
                 }
+            }
+        }
+
+        if let Some(carry) = &a.carry {
+            let over = self.program.animations.clip(&carry.clip).map_err(|e| {
+                unsupported("0x59dc32", &format!("finds no clip {:?}: {e}", carry.clip))
+            })?;
+            if let Some(channel) = over
+                .channels
+                .iter()
+                .find(|c| place(&c.bone).is_some_and(|b| chain[b]))
+            {
+                return Err(unsupported(
+                    "0x5992b3",
+                    &format!(
+                        "person {id}'s carry clip {:?} moves bone {:?}, on the way to a bone \
+                         read: the carry layer's part of the pose",
+                        carry.clip, channel.bone
+                    ),
+                ));
             }
         }
 

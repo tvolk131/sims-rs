@@ -105,12 +105,17 @@ impl Head {
         }
     }
 
-    /// With bit 0 of word 42 clear (0x590886): the turn times 0.8, a
-    /// double in the original. The product is rounded to 64 bits and then
-    /// to 24, where the FPU rounds once; the two differ only within 2^-40
-    /// of a 24-bit midpoint, which is **unverified** never to happen.
+    /// With bit 0 of word 42 clear (0x590886): the turn times 0.8.
+    ///
+    /// The code reads 0.8 as a double (`fmul qword [0x672030]`), but the
+    /// original's runs follow the product with 0.8 as a float, rounded
+    /// once: in every one of the five steps of the fifth capture where the
+    /// two differ (person 21, ticks 814 to 833), and no step anywhere
+    /// follows the double. Why is **unknown**; the captures run the game
+    /// under an emulator, whose x87 may round in its own way. The product
+    /// of two floats is exact here, so it is rounded once.
     pub fn relax(&mut self) {
-        self.turn = s(self.turn.ext() * Ext::from_f64_bits(RELAX)).to_f32();
+        self.turn = s(self.turn.ext() * RELAX.ext()).to_f32();
     }
 
     /// The end of the step (0x5908a0): a turn of less than 0.01 either way
@@ -132,8 +137,9 @@ const STEP: F32 = F32::from_bits(0x3e4c_cccd);
 /// The largest turn, 1.5 (0x668654, 0x672038; 0x3fc00000 and 0xbfc00000
 /// are written).
 const LIMIT: F32 = F32::from_bits(0x3fc0_0000);
-/// 0.8 as a double (0x672030).
-const RELAX: u64 = 0x3fe9_9999_9999_999a;
+/// 0.8, as the original's runs multiply by it (see [`Head::relax`]; the
+/// code holds it as a double at 0x672030).
+const RELAX: F32 = F32::from_bits(0x3f4c_cccd);
 /// Below this either way the turn is none, 0.01 (0x666a4c, 0x67202c).
 const SETTLED: F32 = F32::from_bits(0x3c23_d70a);
 /// Pi as the original's floats hold it (0x671ed8, 0x673438).
@@ -509,8 +515,10 @@ mod tests {
     fn a_turn_left_alone_shrinks_and_then_settles_at_none() {
         let mut h = head(0.0, 0.0, 0.0125);
         h.relax();
-        assert_eq!(h.turn, f(0.01));
-        assert!(h.settle(), "0.01 is not less than 0.01");
+        // 0.0125 times the float 0.8 is one unit in the last place above
+        // 0.01, which is not less than 0.01.
+        assert_eq!(h.turn.to_bits(), 0x3c23_d70b);
+        assert!(h.settle());
         h.relax();
         assert!(!h.settle());
         assert_eq!(h.turn, F32::ZERO);

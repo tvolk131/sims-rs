@@ -2190,7 +2190,7 @@ fn the_goth_house_first_tick_matches_the_original() {
     const TICK_466: &str = "7dd965a56f279614b46c16223faf1abad52290db1940fa293a082e559449b9cd";
     const TICK_583: &str = "95602638fb97031232502163ecded9078771357166b92166150eebfba73adb2d";
     const TICK_608: &str = "baef8063918e1a4bf5ba86408a3121db72ac29b0dfc9052afa5a63da07a9fddc";
-    const TICK_752: &str = "54617024a0028ab8b0921719b0aca10db911aa2e2e2c173f6d5b692b40ab2639";
+    const TICK_871: &str = "9f87c3362a000543a2e3283da523261e51253e3a9c63184832bb10c62120a1f6";
     const TICK_416_20: &str = "37ff5756ac5cf26769da735eadb955be4f78f64381ea8b847963298b51f8320b";
     const USES_233: [(i16, i32); 2] = [(132, 5), (51, 8)];
     const TREES_233: [u16; 9] = [
@@ -2796,12 +2796,20 @@ fn the_goth_house_first_tick_matches_the_original() {
         for _ in 691..=752 {
             interpreter.lot_update(world, &tuning, &mut player).unwrap();
         }
-        assert_eq!(world.ticks, before.ticks + 752);
-        assert_eq!(digest(&world.encode()), TICK_752);
-        // Tick 753: person 21's pose has a carry layer.
+        // Tick 753: person 21 carries something, and its carry layer moves
+        // no bone its head reads. Tick 798: Set Motive Change.
+        for _ in 753..=871 {
+            interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        }
+        assert_eq!(world.ticks, before.ticks + 871);
+        assert_eq!(digest(&world.encode()), TICK_871);
+        // Tick 872: object 121 sets a balloon.
         let error = interpreter
             .lot_update(world, &tuning, &mut player)
             .unwrap_err();
-        assert!(error.to_string().contains("with a carry layer"), "{error}");
+        assert!(
+            error.to_string().contains("unimplemented primitive 41"),
+            "{error}"
+        );
     });
 }

@@ -22,6 +22,7 @@ mod in_way;
 mod interacting;
 mod inventory;
 mod look_towards;
+mod motive_change;
 mod named_tree;
 mod notify;
 mod object_type;
@@ -135,6 +136,7 @@ impl Machine<'_, '_> {
             26 => self.relationship(operands)?.into(),
             27 => self.go_to_relative(operands)?,
             28 => self.run_named_tree(operands)?,
+            29 => self.set_motive_change(operands)?.into(),
             30 => self.gosub_found_action()?,
             31 => self.set_to_next(operands)?.into(),
             42 => self.create_object(operands)?.into(),
