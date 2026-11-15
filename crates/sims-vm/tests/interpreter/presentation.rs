@@ -2,7 +2,8 @@
 //! The lamp runs; its stack object is the Sim.
 
 use crate::support::*;
-use sims_vm::{Fault, Trap};
+use sims_vm::{Fault, Interpreter, SoundEvent, Trap};
+use std::cell::RefCell;
 
 fn refresh(fx: &mut Fixture, selector: i16, mode: i16, stack_object: i16) -> Result<bool, Fault> {
     let mut operands = [0; 8];
@@ -112,4 +113,96 @@ fn play_sound_takes_the_true_branch_and_changes_nothing() {
         assert_eq!(fx.run(), Ok(true));
     }
     assert_eq!(hash_without_frames(&fx.world), before);
+}
+
+/// Runs the lamp's tree 4096, one instruction of `opcode` with
+/// `operands`, with the Sim as stack object, and returns the sound events
+/// it made.
+fn sounds(fx: &mut Fixture, opcode: u16, operands: [u8; 8]) -> Vec<SoundEvent> {
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(opcode, RETURN_TRUE, RETURN_FALSE, operands)]),
+    );
+    let sink = RefCell::new(Vec::new());
+    let mut interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.sounds = Some(&sink);
+    assert_eq!(
+        interpreter.run_tree(&mut fx.world, LAMP, 4096, SIM as i16, &[], 10),
+        Ok(true)
+    );
+    sink.into_inner()
+}
+
+fn play(object: u16, name: &str) -> SoundEvent {
+    SoundEvent::Play {
+        object: object as i16,
+        name: name.into(),
+    }
+}
+
+#[test]
+fn play_sound_plays_the_event_its_fwav_names_in_the_codes_file_then_the_global_one() {
+    let mut fx = Fixture::new();
+    let before = hash_after_success(&fx);
+    for (file, id, name) in [
+        (LAMP_FILE, 5, "lamp_on"),
+        (GLOBAL, 5, "global_five"),
+        (GLOBAL, 6, "global_six"),
+        // The semi-global file is not searched.
+        (SEMI_FILE, 7, "semi_seven"),
+    ] {
+        let library = fx.program.libraries.entry(file).or_default();
+        library.sounds.insert(id, name.into());
+    }
+    // Me, unless byte 4 has bit 1 and is not 0xff.
+    assert_eq!(
+        sounds(&mut fx, 23, [5, 0, 0, 0, 0, 0, 0, 0]),
+        [play(LAMP, "lamp_on")]
+    );
+    assert_eq!(
+        sounds(&mut fx, 23, [5, 0, 0, 0, 2, 0, 0, 0]),
+        [play(SIM, "lamp_on")]
+    );
+    assert_eq!(
+        sounds(&mut fx, 23, [5, 0, 0, 0, 0xff, 0, 0, 0]),
+        [play(LAMP, "lamp_on")]
+    );
+    assert_eq!(
+        sounds(&mut fx, 23, [6, 0, 0, 0, 0, 0, 0, 0]),
+        [play(LAMP, "global_six")]
+    );
+    // A name found nowhere plays nothing, and the branch is still true.
+    assert_eq!(sounds(&mut fx, 23, [7, 0, 0, 0, 0, 0, 0, 0]), []);
+    // The stack object's ID is passed as it is, naming an object or not.
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(
+            23,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [5, 0, 0, 0, 2, 0, 0, 0],
+        )]),
+    );
+    let sink = RefCell::new(Vec::new());
+    let mut interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.sounds = Some(&sink);
+    assert_eq!(
+        interpreter.run_tree(&mut fx.world, LAMP, 4096, 999, &[], 10),
+        Ok(true)
+    );
+    assert_eq!(sink.into_inner(), [play(999, "lamp_on")]);
+    // Sound changes nothing the lot keeps.
+    assert_eq!(hash_without_frames(&fx.world), before);
+}
+
+#[test]
+fn stop_all_sounds_stops_me_or_the_stack_object() {
+    let mut fx = Fixture::new();
+    let stop = |object: u16| SoundEvent::Stop {
+        object: object as i16,
+    };
+    assert_eq!(sounds(&mut fx, 48, [0; 8]), [stop(LAMP)]);
+    assert_eq!(sounds(&mut fx, 48, [1, 0, 0, 0, 0, 0, 0, 0]), [stop(SIM)]);
 }

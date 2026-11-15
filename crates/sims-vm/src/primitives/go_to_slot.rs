@@ -90,6 +90,7 @@ use crate::fault::{Fault, Trap};
 use crate::interpreter::{Flow, Machine, word};
 use crate::placement::stands_on_lot;
 use crate::routing::slot::{direction, new_context, route_slot};
+use crate::sounds::SoundEvent;
 use sims_sim::route::RouteSlot;
 
 /// Object data words.
@@ -122,6 +123,11 @@ const SUCCEEDED: i32 = 8;
 const ARRIVED: i32 = 9;
 const STOPPED: i32 = 10;
 const START: i32 = 12;
+
+/// The sound events a route plays as it starts and after it stops
+/// (0x6c4530, 0x6c4570).
+const BEGIN_ROUTE: &str = "begin_route";
+const END_ROUTE: &str = "end_route";
 const ASK: i32 = 14;
 const GIVE_UP: i32 = 16;
 const PLAN: i32 = 18;
@@ -483,8 +489,11 @@ impl Machine<'_, '_> {
                     return Ok(Flow::Pushed);
                 }
                 START => {
-                    // The original notes the route in its log here
-                    // (0x57a54c), which is not modeled.
+                    // 0x45b989: "begin_route" plays for me.
+                    self.sound(SoundEvent::Play {
+                        object: me as i16,
+                        name: BEGIN_ROUTE.into(),
+                    });
                     self.store_route(&ctx, &path);
                     interpreter.start_route(self.world, me)?;
                     state = UNDER_WAY;
@@ -524,10 +533,13 @@ impl Machine<'_, '_> {
                             "whose animator is still under way when it is to stop",
                         ));
                     }
-                    // The original notes the step in its log (0x57a54c),
-                    // which is not modeled. A route that stopped short of
-                    // the path's end (a blocked step) tries again
-                    // (0x45b384).
+                    // 0x45b3a0: "end_route" plays for me. A route that
+                    // stopped short of the path's end (a blocked step)
+                    // tries again (0x45b384).
+                    self.sound(SoundEvent::Play {
+                        object: me as i16,
+                        name: END_ROUTE.into(),
+                    });
                     state = if state == STOPPED { RETRY } else { SUCCEEDED };
                 }
                 RETRY => match retry as i16 {

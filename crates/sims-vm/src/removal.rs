@@ -30,6 +30,7 @@
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Machine};
+use crate::sounds::SoundEvent;
 use sims_formats::saved_objects::Person;
 use sims_sim::World;
 
@@ -195,7 +196,8 @@ impl Interpreter<'_> {
     /// 3. It resets one last time ([`Interpreter::reset`]), which runs its
     ///    Reset tree if it has one.
     /// 4. The objects it holds are removed.
-    /// 5. It is unlinked from the registration list and from its type's
+    /// 5. Its sounds are stopped (0x4323c9, [`crate::sounds`]), and it is
+    ///    unlinked from the registration list and from its type's
     ///    instance list, and its storage is freed.
     ///
     /// Step 2 is ported for the case where it changes nothing: no person
@@ -268,6 +270,8 @@ impl Interpreter<'_> {
                 "deleting an object that holds another is not ported".into(),
             )));
         }
+        // The object's destructor stops its sounds (0x4323c9).
+        self.sound(SoundEvent::Stop { object: id as i16 });
         world.objects.remove(&id);
         if let Some(deleted) = self.deleted {
             deleted.borrow_mut().push(id);
@@ -302,7 +306,9 @@ impl Interpreter<'_> {
     /// run, and put back where it was.
     ///
     /// Either way the scheduler's countdown for the object is dropped and
-    /// the object gives up the ownership of interface events.
+    /// the object gives up the ownership of interface events. An object
+    /// that is not being deleted has its sounds stopped (0x4320b4,
+    /// [`crate::sounds`]).
     ///
     /// A Reset entry whose tree is missing runs nothing but still counts
     /// as a Reset tree.
@@ -339,6 +345,11 @@ impl Interpreter<'_> {
         }
         if let Some(object) = world.objects.get_mut(&id) {
             object.set_countdown(-1);
+        }
+        // A reset that does not delete stops the object's sounds
+        // (0x4320b4).
+        if !deleting {
+            self.sound(SoundEvent::Stop { object: id as i16 });
         }
         if world.event_owner == id {
             world.event_owner = 0;

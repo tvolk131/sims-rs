@@ -18,6 +18,7 @@ use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, Peo
 use sims_sim::World;
 use sims_sim::load::Context;
 use sims_sim::motives::Tuning;
+use std::cell::RefCell;
 use std::path::Path;
 
 /// Anything that stops a boot, with a message that says where.
@@ -482,6 +483,9 @@ impl Lot {
     /// with [`StepError::Halted`] and changes nothing. A step that fails
     /// before it starts ([`StepError::Incomplete`], [`StepError::Tuning`])
     /// changes nothing either.
+    ///
+    /// The update's [`Update::sounds`] holds the requests to the sound
+    /// system the step made, the frames' included ([`crate::sounds`]).
     pub fn step(&mut self) -> Result<Update, StepError> {
         self.step_in(false)
     }
@@ -523,7 +527,11 @@ impl Lot {
     /// The tick and its frames, for a lot that can step.
     fn advance(&mut self, play: bool) -> Result<Update, StepError> {
         let tuning = self.tuning.as_ref().ok_or(StepError::Incomplete)?;
-        let interpreter = Interpreter::new(&self.program, &self.catalog, Stream::Global);
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
         let mut first_frame = None;
         if self.ticks == 0
             && self.frames.after(0)
@@ -556,9 +564,15 @@ impl Lot {
             ..update
         };
         self.ticks = tick;
-        if self.frames.after(tick)
-            && let Err(error) = interpreter.draw_frame(&mut self.world, VIEW_LEVEL)
-        {
+        let frame = if self.frames.after(tick) {
+            interpreter.draw_frame(&mut self.world, VIEW_LEVEL).err()
+        } else {
+            None
+        };
+        // The step's sounds go with its update whether or not the frame
+        // failed.
+        update.sounds = sounds.into_inner();
+        if let Some(error) = frame {
             if play {
                 update.frame_errors.push(error.to_string());
                 return Ok(update);
