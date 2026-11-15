@@ -264,6 +264,11 @@ pub enum Base {
         /// 0x59281b). Only drawing reads it.
         start: i32,
     },
+    /// The layer the load's restore read into the slot (0x591eec into
+    /// +0x14) for a person the load does not reset, with the saved phase.
+    /// The constructor's posture is -1, so the first base update clears
+    /// it unless the person's posture is -1 too.
+    Loaded,
 }
 
 impl Base {
