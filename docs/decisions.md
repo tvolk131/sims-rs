@@ -43,8 +43,176 @@ sprites. That is only its fallback. Read from the code:
   case). Such an icon shows the empty template, which is what 0x4ccaa0
   leaves when it has no thumbnail.
 - **Unverified:** that the table's word +4, which 0x4575a1 tests, is
-  its entries, so that an empty table counts as none. Global 0x6f2a3c, which drops every kept thumbnail of a type with
-  graphics, is 0 in our capture. No capture shows a queue icon.
+  its entries, so that an empty table counts as none. Global 0x6f2a3c,
+  which drops every kept thumbnail of a type with graphics, is 0 in our
+  capture. No capture shows a queue icon.
+
+## 2026-11-15: The personality panel draws its bars as the original's bar maker lays them out
+
+The live panel's Personality button now opens the selected Sim's
+personality in the subpanel, where Needs opens the needs
+(`sims_ui::hud`, `Kind::Personality`). Without a selected Sim the
+subpanel is empty, as for the needs.
+
+- **Where the numbers come from** (no screenshot of this panel was
+  available, so it is read from the exe):
+  - The panel builder (0x518665) makes five bars with 0x51df31, for
+    person data words 7, 6, 3, 5 and 2 (the table at 0x66c600): Neat,
+    Outgoing, Active, Playful and Nice.
+  - Every bar's label is as wide as the widest label plus 3 (0x52144a),
+    and its bar starts 3 past that (0x521491).
+  - The bar's gadget is 3 wider than the bar, and the gadgets are
+    stacked right-aligned at x 202 of the subpanel, from y 8, 18 apart
+    (0x519cc8). The CJK languages use 15 and 25, which are not ported.
+  - The shorter of the label's line and the bar is centred on the
+    other.
+- **A bar** (0x5211bd) draws the empty bar (4903, 40 by 14), then the
+  full one (4900, 40 by 16) cut to 4 pixels a point and a pixel higher
+  (0x5212b2). A trait is the data word over 100, clamped to 0 to 10.
+- **Labels and fonts:** the labels are font 8 (0x6f2ae4) and the title
+  is font 11 at the needs title's place. The labels are English, as the
+  needs' are (Live.iff STR# 131 has them).
+- **The subpanel** is the needs' rectangle. The layout table at
+  0x6f3a28 puts it at x 300 of the strip, one left of the 301 the needs
+  were measured at. That pixel is left as measured.
+- **Unverified:**
+  - the labels' color (the needs labels' is taken) and their alignment
+    (right, against the bar);
+  - which of the font's heights the centring compares (its line height
+    is taken).
+- **Not drawn yet:** the zodiac sign and its text under the bars (a
+  text gadget in font 12, filled from UIText.iff STR# 165).
+- **Tests:** a unit test checks the layout, presses passing through,
+  each bar's fill and its rows with stand-in art, and that coordinates
+  at the edge of `i32` do not panic. The Goths' panel is pinned by
+  digest, gated on `SIMS_INSTALL`, with Mortimer's, Bella's and
+  Cassandra's traits read from the house.
+
+Reopen with a screenshot of the original's personality panel.
+
+## 2026-11-15: Drop is ported; a second order waits, and a press cancels either, in the window
+
+**Drop** (opcode 5, 0x454430, from the general table at 0x45246a) is
+ported from the original's code, as the inverse of Grab:
+1. The object in my first container slot (+0x130, its second record) is
+   looked up. Nothing there takes the false branch.
+2. The place is my position plus one tile's step in my facing (data
+   word 1; 0x42228a), on my level.
+3. The object's place test runs on the ground there (virtual function
+   0x54, no container). A refusal takes the false branch, and nothing
+   changes.
+4. The object is put there with the lot told (virtual function 0x58),
+   and the true branch is taken.
+
+- **Verified (Goth tests, play mode):**
+  - The snack order, cancelled at step 900 while Mortimer eats
+    (`a_cancelled_snack_is_put_down_in_front_of_the_eater`). His tree
+    0x0139 (node 14) drops the snack at step 1009. He stands at (296,
+    456) facing 6, and it goes to (296, 440). At step 1028 the
+    cancelled action ends, and he is free. No error is caught.
+  - Through the window
+    (`a_second_order_waits_behind_the_first_and_a_press_cancels_either`):
+    - The snack, then Water on plant 162: the water queues behind, its
+      icon second, at x 82.
+    - A press on the water's icon takes it off. The snack goes on to its
+      end at step 1136.
+    - A press on the snack's icon at step 899 (his sixth action, eating)
+      cancels it. With the water queued, the cancel queues nothing of
+      its own (0x45d7c0). He drops the snack at step 1009, and starts
+      the water at step 1028.
+  - A cancel at step 825, as he walks away from the fridge with the
+    snack, stops at the unported route stop below
+    (`a_snack_cancelled_on_the_way_to_the_chair_stops_at_the_unported_route_stop`,
+    a known gap pinned so it is not mistaken for fixed).
+- **A manual sweep, not a test:** the snack order cancelled at each
+  step from 150 to 1136 (every tenth step, then every step near each
+  edge), run 400 steps on. Cancels at steps 150 to 536, 543 to 590 and
+  821 to 829 stop at 0x45b3eb; all the rest catch no error. Too slow to
+  keep as a test (a full lot run per step).
+- **Unverified:** no capture covers a Drop or a cancel. Which tree runs
+  Drop and when is the scripts' own; only the primitive is ported.
+- **Not ported (track 4):** cancelling while Mortimer walks, to the
+  fridge or away from it with the snack, stops his thread at a route
+  whose animator is still under way (0x45b3eb). Sol's review found the
+  walk away (step 825), which the first sweep had missed by sampling
+  steps 760 and 830.
+
+## 2026-11-15: A snack ordered in the window is the scripted snack order
+
+In play mode, the window's order path is the one the original takes:
+the pointer reaching the fridge lists its pie (`Lot::pie_menu`, which
+runs the check trees), a press opens it, and a press on Have A Snack
+queues the action the listing offered (`Lot::pick`). The scripted snack
+order (sims-vm's `the_snack_order_pays_for_the_snack`) queues the same
+action by menu number (`Lot::queue_interaction`) without listing first.
+
+- **Verified (a Goth test, `the_snack_ordered_in_the_window_is_the_scripted_order`):**
+  the action queued at step 51 is the same, field for field. From step
+  150, when Mortimer takes the order, the two lots hash the same at
+  every step through step 1136, when the snack ends. Play mode catches no
+  error. Mortimer pays 5 at step 820. The test also checks that the
+  chosen entry carries the action the check trees listed (not the
+  fallback's menu number), and that the lots differ at every step
+  before 150, so it fails if the window skips the listing (from Sol's
+  review, which found the test passed with the fridge forced onto the
+  fallback menu).
+- **The difference before step 150:** the listing's check trees run as
+  Mortimer. They leave his last result and his saved stack frame's
+  words, and nothing else (compared field by field at step 51). His
+  first tree at step 150 rewrites both. The original lists the menu
+  when the pointer reaches an object (0x48c834), so the window's lot is
+  the more faithful of the two. Whether the original's listing leaves
+  the same words in Mortimer's frame is **unverified**: no capture
+  covers a listing.
+- The test finds the fridge on screen without moving the pointer, since
+  each new object the pointer reaches lists a menu and changes the lot.
+  A player's pointer that crossed other objects first would list their
+  menus too.
+
+## 2026-11-15: The piano plays where its object is, and a start sets a track's levels
+
+Kind 43 (`kPlayPiano`) is ported from the sound manager's case for it
+(0x573e5a). The event's own track is not used: the piano is track 1906
+(`Piano`, in `SimsGeneratedHitSource`), and nothing happens without it.
+
+- **The piano's start:** the object (the first argument) is placed as
+  one object with the piano's `Spl` (0x5730b6, as kinds 1 and 30 place
+  each of their objects), into the second and third arguments. When it
+  is not placed they keep the event's values. The piano then starts and
+  is let go (vtable +0x2c), as kind 1 starts a track.
+- **Its instances:** all of the piano's recorded objects are dropped
+  (0x581f8e on the map at +0xd4), and the track object's own object
+  (vtable +0x24, the field at +0xb0) is recorded. Only a fresh start of
+  a `kArgsIdVolPan` track sets that field (vtable +0x20, 0x57db2e). So
+  a start that lets a held piano go, or one refused at the thread
+  limit, leaves the object of the last fresh start, and before any it
+  is 0. The player now keeps that field for every track.
+- **The skill:** the object's source field 5 is asked for (0x570e61),
+  before track 1907 (`SetPianoSkill`) is looked up. When that track
+  exists it starts with the skill as its first argument. Its script
+  writes it into the piano's register 5.
+- **A start sets the track's levels** (0x57db01): a fresh start writes
+  `extvol` and `pan` from the arguments, as the track's `args` field
+  says: the first two for `kArgsVolPan` (the stations), the second and
+  third for `kArgsIdVolPan`. The player left them at their defaults.
+  Kinds 1 and 30 place the track after its start: an object that cannot
+  be placed still takes the sum's values (see the entry on placement),
+  so only a placement fault now leaves them the event's levels. `play_trk`
+  now hands a started `kArgsIdVolPan` track the caller's registers 2
+  and 3 as its levels. A held track let go by a start, and the idle
+  track kind 53 plays on, keep theirs, as in the original.
+- **Model limit:** the original has one piano track object, so a second
+  piano event restarts it; here it runs a second thread (as for every
+  track; see the entry on the sound player's model).
+- **Tests:** hand-built modules check:
+  - the placement, and the event's levels kept;
+  - the skill asked for, with and without its track, and its start;
+  - the instances replaced, also when the start lets a held piano go or
+    is refused at the thread limit;
+  - the levels a fresh start sets for `kArgsVolPan` and for a
+    `kArgsIdVolPan` track that `play_trk` starts. On the
+  install every event still runs without a bad instruction, and
+  `piano_play` now plays notes for ever.
 
 ## 2026-11-15: The music modes start and stop the music tracks
 
