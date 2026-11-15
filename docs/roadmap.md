@@ -1899,13 +1899,17 @@ Progress:
   unverified.
 - Done: the bay's edge-on ends. The original draws an edge-on diagonal
   wall 300 nearer, anchored halfway along it (0x4c7be2, 0x4c4907), so
-  the straight bay walls' side faces show in front of it. The side it
-  shows was right already (0x53f6c1, 0x53d93a). At near zoom both bay
-  ends now show the shingles (61.2% to 61.7% exact); at medium zoom
-  the depth at both ends is the original's.
+  the straight bay walls' side faces show in front of it. At near zoom
+  both bay ends now show the shingles (61.2% to 61.7% exact); at
+  medium zoom the depth at both ends is the original's.
+- Read, not ported: the side an edge-on diagonal shows. The original
+  shows the side facing view (−1, 1) (0x53f6c1, 0x53d93a); ours shows
+  the same lot side at every rotation. The one column where the wall
+  shows matches neither side until its texel offset is read.
 - Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
-  grass and a light sprite in the original); window light; a
-  screenshot with a marked edge-on diagonal; upper-level depth.
+  grass and a light sprite in the original); window light; the
+  edge-on texel offset and side; a screenshot with a marked edge-on
+  diagonal; upper-level depth.
 
 ## Track: sound (`crates/sims-audio`)
 

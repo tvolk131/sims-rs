@@ -13,14 +13,21 @@ side faces, which come out from behind the diagonal; the edge-on
 diagonal (frame 3) is hidden behind them. We drew the diagonal too
 near, so it covered them.
 
-**The side.** The wall-run code chooses the side as our model does.
-Each run stores two patterns per entry: ascending runs [p2, p3] and
-descending runs [p3, p2], slot 0 (0x53f6c1, 0x53f3e9). When the view
-rotates, the run is turned (0x53d93a). It is reversed when its end sorts
-before its start (0x44054c), which swaps every entry's sides, and the
-slot comes from the table at 0x53db21. So an edge-on diagonal always
-shows the side facing view direction (−1, 1), as ours does. That part
-is read, not changed.
+**The side (read, not ported).** Each run in the original stores two
+patterns per entry: ascending runs [p2, p3] and descending runs
+[p3, p2], slot 0 (0x53f6c1, 0x53f3e9). When the view rotates, the run is
+turned (0x53d93a). It is reversed when its end sorts before its start
+(0x44054c), which swaps every entry's sides, and the slot comes from the
+table at 0x53db21. So the original's edge-on diagonal shows the side
+facing view direction (−1, 1). Which lot side that is changes with the
+rotation.
+
+Ours shows `patterns[3]` for every edge-on diagonal at every rotation,
+so at some rotations it is the other side. That is not changed here.
+Where the original's diagonal does show (column x = 75 above), neither
+side's texels match the original's. That is the texel offset already
+recorded as unread, so the screenshots cannot check a side rule. Reopen
+with that offset.
 
 **The depth.** For wall kind 0x20 (edge-on), 0x4c7be2 stores −300.
 The row loop (0x4c4907) adds it to every row's depth. Each row's depth
