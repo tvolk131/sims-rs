@@ -94,21 +94,21 @@ pub fn zodiac(data: impl Fn(usize) -> i16) -> Option<u8> {
 
 /// The sign whose traits are nearest `traits` (in hundredths of a point,
 /// [`ZODIAC_TRAITS`]' order), as 0x4841fc measures: each trait times the
-/// float 0.01 kept as a float, the squared distances summed in the
-/// x87's 53-bit precision, the least sum kept as a float, the first
-/// sign kept on a tie.
+/// float 0.01, the squared distances summed, the least sum kept, the
+/// first sign kept on a tie. The game sets the x87 to 24-bit precision
+/// (0x4fad5c), so every step rounds as `f32` arithmetic does.
 fn nearest_sign(traits: [i16; 5]) -> u8 {
-    let scale = f64::from(f32::from_bits(0x3c23_d70a));
-    let points = traits.map(|t| (f64::from(t) * scale) as f32);
+    let scale = f32::from_bits(0x3c23_d70a);
+    let points = traits.map(|t| f32::from(t) * scale);
     let mut best = f32::from_bits(0x7e96_7699);
     let mut sign = 1;
     for (n, profile) in ZODIAC_PROFILES.iter().enumerate() {
-        let distance = points.iter().zip(profile).fold(0.0f64, |sum, (p, q)| {
-            let d = f64::from(*p) - f64::from(*q);
+        let distance = points.iter().zip(profile).fold(0.0f32, |sum, (p, q)| {
+            let d = p - q;
             d * d + sum
         });
-        if distance < f64::from(best) {
-            best = distance as f32;
+        if distance < best {
+            best = distance;
             sign = n as u8 + 1;
         }
     }
@@ -551,6 +551,10 @@ mod tests {
         // Equally near two signs, the first is kept: no traits at all are
         // 133 from both Cancer and Aquarius.
         assert_eq!(nearest_sign([0; 5]), 4);
+        // In the game's 24-bit precision these traits are as near
+        // Sagittarius as Aquarius, so Sagittarius, the first, is kept; in
+        // 53-bit precision Aquarius would be nearer.
+        assert_eq!(nearest_sign([274, 503, 864, 245, 614]), 9);
         // Through the person data: the traits by their words, a saved
         // sign held to 1..=12, and none for a kind above 1.
         let person = |words: &[(usize, i16)]| {

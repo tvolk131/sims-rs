@@ -16,9 +16,11 @@ under the title (`household::zodiac`, `Resident::zodiac`, drawn by
     5, 7 and 3 (Outgoing, Nice, Playful, Neat, Active), each times the
     float 0.01 and kept as a float, are measured against the 12 signs'
     traits (0x6c5bf8). The sign with the least sum of squared
-    differences wins, the first on a tie. The sums are in the x87's
-    53-bit precision, MSVC's default, so `f64` gives them exactly; the
-    best so far is kept as a float, as the original keeps it.
+    differences wins, the first on a tie. The game sets the x87 to
+    24-bit precision (0x4fad5c clears the precision bits), so every
+    step rounds to a float, and `f32` arithmetic gives it exactly. With
+    fractional traits this decides ties that wider arithmetic would not
+    (a test pins one, from Sol's review).
   - A saved sign is held to 1 to 12, as the name lookup (0x4842de)
     holds it.
   - A person of a kind above 1 (person data 65) is shown no sign.
