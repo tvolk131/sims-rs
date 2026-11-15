@@ -104,6 +104,12 @@ impl Game {
         &self.lot
     }
 
+    /// The hour of the game's clock (global 0), 0 to 23.
+    pub fn hour(&self) -> u32 {
+        let hour = self.lot.world().globals.first().copied().unwrap_or(0);
+        u32::try_from(hour.rem_euclid(24)).unwrap_or(0)
+    }
+
     /// Why the lot stopped, if it has.
     pub fn stopped(&self) -> Option<&str> {
         self.stopped.as_deref()
