@@ -849,7 +849,10 @@ impl Game {
                 self.answer(caller, button);
                 Outcome::redraw()
             }
-            Command::TogglePanel | Command::OpenPanel(_) => Outcome::redraw(),
+            Command::TogglePanel
+            | Command::OpenPanel(_)
+            | Command::ShowRelations(_)
+            | Command::RelationsPage(_) => Outcome::redraw(),
             other => {
                 self.note = Some(format!("Not carried out yet: {other:?}"));
                 Outcome::redraw()
