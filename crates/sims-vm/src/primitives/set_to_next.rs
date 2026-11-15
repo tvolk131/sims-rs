@@ -68,9 +68,13 @@
 //!   and `.nearby_houses`, their begin pointers 0 as the neighborhood's
 //!   constructor 0x42441a leaves them): the Goth house's from its load
 //!   to update 8699, and the snack order's, the Pleasants', House 7's
-//!   and the Roomies'. What would fill +0x110 is not known, so the
-//!   vector is taken as empty ([`NEARBY_LOTS`]) and mode 11 always takes
-//!   the false branch.
+//!   and the Roomies'. A write watch on +0x110 to +0x11f from the
+//!   neighborhood view to the Goth lot's first update saw no write to
+//!   the table; the one write to the vector was the lot load clearing it
+//!   (0x428110, `erase(begin, end)` at 0x407161) before rebuilding it
+//!   from the empty table. Nothing that fills +0x110 ran, so the vector
+//!   is empty here ([`NEARBY_LOTS`]) and mode 11 always takes the false
+//!   branch.
 //!
 //! [`World::order`]: sims_sim::World::order
 //! [`World::people`]: sims_sim::World::people
