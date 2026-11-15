@@ -253,7 +253,8 @@ impl Depth {
     /// `elevation` near-zoom pixels. It is [`Depth::anchor`]'s depth without
     /// its rounding: the ground rows `R` at the point's level-1 ground row,
     /// the level's offset, and the height curve `H` for `elevation / 16`
-    /// terrain steps (a step is 16 near-zoom pixels).
+    /// terrain steps (a step is 16 near-zoom pixels), held to the curve's
+    /// span as `anchor` holds it.
     ///
     /// The original keeps people out of the lot's depth buffer: a dump
     /// with Sims on screen shows them in the colour buffer only, over a
@@ -265,7 +266,8 @@ impl Depth {
         let rows = f64::from(x + y) * f64::from(4i32 << self.zoom) / 16.0;
         let top = f64::from(SCALE - 12.5);
         let ground = (top - rows * self.row_step) * 65535.0 / f64::from(SCALE);
-        let height = -f64::from(elevation) / 16.0 * unit() / 8.0;
+        let steps = (f64::from(elevation) / 16.0).clamp(-f64::from(CURVE), f64::from(CURVE));
+        let height = -steps * unit() / 8.0;
         (ground + f64::from(LEVEL_DEPTH) * f64::from(level - 1) + height) as f32
     }
 
@@ -385,7 +387,7 @@ mod tests {
                 let m = Depth::new(&c);
                 for level in 1..=3 {
                     for (x, y) in [(0, 0), (64, 32), (300, 500), (512, 512), (1020, 4)] {
-                        for steps in [0, 1, 3, 10] {
+                        for steps in [0, 1, 3, 10, 255, 300] {
                             let elevation = steps * 16;
                             let row = c.project_fine([x, y], level, elevation)[1];
                             let a = m.anchor(row, steps as f32, level);
@@ -411,6 +413,22 @@ mod tests {
         assert!(p(100.0, 100.0, 0.0, 2) < p(100.0, 100.0, 0.0, 1));
         // Along a screen row the depth does not change.
         assert_eq!(p(110.0, 90.0, 0.0, 1), p(90.0, 110.0, 0.0, 1));
+        // Between whole positions and heights it is the straight line
+        // between them (nothing is rounded).
+        for zoom in Zoom::ALL {
+            let m = Depth::new(&camera(zoom, [13, -70]));
+            let p = |x: f32, y: f32, e: f32| m.point([x, y], e, 2);
+            let mid = p(100.5, 200.25, 4.5);
+            let ends = (p(100.0, 200.0, 0.0) + p(101.0, 200.5, 9.0)) / 2.0;
+            assert!((mid - ends).abs() < 0.01, "{zoom:?}: {mid} vs {ends}");
+            assert!(p(100.25, 200.0, 0.0) < p(100.0, 200.0, 0.0));
+            assert!(p(100.0, 200.0, 0.5) < p(100.0, 200.0, 0.0));
+        }
+        // Past the height curve's span the height stops counting, as for
+        // an anchor.
+        let top = 255.0 * 16.0;
+        assert_eq!(p(100.0, 100.0, top, 1), p(100.0, 100.0, top * 2.0, 1));
+        assert_eq!(p(100.0, 100.0, -top, 1), p(100.0, 100.0, -top * 2.0, 1));
     }
 
     #[test]

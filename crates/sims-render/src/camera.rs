@@ -272,6 +272,19 @@ mod tests {
     }
 
     #[test]
+    fn float_projection_keeps_fractions() {
+        for zoom in Zoom::ALL {
+            let c = Camera { zoom, ..camera(0) };
+            let scale = zoom.near_scale() as f32;
+            let [x0, y0] = c.project_fine_f32([10.0, 20.0], 2, 0.0);
+            let [x1, y1] = c.project_fine_f32([10.5, 20.25], 2, 3.0);
+            let across = (8 << zoom.level()) as f32 / 16.0;
+            assert_eq!(x1 - x0, 0.25 * across);
+            assert_eq!(y1 - y0, 0.75 * across / 2.0 - 3.0 / scale);
+        }
+    }
+
+    #[test]
     fn tiles_and_fine_positions_rotate_back() {
         for rotation in 0..4 {
             let c = camera(rotation);
