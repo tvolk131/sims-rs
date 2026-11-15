@@ -4,6 +4,20 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: The game's sound inputs are guesses until measured
+
+`sims-game` feeds `sims-audio`'s player two inputs the simulation does
+not own. The sound scripts' speed register (global register 100,
+`SimSpeed`) is 1 at normal speed, as `sims-audio`'s `play` example
+uses, 2 at fast and 3 at ultra; the ambience's view, which the original
+works out from the camera (0x570c3e, not read), is held at 50, the
+value that plays the backyard ambience in that example. Both are
+**unverified**. The ambience's hour is the clock's (global 0). The
+mixer runs on its own thread, a fifth of a second ahead of the device;
+when it falls behind, the device plays silence rather than the game
+waiting. Reopen when the original's view value or speed register is
+read.
+
 ## 2026-11-15: The game draws people over the lot with a matching 3D camera
 
 `sims-game` draws the people with `sims-people`'s orthographic camera,
