@@ -77,9 +77,9 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     let menu = lot.pie_menu(sim, 16).unwrap_or_else(|e| panic!("{e}"));
     assert_ne!(lot.world().hash(), before);
 
-    // Every entry routes through a queued action that runs at
-    // once (0x45d240), which is not ported, and each refusal leaves the
-    // lot as it was.
+    // Every entry queues an action that runs at once (0x45d240), whose
+    // tree runs a tree by name on another object (0x44ba26), which is not
+    // ported, and each refusal leaves the lot as it was.
     assert!(!menu.entries.is_empty());
     assert!(
         menu.entries
@@ -89,7 +89,7 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     let before = lot.world().hash();
     for entry in menu.entries {
         let refused = lot.pick(sim, entry.action).unwrap_err().to_string();
-        assert!(refused.contains("0x45d240"), "{refused}");
+        assert!(refused.contains("0x44ba26"), "{refused}");
         assert_eq!(lot.world().hash(), before);
     }
 
