@@ -123,9 +123,16 @@ const CHECK_ERROR: u16 = 4;
 const ROOM: usize = 29;
 const HIDDEN: usize = 34;
 
+/// The bounds of person word 1's kinds (0x4a69aa): from -20000 up to
+/// -10000 the interface plays a sound as it shows the value; below or
+/// above, it only shows it.
+const STING: i16 = -20000;
+const MONEY: i16 = -10000;
+
 /// Person data words.
 mod person {
-    /// Something for the interface to act on (0x4a69aa), cleared after.
+    /// Something for the interface to show over the person (0x4a69aa),
+    /// cleared after.
     pub const REQUEST: usize = 1;
     /// Counted up every tick.
     pub const TICKS: usize = 27;
@@ -561,8 +568,16 @@ impl Interpreter<'_> {
     /// 8. Every tenth tick, for an awake member of the household who is
     ///    not hidden, the house's usage counts take a sample (0x4165e3,
     ///    [`sims_sim::HouseUsage::sample`]), which counts whether the
-    ///    person has a route context (0x45c349). A nonzero person word 1
-    ///    goes to 0x4a69aa and is cleared; that is not ported and fails.
+    ///    person has a route context (0x45c349).
+    /// 9. A nonzero person word 1 goes to the interface (0x4a69aa) and is
+    ///    cleared (0x45ce7e). Below -20000 the interface shows -20000 less
+    ///    the value; from -20000 up to -10000 it plays the sound
+    ///    "sting_char_winner" for the person (0x57a54c) and shows -10000
+    ///    less the value; from -10000 up it shows the value as money.
+    ///    Each is shown only while the interface's object
+    ///    (\[0x6f2a58\]+0x84) is there. The showing is presentation (text
+    ///    drawn over the person, 0x4d322c), so only the clearing is
+    ///    modeled; the sound is not ported and fails.
     pub fn tick_person(
         &self,
         world: &mut World,
@@ -675,10 +690,17 @@ impl Interpreter<'_> {
                     .is_some_and(|r| !r.contexts.is_empty());
             world.usage.sample(routing);
         }
-        if word(&person.data, person::REQUEST) != 0 {
-            return Err(fail(Trap::Unsupported(
-                "person word 1 is set, which a person's tick hands to 0x4a69aa; not ported".into(),
-            )));
+        // 0x45ce61: a nonzero person word 1 goes to the interface
+        // (0x4a69aa) and is cleared.
+        let request = word(&person.data, person::REQUEST);
+        if request != 0 {
+            if (STING..MONEY).contains(&request) {
+                return Err(fail(Trap::Unsupported(format!(
+                    "person word 1 is {request}, which 0x4a69aa shows with the sound \
+                     \"sting_char_winner\" (0x4a6a56); not ported"
+                ))));
+            }
+            person.data[person::REQUEST] = 0;
         }
         world.person_ticks.insert(id, state);
         Ok(true)
