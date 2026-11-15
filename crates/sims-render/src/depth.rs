@@ -200,6 +200,14 @@ impl Depth {
             .saturating_add(self.follow(first, y))
     }
 
+    /// The depth at or past which a floor shadow darkens row `y` of the
+    /// tile [`Depth::floor`] describes: the floor's own depth without its
+    /// 65 (0x4b10c4), so the shadow falls on the floor and not on what
+    /// stands in front of it.
+    pub fn shadow(&self, top: [i32; 2], height: i32, level: i32, first: i32, y: i32) -> i32 {
+        self.floor(top, height, level, first, y).saturating_sub(65)
+    }
+
     /// How much the ground table changes from screen row `first` to `y`.
     fn follow(&self, first: i32, y: i32) -> i32 {
         self.row(y.saturating_sub(self.origin_y))
