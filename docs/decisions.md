@@ -37,6 +37,133 @@ none, and the two only share the tile.
 With it the house runs to tick 641, where object 195 (tree 0x1009 node
 11) runs Snap in mode 1, which is not ported.
 
+## 2026-11-15: Switching the selected Sim refreshes the deselected Sim's animator; a second press centres the view
+
+A press on another Sim's portrait now switches the selection in strict
+mode too. Deselecting a Sim refreshes its animator (0x58da12 with 0,
+from 0x446921). That refresh failed in strict mode (`Refresh::Fail`) and
+was left out in play mode (`Refresh::Skip`, `Lot::select_play`; the
+entry "Deselecting a Sim is ported but for its animator's refresh"
+below). Both are gone: the refresh is ported (`Interpreter::deselect`).
+
+- **The refresh** (read from the code): with 0, the gate on animator
+  byte +0x109 (whether the house view drew the person) is skipped, so
+  it always runs. It is the same path a take-off takes when the view
+  drew the person: the clock read again (virtual function 0x34, the
+  lot's tick count), the skin forced up to date at it (0x5992b3 with 1),
+  the animator placed (virtual function 0x60), and the head's step,
+  measurement and restoration (0x590768, 0x5904d2, 0x590b27). Then the
+  head slot's holder is redrawn (0x58dae5 to 0x58dc55, the third
+  container entry). The marker has just left that slot (0x4468fd comes
+  first), so it is usually empty. A person or a group tile there fails
+  (`head_slot_redraw`). It reuses `Interpreter::refresh_animator`.
+- **The clock between ticks**: the selection runs between lot updates,
+  and the animator's clock is the lot's tick count times its per-tick
+  step (0x585483). Our `World::ticks` is raised after the lot's pass,
+  and the recordings compare it after every update. So between ticks
+  it is the count the original reads.
+- **The portrait press** (0x4cf9c4): on another Sim's portrait it
+  selects through 0x4e989b. On a residential lot (0x40745f), 0x4e989b
+  selects the person when person word 32 is 0, else nobody. Global
+  0x6e4f64 overrides this; it is set at 0x4f961d and not read further.
+  Then 0x445449 runs. On the selected Sim's own portrait it centres the
+  view on the Sim instead (0x434ced with 1). Both play `UI_click`
+  (0x4cfa51).
+- **The centring** (0x434ced): nothing unless object data word 34 is 0
+  and word 29 is not negative. A person on the floor shown is centred
+  above its feet by trunc(2√6 · 2.0 · 2^(zoom+1)) / 2: 19, 39 and 78
+  pixels from far to near. The zoom is the house view's virtual
+  function 0x14, which returns 0x6f00d8 (vtable 0x668744). The person's
+  screen point is the sound code's (0x47bc1f about 1023, 0x4a9dc7,
+  `sound::object_point`). The original slides the view there
+  (0x4c9a27); the window jumps. It also clamps to the scroll limits
+  (0x4a9fa9), which the window does not have. Those limits keep the
+  original's origin small enough for the point's 16-bit cut; the
+  window's origin can go further, so it works the point out from the
+  lot's corner and adds the origin after. Anything else, or a person
+  on another floor, shows its floor (0x4a80c7) and is centred without
+  the rise unless off the lot (0x4a7af0).
+- **Verified**: the Goth house in strict mode selects another Goth, back
+  again, and runs 50 more ticks with no error
+  (`the_player_selects_another_goth`). The deselected Sim's animator
+  clock is the tick count's. Through the window
+  (`a_press_on_a_portrait_selects_that_goth_who_then_takes_the_order`),
+  a press on another Goth's portrait at tick 50 selects her (person 18)
+  and plays `UI_click`. A second press centres the view on her and
+  changes nothing on the lot. Have A Snack from the fridge's pie goes to
+  her, not to Mortimer, and she takes it 52 ticks later. Strict mode then
+  runs to tick 454. At tick 455 Mortimer, left to himself, routes to a
+  door one of his routes goes through (0x45b176). That is not ported, and
+  it is track 4's routing.
+- **Unverified**: no recording yet compares the lot after a switch.
+  Track 2 is asked for one, with the switch, a second press, and an
+  order to the second Sim. Also unverified: the people panel's call
+  0x51ea7a on a second press, when global 0x6f6bac (cast) is not the
+  Sim. It closes the panel's window at +0x31c and calls 0x586db2 with 0,
+  presumably ending a camera follow. It is left out. Also unverified: a
+  household member who is not on the lot (0x4e9652), and the lot's
+  bounds used by 0x4a7af0 (taken here as its 64 by 64 tiles).
+
+## 2026-11-15: A press lists the pie menu again, and reaching an entry checks it again
+
+Track 2's recording of the original ordering Mortimer's snack with the
+pointer (the goth-snack scenario: the pointer reached the fridge before
+update 124, pressed before 154, reached "Have A Snack" on the pie before
+176 and chose it before 202) was replayed through the window's input
+layer, in strict mode, with the same input between the same ticks, and
+our full state after every update compared with the recording's (the
+tick verifier, from a throwaway dump of the window's lot). Two input
+steps did not do what the original does; both are fixed:
+
+- **A press lists the menu again.** The live mode's press handler
+  (0x48cbec, vtable 0x667f94) first sets the object under the pointer
+  to none (0x48c834 with 0), so its own pick lists the menu anew
+  (0x48c834 skips only the object it has). The window used to open the
+  listing made when the pointer reached the object. In the recording
+  Mortimer's last result goes false again in update 154, as a listing
+  leaves it. `Game::press` now lists at every press on the lot.
+- **Reaching an entry checks its action again.** The menu window's
+  handler (0x51bb9e) calls 0x48df28 for the entry the pointer is on: a
+  context made by 0x458293 with the byte 1 (put back by 0x4582dd) and
+  0x458319 on the entry's action with the advertisement record as its
+  output. That is autonomy's form of the check: the arguments 1, 0, 0,
+  0, the target's data word 25, the entry's advertisements copied over
+  the record, and the room rule (0x45853f, only with an output).
+  0x48df28 then scores the record for the interface (0x4214a1).
+  `Lot::highlight` (`Interpreter::highlight`, `Machine::highlight`)
+  runs it, and the window calls it each time the pointer reaches a
+  choice's entry of an open menu (`Game::highlight`). In the recording
+  Mortimer's last result goes true in update 176 (the snack's check
+  passes), and the locals the snack's frames start with are what Have A
+  Snack's check tree (0x1008) left in his stack, not the listing's last
+  entry's (0x1030).
+
+**Verified** (the recording, to update 941): with both fixes the
+window's lot equals the recording's after every update from 1 to 453
+in everything the verifier compares, but for two things the input does
+not change. Person 259's animator is marked drawn at update 33 where
+the original's is not, and in a free run of the window against the long
+capture too: the window draws every tick. Bella's (object 18) frame of
+tree 8292 starts with a local of 16104 at update 203 where ours is 0,
+until update 228; the free long capture has 0 there. From update 454
+the people's Room motive differs in spells of 18 updates (454, 514,
+604), then Mortimer's data word 50 (from 622) and his running action
+(from 892). The input steps are done by then, and the same happens
+without the entry check, so that is the simulation after the snack,
+not the input. `the_recorded_snack_order_replayed_in_the_window_matches_the_recording`
+pins what the recording showed the input doing.
+
+**Unverified**: the message that makes the menu window call 0x48df28
+(the recording shows only that it ran when the pointer reached the
+entry), whether a pointer that moves within one entry checks it again
+(the window checks once per entry reached; leaving the window forgets
+the entry, so coming back onto it checks it again), and whether a check
+tree's Add/Change Action String adds anything then (taken as in
+autonomy's check: no menu is being built). The original's pie in the recording
+sits 24 pixels to the right of the press, where ours is centred on it.
+This supersedes "A click opens that listing" in the entry "The game
+lists the pie menu on the lot when the pointer reaches an object".
+
 ## 2026-11-15: A split floor's halves are cut straight, by the screen's clip rectangle
 
 A floor tile a diagonal wall splits now draws each half as the whole
@@ -2123,7 +2250,8 @@ An object reaching a pointer that stands still counts too: each frame
 drawn, the object under the pointer is looked up again. Nothing is
 listed over the panel, a dialog or a menu, or once the lot has stopped.
 A click opens that listing (or lists now, when the pointer did not move
-onto the object first). Only the entries whose check passes are shown,
+onto the object first). (Superseded: a click lists again; see "A press
+lists the pie menu again, and reaching an entry checks it again".) Only the entries whose check passes are shown,
 in the original's order. An entry a check tree named with Add/Change
 Action String (#140, as the fridge's meals are named) shows that name as
 it is; any other, or one named with an empty string, is named by the
