@@ -18,12 +18,18 @@ relationship panel reads.
   as the stand-in gave ($2,542 and Mortimer, as the original showed). The
   motives are not: the house file holds fractions (two of Mortimer's
   are 99.625 and 71.45), and the load leaves whole numbers (100 and
-  95).
+  95): step 13's Reset and Init scripts set them, as the original's
+  load does.
   So the needs panel's two open-strip digests in `tests/hud.rs` are
   pinned again. The other digests are unchanged.
 - **The viewer** boots the lot only with `--hud` and no `--snapshot`;
   without the panel it still shows the house file's world, which needs
   no load. The world is cloned out of the lot; the viewer never runs it.
+  A load that does not complete is not shown: `Lot::load` fails on a
+  house nobody lives in, and returns a lot whose report has no
+  `finished` when a step-13 visit is not ported (steps 17 and 18 then
+  never ran). The viewer prints why and shows the house file as saved,
+  as it did before. The tests' helper asserts the load completed.
 - **The tests** still build their own index for the art, the faces and
   the careers, since the lot does not hand its index out. The catalog is
   the lot's.

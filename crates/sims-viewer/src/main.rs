@@ -7,7 +7,9 @@
 //! Without `--snapshot` the house file is read into a fresh world, or,
 //! with `--hud`, loaded as the game loads it (`sims_vm::boot::Lot`, up to
 //! the frame before the first tick), so the panel shows the family's
-//! funds and its first member selected. With `--snapshot`, the world
+//! funds and its first member selected; a load that does not complete (a
+//! house nobody lives in, or a load step not ported) is reported and the
+//! house file shown as saved. With `--snapshot`, the world
 //! saved by `sims boot --snapshot` (named `boot` unless another name is
 //! given) is shown instead; the house file still names the neighborhood
 //! the art is read with.
@@ -387,6 +389,34 @@ impl ApplicationHandler for Viewer {
     }
 }
 
+/// The house loaded as the game loads it, up to the frame before the
+/// first tick, or None, with the reason printed, when the load does not
+/// complete: a house nobody lives in, or a step-13 visit that is not
+/// ported. The viewer then shows the house file as it was saved.
+fn booted(options: &Options) -> Option<sims_sim::World> {
+    let frames = sims_vm::boot::Frames {
+        after: Vec::new(),
+        every: Vec::new(),
+    };
+    let fallback = "showing the house file as it was saved";
+    match sims_vm::boot::Lot::load(&options.install, &options.house, &[], frames) {
+        Err(error) => {
+            eprintln!("the house was not loaded as the game loads it ({error}); {fallback}");
+            None
+        }
+        Ok(lot) if lot.load_report().finished.is_none() => {
+            let stop = lot
+                .load_report()
+                .stopped
+                .as_deref()
+                .unwrap_or("not reported");
+            eprintln!("the load stopped at step 13 ({stop}); {fallback}");
+            None
+        }
+        Ok(lot) => Some(lot.world().clone()),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = options()?;
     let opened = open_house(&options.install, &options.house)?;
@@ -401,18 +431,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or_else(|| format!("{} holds no world named {name}", path.display()))?,
         // The panel shows what the load's steps 17 and 18 set: the
         // family's funds and its first member selected.
-        None if options.hud => sims_vm::boot::Lot::load(
-            &options.install,
-            &options.house,
-            &[],
-            sims_vm::boot::Frames {
-                after: Vec::new(),
-                every: Vec::new(),
-            },
-        )
-        .map_err(|e| e.to_string())?
-        .world()
-        .clone(),
+        None if options.hud => booted(&options).unwrap_or(opened.world),
         None => opened.world,
     };
     let lot = Lot::from_world(&world)?;

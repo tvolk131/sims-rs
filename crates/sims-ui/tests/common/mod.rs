@@ -52,6 +52,12 @@ pub fn open(root: &Path, house: &str) -> Opened {
         },
     )
     .unwrap();
+    let report = lot.load_report();
+    assert!(
+        report.finished.is_some(),
+        "the load stopped: {:?}",
+        report.stopped
+    );
     let (world, catalog) = (lot.world(), lot.catalog());
     let number = neighborhood
         .houses()
