@@ -270,12 +270,42 @@ impl Painter<'_> {
         })
     }
 
-    /// The pools of light on a straight wall from the lamps marked on its
-    /// tile in the view, or None if no lamp lights it (see
-    /// [`crate::pools`], "Walls"). Diagonal walls take none (0x4c78c5).
-    fn wall_pools(&self, level: usize, s: &Segment) -> Option<Vec<pools::WallPool>> {
+    /// How a wall face whose seen side has light byte `byte` is lit, pixel
+    /// by pixel: in that light plus the pools of the lamps marked on lot
+    /// tile `seen`, for a straight face along view y (`along_y`) or x;
+    /// `seen` None for a diagonal, which takes no pools (0x4c78c5). A room
+    /// in full light shows no pools (0x4c7c59). See [`crate::pools`],
+    /// "Walls".
+    fn wall_light(
+        &self,
+        level: usize,
+        byte: u8,
+        seen: Option<(bool, [i32; 2])>,
+    ) -> impl Fn(usize, usize) -> Light + use<> {
+        let pools = Light::drawn_byte(byte)
+            .zip(seen.and_then(|(along_y, tile)| self.wall_pools(level, along_y, tile)));
+        let rise = pools::wall_rise(self.camera.zoom.index()) as i64;
+        move |x: usize, y: usize| match &pools {
+            Some((base, pools)) => Light::from_sum(
+                base + pools
+                    .iter()
+                    .map(|p| u32::from(p.at(x as i64, y as i64 - rise)))
+                    .sum::<u32>(),
+            ),
+            None => Light::from_byte(byte),
+        }
+    }
+
+    /// The pools of light on a straight wall face along view y
+    /// (`along_y`) or x from the lamps marked on lot tile `[x, y]`, the
+    /// one on its seen side, or None if no lamp lights it.
+    fn wall_pools(
+        &self,
+        level: usize,
+        along_y: bool,
+        [x, y]: [i32; 2],
+    ) -> Option<Vec<pools::WallPool>> {
         let pools = self.assets.pools()?;
-        let (along_y, [x, y]) = seen_tile(self.camera, s.from, s.to)?;
         let record = usize::try_from(x)
             .ok()
             .zip(usize::try_from(y).ok())
@@ -545,21 +575,8 @@ impl Painter<'_> {
                     // that side: sampled just beside the wall's middle, so
                     // a split tile gives the triangle touching the wall.
                     let byte = self.lot.light_at(index, wall_side(&s, front));
-                    let pools = match Light::drawn_byte(byte) {
-                        // A room in full light shows no pools (0x4c7c59).
-                        Some(base) => self.wall_pools(index, &s).map(|p| (base, p)),
-                        None => None,
-                    };
-                    let rise = pools::wall_rise(zoom) as i64;
-                    let light = |x: usize, y: usize| match &pools {
-                        Some((base, pools)) => Light::from_sum(
-                            base + pools
-                                .iter()
-                                .map(|p| u32::from(p.at(x as i64, y as i64 - rise)))
-                                .sum::<u32>(),
-                        ),
-                        None => Light::from_byte(byte),
-                    };
+                    let seen = seen_tile(self.camera, s.from, s.to);
+                    let light = self.wall_light(index, byte, seen);
                     self.place_wall(&image, frame, ends, heights, level, &light, None);
                     if let Some(shape) = capped {
                         let (trim, mask) = if shape == 7 { (252, 9) } else { (253, 10) };
@@ -810,8 +827,8 @@ impl Painter<'_> {
             .copied()
             .find(|&i| corners.walls[i].line() == cap.line)
             .unwrap_or(owner);
-        let light = match face(lit) {
-            Some((_, s, front)) => self.light(index, wall_side(&s, front)),
+        let byte = match face(lit) {
+            Some((_, s, front)) => self.lot.light_at(index, wall_side(&s, front)),
             None => return,
         };
         let [tx, ty] = [c.view[0] + cap.offset[0], c.view[1] + cap.offset[1]];
@@ -855,7 +872,16 @@ impl Painter<'_> {
             [cx.saturating_sub(width), cx]
         };
         let step = ground / 16;
-        let light = |_, _| light;
+        // The cap takes the pools of the lamps on its own seen side, as a
+        // wall on its line would (0x53ca0a, 0x53ca41). Its ends are view
+        // corners; the view tile with it on its low edge starts at the
+        // first.
+        let seen = match cap.line {
+            Line::Y => Some((true, self.camera.unrotate_tile([tx, ty]))),
+            Line::X => Some((false, self.camera.unrotate_tile([tx, ty]))),
+            Line::Rising | Line::Falling => None,
+        };
+        let light = self.wall_light(index, byte, seen);
         self.place_wall(&image, frame, ends, [step; 2], level, &light, Some(columns));
     }
 

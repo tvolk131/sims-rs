@@ -20,16 +20,26 @@ distance below 4 and an offset within `m - 1` of the middle, for the
 distance's `m` of 5, 5, 4 or 3 (0x4b5c98). The image is direction 1's
 table or direction 2's, at the zoom and distance, image `offset + m - 1`
 (0x4b5c0c, 0x4bb595). It has a wall face's shape, as wide as the wall
-sprite, and is read alongside the sprite from `1 << zoom` rows (2, 4 or
-8, zoom counted from 1; 0x4bb4a2) above the sprite's top. Each wall pixel
+sprite, and is read alongside the sprite with its read cursor starting
+`1 << zoom` rows (2, 4 or 8, zoom counted from 1; 0x4bb4a2) before the
+table, so its first row lies that many rows below the sprite's top and
+the rows above take no pool. Each wall pixel
 takes the drawn light byte plus each lamp's byte there, kept to 255, as
 a floor does (0x4b7630 for one lamp, 0x4b7420 for two), and a room in
 full light shows none. Diagonal walls take no pools (0x4c78c5 returns
 none for them).
 
+A corner's cap, the narrow slice of phantom wall face at an exposed wall
+end, takes pools the same way (the cap pass reads the lamps at 0x53ca0a
+and draws through the lit wall pass at 0x53ca41): the lamps of the tile
+on its own seen side, along its own line, in the light of the wall it
+takes its light from. Before, a lit wall's cap stayed in the room's
+light, a dark seam at the wall's end (found in review; a lone wall with a
+lamp beside it now lights its cap too).
+
 **Checked.** The images' face lines up with our wall sprites' opaque
-face exactly at all three zooms and both directions, with the rows above
-the sprite's top as read. Compared with the original at the tick-570
+face exactly at all three zooms and both directions, with the first row
+as many rows below the sprite's top as read. Compared with the original at the tick-570
 world: far zoom at rotation 2 rose from 90.1% to 90.3% exact (non-green
 87.9% to 88.2%); of the 1,250 pixels the pools change, 869 now match
 exactly (1 did before) and the mean channel error fell from 26 to 1.1.

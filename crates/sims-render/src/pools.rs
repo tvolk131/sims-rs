@@ -36,9 +36,11 @@
 //! way (0x4b5c98). Diagonal walls take no pools. The image is direction
 //! 1's table (kind 0) or direction 2's (kind 1), at the zoom, for `out`,
 //! image `along + m_out - 1` (0x4b5c0c, 0x4bb595). It is a wall's face,
-//! as wide as the wall sprite, and is read row by row with the sprite
-//! from [`wall_rise`] rows above the sprite's top (0x4c7cd4 to
-//! 0x4c7cf8; the rise is the table's `1 << zoom`, 0x4bb4a2). Each pixel
+//! as wide as the wall sprite, and is read row by row with the sprite,
+//! the read cursor starting [`wall_rise`] rows before the table, so the
+//! image's first row is that many rows below the sprite's top (0x4c7cd4
+//! to 0x4c7cf8; the rise is the table's `1 << zoom`, 0x4bb4a2). A
+//! corner's cap takes pools the same way. Each pixel
 //! of the wall then takes the drawn light byte plus each lamp's byte
 //! there, kept to 255, as a floor does (0x4b7630 for one lamp, 0x4b7420
 //! for two). That the image lines up with our wall sprites this way is
@@ -76,9 +78,11 @@ fn wall_size(zoom: usize) -> (usize, usize) {
     (16 << (z - 1), (0x3a << (z - 1)) + (8 << z))
 }
 
-/// How many rows above a wall sprite's top its pool image starts, at
-/// zoom index `zoom` (0 far to 2 near): the table's `1 << zoom`, zoom
-/// counted from 1 (0x4bb4a2).
+/// How many rows below a wall sprite's top its pool image starts, at
+/// zoom index `zoom` (0 far to 2 near): the original's read cursor starts
+/// this many rows before the table, so sprite row `r` reads table row
+/// `r - rise` and the rows above are unlit by it. The table's
+/// `1 << zoom`, zoom counted from 1 (0x4bb4a2).
 pub fn wall_rise(zoom: usize) -> usize {
     2 << zoom
 }
@@ -89,7 +93,11 @@ pub fn wall_rise(zoom: usize) -> usize {
 /// None if the lamp is behind the wall or its table has no image for it
 /// (0x4c78c5, 0x4b5c98). See [the module docs](self#walls).
 pub fn wall_lamp(along_y: bool, [dx, dy]: [i32; 2]) -> Option<(i32, usize)> {
-    let (across, along) = if along_y { (dx, -dy) } else { (dy, dx) };
+    let (across, along) = if along_y {
+        (dx, dy.checked_neg()?)
+    } else {
+        (dy, dx)
+    };
     if across > 0 {
         return None;
     }
@@ -248,6 +256,13 @@ mod tests {
         assert_eq!(wall_lamp(true, [-2, 4]), None);
         assert_eq!(wall_lamp(true, [-3, 2]), Some((-2, 3)));
         assert_eq!(wall_lamp(true, [-3, 3]), None);
+        // Offsets no lamp record holds are refused, not overflowed.
+        for d in [i32::MIN, i32::MAX] {
+            for along_y in [true, false] {
+                assert_eq!(wall_lamp(along_y, [0, d]), None);
+                assert_eq!(wall_lamp(along_y, [d, 0]), None);
+            }
+        }
         assert_eq!(wall_lamp(true, [-4, 0]), None);
     }
 
