@@ -1,8 +1,9 @@
 use sims_core::{CrtRng, GameRng};
 use sims_formats::lot::Simulator;
 use sims_formats::tatt::{Entry, Tatt};
-use sims_sim::load::{Context, LoadError};
+use sims_sim::load::{Context, Household, LoadError};
 use sims_sim::{Budget, TypeAttributes, World};
+use std::collections::{BTreeMap, BTreeSet};
 
 fn lot(globals: Vec<i16>) -> World {
     World {
@@ -924,7 +925,9 @@ fn discarding_the_removals_empties_the_queue_and_touches_no_object() {
 
 /// A person whose person data word 61 (its family) and 32 (whether it is
 /// a visitor) are given.
-fn person_of(id: u16, family: i16, visitor: i16) -> sims_sim::Object {
+/// Person `id` of type `guid`, whose words 61 (family) and 32 (visitor)
+/// hold `family` and `visitor`.
+fn person_of(id: u16, guid: u32, family: i16, visitor: i16) -> sims_sim::Object {
     use sims_formats::saved_objects::{Interaction, Person};
     let idle = Interaction {
         uid: 0,
@@ -941,6 +944,7 @@ fn person_of(id: u16, family: i16, visitor: i16) -> sims_sim::Object {
     let mut data = vec![0; 256];
     (data[61], data[32]) = (family, visitor);
     let mut object = object_at(id, [8, 8, 1]);
+    object.guid = guid;
     object.person = Some(Person {
         animation_events: 0,
         engaged: 0,
@@ -962,45 +966,163 @@ fn person_of(id: u16, family: i16, visitor: i16) -> sims_sim::Object {
     object
 }
 
+/// The family's members (types 10 and 11), the neighborhood's characters
+/// (types 20 and 21), and a selection for house 5. In the neighborhood's
+/// zoning house 5 is residential and house 7 is a community lot.
+const MEMBERS: [u32; 2] = [10, 11];
+
+fn zoning() -> BTreeMap<i16, i32> {
+    BTreeMap::from([(5, 1), (7, 2)])
+}
+
+fn household<'a>(
+    characters: &'a BTreeSet<u32>,
+    residents: &'a BTreeSet<u16>,
+    flags: u32,
+    zoning: &'a BTreeMap<i16, i32>,
+) -> Household<'a> {
+    Household {
+        house: 5,
+        flags,
+        members: &MEMBERS,
+        characters,
+        residents,
+        zoning,
+    }
+}
+
+fn visitor_word(world: &World, id: u16) -> i16 {
+    world.objects[&id].person.as_ref().unwrap().data[32]
+}
+
+/// Adds person `id` to the lot.
+fn add_person(world: &mut World, person: sims_sim::Object) {
+    world.people.push(person.id);
+    world.objects.insert(person.id, person);
+}
+
 #[test]
 fn the_selection_ends_quietly_on_a_lot_with_only_the_household() {
+    let characters = BTreeSet::from([20, 21]);
+    let zones = zoning();
     let mut world = lot(vec![0; 64]);
+    let none = BTreeSet::new();
     assert_eq!(
-        lot(vec![0; 32]).finish_selection(0),
+        lot(vec![0; 32]).finish_selection(&household(&characters, &none, 0, &zones)),
         Err(LoadError::NoContext)
     );
     world.apply_context(CONTEXT).unwrap();
     world.select_family(3, 5, 500, None).unwrap();
     world.objects.insert(1, object_at(1, [8, 8, 1]));
-    world.objects.insert(2, person_of(2, 3, 0));
+    add_person(&mut world, person_of(2, 10, 3, 0));
+    add_person(&mut world, person_of(3, 11, 3, 0));
+    let residents = world.residents();
+    assert_eq!(residents, BTreeSet::from([2, 3]));
     let before = world.encode();
-    assert_eq!(world.finish_selection(0), Ok(()));
+    let quiet = household(&characters, &residents, 0, &zones);
+    assert_eq!(world.finish_selection(&quiet), Ok(()));
     // Other flags of the family's record do not matter.
-    assert_eq!(world.finish_selection(!4), Ok(()));
+    let other_flags = household(&characters, &residents, !4, &zones);
+    assert_eq!(world.finish_selection(&other_flags), Ok(()));
     assert_eq!(world.encode(), before);
 
-    // Each thing the original would act on is refused, and names itself.
-    let refused = |world: &World, flags: u32| match world.finish_selection(flags) {
-        Err(LoadError::Selection(what)) => what,
-        other => panic!("{other:?}"),
+    // Each thing the original would act on is refused before anything is
+    // written, and names itself.
+    let refused = |world: &World, household: &Household<'_>| {
+        let mut after = world.clone();
+        let what = match after.finish_selection(household) {
+            Err(LoadError::Selection(what)) => what,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(after.encode(), world.encode());
+        what
     };
-    assert!(refused(&world, 4).contains("asks for the lot to be reset"));
+    assert!(
+        refused(&world, &household(&characters, &residents, 4, &zones))
+            .contains("asks for the lot to be reset")
+    );
     let mut tutorial = world.clone();
     tutorial.globals[26] = 1;
-    assert!(refused(&tutorial, 0).contains("global 26"));
-    let mut guest = world.clone();
-    guest.objects.insert(3, person_of(3, 7, 0));
-    assert!(refused(&guest, 0).contains("person 3 is of family 7"));
-    let mut homeless = world.clone();
-    homeless.objects.insert(3, person_of(3, 0, 0));
-    assert!(refused(&homeless, 0).contains("person 3 is of family 0"));
-    let mut visiting = world.clone();
-    visiting.objects.insert(3, person_of(3, 3, 1));
-    assert!(refused(&visiting, 0).contains("person 3 is a visitor"));
+    assert!(refused(&tutorial, &quiet).contains("global 26"));
+    // A neighborhood character of no family who lives in another house.
+    let mut stray = world.clone();
+    let mut person = person_of(4, 20, 0, 1);
+    person.person.as_mut().unwrap().data[67] = 6;
+    add_person(&mut stray, person);
+    assert!(refused(&stray, &quiet).contains("person 4, a neighborhood character of no family"));
+    // A neighborhood character who lived here and is not of the family.
+    let mut moved_out = world.clone();
+    add_person(&mut moved_out, person_of(4, 21, 7, 0));
+    let residents = moved_out.residents();
+    assert!(
+        refused(&moved_out, &household(&characters, &residents, 0, &zones))
+            .contains("person 4, a neighborhood character who lived here")
+    );
+    // Who was a resident is noted before the family is selected: a word 32
+    // that changes after that does not save the character.
+    let mut changed = moved_out.clone();
+    changed
+        .objects
+        .get_mut(&4)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[32] = 1;
+    assert!(
+        refused(&changed, &household(&characters, &residents, 0, &zones))
+            .contains("person 4, a neighborhood character who lived here")
+    );
     assert_eq!(
         LoadError::Selection("x".into()).to_string(),
         "x, which is not ported"
     );
+}
+
+#[test]
+fn the_selection_works_out_again_who_is_a_visitor() {
+    let characters = BTreeSet::from([20, 21]);
+    let mut world = lot(vec![0; 64]);
+    world.apply_context(CONTEXT).unwrap();
+    world.select_family(3, 5, 500, None).unwrap();
+    // A member saved as a visitor; a stranger saved as a resident; a
+    // stranger (such as the traveling salesman) whose word 32 is 2; a
+    // neighborhood character of no family whose home is this house, and
+    // one of another house who was already a visitor.
+    add_person(&mut world, person_of(2, 10, 3, 1));
+    add_person(&mut world, person_of(3, 30, 0, 0));
+    add_person(&mut world, person_of(4, 31, 0, 2));
+    let mut home = person_of(5, 20, 0, 1);
+    home.person.as_mut().unwrap().data[67] = 5;
+    add_person(&mut world, home);
+    add_person(&mut world, person_of(6, 21, 9, 3));
+    let residents = world.residents();
+    assert_eq!(residents, BTreeSet::from([3]));
+    let zones = zoning();
+    let mut residential = world.clone();
+    residential
+        .finish_selection(&household(&characters, &residents, 0, &zones))
+        .unwrap();
+    let words = |world: &World| [2, 3, 4, 5, 6].map(|id| visitor_word(world, id));
+    assert_eq!(words(&residential), [0, 1, 2, 1, 3]);
+    // House 0 is residential whatever the zoning says.
+    let mut house_0 = world.clone();
+    house_0.globals[10] = 0;
+    house_0
+        .finish_selection(&household(&characters, &residents, 0, &BTreeMap::new()))
+        .unwrap();
+    assert_eq!(words(&house_0), [0, 1, 2, 1, 3]);
+    // The zoning is of global 10 as it stands when the step runs: an
+    // object's Load or Init tree that moved it to a community lot makes
+    // even a member a visitor. So does a house the zoning does not list.
+    for lot in [7, 9] {
+        let mut moved = world.clone();
+        moved.globals[10] = lot;
+        moved
+            .finish_selection(&household(&characters, &residents, 0, &zones))
+            .unwrap();
+        assert_eq!(words(&moved), [1, 1, 2, 1, 3]);
+    }
 }
 
 /// A lot of 40 tiles whose objects have these categories (data word 59),
