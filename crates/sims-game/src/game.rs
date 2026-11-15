@@ -17,6 +17,7 @@ use crate::menu::{self, Listing, Menu};
 use crate::pace::{self, Pace};
 use crate::people::People;
 use crate::pick;
+use crate::sound;
 use crate::view::{Move, View};
 use sims_render::{Canvas, Selected, Walls, open_house};
 use sims_ui::command::{Camera as UiCamera, Command, Speed, Walls as UiWalls};
@@ -179,6 +180,16 @@ impl Game {
             let tile = camera.unrotate_tile(tile.map(i32::from));
             world.outside(level, tile).unwrap_or(false)
         })
+    }
+
+    /// What the sound scripts may ask about the lot's objects, with where
+    /// each is on the screen as the camera shows it now
+    /// ([`sound::sources`], [`sound::screen`]).
+    pub fn sound_sources(&self) -> sims_audio::sources::Snapshot {
+        let world = self.lot.world();
+        let mut snapshot = sound::sources(world);
+        snapshot.screen = sound::screen(world, &self.view.camera, self.view.size);
+        snapshot
     }
 
     /// Why the lot stopped, if it has.
@@ -525,10 +536,12 @@ impl Game {
         Outcome::redraw()
     }
 
-    /// The pointer left the window: it is on no object.
-    pub fn leave(&mut self) {
+    /// The pointer left the window: it is on no object, button or
+    /// portrait. True if the frame changes.
+    pub fn leave(&mut self) -> bool {
         self.pointer = None;
-        self.follow();
+        let redraw = self.hud.leave();
+        self.follow() || redraw
     }
 
     /// Follows the object under the pointer in the frame last drawn: when
@@ -626,6 +639,17 @@ impl Game {
             }
             Err(e) => self.note = Some(format!("Object {object}'s menu is not listed: {e}")),
         }
+    }
+
+    /// The control panel as it was last laid out, from the world as it
+    /// was when the frame was drawn ([`Game::render`]).
+    pub fn panel(&self) -> &[sims_ui::hud::Item] {
+        self.hud.items()
+    }
+
+    /// The first name the panel shows for people of type `guid`.
+    pub fn name(&self, guid: u32) -> Option<&str> {
+        self.hud.name(guid)
     }
 
     /// The pie menu, while one is open. Its labels are placed when the

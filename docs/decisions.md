@@ -35,6 +35,237 @@ action by menu number (`Lot::queue_interaction`) without listing first.
   each new object the pointer reaches lists a menu and changes the lot.
   A player's pointer that crossed other objects first would list their
   menus too.
+## 2026-11-15: A sound's volume and pan come from where its objects are on the screen
+
+Kinds 1 (for a `kArgsIdVolPan` track) and 30 now set the track's
+`extvol` and `pan` from every object recorded for it, as the original
+does after starting it (0x573795 to 0x5737a4, 0x573d5d to 0x573d6e), in
+`sims_audio::placement`. Each object is placed by 0x5730b6, and the sum
+(0x57473b) takes the loudest volume and the volume-weighted pan, in
+32-bit arithmetic that wraps.
+
+The placement uses the screen when the track's `Spl` (register 57) is
+not 0. `Spl` starts at 20, `spl_normal`, from the default bank for
+registers 50 to 62 (0x6f6898, filled at 0x57c83a to 0x57c97b), and no
+script in the install writes it, so every placed object's volume and pan
+come from the screen: the pan from how far across it the object is, the
+volume from the zoom (the far zoom takes 560 of 1024 away, the medium
+280), less off the middle of the screen, and three fifths of that on a
+floor the view does not show (`placement::project`). The game sends
+each object's position (`sims_sim::Object::position`, the original's
++0xf8, +0xf4 and +0x110; `Snapshot::positions`) and its place on the
+screen with the zoom, the screen's size and the floor shown
+(`Snapshot::screen`, from `sims_game::sound::screen`), again whenever
+the camera changes. The place on the screen is the original's (0x570e09):
+the position rotated into the view about 1023, not the drawing's 1024,
+then projected as the original's view does it (0x4a9dc7,
+`sims_game::sound::fine_point`): the tile's corner, then each part of
+the step across the tile cut toward zero on its own, in 16 bits. A point
+can be a pixel off the drawing's (`project_fine`). The original also
+raises the point, and slants the step, by the heights of the tile's
+corners, which is left out (**unverified** on a lot that is not flat).
+Without a place on the screen the placement is a fault.
+
+The same bank corrects three defaults the player had wrong: register 39
+(`BufSizeMult`) starts at 1 and 52 (`tempo`) at 120, and 40
+(`fade_dest`) at 0, not 1. So a `seqgroup_kill` (0x57eef3), which fades
+the holder without setting `fade_dest`, now fades it to 0, not 1.
+
+What the original does with an object it cannot place is kept: an ID
+that names no object, or an object with a first or second coordinate
+of 0, leaves the previous object's values, and the first object's are
+pan 0 and a volume a local held before: the address of the sound
+manager's instance map (0x576235), on the heap. Here that address is
+0x10000d4, **unverified**. It outweighs the other objects in the pan,
+and both the pan and the volume come out where the 32-bit arithmetic
+wraps them: with this address and a `vol` of 1024 the track plays at
+212 of 1024, not at full. A `kArgsIdVolPan`
+kind 1 with object 0 now starts nothing (0x57375b), where it started
+the track; kind 30 records object 0 as an instance, where it skipped it.
+The writes leave the comparison flags the pan's.
+
+The volume and pan are worked out when the event comes, as the original
+does, so `Player::handle` and `Player::play_from` now take the game's
+`Sources`. A track's instances go in the original's multimap's order
+(0x5761c2): the first recorded, then the others newest first. The
+order the map's growth gives them (0x5762c7) is not ported; it only
+matters for an object that cannot be placed.
+
+Not ported: placing every track again on kind 33 (0x57447f), which the
+original's game sends when the camera moves. The game here sends kind
+33 every frame, and placing again would undo a fading `extvol` each
+frame. Also not ported: the limit of 16 voices that kind 1 checks first
+(0x574a87).
+
+**Unverified:** nothing of this has been compared with the running game.
+
+## 2026-11-15: A group snaps where it does not fit and is deleted; strict mode to tick 3602
+
+**Unverified.** No capture covers any of it: the Goth captures end at
+update 1000. Strict mode now runs through tick 3602 (08:30:48, hash
+07ce1fc9…) and stops at tick 3603, where object 354 uses Create New
+Object Instance mode 6 with flag 0x4: the stop the snack order already
+reached, which track 4 has. The snapshot format does not change, and
+every summary line of `sims boot … --ticks 3432` and every pinned hash
+up to tick 3432 is unchanged.
+
+**Snap of a multi-tile object that does not fit** (stop at tick 3433,
+0x454e82). The group's place test (0x422abb) goes on through every tile
+after one refuses (0x422c08), and each tile's collision writes the
+object collided with (0x6e4ad0, 0x433b42) over the last; nothing else in
+the test writes or clears it. So Snap's word 54 is the last object any
+tile's test wrote, whichever tile's code the group keeps
+(`Interpreter::place_test_collided`), and a group's
+`Refusal::Collision` names that object too. At tick 3433 object 334,
+the lead of the car junk (`CarJunk.iff`, GUID 0x4B748E3B, 18 tiles,
+made with the school bus at tick 2703), snaps to a place off the lot:
+word 52 becomes 2 and word 54 0.
+
+**Find Location For mode 1 and Remove Object Instance on a tile of a
+group** (stop at tick 3434, 0x44b52a). Both first ask whether the
+tile's type names function 8 (0x42344e, the first word of callback
+entry 8). If it does, the tile leaves its group first (0x42346a; for
+the removal, the tile goes alone, 0x442def), which is not ported and
+fails loudly. If not, Find Location takes the whole group off
+(0x422d86: every tile is asked function 10, then every tile leaves),
+and the removal queue takes the group's lead tile in place of the tile
+(0x442d9d to 0x442e38). At tick 3434 object 334's tree 0x2000 does
+both on itself (node 33, then node 2, which yields).
+
+**A group is deleted** (0x440f37). At the end of the update the
+registry's drain (0x442447 to 0x4424c1) makes the same test of
+function 8 for a tile of a group, then removes it at once (0x44123f):
+its function 0x50 takes the group off again, and the deletion
+(0x440eeb with 0) goes to the lead (0x440f6f), which marks every tile
+for deletion (flag 0x40, not kept) and deletes each tile in turn along
+the group's list (0x440fe3, with 1), reading the next tile first. Each
+tile's reset (0x431fbe) runs its Reset tree if its type has one, or else
+takes what is left of its group off once more (function 0x50 with 1,
+0x432055), so every remaining tile is asked function 10 again. Each
+tile's destructor (0x42283a) then takes it out of its group (0x4228d6):
+the lead hands the group to the next tile, which every later tile takes
+as its lead. So the take-offs ask function 10 of n, n, n − 1, …, 1
+tiles. None of the car junk's tiles has a Reset tree, function 9 or
+function 10, so at tick 3434 those take-offs run no tree; all 18 tiles
+go.
+
+**A deletion's reset stops the object's sounds.** Every path of an
+object's reset (0x431fbe) with argument 0, which the deletion
+(0x4410a5), error recovery (0x439acc) and the load's visit (0x431f68)
+all pass, meets at 0x43208b and asks the sound system to stop the
+object's sounds (0x4320b4); a nonzero argument jumps straight to the
+exit (0x431fc7 to 0x4320d4); the deletion's mark (flag
+0x40) only spares the rebuild (0x432063). The port had left that stop
+out for a deletion, so a deleted object now notes `SoundEvent::Stop`
+twice, from its reset and from its destructor (0x4323c9). Sound
+requests are not in the snapshot, so no hash changes. Sol found this.
+
+A tile of a group removed before the load has worked the rooms out
+(the load's clear) fails loudly: its take-off needs them.
+
+**Review gaps closed.** Sol's review of #170 noted three optional
+regressions. Two are added: a take-off callback that puts something in
+the person's hand is caught by the check after the callbacks, and a
+tile of a group in the head slot fails (0x58dc08). Selection at a
+nonzero view rotation is not: it needs a loaded lot whose indicator
+trees read Generic Sims Call routine 12.
+
+## 2026-11-15: The panel follows the lot; a portrait under the pointer shows a first name
+
+The coordinator asked for the panel to be wired to live state: the
+selected Sim's motives, the clock, the household's money and the
+selected Sim. Most of it already was. `Hud::draw` lays the panel out
+from `Snapshot::read(world)` every frame, and the window draws a frame
+after every batch of ticks. What is new:
+
+- **A test that it follows the lot.** The Goth test that queues Have A
+  Snack from the fridge's pie now runs 850 ticks on. The panel's text
+  has to show the world's clock and funds before and after. The funds
+  show $2,542 and then $2,537, after Mortimer pays 5 at tick 820. The
+  clock moves, and the needs panel's first meter has to be the selected
+  Sim's hunger (motive 7) both times. `Game::panel()` gives the items
+  last laid out.
+- **The selected Sim.** The strip already lights the selected Sim's
+  portrait (the template's selected cell). The original's live
+  screen shows nothing else of the selected Sim's own. The icon in the
+  top-left corner of the original's screenshots is the action queue
+  (a bed, and a Sim's head for a social interaction), not the selected
+  Sim's portrait. That queue is not drawn yet.
+- **The name.** A person's first name is the first string, in US
+  English, of the catalog strings (`CTSS`) that word 41 of the type's
+  `OBJD` names. Mortimer's file has 2000 there, and `CTSS` 2000 starts
+  with "Mortimer". Word 19 of the same file is 200, its body strings, so
+  the count of words is right. `Faces` reads the name with the face.
+  While the pointer is on a portrait, the panel draws that person's name
+  in a box over the strip, above the portrait. The box takes no presses
+  and does not cover the lot.
+  **Unverified, and ours:** where and how the original shows a name.
+  We believe it shows one on hovering a portrait, but no capture has
+  been compared. The box's look (the needs panel's label color on
+  black, font 8) is ours. Reopen when the harness can hover a portrait.
+  The box is as tall as the font's line with 2 pixels above and below,
+  so descenders stay inside it, and its bottom is 2 pixels above the
+  strip. It is kept inside the frame: a name wider than the frame is cut
+  short. The name goes when the pointer leaves the window. (Sol's review
+  of the first version found the box overflowing at extreme rects,
+  descenders below it, the box off the top of a short window, and the
+  name staying after the pointer left.)
+
+## 2026-11-15: A lit lamp's pool reaches the walls beside it; grass takes none
+
+Straight walls now take lamp pools, from the wall tables in
+`lightMap.dat`, as the original's wall pass draws them (read from its
+code: 0x53db67 calling 0x4c79ca). A wall reads the lamp record of its
+tile in the view: the tile whose low-x edge (a wall along view y,
+direction 1) or low-y edge (along view x, direction 2) it stands on,
+which is the side the camera sees (0x4aed23). Each of the record's two
+lamps on that side of the wall (a view offset from the lamp to the tile
+of at most 0 across it) gives an offset along the wall and a distance
+out from it: for direction 1 `-dy` and `-dx`, for direction 2 `dx` and
+`-dy` (0x4c78c5). A lamp counts if the tables hold an image for it: a
+distance below 4 and an offset within `m - 1` of the middle, for the
+distance's `m` of 5, 5, 4 or 3 (0x4b5c98). The image is direction 1's
+table or direction 2's, at the zoom and distance, image `offset + m - 1`
+(0x4b5c0c, 0x4bb595). It has a wall face's shape, as wide as the wall
+sprite, and is read alongside the sprite with its read cursor starting
+`1 << zoom` rows (2, 4 or 8, zoom counted from 1; 0x4bb4a2) before the
+table, so its first row lies that many rows below the sprite's top and
+the rows above take no pool. Each wall pixel
+takes the drawn light byte plus each lamp's byte there, kept to 255, as
+a floor does (0x4b7630 for one lamp, 0x4b7420 for two), and a room in
+full light shows none. Diagonal walls take no pools (0x4c78c5 returns
+none for them).
+
+A corner's cap, the narrow slice of phantom wall face at an exposed wall
+end, takes pools the same way (the cap pass reads the lamps at 0x53ca0a
+and draws through the lit wall pass at 0x53ca41): the lamps of the tile
+on its own seen side, along its own line, in the light of the wall it
+takes its light from. Before, a lit wall's cap stayed in the room's
+light, a dark seam at the wall's end (found in review; a lone wall with a
+lamp beside it now lights its cap too).
+
+**Checked.** The images' face lines up with our wall sprites' opaque
+face exactly at all three zooms and both directions, with the first row
+as many rows below the sprite's top as read. Compared with the original at the tick-570
+world: far zoom at rotation 2 rose from 90.1% to 90.3% exact (non-green
+87.9% to 88.2%); of the 1,250 pixels the pools change, 869 now match
+exactly (1 did before) and the mean channel error fell from 26 to 1.1.
+At rotation 1, walls up, 80.3% to 80.5% non-green; of 463 pixels
+changed, 269 match (none did), mean error 16.8 to 1.7. Rotation 1 is
+where turning the lamp record the other way with the view (0x4aedc2)
+would show, so the turn is now checked for walls, and floors read the
+same record the same way. The remaining changed pixels are mostly a
+step off. Near and medium zoom show no lit wall and do not change.
+
+**Grass** takes no pools: the lamp record is read (0x4aed23) only by
+the floor draws (0x4adb48, 0x4af474), the wall pass's three wall calls
+and a debug text, not by the grass.
+
+**Not ported.** The wall blitter's second mode (0x4b780d, with
+0x4c4a77 for unlit walls), which a caller's argument selects; our walls
+draw by the first (0x4c4907). The original reads a record whose first
+lamp is empty as having none even if its second is set (0x4aec97 counts,
+then 0x4c78c5 reads from the first); ours never builds such a record.
 
 ## 2026-11-15: The game's speed and pause are the simulation's globals
 
@@ -2425,8 +2656,9 @@ Where the requests come from, read from the code:
 - **Go To Routing Slot.** It plays "begin_route" as a route starts
   (0x45b989) and "end_route" after every stop (0x45b3a0).
 - **Stops.** Stop All Sounds (0x45256e) stops sounds, and so do an
-  object's reset unless it is being deleted (0x4320b4) and the
-  destructor (0x4323c9). A person's reset makes no direct call.
+  object's reset (0x4320b4) and the destructor (0x4323c9). (This first
+  said a reset for a deletion stops nothing; it does, corrected in the
+  entry for tick 3602.) A person's reset makes no direct call.
 
 In 870 play ticks the Goth house plays 62 sounds and stops 50:
 begin_route 21, end_route 18, door_open 4, and so on.

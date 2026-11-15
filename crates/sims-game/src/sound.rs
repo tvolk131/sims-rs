@@ -24,20 +24,28 @@
 //! paused play. `SoundEvent::StopObject` is what to send when an object
 //! goes, and `SoundEvent::StopAll` stops everything at once.
 //!
-//! What the sound scripts ask about an object (`getsrcdatafield`) is
-//! read from the lot between ticks ([`sources`]) and sent as a
-//! [`Snapshot`].
+//! What the sound scripts ask about an object (`getsrcdatafield`), and
+//! where each object is on the lot and on the screen, are read between
+//! ticks ([`sources`] and [`screen`]; `Game::sound_sources` gives both)
+//! and sent as a [`Snapshot`], again whenever they change, the camera
+//! too. Where an object is sets the volume and pan of the sounds started
+//! for it (kinds 1 and 30; `sims_audio::placement`): every track's `Spl`
+//! register starts at 20 and no script changes it, so the original works
+//! them out from the object's place on the screen, the zoom and the floor
+//! shown.
 
 use sims_audio::SoundEvent;
 use sims_audio::files::SoundFiles;
 use sims_audio::module::Module;
+use sims_audio::placement::Projection;
 use sims_audio::player::Player;
 use sims_audio::sources::{FIELDS, NO_ROOM, Snapshot};
 use sims_audio::stations::StationLists;
 use sims_core::F32;
+use sims_render::camera::Camera;
 use sims_sim::World;
 use sims_ui::command::Speed;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// The register the sound scripts read the game's speed from.
@@ -128,7 +136,90 @@ pub fn sources(world: &World) -> Snapshot {
         })
         .filter(|(id, _)| *id > 0)
         .collect();
-    Snapshot { objects, absent }
+    let positions = world
+        .objects
+        .values()
+        .map(|object| (i32::from(object.id), object.position))
+        .filter(|(id, _)| *id > 0)
+        .collect();
+    Snapshot {
+        objects,
+        absent,
+        positions,
+        screen: BTreeMap::new(),
+    }
+}
+
+/// Where each object on the lot is on a screen `size` pixels wide and
+/// high, through `camera`, as the original's sound code asks the view
+/// (0x570e09): the object's fine position rotated into the view about
+/// 1023, not the drawing's 1024 (0x47bc1f), then projected on its level
+/// by [`fine_point`]. Empty for a camera so far off that its arithmetic
+/// would overflow, which no view the controls make comes near.
+pub fn screen(world: &World, camera: &Camera, size: [i32; 2]) -> BTreeMap<i32, Projection> {
+    if camera.origin.iter().any(|n| n.unsigned_abs() >= 1 << 26) {
+        return BTreeMap::new();
+    }
+    let m = 1023;
+    world
+        .objects
+        .values()
+        .filter(|object| object.id > 0)
+        .map(|object| {
+            let [x, y, level] = object.position.map(i32::from);
+            let rotated = match camera.rotation & 3 {
+                1 => [m - y, x],
+                2 => [m - x, m - y],
+                3 => [y, m - x],
+                _ => [x, y],
+            };
+            let at = fine_point(camera, rotated, level);
+            let view = Projection {
+                at,
+                screen: size,
+                zoom: camera.zoom.level() as i32,
+                shown_level: camera.level,
+            };
+            (i32::from(object.id), view)
+        })
+        .collect()
+}
+
+/// The screen point of a fine view position on `level`, as the
+/// original's view works it out (0x4a9dc7), which the drawing's
+/// [`Camera::project_fine`] does not: the tile's corner is projected and
+/// cut to 16 bits each way, then each part of the step across the tile
+/// is cut toward zero on its own and added in 16 bits. The result can be
+/// a pixel off the drawing's.
+///
+/// The original also raises the corner, and slants the step, by the
+/// heights of the tile's four corners. Those are left out (the ground is
+/// taken as flat), which only moves the point up or down
+/// (**unverified** on a lot that is not flat).
+pub fn fine_point(camera: &Camera, [x, y]: [i32; 2], level: i32) -> [i32; 2] {
+    let shift = camera.zoom.level();
+    let [tx, ty] = [x >> 4, y >> 4].map(|n| i32::from(n as i16));
+    let [fx, fy] = [x & 15, y & 15];
+    let [cx, cy] = camera.project([tx, ty], level, 0).map(|n| n as i16);
+    // Down the tile, (rise + 2) or (rise + 4) steps of the zoom's half
+    // tile, for a part `f` of 16; the rises are 0 on flat ground.
+    let down = |steps: i32, f: i32| (steps << (shift + 1)) * f / 16;
+    let across = 8 << shift;
+    let (dx, dy) = if fx == fy {
+        (0, down(4, fx))
+    } else if fx > fy {
+        let (side, diagonal) = (down(2, fx), down(4, fx));
+        let right = across * fx / 16;
+        (right - right * fy / fx, (diagonal - side) * fy / fx + side)
+    } else {
+        let (side, diagonal) = (down(2, fy), down(4, fy));
+        let left = across * fy / -16;
+        (left - left * fx / fy, (diagonal - side) * fx / fy + side)
+    };
+    [
+        i32::from(cx.wrapping_add(dx as i16)),
+        i32::from(cy.wrapping_add(dy as i16)),
+    ]
 }
 
 /// The sound scripts' speed register for the game's speed (unverified).
@@ -205,8 +296,10 @@ impl Mixer {
     pub fn input(&mut self, input: Input) {
         match input {
             Input::Events(events) => {
+                // Placed where the last snapshot has their objects, which
+                // the game sends before a tick's events.
                 for event in &events {
-                    self.player.handle(event);
+                    self.player.handle(event, &self.sources);
                 }
             }
             Input::Hour(hour) => self.hour = hour,
@@ -258,6 +351,36 @@ mod tests {
         // 167772176 times 0.1 is 16777217.6 on the FPU; a single
         // precision division would round it to 16777218 first.
         assert_eq!(tenth(f32::from_bits(0x4d20_0001)), 16_777_217);
+    }
+
+    #[test]
+    fn a_sound_s_point_is_cut_as_the_original_s_view_cuts_it() {
+        use sims_render::camera::{Walls, Zoom};
+        let mut camera = Camera {
+            zoom: Zoom::Far,
+            rotation: 0,
+            level: 1,
+            origin: [400, 17],
+            walls: Walls::Up,
+            focus: sims_render::Focus::default(),
+        };
+        // 0x4a9dc7 gives (402, 178); the drawing's projection 179 down.
+        assert_eq!(fine_point(&camera, [163, 161], 1), [402, 178]);
+        assert_eq!(camera.project_fine([163, 161], 1, 0), [402, 179]);
+        // Along the diagonal, straight down; at the corner, the corner.
+        assert_eq!(fine_point(&camera, [165, 165], 1), [400, 182]);
+        assert_eq!(fine_point(&camera, [160, 160], 1), [400, 177]);
+        // The other side of the diagonal. x: 16 * 3 / -16 = -3, less -3 *
+        // 1 / 3 = -1: -2. y: side 8 * 3 / 16 = 1, diagonal 3, (3 - 1) * 1
+        // / 3 + 1 = 1, where the drawing's is 2.
+        assert_eq!(fine_point(&camera, [161, 163], 1), [398, 178]);
+        assert_eq!(camera.project_fine([161, 163], 1, 0), [398, 179]);
+        // Near, with nothing to cut, the two agree.
+        camera.zoom = Zoom::Near;
+        assert_eq!(
+            fine_point(&camera, [163, 167], 1),
+            camera.project_fine([163, 167], 1, 0)
+        );
     }
 
     #[test]
