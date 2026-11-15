@@ -2081,13 +2081,15 @@ through their public interfaces only; the simulation never depends on it.
   pointer first reaches an object or a person, the game lists the
   selected Sim's menu on it with `Lot::pie_menu`, which changes the lot
   as the original's listing does; a click opens it. The entries are
-  those whose check passes, named by the TTAs strings of the table they
-  came from, with "*" before an entry with flag 0x80; choosing one
+  those whose check passes, named as the check tree named them or else
+  by the TTAs strings of the table they came from, with "*" before an entry with flag 0x80; choosing one
   queues the offered action with `Lot::pick`. Where the simulation has
   not ported something the listing needs, the menu falls back to every
   entry of the table, queued by menu number, and the note across the
   top says why; any other failure shows no menu. Escape closes the menu.
-  The fridge (fallback, 0x458789) lists Have A Snack and the meals.
+  The simulation lists the fridge itself: in the morning the house
+  loads in, Have A Snack, Have Quick Breakfast, Have Breakfast and
+  Serve Breakfast.
 - **Blocked: a Sim doing what he is told.** Have A Snack queued on the
   fridge at tick 51 leaves the queue by tick 151. Strict mode stops at
   tick 154: another person (object 16, tree 0x2156 node 5) runs a slot
@@ -2099,9 +2101,8 @@ through their public interfaces only; the simulation never depends on it.
   Without an order, strict mode runs to tick 2702.
 - **Next:** a real pie.
 - **Needs from other crates:**
-  - `sims-vm`: listings that fail today: the fridge (Add/Change Action
-    String in check tree 0x1012, 0x458789, in review); check trees
-    0x2071 (objects 4, 10, 253) and 0x2035 (object 18, scope 12). Every
+  - `sims-vm`: listings that fail today on the Goth house: check trees
+    on Manage Inventory operation 4 and scope 12. Every
     entry on another person is refused at 0x45d240. A check tree's fault
     should keep its trap rather than become `Unsupported` text, which
     `sims-game` reads to tell unported from failed.

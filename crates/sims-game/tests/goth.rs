@@ -190,10 +190,22 @@ fn the_fridge_and_the_bookshelf_offer_their_interactions() {
     };
     let fridge = find("Have A Snack");
     let shelf = find("Read a Book");
+    // The simulation lists the fridge itself; at the morning the house
+    // loads in, its check tree names the meals breakfasts (0x458789).
     let fridge_menu = labels(fridge);
+    assert_eq!(
+        fridge_menu,
+        [
+            "Have A Snack",
+            "Have Quick Breakfast",
+            "Have Breakfast",
+            "Serve Breakfast"
+        ],
+    );
     assert!(
-        fridge_menu.iter().any(|l| l == "Have A Meal"),
-        "{fridge_menu:?}"
+        menus
+            .iter()
+            .any(|(id, m)| *id == fridge && m.as_ref().is_ok_and(|m| m.unchecked.is_none()))
     );
     // The simulation lists many of them itself, naming an entry with
     // flag 0x80 with a "*" before it.

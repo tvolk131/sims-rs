@@ -4,8 +4,9 @@
 //! [`entries`] lists what the original's pie menu offers
 //! ([`sims_vm::Interpreter::pie_menu`], 0x48d392): each entry of the
 //! object's interaction table whose check passes for that Sim, in order.
-//! Each is named by the TTAs strings with the ID of the TTAB it comes
-//! from, by its menu number, with "*" before it when the entry has flag
+//! Each is named by the name its check tree gave it (Add/Change Action
+//! String, 0x458789), or else by the TTAs strings with the ID of the
+//! TTAB it comes from, by its menu number, with "*" before it when the entry has flag
 //! 0x80, as the original names it. An entry with no string is named by
 //! its number; a person's TTAs names only its first entry (Talk), so a
 //! person's menu is mostly numbers, as where the original reads the rest
@@ -19,8 +20,7 @@
 //! entry queues the very action offered (`Lot::pick`).
 //!
 //! Where the simulation cannot list a menu yet (it fails loudly on what
-//! it has not ported: a check tree adding an entry, as the fridge's does;
-//! an object that offers nothing; a version 0 table; a pet; joining; an
+//! it has not ported: an object that offers nothing; a version 0 table; a pet; joining; an
 //! unported scope or primitive), the lot is left as it was and the menu
 //! falls back to every entry of the table without checks
 //! (`every_entry`); [`Listing::unchecked`] says why, and choosing one
@@ -47,6 +47,7 @@ use sims_ui::frame::{Frame, Rect};
 use sims_vm::DEFINITION_WORDS;
 use sims_vm::boot::Lot;
 use sims_vm::boot::OrderError;
+use sims_vm::orders::MenuEntry;
 use sims_vm::{SoundEvent, Trap};
 use std::collections::BTreeMap;
 
@@ -94,7 +95,7 @@ pub fn entries(
 ) -> Result<Listing, String> {
     match lot.pie_menu(person, object) {
         Ok(menu) => Ok(Listing {
-            entries: named(lot, assets, menu.actions)?,
+            entries: named(lot, assets, menu.entries)?,
             sounds: menu.sounds,
             unchecked: None,
         }),
@@ -141,11 +142,13 @@ fn unported_message(message: &str) -> bool {
     }
 }
 
-/// The entries the simulation's pie menu offered, named.
-fn named(lot: &Lot, assets: &Assets, offered: Vec<Interaction>) -> Result<Vec<Entry>, String> {
+/// The entries the simulation's pie menu offered, named: by the name a
+/// check tree gave the entry (Add/Change Action String, 0x458789), or
+/// else by the TTAs strings.
+fn named(lot: &Lot, assets: &Assets, offered: Vec<MenuEntry>) -> Result<Vec<Entry>, String> {
     let mut labels: BTreeMap<u16, Option<StringTable>> = BTreeMap::new();
     let mut out = Vec::new();
-    for action in offered {
+    for MenuEntry { action, name } in offered {
         let menu = u32::try_from(action.table_index)
             .map_err(|_| format!("an offered entry has menu number {}", action.table_index))?;
         let target = u16::try_from(action.target)
@@ -166,14 +169,16 @@ fn named(lot: &Lot, assets: &Assets, offered: Vec<Interaction>) -> Result<Vec<En
                 .find(|i| i.string_index == menu)
                 .is_some_and(|i| i.flags & DEBUG != 0)
         });
-        let strings = labels
-            .entry(target)
-            .or_insert_with(|| found.and_then(|f| self::labels(assets, f.resource, f.id)));
-        let name = strings
-            .as_ref()
-            .and_then(|l| l.get(menu as usize, LANGUAGE))
-            .filter(|l| !l.trim().is_empty())
-            .map_or_else(|| format!("Interaction {menu}"), str::to_owned);
+        let name = match name {
+            Some(name) => name,
+            None => labels
+                .entry(target)
+                .or_insert_with(|| found.and_then(|f| self::labels(assets, f.resource, f.id)))
+                .as_ref()
+                .and_then(|l| l.get(menu as usize, LANGUAGE))
+                .filter(|l| !l.trim().is_empty())
+                .map_or_else(|| format!("Interaction {menu}"), str::to_owned),
+        };
         let label = if debug { format!("*{name}") } else { name };
         out.push(Entry {
             menu,
