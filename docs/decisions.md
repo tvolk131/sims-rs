@@ -64,6 +64,129 @@ sits 24 pixels to the right of the press, where ours is centred on it.
 This supersedes "A click opens that listing" in the entry "The game
 lists the pie menu on the lot when the pointer reaches an object".
 
+## 2026-11-15: The floor and wall pattern catalogs, and a house's maps renumbered through them
+
+A house saves its floor and wall patterns as IDs and maps each ID to a
+file and a number in that file. The load turns them into the keys of the
+game's pattern catalogs (0x4a0e3b, 0x4c5d35). Both catalogs are now built
+the way the original builds them at start-up (floors 0x4a01cb, walls
+0x4c512d; `sims_content::Surfaces`):
+
+- File 0 is the built-in `floors.iff` or `walls.iff`.
+- Then come the `.FLR` or `.WLL` files of each installed pack's
+  `WallsAndFloors/` (in edition-bit order), then
+  `ExpansionShared/WallsAndFloors/` (edition above 3), then
+  `GameData/Floors/` or `GameData/Walls/`. Each directory is listed in
+  its file-table order, going into each subdirectory where its name
+  falls (0x412699; the catalog scan asks for every directory, 0x412863).
+  A file is known by its file name alone, read in Windows-1252 as a
+  house's map names it, byte for byte: a leading byte-order mark is part
+  of the name, as the original's byte comparison sees it. The same holds
+  for the Windows-1252 text `sims-formats` reads through its shared
+  reader (a house's surface map and roofs, FAR member names, chunk
+  labels, field strings, tuning and career values): none is sniffed for
+  a byte-order mark. The language-aware string tables (`STR#`,
+  `strings::decode`) still go through the encoding's own decode, which
+  sniffs one; nothing on the catalogs' path reads them, and the
+  original's handling there is not checked.
+- A file's pattern count is a third of its `SPR2` (floors) or `SPR#`
+  (walls) chunks, and a file with none is left out.
+- Each pattern takes the next key from a free list seeded with
+  [30, 254] and [256, 65534] for floors, or [31, 247] and [256, 65534]
+  for walls. A key taken for a missing sprite is lost.
+
+**Verified** against the catalogs in the guest's memory on the Complete
+Collection: 209 floor and 273 wall files, the file at every place whose
+name the guest still held (150 of 208 floor files, 186 of 272 wall
+files), and every key (`crates/sims-content/tests/surfaces.rs`). The
+directory listing order on disk would only matter for two names sharing
+a file-table bucket, and none do in this install.
+
+The renumbering (`World::renumber_surfaces`):
+
+- **Lookup.** Each map group finds the first catalog file of its name
+  (any case), and each saved ID listed in the group takes that file's key
+  for its number. A missing pattern gives 0xffff, and a later group
+  overwrites an earlier one's ID unconditionally, as in the original.
+- **IDs left 0xffff.** An ID still at 0xffff would be matched to a
+  pattern by colour (0x4a0bbd). That is not ported and fails loudly
+  (`LoadError::SurfaceColour`).
+- **Unlisted IDs.** An ID no group lists becomes 1.
+- **Floors** are renumbered first: each floor cell, then the half floors
+  of a diagonal wall.
+- **Walls** come next. Each wall cell is read through the wall service
+  (0x4795c5) and written back (0x4797e2) with its neighbours, as
+  `legacy/crates/sims-vm/src/native_wall_io.rs` did. A write-back the
+  port does not know fails loudly (`LoadError::SurfaceRewrite`). The
+  wall vertex map that the put also refreshes (world +0x4c/+0x50,
+  0x479c58) is drawing state and is left out.
+
+**Unverified:** no capture holds a house whose maps have entries, so
+the renumbered cells are not yet compared with the original's. The Goth
+and Newbie houses' maps are empty and their pins are unchanged.
+
+What the houses do now (`sims boot`, 1000 ticks, no answers):
+
+- UserData2's houses 1 and 9 now get past the renumbering.
+  - House 1 stops at the household selection (no family).
+  - House 9 stops at the first frame: person 195's ROOT bone was last
+    turned by a layer that no longer plays (0x5992b3).
+- Of the 474 houses surveyed (UserData to UserData5 and 69 of
+  UserData6), none stops at the renumbering. 306 stop at an object with
+  more saved attributes than the 8 its constructor allocates.
+
+Reopen if a capture of a house with map entries renumbers a cell
+differently, or another install lists two pattern files in one bucket.
+
+## 2026-11-15: Objects cast the original's soft shadows on the floor under them
+
+At near zoom the most visible difference left was the shadow under
+plants, benches and other furniture, which the original darkens into the
+floor or grass after drawing each tile and before any object (its floor
+shadow pass, 0x4ae844 in the tile draw 0x4ad8ac). It is now ported in
+`crates/sims-render/src/shadows.rs`, from the code:
+
+- **One object a tile.** The first object of the tile's object grid cell
+  (lot arrays 3 and 103), or the next on the tile through slot 0, that is
+  not hidden, has no zero-extent flag (data word 8, value 4), is not of
+  type 2 or 9 and has a shadow (0x434e23).
+- **The shadow code** (0x4573e7). A one-tile object's is its OBJD word
+  57, -1 for none. A tile of a group builds one from which of its eight
+  neighbours in the group's grid (OBJD word 11) also have a shadow and
+  have OBJD word 56 at 0 (0x43ac5c); a code the masks cannot draw
+  becomes 0. It is turned by the object's facing and then the view's
+  rotation (the tables 0x53d2fc fills); code 16 never turns.
+- **The masks.** Codes 0 and 16 are hand-drawn, SPR2 0x300 and 0x310
+  (plus 0x20 a zoom) in `floors.iff`, read as palette indices. Every
+  other code's mask is worked out over floor 0's tile shape from four
+  curves, one a side, as the original's float code does it (0x4a3cd3,
+  0x4a3914, 0x4a3993).
+- **Drawing** (0x4b10c4). Mask byte plus strength (OBJD word 79, plus
+  255 less the tile's drawn light byte) gives a light level for the
+  pixel, which is drawn through the lighting's tables; 248 and up leaves
+  it alone. Only pixels at or behind the floor's ground depth change.
+
+**Checked** against the original's screenshots, with the world at their
+time. Near zoom rose from 86.3% to 87.6% exact (two other near cameras
+86.8% to 88.3% and 86.5% to 87.1%); far zoom at rotations 1 and 2 by
+0.1 to 0.2 points and medium zoom from 82.7% to 83.1%. Of the pixels the
+shadows changed, 6,359 of 7,149 now match exactly at near zoom (950 of
+1,186 at far rotation 1, 449 of 574 at rotation 2, 2,046 of 2,755 at
+medium); before, almost none did. The bench's two halves meet in one
+shadow, which checks the turning's sense.
+
+**Not ported:** the option that turns shadows off (the "shadows" cheat)
+and the drawing flags that allow them, taken as on; the faint shadow
+under an object the player is placing (0x438a48). The pass runs in the
+tile order of our floor loop, after all grass, where the original runs it
+tile by tile in its own order, so a later tile's grass blade can cover a
+shadow there and not here.
+
+**Seen, not yet read:** on a split tile whose other half has no floor,
+the original draws that half as flat grass (two tones, no blades); we
+draw the bladed grass. The dashed row along the porch's lower edge at
+near zoom is ours alone.
+
 ## 2026-11-15: The plumb bob is the original's mesh, coloured and lit as the original does
 
 The selected person's plumb bob is now drawn (`sims_people::bob`, from
