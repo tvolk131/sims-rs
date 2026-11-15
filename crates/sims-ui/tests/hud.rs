@@ -176,3 +176,51 @@ fn the_goths_job_panel() {
         "0b6aa2fbe51928b75e2a87a9c581d6550ecb86cb0ee2526c756f5295b6e256bc"
     );
 }
+
+#[test]
+fn the_goths_relationship_panel() {
+    let Some(root) = common::install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to draw the control panel");
+        return;
+    };
+    let opened = common::open(&root, common::GOTH_HOUSE);
+    // Mortimer, selected, knows his wife and daughter: friends both ways,
+    // the family first by the day's feeling, and Bella with the heart.
+    let relations: Vec<_> = opened
+        .snapshot
+        .relations
+        .iter()
+        .map(|r| {
+            (
+                r.id,
+                r.daily,
+                r.lifetime,
+                r.friends,
+                r.pink_heart,
+                r.red_heart,
+                r.family,
+            )
+        })
+        .collect();
+    assert_eq!(
+        relations,
+        [
+            (33, 100, 0, true, true, false, true),
+            (32, 75, 0, true, false, false, true),
+        ]
+    );
+    let controls = Controls {
+        expanded: true,
+        panel: Panel::Relationships,
+        ..Controls::default()
+    };
+    let mut frame = Frame::new(800, 600, [0, 0, 0]);
+    let items = hud::layout([800, 600], &opened.snapshot, &controls);
+    hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
+    // Pins the drawing; it has not been compared with the original's
+    // screen (see docs/decisions.md).
+    assert_eq!(
+        digest(&frame),
+        "4b764150a46580163fb484f70c5eac2db568672649d2e2bf8d05af09c2667c4c"
+    );
+}

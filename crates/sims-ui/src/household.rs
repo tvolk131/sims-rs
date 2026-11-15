@@ -66,6 +66,36 @@ pub struct Snapshot {
     pub residents: Vec<Resident>,
     /// The selected Sim's object ID.
     pub selected: Option<u16>,
+    /// The people the selected Sim has a relationship with, in the
+    /// relationship panel's order ([`Relation`]): none until
+    /// [`Snapshot::with_relations`] reads them.
+    pub relations: Vec<Relation>,
+}
+
+/// A person in the relationship panel: what 0x4ea042 reads of the
+/// selected Sim's relationship row toward them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relation {
+    /// The GUID of the person's type, for their faces.
+    pub guid: u32,
+    /// Their neighbor record's ID.
+    pub id: i16,
+    /// The row's value 0 (the daily relationship, the top bar) and value
+    /// 2 (the lifetime one, the bottom bar), each -100 to 100.
+    pub daily: i32,
+    pub lifetime: i32,
+    /// Whether both have a daily relationship of at least the
+    /// friendship threshold toward each other: the smiley.
+    pub friends: bool,
+    /// Whether the row's value 1, and its value 3, are set: the pink
+    /// heart is drawn for the first and the red one for the second.
+    /// Between the married Goths value 1 is 1.
+    pub pink_heart: bool,
+    pub red_heart: bool,
+    /// Whether they belong to the selected Sim's family (person data
+    /// word 61, [`sims_sim::neighbors::FAMILY`]): the family button's
+    /// list.
+    pub family: bool,
 }
 
 impl Snapshot {
@@ -109,6 +139,7 @@ impl Snapshot {
                 .values()
                 .find(|o| o.selected && o.person.is_some())
                 .map(|o| o.id),
+            relations: Vec::new(),
         }
     }
 
@@ -132,6 +163,19 @@ impl Snapshot {
                 }
             });
         }
+        self
+    }
+
+    /// Reads the selected Sim's [`Snapshot::relations`] from `world`.
+    /// `members` is as for [`Snapshot::read`]; `friendship` is the
+    /// autonomy tuning's friendship threshold (0x6c4398, read from the
+    /// tuning: 50 in the original's capture), which the smiley needs.
+    #[must_use]
+    pub fn with_relations(mut self, world: &World, members: &[u32], friendship: i32) -> Self {
+        let selected = self.selected.and_then(|id| world.objects.get(&id));
+        self.relations = selected
+            .map(|o| relations(world, o.guid, members, friendship))
+            .unwrap_or_default();
         self
     }
 
@@ -206,9 +250,76 @@ impl Careers {
     }
 }
 
+/// The people `guid`'s Sim has a relationship with, in the relationship
+/// panel's order: 0x4e9deb lists the neighbor records, in slot order,
+/// that the Sim's own record (the first of its type) has a row toward,
+/// and 0x4e9fad sorts them: the household's members first, then people on
+/// the lot, then by the daily relationship, highest first, then by
+/// record.
+///
+/// **Not ported:** 0x4e9deb's test of each record (0x423f30, and words
+/// of the person on the lot), so a record the original leaves out may be
+/// listed; and the original breaks the last tie by its own list of
+/// people (0x6f2698), not by record (**unverified** that they agree).
+fn relations(world: &World, guid: u32, members: &[u32], friendship: i32) -> Vec<Relation> {
+    let neighbors = &world.neighbors;
+    let Some(viewer) = neighbors.first_of(guid) else {
+        return Vec::new();
+    };
+    let family = viewer.data.get(sims_sim::neighbors::FAMILY).copied();
+    let on_lot = |guid: u32| {
+        world
+            .objects
+            .values()
+            .any(|o| o.guid == guid && o.person.is_some())
+    };
+    let mut listed = Vec::new();
+    for record in neighbors.slots.iter().flatten() {
+        if record.id == viewer.id {
+            continue;
+        }
+        // 0x4ea042 reads both ways between the first records of the two
+        // types.
+        let Some(target) = neighbors.first_of(record.guid) else {
+            continue;
+        };
+        let Some(row) = viewer.row(i32::from(target.id)) else {
+            continue;
+        };
+        let value = |n: usize| row.values.get(n).copied().unwrap_or(0);
+        if row.values.is_empty() {
+            continue;
+        }
+        let relation = Relation {
+            guid: record.guid,
+            id: record.id,
+            daily: value(0).clamp(-100, 100),
+            lifetime: value(2).clamp(-100, 100),
+            friends: sims_sim::neighbors::mutual_friends(viewer, target, friendship),
+            pink_heart: value(1) != 0,
+            red_heart: value(3) != 0,
+            family: family.is_some()
+                && record.data.get(sims_sim::neighbors::FAMILY).copied() == family,
+        };
+        let order = (
+            !members.contains(&record.guid),
+            !on_lot(record.guid),
+            std::cmp::Reverse(value(0)),
+            record.id,
+        );
+        listed.push((order, relation));
+    }
+    listed.sort_by_key(|a| a.0);
+    listed.into_iter().map(|(_, r)| r).collect()
+}
+
 /// The face of a person in their character file: `BMP_` 2002 holds three
 /// faces side by side, and the panel shows the first.
 pub const FACES: u16 = 2002;
+/// The relationship panel's faces of a person: `BMP_` 2003 holds five
+/// side by side, on red through green, for the lifetime relationship
+/// (0x4e94a4 asks for 2003).
+pub const MOODS: u16 = 2003;
 /// The portrait frame the face is drawn on (kPeopleTemplate): four 45 by
 /// 45 cells.
 pub const TEMPLATE: i32 = 4600;
@@ -227,15 +338,17 @@ const CATALOG_STRINGS: usize = 41;
 #[derive(Debug, Clone, Default)]
 pub struct Faces {
     faces: BTreeMap<u32, Image>,
+    moods: BTreeMap<u32, Image>,
     names: BTreeMap<u32, String>,
 }
 
 impl Faces {
-    /// Reads the face and the first name of each of `guids` from its
+    /// Reads the faces and the first name of each of `guids` from its
     /// character file. A type with no file, no faces or no name is left
     /// out of what it lacks; a face that does not decode is an error.
     pub fn load(index: &Index, catalog: &Catalog, guids: &[u32]) -> Result<Self> {
         let mut faces = BTreeMap::new();
+        let mut moods = BTreeMap::new();
         let mut names = BTreeMap::new();
         for &guid in guids {
             let Some(object) = catalog.object(guid) else {
@@ -248,6 +361,9 @@ impl Faces {
                 Iff::parse(resource.read().map_err(Error::Content)?).map_err(Error::Format)?;
             if let Some(name) = first_name(&iff, object.chunk) {
                 names.insert(guid, name);
+            }
+            if let Some(chunk) = iff.get(b"BMP_", MOODS) {
+                moods.insert(guid, bitmap::bmp(iff.data(chunk)).map_err(Error::Format)?);
             }
             let Some(chunk) = iff.get(b"BMP_", FACES) else {
                 continue;
@@ -262,7 +378,11 @@ impl Faces {
                 faces.insert(guid, face);
             }
         }
-        Ok(Self { faces, names })
+        Ok(Self {
+            faces,
+            moods,
+            names,
+        })
     }
 
     /// The first name of `guid`'s people, if their file gives one.
@@ -280,6 +400,15 @@ impl Faces {
 
     pub fn face(&self, guid: u32) -> Option<&Image> {
         self.faces.get(&guid)
+    }
+
+    pub fn insert_moods(&mut self, guid: u32, moods: Image) {
+        self.moods.insert(guid, moods);
+    }
+
+    /// The relationship panel's five faces of `guid` ([`MOODS`]).
+    pub fn moods(&self, guid: u32) -> Option<&Image> {
+        self.moods.get(&guid)
     }
 
     /// The 45 by 45 portrait of `guid` on cell `cell` of the template.
@@ -331,6 +460,7 @@ mod tests {
             paused: false,
             residents: Vec::new(),
             selected: None,
+            relations: Vec::new(),
         }
     }
 
