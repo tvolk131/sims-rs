@@ -332,6 +332,12 @@ fn changed(
         .count()
 }
 
+/// Every pixel of `canvas`, as (x, y).
+fn pixels(canvas: &sims_render::Canvas) -> impl Iterator<Item = (i32, i32)> + use<> {
+    let [w, h] = [canvas.width as i32, canvas.height as i32];
+    (0..h).flat_map(move |y| (0..w).map(move |x| (x, y)))
+}
+
 /// Drawn over the lot the lot renderer drew, people are hidden by what
 /// stands in front of them, and not by the floor or ground they stand
 /// on. Each person is drawn alone and compared with the same person laid
@@ -367,6 +373,12 @@ fn the_lot_hides_the_people_behind_it() {
                 let view = View::new(&camera);
                 let mut base = sims_render::Canvas::new(800, 600, [0, 0, 0]);
                 sims_render::draw(world, &shape, &mut opened.assets, &camera, &mut base);
+                // The lot alone names objects at some pixels, never a
+                // person.
+                let named = pixels(&base).filter_map(|(x, y)| base.id_at(x, y));
+                let named: Vec<u16> = named.collect();
+                assert!(!named.is_empty());
+                assert!(named.iter().all(|i| world.objects[i].person.is_none()));
                 for &id in &ids {
                     let mut solo = world.clone();
                     solo.animators.retain(|&other, _| other == id);
@@ -381,6 +393,16 @@ fn the_lot_hides_the_people_behind_it() {
                     let mut on = base.clone();
                     let report = people.draw_on_lot(&solo, &camera, &mut on);
                     assert!(report.problems.is_empty(), "{:?}", report.problems);
+                    // Every pixel the person changed names them; every
+                    // other pixel names what it named before.
+                    for (x, y) in pixels(&on) {
+                        let i = y as usize * on.width + x as usize;
+                        if on.color[i] != base.color[i] {
+                            assert_eq!(on.id_at(x, y), Some(id), "{x}, {y}");
+                        } else if on.id_at(x, y) != Some(id) {
+                            assert_eq!(on.id_at(x, y), base.id_at(x, y), "{x}, {y}");
+                        }
+                    }
                     // Laid over everything: nearer than any depth there is.
                     let mut over = base.clone();
                     people.draw(&solo, &camera, &mut over, |_, _, _| -1.0e9);
