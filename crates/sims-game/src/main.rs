@@ -20,9 +20,12 @@
 //! fails, as the simulation has not ported the deselected Sim's
 //! animator refresh; play mode leaves it out (`Lot::select_play`).
 //!
-//! A left click on a person or an object opens its menu for the selected
-//! Sim; a click on an entry queues it, and a click anywhere else, or
-//! Escape, closes the menu. Escape quits only when no menu is open, and a
+//! A left click on a person or an object opens its pie menu for the
+//! selected Sim (`sims_ui::pie`, around the click); a click on an entry
+//! queues it, one on a submenu's entry opens the submenu, and a click
+//! anywhere else, or Escape, closes the menu. The pointer moves to the
+//! middle of a submenu that opens, and of a menu that had to move to
+//! stay in the window, as the original moves it. Escape quits only when no menu is open, and a
 //! held Escape's repeats do nothing.
 //!
 //! The lot runs in strict mode: the first error stops it, and the error
@@ -213,6 +216,27 @@ impl App {
     fn point(&self, position: PhysicalPosition<f64>) -> [i32; 2] {
         let scale = f64::from(self.scale.max(1));
         [(position.x / scale) as i32, (position.y / scale) as i32]
+    }
+
+    /// Moves the pointer where the game asks, as the original moves it
+    /// to the middle of a pie menu.
+    fn move_pointer(&mut self) {
+        let Some([x, y]) = self.game.take_pointer() else {
+            return;
+        };
+        // The middle of that canvas pixel, so it reads back as the same.
+        let scale = f64::from(self.scale.max(1));
+        let position =
+            PhysicalPosition::new((f64::from(x) + 0.5) * scale, (f64::from(y) + 0.5) * scale);
+        if let Some(w) = &self.window {
+            // Not every platform lets a program move the pointer; the
+            // menu still works where it is.
+            if w.set_cursor_position(position).is_ok() {
+                self.cursor = position;
+            }
+        }
+        let redraw = self.game.hover(self.point(self.cursor));
+        self.changed(redraw);
     }
 
     fn changed(&mut self, redraw: bool) {
@@ -448,6 +472,7 @@ impl ApplicationHandler for App {
                 (MouseButton::Left, ElementState::Pressed) => {
                     let outcome = self.game.press(self.point(self.cursor));
                     self.changed(outcome.redraw);
+                    self.move_pointer();
                     if outcome.photo {
                         self.photo();
                     }
