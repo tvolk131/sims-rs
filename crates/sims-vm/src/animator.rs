@@ -23,15 +23,16 @@
 //!    it; then, unless the definition's word 102 has bit 2 set, or the
 //!    layer is there and the person's kind (word 65) is at most 1, the
 //!    posture is noted and, for postures 0 to 2, the posture's clip
-//!    started. Starting it first looks the clip up (virtual function
-//!    0xf4, 0x592625), which reads the person's appearance again if the
-//!    animator says so ([`Animator::profile_stale`]); then the clip goes
-//!    into the base slot (0x592726) to repeat at priority -10, which
-//!    marks the skin's layers changed. Only posture 0 is ported: its clip
-//!    was found every time the capture shows (a base layer after each
-//!    start), while the clips of postures 1 and 2 and a clip the lookup
-//!    does not find (0x59db2f, which leaves the slot empty) were never
-//!    seen and fail.
+//!    started: the posture's clip 3, 1 or 2 by the count of
+//!    [`Interpreter::posture_clip`]. Starting it first looks the clip up
+//!    (virtual function 0xf4, 0x592625), which reads the person's
+//!    appearance again if the animator says so
+//!    ([`Animator::profile_stale`]); then the clip goes into the base slot
+//!    (0x592726) to repeat at priority -10, which marks the skin's layers
+//!    changed. A clip the lookup does not find (0x59db2f, which leaves the
+//!    slot empty) was never seen and fails, as does a base clip with timed
+//!    events, which the skin's update would handle (0x5992b3) and which
+//!    are not kept.
 //! 5. The speed moves towards the speed wanted (0x588fa0) by at most 0.2
 //!    up; down it moves at once.
 //! 6. An animator whose person stands off the lot (0x422632) does nothing
@@ -419,6 +420,19 @@ fn stop_walk_step(from: [F32; 2], to: [F32; 2], t: F32) -> Option<[F32; 2]> {
     Some([mix(from[0], to[0]), mix(from[1], to[1])])
 }
 
+/// The clip of each posture's base layer, as [`Interpreter::posture_clip`]
+/// counts them, for postures 0 to 2 (0x59048c).
+const BASE_CLIPS: [usize; 3] = [3, 1, 2];
+
+/// The clip of `posture`'s base layer among the posture's clips
+/// (0x59048c to 0x5904a1), or None for a posture with no base layer.
+pub(crate) fn base_selection(posture: i32) -> Option<usize> {
+    usize::try_from(posture)
+        .ok()
+        .and_then(|p| BASE_CLIPS.get(p))
+        .copied()
+}
+
 fn unsupported(at: &str, what: &str) -> Trap {
     Trap::Unsupported(format!("the animator {what} ({at}), which is not ported"))
 }
@@ -507,22 +521,50 @@ impl Interpreter<'_> {
         }
         if flags & 4 == 0 && !(a.base && kind <= 1) {
             a.posture = posture;
-            match posture {
-                0 => {
-                    read_appearance_if_stale(world, self.program, id, &mut a.profile_stale)?;
-                    // 0x592726 empties the slot first (it is empty here)
-                    // and adds the new layer to the skin.
-                    a.base = true;
-                    a.skin_dirty = true;
+            if let Some(selection) = base_selection(posture) {
+                read_appearance_if_stale(world, self.program, id, &mut a.profile_stale)?;
+                // Posture 0's clip was found every time the captures show
+                // (a base layer after each start), so it is not looked up
+                // here; postures 1 and 2 are, to fail loudly on a clip that
+                // is missing or has timed events.
+                if posture != 0 {
+                    self.check_base_clip(world, id, posture, selection)?;
                 }
-                1 | 2 => {
-                    return Err(Trap::Unsupported(format!(
-                        "the animator starts the base clip of posture {posture} (0x590497), \
-                         which has not been seen; not ported"
-                    )));
-                }
-                _ => {}
+                // 0x592726 empties the slot first (it is empty here) and
+                // adds the new layer to the skin.
+                a.base = true;
+                a.skin_dirty = true;
             }
+        }
+        Ok(())
+    }
+
+    /// Looks up the base clip of `posture` for person `id` (0x5904af,
+    /// then 0x59dc32), failing loudly where it is not found or has timed
+    /// events, which the skin's update would handle (0x5992b3) and which
+    /// are not kept.
+    fn check_base_clip(
+        &self,
+        world: &World,
+        id: u16,
+        posture: i32,
+        selection: usize,
+    ) -> Result<(), Trap> {
+        let name = self.posture_clip(world, id, selection)?.ok_or_else(|| {
+            unsupported(
+                "0x5904af",
+                &format!("has no name for the base clip of posture {posture}"),
+            )
+        })?;
+        let clip =
+            self.program.animations.clip(&name).map_err(|e| {
+                unsupported("0x59dc32", &format!("finds no base clip {name:?}: {e}"))
+            })?;
+        if clip.tracks.iter().any(|track| !track.events.is_empty()) {
+            return Err(unsupported(
+                "0x5992b3",
+                &format!("plays base clip {name:?}, which has timed events"),
+            ));
         }
         Ok(())
     }

@@ -19,8 +19,13 @@
 //!    word 1) turned by the number of the lowest of the flag's bits 0 to
 //!    6 that is set (0 for none); without it, my own facing. It is kept
 //!    in 0 to 7.
-//! 3. A slot whose snap target (+0x20) is 0 or more puts me into a slot
-//!    of the object; that fails loudly. Otherwise the place is the
+//! 3. A slot whose snap target (+0x20) is 0 or more puts me into that
+//!    slot of the object, as scripts count its container slots (0x454b19):
+//!    one past the last is native error 0x20 (the object's container
+//!    records, object +0x130, count its tile's chain first). The place is
+//!    the object's position and level (+0x110), and the place test is the
+//!    one for a slot of the object (`Interpreter::fits_in`). Otherwise the
+//!    place is the
 //!    object's position and level with the slot's offset turned to the
 //!    object's facing and added (0x454b93): the position goes to world
 //!    units (times 3/16, 0x454f5c), the offset's first two coordinates
@@ -49,8 +54,9 @@
 //!
 //!    Not fitting fails loudly (below).
 //! 5. I am put there if I fit (the place test, virtual function 0x54,
-//!    `Interpreter::fits`), in this order:
-//!    - the lot is told (virtual function 0x58, `Interpreter::put`);
+//!    `Interpreter::fits` or `Interpreter::fits_in`), in this order:
+//!    - the lot is told (virtual function 0x58, `Interpreter::put`), with
+//!      the object and its slot for a place inside it;
 //!    - my facing (data word 1) becomes the direction;
 //!    - if I am a person, my animator's position is unset (its virtual
 //!      function 0x20, 0x589361);
@@ -71,7 +77,9 @@
 //! Flag bit 0 makes the animator's offset my distance from the place
 //! (0x454c7a), which the animator's later placing adds to my position;
 //! that fails loudly, as the offset is not kept. Flag bit 1 only matters
-//! when I do not fit, and bit 2 only for a place inside an object.
+//! when I do not fit. Bit 2, for a place inside an object, tests the walls
+//! around the object instead of putting me there (0x45522c: 0x433d16 and
+//! 0x476dbc); that fails loudly.
 //!
 //! Ported from the original's code (above). The comparisons that cover
 //! it are whole ticks of the Goth house.
@@ -82,6 +90,9 @@ use crate::interpreter::{Machine, word};
 use crate::placement::{Place, closed_directions, on_lot};
 use crate::routing::slot::{direction, route_slot};
 use sims_sim::animator::{Animator, LOADED, UNSET};
+
+/// The SLOT entry kind of a container slot.
+const CONTAINER: u16 = 0;
 
 /// The mode that names a routing slot of the stack object by word 0.
 const SLOT: i16 = 3;
@@ -150,19 +161,51 @@ impl Machine<'_, '_> {
             facing(self, me)?
         };
         let direction = direction.rem_euclid(8);
-        if slot.snap_target >= 0 {
-            return Err(unsupported("0x454b19", "into a slot of the object"));
-        }
-        if slot.offset[0] & 0x7fff_ffff != 0 || slot.offset[1] & 0x7fff_ffff != 0 {
-            return Err(unsupported(
-                "0x455070",
-                "to a slot whose offset turns with the object's facing",
-            ));
-        }
         let position = self.world.objects[&target].position;
-        if position[..2].iter().any(|n| n.unsigned_abs() > FAR as u32) {
-            return Err(unsupported("0x454fb9", "from a position this far out"));
-        }
+        let container = if slot.snap_target >= 0 {
+            // The object's container records, its tile's chain first.
+            let records = self.world.objects[&target].slots.len();
+            if usize::try_from(slot.snap_target).is_ok_and(|s| s + 1 >= records) {
+                return Err(Trap::native(0x20, "Snap names no slot of the object"));
+            }
+            if operands[4] & 4 != 0 {
+                return Err(unsupported(
+                    "0x45522c",
+                    "into a slot with flag bit 2, which tests the walls around the object",
+                ));
+            }
+            // The container slot's offset across, turned to the object's
+            // facing, is added to my animator's offset (0x454ceb to
+            // 0x454d5e), which is not kept.
+            let held = self
+                .program
+                .slots(definition.resource, definition.chunk)
+                .iter()
+                .filter(|entry| entry.kind == CONTAINER)
+                .nth(slot.snap_target as usize);
+            if held.is_some_and(|entry| {
+                entry.offset[..2]
+                    .iter()
+                    .any(|n| n.to_bits() & 0x7fff_ffff != 0)
+            }) {
+                return Err(unsupported(
+                    "0x454ceb",
+                    "into a container slot whose offset across moves my animator",
+                ));
+            }
+            Some((target, slot.snap_target))
+        } else {
+            if slot.offset[0] & 0x7fff_ffff != 0 || slot.offset[1] & 0x7fff_ffff != 0 {
+                return Err(unsupported(
+                    "0x455070",
+                    "to a slot whose offset turns with the object's facing",
+                ));
+            }
+            if position[..2].iter().any(|n| n.unsigned_abs() > FAR as u32) {
+                return Err(unsupported("0x454fb9", "from a position this far out"));
+            }
+            None
+        };
         if operands[4] & 1 != 0 {
             return Err(unsupported(
                 "0x454c7a",
@@ -179,17 +222,18 @@ impl Machine<'_, '_> {
             ));
         }
         let interpreter = self.interpreter();
-        if !interpreter
-            .fits(self.world, me, to, level)
-            .map_err(|f| f.nested(me))?
-        {
+        let fits = match container {
+            Some((target, slot)) => interpreter.fits_in(self.world, me, target, slot, to, level),
+            None => interpreter.fits(self.world, me, to, level),
+        };
+        if !fits.map_err(|f| f.nested(me))? {
             return Err(unsupported("0x454e09", "to a place where I do not fit"));
         }
         let place_at = Place {
             on_lot: on_lot(to),
             position: to,
-            container: None,
-            slot: -1,
+            container: container.map(|(target, _)| target),
+            slot: container.map_or(-1, |(_, slot)| slot),
             level,
         };
         interpreter

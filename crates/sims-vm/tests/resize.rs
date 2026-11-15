@@ -2194,6 +2194,7 @@ fn the_goth_house_first_tick_matches_the_original() {
     const TICK_877: &str = "a1a7d5d98711415cfe740d946f4ca561104f070ef18da034e5d4bbd16c9692fa";
     const TICK_900: &str = "cd9a69d332addf02fb32dcb811114d0dbc83392ba9ffb82b10aff4897fce6b5b";
     const TICK_991: &str = "5db7014c62c2a37753f8101f2be368e30f151429a4b1404e5e3a4b73c7e11fd1";
+    const TICK_1000: &str = "43c2f13eee21f408a2f07965b6354a841751eb23ec4f92ba1c3b27947a375416";
     const TICK_416_20: &str = "37ff5756ac5cf26769da735eadb955be4f78f64381ea8b847963298b51f8320b";
     const USES_233: [(i16, i32); 2] = [(132, 5), (51, 8)];
     const TREES_233: [u16; 9] = [
@@ -2834,10 +2835,13 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert_eq!(world.ticks, before.ticks + 991);
         assert_eq!(digest(&world.encode()), TICK_991);
         // Tick 992: object 21 snaps into a slot of object 174: its
-        // routing slot 0, the second entry of its SLOT chunk.
-        let error = interpreter
-            .lot_update(world, &tuning, &mut player)
-            .unwrap_err();
-        assert!(error.to_string().contains("0x454b19"), "{error}");
+        // routing slot 0, the second entry of its SLOT chunk, which puts
+        // it into the object's container slot. The fifth capture ends
+        // after tick 1000.
+        for _ in 992..=1000 {
+            interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        }
+        assert_eq!(world.ticks, before.ticks + 1000);
+        assert_eq!(digest(&world.encode()), TICK_1000);
     });
 }
