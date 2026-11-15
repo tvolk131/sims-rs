@@ -312,6 +312,29 @@ pub struct Object {
     pub selected: bool,
 }
 
+/// Object data word 29: the room the object was last put in.
+const ROOM: usize = 29;
+
+/// Where a Sim is: what [`World::selected_whereabouts`] reads. Only read
+/// from the state; nothing here is worked out anew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Whereabouts {
+    /// The Sim's object ID.
+    pub id: u16,
+    /// Its position: the two coordinates in sixteenths of a tile, and the
+    /// level (1 the ground floor, 2 upstairs).
+    pub position: [i32; 3],
+    /// The tile and level the position is on, as [`World::tile`] gives
+    /// them (-1, -1 off the lot).
+    pub tile: [i8; 3],
+    /// The level, `position[2]`.
+    pub level: i32,
+    /// Its room word (object data word 29), the room the placement wrote
+    /// when the Sim was last put somewhere (the room map's number for the
+    /// tile, see [`World::room_at`]). None if the object has no word 29.
+    pub room: Option<i16>,
+}
+
 /// The side of a lot's arrays, and of a lot nothing has resized.
 pub const FULL_SIZE: i16 = 64;
 
@@ -445,6 +468,35 @@ impl World {
             .copied()
             .filter(|id| self.objects.get(id).is_some_and(|o| o.person.is_some()))
             .collect()
+    }
+
+    /// The selected Sim: the first person in registration order with
+    /// [`Object::selected`] set (0x4456e4). None while nobody is selected,
+    /// as after a load.
+    ///
+    /// The original walks its list of people. Here that is the registration
+    /// order. Which order the original's list has is **unverified**; it
+    /// matters only if two people are marked.
+    pub fn selected(&self) -> Option<u16> {
+        self.order.iter().copied().find(|id| {
+            self.objects
+                .get(id)
+                .is_some_and(|object| object.person.is_some() && object.selected)
+        })
+    }
+
+    /// Where the selected Sim is, for the presentation to follow: see
+    /// [`Whereabouts`]. None while nobody is selected.
+    pub fn selected_whereabouts(&self) -> Option<Whereabouts> {
+        let id = self.selected()?;
+        let object = &self.objects[&id];
+        Some(Whereabouts {
+            id,
+            position: object.position,
+            tile: World::tile(object.position),
+            level: object.position[2],
+            room: object.data.get(ROOM).copied(),
+        })
     }
 
     /// The canonical encoding: postcard, which writes fields in declaration

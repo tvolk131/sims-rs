@@ -8,8 +8,8 @@ use sims_sim::neighbors::{Inventory, Item, Neighbor, Neighbors, Row};
 use sims_sim::rooms::{Half, Room, Rooms};
 use sims_sim::route::{Candidate, Context, Route, RouteSlot, Routing};
 use sims_sim::{
-    Budget, Dialog, Dialogs, FrameStorage, HouseUsage, MagicHistory, Object, PersonTick, Snapshots,
-    TypeAttributes, Usage, World,
+    Budget, Dialog, Dialogs, FrameStorage, HouseUsage, MagicHistory, Object, PersonTick,
+    ReadOnlySnapshots, Snapshots, TypeAttributes, Usage, Whereabouts, World,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -1045,6 +1045,104 @@ fn snapshots_round_trip_through_redb() {
     );
     assert_eq!(store.load("later").unwrap().unwrap().ticks, world.ticks + 1);
     assert!(store.load("missing").unwrap().is_none());
+}
+
+fn person() -> sims_formats::saved_objects::Person {
+    let interaction = sims_formats::saved_objects::Interaction {
+        uid: 0,
+        caller: 0,
+        target: 0,
+        icon: 0,
+        table_index: 0,
+        args: [0; 4],
+        priority: 0,
+        action: 0,
+        attenuation: 0.0,
+        flags: 0,
+    };
+    sims_formats::saved_objects::Person {
+        animation_events: 0,
+        engaged: 0,
+        appearance: Default::default(),
+        accessories: Vec::new(),
+        animations: Default::default(),
+        routing_state: 0,
+        floats: [0.0; 9],
+        previous_motives: [0.0; 16],
+        motives: [0.0; 16],
+        data: vec![0; 256],
+        routing_frames: 0,
+        active: interaction.clone(),
+        last: interaction,
+        queue: Vec::new(),
+        object_uses: Vec::new(),
+        motive_deltas: Vec::new(),
+    }
+}
+
+#[test]
+fn the_selected_sim_is_the_first_marked_person() {
+    let mut world = world();
+    // Object 5 is marked but is no person.
+    assert_eq!(world.selected(), None);
+    assert_eq!(world.selected_whereabouts(), None);
+    for id in [2, 7, 9] {
+        let mut sim = object(id, 0x3333);
+        sim.person = Some(person());
+        world.objects.insert(id, sim);
+    }
+    world.order = vec![5, 2, 9, 7];
+    assert_eq!(world.selected(), None, "a person must be marked");
+    for id in [7, 9] {
+        let sim = world.objects.get_mut(&id).unwrap();
+        sim.selected = true;
+        sim.position = [-40, 600, 2];
+        sim.data[29] = 1025;
+    }
+    // The registration order decides between two marked people.
+    assert_eq!(world.selected(), Some(9));
+    assert_eq!(
+        world.selected_whereabouts(),
+        Some(Whereabouts {
+            id: 9,
+            position: [-40, 600, 2],
+            tile: [-3, 37, 2],
+            level: 2,
+            room: Some(1025),
+        })
+    );
+    // An object without a room word has no room.
+    world.objects.get_mut(&9).unwrap().data.truncate(29);
+    assert_eq!(world.selected_whereabouts().unwrap().room, None);
+    // Reading moves nothing.
+    let hash = world.hash();
+    world.selected_whereabouts();
+    assert_eq!(world.hash(), hash);
+}
+
+#[test]
+fn read_only_snapshots_never_write_the_file() {
+    let file = Temp::new("read-only");
+    assert!(ReadOnlySnapshots::open(&file.0).is_err());
+    assert!(!file.0.exists(), "opening to read created the file");
+    let world = world();
+    Snapshots::open(&file.0)
+        .unwrap()
+        .save("boot", &world)
+        .unwrap();
+    let before = std::fs::read(&file.0).unwrap();
+    {
+        let store = ReadOnlySnapshots::open(&file.0).unwrap();
+        assert_eq!(
+            store.load("boot").unwrap().unwrap().encode(),
+            world.encode()
+        );
+        assert!(store.load("missing").unwrap().is_none());
+        // Two readers share the file.
+        let other = ReadOnlySnapshots::open(&file.0).unwrap();
+        assert!(other.load("boot").unwrap().is_some());
+    }
+    assert_eq!(std::fs::read(&file.0).unwrap(), before);
 }
 
 /// Boots the target house from a real install when `SIMS_INSTALL` names
