@@ -179,6 +179,62 @@ and 336, below 354, so neither ticks again. In the snack order they are
 The old tests that pinned flag 0x4 and a mode-6 person as unported now
 pin what still fails.
 
+## 2026-11-15: The load restores each person's animator: its saved layers pose the skin, and its head keeps its angles
+
+The Pleasants' first frame stopped: person 242's head follows person
+241, whose animator was never ticked or drawn, so the point on top of
+241's head was what the load left in its skin. The load's restore of the
+animator (0x5918ba, `crate::restore` in `sims-vm`) is now ported as far
+as the simulation reads it:
+
+- **The layers.** Each of the three saved descriptors (foreground, carry
+  slot, base slot; "%s;%d;%d;%d;%d;%d;%d;%d", written at 0x5864ff) is
+  read as 0x591eec does: the clip's name up to the first ';', then the
+  priority, the speed, the phase and the weight (each in thousandths,
+  0x666a24), the end mode and two words nothing ported reads. The C
+  runtime's `atoi` (0x636029) is ported with its wrap-around. A
+  descriptor that runs out of ';' makes no layer. Each layer is made at
+  the load's clock and inserted in the skin by priority (0x5a0a5b,
+  0x599128), then the skin is updated with them at once (0x5992b3,
+  forced) and placed on the person's tile (0x592132).
+- **What stays.** The person's reset then takes the layers out of the
+  skin (0x589220) but not the bones they posed: the skin holds them
+  until it samples a layer again. That pose is kept in
+  `World::held_poses` (snapshot format 28): the layers and the
+  placement. The head's measurement samples them under whatever plays
+  now, and a person not placed since the load is placed where the load
+  put it. The skin's first update with a layer drops them, and the
+  bones they moved count as moved (`World::translated_bones`).
+- **The head.** The heading, the target's heading and the turn are
+  restored. The load's head step sees the constructor's zero data words
+  (the person's data is read after its animator), so the turn relaxes
+  once (x0.8) and settles; the measurement does not run. The events
+  seen (+0xa4) are kept; the reset clears +0xa0. The saved target point
+  is not kept: nothing reads it before the measurement writes it.
+
+**Fails loudly:** a saved placement compensation other than 0 (+0x8c,
+which the placement adds) and a descriptor whose clip our content does
+not hold (the original makes no layer for a name its table lacks, which
+is not ruled out).
+
+**Against the capture** (`house06-pleasants-ticks-20261115`, entry 0,
+the frame before tick 1): person 242's heading, target heading and turn
+are bit for bit the original's, and so are two of the three coordinates
+of its target, the top of person 241's head. The third, the height, is
+one unit in the last place off (0x4187338d here, 0x4187338e there); the
+cause is not found. Nothing reads the target before the next
+measurement writes it. Persons 241 and 243 keep their saved angles, as
+in the capture.
+
+**Strict runs.** The Goth and Newbie states are unchanged but for the
+new field: by tick 33 every Goth's skin has sampled a layer, and the
+pins' format-27 encodings equal the old hashes. The Newbie at tick 1802
+is the same. The Pleasants now stop at tick 1: person 117 was saved
+part way through a route, and the save keeps a count of its route
+contexts (0x460443, each context read by a no-op, 0x5fe4ae) that the
+load does not make yet. UserData2's house 9 gets past its first frame
+and stops at tick 232 on Snap mode 0 (0x4549c7).
+
 ## 2026-11-15: Four types keep more saved attributes than their constructor allocates
 
 A house read used to fail when a saved object held more attributes than

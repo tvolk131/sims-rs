@@ -93,16 +93,18 @@ events, and what it asks for after them) come first.
   again who is a visitor, and reading the people raises the action
   serial. Their load equals the capture's but for one person's data word
   50 and last result, which something in the original's load sets and
-  which is not found yet. The first frame then stops: person 242's head
-  follows person 241, whose animator has never been ticked or drawn, and
-  what the original reads for it is not ported.
+  which is not found yet. The load restores each person's animator and
+  the pose its saved layers left in the skin (0x5918ba), so the first
+  frame matches the capture (person 242's head angles bit for bit; its
+  target's height one unit in the last place off). Tick 1 then stops:
+  person 117 was saved part way through a route, and the load does not
+  yet make the route contexts the save counts (0x460443).
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
   read their arrays whole (Arry 11, 12, 111 and 112). Their floor
   and wall maps are renumbered through the game's pattern catalogs
   (`sims_content::Surfaces`, `World::renumber_surfaces`). UserData2's
-  house 9 then stops at the first frame (a bone last turned by a layer
-  no longer playing, 0x5992b3), the houses with no family stop at the
+  house 9 then stops at tick 232 on Snap mode 0 (0x4549c7), the houses with no family stop at the
   household selection, and the community lots (UserData's houses 40 to
   48) where Create New Object Instance mode 6 makes a person (0x44e60e).
   Four types grow their attribute arrays to the saved count (0x4342ae). The templates' `Patch` families are not
