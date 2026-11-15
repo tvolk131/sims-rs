@@ -16,8 +16,11 @@ route steps in tick 438.
   from `0x58edeb`) and goes straight to the update's tail (`0x58f688`).
   The step (+0x294, +0x298) is already written; the person and the
   animator's position stay where they were. That holds for the end of
-  a path's extra step too: it skips setting the destination and
-  running the state again. The capture's animator holds 3 after tick
+  a path's extra step too. The stand's earlier writes stay (the
+  destination's first two coordinates, the near-end and finishing
+  flags, the state and the progress). Only the final copy of the whole
+  position into the destination is skipped, and the state does not run
+  again, so the standing animator never turns the 3 into 2. The capture's animator holds 3 after tick
   437.
 - **Step 10 tries again.** A route whose animator stopped short of the
   path's end (0x589d47 gives 0, as it does for an end of 3) stops the

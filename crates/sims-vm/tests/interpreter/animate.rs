@@ -1258,6 +1258,47 @@ fn a_blocked_step_ends_the_route_blocked() {
 }
 
 #[test]
+fn a_blocked_last_step_at_the_end_of_the_path_ends_the_route_blocked() {
+    // Near the end of its path with a clip in the foreground, a person
+    // whose object data word 9 is set stands where it is and takes one
+    // more step (0x58e846). When that step is blocked (0x58eecb, as
+    // above), the route ends blocked (3, 0x58f682) and the state's code
+    // does not run again, so the standing animator does not turn the 3
+    // into the route's end (2). The stand's writes before the step stay,
+    // and neither the person nor the animator moves.
+    let mut fx = routed();
+    fx.world.routing.routes.get_mut(&SIM).unwrap().path.pop();
+    fx.sim_mut().data[9] = 1;
+    fx.sim_mut().data[42] = 0;
+    let a = fx.world.animators.get_mut(&SIM).unwrap();
+    a.position[2] = F32::from_f32(2.0);
+    a.destination[2] = F32::from_f32(2.0);
+    a.motion.near_end = 1;
+    a.motion.step = [16.0, 0.0].map(F32::from_f32);
+    a.walking = true;
+    a.foreground = Some(sims_sim::animator::Layer::start(
+        CLIP,
+        F32::from_bits(HUNDRED),
+        4,
+        true,
+        0,
+        false,
+        0,
+    ));
+    let before = a.position;
+    let placed = fx.world.objects[&SIM].position;
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!(a.arrival, 3);
+    assert_eq!((a.state, a.motion.near_end, a.motion.finishing), (3, 1, 1));
+    assert_eq!(a.position, before);
+    assert_eq!(a.destination, before);
+    assert!(a.walking);
+    assert_ne!(a.motion.step, [16.0, 0.0].map(F32::from_f32));
+    assert_eq!(fx.world.objects[&SIM].position, placed);
+}
+
+#[test]
 fn what_the_route_follow_does_not_port_fails_loudly() {
     // Facing the point ahead, a standing animator walks; but the point,
     // 21.33 away, is farther than the stop clip's stride (1 times 16/3),
