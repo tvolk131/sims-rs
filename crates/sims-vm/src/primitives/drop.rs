@@ -1,5 +1,6 @@
 //! Drop (opcode 5, 0x454430, from the general table at 0x45246a): put
 //! what I hold in my first container slot on the floor in front of me.
+//! The inverse of [`Grab`](super::grab).
 //!
 //! The original ignores the operands. In order:
 //!
@@ -23,7 +24,8 @@
 //!
 //! **Unverified**: no capture covers a Drop. The first reached is the
 //! Goth house's tick 5310 (object 12, tree 0x1006 node 12), past the
-//! last capture.
+//! last capture. In play mode, a person's tree 0x0139 (node 14) drops
+//! the snack it is eating when the player cancels it.
 
 use crate::fault::Trap;
 use crate::interpreter::Machine;

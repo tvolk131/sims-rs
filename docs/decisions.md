@@ -43,7 +43,13 @@ for its update (0x590d26).
   frame with neither fails loudly. With 0x2 it is native error 0x36
   (0x44e88c), and 0x2 is not ported.
 - **Drop** (opcode 5, 0x454430): what my first container slot holds
-  goes one tile in front of me, after its place test.
+  goes one tile in front of me, after its place test. #183 ported it
+  too (the entry below); this branch's port is kept, as #183's added
+  the step's words to the wrong coordinates. 0x42228a's first word is
+  added to +0xf4 (0x4544ab), which is our second coordinate, as in
+  `routing::slot`. In #183's cancelled-snack test Mortimer stands at
+  (296, 456) facing 6, so the snack goes to (280, 456), not (296, 440).
+  **Unverified**: no capture covers a Drop.
 - **A person's reset ends its object uses first** (0x45e814): frames
   are popped down to each use's count, and the object used resets.
 - **The route-failure feedback tree** (step 17, 0x45af2a): this branch
@@ -172,6 +178,528 @@ and 336, below 354, so neither ticks again. In the snack order they are
 
 The old tests that pinned flag 0x4 and a mode-6 person as unported now
 pin what still fails.
+
+## 2026-11-15: Objects cast the original's soft shadows on the floor under them
+
+At near zoom the most visible difference left was the shadow under
+plants, benches and other furniture, which the original darkens into the
+floor or grass after drawing each tile and before any object (its floor
+shadow pass, 0x4ae844 in the tile draw 0x4ad8ac). It is now ported in
+`crates/sims-render/src/shadows.rs`, from the code:
+
+- **One object a tile.** The first object of the tile's object grid cell
+  (lot arrays 3 and 103), or the next on the tile through slot 0, that is
+  not hidden, has no zero-extent flag (data word 8, value 4), is not of
+  type 2 or 9 and has a shadow (0x434e23).
+- **The shadow code** (0x4573e7). A one-tile object's is its OBJD word
+  57, -1 for none. A tile of a group builds one from which of its eight
+  neighbours in the group's grid (OBJD word 11) also have a shadow and
+  have OBJD word 56 at 0 (0x43ac5c); a code the masks cannot draw
+  becomes 0. It is turned by the object's facing and then the view's
+  rotation (the tables 0x53d2fc fills); code 16 never turns.
+- **The masks.** Codes 0 and 16 are hand-drawn, SPR2 0x300 and 0x310
+  (plus 0x20 a zoom) in `floors.iff`, read as palette indices. Every
+  other code's mask is worked out over floor 0's tile shape from four
+  curves, one a side, as the original's float code does it (0x4a3cd3,
+  0x4a3914, 0x4a3993).
+- **Drawing** (0x4b10c4). Mask byte plus strength (OBJD word 79, plus
+  255 less the tile's drawn light byte) gives a light level for the
+  pixel, which is drawn through the lighting's tables; 248 and up leaves
+  it alone. Only pixels at or behind the floor's ground depth change.
+
+**Checked** against the original's screenshots, with the world at their
+time. Near zoom rose from 86.3% to 87.6% exact (two other near cameras
+86.8% to 88.3% and 86.5% to 87.1%); far zoom at rotations 1 and 2 by
+0.1 to 0.2 points and medium zoom from 82.7% to 83.1%. Of the pixels the
+shadows changed, 6,359 of 7,149 now match exactly at near zoom (950 of
+1,186 at far rotation 1, 449 of 574 at rotation 2, 2,046 of 2,755 at
+medium); before, almost none did. The bench's two halves meet in one
+shadow, which checks the turning's sense.
+
+**Not ported:** the option that turns shadows off (the "shadows" cheat)
+and the drawing flags that allow them, taken as on; the faint shadow
+under an object the player is placing (0x438a48). The pass runs in the
+tile order of our floor loop, after all grass, where the original runs it
+tile by tile in its own order, so a later tile's grass blade can cover a
+shadow there and not here.
+
+**Seen, not yet read:** on a split tile whose other half has no floor,
+the original draws that half as flat grass (two tones, no blades); we
+draw the bladed grass. The dashed row along the porch's lower edge at
+near zoom is ours alone.
+
+## 2026-11-15: The plumb bob is the original's mesh, coloured and lit as the original does
+
+The selected person's plumb bob is now drawn (`sims_people::bob`, from
+`People::draw`). Everything below was read from the original's code in
+a memory image, except where it says otherwise.
+
+- **What it is.** An ordinary object (`PlumbBob.iff`, GUID 0x2F726FFF)
+  in the person's head slot (their container slot 2), with no sprites.
+  Its object string 200 names the skeleton `root` and the suit
+  `head-arrow,ROOT=white`. The suit's mesh, `xskin-head-arrow-ROOT-ARROW`,
+  is in `Animation.far`, 2.1 units long on its z axis. No
+  `root-skeleton.cmx.bcf` or `white.bmp` exists, so we make a one-bone
+  skeleton and draw the mesh white.
+- **Where.** The head slot's redraw (0x58dbd8 to 0x58dc03) gives the
+  bob's graphic the `HEAD` bone's position times the person's
+  placement, without the bone's own turn. The draw (0x585dc5) sets the
+  root bone at (0, 3, 0), turned by the original's Euler routine
+  (0x5c4bb0, run in an emulator to fix its order) a quarter turn about
+  x and the spin about z. So the bob stands upright from three units
+  over the head and spins about its length.
+- **Spin.** The game's clock in milliseconds (0x6e54e0) × 0.001 × π, or
+  half a turn a second. We have no such clock, so the game window passes
+  the time it has run (`People::set_clock`, from `Game::advance`). That
+  time runs on while the lot is paused or a dialog waits; whether the
+  original's clock does is **unverified**. While a bob is on the lot,
+  the window draws a new frame every 50 ms even when no tick runs (our
+  choice; the original's frame rate is not ported).
+- **Colour.** The suit's name sets a mode (`head-arrow` 1,
+  `head-arrow-date` 2, `head-star` 3, 0x5856db to 0x58579f). In mode 1,
+  m is the mood (motive 3 cut to an integer) × 0.012, held to −1..1.
+  - From 0 up, r = b = 1 − m and g = 1, with b lowered a further
+    0.4 − m below 0.4.
+  - Below 0, r = 1 and g = b = 1 − m², with b lowered a further m + 0.4
+    above −0.4.
+  - So the bob runs red, pale yellow, green.
+- **Light.** The colour is a light of intensity 1, and the ambient light
+  is a quarter of the colour plus 0.05. The light's vector is the house
+  camera's unit vector from its eye to the centre (+0x184, set at
+  0x49b2aa), turned 80° about y and then 30° about x (0x6f6b38). That
+  turn is in the lot's terms, so the light falls from another side at
+  each rotation of the view.
+
+**Taken from the screenshot, not read.** In the original's screenshot
+(medium zoom, 7:38 AM, Mortimer reading on the porch bench), the bob is
+brightest on the viewer's left and lit on its lower half. That is what
+we get by taking the vector as pointing towards the light. Taken the
+other way, the left side is dark. With that choice our bob's green
+pixels span the original's box (x 427 to 434, y 74 to 97), each edge
+within a pixel, as a gated test checks; the pixels inside the box are
+not compared one by one.
+
+**Unverified.**
+- Which bone the slot names (its +0x20); `HEAD` puts the bob where the
+  screenshot has it.
+- Rotations other than 0.
+- The bob's pixels name the person who holds it, for a click; what the
+  original does on a click there was not checked.
+
+**Not ported.** Modes 2 and 3, the date and star bobs.
+
+## 2026-11-15: A split floor tile's grass keeps the blades of the tile drawn before it
+
+The grass's blade count is now worked out tile by tile in the order the
+original draws the tiles, and carried from one to the next, as the
+original keeps it in the grass object between tiles (0x49d0da to
+0x49d215). The tiles are drawn in runs along the view's diagonals, x + y
+rising, and x rising along each run (0x4ad4bd calling 0x4ad8ac). A tile:
+
+- with no floor counts its blades by its grass value, as before;
+- with a floor and no diagonal wall counts none (0x49d155) and keeps the
+  previous tile's short-blade flag;
+- with a floor split by a diagonal wall (wall byte 0 & 0x30) keeps the
+  count and the flag of the tile drawn before it, whatever its own grass
+  (0x49d14b);
+- off the lot's inner tiles (1 to size − 2 in x and y) returns before
+  any of this and leaves the count as it was (0x49cecc); it draws no
+  blades here, as before.
+
+So the floorless half of a split tile beside a porch shows flat grass,
+and beside a lawn a full lawn. Before, it counted by its own grass.
+
+**Checked.** Against the original at the tick-570 world: near zoom (the
+porch view, origin 619, −1189) rose from 86.5% to 87.0% exact; of the
+2,402 pixels the change touches, 2,115 now match exactly (3 did before),
+and the mean channel error there fell from 21.1 to 4.6. Medium zoom
+(cutaway): 82.7% to 82.8%; of 771 pixels changed, 715 match (none did),
+error 16.6 to 0.3. At far zoom only a few pixels change: 8 at rotation
+1, all now exact (none were), and 9 at rotation 2, which match neither
+way. Tile (27, 28) on the Goth
+porch is one: the tile drawn before it, (26, 29), has a floor, so its
+empty half is flat in both.
+
+**Not ported.** The original clips each run to the screen before drawing
+it, so a tile off screen is not drawn and does not pass its count on;
+here every tile is in the order. A split tile at the screen's edge could
+take a count from a different tile. The pool test (0x47c16d), which
+gives a tile in a pool none, is still not looked at.
+
+## 2026-11-15: The relationship panel lists who the Sim knows
+
+The live panel's Relationships button now opens the selected Sim's
+relationships in the subpanel (`sims_ui::hud`, `Kind::Relation`), read
+from the exe; no screenshot of this panel was available.
+
+- **The list** (0x4e9deb): every neighbor record but the Sim's own that
+  the Sim has a relationship row toward, in slot order. A record stands
+  for its type: its GUID gives a person (0x4e9753), and the row asked
+  for is toward that person's record, the type's first (0x4ea192). So
+  a second record of the same type is listed with the first's row, and
+  not at all where only it has one. This is the original's behaviour,
+  kept, not a slip.
+  - The buttons filter it (0x51a7ea, 0x51a8c3): Family (4108) keeps the
+    people with the Sim's family word (person data 61), Friends (4109)
+    the mutual friends (value 0 at the friendship threshold or more
+    both ways), Everyone (4110, the default) all of them. The Superstar
+    button (4111) is drawn disabled, as without the expansion's flag.
+  - The order (0x4e9fad): the household first, then the people on the
+    lot, then by the day's relationship (row value 0), highest first.
+  - `Snapshot::with_relations(world, members, friendship)` fills it.
+    The host passes the friendship threshold from the tuning
+    (`autonomy_constants().friendship_threshold`): 50 in the original's
+    capture, though the exe's default is 25.
+- **The layout** (0x51db56), on the 279 by 100 subpanel: the four 20 by
+  20 buttons down the left at (3, 1), (2, 22), (2, 43) and (2, 64); the
+  entries 45 by 90 from (35, 18), 45 apart, five a page; the page arrows
+  (100 and 101, 9 by 49) at (24, 25) and (268, 25), each shown only
+  when there is a page that way. A page past the end shows the last
+  (0x51db4b).
+- **An entry** (0x52838f), font 7: the face is one of five in the
+  person's BMP_ 2003, by the lifetime relationship (value 2), centred
+  at the top; the day's number on a dark blue box two pixels over the
+  face's bottom; the day's bar 2 high and the lifetime's 4 high, 40
+  wide, a fifth of a pixel a point from -100, with the dark line
+  closing the filled part as the needs' meters have; the lifetime's
+  number; the smiley for friends and the red heart (value 3) or else
+  the pink one (value 1), 3 past the smiley's width whether the smiley
+  shows or not. The bars' green and red lean from the
+  panel's color by the lifetime relationship, through the original's
+  16-bit blend table (0x49a2fb, 0x49a60b), ported with its float
+  constants.
+- **Edges kept from the original** (Sol's review asked about them):
+  - The face is lifetime plus 100 over the strip's cell width (the
+    bitmap's width over 5), not over a fixed 40 points
+    (0x5283fa..0x528424). The install's cells are 40 wide, so the two
+    agree there.
+  - The dark line after a bar's filled part needs only two pixels left
+    on the right (0x5287e9). An empty bar (-100 to -96) gets it a pixel
+    left of the bar, where the needs' meters draw none.
+- **Unverified:**
+  - Font 6, which sets the buttons' and arrows' heights, is not in the
+    install; its height is taken as 0.
+  - Where the lifetime number's box starts (an instruction the copy
+    protection hides; under the lifetime bar is taken), and so the
+    icons' height.
+  - That the numbers are centred, in the labels' color.
+  - That an entry is lit (the purer green and red) when the pointer is
+    on it.
+  - Ties in the order go by the original's per-person UI index; the
+    record ID stands in.
+  - The original's check of who may be listed (0x423f30, and the
+    on-lot person words) and its Superstar filter are not ported; at
+    exactly 1024 wide it shows ten a page, not modelled.
+- **Reopen** when a screenshot of the panel is available, or the hidden
+  instructions are read from a clean image.
+
+## 2026-11-15: The job panel draws the skills and what the next level needs
+
+The live panel's Job button now opens the selected Sim's skills in the
+subpanel (`sims_ui::hud`, `Kind::Skills`), with the title "Job". The
+panel's left column (the career's icon and title, the salary, the
+performance and the friends needed) is not drawn yet.
+
+- **Which panel:** the exe has two job panels. The one at 0x52bb86 is
+  Superstar's fame panel (fame stars, fame.iff strings). The ordinary
+  one is built at 0x52f2ff and drawn at 0x5301ca; this is that one.
+- **Where the numbers come from** (read from the exe; no screenshot of
+  this panel was available):
+  - The title is font 11 at (35, 3) of the subpanel, through 0x51eaad,
+    in a western language.
+  - The skills are person data 10, 12, 11, 17, 18 and 15 (0x66dfec):
+    Cooking, Mechanical, Charisma, Body, Logic and Creativity.
+  - A skill's empty bar (4920) is at (157, 7), the next 15 below. The
+    full bar (4901) is cut to 4 pixels a point, and drawn whole at 10
+    points. A point is the data word over 100, clamped to 0 to 10. The
+    CJK languages use 4919 and 4900 and other places; they are not
+    ported.
+  - A skill's label is font 7 (0x6f2ae0), right-aligned in a 62 by 16
+    box at (93, 6), the next 15 below (0x6f4420). The font is now
+    loaded with the others.
+- **What the next level needs** (0x4ea823): the career is person data
+  56 and the level 57. The career is the `CARR` of `work.iff` with
+  that ID (0x404cb3). Value 1 to 6 of the level after the person's own
+  is the need for Cooking, Mechanical, Charisma, Body, Logic and
+  Creativity. It counts only where it is more than the person's skill.
+  - `household::Careers` reads the careers.
+  - `Snapshot::with_careers` fills in each resident's needs; a host
+    calls it after `Snapshot::read`. The game and the viewer load the
+    careers when they open and do (`sims_game::Game::snapshot` gives
+    what the panel is laid out from).
+  - A need is the career's whole 32-bit value, as 0x4ea883 returns it,
+    so a custom career past 32,767 still marks where it says.
+- **What a need draws** (0x530407), in the labels' color (0x6f2a94,
+  which is the needs labels' 0xc679):
+  - a line down the bar at the need's last pixel;
+  - a line along the bar's bottom row, from 16 left of the bar to it;
+  - the skill's label underlined. Every label is drawn; where there is
+    a need, 0x5e4c01 sets the label gadget's +0x170, which 0x5e3ef1
+    passes to the font as flag 4. The font's glyph drawing (0x60bf62)
+    then lines each character, from where it starts to a pixel past
+    its advance (glyph +0x18), in the text's color, on the row just
+    under an `A` (0x60b927: `A`'s y bearing plus its height), when that
+    row is inside the line. `Font::draw_underlined` does this.
+- **Unverified:** the labels' vertical place in their box (centred on
+  the font's line here) and the subpanel's x, as for the personality
+  panel.
+- **Tests:**
+  - a unit test checks the layout, presses passing through, and each
+    bar's fill and the need lines with stand-in art;
+  - the Goths' panel is pinned by digest, gated on `SIMS_INSTALL`. Nobody
+    has a skill, and Mortimer's next level (Science, "Lab Assistant")
+    needs none;
+  - a second digest moves Mortimer to "Field Researcher": the install's
+    "Science Teacher" then needs a point of Charisma and three of Logic;
+  - `sims-game`'s Goth test checks the same through the game's own
+    snapshot, so a host that skips the careers fails it.
+
+Reopen with a screenshot of the original's job panel.
+
+## 2026-11-15: A person's base layer is drawn as the simulation keeps it
+
+`sims_people` now poses a person's base layer from the simulation's
+playback of it (`World::base_layers`, the layer in the animator's base
+slot): its clip, its phase, its end mode and its weight. Before, the
+simulation did not keep the layer, so the drawing stood in with the
+saved person record's base clip (the standing loop, for each Goth)
+repeating at the animator's clock, or a script's clip from when it
+started. A seated person was posed on the standing loop under the
+foreground clip.
+
+Sampled every 50 ticks over the Goths' first 3,400 ticks (strict mode),
+a person sits in 94 of 226 samples; the base clip is `a2o-sit-loop`
+there, and `a2o-standing-loop` or `c2o-standing-loop` otherwise. The
+child sits on the adult's sit loop too: that is the clip the posture's
+tables name for him (`posture_clip`), which the drawing takes as it is.
+In every one of those samples a foreground clip plays at full weight,
+and those clips move every bone, so the drawn day hardly changes: at
+ticks 500, 1100, 1300, 2900 and 3050 (medium zoom, the porch and the
+living room) the people are the same pixel for pixel. The change counts
+where a foreground clip is partial, fading or absent, and it removes a
+stand-in.
+
+**Checked** only in part. Against the original at medium zoom (Mortimer
+and Alexander reading on the porch bench at 7:38), both sit as the
+original's do, but they did before too: the reading clip drives every
+bone. No screenshot of the original yet shows a seated person whose
+foreground leaves bones to the base layer. The original's people are
+drawn lighter than ours, and it shows the plumb bob over the selected
+Sim, which is not drawn here; neither is about the base layer.
+
+A caller that has no layers for a person (passes None) gets the
+stand-in as before. A state kept before the simulation held the layer
+(encodings before format 25) is refused when loaded, not migrated.
+
+## 2026-11-15: The personality panel draws its bars as the original's bar maker lays them out
+
+The live panel's Personality button now opens the selected Sim's
+personality in the subpanel, where Needs opens the needs
+(`sims_ui::hud`, `Kind::Personality`). Without a selected Sim the
+subpanel is empty, as for the needs.
+
+- **Where the numbers come from** (no screenshot of this panel was
+  available, so it is read from the exe):
+  - The panel builder (0x518665) makes five bars with 0x51df31, for
+    person data words 7, 6, 3, 5 and 2 (the table at 0x66c600): Neat,
+    Outgoing, Active, Playful and Nice.
+  - Every bar's label is as wide as the widest label plus 3 (0x52144a),
+    and its bar starts 3 past that (0x521491).
+  - The bar's gadget is 3 wider than the bar, and the gadgets are
+    stacked right-aligned at x 202 of the subpanel, from y 8, 18 apart
+    (0x519cc8). The CJK languages use 15 and 25, which are not ported.
+  - The shorter of the label's line and the bar is centred on the
+    other.
+- **A bar** (0x5211bd) draws the empty bar (4903, 40 by 14), then the
+  full one (4900, 40 by 16) cut to 4 pixels a point and a pixel higher
+  (0x5212b2). A trait is the data word over 100, clamped to 0 to 10.
+- **Labels and fonts:** the labels are font 8 (0x6f2ae4) and the title
+  is font 11 at the needs title's place. The labels are English, as the
+  needs' are (Live.iff STR# 131 has them).
+- **The subpanel** is the needs' rectangle. The layout table at
+  0x6f3a28 puts it at x 300 of the strip, one left of the 301 the needs
+  were measured at. That pixel is left as measured.
+- **Unverified:**
+  - the labels' color (the needs labels' is taken) and their alignment
+    (right, against the bar);
+  - which of the font's heights the centring compares (its line height
+    is taken).
+- **Not drawn yet:** the zodiac sign and its text under the bars (a
+  text gadget in font 12, filled from UIText.iff STR# 165).
+- **Tests:** a unit test checks the layout, presses passing through,
+  each bar's fill and its rows with stand-in art, and that coordinates
+  at the edge of `i32` do not panic. The Goths' panel is pinned by
+  digest, gated on `SIMS_INSTALL`, with Mortimer's, Bella's and
+  Cassandra's traits read from the house.
+
+Reopen with a screenshot of the original's personality panel.
+
+## 2026-11-15: Drop is ported; a second order waits, and a press cancels either, in the window
+
+**Drop** (opcode 5, 0x454430, from the general table at 0x45246a) is
+ported from the original's code, as the inverse of Grab:
+1. The object in my first container slot (+0x130, its second record) is
+   looked up. Nothing there takes the false branch.
+2. The place is my position plus one tile's step in my facing (data
+   word 1; 0x42228a), on my level.
+3. The object's place test runs on the ground there (virtual function
+   0x54, no container). A refusal takes the false branch, and nothing
+   changes.
+4. The object is put there with the lot told (virtual function 0x58),
+   and the true branch is taken.
+
+- **Verified (Goth tests, play mode):**
+  - The snack order, cancelled at step 900 while Mortimer eats
+    (`a_cancelled_snack_is_put_down_in_front_of_the_eater`). His tree
+    0x0139 (node 14) drops the snack at step 1009. He stands at (296,
+    456) facing 6, and it goes to (296, 440) (corrected to (280, 456)
+    by the entry above). At step 1028 the
+    cancelled action ends, and he is free. No error is caught.
+  - Through the window
+    (`a_second_order_waits_behind_the_first_and_a_press_cancels_either`):
+    - The snack, then Water on plant 162: the water queues behind, its
+      icon second, at x 82.
+    - A press on the water's icon takes it off. The snack goes on to its
+      end at step 1136.
+    - A press on the snack's icon at step 899 (his sixth action, eating)
+      cancels it. With the water queued, the cancel queues nothing of
+      its own (0x45d7c0). He drops the snack at step 1009, and starts
+      the water at step 1028.
+  - A cancel at step 825, as he walks away from the fridge with the
+    snack, stops at the unported route stop below
+    (`a_snack_cancelled_on_the_way_to_the_chair_stops_at_the_unported_route_stop`,
+    a known gap pinned so it is not mistaken for fixed).
+- **A manual sweep, not a test:** the snack order cancelled at each
+  step from 150 to 1136 (every tenth step, then every step near each
+  edge), run 400 steps on. Cancels at steps 150 to 536, 543 to 590 and
+  821 to 829 stop at 0x45b3eb; all the rest catch no error. Too slow to
+  keep as a test (a full lot run per step).
+- **Unverified:** no capture covers a Drop or a cancel. Which tree runs
+  Drop and when is the scripts' own; only the primitive is ported.
+- **Not ported (track 4):** cancelling while Mortimer walks, to the
+  fridge or away from it with the snack, stops his thread at a route
+  whose animator is still under way (0x45b3eb). Sol's review found the
+  walk away (step 825), which the first sweep had missed by sampling
+  steps 760 and 830.
+
+## 2026-11-15: A snack ordered in the window is the scripted snack order
+
+In play mode, the window's order path is the one the original takes:
+the pointer reaching the fridge lists its pie (`Lot::pie_menu`, which
+runs the check trees), a press opens it, and a press on Have A Snack
+queues the action the listing offered (`Lot::pick`). The scripted snack
+order (sims-vm's `the_snack_order_pays_for_the_snack`) queues the same
+action by menu number (`Lot::queue_interaction`) without listing first.
+
+- **Verified (a Goth test, `the_snack_ordered_in_the_window_is_the_scripted_order`):**
+  the action queued at step 51 is the same, field for field. From step
+  150, when Mortimer takes the order, the two lots hash the same at
+  every step through step 1136, when the snack ends. Play mode catches no
+  error. Mortimer pays 5 at step 820. The test also checks that the
+  chosen entry carries the action the check trees listed (not the
+  fallback's menu number), and that the lots differ at every step
+  before 150, so it fails if the window skips the listing (from Sol's
+  review, which found the test passed with the fridge forced onto the
+  fallback menu).
+- **The difference before step 150:** the listing's check trees run as
+  Mortimer. They leave his last result and his saved stack frame's
+  words, and nothing else (compared field by field at step 51). His
+  first tree at step 150 rewrites both. The original lists the menu
+  when the pointer reaches an object (0x48c834), so the window's lot is
+  the more faithful of the two. Whether the original's listing leaves
+  the same words in Mortimer's frame is **unverified**: no capture
+  covers a listing.
+- The test finds the fridge on screen without moving the pointer, since
+  each new object the pointer reaches lists a menu and changes the lot.
+  A player's pointer that crossed other objects first would list their
+  menus too.
+
+## 2026-11-15: The piano plays where its object is, and a start sets a track's levels
+
+Kind 43 (`kPlayPiano`) is ported from the sound manager's case for it
+(0x573e5a). The event's own track is not used: the piano is track 1906
+(`Piano`, in `SimsGeneratedHitSource`), and nothing happens without it.
+
+- **The piano's start:** the object (the first argument) is placed as
+  one object with the piano's `Spl` (0x5730b6, as kinds 1 and 30 place
+  each of their objects), into the second and third arguments. When it
+  is not placed they keep the event's values. The piano then starts and
+  is let go (vtable +0x2c), as kind 1 starts a track.
+- **Its instances:** all of the piano's recorded objects are dropped
+  (0x581f8e on the map at +0xd4), and the track object's own object
+  (vtable +0x24, the field at +0xb0) is recorded. Only a fresh start of
+  a `kArgsIdVolPan` track sets that field (vtable +0x20, 0x57db2e). So
+  a start that lets a held piano go, or one refused at the thread
+  limit, leaves the object of the last fresh start, and before any it
+  is 0. The player now keeps that field for every track.
+- **The skill:** the object's source field 5 is asked for (0x570e61),
+  before track 1907 (`SetPianoSkill`) is looked up. When that track
+  exists it starts with the skill as its first argument. Its script
+  writes it into the piano's register 5.
+- **A start sets the track's levels** (0x57db01): a fresh start writes
+  `extvol` and `pan` from the arguments, as the track's `args` field
+  says: the first two for `kArgsVolPan` (the stations), the second and
+  third for `kArgsIdVolPan`. The player left them at their defaults.
+  Kinds 1 and 30 place the track after its start: an object that cannot
+  be placed still takes the sum's values (see the entry on placement),
+  so only a placement fault now leaves them the event's levels. `play_trk`
+  now hands a started `kArgsIdVolPan` track the caller's registers 2
+  and 3 as its levels. A held track let go by a start, and the idle
+  track kind 53 plays on, keep theirs, as in the original.
+- **Model limit:** the original has one piano track object, so a second
+  piano event restarts it; here it runs a second thread (as for every
+  track; see the entry on the sound player's model).
+- **Tests:** hand-built modules check:
+  - the placement, and the event's levels kept;
+  - the skill asked for, with and without its track, and its start;
+  - the instances replaced, also when the start lets a held piano go or
+    is refused at the thread limit;
+  - the levels a fresh start sets for `kArgsVolPan` and for a
+    `kArgsIdVolPan` track that `play_trk` starts. On the
+  install every event still runs without a bad instruction, and
+  `piano_play` now plays notes for ever.
+
+## 2026-11-15: The music modes start and stop the music tracks
+
+Kind 36's music half is ported from the sound manager's mode change
+(0x575170), so the game's modes now play their music. Its ambience half
+was already ported. The music half runs only when the mode changes,
+and only once the neighbourhood (mode 3) has been shown, as in the
+original. The ambience half runs on every kind 36 event, the same mode
+again included: after a stop, a second live (0) event starts the live
+ambience again though the music does not change.
+
+- **What each mode does** is listed on `Player::change_music`. Each
+  start is a track start as kind 1 makes it (vtable +0x2c), with the hit
+  list as the first argument; the scripts (`SetMainMusicSongAndHitList`,
+  `MainMusicLoop`, ...) do the rest.
+- **The expansions in** are a byte of the configuration
+  (`[0x6e48bc]+0x66`), which picks the credits' list and whether the
+  neighbourhood stops the Grim Reaper's loop. It is taken as every
+  expansion (0xff), as the station lists already are; the Complete
+  Collection has them all.
+- **`play_trk`** (0x57f1f2) now starts the track with the caller's own
+  argument registers (1 to 3), not zeros, and copies the caller's
+  `source` (register 47), read through the caller's `target` as any
+  register read is (vtable +0x88), into the new thread. `MainMusicLoop` reads the
+  list its starter was given this way.
+- **`kill_trk`** (0x57f284) now ends the whole track, whatever object
+  it plays for. It ended only the caller's object's threads, which was a
+  guess; the original finds one track object by number and kills it.
+- **Not ported:** the 100 ms `Sleep` the original's game thread takes
+  around most of these starts, which lets its sound thread run between
+  them. Here they happen at once, in order. What that changes is
+  **unverified**.
+- **Known difference:** the original's sound manager steps its tracks
+  and fades once a millisecond (0x57cf37); the player steps them once a
+  block (64 frames, about 2.9 ms). The slow fade into live mode is
+  therefore about three times slower here. This is left for its own
+  change.
+- **Tests:** a hand-built module checks each mode's starts and stops,
+  and `play_trk`'s and `kill_trk`'s. On the install, every event still
+  runs without a bad instruction. 5 more of them leave music or a river
+  playing, and the backyard's ambience test now also plays the
+  neighbourhood's music, which shares the player's random draws.
 
 ## 2026-11-15: A route that gives up near its slot runs the failure feedback tree
 
@@ -4168,9 +4696,9 @@ control panel in the bottom-left corner.
   One depth model for floors and ground would settle it.
 - Grass on a pool, which the original leaves bare. Pools are not looked
   at.
-- A floor tile split by a diagonal wall. The original keeps the blade
-  count of whichever tile it drew before; here it counts by its own
-  grass.
+- A floor tile split by a diagonal wall. Now ported; see "A split floor
+  tile's grass keeps the blades of the tile drawn before it"
+  (2026-11-15).
 - Seasons, which swap the blade-height tables (0x6c629c, 0x6c62a8).
 - A flag at 0x8d that blanks the colors of tiles on the lot's edge. It
   is off in this capture and not modelled.
