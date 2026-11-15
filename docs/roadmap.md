@@ -1328,10 +1328,15 @@ Progress:
   original's code does; the lot lies on the screen as the lot drawing has
   it. Catalogs load in the original's order, and the head turns as the
   simulation says.
-- Next: compare the standing loop; record the original's lighting (room
-  light, lamps, the standard light) and how far ours is from it. The base
-  layer's clip and phase are not simulation state yet, so the saved
-  record and the animator's clock stand in.
+- Done: the viewer runs a booted lot (`people-viewer --boot`, through
+  `sims_vm::boot::Lot`) and draws its people after each tick, including
+  people a script makes; it only reads the lot. A gated test runs the
+  Goths' lot to its end (tick 366 today) and draws everyone placed every
+  30 ticks.
+- Next: match the original's lighting (see its decisions entry); compare
+  Mortimer standing without his book. The base layer's clip and phase are
+  not simulation state yet, so the saved record and the animator's clock
+  stand in.
 
 ## Track: lot rendering (`crates/sims-render`)
 
