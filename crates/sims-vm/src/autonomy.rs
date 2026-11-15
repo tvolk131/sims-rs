@@ -134,7 +134,7 @@ pub(crate) mod person {
 }
 
 /// Interaction table entry flags.
-mod entry {
+pub(crate) mod entry {
     pub const VISITORS: u32 = 1;
     /// Ruled out for a child.
     pub const NOT_CHILD: u32 = 0x10;

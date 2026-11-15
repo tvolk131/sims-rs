@@ -475,6 +475,88 @@ fn go_to_routing_slot_numbers_its_slot_across_the_whole_chunk() {
     }
 }
 
+type GoTo = (Result<bool, sims_vm::Fault>, Vec<i32>, Vec<(u16, u16)>);
+
+/// Runs Go To Routing Slot as `me` on the lamp with operand words 0 and
+/// 1 and the tree's parameters `args`. The lamp's chunk is kinds 0, 3, 0,
+/// 1, 3, and the global file's SLOT 100 kinds 3, 0, 3. Returns the
+/// result, the slot numbers of the route contexts made and the keys of
+/// the slot flags kept.
+fn go_to(number: i16, source: i16, args: &[i16]) -> GoTo {
+    let (mut fx, me) = snapper(0);
+    let kinds = [0u16, 3, 0, 1, 3];
+    set_slots(
+        &mut fx,
+        kinds.iter().map(|&kind| Slot { kind, ..slot(0) }).collect(),
+    );
+    let global = fx.program.global;
+    fx.program.libraries.get_mut(&global).unwrap().slots.insert(
+        100,
+        [3u16, 0, 3]
+            .iter()
+            .map(|&kind| Slot { kind, ..slot(0) })
+            .collect(),
+    );
+    fx.lamp_mut().position = [56, 24, 1];
+    let [n0, n1] = number.to_le_bytes();
+    let [s0, s1] = source.to_le_bytes();
+    let guid = fx.world.objects[&me].guid;
+    let file = fx.catalog.object(guid).unwrap().resource;
+    fx.add(
+        file,
+        TREE,
+        tree(vec![ins(
+            45,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [n0, n1, s0, s1, 0, 0, 0, 0],
+        )]),
+    );
+    let result = fx.run_with(me, TREE, LAMP as i16, args, 1);
+    let numbers = fx
+        .world
+        .routing
+        .routes
+        .get(&me)
+        .map(|r| r.contexts.iter().map(|c| c.slot.number).collect())
+        .unwrap_or_default();
+    let keys = fx.world.routing.slot_flags.keys().copied().collect();
+    (result, numbers, keys)
+}
+
+#[test]
+fn go_to_routing_slot_names_its_slot_by_parameter_or_from_the_global_slots() {
+    // Source 0: routing slot 1 of the lamp, from parameter 2. The route
+    // stops at a step not ported for this person, after its context.
+    let (result, numbers, keys) = go_to(2, 0, &[0, 0, 1, 0]);
+    assert!(result.is_err());
+    assert_eq!((numbers, keys), (vec![5], vec![(LAMP, 1)]));
+    // Source 2: global routing slot 1, the chunk's entry 2, numbered 3;
+    // its flags are the lot's, kept under object 0.
+    let (result, numbers, keys) = go_to(1, 2, &[]);
+    assert!(result.is_err());
+    assert_eq!((numbers, keys), (vec![3], vec![(0, 1)]));
+}
+
+#[test]
+fn a_slot_named_past_its_table_or_from_no_table_fails() {
+    let native = |result: Result<bool, sims_vm::Fault>| {
+        assert_eq!(result.map_err(|f| f.trap.code()), Err(Some(0x25)));
+    };
+    // Global slot 2 does not exist; nor does a slot from parameter 0's
+    // value, 5; nor table 3.
+    native(go_to(2, 2, &[]).0);
+    native(go_to(0, 0, &[5]).0);
+    native(go_to(0, 3, &[]).0);
+    // A parameter past the frame's four reads memory the original does not
+    // bound; that fails loudly.
+    let fault = go_to(4, 0, &[]).0.unwrap_err();
+    assert!(
+        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("parameter 4 of 4")),
+        "{fault}"
+    );
+}
+
 /// The lamp's SLOT chunk: a routing slot that snaps into container slot
 /// `into`, then two container slots at its centre, at height 1.
 fn into_lamp(fx: &mut Fixture, into: i32) {

@@ -67,17 +67,24 @@
 //! with a slot record it makes from its operands instead of one of the
 //! object's slots ([`relative_slot`]).
 //!
-//! The slot is named by its index in the object's routing slot table,
-//! which holds only the SLOT entries of kind 3
-//! ([`crate::Program::routing_slot`]); none is native error 0x25.
+//! The slot is named by its index (operand word 0) in a routing slot
+//! table, which holds only the SLOT entries of kind 3. Operand word 1
+//! says which table and how (0x45ac22): 1, the object's
+//! ([`crate::Program::routing_slot`]) by the literal index; 0, the
+//! object's by the index in that parameter; 2, the lot's global routing
+//! slots ([`crate::Program::global_routing_slot`]) by the literal index,
+//! still placed by the stack object. A missing slot, or any other table,
+//! is native error 0x25. Flag 0x4000 is written into the lot's one copy
+//! of a global slot, shared by every object, kept here under
+//! [`GLOBAL_SLOTS`].
 //!
 //! A slot record an object holds in place of its type's (the move slot
 //! of the marker made to ask a person to move, `world.routing.slots`) is
 //! used instead of the type's slot.
 //!
 //! Ported from the original's code. What the Goth house's routes to
-//! update 438 do not reach fails loudly: slots named any way but by a
-//! literal, a stack object that is missing or off the lot in a later
+//! update 438 do not reach fails loudly: a parameter number past the
+//! frame's parameters, a stack object that is missing or off the lot in a later
 //! step, a person with bit 0 of word 68 set or other contexts, a person
 //! who wants to be interrupted, a person sitting (posture 1), no door to
 //! go through, giving up on a slot the route may end near (the failure
@@ -92,6 +99,10 @@ use crate::placement::stands_on_lot;
 use crate::routing::slot::{direction, new_context, route_slot};
 use crate::sounds::SoundEvent;
 use sims_sim::route::RouteSlot;
+
+/// The object ID under which the slot flags of the lot's global routing
+/// slots are kept: no object has it.
+pub(crate) const GLOBAL_SLOTS: u16 = 0;
 
 /// Object data words.
 const DIRECTION: usize = 1;
@@ -247,23 +258,48 @@ impl Machine<'_, '_> {
             return Ok(Flow::Branch(false));
         }
         let source = word(operands, 2);
-        if source != 1 {
-            return Err(unsupported(
-                "0x45ac2e",
-                &format!("naming its slot from source {source}"),
-            ));
-        }
-        let guid = self.world.objects[&target].guid;
-        let definition = self.definition(guid)?;
-        let index = usize::try_from(word(operands, 0)).ok();
-        let (entry, type_slot) = index
-            .and_then(|i| {
+        let number = word(operands, 0);
+        let (owner, index) = match source {
+            // Its number from a parameter (0x45ac2e). The original's bound
+            // check (0x45ac34) never fails, and reads past the parameters
+            // for a number out of their range.
+            0 => {
+                let parameters = &self.frame()?.parameters;
+                let index = usize::try_from(number)
+                    .ok()
+                    .and_then(|n| parameters.get(n).copied())
+                    .ok_or_else(|| {
+                        unsupported(
+                            "0x45ac5c",
+                            &format!(
+                                "naming its slot by parameter {number} of {}, past the \
+                                 parameters",
+                                parameters.len()
+                            ),
+                        )
+                    })?;
+                (target, index)
+            }
+            1 => (target, number),
+            // One of the lot's global routing slots (0x45acf0).
+            2 => (GLOBAL_SLOTS, number),
+            _ => return Err(Trap::native(0x25, "Go To Routing Slot names no slot")),
+        };
+        let (entry, type_slot) = if owner == GLOBAL_SLOTS {
+            usize::try_from(index)
+                .ok()
+                .and_then(|i| self.program.global_routing_slot(i))
+        } else {
+            let guid = self.world.objects[&target].guid;
+            let definition = self.definition(guid)?;
+            usize::try_from(index).ok().and_then(|i| {
                 self.program
                     .routing_slot(definition.resource, definition.chunk, i)
             })
-            .ok_or(Trap::native(0x25, "Go To Routing Slot names no slot"))?;
+        }
+        .ok_or(Trap::native(0x25, "Go To Routing Slot names no slot"))?;
         let type_slot = type_slot.clone();
-        let key = (target, word(operands, 0) as u16);
+        let key = (owner, index as u16);
         let near = |flags: i32| {
             if operands[4] & 1 == 0 {
                 flags | NEAR
