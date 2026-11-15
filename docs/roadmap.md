@@ -2104,7 +2104,11 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   Nice) in the subpanel, laid out as the original's bar maker does
   (0x51df31). The Goths' panel is pinned by digest, gated on
   `SIMS_INSTALL`; it is not yet compared with a screenshot, and the
-  zodiac sign under the bars is not drawn.
+  zodiac sign under the bars is not drawn. In the window, the
+  personality and needs panels show the selected Sim's live person data
+  and motives, through the ticks and after a press on another portrait
+  (`sims-game` tests `the_personality_panel_shows_the_selected_goths_traits`,
+  `the_needs_panel_follows_the_selected_goths_motives`).
 - **Done: the job panel's skills.** The Job button opens the selected
   Sim's six skill bars, with the labels of what the next level of
   their career needs underlined and a line marking how much (from
