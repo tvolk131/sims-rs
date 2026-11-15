@@ -1848,9 +1848,13 @@ Progress:
 - Next: compare a person behind furniture with the original; a person on
   an upper level stands at the floor, without the original's offset.
   Match the original's lighting (see its decisions entry); compare
-  Mortimer standing without his book. The base layer's clip and phase
-  are not simulation state yet, so the saved record and the animator's
-  clock stand in.
+  Mortimer standing without his book. The plumb bob over the selected
+  Sim (the head slot's object) is not drawn.
+- Done: a person's base layer is the simulation's (`World::base_layers`):
+  the posture's loop or a script's clip, at the phase the simulation
+  advanced it to. Over the Goths' first 3,400 ticks a person is seated
+  in 94 of 226 samples, which before were posed on the standing loop;
+  a full-weight foreground clip hides the difference in all of them.
 
 ## Track: lot rendering (`crates/sims-render`)
 

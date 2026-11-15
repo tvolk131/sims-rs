@@ -315,7 +315,7 @@ impl People {
                     .unwrap_or(0.0);
             }
             let base = base_clip(person, skeleton);
-            match player.pose(&body.skeleton, animator, &base) {
+            match player.pose(&body.skeleton, animator, world.base_layers.get(&id), &base) {
                 Ok(pose) => posed.push(Posed {
                     id,
                     level,
