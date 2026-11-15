@@ -191,7 +191,9 @@ impl Interpreter<'_> {
     /// house read does not let grow (`GROWN`); a person type with
     /// no skeleton in `people`; a person with no neighborhood record,
     /// for which the original makes one; and a person whose saved
-    /// animator the restore does not port (`crate::restore`).
+    /// animator the restore does not port (`crate::restore`), among them
+    /// every person whose type's scripts did not change since the save,
+    /// which load step 13 does not reset.
     ///
     /// Each person's animator is restored as far as the simulation reads
     /// it (`crate::restore`): what differs from
@@ -262,7 +264,11 @@ impl Interpreter<'_> {
         let mut held_poses = BTreeMap::new();
         for &id in &order {
             let restored = self
-                .restore_animator(id, &objects[&id])
+                .restore_animator(
+                    id,
+                    &objects[&id],
+                    world.changed_types.contains(&objects[&id].guid),
+                )
                 .map_err(|trap| fail(id, trap))?;
             if let Some(a) = restored.animator {
                 animators.insert(id, a);

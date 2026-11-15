@@ -11,6 +11,12 @@
 //!    foreground slot +0xc, the carry slot +0x13c and the base slot +0x14,
 //!    in that order. Each makes a layer in the skin ([`descriptor`]).
 //! 3. The routing state +0x190, which the reset sets to 3.
+//!
+//! Everything below assumes the person's reset in load step 13, which
+//! runs only when the person's type's scripts changed since the save
+//! ([`sims_sim::World::changed_types`]). On the Goth house and the Newbie
+//! house every person's type has; on the Pleasants' none has. A person
+//! the load does not reset fails ([`Interpreter::restore_animator`]).
 //! 4. The head: +0x210 the heading, +0x214 the target's heading, +0x218
 //!    the turn and +0x21c the target point; then the placement's
 //!    compensation (+0x8c, three floats).
@@ -126,10 +132,31 @@ impl Interpreter<'_> {
     /// Person `id`'s animator and held pose as the load leaves them
     /// (the module documentation). `object` is the person as read; the
     /// placement takes its position and its data word 1, the direction.
-    pub(crate) fn restore_animator(&self, id: u16, object: &Object) -> Result<Restored, Trap> {
+    /// `reset` says whether load step 13 resets the person: it does when
+    /// its type's scripts changed since the save
+    /// ([`sims_sim::World::changed_types`], `crate::visits`).
+    ///
+    /// A person the load does not reset fails: its animator keeps what
+    /// the read left (its clips play on in their slots, Animate Sim's
+    /// clip is still playing, its state stays the saved one, it stays
+    /// placed), which is not ported.
+    pub(crate) fn restore_animator(
+        &self,
+        id: u16,
+        object: &Object,
+        reset: bool,
+    ) -> Result<Restored, Trap> {
         let Some(person) = object.person.as_ref() else {
             return Ok(Restored::default());
         };
+        if !reset {
+            return Err(Trap::Unsupported(format!(
+                "person {id} is not reset by the load (its type's scripts are unchanged since \
+                 the save, 0x459bf6), so its animator keeps what the restore read (0x5918ba): \
+                 its clips play on and it stays in state {}; not ported",
+                person.routing_state
+            )));
+        }
         let floats = person.floats;
         if floats[6..].iter().any(|&v| v != 0.0) {
             return Err(Trap::Unsupported(format!(

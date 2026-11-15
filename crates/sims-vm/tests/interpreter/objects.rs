@@ -15,7 +15,8 @@ const STOOL: u32 = 0x5004;
 
 /// A cleared lot whose catalog has a chair (12 attributes, 3 dynamic
 /// sprites), two person types, and a stool whose definition asks for
-/// nothing.
+/// nothing. Both person types' scripts changed since the save, so load
+/// step 13 resets their people.
 fn lot() -> Fixture {
     let mut fx = Fixture::new();
     fx.world.objects.clear();
@@ -28,6 +29,7 @@ fn lot() -> Fixture {
     fx.add_type(CHILD, 2, 0, 4097);
     fx.add_type(STOOL, 4, 0, 4097);
     fx.world.neighbors = records(11);
+    fx.world.changed_types = [ADULT, CHILD].into();
     fx
 }
 
@@ -439,5 +441,23 @@ fn people_the_read_cannot_construct_fail_loudly() {
     let (_, cause) = trap(read(&mut fx, &file(vec![saved(3, ADULT)]), &people()));
     assert!(matches!(cause, Trap::Invalid(_)), "{cause:?}");
     // The stream and the files read are as they were.
+    assert_eq!(fx.world.encode(), before.encode());
+}
+
+#[test]
+fn a_person_the_load_does_not_reset_fails() {
+    // Load step 13 resets a person only when its type's scripts changed
+    // since the save; otherwise its animator keeps what the restore read,
+    // which is not ported.
+    let mut fx = lot();
+    fx.world.changed_types.remove(&CHILD);
+    let before = fx.world.clone();
+    let objects = file(vec![sim(3, ADULT), sim(2, CHILD)]);
+    let (object, cause) = trap(read(&mut fx, &objects, &people()));
+    assert_eq!(object, 2);
+    assert!(
+        matches!(&cause, Trap::Unsupported(text) if text.contains("not reset by the load")),
+        "{cause:?}"
+    );
     assert_eq!(fx.world.encode(), before.encode());
 }

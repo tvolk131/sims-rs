@@ -212,13 +212,24 @@ as the simulation reads it:
   seen (+0xa4) are kept; the reset clears +0xa0. The saved target point
   is not kept: nothing reads it before the measurement writes it.
 
-**Fails loudly:** a saved placement compensation other than 0 (+0x8c,
-which the placement adds) and a descriptor whose clip our content does
-not hold (the original makes no layer for a name its table lacks, which
-is not ruled out).
+**Only after a reset.** Everything above assumes the person is reset
+at step 13 of the load, which happens only when its type's scripts
+changed since the save (`World::changed_types`, 0x459bf6). On the Goth
+and Newbie houses every person's type changed; on the Pleasants none
+did, so their people keep what the restore read: the foreground clip
+plays on from its saved phase (person 242's fidget ends at update 13 in
+the capture), the person stays in its saved routing state (0, 4 or 9)
+and its saved route contexts stay. That live restore is not ported, so
+a person the load does not reset fails loudly.
+
+**Fails loudly:** a person the load does not reset, a saved placement
+compensation other than 0 (+0x8c, which the placement adds) and a
+descriptor whose clip our content does not hold (the original makes no
+layer for a name its table lacks, which is not ruled out).
 
 **Against the capture** (`house06-pleasants-ticks-20261115`, entry 0,
-the frame before tick 1): person 242's heading, target heading and turn
+the frame before tick 1), measured with the reset assumed for the
+Pleasants' people, before the check above: person 242's heading, target heading and turn
 are bit for bit the original's, and so are two of the three coordinates
 of its target, the top of person 241's head. The third, the height, is
 one unit in the last place off (0x4187338d here, 0x4187338e there); the
@@ -229,11 +240,10 @@ in the capture.
 **Strict runs.** The Goth and Newbie states are unchanged but for the
 new field: by tick 33 every Goth's skin has sampled a layer, and the
 pins' format-27 encodings equal the old hashes. The Newbie at tick 1802
-is the same. The Pleasants now stop at tick 1: person 117 was saved
-part way through a route, and the save keeps a count of its route
-contexts (0x460443, each context read by a no-op, 0x5fe4ae) that the
-load does not make yet. UserData2's house 9 gets past its first frame
-and stops at tick 232 on Snap mode 0 (0x4549c7).
+is the same. The Pleasants now stop at the load, on person 117, the
+first person whose type did not change. UserData2's house 9 (whose
+people are all reset) gets past its first frame and stops at tick 232
+on Snap mode 0 (0x4549c7).
 
 ## 2026-11-15: Four types keep more saved attributes than their constructor allocates
 

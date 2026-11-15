@@ -93,12 +93,12 @@ events, and what it asks for after them) come first.
   again who is a visitor, and reading the people raises the action
   serial. Their load equals the capture's but for one person's data word
   50 and last result, which something in the original's load sets and
-  which is not found yet. The load restores each person's animator and
-  the pose its saved layers left in the skin (0x5918ba), so the first
-  frame matches the capture (person 242's head angles bit for bit; its
-  target's height one unit in the last place off). Tick 1 then stops:
-  person 117 was saved part way through a route, and the load does not
-  yet make the route contexts the save counts (0x460443).
+  which is not found yet. The load restores a reset person's animator
+  and the pose its saved layers left in the skin (0x5918ba). But no
+  Pleasant's type changed since the save, so the load resets none of
+  them and their animators keep what the restore read: clips playing on
+  from their saved phase, saved routing states and route contexts. That
+  is not ported, so the load stops on person 117.
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
   read their arrays whole (Arry 11, 12, 111 and 112). Their floor
