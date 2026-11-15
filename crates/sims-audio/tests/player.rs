@@ -1,8 +1,8 @@
 //! The HIT player on hand-built modules and samples.
 
-use sims_audio::levels;
 use sims_audio::module::Module;
-use sims_audio::player::{BLOCK, NoSources, Player, RATE, Sources};
+use sims_audio::placement::Projection;
+use sims_audio::player::{BLOCK, MIDDLE, NoSources, Player, RATE, Sources};
 use sims_audio::sources::Snapshot;
 use sims_audio::{Pcm, SoundEvent};
 use std::collections::BTreeMap;
@@ -243,6 +243,10 @@ impl Sources for Gender {
     fn position(&self, _: i32) -> Option<[i32; 3]> {
         Some([1, 1, 1])
     }
+
+    fn projection(&self, _: i32) -> Option<Projection> {
+        Some(MIDDLE)
+    }
 }
 
 #[test]
@@ -288,6 +292,7 @@ fn a_refused_field_leaves_the_register_and_is_a_fault() {
     let mut snapshot = Snapshot::default();
     snapshot.objects.insert(9, [5; sims_audio::sources::FIELDS]);
     snapshot.positions.insert(9, [1, 1, 1]);
+    snapshot.screen.insert(9, MIDDLE);
     for (field, plays, faults) in [(21, true, 1), (20, false, 0)] {
         let code = routine(field);
         let mut player = Player::new(vec![module(&[&code, &[END]], 1)], samples(), 1);
@@ -435,6 +440,10 @@ impl Sources for Asked {
 
     fn position(&self, _: i32) -> Option<[i32; 3]> {
         Some([1, 1, 1])
+    }
+
+    fn projection(&self, _: i32) -> Option<Projection> {
+        Some(MIDDLE)
     }
 }
 
@@ -724,8 +733,8 @@ fn seqgroup_kill_stops_a_holder_whose_extvol_is_0_at_once() {
 
 #[test]
 fn seqgroup_kill_fades_out_the_holder_then_runs_on() {
-    // e0 claims group 1, waits until its extvol (19) reaches fade_dest
-    // (1, register 8 here), then plays patch 1.
+    // e0 claims group 1, waits until its extvol (19) is 1 (register 8
+    // here), then plays patch 1.
     let mut holder = loadb(5, 1).to_vec();
     holder.extend([SEQGROUP_RETURN, 5]);
     holder.extend(loadb(8, 1));
@@ -741,16 +750,14 @@ fn seqgroup_kill_fades_out_the_holder_then_runs_on() {
     let out = player.render_until_idle(20 * BLOCK, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     // e1 waits 2 ms, so it plays from the second block. e0's extvol falls
-    // by 200 a block from 1024, reaching 1 in the seventh block; then its
-    // note plays at extvol 1 of 1024: -39.97 dB, about a hundredth.
+    // by 200 a block from 1024 to fade_dest, which starts at 0, passing
+    // over 1. e1's second try (0x57eef3) finds the group its own and runs
+    // on, so nothing ends e0: it stays, silent, waiting for an extvol it
+    // has passed.
     assert!(out[..BLOCK].iter().all(|&s| s == 0));
     assert_eq!(&out[BLOCK..BLOCK + 3], [2000, 4000, -2000]);
-    assert!(out[BLOCK + 3..6 * BLOCK].iter().all(|&s| s == 0));
-    let gain = i64::from(levels::gain(levels::attenuation(1, 1024)));
-    assert_eq!(levels::attenuation(1, 1024), -3997);
-    let faint: Vec<i16> = (1..=100).map(|s| ((s * gain) >> 16) as i16).collect();
-    assert_eq!(&out[6 * BLOCK..6 * BLOCK + 100], &faint);
-    assert!(player.is_idle());
+    assert!(out[BLOCK + 3..].iter().all(|&s| s == 0));
+    assert!(!player.is_idle());
 }
 
 #[test]
@@ -1402,6 +1409,7 @@ fn on_lot(objects: &[i32]) -> Snapshot {
     let mut snapshot = Snapshot::default();
     for &object in objects {
         snapshot.positions.insert(object, [40, 56, 1]);
+        snapshot.screen.insert(object, MIDDLE);
     }
     snapshot
 }

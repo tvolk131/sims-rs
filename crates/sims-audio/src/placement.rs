@@ -21,11 +21,14 @@
 //!   (register 57) is 0, and when it is not, works them out from where
 //!   the object is on the screen ([`project`]).
 //!
-//! No script in the install writes `Spl`, and a track starts with it 0,
-//! so in the original every object that is on the lot is placed at full
-//! volume in the centre, whatever the camera. Screen positions are only
-//! needed for a script that sets `Spl`; [`Projection`] is what it would
-//! need.
+//! A track's `Spl` starts at 20, `spl_normal` (the default bank at
+//! 0x6f6898, `crate::player::DEFAULTS`), and no script in the install
+//! writes it, so every object on the lot is placed from where it is on
+//! the screen: the host gives a [`Projection`] for each. At the far zoom
+//! a sound loses 560 of its 1024 and at the medium 280; the pan follows
+//! how far across the screen the object is, and the volume fades for an
+//! object off the middle of the screen and drops to three fifths for one
+//! on a floor the view does not show.
 //!
 //! The sum (0x57473b) takes the loudest volume, and the pan of each
 //! object weighted by its volume, in 32-bit arithmetic that wraps. The
@@ -61,7 +64,7 @@ pub const CENTRE: i32 = 512;
 pub const STALE_VOL: i32 = 1024;
 
 /// Where an object is on the screen, as the placement reads it when a
-/// track's `Spl` is not 0.
+/// track's `Spl` is not 0 (which it starts as).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Projection {
     /// The object's position on the screen, in pixels (0x570e09, through
@@ -69,7 +72,7 @@ pub struct Projection {
     pub at: [i32; 2],
     /// The screen's width and height (0x570c23).
     pub screen: [i32; 2],
-    /// The zoom (0x570c11): 1 near to 3 far.
+    /// The zoom (0x570c11): 1 far, 2 medium, 3 near.
     pub zoom: i32,
     /// The level the view shows (0x570c39).
     pub shown_level: i32,

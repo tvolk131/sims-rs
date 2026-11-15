@@ -4,7 +4,7 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
-## 2026-11-15: A sound's volume and pan come from where its objects are, not from the screen
+## 2026-11-15: A sound's volume and pan come from where its objects are on the screen
 
 Kinds 1 (for a `kArgsIdVolPan` track) and 30 now set the track's
 `extvol` and `pan` from every object recorded for it, as the original
@@ -13,16 +13,29 @@ does after starting it (0x573795 to 0x5737a4, 0x573d5d to 0x573d6e), in
 (0x57473b) takes the loudest volume and the volume-weighted pan, in
 32-bit arithmetic that wraps.
 
-The placement only uses the screen when the track's `Spl` (register 57)
-is not 0. Spl starts at 0, and no script in the install writes it, so
-every object on the lot is placed at full volume (1024) in the centre
-(512), whatever the camera. So the game needs no screen positions: it
-sends each object's position (`sims_sim::Object::position`, the
-original's +0xf8, +0xf4 and +0x110) with the `getsrcdatafield` answers
-(`Snapshot::positions`). `Sources::projection` is what a script that
-sets `Spl` would need; the screen math is ported (`placement::project`)
-but untested against the game, and without a projection such a track's
-placement is a fault.
+The placement uses the screen when the track's `Spl` (register 57) is
+not 0. `Spl` starts at 20, `spl_normal`, from the default bank for
+registers 50 to 62 (0x6f6898, filled at 0x57c83a to 0x57c97b), and no
+script in the install writes it, so every placed object's volume and pan
+come from the screen: the pan from how far across it the object is, the
+volume from the zoom (the far zoom takes 560 of 1024 away, the medium
+280), less off the middle of the screen, and three fifths of that on a
+floor the view does not show (`placement::project`). The game sends
+each object's position (`sims_sim::Object::position`, the original's
++0xf8, +0xf4 and +0x110; `Snapshot::positions`) and its place on the
+screen with the zoom, the screen's size and the floor shown
+(`Snapshot::screen`, from `sims_game::sound::screen`), again whenever
+the camera changes. The place on the screen is the original's (0x570e09):
+the position rotated into the view about 1023, not the drawing's 1024,
+projected, and cut to 16 bits. Its projection (0x4a9dc7) also raises the
+point by the ground under it, which is left out (**unverified** on a lot
+that is not flat). Without a place on the screen the placement is a
+fault.
+
+The same bank corrects three defaults the player had wrong: register 39
+(`BufSizeMult`) starts at 1 and 52 (`tempo`) at 120, and 40
+(`fade_dest`) at 0, not 1. So a `seqgroup_kill` (0x57eef3), which fades
+the holder without setting `fade_dest`, now fades it to 0, not 1.
 
 What the original does with an object it cannot place is kept: an ID
 that names no object, or an object with a first or second coordinate

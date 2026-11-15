@@ -1989,9 +1989,9 @@ stop-sounds events.
   personality and motive 3, the hour, the size of the object's room),
   read from the lot between ticks (`sims_game::sound::sources`).
 - **Done: where a sound's objects are.** Kinds 1 and 30 set a track's
-  volume and pan from its objects' positions (0x5730b6, 0x57473b), which
-  the game sends with the answers. The screen only matters for a track
-  whose `Spl` is set, which no script does.
+  volume and pan from where its objects are on the screen (0x5730b6,
+  0x57473b, 0x570e09), which the game sends with the answers, from its
+  camera.
 - **Next:**
   - The piano (43) and the music half of the music modes (36). 103 and
     104 are debug commands. Placing the tracks again when the camera
@@ -2185,12 +2185,6 @@ through their public interfaces only; the simulation never depends on it.
   - `sims-people`: the selected Sim's head as an image, which the
     original renders live into the pie's face bitmap; the middle of the
     pie is empty until then.
-  - `sims-audio`: the inputs the game cannot give yet (the camera
-    value of the ambience's cursor, 0x570c3e, is ported, #160): what
-    the sound scripts' `getsrcdatafield` fields are (`sims-game`
-    answers 0 to every one; an object's place on screen, for its pan,
-    is presumably among them, unread), and what pausing the game does
-    to the sounds playing (the pause events are not ported).
 
 ## Working rules
 

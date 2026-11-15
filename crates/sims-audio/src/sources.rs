@@ -39,6 +39,7 @@
 //! The snapshot also holds where each object is, which the placement
 //! reads for a sound's volume and pan ([`crate::placement`]).
 
+use crate::placement::Projection;
 use crate::player::Sources;
 use std::collections::BTreeMap;
 
@@ -57,6 +58,9 @@ pub struct Snapshot {
     /// Each object's position (`sims_sim::Object::position`), by object
     /// ID. An ID not here names no object.
     pub positions: BTreeMap<i32, [i32; 3]>,
+    /// Where each object is on the screen, with the view, by object ID
+    /// ([`Sources::projection`]).
+    pub screen: BTreeMap<i32, Projection>,
 }
 
 /// Field 13's answer for no object or no room (0x570fba).
@@ -70,6 +74,7 @@ impl Default for Snapshot {
             objects: BTreeMap::new(),
             absent,
             positions: BTreeMap::new(),
+            screen: BTreeMap::new(),
         }
     }
 }
@@ -88,5 +93,9 @@ impl Sources for Snapshot {
 
     fn position(&self, object: i32) -> Option<[i32; 3]> {
         self.positions.get(&object).copied()
+    }
+
+    fn projection(&self, object: i32) -> Option<Projection> {
+        self.screen.get(&object).copied()
     }
 }

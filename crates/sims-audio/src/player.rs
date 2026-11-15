@@ -207,9 +207,13 @@ pub const ISPLAYING: u8 = 46;
 /// `Spl`, which the placement reads ([`crate::placement`]).
 pub const SPL: u8 = 57;
 /// A new thread's registers that do not start at 0, as the original's
-/// default register bank holds them: `priority`, `vol`, `extvol`, `pan`,
-/// `pitch`, `MinDistance`, `MaxDistance` and `fade_dest`.
-pub const DEFAULTS: [(u8, i32); 8] = [
+/// default register banks hold them (written at 0x57c83a to 0x57c97b):
+/// `priority`, `vol`, `extvol`, `pan`, `pitch`, `MinDistance`,
+/// `MaxDistance`, `BufSizeMult`, `tempo` and `Spl`. A fresh start copies
+/// both banks into the track's registers 17 to 47 and 50 to 62
+/// (0x57da3a to 0x57da87); a register never written reads the bank's
+/// value too (0x5802cf).
+pub const DEFAULTS: [(u8, i32); 10] = [
     (17, 32),
     (18, 1024),
     (EXTVOL, 1024),
@@ -217,8 +221,12 @@ pub const DEFAULTS: [(u8, i32); 8] = [
     (21, 3600),
     (28, 100),
     (29, 10000),
-    (FADE_DEST, 1),
+    (39, 1),
+    (52, 120),
+    (SPL, SPL_NORMAL),
 ];
+/// `Spl`'s default, the HSM files' `spl_normal`.
+pub const SPL_NORMAL: i32 = 20;
 /// Registers with side effects: `vol`, `duckpri`, 3D, `target` and the
 /// global `main_duckpri`.
 pub const VOL: u8 = 18;
@@ -316,13 +324,11 @@ pub trait Sources {
     /// an ID that names no object.
     fn position(&self, object: i32) -> Option<[i32; 3]>;
 
-    /// Where an object is on the screen. Only asked for a track whose
-    /// `Spl` (register 57) is not 0, which no script in the install sets,
-    /// so a host need not give it; without it such a track's placement is
-    /// a fault.
-    fn projection(&self, _object: i32) -> Option<Projection> {
-        None
-    }
+    /// Where an object is on the screen, with the view: asked for a
+    /// track whose `Spl` (register 57) is not 0, which is every track,
+    /// since `Spl` starts at 20 and no script writes it. Without it the
+    /// placement is a fault, and the track keeps its `extvol` and `pan`.
+    fn projection(&self, object: i32) -> Option<Projection>;
 }
 
 /// *(code)* Writes a starting track's argument registers 1 to 3, as the
@@ -337,8 +343,17 @@ fn set_arguments(thread: &mut Thread, args: [u32; 3]) {
 }
 
 /// Answers 0 to every field, and has every object on the lot, at 1, 1
-/// on the ground floor.
+/// on the ground floor, in the middle of an 800 by 600 screen at the
+/// near zoom: where the placement gives full volume in the centre.
 pub struct NoSources;
+
+/// Where [`NoSources`] has every object on the screen.
+pub const MIDDLE: Projection = Projection {
+    at: [400, 300],
+    screen: [800, 600],
+    zoom: 3,
+    shown_level: 1,
+};
 
 impl Sources for NoSources {
     fn field(&self, _: i32, _: i32) -> Option<i32> {
@@ -347,6 +362,10 @@ impl Sources for NoSources {
 
     fn position(&self, _: i32) -> Option<[i32; 3]> {
         Some([1, 1, 1])
+    }
+
+    fn projection(&self, _: i32) -> Option<Projection> {
+        Some(MIDDLE)
     }
 }
 
@@ -969,7 +988,10 @@ impl<S: Samples> Player<S> {
 
     /// The objects of a track and its `Spl`, as the sum over them
     /// (0x57473b) reads them: before the start. `Spl` is read from the
-    /// track's newest thread, through its `target`; 0 when none runs.
+    /// track's newest thread, through its `target`. When none runs it is
+    /// [`SPL_NORMAL`]: the original's track keeps its last run's
+    /// registers, and before its first run reads the default, but no
+    /// script writes `Spl`.
     fn placing(&self, track: u32) -> Placing {
         let objects = self
             .instances
@@ -982,7 +1004,7 @@ impl<S: Samples> Player<S> {
             .chain(&self.pending)
             .filter(|t| t.track == track)
             .max_by_key(|t| t.id)
-            .map_or(0, |t| self.read(t, i64::from(SPL)));
+            .map_or(SPL_NORMAL, |t| self.read(t, i64::from(SPL)));
         Placing {
             objects,
             spl,

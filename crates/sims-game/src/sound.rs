@@ -25,26 +25,27 @@
 //! goes, and `SoundEvent::StopAll` stops everything at once.
 //!
 //! What the sound scripts ask about an object (`getsrcdatafield`), and
-//! where each object is, are read from the lot between ticks
-//! ([`sources`]) and sent as a [`Snapshot`]. Where an object is sets the
-//! volume and pan of the sounds started for it (kinds 1 and 30;
-//! `sims_audio::placement`). The original works them out from the
-//! object's place on the screen only for a track whose `Spl` register is
-//! not 0, and no script in the install sets it: every object on the lot
-//! plays at full volume in the centre, whatever the camera. So the game
-//! sends no screen positions (`sims_audio::player::Sources::projection`
-//! is left unanswered).
+//! where each object is on the lot and on the screen, are read between
+//! ticks ([`sources`] and [`screen`]; `Game::sound_sources` gives both)
+//! and sent as a [`Snapshot`], again whenever they change, the camera
+//! too. Where an object is sets the volume and pan of the sounds started
+//! for it (kinds 1 and 30; `sims_audio::placement`): every track's `Spl`
+//! register starts at 20 and no script changes it, so the original works
+//! them out from the object's place on the screen, the zoom and the floor
+//! shown.
 
 use sims_audio::SoundEvent;
 use sims_audio::files::SoundFiles;
 use sims_audio::module::Module;
+use sims_audio::placement::Projection;
 use sims_audio::player::Player;
 use sims_audio::sources::{FIELDS, NO_ROOM, Snapshot};
 use sims_audio::stations::StationLists;
 use sims_core::F32;
+use sims_render::camera::Camera;
 use sims_sim::World;
 use sims_ui::command::Speed;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// The register the sound scripts read the game's speed from.
@@ -145,7 +146,48 @@ pub fn sources(world: &World) -> Snapshot {
         objects,
         absent,
         positions,
+        screen: BTreeMap::new(),
     }
+}
+
+/// Where each object on the lot is on a screen `size` pixels wide and
+/// high, through `camera`, as the original's sound code asks the view
+/// (0x570e09): the object's fine position rotated into the view about
+/// 1023, not the drawing's 1024 (0x47bc1f), then projected on its level
+/// and cut to 16 bits each way. The original's projection (0x4a9dc7)
+/// also raises the point by the ground under it; that is left out, which
+/// only moves it up or down (**unverified** on a lot that is not flat).
+/// Empty for a camera so far off that its arithmetic would overflow,
+/// which no view the controls make comes near.
+pub fn screen(world: &World, camera: &Camera, size: [i32; 2]) -> BTreeMap<i32, Projection> {
+    if camera.origin.iter().any(|n| n.unsigned_abs() >= 1 << 26) {
+        return BTreeMap::new();
+    }
+    let m = 1023;
+    world
+        .objects
+        .values()
+        .filter(|object| object.id > 0)
+        .map(|object| {
+            let [x, y, level] = object.position.map(i32::from);
+            let rotated = match camera.rotation & 3 {
+                1 => [m - y, x],
+                2 => [m - x, m - y],
+                3 => [y, m - x],
+                _ => [x, y],
+            };
+            let at = camera
+                .project_fine(rotated, level, 0)
+                .map(|n| i32::from(n as i16));
+            let view = Projection {
+                at,
+                screen: size,
+                zoom: camera.zoom.level() as i32,
+                shown_level: camera.level,
+            };
+            (i32::from(object.id), view)
+        })
+        .collect()
 }
 
 /// The sound scripts' speed register for the game's speed (unverified).

@@ -535,6 +535,58 @@ fn the_sound_scripts_learn_about_the_goths() {
 }
 
 #[test]
+fn the_sound_scripts_see_the_goths_where_the_camera_shows_them() {
+    use sims_audio::placement;
+    use sims_audio::player::{SPL_NORMAL, Sources};
+    use sims_game::view::Move;
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    while game.view.camera.rotation != 0 {
+        game.apply(Move::Rotate(true));
+    }
+    let snapshot = game.sound_sources();
+    let camera = game.view.camera;
+    let world = game.lot().world();
+    let objects: Vec<(u16, &sims_sim::Object)> = world
+        .objects
+        .iter()
+        .filter(|(id, _)| **id > 0)
+        .map(|(&id, o)| (id, o))
+        .collect();
+    assert_eq!(snapshot.screen.len(), objects.len());
+    // Unturned, the sound's projection is the drawing's, for the object's
+    // place on the floor.
+    for &(id, object) in &objects {
+        let [x, y, level] = object.position.map(i32::from);
+        let view = snapshot.projection(i32::from(id)).unwrap();
+        assert_eq!(
+            view.at,
+            camera.project_fine([x, y], level, 0),
+            "object {id}"
+        );
+        assert_eq!(view.screen, [800, 600]);
+        assert_eq!(view.zoom, camera.zoom.level() as i32);
+        assert_eq!(view.shown_level, camera.level);
+    }
+    // The Goths are on the screen at the far zoom the house opens at,
+    // where a track's sounds lose 560 of their 1024; nearer, less.
+    let people: Vec<u32> = objects
+        .iter()
+        .filter(|(_, o)| o.person.is_some())
+        .map(|&(id, _)| u32::from(id))
+        .collect();
+    let far = placement::combine(&people, SPL_NORMAL, &snapshot).unwrap();
+    assert!(far.0 <= 1024 - 560, "{far:?}");
+    assert!((0..=1024).contains(&far.1), "{far:?}");
+    game.apply(Move::ZoomIn);
+    let medium = placement::combine(&people, SPL_NORMAL, &game.sound_sources()).unwrap();
+    assert!(medium.0 > far.0, "{medium:?} {far:?}");
+}
+
+#[test]
 fn a_press_on_a_portrait_selects_that_goth() {
     let Some(install) = install() else {
         return;

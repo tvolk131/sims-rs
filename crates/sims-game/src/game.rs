@@ -17,6 +17,7 @@ use crate::menu::{self, Listing, Menu};
 use crate::pace::Pace;
 use crate::people::People;
 use crate::pick;
+use crate::sound;
 use crate::view::{Move, View};
 use sims_render::{Canvas, Selected, Walls, open_house};
 use sims_ui::command::{Camera as UiCamera, Command, Walls as UiWalls};
@@ -176,6 +177,16 @@ impl Game {
             let tile = camera.unrotate_tile(tile.map(i32::from));
             world.outside(level, tile).unwrap_or(false)
         })
+    }
+
+    /// What the sound scripts may ask about the lot's objects, with where
+    /// each is on the screen as the camera shows it now
+    /// ([`sound::sources`], [`sound::screen`]).
+    pub fn sound_sources(&self) -> sims_audio::sources::Snapshot {
+        let world = self.lot.world();
+        let mut snapshot = sound::sources(world);
+        snapshot.screen = sound::screen(world, &self.view.camera, self.view.size);
+        snapshot
     }
 
     /// Why the lot stopped, if it has.

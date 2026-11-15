@@ -298,7 +298,7 @@ impl App {
         // What the tick's sounds may ask about their objects, before the
         // sounds themselves. Read on every call, not only after a step
         // that succeeded: a failed step may still have changed the lot.
-        let sources = sound::sources(self.game.lot().world());
+        let sources = self.game.sound_sources();
         if self.told.as_ref() != Some(&sources) {
             self.sound.send(Input::Sources(sources.clone()));
             self.told = Some(sources);
