@@ -1,6 +1,7 @@
 //! The interpreter against synthetic trees and a synthetic lot. No game
 //! data.
 
+mod action_string;
 mod animate;
 mod autonomy;
 mod budget;

@@ -311,7 +311,12 @@ pub struct Budget {
     pub lot_value: i32,
     pub objects_value: i32,
     pub architecture_value: i32,
-    /// Recent days' budget entries; None marks a day with no entry.
+    /// The daily budget entries, eight categories each, in the save's
+    /// order, which the load keeps (0x46d1e4): today's first (simulator
+    /// +0x184, which spending adds to, 0x46d91c), then yesterday and the
+    /// four days before it (+0xe4 on). None is a day the save marked with
+    /// flag 0; the original then reads seven words for it (0x46d270),
+    /// which the parser does not. Empty until a save is read.
     pub days: Vec<Option<[i32; 8]>>,
 }
 

@@ -442,20 +442,10 @@ fn a_named_tree_a_check_tree_runs_may_change_its_advertisements() {
 }
 
 #[test]
-fn the_primitives_check_trees_use_fail_loudly_elsewhere() {
-    // Add/Change Action String outside a check tree names the running
-    // interaction, which is not ported.
-    let mut fx = lot(0x100);
-    fx.add(
-        SIM_FILE,
-        CHOOSE,
-        tree(vec![ins(50, RETURN_TRUE, RETURN_TRUE, [0; 8])]),
-    );
-    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
-    assert!(fault.to_string().contains("0x41f1ae"), "{fault}");
+fn the_advertisement_scopes_fail_loudly_before_the_first_copy() {
     // The advertisement scopes before Find Best Interaction first copies
-    // into the record.
+    // into the record. (Add/Change Action String outside a check tree is
+    // in action_string.rs.)
     let mut fx = lot(0x100);
     fx.add(
         SIM_FILE,

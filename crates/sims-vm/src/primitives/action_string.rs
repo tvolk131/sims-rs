@@ -17,7 +17,11 @@
 //!   [`crate::orders`].
 //! - otherwise, if the byte 0x6c4d6c is set and the object is a person,
 //!   the string names the person's running interaction (0x41f1ae on
-//!   person +0xa48).
+//!   person +0xa48): the name goes to the action's +0x28 and its flag
+//!   0x80 (+0x40) is set. The byte is 1 in the memory image and only the
+//!   synchronous run (0x4749b5) changes it: it clears it for the run and
+//!   puts it back after (0x474a37, 0x474ad0). So it is set in a thread's
+//!   run and clear in any tree run at once.
 //!
 //! It always takes the true branch.
 //!
@@ -33,36 +37,38 @@
 //! (the three pointers were 0 in a memory image of the original at its
 //! first call), and the synchronous run (0x4749b5) clears 0x6c4d6c, so the
 //! string is dropped. There the string is not looked up or formatted;
-//! whether that can fail on some strings is **unverified**. Anywhere else
-//! the primitive fails loudly. A string the file lacks fails loudly too:
-//! what the original makes of the empty string pointer 0x4704fa returns
-//! for it is not read. The old prototype's `change_action_string`
-//! (legacy/crates/sims-vm/src/person.rs) reads the code the same way.
+//! whether that can fail on some strings is **unverified**.
+//!
+//! In a thread's run the person's running action ([`sims_sim::Object`]'s
+//! `person.active`) takes flag 0x80. Its name is not kept, as no action's
+//! name is here (the save holds none either), so the string is looked up
+//! but not formatted: the formatted string goes only to the name.
+//! **Unverified**: that no formatting pass changes anything but the
+//! string and the four argument words. Another object's thread does
+//! nothing more than the lookup.
+//!
+//! Any other tree run at once fails loudly: the original drops the string
+//! there too, but which of the port's runs at once are the original's
+//! synchronous run has not been checked one by one. A string the file
+//! lacks fails loudly: what the original makes of the empty string pointer
+//! 0x4704fa returns for it is not read. The old prototype's
+//! `change_action_string` (legacy/crates/sims-vm/src/person.rs) reads the
+//! code the same way.
 
 use crate::autonomy::checked;
 use crate::fault::Trap;
 use crate::interpreter::Machine;
 use crate::orders::MenuEntry;
 
+/// The running action's flag 0x41f1ae sets when it names the action
+/// (+0x40, 0x41f1bd).
+const NAMED: u32 = 0x80;
+
 impl Machine<'_, '_> {
     pub(crate) fn action_string(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
         if let Some(menu) = self.menu {
-            let table = u16::from_le_bytes([operands[0], operands[1]]);
-            let index = operands[4];
             let frame = self.frame()?;
-            let owner = self.owner(frame)?;
-            let name = self
-                .program
-                .libraries
-                .get(&owner)
-                .and_then(|library| library.strings.get(&table))
-                .and_then(|strings| strings.get(usize::from(index).checked_sub(1)?))
-                .ok_or_else(|| {
-                    Trap::Unsupported(format!(
-                        "Add/Change Action String names string {index} of table {table}, which \
-                         the running code's file lacks (0x4704fa)"
-                    ))
-                })?;
+            let name = self.action_name(operands)?;
             if name.contains('$') {
                 return Err(Trap::Unsupported(format!(
                     "Add/Change Action String's string {name:?}, whose tokens the formatter \
@@ -71,7 +77,6 @@ impl Machine<'_, '_> {
             }
             // The formatter leaves the first argument 0 (0x44cca3).
             let args = [frame.stack_object, 0, 0, 0];
-            let name = name.clone();
             let mut checking = menu.borrow_mut();
             let mut action = checking.action.clone();
             action.flags = (action.flags | checked::RAN | checked::PASSED) & !checked::MARKED;
@@ -82,13 +87,43 @@ impl Machine<'_, '_> {
             });
             return Ok(true);
         }
-        if !self.checking {
+        if self.checking {
+            return Ok(true);
+        }
+        if self.synchronous {
             return Err(Trap::Unsupported(
-                "Add/Change Action String outside autonomy's check trees, where it names the \
-                 running interaction (0x41f1ae)"
+                "Add/Change Action String in a tree run at once other than autonomy's check \
+                 trees; the synchronous run clears 0x6c4d6c (0x474a37), but which of these \
+                 runs are the original's 0x4749b5 is not checked"
                     .into(),
             ));
         }
+        // A thread's run, with 0x6c4d6c set: the string names the
+        // person's running interaction, which sets its flag 0x80.
+        self.action_name(operands)?;
+        if let Some(person) = self.me_mut()?.person.as_mut() {
+            person.active.flags |= NAMED;
+        }
         Ok(true)
+    }
+
+    /// String `byte 4` (counted from 1) of the string table `word 0` in
+    /// the running code's file (0x4704fa), unformatted.
+    fn action_name(&self, operands: &[u8; 8]) -> Result<String, Trap> {
+        let table = u16::from_le_bytes([operands[0], operands[1]]);
+        let index = operands[4];
+        let owner = self.owner(self.frame()?)?;
+        self.program
+            .libraries
+            .get(&owner)
+            .and_then(|library| library.strings.get(&table))
+            .and_then(|strings| strings.get(usize::from(index).checked_sub(1)?))
+            .cloned()
+            .ok_or_else(|| {
+                Trap::Unsupported(format!(
+                    "Add/Change Action String names string {index} of table {table}, which the \
+                     running code's file lacks (0x4704fa)"
+                ))
+            })
     }
 }
