@@ -41,7 +41,7 @@ pub fn placeable() -> (Fixture, usize) {
     (fx, file)
 }
 
-fn widget(fx: &mut Fixture) -> u16 {
+pub fn widget(fx: &mut Fixture) -> u16 {
     sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream)
         .create(&mut fx.world, WIDGET)
         .unwrap()
@@ -67,7 +67,7 @@ fn run(
     fx.run_with(LAMP, 4096, stack_object, &[], 1000)
 }
 
-fn find(fx: &mut Fixture, local: i16, target: u16, flags: u8) -> Result<bool, sims_vm::Fault> {
+pub fn find(fx: &mut Fixture, local: i16, target: u16, flags: u8) -> Result<bool, sims_vm::Fault> {
     run(
         fx,
         local,

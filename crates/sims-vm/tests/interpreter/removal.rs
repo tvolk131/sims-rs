@@ -131,7 +131,7 @@ fn a_missing_object_is_the_false_branch() {
 }
 
 #[test]
-fn objects_that_need_the_lot_to_leave_it_fail_loudly() {
+fn objects_off_the_lot_that_need_more_fail_loudly() {
     let unsupported = |prepare: fn(&mut Fixture, usize)| {
         let (mut fx, file) = two();
         fx.add(file, 4200, remover(1, 0));
@@ -140,8 +140,6 @@ fn objects_that_need_the_lot_to_leave_it_fail_loudly() {
         assert!(matches!(fault.trap, Trap::Unsupported(_)), "{fault}");
         assert!(fx.world.removals.is_empty());
     };
-    // Standing on the lot.
-    unsupported(|fx, _| fx.world.objects.get_mut(&4).unwrap().position = [24, 24, 1]);
     // In a container.
     unsupported(|fx, _| fx.world.objects.get_mut(&4).unwrap().data[2] = 3);
     // Holding something.
@@ -169,4 +167,85 @@ fn objects_that_need_the_lot_to_leave_it_fail_loudly() {
     let mut fx = Fixture::new();
     fx.add(LAMP_FILE, 4096, remover(1, 0));
     assert!(matches!(trap(fx.run()), Trap::Unsupported(_)));
+}
+
+/// Where an object is on the object grid (array 3, level 1).
+fn on_grid(fx: &Fixture, tile: (usize, usize)) -> i16 {
+    let grid = &fx.world.arrays[&3].data;
+    let at = (tile.0 * 64 + tile.1) * 2;
+    i16::from_le_bytes([grid[at], grid[at + 1]])
+}
+
+#[test]
+fn an_object_on_the_lot_leaves_it_through_the_placement() {
+    let (mut fx, _) = crate::find_location::placeable();
+    fx.lamp_mut().position = [40, 40, 1];
+    let id = crate::find_location::widget(&mut fx);
+    assert_eq!(
+        crate::find_location::find(&mut fx, LAMP as i16, id, 1),
+        Ok(true)
+    );
+    let placed = fx.world.objects[&id].position;
+    let tile = ((placed[0] >> 4) as usize, (placed[1] >> 4) as usize);
+    assert_eq!(on_grid(&fx, tile), id as i16);
+    fx.world.objects.get_mut(&id).unwrap().data[8] |= 0x100;
+    // Remove the stack object, with flag bit 1.
+    fx.add(
+        LAMP_FILE,
+        4200,
+        tree(vec![ins(
+            18,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [1, 0, 2, 0, 0, 0, 0, 0],
+        )]),
+    );
+    assert_eq!(fx.run_with(LAMP, 4200, id as i16, &[], BUDGET), Ok(true));
+    assert_eq!(fx.world.removals, [id]);
+    let widget = &fx.world.objects[&id];
+    // Off the lot, in no container and no room, flag 0x100 cleared, and
+    // gone from its tile.
+    assert_eq!(widget.position, [-16, -16, 1]);
+    assert_eq!((widget.data[2], widget.data[3]), (0, -1));
+    assert_eq!(widget.data[29], -5);
+    assert_eq!(widget.data[8] & 0x100, 0);
+    assert!(widget.removal_skips_resets);
+    assert_eq!(on_grid(&fx, tile), 0);
+    // Still registered until the removals are carried out, and asking
+    // again queues nothing new.
+    assert!(fx.world.order.contains(&id));
+    assert_eq!(fx.run_with(LAMP, 4200, id as i16, &[], BUDGET), Ok(true));
+    assert_eq!(fx.world.removals, [id]);
+}
+
+#[test]
+fn an_object_whose_holder_is_queued_is_not_queued() {
+    let (mut fx, file) = two();
+    fx.add(file, 4200, remover(1, 0));
+    // Widget 4 sits in slot 0 of widget 3 (data word 26 names the holder,
+    // word 14 the slot plus one), and widget 3 is queued already.
+    fx.world.removals.push(3);
+    let widget = fx.world.objects.get_mut(&4).unwrap();
+    (widget.data[26], widget.data[14]) = (3, 1);
+    let before = widget.clone();
+    assert_eq!(fx.run_with(3, 4200, 4, &[], BUDGET), Ok(true));
+    assert_eq!(fx.world.removals, [3]);
+    let widget = &fx.world.objects[&4];
+    assert_eq!(widget.data, before.data);
+    assert_eq!(widget.position, before.position);
+}
+
+#[test]
+fn a_tile_of_a_group_fails_loudly() {
+    let (mut fx, file) = two();
+    fx.add(file, 4200, remover(1, 0));
+    fx.world.objects.get_mut(&4).unwrap().multipart =
+        Some(sims_formats::saved_objects::Multipart {
+            offset: [0; 3],
+            group: [0; 3],
+            parent: 0,
+        });
+    let fault = fx.run_with(3, 4200, 4, &[], BUDGET).unwrap_err();
+    assert!(matches!(fault.trap, Trap::Unsupported(_)), "{fault}");
+    assert!(fx.world.removals.is_empty());
 }
