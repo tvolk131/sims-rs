@@ -4,6 +4,30 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: People are drawn over the finished lot, against its depth
+
+`People::draw_on_lot` draws a lot's people into the canvas
+`sims_render::draw` has filled, as the render track found the original
+does: its depth buffer, dumped with Sims on screen, holds only the lot.
+Each mesh vertex takes the lot renderer's `Depth::point` for its fine
+view position, elevation and level, interpolated across the triangle,
+and each pixel goes in by `Canvas::put`'s sprite rule (no farther than
+what is there, ties to the person; fainter than 65 left out; soft pixels
+blend; depth written so a nearer part of the same body covers a farther
+one). Depths are cut toward zero, as the original's conversion does and
+as `Depth::anchor` does. The screen position is the renderer's
+`Camera::project_fine_f32`, one column right.
+
+Checked in the booted Goths' lot (ticks 120 to 480, four rotations,
+medium zoom): with the camera on the ground level and walls down, 84% of
+the people's pixels show and the rest are behind furniture such as the
+bed's posts. Their feet show: a floor lies 65 units farther than the
+point under it, and grass, held at its tile's top corner, 80 or more
+(200 to 650 at five grass pixels probed). With the camera on level 2
+the upper floor hides everyone below it, as it hides the rooms. How the
+original gives a person's mesh its depth is still **unverified**; reopen
+when a person behind furniture is compared with the original.
+
 ## 2026-11-15: A person's ground height and model matrix are read from sims-sim
 
 `sims_sim::head::ground_height` and `sims_sim::head::model` give the

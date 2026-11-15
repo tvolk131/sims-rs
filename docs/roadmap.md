@@ -1787,13 +1787,17 @@ Progress:
   under them. A gated test draws the Goths' lot's people at all four
   rotations every 30 ticks and checks each is drawn where the lot
   renderer projects them.
-- Next: draw into the lot renderer's canvas and depth once it takes
-  people (with the render track: `Canvas::put`, `Depth::point`, then the
-  per-level interleave); a person on an upper level stands at the floor,
-  without the original's offset. Match the original's lighting (see its
-  decisions entry); compare Mortimer standing without his book. The base layer's clip and phase are
-  not simulation state yet, so the saved record and the animator's clock
-  stand in.
+- Done: people drawn into the lot renderer's canvas, tested against the
+  lot's depth (`People::draw_on_lot`, after `sims_render::draw`): walls,
+  furniture and the floor above hide them. A gated test draws the Goths'
+  people over their lot every 120 ticks at four rotations and checks
+  that some are hidden and most of their pixels still show.
+- Next: compare a person behind furniture with the original; a person on
+  an upper level stands at the floor, without the original's offset.
+  Match the original's lighting (see its decisions entry); compare
+  Mortimer standing without his book. The base layer's clip and phase
+  are not simulation state yet, so the saved record and the animator's
+  clock stand in.
 
 ## Track: lot rendering (`crates/sims-render`)
 
