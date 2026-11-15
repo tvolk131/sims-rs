@@ -1462,7 +1462,7 @@ fn the_personality_panel_shows_the_selected_goths_traits() {
             .panel()
             .iter()
             .filter_map(|item| match item.kind {
-                Kind::Personality(values) => Some(values),
+                Kind::Personality { traits, .. } => Some(traits),
                 _ => None,
             })
             .collect();
@@ -1815,7 +1815,7 @@ fn a_press_on_the_selected_goths_portrait_centres_him_after_a_long_scroll() {
 /// and chose it before 202. The window, given the same input between the
 /// same ticks in strict mode, matched the recording's full state after
 /// every update from 1 to 453 but for two things the input does not
-/// change (see docs/decisions.md). This pins what the recording showed
+/// change (see docs/decisions/). This pins what the recording showed
 /// the input doing: Mortimer's last result after each step, and what the
 /// fridge's check trees left in his frames when the snack starts.
 #[test]

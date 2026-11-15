@@ -6,7 +6,7 @@
 //! captured them from the running game's windows
 //! (legacy/crates/sims-app/src/hud_cluster.rs and original_hud.rs); the
 //! rest were measured on a screenshot of the original (see
-//! `docs/decisions.md`). At another size the cluster keeps to the bottom
+//! `docs/decisions/`). At another size the cluster keeps to the bottom
 //! left, the strip runs from it to the right edge, the needs keep to the
 //! right edge and the strip's background stretches its last column, as
 //! the original does when its window is wider than 800.
@@ -263,7 +263,10 @@ pub enum Kind {
     /// selected Sim's traits in the panel's order
     /// ([`crate::household::PERSONALITY`]). Laid out when drawn, from the
     /// labels' font.
-    Personality([i16; 5]),
+    Personality {
+        traits: [i16; 5],
+        zodiac: Option<u8>,
+    },
     /// The job panel's skills, in `rect`, the subpanel: the selected
     /// Sim's skills and what the next level of their career needs of
     /// each, in the panel's order ([`crate::household::SKILLS`]).
@@ -631,7 +634,10 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         });
         items.push(Item {
             rect: panel,
-            kind: Kind::Personality(resident.personality),
+            kind: Kind::Personality {
+                traits: resident.personality,
+                zodiac: resident.zodiac,
+            },
             command: None,
         });
     }
@@ -737,6 +743,37 @@ fn draw_personality(frame: &mut Frame, art: &Art, panel: Rect, values: &[i16; 5]
             frame.draw(full, source, [at[0], at[1].saturating_sub(1)]);
         }
     }
+}
+
+/// The signs of the zodiac, Aries first (UIText.iff STR# 164, strings 1
+/// to 12, read by 0x48410b), and their font (0x6f2af4).
+const ZODIAC_NAMES: [&str; 12] = [
+    "Aries",
+    "Taurus",
+    "Gemini",
+    "Cancer",
+    "Leo",
+    "Virgo",
+    "Libra",
+    "Scorpio",
+    "Sagittarius",
+    "Capricorn",
+    "Aquarius",
+    "Pisces",
+];
+const ZODIAC_FONT: u8 = 12;
+
+/// The personality panel's sign of the zodiac (0x51cd11..0x51cdfe): its
+/// name, sized to the text, 5 from the panel's left and 5 above its
+/// bottom less the line. **Unverified:** the color (the labels' is
+/// taken).
+fn draw_zodiac(frame: &mut Frame, art: &Art, panel: Rect, sign: u8) {
+    let Some(font) = art.font(ZODIAC_FONT) else {
+        return;
+    };
+    let name = ZODIAC_NAMES[usize::from(sign.clamp(1, 12) - 1)];
+    let y = panel.y.saturating_add(panel.height - font.line_height - 5);
+    font.draw(frame, name, [panel.x.saturating_add(5), y], LABEL);
 }
 
 /// The job panel's title, from the subpanel (0x530340).
@@ -1303,7 +1340,12 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                     draw_name(frame, font, name, r);
                 }
             }
-            Kind::Personality(values) => draw_personality(frame, art, r, values),
+            Kind::Personality { traits, zodiac } => {
+                draw_personality(frame, art, r, traits);
+                if let Some(sign) = zodiac {
+                    draw_zodiac(frame, art, r, *sign);
+                }
+            }
             Kind::Skills { skills, needs } => draw_skills(frame, art, r, skills, needs),
             Kind::Relation { relation, lit } => draw_relation(frame, art, faces, r, relation, *lit),
             Kind::Meter(value) => {
@@ -1359,7 +1401,7 @@ impl Item {
                     | Kind::Bars { .. }
                     | Kind::Meter(_)
                     | Kind::Name { .. }
-                    | Kind::Personality(_)
+                    | Kind::Personality { .. }
                     | Kind::Skills { .. }
                     | Kind::Relation { .. }
             )
@@ -1412,6 +1454,7 @@ mod tests {
                     guid: u32::from(object),
                     motives: [50.; 16],
                     personality: [0; 5],
+                    zodiac: None,
                     skills: [0; 6],
                     job: [0; 2],
                     needs: [0; 6],
@@ -1502,6 +1545,7 @@ mod tests {
                 guid: u32::from(object),
                 motives: [0.; 16],
                 personality: [0; 5],
+                zodiac: None,
                 skills: [0; 6],
                 job: [0; 2],
                 needs: [0; 6],
@@ -1707,6 +1751,7 @@ mod tests {
     fn the_personality_panel_shows_the_selected_sims_traits() {
         let mut s = snapshot();
         s.residents[0].personality = [250, -5, 1500, 0, 999];
+        s.residents[0].zodiac = Some(9);
         let controls = Controls {
             expanded: true,
             panel: Panel::Personality,
@@ -1715,17 +1760,27 @@ mod tests {
         let items = layout([800, 600], &s, &controls);
         let panels: Vec<&Item> = items
             .iter()
-            .filter(|i| matches!(i.kind, Kind::Personality(_)))
+            .filter(|i| matches!(i.kind, Kind::Personality { .. }))
             .collect();
         // The subpanel, as the needs' is.
         assert_eq!(panels.len(), 1);
         assert_eq!(panels[0].rect, Rect::new(521, 500, 279, 100));
-        assert_eq!(panels[0].kind, Kind::Personality([250, -5, 1500, 0, 999]));
+        assert_eq!(
+            panels[0].kind,
+            Kind::Personality {
+                traits: [250, -5, 1500, 0, 999],
+                zodiac: Some(9)
+            }
+        );
         // Presses go through it; nobody selected, no panel.
         assert_eq!(press(&items, [700, 520]), None);
         s.selected = None;
         let items = layout([800, 600], &s, &controls);
-        assert!(!items.iter().any(|i| matches!(i.kind, Kind::Personality(_))));
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i.kind, Kind::Personality { .. }))
+        );
 
         // Drawn with a font whose labels are 0 wide: every bar's label is
         // 3 wide and its bar starts 3 after, so the 40-pixel bars run from
@@ -2080,6 +2135,29 @@ mod tests {
                 &relation,
                 true,
             );
+        }
+    }
+
+    #[test]
+    fn the_sign_of_the_zodiac_goes_at_the_panels_bottom_left() {
+        let mut art = Art::default();
+        art.insert_font(ZODIAC_FONT, crate::font::tests::font());
+        let line = art.font(ZODIAC_FONT).unwrap().line_height;
+        // "Aries": only its `A` is in the test font, drawn a pixel in
+        // (its bearing) from 5 in, at 100 - line - 5 down.
+        let mut frame = Frame::new(40, 110, [0; 3]);
+        draw_zodiac(&mut frame, &art, Rect::new(0, 0, 279, 100), 1);
+        let top = 100 - line - 5;
+        assert_eq!(frame.pixel(6, top), Some(LABEL));
+        assert_eq!(frame.pixel(5, top), Some([0; 3]));
+        assert_eq!(frame.pixel(6, top - 1), Some([0; 3]));
+        // Without the font nothing is drawn, and far places do not
+        // overflow.
+        let mut frame = Frame::new(4, 4, [0; 3]);
+        draw_zodiac(&mut frame, &Art::default(), Rect::new(0, 0, 279, 100), 1);
+        assert!(frame.rgb().iter().all(|p| *p == [0; 3]));
+        for at in [i32::MAX - 2, i32::MIN + 2] {
+            draw_zodiac(&mut frame, &art, Rect::new(at, at, 279, 100), 12);
         }
     }
 

@@ -16,7 +16,7 @@
 //! the pie menu is listed on, and the simulation sends the interactions
 //! of a tile on to the tile that takes them, as the original does
 //! (`crate::menu::target`, 0x435286). How the original resolves a click
-//! to an object or a Sim is **unverified** (see `docs/decisions.md`, "A
+//! to an object or a Sim is **unverified** (see `docs/decisions/`, "A
 //! click picks what the frame shows at the pixel").
 
 use sims_render::Canvas;
