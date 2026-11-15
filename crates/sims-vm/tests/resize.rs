@@ -417,12 +417,23 @@ fn routing_18_bytes(routing: &sims_sim::route::Routing) -> Vec<u8> {
     bytes
 }
 
+/// A lot's encoding as snapshot format 25 wrote it: without the record of
+/// the bones the skins moved ([`World::translated_bones`]) that format 26
+/// added at the end. The older formats' encodings start from this one.
+fn format_25_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let moved = postcard::to_allocvec(&world.translated_bones).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - moved.len()), moved);
+    bytes
+}
+
 /// A lot's encoding as snapshot format 24 wrote it: without the base
 /// slots' layers ([`World::base_layers`]) that format 25 added at the end,
 /// so a state pinned under format 24 can be shown to be the same state
-/// but for those layers. The older formats' encodings start from this one.
+/// but for those layers. It starts from [`format_25_bytes`], and the older
+/// formats' encodings from this one.
 fn format_24_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_25_bytes(world);
     let layers = postcard::to_allocvec(&world.base_layers).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - layers.len()), layers);
     bytes

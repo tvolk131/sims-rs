@@ -306,12 +306,16 @@ when a recording of play selects a Sim.
 
 **Unverified.** No capture covers any of it: everything here is from
 tick 2837 on, and the Goth captures end at update 1000. Strict mode now
-runs through tick 3432 (08:25:08, hash fbb3d668…) and stops at tick
-3433.
+runs through tick 3432 (08:25:08, hash 359095d7…; fbb3d668… in format
+25) and stops at tick 3433.
 
-**Hashes.** Snapshot format 25 appends `World::base_layers`, so every
-pinned hash changes. The format-24 encoding is a prefix of the new one,
-and `boot.rs` pins both (`format_24_bytes`): ticks 33 and 1103 keep
+**Hashes.** Snapshot format 25 appends `World::base_layers`, and format
+26 then `World::translated_bones`, so every pinned hash changes. The
+format-25 encoding is a prefix of the format-26 one, and `boot.rs` and
+`resize.rs` pin both (`format_25_bytes`): every format-25 hash this
+entry first pinned (ticks 33, 1103, 2881 and 3432) still holds. The
+format-24 encoding is a prefix of the format-25 one, and `boot.rs` pins
+both (`format_24_bytes`): ticks 33 and 1103 keep
 their format-24 hashes, and the state at tick 2836 is byte for byte the
 one the previous commit (1bacd2d3) reaches (format 24, f74e31af…).
 At tick 2881 the format-24 hash changes from eed688a0… to cdd5b72c…,
@@ -337,7 +341,17 @@ Each layer at weight 1 or more replaces what the bones held:
 - The skin never puts the bones back at rest. A rotation on the way to
   a measured bone that no layer playing now writes is what an earlier
   layer left, which is not kept, so that fails.
-- A translation no layer writes is taken at rest (unverified).
+- A translation is kept too: a motion with no positions leaves it as
+  it was (0x598226, 0x598450). `World::translated_bones` (snapshot
+  format 26) records, per person, every bone whose translation a layer
+  the skin's update could sample has written since the person was made
+  or loaded. A bone on the way to a measured bone that no layer playing
+  now moves fails if it is in that record, and is at rest otherwise. The
+  record counts every layer that could sample, without the update's
+  "pose" argument (0x59820a) or the sample count, so it may hold more
+  bones than the original moved; that only makes more cases fail. That
+  a skin starts at rest at load is unverified. Of 7,950 clips, 7,947
+  move ROOT and 7,577 PELVIS; SPINE is moved by 32.
 
 A posture whose clip has no name starts nothing and leaves the slot as
 it was (0x5904af, from the disassembly; retried next tick). Animate Sim
@@ -367,11 +381,11 @@ choosing a branch, both must agree. This is exactly what is checked:
 1. At the take-off, the refresh is worked out on a copy of the lot as
    the take-off leaves it (after the holder's function 9 and the
    portal's tiles, before the registry, which does nothing for a
-   person). The copy, with the person's animator and base layer put
-   back, must encode byte for byte as the lot does, and the refresh
-   must play no sound into the sound list. So the refresh writes
-   nothing but those two, judged on the state it would really have
-   read. A running head countdown (word 45) fails here, and so does a
+   person). The copy, with the person's animator, base layer and record
+   of moved bones (`World::translated_bones`) put back, must encode byte
+   for byte as the lot does, and the refresh must play no sound into the
+   sound list. So the refresh writes nothing but those three, judged on
+   the state it would really have read. A running head countdown (word 45) fails here, and so does a
    timed event that writes a hand or the censor word to a new value.
    The sound list does not hear the sounds of timed events, which are
    not modeled. So a timed event due in the refresh with a sound key
@@ -384,11 +398,12 @@ choosing a branch, both must agree. This is exactly what is checked:
    operand 1 set to 1. Anything else fails, naming 0x58da12. That these
    read no animator and no base layer is from their ports, not proven
    for the original.
-3. At the animator's tick, the animator and its base layer must be
-   those the take-off left (compared field by field).
-4. The tick from the refreshed animator and base layer, on the lot as
-   it is then, must reach the same encoded world, and append the same
-   sounds, as the tick alone.
+3. At the animator's tick, the animator, its base layer and the record
+   of moved bones must be those the take-off left (compared field by
+   field).
+4. The tick from the refreshed three, on the lot as it is then, must
+   reach the same encoded world, and append the same sounds, as the
+   tick alone.
 
 What this does not cover: anything the refresh does that the port
 leaves out (the draw state, the face, the pose). In the tick itself the

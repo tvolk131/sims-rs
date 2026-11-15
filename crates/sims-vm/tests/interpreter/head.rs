@@ -242,6 +242,29 @@ fn a_bone_no_layer_turns_fails_loudly() {
     );
 }
 
+#[test]
+fn a_bone_no_layer_moves_is_at_rest_until_a_layer_has_moved_it() {
+    // A motion with no positions leaves the bone's translation as it was
+    // (0x598226, 0x598450). The clip moves no bone: the head is at rest
+    // while no layer has ever moved it, and is not known once one has.
+    let at_rest = draw(anchored(Some("Top"))).unwrap();
+    let mut fx = anchored(Some("Top"));
+    fx.world
+        .translated_bones
+        .insert(SIM, ["ARM".to_owned()].into());
+    assert_eq!(draw(fx).unwrap(), at_rest);
+    let mut fx = anchored(Some("Top"));
+    fx.world
+        .translated_bones
+        .insert(SIM, ["HEAD".to_owned()].into());
+    let fault = draw(fx).unwrap_err();
+    assert!(
+        matches!(&fault.trap, sims_vm::Trap::Unsupported(m)
+            if m.contains("0x598226") && m.contains("\"HEAD\"")),
+        "{fault}"
+    );
+}
+
 /// [`carrying`] with no carry layer, the foreground turning `fore`, and,
 /// in the base slot, a clip a script put there (0x58957e) that turns the
 /// head.

@@ -2153,6 +2153,36 @@ fn a_refresh_whose_event_plays_a_sound_fails_at_the_take_off() {
 }
 
 #[test]
+fn the_skins_update_notes_the_bones_its_layers_move() {
+    // Every motion with positions of a layer the skin's update samples
+    // (0x597c4c, 0x598226); a motion with rotations only moves nothing.
+    let mut fx = standing();
+    playing_an_event(&mut fx, "xevt", "1");
+    let clip = fx.program.animations.clip(CLIP).unwrap().clone();
+    let channel = |bone: &str, translation| sims_content::Channel {
+        bone: bone.into(),
+        translation,
+        rotation: Some(0),
+    };
+    fx.program.animations.insert(
+        "test.far",
+        Clip {
+            channels: vec![channel("ROOT", Some(0)), channel("HEAD", None)],
+            ..clip
+        },
+    );
+    tick(&mut fx).unwrap();
+    assert_eq!(fx.world.translated_bones[&SIM], ["ROOT".to_owned()].into());
+    // A layer with no weight samples nothing.
+    let mut fx = standing();
+    playing_an_event(&mut fx, "xevt", "1");
+    let a = fx.world.animators.get_mut(&SIM).unwrap();
+    a.foreground.as_mut().unwrap().weight = F32::ZERO;
+    tick(&mut fx).unwrap();
+    assert!(!fx.world.translated_bones.contains_key(&SIM));
+}
+
+#[test]
 fn a_refresh_that_would_count_the_head_down_fails_loudly() {
     // With the head's countdown running, the refresh's head step lowers
     // person word 45, which the rest of the lot update may read: whether

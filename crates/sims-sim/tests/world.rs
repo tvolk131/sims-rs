@@ -244,6 +244,10 @@ fn world() -> World {
         routing: routing(),
         action_serial: 9,
         base_layers: BTreeMap::from([(5, base_layer())]),
+        translated_bones: BTreeMap::from([(
+            5,
+            BTreeSet::from(["PELVIS".to_owned(), "ROOT".to_owned()]),
+        )]),
     }
 }
 
@@ -415,7 +419,24 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "f44771b305c9f7af1aaf760cb475f98f1a815bff357191a399bd14a79b35e85b";
+const PINNED: &str = "d550ed76e8971864d5c06fe3fbcb810ff283b751659697240ff30668ddedd13e";
+
+#[test]
+fn without_the_bones_moved_the_encoding_is_format_25() {
+    // Snapshot format 26 added the bones the skins moved at the end.
+    assert_eq!(digest(&format_25_bytes(&world())), PINNED_25);
+}
+const PINNED_25: &str = "f44771b305c9f7af1aaf760cb475f98f1a815bff357191a399bd14a79b35e85b";
+
+/// The encoding of `world` as snapshot format 25 wrote it: without the
+/// bones the skins moved ([`World::translated_bones`]) that format 26
+/// added at the end. The older formats' encodings start from this one.
+fn format_25_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let moved = postcard::to_allocvec(&world.translated_bones).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - moved.len()), moved);
+    bytes
+}
 
 #[test]
 fn without_the_base_layers_the_encoding_is_format_24() {
@@ -426,9 +447,10 @@ const PINNED_24: &str = "992789f0d0ba45f0e3a203b4cdff77c9b180f5a1da7b99061e521ca
 
 /// The encoding of `world` as snapshot format 24 wrote it: without the
 /// base slots' layers ([`World::base_layers`]) that format 25 added at
-/// the end. The older formats' encodings start from this one.
+/// the end. It starts from [`format_25_bytes`], and the older formats'
+/// encodings from this one.
 fn format_24_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_25_bytes(world);
     let layers = postcard::to_allocvec(&world.base_layers).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - layers.len()), layers);
     bytes

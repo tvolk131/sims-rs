@@ -149,6 +149,16 @@ pub struct World {
     /// that the encodings of the states before it was kept stay a prefix
     /// of the new ones.
     pub base_layers: BTreeMap<u16, Layer>,
+    /// The bones of each person's skin whose translation a layer has
+    /// written since the skin was made, by name. The skin's update keeps
+    /// a bone's translation when no layer it samples moves that bone
+    /// (0x598226, 0x598450), so a bone in this set that no layer playing
+    /// now moves holds a translation that is not kept; one not in it is
+    /// still at rest. Every layer the skin's update could sample is
+    /// counted, so this may hold more than the original moved. Kept apart
+    /// from the animator so that the encodings of the states before it
+    /// was kept stay a prefix of the new ones.
+    pub translated_bones: BTreeMap<u16, BTreeSet<String>>,
 }
 
 /// How many advertisements the record of [`World::advertisement_record`]
@@ -486,6 +496,7 @@ impl World {
             families: Vec::new(),
             headlines: BTreeMap::new(),
             base_layers: BTreeMap::new(),
+            translated_bones: BTreeMap::new(),
         }
     }
 

@@ -51,8 +51,12 @@
 //! ported. The skin does not put the bones back at rest first, so a bone
 //! on the way from the root to a bone measured or turned whose rotation
 //! no layer playing now writes holds what an earlier layer left, which is
-//! not kept and fails; a translation no layer writes is taken at rest,
-//! which is unverified. The bones
+//! not kept and fails. Likewise a translation no layer playing now
+//! writes (0x598226 and 0x598450 skip a motion with no positions) is what
+//! an earlier layer left: it fails if any layer has moved the bone since
+//! the skin was made ([`World::translated_bones`]), and is taken at rest
+//! otherwise. That the skin starts at rest when the person is made or
+//! loaded is unverified. The bones
 //! are then placed from the root (0x5994c3), which stands at the origin.
 //!
 //! The person's model matrix (0x592132) turns the skeleton to the
@@ -396,6 +400,7 @@ impl Interpreter<'_> {
             })
             .collect();
         let mut rotated = vec![false; parents.len()];
+        let mut translated = vec![false; parents.len()];
         for layer in layers.into_iter().flatten() {
             if a.skin_dirty || layer.current != a.skin_clock {
                 return Err(Trap::Unsupported(format!(
@@ -460,6 +465,9 @@ impl Interpreter<'_> {
                 if motion.rotations.is_some() {
                     rotated[bone] = true;
                 }
+                if motion.translations.is_some() {
+                    translated[bone] = true;
+                }
                 pose::sample(&mut locals[bone], motion, at).map_err(bad)?;
             }
         }
@@ -472,6 +480,23 @@ impl Interpreter<'_> {
                 &format!(
                     "person {id}'s bone {:?}, on the way to a bone read, is turned by no layer \
                      playing now: its rotation is the last layer's that turned it",
+                    skeleton.bones[bone].name
+                ),
+            ));
+        }
+        // Nor a translation (0x598226, 0x598450): one no layer playing now
+        // writes is at rest only while no layer has moved the bone since
+        // the skin was made.
+        let moved = world.translated_bones.get(&id);
+        if let Some(bone) = (0..parents.len()).find(|&b| {
+            chain[b] && !translated[b] && moved.is_some_and(|m| m.contains(&skeleton.bones[b].name))
+        }) {
+            return Err(unsupported(
+                "0x598226",
+                &format!(
+                    "person {id}'s bone {:?}, on the way to a bone read, is moved by no layer \
+                     playing now but was moved before: its translation is the last layer's \
+                     that moved it",
                     skeleton.bones[bone].name
                 ),
             ));

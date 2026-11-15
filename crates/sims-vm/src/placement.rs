@@ -67,11 +67,13 @@ pub(crate) struct Pending {
     pub refreshed: Kept,
 }
 
-/// A person's animator and base layer.
+/// A person's animator, base layer and the bones its skin has moved
+/// ([`World::translated_bones`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Kept {
     pub animator: Option<Animator>,
     pub base: Option<Layer>,
+    pub translated: Option<BTreeSet<String>>,
 }
 
 impl Kept {
@@ -79,6 +81,7 @@ impl Kept {
         Self {
             animator: world.animators.get(&id).cloned(),
             base: world.base_layers.get(&id).cloned(),
+            translated: world.translated_bones.get(&id).cloned(),
         }
     }
 
@@ -91,6 +94,10 @@ impl Kept {
         match &self.base {
             Some(layer) => world.base_layers.insert(id, layer.clone()),
             None => world.base_layers.remove(&id),
+        };
+        match &self.translated {
+            Some(bones) => world.translated_bones.insert(id, bones.clone()),
+            None => world.translated_bones.remove(&id),
         };
     }
 }

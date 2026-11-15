@@ -8,10 +8,14 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 33 --answers 3`
-/// gives this hash with the default frames (snapshot format 25).
-const TICK_33: &str = "3900ae00e04dd717ef5d4a03d9e7629f7843f95d22e54c97733349d16cd147f3";
+/// gives this hash with the default frames (snapshot format 26).
+const TICK_33: &str = "915a9af271f2d48b191c3c1d7f4d0add337aef4c5a5899fae0a1ba02c5657e11";
+/// The same state's hash under snapshot format 25, which had no record of
+/// the bones the skins moved ([`sims_sim::World::translated_bones`]) at
+/// the end.
+const TICK_33_25: &str = "3900ae00e04dd717ef5d4a03d9e7629f7843f95d22e54c97733349d16cd147f3";
 /// The same state's hash under snapshot format 24, which had no base
-/// layers ([`sims_sim::World::base_layers`]) at the end.
+/// layers ([`sims_sim::World::base_layers`]) either.
 const TICK_33_24: &str = "da80de5807a89da3fdae78c8759d3e411bdd87c5dc7aae0bafceec963cf59796";
 /// The same state's hash under snapshot format 23, which had no headlines
 /// ([`sims_sim::World::headlines`]) either.
@@ -22,7 +26,9 @@ const TICK_33_22: &str = "041181badfd4d6953814b6c46612398df1004fa583b1d2aa5bd11c
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 1103 --answers
 /// 3` gives this hash, the tick before the salesman leaves.
-const TICK_1103: &str = "54a5adc12bd7ae9641a7029acb435272121c6678fc938ac95036f788b6b5bc86";
+const TICK_1103: &str = "ce627e5ef44b7133e74322f8d5dcf1929821114529b846a4c1e442475470399a";
+/// The same state's hash under snapshot format 25.
+const TICK_1103_25: &str = "54a5adc12bd7ae9641a7029acb435272121c6678fc938ac95036f788b6b5bc86";
 /// The same state's hash under snapshot format 24.
 const TICK_1103_24: &str = "714496702b0ff2dbda94c299c217e2ae7414172e6a71775950901b0cfa6222b5";
 
@@ -34,12 +40,22 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The lot's encoding as snapshot format 25 wrote it: without the record
+/// of the bones the skins moved ([`sims_sim::World::translated_bones`])
+/// that format 26 added at the end, so a state pinned under format 25 can
+/// be shown to be the same state but for it.
+fn format_25_bytes(lot: &Lot) -> Vec<u8> {
+    let mut bytes = lot.world().encode();
+    let moved = postcard::to_allocvec(&lot.world().translated_bones).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - moved.len()), moved);
+    bytes
+}
+
 /// The lot's encoding as snapshot format 24 wrote it: without the base
 /// layers ([`sims_sim::World::base_layers`]) that format 25 added at the
-/// end, so a state pinned under format 24 can be shown to be the same
-/// state but for them.
+/// end either. It starts from [`format_25_bytes`].
 fn format_24_bytes(lot: &Lot) -> Vec<u8> {
-    let mut bytes = lot.world().encode();
+    let mut bytes = format_25_bytes(lot);
     let layers = postcard::to_allocvec(&lot.world().base_layers).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - layers.len()), layers);
     bytes
@@ -69,6 +85,7 @@ fn the_goth_house_steps_to_tick_33() {
     // No headline shows.
     assert!(lot.world().headlines.is_empty());
     assert_eq!(lot.world().hash_hex(), TICK_33);
+    assert_eq!(digest(&format_25_bytes(&lot)), TICK_33_25);
     let mut bytes = format_24_bytes(&lot);
     assert_eq!(digest(&bytes), TICK_33_24);
     let headlines = postcard::to_allocvec(&lot.world().headlines).unwrap();
@@ -422,6 +439,7 @@ fn strict_mode_takes_the_salesman_off_the_lot_at_tick_1104() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_1103);
+    assert_eq!(digest(&format_25_bytes(&lot)), TICK_1103_25);
     assert_eq!(digest(&format_24_bytes(&lot)), TICK_1103_24);
     // The salesman (GUID 0x44A86A6C, made by object 382 at tick 6).
     assert_eq!(lot.world().objects[&259].guid, 0x44A8_6A6C);
@@ -487,13 +505,17 @@ fn the_player_selects_another_goth() {
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 2881
 /// --answers 3` gives this hash.
-const TICK_2881: &str = "677bfb1d0fef771671a6b2881729604bb50d3fd2dc6ea18ca829d6cca7861aef";
+const TICK_2881: &str = "16c83a8e5f49c088dce71c67874ba7ccbb367c952b4fde8a4b3d7c78ad7a081f";
+/// The same state's hash under snapshot format 25.
+const TICK_2881_25: &str = "677bfb1d0fef771671a6b2881729604bb50d3fd2dc6ea18ca829d6cca7861aef";
 /// The same state's hash under snapshot format 24.
 const TICK_2881_24: &str = "cdd5b72c0ed8481f4db525817d1145f5445b6d2562c2ea4abfbfbfcfae4e26bf";
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 3432
 /// --answers 3` gives this hash.
-const TICK_3432: &str = "fbb3d6685e20066970fce710ca97e397b921bad0384876d05a6bcb530a62d9a9";
+const TICK_3432: &str = "359095d7d0e8a141ac07a3662a3aec4de888d755c663754aa624e057a6596f5b";
+/// The same state's hash under snapshot format 25.
+const TICK_3432_25: &str = "fbb3d6685e20066970fce710ca97e397b921bad0384876d05a6bcb530a62d9a9";
 /// The same state's hash under snapshot format 24.
 const TICK_3432_24: &str = "c8d4fccd905caec7a03bb6d2872d83ba0ce462ffbc6c3e0bc1432034dade3f9a";
 
@@ -520,6 +542,7 @@ fn strict_mode_runs_to_tick_3432_past_the_school_bus() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_2881);
+    assert_eq!(digest(&format_25_bytes(&lot)), TICK_2881_25);
     assert_eq!(digest(&format_24_bytes(&lot)), TICK_2881_24);
     // Each update is two game seconds, 30 a game minute, so a day is
     // 43,200 updates.
@@ -528,6 +551,7 @@ fn strict_mode_runs_to_tick_3432_past_the_school_bus() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_3432);
+    assert_eq!(digest(&format_25_bytes(&lot)), TICK_3432_25);
     assert_eq!(digest(&format_24_bytes(&lot)), TICK_3432_24);
     assert_eq!(clock(&lot), (8, 25, 8));
     // Tick 3433: object 334 snaps a multi-tile object to a place where it

@@ -241,6 +241,46 @@ impl Interpreter<'_> {
             self.update_carry(world, id, a, now)?;
         }
         a.skin_clock = now;
+        self.note_translations(world, id, a)
+    }
+
+    /// Notes in [`World::translated_bones`] the bones whose translation a
+    /// layer of person `id`'s skin could have written at its update:
+    /// every motion with positions of each layer with something bound,
+    /// frames and weight (0x597c4c, 0x598226). The original samples only
+    /// when its update is asked to pose (0x59820a), and a motion's
+    /// positions only up to the clip's count; neither is told apart here,
+    /// so the set may hold more than the original moved.
+    fn note_translations(&self, world: &mut World, id: u16, a: &Animator) -> Result<(), Trap> {
+        let base = world.base_layers.get(&id);
+        let layers = [base, a.foreground.as_ref(), a.carry.as_ref()];
+        let mut moved = Vec::new();
+        for layer in layers.into_iter().flatten() {
+            if !layer.bound || layer.frames == 0 || layer.weight.ext() <= Ext::ZERO {
+                continue;
+            }
+            let clip = self.program.animations.clip(&layer.clip).map_err(|e| {
+                Trap::Unsupported(format!(
+                    "person {id}'s skin samples a clip {:?} that cannot be found (0x59dc32): {e}",
+                    layer.clip
+                ))
+            })?;
+            moved.extend(
+                clip.channels
+                    .iter()
+                    .filter(|c| c.translation.is_some())
+                    .map(|c| &c.bone),
+            );
+        }
+        if moved.is_empty() {
+            return Ok(());
+        }
+        let known = world.translated_bones.entry(id).or_default();
+        for bone in moved {
+            if !known.contains(bone) {
+                known.insert(bone.clone());
+            }
+        }
         Ok(())
     }
 
