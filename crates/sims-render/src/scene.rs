@@ -1358,23 +1358,38 @@ fn within(image: &Image, x: i32, [from, to]: [i32; 2]) -> Option<(Image, i32)> {
 /// One half of a floor image for a tile a diagonal wall splits: half 0
 /// holds corner (0, 0) under a descending wall, or corner (0, 1) under an
 /// ascending one.
+///
+/// On screen a tile's diagonal runs level (through its left and right
+/// corners) or upright (through its top and bottom ones), so the original
+/// cuts no triangle: it draws each half's whole floor sprite with the
+/// screen's clip rectangle narrowed to that half's side of the cut
+/// (0x4af70a and 0x4af924 for a level cut, 0x4afcf5 and 0x4afef6 for an
+/// upright one). The upper half ends above the corners' row and the lower
+/// half starts on it. The original places the sprite at the cut's column
+/// less half a tile (`8 << zoom`, the view's field +0x5c set at 0x4a6cfa),
+/// so the left half ends before column `8 << zoom` of the image and the
+/// right half starts on it. The sprites are a pixel narrower than the tile
+/// (31, 63 and 127 wide) with their top and bottom corners on the middle
+/// column, one left of the cut, so that column goes to the left half.
 fn split_half(camera: &Camera, image: &Image, segments: u8, half: usize) -> Image {
-    let half_w = 8 << camera.zoom.level();
-    let half_h = 4 << camera.zoom.level();
+    let half_h = (4 << camera.zoom.level()) as usize;
+    let corner = (8 << camera.zoom.level()) as usize;
+    // In the view the cut is level when the wall descends there.
+    let level = (segments & lot::DESCENDING != 0) != (camera.rotation & 1 == 1);
+    // Whether half 0 is the upper (or left) one: test a point well inside
+    // that side, in sixteenths of the tile in the view.
+    let [x, y] = unrotate_local(camera, if level { [4, 4] } else { [4, 12] });
+    let first = if segments & lot::DESCENDING != 0 {
+        x + y < 16
+    } else {
+        x < y
+    };
+    let upper = first == (half == 0);
     let mut out = image.clone();
     for py in 0..image.height {
         for px in 0..image.width {
-            // The pixel's view position inside the tile, in sixteenths,
-            // from its offset below the top corner.
-            let s = py as i32 * 16 / half_h;
-            let d = (px as i32 - image.width as i32 / 2) * 16 / half_w;
-            let [x, y] = unrotate_local(camera, [(s + d) / 2, (s - d) / 2]);
-            let first = if segments & lot::DESCENDING != 0 {
-                x + y < 16
-            } else {
-                x < y
-            };
-            if first != (half == 0) {
+            let before = if level { py < half_h } else { px < corner };
+            if before != upper {
                 out.rgba[(py * image.width + px) * 4 + 3] = 0;
             }
         }
@@ -1722,6 +1737,70 @@ mod tests {
                 };
                 assert_eq!(opaque(&a) + opaque(&b), 127 * 64);
                 assert!(opaque(&a) > 127 * 16 && opaque(&b) > 127 * 16);
+            }
+        }
+    }
+
+    #[test]
+    fn a_split_floor_is_cut_straight_along_the_corners_row_or_half_a_tile_in() {
+        // As wide as the game's near floor sprites, a pixel short of the
+        // tile.
+        let image = Image {
+            width: 127,
+            height: 64,
+            rgba: [9, 9, 9, 255].repeat(127 * 64),
+            depth: None,
+        };
+        let shows = |i: &Image, [x, y]: [usize; 2]| i.rgba[(y * i.width + x) * 4 + 3] != 0;
+        for rotation in 0..4 {
+            let c = camera(rotation);
+            for segments in [lot::DESCENDING, lot::ASCENDING] {
+                let halves = [0, 1].map(|h| split_half(&c, &image, segments, h));
+                // Which half holds the corner it is named for, from a point
+                // well inside it: (4, 4) or (4, 12) of the lot tile.
+                let inside = if segments & lot::DESCENDING != 0 {
+                    [4, 4]
+                } else {
+                    [4, 12]
+                };
+                let view = match rotation {
+                    1 => [16 - inside[1], inside[0]],
+                    2 => [16 - inside[0], 16 - inside[1]],
+                    3 => [inside[1], 16 - inside[0]],
+                    _ => inside,
+                };
+                // View sixteenths to pixels: a tile 128 wide and 64 tall
+                // placed half a tile left of its top corner.
+                let px = [64 + (view[0] - view[1]) * 4, (view[0] + view[1]) * 2];
+                let px = px.map(|n| n as usize);
+                assert!(
+                    shows(&halves[0], px),
+                    "rotation {rotation} segments {segments}"
+                );
+                assert!(
+                    !shows(&halves[1], px),
+                    "rotation {rotation} segments {segments}"
+                );
+                let level = (segments == lot::DESCENDING) == (rotation % 2 == 0);
+                // The upper (or left) half holds the top (or left) corner.
+                let corner = if level { [64, 0] } else { [0, 32] };
+                let (upper, lower) = if shows(&halves[0], corner) {
+                    (&halves[0], &halves[1])
+                } else {
+                    (&halves[1], &halves[0])
+                };
+                for n in 0..127 {
+                    if level {
+                        // The corners' row is wholly the lower half's.
+                        assert!(!shows(upper, [n, 32]) && shows(lower, [n, 32]));
+                        assert!(shows(upper, [n, 31]) && !shows(lower, [n, 31]));
+                    } else if n < 64 {
+                        // Column 64, half a tile in, is wholly the right
+                        // half's; the sprite's middle column 63 the left's.
+                        assert!(!shows(upper, [64, n]) && shows(lower, [64, n]));
+                        assert!(shows(upper, [63, n]) && !shows(lower, [63, n]));
+                    }
+                }
             }
         }
     }
