@@ -37,6 +37,153 @@ Few match exactly yet because the grass under them still differs (see
 the split tile's blade count). Which half takes which floor is
 unchanged.
 
+## 2026-11-15: Objects cast the original's soft shadows on the floor under them
+
+At near zoom the most visible difference left was the shadow under
+plants, benches and other furniture, which the original darkens into the
+floor or grass after drawing each tile and before any object (its floor
+shadow pass, 0x4ae844 in the tile draw 0x4ad8ac). It is now ported in
+`crates/sims-render/src/shadows.rs`, from the code:
+
+- **One object a tile.** The first object of the tile's object grid cell
+  (lot arrays 3 and 103), or the next on the tile through slot 0, that is
+  not hidden, has no zero-extent flag (data word 8, value 4), is not of
+  type 2 or 9 and has a shadow (0x434e23).
+- **The shadow code** (0x4573e7). A one-tile object's is its OBJD word
+  57, -1 for none. A tile of a group builds one from which of its eight
+  neighbours in the group's grid (OBJD word 11) also have a shadow and
+  have OBJD word 56 at 0 (0x43ac5c); a code the masks cannot draw
+  becomes 0. It is turned by the object's facing and then the view's
+  rotation (the tables 0x53d2fc fills); code 16 never turns.
+- **The masks.** Codes 0 and 16 are hand-drawn, SPR2 0x300 and 0x310
+  (plus 0x20 a zoom) in `floors.iff`, read as palette indices. Every
+  other code's mask is worked out over floor 0's tile shape from four
+  curves, one a side, as the original's float code does it (0x4a3cd3,
+  0x4a3914, 0x4a3993).
+- **Drawing** (0x4b10c4). Mask byte plus strength (OBJD word 79, plus
+  255 less the tile's drawn light byte) gives a light level for the
+  pixel, which is drawn through the lighting's tables; 248 and up leaves
+  it alone. Only pixels at or behind the floor's ground depth change.
+
+**Checked** against the original's screenshots, with the world at their
+time. Near zoom rose from 86.3% to 87.6% exact (two other near cameras
+86.8% to 88.3% and 86.5% to 87.1%); far zoom at rotations 1 and 2 by
+0.1 to 0.2 points and medium zoom from 82.7% to 83.1%. Of the pixels the
+shadows changed, 6,359 of 7,149 now match exactly at near zoom (950 of
+1,186 at far rotation 1, 449 of 574 at rotation 2, 2,046 of 2,755 at
+medium); before, almost none did. The bench's two halves meet in one
+shadow, which checks the turning's sense.
+
+**Not ported:** the option that turns shadows off (the "shadows" cheat)
+and the drawing flags that allow them, taken as on; the faint shadow
+under an object the player is placing (0x438a48). The pass runs in the
+tile order of our floor loop, after all grass, where the original runs it
+tile by tile in its own order, so a later tile's grass blade can cover a
+shadow there and not here.
+
+**Seen, not yet read:** on a split tile whose other half has no floor,
+the original draws that half as flat grass (two tones, no blades); we
+draw the bladed grass. The dashed row along the porch's lower edge at
+near zoom is ours alone.
+
+## 2026-11-15: The plumb bob is the original's mesh, coloured and lit as the original does
+
+The selected person's plumb bob is now drawn (`sims_people::bob`, from
+`People::draw`). Everything below was read from the original's code in
+a memory image, except where it says otherwise.
+
+- **What it is.** An ordinary object (`PlumbBob.iff`, GUID 0x2F726FFF)
+  in the person's head slot (their container slot 2), with no sprites.
+  Its object string 200 names the skeleton `root` and the suit
+  `head-arrow,ROOT=white`. The suit's mesh, `xskin-head-arrow-ROOT-ARROW`,
+  is in `Animation.far`, 2.1 units long on its z axis. No
+  `root-skeleton.cmx.bcf` or `white.bmp` exists, so we make a one-bone
+  skeleton and draw the mesh white.
+- **Where.** The head slot's redraw (0x58dbd8 to 0x58dc03) gives the
+  bob's graphic the `HEAD` bone's position times the person's
+  placement, without the bone's own turn. The draw (0x585dc5) sets the
+  root bone at (0, 3, 0), turned by the original's Euler routine
+  (0x5c4bb0, run in an emulator to fix its order) a quarter turn about
+  x and the spin about z. So the bob stands upright from three units
+  over the head and spins about its length.
+- **Spin.** The game's clock in milliseconds (0x6e54e0) × 0.001 × π, or
+  half a turn a second. We have no such clock, so the game window passes
+  the time it has run (`People::set_clock`, from `Game::advance`). That
+  time runs on while the lot is paused or a dialog waits; whether the
+  original's clock does is **unverified**. While a bob is on the lot,
+  the window draws a new frame every 50 ms even when no tick runs (our
+  choice; the original's frame rate is not ported).
+- **Colour.** The suit's name sets a mode (`head-arrow` 1,
+  `head-arrow-date` 2, `head-star` 3, 0x5856db to 0x58579f). In mode 1,
+  m is the mood (motive 3 cut to an integer) × 0.012, held to −1..1.
+  - From 0 up, r = b = 1 − m and g = 1, with b lowered a further
+    0.4 − m below 0.4.
+  - Below 0, r = 1 and g = b = 1 − m², with b lowered a further m + 0.4
+    above −0.4.
+  - So the bob runs red, pale yellow, green.
+- **Light.** The colour is a light of intensity 1, and the ambient light
+  is a quarter of the colour plus 0.05. The light's vector is the house
+  camera's unit vector from its eye to the centre (+0x184, set at
+  0x49b2aa), turned 80° about y and then 30° about x (0x6f6b38). That
+  turn is in the lot's terms, so the light falls from another side at
+  each rotation of the view.
+
+**Taken from the screenshot, not read.** In the original's screenshot
+(medium zoom, 7:38 AM, Mortimer reading on the porch bench), the bob is
+brightest on the viewer's left and lit on its lower half. That is what
+we get by taking the vector as pointing towards the light. Taken the
+other way, the left side is dark. With that choice our bob's green
+pixels span the original's box (x 427 to 434, y 74 to 97), each edge
+within a pixel, as a gated test checks; the pixels inside the box are
+not compared one by one.
+
+**Unverified.**
+- Which bone the slot names (its +0x20); `HEAD` puts the bob where the
+  screenshot has it.
+- Rotations other than 0.
+- The bob's pixels name the person who holds it, for a click; what the
+  original does on a click there was not checked.
+
+**Not ported.** Modes 2 and 3, the date and star bobs.
+
+## 2026-11-15: A split floor tile's grass keeps the blades of the tile drawn before it
+
+The grass's blade count is now worked out tile by tile in the order the
+original draws the tiles, and carried from one to the next, as the
+original keeps it in the grass object between tiles (0x49d0da to
+0x49d215). The tiles are drawn in runs along the view's diagonals, x + y
+rising, and x rising along each run (0x4ad4bd calling 0x4ad8ac). A tile:
+
+- with no floor counts its blades by its grass value, as before;
+- with a floor and no diagonal wall counts none (0x49d155) and keeps the
+  previous tile's short-blade flag;
+- with a floor split by a diagonal wall (wall byte 0 & 0x30) keeps the
+  count and the flag of the tile drawn before it, whatever its own grass
+  (0x49d14b);
+- off the lot's inner tiles (1 to size − 2 in x and y) returns before
+  any of this and leaves the count as it was (0x49cecc); it draws no
+  blades here, as before.
+
+So the floorless half of a split tile beside a porch shows flat grass,
+and beside a lawn a full lawn. Before, it counted by its own grass.
+
+**Checked.** Against the original at the tick-570 world: near zoom (the
+porch view, origin 619, −1189) rose from 86.5% to 87.0% exact; of the
+2,402 pixels the change touches, 2,115 now match exactly (3 did before),
+and the mean channel error there fell from 21.1 to 4.6. Medium zoom
+(cutaway): 82.7% to 82.8%; of 771 pixels changed, 715 match (none did),
+error 16.6 to 0.3. At far zoom only a few pixels change: 8 at rotation
+1, all now exact (none were), and 9 at rotation 2, which match neither
+way. Tile (27, 28) on the Goth
+porch is one: the tile drawn before it, (26, 29), has a floor, so its
+empty half is flat in both.
+
+**Not ported.** The original clips each run to the screen before drawing
+it, so a tile off screen is not drawn and does not pass its count on;
+here every tile is in the order. A split tile at the screen's edge could
+take a count from a different tile. The pool test (0x47c16d), which
+gives a tile in a pool none, is still not looked at.
+
 ## 2026-11-15: The relationship panel lists who the Sim knows
 
 The live panel's Relationships button now opens the selected Sim's
@@ -4406,9 +4553,9 @@ control panel in the bottom-left corner.
   One depth model for floors and ground would settle it.
 - Grass on a pool, which the original leaves bare. Pools are not looked
   at.
-- A floor tile split by a diagonal wall. The original keeps the blade
-  count of whichever tile it drew before; here it counts by its own
-  grass.
+- A floor tile split by a diagonal wall. Now ported; see "A split floor
+  tile's grass keeps the blades of the tile drawn before it"
+  (2026-11-15).
 - Seasons, which swap the blade-height tables (0x6c629c, 0x6c62a8).
 - A flag at 0x8d that blanks the colors of tiles on the lot's edge. It
   is off in this capture and not modelled.

@@ -10,6 +10,7 @@ use crate::grass::{self, Grass};
 use crate::light::Light;
 use crate::lot::{self, Lot, WallCell};
 use crate::pools::{self, Pools};
+use crate::shadows;
 use sims_sim::{Object, World};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -370,9 +371,6 @@ impl Painter<'_> {
             for y in 0..self.lot.size as i32 {
                 let cell = Lot::cell(x as usize, y as usize);
                 let floor = self.lot.levels[index].floors[cell];
-                if floor == 0 {
-                    continue;
-                }
                 // The tile's top corner in the view.
                 let top = [[x, y], [x + 1, y], [x + 1, y + 1], [x, y + 1]]
                     .into_iter()
@@ -383,6 +381,10 @@ impl Painter<'_> {
                     .unwrap_or([x, y]);
                 let p = self.corner_screen(top, level);
                 let (view, height) = (self.rotate_corner(top), self.corner_elevation(top) / 16);
+                if floor == 0 {
+                    self.shadow(level, [x, y], p, view, height);
+                    continue;
+                }
                 let wall = self.lot.levels[index].walls[cell];
                 let halves = if floor == lot::SPLIT_FLOOR {
                     wall.split_floors().map(Some)
@@ -437,8 +439,72 @@ impl Painter<'_> {
                     }
                     self.stats.floors += 1;
                 }
+                self.shadow(level, [x, y], p, view, height);
             }
         }
+    }
+
+    /// Casts the floor shadow of tile (`x`, `y`) on `level`, whose top
+    /// corner is at screen point `p` and view corner `view` at terrain
+    /// height `height`: that of the first object on the tile that has one
+    /// (see [`crate::shadows`]).
+    fn shadow(&mut self, level: i32, [x, y]: [i32; 2], p: [i32; 2], view: [i32; 2], height: i32) {
+        let Some((code, strength)) = self.shadow_of(level, [x, y]) else {
+            return;
+        };
+        let index = (level - 1) as usize;
+        let byte = self.lot.light_at(index, [x * 16 + 8, y * 16 + 8]);
+        let strength = i32::from(strength) + 255 - Light::drawn_byte(byte).unwrap_or(255) as i32;
+        let zoom = self.camera.zoom.index();
+        // The mask sits where the plain floor tile would, centred by the
+        // tile's width rather than its own.
+        let tile = self.assets.floor(0, zoom).map(|image| image.width);
+        let Some(mask) = self.assets.shadow_mask(zoom, code) else {
+            return;
+        };
+        let at = [p[0] - tile.unwrap_or(mask.width) as i32 / 2, p[1]];
+        for my in 0..mask.height {
+            let row = at[1] + my as i32;
+            let at_least = self.depth.shadow(view, height, level, at[1], row);
+            for mx in 0..mask.width {
+                if let Some(s) = mask.shade(mx, my, strength) {
+                    self.canvas
+                        .shade(at[0] + mx as i32, row, at_least, Light::from_sum(s));
+                }
+            }
+        }
+    }
+
+    /// The shadow code, turned into the view, and strength of the first
+    /// object on a tile that casts a shadow (0x4ae844, 0x434e23).
+    fn shadow_of(&mut self, level: i32, [x, y]: [i32; 2]) -> Option<(u8, i16)> {
+        let grid = self
+            .world
+            .arrays
+            .get(&[3, 103][usize::try_from(level - 1).ok()?])?;
+        let cell = Lot::cell(usize::try_from(x).ok()?, usize::try_from(y).ok()?) * 2;
+        let word = grid.data.get(cell..cell + 2)?;
+        let mut next = i16::from_le_bytes([word[0], word[1]]);
+        // A chain longer than the lot's objects has looped.
+        for _ in 0..self.world.objects.len() {
+            let o = u16::try_from(next)
+                .ok()
+                .and_then(|id| self.world.objects.get(&id))?;
+            let visible = o.data.get(HIDDEN).is_none_or(|&w| w == 0)
+                && o.data.get(FLAGS).is_none_or(|&w| w & ZERO_EXTENT == 0);
+            if visible
+                && let Some(definition) = self.assets.definition(o.guid)
+                && !matches!(definition.kind, 2 | 9)
+                && let Some(code) = definition.shadow
+            {
+                let facing = o.data.get(FACING).copied().unwrap_or(0) / 2;
+                let code = shadows::rotate(code, facing.max(0) as u8);
+                let code = shadows::rotate(code, self.camera.rotation);
+                return Some((code, definition.shadow_strength));
+            }
+            next = o.slots.first()?.object;
+        }
+        None
     }
 
     /// Draws a grass tile in the original's four-pixel columns (see
@@ -1034,6 +1100,12 @@ fn rotate_direction(rotation: u8, [x, y]: [i32; 2]) -> [i32; 2] {
 /// An object's data word that hides it when not zero (the simulation's
 /// `HIDDEN`).
 const HIDDEN: usize = 34;
+/// Object data word 1: the way the object faces, in eighths of a turn.
+const FACING: usize = 1;
+/// Object data word 8, its flags, and the flag of an object that takes no
+/// room on its tile.
+const FLAGS: usize = 8;
+const ZERO_EXTENT: i16 = 4;
 
 /// An object's data word holding the light it gives.
 const LIGHT: usize = 51;
