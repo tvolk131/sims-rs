@@ -50,8 +50,9 @@
 //! The candidates keep the list's order (0x45bb04 appends each to a
 //! static vector), so the first one that agrees to move in step 2, and
 //! the first whose footprint holds a sample in step 3, are found in
-//! that order. An action that runs at once (interaction flag 4) and one
-//! that pushes queued actions out fail loudly.
+//! that order. An action that runs at once (interaction flag 4) fails
+//! loudly. One that goes in before queued actions drops them, each
+//! target told ([`Machine::queue_action`], 0x45d4c8).
 
 use crate::autonomy::{attenuation, find, person};
 use crate::fault::{Fault, Trap};
