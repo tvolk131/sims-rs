@@ -230,10 +230,10 @@ pub enum Align {
 /// measured on the original's screen (the second is also the color the
 /// old prototype captured for tutorial text).
 const GREEN: [u8; 3] = rgb565(0x2f2b);
-const LABEL: [u8; 3] = rgb565(0xc679);
+pub(crate) const LABEL: [u8; 3] = rgb565(0xc679);
 
 /// A 16-bit color widened to 8 bits a channel by repeating the high bits.
-const fn rgb565(c: u16) -> [u8; 3] {
+pub(crate) const fn rgb565(c: u16) -> [u8; 3] {
     let (r, g, b) = ((c >> 11) as u8, ((c >> 5) & 63) as u8, (c & 31) as u8);
     [
         (r << 3) | (r >> 2),

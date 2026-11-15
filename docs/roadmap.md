@@ -1565,26 +1565,39 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   digest at 800×600 and 1280×720, gated on `SIMS_INSTALL`. `sims-viewer
   --hud` shows it over the lot. Camera buttons move the camera; the
   other commands are printed, since the simulation cannot take them yet.
-- **Next:** a message dialog with buttons drawn from a real dialog
-  string; pie menus; the other live panels.
+- **Done: message dialogs.** The dialog a script's Dialog instruction
+  shows (one, two or three buttons) is read from the record and the
+  caller's string table and drawn with the original's fonts, icon and
+  button art. Measured against two screenshots of the original
+  ("Magic Town", "Studio Town"). Inside the frame they match except for
+  5 pixels, and the button except for its white label under the pointer.
+  The frame's corners are close but not exact. "Magic Town" is pinned by
+  layout and digest, gated on `SIMS_INSTALL`. `sims-viewer --hud` shows a
+  waiting dialog, and its answer is printed.
+- **Next:** open houses through `sims_vm::boot::Lot` (which now runs the
+  household load) in the tests and the viewer, in place of their
+  stand-in for steps 17 and 18; pie menus; a Yes/No dialog checked
+  against the original (the "Help System" one at tick 2) for the layout
+  of several buttons; text entry dialogs; the other live panels.
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
   - A command intake, for example `World::apply(&mut self, command:
     sims_sim::Command) -> Result<(), CommandError>`, run between ticks,
     taking: select a Sim (object ID), set the speed, pause or run, go
     to a mode, answer a dialog (caller, button), and choose a pie menu
     entry (Sim, object, interaction).
-  - A library form of the boot's household load (`sims boot` steps 17
-    and 18): `World::load_household(&mut self, family: &Family)` that
-    sets the funds and selects the first member. Today the CLI does it
-    and a host that opens a house gets the house file's funds and no
-    selection.
   - The household's member order kept in the world, for example
     `World::household(&self) -> &[u32]` (GUIDs), so the portraits do
     not need the neighborhood file.
   - The game speed, for example `World::speed(&self) -> u8`.
-  - A pending dialog's text resolved: `Dialog::text(&self, world:
-    &World) -> DialogText` with the message, the button labels and the
-    title, read from the caller's tree's string table.
+  - A way to leave a dialog waiting: `sims boot` answers each dialog as
+    it is made, so no snapshot holds one for the viewer to show. For
+    example, an answer policy in the boot runner that stops at the first
+    dialog without an answer and leaves it at status 0. The intake then
+    answers it.
+  - The frame that ran the Dialog instruction, for example
+    `Dialog::owner(&self) -> u16` (the code owner's type). Today the
+    interface takes the caller's top stack frame, which is right only
+    while the caller waits on the dialog.
   - Each Sim's current action and its icon, for the icons over the
     portraits.
 
