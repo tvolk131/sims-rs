@@ -72,16 +72,21 @@ impl Outfit {
         let mut parts: Vec<(String, String)> = [1, 17, 18, 2]
             .into_iter()
             .filter_map(|row| strings.get(row))
-            .map(|s| {
-                let first = s.split_once(';').map_or(s.as_str(), |(a, _)| a);
-                match first.split_once(',') {
-                    Some((name, textures)) => (name.trim().to_owned(), textures.trim().to_owned()),
-                    None => (first.trim().to_owned(), String::new()),
-                }
-            })
+            .map(|s| body_string(s))
             .collect();
         parts.retain(|(name, _)| !name.is_empty());
         Self { parts }
+    }
+}
+
+/// A body string's everyday appearance and its texture string: the part
+/// before any `;`, split at its first `,` (see
+/// [`Outfit::from_body_strings`]).
+pub fn body_string(s: &str) -> (String, String) {
+    let first = s.split_once(';').map_or(s, |(a, _)| a);
+    match first.split_once(',') {
+        Some((name, textures)) => (name.trim().to_owned(), textures.trim().to_owned()),
+        None => (first.trim().to_owned(), String::new()),
     }
 }
 

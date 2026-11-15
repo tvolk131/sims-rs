@@ -299,26 +299,23 @@ impl People {
     }
 
     /// What `person` (of the type `guid`) wears for their suit, or None
-    /// when they wear their record's clothes: for suit 0, and for a person
-    /// whose record names no body (one no clothes were chosen for yet,
-    /// who wears their type's default outfit).
+    /// for suit 0, whose clothes are the record's (or, for a record that
+    /// names no body, the type's default outfit).
     fn dress(&mut self, guid: u32, person: &Person) -> Result<Option<Outfit>, String> {
-        if person.data.get(SUIT).copied().unwrap_or(0) == 0
-            || person.appearance[0].trim().is_empty()
-        {
+        if person.data.get(SUIT).copied().unwrap_or(0) == 0 {
             return Ok(None);
         }
         let assets = &self.assets;
         let wardrobe = self.wardrobe.get_or_insert_with(|| Wardrobe::of(assets));
         let rows = self.cast.body_strings(guid)?;
         let clothes = dress(
-            &Clothes::of(person),
+            &Clothes::of(person, &rows),
             &person.data,
             &rows,
             self.cast.careers(),
             wardrobe,
         )?;
-        Ok(Some(clothes.wear(person)))
+        Ok(Some(clothes.wear(person, &rows)))
     }
 
     /// Each placed person whose body is loaded, posed as the world has

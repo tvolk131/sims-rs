@@ -273,8 +273,8 @@ fn mortimer_in_his_work_clothes() {
         "Mortimer's career"
     );
     data[suit::SUIT] = 3;
-    let worn = suit::Clothes::of(&mortimer.person);
     let rows = cast.body_strings(mortimer.guid).unwrap();
+    let worn = suit::Clothes::of(&mortimer.person, &rows);
     let clothes = suit::dress(
         &worn,
         &data,
@@ -290,7 +290,7 @@ fn mortimer_in_his_work_clothes() {
     assert_eq!(clothes.hands, worn.hands);
     let mut person = mortimer.person.clone();
     person.data = data;
-    let outfit = clothes.wear(&person);
+    let outfit = clothes.wear(&person, &rows);
     assert_eq!(outfit.parts[0], clothes.body);
     assert_eq!(
         outfit.parts.len(),
@@ -303,4 +303,37 @@ fn mortimer_in_his_work_clothes() {
             .any(|p| p.texture_name.as_deref() == Some("sciencemlgt_01")),
         "the coat is drawn with its texture"
     );
+}
+
+/// A person a script made has a record that names no clothes; their suit
+/// still dresses them, starting from their type's default outfit.
+#[test]
+fn a_person_with_no_chosen_clothes_still_wears_their_suit() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let cast = Cast::of_house(&root, &house).unwrap();
+    let assets = Assets::scan(&root).unwrap();
+    let people = residents(&root, &house).unwrap();
+    let mortimer = people.iter().find(|r| r.id == 21).unwrap();
+    let rows = cast.body_strings(mortimer.guid).unwrap();
+    let mut person = mortimer.person.clone();
+    person.appearance = Default::default();
+    person.accessories.clear();
+    person.data[suit::SUIT] = 3;
+    let worn = suit::Clothes::of(&person, &rows);
+    let defaults = Outfit::from_body_strings(&rows);
+    assert_eq!(worn.body, defaults.parts[0]);
+    let clothes = suit::dress(
+        &worn,
+        &person.data,
+        &rows,
+        cast.careers(),
+        &suit::Wardrobe::of(&assets),
+    )
+    .unwrap();
+    assert_eq!(clothes.body.0, "sciencemfit_01");
+    let outfit = clothes.wear(&person, &rows);
+    // The coat, the type's two hands and its head.
+    assert_eq!(outfit.parts[0], clothes.body);
+    assert_eq!(&outfit.parts[1..], &defaults.parts[1..]);
 }

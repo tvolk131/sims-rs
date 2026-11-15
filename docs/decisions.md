@@ -15,6 +15,8 @@ from matched names (`sims_people::suit`): 1, 2, 4, 17 and 18 from
 their entries; 3 from the career level (0x45ee5f); 5 from entry 33 or
 matched pajamas (0x45f034); a body left without a name falls back to
 entry 2 (0x58d492). Suit 0 keeps the record's own clothes, as before.
+A person whose record names no clothes (one a script made) starts from
+their type's default outfit, and their suit is applied to that.
 
 A career level names a male and a female body and a texture, as
 templates (`Science$g$b_01`, `Science$g$c_01`): `$g` is the sex's

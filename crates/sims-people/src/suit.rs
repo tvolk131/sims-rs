@@ -34,7 +34,7 @@
 //! the cache 0x45ee5f keeps by career and level, which can keep a
 //! person's old work clothes when only their age or sex changes.
 
-use crate::appearance::{Outfit, appearance_names};
+use crate::appearance::{Outfit, appearance_names, body_string};
 use crate::assets::Assets;
 use sims_formats::career::Level;
 use sims_formats::saved_objects::Person;
@@ -467,11 +467,31 @@ pub fn dress(
     Ok(clothes)
 }
 
+/// Whether `person`'s record names no body, as
+/// [`crate::house::Cast::residents`] tells (it then draws the type's
+/// default outfit).
+fn unchosen(person: &Person) -> bool {
+    person.appearance[0].trim().is_empty()
+}
+
 impl Clothes {
     /// The record's clothes: its body (appearance slots 0 and 1), left
     /// hand (4, 5) and right hand (6, 7).
-    pub fn of(person: &Person) -> Self {
+    ///
+    /// A record that names no body (a person a script made, whose clothes
+    /// were never chosen) gives instead the type's default outfit from its
+    /// body strings `rows`: the body (row 1), left hand (row 17) and right
+    /// hand (row 18), as [`Outfit::from_body_strings`] reads them.
+    pub fn of(person: &Person, rows: &[String]) -> Self {
         let a = &person.appearance;
+        if unchosen(person) {
+            let row = |n: usize| rows.get(n).map(|s| body_string(s)).unwrap_or_default();
+            return Self {
+                body: row(1),
+                extra: String::new(),
+                hands: [row(17), row(18)],
+            };
+        }
         Self {
             body: (a[0].clone(), a[1].clone()),
             extra: String::new(),
@@ -479,24 +499,34 @@ impl Clothes {
         }
     }
 
-    /// The outfit `person`'s record gives ([`Outfit::from_person`]) with
-    /// its body and hands replaced by these: the body, the extra part,
-    /// the hands, then the record's head and accessories.
-    pub fn wear(&self, person: &Person) -> Outfit {
-        let worn = Outfit::from_person(person);
-        let a = &person.appearance;
-        // The head and accessories: every part after the record's body and
-        // hands, whichever of those it names.
-        let skip = [&a[0], &a[4], &a[6]]
-            .iter()
-            .filter(|n| !n.is_empty())
-            .count();
+    /// The outfit `person` wears with its body and hands replaced by
+    /// these: the body, the extra part, the hands, then the head and
+    /// accessories of the record ([`Outfit::from_person`]), or for a record
+    /// that names no body the head of the type's body strings `rows` (row
+    /// 2, as [`Outfit::from_body_strings`] gives it).
+    pub fn wear(&self, person: &Person, rows: &[String]) -> Outfit {
+        let rest: Vec<Worn> = if unchosen(person) {
+            rows.get(2).map(|s| body_string(s)).into_iter().collect()
+        } else {
+            let a = &person.appearance;
+            // Every part after the record's body and hands, whichever of
+            // those it names.
+            let skip = [&a[0], &a[4], &a[6]]
+                .iter()
+                .filter(|n| !n.is_empty())
+                .count();
+            Outfit::from_person(person)
+                .parts
+                .into_iter()
+                .skip(skip)
+                .collect()
+        };
         let mut parts = vec![self.body.clone()];
         if !self.extra.is_empty() {
             parts.push((self.extra.clone(), String::new()));
         }
         parts.extend(self.hands.iter().cloned());
-        parts.extend(worn.parts.into_iter().skip(skip));
+        parts.extend(rest);
         parts.retain(|(name, _)| !name.is_empty());
         Outfit { parts }
     }
