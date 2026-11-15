@@ -80,22 +80,34 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     // Every entry routes through a queued action that runs at
     // once (0x45d240), which is not ported, and each refusal leaves the
     // lot as it was.
-    assert!(!menu.actions.is_empty());
+    assert!(!menu.entries.is_empty());
     assert!(
-        menu.actions
+        menu.entries
             .iter()
-            .all(|a| a.caller == sim as i16 && a.uid == 0)
+            .all(|e| e.action.caller == sim as i16 && e.action.uid == 0)
     );
     let before = lot.world().hash();
-    for action in menu.actions {
-        let refused = lot.pick(sim, action).unwrap_err().to_string();
+    for entry in menu.entries {
+        let refused = lot.pick(sim, entry.action).unwrap_err().to_string();
         assert!(refused.contains("0x45d240"), "{refused}");
         assert_eq!(lot.world().hash(), before);
     }
 
+    // The fridge's check tree names its entries, one for each meal.
+    let menu = lot.pie_menu(sim, 118).unwrap_or_else(|e| panic!("{e}"));
+    let named: Vec<_> = menu
+        .entries
+        .iter()
+        .filter_map(|e| e.name.as_deref())
+        .collect();
+    assert_eq!(
+        named,
+        ["Have Quick Breakfast", "Have Breakfast", "Serve Breakfast"]
+    );
+
     // Object 1's first entry is queued.
     let menu = lot.pie_menu(sim, 1).unwrap_or_else(|e| panic!("{e}"));
-    let action = menu.actions[0].clone();
+    let action = menu.entries[0].action.clone();
     let queued = lot.pick(sim, action).unwrap();
     assert!(queued.is_some());
     assert_eq!(queue(&lot).last().map(|a| a.uid), queued);

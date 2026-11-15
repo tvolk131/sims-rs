@@ -1001,6 +1001,11 @@ impl Machine<'_, '_> {
     /// 6. Flag 8 is set if it passed, and flag 0x10 is set or cleared by
     ///    whether the person's object data word 50 is set.
     ///
+    /// With `menu`, the check is the pie menu's listing's: the check tree
+    /// runs with the listing's state ([`crate::Interpreter`]'s `menu`),
+    /// holding the action as step 1 left it, and the entries the tree adds
+    /// (Add/Change Action String, 0x458789) are added to `menu`.
+    ///
     /// A queued action here is taken not to join another (its word +0,
     /// which the save does not keep, 0); 0x41f00e, which makes the pie
     /// menu's actions, writes 0 there.
@@ -1008,6 +1013,7 @@ impl Machine<'_, '_> {
         &mut self,
         action: &mut sims_formats::saved_objects::Interaction,
         saved: &mut Option<Vec<i16>>,
+        menu: Option<&mut Vec<crate::orders::MenuEntry>>,
     ) -> Result<(), Trap> {
         action.flags = (action.flags & !checked::PASSED) | checked::RAN;
         let Some(target) = u16::try_from(action.target).ok().filter(|&t| t != 0) else {
@@ -1089,7 +1095,18 @@ impl Machine<'_, '_> {
                     let tree = record.test;
                     let args = [0, 0, 0, 0, tree as i16];
                     let me = self.me;
-                    self.interpreter()
+                    let checking = menu.is_some().then(|| {
+                        std::cell::RefCell::new(crate::orders::Checking {
+                            action: action.clone(),
+                            added: Vec::new(),
+                        })
+                    });
+                    let outer = self.interpreter();
+                    let interpreter = crate::Interpreter {
+                        menu: checking.as_ref().or(outer.menu),
+                        ..outer
+                    };
+                    let passed = interpreter
                         .call_as(
                             self.world,
                             me,
@@ -1105,7 +1122,11 @@ impl Machine<'_, '_> {
                             Trap::Unsupported(format!(
                                 "check tree {tree:#06x} of object {target}: {fault}"
                             ))
-                        })?
+                        })?;
+                    if let (Some(menu), Some(checking)) = (menu, checking) {
+                        menu.extend(checking.into_inner().added);
+                    }
+                    passed
                 }
             }
         };

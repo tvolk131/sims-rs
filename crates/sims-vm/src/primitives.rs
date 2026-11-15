@@ -152,7 +152,7 @@ impl Machine<'_, '_> {
             36 => self.dialog(operands)?,
             37 => self.sim_interacting_with(operands)?.into(),
             49 => self.notify()?.into(),
-            50 => self.action_string()?.into(),
+            50 => self.action_string(operands)?.into(),
             51 => self.manage_inventory(operands)?.into(),
             opcode => return Err(Trap::Unimplemented { opcode }),
         })
