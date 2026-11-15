@@ -2125,6 +2125,13 @@ through their public interfaces only; the simulation never depends on it.
   Since #156 strict mode runs the order through step 3400 and stops at
   step 3401 (person 16 routes for an action that wants to be
   interrupted, 0x45afd2); without an order it runs to tick 2881.
+- **Done in play mode: selecting a Sim.** A press on a portrait selects
+  that Sim (0x445449, between ticks): the Sim selected before is
+  deselected, the indicators move, and the panel and the pie menus
+  follow the new Sim. Deselecting refreshes the old Sim's animator
+  (0x58da12), which is not ported, so in strict mode (`Lot::select`)
+  switching Sims fails and changes nothing; play mode
+  (`Lot::select_play`) leaves the refresh out.
 - **Next:** draw the menu with `sims_ui::pie` (#157), which is ported
   from the original's menu window, in place of the plain list.
 - **Needs from other crates:**
@@ -2143,6 +2150,14 @@ through their public interfaces only; the simulation never depends on it.
   - `sims-people`: which person drew each pixel (`draw_on_lot` with an
     owner per pixel), so `sims-game` need not repeat its drawing loop
     to find the person a click lands on.
+  - `sims-vm`: the animator's refresh (0x58da12), which deselecting a
+    Sim makes, so strict mode can switch Sims.
+  - `sims-audio`: the inputs the game cannot give yet (the camera
+    value of the ambience's cursor, 0x570c3e, is ported, #160): what
+    the sound scripts' `getsrcdatafield` fields are (`sims-game`
+    answers 0 to every one; an object's place on screen, for its pan,
+    is presumably among them, unread), and what pausing the game does
+    to the sounds playing (the pause events are not ported).
 
 ## Working rules
 
