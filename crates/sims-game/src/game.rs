@@ -347,9 +347,12 @@ impl Game {
         true
     }
 
-    /// Moves the camera.
+    /// Moves the camera. A turn is the lot's input too: Generic Sims Call
+    /// 12 reads the view's rotation ([`Lot::set_view_rotation`]).
     pub fn apply(&mut self, command: Move) -> bool {
-        self.view.apply(command)
+        let moved = self.view.apply(command);
+        self.lot.set_view_rotation(self.view.camera.rotation);
+        moved
     }
 
     /// Whether the panel takes presses at `point`.
@@ -580,8 +583,14 @@ impl Game {
                 UiCamera::ZoomIn => moved(&mut self.view, Move::ZoomIn),
                 UiCamera::ZoomOut => moved(&mut self.view, Move::ZoomOut),
                 // Which way the original turns for each is unverified.
-                UiCamera::RotateRight => moved(&mut self.view, Move::Rotate(true)),
-                UiCamera::RotateLeft => moved(&mut self.view, Move::Rotate(false)),
+                UiCamera::RotateRight => {
+                    self.apply(Move::Rotate(true));
+                    Outcome::redraw()
+                }
+                UiCamera::RotateLeft => {
+                    self.apply(Move::Rotate(false));
+                    Outcome::redraw()
+                }
                 UiCamera::FloorUp => moved(&mut self.view, Move::LevelUp),
                 UiCamera::FloorDown => moved(&mut self.view, Move::LevelDown),
                 UiCamera::Walls(w) => moved(

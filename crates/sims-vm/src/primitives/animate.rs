@@ -54,11 +54,11 @@
 //!
 //! **Not ported**, failing loudly: names listed anywhere but the global
 //! animation tables and an object's own (byte 4 other than 3 and 0), a
-//! clip that is missing, the timed events `clip_events.rs` does not port,
-//! a clip with timed events in the base slot, and a person whose posture
-//! is 1 or 2 when its clip is done. The original also notes an unexpected
+//! clip that is missing, and the timed events `clip_events.rs` does not
+//! port. The original also notes an unexpected
 //! event in its log when logging is on (0x6f2a44); that is not modeled.
 
+use crate::animator::clear_base;
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine, word};
 use crate::people::read_appearance_if_stale;
@@ -413,10 +413,9 @@ impl Machine<'_, '_> {
     ///
     /// The original goes on when the clip is not found (0x592726 then
     /// fails, and 0x452bed reports it); here a clip that is not found
-    /// fails, as it does for the foreground. A clip with timed events
-    /// fails too (0x5992b3): the skin's update would handle them, at a
-    /// place in the skin's list that is not kept, from a layer whose clock
-    /// is not kept.
+    /// fails, as it does for the foreground. The layer is kept in
+    /// [`sims_sim::World::base_layers`] and updated with the skin's others
+    /// in the animator's tick, timed events included.
     fn animate_base(
         &mut self,
         a: &mut Animator,
@@ -425,30 +424,21 @@ impl Machine<'_, '_> {
     ) -> Result<Flow, Trap> {
         let flags = operands[5];
         if id == 0 {
-            if a.base.is_filled() {
-                a.base = Base::Empty;
-                a.skin_dirty = true;
-            }
+            clear_base(self.world, self.me, a);
             return Ok(Flow::Branch(true));
         }
         read_appearance_if_stale(self.world, self.program, self.me, &mut a.profile_stale)?;
-        let (name, _, _, _, tracks) = self.clip(operands, id)?;
-        if tracks > 0 {
-            return Err(Trap::Unsupported(format!(
-                "Animate Sim plays clip {name:?} in the base slot, which has timed events the \
-                 skin's update would handle (0x5992b3); the base layer's clock and place in \
-                 the skin are not kept"
-            )));
-        }
+        let (name, _, _, _, _) = self.clip(operands, id)?;
         a.slow = flags & 0x80 != 0;
-        // 0x592726 clears the slot first (0x592878, at once) and puts the
-        // new layer in the skin; either marks the skin's layers changed.
+        let reverse = flags & 0x02 != 0;
+        let start = a.clock_at(self.world.ticks as i32);
+        self.interpreter()
+            .start_base(self.world, self.me, a, &name, reverse, start)?;
         a.base = Base::Script {
             clip: name,
-            reverse: flags & 0x02 != 0,
-            start: a.clock_at(self.world.ticks as i32),
+            reverse,
+            start,
         };
-        a.skin_dirty = true;
         Ok(Flow::Branch(true))
     }
 

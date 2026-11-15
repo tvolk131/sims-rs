@@ -30,10 +30,11 @@
 //!    appearance again if the animator says so
 //!    ([`Animator::profile_stale`]); then the clip goes into the base slot
 //!    (0x592726) to repeat at priority -10, which marks the skin's layers
-//!    changed. A clip the lookup does not find (0x59db2f, which leaves the
-//!    slot empty) was never seen and fails, as does a base clip with timed
-//!    events, which the skin's update would handle (0x5992b3) and which
-//!    are not kept.
+//!    changed; its playback is kept in [`World::base_layers`] and updated
+//!    with the skin's others in the tail, timed events included. A
+//!    posture whose clip has no name (0x59db2f gives none) starts nothing
+//!    and leaves the slot as it was (0x5904af), to be tried again on the
+//!    next tick. A name no file holds fails ([`Interpreter::start_base`]).
 //! 5. The speed moves towards the speed wanted (0x588fa0) by at most 0.2
 //!    up; down it moves at once.
 //! 6. An animator whose person stands off the lot (0x422632) does nothing
@@ -67,6 +68,16 @@
 //! fields (+0x18 to +0x28) which only states 6 to 10 read. That none of
 //! this changes what the simulation reads is **unverified**.
 //!
+//! A person that takes itself off the lot during its own tick (Find
+//! Location, [`Interpreter::take_self_off`]) has its animator refreshed
+//! there if the house view drew it (0x58da12, animator byte +0x109): a
+//! small tick of the clock, the skin forced, the place and the head.
+//! Whether the view drew it is not kept, so the take-off checks that the
+//! refresh would write nothing but the animator and its base layer
+//! ([`Interpreter::refresh_at_take_off`]), and the animator's tick that
+//! the refresh then the tick reach what the tick alone does
+//! ([`Interpreter::tick_animator_after_take_off`]); anything else fails.
+//!
 //! The person's tick passes the animator a flag (byte 0x6e48c0 is 0)
 //! that picks which skin routine runs first (0x5a0ffd or 0x5a0ef5); either
 //! way the layers are updated once, and which routine ran changes only the
@@ -75,11 +86,12 @@
 use crate::fault::Trap;
 use crate::interpreter::Interpreter;
 use crate::people::read_appearance_if_stale;
-use crate::placement::{Place, on_lot, pool_tile};
+use crate::placement::{Kept, Pending, Place, on_lot, pool_tile};
 use sims_core::{Ext, F32};
 use sims_sim::World;
 use sims_sim::animator::{Animator, Base, EPSILON, LOADED, Layer, UNSET};
 use sims_sim::pose;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 
 /// Person data words.
@@ -89,6 +101,8 @@ const KIND: usize = 65;
 const DIRECTION: usize = 1;
 /// The word 0x588fa0 tests for 1 (object +0x6c).
 const PACE: usize = 17;
+/// The priority of the base slot's layer (0x5904c1, 0x58957e).
+const BASE_PRIORITY: i32 = -10;
 /// The definition word whose bit 2 keeps the base layer from starting
 /// (definition +0xcc).
 const DEFINITION_FLAGS: usize = 102;
@@ -186,30 +200,7 @@ impl Interpreter<'_> {
         }
 
         // 0x5992b3: the skin's update.
-        if a.skin_dirty || now != a.skin_clock {
-            // 0x5991fd: a changed skin first sorts its layers by priority,
-            // lowest first, keeping the order of layers of the same
-            // priority. Every change marks the skin changed, so the layers
-            // are always in that order when they update: the list's own
-            // order (Animator::carry_first) decides only a tie.
-            let carry_first = match (&a.carry, &a.foreground) {
-                (Some(carry), Some(foreground)) => match carry.priority.cmp(&foreground.priority) {
-                    Ordering::Less => true,
-                    Ordering::Greater => false,
-                    Ordering::Equal => a.carry_first,
-                },
-                _ => a.carry_first,
-            };
-            a.skin_dirty = false;
-            if carry_first {
-                self.update_carry(world, id, &mut a, now)?;
-                self.update_foreground(world, id, &mut a, now)?;
-            } else {
-                self.update_foreground(world, id, &mut a, now)?;
-                self.update_carry(world, id, &mut a, now)?;
-            }
-            a.skin_clock = now;
-        }
+        self.update_skin(world, id, &mut a, now, false)?;
         place(&mut a, position, direction);
 
         // 0x590768, 0x5904d2 and 0x590b27: the head.
@@ -220,6 +211,191 @@ impl Interpreter<'_> {
 }
 
 impl Interpreter<'_> {
+    /// The skin's update at clock `now` (0x5992b3): unless `force`d, only
+    /// when its layers changed or it was last updated at another clock.
+    fn update_skin(
+        &self,
+        world: &mut World,
+        id: u16,
+        a: &mut Animator,
+        now: i32,
+        force: bool,
+    ) -> Result<(), Trap> {
+        if !force && !a.skin_dirty && now == a.skin_clock {
+            return Ok(());
+        }
+        // 0x5991fd: a changed skin first sorts its layers by priority,
+        // lowest first, keeping the order of layers of the same priority.
+        // Every change marks the skin changed, so the layers are always in
+        // that order when they update: the list's own order
+        // (Animator::carry_first) decides only a tie.
+        let carry_first = carry_first(a);
+        a.skin_dirty = false;
+        // The base layer, at priority -10, is the lowest.
+        self.update_base_layer(world, id, a, now)?;
+        if carry_first {
+            self.update_carry(world, id, a, now)?;
+            self.update_foreground(world, id, a, now)?;
+        } else {
+            self.update_foreground(world, id, a, now)?;
+            self.update_carry(world, id, a, now)?;
+        }
+        a.skin_clock = now;
+        self.note_translations(world, id, a)
+    }
+
+    /// Notes in [`World::translated_bones`] the bones whose translation a
+    /// layer of person `id`'s skin could have written at its update:
+    /// every motion with positions of each layer with something bound,
+    /// frames and weight (0x597c4c, 0x598226). The original samples only
+    /// when its update is asked to pose (0x59820a), and a motion's
+    /// positions only up to the clip's count; neither is told apart here,
+    /// so the set may hold more than the original moved.
+    fn note_translations(&self, world: &mut World, id: u16, a: &Animator) -> Result<(), Trap> {
+        let base = world.base_layers.get(&id);
+        let layers = [base, a.foreground.as_ref(), a.carry.as_ref()];
+        let mut moved = Vec::new();
+        for layer in layers.into_iter().flatten() {
+            if !layer.bound || layer.frames == 0 || layer.weight.ext() <= Ext::ZERO {
+                continue;
+            }
+            let clip = self.program.animations.clip(&layer.clip).map_err(|e| {
+                Trap::Unsupported(format!(
+                    "person {id}'s skin samples a clip {:?} that cannot be found (0x59dc32): {e}",
+                    layer.clip
+                ))
+            })?;
+            moved.extend(
+                clip.channels
+                    .iter()
+                    .filter(|c| c.translation.is_some())
+                    .map(|c| &c.bone),
+            );
+        }
+        if moved.is_empty() {
+            return Ok(());
+        }
+        let known = world.translated_bones.entry(id).or_default();
+        for bone in moved {
+            if !known.contains(bone) {
+                known.insert(bone.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Person `id`'s animator refresh as a take-off makes it when the
+    /// house view drew the person (0x58da12 with +0x109 set; see
+    /// [`Interpreter::take_self_off`]): the clock read again, the skin's
+    /// update forced at it, the animator placed, and the head's step,
+    /// measurement and restoration. What the original also does there and
+    /// the animator's tick leaves out (the draw state, the face, the pose)
+    /// is left out here too, and so is the redraw of what the head slot
+    /// holds (`crate::placement::head_slot_redraw`), which is checked
+    /// before.
+    fn refresh_animator(&self, world: &mut World, id: u16) -> Result<(), Trap> {
+        let object = world
+            .objects
+            .get(&id)
+            .ok_or_else(|| Trap::native(10, "missing object"))?;
+        let position = object.position;
+        let direction = object.data.get(DIRECTION).copied().unwrap_or(0);
+        let mut a = world.animators.get(&id).cloned().unwrap_or(LOADED);
+        let now = a.clock_at(world.ticks as i32);
+        a.clock = now;
+        self.update_skin(world, id, &mut a, now, true)?;
+        place(&mut a, position, direction);
+        self.look(world, id, &mut a)?;
+        world.animators.insert(id, a);
+        Ok(())
+    }
+
+    /// Person `id`'s animator refresh at its taking itself off the lot
+    /// ([`Interpreter::take_self_off`]), worked out on a copy of `world`
+    /// as the take-off leaves it. It fails unless the refresh writes
+    /// nothing but the person's animator and base layer and plays no
+    /// sound, so that what runs before the person's animator tick sees
+    /// the same lot whether or not the original made it. The sounds of
+    /// timed events are not modeled, so a timed event with a sound key
+    /// fails here ([`crate::clip_events`]).
+    pub(crate) fn refresh_at_take_off(&self, world: &World, id: u16) -> Result<Pending, Trap> {
+        let sounds = RefCell::new(Vec::new());
+        let apart = Interpreter {
+            sounds: self.sounds.map(|_| &sounds),
+            take_off_refresh: true,
+            ..*self
+        };
+        let mut refreshed = world.clone();
+        apart.refresh_animator(&mut refreshed, id)?;
+        let pending = Pending {
+            left: Kept::of(world, id),
+            refreshed: Kept::of(&refreshed, id),
+        };
+        pending.left.restore(&mut refreshed, id);
+        if refreshed.encode() != world.encode() || !sounds.borrow().is_empty() {
+            return Err(Trap::Unsupported(format!(
+                "person {id} took itself off the lot, and its animator's refresh there (0x58da12), \
+                 made only if the house view drew it (animator byte +0x109, which is not kept), \
+                 would write more than its animator or play a sound"
+            )));
+        }
+        Ok(pending)
+    }
+
+    /// Person `id`'s animator tick after it took itself off the lot in its
+    /// thread's run, with its animator's refresh there worked out
+    /// (`pending`, [`Interpreter::refresh_at_take_off`]). Whether the
+    /// original made the refresh is not known, so both branches must
+    /// agree:
+    ///
+    /// 1. The animator and its base layer are as the take-off left them,
+    ///    so nothing in between wrote them (the primitives allowed in
+    ///    between, [`crate::placement::reads_no_animator`], read none of
+    ///    them).
+    /// 2. The tick from the refreshed animator and base layer, on the lot
+    ///    as it is now, reaches the same world, and the same sounds, as
+    ///    the tick alone.
+    ///
+    /// The tick alone is what is kept. Anything else fails.
+    pub(crate) fn tick_animator_after_take_off(
+        &self,
+        world: &mut World,
+        id: u16,
+        pending: Pending,
+    ) -> Result<(), Trap> {
+        let refused = |what: &str| {
+            Trap::Unsupported(format!(
+                "person {id} took itself off the lot and {what}, so whether the house view drew \
+                 it, which decides its animator's refresh at the take-off (0x58da12, animator \
+                 byte +0x109), matters; that is not kept"
+            ))
+        };
+        if Kept::of(world, id) != pending.left {
+            return Err(refused(
+                "its animator or base layer changed before its animator's tick",
+            ));
+        }
+        let sounds = RefCell::new(Vec::new());
+        let apart = Interpreter {
+            sounds: self.sounds.map(|_| &sounds),
+            ..*self
+        };
+        let mut refreshed = world.clone();
+        pending.refreshed.restore(&mut refreshed, id);
+        apart.tick_animator(&mut refreshed, id)?;
+        let before = self.sounds.map_or(0, |s| s.borrow().len());
+        self.tick_animator(world, id)?;
+        let same_sounds = self
+            .sounds
+            .is_none_or(|s| s.borrow()[before..] == sounds.borrow()[..]);
+        if refreshed.encode() != world.encode() || !same_sounds {
+            return Err(refused(
+                "the refresh then the tick reach another state than the tick alone",
+            ));
+        }
+        Ok(())
+    }
+
     /// Updates the foreground layer, if there is one, at clock `now`
     /// ([`Interpreter::update_layer`]).
     fn update_foreground(
@@ -235,6 +411,31 @@ impl Interpreter<'_> {
             updated?;
         }
         Ok(())
+    }
+
+    /// Updates the base slot's layer, if there is one, at clock `now`
+    /// ([`Interpreter::update_layer`]). A filled slot with no layer kept
+    /// is a broken state.
+    fn update_base_layer(
+        &self,
+        world: &mut World,
+        id: u16,
+        a: &mut Animator,
+        now: i32,
+    ) -> Result<(), Trap> {
+        match (a.base.is_filled(), world.base_layers.remove(&id)) {
+            (false, None) => Ok(()),
+            (true, Some(mut layer)) => {
+                let updated = self.update_layer(world, id, a, &mut layer, now);
+                world.base_layers.insert(id, layer);
+                updated
+            }
+            (filled, _) => Err(Trap::Invalid(format!(
+                "person {id}'s base slot is {} but its layer is {}",
+                if filled { "filled" } else { "empty" },
+                if filled { "missing" } else { "kept" },
+            ))),
+        }
     }
 
     /// Updates the carry layer, if there is one, at clock `now`
@@ -531,12 +732,11 @@ impl Interpreter<'_> {
             .data;
         let posture = i32::from(words.get(POSTURE).copied().unwrap_or(0));
         let kind = words.get(KIND).copied().unwrap_or(0);
-        if a.posture != posture && a.base.is_filled() {
+        if a.posture != posture {
             // 0x592878 removes the base slot's layer at once (0x5a0a7b),
             // which marks the skin's layers changed (0x5991d4). A clip
             // Animate Sim put there goes the same way.
-            a.base = Base::Empty;
-            a.skin_dirty = true;
+            clear_base(world, id, a);
         }
         // A layer in the slot stays for a person of kind at most 1,
         // whoever started it; for any other kind the posture's clip
@@ -545,50 +745,59 @@ impl Interpreter<'_> {
             a.posture = posture;
             if let Some(selection) = base_selection(posture) {
                 read_appearance_if_stale(world, self.program, id, &mut a.profile_stale)?;
-                // Posture 0's clip was found every time the captures show
-                // (a base layer after each start), so it is not looked up
-                // here; postures 1 and 2 are, to fail loudly on a clip that
-                // is missing or has timed events.
-                if posture != 0 {
-                    self.check_base_clip(world, id, posture, selection)?;
-                }
-                // 0x592726 empties the slot first (0x592878, at once) and
-                // adds the new layer to the skin; either marks the skin's
-                // layers changed.
+                // 0x5904af: with no name the lookup gives no clip, and
+                // nothing starts.
+                let Some(name) = self.posture_clip(world, id, selection)? else {
+                    return Ok(());
+                };
+                let now = a.clock_at(world.ticks as i32);
+                self.start_base(world, id, a, &name, false, now)?;
                 a.base = Base::Posture;
-                a.skin_dirty = true;
             }
         }
         Ok(())
     }
 
-    /// Looks up the base clip of `posture` for person `id` (0x5904af,
-    /// then 0x59dc32), failing loudly where it is not found or has timed
-    /// events, which the skin's update would handle (0x5992b3) and which
-    /// are not kept.
-    fn check_base_clip(
+    /// Starts clip `name` in person `id`'s base slot at clock `now`
+    /// (virtual function 0x100, 0x592726, then +0x40 = 1 and 0x59867f
+    /// with -10, as 0x5904b9 and Animate Sim's 0x58957e both do): the
+    /// slot is emptied first (virtual function 0x104, 0x592878, at once)
+    /// and the new layer made at priority 1 at the clock, forward from
+    /// phase 0 or, with `reverse`, backward from phase 1 (0x597a88,
+    /// 0x59281b); then it repeats (end mode 1) at priority -10. Either
+    /// step marks the skin's layers changed. The caller says what the
+    /// slot holds ([`Animator::base`]); the layer goes to
+    /// [`World::base_layers`].
+    ///
+    /// Fails for what is not ported: a name no file holds, which the
+    /// lookup (0x592625, 0x59dc32) or the start (0x592726 failing at
+    /// 0x592748) would pass over.
+    pub(crate) fn start_base(
         &self,
-        world: &World,
+        world: &mut World,
         id: u16,
-        posture: i32,
-        selection: usize,
+        a: &mut Animator,
+        name: &str,
+        reverse: bool,
+        now: i32,
     ) -> Result<(), Trap> {
-        let name = self.posture_clip(world, id, selection)?.ok_or_else(|| {
-            unsupported(
-                "0x5904af",
-                &format!("has no name for the base clip of posture {posture}"),
-            )
-        })?;
         let clip =
-            self.program.animations.clip(&name).map_err(|e| {
+            self.program.animations.clip(name).map_err(|e| {
                 unsupported("0x59dc32", &format!("finds no base clip {name:?}: {e}"))
             })?;
-        if clip.tracks.iter().any(|track| !track.events.is_empty()) {
-            return Err(unsupported(
-                "0x5992b3",
-                &format!("plays base clip {name:?}, which has timed events"),
-            ));
-        }
+        let mut layer = Layer::start(
+            name,
+            F32::from_bits(clip.duration),
+            clip.frames,
+            clip.motions > 0,
+            clip.tracks.len(),
+            reverse,
+            now,
+        );
+        layer.mode = 1;
+        layer.priority = BASE_PRIORITY;
+        world.base_layers.insert(id, layer);
+        a.skin_dirty = true;
         Ok(())
     }
 
@@ -2106,6 +2315,33 @@ fn heading(dx: Ext, dy: Ext) -> Ext {
         heading = (heading - eight).single();
     }
     heading
+}
+
+/// Whether the skin's update reaches the carry layer before the
+/// foreground layer: the lower priority first (0x5991fd), and between
+/// equal priorities the order of the skin's list
+/// ([`Animator::carry_first`]).
+pub(crate) fn carry_first(a: &Animator) -> bool {
+    match (&a.carry, &a.foreground) {
+        (Some(carry), Some(foreground)) => match carry.priority.cmp(&foreground.priority) {
+            Ordering::Less => true,
+            Ordering::Greater => false,
+            Ordering::Equal => a.carry_first,
+        },
+        _ => a.carry_first,
+    }
+}
+
+/// Empties person `id`'s base slot, if it holds a layer (virtual
+/// function 0x104, 0x592878): the base slot's layer is always removed at
+/// once (0x592890, 0x5a0a7b), which marks the skin's layers changed
+/// (0x5991d4).
+pub(crate) fn clear_base(world: &mut World, id: u16, a: &mut Animator) {
+    if a.base.is_filled() {
+        a.base = Base::Empty;
+        a.skin_dirty = true;
+    }
+    world.base_layers.remove(&id);
 }
 
 /// The foreground clip is cleared (virtual function 0xfc, 0x586b63): a

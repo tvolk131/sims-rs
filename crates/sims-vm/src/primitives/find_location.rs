@@ -26,7 +26,8 @@
 //! Mode 1 takes the object off the lot (0x44b519 to 0x44b565): its virtual
 //! function 0x50 runs, asked to tell the registry (as Remove Object
 //! Instance's queue does, [`crate::Interpreter::take_off`]), and the true
-//! branch is taken. The original first tests a tile of a group (definition
+//! branch is taken. A person can take only itself off, during its own
+//! tick (`Interpreter::take_self_off`, for its animator's refresh). The original first tests a tile of a group (definition
 //! +0x14 set) with 0x42344e and may then call 0x42346a on it. That is not
 //! decoded, so a tile of a group fails loudly, as it does for Remove
 //! Object Instance.
@@ -83,9 +84,16 @@ impl Machine<'_, '_> {
                 ));
             }
             let me = self.me;
-            self.interpreter()
-                .take_off(self.world, target, true)
-                .map_err(|fault| fault.nested(me))?;
+            let interpreter = self.interpreter();
+            if target == me && self.world.objects[&target].person.is_some() {
+                interpreter
+                    .take_self_off(self.world, target)
+                    .map_err(|fault| fault.nested(me))?;
+            } else {
+                interpreter
+                    .take_off(self.world, target, true)
+                    .map_err(|fault| fault.nested(me))?;
+            }
             return Ok(true);
         }
         let rules = Rules {

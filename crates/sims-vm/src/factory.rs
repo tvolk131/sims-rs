@@ -343,6 +343,8 @@ impl<'a> Machine<'a, '_> {
         }
         self.world.person_ticks.remove(&id);
         self.world.animators.remove(&id);
+        self.world.base_layers.remove(&id);
+        self.world.translated_bones.remove(&id);
         if person {
             let clock = LOADED.clock_at(self.world.ticks as i32);
             self.world.animators.insert(id, Animator::new(clock));
