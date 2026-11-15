@@ -25,7 +25,9 @@ The order inside 0x458319 is:
    (0x458524).
 4. When the target is in another room than the person, the room motive's
    delta becomes its minimum negated, in the record (0x45853f). This
-   happens whatever the check returned.
+   happens whatever the check returned. Both rooms are read after the
+   check tree (0x45852f, 0x458536), so a check that moves either object
+   counts. Before, the port compared the rooms from before the scan.
 
 Scopes 12, 28 and 29 (0x453a09, 0x453a42, 0x453a7a) read [0x6c437c] in
 any tree, so a check tree the pie menu runs reads and writes whatever the

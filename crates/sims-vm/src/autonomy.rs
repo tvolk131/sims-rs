@@ -357,7 +357,6 @@ struct Chooser {
     cat: bool,
     pets_outside: bool,
     autonomy: i16,
-    room: i16,
     residential: bool,
     constants: Constants,
 }
@@ -446,7 +445,6 @@ impl Machine<'_, '_> {
             cat,
             pets_outside: word(person::PETS_OUTSIDE) != 0,
             autonomy: word(person::AUTONOMY),
-            room: object.data.get(data::ROOM).copied().unwrap_or(0),
             residential: zoning == 1,
             constants,
         };
@@ -838,7 +836,6 @@ impl Machine<'_, '_> {
         if !fits || !allowed {
             return Ok(None);
         }
-        let room = target_data(data::ROOM);
         // 0x4763c5 copies as many as both have (the record always has
         // sixteen), so the rest stay as the last copy left them.
         let mut ads = match self.world.advertisement_record {
@@ -911,9 +908,22 @@ impl Machine<'_, '_> {
         } else {
             true
         };
-        // The check adjusts the record itself (0x45853f).
+        // The check tree may have moved either object: both rooms are read
+        // after it (0x45852f, 0x458536), and the record itself is adjusted
+        // (0x45853f).
+        let room_of = |world: &sims_sim::World, id: u16| {
+            world
+                .objects
+                .get(&id)
+                .map(|o| o.data.get(data::ROOM).copied().unwrap_or(0))
+                .ok_or_else(|| {
+                    Trap::Unsupported(format!(
+                        "object {id} deleted by a check tree, whose room 0x45852f reads after it"
+                    ))
+                })
+        };
         let mut ads = self.world.advertisement_record.unwrap_or(ads);
-        if room != chooser.room {
+        if room_of(self.world, entry.target)? != room_of(self.world, me)? {
             ads[13].delta = ads[13].minimum.wrapping_neg();
         }
         self.world.advertisement_record = Some(ads);

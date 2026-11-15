@@ -500,6 +500,49 @@ fn an_entry_with_fewer_advertisements_keeps_the_rest_of_the_last_copy() {
     assert!(fault.to_string().contains("0x6e5100"), "{fault}");
 }
 
+/// The room adjustment compares the rooms after the check tree (0x45852f,
+/// 0x458536), and changes the record whatever the check returned.
+#[test]
+fn the_room_adjustment_reads_the_rooms_the_check_left() {
+    const ROOM: i16 = 29;
+    let mut fx = lot(0x100);
+    // Menu 3's check, which runs on the Sim, moves the Sim to room 1 and
+    // fails.
+    fx.add(
+        LAMP_FILE,
+        CHECK,
+        tree(vec![assign(
+            scope::MY_DATA,
+            ROOM,
+            scope::LITERAL,
+            1,
+            RETURN_FALSE,
+        )]),
+    );
+    let table = fx
+        .program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .interactions
+        .get_mut(&TABLE)
+        .unwrap()
+        .as_mut()
+        .unwrap();
+    table.interactions[0].test = CHECK;
+    table.interactions[0].motives[13].minimum = 123;
+    table.interactions[0].motives[13].delta = 456;
+    // Both start in room 0.
+    fx.lamp_mut().data[ROOM as usize] = 0;
+    fx.sim_mut().data[ROOM as usize] = 0;
+    assert_eq!(turn(&mut fx), Status::Yielded);
+    assert_eq!(fx.sim().data[ROOM as usize], 1);
+    // Menu 5 was chosen; menu 3's failed check left its record, adjusted.
+    assert_eq!(fx.sim().data[20], 5);
+    let record = fx.world.advertisement_record.unwrap();
+    assert_eq!((record[13].minimum, record[13].delta), (123, -123));
+}
+
 /// Outside a check tree, the advertisement scopes read and write the
 /// record the last check left (0x453a09 always reads [0x6c437c]), as a
 /// check tree the pie menu runs does.
