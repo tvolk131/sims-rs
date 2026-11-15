@@ -65,11 +65,13 @@
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Status, Stream};
+use crate::play::{Play, Recovery, ScriptError};
 use crate::primitives::dialog::{self, DONE, NEW, SHOWN};
 use crate::selection::selected;
 use sims_sim::motives::{self, Tuning};
 use sims_sim::rooms::Room;
 use sims_sim::{PersonTick, World};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -232,6 +234,14 @@ pub struct Update {
     pub answered: Vec<(u16, u8)>,
     /// The objects the registry removed.
     pub removed: Vec<u16>,
+    /// In play mode, the error caught in an object's tick, if any, and
+    /// what was done about it ([`crate::play`]). Always empty in strict
+    /// mode.
+    pub errors: Vec<ScriptError>,
+    /// In play mode, the frames of the house view drawn with this step
+    /// that failed, and were skipped ([`crate::boot::Lot::step_play`]), in
+    /// the order they were drawn. Always empty in strict mode.
+    pub frame_errors: Vec<String>,
 }
 
 impl Interpreter<'_> {
@@ -244,15 +254,39 @@ impl Interpreter<'_> {
         tuning: &Tuning,
         player: &mut dyn Player,
     ) -> Result<Update, TickError> {
+        self.lot_update_with(world, tuning, player, None)
+    }
+
+    /// One lot update, in play mode when `play` is given ([`crate::play`]):
+    /// an error in an object's tick is caught and the object reset, and
+    /// the update goes on.
+    pub fn lot_update_with(
+        &self,
+        world: &mut World,
+        tuning: &Tuning,
+        player: &mut dyn Player,
+        play: Option<&mut Play>,
+    ) -> Result<Update, TickError> {
         let mut update = Update::default();
+        // In play mode the deletions are noted, so that an object reset
+        // and a later one given its ID are told apart (Interpreter::recover).
+        let deleted = RefCell::new(Vec::new());
+        let this = match play {
+            Some(_) => Interpreter {
+                deleted: Some(&deleted),
+                ..*self
+            },
+            None => Interpreter { ..*self },
+        };
+        let mut play = play;
         let lot = Interpreter {
             stream: Stream::Lot,
-            ..*self
+            ..this
         };
-        update.full = lot.scheduler_pass(world, tuning, &mut update)?;
+        update.full = lot.pass(world, tuning, &mut update, play.as_deref_mut())?;
         let game = Interpreter {
             stream: Stream::Global,
-            ..*self
+            ..this
         };
         let mut signal = None;
         let mut hour_turned = false;
@@ -282,6 +316,11 @@ impl Interpreter<'_> {
             }
         }
         game.end_of_update(world, !update.full, player, &mut update)?;
+        if let Some(play) = play {
+            for gone in deleted.take() {
+                play.fresh.remove(&gone);
+            }
+        }
         // Signal 0xdb reaches only the interface among the subscribers
         // (see the module's documentation).
         let _ = signal;
@@ -338,6 +377,20 @@ impl Interpreter<'_> {
         tuning: &Tuning,
         update: &mut Update,
     ) -> Result<bool, TickError> {
+        self.pass(world, tuning, update, None)
+    }
+
+    /// The scheduler's pass, in play mode when `play` is given: a fault in
+    /// an object's tick is dealt with as the original deals with a
+    /// SimAntics error ([`crate::play`]), and the pass stops partial with
+    /// the cursor on the object.
+    fn pass(
+        &self,
+        world: &mut World,
+        tuning: &Tuning,
+        update: &mut Update,
+        mut play: Option<&mut Play>,
+    ) -> Result<bool, TickError> {
         let partial =
             global(world, PAUSED)? != 0 || (global(world, MODE)? != 0 && global(world, LOT)? != 0);
         let end = world.objects.keys().next_back().copied().unwrap_or(0);
@@ -368,11 +421,38 @@ impl Interpreter<'_> {
             let tick = world.ticks as i32;
             let is_person = object.person.is_some();
             update.ticked.push(id);
-            let carried_on = if is_person {
-                self.tick_person(world, id, tick, tuning)?
+            let mut caught = None;
+            let catch = play.is_some().then_some(&mut caught);
+            let result = if is_person {
+                self.person_tick(world, id, tick, tuning, catch)
             } else {
-                self.tick_object(world, id)?
+                self.object_tick(world, id, catch)
             };
+            // The fault caught in the thread, whether it was, and a fault
+            // in the rest of the tick after it.
+            let (carried_on, error) = match result {
+                Ok(carried_on) => (carried_on, caught.map(|fault| (fault, true, None))),
+                Err(fault) if play.is_some() => match caught {
+                    Some(first) => (true, Some((first, true, Some(fault)))),
+                    None => (true, Some((fault, false, None))),
+                },
+                Err(fault) => return Err(fault.into()),
+            };
+            if let Some(play) = play.as_deref_mut() {
+                if let Some((fault, in_thread, then)) = error {
+                    let recovery = self.recover(world, id, play);
+                    update.errors.push(ScriptError {
+                        tick: world.ticks,
+                        object: id,
+                        fault,
+                        in_thread,
+                        then,
+                        recovery,
+                    });
+                    return Ok(false);
+                }
+                play.fresh.remove(&id);
+            }
             if !carried_on {
                 return Err(TickError::Unsupported(format!(
                     "object {id}'s tick returned false, which stops the scheduler's pass with \
@@ -394,27 +474,46 @@ impl Interpreter<'_> {
     /// error handler deals with; that fails here. No ported primitive
     /// returns the codes that make a thread return false.
     pub fn tick_object(&self, world: &mut World, id: u16) -> Result<bool, Fault> {
+        self.object_tick(world, id, None)
+    }
+
+    /// An object's tick. With `catch`, a fault in the thread's run is put
+    /// there and the rest of the tick runs, as the original's catch
+    /// (0x474ec1) lets it ([`crate::play`]); without, it is returned.
+    fn object_tick(
+        &self,
+        world: &mut World,
+        id: u16,
+        catch: Option<&mut Option<Fault>>,
+    ) -> Result<bool, Fault> {
         let fail = |code, message| Fault {
             object: id,
             at: None,
             trap: Trap::native(code, message),
         };
-        match self.turn(world, id, TICK_BUDGET)? {
-            Status::Yielded => {}
-            Status::Returned(_) => {
-                return Err(fail(
-                    0x3e9,
-                    "the thread returned from its outermost frame; the original's error \
-                     handling (the object's virtual function 4) is not ported",
-                ));
+        let error = match self.turn(world, id, TICK_BUDGET) {
+            Ok(Status::Yielded) => None,
+            Ok(Status::Returned(_)) => Some(fail(
+                0x3e9,
+                "the thread returned from its outermost frame; the original's error \
+                 handling (the object's virtual function 4) is not ported",
+            )),
+            Ok(Status::Running) => Some(fail(
+                0x44d,
+                "the thread ran past the instruction limit of one tick; the original's \
+                 error handling (the object's virtual function 4) is not ported",
+            )),
+            Err(fault) => Some(fault),
+        };
+        if let Some(fault) = error {
+            let Some(slot) = catch else {
+                return Err(fault);
+            };
+            // The original's virtual function 4 (0x439a4e) sets flag 4.
+            if let Some(object) = world.objects.get_mut(&id) {
+                object.set_flags(CHECK_ERROR, true);
             }
-            Status::Running => {
-                return Err(fail(
-                    0x44d,
-                    "the thread ran past the instruction limit of one tick; the original's \
-                     error handling (the object's virtual function 4) is not ported",
-                ));
-            }
+            *slot = Some(fault);
         }
         // The tail of 0x4521f7, as the factory runs it after an object's
         // first turn.
@@ -462,12 +561,25 @@ impl Interpreter<'_> {
         tick: i32,
         tuning: &Tuning,
     ) -> Result<bool, Fault> {
+        self.person_tick(world, id, tick, tuning, None)
+    }
+
+    /// A person's tick, catching a fault in its thread's run as
+    /// [`Interpreter::object_tick`] does.
+    fn person_tick(
+        &self,
+        world: &mut World,
+        id: u16,
+        tick: i32,
+        tuning: &Tuning,
+        catch: Option<&mut Option<Fault>>,
+    ) -> Result<bool, Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
             trap,
         };
-        if !self.tick_object(world, id)? {
+        if !self.object_tick(world, id, catch)? {
             return Ok(false);
         }
         let hour = world.globals.get(HOURS).copied().unwrap_or(0);
@@ -626,6 +738,55 @@ impl Interpreter<'_> {
             }
         }
         Ok(())
+    }
+
+    /// What play mode does with an object after its error
+    /// ([`crate::play`]): the original's handling (0x439a6f), or where
+    /// that fails, a restart of its thread, or where that fails too or the
+    /// object faulted on its first tick after a reset, parking it.
+    fn recover(&self, world: &mut World, id: u16, play: &mut Play) -> Recovery {
+        let park = |world: &mut World| {
+            if let Some(object) = world.objects.get_mut(&id) {
+                object.set_flags(READY, false);
+            }
+        };
+        // An object deleted since it was reset is not the one that is
+        // fresh, even if a later one has its ID.
+        if let Some(deleted) = self.deleted {
+            for gone in deleted.take() {
+                play.fresh.remove(&gone);
+            }
+        }
+        if !play.fresh.insert(id) {
+            play.fresh.remove(&id);
+            park(world);
+            return Recovery::Parked(None);
+        }
+        let reset = self.drop_references(world, id).and_then(|()| {
+            if world.objects.get(&id).is_some_and(|o| o.person.is_some()) {
+                self.reset_person(world, id, &self.program.people)
+            } else {
+                self.reset(world, id, false)
+            }
+        });
+        let Err(failed) = reset else {
+            return Recovery::Reset;
+        };
+        // A person's animator is reset too where it can be, as a person's
+        // own reset does; one it cannot reset is left as it is.
+        if let Some(animator) = world.animators.get_mut(&id) {
+            let _ = animator.reset();
+        }
+        let mut machine = self.machine(world, id, 0, false);
+        match machine.install_main() {
+            Ok(()) => Recovery::Restarted(failed),
+            Err(trap) => {
+                let fault = machine.fault(trap);
+                play.fresh.remove(&id);
+                park(world);
+                Recovery::Parked(Some(fault))
+            }
+        }
     }
 
     /// The registry's pass at the end of a lot update (0x4412d1):

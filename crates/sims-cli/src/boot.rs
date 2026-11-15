@@ -22,6 +22,10 @@ pub struct Options<'a> {
     pub snapshot: Option<&'a Path>,
     /// When the house view draws a frame ([`Frames`]).
     pub frames: Frames,
+    /// Step in play mode ([`Lot::step_play`]): an object's error resets
+    /// the object instead of stopping the boot. Not for comparing with
+    /// the original.
+    pub play: bool,
 }
 
 pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
@@ -40,7 +44,12 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
         return Err("ticks were asked for, but the load did not complete".into());
     }
     for _ in 0..options.ticks {
-        match lot.step() {
+        let step = if options.play {
+            lot.step_play()
+        } else {
+            lot.step()
+        };
+        match step {
             Ok(update) => ticked.push(update),
             // Missing motive constants stop the run before any tick, with
             // no report, as before the library.
@@ -205,6 +214,40 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
             },
             update.removed.len()
         );
+    }
+    if options.play {
+        let errors: Vec<_> = ticked.iter().flat_map(|u| &u.errors).collect();
+        let frames: Vec<_> = ticked.iter().flat_map(|u| &u.frame_errors).collect();
+        let _ = writeln!(
+            out,
+            "Play:    {} errors caught, {} frames skipped{}",
+            errors.len(),
+            frames.len(),
+            frames
+                .first()
+                .map(|e| format!(" (the first: {e})"))
+                .unwrap_or_default()
+        );
+        for error in errors {
+            let _ = writeln!(
+                out,
+                "         tick {}, object {}{}: {}{}; {:?}",
+                error.tick,
+                error.object,
+                if error.in_thread {
+                    ""
+                } else {
+                    " (outside its thread)"
+                },
+                error.fault,
+                error
+                    .then
+                    .as_ref()
+                    .map(|then| format!("; then outside its thread: {then}"))
+                    .unwrap_or_default(),
+                error.recovery
+            );
+        }
     }
     if let Some(failed) = failed {
         let _ = writeln!(out, "Stopped: {failed}");

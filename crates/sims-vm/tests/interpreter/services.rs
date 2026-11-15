@@ -332,7 +332,14 @@ fn mode_4_needs_one_definition_for_the_guid() {
 #[test]
 fn mode_10_walks_the_career_list() {
     let mut fx = Fixture::new();
-    fx.program.careers = Some(vec![4, -1, 0, 9]);
+    fx.program.careers = Some(
+        [4, -1, 0, 9]
+            .map(|id| sims_vm::Career {
+                id,
+                levels: Vec::new(),
+            })
+            .into(),
+    );
     let mut seen = Vec::new();
     let mut cursor = 0;
     // Zero is not in front of the list here: it is a career ID like any
