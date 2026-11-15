@@ -11,6 +11,7 @@ mod debug;
 pub(crate) mod dialog;
 mod direction;
 pub(crate) mod distance;
+mod drop;
 mod events;
 mod expression;
 mod find_best_object;
@@ -124,6 +125,7 @@ impl Machine<'_, '_> {
             2 => self.expression(operands)?.into(),
             3 => self.find_best_interaction()?,
             4 => self.grab()?.into(),
+            5 => self.drop_held()?.into(),
             6 => self.change_suit(operands)?.into(),
             7 => self.refresh(operands)?.into(),
             8 => self.random(operands)?.into(),
