@@ -268,6 +268,7 @@ impl Interpreter<'_> {
             .routing
             .slot_flags
             .retain(|&(object, _), _| object != id);
+        world.routing.slots.retain(|&(object, _), _| object != id);
         world.fires.retain(|&other| other != id);
         world.order.retain(|&other| other != id);
         // A type's instance list outlives its instances (0x44383c).

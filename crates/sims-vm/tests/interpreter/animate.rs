@@ -446,19 +446,71 @@ fn look_towards_mode_0_sets_the_heads_target() {
         fx.sim().person.as_ref().unwrap().data[41..46],
         [0, 0, 0, 1, 0]
     );
-    // Modes 1 to 3 turn the person on the spot, which is not ported;
-    // any other mode is error 0x27; an object that is not a person fails.
+    // Modes 1 to 3 turn the person on the spot (below); any other mode is
+    // error 0x27; an object that is not a person fails.
     let fails = |fx: &mut Fixture, object: u16| {
         fx.run_with(object, 4096, LAMP as i16, &[], 10)
             .unwrap_err()
             .to_string()
     };
-    assert!(fails(&mut look(2), SIM).contains("mode 2"));
     assert_eq!(
         code(look(4).run_with(SIM, 4096, LAMP as i16, &[], 10)),
         Some(0x27)
     );
     assert!(fails(&mut look(0), LAMP).contains("not a person"));
+}
+
+/// Look Towards (opcode 22) in modes 2 and 3 (0x45a9c1): the person turns
+/// on the spot, by a route from its own place to its own place, then to
+/// the stack object's place (mode 2) or the place mirrored through its
+/// own (mode 3).
+#[test]
+fn look_towards_modes_2_and_3_turn_on_the_spot() {
+    let look = |mode: i16| {
+        let mut fx = Fixture::new();
+        let [a, b] = mode.to_le_bytes();
+        fx.add(
+            SIM_FILE,
+            4096,
+            tree(vec![ins(
+                22,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [a, b, 0, 0, 0, 0, 0, 0],
+            )]),
+        );
+        fx.world.animators.insert(SIM, LOADED);
+        fx.sim_mut().position = [100, 200, 1];
+        fx.lamp_mut().position = [130, 210, 1];
+        fx
+    };
+    let run =
+        |fx: &mut Fixture, stack_object: u16| fx.run_with(SIM, 4096, stack_object as i16, &[], 10);
+    // A person sitting or lying (word 0 not 0) does not turn.
+    let mut fx = look(2);
+    fx.sim_mut().person.as_mut().unwrap().data[0] = 1;
+    assert!(!run(&mut fx, LAMP).unwrap());
+    assert!(!fx.world.routing.routes.contains_key(&SIM));
+    // With no stack object, error 0x15.
+    assert_eq!(code(run(&mut look(2), 0)), Some(0x15));
+    // Mode 1 turns towards the camera, which is not ported.
+    assert!(
+        run(&mut look(1), LAMP)
+            .unwrap_err()
+            .to_string()
+            .contains("mode 1")
+    );
+    // The path holds the second coordinate first. A synchronous tree may
+    // not wait for the turn (error 0x44f).
+    for (mode, to) in [(2, [210, 130]), (3, [190, 70])] {
+        let mut fx = look(mode);
+        let result = run(&mut fx, LAMP);
+        assert_eq!(
+            fx.world.routing.routes[&SIM].path,
+            vec![[200, 100], [200, 100], to]
+        );
+        assert_eq!(code(result), Some(0x44f), "mode {mode}");
+    }
 }
 
 #[test]
