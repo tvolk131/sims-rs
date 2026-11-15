@@ -217,6 +217,8 @@ struct App {
     sound: Sound,
     /// The hour, speed and ambience view the sound was last told.
     heard: Option<(u32, Speed, i32)>,
+    /// The object answers the sound was last told.
+    told: Option<sims_audio::sources::Snapshot>,
 }
 
 impl App {
@@ -304,6 +306,14 @@ impl App {
         let ran = self.game.advance(micros);
         // A dialog shown at the first tick due is drawn though none ran.
         let mut redraw = ran > 0 || (!waited && self.game.asking().is_some());
+        // What the tick's sounds may ask about their objects, before the
+        // sounds themselves. Read on every call, not only after a step
+        // that succeeded: a failed step may still have changed the lot.
+        let sources = sound::sources(self.game.lot().world());
+        if self.told.as_ref() != Some(&sources) {
+            self.sound.send(Input::Sources(sources.clone()));
+            self.told = Some(sources);
+        }
         let sounds = self.game.take_sounds();
         if !sounds.is_empty() {
             self.sound.send(Input::Events(
@@ -567,6 +577,7 @@ fn run() -> Result<(), String> {
         printed: 0,
         sound: Sound::start(&options.install, mute),
         heard: None,
+        told: None,
     };
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     event_loop.run_app(&mut app).map_err(|e| e.to_string())

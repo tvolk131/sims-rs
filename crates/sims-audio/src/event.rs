@@ -18,4 +18,15 @@ pub enum SoundEvent {
     StopObject { object: u32 },
     /// Stop every sound at once (kind 20).
     StopAll,
+    /// Pause the sound (kind 21): what the original's game sends when the
+    /// game pauses, and when it leaves live mode (its mode handler,
+    /// 0x4ce4c9 and 0x4ce5c5). Sounds already playing are held where
+    /// they are, except the interface's clicks, the speed buttons and
+    /// the main music loop; sounds started after it play. See
+    /// [`crate::player::Player::pause`].
+    Pause,
+    /// Unpause the sound (kind 22): what the original's game sends when
+    /// live mode resumes unpaused (0x4ce4e5 and 0x4ce5d9). Every held
+    /// sound goes on from where it was.
+    Unpause,
 }

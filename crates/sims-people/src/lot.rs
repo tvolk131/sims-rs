@@ -136,6 +136,10 @@ impl Target for sims_render::Canvas {
         let [r, g, b, a] = texel;
         self.put(x as i32, y as i32, [lit(r), lit(g), lit(b), a], z as i32);
     }
+
+    fn set_id(&mut self, id: Option<u16>) {
+        sims_render::Canvas::set_id(self, id);
+    }
 }
 
 /// Turns a fine position (or, with `size` 0, a direction) by `rotation`
@@ -367,6 +371,8 @@ impl People {
         };
         posed.sort_by(|a, b| far(b).total_cmp(&far(a)).then(a.id.cmp(&b.id)));
         for person in &posed {
+            // Each pixel the person draws names them, for a click.
+            target.set_id(Some(person.id));
             for part in person.body.parts.iter().filter(|p| p.censor == 0) {
                 let skinned = skin(part, &person.bones);
                 draw_part(target, part, &skinned, light, |p| {
@@ -376,6 +382,7 @@ impl People {
                 });
             }
         }
+        target.set_id(None);
         Drawn {
             people: posed.len(),
             problems,
@@ -459,6 +466,7 @@ mod tests {
         canvas.plot(0, 0, 100, [9, 9, 9]);
         let target: &mut dyn Target = &mut canvas;
         assert_eq!(target.size(), (2, 1));
+        target.set_id(Some(5));
         assert!(!target.passes(0, 0, 101.0));
         // Cut toward zero: 100.9 is 100, a tie.
         assert!(target.passes(0, 0, 100.9));
@@ -472,6 +480,8 @@ mod tests {
         );
         assert_eq!(canvas.color, vec![[100, 50, 25], [0, 0, 0]]);
         assert_eq!(canvas.depth, vec![100, sims_render::depth::EMPTY]);
+        // The pixel taken names the person; the one left out names nobody.
+        assert_eq!([canvas.id_at(0, 0), canvas.id_at(1, 0)], [Some(5), None]);
     }
 
     /// The light keeps its place relative to the viewer as the view

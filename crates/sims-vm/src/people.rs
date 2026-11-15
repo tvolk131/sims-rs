@@ -425,9 +425,9 @@ impl Interpreter<'_> {
         person.data[30] = 0;
         // An animator that has not ticked is in the state a reset leaves
         // ([`sims_sim::animator::LOADED`]); one that has is reset.
-        if let Some(animator) = world.animators.get_mut(&id) {
-            animator.reset().map_err(|e| fail(Trap::Unsupported(e)))?;
-        }
+        world
+            .reset_animator(id)
+            .map_err(|e| fail(Trap::Unsupported(e)))?;
         let person = world
             .objects
             .get_mut(&id)

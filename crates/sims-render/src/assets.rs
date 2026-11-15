@@ -19,6 +19,7 @@
 
 use crate::camera::Zoom;
 use crate::canvas::Image;
+use crate::pools::Pools;
 use crate::{Error, Result};
 use sims_content::{Catalog, Index, Install};
 use sims_formats::execution::Slots;
@@ -51,6 +52,8 @@ pub struct Definition {
     /// and 1) and how many there are (word 4).
     pub graphic: u16,
     pub graphics: u16,
+    /// The object's type (OBJD word 9): 8 is a window, 2 a person.
+    pub kind: i16,
     /// The SPR2 ID of the first dynamic sprite (OBJD byte 0x80).
     pub dynamic_base: i16,
     /// The wall style the object puts on the wall it stands in (OBJD byte
@@ -86,6 +89,7 @@ pub struct Assets {
     groups: BTreeMap<(usize, u16, u32, usize), Vec<Part>>,
     object_shapes: BTreeMap<(usize, u16, bool, usize), Option<[Image; 4]>>,
     trims: BTreeMap<(bool, usize), Vec<Image>>,
+    pools: Option<Pools>,
 }
 
 impl Assets {
@@ -109,7 +113,16 @@ impl Assets {
             groups: BTreeMap::new(),
             object_shapes: BTreeMap::new(),
             trims: BTreeMap::new(),
+            pools: read_pools(install),
         })
+    }
+
+    /// The lamps' pools of light, if the game's `lightMap.dat` is there
+    /// and the size the original's layout gives. The original works the
+    /// maps out itself when the file is missing (0x4bb5bc, 0x4a38b6);
+    /// that is not ported, so without the file no pools are drawn.
+    pub fn pools(&self) -> Option<&Pools> {
+        self.pools.as_ref()
     }
 
     pub fn index(&self) -> &Index {
@@ -242,6 +255,7 @@ impl Assets {
             resource: object.resource,
             graphic: word(3) as u16,
             graphics: word(4) as u16,
+            kind: word(9),
             dynamic_base: word(0x80 / 2),
             wall_style: word(0x5c / 2),
             wall_shape: word(0xa2 / 2) as u16,
@@ -326,6 +340,14 @@ pub fn slot_height(category: i32, z: f32) -> f32 {
         4 => f32::from_bits(0x4081_999a),
         _ => z,
     }
+}
+
+/// Reads `GameData/lightMap.dat` (the original opens "lightmap.dat" in
+/// the game's data folder, 0x4b5700) and its pool maps, or None if it is
+/// missing, unreadable or not the expected size.
+fn read_pools(install: &Install) -> Option<Pools> {
+    let path = install.file("GameData/lightMap.dat").ok()?;
+    Pools::parse(&std::fs::read(path).ok()?)
 }
 
 fn four(mut frame: impl FnMut(usize) -> Option<Image>) -> Option<[Image; 4]> {

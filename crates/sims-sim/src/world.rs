@@ -1,4 +1,4 @@
-use crate::animator::Animator;
+use crate::animator::{Animator, Layer};
 use crate::neighbors::{Family, Neighbors};
 use crate::rooms::Rooms;
 use crate::route::Routing;
@@ -140,6 +140,25 @@ pub struct World {
     /// [`Headline`]. An object with no entry shows none: its first
     /// headline, if it has any, has a duration of 0.
     pub headlines: BTreeMap<u16, Headline>,
+    /// The layer in the base slot (animator +0x14) of each person's
+    /// animator that has one: the clip's playback, whose phase the
+    /// skin's update advances (0x5992b3, 0x597c4c) and from which the
+    /// head's measurement poses the bones (0x5904d2). What kind of clip
+    /// it is stays in [`Animator::base`], and a person has an entry here
+    /// exactly when that slot is filled. Kept apart from the animator so
+    /// that the encodings of the states before it was kept stay a prefix
+    /// of the new ones.
+    pub base_layers: BTreeMap<u16, Layer>,
+    /// The bones of each person's skin whose translation a layer has
+    /// written since the skin was made, by name. The skin's update keeps
+    /// a bone's translation when no layer it samples moves that bone
+    /// (0x598226, 0x598450), so a bone in this set that no layer playing
+    /// now moves holds a translation that is not kept; one not in it is
+    /// still at rest. Every layer the skin's update could sample is
+    /// counted, so this may hold more than the original moved. Kept apart
+    /// from the animator so that the encodings of the states before it
+    /// was kept stay a prefix of the new ones.
+    pub translated_bones: BTreeMap<u16, BTreeSet<String>>,
 }
 
 /// How many advertisements the record of [`World::advertisement_record`]
@@ -476,6 +495,8 @@ impl World {
             advertisement_record: None,
             families: Vec::new(),
             headlines: BTreeMap::new(),
+            base_layers: BTreeMap::new(),
+            translated_bones: BTreeMap::new(),
         }
     }
 
@@ -558,6 +579,19 @@ impl World {
             .copied()
             .filter(|id| self.objects.get(id).is_some_and(|o| o.person.is_some()))
             .collect()
+    }
+
+    /// Resets person `id`'s animator ([`Animator::reset`]), which empties
+    /// its base slot, so the slot's layer ([`World::base_layers`]) goes
+    /// with it. Answers whether the person has an animator; a reset that
+    /// fails changes nothing.
+    pub fn reset_animator(&mut self, id: u16) -> std::result::Result<bool, String> {
+        let Some(animator) = self.animators.get_mut(&id) else {
+            return Ok(false);
+        };
+        animator.reset()?;
+        self.base_layers.remove(&id);
+        Ok(true)
     }
 
     /// The selected Sim: the first person in registration order with
