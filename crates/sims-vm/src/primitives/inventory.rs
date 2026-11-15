@@ -16,6 +16,15 @@
 //!    record's ID; if there is none, an empty one is added at the end
 //!    (0x42a8a1).
 //!
+//! Operation 0 (0x4556f4) adds tokens: the count is 1, or with flag 0x2
+//! the caller's temp `(flags >> 2) & 3`. A count of 0 adds nothing. The
+//! first token of that kind and GUID (0x41f721) takes the count added to
+//! its own, both read as signed words, and 0x7fff when the sum is that or
+//! more (0x41f3f6); without one, a token of that kind, GUID and count is
+//! added at the end (0x41f7c8), unless the inventory already holds 0x7fff
+//! tokens, which is the false branch (0x41f3cb). Otherwise the branch is
+//! true (0x41f38d).
+//!
 //! Operation 3 (0x455579) finds the first token of that kind and GUID
 //! (0x41f660, 0x41f721). None, or a count of 0, is the false branch with
 //! nothing written. Otherwise the caller's temp `(flags >> 5) & 3` takes
@@ -33,7 +42,7 @@
 //! whose place is cut to -1 like every place (both operations store the
 //! index's low word), is false with its count written.
 //!
-//! The other operations fail loudly. Ported from the original's code
+//! Operations 1, 2, 5, 6 and above fail loudly. Ported from the original's code
 //! (above) and checked against the old prototype's `inventory`
 //! (legacy/crates/sims-vm/src/person.rs), whose operation 3 agrees.
 //!
@@ -42,17 +51,22 @@
 
 use crate::fault::Trap;
 use crate::interpreter::Machine;
-use sims_sim::neighbors::Inventory;
+use sims_sim::neighbors::{Inventory, Item};
 
 /// Flag 0x2000: the owner is the object the caller's temp 4 names.
 const OWNER_IN_TEMP_4: u16 = 0x2000;
 /// Flag 0x1: operation 4 finds only tokens of the GUID too.
 const MATCH_GUID: u16 = 0x1;
+/// Flag 0x2: operation 0's count is in the caller's temp
+/// `(flags >> 2) & 3`.
+const COUNT_IN_TEMP: u16 = 0x2;
+/// The most tokens, and the greatest count, an inventory holds.
+const MOST: i32 = 0x7fff;
 
 impl Machine<'_, '_> {
     pub(crate) fn manage_inventory(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
         let operation = operands[0];
-        if !matches!(operation, 3 | 4) {
+        if !matches!(operation, 0 | 3 | 4) {
             return Err(Trap::Unsupported(format!(
                 "Manage Inventory operation {operation} is not ported"
             )));
@@ -102,7 +116,41 @@ impl Machine<'_, '_> {
                 inventories.len() - 1
             }
         };
-        let items = &inventories[place].items;
+        if operation == 0 {
+            let temps = &self
+                .world
+                .objects
+                .get(&self.me)
+                .ok_or(Trap::native(10, "missing object"))?
+                .temps;
+            let count = if flags & COUNT_IN_TEMP != 0 {
+                temps[usize::from((flags >> 2) & 3)]
+            } else {
+                1
+            };
+            if count == 0 {
+                return Ok(true);
+            }
+            let items = &mut self.world.neighbors.inventories[place].items;
+            match items.iter_mut().find(|i| i.kind == kind && i.guid == guid) {
+                Some(item) => {
+                    let sum = i32::from(item.count as i16) + i32::from(count);
+                    item.count = if sum >= MOST { MOST as u16 } else { sum as u16 };
+                }
+                None => {
+                    if items.len() >= MOST as usize {
+                        return Ok(false);
+                    }
+                    items.push(Item {
+                        kind,
+                        guid,
+                        count: count as u16,
+                    });
+                }
+            }
+            return Ok(true);
+        }
+        let items = &self.world.neighbors.inventories[place].items;
         let temps = &mut self
             .world
             .objects

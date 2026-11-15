@@ -51,36 +51,48 @@ events, and what it asks for after them) come first.
 ### Progress
 
 - Step 1 is done.
+- Step 4: the first player-order recording (track 2's goth-snack
+  scenario) replayed through the window's input layer equals the
+  original's state after every update to 453, once a press lists the
+  menu again and reaching an entry checks it again. From update 454 the
+  snack's simulation differs (the Room motive, then Mortimer's data
+  word 50): see the decisions log.
 - The integration hooks are merged: play mode (#120), player orders
   (#121), sound events (#122), Idle For Input starting a queued action
   (#131), the pie menu and picking from it (#132), and Go To Routing
   Slot's parameter and global slots (#134), which a player's snack order
   reached.
-- Strict mode on the Goth house runs to tick 3602, 08:30 on the first
+- Strict mode on the Goth house runs to tick 9906, 12:00 on the first
   day. One tick is two game seconds, so a day is 43,200 ticks (measured
   from the clock globals). The carpool makes the school bus at tick 2703
   (the multi-tile factory is ported). The base layer is kept and the
   pose composed from it, and a person may take itself off the lot in
   its own tick. A multi-tile object may snap where it does not fit
   (0x454e82), and a group is deleted (0x440f37): at tick 3434 the car
-  junk's 18 tiles go. At tick 3603 object 354 uses Create New Object
-  Instance mode 6 with flag 0x4, which is not ported (the same stop as
-  the snack order's). Step 2 continues from there.
+  junk's 18 tiles go. At tick 3603 object 354 makes two neighbors'
+  people off the lot (Create New Object Instance mode 6, flag 0x4) and
+  removes them. At tick 3913 a seated person's route stands it up
+  first; at tick 6756 a pet is made (the expansions installed allow
+  pets) and walks, runs and turns at its own pace; an inventory count
+  goes up at 7702 and a route with no door gives up at 9337. Past tick
+  1000 this is unverified: there is no capture. At tick 9907 object 5
+  walks the neighborhood's lots in order of distance (Set To Next mode
+  11), which needs a lot-position table the simulation does not hold
+  (the snack order stops on it at the same step). Step 2 continues from
+  there.
 - Of the base neighborhood's houses only the Goths' and the Newbies'
   (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
-  tick 1802; a route that gives up on a slot it may end near runs the
+  tick 4052; a route that gives up on a slot it may end near runs the
   Route failure feedback tree (tick 1473). Against the recording of the
   house (updates 0 to 935), every update's random streams, scheduler
   cursor, action serial, globals and objects, and each object's data,
   temps, attributes, frames and person data match, except the words the
   original left from memory it never set (person word 37, locals on half
   a pointer) and global 12 at updates 1 and 3 (the interface's tutorial
-  wait). At tick 1803 object 290 needs Create New Object Instance mode 6
-  with flag 0x4, which track 3 is porting for the Goths' snack order.
-
-  tick 1472, with no recording to compare yet; at tick 1473 object 105
-  gives up a route and needs the route-failure feedback tree (0x45af2a),
-  which is not ported.
+  wait). At tick 1803 object 290 makes two neighbors' people off the lot
+  (Create New Object Instance mode 6, flag 0x4), unverified past update
+  935. The frame drawn after tick 4053 finds person 140's skin waiting
+  for its update (0x590d26), which is not ported.
 - The Pleasants (`House06.iff` as the original saved it after moving
   them in, with the Traveling Salesman on the lot) load to the state the
   first tick starts from: the end of the household selection works out
@@ -1982,10 +1994,13 @@ Progress:
   them, as the original works them out and draws them. Near zoom rose
   from 86.3% to 87.6% exact, and nine in ten of the pixels the shadows
   change match the original exactly.
-- Next: flat grass on a split tile's empty half; the dashed row along
-  a floor's lower edge at near zoom; near-zoom fidelity below the bay's
-  left end (rows 436 to 520, grass and a light sprite in the original);
-  the edge-on texel offset and side; a screenshot with a marked edge-on
+- Done: a split floor's halves are cut straight along the corners' row
+  or half a tile in, as the original's clip rectangle cuts them; the
+  dashed row along a porch's diagonal edge is gone.
+- Next: flat grass on a split tile's empty half; near-zoom fidelity
+  below the bay's left end (rows 436 to 520, grass and a light sprite
+  in the original); the edge-on texel offset and side; a screenshot
+  with a marked edge-on
   diagonal; upper-level depth.
 
 ## Track: sound (`crates/sims-audio`)
@@ -2124,7 +2139,19 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   Nice) in the subpanel, laid out as the original's bar maker does
   (0x51df31). The Goths' panel is pinned by digest, gated on
   `SIMS_INSTALL`; it is not yet compared with a screenshot, and the
-  zodiac sign under the bars is not drawn.
+  zodiac sign under the bars is not drawn. In the window, the
+  personality, needs, job and relationship panels show the selected
+  Sim's live person data, motives, skills and relationship rows, and
+  follow a press on another portrait; the needs are also checked to
+  follow the ticks (`sims-game` tests
+  `the_personality_panel_shows_the_selected_goths_traits`,
+  `the_needs_panel_follows_the_selected_goths_motives`,
+  `the_job_panel_shows_the_selected_sims_skills`, in house 7, whose
+  Sims have skills,
+  `the_relationship_panel_lists_who_the_selected_goth_knows`). The
+  game's panel reads the relationships, while that panel is open, with
+  the tuning's friendship threshold, and loads the faces of everyone in
+  the neighborhood's records.
 - **Done: the job panel's skills.** The Job button opens the selected
   Sim's six skill bars, with the labels of what the next level of
   their career needs underlined and a line marking how much (from
@@ -2197,8 +2224,8 @@ through their public interfaces only; the simulation never depends on it.
   play mode does not catch stops it. In play mode the Goths' house runs
   12,000 ticks (ten minutes at normal speed) without stopping, through
   about a dozen different caught errors; in strict mode it stops after
-  tick 3602 (at tick 3603 Create New Object Instance mode 6 is not
-  ported).
+  tick 9906 (at tick 9907 Set To Next mode 11 needs the neighborhood's
+  lot order).
   `--png <file>
   --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
@@ -2239,11 +2266,9 @@ through their public interfaces only; the simulation never depends on it.
   his hunger goes from 94.5 to 100.0 (tick 936); at 1088 the snack goes
   off the lot and at 1136 it is deleted, and he is free again. He goes
   on to other things (object 71 at tick 1497, object 132 at 2292).
-  Strict mode now runs the order through step 3602 and stops at step
-  3603 (object 354 uses Create New Object Instance mode 6 with flag 0x4,
-  not ported); without an order it stops there too.
-
-  not ported); without an order it runs to tick 3432.
+  Strict mode now runs the order through step 9906 and stops at step
+  9907 (Set To Next mode 11 needs the neighborhood's lot order); without
+  an order it stops on the same at tick 9907.
 - **Done: a player's order from the window, in play mode.** With
   `--play`, the pointer on the fridge lists its pie, a click opens it,
   and Have A Snack queues the action the listing offered. A Goth test
@@ -2263,13 +2288,19 @@ through their public interfaces only; the simulation never depends on it.
   speed (`0x442f9b`, presumably everyone away or asleep), it runs at
   1000 and keeps the speed to go back to in global 18. It goes back once
   someone holds it. The window follows: 1 ms a tick at 1000.
-- **Done in play mode: selecting a Sim.** A press on a portrait selects
-  that Sim (0x445449, between ticks): the Sim selected before is
-  deselected, the indicators move, and the panel and the pie menus
-  follow the new Sim. Deselecting refreshes the old Sim's animator
-  (0x58da12), which is not ported, so in strict mode (`Lot::select`)
-  switching Sims fails and changes nothing; play mode
-  (`Lot::select_play`) leaves the refresh out.
+- **Done: selecting a Sim.** A press on a portrait selects that Sim
+  (0x4cf9c4, 0x445449, between ticks), in strict mode as in play mode:
+  the Sim selected before is deselected and its animator refreshed at
+  the tick count (0x58da12 with 0, now ported), the indicators move,
+  and the panel, the queue and the pie menus follow the new Sim. A
+  second press on the selected Sim's portrait centres the view on her
+  (0x434ced; the original's slide is left out). Both play `UI_click`.
+  A Goth test switches to another Goth through the window and orders
+  her a snack from the fridge's pie: she takes it 52 ticks later, and
+  strict mode runs to tick 454. At tick 455 Mortimer, left to himself,
+  routes to a door one of his routes goes through (0x45b176), which is
+  not ported. No recording compares a switch yet; track 2 is asked for
+  one.
 - Done: a click picks what the frame shows at the pixel
   (`Canvas::id_at`, `sims_game::pick`): the person shown there or
   nearest within two pixels, else the object shown there. A tile of a

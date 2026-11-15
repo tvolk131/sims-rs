@@ -248,6 +248,7 @@ fn world() -> World {
             5,
             BTreeSet::from(["PELVIS".to_owned(), "ROOT".to_owned()]),
         )]),
+        neighborhood_data: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -6, 0],
     }
 }
 
@@ -419,7 +420,24 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "d550ed76e8971864d5c06fe3fbcb810ff283b751659697240ff30668ddedd13e";
+const PINNED: &str = "60918414b09f2283b3f219c0cf7023f405d55754046afe86b1594a0cb1237b8f";
+
+#[test]
+fn without_the_neighborhood_data_the_encoding_is_format_26() {
+    // Snapshot format 27 added the neighborhood's data words at the end.
+    assert_eq!(digest(&format_26_bytes(&world())), PINNED_26);
+}
+const PINNED_26: &str = "d550ed76e8971864d5c06fe3fbcb810ff283b751659697240ff30668ddedd13e";
+
+/// The encoding of `world` as snapshot format 26 wrote it: without the
+/// neighborhood's data words ([`World::neighborhood_data`]) that format
+/// 27 added at the end. The older formats' encodings start from this one.
+fn format_26_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let data = postcard::to_allocvec(&world.neighborhood_data).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - data.len()), data);
+    bytes
+}
 
 #[test]
 fn without_the_bones_moved_the_encoding_is_format_25() {
@@ -430,9 +448,10 @@ const PINNED_25: &str = "f44771b305c9f7af1aaf760cb475f98f1a815bff357191a399bd14a
 
 /// The encoding of `world` as snapshot format 25 wrote it: without the
 /// bones the skins moved ([`World::translated_bones`]) that format 26
-/// added at the end. The older formats' encodings start from this one.
+/// added at the end. It starts from [`format_26_bytes`], and the older
+/// formats' encodings from this one.
 fn format_25_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_26_bytes(world);
     let moved = postcard::to_allocvec(&world.translated_bones).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - moved.len()), moved);
     bytes

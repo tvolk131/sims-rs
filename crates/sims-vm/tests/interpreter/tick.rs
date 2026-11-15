@@ -15,7 +15,7 @@ fn dialog(kind: u8, temp: u8) -> [u8; 8] {
     [0, 0, 0, 0, 0, kind, 0, temp << 4]
 }
 
-fn tuning() -> Tuning {
+pub fn tuning() -> Tuning {
     let rates = || Rates::from_lookup(0, |_| None);
     let curve = |motive| Curve::parse(motive, "(-100;1)(100;1)", 8);
     Tuning {
