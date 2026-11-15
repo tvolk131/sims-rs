@@ -367,21 +367,7 @@ fn idle_for_input_is_interrupted_by_a_queued_action() {
     assert_eq!(turn(&mut queued(51, 0)), Status::Returned(true));
     assert_eq!(turn(&mut queued(50, 0)), Status::Yielded);
     assert_eq!(turn(&mut queued(0, 2)), Status::Returned(true));
-    // Asked to start the queued action: not ported.
-    let mut fx = queued(51, 0);
-    fx.add(
-        SIM_FILE,
-        4096,
-        tree(vec![ins(
-            17,
-            RETURN_TRUE,
-            RETURN_FALSE,
-            [0, 0, 1, 0, 0, 0, 0, 0],
-        )]),
-    );
-    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    let fault = interpreter.turn(&mut fx.world, SIM, BUDGET).unwrap_err();
-    assert!(matches!(fault.trap, Trap::Unsupported(_)), "{fault}");
+    // Starting the queued action when asked is in push.rs.
     // With nothing queued, asking does not matter.
     let mut fx = idle(3, 1);
     fx.sim_mut().person.as_mut().unwrap().motives[9] = -100.0;

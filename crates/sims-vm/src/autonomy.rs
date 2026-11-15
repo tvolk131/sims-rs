@@ -891,11 +891,13 @@ impl Machine<'_, '_> {
                 }
             };
         let allowed = if record.test != 0 && !found {
-            // The synchronous run fails to push a tree the file lacks
-            // (0x47484a), and returns false (0x474ada).
+            // The synchronous run writes its mark above the top frame
+            // (0x4749d9), fails to push a tree the file lacks (0x47484a),
+            // and returns false (0x474ada).
             if saved.is_none() {
                 *saved = Some(self.me()?.temps.clone());
             }
+            self.write_mark()?;
             false
         } else if record.test != 0 {
             if saved.is_none() {
@@ -960,6 +962,163 @@ pub(crate) fn find(table: &InteractionTable, menu: u32) -> Option<&Interaction> 
         .interactions
         .iter()
         .find(|interaction| interaction.string_index == menu)
+}
+
+/// The flags the check leaves on an action (0x458328, 0x458552): 4 always,
+/// 8 when it passes, and 0x10 when the person's object data word 50 is
+/// set afterwards.
+pub(crate) mod checked {
+    pub const RAN: u32 = 4;
+    pub const PASSED: u32 = 8;
+    pub const MARKED: u32 = 0x10;
+}
+
+impl Machine<'_, '_> {
+    /// The check of an action the player chose (0x458319 on a context
+    /// that 0x4582ad makes with the byte 0, and no advertisements). It
+    /// writes its result to the action's flags ([`checked`]):
+    ///
+    /// 1. Flag 8 is cleared and flag 4 set. An action with no target, or
+    ///    whose target's table has no entry with its menu number (the
+    ///    first such entry is the one read), ends there.
+    /// 2. The person's object data word 50 is cleared.
+    /// 3. It fails if the target's data word 8 has bit 9 set. Unlike
+    ///    autonomy's check, the target's data word 25 is not read.
+    /// 4. The visitor rule and the rule by age and kind, as autonomy's
+    ///    check ([`Machine::autonomy_allows`]): a visitor needs the
+    ///    entry's flag 1, or a lot that is not residential and the entry's
+    ///    flag 0x20, and a target of category 4 or 7 that would ask the
+    ///    relationship (0x41f660) fails loudly.
+    /// 5. If it has not failed, the entry's check tree, if it has one,
+    ///    decides: it runs synchronously on the person's stack with the
+    ///    target as its stack object and the arguments 0, 0, 0, 0 (byte 0
+    ///    and an action that does not join; the tree's ID follows). The
+    ///    person's temps are saved into `saved` first, if they were not
+    ///    already; the caller puts them back (0x4582dd). A tree the file
+    ///    lacks fails. An interface flag (0x6e5134) would pass the action
+    ///    after its tree whatever the tree returned; only interface code
+    ///    writes it, so it is taken to be clear.
+    /// 6. Flag 8 is set if it passed, and flag 0x10 is set or cleared by
+    ///    whether the person's object data word 50 is set.
+    ///
+    /// A queued action here is taken not to join another (its word +0,
+    /// which the save does not keep, 0); 0x41f00e, which makes the pie
+    /// menu's actions, writes 0 there.
+    pub(crate) fn check_chosen(
+        &mut self,
+        action: &mut sims_formats::saved_objects::Interaction,
+        saved: &mut Option<Vec<i16>>,
+    ) -> Result<(), Trap> {
+        action.flags = (action.flags & !checked::PASSED) | checked::RAN;
+        let Some(target) = u16::try_from(action.target).ok().filter(|&t| t != 0) else {
+            return Ok(());
+        };
+        if !self.world.objects.contains_key(&target) {
+            return Err(Trap::Invalid(format!(
+                "a queued action's target, object {target}, is not there"
+            )));
+        }
+        let Some(table) = self.table(target)? else {
+            return Ok(());
+        };
+        let Some(record) = find(table, action.table_index as u32) else {
+            return Ok(());
+        };
+        let record = record.clone();
+        self.me_mut()?.data[data::CHECKED] = 0;
+        let word = |object: &sims_sim::Object, index: usize| object.data.get(index).copied();
+        let me = self.me()?;
+        let person = me
+            .person
+            .as_ref()
+            .ok_or(Trap::native(0x1c, "object is not a person"))?;
+        let personal = |index: usize| person.data.get(index).copied().unwrap_or(0);
+        let visitor = personal(person::VISITOR) != 0;
+        let age = personal(person::AGE);
+        let kind = personal(person::KIND);
+        let target_object = &self.world.objects[&target];
+        let target_data = |index: usize| word(target_object, index).unwrap_or(0);
+        let lot = self.world.globals.get(LOT).copied().unwrap_or(0);
+        let mut allowed = target_data(data::FLAGS) & 0x200 == 0;
+        if allowed && record.flags & entry::VISITORS == 0 && visitor {
+            let community = self.zoning(lot) != 1 && record.flags & entry::COMMUNITY != 0;
+            if !community {
+                if matches!(target_data(data::CATEGORY), 4 | 7) {
+                    return Err(Trap::Unsupported(
+                        "a visitor's chosen action on an object of category 4 or 7, which asks \
+                         the relationship (0x41f660)"
+                            .into(),
+                    ));
+                }
+                allowed = false;
+            }
+        }
+        let flags = record.flags;
+        let fits = if age != 0 && age < 18 {
+            flags & entry::NOT_CHILD == 0
+        } else if kind & 2 != 0 {
+            flags & entry::DOGS != 0
+        } else if kind & 4 != 0 {
+            flags & entry::CATS != 0
+        } else {
+            flags & entry::NOT_ADULT == 0
+        };
+        let passed = if !allowed || !fits {
+            false
+        } else if record.test == 0 {
+            true
+        } else {
+            if saved.is_none() {
+                *saved = Some(self.me()?.temps.clone());
+            }
+            let resource = self.definition(self.world.objects[&target].guid)?.resource;
+            match self.program.tree(resource, record.test) {
+                // The synchronous run writes its mark above the top frame
+                // (0x4749d9), fails to push a tree the file lacks
+                // (0x47484a), and returns false.
+                crate::program::Tree::Missing => {
+                    self.write_mark()?;
+                    false
+                }
+                crate::program::Tree::Primitive(id) => {
+                    return Err(Trap::Unsupported(format!(
+                        "check tree {id:#06x}, which names a primitive"
+                    )));
+                }
+                crate::program::Tree::Behavior(..) => {
+                    let tree = record.test;
+                    let args = [0, 0, 0, 0, tree as i16];
+                    let me = self.me;
+                    self.interpreter()
+                        .call_as(
+                            self.world,
+                            me,
+                            target,
+                            tree,
+                            target as i16,
+                            &args,
+                            args.len(),
+                            TURN_BUDGET,
+                            &mut None,
+                        )
+                        .map_err(|fault| {
+                            Trap::Unsupported(format!(
+                                "check tree {tree:#06x} of object {target}: {fault}"
+                            ))
+                        })?
+                }
+            }
+        };
+        let marked = self.me()?.data.get(data::CHECKED).is_some_and(|&w| w != 0);
+        action.flags &= !(checked::PASSED | checked::MARKED);
+        if passed {
+            action.flags |= checked::PASSED;
+        }
+        if marked {
+            action.flags |= checked::MARKED;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
