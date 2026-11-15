@@ -11,6 +11,7 @@ pub(crate) mod dialog;
 pub(crate) mod distance;
 mod events;
 mod expression;
+mod find_best_object;
 mod find_location;
 mod found_action;
 mod generic;
@@ -118,6 +119,7 @@ impl Machine<'_, '_> {
             8 => self.random(operands)?.into(),
             10 => self.own_events(operands)?.into(),
             11 => self.get_distance_to(operands)?.into(),
+            14 => self.find_best_object(operands)?.into(),
             16 => self.find_location(operands)?.into(),
             17 => self.idle_for_input(operands)?,
             18 => self.remove(operands)?,

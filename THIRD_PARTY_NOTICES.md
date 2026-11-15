@@ -38,6 +38,31 @@ adaptation must be reviewed, correctly attributed and distributed under its
 applicable terms; the project MIT license does not override them. Do not copy or
 translate upstream implementation code into an MIT-only file without that review.
 
+## Sound (`crates/sims-audio`)
+
+Dependencies, used unmodified from crates.io:
+
+| Crate | Version | License | Use |
+| --- | --- | --- | --- |
+| `symphonia-core`, `symphonia-bundle-mp3` | 0.5.5 | MPL-2.0 | Decoding the radio stations' MP3 files. |
+| `cpal` | 0.18.2 | Apache-2.0 | Live playback in the `play` example only, behind the `playback` feature, off by default. It and its platform crates (Core Audio, ALSA, WASAPI bindings) are built only with that feature. |
+
+Public notes consulted on the sound formats and scripts. None of their code is
+copied or translated:
+
+- FFmpeg's "Maxis XA" demuxer and `adpcm_ea_maxis_xa` decoder (LGPL-2.1-or-later):
+  the XA layout.
+- The Niotso wiki's XA, HIT and HOT pages: the file layouts and the HIT operand
+  layouts.
+- FreeSO's HIT interpreter and FSC player (MPL-2.0; see above for the project): the
+  operand layouts and register meanings. The FSC player was read for
+  orientation only.
+
+The volume, pan, pitch, ducking, event-kind and ambient-score behaviour was read
+from the original executable's code in a memory image, as the module docs mark.
+The same caveat as for the consulted projects above applies: this is not a
+clean-room provenance claim.
+
 ## Original developer documentation
 
 Development notes also cite the original virtual-machine and graphics design

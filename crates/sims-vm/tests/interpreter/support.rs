@@ -213,6 +213,7 @@ pub fn world() -> World {
         lot_rng: GameRng::from_state(1),
         global_rng: GameRng::from_state(2),
         order: vec![LAMP, SIM],
+        people: vec![SIM],
         types: BTreeMap::from([(7, LAMP_GUID), (8, SIM_GUID)]),
         objects: BTreeMap::from([(LAMP, object(LAMP, LAMP_GUID)), (SIM, sim)]),
         ..World::empty()
@@ -446,6 +447,7 @@ impl Fixture {
         let mut sim = object(id, SIM_GUID);
         sim.person = Some(person());
         self.world.order.push(id);
+        self.world.people.push(id);
         self.world.objects.insert(id, sim);
         self.world.objects.get_mut(&id).unwrap()
     }

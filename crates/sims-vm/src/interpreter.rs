@@ -86,6 +86,10 @@ pub struct Interpreter<'a> {
     /// Where to note each callback the lot asks of an object, or None to
     /// note nothing. See [`Asked`].
     pub asked: Option<&'a RefCell<Vec<Asked>>>,
+    /// The person the factory is making, while its scripts run. When in
+    /// the making the original appends a person to the person vector is
+    /// not read, so a walk of the vector meanwhile is refused.
+    pub(crate) making_person: Option<u16>,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -105,6 +109,7 @@ impl<'a> Interpreter<'a> {
             catalog,
             stream,
             asked: None,
+            making_person: None,
         }
     }
 
@@ -233,6 +238,7 @@ impl<'a> Interpreter<'a> {
             asked: self.asked,
             base,
             synchronous,
+            making_person: self.making_person,
             advertisements: None,
         }
     }
@@ -291,6 +297,8 @@ pub(crate) struct Machine<'a, 'w> {
     /// (the record at [0x6c437c]), which scopes 12, 28 and 29 read and
     /// write. None outside a check tree.
     pub advertisements: Option<Advertisements>,
+    /// See [`Interpreter::making_person`].
+    pub making_person: Option<u16>,
 }
 
 /// See [`Machine::advertisements`].
@@ -305,6 +313,7 @@ impl<'a> Machine<'a, '_> {
             catalog: self.catalog,
             stream: self.stream,
             asked: self.asked,
+            making_person: self.making_person,
         }
     }
 

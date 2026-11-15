@@ -1,6 +1,7 @@
 //! The game's interface, drawn from the original artwork.
 //!
 //! - [`hud`]: the live-mode control panel.
+//! - [`dialog`]: the dialogs scripts show.
 //! - [`command`]: what the player's clicks ask for.
 //! - [`household`]: what the panel shows, read from the simulation.
 //! - [`art`] and [`font`]: the original bitmaps and fonts.
@@ -13,6 +14,7 @@
 
 pub mod art;
 pub mod command;
+pub mod dialog;
 pub mod font;
 pub mod frame;
 pub mod household;
@@ -23,6 +25,7 @@ pub mod hud;
 pub enum Error {
     Content(sims_content::Error),
     Format(sims_formats::Error),
+    Io(std::io::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -30,6 +33,7 @@ impl std::fmt::Display for Error {
         match self {
             Self::Content(e) => e.fmt(f),
             Self::Format(e) => e.fmt(f),
+            Self::Io(e) => e.fmt(f),
         }
     }
 }

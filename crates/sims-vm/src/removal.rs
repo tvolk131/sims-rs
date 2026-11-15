@@ -271,6 +271,7 @@ impl Interpreter<'_> {
         world.routing.slots.retain(|&(object, _), _| object != id);
         world.fires.retain(|&other| other != id);
         world.order.retain(|&other| other != id);
+        world.people.retain(|&other| other != id);
         // A type's instance list outlives its instances (0x44383c).
         for instances in world.instances.values_mut() {
             instances.retain(|&other| other != id);
