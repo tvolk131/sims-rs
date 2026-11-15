@@ -107,8 +107,11 @@ fn a_new_person_gets_the_lowest_unused_id_and_runs_its_init_and_first_update() {
     let start = fx.world.crt_rng;
     let id = create(&mut fx, ADULT).unwrap();
     assert_eq!(id, 3);
-    // Registered at the head of the list.
+    // Registered at the head of the list, and at the end of the person
+    // vector.
     assert_eq!(fx.world.order[0], 3);
+    assert_eq!(fx.world.people.last(), Some(&3));
+    assert_eq!(fx.world.people.iter().filter(|&&p| p == 3).count(), 1);
     let object = &fx.world.objects[&3];
     assert_eq!(object.guid, ADULT);
     // The price, and the scheduler's ready flag.

@@ -568,6 +568,7 @@ mod tests {
             .objects
             .insert(TARGET, object(TARGET, GUIDS[1].0, 2, 64, 0));
         world.order = vec![PERSON, TARGET];
+        world.people = vec![PERSON];
         let tiles = [
             (10, 1, 32, 0),
             (11, 2, 48, 0),

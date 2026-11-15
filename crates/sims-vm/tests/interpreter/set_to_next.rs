@@ -151,6 +151,34 @@ fn mode_1_walks_people_and_ends_at_zero() {
 }
 
 #[test]
+fn modes_1_and_12_walk_the_person_vector_not_registration_order() {
+    let mut fx = Fixture::new();
+    fx.add_sim(4);
+    fx.add_sim(6);
+    // A person made at run time heads the registration list but ends the
+    // person vector.
+    fx.world.order = vec![6, 1, 2, 4];
+    fx.world.people = vec![2, 4, 6];
+    assert_eq!(scan(&mut fx, 1), (vec![2, 4, 6], 0));
+    // Mode 12 wraps round the same vector, within the family.
+    for id in [2, 4, 6] {
+        fx.world
+            .objects
+            .get_mut(&id)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[61] = 1;
+    }
+    assert_eq!(step(&mut fx, 12, 6), Ok(true));
+    assert_eq!(fx.lamp().temps[0], 2);
+    // A vector naming an object that is gone is invalid, not skipped.
+    fx.world.people.push(9);
+    assert!(step(&mut fx, 1, 0).is_err());
+}
+
+#[test]
 fn mode_2_skips_people() {
     let mut fx = Fixture::new();
     fx.add_object(3);

@@ -93,12 +93,15 @@ fn a_deleted_object_resets_one_last_time_and_is_unlinked() {
 fn an_object_without_a_reset_tree_is_deleted_without_running_anything() {
     let (mut fx, _) = lot(2, false);
     fx.world.instances.insert(WIDGET, vec![1, 2]);
+    // Removal takes an object out of the person vector too.
+    fx.world.people = vec![1, 2];
     let globals = fx.world.globals.clone();
     let interpreter = fx.interpreter();
     let mut world = fx.world.clone();
     assert_eq!(interpreter.remove_now(&mut world, 1), Ok(()));
     assert_eq!(world.globals, globals);
     assert_eq!(world.order, [2]);
+    assert_eq!(world.people, [2]);
     // The instance list outlives its last instance.
     assert_eq!(interpreter.remove_now(&mut world, 2), Ok(()));
     assert_eq!(world.instances[&WIDGET], []);

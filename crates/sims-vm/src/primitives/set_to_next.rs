@@ -16,7 +16,9 @@
 //!
 //! Modes over state `World` holds:
 //! - 0: the next object in registration order ([`World::order`]).
-//! - 1: the next person, in the same order.
+//! - 1: the next person in the person vector ([`World::people`],
+//!   0x44efb4), which is not registration order: a person made at run
+//!   time comes last.
 //! - 2: the next object that is not a person (definition word 9 is not 2).
 //! - 3: the next tile of the cursor's multi-tile group.
 //! - 4: the next instance of the type the GUID names, in that type's list
@@ -26,7 +28,8 @@
 //! - 10: the next career ID in [`crate::Program::careers`] (0x404cb3). A
 //!   cursor that is no career ID starts from the first. Unlike the object
 //!   modes, a next ID of zero still takes the true branch.
-//! - 12: the next member of the cursor's family (0x44f0d9).
+//! - 12: the next member of the cursor's family, round the person
+//!   vector (0x44f0d4).
 //!
 //! - 8: the next object on the cursor's tile, going round: the objects
 //!   that stand on the tile and everything they hold, in the order the
@@ -54,6 +57,7 @@
 //! Mode 11 fails loudly: it needs the neighborhood's lot order.
 //!
 //! [`World::order`]: sims_sim::World::order
+//! [`World::people`]: sims_sim::World::people
 
 use crate::fault::Trap;
 use crate::interpreter::Machine;
@@ -354,14 +358,21 @@ impl Machine<'_, '_> {
             .collect()
     }
 
-    /// The native person vector. Loading appends each person as it is
-    /// registered (legacy sims-content/src/save_storage.rs:1198), so it is
-    /// the people in registration order. Unverified once Sims join or leave
-    /// the lot, which nothing does yet.
+    /// The native person vector ([`sims_sim::World::people`]).
     fn person_order(&self) -> Result<Vec<(i16, &Object)>, Trap> {
-        let mut order = self.registration_order()?;
-        order.retain(|(_, o)| o.person.is_some());
-        Ok(order)
+        self.world
+            .people
+            .iter()
+            .map(|&id| {
+                let object = self.world.objects.get(&id).ok_or_else(|| {
+                    Trap::Invalid(format!("person vector names object {id}, which is gone"))
+                })?;
+                let id = i16::try_from(id).map_err(|_| {
+                    Trap::Invalid(format!("object ID {id} does not fit a script word"))
+                })?;
+                Ok((id, object))
+            })
+            .collect()
     }
 }
 

@@ -116,6 +116,11 @@ impl Interpreter<'_> {
             .machine(world, id, 0, false)
             .construct(guid, true)
             .map_err(|trap| fail(id, trap))?;
+        // The person joins the end of the person vector. A load's people
+        // keep its order, and Set To Next in tick 409 of the Goth house
+        // shows a person made at run time coming after them; when in the
+        // making the original appends it is not read.
+        world.people.push(id);
         // The post-constructor.
         let mut draws = Draws {
             stream: &mut world.crt_rng,
