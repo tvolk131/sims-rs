@@ -5,9 +5,11 @@
 //! **Who is in the way** (0x45ba28, for the routing person R and R's
 //! last context):
 //!
-//! 1. The candidates are the lot's people but R, one the planner leaves
-//!    out of its obstacles for R's context ([`crate::Interpreter::ignored`]:
-//!    one farther than 3 tiles, among others), every one when R's
+//! 1. The candidates are the people on the lot's list of people
+//!    ([`sims_sim::World::people`], in its order) but R, one the planner
+//!    leaves out of its obstacles for R's context
+//!    ([`crate::Interpreter::ignored`]: one farther than 3 tiles, among
+//!    others), every one when R's
 //!    posture (person word 0) is not 0, and one some person's route
 //!    context already waits on (+0x80). None: nobody is in the way.
 //! 2. A new context for R and the same slot (0x48163e) is planned once
@@ -45,9 +47,11 @@
 //! 6. R's context then waits on P (+0x80) for that action (+0x90), and
 //!    its byte +0x84 is cleared.
 //!
-//! The lot's list of people is not modeled; more than one candidate,
-//! whose order would matter, fails loudly. So do an action that runs at
-//! once (interaction flag 4) and one that pushes queued actions out.
+//! The candidates keep the list's order (0x45bb04 appends each to a
+//! static vector), so the first one that agrees to move in step 2, and
+//! the first whose footprint holds a sample in step 3, are found in
+//! that order. An action that runs at once (interaction flag 4) and one
+//! that pushes queued actions out fail loudly.
 
 use crate::autonomy::{attenuation, find, person};
 use crate::fault::{Fault, Trap};
@@ -155,12 +159,13 @@ impl Machine<'_, '_> {
         let wrap = |fault: Fault| {
             Trap::Unsupported(format!("finding a person in the way (0x45ba28): {fault}"))
         };
+        // The person vector Set To Next walks too ([person +0xdc] +0x84),
+        // checked the same way: each entry a person, and no person in the
+        // making.
         let people: Vec<u16> = self
-            .world
-            .objects
-            .iter()
-            .filter(|(_, o)| o.person.is_some())
-            .map(|(&id, _)| id)
+            .person_order()?
+            .into_iter()
+            .map(|(id, _)| id as u16)
             .collect();
         let posture = self.person_word(POSTURE)?;
         let mut candidates = Vec::new();
@@ -181,18 +186,8 @@ impl Machine<'_, '_> {
                 candidates.push(id);
             }
         }
-        match candidates.len() {
-            0 => return Ok(false),
-            1 => {}
-            n => {
-                return Err(unsupported(
-                    "0x45bb04",
-                    &format!(
-                        "with {n} people in the way, whose order on the lot's list of people \
-                         is not modeled"
-                    ),
-                ));
-            }
+        if candidates.is_empty() {
+            return Ok(false);
         }
         let mut copy = new_context(self.world, me, ctx.target, ctx.slot);
         let mut path = Vec::new();
