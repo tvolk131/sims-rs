@@ -4,6 +4,27 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-14: Live sound plays through cpal, behind a feature that is off by default
+
+`cargo run -p sims-audio --features playback --example play -- <event>...`
+plays sound events on the default output device. The player renders
+22,050 Hz stereo blocks on the main thread and sends them through a
+bounded channel. The device callback converts them to the device's rate
+(by linear interpolation) and sample format. The channel's capacity
+paces the rendering, so nothing waits on the wall clock.
+
+- cpal is optional and only the `play` example needs it, so `cargo
+  test` and CI build no audio library and need no device. This matters
+  on Linux, where cpal needs ALSA's headers.
+- It lives in an example, not the library: the game's real host will
+  live in the app, and how it mixes sound with its frame loop is the
+  app's choice.
+- Run on macOS only (48 kHz, f32): the device opened and the events
+  played with no errors or underruns. Nobody has listened to it yet.
+
+Reopen when the app wants live sound: it can take this callback or use
+its own.
+
 ## 2026-11-14: The ambient scores play as the original's score player does
 
 `crates/sims-audio/src/ambience.rs` plays the FSC scores (backyard,
