@@ -41,7 +41,7 @@ fn container_slot() -> Slot {
 
 /// Find Location For's lot and widget, with the lamp a container on tile
 /// (2, 2) in room 1, and the widget's file.
-fn container() -> (Fixture, usize) {
+pub fn container() -> (Fixture, usize) {
     let (mut fx, file) = placeable();
     fx.words(LAMP_FILE)[20] = SLOTS as i16;
     fx.program
@@ -274,6 +274,47 @@ fn flag_0x1_finds_an_object_held_by_one_on_the_tile() {
 }
 
 #[test]
+fn mode_4_into_a_person_uses_the_slot_it_carries_in() {
+    // The Sim, on the lamp's tile in live mode, has the tile slot and the
+    // five a person adds (0x45962b); its slot 0 is at height 6.
+    let person = |fx: &mut Fixture| {
+        fx.world.globals[19] = 0;
+        let sim = fx.sim_mut();
+        sim.position = [40, 40, 1];
+        sim.data[29] = 1;
+        for held in &mut sim.slots {
+            held.object = 0;
+        }
+        let tile = sim.slots[0].clone();
+        sim.slots.resize(6, tile);
+    };
+    // The widget's Init lets it go at height 1 only, so the slot refuses
+    // it and it is removed.
+    let (mut fx, _) = container();
+    person(&mut fx);
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 4, 0, SIM as i16), Ok(false));
+    assert_eq!(ids(&fx), before);
+    // With bit 5 of data word 4 too, it goes in.
+    let (mut fx, file) = container();
+    person(&mut fx);
+    fx.add(
+        file,
+        4096,
+        tree(vec![
+            assign(scope::MY_DATA, 4, scope::LITERAL, 0x21, 1),
+            assign(scope::MY_DATA, 42, scope::LITERAL, 2, RETURN_TRUE),
+        ]),
+    );
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 4, 0, SIM as i16), Ok(true));
+    let id = new_object(&fx, &before);
+    let held: Vec<i16> = fx.sim().slots[1..].iter().map(|s| s.object).collect();
+    assert_eq!(held, [id as i16, 0, 0, 0, 0]);
+    assert_eq!(fx.world.objects[&id].data[2], SIM as i16);
+}
+
+#[test]
 fn what_mode_4_does_not_port_fails_loudly() {
     // Flags other than 0x1.
     for flags in [0x2, 0x4, 0x8, 0x10, 0x20, 0x40, 0x21] {
@@ -296,14 +337,6 @@ fn what_mode_4_does_not_port_fails_loudly() {
         );
         assert_eq!(ids(&fx), before, "word {word}");
     }
-    // A person as the container: its slots are not ported.
-    let (mut fx, _) = container();
-    fx.sim_mut().position = [40, 40, 1];
-    fx.sim_mut().data[29] = 1;
-    let before = ids(&fx);
-    let result = create(&mut fx, 4, 0, SIM as i16);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x459630")));
-    assert_eq!(ids(&fx), before);
     // The modes not ported.
     for mode in [0, 1, 2, 3, 5, 7, 9, 15] {
         let (mut fx, _) = container();

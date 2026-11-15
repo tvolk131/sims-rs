@@ -17,6 +17,7 @@ mod find_location;
 mod found_action;
 mod generic;
 mod go_to_slot;
+mod grab;
 mod headline;
 mod idle;
 mod in_way;
@@ -120,6 +121,7 @@ impl Machine<'_, '_> {
             1 => self.generic_call(operands)?.into(),
             2 => self.expression(operands)?.into(),
             3 => self.find_best_interaction()?,
+            4 => self.grab()?.into(),
             6 => self.change_suit(operands)?.into(),
             7 => self.refresh(operands)?.into(),
             8 => self.random(operands)?.into(),
