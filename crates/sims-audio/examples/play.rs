@@ -14,22 +14,33 @@
 //! play --view 50 --hour 12 bkground_nhood1 setambience_backyard bkground_live
 //! ```
 //!
-//! The player renders 22,050 Hz stereo on this thread; the device's
-//! callback converts it to the device's rate and format. Nothing here is
-//! part of the simulation: wall-clock pacing comes from the device.
+//! The player renders 22,050 Hz stereo on this thread into a ring of
+//! frames allocated once; the device's callback takes frames from it,
+//! converting them to the device's rate and format, and allocates
+//! nothing. Nothing here is part of the simulation: the device paces the
+//! rendering. If the device stops taking frames for two seconds, or
+//! reports that the stream is gone, the program stops with an error.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
+use cpal::{ErrorKind, FromSample, SampleFormat, SizedSample, StreamConfig};
 use sims_audio::SoundEvent;
 use sims_audio::files::SoundFiles;
 use sims_audio::module::Module;
 use sims_audio::player::{BLOCK, NoSources, Player, RATE};
 use sims_audio::stations::StationLists;
 use std::collections::VecDeque;
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
-/// Blocks rendered ahead of the device: about 0.2 s.
-const AHEAD: usize = 64;
+/// Frames rendered ahead of the device: about 0.2 s.
+const CAPACITY: usize = 64 * BLOCK;
+/// How long the main thread waits for the device at a time, and how many
+/// waits in a row with no callback count as the device having stopped.
+const WAIT: Duration = Duration::from_millis(100);
+const STALLS: u32 = 20;
+/// 1.0 in the converter's 16.16 fixed point.
+const ONE: u64 = 1 << 16;
 
 struct Options {
     seconds: u64,
@@ -77,6 +88,98 @@ fn options() -> Result<Options, String> {
     Ok(options)
 }
 
+/// What the main thread and the device's callback share.
+struct Shared {
+    ring: Mutex<Ring>,
+    /// Signalled after each callback.
+    moved: Condvar,
+    /// Set when the stream reports that it cannot go on.
+    failed: AtomicBool,
+}
+
+struct Ring {
+    frames: VecDeque<[i16; 2]>,
+    /// No more frames will come.
+    ended: bool,
+    /// Ended, and the last frame has had time to reach the speakers.
+    finished: bool,
+    callbacks: u64,
+}
+
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, Ring> {
+        self.ring.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits until `done` holds, failing if the stream failed or stopped
+    /// calling back.
+    fn wait_until(&self, done: impl Fn(&Ring) -> bool) -> Result<MutexGuard<'_, Ring>, String> {
+        let mut ring = self.lock();
+        let mut stalls = 0;
+        while !done(&ring) {
+            if self.failed.load(Ordering::Relaxed) {
+                return Err("the output stream failed".into());
+            }
+            let before = ring.callbacks;
+            ring = self
+                .moved
+                .wait_timeout(ring, WAIT)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+            stalls = if ring.callbacks == before {
+                stalls + 1
+            } else {
+                0
+            };
+            if stalls >= STALLS {
+                return Err("the output device stopped taking sound".into());
+            }
+        }
+        Ok(ring)
+    }
+}
+
+/// Converts 22,050 Hz frames to the device's rate by linear
+/// interpolation.
+struct Converter {
+    /// Source frames per device frame, 16.16.
+    step: u64,
+    /// Position between the first two frames, 16.16; at or past
+    /// [`ONE`], frames still owed a skip.
+    phase: u64,
+}
+
+impl Converter {
+    fn new(rate: u32) -> Self {
+        Converter {
+            step: (u64::from(RATE) << 16) / u64::from(rate.max(1)),
+            phase: 0,
+        }
+    }
+
+    /// The next device frame, or `None` when the frames have run out (or,
+    /// once `ended`, are over).
+    fn next(&mut self, frames: &mut VecDeque<[i16; 2]>, ended: bool) -> Option<[f32; 2]> {
+        while self.phase >= ONE && !frames.is_empty() {
+            frames.pop_front();
+            self.phase -= ONE;
+        }
+        if self.phase >= ONE {
+            return None;
+        }
+        let a = *frames.front()?;
+        let b = match frames.get(1) {
+            Some(b) => *b,
+            None if ended => a,
+            None => return None,
+        };
+        let t = self.phase as f32 / ONE as f32;
+        let mix = |x: i16, y: i16| (f32::from(x) * (1.0 - t) + f32::from(y) * t) / 32768.0;
+        self.phase += self.step;
+        Some([mix(a[0], b[0]), mix(a[1], b[1])])
+    }
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
@@ -107,100 +210,86 @@ fn run() -> Result<(), String> {
         "playing at {} Hz, {} channels, {format}",
         config.sample_rate, config.channels
     );
-    let (blocks, from_player) = sync_channel::<Vec<i16>>(AHEAD);
-    let (drained, done) = sync_channel::<()>(1);
+    let shared = Arc::new(Shared {
+        ring: Mutex::new(Ring {
+            frames: VecDeque::with_capacity(CAPACITY),
+            ended: false,
+            finished: false,
+            callbacks: 0,
+        }),
+        moved: Condvar::new(),
+        failed: AtomicBool::new(false),
+    });
     let stream = match format {
-        SampleFormat::I16 => stream::<i16>(&device, config, from_player, drained),
-        SampleFormat::I32 => stream::<i32>(&device, config, from_player, drained),
-        SampleFormat::F32 => stream::<f32>(&device, config, from_player, drained),
-        SampleFormat::F64 => stream::<f64>(&device, config, from_player, drained),
+        SampleFormat::I16 => stream::<i16>(&device, config, shared.clone()),
+        SampleFormat::I32 => stream::<i32>(&device, config, shared.clone()),
+        SampleFormat::F32 => stream::<f32>(&device, config, shared.clone()),
+        SampleFormat::F64 => stream::<f64>(&device, config, shared.clone()),
         format => return Err(format!("sample format {format} is not supported")),
     }?;
+
     for name in &options.events {
         player.handle(&SoundEvent::Play {
             object: 1,
             name: name.clone(),
         });
     }
-    let blocks_total = options.seconds.saturating_mul(u64::from(RATE)) / BLOCK as u64;
+    let blocks = options.seconds.saturating_mul(u64::from(RATE)) / BLOCK as u64;
     let mut playing = false;
-    for sent in 0..blocks_total {
+    for _ in 0..blocks {
         if let Some(view) = options.view {
             player.set_ambience_view(view, options.hour.unwrap_or(u32::MAX));
         }
-        if send(&blocks, player.render_stereo(BLOCK, &NoSources)).is_err() || player.is_idle() {
-            break;
-        }
-        // The device starts once the channel is full, so it does not
-        // run dry at once.
-        if !playing && sent + 1 >= AHEAD as u64 {
+        let block = player.render_stereo(BLOCK, &NoSources);
+        // The device starts once the ring is full, so it does not run dry
+        // at once.
+        if !playing && shared.lock().frames.len() + BLOCK > CAPACITY {
             stream.play().map_err(|e| format!("play: {e}"))?;
             playing = true;
         }
+        let mut ring = shared.wait_until(|ring| ring.frames.len() + BLOCK <= CAPACITY)?;
+        ring.frames.extend(block.as_chunks::<2>().0.iter().copied());
+        drop(ring);
+        if player.is_idle() {
+            break;
+        }
     }
-    drop(blocks);
+    shared.lock().ended = true;
     if !playing {
         stream.play().map_err(|e| format!("play: {e}"))?;
     }
-    // The callback says when it has played what was sent.
-    let _ = done.recv();
+    drop(shared.wait_until(|ring| ring.finished)?);
+    drop(stream);
     for fault in &player.faults {
         eprintln!("fault: {fault}");
     }
     Ok(())
 }
 
-fn send(blocks: &SyncSender<Vec<i16>>, block: Vec<i16>) -> Result<(), ()> {
-    blocks.send(block).map_err(|_| ())
-}
-
-/// The device's stream, pulling the player's blocks and converting them
-/// by linear interpolation.
+/// The device's stream, taking frames from the ring.
 fn stream<T>(
     device: &cpal::Device,
     config: StreamConfig,
-    blocks: Receiver<Vec<i16>>,
-    drained: SyncSender<()>,
+    shared: Arc<Shared>,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample + FromSample<f32>,
 {
     let channels = usize::from(config.channels).max(1);
-    // Source frames per device frame, 16.16 fixed point.
-    let step = (u64::from(RATE) << 16) / u64::from(config.sample_rate.max(1));
-    let mut frames: VecDeque<[i16; 2]> = VecDeque::new();
-    let mut phase: u64 = 0;
-    let mut ended = false;
-    let callback = move |out: &mut [T], _: &cpal::OutputCallbackInfo| {
+    let rate = config.sample_rate.max(1);
+    let mut converter = Converter::new(rate);
+    // Device frames of silence written since the frames ended.
+    let mut tail: u64 = 0;
+    let errors = shared.clone();
+    let callback = move |out: &mut [T], info: &cpal::OutputCallbackInfo| {
+        let mut ring = shared.lock();
+        let ended = ring.ended;
+        let mut silent: u64 = 0;
         for frame in out.chunks_mut(channels) {
-            while frames.len() < 2 && !ended {
-                match blocks.try_recv() {
-                    Ok(block) => frames.extend(block.chunks(2).map(|p| [p[0], p[1]])),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => ended = true,
-                }
-            }
-            let (left, right) = match (frames.front(), frames.get(1)) {
-                (Some(a), Some(b)) => {
-                    let mix = |x: i16, y: i16| {
-                        let t = phase as f32 / 65536.0;
-                        (f32::from(x) * (1.0 - t) + f32::from(y) * t) / 32768.0
-                    };
-                    (mix(a[0], b[0]), mix(a[1], b[1]))
-                }
-                (Some(a), None) if ended => (f32::from(a[0]) / 32768.0, f32::from(a[1]) / 32768.0),
-                _ => (0.0, 0.0),
-            };
-            if frames.len() >= 2 || (ended && !frames.is_empty()) {
-                phase += step;
-                while phase >= 1 << 16 && !frames.is_empty() {
-                    phase -= 1 << 16;
-                    frames.pop_front();
-                }
-            }
-            if ended && frames.is_empty() {
-                let _ = drained.try_send(());
-            }
+            let [left, right] = converter.next(&mut ring.frames, ended).unwrap_or_else(|| {
+                silent += 1;
+                [0.0, 0.0]
+            });
             match frame {
                 [only] => *only = T::from_sample((left + right) / 2.0),
                 [l, r, rest @ ..] => {
@@ -213,8 +302,81 @@ where
                 [] => {}
             }
         }
+        if ended && ring.frames.is_empty() {
+            tail += silent;
+            // Done once the silence after the end covers the device's
+            // latency and a tenth of a second more.
+            let timestamp = info.timestamp();
+            let latency = timestamp.playback.duration_since(timestamp.callback);
+            let latency =
+                u64::try_from(latency.as_micros() * u128::from(rate) / 1_000_000).unwrap_or(0);
+            if tail >= latency + u64::from(rate) / 10 {
+                ring.finished = true;
+            }
+        }
+        ring.callbacks += 1;
+        drop(ring);
+        shared.moved.notify_one();
+    };
+    let on_error = move |error: cpal::Error| {
+        eprintln!("stream: {error}");
+        if !matches!(
+            error.kind(),
+            ErrorKind::Xrun | ErrorKind::DeviceChanged | ErrorKind::RealtimeDenied
+        ) {
+            errors.failed.store(true, Ordering::Relaxed);
+            errors.moved.notify_one();
+        }
     };
     device
-        .build_output_stream(config, callback, |error| eprintln!("stream: {error}"), None)
+        .build_output_stream(config, callback, on_error, None)
         .map_err(|e| format!("stream: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Converts `frames` source frames alternating between ±30,000 to
+    /// `rate`, adding them in uneven batches, and checks every output lies
+    /// within the input's range. Returns the device frames made.
+    fn convert(rate: u32, frames: usize) -> usize {
+        let mut converter = Converter::new(rate);
+        let mut ring = VecDeque::new();
+        let mut fed = 0;
+        let mut out = 0;
+        let mut batch = 1;
+        loop {
+            let ended = fed == frames;
+            match converter.next(&mut ring, ended) {
+                Some([l, r]) => {
+                    let bound = 30_000.0 / 32_768.0 + 1e-6;
+                    assert!(l.abs() <= bound && (l - r).abs() < 1e-6, "{rate}: {l} {r}");
+                    out += 1;
+                }
+                None if ended => return out,
+                None => {
+                    for _ in 0..batch.min(frames - fed) {
+                        let v = if fed % 2 == 0 { 30_000 } else { -30_000 };
+                        ring.push_back([v, v]);
+                        fed += 1;
+                    }
+                    batch = batch % 5 + 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_converter_stays_in_range_at_any_rate() {
+        for rate in [8_000, 11_025, 22_050, 44_100, 48_000, 96_000] {
+            let out = convert(rate, 22_050);
+            let expected = 22_050 * u64::from(rate) / u64::from(RATE);
+            // The 16.16 step rounds down: at most a frame in 10,000 more.
+            assert!(
+                out.abs_diff(expected as usize) <= expected as usize / 10_000 + 2,
+                "{rate}: {out} {expected}"
+            );
+        }
+    }
 }
