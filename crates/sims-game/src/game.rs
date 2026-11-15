@@ -110,6 +110,9 @@ pub struct Game {
     /// The pie menu listed when the pointer reached an object: for whom,
     /// on what, and the listing, until a click opens it.
     listed: Option<(u16, u16, Result<Listing, String>)>,
+    /// The entry of the open pie menu the pointer last highlighted
+    /// ([`Game::highlight`]).
+    highlighted: Option<usize>,
     /// The time the window has passed in, in microseconds: the clock
     /// that spins the plumb bob.
     clock_us: u64,
@@ -154,6 +157,7 @@ impl Game {
             pointer: None,
             reached: None,
             listed: None,
+            highlighted: None,
             note: None,
             clock_us: 0,
             drawn_us: 0,
@@ -534,6 +538,7 @@ impl Game {
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
         self.pointer = Some(point);
         let mut redraw = self.hud.hover(point);
+        redraw |= self.highlight(point);
         redraw |= self.follow();
         // The cutaway follows the rooms the pointer passes over, while
         // the cutaway is on and the pointer is over the lot.
@@ -572,10 +577,12 @@ impl Game {
         Outcome::redraw()
     }
 
-    /// The pointer left the window: it is on no object, button or
-    /// portrait. True if the frame changes.
+    /// The pointer left the window: it is on no object, button, portrait
+    /// or pie entry, so coming back onto an entry checks it again. True
+    /// if the frame changes.
     pub fn leave(&mut self) -> bool {
         self.pointer = None;
+        self.highlighted = None;
         let redraw = self.hud.leave();
         self.follow() || redraw
     }
@@ -590,6 +597,7 @@ impl Game {
             Some(point) if self.stopped.is_none() && !self.hud.covers(point) => self.under(point),
             _ => None,
         };
+
         if under == self.reached {
             return false;
         }
@@ -604,6 +612,40 @@ impl Game {
         self.listed
             .as_ref()
             .map(|(person, object, _)| (*person, *object))
+    }
+
+    /// Checks again the action of the open pie menu's entry the pointer
+    /// at `point` has reached, as the original does each time the pointer
+    /// reaches an entry (0x48df28, `Lot::highlight`), which changes the
+    /// lot. The action the check leaves is the one choosing the entry
+    /// queues. True if the check ran.
+    fn highlight(&mut self, point: [i32; 2]) -> bool {
+        let Some(menu) = &self.hud.menu else {
+            self.highlighted = None;
+            return false;
+        };
+        let entry = menu.highlighted(point);
+        if entry == self.highlighted {
+            return false;
+        }
+        self.highlighted = entry;
+        let Some((i, Some(action))) = entry.map(|i| (i, menu.entries[i].action.clone())) else {
+            return false;
+        };
+        if self.stopped.is_some() {
+            return false;
+        }
+        let person = menu.person;
+        match self.lot.highlight(person, action) {
+            Ok(checked) => {
+                self.keep_sounds(checked.sounds);
+                if let Some(entry) = self.hud.menu.as_mut().and_then(|m| m.entries.get_mut(i)) {
+                    entry.action = Some(checked.action);
+                }
+            }
+            Err(e) => self.note = Some(format!("The entry's check did not run: {e}")),
+        }
+        true
     }
 
     /// The person or object shown at `point` on the lot in the frame last
@@ -641,9 +683,10 @@ impl Game {
             self.note = Some("Nobody is selected to do anything.".into());
             return;
         };
-        if !matches!(self.listed, Some((p, o, _)) if p == person && o == object) {
-            self.list(object);
-        }
+        // The press lists the menu again: the live mode's press handler
+        // (0x48cbec) first sets the object under the pointer to none
+        // (0x48c834 with 0), so the press's own pick lists it anew.
+        self.list(object);
         self.reached = Some(object);
         let Some((_, _, listing)) = self.listed.take() else {
             return;
@@ -663,6 +706,7 @@ impl Game {
                     });
                 } else {
                     self.note = why.map(|why| format!("Every entry is shown, as {why}"));
+                    self.highlighted = None;
                     self.hud.menu = Some(Menu::new(
                         person,
                         object,

@@ -1,6 +1,8 @@
 //! Grab (opcode 4, 0x451dda): the stack object goes into my first
 //! container slot, after its place test (0x433311), and a person's
 //! container slots include the five its post-constructor adds (0x45962b).
+//! Drop (opcode 5, 0x454430) puts what the slot holds on the floor one
+//! tile in front.
 //!
 //! The lot and the lamp are Create New Object Instance mode 4's: the lamp
 //! on tile (2, 2) in room 1, with two empty container slots at its centre,
@@ -9,7 +11,7 @@
 //! person adds, its definition having no SLOT.
 
 use crate::create::container;
-use crate::find_location::widget;
+use crate::find_location::{find, widget};
 use crate::support::*;
 use sims_formats::execution::Slot;
 use sims_formats::saved_objects::Multipart;
@@ -248,4 +250,65 @@ fn a_grab_whose_put_fails_leaves_the_lot_as_it_was() {
     let result = grab(&mut fx, SIM, id as i16);
     assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("facing 8")));
     assert_eq!(lot_hash(&fx.world), before);
+}
+
+const DROP: u16 = 5;
+
+/// Runs tree 4096 of the lamp, whose one instruction is Drop with the
+/// given operands.
+fn drop_with(fx: &mut Fixture, operands: [u8; 8]) -> Result<bool, sims_vm::Fault> {
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(DROP, RETURN_TRUE, RETURN_FALSE, operands)]),
+    );
+    fx.run_with(LAMP, 4096, 0, &[], 1000)
+}
+
+#[test]
+fn drop_puts_what_i_hold_one_tile_in_front_of_me() {
+    // 0x454430: one tile from mine in my direction (0x42228a), on my
+    // level, out of my first container slot. The operands are not read.
+    let places = [
+        [40, 24],
+        [56, 24],
+        [56, 40],
+        [56, 56],
+        [40, 56],
+        [24, 56],
+        [24, 40],
+        [24, 24],
+    ];
+    for (facing, place) in places.into_iter().enumerate() {
+        let (mut fx, id) = lot(false);
+        assert_eq!(grab(&mut fx, LAMP, id as i16), Ok(true));
+        fx.lamp_mut().data[1] = facing as i16;
+        assert_eq!(drop_with(&mut fx, [0xff; 8]), Ok(true), "facing {facing}");
+        let widget = &fx.world.objects[&id];
+        assert_eq!(widget.position, [place[0], place[1], 1], "facing {facing}");
+        assert_eq!((widget.data[2], widget.data[14]), (0, -1));
+        assert_eq!(held(fx.lamp()), [0, 0]);
+    }
+}
+
+#[test]
+fn drop_takes_the_false_branch_when_nothing_is_held_or_the_place_refuses() {
+    // Nothing in my first container slot.
+    let (mut fx, _) = lot(false);
+    let before = hash_without_frames(&fx.world);
+    assert_eq!(drop_with(&mut fx, [0; 8]), Ok(false));
+    assert_eq!(hash_without_frames(&fx.world), before);
+    // A widget already stands on the tile in front (facing 7, tile
+    // (1, 1)): the place test refuses and nothing changes.
+    let (mut fx, id) = lot(false);
+    assert_eq!(grab(&mut fx, LAMP, id as i16), Ok(true));
+    let blocker = widget(&mut fx);
+    assert_eq!(find(&mut fx, 0, blocker, 0), Ok(true));
+    assert_eq!(fx.world.objects[&blocker].position, [24, 24, 1]);
+    fx.lamp_mut().data[1] = 7;
+    let before = fx.world.objects[&id].position;
+    assert_eq!(drop_with(&mut fx, [0; 8]), Ok(false));
+    assert_eq!(fx.world.objects[&id].position, before);
+    assert_eq!(fx.world.objects[&blocker].position, [24, 24, 1]);
+    assert_eq!(held(fx.lamp()), [id as i16, 0]);
 }

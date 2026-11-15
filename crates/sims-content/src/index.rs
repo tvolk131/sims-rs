@@ -116,6 +116,10 @@ pub struct Index {
     pub diagnostics: Vec<String>,
 }
 
+/// A directory's listing ([`Index::listing`]): each entry's key-form name
+/// and resource, and the reasons any entries were skipped.
+pub(crate) type Listing = (Vec<(Vec<u8>, Resource)>, Vec<String>);
+
 impl Index {
     /// The name of the mount [`Index::add_characters`] adds.
     pub const CHARACTERS: &'static str = "Characters";
@@ -193,6 +197,52 @@ impl Index {
                 r.file_name().eq_ignore_ascii_case(name)
             }
         })
+    }
+
+    /// The files and archive members in one directory of a mount and every
+    /// directory below it, in the order the original's file table walks
+    /// them (0x4125a2): a subdirectory is gone into where its name falls
+    /// (0x412699), as the pattern catalogs' scan asks for every directory
+    /// (0x412863, set at 0x4a06e9). Each comes with its file name in key
+    /// form. `directory` is the mount's directory on disk, which is
+    /// scanned recursively, as the original mounts it, and `at` the
+    /// directory's key below it (empty, or ending in `\`).
+    pub(crate) fn listing(directory: &Path, at: &[u8]) -> Result<Listing> {
+        let mut index = Self {
+            root: directory.to_path_buf(),
+            mounts: Vec::new(),
+            resources: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut directories = Directories::new();
+        index.scan(&mut directories, &[], directory, true)?;
+        let mut listed = Vec::new();
+        Self::list_all(&directories, at, &mut listed);
+        Ok((listed, index.diagnostics))
+    }
+
+    /// [`Index::listing`]'s walk of one directory.
+    fn list_all(directories: &Directories, at: &[u8], listed: &mut Vec<(Vec<u8>, Resource)>) {
+        let Some(here) = directories.get(at) else {
+            return;
+        };
+        for name in here.table().iter() {
+            let resource = |path: &PathBuf, member: Option<&Member>| Resource {
+                mount: 0,
+                path: path.clone(),
+                member: member.cloned(),
+            };
+            match here.entries.get(name) {
+                Some(Entry::File(path)) => listed.push((name.to_vec(), resource(path, None))),
+                Some(Entry::Member(path, member)) => {
+                    listed.push((name.to_vec(), resource(path, Some(member))))
+                }
+                Some(Entry::Directory) => {
+                    Self::list_all(directories, &[at, name, b"\\"].concat(), listed)
+                }
+                Some(Entry::Archive) | None => {}
+            }
+        }
     }
 
     /// Lists one mount: gathers its directories, then walks them.

@@ -461,7 +461,7 @@ fn a_menu_for_someone_who_is_not_a_person_is_an_error() {
 }
 
 #[test]
-fn the_pointer_reaching_an_object_lists_its_menu_once_and_a_click_opens_it() {
+fn the_pointer_reaching_an_object_lists_its_menu_and_a_click_lists_it_again() {
     let Some(install) = install() else {
         return;
     };
@@ -490,7 +490,8 @@ fn the_pointer_reaching_an_object_lists_its_menu_once_and_a_click_opens_it() {
         game.hover(point);
         assert_eq!(game.lot().world().hash(), before);
         assert_eq!(game.listed(), Some((person, id)));
-        // A click opens the listing, when it offers anything.
+        // A click lists the menu again (0x48cbec) and opens that
+        // listing, when it offers anything.
         game.press(point);
         assert_eq!(game.listed(), None);
         if game.close_menu() {
@@ -797,7 +798,7 @@ fn a_second_order_waits_behind_the_first_and_a_press_cancels_either() {
     // 1028 the water starts.
     assert_eq!(game.run(128), 128);
     assert_eq!(mortimer(&game).active.uid, eating);
-    assert_eq!(game.lot().world().objects[&snack].position, [296, 440, 1]);
+    assert_eq!(game.lot().world().objects[&snack].position, [280, 456, 1]);
     assert_eq!(game.run(1), 1);
     let watering = mortimer(&game).active;
     assert_eq!((watering.uid, watering.target), (2, plant as i16));
@@ -1374,5 +1375,149 @@ fn a_press_on_the_selected_goths_portrait_centres_him_after_a_long_scroll() {
             "{scroll:?}: drawn at {drawn:?}"
         );
     }
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// Track 2's recording of the original (the goth-snack scenario) ordered
+/// Mortimer's snack with the pointer: it reached the fridge before update
+/// 124, pressed before 154, reached "Have A Snack" on the pie before 176
+/// and chose it before 202. The window, given the same input between the
+/// same ticks in strict mode, matched the recording's full state after
+/// every update from 1 to 453 but for two things the input does not
+/// change (see docs/decisions.md). This pins what the recording showed
+/// the input doing: Mortimer's last result after each step, and what the
+/// fridge's check trees left in his frames when the snack starts.
+#[test]
+fn the_recorded_snack_order_replayed_in_the_window_matches_the_recording() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    let fridge = 118;
+    let mortimer = game.lot().world().selected().expect("a Sim is selected");
+    assert_eq!(mortimer, 21);
+    let last = |game: &Game| game.lot().world().objects[&mortimer].last_result;
+    let run_to = |game: &mut Game, tick: u32| {
+        while game.lot().ticks() < tick {
+            assert_eq!(game.run(1), 1, "{:?}", game.stopped());
+            game.render();
+        }
+    };
+    run_to(&mut game, 123);
+    let at = (0..600)
+        .step_by(2)
+        .flat_map(|y| (0..800).step_by(2).map(move |x| [x, y]))
+        .find(|&p| !game.over_panel(p) && game.under(p) == Some(fridge))
+        .expect("the fridge is on screen");
+    game.hover(at);
+    assert_eq!(game.listed(), Some((mortimer, fridge)));
+    run_to(&mut game, 124);
+    assert!(!last(&game), "the listing's last check failed");
+    run_to(&mut game, 153);
+    assert!(last(&game));
+    // The press lists the menu again, whose last check fails again.
+    game.press(at);
+    game.render();
+    run_to(&mut game, 154);
+    assert!(!last(&game), "the press listed the menu again");
+    run_to(&mut game, 175);
+    let entry = {
+        let menu = game.menu().expect("the fridge's pie is open");
+        let (_, r) = menu
+            .labels()
+            .into_iter()
+            .find(|(text, _)| *text == "Have A Snack")
+            .expect("Have A Snack on the pie");
+        [r.x + r.width / 2, r.y + r.height / 2]
+    };
+    // Reaching the entry checks its action again, which passes.
+    game.hover(entry);
+    run_to(&mut game, 176);
+    assert!(last(&game), "reaching the entry checked it");
+    run_to(&mut game, 201);
+    game.press(entry);
+    assert!(game.menu().is_none());
+    let queue = &game.lot().world().objects[&mortimer]
+        .person
+        .as_ref()
+        .unwrap()
+        .queue;
+    assert_eq!(queue.len(), 1);
+    let action = &queue[0];
+    assert_eq!(
+        (
+            action.target,
+            action.table_index,
+            action.action,
+            action.priority,
+            action.flags
+        ),
+        (118, 1, 4103, 50, 12)
+    );
+    run_to(&mut game, 202);
+    // The snack's frames hold what the checks left in his stack: the
+    // last check tree run there was Have A Snack's (0x1008), when the
+    // pointer reached its entry, not the listing's last (0x1030).
+    let stack = &game.lot().world().objects[&mortimer].stack;
+    let locals = |tree: u16| {
+        stack
+            .iter()
+            .find(|f| f.tree == tree)
+            .map(|f| f.locals.clone())
+            .unwrap_or_else(|| panic!("a frame of tree {tree:#06x}"))
+    };
+    assert_eq!(locals(4120), [4104, 254]);
+    assert_eq!(locals(4142), [363]);
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// Reaching a pie entry checks its action, which changes the lot;
+/// staying on it does not check it again, but leaving the window and
+/// coming back onto it does, as passing over another point of the pie
+/// would (`Game::leave` forgets the entry, as it forgets the pointer).
+#[test]
+fn coming_back_onto_a_pie_entry_checks_it_again() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    assert_eq!(game.run(50), 50);
+    game.render();
+    let fridge = 118;
+    let at = (0..600)
+        .step_by(2)
+        .flat_map(|y| (0..800).step_by(2).map(move |x| [x, y]))
+        .find(|&p| !game.over_panel(p) && game.under(p) == Some(fridge))
+        .expect("the fridge is on screen");
+    game.hover(at);
+    game.press(at);
+    game.render();
+    let entry = {
+        let menu = game.menu().expect("the fridge's pie is open");
+        let (_, r) = menu
+            .labels()
+            .into_iter()
+            .find(|(text, _)| *text == "Have A Snack")
+            .expect("Have A Snack on the pie");
+        [r.x + r.width / 2, r.y + r.height / 2]
+    };
+    let hash = |game: &Game| game.lot().world().hash();
+    let before = hash(&game);
+    game.hover(entry);
+    assert_ne!(hash(&game), before, "reaching the entry checked it");
+    // Some ticks later the check would leave something else: his
+    // motives, which it copies the advertisements against, have moved.
+    assert_eq!(game.run(60), 60);
+    game.render();
+    let later = hash(&game);
+    game.hover([entry[0] + 1, entry[1]]);
+    assert_eq!(hash(&game), later, "still on the entry: not checked");
+    game.leave();
+    assert_eq!(hash(&game), later);
+    game.hover(entry);
+    assert_ne!(hash(&game), later, "coming back checked it again");
+    assert!(game.menu().is_some());
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }

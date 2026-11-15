@@ -14,7 +14,7 @@
 
 use crate::play::Play;
 use crate::{Answers, Callback, Interpreter, Program, Stream, TickError, Update};
-use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People};
+use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People, Surfaces};
 use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
@@ -328,6 +328,14 @@ pub struct Menu {
     pub sounds: Vec<crate::SoundEvent>,
 }
 
+/// What [`Lot::highlight`] did: the entry's action as the check left it,
+/// and the check tree's requests to the sound system.
+#[derive(Debug, Clone)]
+pub struct Highlight {
+    pub action: sims_formats::saved_objects::Interaction,
+    pub sounds: Vec<crate::SoundEvent>,
+}
+
 /// What [`Lot::cancel`] did: whether the press counts, and the trees'
 /// requests to the sound system.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -419,6 +427,7 @@ impl Lot {
         // step walks them all, so the whole catalog is linked.
         let mut program = Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid))?;
         program.zoning = neighborhood.zoning(context.expansions)?;
+        program.expansions = context.expansions;
         program.animations = Animations::load(&install, &index)?;
         let person_types = || {
             catalog
@@ -471,8 +480,14 @@ impl Lot {
                 .version()
                 .ok_or("the house file has no HOUS 1 chunk, which holds its version")?;
             world.read_arrays(&file.arrays, version)?;
-            load.renumbered =
-                world.renumber_surfaces(file.floor_map.as_deref(), file.wall_map.as_deref())?;
+            // The floor and wall catalogs, which the original builds at
+            // start-up.
+            let surfaces = Surfaces::build(&install)?;
+            load.renumbered = world.renumber_surfaces(
+                file.floor_map.as_deref(),
+                file.wall_map.as_deref(),
+                &surfaces,
+            )?;
             // 6c and 7: the type table, which marks the types whose scripts
             // changed.
             if file.guid_table {
@@ -863,6 +878,36 @@ impl Lot {
         })
     }
 
+    /// Checks again the action of the pie menu's entry the pointer has
+    /// reached ([`Interpreter::highlight`], 0x48df28). Call it between
+    /// steps when the pointer reaches an entry of an open menu: the check
+    /// tree changes the lot, so a recording of play must note each call.
+    /// Returns the action as the check left it, and the requests to the
+    /// sound system its tree made. A check that fails on something not
+    /// ported changes nothing, as for [`Lot::pie_menu`].
+    pub fn highlight(
+        &mut self,
+        person: u16,
+        action: sims_formats::saved_objects::Interaction,
+    ) -> Result<Highlight, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let action = interpreter
+            .highlight(&mut world, person, action)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        Ok(Highlight {
+            action,
+            sounds: sounds.into_inner(),
+        })
+    }
+
     /// Queues on `person` the action of an entry [`Lot::pie_menu`] listed,
     /// as picking it does ([`Interpreter::pick`]). Returns the action's number, or None
     /// when the queue took nothing (it is full, or the action's entry is
@@ -1101,6 +1146,7 @@ mod tests {
                 animations: Default::default(),
                 people: Default::default(),
                 icon_frames: None,
+                expansions: 0,
             },
             catalog: Catalog {
                 global: 0,

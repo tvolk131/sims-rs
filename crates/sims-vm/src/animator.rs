@@ -335,7 +335,7 @@ impl Interpreter<'_> {
         pending.left.restore(&mut refreshed, id);
         if refreshed.encode() != world.encode() || !sounds.borrow().is_empty() {
             return Err(Trap::Unsupported(format!(
-                "person {id} took itself off the lot, and its animator's refresh there (0x58da12), \
+                "person {id} left the lot, and its animator's refresh there (0x58da12), \
                  made only if the house view drew it (animator byte +0x109, which is not kept), \
                  would write more than its animator or play a sound"
             )));
@@ -366,7 +366,7 @@ impl Interpreter<'_> {
     ) -> Result<(), Trap> {
         let refused = |what: &str| {
             Trap::Unsupported(format!(
-                "person {id} took itself off the lot and {what}, so whether the house view drew \
+                "person {id} left the lot and {what}, so whether the house view drew \
                  it, which decides its animator's refresh at the take-off (0x58da12, animator \
                  byte +0x109), matters; that is not kept"
             ))
@@ -586,6 +586,9 @@ const STOP_WALK_END: F32 = F32::from_bits(0x3f73_3333);
 const ONE: F32 = F32::from_bits(0x3f80_0000);
 const HALF: F32 = F32::from_bits(0x3f00_0000);
 const QUARTER: F32 = F32::from_bits(0x3e80_0000);
+/// What a person of kind above 1 (a pet) turns at once within, in place
+/// of [`QUARTER`] (0x667278, 0x58df7a).
+const SIXTEENTH: F32 = F32::from_bits(0x3d80_0000);
 const TWO: F32 = F32::from_bits(0x4000_0000);
 const THREE: F32 = F32::from_bits(0x4040_0000);
 const FOUR: F32 = F32::from_bits(0x4080_0000);
@@ -698,8 +701,8 @@ impl Interpreter<'_> {
                     }
                 }
                 4 => turn(world, id, a)?,
-                6 => self.stop_walk(world, id, a, now)?,
-                9 => self.follow(world, id, a, now)?,
+                6 | 11 => self.stop_walk(world, id, a, now)?,
+                9 | 10 => self.follow(world, id, a, now)?,
                 state => {
                     return Err(Trap::Unsupported(format!(
                         "the animator in state {state} (0x58faa2), which is not ported"
@@ -916,8 +919,15 @@ impl Interpreter<'_> {
     /// and priority 5 (0x59867f), and the animator turns (state 4). The
     /// original also sets global 0x6f6d6c to 2, which is not kept.
     ///
-    /// Fails for what is not ported: a person of kind above 1, whose
-    /// bounds are scaled (0x58df72), and a turn that is not a number, for
+    /// For a person of kind above 1 (person word 65, a pet; 0x58df67) the
+    /// bounds are scaled (0x58df72): a step is 1 times 1/16 (0x667278)
+    /// over the rate, and the distance below which the animator is put at
+    /// its destination is 0.5 times 0.2 (0x66d72c). An animator that
+    /// turns at once has arrived, 0 away, below either. (The bound a step
+    /// by heading compares with, 3.1 times 1/12, is read only on the path
+    /// that fails at 0x58df1e.)
+    ///
+    /// Fails for what is not ported: a turn that is not a number, for
     /// which the original would loop forever (0x58e039).
     fn start_turn(
         &self,
@@ -937,10 +947,12 @@ impl Interpreter<'_> {
         while d < (-FOUR.ext()).single() {
             d = (d + eight).single();
         }
-        let step = ((ONE.ext() * QUARTER.ext()).single() / a.rate.ext()).single();
-        if person_word(world, id, KIND)? > 1 {
-            return Err(unsupported("0x58df72", "turns a person of kind above 1"));
-        }
+        let share = if person_word(world, id, KIND)? > 1 {
+            SIXTEENTH
+        } else {
+            QUARTER
+        };
+        let step = ((ONE.ext() * share.ext()).single() / a.rate.ext()).single();
         if d < step && d > (-step).single() {
             // 0x58dfc0: arrived, so 0 away, below 0.5 (0x6d07e4).
             a.position[0] = a.destination[0];
@@ -1152,11 +1164,13 @@ impl Interpreter<'_> {
         Ok(lookup(global, table).or_else(|| lookup(global, NAMES)))
     }
 
-    /// The distance the walk looks ahead, as far as it is ported: half of
-    /// +0x200, the stride of the posture's clip 0x14 halved
-    /// ([`Interpreter::stride`]).
-    fn look_ahead(&self, world: &World, id: u16) -> Result<Ext, Trap> {
-        Ok((self.stride(world, id, WALK, true)? * HALF.ext()).single())
+    /// The distance the walk looks ahead (0x58e6cb): half of +0x200, the
+    /// stride of the posture's clip 0x14 halved, or, with data word 17
+    /// set, half of +0x1fc, that of clip 0x15 halved (0x588438;
+    /// [`Interpreter::stride`]).
+    fn look_ahead(&self, world: &World, id: u16, pace: i16) -> Result<Ext, Trap> {
+        let clip = if pace != 0 { RUN } else { WALK };
+        Ok((self.stride(world, id, clip, true)? * HALF.ext()).single())
     }
 
     /// State 9 (0x58e4e0): the animator follows the person's path. From
@@ -1175,9 +1189,8 @@ impl Interpreter<'_> {
     ///
     /// The point before the path's last is where the path ends; the last
     /// point is only the way to face there ([`Interpreter::end_of_path`]).
-    ///
-    /// Fails for what is not ported: a person whose data word 17 is set
-    /// (another look-ahead).
+    /// How far it looks ahead depends on data word 17
+    /// ([`Interpreter::look_ahead`]).
     fn follow(&self, world: &mut World, id: u16, a: &mut Animator, now: i32) -> Result<Next, Trap> {
         let path = world
             .routing
@@ -1257,16 +1270,10 @@ impl Interpreter<'_> {
                 let ahead0 = round(p0, q0);
                 let dx = (Ext::from_i32(ahead1) - x).single();
                 let dy = (Ext::from_i32(ahead0) - y).single();
-                if pace != 0 {
-                    return Err(unsupported(
-                        "0x58e6d5",
-                        "looks ahead for a person whose data word 17 is set",
-                    ));
-                }
                 let reach = match reach {
                     Some(reach) => reach,
                     None => {
-                        let s = self.look_ahead(world, id)?;
+                        let s = self.look_ahead(world, id, pace)?;
                         *reach.insert((s * s).single())
                     }
                 };
@@ -1558,6 +1565,10 @@ impl Interpreter<'_> {
     /// walk flag is set and the animator follows its route again (state
     /// 9, whose code runs, 0x58e242). The original also sets global
     /// 0x6f6d68 to 10, which is not kept.
+    ///
+    /// State 11 (0x58e377), which a walk with data word 17 set goes to,
+    /// is the same code with the posture's clip 0x16 in place of 0x13; it
+    /// ends in state 10 (0x58e494), and sets the global to 12.
     fn stop_walk(
         &self,
         world: &mut World,
@@ -1565,8 +1576,14 @@ impl Interpreter<'_> {
         a: &mut Animator,
         now: i32,
     ) -> Result<Next, Trap> {
-        if a.selection != STOP_WALK as i32 {
-            self.start_clip(world, id, a, STOP_WALK, now, STOP)?;
+        // 0x58e377: state 11 starts with clip 0x16 and goes on to state 10.
+        let (clip, then) = if a.state == 11 {
+            (STOP_RUN, 10)
+        } else {
+            (STOP_WALK, 9)
+        };
+        if a.selection != clip as i32 {
+            self.start_clip(world, id, a, clip, now, STOP)?;
             let pace = datum(world, id, PACE)?;
             let kind = person_word(world, id, KIND)?;
             let wanted = wanted_rate(pace, a.state, kind).to_f32();
@@ -1606,7 +1623,7 @@ impl Interpreter<'_> {
         a.position[0] = a.destination[0];
         a.position[1] = a.destination[1];
         a.destination[2] = a.position[2];
-        a.state = 9;
+        a.state = then;
         a.walking = true;
         Ok(Next::Again)
     }
@@ -1623,8 +1640,8 @@ impl Interpreter<'_> {
     ///    held stops instead when the point is further than the stopping
     ///    distance (+0x1f8, or +0x204 with data word 17 set), and so does
     ///    any for a person whose word 64 is set: it goes to state 6, or
-    ///    11 with data word 17 set (0x58ed52), and that state's code runs
-    ///    ([`Interpreter::stop_walk`]). State 11 is not ported and fails.
+    ///    11 with data word 17 1 (0x58ed52), and that state's code runs
+    ///    ([`Interpreter::stop_walk`]).
     /// 3. The walk flag is set. The clip (0x14 in state 9, 0x15 in state
     ///    10, where data word 17 clear makes it state 9 first, else 0)
     ///    plays in the foreground, repeating ([`Interpreter::start_clip`]
@@ -1693,15 +1710,9 @@ impl Interpreter<'_> {
             if person_word(world, id, SPECIAL)? != 0
                 || (!held && stop(if pace == 1 { STOP_RUN } else { STOP_WALK })?)
             {
-                // 0x58ed52: state 6, or 11 with data word 17 set; +0x24
+                // 0x58ed52: state 6, or 11 with data word 17 1; +0x24
                 // and +0x28 become 0 (not kept); that state's code runs.
-                if pace == 1 {
-                    return Err(unsupported(
-                        "0x58ed52",
-                        "goes to state 11 to start a walk with data word 17 set",
-                    ));
-                }
-                a.state = 6;
+                a.state = if pace == 1 { 11 } else { 6 };
                 return Ok(Next::Again);
             }
         }
