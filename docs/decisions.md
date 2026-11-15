@@ -50,7 +50,10 @@ in its own order, and only takes a lamp's marks off when it next counts
 it dark; we work them out afresh, lamps in object order. They could
 differ where three or more lamps reach a tile or a lamp went dark; no
 screenshot shows either. Which way the record turns with the view
-(0x4aedc2) is not read: the maps are symmetric, so it cannot show. When
+(0x4aedc2) is not read: we turn each offset as the camera turns the
+lot, so a pool stays centred on its lamp. Turned the other way, a tile
+off the lamp's axes would show its gradient reversed; rotation 2 cannot
+tell the two apart, and no screenshot at rotation 1 or 3 shows a pool. When
 the file is missing the original computes the maps (0x4bb5bc); we draw
 no pools. Data word 16's meaning is not known.
 

@@ -267,13 +267,8 @@ impl Painter<'_> {
     }
 
     /// Rotates a lot direction into the view.
-    fn rotate_direction(&self, [x, y]: [i32; 2]) -> [i32; 2] {
-        match self.camera.rotation & 3 {
-            1 => [-y, x],
-            2 => [-x, -y],
-            3 => [y, -x],
-            _ => [x, y],
-        }
+    fn rotate_direction(&self, direction: [i32; 2]) -> [i32; 2] {
+        rotate_direction(self.camera.rotation, direction)
     }
 
     /// The screen point of a lot corner on a level, at its terrain height.
@@ -927,6 +922,17 @@ impl Painter<'_> {
     }
 }
 
+/// Rotates a lot direction into the view at `rotation`, as
+/// [`Camera::rotate_fine`] turns positions.
+fn rotate_direction(rotation: u8, [x, y]: [i32; 2]) -> [i32; 2] {
+    match rotation & 3 {
+        1 => [-y, x],
+        2 => [-x, -y],
+        3 => [y, -x],
+        _ => [x, y],
+    }
+}
+
 /// An object's data word that hides it when not zero (the simulation's
 /// `HIDDEN`).
 const HIDDEN: usize = 34;
@@ -1283,6 +1289,22 @@ mod tests {
         assert_eq!(wall_side(&descending, 1), [54, 86]);
         assert_eq!(wall_side(&ascending, 0), [58, 86]);
         assert_eq!(wall_side(&ascending, 1), [54, 90]);
+    }
+
+    /// A lamp's offset to a tile turns as the camera turns their
+    /// positions, so its pool stays centred on it in every view, the
+    /// off-axis tiles' gradients too.
+    #[test]
+    fn lamp_offsets_turn_as_the_camera_turns_positions() {
+        for rotation in 0..4 {
+            let camera = camera(rotation);
+            for (lamp, offset) in [([10, 20], [3, 0]), ([10, 20], [-2, 1]), ([40, 5], [1, -3])] {
+                let tile = [lamp[0] + offset[0], lamp[1] + offset[1]];
+                let [a, b] = [tile, lamp].map(|t| camera.rotate_fine(t.map(|n| n * 16)));
+                let turned = rotate_direction(rotation, offset).map(|n| n * 16);
+                assert_eq!([a[0] - b[0], a[1] - b[1]], turned, "{rotation} {offset:?}");
+            }
+        }
     }
 
     #[test]

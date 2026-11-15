@@ -494,6 +494,73 @@ mod tests {
         assert_eq!(lot.light_at(0, [24, 24]), 0);
     }
 
+    /// A lit lamp marks the tiles within four of it in its own room and
+    /// on the inner lot, each with its offset from the lamp; a dark one,
+    /// or one on another level, marks nothing.
+    #[test]
+    fn a_lit_lamp_marks_the_tiles_of_its_room_around_it() {
+        let mut world = World::empty();
+        let full = FULL * FULL;
+        for (id, stride) in [(0, 4), (1, 1), (2, 8), (101, 1), (102, 8)] {
+            world.arrays.insert(id, array(stride, full * stride));
+        }
+        // Room 1 is the tiles x < 6 (but the lot's edge); room 0 the rest.
+        let mut map = vec![0i16; full];
+        for y in 0..FULL {
+            for x in 0..6 {
+                map[Lot::cell(x, y)] = 1;
+            }
+        }
+        world.rooms.map = [map, vec![0; full]];
+        let lamp = |id: u16, tile: [i32; 2], level: i32, light: i16| {
+            let mut data = vec![0i16; 64];
+            (data[16], data[40], data[51]) = (1, 0x400, light);
+            sims_sim::Object {
+                id,
+                guid: 0,
+                footprint: [0; 4],
+                position: [tile[0] * 16 + 8, tile[1] * 16 + 8, level],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: Vec::new(),
+                data,
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: 0,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            }
+        };
+        world.objects.insert(1, lamp(1, [2, 10], 1, 1));
+        world.objects.insert(2, lamp(2, [20, 20], 1, 0));
+        world.objects.insert(3, lamp(3, [30, 30], 2, 1));
+        let lot = Lot::from_world(&world).unwrap();
+        let at = |level: usize, x, y| lot.lamps[level][Lot::cell(x, y)].0[0];
+        assert_eq!(at(0, 2, 10), Some([0, 0]));
+        assert_eq!(at(0, 5, 14), Some([3, 4]));
+        assert_eq!(at(0, 1, 6), Some([-1, -4]));
+        // Past four tiles, another room, the lot's edge row.
+        assert_eq!(at(0, 2, 15), None);
+        assert_eq!(at(0, 6, 10), None);
+        assert_eq!(at(0, 0, 10), None);
+        // The dark lamp marks nothing; the upstairs lamp only upstairs,
+        // where this lot has no rooms.
+        assert_eq!(at(0, 20, 20), None);
+        assert_eq!(at(0, 30, 30), None);
+        let marked = |level: usize| lot.lamps[level].iter().filter(|l| l.0[0].is_some()).count();
+        // Columns 1 to 5 (the edge and room 0 left out), rows 6 to 14.
+        assert_eq!(marked(0), 5 * 9);
+    }
+
     #[test]
     fn light_bytes_round_half_up_and_keep_the_low_byte() {
         assert_eq!(light_byte(0.0), 0);

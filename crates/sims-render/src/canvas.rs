@@ -530,6 +530,23 @@ mod tests {
         assert_eq!(c.color, vec![[1, 2, 3], [1, 2, 3], [0, 0, 0], [0, 0, 0]]);
     }
 
+    /// Each pixel's light comes from its place in the image, also where
+    /// the image is clipped.
+    #[test]
+    fn shaded_pixels_take_the_light_of_their_place_in_the_image() {
+        let mut c = Canvas::new(2, 1, [0, 0, 0]);
+        let dark = Light::from_byte(0);
+        c.draw_shaded(
+            &image(3, 1, [200, 200, 200, 255], None),
+            [-1, 0],
+            |x, y| if (x, y) == (2, 0) { Light::FULL } else { dark },
+            |_, _, _| Some(0),
+        );
+        assert_eq!(c.color[0], dark.apply([200; 3]));
+        assert_eq!(c.color[1], [200; 3]);
+        assert_ne!(c.color[0], c.color[1]);
+    }
+
     #[test]
     fn quantizing_keeps_the_extremes() {
         assert_eq!(quantize565([255, 255, 255]), [255, 255, 255]);
