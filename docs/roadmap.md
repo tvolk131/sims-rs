@@ -88,12 +88,12 @@ events, and what it asks for after them) come first.
   935. The frame drawn after tick 4053 finds person 140's skin waiting
   for its update (0x590d26), which is not ported.
 - The Pleasants (`House06.iff` as the original saved it after moving
-  them in, with the Traveling Salesman on the lot) load to the state the
-  first tick starts from: the end of the household selection works out
-  again who is a visitor, and reading the people raises the action
-  serial. Their load equals the capture's but for one person's data word
-  50 and last result, which something in the original's load sets and
-  which is not found yet. The load restores a reset person's animator
+  them in, with the Traveling Salesman on the lot) loaded to the state
+  the first tick starts from before the animator restore: the end of the
+  household selection works out again who is a visitor, and reading the
+  people raises the action serial. That load equalled the capture's but
+  for one person's data word 50 and last result, which something in the
+  original's load sets and which is not found yet. The load now restores a reset person's animator
   and the pose its saved layers left in the skin (0x5918ba). But no
   Pleasant's type changed since the save, so the load resets none of
   them and their animators keep what the restore read: clips playing on
