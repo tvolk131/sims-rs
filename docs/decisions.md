@@ -4,6 +4,22 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-14: The hour turns; the signals' other subscribers taken as presentation, and K = 900
+
+The hour's turn is ported from the lot update (0x46d3cc to 0x46d51d).
+When the time of day changes, the game tells the interface (0x4c4648)
+and sends signals 0xf8 and 0xdd. Of what they reach, only the lot's
+subscriber is read: it has no case for 0xf8, and on 0xdd it marks every
+room and sets a light ceiling only the drawing reads. The interface call
+picks a panel's look. The other subscribers' handling of the two signals
+is not read, and is taken to change no simulation state. Ticks 878 to
+900, which cross 7:00, equal the fifth capture, but the rooms marked then
+are counted only at the next frame draw (after tick 903), so the recount
+is not yet compared. **Unverified**; reopen if the room motives differ
+after tick 903, or a later tick differs after a change of the time of day
+(the next at 18:00). The day's turn still fails loudly. K = 900;
+tick 901 reads job data (scope 33).
+
 ## 2026-11-14: No headline state until a headline can show, and K = 877
 
 Set Balloon/Headline is ported only as far as clearing (0x44b724). An

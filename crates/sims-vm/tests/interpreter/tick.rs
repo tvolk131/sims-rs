@@ -232,17 +232,75 @@ fn a_partial_pass_runs_only_flag_2_objects_and_leaves_the_clock() {
 }
 
 #[test]
-fn the_minute_turns_at_sixty_seconds_and_the_hour_fails_loudly() {
+fn the_minute_turns_at_sixty_seconds() {
     let mut fx = lot(sleeper());
     fx.thread(LAMP, 4096, &[3]);
     fx.world.globals[6] = 58;
     update(&mut fx, &mut answers(&[])).unwrap();
     assert_eq!((fx.world.globals[5], fx.world.globals[6]), (1, 0));
+}
+
+/// A lot at `hours`:59:58 with time of day `period` and one counted room.
+fn before_the_hour(hours: i16, period: i16) -> Fixture {
+    let mut fx = lot(sleeper());
+    fx.thread(LAMP, 4096, &[3]);
+    fx.world.globals[0] = hours;
+    fx.world.globals[4] = period;
     fx.world.globals[5] = 59;
     fx.world.globals[6] = 58;
+    fx.world
+        .rooms
+        .rooms
+        .insert(1, sims_sim::rooms::Room::default());
+    fx.world.rooms.pending = 0;
+    fx
+}
+
+#[test]
+fn the_hour_turns_and_a_new_time_of_day_marks_every_room() {
+    // 6:59 is dawn (3); 7:00 is day (0).
+    let mut fx = before_the_hour(6, 3);
+    update(&mut fx, &mut answers(&[])).unwrap();
+    let clock = |fx: &Fixture| {
+        let g = &fx.world.globals;
+        (g[0], g[5], g[6], g[4])
+    };
+    assert_eq!(clock(&fx), (7, 0, 0, 0));
+    assert!(fx.world.rooms.rooms[&1].dirty);
+    assert_eq!(fx.world.rooms.pending, 3);
+    // 7:59 to 8:00 stays day: no room is marked.
+    let mut fx = before_the_hour(7, 0);
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(clock(&fx), (8, 0, 0, 0));
+    assert!(!fx.world.rooms.rooms[&1].dirty);
+    assert_eq!(fx.world.rooms.pending, 0);
+}
+
+#[test]
+fn the_time_of_day_follows_the_hour() {
+    for (hours, period) in [
+        (1, 2),
+        (5, 2),
+        (6, 3),
+        (7, 0),
+        (17, 0),
+        (18, 1),
+        (19, 2),
+        (23, 2),
+    ] {
+        // Start an hour before, at a time of day it cannot be.
+        let mut fx = before_the_hour(hours - 1, 9);
+        update(&mut fx, &mut answers(&[])).unwrap();
+        assert_eq!(fx.world.globals[4], period, "hour {hours}");
+    }
+}
+
+#[test]
+fn the_day_turning_fails_loudly() {
+    let mut fx = before_the_hour(23, 2);
     assert!(matches!(
         update(&mut fx, &mut answers(&[])),
-        Err(TickError::Unsupported(m)) if m.contains("hour")
+        Err(TickError::Unsupported(m)) if m.contains("the day turns")
     ));
 }
 

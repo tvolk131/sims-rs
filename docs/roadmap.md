@@ -60,10 +60,10 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 877 on the Goth house**: our
+  there, as three captures recorded). **K = 900 on the Goth house**: our
   state after every one of ticks 1 to 608 equals the fourth capture of the
   original (full state after every update), and after every one of ticks
-  600 to 877 the fifth, in everything compared, but
+  600 to 900 the fifth, in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
   other captures agree where they hold a state, but for fields that also
@@ -831,9 +831,8 @@ original and found equal.
    and the stream is swapped back.
 2. If the pass was a full one, global 6 (seconds) goes up by 2 and the
    tick count by 1. At 60 seconds global 5 (minutes) goes up and signal
-   0xdb is sent. Ported up to here. At 60 minutes the hour turns (global
-   0), and with it the time of day, the lighting, every room's mark and,
-   at 24 hours, the new day. That is not ported and fails loudly.
+   0xdb is sent. At 60 minutes the hour turns (global 0); at 24 hours
+   the day turns, which is not ported and fails loudly.
 3. The registry's pass at the end of the update (`0x4412d1`,
    `Interpreter::end_of_update`). It is not only the removals, as this
    file said before. In order: the dialogs (a new one is shown, and a
@@ -844,6 +843,9 @@ original and found equal.
    selected (selecting another, `0x445501`, is not ported and fails).
 4. Signal 0xdb goes to the game's eight subscribers. Only the interface
    takes it (a sound on the hour), so it changes nothing here.
+5. If the hour turned and the time of day changes with it (`0x46d525`),
+   global 4 takes the new one and the lot marks every room for counting
+   (signal 0xdd). See "Ticks 878 to 900".
 
 **One scheduler pass** (`0x46d553`, `Interpreter::scheduler_pass`). The
 pass is partial if global 17 is not 0, or globals 19 and 10 both are not.
@@ -1666,7 +1668,36 @@ capture in everything compared, the three random streams included, but
 for the head fields of "Ticks 334 to 366".
 
 **Stops.** Tick 878: the hour turns (globals 0 and 5, the time of day,
-the lighting, signals 0xf8 and 0xdd), which is not ported.
+the lighting, signals 0xf8 and 0xdd), which is not ported. See "Ticks
+878 to 900".
+
+### Ticks 878 to 900
+
+**The hour turns** (`0x46d3cc` to `0x46d51d`, `tick.rs`). At 60 minutes
+the minutes go back by 60 and global 0 (hours) goes up; at 24 the day
+turns, which still fails loudly. After the registry's pass and signal
+0xdb, the time of day for the new hour (`0x46d525`: night before 6, dawn
+at 6, day from 7 to 17, dusk at 18, night from 19) is compared with
+global 4. If it differs, global 4 takes it, the interface is told
+(`0x4c4648`, the day or night look of the current mode's panel), and
+signals 0xf8 (with 5) and 0xdd go out. The lot's subscriber has no case
+for 0xf8; on 0xdd (`0x416446`, `0x466ba3`) it sets the brightest a lit
+tile may be, which only the drawing reads (`0x6c741c`, `0x4b4525`), and
+marks every room for counting and both levels as waiting. The next frame
+draw counts them with the new daylight. What the other subscribers do
+with 0xf8 and 0xdd is **unverified**. In tick 878 the clock goes from
+6:59 to 7:00, dawn to day.
+
+**K = 900.** Our state after every tick from 878 to 900 equals the fifth
+capture in everything compared, the three random streams included, but
+for the head fields of "Ticks 334 to 366". The rooms marked at 7:00 are
+counted at the next frame draw, after tick 903 in the captures' schedule,
+so these ticks compare the clock and the time of day but not yet the
+recount; the capture holds no rooms, and the recount shows in what reads
+it, each person's room motive (taken every tick) and global 27.
+
+**Stops.** Tick 901: object 8 reads job data indexed by temps 0 and 1
+(scope 33), which is not ported.
 
 ## Track: drawing people (`crates/sims-people`)
 
