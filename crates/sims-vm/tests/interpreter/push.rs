@@ -1090,6 +1090,24 @@ fn an_action_queued_while_one_runs_at_once_takes_its_place() {
         (queued.uid, queued.table_index, queued.priority),
         (1, 3, 100)
     );
+    assert_eq!(queued.flags, 1);
+
+    // With flag 0x40 (Push Interaction's flag bit 3) the queued action
+    // takes the running action's name, which sets its flag 0x80
+    // (0x41f1ae).
+    let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    fx.add(
+        LAMP_FILE,
+        ACTION,
+        tree(vec![
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, SIM as i16, 1),
+            assign(scope::LOCALS, 0, scope::LITERAL, LAMP as i16, 2),
+            ins(13, RETURN_TRUE, RETURN_TRUE, [3, 0, 1, 10, 0, 0, 0, 0]),
+        ]),
+    );
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 4), Ok(Some(1)));
+    assert_eq!(fx.sim().person.as_ref().unwrap().queue[0].flags, 0xc1);
 
     // A full queue takes nothing, but the action is still copied over the
     // running one, so its number is returned.

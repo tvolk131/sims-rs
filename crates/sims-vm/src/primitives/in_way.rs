@@ -409,8 +409,9 @@ impl Machine<'_, '_> {
     /// runs, is copied over the running action (0x45d5a5, 0x41edbf: every
     /// field, its number and flags too), and is queued as well, or not when
     /// the queue is full. With the new action's flag 0x40, the original
-    /// first gives it the running action's name (0x41f167, 0x41f1ae); the
-    /// names of queued actions are not kept here.
+    /// first gives it the running action's name (0x41f167, 0x41f1ae),
+    /// which sets its flag 0x80; the flag is set here, but the names of
+    /// queued actions are not kept.
     ///
     /// An entry that runs at once is not queued (0x45d240):
     ///
@@ -474,6 +475,11 @@ impl Machine<'_, '_> {
         // While the person's action runs at once, the new action is copied
         // over it, number and all, and is queued as well (0x45d5a5).
         if let Some(running) = self.running_at_once.filter(|r| r.person == id) {
+            // With flag 0x40 the action first takes the running action's
+            // name, which sets its flag 0x80 (0x41f1ae).
+            if action.flags & 0x40 != 0 {
+                action.flags |= 0x80;
+            }
             *running.action.borrow_mut() = action.clone();
         }
         if queue.len() >= QUEUE {

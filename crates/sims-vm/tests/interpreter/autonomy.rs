@@ -390,6 +390,46 @@ fn a_check_tree_may_change_its_entry_s_advertisements() {
     assert!(fault.to_string().contains("0x1a"), "{fault}");
 }
 
+/// A check tree that runs a named tree at once (Run Tree By Name mode 0)
+/// shares its advertisements with it: the named tree's change counts.
+#[test]
+fn a_named_tree_a_check_tree_runs_may_change_its_advertisements() {
+    const ADJUST: u16 = 4300;
+    let mut fx = lot(0x100);
+    fx.add(
+        LAMP_FILE,
+        ADJUST,
+        tree(vec![assign(12, 5, scope::LITERAL, 30000, RETURN_TRUE)]),
+    );
+    let lamp = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+    lamp.names.insert(ADJUST, "Adjust".to_owned());
+    lamp.tree_names = vec!["Adjust".to_owned()];
+    fx.add(
+        LAMP_FILE,
+        CHECK,
+        tree(vec![ins(
+            28,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [47, 1, 0, 0, 1, 0, 0, 0],
+        )]),
+    );
+    let table = fx
+        .program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .interactions
+        .get_mut(&TABLE)
+        .unwrap()
+        .as_mut()
+        .unwrap();
+    table.interactions[0].test = CHECK;
+    table.interactions[0].flags = 0x100;
+    assert_eq!(turn(&mut fx), Status::Yielded);
+    assert_eq!(fx.sim().data[20], 3);
+}
+
 #[test]
 fn the_primitives_check_trees_use_fail_loudly_elsewhere() {
     // Add/Change Action String outside a check tree names the running

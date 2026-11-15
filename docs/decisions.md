@@ -26,8 +26,11 @@ action's number and takes none of its own. This replaces the loud
 refusal recorded in the at-once entry below.
 
 With flag 0x40, the original also gives the queued action the running
-action's name (0x41f167, 0x41f1ae). Queued actions' names are not kept
-here.
+action's name (0x41f167, 0x41f1ae), which sets its flag 0x80. The flag is
+set here, but queued actions' names are not kept.
+
+In modes 0 and 1 a check tree's advertisements (the global record at
+0x6c437c) stay the same record through the named run.
 
 **On Goth.** The first pick on person 16 now queues the social through
 the object its tree made, and returns that action's number. The next
