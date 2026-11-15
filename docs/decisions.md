@@ -30,6 +30,7 @@ the upper floor hides everyone below it, as it hides the rooms. How the
 original gives a person's mesh its depth is still **unverified**; reopen
 when a person behind furniture is compared with the original.
 
+
 ## 2026-11-15: A person's ground height and model matrix are read from sims-sim
 
 `sims_sim::head::ground_height` and `sims_sim::head::model` give the
