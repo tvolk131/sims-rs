@@ -54,6 +54,17 @@ tiles. None of the car junk's tiles has a Reset tree, function 9 or
 function 10, so at tick 3434 those take-offs run no tree; all 18 tiles
 go.
 
+**A deletion's reset stops the object's sounds.** Every path of an
+object's reset (0x431fbe) meets at 0x43208b and asks the sound system
+to stop the object's sounds (0x4320b4); the deletion's mark (flag
+0x40) only spares the rebuild (0x432063). The port had left that stop
+out for a deletion, so a deleted object now notes `SoundEvent::Stop`
+twice, from its reset and from its destructor (0x4323c9). Sound
+requests are not in the snapshot, so no hash changes. Sol found this.
+
+A tile of a group removed before the load has worked the rooms out
+(the load's clear) fails loudly: its take-off needs them.
+
 **Review gaps closed.** Sol's review of #170 noted three optional
 regressions. Two are added: a take-off callback that puts something in
 the person's hand is caught by the check after the callbacks, and a
@@ -2119,8 +2130,9 @@ Where the requests come from, read from the code:
 - **Go To Routing Slot.** It plays "begin_route" as a route starts
   (0x45b989) and "end_route" after every stop (0x45b3a0).
 - **Stops.** Stop All Sounds (0x45256e) stops sounds, and so do an
-  object's reset unless it is being deleted (0x4320b4) and the
-  destructor (0x4323c9). A person's reset makes no direct call.
+  object's reset (0x4320b4) and the destructor (0x4323c9). (This first
+  said a reset for a deletion stops nothing; it does, corrected in the
+  entry for tick 3602.) A person's reset makes no direct call.
 
 In 870 play ticks the Goth house plays 62 sounds and stops 50:
 begin_route 21, end_route 18, door_open 4, and so on.

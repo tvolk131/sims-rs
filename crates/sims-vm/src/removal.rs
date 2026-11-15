@@ -158,7 +158,8 @@ impl Interpreter<'_> {
     /// of [`Machine::leave_lot`], which the load was compared through. A
     /// tile of a group takes its whole group off through the lot's
     /// placement (its vtable 0x666c20's function 0x50, 0x422d86,
-    /// [`Interpreter::take_off`]). A person leaves through
+    /// [`Interpreter::take_off`]), which also needs the rooms worked out.
+    /// A person leaves through
     /// [`Interpreter::take_off_to_remove`], which needs the lot's rooms
     /// worked out; before the load has done so it fails.
     ///
@@ -194,6 +195,16 @@ impl Interpreter<'_> {
             .get(&id)
             .is_some_and(|o| o.multipart.is_some())
         {
+            if matches!(
+                world.room_at([OFF_LOT, OFF_LOT, 1]),
+                Err(RoomError::NoRooms)
+            ) {
+                return Err(fail(Trap::Unsupported(
+                    "removing a tile of a group (0x422d86, from 0x4412a4) before the load has \
+                     worked the lot's rooms out is not ported"
+                        .into(),
+                )));
+            }
             self.take_off(world, id, true)?;
         } else {
             let mut machine = self.machine(world, id, 0, false);
@@ -419,10 +430,11 @@ impl Interpreter<'_> {
     /// taken off the lot, its storage reset, its Init and a first turn
     /// run, and put back where it was.
     ///
-    /// Either way the scheduler's countdown for the object is dropped and
-    /// the object gives up the ownership of interface events. An object
-    /// that is not being deleted has its sounds stopped (0x4320b4,
-    /// [`crate::sounds`]).
+    /// Either way the scheduler's countdown for the object is dropped, its
+    /// sounds are stopped (0x4320b4, [`crate::sounds`]), and the object
+    /// gives up the ownership of interface events. Being deleted (object
+    /// flag 0x40) only spares the rebuild (0x432063): the deletion's reset
+    /// stops the object's sounds too, and its destructor then once more.
     ///
     /// A Reset entry whose tree is missing runs nothing but still counts
     /// as a Reset tree.
@@ -462,11 +474,9 @@ impl Interpreter<'_> {
         if let Some(object) = world.objects.get_mut(&id) {
             object.set_countdown(-1);
         }
-        // A reset that does not delete stops the object's sounds
+        // Every path meets at 0x43208b and stops the object's sounds
         // (0x4320b4).
-        if !deleting {
-            self.sound(SoundEvent::Stop { object: id as i16 });
-        }
+        self.sound(SoundEvent::Stop { object: id as i16 });
         if world.event_owner == id {
             world.event_owner = 0;
         }

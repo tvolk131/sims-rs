@@ -308,3 +308,20 @@ fn removing_a_tile_queues_its_lead() {
     assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("0x442def")));
     assert!(fx.world.removals.is_empty());
 }
+
+#[test]
+fn a_group_removed_before_the_rooms_are_worked_out_fails_loudly() {
+    // The load's clear removes objects before it works the rooms out; a
+    // group's take-off needs them.
+    let mut fx = Fixture::new();
+    let file = group(&mut fx);
+    counting(&mut fx, file, false);
+    assert_eq!(create(&mut fx, MASTER), Ok(3));
+    let before = fx.world.clone();
+    let fault = remove_now(&mut fx, 4).unwrap_err();
+    assert!(
+        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x4412a4")),
+        "{fault}"
+    );
+    assert_eq!(fx.world.hash(), before.hash());
+}
