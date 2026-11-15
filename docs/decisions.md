@@ -28,8 +28,8 @@ objects and grass. Most of what is left is not drawing:
   is drawn at about light-table level 20 (see `Light`), judged from its
   pixels; ours uses level 16, the half-light floor. Its walls, floor
   and stairs make up nearly all the misses at rotations 1 and 2 and in
-  the bay view. The room's light is the
-  simulation's, so the render leaves it.
+  the bay view. The room's light is the simulation's, so the render
+  leaves it.
 - The Sims in the shots, which this crate does not draw.
 
 One drawing difference remains in these new views (the door jamb's
