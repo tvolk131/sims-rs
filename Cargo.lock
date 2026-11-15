@@ -1619,6 +1619,7 @@ dependencies = [
 name = "sims-game"
 version = "0.1.0"
 dependencies = [
+ "cpal",
  "sims-audio",
  "sims-content",
  "sims-people",
