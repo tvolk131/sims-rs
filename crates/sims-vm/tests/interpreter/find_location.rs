@@ -206,6 +206,32 @@ fn other_find_location_modes_fail_loudly() {
 }
 
 #[test]
+fn modes_3_and_4_spiral_when_the_line_direction_is_minus_1() {
+    // The search record keeps the raw direction, and -1 there is the
+    // spiral (0x434ba9): mode 3 from a facing of -1, and mode 4 from -3
+    // (turned by 2, remainder 8). The start tile is taken, so the spiral
+    // finds the free tile (2, 3); a line of direction -1 would never step
+    // and would give up.
+    for (mode, facing) in [(3, -1), (4, -3)] {
+        let (mut fx, _) = placeable();
+        fx.lamp_mut().position = [40, 40, 1];
+        fx.lamp_mut().data[1] = facing;
+        let (first, other) = (widget(&mut fx), widget(&mut fx));
+        for (id, expected) in [(first, [40, 40, 1]), (other, [40, 56, 1])] {
+            let result = run(
+                &mut fx,
+                LAMP as i16,
+                id as i16,
+                FIND_LOCATION,
+                [mode, 0, 1, 0, 0, 0, 0, 0],
+            );
+            assert_eq!(result, Ok(true), "mode {mode}");
+            assert_eq!(fx.world.objects[&id].position, expected, "mode {mode}");
+        }
+    }
+}
+
+#[test]
 fn modes_3_and_4_search_along_a_line_by_the_objects_facing() {
     // The lamp stands on tile (2, 2), facing 0. Mode 3 searches along its
     // facing: the second tile coordinate steps 0, 1, -1 (0x434be9). Mode

@@ -413,8 +413,9 @@ impl Interpreter<'_> {
     /// [`Interpreter::search`] along a line instead of a spiral (search
     /// record +0x10 not -1, 0x434be9): for a direction of 0 or 4 the second
     /// coordinate's step goes 0, 1, -1, 2, -2 and so on, and for 2 or 6
-    /// the first's does. Any other direction does not step, so the start
-    /// tile is tried until the search gives up. The rest is the spiral's.
+    /// the first's does. A direction of -1 is the spiral's. Any other
+    /// direction does not step, so the start tile is tried until the
+    /// search gives up. The rest is the spiral's.
     pub(crate) fn search_line(
         &self,
         world: &mut World,
@@ -475,8 +476,11 @@ impl Interpreter<'_> {
                     return Ok(Some([(i32::from(a) << 4) | 8, (i32::from(b) << 4) | 8]));
                 }
             }
+            // The record keeps the raw direction (0x434803 to 0x434817), and
+            // -1 there is the spiral (0x434ba9): a line search from an
+            // object facing -1 (or -3 turned by 2) spirals.
             match direction {
-                None => spiral_step(&mut dx, &mut dy),
+                None | Some(-1) => spiral_step(&mut dx, &mut dy),
                 Some(direction) => line_step(direction, &mut dx, &mut dy),
             }
             count += 1;
