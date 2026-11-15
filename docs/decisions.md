@@ -360,9 +360,22 @@ in the base slot now plays clips with timed events.
 **Generic Sims Call 12** (stop at tick 2930, 0x44fd4b). Temp 0 becomes
 minus the sum of the stack object's tile coordinates, turned by the
 house view's rotation (0x434f58, the table 0x407704 builds), as a
-16-bit word. The view's rotation is `Interpreter::view_rotation`. Strict
-boots use 0, which is unverified. A coordinate outside 0 to 63 at a
-rotation other than 0 fails, since the original reads outside its table.
+16-bit word. A coordinate outside 0 to 63 at a rotation other than 0
+fails, since the original reads outside its table.
+
+The view's rotation (the scene at 0x6e5528, +0x84, passed at 0x44fdb8)
+is the player's, not the lot's, but the simulation reads it, so it is an
+input of `Lot` like an order: `Lot::set_view_rotation`, between steps.
+Every interpreter `Lot` builds (load, step, orders, pie menu) passes it.
+The game window sets it whenever its camera turns, from the panel or the
+keys. **A recording of play must log each change** with the tick it came
+before. The load starts it at the camera direction the house file saved
+(HOUS, `boot::opening_rotation`), as the render track opens the view.
+That the original's load turns the scene to it is not traced (its HOUS
+read goes through 0x4b4263 and 0x4b42ba). The Goth and Newbie houses
+both saved 0, and the comparison harness saw the Goth house open at
+rotation 0, so strict boots of both run at 0. Which way the panel's two
+buttons turn the original's scene is unverified.
 
 **Generic Sims Call 2** (stop at tick 3356, 0x44fb51). It names the
 running action's icon. #158 ported the same routine on main with the

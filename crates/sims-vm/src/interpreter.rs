@@ -123,9 +123,9 @@ pub struct Interpreter<'a> {
     pub(crate) letting_go: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
     /// The house view's rotation, 0 to 3 (the scene at 0x6e5528, +0x84),
     /// which Generic Sims Call routine 12 reads. It is the player's
-    /// choice, not the lot's, so it is an input here. A house opens at
-    /// rotation 0, and the comparison harness never turns the view, so
-    /// [`Interpreter::new`] gives 0.
+    /// choice, not the lot's, so it is an input here: [`Interpreter::new`]
+    /// gives 0, and a booted lot passes its own
+    /// ([`crate::boot::Lot::set_view_rotation`]).
     pub view_rotation: u8,
     /// While a person's own tick runs its thread, the person and the
     /// animator refresh pending from its taking itself off the lot

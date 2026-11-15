@@ -72,6 +72,9 @@ fn the_goth_house_steps_to_tick_33() {
     let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
     assert!(lot.load_report().stopped.is_none());
     assert!(lot.load_report().finished.is_some());
+    // The house saved camera direction 0, and the comparison harness saw
+    // it open at rotation 0; Generic Sims Call 12 reads it.
+    assert_eq!(lot.view_rotation(), 0);
     let start = lot.world().ticks;
     for tick in 1..=33 {
         lot.step().unwrap();

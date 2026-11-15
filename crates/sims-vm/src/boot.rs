@@ -186,6 +186,8 @@ pub struct Lot {
     /// Play mode's own state ([`crate::play`]), used by
     /// [`Lot::step_play`] only.
     play: Play,
+    /// The house view's rotation, 0 to 3 ([`Lot::set_view_rotation`]).
+    view_rotation: u8,
 }
 
 /// Why a step could not run, or stopped partway.
@@ -270,6 +272,17 @@ impl std::fmt::Display for OrderError {
 
 impl std::error::Error for OrderError {}
 
+/// The rotation a house opens at: the camera direction its file saved
+/// (the HOUS chunk), as the render track opens the view
+/// (`sims_render::open_house`). That the original's load turns the scene
+/// (0x6e5528, +0x84) to it is not traced; the comparison harness saw the
+/// Goth house (`House05.iff`, which saved 0) open at rotation 0.
+pub fn opening_rotation(file: &House) -> u8 {
+    file.view
+        .as_ref()
+        .map_or(0, |v| (v.camera_direction & 3) as u8)
+}
+
 impl Lot {
     /// Loads the house file `house` (inside a neighborhood's `Houses`
     /// directory) from the install at `root`. `answers` answers, in order,
@@ -294,6 +307,7 @@ impl Lot {
         }
         let catalog = Catalog::build(&index)?;
         let file = House::load(house, &catalog)?;
+        let view_rotation = opening_rotation(&file);
         let context = Context::COMPLETE_COLLECTION;
         // The original has every definition registered, and the resize
         // step walks them all, so the whole catalog is linked.
@@ -315,7 +329,10 @@ impl Lot {
         let mut world = World::empty();
         let mut load = LoadReport::default();
         {
-            let interpreter = Interpreter::new(&program, &catalog, Stream::Global);
+            let interpreter = Interpreter {
+                view_rotation,
+                ..Interpreter::new(&program, &catalog, Stream::Global)
+            };
             // The lot the game holds before the load: empty, with the
             // neighborhood's people, the type attributes the neighborhood
             // saved and the two indicator objects.
@@ -487,6 +504,7 @@ impl Lot {
             load,
             halted: false,
             play: Play::default(),
+            view_rotation,
         })
     }
 
@@ -545,6 +563,7 @@ impl Lot {
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut first_frame = None;
@@ -621,7 +640,10 @@ impl Lot {
         menu: u32,
     ) -> Result<Option<i32>, OrderError> {
         self.ready()?;
-        let interpreter = Interpreter::new(&self.program, &self.catalog, Stream::Global);
+        let interpreter = Interpreter {
+            view_rotation: self.view_rotation,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
         let mut world = self.world.clone();
         let queued = interpreter
             .order(&mut world, person, object, menu)
@@ -644,6 +666,7 @@ impl Lot {
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -668,7 +691,10 @@ impl Lot {
         action: sims_formats::saved_objects::Interaction,
     ) -> Result<Option<i32>, OrderError> {
         self.ready()?;
-        let interpreter = Interpreter::new(&self.program, &self.catalog, Stream::Global);
+        let interpreter = Interpreter {
+            view_rotation: self.view_rotation,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
         let mut world = self.world.clone();
         let queued = interpreter
             .pick(&mut world, person, action)
@@ -748,6 +774,22 @@ impl Lot {
         &self.catalog
     }
 
+    /// The house view's rotation, 0 to 3 (the scene at 0x6e5528, +0x84),
+    /// which Generic Sims Call routine 12 reads (0x44fdb8, 0x434f58).
+    pub fn view_rotation(&self) -> u8 {
+        self.view_rotation
+    }
+
+    /// Turns the house view to `rotation` (taken modulo 4). It is the
+    /// player's choice, not the lot's, but the simulation reads it, so it
+    /// is an input like an order: the game window sets it whenever its
+    /// camera turns, between steps, and a recording of play must note
+    /// each change. The load starts it at the house's saved camera
+    /// direction ([`opening_rotation`]).
+    pub fn set_view_rotation(&mut self, rotation: u8) {
+        self.view_rotation = rotation & 3;
+    }
+
     /// What the load did.
     pub fn load_report(&self) -> &LoadReport {
         &self.load
@@ -808,6 +850,7 @@ mod tests {
             load,
             halted: false,
             play: Play::default(),
+            view_rotation: 0,
         }
     }
 
@@ -836,6 +879,18 @@ mod tests {
         }
         assert_eq!(lot.world().hash_hex(), failed);
         assert_eq!(lot.ticks(), 0);
+    }
+
+    #[test]
+    fn the_view_rotation_is_an_input_taken_modulo_4() {
+        let mut lot = lot(World::empty(), true, Frames::default());
+        assert_eq!(lot.view_rotation(), 0);
+        lot.set_view_rotation(3);
+        assert_eq!(lot.view_rotation(), 3);
+        lot.set_view_rotation(6);
+        assert_eq!(lot.view_rotation(), 2);
+        // The lot's state does not hold it.
+        assert_eq!(lot.world().hash_hex(), World::empty().hash_hex());
     }
 
     #[test]
