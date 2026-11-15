@@ -1235,6 +1235,29 @@ fn at_the_end_of_its_path_a_person_walks_on_then_stops() {
 }
 
 #[test]
+fn a_blocked_step_ends_the_route_blocked() {
+    // A step onto a tile where the person does not fit (0x58eecb): the
+    // lot has no floors, and without data word 42 flag 2 the person may
+    // not stand without one. The route ends blocked (+0x188 = 3,
+    // 0x58f682); the step is kept, but neither the person nor the
+    // animator moves.
+    let mut fx = routed();
+    fx.sim_mut().data[1] = 2;
+    fx.world.animators.get_mut(&SIM).unwrap().position[2] = F32::from_f32(2.0);
+    fx.world.animators.get_mut(&SIM).unwrap().destination[2] = F32::from_f32(2.0);
+    fx.sim_mut().data[42] = 0;
+    let before = fx.world.animators[&SIM].position;
+    let placed = fx.world.objects[&SIM].position;
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!(a.arrival, 3);
+    assert!(a.walking);
+    assert_eq!(a.position[..2], before[..2]);
+    assert_ne!(a.motion.step, [F32::ZERO; 2]);
+    assert_eq!(fx.world.objects[&SIM].position, placed);
+}
+
+#[test]
 fn what_the_route_follow_does_not_port_fails_loudly() {
     // Facing the point ahead, a standing animator walks; but the point,
     // 21.33 away, is farther than the stop clip's stride (1 times 16/3),
@@ -1264,15 +1287,6 @@ fn what_the_route_follow_does_not_port_fails_loudly() {
     tick(&mut fx).unwrap();
     let a = &fx.world.animators[&SIM];
     assert_eq!((a.state, a.selection, a.walking), (6, 0x13, false));
-    // A step onto a tile where the person does not fit (0x58f682): the
-    // lot has no floors, and without data word 42 flag 2 the person may
-    // not stand without one.
-    let mut fx = routed();
-    fx.sim_mut().data[1] = 2;
-    fx.world.animators.get_mut(&SIM).unwrap().position[2] = F32::from_f32(2.0);
-    fx.world.animators.get_mut(&SIM).unwrap().destination[2] = F32::from_f32(2.0);
-    fx.sim_mut().data[42] = 0;
-    assert!(tick(&mut fx).unwrap_err().to_string().contains("blocked"));
     // The end of a path for a person whose object data word 9 is clear
     // (0x58e8be) needs the walk's footfalls, which this walk clip has no
     // events for (0x588df8).
