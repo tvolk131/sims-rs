@@ -199,18 +199,16 @@ impl Machine<'_, '_> {
     ///    the first to the second coordinate, the second to the first.
     ///    This repeats, adding to the point already moved, until its tile
     ///    (each coordinate shifted right 4 and cut to a byte, 0x433067) is
-    ///    inside the lot's bounds less a tile at each side (0x434cb7). The
-    ///    bounds (the world's +0x70 to +0x7c) are the box round the lot's
-    ///    four corner tiles, turned by the world's rotation (0x478fef,
-    ///    0x4791a6, and the resize at 0x478026), so tiles 1 to size - 2,
-    ///    whatever the rotation.
+    ///    inside the lot's bounds less a tile at each side (0x434cb7; see
+    ///    [`interior`]).
     /// 3. Either way the point is turned within a square of 1024 (0x47bc1f)
     ///    by the inverse of the view's rotation (the world's +0x84, negated
     ///    modulo 4; [`crate::Interpreter::view_rotation`]).
     ///
     /// A lot smaller than three tiles has no tile inside its bounds, so
     /// the original's loop never ends, and a lot of size 0 divides by zero:
-    /// both fail.
+    /// both fail. So does a turned lot wider than 64 tiles, whose corners
+    /// the original would look up past its table of turns.
     fn random_start(&mut self, from: [i32; 2]) -> Result<[i32; 2], Trap> {
         let size = i32::from(self.world.size);
         if size < 3 {
@@ -219,18 +217,25 @@ impl Machine<'_, '_> {
                  bounds, so the random start never ends (0x434951)"
             )));
         }
+        if size > 64 && self.view_rotation & 3 != 0 {
+            return Err(Trap::Unsupported(format!(
+                "Find Location For mode 5 on a lot {size} tiles wide, turned: its corners are \
+                 past the table of turns (0x434f58)"
+            )));
+        }
         let [mut x, mut y] = from;
         if [x, y] == [1, 1] {
             y = (self.draw() % size as u32) as i32;
             x = (self.draw() % size as u32) as i32;
         } else {
-            let inside = |n: i32| (1..=size - 2).contains(&i32::from((n >> 4) as i8));
+            let [across, down] = interior(size, self.view_rotation);
+            let tile = |n: i32| i32::from((n >> 4) as i8);
             loop {
                 let first = (self.draw() % 10) as i32 - 5;
                 let second = (self.draw() % 10) as i32 - 5;
                 y = y.wrapping_add((first << 4) | 8);
                 x = x.wrapping_add((second << 4) | 8);
-                if inside(y) && inside(x) {
+                if down.contains(&tile(y)) && across.contains(&tile(x)) {
                     break;
                 }
             }
@@ -315,6 +320,30 @@ impl Machine<'_, '_> {
     }
 }
 
+/// The tiles inside the lot's bounds less one at each side, as the random
+/// start tests them (0x434cb7): first along the first coordinate, then
+/// along the second.
+///
+/// The bounds (the world's +0x70 to +0x7c) are the box round the lot's
+/// four corner tiles, each turned by the world's rotation (0x4791a6, and
+/// the resize at 0x477fbb). The turn (0x434f58) looks the tile up in a
+/// table (filled at 0x407704) that turns it within the whole 64-tile
+/// square, not the lot: a turn of 1 takes tile (a, b), as 0x433067 cuts
+/// it (the second coordinate first), to (63 - b, a). So on a lot smaller
+/// than 64 tiles, a turned view moves the bounds to the square's far
+/// side along one coordinate or both, and the walk, which starts from
+/// the unturned point, has to go round to them (the cut to a byte wraps).
+fn interior(size: i32, rotation: u8) -> [std::ops::RangeInclusive<i32>; 2] {
+    let near = 1..=size - 2;
+    let far = 65 - size..=62;
+    match rotation & 3 {
+        1 => [near, far],
+        2 => [far.clone(), far],
+        3 => [far, near],
+        _ => [near.clone(), near],
+    }
+}
+
 /// The largest coordinate of the square 0x47bc1f turns points in (its
 /// size, 0x400, less 1).
 const SPAN: i32 = 0x3ff;
@@ -333,6 +362,19 @@ fn turn([x, y]: [i32; 2], rotation: u8) -> [i32; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_turned_view_moves_the_bounds_round_the_64_tile_square() {
+        // Size 6: tiles 1 to 4 near, 59 to 62 far (0x407704's table).
+        assert_eq!(interior(6, 0), [1..=4, 1..=4]);
+        assert_eq!(interior(6, 1), [1..=4, 59..=62]);
+        assert_eq!(interior(6, 2), [59..=62, 59..=62]);
+        assert_eq!(interior(6, 3), [59..=62, 1..=4]);
+        // A whole lot's bounds are the same whatever the turn.
+        for rotation in 0..4 {
+            assert_eq!(interior(64, rotation), [1..=62, 1..=62]);
+        }
+    }
 
     #[test]
     fn a_point_is_turned_by_the_inverse_of_the_view() {

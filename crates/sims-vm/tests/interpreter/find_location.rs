@@ -485,15 +485,38 @@ fn find_random(
 /// tile offsets of a draw modulo 10 less 5, the first draw to the second
 /// coordinate, added up until the tile, cut to a byte, is inside the
 /// border.
-fn walked(rng: &mut GameRng, size: i32, [mut x, mut y]: [i32; 2]) -> [i32; 2] {
-    let inside = |n: i32| (1..=size - 2).contains(&i32::from((n >> 4) as i8));
+fn walked(rng: &mut GameRng, size: i32, from: [i32; 2]) -> [i32; 2] {
+    walked_turned(rng, size, 0, from).0
+}
+
+/// [`walked`] under a turned view, with the number of draws: the bounds
+/// are the lot's corners turned within the whole 64-tile square (0x4791a6
+/// through 0x407704's table), so a turn moves the first coordinate's,
+/// the second's or both to tiles 65 - size to 62.
+fn walked_turned(
+    rng: &mut GameRng,
+    size: i32,
+    rotation: u8,
+    [mut x, mut y]: [i32; 2],
+) -> ([i32; 2], u32) {
+    let near = 1..=size - 2;
+    let far = 65 - size..=62;
+    let (across, down) = match rotation {
+        1 => (near, far),
+        2 => (far.clone(), far),
+        3 => (far, near),
+        _ => (near.clone(), near),
+    };
+    let tile = |n: i32| i32::from((n >> 4) as i8);
+    let mut draws = 0;
     loop {
         let first = (rng.next_u32() % 10) as i32 - 5;
         let second = (rng.next_u32() % 10) as i32 - 5;
+        draws += 2;
         y += first * 16 + 8;
         x += second * 16 + 8;
-        if inside(x) && inside(y) {
-            return [x, y];
+        if across.contains(&tile(x)) && down.contains(&tile(y)) {
+            return ([x, y], draws);
         }
     }
 }
@@ -567,14 +590,31 @@ fn mode_5_from_exactly_1_1_draws_a_point_modulo_the_lots_size() {
 
 #[test]
 fn mode_5_turns_its_start_by_the_inverse_of_the_view() {
-    // From state 8 the walk ends at (40, 40). Turned half round within
-    // 1024 it is (983, 983), tile 61, clamped to tile 4. A quarter turn
-    // (view 1, turned by 3) gives (1023 - 40, 40): tiles (4, 2).
-    for (rotation, tile) in [(0, [2, 2]), (2, [4, 4]), (1, [4, 2]), (3, [2, 4])] {
+    // From state 8 on the six-tile lot. Unturned, the walk ends at once on
+    // (40, 40). Turned, the bounds are on the 64-tile square's far side
+    // along one coordinate or both, so the walk goes round (the tile is
+    // cut to a byte) until it reaches them. View 1: (8216, 9160), tiles
+    // (1, 60), turned by 3 to (1023 - 9160, 8216), tiles (3, 1). View 2:
+    // (-3144, 984), tiles (59, 61), turned to (4167, 39), tiles (4, 2).
+    // View 3: (5088, 4128), tiles (62, 2), turned by 1 to (4128, -4065),
+    // tiles (2, 1). The lot is free, so the search takes the start tile.
+    for (rotation, walk, draws, tile) in [
+        (0, [40, 40], 2, [2, 2]),
+        (1, [8216, 9160], 51266, [3, 1]),
+        (2, [-3144, 984], 7526, [4, 2]),
+        (3, [5088, 4128], 40416, [2, 1]),
+    ] {
         let (mut fx, _) = placeable();
         let id = widget(&mut fx);
         fx.world.lot_rng = GameRng::from_state(8);
+        let mut expected = fx.world.lot_rng;
+        assert_eq!(
+            walked_turned(&mut expected, 6, rotation, [16, 16]),
+            (walk, draws),
+            "view {rotation}"
+        );
         assert_eq!(find_random(&mut fx, 0, id, 0, rotation), Ok(true));
+        assert_eq!(fx.world.lot_rng, expected, "view {rotation}");
         let middle = tile.map(|t| (t << 4) | 8);
         assert_eq!(
             fx.world.objects[&id].position,
