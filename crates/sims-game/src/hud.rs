@@ -1,5 +1,6 @@
 //! The live-mode control panel (`sims-ui`) over the lot, read from the
-//! running world each frame, and the dialog the world waits on.
+//! running world each frame, the selected Sim's queue of actions, and
+//! the dialog the world waits on.
 //!
 //! The panel turns presses into `sims_ui` commands; [`Hud::press`] hands
 //! them to the game, which carries out what it can.
@@ -18,12 +19,22 @@ use sims_ui::frame::{Frame, Rect};
 use sims_ui::household::{Faces, Snapshot};
 use sims_ui::hud::{self, Controls, Item};
 use sims_ui::pie;
+use sims_ui::queue::Queue;
+use sims_vm::SoundEvent;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// The status line's font size and colors.
 const STATUS_SIZE: u8 = 10;
 const STATUS_TEXT: [u8; 3] = [255, 255, 255];
 const STATUS_BACK: [u8; 3] = [96, 24, 24];
+
+/// The object the interface's own sounds are played for (0x4cb171).
+pub const INTERFACE: i16 = -4;
+/// What a press on an action's icon plays when it counts, and when it
+/// does not or is a pet's (0x4cb16e).
+pub const QUEUE_DELETE: &str = "UI_queue_delete";
+pub const ERROR: &str = "UI_error";
 
 pub struct Hud {
     pub art: Art,
@@ -41,6 +52,13 @@ pub struct Hud {
     pub menu: Option<Menu>,
     /// The status band across the top, as last drawn.
     band: Option<Rect>,
+    /// The selected Sim's actions, as last drawn.
+    queue: Queue,
+    /// The actions whose icons were pressed while they show: a second
+    /// press on an icon does nothing (0x4cb148).
+    pressed: BTreeSet<i32>,
+    /// The interface's sounds, until the game takes them.
+    sounds: Vec<SoundEvent>,
 }
 
 impl Hud {
@@ -53,6 +71,7 @@ impl Hud {
             .iter()
             .chain(&dialog::RESOURCES)
             .chain(&pie::RESOURCES)
+            .chain(&sims_ui::queue::RESOURCES)
             .copied()
             .collect();
         let art = Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
@@ -89,6 +108,9 @@ impl Hud {
             dialog: None,
             menu: None,
             band: None,
+            queue: Queue::default(),
+            pressed: BTreeSet::new(),
+            sounds: Vec::new(),
         })
     }
 
@@ -143,6 +165,10 @@ impl Hud {
         // The game pauses by not stepping the lot; the button shows it.
         snapshot.paused |= pace.paused;
         self.items = hud::layout(view.size, &snapshot, &self.controls);
+        self.queue = Queue::read(world, snapshot.selected);
+        // An icon gone takes its press with it.
+        let shown: BTreeSet<i32> = self.queue.icons.iter().map(|i| i.uid).collect();
+        self.pressed.retain(|uid| shown.contains(uid));
         self.read_dialog(world, assets);
         let (width, height) = (
             u32::try_from(canvas.width).unwrap_or(u32::MAX),
@@ -162,6 +188,7 @@ impl Hud {
             &self.items,
             &self.controls,
         );
+        self.queue.draw(&mut frame, &self.art, &self.faces);
         self.dialog = self
             .message
             .as_ref()
@@ -221,6 +248,46 @@ impl Hud {
             || self.menu.is_some()
             || self.band.is_some_and(|b| b.contains(point[0], point[1]))
             || hud::covers(&self.items, point)
+            || self.queue.at(point).is_some()
+    }
+
+    /// The selected Sim's actions as last drawn.
+    pub fn queue(&self) -> &Queue {
+        &self.queue
+    }
+
+    /// The interface's sounds since the last call.
+    pub fn take_sounds(&mut self) -> Vec<SoundEvent> {
+        std::mem::take(&mut self.sounds)
+    }
+
+    /// Plays one of the interface's sounds.
+    pub fn play(&mut self, name: &str) {
+        self.sounds.push(SoundEvent::Play {
+            object: INTERFACE,
+            name: name.into(),
+        });
+    }
+
+    /// A press on the icon of the selected Sim's action at `point`
+    /// (0x4cb126): the cancel it asks for, if any. A pet's icon only
+    /// plays `UI_error`; an icon already pressed, or whose action is
+    /// already cancelled, does nothing.
+    fn press_queue(&mut self, point: [i32; 2]) -> Option<Option<Command>> {
+        let icon = self.queue.at(point)?;
+        let (uid, cancelled) = (icon.uid, icon.cancelled);
+        let person = self.queue.person?;
+        if self.queue.pet {
+            self.play(ERROR);
+            return Some(None);
+        }
+        if cancelled || !self.pressed.insert(uid) {
+            return Some(None);
+        }
+        Some(Some(Command::CancelAction {
+            sim: person,
+            action: uid,
+        }))
     }
 
     /// Moves the pointer; true if what it hovers changed.
@@ -278,6 +345,9 @@ impl Hud {
                 }
                 Press::Closed => None,
             };
+        }
+        if let Some(command) = self.press_queue(point) {
+            return command;
         }
         let command = hud::press(&self.items, point)?;
         self.controls.apply(&command);
