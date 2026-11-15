@@ -151,6 +151,11 @@ impl Game {
     /// camera (0x570c3e).
     pub fn ambience_view(&self) -> i32 {
         let camera = &self.view.camera;
+        // The camera's arithmetic overflows for an origin this far off;
+        // no view the controls make comes near it.
+        if camera.origin.iter().any(|n| n.unsigned_abs() >= 1 << 26) {
+            return 0;
+        }
         let corner = camera
             .rotate_fine(camera.unproject_fine([0, 0]))
             .map(|n| n >> 4);
