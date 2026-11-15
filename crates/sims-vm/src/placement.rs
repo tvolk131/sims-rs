@@ -109,9 +109,11 @@ impl Kept {
     }
 }
 
-/// What a person's animator refresh at its taking itself off the lot
-/// does with its head slot (0x58dae5 to 0x58dc55), when the house view
-/// drew the person ([`Interpreter::take_self_off`]). The refresh reads the
+/// What a person's animator refresh does with its head slot (0x58dae5 to
+/// 0x58dc55): at its taking itself off the lot when the house view drew
+/// the person ([`Interpreter::take_self_off`]), and always at its
+/// deselection (`Interpreter::deselect`), where the marker has just left
+/// the slot. The refresh reads the
 /// person's container entry at begin + 0x48 when there are more than two
 /// (our slot 2, the head's attachment; it holds the marker over the
 /// selected Sim, GUID 0x2F726FFF). Unless the entry names no bone (+0x20)
@@ -133,7 +135,7 @@ impl Kept {
 /// this one is too, which is as unverified. A person or a tile of a group
 /// in the slot has another class (0x667378, 0x666c20), whose functions
 /// there are not read, so it fails.
-fn head_slot_redraw(world: &World, id: u16) -> Result<(), Trap> {
+pub(crate) fn head_slot_redraw(world: &World, id: u16) -> Result<(), Trap> {
     let person = world.objects.get(&id).ok_or_else(missing)?;
     let Some(slot) = person.slots.get(2).filter(|slot| slot.object > 0) else {
         return Ok(());
@@ -143,8 +145,8 @@ fn head_slot_redraw(world: &World, id: u16) -> Result<(), Trap> {
     };
     if held.person.is_some() || held.multipart.is_some() {
         return Err(Trap::Unsupported(format!(
-            "person {id} takes itself off the lot with {} {} in its head slot: its animator's \
-             refresh, if the house view drew it, redraws it through that class's functions \
+            "person {id}'s animator refresh (0x58da12, at its taking itself off the lot or its \
+             deselection) redraws {} {} in its head slot through that class's functions \
              (0x58dc08 to 0x58dc52), which are not read",
             if held.person.is_some() {
                 "the person"
