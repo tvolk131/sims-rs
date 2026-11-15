@@ -555,13 +555,20 @@ impl Painter<'_> {
                 [bottom[0] - w / 2, bottom[1] - h]
             }
         };
-        let (end, height) = match (frame, a[1].cmp(&b[1])) {
-            (2, _) if a[0] <= b[0] => (a, heights[0]),
-            (2, _) => (b, heights[1]),
-            (_, std::cmp::Ordering::Less) => (b, heights[1]),
-            _ => (a, heights[0]),
+        let anchor = match (frame, a[1].cmp(&b[1])) {
+            (2, _) if a[0] <= b[0] => self.depth.anchor(a[1], heights[0] as f32, level),
+            (2, _) => self.depth.anchor(b[1], heights[1] as f32, level),
+            // An edge-on diagonal is anchored halfway between its ends:
+            // with the original's bias (see `Depth::diagonal`) that gives
+            // its depth on every row compared (2026-11-15). Its height
+            // there, the ends' mean, is unverified.
+            (3, _) => {
+                let height = (heights[0] + heights[1]) as f32 / 2.0;
+                self.depth.anchor((a[1] + b[1]) / 2, height, level)
+            }
+            (_, std::cmp::Ordering::Less) => self.depth.anchor(b[1], heights[1] as f32, level),
+            _ => self.depth.anchor(a[1], heights[0] as f32, level),
         };
-        let anchor = self.depth.anchor(end[1], height as f32, level);
         let sprite_left = at[0];
         let clipped;
         let (image, at) = match columns {
@@ -579,7 +586,7 @@ impl Painter<'_> {
         self.canvas
             .draw_wall(image, at, light, |sx, sy| match frame {
                 0 | 1 => depth.wall(anchor, sy, first, sx.saturating_sub(sprite_left)),
-                _ => depth.diagonal(anchor, sy),
+                _ => depth.diagonal(anchor, sy, frame == 3),
             });
     }
 

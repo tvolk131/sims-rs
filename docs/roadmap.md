@@ -62,6 +62,11 @@ events, and what it asks for after them) come first.
   (the multi-tile factory is ported). At tick 2882 person 16's pose
   without a foreground layer (0x5992b3) is not ported. Step 2 continues
   from there.
+- Of the base neighborhood's houses only the Goths' and the Newbies'
+  (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
+  tick 562, with no recording to compare yet; at tick 563 a head's pose
+  blends a base clip under the foreground (0x5992b3), which is not
+  ported.
 
 ## Met goal: a headless lot boot that matches the original
 
@@ -1880,12 +1885,6 @@ Progress:
 - Done: light levels use the original's colour tables, which shift blue
   by a step; at the compared cameras the house box rose by 0.7 to 1.3
   points (medium zoom 90.4%, cutaway 87.1%).
-- Done: the pools of light lit lamps throw on the floor, from the
-  game's `lightMap.dat`, and lit lamps drawn in full light, as the
-  original does. With the world at the screenshots' time, near zoom
-  rose from 85.2% to 86.1% exact and far zoom at rotation 2 from 89.9%
-  to 90.1%. Pools on walls (the file's wall tables) are read in part,
-  not ported.
 - Done: far zoom at rotations 1 and 2, and near zoom, compared with the
   original. The geometry lines up at all of them; the house box is
   56.2% to 90.4% exact. Most misses are one room the original lit
@@ -1906,20 +1905,25 @@ Progress:
   buffer holds the lot without its people. The game does not use it
   yet, and how the original gives a person's mesh its depth is
   unverified.
-- Found, not ported: an edge-on diagonal wall shows the wrong side, not
-  only the wrong texels. At near zoom the original shows the outside
-  shingles at both edge-on ends of the bay; we show the inside
-  wallpaper at the left end. Both walls face the same way, but the
-  outside lies on opposite sides of them, so no rule by the wall's
-  facing matches both. Code at 0x53f8ce copies two wall-cell records
-  (the cell's, and its neighbour's or the same cell's again) and reads
-  a word from each at an index from the wall's direction and a stack
-  value (`[ebp-0x2c]`, through 0x43517c). What that value means, and
-  how those words map to our wallpaper per side, are not read yet; the
-  port waits on both.
-- Next: trace that stack value and map the words to the wallpaper per
-  side (0x53f8ce), then the edge-on texels; a screenshot with a marked
-  edge-on diagonal; upper-level depth.
+- Done: the bay's edge-on ends. The original draws an edge-on diagonal
+  wall 300 nearer, anchored halfway along it (0x4c7be2, 0x4c4907), so
+  the straight bay walls' side faces show in front of it. At near zoom
+  both bay ends now show the shingles (61.2% to 61.7% exact); at
+  medium zoom the depth at both ends is the original's.
+- Read, not ported: the side an edge-on diagonal shows. The original
+  shows the side facing view (−1, 1) (0x53f6c1, 0x53d93a); ours shows
+  the same lot side at every rotation. The one column where the wall
+  shows matches neither side until its texel offset is read.
+- Done: the pools of light lit lamps throw on the floor, from the
+  game's `lightMap.dat`, and lit lamps drawn in full light, as the
+  original does. With the world at the screenshots' time, near zoom
+  rose from 85.2% to 86.1% exact and far zoom at rotation 2 from 89.9%
+  to 90.1%. Pools on walls (the file's wall tables) are read in part,
+  not ported.
+- Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
+  grass and a light sprite in the original); lamp pools on walls; the
+  edge-on texel offset and side; a screenshot with a marked edge-on
+  diagonal; upper-level depth.
 
 ## Track: sound (`crates/sims-audio`)
 
@@ -1958,10 +1962,14 @@ stop-sounds events.
 - **Done: live playback.** The `play` example plays events (and the
   ambience) on the default output device, behind the `playback`
   feature (cpal), off by default; tests and CI build none of it.
+- **Done: the ambience's inputs.** The simulation emits its sound
+  requests (`Update::sounds`), and the game plays them. The camera
+  value the ambience's row follows is ported (`ambience::view`, from
+  0x570c3e: the share of the screen's tiles that are outdoors, read
+  through `World::outside`), and the hour is the clock's.
 - **Next:**
-  - The simulation emits `SoundEvent`s (the interface is in the
-    decisions log), and gives the camera value and the hour for the
-    ambience's cursor.
+  - Positions for 3D sound, pause and unpause (103), reload (104), the
+    piano (43) and the music half of the music modes (36).
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)
@@ -2093,26 +2101,48 @@ through their public interfaces only; the simulation never depends on it.
   a book comes off the shelf, the fountain tinkles. `begin_route` and
   `end_route` have no event in the install's sound files and play
   nothing.
-- **Done: a stopgap pie menu.** Clicking an object or a person opens a
-  list of the interactions an order on it is queued from (those of the
-  tile the simulation sends a multi-tile object's orders to; each menu
-  number once, named by that table's TTAs strings, debug entries
-  hidden); choosing one
-  queues it for the selected Sim with `Lot::queue_interaction`, and the
-  note across the top says whether it was queued. Escape closes the
-  menu. The fridge lists Have A Snack, Have Lite Meal, Have A Meal,
-  Serve Meal; the bookshelf lists Read a Book and the studies.
-- **Blocked: a Sim doing what he is told.** Idle For Input now starts
-  a queued order (#131): Have A Snack queued on the fridge at tick 51
-  leaves the queue by tick 151. Three ticks later, another person
-  (object 16) fails a route that names its slot from source 2 (tree
-  0x2156 node 5; 0x45ac2e, not ported), which stops the lot in strict
-  mode. Without an order, strict mode runs to tick 2881. That route is
-  the simulation's next step toward the done criterion.
-- **Next:** the menu from the simulation's pie-menu entries (the check
-  each entry runs, which the stopgap skips) once that accessor lands;
-  then a real pie.
+- **Done: the pie menu from the simulation's listing.** When the
+  pointer first reaches an object or a person, the game lists the
+  selected Sim's menu on it with `Lot::pie_menu`, which changes the lot
+  as the original's listing does; a click opens it. The entries are
+  those whose check passes, named as the check tree named them or else
+  by the TTAs strings of the table they came from, with "*" before such
+  an entry with flag 0x80; choosing one queues the offered action with
+  `Lot::pick`. Where the simulation has
+  not ported something the listing needs, the menu falls back to every
+  entry of the table, queued by menu number, and the note across the
+  top says why; any other failure shows no menu. Escape closes the menu.
+  The menu is drawn as the original's pie, with `sims_ui::pie` (#157):
+  the labels around the click, a name with a `/` in a submenu, at most
+  12 shown; a test clicks the fridge and chooses Have A Snack from its
+  pie. The simulation lists the fridge itself: in the morning the house
+  loads in, Have A Snack, Have Quick Breakfast, Have Breakfast and
+  Serve Breakfast.
+- **Done: a Sim doing what he is told.** Have A Snack queued on the
+  fridge at tick 51 (the snack order, run 2026-11-15 on main d46c93ab,
+  in play mode and in strict mode alike): Mortimer takes the order at
+  tick 150, the fridge makes the snack (object 263) at tick 615, he
+  takes it at 748, pays 5 at 820 and eats it (menu 2 on the snack) while
+  his hunger goes from 94.5 to 100.0 (tick 936); at 1088 the snack goes
+  off the lot and at 1136 it is deleted, and he is free again. He goes
+  on to other things (object 71 at tick 1497, object 132 at 2292).
+  Since #156 strict mode runs the order through step 3400 and stops at
+  step 3401 (person 16 routes for an action that wants to be
+  interrupted, 0x45afd2); without an order it runs to tick 2881.
+- **Done in play mode: selecting a Sim.** A press on a portrait selects
+  that Sim (0x445449, between ticks): the Sim selected before is
+  deselected, the indicators move, and the panel and the pie menus
+  follow the new Sim. Deselecting refreshes the old Sim's animator
+  (0x58da12), which is not ported, so in strict mode (`Lot::select`)
+  switching Sims fails and changes nothing; play mode
+  (`Lot::select_play`) leaves the refresh out.
+- **Next:** the selected Sim's head in the middle of the pie; answering
+  a dialog from the window.
 - **Needs from other crates:**
+  - `sims-vm`: listings that fail today on the Goth house: check trees
+    on Manage Inventory operation 4 and scope 12. A check tree's fault
+    should keep its trap rather than become `Unsupported` text, which
+    `sims-game` reads to tell unported from failed.
   - `sims-render`: which object drew each pixel (an object ID buffer
     beside the depth), so a click picks the object under it. Today
     `sims-game` guesses from each object's tile.
@@ -2124,13 +2154,17 @@ through their public interfaces only; the simulation never depends on it.
   - `sims-people`: which person drew each pixel (`draw_on_lot` with an
     owner per pixel), so `sims-game` need not repeat its drawing loop
     to find the person a click lands on.
-  - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
-    and dialogs are. `sims-game` draws a plain list until then.
-  - `sims-vm`: a route naming its slot from source 2 (0x45ac2e), and
-    the entries the pie menu offers a person on an object, with their
-    labels' table. Until then, the tile an order on an object goes to
-    (`interaction_target`) and the ID and file of the TTAB it is queued
-    from, which `sims-game` now repeats from the program's data.
+  - `sims-vm`: the animator's refresh (0x58da12), which deselecting a
+    Sim makes, so strict mode can switch Sims.
+  - `sims-people`: the selected Sim's head as an image, which the
+    original renders live into the pie's face bitmap; the middle of the
+    pie is empty until then.
+  - `sims-audio`: the inputs the game cannot give yet (the camera
+    value of the ambience's cursor, 0x570c3e, is ported, #160): what
+    the sound scripts' `getsrcdatafield` fields are (`sims-game`
+    answers 0 to every one; an object's place on screen, for its pan,
+    is presumably among them, unread), and what pausing the game does
+    to the sounds playing (the pause events are not ported).
 
 ## Working rules
 
