@@ -678,11 +678,33 @@ impl Lot {
     /// selected before is deselected, and the indicators move. Returns
     /// the requests to the sound system the indicators' trees made.
     ///
+    /// Deselecting refreshes the deselected Sim's animator, which is not
+    /// ported, so selecting another Sim while one is selected fails here
+    /// ([`crate::Refresh::Fail`]); [`Lot::select_play`] leaves the
+    /// refresh out.
+    ///
     /// A selection that fails changes nothing, as for
     /// [`Lot::queue_interaction`]. Only a person can be selected; which
     /// people the interface lets the player select (the portraits of the
     /// household) is the caller's to decide.
     pub fn select(&mut self, person: u16) -> Result<Vec<crate::SoundEvent>, OrderError> {
+        self.select_with(person, crate::Refresh::Fail)
+    }
+
+    /// [`Lot::select`] for play mode: the deselected Sim's animator
+    /// refresh, which is not ported, is left out
+    /// ([`crate::Refresh::Skip`]), so its animator, head and person words
+    /// do not move as the original's would. A lot selected this way is not
+    /// one to compare with the original.
+    pub fn select_play(&mut self, person: u16) -> Result<Vec<crate::SoundEvent>, OrderError> {
+        self.select_with(person, crate::Refresh::Skip)
+    }
+
+    fn select_with(
+        &mut self,
+        person: u16,
+        refresh: crate::Refresh,
+    ) -> Result<Vec<crate::SoundEvent>, OrderError> {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
@@ -691,7 +713,7 @@ impl Lot {
         };
         let mut world = self.world.clone();
         interpreter
-            .select(&mut world, Some(person))
+            .select_with(&mut world, Some(person), refresh)
             .map_err(OrderError::Refused)?;
         self.world = world;
         Ok(sounds.into_inner())

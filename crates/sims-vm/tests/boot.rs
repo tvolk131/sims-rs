@@ -403,7 +403,14 @@ fn the_player_selects_another_goth() {
             id != mortimer && data[32] == 0 && data[61] == family
         })
         .unwrap();
-    lot.select(other).unwrap();
+    // In strict mode deselecting Mortimer fails on his animator's refresh
+    // (0x58da12), which is not ported, and changes nothing.
+    let before = lot.world().hash();
+    let refused = lot.select(other).unwrap_err().to_string();
+    assert!(refused.contains("0x58da12"), "{refused}");
+    assert_eq!(lot.world().hash(), before);
+    // Play mode leaves the refresh out.
+    lot.select_play(other).unwrap();
     let world = lot.world();
     assert_eq!(world.selected(), Some(other));
     assert!(!world.objects[&mortimer].selected);
@@ -412,14 +419,14 @@ fn the_player_selects_another_goth() {
     assert_eq!(world.objects[&other].slots[2].object, first as i16);
     assert_eq!(world.objects[&mortimer].slots[2].object, 0);
     // Selecting him back gives the indicator back.
-    lot.select(mortimer).unwrap();
+    lot.select_play(mortimer).unwrap();
     assert_eq!(lot.world().selected(), Some(mortimer));
     assert_eq!(lot.world().objects[&first].data[2], mortimer as i16);
     // A selection that fails changes nothing.
     let before = lot.world().hash();
-    assert!(lot.select(first).is_err());
+    assert!(lot.select_play(first).is_err());
     assert_eq!(lot.world().hash(), before);
     for _ in 0..50 {
-        lot.step().unwrap();
+        assert!(lot.step_play().unwrap().errors.is_empty());
     }
 }

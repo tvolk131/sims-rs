@@ -52,6 +52,20 @@ fn unsupported(object: u16, what: &str) -> Fault {
     fault(object, Trap::Unsupported(what.into()))
 }
 
+/// What deselecting a Sim does about its animator's refresh (0x58da12
+/// with 0, from 0x446921), which is not ported: see
+/// [`Interpreter::select_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refresh {
+    /// Fail loudly, as for anything not ported: the default.
+    Fail,
+    /// Leave the refresh out, so the deselected Sim's animator, head and
+    /// person words do not move as the original's would. For play mode
+    /// only (`Lot::select_play`); a lot that did this is not one to
+    /// compare with the original.
+    Skip,
+}
+
 /// The selected Sim (0x4456e4): [`World::selected`].
 pub fn selected(world: &World) -> Option<u16> {
     world.selected()
@@ -189,13 +203,27 @@ impl Interpreter<'_> {
     ///
     /// After a load nobody is selected. The player selects a Sim from the
     /// interface (a portrait), between ticks.
+    ///
+    /// Deselecting a Sim while the lot has indicators refreshes its
+    /// animator, which is not ported, so that fails ([`Refresh::Fail`]).
     pub fn select(&self, world: &mut World, target: Option<u16>) -> Result<(), Fault> {
+        self.select_with(world, target, Refresh::Fail)
+    }
+
+    /// [`Interpreter::select`], with `refresh` saying what deselecting
+    /// does about the deselected Sim's animator refresh.
+    pub fn select_with(
+        &self,
+        world: &mut World,
+        target: Option<u16>,
+        refresh: Refresh,
+    ) -> Result<(), Fault> {
         let previous = selected(world);
         if previous == target {
             return Ok(());
         }
         if let Some(previous) = previous {
-            self.deselect(world, previous)?;
+            self.deselect(world, previous, refresh)?;
         }
         let Some(sim) = target else {
             return set_global(world, SELECTED, 0);
@@ -221,8 +249,19 @@ impl Interpreter<'_> {
     ///
     /// 1. The first indicator is taken off the lot (its virtual function
     ///    0x50 with 1, 0x4468fd), as `Interpreter::take_off` takes it.
-    /// 2. The second indicator is taken off the lot too (0x446be8).
-    /// 3. With the Superstar pack (bit 0x40 of the installed-expansions
+    /// 2. The person's animator is refreshed (its virtual function 0x54
+    ///    with 0, 0x446921, 0x58da12). With 0 the refresh always runs: it
+    ///    reads the clock again (virtual function 0x34), brings the skin
+    ///    up to date at that clock (0x5992b3), places the animator
+    ///    (virtual function 0x60), runs the head's step, measurement and
+    ///    restoration (0x590768, 0x5904d2, 0x590b27), which can count
+    ///    person word 45 down and write word 42, and redraws what the
+    ///    person carries in its slot 1. Between ticks the clock has moved
+    ///    on from the animator's, so this changes what the simulation
+    ///    reads. It is not ported: with [`Refresh::Fail`] it fails; with
+    ///    [`Refresh::Skip`] it is left out.
+    /// 3. The second indicator is taken off the lot too (0x446be8).
+    /// 4. With the Superstar pack (bit 0x40 of the installed-expansions
     ///    mask, application field +0x66, set on a Complete Collection
     ///    install and not modeled), a person whose word 81 is 10 or more
     ///    gets a star marker (0x446c15). That is not ported and fails,
@@ -230,10 +269,10 @@ impl Interpreter<'_> {
     ///    does.
     ///
     /// Not modeled, being presentation: the object is redrawn (0x434101
-    /// with 0, from the outermost object holding it) and the person's
-    /// graphic refreshed (0x44690a). A lot without indicators does
-    /// nothing more than take the mark off (0x44667f).
-    fn deselect(&self, world: &mut World, sim: u16) -> Result<(), Fault> {
+    /// with 0, from the outermost object holding it; that it writes
+    /// nothing the simulation reads is **unverified**). A lot without
+    /// indicators does nothing more than take the mark off (0x44667f).
+    fn deselect(&self, world: &mut World, sim: u16, refresh: Refresh) -> Result<(), Fault> {
         let object = world
             .objects
             .get_mut(&sim)
@@ -245,6 +284,14 @@ impl Interpreter<'_> {
         }
         if selected(world).is_none() {
             self.take_off(world, first, true)?;
+            if refresh == Refresh::Fail {
+                return Err(unsupported(
+                    sim,
+                    "deselecting a Sim refreshes its animator (0x58da12 with 0, from 0x446921), \
+                     which reads the clock again, updates the skin and steps the head; not \
+                     ported",
+                ));
+            }
         }
         if selected(world).is_none() && second != 0 {
             self.take_off(world, second, true)?;

@@ -500,8 +500,17 @@ impl Game {
     /// Selects the Sim `sim`, as a press on its portrait does
     /// (`Lot::select`, 0x445449), keeping the sounds that made. A menu
     /// listed for the Sim selected before is dropped.
+    ///
+    /// In strict mode selecting another Sim fails, as deselecting
+    /// refreshes the Sim's animator, which the simulation has not ported;
+    /// play mode leaves the refresh out (`Lot::select_play`).
     pub fn select(&mut self, sim: u16) {
-        match self.lot.select(sim) {
+        let selected = if self.play {
+            self.lot.select_play(sim)
+        } else {
+            self.lot.select(sim)
+        };
+        match selected {
             Ok(sounds) => self.keep_sounds(sounds),
             Err(e) => self.note = Some(format!("Person {sim} was not selected: {e}")),
         }

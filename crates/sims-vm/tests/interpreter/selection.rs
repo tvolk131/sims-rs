@@ -7,7 +7,7 @@ use crate::visits::{lot, stand};
 use sims_core::F32;
 use sims_formats::saved_objects::Slot;
 use sims_formats::tuning::{Constant, Constants};
-use sims_vm::{Asked, INDICATORS, Interpreter, Trap, selected};
+use sims_vm::{Asked, INDICATORS, Interpreter, Refresh, Trap, selected};
 use std::cell::RefCell;
 
 /// The person the tests add, and the tile it stands on, inside the
@@ -132,16 +132,49 @@ fn selecting_a_sim_marks_it_and_puts_the_indicator_in_its_slot() {
     assert_eq!(fx.world.hash(), before);
 }
 
-#[test]
-fn selecting_another_sim_deselects_the_first() {
+/// The lot with two residents, the indicators made and the first
+/// resident selected.
+fn two_residents() -> Fixture {
     let mut fx = lot_with_person();
     resident(&mut fx, PERSON + 1, [4, 4]);
     asking(&mut fx, |i, world| i.announce_house(world).unwrap());
-    let [first, second] = fx.world.indicators;
     asking(&mut fx, |i, world| i.select(world, Some(PERSON)).unwrap());
+    fx
+}
+
+#[test]
+fn deselecting_fails_on_the_animators_refresh() {
+    // Deselecting refreshes the Sim's animator (0x58da12 with 0), which
+    // is not ported.
+    let mut fx = two_residents();
+    let (result, _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON + 1)));
+    assert!(unsupported(result).contains("0x58da12"));
+    let mut fx = two_residents();
+    let (result, _) = asking(&mut fx, |i, world| i.select(world, None));
+    assert!(unsupported(result).contains("0x58da12"));
+}
+
+#[test]
+fn selecting_another_sim_deselects_the_first() {
+    let mut fx = two_residents();
+    let [first, second] = fx.world.indicators;
+    // Play mode leaves the refresh out: the deselected Sim's person words
+    // stay as they were, where the original's head step may move words 45
+    // and 42.
+    let words = fx.world.objects[&PERSON]
+        .person
+        .as_ref()
+        .unwrap()
+        .data
+        .clone();
     let ((), calls) = asking(&mut fx, |i, world| {
-        i.select(world, Some(PERSON + 1)).unwrap()
+        i.select_with(world, Some(PERSON + 1), Refresh::Skip)
+            .unwrap()
     });
+    assert_eq!(
+        fx.world.objects[&PERSON].person.as_ref().unwrap().data,
+        words
+    );
     // With nobody selected, both indicators are taken off the lot
     // (0x4468fd, 0x446be8), each twice as an indicator is: the first
     // leaves the Sim's slot, which tells the Sim. Then the new Sim is
@@ -171,7 +204,9 @@ fn selecting_another_sim_deselects_the_first() {
     assert_eq!(fx.world.objects[&first].data[2], (PERSON + 1) as i16);
     assert_eq!(fx.world.objects[&second].position, [-16, -16, 1]);
     // Selecting nobody deselects and announces 0.
-    let ((), _) = asking(&mut fx, |i, world| i.select(world, None).unwrap());
+    let ((), _) = asking(&mut fx, |i, world| {
+        i.select_with(world, None, Refresh::Skip).unwrap()
+    });
     assert_eq!(selected(&fx.world), None);
     assert_eq!(fx.world.globals[3], 0);
     assert_eq!(fx.world.objects[&(PERSON + 1)].slots[2].object, 0);
@@ -182,20 +217,21 @@ fn selecting_another_sim_deselects_the_first() {
 #[test]
 fn a_sim_deselected_with_fame_fails() {
     // Person word 81 at 10 or more takes a star marker (0x446c15).
-    let mut fx = lot_with_person();
-    resident(&mut fx, PERSON + 1, [4, 4]);
-    asking(&mut fx, |i, world| i.announce_house(world).unwrap());
-    asking(&mut fx, |i, world| i.select(world, Some(PERSON)).unwrap());
+    let mut fx = two_residents();
     let sim = fx.world.objects.get_mut(&PERSON).unwrap();
     sim.person.as_mut().unwrap().data[81] = 10;
-    let (result, _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON + 1)));
+    let (result, _) = asking(&mut fx, |i, world| {
+        i.select_with(world, Some(PERSON + 1), Refresh::Skip)
+    });
     assert!(unsupported(result).contains("word 81"));
     // A Sim that is not a person still cannot be selected, after the
     // deselection.
     let mut fx = lot_with_person();
     asking(&mut fx, |i, world| i.announce_house(world).unwrap());
     asking(&mut fx, |i, world| i.select(world, Some(PERSON)).unwrap());
-    let (result, _) = asking(&mut fx, |i, world| i.select(world, Some(LAMP)));
+    let (result, _) = asking(&mut fx, |i, world| {
+        i.select_with(world, Some(LAMP), Refresh::Skip)
+    });
     assert!(matches!(result.unwrap_err().trap, Trap::Invalid(_)));
 }
 

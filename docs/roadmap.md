@@ -2103,10 +2103,13 @@ through their public interfaces only; the simulation never depends on it.
   without an order; play mode goes on, through caught errors (Snap to a
   place where the object does not fit, 0x454e09; Create New Object
   Instance mode 6 with flags 0x4; scopes 34 and 24).
-- **Done: selecting a Sim.** A press on a portrait selects that Sim
-  (`Lot::select`, 0x445449, between ticks): the Sim selected before is
+- **Done in play mode: selecting a Sim.** A press on a portrait selects
+  that Sim (0x445449, between ticks): the Sim selected before is
   deselected, the indicators move, and the panel and the pie menus
-  follow the new Sim.
+  follow the new Sim. Deselecting refreshes the old Sim's animator
+  (0x58da12), which is not ported, so in strict mode (`Lot::select`)
+  switching Sims fails and changes nothing; play mode
+  (`Lot::select_play`) leaves the refresh out.
 - **Next:** a real pie.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
@@ -2125,6 +2128,8 @@ through their public interfaces only; the simulation never depends on it.
   - `sims-people`: which person drew each pixel (`draw_on_lot` with an
     owner per pixel), so `sims-game` need not repeat its drawing loop
     to find the person a click lands on.
+  - `sims-vm`: the animator's refresh (0x58da12), which deselecting a
+    Sim makes, so strict mode can switch Sims.
   - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
     and dialogs are. `sims-game` draws a plain list until then.
   - `sims-audio`: the inputs the game cannot give yet: the camera value
