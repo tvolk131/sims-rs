@@ -59,6 +59,11 @@ events, and what it asks for after them) come first.
 - Strict mode on the Goth house runs to tick 2702. At tick 2703 the
   carpool (object 8) makes the school bus, and the factory for
   multi-tile objects is not ported. Step 2 starts there.
+- Of the base neighborhood's houses only the Goths' and the Newbies'
+  (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
+  tick 562, with no recording to compare yet; at tick 563 a head's pose
+  blends a base clip under the foreground (0x5992b3), which is not
+  ported.
 
 ## Met goal: a headless lot boot that matches the original
 

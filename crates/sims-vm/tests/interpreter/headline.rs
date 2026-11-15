@@ -214,11 +214,11 @@ fn option_bit_12_adds_my_temp_0_to_the_index() {
 
 #[test]
 fn what_is_not_ported_fails() {
-    // A catalog picture.
+    // A neighbor's catalog picture (kind 7, mode 1).
     let mut fx = fixture();
-    let fault = run(&mut fx, SIM, 0, icon(false, 7, 0, 10, 0)).unwrap_err();
+    let fault = run(&mut fx, SIM, 0, icon(false, 7, 1, 10, 0)).unwrap_err();
     assert!(
-        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x44b811")),
+        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x44b862")),
         "{fault}"
     );
     // Sprites that were not read.
@@ -238,6 +238,93 @@ fn what_is_not_ported_fails() {
         matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x4c8deb")),
         "{fault}"
     );
+}
+
+#[test]
+fn a_catalog_picture_of_the_stack_object_has_one_frame() {
+    // Kind 7, mode 0: no sprite is needed, and the frame count is 1.
+    let mut fx = Fixture::new();
+    assert_eq!(
+        run(&mut fx, SIM, LAMP as i16, icon(false, 7, 0, 10, 0)),
+        Ok(true)
+    );
+    assert_eq!(fx.world.headlines, BTreeMap::from([(SIM, shown(1, 10))]));
+    // Option bit 11 counts loops of one frame: 12 ticks each.
+    assert_eq!(
+        run(&mut fx, SIM, LAMP as i16, icon(false, 7, 0, 5, 0x800)),
+        Ok(true)
+    );
+    assert_eq!(fx.world.headlines[&SIM], shown(1, 60));
+    // -1 stays as it is.
+    assert_eq!(
+        run(&mut fx, SIM, LAMP as i16, icon(false, 7, 0, -1, 0x800)),
+        Ok(true)
+    );
+    assert_eq!(fx.world.headlines[&SIM], shown(1, -1));
+}
+
+#[test]
+fn a_catalog_picture_of_nothing_on_the_lot_shows_nothing() {
+    let mut fx = Fixture::new();
+    for stack in [0, -1, 999] {
+        assert_eq!(run(&mut fx, SIM, stack, icon(false, 7, 0, 10, 0)), Ok(true));
+    }
+    assert!(fx.world.headlines.is_empty());
+    // Any mode above 2 shows nothing either; the mode is byte 2 without
+    // the temp that option bit 12 adds.
+    assert_eq!(
+        run(&mut fx, SIM, LAMP as i16, icon(false, 7, 3, 10, 0)),
+        Ok(true)
+    );
+    fx.sim_mut().temps[0] = 2;
+    assert_eq!(
+        run(&mut fx, SIM, LAMP as i16, icon(false, 7, 0, 10, 0x1000)),
+        Ok(true)
+    );
+    assert_eq!(fx.world.headlines, BTreeMap::from([(SIM, shown(1, 10))]));
+    // Still showing, a headline of the same priority keeps its priority
+    // when the picture is not found.
+    assert_eq!(run(&mut fx, SIM, 999, icon(false, 7, 0, 20, 0)), Ok(true));
+    assert_eq!(fx.world.headlines[&SIM], shown(1, 10));
+}
+
+/// Runs Set Balloon/Headline as the Sim's tree 4096, after an Expression
+/// that sets local `local` to `value`.
+fn run_with_local(
+    fx: &mut Fixture,
+    local: u8,
+    value: i16,
+    operands: [u8; 8],
+) -> Result<bool, sims_vm::Fault> {
+    fx.add(
+        SIM_FILE,
+        4096,
+        tree(vec![
+            assign(scope::LOCALS, i16::from(local), scope::LITERAL, value, 1),
+            ins(HEADLINE, RETURN_TRUE, RETURN_FALSE, operands),
+        ]),
+    );
+    fx.run_with(SIM, 4096, 0, &[], 100)
+}
+
+#[test]
+fn a_catalog_picture_of_a_locals_object() {
+    // Kind 7, mode 2: the local is operand word 0 shifted right by one;
+    // bit 0 still picks the object the headline is on.
+    let mut fx = Fixture::new();
+    let mut operands = icon(false, 7, 2, 10, 0);
+    operands[0] = 3 << 1;
+    assert_eq!(run_with_local(&mut fx, 3, LAMP as i16, operands), Ok(true));
+    assert_eq!(fx.world.headlines, BTreeMap::from([(SIM, shown(1, 10))]));
+    // A local naming nothing on the lot shows nothing.
+    let mut fx = Fixture::new();
+    assert_eq!(run_with_local(&mut fx, 3, 999, operands), Ok(true));
+    assert!(fx.world.headlines.is_empty());
+    // A local past the frame's four: native error 0x33.
+    let mut fx = Fixture::new();
+    operands[0] = 4 << 1;
+    let fault = run_with_local(&mut fx, 3, LAMP as i16, operands).unwrap_err();
+    assert_eq!(fault.trap.code(), Some(0x33), "{fault}");
 }
 
 #[test]

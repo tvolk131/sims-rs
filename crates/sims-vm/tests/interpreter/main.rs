@@ -8,6 +8,7 @@ mod budget;
 mod calls;
 mod change_suit;
 mod create;
+mod debug;
 mod deletion;
 mod expression;
 mod factory;

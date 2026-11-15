@@ -25,9 +25,12 @@
 //! 1. With person word 41 not 0, the object it names is looked up
 //!    (0x40743b). One that is missing clears word 41 and sets word 42 to
 //!    0x10. For a person, the target becomes the point on top of its head
-//!    (0x59293d with 1, its +0x144 anchor). For any other object the
-//!    target is the middle of its tile (0x454f5c), which is not ported.
-//!    Then a target on another level than the person (object +0x110)
+//!    (0x59293d with 1, its +0x144 anchor). For any other object (its
+//!    type, +0x118 +0x12, not 2) the target is its position in world
+//!    units at height 0 (0x59058f: 0x454f5c on +0xf4 and +0xf8, our
+//!    second and first coordinates, with level 0.0): the first
+//!    coordinate 3/16 of its second, the third 3/16 of its first, each
+//!    rounded to single precision ([`to_world_units`]). Then a target on another level than the person (object +0x110)
 //!    clears word 41 and sets word 42 to 0x10.
 //! 2. The head's heading: from the point on top of the head to the point
 //!    100 units in front of it ([`sims_sim::head::heading`]).
@@ -58,6 +61,7 @@
 
 use crate::fault::Trap;
 use crate::interpreter::Interpreter;
+use crate::routing::slot::to_world_units;
 use sims_core::{Ext, F32};
 use sims_sim::World;
 use sims_sim::animator::{Animator, Base};
@@ -163,23 +167,21 @@ impl Interpreter<'_> {
                     set(data, HEAD_MODE, 0x10)?;
                 }
                 Some((t, object)) => {
+                    let level = World::tile(object.position)[2];
                     if object.person.is_none() {
-                        return Err(unsupported(
-                            "0x454f5c",
-                            &format!(
-                                "person {id} looks at object {t}, which is not a person: the \
-                                 target is the middle of its tile"
-                            ),
-                        ));
-                    }
-                    if t == id {
+                        // 0x59058f to 0x5905d0.
+                        let [first, second, _] = object.position;
+                        a.head.target = Some([
+                            to_world_units(Ext::from_i32(second)).to_f32(),
+                            F32::ZERO,
+                            to_world_units(Ext::from_i32(first)).to_f32(),
+                        ]);
+                    } else if t == id {
                         return Err(Trap::Unsupported(format!(
                             "person {id} looks at itself (0x59293d on its own animator, with \
                              its head turned): not ported"
                         )));
-                    }
-                    let level = World::tile(object.position)[2];
-                    if let Some(point) = self.top_of(world, t)? {
+                    } else if let Some(point) = self.top_of(world, t)? {
                         a.head.target = Some(point);
                     }
                     let own = world

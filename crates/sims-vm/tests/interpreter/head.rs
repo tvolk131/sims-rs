@@ -256,3 +256,33 @@ fn a_head_looking_at_a_person_queued_for_removal_fails_loudly() {
         "{fault}"
     );
 }
+
+#[test]
+fn a_head_looking_at_an_object_aims_at_its_position_at_height_0() {
+    // 0x59058f: the object's +0xf4 and +0xf8 (our second and first
+    // coordinates) in world units, 3/16 of each, at height 0.
+    let mut fx = anchored(Some("Top"));
+    fx.lamp_mut().position = [33, 48, 1];
+    fx.sim_mut().person.as_mut().unwrap().data[41] = LAMP as i16;
+    let vm = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    vm.draw_frame(&mut fx.world, 1).unwrap();
+    assert_eq!(
+        fx.world.animators[&SIM].head.target,
+        Some([F32::from_f32(9.0), F32::ZERO, F32::from_f32(6.1875)])
+    );
+    let data = &fx.sim().person.as_ref().unwrap().data;
+    assert_eq!(data[41..43], [LAMP as i16, 1]);
+
+    // On another level the target is still written, then forgotten.
+    let mut fx = anchored(Some("Top"));
+    fx.lamp_mut().position = [33, 48, 2];
+    fx.sim_mut().person.as_mut().unwrap().data[41] = LAMP as i16;
+    let vm = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    vm.draw_frame(&mut fx.world, 1).unwrap();
+    assert_eq!(
+        fx.world.animators[&SIM].head.target,
+        Some([F32::from_f32(9.0), F32::ZERO, F32::from_f32(6.1875)])
+    );
+    let data = &fx.sim().person.as_ref().unwrap().data;
+    assert_eq!(data[41..43], [0, 0x10]);
+}
