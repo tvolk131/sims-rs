@@ -60,8 +60,8 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 408 on the Goth house**: our
-  state after every one of ticks 1 to 408 equals the fourth capture of the
+  there, as three captures recorded). **K = 416 on the Goth house**: our
+  state after every one of ticks 1 to 416 equals the fourth capture of the
   original (full state after every update) in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
@@ -1381,12 +1381,34 @@ bind; that this matches the original's registry is not verified. The suit
 form and taking an accessory off are ported from the code but not
 reached.
 
-**Differs.** Tick 409: person 18's route plays "route waiting
-animation" (step 14), and person 18 looks at person 16 where the
-capture has it look at person 259 (person word 41 and the head's
-target). This is the first tick that differs, and it is silent: the
-route step it comes from was ported in "Ticks 367 to 367" but first
-runs here.
+**Differs.** Tick 409, until fixed in "Ticks 409 to 416".
+
+### Ticks 409 to 416
+
+**The person vector.** In tick 409 person 18's route plays "route
+waiting animation" (step 14). Its tree looks round the people in its
+room (Set To Next mode 1, then a draw for each), and the original looked
+at person 259 where ours looked at person 16. Set To Next walks the
+original's person vector (`0x44efb4`), not the list of objects, and
+person 259, made at run time, comes after the people the load read,
+where it heads the object list. The world now keeps that vector
+(`World::people`, snapshot format 20): the load's people in
+registration order, each person made since at the end, and a removed
+person out. Modes 1 and 12 walk it.
+
+**Compared with the original.** After every one of ticks 409 to 416 our
+state equals the fourth capture's in every field compared, with the
+same head exception. The two orders draw the same number of times, so
+the random streams agreed before the fix too; only the person looked at
+differed.
+
+**Not verified.** That a person made at run time joins the end of the
+vector is read from the draws in tick 409, not from the code that adds
+it, which was not found; nor is when in the making it joins. No capture
+page holds the vector.
+
+**Stops.** Tick 417: person 21 runs Find Best Object for Function
+(opcode 14), which is not ported.
 
 ## Track: drawing people (`crates/sims-people`)
 

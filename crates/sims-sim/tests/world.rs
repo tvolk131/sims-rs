@@ -70,6 +70,7 @@ fn world() -> World {
             days: vec![None, Some([1, 2, 3, 4, 5, 6, 7, 8]), None],
         },
         order: vec![5, 2],
+        people: vec![5],
         types: BTreeMap::from([(7, 0x1111), (8, 0x2222)]),
         objects: BTreeMap::from([(2, object(2, 0x1111)), (5, object(5, 0x2222))]),
         arrays: BTreeMap::from([(
@@ -353,7 +354,33 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "e4a24ddfd65d8ccb54cc45b7d6f6c49ef4f1b06413842308c1977c72e13cd064";
+const PINNED: &str = "cde80db397840aa1122cd14801bcaf618d6476626e4aea7b29310e569134fdc5";
+
+#[test]
+fn without_the_person_vector_the_encoding_is_format_19() {
+    // Snapshot format 20 added the person vector after the registration
+    // order.
+    assert_eq!(digest(&format_19_bytes(&world())), PINNED_19);
+}
+const PINNED_19: &str = "e4a24ddfd65d8ccb54cc45b7d6f6c49ef4f1b06413842308c1977c72e13cd064";
+
+/// The encoding of `world` as snapshot format 19 wrote it: without the
+/// person vector ([`World::people`]) that format 20 added after the
+/// registration order. The older formats' encodings start from this one.
+fn format_19_bytes(world: &World) -> Vec<u8> {
+    let marker = vec![0xbeef, 0xbeef, 0xbeef];
+    let blank = World {
+        people: marker.clone(),
+        ..world.clone()
+    };
+    splice(
+        &world.encode(),
+        &blank.encode(),
+        &postcard::to_allocvec(&world.people).unwrap(),
+        &postcard::to_allocvec(&marker).unwrap(),
+        &[],
+    )
+}
 
 #[test]
 fn without_the_action_and_the_slot_records_the_encoding_is_format_18() {
@@ -405,8 +432,8 @@ fn routing_18_bytes(routing: &sims_sim::route::Routing) -> Vec<u8> {
 /// person to move out of the way, and at the end of the routing the slot
 /// records objects hold in place of their type's. This writes the
 /// routing again without them, so a state pinned under format 18 can be
-/// shown to be the same state but for those fields. The older formats'
-/// encodings start from this one.
+/// shown to be the same state but for those fields. It starts from
+/// [`format_19_bytes`], and the older formats' encodings from this one.
 fn format_18_bytes(world: &World) -> Vec<u8> {
     // The routing is found where a marker routing stands in the same
     // lot's encoding: an empty routing's bytes can stand in many places.
@@ -419,8 +446,8 @@ fn format_18_bytes(world: &World) -> Vec<u8> {
         ..world.clone()
     };
     splice(
-        &world.encode(),
-        &blank.encode(),
+        &format_19_bytes(world),
+        &format_19_bytes(&blank),
         &postcard::to_allocvec(&world.routing).unwrap(),
         &postcard::to_allocvec(&marker).unwrap(),
         &routing_18_bytes(&world.routing),
@@ -848,6 +875,9 @@ fn encoding_round_trips_bit_for_bit() {
 #[test]
 fn any_field_change_changes_the_hash() {
     let base = world().hash();
+    let mut changed = world();
+    changed.people.push(2);
+    assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.dialogs.records[0].status = 5;
     assert_ne!(changed.hash(), base);

@@ -414,6 +414,28 @@ fn routing_18_bytes(routing: &sims_sim::route::Routing) -> Vec<u8> {
     bytes
 }
 
+/// A lot's encoding as snapshot format 19 wrote it. Format 20 added,
+/// after the registration order, the person vector
+/// ([`World::people`]). This writes the lot again without it, so a state
+/// pinned under format 19 can be shown to be the same state but for that
+/// field. The older formats' encodings start from this one.
+fn format_19_bytes(world: &World) -> Vec<u8> {
+    // A marker vector stands where the person vector does in the same
+    // lot's encoding, so the field is found in one place.
+    let marker = vec![0xbeef, 0xbeef, 0xbeef];
+    let blank = World {
+        people: marker.clone(),
+        ..world.clone()
+    };
+    splice(
+        &world.encode(),
+        &blank.encode(),
+        &postcard::to_allocvec(&world.people).unwrap(),
+        &postcard::to_allocvec(&marker).unwrap(),
+        &[],
+    )
+}
+
 /// A lot's encoding as snapshot format 18 wrote it. Format 19 added at
 /// the end of each route context the number of the action that asks a
 /// person to move out of the way, and at the end of the routing the slot
@@ -433,8 +455,8 @@ fn format_18_bytes(world: &World) -> Vec<u8> {
         ..world.clone()
     };
     splice(
-        &world.encode(),
-        &blank.encode(),
+        &format_19_bytes(world),
+        &format_19_bytes(&blank),
         &postcard::to_allocvec(&world.routing).unwrap(),
         &postcard::to_allocvec(&marker).unwrap(),
         &routing_18_bytes(&world.routing),
@@ -2065,14 +2087,16 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// 21 is in it. Step 6 of the route tries again, finds person 21 in the
 /// way (0x45ba28) and asks it to move (0x45bf2e, 0x45d20b), and step 14
 /// plays the asking tree. In tick 368 person 21 puts on a book
-/// (Change Suit/Accessory, opcode 6). Our state after each of ticks 1 to
-/// 408 equals the fourth capture (full state after every update), as
+/// (Change Suit/Accessory, opcode 6). In tick 409 person 18's route
+/// plays its waiting tree, which looks round the people in the person
+/// vector, where person 259 comes last. Our state after each of ticks 1
+/// to 416 equals the fourth capture (full state after every update), as
 /// compared outside this test, but for one field: person 16's head target
 /// height (+0x220) is one unit in the last place lower on some ticks from
-/// 335 on, for a reason that is **unknown** (the bones' pages are not
-/// captured). In tick 409 person 18's route plays its waiting tree, and
-/// person 18 looks at person 16 where the capture has it look at person
-/// 259: the first tick that differs, which this test does not run.
+/// 335 on (and its head turn a few units with it), for a reason that is
+/// **unknown** (the bones' pages are not captured). Tick 417 stops
+/// loudly: person 21 runs Find Best Object for Function (opcode 14),
+/// which is not ported.
 ///
 /// The first capture does not choose in tick 233: its one draw from the
 /// lot's stream in ticks 233 and 234 comes in tick 234, and after tick
@@ -2105,8 +2129,10 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// were kept, and still hold ([`format_17_bytes`]); the state after tick
 /// 333 is pinned again under format 18 (`TICK_333_18`), and so are the
 /// states after ticks 334 and 366; they still hold under format 19
-/// ([`format_18_bytes`]), which pins the states after ticks 367 and 408. The
-/// digests are of our own state, as built here.
+/// ([`format_18_bytes`]), which pinned the states after ticks 367 and
+/// 408. Those still hold under format 20 ([`format_19_bytes`]), which
+/// pins the state after tick 416. The digests are of our own state, as
+/// built here.
 #[test]
 fn the_goth_house_first_tick_matches_the_original() {
     const TICK_1_9: &str = "62fc28f5e7689d166791a620dbed066fb8a7d707ea79017fbadf0eed3da5c937";
@@ -2126,8 +2152,9 @@ fn the_goth_house_first_tick_matches_the_original() {
     const TICK_333_18: &str = "8c1e86596e70a9d320c14794e7483c4a8a9304c36236c0b1d4f3257f4d69af95";
     const TICK_334_18: &str = "85a315a4b435176ffe2e09ce08fb75880c792a0313743c94c21548f65653ef8b";
     const TICK_366_18: &str = "d9bcf685db4e2c1186715bf7a674c640bd8c4cbd6cbed374644c370b242667f0";
-    const TICK_367: &str = "0a9a7c29774c3b5cee673ab0bc94f319a95b72fb9787e282ec9cbedc9975e82a";
-    const TICK_408: &str = "7a9c943eba9536e011feafaf60b611e9d9accad6a0a50f8c13856dc72d4cb4d1";
+    const TICK_367_19: &str = "0a9a7c29774c3b5cee673ab0bc94f319a95b72fb9787e282ec9cbedc9975e82a";
+    const TICK_408_19: &str = "7a9c943eba9536e011feafaf60b611e9d9accad6a0a50f8c13856dc72d4cb4d1";
+    const TICK_416: &str = "37ff5756ac5cf26769da735eadb955be4f78f64381ea8b847963298b51f8320b";
     const USES_233: [(i16, i32); 2] = [(132, 5), (51, 8)];
     const TREES_233: [u16; 9] = [
         0x1000, 0x2001, 0x205b, 0x2029, 0x100e, 0x1014, 0x1012, 0x1009, 0x1010,
@@ -2579,7 +2606,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         let context = world.routing.routes[&18].contexts.last().unwrap();
         assert_eq!((context.objects[1], context.action), (21, 4));
         assert!(world.routing.slots.contains_key(&(260, 0)));
-        assert_eq!(digest(&world.encode()), TICK_367);
+        assert_eq!(digest(&format_19_bytes(world)), TICK_367_19);
         // Tick 368: person 21 takes a book from the bookcase (object 132),
         // whose tree puts on the accessory "suit-book101" (Change
         // Suit/Accessory, opcode 6). The capture shows one accessory on
@@ -2597,6 +2624,18 @@ fn the_goth_house_first_tick_matches_the_original() {
             }
         }
         assert_eq!(world.ticks, before.ticks + 408);
-        assert_eq!(digest(&world.encode()), TICK_408);
+        assert_eq!(digest(&format_19_bytes(world)), TICK_408_19);
+        // Person 259, made at run time, heads the registration list but
+        // ends the person vector.
+        assert_eq!(world.people, [21, 18, 16, 259]);
+        assert_eq!(world.order[1], 259);
+        // Tick 409: person 18's waiting tree looks round the people in the
+        // vector (Set To Next mode 1), and looks at person 259.
+        interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        assert_eq!(world.objects[&18].person.as_ref().unwrap().data[41], 259);
+        for _ in 410..=416 {
+            interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        }
+        assert_eq!(digest(&world.encode()), TICK_416);
     });
 }
