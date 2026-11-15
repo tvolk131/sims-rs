@@ -53,6 +53,85 @@ the original draws that half as flat grass (two tones, no blades); we
 draw the bladed grass. The dashed row along the porch's lower edge at
 near zoom is ours alone.
 
+## 2026-11-15: Drop is ported; a second order waits, and a press cancels either, in the window
+
+**Drop** (opcode 5, 0x454430, from the general table at 0x45246a) is
+ported from the original's code, as the inverse of Grab:
+1. The object in my first container slot (+0x130, its second record) is
+   looked up. Nothing there takes the false branch.
+2. The place is my position plus one tile's step in my facing (data
+   word 1; 0x42228a), on my level.
+3. The object's place test runs on the ground there (virtual function
+   0x54, no container). A refusal takes the false branch, and nothing
+   changes.
+4. The object is put there with the lot told (virtual function 0x58),
+   and the true branch is taken.
+
+- **Verified (Goth tests, play mode):**
+  - The snack order, cancelled at step 900 while Mortimer eats
+    (`a_cancelled_snack_is_put_down_in_front_of_the_eater`). His tree
+    0x0139 (node 14) drops the snack at step 1009. He stands at (296,
+    456) facing 6, and it goes to (296, 440). At step 1028 the
+    cancelled action ends, and he is free. No error is caught.
+  - Through the window
+    (`a_second_order_waits_behind_the_first_and_a_press_cancels_either`):
+    - The snack, then Water on plant 162: the water queues behind, its
+      icon second, at x 82.
+    - A press on the water's icon takes it off. The snack goes on to its
+      end at step 1136.
+    - A press on the snack's icon at step 899 (his sixth action, eating)
+      cancels it. With the water queued, the cancel queues nothing of
+      its own (0x45d7c0). He drops the snack at step 1009, and starts
+      the water at step 1028.
+  - A cancel at step 825, as he walks away from the fridge with the
+    snack, stops at the unported route stop below
+    (`a_snack_cancelled_on_the_way_to_the_chair_stops_at_the_unported_route_stop`,
+    a known gap pinned so it is not mistaken for fixed).
+- **A manual sweep, not a test:** the snack order cancelled at each
+  step from 150 to 1136 (every tenth step, then every step near each
+  edge), run 400 steps on. Cancels at steps 150 to 536, 543 to 590 and
+  821 to 829 stop at 0x45b3eb; all the rest catch no error. Too slow to
+  keep as a test (a full lot run per step).
+- **Unverified:** no capture covers a Drop or a cancel. Which tree runs
+  Drop and when is the scripts' own; only the primitive is ported.
+- **Not ported (track 4):** cancelling while Mortimer walks, to the
+  fridge or away from it with the snack, stops his thread at a route
+  whose animator is still under way (0x45b3eb). Sol's review found the
+  walk away (step 825), which the first sweep had missed by sampling
+  steps 760 and 830.
+
+## 2026-11-15: A snack ordered in the window is the scripted snack order
+
+In play mode, the window's order path is the one the original takes:
+the pointer reaching the fridge lists its pie (`Lot::pie_menu`, which
+runs the check trees), a press opens it, and a press on Have A Snack
+queues the action the listing offered (`Lot::pick`). The scripted snack
+order (sims-vm's `the_snack_order_pays_for_the_snack`) queues the same
+action by menu number (`Lot::queue_interaction`) without listing first.
+
+- **Verified (a Goth test, `the_snack_ordered_in_the_window_is_the_scripted_order`):**
+  the action queued at step 51 is the same, field for field. From step
+  150, when Mortimer takes the order, the two lots hash the same at
+  every step through step 1136, when the snack ends. Play mode catches no
+  error. Mortimer pays 5 at step 820. The test also checks that the
+  chosen entry carries the action the check trees listed (not the
+  fallback's menu number), and that the lots differ at every step
+  before 150, so it fails if the window skips the listing (from Sol's
+  review, which found the test passed with the fridge forced onto the
+  fallback menu).
+- **The difference before step 150:** the listing's check trees run as
+  Mortimer. They leave his last result and his saved stack frame's
+  words, and nothing else (compared field by field at step 51). His
+  first tree at step 150 rewrites both. The original lists the menu
+  when the pointer reaches an object (0x48c834), so the window's lot is
+  the more faithful of the two. Whether the original's listing leaves
+  the same words in Mortimer's frame is **unverified**: no capture
+  covers a listing.
+- The test finds the fridge on screen without moving the pointer, since
+  each new object the pointer reaches lists a menu and changes the lot.
+  A player's pointer that crossed other objects first would list their
+  menus too.
+
 ## 2026-11-15: The piano plays where its object is, and a start sets a track's levels
 
 Kind 43 (`kPlayPiano`) is ported from the sound manager's case for it
