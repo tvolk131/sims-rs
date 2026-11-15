@@ -10,6 +10,9 @@ When the pointer first reaches an object or a person on the lot, the
 game lists the selected Sim's pie menu on it with `Lot::pie_menu`
 (0x48d392), as the original lists it then (0x48c834); the listing keeps
 what its check trees change, and its sounds are played with the steps'.
+An object reaching a pointer that stands still counts too: each frame
+drawn, the object under the pointer is looked up again. Nothing is
+listed over the panel, a dialog or a menu, or once the lot has stopped.
 A click opens that listing (or lists now, when the pointer did not move
 onto the object first). Only the entries whose check passes are shown,
 in the original's order, each named by the TTAs strings with the ID of
@@ -21,7 +24,10 @@ fridge's check tree adds an entry; an object offers nothing; a version 0
 table), the lot is unchanged, the menu shows every entry of the table
 without checks, debug entries hidden, queued by menu number
 (`Lot::queue_interaction`), and the note says why. Any other failure
-shows no menu.
+shows no menu. The simulation reports every fault of a check tree as
+unsupported and keeps the fault inside only as text, so for those the
+game reads the inner trap from the text: a check tree taking its error
+branch or running out of instructions shows no menu.
 
 This runs menu checks on the shared simulation, where
 `docs/vision.md` ("Other rules") runs them on a throwaway copy per
@@ -191,8 +197,9 @@ unchanged by it.
 
 ## 2026-11-15: The game's pie menu is a list of the table's entries until the simulation offers them
 
-Superseded by "The game's pie menu is the simulation's listing, on a
-copy of the lot" above, except where the simulation cannot list a menu.
+Superseded by "The game lists the pie menu on the lot when the pointer
+reaches an object" above, except where the simulation cannot list a
+menu.
 
 Clicking an object (or a person) in `sims-game` lists the entries of
 the interaction table `Lot::queue_interaction` queues from: that of the

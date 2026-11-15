@@ -95,6 +95,8 @@ pub struct Game {
     sounds: VecDeque<SoundEvent>,
     /// A short message about the last press, until the next one.
     note: Option<String>,
+    /// Where the pointer is on the canvas, while it is over the window.
+    pointer: Option<[i32; 2]>,
     /// The object the pointer last reached on the lot, if it is still on
     /// it.
     reached: Option<u16>,
@@ -135,6 +137,7 @@ impl Game {
             stopped,
             errors: Errors::default(),
             sounds: VecDeque::new(),
+            pointer: None,
             reached: None,
             listed: None,
             note: None,
@@ -264,8 +267,20 @@ impl Game {
         }
     }
 
-    /// Draws the frame: the lot, its people, then the panel.
+    /// Draws the frame: the lot, its people, then the panel. When the
+    /// frame shows a new object under the pointer (the object moved, or
+    /// the view did), its pie menu is listed, as when the pointer moves
+    /// onto it, and the frame drawn again if the listing changed the lot.
     pub fn render(&mut self) -> &Canvas {
+        self.draw();
+        if self.follow() {
+            self.draw();
+        }
+        &self.canvas
+    }
+
+    /// Draws the frame.
+    fn draw(&mut self) {
         let [w, h] = self.view.size.map(|n| n.max(1) as usize);
         if (self.canvas.width, self.canvas.height) != (w, h) {
             self.canvas = Canvas::new(w, h, [0, 0, 0]);
@@ -294,7 +309,6 @@ impl Game {
             status.as_deref(),
             &mut self.canvas,
         );
-        &self.canvas
     }
 
     /// The canvas last drawn.
@@ -325,19 +339,9 @@ impl Game {
     /// the lot, the selected Sim's pie menu on it is listed, as the
     /// original lists it then (0x48c834); listing changes the lot.
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
+        self.pointer = Some(point);
         let mut redraw = self.hud.hover(point);
-        let under = if self.hud.covers(point) {
-            None
-        } else {
-            self.under(point)
-        };
-        if under != self.reached {
-            self.reached = under;
-            self.listed = None;
-            if let Some(object) = under {
-                self.list(object);
-            }
-        }
+        redraw |= self.follow();
         // The cutaway follows the rooms the pointer passes over, while
         // the cutaway is on and the pointer is over the lot.
         if !self.hud.covers(point) && self.view.camera.walls == Walls::Cutaway {
@@ -372,8 +376,41 @@ impl Game {
         Outcome::redraw()
     }
 
-    /// The person or object shown at `point` on the lot.
-    fn under(&self, point: [i32; 2]) -> Option<u16> {
+    /// The pointer left the window: it is on no object.
+    pub fn leave(&mut self) {
+        self.pointer = None;
+        self.follow();
+    }
+
+    /// Follows the object under the pointer in the frame last drawn: when
+    /// it changes to an object, lists the selected Sim's pie menu on it.
+    /// Nothing is listed while the pointer is over the panel, a dialog or
+    /// a menu, or once the lot has stopped. True if a listing may have
+    /// changed the lot.
+    fn follow(&mut self) -> bool {
+        let under = match self.pointer {
+            Some(point) if self.stopped.is_none() && !self.hud.covers(point) => self.under(point),
+            _ => None,
+        };
+        if under == self.reached {
+            return false;
+        }
+        self.reached = under;
+        self.listed = None;
+        under.is_some_and(|object| self.list(object))
+    }
+
+    /// For whom and on what the pie menu was listed when the pointer
+    /// reached an object, until a click opens it or the pointer leaves.
+    pub fn listed(&self) -> Option<(u16, u16)> {
+        self.listed
+            .as_ref()
+            .map(|(person, object, _)| (*person, *object))
+    }
+
+    /// The person or object shown at `point` on the lot in the frame last
+    /// drawn.
+    pub fn under(&self, point: [i32; 2]) -> Option<u16> {
         let world = self.lot.world();
         self.people
             .at(world, point)
@@ -381,16 +418,19 @@ impl Game {
     }
 
     /// Lists the selected Sim's pie menu on `object` (`Lot::pie_menu`,
-    /// which changes the lot), keeping its sounds for the host.
-    fn list(&mut self, object: u16) {
+    /// which changes the lot), keeping its sounds for the host. True if
+    /// the simulation listed it, and so may have changed the lot.
+    fn list(&mut self, object: u16) -> bool {
         let Some(person) = self.lot.world().selected() else {
-            return;
+            return false;
         };
         let listing = menu::entries(&mut self.lot, &self.assets, person, object);
+        let changed = listing.as_ref().is_ok_and(|l| l.unchecked.is_none());
         if let Ok(listing) = &listing {
             self.keep_sounds(listing.sounds.clone());
         }
         self.listed = Some((person, object, listing));
+        changed
     }
 
     /// Opens the pie menu of `object` at `point` for the selected Sim:
@@ -398,6 +438,10 @@ impl Game {
     /// listed then (the pointer did not move onto it first), one listed
     /// now.
     fn open_menu(&mut self, object: u16, point: [i32; 2]) {
+        if self.stopped.is_some() {
+            self.note = Some("The lot has stopped, so it takes no orders.".into());
+            return;
+        }
         let Some(person) = self.lot.world().selected() else {
             self.note = Some("Nobody is selected to do anything.".into());
             return;

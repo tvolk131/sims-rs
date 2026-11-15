@@ -110,10 +110,35 @@ pub fn entries(
 /// Whether `trap` is something the simulation has not ported, rather
 /// than a failure of the script or a wrong caller.
 fn unported(trap: &Trap) -> bool {
-    matches!(
-        trap,
-        Trap::Unsupported(_) | Trap::UnsupportedScope { .. } | Trap::Unimplemented { .. }
-    )
+    match trap {
+        Trap::UnsupportedScope { .. } | Trap::Unimplemented { .. } => true,
+        Trap::Unsupported(message) => unported_message(message),
+        _ => false,
+    }
+}
+
+/// Whether an unsupported trap with `message` is something not ported.
+/// The simulation reports every fault of an entry's check tree as
+/// unsupported, whatever it was ("check tree 0x1012 of object 118:
+/// object 21, tree 0x1012 node 5: unsupported: ..."), and keeps the
+/// fault inside only as text; so for such a message, the trap at its end
+/// decides. A check tree that takes its error branch or runs out of
+/// instructions is not something unported.
+fn unported_message(message: &str) -> bool {
+    let Some(wrapped) = message.strip_prefix("check tree ") else {
+        return true;
+    };
+    // The check tree and its object, the fault's object and frame, and
+    // the fault's trap.
+    let Some(inner) = wrapped.splitn(3, ": ").nth(2) else {
+        return false;
+    };
+    match inner.strip_prefix("unsupported: ") {
+        Some(message) => unported_message(message),
+        None => {
+            inner.starts_with("unsupported scope ") || inner.starts_with("unimplemented primitive ")
+        }
+    }
 }
 
 /// The entries the simulation's pie menu offered, named.
@@ -480,6 +505,7 @@ impl Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sims_vm::Location;
 
     fn entry(menu: u32) -> Entry {
         Entry {
@@ -491,17 +517,43 @@ mod tests {
 
     #[test]
     fn only_what_is_not_ported_falls_back_to_every_entry() {
-        assert!(unported(&Trap::Unsupported("a pet's pie menu".into())));
-        assert!(unported(&Trap::UnsupportedScope { scope: 12 }));
-        assert!(unported(&Trap::Unimplemented { opcode: 0x50 }));
-        for trap in [
+        // A check tree's fault, as the simulation reports it: unsupported,
+        // with the fault inside as text.
+        let check = |trap: Trap, at: Option<Location>| {
+            let inner = sims_vm::Fault {
+                object: 21,
+                at,
+                trap,
+            };
+            Trap::Unsupported(format!("check tree 0x1012 of object 118: {inner}"))
+        };
+        let at = Some(Location {
+            tree: 0x1012,
+            node: 5,
+        });
+        let not_ported = [
+            Trap::Unsupported("a pet's pie menu".into()),
+            Trap::UnsupportedScope { scope: 12 },
+            Trap::Unimplemented { opcode: 0x50 },
+        ];
+        let failures = [
             Trap::ErrorBranch,
             Trap::BudgetExhausted { budget: 1 },
             Trap::Invalid("object 5 is not a person".into()),
             Trap::MissingTree { id: 0x1012 },
             Trap::StackOverflow,
-        ] {
+        ];
+        for trap in not_ported.clone() {
+            assert!(unported(&trap), "{trap:?}");
+            assert!(unported(&check(trap.clone(), at)), "{trap:?}");
+            assert!(unported(&check(trap.clone(), None)), "{trap:?}");
+            assert!(unported(&check(check(trap.clone(), at), at)), "{trap:?}");
+        }
+        for trap in failures {
             assert!(!unported(&trap), "{trap:?}");
+            assert!(!unported(&check(trap.clone(), at)), "{trap:?}");
+            assert!(!unported(&check(trap.clone(), None)), "{trap:?}");
+            assert!(!unported(&check(check(trap.clone(), at), at)), "{trap:?}");
         }
     }
 

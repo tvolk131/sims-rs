@@ -314,3 +314,44 @@ fn a_menu_for_someone_who_is_not_a_person_is_an_error() {
     assert!(listing.is_err(), "{listing:?}");
     assert_eq!(lot.world().hash(), before);
 }
+
+#[test]
+fn the_pointer_reaching_an_object_lists_its_menu_once_and_a_click_opens_it() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    game.render();
+    let person = game.lot().world().selected().expect("a Sim is selected");
+    // Points over objects on the lot, not over the panel.
+    let points: Vec<([i32; 2], u16)> = (0..600)
+        .step_by(6)
+        .flat_map(|y| (0..800).step_by(6).map(move |x| [x, y]))
+        .filter(|&p| !game.over_panel(p))
+        .filter_map(|p| game.under(p).map(|id| (p, id)))
+        .collect();
+    assert!(!points.is_empty());
+    let mut opened = false;
+    for (point, id) in points {
+        // Off every object, then onto this one: it is listed.
+        game.leave();
+        assert_eq!(game.listed(), None);
+        game.hover(point);
+        assert_eq!(game.listed(), Some((person, id)), "{point:?}");
+        // Moving on the same object lists nothing again.
+        let before = game.lot().world().hash();
+        game.hover(point);
+        assert_eq!(game.lot().world().hash(), before);
+        assert_eq!(game.listed(), Some((person, id)));
+        // A click opens the listing, when it offers anything.
+        game.press(point);
+        assert_eq!(game.listed(), None);
+        if game.close_menu() {
+            opened = true;
+            break;
+        }
+    }
+    assert!(opened, "no object's menu opened");
+}
