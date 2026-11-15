@@ -19,10 +19,16 @@ the Goths' lot the house sits six terrain steps up, 48 pixels at medium
 zoom, and the floor hid Bella completely while she played with the
 dollhouse upstairs (ticks 798 to 1872, 6:56 to 7:32 AM).
 
+Checked against a screenshot of the original at 7:29 AM (medium zoom,
+rotation 0, level 2, walls down, camera origin (335, −496)): Bella
+kneels at the dollhouse where we draw her at tick 1770, within a pixel
+or two, with the same rows hidden by the front wall's strip. So the
+view-table offset lifts a level by the floor height, at least at this
+zoom and rotation. The original draws her brighter; that is the room's
+light, not her place.
+
 The entry "People join the lot renderer's view through a depth hook"
-said such a person stands at the floor; this replaces that. How far
-the original's view-table offset lifts a level is **unverified**;
-reopen if it is read and differs from the floor height.
+said such a person stands at the floor; this replaces that.
 
 ## 2026-11-15: The plumb bob is the original's mesh, coloured and lit as the original does
 
