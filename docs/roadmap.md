@@ -51,6 +51,12 @@ events, and what it asks for after them) come first.
 ### Progress
 
 - Step 1 is done.
+- Step 4: the first player-order recording (track 2's goth-snack
+  scenario) replayed through the window's input layer equals the
+  original's state after every update to 453, once a press lists the
+  menu again and reaching an entry checks it again. From update 454 the
+  snack's simulation differs (the Room motive, then Mortimer's data
+  word 50): see the decisions log.
 - The integration hooks are merged: play mode (#120), player orders
   (#121), sound events (#122), Idle For Input starting a queued action
   (#131), the pie menu and picking from it (#132), and Go To Routing
