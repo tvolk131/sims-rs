@@ -445,4 +445,11 @@ fn a_feedback_tree_that_cannot_be_pushed_fails_loudly() {
         matches!(&fault, sims_vm::Trap::Unsupported(m) if m.contains("0x45afb2")),
         "{fault:?}"
     );
+    // Nothing was pushed and step 17 was not written: the original
+    // writes it only after the push (0x45afac, then 0x45b6ba and
+    // 0x45b9a0). The routing frame is on top, at the step it had saved.
+    let person = &fx.world.objects[&me];
+    let routing = person.stack.last().unwrap();
+    assert_eq!(routing.tree, TREE);
+    assert_eq!(routing.primitive_state, 4);
 }

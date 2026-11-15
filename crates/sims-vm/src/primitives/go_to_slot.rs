@@ -773,17 +773,26 @@ impl Machine<'_, '_> {
                     {
                         // 0x45af2a: the slot's object's "Route failure
                         // feedback" tree, with the result and word +0x8c
-                        // as its first two arguments. The step becomes 17
-                        // and person word 72 is cleared (0x45b6ba); the
-                        // context and the step are written before the
-                        // tree is pushed, as the frame changes with it.
+                        // as its first two arguments (0x45afac). Only
+                        // once it is pushed does the step become 17 and
+                        // person word 72 get cleared (0x45b6ba), and the
+                        // context get written (0x45b9a0), so a tree that
+                        // cannot be pushed leaves the route as it was.
+                        // The routing frame is now the one below the top.
                         let args = [ctx.result as i16, ctx.word_8c, 0, 0];
+                        self.give_feedback(object, tree, &args)?;
+                        self.set_person_word(WORD_72, 0)?;
                         ctx.word_58 = i32::from(retry as i16);
                         ctx.saved = spot;
                         self.store_route(&ctx, &path);
-                        self.set_person_word(WORD_72, 0)?;
-                        self.frame_mut()?.primitive_state = FEEDBACK;
-                        self.give_feedback(object, tree, &args)?;
+                        let stack = &mut self.me_mut()?.stack;
+                        let below = stack.len().checked_sub(2);
+                        below
+                            .and_then(|at| stack.get_mut(at))
+                            .ok_or_else(|| {
+                                Trap::Invalid("no routing frame below the feedback tree".into())
+                            })?
+                            .primitive_state = FEEDBACK;
                         return Ok(Flow::Pushed);
                     }
                 }

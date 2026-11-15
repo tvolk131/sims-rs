@@ -12,7 +12,8 @@ if it was 0, writes it to person word 62 and goes to step 7, which fails
 the primitive. Before that, when the slot says the route may end near it
 (flag 0x4000), it looks up the tree named `Route failure feedback`
 (0x6c457c) in the file of the frame's stack object (0x4021f2). If there
-is one, it pushes it through the stack object's vtable +0x34 (0x45e59b):
+is one, it pushes it through the person's vtable +0x34 (0x45e59b), with
+the stack object as an argument:
 the person is woken (0x44574b), the tree runs on the stack object with
 the arguments result, the context's word +0x8c, 0 and 0 (0x47484a), and
 the person starts using the stack object (a use record at +0xb00 and the
@@ -25,6 +26,9 @@ to step 7 at once, as before.
 - A push that fails, where the original goes on to step 7 (0x45afb2),
   is not ported and fails loudly; so does a feedback tree with more
   than four arguments, since 0x47484a would read past the four given.
+  Step 17, word 72 and the context are written only after the push, as
+  in the original (0x45afac, then 0x45b6ba and 0x45b9a0), so a push that
+  fails leaves the route as it was.
 
 - The frame's stack object must exist: 0x45af5b reads its definition
   without a check, so a missing one fails loudly here.
