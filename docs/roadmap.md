@@ -62,6 +62,11 @@ events, and what it asks for after them) come first.
   (the multi-tile factory is ported). At tick 2882 person 16's pose
   without a foreground layer (0x5992b3) is not ported. Step 2 continues
   from there.
+- Of the base neighborhood's houses only the Goths' and the Newbies'
+  (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
+  tick 562, with no recording to compare yet; at tick 563 a head's pose
+  blends a base clip under the foreground (0x5992b3), which is not
+  ported.
 
 ## Met goal: a headless lot boot that matches the original
 

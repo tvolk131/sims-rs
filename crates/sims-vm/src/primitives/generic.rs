@@ -27,6 +27,11 @@
 //!   data word 72 and clears word 73 (0x44fe72 to 0x44fe7d). When temp 0
 //!   is 0 its footprint is then worked out again where it stands
 //!   (0x433d16, through 0x43519f), with word 73 already clear.
+//! - 2 (0x44fb51): the stack object becomes the icon of the running
+//!   person's action (person +0xa54), if the person has a running action
+//!   (+0xa84 not 0). The stack object must be on the lot (native error
+//!   0xa otherwise, checked first: the lot's object table at +0x18 of the
+//!   person's lot, +0xdc), and the running object a person (error 0x1c).
 
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
@@ -63,6 +68,10 @@ impl Machine<'_, '_> {
                 }
                 Ok(true)
             }
+            2 => {
+                self.set_action_icon()?;
+                Ok(true)
+            }
             15 => {
                 self.copy_temp_to_person()?;
                 Ok(true)
@@ -75,6 +84,26 @@ impl Machine<'_, '_> {
                 "Generic Sims Call routine {routine}"
             ))),
         }
+    }
+}
+
+impl Machine<'_, '_> {
+    /// Routine 2 (0x44fb51 to 0x44fbd8).
+    fn set_action_icon(&mut self) -> Result<(), Trap> {
+        let stack_object = self.frame()?.stack_object;
+        if stack_object <= 0 || !self.world.objects.contains_key(&(stack_object as u16)) {
+            return Err(Trap::native(0xa, "the stack object is not on the lot"));
+        }
+        let action = &mut self
+            .me_mut()?
+            .person
+            .as_mut()
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .active;
+        if action.uid != 0 {
+            action.icon = stack_object;
+        }
+        Ok(())
     }
 }
 
