@@ -45,16 +45,33 @@ the exe.
   - the money format (the funds' is taken; the panel uses the same
     formatter, 0x6fe90c);
   - the text color (the labels' is taken);
-  - which lines of a title that wraps past its box show (here the ones
-    that fit, down to 45).
+  - where the font's range of characters starts and ends (0x60b898):
+    the original stops at a line that starts outside it; here only the
+    end of the text stops it.
+- **How a title wraps** (0x60b4a1, the font's wrapped text, and
+  0x60b620, which fits each line; `Font::break_lines`):
+  - a line is measured by its characters' advances, but the last
+    character counts its glyph's width;
+  - it ends after the last space or hyphen that fits, or after a line
+    break. With neither, it ends mid-word, one character before the
+    first that does not fit; a first character wider than the box
+    takes its whole word. The spaces after a break stay on its line;
+  - a line is drawn when its top is above the box's bottom (45), however
+    far down it reaches, so a 13-high font shows two lines (from 22 and
+    35). The wrapped text sets no clip of its own (0x60bf0c only locks
+    the surfaces), and the gadget is 22 and two lines high, so the
+    second line fits in it.
+  - "Counter-Intelligence" breaks after its hyphen, "Medical
+    Technician" after its space.
 - **The original reads titles for 11, 16 or 21 careers**, by the
   game's expansion level (0x403f53). Here every career gets them; the
   full install has 21.
 - **Tests:**
   - the levels, titles, children and missing careers;
   - the performance's names at their bounds;
-  - the column's places, by pixel;
-  - the Goths' column, with their digests pinned again.
+  - the column's places, by pixel, and the line breaks, in a test font;
+  - the Goths' column, with their digests pinned again, and a
+    hyphenated title in the game's font.
 
 ## 2026-11-15: The personality panel shows the sign of the zodiac
 

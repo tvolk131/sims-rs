@@ -975,10 +975,15 @@ fn draw_work(
         frame.draw(image, source, [x, y]);
     }
     let title = work.level.as_ref().map_or(UNEMPLOYED, |l| l.title.as_str());
-    let fit = usize::try_from((TITLE_BOTTOM - cell) / career.line_height.max(1)).unwrap_or(0);
-    for (n, line) in career.wrap(title, WORK_WIDTH).iter().take(fit).enumerate() {
-        let top = cell.saturating_add(career.line_height.saturating_mul(n as i32));
-        career.draw(frame, line, [x, y.saturating_add(top)], LABEL);
+    // A line shows when its top is above the box's bottom, as the
+    // original's wrapped text does (0x60b510), however far it reaches.
+    let mut top = cell;
+    for line in career.break_lines(title, WORK_WIDTH) {
+        if top >= TITLE_BOTTOM {
+            break;
+        }
+        career.draw(frame, &line, [x, y.saturating_add(top)], LABEL);
+        top = top.saturating_add(career.line_height.max(1));
     }
     y = y.saturating_add(cell.saturating_add(career.line_height.saturating_mul(2)));
 
@@ -2462,18 +2467,24 @@ mod tests {
         // A family with enough friends: none.
         assert_eq!(draw(&work, 5).pixel(at + 9, 54), Some([0; 3]));
         assert_eq!(draw(&work, 5).pixel(at, 44), Some(rating));
-        // A title wraps at 95: six lines of 16 `M`s, five of which fit
-        // the box down to 45.
+        // A title wraps at 95: seven lines of 16 `M`s, of which the six
+        // that start above the box's bottom (45) show.
         let word = "M".repeat(16);
-        work.level = Some(WorkLevel {
-            title: [word.as_str(); 6].join(" "),
-            salary: 0,
-        });
-        let frame = draw(&work, 5);
-        for n in 0..5 {
+        let mut title = |title: String| {
+            work.level = Some(WorkLevel { title, salary: 0 });
+            draw(&work, 5)
+        };
+        let frame = title([word.as_str(); 7].join(" "));
+        for n in 0..6 {
             assert_eq!(frame.pixel(40, 26 + 4 * n), Some(LABEL), "line {n}");
         }
-        assert_eq!(frame.pixel(40, 46), Some([0; 3]));
+        assert_eq!(frame.pixel(40, 50), Some([0; 3]));
+        // After a hyphen, and mid-word when a word is wider than the box.
+        let frame = title(format!("{word}-{word}"));
+        assert_eq!(frame.pixel(40, 30), Some(LABEL));
+        let frame = title("M".repeat(40));
+        assert_eq!(frame.pixel(3, 30), Some(LABEL));
+        assert_eq!(frame.pixel(98, 26), Some([0; 3]));
         // Rows the icons lack, school's -1 and past the 22, draw none.
         for icon in [-1, 22] {
             work.icon = icon;

@@ -231,6 +231,26 @@ fn the_goths_job_panel() {
         draw(&snapshot),
         "d0ad6b0746169b1864e3351448cef65a4d7d7f6b8cfd83263df7d255cf86dc6a"
     );
+    // Titles wider than the column break as the original's do: after a
+    // hyphen or a space, and both lines start above the box's bottom.
+    let font = opened.art.font(7).expect("the 7-point font");
+    assert_eq!(font.line_height, 13);
+    assert_eq!(
+        font.break_lines("Counter-Intelligence", 95),
+        ["Counter-", "Intelligence"]
+    );
+    assert_eq!(
+        font.break_lines("Medical Technician", 95),
+        ["Medical ", "Technician"]
+    );
+    let mut snapshot = opened.snapshot.clone();
+    if let Some(level) = &mut snapshot.residents[0].work.level {
+        level.title = "Counter-Intelligence".into();
+    }
+    assert_eq!(
+        draw(&snapshot),
+        "49147ac862b847e2f8c06ede08f7f98f45b3fba31a8600ac9489926dc2ff1716"
+    );
 }
 
 #[test]
