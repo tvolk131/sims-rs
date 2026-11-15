@@ -29,7 +29,7 @@
 //! and `prepare` (legacy/crates/sims-sim/src/native_turn.rs) port modes 1
 //! to 3; this port follows the original's code above.
 
-use crate::animator::stop_route;
+use crate::animator::ask_stop;
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine, word};
 
@@ -110,12 +110,7 @@ impl Machine<'_, '_> {
             result = 1;
         }
         if result != 2 {
-            let animator = self
-                .world
-                .animators
-                .get_mut(&me)
-                .ok_or_else(|| Trap::Invalid(format!("person {me} has no animator")))?;
-            if !stop_route(animator) {
+            if !ask_stop(self.world, me)? {
                 result = 2;
             }
         }

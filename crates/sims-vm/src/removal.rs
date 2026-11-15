@@ -404,6 +404,7 @@ impl Interpreter<'_> {
             world.animators.remove(&id);
             world.base_layers.remove(&id);
             world.translated_bones.remove(&id);
+            world.stops_asked.remove(&id);
             world.routing.routes.remove(&id);
             world.person_ticks.remove(&id);
             world

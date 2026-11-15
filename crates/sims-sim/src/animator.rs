@@ -286,10 +286,11 @@ impl Base {
 /// flags; the route start clears the first.
 ///
 /// The route start also writes +0x8c to +0x94, +0x18c and +0x284, and
-/// the turn +0x19c, +0x24, +0x28 and +0x290, all to 0. The walk sets
-/// +0x290 to 1, and only the end of a path for a person whose word 64 is
-/// set reads it (0x58ef8e), which is not ported. Nothing ported reads the
-/// others, and they are left out.
+/// the turn +0x19c, +0x24, +0x28 and +0x290, all to 0; +0x284 is kept
+/// apart ([`crate::World::stops_asked`]). The walk sets +0x290 to 1, and
+/// only a walk asked to stop for a person whose word 64 is set reads it
+/// (0x58ef8e), which is not ported. Nothing ported reads the others, and
+/// they are left out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Motion {
     /// +0x180: the index of the path point the animator is heading for.
@@ -802,7 +803,8 @@ impl Animator {
     ///   or -1 the destination becomes the unset position too (0x589e5d).
     ///   Its other writes (the segment -1, the timer of a stop 0, the
     ///   state 3) the reset makes anyway. For 1 or -1, a route under way,
-    ///   the stop only sets +0x284, which is not kept. It also sets +0x18c
+    ///   the stop only sets +0x284 ([`crate::World::stops_asked`]), which
+    ///   nothing reads before a route's start clears it. It also sets +0x18c
     ///   and global 0x6f6d68, which nothing ported reads.
     ///
     /// The speed, its target, the clocks, the pickup flag, the count of

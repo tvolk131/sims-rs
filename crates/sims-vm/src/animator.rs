@@ -1815,6 +1815,25 @@ impl Interpreter<'_> {
         }
         a.position[0] = x.to_f32();
         a.position[1] = y.to_f32();
+        // 0x58eeeb: a route under way that was asked to stop
+        // ([`ask_stop`]) stops here, unless its foreground clip may not be
+        // interrupted (layer +0x68 0): the route ends blocked (3, 0x58f682)
+        // and the update goes to its tail.
+        if world.stops_asked.contains(&id)
+            && a.arrival == 1
+            && a.foreground
+                .as_ref()
+                .is_none_or(|layer| layer.interruptible != 0)
+        {
+            if person_word(world, id, SPECIAL)? != 0 {
+                return Err(unsupported(
+                    "0x58ef2f",
+                    "stops its route where it was asked to, for a person whose word 64 is set",
+                ));
+            }
+            a.arrival = BLOCKED;
+            return Ok(false);
+        }
         Ok(true)
     }
 
@@ -2127,6 +2146,7 @@ impl Interpreter<'_> {
         let scale = (ONE.ext() * SCALE_UNIT.ext()).single().to_i32_truncate();
         set_datum(world, id, SCALE_WORD, scale as i16)?;
         a.arrival = 1;
+        world.stops_asked.remove(&id);
         a.motion.progress = F32::ZERO;
         a.motion.segment = 0;
         a.motion.near_end = 0;
@@ -2214,10 +2234,12 @@ fn end_turn(world: &mut World, id: u16, a: &mut Animator) -> Result<(), Trap> {
 
 /// The animator stops following its route (0x589e2d), as the route's
 /// steps 9 and 10 and its end ask. While the route is under way (its end,
-/// +0x188, is 1 or -1) nothing stops: +0x284 is set to 1, which nothing
-/// ported reads, and the answer is false. Otherwise the end becomes 0,
+/// +0x188, is 1 or -1) nothing stops: +0x284 is set to 1, the request
+/// [`ask_stop`] keeps, and the answer is false. Otherwise the end becomes 0,
 /// the segment -1, the destination the position, and the animator
 /// stands (state 3); the answer is true.
+///
+/// Callers on a lot use [`ask_stop`], which keeps the request.
 ///
 /// The timer of a stop at the end of a path (+0x1c0) becomes 0 too
 /// (0x589e56). The original also sets +0x18c to 1 and the global
@@ -2232,6 +2254,21 @@ pub(crate) fn stop_route(a: &mut Animator) -> bool {
     a.destination = a.position;
     a.state = 3;
     true
+}
+
+/// Person `id`'s animator stops following its route ([`stop_route`],
+/// 0x589e2d). A route under way does not stop, and the request is kept
+/// ([`World::stops_asked`], +0x284) for the walk's next step.
+pub(crate) fn ask_stop(world: &mut World, id: u16) -> Result<bool, Trap> {
+    let animator = world
+        .animators
+        .get_mut(&id)
+        .ok_or_else(|| Trap::Invalid(format!("person {id} has no animator")))?;
+    let stopped = stop_route(animator);
+    if !stopped {
+        world.stops_asked.insert(id);
+    }
+    Ok(stopped)
 }
 
 /// The start of a stop at the end of a path, with no timer set yet
