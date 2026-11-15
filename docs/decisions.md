@@ -75,6 +75,167 @@ tile of a group in the head slot fails (0x58dc08). Selection at a
 nonzero view rotation is not: it needs a loaded lot whose indicator
 trees read Generic Sims Call routine 12.
 
+## 2026-11-15: A lit lamp's pool reaches the walls beside it; grass takes none
+
+Straight walls now take lamp pools, from the wall tables in
+`lightMap.dat`, as the original's wall pass draws them (read from its
+code: 0x53db67 calling 0x4c79ca). A wall reads the lamp record of its
+tile in the view: the tile whose low-x edge (a wall along view y,
+direction 1) or low-y edge (along view x, direction 2) it stands on,
+which is the side the camera sees (0x4aed23). Each of the record's two
+lamps on that side of the wall (a view offset from the lamp to the tile
+of at most 0 across it) gives an offset along the wall and a distance
+out from it: for direction 1 `-dy` and `-dx`, for direction 2 `dx` and
+`-dy` (0x4c78c5). A lamp counts if the tables hold an image for it: a
+distance below 4 and an offset within `m - 1` of the middle, for the
+distance's `m` of 5, 5, 4 or 3 (0x4b5c98). The image is direction 1's
+table or direction 2's, at the zoom and distance, image `offset + m - 1`
+(0x4b5c0c, 0x4bb595). It has a wall face's shape, as wide as the wall
+sprite, and is read alongside the sprite with its read cursor starting
+`1 << zoom` rows (2, 4 or 8, zoom counted from 1; 0x4bb4a2) before the
+table, so its first row lies that many rows below the sprite's top and
+the rows above take no pool. Each wall pixel
+takes the drawn light byte plus each lamp's byte there, kept to 255, as
+a floor does (0x4b7630 for one lamp, 0x4b7420 for two), and a room in
+full light shows none. Diagonal walls take no pools (0x4c78c5 returns
+none for them).
+
+A corner's cap, the narrow slice of phantom wall face at an exposed wall
+end, takes pools the same way (the cap pass reads the lamps at 0x53ca0a
+and draws through the lit wall pass at 0x53ca41): the lamps of the tile
+on its own seen side, along its own line, in the light of the wall it
+takes its light from. Before, a lit wall's cap stayed in the room's
+light, a dark seam at the wall's end (found in review; a lone wall with a
+lamp beside it now lights its cap too).
+
+**Checked.** The images' face lines up with our wall sprites' opaque
+face exactly at all three zooms and both directions, with the first row
+as many rows below the sprite's top as read. Compared with the original at the tick-570
+world: far zoom at rotation 2 rose from 90.1% to 90.3% exact (non-green
+87.9% to 88.2%); of the 1,250 pixels the pools change, 869 now match
+exactly (1 did before) and the mean channel error fell from 26 to 1.1.
+At rotation 1, walls up, 80.3% to 80.5% non-green; of 463 pixels
+changed, 269 match (none did), mean error 16.8 to 1.7. Rotation 1 is
+where turning the lamp record the other way with the view (0x4aedc2)
+would show, so the turn is now checked for walls, and floors read the
+same record the same way. The remaining changed pixels are mostly a
+step off. Near and medium zoom show no lit wall and do not change.
+
+**Grass** takes no pools: the lamp record is read (0x4aed23) only by
+the floor draws (0x4adb48, 0x4af474), the wall pass's three wall calls
+and a debug text, not by the grass.
+
+**Not ported.** The wall blitter's second mode (0x4b780d, with
+0x4c4a77 for unlit walls), which a caller's argument selects; our walls
+draw by the first (0x4c4907). The original reads a record whose first
+lamp is empty as having none even if its second is set (0x4aec97 counts,
+then 0x4c78c5 reads from the first); ours never builds such a record.
+
+## 2026-11-15: The game's speed and pause are the simulation's globals
+
+The window paced the lot by itself: a tick every 50 ms at normal speed,
+a third and a tenth of that faster, and no ticks while paused. The
+simulation's globals were not touched. The original's code says
+otherwise, so the window now does what its buttons do. Read from the
+disassembly; none of it is checked against a run.
+
+- The speed buttons call the setter (`0x46d697`) with 760 (normal,
+  `0x4425a2`), 924 (fast, `0x46d264`) or 994 (ultra, `0x46d26a`). The
+  setter clamps the speed to 0 to 1000 and keeps it in global 16. While
+  global 18 is not negative, it keeps it there too. The time between
+  two lot updates is 172 − speed × 0.001 × 171 ms, plus 0.5 and
+  truncated (constants at `0x666a24`, `0x667720`, `0x66771c` and
+  `0x667270`). That is 42, 14 and 2 ms. `sims_sim::speed` ports this,
+  and `Lot::set_speed` takes it between ticks.
+- The idle loop (`0x46d9d6`) runs an update each time a period has
+  passed. The update (`0x46d345`) never reads the speed. The speed
+  reaches the simulation only as globals 16 and 18. What reads them
+  there was not looked for.
+- Pausing (`0x46d813`) sets global 17, and running again (`0x46d83a`)
+  clears it. The idle loop does not look at it, so a paused game goes
+  on updating the lot. Each pass is then a partial one (`0x46d553`,
+  already ported): only objects with scheduler flag 2 run,
+  and the clock stands. `Lot::pause` and `Lot::unpause` do this. The
+  window goes on stepping a paused lot. Strict mode on the Goths' house
+  runs 200 paused ticks, and its clock stands through them.
+- In live mode the speed buttons (`0x53a62a`, `0x53a6ad`, `0x53a728`)
+  also run a paused game again. They ask the interface for it
+  (`0x4cee4a`), which applies the speed first and then the unpause
+  (`0x4ce5cc`, `0x46d83a`). `Game::set_speed` does the two the other
+  way round. Both clear the same clocks with no tick between, so the
+  order makes no difference. A button for the speed the game already
+  has does not call the setter (`0x4ce588`), so the time owed carries
+  on. Sol's review found both.
+- **Unverified:**
+  - The pause is refused while a field of the interface
+    (`[0x6f2a58]+0x7c`) is not 0. Here it is never refused.
+  - The setter and running again restart the idle loop's clocks
+    (`+0xb8`, `+0xbc`), after which an update may be due at once. Here
+    the time owed starts again from 0.
+  - The original also caps how far it catches up (`0x4732de`). We keep
+    our cap of 20 ticks a call.
+  - Message 0xc2, which the setter and the pause send to the interface,
+    and its effect on the sounds, are not ported.
+- **Ported: the idle loop's own speed** (`World::idle_speed`, run by
+  `Lot::step` before every update, in strict and play mode).
+  - On a residential lot (`0x40745f`: zoning 1, `0x42b9e3`), before
+    its updates, the idle loop asks whether anyone holds the game to the
+    player's speed (`0x442f9b`, `World::speed_held`). A person in the
+    registry's list holds it when all of these are true:
+    - object data word 34 (`+0x8e`) is 0;
+    - person data word 65 (`+0x60e`) is at most 1;
+    - motive 11 (`+0x7b8`; motives start at `+0x78c`) is not below 0.0
+      (`0x45edc5`, against the 0.0 at `0x66657c`; a NaN counts as
+      below, as the x87 compare branches);
+    - person data word 32 (`+0x5cc`) is 0.
+  - While nobody holds it and global 18 is negative, the idle loop goes
+    to 1000 (`0x46d790`): the setter makes the speed 1000, then global
+    18 keeps the speed it was. While global 18 is not negative,
+    `0x46d790` does nothing (`0x46d795`). So a speed the player sets
+    meanwhile (the setter writes global 18 too) stands, not 1000.
+  - While someone holds it and global 18 is not negative, the idle loop
+    goes back (`0x46d7db`): the setter makes the speed global 18's,
+    then global 18 becomes -1.
+  - Both also restart the idle loop's clocks and send message 0x109 to
+    the interface (1 going to 1000, 0 going back). That is not ported.
+  - **Unverified:**
+    - What word 34, word 65 and motive 11 mean. They presumably mark a
+      Sim who is hidden (away at work or school) and one who is asleep.
+      The full Goth day will exercise this when the household leaves or
+      goes to bed.
+    - Whether the original's speed changes on the Goths' house in the
+      ticks we compare. The strict boot (House05, 1102 ticks) is
+      unchanged by the port, so through it someone always holds the
+      speed and global 18 stays -1.
+  - `Lot::step` runs it before every update. The original's idle loop
+    runs it on every pass, whether an update is due or not and paused
+    or not, so `Lot::idle_speed` runs it between ticks too, and the
+    window calls that on every pass of its own. A speed the player
+    picks after the switch to 1000 then stands, as in the original. The
+    check is idempotent: a second call in the same state does nothing.
+  - The window follows the simulation's speed: ticks are owed at the
+    period of global 16 (1 ms at 1000). Whenever the check calls the
+    setter, even for the speed the game already has (going back to it),
+    the time owed starts again and that pass runs no more ticks, as the
+    setter restarts the clocks. The original may run an update at once
+    then, if its second clock (`0x4732de`) is ready (`0x46da1b`); here
+    the next tick waits a period of the new speed (**unverified**,
+    window timing only). The panel's buttons still show the player's
+    choice.
+  - Sol's reviews found the guard that stood here before was wrong both
+    ways, and that the check has to run between ticks as well. It failed where `0x46d790` keeps global 18's speed. It missed
+    hidden and sleeping Sims, whose words it took to be unkept. Porting
+    the whole head of the idle loop replaced it.
+- Strict `sims boot` never calls the speed or pause hooks. The idle
+  loop's speed never changes on the Goths through tick 1102, so the
+  output is unchanged.
+- **With the dialogs (#171).** While a dialog waits for the player, the
+  window owes no time and does not run the idle loop's check: the lot
+  takes nothing between ticks then (`Lot::idle_speed` is refused, as
+  orders are). Once the dialog is answered, the time owed starts again.
+  Whether the original's idle loop sets its speed while a dialog is up
+  is **unverified**.
+
 ## 2026-11-15: The pie menu shows the Sim's head, drawn from in front
 
 The original renders the selected Sim's head live into the middle of the

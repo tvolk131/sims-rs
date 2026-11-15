@@ -588,6 +588,44 @@ fn strict_mode_runs_to_tick_3602_past_the_school_bus() {
 }
 
 #[test]
+fn a_paused_goth_house_goes_on_updating_with_its_clock_standing() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    // The house loads at normal speed, with no speed to go back to.
+    assert_eq!(lot.world().speed(), sims_sim::speed::NORMAL);
+    assert_eq!(lot.world().globals[18], -1);
+    for _ in 0..40 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.set_speed(924), Ok(14));
+    assert_eq!(lot.world().speed(), 924);
+    assert_eq!(lot.world().globals[18], -1);
+    assert_eq!(lot.pause(), Ok(true));
+    assert_eq!(lot.pause(), Ok(false));
+    let clock = |lot: &Lot| {
+        let g = &lot.world().globals;
+        (lot.world().ticks, g[0], g[5], g[6])
+    };
+    let before = clock(&lot);
+    for tick in 41..=240 {
+        let update = lot.step().unwrap();
+        assert!(!update.full, "tick {tick}");
+        assert_eq!(lot.ticks(), tick);
+    }
+    assert_eq!(clock(&lot), before);
+    assert_eq!(lot.unpause(), Ok(true));
+    for _ in 0..100 {
+        assert!(lot.step().unwrap().full);
+    }
+    assert_eq!(lot.world().ticks, before.0.wrapping_add(100));
+}
+
+#[test]
 fn the_player_answers_a_dialog_when_it_is_shown() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");

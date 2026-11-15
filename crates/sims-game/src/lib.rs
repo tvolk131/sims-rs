@@ -2,11 +2,12 @@
 //! its people and the live-mode interface, in one window.
 //!
 //! This crate joins the others through their public interfaces. It reads
-//! the simulation's state to draw it and changes it only by stepping the
-//! lot (`sims_vm::boot::Lot::step`); the simulation never depends on it.
+//! the simulation's state to draw it and changes it only through the
+//! lot's inputs (`sims_vm::boot::Lot`: stepping it, the player's orders,
+//! the speed and the pause); the simulation never depends on it.
 //!
 //! - [`game`]: the game without its window, so it is tested headless.
-//! - [`pace`]: the speed and pause, as ticks owed for the time passed.
+//! - [`pace`]: the speed, as ticks owed for the time passed.
 //! - [`view`]: the house view's camera.
 //! - [`people`]: the people drawn into the lot, behind what is in front
 //!   of them.
