@@ -96,7 +96,6 @@ the upper floor hides everyone below it, as it hides the rooms. How the
 original gives a person's mesh its depth is still **unverified**; reopen
 when a person behind furniture is compared with the original.
 
-
 ## 2026-11-15: Snap into a container slot, the base clips of postures 1 and 2, and K = 1000
 
 Snap into an object's container slot is ported, with the place test for
