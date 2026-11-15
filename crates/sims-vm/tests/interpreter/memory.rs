@@ -2,7 +2,8 @@
 //! The lamp runs; its stack object is the Sim.
 
 use crate::support::*;
-use sims_vm::{Fault, Trap};
+use sims_formats::career::Level;
+use sims_vm::{Career, Fault, Trap};
 
 const EQUAL: u8 = op::EQUAL;
 const ASSIGN: u8 = op::ASSIGN;
@@ -408,9 +409,101 @@ fn the_room_in_temp_0() {
     }
 }
 
+/// A level whose numbers count up from `base`, with `title` as its
+/// second string.
+fn level(base: i32, title: &str) -> Level {
+    Level {
+        values: std::array::from_fn(|i| base + i as i32),
+        strings: std::array::from_fn(|i| if i == 1 { title.into() } else { String::new() }),
+    }
+}
+
+/// Careers 4 (two levels) and -1 (one), my temps 0 and 1 naming the
+/// career and the level.
+fn jobs(career: i16, level_number: i16) -> Fixture {
+    let mut fx = Fixture::new();
+    fx.program.careers = Some(vec![
+        Career {
+            id: 4,
+            levels: vec![level(100, "Cadet"), level(0x1_0200, "")],
+        },
+        Career {
+            id: -1,
+            levels: vec![level(-50, "")],
+        },
+    ]);
+    fx.lamp_mut().temps[0] = career;
+    fx.lamp_mut().temps[1] = level_number;
+    fx
+}
+
+#[test]
+fn job_data_reads_the_levels_numbers_in_the_originals_order() {
+    let mut fx = jobs(4, 0);
+    // Field 0 is the number of levels, whatever the level.
+    assert!(reads(&mut fx, 33, 0, 2));
+    let fields = [
+        (1, 117),
+        (2, 100),
+        (11, 109),
+        (12, 118),
+        (13, 119),
+        (14, 110),
+        (20, 116),
+        (21, 120),
+        (22, 1),
+    ];
+    for (field, value) in fields {
+        assert!(reads(&mut fx, 33, field, value), "field {field}");
+    }
+    // The second level: numbers are cut to a word, and its second string
+    // is empty.
+    let mut fx = jobs(4, 1);
+    assert!(reads(&mut fx, 33, 2, 0x200));
+    assert!(reads(&mut fx, 33, 22, 0));
+    // It reads with no word pointer.
+    assert_eq!(code(write(&mut fx, 33, 2, 1)), Some(0x13));
+}
+
+#[test]
+fn career_minus_one_always_reads_its_first_level() {
+    let mut fx = jobs(-1, 5);
+    assert!(reads(&mut fx, 33, 2, -50));
+    assert!(reads(&mut fx, 33, 0, 1));
+}
+
+#[test]
+fn job_data_errors() {
+    // No such career.
+    assert_eq!(code(read(&mut jobs(3, 0), 33, 0)), Some(0x39));
+    // No such level, unless the field is 0.
+    for level in [2, -1] {
+        let mut fx = jobs(4, level);
+        assert_eq!(code(read(&mut fx, 33, 1)), Some(0x3a));
+        assert!(reads(&mut fx, 33, 0, 2));
+    }
+    // No such field.
+    for field in [23, -1] {
+        assert_eq!(code(read(&mut jobs(4, 0), 33, field)), Some(0x3a));
+    }
+}
+
+#[test]
+fn job_data_without_a_career_table_names_the_loader() {
+    // The fixture has no career table.
+    let fault = read(&mut Fixture::new(), 33, 0).unwrap_err();
+    let Trap::Unsupported(text) = &fault.trap else {
+        panic!("{fault}");
+    };
+    assert!(
+        text.contains("0x4531fb") && text.contains("0x4036e8"),
+        "{text}"
+    );
+}
+
 #[test]
 fn unsupported_scopes_name_themselves() {
-    for scope in [12, 24, 28, 29, 33, 34, 38] {
+    for scope in [12, 24, 28, 29, 34, 38] {
         let mut fx = Fixture::new();
         let fault = read(&mut fx, scope, 0).unwrap_err();
         assert_eq!(fault.trap, Trap::UnsupportedScope { scope });

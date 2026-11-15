@@ -11,7 +11,7 @@
 
 use crate::fault::Trap;
 use crate::interpreter::Machine;
-use crate::program::{DEFINITION_WORDS, Tree};
+use crate::program::{Career, DEFINITION_WORDS, Tree};
 use sims_core::{Ext, F32};
 use sims_formats::saved_objects::Frame;
 use sims_sim::{Object, World};
@@ -439,9 +439,34 @@ impl Machine<'_, '_> {
                 };
                 Cell::Advertisement(bounded(index, count, 0x1a)?, field)
             }
-            // Neighbor fields (24), jobs (33), neighborhood data (34) and
-            // scope 38 need state the simulation doesn't hold yet.
-            24 | 33 | 34 | 38 => {
+            // Job data (0x4531fb): a field of a level of the career my
+            // temp 0 names, the level being my temp 1 (0 for career -1);
+            // see [`job_field`]. Its value, with no word pointer. No such
+            // career is native error 0x39, and no such level or field
+            // 0x3a. Without the career table (see
+            // [`crate::Program::careers`]) it fails loudly.
+            33 => {
+                let careers = self.program.careers.as_ref().ok_or_else(|| {
+                    Trap::Unsupported(
+                        "job data (0x4531fb) with no career table: the install has no \
+                         work.iff, or has a Careers.txt, whose loader (0x4036e8) is not ported"
+                            .into(),
+                    )
+                })?;
+                let id = temp(0)?;
+                let career = careers
+                    .iter()
+                    .find(|career| career.id == i32::from(id))
+                    .ok_or(Trap::native(0x39, "job data names no career"))?;
+                let level = if id == -1 { 0 } else { temp(1)? };
+                Cell::Literal(
+                    job_field(career, level, index)
+                        .ok_or(Trap::native(0x3a, "job data names no level or field"))?,
+                )
+            }
+            // Neighbor fields (24), neighborhood data (34) and scope 38
+            // need state the simulation doesn't hold yet.
+            24 | 34 | 38 => {
                 return Err(unsupported(scope));
             }
             2 | 5 | 39..=255 => return Err(Trap::native(9, "invalid memory scope")),
@@ -612,6 +637,34 @@ impl Machine<'_, '_> {
         let (cell, _) = self.resolve(scope, index, false)?;
         self.value(cell)
     }
+}
+
+/// Field `index` of level `level` of a career, cut to a word (0x40362f),
+/// or None when there is no such level or field. Field 0 is the number of
+/// levels, whatever the level. The others read the level's numbers in
+/// the CARR chunk's order: field 1 is number 17, fields 2 to 11 numbers 0
+/// to 9, fields 12 and 13 numbers 18 and 19, fields 14 to 20 numbers 10
+/// to 16, and field 21 number 20. Field 22 is whether the level's second
+/// string (+0x284) is not empty: the original asks the string's first
+/// virtual function, which the old prototype took as its length
+/// (legacy/crates/sims-vm/src/memory.rs:421); unverified.
+fn job_field(career: &Career, level: i16, index: i16) -> Option<i16> {
+    if index == 0 {
+        return Some(career.levels.len() as i16);
+    }
+    let level = career.levels.get(usize::try_from(level).ok()?)?;
+    let numbers = &level.values;
+    let value = match index {
+        1 => numbers[17],
+        2..=11 => numbers[index as usize - 2],
+        12 => numbers[18],
+        13 => numbers[19],
+        14..=20 => numbers[index as usize - 4],
+        21 => numbers[20],
+        22 => i32::from(!level.strings[1].is_empty()),
+        _ => return None,
+    };
+    Some(value as i16)
 }
 
 fn object_mut(world: &mut World, id: u16) -> Result<&mut Object, Trap> {
