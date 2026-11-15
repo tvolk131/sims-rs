@@ -147,6 +147,12 @@ pub struct Program {
     /// (0x440d8b). [`Program::link`] leaves it 0, no pack installed, for
     /// the caller to fill.
     pub expansions: u16,
+    /// The GUIDs of the types registered from the neighborhood's
+    /// `Characters` folder, which the original registers with kind 1
+    /// (bits 2 and 3 of the type record's +0xb4, 0x424a8b, 0x43c228,
+    /// 0x43bd19). [`Program::link`] leaves it empty for the caller to
+    /// fill.
+    pub characters: BTreeSet<u32>,
 }
 
 impl Program {
@@ -167,6 +173,7 @@ impl Program {
             people: People::default(),
             icon_frames: None,
             expansions: 0,
+            characters: BTreeSet::new(),
         };
         program.load(index, catalog.global)?;
         for guid in guids {

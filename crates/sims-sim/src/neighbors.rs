@@ -554,6 +554,43 @@ impl World {
         count
     }
 
+    /// The friend count of the record `id` names (0x427148, from scope 24
+    /// field 5): while the record's count is out of date (+0x24) it is
+    /// worked out again and kept (+0x20); the reader does not mark it up
+    /// to date, so it is worked out again at every read until then. It
+    /// counts the other records, in slot order, whose type is one of
+    /// `characters` (the record's type, +8, registered with kind 1:
+    /// 0x423f30 reads bits 2 and 3 of its +0xb4; a record whose type has
+    /// no definition has none, and does not count), whose word 61 (the
+    /// family) is not 0, and that are friends both ways with it
+    /// ([`mutual_friends`], `threshold` being the autonomy tuning's
+    /// friendship threshold, 0x6c4398). None for no such record.
+    pub fn record_friends(
+        &mut self,
+        id: i16,
+        threshold: i32,
+        characters: &BTreeSet<u32>,
+    ) -> Option<i32> {
+        let record = self.neighbors.get(id)?;
+        if !record.stale {
+            return Some(record.friends);
+        }
+        let place = usize::try_from(id).ok()?.checked_sub(1)?;
+        let mut count = 0i32;
+        for (other_place, other) in self.neighbors.slots.iter().enumerate() {
+            let Some(other) = other else { continue };
+            if other_place == place || !characters.contains(&other.guid) || other.data[FAMILY] == 0
+            {
+                continue;
+            }
+            if mutual_friends(other, record, threshold) {
+                count = count.wrapping_add(1);
+            }
+        }
+        self.neighbors.get_mut(id)?.friends = count;
+        Some(count)
+    }
+
     /// What a write to a relationship marks out of date about one of its
     /// two records (0x4246b9): the record's own friend count, and the
     /// friend count of the first family whose ID is the record's word 61.
