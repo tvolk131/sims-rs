@@ -671,6 +671,134 @@ fn a_press_on_an_actions_icon_cancels_it() {
     assert_eq!(mortimer(&game).queue.len(), before.queue.len());
 }
 
+/// Play mode, through the window: the player orders a snack from the
+/// fridge's pie and then the plant's Water from its pie. The water waits
+/// behind the snack, its icon second. A press on the queued water's icon
+/// takes it off; a press on the snack's icon while Mortimer eats it
+/// cancels it, he puts the snack down (Drop, 0x454430) and goes to water
+/// the plant. No error is caught on the way.
+#[test]
+fn a_second_order_waits_behind_the_first_and_a_press_cancels_either() {
+    let Some(install) = install() else {
+        return;
+    };
+    let open = || {
+        let mut game = Game::open(&Options {
+            play: true,
+            ..options(install.clone())
+        })
+        .expect("the Goth house opens");
+        assert_eq!(game.run(50), 50);
+        game.resize([800, 600]);
+        game.render();
+        game
+    };
+    let (fridge, plant) = (118, 162);
+    let mut game = open();
+    let sim = game.lot().world().selected().expect("a Sim is selected");
+    order(&mut game, fridge, "Have A Snack");
+    order(&mut game, plant, "Water");
+    let mortimer = |game: &Game| game.lot().world().objects[&sim].person.clone().unwrap();
+    let orders: Vec<(i32, i16)> = mortimer(&game)
+        .queue
+        .iter()
+        .map(|a| (a.uid, a.target))
+        .collect();
+    assert_eq!(orders, [(1, fridge as i16), (2, plant as i16)]);
+    let guid = |game: &Game, id: u16| game.lot().world().objects[&id].guid;
+    let icons = |game: &Game| -> Vec<(i32, Picture, i32)> {
+        game.queue()
+            .icons
+            .iter()
+            .map(|i| (i.uid, i.picture, i.rect.x))
+            .collect()
+    };
+    assert_eq!(
+        icons(&game),
+        [
+            (1, Picture::Object(guid(&game, fridge)), 32),
+            (2, Picture::Object(guid(&game, plant)), 82)
+        ]
+    );
+
+    // The queued water, taken off: the snack goes on to its end at step
+    // 1136, and nothing follows it.
+    let mut taken_off = open();
+    order(&mut taken_off, fridge, "Have A Snack");
+    order(&mut taken_off, plant, "Water");
+    taken_off.take_sounds();
+    taken_off.press([82 + 22, 32 + 22]);
+    assert_eq!(taken_off.take_sounds(), [delete()]);
+    assert_eq!(mortimer(&taken_off).queue.len(), 1);
+    assert_eq!(taken_off.run(1085), 1085);
+    assert_ne!(mortimer(&taken_off).active.uid, 0);
+    assert_eq!(taken_off.run(1), 1);
+    assert_eq!(mortimer(&taken_off).active.uid, 0);
+    assert!(mortimer(&taken_off).queue.is_empty());
+    assert_eq!(taken_off.caught(), 0, "{:?}", taken_off.errors());
+
+    // Step 899: he eats the snack (object 263), his sixth action, as the
+    // water took the second number; the water waits.
+    assert_eq!(game.run(849), 849);
+    game.render();
+    let snack = 263;
+    let eating = mortimer(&game).active.uid;
+    assert_eq!(eating, 6);
+    assert_eq!(
+        icons(&game),
+        [
+            (6, Picture::Object(guid(&game, snack)), 32),
+            (2, Picture::Object(guid(&game, plant)), 82)
+        ]
+    );
+    assert!(game.queue().icons[0].yellow);
+    game.take_sounds();
+    game.press([32 + 22, 32 + 22]);
+    assert_eq!(game.take_sounds(), [delete()]);
+    assert_ne!(mortimer(&game).active.flags & 0x100, 0);
+    // With the water queued, the cancel queues nothing of its own
+    // (0x45d7c0).
+    assert_eq!(mortimer(&game).queue.len(), 1);
+    // He puts the snack down in front of him at step 1009, and at step
+    // 1028 the water starts.
+    assert_eq!(game.run(128), 128);
+    assert_eq!(mortimer(&game).active.uid, eating);
+    assert_eq!(game.lot().world().objects[&snack].position, [296, 440, 1]);
+    assert_eq!(game.run(1), 1);
+    let watering = mortimer(&game).active;
+    assert_eq!((watering.uid, watering.target), (2, plant as i16));
+    game.render();
+    assert_eq!(icons(&game)[0].0, 2);
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// Moves the pointer straight onto `object` where the frame shows it
+/// (listing its pie), presses it, and presses `label` on the pie.
+fn order(game: &mut Game, object: u16, label: &str) {
+    let at = (0..600)
+        .step_by(4)
+        .flat_map(|y| (0..800).step_by(4).map(move |x| [x, y]))
+        .find(|&p| !game.over_panel(p) && game.under(p) == Some(object))
+        .unwrap_or_else(|| panic!("object {object} is not on screen"));
+    game.hover(at);
+    game.press(at);
+    game.render();
+    let entry = {
+        let menu = game
+            .menu()
+            .unwrap_or_else(|| panic!("object {object}'s pie"));
+        let (_, r) = menu
+            .labels()
+            .into_iter()
+            .find(|(text, _)| *text == label)
+            .unwrap_or_else(|| panic!("{label} on object {object}'s pie"));
+        [r.x + r.width / 2, r.y + r.height / 2]
+    };
+    game.press(entry);
+    assert!(game.menu().is_none());
+    game.render();
+}
+
 fn delete() -> SoundEvent {
     SoundEvent::Play {
         object: -4,

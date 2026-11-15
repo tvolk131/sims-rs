@@ -47,6 +47,23 @@ change and that stop are not seen.
 The executable digests that guest/launch.sh verified (share/game-identity.txt)
 are recorded in status.json and as a game_identity event.
 
+Sparse recordings (a whole game day): --full saves a fixed set of updates
+(for example every tenth, 10-50000/10). --around N also saves the update in
+which something happens and the N updates after it: an object appears on or
+leaves the registry (an objects_changed event names them), a dialog is shown,
+or the hour (global 0) turns (an hour_turned event; the day turns at hour
+24). --before-hour B also saves the last B updates before each hour turns,
+worked out from the clock (globals 5 and 6; a full pass adds 2 seconds).
+Every line of updates.jsonl also holds the clock (globals 0, 5 and 6), the
+date globals 1 to 3 and 7 to 8, and the number of objects in the registry;
+a saved update's line says why it was saved (saved_for). --answer-stuck S
+(with --guest-dir and --window) presses Return in the game window when a
+dialog shown in update --answer-from or later has had no result for S
+seconds, and again every S seconds (at most three times); each press is
+logged (dialog_auto_answer, and input-log.txt), and a result cancels its own
+dialog's presses not yet made. dialog_result's result is the function's
+argument (the record's status at that stop is the old value).
+
 --scenario FILE (with --guest-dir) drives the game through a scripted input
 scenario (input.py has the format) and logs it to input.jsonl. It adds a
 breakpoint at 0x48ddcb, where the pie menu pushes the chosen action on a
@@ -61,6 +78,7 @@ import os
 import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -70,8 +88,12 @@ from qmp import Qmp  # noqa: E402
 import qemu_retained_owners  # noqa: E402
 import qemu_neighborhood_owners as neighborhood_owners  # noqa: E402
 import input as scenario_input  # noqa: E402
+import guest as guest_jobs  # noqa: E402
 
 ENTRY, RETURN = 0x46d345, 0x46d51d
+# The clock's globals (see crates/sims-vm/src/tick.rs) and those of the date.
+HOURS, MINUTES, SECONDS = 0, 5, 6
+DATE_GLOBALS = (1, 2, 3, 7, 8)
 DIALOG_SHOW, DIALOG_RESULT, DIALOG_READ = 0x436da0, 0x4370be, 0x43718f
 OWNER, GLOBAL_RNG, ACTION_SERIAL, CRT_TLS_INDEX = 0x6e48bc, 0x6e54ac, 0x6e4904, 0x6db360
 
@@ -193,6 +215,18 @@ class Memory:
         owner = self.word(OWNER)
         n = self.word(owner + 0x24) if owner else 0
         return self.word(n + 0x164) if n else None
+
+    def clock(self, sim):
+        """[hours, minutes, seconds] and the date globals (1, 2, 3, 7, 8)."""
+        g = self.words(sim + 0x10, 9, 2)
+        return [g[HOURS], g[MINUTES], g[SECONDS]], [g[i] for i in DATE_GLOBALS]
+
+    def registry(self, sim):
+        """The registry's object pointers, in order (zeros left out)."""
+        reg = self.word(sim + 0xb0)
+        first, end = self.word(reg + 0x18), self.word(reg + 0x1c)
+        assert end >= first and (end - first) % 4 == 0 and end - first < 131072
+        return [p for p in self.words(first, (end - first) // 4) if p]
 
     def summary(self, sim, teb):
         return dict(tick=self.word(sim + 0x98), lot_rng=self.word(sim + 0xac), global_rng=self.word(GLOBAL_RNG),
@@ -329,6 +363,124 @@ def parse_set(text):
     return out
 
 
+def updates_to_hour(clock):
+    """How many more full passes until the hour turns, from [hours, minutes, seconds] (a pass adds 2 seconds)."""
+    _, minutes, seconds = clock
+    return max(1, ((59 - minutes) * 60 + 60 - seconds + 1) // 2)
+
+
+class DialogAnswerer:
+    """Presses Return in the game window when a dialog has had no result for
+    `after` seconds, and again every `after` seconds, at most `tries` times. It
+    only writes guest jobs to the share (the guest runs while a modal dialog is
+    up); the capture's stops tell it when a dialog is shown and answered. The
+    dialogs are told apart by their record, so a result ends only its own
+    dialog's presses.
+
+    A press job checks for its own `.cancel` file right before it presses, and
+    a result writes that file for every job of its dialog. The capture reports
+    a result while the guest is stopped, so a job that has not reached its
+    check by then never presses. One already past its check when the result
+    stop came (the press that may have made the result) still lands."""
+
+    def __init__(self, share, window, after, log, input_log, tries=3):
+        self.share, self.window, self.after, self.log, self.input_log = share, window, after, log, input_log
+        self.tries = tries
+        self.lock = threading.Lock()
+        self.open = {}  # record -> dict(serial, update, timer, jobs) of a dialog waiting for a result
+        self.serial = 0
+
+    def shown(self, update, record=None, jobs=()):
+        """A dialog was shown. `jobs`: the press jobs an earlier run already handed to the guest for it (a
+        resumed run), which its result cancels too; the presses go on from there."""
+        with self.lock:
+            self._end(record, 'shown_again')
+            self.serial += 1
+            self.open[record] = dict(serial=self.serial, update=update, timer=None, jobs=list(jobs))
+            if len(jobs) < self.tries:
+                self._schedule(record, len(jobs) + 1)
+
+    def answered(self, record=None):
+        with self.lock:
+            self._end(record, 'answered')
+
+    def _end(self, record, why):
+        entry = self.open.pop(record, None)
+        if not entry:
+            return
+        if entry['timer']:
+            entry['timer'].cancel()
+        for job in entry['jobs']:
+            (Path(self.share) / 'cmd' / f'{job:05d}.cancel').write_text(why + '\n')
+        if entry['jobs']:
+            self.log(kind='dialog_auto_answer_cancelled', update=entry['update'], record=record, jobs=entry['jobs'],
+                     why=why)
+
+    def _schedule(self, record, n):
+        entry = self.open[record]
+        entry['timer'] = threading.Timer(self.after, self._press, (record, entry['serial'], n))
+        entry['timer'].daemon = True
+        entry['timer'].start()
+
+    def _press(self, record, serial, n):
+        with self.lock:
+            entry = self.open.get(record)
+            if not entry or entry['serial'] != serial:
+                return
+            update = entry['update']
+            command = f'xdotool windowfocus --sync {self.window} sleep 1 key Return'
+            script = (f'set -u\nexport DISPLAY=:98\nxdotool windowfocus --sync {self.window} sleep 1 || exit 4\n'
+                      '[ -e "${0%.sh}.cancel" ] && { echo cancelled; exit 3; }\nxdotool key Return\n')
+            job = guest_jobs.submit(self.share, script)
+            entry['jobs'].append(job)
+            with open(self.input_log, 'a') as f:
+                f.write(f'{time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}\n'
+                        f'auto answer (dialog of update {update}, press {n}): {command}\n')
+            self.log(kind='dialog_auto_answer', update=update, record=record, press=n, job=job, command=command)
+            if n < self.tries:
+                self._schedule(record, n + 1)
+
+    def close(self):
+        with self.lock:
+            for entry in self.open.values():
+                if entry['timer']:
+                    entry['timer'].cancel()
+            self.open.clear()
+
+
+def open_dialogs(rows):
+    """{record: (update, [job])} of the dialogs shown in these events and given no result yet, with the press
+    jobs handed to the guest for each (and not cancelled)."""
+    out = {}
+    for r in rows:
+        if r['kind'] == 'dialog_show':
+            out[r.get('record')] = (r['update'], [])
+        elif r['kind'] == 'dialog_result':
+            out.pop(r.get('record'), None)
+        elif r['kind'] == 'dialog_auto_answer' and 'record' in r and r['record'] in out:
+            out[r['record']][1].append(r['job'])
+    return out
+
+
+def drop_redone_events(path, updates, kinds):
+    """Before a resume: drop the events of these kinds (of hour_turned and objects_changed, the ones the
+    resumed run can write again) that a lot update's return produced for an update after the last recorded
+    row. The resumed run redoes that return and writes them again. Returns the dropped rows."""
+    if not path.exists():
+        return []
+    keep, dropped = [], []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        (dropped if r['kind'] in kinds and r.get('update', 0) > updates else keep).append(line)
+    if dropped:
+        tmp = path.with_suffix('.jsonl.tmp')
+        tmp.write_text(''.join(line + '\n' for line in keep))
+        tmp.rename(path)
+    return [json.loads(line) for line in dropped]
+
+
 def dump(container, guest_dir, d, regs, raw):
     """Write every present user page of the stopped process: d/ranges.json ([start, size, protection, file]),
     d/registers.json (the stop's registers and the stub's whole register packet, which holds the segment
@@ -397,6 +549,15 @@ def main():
                     'Logged to input.jsonl')
     ap.add_argument('--window', default=os.environ.get('SIMS_WINDOW', scenario_input.WINDOW),
                     help='the game window in the guest, for --scenario')
+    ap.add_argument('--around', type=int, default=0,
+                    help='also save the update in which an object appears or leaves, a dialog is shown or the hour '
+                         'turns, and this many updates after it')
+    ap.add_argument('--before-hour', type=int, default=0,
+                    help='also save the last this many updates before each hour turns')
+    ap.add_argument('--answer-stuck', type=float, default=0,
+                    help='press Return when a dialog has had no result for this many seconds (needs --guest-dir)')
+    ap.add_argument('--answer-from', type=int, default=3,
+                    help='--answer-stuck answers only dialogs shown in this lot update or later')
     ap.add_argument('--resume', action='store_true',
                     help='take over a guest that an earlier run of this script left stopped at a breakpoint '
                          '(it was killed, not detached): continue its output directory and numbering')
@@ -407,26 +568,48 @@ def main():
         ap.error('--dump needs --guest-dir')
     if args.scenario and not args.guest_dir:
         ap.error('--scenario needs --guest-dir')
+    if args.answer_stuck and not args.guest_dir:
+        ap.error('--answer-stuck needs --guest-dir')
+    if args.around < 0 or args.before_hour < 0 or args.answer_stuck < 0:
+        ap.error('--around, --before-hour and --answer-stuck cannot be negative')
     if args.scenario and args.resume:
         # A new runner would start the scenario again from its first step.
         ap.error('--scenario cannot be resumed')
     try:
         steps = scenario_input.parse_scenario(args.scenario.read_text()) if args.scenario else None
-        if steps is not None:
+        if steps is not None or args.answer_stuck:
             scenario_input.check_window(args.window)
     except scenario_input.ScenarioError as e:
         ap.error(str(e))
     out = args.output
     out.mkdir(parents=True, exist_ok=args.resume)
+    prior_status, dropped = {}, []
+    if args.resume:
+        try:
+            prior_status = json.loads((out / 'status.json').read_text())
+        except (OSError, ValueError):
+            pass
+        lines = (out / 'updates.jsonl').read_text().splitlines() if (out / 'updates.jsonl').exists() else []
+        # Only what the redone return can write again: an hour turn needs the last row's clock, an object
+        # change the registry saved with the last row.
+        kinds = []
+        if lines and 'clock' in json.loads(lines[-1]):
+            kinds.append('hour_turned')
+        if args.around and prior_status.get('registry_update') == len(lines) and prior_status.get('registry') is not None:
+            kinds.append('objects_changed')
+        dropped = drop_redone_events(out / 'events.jsonl', len(lines), kinds)
     events = open(out / 'events.jsonl', 'a')
     watch_log = open(out / 'watch.jsonl', 'a') if args.watch else None
     updates_log = open(out / 'updates.jsonl', 'a')
     status = dict(started=time.time(), updates=0, state='attaching', settings={k: str(v) for k, v in vars(args).items()})
 
+    event_lock = threading.Lock()
+
     def event(**row):
         row['time'] = time.time()
-        events.write(json.dumps(row, default=str) + '\n')
-        events.flush()
+        with event_lock:
+            events.write(json.dumps(row, default=str) + '\n')
+            events.flush()
 
     def save_status(**kw):
         status.update(kw, now=time.time())
@@ -443,6 +626,10 @@ def main():
         runner = scenario_input.Runner(steps, agent, out / 'input.jsonl', shots_dir=out / 'input-shots')
         runner.write(kind='scenario', status='loaded', file=str(args.scenario), steps=len(steps),
                      agent_started=agent.start())
+    answerer = None
+    if args.answer_stuck:
+        answerer = DialogAnswerer(args.guest_dir / 'share', args.window, args.answer_stuck, event,
+                                  out / 'input-log.txt')
     remote = Remote(args.container)
     breaks = set()
 
@@ -559,11 +746,39 @@ def main():
     baseline = False
     updates = 0
     elsewhere = 0
+    around_until = 0  # with --around: save every update up to this one
+    last_clock = None
+    last_objects = None  # {pointer: id} of the registry at the last return (None: not known)
+    dialog_pending = False  # a dialog was shown since the last return
     if args.resume:
         rows = [json.loads(line) for line in open(out / 'events.jsonl')]
         sims_cr3 = next(r['cr3'] for r in rows if r['kind'] == 'baseline')
         baseline = True
-        updates = sum(1 for _ in open(out / 'updates.jsonl'))
+        lines = open(out / 'updates.jsonl').read().splitlines()
+        updates = len(lines)
+        if lines:
+            last = json.loads(lines[-1])
+            around_until = last.get('around_until', 0)
+            last_clock = last.get('clock')
+        if args.around:
+            # The registry at the last recorded return, saved with it in status.json.
+            if prior_status.get('registry_update') == updates and prior_status.get('registry') is not None:
+                last_objects = {p: i for p, i in prior_status['registry']}
+                # Kept in the new status.json too, in case this run is taken over before its first return.
+                status.update(registry=prior_status['registry'], registry_update=updates)
+            else:
+                event(kind='registry_unknown', updates=updates, registry_update=prior_status.get('registry_update'))
+        if dropped:
+            event(kind='resume_dropped', events=[dict(kind=r['kind'], update=r['update']) for r in dropped])
+        # A dialog shown since the last recorded return, and the dialogs still waiting for a result.
+        dialog_pending = any(r['kind'] == 'dialog_show' and r['update'] > updates for r in rows)
+        waiting = open_dialogs(rows)
+        if waiting:
+            event(kind='resume_open_dialogs', dialogs=[dict(record=k, update=u, jobs=j) for k, (u, j) in waiting.items()])
+        if answerer:
+            for record, (shown_in, jobs) in waiting.items():
+                if shown_in >= args.answer_from:
+                    answerer.shown(shown_in, record, jobs)
     try:
         reply = remote.stop_reply()
         event(kind='attach', reply=reply, resume=args.resume, updates=updates)
@@ -638,6 +853,11 @@ def main():
                     write_gz(d / 'full-state.json.gz', full)
                     write_gz(d / 'pages.json.gz', pages)
                     baseline = True
+                    # The registry and the clock at update 1's entry, so a change in update 1 is seen.
+                    if args.around or args.before_hour:
+                        last_clock = m.clock(sim)[0]
+                    if args.around:
+                        last_objects = {p: m.object_id(p) for p in m.registry(sim)}
                     event(kind='baseline', tick=state['tick'], lot=lot, cr3=cr3, teb=fs_base, seconds=time.time() - t0,
                           packets=remote.packets, sim=regs['ecx'])
                     if 1 in dump_set:  # the baseline is the entry of lot update 1
@@ -665,7 +885,43 @@ def main():
                     updates += 1
                     advanced = m.byte(regs['ebp'] - 1)
                     row = dict(update=updates, advanced=advanced, **m.summary(sim, fs_base))
-                    if updates in full_set:
+                    reasons = ['full'] if updates in full_set else []
+                    if args.around or args.before_hour:
+                        row['clock'], row['date'] = m.clock(sim)
+                        pointers = m.registry(sim)
+                        row['objects'] = len(pointers)
+                        triggers = []
+                        now = None
+                        if args.around:
+                            # Every ID is read again: an object made at a freed object's address is
+                            # another object. The IDs lie on about one page for every four objects.
+                            now = {p: m.object_id(p) for p in pointers}
+                        if last_objects is not None and now is not None and \
+                                list(now.items()) != list(last_objects.items()):
+                            before, after = set(last_objects.items()), set(now.items())
+                            added = [dict(id=i, pointer=p) for p, i in now.items() if (p, i) not in before]
+                            removed = [dict(id=i, pointer=p) for p, i in last_objects.items() if (p, i) not in after]
+                            event(kind='objects_changed', update=updates, tick=row['tick'], added=added,
+                                  removed=removed, count=len(pointers))
+                            triggers.append('objects')
+                        if last_clock is not None and row['clock'][0] != last_clock[0]:
+                            event(kind='hour_turned', update=updates, tick=row['tick'], clock=row['clock'],
+                                  date=row['date'], previous=last_clock)
+                            triggers.append('hour')
+                        if dialog_pending:
+                            triggers.append('dialog')
+                        dialog_pending = False
+                        last_objects, last_clock = now, row['clock']
+                        if args.around and triggers:
+                            around_until = max(around_until, updates + args.around)
+                            reasons += triggers
+                        elif args.around and updates <= around_until:
+                            reasons.append('around')
+                        if args.before_hour and updates_to_hour(row['clock']) <= args.before_hour:
+                            reasons.append('before_hour')
+                        if around_until > updates:
+                            row['around_until'] = around_until
+                    if reasons:
                         t0 = time.time()
                         state, full, pages = m.snapshot('lot_update_return', regs, sim, fs_base)
                         state['advanced'] = advanced
@@ -681,10 +937,15 @@ def main():
                         write_gz(d / 'full-state.json.gz', full)
                         write_gz(d / 'pages.json.gz', pages)
                         row['saved'] = d.name
+                        row['saved_for'] = reasons
                         row['seconds'] = round(time.time() - t0, 2)
                     updates_log.write(json.dumps(row) + '\n')
                     updates_log.flush()
-                    save_status(updates=updates, last=row)
+                    if args.around and last_objects is not None:
+                        save_status(updates=updates, last=row, registry=list(last_objects.items()),
+                                    registry_update=updates)
+                    else:
+                        save_status(updates=updates, last=row)
                     if runner and baseline:
                         runner.on_update(updates, m, sim)
                     if updates + 1 in dump_set:
@@ -702,11 +963,21 @@ def main():
                     row['status'] = m.word(record + 0x74)
                     row['modal'] = m.byte(record + 0x69)
                     row['stack'] = m.read(regs['esp'], 0x20).hex()
+                    if pc == DIALOG_RESULT:
+                        # The stop is at the function's entry: the result is its argument, and the
+                        # record's status still holds the old value.
+                        row['result'] = m.word(regs['esp'] + 4)
                 except MemoryError as e:
                     row['error'] = str(e)
                 event(**row)
                 if runner:
                     runner.on_dialog(row['kind'], updates + 1)
+                if pc == DIALOG_SHOW:
+                    dialog_pending = True
+                    if answerer and updates + 1 >= args.answer_from:
+                        answerer.shown(updates + 1, record)
+                elif pc == DIALOG_RESULT and answerer:
+                    answerer.answered(record)
                 if pc == DIALOG_SHOW:
                     save_status(dialog=dict(update=updates + 1, record=record, shown=time.time()))
             if not foreign and live_watches:
@@ -733,6 +1004,8 @@ def main():
         save_status(state='error', error=repr(e))
         raise
     finally:
+        if answerer:
+            answerer.close()
         if runner:
             runner.close()
         try:

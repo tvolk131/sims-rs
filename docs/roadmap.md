@@ -2095,12 +2095,19 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   agree to the pixel with two menus read from the running original
   (gated on `SIMS_INSTALL`); the drawn look is not yet compared with a
   screenshot. The host keeps a `pie::Pie` and renders the head.
+- **Done: the personality panel.** The Personality button opens the
+  selected Sim's five trait bars (Neat, Outgoing, Active, Playful,
+  Nice) in the subpanel, laid out as the original's bar maker does
+  (0x51df31). The Goths' panel is pinned by digest, gated on
+  `SIMS_INSTALL`; it is not yet compared with a screenshot, and the
+  zodiac sign under the bars is not drawn.
 - **Next:** open houses through `sims_vm::boot::Lot` (which now runs the
   household load) in the tests and the viewer, in place of their
   stand-in for steps 17 and 18; a screenshot of an open pie menu; a
   Yes/No dialog checked
   against the original (the "Help System" one at tick 2) for the layout
-  of several buttons; text entry dialogs; the other live panels.
+  of several buttons; text entry dialogs; the personality panel's
+  zodiac sign; the job and relationship panels; the other live panels.
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
   - A command intake, for example `World::apply(&mut self, command:
     sims_sim::Command) -> Result<(), CommandError>`, run between ticks,
@@ -2248,6 +2255,17 @@ through their public interfaces only; the simulation never depends on it.
   them, and a press cancels one (`Lot::cancel`, 0x45d5f8) with the
   original's sound. Objects' catalog pictures are not made yet (a grey
   square stands in), and the icons do not slide into place.
+- **Done in play mode: a second order, and cancelling either.** Through
+  the window, the snack from the fridge's pie and then Water from a
+  plant's: the water waits behind the snack, its icon second. A press on
+  the water's icon takes it off. A press on the snack's icon while
+  Mortimer eats cancels it: he puts the snack down in front of him (Drop,
+  opcode 5, 0x454430, now ported) and goes to water the plant. A cancel
+  while he walks stops his thread on a route whose animator is still
+  moving (0x45b3eb, not ported; track 4's): on the snack order, a cancel
+  at steps 150 to 536 or 543 to 590 (to the fridge) or 821 to 829 (away
+  from it with the snack). Cancels at the other steps to 1136 catch no
+  error (a manual sweep, not a test).
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
     on Manage Inventory operation 4 and scope 12. A check tree's fault

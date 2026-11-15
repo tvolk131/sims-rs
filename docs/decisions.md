@@ -4,6 +4,96 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: The personality panel draws its bars as the original's bar maker lays them out
+
+The live panel's Personality button now opens the selected Sim's
+personality in the subpanel, where Needs opens the needs
+(`sims_ui::hud`, `Kind::Personality`). Without a selected Sim the
+subpanel is empty, as for the needs.
+
+- **Where the numbers come from** (no screenshot of this panel was
+  available, so it is read from the exe):
+  - The panel builder (0x518665) makes five bars with 0x51df31, for
+    person data words 7, 6, 3, 5 and 2 (the table at 0x66c600): Neat,
+    Outgoing, Active, Playful and Nice.
+  - Every bar's label is as wide as the widest label plus 3 (0x52144a),
+    and its bar starts 3 past that (0x521491).
+  - The bar's gadget is 3 wider than the bar, and the gadgets are
+    stacked right-aligned at x 202 of the subpanel, from y 8, 18 apart
+    (0x519cc8). The CJK languages use 15 and 25, which are not ported.
+  - The shorter of the label's line and the bar is centred on the
+    other.
+- **A bar** (0x5211bd) draws the empty bar (4903, 40 by 14), then the
+  full one (4900, 40 by 16) cut to 4 pixels a point and a pixel higher
+  (0x5212b2). A trait is the data word over 100, clamped to 0 to 10.
+- **Labels and fonts:** the labels are font 8 (0x6f2ae4) and the title
+  is font 11 at the needs title's place. The labels are English, as the
+  needs' are (Live.iff STR# 131 has them).
+- **The subpanel** is the needs' rectangle. The layout table at
+  0x6f3a28 puts it at x 300 of the strip, one left of the 301 the needs
+  were measured at. That pixel is left as measured.
+- **Unverified:**
+  - the labels' color (the needs labels' is taken) and their alignment
+    (right, against the bar);
+  - which of the font's heights the centring compares (its line height
+    is taken).
+- **Not drawn yet:** the zodiac sign and its text under the bars (a
+  text gadget in font 12, filled from UIText.iff STR# 165).
+- **Tests:** a unit test checks the layout, presses passing through,
+  each bar's fill and its rows with stand-in art, and that coordinates
+  at the edge of `i32` do not panic. The Goths' panel is pinned by
+  digest, gated on `SIMS_INSTALL`, with Mortimer's, Bella's and
+  Cassandra's traits read from the house.
+
+Reopen with a screenshot of the original's personality panel.
+
+## 2026-11-15: Drop is ported; a second order waits, and a press cancels either, in the window
+
+**Drop** (opcode 5, 0x454430, from the general table at 0x45246a) is
+ported from the original's code, as the inverse of Grab:
+1. The object in my first container slot (+0x130, its second record) is
+   looked up. Nothing there takes the false branch.
+2. The place is my position plus one tile's step in my facing (data
+   word 1; 0x42228a), on my level.
+3. The object's place test runs on the ground there (virtual function
+   0x54, no container). A refusal takes the false branch, and nothing
+   changes.
+4. The object is put there with the lot told (virtual function 0x58),
+   and the true branch is taken.
+
+- **Verified (Goth tests, play mode):**
+  - The snack order, cancelled at step 900 while Mortimer eats
+    (`a_cancelled_snack_is_put_down_in_front_of_the_eater`). His tree
+    0x0139 (node 14) drops the snack at step 1009. He stands at (296,
+    456) facing 6, and it goes to (296, 440). At step 1028 the
+    cancelled action ends, and he is free. No error is caught.
+  - Through the window
+    (`a_second_order_waits_behind_the_first_and_a_press_cancels_either`):
+    - The snack, then Water on plant 162: the water queues behind, its
+      icon second, at x 82.
+    - A press on the water's icon takes it off. The snack goes on to its
+      end at step 1136.
+    - A press on the snack's icon at step 899 (his sixth action, eating)
+      cancels it. With the water queued, the cancel queues nothing of
+      its own (0x45d7c0). He drops the snack at step 1009, and starts
+      the water at step 1028.
+  - A cancel at step 825, as he walks away from the fridge with the
+    snack, stops at the unported route stop below
+    (`a_snack_cancelled_on_the_way_to_the_chair_stops_at_the_unported_route_stop`,
+    a known gap pinned so it is not mistaken for fixed).
+- **A manual sweep, not a test:** the snack order cancelled at each
+  step from 150 to 1136 (every tenth step, then every step near each
+  edge), run 400 steps on. Cancels at steps 150 to 536, 543 to 590 and
+  821 to 829 stop at 0x45b3eb; all the rest catch no error. Too slow to
+  keep as a test (a full lot run per step).
+- **Unverified:** no capture covers a Drop or a cancel. Which tree runs
+  Drop and when is the scripts' own; only the primitive is ported.
+- **Not ported (track 4):** cancelling while Mortimer walks, to the
+  fridge or away from it with the snack, stops his thread at a route
+  whose animator is still under way (0x45b3eb). Sol's review found the
+  walk away (step 825), which the first sweep had missed by sampling
+  steps 760 and 830.
+
 ## 2026-11-15: A snack ordered in the window is the scripted snack order
 
 In play mode, the window's order path is the one the original takes:
