@@ -45,6 +45,10 @@ const SCALE: f32 = f32::from_bits(0x43AD_9D3F);
 /// zoom (depth owner words 33 to 35).
 const LEVEL_DEPTH: i32 = -967;
 
+/// What a diagonal wall seen edge-on adds to its depth, at every zoom
+/// (0x4c7be2, for wall kind 0x20 only).
+const EDGE_ON_DEPTH: i32 = -300;
+
 /// The largest terrain height the curve covers, either way.
 const CURVE: i32 = 255;
 
@@ -302,9 +306,16 @@ impl Depth {
     }
 
     /// The depth of a diagonal wall's pixel on row `y` (0x4c7bce: its
-    /// column table is all zero).
-    pub fn diagonal(&self, anchor: Anchor, y: i32) -> i32 {
-        self.stand(anchor, y)
+    /// column table is all zero). A diagonal seen edge-on (`edge_on`)
+    /// stands [`EDGE_ON_DEPTH`] nearer: 0x4c7be2 passes it to the row
+    /// loop (0x4c4907), which adds it to every row's depth.
+    pub fn diagonal(&self, anchor: Anchor, y: i32, edge_on: bool) -> i32 {
+        let depth = self.stand(anchor, y);
+        if edge_on {
+            depth.saturating_add(EDGE_ON_DEPTH)
+        } else {
+            depth
+        }
     }
 
     /// Where a straight wall's columns start: the rising ramp for a wall
