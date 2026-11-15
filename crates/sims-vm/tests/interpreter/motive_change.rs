@@ -63,13 +63,40 @@ fn changes_are_added_in_order_as_an_amount_per_tick() {
     );
 }
 
+/// Operands whose amount and stop name a parameter the tree does not
+/// have, so reading either fails.
+fn unreadable(motive: u8, flags: u8) -> [u8; 8] {
+    let mut operands = change(motive, flags, 5, 6);
+    operands[0] = scope::PARAMETERS;
+    operands[1] = scope::PARAMETERS;
+    operands
+}
+
 #[test]
 fn flag_bit_0_drops_every_change_and_reads_nothing() {
     let mut fx = Fixture::new();
     run(&mut fx, &[change(7, 0, 100, 10)]).unwrap();
-    // A motive that takes no change, with flag bit 0: still a clear.
-    assert_eq!(run(&mut fx, &[change(0, 1, 0, 0)]), Ok(true));
+    // A motive that takes no change and operands that cannot be read,
+    // with flag bit 0: still a clear.
+    assert_eq!(run(&mut fx, &[unreadable(0, 1)]), Ok(true));
     assert!(changes(&fx).is_empty());
+}
+
+#[test]
+fn the_motive_is_checked_before_the_operands_are_read() {
+    let mut fx = Fixture::new();
+    let fault = run(&mut fx, &[unreadable(0, 0)]).unwrap_err();
+    assert_eq!(fault.trap.code(), Some(0x1a), "{fault}");
+}
+
+#[test]
+fn a_stop_that_cannot_be_read_adds_nothing_and_keeps_the_rest() {
+    let mut fx = Fixture::new();
+    run(&mut fx, &[change(7, 0, 1800, 10)]).unwrap();
+    let mut operands = change(5, 0, 100, 6);
+    operands[1] = scope::PARAMETERS;
+    assert!(run(&mut fx, &[operands]).is_err());
+    assert_eq!(changes(&fx), [(7, 1f32.to_bits(), 10.0)]);
 }
 
 #[test]

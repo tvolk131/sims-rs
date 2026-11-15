@@ -44,7 +44,7 @@ impl Machine<'_, '_> {
         if self.me()?.person.is_none() {
             return Err(Trap::Unsupported(
                 "Set Motive Change on an object that is not a person: the general primitive \
-                 table handles it, which is not ported"
+                 table's handler runs, not the person's (0x45a16f), and it is not ported"
                     .into(),
             ));
         }
