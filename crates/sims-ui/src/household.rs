@@ -23,7 +23,14 @@ pub struct Resident {
     pub object: u16,
     pub guid: u32,
     pub motives: [f32; 16],
+    /// The personality in the panel's order ([`PERSONALITY`]), in
+    /// hundredths of a point (0 to 1000).
+    pub personality: [i16; 5],
 }
+
+/// The person data words of the personality, in the panel's order: Neat,
+/// Outgoing, Active, Playful and Nice (0x66c600).
+pub const PERSONALITY: [usize; 5] = [7, 6, 3, 5, 2];
 
 /// The simulation state the control panel shows, copied out of a
 /// [`World`] so drawing never holds the world.
@@ -55,14 +62,13 @@ impl Snapshot {
                 .values()
                 .find(|o| o.guid == guid && o.person.is_some())
             {
+                let person = object.person.as_ref();
                 residents.push(Resident {
                     object: object.id,
                     guid,
-                    motives: object
-                        .person
-                        .as_ref()
-                        .map(|p| p.motives)
-                        .unwrap_or_default(),
+                    motives: person.map(|p| p.motives).unwrap_or_default(),
+                    personality: PERSONALITY
+                        .map(|word| person.and_then(|p| p.data.get(word).copied()).unwrap_or(0)),
                 });
             }
         }
