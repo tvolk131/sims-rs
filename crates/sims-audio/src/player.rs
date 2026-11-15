@@ -18,10 +18,13 @@
 //!
 //! - Registers below 100 belong to a thread; 100 and above are globals
 //!   shared by every thread (`SimSpeed` is 100). A new thread's `patch`
-//!   register (50) holds its track's patch. When the track's arguments
-//!   are `kArgsIdVolPan` (2, nearly every track), `arg1` holds the object
-//!   that started it: routines pass it to `getsrcdatafield`
-//!   ([`crate::sources`]).
+//!   register (50) holds its track's patch. *(code)* `arg1` to `arg3`
+//!   (registers 1 to 3) hold the arguments it was started with, whatever
+//!   the track's argument kind (0x57d9cb): the first is the object that
+//!   started it, which routines pass to `getsrcdatafield`
+//!   ([`crate::sources`]). A track a script starts (`play_trk`) gets
+//!   its object and two zeros; what the original passes there is not
+//!   read.
 //! - *(code)* The registers in [`DEFAULTS`] start as the original's
 //!   default register bank holds them, then `vol` (18) and `duckpri` (25)
 //!   take the HOT track's volume and duck priority; every other starts
@@ -88,6 +91,12 @@
 //!   object still has fades out at speed 100 and ends, or ends at once
 //!   when it has no note playing (0x57dca3). Kill all also stops every
 //!   ambient score.
+//! - 21, pause, and 22, unpause ([`SoundEvent::Pause`] and
+//!   [`SoundEvent::Unpause`], what the game sends): a pause holds every
+//!   track that runs or plays, but for the interface's clicks, the speed
+//!   buttons and the main music loop ([`PAUSE_SPARES`]), and the live
+//!   ambience; an unpause lets them all go on from where they were. See
+//!   [`Player::pause`].
 //! - 30, `kTurnOnTv` (radios too): kills the object's instances, then
 //!   records the object as an instance of the track and starts it.
 //! - 53, `kSequenceTrackHitList`: picks a patch from a hit list and
@@ -116,7 +125,7 @@
 //! thread where the original would use its one object. When an object
 //! lets go of a track others still have, the original re-evaluates the
 //! shared track (0x5746d9, not read); here that object's threads fade
-//! out and end. Kinds not ported (the music, the piano, pausing, reloading, and the sound object calls only the game's
+//! out and end. Kinds not ported (the music, the piano, reloading, and the sound object calls only the game's
 //! code makes) are reported as faults; kinds whose case does nothing for
 //! sound are ignored.
 //!
@@ -189,6 +198,8 @@ pub const FADE_DEST: u8 = 40;
 pub const FADE_VAR: u8 = 41;
 pub const FADE_SPEED: u8 = 42;
 pub const FADE_ON: u8 = 45;
+/// `isplaying`, which a fresh start sets to 1.
+pub const ISPLAYING: u8 = 46;
 /// A new thread's registers that do not start at 0, as the original's
 /// default register bank holds them: `priority`, `vol`, `extvol`, `pan`,
 /// `pitch`, `MinDistance`, `MaxDistance` and `fade_dest`.
@@ -228,6 +239,11 @@ pub const RADIO_TRACKS: [u32; 10] = [
     0x104, 0x10d, 0x10e, 0x118, 0x1a19, 0x1a1a, 0x1a1b, 0x1a1c, 0x1a1d, 0x18704,
 ];
 
+/// *(code)* The tracks a pause leaves playing (0x5748a2 to 0x5748c3):
+/// `ui_click` (1541), `MainMusicLoop` (515) and the speed buttons'
+/// `ui_speed_1top` to `ui_speed_3top` (2727, 2733, 2739).
+pub const PAUSE_SPARES: [u32; 5] = [0x605, 0x203, 0xaa7, 0xaad, 0xab3];
+
 /// Event kinds: the HOT files' `kSndob` equates, and how the original's
 /// dispatcher (0x573617) treats the rest.
 pub mod kind {
@@ -235,6 +251,8 @@ pub mod kind {
     pub const FADE: i64 = 18;
     pub const CANCEL_NOTE: i64 = 19;
     pub const KILL_ALL: i64 = 20;
+    pub const PAUSE: i64 = 21;
+    pub const UNPAUSE: i64 = 22;
     pub const KILL_INSTANCE: i64 = 23;
     pub const TURN_ON_TV: i64 = 30;
     pub const SET_MUSIC_MODE: i64 = 36;
@@ -252,9 +270,9 @@ pub mod kind {
     /// reported when an event has one.
     /// Kind 36 is listed though its ambience half is ported (see
     /// `Player::set_music_mode`).
-    pub const NOT_PORTED: [i64; 35] = [
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 24, 25, 26, 32, 33, 34, 35,
-        36, 37, 38, 39, 40, 41, 42, 43, 103, 104,
+    pub const NOT_PORTED: [i64; 33] = [
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 24, 25, 26, 32, 33, 34, 35, 36, 37,
+        38, 39, 40, 41, 42, 43, 103, 104,
     ];
 }
 
@@ -283,6 +301,17 @@ impl Samples for BTreeMap<String, Pcm> {
 /// keeps its value). [`crate::sources`] has the original's answers.
 pub trait Sources {
     fn field(&self, source: i32, field: i32) -> Option<i32>;
+}
+
+/// *(code)* Writes a starting track's argument registers 1 to 3, as the
+/// original's start does whatever the track's argument kind (0x57d9cb to
+/// 0x57d9eb, each a register write that sets the comparison flags).
+fn set_arguments(thread: &mut Thread, args: [u32; 3]) {
+    thread.target = Target::Own;
+    for (register, value) in (1..=3).zip(args) {
+        thread.registers[register] = value as i32;
+    }
+    thread.kept = i64::from(args[2] as i32);
 }
 
 /// Answers 0 to everything.
@@ -468,6 +497,12 @@ pub struct Player<S> {
     /// mode 3 has been set, after which modes are recorded (0x6f6428).
     music_mode: i64,
     music_started: bool,
+    /// *(code)* Whether the sound is paused (manager +0xd).
+    paused: bool,
+    /// *(code)* The tracks a pause holds (each track's +0x1c8): their
+    /// threads do not run or fade and their notes stay where they are,
+    /// silent, until an unpause or until the track starts again.
+    held: BTreeSet<u32>,
     /// The ambience cells' sounds.
     voices: Vec<AmbientVoice>,
     /// Ambience sample paths to their numbers in the patch cache.
@@ -522,6 +557,8 @@ impl<S: Samples> Player<S> {
             ambience: None,
             music_mode: 4,
             music_started: false,
+            paused: false,
+            held: BTreeSet::new(),
             voices: Vec::new(),
             ambient_patches: BTreeMap::new(),
             ambient_cache: BTreeMap::new(),
@@ -776,6 +813,9 @@ impl<S: Samples> Player<S> {
             SoundEvent::StopObject { object } => self.kill_instance(*object),
             // Kind 20, as the game calls it.
             SoundEvent::StopAll => self.kill_all(),
+            // Kinds 21 and 22, as the game calls them (0x57a7f2, 0x57a8e3).
+            SoundEvent::Pause => self.pause(),
+            SoundEvent::Unpause => self.unpause(),
         }
     }
 
@@ -836,6 +876,8 @@ impl<S: Samples> Player<S> {
             kind::FADE => self.fade_track(track, args),
             kind::CANCEL_NOTE => self.cancel_radio_notes(),
             kind::KILL_ALL => self.kill_all(),
+            kind::PAUSE => self.pause(),
+            kind::UNPAUSE => self.unpause(),
             kind::KILL_INSTANCE => self.kill_instance(track),
             kind::SET_AMBIENCE_MODE => self.set_ambience_mode(track),
             kind::SET_MUSIC_MODE => {
@@ -866,7 +908,7 @@ impl<S: Samples> Player<S> {
         if !alive {
             self.instances.retain(|&(t, _)| t != track);
         }
-        if self.start(args[0], module, track, false)
+        if self.start(args, module, track, false)
             && self.track_args(module, track) == Some(ARGS_ID_VOL_PAN)
             && args[0] != 0
         {
@@ -959,6 +1001,65 @@ impl<S: Samples> Player<S> {
         }
     }
 
+    /// Kind 21: *(code)* pauses the sound (0x573c20, 0x57481e). The
+    /// manager is marked paused; `main_duckpri` becomes 0 (0x57d361),
+    /// which here drops every thread's ducking request; every track
+    /// that runs or plays is held except [`PAUSE_SPARES`]; and in music
+    /// mode 0 the current ambience player is paused (see
+    /// [`crate::ambience::Fresh::set_paused`]). A held track's threads
+    /// do not run or fade, and its notes stay where they are, silent. A
+    /// track started while paused plays: starting a track (0x57d960)
+    /// clears its hold, and a held track whose script still runs is let
+    /// go rather than started again. The original also stops its day and night
+    /// loop (0x574978), which this player does not have.
+    pub fn pause(&mut self) {
+        self.paused = true;
+        self.duck.clear();
+        self.update_main_duckpri();
+        let tracks: BTreeSet<u32> = self
+            .threads
+            .iter()
+            .chain(&self.pending)
+            .map(|t| t.track)
+            .chain(self.notes.iter().map(|n| n.track))
+            .filter(|t| !PAUSE_SPARES.contains(t))
+            .collect();
+        self.held.extend(tracks);
+        if self.music_mode == 0
+            && let Some(current) = self.ambience
+        {
+            self.with_score(current, |score, _| score.set_paused(true));
+        }
+    }
+
+    /// Kind 22: *(code)* unpauses the sound (0x573c44, 0x574904): every
+    /// track is let go (0x57cd2c) and the current ambience player, in
+    /// any music mode, unpaused. Letting a track go (vtable +0x5c,
+    /// 0x57dc63) also moves its wait deadline (+0x198, which `wait`
+    /// sets at 0x57e453) to now, so every running thread's wait ends at
+    /// the next update, whether or not it was held, and whether or not
+    /// the sound was paused. (The original does this only while the
+    /// sound is on, manager +0xc, which this player always is; it also
+    /// restarts its day and night loop and its music, 0x575155, which
+    /// this player does not have.) `main_duckpri` stays as the pause
+    /// left it until a thread asks again.
+    pub fn unpause(&mut self) {
+        self.paused = false;
+        self.held.clear();
+        let now = self.frame;
+        for thread in self.threads.iter_mut().chain(&mut self.pending) {
+            thread.wake = now;
+        }
+        if let Some(current) = self.ambience {
+            self.with_score(current, |score, _| score.set_paused(false));
+        }
+    }
+
+    /// Whether the sound is paused (kind 21 since the last 22).
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
     /// Kind 20: *(code)* ends every track at once, forgets every object
     /// instance and stops every ambience player (the current one stays
     /// current). (The original also stops its music stations, which this
@@ -967,6 +1068,7 @@ impl<S: Samples> Player<S> {
         self.threads.clear();
         self.pending.clear();
         self.notes.clear();
+        self.held.clear();
         self.seqgroups.clear();
         self.instances.clear();
         let modes: Vec<u32> = self.scores.keys().copied().collect();
@@ -1055,7 +1157,10 @@ impl<S: Samples> Player<S> {
 
     /// Kind 30 (`kTurnOnTv`, which radios use too): *(code)* lets go of
     /// whatever the object (the first argument) had playing, records it
-    /// as an instance of the track, and starts the track for it.
+    /// as an instance of the track, and starts the track for it. A track
+    /// started anew is left held (the start ends by holding it, 0x57dbd6)
+    /// and let go only when the sound is not paused (0x573d71), so a
+    /// television turned on during a pause is silent until the unpause.
     fn turn_on_tv(&mut self, module: usize, track: u32, args: [u32; 3]) {
         self.kill_instance(args[0]);
         if self.owner(module, track).is_none() {
@@ -1065,7 +1170,15 @@ impl<S: Samples> Player<S> {
         if args[0] != 0 {
             self.record(track, args[0]);
         }
-        self.start(args[0], module, track, false);
+        let resumes = self.held.contains(&track)
+            && self
+                .threads
+                .iter()
+                .chain(&self.pending)
+                .any(|t| t.track == track);
+        if self.start(args, module, track, false) && self.paused && !resumes {
+            self.held.insert(track);
+        }
     }
 
     /// Kind 53 (`kSequenceTrackHitList`): *(code)* picks a patch from a
@@ -1109,7 +1222,7 @@ impl<S: Samples> Player<S> {
                     .rposition(|n| n.thread == 0 && n.track == track);
                 if let Some(note) = idle {
                     self.chain(note, track, patch);
-                } else if let Some(mut thread) = self.thread(0, owner, track) {
+                } else if let Some(mut thread) = self.thread([0; 3], owner, track) {
                     thread.id = 0;
                     thread.registers[usize::from(PATCH)] = patch as i32;
                     self.note_on(&thread);
@@ -1133,16 +1246,24 @@ impl<S: Samples> Player<S> {
     /// Starts a track's routine for an object. The module given is tried
     /// first, then every other. A deferred thread first runs in the next
     /// block. False when it could not start.
-    fn start(&mut self, object: u32, module: usize, track: u32, defer: bool) -> bool {
-        if self.threads.len() + self.pending.len() >= THREADS {
-            self.report(format!("track {track}: more than {THREADS} threads"));
-            return false;
-        }
+    fn start(&mut self, args: [u32; 3], module: usize, track: u32, defer: bool) -> bool {
         let Some(module) = self.owner(module, track) else {
             self.report(format!("no track {track}"));
             return false;
         };
-        let Some(thread) = self.thread(object, module, track) else {
+        // *(code)* Starting a track the pause holds while its script runs
+        // does not start it again (0x57d9f1 to 0x57da12): it lets it go
+        // (vtable +0x5c), so the script goes on from where it was, its
+        // wait ended, with the new arguments. No thread is made, so the
+        // thread limit does not apply.
+        if self.held.remove(&track) && self.resume_held(args, track) {
+            return true;
+        }
+        if self.threads.len() + self.pending.len() >= THREADS {
+            self.report(format!("track {track}: more than {THREADS} threads"));
+            return false;
+        }
+        let Some(thread) = self.thread(args, module, track) else {
             return false;
         };
         if defer {
@@ -1153,9 +1274,32 @@ impl<S: Samples> Player<S> {
         true
     }
 
+    /// Lets a held track's running threads go on, as starting it does
+    /// (see [`Player::start`]). Each one's `target` points back at itself
+    /// (0x57d9c3), its argument registers take `args` (see
+    /// [`Player::thread`]) and its wait ends. False when none of the
+    /// track runs, so it is started anew. (A held thread does not run,
+    /// so none of these is the thread running `play_trk`.)
+    fn resume_held(&mut self, args: [u32; 3], track: u32) -> bool {
+        let now = self.frame;
+        let mut resumed = false;
+        for thread in self
+            .threads
+            .iter_mut()
+            .chain(&mut self.pending)
+            .filter(|t| t.track == track)
+        {
+            set_arguments(thread, args);
+            thread.wake = now;
+            resumed = true;
+        }
+        resumed
+    }
+
     /// A new thread of a track the module defines, with its starting
     /// registers, or `None` (reported) when the track has no entry point.
-    fn thread(&mut self, object: u32, module: usize, track: u32) -> Option<Thread> {
+    fn thread(&mut self, args: [u32; 3], module: usize, track: u32) -> Option<Thread> {
+        let object = args[0];
         let owner = &self.modules[module];
         let Some(pc) = owner.entry(track).and_then(|entry| owner.address(entry)) else {
             self.report(format!("track {track}: entry point not found"));
@@ -1175,11 +1319,8 @@ impl<S: Samples> Player<S> {
         registers[usize::from(DUCKPRI)] = owner.number(&fields.duck_priority).unwrap_or(0) as i32;
         let group = owner.number(&fields.group).unwrap_or(0);
         registers[usize::from(PATCH)] = patch as i32;
-        if owner.number(&fields.args) == Some(ARGS_ID_VOL_PAN) {
-            registers[1] = object as i32;
-        }
         let id = self.id();
-        Some(Thread {
+        let mut thread = Thread {
             id,
             object,
             module,
@@ -1195,7 +1336,15 @@ impl<S: Samples> Player<S> {
             group,
             target: Target::Own,
             kill_after_fade: false,
-        })
+        };
+        set_arguments(&mut thread, args);
+        // *(code)* A fresh start then writes `isplaying` 1 (0x57dbc5),
+        // which leaves the comparison flags positive. (It also sets the
+        // wait deadline to now and holds the track, 0x57dbd6, which its
+        // callers let go; kind 1 always does.)
+        thread.registers[usize::from(ISPLAYING)] = 1;
+        thread.kept = 1;
+        Some(thread)
     }
 
     /// Records a fault, up to [`FAULTS`] of them; later ones are dropped,
@@ -1279,8 +1428,10 @@ impl<S: Samples> Player<S> {
         let mut sums = vec![0i64; 2 * frames];
         let cache = &self.cache;
         let ambient_cache = &self.ambient_cache;
+        let held = &self.held;
+        // A held track's notes keep their place and are not heard.
         self.notes
-            .retain_mut(|note| mix_note(note, cache, &mut sums));
+            .retain_mut(|note| held.contains(&note.track) || mix_note(note, cache, &mut sums));
         self.voices
             .retain_mut(|voice| mix_note(&mut voice.note, ambient_cache, &mut sums));
         out.extend(sums.iter().map(|&s| s.clamp(-32768, 32767) as i16));
@@ -1347,6 +1498,11 @@ impl<S: Samples> Player<S> {
         let mut budget = BLOCK_STEPS;
         let mut index = 0;
         while index < self.threads.len() {
+            // A held track's threads wait, without fading (0x57d7f3).
+            if self.held.contains(&self.threads[index].track) {
+                index += 1;
+                continue;
+            }
             if budget == 0 {
                 if !self.over_budget {
                     self.over_budget = true;
@@ -1357,6 +1513,9 @@ impl<S: Samples> Player<S> {
                 // The threads not reached still fade, and run first next
                 // block, so busy threads cannot starve them.
                 for at in index..self.threads.len() {
+                    if self.held.contains(&self.threads[at].track) {
+                        continue;
+                    }
                     let mut thread = self.threads[at].clone();
                     self.fade(&mut thread);
                     self.threads[at] = thread;
@@ -1818,7 +1977,7 @@ impl<S: Samples> Player<S> {
             }
             "play_trk" => {
                 let track = self.read(thread, arg(0)) as u32;
-                self.start(thread.object, thread.module, track, true);
+                self.start([thread.object, 0, 0], thread.module, track, true);
                 Flow::Next
             }
             "kill_trk" => {

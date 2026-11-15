@@ -842,18 +842,9 @@ impl Machine<'_, '_> {
             return Ok(None);
         }
         // 0x4763c5 copies as many as both have (the record always has
-        // sixteen), so the rest stay as the last copy left them.
-        let mut ads = match self.world.advertisement_record {
-            Some(ads) => ads,
-            None if record.motives.len() < ADVERTISEMENTS => {
-                return Err(Trap::Unsupported(format!(
-                    "an interaction with {} advertisements copied before any other: the \
-                     rest of the record (0x6e5100) holds what the game's start left",
-                    record.motives.len()
-                )));
-            }
-            None => [Advertisement::default(); ADVERTISEMENTS],
-        };
+        // sixteen), so the rest stay as the last copy, or the game's
+        // start, left them.
+        let mut ads = self.world.advertisement_record.unwrap_or_default();
         for (ad, motive) in ads.iter_mut().zip(&record.motives) {
             *ad = Advertisement {
                 personality: motive.personality as i16,

@@ -71,7 +71,8 @@ impl Pace {
     }
 
     /// Starts the time owed again, as running a paused game does
-    /// (`0x46d83a`).
+    /// (`0x46d83a`), and as a dialog the player answers does: no time is
+    /// owed from before the wait.
     pub fn restart(&mut self) {
         self.owed = 0;
     }

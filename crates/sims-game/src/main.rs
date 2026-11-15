@@ -7,8 +7,10 @@
 //!
 //! The install defaults to `SIMS_INSTALL`, and the house to the Goths'
 //! (`UserData/Houses/House05.iff`). `--answers` answers the dialogs that
-//! offer a choice, in order, as `sims boot` does; for the Goths' house it
-//! defaults to `3` (No to the Help System).
+//! offer a choice, in order, as `sims boot` does. Once they run out, a
+//! dialog waits for the player, as the original's does, and a press on
+//! one of its buttons answers it. `--png` has nobody to answer, so there
+//! the Goths' house defaults to `3` (No to the Help System).
 //!
 //! The lot runs at the original's pace: a tick every 42 milliseconds at
 //! normal speed, 14 at fast and 2 at ultra. The panel's speed, pause and
@@ -179,7 +181,14 @@ fn options() -> Result<(Options, Option<Still>, bool), String> {
     if paths.next().is_some() {
         return Err(usage.into());
     }
-    let answers = answers.unwrap_or_else(|| if house == goths { vec![3] } else { Vec::new() });
+    // In the window the player answers; a still has nobody to.
+    let answers = answers.unwrap_or_else(|| {
+        if house == goths && png.is_some() {
+            vec![3]
+        } else {
+            Vec::new()
+        }
+    });
     let still = png.map(|file| Still { file, ticks, size });
     Ok((
         Options {
@@ -295,8 +304,10 @@ impl App {
         let elapsed = now.duration_since(self.last);
         self.last = now;
         let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let waited = self.game.asking().is_some();
         let ran = self.game.advance(micros);
-        let mut redraw = ran > 0;
+        // A dialog shown at the first tick due is drawn though none ran.
+        let mut redraw = ran > 0 || (!waited && self.game.asking().is_some());
         // What the tick's sounds may ask about their objects, before the
         // sounds themselves. Read on every call, not only after a step
         // that succeeded: a failed step may still have changed the lot.
