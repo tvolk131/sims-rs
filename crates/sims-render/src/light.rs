@@ -35,13 +35,25 @@ impl Light {
 
     /// The light for a tile's light byte.
     pub fn from_byte(byte: u8) -> Self {
-        // The drawing context keeps the fraction between 0.5 and 1.
+        Self::drawn_byte(byte).map_or(Self::FULL, Self::from_sum)
+    }
+
+    /// The light byte a tile's light byte is drawn with, or None for full
+    /// light. The drawing context keeps the fraction between 0.5 and 1,
+    /// and a fraction of 1 draws in full light (0x4c7c59); any other
+    /// becomes `fraction * 255 + 0.5`, truncated (0x4b76a8).
+    pub fn drawn_byte(byte: u8) -> Option<u32> {
         let fraction = (f32::from(byte) / 255.0).clamp(0.5, 1.0);
         if (fraction - 1.0).abs() < 1e-6 {
-            return Self::FULL;
+            return None;
         }
-        let byte = (f64::from(fraction) * 255.0 + 0.5) as u32;
-        Light(Some((byte.min(255) >> 3) as u8))
+        Some((f64::from(fraction) * 255.0 + 0.5) as u32)
+    }
+
+    /// The light for a drawn light byte plus whatever a lamp's pool adds,
+    /// kept to 255 (0x4b6c17): never full light, even at 255.
+    pub fn from_sum(sum: u32) -> Self {
+        Light(Some((sum.min(255) >> 3) as u8))
     }
 
     pub fn is_full(self) -> bool {
@@ -80,6 +92,15 @@ mod tests {
         // 204 / 255 * 255 + 0.5 truncates to 204, level 25.
         assert_eq!(Light::from_byte(204), Light(Some(25)));
         assert_eq!(Light::from_byte(254), Light(Some(31)));
+    }
+
+    #[test]
+    fn a_pool_adds_to_the_drawn_byte_up_to_255() {
+        assert_eq!(Light::drawn_byte(255), None);
+        assert_eq!(Light::drawn_byte(162), Some(162));
+        assert_eq!(Light::drawn_byte(0), Some(128));
+        assert_eq!(Light::from_sum(162 + 40), Light(Some(25)));
+        assert_eq!(Light::from_sum(162 + 255), Light(Some(31)));
     }
 
     #[test]

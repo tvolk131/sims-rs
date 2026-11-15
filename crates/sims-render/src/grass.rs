@@ -739,6 +739,7 @@ mod tests {
             outdoor_rooms: Default::default(),
             room_lights: Default::default(),
             halves: Default::default(),
+            lamps: Default::default(),
         }
     }
 
