@@ -69,6 +69,15 @@ events, and what it asks for after them) come first.
   tick 1472, with no recording to compare yet; at tick 1473 object 105
   gives up a route and needs the route-failure feedback tree (0x45af2a),
   which is not ported.
+- The Pleasants (`House06.iff` as the original saved it after moving
+  them in, with the Traveling Salesman on the lot) load to the state the
+  first tick starts from: the end of the household selection works out
+  again who is a visitor, and reading the people raises the action
+  serial. Their load equals the capture's but for one person's data word
+  50 and last result, which something in the original's load sets and
+  which is not found yet. The first frame then stops: person 242's head
+  follows person 241, whose animator has never been ticked or drawn, and
+  what the original reads for it is not ported.
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
   read their arrays whole (Arry 11, 12, 111 and 112). UserData2's
