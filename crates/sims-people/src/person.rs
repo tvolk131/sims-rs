@@ -136,6 +136,25 @@ impl<'a> Player<'a> {
         }
     }
 
+    /// A player that starts with the clips another one loaded
+    /// ([`Player::into_clips`]).
+    pub(crate) fn with_clips(
+        assets: &'a Assets,
+        library: &'a Library,
+        clips: BTreeMap<String, Clip>,
+    ) -> Self {
+        Self {
+            assets,
+            library,
+            clips,
+        }
+    }
+
+    /// The clips loaded so far, to keep between frames.
+    pub(crate) fn into_clips(self) -> BTreeMap<String, Clip> {
+        self.clips
+    }
+
     /// The clip named `name`, loaded on first use.
     pub fn clip(&mut self, name: &str) -> Result<&Clip, String> {
         let key = name.to_ascii_lowercase();
