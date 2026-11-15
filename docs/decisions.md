@@ -4,6 +4,26 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: A person upstairs stands on the terrain too
+
+A person on a level above the ground now stands on the terrain's
+altitude under their position, as a person on the ground does
+(`sims_people::lot`). The original's model matrix (0x592132) looks up
+the altitude (0x478dfe) whatever the person's level; it skips it only
+for a point off the lot (0x45ee1d). It then adds the level's offset from
+the view's table, which is still not ported: we keep projecting a level
+as the lot renderer does, a floor height per level above the first. The
+lot renderer lifts an upper level's floor by the terrain under it too,
+so before this a person upstairs stood that much below their floor. On
+the Goths' lot the house sits six terrain steps up, 48 pixels at medium
+zoom, and the floor hid Bella completely while she played with the
+dollhouse upstairs (ticks 798 to 1872, 6:56 to 7:32 AM).
+
+The entry "People join the lot renderer's view through a depth hook"
+said such a person stands at the floor; this replaces that. How far
+the original's view-table offset lifts a level is **unverified**;
+reopen if it is read and differs from the floor height.
+
 ## 2026-11-15: The plumb bob is the original's mesh, coloured and lit as the original does
 
 The selected person's plumb bob is now drawn (`sims_people::bob`, from

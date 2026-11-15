@@ -24,10 +24,12 @@
 //!
 //! A person stands on the terrain under it (`sims_sim::head::ground_height`:
 //! the tile's altitude where its position falls, as the original finds it,
-//! 0x478dfe).
-//! On a level above the ground the original adds an offset from the
-//! view's table, which is not ported: such a person stands at the level's
-//! floor.
+//! 0x478dfe), on every level: the original's model matrix (0x592132) adds
+//! the altitude whatever the level, and the renderer lifts an upper
+//! level's floor by the terrain under it too. On a level above the ground
+//! the original then adds an offset from the view's table, which is not
+//! ported: such a person stands that many floor heights above the ground,
+//! as the renderer projects the level.
 //!
 //! **Depth.** [`People::draw_on_lot`] draws over a lot `sims_render` has
 //! drawn, as the original does: the lot first, then the people, each
@@ -326,12 +328,13 @@ impl People {
             if !(0..size).contains(&x) || !(0..size).contains(&y) || level > top {
                 continue;
             }
-            if level <= 1 {
-                let at = [animator.position[0], animator.position[1]];
-                root.translation.y = sims_sim::head::ground_height(world, at)
-                    .map(F32::to_f32)
-                    .unwrap_or(0.0);
-            }
+            // The terrain lifts a person on every level, as it lifts the
+            // floors the renderer draws there (0x592132 adds the altitude
+            // whatever the level).
+            let at = [animator.position[0], animator.position[1]];
+            root.translation.y = sims_sim::head::ground_height(world, at)
+                .map(F32::to_f32)
+                .unwrap_or(0.0);
             let base = base_clip(person, skeleton);
             match player.pose(&body.skeleton, animator, world.base_layers.get(&id), &base) {
                 Ok(pose) => posed.push(Posed {
