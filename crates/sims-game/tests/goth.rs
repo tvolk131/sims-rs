@@ -1324,3 +1324,53 @@ fn the_recorded_snack_order_replayed_in_the_window_matches_the_recording() {
     assert_eq!(locals(4142), [363]);
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
+
+/// Reaching a pie entry checks its action, which changes the lot;
+/// staying on it does not check it again, but leaving the window and
+/// coming back onto it does, as passing over another point of the pie
+/// would (`Game::leave` forgets the entry, as it forgets the pointer).
+#[test]
+fn coming_back_onto_a_pie_entry_checks_it_again() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    assert_eq!(game.run(50), 50);
+    game.render();
+    let fridge = 118;
+    let at = (0..600)
+        .step_by(2)
+        .flat_map(|y| (0..800).step_by(2).map(move |x| [x, y]))
+        .find(|&p| !game.over_panel(p) && game.under(p) == Some(fridge))
+        .expect("the fridge is on screen");
+    game.hover(at);
+    game.press(at);
+    game.render();
+    let entry = {
+        let menu = game.menu().expect("the fridge's pie is open");
+        let (_, r) = menu
+            .labels()
+            .into_iter()
+            .find(|(text, _)| *text == "Have A Snack")
+            .expect("Have A Snack on the pie");
+        [r.x + r.width / 2, r.y + r.height / 2]
+    };
+    let hash = |game: &Game| game.lot().world().hash();
+    let before = hash(&game);
+    game.hover(entry);
+    assert_ne!(hash(&game), before, "reaching the entry checked it");
+    // Some ticks later the check would leave something else: his
+    // motives, which it copies the advertisements against, have moved.
+    assert_eq!(game.run(60), 60);
+    game.render();
+    let later = hash(&game);
+    game.hover([entry[0] + 1, entry[1]]);
+    assert_eq!(hash(&game), later, "still on the entry: not checked");
+    game.leave();
+    assert_eq!(hash(&game), later);
+    game.hover(entry);
+    assert_ne!(hash(&game), later, "coming back checked it again");
+    assert!(game.menu().is_some());
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}

@@ -544,10 +544,12 @@ impl Game {
         Outcome::redraw()
     }
 
-    /// The pointer left the window: it is on no object, button or
-    /// portrait. True if the frame changes.
+    /// The pointer left the window: it is on no object, button, portrait
+    /// or pie entry, so coming back onto an entry checks it again. True
+    /// if the frame changes.
     pub fn leave(&mut self) -> bool {
         self.pointer = None;
+        self.highlighted = None;
         let redraw = self.hud.leave();
         self.follow() || redraw
     }
