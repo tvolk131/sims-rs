@@ -41,6 +41,7 @@ track while paused lets its older threads go on as well.
 
 **Unverified:** nothing of this has been compared with the running game.
 Reopen when a capture with sound can be compared.
+
 ## 2026-11-15: From house version 63 the floors and walls are read whole from Arry 11, 12, 111 and 112
 
 The lot array loader (0x478599) tests the house's version once per level
