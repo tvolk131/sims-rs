@@ -1349,3 +1349,38 @@ fn event_numbers_past_32_bits_are_faults() {
     play(&mut player, "ok");
     assert!(player.faults[2].contains("no hit list 4294967295"));
 }
+
+const IFLT: u8 = 65;
+
+#[test]
+fn a_fresh_start_leaves_positive_flags_whatever_its_third_argument() {
+    // Branch to the silent routine 0x101 if the flags are negative; the
+    // event's third argument is -1. A fresh start writes isplaying (46)
+    // last (0x57dbc5), so the flags are positive and the note plays.
+    let mut branches = vec![IFLT];
+    branches.extend(long(0x101));
+    branches.extend([2, 5, WAIT_SAMP, END]);
+    let silent: &[u8] = &[END];
+    let module = module_with(&[&branches, silent], 1, 10, "neg=1,10,0,0,-1\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "neg");
+    assert_eq!(player.render(5, &NoSources), [1, 2, 3, 4, 5]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_television_turned_on_during_a_pause_waits_for_the_unpause() {
+    // Kind 30 starts the track but resumes it only when the game is not
+    // paused (0x573d71); the start held it (0x57dc2e).
+    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
+    let module = module_with(&[generic], 1, 10, "on=30,10,3\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    player.handle(&SoundEvent::Pause);
+    play(&mut player, "on");
+    assert!(player.render(2 * BLOCK, &NoSources).iter().all(|&s| s == 0));
+    player.handle(&SoundEvent::Unpause);
+    let out = player.render(2 * BLOCK, &NoSources);
+    let first = out.iter().position(|&s| s != 0).expect("the note plays");
+    assert_eq!(&out[first..first + 5], [1, 2, 3, 4, 5]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}

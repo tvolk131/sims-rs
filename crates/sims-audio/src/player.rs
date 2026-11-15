@@ -198,6 +198,8 @@ pub const FADE_DEST: u8 = 40;
 pub const FADE_VAR: u8 = 41;
 pub const FADE_SPEED: u8 = 42;
 pub const FADE_ON: u8 = 45;
+/// `isplaying`, which a fresh start sets to 1.
+pub const ISPLAYING: u8 = 46;
 /// A new thread's registers that do not start at 0, as the original's
 /// default register bank holds them: `priority`, `vol`, `extvol`, `pan`,
 /// `pitch`, `MinDistance`, `MaxDistance` and `fade_dest`.
@@ -1155,7 +1157,10 @@ impl<S: Samples> Player<S> {
 
     /// Kind 30 (`kTurnOnTv`, which radios use too): *(code)* lets go of
     /// whatever the object (the first argument) had playing, records it
-    /// as an instance of the track, and starts the track for it.
+    /// as an instance of the track, and starts the track for it. A track
+    /// started anew is left held (the start ends by holding it, 0x57dbd6)
+    /// and let go only when the sound is not paused (0x573d71), so a
+    /// television turned on during a pause is silent until the unpause.
     fn turn_on_tv(&mut self, module: usize, track: u32, args: [u32; 3]) {
         self.kill_instance(args[0]);
         if self.owner(module, track).is_none() {
@@ -1165,7 +1170,15 @@ impl<S: Samples> Player<S> {
         if args[0] != 0 {
             self.record(track, args[0]);
         }
-        self.start(args, module, track, false);
+        let resumes = self.held.contains(&track)
+            && self
+                .threads
+                .iter()
+                .chain(&self.pending)
+                .any(|t| t.track == track);
+        if self.start(args, module, track, false) && self.paused && !resumes {
+            self.held.insert(track);
+        }
     }
 
     /// Kind 53 (`kSequenceTrackHitList`): *(code)* picks a patch from a
@@ -1325,6 +1338,12 @@ impl<S: Samples> Player<S> {
             kill_after_fade: false,
         };
         set_arguments(&mut thread, args);
+        // *(code)* A fresh start then writes `isplaying` 1 (0x57dbc5),
+        // which leaves the comparison flags positive. (It also sets the
+        // wait deadline to now and holds the track, 0x57dbd6, which its
+        // callers let go; kind 1 always does.)
+        thread.registers[usize::from(ISPLAYING)] = 1;
+        thread.kept = 1;
         Some(thread)
     }
 

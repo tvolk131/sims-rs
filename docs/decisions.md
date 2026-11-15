@@ -31,7 +31,12 @@ points the track's `target` back at itself (0x57d9c3) and writes its
 argument registers 1 to 3 (0x57d9cb to 0x57d9eb) whatever its argument
 kind, so a resumed script sees the new arguments; a new thread here
 now gets all three too, where it had only `arg1`, and only for
-`kArgsIdVolPan` tracks. An unpause (0x574904) lets every track go
+`kArgsIdVolPan` tracks. A fresh start then writes `isplaying` (register
+46) 1 (0x57dbc5), so its script begins with positive comparison flags
+whatever its third argument, and ends by holding the track (0x57dbd6).
+Kind 1 always lets it go; kind 30 (0x573d14) lets it go only when the
+sound is not paused (0x573d71), so a television or radio turned on
+during a pause is silent until the unpause. An unpause (0x574904) lets every track go
 (0x57cd2c, vtable +0x5c on each) and unpauses the current ambience
 player, whatever the music mode. Letting a track go also sets its wait
 deadline (+0x198, which `wait` sets at 0x57e453 and the update reads at
