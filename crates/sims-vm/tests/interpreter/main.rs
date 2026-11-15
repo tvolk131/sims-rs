@@ -27,6 +27,7 @@ mod random;
 mod removal;
 mod rooms;
 mod run_functional_tree;
+mod seat;
 mod selection;
 mod services;
 mod set_to_next;
