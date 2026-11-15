@@ -547,6 +547,13 @@ fn the_player_answers_a_dialog_when_it_is_shown() {
     asked.answer(3).unwrap();
     assert!(asked.asking().is_none());
     assert_eq!(asked.answer(3), Err(sims_vm::boot::AnswerError::NotAsked));
+    // Until the tick runs again, the lot is as it was before it, and an
+    // order would be given to that lot: it takes none.
+    assert_eq!(
+        asked.pie_menu(person, person).unwrap_err(),
+        sims_vm::boot::OrderError::Asking
+    );
+    assert_eq!(asked.world().hash(), before);
     // From there the two lots are the same, tick for tick.
     for tick in 2..=200 {
         let a = listed.step().unwrap();

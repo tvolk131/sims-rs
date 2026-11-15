@@ -16,7 +16,10 @@ world, play-mode state, tick count and player. The dialog
 where the dialog's record is) are kept. Steps say `StepError::Asking`
 and orders are refused until `Lot::answer` gives one of the dialog's
 answers. The next step then runs the tick again from the start with
-that answer queued. The simulation is deterministic, so the tick runs
+that answer queued. Until it has, orders are still refused: the lot is
+as it was before the tick, and a listing or an order then would change
+it where the original's never was (Sol's review found the window
+listing a menu there). The simulation is deterministic, so the tick runs
 as it would have with the answer listed at load. The test checks this:
 the Goths' lot answered from the window gives the same world hash,
 dialogs answered and sounds as `--answers 3`, tick for tick, through
@@ -32,7 +35,7 @@ deep in the tick, and our interpreter cannot stop there and go on later.
   as before.
 - The cost is a copy of the world before every step of a waiting lot:
   0.1 to 0.4 ms on the Goths' house, measured with a step of 0.15 to
-  0.6 ms. A tick at ultra speed has 2 ms.
+  0.6 ms. A tick at ultra speed has 5 ms here (`sims-game`'s pace).
 - **Unverified:**
   - A sound the tick makes before the dialog is requested when the tick
     runs again, after the answer. The original presumably plays it
@@ -43,8 +46,9 @@ deep in the tick, and our interpreter cannot stop there and go on later.
     (`draw_frame`), so the frames are an input that may matter.
 - The window (`sims-game`) always waits. A press on a button gives the
   answer the button stands for: 2, 3 or 4 for the first to the third
-  (`Shown::answers`). While the dialog waits, the time owed to the lot
-  is dropped, so the lot does not race to catch up after the answer.
+  (`Shown::answers`), and the tick runs again at once. While the dialog
+  waits, the time owed to the lot is dropped, remainder and all, so the
+  lot does not race to catch up after the answer.
   `--answers` still answers first. `--png` has nobody to answer, so for
   the Goths' house it still defaults to `3`.
 

@@ -144,8 +144,9 @@ fn the_player_answers_the_help_dialog_from_the_window() {
     let shown = game.asking().expect("a dialog waits").shown.clone();
     assert_eq!(shown.answers, &[2, 3]);
     let waiting = game.lot().world().hash();
-    // Time goes by, but the lot does not.
+    // Time goes by, but the lot does not, and none of it is owed after.
     assert_eq!(game.advance(1_000_000), 0);
+    assert_eq!(game.advance(49_999), 0);
     assert_eq!(game.run(10), 0);
     assert_eq!(game.lot().world().hash(), waiting);
     game.resize([800, 600]);
@@ -157,7 +158,10 @@ fn the_player_answers_the_help_dialog_from_the_window() {
     let no = layout.buttons[1];
     game.press([no.x + no.width / 2, no.y + no.height / 2]);
     assert!(game.asking().is_none(), "{:?}", game.stopped());
-    assert_eq!(game.run(199), 199);
+    // The answered tick ran at once.
+    assert_eq!(game.lot().ticks(), 2);
+    assert_eq!(game.advance(1), 0);
+    assert_eq!(game.run(198), 198);
     assert_eq!(game.stopped(), None);
     let mut listed = Game::open(&options(install)).expect("the Goth house opens");
     assert_eq!(listed.run(200), 200);

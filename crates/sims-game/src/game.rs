@@ -217,6 +217,7 @@ impl Game {
     pub fn advance(&mut self, elapsed_us: u64) -> u32 {
         let due = self.pace.due(elapsed_us);
         if self.lot.asking().is_some() {
+            self.pace.restart();
             return 0;
         }
         self.run(due)
@@ -565,7 +566,7 @@ impl Game {
 
     /// Answers the dialog `caller` shows with its button `button` (0 the
     /// first): the answer the button gives (`Shown::answers`) goes to the
-    /// lot, which runs the tick that showed it at the next step.
+    /// lot, and the tick that showed it runs again at once.
     pub fn answer(&mut self, caller: u16, button: u8) {
         let Some(asking) = self.lot.asking() else {
             self.note = Some("No dialog waits for an answer.".into());
@@ -584,7 +585,11 @@ impl Game {
         };
         if let Err(e) = self.lot.answer(answer) {
             self.note = Some(format!("The answer was not taken: {e}"));
+            return;
         }
+        // The tick that showed the dialog runs again now, with the answer,
+        // so nothing is listed or ordered on the lot as it was before it.
+        self.run(1);
     }
 
     /// Selects the Sim `sim`, as a press on its portrait does

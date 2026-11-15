@@ -192,6 +192,10 @@ pub struct Lot {
     asks: bool,
     /// The dialog the lot waits on, while it waits.
     asking: Option<Box<Asking>>,
+    /// The dialog is answered and the tick that showed it has not run
+    /// again yet: the lot is as it was before that tick, so it takes no
+    /// input until the next step.
+    answered: bool,
 }
 
 /// A dialog the lot waits on ([`Lot::asking`]). The tick that showed it
@@ -567,6 +571,7 @@ impl Lot {
             halted: false,
             play: Play::default(),
             asks: false,
+            answered: false,
             asking: None,
         })
     }
@@ -633,6 +638,7 @@ impl Lot {
             self.ticks,
             self.player.clone(),
         );
+        self.answered = false;
         match self.advance(play) {
             Err(Stop::Asks { tick, shown }) => {
                 let (world, play, ticks, player) = before;
@@ -869,7 +875,8 @@ impl Lot {
 
     /// Answers the dialog the lot waits on with `answer` (the status its
     /// button gives: 2 the first, 3 the second, 4 the third). The next
-    /// step runs the tick again and gives it this answer.
+    /// step runs the tick again and gives it this answer; until then the
+    /// lot is as it was before that tick and takes no orders.
     pub fn answer(&mut self, answer: u8) -> Result<(), AnswerError> {
         let asking = self.asking.as_ref().ok_or(AnswerError::NotAsked)?;
         let offered = asking.shown.answers;
@@ -878,6 +885,7 @@ impl Lot {
         }
         self.player.queue.push_back(answer);
         self.asking = None;
+        self.answered = true;
         Ok(())
     }
 
@@ -886,7 +894,7 @@ impl Lot {
         if self.halted {
             return Err(OrderError::Halted);
         }
-        if self.asking.is_some() {
+        if self.asking.is_some() || self.answered {
             return Err(OrderError::Asking);
         }
         if self.load.finished.is_none() {
@@ -970,6 +978,7 @@ mod tests {
             halted: false,
             play: Play::default(),
             asks: false,
+            answered: false,
             asking: None,
         }
     }
