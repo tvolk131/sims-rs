@@ -49,18 +49,9 @@ fn unsupported(object: u16, what: &str) -> Fault {
     fault(object, Trap::Unsupported(what.into()))
 }
 
-/// The selected Sim (0x4456e4): the first person with the selected mark.
-///
-/// The original walks its list of people. Here that is the registration
-/// order. Which order the original's list has is **unverified**; it
-/// matters only if two people are marked.
+/// The selected Sim (0x4456e4): [`World::selected`].
 pub fn selected(world: &World) -> Option<u16> {
-    world.order.iter().copied().find(|id| {
-        world
-            .objects
-            .get(id)
-            .is_some_and(|object| object.person.is_some() && object.selected)
-    })
+    world.selected()
 }
 
 impl Interpreter<'_> {

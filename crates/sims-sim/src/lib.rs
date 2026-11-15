@@ -33,10 +33,10 @@ mod snapshot;
 mod world;
 
 pub use error::Error;
-pub use snapshot::Snapshots;
+pub use snapshot::{ReadOnlySnapshots, Snapshots};
 pub use world::{
     Budget, Dialog, Dialogs, FULL_SIZE, FrameStorage, HouseUsage, MagicHistory, Object, PersonTick,
-    TypeAttributes, Usage, World,
+    TypeAttributes, Usage, Whereabouts, World,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
