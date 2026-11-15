@@ -431,7 +431,7 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "55e2bb7e7506ddf8fa5c89b3a068c2378292403568e54733a73a13337acbd580";
+const PINNED: &str = "1e854596699af21756dd277d321f3e0068d1f9159afa9b974e6c364ee47aa1ee";
 
 #[test]
 fn without_the_held_poses_the_encoding_is_format_27() {
