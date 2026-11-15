@@ -23,10 +23,13 @@ fn main() {
     player.set_global(100, 1);
     let mut samples = Vec::new();
     for name in &events {
-        player.handle(&SoundEvent::Play {
-            object: 1,
-            name: name.clone(),
-        });
+        player.handle(
+            &SoundEvent::Play {
+                object: 1,
+                name: name.clone(),
+            },
+            &NoSources,
+        );
         samples.extend(player.render(RATE as usize, &NoSources));
     }
     samples.extend(player.render_until_idle(60 * RATE as usize, &NoSources));

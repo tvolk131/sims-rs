@@ -77,6 +77,132 @@ countdown ends at update 36, so the turn never reached its limit.
 
 The strict Goth run is unchanged to tick 3602, as is the Newbie run.
 
+## 2026-11-15: The selected Sim's actions show in the top left, and a press cancels one
+
+The coordinator asked for the action queue to be drawn as in the
+original, with the icons, their order, and cancel on a click. Track 6
+had nothing for it in `sims-ui`. It is read from the original's code:
+0x4d28df lays the icons out, 0x4ea31c collects them, 0x4ea203 builds
+each, 0x4cabe0 and 0x4cb30c draw them, and 0x4cb126 handles a press,
+which calls 0x45d5f8. The old prototype's
+`legacy/crates/sims-vm/src/scheduler/clock/draw/actions` read the same
+routines and agrees.
+
+- **What shows** (`sims_ui::queue`). The running action comes first,
+  then each queued action in order, each only when its icon names an
+  object. The icons are 45 by 45, the first at (32, 32) and each next
+  one 50 to the right. The picture is drawn first. `kIconFrame` goes
+  over it: blue shows the picture and magenta cuts the corners. A queued
+  action takes the grey cell. The running action takes the yellow cell
+  once person data word 39 is not 0, and the grey one before that. In
+  the snack, word 39 turns 1 at tick 615 (at the fridge), and the eating
+  action the fridge hands over at tick 820 turns yellow at 837. An
+  action with flag 0x100 has `kQueueCancelOverlay`, a red cross, over
+  it. A person's picture is the household's portrait, cell 0. A person
+  outside the household has none and shows as a dark grey (40, 40, 40)
+  square with no frame.
+- **A press** (`Lot::cancel`, `sims_vm::Interpreter::cancel`, 0x45d5f8).
+  On the running action it clears person data word 33 and sets the
+  action's flag 0x100. Unless the person would be interrupted anyway
+  (0x45d7c0), it then queues the person's own interaction 33 at priority
+  50 with no icon, which shows no icon. On a queued action it drops the
+  action, and the target runs function 4 first. The VM already had that
+  branch for routes (`Machine::release_action`), and the cancel uses it.
+  The game plays `UI_queue_delete` (object -4) for a press that counts
+  and `UI_error` for one that does not. A press on a pet's icon (person
+  word 65 above 1) only plays `UI_error`. A second press on the same
+  icon, or on an action already cancelled, does nothing.
+- **Tested** on the Goths, through the game's input layer. The snack
+  is queued from the fridge's pie and its icon shows at (32, 32) with
+  the fridge's picture. A press takes it off with `UI_queue_delete`.
+  Queued again, Mortimer takes it at tick 150. A press on it then shows
+  the cross, and a second press does nothing. The VM test checks the
+  same on `Lot` directly. It also checks the menu-33 action queued
+  behind the running one, and that play mode then parks Mortimer at
+  step 182. There he is walking to the fridge, and stopping a route
+  whose animator is under way (0x45b3eb) is not ported. That is the
+  VM's next gap for a cancel to finish.
+
+**Not done.** An object's catalog picture (0x4ccaa0, which the original
+renders from the object's sprites) is not made yet. An object's icon
+shows its frame over the dark grey of a missing picture.
+The icons do not slide to their places over 500 ms (0x4cb1df), and a
+new icon does not start at the pie. A press during a slide, which the
+original ignores, is taken here. The action's name as a tooltip is left
+out, because the queue keeps no names.
+**Unverified:** that the sound player finds `UI_queue_delete` and
+`UI_error` for object -4 as the original's does. No capture compares the
+drawn icons yet.
+
+**Ours, from Sol's review.** A press on the status band across the top
+is the band's, even where a wrapped note covers an icon. A cancel that
+never reaches the simulation (the lot refuses it, or has stopped) leaves
+the icon to take another press. In the original a cancel cannot fail,
+and it has no such band.
+## 2026-11-15: A sound's volume and pan come from where its objects are on the screen
+
+Kinds 1 (for a `kArgsIdVolPan` track) and 30 now set the track's
+`extvol` and `pan` from every object recorded for it, as the original
+does after starting it (0x573795 to 0x5737a4, 0x573d5d to 0x573d6e), in
+`sims_audio::placement`. Each object is placed by 0x5730b6, and the sum
+(0x57473b) takes the loudest volume and the volume-weighted pan, in
+32-bit arithmetic that wraps.
+
+The placement uses the screen when the track's `Spl` (register 57) is
+not 0. `Spl` starts at 20, `spl_normal`, from the default bank for
+registers 50 to 62 (0x6f6898, filled at 0x57c83a to 0x57c97b), and no
+script in the install writes it, so every placed object's volume and pan
+come from the screen: the pan from how far across it the object is, the
+volume from the zoom (the far zoom takes 560 of 1024 away, the medium
+280), less off the middle of the screen, and three fifths of that on a
+floor the view does not show (`placement::project`). The game sends
+each object's position (`sims_sim::Object::position`, the original's
++0xf8, +0xf4 and +0x110; `Snapshot::positions`) and its place on the
+screen with the zoom, the screen's size and the floor shown
+(`Snapshot::screen`, from `sims_game::sound::screen`), again whenever
+the camera changes. The place on the screen is the original's (0x570e09):
+the position rotated into the view about 1023, not the drawing's 1024,
+then projected as the original's view does it (0x4a9dc7,
+`sims_game::sound::fine_point`): the tile's corner, then each part of
+the step across the tile cut toward zero on its own, in 16 bits. A point
+can be a pixel off the drawing's (`project_fine`). The original also
+raises the point, and slants the step, by the heights of the tile's
+corners, which is left out (**unverified** on a lot that is not flat).
+Without a place on the screen the placement is a fault.
+
+The same bank corrects three defaults the player had wrong: register 39
+(`BufSizeMult`) starts at 1 and 52 (`tempo`) at 120, and 40
+(`fade_dest`) at 0, not 1. So a `seqgroup_kill` (0x57eef3), which fades
+the holder without setting `fade_dest`, now fades it to 0, not 1.
+
+What the original does with an object it cannot place is kept: an ID
+that names no object, or an object with a first or second coordinate
+of 0, leaves the previous object's values, and the first object's are
+pan 0 and a volume a local held before: the address of the sound
+manager's instance map (0x576235), on the heap. Here that address is
+0x10000d4, **unverified**. It outweighs the other objects in the pan,
+and both the pan and the volume come out where the 32-bit arithmetic
+wraps them: with this address and a `vol` of 1024 the track plays at
+212 of 1024, not at full. A `kArgsIdVolPan`
+kind 1 with object 0 now starts nothing (0x57375b), where it started
+the track; kind 30 records object 0 as an instance, where it skipped it.
+The writes leave the comparison flags the pan's.
+
+The volume and pan are worked out when the event comes, as the original
+does, so `Player::handle` and `Player::play_from` now take the game's
+`Sources`. A track's instances go in the original's multimap's order
+(0x5761c2): the first recorded, then the others newest first. The
+order the map's growth gives them (0x5762c7) is not ported; it only
+matters for an object that cannot be placed.
+
+Not ported: placing every track again on kind 33 (0x57447f), which the
+original's game sends when the camera moves. The game here sends kind
+33 every frame, and placing again would undo a fading `extvol` each
+frame. Also not ported: the limit of 16 voices that kind 1 checks first
+(0x574a87).
+
+**Unverified:** nothing of this has been compared with the running game.
+
 ## 2026-11-15: A group snaps where it does not fit and is deleted; strict mode to tick 3602
 
 **Unverified.** No capture covers any of it: the Goth captures end at
