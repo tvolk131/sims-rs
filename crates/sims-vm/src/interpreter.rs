@@ -908,9 +908,10 @@ impl<'a> Machine<'a, '_> {
                         return Ok(Status::Running);
                     }
                     if state != 0 {
-                        // A primitive that ran a tree (Idle For Input, Run
-                        // Functional Tree and others) resumes instead of
-                        // branching (legacy lib.rs:1737).
+                        // A primitive that ran a tree and keeps a state
+                        // (Idle For Input and others) resumes instead of
+                        // branching (legacy lib.rs:1737). Run Functional
+                        // Tree keeps none, so its call branches below.
                         return Err(Trap::Unsupported(format!(
                             "return into a primitive with saved state {state:#x}"
                         )));

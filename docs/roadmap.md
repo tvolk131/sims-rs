@@ -60,8 +60,8 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 416 on the Goth house**: our
-  state after every one of ticks 1 to 416 equals the fourth capture of the
+  there, as three captures recorded). **K = 417 on the Goth house**: our
+  state after every one of ticks 1 to 417 equals the fourth capture of the
   original (full state after every update) in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
@@ -1433,12 +1433,28 @@ takes the true branch at once to node 7, as the capture does. Clip 0
 clears the slot. The animator keeps the carry layer (snapshot format
 21) and updates it with the foreground layer in the skin's list order.
 
-**Not verified.** The carry layer's fields against a capture; tick 417
-has not run to its end yet.
+**Run Functional Tree** (opcode 20, `0x44f681`,
+`run_functional_tree.rs`). Node 7 of the same tree runs object 174's
+action for a function: the function names a callback in the stack
+object's function table, and its action tree is pushed on the running
+thread as a call, the way Run Tree By Name's mode 2 pushes, with the
+running object's temps as its arguments and a person's use of the
+object noted. Unlike Run Tree By Name, the frame keeps no state, so the
+instruction takes the branch of the tree's result. Object 174's tree
+8215 runs trees 4105 and 4112 of object 52, and the tick ends with the
+same frames and object uses as the capture.
 
-**Stops.** Tick 417, node 7 of the same tree: Run Functional Tree
-(opcode 20), which is not ported. The capture runs tree 8215 of object
-174, then trees 4105 and 4112 of object 52.
+**K = 417.** Our state after tick 417 equals the fourth capture in
+everything compared, but for the head field of "Ticks 334 to 366".
+
+**Not verified.** The carry layer's fields: the capture holds that the
+slot is filled, but not the page its layer is on.
+
+**Stops.** Tick 418: person 21's thread (tree 4113 of object 52)
+routes with two people in the way, whose order on the lot's list of
+people is not modeled (`0x45bb04`). The capture never enters tree 4113
+there: it goes on in tree 4112, with object 92 as the stack object.
+Finding why the two part ways is the next step.
 
 ## Track: drawing people (`crates/sims-people`)
 
