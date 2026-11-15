@@ -21,8 +21,6 @@
 
 use sims_content::{Member, Resource};
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -252,26 +250,14 @@ fn list(directory: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
+/// An archive's members, read by `sims_content`'s reader: the directory is
+/// at most 64 MiB ([`sims_formats::far::MAX_DIRECTORY`]) and is bounded
+/// before it is read. A member that reader leaves out (compressed, or with
+/// a name too long or too deep) is not found by name here. Each member is
+/// read later through [`Resource::read`], which caps it at 128 MiB.
 fn far_members(path: &Path) -> Result<Vec<Member>, String> {
-    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
-    let mut file = File::open(path).map_err(|e| fail(&e))?;
-    let len = file.metadata().map_err(|e| fail(&e))?.len();
-    let mut header = [0; 16];
-    file.read_exact(&mut header).map_err(|e| fail(&e))?;
-    let offset = sims_formats::far::manifest_offset(&header, len).map_err(|e| fail(&e))?;
-    file.seek(SeekFrom::Start(u64::from(offset)))
-        .map_err(|e| fail(&e))?;
-    let mut directory = Vec::new();
-    file.read_to_end(&mut directory).map_err(|e| fail(&e))?;
-    let entries = sims_formats::far::directory(&directory, len).map_err(|e| fail(&e))?;
-    Ok(entries
-        .into_iter()
-        .map(|e| Member {
-            name: e.name,
-            offset: u64::from(e.offset),
-            size: u64::from(e.stored_size),
-        })
-        .collect())
+    let (members, _skipped) = sims_content::far_members(path).map_err(|e| e.to_string())?;
+    Ok(members)
 }
 
 #[cfg(test)]
@@ -319,5 +305,74 @@ mod tests {
         assert_eq!(folder("/install/x.far", Some("A/B\\c.bmp")), "a/b");
         // A file outside the install has no folder but its own.
         assert_eq!(folder("/elsewhere/x.far", Some("Skins\\c.bmp")), "skins");
+    }
+
+    /// A FAR 1a archive with the directory right after the header.
+    /// Each member is `(name, stored bytes, unpacked size)`.
+    fn far(members: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let payload: usize = members.iter().map(|(_, bytes, _)| bytes.len()).sum();
+        let mut out = b"FAR!byAZ".to_vec();
+        out.extend(1u32.to_le_bytes());
+        out.extend(((16 + payload) as u32).to_le_bytes());
+        let mut offset = 16u32;
+        let mut directory = (members.len() as u32).to_le_bytes().to_vec();
+        for (name, bytes, unpacked) in members {
+            out.extend_from_slice(bytes);
+            directory.extend(unpacked.to_le_bytes());
+            directory.extend((bytes.len() as u32).to_le_bytes());
+            directory.extend(offset.to_le_bytes());
+            directory.extend((name.len() as u32).to_le_bytes());
+            directory.extend(name.as_bytes());
+            offset += bytes.len() as u32;
+        }
+        out.extend(directory);
+        out
+    }
+
+    /// A file in the system's temporary directory, removed when dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            Self(
+                std::env::temp_dir().join(format!("sims-people-{name}-{}.far", std::process::id())),
+            )
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_far_directory_over_64_mib_is_refused_before_it_is_read() {
+        let file = Scratch::new("sparse");
+        std::fs::write(&file.0, far(&[])).unwrap();
+        // Sparse: the directory claims the rest of a file over 64 MiB,
+        // which the old reader would have read whole.
+        std::fs::File::options()
+            .write(true)
+            .open(&file.0)
+            .unwrap()
+            .set_len(16 + 64 * 1024 * 1024 + 1)
+            .unwrap();
+        let error = far_members(&file.0).unwrap_err();
+        assert!(error.contains("64 MiB"), "{error}");
+    }
+
+    #[test]
+    fn a_compressed_far_member_is_left_out() {
+        let file = Scratch::new("compressed");
+        std::fs::write(
+            &file.0,
+            far(&[("a.bmp", b"plain", 5), ("Skins\\b.bmp", b"packed", 60)]),
+        )
+        .unwrap();
+        let members = far_members(&file.0).unwrap();
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["a.bmp"]);
+        assert_eq!((members[0].offset, members[0].size), (16, 5));
     }
 }

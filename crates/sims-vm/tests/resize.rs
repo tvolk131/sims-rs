@@ -386,6 +386,61 @@ fn animator_17_bytes(animator: &sims_sim::animator::Animator) -> Vec<u8> {
     bytes
 }
 
+/// A route context's encoding under snapshot format 18: without the
+/// number of the action asking a person to move
+/// ([`sims_sim::route::Context::action`], context +0x90) that format 19
+/// added at its end.
+fn context_18_bytes(context: &sims_sim::route::Context) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(context).unwrap();
+    let added = postcard::to_allocvec(&context.action).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - added.len()), added);
+    bytes
+}
+
+/// The routing's encoding under snapshot format 18: each context as
+/// [`context_18_bytes`] writes it, and without the slot records
+/// ([`sims_sim::route::Routing::slots`]) that format 19 added at the end.
+fn routing_18_bytes(routing: &sims_sim::route::Routing) -> Vec<u8> {
+    let mut bytes = map_bytes(&routing.routes, |route| {
+        let mut bytes = postcard::to_allocvec(&(route.contexts.len() as u64)).unwrap();
+        for context in &route.contexts {
+            bytes.extend(context_18_bytes(context));
+        }
+        bytes.extend(postcard::to_allocvec(&route.path).unwrap());
+        bytes
+    });
+    bytes.extend(postcard::to_allocvec(&routing.slot_flags).unwrap());
+    bytes.extend(postcard::to_allocvec(&routing.unknown_words).unwrap());
+    bytes
+}
+
+/// A lot's encoding as snapshot format 18 wrote it. Format 19 added at
+/// the end of each route context the number of the action that asks a
+/// person to move out of the way, and at the end of the routing the slot
+/// records objects hold in place of their type's. This writes the
+/// routing again without them, so a state pinned under format 18 can be
+/// shown to be the same state but for those fields. The older formats'
+/// encodings start from this one.
+fn format_18_bytes(world: &World) -> Vec<u8> {
+    // The routing is found where a marker routing stands in the same
+    // lot's encoding: an empty routing's bytes can stand in many places.
+    let marker = sims_sim::route::Routing {
+        unknown_words: [(0xbeef, 0xdead_beef)].into(),
+        ..Default::default()
+    };
+    let blank = World {
+        routing: marker.clone(),
+        ..world.clone()
+    };
+    splice(
+        &world.encode(),
+        &blank.encode(),
+        &postcard::to_allocvec(&world.routing).unwrap(),
+        &postcard::to_allocvec(&marker).unwrap(),
+        &routing_18_bytes(&world.routing),
+    )
+}
+
 /// A lot's encoding as snapshot format 17 wrote it. Format 18 added at
 /// the end of each animator the head's angles, turn and target
 /// ([`sims_sim::animator::Animator::head`]). This writes the animators
@@ -397,8 +452,8 @@ fn format_17_bytes(world: &World) -> Vec<u8> {
         ..world.clone()
     };
     splice(
-        &world.encode(),
-        &blank.encode(),
+        &format_18_bytes(world),
+        &format_18_bytes(&blank),
         &postcard::to_allocvec(&world.animators).unwrap(),
         &[0],
         &map_bytes(&world.animators, animator_17_bytes),
@@ -465,8 +520,8 @@ fn format_16_bytes(world: &World) -> Vec<u8> {
         ..world.clone()
     };
     splice(
-        &world.encode(),
-        &blank.encode(),
+        &format_18_bytes(world),
+        &format_18_bytes(&blank),
         &postcard::to_allocvec(&world.animators).unwrap(),
         &[0],
         &map_bytes(&world.animators, animator_16_bytes),
@@ -480,8 +535,8 @@ fn without_motion_steps(world: &World) -> Vec<u8> {
         ..world.clone()
     };
     splice(
-        &world.encode(),
-        &blank.encode(),
+        &format_18_bytes(world),
+        &format_18_bytes(&blank),
         &postcard::to_allocvec(&world.animators).unwrap(),
         &[0],
         &map_bytes(&world.animators, animator_15_bytes),
@@ -554,7 +609,7 @@ fn format_13_bytes(world: &World) -> Vec<u8> {
     old.animators.clear();
     let mut encoded = format_14_bytes(&old);
     let mut tail = postcard::to_allocvec(&world.usage).unwrap();
-    tail.extend(postcard::to_allocvec(&world.routing).unwrap());
+    tail.extend(routing_18_bytes(&world.routing));
     assert_eq!(encoded.split_off(encoded.len() - tail.len()), tail);
     assert_eq!(encoded.pop(), Some(0));
     let count = world.animators.len() as u64;
@@ -2006,15 +2061,18 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// tick 356 on person 259 stands on sloped tiles, whose height comes from
 /// the tile's corners (0x478dfe).
 ///
-/// Tick 367 then fails loudly: person 18's route to a slot finds no way,
-/// because person 21 is in it (the place test's collision is now told
-/// apart, 0x48158c), and step 6 of the route, which tries again and asks
-/// a person in the way to move (0x45b066, 0x45ba28), is not ported. Our
-/// state after each of ticks 1 to 366 equals the fourth capture (full
-/// state after every update), as compared outside this test, but for one
-/// field: person 16's head target height (+0x220) is one unit in the last
-/// place lower on some ticks from 335 to 353, for a reason that is
-/// **unknown** (the bones' pages are not captured).
+/// In tick 367 person 18's route to a slot finds no way, because person
+/// 21 is in it. Step 6 of the route tries again, finds person 21 in the
+/// way (0x45ba28) and asks it to move (0x45bf2e, 0x45d20b), and step 14
+/// plays the asking tree. In tick 368 person 21 puts on a book
+/// (Change Suit/Accessory, opcode 6). Our state after each of ticks 1 to
+/// 408 equals the fourth capture (full state after every update), as
+/// compared outside this test, but for one field: person 16's head target
+/// height (+0x220) is one unit in the last place lower on some ticks from
+/// 335 on, for a reason that is **unknown** (the bones' pages are not
+/// captured). In tick 409 person 18's route plays its waiting tree, and
+/// person 18 looks at person 16 where the capture has it look at person
+/// 259: the first tick that differs, which this test does not run.
 ///
 /// The first capture does not choose in tick 233: its one draw from the
 /// lot's stream in ticks 233 and 234 comes in tick 234, and after tick
@@ -2045,9 +2103,10 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// 261 is pinned again under format 17 (`TICK_261_17`). The states after
 /// ticks 261 and 333 were pinned under format 17, before the head's fields
 /// were kept, and still hold ([`format_17_bytes`]); the state after tick
-/// 333 is pinned again under format 18 (`TICK_333`), and so are the states
-/// after ticks 334 and 366. The digests are of our own state, as built
-/// here.
+/// 333 is pinned again under format 18 (`TICK_333_18`), and so are the
+/// states after ticks 334 and 366; they still hold under format 19
+/// ([`format_18_bytes`]), which pins the states after ticks 367 and 408. The
+/// digests are of our own state, as built here.
 #[test]
 fn the_goth_house_first_tick_matches_the_original() {
     const TICK_1_9: &str = "62fc28f5e7689d166791a620dbed066fb8a7d707ea79017fbadf0eed3da5c937";
@@ -2064,9 +2123,11 @@ fn the_goth_house_first_tick_matches_the_original() {
     const TICK_261: &str = "1b931d4492d3e02a8c72bcb658c55110e6b0f535cd20d99a937d09b6d62a420b";
     const TICK_261_17: &str = "2cc7b436d7f3e46f09b4801883c5d258d7d1e1e7411ba32e54eb1c8e52c419d4";
     const TICK_333_17: &str = "d82f96a31cf3dfd69c64b0b7ea14c0f943feb566ed2ecf7abdc8bcf845200916";
-    const TICK_333: &str = "8c1e86596e70a9d320c14794e7483c4a8a9304c36236c0b1d4f3257f4d69af95";
-    const TICK_334: &str = "85a315a4b435176ffe2e09ce08fb75880c792a0313743c94c21548f65653ef8b";
-    const TICK_366: &str = "d9bcf685db4e2c1186715bf7a674c640bd8c4cbd6cbed374644c370b242667f0";
+    const TICK_333_18: &str = "8c1e86596e70a9d320c14794e7483c4a8a9304c36236c0b1d4f3257f4d69af95";
+    const TICK_334_18: &str = "85a315a4b435176ffe2e09ce08fb75880c792a0313743c94c21548f65653ef8b";
+    const TICK_366_18: &str = "d9bcf685db4e2c1186715bf7a674c640bd8c4cbd6cbed374644c370b242667f0";
+    const TICK_367: &str = "0a9a7c29774c3b5cee673ab0bc94f319a95b72fb9787e282ec9cbedc9975e82a";
+    const TICK_408: &str = "7a9c943eba9536e011feafaf60b611e9d9accad6a0a50f8c13856dc72d4cb4d1";
     const USES_233: [(i16, i32); 2] = [(132, 5), (51, 8)];
     const TREES_233: [u16; 9] = [
         0x1000, 0x2001, 0x205b, 0x2029, 0x100e, 0x1014, 0x1012, 0x1009, 0x1010,
@@ -2435,7 +2496,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         }
         assert_eq!(world.ticks, before.ticks + 333);
         assert_eq!(digest(&format_17_bytes(world)), TICK_333_17);
-        assert_eq!(digest(&world.encode()), TICK_333);
+        assert_eq!(digest(&format_18_bytes(world)), TICK_333_18);
         // Tick 334: person 16 looks towards person 259 (Look Towards, mode
         // 0, sets its person data words 41 to 45), and its head then
         // follows it (0x590768, 0x5904d2): it measures the heading from
@@ -2461,7 +2522,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         for id in [18, 21, 259] {
             assert_eq!(world.animators[&id].head, sims_sim::head::Head::LOADED);
         }
-        assert_eq!(digest(&world.encode()), TICK_334);
+        assert_eq!(digest(&format_18_bytes(world)), TICK_334_18);
         // Ticks 335 to 366, with a frame after tick 363.
         for tick in 335..=366 {
             interpreter.lot_update(world, &tuning, &mut player).unwrap();
@@ -2493,16 +2554,49 @@ fn the_goth_house_first_tick_matches_the_original() {
             }
         }
         assert_eq!(world.ticks, before.ticks + 366);
-        assert_eq!(digest(&world.encode()), TICK_366);
-        // Tick 367 stops loudly: person 18's route to a slot finds no way,
-        // because person 21 stands in it, and the step that tries again
-        // and asks a person in the way to move (0x45b066, 0x45ba28) is not
-        // ported.
-        let error = interpreter
-            .lot_update(world, &tuning, &mut player)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("object 18"), "{error}");
-        assert!(error.contains("0x45b066"), "{error}");
+        assert_eq!(digest(&format_18_bytes(world)), TICK_366_18);
+        // Tick 367: person 18's route to a slot finds no way, because
+        // person 21 stands in it. Step 6 tries again, then finds person 21
+        // in the way (0x45ba28) and asks it to move (0x45bf2e): a marker
+        // (260) is made where person 21 stands and person 21 is given
+        // action 4, to go to the marker's move slot. The slot search draws
+        // 72 times from the lot's stream (0x483b02). Step 14 then plays
+        // "route ask to move animation" with person 21 as the stack
+        // object.
+        interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        assert_eq!(world.ticks, before.ticks + 367);
+        assert_eq!(world.lot_rng.state(), 689_947_733);
+        assert_eq!(world.action_serial, 4);
+        assert_eq!(world.objects[&260].guid, 0x7c4);
+        let asked = &world.objects[&21].person.as_ref().unwrap().queue;
+        assert_eq!(
+            asked
+                .iter()
+                .map(|a| (a.uid, a.caller, a.target, a.table_index, a.priority))
+                .collect::<Vec<_>>(),
+            [(4, 21, 260, 3, 2)]
+        );
+        let context = world.routing.routes[&18].contexts.last().unwrap();
+        assert_eq!((context.objects[1], context.action), (21, 4));
+        assert!(world.routing.slots.contains_key(&(260, 0)));
+        assert_eq!(digest(&world.encode()), TICK_367);
+        // Tick 368: person 21 takes a book from the bookcase (object 132),
+        // whose tree puts on the accessory "suit-book101" (Change
+        // Suit/Accessory, opcode 6). The capture shows one accessory on
+        // person 21 from update 368 on.
+        for tick in 368..=408 {
+            interpreter.lot_update(world, &tuning, &mut player).unwrap();
+            if tick == 368 {
+                let worn = &world.objects[&21].person.as_ref().unwrap().accessories;
+                assert_eq!(
+                    worn.iter()
+                        .map(|a| (a.name.as_str(), a.binding.as_str()))
+                        .collect::<Vec<_>>(),
+                    [("suit-book101", "")]
+                );
+            }
+        }
+        assert_eq!(world.ticks, before.ticks + 408);
+        assert_eq!(digest(&world.encode()), TICK_408);
     });
 }

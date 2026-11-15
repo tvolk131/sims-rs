@@ -247,6 +247,167 @@ the original draws them.
   light. Night outdoors. Whether the original lights a wall by the room
   on its visible side. Lamp pools. Any of these would reopen the formula.
 
+## 2026-11-14: Change Suit/Accessory, and K = 408
+
+Tick 368 of the Goth house stopped on Change Suit/Accessory (opcode 6,
+`0x45d962`). It is ported in `primitives/change_suit.rs`, with the
+animator's "dress" and "undress" (virtual functions 0xd8 and 0xdc,
+`0x58d88f` and `0x58d919`) as functions on the person's accessory list,
+which the world already keeps from the saved file. Our state then
+equals the fourth capture through tick 408 in every field the verifier
+compares, with two known exceptions: person 16's head target height is
+one ULP low on some ticks, and its head turn a few ULP with it (as
+before this step), and the capture holds
+the accessory count, not the entry's name or binding. K goes from 367
+to 408.
+
+What was decided:
+
+- **A suit no decoded avatar file names fails loudly; any other is
+  taken to bind.** The original adds the entry, then binds its suit to
+  the skeleton (`0x583559`), storing the name and binding only when that
+  works; an entry that fails stays with an empty name. Read from the
+  code, the bind fails only when the suit lookup (`0x5a044d`) does: the
+  name is not in the avatar registry, or the registry's lazy load of it
+  (`0x5a38da`) fails. The attach after it (`0x599427`, through
+  `0x5954d8`) has no failure path. The content loader now reads every
+  avatar file's skeletons and suits record by record, as the original's
+  catalog reader does (so a file holding animations still gives its
+  suits), and keeps the suit names (`People::suits`, lowered) and the
+  files that stopped decoding (`People::suit_errors`). Putting on a
+  name outside that set is `Trap::Unsupported` before anything changes,
+  naming any such files. **Unverified**: that the registry holds exactly
+  these names (the install has no NDX index, so where it gets them is
+  not read) and that its lazy load succeeds whenever ours decodes. The
+  capture shows the entry count (one, from update 368), not the entry.
+  Sol asked that every bind fail loudly until the registry is ported;
+  rejected, since the code leaves only that registry question, and
+  refusing would stop the one case the capture shows.
+- **Only the words a branch reads must be known.** Suits 0 to 7 read no
+  person data; others read the suit and age, and the variant only on
+  the suit already worn. Writing the suit and variant makes them known.
+  The age compare is signed (`0x45d9b4`), so a negative age is a
+  child's.
+- **Clip events "dress" and "undress" still fail loudly.** They call the
+  same functions, but how the event's value becomes a name and binding
+  (`0x5912fd`) is not read yet.
+- **The variant draws use the active stream** (`0x46f457`, as Find Best
+  Interaction's draws), so `Machine::draw` is now shared.
+
+What would reopen it: a lot that puts on a suit no skeleton file
+defines (it stops loudly now), or a capture page holding the entry.
+
+The first difference is in tick 409, where person 18's route plays its
+waiting tree and looks at another person than the original does. It is
+silent, not a stop, and is the next step.
+
+## 2026-11-14: A route asks a person in the way to move, and K = 367
+
+In tick 367 of the Goth house, person 18's route finds person 21 in its
+way. The route now tries again (step 6), asks person 21 to move, and
+plays the asking animation (step 14). Our state after tick 367 equals
+the fourth capture. Tick 368 stops loudly on Change Suit/Accessory. K
+goes from 366 to 367.
+
+Terms used here. The *asking person* routes; the *asked person* stands
+in the way. A *marker* is the small object made where the asked person
+stands; the asked person is given an action to walk to one of the
+marker's slots.
+
+What was decided:
+
+- **Route steps 6, 14 and 16 are ported** (0x45b066, 0x45b475,
+  0x45aef7), with the retry count (+0x58) and noted place (+0x60,
+  +0x64) read at the start of each run of the steps and written back
+  at its end (0x45b9a0), not put back as they were. Step 16 fails
+  loudly where it would read the route's slot flags on a later run,
+  because the original reads them through a null slot record there
+  (0x45ad54 passes 0 after the first run).
+- **The person in the way and the marker are ported** (0x45ba28,
+  0x45bf2e), in `primitives/in_way.rs`. The lot's own list of people is
+  not modeled, so more than one candidate fails loudly (0x45bb04): the
+  order would matter. The marker's move slot is kept in a new map,
+  `Routing::slots`, which Go To Routing Slot reads before the type's
+  slot table; deleting an object drops its records.
+- **Queueing an action is ported for the plain case** (0x45d20b): the
+  next action number, then a priority insert; a full queue (8) takes
+  nothing. Running at once, putting at the front and pushing queued
+  actions out fail loudly. Taking an action out of a queue (0x45d5f8)
+  calls each removed action's object with function 4 and then checks
+  that the queue was not changed by those calls; the person running the
+  action fails loudly.
+- **Snapshot format 19** keeps the context's action number (+0x90) and
+  the slot records. The format 18 pins still hold with them left out
+  (`format_18_bytes`).
+- **Slot flag 0x2000 adds a random part** to each place's score: one
+  draw from the active stream, modulo 20, less 10 (0x483b02). The
+  capture's 72 draws in tick 367 match one draw per place in range.
+- **The slot search scores each place once.** The loop at 0x483a5d
+  takes the place at the standing index or at the index after the
+  seats, whichever weight is larger, never both. Our second pass over
+  refused places was wrong; it never showed before, as classification
+  has no other effect. This is a correction to an earlier reading.
+- **Look Towards modes 2 and 3 are ported** (0x45a9c1): a route from the
+  person's place to itself and then to the target (mirrored through the
+  person in mode 3). Mode 1 reads the camera and fails loudly.
+
+Not yet reached by a capture comparison: step 14's waiting tree, the
+third and fourth retries, step 16 and the end-of-route release. They
+are ported from the disassembly. The capture shows the waiting tree at
+update 409 and the route ending at 489, so they are checked as K passes
+those ticks.
+
+The Sol review raised two findings, both rejected:
+- *Function 4 should run after the action leaves the queue.* The
+  original runs it with the queue intact (0x45d697 to 0x45d70b; see
+  `release_action`).
+- *Format 19 should still decode format 18.* Snapshots refuse any
+  other format by design (`FORMAT`), as for formats 15 to 18. Saves
+  with migrations are a separate format.
+
+What would reopen it: a capture where a slot search with flag 0x2000
+draws a different number of times, or a house with two people in a
+route's way.
+
+
+## 2026-11-14: The ambient scores play as the original's score player does
+
+`crates/sims-audio/src/ambience.rs` plays the FSC scores (backyard,
+beach, park, Magic Town). How the original's score player behaves was
+read from its code in a memory image (read only, never written); none
+of it was heard, since the harness runs the game with `-nosound`.
+
+- A score is a grid of cells. A cursor moves over it: the row from a
+  value the game computes from the camera, the column from the hour.
+  On the score's beat the player picks cells near the cursor, weighted
+  by each cell's chance, groups and exclusions, until enough are
+  playing. A picked cell loads, starts on the next first beat, and
+  frees its slot when its sound ends.
+- The ambience modes (kind 52) and the ambience half of the music modes
+  (kind 36) start and stop the scores as the original's dispatcher
+  does. The music half of kind 36 is not ported and is still reported.
+- Random draws come from the player's seeded generator, not the
+  original's `rand`, so the picks differ from the original's but repeat
+  for a seed.
+- **Unverified:** how a cell's position maps to pan (taken as HIT pan
+  `512 + 512x`); that the value 0x570c3e computes comes from the camera
+  and that the second input is the hour; whether the sound system finds
+  a cell's file outside the score's directory (the Magic Town score has
+  50 such cells, which do not play here).
+- Two of the original's quirks are kept: the beat clock wraps after
+  about five hours of one score playing, and a beat can pick one cell
+  past the score's limit. One guard is not the original's: a looping
+  cell whose sound the mixer dropped frees its slot.
+- **Left out:** fade in and out, the fast counter, the delay,
+  quantise, stereo and third random fields, tempo changes and pausing.
+
+The simulation has to provide the camera value and the hour (through
+`Player::set_ambience_view`) for the cursor to move; until then the
+cursor stays where the modes put it.
+
+Reopen when a run with sound can be compared, or when the simulation
+gives the cursor's inputs.
+
 ## 2026-11-14: The people viewer runs a booted lot
 
 `people-viewer --boot` boots the house with `sims_vm::boot::Lot` (the
