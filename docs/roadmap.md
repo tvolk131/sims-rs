@@ -1863,6 +1863,12 @@ Progress:
   the Goths' people alone over their lot every 120 ticks at four
   rotations and checks that something hides them at times, that their
   feet show in most views, and that nobody is hidden throughout.
+- Done: people are lit by the original's standard light at their room's
+  level (`Lighting::standard`, `sims_people::lot::level`): a person in
+  full light is drawn at full light all over, as the original draws
+  Mortimer on the porch in a screenshot, and one in a dim room shows the
+  side towards the light, which stays behind the viewer as the view
+  turns. Room lamps, the level's fade and the night cap are not ported.
 - Done: the plumb bob (`sims_people::bob`) over the person whose head
   slot holds it: the original's `head-arrow` mesh, three units over the
   head bone, spinning half a turn a second by a clock the app gives

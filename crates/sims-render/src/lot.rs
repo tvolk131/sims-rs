@@ -210,18 +210,7 @@ impl Lot {
             .rooms
             .rooms
             .iter()
-            .map(|(&id, r)| {
-                // A room the room update has never counted has no light
-                // yet (every counted room has at least one tile). Draw
-                // the outdoors in daylight then, so a house read without
-                // a load still shows; indoors keeps its light of 0.
-                let light = if r.half_tiles == 0 && r.outdoors {
-                    1.0
-                } else {
-                    r.shown_light().to_f32()
-                };
-                (id, light_byte(light))
-            })
+            .map(|(&id, r)| (id, room_light(r)))
             .collect();
         let halves = world
             .rooms
@@ -379,6 +368,21 @@ fn lamps(
         }
     }
     records
+}
+
+/// The light byte the original stores for a room's tiles: the light the
+/// room shows ([`sims_sim::rooms::Room::shown_light`]) as [`light_byte`]
+/// makes it. A room the room update has never counted has no light yet
+/// (every counted room has at least one tile); the outdoors is drawn in
+/// daylight then, so a house read without a load still shows, and indoors
+/// keeps its light of 0.
+pub fn room_light(room: &sims_sim::rooms::Room) -> u8 {
+    let light = if room.half_tiles == 0 && room.outdoors {
+        1.0
+    } else {
+        room.shown_light().to_f32()
+    };
+    light_byte(light)
 }
 
 /// A room's light as the byte the original stores for its tiles: the light
