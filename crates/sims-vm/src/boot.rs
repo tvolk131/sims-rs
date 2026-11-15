@@ -16,9 +16,10 @@ use crate::play::Play;
 use crate::{Answers, Callback, Interpreter, Program, Stream, TickError, Update};
 use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People};
 use sims_sim::World;
-use sims_sim::load::Context;
+use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Anything that stops a boot, with a message that says where.
@@ -551,6 +552,9 @@ impl Lot {
             )?;
             load.family = family;
             load.house = number;
+            // 0x42821a: the people who are not visitors, noted before the
+            // family is selected.
+            let residents = world.residents();
             world.select_family(
                 i16::try_from(family)?,
                 i16::try_from(number)?,
@@ -566,8 +570,8 @@ impl Lot {
             load.reset = visited.reset.len();
             load.stopped = visited.stopped.map(|fault| fault.to_string());
             // 14: the indicators are created if no visit made them. 15: the
-            // end of the household selection, which has nothing to do on a
-            // lot whose people are all members of the household. 16: the
+            // end of the household selection, which works out again who is
+            // a visitor (`World::finish_selection`). 16: the
             // loaded house is announced, which asks for the indicators once
             // more and clears the selected Sim. 17 and 18: the funds are set
             // again and the family's first member is selected. 19: the game
@@ -576,7 +580,28 @@ impl Lot {
             // clears global 12.
             if load.stopped.is_none() {
                 let made = interpreter.ensure_indicators(&mut world)?.is_some();
-                world.finish_selection(record.flags)?;
+                // The types registered from the neighborhood's
+                // Characters folder, which the original registers with
+                // kind 1 (0x424a8b, 0x43c228).
+                let characters: BTreeSet<u32> = catalog
+                    .objects
+                    .iter()
+                    .map(|o| o.guid)
+                    .filter(|&guid| {
+                        catalog.object(guid).is_some_and(|o| {
+                            index.mounts[index.resources[o.resource].mount].path
+                                == Index::CHARACTERS
+                        })
+                    })
+                    .collect();
+                world.finish_selection(&Household {
+                    house: i32::try_from(number)?,
+                    flags: record.flags,
+                    members: &record.members,
+                    characters: &characters,
+                    residents: &residents,
+                    zoning: &program.zoning,
+                })?;
                 let made_again = interpreter.announce_house(&mut world)?.is_some();
                 let sim =
                     interpreter.select_resident(&mut world, record.budget, &record.members)?;
