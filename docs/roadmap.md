@@ -2144,8 +2144,10 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   selected Sim's five trait bars (Neat, Outgoing, Active, Playful,
   Nice) in the subpanel, laid out as the original's bar maker does
   (0x51df31). The Goths' panel is pinned by digest, gated on
-  `SIMS_INSTALL`; it is not yet compared with a screenshot, and the
-  zodiac sign under the bars is not drawn. In the window, the
+  `SIMS_INSTALL`; it is not yet compared with a screenshot. The sign of
+  the zodiac shows at the panel's bottom left: the one saved in the
+  person's data, or else the one nearest their traits (0x4841fc). In
+  the window, the
   personality, needs, job and relationship panels show the selected
   Sim's live person data, motives, skills and relationship rows, and
   follow a press on another portrait; the needs are also checked to
@@ -2178,8 +2180,8 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   stand-in for steps 17 and 18; a screenshot of an open pie menu; a
   Yes/No dialog checked
   against the original (the "Help System" one at tick 2) for the layout
-  of several buttons; text entry dialogs; the personality panel's
-  zodiac sign; the job panel's left column (the career's icon and
+  of several buttons; text entry dialogs; the sign's help balloon
+  (its compatible signs); the job panel's left column (the career's icon and
   title, the salary, the performance and the friends needed); the
   relationship panel's Superstar filter and which people the original
   leaves out; the other live panels.
