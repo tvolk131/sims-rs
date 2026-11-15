@@ -54,9 +54,8 @@ pub struct Hud {
     band: Option<Rect>,
     /// The selected Sim's actions, as last drawn.
     queue: Queue,
-    /// The actions whose icons were pressed while they show: a second
-    /// press on an icon does nothing (0x4cb148).
-    pressed: BTreeSet<i32>,
+    /// The actions whose icons were pressed while they show.
+    pressed: Pressed,
     /// The interface's sounds, until the game takes them.
     sounds: Vec<SoundEvent>,
 }
@@ -109,7 +108,7 @@ impl Hud {
             menu: None,
             band: None,
             queue: Queue::default(),
-            pressed: BTreeSet::new(),
+            pressed: Pressed::default(),
             sounds: Vec::new(),
         })
     }
@@ -167,9 +166,7 @@ impl Hud {
         let snapshot = Snapshot::read(world, &self.members);
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         self.queue = Queue::read(world, snapshot.selected);
-        // An icon gone takes its press with it.
-        let shown: BTreeSet<i32> = self.queue.icons.iter().map(|i| i.uid).collect();
-        self.pressed.retain(|uid| shown.contains(uid));
+        self.pressed.keep(&self.queue);
         let (width, height) = (
             u32::try_from(canvas.width).unwrap_or(u32::MAX),
             u32::try_from(canvas.height).unwrap_or(u32::MAX),
@@ -286,13 +283,20 @@ impl Hud {
             self.play(ERROR);
             return Some(None);
         }
-        if cancelled || !self.pressed.insert(uid) {
+        if cancelled || !self.pressed.press(uid) {
             return Some(None);
         }
         Some(Some(Command::CancelAction {
             sim: person,
             action: uid,
         }))
+    }
+
+    /// Forgets the press on `uid`'s icon, whose cancel never reached the
+    /// simulation (the lot refused it, or has stopped), so that the icon
+    /// takes the next press. In the original a cancel cannot fail.
+    pub fn release(&mut self, uid: i32) {
+        self.pressed.release(uid);
     }
 
     /// Moves the pointer; true if what it hovers changed.
@@ -357,11 +361,75 @@ impl Hud {
                 Press::Closed => None,
             };
         }
+        // The status band is drawn over everything else on the lot,
+        // the icons too, and takes the press.
+        if self.band.is_some_and(|b| b.contains(point[0], point[1])) {
+            return None;
+        }
         if let Some(command) = self.press_queue(point) {
             return command;
         }
         let command = hud::press(&self.items, point)?;
         self.controls.apply(&command);
         Some(command)
+    }
+}
+
+/// The actions whose icons were pressed while they show: a second press
+/// on an icon does nothing (0x4cb148, the icon's +0xf1).
+#[derive(Debug, Default)]
+struct Pressed(BTreeSet<i32>);
+
+impl Pressed {
+    /// Notes a press on `uid`'s icon; false if it was pressed already.
+    fn press(&mut self, uid: i32) -> bool {
+        self.0.insert(uid)
+    }
+
+    /// Forgets the press on `uid`'s icon.
+    fn release(&mut self, uid: i32) {
+        self.0.remove(&uid);
+    }
+
+    /// Keeps the presses of the icons `queue` shows: an icon gone takes
+    /// its press with it.
+    fn keep(&mut self, queue: &Queue) {
+        self.0
+            .retain(|uid| queue.icons.iter().any(|icon| icon.uid == *uid));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sims_ui::frame::Rect;
+    use sims_ui::queue::{Icon, Picture};
+
+    #[test]
+    fn an_icon_takes_one_press_until_released_or_gone() {
+        let icon = |uid| Icon {
+            uid,
+            picture: Picture::Object(1),
+            yellow: false,
+            cancelled: false,
+            rect: Rect::new(32, 32, 45, 45),
+        };
+        let mut pressed = Pressed::default();
+        assert!(pressed.press(7));
+        assert!(!pressed.press(7));
+        // A cancel that failed lets the icon be pressed again.
+        pressed.release(7);
+        assert!(pressed.press(7));
+        // Shown again, the press stays; gone, it goes.
+        let mut queue = Queue {
+            person: Some(1),
+            pet: false,
+            icons: vec![icon(7)],
+        };
+        pressed.keep(&queue);
+        assert!(!pressed.press(7));
+        queue.icons.clear();
+        pressed.keep(&queue);
+        assert!(pressed.press(7));
     }
 }

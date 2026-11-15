@@ -682,10 +682,12 @@ impl Game {
     /// Cancels `sim`'s action numbered `action`, as a press on its icon
     /// does (`Lot::cancel`, 0x4ea3e3), keeping the sounds the trees made,
     /// then plays `UI_queue_delete` if the press counts and `UI_error` if
-    /// not (0x4cb16e).
+    /// not (0x4cb16e). A cancel the lot refuses, or a stopped lot, leaves
+    /// the icon to take another press.
     fn cancel(&mut self, sim: u16, action: i32) {
         if self.stopped.is_some() {
             self.note = Some("The lot has stopped, so it takes no orders.".into());
+            self.hud.release(action);
             return;
         }
         match self.lot.cancel(sim, action) {
@@ -697,7 +699,11 @@ impl Game {
                     crate::hud::ERROR
                 });
             }
-            Err(e) => self.note = Some(format!("The action was not cancelled: {e}")),
+            Err(e) => {
+                // The lot is as it was, so the icon takes another press.
+                self.hud.release(action);
+                self.note = Some(format!("The action was not cancelled: {e}"));
+            }
         }
     }
 

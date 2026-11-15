@@ -624,9 +624,21 @@ fn a_press_on_an_actions_icon_cancels_it() {
     assert_eq!(icon.picture, Picture::Object(fridge));
     assert!(!icon.yellow && !icon.cancelled);
     assert_eq!(icon.rect, Rect::new(32, 32, 45, 45));
-    // A press on it takes it off the queue, with the interface's sound.
-    game.take_sounds();
     let centre = [icon.rect.x + 22, icon.rect.y + 22];
+    // In a narrow window the note the order left across the top wraps
+    // down over the icon; a press there is the band's, and cancels
+    // nothing. The press clears the note.
+    game.resize([80, 600]);
+    game.render();
+    game.take_sounds();
+    let under_band = [icon.rect.x + 22, icon.rect.y + 8];
+    assert_eq!(game.queue().at(under_band).map(|i| i.uid), Some(icon.uid));
+    game.press(under_band);
+    assert_eq!(mortimer(&game).queue.len(), 1);
+    assert!(game.take_sounds().is_empty());
+    game.resize([800, 600]);
+    game.render();
+    // A press on it takes it off the queue, with the interface's sound.
     assert!(game.over_panel(centre));
     game.press(centre);
     assert!(mortimer(&game).queue.is_empty());

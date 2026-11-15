@@ -61,6 +61,12 @@ out, because the queue keeps no names.
 `UI_error` for object -4 as the original's does. No capture compares the
 drawn icons yet.
 
+**Ours, from Sol's review.** A press on the status band across the top
+is the band's, even where a wrapped note covers an icon. A cancel that
+never reaches the simulation (the lot refuses it, or has stopped) leaves
+the icon to take another press. In the original a cancel cannot fail,
+and it has no such band.
+
 ## 2026-11-15: The panel follows the lot; a portrait under the pointer shows a first name
 
 The coordinator asked for the panel to be wired to live state: the
