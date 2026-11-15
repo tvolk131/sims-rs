@@ -13,7 +13,7 @@
 //! and [`rooms`] works out the lot's rooms from its walls and counts
 //! them: their size, what stands in them, their light and their score.
 //! [`route`] holds the people's routes. [`motives`] decays a person's motives and works out the mood.
-//! [`neighbors`] holds the neighborhood's people, and [`animator`] what
+//! [`grass`] grows the lawn. [`neighbors`] holds the neighborhood's people, and [`animator`] what
 //! each person's animator keeps.
 //!
 //! The state holds every field the readers decode. Bytes the readers keep
@@ -22,6 +22,7 @@
 
 pub mod animator;
 mod error;
+pub mod grass;
 pub mod head;
 pub mod load;
 pub mod motives;
