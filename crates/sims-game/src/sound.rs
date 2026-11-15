@@ -14,12 +14,19 @@
 //!   outdoors, which the original works out from the camera each frame
 //!   (0x570c3e, `sims_audio::ambience::view`; the game sends
 //!   `Game::ambience_view`).
+//!
+//! What the sound scripts ask about an object (`getsrcdatafield`) is
+//! read from the lot between ticks ([`sources`]) and sent as a
+//! [`Snapshot`].
 
 use sims_audio::SoundEvent;
 use sims_audio::files::SoundFiles;
 use sims_audio::module::Module;
-use sims_audio::player::{NoSources, Player};
+use sims_audio::player::Player;
+use sims_audio::sources::{FIELDS, Snapshot};
 use sims_audio::stations::StationLists;
+use sims_core::F32;
+use sims_sim::World;
 use sims_ui::command::Speed;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -34,6 +41,81 @@ const REPORTED: usize = 256;
 /// The player's seed. The sound's randomness never reaches the
 /// simulation, so any fixed seed does.
 const SEED: u64 = 1;
+
+/// Person data words the object query reads (0x570e61).
+const FLAGS: usize = 74;
+const AGE: usize = 58;
+const GENDER: usize = 65;
+
+/// Object data word 29: the room the object was last put in.
+const ROOM: usize = 29;
+
+/// The motive field 14 reads.
+const MOTIVE: usize = 3;
+
+/// The single 0.1 at 0x669420 that field 14 scales the motive by.
+const TENTH: F32 = F32::from_bits(0x3dcc_cccd);
+
+/// The person data word fields 2, 3, 5, 6, 7, 11, 12 and 15 to 20 read,
+/// each divided by 10.
+const TENTHS: [(usize, usize); 13] = [
+    (2, 10),
+    (3, 9),
+    (5, 15),
+    (6, 11),
+    (7, 12),
+    (11, 17),
+    (12, 18),
+    (15, 2),
+    (16, 3),
+    (17, 4),
+    (18, 5),
+    (19, 6),
+    (20, 7),
+];
+
+/// The original's answers to `getsrcdatafield` for every object on the
+/// lot (0x570e61; `sims_audio::sources` lists them). A word the object
+/// does not have reads as 0.
+pub fn sources(world: &World) -> Snapshot {
+    let hour = i32::from(world.globals.first().copied().unwrap_or(0));
+    // 0x466fcc then 0x46810a: the room's half tiles over 2, as `idiv`.
+    let room_tiles = |room: Option<i16>| {
+        room.and_then(|id| world.rooms.rooms.get(&id))
+            .map_or(100, |room| room.half_tiles / 2)
+    };
+    let mut absent = [0; FIELDS];
+    absent[4] = hour;
+    absent[13] = room_tiles(None);
+    let objects = world
+        .objects
+        .values()
+        .map(|object| {
+            let mut answers = [0; FIELDS];
+            answers[4] = hour;
+            answers[13] = room_tiles(object.data.get(ROOM).copied());
+            if let Some(person) = &object.person {
+                let word = |i: usize| i32::from(person.data.get(i).copied().unwrap_or(0));
+                answers[0] = if word(FLAGS) & 0b1100 != 0 {
+                    1000
+                } else if word(AGE) < 12 {
+                    2
+                } else {
+                    word(GENDER)
+                };
+                answers[1] = word(AGE);
+                for (field, i) in TENTHS {
+                    answers[field] = word(i) / 10;
+                }
+                let motive = F32::from_f32(person.motives.get(MOTIVE).copied().unwrap_or(0.0));
+                answers[14] = (motive.ext() * TENTH.ext()).to_i32_truncate();
+            }
+            (i32::from(object.id), answers)
+        })
+        .filter(|(id, _)| *id > 0)
+        .collect();
+    Snapshot { objects, absent }
+}
 
 /// The sound scripts' speed register for the game's speed (unverified).
 pub fn speed_register(speed: Speed) -> i32 {
@@ -71,6 +153,8 @@ pub enum Input {
     /// The ambience's camera value (see the module documentation).
     View(i32),
     Speed(Speed),
+    /// What the sound scripts may ask about the lot's objects.
+    Sources(Snapshot),
 }
 
 /// The sound player with every module, station and ambient score of an
@@ -79,6 +163,7 @@ pub struct Mixer {
     player: Player<SoundFiles>,
     hour: u32,
     view: i32,
+    sources: Snapshot,
     /// Faults already reported, so each is reported once.
     reported: BTreeSet<String>,
 }
@@ -97,6 +182,7 @@ impl Mixer {
             player,
             hour: u32::MAX,
             view: 0,
+            sources: Snapshot::default(),
             reported: BTreeSet::new(),
         })
     }
@@ -111,6 +197,7 @@ impl Mixer {
             }
             Input::Hour(hour) => self.hour = hour,
             Input::View(view) => self.view = view,
+            Input::Sources(sources) => self.sources = sources,
             Input::Speed(speed) => self
                 .player
                 .set_global(SPEED_REGISTER, speed_register(speed)),
@@ -122,7 +209,7 @@ impl Mixer {
     /// frame.
     pub fn render(&mut self, frames: usize) -> Vec<i16> {
         self.player.set_ambience_view(self.view, self.hour);
-        self.player.render_stereo(frames, &NoSources)
+        self.player.render_stereo(frames, &self.sources)
     }
 
     /// Faults not reported yet, each once, up to [`REPORTED`] of them; a

@@ -3,6 +3,7 @@
 use sims_audio::levels;
 use sims_audio::module::Module;
 use sims_audio::player::{BLOCK, NoSources, Player, RATE, Sources};
+use sims_audio::sources::Snapshot;
 use sims_audio::{Pcm, SoundEvent};
 use std::collections::BTreeMap;
 
@@ -234,9 +235,9 @@ fn hit_lists_choose_with_the_seed() {
 struct Gender(i32);
 
 impl Sources for Gender {
-    fn field(&self, object: u32, source: i32, field: i32) -> i32 {
-        assert_eq!((object, source, field), (9, 9, 3));
-        self.0
+    fn field(&self, source: i32, field: i32) -> Option<i32> {
+        assert_eq!((source, field), (9, 3));
+        Some(self.0)
     }
 }
 
@@ -261,6 +262,56 @@ fn scripts_ask_the_simulation_about_their_object() {
         let out = player.render(4, &Gender(answer));
         assert_eq!(out[0] == 1, plays);
     }
+}
+
+#[test]
+fn a_refused_field_leaves_the_register_and_is_a_fault() {
+    // v2 = 1; v2 = field v3 of arg1; play only when v2 is still 1.
+    let routine = |field: u8| -> Vec<u8> {
+        [
+            &[4, 6, 1][..], // loadb v2, 1
+            &[4, 7, field], // loadb v3, field
+            &[72, 6, 1, 7], // getsrcdatafield v2, arg1, v3
+            &[4, 8, 1],     // loadb v4, 1
+            &[20, 6, 8],    // cmp v2, v4
+            &[63],
+            &long(0x101), // ifne end
+            &[2, 5, WAIT_SAMP],
+            &[END],
+        ]
+        .concat()
+    };
+    let mut snapshot = Snapshot::default();
+    snapshot.objects.insert(9, [5; sims_audio::sources::FIELDS]);
+    for (field, plays, faults) in [(21, true, 1), (20, false, 0)] {
+        let code = routine(field);
+        let mut player = Player::new(vec![module(&[&code, &[END]], 1)], samples(), 1);
+        play(&mut player, "e0");
+        let out = player.render(4, &snapshot);
+        assert_eq!(out[0] == 1, plays, "field {field}");
+        assert_eq!(player.faults.len(), faults, "{:?}", player.faults);
+        if faults > 0 {
+            assert!(player.faults[0].contains("Illegal source parameter request"));
+        }
+    }
+}
+
+#[test]
+fn a_snapshot_answers_by_object_and_field() {
+    let mut snapshot = Snapshot::default();
+    let mut answers = [0; sims_audio::sources::FIELDS];
+    answers[3] = 7;
+    snapshot.objects.insert(9, answers);
+    snapshot.absent[13] = 100;
+    assert_eq!(snapshot.field(9, 3), Some(7));
+    assert_eq!(snapshot.field(9, 13), Some(0));
+    assert_eq!(snapshot.field(10, 13), Some(100));
+    assert_eq!(snapshot.field(-1, 13), Some(100));
+    // A negative field falls to the query's default; 21 on is refused.
+    assert_eq!(snapshot.field(9, -1), Some(0));
+    assert_eq!(snapshot.field(9, i32::MIN), Some(0));
+    assert_eq!(snapshot.field(9, 21), None);
+    assert_eq!(snapshot.field(9, i32::MAX), None);
 }
 
 #[test]
