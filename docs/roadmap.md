@@ -95,11 +95,11 @@ events, and what it asks for after them) come first.
   (Create New Object Instance mode 6, flag 0x4), unverified past update
   935. The frame drawn after tick 4053 finds person 140's skin waiting
   for its update (0x590d26), which is not ported.
-- The Pleasants (`House06.iff` as the original saved it after moving
-  them in, with the Traveling Salesman on the lot) load to the state the
-  first tick starts from: the end of the household selection works out
-  again who is a visitor, and reading the people raises the action
-  serial. Before the animator restore, their load equals the capture's
+- Before #208's animator restore, the Pleasants (`House06.iff` as the
+  original saved it after moving them in, with the Traveling Salesman on
+  the lot) loaded to the state the first tick starts from: the end of
+  the household selection works out again who is a visitor, and reading
+  the people raises the action serial. That load equals the capture's
   but for one person's data word 50 and last result, which something in
   the original's load sets and which is not found yet. The load now
   restores a reset person's animator and the pose its saved layers left
