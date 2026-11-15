@@ -97,9 +97,9 @@ What the houses do now (`sims boot`, 1000 ticks, no answers):
   - House 1 stops at the household selection (no family).
   - House 9 stops at the first frame: person 195's ROOT bone was last
     turned by a layer that no longer plays (0x5992b3).
-- No surveyed house stops at the renumbering.
-- The commonest stop is now an object with more saved attributes than
-  the 8 its constructor allocates (149 houses).
+- Of the 474 houses surveyed (UserData to UserData5 and 69 of
+  UserData6), none stops at the renumbering. 306 stop at an object with
+  more saved attributes than the 8 its constructor allocates.
 
 Reopen if a capture of a house with map entries renumbers a cell
 differently, or another install lists two pattern files in one bucket.

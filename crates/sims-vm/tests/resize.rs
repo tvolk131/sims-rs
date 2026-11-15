@@ -1382,7 +1382,11 @@ fn reading_the_people_raises_the_action_serial() {
             interpreter.clear(world).unwrap();
             world.read_arrays(&house.arrays, 62).unwrap();
             world
-                .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+                .renumber_surfaces(
+                    house.floor_map.as_deref(),
+                    house.wall_map.as_deref(),
+                    &Default::default(),
+                )
                 .unwrap();
             interpreter.read_types(world, &house.types).unwrap();
             interpreter.clear(world).unwrap();

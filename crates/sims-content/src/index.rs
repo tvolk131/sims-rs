@@ -116,6 +116,10 @@ pub struct Index {
     pub diagnostics: Vec<String>,
 }
 
+/// A directory's listing ([`Index::listing`]): each entry's key-form name
+/// and resource, and the reasons any entries were skipped.
+pub(crate) type Listing = (Vec<(Vec<u8>, Resource)>, Vec<String>);
+
 impl Index {
     /// The name of the mount [`Index::add_characters`] adds.
     pub const CHARACTERS: &'static str = "Characters";
@@ -201,10 +205,7 @@ impl Index {
     /// disk, which is scanned recursively, as the original mounts it, and
     /// `at` the directory's key below it (empty, or ending in `\`).
     /// Subdirectories are left out.
-    pub(crate) fn listing(
-        directory: &Path,
-        at: &[u8],
-    ) -> Result<(Vec<(Vec<u8>, Resource)>, Vec<String>)> {
+    pub(crate) fn listing(directory: &Path, at: &[u8]) -> Result<Listing> {
         let mut index = Self {
             root: directory.to_path_buf(),
             mounts: Vec::new(),
