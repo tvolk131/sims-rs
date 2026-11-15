@@ -62,6 +62,11 @@ events, and what it asks for after them) come first.
   (the multi-tile factory is ported). At tick 2882 person 16's pose
   without a foreground layer (0x5992b3) is not ported. Step 2 continues
   from there.
+- The houses of UserData2 to 8 get past the neighborhood: the reload
+  makes the records their template files lack. The version-63 houses
+  stop at the arrays, and the version-62 ones have no family. The
+  templates' `Patch` families are not imported (see
+  `docs/decisions.md`).
 
 ## Met goal: a headless lot boot that matches the original
 
