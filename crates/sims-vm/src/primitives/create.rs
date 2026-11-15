@@ -51,6 +51,20 @@
 //! (however deep) by one that does, nothing is made and the false branch
 //! is taken. See `Machine::same_type_on_tile`.
 //!
+//! The person test (0x44e6b6 to 0x44e727) is left out. When the new
+//! object is a person (definition type 2) with bit 0 of person word 84
+//! (+0x634) or 68 (+0x614) set, or bit 0 or 1 of word 74 (+0x620), the
+//! original calls 0x45810c with 1, then sets bit 0x20000000 of the
+//! screen's flags (`[[0x6f2a58]+0xb0]+0xc`, 0x4ceceb). 0x45810c looks
+//! its type's handle up (0x4eb0eb) in the table at 0x6f2698 (0x44-byte
+//! entries, which only the interface code reads) and, when it is there,
+//! resets seven of the entry's members (0x4e895e, 0x5a5f79) and sets the
+//! same screen flag. Nothing the sim reads is written, so the port does
+//! nothing.
+//! **Unverified** that the table is only what is drawn: no capture covers
+//! a person made with these words set (the Goth house's tick 30320,
+//! object 243 making person 36).
+//!
 //! The object is made by [`crate::Interpreter::create`] (0x440b2d), or a
 //! person by [`crate::Interpreter::create_person`], so its Init and first
 //! turn have run before it is placed. It becomes the stack object and the
@@ -165,9 +179,8 @@ impl Machine<'_, '_> {
     ///    path and then takes its record's interests and personality
     ///    ([`Machine::make_person`], 0x44e608).
     /// 4. Flag 0x20 turns it ([`Machine::face_as_stack_object`]).
-    /// 5. A new person with bit 0 of person word 84 or 68 set, or bit 0 or
-    ///    1 of word 74, goes through 0x45810c, which is not ported and
-    ///    fails ([`Machine::check_new_person`]).
+    /// 5. A new person's person test (see the module's note) touches only the
+    ///    screen, and is left out.
     /// 6. The place test and the put are skipped (0x44e72c): the object
     ///    stays off the lot where it was made.
     /// 7. Flag 0x4 runs a visitor's "init visitor" tree
@@ -187,7 +200,6 @@ impl Machine<'_, '_> {
         if flags & FACE_AS_STACK_OBJECT != 0 {
             self.face_as_stack_object(created, person)?;
         }
-        self.check_new_person(created)?;
         self.finish_new(created, flags)
     }
 
@@ -485,9 +497,8 @@ impl Machine<'_, '_> {
     ///    object. Only the case with nothing to turn is ported; a turn
     ///    (0x433f75, which redraws, updates seats and the walls beside)
     ///    fails loudly.
-    /// 6. A new person with bit 0 of person word 84 or 68 set, or bit 0 or
-    ///    1 of word 74, goes through 0x45810c, which is not ported and
-    ///    fails.
+    /// 6. A new person's person test (see the module's note) touches only the
+    ///    screen, and is left out.
     /// 7. The place test (virtual function 0x54, with no container) at the
     ///    exact position. If it refuses, the new object is removed at once
     ///    (0x44123f) and the false branch is taken. Removing a person is
@@ -646,8 +657,7 @@ impl Machine<'_, '_> {
     }
 
     /// The tail's last steps (from 0x44e6b6) for the object `created` just
-    /// made: the person test ([`Machine::check_new_person`]), then the
-    /// place test of `place` (virtual function 0x54: on the ground, or in
+    /// made: the place test of `place` (virtual function 0x54: on the ground, or in
     /// the container's slot), and the put (virtual function 0x58). A
     /// refusal removes the new object at once (0x44123f) and takes the
     /// false branch; otherwise the tail ends ([`Machine::finish_new`]).
@@ -658,7 +668,6 @@ impl Machine<'_, '_> {
         flags: u8,
         dynamic: bool,
     ) -> Result<bool, Trap> {
-        self.check_new_person(created)?;
         let interpreter = self.interpreter();
         let unsupported = |fault| {
             Trap::Unsupported(format!(
@@ -691,26 +700,5 @@ impl Machine<'_, '_> {
                 .map_err(unsupported)?;
         }
         self.finish_new(created, flags)
-    }
-
-    /// The tail's person test (0x44e6b6 to 0x44e727): a new person with
-    /// bit 0 of person word 84 or 68 set, or bit 0 or 1 of word 74, goes
-    /// through 0x45810c, which is not ported and fails.
-    fn check_new_person(&self, created: u16) -> Result<(), Trap> {
-        if let Some(person) = self
-            .world
-            .objects
-            .get(&created)
-            .and_then(|o| o.person.as_ref())
-        {
-            let word = |index: usize| person.data.get(index).copied().unwrap_or(0);
-            if word(84) & 1 != 0 || word(68) & 1 != 0 || word(74) & 3 != 0 {
-                return Err(Trap::Unsupported(format!(
-                    "Create New Object Instance making person {created}, whose person word 84, \
-                     68 or 74 is set: 0x45810c is not ported"
-                )));
-            }
-        }
-        Ok(())
     }
 }

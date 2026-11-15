@@ -27,6 +27,12 @@
 //! 6. The chosen candidate is the goal reached (context +0x50), and the
 //!    path's points, coordinates swapped, are the person's path.
 //!
+//! A person with bit 0 of person word 84 or 68 set goes through
+//! everything ([`through`]): no slot in another room fails it, and it has
+//! no obstacles in steps 2 and 3, and the width limit in step 5.
+//! **Unverified**: no capture covers it; the first is the Goth house's
+//! tick 30321 (person 36, made at tick 30320 by object 243).
+//!
 //! Ported from the original's code, with the search policy of the old
 //! prototype (legacy/crates/sims-sim/src/lot_route/search.rs:
 //! `Config::prepare`, `Config::steps`, `Config::run`, `goals`;
@@ -52,8 +58,8 @@ const PACE: usize = 17;
 const ROOM: usize = 29;
 const WALL_MASK: usize = 53;
 const DIRECTION: usize = 1;
-/// Person data words: bit 0 of either sends the planner down paths that
-/// are not ported.
+/// Person data words: bit 0 of either makes the person go through
+/// everything ([`through`]).
 const NO_ROOM: usize = 68;
 const CARRIED: usize = 84;
 
@@ -189,16 +195,11 @@ impl Interpreter<'_> {
             .person
             .as_ref()
             .ok_or_else(|| fail(unsupported("a route for an object that is not a person")))?;
-        let bit = |i: usize| words.data.get(i).is_some_and(|w| w & 1 != 0);
-        if bit(CARRIED) || bit(NO_ROOM) {
-            return Err(fail(unsupported(
-                "a person with bit 0 of person word 84 or 68",
-            )));
-        }
+        let through = through(&words.data);
         // 0x482458: data word 17 set, the ground is not costed.
         let ground = datum(world, person, PACE).map_err(fail)? == 0;
         let room = datum(world, person, ROOM).map_err(fail)?;
-        if datum(world, ctx.target, ROOM).map_err(fail)? != room {
+        if !through && datum(world, ctx.target, ROOM).map_err(fail)? != room {
             return Err(fail(unsupported("a slot in another room than the person")));
         }
         let (outdoors, half, objects) = match world.rooms.rooms.get(&room) {
@@ -208,9 +209,14 @@ impl Interpreter<'_> {
         let free_cost = free_cost(room, outdoors, ground);
         let actor = me.footprint;
 
-        // The objects' obstacles.
+        // The objects' obstacles; none for a person going through
+        // everything (0x48258f).
         let mut dynamic = Vec::new();
-        let order = world.order.clone();
+        let order = if through {
+            Vec::new()
+        } else {
+            world.order.clone()
+        };
         for id in order {
             if id == person || !world.objects.contains_key(&id) {
                 continue;
@@ -252,8 +258,14 @@ impl Interpreter<'_> {
         // 0x4827f6: the room's own rectangles (0x46795a, with terrain), or,
         // for an outdoor room on level 1 with the ground not costed, the
         // room's rectangles made again without terrain (0x4818af with 0).
+        // A person going through everything has none (0x4827e3: the
+        // list stays null, which the search reads as empty, 0x469733).
         let terrain = ground || !(super::rooms::room_level(room) == 1 && outdoors);
-        let fixed = self.room_rects(world, room, terrain).map_err(fail)?;
+        let fixed = if through {
+            Vec::new()
+        } else {
+            self.room_rects(world, room, terrain).map_err(fail)?
+        };
 
         // The goals.
         let mut goals = Vec::new();
@@ -273,7 +285,9 @@ impl Interpreter<'_> {
         }
 
         let tiles = half / 2;
-        let bounded = bounded(objects, half);
+        // 0x4828ba: a person going through everything always keeps the
+        // width limit.
+        let bounded = through || bounded(objects, half);
         let limit = tiles
             .wrapping_mul(goals.len() as i32)
             .wrapping_add(50)
@@ -314,6 +328,17 @@ impl Interpreter<'_> {
         path.extend(found.points.iter().map(|p| [p[1], p[0]]));
         Ok(true)
     }
+}
+
+/// Whether a person goes through everything (0x482413 to 0x482451): bit
+/// 0 of its person word 84 (+0x634) or 68 (+0x614). The planner then
+/// takes the person's own room whatever the slot's (0x4824a0), leaves
+/// out the objects' obstacles (0x48258f) and the room's own rectangles,
+/// walls included (0x4827e3), and searches with the width limit
+/// (0x4828ba). A person with no person words does not.
+fn through(words: &[i16]) -> bool {
+    let bit = |i: usize| words.get(i).is_some_and(|w| w & 1 != 0);
+    bit(CARRIED) || bit(NO_ROOM)
 }
 
 /// 0x481745: a context with a chosen candidate forgets it: that
