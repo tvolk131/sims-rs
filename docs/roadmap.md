@@ -1988,9 +1988,14 @@ stop-sounds events.
   original's answers (0x570e61: a person's voice, age, skills,
   personality and motive 3, the hour, the size of the object's room),
   read from the lot between ticks (`sims_game::sound::sources`).
+- **Done: where a sound's objects are.** Kinds 1 and 30 set a track's
+  volume and pan from its objects' positions (0x5730b6, 0x57473b), which
+  the game sends with the answers. The screen only matters for a track
+  whose `Spl` is set, which no script does.
 - **Next:**
-  - Positions for 3D sound, the piano (43) and the music half of the
-    music modes (36). 103 and 104 are debug commands.
+  - The piano (43) and the music half of the music modes (36). 103 and
+    104 are debug commands. Placing the tracks again when the camera
+    moves (kind 33), once the game sends it only then.
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)

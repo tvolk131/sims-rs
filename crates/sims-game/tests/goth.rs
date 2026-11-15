@@ -526,6 +526,12 @@ fn the_sound_scripts_learn_about_the_goths() {
     assert_eq!(snapshot.field(-3, 4), Some(hour));
     assert_eq!(snapshot.field(70_000, 0), Some(0));
     assert_eq!(snapshot.field(16, 21), None);
+    // Every object is where the lot has it, for its sounds' placement;
+    // an ID that names nothing is nowhere.
+    for (&id, object) in &world.objects {
+        assert_eq!(snapshot.position(i32::from(id)), Some(object.position));
+    }
+    assert_eq!(snapshot.position(70_000), None);
 }
 
 #[test]

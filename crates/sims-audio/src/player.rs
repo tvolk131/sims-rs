@@ -78,10 +78,11 @@
 //! event's own number when not 0, else the caller's (the object for the
 //! first, 0 for the others). [`kind`] lists them; ported are:
 //!
-//! - 1, play: starts the track. Its object is recorded as an *instance*
-//!   of the track when the track's arguments are `kArgsIdVolPan` and the
-//!   object is not 0; a track with no running thread loses its stale
-//!   instances first.
+//! - 1, play: starts the track. When the track's arguments are
+//!   `kArgsIdVolPan`, its object is recorded as an *instance* of the
+//!   track, and the track's `extvol` and `pan` are set from where all its
+//!   objects are ([`crate::placement`]); an object of 0 starts nothing.
+//!   A track with no running thread loses its stale instances first.
 //! - 18, fade: fades the track's `extvol` to 0 (see [`Player::play_from`]
 //!   for the speed), ending it after when the third argument says so.
 //! - 19, `radio_next_song`: stops the radio tracks' notes.
@@ -98,7 +99,8 @@
 //!   ambience; an unpause lets them all go on from where they were. See
 //!   [`Player::pause`].
 //! - 30, `kTurnOnTv` (radios too): kills the object's instances, then
-//!   records the object as an instance of the track and starts it.
+//!   records the object as an instance of the track (even 0), starts it
+//!   and sets its `extvol` and `pan` as kind 1 does.
 //! - 53, `kSequenceTrackHitList`: picks a patch from a hit list and
 //!   chains it to the note the track is playing, to start with no gap
 //!   when that one ends; with no note playing, starts it.
@@ -130,8 +132,9 @@
 //! sound are ignored.
 //!
 //! **Unverified** against the original at run time: all of the above.
-//! Left out: priorities, 3D position (a 3D track is centred), the track
-//! group's own volume beyond the host's [`Player::set_group_volume`], and
+//! Left out: priorities, and the limit of 16 voices kind 1 checks first
+//! (0x574a87); placing every track again when the camera moves (kind 33,
+//! see [`crate::placement`]); the track group's own volume beyond the host's [`Player::set_group_volume`], and
 //! the second pitch the original adds (taken as 3600).
 //! `seqgroup_wait`, `add_to_group`, `remove_from_group` and `test1` to
 //! `test4` are not ported: a thread that reaches one ends with a fault.
@@ -156,6 +159,7 @@ use crate::fsc::Score;
 use crate::hit::{Instruction, Operand};
 use crate::levels::{self, Inputs, Levels};
 use crate::module::Module;
+use crate::placement::{self, Projection};
 use crate::stations::StationLists;
 use crate::{Pcm, SoundEvent};
 use std::collections::{BTreeMap, BTreeSet};
@@ -200,6 +204,8 @@ pub const FADE_SPEED: u8 = 42;
 pub const FADE_ON: u8 = 45;
 /// `isplaying`, which a fresh start sets to 1.
 pub const ISPLAYING: u8 = 46;
+/// `Spl`, which the placement reads ([`crate::placement`]).
+pub const SPL: u8 = 57;
 /// A new thread's registers that do not start at 0, as the original's
 /// default register bank holds them: `priority`, `vol`, `extvol`, `pan`,
 /// `pitch`, `MinDistance`, `MaxDistance` and `fade_dest`.
@@ -295,12 +301,28 @@ impl Samples for BTreeMap<String, Pcm> {
     }
 }
 
-/// What scripts may ask about an object (`getsrcdatafield`): the
-/// answer for an object ID and a field, as both source registers hold
-/// them, or None for a field the original refuses (the destination then
-/// keeps its value). [`crate::sources`] has the original's answers.
+/// What the player asks the game about objects. [`crate::sources`]
+/// has the original's answers.
 pub trait Sources {
+    /// What a script asks about an object (`getsrcdatafield`): the
+    /// answer for an object ID and a field, as both source registers hold
+    /// them, or None for a field the original refuses (the destination
+    /// then keeps its value).
     fn field(&self, source: i32, field: i32) -> Option<i32>;
+
+    /// Where an object is, for its sound's volume and pan
+    /// ([`crate::placement`]): `sims_sim::Object::position` (the
+    /// original's object +0xf8, +0xf4 and +0x110, 0x570dc9), or None for
+    /// an ID that names no object.
+    fn position(&self, object: i32) -> Option<[i32; 3]>;
+
+    /// Where an object is on the screen. Only asked for a track whose
+    /// `Spl` (register 57) is not 0, which no script in the install sets,
+    /// so a host need not give it; without it such a track's placement is
+    /// a fault.
+    fn projection(&self, _object: i32) -> Option<Projection> {
+        None
+    }
 }
 
 /// *(code)* Writes a starting track's argument registers 1 to 3, as the
@@ -314,13 +336,28 @@ fn set_arguments(thread: &mut Thread, args: [u32; 3]) {
     thread.kept = i64::from(args[2] as i32);
 }
 
-/// Answers 0 to everything.
+/// Answers 0 to every field, and has every object on the lot, at 1, 1
+/// on the ground floor.
 pub struct NoSources;
 
 impl Sources for NoSources {
     fn field(&self, _: i32, _: i32) -> Option<i32> {
         Some(0)
     }
+
+    fn position(&self, _: i32) -> Option<[i32; 3]> {
+        Some([1, 1, 1])
+    }
+}
+
+/// *(code)* An `extvol` and `pan` to work out from where a track's objects
+/// are, at the next block, for the threads a start started or let go.
+/// The objects and `Spl` are as they were when the event came.
+#[derive(Debug, Clone)]
+struct Placing {
+    objects: Vec<u32>,
+    spl: i32,
+    threads: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -503,6 +540,8 @@ pub struct Player<S> {
     /// threads do not run or fade and their notes stay where they are,
     /// silent, until an unpause or until the track starts again.
     held: BTreeSet<u32>,
+    /// Volumes and pans to work out at the next block, in order.
+    placing: Vec<Placing>,
     /// The ambience cells' sounds.
     voices: Vec<AmbientVoice>,
     /// Ambience sample paths to their numbers in the patch cache.
@@ -559,6 +598,7 @@ impl<S: Samples> Player<S> {
             music_started: false,
             paused: false,
             held: BTreeSet::new(),
+            placing: Vec::new(),
             voices: Vec::new(),
             ambient_patches: BTreeMap::new(),
             ambient_cache: BTreeMap::new(),
@@ -898,21 +938,88 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// Kind 1: starts a track. *(code)* When nothing of the track runs or
-    /// plays, the object instances recorded for it are dropped first; when the
-    /// track's arguments are `kArgsIdVolPan` and the first is not 0, the
-    /// track and that object are recorded as an instance.
+    /// Kind 1: starts a track (0x5736ee). *(code)* When nothing of the
+    /// track runs or plays, the object instances recorded for it are
+    /// dropped first. When the track's arguments are `kArgsIdVolPan`, a
+    /// first argument of 0 starts nothing; any other is recorded as an
+    /// instance of the track, and the track's `extvol` and `pan` are set
+    /// from where its objects are ([`crate::placement`]).
     fn play_track(&mut self, module: usize, track: u32, args: [u32; 3]) {
+        if self.owner(module, track).is_none() {
+            self.report(format!("no track {track}"));
+            return;
+        }
         let alive = self.threads.iter().any(|t| t.track == track)
             || self.notes.iter().any(|n| n.track == track);
         if !alive {
             self.instances.retain(|&(t, _)| t != track);
         }
-        if self.start(args, module, track, false)
-            && self.track_args(module, track) == Some(ARGS_ID_VOL_PAN)
-            && args[0] != 0
-        {
-            self.record(track, args[0]);
+        if self.track_args(module, track) != Some(ARGS_ID_VOL_PAN) {
+            self.start(args, module, track, false);
+            return;
+        }
+        if args[0] == 0 {
+            return;
+        }
+        self.record(track, args[0]);
+        let placing = self.placing(track);
+        let threads = self.start(args, module, track, false);
+        self.place_later(placing, threads);
+    }
+
+    /// The objects of a track and its `Spl`, as the sum over them
+    /// (0x57473b) reads them: before the start. `Spl` is read from the
+    /// track's newest thread, through its `target`; 0 when none runs.
+    fn placing(&self, track: u32) -> Placing {
+        let objects = self
+            .instances
+            .range((track, 0)..=(track, u32::MAX))
+            .map(|&(_, object)| object)
+            .collect();
+        let spl = self
+            .threads
+            .iter()
+            .chain(&self.pending)
+            .filter(|t| t.track == track)
+            .max_by_key(|t| t.id)
+            .map_or(0, |t| self.read(t, i64::from(SPL)));
+        Placing {
+            objects,
+            spl,
+            threads: Vec::new(),
+        }
+    }
+
+    /// Sets the started threads' `extvol` and `pan` at the next block,
+    /// when the player has the game's [`Sources`].
+    fn place_later(&mut self, placing: Placing, threads: Vec<u32>) {
+        if !threads.is_empty() {
+            self.placing.push(Placing { threads, ..placing });
+        }
+    }
+
+    /// *(code)* Writes each placing's `extvol` (0x57d57a) then `pan`
+    /// (0x57d5a0), as the start left them pointing at themselves: the
+    /// comparison flags are the pan's. A fault leaves both as they were.
+    fn place(&mut self, sources: &dyn Sources) {
+        for placing in std::mem::take(&mut self.placing) {
+            let (vol, pan) = match placement::combine(&placing.objects, placing.spl, sources) {
+                Ok(placed) => placed,
+                Err(fault) => {
+                    self.report(fault);
+                    continue;
+                }
+            };
+            for thread in self
+                .threads
+                .iter_mut()
+                .chain(&mut self.pending)
+                .filter(|t| placing.threads.contains(&t.id))
+            {
+                thread.registers[usize::from(EXTVOL)] = vol;
+                thread.registers[usize::from(PAN)] = pan;
+                thread.kept = i64::from(pan);
+            }
         }
     }
 
@@ -1167,18 +1274,19 @@ impl<S: Samples> Player<S> {
             self.report(format!("no track {track}"));
             return;
         }
-        if args[0] != 0 {
-            self.record(track, args[0]);
-        }
+        self.record(track, args[0]);
+        let placing = self.placing(track);
         let resumes = self.held.contains(&track)
             && self
                 .threads
                 .iter()
                 .chain(&self.pending)
                 .any(|t| t.track == track);
-        if self.start(args, module, track, false) && self.paused && !resumes {
+        let threads = self.start(args, module, track, false);
+        if !threads.is_empty() && self.paused && !resumes {
             self.held.insert(track);
         }
+        self.place_later(placing, threads);
     }
 
     /// Kind 53 (`kSequenceTrackHitList`): *(code)* picks a patch from a
@@ -1245,44 +1353,49 @@ impl<S: Samples> Player<S> {
 
     /// Starts a track's routine for an object. The module given is tried
     /// first, then every other. A deferred thread first runs in the next
-    /// block. False when it could not start.
-    fn start(&mut self, args: [u32; 3], module: usize, track: u32, defer: bool) -> bool {
+    /// block. The threads started or let go: none when it could not
+    /// start.
+    fn start(&mut self, args: [u32; 3], module: usize, track: u32, defer: bool) -> Vec<u32> {
         let Some(module) = self.owner(module, track) else {
             self.report(format!("no track {track}"));
-            return false;
+            return Vec::new();
         };
         // *(code)* Starting a track the pause holds while its script runs
         // does not start it again (0x57d9f1 to 0x57da12): it lets it go
         // (vtable +0x5c), so the script goes on from where it was, its
         // wait ended, with the new arguments. No thread is made, so the
         // thread limit does not apply.
-        if self.held.remove(&track) && self.resume_held(args, track) {
-            return true;
+        if self.held.remove(&track) {
+            let resumed = self.resume_held(args, track);
+            if !resumed.is_empty() {
+                return resumed;
+            }
         }
         if self.threads.len() + self.pending.len() >= THREADS {
             self.report(format!("track {track}: more than {THREADS} threads"));
-            return false;
+            return Vec::new();
         }
         let Some(thread) = self.thread(args, module, track) else {
-            return false;
+            return Vec::new();
         };
+        let id = thread.id;
         if defer {
             self.pending.push(thread);
         } else {
             self.threads.push(thread);
         }
-        true
+        vec![id]
     }
 
     /// Lets a held track's running threads go on, as starting it does
     /// (see [`Player::start`]). Each one's `target` points back at itself
     /// (0x57d9c3), its argument registers take `args` (see
-    /// [`Player::thread`]) and its wait ends. False when none of the
-    /// track runs, so it is started anew. (A held thread does not run,
-    /// so none of these is the thread running `play_trk`.)
-    fn resume_held(&mut self, args: [u32; 3], track: u32) -> bool {
+    /// [`Player::thread`]) and its wait ends. The threads let go: none
+    /// when none of the track runs, so it is started anew. (A held thread
+    /// does not run, so none of these is the thread running `play_trk`.)
+    fn resume_held(&mut self, args: [u32; 3], track: u32) -> Vec<u32> {
         let now = self.frame;
-        let mut resumed = false;
+        let mut resumed = Vec::new();
         for thread in self
             .threads
             .iter_mut()
@@ -1291,7 +1404,7 @@ impl<S: Samples> Player<S> {
         {
             set_arguments(thread, args);
             thread.wake = now;
-            resumed = true;
+            resumed.push(thread.id);
         }
         resumed
     }
@@ -1495,6 +1608,7 @@ impl<S: Samples> Player<S> {
     }
 
     fn run(&mut self, sources: &dyn Sources) {
+        self.place(sources);
         let mut budget = BLOCK_STEPS;
         let mut index = 0;
         while index < self.threads.len() {

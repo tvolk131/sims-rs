@@ -35,6 +35,9 @@
 //! after a slow frame) snapshots after the last, so a sound from an
 //! earlier tick of the batch hears a later state, and the mixer's own
 //! timing adds more. Nothing the sound does is known to depend on it.
+//!
+//! The snapshot also holds where each object is, which the placement
+//! reads for a sound's volume and pan ([`crate::placement`]).
 
 use crate::player::Sources;
 use std::collections::BTreeMap;
@@ -42,8 +45,8 @@ use std::collections::BTreeMap;
 /// How many fields the query answers (0x571127 refuses 21 and above).
 pub const FIELDS: usize = 21;
 
-/// The query's answers for every object, taken between ticks. The
-/// default holds no object, with the hour 0.
+/// The query's answers and the position of every object, taken between
+/// ticks. The default holds no object, with the hour 0.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     /// Each object's answers, by object ID.
@@ -51,6 +54,9 @@ pub struct Snapshot {
     /// The answers for an ID that names no object: field 4 is still the
     /// hour and field 13 is 100; the rest are 0.
     pub absent: [i32; FIELDS],
+    /// Each object's position (`sims_sim::Object::position`), by object
+    /// ID. An ID not here names no object.
+    pub positions: BTreeMap<i32, [i32; 3]>,
 }
 
 /// Field 13's answer for no object or no room (0x570fba).
@@ -63,6 +69,7 @@ impl Default for Snapshot {
         Self {
             objects: BTreeMap::new(),
             absent,
+            positions: BTreeMap::new(),
         }
     }
 }
@@ -77,5 +84,9 @@ impl Sources for Snapshot {
         };
         let answers = self.objects.get(&source).unwrap_or(&self.absent);
         Some(answers[field])
+    }
+
+    fn position(&self, object: i32) -> Option<[i32; 3]> {
+        self.positions.get(&object).copied()
     }
 }

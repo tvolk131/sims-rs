@@ -24,9 +24,16 @@
 //! paused play. `SoundEvent::StopObject` is what to send when an object
 //! goes, and `SoundEvent::StopAll` stops everything at once.
 //!
-//! What the sound scripts ask about an object (`getsrcdatafield`) is
-//! read from the lot between ticks ([`sources`]) and sent as a
-//! [`Snapshot`].
+//! What the sound scripts ask about an object (`getsrcdatafield`), and
+//! where each object is, are read from the lot between ticks
+//! ([`sources`]) and sent as a [`Snapshot`]. Where an object is sets the
+//! volume and pan of the sounds started for it (kinds 1 and 30;
+//! `sims_audio::placement`). The original works them out from the
+//! object's place on the screen only for a track whose `Spl` register is
+//! not 0, and no script in the install sets it: every object on the lot
+//! plays at full volume in the centre, whatever the camera. So the game
+//! sends no screen positions (`sims_audio::player::Sources::projection`
+//! is left unanswered).
 
 use sims_audio::SoundEvent;
 use sims_audio::files::SoundFiles;
@@ -128,7 +135,17 @@ pub fn sources(world: &World) -> Snapshot {
         })
         .filter(|(id, _)| *id > 0)
         .collect();
-    Snapshot { objects, absent }
+    let positions = world
+        .objects
+        .values()
+        .map(|object| (i32::from(object.id), object.position))
+        .filter(|(id, _)| *id > 0)
+        .collect();
+    Snapshot {
+        objects,
+        absent,
+        positions,
+    }
 }
 
 /// The sound scripts' speed register for the game's speed (unverified).

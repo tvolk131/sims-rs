@@ -4,6 +4,49 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: A sound's volume and pan come from where its objects are, not from the screen
+
+Kinds 1 (for a `kArgsIdVolPan` track) and 30 now set the track's
+`extvol` and `pan` from every object recorded for it, as the original
+does after starting it (0x573795 to 0x5737a4, 0x573d5d to 0x573d6e), in
+`sims_audio::placement`. Each object is placed by 0x5730b6, and the sum
+(0x57473b) takes the loudest volume and the volume-weighted pan, in
+32-bit arithmetic that wraps.
+
+The placement only uses the screen when the track's `Spl` (register 57)
+is not 0. Spl starts at 0, and no script in the install writes it, so
+every object on the lot is placed at full volume (1024) in the centre
+(512), whatever the camera. So the game needs no screen positions: it
+sends each object's position (`sims_sim::Object::position`, the
+original's +0xf8, +0xf4 and +0x110) with the `getsrcdatafield` answers
+(`Snapshot::positions`). `Sources::projection` is what a script that
+sets `Spl` would need; the screen math is ported (`placement::project`)
+but untested against the game, and without a projection such a track's
+placement is a fault.
+
+What the original does with an object it cannot place is kept: an ID
+that names no object, or an object with a first or second coordinate
+of 0, leaves the previous object's values, and the first object's are
+pan 0 (all the way left) and a volume a local held before, a heap
+address. Here that volume is 1024, **unverified**. A `kArgsIdVolPan`
+kind 1 with object 0 now starts nothing (0x57375b), where it started
+the track; kind 30 records object 0 as an instance, where it skipped it.
+The writes leave the comparison flags the pan's.
+
+The volume and pan are worked out at the next block, when the player
+has the game's answers, from the objects and `Spl` as they were when the
+event came. The instances go in object ID order, where the original's
+hash multimap has its own; it only matters for an object that cannot be
+placed.
+
+Not ported: placing every track again on kind 33 (0x57447f), which the
+original's game sends when the camera moves. The game here sends kind
+33 every frame, and placing again would undo a fading `extvol` each
+frame. Also not ported: the limit of 16 voices that kind 1 checks first
+(0x574a87).
+
+**Unverified:** nothing of this has been compared with the running game.
+
 ## 2026-11-15: Pausing holds the sounds playing, as the original's sound manager does
 
 The sound's pause and unpause, kinds 21 and 22, are ported from the

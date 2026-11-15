@@ -239,6 +239,10 @@ impl Sources for Gender {
         assert_eq!((source, field), (9, 3));
         Some(self.0)
     }
+
+    fn position(&self, _: i32) -> Option<[i32; 3]> {
+        Some([1, 1, 1])
+    }
 }
 
 #[test]
@@ -283,6 +287,7 @@ fn a_refused_field_leaves_the_register_and_is_a_fault() {
     };
     let mut snapshot = Snapshot::default();
     snapshot.objects.insert(9, [5; sims_audio::sources::FIELDS]);
+    snapshot.positions.insert(9, [1, 1, 1]);
     for (field, plays, faults) in [(21, true, 1), (20, false, 0)] {
         let code = routine(field);
         let mut player = Player::new(vec![module(&[&code, &[END]], 1)], samples(), 1);
@@ -426,6 +431,10 @@ impl Sources for Asked {
     fn field(&self, source: i32, field: i32) -> Option<i32> {
         self.0.borrow_mut().push((source, field));
         Some(0)
+    }
+
+    fn position(&self, _: i32) -> Option<[i32; 3]> {
+        Some([1, 1, 1])
     }
 }
 
@@ -1195,7 +1204,7 @@ fn radio_next_song_stops_each_station_s_note() {
 
 #[test]
 fn kill_all_and_kill_object_sounds_events() {
-    let events = "all=20,0\nobjects=105,0\n";
+    let events = "all=20,0\nobjects=105,0\non=30,10\n";
     let module = module_with(&[&LOOPING], 1, 10, events);
     let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
     play_for(&mut player, 1, "e0");
@@ -1210,10 +1219,13 @@ fn kill_all_and_kill_object_sounds_events() {
     play(&mut player, "objects");
     player.render(12 * BLOCK, &NoSources);
     assert!(player.is_idle());
-    // An object of 0 records no instance: its track plays on.
+    // Kind 1 starts nothing for an object of 0 (0x57375b). Kind 30
+    // records it, but kind 105 leaves it: its track plays on.
     let module = module_with(&[&LOOPING], 1, 10, events);
     let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
     play_for(&mut player, 0, "e0");
+    assert!(player.is_idle());
+    play_for(&mut player, 0, "on");
     player.render(BLOCK, &NoSources);
     play(&mut player, "objects");
     player.render(12 * BLOCK, &NoSources);
@@ -1383,4 +1395,44 @@ fn a_television_turned_on_during_a_pause_waits_for_the_unpause() {
     let first = out.iter().position(|&s| s != 0).expect("the note plays");
     assert_eq!(&out[first..first + 5], [1, 2, 3, 4, 5]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+/// A snapshot with these objects on the lot.
+fn on_lot(objects: &[i32]) -> Snapshot {
+    let mut snapshot = Snapshot::default();
+    for &object in objects {
+        snapshot.positions.insert(object, [40, 56, 1]);
+    }
+    snapshot
+}
+
+#[test]
+fn a_sound_for_an_object_not_on_the_lot_plays_on_the_left() {
+    // The placement leaves its pan as the sum starts it, 0 (0x57479c).
+    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
+    for (lot, both) in [(on_lot(&[9]), true), (on_lot(&[]), false)] {
+        let mut player = Player::new(vec![module(&[generic], 1)], samples(), 1);
+        play(&mut player, "e0");
+        let out = player.render_stereo(4, &lot);
+        assert!(out[0] != 0, "{out:?}");
+        assert_eq!(out[1] != 0, both, "{out:?}");
+        assert!(player.faults.is_empty(), "{:?}", player.faults);
+    }
+}
+
+#[test]
+fn the_placement_s_pan_sets_the_comparison_flags() {
+    // Branch to the silent routine 0x101 unless the flags are positive:
+    // the pan written last (0x57d5a0) is 512 for an object on the lot
+    // and 0 for one that is not.
+    let mut branches = vec![IFLE];
+    branches.extend(long(0x101));
+    branches.extend([2, 5, WAIT_SAMP, END]);
+    let silent: &[u8] = &[END];
+    for (lot, plays) in [(on_lot(&[9]), true), (on_lot(&[]), false)] {
+        let mut player = Player::new(vec![module(&[&branches, silent], 1)], samples(), 1);
+        play(&mut player, "e0");
+        let out = player.render(4, &lot);
+        assert_eq!(out[0] != 0, plays, "{out:?}");
+    }
 }
