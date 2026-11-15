@@ -4,6 +4,21 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: Snap in mode 0 takes the routing slot's number from a local
+
+UserData2's house 9 stopped at tick 232 on Snap in mode 0. The original
+(0x454a4b) reads word 0 as the number of one of my frame's locals: from 0
+to the tree's count of locals (frame byte +7) less one, compared signed,
+or native error 8. The local's value is the slot's number, and from there
+it is mode 3: the stack object's routing slot table (+0x13c), the same
+range check (native error 0x1b), the same placement (0x454ac5 on). The
+slot's own record and flags are looked up by that number too.
+
+With it, and the catalogs, grown attributes and animator restore of the
+open branches, the house runs to tick 451 and stops on scope 34, the
+neighborhood's data, which track 3's strict day branch ports. Modes 1 and
+2 (the object itself, the tile in front of it) still fail loudly.
+
 ## 2026-11-15: The plumb bob is the original's mesh, coloured and lit as the original does
 
 The selected person's plumb bob is now drawn (`sims_people::bob`, from
