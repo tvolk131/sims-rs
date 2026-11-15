@@ -41,6 +41,46 @@ pub struct Resident {
     /// person has less: 0 elsewhere, and everywhere until
     /// [`Snapshot::with_careers`] fills it in.
     pub needs: [i32; 6],
+    /// Whether the person is a child: person data 58, the age, under 18
+    /// (0x4ea908). The job panel shows a child at school, level 0
+    /// (0x4ea722).
+    pub child: bool,
+    /// Whether the low bit of person data 65 is set, as the job panel
+    /// tells a woman (0x4eaa75).
+    pub female: bool,
+    /// The job panel's performance: person data 63, or a child's data 57
+    /// (0x4ea88c).
+    pub performance: i16,
+    /// What the job panel's left column shows: the default until
+    /// [`Snapshot::with_careers`] fills it in.
+    pub work: Work,
+}
+
+/// What the job panel's left column shows of a person (0x530501).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Work {
+    /// The row of the career icons ([`crate::hud`]'s art 4902) the panel
+    /// shows: the ID of the career the person has (person data 56), 0
+    /// with none or one `work.iff` lacks (0x4ea701). A row the icons do
+    /// not have shows none: a child's -1, school.
+    pub icon: i16,
+    /// The level the person is at ([`Snapshot::with_careers`]): none for a
+    /// person without a career, or past its levels.
+    pub level: Option<WorkLevel>,
+    /// The family friends the next level of the person's career needs:
+    /// its value 0, or 0 with no next level (0x4ea7cc). The panel shows
+    /// it where the family has fewer ([`Snapshot::family_friends`],
+    /// 0x4ea8d3).
+    pub friends: i32,
+}
+
+/// A career level as the job panel shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkLevel {
+    /// The level's title: a woman's where the career has one (0x4033a4).
+    pub title: String,
+    /// The daily pay: the level's value 17 (0x4b4513).
+    pub salary: i32,
 }
 
 /// The person data words of the personality, in the panel's order: Neat,
@@ -122,6 +162,22 @@ pub const SKILLS: [usize; 6] = [10, 12, 11, 17, 18, 15];
 /// The person data words of the career and the level in it.
 const JOB: [usize; 2] = [56, 57];
 
+/// Person data words the job panel reads: the age, the performance, and
+/// the low bit of the kind for a woman (0x4ea908, 0x4ea88c, 0x4eaa75).
+const AGE: usize = 58;
+const PERFORMANCE: usize = 63;
+/// The age a person is a child under.
+const GROWN: i16 = 18;
+
+/// The career a child is in, and the level (0x4ea722): school, `CARR`
+/// 0xffff.
+const SCHOOL: i16 = -1;
+
+/// The level value of the family friends a career level needs, and of its
+/// daily pay (0x403429, 0x4b4513).
+const FRIENDS_NEEDED: usize = 0;
+const SALARY: usize = 17;
+
 /// Which of a career level's values is the need of each of [`SKILLS`]
 /// (0x4ea823).
 const SKILL_NEEDS: [usize; 6] = [1, 2, 3, 4, 5, 6];
@@ -138,6 +194,13 @@ pub struct Snapshot {
     pub residents: Vec<Resident>,
     /// The selected Sim's object ID.
     pub selected: Option<u16>,
+    /// How many friends the family has, as the job panel compares it
+    /// (0x410260): the count the lot's family (global 9) keeps
+    /// ([`sims_sim::neighbors::Family::friends`]), which the lot works
+    /// out again after each update (`refresh_family_panel` in sims-vm),
+    /// or 0 with no such family. [`Snapshot::with_relations`] works it
+    /// out if it is out of date.
+    pub family_friends: i32,
     /// The people the selected Sim has a relationship with, in the
     /// relationship panel's order ([`Relation`]): none until
     /// [`Snapshot::with_relations`] reads them.
@@ -189,6 +252,7 @@ impl Snapshot {
                 let person = object.person.as_ref();
                 let data =
                     |word: usize| person.and_then(|p| p.data.get(word).copied()).unwrap_or(0);
+                let child = data(AGE) < GROWN;
                 residents.push(Resident {
                     object: object.id,
                     guid,
@@ -198,6 +262,10 @@ impl Snapshot {
                     skills: SKILLS.map(data),
                     job: JOB.map(data),
                     needs: [0; 6],
+                    child,
+                    female: data(sims_sim::neighbors::KIND) & 1 == 1,
+                    performance: data(if child { JOB[1] } else { PERFORMANCE }),
+                    work: Work::default(),
                 });
             }
         }
@@ -212,6 +280,7 @@ impl Snapshot {
                 .values()
                 .find(|o| o.selected && o.person.is_some())
                 .map(|o| o.id),
+            family_friends: lot_family(world).map_or(0, |f| f.friends),
             relations: Vec::new(),
         }
     }
@@ -220,11 +289,31 @@ impl Snapshot {
     /// the original's 0x4ea823 works them out: the value of the level
     /// after the person's own, where it is more than the person's skill.
     /// A person with no career, or at its top level, needs nothing.
+    ///
+    /// Fills in each resident's [`Resident::work`] too, from the career
+    /// and level the job panel reads (0x4ea722: a child's is school, level
+    /// 0) and the next level of the person's own career (0x4ea7cc).
     #[must_use]
     pub fn with_careers(mut self, careers: &Careers) -> Self {
         for resident in &mut self.residents {
             let [career, level] = resident.job;
             let next = careers.level(career, i32::from(level) + 1);
+            let (shown, at) = if resident.child {
+                (SCHOOL, 0)
+            } else {
+                (career, i32::from(level))
+            };
+            resident.work = Work {
+                icon: if careers.has(career) { career } else { 0 },
+                level: careers.level(shown, at).map(|l| WorkLevel {
+                    title: careers
+                        .title(shown, at, resident.female)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    salary: l.values[SALARY],
+                }),
+                friends: next.map_or(0, |l| l.values[FRIENDS_NEEDED]),
+            };
             resident.needs = std::array::from_fn(|n| {
                 let need = next
                     .and_then(|l| l.values.get(SKILL_NEEDS[n]).copied())
@@ -244,7 +333,13 @@ impl Snapshot {
     /// autonomy tuning's friendship threshold (0x6c4398, read from the
     /// tuning: 50 in the original's capture), which the smiley needs.
     #[must_use]
+    ///
+    /// Works [`Snapshot::family_friends`] out again too where the count
+    /// is out of date, as reading it does in the original (0x427219).
     pub fn with_relations(mut self, world: &World, members: &[u32], friendship: i32) -> Self {
+        if let Some(family) = lot_family(world).filter(|f| f.stale) {
+            self.family_friends = world.count_family_friends(family, friendship);
+        }
         let selected = self.selected.and_then(|id| world.objects.get(&id));
         self.relations = selected
             .map(|o| relations(world, o.guid, members, friendship))
@@ -274,44 +369,109 @@ impl Snapshot {
     /// the original for that value; how it writes a debt is
     /// **unverified** (here `-$5`).
     pub fn money(&self) -> String {
-        let digits = self.funds.unsigned_abs().to_string();
-        let mut out = String::new();
-        for (i, c) in digits.chars().enumerate() {
-            if i > 0 && (digits.len() - i).is_multiple_of(3) {
-                out.push(',');
-            }
-            out.push(c);
-        }
-        format!("{}${out}", if self.funds < 0 { "-" } else { "" })
+        money(self.funds)
     }
 }
 
+/// An amount as the panel writes money: `$2,542` ([`Snapshot::money`]).
+pub fn money(amount: i32) -> String {
+    let digits = amount.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    format!("{}${out}", if amount < 0 { "-" } else { "" })
+}
+
 /// The careers of `work.iff`, by the ID of their `CARR` resource, as
-/// the original looks a person's career up (0x404cb3).
+/// the original looks a person's career up (0x404cb3), with the levels'
+/// titles.
 #[derive(Debug, Clone, Default)]
 pub struct Careers {
     careers: BTreeMap<i16, Vec<Level>>,
+    /// Each career's levels' titles, a man's and a woman's.
+    titles: BTreeMap<i16, Vec<[String; 2]>>,
 }
 
+/// The career, in `work.iff`'s order, whose titles the original never
+/// reads (0x403f8f): school, which has no `STR#`.
+const UNTITLED: usize = 10;
+
 impl Careers {
-    /// Reads every `CARR` of the install's `work.iff`. An install without
-    /// the file has no careers.
+    /// Reads every `CARR` of the install's `work.iff`, and the levels'
+    /// titles from the `STR#` of the career's ID (0x403f26): for level
+    /// `k`, string `3 + 2k`, and a woman's, `23 + k`, in US English. An
+    /// install without the file has no careers.
+    ///
+    /// The original reads the titles of only the first 11, 16 or 21
+    /// careers, by the game's expansion level (0x403f53); here every
+    /// career's, which is all 21 of the full install's.
     pub fn load(index: &Index) -> Result<Self> {
-        let mut careers = BTreeMap::new();
+        let mut out = Self::default();
         let Some((_, file)) = index.named("work.iff").next() else {
-            return Ok(Self { careers });
+            return Ok(out);
         };
         let iff = Iff::parse(file.read().map_err(Error::Content)?).map_err(Error::Format)?;
-        for chunk in iff.resource_order(b"CARR").map_err(Error::Format)? {
+        for (n, chunk) in iff
+            .resource_order(b"CARR")
+            .map_err(Error::Format)?
+            .into_iter()
+            .enumerate()
+        {
             let career = Career::parse(iff.data(chunk)).map_err(Error::Format)?;
-            careers.insert(chunk.id as i16, career.levels);
+            let id = chunk.id as i16;
+            if n != UNTITLED
+                && let Some(strings) = iff.get(b"STR#", chunk.id)
+            {
+                let table = StringTable::parse(iff.data(strings)).map_err(Error::Format)?;
+                let text = |i: usize| {
+                    table
+                        .get(i, sims_content::ui_graphics::US_ENGLISH)
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                let titles = (0..career.levels.len())
+                    .map(|k| [text(3 + 2 * k), text(23 + k)])
+                    .collect();
+                out.titles.insert(id, titles);
+            }
+            out.careers.insert(id, career.levels);
         }
-        Ok(Self { careers })
+        Ok(out)
     }
 
     /// Adds or replaces a career, as tests do.
     pub fn insert(&mut self, id: i16, levels: Vec<Level>) {
         self.careers.insert(id, levels);
+    }
+
+    /// Adds or replaces a career's titles, a man's and a woman's for
+    /// each level, as tests do.
+    pub fn insert_titles(&mut self, id: i16, titles: Vec<[String; 2]>) {
+        self.titles.insert(id, titles);
+    }
+
+    /// Whether career `career` exists (0x404cb3).
+    pub fn has(&self, career: i16) -> bool {
+        self.careers.contains_key(&career)
+    }
+
+    /// The title of level `level` of career `career` (0x4033a4): a
+    /// woman's where the level has one, else the level's; empty for a
+    /// level without a title.
+    pub fn title(&self, career: i16, level: i32, female: bool) -> Option<&str> {
+        let [man, woman] = self
+            .titles
+            .get(&career)?
+            .get(usize::try_from(level).ok()?)?;
+        Some(if female && !woman.is_empty() {
+            woman
+        } else {
+            man
+        })
     }
 
     /// Level `level` (from 0) of career `career`, if both exist.
@@ -321,6 +481,13 @@ impl Careers {
         }
         self.careers.get(&career)?.get(usize::try_from(level).ok()?)
     }
+}
+
+/// The lot's family: the first whose ID is global 9, as the lot's
+/// family panel finds it (`refresh_family_panel` in sims-vm).
+fn lot_family(world: &World) -> Option<&sims_sim::neighbors::Family> {
+    let id = i32::from(world.globals.get(9).copied().unwrap_or(0));
+    (id != 0).then(|| world.families.iter().find(|f| f.id == id))?
 }
 
 /// The people `guid`'s Sim has a relationship with, in the relationship
@@ -537,6 +704,7 @@ mod tests {
             paused: false,
             residents: Vec::new(),
             selected: None,
+            family_friends: 0,
             relations: Vec::new(),
         }
     }
@@ -649,6 +817,10 @@ mod tests {
             skills: [0, 0, 300, 1000, 199, 0],
             job,
             needs: [7; 6],
+            child: false,
+            female: false,
+            performance: 0,
+            work: Work::default(),
         };
         let mut s = snapshot(0, 0, 0);
         s.residents = vec![resident([9, 0]), resident([9, 1]), resident([0, 0])];
@@ -662,5 +834,100 @@ mod tests {
         // the 16-bit range too; at the top level, or with no career,
         // nothing.
         assert_eq!(needs, [[100, 0, 0, 40_000, 200, 0], [0; 6], [0; 6]]);
+    }
+
+    #[test]
+    fn the_job_panel_shows_the_level_the_person_is_at() {
+        let level = |friends: i32, salary: i32| {
+            let mut level = Level {
+                values: [0; 21],
+                strings: Default::default(),
+            };
+            level.values[FRIENDS_NEEDED] = friends;
+            level.values[SALARY] = salary;
+            level
+        };
+        let mut careers = Careers::default();
+        careers.insert(9, vec![level(0, 155), level(2, 230)]);
+        careers.insert(SCHOOL, vec![level(0, 0), level(0, 0)]);
+        careers.insert(3, vec![level(0, 240)]);
+        careers.insert_titles(
+            9,
+            vec![
+                ["Test Subject".into(), String::new()],
+                ["Lab Assistant".into(), "Lab Lady".into()],
+            ],
+        );
+        // A woman's title only where the level has one; none for a level
+        // past the titles, or a career without them.
+        assert_eq!(careers.title(9, 0, true), Some("Test Subject"));
+        assert_eq!(careers.title(9, 1, true), Some("Lab Lady"));
+        assert_eq!(careers.title(9, 1, false), Some("Lab Assistant"));
+        assert_eq!(careers.title(9, 2, false), None);
+        assert_eq!(careers.title(9, -1, false), None);
+        assert_eq!(careers.title(3, 0, false), None);
+        assert!(careers.has(SCHOOL) && !careers.has(0) && !careers.has(4));
+
+        let resident = |job: [i16; 2], child: bool, female: bool| Resident {
+            object: 1,
+            guid: 1,
+            motives: [0.0; 16],
+            personality: [0; 5],
+            zodiac: None,
+            skills: [0; 6],
+            job,
+            needs: [0; 6],
+            child,
+            female,
+            performance: 0,
+            work: Work::default(),
+        };
+        let mut s = snapshot(0, 0, 0);
+        s.residents = vec![
+            resident([9, 0], false, false),
+            resident([9, 1], false, true),
+            resident([9, 2], false, false),
+            resident([3, 0], false, false),
+            resident([4, 0], false, false),
+            resident([0, 0], false, false),
+            resident([SCHOOL, 4], true, false),
+            resident([9, 0], true, false),
+        ];
+        let work: Vec<_> = s
+            .with_careers(&careers)
+            .residents
+            .into_iter()
+            .map(|r| r.work)
+            .collect();
+        let at = |title: &str, salary: i32| {
+            Some(WorkLevel {
+                title: title.into(),
+                salary,
+            })
+        };
+        let shown = |icon: i16, level: Option<WorkLevel>, friends: i32| Work {
+            icon,
+            level,
+            friends,
+        };
+        assert_eq!(
+            work,
+            [
+                // The next level needs two friends.
+                shown(9, at("Test Subject", 155), 2),
+                shown(9, at("Lab Lady", 230), 0),
+                // Past the career's levels: no level.
+                shown(9, None, 0),
+                // A career without titles shows an empty one.
+                shown(3, at("", 240), 0),
+                // A career work.iff lacks: the first icon, no level.
+                shown(0, None, 0),
+                shown(0, None, 0),
+                // A child is at school, level 0, whatever the words say;
+                // the icon and the friends follow the words.
+                shown(SCHOOL, at("", 0), 0),
+                shown(9, at("", 0), 2),
+            ]
+        );
     }
 }

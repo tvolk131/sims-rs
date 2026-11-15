@@ -166,6 +166,34 @@ fn the_goths_job_panel() {
             ([-1, 4], [0; 6], [0; 6])
         ]
     );
+    // The left column: Mortimer's icon (row 9, the flask), title and
+    // pay; Bella unemployed; Cassandra, a child, at school, level 0, with
+    // no icon (row -1) and no title (school has no `STR#`), her
+    // performance her data 57. The family has no friends.
+    let shown: Vec<_> = opened
+        .snapshot
+        .residents
+        .iter()
+        .map(|r| {
+            (
+                r.child,
+                r.female,
+                r.performance,
+                r.work.icon,
+                r.work.level.as_ref().map(|l| (l.title.as_str(), l.salary)),
+                r.work.friends,
+            )
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (false, false, 0, 9, Some(("Test Subject", 155)), 0),
+            (false, true, 0, 0, None, 0),
+            (true, true, 4, -1, Some(("", 0)), 0),
+        ]
+    );
+    assert_eq!(opened.snapshot.family_friends, 0);
     let controls = Controls {
         expanded: true,
         panel: Panel::Job,
@@ -181,19 +209,27 @@ fn the_goths_job_panel() {
     // screen (see docs/decisions.md).
     assert_eq!(
         draw(&opened.snapshot),
-        "3332eada844f300442b413d9994c5aab8b198314ec41292cd584e9261b6fed64"
+        "2cafffacb29e6f322fbe86b6257545d9e4c417eee6afb384b18adfd03b4f3edf"
     );
-    // A level up the ladder, "Field Researcher": the next level, "Science
-    // Teacher", needs a point of Charisma and three of Logic, and he has
-    // two of Logic.
+    // A level up the ladder, "Field Researcher" at $320: the next level,
+    // "Science Teacher", needs a point of Charisma, three of Logic, which
+    // he has two of, and a family friend, which the family lacks.
     let mut snapshot = opened.snapshot.clone();
     snapshot.residents[0].job = [9, 2];
     snapshot.residents[0].skills = [0, 0, 0, 0, 200, 0];
     let snapshot = snapshot.with_careers(&opened.careers);
     assert_eq!(snapshot.residents[0].needs, [0, 0, 100, 0, 300, 0]);
+    let work = &snapshot.residents[0].work;
+    assert_eq!(
+        (
+            work.level.as_ref().map(|l| (l.title.as_str(), l.salary)),
+            work.friends
+        ),
+        (Some(("Field Researcher", 320)), 1)
+    );
     assert_eq!(
         draw(&snapshot),
-        "f31ded2b92e5ae9d45e42de2f78142b1f9ed22423feb4b6d702bb1cce3ba6e01"
+        "d0ad6b0746169b1864e3351448cef65a4d7d7f6b8cfd83263df7d255cf86dc6a"
     );
 }
 
