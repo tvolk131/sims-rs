@@ -557,15 +557,22 @@ fn the_sound_scripts_see_the_goths_where_the_camera_shows_them() {
         .map(|(&id, o)| (id, o))
         .collect();
     assert_eq!(snapshot.screen.len(), objects.len());
-    // Unturned, the sound's projection is the drawing's, for the object's
-    // place on the floor.
+    // Unturned, the sound's projection is the original view's for the
+    // object's place on the floor, which is the drawing's or a pixel off
+    // it.
     for &(id, object) in &objects {
         let [x, y, level] = object.position.map(i32::from);
         let view = snapshot.projection(i32::from(id)).unwrap();
         assert_eq!(
             view.at,
-            camera.project_fine([x, y], level, 0),
+            sims_game::sound::fine_point(&camera, [x, y], level),
             "object {id}"
+        );
+        let drawn = camera.project_fine([x, y], level, 0);
+        assert!(
+            (0..2).all(|i| (view.at[i] - drawn[i]).abs() <= 1),
+            "object {id}: {:?} {drawn:?}",
+            view.at
         );
         assert_eq!(view.screen, [800, 600]);
         assert_eq!(view.zoom, camera.zoom.level() as i32);

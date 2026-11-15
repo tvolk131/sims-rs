@@ -36,11 +36,14 @@
 //! object's; for the first, the pan is 0 and the volume is whatever a
 //! local held before: the instance lookup (0x576235) leaves the address
 //! of the instance map, the sound manager +0xd4, a heap address. Here it
-//! is [`STALE_VOL`], **unverified**. It is far above full volume, so the
-//! loudest is too (the player plays it at full), and it outweighs every
-//! other object in the pan; how the pan comes out depends on where the
-//! heap is (below 0x400000 the weighted sum does not wrap, and the pan is
-//! all the way left; above it wraps). A track with no instance gets
+//! is [`STALE_VOL`], **unverified**. It is far above full volume, so it
+//! is the loudest, and it outweighs every other object in the pan. Both
+//! come out where the 32-bit arithmetic wraps them, so they depend on
+//! where the heap is. The pan: below 0x400000 the weighted sum does not
+//! wrap and the pan is all the way left; above it wraps. The volume: the
+//! player multiplies it by `vol` ([`crate::levels::volume`]),
+//! which wraps too; with this address and a `vol` of 1024 the track
+//! plays at 212 of 1024, not at full. A track with no instance gets
 //! volume 0 and the centre.
 //!
 //! The volume and pan are worked out when the event comes, so the host

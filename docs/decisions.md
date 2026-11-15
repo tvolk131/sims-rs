@@ -27,10 +27,13 @@ screen with the zoom, the screen's size and the floor shown
 (`Snapshot::screen`, from `sims_game::sound::screen`), again whenever
 the camera changes. The place on the screen is the original's (0x570e09):
 the position rotated into the view about 1023, not the drawing's 1024,
-projected, and cut to 16 bits. Its projection (0x4a9dc7) also raises the
-point by the ground under it, which is left out (**unverified** on a lot
-that is not flat). Without a place on the screen the placement is a
-fault.
+then projected as the original's view does it (0x4a9dc7,
+`sims_game::sound::fine_point`): the tile's corner, then each part of
+the step across the tile cut toward zero on its own, in 16 bits. A point
+can be a pixel off the drawing's (`project_fine`). The original also
+raises the point, and slants the step, by the heights of the tile's
+corners, which is left out (**unverified** on a lot that is not flat).
+Without a place on the screen the placement is a fault.
 
 The same bank corrects three defaults the player had wrong: register 39
 (`BufSizeMult`) starts at 1 and 52 (`tempo`) at 120, and 40
@@ -42,9 +45,10 @@ that names no object, or an object with a first or second coordinate
 of 0, leaves the previous object's values, and the first object's are
 pan 0 and a volume a local held before: the address of the sound
 manager's instance map (0x576235), on the heap. Here that address is
-0x10000d4, **unverified**; it makes the track's volume full and
-outweighs the other objects in the pan, which comes out where the
-wrapping sum puts it. A `kArgsIdVolPan`
+0x10000d4, **unverified**. It outweighs the other objects in the pan,
+and both the pan and the volume come out where the 32-bit arithmetic
+wraps them: with this address and a `vol` of 1024 the track plays at
+212 of 1024, not at full. A `kArgsIdVolPan`
 kind 1 with object 0 now starts nothing (0x57375b), where it started
 the track; kind 30 records object 0 as an instance, where it skipped it.
 The writes leave the comparison flags the pan's.

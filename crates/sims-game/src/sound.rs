@@ -154,11 +154,8 @@ pub fn sources(world: &World) -> Snapshot {
 /// high, through `camera`, as the original's sound code asks the view
 /// (0x570e09): the object's fine position rotated into the view about
 /// 1023, not the drawing's 1024 (0x47bc1f), then projected on its level
-/// and cut to 16 bits each way. The original's projection (0x4a9dc7)
-/// also raises the point by the ground under it; that is left out, which
-/// only moves it up or down (**unverified** on a lot that is not flat).
-/// Empty for a camera so far off that its arithmetic would overflow,
-/// which no view the controls make comes near.
+/// by [`fine_point`]. Empty for a camera so far off that its arithmetic
+/// would overflow, which no view the controls make comes near.
 pub fn screen(world: &World, camera: &Camera, size: [i32; 2]) -> BTreeMap<i32, Projection> {
     if camera.origin.iter().any(|n| n.unsigned_abs() >= 1 << 26) {
         return BTreeMap::new();
@@ -176,9 +173,7 @@ pub fn screen(world: &World, camera: &Camera, size: [i32; 2]) -> BTreeMap<i32, P
                 3 => [y, m - x],
                 _ => [x, y],
             };
-            let at = camera
-                .project_fine(rotated, level, 0)
-                .map(|n| i32::from(n as i16));
+            let at = fine_point(camera, rotated, level);
             let view = Projection {
                 at,
                 screen: size,
@@ -188,6 +183,43 @@ pub fn screen(world: &World, camera: &Camera, size: [i32; 2]) -> BTreeMap<i32, P
             (i32::from(object.id), view)
         })
         .collect()
+}
+
+/// The screen point of a fine view position on `level`, as the
+/// original's view works it out (0x4a9dc7), which the drawing's
+/// [`Camera::project_fine`] does not: the tile's corner is projected and
+/// cut to 16 bits each way, then each part of the step across the tile
+/// is cut toward zero on its own and added in 16 bits. The result can be
+/// a pixel off the drawing's.
+///
+/// The original also raises the corner, and slants the step, by the
+/// heights of the tile's four corners. Those are left out (the ground is
+/// taken as flat), which only moves the point up or down
+/// (**unverified** on a lot that is not flat).
+pub fn fine_point(camera: &Camera, [x, y]: [i32; 2], level: i32) -> [i32; 2] {
+    let shift = camera.zoom.level();
+    let [tx, ty] = [x >> 4, y >> 4].map(|n| i32::from(n as i16));
+    let [fx, fy] = [x & 15, y & 15];
+    let [cx, cy] = camera.project([tx, ty], level, 0).map(|n| n as i16);
+    // Down the tile, (rise + 2) or (rise + 4) steps of the zoom's half
+    // tile, for a part `f` of 16; the rises are 0 on flat ground.
+    let down = |steps: i32, f: i32| (steps << (shift + 1)) * f / 16;
+    let across = 8 << shift;
+    let (dx, dy) = if fx == fy {
+        (0, down(4, fx))
+    } else if fx > fy {
+        let (side, diagonal) = (down(2, fx), down(4, fx));
+        let right = across * fx / 16;
+        (right - right * fy / fx, (diagonal - side) * fy / fx + side)
+    } else {
+        let (side, diagonal) = (down(2, fy), down(4, fy));
+        let left = across * fy / -16;
+        (left - left * fx / fy, (diagonal - side) * fx / fy + side)
+    };
+    [
+        i32::from(cx.wrapping_add(dx as i16)),
+        i32::from(cy.wrapping_add(dy as i16)),
+    ]
 }
 
 /// The sound scripts' speed register for the game's speed (unverified).
@@ -319,6 +351,36 @@ mod tests {
         // 167772176 times 0.1 is 16777217.6 on the FPU; a single
         // precision division would round it to 16777218 first.
         assert_eq!(tenth(f32::from_bits(0x4d20_0001)), 16_777_217);
+    }
+
+    #[test]
+    fn a_sound_s_point_is_cut_as_the_original_s_view_cuts_it() {
+        use sims_render::camera::{Walls, Zoom};
+        let mut camera = Camera {
+            zoom: Zoom::Far,
+            rotation: 0,
+            level: 1,
+            origin: [400, 17],
+            walls: Walls::Up,
+            focus: sims_render::Focus::default(),
+        };
+        // 0x4a9dc7 gives (402, 178); the drawing's projection 179 down.
+        assert_eq!(fine_point(&camera, [163, 161], 1), [402, 178]);
+        assert_eq!(camera.project_fine([163, 161], 1, 0), [402, 179]);
+        // Along the diagonal, straight down; at the corner, the corner.
+        assert_eq!(fine_point(&camera, [165, 165], 1), [400, 182]);
+        assert_eq!(fine_point(&camera, [160, 160], 1), [400, 177]);
+        // The other side of the diagonal. x: 16 * 3 / -16 = -3, less -3 *
+        // 1 / 3 = -1: -2. y: side 8 * 3 / 16 = 1, diagonal 3, (3 - 1) * 1
+        // / 3 + 1 = 1, where the drawing's is 2.
+        assert_eq!(fine_point(&camera, [161, 163], 1), [398, 178]);
+        assert_eq!(camera.project_fine([161, 163], 1, 0), [398, 179]);
+        // Near, with nothing to cut, the two agree.
+        camera.zoom = Zoom::Near;
+        assert_eq!(
+            fine_point(&camera, [163, 167], 1),
+            camera.project_fine([163, 167], 1, 0)
+        );
     }
 
     #[test]

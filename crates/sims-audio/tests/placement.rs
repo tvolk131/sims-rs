@@ -117,6 +117,20 @@ fn an_object_not_placed_takes_the_values_before_it() {
     assert_eq!(STALE_VOL, 0x0100_00d4);
     assert_eq!(combine(&[4], 0, &lot), Ok((STALE_VOL, CENTRE)));
     assert_eq!(combine(&[4, 5], 0, &lot), Ok((STALE_VOL, CENTRE)));
+    // That volume times a `vol` of 1024 wraps in 32 bits: 0x35000 over
+    // 1024, 212, not full.
+    let inputs = sims_audio::levels::Inputs {
+        vol: 1024,
+        extvol: STALE_VOL,
+        pan: CENTRE,
+        pitch: 0,
+        duck_priority: 0,
+        three_d: false,
+        group_volume: 1024,
+        main_duck_priority: 0,
+        master: 1024,
+    };
+    assert_eq!(sims_audio::levels::volume(&inputs), 212);
     // After an object at the centre, it is at the centre too.
     assert_eq!(combine(&[5, 7], 0, &lot), Ok((FULL, CENTRE)));
 }
