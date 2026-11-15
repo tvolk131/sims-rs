@@ -923,12 +923,12 @@ fn digest(bytes: &[u8]) -> String {
 /// bytes.
 #[test]
 fn the_goth_house_resize_creates_the_controllers() {
-    const PINNED: &str = "3eaa7756a082ffc951a121739693c4cbe23eed354b877498e8e42da0d065fbef";
-    const PINNED_7: &str = "2ed7303150a4b04d4f2e77a87068b4dc068f817a9e133d842b6cbc5dec22104e";
+    const PINNED: &str = "819756c776e4f4517e5b43c2c81ecb448815c9bcaebee79209964b873526119b";
+    const PINNED_7: &str = "041741b9964e5afb8d11370b056cadbc9fd1a573bfd0ab4dc219d194a5e6c411";
 
-    const FORMAT_6: &str = "5da903b012eb85ced13111300ed5fd6f125ba083eb7517bac76e5c342eae2d91";
-    const FORMAT_5: &str = "9e5cab3b2caf4e1915faf58b9a3ef5fe192495b44cfb09420b9396368947bd15";
-    const FORMAT_4: &str = "06925c3997de50179b8bfe0dd5cdb751b8e0f449ce0280ffcc6269c4e4e7e72e";
+    const FORMAT_6: &str = "0bcd63b82873b11b2fdc9a5c2e964410b2ea2afa50bf2abe09ab456b092f3c92";
+    const FORMAT_5: &str = "fc89c0a0ccde594eb06675a096f685d76a8dd69ec0dd18d2126dcdce7e7fa7ce";
+    const FORMAT_4: &str = "72c502a09a31deb7fa65e1904a8e339265d239710cf1253b1f5f5a2d0062a229";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1341,11 +1341,11 @@ fn the_goth_house_objects_are_constructed_and_read() {
 /// 52 tiles and the four bytes of format 6's new field.
 #[test]
 fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
-    const PINNED: &str = "b9c40a8b5a539faa96d1697f068f4e91be53eb57211dee41854ce9240414a6e6";
-    const PINNED_7: &str = "4e84404aa396e329c0c58d4ffbffa7744f1074f8b201b5907d713a17c94eb43e";
+    const PINNED: &str = "bddc0670e658fd31dcb223e119126b69d2c2cc2d8859a285c827bbc68665373d";
+    const PINNED_7: &str = "96194b11e2e07c4f2b3f438ec82999072e335676485a077e54f0820301ca2de1";
 
-    const FORMAT_6: &str = "2c000ad6962e840ece561db6b3a6ff572d8dd83815680c67a2a7eb861d3698b1";
-    const FORMAT_5: &str = "d014a3ce407d420fc6b69248f9e23282b0fdc348bac79afc5670629b60ed46b1";
+    const FORMAT_6: &str = "bc1dff5b1eb81b404163ceafe2d880abb2d796c53261c4224a04ec4048938cb8";
+    const FORMAT_5: &str = "eb2602d277834de8cca39610d6d0e19425493d7973757ec009fde8bdbe23e02a";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1494,12 +1494,12 @@ fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
 /// The digests are of our own state, as built here.
 #[test]
 fn the_goth_house_gets_its_rooms_and_its_household() {
-    const COUNTED: &str = "d43f1bc85e6196f4942860186e6e86a447e0debd8688688854eba860acb0eb29";
-    const COUNTED_7: &str = "fe0ce22c868f9d294105766ed86fe1767389e31a8c4f00971115bc6d71196ff2";
-    const SELECTED: &str = "c1fe23f51196c7858503040b65cbb6431a7402412e1bf0190a691a829ced37fd";
-    const SELECTED_7: &str = "7eeda38aba85a2ace8a4c52ecdbe4eab7c97cb9ae89edaa98d3d0752124591b9";
-    const COUNTED_6: &str = "d994b4eb25b6bb9b8ec8202bb1ede1f33ae40513f9cc2745298d76675ab6d476";
-    const SELECTED_6: &str = "6a9a7290da69b6e376c09a57295217df82ef28a8a7259eff97420d5c7c1e649d";
+    const COUNTED: &str = "32e87085a0f2b6f4118ec0c252c2d60244fe59b147b1df0313076509c0e940d1";
+    const COUNTED_7: &str = "97538352ea5c303dcbde81685a3c8b3bd769c4f7c76f5cbcaae261556dae1518";
+    const SELECTED: &str = "df7beddf55ca287f181abd48574a8f72fb55a5f0d07c9ff8939e345b13175ac9";
+    const SELECTED_7: &str = "b8926c8537b9d368b280b4cf630b16eb0961f7fc787d81bffcedd1f316e282e5";
+    const COUNTED_6: &str = "50725dcfbbbd1b6aebcd72598e419cc8ae9e315546cd6f7f0d6a7cd3c97a7734";
+    const SELECTED_6: &str = "961a16756c0f8b3d729e3d7a2d01a901a24fe1d9689f65d1a7f087ed1a6907bc";
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1759,7 +1759,7 @@ fn the_goth_house_objects_are_all_visited() {
         let calls: Vec<(usize, i32)> = calls.into_iter().collect();
         assert_eq!(
             calls,
-            [(0, 578), (2, 379), (3, 26), (6, 4), (9, 404), (10, 390)]
+            [(0, 578), (2, 379), (3, 26), (6, 4), (9, 404), (10, 397)]
         );
         // The people are visits 202 to 204. Each is asked Reset and Init.
         assert_eq!(before.order[201..204], [21, 18, 16]);

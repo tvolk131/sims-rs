@@ -14,12 +14,13 @@
 //! synchronous tree such as Init it cannot yield and takes the true
 //! branch.
 //!
-//! The queueing is the original's (0x442d70, `queue_removal` below): an
-//! object on the lot leaves it through the lot's placement
-//! (`Interpreter::take_off`, the object's virtual function 0x50), and an
-//! object already off the lot through `Machine::leave_lot` in
-//! `removal.rs`, which fails loudly for one that is not simple. A tile of
-//! a group and a person fail loudly.
+//! The queueing is the original's (0x442d70, `queue_removal` below): the
+//! object leaves the lot through the lot's placement
+//! (`Interpreter::take_off`, the object's virtual function 0x50), except
+//! while the load has not worked the rooms out, when `Machine::leave_lot`
+//! in `removal.rs` takes an object already off the lot and fails loudly
+//! for one that is not simple. A tile of a group and a person fail
+//! loudly.
 //!
 //! Flag bit 1 asks that removing the object does not reset
 //! the objects that depend on it; it is recorded on the object for
@@ -28,6 +29,7 @@
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine, word};
 use crate::placement::capture;
+use sims_sim::rooms::RoomError;
 use std::collections::BTreeSet;
 
 /// Off the lot: where the factory puts a new object.
@@ -66,12 +68,15 @@ impl Machine<'_, '_> {
     ///    them is queued, nothing happens.
     /// 3. If the object itself is queued, nothing happens.
     /// 4. It leaves the lot (its virtual function 0x50, 0x433125, asked to
-    ///    tell the registry: `Interpreter::take_off`). An object already
-    ///    off the lot, as the lot-wide controllers are, still goes the
-    ///    narrower way of `Machine::leave_lot`, which the load and the
-    ///    ticks so far were compared through: the general way works out
-    ///    the room of the off-lot place, and during the load the rooms are
-    ///    not worked out yet.
+    ///    tell the registry: `Interpreter::take_off`). While the load has
+    ///    not worked the lot's rooms out yet, that way cannot find the
+    ///    room of the off-lot place, so an object then goes the narrower
+    ///    way of `Machine::leave_lot`, which the load was compared
+    ///    through. It takes only an object already off the lot that runs
+    ///    no callback for leaving, works its footprint out again as the
+    ///    general way does, and fails loudly for any other object.
+    ///    A fault in a callback the general way runs keeps the object,
+    ///    tree and node it happened at.
     /// 5. Its mark not to reset what depends on it (object flag 0x1000) is
     ///    set from flag bit 1, and it joins the queue.
     fn queue_removal(&mut self, id: u16, flags: u8) -> Result<(), Trap> {
@@ -103,13 +108,16 @@ impl Machine<'_, '_> {
         if self.world.removals.contains(&id) {
             return Ok(());
         }
-        let position = self.world.objects[&id].position;
-        if position[..2] == [OFF_LOT, OFF_LOT] {
+        if matches!(
+            self.world.room_at([OFF_LOT, OFF_LOT, 1]),
+            Err(RoomError::NoRooms)
+        ) {
             self.leave_lot(id)?;
         } else {
+            let me = self.me;
             self.interpreter()
                 .take_off(self.world, id, true)
-                .map_err(|fault| fault.trap)?;
+                .map_err(|fault| fault.nested(me))?;
         }
         let object = self
             .world

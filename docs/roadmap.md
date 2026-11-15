@@ -1557,9 +1557,11 @@ whose holder (each container `capture` gives, up the chain) is queued,
 then takes it off the lot through the object's own remove-from-lot
 (virtual function 0x50, `Interpreter::take_off`, telling the registry),
 and queues it. In tick 609 object 260 removes itself from its tile.
-An object already off the lot, as the lot-wide controllers are, still
-leaves the narrower way of `Machine::leave_lot`, which the earlier ticks
-were compared through. A tile of a group may stand for its lead tile by
+Only while the load has not worked the rooms out does an object leave
+the narrower way of `Machine::leave_lot`, which the load was compared
+through; it takes an object already off the lot with no callback for
+leaving, works its footprint out again as the general way does, and
+fails loudly for any other. A tile of a group may stand for its lead tile by
 a test (0x42344e, its function table's entry 8) not decoded yet, and
 fails loudly.
 
@@ -1572,9 +1574,11 @@ finds person 16 in the way and asks it to move.
 
 **A random choice of slot places** (`0x483c57`). When the search by
 distance finds more places than the context's limit, it keeps a random
-choice: the places with word +0xc first, then, while fewer than the limit
-are kept, a draw from the active stream modulo the number found names a
-place, and the first from there on not yet taken is kept. A kept place's
+choice: the places with word +0xc first, then up to as many attempts as
+the limit less those (a signed count; each attempt counts whether or not
+it keeps a place, so fewer than the limit can be kept): a draw from the
+active stream modulo the number found names a place, and the first from
+there on not yet taken is kept, with no wrap past the last. A kept place's
 score in the copy becomes 0, which is the mark of a taken place (so a
 place that scored 0 is never chosen). Person 16, asked to move in tick
 672, chooses this way.

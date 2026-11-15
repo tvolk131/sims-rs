@@ -99,6 +99,9 @@ fn another_object_is_removed_without_yielding() {
     fx.add(file, 4200, remover(1, 0));
     fx.thread(3, 4200, &[0; 4]);
     fx.world.objects.get_mut(&3).unwrap().stack[0].stack_object = 4;
+    // A footprint other than the one the off-lot place gives, as the
+    // factory may leave one.
+    fx.world.objects.get_mut(&4).unwrap().footprint = [0; 4];
     let interpreter = fx.interpreter();
     let mut world = fx.world.clone();
     assert_eq!(
@@ -106,6 +109,8 @@ fn another_object_is_removed_without_yielding() {
         Ok(Status::Returned(true))
     );
     assert_eq!(world.removals, [4]);
+    // Leaving the lot works it out again: 16 wide round (-16, -16).
+    assert_eq!(world.objects[&4].footprint, [-24, -24, -8, -8]);
     // Requests keep their order.
     fx.world = world;
     fx.add(file, 4200, remover(0, 1));
@@ -216,6 +221,53 @@ fn an_object_on_the_lot_leaves_it_through_the_placement() {
     assert!(fx.world.order.contains(&id));
     assert_eq!(fx.run_with(LAMP, 4200, id as i16, &[], BUDGET), Ok(true));
     assert_eq!(fx.world.removals, [id]);
+}
+
+#[test]
+fn a_fault_in_the_removed_objects_callback_keeps_where_it_happened() {
+    let (mut fx, file) = crate::find_location::placeable();
+    fx.lamp_mut().position = [40, 40, 1];
+    let id = crate::find_location::widget(&mut fx);
+    assert_eq!(
+        crate::find_location::find(&mut fx, LAMP as i16, id, 1),
+        Ok(true)
+    );
+    // The widget's tree for leaving the lot (function 10, tree 4300)
+    // calls a tree that is not there.
+    let table = fx
+        .program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .callbacks
+        .get_mut(&128)
+        .unwrap();
+    table.resize(
+        11,
+        sims_formats::execution::ObjectFunction {
+            condition: 0,
+            action: 0,
+        },
+    );
+    table[10].action = 4300;
+    fx.add(
+        file,
+        4300,
+        tree(vec![ins(4999, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
+    );
+    fx.add(LAMP_FILE, 4200, remover(1, 0));
+    let fault = fx.run_with(LAMP, 4200, id as i16, &[], BUDGET).unwrap_err();
+    // The lamp's instruction reports it, and says it happened in the
+    // widget's tree 4300.
+    assert_eq!(fault.object, LAMP);
+    let Trap::Invalid(message) = &fault.trap else {
+        panic!("{fault}");
+    };
+    assert!(
+        message.starts_with(&format!("object {id}, tree 0x10cc node 0: ")),
+        "{message}"
+    );
+    assert!(fx.world.removals.is_empty());
 }
 
 #[test]
