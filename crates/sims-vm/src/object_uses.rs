@@ -195,8 +195,12 @@ impl Machine<'_, '_> {
     /// 3. Person word 33 takes the new action's priority.
     /// 4. The person's motive changes are all removed (0x46085a).
     /// 5. If person word 73 is set, it is cleared and the person's
-    ///    footprint worked out again (0x433d16); that is not ported and
-    ///    fails, before anything changes.
+    ///    footprint (+0x100) worked out again where it stands (0x45e756 to
+    ///    0x45e778: 0x433d16 with +0xf4 and +0x100, the call Generic Sims
+    ///    Call routine 15 makes). The footprint reads person words 68, 84
+    ///    and 73, so it is worked out before anything changes, from the
+    ///    words as they will be: one that is not ported leaves the person
+    ///    as it was.
     /// 6. Person words 72 and 71 are cleared.
     ///
     /// [`World::action_serial`]: sims_sim::World::action_serial
@@ -205,27 +209,34 @@ impl Machine<'_, '_> {
         mut action: Interaction,
         last_result: bool,
     ) -> Result<(), Trap> {
-        let wide = self
+        let mut data = self
             .me()?
             .person
             .as_ref()
             .ok_or(Trap::native(0x1c, "object is not a person"))?
             .data
-            .get(person::WIDE)
-            .copied();
-        if wide.is_none_or(|w| w != 0) {
-            return Err(Trap::Unsupported(
-                "a person's running action changes with person word 73 set, after which the \
-                 original works out its footprint again (0x433d16); not ported"
-                    .into(),
-            ));
-        }
+            .clone();
+        let wide = data
+            .get_mut(person::WIDE)
+            .ok_or_else(|| Trap::Invalid(format!("a person has no data word {}", person::WIDE)))?;
+        let footprint = if *wide != 0 {
+            *wide = 0;
+            Some(
+                self.interpreter()
+                    .standing_footprint(self.world, self.me, Some(&data))?,
+            )
+        } else {
+            None
+        };
         if action.target != 0 && action.uid == 0 {
             self.world.action_serial = self.world.action_serial.wrapping_add(1);
             action.uid = self.world.action_serial;
         }
-        let person = self
-            .me_mut()?
+        let object = self.me_mut()?;
+        if let Some(footprint) = footprint {
+            object.footprint = footprint;
+        }
+        let person = object
             .person
             .as_mut()
             .ok_or(Trap::native(0x1c, "object is not a person"))?;
@@ -242,6 +253,7 @@ impl Machine<'_, '_> {
         person.active = action;
         person.data[person::PRIORITY] = person.active.priority as i16;
         person.motive_deltas.clear();
+        person.data[person::WIDE] = 0;
         for word in person::CLEARED {
             person.data[word] = 0;
         }

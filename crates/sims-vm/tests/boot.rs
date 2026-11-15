@@ -172,12 +172,35 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
         lot.world().headlines,
         BTreeMap::from([(16, shown(99)), (sim, shown(98))])
     );
-    // Tick 264: the social ends with person word 73 set, after which the
-    // original works out my footprint again (0x433d16), which is not
-    // ported.
+    // Tick 264: the social ends. Person word 73 was set, so it is cleared
+    // and my footprint worked out again (0x45e756).
     lot.step().unwrap_or_else(|e| panic!("{e}"));
-    let stopped = lot.step().unwrap_err().to_string();
-    for part in ["tick 264,", "0x433d16"] {
+    assert_ne!(
+        lot.world().objects[&sim].person.as_ref().unwrap().data[73],
+        0
+    );
+    lot.step().unwrap_or_else(|e| panic!("{e}"));
+    let person = lot.world().objects[&sim].person.as_ref().unwrap();
+    assert_eq!((person.active.target, person.data[73]), (0, 0));
+    // The headlines count down to 0 and stop showing.
+    for _ in 0..96 {
+        lot.step().unwrap_or_else(|e| panic!("{e}"));
+    }
+    assert_eq!(lot.world().headlines, BTreeMap::from([(16, shown(1))]));
+    lot.step().unwrap_or_else(|e| panic!("{e}"));
+    assert!(lot.world().headlines.is_empty());
+    // The lot runs on until person 259 routes to a slot wanting to be
+    // interrupted (0x45b196), which is not ported.
+    let mut steps = 359;
+    let stopped = loop {
+        steps += 1;
+        assert!(steps <= 1000, "the lot did not stop");
+        if let Err(e) = lot.step() {
+            break e.to_string();
+        }
+    };
+    assert_eq!(steps, 595, "{stopped}");
+    for part in ["tick 597,", "object 259, tree 0x0176 node 26", "0x45b196"] {
         assert!(stopped.contains(part), "{stopped}");
     }
 }

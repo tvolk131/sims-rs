@@ -254,14 +254,6 @@ fn the_end_of_a_use_notes_the_last_flagged_object_as_the_icon() {
 
 #[test]
 fn what_the_end_of_a_use_does_not_port_fails_loudly() {
-    // Person word 73 set when the action ends: the original works out the
-    // person's footprint again (0x433d16).
-    let mut fx = using();
-    assert_eq!(turn(&mut fx), Status::Yielded);
-    fx.sim_mut().person.as_mut().unwrap().data[73] = 1;
-    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
-    assert!(fault.to_string().contains("0x433d16"), "{fault}");
     // A used object that is gone.
     let mut fx = using();
     assert_eq!(turn(&mut fx), Status::Yielded);
@@ -269,6 +261,41 @@ fn what_the_end_of_a_use_does_not_port_fails_loudly() {
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
     assert!(fault.to_string().contains("is gone"), "{fault}");
+}
+
+/// [`using`], after its first turn, with the Sim at (56, 56) facing 2,
+/// its definition insetting each side by 1, and person word 73 set.
+fn wide() -> Fixture {
+    let mut fx = using();
+    assert_eq!(turn(&mut fx), Status::Yielded);
+    fx.words(SIM_FILE)[0x9a / 2] = 0x1111;
+    let sim = fx.sim_mut();
+    (sim.position, sim.footprint, sim.data[1]) = ([56, 56, 1], [1, 2, 3, 4], 2);
+    sim.person.as_mut().unwrap().data[73] = 1;
+    fx
+}
+
+#[test]
+fn a_new_action_works_the_footprint_out_again_while_person_word_73_is_set() {
+    // 0x45e756: word 73 is cleared and the footprint worked out again
+    // (0x433d16), with the word already clear, so the insets count.
+    let mut fx = wide();
+    assert_eq!(turn(&mut fx), Status::Returned(true));
+    let sim = fx.sim();
+    assert_eq!(sim.footprint, [54, 54, 58, 58]);
+    let person = sim.person.as_ref().unwrap();
+    assert_eq!((person.data[73], person.active.target), (0, 0));
+    // A facing the footprint does not handle fails before the action
+    // changes.
+    let mut fx = wide();
+    fx.sim_mut().data[1] = 9;
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
+    assert!(fault.to_string().contains("facing 9"), "{fault}");
+    let sim = fx.sim();
+    assert_eq!(sim.footprint, [1, 2, 3, 4]);
+    let person = sim.person.as_ref().unwrap();
+    assert_eq!((person.data[73], person.active.target), (1, LAMP as i16));
 }
 
 #[test]
