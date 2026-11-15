@@ -4,6 +4,7 @@ use crate::assets::{Assets, Definition};
 use crate::camera::{self, Camera, Walls, Zoom};
 use crate::canvas::{Canvas, Image};
 use crate::depth;
+use crate::light::Light;
 use crate::lot::{self, Lot, WallCell};
 use sims_sim::World;
 use std::collections::{BTreeMap, BTreeSet};
@@ -93,6 +94,13 @@ fn segments(x: i32, y: i32) -> [Segment; 4] {
     ]
 }
 
+/// A fine position just beside a wall segment's middle, on its normal's
+/// side (side 0) or the other (side 1).
+fn wall_side(s: &Segment, side: usize) -> [i32; 2] {
+    let sign = if side == 0 { 2 } else { -2 };
+    [0, 1].map(|i| (s.from[i] + s.to[i]) * 8 + sign * s.normal[i])
+}
+
 struct Painter<'a> {
     world: &'a World,
     lot: &'a Lot,
@@ -118,6 +126,11 @@ impl Painter<'_> {
             _ => 3,
         };
         i32::from(h[corner]) * 16
+    }
+
+    /// The light at a fine position on a level (0 or 1).
+    fn light(&self, level: usize, fine: [i32; 2]) -> Light {
+        Light::from_byte(self.lot.light_at(level, fine))
     }
 
     /// Rotates a lot corner (0 to 64) into the view.
@@ -196,8 +209,17 @@ impl Painter<'_> {
                     } else {
                         image.clone()
                     };
+                    // A point inside the half, for its room's light.
+                    let inside = match (floor == lot::SPLIT_FLOOR, wall.segments, half) {
+                        (false, _, _) => [8, 8],
+                        (true, s, 0) if s & lot::DESCENDING != 0 => [4, 4],
+                        (true, s, _) if s & lot::DESCENDING != 0 => [12, 12],
+                        (true, _, 0) => [4, 12],
+                        (true, _, _) => [12, 4],
+                    };
+                    let light = self.light(index, [x * 16 + inside[0], y * 16 + inside[1]]);
                     let camera = self.camera;
-                    self.canvas.draw(&image, at, false, |_, y, _| {
+                    self.canvas.draw_lit(&image, at, false, light, |_, y, _| {
                         depth::ground(camera, y, elevation)
                     });
                     self.stats.floors += 1;
@@ -219,13 +241,14 @@ impl Painter<'_> {
             )
         });
         let origin = self.camera.origin;
+        let lit = self.light(0, [x * 16 + 8, y * 16 + 8]);
         for [a, b, c] in [[0, 1, 2], [0, 2, 3]] {
             fill_triangle(self.canvas, points[a], points[b], points[c], |x, y| {
-                if speckle(x - origin[0], y - origin[1]) {
+                lit.apply(if speckle(x - origin[0], y - origin[1]) {
                     dark
                 } else {
                     light
-                }
+                })
             });
         }
     }
@@ -351,8 +374,12 @@ impl Painter<'_> {
                         }
                     };
                     let elevation = base + self.corner_elevation(s.from);
+                    // The side that shows takes the light of the room on
+                    // that side: sampled just beside the wall's middle, so
+                    // a split tile gives the triangle touching the wall.
+                    let light = self.light(index, wall_side(&s, front));
                     let camera = self.camera;
-                    self.canvas.draw(&image, at, false, |sx, sy, _| {
+                    self.canvas.draw_lit(&image, at, false, light, |sx, sy, _| {
                         let row = match frame {
                             0 => foot[1] - (sx - foot[0]) / 2,
                             1 => foot[1] + (sx - foot[0]) / 2,
@@ -426,6 +453,12 @@ impl Painter<'_> {
             }
             let facing = o.data.get(1).copied().unwrap_or(0);
             let base = level_elevation(level) + ground;
+            // An object takes the light of the room at its position (the
+            // original samples the tile light map there, 0x467482).
+            let light = Light::from_byte(
+                self.lot
+                    .light_at((level - 1) as usize, [o.position[0], o.position[1]]),
+            );
             for part in parts {
                 if !sprite_visible(part.sprite, definition.dynamic_base, &o.dynamic_sprites) {
                     continue;
@@ -445,9 +478,10 @@ impl Painter<'_> {
                 } else {
                     part_anchor(self.camera, o.position, facing, part.object, base)
                 };
-                self.canvas.draw(&part.image, at, part.flip, |_, _, byte| {
-                    depth::sprite(anchor, byte)
-                });
+                self.canvas
+                    .draw_lit(&part.image, at, part.flip, light, |_, _, byte| {
+                        depth::sprite(anchor, byte)
+                    });
             }
             self.stats.objects += 1;
         }
@@ -689,6 +723,20 @@ mod tests {
             origin: [0, 0],
             walls: Walls::Up,
         }
+    }
+
+    #[test]
+    fn a_wall_takes_light_from_the_triangle_touching_it() {
+        // Sample points land inside the tile, in the triangle that holds
+        // the wall's side (1 SW, 2 SE, 3 NE, 4 NW; see `Lot::room_at`).
+        let [west, north, descending, ascending] = segments(3, 5);
+        assert_eq!(wall_side(&west, 0), [50, 88]);
+        assert_eq!(wall_side(&west, 1), [46, 88]);
+        assert_eq!(wall_side(&north, 0), [56, 82]);
+        assert_eq!(wall_side(&descending, 0), [58, 90]);
+        assert_eq!(wall_side(&descending, 1), [54, 86]);
+        assert_eq!(wall_side(&ascending, 0), [58, 86]);
+        assert_eq!(wall_side(&ascending, 1), [54, 90]);
     }
 
     #[test]
