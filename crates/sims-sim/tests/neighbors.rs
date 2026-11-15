@@ -73,6 +73,7 @@ fn neighborhood() -> Neighborhood {
                 count: 4,
             }],
         })],
+        data: [0, 7, -3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
     }
 }
 
@@ -127,6 +128,11 @@ fn records_keep_their_slots_and_are_left_as_the_reader_leaves_them() {
     assert_eq!(neighbors.inventories.len(), 1);
     assert_eq!(neighbors.inventories[0].neighbor, 3);
     assert_eq!(neighbors.inventories[0].items[0].count, 4);
+    assert_eq!(
+        world.neighborhood_data,
+        [0, 7, -3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        "the data words are the file's"
+    );
     // A script names a record by its place plus one.
     assert_eq!(neighbors.get(2), None);
     assert_eq!(neighbors.next(0), 1);

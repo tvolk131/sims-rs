@@ -42,6 +42,472 @@ profile is bound (0x409315), the career cache that keeps old work
 clothes when only age or sex changes, and a `Careers.txt`, which the
 original reads in place of `work.iff`.
 
+## 2026-11-15: A split floor's halves are cut straight, by the screen's clip rectangle
+
+A floor tile a diagonal wall splits now draws each half as the whole
+floor sprite with everything past the cut left out, the cut a straight
+row or column: the original draws each half's sprite with the screen's
+clip rectangle (the words at 0x6f0c10, top, left, bottom, right)
+narrowed to its side of the cut, and restores it after (0x4af380 on).
+On screen a tile's diagonal runs level, through its left and right
+corners, or upright, through its top and bottom ones. For a level cut
+one half is drawn with the top raised to the corners' row (0x4af70a) and
+the other with the bottom lowered to it (0x4af924); for an upright cut
+the right edge is lowered to the tile's x (0x4afcf5) and the left raised
+to it (0x4afef6). The corners' row goes to the lower half and the cut's
+column to the right half. The sprite is drawn at that x less half a tile
+(the view's field +0x5c, `8 << zoom`, set at 0x4a6cfa), so the cut is
+16, 32 or 64 pixels into the image. The sprites are a pixel narrower
+than the tile (31, 63 and 127 wide) with their top and bottom corners on
+the middle column, so the cut falls one column right of the corners,
+not on them.
+
+Before, each pixel was placed in the tile and tested against the
+diagonal, with the position rounded toward zero. On the level cut's row
+that put alternate 4-pixel runs at near zoom (2 at medium) in the upper
+half, so a porch floor ended in a dashed row over the grass below it.
+
+**Checked.** Against the original at the tick-570 world, the pixels the
+change touches fall in mean channel error from 98.7 to 9.8 at near zoom
+(192 pixels, the porch view), from 98.5 to 13.7 at medium (49), and
+from 80 to 2 and 105 to 1.5 at far zoom, rotations 2 and 1 (48 and 10).
+Few match exactly yet because the grass under them still differs (see
+the split tile's blade count). Which half takes which floor is
+unchanged.
+
+## 2026-11-15: A seated route, Drop, pets, runs and the route-failure feedback; strict mode to tick 9906
+
+**Unverified.** The Goth day capture (`goth-day-20261115`, past update
+8699) covers these ticks, but this run has not been compared with it.
+One word was read from it: at update 6756 the new pet's bottom frame
+(Main) has the arguments -2, 0, 0, 0, the -2 being the maker's temp 0
+that Create flag 0x10 copies (below); before the fix this port left 0
+there. Strict mode now runs through tick 9906 (12:00:56, hash
+c8240fc7…) and stops at tick 9907, where object 5 (tree 0x1005 node 5)
+runs Set To Next mode 11. The snack order stops on the same at step
+9907. Snapshot format 27 appends the neighborhood's data words
+(`World::neighborhood_data`); every pinned state up to tick 3912 is the
+same state, which the format-26 hashes kept beside the new ones show.
+The Newbie house, which stopped at tick 1803 on the same Create flag
+0x4, now runs to tick 4052 (its tick-1802 state unchanged under format
+26); the frame drawn after tick 4053 finds person 140's skin waiting
+for its update (0x590d26).
+
+**Ported on the way, in the order the run reached them:**
+
+- **A seated person's route** (tick 3913, 0x4832d4, 0x45b1d7). A person
+  in a container with a Sit function starts its route from the best
+  place beside the seat (the seat's entry bits, definition word 66). If
+  it already sits in a seat a candidate names (0x48177b) it is there;
+  otherwise its seat's Stand tree runs first (step 5, 0x45b6d4) and, if
+  that returns true with the person standing, the candidates are found
+  again (0x45b439); otherwise the route gives up with result 6.
+- **Neighborhood data** (scope 34, 0x4531bf): words 1 to 15 of the
+  neighborhood's sixteen, read only, from the NGBH chunk. Others are
+  native error 0x3c.
+- **Create New Object Instance modes 2 and 5, and flag 0x10.** Mode 2
+  (0x44e22f) puts the new object in the running object's first
+  container slot, mode 5 (0x44e3e9) where the running object stands.
+  Flag 0x10 without flag 0x2 (0x44e8e1 to 0x44e90c) writes my temp 0
+  (+0x3a) to the first data word of the new object's bottom frame: its
+  first argument, or its first local if it takes no argument; a bottom
+  frame with neither fails loudly. With 0x2 it is native error 0x36
+  (0x44e88c), and 0x2 is not ported.
+- **Drop** (opcode 5, 0x454430): what my first container slot holds
+  goes one tile in front of me, after its place test. #183 ported it
+  too (the entry below); this branch's port is kept, as #183's added
+  the step's words to the wrong coordinates. 0x42228a's first word is
+  added to +0xf4 (0x4544ab), which is our second coordinate, as in
+  `routing::slot`. In #183's cancelled-snack test Mortimer stands at
+  (296, 456) facing 6, so the snack goes to (280, 456), not (296, 440).
+  **Unverified**: no capture covers a Drop.
+- **A person's reset ends its object uses first** (0x45e814): frames
+  are popped down to each use's count, and the object used resets.
+- **The route-failure feedback tree** (step 17, 0x45af2a): this branch
+  had ported it too; #181's port (the entry below), checked against the
+  Newbie recording, is kept in place of it.
+- **Pets** (tick 6756). The person factory's pet guard (0x440d63) makes
+  a "dog" or "kat" only with bit 0x20 (Unleashed) or 0x80 (Makin'
+  Magic) of the application's word +0x66; `Program::expansions` now
+  holds the installed mask the lot's zoning already used. The Complete
+  Collection has both. From tick 6760 the pet searches for places with
+  seats off (0x4823d0: person word 65 above 1, so the sitting weight is
+  0 at 0x4835f8); with data word 17 (its pace) set the planner's free
+  cost is 0 (0x482505) and a level-1 outdoor room's fixed rectangles
+  leave out terrain (0x4827f6); and it turns by a sixteenth of a step
+  over the rate, not a quarter (0x58df67). Dropping the seats of a slot
+  with a sitting weight for a pet (0x46de84) is still not ported.
+- **Running** (tick 6784, 8215). With pace 1 a walk starts in animator
+  state 11 (0x58ed52), state 6 with the stop-from-run clip 0x16, which
+  ends in state 10 (0x58e377), and the look-ahead uses the run clip's
+  stride (+0x1fc) when the pace is not 0 (0x58e6cb).
+- **Manage Inventory operation 0** (tick 7702, 0x4556f4): adds 1, or
+  temp `(flags >> 2) & 3` with flag 0x2, to the first token of the kind
+  and GUID (capped at 0x7fff), or adds a token at the end unless the
+  inventory holds 0x7fff.
+- **No door** (tick 9337, 0x45b036): a route that must go through a
+  door and has none gives up with result 2.
+
+**Set To Next mode 11** (stop at tick 9907, 0x44f08d) walks the
+vector of lot numbers at neighborhood +0x11c: cursor 0 gives the
+first, otherwise the one after the cursor; none, or the last, is the
+false branch. The lot load (0x428041, at 0x428350) builds it from lots
+1 to the length of the 8-byte (x, y) table at neighborhood +0x110 less
+one, leaving out the current lot, sorted (0x42ffce) by squared distance
+(0x427fb9). What fills the +0x110 table was not found:
+`LotLocations.iff` (STR# rows of "lot, x, y") is read only by a
+single-lot lookup for the interface (0x4e1f3a) and written by the
+editors (0x54d8b7, 0x555b46), and the zoning vector (+0x174) is a
+different one. Until that table is found, mode 11 fails loudly.
+
+## 2026-11-15: Neighbors' people made off the lot and removed; strict mode to tick 3912
+
+**Unverified.** No capture covers any of it: the Goth captures end at
+update 1000. Strict mode now runs through tick 3912 (08:41:08, hash
+41652f2f…) and stops at tick 3913, where object 16 (tree 0x1010 node
+6) asks for a route from inside a container (0x4832d4). The snack order
+runs through step 4224 and stops on the same at step 4225. The snapshot
+format does not change, and every summary line of `sims boot …
+--ticks 3602` and every pinned hash up to tick 3602 is unchanged.
+
+**Create New Object Instance's flag 0x4** (stop at tick 3603). The
+flag was read as acting only at the end of the tail. It also picks the
+type (0x44e0e6): with it, the definition is not the GUID operand's
+(0x43ac10) but the one linked to the neighbor record the stack object
+names (0x425afe: slot `id − 1` of the record vector, 0x4256f4, then
+record +8, the definition its GUID resolves to). A stack object that
+names no record leaves a null definition, and the false branch is
+taken before anything is made (0x44e117). At the end of the tail
+(0x44e7dd to 0x44e877) a new person that is a visitor (person word 32,
++0x5cc) runs the tree its file names "init visitor" (string 0x6c4120,
+looked up by 0x4021f2) at once on its own thread: 0x474afb calls the
+synchronous run 0x4749b5 with the person as its stack object and a null
+arguments pointer, so its arguments are its own temps, as Run Tree By
+Name's mode 1 runs. What it returns is not read.
+
+**Mode 6 making a person.** Mode 6 clears the byte that asks for the
+off-lot and room tests and the place (0x44e4b5, `[ebp-0x15]`), so a
+person goes the tail's person steps and stays where the factory left
+it: it takes its record's interests and personality (0x425930), flag
+0x20 turns it, and the person-word test (84, 68, 74 → 0x45810c, not
+ported) runs, as in mode 8.
+
+At tick 3603 object 354 (GUID 0x20E32C3C, tree 0x1022) counts the
+neighbor records, picks two at random, makes each one's person off
+the lot (objects 334 and 336; node 29 and 31), writes their person
+words 80 and 81, and removes both (nodes 33 and 34). The Goth lot is
+residential, so neither is a visitor and no "init visitor" tree runs;
+that step is checked only by the synthetic tests.
+
+**Removing a person for another object.** A person's take-off
+(0x433125) refreshes its animator (0x58da12) only if animator byte
++0x109 is set. The animator's tick writes that byte from the house
+view's on-screen test (0x58f69f to 0x58f6e4: 1 after 0x5a0ef5 when the
+test passes, 0 after 0x5a0ffd when it fails; the person's tick passes
+1, 0x45cd39), and so does the view's draw (0x590b8b). It is not kept.
+Until now Remove Object Instance took a person only when it removed
+itself and yielded. Now any other removal of a person works the refresh
+out on a copy of the lot as the take-off leaves it, as a person that
+takes itself off does (`Interpreter::refresh_before_removal`). The
+refresh must write nothing but the person's animator and base layer and
+play no sound, and the person's hand must be empty. The lot goes on
+without the refresh. Here it would place the never-placed animator at
+the off-lot position and clear its skin's update mark.
+
+The branches then differ only in that animator, which the deletion at
+the end of the update destroys. What is checked before then:
+
+- A person with an ID above the remover's has its tick in the same
+  pass (the scheduler walks IDs in order). The refresh is held for that
+  tick (`Interpreter::taken_off`, kept for the pass) and settled as for
+  a person that takes itself off. Until its animator's tick, its thread
+  may run only primitives that read no animator. The refresh then the
+  tick must reach what the tick alone does.
+- A person that removes itself in its own tick and goes on (flag bit
+  0, or a synchronous run) has its animator's tick still to come at
+  the same clock. The refresh is held in that tick
+  (`Interpreter::refreshing`) and settled the same way.
+- A queued person whose tick starts with no refresh held, or whose
+  thread runs a primitive that reads an animator, fails.
+- A head that looks at it fails, as before.
+- A person left queued after a partial pass fails, as before.
+
+Not checked, and **unverified** as for every removal of a person:
+another object's primitive that reads the queued person's animator
+before the deletion, and the deletion's last reset. In strict mode the two people are 334
+and 336, below 354, so neither ticks again. In the snack order they are
+374 and 375, so both tick while queued, and the branches agree.
+
+**Tests.** `create_person` covers:
+
+- the record lookup and its misses;
+- mode 6 making a person;
+- the "init visitor" run, and the cases where it does not run;
+- the loud failures;
+- the removal by another, with each guard;
+- the pass in which the removed person ticks.
+
+The old tests that pinned flag 0x4 and a mode-6 person as unported now
+pin what still fails.
+
+## 2026-11-15: Four types keep more saved attributes than their constructor allocates
+
+A house read used to fail when a saved object held more attributes than
+its constructor allocates (the larger of the definition's count and 8).
+UserData's houses 21, 53 and 58, and most of the template houses of
+UserData2 to 8, stopped there.
+
+The object read (vtable 0x7c, 0x4342ae) reads the saved count from house
+version 0x18. When the count is larger than the array and the read's
+third argument is set, it frees the array, allocates one of the saved
+length, zeroes it and reads the attributes into it (0x434345). Otherwise
+it reads them past the end of the array (0x43437b). The house read
+(0x43fe0a) sets that argument only for an object whose definition is one
+of four types (0x43df98, 0x43dfa3, 0x43dfae, 0x43dfb9, compared at
+0x4400a7):
+
+- 0x3C08965F, the `*Placeholder` object;
+- 0x7FD96B54;
+- 0x4A70DF92 and 0x7BEA0977, only when the configuration's expansions
+  byte (`[0x6e48bc]+0x66`) has Unleashed's bit (0x20). Without that bit
+  both slots hold the first type (0x43fe9d).
+
+The port takes the expansions from global 20, which the load sets from
+the same mask (0xff in every boot here). An object of any other type
+with too many attributes still fails loudly, and the message now names
+its type.
+
+**Unverified:** no capture holds a house with such an object.
+
+What the houses do now (`sims boot`, 1000 ticks, answers 3): no surveyed
+house stops at the attributes. Most stop at the household selection (no
+family). The community lots, UserData's houses 40 to 48, stop where
+Create New Object Instance mode 6 makes a person (0x44e60e).
+
+Reopen if a capture shows an object of another type with more saved
+attributes than its array holds.
+
+## 2026-11-15: The floor and wall pattern catalogs, and a house's maps renumbered through them
+
+A house saves its floor and wall patterns as IDs and maps each ID to a
+file and a number in that file. The load turns them into the keys of the
+game's pattern catalogs (0x4a0e3b, 0x4c5d35). Both catalogs are now built
+the way the original builds them at start-up (floors 0x4a01cb, walls
+0x4c512d; `sims_content::Surfaces`):
+
+- File 0 is the built-in `floors.iff` or `walls.iff`.
+- Then come the `.FLR` or `.WLL` files of each installed pack's
+  `WallsAndFloors/` (in edition-bit order), then
+  `ExpansionShared/WallsAndFloors/` (edition above 3), then
+  `GameData/Floors/` or `GameData/Walls/`. Each directory is listed in
+  its file-table order, going into each subdirectory where its name
+  falls (0x412699; the catalog scan asks for every directory, 0x412863).
+  A file is known by its file name alone, read in Windows-1252 as a
+  house's map names it, byte for byte: a leading byte-order mark is part
+  of the name, as the original's byte comparison sees it. The same holds
+  for the Windows-1252 text `sims-formats` reads through its shared
+  reader (a house's surface map and roofs, FAR member names, chunk
+  labels, field strings, tuning and career values): none is sniffed for
+  a byte-order mark. The language-aware string tables (`STR#`,
+  `strings::decode`) still go through the encoding's own decode, which
+  sniffs one; nothing on the catalogs' path reads them, and the
+  original's handling there is not checked.
+- A file's pattern count is a third of its `SPR2` (floors) or `SPR#`
+  (walls) chunks, and a file with none is left out.
+- Each pattern takes the next key from a free list seeded with
+  [30, 254] and [256, 65534] for floors, or [31, 247] and [256, 65534]
+  for walls. A key taken for a missing sprite is lost.
+
+**Verified** against the catalogs in the guest's memory on the Complete
+Collection: 209 floor and 273 wall files, the file at every place whose
+name the guest still held (150 of 208 floor files, 186 of 272 wall
+files), and every key (`crates/sims-content/tests/surfaces.rs`). The
+directory listing order on disk would only matter for two names sharing
+a file-table bucket, and none do in this install.
+
+The renumbering (`World::renumber_surfaces`):
+
+- **Lookup.** Each map group finds the first catalog file of its name
+  (any case), and each saved ID listed in the group takes that file's key
+  for its number. A missing pattern gives 0xffff, and a later group
+  overwrites an earlier one's ID unconditionally, as in the original.
+- **IDs left 0xffff.** An ID still at 0xffff would be matched to a
+  pattern by colour (0x4a0bbd). That is not ported and fails loudly
+  (`LoadError::SurfaceColour`).
+- **Unlisted IDs.** An ID no group lists becomes 1.
+- **Floors** are renumbered first: each floor cell, then the half floors
+  of a diagonal wall.
+- **Walls** come next. Each wall cell is read through the wall service
+  (0x4795c5) and written back (0x4797e2) with its neighbours, as
+  `legacy/crates/sims-vm/src/native_wall_io.rs` did. A write-back the
+  port does not know fails loudly (`LoadError::SurfaceRewrite`). The
+  wall vertex map that the put also refreshes (world +0x4c/+0x50,
+  0x479c58) is drawing state and is left out.
+
+**Unverified:** no capture holds a house whose maps have entries, so
+the renumbered cells are not yet compared with the original's. The Goth
+and Newbie houses' maps are empty and their pins are unchanged.
+
+What the houses do now (`sims boot`, 1000 ticks, no answers):
+
+- UserData2's houses 1 and 9 now get past the renumbering.
+  - House 1 stops at the household selection (no family).
+  - House 9 stops at the first frame: person 195's ROOT bone was last
+    turned by a layer that no longer plays (0x5992b3).
+- Of the 474 houses surveyed (UserData to UserData5 and 69 of
+  UserData6), none stops at the renumbering. 306 stop at an object with
+  more saved attributes than the 8 its constructor allocates.
+
+Reopen if a capture of a house with map entries renumbers a cell
+differently, or another install lists two pattern files in one bucket.
+
+## 2026-11-15: Objects cast the original's soft shadows on the floor under them
+
+At near zoom the most visible difference left was the shadow under
+plants, benches and other furniture, which the original darkens into the
+floor or grass after drawing each tile and before any object (its floor
+shadow pass, 0x4ae844 in the tile draw 0x4ad8ac). It is now ported in
+`crates/sims-render/src/shadows.rs`, from the code:
+
+- **One object a tile.** The first object of the tile's object grid cell
+  (lot arrays 3 and 103), or the next on the tile through slot 0, that is
+  not hidden, has no zero-extent flag (data word 8, value 4), is not of
+  type 2 or 9 and has a shadow (0x434e23).
+- **The shadow code** (0x4573e7). A one-tile object's is its OBJD word
+  57, -1 for none. A tile of a group builds one from which of its eight
+  neighbours in the group's grid (OBJD word 11) also have a shadow and
+  have OBJD word 56 at 0 (0x43ac5c); a code the masks cannot draw
+  becomes 0. It is turned by the object's facing and then the view's
+  rotation (the tables 0x53d2fc fills); code 16 never turns.
+- **The masks.** Codes 0 and 16 are hand-drawn, SPR2 0x300 and 0x310
+  (plus 0x20 a zoom) in `floors.iff`, read as palette indices. Every
+  other code's mask is worked out over floor 0's tile shape from four
+  curves, one a side, as the original's float code does it (0x4a3cd3,
+  0x4a3914, 0x4a3993).
+- **Drawing** (0x4b10c4). Mask byte plus strength (OBJD word 79, plus
+  255 less the tile's drawn light byte) gives a light level for the
+  pixel, which is drawn through the lighting's tables; 248 and up leaves
+  it alone. Only pixels at or behind the floor's ground depth change.
+
+**Checked** against the original's screenshots, with the world at their
+time. Near zoom rose from 86.3% to 87.6% exact (two other near cameras
+86.8% to 88.3% and 86.5% to 87.1%); far zoom at rotations 1 and 2 by
+0.1 to 0.2 points and medium zoom from 82.7% to 83.1%. Of the pixels the
+shadows changed, 6,359 of 7,149 now match exactly at near zoom (950 of
+1,186 at far rotation 1, 449 of 574 at rotation 2, 2,046 of 2,755 at
+medium); before, almost none did. The bench's two halves meet in one
+shadow, which checks the turning's sense.
+
+**Not ported:** the option that turns shadows off (the "shadows" cheat)
+and the drawing flags that allow them, taken as on; the faint shadow
+under an object the player is placing (0x438a48). The pass runs in the
+tile order of our floor loop, after all grass, where the original runs it
+tile by tile in its own order, so a later tile's grass blade can cover a
+shadow there and not here.
+
+**Seen, not yet read:** on a split tile whose other half has no floor,
+the original draws that half as flat grass (two tones, no blades); we
+draw the bladed grass. The dashed row along the porch's lower edge at
+near zoom is ours alone.
+
+## 2026-11-15: The plumb bob is the original's mesh, coloured and lit as the original does
+
+The selected person's plumb bob is now drawn (`sims_people::bob`, from
+`People::draw`). Everything below was read from the original's code in
+a memory image, except where it says otherwise.
+
+- **What it is.** An ordinary object (`PlumbBob.iff`, GUID 0x2F726FFF)
+  in the person's head slot (their container slot 2), with no sprites.
+  Its object string 200 names the skeleton `root` and the suit
+  `head-arrow,ROOT=white`. The suit's mesh, `xskin-head-arrow-ROOT-ARROW`,
+  is in `Animation.far`, 2.1 units long on its z axis. No
+  `root-skeleton.cmx.bcf` or `white.bmp` exists, so we make a one-bone
+  skeleton and draw the mesh white.
+- **Where.** The head slot's redraw (0x58dbd8 to 0x58dc03) gives the
+  bob's graphic the `HEAD` bone's position times the person's
+  placement, without the bone's own turn. The draw (0x585dc5) sets the
+  root bone at (0, 3, 0), turned by the original's Euler routine
+  (0x5c4bb0, run in an emulator to fix its order) a quarter turn about
+  x and the spin about z. So the bob stands upright from three units
+  over the head and spins about its length.
+- **Spin.** The game's clock in milliseconds (0x6e54e0) × 0.001 × π, or
+  half a turn a second. We have no such clock, so the game window passes
+  the time it has run (`People::set_clock`, from `Game::advance`). That
+  time runs on while the lot is paused or a dialog waits; whether the
+  original's clock does is **unverified**. While a bob is on the lot,
+  the window draws a new frame every 50 ms even when no tick runs (our
+  choice; the original's frame rate is not ported).
+- **Colour.** The suit's name sets a mode (`head-arrow` 1,
+  `head-arrow-date` 2, `head-star` 3, 0x5856db to 0x58579f). In mode 1,
+  m is the mood (motive 3 cut to an integer) × 0.012, held to −1..1.
+  - From 0 up, r = b = 1 − m and g = 1, with b lowered a further
+    0.4 − m below 0.4.
+  - Below 0, r = 1 and g = b = 1 − m², with b lowered a further m + 0.4
+    above −0.4.
+  - So the bob runs red, pale yellow, green.
+- **Light.** The colour is a light of intensity 1, and the ambient light
+  is a quarter of the colour plus 0.05. The light's vector is the house
+  camera's unit vector from its eye to the centre (+0x184, set at
+  0x49b2aa), turned 80° about y and then 30° about x (0x6f6b38). That
+  turn is in the lot's terms, so the light falls from another side at
+  each rotation of the view.
+
+**Taken from the screenshot, not read.** In the original's screenshot
+(medium zoom, 7:38 AM, Mortimer reading on the porch bench), the bob is
+brightest on the viewer's left and lit on its lower half. That is what
+we get by taking the vector as pointing towards the light. Taken the
+other way, the left side is dark. With that choice our bob's green
+pixels span the original's box (x 427 to 434, y 74 to 97), each edge
+within a pixel, as a gated test checks; the pixels inside the box are
+not compared one by one.
+
+**Unverified.**
+- Which bone the slot names (its +0x20); `HEAD` puts the bob where the
+  screenshot has it.
+- Rotations other than 0.
+- The bob's pixels name the person who holds it, for a click; what the
+  original does on a click there was not checked.
+
+**Not ported.** Modes 2 and 3, the date and star bobs.
+
+## 2026-11-15: A split floor tile's grass keeps the blades of the tile drawn before it
+
+The grass's blade count is now worked out tile by tile in the order the
+original draws the tiles, and carried from one to the next, as the
+original keeps it in the grass object between tiles (0x49d0da to
+0x49d215). The tiles are drawn in runs along the view's diagonals, x + y
+rising, and x rising along each run (0x4ad4bd calling 0x4ad8ac). A tile:
+
+- with no floor counts its blades by its grass value, as before;
+- with a floor and no diagonal wall counts none (0x49d155) and keeps the
+  previous tile's short-blade flag;
+- with a floor split by a diagonal wall (wall byte 0 & 0x30) keeps the
+  count and the flag of the tile drawn before it, whatever its own grass
+  (0x49d14b);
+- off the lot's inner tiles (1 to size − 2 in x and y) returns before
+  any of this and leaves the count as it was (0x49cecc); it draws no
+  blades here, as before.
+
+So the floorless half of a split tile beside a porch shows flat grass,
+and beside a lawn a full lawn. Before, it counted by its own grass.
+
+**Checked.** Against the original at the tick-570 world: near zoom (the
+porch view, origin 619, −1189) rose from 86.5% to 87.0% exact; of the
+2,402 pixels the change touches, 2,115 now match exactly (3 did before),
+and the mean channel error there fell from 21.1 to 4.6. Medium zoom
+(cutaway): 82.7% to 82.8%; of 771 pixels changed, 715 match (none did),
+error 16.6 to 0.3. At far zoom only a few pixels change: 8 at rotation
+1, all now exact (none were), and 9 at rotation 2, which match neither
+way. Tile (27, 28) on the Goth
+porch is one: the tile drawn before it, (26, 29), has a floor, so its
+empty half is flat in both.
+
+**Not ported.** The original clips each run to the screen before drawing
+it, so a tile off screen is not drawn and does not pass its count on;
+here every tile is in the order. A split tile at the screen's edge could
+take a count from a different tile. The pool test (0x47c16d), which
+gives a tile in a pool none, is still not looked at.
+
 ## 2026-11-15: The relationship panel lists who the Sim knows
 
 The live panel's Relationships button now opens the selected Sim's
@@ -268,7 +734,8 @@ ported from the original's code, as the inverse of Grab:
   - The snack order, cancelled at step 900 while Mortimer eats
     (`a_cancelled_snack_is_put_down_in_front_of_the_eater`). His tree
     0x0139 (node 14) drops the snack at step 1009. He stands at (296,
-    456) facing 6, and it goes to (296, 440). At step 1028 the
+    456) facing 6, and it goes to (296, 440) (corrected to (280, 456)
+    by the entry above). At step 1028 the
     cancelled action ends, and he is free. No error is caught.
   - Through the window
     (`a_second_order_waits_behind_the_first_and_a_press_cancels_either`):
@@ -4411,9 +4878,9 @@ control panel in the bottom-left corner.
   One depth model for floors and ground would settle it.
 - Grass on a pool, which the original leaves bare. Pools are not looked
   at.
-- A floor tile split by a diagonal wall. The original keeps the blade
-  count of whichever tile it drew before; here it counts by its own
-  grass.
+- A floor tile split by a diagonal wall. Now ported; see "A split floor
+  tile's grass keeps the blades of the tile drawn before it"
+  (2026-11-15).
 - Seasons, which swap the blade-height tables (0x6c629c, 0x6c62a8).
 - A flag at 0x8d that blanks the colors of tiles on the lot's edge. It
   is off in this capture and not modelled.

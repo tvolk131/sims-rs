@@ -17,6 +17,7 @@
 pub mod animation;
 pub mod appearance;
 pub mod assets;
+pub mod bob;
 pub mod house;
 pub mod lot;
 pub mod math;

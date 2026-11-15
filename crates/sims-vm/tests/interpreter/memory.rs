@@ -546,19 +546,36 @@ fn the_advertisement_record_is_the_one_find_best_interaction_last_copied() {
 }
 
 #[test]
-fn unsupported_scopes_name_themselves() {
-    for scope in [34, 38] {
-        let mut fx = Fixture::new();
-        let fault = read(&mut fx, scope, 0).unwrap_err();
-        assert_eq!(fault.trap, Trap::UnsupportedScope { scope });
-        let text = fault.to_string();
-        assert!(
-            text.contains(&format!(
-                "unsupported scope {scope} ({})",
-                sims_vm::scope_name(scope)
-            )),
-            "{text}"
-        );
+fn neighborhood_data_reads_words_1_to_15() {
+    // Scope 34 (0x4531bf): word `index` of the neighborhood's sixteen, a
+    // value with no word pointer, so it cannot be written (native error
+    // 0x13). Words 0 and 16 on are native error 0x3c.
+    let mut fx = Fixture::new();
+    fx.world.neighborhood_data[5] = 42;
+    fx.world.neighborhood_data[15] = -3;
+    assert!(reads(&mut fx, 34, 5, 42));
+    assert!(reads(&mut fx, 34, 15, -3));
+    assert!(reads(&mut fx, 34, 1, 0));
+    for index in [0, 16, -1] {
+        assert_eq!(code(read(&mut fx, 34, index)), Some(0x3c), "index {index}");
     }
+    assert_eq!(code(write(&mut fx, 34, 5, 7)), Some(0x13));
+    assert_eq!(fx.world.neighborhood_data[5], 42);
+}
+
+#[test]
+fn unsupported_scopes_name_themselves() {
+    let scope = 38;
+    let mut fx = Fixture::new();
+    let fault = read(&mut fx, scope, 0).unwrap_err();
+    assert_eq!(fault.trap, Trap::UnsupportedScope { scope });
+    let text = fault.to_string();
+    assert!(
+        text.contains(&format!(
+            "unsupported scope {scope} ({})",
+            sims_vm::scope_name(scope)
+        )),
+        "{text}"
+    );
     assert_eq!(sims_vm::scope_name(24), "neighbor in stack object");
 }

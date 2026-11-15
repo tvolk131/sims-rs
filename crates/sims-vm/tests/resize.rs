@@ -45,6 +45,7 @@ fn with_goth_people(
     let mut program =
         Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid)).unwrap();
     program.zoning = neighborhood.zoning(context.expansions).unwrap();
+    program.expansions = context.expansions;
     program.animations = Animations::load(&install, &index).unwrap();
     // Every person type's skeleton and appearance, for the people a script
     // makes, as `sims boot` loads them.
@@ -417,11 +418,21 @@ fn routing_18_bytes(routing: &sims_sim::route::Routing) -> Vec<u8> {
     bytes
 }
 
+/// A lot's encoding as snapshot format 26 wrote it: without the
+/// neighborhood's data words ([`World::neighborhood_data`]) that format 27
+/// added at the end. The older formats' encodings start from this one.
+fn format_26_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let data = postcard::to_allocvec(&world.neighborhood_data).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - data.len()), data);
+    bytes
+}
+
 /// A lot's encoding as snapshot format 25 wrote it: without the record of
 /// the bones the skins moved ([`World::translated_bones`]) that format 26
-/// added at the end. The older formats' encodings start from this one.
+/// added at the end either. It starts from [`format_26_bytes`].
 fn format_25_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_26_bytes(world);
     let moved = postcard::to_allocvec(&world.translated_bones).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - moved.len()), moved);
     bytes
@@ -1164,7 +1175,11 @@ fn the_goth_house_arrays_are_read_and_nothing_is_renumbered() {
             assert_eq!(house.wall_map.as_deref(), Some(&[][..]));
             let before = world.arrays.clone();
             let changed = world
-                .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+                .renumber_surfaces(
+                    house.floor_map.as_deref(),
+                    house.wall_map.as_deref(),
+                    &Default::default(),
+                )
                 .unwrap();
             assert_eq!(changed, 0);
             assert_eq!(world.arrays, before);
@@ -1207,7 +1222,9 @@ fn the_goth_house_type_table_marks_the_changed_types() {
             world.clear_family().unwrap();
             interpreter.clear(world).unwrap();
             world.read_arrays(&house.arrays, 62).unwrap();
-            world.renumber_surfaces(Some(&[]), Some(&[])).unwrap();
+            world
+                .renumber_surfaces(Some(&[]), Some(&[]), &Default::default())
+                .unwrap();
             let before = world.clone();
             let changed = interpreter.read_types(world, &house.types).unwrap();
             assert_eq!((changed.len(), house.types.entries.len()), (77, 113));
@@ -1300,7 +1317,11 @@ fn the_goth_house_objects_are_constructed_and_read() {
             interpreter.clear(world).unwrap();
             world.read_arrays(&house.arrays, 62).unwrap();
             world
-                .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+                .renumber_surfaces(
+                    house.floor_map.as_deref(),
+                    house.wall_map.as_deref(),
+                    &Default::default(),
+                )
                 .unwrap();
             interpreter.read_types(world, &house.types).unwrap();
             assert_eq!(interpreter.clear(world), Ok(vec![]));
@@ -1372,7 +1393,11 @@ fn reading_the_people_raises_the_action_serial() {
             interpreter.clear(world).unwrap();
             world.read_arrays(&house.arrays, 62).unwrap();
             world
-                .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+                .renumber_surfaces(
+                    house.floor_map.as_deref(),
+                    house.wall_map.as_deref(),
+                    &Default::default(),
+                )
                 .unwrap();
             interpreter.read_types(world, &house.types).unwrap();
             interpreter.clear(world).unwrap();
@@ -1474,7 +1499,11 @@ fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
             interpreter.clear(world).unwrap();
             world.read_arrays(&house.arrays, 62).unwrap();
             world
-                .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+                .renumber_surfaces(
+                    house.floor_map.as_deref(),
+                    house.wall_map.as_deref(),
+                    &Default::default(),
+                )
                 .unwrap();
             interpreter.read_types(world, &house.types).unwrap();
             interpreter.clear(world).unwrap();
@@ -1629,7 +1658,11 @@ fn the_goth_house_gets_its_rooms_and_its_household() {
         interpreter.clear(world).unwrap();
         world.read_arrays(&house.arrays, 62).unwrap();
         world
-            .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+            .renumber_surfaces(
+                house.floor_map.as_deref(),
+                house.wall_map.as_deref(),
+                &Default::default(),
+            )
             .unwrap();
         interpreter.read_types(world, &house.types).unwrap();
         interpreter.clear(world).unwrap();
@@ -1747,7 +1780,11 @@ fn selected(root: &std::path::Path, then: impl FnOnce(&Interpreter, &mut World, 
         interpreter.clear(world).unwrap();
         world.read_arrays(&house.arrays, 62).unwrap();
         world
-            .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+            .renumber_surfaces(
+                house.floor_map.as_deref(),
+                house.wall_map.as_deref(),
+                &Default::default(),
+            )
             .unwrap();
         interpreter.read_types(world, &house.types).unwrap();
         interpreter.clear(world).unwrap();
