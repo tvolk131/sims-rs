@@ -3,7 +3,7 @@
 //! The original keeps one record per neighbor in the neighborhood object
 //! (`[[0x6e48bc]+0x24]`), in a vector of record pointers at +0x148. It
 //! builds them when it reads the neighborhood file (NBRS, read by
-//! 0x42feb2) and rebuilds part of them each time it reloads the
+//! 0x430ad6, each record by 0x423e08) and rebuilds part of them each time it reloads the
 //! neighborhood (0x424806), before any lot loads. A lot's scripts read
 //! and write them: Set To Next walks them (modes 5 and 7), an expression
 //! reads a record's person data (scope 32), and Relationship keeps the
@@ -19,7 +19,7 @@ use crate::load::LoadError;
 use serde::{Deserialize, Serialize};
 use sims_content::Neighborhood;
 use sims_formats::neighborhood::Neighbor as Saved;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// How many person data words a record holds (+0x74, 256 words).
 pub const PERSON_WORDS: usize = 256;
@@ -126,7 +126,7 @@ pub struct Item {
 }
 
 impl Neighbor {
-    /// A record as the reader (0x42feb2) leaves it.
+    /// A record as the reader (0x423e08) leaves it.
     pub fn read(saved: &Saved) -> Self {
         let mut data = vec![0; PERSON_WORDS];
         let saved_words = saved.person_data.len().min(PERSON_WORDS);
@@ -200,32 +200,119 @@ impl Neighbors {
     }
 }
 
+/// The OBJD types the reload makes a record for when no record links to
+/// a definition of that type (0x424d58 to 0x424e3c): 2, a person, and
+/// 0x200, 0x400, 0x800 and 0x1000.
+pub const RECORDED_KINDS: [u16; 5] = [2, 0x200, 0x400, 0x800, 0x1000];
+
+/// One registered object definition, as the reload walks them: the game's
+/// definition registry (`[[0x6e48bc]+0x28]`) keeps every definition it
+/// registers in a vector (+0x20, read by 0x43ac3a), duplicates included,
+/// and a map from GUID to the last one registered (+0x125c, read by
+/// 0x43ac10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Registered {
+    pub guid: u32,
+    /// The OBJD type (OBJD +0x12).
+    pub kind: u16,
+    /// Whether the map gives this definition for its GUID: it is the last
+    /// registered with that GUID.
+    pub resolves: bool,
+}
+
+/// The registry as the reload sees it, from the catalog built from
+/// `index`.
+///
+/// The catalog registers a neighborhood's characters where the index
+/// mounts them, before `Downloads` ([`sims_content::Index::add_characters`]).
+/// The reload reregisters them first (0x43c228, at 0x424a8b): it takes
+/// the old characters' definitions out and registers the new ones, which
+/// appends them to the vector and makes them the map's for their GUIDs. So
+/// here the definitions from the `Characters` mount come after every
+/// other, in their own order, and a GUID resolves to the last definition
+/// of it in that order.
+///
+/// Checked against a capture of the original's registry in the base
+/// neighborhood (the Newbie house's startup): the 463 definitions of
+/// [`RECORDED_KINDS`] come in the same order. Its whole vector differs
+/// from the catalog's in other places, which this does not use.
+pub fn registry(index: &sims_content::Index, catalog: &sims_content::Catalog) -> Vec<Registered> {
+    let character = |object: &&sims_content::Object| {
+        index.mounts[index.resources[object.resource].mount].path == "Characters"
+    };
+    let ordered: Vec<&sims_content::Object> = catalog
+        .objects
+        .iter()
+        .filter(|o| !character(o))
+        .chain(catalog.objects.iter().filter(|o| character(o)))
+        .collect();
+    let mut last = BTreeMap::new();
+    for (place, object) in ordered.iter().enumerate() {
+        last.insert(object.guid, place);
+    }
+    ordered
+        .iter()
+        .enumerate()
+        .map(|(place, object)| Registered {
+            guid: object.guid,
+            kind: object.kind,
+            resolves: last[&object.guid] == place,
+        })
+        .collect()
+}
+
 impl World {
-    /// Reads the neighborhood's records (NBRS, 0x42feb2) and inventories
-    /// (NGBH, 0x4254f6), and does what the neighborhood's reload (0x424806)
-    /// does to the records before a lot loads. `characters` are the GUIDs
-    /// of the person types the game has registered.
+    /// Reads the neighborhood's records (NBRS, 0x430ad6) and inventories
+    /// (NGBH, 0x4254f6, which reads them with 0x42feb2), and does what the
+    /// neighborhood's reload (0x424806) does to the records before a lot
+    /// loads. `registry` is every
+    /// definition the game has registered, in order ([`registry`]).
     ///
     /// An empty slot in the file's inventory vector fails: the original
     /// would hold a null pointer there, which its inventory lookup
     /// (0x42a8a1) does not expect.
     ///
-    /// The reload:
+    /// Reading a record links it to the definition its GUID resolves to
+    /// (record +8, 0x423ef2), or to none. The reload:
     ///
-    /// 1. drops each family's members that no record has the GUID of;
-    /// 2. orders the families by their number, then their chunk ID, both
+    /// 1. deletes each record linked to no definition (0x424ad8, 0x4259a2),
+    ///    which is **not ported**: such a record is an error here;
+    /// 2. drops each family's members that no record has the GUID of;
+    /// 3. orders the families by their number, then their chunk ID, both
     ///    descending (0x425209), with an empty family 0 of number -1
     ///    added when the file has none;
-    /// 3. makes a record for each person type that has none, which is
-    ///    **not ported**: a type without a record is an error here;
-    /// 4. rebuilds person data word 61, the family (0x425244): every
+    /// 4. makes a record for each registered definition, in registration
+    ///    order (the neighborhood's characters last, see [`registry`]), of a type in [`RECORDED_KINDS`] that no record is linked
+    ///    to (0x424d40 to 0x424e82): a record is linked to the definition
+    ///    its GUID resolves to, so a definition another of its GUID
+    ///    replaced gets one too. The record (0x4257a5 with no slot asked
+    ///    for, then 0x4237a1) goes in the last empty slot, or in a new
+    ///    slot at the end when none is empty, and its ID is its slot's
+    ///    place plus one. It has the definition's GUID, revision 0, every
+    ///    person data word 0 and no relationship rows, and no inventory;
+    /// 5. rebuilds person data word 61, the family (0x425244): every
     ///    record's is cleared, then each family in that order writes its
     ///    chunk ID into the first record of each member's GUID.
     ///
-    /// Ported from the old prototype (legacy/crates/sims-vm/src/neighborhood.rs,
-    /// `prepare_family_reload` and `rebuild_family_links`). The families
-    /// are kept, in that order, as far as [`Family`] holds them: each
-    /// with its friend count as the file saved it and out of date.
+    /// The record's name (+0x28, from the definition by 0x457e0e) is
+    /// presentation and is not kept. Its friend count and whether that is
+    /// out of date (+0x20, +0x24) are left as the allocator returned them.
+    /// The original can read them before a relationship write marks the
+    /// count out of date: scope 24 field 5 (0x425c19, 0x427148) returns
+    /// the count as it is when the flag byte is 0. Here they are 0 and
+    /// out of date, as for a record read from the file, and that field is
+    /// not ported (it fails loudly), so nothing reads them.
+    ///
+    /// The original reads the records only when the neighborhood file has
+    /// an NGBH chunk (0x424a90; without one it makes every record). Here
+    /// they are read either way. Every shipped neighborhood has one.
+    ///
+    /// Steps 2, 3 and 5 are ported from the old prototype
+    /// (legacy/crates/sims-vm/src/neighborhood.rs, `prepare_family_reload`
+    /// and `rebuild_family_links`), steps 1 and 4 from the original's
+    /// code. The families are kept, in that order, as far as [`Family`]
+    /// holds them: each with its friend count as the file saved it and
+    /// out of date.
     ///
     /// Checked against the original: from the install's neighborhood
     /// file, every record's word 61 equals the capture's at the Goth
@@ -233,11 +320,15 @@ impl World {
     /// file, which differs from the install's in five records (47, 48,
     /// 301, 344 and 351); see `docs/decisions.md`. So do the families'
     /// IDs, houses, members and order, and every friend count but the
-    /// Goth family's, which the load counts again (load step 20).
+    /// Goth family's, which the load counts again (load step 20). That
+    /// neighborhood has a record for every registered definition, so step
+    /// 4 makes none there; the records it makes for a neighborhood that
+    /// lacks them are **unverified** against the original, the order of
+    /// the registry most of all.
     pub fn read_neighbors(
         &mut self,
         neighborhood: &Neighborhood,
-        characters: impl IntoIterator<Item = u32>,
+        registry: &[Registered],
     ) -> Result<(), LoadError> {
         let families = &neighborhood.families;
         let mut inventories = Vec::new();
@@ -267,20 +358,17 @@ impl World {
             inventories,
             relationships_changed: false,
         };
-        let mut first = BTreeMap::new();
-        for (place, record) in neighbors.slots.iter().enumerate() {
-            if let Some(record) = record {
-                first.entry(record.guid).or_insert(place);
-            }
-        }
-        for guid in characters {
-            if !first.contains_key(&guid) {
+        let registered: BTreeSet<u32> = registry.iter().map(|d| d.guid).collect();
+        for record in neighbors.slots.iter().flatten() {
+            if !registered.contains(&record.guid) {
                 return Err(LoadError::Neighborhood(format!(
-                    "the person type 0x{guid:08X} has no neighborhood record; the reload makes \
-                     one (0x424806), which is not ported"
+                    "record {} has the person type 0x{:08X}, which no definition has; the \
+                     reload deletes it (0x4259a2), which is not ported",
+                    record.id, record.guid
                 )));
             }
         }
+        let first = first_records(&neighbors);
         // The added family 0 has number -1, no house, no members, and the
         // friend count its constructor gives (0).
         let mut ordered: Vec<(i32, Family)> = families
@@ -312,6 +400,16 @@ impl World {
             ordered.push((-1, family));
         }
         ordered.sort_unstable_by_key(|(number, family)| std::cmp::Reverse((*number, family.id)));
+        // A record read from the file is linked to the definition its GUID
+        // resolves to; a record made here, to the definition it was made
+        // for, which is never another registered definition.
+        for definition in registry {
+            let linked = definition.resolves && first.contains_key(&definition.guid);
+            if RECORDED_KINDS.contains(&definition.kind) && !linked {
+                neighbors.make_record(definition.guid)?;
+            }
+        }
+        let first = first_records(&neighbors);
         for record in neighbors.slots.iter_mut().flatten() {
             record.data[FAMILY] = 0;
         }
@@ -330,6 +428,64 @@ impl World {
         }
         self.neighbors = neighbors;
         self.families = ordered.into_iter().map(|(_, family)| family).collect();
+        Ok(())
+    }
+
+    /// What the house load (0x428041) does to the families right after
+    /// the reload (0x428071 to 0x4280b1): each family other than family 0
+    /// that has no members is taken out of its house and deleted
+    /// (0x425efb). That is **not ported**: such a family is an error here.
+    pub fn drop_empty_families(&self) -> Result<(), LoadError> {
+        match self
+            .families
+            .iter()
+            .find(|f| f.id != 0 && f.members.is_empty())
+        {
+            Some(family) => Err(LoadError::Neighborhood(format!(
+                "family {} has no members; the house load deletes it (0x425efb), which is not \
+                 ported",
+                family.id
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The place of the first record of each GUID, in slot order.
+fn first_records(neighbors: &Neighbors) -> BTreeMap<u32, usize> {
+    let mut first = BTreeMap::new();
+    for (place, record) in neighbors.slots.iter().enumerate() {
+        if let Some(record) = record {
+            first.entry(record.guid).or_insert(place);
+        }
+    }
+    first
+}
+
+impl Neighbors {
+    /// Makes a record of the person type `guid` (0x4257a5 asked for no
+    /// slot, then 0x4237a1): in the last empty slot, or a new slot at the
+    /// end when none is empty. Its ID is the slot's place plus one.
+    fn make_record(&mut self, guid: u32) -> Result<(), LoadError> {
+        let place = match self.slots.iter().rposition(Option::is_none) {
+            Some(place) => place,
+            None => {
+                self.slots.push(None);
+                self.slots.len() - 1
+            }
+        };
+        let id = i16::try_from(place + 1).map_err(|_| {
+            LoadError::Neighborhood("the neighborhood holds more records than a word counts".into())
+        })?;
+        self.slots[place] = Some(Neighbor {
+            id,
+            guid,
+            revision: 0,
+            data: vec![0; PERSON_WORDS],
+            relationships: Vec::new(),
+            friends: 0,
+            stale: true,
+        });
         Ok(())
     }
 }
