@@ -247,9 +247,12 @@ impl Depth {
         Anchor { row, depth }
     }
 
-    /// The upright part of a wall pixel on screen row `y`, for a wall
-    /// placed at `anchor`.
-    fn stand(&self, anchor: Anchor, y: i32) -> i32 {
+    /// The depth of a pixel on screen row `y` of something standing
+    /// upright at `anchor`, without its own depth bytes or columns: the
+    /// anchor's depth plus `L` for the rows `y` stands above the anchor's
+    /// row. Walls take their depth this way; anything else drawn upright
+    /// from an anchor (a person's mesh) can too.
+    pub fn stand(&self, anchor: Anchor, y: i32) -> i32 {
         let i = anchor.row.saturating_add(8 << self.zoom).saturating_sub(y);
         anchor.depth.saturating_add(self.upright(i))
     }

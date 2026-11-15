@@ -109,3 +109,79 @@ fn an_empty_point_measures_the_head_from_the_bones_origin() {
 fn an_absent_point_measures_the_head_from_the_bones_origin() {
     assert_ne!(heading(None), F32::ZERO);
 }
+
+/// [`anchored`] with a skeleton of a root, the head under it and an arm
+/// beside the head, and a carry layer at half weight playing a clip that
+/// moves `carried`.
+fn carrying(carried: &str) -> Fixture {
+    let mut fx = anchored(Some("Top"));
+    let bone = |name: &str, parent| Bone {
+        name: name.into(),
+        parent,
+        translation: [0; 3],
+        rotation: [0, 0, 0, 1f32.to_bits()],
+    };
+    fx.program
+        .people
+        .skeletons
+        .get_mut(&SIM_GUID)
+        .unwrap()
+        .bones = vec![
+        bone("ROOT", None),
+        bone("HEAD", Some(0)),
+        bone("ARM", Some(0)),
+    ];
+    fx.program.animations.insert(
+        "test",
+        Clip {
+            name: "carry".into(),
+            skill: "skill".into(),
+            duration: 100f32.to_bits(),
+            distance: 0,
+            moving: false,
+            frames: 1,
+            motions: 1,
+            tracks: vec![],
+            channels: vec![sims_content::Channel {
+                bone: carried.into(),
+                translation: None,
+                rotation: Some(0),
+            }],
+            samples: [0, 0],
+        },
+    );
+    let animator = fx.world.animators.get_mut(&SIM).unwrap();
+    let mut layer = Layer::start("carry", F32::from_f32(100.), 1, true, 0, false, 50);
+    layer.priority = 10;
+    layer.weight = F32::from_f32(0.5);
+    animator.carry = Some(layer);
+    animator.carry_selection = 0;
+    fx
+}
+
+fn draw(mut fx: Fixture) -> Result<F32, sims_vm::Fault> {
+    let vm = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    vm.draw_frame(&mut fx.world, 1)?;
+    Ok(fx.world.animators[&SIM].head.heading)
+}
+
+#[test]
+fn a_carry_layer_that_moves_only_the_arm_is_passed_over() {
+    let heading = draw(carrying("ARM")).unwrap();
+    let mut alone = carrying("ARM");
+    let animator = alone.world.animators.get_mut(&SIM).unwrap();
+    animator.carry = None;
+    animator.carry_selection = -1;
+    assert_eq!(heading, draw(alone).unwrap());
+}
+
+#[test]
+fn a_carry_layer_that_moves_the_head_or_its_root_fails_loudly() {
+    for bone in ["HEAD", "ROOT"] {
+        let fault = draw(carrying(bone)).unwrap_err();
+        assert!(
+            matches!(&fault.trap, sims_vm::Trap::Unsupported(m) if m.contains("carry clip")),
+            "{bone}: {fault}"
+        );
+    }
+}

@@ -60,10 +60,10 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 690 on the Goth house**: our
+  there, as three captures recorded). **K = 877 on the Goth house**: our
   state after every one of ticks 1 to 608 equals the fourth capture of the
   original (full state after every update), and after every one of ticks
-  600 to 690 the fifth, in everything compared, but
+  600 to 877 the fifth, in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
   other captures agree where they hold a state, but for fields that also
@@ -1589,6 +1589,84 @@ for the head fields of "Ticks 334 to 366".
 
 **Stops.** Tick 691: person 18 routes in a room upstairs (room 1025),
 and the room's rectangles above the ground (`0x4818af`) are not ported.
+See "Ticks 691 to 752".
+
+### Ticks 691 to 752
+
+**A room upstairs** (`0x4818af`, `routing/rooms.rs`). The room's
+rectangles are worked out the same way on both levels: the room's ID
+gives the level (`0x468756`), which picks the room map (`0x481926`) and
+the walls (`0x4795c5`, array 102 upstairs), and the tile test
+(`0x4821f3`) looks at the objects on that level. The ground's covering
+counts only on level 1 (`0x4818e0`), as water does (`0x478f4a`). In tick
+691 person 18 routes in room 1025, upstairs.
+
+**K = 752.** Our state after every tick from 691 to 752 equals the fifth
+capture in everything compared, the three random streams included, but
+for the head fields of "Ticks 334 to 366".
+
+**Stops.** Tick 753: person 21's pose has a carry layer (`0x5992b3`),
+which the animator does not port. See "Ticks 753 to 871".
+
+### Ticks 753 to 871
+
+**A carry layer the head does not read** (`0x5992b3`, `head.rs`). A
+person carrying something plays the script's carry clip as a layer of
+priority 10. The pose is read only for the head: the bones from the
+root to the head's anchors and the head itself. A carry layer whose clip
+moves none of them leaves them as the foreground put them, so it is
+passed over. One that moves such a bone, and a carry clip chosen with no
+carry layer, still fail loudly. In tick 753, person 21 carries.
+
+**Set Motive Change** (opcode 29, `0x45a16f`, `motive_change.rs`). It is
+the person's own primitive. Flag bit 0 drops all of the person's motive
+changes. Otherwise the motive must be 5 to 9, 14 or 15 (native error
+0x1a), checked before the amount and the stop value are read. The
+change goes on the end of the list: the motive, the amount per hour
+times the float at `0x667408` (1/1800) for a change per tick, and the
+stop value. The person's tick applies the list in order. Person 18 sets
+one in tick 798.
+
+**The head relaxes by a float 0.8** (`0x590886`). With the follow off,
+the head's turn shrinks to 0.8 of itself each tick. The code multiplies
+by a double (`0x672030`). The original's runs follow the product with
+0.8 as a float in each of the five steps of the fifth capture where the
+two differ (person 21, ticks 814 to 833), and no step anywhere follows
+the double; see the decision.
+
+**K = 871.** Our state after every tick from 753 to 871 equals the fifth
+capture in everything compared, the three random streams included, but
+for the head fields of "Ticks 334 to 366". Ticks 1 to 608 compare with
+the fourth capture as before.
+
+**Stops.** Tick 872: object 121 sets a balloon (Set Balloon/Headline,
+opcode 41), which is not ported. See "Ticks 872 to 877".
+
+### Ticks 872 to 877
+
+**Set Balloon/Headline** (opcode 41, `0x44b724`, `headline.rs`). An
+object's headlines are a list its construction fills: one for each SLOT
+entry of kind 1 (`0x46e2d1`, from the base constructor), and one more
+for a person (`0x459630`). Nothing in a house file restores one. The
+primitive acts on the first headline of me or, with byte 0 bit 0, of the
+stack object (native error 0x15 if there is none); an object with no
+headline is left alone. A duration of 0 clears the headline. Showing an
+icon (the sprite or picture, its frames, the options, the redraw and the
+note to the lot, `0x44574b`, which looks at the scheduler when the
+object sleeps) fails loudly. Since nothing here shows one, no headline
+ever has a duration, so clearing changes nothing that is kept, and no
+headline state is kept yet: the priority is read only while a headline
+shows. Sleep's test of the first headline (`0x44aa57`), the countdown
+after each thread run (`0x4521f7`) and the reset (`0x45e8af`) are
+unaffected for the same reason. In tick 872 object 121, a trash can,
+clears its headline.
+
+**K = 877.** Our state after every tick from 872 to 877 equals the fifth
+capture in everything compared, the three random streams included, but
+for the head fields of "Ticks 334 to 366".
+
+**Stops.** Tick 878: the hour turns (globals 0 and 5, the time of day,
+the lighting, signals 0xf8 and 0xdd), which is not ported.
 
 ## Track: drawing people (`crates/sims-people`)
 

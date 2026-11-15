@@ -16,9 +16,9 @@
 //! turn finds the countdown at zero and finishes the Sleep. Anything else
 //! keeps running every tick and lowers its own parameter.
 //!
-//! The original also keeps an object with a headline showing out of the
-//! scheduler's hands. Headlines are not modeled, so that test is missing.
-//! **Unverified** for any object that shows one.
+//! The original also keeps an object whose first headline is showing out
+//! of the scheduler's hands (0x44aa57). Showing a headline is not ported
+//! (see `headline.rs`), so none ever shows and that test is left out.
 
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine, word};
