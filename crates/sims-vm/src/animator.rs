@@ -1765,8 +1765,10 @@ impl Interpreter<'_> {
     /// rounded to whole units, is moved onto the person's path, the
     /// person must fit there, and is put there; the animator's position
     /// becomes the step's end, unrounded. Returns false, with the route's
-    /// end set to 3 and nothing moved, when the person does not fit
-    /// there. See [`Interpreter::walk`].
+    /// end set to 3, when the person does not fit there (nothing moved),
+    /// or when a stop asked for under way ends the route once the person
+    /// is put (both go to the update's tail, 0x58f682). See
+    /// [`Interpreter::walk`].
     fn walk_step(
         &self,
         world: &mut World,
@@ -1846,8 +1848,9 @@ impl Interpreter<'_> {
                 ));
             }
             // 0x58ef29 to 0x58f682: the route ends blocked (3), and the
-            // update goes to its tail.
+            // update goes to its tail, as for a step that does not fit.
             a.arrival = BLOCKED;
+            return Ok(false);
         }
         Ok(true)
     }

@@ -27,7 +27,11 @@ The animator reads +0x284 in the walk's step, after the person is put on
 the next tile (0x58eeeb): when it is set, the route end is still 1 and
 the foreground clip may be interrupted (layer +0x68), a person whose
 word 64 is 0 has the route end set to 3, blocked (0x58ef29 to 0x58f682),
-and the update goes to its tail. On the next tick step 11 stops the
+and the update goes to its tail, as for a step the person does not
+fit: the step ends false, so at the end of the path the position is not
+copied to the destination and the state is not run again (track 3's
+strict run against the original caught an earlier version that went on
+as if the step had been taken). On the next tick step 11 stops the
 animator, plays `end_route` and fails the route with result 4. A person
 whose word 64 is set instead plays the stop clip (state 7, clip 0x13,
 0x58f010), which is not ported and fails loudly. Starting a route clears
