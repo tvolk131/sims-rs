@@ -869,3 +869,65 @@ fn nothing_goes_into_an_object_it_holds() {
     assert_eq!(result, Ok(false));
     assert_eq!(unmoved(&fx, me), start);
 }
+
+/// A widget person made where the lamp stands at `at`.
+fn person_at(fx: &mut Fixture, at: [i32; 2]) -> u16 {
+    fx.lamp_mut().position = [at[0], at[1], 1];
+    let before: Vec<u16> = fx.world.objects.keys().copied().collect();
+    assert_eq!(create(fx, 0, 0, SIM as i16), Ok(true));
+    let id = *fx
+        .world
+        .objects
+        .keys()
+        .find(|id| !before.contains(id))
+        .unwrap();
+    assert_eq!(fx.world.objects[&id].position, [at[0], at[1], 1]);
+    id
+}
+
+/// The snapper (on tile (2, 2)) made the lead of a group whose second
+/// tile, one tile on in the second coordinate, stands on tile (2, 3); a
+/// person in the way on each tile of `blocked`; the lamp, whose slot
+/// skips the placement's checks, on tile (3, 2). The group would then
+/// stand on tiles (3, 2) and (3, 3).
+fn group_snapper(blocked: &[[i32; 2]]) -> (Fixture, u16, Vec<u16>) {
+    use sims_formats::saved_objects::Multipart;
+    let (mut fx, me) = snapper(SKIP_CHECKS);
+    let tile = person_at(&mut fx, [40, 56]);
+    let blockers = blocked.iter().map(|&at| person_at(&mut fx, at)).collect();
+    for (id, offset, parent) in [(me, [0, 0, 0], 0), (tile, [0, 1, 0], me as i16)] {
+        fx.world.objects.get_mut(&id).unwrap().multipart = Some(Multipart {
+            offset,
+            group: offset,
+            parent,
+        });
+    }
+    fx.world.next_parts.insert(me, tile);
+    fx.lamp_mut().position = [56, 40, 1];
+    (fx, me, blockers)
+}
+
+#[test]
+fn a_group_that_does_not_fit_names_the_last_object_its_tiles_collided_with() {
+    // The group's test goes on through every tile after one refuses
+    // (0x422c08), and each collision writes the object collided with over
+    // the last (0x433b42): word 54 names the second tile's, though the
+    // code kept is the first tile's (0x422b9e).
+    let (mut fx, me, blockers) = group_snapper(&[[56, 40], [56, 56]]);
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(false));
+    let data = &fx.world.objects[&me].data;
+    assert_eq!((data[52], data[54]), (0, blockers[1] as i16));
+    assert_eq!(fx.world.objects[&me].position, [40, 40, 1]);
+    // With only the first tile blocked, it names that one.
+    let (mut fx, me, blockers) = group_snapper(&[[56, 40]]);
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(false));
+    assert_eq!(fx.world.objects[&me].data[54], blockers[0] as i16);
+    // The first tile refused for another reason (data word 4 without bit
+    // 0, code 0x18), the second by a collision: the group keeps code 0x18,
+    // and word 54 still names the object the second tile collided with.
+    let (mut fx, me, blockers) = group_snapper(&[[56, 56]]);
+    fx.world.objects.get_mut(&me).unwrap().data[4] &= !1;
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(false));
+    let data = &fx.world.objects[&me].data;
+    assert_eq!((data[52], data[54]), (0, blockers[0] as i16));
+}

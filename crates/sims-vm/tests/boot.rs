@@ -557,11 +557,13 @@ fn strict_mode_runs_to_tick_3432_past_the_school_bus() {
     assert_eq!(digest(&format_25_bytes(&lot)), TICK_3432_25);
     assert_eq!(digest(&format_24_bytes(&lot)), TICK_3432_24);
     assert_eq!(clock(&lot), (8, 25, 8));
-    // Tick 3433: object 334 snaps a multi-tile object to a place where it
-    // does not fit, and which object its group's test leaves as collided
-    // with is not ported.
+    // Tick 3433: object 334 snaps itself, a multi-tile object, to a place
+    // where it does not fit (0x454e82).
+    lot.step().unwrap();
+    // Tick 3434: it then asks Find Location mode 1 of itself, a tile of a
+    // group, which is not ported.
     let stopped = lot.step().unwrap_err().to_string();
-    for part in ["tick 3433,", "object 334", "0x454e82"] {
+    for part in ["tick 3434,", "object 334", "0x44b52a"] {
         assert!(stopped.contains(part), "{stopped}");
     }
 }
