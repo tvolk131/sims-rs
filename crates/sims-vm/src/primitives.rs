@@ -5,6 +5,7 @@
 mod action_string;
 mod animate;
 mod budget;
+mod change_suit;
 mod create;
 pub(crate) mod dialog;
 pub(crate) mod distance;
@@ -112,6 +113,7 @@ impl Machine<'_, '_> {
             1 => self.generic_call(operands)?.into(),
             2 => self.expression(operands)?.into(),
             3 => self.find_best_interaction()?,
+            6 => self.change_suit(operands)?.into(),
             7 => self.refresh(operands)?.into(),
             8 => self.random(operands)?.into(),
             10 => self.own_events(operands)?.into(),

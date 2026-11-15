@@ -5,10 +5,12 @@
 use crate::index::{all_far_members, sorted_entries};
 use crate::install::resolve;
 use crate::{Catalog, Error, Index, Install, Resource, Result};
+use sims_formats::avatar::catalog::{Asset, Binary};
+use sims_formats::avatar::index::Kind;
 use sims_formats::avatar::read_bcf;
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The skeleton a type of person is built on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +71,16 @@ pub struct People {
     pub skeletons: BTreeMap<u32, Skeleton>,
     /// Each person type's profile, by the type's GUID.
     pub profiles: BTreeMap<u32, Profile>,
+    /// The names of the suits (appearances) the avatar files define,
+    /// lowered in ASCII: what an accessory put on by name can be. They
+    /// come from the same files as the skeletons, so the same caveat
+    /// holds: that these are the names the original's avatar registry
+    /// holds is **unverified**.
+    pub suits: BTreeSet<String>,
+    /// Each avatar file whose skeletons or suits stopped decoding, by
+    /// location, with the error: its suits after that point are missing
+    /// from `suits`.
+    pub suit_errors: BTreeMap<String, String>,
 }
 
 /// The string table an object definition of type 2 names its body in: the
@@ -163,8 +175,10 @@ impl People {
             names.insert(guid, name);
         }
         let mut skeletons = BTreeMap::new();
+        let avatar_files = avatar_files(install, index)?;
+        let (suits, suit_errors) = suit_names(install, &avatar_files)?;
         if !names.is_empty() {
-            let files = skeleton_files(install, index)?;
+            let files = skeleton_files(install, &avatar_files)?;
             for (guid, name) in names {
                 let mut found = files.iter().flat_map(|(file, skeletons)| {
                     skeletons
@@ -208,6 +222,8 @@ impl People {
             Self {
                 skeletons,
                 profiles,
+                suits,
+                suit_errors,
             },
             unresolved,
         ))
@@ -257,7 +273,10 @@ type Skeletons = Vec<(String, Vec<i32>, Vec<Bone>)>;
 
 /// Every skeleton file the lookup searches, by path relative to the
 /// install, in path order.
-fn skeleton_files(install: &Install, index: &Index) -> Result<BTreeMap<String, Skeletons>> {
+/// The avatar files (`.bcf`) the skeletons and suits are looked up in:
+/// the archives' members in `GameData/Animation`, then the indexed
+/// object directories' files.
+fn avatar_files(install: &Install, index: &Index) -> Result<Vec<Resource>> {
     let mut resources = Vec::new();
     if let Some(directory) = resolve(&install.root, "GameData/Animation")? {
         for path in sorted_entries(&directory)? {
@@ -276,11 +295,55 @@ fn skeleton_files(install: &Install, index: &Index) -> Result<BTreeMap<String, S
         }
     }
     resources.extend(index.resources.iter().cloned());
+    resources.retain(|resource| resource.name().to_ascii_lowercase().ends_with(".bcf"));
+    Ok(resources)
+}
+
+/// The suit names the avatar files define, lowered, and the files that
+/// stopped decoding. Each file is read record by record (as the
+/// original's catalog reader does, 0x5950f5 lowering each suit's name)
+/// through its skeletons and suits; its animations are not read, so a
+/// file holding them still gives its suits. A file that fails keeps the
+/// suits read before the failure, and the error is kept with its
+/// location.
+fn suit_names(
+    install: &Install,
+    files: &[Resource],
+) -> Result<(BTreeSet<String>, BTreeMap<String, String>)> {
+    let mut suits = BTreeSet::new();
+    let mut errors = BTreeMap::new();
+    for resource in files {
+        let bytes = resource.read()?;
+        if let Err(error) = read_suits(&bytes, &mut suits) {
+            errors.insert(resource.location(&install.root), error.to_string());
+        }
+    }
+    Ok((suits, errors))
+}
+
+/// Adds the suits one avatar file defines to `suits`. A file too short
+/// to hold a group's count ends there, as in the original.
+fn read_suits(bytes: &[u8], suits: &mut BTreeSet<String>) -> sims_formats::Result<()> {
+    let mut catalog = Binary::new(bytes);
+    for kind in [Kind::Skeleton, Kind::Appearance] {
+        let Some(count) = catalog.count(kind)? else {
+            return Ok(());
+        };
+        for _ in 0..count {
+            if let Asset::Appearance(appearance) = catalog.read(kind)? {
+                suits.insert(appearance.name);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn skeleton_files(
+    install: &Install,
+    resources: &[Resource],
+) -> Result<BTreeMap<String, Skeletons>> {
     let mut files = BTreeMap::new();
     for resource in resources {
-        if !resource.name().to_ascii_lowercase().ends_with(".bcf") {
-            continue;
-        }
         let bytes = resource.read()?;
         // A file starts with how many skeletons it holds. Most hold none.
         if bytes.first_chunk::<4>().is_none_or(|n| *n == [0; 4]) {
@@ -312,4 +375,47 @@ fn skeleton_files(install: &Install, index: &Index) -> Result<BTreeMap<String, S
         files.insert(location, skeletons);
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An avatar file with no skeletons, the suits `names` (no bindings),
+    /// and then `tail`.
+    fn catalog(names: &[&str], tail: &[u8]) -> Vec<u8> {
+        let mut bytes = 0u32.to_le_bytes().to_vec();
+        bytes.extend((names.len() as u32).to_le_bytes());
+        for name in names {
+            bytes.push(name.len() as u8);
+            bytes.extend(name.as_bytes());
+            bytes.extend([0u8; 12]); // kind, reserved, no bindings
+        }
+        bytes.extend(tail);
+        bytes
+    }
+
+    #[test]
+    fn a_file_with_animations_still_gives_its_suits() {
+        // One animation follows, which neither this reader nor
+        // `read_bcf` decodes.
+        let bytes = catalog(&["Suit-Book101", "hat"], &1u32.to_le_bytes());
+        assert!(read_bcf(&bytes).is_err());
+        let mut suits = BTreeSet::new();
+        read_suits(&bytes, &mut suits).unwrap();
+        assert_eq!(suits, ["hat", "suit-book101"].map(String::from).into());
+    }
+
+    #[test]
+    fn a_file_that_fails_keeps_the_suits_before_the_failure() {
+        let mut bytes = catalog(&["cane"], &[]);
+        // Claims a second suit, whose name runs past the end.
+        bytes[4] = 2;
+        bytes.extend([9, b'x']);
+        let mut suits = BTreeSet::new();
+        assert!(read_suits(&bytes, &mut suits).is_err());
+        assert_eq!(suits, ["cane".to_string()].into());
+        // Too short for the first count: nothing, and no error.
+        read_suits(&[0, 0], &mut suits).unwrap();
+    }
 }

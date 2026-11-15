@@ -2064,13 +2064,15 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// In tick 367 person 18's route to a slot finds no way, because person
 /// 21 is in it. Step 6 of the route tries again, finds person 21 in the
 /// way (0x45ba28) and asks it to move (0x45bf2e, 0x45d20b), and step 14
-/// plays the asking tree. Tick 368 then fails loudly: person 21 changes
-/// its suit (Change Suit/Accessory, opcode 6), which is not ported. Our
-/// state after each of ticks 1 to 367 equals the fourth capture (full
-/// state after every update), as compared outside this test, but for one
-/// field: person 16's head target height (+0x220) is one unit in the last
-/// place lower on some ticks from 335 to 367, for a reason that is
-/// **unknown** (the bones' pages are not captured).
+/// plays the asking tree. In tick 368 person 21 puts on a book
+/// (Change Suit/Accessory, opcode 6). Our state after each of ticks 1 to
+/// 408 equals the fourth capture (full state after every update), as
+/// compared outside this test, but for one field: person 16's head target
+/// height (+0x220) is one unit in the last place lower on some ticks from
+/// 335 on, for a reason that is **unknown** (the bones' pages are not
+/// captured). In tick 409 person 18's route plays its waiting tree, and
+/// person 18 looks at person 16 where the capture has it look at person
+/// 259: the first tick that differs, which this test does not run.
 ///
 /// The first capture does not choose in tick 233: its one draw from the
 /// lot's stream in ticks 233 and 234 comes in tick 234, and after tick
@@ -2103,7 +2105,7 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// were kept, and still hold ([`format_17_bytes`]); the state after tick
 /// 333 is pinned again under format 18 (`TICK_333_18`), and so are the
 /// states after ticks 334 and 366; they still hold under format 19
-/// ([`format_18_bytes`]), which pins the state after tick 367. The
+/// ([`format_18_bytes`]), which pins the states after ticks 367 and 408. The
 /// digests are of our own state, as built here.
 #[test]
 fn the_goth_house_first_tick_matches_the_original() {
@@ -2125,6 +2127,7 @@ fn the_goth_house_first_tick_matches_the_original() {
     const TICK_334_18: &str = "85a315a4b435176ffe2e09ce08fb75880c792a0313743c94c21548f65653ef8b";
     const TICK_366_18: &str = "d9bcf685db4e2c1186715bf7a674c640bd8c4cbd6cbed374644c370b242667f0";
     const TICK_367: &str = "0a9a7c29774c3b5cee673ab0bc94f319a95b72fb9787e282ec9cbedc9975e82a";
+    const TICK_408: &str = "7a9c943eba9536e011feafaf60b611e9d9accad6a0a50f8c13856dc72d4cb4d1";
     const USES_233: [(i16, i32); 2] = [(132, 5), (51, 8)];
     const TREES_233: [u16; 9] = [
         0x1000, 0x2001, 0x205b, 0x2029, 0x100e, 0x1014, 0x1012, 0x1009, 0x1010,
@@ -2577,13 +2580,23 @@ fn the_goth_house_first_tick_matches_the_original() {
         assert_eq!((context.objects[1], context.action), (21, 4));
         assert!(world.routing.slots.contains_key(&(260, 0)));
         assert_eq!(digest(&world.encode()), TICK_367);
-        // Tick 368 stops loudly: person 21's own tree changes its suit
-        // (Change Suit/Accessory, opcode 6), which is not ported.
-        let error = interpreter
-            .lot_update(world, &tuning, &mut player)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("object 21"), "{error}");
-        assert!(error.contains("Change Suit"), "{error}");
+        // Tick 368: person 21 takes a book from the bookcase (object 132),
+        // whose tree puts on the accessory "suit-book101" (Change
+        // Suit/Accessory, opcode 6). The capture shows one accessory on
+        // person 21 from update 368 on.
+        for tick in 368..=408 {
+            interpreter.lot_update(world, &tuning, &mut player).unwrap();
+            if tick == 368 {
+                let worn = &world.objects[&21].person.as_ref().unwrap().accessories;
+                assert_eq!(
+                    worn.iter()
+                        .map(|a| (a.name.as_str(), a.binding.as_str()))
+                        .collect::<Vec<_>>(),
+                    [("suit-book101", "")]
+                );
+            }
+        }
+        assert_eq!(world.ticks, before.ticks + 408);
+        assert_eq!(digest(&world.encode()), TICK_408);
     });
 }
