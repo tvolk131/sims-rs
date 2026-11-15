@@ -56,7 +56,8 @@ pins what the recording showed the input doing.
 **Unverified**: the message that makes the menu window call 0x48df28
 (the recording shows only that it ran when the pointer reached the
 entry), whether a pointer that moves within one entry checks it again
-(the window checks once per entry reached), and whether a check tree's
+(the window checks once per entry reached; leaving the window forgets
+the entry, so coming back onto it checks it again), and whether a check tree's
 Add/Change Action String adds anything then (taken as in autonomy's
 check: no menu is being built). The original's pie in the recording
 sits 24 pixels to the right of the press, where ours is centred on it.
