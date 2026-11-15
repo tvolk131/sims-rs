@@ -56,14 +56,16 @@ events, and what it asks for after them) come first.
   (#131), the pie menu and picking from it (#132), and Go To Routing
   Slot's parameter and global slots (#134), which a player's snack order
   reached.
-- Strict mode on the Goth house runs to tick 3432, 08:25 on the first
+- Strict mode on the Goth house runs to tick 3602, 08:30 on the first
   day. One tick is two game seconds, so a day is 43,200 ticks (measured
   from the clock globals). The carpool makes the school bus at tick 2703
   (the multi-tile factory is ported). The base layer is kept and the
   pose composed from it, and a person may take itself off the lot in
-  its own tick. At tick 3433, Snap of a multi-tile object that does not
-  fit (object 334; the collided object of 0x454e82) is not ported. Step
-  2 continues from there.
+  its own tick. A multi-tile object may snap where it does not fit
+  (0x454e82), and a group is deleted (0x440f37): at tick 3434 the car
+  junk's 18 tiles go. At tick 3603 object 354 uses Create New Object
+  Instance mode 6 with flag 0x4, which is not ported (the same stop as
+  the snack order's). Step 2 continues from there.
 - Of the base neighborhood's houses only the Goths' and the Newbies'
   (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
   tick 1472, with no recording to compare yet; at tick 1473 object 105
@@ -2105,8 +2107,8 @@ through their public interfaces only; the simulation never depends on it.
   play mode does not catch stops it. In play mode the Goths' house runs
   12,000 ticks (ten minutes at normal speed) without stopping, through
   about a dozen different caught errors; in strict mode it stops after
-  tick 3432 (at tick 3433 a multi-tile Snap that does not fit, 0x454e82,
-  is not ported).
+  tick 3602 (at tick 3603 Create New Object Instance mode 6 is not
+  ported).
   `--png <file>
   --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
@@ -2147,7 +2149,7 @@ through their public interfaces only; the simulation never depends on it.
   on to other things (object 71 at tick 1497, object 132 at 2292).
   Strict mode now runs the order through step 3602 and stops at step
   3603 (object 354 uses Create New Object Instance mode 6 with flag 0x4,
-  not ported); without an order it runs to tick 3432.
+  not ported); without an order it stops there too.
 - **Done in play mode: selecting a Sim.** A press on a portrait selects
   that Sim (0x445449, between ticks): the Sim selected before is
   deselected, the indicators move, and the panel and the pie menus

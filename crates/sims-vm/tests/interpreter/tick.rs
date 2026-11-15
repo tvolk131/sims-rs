@@ -406,6 +406,38 @@ fn queued_removals_go_after_a_full_pass_only() {
 }
 
 #[test]
+fn a_queued_tile_goes_with_its_whole_group() {
+    use crate::group_factory::{MASTER, counting, create, dynamic, group};
+    let made = |dynamic_group: bool| {
+        let mut fx = lot(sleeper());
+        crate::rooms::build(&mut fx);
+        let file = group(&mut fx);
+        counting(&mut fx, file, false);
+        if dynamic_group {
+            dynamic(&mut fx, file);
+        }
+        assert_eq!(create(&mut fx, MASTER), Ok(3));
+        fx.world.removals = vec![4];
+        fx
+    };
+    // 0x4424c1: the immediate removal, which deletes the group from its
+    // lead (0x440f37).
+    let mut fx = made(false);
+    let tick = update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(tick.removed, vec![4]);
+    for id in [3, 4, 5] {
+        assert!(!fx.world.objects.contains_key(&id), "tile {id}");
+    }
+    assert!(fx.world.next_parts.is_empty());
+    // A tile whose type has the dynamic group function leaves its group
+    // first (0x4424b0, 0x42346a), which is not ported.
+    let mut fx = made(true);
+    let stopped = update(&mut fx, &mut answers(&[])).unwrap_err().to_string();
+    assert!(stopped.contains("0x42346a"), "{stopped}");
+    assert!(fx.world.objects.contains_key(&4));
+}
+
+#[test]
 fn registry_byte_0x12_is_cleared_on_a_tick_count_that_is_a_multiple_of_40() {
     // 0x4424cb: after a full pass, once the update has counted its tick.
     let mut fx = lot(sleeper());

@@ -522,8 +522,12 @@ const TICK_3432_25: &str = "fbb3d6685e20066970fce710ca97e397b921bad0384876d05a6b
 /// The same state's hash under snapshot format 24.
 const TICK_3432_24: &str = "c8d4fccd905caec7a03bb6d2872d83ba0ce462ffbc6c3e0bc1432034dade3f9a";
 
+/// `sims boot <install> UserData/Houses/House05.iff --ticks 3602
+/// --answers 3` gives this hash.
+const TICK_3602: &str = "07ce1fc95d4c26d2b5466524759ddaa0d9cf6fbcde3c631c9b60e907c8bbe6a0";
+
 #[test]
-fn strict_mode_runs_to_tick_3432_past_the_school_bus() {
+fn strict_mode_runs_to_tick_3602_past_the_school_bus() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -557,13 +561,28 @@ fn strict_mode_runs_to_tick_3432_past_the_school_bus() {
     assert_eq!(digest(&format_25_bytes(&lot)), TICK_3432_25);
     assert_eq!(digest(&format_24_bytes(&lot)), TICK_3432_24);
     assert_eq!(clock(&lot), (8, 25, 8));
-    // Tick 3433: object 334 snaps itself, a multi-tile object, to a place
-    // where it does not fit (0x454e82).
+    // Tick 3433: object 334, the lead of the car junk's group, snaps
+    // itself to a place where it does not fit (0x454e82).
     lot.step().unwrap();
-    // Tick 3434: it then asks Find Location mode 1 of itself, a tile of a
-    // group, which is not ported.
+    // Tick 3434: its group is taken off the lot (Find Location mode 1)
+    // and queued for removal, and at the end of the update all 18 tiles
+    // are deleted (0x440f37).
+    let junk = [
+        334, 336, 340, 342, 348, 349, 350, 351, 352, 355, 356, 357, 368, 369, 370, 371, 372, 373,
+    ];
+    assert!(junk.iter().all(|id| lot.world().objects.contains_key(id)));
+    let tick = lot.step().unwrap();
+    assert_eq!(tick.removed, [334]);
+    assert!(junk.iter().all(|id| !lot.world().objects.contains_key(id)));
+    for _ in 3435..=3602 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.world().hash_hex(), TICK_3602);
+    assert_eq!(clock(&lot), (8, 30, 48));
+    // Tick 3603: object 354 asks Create New Object Instance mode 6, which
+    // is not ported.
     let stopped = lot.step().unwrap_err().to_string();
-    for part in ["tick 3434,", "object 334", "0x44b52a"] {
+    for part in ["tick 3603,", "object 354", "mode 6"] {
         assert!(stopped.contains(part), "{stopped}");
     }
 }
