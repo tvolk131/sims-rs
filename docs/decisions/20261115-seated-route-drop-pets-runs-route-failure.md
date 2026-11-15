@@ -40,7 +40,7 @@ for its update (0x590d26).
   (0x44e88c), and 0x2 is not ported.
 - **Drop** (opcode 5, 0x454430): what my first container slot holds
   goes one tile in front of me, after its place test. #183 ported it
-  too (the entry below); this branch's port is kept, as #183's added
+  too ([20261115-drop-ported-second-order-waits-press-cancels](20261115-drop-ported-second-order-waits-press-cancels.md)); this branch's port is kept, as #183's added
   the step's words to the wrong coordinates. 0x42228a's first word is
   added to +0xf4 (0x4544ab), which is our second coordinate, as in
   `routing::slot`. In #183's cancelled-snack test Mortimer stands at
@@ -49,7 +49,7 @@ for its update (0x590d26).
 - **A person's reset ends its object uses first** (0x45e814): frames
   are popped down to each use's count, and the object used resets.
 - **The route-failure feedback tree** (step 17, 0x45af2a): this branch
-  had ported it too; #181's port (the entry below), checked against the
+  had ported it too; #181's port ([20261115-route-that-gives-up-near-slot-runs-failure](20261115-route-that-gives-up-near-slot-runs-failure.md)), checked against the
   Newbie recording, is kept in place of it.
 - **Pets** (tick 6756). The person factory's pet guard (0x440d63) makes
   a "dog" or "kat" only with bit 0x20 (Unleashed) or 0x80 (Makin'

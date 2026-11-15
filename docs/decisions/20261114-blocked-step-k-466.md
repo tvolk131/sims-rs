@@ -26,7 +26,7 @@ route steps in tick 438.
   steps function reuses its slot argument (`[ebp+0xc]`): at `0x45aec6`
   every run sets it to the context's copy of the slot record
   (0x5c354f returns context +0xc). Giving up reads that copy's flag
-  0x4000. The earlier entry's "null slot record on a later run" was
+  0x4000. [20261114-route-asks-person-way-move-k-367](20261114-route-asks-person-way-move-k-367.md)'s "null slot record on a later run" was
   wrong, and the loud failure is gone. A slot the route may end near
   still fails loudly (the failure feedback tree, `0x45af2a`).
 - **Tick 438.** Person 16's route stops short, re-plans and finds no

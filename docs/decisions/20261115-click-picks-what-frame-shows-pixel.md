@@ -3,7 +3,7 @@
 *Decided 2026-11-15.*
 
 The game window picks from the per-pixel IDs the lot and its people
-were drawn with (`Canvas::id_at`, previous entry), replacing its guess
+were drawn with (`Canvas::id_at`, [20261115-canvas-notes-which-object-or-person-drew-each](20261115-canvas-notes-which-object-or-person-drew-each.md)), replacing its guess
 from each object's tile and its own copy of the people's drawing loop
 (`sims-game` now draws people with `draw_on_lot`, pixel for pixel as
 before; the Goth test checks it against `sims-people`'s own call).

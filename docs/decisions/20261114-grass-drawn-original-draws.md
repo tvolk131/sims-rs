@@ -46,7 +46,7 @@ are in that image.
   (14, 28, 14), which is now `BACKGROUND`.
 
 **Result at the compared camera** (far zoom, rotation 0, floor 1, 800x600,
-the screenshots of the lighting entry below). Exact matches:
+the screenshots of [20261114-rooms-darken-their-light-lot-drawing](20261114-rooms-darken-their-light-lot-drawing.md)). Exact matches:
 
 - In a box of open grass (x 530 to 640, y 335 to 365): 0% to 100%,
   in both wall modes.

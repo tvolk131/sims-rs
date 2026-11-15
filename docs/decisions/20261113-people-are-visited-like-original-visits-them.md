@@ -95,11 +95,11 @@ prints one line for each thing compared).
   arrays inside the lot's size, the object grids included.
 - **The same at the three later stops**, after our steps 14, 15 and 16.
   The trace changes nothing compared between them, and neither do we.
-- **The two stops in the middle of visit 140**, as in the entry below,
+- **The two stops in the middle of visit 140**, as in [20261113-objects-are-visited-up-first-person-frames-keep](20261113-objects-are-visited-up-first-person-frames-keep.md),
   now with the people's motives and actions compared as well.
 
 This is the first check of what is not an object field after visit 140.
-The entry below called that unverified: the global random stream, the
+[20261113-objects-are-visited-up-first-person-frames-keep](20261113-objects-are-visited-up-first-person-frames-keep.md) called that unverified: the global random stream, the
 globals, the arrays and object grids, the removal queue and the rooms
 waiting to be counted. All are equal at the step's return. The global
 random stream moves during the step, so its being equal is not empty.
@@ -151,7 +151,7 @@ What changed in earlier work, and why:
 - **`sims boot` no longer says it stops before the indicators.** It
   reports steps 14 to 16 and stops before step 17.
 - **The roadmap's "Progress" said the boot runs through step 12.** It had
-  been running into step 13 since the entry below.
+  been running into step 13 since [20261113-objects-are-visited-up-first-person-frames-keep](20261113-objects-are-visited-up-first-person-frames-keep.md).
 
 What is **unverified**:
 

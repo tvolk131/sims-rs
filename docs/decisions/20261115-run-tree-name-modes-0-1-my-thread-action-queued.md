@@ -19,7 +19,7 @@ once, an action queued on that person is copied over the running action,
 including its number and flags (0x45d5a5, 0x41edbf). It is also queued,
 unless the queue is full. The at-once run then returns the queued
 action's number and takes none of its own. This replaces the loud
-refusal recorded in the at-once entry below.
+refusal recorded in [20261115-action-whose-entry-runs-once-checked-run-there](20261115-action-whose-entry-runs-once-checked-run-there.md).
 
 With flag 0x40, the original also gives the queued action the running
 action's name (0x41f167, 0x41f1ae), which sets its flag 0x80. The flag is

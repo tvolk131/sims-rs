@@ -14,7 +14,7 @@ view* is the part that draws the lot. A *write watchpoint* is a hardware
 breakpoint that stops the game when it writes given bytes; it gives the
 instruction that wrote (its address, EIP) and, through the saved frame
 pointers, the return addresses of the calls that led there (the *call
-chain*). The *animator* and its *state* are as in the entry below.
+chain*). The *animator* and its *state* are as in [20261114-person-routes-slot-ticks-14-33-match-k-33](20261114-person-routes-slot-ticks-14-33-match-k-33.md).
 
 What was decided:
 

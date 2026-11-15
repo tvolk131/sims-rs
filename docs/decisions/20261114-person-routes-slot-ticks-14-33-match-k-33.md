@@ -72,7 +72,7 @@ How it was checked:
 
 - Our state after each of ticks 1 to 33 was compared with the capture's
   after the same lot update, field by field, floats bit for bit. The
-  fields are those of the previous entry, plus the animators' route
+  fields are those of [20261114-script-can-make-person-ticks-6-13-match-k-13](20261114-script-can-make-person-ticks-6-13-match-k-13.md), plus the animators' route
   fields and each person's number of route contexts. The list is in the
   doc comment of `the_goth_house_first_tick_matches_the_original`.
 - The capture does not hold the context or the path. A new run of the
@@ -86,7 +86,7 @@ How it was checked:
 What did not match, and why:
 
 - After tick 1, global 12 and registry byte 0x12. These are the known
-  differences of the previous entries.
+  differences of [20261114-script-can-make-person-ticks-6-13-match-k-13](20261114-script-can-make-person-ticks-6-13-match-k-13.md) and the entries before it.
 - After tick 34, person 259's animator. The capture has 0 as its
   direction and its destination's direction; ours has the turn's (0.127
   and 0.210). The emulated update writes the same direction as ours, at

@@ -18,5 +18,5 @@ The performance class comes from the machine's memory and CPU speed, so
 the comparison harness must read all five from the running original.
 
 Writing the sequence down showed that the catalog order was wrong for load
-step 4, where new objects get IDs in catalog order. The entry above fixes
+step 4, where new objects get IDs in catalog order. [20261113-catalog-follows-originals-scan-order-file-tables](20261113-catalog-follows-originals-scan-order-file-tables.md) fixes
 it.

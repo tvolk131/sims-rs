@@ -26,7 +26,7 @@ inventory is made if it has none, and with GUID 0 the stack object's is
 read first, whether or not the flag uses it. Setting the interface's
 inventory flag on success is presentation.
 
-**The advertisement record before the first copy.** The earlier entry
+**The advertisement record before the first copy.** The earlier entry [20261115-advertisement-record-outlives-find-best](20261115-advertisement-record-outlives-find-best.md)
 left it unread, failing loudly. It is now ported from the code: the
 record's constructor (0x475e23) allocates its sixteen advertisements and
 zeroes each one, and it runs from the static initializer 0x458271, which

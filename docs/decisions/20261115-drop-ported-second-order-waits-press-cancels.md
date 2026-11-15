@@ -19,7 +19,7 @@ ported from the original's code, as the inverse of Grab:
     (`a_cancelled_snack_is_put_down_in_front_of_the_eater`). His tree
     0x0139 (node 14) drops the snack at step 1009. He stands at (296,
     456) facing 6, and it goes to (296, 440) (corrected to (280, 456)
-    by the entry above). At step 1028 the
+    by [20261115-seated-route-drop-pets-runs-route-failure](20261115-seated-route-drop-pets-runs-route-failure.md)). At step 1028 the
     cancelled action ends, and he is free. No error is caught.
   - Through the window
     (`a_second_order_waits_behind_the_first_and_a_press_cancels_either`):

@@ -5,7 +5,7 @@
 **Unverified.** No capture covers any of it: the Goth captures end at
 update 1000, and all of this is from tick 2703 on. Strict mode's output
 for ticks 1 to 2702 is unchanged line for line, hashes included:
-3b539cc1… at tick 1102 and c5803e84… at tick 2702. (The entry below
+3b539cc1… at tick 1102 and c5803e84… at tick 2702. ([20261115-person-taken-off-lot-deleted-snap-turns-slots](20261115-person-taken-off-lot-deleted-snap-turns-slots.md)
 gives older hashes for those ticks; `boot.rs` pins the current ones.)
 Strict mode now runs through tick 2881, hash eed688a0…, and stops at
 tick 2882.

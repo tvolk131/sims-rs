@@ -70,7 +70,7 @@ compared).
   of the selection (after step 18), the return of the lot's part of the
   mode change and the entry of the second selection (inside and after
   step 19), the entry of the wait check (after step 21), and the entry
-  of the first tick. At each: everything the entry below lists for the
+  of the first tick. At each: everything [20261113-people-are-visited-like-original-visits-them](20261113-people-are-visited-like-original-visits-them.md) lists for the
   end of step 13, and each object's selected mark.
 - **The rooms at each of those stops**, all 11: the twelve counts, the
   lights and people, the score and the light bit for bit, whether the
@@ -79,7 +79,7 @@ compared).
 - **The callbacks of step 18**, in order: 383:10, 383:10, 383:9, 21:9.
   No other callback is asked between the end of step 13 and the first
   tick, there or here.
-- **Steps 13 to 15** as before; the comparison of the entry below was
+- **Steps 13 to 15** as before; the comparison of [20261113-people-are-visited-like-original-visits-them](20261113-people-are-visited-like-original-visits-them.md) was
   run again with the room fields added.
 
 Why the six indoor rooms stay marked after step 21, which the roadmap

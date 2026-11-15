@@ -91,7 +91,7 @@ What did not match, and why:
 
 - After tick 1, global 12 (17 in the original, 0 here) and registry byte
   0x12 (set in the original from its load, here from tick 2). These are
-  the known differences of the previous entry.
+  the known differences of [20261114-comparison-harness-runs-again-capture-holds-1000](20261114-comparison-harness-runs-again-capture-holds-1000.md).
 - Tick 14 does not finish. Person 259 reaches Go To Routing Slot
   (primitive 45, 0x45abce), the start of routing, which is not ported.
   Where it stops, person 259's frames and objects in use and the 258

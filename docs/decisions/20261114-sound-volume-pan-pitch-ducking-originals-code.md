@@ -41,7 +41,7 @@ mix.
 - **Sequence groups hold track numbers, not thread IDs.** The ID the
   original stores in a slot is the one `target` looks up, and scripts
   pass track numbers to `target`. So two threads of one track no longer
-  end each other. This corrects the previous entry.
+  end each other. This corrects [20261114-sound-event-kinds-follow-originals-dispatcher](20261114-sound-event-kinds-follow-originals-dispatcher.md).
 - Levels are applied to notes once per block, after the threads run,
   and when a thread ends. The original applies them as registers
   change. 3D position, the

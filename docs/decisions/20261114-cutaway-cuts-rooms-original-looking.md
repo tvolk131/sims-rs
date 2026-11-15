@@ -55,7 +55,7 @@ the bathroom now stand, as in the original. Exact matches:
 - Whole screen: 81.2% before, 82.0% now, and 82.4% after a boot.
 
 **What still differs:** the trim along the top of cut walls (since
-added; see the entry above), the Sims,
+added; see [20261114-wood-trim-along-tops-walls](20261114-wood-trim-along-tops-walls.md)), the Sims,
 and the light on a few walls. The bedroom's west wall, with its door,
 is cut in the original but stands here. The hall behind it, under the
 stairs, is outdoors in our rooms, and no mask from an indoor room

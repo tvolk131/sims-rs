@@ -74,7 +74,7 @@ What was decided:
   before, so the tick-1 pins for formats 9 and 10 still hold.
 
 How it was checked. The private capture of the original running ticks 2
-to 5 (the entries below) includes memory pages that hold the three
+to 5 ([20261113-neighborhoods-people-are-held-tick-2-runs](20261113-neighborhoods-people-are-held-tick-2-runs.md) and the entries before it) includes memory pages that hold the three
 people's animators and their foreground layers. The scratchpad tool
 `tick_verify.py` now reads them and compares each field we keep, as
 bits for the floats.
@@ -86,7 +86,7 @@ Equal to the original:
   0x3f99999a), the target speed (bits 0x3fb33334), the state, the
   position and the clock. 23 field readings fall on pages the capture
   did not save. The rest of our state after tick 1 is unchanged and
-  still equals the capture, as the entry below lists.
+  still equals the capture, as [20261113-neighborhoods-people-are-held-tick-2-runs](20261113-neighborhoods-people-are-held-tick-2-runs.md) lists.
 - Where tick 2 stops (at object 364, after every lower ID has run):
   72 of 72 readable animator fields, including object 16's foreground
   layer (priority, clock, duration, speed, phase, event times, frame
@@ -107,7 +107,7 @@ Did not match:
   to place it with Find Location For, which is where we stop. That the
   placement writes the word is likely and **unverified**.
 - Object 364's own frames, since it has not finished its turn.
-- Everything else the entries below list as not matching still does
+- Everything else [20261113-neighborhoods-people-are-held-tick-2-runs](20261113-neighborhoods-people-are-held-tick-2-runs.md) and the entries before it list as not matching still does
   not.
 
 **Unverified**, with no evidence either way:

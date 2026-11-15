@@ -97,7 +97,7 @@ be the same.
 - No data word changes in the trace, and the first pass changes none here.
   So the room worked out for each of the 382 objects is the room the
   house saved. 234 of them stand on the lot.
-- All the fields compared after step 9 (see the entry below), for all 382
+- All the fields compared after step 9 (see [20261113-controllers-are-reconciled-among-saved-objects](20261113-controllers-are-reconciled-among-saved-objects.md)), for all 382
   objects, with the last result. The globals, both game random streams,
   the removal queue and the arrays.
 - Whether a room is outdoors, for the 8 rooms the trace has worked it out
@@ -155,7 +155,7 @@ every array is equal. The digests of the arrays and of the states after
 steps 6e and 9 changed with it. The gated tests show that zeroing those
 cells again gives the digests pinned before.
 
-The same memory settles two things the entry below left unverified. The
+The same memory settles two things [20261113-controllers-are-reconciled-among-saved-objects](20261113-controllers-are-reconciled-among-saved-objects.md) left unverified. The
 eight grid cells outside the lot's size that name objects standing
 elsewhere are still there in the trace after step 9, as they are here. And
 the cells outside the size of the other arrays are what we have.

@@ -22,7 +22,7 @@ and already matched:
   (0x4a4783, 0x4a48eb) and the blades (0x49ce80) use.
 
 **Result** at far zoom, rotation 3, walls up (the private screenshot
-from the camera entry below). Exact matches:
+from [20261114-two-more-cameras-compared-original](20261114-two-more-cameras-compared-original.md)). Exact matches:
 
 | Area | Before | After |
 |---|---|---|

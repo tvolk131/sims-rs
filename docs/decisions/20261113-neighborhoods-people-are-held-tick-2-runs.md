@@ -70,7 +70,7 @@ What was decided:
   still equals the capture.
 
 How it was checked. The private capture of the original running ticks 2
-to 5 (the one in the entry below) holds the 463 records, the
+to 5 (the one in [20261113-ticks-run-first-one-matches-original](20261113-ticks-run-first-one-matches-original.md)) holds the 463 records, the
 inventories and the registry byte after every tick. The scratchpad tool
 `tick_verify.py` now compares them too, one line per field.
 
@@ -110,7 +110,7 @@ Did not match: registry byte 0x12 is 1 in the capture after tick 1 and 0
 here. A load trace of another run shows it 0 at the resize and 1 after
 the object read; what sets it there is not known, and nothing ported
 reads it. The C runtime's random stream is still 52 draws further on in
-the capture (the entry below); ours does not move in tick 2 up to the
+the capture ([20261113-ticks-run-first-one-matches-original](20261113-ticks-run-first-one-matches-original.md)); ours does not move in tick 2 up to the
 stop.
 The six type attribute words no file holds (the entry two below) play no
 part in these results: the comparison is the same with and without them.
