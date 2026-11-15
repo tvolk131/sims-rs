@@ -351,12 +351,20 @@ fn a_check_tree_may_change_its_entry_s_advertisements() {
     // tree), asks whether the Sim uses the lamp (it does not), and raises
     // its energy advertisement's delta (scope 12, motive 5) to 30000. Menu
     // 3 is then the best, and with flag 0x100 it is taken without a draw.
+    // The string (table 300, string 1) is looked up and formatted even
+    // there (0x4704fa, 0x44bf1a).
     let mut fx = lot(0x100);
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .strings
+        .insert(300, vec!["Eat".to_owned()]);
     fx.add(
         LAMP_FILE,
         CHECK,
         tree(vec![
-            ins(50, 1, 1, [0; 8]),
+            ins(50, 1, 1, [0x2c, 0x01, 0, 0, 1, 0, 0, 0]),
             ins(37, RETURN_FALSE, 2, [0; 8]),
             assign(12, 5, scope::LITERAL, 30000, RETURN_TRUE),
         ]),

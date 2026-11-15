@@ -82,3 +82,25 @@ fn a_missing_string_or_a_run_at_once_fails_loudly() {
     assert!(fault.to_string().contains("0x474a37"), "{fault}");
     assert_eq!(active_flags(&fx), 0x41);
 }
+
+#[test]
+fn a_string_with_tokens_fails_loudly_before_anything_changes() {
+    // The string is formatted (0x44bf1a) before 0x44cc9a looks at where
+    // it goes, and a pass can raise an error (native 0x1c for a
+    // non-person, 0x44c57b), so a string with "$" fails loudly in a
+    // thread's run as well: the person's and another object's.
+    for (object, file) in [(SIM, SIM_FILE), (LAMP, LAMP_FILE)] {
+        let mut fx = named(object, file, 1);
+        for resource in [SIM_FILE, LAMP_FILE] {
+            fx.program
+                .libraries
+                .get_mut(&resource)
+                .unwrap()
+                .strings
+                .insert(300, vec!["$TokenNameLocal:0".to_owned()]);
+        }
+        let fault = turn(&mut fx, object).unwrap_err();
+        assert!(fault.to_string().contains("0x44bf1a"), "{fault}");
+        assert_eq!(active_flags(&fx), 0x41);
+    }
+}

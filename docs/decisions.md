@@ -58,9 +58,14 @@ it checks the byte 0x6c4d6c, which starts as 1. Only the synchronous run
 (0x474a37, 0x474ad0). With the byte set and the object a person
 (0x635abe), 0x41f1ae stores the string as the action's name (+0x28) and
 sets its flag 0x80 (+0x40). As before for 0x41f1ae, only the flag is
-kept. The string is looked up, and a missing one fails loudly, but it is
-not formatted, since only the name would hold the result. Another
-object's thread does only the lookup. Autonomy's check trees still drop
+kept. In every run, the string is looked up (0x4704fa) and formatted
+(0x44bf1a) before 0x44cc9a asks where it goes. A formatting pass can
+raise an error; one raises native error 0x1c for a non-person
+(0x44c57b). So a missing string, or one with a "$" token, now fails
+loudly in every run, autonomy's check trees included. Before, it failed
+only in a pie menu's listing (a Sol review finding). A string without
+tokens is not formatted: only the name would hold the result. Another
+object's thread does only the lookup. Autonomy's check trees then drop
 the string. Other runs at once still fail loudly, because the port's runs
 at once have not been matched one by one to 0x4749b5's callers (0x422d7d,
 0x44bc1b, 0x44f593, 0x452c37, 0x458505, 0x474b0b).

@@ -33,19 +33,22 @@
 //! The passes are not ported: a menu entry's string with "$" in it fails
 //! loudly. Some of them write the arguments (0x44c0e3).
 //!
+//! The string is looked up (0x4704fa) and formatted (0x44bf1a) first, in
+//! every run, before 0x44cc9a asks whether a menu is being built. So in
+//! every run a string with "$" fails loudly, as does a string the file
+//! lacks; a pass can raise an error (one raises native error 0x1c for a
+//! non-person, 0x44c57b).
+//!
 //! In a check tree that Find Best Interaction runs, no menu is being built
 //! (the three pointers were 0 in a memory image of the original at its
 //! first call), and the synchronous run (0x4749b5) clears 0x6c4d6c, so the
-//! string is dropped. There the string is not looked up or formatted;
-//! whether that can fail on some strings is **unverified**.
+//! formatted string is dropped.
 //!
 //! In a thread's run the person's running action ([`sims_sim::Object`]'s
 //! `person.active`) takes flag 0x80. Its name is not kept, as no action's
-//! name is here (the save holds none either), so the string is looked up
-//! but not formatted: the formatted string goes only to the name.
-//! **Unverified**: that no formatting pass changes anything but the
-//! string and the four argument words. Another object's thread does
-//! nothing more than the lookup.
+//! name is here (the save holds none either): the formatted string goes
+//! only to the name. Another object's thread does nothing more than the
+//! lookup.
 //!
 //! Any other tree run at once fails loudly: the original drops the string
 //! there too, but which of the port's runs at once are the original's
@@ -66,15 +69,18 @@ const NAMED: u32 = 0x80;
 
 impl Machine<'_, '_> {
     pub(crate) fn action_string(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
+        // The string is looked up (0x4704fa) and formatted (0x44bf1a)
+        // before anything looks at where it goes (0x44cc9a), so a pass
+        // that fails, fails in every run.
+        let name = self.action_name(operands)?;
+        if name.contains('$') {
+            return Err(Trap::Unsupported(format!(
+                "Add/Change Action String's string {name:?}, whose tokens the formatter \
+                 replaces (0x44bf1a)"
+            )));
+        }
         if let Some(menu) = self.menu {
             let frame = self.frame()?;
-            let name = self.action_name(operands)?;
-            if name.contains('$') {
-                return Err(Trap::Unsupported(format!(
-                    "Add/Change Action String's string {name:?}, whose tokens the formatter \
-                     replaces (0x44bf1a)"
-                )));
-            }
             // The formatter leaves the first argument 0 (0x44cca3).
             let args = [frame.stack_object, 0, 0, 0];
             let mut checking = menu.borrow_mut();
@@ -100,7 +106,6 @@ impl Machine<'_, '_> {
         }
         // A thread's run, with 0x6c4d6c set: the string names the
         // person's running interaction, which sets its flag 0x80.
-        self.action_name(operands)?;
         if let Some(person) = self.me_mut()?.person.as_mut() {
             person.active.flags |= NAMED;
         }
