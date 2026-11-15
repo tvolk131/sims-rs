@@ -2057,7 +2057,9 @@ through their public interfaces only; the simulation never depends on it.
   error is printed and shown across the top for a while; only a failure
   play mode does not catch stops it. In play mode the Goths' house runs
   12,000 ticks (ten minutes at normal speed) without stopping, through
-  about a dozen different caught errors. `--png <file> --ticks N` draws one frame without a window.
+  about a dozen different caught errors; in strict mode it stops after
+  tick 991 (Snap into a slot of the object, 0x454b19). `--png <file>
+  --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
   default device (on macOS; elsewhere with the `sound` feature, so CI
   needs no audio library; `--mute` turns it off). A thread renders
@@ -2078,7 +2080,8 @@ through their public interfaces only; the simulation never depends on it.
   Serve Meal; the bookshelf lists Read a Book and the studies.
 - **Blocked: Mortimer doing what he is told.** The order is queued, but
   on his next tick Idle For Input fails on starting the queued action
-  (0x45dc14, not ported); play mode resets him and the queue empties.
+  (0x45dc14, not ported). In strict mode that stops the lot; in play
+  mode he is reset and the queue empties.
   That is the simulation's next step toward the done criterion.
 - **Next:** the menu from the simulation's pie-menu entries (the check
   each entry runs, which the stopgap skips) once that accessor lands;
