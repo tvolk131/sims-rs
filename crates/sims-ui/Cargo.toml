@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+libm.workspace = true
 sims-content.workspace = true
 sims-formats.workspace = true
 sims-sim.workspace = true
