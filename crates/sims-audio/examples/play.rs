@@ -229,10 +229,13 @@ fn run() -> Result<(), String> {
     }?;
 
     for name in &options.events {
-        player.handle(&SoundEvent::Play {
-            object: 1,
-            name: name.clone(),
-        });
+        player.handle(
+            &SoundEvent::Play {
+                object: 1,
+                name: name.clone(),
+            },
+            &NoSources,
+        );
     }
     let blocks = options.seconds.saturating_mul(u64::from(RATE)) / BLOCK as u64;
     let mut playing = false;
