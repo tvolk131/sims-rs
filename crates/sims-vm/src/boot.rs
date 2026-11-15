@@ -738,6 +738,20 @@ impl Lot {
         self.select_with(person, crate::Refresh::Fail)
     }
 
+    /// Sets the idle loop's own speed between ticks (`0x46d9d6`,
+    /// [`World::idle_speed`]), as the original's idle loop does on each
+    /// pass, whether an update is due or not and paused or not. Each step
+    /// does it too, before its update, so a host that only steps gets the
+    /// same ticks; a host with a clock calls this on each pass of its own,
+    /// so that a speed set between ticks meets the idle loop's as the
+    /// original's does. Returns whether it called the setter, which
+    /// restarts the original's clocks, even when the speed stays the same.
+    pub fn idle_speed(&mut self) -> Result<bool, OrderError> {
+        self.ready()?;
+        let residential = residential(&self.world, &self.program);
+        Ok(self.world.idle_speed(residential))
+    }
+
     /// Sets the game's speed between ticks, as the panel's speed buttons
     /// do ([`sims_sim::speed`], `0x46d697`): globals 16 and 18. Returns
     /// the milliseconds the original waits between two lot updates at
@@ -924,6 +938,25 @@ mod tests {
         // its speed alone.
         lot.world.globals[10] = 7;
         assert!(!super::residential(&lot.world, &lot.program));
+    }
+
+    #[test]
+    fn the_idle_loops_speed_is_set_between_ticks_and_a_speed_set_after_stands() {
+        let mut world = World::empty();
+        world.globals[16] = 760;
+        world.globals[18] = -1;
+        let mut lot = lot(world, true, Frames::default());
+        // Between ticks, before any is due: 1000, once.
+        assert_eq!(lot.idle_speed(), Ok(true));
+        assert_eq!((lot.world.speed(), lot.world.globals[18]), (1000, 760));
+        assert_eq!(lot.idle_speed(), Ok(false));
+        // The player's speed set after it stands.
+        assert_eq!(lot.set_speed(924), Ok(14));
+        assert_eq!(lot.idle_speed(), Ok(false));
+        assert_eq!((lot.world.speed(), lot.world.globals[18]), (924, 924));
+        // A halted lot takes none.
+        lot.halted = true;
+        assert_eq!(lot.idle_speed(), Err(OrderError::Halted));
     }
 
     #[test]

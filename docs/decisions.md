@@ -80,13 +80,23 @@ disassembly; none of it is checked against a run.
       ticks we compare. The strict boot (House05, 1102 ticks) is
       unchanged by the port, so through it someone always holds the
       speed and global 18 stays -1.
+  - `Lot::step` runs it before every update. The original's idle loop
+    runs it on every pass, whether an update is due or not and paused
+    or not, so `Lot::idle_speed` runs it between ticks too, and the
+    window calls that on every pass of its own. A speed the player
+    picks after the switch to 1000 then stands, as in the original. The
+    check is idempotent: a second call in the same state does nothing.
   - The window follows the simulation's speed: ticks are owed at the
-    period of global 16 (1 ms at 1000). A tick that changes the speed
-    ends the batch of ticks owed, and the time owed starts again, as the
-    setter restarts the clocks. The panel's buttons still show the
-    player's choice.
-  - Sol's review found the guard that stood here before was wrong both
-    ways. It failed where `0x46d790` keeps global 18's speed. It missed
+    period of global 16 (1 ms at 1000). Whenever the check calls the
+    setter, even for the speed the game already has (going back to it),
+    the time owed starts again and that pass runs no more ticks, as the
+    setter restarts the clocks. The original may run an update at once
+    then, if its second clock (`0x4732de`) is ready (`0x46da1b`); here
+    the next tick waits a period of the new speed (**unverified**,
+    window timing only). The panel's buttons still show the player's
+    choice.
+  - Sol's reviews found the guard that stood here before was wrong both
+    ways, and that the check has to run between ticks as well. It failed where `0x46d790` keeps global 18's speed. It missed
     hidden and sleeping Sims, whose words it took to be unkept. Porting
     the whole head of the idle loop replaced it.
 - Strict `sims boot` never calls the speed or pause hooks. The idle
