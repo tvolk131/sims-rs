@@ -4,6 +4,129 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: Held objects stand on their holder's slot
+
+The lamps were missing because we drew them on the floor. The Goth
+house has three, all table lamps: one on a kitchen counter and two on
+end tables. Each is held by its table: data word 2 names the holder and
+word 3 which of its slots. Their own position is the table's, and their
+sprites carry no height, so they ended up inside the table and were
+hidden by it. The sink in the other counter is held the same way.
+
+The original draws a holder's contents while it draws the holder
+(0x437fdd). It adds the slot's offset, turned by the holder's facing,
+to the position, and adds the slot's height. We now do the same:
+
+- the slots are the holder's SLOT entries of kind 0 (OBJD word 20
+  names the chunk);
+- the height comes from the entry's category, as the old prototype read
+  it and checked against the original (`containment_height`): counter
+  4.05, table and end table 4, low table 2.5, category 1 none, others
+  the entry's own z;
+- the height adds to the sprite's own height, which raises it on screen
+  and moves its depth;
+- the offset adds to the held object's own position and level, which
+  the game keeps at its holder's (the original starts from the
+  holder's; the two agree in this house);
+- a hidden holder hides what it holds;
+- a loop of holders gives no offset, and offsets and heights are
+  clamped to a lot's width, so a broken save cannot overflow anything;
+- objects a Sim holds stay where they were.
+
+**Result.** At far zoom, rotation 3, the end-table lamp now matches the
+original pixel for pixel in place. Exact matches in a box around it
+rose from 62.2% to 78.1% (96.4% within one light step). The house box
+rose from 88.5% to 88.7%. The other compared cameras do not show a
+lamp: the lamps stand behind walls there.
+
+**Unverified:**
+- The kitchen counter lamp is not in view at any compared camera.
+- Every slot here has no x or y offset, so the direction we turn slot
+  offsets (the same as draw-group offsets) is not checked.
+- The original draws held objects right after their holder; we sort
+  them by depth with everything else, which puts them after it here.
+
+## 2026-11-15: Objects sit one pixel right of the walls
+
+At every compared camera, objects were drawn one pixel left of where
+the original draws them, measured against the walls and floors around
+them. Moving every object one pixel right raised the exact matches at
+all three cameras. Moving them one pixel up or down, or two pixels
+right, did not help. Moving the walls one pixel either way instead
+lowered the house box from 89% to 57%, so the walls were already in
+place. The shift helps plain and mirrored sprites alike.
+
+| Camera | House box before | after | Whole screen before | after |
+| --- | --- | --- | --- | --- |
+| Medium zoom, rotation 0 | 74.1% | 88.9% | 76.4% | 85.8% |
+| Far zoom, rotation 0, walls up | 75.7% | 89.0% | 84.4% | 89.8% |
+| Far zoom, rotation 3, walls up | 74.0% | 88.5% | 80.8% | 86.2% |
+| Far zoom, rotation 0, cutaway | 57.6% | 68.0% | 80.8% | 85.7% |
+
+(The cutaway row uses the settled screenshot with no rooms in focus,
+so it is lower than the figures in earlier entries.) A search around
+each fitted camera origin still picks the same origin.
+
+The renderer's camera origin is fitted to the tile art, so the
+constant is `OBJECT_COLUMN = 1` in the object placement. Where the
+original's pixel comes from is **unverified**: its tile rectangle
+(0x4ac25d) runs from x - half width - 1, which suggests it draws tile
+art one pixel left of the projected point and objects at it. The
+floor code around 0x4b17b2 shows no such -1, though, so we have not
+confirmed it.
+
+**What still differs at the door at medium zoom:** the door's position
+matches pixel for pixel on its right edge and handle. One column of
+its left jamb (x 466) still shows the wall in our render and the door
+in the original's. Our wall there is 13 depth bytes in front of the
+door frame, and its doorway mask opens one column later. Shifting the
+doorway masks one pixel either way lowers the overall match, so we keep
+them where they are; that does not prove they are exact at this column.
+The original's wall may have a deeper edge around the opening that a
+flat wall depth does not reproduce. Both are **unverified**. Window and door
+frames also differ by one light step in places. The original's
+screenshot also has a cardboard box by the front door that a tick-1
+world does not have.
+
+## 2026-11-15: The sun does not turn with the camera
+
+The grass at far zoom, rotation 3, matched the original only 12.7%.
+The reason was the sun. We tilted it by the camera's rotation (1, 2, 3
+and 2 tenths of π from the zenith at rotations 0 to 3), as the setter
+at 0x4a4551 does. But only a command handler calls that setter (message
+0xdd at 0x4c41bf), and turning the camera does not send that message.
+The sun keeps the angle the grass's constructor gives it: π/10 (the
+float 0x3ea0d973 at 0x49c187), at every rotation. It still stands
+toward the view's +x, since the slopes it lights are read in view
+order.
+
+Everything else in the shading was checked against the original's code
+and already matched:
+- view tiles turn to lot tiles through a 64 by 64 table built around 63
+  (0x407704), as `unrotate_tile` does;
+- corner heights are reordered per rotation (0x6c4ebc);
+- the vertex loop and the blade map count from the lot's least view
+  corner, which turning the camera sets (0x4791a6) and the shading
+  (0x4a4783, 0x4a48eb) and the blades (0x49ce80) use.
+
+**Result** at far zoom, rotation 3, walls up (the private screenshot
+from the camera entry below). Exact matches:
+
+| Area | Before | After |
+|---|---|---|
+| Open grass (x 560 to 760, y 440 to 540) | 12.7% | 99.4% |
+| House box (x 230 to 480, y 200 to 400) | 55.2% | 74.0% |
+| Whole screen | 22.6% | 80.8% |
+
+Fitting the angle alone gives the same answer: 0.09π and 0.11π reach
+about 63% to 65%, 0.125π 28%, and 0.1π 99.4%. Rotation 0 is unchanged:
+84.4% of the whole screen with walls up. Medium zoom is unchanged too:
+76.4%.
+
+**Unverified:** rotations 1 and 2 have not been shot, but the same
+constructor value applies to them. Sending message 0xdd (probably a
+debug command) would tilt the sun; it is not modelled.
+
 ## 2026-11-14: A blocked step, and K = 466
 
 Tick 437 of the Goth house stopped where person 16's walk found its

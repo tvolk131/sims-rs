@@ -1583,9 +1583,18 @@ Progress:
   (rotation 0) open grass matches 96% and the house 74%; objects set
   into walls are a pixel or two off. At far zoom, rotation 3, the house
   lines up but the grass matches only 13%; why is not known yet.
-- Next: the grass at rotations other than 0; object placement and depth
-  at medium zoom; lamps, which are not drawn; the cap where a cut wall
-  meets a standing one.
+- Done: the grass at other rotations. The sun no longer turns with the
+  camera, as in the original. At far zoom, rotation 3, open grass rose
+  from 13% to 99% exact, and the whole screen from 23% to 81%.
+- Done: objects sit one pixel right of the point the camera projects
+  them to, as in the original. At the three compared cameras the house
+  box rose from 74% to 89% (medium zoom), 76% to 89% (far zoom,
+  rotation 0) and 74% to 89% (far zoom, rotation 3).
+- Done: objects held by others (lamps on end tables and counters, the
+  sink in a counter) stand on their holder's slot. The lamps were drawn
+  on the floor, inside their tables.
+- Next: the cap where a cut wall meets a standing one, and the extra
+  trim pieces at diagonal cut corners.
 
 ## Track: sound (`crates/sims-audio`)
 
