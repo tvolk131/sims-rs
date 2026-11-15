@@ -17,7 +17,12 @@ action by menu number (`Lot::queue_interaction`) without listing first.
   the action queued at step 51 is the same, field for field. From step
   150, when Mortimer takes the order, the two lots hash the same at
   every step through step 1136, when the snack ends. Play mode catches no
-  error. Mortimer pays 5 at step 820.
+  error. Mortimer pays 5 at step 820. The test also checks that the
+  chosen entry carries the action the check trees listed (not the
+  fallback's menu number), and that the lots differ at every step
+  before 150, so it fails if the window skips the listing (from Sol's
+  review, which found the test passed with the fridge forced onto the
+  fallback menu).
 - **The difference before step 150:** the listing's check trees run as
   Mortimer. They leave his last result and his saved stack frame's
   words, and nothing else (compared field by field at step 51). His

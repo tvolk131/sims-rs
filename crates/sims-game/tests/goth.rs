@@ -564,6 +564,14 @@ fn the_snack_ordered_in_the_window_is_the_scripted_order() {
     game.render();
     let snack = {
         let menu = game.menu().expect("the fridge's pie opens");
+        // The entry is one the fridge's check trees listed, not the
+        // fallback's, so choosing it goes through `Lot::pick`.
+        let entry = menu
+            .entries
+            .iter()
+            .find(|e| e.label == "Have A Snack")
+            .expect("Have A Snack listed");
+        assert!(entry.action.is_some(), "{entry:?}");
         let (_, r) = menu
             .labels()
             .into_iter()
@@ -587,6 +595,9 @@ fn the_snack_ordered_in_the_window_is_the_scripted_order() {
         )
     };
     assert_eq!(queue(game.lot()), queue(&scripted));
+    // The listing ran the check trees on the window's lot, which left
+    // Mortimer's last result and frame storage changed until step 150.
+    assert_ne!(game.lot().world().hash(), scripted.world().hash());
     let doing = |lot: &Lot| {
         lot.world().objects[&sim]
             .person
@@ -599,13 +610,8 @@ fn the_snack_ordered_in_the_window_is_the_scripted_order() {
         assert_eq!(game.run(1), 1, "step {step}");
         let update = scripted.step_play().unwrap();
         assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
-        if step >= 150 {
-            assert_eq!(
-                game.lot().world().hash(),
-                scripted.world().hash(),
-                "step {step}"
-            );
-        }
+        let same = game.lot().world().hash() == scripted.world().hash();
+        assert_eq!(same, step >= 150, "step {step}");
         match step {
             150 => assert_eq!(doing(game.lot()), 1),
             // He pays for the snack, whose action is his fifth.
