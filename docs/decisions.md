@@ -37,6 +37,71 @@ level's arrays, not a port of its own. A room ID naming level 3 or 4
 fails as invalid state, as the lot holds two. K = 752: ticks 691 to 752
 equal the fifth capture; tick 753 needs a pose with a carry layer.
 
+## 2026-11-14: Rotations 1 and 2 and near zoom, compared with the original
+
+New screenshots of the Goth house in the original: far zoom at rotations
+1 and 2, and three near-zoom views at rotation 0 (the front wall and
+door, the porch, the bay window), all with walls up. The camera origins
+were found by search; each places the house to the pixel. House box,
+exact matches in 565 space:
+
+| Camera | Exact |
+|---|---|
+| Far zoom, rotation 1 | 85.5% |
+| Far zoom, rotation 2 | 86.1% |
+| Near zoom, front wall and door | 90.4% |
+| Near zoom, porch | 80.5% |
+| Near zoom, bay window | 56.2% |
+
+The geometry lines up at every one: walls, openings, trim, floors,
+objects and grass. Most of what is left is not drawing:
+
+- The shots were taken at 6:49 in the morning, later than the earlier
+  ones. In the original the stair room (the one with the bay window)
+  is drawn at about light-table level 20 (see `Light`), judged from its
+  pixels; ours uses level 16, the half-light floor. Its walls, floor
+  and stairs make up nearly all the misses at rotations 1 and 2 and in
+  the bay view. The room's light is the simulation's, so the render
+  leaves it.
+- The Sims in the shots, which this crate does not draw.
+
+One drawing difference remains in these new views (the door jamb's
+depth, recorded below, is separate): a diagonal wall seen edge-on (frame 3,
+the bay's left end) shows other texels than ours over its width, 4
+pixels at far zoom and 16 at near. Showing the wall's other side did
+not match either, so it is not only the side. The original picks the
+side from the run's direction (0x53fd47), and for an edge-on line looks
+up its own side's wallpaper by a fixed view direction (0x53f8ce); the
+texel offset was not read. Reopen with that offset.
+
+## 2026-11-14: The original's strip on a marked edge-on diagonal is read, not ported
+
+The last unported piece of the wall caps is the strip the original lays
+on a marked cut wall that runs edge-on (a "rising" diagonal, frame 3).
+From its code (0x53eb6d to 0x53ebf5, 0x53e87b, 0x4ac14b):
+
+- The strip is always pattern 252 in shape 9, whichever end is marked.
+- Before drawing, the strip's rectangle is moved up by 24, 47 or 94
+  pixels at the far, medium and near zoom (`(92 >> (3 - zoom)) + 1`,
+  or `+ 2` at near). The call is to OffsetRect; other call sites pass
+  (rect, -left, -top).
+- The rectangle is the wall's: 4 pixels wide at far zoom, from 42 above
+  its anchor to 16 below, and an edge-on wall is anchored 1 pixel left
+  and 17 pixels lower (at far zoom) than the other kinds.
+
+Put together, the strip would end 8 pixels above the stub it belongs
+to (the marked wall's shape 7 or 8 is only the stub for this frame), so
+either part of the placement is still unread or the case does not come
+up. None of our screenshots has one, and the Goth house has five
+diagonal walls, none marked in the compared cutaway at any rotation.
+So the original's rule is not ported: if such a wall does come up, we
+draw it like any marked cut wall (pattern 252 in shape 9 or 253 in
+shape 10, by which end is marked, not moved). Reopen with a screenshot of a cut edge-on diagonal meeting a standing
+wall.
+
+Caps on diagonal corners (the 2-pixel slices) are drawn as the corner
+records give them; they too are unverified for the same reason.
+
 ## 2026-11-14: The removal queue, no way in the planner, and K = 690
 
 Remove Object Instance now queues as the original's removal queue does
