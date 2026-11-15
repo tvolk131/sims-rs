@@ -56,8 +56,10 @@
 //!    (0x45866d).
 //! 5. When the listing offers nothing (0x48d423), each object on the
 //!    clicked object's tile (object +0xfc, read through 0x43f331 and
-//!    0x43f379, in the order the lot links them) is listed in turn, steps
-//!    1 to 4, and what it offers is added to the menu. The clicked object
+//!    0x43f379, in the order the lot links them, the links read again
+//!    after each listing; none outside the lot's size or off levels 1
+//!    and 2) is listed in turn, steps 1 to 4, the pet's check included,
+//!    and what it offers is added to the menu. The clicked object
 //!    is left out, and so are an object of type 8 (definition word 9) and
 //!    one whose definition word 91 (+0xb6) lacks bit 0. Each of these
 //!    listings has its own temps: saved before its first check tree and
@@ -69,7 +71,7 @@
 use crate::autonomy::{attenuation, checked, entry, find, person};
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Machine};
-use crate::placement::standing_on;
+use crate::placement::Cursor;
 use sims_formats::saved_objects::Interaction;
 use sims_sim::World;
 
@@ -228,19 +230,6 @@ impl Machine<'_, '_> {
     /// Lists the pie menu on `object` for the running person (0x48d392;
     /// see the module's documentation).
     pub(crate) fn pie_menu(&mut self, object: u16) -> Result<Vec<Interaction>, Trap> {
-        let me = self.me;
-        let data = &self
-            .me()?
-            .person
-            .as_ref()
-            .ok_or_else(|| Trap::Invalid(format!("object {me} is not a person")))?
-            .data;
-        let word = |index: usize| data.get(index).copied().unwrap_or(0);
-        if word(person::KIND) & 6 != 0 {
-            return Err(Trap::Unsupported(
-                "a pet's pie menu, which reads interface state (0x6e4f68, 0x4585b1)".into(),
-            ));
-        }
         let mut saved = None;
         let listed = self.list_with_tile(object, &mut saved);
         // The first listing's temps go back last (0x48d492), after the
@@ -269,29 +258,30 @@ impl Machine<'_, '_> {
             .get(&object)
             .ok_or(Trap::native(0x15, "missing object"))?
             .position;
-        let at = World::tile(position);
-        for other in standing_on(self.world, at.map(|n| n as u8))? {
-            if other == object {
-                continue;
+        // The walk reads the tile's links again after each listing, so a
+        // check tree that moves or deletes an object changes what follows.
+        let mut cursor = Cursor::on_tile(self.world, World::tile(position));
+        while let Some(other) = cursor.current() {
+            if other != object {
+                let guid = self
+                    .world
+                    .objects
+                    .get(&other)
+                    .ok_or(Trap::native(0x15, "missing object"))?
+                    .guid;
+                let words = self.definition_words(guid)?;
+                if words[TYPE] != TILE_SKIPPED && words[MENU_WORD] & ON_TILE != 0 {
+                    // Each object's own listing puts its temps back when it
+                    // ends (0x4582dd).
+                    let mut own = None;
+                    let more = self.listing(other, &mut own);
+                    if let Some(temps) = own {
+                        self.me_mut()?.temps = temps;
+                    }
+                    listed.extend(more?);
+                }
             }
-            let guid = self
-                .world
-                .objects
-                .get(&other)
-                .ok_or(Trap::native(0x15, "missing object"))?
-                .guid;
-            let words = self.definition_words(guid)?;
-            if words[TYPE] == TILE_SKIPPED || words[MENU_WORD] & ON_TILE == 0 {
-                continue;
-            }
-            // Each object's own listing puts its temps back when it ends
-            // (0x4582dd).
-            let mut own = None;
-            let more = self.listing(other, &mut own);
-            if let Some(temps) = own {
-                self.me_mut()?.temps = temps;
-            }
-            listed.extend(more?);
+            cursor.advance(self.world)?;
         }
         Ok(listed)
     }
@@ -303,6 +293,20 @@ impl Machine<'_, '_> {
         object: u16,
         saved: &mut Option<Vec<i16>>,
     ) -> Result<Vec<Interaction>, Trap> {
+        // Read for each listing, after the checks of any before it.
+        let me = self.me;
+        let data = &self
+            .me()?
+            .person
+            .as_ref()
+            .ok_or_else(|| Trap::Invalid(format!("object {me} is not a person")))?
+            .data;
+        let word = |index: usize| data.get(index).copied().unwrap_or(0);
+        if word(person::KIND) & 6 != 0 {
+            return Err(Trap::Unsupported(
+                "a pet's pie menu, which reads interface state (0x6e4f68, 0x4585b1)".into(),
+            ));
+        }
         let target = self.interaction_target(object)?;
         let menus: Vec<u32> = self
             .table(target)?

@@ -8,7 +8,9 @@ says what was decided, why, and what would reopen it. Entries marked
 
 When the listing on an object offers nothing, the original lists each
 other object on that object's tile in turn (0x48d423, walking the tile
-with 0x43f331 and 0x43f379) and adds what they offer. It leaves out an
+with 0x43f331 and 0x43f379, the links read again after each listing,
+nothing outside the lot's size) and adds what they offer. Each listing
+checks again whether the person is a pet. It leaves out an
 object of type 8 and one whose definition word 91 lacks bit 0. Each of
 those listings saves and restores the person's temps itself, and the
 first listing's temps go back last. A menu that still offers nothing

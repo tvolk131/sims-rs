@@ -803,6 +803,7 @@ fn tile_lot() -> Fixture {
     other.slots.clear();
     fx.world.objects.insert(3, other);
     fx.world.order.push(3);
+    fx.world.size = 64;
     fx.sim_mut().temps[0] = 11;
     fx
 }
@@ -837,4 +838,36 @@ fn the_tiles_listing_leaves_out_type_8_and_objects_without_word_91_bit_0() {
         let listed = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap();
         assert!(listed.is_empty(), "word {word}: {listed:?}");
     }
+}
+
+#[test]
+fn the_tiles_listing_finds_nothing_outside_the_lots_size() {
+    // Tile (2, 2) is outside a lot of size 2.
+    let mut fx = tile_lot();
+    fx.world.size = 2;
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let listed = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap();
+    assert!(listed.is_empty(), "{listed:?}");
+}
+
+#[test]
+fn each_listing_on_the_tile_checks_again_for_a_pet() {
+    // Menu 6's check makes me a dog (person data word 65) as it refuses;
+    // the next listing, on object 3, is a pet's, which is not ported.
+    let mut fx = tile_lot();
+    fx.add(
+        LAMP_FILE,
+        4303,
+        tree(vec![
+            assign(scope::TEMPS, 0, scope::LITERAL, 99, 1),
+            assign(18, 65, scope::LITERAL, 2, 2),
+            ins(0, RETURN_FALSE, RETURN_FALSE, [0; 8]),
+        ]),
+    );
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let fault = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap_err();
+    assert!(
+        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x4585b1")),
+        "{fault}"
+    );
 }
