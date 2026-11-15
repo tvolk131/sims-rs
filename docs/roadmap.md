@@ -1789,9 +1789,10 @@ Progress:
   renderer projects them.
 - Done: people drawn into the lot renderer's canvas, tested against the
   lot's depth (`People::draw_on_lot`, after `sims_render::draw`): walls,
-  furniture and the floor above hide them. A gated test draws the Goths'
-  people over their lot every 120 ticks at four rotations and checks
-  that some are hidden and most of their pixels still show.
+  furniture and the floor above hide them. A gated test draws each of
+  the Goths' people alone over their lot every 120 ticks at four
+  rotations and checks that something hides them at times, that their
+  feet show in most views, and that nobody is hidden throughout.
 - Next: compare a person behind furniture with the original; a person on
   an upper level stands at the floor, without the original's offset.
   Match the original's lighting (see its decisions entry); compare

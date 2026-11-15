@@ -18,10 +18,12 @@ one). Depths are cut toward zero, as the original's conversion does and
 as `Depth::anchor` does. The screen position is the renderer's
 `Camera::project_fine_f32`, one column right.
 
-Checked in the booted Goths' lot (ticks 120 to 480, four rotations,
-medium zoom): with the camera on the ground level and walls down, 84% of
-the people's pixels show and the rest are behind furniture such as the
-bed's posts. Their feet show: a floor lies 65 units farther than the
+Checked in the booted Goths' lot, each person drawn alone (ticks 120 to
+480, four rotations, medium zoom, the camera on the ground level, walls
+down): their feet show in 44 of the 53 views where they are on screen.
+In the three views looked at where a person or their feet are hidden,
+a hedge with the porch railing, a bookcase or the bed's posts stands in
+front; the others were not looked at. Feet show because a floor lies 65 units farther than the
 point under it, and grass, held at its tile's top corner, 80 or more
 (200 to 650 at five grass pixels probed). With the camera on level 2
 the upper floor hides everyone below it, as it hides the rooms. How the
