@@ -25,7 +25,7 @@ fn options(install: PathBuf) -> Options {
         house: goth_house(&install),
         install,
         answers: vec![3],
-        strict: false,
+        play: false,
     }
 }
 
@@ -110,7 +110,11 @@ fn play_mode_runs_the_goths_past_the_hour() {
     let Some(install) = install() else {
         return;
     };
-    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    let options = Options {
+        play: true,
+        ..options(install)
+    };
+    let mut game = Game::open(&options).expect("the Goth house opens");
     // Past the hour turning at tick 878, through the errors play mode
     // catches.
     assert_eq!(game.run(3000), 3000);

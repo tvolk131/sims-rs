@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! sims-game [<install>] [<house file>] [--answers A,B,...] [--mute]
-//!           [--strict] [--png <file> [--ticks N] [--size WxH]]
+//!           [--play] [--png <file> [--ticks N] [--size WxH]]
 //! ```
 //!
 //! The install defaults to `SIMS_INSTALL`, and the house to the Goths'
@@ -16,9 +16,10 @@
 //! floor, `1`/`2`/`3` walls up, cutaway and down, the arrows or a
 //! right-button drag scroll, space pauses, Escape quits.
 //!
-//! The lot runs in play mode: an object whose tick fails is reset and the
-//! lot goes on, and each new error is printed and shown across the top
-//! for a while. `--strict` stops the lot at the first error instead.
+//! The lot runs in strict mode: the first error stops it, and the error
+//! is written across the top. `--play` runs it in play mode instead: an
+//! object whose tick fails is reset and the lot goes on, and each new
+//! error is printed and shown across the top for a while.
 //!
 //! Sound plays on the default output device (on macOS, or built with the
 //! `sound` feature) unless `--mute` is given.
@@ -105,14 +106,14 @@ struct Still {
 
 fn options() -> Result<(Options, Option<Still>, bool), String> {
     let usage = "usage: sims-game [<install>] [<house file>] [--answers A,B,...] [--mute] \
-                 [--strict] [--png <file> [--ticks N] [--size WxH]]";
+                 [--play] [--png <file> [--ticks N] [--size WxH]]";
     let mut paths = Vec::new();
     let mut answers = None;
     let mut png = None;
     let mut ticks = 0;
     let mut size = [800, 600];
     let mut mute = false;
-    let mut strict = false;
+    let mut play = false;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         let mut text = |name: &str| -> Result<String, String> {
@@ -122,8 +123,8 @@ fn options() -> Result<(Options, Option<Still>, bool), String> {
         };
         if arg == "--mute" {
             mute = true;
-        } else if arg == "--strict" {
-            strict = true;
+        } else if arg == "--play" {
+            play = true;
         } else if arg == "--png" {
             png = Some(PathBuf::from(text("--png")?));
         } else if arg == "--ticks" {
@@ -171,7 +172,7 @@ fn options() -> Result<(Options, Option<Still>, bool), String> {
             install,
             house,
             answers,
-            strict,
+            play,
         },
         still,
         mute,

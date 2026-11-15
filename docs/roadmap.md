@@ -2046,18 +2046,18 @@ through their public interfaces only; the simulation never depends on it.
 
 - **Done: the window.** `cargo run --release -p sims-game` boots the
   Goths' house (`SIMS_INSTALL`, `House05.iff`, answering No to the Help
-  System) and runs it in play mode, a tick every 50 ms at normal
+  System) and runs it in strict mode, a tick every 50 ms at normal
   speed. The lot, the people over it and the panel over both are drawn
   every tick; the clock, funds and needs on the panel are the live
   world's. The panel's speed, pause and camera buttons work (the game
   paces the lot; the simulation's own speed global is not touched).
-  An object whose tick fails is reset and the lot goes on; each new
-  error is printed and shown across the top for a while (`--strict`
-  stops at the first error instead). A failure play mode does not catch
-  stops the lot, which stays on screen as it was with the failure across
-  the top. The Goths' house now runs 12,000 ticks (ten minutes at normal
-  speed) without stopping, through about a dozen different caught
-  errors. `--png <file> --ticks N` draws one frame without a window.
+  The first error stops the lot, which stays on screen as it was with
+  the failure across the top. `--play` runs it in play mode instead: an
+  object whose tick fails is reset and the lot goes on, and each new
+  error is printed and shown across the top for a while; only a failure
+  play mode does not catch stops it. In play mode the Goths' house runs
+  12,000 ticks (ten minutes at normal speed) without stopping, through
+  about a dozen different caught errors. `--png <file> --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
   default device (on macOS; elsewhere with the `sound` feature, so CI
   needs no audio library; `--mute` turns it off). A thread renders

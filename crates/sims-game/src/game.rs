@@ -2,14 +2,15 @@
 //! speed asks, drawn with its people and the live-mode panel, and the
 //! player's presses turned into what they ask for.
 //!
-//! The simulation runs in play mode ([`Lot::step_play`]): an object whose
-//! tick fails, usually on something the simulation does not do yet, is
-//! reset as the original resets an object after a SimAntics error, and
-//! the lot goes on. Each new error caught is logged and shown across the
-//! top for a while. A failure play mode does not catch stops the lot, which
-//! stays on screen as the failure left it, with the failure written
-//! across the top. [`Options::strict`] steps with [`Lot::step`] instead,
-//! which stops at the first error of any kind.
+//! The simulation runs in strict mode ([`Lot::step`]) unless
+//! [`Options::play`] asks for play mode. In strict mode the first step
+//! that fails stops the lot, which stays on screen as the failure left
+//! it, with the failure written across the top. In play mode
+//! ([`Lot::step_play`]) an object whose tick fails, usually on something
+//! the simulation does not do yet, is reset as the original resets an
+//! object after a SimAntics error, and the lot goes on; each new error
+//! caught is logged and shown across the top for a while, and only a
+//! failure play mode does not catch stops the lot.
 
 use crate::hud::Hud;
 use crate::pace::Pace;
@@ -48,9 +49,10 @@ pub struct Options {
     /// `sims boot --answers` (the Goths' house takes `3`, No to the Help
     /// System). The player cannot answer them yet.
     pub answers: Vec<u8>,
-    /// Step in strict mode ([`Lot::step`]), which stops the lot at the
-    /// first error, instead of play mode.
-    pub strict: bool,
+    /// Step in play mode ([`Lot::step_play`]), which resets an object
+    /// after its error and goes on, instead of strict mode ([`Lot::step`]),
+    /// which stops the lot at the first error.
+    pub play: bool,
 }
 
 /// What the host should do after an input.
@@ -79,7 +81,7 @@ pub struct Game {
     people: People,
     hud: Hud,
     pub pace: Pace,
-    strict: bool,
+    play: bool,
     /// Why the lot stopped, once it has.
     stopped: Option<String>,
     errors: Errors,
@@ -115,7 +117,7 @@ impl Game {
             people,
             hud,
             pace: Pace::default(),
-            strict: options.strict,
+            play: options.play,
             stopped,
             errors: Errors::default(),
             note: None,
@@ -168,10 +170,10 @@ impl Game {
     pub fn run(&mut self, ticks: u32) -> u32 {
         let mut ran = 0;
         while ran < ticks && self.stopped.is_none() {
-            let step = if self.strict {
-                self.lot.step()
-            } else {
+            let step = if self.play {
                 self.lot.step_play()
+            } else {
+                self.lot.step()
             };
             match step {
                 Ok(update) => {
