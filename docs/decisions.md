@@ -72,6 +72,77 @@ What would reopen it: a capture where a slot search with flag 0x2000
 draws a different number of times, or a house with two people in a
 route's way.
 
+## 2026-11-14: The ambient scores play as the original's score player does
+
+`crates/sims-audio/src/ambience.rs` plays the FSC scores (backyard,
+beach, park, Magic Town). How the original's score player behaves was
+read from its code in a memory image (read only, never written); none
+of it was heard, since the harness runs the game with `-nosound`.
+
+- A score is a grid of cells. A cursor moves over it: the row from a
+  value the game computes from the camera, the column from the hour.
+  On the score's beat the player picks cells near the cursor, weighted
+  by each cell's chance, groups and exclusions, until enough are
+  playing. A picked cell loads, starts on the next first beat, and
+  frees its slot when its sound ends.
+- The ambience modes (kind 52) and the ambience half of the music modes
+  (kind 36) start and stop the scores as the original's dispatcher
+  does. The music half of kind 36 is not ported and is still reported.
+- Random draws come from the player's seeded generator, not the
+  original's `rand`, so the picks differ from the original's but repeat
+  for a seed.
+- **Unverified:** how a cell's position maps to pan (taken as HIT pan
+  `512 + 512x`); that the value 0x570c3e computes comes from the camera
+  and that the second input is the hour; whether the sound system finds
+  a cell's file outside the score's directory (the Magic Town score has
+  50 such cells, which do not play here).
+- Two of the original's quirks are kept: the beat clock wraps after
+  about five hours of one score playing, and a beat can pick one cell
+  past the score's limit. One guard is not the original's: a looping
+  cell whose sound the mixer dropped frees its slot.
+- **Left out:** fade in and out, the fast counter, the delay,
+  quantise, stereo and third random fields, tempo changes and pausing.
+
+The simulation has to provide the camera value and the hour (through
+`Player::set_ambience_view`) for the cursor to move; until then the
+cursor stays where the modes put it.
+
+Reopen when a run with sound can be compared, or when the simulation
+gives the cursor's inputs.
+
+## 2026-11-14: The people viewer runs a booted lot
+
+`people-viewer --boot` boots the house with `sims_vm::boot::Lot` (the
+library form of `sims boot`) and runs it in the window: one tick every
+50 milliseconds, because the animator clock moves 50 a tick at normal
+speed. It catches up by at most 10 ticks per drawn frame, so a slow
+tick slows the lot down instead of stalling the window. After each tick
+the people are drawn from the lot's state as they are from a snapshot.
+People a script makes while the lot runs are read from their objects
+when they first appear, each on its own, so one person that cannot be
+read (a type missing from the install) does not hide the others. `--answers` answers dialogs as `sims boot` does
+(the Goths' house takes `--answers 3`). `--png` with `--at` runs `--at`
+/ 50 ticks and then draws one frame.
+
+When a step fails, the run ends there. The viewer prints the failure and
+keeps the last state on screen. Today the Goths' lot stops at tick 367,
+on a route that is not ported. That is the end of what the simulation
+runs, not a fault in the drawing.
+
+The viewer holds the lot and reads it only through `Lot::world`. The
+library does not depend on `sims-vm`: only the viewer does (behind the
+`viewer` feature), and so do the tests.
+
+Checked: a gated test (`tests/lot.rs`) runs the Goths' lot to its end
+and draws everyone placed every 30 ticks. At most four people are
+placed at once (the family and a visitor). Each draws on its own,
+covering part of the frame. Looked at by eye, the people move between
+ticks. Unverified: none of this is compared with the original. Ticks
+run at 50 ms, so the lot plays at normal speed; the slowed clock (42 a
+tick) is not used. The camera still centres on the average of the
+people, so on a whole lot some of them are off screen until it is zoomed
+out.
+
 ## 2026-11-14: The standing Goths compared with the original
 
 A screenshot of the original (House05, early morning, medium zoom) shows

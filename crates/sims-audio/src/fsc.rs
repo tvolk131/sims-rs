@@ -10,12 +10,14 @@
 //!    fout dly rand? loop loop? quant prob pitchL pitchH fast? groupID
 //!    stereo? filename exclusion cells`);
 //! 5. `rows * cols` cell rows: 18 numbers and a sample file name, or
-//!    `NONE` for an empty cell.
+//!    `NONE` for an empty cell, then any number of exclusion cells, each
+//!    written `(a,b)`.
 //!
-//! The field names are the file's own; what the player does with them is
-//! not read here. Sample names are bare file names, looked up in the
-//! directory the FSC file is in. That the original resolves them this way
-//! is **unverified**.
+//! The field names are the file's own; [`crate::ambience`] says what the
+//! player does with them. *(code)* The original reads version 5 and 6
+//! files too (17 cell numbers, no `stereo?`); every score in the install
+//! is version 7, the only one read here. Sample names are bare file
+//! names, opened in the directory the FSC file is in.
 
 use crate::hot::number;
 use crate::{Error, Result};
@@ -36,12 +38,16 @@ pub struct Score {
     pub cells: Vec<Option<Cell>>,
 }
 
-/// One cell: its 18 numbers, in the order of the file's cell header, and
-/// its sample file.
+/// One cell: its 18 numbers, in the order of the file's cell header, its
+/// sample file and its exclusion cells.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     pub fields: Vec<i64>,
     pub file: String,
+    /// The `(a,b)` pairs after the file name, in order. *(code)* The
+    /// player takes `a` as the column and `b` as the row. No score in the
+    /// install has any.
+    pub exclusions: Vec<(i64, i64)>,
 }
 
 impl Score {
@@ -113,9 +119,14 @@ impl Score {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let rest = parts[20..].join("\t");
+            let exclusions = exclusions(&rest).ok_or_else(|| {
+                Error::text("FSC", line + 1, "an exclusion cell is not two numbers")
+            })?;
             cells.push(Some(Cell {
                 fields,
                 file: file.to_owned(),
+                exclusions,
             }));
         }
         Ok(Self {
@@ -126,4 +137,22 @@ impl Score {
             cells,
         })
     }
+}
+
+/// The `(a,b)` pairs in the text after a cell's file name; `None` when one
+/// is not two numbers. Text outside parentheses is ignored. (The original
+/// splits the line at each `(` and `)`; what it does with text between
+/// pairs, or a pair that is not two numbers, was not followed, as no
+/// score in the install has an exclusion.)
+fn exclusions(text: &str) -> Option<Vec<(i64, i64)>> {
+    let mut pairs = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('(') {
+        let after = &rest[open + 1..];
+        let close = after.find(')')?;
+        let (a, b) = after[..close].split_once(',')?;
+        pairs.push((number(a.trim())?, number(b.trim())?));
+        rest = &after[close + 1..];
+    }
+    Some(pairs)
 }
