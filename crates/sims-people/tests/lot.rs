@@ -65,7 +65,9 @@ fn the_people_of_a_running_lot_are_drawn_from_its_state() {
                 let Some((body, base)) = bodies.get(id) else {
                     panic!("tick {}: person {id} is placed but not read", lot.ticks());
                 };
-                let pose = player.pose(&body.skeleton, animator, base).unwrap();
+                let pose = player
+                    .pose(&body.skeleton, animator, world.base_layers.get(id), base)
+                    .unwrap();
                 let bones = pose.world(&body.skeleton, root);
                 // Drawn alone, with the camera on the person, it covers
                 // part of the frame, and only part. The camera is on the
