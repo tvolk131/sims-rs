@@ -189,8 +189,9 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     assert_eq!(lot.world().headlines, BTreeMap::from([(16, shown(1))]));
     lot.step().unwrap_or_else(|e| panic!("{e}"));
     assert!(lot.world().headlines.is_empty());
-    // The lot runs on until person 259 routes to a slot wanting to be
-    // interrupted (0x45b196), which is not ported.
+    // The lot runs on until person 259's route to a slot fails, as it
+    // wants to be interrupted (0x45b18b), and its tree takes it off the
+    // lot, which is not ported.
     let mut steps = 359;
     let stopped = loop {
         steps += 1;
@@ -200,7 +201,11 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
         }
     };
     assert_eq!(steps, 595, "{stopped}");
-    for part in ["tick 597,", "object 259, tree 0x0176 node 26", "0x45b196"] {
+    for part in [
+        "tick 597,",
+        "object 259, tree 0x0176 node 27",
+        "taking a person off the lot is not ported",
+    ] {
         assert!(stopped.contains(part), "{stopped}");
     }
 }

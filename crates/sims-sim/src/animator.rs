@@ -740,6 +740,22 @@ pub enum Advance {
 }
 
 impl Animator {
+    /// Whether what the animator is doing may be stopped for an interrupt
+    /// (virtual function 0x30, 0x589ead), by its state (+0x190): while it
+    /// plays a script's clip (0) or in states 9 and 10, whatever the
+    /// foreground layer (+0xc) says at +0x68, or yes with none; in states
+    /// 1 to 3, yes; in any other, no.
+    pub fn interruptible(&self) -> bool {
+        match self.state {
+            0 | 9 | 10 => self
+                .foreground
+                .as_ref()
+                .is_none_or(|layer| layer.interruptible != 0),
+            1..=3 => true,
+            _ => false,
+        }
+    }
+
     /// A new animator (0x587d2c, after its base 0x58464f), made with its
     /// person, at clock `clock` (the clock when the person is made,
     /// 0x585483).
