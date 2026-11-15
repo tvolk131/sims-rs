@@ -6,8 +6,8 @@ use sims_vm::boot::{Frames, Lot, StepError};
 use std::path::PathBuf;
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 33 --answers 3`
-/// gives this hash with the default frames (snapshot format 21).
-const TICK_33: &str = "f04b6b12f014338ffae07e2991a99d70791ef7bd9699fe9c659714804e846c1e";
+/// gives this hash with the default frames (snapshot format 22).
+const TICK_33: &str = "041181badfd4d6953814b6c46612398df1004fa583b1d2aa5bd11c59715d65c0";
 
 #[test]
 fn the_goth_house_steps_to_tick_33() {
@@ -64,11 +64,16 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
             .clone()
     };
 
-    // Object 18's listing runs check trees and fails partway, at a scope
-    // not ported, and the lot is as it was.
+    // Object 18's listing runs check trees and fails partway: one reads
+    // the advertisement record (scope 12) before Find Best Interaction
+    // has first copied into it, which the load does not reach. The lot is
+    // as it was.
     let before = lot.world().hash();
     let refused = lot.pie_menu(sim, 18).unwrap_err().to_string();
-    assert!(refused.contains("scope 12"), "{refused}");
+    assert!(
+        refused.contains("scope 12") && refused.contains("0x6e5100"),
+        "{refused}"
+    );
     assert_eq!(lot.world().hash(), before);
 
     // Person 16: listing changes the lot (its check trees' work), and

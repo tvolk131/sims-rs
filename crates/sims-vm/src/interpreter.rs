@@ -227,7 +227,7 @@ impl<'a> Interpreter<'a> {
             args,
             most,
             budget,
-            &mut None,
+            false,
         )
     }
 
@@ -246,12 +246,12 @@ impl<'a> Interpreter<'a> {
         args: &[i16],
         most: usize,
         budget: usize,
-        advertisements: &mut Option<Advertisements>,
+        checking: bool,
     ) -> Result<bool, Fault> {
         let base = world.objects.get(&object).map_or(0, |o| o.stack.len());
         let mut machine = self.machine(world, object, base, true);
-        machine.advertisements = advertisements.take();
-        let result = run(
+        machine.checking = checking;
+        run(
             &mut machine,
             object,
             owner,
@@ -260,9 +260,7 @@ impl<'a> Interpreter<'a> {
             args,
             most,
             budget,
-        );
-        *advertisements = machine.advertisements.take();
-        result
+        )
     }
 
     pub(crate) fn machine<'w>(
@@ -287,7 +285,7 @@ impl<'a> Interpreter<'a> {
             menu: self.menu,
             running_at_once: self.running_at_once,
             letting_go: self.letting_go,
-            advertisements: None,
+            checking: false,
         }
     }
 }
@@ -344,10 +342,10 @@ pub(crate) struct Machine<'a, 'w> {
     pub base: usize,
     /// Whether the run must finish without yielding, as a callback does.
     pub synchronous: bool,
-    /// The advertisements Find Best Interaction copies for a check tree
-    /// (the record at [0x6c437c]), which scopes 12, 28 and 29 read and
-    /// write. None outside a check tree.
-    pub advertisements: Option<Advertisements>,
+    /// Whether the run is a check tree Find Best Interaction runs (or a
+    /// tree such a check runs by name), where Add/Change Action String
+    /// names the interaction being checked (0x41f1ae).
+    pub checking: bool,
     /// See [`Interpreter::making_person`].
     pub making_person: Option<u16>,
     /// See [`Interpreter::menu`].
@@ -357,9 +355,6 @@ pub(crate) struct Machine<'a, 'w> {
     /// See [`Interpreter::letting_go`].
     pub letting_go: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
 }
-
-/// See [`Machine::advertisements`].
-pub(crate) type Advertisements = [crate::autonomy::Advertisement; crate::autonomy::ADVERTISEMENTS];
 
 impl<'a> Machine<'a, '_> {
     /// An interpreter over the same code, for services that run other
