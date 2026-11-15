@@ -40,6 +40,8 @@ the repository, and so do the captures.
 | `input.py` | Scripted input for a capture (`--scenario`): the scenario format, the memory readers for the pointer, the pie menu and the people's queues, and the runner. |
 | `guest/input-agent.sh` | Guest job that `input.py` starts. It runs the input commands the host drops in `/research/input`, in order, and polls often. |
 | `test_input.py` | Tests of `input.py` against a fake guest memory. They need no Docker. |
+| `manifest.py` | Writes `manifest.json` next to a capture: the updates and ticks it covers, which updates have a full state and why, the hours turned and the length of the game day, the objects that appeared or left, the dialogs and how each was answered, the presses and the queued actions. |
+| `test_manifest.py` | Tests for `manifest.py` against a synthetic capture. |
 | `test_capture.py` | Tests for `capture.py`, `guest.py` and `rsp.py` against a fake stub and fake memory, with no Docker: `python3 -B -m unittest discover -s tools/harness -p 'test_*.py'`. |
 
 ## Running a capture
@@ -101,6 +103,31 @@ Things to know:
   identities (`stale`, `ids: null`), and checks identities only in a
   current cache. Before this, a run stopped at update 609 with `unknown
   retained spatial-order object identity`.
+- **Sparse recordings.** For a long run (a whole game day is about 43,200
+  updates) save the full state sparsely and around what happens:
+  `--full 1-20,30-44000/10 --around 20 --before-hour 10`. `--around N`
+  saves the update in which an object appears on or leaves the registry, a
+  dialog is shown, or the hour turns, and the N updates after it
+  (`objects_changed` and `hour_turned` events name what happened).
+  `--before-hour B` saves the last B updates before each hour turns. With
+  either, every line of `updates.jsonl` also has the clock (`clock`:
+  globals 0, 5 and 6), the date globals 1 to 3, 7 and 8 (`date`) and the
+  registry's object count, and a saved update's line has `saved_for`. The
+  random streams are on every line in any case. A full state takes about
+  6 seconds and an update that is not saved about 0.16 seconds, so a day
+  takes about 10 hours.
+- **Dialogs during a long run.** `--answer-stuck 150 --guest-dir <guest dir>
+  --window <window>` presses Return in the game window when a dialog shown
+  in update `--answer-from` (default 3) or later has had no result for 150
+  seconds, and again every 150 seconds, three times at most. Many notices
+  close on their own (one at 7:00 did, in update 901 of the Goth house);
+  this only keeps a run from waiting forever. Each press is logged
+  (`dialog_auto_answer`, and `input-log.txt`), and `dialog_result` has the
+  answer. Answer the first dialogs (updates 1 and 2) by hand as above:
+  Return may not be the answer wanted there.
+- **Manifest.** `python3 tools/harness/manifest.py <capture dir> --house
+  'UserData/Houses/House05.iff (the Goths)' --note '...'` writes
+  `manifest.json` from the capture's own files.
 - **Stopping.** To end the capture, create the stop file. The capture then
   detaches, which resumes the game.
 - **Taking over a running capture.** Kill `capture.py` and its `docker exec`
@@ -262,11 +289,12 @@ python3 -B -m unittest discover -s tools/harness -p 'test_*.py'
 | `state.json.gz` | In both kinds of directory: the scheduler, the three random streams, the 64 globals, and every object with its frames (people with person data, motives and actions; doors, objects of type 8, with their portal costs as float bit patterns, `portal_bits`). |
 | `full-state.json.gz` | In both kinds of directory: the registry, the neighborhood, and the object and animator pointers. |
 | `pages.json.gz` | In both kinds of directory: the memory pages of the people and their animators. |
-| `updates.jsonl` | One line per lot update: the tick, whether it was a full pass, the three random streams and the scheduler cursor. |
-| `events.jsonl` | The dialog functions passed (each record, its status and modal byte), the baseline, other stops, the game's identity (`game_identity`) and the watch events. |
+| `updates.jsonl` | One line per lot update: the tick, whether it was a full pass, the three random streams and the scheduler cursor; with `--around` or `--before-hour` also the clock, the date and the object count, and for a saved update why it was saved. |
+| `events.jsonl` | The dialog functions passed (each record, its status and modal byte), the baseline, other stops, the game's identity (`game_identity`), the watch events, and with `--around` the objects that appeared or left (`objects_changed`), the hours turned (`hour_turned`) and the presses of `--answer-stuck` (`dialog_auto_answer`). |
 | `dump-NNNN/` | With `--dump`: the user memory at the entry of lot update N. `ranges.json` lists the ranges (start, size, protection, file); `registers.json` holds the stop's registers and the stub's whole register packet. |
 | `watch.jsonl` | With `--watch`: one line per write to a watched address (see above). |
 | `status.json` | Progress, and `game_identity`: the digests `launch.sh` verified, or null if the game was not started by it. |
 | `input-log.txt` | Every press made, with its time (written by `answer.sh`). |
 | `input.jsonl` | With `--scenario`: the steps, the guest commands, the pie menus and every action the pie menu queued, each with its lot update (see Scripted input). |
 | `input-shots/` | With `--scenario`: the `shot` steps' screenshots. |
+| `manifest.json` | Written by `manifest.py` (see above). |
