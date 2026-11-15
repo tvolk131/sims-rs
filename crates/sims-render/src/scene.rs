@@ -8,7 +8,7 @@ use crate::depth;
 use crate::grass::{self, Grass};
 use crate::light::Light;
 use crate::lot::{self, Lot, WallCell};
-use sims_sim::World;
+use sims_sim::{Object, World};
 use std::collections::BTreeMap;
 
 /// Rows between a tile's left corner and the top of its first grass
@@ -629,7 +629,9 @@ impl Painter<'_> {
             if !self.lot.contains(tile[0], tile[1]) {
                 continue;
             }
-            let Some(([x, y], lift)) = held(self.world, self.assets, id) else {
+            let assets = &mut *self.assets;
+            let slot = |guid, i: usize| assets.definition(guid)?.slots.get(i).copied();
+            let Some(([x, y], lift)) = held(&self.world.objects, slot, id) else {
                 continue;
             };
             let view = self.camera.rotate_fine([x, y]);
@@ -737,17 +739,22 @@ const CONTAINER_SLOT: usize = 3;
 /// the original adds these while it draws the holder's contents
 /// (0x437fdd, read by the old prototype in
 /// `legacy/crates/sims-render/src/lib.rs`). None when a holder is hidden.
-/// Objects a Sim holds stay at their own position.
-fn held(world: &World, assets: &mut Assets, id: u16) -> Option<([i32; 2], f32)> {
-    let mut cursor = world.objects.get(&id)?;
+/// Objects a Sim holds stay at their own position. `slot` gives a
+/// holder's slot by its GUID and the slot's index.
+fn held(
+    objects: &BTreeMap<u16, Object>,
+    mut slot: impl FnMut(u32, usize) -> Option<[f32; 3]>,
+    id: u16,
+) -> Option<([i32; 2], f32)> {
+    let mut cursor = objects.get(&id)?;
     let mut offset = [0.0f32; 3];
     // A chain longer than the lot has objects is a loop.
-    for _ in 0..world.objects.len() {
+    for _ in 0..objects.len() {
         let container = cursor.data.get(CONTAINER).copied().unwrap_or(0);
         let Some(holder) = u16::try_from(container)
             .ok()
             .filter(|&c| c != 0)
-            .and_then(|c| world.objects.get(&c))
+            .and_then(|c| objects.get(&c))
             .filter(|h| h.person.is_none())
         else {
             break;
@@ -755,11 +762,11 @@ fn held(world: &World, assets: &mut Assets, id: u16) -> Option<([i32; 2], f32)> 
         if holder.data.get(HIDDEN).is_some_and(|&w| w != 0) {
             return None;
         }
-        let slot = usize::try_from(cursor.data.get(CONTAINER_SLOT).copied().unwrap_or(-1))
+        let at = usize::try_from(cursor.data.get(CONTAINER_SLOT).copied().unwrap_or(-1))
             .ok()
-            .and_then(|i| assets.definition(holder.guid)?.slots.get(i).copied())
+            .and_then(|i| slot(holder.guid, i))
             .unwrap_or_default();
-        let [mut x, mut y, z] = sprite_offset(slot);
+        let [mut x, mut y, z] = sprite_offset(at);
         for _ in 0..(i32::from(holder.data.get(1).copied().unwrap_or(0)) / 2).rem_euclid(4) {
             (x, y) = (-y, x);
         }
@@ -1013,6 +1020,75 @@ mod tests {
         assert_eq!(view_direction(0, &camera(1)), 4);
         assert_eq!(view_direction(6, &camera(1)), 1);
         assert_eq!(view_direction(4, &camera(3)), 4);
+    }
+
+    fn object(id: u16, guid: u32, position: [i32; 3], words: &[(usize, i16)]) -> Object {
+        let mut data = vec![0; 64];
+        for &(i, v) in words {
+            data[i] = v;
+        }
+        Object {
+            id,
+            guid,
+            footprint: [0; 4],
+            position,
+            unknown_short: 0,
+            attributes: Vec::new(),
+            temps: Vec::new(),
+            data,
+            obsolete_word: 0,
+            stack_capacity_bytes: 0,
+            stack: Vec::new(),
+            relationship_flag: 0,
+            relationships: Vec::new(),
+            slots: Vec::new(),
+            dynamic_sprites: Vec::new(),
+            multipart: None,
+            portal: None,
+            person: None,
+            registry_word: None,
+            last_result: false,
+            removal_skips_resets: false,
+            selected: false,
+        }
+    }
+
+    #[test]
+    fn held_objects_stand_on_their_holders_slot() {
+        const TABLE: u32 = 7;
+        let slot = |guid: u32, i: usize| (guid == TABLE && i == 1).then_some([4.0, 0.0, 4.0]);
+        let mut objects = BTreeMap::new();
+        // A table facing 2 (one quarter turn) holds a lamp in its slot 1.
+        objects.insert(1, object(1, TABLE, [100, 200, 1], &[(1, 2)]));
+        objects.insert(
+            2,
+            object(2, 9, [100, 200, 1], &[(CONTAINER, 1), (CONTAINER_SLOT, 1)]),
+        );
+        // The slot's x turns with the table into y; its height lifts.
+        assert_eq!(held(&objects, slot, 2), Some(([100, 204], 4.0)));
+        assert_eq!(held(&objects, slot, 1), Some(([100, 200], 0.0)));
+        // A holder without that slot puts it at its own place.
+        objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 5;
+        assert_eq!(held(&objects, slot, 2), Some(([100, 200], 0.0)));
+        // A hidden holder hides what it holds.
+        objects.get_mut(&1).unwrap().data[HIDDEN] = 1;
+        assert_eq!(held(&objects, slot, 2), None);
+        // Holders that hold each other end the walk.
+        objects.get_mut(&1).unwrap().data[HIDDEN] = 0;
+        objects.get_mut(&1).unwrap().data[CONTAINER] = 2;
+        assert!(held(&objects, slot, 2).is_some());
+    }
+
+    #[test]
+    fn slot_heights_follow_the_category() {
+        use crate::assets::slot_height;
+        assert_eq!(slot_height(1, 3.0), 0.0);
+        assert_eq!(slot_height(2, 0.0), 2.5);
+        assert_eq!(slot_height(3, 0.0), 4.0);
+        assert_eq!(slot_height(8, 5.0), 4.0);
+        assert_eq!(slot_height(4, 0.0).to_bits(), 0x4081_999a);
+        assert_eq!(slot_height(0, 5.0), 5.0);
+        assert_eq!(slot_height(5, 4.0), 4.0);
     }
 
     #[test]
