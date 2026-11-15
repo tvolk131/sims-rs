@@ -277,6 +277,56 @@ fn the_hour_turns_and_a_new_time_of_day_marks_every_room() {
 }
 
 #[test]
+fn a_new_time_of_day_grows_the_lawn_when_global_36_is_set() {
+    use sims_formats::lot::Array;
+    // Grass 0 and target 100 on the whole lot, but (1, 1) is grown, so
+    // its diagonal neighbour (2, 2) grows by 5 × 4.
+    let lawn = |fx: &mut Fixture| {
+        let size = fx.world.size as usize;
+        let array = |fill: u8| Array {
+            width: size,
+            height: size,
+            stride: 1,
+            encoding: 0,
+            data: vec![fill; size * size],
+        };
+        let mut grass = array(0);
+        grass.data[size + 1] = 100;
+        fx.world.arrays.insert(6, grass);
+        fx.world.arrays.insert(7, array(100));
+    };
+    let cell = |fx: &Fixture, x: usize, y: usize| {
+        let grass = &fx.world.arrays[&6];
+        grass.data[x * grass.height + y]
+    };
+    // 17:59 to 18:00 turns day to dusk.
+    let mut fx = before_the_hour(17, 0);
+    lawn(&mut fx);
+    fx.world.globals[36] = 1;
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(cell(&fx, 2, 2), 20);
+    assert_eq!(cell(&fx, 3, 3), 0);
+    // Without global 36 the lawn stays.
+    let mut fx = before_the_hour(17, 0);
+    lawn(&mut fx);
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(cell(&fx, 2, 2), 0);
+    // An hour that keeps the time of day sends no signal.
+    let mut fx = before_the_hour(8, 0);
+    lawn(&mut fx);
+    fx.world.globals[36] = 1;
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(cell(&fx, 2, 2), 0);
+    // A lot without the arrays fails loudly.
+    let mut fx = before_the_hour(17, 0);
+    fx.world.globals[36] = 1;
+    assert!(matches!(
+        update(&mut fx, &mut answers(&[])),
+        Err(TickError::Unsupported(m)) if m.contains("the lawn grows")
+    ));
+}
+
+#[test]
 fn the_time_of_day_follows_the_hour() {
     for (hours, period) in [
         (1, 2),

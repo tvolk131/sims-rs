@@ -4,21 +4,37 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
-## 2026-11-14: The hour turns; the signals' other subscribers taken as presentation, and K = 900
+## 2026-11-14: The hour turns, a new time of day grows the lawn, and K = 900
 
 The hour's turn is ported from the lot update (0x46d3cc to 0x46d51d).
 When the time of day changes, the game tells the interface (0x4c4648)
-and sends signals 0xf8 and 0xdd. Of what they reach, only the lot's
-subscriber is read: it has no case for 0xf8, and on 0xdd it marks every
-room and sets a light ceiling only the drawing reads. The interface call
-picks a panel's look. The other subscribers' handling of the two signals
-is not read, and is taken to change no simulation state. Ticks 878 to
-900, which cross 7:00, equal the fifth capture, but the rooms marked then
-are counted only at the next frame draw (after tick 903), so the recount
-is not yet compared. **Unverified**; reopen if the room motives differ
-after tick 903, or a later tick differs after a change of the time of day
-(the next at 18:00). The day's turn still fails loudly. K = 900;
-tick 901 reads job data (scope 33).
+and sends signals 0xf8 and 0xdd. The interface call picks a panel's look.
+On 0xdd the lot's subscriber marks every room and sets a light ceiling
+only the drawing reads.
+
+Signal 0xf8 is not presentation, as a first reading had it (the review
+caught this). The architecture's subscriber (0x47b22a) takes it and,
+when global 36 is not 0, grows the lawn (0x47b3c8): each tile inside the
+lot's border whose grass (Arry 6) is below its target (Arry 7), and that
+has a diagonal neighbour already at its target, grows by 20, up to the
+target. The sweep changes the array as it goes, row by row. It then
+sends 0x86 and 0x83, which only the house viewer takes, to redraw. This
+is ported (`World::grow_grass`) from the code; the original's direction
+table was read from a memory image.
+
+A scan of the cases each of the eight subscribers tests finds 0xf8 only
+in the architecture's and 0xdd only in the lot's, but two handlers
+(0x4a82db, 0x4c3ea5) were not read in full, so that the others ignore
+0xdd is **unverified**.
+
+Ticks 878 to 900 cross 7:00 but do not change the time of day: the save
+already holds day (global 4 is 0 at 6:30, in the capture and here), so
+neither the lawn nor the rooms change, and they equal the fifth capture.
+The first change comes at 18:00. The tick captures do not hold the lot's
+arrays, so the lawn's growth is **unverified** against the original;
+the full day's recording must capture the grass array at 18:00. The
+day's turn still fails loudly. K = 900; tick 901 reads job data
+(scope 33).
 
 ## 2026-11-14: No headline state until a headline can show, and K = 877
 

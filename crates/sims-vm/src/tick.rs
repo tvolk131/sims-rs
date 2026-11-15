@@ -26,7 +26,10 @@
 //!    compared with global 4. If it differs, global 4 takes it, the
 //!    interface is told (0x4c4648, which picks the day or night look of
 //!    the panel of the current mode), and signals 0xf8 (with 5) and 0xdd
-//!    are sent. The lot's subscriber has no case for 0xf8. On 0xdd it
+//!    are sent. Of the subscribers only the architecture takes 0xf8
+//!    (0x47b22a): when global 36 is not 0 it grows the lawn
+//!    ([`World::grow_grass`] by 5, 0x47b3c8), and then sends 0x86 and
+//!    0x83, which only the house viewer takes, to redraw. On 0xdd the lot
 //!    marks every room as not counted and both levels as waiting
 //!    ([`World::mark_all_rooms`]), after setting the brightest a lit
 //!    tile may be, 1 by day and 0.8 otherwise (0x466ba3, at 0x6c741c,
@@ -44,7 +47,9 @@
 //! **unverified**. The lot's subscriber forwards each signal to a second
 //! subscriber at lot 0x10 (0x416393) before its own cases; what that one
 //! is, and what it does with 0xdb and 0xf7, is **unverified**, and so is
-//! what the subscribers other than the lot do with 0xf8 and 0xdd. The
+//! what the subscribers other than the lot do with 0xdd (a scan of the
+//! cases they test finds it in none, but two handlers, 0x4a82db and
+//! 0x4c3ea5, were not read in full). The
 //! registry's pass also opens the game's special panels (registry words
 //! 0xe8 to 0x108) when a script asked for one; no ported primitive asks,
 //! so they never open here. When the pass showed a modal dialog the lot
@@ -79,6 +84,11 @@ const HOURS: usize = 0;
 /// Global 4: the time of day (0 day, 1 dusk, 2 night, 3 dawn).
 const TIME_OF_DAY: usize = 4;
 const MINUTES: usize = 5;
+/// The global that lets the lawn grow when the time of day changes
+/// (0x47b2e8: simulator +0x58), and the amount it grows by: signal
+/// 0xf8's parameter, which the clock sends as 5.
+const GROW_LAWN: usize = 36;
+const LAWN_GROWTH: i32 = 5;
 const SECONDS: usize = 6;
 /// Globals that make the scheduler's pass partial: 17, or 19 and 10 both.
 const PAUSED: usize = 17;
@@ -276,10 +286,16 @@ impl Interpreter<'_> {
             let period = time_of_day(global(world, HOURS)?);
             if period != global(world, TIME_OF_DAY)? {
                 set_global(world, TIME_OF_DAY, period)?;
-                // The interface's call (0x4c4648) and signal 0xf8 change
-                // nothing kept here; signal 0xdd makes the lot mark every
+                // The interface's call (0x4c4648) changes nothing kept
+                // here. Signal 0xf8 grows the lawn when global 36 is set
+                // (0x47b2e0), and signal 0xdd makes the lot mark every
                 // room (0x416446, 0x466ba3). See the module's
                 // documentation.
+                if global(world, GROW_LAWN)? != 0 {
+                    world
+                        .grow_grass(LAWN_GROWTH)
+                        .map_err(TickError::Unsupported)?;
+                }
                 world.mark_all_rooms();
             }
         }
