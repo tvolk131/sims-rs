@@ -461,3 +461,30 @@ fn a_person_the_load_does_not_reset_fails() {
     );
     assert_eq!(fx.world.encode(), before.encode());
 }
+
+#[test]
+fn the_load_restores_the_head_as_saved_and_does_not_relax_its_turn() {
+    // The saved heading, target heading, turn and target point (0x5918ba).
+    // The constructor's head clock equals the clock the restore read, so
+    // the head's step does not relax the turn (0x590788): a turn of 1.0
+    // stays 1.0. The target point is kept: a measurement whose target is
+    // gone reads it (0x5906bc).
+    let mut fx = lot();
+    let mut adult = sim(3, ADULT);
+    adult.person.as_mut().unwrap().floats = [1.0, 2.0, 1.0, 70.0, 16.0, 80.0, 0.0, 0.0, 0.0];
+    read(&mut fx, &file(vec![adult]), &people()).unwrap();
+    let head = fx.world.animators[&3].head;
+    let bits = |f: sims_core::F32| f.to_bits();
+    assert_eq!(
+        (
+            bits(head.heading),
+            bits(head.target_heading),
+            bits(head.turn)
+        ),
+        (1.0f32.to_bits(), 2.0f32.to_bits(), 1.0f32.to_bits())
+    );
+    assert_eq!(
+        head.target.map(|t| t.map(bits)),
+        Some([70.0f32, 16.0, 80.0].map(f32::to_bits))
+    );
+}

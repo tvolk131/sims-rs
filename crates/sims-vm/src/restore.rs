@@ -12,14 +12,15 @@
 //!    in that order. Each makes a layer in the skin ([`descriptor`]).
 //! 3. The routing state +0x190, which the reset sets to 3.
 //!
-//! Everything below assumes the person's reset in load step 13, which
+//! 4. The head: +0x210 the heading, +0x214 the target's heading, +0x218
+//!    the turn and +0x21c the target point; then the placement's
+//!    compensation (+0x8c, three floats).
+//!
+//! Everything here assumes the person's reset in load step 13, which
 //! runs only when the person's type's scripts changed since the save
 //! ([`sims_sim::World::changed_types`]). On the Goth house and the Newbie
 //! house every person's type has; on the Pleasants' none has. A person
 //! the load does not reset fails ([`Interpreter::restore_animator`]).
-//! 4. The head: +0x210 the heading, +0x214 the target's heading, +0x218
-//!    the turn and +0x21c the target point; then the placement's
-//!    compensation (+0x8c, three floats).
 //!
 //! Then (0x591c2e on): the clock is read (0x434101 with 0), the skin is
 //! updated with the layers at once (0x5992b3, forced), the animator is
@@ -27,8 +28,10 @@
 //! bones placed (0x5994c3), and the head takes its step (0x590768),
 //! measures (0x5904d2) and is restored (0x590b27). The person's data words
 //! are read after the animator, so that step sees the constructor's zero
-//! words: word 45 is 0 and bit 0 of word 42 is clear, so the turn relaxes
-//! and settles, and the measurement does not run. The animator's refresh
+//! words: bit 0 of word 42 is clear, so the measurement does not run. The
+//! head clock (+0x164) the constructor set equals the clock just read, so
+//! the step neither counts word 45 down nor relaxes the turn (0x590788);
+//! the turn only settles. The animator's refresh
 //! (virtual function 0x54 with 0, 0x58da12) reads the same clock again
 //! and changes nothing the simulation keeps.
 //!
@@ -36,8 +39,8 @@
 //! 0x104, 0x592878) but leaves the bones they posed and the skin's model
 //! matrix ([`sims_sim::animator::HeldPose`]). It leaves the head's fields.
 //!
-//! Not kept: the target point (+0x21c), which nothing reads before the
-//! measurement writes it; a layer's +0x5c, +0x78 and +0x7c, which the
+//! The target point (+0x21c) is kept: a measurement whose target object
+//! is gone reads it (0x5906bc). Not kept: a layer's +0x5c, +0x78 and +0x7c, which the
 //! restore sets and nothing ported reads. A compensation other than 0
 //! fails, since the placement adds it and that is not ported.
 
@@ -221,8 +224,10 @@ impl Interpreter<'_> {
         a.head.heading = F32::from_f32(floats[0]);
         a.head.target_heading = F32::from_f32(floats[1]);
         a.head.turn = F32::from_f32(floats[2]);
-        // 0x590768 with the constructor's zero data words.
-        a.head.relax();
+        a.head.target = Some([3, 4, 5].map(|i| F32::from_f32(floats[i])));
+        // 0x590768: the head clock (+0x164) the constructor set equals the
+        // clock the restore read (+0xb4), so the step skips the countdown
+        // and the relaxing (0x590788) and only settles.
         a.head.settle();
         Ok(Restored {
             animator: (a != LOADED).then_some(a),

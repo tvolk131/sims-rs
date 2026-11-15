@@ -2,14 +2,17 @@
 //! Goth house loads and steps one tick at a time to the state `sims boot`
 //! reaches.
 
-use sims_sim::Headline;
+use sims_sim::{Headline, World};
 use sims_vm::boot::{Frames, Lot, StepError};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 33 --answers 3`
 /// gives this hash with the default frames (snapshot format 27).
-const TICK_33: &str = "29d120a9a63fc70de5e8f289a8b0c18d6504eeb3f0cc4b572eb0c45ff7a0ae3b";
+const TICK_33: &str = "333c94279bfa54c27b9e14ae86e7622daea41f4af37c9ce4f1e055e16bb4280e";
+/// The same state's hash before the load kept the people's saved head
+/// targets ([`without_saved_targets`]).
+const TICK_33_UNTARGETED: &str = "29d120a9a63fc70de5e8f289a8b0c18d6504eeb3f0cc4b572eb0c45ff7a0ae3b";
 /// The same state's hash under snapshot format 27, which had no poses
 /// the load left in the skins ([`sims_sim::World::held_poses`]) at the end.
 const TICK_33_27: &str = "db1ce596748d8f9c5a39ba4197203ad261f354d545cc71a4ef8897d92bafba7d";
@@ -52,48 +55,67 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// The lot's encoding as snapshot format 27 wrote it: without the poses
+/// The world's encoding as snapshot format 27 wrote it: without the poses
 /// the load left in the skins ([`sims_sim::World::held_poses`]) that
 /// format 28 added at the end, so a state pinned under format 27 can be
 /// shown to be the same state but for them.
-fn format_27_bytes(lot: &Lot) -> Vec<u8> {
-    let mut bytes = lot.world().encode();
-    let held = postcard::to_allocvec(&lot.world().held_poses).unwrap();
+fn format_27_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let held = postcard::to_allocvec(&world.held_poses).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - held.len()), held);
     bytes
 }
 
-/// The lot's encoding as snapshot format 26 wrote it: without the
+/// The world's encoding as snapshot format 26 wrote it: without the
 /// neighborhood's data words ([`sims_sim::World::neighborhood_data`]) that
 /// format 27 added at the end, so a state pinned under format 26 can be
 /// shown to be the same state but for them.
-fn format_26_bytes(lot: &Lot) -> Vec<u8> {
-    let mut bytes = format_27_bytes(lot);
-    let data = postcard::to_allocvec(&lot.world().neighborhood_data).unwrap();
+fn format_26_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = format_27_bytes(world);
+    let data = postcard::to_allocvec(&world.neighborhood_data).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - data.len()), data);
     bytes
 }
 
-/// The lot's encoding as snapshot format 25 wrote it: without the record
+/// The world's encoding as snapshot format 25 wrote it: without the record
 /// of the bones the skins moved ([`sims_sim::World::translated_bones`])
 /// that format 26 added at the end either, so a state pinned under format
 /// 25 can be shown to be the same state but for it. It starts from
 /// [`format_26_bytes`].
-fn format_25_bytes(lot: &Lot) -> Vec<u8> {
-    let mut bytes = format_26_bytes(lot);
-    let moved = postcard::to_allocvec(&lot.world().translated_bones).unwrap();
+fn format_25_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = format_26_bytes(world);
+    let moved = postcard::to_allocvec(&world.translated_bones).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - moved.len()), moved);
     bytes
 }
 
-/// The lot's encoding as snapshot format 24 wrote it: without the base
+/// The world's encoding as snapshot format 24 wrote it: without the base
 /// layers ([`sims_sim::World::base_layers`]) that format 25 added at the
 /// end either. It starts from [`format_25_bytes`].
-fn format_24_bytes(lot: &Lot) -> Vec<u8> {
-    let mut bytes = format_25_bytes(lot);
-    let layers = postcard::to_allocvec(&lot.world().base_layers).unwrap();
+fn format_24_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = format_25_bytes(world);
+    let layers = postcard::to_allocvec(&world.base_layers).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - layers.len()), layers);
     bytes
+}
+
+/// The state as it was before the load kept each person's saved head
+/// target (animator +0x21c, 0x5918ba): every target still the one the
+/// load restored in `loaded` is cleared, as no measurement has written it,
+/// and an animator then equal to [`sims_sim::animator::LOADED`] is dropped.
+/// A state pinned before that change can be shown to be the same state but
+/// for those targets.
+fn without_saved_targets(world: &World, loaded: &World) -> World {
+    let mut old = world.clone();
+    for (id, animator) in old.animators.iter_mut() {
+        let saved = loaded.animators.get(id).and_then(|a| a.head.target);
+        if saved.is_some() && animator.head.target == saved {
+            animator.head.target = None;
+        }
+    }
+    old.animators
+        .retain(|_, animator| *animator != sims_sim::animator::LOADED);
+    old
 }
 
 #[test]
@@ -110,6 +132,7 @@ fn the_goth_house_steps_to_tick_33() {
     // The house saved camera direction 0, and the comparison harness saw
     // it open at rotation 0; Generic Sims Call 12 reads it.
     assert_eq!(lot.view_rotation(), 0);
+    let loaded = lot.world().clone();
     let start = lot.world().ticks;
     for tick in 1..=33 {
         lot.step().unwrap();
@@ -123,15 +146,19 @@ fn the_goth_house_steps_to_tick_33() {
     // No headline shows.
     assert!(lot.world().headlines.is_empty());
     assert_eq!(lot.world().hash_hex(), TICK_33);
-    assert_eq!(digest(&format_27_bytes(&lot)), TICK_33_27);
-    assert_eq!(digest(&format_26_bytes(&lot)), TICK_33_26);
-    assert_eq!(digest(&format_25_bytes(&lot)), TICK_33_25);
-    let mut bytes = format_24_bytes(&lot);
+    // A person whose head has not measured since the load still holds the
+    // target the save held; without them it is the state pinned before.
+    let old = without_saved_targets(lot.world(), &loaded);
+    assert_eq!(old.hash_hex(), TICK_33_UNTARGETED);
+    assert_eq!(digest(&format_27_bytes(&old)), TICK_33_27);
+    assert_eq!(digest(&format_26_bytes(&old)), TICK_33_26);
+    assert_eq!(digest(&format_25_bytes(&old)), TICK_33_25);
+    let mut bytes = format_24_bytes(&old);
     assert_eq!(digest(&bytes), TICK_33_24);
-    let headlines = postcard::to_allocvec(&lot.world().headlines).unwrap();
+    let headlines = postcard::to_allocvec(&old.headlines).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - headlines.len()), headlines);
     assert_eq!(digest(&bytes), TICK_33_23);
-    let families = postcard::to_allocvec(&lot.world().families).unwrap();
+    let families = postcard::to_allocvec(&old.families).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - families.len()), families);
     assert_eq!(digest(&bytes), TICK_33_22);
 }
@@ -489,10 +516,10 @@ fn strict_mode_takes_the_salesman_off_the_lot_at_tick_1104() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_1103);
-    assert_eq!(digest(&format_27_bytes(&lot)), TICK_1103_27);
-    assert_eq!(digest(&format_26_bytes(&lot)), TICK_1103_26);
-    assert_eq!(digest(&format_25_bytes(&lot)), TICK_1103_25);
-    assert_eq!(digest(&format_24_bytes(&lot)), TICK_1103_24);
+    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_1103_27);
+    assert_eq!(digest(&format_26_bytes(lot.world())), TICK_1103_26);
+    assert_eq!(digest(&format_25_bytes(lot.world())), TICK_1103_25);
+    assert_eq!(digest(&format_24_bytes(lot.world())), TICK_1103_24);
     // The salesman (GUID 0x44A86A6C, made by object 382 at tick 6).
     assert_eq!(lot.world().objects[&259].guid, 0x44A8_6A6C);
     let update = lot.step().unwrap();
@@ -622,10 +649,10 @@ fn strict_mode_runs_to_tick_9906_past_noon() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_2881);
-    assert_eq!(digest(&format_27_bytes(&lot)), TICK_2881_27);
-    assert_eq!(digest(&format_26_bytes(&lot)), TICK_2881_26);
-    assert_eq!(digest(&format_25_bytes(&lot)), TICK_2881_25);
-    assert_eq!(digest(&format_24_bytes(&lot)), TICK_2881_24);
+    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_2881_27);
+    assert_eq!(digest(&format_26_bytes(lot.world())), TICK_2881_26);
+    assert_eq!(digest(&format_25_bytes(lot.world())), TICK_2881_25);
+    assert_eq!(digest(&format_24_bytes(lot.world())), TICK_2881_24);
     // Each update is two game seconds, 30 a game minute, so a day is
     // 43,200 updates.
     assert_eq!(clock(&lot), (8, 6, 46));
@@ -633,10 +660,10 @@ fn strict_mode_runs_to_tick_9906_past_noon() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_3432);
-    assert_eq!(digest(&format_27_bytes(&lot)), TICK_3432_27);
-    assert_eq!(digest(&format_26_bytes(&lot)), TICK_3432_26);
-    assert_eq!(digest(&format_25_bytes(&lot)), TICK_3432_25);
-    assert_eq!(digest(&format_24_bytes(&lot)), TICK_3432_24);
+    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_3432_27);
+    assert_eq!(digest(&format_26_bytes(lot.world())), TICK_3432_26);
+    assert_eq!(digest(&format_25_bytes(lot.world())), TICK_3432_25);
+    assert_eq!(digest(&format_24_bytes(lot.world())), TICK_3432_24);
     assert_eq!(clock(&lot), (8, 25, 8));
     // Tick 3433: object 334, the lead of the car junk's group, snaps
     // itself to a place where it does not fit (0x454e82).
@@ -655,8 +682,8 @@ fn strict_mode_runs_to_tick_9906_past_noon() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_3602);
-    assert_eq!(digest(&format_27_bytes(&lot)), TICK_3602_27);
-    assert_eq!(digest(&format_26_bytes(&lot)), TICK_3602_26);
+    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_3602_27);
+    assert_eq!(digest(&format_26_bytes(lot.world())), TICK_3602_26);
     assert_eq!(clock(&lot), (8, 30, 48));
     // Tick 3603: object 354 (tree 0x1022) picks two neighbor records at
     // random, makes the person of each off the lot (Create New Object
@@ -741,8 +768,8 @@ fn a_newbie_gives_up_on_a_route_with_its_failure_feedback() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), NEWBIE_1802);
-    assert_eq!(digest(&format_27_bytes(&lot)), NEWBIE_1802_27);
-    assert_eq!(digest(&format_26_bytes(&lot)), NEWBIE_1802_26);
+    assert_eq!(digest(&format_27_bytes(lot.world())), NEWBIE_1802_27);
+    assert_eq!(digest(&format_26_bytes(lot.world())), NEWBIE_1802_26);
     // Tick 1803: object 290 (tree 0x1022) makes two neighbors' people off
     // the lot (Create New Object Instance mode 6, flag 0x4) and removes
     // them, as the Goths' object 354 does at tick 3603. Unverified: the

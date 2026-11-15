@@ -205,12 +205,14 @@ as the simulation reads it:
   now, and a person not placed since the load is placed where the load
   put it. The skin's first update with a layer drops them, and the
   bones they moved count as moved (`World::translated_bones`).
-- **The head.** The heading, the target's heading and the turn are
-  restored. The load's head step sees the constructor's zero data words
-  (the person's data is read after its animator), so the turn relaxes
-  once (x0.8) and settles; the measurement does not run. The events
-  seen (+0xa4) are kept; the reset clears +0xa0. The saved target point
-  is not kept: nothing reads it before the measurement writes it.
+- **The head.** The heading, the target's heading, the turn and the
+  target point are restored (a measurement whose target object is gone
+  reads the point, 0x5906bc). The load's head step sees the
+  constructor's zero data words (the person's data is read after its
+  animator), so the measurement does not run, and the constructor's head
+  clock equals the clock the restore read, so the turn is not relaxed
+  (0x590788); it only settles. The events seen (+0xa4) are kept; the
+  reset clears +0xa0.
 
 **Only after a reset.** Everything above assumes the person is reset
 at step 13 of the load, which happens only when its type's scripts
@@ -238,8 +240,12 @@ measurement writes it. Persons 241 and 243 keep their saved angles, as
 in the capture.
 
 **Strict runs.** The Goth and Newbie states are unchanged but for the
-new field: by tick 33 every Goth's skin has sampled a layer, and the
-pins' format-27 encodings equal the old hashes. The Newbie at tick 1802
+new field and the kept head targets: by tick 33 every Goth's skin has
+sampled a layer, and the pins' format-27 encodings equal the old hashes
+once the targets no measurement has written since the load are cleared.
+Those targets are what the save held (each Goth's is 0x00fdf000 three
+times, memory the original never set before saving), so the tick-33 pin
+moves; from tick 1103 on the Goth pins are unchanged. The Newbie at tick 1802
 is the same. The Pleasants now stop at the load, on person 117, the
 first person whose type did not change. UserData2's house 9 (whose
 people are all reset) gets past its first frame and stops at tick 232
