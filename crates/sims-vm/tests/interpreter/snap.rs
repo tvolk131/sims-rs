@@ -14,7 +14,7 @@ use sims_vm::Trap;
 
 const SNAP: u16 = 46;
 /// The person's tree that runs Snap.
-const TREE: u16 = 4200;
+pub(crate) const TREE: u16 = 4200;
 /// The lamp's SLOT chunk.
 const SLOTS: u16 = 300;
 /// Slot flags: the placement skips its checks, the direction follows the
@@ -23,7 +23,7 @@ const SKIP_CHECKS: u32 = 0x800;
 const TURNED: u32 = 0x1000;
 
 /// A routing slot at the object, with the given flags.
-fn slot(flags: u32) -> Slot {
+pub(crate) fn slot(flags: u32) -> Slot {
     Slot {
         kind: 3,
         offset: [0.0; 3],
@@ -44,7 +44,7 @@ fn slot(flags: u32) -> Slot {
 
 /// The person, made on the lamp's tile (2, 2) in room 1, facing 3, and
 /// the widget's file. The lamp has one routing slot with `flags`.
-fn snapper(flags: u32) -> (Fixture, u16) {
+pub(crate) fn snapper(flags: u32) -> (Fixture, u16) {
     let mut fx = person_widget();
     let before: Vec<u16> = fx.world.objects.keys().copied().collect();
     assert_eq!(create(&mut fx, 0, 0, SIM as i16), Ok(true));
@@ -64,7 +64,7 @@ fn snapper(flags: u32) -> (Fixture, u16) {
     (fx, me)
 }
 
-fn set_slots(fx: &mut Fixture, slots: Vec<Slot>) {
+pub(crate) fn set_slots(fx: &mut Fixture, slots: Vec<Slot>) {
     fx.program
         .libraries
         .get_mut(&LAMP_FILE)

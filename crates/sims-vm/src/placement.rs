@@ -461,6 +461,39 @@ pub(crate) fn first_on(world: &World, at: [i32; 2], level: i8) -> Option<u16> {
     head(world, [at[0] as i8, at[1] as i8, level])
 }
 
+/// The first object on a point's tile that is not passed over (0x43244d),
+/// the point given as the lot links objects (the first coordinate,
+/// object +0xf8, first). The tile's first object (0x43248a, 0x432500:
+/// none outside the lot's size or off levels 1 and 2), then each next
+/// one on the tile (slot 0, 0x432823), is passed over when its data word
+/// 8 has bit 2 set and bit 1 clear, or bit 2 clear and bit 4 set.
+pub(crate) fn first_kept_on(world: &World, at: [i32; 2], level: i32) -> Result<Option<u16>, Trap> {
+    let size = i32::from(world.size);
+    let column = i32::from((at[0] >> 4) as i8);
+    let row = i32::from((at[1] >> 4) as i8);
+    if !(0..size).contains(&column) || !(0..size).contains(&row) {
+        return Ok(None);
+    }
+    let mut next = read_head(world, at, level);
+    let mut seen = BTreeSet::new();
+    while let Some(id) = next {
+        if !seen.insert(id) {
+            return Err(Trap::Invalid("the objects on a tile link in a loop".into()));
+        }
+        let flags = datum(world, id, data::FLAGS)?;
+        let passed = if flags & 4 != 0 {
+            flags & 2 == 0
+        } else {
+            flags & 0x10 != 0
+        };
+        if !passed {
+            return Ok(Some(id));
+        }
+        next = slot(world, id, 0)?;
+    }
+    Ok(None)
+}
+
 /// The objects on the tile an object stands on, with everything they
 /// hold, in the order the lot links them, for scripts (Set To Next mode
 /// 8). None if the object is linked from no tile inside the lot's size.
@@ -577,6 +610,13 @@ impl Interpreter<'_> {
     }
 
     pub(crate) fn has_function(&self, world: &World, id: u16, function: usize) -> bool {
+        self.function_tree(world, id, function) != 0
+    }
+
+    /// The action tree an object's definition names for a function (the
+    /// first word of its callback entry, 0x457c38, 0x455fa9), or 0 for
+    /// none, a function past the table's end, or a missing object.
+    pub(crate) fn function_tree(&self, world: &World, id: u16, function: usize) -> u16 {
         world
             .objects
             .get(&id)
@@ -588,7 +628,7 @@ impl Interpreter<'_> {
                     .and_then(|l| l.callbacks.get(&definition.chunk))
             })
             .and_then(|table| table.get(function))
-            .is_some_and(|f| f.action != 0)
+            .map_or(0, |f| f.action)
     }
 
     /// Moves an object and everything it holds to a position (0x433e50).
