@@ -25,7 +25,10 @@ does what the original does (0x428041 from 0x4283cf;
    then 0 if the person's type is one of the family's members (0x41019b,
    the family's member list at +0x12c), then on a lot not zoned
    residential (0x40745f: the zoning of global 10's house, house 0
-   residential) a 0 becomes 1 again.
+   residential) a 0 becomes 1 again. Global 10 is read as it stands at
+   this step, not the house number the load was given: an object's Load
+   or Init tree may have changed it, so `World::finish_selection` takes
+   the neighborhood's zoning and reads the global itself.
 4. A neighborhood character who was a resident before the selection (word
    32 was 0 in the note taken at 0x42821a, `World::residents`) and is now
    a visitor is deleted (0x4285e2). The family number check after it is

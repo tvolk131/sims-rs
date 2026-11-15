@@ -1356,8 +1356,9 @@ fn the_goth_house_objects_are_constructed_and_read() {
 }
 
 /// Reading a person's interactions raises the action serial to the
-/// largest number among them, compared signed (0x41f320). The Goth
-/// people's are all 0; here two are given others.
+/// largest number among them, compared signed (0x41f320): each person's
+/// active, last and queued interactions. The Goth people's are all 0;
+/// here some are given others.
 #[test]
 fn reading_the_people_raises_the_action_serial() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
@@ -1386,10 +1387,23 @@ fn reading_the_people_raises_the_action_serial() {
             interpreter.read_objects(world, &objects, people).unwrap();
             assert_eq!(world.action_serial, 7);
             // A larger serial stays.
-            *world = before;
+            *world = before.clone();
             world.action_serial = 8;
             interpreter.read_objects(world, &objects, people).unwrap();
             assert_eq!(world.action_serial, 8);
+            // A queued interaction counts too.
+            *world = before;
+            let third = objects
+                .instances
+                .values_mut()
+                .filter_map(|i| i.person.as_mut())
+                .nth(2)
+                .unwrap();
+            let mut queued = third.active.clone();
+            queued.uid = 12;
+            third.queue.push(queued);
+            interpreter.read_objects(world, &objects, people).unwrap();
+            assert_eq!(world.action_serial, 12);
         },
     );
 }
@@ -1821,7 +1835,8 @@ fn selected(root: &std::path::Path, then: impl FnOnce(&Interpreter, &mut World, 
 /// The digests are of our own state, as built here. The first is the
 /// state after visit 201, pinned when the step stopped there.
 /// Load step 15 on the Goth lot (`World::finish_selection`). Its people
-/// are all of the family and the lot is residential, so which types are
+/// are all of the family and the lot (house 5) is zoned residential, so
+/// which types are
 /// the neighborhood's characters does not matter, and the residents noted
 /// before the selection are the people on the lot now.
 fn finish_goth_selection(world: &mut World, family: &sims_formats::neighborhood::Family) {
@@ -1833,7 +1848,7 @@ fn finish_goth_selection(world: &mut World, family: &sims_formats::neighborhood:
             members: &family.members,
             characters: &std::collections::BTreeSet::new(),
             residents: &residents,
-            residential: true,
+            zoning: &std::collections::BTreeMap::from([(5, 1)]),
         })
         .unwrap();
 }

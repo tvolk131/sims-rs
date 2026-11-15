@@ -573,17 +573,13 @@ impl Lot {
                         })
                     })
                     .collect();
-                // 0x40745f, 0x42b9e3: house 0 is residential; any other
-                // has the neighborhood's zoning.
-                let residential =
-                    number == 0 || program.zoning.get(&i16::try_from(number)?) == Some(&1);
                 world.finish_selection(&Household {
                     house: i32::try_from(number)?,
                     flags: record.flags,
                     members: &record.members,
                     characters: &characters,
                     residents: &residents,
-                    residential,
+                    zoning: &program.zoning,
                 })?;
                 let made_again = interpreter.announce_house(&mut world)?.is_some();
                 let sim =

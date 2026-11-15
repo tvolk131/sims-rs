@@ -206,9 +206,11 @@ pub struct Household<'a> {
     /// The people who were residents before the family was selected: see
     /// [`World::residents`].
     pub residents: &'a BTreeSet<u16>,
-    /// Whether the lot is zoned residential (0x40745f: the zoning of
-    /// global 10's house is 1).
-    pub residential: bool,
+    /// The neighborhood's zoning by house number. The lot is residential
+    /// when global 10, as it stands when the step runs, is 0 or a house
+    /// zoned 1 (0x40745f, 0x42b9e3). An object's Load or Init tree may
+    /// have changed global 10 since the house was chosen.
+    pub zoning: &'a BTreeMap<i16, i32>,
 }
 
 /// The ground level's object grid: for each tile, the ID of the first
@@ -774,7 +776,8 @@ impl World {
     /// 4. Who is a visitor is worked out again (0x42a2b4): each person's
     ///    word 32 becomes 0 if its type is one of the family's members
     ///    (0x41019b), and otherwise stays as it was, or 1 if it was 0; on
-    ///    a lot not zoned residential (0x40745f) a 0 becomes 1 too.
+    ///    a lot not zoned residential (0x40745f, read from global 10 now)
+    ///    a 0 becomes 1 too.
     /// 5. Each neighborhood character who was a resident before (in
     ///    `household.residents`, see [`World::residents`]) and is now a
     ///    visitor is deleted (0x428550). The original then checks the
@@ -825,6 +828,8 @@ impl World {
                 "the family's record asks for the lot to be reset (flag 4)".into(),
             ));
         }
+        let lot = self.globals[10];
+        let residential = lot == 0 || household.zoning.get(&lot) == Some(&1);
         let mut visitors = BTreeMap::new();
         for id in &people {
             let object = &self.objects[id];
@@ -835,7 +840,7 @@ impl World {
             if household.members.contains(&object.guid) {
                 visitor = 0;
             }
-            if !household.residential && visitor == 0 {
+            if !residential && visitor == 0 {
                 visitor = 1;
             }
             if character(object) && household.residents.contains(id) && visitor != 0 {
