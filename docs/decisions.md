@@ -4,27 +4,83 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
-## 2026-11-15: The game's pie menu is the simulation's listing, on a copy of the lot
+## 2026-11-15: The game lists the pie menu on the lot when the pointer reaches an object
 
-A click on an object or a person lists its menu with
-`Interpreter::pie_menu` (0x48d392): only the entries whose check passes
-for the selected Sim, in the original's order. Each is named by the
-TTAs strings with the ID of the TTAB the simulation reads, by its menu
-number, with "*" before it when the entry has flag 0x80. The listing
-runs on a copy of the lot's world and the copy's changes are dropped, as
-`docs/vision.md` requires of menu checks (they may draw random numbers,
-and run per player), although the original's check trees change the lot
-(person word 50 is left as the last check left it). Choosing an entry
-still queues it by its menu number (`Lot::queue_interaction`), which
-builds the action again from the lot's world, not the offered action
-itself (`Interpreter::pick`); where an earlier check on the copy made the
-person a visitor, the queued action's attenuation differs from the
-offered one's. Where the simulation has not ported something the listing
-needs (a trap of an unsupported kind, scope or primitive: the fridge's
-check tree adds an entry; an object offers nothing; a version 0 table),
-the menu shows every entry of the table without checks, debug entries
-hidden, and the note says why. Any other failure shows no menu. Reopen
-when `Lot` can queue an offered action.
+When the pointer first reaches an object or a person on the lot, the
+game lists the selected Sim's pie menu on it with `Lot::pie_menu`
+(0x48d392), as the original lists it then (0x48c834); the listing keeps
+what its check trees change, and its sounds are played with the steps'.
+A click opens that listing (or lists now, when the pointer did not move
+onto the object first). Only the entries whose check passes are shown,
+in the original's order, each named by the TTAs strings with the ID of
+the TTAB the simulation reads, by its menu number, with "*" before it
+when the entry has flag 0x80. Choosing one queues the very action
+offered (`Lot::pick`). Where the simulation has not ported something the
+listing needs (a trap of an unsupported kind, scope or primitive: the
+fridge's check tree adds an entry; an object offers nothing; a version 0
+table), the lot is unchanged, the menu shows every entry of the table
+without checks, debug entries hidden, queued by menu number
+(`Lot::queue_interaction`), and the note says why. Any other failure
+shows no menu.
+
+This runs menu checks on the shared simulation, where
+`docs/vision.md` ("Other rules") runs them on a throwaway copy per
+player. The original does it on the lot in single player, and #138 made
+`Lot` do the same; the vision's rule is for multiplayer and is to be
+settled there. Reopen when multiplayer lists menus, or when a recording
+shows a listing at another moment.
+
+## 2026-11-15: The lot lists pie menus and takes picks on the real lot
+
+`Lot::pie_menu(person, object)` and `Lot::pick(person, action)` run the
+interpreter's listing and pick on the lot itself, not on a copy, because
+the original's listing runs check trees that change the lot. A recording
+of play has to note each listing, at the moment the original makes it:
+when the cursor first reaches an object (0x48c834), not on the click. A
+listing or pick that fails on something not ported changes nothing and
+does not halt the lot, as for `Lot::queue_interaction`. The listing
+returns the sound requests its check trees made with the actions.
+
+On the Goth house the selected Sim can list and queue entries on several
+objects. Every entry on another person still fails on a queued action
+that runs at once (0x45d240). Reopen when a recording shows a listing at
+another moment, such as on a click.
+
+## 2026-11-15: People let go of an object that resets or is deleted
+
+Before an object resets, and when it is deleted, each person on the lot's
+list of people, in its order, lets go of it (0x444306 calling the
+person's reset 0x45e791 with the object; `crate::forget`). Objects that
+are not people are not told, and a person object not on the list is not
+told either. A person that does not use the object filters it out: the
+queued actions naming it are dropped, each one's target told it was
+cancelled (function 4, so an action on the object tells the object
+itself) and the rest kept in order; the last action naming it becomes
+the empty action, or loses the icon; the running action naming it ends.
+When the object is a person, route contexts asking it to move forget it.
+A person nested in a broadcast it set off is skipped, as the original's
+object flag 0x800 skips it; that flag is carried by the interpreter for
+the broadcast's length, not kept in the world. A person's own reset sets
+the same flag for its length, so its callbacks' broadcasts skip it too,
+and a reset of a person already flagged, which the original skips, fails
+loudly. A broadcast while the factory makes a person fails loudly, as
+any walk of the list of people does then. A cancel's fault keeps the
+tree and node it happened at, and a failure partway leaves the queue no
+longer than its ring of 8.
+
+A person using the object, or whose running action shows its icon, is
+reset fully by the original: its uses unwound and each used object reset,
+then its own reset. That is **not ported** and fails loudly.
+
+What the filter leaves naming the object, the original leaves as a
+pointer to freed memory: the last action after the running action ends,
+a route context aimed at an object that is not a person, frames whose
+stack object it was. Here they keep its ID, which a later object may be
+given. A deletion with a route aimed at the object still fails loudly
+before anything changes. Reopen when a capture shows a deletion with
+people on the lot; none of this is **verified**. Ported from the
+original's code; the old prototype's `person_reset.rs` reads it the same
+way. Play mode reached it at tick 1023 after a player's snack order.
 
 ## 2026-11-15: The game draws people into the lot with sims-people's depth test
 

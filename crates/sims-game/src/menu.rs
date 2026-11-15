@@ -11,31 +11,24 @@
 //! person's menu is mostly numbers, as where the original reads the rest
 //! is not found yet.
 //!
-//! **Listed on a copy.** Listing the menu runs the entries' check trees,
-//! which change the lot and may draw random numbers. The project's rule
-//! (`docs/vision.md`, "Other rules") runs them against a throwaway copy
-//! of the state, never the shared simulation, so the game lists the menu
-//! on a copy of the lot's world when the object is clicked and drops the
-//! copy's changes.
-//!
-//! **Still a stopgap in two ways.** Choosing an entry queues it by its
-//! menu number (`Lot::queue_interaction`), which builds the action again
-//! from the lot's own world without its check: where an earlier check on
-//! the copy changed what an action is built from (whether the person is
-//! a visitor, which sets its attenuation), the queued action differs from
-//! the one offered. `Lot` has no way yet to queue the offered action
-//! itself (`Interpreter::pick`). And the menu is a plain list at the
-//! pointer, in columns when it is taller than the view, not the
-//! original's pie.
+//! **Listed on the lot.** Listing the menu runs the entries' check
+//! trees, which change the lot as the original's do and may draw random
+//! numbers, so [`entries`] lists it with `Lot::pie_menu` on the lot
+//! itself, and the game calls it when the pointer first reaches an
+//! object (0x48c834), as the original does, not on the click. Choosing an
+//! entry queues the very action offered (`Lot::pick`).
 //!
 //! Where the simulation cannot list a menu yet (it fails loudly on what
 //! it has not ported: a check tree adding an entry, as the fridge's does;
 //! an object that offers nothing; a version 0 table; a pet; joining; an
-//! unported scope or primitive), the menu falls back to every entry of
-//! the table without checks (`every_entry`), and [`Listing::unchecked`]
-//! says why. Any other failure (a person who is not one, a check tree
-//! taking its error branch or running out of instructions) is an error:
-//! no menu is shown.
+//! unported scope or primitive), the lot is left as it was and the menu
+//! falls back to every entry of the table without checks
+//! (`every_entry`); [`Listing::unchecked`] says why, and choosing one
+//! queues it by its menu number (`Lot::queue_interaction`). Any other
+//! failure (a person who is not one, a check tree taking its error branch
+//! or running out of instructions, a halted lot) is an error: no menu is
+//! shown. The menu is a plain list at the pointer, in columns when it is
+//! taller than the view, not the original's pie.
 //!
 //! Which TTAB an object's entries come from, and which tile of a
 //! multi-tile object they go to, the simulation decides in code it keeps
@@ -53,7 +46,8 @@ use sims_ui::font::Font;
 use sims_ui::frame::{Frame, Rect};
 use sims_vm::DEFINITION_WORDS;
 use sims_vm::boot::Lot;
-use sims_vm::{Interpreter, Stream, Trap};
+use sims_vm::boot::OrderError;
+use sims_vm::{SoundEvent, Trap};
 use std::collections::BTreeMap;
 
 /// The language the labels are read in (US English).
@@ -63,41 +57,53 @@ const LANGUAGE: u8 = 1;
 const DEBUG: u32 = 0x80;
 
 /// One line of the menu.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Entry {
     /// The menu number the simulation queues by (the entry's string
     /// index).
     pub menu: u32,
     pub label: String,
+    /// The action the simulation offered, which choosing the entry
+    /// queues; None for the fallback's entries, queued by menu number.
+    pub action: Option<Interaction>,
 }
 
-/// A menu's entries, and why they are not the original's when they are
-/// not.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A menu's entries, the sounds its check trees asked for, and why the
+/// entries are not the original's when they are not.
+#[derive(Debug, Clone)]
 pub struct Listing {
     pub entries: Vec<Entry>,
+    /// The check trees' requests to the sound system, in order.
+    pub sounds: Vec<SoundEvent>,
     /// Why the simulation could not list the menu, when the entries are
     /// every entry of the table instead (see `every_entry`).
     pub unchecked: Option<String>,
 }
 
 /// What the pie menu offers `person` on `object`: the simulation's
-/// listing (see the module documentation), listed on a copy of the lot's
-/// world so the lot is not changed; or, where the simulation has not
-/// ported something the listing needs, every entry of the table, with
-/// the reason. Any other failure of the listing is an error.
-pub fn entries(lot: &Lot, assets: &Assets, person: u16, object: u16) -> Result<Listing, String> {
-    let interpreter = Interpreter::new(lot.program(), lot.catalog(), Stream::Global);
-    match interpreter.pie_menu(&mut lot.world().clone(), person, object) {
-        Ok(offered) => Ok(Listing {
-            entries: named(lot, assets, offered)?,
+/// listing on the lot (`Lot::pie_menu`, which keeps the changes its check
+/// trees make; see the module documentation); or, where the simulation
+/// has not ported something the listing needs, every entry of the table,
+/// with the reason, and the lot unchanged. Any other failure of the
+/// listing is an error.
+pub fn entries(
+    lot: &mut Lot,
+    assets: &Assets,
+    person: u16,
+    object: u16,
+) -> Result<Listing, String> {
+    match lot.pie_menu(person, object) {
+        Ok(menu) => Ok(Listing {
+            entries: named(lot, assets, menu.actions)?,
+            sounds: menu.sounds,
             unchecked: None,
         }),
-        Err(fault) if unported(&fault.trap) => Ok(Listing {
+        Err(OrderError::Refused(fault)) if unported(&fault.trap) => Ok(Listing {
             entries: every_entry(lot, assets, object)?,
+            sounds: Vec::new(),
             unchecked: Some(fault.to_string()),
         }),
-        Err(fault) => Err(fault.to_string()),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -144,7 +150,11 @@ fn named(lot: &Lot, assets: &Assets, offered: Vec<Interaction>) -> Result<Vec<En
             .filter(|l| !l.trim().is_empty())
             .map_or_else(|| format!("Interaction {menu}"), str::to_owned);
         let label = if debug { format!("*{name}") } else { name };
-        out.push(Entry { menu, label });
+        out.push(Entry {
+            menu,
+            label,
+            action: Some(action),
+        });
     }
     Ok(out)
 }
@@ -193,7 +203,11 @@ fn every_entry(lot: &Lot, assets: &Assets, object: u16) -> Result<Vec<Entry>, St
             .and_then(|l| l.get(menu as usize, LANGUAGE))
             .filter(|l| !l.trim().is_empty())
             .map_or_else(|| format!("Interaction {menu}"), str::to_owned);
-        out.push(Entry { menu, label });
+        out.push(Entry {
+            menu,
+            label,
+            action: None,
+        });
     }
     Ok(out)
 }
@@ -471,6 +485,7 @@ mod tests {
         Entry {
             menu,
             label: format!("entry {menu}"),
+            action: None,
         }
     }
 

@@ -31,7 +31,6 @@
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Machine};
 use crate::sounds::SoundEvent;
-use sims_formats::saved_objects::Person;
 use sims_sim::World;
 
 /// Off the lot: where the factory puts a new object.
@@ -101,33 +100,6 @@ impl Machine<'_, '_> {
     }
 }
 
-/// Whether a person refers to an object in a way the notification of its
-/// deletion acts on (the person's reset called with the object, 0x45e791,
-/// from 0x444306): the person is using it, its running, last or a queued
-/// action targets it, or one of those shows its icon.
-///
-/// A person told about an object it does not refer to this way changes
-/// nothing: the notification sets its guard flag, finds nothing to cancel
-/// or unwind, and clears the flag again. That is from the old prototype
-/// (phases 0 and 12 to 16 of `Reset::next`,
-/// legacy/crates/sims-vm/src/person_reset.rs), which compared its port
-/// with the original's code run alone. It was not compared with the
-/// running game: no capture holds a deletion on a lot with people.
-///
-/// The old prototype tests the frames of the person's thread that use an
-/// object; here the saved list of uses stands for them. When the object is
-/// itself a person the notification also drops route references to it;
-/// deleting a person is not ported at all.
-pub(crate) fn refers_to(person: &Person, id: u16) -> bool {
-    let names = |action: &sims_formats::saved_objects::Interaction| {
-        [action.target, action.icon].contains(&(id as i16))
-    };
-    names(&person.active)
-        || names(&person.last)
-        || person.queue.iter().any(names)
-        || person.object_uses.iter().any(|u| u.target == id as i16)
-}
-
 impl Interpreter<'_> {
     /// Load step 5: removes every object on the lot (0x44279a). First the
     /// two indicators in [`World::indicators`] (0x445f84), then whatever
@@ -191,8 +163,7 @@ impl Interpreter<'_> {
     /// Deletes an object that is off the lot (0x440eeb):
     ///
     /// 1. It gives up the ownership of interface events.
-    /// 2. Every person drops their references to it (0x444306) and the
-    ///    actions queued on it are cancelled.
+    /// 2. Every person lets go of it ([`crate::forget`], 0x444306).
     /// 3. It resets one last time ([`Interpreter::reset`]), which runs its
     ///    Reset tree if it has one.
     /// 4. The objects it holds are removed.
@@ -200,10 +171,10 @@ impl Interpreter<'_> {
     ///    unlinked from the registration list and from its type's
     ///    instance list, and its storage is freed.
     ///
-    /// Step 2 is ported for the case where it changes nothing: no person
-    /// refers to the object (`refers_to`). A person that does must cancel
-    /// actions and unwind its thread, which is not ported and fails before
-    /// anything has changed. Step 4 is not ported: an object holding
+    /// A person using the object fails in step 2 (`crate::forget`). A
+    /// route aimed at the object fails before anything changes: the
+    /// original leaves the route a pointer to the freed object. Step 4 is
+    /// not ported: an object holding
     /// another fails. A person and a tile of a multi-tile object have their
     /// own deletion, which fails too.
     ///
@@ -230,19 +201,6 @@ impl Interpreter<'_> {
                 "deleting a person or a multi-tile object is not ported".into(),
             )));
         }
-        // 0x444306 tells every other person, in the order of the game's
-        // list of people, that the object is going. A person that does not
-        // refer to it changes nothing, so that order does not matter here.
-        for (&other, person) in &world.objects {
-            if let Some(person) = &person.person
-                && refers_to(person, id)
-            {
-                return Err(fail(Trap::Unsupported(format!(
-                    "person {other} refers to object {id}; making a person drop an object \
-                     that is being deleted is not ported"
-                ))));
-            }
-        }
         // A route context holds a pointer to its slot's object
         // (context +0x48); what the original does with it when the object
         // goes is not known.
@@ -260,6 +218,7 @@ impl Interpreter<'_> {
         if world.event_owner == id {
             world.event_owner = 0;
         }
+        self.drop_references(world, id)?;
         self.reset(world, id, true)?;
         let object = world
             .objects

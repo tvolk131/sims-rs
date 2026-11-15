@@ -44,7 +44,6 @@ use crate::fault::{Fault, Trap};
 use crate::interpreter::{Asked, Interpreter};
 use crate::placement::capture;
 use crate::program::Tree;
-use crate::removal::refers_to;
 use sims_content::People;
 use sims_sim::World;
 
@@ -209,29 +208,6 @@ impl Interpreter<'_> {
         self.machine(world, id, 0, false)
             .refresh_flags()
             .map_err(fail)
-    }
-
-    /// Tells every person that an object is about to reset (0x444306). A
-    /// person that does not refer to the object changes nothing. One that
-    /// does must cancel actions and unwind its thread, which is not ported
-    /// and fails.
-    pub(crate) fn drop_references(&self, world: &World, id: u16) -> Result<(), Fault> {
-        for (&other, object) in &world.objects {
-            if let Some(person) = &object.person
-                && other != id
-                && refers_to(person, id)
-            {
-                return Err(Fault {
-                    object: id,
-                    at: None,
-                    trap: Trap::Unsupported(format!(
-                        "person {other} refers to object {id}; making a person drop an object \
-                         that resets is not ported"
-                    )),
-                });
-            }
-        }
-        Ok(())
     }
 
     /// Resets an object that has no Reset tree (0x431fbe, with 0x431be1):

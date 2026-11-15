@@ -158,16 +158,18 @@ fn the_fridge_and_the_bookshelf_offer_their_interactions() {
         .expect("the house opens")
         .assets;
     let person = lot.world().selected().expect("a Sim is selected");
-    let before = lot.world().hash();
-    // Every object's menu, or why it is not listed.
-    let menus: Vec<(u16, Result<sims_game::menu::Listing, String>)> = lot
-        .world()
-        .objects
-        .keys()
-        .map(|&id| (id, sims_game::menu::entries(&lot, &assets, person, id)))
-        .collect();
-    // Listing them all changed nothing in the lot.
-    assert_eq!(lot.world().hash(), before);
+    // Every object's menu, or why it is not listed. A listing the
+    // simulation could not make leaves the lot as it was.
+    let ids: Vec<u16> = lot.world().objects.keys().copied().collect();
+    let mut menus: Vec<(u16, Result<sims_game::menu::Listing, String>)> = Vec::new();
+    for id in ids {
+        let before = lot.world().hash();
+        let listing = sims_game::menu::entries(&mut lot, &assets, person, id);
+        if !listing.as_ref().is_ok_and(|l| l.unchecked.is_none()) {
+            assert_eq!(lot.world().hash(), before, "object {id}: {listing:?}");
+        }
+        menus.push((id, listing));
+    }
     let labels = |id: u16| -> Vec<String> {
         menus
             .iter()
@@ -206,16 +208,18 @@ fn the_fridge_and_the_bookshelf_offer_their_interactions() {
             .iter()
             .any(|m| m.entries.iter().any(|e| e.label.starts_with('*')))
     );
-    let entry = sims_game::menu::entries(&lot, &assets, person, shelf)
+    let entry = sims_game::menu::entries(&mut lot, &assets, person, shelf)
         .expect("the menu is listed")
         .entries
         .into_iter()
         .find(|e| e.label == "Read a Book")
         .expect("Read a Book");
-    assert!(matches!(
-        lot.queue_interaction(person, shelf, entry.menu),
-        Ok(Some(_))
-    ));
+    // Queued as choosing it does: the offered action, or by its number.
+    let queued = match entry.action.clone() {
+        Some(action) => lot.pick(person, action),
+        None => lot.queue_interaction(person, shelf, entry.menu),
+    };
+    assert!(matches!(queued, Ok(Some(_))), "{queued:?}");
     let queue = &lot.world().objects[&person].person.as_ref().unwrap().queue;
     assert!(
         queue
@@ -239,12 +243,24 @@ fn a_tile_offers_the_menu_of_the_tile_its_orders_go_to() {
         .assets;
     let person = lot.world().selected().expect("a Sim is selected");
     let mut redirected = Vec::new();
-    for &id in lot.world().objects.keys() {
+    let ids: Vec<u16> = lot.world().objects.keys().copied().collect();
+    // The menu numbers and labels a listing shows, or its error.
+    let shown = |listing: &Result<sims_game::menu::Listing, String>| {
+        listing.as_ref().map_err(String::clone).map(|l| {
+            let entries: Vec<(u32, String)> = l
+                .entries
+                .iter()
+                .map(|e| (e.menu, e.label.clone()))
+                .collect();
+            (entries, l.unchecked.clone())
+        })
+    };
+    for id in ids {
         let target = sims_game::menu::target(&lot, id).expect("a target");
-        let listing = sims_game::menu::entries(&lot, &assets, person, id);
+        let listing = sims_game::menu::entries(&mut lot, &assets, person, id);
         assert_eq!(
-            listing,
-            sims_game::menu::entries(&lot, &assets, person, target),
+            shown(&listing),
+            shown(&sims_game::menu::entries(&mut lot, &assets, person, target)),
             "object {id} and its target {target}"
         );
         if target != id
@@ -258,10 +274,11 @@ fn a_tile_offers_the_menu_of_the_tile_its_orders_go_to() {
     assert!(redirected.len() >= 8, "{}", redirected.len());
     // An order on such a tile goes where the menu said it would.
     let (tile, target, entry) = redirected[0].clone();
-    assert!(matches!(
-        lot.queue_interaction(person, tile, entry.menu),
-        Ok(Some(_))
-    ));
+    let queued = match entry.action.clone() {
+        Some(action) => lot.pick(person, action),
+        None => lot.queue_interaction(person, tile, entry.menu),
+    };
+    assert!(matches!(queued, Ok(Some(_))), "{queued:?}");
     let queue = &lot.world().objects[&person].person.as_ref().unwrap().queue;
     assert!(
         queue
@@ -277,8 +294,9 @@ fn a_menu_for_someone_who_is_not_a_person_is_an_error() {
         return;
     };
     let house = goth_house(&install);
-    let lot = sims_vm::boot::Lot::load(&install, &house, &[3], sims_vm::boot::Frames::default())
-        .expect("the Goth house boots");
+    let mut lot =
+        sims_vm::boot::Lot::load(&install, &house, &[3], sims_vm::boot::Frames::default())
+            .expect("the Goth house boots");
     let assets = open_house(&install, &house)
         .expect("the house opens")
         .assets;
@@ -291,6 +309,8 @@ fn a_menu_for_someone_who_is_not_a_person_is_an_error() {
         .expect("an object that is not a person")
         .0;
     // Not something unported: no fallback menu is shown.
-    let listing = sims_game::menu::entries(&lot, &assets, thing, person);
+    let before = lot.world().hash();
+    let listing = sims_game::menu::entries(&mut lot, &assets, thing, person);
     assert!(listing.is_err(), "{listing:?}");
+    assert_eq!(lot.world().hash(), before);
 }

@@ -103,6 +103,10 @@ pub struct Interpreter<'a> {
     /// tree that the listing runs, nested ones included. Add/Change Action
     /// String reads it.
     pub(crate) building_menu: bool,
+    /// The people in the middle of letting go of an object (object flag
+    /// 0x800, [`crate::forget`]), whom a broadcast it sets off skips. None
+    /// outside one.
+    pub(crate) letting_go: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -126,6 +130,7 @@ impl<'a> Interpreter<'a> {
             sounds: None,
             making_person: None,
             building_menu: false,
+            letting_go: None,
         }
     }
 
@@ -265,6 +270,7 @@ impl<'a> Interpreter<'a> {
             synchronous,
             making_person: self.making_person,
             building_menu: self.building_menu,
+            letting_go: self.letting_go,
             advertisements: None,
         }
     }
@@ -330,6 +336,8 @@ pub(crate) struct Machine<'a, 'w> {
     pub making_person: Option<u16>,
     /// See [`Interpreter::building_menu`].
     pub building_menu: bool,
+    /// See [`Interpreter::letting_go`].
+    pub letting_go: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
 }
 
 /// See [`Machine::advertisements`].
@@ -348,6 +356,7 @@ impl<'a> Machine<'a, '_> {
             sounds: self.sounds,
             making_person: self.making_person,
             building_menu: self.building_menu,
+            letting_go: self.letting_go,
         }
     }
 

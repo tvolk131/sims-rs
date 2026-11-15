@@ -2072,38 +2072,34 @@ through their public interfaces only; the simulation never depends on it.
   a book comes off the shelf, the fountain tinkles. `begin_route` and
   `end_route` have no event in the install's sound files and play
   nothing.
-- **Done: the pie menu from the simulation's listing.** Clicking an
-  object or a person opens the entries `Interpreter::pie_menu` offers
-  the selected Sim (each entry's check run, named by the TTAs strings of
-  the table it came from, with "*" before an entry with flag 0x80). The
-  listing runs on a copy of the lot and its changes are dropped, as
-  `docs/vision.md` requires of menu checks. Where the simulation has not
-  ported something the listing needs, the menu falls back to every
-  entry of the table (the stopgap of #126) and the note across the top
-  says why; any other failure shows no menu. Choosing an
-  entry queues it for the selected Sim with `Lot::queue_interaction`.
-  Escape closes the menu. The fridge (fallback) lists Have A Snack and
-  the meals; the bookshelf lists Read a Book and the studies.
-- **Blocked: a Sim doing what he is told.** Idle For Input starts a
-  queued order (#131) and a route names its slot from the global slots
-  (#134): Have A Snack queued on the fridge at tick 51 leaves the queue
-  by tick 151. At tick 154, another person (object 16, tree 0x2156
-  node 5) runs a slot search with seats (0x4835f0, not ported), which
-  stops the lot in strict mode. Without an order, strict mode runs to
-  tick 1102. Play mode with the order reaches tick 834, where a person
-  must drop an object being deleted (0x444306).
-- **Next:** queue the offered action itself with `pick` once `Lot` can;
-  then a real pie.
+- **Done: the pie menu from the simulation's listing.** When the
+  pointer first reaches an object or a person, the game lists the
+  selected Sim's menu on it with `Lot::pie_menu`, which changes the lot
+  as the original's listing does; a click opens it. The entries are
+  those whose check passes, named by the TTAs strings of the table they
+  came from, with "*" before an entry with flag 0x80; choosing one
+  queues the offered action with `Lot::pick`. Where the simulation has
+  not ported something the listing needs, the menu falls back to every
+  entry of the table, queued by menu number, and the note across the
+  top says why; any other failure shows no menu. Escape closes the menu.
+  The fridge (fallback, 0x458789) lists Have A Snack and the meals.
+- **Blocked: a Sim doing what he is told.** Have A Snack queued on the
+  fridge at tick 51 leaves the queue by tick 151. Strict mode stops at
+  tick 154: another person (object 16, tree 0x2156 node 5) runs a slot
+  search with seats (0x4835f0). Play mode runs 20,000 ticks after the
+  order without stopping, but at tick 634 Mortimer's snack fails on
+  Create New Object Instance mode 4 with flags 0x1 (tree 0x1019 node 1)
+  and he is parked ("dropping the frames of a person that is using an
+  object"); at tick 20051 his running interaction is still the snack.
+- **Next:** a real pie.
 - **Needs from other crates:**
-  - `sims-vm`: `Lot::pick(person, action)`, to queue the action the
-    menu offered (listed on a copy) rather than one built again from the
-    lot's world, which can differ from it. The listing fails today for the
-    fridge (Add/Change Action String in check tree 0x1012, 0x458789),
-    for objects offering nothing such as beds and walls (0x48d423), for
-    32 objects whose interaction table is version 0, and for object 18
-    (scope 12 in a check tree).
-  - `sims-vm`: a slot search with seats (0x4835f0) and dropping an
-    object being deleted (0x444306).
+  - `sims-vm`: listings that fail today: the fridge (Add/Change Action
+    String in check tree 0x1012, 0x458789); objects offering nothing
+    (0x48d423); 32 objects whose interaction table is version 0; check
+    trees 0x2071 (objects 4, 10, 253) and 0x2035 (object 18, scope 12).
+    Every entry on another person is refused at 0x45d240.
+  - `sims-vm`: a slot search with seats (0x4835f0), and Create New
+    Object Instance mode 4 with flags 0x1, which the snack makes.
   - `sims-render`: which object drew each pixel (an object ID buffer
     beside the depth), so a click picks the object under it. Today
     `sims-game` guesses from each object's tile.
