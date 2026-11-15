@@ -2140,6 +2140,9 @@ through their public interfaces only; the simulation never depends on it.
     game's speed global. A play-mode step that fails should still hand
     back the errors it caught before failing, and say which frame
     (before or after the tick) was skipped.
+  - `sims-people`: which person drew each pixel (`draw_on_lot` with an
+    owner per pixel), so `sims-game` need not repeat its drawing loop
+    to find the person a click lands on.
   - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
     and dialogs are. `sims-game` draws a plain list until then.
   - `sims-vm`: a route naming its slot from source 2 (0x45ac2e), and

@@ -72,10 +72,17 @@ fn people_stand_where_a_click_finds_them() {
     let mut canvas = Canvas::new(800, 600, [0, 0, 0]);
     sims_render::draw(world, &shape, &mut opened.assets, &view.camera, &mut canvas);
     let bare = canvas.color.clone();
+    let mut theirs = canvas.clone();
     let mut people = People::open(&install, &house).expect("the people's files");
     people.refresh(world);
     people.draw(world, &view.camera, &mut canvas);
     assert!(people.problems.is_empty(), "{:?}", people.problems);
+    // The game draws them as sims-people's own call does, pixel for pixel.
+    let mut reference = sims_people::People::open(&install, &house).expect("the people's files");
+    assert!(reference.update(world).is_empty());
+    let drawn = reference.draw_on_lot(world, &view.camera, &mut theirs);
+    assert!(drawn.people > 0 && drawn.problems.is_empty(), "{drawn:?}");
+    assert!(theirs.color == canvas.color && theirs.depth == canvas.depth);
     let drawn = bare
         .iter()
         .zip(&canvas.color)
@@ -88,12 +95,13 @@ fn people_stand_where_a_click_finds_them() {
     let changed: Vec<usize> = (0..bare.len())
         .filter(|&i| bare[i] != canvas.color[i])
         .collect();
-    for &i in changed.iter().step_by(7) {
+    for &i in &changed {
         let point = [(i % 800) as i32, (i / 800) as i32];
-        if let Some(id) = people.at(world, &view.camera, point) {
-            assert!(world.objects[&id].person.is_some(), "object {id}");
-            found.insert(id);
-        }
+        let id = people
+            .at(world, point)
+            .unwrap_or_else(|| panic!("nobody at {point:?}, which a person was drawn in"));
+        assert!(world.objects[&id].person.is_some(), "object {id}");
+        found.insert(id);
     }
     assert!(!found.is_empty(), "no drawn person is found by a click");
     let far = (0..bare.len())
@@ -106,11 +114,7 @@ fn people_stand_where_a_click_finds_them() {
         })
         .expect("a pixel far from every person");
     assert_eq!(
-        people.at(
-            world,
-            &view.camera,
-            [(far % 800) as i32, (far / 800) as i32]
-        ),
+        people.at(world, [(far % 800) as i32, (far / 800) as i32]),
         None
     );
     // Behind a lot nearer than everyone, nobody is drawn, and a click
@@ -120,7 +124,7 @@ fn people_stand_where_a_click_finds_them() {
     people.draw(world, &view.camera, &mut covered);
     for &i in changed.iter().step_by(7) {
         let point = [(i % 800) as i32, (i / 800) as i32];
-        assert_eq!(people.at(world, &view.camera, point), None, "{point:?}");
+        assert_eq!(people.at(world, point), None, "{point:?}");
     }
 }
 

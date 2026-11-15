@@ -344,7 +344,7 @@ impl Game {
         let camera = &self.view.camera;
         let target = self
             .people
-            .at(world, camera, point)
+            .at(world, point)
             .or_else(|| pick::object(world, &self.lot_shape, camera, point));
         let Some(target) = target else {
             return Outcome {

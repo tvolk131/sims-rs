@@ -18,11 +18,16 @@ Down), so on the second floor the people downstairs are hidden with
 their rooms. How the original gives a person's mesh its depth is
 **unverified** (see "People's meshes go into the lot renderer's canvas").
 
-A click finds a person only on a pixel they were drawn in the last frame
-(or within 2 pixels of one), the nearest whose standing box, placed as
-`sims-people` places them, holds the click. A person hidden behind a
-bookcase no longer takes a click meant for it, and one off the lot or
-upstairs of the view is not found.
+A click finds the person shown at that pixel in the frame on screen (or
+the one shown nearest within 2 pixels): while it draws the people, the
+game notes whose pixel the canvas took last at each point. A person
+hidden behind a bookcase is shown nowhere, so it no longer takes a click
+meant for the bookcase, and one off the lot or upstairs of the view is
+not found. `sims-people` does not say which person drew a pixel, so the
+game repeats `draw_on_lot`'s loop from its public parts (`posed`,
+`skin`, `draw_part`, `View`); a test checks that the frames are the
+same, colour and depth. Reopen when `sims-people` reports the person
+per pixel.
 
 ## 2026-11-15: Idle For Input starts a queued action; the pie menu's check
 
