@@ -4,6 +4,7 @@
 
 use crate::support::*;
 use sims_formats::behavior::{Interaction, InteractionTable};
+use sims_vm::Status;
 
 /// The lamp's interaction table (definition word 7, which counts up from
 /// 1000 in the synthetic definitions).
@@ -269,4 +270,163 @@ fn a_full_queue_takes_nothing_but_the_number_is_used() {
     let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 3), Ok(None));
     assert_eq!(fx.world.action_serial, serial + 2);
+}
+
+/// The Sim's tree 4096: Idle For Input asked to start the queued action,
+/// with parameter 0 as its count.
+const IDLE: u16 = 4096;
+
+/// The lot with the Sim idle (count 3) and the lamp's action tree a Sleep
+/// on its parameter 0. The Sim's order for menu 3 is queued with
+/// priority 50, above the Sim's 7, so it interrupts the wait.
+fn ordered() -> Fixture {
+    let mut fx = lot([0; 8]);
+    fx.add(
+        SIM_FILE,
+        IDLE,
+        tree(vec![ins(
+            17,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, 1, 0, 0, 0, 0, 0],
+        )]),
+    );
+    fx.add(
+        LAMP_FILE,
+        ACTION,
+        tree(vec![ins(0, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
+    );
+    fx.world.globals[10] = 4;
+    fx.program.zoning.insert(4, 1);
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    person.data[71] = 0;
+    // Word 73 clear (no footprint to work out again); an adult person,
+    // not a pet.
+    person.data[73] = 0;
+    person.data[58] = 30;
+    person.data[65] = 0;
+    person.motives = [0.0; 16];
+    fx.thread(SIM, IDLE, &[3]);
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 3), Ok(Some(1)));
+    fx
+}
+
+fn idle_turn(fx: &mut Fixture) -> (Status, Vec<sims_vm::Asked>) {
+    let asked = std::cell::RefCell::new(Vec::new());
+    let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.asked = Some(&asked);
+    let status = interpreter
+        .turn(&mut fx.world, SIM, 100)
+        .unwrap_or_else(|f| panic!("{f}"));
+    (status, asked.into_inner())
+}
+
+#[test]
+fn idle_for_input_starts_the_players_order() {
+    let mut fx = ordered();
+    fx.sim_mut().person.as_mut().unwrap().queue[0].args = [2, 0, 0, 0];
+    fx.sim_mut().temps[0] = 11;
+    let (status, asked) = idle_turn(&mut fx);
+    // The lamp's action tree runs on the Sim with the action's arguments
+    // and the lamp as its stack object, and sleeps.
+    assert_eq!(status, Status::Yielded);
+    assert!(asked.is_empty(), "{asked:?}");
+    let sim = fx.sim();
+    let [idle, action] = sim.stack.as_slice() else {
+        panic!("{:?}", sim.stack);
+    };
+    assert_eq!(
+        (idle.tree, idle.parameters[0], idle.primitive_state),
+        (IDLE, 0, 1)
+    );
+    assert_eq!((action.tree, action.stack_object), (ACTION, LAMP as i16));
+    assert_eq!(action.parameters[0], 1);
+    assert_eq!(sim.data[8] & 0x40, 0x40);
+    // It is the running action, off the queue, with the check's flags.
+    let person = sim.person.as_ref().unwrap();
+    assert!(person.queue.is_empty());
+    assert_eq!((person.active.uid, person.active.target), (1, LAMP as i16));
+    assert_eq!(person.active.flags & 0x1c, 0xc);
+    assert_eq!(person.data[33], 50);
+    assert_eq!(sim.temps[0], 11);
+    // When the action tree returns, Idle For Input looks again: nothing
+    // is queued or low, and the count is 0, so it is done.
+    assert_eq!(idle_turn(&mut fx).0, Status::Yielded);
+    assert_eq!(idle_turn(&mut fx).0, Status::Returned(true));
+    assert_eq!(fx.sim().data[8] & 0x40, 0);
+}
+
+#[test]
+fn after_an_action_only_one_pushed_to_the_front_is_started() {
+    for (flags, started) in [(0xd, false), (0xf, true)] {
+        // The first action sleeps a turn; another, of priority 60, is
+        // queued meanwhile and interrupts once it returns.
+        let mut fx = ordered();
+        fx.sim_mut().person.as_mut().unwrap().queue[0].args = [1, 0, 0, 0];
+        assert_eq!(idle_turn(&mut fx).0, Status::Yielded);
+        let person = fx.sim_mut().person.as_mut().unwrap();
+        let mut next = person.active.clone();
+        (next.uid, next.flags, next.args, next.priority) = (0, flags, [5, 0, 0, 0], 60);
+        person.queue.push(next);
+        let (status, _) = idle_turn(&mut fx);
+        let person = fx.sim().person.as_ref().unwrap();
+        if started {
+            assert_eq!(status, Status::Yielded, "flags {flags:#x}");
+            assert!(person.queue.is_empty());
+            assert_eq!(person.active.uid, 2);
+        } else {
+            assert_eq!(status, Status::Returned(true), "flags {flags:#x}");
+            assert_eq!(person.queue.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn a_refused_order_is_cancelled_on_its_target() {
+    // A target with data word 8 bit 9, a visitor without the entry's
+    // flag 1, or a check tree that returns false.
+    let refusals: [fn(&mut Fixture); 3] = [
+        |fx| fx.lamp_mut().data[8] |= 0x200,
+        |fx| fx.sim_mut().person.as_mut().unwrap().data[32] = 1,
+        |fx| {
+            fx.add(
+                LAMP_FILE,
+                4300,
+                // A Sleep on parameter 0, which the check sets to 0.
+                tree(vec![ins(0, RETURN_FALSE, RETURN_FALSE, [0; 8])]),
+            );
+            let table = fx
+                .program
+                .libraries
+                .get_mut(&LAMP_FILE)
+                .unwrap()
+                .interactions
+                .get_mut(&TABLE)
+                .unwrap()
+                .as_mut()
+                .unwrap();
+            table.interactions[0].test = 4300;
+        },
+    ];
+    for (case, refuse) in refusals.into_iter().enumerate() {
+        let mut fx = ordered();
+        refuse(&mut fx);
+        let before = format!("{:?}", fx.sim().person.as_ref().unwrap().active);
+        let (status, asked) = idle_turn(&mut fx);
+        assert_eq!(status, Status::Yielded, "case {case}");
+        let functions: Vec<_> = asked.iter().map(|a| (a.object, a.function)).collect();
+        assert_eq!(functions, [(LAMP, 4)], "case {case}");
+        let person = fx.sim().person.as_ref().unwrap();
+        assert!(person.queue.is_empty(), "case {case}");
+        assert_eq!(format!("{:?}", person.active), before, "case {case}");
+        assert_eq!(fx.sim().stack.len(), 1, "case {case}");
+    }
+    // An action with no target is dropped without asking anyone.
+    let mut fx = ordered();
+    fx.sim_mut().person.as_mut().unwrap().queue[0].target = 0;
+    let (status, asked) = idle_turn(&mut fx);
+    assert_eq!(status, Status::Yielded);
+    assert!(asked.is_empty());
+    assert!(fx.sim().person.as_ref().unwrap().queue.is_empty());
 }
