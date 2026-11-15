@@ -17,6 +17,8 @@
 //!   (samples), and lists the hit lists scripts pick samples from.
 //! - [`module`]: one HIT program with its HSM and HOT files.
 //! - [`fsc`]: ambient sound scores.
+//! - [`ambience`]: the player of those scores, as the original plays
+//!   them.
 //! - [`levels`]: volume, pan and pitch, from registers to gains and a
 //!   playback rate.
 //! - [`stations`]: the radio, television and music hit lists the
@@ -25,6 +27,7 @@
 //!   [`SoundEvent`]s, the simulation's only link to sound, and renders
 //!   PCM.
 
+pub mod ambience;
 pub mod decode;
 mod error;
 mod event;
