@@ -1569,8 +1569,11 @@ Progress:
   them to, as in the original. At the three compared cameras the house
   box rose from 74% to 89% (medium zoom), 76% to 89% (far zoom,
   rotation 0) and 74% to 89% (far zoom, rotation 3).
-- Next: lamps, which are not drawn; the cap where a cut wall meets a
-  standing one.
+- Done: objects held by others (lamps on end tables and counters, the
+  sink in a counter) stand on their holder's slot. The lamps were drawn
+  on the floor, inside their tables.
+- Next: the cap where a cut wall meets a standing one, and the extra
+  trim pieces at diagonal cut corners.
 
 ## Track: sound (`crates/sims-audio`)
 
