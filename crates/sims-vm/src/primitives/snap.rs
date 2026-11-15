@@ -97,7 +97,9 @@ use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
 use crate::placement::{Place, Refusal, closed_directions, on_lot};
 use crate::primitives::go_to_slot::GLOBAL_SLOTS;
-use crate::routing::slot::{direction, facing_cos_sin, route_slot, to_lot_units, to_world_units};
+use crate::routing::slot::{
+    direction, facing_cos_sin, route_slot, step, to_lot_units, to_world_units,
+};
 use crate::routing::walls_cross;
 use sims_core::{Ext, F32};
 use sims_sim::animator::{Animator, LOADED, UNSET};
@@ -209,33 +211,11 @@ impl Machine<'_, '_> {
             .ok_or(Trap::native(0x15, "Snap has no stack object"))?;
         let mode = word(operands, 2);
         let owner = match mode {
-            0..=2 => {
-                return Err(unsupported("0x4549c7", &format!("in mode {mode}")));
-            }
-            SLOT => target,
-            GLOBAL => GLOBAL_SLOTS,
+            1 | 2 => None,
+            0 => return Err(unsupported("0x454a4b", "in mode 0")),
+            SLOT => Some(target),
+            GLOBAL => Some(GLOBAL_SLOTS),
             _ => return Err(Trap::native(0x24, "Snap has an unknown mode")),
-        };
-        let guid = self.world.objects[&target].guid;
-        let definition = self.definition(guid)?;
-        let index = usize::try_from(word(operands, 0)).ok();
-        let (entry, type_slot) = if owner == GLOBAL_SLOTS {
-            index.and_then(|i| self.program.global_routing_slot(i))
-        } else {
-            index.and_then(|i| {
-                self.program
-                    .routing_slot(definition.resource, definition.chunk, i)
-            })
-        }
-        .ok_or(Trap::native(0x1b, "Snap names no slot"))?;
-        let key = (owner, word(operands, 0) as u16);
-        let slot = match self.world.routing.slots.get(&key) {
-            Some(record) => *record,
-            None => route_slot(
-                type_slot,
-                entry,
-                self.world.routing.slot_flags.get(&key).copied(),
-            ),
         };
         let facing = |machine: &Self, id: u16| -> Result<i32, Trap> {
             machine.world.objects[&id]
@@ -245,53 +225,31 @@ impl Machine<'_, '_> {
                 .map(i32::from)
                 .ok_or_else(|| Trap::Invalid(format!("object {id} has no data word {FACING}")))
         };
-        let direction = if slot.flags & TURNED != 0 {
-            let turn = (0..7).find(|bit| slot.flags & (1 << bit) != 0).unwrap_or(0);
-            facing(self, target)?.wrapping_add(turn)
-        } else {
-            facing(self, me)?
+        let (container, position, direction, skip_checks) = match owner {
+            None => {
+                // 0x4549d1 and 0x454a1d: the object's place, my own facing,
+                // and the placement's own checks.
+                let [p0, p1, level] = self.world.objects[&target].position;
+                let direction = facing(self, me)?;
+                if mode == 2 {
+                    let [first, second] = step(facing(self, target)?);
+                    let position = [p0.wrapping_add(second), p1.wrapping_add(first), level];
+                    (None, position, direction, false)
+                } else {
+                    if self.world.objects[&target].slots.len() < 2 {
+                        return Err(unsupported(
+                            "0x4550a0",
+                            "in mode 1 into an object with no container slot 0",
+                        ));
+                    }
+                    self.container_offset(target, 0)?;
+                    (Some((target, 0)), [p0, p1, level], direction, false)
+                }
+            }
+            Some(owner) => self.slot_place(owner, target, word(operands, 0))?,
         };
+        // 0x454d7a.
         let direction = direction.rem_euclid(8);
-        let position = self.world.objects[&target].position;
-        let container = if slot.snap_target >= 0 {
-            // The object's container records, its tile's chain first.
-            let records = self.world.objects[&target].slots.len();
-            if usize::try_from(slot.snap_target).is_ok_and(|s| s + 1 >= records) {
-                return Err(Trap::native(0x20, "Snap names no slot of the object"));
-            }
-            // The container slot's offset across, turned to the object's
-            // facing, is added to my animator's offset (0x454ceb to
-            // 0x454d5e), which is not kept.
-            let held = self
-                .program
-                .slots(definition.resource, definition.chunk)
-                .iter()
-                .filter(|entry| entry.kind == CONTAINER)
-                .nth(slot.snap_target as usize);
-            if held.is_some_and(|entry| {
-                entry.offset[..2]
-                    .iter()
-                    .any(|n| n.to_bits() & 0x7fff_ffff != 0)
-            }) {
-                return Err(unsupported(
-                    "0x454ceb",
-                    "into a container slot whose offset across moves my animator",
-                ));
-            }
-            Some((target, slot.snap_target))
-        } else {
-            None
-        };
-        let position = if container.is_none() {
-            let [x, y] = place_by_offset(
-                [position[0], position[1]],
-                [slot.offset[0], slot.offset[1]],
-                facing(self, target)?,
-            );
-            [x, y, position[2]]
-        } else {
-            position
-        };
         if operands[4] & 1 != 0 {
             return Err(unsupported(
                 "0x454c7a",
@@ -301,9 +259,7 @@ impl Machine<'_, '_> {
         let person = self.me()?.person.is_some();
         let to = [position[0], position[1]];
         let level = position[2];
-        let refusal = if slot.flags & SKIP_CHECKS == 0
-            && let Some(code) = self.may_stand(to, level)?
-        {
+        let refusal = if !skip_checks && let Some(code) = self.may_stand(to, level)? {
             Some(NotFit::Code(code))
         } else {
             let interpreter = self.interpreter();
@@ -355,6 +311,104 @@ impl Machine<'_, '_> {
             place(self.animator(), own, direction as i16);
         }
         Ok(true)
+    }
+
+    /// The place of modes 3 and 4 (0x454ac5 to 0x454c6d), from the routing
+    /// slot `index` of `owner`'s table (the stack object `target`'s, or
+    /// [`GLOBAL_SLOTS`]): the slot or the place, my direction, and whether
+    /// the slot skips the placement's own checks (flag 0x800). See steps 1
+    /// to 3 of the module's doc.
+    #[allow(clippy::type_complexity)]
+    fn slot_place(
+        &self,
+        owner: u16,
+        target: u16,
+        index: i16,
+    ) -> Result<(Option<(u16, i32)>, [i32; 3], i32, bool), Trap> {
+        let me = self.me;
+        let guid = self.world.objects[&target].guid;
+        let definition = self.definition(guid)?;
+        let at = usize::try_from(index).ok();
+        let (entry, type_slot) = if owner == GLOBAL_SLOTS {
+            at.and_then(|i| self.program.global_routing_slot(i))
+        } else {
+            at.and_then(|i| {
+                self.program
+                    .routing_slot(definition.resource, definition.chunk, i)
+            })
+        }
+        .ok_or(Trap::native(0x1b, "Snap names no slot"))?;
+        let key = (owner, index as u16);
+        let slot = match self.world.routing.slots.get(&key) {
+            Some(record) => *record,
+            None => route_slot(
+                type_slot,
+                entry,
+                self.world.routing.slot_flags.get(&key).copied(),
+            ),
+        };
+        let facing = |id: u16| -> Result<i32, Trap> {
+            self.world.objects[&id]
+                .data
+                .get(FACING)
+                .copied()
+                .map(i32::from)
+                .ok_or_else(|| Trap::Invalid(format!("object {id} has no data word {FACING}")))
+        };
+        let direction = if slot.flags & TURNED != 0 {
+            let turn = (0..7).find(|bit| slot.flags & (1 << bit) != 0).unwrap_or(0);
+            facing(target)?.wrapping_add(turn)
+        } else {
+            facing(me)?
+        };
+        let position = self.world.objects[&target].position;
+        let skip_checks = slot.flags & SKIP_CHECKS != 0;
+        if slot.snap_target >= 0 {
+            // The object's container records, its tile's chain first.
+            let records = self.world.objects[&target].slots.len();
+            if usize::try_from(slot.snap_target).is_ok_and(|s| s + 1 >= records) {
+                return Err(Trap::native(0x20, "Snap names no slot of the object"));
+            }
+            self.container_offset(target, slot.snap_target)?;
+            return Ok((
+                Some((target, slot.snap_target)),
+                position,
+                direction,
+                skip_checks,
+            ));
+        }
+        let [x, y] = place_by_offset(
+            [position[0], position[1]],
+            [slot.offset[0], slot.offset[1]],
+            facing(target)?,
+        );
+        Ok((None, [x, y, position[2]], direction, skip_checks))
+    }
+
+    /// The container slot `slot` of `target`: its offset across, turned
+    /// to the object's facing, is added to my animator's offset (0x454ceb
+    /// to 0x454d5e), which is not kept, so an offset that is not zero
+    /// fails loudly.
+    fn container_offset(&self, target: u16, slot: i32) -> Result<(), Trap> {
+        let guid = self.world.objects[&target].guid;
+        let definition = self.definition(guid)?;
+        let held = self
+            .program
+            .slots(definition.resource, definition.chunk)
+            .iter()
+            .filter(|entry| entry.kind == CONTAINER)
+            .nth(slot as usize);
+        if held.is_some_and(|entry| {
+            entry.offset[..2]
+                .iter()
+                .any(|n| n.to_bits() & 0x7fff_ffff != 0)
+        }) {
+            return Err(unsupported(
+                "0x454ceb",
+                "into a container slot whose offset across moves my animator",
+            ));
+        }
+        Ok(())
     }
 
     /// Flag bit 2's wall test for a place in a slot of `target` (0x45522c
