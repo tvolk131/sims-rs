@@ -14,12 +14,12 @@
 
 use crate::hud::Hud;
 use crate::menu::{self, Listing, Menu};
-use crate::pace::Pace;
+use crate::pace::{self, Pace};
 use crate::people::People;
 use crate::pick;
 use crate::view::{Move, View};
 use sims_render::{Canvas, Selected, Walls, open_house};
-use sims_ui::command::{Camera as UiCamera, Command, Walls as UiWalls};
+use sims_ui::command::{Camera as UiCamera, Command, Speed, Walls as UiWalls};
 use sims_vm::SoundEvent;
 use sims_vm::boot::{Frames, Lot, StepError};
 use sims_vm::play::{Recovery, ScriptError};
@@ -53,7 +53,8 @@ pub struct Options {
     pub house: PathBuf,
     /// Answers to the dialogs that offer a choice, in order, as with
     /// `sims boot --answers` (the Goths' house takes `3`, No to the Help
-    /// System). The player cannot answer them yet.
+    /// System). A dialog shown once they run out waits for the player
+    /// (`Lot::wait_for_answers`).
     pub answers: Vec<u8>,
     /// Step in play mode ([`Lot::step_play`]), which resets an object
     /// after its error and goes on, instead of strict mode ([`Lot::step`]),
@@ -111,8 +112,10 @@ impl Game {
     pub fn open(options: &Options) -> Result<Self, String> {
         let house = &options.house;
         let opened = open_house(&options.install, house).map_err(|e| e.to_string())?;
-        let lot = Lot::load(&options.install, house, &options.answers, Frames::default())
+        let mut lot = Lot::load(&options.install, house, &options.answers, Frames::default())
             .map_err(|e| format!("{}: {e}", house.display()))?;
+        // The player answers a dialog when it is shown.
+        lot.wait_for_answers();
         let stopped = lot
             .load_report()
             .stopped
@@ -207,17 +210,118 @@ impl Game {
         &self.people.problems
     }
 
-    /// Runs the ticks owed after `elapsed_us` more microseconds. Returns
-    /// how many ran.
-    pub fn advance(&mut self, elapsed_us: u64) -> u32 {
-        let due = self.pace.due(elapsed_us);
-        self.run(due)
+    /// Sets the game's speed, as the panel's speed buttons do in live
+    /// mode (`0x53a62a`, `0x53a6ad`, `0x53a728`): a paused game runs
+    /// again (the original applies it after the speed; both restart the
+    /// same clocks, so the order does not matter), and the simulation's speed ([`Lot::set_speed`]) and the
+    /// time between ticks with it are set, unless the speed is already
+    /// the one asked for (`0x4ce588`), when the time owed carries on. A
+    /// lot that cannot take it keeps its speed, and the note across the
+    /// top says why.
+    pub fn set_speed(&mut self, speed: Speed) {
+        let level = pace::level(speed);
+        let result = if self.paused() {
+            self.lot.unpause().map(|_| self.pace.restart())
+        } else {
+            Ok(())
+        };
+        let result = result.and_then(|()| {
+            if self.lot.world().speed() == level {
+                self.pace.speed = speed;
+                return Ok(());
+            }
+            self.lot
+                .set_speed(i32::from(level))
+                .map(|_| self.pace.set_speed(speed))
+        });
+        if let Err(e) = result {
+            self.note = Some(format!("The speed was not changed: {e}"));
+        }
     }
 
-    /// Runs up to `ticks` ticks, stopping at the first that fails.
+    /// Whether the game is paused (global 17).
+    pub fn paused(&self) -> bool {
+        self.lot.world().paused()
+    }
+
+    /// Pauses the game, or runs it again, as the panel's pause button
+    /// does. A paused lot goes on ticking, with its clock standing
+    /// ([`Lot::pause`]).
+    pub fn toggle_pause(&mut self) {
+        let result = if self.paused() {
+            self.lot.unpause().map(|_| self.pace.restart())
+        } else {
+            self.lot.pause().map(|_| ())
+        };
+        if let Err(e) = result {
+            self.note = Some(format!("The pause was not changed: {e}"));
+        }
+    }
+
+    /// Runs the ticks owed after `elapsed_us` more microseconds at the
+    /// simulation's speed. Returns how many ran.
+    ///
+    /// While a dialog waits for the player, no time is owed: the game
+    /// waits, as the original does, and the idle loop's speed is not set
+    /// (the lot takes nothing between ticks then; **unverified** whether
+    /// the original's idle loop sets it while its dialog is up).
+    ///
+    /// Each call is a pass of the original's idle loop, so it first sets
+    /// the idle loop's own speed ([`Lot::idle_speed`]), whether a tick is
+    /// owed or not, paused or not: a speed the player picks after that
+    /// stands. The same check runs again before each tick owed. Whenever
+    /// it calls the setter, even for the speed the game already has, the
+    /// time owed starts again and no more ticks run in this call, as the
+    /// setter restarts the original's clocks. The original may then run
+    /// an update at once, when its second clock (`0x4732de`) is ready
+    /// (`0x46da1b`); here the next tick waits a period of the new speed
+    /// (**unverified**, and the window's timing, not the simulation's).
+    pub fn advance(&mut self, elapsed_us: u64) -> u32 {
+        if self.lot.asking().is_some() {
+            self.pace.restart();
+            return 0;
+        }
+        if self.idle_speed() {
+            return 0;
+        }
+        let due = self.pace.due(elapsed_us, self.lot.world().speed());
+        self.run_while(due, true)
+    }
+
+    /// Sets the idle loop's own speed between ticks ([`Lot::idle_speed`]).
+    /// True if it called the setter, which starts the time owed again.
+    fn idle_speed(&mut self) -> bool {
+        // A lot that cannot take it (halted, or not loaded) has stopped,
+        // and the banner says why.
+        let set = self.lot.idle_speed().unwrap_or(false);
+        if set {
+            self.pace.restart();
+        }
+        set
+    }
+
+    /// The dialog the lot waits on, if it waits for the player.
+    pub fn asking(&self) -> Option<&sims_vm::boot::Asking> {
+        self.lot.asking()
+    }
+
+    /// Where the dialog shown in the last frame drawn is, and its buttons.
+    pub fn dialog(&self) -> Option<&sims_ui::dialog::Layout> {
+        self.hud.dialog()
+    }
+
+    /// Runs up to `ticks` ticks, stopping at the first that fails or that
+    /// shows a dialog the player has to answer.
     pub fn run(&mut self, ticks: u32) -> u32 {
+        self.run_while(ticks, false)
+    }
+
+    /// Runs up to `ticks` ticks, stopping at the first that fails, and,
+    /// if `idle`, before a tick the idle loop's speed sets the speed for
+    /// ([`Game::idle_speed`]).
+    fn run_while(&mut self, ticks: u32, idle: bool) -> u32 {
         let mut ran = 0;
-        while ran < ticks && self.stopped.is_none() {
+        while ran < ticks && self.stopped.is_none() && !(idle && self.idle_speed()) {
             let step = if self.play {
                 self.lot.step_play()
             } else {
@@ -231,6 +335,12 @@ impl Game {
                         self.errors.push(at, line);
                     }
                     self.keep_sounds(update.sounds);
+                }
+                // The tick shows a dialog: it runs once it is answered,
+                // and no time is owed from before the wait.
+                Err(StepError::Asking { .. }) => {
+                    self.pace.restart();
+                    break;
                 }
                 Err(error) => {
                     // A strict step whose frame failed after its tick ran
@@ -322,10 +432,24 @@ impl Game {
             &mut self.canvas,
         );
         self.people.draw(world, &self.view.camera, &mut self.canvas);
+        // The pie menu shows the head of the Sim it is for, as posed now.
+        if let Some(menu) = &mut self.hud.menu {
+            menu.head = match self.people.head(world, menu.person, menu.face_size()) {
+                Ok(head) => Some(head),
+                Err(e) => {
+                    self.people
+                        .note(vec![format!("the pie menu has no head: {e}")]);
+                    None
+                }
+            };
+        }
         let status = self.status();
+        // A dialog the lot waits on is in the lot as the tick left it when
+        // it was shown.
+        let dialogs = self.lot.asking().map_or(world, |a| &a.world);
+        self.hud.read_dialog(dialogs, &self.assets);
         self.hud.draw(
             world,
-            &self.assets,
             &self.view,
             &self.pace,
             status.as_deref(),
@@ -401,10 +525,12 @@ impl Game {
         Outcome::redraw()
     }
 
-    /// The pointer left the window: it is on no object.
-    pub fn leave(&mut self) {
+    /// The pointer left the window: it is on no object, button or
+    /// portrait. True if the frame changes.
+    pub fn leave(&mut self) -> bool {
         self.pointer = None;
-        self.follow();
+        let redraw = self.hud.leave();
+        self.follow() || redraw
     }
 
     /// Follows the object under the pointer in the frame last drawn: when
@@ -436,10 +562,7 @@ impl Game {
     /// The person or object shown at `point` on the lot in the frame last
     /// drawn.
     pub fn under(&self, point: [i32; 2]) -> Option<u16> {
-        let world = self.lot.world();
-        self.people
-            .at(world, point)
-            .or_else(|| pick::object(world, &self.lot_shape, &self.view.camera, point))
+        pick::at(self.lot.world(), &self.canvas, point)
     }
 
     /// Lists the selected Sim's pie menu on `object` (`Lot::pie_menu`,
@@ -507,6 +630,17 @@ impl Game {
         }
     }
 
+    /// The control panel as it was last laid out, from the world as it
+    /// was when the frame was drawn ([`Game::render`]).
+    pub fn panel(&self) -> &[sims_ui::hud::Item] {
+        self.hud.items()
+    }
+
+    /// The first name the panel shows for people of type `guid`.
+    pub fn name(&self, guid: u32) -> Option<&str> {
+        self.hud.name(guid)
+    }
+
     /// The pie menu, while one is open. Its labels are placed when the
     /// game is rendered.
     pub fn menu(&self) -> Option<&Menu> {
@@ -542,6 +676,34 @@ impl Game {
         });
     }
 
+    /// Answers the dialog `caller` shows with its button `button` (0 the
+    /// first): the answer the button gives (`Shown::answers`) goes to the
+    /// lot, and the tick that showed it runs again at once.
+    pub fn answer(&mut self, caller: u16, button: u8) {
+        let Some(asking) = self.lot.asking() else {
+            self.note = Some("No dialog waits for an answer.".into());
+            return;
+        };
+        if asking.shown.object != caller {
+            self.note = Some(format!(
+                "The dialog shown is object {}'s, not object {caller}'s.",
+                asking.shown.object
+            ));
+            return;
+        }
+        let Some(&answer) = asking.shown.answers.get(usize::from(button)) else {
+            self.note = Some(format!("The dialog has no button {button}."));
+            return;
+        };
+        if let Err(e) = self.lot.answer(answer) {
+            self.note = Some(format!("The answer was not taken: {e}"));
+            return;
+        }
+        // The tick that showed the dialog runs again now, with the answer,
+        // so nothing is listed or ordered on the lot as it was before it.
+        self.run(1);
+    }
+
     /// Selects the Sim `sim`, as a press on its portrait does
     /// (`Lot::select`, 0x445449), keeping the sounds that made. A menu
     /// listed for the Sim selected before is dropped.
@@ -572,11 +734,11 @@ impl Game {
         };
         match command {
             Command::SetSpeed(speed) => {
-                self.pace.set_speed(speed);
+                self.set_speed(speed);
                 Outcome::redraw()
             }
             Command::TogglePause => {
-                self.pace.toggle_pause();
+                self.toggle_pause();
                 Outcome::redraw()
             }
             Command::Camera(camera) => match camera {
@@ -624,6 +786,10 @@ impl Game {
             }
             Command::Select { sim } => {
                 self.select(sim);
+                Outcome::redraw()
+            }
+            Command::AnswerDialog { caller, button } => {
+                self.answer(caller, button);
                 Outcome::redraw()
             }
             Command::TogglePanel | Command::OpenPanel(_) => Outcome::redraw(),

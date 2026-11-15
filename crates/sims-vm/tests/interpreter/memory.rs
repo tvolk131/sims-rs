@@ -511,15 +511,21 @@ fn job_data_without_a_career_table_names_the_loader() {
 
 #[test]
 fn the_advertisement_record_is_the_one_find_best_interaction_last_copied() {
-    // Before the first copy the record holds what the game's start left
-    // there, which is not read.
+    // Before the first copy the record holds the sixteen zeroed
+    // advertisements the game's start leaves (0x475e23).
     for scope in [12, 28, 29] {
-        let fault = read(&mut Fixture::new(), scope, 0).unwrap_err();
-        let Trap::Unsupported(text) = &fault.trap else {
-            panic!("{fault}");
-        };
-        assert!(text.contains("0x6e5100"), "{text}");
+        assert!(reads(&mut Fixture::new(), scope, 15, 0));
     }
+    let mut fx = Fixture::new();
+    assert_eq!(write(&mut fx, 12, 3, 7), Ok(true));
+    let record = fx.world.advertisement_record.unwrap();
+    assert_eq!(record[3].delta, 7);
+    assert!(
+        record
+            .iter()
+            .enumerate()
+            .all(|(i, ad)| i == 3 || *ad == Default::default())
+    );
     // After it, any tree reads and writes the record: the personality
     // number (28), the minimum (29) and the delta (12), sixteen of them.
     let mut fx = Fixture::new();
