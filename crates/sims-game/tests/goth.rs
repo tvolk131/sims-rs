@@ -229,6 +229,7 @@ fn the_plumb_bob_spins_by_the_time_passed_in() {
     assert_eq!(game.run(100), 100);
     game.resize([800, 600]);
     let before = game.render().rgb565();
+    assert!(!game.spin_due());
     let standing = game.lot().world().hash();
     // Short of a tick each time, so the lot stands still while half a
     // second passes: a quarter turn of the bob (half a turn a second).
@@ -237,7 +238,10 @@ fn the_plumb_bob_spins_by_the_time_passed_in() {
         assert_eq!(game.advance(40_000), 0);
     }
     assert_eq!(game.lot().world().hash(), standing);
+    // No tick ran, but the bob is due a new frame, so the window draws.
+    assert!(game.spin_due());
     let after = game.render().rgb565();
+    assert!(!game.spin_due());
     let changed: Vec<usize> = (0..before.len())
         .filter(|&i| before[i] != after[i])
         .collect();

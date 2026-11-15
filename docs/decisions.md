@@ -28,7 +28,9 @@ a memory image, except where it says otherwise.
   half a turn a second. We have no such clock, so the game window passes
   the time it has run (`People::set_clock`, from `Game::advance`). That
   time runs on while the lot is paused or a dialog waits; whether the
-  original's clock does is **unverified**.
+  original's clock does is **unverified**. While a bob is on the lot,
+  the window draws a new frame every 50 ms even when no tick runs (our
+  choice; the original's frame rate is not ported).
 - **Colour.** The suit's name sets a mode (`head-arrow` 1,
   `head-arrow-date` 2, `head-star` 3, 0x5856db to 0x58579f). In mode 1,
   m is the mood (motive 3 cut to an integer) × 0.012, held to −1..1.

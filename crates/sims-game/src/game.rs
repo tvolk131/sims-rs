@@ -81,6 +81,11 @@ impl Outcome {
     }
 }
 
+/// How often the window draws the plumb bob's spin when nothing else
+/// changes: 20 frames a second, this crate's choice (the original's frame
+/// rate is not ported).
+pub const SPIN_FRAME_US: u64 = 50_000;
+
 pub struct Game {
     lot: Lot,
     lot_shape: sims_render::Lot,
@@ -108,6 +113,8 @@ pub struct Game {
     /// The time the window has passed in, in microseconds: the clock
     /// that spins the plumb bob.
     clock_us: u64,
+    /// `clock_us` when the frame was last drawn.
+    drawn_us: u64,
     canvas: Canvas,
 }
 
@@ -149,6 +156,7 @@ impl Game {
             listed: None,
             note: None,
             clock_us: 0,
+            drawn_us: 0,
             canvas: Canvas::new(1, 1, [0, 0, 0]),
         })
     }
@@ -271,6 +279,19 @@ impl Game {
         if let Err(e) = result {
             self.note = Some(format!("The pause was not changed: {e}"));
         }
+    }
+
+    /// Whether the plumb bob has spun enough since the frame was drawn to
+    /// draw it again, though no tick ran (as while a dialog waits): a
+    /// plumb bob is on the lot and [`SPIN_FRAME_US`] have passed.
+    pub fn spin_due(&self) -> bool {
+        self.clock_us.saturating_sub(self.drawn_us) >= SPIN_FRAME_US
+            && self
+                .lot
+                .world()
+                .objects
+                .values()
+                .any(|o| o.guid == sims_people::bob::STANDARD)
     }
 
     /// Runs the ticks owed after `elapsed_us` more microseconds at the
@@ -451,6 +472,7 @@ impl Game {
         // original's 0x6e54e0); here the time passed in, which runs on
         // while the lot is paused or a dialog waits (**unverified**
         // whether the original's does).
+        self.drawn_us = self.clock_us;
         let milliseconds = (self.clock_us / 1000) as u32;
         self.people.set_clock(milliseconds);
         self.people.draw(world, &self.view.camera, &mut self.canvas);
