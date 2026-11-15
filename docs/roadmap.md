@@ -1970,6 +1970,10 @@ Progress:
   tables (grass takes none in the original). Far zoom at rotation 2
   rose from 90.1% to 90.3% exact; of the pixels they change, 70% now
   match exactly and the rest are mostly a step off.
+- Done: a floor tile split by a diagonal wall takes the blade count of
+  the tile drawn before it, as the original carries it from tile to
+  tile. Near zoom rose from 86.5% to 87.0% exact; of the 2,402 pixels it
+  changes, 2,115 now match.
 - Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
   grass and a light sprite in the original); the
   edge-on texel offset and side; a screenshot with a marked edge-on
