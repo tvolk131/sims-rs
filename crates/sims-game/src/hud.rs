@@ -247,6 +247,12 @@ impl Hud {
         ) != before
     }
 
+    /// The pointer left the window: no button is hovered and no name
+    /// shows. True if the pointer was in it, so the frame changes.
+    pub fn leave(&mut self) -> bool {
+        self.controls.pointer.take().is_some()
+    }
+
     /// Where the pointer is to be moved, as the original moves it when a
     /// pie menu opens; the panel's pointer is moved there.
     pub fn take_pointer(&mut self) -> Option<[i32; 2]> {

@@ -37,6 +37,13 @@ after every batch of ticks. What is new:
   We believe it shows one on hovering a portrait, but no capture has
   been compared. The box's look (the needs panel's label color on
   black, font 8) is ours. Reopen when the harness can hover a portrait.
+  The box is as tall as the font's line with 2 pixels above and below,
+  so descenders stay inside it, and its bottom is 2 pixels above the
+  strip. It is kept inside the frame: a name wider than the frame is cut
+  short. The name goes when the pointer leaves the window. (Sol's review
+  of the first version found the box overflowing at extreme rects,
+  descenders below it, the box off the top of a short window, and the
+  name staying after the pointer left.)
 
 ## 2026-11-15: Pausing holds the sounds playing, as the original's sound manager does
 

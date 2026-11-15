@@ -469,6 +469,13 @@ fn a_snack_is_chosen_from_the_fridges_pie() {
         game.panel().iter().any(|i| i.kind == Kind::Name { guid }),
         "no name over the portrait"
     );
+    // The pointer leaving the window takes the name away.
+    assert!(game.leave(), "leaving does not redraw");
+    game.render();
+    assert!(
+        !game.panel().iter().any(|i| i.kind == Kind::Name { guid }),
+        "the name stays after the pointer left"
+    );
 }
 
 /// What the panel shows of the lot, as text, and the selected Sim's

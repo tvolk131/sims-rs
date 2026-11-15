@@ -401,10 +401,12 @@ impl Game {
         Outcome::redraw()
     }
 
-    /// The pointer left the window: it is on no object.
-    pub fn leave(&mut self) {
+    /// The pointer left the window: it is on no object, button or
+    /// portrait. True if the frame changes.
+    pub fn leave(&mut self) -> bool {
         self.pointer = None;
-        self.follow();
+        let redraw = self.hud.leave();
+        self.follow() || redraw
     }
 
     /// Follows the object under the pointer in the frame last drawn: when

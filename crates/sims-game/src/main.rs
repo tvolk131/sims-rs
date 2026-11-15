@@ -481,7 +481,10 @@ impl ApplicationHandler for App {
                 (MouseButton::Right, ElementState::Released) => self.drag = None,
                 _ => {}
             },
-            WindowEvent::CursorLeft { .. } => self.game.leave(),
+            WindowEvent::CursorLeft { .. } => {
+                let redraw = self.game.leave();
+                self.changed(redraw);
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
                 let point = self.point(position);

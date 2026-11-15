@@ -13,6 +13,7 @@
 
 use crate::art::Art;
 use crate::command::{Camera, Command, Mode, Panel, Speed, Walls};
+use crate::font::Font;
 use crate::frame::{Frame, Rect};
 use crate::household::{Faces, Snapshot};
 
@@ -574,10 +575,13 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
     }
 }
 
-/// The name box's height and font size, and its colors: the needs
-/// panel's label color on black.
+/// The name item's height, the font size, the room around the name in
+/// its box (across, then down), and the box's colors: the needs panel's label color on
+/// black. The box drawn is as tall as the font's line needs; its bottom
+/// is the item's.
 const NAME_HEIGHT: i32 = 16;
 const NAME_SIZE: u8 = 8;
+const NAME_PAD: [i32; 2] = [4, 2];
 const NAME_BACK: [u8; 3] = [0, 0, 0];
 
 /// The needs in the panel's order, left column first, with their motive
@@ -761,20 +765,9 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                 }
             }
             Kind::Name { guid } => {
-                let (Some(name), Some(font)) = (faces.name(*guid), art.font(NAME_SIZE)) else {
-                    continue;
-                };
-                let width = font.width(name).saturating_add(8);
-                let x = r.x + (r.width - width).div_euclid(2);
-                let right = i32::try_from(frame.width()).unwrap_or(i32::MAX);
-                let x = x.clamp(0, (right - width).max(0));
-                let box_ = Rect::new(x, r.y, width, r.height);
-                frame.fill(box_, LABEL);
-                frame.fill(
-                    Rect::new(x + 1, r.y + 1, width - 2, r.height - 2),
-                    NAME_BACK,
-                );
-                font.draw(frame, name, [x + 4, r.y + 2], LABEL);
+                if let (Some(name), Some(font)) = (faces.name(*guid), art.font(NAME_SIZE)) {
+                    draw_name(frame, font, name, r);
+                }
             }
             Kind::Meter(value) => {
                 let (width, left, right) = meter(*value);
@@ -788,6 +781,33 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
             }
         }
     }
+}
+
+/// Draws `name` in a box centred over `r`, its bottom on `r`'s bottom,
+/// as tall as the font's line with [`NAME_PAD`] around it, and kept
+/// inside the frame; a name wider than the frame is cut short.
+fn draw_name(frame: &mut Frame, font: &Font, name: &str, r: Rect) {
+    let (right, bottom) = (i64::from(frame.width()), i64::from(frame.height()));
+    let [pad_x, pad_y] = NAME_PAD.map(i64::from);
+    let room = right - 2 * pad_x;
+    if room <= 0 {
+        return;
+    }
+    let mut text = name.to_owned();
+    while i64::from(font.width(&text)) > room {
+        text.pop();
+    }
+    let width = i64::from(font.width(&text)) + 2 * pad_x;
+    let height = i64::from(font.line_height.max(0)) + 2 * pad_y;
+    let x = i64::from(r.x) + (i64::from(r.width) - width).div_euclid(2);
+    let y = i64::from(r.y) + i64::from(r.height) - height;
+    let x = x.clamp(0, (right - width).max(0));
+    let y = y.clamp(0, (bottom - height).max(0));
+    // Inside the frame now, so each fits.
+    let [x, y, width, height] = [x, y, width, height].map(|v| i32::try_from(v).unwrap_or(i32::MAX));
+    frame.fill(Rect::new(x, y, width, height), LABEL);
+    frame.fill(Rect::new(x + 1, y + 1, width - 2, height - 2), NAME_BACK);
+    font.draw(frame, &text, [x + NAME_PAD[0], y + NAME_PAD[1]], LABEL);
 }
 
 impl Item {
@@ -1028,6 +1048,74 @@ mod tests {
             &Controls::default(),
         );
         assert_eq!(frame.pixel(1, 1), Some([0; 3]));
+    }
+
+    /// Art with an 8-point font of one glyph, "M": 3 by 4, solid.
+    fn art_with_a_font() -> Art {
+        let mut art = Art::default();
+        art.insert_font(
+            NAME_SIZE,
+            Font::new(sims_formats::ffn::Font {
+                flags: 0,
+                glyphs: vec![sims_formats::ffn::Glyph {
+                    code: u16::from(b'M'),
+                    width: 3,
+                    height: 4,
+                    atlas_x: 0,
+                    atlas_y: 0,
+                    first_bearing: 0,
+                    bearing_x: 0,
+                    bearing_y: 0,
+                }],
+                width: 3,
+                height: 4,
+                coverage: vec![15; 12],
+            }),
+        );
+        art
+    }
+
+    #[test]
+    fn a_name_keeps_inside_its_box_and_the_frame() {
+        let art = art_with_a_font();
+        let mut faces = Faces::default();
+        faces.insert_name(1, &"M".repeat(24));
+        let name = |rect| Item {
+            rect,
+            kind: Kind::Name { guid: 1 },
+            command: None,
+        };
+        // Above the top and wider than the frame: the box comes down to
+        // the top and the name is cut to the frame's width.
+        let mut frame = Frame::new(40, 30, [9; 3]);
+        let item = name(Rect::new(30, -50, 45, NAME_HEIGHT));
+        draw(&mut frame, &art, &faces, &[item], &Controls::default());
+        // The box: the line's 4 rows and 2 above and below, and the ten
+        // glyphs that fit (30 pixels) with 4 each side, from x 2.
+        for (x, y) in [(2, 0), (39, 0), (2, 7), (39, 7)] {
+            assert_eq!(frame.pixel(x, y), Some(LABEL), "({x}, {y})");
+        }
+        assert_eq!(frame.pixel(3, 1), Some(NAME_BACK));
+        assert_eq!(frame.pixel(6, 2), Some(LABEL));
+        assert_eq!(frame.pixel(6, 5), Some(LABEL));
+        assert_eq!(frame.pixel(6, 6), Some(NAME_BACK));
+        assert_eq!(frame.pixel(36, 2), Some(NAME_BACK));
+        assert_eq!(frame.pixel(1, 0), Some([9; 3]));
+        assert_eq!(frame.pixel(20, 8), Some([9; 3]));
+        // At the edges of i32, nothing overflows.
+        let mut frame = Frame::new(2, 2, [0; 3]);
+        let items: Vec<Item> = [i32::MIN, i32::MAX]
+            .into_iter()
+            .flat_map(|v| {
+                [
+                    Rect::new(v, 0, i32::MAX, 1),
+                    Rect::new(0, v, 1, i32::MAX),
+                    Rect::new(v, v, i32::MAX, i32::MAX),
+                ]
+            })
+            .map(name)
+            .collect();
+        draw(&mut frame, &art, &faces, &items, &Controls::default());
     }
 
     #[test]
