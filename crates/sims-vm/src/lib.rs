@@ -36,6 +36,7 @@
 mod animator;
 mod autonomy;
 pub mod boot;
+mod cancel;
 mod clip_events;
 mod error;
 mod factory;

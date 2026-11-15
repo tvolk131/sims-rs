@@ -51,6 +51,10 @@ use sims_sim::World;
 pub(crate) mod function {
     pub const INIT: usize = 0;
     pub const LOAD: usize = 2;
+    /// The function a type of a group names to have a tile leave its
+    /// group before it is taken off or removed (0x42344e: the first word
+    /// of its callback entry 8, 0x457c38, 0x455fa9).
+    pub const DYNAMIC_GROUP: usize = 8;
     pub const PLACED: usize = 9;
     pub const LEAVING: usize = 10;
 }

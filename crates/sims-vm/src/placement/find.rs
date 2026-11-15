@@ -598,6 +598,35 @@ impl Interpreter<'_> {
         self.test_place(world, id, position, level, None)
     }
 
+    /// [`Interpreter::place_test`], with the object the test last wrote
+    /// to 0x6e4ad0 as collided with (0x433b42), or None if it wrote none
+    /// and left it as the caller set it. For one object that is the
+    /// object of a [`Refusal::Collision`]; for a tile of a group, whose
+    /// test goes on through every tile, it is the last tile's collision,
+    /// whatever code the group keeps ([`Self::test_group`]).
+    pub(crate) fn place_test_collided(
+        &self,
+        world: &mut World,
+        id: u16,
+        position: [i32; 2],
+        level: i32,
+    ) -> Result<(Result<(), Refusal>, Option<u16>), Fault> {
+        let object = world.objects.get(&id).ok_or_else(|| Fault {
+            object: id,
+            at: None,
+            trap: missing(),
+        })?;
+        if object.multipart.is_some() {
+            return self.group_test(world, id, position, level);
+        }
+        let test = self.test_tile(world, id, position, level, None)?;
+        let written = match test {
+            Err(Refusal::Collision(other)) => other,
+            _ => None,
+        };
+        Ok((test, written))
+    }
+
     /// [`Interpreter::fits_in`], with the reason for a refusal.
     pub(crate) fn place_test_in(
         &self,
@@ -650,7 +679,11 @@ impl Interpreter<'_> {
     ///    (0x433311, [`Interpreter::fits`]'s steps).
     /// 3. The group refuses when a tile does. The code it leaves is the
     ///    first tile's refusal, replaced by any later one of 0x1e or 0x1f
-    ///    (0x422b9e to 0x422bb3).
+    ///    (0x422b9e to 0x422bb3). The tiles after a refusal are still
+    ///    tested (0x422c08), and each collision among them writes the
+    ///    object collided with (0x6e4ad0, 0x433b42) over the last: a
+    ///    [`Refusal::Collision`] of the group names the last one written
+    ///    by any tile, which is not always the tile whose code is kept.
     ///
     /// A tile that refuses without leaving a code ([`Refusal::Unrecorded`])
     /// fails loudly: the group then reads whatever code an earlier test
@@ -666,6 +699,22 @@ impl Interpreter<'_> {
         position: [i32; 2],
         level: i32,
     ) -> Result<Result<(), Refusal>, Fault> {
+        let (kept, written) = self.group_test(world, id, position, level)?;
+        Ok(kept.map_err(|refusal| match refusal {
+            Refusal::Collision(_) => Refusal::Collision(written),
+            refusal => refusal,
+        }))
+    }
+
+    /// [`Self::test_group`]: the refusal of the tile whose code the group
+    /// keeps, and the object the tiles' tests last wrote as collided with.
+    fn group_test(
+        &self,
+        world: &mut World,
+        id: u16,
+        position: [i32; 2],
+        level: i32,
+    ) -> Result<(Result<(), Refusal>, Option<u16>), Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -686,9 +735,10 @@ impl Interpreter<'_> {
         ];
         let origin_level = level.wrapping_sub(selected[2]);
         if super::off_lot(world, origin) {
-            return Ok(Err(Refusal::OffLot));
+            return Ok((Err(Refusal::OffLot), None));
         }
         let mut refusal: Option<Refusal> = None;
+        let mut written = None;
         for part in self.parts(world, id).map_err(fail)? {
             let at = offset(world, part)?;
             let place = [
@@ -696,7 +746,11 @@ impl Interpreter<'_> {
                 origin[1].wrapping_add(at[1].wrapping_mul(16)),
             ];
             let part_level = origin_level.wrapping_add(at[2]);
-            match self.test_tile(world, part, place, part_level, None)? {
+            let test = self.test_tile(world, part, place, part_level, None)?;
+            if let Err(Refusal::Collision(Some(other))) = test {
+                written = Some(other);
+            }
+            match test {
                 Ok(()) => {}
                 Err(Refusal::Unrecorded) => {
                     return Err(fail(Trap::Unsupported(format!(
@@ -718,7 +772,7 @@ impl Interpreter<'_> {
                 },
             }
         }
-        Ok(refusal.map_or(Ok(()), Err))
+        Ok((refusal.map_or(Ok(()), Err), written))
     }
 
     /// The ordinary place test of one object (0x433311 and 0x4329c1).

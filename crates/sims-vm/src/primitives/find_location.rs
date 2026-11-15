@@ -27,10 +27,14 @@
 //! function 0x50 runs, asked to tell the registry (as Remove Object
 //! Instance's queue does, [`crate::Interpreter::take_off`]), and the true
 //! branch is taken. A person can take only itself off, during its own
-//! tick (`Interpreter::take_self_off`, for its animator's refresh). The original first tests a tile of a group (definition
-//! +0x14 set) with 0x42344e and may then call 0x42346a on it. That is not
-//! decoded, so a tile of a group fails loudly, as it does for Remove
-//! Object Instance.
+//! tick (`Interpreter::take_self_off`, for its animator's refresh). A
+//! tile of a group (definition word 10, +0x14, set, and the object one of
+//! a group, 0x44b52a to 0x44b545) is first asked whether its type names
+//! function 8 (0x42344e). If it does, the tile leaves its group and the
+//! group's offsets are worked out again (0x42346a: 0x4228d6, 0x4234ab),
+//! which is not ported and fails loudly. If not, nothing happens before
+//! the take-off, which takes the whole group off
+//! ([`crate::Interpreter::take_off`], 0x422d86).
 //!
 //! Modes 3 and 4 search along a line through the object the local names,
 //! following its facing (see `Machine::find_in_line`).
@@ -38,10 +42,11 @@
 //! Mode 2 (in front of the object) and 5 (a search from a random start,
 //! which draws random numbers) fail loudly.
 
-use crate::factory::word::GRAPHICS;
+use crate::factory::word::{GRAPHICS, GROUP};
 use crate::fault::Trap;
 use crate::interpreter::Machine;
 use crate::placement::{Place, Rules, on_lot};
+use crate::visits::function;
 
 impl Machine<'_, '_> {
     pub(crate) fn find_location(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
@@ -76,15 +81,19 @@ impl Machine<'_, '_> {
             level = p[2];
         }
         if mode == 1 {
-            if self.world.objects[&target].multipart.is_some() {
+            let me = self.me;
+            let interpreter = self.interpreter();
+            if self.world.objects[&target].multipart.is_some()
+                && interpreter.words(self.world, target)?[GROUP] != 0
+                && interpreter.has_function(self.world, target, function::DYNAMIC_GROUP)
+            {
                 return Err(Trap::Unsupported(
-                    "Find Location For mode 1 on a tile of a group, which the original tests \
-                     first (0x44b52a, 0x42344e)"
+                    "Find Location For mode 1 on a tile of a group whose type has the dynamic \
+                     group function (8): the tile leaves its group first and the group's \
+                     offsets are worked out again (0x42346a), which is not ported"
                         .into(),
                 ));
             }
-            let me = self.me;
-            let interpreter = self.interpreter();
             if target == me && self.world.objects[&target].person.is_some() {
                 interpreter
                     .take_self_off(self.world, target)

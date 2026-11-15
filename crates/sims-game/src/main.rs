@@ -12,8 +12,10 @@
 //! one of its buttons answers it. `--png` has nobody to answer, so there
 //! the Goths' house defaults to `3` (No to the Help System).
 //!
-//! The lot runs at normal speed, a tick every 50 milliseconds. The
-//! panel's speed, pause and camera buttons work. Keys: `+`/`-` or the
+//! The lot runs at the original's pace: a tick every 42 milliseconds at
+//! normal speed, 14 at fast and 2 at ultra. The panel's speed, pause and
+//! camera buttons work; a paused lot goes on ticking with its clock
+//! standing, as the original's does. Keys: `+`/`-` or the
 //! wheel zoom, `[`/`]` or `,`/`.` rotate, Page Up and Page Down change the
 //! floor, `1`/`2`/`3` walls up, cutaway and down, the arrows or a
 //! right-button drag scroll, space pauses, Escape quits.
@@ -276,7 +278,7 @@ impl App {
             Key::Named(NamedKey::PageUp) => Move::LevelUp,
             Key::Named(NamedKey::PageDown) => Move::LevelDown,
             Key::Named(NamedKey::Space) => {
-                self.game.pace.toggle_pause();
+                self.game.toggle_pause();
                 self.changed(true);
                 return;
             }
@@ -309,7 +311,7 @@ impl App {
         // What the tick's sounds may ask about their objects, before the
         // sounds themselves. Read on every call, not only after a step
         // that succeeded: a failed step may still have changed the lot.
-        let sources = sound::sources(self.game.lot().world());
+        let sources = self.game.sound_sources();
         if self.told.as_ref() != Some(&sources) {
             self.sound.send(Input::Sources(sources.clone()));
             self.told = Some(sources);
@@ -370,7 +372,7 @@ impl App {
                 lot.ticks(),
                 if self.game.stopped().is_some() {
                     ", stopped"
-                } else if self.game.pace.paused {
+                } else if self.game.paused() {
                     ", paused"
                 } else {
                     ""
@@ -492,7 +494,10 @@ impl ApplicationHandler for App {
                 (MouseButton::Right, ElementState::Released) => self.drag = None,
                 _ => {}
             },
-            WindowEvent::CursorLeft { .. } => self.game.leave(),
+            WindowEvent::CursorLeft { .. } => {
+                let redraw = self.game.leave();
+                self.changed(redraw);
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
                 let point = self.point(position);

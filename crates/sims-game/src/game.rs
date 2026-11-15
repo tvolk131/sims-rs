@@ -14,12 +14,13 @@
 
 use crate::hud::Hud;
 use crate::menu::{self, Listing, Menu};
-use crate::pace::Pace;
+use crate::pace::{self, Pace};
 use crate::people::People;
 use crate::pick;
+use crate::sound;
 use crate::view::{Move, View};
 use sims_render::{Canvas, Selected, Walls, open_house};
-use sims_ui::command::{Camera as UiCamera, Command, Walls as UiWalls};
+use sims_ui::command::{Camera as UiCamera, Command, Speed, Walls as UiWalls};
 use sims_vm::SoundEvent;
 use sims_vm::boot::{Frames, Lot, StepError};
 use sims_vm::play::{Recovery, ScriptError};
@@ -181,6 +182,16 @@ impl Game {
         })
     }
 
+    /// What the sound scripts may ask about the lot's objects, with where
+    /// each is on the screen as the camera shows it now
+    /// ([`sound::sources`], [`sound::screen`]).
+    pub fn sound_sources(&self) -> sims_audio::sources::Snapshot {
+        let world = self.lot.world();
+        let mut snapshot = sound::sources(world);
+        snapshot.screen = sound::screen(world, &self.view.camera, self.view.size);
+        snapshot
+    }
+
     /// Why the lot stopped, if it has.
     pub fn stopped(&self) -> Option<&str> {
         self.stopped.as_deref()
@@ -210,17 +221,94 @@ impl Game {
         &self.people.problems
     }
 
-    /// Runs the ticks owed after `elapsed_us` more microseconds. Returns
-    /// how many ran.
+    /// Sets the game's speed, as the panel's speed buttons do in live
+    /// mode (`0x53a62a`, `0x53a6ad`, `0x53a728`): a paused game runs
+    /// again (the original applies it after the speed; both restart the
+    /// same clocks, so the order does not matter), and the simulation's speed ([`Lot::set_speed`]) and the
+    /// time between ticks with it are set, unless the speed is already
+    /// the one asked for (`0x4ce588`), when the time owed carries on. A
+    /// lot that cannot take it keeps its speed, and the note across the
+    /// top says why.
+    pub fn set_speed(&mut self, speed: Speed) {
+        let level = pace::level(speed);
+        let result = if self.paused() {
+            self.lot.unpause().map(|_| self.pace.restart())
+        } else {
+            Ok(())
+        };
+        let result = result.and_then(|()| {
+            if self.lot.world().speed() == level {
+                self.pace.speed = speed;
+                return Ok(());
+            }
+            self.lot
+                .set_speed(i32::from(level))
+                .map(|_| self.pace.set_speed(speed))
+        });
+        if let Err(e) = result {
+            self.note = Some(format!("The speed was not changed: {e}"));
+        }
+    }
+
+    /// Whether the game is paused (global 17).
+    pub fn paused(&self) -> bool {
+        self.lot.world().paused()
+    }
+
+    /// Pauses the game, or runs it again, as the panel's pause button
+    /// does. A paused lot goes on ticking, with its clock standing
+    /// ([`Lot::pause`]).
+    pub fn toggle_pause(&mut self) {
+        let result = if self.paused() {
+            self.lot.unpause().map(|_| self.pace.restart())
+        } else {
+            self.lot.pause().map(|_| ())
+        };
+        if let Err(e) = result {
+            self.note = Some(format!("The pause was not changed: {e}"));
+        }
+    }
+
+    /// Runs the ticks owed after `elapsed_us` more microseconds at the
+    /// simulation's speed. Returns how many ran.
+    ///
     /// While a dialog waits for the player, no time is owed: the game
-    /// waits, as the original does.
+    /// waits, as the original does, and the idle loop's speed is not set
+    /// (the lot takes nothing between ticks then; **unverified** whether
+    /// the original's idle loop sets it while its dialog is up).
+    ///
+    /// Each call is a pass of the original's idle loop, so it first sets
+    /// the idle loop's own speed ([`Lot::idle_speed`]), whether a tick is
+    /// owed or not, paused or not: a speed the player picks after that
+    /// stands. The same check runs again before each tick owed. Whenever
+    /// it calls the setter, even for the speed the game already has, the
+    /// time owed starts again and no more ticks run in this call, as the
+    /// setter restarts the original's clocks. The original may then run
+    /// an update at once, when its second clock (`0x4732de`) is ready
+    /// (`0x46da1b`); here the next tick waits a period of the new speed
+    /// (**unverified**, and the window's timing, not the simulation's).
     pub fn advance(&mut self, elapsed_us: u64) -> u32 {
-        let due = self.pace.due(elapsed_us);
         if self.lot.asking().is_some() {
             self.pace.restart();
             return 0;
         }
-        self.run(due)
+        if self.idle_speed() {
+            return 0;
+        }
+        let due = self.pace.due(elapsed_us, self.lot.world().speed());
+        self.run_while(due, true)
+    }
+
+    /// Sets the idle loop's own speed between ticks ([`Lot::idle_speed`]).
+    /// True if it called the setter, which starts the time owed again.
+    fn idle_speed(&mut self) -> bool {
+        // A lot that cannot take it (halted, or not loaded) has stopped,
+        // and the banner says why.
+        let set = self.lot.idle_speed().unwrap_or(false);
+        if set {
+            self.pace.restart();
+        }
+        set
     }
 
     /// The dialog the lot waits on, if it waits for the player.
@@ -236,8 +324,15 @@ impl Game {
     /// Runs up to `ticks` ticks, stopping at the first that fails or that
     /// shows a dialog the player has to answer.
     pub fn run(&mut self, ticks: u32) -> u32 {
+        self.run_while(ticks, false)
+    }
+
+    /// Runs up to `ticks` ticks, stopping at the first that fails, and,
+    /// if `idle`, before a tick the idle loop's speed sets the speed for
+    /// ([`Game::idle_speed`]).
+    fn run_while(&mut self, ticks: u32, idle: bool) -> u32 {
         let mut ran = 0;
-        while ran < ticks && self.stopped.is_none() {
+        while ran < ticks && self.stopped.is_none() && !(idle && self.idle_speed()) {
             let step = if self.play {
                 self.lot.step_play()
             } else {
@@ -348,6 +443,17 @@ impl Game {
             &mut self.canvas,
         );
         self.people.draw(world, &self.view.camera, &mut self.canvas);
+        // The pie menu shows the head of the Sim it is for, as posed now.
+        if let Some(menu) = &mut self.hud.menu {
+            menu.head = match self.people.head(world, menu.person, menu.face_size()) {
+                Ok(head) => Some(head),
+                Err(e) => {
+                    self.people
+                        .note(vec![format!("the pie menu has no head: {e}")]);
+                    None
+                }
+            };
+        }
         let status = self.status();
         // A dialog the lot waits on is in the lot as the tick left it when
         // it was shown.
@@ -415,10 +521,13 @@ impl Game {
         if self.hud.covers(point) {
             // The menu, whose entries a choice is an index into.
             let menu = self.hud.menu.clone();
-            return match self.hud.press(point) {
+            let outcome = match self.hud.press(point) {
                 Some(command) => self.command(command, menu.as_ref()),
                 None => Outcome::redraw(),
             };
+            let sounds = self.hud.take_sounds();
+            self.keep_sounds(sounds);
+            return outcome;
         }
         let Some(target) = self.under(point) else {
             return Outcome {
@@ -430,10 +539,12 @@ impl Game {
         Outcome::redraw()
     }
 
-    /// The pointer left the window: it is on no object.
-    pub fn leave(&mut self) {
+    /// The pointer left the window: it is on no object, button or
+    /// portrait. True if the frame changes.
+    pub fn leave(&mut self) -> bool {
         self.pointer = None;
-        self.follow();
+        let redraw = self.hud.leave();
+        self.follow() || redraw
     }
 
     /// Follows the object under the pointer in the frame last drawn: when
@@ -533,6 +644,17 @@ impl Game {
         }
     }
 
+    /// The control panel as it was last laid out, from the world as it
+    /// was when the frame was drawn ([`Game::render`]).
+    pub fn panel(&self) -> &[sims_ui::hud::Item] {
+        self.hud.items()
+    }
+
+    /// The first name the panel shows for people of type `guid`.
+    pub fn name(&self, guid: u32) -> Option<&str> {
+        self.hud.name(guid)
+    }
+
     /// The pie menu, while one is open. Its labels are placed when the
     /// game is rendered.
     pub fn menu(&self) -> Option<&Menu> {
@@ -566,6 +688,39 @@ impl Game {
             Ok(None) => format!("Person {person}'s queue is full; \"{label}\" was not queued."),
             Err(e) => format!("\"{label}\" was not queued: {e}"),
         });
+    }
+
+    /// Cancels `sim`'s action numbered `action`, as a press on its icon
+    /// does (`Lot::cancel`, 0x4ea3e3), keeping the sounds the trees made,
+    /// then plays `UI_queue_delete` if the press counts and `UI_error` if
+    /// not (0x4cb16e). A cancel the lot refuses, or a stopped lot, leaves
+    /// the icon to take another press.
+    fn cancel(&mut self, sim: u16, action: i32) {
+        if self.stopped.is_some() {
+            self.note = Some("The lot has stopped, so it takes no orders.".into());
+            self.hud.release(action);
+            return;
+        }
+        match self.lot.cancel(sim, action) {
+            Ok(cancelled) => {
+                self.keep_sounds(cancelled.sounds);
+                self.hud.play(if cancelled.counts {
+                    crate::hud::QUEUE_DELETE
+                } else {
+                    crate::hud::ERROR
+                });
+            }
+            Err(e) => {
+                // The lot is as it was, so the icon takes another press.
+                self.hud.release(action);
+                self.note = Some(format!("The action was not cancelled: {e}"));
+            }
+        }
+    }
+
+    /// The selected Sim's actions as the frame last drawn showed them.
+    pub fn queue(&self) -> &sims_ui::queue::Queue {
+        self.hud.queue()
     }
 
     /// Answers the dialog `caller` shows with its button `button` (0 the
@@ -626,11 +781,11 @@ impl Game {
         };
         match command {
             Command::SetSpeed(speed) => {
-                self.pace.set_speed(speed);
+                self.set_speed(speed);
                 Outcome::redraw()
             }
             Command::TogglePause => {
-                self.pace.toggle_pause();
+                self.toggle_pause();
                 Outcome::redraw()
             }
             Command::Camera(camera) => match camera {
@@ -678,6 +833,10 @@ impl Game {
             }
             Command::Select { sim } => {
                 self.select(sim);
+                Outcome::redraw()
+            }
+            Command::CancelAction { sim, action } => {
+                self.cancel(sim, action);
                 Outcome::redraw()
             }
             Command::AnswerDialog { caller, button } => {

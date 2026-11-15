@@ -209,14 +209,19 @@ impl Canvas {
         light: Light,
         depth: impl Fn(i32, i32) -> i32,
     ) {
-        self.blit(
-            image,
-            at,
-            false,
-            |_, _| light,
-            1,
-            |x, y, _| Some(depth(x, y)),
-        );
+        self.draw_wall_shaded(image, at, |_, _| light, depth);
+    }
+
+    /// [`Canvas::draw_wall`] with each pixel's light given by its place
+    /// in the image (column, row), as a lamp's pool on a wall gives it.
+    pub fn draw_wall_shaded(
+        &mut self,
+        image: &Image,
+        at: [i32; 2],
+        light: impl Fn(usize, usize) -> Light,
+        depth: impl Fn(i32, i32) -> i32,
+    ) {
+        self.blit(image, at, false, light, 1, |x, y, _| Some(depth(x, y)));
     }
 
     fn blit(

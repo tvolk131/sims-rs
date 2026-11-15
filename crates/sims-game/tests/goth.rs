@@ -8,6 +8,11 @@ use sims_game::pick;
 use sims_game::view::View;
 use sims_game::{Game, Options};
 use sims_render::{Canvas, open_house};
+use sims_ui::frame::Rect;
+use sims_ui::household::Snapshot;
+use sims_ui::hud::Kind;
+use sims_ui::queue::Picture;
+use sims_vm::SoundEvent;
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
@@ -42,11 +47,35 @@ fn the_goths_play_and_are_drawn() {
     game.resize([800, 600]);
     let canvas = game.render();
     assert_eq!((canvas.width, canvas.height), (800, 600));
-    // Paused, the lot owes no ticks however long it waits.
-    game.pace.toggle_pause();
-    assert_eq!(game.advance(10_000_000), 0);
-    game.pace.toggle_pause();
+    // A tick every 42 ms at normal speed.
     assert_eq!(game.advance(100_000), 2);
+    // Paused, the lot goes on ticking, but its clock stands.
+    let clock = |game: &Game| {
+        let world = game.lot().world();
+        (world.ticks, world.globals[5], world.globals[6])
+    };
+    let before = clock(&game);
+    game.toggle_pause();
+    assert!(game.paused());
+    assert_eq!(game.advance(420_000), 10);
+    assert_eq!(clock(&game), before);
+    game.toggle_pause();
+    assert!(!game.paused());
+    // Ultra speed is a tick every 2 ms, and the simulation's speed is 994.
+    game.set_speed(sims_ui::command::Speed::Ultra);
+    assert_eq!(game.lot().world().speed(), 994);
+    assert_eq!(game.advance(20_000), 10);
+    assert_eq!(game.lot().world().ticks, before.0.wrapping_add(10));
+    // A speed button runs a paused game again.
+    game.toggle_pause();
+    game.set_speed(sims_ui::command::Speed::Fast);
+    assert!(!game.paused());
+    assert_eq!(game.lot().world().speed(), 924);
+    // The button of the speed the game has does not start the time again.
+    assert_eq!(game.advance(13_000), 0);
+    game.set_speed(sims_ui::command::Speed::Fast);
+    assert_eq!(game.advance(1_000), 1);
+    assert_eq!(game.stopped(), None);
 }
 
 #[test]
@@ -447,8 +476,85 @@ fn a_snack_is_chosen_from_the_fridges_pie() {
     game.resize([800, 600]);
     game.render();
     let person = game.lot().world().selected().expect("a Sim is selected");
-    // A click on each object on the lot, until one opens a pie with Have A
-    // Snack (the fridge).
+    let (fridge, snack, number) = snack_pie(&mut game);
+    let queued = |game: &Game| {
+        let queue = &game.lot().world().objects[&person]
+            .person
+            .as_ref()
+            .unwrap()
+            .queue;
+        queue
+            .iter()
+            .filter(|a| a.target == fridge as i16 && a.table_index == number as i32)
+            .count()
+    };
+    let before = queued(&game);
+    game.press(snack);
+    assert!(game.menu().is_none(), "choosing closes the pie");
+    // Have A Snack, not another of the fridge's entries, is queued.
+    assert_eq!(queued(&game), before + 1);
+    // The panel follows the lot as it runs: Mortimer pays 5 for the snack
+    // (at tick 820) and eats it, and the clock moves on.
+    game.render();
+    let start = panel(&game, person);
+    assert_eq!(start.money, "$2,542");
+    assert_eq!(game.run(850), 850);
+    game.render();
+    let fed = panel(&game, person);
+    assert_eq!(fed.money, "$2,537");
+    // He eats: the fridge gave him the action, whose icon is the snack
+    // (object 263), yellow now that it is under way (person data word 39,
+    // set at tick 837).
+    let snack_guid = game.lot().world().objects[&263].guid;
+    let running = &game.queue().icons[0];
+    assert_eq!(
+        running.uid,
+        game.lot().world().objects[&person]
+            .person
+            .as_ref()
+            .unwrap()
+            .active
+            .uid
+    );
+    assert_eq!(running.picture, Picture::Object(snack_guid));
+    assert!(running.yellow);
+    assert_ne!(fed.clock, start.clock);
+    assert_ne!(fed.hunger, start.hunger);
+    // The pointer on Mortimer's portrait shows his name over it.
+    let (portrait, guid) = game
+        .panel()
+        .iter()
+        .find_map(|i| match i.kind {
+            Kind::Portrait {
+                guid,
+                selected: true,
+            } => Some((i.rect, guid)),
+            _ => None,
+        })
+        .expect("the selected Sim's portrait");
+    assert_eq!(guid, game.lot().world().objects[&person].guid);
+    assert_eq!(game.name(guid), Some("Mortimer"));
+    game.hover([portrait.x + 20, portrait.y + 20]);
+    game.render();
+    assert!(
+        game.panel().iter().any(|i| i.kind == Kind::Name { guid }),
+        "no name over the portrait"
+    );
+    // The pointer leaving the window takes the name away.
+    assert!(game.leave(), "leaving does not redraw");
+    game.render();
+    assert!(
+        !game.panel().iter().any(|i| i.kind == Kind::Name { guid }),
+        "the name stays after the pointer left"
+    );
+}
+
+/// What the panel shows of the lot, as text, and the selected Sim's
+/// hunger meter, which must be what the world holds.
+/// Clicks each object on the lot until one opens a pie with Have A Snack
+/// (the fridge), and leaves that pie open. Returns the object clicked,
+/// where Have A Snack is, and its menu number.
+fn snack_pie(game: &mut Game) -> (u16, [i32; 2], u32) {
     let points: Vec<([i32; 2], u16)> = (0..600)
         .step_by(6)
         .flat_map(|y| (0..800).step_by(6).map(move |x| [x, y]))
@@ -456,7 +562,6 @@ fn a_snack_is_chosen_from_the_fridges_pie() {
         .filter_map(|p| game.under(p).map(|id| (p, id)))
         .collect();
     let mut tried = std::collections::BTreeSet::new();
-    let mut fridge = None;
     for (point, id) in points {
         if !tried.insert(id) {
             continue;
@@ -476,28 +581,138 @@ fn a_snack_is_chosen_from_the_fridges_pie() {
             Some((at, entry.menu))
         });
         if let Some((at, number)) = snack {
-            fridge = Some((id, at, number));
-            break;
+            return (id, at, number);
         }
         game.close_menu();
     }
-    let (fridge, snack, number) = fridge.expect("the fridge's pie offers Have A Snack");
-    let queued = |game: &Game| {
-        let queue = &game.lot().world().objects[&person]
-            .person
-            .as_ref()
-            .unwrap()
-            .queue;
-        queue
-            .iter()
-            .filter(|a| a.target == fridge as i16 && a.table_index == number as i32)
-            .count()
+    panic!("no pie offers Have A Snack");
+}
+
+/// The snack queued from the fridge's pie shows as an icon in the top
+/// left; a press on it cancels it, and so does a press on the icon of the
+/// snack Mortimer is doing (`Lot::cancel`, 0x4cb126).
+#[test]
+fn a_press_on_an_actions_icon_cancels_it() {
+    let Some(install) = install() else {
+        return;
     };
-    let before = queued(&game);
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(50), 50);
+    game.resize([800, 600]);
+    game.render();
+    let person = game.lot().world().selected().expect("a Sim is selected");
+    let mortimer = |game: &Game| game.lot().world().objects[&person].person.clone().unwrap();
+    // He is doing nothing, so nothing shows.
+    assert!(game.queue().icons.is_empty());
+    let (_, snack, _) = snack_pie(&mut game);
     game.press(snack);
-    assert!(game.menu().is_none(), "choosing closes the pie");
-    // Have A Snack, not another of the fridge's entries, is queued.
-    assert_eq!(queued(&game), before + 1);
+    game.render();
+    let [queued] = &mortimer(&game).queue[..] else {
+        panic!("{:?}", mortimer(&game).queue);
+    };
+    // The icon is the fridge's (object 118), grey, at (32, 32).
+    let fridge = game.lot().world().objects[&118].guid;
+    let [icon] = game
+        .queue()
+        .icons
+        .clone()
+        .try_into()
+        .unwrap_or_else(|icons| {
+            panic!("{icons:?}");
+        });
+    assert_eq!(icon.uid, queued.uid);
+    assert_eq!(icon.picture, Picture::Object(fridge));
+    assert!(!icon.yellow && !icon.cancelled);
+    assert_eq!(icon.rect, Rect::new(32, 32, 45, 45));
+    let centre = [icon.rect.x + 22, icon.rect.y + 22];
+    // In a narrow window the note the order left across the top wraps
+    // down over the icon; a press there is the band's, and cancels
+    // nothing. The press clears the note.
+    game.resize([80, 600]);
+    game.render();
+    game.take_sounds();
+    let under_band = [icon.rect.x + 22, icon.rect.y + 8];
+    assert_eq!(game.queue().at(under_band).map(|i| i.uid), Some(icon.uid));
+    game.press(under_band);
+    assert_eq!(mortimer(&game).queue.len(), 1);
+    assert!(game.take_sounds().is_empty());
+    game.resize([800, 600]);
+    game.render();
+    // A press on it takes it off the queue, with the interface's sound.
+    assert!(game.over_panel(centre));
+    game.press(centre);
+    assert!(mortimer(&game).queue.is_empty());
+    assert_eq!(game.take_sounds(), [delete()]);
+    game.render();
+    assert!(game.queue().icons.is_empty());
+    // Queued again, he takes it 100 ticks later.
+    let (_, snack, _) = snack_pie(&mut game);
+    game.press(snack);
+    let uid = mortimer(&game).queue[0].uid;
+    for _ in 0..100 {
+        assert_eq!(game.run(1), 1);
+    }
+    assert_eq!(mortimer(&game).active.uid, uid);
+    game.render();
+    let icon = game.queue().icons[0].clone();
+    assert_eq!((icon.uid, icon.yellow, icon.cancelled), (uid, false, false));
+    // A press on the running snack cancels it: the cross shows, and a
+    // second press does nothing.
+    game.take_sounds();
+    game.press([icon.rect.x + 22, icon.rect.y + 22]);
+    assert_ne!(mortimer(&game).active.flags & 0x100, 0);
+    assert_eq!(game.take_sounds(), [delete()]);
+    game.render();
+    assert!(game.queue().icons[0].cancelled);
+    let before = mortimer(&game);
+    game.press([icon.rect.x + 22, icon.rect.y + 22]);
+    assert!(game.take_sounds().is_empty());
+    assert_eq!(mortimer(&game).queue.len(), before.queue.len());
+}
+
+fn delete() -> SoundEvent {
+    SoundEvent::Play {
+        object: -4,
+        name: "UI_queue_delete".into(),
+    }
+}
+
+struct Shown {
+    clock: String,
+    money: String,
+    hunger: f32,
+}
+
+fn panel(game: &Game, person: u16) -> Shown {
+    let world = game.lot().world();
+    let texts: Vec<&str> = game
+        .panel()
+        .iter()
+        .filter_map(|i| match &i.kind {
+            Kind::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let snapshot = Snapshot::read(world, &[]);
+    let (clock, money) = (snapshot.clock(), snapshot.money());
+    assert!(texts.contains(&clock.as_str()), "{texts:?}");
+    assert!(texts.contains(&money.as_str()), "{texts:?}");
+    let hunger = world.objects[&person].person.as_ref().unwrap().motives[7];
+    // Hunger is the needs panel's first meter.
+    let meters: Vec<f32> = game
+        .panel()
+        .iter()
+        .filter_map(|i| match i.kind {
+            Kind::Meter(value) => Some(value),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(meters.first(), Some(&hunger), "{meters:?}");
+    Shown {
+        clock,
+        money,
+        hunger,
+    }
 }
 
 #[test]
@@ -588,6 +803,71 @@ fn the_sound_scripts_learn_about_the_goths() {
     assert_eq!(snapshot.field(-3, 4), Some(hour));
     assert_eq!(snapshot.field(70_000, 0), Some(0));
     assert_eq!(snapshot.field(16, 21), None);
+    // Every object is where the lot has it, for its sounds' placement;
+    // an ID that names nothing is nowhere.
+    for (&id, object) in &world.objects {
+        assert_eq!(snapshot.position(i32::from(id)), Some(object.position));
+    }
+    assert_eq!(snapshot.position(70_000), None);
+}
+
+#[test]
+fn the_sound_scripts_see_the_goths_where_the_camera_shows_them() {
+    use sims_audio::placement;
+    use sims_audio::player::{SPL_NORMAL, Sources};
+    use sims_game::view::Move;
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    while game.view.camera.rotation != 0 {
+        game.apply(Move::Rotate(true));
+    }
+    let snapshot = game.sound_sources();
+    let camera = game.view.camera;
+    let world = game.lot().world();
+    let objects: Vec<(u16, &sims_sim::Object)> = world
+        .objects
+        .iter()
+        .filter(|(id, _)| **id > 0)
+        .map(|(&id, o)| (id, o))
+        .collect();
+    assert_eq!(snapshot.screen.len(), objects.len());
+    // Unturned, the sound's projection is the original view's for the
+    // object's place on the floor, which is the drawing's or a pixel off
+    // it.
+    for &(id, object) in &objects {
+        let [x, y, level] = object.position.map(i32::from);
+        let view = snapshot.projection(i32::from(id)).unwrap();
+        assert_eq!(
+            view.at,
+            sims_game::sound::fine_point(&camera, [x, y], level),
+            "object {id}"
+        );
+        let drawn = camera.project_fine([x, y], level, 0);
+        assert!(
+            (0..2).all(|i| (view.at[i] - drawn[i]).abs() <= 1),
+            "object {id}: {:?} {drawn:?}",
+            view.at
+        );
+        assert_eq!(view.screen, [800, 600]);
+        assert_eq!(view.zoom, camera.zoom.level() as i32);
+        assert_eq!(view.shown_level, camera.level);
+    }
+    // The Goths are on the screen at the far zoom the house opens at,
+    // where a track's sounds lose 560 of their 1024; nearer, less.
+    let people: Vec<u32> = objects
+        .iter()
+        .filter(|(_, o)| o.person.is_some())
+        .map(|&(id, _)| u32::from(id))
+        .collect();
+    let far = placement::combine(&people, SPL_NORMAL, &snapshot).unwrap();
+    assert!(far.0 <= 1024 - 560, "{far:?}");
+    assert!((0..=1024).contains(&far.1), "{far:?}");
+    game.apply(Move::ZoomIn);
+    let medium = placement::combine(&people, SPL_NORMAL, &game.sound_sources()).unwrap();
+    assert!(medium.0 > far.0, "{medium:?} {far:?}");
 }
 
 #[test]
@@ -647,4 +927,43 @@ fn a_press_on_a_portrait_selects_that_goth() {
     assert_eq!(game.stopped(), None);
     game.select(mortimer);
     assert_eq!(game.lot().world().selected(), Some(mortimer));
+}
+
+#[test]
+fn the_pie_shows_the_selected_goths_head() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    game.render();
+    let selected = game.lot().world().selected().expect("a Sim is selected");
+    let points: Vec<[i32; 2]> = (0..600)
+        .step_by(6)
+        .flat_map(|y| (0..800).step_by(6).map(move |x| [x, y]))
+        .filter(|&p| !game.over_panel(p))
+        .collect();
+    for point in points {
+        game.leave();
+        game.hover(point);
+        game.press(point);
+        if game.menu().is_some() {
+            break;
+        }
+    }
+    game.render();
+    let menu = game.menu().expect("the menu stays open");
+    assert_eq!(menu.person, selected);
+    let head = menu.head.as_ref().expect("the head is drawn");
+    assert_eq!([head.width, head.height], menu.face_size());
+    // The head fills much of the face, and is clear around it.
+    let opaque = head.rgba.chunks(4).filter(|p| p[3] == 255).count();
+    let area = (head.width * head.height) as usize;
+    assert!(
+        opaque > area / 5 && opaque < area * 4 / 5,
+        "{opaque} of {area}"
+    );
+    assert_eq!(head.rgba[3], 0);
+    assert!(game.problems().is_empty(), "{:?}", game.problems());
 }
