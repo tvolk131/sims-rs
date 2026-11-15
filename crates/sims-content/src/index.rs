@@ -423,9 +423,10 @@ pub(crate) fn all_far_members(path: &Path) -> Result<Vec<Member>> {
 /// wrong, and decompression is not implemented, so it is left out, as the
 /// prototype's reader refused it. Whether the original lists such a member
 /// is unverified: the game's own archives hold none. A member whose name
-/// is longer than [`MAX_MEMBER_NAME`] or holds more than
-/// [`MAX_MEMBER_DEPTH`] directories is left out too.
-pub(crate) fn far_members(path: &Path) -> Result<(Vec<Member>, Vec<String>)> {
+/// is longer than 1024 bytes (`MAX_MEMBER_NAME`) or holds more than 32
+/// directories (`MAX_MEMBER_DEPTH`) is left out too. The directory is at
+/// most [`far::MAX_DIRECTORY`] bytes, checked before it is read.
+pub fn far_members(path: &Path) -> Result<(Vec<Member>, Vec<String>)> {
     let (members, skipped) = archive_members(path)?;
     Ok((
         members.into_iter().map(|(member, _)| member).collect(),
