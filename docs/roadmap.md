@@ -2106,8 +2106,9 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   `SIMS_INSTALL`; it is not yet compared with a screenshot, and the
   zodiac sign under the bars is not drawn. In the window, the
   personality, needs, job and relationship panels show the selected
-  Sim's live person data, motives, skills and relationship rows, through
-  the ticks and after a press on another portrait (`sims-game` tests
+  Sim's live person data, motives, skills and relationship rows, and
+  follow a press on another portrait; the needs are also checked to
+  follow the ticks (`sims-game` tests
   `the_personality_panel_shows_the_selected_goths_traits`,
   `the_needs_panel_follows_the_selected_goths_motives`,
   `the_job_panel_shows_the_selected_goths_skills`,
