@@ -564,7 +564,10 @@ fn an_empty_map_gives_unlisted_floor_ids_65535() {
     // Outside the lot's size nothing is looked at.
     set(&mut world, 1, 8, 0, &300u16.to_le_bytes());
     let before = world.clone();
-    assert_eq!(world.renumber_surfaces(Some(&[]), Some(&[])), Ok(5));
+    assert_eq!(
+        world.renumber_surfaces(Some(&[]), Some(&[]), &Default::default()),
+        Ok(5)
+    );
     let floor = &world.arrays[&1];
     for (x, id) in [0u16, 29, 255, 65535].into_iter().enumerate() {
         assert_eq!(cell(floor, x, 0), id.to_le_bytes());
@@ -576,117 +579,202 @@ fn an_empty_map_gives_unlisted_floor_ids_65535() {
     assert_eq!(cell(floor, 8, 0), 300u16.to_le_bytes());
     // A house without a floor map leaves the floors alone.
     let mut world = before.clone();
-    assert_eq!(world.renumber_surfaces(None, Some(&[])), Ok(0));
+    assert_eq!(
+        world.renumber_surfaces(None, Some(&[]), &Default::default()),
+        Ok(0)
+    );
     assert_eq!(world.encode(), before.encode());
 }
 
+/// A floor catalog with one pattern file after the built-in one: `tile.flr`,
+/// whose pattern 1 has key 300 and whose pattern 2 is missing.
+fn catalog() -> sims_content::Surfaces {
+    use sims_content::{SurfaceCatalog, SurfaceFile, Surfaces};
+    let file = |name: &str, keys: &[(u16, u16)]| SurfaceFile {
+        name: name.into(),
+        location: name.into(),
+        keys: keys.iter().copied().collect(),
+    };
+    Surfaces {
+        floors: SurfaceCatalog {
+            files: vec![file("floors.iff", &[]), file("tile.flr", &[(1, 300)])],
+        },
+        walls: SurfaceCatalog {
+            files: vec![file("walls.iff", &[]), file("brick.wll", &[(1, 400)])],
+        },
+    }
+}
+
+fn group(name: &str, entries: &[(u16, u16)]) -> sims_formats::lot::SurfaceMapping {
+    sims_formats::lot::SurfaceMapping {
+        name: name.into(),
+        entries: entries
+            .iter()
+            .map(|&(id, local)| sims_formats::lot::SurfaceEntry {
+                id,
+                local,
+                fallback: 0,
+            })
+            .collect(),
+    }
+}
+
 #[test]
-fn renumbering_that_needs_more_fails_and_changes_nothing() {
-    use sims_formats::lot::{SurfaceEntry, SurfaceMapping};
-    let listed = [SurfaceMapping {
-        name: "tile.flr".into(),
-        entries: vec![SurfaceEntry {
-            id: 40,
-            local: 1,
-            fallback: 0,
-        }],
-    }];
+fn a_listed_id_takes_its_patterns_key_and_one_without_fails() {
+    let patterns = catalog();
     let mut world = surfaces();
     set(&mut world, 1, 0, 0, &40u16.to_le_bytes());
+    set(&mut world, 101, 3, 4, &40u16.to_le_bytes());
+    set(&mut world, 1, 1, 0, &41u16.to_le_bytes());
     let before = world.clone();
-    // A map with entries needs the loaded patterns.
-    assert_eq!(
-        world.renumber_surfaces(Some(&listed), Some(&[])),
-        Err(LoadError::SurfaceCatalog)
-    );
-    assert_eq!(
-        world.renumber_surfaces(Some(&[]), Some(&listed)),
-        Err(LoadError::SurfaceCatalog)
-    );
-    // A group with no entries lists nothing.
-    let unlisted = [SurfaceMapping {
-        name: "tile.flr".into(),
-        entries: Vec::new(),
-    }];
-    assert_eq!(
-        world.clone().renumber_surfaces(Some(&unlisted), None),
-        Ok(1)
-    );
-    assert_eq!(world.encode(), before.encode());
+    // The name matches ignoring case.
+    let map = [group("TILE.flr", &[(40, 1)])];
+    assert_eq!(world.renumber_surfaces(Some(&map), None, &patterns), Ok(3));
+    assert_eq!(cell(&world.arrays[&1], 0, 0), 300u16.to_le_bytes());
+    assert_eq!(cell(&world.arrays[&101], 3, 4), 300u16.to_le_bytes());
+    assert_eq!(cell(&world.arrays[&1], 1, 0), [0xff, 0xff]);
+    // A pattern the file lacks, a file the catalog lacks, the built-in
+    // file and an ID past the table all need the colour match.
+    for map in [
+        [group("tile.flr", &[(40, 2)])],
+        [group("stone.flr", &[(40, 1)])],
+        [group("floors.iff", &[(40, 1)])],
+        [group("tile.flr", &[(65535, 1)])],
+    ] {
+        let mut world = before.clone();
+        assert!(matches!(
+            world.renumber_surfaces(Some(&map), None, &patterns),
+            Err(LoadError::SurfaceColour { .. })
+        ));
+        assert_eq!(world.encode(), before.encode());
+    }
+    // A later group's entry replaces an earlier one's for the same ID,
+    // before the colour match is needed.
+    let mut world = before.clone();
+    let map = [group("tile.flr", &[(40, 1)]), group("tile.flr", &[(40, 2)])];
+    assert!(matches!(
+        world.renumber_surfaces(Some(&map), None, &patterns),
+        Err(LoadError::SurfaceColour { id: 40, .. })
+    ));
+}
 
-    // Wall patterns: a straight segment's one word, by segment.
-    for (segment, at) in [(1u8, 6), (2, 8), (4, 12), (8, 10)] {
+#[test]
+fn a_wall_pattern_is_written_back_with_its_neighbours() {
+    let patterns = catalog();
+    let map = [group("brick.wll", &[(31, 1)])];
+    // Each straight segment's pattern word, and the side of the wall the
+    // service marks in the neighbour.
+    for (segment, at, neighbour, side) in [(1u8, 6, (1, 3), 4u8), (2, 8, (2, 2), 8)] {
         let mut world = surfaces();
         let mut wall = [0u8; 14];
         wall[0] = segment;
         wall[at] = 31;
         set(&mut world, 102, 2, 3, &wall);
-        let stop = LoadError::SurfaceRewrite {
-            level: 2,
-            x: 2,
-            y: 3,
-        };
-        assert_eq!(world.renumber_surfaces(Some(&[]), Some(&[])), Err(stop));
-        // The same word under another segment is not that segment's
-        // pattern, and built-in patterns stay.
-        wall[0] = if segment == 1 { 2 } else { 1 };
-        wall[6] = if at == 6 { 31 } else { 30 };
-        wall[8] = if at == 6 { 248 } else { 0 };
+        assert_eq!(world.renumber_surfaces(None, Some(&map), &patterns), Ok(1));
+        let cells = &world.arrays[&102];
+        assert_eq!(cell(cells, 2, 3)[at..at + 2], 400u16.to_le_bytes());
+        assert_eq!(cell(cells, neighbour.0, neighbour.1)[0], side);
+        // Unlisted, the pattern becomes 65535.
         set(&mut world, 102, 2, 3, &wall);
-        if at != 6 && at != 8 {
-            assert_eq!(world.renumber_surfaces(Some(&[]), Some(&[])), Ok(0));
-        }
+        assert_eq!(world.renumber_surfaces(None, Some(&[]), &patterns), Ok(1));
+        assert_eq!(cell(&world.arrays[&102], 2, 3)[at..at + 2], [0xff, 0xff]);
         // Without a wall map the walls are not looked at.
-        wall[0] = segment;
         set(&mut world, 102, 2, 3, &wall);
-        assert_eq!(world.renumber_surfaces(Some(&[]), None), Ok(0));
+        assert_eq!(world.renumber_surfaces(Some(&[]), None, &patterns), Ok(0));
     }
-    // A diagonal segment has two pattern words, and its cell's floor is
-    // two halves kept in the wall cell.
-    let mut world = surfaces();
-    let mut wall = [0u8; 14];
-    wall[0] = 0x10;
-    wall[12] = 100;
-    set(&mut world, 2, 1, 1, &wall);
-    let stop = LoadError::SurfaceRewrite {
-        level: 1,
-        x: 1,
-        y: 1,
-    };
-    assert_eq!(
-        world.renumber_surfaces(Some(&[]), Some(&[])),
-        Err(stop.clone())
-    );
-    let mut world = surfaces();
-    set(&mut world, 1, 1, 1, &255u16.to_le_bytes());
-    wall[12] = 0;
-    wall[2] = 250; // a half floor: 250 is renumbered as a floor ID
-    set(&mut world, 2, 1, 1, &wall);
-    assert_eq!(
-        world.renumber_surfaces(Some(&[]), Some(&[])),
-        Err(stop.clone())
-    );
-    // As a wall pattern 250 is built in, and a floor that is not 255 does
-    // not read the halves.
-    set(&mut world, 1, 1, 1, &0u16.to_le_bytes());
-    assert_eq!(world.renumber_surfaces(Some(&[]), Some(&[])), Ok(0));
-    // The walk stops when it reaches the last segment from a lower one:
-    // with segments 1 and 0x20, only segment 1's pattern is looked at.
+    // An east or south wall is the neighbour's west or north one: written
+    // back, it rewrites the neighbour's style, which the service reads from
+    // the neighbour only when the neighbour owns the wall.
+    for (segment, at, neighbour, owns) in [(4u8, 12, (3, 3), 1u8), (8, 10, (2, 4), 2)] {
+        let mut world = surfaces();
+        let mut wall = [0u8; 14];
+        wall[0] = segment;
+        wall[at] = 31;
+        set(&mut world, 102, 2, 3, &wall);
+        let before = world.clone();
+        assert_eq!(
+            world.renumber_surfaces(None, Some(&map), &patterns),
+            Err(LoadError::SurfaceRewrite {
+                level: 2,
+                x: 2,
+                y: 3
+            })
+        );
+        assert_eq!(world.encode(), before.encode());
+        let mut other = [0u8; 14];
+        other[0] = owns;
+        other[1] = 0x0f;
+        other[2 * usize::from(owns)] = 7;
+        set(&mut world, 102, neighbour.0, neighbour.1, &other);
+        assert_eq!(world.renumber_surfaces(None, Some(&map), &patterns), Ok(1));
+        let cells = &world.arrays[&102];
+        assert_eq!(cell(cells, 2, 3)[at..at + 2], 400u16.to_le_bytes());
+        assert_eq!(cell(cells, neighbour.0, neighbour.1), other);
+    }
+    // A segment the cell's byte has that the walk does not reach stays.
     let mut world = surfaces();
     let mut wall = [0u8; 14];
     wall[0] = 0x21;
+    wall[6] = 31;
     wall[10] = 40;
     set(&mut world, 2, 1, 1, &wall);
-    assert_eq!(world.renumber_surfaces(Some(&[]), Some(&[])), Ok(0));
-    wall[0] = 0x20;
+    assert_eq!(world.renumber_surfaces(None, Some(&map), &patterns), Ok(1));
+    let cells = &world.arrays[&2];
+    assert_eq!(cell(cells, 1, 1)[6..8], 400u16.to_le_bytes());
+    assert_eq!(cell(cells, 1, 1)[10..12], 40u16.to_le_bytes());
+    // A lowest segment above 0x20 is not ported.
+    let mut world = surfaces();
+    wall[0] = 0x40;
     set(&mut world, 2, 1, 1, &wall);
-    assert_eq!(world.renumber_surfaces(Some(&[]), Some(&[])), Err(stop));
+    assert_eq!(
+        world.renumber_surfaces(None, Some(&map), &patterns),
+        Err(LoadError::SurfaceRewrite {
+            level: 1,
+            x: 1,
+            y: 1
+        })
+    );
     // A lot without the arrays cannot be renumbered.
     let mut world = lot(vec![0; 64]);
     assert_eq!(
-        world.renumber_surfaces(Some(&[]), Some(&[])),
+        world.renumber_surfaces(Some(&[]), Some(&[]), &patterns),
         Err(LoadError::MissingArray(1))
     );
+}
+
+#[test]
+fn a_diagonal_walls_patterns_and_half_floors_are_renumbered() {
+    let patterns = catalog();
+    let floors = [group("tile.flr", &[(250, 1)])];
+    let walls = [group("brick.wll", &[(100, 1)])];
+    let mut world = surfaces();
+    let mut wall = [0u8; 14];
+    wall[0] = 0x10;
+    wall[2] = 250; // the first half floor
+    wall[4] = 9;
+    wall[6] = 250; // the second
+    wall[10] = 100;
+    wall[12] = 100;
+    set(&mut world, 2, 1, 1, &wall);
+    // A floor that is not 255 does not read the halves.
+    assert_eq!(
+        world
+            .clone()
+            .renumber_surfaces(Some(&floors), None, &patterns),
+        Ok(0)
+    );
+    set(&mut world, 1, 1, 1, &255u16.to_le_bytes());
+    assert_eq!(
+        world.renumber_surfaces(Some(&floors), Some(&walls), &patterns),
+        Ok(2)
+    );
+    let mut expected = wall;
+    expected[2..4].copy_from_slice(&300u16.to_le_bytes());
+    expected[6..8].copy_from_slice(&300u16.to_le_bytes());
+    expected[10..12].copy_from_slice(&400u16.to_le_bytes());
+    expected[12..14].copy_from_slice(&400u16.to_le_bytes());
+    assert_eq!(cell(&world.arrays[&2], 1, 1), expected);
+    assert_eq!(cell(&world.arrays[&1], 1, 1), 255u16.to_le_bytes());
 }
 
 /// A lot of size 8 with empty object grids on both levels, and objects at

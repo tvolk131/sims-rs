@@ -192,6 +192,44 @@ impl Index {
         })
     }
 
+    /// The files and archive members directly in one directory of a mount,
+    /// in the order the original's file table walks it (0x4125a2), each
+    /// with its name in key form. `directory` is the mount's directory on
+    /// disk, which is scanned recursively, as the original mounts it, and
+    /// `at` the directory's key below it (empty, or ending in `\`).
+    /// Subdirectories are left out.
+    pub(crate) fn listing(
+        directory: &Path,
+        at: &[u8],
+    ) -> Result<(Vec<(Vec<u8>, Resource)>, Vec<String>)> {
+        let mut index = Self {
+            root: directory.to_path_buf(),
+            mounts: Vec::new(),
+            resources: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut directories = Directories::new();
+        index.scan(&mut directories, &[], directory, true)?;
+        let mut listed = Vec::new();
+        if let Some(here) = directories.get(at) {
+            for name in here.table().iter() {
+                let resource = |path: &PathBuf, member: Option<&Member>| Resource {
+                    mount: 0,
+                    path: path.clone(),
+                    member: member.cloned(),
+                };
+                match here.entries.get(name) {
+                    Some(Entry::File(path)) => listed.push((name.to_vec(), resource(path, None))),
+                    Some(Entry::Member(path, member)) => {
+                        listed.push((name.to_vec(), resource(path, Some(member))))
+                    }
+                    Some(Entry::Directory | Entry::Archive) | None => {}
+                }
+            }
+        }
+        Ok((listed, index.diagnostics))
+    }
+
     /// Lists one mount: gathers its directories, then walks them.
     fn walk(&mut self, mount: usize, directory: &Path, recursive: bool) -> Result<()> {
         let mut directories = Directories::new();
