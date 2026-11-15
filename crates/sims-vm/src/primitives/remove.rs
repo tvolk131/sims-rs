@@ -19,7 +19,8 @@
 //! (`Interpreter::take_off`, the object's virtual function 0x50), except
 //! while the load has not worked the rooms out, when `Machine::leave_lot`
 //! in `removal.rs` takes an object already off the lot and fails loudly
-//! for one that is not simple. A tile of a group fails loudly. A person
+//! for one that is not simple. A tile of a group stands for its lead tile
+//! (0x442d9d). A person
 //! leaves through `Interpreter::take_off_to_remove`, the one way a person
 //! leaves the lot that is ported.
 //!
@@ -27,9 +28,11 @@
 //! the objects that depend on it; it is recorded on the object for
 //! whatever carries the removal out.
 
+use crate::factory::word::GROUP;
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine, word};
 use crate::placement::capture;
+use crate::visits::function;
 use sims_sim::rooms::RoomError;
 use std::collections::BTreeSet;
 
@@ -58,12 +61,54 @@ impl Machine<'_, '_> {
         Ok(Flow::Branch(true))
     }
 
+    /// The object the removal queue takes for `id` (0x442d9d to 0x442e38):
+    /// for an object whose definition names a group (word 10, +0x14), and
+    /// that is a tile of one, the group's lead tile, unless the type names
+    /// function 8 (0x42344e), when the tile goes alone. Fails loudly for
+    /// that tile alone, which is not ported, and for an object that is a
+    /// tile of a group without its definition naming one, or names one
+    /// without being a tile (the original then does nothing, 0x442ddd);
+    /// neither is a state the factory makes.
+    fn removed_for(&self, id: u16) -> Result<u16, Trap> {
+        let object = self
+            .world
+            .objects
+            .get(&id)
+            .ok_or(Trap::native(10, "missing object"))?;
+        let interpreter = self.interpreter();
+        let group = interpreter.words(self.world, id)?[GROUP] != 0;
+        match (&object.multipart, group) {
+            (None, false) => Ok(id),
+            (Some(part), true) => {
+                if interpreter.has_function(self.world, id, function::DYNAMIC_GROUP) {
+                    return Err(Trap::Unsupported(
+                        "removing a tile of a group whose type has the dynamic group function \
+                         (8): the tile goes alone (0x442def), which is not ported"
+                            .into(),
+                    ));
+                }
+                Ok(if part.parent == 0 {
+                    id
+                } else {
+                    part.parent as u16
+                })
+            }
+            (Some(_), false) => Err(Trap::Unsupported(format!(
+                "removing object {id}, a tile of a group whose definition names no group \
+                 (0x442db5), which is not ported"
+            ))),
+            (None, true) => Err(Trap::Unsupported(format!(
+                "removing object {id}, whose definition names a group but which is no tile of \
+                 one: the original queues nothing (0x442ddd), which is not ported"
+            ))),
+        }
+    }
+
     /// The removal queue (0x442d70): the object leaves the lot and is
     /// queued, unless it or an object holding it is queued already.
     ///
-    /// 1. A tile of a group stands for its group: the original queues the
-    ///    lead tile unless a test of the object (0x42344e) says otherwise.
-    ///    That test is not decoded, so a tile of a group fails loudly.
+    /// 1. A tile of a group stands for its group: its lead tile is queued
+    ///    instead ([`Machine::removed_for`]).
     /// 2. The objects holding it are walked, each the container of the
     ///    one before as `capture` gives it (0x43265e, 0x4325b5); if one of
     ///    them is queued, nothing happens.
@@ -82,18 +127,7 @@ impl Machine<'_, '_> {
     /// 5. Its mark not to reset what depends on it (object flag 0x1000) is
     ///    set from flag bit 1, and it joins the queue.
     fn queue_removal(&mut self, id: u16, flags: u8) -> Result<(), Trap> {
-        if self
-            .world
-            .objects
-            .get(&id)
-            .ok_or(Trap::native(10, "missing object"))?
-            .multipart
-            .is_some()
-        {
-            return Err(Trap::Unsupported(
-                "removing a tile of a group, which may stand for its lead tile (0x442db5)".into(),
-            ));
-        }
+        let id = self.removed_for(id)?;
         let mut seen = BTreeSet::from([id]);
         let mut holder = id;
         while let Some(container) = capture(self.world, holder)?.container {

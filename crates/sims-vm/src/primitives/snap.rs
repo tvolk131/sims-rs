@@ -74,9 +74,9 @@
 //!
 //! When I do not fit, word 52 and word 54 (+0xb6) are set from the
 //! placement error and the object collided with (0x454e09 to 0x454e9b,
-//! `not_fit`), and the branch is false. A multi-tile object that does not
-//! fit, and a person blocked by another person with flag bit 1, fail
-//! loudly.
+//! `not_fit`), and the branch is false; for a multi-tile object the
+//! object collided with is the last that any of its tiles' tests wrote. A
+//! person blocked by another person with flag bit 1 fails loudly.
 //!
 //! Flag bit 0 makes the animator's offset my distance from the place
 //! (0x454c7a), which the animator's later placing adds to my position;
@@ -101,8 +101,9 @@ use sims_sim::animator::{Animator, LOADED, UNSET};
 enum NotFit {
     /// Its own checks of the place refused, leaving this placement error.
     Code(u32),
-    /// The place test refused.
-    Refused(Refusal),
+    /// The place test refused, leaving the object it last wrote as
+    /// collided with (0x6e4ad0), if any.
+    Refused(Refusal, Option<u16>),
 }
 
 /// The SLOT entry kind of a container slot.
@@ -307,13 +308,20 @@ impl Machine<'_, '_> {
             Some(NotFit::Code(code))
         } else {
             let interpreter = self.interpreter();
-            let test = match container {
-                Some((target, slot)) => {
-                    interpreter.place_test_in(self.world, me, target, slot, to, level)
-                }
-                None => interpreter.place_test(self.world, me, to, level),
-            };
-            test.map_err(|f| f.nested(me))?.err().map(NotFit::Refused)
+            let (test, collided) = match container {
+                Some((target, slot)) => interpreter
+                    .place_test_in(self.world, me, target, slot, to, level)
+                    .map(|test| {
+                        let collided = match test {
+                            Err(Refusal::Collision(other)) => other,
+                            _ => None,
+                        };
+                        (test, collided)
+                    }),
+                None => interpreter.place_test_collided(self.world, me, to, level),
+            }
+            .map_err(|f| f.nested(me))?;
+            test.err().map(|refusal| NotFit::Refused(refusal, collided))
         };
         if let Some(refusal) = refusal {
             self.not_fit(refusal, operands[4] & 2 != 0)?;
@@ -402,20 +410,21 @@ impl Machine<'_, '_> {
     /// 4. Word 54 (+0xb6) becomes the ID of the object collided with, or
     ///    0.
     ///
-    /// The branch is then false. Fails loudly for a refusal that leaves
-    /// whatever code an earlier test left ([`Refusal::Unrecorded`]), and
-    /// for a multi-tile object: its group's test goes on past the first
-    /// tile that refuses and keeps that tile's code, while a later tile's
-    /// collision still writes 0x6e4ad0 (0x422b9e), which is not kept.
+    /// The branch is then false. For a multi-tile object the code is the
+    /// one its group's test keeps and the object the last collision any
+    /// of its tiles wrote (0x422abb,
+    /// [`crate::Interpreter`]`::place_test_collided`). Fails loudly for a
+    /// refusal that leaves whatever code an earlier test left
+    /// ([`Refusal::Unrecorded`]).
     fn not_fit(&mut self, refusal: NotFit, blocked_by_person: bool) -> Result<(), Trap> {
         let (code, collided) = match refusal {
             NotFit::Code(code) => (Some(code), None),
-            NotFit::Refused(Refusal::OffLot) => (Some(1), None),
-            NotFit::Refused(Refusal::Wall) => (Some(7), None),
-            NotFit::Refused(Refusal::Collision(other)) => (Some(11), other),
+            NotFit::Refused(Refusal::OffLot, collided) => (Some(1), collided),
+            NotFit::Refused(Refusal::Wall, collided) => (Some(7), collided),
+            NotFit::Refused(Refusal::Collision(_), collided) => (Some(11), collided),
             // A code other than 1, 7 and 11, which Snap does not test.
-            NotFit::Refused(Refusal::Other) => (None, None),
-            NotFit::Refused(Refusal::Unrecorded) => {
+            NotFit::Refused(Refusal::Other, collided) => (None, collided),
+            NotFit::Refused(Refusal::Unrecorded, _) => {
                 return Err(unsupported(
                     "0x454e66",
                     "to a place where I do not fit, refused with whatever placement error an \
@@ -423,13 +432,6 @@ impl Machine<'_, '_> {
                 ));
             }
         };
-        if self.me()?.multipart.is_some() {
-            return Err(unsupported(
-                "0x454e82",
-                "of a multi-tile object to a place where it does not fit: which object its \
-                 group's test leaves as collided with",
-            ));
-        }
         let code = code.unwrap_or(0);
         self.set_datum(WORD_52, 0)?;
         if self.me()?.person.is_some()

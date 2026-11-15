@@ -39,6 +39,480 @@ A caller that has no layers for a person (passes None) gets the
 stand-in as before. A state kept before the simulation held the layer
 (encodings before format 25) is refused when loaded, not migrated.
 
+## 2026-11-15: A snack ordered in the window is the scripted snack order
+
+In play mode, the window's order path is the one the original takes:
+the pointer reaching the fridge lists its pie (`Lot::pie_menu`, which
+runs the check trees), a press opens it, and a press on Have A Snack
+queues the action the listing offered (`Lot::pick`). The scripted snack
+order (sims-vm's `the_snack_order_pays_for_the_snack`) queues the same
+action by menu number (`Lot::queue_interaction`) without listing first.
+
+- **Verified (a Goth test, `the_snack_ordered_in_the_window_is_the_scripted_order`):**
+  the action queued at step 51 is the same, field for field. From step
+  150, when Mortimer takes the order, the two lots hash the same at
+  every step through step 1136, when the snack ends. Play mode catches no
+  error. Mortimer pays 5 at step 820. The test also checks that the
+  chosen entry carries the action the check trees listed (not the
+  fallback's menu number), and that the lots differ at every step
+  before 150, so it fails if the window skips the listing (from Sol's
+  review, which found the test passed with the fridge forced onto the
+  fallback menu).
+- **The difference before step 150:** the listing's check trees run as
+  Mortimer. They leave his last result and his saved stack frame's
+  words, and nothing else (compared field by field at step 51). His
+  first tree at step 150 rewrites both. The original lists the menu
+  when the pointer reaches an object (0x48c834), so the window's lot is
+  the more faithful of the two. Whether the original's listing leaves
+  the same words in Mortimer's frame is **unverified**: no capture
+  covers a listing.
+- The test finds the fridge on screen without moving the pointer, since
+  each new object the pointer reaches lists a menu and changes the lot.
+  A player's pointer that crossed other objects first would list their
+  menus too.
+
+## 2026-11-15: The piano plays where its object is, and a start sets a track's levels
+
+Kind 43 (`kPlayPiano`) is ported from the sound manager's case for it
+(0x573e5a). The event's own track is not used: the piano is track 1906
+(`Piano`, in `SimsGeneratedHitSource`), and nothing happens without it.
+
+- **The piano's start:** the object (the first argument) is placed as
+  one object with the piano's `Spl` (0x5730b6, as kinds 1 and 30 place
+  each of their objects), into the second and third arguments. When it
+  is not placed they keep the event's values. The piano then starts and
+  is let go (vtable +0x2c), as kind 1 starts a track.
+- **Its instances:** all of the piano's recorded objects are dropped
+  (0x581f8e on the map at +0xd4), and the track object's own object
+  (vtable +0x24, the field at +0xb0) is recorded. Only a fresh start of
+  a `kArgsIdVolPan` track sets that field (vtable +0x20, 0x57db2e). So
+  a start that lets a held piano go, or one refused at the thread
+  limit, leaves the object of the last fresh start, and before any it
+  is 0. The player now keeps that field for every track.
+- **The skill:** the object's source field 5 is asked for (0x570e61),
+  before track 1907 (`SetPianoSkill`) is looked up. When that track
+  exists it starts with the skill as its first argument. Its script
+  writes it into the piano's register 5.
+- **A start sets the track's levels** (0x57db01): a fresh start writes
+  `extvol` and `pan` from the arguments, as the track's `args` field
+  says: the first two for `kArgsVolPan` (the stations), the second and
+  third for `kArgsIdVolPan`. The player left them at their defaults.
+  Kinds 1 and 30 place the track after its start: an object that cannot
+  be placed still takes the sum's values (see the entry on placement),
+  so only a placement fault now leaves them the event's levels. `play_trk`
+  now hands a started `kArgsIdVolPan` track the caller's registers 2
+  and 3 as its levels. A held track let go by a start, and the idle
+  track kind 53 plays on, keep theirs, as in the original.
+- **Model limit:** the original has one piano track object, so a second
+  piano event restarts it; here it runs a second thread (as for every
+  track; see the entry on the sound player's model).
+- **Tests:** hand-built modules check:
+  - the placement, and the event's levels kept;
+  - the skill asked for, with and without its track, and its start;
+  - the instances replaced, also when the start lets a held piano go or
+    is refused at the thread limit;
+  - the levels a fresh start sets for `kArgsVolPan` and for a
+    `kArgsIdVolPan` track that `play_trk` starts. On the
+  install every event still runs without a bad instruction, and
+  `piano_play` now plays notes for ever.
+
+## 2026-11-15: The music modes start and stop the music tracks
+
+Kind 36's music half is ported from the sound manager's mode change
+(0x575170), so the game's modes now play their music. Its ambience half
+was already ported. The music half runs only when the mode changes,
+and only once the neighbourhood (mode 3) has been shown, as in the
+original. The ambience half runs on every kind 36 event, the same mode
+again included: after a stop, a second live (0) event starts the live
+ambience again though the music does not change.
+
+- **What each mode does** is listed on `Player::change_music`. Each
+  start is a track start as kind 1 makes it (vtable +0x2c), with the hit
+  list as the first argument; the scripts (`SetMainMusicSongAndHitList`,
+  `MainMusicLoop`, ...) do the rest.
+- **The expansions in** are a byte of the configuration
+  (`[0x6e48bc]+0x66`), which picks the credits' list and whether the
+  neighbourhood stops the Grim Reaper's loop. It is taken as every
+  expansion (0xff), as the station lists already are; the Complete
+  Collection has them all.
+- **`play_trk`** (0x57f1f2) now starts the track with the caller's own
+  argument registers (1 to 3), not zeros, and copies the caller's
+  `source` (register 47), read through the caller's `target` as any
+  register read is (vtable +0x88), into the new thread. `MainMusicLoop` reads the
+  list its starter was given this way.
+- **`kill_trk`** (0x57f284) now ends the whole track, whatever object
+  it plays for. It ended only the caller's object's threads, which was a
+  guess; the original finds one track object by number and kills it.
+- **Not ported:** the 100 ms `Sleep` the original's game thread takes
+  around most of these starts, which lets its sound thread run between
+  them. Here they happen at once, in order. What that changes is
+  **unverified**.
+- **Known difference:** the original's sound manager steps its tracks
+  and fades once a millisecond (0x57cf37); the player steps them once a
+  block (64 frames, about 2.9 ms). The slow fade into live mode is
+  therefore about three times slower here. This is left for its own
+  change.
+- **Tests:** a hand-built module checks each mode's starts and stops,
+  and `play_trk`'s and `kill_trk`'s. On the install, every event still
+  runs without a bad instruction. 5 more of them leave music or a river
+  playing, and the backyard's ambience test now also plays the
+  neighbourhood's music, which shares the player's random draws.
+
+## 2026-11-15: A route that gives up near its slot runs the failure feedback tree
+
+Go To Routing Slot and Go To Relative Position share the route steps of
+0x45ad63. Step 16 (0x45aef7), giving up, sets the context's result to 1
+if it was 0, writes it to person word 62 and goes to step 7, which fails
+the primitive. Before that, when the slot says the route may end near it
+(flag 0x4000), it looks up the tree named `Route failure feedback`
+(0x6c457c) in the file of the frame's stack object (0x4021f2). If there
+is one, it pushes it through the person's vtable +0x34 (0x45e59b), with
+the stack object as an argument:
+the person is woken (0x44574b), the tree runs on the stack object with
+the arguments result, the context's word +0x8c, 0 and 0 (0x47484a), and
+the person starts using the stack object (a use record at +0xb00 and the
+object's +0xc6 counted, `count_use`). The step then returns 3, clears
+person word 72, saves the context (0x45b9a0) and goes on in step 17
+(0x45afb7), which writes the result to word 62 again and goes to step 7.
+The tree's return value is not read. With no such tree the route goes
+to step 7 at once, as before.
+
+- A push that fails, where the original goes on to step 7 (0x45afb2),
+  is not ported and fails loudly; so does a feedback tree with more
+  than four arguments, since 0x47484a would read past the four given.
+  Step 17, word 72 and the context are written only after the push, as
+  in the original (0x45afac, then 0x45b6ba and 0x45b9a0), so a push that
+  fails leaves the route as it was.
+
+- The frame's stack object must exist: 0x45af5b reads its definition
+  without a check, so a missing one fails loudly here.
+- On the Newbie house (House07) the step runs at tick 1473: person 105
+  gives up on a slot of object 64 with result 3, and the global tree
+  0x18e returns in the same update. Strict mode now runs to tick 1802.
+- The Newbie house matches track 2's recording through update 935 in
+  everything the comparison reads (random streams, cursor, serial,
+  globals, object IDs, and each object's data, temps, attributes,
+  frames and person data), except the words already held as unknown:
+  person word 37, which the planner copies from memory the original
+  never set (see the planner entry), and locals that start on half of a
+  pointer in the frame arena (2625 is 0x0a41, the high half of a code
+  pointer of the capture). Global 12 differs at updates 1 and 3, where
+  the original's interface waits on its tutorial dialogs.
+- Reopen if a recording shows the feedback tree's push failing, or a
+  route giving up near a slot without running it.
+
+## 2026-11-15: The household selection works out again who is a visitor
+
+The Pleasants' house, as the original saved it after moving them in
+(`House06.iff`), holds the Traveling Salesman, an NPC of no family whose
+visitor word (person word 32) is 2. The end of the household selection
+refused any person not of the family, so the house did not load. It now
+does what the original does (0x428041 from 0x4283cf;
+`World::finish_selection`):
+
+1. A person whose type is a neighborhood character, of no family, whose
+   word 67 is not this house, is deleted. A type is a neighborhood
+   character when it was registered from the neighborhood's `Characters`
+   folder: 0x43c228 registers that folder with kind 1, which 0x43ba52
+   keeps in bits 2 and 3 of the type record's +0xb4, and the scan tests
+   for 4 there. Here those are the types whose resource comes from the
+   `Characters` mount (`Index::CHARACTERS`).
+2. Global 26 and flag 4 of the family's record still fail, as before.
+3. Each person's word 32 is worked out again (0x42a2b4): a 0 becomes 1,
+   then 0 if the person's type is one of the family's members (0x41019b,
+   the family's member list at +0x12c), then on a lot not zoned
+   residential (0x40745f: the zoning of global 10's house, house 0
+   residential) a 0 becomes 1 again. Global 10 is read as it stands at
+   this step, not the house number the load was given: an object's Load
+   or Init tree may have changed it, so `World::finish_selection` takes
+   the neighborhood's zoning and reads the global itself.
+4. A neighborhood character who was a resident before the selection (word
+   32 was 0 in the note taken at 0x42821a, `World::residents`) and is now
+   a visitor is deleted (0x4285e2). The family number check after it is
+   for a number below 3000 and from 3010 on, which no number is, so it
+   deletes no one.
+
+The deletions are not ported and fail before anything is written. The
+salesman is not a neighborhood character (his type is from
+`ExpansionPack7.far`), so he stays, with word 32 still 2, as the capture
+has him.
+
+Reading the people also raises the action serial (global 0x6e4904): the
+interaction reader (0x41f1c5) ends with the serial taking the
+interaction's number when that is larger, compared signed (0x41f320),
+and it reads each person's running, last and queued interactions
+(0x45d012, 0x45d01f, 0x45d08b). Nothing resets the serial. The Goths' and
+the Newbies' numbers are all 0, so this changes nothing there; the
+Pleasants' largest is 4, as the capture's serial is after the load.
+
+With these, the Pleasants' load matches track 2's capture
+(`house06-pleasants-ticks-20261115`, entry) in the streams, the globals,
+the action serial, the object IDs and every object's data, temps,
+attributes, frames and person data, but for two things:
+
+- Person 241's fourth frame has tree 0xa029 in the capture and 0x2029
+  here and in the file, like object 19's 0x8118 in the Goth captures.
+  The frame reader (0x474694) writes only the low 15 bits of the tree
+  word and keeps bit 15 from the frame arena, which is freshly allocated
+  and not cleared (0x4750ed clears only its first four bytes); every
+  reader masks the bit off (0x4746c0, 0x4747ea, 0x474f79). The bit is
+  left over from the heap and nothing reads it, so it is not kept.
+- Person 243, the Sim selected, has object data word 50 at 1 and its
+  last result true in the capture, 0 and false here. Word 50 is the
+  word a check tree sets; something in the original's load runs a tree
+  on 243 that is not ported, and what is not found yet.
+
+The first frame then stops. Person 242's head follows person 241 (word 41
+is 241, word 42 is 1), and 242 is drawn before 241, whose animator has
+never been ticked or drawn. The original measures the point on top of
+241's head from the anchor's bone matrices as the skin's construction at
+load left them (0x59293d, 0x59640d, 0x59638f); measuring also places the
+animator (0x592132 sets each unset coordinate from the person's). What
+those matrices hold is not in any capture, so it is not ported and the
+frame fails naming it. In the capture 242's word 42 stays 1 until its
+countdown ends at update 36, so the turn never reached its limit.
+
+The strict Goth run is unchanged to tick 3602, as is the Newbie run.
+
+## 2026-11-15: The selected Sim's actions show in the top left, and a press cancels one
+
+The coordinator asked for the action queue to be drawn as in the
+original, with the icons, their order, and cancel on a click. Track 6
+had nothing for it in `sims-ui`. It is read from the original's code:
+0x4d28df lays the icons out, 0x4ea31c collects them, 0x4ea203 builds
+each, 0x4cabe0 and 0x4cb30c draw them, and 0x4cb126 handles a press,
+which calls 0x45d5f8. The old prototype's
+`legacy/crates/sims-vm/src/scheduler/clock/draw/actions` read the same
+routines and agrees.
+
+- **What shows** (`sims_ui::queue`). The running action comes first,
+  then each queued action in order, each only when its icon names an
+  object. The icons are 45 by 45, the first at (32, 32) and each next
+  one 50 to the right. The picture is drawn first. `kIconFrame` goes
+  over it: blue shows the picture and magenta cuts the corners. A queued
+  action takes the grey cell. The running action takes the yellow cell
+  once person data word 39 is not 0, and the grey one before that. In
+  the snack, word 39 turns 1 at tick 615 (at the fridge), and the eating
+  action the fridge hands over at tick 820 turns yellow at 837. An
+  action with flag 0x100 has `kQueueCancelOverlay`, a red cross, over
+  it. A person's picture is the household's portrait, cell 0. A person
+  outside the household has none and shows as a dark grey (40, 40, 40)
+  square with no frame.
+- **A press** (`Lot::cancel`, `sims_vm::Interpreter::cancel`, 0x45d5f8).
+  On the running action it clears person data word 33 and sets the
+  action's flag 0x100. Unless the person would be interrupted anyway
+  (0x45d7c0), it then queues the person's own interaction 33 at priority
+  50 with no icon, which shows no icon. On a queued action it drops the
+  action, and the target runs function 4 first. The VM already had that
+  branch for routes (`Machine::release_action`), and the cancel uses it.
+  The game plays `UI_queue_delete` (object -4) for a press that counts
+  and `UI_error` for one that does not. A press on a pet's icon (person
+  word 65 above 1) only plays `UI_error`. A second press on the same
+  icon, or on an action already cancelled, does nothing.
+- **Tested** on the Goths, through the game's input layer. The snack
+  is queued from the fridge's pie and its icon shows at (32, 32) with
+  the fridge's picture. A press takes it off with `UI_queue_delete`.
+  Queued again, Mortimer takes it at tick 150. A press on it then shows
+  the cross, and a second press does nothing. The VM test checks the
+  same on `Lot` directly. It also checks the menu-33 action queued
+  behind the running one, and that play mode then parks Mortimer at
+  step 182. There he is walking to the fridge, and stopping a route
+  whose animator is under way (0x45b3eb) is not ported. That is the
+  VM's next gap for a cancel to finish.
+
+**Not done.** An object's catalog picture (0x4ccaa0, which the original
+renders from the object's sprites) is not made yet. An object's icon
+shows its frame over the dark grey of a missing picture.
+The icons do not slide to their places over 500 ms (0x4cb1df), and a
+new icon does not start at the pie. A press during a slide, which the
+original ignores, is taken here. The action's name as a tooltip is left
+out, because the queue keeps no names.
+**Unverified:** that the sound player finds `UI_queue_delete` and
+`UI_error` for object -4 as the original's does. No capture compares the
+drawn icons yet.
+
+**Ours, from Sol's review.** A press on the status band across the top
+is the band's, even where a wrapped note covers an icon. A cancel that
+never reaches the simulation (the lot refuses it, or has stopped) leaves
+the icon to take another press. In the original a cancel cannot fail,
+and it has no such band.
+
+## 2026-11-15: A sound's volume and pan come from where its objects are on the screen
+
+Kinds 1 (for a `kArgsIdVolPan` track) and 30 now set the track's
+`extvol` and `pan` from every object recorded for it, as the original
+does after starting it (0x573795 to 0x5737a4, 0x573d5d to 0x573d6e), in
+`sims_audio::placement`. Each object is placed by 0x5730b6, and the sum
+(0x57473b) takes the loudest volume and the volume-weighted pan, in
+32-bit arithmetic that wraps.
+
+The placement uses the screen when the track's `Spl` (register 57) is
+not 0. `Spl` starts at 20, `spl_normal`, from the default bank for
+registers 50 to 62 (0x6f6898, filled at 0x57c83a to 0x57c97b), and no
+script in the install writes it, so every placed object's volume and pan
+come from the screen: the pan from how far across it the object is, the
+volume from the zoom (the far zoom takes 560 of 1024 away, the medium
+280), less off the middle of the screen, and three fifths of that on a
+floor the view does not show (`placement::project`). The game sends
+each object's position (`sims_sim::Object::position`, the original's
++0xf8, +0xf4 and +0x110; `Snapshot::positions`) and its place on the
+screen with the zoom, the screen's size and the floor shown
+(`Snapshot::screen`, from `sims_game::sound::screen`), again whenever
+the camera changes. The place on the screen is the original's (0x570e09):
+the position rotated into the view about 1023, not the drawing's 1024,
+then projected as the original's view does it (0x4a9dc7,
+`sims_game::sound::fine_point`): the tile's corner, then each part of
+the step across the tile cut toward zero on its own, in 16 bits. A point
+can be a pixel off the drawing's (`project_fine`). The original also
+raises the point, and slants the step, by the heights of the tile's
+corners, which is left out (**unverified** on a lot that is not flat).
+Without a place on the screen the placement is a fault.
+
+The same bank corrects three defaults the player had wrong: register 39
+(`BufSizeMult`) starts at 1 and 52 (`tempo`) at 120, and 40
+(`fade_dest`) at 0, not 1. So a `seqgroup_kill` (0x57eef3), which fades
+the holder without setting `fade_dest`, now fades it to 0, not 1.
+
+What the original does with an object it cannot place is kept: an ID
+that names no object, or an object with a first or second coordinate
+of 0, leaves the previous object's values, and the first object's are
+pan 0 and a volume a local held before: the address of the sound
+manager's instance map (0x576235), on the heap. Here that address is
+0x10000d4, **unverified**. It outweighs the other objects in the pan,
+and both the pan and the volume come out where the 32-bit arithmetic
+wraps them: with this address and a `vol` of 1024 the track plays at
+212 of 1024, not at full. A `kArgsIdVolPan`
+kind 1 with object 0 now starts nothing (0x57375b), where it started
+the track; kind 30 records object 0 as an instance, where it skipped it.
+The writes leave the comparison flags the pan's.
+
+The volume and pan are worked out when the event comes, as the original
+does, so `Player::handle` and `Player::play_from` now take the game's
+`Sources`. A track's instances go in the original's multimap's order
+(0x5761c2): the first recorded, then the others newest first. The
+order the map's growth gives them (0x5762c7) is not ported; it only
+matters for an object that cannot be placed.
+
+Not ported: placing every track again on kind 33 (0x57447f), which the
+original's game sends when the camera moves. The game here sends kind
+33 every frame, and placing again would undo a fading `extvol` each
+frame. Also not ported: the limit of 16 voices that kind 1 checks first
+(0x574a87).
+
+**Unverified:** nothing of this has been compared with the running game.
+
+## 2026-11-15: A group snaps where it does not fit and is deleted; strict mode to tick 3602
+
+**Unverified.** No capture covers any of it: the Goth captures end at
+update 1000. Strict mode now runs through tick 3602 (08:30:48, hash
+07ce1fc9…) and stops at tick 3603, where object 354 uses Create New
+Object Instance mode 6 with flag 0x4: the stop the snack order already
+reached, which track 4 has. The snapshot format does not change, and
+every summary line of `sims boot … --ticks 3432` and every pinned hash
+up to tick 3432 is unchanged.
+
+**Snap of a multi-tile object that does not fit** (stop at tick 3433,
+0x454e82). The group's place test (0x422abb) goes on through every tile
+after one refuses (0x422c08), and each tile's collision writes the
+object collided with (0x6e4ad0, 0x433b42) over the last; nothing else in
+the test writes or clears it. So Snap's word 54 is the last object any
+tile's test wrote, whichever tile's code the group keeps
+(`Interpreter::place_test_collided`), and a group's
+`Refusal::Collision` names that object too. At tick 3433 object 334,
+the lead of the car junk (`CarJunk.iff`, GUID 0x4B748E3B, 18 tiles,
+made with the school bus at tick 2703), snaps to a place off the lot:
+word 52 becomes 2 and word 54 0.
+
+**Find Location For mode 1 and Remove Object Instance on a tile of a
+group** (stop at tick 3434, 0x44b52a). Both first ask whether the
+tile's type names function 8 (0x42344e, the first word of callback
+entry 8). If it does, the tile leaves its group first (0x42346a; for
+the removal, the tile goes alone, 0x442def), which is not ported and
+fails loudly. If not, Find Location takes the whole group off
+(0x422d86: every tile is asked function 10, then every tile leaves),
+and the removal queue takes the group's lead tile in place of the tile
+(0x442d9d to 0x442e38). At tick 3434 object 334's tree 0x2000 does
+both on itself (node 33, then node 2, which yields).
+
+**A group is deleted** (0x440f37). At the end of the update the
+registry's drain (0x442447 to 0x4424c1) makes the same test of
+function 8 for a tile of a group, then removes it at once (0x44123f):
+its function 0x50 takes the group off again, and the deletion
+(0x440eeb with 0) goes to the lead (0x440f6f), which marks every tile
+for deletion (flag 0x40, not kept) and deletes each tile in turn along
+the group's list (0x440fe3, with 1), reading the next tile first. Each
+tile's reset (0x431fbe) runs its Reset tree if its type has one, or else
+takes what is left of its group off once more (function 0x50 with 1,
+0x432055), so every remaining tile is asked function 10 again. Each
+tile's destructor (0x42283a) then takes it out of its group (0x4228d6):
+the lead hands the group to the next tile, which every later tile takes
+as its lead. So the take-offs ask function 10 of n, n, n − 1, …, 1
+tiles. None of the car junk's tiles has a Reset tree, function 9 or
+function 10, so at tick 3434 those take-offs run no tree; all 18 tiles
+go.
+
+**A deletion's reset stops the object's sounds.** Every path of an
+object's reset (0x431fbe) with argument 0, which the deletion
+(0x4410a5), error recovery (0x439acc) and the load's visit (0x431f68)
+all pass, meets at 0x43208b and asks the sound system to stop the
+object's sounds (0x4320b4); a nonzero argument jumps straight to the
+exit (0x431fc7 to 0x4320d4); the deletion's mark (flag
+0x40) only spares the rebuild (0x432063). The port had left that stop
+out for a deletion, so a deleted object now notes `SoundEvent::Stop`
+twice, from its reset and from its destructor (0x4323c9). Sound
+requests are not in the snapshot, so no hash changes. Sol found this.
+
+A tile of a group removed before the load has worked the rooms out
+(the load's clear) fails loudly: its take-off needs them.
+
+**Review gaps closed.** Sol's review of #170 noted three optional
+regressions. Two are added: a take-off callback that puts something in
+the person's hand is caught by the check after the callbacks, and a
+tile of a group in the head slot fails (0x58dc08). Selection at a
+nonzero view rotation is not: it needs a loaded lot whose indicator
+trees read Generic Sims Call routine 12.
+
+## 2026-11-15: The panel follows the lot; a portrait under the pointer shows a first name
+
+The coordinator asked for the panel to be wired to live state: the
+selected Sim's motives, the clock, the household's money and the
+selected Sim. Most of it already was. `Hud::draw` lays the panel out
+from `Snapshot::read(world)` every frame, and the window draws a frame
+after every batch of ticks. What is new:
+
+- **A test that it follows the lot.** The Goth test that queues Have A
+  Snack from the fridge's pie now runs 850 ticks on. The panel's text
+  has to show the world's clock and funds before and after. The funds
+  show $2,542 and then $2,537, after Mortimer pays 5 at tick 820. The
+  clock moves, and the needs panel's first meter has to be the selected
+  Sim's hunger (motive 7) both times. `Game::panel()` gives the items
+  last laid out.
+- **The selected Sim.** The strip already lights the selected Sim's
+  portrait (the template's selected cell). The original's live
+  screen shows nothing else of the selected Sim's own. The icon in the
+  top-left corner of the original's screenshots is the action queue
+  (a bed, and a Sim's head for a social interaction), not the selected
+  Sim's portrait. That queue is not drawn yet.
+- **The name.** A person's first name is the first string, in US
+  English, of the catalog strings (`CTSS`) that word 41 of the type's
+  `OBJD` names. Mortimer's file has 2000 there, and `CTSS` 2000 starts
+  with "Mortimer". Word 19 of the same file is 200, its body strings, so
+  the count of words is right. `Faces` reads the name with the face.
+  While the pointer is on a portrait, the panel draws that person's name
+  in a box over the strip, above the portrait. The box takes no presses
+  and does not cover the lot.
+  **Unverified, and ours:** where and how the original shows a name.
+  We believe it shows one on hovering a portrait, but no capture has
+  been compared. The box's look (the needs panel's label color on
+  black, font 8) is ours. Reopen when the harness can hover a portrait.
+  The box is as tall as the font's line with 2 pixels above and below,
+  so descenders stay inside it, and its bottom is 2 pixels above the
+  strip. It is kept inside the frame: a name wider than the frame is cut
+  short. The name goes when the pointer leaves the window. (Sol's review
+  of the first version found the box overflowing at extreme rects,
+  descenders below it, the box off the top of a short window, and the
+  name staying after the pointer left.)
+
 ## 2026-11-15: A lit lamp's pool reaches the walls beside it; grass takes none
 
 Straight walls now take lamp pools, from the wall tables in
@@ -2484,8 +2958,9 @@ Where the requests come from, read from the code:
 - **Go To Routing Slot.** It plays "begin_route" as a route starts
   (0x45b989) and "end_route" after every stop (0x45b3a0).
 - **Stops.** Stop All Sounds (0x45256e) stops sounds, and so do an
-  object's reset unless it is being deleted (0x4320b4) and the
-  destructor (0x4323c9). A person's reset makes no direct call.
+  object's reset (0x4320b4) and the destructor (0x4323c9). (This first
+  said a reset for a deletion stops nothing; it does, corrected in the
+  entry for tick 3602.) A person's reset makes no direct call.
 
 In 870 play ticks the Goth house plays 62 sounds and stops 50:
 begin_route 21, end_route 18, door_open 4, and so on.
