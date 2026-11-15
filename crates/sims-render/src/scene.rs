@@ -19,9 +19,9 @@ const GRASS_COLUMN: i32 = 1;
 /// Object sprites sit one pixel right of the point the camera projects
 /// them to, measured against the walls and floors around them. The camera
 /// origin is fitted to the tile art, and the original places the two
-/// kinds of art one pixel apart; at all three zooms and both measured
-/// rotations the gap is this same pixel (see the decisions log,
-/// 2026-11-15).
+/// kinds of art one pixel apart; at every compared camera (far and
+/// medium zoom) the gap is this same pixel. Near zoom is unverified (see
+/// the decisions log, 2026-11-15).
 const OBJECT_COLUMN: i32 = 1;
 
 /// What the window shows outside the lot: the original's grey (5-6-5

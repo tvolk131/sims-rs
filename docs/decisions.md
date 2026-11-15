@@ -38,9 +38,10 @@ matches pixel for pixel on its right edge and handle. One column of
 its left jamb (x 466) still shows the wall in our render and the door
 in the original's. Our wall there is 13 depth bytes in front of the
 door frame, and its doorway mask opens one column later. Shifting the
-doorway masks left lowers the match, so the mask is placed right. The
-original's wall probably has a deeper edge around the opening that a
-flat wall depth does not reproduce; **unverified**. Window and door
+doorway masks one pixel either way lowers the overall match, so we keep
+them where they are; that does not prove they are exact at this column.
+The original's wall may have a deeper edge around the opening that a
+flat wall depth does not reproduce. Both are **unverified**. Window and door
 frames also differ by one light step in places. The original's
 screenshot also has a cardboard box by the front door that a tick-1
 world does not have.
