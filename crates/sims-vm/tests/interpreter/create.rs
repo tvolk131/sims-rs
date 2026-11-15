@@ -18,6 +18,9 @@ const CREATE: u16 = 42;
 /// The lamp's SLOT chunk.
 const SLOTS: u16 = 300;
 const NOT_BESIDE_ITS_TYPE: u8 = 0x1;
+/// The widget's Main tree, and the global tree that sleeps (`factory`).
+const MAIN: u16 = 4097;
+const SLEEP: u16 = 256;
 
 /// A container slot at the object's centre, at height 1.
 fn container_slot() -> Slot {
@@ -359,21 +362,62 @@ fn mode_5_puts_the_new_object_where_the_running_object_stands() {
 }
 
 #[test]
-fn flag_0x10_without_0x2_does_nothing() {
-    // 0x44e88c reads flag 0x10 only with 0x2.
+fn flag_0x10_puts_my_temp_0_in_the_new_objects_bottom_frame() {
+    // 0x44e8e1 to 0x44e90c: without 0x2, the running object's temp 0
+    // (+0x3a) goes to the first data word of the new object's bottom
+    // frame (+0x10): its first argument. Nothing else changes.
     for mode in [2, 4, 5, 6] {
         let (mut fx, _) = container();
+        fx.lamp_mut().temps[0] = 42;
         let before = ids(&fx);
         assert_eq!(
             create(&mut fx, mode, 0x10, LAMP as i16),
             Ok(true),
             "mode {mode}"
         );
-        new_object(&fx, &before);
+        let id = new_object(&fx, &before);
         let (mut plain, _) = container();
+        plain.lamp_mut().temps[0] = 42;
         assert_eq!(create(&mut plain, mode, 0, LAMP as i16), Ok(true));
+        let bottom = &plain.world.objects[&id].stack[0];
+        assert!(!bottom.parameters.is_empty(), "mode {mode}");
+        assert_ne!(bottom.parameters[0], 42, "mode {mode}");
+        plain.world.objects.get_mut(&id).unwrap().stack[0].parameters[0] = 42;
         assert_eq!(fx.world.hash(), plain.world.hash(), "mode {mode}");
     }
+}
+
+#[test]
+fn flag_0x10_with_no_argument_writes_the_first_local_or_fails_loudly() {
+    // The frame's data is its arguments, then its locals (0x47518f): a
+    // bottom frame with no argument has its first local written, and one
+    // with neither fails before anything past it is written.
+    let run = |locals: u16| {
+        let (mut fx, file) = container();
+        fx.add(
+            file,
+            MAIN,
+            shaped(
+                0x8002,
+                0,
+                0,
+                locals,
+                vec![ins(SLEEP, 0, ERROR, [20, 0, 0, 0, 0, 0, 0, 0])],
+            ),
+        );
+        fx.lamp_mut().temps[0] = 42;
+        let before = ids(&fx);
+        let result = create(&mut fx, 6, 0x10, LAMP as i16);
+        (fx, before, result)
+    };
+    let (fx, before, result) = run(2);
+    assert_eq!(result, Ok(true));
+    let bottom = &fx.world.objects[&new_object(&fx, &before)].stack[0];
+    assert_eq!(bottom.tree, MAIN);
+    assert!(bottom.parameters.is_empty());
+    assert_eq!(bottom.locals, [42, 0]);
+    let (_, _, result) = run(0);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x44e90c")),);
 }
 
 #[test]

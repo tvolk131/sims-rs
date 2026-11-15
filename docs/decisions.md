@@ -6,9 +6,13 @@ says what was decided, why, and what would reopen it. Entries marked
 
 ## 2026-11-15: A seated route, Drop, pets, runs and the route-failure feedback; strict mode to tick 9906
 
-**Unverified.** No capture covers any of it: the Goth captures end at
-update 1000. Strict mode now runs through tick 9906 (12:00:56, hash
-643bf9dd…) and stops at tick 9907, where object 5 (tree 0x1005 node 5)
+**Unverified.** The Goth day capture (`goth-day-20261115`, past update
+8699) covers these ticks, but this run has not been compared with it.
+One word was read from it: at update 6756 the new pet's bottom frame
+(Main) has the arguments -2, 0, 0, 0, the -2 being the maker's temp 0
+that Create flag 0x10 copies (below); before the fix this port left 0
+there. Strict mode now runs through tick 9906 (12:00:56, hash
+c8240fc7…) and stops at tick 9907, where object 5 (tree 0x1005 node 5)
 runs Set To Next mode 11. The snack order stops on the same at step
 9907. Snapshot format 27 appends the neighborhood's data words
 (`World::neighborhood_data`); every pinned state up to tick 3912 is the
@@ -33,8 +37,11 @@ for its update (0x590d26).
 - **Create New Object Instance modes 2 and 5, and flag 0x10.** Mode 2
   (0x44e22f) puts the new object in the running object's first
   container slot, mode 5 (0x44e3e9) where the running object stands.
-  Flag 0x10 is read only with flag 0x2 (0x44e88c), so alone it does
-  nothing.
+  Flag 0x10 without flag 0x2 (0x44e8e1 to 0x44e90c) writes my temp 0
+  (+0x3a) to the first data word of the new object's bottom frame: its
+  first argument, or its first local if it takes no argument; a bottom
+  frame with neither fails loudly. With 0x2 it is native error 0x36
+  (0x44e88c), and 0x2 is not ported.
 - **Drop** (opcode 5, 0x454430): what my first container slot holds
   goes one tile in front of me, after its place test.
 - **A person's reset ends its object uses first** (0x45e814): frames

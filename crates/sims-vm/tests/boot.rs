@@ -569,7 +569,7 @@ const TICK_3912: &str = "0045276c46ed63146dac1d55f0042b964bfb169fb1f0e26e5987f6b
 const TICK_3912_26: &str = "41652f2fbb6dad9eec17b3fcb49d4546da8f2fa6b4bab1957cd831491f6cc285";
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 9906
 /// --answers 3` gives this hash, the last tick strict mode reaches.
-const TICK_9906: &str = "643bf9dd41cb51d5cc3343cb472eb55a8f53579a38f1dab0ebfa180eb0655cae";
+const TICK_9906: &str = "c8240fc703c03716105cd4d2e554ef225259aac9799c8d3e91de604f25cee599";
 
 #[test]
 fn strict_mode_runs_to_tick_9906_past_noon() {
@@ -646,7 +646,8 @@ fn strict_mode_runs_to_tick_9906_past_noon() {
     assert_eq!(clock(&lot), (8, 41, 8));
     // Tick 3913: object 16, seated, asks for a route, and stands up first
     // (0x4832d4). Tick 6756: a pet is made (the pet guard 0x440d63 lets it
-    // be, with the expansions installed); from 6760 it looks for a place
+    // be, with the expansions installed), its Main's first argument the
+    // maker's temp 0, -2, as in the capture (Create flag 0x10); from 6760 it looks for a place
     // to go with no seats (0x4823d0), on its own pace (planner data word
     // 17) and turns at a pet's rate (0x58df67). Tick 6784: it stops
     // running (animator state 11). Tick 7702: an inventory count goes up

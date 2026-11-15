@@ -38,9 +38,13 @@
 //! (`Machine::finish_new`; 0x4021f2, 0x474afb). For any other object
 //! that does nothing.
 //!
-//! Flag 0x10 is read only with flag 0x2 (0x44e88c: the two together are
-//! native error 0x36). Flag 0x2 is not ported, so 0x10 does nothing here,
-//! with any mode.
+//! Flag 0x10 without flag 0x2 (0x44e8e1 to 0x44e90c), after "init
+//! visitor": if the new object's thread has a frame, the running object's
+//! temp 0 (+0x3a) is written to the first word of its bottom frame's data
+//! (0x474fa8 with 0, frame +0x10 by 0x47518b): its first argument, or its
+//! first local if it takes no argument. A bottom frame with neither fails
+//! loudly. With flag 0x2 it is native error 0x36 (0x44e88c); flag 0x2 is
+//! not ported. See `Machine::finish_new`.
 //!
 //! Flag 0x1 (0x44e4e1), the tail's first test: if an object of the same
 //! type already stands on the tile the new object is to go to, or is held
@@ -87,9 +91,10 @@ const FROM_RECORD: u8 = 0x4;
 /// Person data word 32 (+0x5cc): nonzero for a visitor.
 const VISITOR: usize = 32;
 
-/// Flag 0x10: read only with flag 0x2, the two together being native
-/// error 0x36 (0x44e88c); alone it does nothing.
-const WITHOUT_0X2: u8 = 0x10;
+/// Flag 0x10: without flag 0x2, the running object's temp 0 goes into
+/// the new object's bottom frame (0x44e8e1); with it, native error 0x36
+/// (0x44e88c), which is not reached here as 0x2 is not ported.
+const TEMP_0_TO_NEW: u8 = 0x10;
 
 /// The tree a new visitor runs with flag 0x4 (the string at 0x6c4120).
 const INIT_VISITOR_TREE: &str = "init visitor";
@@ -108,9 +113,9 @@ impl Machine<'_, '_> {
         let guid = u32::from_le_bytes([operands[0], operands[1], operands[2], operands[3]]);
         let (mode, flags) = (operands[4], operands[5]);
         let supported = match mode {
-            2 | 4 => flags & !(NOT_BESIDE_ITS_TYPE | FROM_RECORD | WITHOUT_0X2) == 0,
+            2 | 4 => flags & !(NOT_BESIDE_ITS_TYPE | FROM_RECORD | TEMP_0_TO_NEW) == 0,
             5 | 6 | 8 => {
-                flags & !(NOT_BESIDE_ITS_TYPE | FACE_AS_STACK_OBJECT | FROM_RECORD | WITHOUT_0X2)
+                flags & !(NOT_BESIDE_ITS_TYPE | FACE_AS_STACK_OBJECT | FROM_RECORD | TEMP_0_TO_NEW)
                     == 0
             }
             _ => false,
@@ -193,8 +198,10 @@ impl Machine<'_, '_> {
     /// 0x4749b5), with itself as the stack object and, as the arguments
     /// pointer is null, its own temps as the arguments (0x47484a). What it
     /// returns is not read, and no tree of that name runs nothing. Any
-    /// other object does nothing here. Then the new object becomes the
-    /// stack object and the true branch is taken (0x44e90f).
+    /// other object does nothing here. Then flag 0x10 writes the running
+    /// object's temp 0 to the first data word of the new object's bottom
+    /// frame (0x44e8e1 to 0x44e90c; module doc). Then the new object
+    /// becomes the stack object and the true branch is taken (0x44e90f).
     fn finish_new(&mut self, created: u16, flags: u8) -> Result<bool, Trap> {
         if flags & FROM_RECORD != 0 {
             let object = self
@@ -233,6 +240,33 @@ impl Machine<'_, '_> {
                             ))
                         })?;
                 }
+            }
+        }
+        if flags & TEMP_0_TO_NEW != 0 {
+            let value = *self
+                .me()?
+                .temps
+                .first()
+                .ok_or(Trap::Invalid("an object with no temps".into()))?;
+            let object = self
+                .world
+                .objects
+                .get_mut(&created)
+                .ok_or(Trap::native(10, "missing object"))?;
+            if let Some(bottom) = object.stack.first_mut() {
+                // The frame's data is its arguments, then its locals
+                // (0x47518b, 0x47518f).
+                let word = match bottom.parameters.first_mut() {
+                    Some(word) => word,
+                    None => bottom.locals.first_mut().ok_or_else(|| {
+                        Trap::Unsupported(format!(
+                            "Create New Object Instance flag 0x10 writing past the bottom \
+                             frame of object {created}, which has no argument or local \
+                             (0x44e90c)"
+                        ))
+                    })?,
+                };
+                *word = value;
             }
         }
         self.frame_mut()?.stack_object = created as i16;
@@ -464,7 +498,7 @@ impl Machine<'_, '_> {
     /// group (word 10, which sends the original through a group's own
     /// steps) fails loudly before anything is made. Flags 0x2, 0x8 and
     /// 0x40, which this mode can also carry, are refused by the caller;
-    /// flag 0x4 only chose the type, and 0x10 does nothing without 0x2.
+    /// flag 0x4 only chose the type.
     fn create_at_local(&mut self, guid: u32, flags: u8, local: i8) -> Result<bool, Trap> {
         let frame = self.frame()?;
         let local = usize::try_from(local)
