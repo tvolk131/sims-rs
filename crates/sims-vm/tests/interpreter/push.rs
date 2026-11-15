@@ -575,8 +575,10 @@ fn the_pie_menu_lists_each_entry_whose_check_passes_in_order() {
     let listed = interpreter
         .pie_menu(&mut fx.world, SIM, LAMP)
         .unwrap_or_else(|f| panic!("{f}"));
+    assert!(listed.iter().all(|e| e.name.is_none()));
     let shown: Vec<_> = listed
         .iter()
+        .map(|e| &e.action)
         .map(|a| (a.table_index, a.flags, a.action, a.uid, a.priority))
         .collect();
     assert_eq!(
@@ -600,14 +602,14 @@ fn a_picked_action_is_queued_as_listed() {
     let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     let listed = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap();
     assert_eq!(
-        interpreter.pick(&mut fx.world, SIM, listed[0].clone()),
+        interpreter.pick(&mut fx.world, SIM, listed[0].action.clone()),
         Ok(Some(1))
     );
     let queue = &fx.sim().person.as_ref().unwrap().queue;
     let [queued] = queue.as_slice() else {
         panic!("{queue:?}");
     };
-    let mut expected = listed[0].clone();
+    let mut expected = listed[0].action.clone();
     expected.uid = 1;
     assert_eq!(format!("{queued:?}"), format!("{expected:?}"));
     // The same as an order for the entry.
@@ -622,7 +624,7 @@ fn a_picked_action_is_queued_as_listed() {
     );
     // An entry that runs at once is not ported.
     let fault = interpreter
-        .pick(&mut fx.world, SIM, listed[1].clone())
+        .pick(&mut fx.world, SIM, listed[1].action.clone())
         .unwrap_err();
     assert!(
         matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x45d240")),
@@ -666,9 +668,9 @@ fn a_picked_action_whose_entry_is_gone_is_not_queued() {
     let listed = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap();
     // Its menu number is no longer in the table, or its target has no
     // table: nothing is queued and no number is used (0x45d22a).
-    let mut renumbered = listed[0].clone();
+    let mut renumbered = listed[0].action.clone();
     renumbered.table_index = 9;
-    let mut on_sim = listed[0].clone();
+    let mut on_sim = listed[0].action.clone();
     on_sim.target = SIM as i16;
     for action in [renumbered, on_sim] {
         assert_eq!(interpreter.pick(&mut fx.world, SIM, action), Ok(None));
@@ -717,30 +719,120 @@ fn each_listed_action_reads_whether_i_am_a_visitor_after_the_checks_before_it() 
     let listed = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap();
     let made: Vec<_> = listed
         .iter()
-        .map(|a| (a.table_index, a.attenuation))
+        .map(|e| (e.action.table_index, e.action.attenuation))
         .collect();
     assert_eq!(made, [(3, 0.25), (4, 0.75)]);
 }
 
+/// Add/Change Action String's operands: string `index` (from 1) of the
+/// string table 300.
+fn action_string(index: u8) -> [u8; 8] {
+    let mut operands = [0; 8];
+    operands[..2].copy_from_slice(&300u16.to_le_bytes());
+    operands[4] = index;
+    operands
+}
+
+/// A menu lot whose lamp's file has string table 300 with `strings`.
+fn named_menu_lot(entries: Vec<Interaction>, strings: &[&str]) -> Fixture {
+    let mut fx = menu_lot(entries);
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .strings
+        .insert(300, strings.iter().map(|s| s.to_string()).collect());
+    fx
+}
+
 #[test]
-fn an_action_string_while_the_menu_is_listed_fails_loudly_and_temps_come_back() {
-    // Menu 3's check writes temp 0, then menu 4's runs Add/Change Action
-    // String, which would add an entry to the menu (0x458789).
-    let mut fx = menu_lot(vec![with_test(3, 0, 4300), with_test(4, 0, 4302)]);
-    temp_writing_check(&mut fx);
+fn a_check_tree_adds_named_entries_in_place_of_its_action() {
+    // Menu 3's check names two entries and passes; menu 4's names one and
+    // refuses; menu 5 has no check tree. Menu 3's check writes temp 0.
+    let mut fx = named_menu_lot(
+        vec![
+            with_test(3, 0x100, 4302),
+            with_test(4, 0, 4303),
+            entry(5, 0),
+        ],
+        &["Have Snack", "Serve Dinner", "Grab Juice"],
+    );
     fx.add(
         LAMP_FILE,
         4302,
-        tree(vec![ins(50, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
+        tree(vec![
+            assign(scope::TEMPS, 0, scope::LITERAL, 99, 1),
+            ins(50, 2, RETURN_FALSE, action_string(1)),
+            ins(50, RETURN_TRUE, RETURN_FALSE, action_string(2)),
+        ]),
+    );
+    fx.add(
+        LAMP_FILE,
+        4303,
+        tree(vec![
+            ins(50, 1, RETURN_FALSE, action_string(3)),
+            ins(0, RETURN_FALSE, RETURN_FALSE, [0; 8]),
+        ]),
     );
     fx.sim_mut().temps[0] = 11;
     let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    let fault = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap_err();
-    assert!(
-        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x458789")),
-        "{fault}"
+    let listed = interpreter
+        .pie_menu(&mut fx.world, SIM, LAMP)
+        .unwrap_or_else(|f| panic!("{f}"));
+    let shown: Vec<_> = listed
+        .iter()
+        .map(|e| {
+            let a = &e.action;
+            (e.name.as_deref(), a.table_index, a.flags, a.args, a.target)
+        })
+        .collect();
+    // Each named entry is a copy of the action being checked, with flags
+    // 4 and 8, the stack object (the lamp) as its first argument; the
+    // action itself is left out whether or not its check passed.
+    let lamp = LAMP as i16;
+    assert_eq!(
+        shown,
+        [
+            (Some("Have Snack"), 3, 0xd, [lamp, 0, 0, 0], lamp),
+            (Some("Serve Dinner"), 3, 0xd, [lamp, 0, 0, 0], lamp),
+            (Some("Grab Juice"), 4, 0xc, [lamp, 0, 0, 0], lamp),
+            (None, 5, 0xc, [0; 4], lamp),
+        ]
     );
+    assert!(listed.iter().all(|e| e.action.priority == 50));
     assert_eq!(fx.sim().temps[0], 11);
+    // Picking a named entry queues its action, arguments and all.
+    assert_eq!(
+        interpreter.pick(&mut fx.world, SIM, listed[1].action.clone()),
+        Ok(Some(1))
+    );
+    let queued = &fx.sim().person.as_ref().unwrap().queue[0];
+    assert_eq!((queued.table_index, queued.args), (3, [lamp, 0, 0, 0]));
+}
+
+#[test]
+fn an_entrys_string_with_a_token_or_missing_fails_loudly() {
+    // Index 2 has a token the formatter would replace; 0 and 3 are not in
+    // the table.
+    for (index, address) in [(2, "0x44bf1a"), (0, "0x4704fa"), (3, "0x4704fa")] {
+        let mut fx = named_menu_lot(vec![with_test(4, 0, 4302)], &["Eat", "Eat $Object"]);
+        fx.add(
+            LAMP_FILE,
+            4302,
+            tree(vec![ins(
+                50,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                action_string(index),
+            )]),
+        );
+        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        let fault = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap_err();
+        assert!(
+            matches!(&fault.trap, Trap::Unsupported(m) if m.contains(address)),
+            "{index}: {fault}"
+        );
+    }
 }
 
 /// A menu lot whose lamp heads tile (2, 2) of level 1, with a second
@@ -817,7 +909,10 @@ fn a_menu_that_offers_nothing_lists_the_other_objects_on_the_tile() {
         .unwrap_or_else(|f| panic!("{f}"));
     // The lamp offers nothing; object 3's menu 5 passes, because the
     // lamp's own temps are not yet put back when object 3 is listed.
-    let shown: Vec<_> = listed.iter().map(|a| (a.target, a.table_index)).collect();
+    let shown: Vec<_> = listed
+        .iter()
+        .map(|e| (e.action.target, e.action.table_index))
+        .collect();
     assert_eq!(shown, [(3, 5)]);
     // All the temps are put back in the end.
     assert_eq!(fx.sim().temps[0], 11);
