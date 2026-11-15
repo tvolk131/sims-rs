@@ -1513,11 +1513,13 @@ stop-sounds events.
   the camera and the hour move, on the score's beat. The ambience modes
   (52) and the ambience half of the music modes (36) are ported, so 24
   events remain.
+- **Done: live playback.** The `play` example plays events (and the
+  ambience) on the default output device, behind the `playback`
+  feature (cpal), off by default; tests and CI build none of it.
 - **Next:**
   - The simulation emits `SoundEvent`s (the interface is in the
     decisions log), and gives the camera value and the hour for the
     ambience's cursor.
-  - Live playback behind a feature.
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)

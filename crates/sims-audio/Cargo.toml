@@ -12,9 +12,19 @@ publish = false
 sims-formats.workspace = true
 symphonia-bundle-mp3 = { version = "0.5.5", default-features = false, features = ["mp3"] }
 symphonia-core = "0.5.5"
+# Live playback, for the `play` example only; off by default so tests and
+# CI need no audio device or system audio library.
+cpal = { version = "0.18.2", optional = true }
+
+[features]
+playback = ["dep:cpal"]
 
 [dev-dependencies]
 sha2.workspace = true
+
+[[example]]
+name = "play"
+required-features = ["playback"]
 
 [lints]
 workspace = true
