@@ -6,7 +6,7 @@
 //! captured them from the running game's windows
 //! (legacy/crates/sims-app/src/hud_cluster.rs and original_hud.rs); the
 //! rest were measured on a screenshot of the original (see
-//! `docs/decisions.md`). At another size the cluster keeps to the bottom
+//! `docs/decisions/`). At another size the cluster keeps to the bottom
 //! left, the strip runs from it to the right edge, the needs keep to the
 //! right edge and the strip's background stretches its last column, as
 //! the original does when its window is wider than 800.

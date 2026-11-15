@@ -58,7 +58,7 @@
 //!
 //! Mode 8 making a person is what the Goth house's tick 6 does (object
 //! 382 makes person 259). The state after it, and after ticks 7 to 13 in
-//! which that person runs, equals the capture's (`docs/decisions.md`).
+//! which that person runs, equals the capture's (`docs/decisions/`).
 //! Mode 6 with flag 0x4 is what its tick 3603 does (object 354, tree
 //! 0x1022, makes two neighbors' people off the lot), which is
 //! **unverified**: there is no capture past tick 1000.

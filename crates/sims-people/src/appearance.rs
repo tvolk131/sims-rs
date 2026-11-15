@@ -72,16 +72,21 @@ impl Outfit {
         let mut parts: Vec<(String, String)> = [1, 17, 18, 2]
             .into_iter()
             .filter_map(|row| strings.get(row))
-            .map(|s| {
-                let first = s.split_once(';').map_or(s.as_str(), |(a, _)| a);
-                match first.split_once(',') {
-                    Some((name, textures)) => (name.trim().to_owned(), textures.trim().to_owned()),
-                    None => (first.trim().to_owned(), String::new()),
-                }
-            })
+            .map(|s| body_string(s))
             .collect();
         parts.retain(|(name, _)| !name.is_empty());
         Self { parts }
+    }
+}
+
+/// A body string's everyday appearance and its texture string: the part
+/// before any `;`, split at its first `,` (see
+/// [`Outfit::from_body_strings`]).
+pub fn body_string(s: &str) -> (String, String) {
+    let first = s.split_once(';').map_or(s, |(a, _)| a);
+    match first.split_once(',') {
+        Some((name, textures)) => (name.trim().to_owned(), textures.trim().to_owned()),
+        None => (first.trim().to_owned(), String::new()),
     }
 }
 
@@ -264,7 +269,27 @@ fn appearance_rank(folder: &str) -> usize {
 /// (such as an expansion's object folder) are loaded after all the others,
 /// where the original may not load them at all.
 pub fn load_appearance(assets: &Assets, name: &str) -> Result<Appearance, String> {
-    let index = assets.appearances(|| {
+    let (file, resource) = appearance_index(assets)
+        .get(&name.to_ascii_lowercase())
+        .ok_or_else(|| format!("no catalog holds the appearance {name:?}"))?;
+    let bytes = resource.read().map_err(|e| format!("{file}: {e}"))?;
+    parse_catalog(file, &bytes)?
+        .appearances
+        .into_iter()
+        .find(|a| a.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| format!("{file} no longer holds the appearance {name:?}"))
+}
+
+/// The name of every appearance the install's catalogs give, in
+/// lowercase and in name order (see [`load_appearance`]). Reads every
+/// catalog the first time.
+pub fn appearance_names(assets: &Assets) -> impl Iterator<Item = &str> {
+    appearance_index(assets).keys().map(String::as_str)
+}
+
+/// Where each appearance is loaded from, built on first use.
+fn appearance_index(assets: &Assets) -> &BTreeMap<String, (String, sims_content::Resource)> {
+    assets.appearances(|| {
         let mut files = Vec::new();
         for file in assets.names().filter(|n| is_catalog(n)) {
             for resource in assets.sources(file) {
@@ -278,16 +303,7 @@ pub fn load_appearance(assets: &Assets, name: &str) -> Result<Appearance, String
                 .and_then(|bytes| parse_catalog(&file, &bytes));
             ((file, resource), catalog)
         }))
-    });
-    let (file, resource) = index
-        .get(&name.to_ascii_lowercase())
-        .ok_or_else(|| format!("no catalog holds the appearance {name:?}"))?;
-    let bytes = resource.read().map_err(|e| format!("{file}: {e}"))?;
-    parse_catalog(file, &bytes)?
-        .appearances
-        .into_iter()
-        .find(|a| a.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| format!("{file} no longer holds the appearance {name:?}"))
+    })
 }
 
 /// Whether the file `name` (lowercase) is an appearance catalog: a text or

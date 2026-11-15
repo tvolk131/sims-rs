@@ -35,7 +35,7 @@ const VIEW_LEVEL: i8 = 1;
 ///
 /// The default, `0,1,2,3,33+30`, is what three captures of the original
 /// running the Goth house recorded, with a hardware watchpoint on the
-/// house view's draw guard (`docs/decisions.md`): a frame before the
+/// house view's draw guard (`docs/decisions/`): a frame before the
 /// first lot update, after updates 1, 2 and 3 (many times while a dialog
 /// waited), after update 33, and after every 30th update from there (63,
 /// 93, ...). Frames write two things: the first frame that draws a

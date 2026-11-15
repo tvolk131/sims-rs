@@ -41,7 +41,7 @@
 //! What the filter leaves naming T, the original leaves as a pointer to
 //! the freed object: the last action after the running action ended,
 //! route contexts aimed at an object that is not a person, frames whose
-//! stack object is T. Here they keep T's ID (`docs/decisions.md`).
+//! stack object is T. Here they keep T's ID (`docs/decisions/`).
 //!
 //! Ported from the original's code and the old prototype's
 //! `person_reset.rs`, which reads it the same way; **unverified**, as no
