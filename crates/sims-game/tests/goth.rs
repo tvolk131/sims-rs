@@ -463,7 +463,9 @@ fn the_sound_scripts_learn_about_the_goths() {
     assert_eq!(snapshot.field(-3, 4), Some(hour));
     assert_eq!(snapshot.field(70_000, 0), Some(0));
     assert_eq!(snapshot.field(16, 21), None);
+}
 
+#[test]
 fn a_press_on_a_portrait_selects_that_goth() {
     let Some(install) = install() else {
         return;
