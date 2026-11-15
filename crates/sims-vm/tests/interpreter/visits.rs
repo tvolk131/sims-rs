@@ -537,6 +537,39 @@ fn a_changed_person_resets_in_its_own_way_and_then_runs_init() {
 }
 
 #[test]
+fn a_changed_person_using_an_object_lets_it_go_and_the_object_resets() {
+    // 0x45e814: the person's thread pops frames down to the use's frame
+    // count less one, the last pop releasing the use; then the object it
+    // used resets (its function 3 here), before the person's own reset.
+    let (mut fx, file) = lot();
+    let people = resident(&mut fx);
+    let widget = stand(&mut fx, [2, 2]);
+    fx.add(file, CANCELLED, note(7, scope::LITERAL, 8));
+    function(&mut fx, file, 3, CANCELLED);
+    fx.world.changed_types.insert(RESIDENT);
+    let person = fx
+        .world
+        .objects
+        .get_mut(&PERSON)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person
+        .object_uses
+        .push(sims_formats::saved_objects::ObjectUse {
+            target: widget as i16,
+            stack_depth: 1,
+            unknown: 0,
+        });
+    let visited = visit_with(&mut fx, PERSON, &people);
+    assert_eq!(visited, [(widget, 3), (PERSON, 3), (PERSON, 0)]);
+    assert_eq!(fx.lamp().attributes[7], 8);
+    let person = fx.world.objects[&PERSON].person.as_ref().unwrap();
+    assert!(person.object_uses.is_empty());
+}
+
+#[test]
 fn a_profile_string_that_is_missing_leaves_its_word() {
     let profile =
         |gender: Option<&str>, age: Option<&str>, skin: Option<&str>| sims_content::Profile {
@@ -596,14 +629,6 @@ fn a_person_the_reset_would_do_more_for_stops_its_visit() {
     let person = |change: &dyn Fn(&mut sims_formats::saved_objects::Person)| {
         fails(&|object| change(object.person.as_mut().unwrap()))
     };
-    let using = person(&|p| {
-        p.object_uses.push(sims_formats::saved_objects::ObjectUse {
-            target: 1,
-            stack_depth: 1,
-            unknown: 0,
-        })
-    });
-    assert!(using.contains("that is using an object"), "{using}");
     let acting = person(&|p| p.active.target = 77);
     assert!(
         acting.contains("whose running action has a target"),

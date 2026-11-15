@@ -131,6 +131,12 @@ pub struct Interpreter<'a> {
     /// animator refresh pending from its taking itself off the lot
     /// ([`crate::placement::Refreshing`]). None otherwise.
     pub(crate) refreshing: Option<&'a RefCell<crate::placement::Refreshing>>,
+    /// While the scheduler's pass runs, the animator refreshes worked out
+    /// for the people another's removal took off the lot in it, by ID
+    /// (`Interpreter::refresh_before_removal`); each waits for the
+    /// person's tick. None otherwise.
+    pub(crate) taken_off:
+        Option<&'a RefCell<std::collections::BTreeMap<u16, crate::placement::Pending>>>,
     /// Whether this is a person's animator refresh at its taking itself
     /// off the lot (`Interpreter::refresh_at_take_off`), where a timed
     /// event that would play a sound fails ([`crate::clip_events`]).
@@ -162,6 +168,7 @@ impl<'a> Interpreter<'a> {
             letting_go: None,
             view_rotation: 0,
             refreshing: None,
+            taken_off: None,
             take_off_refresh: false,
         }
     }
@@ -304,6 +311,7 @@ impl<'a> Interpreter<'a> {
             letting_go: self.letting_go,
             view_rotation: self.view_rotation,
             refreshing: self.refreshing,
+            taken_off: self.taken_off,
             checking: false,
         }
     }
@@ -377,6 +385,9 @@ pub(crate) struct Machine<'a, 'w> {
     pub view_rotation: u8,
     /// See [`Interpreter::refreshing`].
     pub(crate) refreshing: Option<&'a RefCell<crate::placement::Refreshing>>,
+    /// See [`Interpreter::taken_off`].
+    pub(crate) taken_off:
+        Option<&'a RefCell<std::collections::BTreeMap<u16, crate::placement::Pending>>>,
 }
 
 impl<'a> Machine<'a, '_> {
@@ -396,6 +407,7 @@ impl<'a> Machine<'a, '_> {
             letting_go: self.letting_go,
             view_rotation: self.view_rotation,
             refreshing: self.refreshing,
+            taken_off: self.taken_off,
             take_off_refresh: false,
         }
     }
@@ -774,7 +786,7 @@ impl<'a> Machine<'a, '_> {
     /// Pops the top frame (0x4752f6). What it held stays in the frame
     /// storage. Then, for a person, the objects it uses are looked at (the
     /// object's virtual function 8; [`Machine::release_use`]).
-    fn pop_frame(&mut self) -> Result<(), Trap> {
+    pub(crate) fn pop_frame(&mut self) -> Result<(), Trap> {
         self.sync_frames()?;
         let me = self.me;
         self.me_mut()?.stack.pop();
@@ -865,11 +877,24 @@ impl<'a> Machine<'a, '_> {
             && !crate::placement::reads_no_animator(instruction.opcode, &instruction.operands)
         {
             return Err(Trap::Unsupported(format!(
-                "{} (opcode {}) after person {person} took itself off the lot and before its \
+                "{} (opcode {}) after person {person} left the lot and before its \
                  animator's tick: the animator's refresh at the take-off (0x58da12), if the \
                  house view drew the person, may have written what it reads",
                 crate::primitives::primitive_name(instruction.opcode),
                 instruction.opcode
+            )));
+        }
+        if self.world.removals.contains(&self.me)
+            && self.me()?.person.is_some()
+            && !crate::placement::reads_no_animator(instruction.opcode, &instruction.operands)
+        {
+            return Err(Trap::Unsupported(format!(
+                "{} (opcode {}) on the thread of person {}, which is queued for removal: its \
+                 animator's refresh as it left the lot (0x58da12), if the house view drew it, \
+                 may have written what it reads",
+                crate::primitives::primitive_name(instruction.opcode),
+                instruction.opcode,
+                self.me
             )));
         }
         let state = self.frame()?.primitive_state;

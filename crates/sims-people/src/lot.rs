@@ -45,10 +45,18 @@
 //! it in their head slot, right after them, by the original's own light
 //! and colour; [`People::set_clock`] spins it.
 //!
-//! **Light** is our own ([`crate::raster::LIGHT`]), held fixed relative
-//! to the viewer as the view turns, as the original's standard light is
-//! (see the decisions entry "How the original lights a person"). Room
-//! light and lamps are not applied.
+//! **Light** is the original's standard light ([`STANDARD_LIGHT`]) at the
+//! person's level ([`level`]), lit as [`Lighting::standard`] says. The
+//! light keeps its place relative to the viewer as the view turns: the
+//! original turns it by the view's matrix (+0x130 of the view object, a
+//! turn about the vertical by a quarter turn per rotation, built at
+//! 0x49b60e) before it sets it (0x4b49c7). A person in a room at full
+//! light is drawn in full light all over; one in a dark room shows the
+//! light's side. The room's lamps (one light each, from the lamp to the
+//! person), the level's fade over 250 ms, the dimmer daylight cap after
+//! dark (0.8) and the person's flag that draws them at full light are
+//! not ported (decisions entry "A person is lit by the original's
+//! standard light, at their room's level").
 
 use crate::animation::{Clip, Library};
 use crate::appearance::Body;
@@ -57,7 +65,7 @@ use crate::bob::{self, Bob};
 use crate::house::Cast;
 use crate::math::{Transform, Vec3};
 use crate::person::{Player, UNITS_PER_TILE, base_clip, placement};
-use crate::raster::{LIGHT, Shade, Target, draw_part, draw_shaded};
+use crate::raster::{Lighting, Shade, Target, draw_part, draw_shaded};
 use crate::rig;
 use crate::skin::skin;
 use sims_core::F32;
@@ -113,16 +121,51 @@ impl View {
         [x + OBJECT_COLUMN, y]
     }
 
-    /// The direction towards the light: [`LIGHT`] as it is at rotation 0,
-    /// turned with the view so it stays where it is relative to the
-    /// viewer.
+    /// The direction towards the standard light: [`STANDARD_LIGHT`] as it
+    /// is at rotation 0, turned with the view so it stays where it is
+    /// relative to the viewer.
     pub fn light(&self) -> Vec3 {
-        // LIGHT's direction in the view at rotation 0, then back out
+        // The light's direction in the view at rotation 0, then back out
         // through this rotation.
-        let fine = [-LIGHT.z, -LIGHT.x];
+        let light = STANDARD_LIGHT;
+        let fine = [-light.z, -light.x];
         let back = rotate((4 - (self.camera.rotation & 3)) & 3, fine, 0.0);
-        Vec3::new(-back[1], LIGHT.y, -back[0])
+        Vec3::new(-back[1], light.y, -back[0])
     }
+}
+
+/// The direction towards the original's standard light at rotation 0, in
+/// the drawing frame (the files' frame, [`crate::rig`]). The light is
+/// `GameData/Lights/stdlight.lgt`: one white directional light of
+/// intensity 1 whose direction, the way it shines, is (−0.644, −0.418,
+/// −0.641). Towards it is the opposite: up, and back towards the house
+/// camera at rotation 0, whose eye is along (0.61, 0.5, 0.61) (0x49b0de).
+/// That direction is also the way to the position the file gives the
+/// light, (6.79, 9.55, 6.79): a light above and behind the viewer. That
+/// the direction is the way the light shines, as Direct3D takes a
+/// directional light's, is read from the file's own position, not from
+/// the running game; a person at full light, the only kind compared,
+/// shows no side.
+pub const STANDARD_LIGHT: Vec3 = Vec3::new(0.644_362_6, 0.417_676, 0.640_580_7);
+
+/// The level a person is lit at, 0.5 to 1: the light byte of the room
+/// at their position as the lot renderer draws it
+/// ([`sims_render::lot::room_light`]; full light off the lot and outside
+/// every room), over 255, held between 0.5 and 1. The original reads the
+/// level from the drawing's lighting record (0x4b4499), whose only setter
+/// holds it between 0.5 and the brightest a lit tile may be, 1 by day
+/// (0x4b4525); the lot's objects set it from the tile's light byte over
+/// 255 (0x467482). That a person's record is set the same way, from the
+/// tile they stand on, is **unverified**.
+pub fn level(world: &World, person: u16) -> f32 {
+    let byte = world
+        .objects
+        .get(&person)
+        .and_then(|o| world.room_at(o.position).ok())
+        .filter(|&room| room >= 0)
+        .and_then(|room| world.rooms.rooms.get(&room))
+        .map_or(255, sims_render::lot::room_light);
+    (f32::from(byte) / 255.0).clamp(0.5, 1.0)
 }
 
 /// The lot renderer's canvas takes people pixel by pixel, by its sprite
@@ -406,9 +449,10 @@ impl People {
             };
             // Each pixel the person draws names them, for a click.
             target.set_id(Some(person.id));
+            let lighting = Lighting::standard(light, level(world, person.id));
             for part in person.body.parts.iter().filter(|p| p.censor == 0) {
                 let skinned = skin(part, &person.bones);
-                draw_part(target, part, &skinned, light, project);
+                draw_part(target, part, &skinned, lighting, project);
             }
             // The plumb bob over their head, if they hold it. Its pixels
             // name the person too.
@@ -569,6 +613,47 @@ mod tests {
             assert!((d[0] - first.0[0]).abs() < 1e-4 && (d[1] - first.0[1]).abs() < 1e-4);
             assert_eq!(y, first.1);
         }
-        assert_eq!(View::new(&camera(Zoom::Far, 0)).light(), LIGHT);
+        assert_eq!(View::new(&camera(Zoom::Far, 0)).light(), STANDARD_LIGHT);
+    }
+
+    /// At every rotation the standard light is above and behind the
+    /// viewer, straight back along the view: its fine x and y in the view
+    /// are equal and fall towards the viewer, as the house camera's eye
+    /// does.
+    #[test]
+    fn the_standard_light_is_above_and_behind_the_viewer() {
+        for rotation in 0..4 {
+            let view = View::new(&camera(Zoom::Medium, rotation));
+            let light = view.light();
+            let (a, _) = view.place(light);
+            let (o, _) = view.place(Vec3::ZERO);
+            let [x, y] = [a[0] - o[0], a[1] - o[1]];
+            assert!(
+                x < 0.0 && y < 0.0 && (x - y).abs() < 0.1 * x.abs(),
+                "{x} {y}"
+            );
+            assert!(light.y > 0.0);
+        }
+    }
+
+    /// At full light a person is at full light all over; at half light
+    /// the side away from the light is at the ambient grey, 128/255, and
+    /// the side facing it at full light. A person the world does not know
+    /// is at full light.
+    #[test]
+    fn the_level_sets_the_ambient_grey_and_the_lights_strength() {
+        assert_eq!(level(&World::empty(), 7), 1.0);
+        let towards = STANDARD_LIGHT.normalize();
+        let full = Lighting::standard(STANDARD_LIGHT, 1.0);
+        assert_eq!(full.shade(-towards), 1.0);
+        let half = Lighting::standard(STANDARD_LIGHT, 0.5);
+        assert_eq!(half.shade(-towards), 128.0 / 255.0);
+        assert_eq!(half.shade(towards), 1.0);
+        // At an angle, the light adds its strength times the cosine: at
+        // 60° from the light, half its strength.
+        let side = Vec3::new(towards.z, 0.0, -towards.x).normalize();
+        let tilted = (towards * 0.5 + side * (3.0f32.sqrt() / 2.0)).normalize();
+        assert!((tilted.dot(towards) - 0.5).abs() < 1e-6);
+        assert!((half.shade(tilted) - (128.0 / 255.0 + 0.25)).abs() < 1e-6);
     }
 }

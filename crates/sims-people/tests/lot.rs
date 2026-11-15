@@ -629,3 +629,26 @@ fn the_plumb_bob_floats_over_the_selected_persons_head() {
     without.objects.get_mut(&21).unwrap().slots[2].object = 0;
     assert_eq!(green(&without).0, Vec::new());
 }
+
+/// Each Goth is lit at the light of the room they stand in, held between
+/// a half and full light. A little after 7 in the morning (tick 1100)
+/// Mortimer reads on the porch, outdoors in daylight; Cassandra is
+/// indoors in room 4, at its light; and Bella is upstairs in a room whose
+/// light is 0, which shows 0.8 because someone is in it.
+#[test]
+fn each_person_is_lit_at_their_rooms_light() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    while lot.ticks() < 1100 {
+        lot.step().unwrap();
+    }
+    let world = lot.world();
+    let level = |id| sims_people::lot::level(world, id);
+    let room = |id: u16| world.room_at(world.objects[&id].position).unwrap();
+    assert_eq!((room(21), level(21)), (0, 1.0));
+    let kitchen = sims_render::lot::room_light(&world.rooms.rooms[&room(16)]);
+    assert_eq!((room(16), level(16)), (4, f32::from(kitchen) / 255.0));
+    assert!(level(16) > 0.5 && level(16) < 1.0, "{}", level(16));
+    assert_eq!((room(18), level(18)), (1025, 204.0 / 255.0));
+}

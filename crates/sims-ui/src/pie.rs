@@ -492,6 +492,23 @@ impl Pie {
         hit(layouts.last()?, point)
     }
 
+    /// The choice whose entry a pointer at `point` highlights in the top
+    /// menu of `layouts`: the one a press there would choose. An entry
+    /// that opens a submenu is no choice.
+    pub fn choice_at(&self, layouts: &[Layout], point: [i32; 2]) -> Option<usize> {
+        let i = Self::hit(layouts, point)?;
+        match self.submenu {
+            Some((n, _)) => match self.nodes.get(n) {
+                Some(Node::Submenu { entries, .. }) => entries.get(i).map(|e| e.1),
+                _ => None,
+            },
+            None => match self.nodes.get(i) {
+                Some(Node::Choice { choice, .. }) => Some(*choice),
+                _ => None,
+            },
+        }
+    }
+
     /// A press at `point`, as the picker takes the menu's answer
     /// (0x48dac2 to 0x48dc5e).
     pub fn press(&mut self, layouts: &[Layout], point: [i32; 2]) -> Pressed {

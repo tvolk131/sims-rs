@@ -141,6 +141,12 @@ pub struct Program {
     /// None when it was not read: showing an icon then fails.
     /// [`Program::link`] leaves it None for the caller to fill.
     pub icon_frames: Option<BTreeMap<u16, i32>>,
+    /// The installed-expansions mask: the application's word at +0x66
+    /// (\[0x6e48bc\]+0x66), which the original sets from the registry at
+    /// startup (0x43ae81). The person factory's pet guard reads it
+    /// (0x440d8b). [`Program::link`] leaves it 0, no pack installed, for
+    /// the caller to fill.
+    pub expansions: u16,
 }
 
 impl Program {
@@ -160,6 +166,7 @@ impl Program {
             animations: Animations::default(),
             people: People::default(),
             icon_frames: None,
+            expansions: 0,
         };
         program.load(index, catalog.global)?;
         for guid in guids {

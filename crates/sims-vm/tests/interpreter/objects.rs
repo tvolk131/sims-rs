@@ -193,6 +193,53 @@ fn a_read_that_cannot_be_done_changes_nothing() {
     assert_eq!(fx.world.encode(), held.encode());
 }
 
+/// Four types may keep more saved attributes than their constructor
+/// allocates (0x43fe49, 0x434345): the array grows to the saved count.
+/// The last two only with Unleashed's bit in the expansions (0x43fe9d).
+#[test]
+fn the_types_the_house_read_names_grow_their_attributes() {
+    const FIRST: u32 = 0x3C08_965F;
+    const THIRD: u32 = 0x4A70_DF92;
+    let mut fx = lot();
+    fx.add_type(FIRST, 4, 0, 4097);
+    fx.add_type(THIRD, 4, 0, 4097);
+    let long = |id, guid| {
+        let mut object = saved(id, guid);
+        object.attributes = (1..=11).collect();
+        object
+    };
+    fx.world.globals[20] = 0x20;
+    read(
+        &mut fx,
+        &file(vec![long(5, FIRST), long(6, THIRD)]),
+        &People::default(),
+    )
+    .unwrap();
+    for id in [5, 6] {
+        assert_eq!(
+            fx.world.objects[&id].attributes,
+            (1..=11).collect::<Vec<i16>>()
+        );
+    }
+    // Without the bit only the first two grow.
+    let mut fx = lot();
+    fx.add_type(FIRST, 4, 0, 4097);
+    fx.add_type(THIRD, 4, 0, 4097);
+    fx.world.globals[20] = 0xdf;
+    let before = fx.world.encode();
+    let (object, cause) = trap(read(
+        &mut fx,
+        &file(vec![long(5, FIRST), long(6, THIRD)]),
+        &People::default(),
+    ));
+    assert_eq!(object, 6);
+    assert!(
+        matches!(&cause, Trap::Unsupported(m) if m.contains("0x4A70DF92")),
+        "{cause:?}"
+    );
+    assert_eq!(fx.world.encode(), before);
+}
+
 fn tile(id: u16, lead: i16) -> Instance {
     let mut tile = saved(id, CHAIR);
     tile.multipart = Some(Multipart {

@@ -142,6 +142,20 @@ impl Draws<'_> {
     }
 }
 
+/// The types whose saved attributes may outnumber what their constructor
+/// allocates (0x43df98, 0x43dfa3, 0x43dfae and 0x43dfb9, read at
+/// 0x43fe49): the house read lets each of these grow its attribute array to
+/// the saved count. The last two only when the configuration's expansions
+/// byte (`[0x6e48bc]+0x66`, the mask global 20 is set from) has Unleashed's
+/// bit, 0x20; without it both slots hold the first type (0x43fe9d).
+const GROWN: [u32; 4] = [0x3C08_965F, 0x7FD9_6B54, 0x4A70_DF92, 0x7BEA_0977];
+
+/// Whether the house read lets type `guid` grow its attribute array.
+fn grows(guid: u32, expansions: i16) -> bool {
+    let types = if expansions & 0x20 != 0 { 4 } else { 2 };
+    GROWN[..types].contains(&guid)
+}
+
 impl Interpreter<'_> {
     /// Load step 6e: reads a house's saved objects onto the lot (0x449c5e).
     /// The lot must hold no objects: the original clears it first.
@@ -173,7 +187,8 @@ impl Interpreter<'_> {
     ///
     /// On an error the lot is unchanged. These fail: a lot that holds
     /// objects; an object or a multi-tile lead without a definition; saved
-    /// attributes beyond what the constructor allocates; a person type with
+    /// attributes beyond what the constructor allocates, for a type the
+    /// house read does not let grow (`GROWN`); a person type with
     /// no skeleton in `people`; and a person with no neighborhood record,
     /// for which the original makes one.
     ///
@@ -208,6 +223,7 @@ impl Interpreter<'_> {
             count: 0,
         };
         let mut files = world.skeleton_files.clone();
+        let expansions = world.globals.get(20).copied().unwrap_or(0);
         let mut objects = BTreeMap::new();
         let mut order = Vec::new();
         // First every object is constructed, then every object is read.
@@ -218,7 +234,14 @@ impl Interpreter<'_> {
                 continue;
             };
             let object = self
-                .construct_saved(instance, people, &world.neighbors, &mut draws, &mut files)
+                .construct_saved(
+                    instance,
+                    people,
+                    &world.neighbors,
+                    &mut draws,
+                    &mut files,
+                    expansions,
+                )
                 .map_err(|trap| fail(id, trap))?;
             if objects.insert(id, object).is_some() {
                 return Err(fail(id, Trap::Invalid("a saved ID is listed twice".into())));
@@ -269,6 +292,7 @@ impl Interpreter<'_> {
         neighbors: &Neighbors,
         draws: &mut Draws<'_>,
         files: &mut BTreeSet<String>,
+        expansions: i16,
     ) -> Result<Object, Trap> {
         let definition = self
             .catalog
@@ -311,13 +335,25 @@ impl Interpreter<'_> {
         if person {
             construct_person(saved.guid, people, neighbors, draws, files)?;
         }
-        // The read (the object's function at vtable offset 0x7c).
-        if saved.attributes.len() > attributes {
-            return Err(Trap::Unsupported(format!(
-                "{} saved attributes, more than the {attributes} the constructor allocates",
-                saved.attributes.len()
-            )));
-        }
+        // The read (the object's function at vtable offset 0x7c, 0x4342ae).
+        // From version 0x18 the saved attribute count comes first; when it
+        // is larger than the array, the array is made that long, zeroed and
+        // read whole if the house read asks for it (0x434345), and the
+        // house read (0x4400a7) asks only for the types in `GROWN`.
+        let attributes = if saved.attributes.len() > attributes {
+            if !grows(saved.guid, expansions) {
+                return Err(Trap::Unsupported(format!(
+                    "{} saved attributes of type 0x{:08X}, more than the {attributes} the \
+                     constructor allocates: the original reads them past the array's end \
+                     (0x43437b)",
+                    saved.attributes.len(),
+                    saved.guid
+                )));
+            }
+            saved.attributes.len()
+        } else {
+            attributes
+        };
         let mut object = Object {
             id: saved.id,
             guid: saved.guid,
