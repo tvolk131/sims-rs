@@ -13,6 +13,9 @@ sims-content.workspace = true
 sims-formats.workspace = true
 sims-core.workspace = true
 sims-sim.workspace = true
+# The lot renderer's camera, for drawing people into its view. One way
+# only: sims-render does not depend on this crate.
+sims-render = { path = "../sims-render" }
 # The viewer's window, and the simulation it can run a lot with, only
 # with the `viewer` feature (see src/bin). The library itself reads the
 # simulation's state and never runs it.

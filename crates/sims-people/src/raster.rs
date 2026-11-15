@@ -132,31 +132,34 @@ impl Canvas {
     }
 }
 
-/// What the rasterizer draws into: an image with a depth per pixel, row
-/// by row. Each surface keeps its own depth units and its own rule for
-/// writing a texel; the rasterizer interpolates depth linearly across a
-/// triangle in whatever units the projection gives.
-pub(crate) trait Surface {
+/// What the rasterizer draws into: an image with a depth per pixel. A
+/// target keeps its own depth units (the projection gives each vertex its
+/// depth in them, and the rasterizer interpolates it linearly across a
+/// triangle) and its own rule for writing a texel. [`Canvas`] is one; an
+/// app draws people into its lot's image through another.
+pub trait Target {
     /// Width and height in pixels.
     fn size(&self) -> (u32, u32);
-    /// Whether a texel at depth `z` on pixel `i` is in front of what is
-    /// there.
-    fn passes(&self, i: usize, z: f32) -> bool;
-    /// Writes a texel that passed, its colour times `shade`. Its alpha is
-    /// never 0.
-    fn write(&mut self, i: usize, z: f32, texel: [u8; 4], shade: f32);
+    /// Whether a texel at depth `z` on pixel (`x`, `y`) would be in front
+    /// of what is there. Asked before the texture is sampled, so a hidden
+    /// pixel costs little; [`Target::write`] may still test again.
+    fn passes(&self, x: u32, y: u32, z: f32) -> bool;
+    /// Writes a texel that passed: its colour times `shade` (from 0.45 in
+    /// shadow to 1 facing the light). Its alpha is never 0.
+    fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32);
 }
 
-impl Surface for Canvas {
+impl Target for Canvas {
     fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
 
-    fn passes(&self, i: usize, z: f32) -> bool {
-        z < self.depth[i]
+    fn passes(&self, x: u32, y: u32, z: f32) -> bool {
+        z < self.depth[(y * self.width + x) as usize]
     }
 
-    fn write(&mut self, i: usize, z: f32, texel: [u8; 4], s: f32) {
+    fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], s: f32) {
+        let i = (y * self.width + x) as usize;
         let alpha = texel[3];
         let lit = |c: u8| (f32::from(c) * s).min(255.0);
         if alpha == 255 {
@@ -183,11 +186,12 @@ impl Surface for Canvas {
     }
 }
 
-/// Draws one skinned part into `surface`, lit by a light from `light` (a
+/// Draws one skinned part into `target`, lit by a light from `light` (a
 /// direction towards the light) with some ambient light. `project` takes a
-/// world point to the surface: x and y in pixels, z its depth.
-pub(crate) fn draw_part<S: Surface>(
-    surface: &mut S,
+/// world point to the target: x and y in pixels, z its depth in the
+/// target's units.
+pub fn draw_part<T: Target + ?Sized>(
+    target: &mut T,
     part: &Part,
     skinned: &Skinned,
     light: Vec3,
@@ -216,7 +220,7 @@ pub(crate) fn draw_part<S: Surface>(
             continue;
         };
         triangle(
-            surface,
+            target,
             [pa, pb, pc],
             [va.uv, vb.uv, vc.uv],
             [
@@ -229,14 +233,14 @@ pub(crate) fn draw_part<S: Surface>(
     }
 }
 
-fn triangle<S: Surface>(
-    surface: &mut S,
+fn triangle<T: Target + ?Sized>(
+    target: &mut T,
     mut p: [Vec3; 3],
     mut uv: [[f32; 2]; 3],
     mut shade: [f32; 3],
     part: &Part,
 ) {
-    let (width, height) = surface.size();
+    let (width, height) = target.size();
     let mut area = edge(p[0], p[1], p[2]);
     if area.abs() < 1e-8 || !area.is_finite() {
         return;
@@ -299,8 +303,8 @@ fn triangle<S: Surface>(
             }
             let [w0, w1, w2] = e.map(|e| e / area);
             let z = w0 * p[0].z + w1 * p[1].z + w2 * p[2].z;
-            let i = (y as u32 * width + x as u32) as usize;
-            if !surface.passes(i, z) {
+            let (x, y) = (x as u32, y as u32);
+            if !target.passes(x, y, z) {
                 continue;
             }
             let u = w0 * uv[0][0] + w1 * uv[1][0] + w2 * uv[2][0];
@@ -312,7 +316,7 @@ fn triangle<S: Surface>(
             if texel[3] == 0 {
                 continue;
             }
-            surface.write(i, z, texel, s);
+            target.write(x, y, z, texel, s);
         }
     }
 }

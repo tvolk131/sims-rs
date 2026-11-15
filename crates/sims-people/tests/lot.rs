@@ -4,8 +4,13 @@
 //! kept.
 
 use sims_people::math::Vec3;
+use sims_people::raster::Target;
 use sims_people::raster::{Camera, Canvas};
-use sims_people::{Assets, Body, Cast, Library, Player, base_clip, placement, residents_of};
+use sims_people::{
+    Assets, Body, Cast, Library, People, Player, View, base_clip, placement, residents_of,
+};
+use sims_render::{Camera as LotCamera, Walls, Zoom};
+use sims_sim::World;
 use sims_vm::boot::{Frames, Lot, StepError};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -101,4 +106,172 @@ fn the_people_of_a_running_lot_are_drawn_from_its_state() {
     // gets is the simulation's to say.
     assert!(most >= 3, "at most {most} people placed");
     assert!(drawn >= 2, "the run ended at tick {}", lot.ticks());
+}
+
+/// A depth image that counts what is drawn into it, for [`People::draw`].
+struct Frame {
+    width: u32,
+    height: u32,
+    depth: Vec<f32>,
+    /// Whether each pixel was written.
+    written: Vec<bool>,
+}
+
+impl Frame {
+    fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            depth: vec![f32::INFINITY; (width * height) as usize],
+            written: vec![false; (width * height) as usize],
+        }
+    }
+
+    /// How many pixels were written within `reach` pixels of `at`.
+    fn near(&self, [x, y]: [f32; 2], reach: f32) -> usize {
+        let range = |c: f32, side: u32| {
+            let low = (c - reach).max(0.0) as u32;
+            let high = ((c + reach).max(0.0) as u32).min(side);
+            low..high
+        };
+        range(y, self.height)
+            .flat_map(|py| range(x, self.width).map(move |px| (py * self.width + px) as usize))
+            .filter(|&i| self.written[i])
+            .count()
+    }
+}
+
+impl Target for Frame {
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    fn passes(&self, x: u32, y: u32, z: f32) -> bool {
+        z < self.depth[(y * self.width + x) as usize]
+    }
+
+    fn write(&mut self, x: u32, y: u32, z: f32, _: [u8; 4], _: f32) {
+        let i = (y * self.width + x) as usize;
+        self.depth[i] = z;
+        self.written[i] = true;
+    }
+}
+
+/// A stand-in for the lot renderer's depth: nearer the viewer and higher
+/// is nearer. Only the order matters here.
+fn stand_in_depth([x, y]: [f32; 2], elevation: f32, level: i32) -> f32 {
+    -3.0 * (x + y) - elevation / 2.0 - 116.0 * (level - 1) as f32
+}
+
+#[test]
+fn the_people_of_a_running_lot_are_drawn_in_the_lot_renderers_view() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    let mut people = People::open(&root, &house).unwrap();
+    let mut drawn = 0;
+    let mut most = 0;
+    loop {
+        if lot.ticks().is_multiple_of(EVERY) {
+            let world = lot.world();
+            assert_eq!(people.update(world), Vec::<String>::new());
+            for rotation in 0..4 {
+                let mut camera = LotCamera {
+                    zoom: Zoom::Far,
+                    rotation,
+                    level: 2,
+                    origin: [0, 0],
+                    walls: Walls::Up,
+                    focus: Default::default(),
+                };
+                // The whole lot fits: its diagonal is 128 tiles of 16
+                // pixels at the far zoom, its depth 128 of 8. People stand
+                // on the road at the lot's corners.
+                camera.center_on([32 * 16, 32 * 16], [1200, 700]);
+                let view = View::new(&camera);
+                // Each person is drawn around where the lot renderer
+                // projects their skeleton's root.
+                let (posed, problems) = people.posed(world, camera.level);
+                assert!(problems.is_empty(), "{problems:?}");
+                let roots: Vec<(u16, i32, Vec3)> = posed
+                    .iter()
+                    .map(|p| (p.id, p.level, p.bones[0].translation))
+                    .collect();
+                most = most.max(roots.len());
+                let mut frame = Frame::new(2400, 1400);
+                let report = people.draw(world, &camera, &mut frame, stand_in_depth);
+                assert_eq!(report.people, roots.len());
+                assert!(report.problems.is_empty(), "{:?}", report.problems);
+                for (id, level, at) in roots {
+                    let (fine, elevation) = view.place(at);
+                    let [x, y] = view.screen(fine, elevation, level);
+                    let near = frame.near([x, y], 20.0);
+                    assert!(
+                        near > 20,
+                        "tick {}, rotation {rotation}: person {id} at {x}, {y}: {near} pixels",
+                        lot.ticks(),
+                    );
+                }
+            }
+            drawn += 1;
+        }
+        if lot.ticks() >= LAST {
+            break;
+        }
+        match lot.step() {
+            Ok(_) => {}
+            Err(StepError::Tick { .. } | StepError::Frame { .. }) => break,
+            Err(e) => panic!("tick {}: {e}", lot.ticks() + 1),
+        }
+    }
+    assert!(most >= 3, "at most {most} people placed");
+    assert!(drawn >= 1);
+
+    // People who change clothes are dressed again; people who leave are
+    // forgotten.
+    let mut world = lot.world().clone();
+    let ids: Vec<u16> = world
+        .objects
+        .iter()
+        .filter(|(_, o)| o.person.is_some())
+        .map(|(&id, _)| id)
+        .collect();
+    let bodies = |people: &mut People, world: &World| -> Vec<(u16, String)> {
+        people
+            .posed(world, 2)
+            .0
+            .iter()
+            .map(|p| (p.id, p.body.parts[0].mesh.name.clone()))
+            .collect()
+    };
+    people.update(&world);
+    let before = bodies(&mut people, &world);
+    let (&[first, second], _) = ids.split_first_chunk::<2>().unwrap();
+    let theirs = world.objects[&second]
+        .person
+        .as_ref()
+        .unwrap()
+        .appearance
+        .clone();
+    world
+        .objects
+        .get_mut(&first)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .appearance = theirs;
+    assert_eq!(people.update(&world), Vec::<String>::new());
+    let after = bodies(&mut people, &world);
+    let body_of = |list: &[(u16, String)], id| list.iter().find(|(i, _)| *i == id).cloned();
+    if let (Some(a), Some(b)) = (body_of(&after, first), body_of(&before, second)) {
+        assert_eq!(a.1, b.1, "person {first} wears person {second}'s body");
+    }
+    world.objects.remove(&first);
+    people.update(&world);
+    assert!(
+        bodies(&mut people, &world)
+            .iter()
+            .all(|(id, _)| *id != first)
+    );
 }
