@@ -418,7 +418,7 @@ fn snap_checks_its_object_mode_and_slot() {
     assert_eq!(code(snap(&mut fx, me, LAMP as i16, 0, 5, 0)), Some(0x24));
     assert_eq!(code(snap(&mut fx, me, LAMP as i16, 1, 3, 0)), Some(0x1b));
     assert_eq!(code(snap(&mut fx, me, LAMP as i16, -1, 3, 0)), Some(0x1b));
-    for mode in [0, 1, 2] {
+    for mode in [1, 2] {
         let result = snap(&mut fx, me, LAMP as i16, 0, mode, 0);
         assert!(
             matches!(trap(result), Trap::Unsupported(ref m) if m.contains("mode")),
@@ -930,4 +930,44 @@ fn a_group_that_does_not_fit_names_the_last_object_its_tiles_collided_with() {
     assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(false));
     let data = &fx.world.objects[&me].data;
     assert_eq!((data[52], data[54]), (0, blockers[0] as i16));
+}
+
+/// Runs Snap in mode 0 as `me` on the lamp, naming local `local`, after
+/// setting local 2 to `value`.
+fn snap_by_local(
+    fx: &mut Fixture,
+    me: u16,
+    local: i16,
+    value: i16,
+) -> Result<bool, sims_vm::Fault> {
+    let [l0, l1] = local.to_le_bytes();
+    let guid = fx.world.objects[&me].guid;
+    let file = fx.catalog.object(guid).unwrap().resource;
+    fx.add(
+        file,
+        TREE,
+        tree(vec![
+            assign(scope::LOCALS, 2, scope::LITERAL, value, 1),
+            ins(SNAP, RETURN_TRUE, RETURN_FALSE, [l0, l1, 0, 0, 0, 0, 0, 0]),
+        ]),
+    );
+    fx.run_with(me, TREE, LAMP as i16, &[], 100)
+}
+
+#[test]
+fn mode_0_reads_the_slots_number_from_a_local() {
+    // 0x454a4b: word 0 names the local; the local holds the number of the
+    // stack object's routing slot, which is then taken as mode 3 takes it.
+    let (mut fx, me) = snapper(SKIP_CHECKS);
+    fx.lamp_mut().position = [72, 24, 1];
+    let start = unmoved(&fx, me);
+    // Local 2 holds 1: past the lamp's one slot.
+    assert_eq!(code(snap_by_local(&mut fx, me, 2, 1)), Some(0x1b));
+    // A local the tree does not have (it has four) is native error 8.
+    assert_eq!(code(snap_by_local(&mut fx, me, 4, 0)), Some(8));
+    assert_eq!(code(snap_by_local(&mut fx, me, -1, 0)), Some(8));
+    assert_eq!(unmoved(&fx, me), start);
+    // Local 2 holds 0: the lamp's slot 0, though word 0 is 2.
+    assert_eq!(snap_by_local(&mut fx, me, 2, 0), Ok(true));
+    assert_eq!(fx.world.objects[&me].position, [72, 24, 1]);
 }
