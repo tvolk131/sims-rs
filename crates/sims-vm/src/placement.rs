@@ -753,6 +753,27 @@ impl Interpreter<'_> {
         )
     }
 
+    /// An object's footprint were it at `position` facing `facing`
+    /// (0x433d16 with a position given, as Snap's wall test calls it with
+    /// its facing set for the call, 0x455263).
+    pub(crate) fn footprint_at(
+        &self,
+        world: &World,
+        id: u16,
+        position: [i32; 3],
+        facing: i16,
+    ) -> Result<[i32; 4], Trap> {
+        let words = self.words(world, id)?;
+        let object = world.objects.get(&id).ok_or_else(missing)?;
+        let person = object.person.as_ref().map(|p| p.data.as_slice());
+        if person.is_some() != (words[word::TYPE] == 2) {
+            return Err(Trap::Invalid(
+                "an object and its definition disagree on whether it is a person".into(),
+            ));
+        }
+        footprint(position, words, facing, person)
+    }
+
     pub(crate) fn words(&self, world: &World, id: u16) -> Result<&[i16; DEFINITION_WORDS], Trap> {
         let object = world.objects.get(&id).ok_or_else(missing)?;
         let definition = self

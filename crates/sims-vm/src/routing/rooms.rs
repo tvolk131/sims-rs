@@ -60,6 +60,100 @@ fn array(world: &World, id: u16, stride: usize) -> Result<&[u8], Trap> {
     Ok(&array.data)
 }
 
+/// Whether a wall crosses a footprint (0x476dbc), given in the original's
+/// order (`[greatest +0xf4, greatest +0xf8, least +0xf4, least +0xf8]`)
+/// on `level`. Each tile it covers, `+0xf4` tiles in the outer loop and
+/// `+0xf8` tiles in the inner (each from the least coordinate's tile to
+/// the tile of the greatest less one), is read as 0x4795c5 expands it:
+/// its segments are the cell's first byte, the style of segment 1 its
+/// first style word and that of segments 2, 0x10 and 0x20 its second
+/// (0x53b98f). From the lowest segment the tile has, through each higher
+/// one below 0x20, a segment whose style is not one a person crosses
+/// ([`CROSSABLE`]) crosses the footprint when its line lies strictly
+/// between the footprint's two values for it:
+///
+/// - segment 1, the line `+0xf8` = 16 × the `+0xf8` tile, against the
+///   least and greatest `+0xf8`;
+/// - segment 2, `+0xf4` = 16 × the `+0xf4` tile, against the `+0xf4`s;
+/// - segment 0x10, `+0xf4 + +0xf8` = 16 × (the two tiles' sum + 1),
+///   against the sums of the greatest and of the least;
+/// - segment 0x20, `+0xf4 - +0xf8` = 16 × (the tiles' difference),
+///   against least `+0xf4` less greatest `+0xf8` and greatest less least.
+///
+/// Segments 4 and 8 are never tested, and 0x20 only when it is the
+/// tile's lowest (the search for the next segment stops at 0x20).
+pub(crate) fn walls_cross(world: &World, footprint: [i32; 4], level: i32) -> Result<bool, Trap> {
+    let floor = usize::try_from(level - 1)
+        .ok()
+        .filter(|&f| f < WALLS.len())
+        .ok_or_else(|| {
+            Trap::Unsupported(format!(
+                "a wall test on level {level}, whose walls the original reads past its arrays \
+                 (0x4795c5)"
+            ))
+        })?;
+    let walls = array(world, WALLS[floor], WALL_CELL)?;
+    let [top_a, top_b, low_a, low_b] = footprint;
+    let between = |line: i32, one: i32, other: i32| {
+        (one < line && line < other) || (other < line && line < one)
+    };
+    for a in (low_a >> 4)..=((top_a - 1) >> 4) {
+        for b in (low_b >> 4)..=((top_b - 1) >> 4) {
+            let (x, y) = (b as i8, a as i8);
+            let inside = |n: i8| (0..FULL as i8).contains(&n);
+            if !inside(x) || !inside(y) {
+                return Err(Trap::Unsupported(format!(
+                    "a wall test over tile ({x}, {y}), off the lot's arrays (0x4795c5)"
+                )));
+            }
+            let cell = (x as usize * FULL + y as usize) * WALL_CELL;
+            let mask = u32::from(walls[cell]);
+            let style = |word: usize| {
+                u16::from_le_bytes([walls[cell + 2 + word * 2], walls[cell + 3 + word * 2]])
+            };
+            if mask == 0 {
+                continue;
+            }
+            let mut bit = mask & mask.wrapping_neg();
+            loop {
+                let line = match bit {
+                    1 => Some((style(0), i32::from(x) << 4, low_b, top_b)),
+                    2 => Some((style(1), i32::from(y) << 4, low_a, top_a)),
+                    0x10 => Some((
+                        style(1),
+                        (i32::from(y) + i32::from(x) + 1) << 4,
+                        top_a + top_b,
+                        low_a + low_b,
+                    )),
+                    0x20 => Some((
+                        style(1),
+                        (i32::from(y) - i32::from(x)) << 4,
+                        low_a - top_b,
+                        top_a - low_b,
+                    )),
+                    _ => None,
+                };
+                if let Some((style, line, one, other)) = line
+                    && !CROSSABLE.contains(&style)
+                    && between(line, one, other)
+                {
+                    return Ok(true);
+                }
+                loop {
+                    bit <<= 1;
+                    if bit & mask == bit || bit >= 0x20 {
+                        break;
+                    }
+                }
+                if bit >= 0x20 {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// The level a room is on, from its ID (0x468756).
 pub(crate) fn room_level(room: i16) -> i32 {
     i32::from((room as u16 >> 10) & 3) + 1
