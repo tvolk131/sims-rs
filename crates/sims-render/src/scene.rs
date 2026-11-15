@@ -16,6 +16,14 @@ use std::collections::BTreeMap;
 const GRASS_ROW: i32 = 0;
 const GRASS_COLUMN: i32 = 1;
 
+/// Object sprites sit one pixel right of the point the camera projects
+/// them to, measured against the walls and floors around them. The camera
+/// origin is fitted to the tile art, and the original places the two
+/// kinds of art one pixel apart; at all three zooms and both measured
+/// rotations the gap is this same pixel (see the decisions log,
+/// 2026-11-15).
+const OBJECT_COLUMN: i32 = 1;
+
 /// What the window shows outside the lot: the original's grey (5-6-5
 /// red 14, green 28, blue 14), widened to 8 bits a channel.
 pub const BACKGROUND: [u8; 3] = [115, 113, 115];
@@ -683,7 +691,9 @@ impl Painter<'_> {
                 // canvas clips whatever this gives.
                 let height = i32::try_from(part.image.height).unwrap_or(i32::MAX);
                 let at = [
-                    screen[0].saturating_add(part.offset[0]),
+                    screen[0]
+                        .saturating_add(part.offset[0])
+                        .saturating_add(OBJECT_COLUMN),
                     screen[1]
                         .saturating_add(part.offset[1])
                         .saturating_sub(height)
