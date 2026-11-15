@@ -14,7 +14,8 @@ across the top for 200 ticks (10 s at normal speed) with a running
 count. The same error again at a later tick (or a frame skipped the
 same way again) is only counted, so one that recurs every frame does
 not hold the line open. The first 256 different errors are listed,
-later ones only counted. A failure play mode does not catch still stops
+later ones only counted; after 4096 different errors every new one is
+only counted, as it can no longer be told from its repeats. A failure play mode does not catch still stops
 the lot, as before. An error caught in a step that then fails is not
 logged: `Lot::step_play` returns the failure without the step's update.
 Within a step the log keeps the order things happened in: the frame

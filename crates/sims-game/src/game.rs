@@ -33,7 +33,8 @@ const SHOWN_TICKS: u32 = 200;
 /// The most errors kept in the log; later ones are only counted.
 const LOGGED: usize = 256;
 
-/// The most different errors remembered, to show each once.
+/// The most different errors remembered, to show each once. Errors
+/// after that are only counted.
 const SEEN: usize = 4096;
 
 /// What the game is started with.
@@ -401,12 +402,12 @@ impl Errors {
             .strip_prefix("tick ")
             .and_then(|rest| rest.split_once(", "))
             .map_or(line.as_str(), |(_, what)| what);
-        if self.seen.contains(what) {
+        // Once SEEN different errors are remembered, a new one cannot be
+        // told from its repeats, so it is only counted.
+        if self.seen.contains(what) || self.seen.len() >= SEEN {
             return;
         }
-        if self.seen.len() < SEEN {
-            self.seen.insert(what.to_owned());
-        }
+        self.seen.insert(what.to_owned());
         if self.lines.len() < LOGGED {
             self.lines.push(line.clone());
         } else if self.lines.len() == LOGGED {
@@ -601,5 +602,15 @@ mod tests {
             errors.lines.last().unwrap(),
             "further errors are counted, not listed"
         );
+        // Once SEEN different errors are remembered, a new one is only
+        // counted, so one recurring every tick does not hold the line open.
+        for n in errors.seen.len()..SEEN {
+            errors.push(400, format!("tick 9, filler {n}"));
+        }
+        let count = errors.count;
+        errors.push(400 + SHOWN_TICKS, "tick 10, object 3: new".into());
+        assert_eq!(errors.count, count + 1);
+        assert_eq!(errors.recent(400 + SHOWN_TICKS), None);
+        assert_eq!(errors.lines.len(), LOGGED + 1);
     }
 }
