@@ -1324,6 +1324,335 @@ fn the_job_panel_shows_what_the_next_level_needs() {
     assert_eq!(needs(&world), [0, 0, 100, 0, 300, 0]);
 }
 
+/// The live panel's Personality button shows the selected Sim's
+/// personality as the world holds it (person data words 7, 6, 3, 5 and
+/// 2: Neat, Outgoing, Active, Playful, Nice), and follows a press on
+/// another Goth's portrait.
+#[test]
+fn the_personality_panel_shows_the_selected_goths_traits() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        play: true,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    assert_eq!(game.run(20), 20);
+    game.resize([800, 600]);
+    game.render();
+    let centre = |r: Rect| [r.x + r.width / 2, r.y + r.height / 2];
+    let button = game
+        .panel()
+        .iter()
+        .find(|item| {
+            item.command
+                == Some(sims_ui::command::Command::OpenPanel(
+                    sims_ui::command::Panel::Personality,
+                ))
+        })
+        .expect("the Personality button")
+        .rect;
+    game.press(centre(button));
+    let shown = |game: &mut Game| {
+        game.render();
+        let shown: Vec<[i16; 5]> = game
+            .panel()
+            .iter()
+            .filter_map(|item| match item.kind {
+                Kind::Personality(values) => Some(values),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown.len(), 1, "one personality panel");
+        shown[0]
+    };
+    let traits = |game: &Game, sim: u16| {
+        let data = &game.lot().world().objects[&sim]
+            .person
+            .as_ref()
+            .unwrap()
+            .data;
+        [7, 6, 3, 5, 2].map(|word| data[word])
+    };
+    let mortimer = game.lot().world().selected().expect("a Sim is selected");
+    assert_eq!(shown(&mut game), traits(&game, mortimer));
+    // Another Goth's portrait: the panel stays open and shows hers.
+    let (other, portrait) = game
+        .panel()
+        .iter()
+        .find_map(|item| match item.command {
+            Some(sims_ui::command::Command::Select { sim }) if sim != mortimer => {
+                Some((sim, item.rect))
+            }
+            _ => None,
+        })
+        .expect("another Goth's portrait");
+    game.press(centre(portrait));
+    assert_eq!(game.lot().world().selected(), Some(other));
+    let hers = shown(&mut game);
+    assert_eq!(hers, traits(&game, other));
+    assert_ne!(hers, traits(&game, mortimer), "the two Goths differ");
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// The live panel's Needs meters are the selected Sim's motives as the
+/// world holds them, in the panel's order (Hunger, Energy, Comfort, Fun,
+/// Hygiene, Social, Bladder, Room: motives 7, 5, 6, 15, 8, 14, 9 and 13).
+/// They follow the ticks and a press on another Goth's portrait.
+#[test]
+fn the_needs_panel_follows_the_selected_goths_motives() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        play: true,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    assert_eq!(game.run(20), 20);
+    game.resize([800, 600]);
+    let shown = |game: &mut Game| {
+        game.render();
+        game.panel()
+            .iter()
+            .filter_map(|item| match item.kind {
+                Kind::Meter(value) => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<f32>>()
+    };
+    let motives = |game: &Game, sim: u16| {
+        let motives = &game.lot().world().objects[&sim]
+            .person
+            .as_ref()
+            .unwrap()
+            .motives;
+        [7, 5, 6, 15, 8, 14, 9, 13]
+            .map(|motive| motives[motive])
+            .to_vec()
+    };
+    let mortimer = game.lot().world().selected().expect("a Sim is selected");
+    let before = shown(&mut game);
+    assert_eq!(before, motives(&game, mortimer));
+    assert_eq!(game.run(200), 200);
+    let after = shown(&mut game);
+    assert_eq!(after, motives(&game, mortimer));
+    assert_ne!(after, before, "his needs moved in 200 ticks");
+    let (other, portrait) = game
+        .panel()
+        .iter()
+        .find_map(|item| match item.command {
+            Some(sims_ui::command::Command::Select { sim }) if sim != mortimer => {
+                Some((sim, item.rect))
+            }
+            _ => None,
+        })
+        .expect("another Goth's portrait");
+    game.press([
+        portrait.x + portrait.width / 2,
+        portrait.y + portrait.height / 2,
+    ]);
+    assert_eq!(game.lot().world().selected(), Some(other));
+    let hers = shown(&mut game);
+    assert_eq!(hers, motives(&game, other));
+    assert_ne!(hers, motives(&game, mortimer), "the two Goths differ");
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// The live panel's Job button shows the selected Sim's skills as the
+/// world holds them (person data words 10, 12, 11, 17, 18 and 15:
+/// Cooking, Mechanical, Charisma, Body, Logic, Creativity) and what the
+/// next level of their career needs, and follows a press on another
+/// Sim's portrait. The Goths have no skill points yet, so this is
+/// checked in house 7, whose two Sims have different skills (Cooking 3
+/// and Mechanical 2 against none);
+/// `the_job_panel_shows_what_the_next_level_needs` checks the needs.
+#[test]
+fn the_job_panel_shows_the_selected_sims_skills() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        play: true,
+        house: install.join("UserData/Houses/House07.iff"),
+        ..options(install)
+    })
+    .expect("house 7 opens");
+    assert_eq!(game.stopped(), None, "the load completes");
+    assert_eq!(game.run(20), 20);
+    game.resize([800, 600]);
+    game.render();
+    let centre = |r: Rect| [r.x + r.width / 2, r.y + r.height / 2];
+    let button = game
+        .panel()
+        .iter()
+        .find(|item| {
+            item.command
+                == Some(sims_ui::command::Command::OpenPanel(
+                    sims_ui::command::Panel::Job,
+                ))
+        })
+        .expect("the Job button")
+        .rect;
+    game.press(centre(button));
+    let shown = |game: &mut Game| {
+        game.render();
+        let shown: Vec<([i16; 6], [i32; 6])> = game
+            .panel()
+            .iter()
+            .filter_map(|item| match item.kind {
+                Kind::Skills { skills, needs } => Some((skills, needs)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown.len(), 1, "one job panel");
+        shown[0]
+    };
+    let held = |game: &Game, sim: u16| {
+        let world = game.lot().world();
+        let data = &world.objects[&sim].person.as_ref().unwrap().data;
+        let needs = game
+            .snapshot(world)
+            .resident(sim)
+            .expect("a Goth lives here")
+            .needs;
+        ([10, 12, 11, 17, 18, 15].map(|word| data[word]), needs)
+    };
+    let first = game.lot().world().selected().expect("a Sim is selected");
+    let theirs = shown(&mut game);
+    assert_eq!(theirs, held(&game, first));
+    let (other, portrait) = game
+        .panel()
+        .iter()
+        .find_map(|item| match item.command {
+            Some(sims_ui::command::Command::Select { sim }) if sim != first => {
+                Some((sim, item.rect))
+            }
+            _ => None,
+        })
+        .expect("the other Sim's portrait");
+    game.press(centre(portrait));
+    assert_eq!(game.lot().world().selected(), Some(other));
+    let others = shown(&mut game);
+    assert_eq!(others, held(&game, other));
+    assert_ne!(others.0, theirs.0, "the two Sims' skills differ");
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// The live panel's Relationships button lists the people the selected
+/// Sim knows, from the neighborhood records the booted lot holds: the
+/// Goths know only each other, the married ones with the pink heart, and
+/// each entry's numbers are the selected Sim's row toward that person
+/// (values 0 and 2). The list follows a press on another Goth's
+/// portrait.
+#[test]
+fn the_relationship_panel_lists_who_the_selected_goth_knows() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        play: true,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    assert_eq!(game.run(20), 20);
+    game.resize([800, 600]);
+    game.render();
+    let centre = |r: Rect| [r.x + r.width / 2, r.y + r.height / 2];
+    let button = game
+        .panel()
+        .iter()
+        .find(|item| {
+            item.command
+                == Some(sims_ui::command::Command::OpenPanel(
+                    sims_ui::command::Panel::Relationships,
+                ))
+        })
+        .expect("the Relationships button")
+        .rect;
+    game.press(centre(button));
+    let shown = |game: &mut Game| {
+        game.render();
+        game.panel()
+            .iter()
+            .filter_map(|item| match &item.kind {
+                Kind::Relation { relation, .. } => Some(relation.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    // Each entry's numbers are the selected Sim's row toward the
+    // person's record, as the world holds it.
+    let check = |game: &Game, sim: u16, shown: &[sims_ui::household::Relation]| {
+        let world = game.lot().world();
+        let neighbors = &world.neighbors;
+        let viewer = neighbors
+            .first_of(world.objects[&sim].guid)
+            .expect("the Sim's own record");
+        for relation in shown {
+            let target = neighbors.first_of(relation.guid).expect("a record");
+            let row = viewer.row(i32::from(target.id)).expect("a row");
+            assert_eq!(relation.daily, row.values[0].clamp(-100, 100));
+            assert_eq!(relation.lifetime, row.values[2].clamp(-100, 100));
+            assert_eq!(relation.pink_heart, row.values[1] != 0);
+        }
+    };
+    // Who is listed, in order: the type's GUID, the record, the daily
+    // and lifetime relationships, then the smiley, the pink and red
+    // hearts and the family mark.
+    let listed = |shown: &[sims_ui::household::Relation]| {
+        shown
+            .iter()
+            .map(|r| {
+                (
+                    r.guid,
+                    r.id,
+                    r.daily,
+                    r.lifetime,
+                    [r.friends, r.pink_heart, r.red_heart, r.family],
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let (mortimer, bella, cassandra) = (0xc07f_6184, 0xc0c6_298e, 0xc120_7913);
+    let selected = game.lot().world().selected().expect("a Sim is selected");
+    assert_eq!(game.lot().world().objects[&selected].guid, mortimer);
+    let his = shown(&mut game);
+    check(&game, selected, &his);
+    // His family only, his wife first with the pink heart.
+    assert_eq!(
+        listed(&his),
+        [
+            (bella, 33, 100, 100, [true, true, false, true]),
+            (cassandra, 32, 75, 75, [true, false, false, true]),
+        ]
+    );
+    let (other, portrait) = game
+        .panel()
+        .iter()
+        .find_map(|item| match item.command {
+            Some(sims_ui::command::Command::Select { sim }) if sim != selected => {
+                Some((sim, item.rect))
+            }
+            _ => None,
+        })
+        .expect("another Goth's portrait");
+    assert_eq!(game.lot().world().objects[&other].guid, bella);
+    game.press(centre(portrait));
+    assert_eq!(game.lot().world().selected(), Some(other));
+    let hers = shown(&mut game);
+    check(&game, other, &hers);
+    assert_eq!(
+        listed(&hers),
+        [
+            (mortimer, 34, 100, 100, [true, true, false, true]),
+            (cassandra, 32, 85, 85, [true, false, false, true]),
+        ]
+    );
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
 /// A press on the selected Sim's portrait centres the view on him even
 /// after the view has been scrolled further than 16 bits of screen hold:
 /// where the drawing puts him then is the middle of the screen, a little
