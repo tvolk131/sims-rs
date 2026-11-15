@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// The SLOT entry kind that makes a routing slot (0x46e3a0).
 const ROUTING_SLOT: u16 = 3;
+/// The global file's SLOT chunk that holds the lot's global routing slots
+/// (0x440630).
+const GLOBAL_SLOT_CHUNK: u16 = 100;
 
 /// The code and constants one IFF file provides.
 #[derive(Debug, Clone, Default)]
@@ -556,6 +559,25 @@ impl Program {
         index: usize,
     ) -> Option<(usize, &sims_formats::execution::Slot)> {
         self.slots(resource, chunk)
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.kind == ROUTING_SLOT)
+            .nth(index)
+    }
+
+    /// The lot's global routing slot `index`, with its index in the SLOT
+    /// chunk: the lot's table (+0x9c) holds the kind 3 entries of SLOT 100
+    /// of the global file, in order, as an object's table holds its type's
+    /// (made as the lot loads, 0x440635 and 0x4430e9). None when there is
+    /// no such entry.
+    pub fn global_routing_slot(
+        &self,
+        index: usize,
+    ) -> Option<(usize, &sims_formats::execution::Slot)> {
+        self.libraries
+            .get(&self.global)?
+            .slots
+            .get(&GLOBAL_SLOT_CHUNK)?
             .iter()
             .enumerate()
             .filter(|(_, slot)| slot.kind == ROUTING_SLOT)

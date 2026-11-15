@@ -21,7 +21,8 @@ pub struct Routing {
     /// Slot flags an object's slot table holds that differ from its
     /// type's, by object ID and slot index. Go To Routing Slot sets and
     /// clears flag 0x4000 in the object's own copy of the table
-    /// (0x45ac5c).
+    /// (0x45ac5c). Object ID 0, which no object has, holds the flags of
+    /// the lot's global routing slots (lot +0x9c).
     pub slot_flags: BTreeMap<(u16, u16), i32>,
     /// Person data words whose value is not known, by person ID and word.
     /// The original wrote them from memory it never initialized: the
