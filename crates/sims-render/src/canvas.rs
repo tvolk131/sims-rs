@@ -5,12 +5,20 @@
 //! draw wins (the `<=` test of the old prototype's reading of the sprite
 //! blitters, `legacy/crates/sims-sim/src/lot_presenter/sprite2_clipped.rs`).
 //!
-//! The unit is a sixteenth of a sprite depth byte. See [`crate::depth`].
+//! Depth is the original's 16-bit depth (see [`crate::depth`]): what a
+//! pixel stores is held to 0 to 65535, where the original keeps the low
+//! 16 bits; the two differ only off the original's tables.
 
+pub use crate::depth::EMPTY;
 use crate::light::Light;
 
-/// Depth of a pixel nothing was drawn on.
-pub const EMPTY: i32 = i32::MAX;
+/// The faintest alpha drawn: 8 of the files' 31 steps (8 * 255 / 31,
+/// rounded down). The original leaves out a sprite's fainter edge pixels,
+/// colour and depth both; the threshold is fitted to its frame buffer and
+/// depth buffer at three cameras, where it lifts the depth
+/// match from 98.0% to 99.1% (medium zoom) and 98.9% to 99.7% (far zoom),
+/// and puts the door's left jamb back. Not read from the code.
+pub const FAINT: u8 = 65;
 
 /// A decoded sprite frame: straight-alpha RGBA and, if it has one, a depth
 /// byte per pixel (255 where nothing is drawn).
@@ -122,18 +130,44 @@ impl Canvas {
         flip: bool,
         depth: impl Fn(i32, i32, u8) -> i32,
     ) {
-        self.draw_lit(image, at, flip, Light::FULL, depth);
+        self.draw_lit(image, at, flip, Light::FULL, |x, y, b| Some(depth(x, y, b)));
     }
 
     /// [`Canvas::draw`] under a light: each pixel's color is darkened by
-    /// `light` before it is written or blended.
+    /// `light` before it is written or blended. A pixel whose depth is
+    /// None is not drawn, nor is one fainter than [`FAINT`].
     pub fn draw_lit(
         &mut self,
         image: &Image,
         at: [i32; 2],
         flip: bool,
         light: Light,
-        depth: impl Fn(i32, i32, u8) -> i32,
+        depth: impl Fn(i32, i32, u8) -> Option<i32>,
+    ) {
+        self.blit(image, at, flip, light, 0, depth);
+    }
+
+    /// Draws a wall: as [`Canvas::draw_lit`], but a pixel up to one unit
+    /// farther than what is there still wins, as in the original's wall
+    /// blitter (0x4c4907).
+    pub fn draw_wall(
+        &mut self,
+        image: &Image,
+        at: [i32; 2],
+        light: Light,
+        depth: impl Fn(i32, i32) -> i32,
+    ) {
+        self.blit(image, at, false, light, 1, |x, y, _| Some(depth(x, y)));
+    }
+
+    fn blit(
+        &mut self,
+        image: &Image,
+        at: [i32; 2],
+        flip: bool,
+        light: Light,
+        slack: i32,
+        depth: impl Fn(i32, i32, u8) -> Option<i32>,
     ) {
         // Clip in i64: the canvas and image sides fit, and so does any i32
         // position plus a side. Inside the canvas everything fits in i32.
@@ -164,22 +198,24 @@ impl Canvas {
                 }
                 let source = iy * image.width + ix;
                 let a = image.rgba[source * 4 + 3];
-                if a == 0 {
+                if a < FAINT {
                     continue;
                 }
                 let byte = image
                     .depth
                     .as_ref()
                     .map_or(255, |d| d.get(source).copied().unwrap_or(255));
-                let d = depth(sx, sy, byte);
+                let Some(d) = depth(sx, sy, byte) else {
+                    continue;
+                };
                 let target = py * self.width + px;
-                if d > self.depth[target] {
+                if d > self.depth[target].saturating_add(slack) {
                     continue;
                 }
                 let s = &image.rgba[source * 4..source * 4 + 3];
                 let rgb = light.apply([s[0], s[1], s[2]]);
                 let pixel = &mut self.color[target];
-                self.depth[target] = d;
+                self.depth[target] = d.clamp(0, EMPTY);
                 if a == 255 {
                     *pixel = rgb;
                 } else {
@@ -200,7 +236,7 @@ impl Canvas {
         let target = y as usize * self.width + x as usize;
         if d <= self.depth[target] {
             self.color[target] = rgb;
-            self.depth[target] = d;
+            self.depth[target] = d.clamp(0, EMPTY);
         }
     }
 

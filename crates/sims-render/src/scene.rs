@@ -5,7 +5,7 @@ use crate::camera::{self, Camera, Walls, Zoom};
 use crate::canvas::{Canvas, Image};
 use crate::caps::{self, Cap, Corners, Line, solid};
 use crate::cutaway::{self, Mask};
-use crate::depth;
+use crate::depth::{Anchor, Depth};
 use crate::grass::{self, Grass};
 use crate::light::Light;
 use crate::lot::{self, Lot, WallCell};
@@ -57,6 +57,7 @@ pub fn draw(
         assets,
         canvas,
         grass: Grass::new(lot, camera),
+        depth: Depth::new(camera),
         stats: Stats::default(),
     };
     let top = camera.level.clamp(1, 2);
@@ -171,12 +172,6 @@ fn edge(a: [i32; 2], b: [i32; 2]) -> Edge {
     if a <= b { [a, b] } else { [b, a] }
 }
 
-/// The elevation of a level's floor above the ground level, in near-zoom
-/// pixels.
-fn level_elevation(level: i32) -> i32 {
-    Zoom::Near.floor_height() * (level - 1)
-}
-
 /// One wall of a cell: its corners and the direction its first side faces.
 struct Segment {
     bit: u8,
@@ -214,6 +209,7 @@ struct Painter<'a> {
     assets: &'a mut Assets,
     canvas: &'a mut Canvas,
     grass: Grass,
+    depth: Depth,
     stats: Stats,
 }
 
@@ -287,7 +283,6 @@ impl Painter<'_> {
         }
         let index = (level - 1) as usize;
         let zoom = self.camera.zoom.index();
-        let base = level_elevation(level);
         for x in 0..self.lot.size as i32 {
             for y in 0..self.lot.size as i32 {
                 let cell = Lot::cell(x as usize, y as usize);
@@ -303,8 +298,8 @@ impl Painter<'_> {
                         v[0] + v[1]
                     })
                     .unwrap_or([x, y]);
-                let elevation = base + self.corner_elevation(top);
                 let p = self.corner_screen(top, level);
+                let (view, height) = (self.rotate_corner(top), self.corner_elevation(top) / 16);
                 let wall = self.lot.levels[index].walls[cell];
                 let halves = if floor == lot::SPLIT_FLOOR {
                     wall.split_floors().map(Some)
@@ -333,9 +328,9 @@ impl Painter<'_> {
                         (true, _, _) => [12, 4],
                     };
                     let light = self.light(index, [x * 16 + inside[0], y * 16 + inside[1]]);
-                    let camera = self.camera;
+                    let depth = &self.depth;
                     self.canvas.draw_lit(&image, at, false, light, |_, y, _| {
-                        depth::ground(camera, y, elevation)
+                        Some(depth.floor(view, height, level, at[1], y))
                     });
                     self.stats.floors += 1;
                 }
@@ -364,19 +359,11 @@ impl Painter<'_> {
             return;
         }
         let lit = self.light(0, [x * 16 + 8, y * 16 + 8]);
-        // The whole tile takes the depth of its lowest corner. Following
-        // the slope would be truer, but floors take their top corner's
-        // elevation, and where sloped ground meets a floor the grass would
-        // then cover the floor's edge, which the original does not.
-        let elevation = (0..4)
-            .map(|c| self.corner_elevation([x + (c & 1), y + (c >> 1)]))
-            .min()
-            .unwrap_or(0);
-        let camera = self.camera;
+        // The whole tile takes one depth, from its top corner.
+        let depth = self.depth.grass(view, i32::from(heights[1]));
         let left = corner[0] + GRASS_COLUMN;
         for column in grass::columns(left, corner[1] + GRASS_ROW, heights, shades, colors, zoom) {
             for (row, pixels) in column.rows() {
-                let depth = depth::ground(camera, row, elevation);
                 for (i, &p) in pixels.iter().enumerate() {
                     self.canvas
                         .plot(column.x + i as i32, row, depth, lit.apply(grass::widen(p)));
@@ -384,7 +371,6 @@ impl Painter<'_> {
             }
             let index = ((column.x - left) / 4) as usize;
             for (bx, foot, height, p) in self.grass.blades(view, &column, index) {
-                let depth = depth::ground(camera, foot, elevation);
                 let color = lit.apply(grass::widen(p));
                 for row in foot.saturating_sub(height - 1)..=foot {
                     self.canvas.plot(bx, row, depth, color);
@@ -458,7 +444,7 @@ impl Painter<'_> {
                     let opening = openings.get(&key);
                     let pattern = patterns[front];
                     let ends = [s.from, s.to].map(|c| self.corner_screen(c, level));
-                    let elevation = level_elevation(level) + self.corner_elevation(s.from);
+                    let heights = [s.from, s.to].map(|c| self.corner_elevation(c) / 16);
                     let frame = wall_frame(ends);
                     // A cut wall marked for a cap at one end stands full
                     // height there: the original draws it in shape 7 or 8,
@@ -486,14 +472,14 @@ impl Painter<'_> {
                     // that side: sampled just beside the wall's middle, so
                     // a split tile gives the triangle touching the wall.
                     let light = self.light(index, wall_side(&s, front));
-                    self.place_wall(&image, frame, ends, elevation, light, None);
+                    self.place_wall(&image, frame, ends, heights, level, light, None);
                     if let Some(shape) = capped {
                         let (trim, mask) = if shape == 7 { (252, 9) } else { (253, 10) };
                         if let Some(strip) =
                             wall_image(self.assets, trim, mask, None, false, zoom, frame)
                         {
                             // At full light, like the trim along the top.
-                            self.place_wall(&strip, frame, ends, elevation, Light::FULL, None);
+                            self.place_wall(&strip, frame, ends, heights, level, Light::FULL, None);
                         }
                     }
                     self.stats.walls += 1;
@@ -502,15 +488,22 @@ impl Painter<'_> {
         }
     }
 
-    /// Draws a wall face standing between the screen points `a` and `b`
-    /// of its ends, its foot `elevation` near-zoom pixels up, only within
-    /// screen columns `columns` (from, to) when given.
+    /// Draws a wall face on `level` standing between the screen points
+    /// `a` and `b` of its ends, on terrain `heights` steps up at each,
+    /// only within screen columns `columns` (from, to) when given.
+    ///
+    /// The wall is placed at its end lower on the screen (the left one of
+    /// a wall level on screen), and a straight wall's columns run up or
+    /// down its column table from there; both were fitted to the
+    /// original's depth buffer at medium zoom (2026-11-14).
+    #[allow(clippy::too_many_arguments)]
     fn place_wall(
         &mut self,
         image: &Image,
         frame: usize,
         [a, b]: [[i32; 2]; 2],
-        elevation: i32,
+        heights: [i32; 2],
+        level: i32,
         light: Light,
         columns: Option<[i32; 2]>,
     ) {
@@ -520,14 +513,22 @@ impl Painter<'_> {
         // The sprite's bottom row sits one pixel above the corner's
         // projected point (matched against the original's screen,
         // 2026-11-14).
-        let (foot, at) = match frame {
-            0 | 2 => (left, [left[0], left[1] - h]),
-            1 => (left, [left[0], left[1] - (h - rise)]),
+        let at = match frame {
+            0 | 2 => [left[0], left[1] - h],
+            1 => [left[0], left[1] - (h - rise)],
             _ => {
                 let bottom = if a[1] > b[1] { a } else { b };
-                (bottom, [bottom[0] - w / 2, bottom[1] - h])
+                [bottom[0] - w / 2, bottom[1] - h]
             }
         };
+        let (end, height) = match (frame, a[1].cmp(&b[1])) {
+            (2, _) if a[0] <= b[0] => (a, heights[0]),
+            (2, _) => (b, heights[1]),
+            (_, std::cmp::Ordering::Less) => (b, heights[1]),
+            _ => (a, heights[0]),
+        };
+        let anchor = self.depth.anchor(end[1], height as f32, level);
+        let sprite_left = at[0];
         let clipped;
         let (image, at) = match columns {
             Some(columns) => {
@@ -539,15 +540,13 @@ impl Painter<'_> {
             }
             None => (image, at),
         };
-        let camera = self.camera;
-        self.canvas.draw_lit(image, at, false, light, |sx, sy, _| {
-            let row = match frame {
-                0 => foot[1] - (sx - foot[0]) / 2,
-                1 => foot[1] + (sx - foot[0]) / 2,
-                _ => foot[1],
-            };
-            depth::upright(camera, sy, row, elevation)
-        });
+        let depth = &self.depth;
+        let first = depth.wall_start(frame == 0);
+        self.canvas
+            .draw_wall(image, at, light, |sx, sy| match frame {
+                0 | 1 => depth.wall(anchor, sy, first, sx.saturating_sub(sprite_left)),
+                _ => depth.diagonal(anchor, sy),
+            });
     }
 
     /// A level's walls as the original's corner pass sees them (see
@@ -598,10 +597,10 @@ impl Painter<'_> {
         let zoom = self.camera.zoom;
         let half = zoom.tile_width() / 2;
         let cut_height = [6, 12, 23][zoom.index()];
-        let base = level_elevation(level);
         for (&corner, c) in &corners.corners {
             let at = self.corner_screen(corner, level);
-            let elevation = base + self.corner_elevation(corner);
+            let view = self.rotate_corner(corner);
+            let ground = self.corner_elevation(corner) / 16;
             for (bits, is_cut, height) in [
                 (c.cut, true, cut_height),
                 (c.standing, false, zoom.floor_height()),
@@ -657,12 +656,12 @@ impl Painter<'_> {
                     let Some(y) = at[1].checked_sub(rise) else {
                         continue;
                     };
-                    let camera = self.camera;
-                    // The trim lies on the wall tops: each pixel as deep as
-                    // the wall under it.
+                    // The trim lies on the wall tops, one depth a row
+                    // (fitted to the original's depth buffer, 2026-11-14).
+                    let depth = &self.depth;
                     self.canvas
                         .draw_lit(&image, [x, y], false, Light::FULL, |_, sy, _| {
-                            depth::upright(camera, sy, sy + height, elevation)
+                            Some(depth.flat(view, ground, level, y, sy))
                         });
                 }
             }
@@ -754,8 +753,8 @@ impl Painter<'_> {
         } else {
             [cx.saturating_sub(width), cx]
         };
-        let elevation = level_elevation(level) + ground;
-        self.place_wall(&image, frame, ends, elevation, light, Some(columns));
+        let step = ground / 16;
+        self.place_wall(&image, frame, ends, [step; 2], level, light, Some(columns));
     }
 
     fn objects(&mut self, level: i32, cut: &Cut) {
@@ -788,13 +787,13 @@ impl Painter<'_> {
                 .map(|c| self.corner_elevation([tile[0] + (c & 1), tile[1] + (c >> 1)]))
                 .sum::<i32>()
                 / 4;
-            let up = (lift * 16.0).round() as i32;
-            let anchor = depth::point(view, level_elevation(level) + ground + up);
+            let height = ground as f32 / 16.0 + lift;
+            let anchor = place(&self.depth, self.camera, view, level, height);
             list.push((anchor, id, view, ground, [x, y], lift));
         }
         // Far objects first, so soft edges blend over what is behind them.
-        list.sort_by_key(|&(d, id, ..)| (std::cmp::Reverse(d), id));
-        for (anchor, id, view, ground, place, lift) in list {
+        list.sort_by_key(|&(a, id, ..)| (std::cmp::Reverse(a.depth), id));
+        for (anchor, id, view, ground, spot, lift) in list {
             let o = &self.world.objects[&id];
             let Some(definition) = self.assets.definition(o.guid) else {
                 self.stats.missing_objects += 1;
@@ -830,7 +829,7 @@ impl Painter<'_> {
                 continue;
             }
             let facing = o.data.get(1).copied().unwrap_or(0);
-            let base = level_elevation(level) + ground;
+            let base = ground as f32 / 16.0;
             // An object takes the light of the room at its position (the
             // original samples the tile light map there, 0x467482).
             let light = Light::from_byte(
@@ -859,11 +858,13 @@ impl Painter<'_> {
                 let anchor = if part.object == [0.0; 3] {
                     anchor
                 } else {
-                    part_anchor(self.camera, [place[0], place[1], 0], facing, object, base)
+                    let depth = &self.depth;
+                    part_anchor(depth, self.camera, spot, facing, object, level, base)
                 };
+                let depth = &self.depth;
                 self.canvas
                     .draw_lit(&part.image, at, part.flip, light, |_, _, byte| {
-                        depth::sprite(anchor, byte)
+                        depth.sprite(anchor, byte)
                     });
             }
             self.stats.objects += 1;
@@ -962,21 +963,35 @@ fn sprite_rise(object: [f32; 3], zoom: Zoom) -> i32 {
     (z * (2 << zoom.level()) as f32 + 0.5).trunc() as i32
 }
 
+/// Places a point at fine view position `view` on `level`, `height`
+/// terrain steps up (16 near-zoom pixels each): the original projects it
+/// at its height rounded to a whole step, then takes its depth anchor
+/// (0x4b97ea to 0x4c9ceb).
+fn place(depth: &Depth, camera: &Camera, view: [i32; 2], level: i32, height: f32) -> Anchor {
+    let steps = (height + 0.5).trunc() as i32;
+    let rise = steps.saturating_mul(2 << camera.zoom.level());
+    let y = camera.project_fine(view, level, 0)[1].saturating_sub(rise);
+    depth.anchor(y, height, level)
+}
+
 /// The depth anchor of a draw group sprite that sits `object` away from
-/// an object at `position` (fine units) facing `facing` (data word 1), on
-/// ground `base` near-zoom pixels up. The offset's x and y are sixteenths
-/// of a tile in the object's own frame, and turn with it a quarter turn per
-/// two steps of facing, as the old prototype turned them; z is in height
-/// units of 16 near-zoom pixels (2 << 3, as [`sprite_rise`]). The old
-/// prototype read the same units (`legacy/crates/sims-render/src/lib.rs`
-/// divides x and y by 16 to get tiles).
+/// an object at fine position `position` facing `facing` (data word 1),
+/// on `level`, on ground `base` terrain steps up. The offset's x and y are
+/// sixteenths of a tile in the object's own frame, and turn with it a
+/// quarter turn per two steps of facing, as the old prototype turned them;
+/// z is in height units of 16 near-zoom pixels (2 << 3, as
+/// [`sprite_rise`]), the same as a terrain step. The old prototype read
+/// the same units (`legacy/crates/sims-render/src/lib.rs` divides x and y
+/// by 16 to get tiles).
 fn part_anchor(
+    depth: &Depth,
     camera: &Camera,
-    position: [i32; 3],
+    position: [i32; 2],
     facing: i16,
     object: [f32; 3],
-    base: i32,
-) -> i32 {
+    level: i32,
+    base: f32,
+) -> Anchor {
     let [mut x, mut y, z] = sprite_offset(object);
     for _ in 0..(i32::from(facing) / 2).rem_euclid(4) {
         (x, y) = (-y, x);
@@ -985,8 +1000,7 @@ fn part_anchor(
         position[0] + x.round() as i32,
         position[1] + y.round() as i32,
     ];
-    let up = (z * 16.0).round() as i32;
-    depth::point(camera.rotate_fine(fine), base + up)
+    place(depth, camera, camera.rotate_fine(fine), level, base + z)
 }
 
 /// The draw group view (one bit of 1, 4, 16 and 64) for an object facing
@@ -1315,33 +1329,26 @@ mod tests {
 
     #[test]
     fn sprite_world_offsets_move_depth_with_the_object_and_camera() {
-        let position = [100, 200, 1];
-        let base = 32;
-        let anchor = depth::point(camera(0).rotate_fine([100, 200]), base);
-        assert_eq!(part_anchor(&camera(0), position, 0, [0.0; 3], base), anchor);
-        // One height unit up is 16 near-zoom pixels, and nearer.
-        assert_eq!(
-            part_anchor(&camera(0), position, 0, [0.0, 0.0, 1.0], base),
-            depth::point([100, 200], base + 16)
-        );
+        let position = [100, 200];
+        let base = 2.0;
+        let d = Depth::new(&camera(0));
+        let at =
+            |c: u8, fine, height| place(&d, &camera(c), camera(c).rotate_fine(fine), 1, height);
+        let part =
+            |c: u8, facing, object| part_anchor(&d, &camera(c), position, facing, object, 1, base);
+        assert_eq!(part(0, 0, [0.0; 3]), at(0, [100, 200], base));
+        // One height unit up is one terrain step, and nearer.
+        assert_eq!(part(0, 0, [0.0, 0.0, 1.0]), at(0, [100, 200], base + 1.0));
+        assert!(part(0, 0, [0.0, 0.0, 1.0]).depth < part(0, 0, [0.0; 3]).depth);
         // Sixteen units along x is one tile, at facing 0; at facing 2 (a
         // quarter turn) x becomes y.
-        assert_eq!(
-            part_anchor(&camera(0), position, 0, [16.0, 0.0, 0.0], base),
-            depth::point([116, 200], base)
-        );
-        assert_eq!(
-            part_anchor(&camera(0), position, 2, [16.0, 0.0, 0.0], base),
-            depth::point([100, 216], base)
-        );
+        assert_eq!(part(0, 0, [16.0, 0.0, 0.0]), at(0, [116, 200], base));
+        assert_eq!(part(0, 2, [16.0, 0.0, 0.0]), at(0, [100, 216], base));
         // The camera's rotation turns the moved point like any other.
-        assert_eq!(
-            part_anchor(&camera(1), position, 2, [16.0, 0.0, 0.0], base),
-            depth::point(camera(1).rotate_fine([100, 216]), base)
-        );
+        assert_eq!(part(1, 2, [16.0, 0.0, 0.0]), at(1, [100, 216], base));
         // Nonsense in a file stays bounded.
         for bad in [f32::NAN, f32::INFINITY, f32::MAX, f32::MIN] {
-            let _ = part_anchor(&camera(3), position, i16::MIN, [bad, bad, bad], base);
+            let _ = part_anchor(&d, &camera(3), position, i16::MIN, [bad, bad, bad], 1, base);
             let _ = sprite_rise([bad, bad, bad], Zoom::Near);
         }
     }
