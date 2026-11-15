@@ -226,15 +226,16 @@ pub fn layout(
             0
         } else if start.saturating_add(size[i]) >= screen[i] {
             moved = true;
-            screen[i] - size[i]
+            screen[i].saturating_sub(size[i])
         } else {
             start
         }
     });
-    let place = |r: Rect| r.offset(origin[0] + middle[0], origin[1] + middle[1]);
+    let center = [0, 1].map(|i| origin[i].saturating_add(middle[i]));
+    let place = |r: Rect| r.offset(center[0], center[1]);
     Some(Layout {
         window: Rect::new(origin[0], origin[1], size[0], size[1]),
-        center: [origin[0] + middle[0], origin[1] + middle[1]],
+        center,
         moved,
         face: place(Rect::new(face_at[0], face_at[1], face[0], face[1])),
         title: (!title.is_empty()).then(|| Label {
@@ -341,8 +342,10 @@ pub fn draw(
     highlighted: Option<usize>,
     pressed: bool,
 ) {
-    if let Some(head) = head {
-        frame.draw_all(head, [layout.face.x, layout.face.y]);
+    // The face bitmap is all colour key in the game's art; the head is
+    // rendered into it.
+    for image in [art.image(FACE), head].into_iter().flatten() {
+        frame.draw_all(image, [layout.face.x, layout.face.y]);
     }
     let Some(font) = art.font(FONT) else {
         return;
@@ -505,9 +508,9 @@ impl Pie {
                 return Pressed::Chose(choice);
             }
             // A press within the dead zone goes back (0x48db04).
-            let dx = i64::from(point[0]) - i64::from(top.center[0]);
-            let dy = i64::from(point[1]) - i64::from(top.center[1]);
-            if ((dx * dx + dy * dy) as f64).sqrt() as f32 <= DEAD_ZONE as f32 {
+            let dx = f64::from(point[0]) - f64::from(top.center[0]);
+            let dy = f64::from(point[1]) - f64::from(top.center[1]);
+            if (dx * dx + dy * dy).sqrt() as f32 <= DEAD_ZONE as f32 {
                 self.submenu = None;
                 return Pressed::Back;
             }
@@ -743,12 +746,20 @@ mod tests {
         let art = art();
         let mut frame = Frame::new(10, 10, [0; 3]);
         for at in [[i32::MIN, i32::MIN], [i32::MAX, i32::MAX], [0, 0]] {
-            for screen in [[0, 0], [-5, -5], [i32::MAX, i32::MAX]] {
+            for screen in [[0, 0], [-5, -5], [i32::MAX, i32::MAX], [i32::MIN, 600]] {
                 let l = layout(screen, at, "T", &entries(&["A"; 13]), &art).unwrap();
                 draw(&mut frame, &art, &l, None, Some(0), true);
                 let _ = hit(&l, at);
             }
         }
         assert!(layout([1, 1], [0, 0], "", &[], &Art::default()).is_none());
+        let mut pie = Pie::new(&["Ask/Dance"], [400, 300]);
+        let layouts = pie.layout([800, 600], &art).unwrap();
+        let ask = layouts[0].labels[0].rect;
+        pie.press(&layouts, [ask.x + 1, ask.y + 1]);
+        let layouts = pie.layout([800, 600], &art).unwrap();
+        for far in [[i32::MIN, i32::MIN], [i32::MAX, i32::MAX]] {
+            assert_eq!(pie.clone().press(&layouts, far), Pressed::Closed);
+        }
     }
 }
