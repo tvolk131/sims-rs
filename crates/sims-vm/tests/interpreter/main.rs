@@ -5,6 +5,7 @@ mod animate;
 mod autonomy;
 mod budget;
 mod calls;
+mod change_suit;
 mod deletion;
 mod expression;
 mod factory;

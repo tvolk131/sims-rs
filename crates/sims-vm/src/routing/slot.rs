@@ -20,7 +20,7 @@
 //! and a place the person does not fit at (whose answer depends on why).
 
 use crate::fault::{Fault, Trap};
-use crate::interpreter::Interpreter;
+use crate::interpreter::{Interpreter, Stream};
 use crate::placement::{Refusal, capture, closed_directions};
 use sims_core::{Ext, F32};
 use sims_formats::execution::Slot;
@@ -41,6 +41,8 @@ const HEIGHTS: u16 = 0;
 /// A candidate's score when the slot's own place is free (0x483574),
 /// and the base of every score in a search (0x483af3).
 const FREE: i32 = 100;
+/// The slot flag that adds a random part to each score (0x483aed).
+const JITTER: i32 = 0x2000;
 /// 16 as a float (0x666a54) and 1/16 (0x667278).
 const SIXTEEN: F32 = F32::from_bits(0x4180_0000);
 const SIXTEENTH: F32 = F32::from_bits(0x3d80_0000);
@@ -99,6 +101,7 @@ pub(crate) fn new_context(world: &World, person: u16, target: u16, slot: RouteSl
         byte_8e: false,
         word_94,
         limit: 0x30,
+        action: 0,
     }
 }
 
@@ -520,15 +523,18 @@ impl Interpreter<'_> {
     ///    bit; then the next point. Answer 3 ends the direction at the end
     ///    of the row.
     ///
-    /// A point refused goes through the classification a second time
-    /// (0x483a5d: the loop that also looks at seats comes back to the
-    /// standing place, its weight register then holding the context's
-    /// address). With the same answer, which is what the classification
-    /// gives for the same point, nothing changes; any other fails loudly.
+    /// Each point is scored and classified once (0x483a5d: the loop over
+    /// the standing place, the eight seats and the standing place again
+    /// takes the place at the first or the last index, whichever weight is
+    /// the larger; seats fail loudly, so the sitting weight is 0).
     ///
-    /// Fails loudly for a slot with a sitting weight (seats), with flag
-    /// 0x2000 (a random part of the score), and for more candidates than
-    /// the context's limit (a random choice among them, 0x483c57).
+    /// With slot flag 0x2000, each score also takes a draw from the active
+    /// random stream (0x46f457) modulo 20, less 10, before the additions
+    /// for the sides and the start (0x483b02).
+    ///
+    /// Fails loudly for a slot with a sitting weight (seats) and for more
+    /// candidates than the context's limit (a random choice among them,
+    /// 0x483c57).
     fn search_by_distance(
         &self,
         world: &mut World,
@@ -573,12 +579,7 @@ impl Interpreter<'_> {
                 beside |= (1 << i) | (1 << ((i + 7) % 8)) | (1 << ((i + 1) % 8));
             }
         }
-        if slot.flags & 0x2000 != 0 {
-            return Err(fail(unsupported(
-                "0x483b02",
-                "a slot search with a random part in its score",
-            )));
-        }
+        let jitter = slot.flags & JITTER != 0;
         let weight = slot.standing.max(slot.ground).wrapping_mul(10);
         let resolution = slot.resolution;
         let gradient = F32::from_bits(slot.gradient);
@@ -615,69 +616,61 @@ impl Interpreter<'_> {
                     let b = (y.ext() + F32::from_bits(slot.offset[1]).ext()).single();
                     let place = transform(pos, a.to_f32(), b.to_f32(), dir).map_err(fail)?;
                     let (xi, yi) = (a.to_i32_truncate(), b.to_i32_truncate());
-                    let mut answers = Vec::new();
-                    // The standing place, then (0x483a5d) the same place
-                    // once more after the seats are looked at.
-                    for pass in 0..2 {
-                        if weight == 0 {
-                            break;
-                        }
-                        let squared = xi.wrapping_mul(xi).wrapping_add(yi.wrapping_mul(yi));
-                        if squared > far.wrapping_mul(far) || squared < near.wrapping_mul(near) {
-                            break;
-                        }
-                        let radial = Ext::from_i32(squared).sqrt().single().to_i32_truncate();
-                        let off = radial.wrapping_sub(best).wrapping_abs();
-                        let penalty = (Ext::from_i32(off) * gradient.ext())
-                            .single()
-                            .to_i32_truncate();
-                        let mut score = weight.wrapping_add(FREE).wrapping_sub(penalty);
-                        if beside & bit == 0 {
-                            score = score.wrapping_add(25);
-                        }
-                        let there = transform(
-                            pos,
-                            Ext::from_i32(xi).to_f32(),
-                            Ext::from_i32(yi).to_f32(),
-                            dir,
-                        )
-                        .map_err(fail)?;
-                        if there == [ctx.start[0], ctx.start[1]] {
-                            score = score.wrapping_add(20);
-                        }
-                        let answer = self.classify(world, ctx, place, dir)?;
-                        refusals.note(answer);
-                        if answer == 3 {
-                            stop = true;
-                        }
-                        if answer == 6 {
-                            if pass == 1 {
-                                return Err(fail(unsupported(
-                                    "0x483bdb",
-                                    "a slot place taken on its second classification, with \
-                                     a score made from an address",
-                                )));
-                            }
-                            ctx.candidates.push(Candidate {
-                                position: place,
-                                score,
-                                word_c: 0,
-                                word_e: Some(bit as i16),
-                            });
-                            if score > ctx.best {
-                                ctx.best = score;
-                            }
-                            break;
-                        }
-                        answers.push(answer);
+                    // 0x483a5d: the place is scored once, as the standing
+                    // place (index -1) or, when the sitting weight is the
+                    // larger, after the seats (index 8). Seats fail loudly
+                    // above, so the sitting weight is 0 and either index
+                    // gives the same single pass.
+                    if weight == 0 {
+                        continue;
                     }
-                    if let [first, second] = answers[..]
-                        && first != second
-                    {
-                        return Err(fail(unsupported(
-                            "0x483b77",
-                            "a slot place classified differently the second time",
-                        )));
+                    let squared = xi.wrapping_mul(xi).wrapping_add(yi.wrapping_mul(yi));
+                    if squared > far.wrapping_mul(far) || squared < near.wrapping_mul(near) {
+                        continue;
+                    }
+                    let radial = Ext::from_i32(squared).sqrt().single().to_i32_truncate();
+                    let off = radial.wrapping_sub(best).wrapping_abs();
+                    let penalty = (Ext::from_i32(off) * gradient.ext())
+                        .single()
+                        .to_i32_truncate();
+                    let mut score = weight.wrapping_add(FREE).wrapping_sub(penalty);
+                    if jitter {
+                        // 0x483b02: a draw from the active stream, as -10
+                        // to 9.
+                        let draw = match self.stream {
+                            Stream::Lot => world.lot_rng.next_u32(),
+                            Stream::Global => world.global_rng.next_u32(),
+                        };
+                        score = score.wrapping_add((draw % 20) as i32 - 10);
+                    }
+                    if beside & bit == 0 {
+                        score = score.wrapping_add(25);
+                    }
+                    let there = transform(
+                        pos,
+                        Ext::from_i32(xi).to_f32(),
+                        Ext::from_i32(yi).to_f32(),
+                        dir,
+                    )
+                    .map_err(fail)?;
+                    if there == [ctx.start[0], ctx.start[1]] {
+                        score = score.wrapping_add(20);
+                    }
+                    let answer = self.classify(world, ctx, place, dir)?;
+                    refusals.note(answer);
+                    if answer == 3 {
+                        stop = true;
+                    }
+                    if answer == 6 {
+                        ctx.candidates.push(Candidate {
+                            position: place,
+                            score,
+                            word_c: 0,
+                            word_e: Some(bit as i16),
+                        });
+                        if score > ctx.best {
+                            ctx.best = score;
+                        }
                     }
                 }
                 row -= 1;
