@@ -243,7 +243,26 @@ fn world() -> World {
         },
         routing: routing(),
         action_serial: 9,
+        base_layers: BTreeMap::from([(5, base_layer())]),
     }
+}
+
+/// Person 5's base slot's layer: a posture clip that repeats, at the base
+/// slot's priority, part way through.
+fn base_layer() -> Layer {
+    let mut layer = Layer::start(
+        "a2o-standing-loop",
+        F32::from_bits(0x4502_0000),
+        64,
+        true,
+        3,
+        false,
+        4_422_100,
+    );
+    layer.mode = 1;
+    layer.priority = -10;
+    layer.phase = F32::from_bits(0x3f00_0000);
+    layer
 }
 
 /// A route of person 5 to slot 0 of object 2, part way through.
@@ -396,7 +415,24 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "992789f0d0ba45f0e3a203b4cdff77c9b180f5a1da7b99061e521ca5ae5b3d38";
+const PINNED: &str = "f44771b305c9f7af1aaf760cb475f98f1a815bff357191a399bd14a79b35e85b";
+
+#[test]
+fn without_the_base_layers_the_encoding_is_format_24() {
+    // Snapshot format 25 added the base slots' layers at the end.
+    assert_eq!(digest(&format_24_bytes(&world())), PINNED_24);
+}
+const PINNED_24: &str = "992789f0d0ba45f0e3a203b4cdff77c9b180f5a1da7b99061e521ca5ae5b3d38";
+
+/// The encoding of `world` as snapshot format 24 wrote it: without the
+/// base slots' layers ([`World::base_layers`]) that format 25 added at
+/// the end. The older formats' encodings start from this one.
+fn format_24_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let layers = postcard::to_allocvec(&world.base_layers).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - layers.len()), layers);
+    bytes
+}
 
 #[test]
 fn without_the_headlines_the_encoding_is_format_23() {
@@ -406,10 +442,11 @@ fn without_the_headlines_the_encoding_is_format_23() {
 const PINNED_23: &str = "d73a66741337b2527a28c856d5d94f1a91a6f7137a7ee199fcfc289bd21dcadb";
 
 /// The encoding of `world` as snapshot format 23 wrote it: without the
-/// headlines ([`World::headlines`]) that format 24 added at the end. The
-/// older formats' encodings start from this one.
+/// headlines ([`World::headlines`]) that format 24 added at the end. It
+/// starts from [`format_24_bytes`], and the older formats' encodings from
+/// this one.
 fn format_23_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_24_bytes(world);
     let headlines = postcard::to_allocvec(&world.headlines).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - headlines.len()), headlines);
     bytes
@@ -473,6 +510,7 @@ fn the_base_slot_encodes_as_the_flag_it_was_unless_a_script_fills_it() {
     };
     let back = World::decode(&world.encode()).unwrap();
     assert_eq!(back.animators, world.animators);
+    assert_eq!(back.base_layers, world.base_layers);
     assert_eq!(back.hash(), world.hash());
 }
 

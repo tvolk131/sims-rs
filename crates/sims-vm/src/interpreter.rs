@@ -121,6 +121,16 @@ pub struct Interpreter<'a> {
     /// 0x800, [`crate::forget`]), whom a broadcast it sets off skips. None
     /// outside one.
     pub(crate) letting_go: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
+    /// The house view's rotation, 0 to 3 (the scene at 0x6e5528, +0x84),
+    /// which Generic Sims Call routine 12 reads. It is the player's
+    /// choice, not the lot's, so it is an input here. A house opens at
+    /// rotation 0, and the comparison harness never turns the view, so
+    /// [`Interpreter::new`] gives 0.
+    pub view_rotation: u8,
+    /// While a person's own tick runs its thread, the person and the
+    /// animator refresh pending from its taking itself off the lot
+    /// ([`crate::placement::Refreshing`]). None otherwise.
+    pub(crate) refreshing: Option<&'a RefCell<crate::placement::Refreshing>>,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -146,6 +156,8 @@ impl<'a> Interpreter<'a> {
             menu: None,
             running_at_once: None,
             letting_go: None,
+            view_rotation: 0,
+            refreshing: None,
         }
     }
 
@@ -285,6 +297,8 @@ impl<'a> Interpreter<'a> {
             menu: self.menu,
             running_at_once: self.running_at_once,
             letting_go: self.letting_go,
+            view_rotation: self.view_rotation,
+            refreshing: self.refreshing,
             checking: false,
         }
     }
@@ -354,6 +368,10 @@ pub(crate) struct Machine<'a, 'w> {
     pub running_at_once: Option<AtOnce<'a>>,
     /// See [`Interpreter::letting_go`].
     pub letting_go: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
+    /// See [`Interpreter::view_rotation`].
+    pub view_rotation: u8,
+    /// See [`Interpreter::refreshing`].
+    pub(crate) refreshing: Option<&'a RefCell<crate::placement::Refreshing>>,
 }
 
 impl<'a> Machine<'a, '_> {
@@ -371,6 +389,8 @@ impl<'a> Machine<'a, '_> {
             menu: self.menu,
             running_at_once: self.running_at_once,
             letting_go: self.letting_go,
+            view_rotation: self.view_rotation,
+            refreshing: self.refreshing,
         }
     }
 
@@ -829,6 +849,22 @@ impl<'a> Machine<'a, '_> {
             }
             self.call(instruction)?;
             return Ok(Status::Running);
+        }
+        if let Some(refreshing) = self.refreshing
+            && let Some(person) = refreshing
+                .borrow()
+                .pending
+                .as_ref()
+                .map(|_| refreshing.borrow().person)
+            && !crate::placement::reads_no_animator(instruction.opcode, &instruction.operands)
+        {
+            return Err(Trap::Unsupported(format!(
+                "{} (opcode {}) after person {person} took itself off the lot and before its \
+                 animator's tick: the animator's refresh at the take-off (0x58da12), if the \
+                 house view drew the person, may have written what it reads",
+                crate::primitives::primitive_name(instruction.opcode),
+                instruction.opcode
+            )));
         }
         let state = self.frame()?.primitive_state;
         if state == RAN_TREE && instruction.opcode == 28 {

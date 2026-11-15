@@ -5,7 +5,7 @@
 use crate::support::*;
 use sims_content::{Clip, Event, Profile, Track};
 use sims_core::F32;
-use sims_sim::animator::{Base, LOADED, UNSET};
+use sims_sim::animator::{Base, LOADED, Layer, UNSET};
 use sims_sim::motives::{Curve, Rates, Tuning};
 use sims_vm::{Status, Trap};
 
@@ -219,6 +219,7 @@ fn a_finished_clip_sends_the_events_it_missed_then_ends() {
     // Bit 2 of the type's definition word 102 would keep the base layer
     // off; the fixture's word (1102) has it.
     sim_definition(&mut fx)[102] = 0;
+    name_standing_clip(&mut fx);
     fx.thread(SIM, 4096, &[-7]);
     assert_eq!(turn(&mut fx).unwrap(), Status::Returned(true));
     let a = &fx.world.animators[&SIM];
@@ -535,11 +536,13 @@ fn what_animate_sim_does_not_port_fails_loudly() {
         },
     );
     fx.program.animations.insert_samples(SKILL);
-    let message = unsupported(turn(&mut fx));
-    assert!(
-        message.contains("base slot") && message.contains("0x5992b3"),
-        "{message}"
-    );
+    // A clip with timed events plays in the base slot too: its layer is
+    // kept, repeating at priority -10, and the skin's update handles its
+    // events (0x5992b3).
+    assert_eq!(turn(&mut fx).unwrap(), Status::Returned(true));
+    let layer = &fx.world.base_layers[&SIM];
+    assert_eq!((layer.mode, layer.priority), (1, -10));
+    assert!(matches!(&fx.world.animators[&SIM].base, Base::Script { clip, .. } if clip == CLIP));
     // A clip that ends with the person sitting starts posture 1's base
     // clip, whose name this person's word 64 makes the lookup take from
     // the special tables (0x59db44).
@@ -1423,9 +1426,14 @@ fn routed() -> Fixture {
             path: vec![[200, 100], [200, 300], [200, 400], [200, 500]],
         },
     );
-    // A flat lot of 40 tiles a side with no walls, floors, pools or
-    // water, on which the Sim may stand on level 1 (data word 4 bit 0)
-    // without a floor (data word 42 flag 2), for the walk's place test.
+    flat_lot(&mut fx);
+    fx
+}
+
+/// A flat lot of 40 tiles a side with no walls, floors, pools or water, on
+/// which the Sim may stand on level 1 (data word 4 bit 0) without a floor
+/// (data word 42 flag 2), for the walk's place test.
+fn flat_lot(fx: &mut Fixture) {
     use crate::rooms::array;
     let world = &mut fx.world;
     world.size = 40;
@@ -1444,7 +1452,6 @@ fn routed() -> Fixture {
     let sim = fx.sim_mut();
     sim.data[4] |= 1;
     sim.data[42] = 2;
-    fx
 }
 
 #[test]
@@ -1824,6 +1831,23 @@ fn what_a_draw_does_not_port_fails_loudly() {
 /// The standing Sim sitting (posture 1) with its base layer free to start:
 /// definition word 102 clear, person word 64 clear, and an adult, so its
 /// clips are named by the global file's adult tables (152 and 153).
+/// Names posture 0's base clip (its clip 3) [`CLIP`], in the global
+/// table 150, for an adult whose word 64 is clear.
+fn name_standing_clip(fx: &mut Fixture) {
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    person.data[58] = 30;
+    person.data[64] = 0;
+    fx.program
+        .libraries
+        .get_mut(&GLOBAL)
+        .unwrap()
+        .strings
+        .insert(
+            150,
+            vec![String::new(), String::new(), String::new(), CLIP.into()],
+        );
+}
+
 fn sitting(name: &str) -> Fixture {
     let mut fx = standing();
     fx.program
@@ -1860,6 +1884,7 @@ fn the_base_update_keeps_a_scripts_clip_until_the_posture_changes() {
     let base_after = |kind: i16, noted: i32, flags: i16| {
         let mut fx = standing();
         sim_definition(&mut fx)[102] = flags;
+        name_standing_clip(&mut fx);
         fx.sim_mut().person.as_mut().unwrap().data[65] = kind;
         fx.world.animators.insert(
             SIM,
@@ -1869,6 +1894,10 @@ fn the_base_update_keeps_a_scripts_clip_until_the_posture_changes() {
                 ..LOADED
             },
         );
+        let mut layer = Layer::start(CLIP, F32::from_bits(HUNDRED), 4, true, 0, false, 0);
+        layer.mode = 1;
+        layer.priority = -10;
+        fx.world.base_layers.insert(SIM, layer);
         tick(&mut fx).unwrap();
         let a = &fx.world.animators[&SIM];
         (a.base.clone(), a.posture)
@@ -1908,10 +1937,14 @@ fn postures_1_and_2_start_their_base_clip_once_it_is_found() {
     tick(&mut fx).unwrap();
     let animator = &fx.world.animators[&SIM];
     assert_eq!((animator.posture, &animator.base), (1, &Base::Posture));
-    // A clip with no name (0x5904af), or a name no file holds (0x59dc32),
-    // fails loudly, as does a clip with timed events (0x5992b3).
+    // A clip with no name starts nothing (0x5904af): the posture is noted
+    // and the slot stays empty. A name no file holds fails loudly
+    // (0x59dc32). A clip with timed events starts.
     let mut fx = sitting("");
-    assert!(tick(&mut fx).unwrap_err().to_string().contains("0x5904af"));
+    tick(&mut fx).unwrap();
+    let animator = &fx.world.animators[&SIM];
+    assert_eq!((animator.posture, &animator.base), (1, &Base::Empty));
+    assert!(!fx.world.base_layers.contains_key(&SIM));
     let mut fx = sitting("a-clip-no-file-holds");
     assert!(tick(&mut fx).unwrap_err().to_string().contains("0x59dc32"));
     let mut fx = sitting(CLIP);
@@ -1930,7 +1963,9 @@ fn postures_1_and_2_start_their_base_clip_once_it_is_found() {
             samples: [0, 0],
         },
     );
-    assert!(tick(&mut fx).unwrap_err().to_string().contains("0x5992b3"));
+    tick(&mut fx).unwrap();
+    assert_eq!(fx.world.animators[&SIM].base, Base::Posture);
+    assert_eq!(fx.world.base_layers[&SIM].clip, CLIP);
     // Posture 2's base clip is its clip 2, not clip 1: with the name at
     // clip 2 the layer starts, and with it at clip 1 only, clip 2 has no
     // name.
@@ -1945,13 +1980,10 @@ fn postures_1_and_2_start_their_base_clip_once_it_is_found() {
                 .strings
                 .insert(table, names.iter().map(|n| n.to_string()).collect());
         }
-        if found {
-            tick(&mut fx).unwrap();
-            let animator = &fx.world.animators[&SIM];
-            assert_eq!((animator.posture, &animator.base), (2, &Base::Posture));
-        } else {
-            assert!(tick(&mut fx).unwrap_err().to_string().contains("0x5904af"));
-        }
+        tick(&mut fx).unwrap();
+        let animator = &fx.world.animators[&SIM];
+        let base = if found { Base::Posture } else { Base::Empty };
+        assert_eq!((animator.posture, &animator.base), (2, &base));
     }
 }
 
@@ -1980,4 +2012,88 @@ fn a_seated_animator_clears_a_clip_still_playing_and_stops_walking() {
     assert_eq!(seated(2, 0), (false, false, 2));
     assert_eq!(seated(1, 1), (true, false, 1));
     assert_eq!(seated(2, 1), (false, false, 2));
+}
+
+/// [`standing`] running, in its own tick, a tree of one parameter that
+/// takes the person off the lot (Find Location For mode 1 on itself) and
+/// then runs `next`.
+fn taking_itself_off(next: sims_formats::behavior::Instruction) -> Fixture {
+    let mut fx = standing();
+    fx.add(
+        SIM_FILE,
+        4098,
+        shaped(
+            0x8002,
+            0,
+            1,
+            0,
+            vec![ins(16, 1, 1, [1, 0, 0, 0, 0, 0, 0, 0]), next],
+        ),
+    );
+    fx.thread(SIM, 4098, &[5]);
+    fx.sim_mut().stack[0].stack_object = SIM as i16;
+    // The head's countdown (person word 45) has run out: the refresh's
+    // head step (0x58da12) then writes no person word.
+    fx.sim_mut().person.as_mut().unwrap().data[45] = 0;
+    flat_lot(&mut fx);
+    fx
+}
+
+/// Sleep for the tree's parameter.
+fn sleep() -> sims_formats::behavior::Instruction {
+    ins(0, RETURN_TRUE, RETURN_FALSE, [0; 8])
+}
+
+#[test]
+fn a_person_takes_itself_off_the_lot_in_its_own_tick() {
+    // 0x433125 refreshes the person's animator (0x58da12) only if the
+    // house view drew it, which is not kept. Here the refresh then the
+    // tick reach what the tick alone does, so either way it is the same.
+    let mut fx = taking_itself_off(sleep());
+    let mut alone = standing();
+    tick(&mut alone).unwrap();
+    tick(&mut fx).unwrap();
+    let off = fx.sim();
+    assert_ne!(off.position, alone.sim().position);
+    assert_eq!(off.data[2], 0);
+    let (a, b) = (&fx.world.animators[&SIM], &alone.world.animators[&SIM]);
+    assert_eq!(
+        (a.clock, a.head_clock, a.skin_clock),
+        (b.clock, b.head_clock, b.skin_clock)
+    );
+}
+
+#[test]
+fn after_taking_itself_off_only_what_reads_no_animator_may_run() {
+    // Animate Sim reads the animator, which the refresh at the take-off
+    // may have written.
+    let mut fx = taking_itself_off(ins(44, RETURN_TRUE, RETURN_FALSE, [0; 8]));
+    let fault = tick(&mut fx).unwrap_err().to_string();
+    assert!(
+        fault.contains("0x58da12") && fault.contains("opcode 44"),
+        "{fault}"
+    );
+}
+
+#[test]
+fn a_person_carrying_something_taking_itself_off_fails_loudly() {
+    // The refresh redraws what it carries (0x58dae5).
+    let mut fx = taking_itself_off(sleep());
+    fx.sim_mut().slots[1].object = LAMP as i16;
+    let fault = tick(&mut fx).unwrap_err().to_string();
+    assert!(fault.contains("0x58dae5"), "{fault}");
+}
+
+#[test]
+fn a_refresh_that_would_count_the_head_down_fails_loudly() {
+    // With the head's countdown running, the refresh's head step lowers
+    // person word 45, which the rest of the lot update may read: whether
+    // the house view drew the person would then matter.
+    let mut fx = taking_itself_off(sleep());
+    fx.sim_mut().person.as_mut().unwrap().data[45] = 2;
+    let fault = tick(&mut fx).unwrap_err().to_string();
+    assert!(
+        fault.contains("0x58da12") && fault.contains("write more than its animator"),
+        "{fault}"
+    );
 }

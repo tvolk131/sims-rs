@@ -282,12 +282,14 @@ impl Interpreter<'_> {
         } else {
             self.attach_traits(world, id).map_err(fail)?;
         }
-        world
-            .animators
-            .get_mut(&id)
-            .ok_or_else(|| fail(Trap::Invalid("a new person without an animator".into())))?
-            .reset()
-            .map_err(|e| fail(Trap::Unsupported(e)))?;
+        if !world
+            .reset_animator(id)
+            .map_err(|e| fail(Trap::Unsupported(e)))?
+        {
+            return Err(fail(Trap::Invalid(
+                "a new person without an animator".into(),
+            )));
+        }
         Ok(())
     }
 }

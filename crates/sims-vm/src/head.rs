@@ -27,7 +27,8 @@
 //!    0x10. For a person, the target becomes the point on top of its head
 //!    (0x59293d with 1, its +0x144 anchor). For any other object the
 //!    target is its position in world units, at height 0 (0x59058f,
-//!    0x454f5c).
+//!    0x454f5c): native +0xf4 (our second coordinate) first, then +0xf8
+//!    (our first), each times 3/16.
 //!    Then a target on another level than the person (object +0x110)
 //!    clears word 41 and sets word 42 to 0x10.
 //! 2. The head's heading: from the point on top of the head to the point
@@ -41,16 +42,17 @@
 //! is needed ([`Interpreter::posed`]), so there is nothing to put back.
 //!
 //! The pose, as the skin's update left it (0x5992b3, 0x597c4c): each
-//! bone at rest, then each layer's motions sampled at its phase, by
-//! priority. Only a foreground layer at weight 1 or more is ported: its
-//! motions replace the bones' rest values. A base layer whose clip moves
-//! a part of a bone the foreground leaves alone, on the way from the root
-//! to a bone measured or turned, would show through and is not ported;
-//! nor is a foreground below weight 1, or none. A carry layer (a
-//! script's carry clip, priority 10) that moves no bone on those ways
-//! leaves them as the foreground put them, so it is passed over; one that
-//! moves such a bone, and a carry clip chosen with no carry layer, are
-//! not ported. The bones
+//! layer's motions sampled at its phase, by priority (0x5991fd): the base
+//! layer (-10, kept in [`World::base_layers`]) first, then the foreground
+//! and the carry layer in the order the skin's list holds them. Each
+//! layer at weight 1 or more replaces what the bones held with its
+//! motions; one with nothing bound, no frames or no weight samples
+//! nothing, and one below weight 1, which blends (0x597c4c), is not
+//! ported. The skin does not put the bones back at rest first, so a bone
+//! on the way from the root to a bone measured or turned whose rotation
+//! no layer playing now writes holds what an earlier layer left, which is
+//! not kept and fails; a translation no layer writes is taken at rest,
+//! which is unverified. The bones
 //! are then placed from the root (0x5994c3), which stands at the origin.
 //!
 //! The person's model matrix (0x592132) turns the skeleton to the
@@ -62,7 +64,7 @@ use crate::interpreter::Interpreter;
 use crate::routing::slot::to_world_units;
 use sims_core::{Ext, F32};
 use sims_sim::World;
-use sims_sim::animator::{Animator, Base};
+use sims_sim::animator::Animator;
 use sims_sim::head::{self, Anchor, Matrix};
 use sims_sim::pose;
 
@@ -308,8 +310,9 @@ impl Interpreter<'_> {
     /// Person `id`'s bones placed relative to the skeleton's root, as the
     /// skin's last update left them (the module documentation), with
     /// the bone "HEAD" turned by `turn` when given. `needed` are the bones
-    /// the caller reads; the way from the root to each, and to the turned
-    /// bone, must be the foreground's alone.
+    /// the caller reads; the rotation of each bone on the way from the
+    /// root to each, and to the turned bone, must be one a layer playing
+    /// now writes.
     fn posed(
         &self,
         world: &World,
@@ -325,32 +328,12 @@ impl Interpreter<'_> {
             .guid;
         let skeleton = self.skeleton(guid)?;
         // A carry clip chosen whose layer has not started yet is not
-        // ported; a playing one is checked against the bones read below.
+        // ported.
         if a.carry_selection != -1 && a.carry.is_none() {
             return Err(unsupported(
                 "0x5992b3",
                 &format!("person {id}'s pose with a carry clip but no carry layer"),
             ));
-        }
-        let layer = a.foreground.as_ref().ok_or_else(|| {
-            unsupported(
-                "0x5992b3",
-                &format!("person {id}'s pose without a foreground layer"),
-            )
-        })?;
-        if layer.weight.ext() < Ext::from_i32(1) || !layer.bound {
-            return Err(unsupported(
-                "0x5992b3",
-                &format!(
-                    "person {id}'s pose with its foreground layer below weight 1 or bound to \
-                     nothing"
-                ),
-            ));
-        }
-        if a.skin_dirty || layer.current != a.skin_clock {
-            return Err(Trap::Unsupported(format!(
-                "person {id}'s pose is read while its skin waits for its update (0x5992b3)"
-            )));
         }
         let parents: Vec<Option<usize>> = skeleton.bones.iter().map(|b| b.parent).collect();
         let place = |bone: &str| skeleton.bones.iter().position(|b| b.name == bone);
@@ -366,11 +349,6 @@ impl Interpreter<'_> {
             }
             None => None,
         };
-        let clip = self
-            .program
-            .animations
-            .clip(&layer.clip)
-            .map_err(|e| unsupported("0x59dc32", &format!("finds no clip: {e}")))?;
 
         // The bones from the root to each needed one.
         let mut chain = vec![false; parents.len()];
@@ -389,86 +367,26 @@ impl Interpreter<'_> {
                 }
             }
         }
-        if a.base.is_filled() {
-            let name = match &a.base {
-                Base::Script { clip, .. } => clip.clone(),
-                _ => self.base_clip(world, id, a.posture)?,
-            };
-            let base =
-                self.program.animations.clip(&name).map_err(|e| {
-                    unsupported("0x59dc32", &format!("finds no clip {name:?}: {e}"))
-                })?;
-            for channel in &base.channels {
-                let Some(bone) = place(&channel.bone).filter(|&b| chain[b]) else {
-                    continue;
-                };
-                let over = clip.channels.iter().find(|c| place(&c.bone) == Some(bone));
-                let covered =
-                    |base: Option<u32>, fore: Option<u32>| base.is_none() || fore.is_some();
-                let ok = over.is_some_and(|over| {
-                    covered(channel.translation, over.translation)
-                        && covered(channel.rotation, over.rotation)
-                });
-                if !ok {
-                    return Err(unsupported(
-                        "0x5992b3",
-                        &format!(
-                            "person {id}'s base clip {name:?} moves bone {:?}, which its \
-                             foreground clip {:?} leaves alone: the blend of the two",
-                            channel.bone, layer.clip
-                        ),
-                    ));
-                }
-            }
-        }
 
-        if let Some(carry) = &a.carry {
-            let over = self.program.animations.clip(&carry.clip).map_err(|e| {
-                unsupported("0x59dc32", &format!("finds no clip {:?}: {e}", carry.clip))
-            })?;
-            if let Some(channel) = over
-                .channels
-                .iter()
-                .find(|c| place(&c.bone).is_some_and(|b| chain[b]))
-            {
-                return Err(unsupported(
-                    "0x5992b3",
-                    &format!(
-                        "person {id}'s carry clip {:?} moves bone {:?}, on the way to a bone \
-                         read: the carry layer's part of the pose",
-                        carry.clip, channel.bone
-                    ),
-                ));
-            }
-        }
+        // The skin's layers in the order its update samples them: by
+        // priority, the base layer (-10) first (0x5991fd).
+        let base = if a.base.is_filled() {
+            Some(world.base_layers.get(&id).ok_or_else(|| {
+                Trap::Invalid(format!(
+                    "person {id}'s base slot is filled but has no layer"
+                ))
+            })?)
+        } else {
+            None
+        };
+        let (first, second) = if crate::animator::carry_first(a) {
+            (a.carry.as_ref(), a.foreground.as_ref())
+        } else {
+            (a.foreground.as_ref(), a.carry.as_ref())
+        };
+        let layers = [base, first, second];
 
-        let samples = self
-            .program
-            .animations
-            .samples(clip)
-            .map_err(|e| unsupported("0x5992b3", &format!("cannot read its samples: {e}")))?;
-        let translations: Vec<[F32; 3]> = samples
-            .translations
-            .iter()
-            .map(|v| v.map(F32::from_f32))
-            .collect();
-        let rotations: Vec<[F32; 4]> = samples
-            .rotations
-            .iter()
-            .map(|v| v.map(F32::from_f32))
-            .collect();
         let bad = |e: pose::Error| unsupported("0x5992b3", &format!("cannot pose: {}", e.0));
-        let elapsed = Ext::from_i32(layer.current.wrapping_sub(layer.previous))
-            .single()
-            .to_f32();
-        let at = pose::Selection::at(
-            layer.phase,
-            layer.frames,
-            layer.duration,
-            elapsed,
-            layer.mode == 1,
-        )
-        .map_err(bad)?;
         let mut locals: Vec<pose::Bone> = skeleton
             .bones
             .iter()
@@ -477,18 +395,86 @@ impl Interpreter<'_> {
                 rotation: b.rotation.map(F32::from_bits),
             })
             .collect();
-        for channel in &clip.channels {
-            let Some(bone) = place(&channel.bone) else {
+        let mut rotated = vec![false; parents.len()];
+        for layer in layers.into_iter().flatten() {
+            if a.skin_dirty || layer.current != a.skin_clock {
+                return Err(Trap::Unsupported(format!(
+                    "person {id}'s pose is read while its skin waits for its update (0x5992b3)"
+                )));
+            }
+            // 0x597c4c samples nothing for a layer with nothing bound, no
+            // frames or no weight.
+            if !layer.bound || layer.frames == 0 || layer.weight.ext() <= Ext::ZERO {
                 continue;
-            };
-            let from =
-                |start: Option<u32>, len: usize| start.map(|s| s as usize).filter(|&s| s <= len);
-            let motion = pose::Motion {
-                translations: from(channel.translation, translations.len())
-                    .map(|s| &translations[s..]),
-                rotations: from(channel.rotation, rotations.len()).map(|s| &rotations[s..]),
-            };
-            pose::sample(&mut locals[bone], motion, at).map_err(bad)?;
+            }
+            if layer.weight.ext() < Ext::from_i32(1) {
+                return Err(unsupported(
+                    "0x597c4c",
+                    &format!(
+                        "person {id}'s pose with its layer of {:?} below weight 1: the blend \
+                         with what the bones held",
+                        layer.clip
+                    ),
+                ));
+            }
+            let clip = self.program.animations.clip(&layer.clip).map_err(|e| {
+                unsupported("0x59dc32", &format!("finds no clip {:?}: {e}", layer.clip))
+            })?;
+            let samples =
+                self.program.animations.samples(clip).map_err(|e| {
+                    unsupported("0x5992b3", &format!("cannot read its samples: {e}"))
+                })?;
+            let translations: Vec<[F32; 3]> = samples
+                .translations
+                .iter()
+                .map(|v| v.map(F32::from_f32))
+                .collect();
+            let rotations: Vec<[F32; 4]> = samples
+                .rotations
+                .iter()
+                .map(|v| v.map(F32::from_f32))
+                .collect();
+            let elapsed = Ext::from_i32(layer.current.wrapping_sub(layer.previous))
+                .single()
+                .to_f32();
+            let at = pose::Selection::at(
+                layer.phase,
+                layer.frames,
+                layer.duration,
+                elapsed,
+                layer.mode == 1,
+            )
+            .map_err(bad)?;
+            for channel in &clip.channels {
+                let Some(bone) = place(&channel.bone) else {
+                    continue;
+                };
+                let from = |start: Option<u32>, len: usize| {
+                    start.map(|s| s as usize).filter(|&s| s <= len)
+                };
+                let motion = pose::Motion {
+                    translations: from(channel.translation, translations.len())
+                        .map(|s| &translations[s..]),
+                    rotations: from(channel.rotation, rotations.len()).map(|s| &rotations[s..]),
+                };
+                if motion.rotations.is_some() {
+                    rotated[bone] = true;
+                }
+                pose::sample(&mut locals[bone], motion, at).map_err(bad)?;
+            }
+        }
+        // 0x5992b3 does not put the bones back at rest before it samples:
+        // a rotation no layer playing now writes is what the last layer
+        // that wrote it left, which is not kept.
+        if let Some(bone) = (0..parents.len()).find(|&b| chain[b] && !rotated[b]) {
+            return Err(unsupported(
+                "0x5992b3",
+                &format!(
+                    "person {id}'s bone {:?}, on the way to a bone read, is turned by no layer \
+                     playing now: its rotation is the last layer's that turned it",
+                    skeleton.bones[bone].name
+                ),
+            ));
         }
         let mut placed = pose::absolute(&parents, &locals).map_err(bad)?;
         if let Some((turned, turn)) = turned {
@@ -505,22 +491,6 @@ impl Interpreter<'_> {
             placed[turned] = pose::compose(bone, parent);
         }
         Ok(placed)
-    }
-
-    /// The name of the clip the base layer plays for `posture`
-    /// ([`crate::animator::base_selection`]).
-    fn base_clip(&self, world: &World, id: u16, posture: i32) -> Result<String, Trap> {
-        let selection = crate::animator::base_selection(posture).ok_or_else(|| {
-            Trap::Invalid(format!(
-                "person {id}'s base layer plays for posture {posture}"
-            ))
-        })?;
-        self.posture_clip(world, id, selection)?.ok_or_else(|| {
-            unsupported(
-                "0x59db2f",
-                &format!("person {id}'s base layer has no name for its clip"),
-            )
-        })
     }
 
     /// Person `id`'s model matrix (0x592132; [`head::placement`]) on the
@@ -586,13 +556,15 @@ struct Rig {
     front: Option<Bound>,
 }
 
-/// A position in the lot as a point in world units (0x454f5c): the first
-/// coordinate (+0xf8) and the second (+0xf4) times 3/16, each stored as a
-/// float, with the height between them 0 (0x454f29 of 0, times 3).
+/// A position in the lot as a point in world units (0x454f5c), as the
+/// head's measurement passes it (0x59058f): the input is native +0xf4 then
+/// +0xf8, which are our second coordinate then our first. So the point is
+/// the second coordinate times 3/16, the height 0 (0x454f29 of 0, times
+/// 3), then the first coordinate times 3/16, each stored as a float.
 fn world_point(position: [i32; 3]) -> [F32; 3] {
     [
-        to_world_units(Ext::from_i32(position[0])).to_f32(),
-        F32::from_bits(0),
         to_world_units(Ext::from_i32(position[1])).to_f32(),
+        F32::from_bits(0),
+        to_world_units(Ext::from_i32(position[0])).to_f32(),
     ]
 }

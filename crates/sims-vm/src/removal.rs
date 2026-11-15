@@ -330,6 +330,7 @@ impl Interpreter<'_> {
         if person {
             // The person's destructor (0x459511).
             world.animators.remove(&id);
+            world.base_layers.remove(&id);
             world.routing.routes.remove(&id);
             world.person_ticks.remove(&id);
             world

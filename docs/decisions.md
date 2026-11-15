@@ -302,6 +302,107 @@ selected Sim (0x44123f) reaches the new path, which still fails there
 Goth run removes no selected Sim. Reopen when 0x58da12 is ported, or
 when a recording of play selects a Sim.
 
+## 2026-11-15: The base layer kept; a person takes itself off; strict mode to tick 3432
+
+**Unverified.** No capture covers any of it: everything here is from
+tick 2837 on, and the Goth captures end at update 1000. Strict mode now
+runs through tick 3432 (08:25:08, hash fbb3d668…) and stops at tick
+3433.
+
+**Hashes.** Snapshot format 25 appends `World::base_layers`, so every
+pinned hash changes. The format-24 encoding is a prefix of the new one,
+and `boot.rs` pins both (`format_24_bytes`): ticks 33 and 1103 keep
+their format-24 hashes, and the state at tick 2836 is byte for byte the
+one the previous commit (1bacd2d3) reaches (format 24, f74e31af…).
+At tick 2881 the format-24 hash changes from eed688a0… to cdd5b72c…,
+which is the head fix below; ticks up to 2836 are unchanged. Every
+summary line of `sims boot … --ticks 2881` is unchanged. The K=1000
+pins in `resize.rs` hold.
+
+**The head looks at an object with its coordinates the right way
+round** (0x59058f, 0x454f5c). The measurement passes native +0xf4 first,
+which is our second lot coordinate, so the target is [3/16 ·
+position[1], 0, 3/16 · position[0]]. #156 had them swapped. Track 4
+found this and a review agreed.
+
+**The base layer and the pose** (stop at tick 2882, 0x5992b3). The base
+slot's playback is kept in `World::base_layers` and updated with the
+skin's other layers in the animator's tail, timed events included. The
+pose samples the layers by priority (0x5991fd): the base layer (-10)
+first, then the foreground and the carry layer in the skin's order.
+Each layer at weight 1 or more replaces what the bones held:
+
+- A layer with nothing bound, no frames or no weight samples nothing.
+- One below weight 1 blends (0x597c4c), which fails.
+- The skin never puts the bones back at rest. A rotation on the way to
+  a measured bone that no layer playing now writes is what an earlier
+  layer left, which is not kept, so that fails.
+- A translation no layer writes is taken at rest (unverified).
+
+A posture whose clip has no name starts nothing and leaves the slot as
+it was (0x5904af, from the disassembly; retried next tick). Animate Sim
+in the base slot now plays clips with timed events.
+
+**Generic Sims Call 12** (stop at tick 2930, 0x44fd4b). Temp 0 becomes
+minus the sum of the stack object's tile coordinates, turned by the
+house view's rotation (0x434f58, the table 0x407704 builds), as a
+16-bit word. The view's rotation is `Interpreter::view_rotation`. Strict
+boots use 0, which is unverified. A coordinate outside 0 to 63 at a
+rotation other than 0 fails, since the original reads outside its table.
+
+**Generic Sims Call 2** (stop at tick 3356, 0x44fb51). It names the
+running action's icon. #158 ported the same routine on main with the
+same meaning, so the rebase keeps main's.
+
+**A person takes itself off the lot in its own tick** (stop at tick
+3356; Find Location mode 1 with the person as target). 0x433125
+refreshes the person's animator before the registry hears of it
+(0x4332e0, virtual function 0x54 with 1, 0x58da12), but only if animator
+byte +0x109 is set. That byte is the house view's last draw test
+(0x590b8b), which is presentation and is not kept. The refresh is a
+small animator tick: the clock, the blend slot, the skin forced, the
+place, and the head's step, measurement and restoration. Instead of
+choosing a branch, both must agree:
+
+1. Until the animator's tick, the person's thread may run only
+   primitives that read no animator. These are Sleep, Expression, Set
+   Motive Change, Set To Next, and Change Suit with operand 1 set to 1.
+   Anything else fails, naming 0x58da12.
+2. At the animator's tick, the animator, its base layer and person
+   words 41, 42, 44 and 45 must be as the take-off left them.
+3. The refresh alone must write nothing but the animator and its base
+   layer, and play no sound. A running head countdown (word 45) fails
+   here.
+4. The refresh then the tick must reach the world, and the sounds, the
+   tick alone does.
+
+The tick alone is kept. A person carrying something (slot 1) fails
+(0x58dae5 redraws it), and so does a multi-tile person. The draw state
+(0x434101) and the face (0x58faf6) are taken as presentation, as in the
+tick; that is unverified. Person 21 passes all four checks at tick 3356.
+
+**Go To Routing Slot's interrupt tests** (stop at tick 3370):
+
+- the door step (0x45afd0) and the asking step (0x45b475) fail with
+  result 4, as step 1 does;
+- the walk under way (0x45b2b7) takes result 4 to step 11, which stops
+  the animator, plays `end_route` and fails (0x45b3c2).
+
+These are on track 4's list; strict mode on the Goth house needed them,
+so they are ported here. Only the door step has a synthetic test. The
+other two use the same interrupt check and are tested only by the boot.
+
+**Where it stops.** In strict mode, at tick 3433. Object 334 (tree
+0x200d node 5) snaps a multi-tile object to a place where it does not
+fit, and which object its group's test leaves as collided with is not
+ported (0x454e82). The snack order (play mode) now runs without a caught
+error until step 3603. There, object 354 (tree 0x1022 node 29) uses
+Create New Object Instance mode 6 with flag 0x4, which is not ported.
+With this and #158, strict mode on the Newbie house (`House07.iff`) runs
+through tick 1472 (no recording to compare); at tick 1473 object 105
+(tree 0x1017 node 0) gives up a route and needs the route-failure
+feedback tree (0x45af2a), which is not ported.
+
 ## 2026-11-15: The game lists the pie menu on the lot when the pointer reaches an object
 
 When the pointer first reaches an object or a person on the lot, the
