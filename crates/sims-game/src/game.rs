@@ -13,7 +13,7 @@
 //! failure play mode does not catch stops the lot.
 
 use crate::hud::Hud;
-use crate::menu::{self, Menu};
+use crate::menu::{self, Listing, Menu};
 use crate::pace::Pace;
 use crate::people::People;
 use crate::pick;
@@ -95,6 +95,14 @@ pub struct Game {
     sounds: VecDeque<SoundEvent>,
     /// A short message about the last press, until the next one.
     note: Option<String>,
+    /// Where the pointer is on the canvas, while it is over the window.
+    pointer: Option<[i32; 2]>,
+    /// The object the pointer last reached on the lot, if it is still on
+    /// it.
+    reached: Option<u16>,
+    /// The pie menu listed when the pointer reached an object: for whom,
+    /// on what, and the listing, until a click opens it.
+    listed: Option<(u16, u16, Result<Listing, String>)>,
     canvas: Canvas,
 }
 
@@ -129,6 +137,9 @@ impl Game {
             stopped,
             errors: Errors::default(),
             sounds: VecDeque::new(),
+            pointer: None,
+            reached: None,
+            listed: None,
             note: None,
             canvas: Canvas::new(1, 1, [0, 0, 0]),
         })
@@ -173,7 +184,7 @@ impl Game {
     }
 
     /// The errors play mode caught and recovered from, one line each, in
-    /// order: the first [`LOGGED`] different ones (an error again at a
+    /// order: the first `LOGGED` (256) different ones (an error again at a
     /// later tick is not listed again), then a line saying more were
     /// caught.
     pub fn errors(&self) -> &[String] {
@@ -278,8 +289,20 @@ impl Game {
         }
     }
 
-    /// Draws the frame: the lot, its people, then the panel.
+    /// Draws the frame: the lot, its people, then the panel. When the
+    /// frame shows a new object under the pointer (the object moved, or
+    /// the view did), its pie menu is listed, as when the pointer moves
+    /// onto it, and the frame drawn again if the listing changed the lot.
     pub fn render(&mut self) -> &Canvas {
+        self.draw();
+        if self.follow() {
+            self.draw();
+        }
+        &self.canvas
+    }
+
+    /// Draws the frame.
+    fn draw(&mut self) {
         let [w, h] = self.view.size.map(|n| n.max(1) as usize);
         if (self.canvas.width, self.canvas.height) != (w, h) {
             self.canvas = Canvas::new(w, h, [0, 0, 0]);
@@ -308,7 +331,6 @@ impl Game {
             status.as_deref(),
             &mut self.canvas,
         );
-        &self.canvas
     }
 
     /// The canvas last drawn.
@@ -335,9 +357,13 @@ impl Game {
         self.hud.covers(point)
     }
 
-    /// Moves the pointer to `point`.
+    /// Moves the pointer to `point`. When it first reaches an object on
+    /// the lot, the selected Sim's pie menu on it is listed, as the
+    /// original lists it then (0x48c834); listing changes the lot.
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
+        self.pointer = Some(point);
         let mut redraw = self.hud.hover(point);
+        redraw |= self.follow();
         // The cutaway follows the rooms the pointer passes over, while
         // the cutaway is on and the pointer is over the lot.
         if !self.hud.covers(point) && self.view.camera.walls == Walls::Cutaway {
@@ -362,13 +388,7 @@ impl Game {
                 None => Outcome::redraw(),
             };
         }
-        let world = self.lot.world();
-        let camera = &self.view.camera;
-        let target = self
-            .people
-            .at(world, point)
-            .or_else(|| pick::object(world, &self.lot_shape, camera, point));
-        let Some(target) = target else {
+        let Some(target) = self.under(point) else {
             return Outcome {
                 redraw: cleared,
                 photo: false,
@@ -378,18 +398,102 @@ impl Game {
         Outcome::redraw()
     }
 
-    /// Opens the pie menu of `object` at `point` for the selected Sim.
+    /// The pointer left the window: it is on no object.
+    pub fn leave(&mut self) {
+        self.pointer = None;
+        self.follow();
+    }
+
+    /// Follows the object under the pointer in the frame last drawn: when
+    /// it changes to an object, lists the selected Sim's pie menu on it.
+    /// Nothing is listed while the pointer is over the panel, a dialog or
+    /// a menu, or once the lot has stopped. True if a listing may have
+    /// changed the lot.
+    fn follow(&mut self) -> bool {
+        let under = match self.pointer {
+            Some(point) if self.stopped.is_none() && !self.hud.covers(point) => self.under(point),
+            _ => None,
+        };
+        if under == self.reached {
+            return false;
+        }
+        self.reached = under;
+        self.listed = None;
+        under.is_some_and(|object| self.list(object))
+    }
+
+    /// For whom and on what the pie menu was listed when the pointer
+    /// reached an object, until a click opens it or the pointer leaves.
+    pub fn listed(&self) -> Option<(u16, u16)> {
+        self.listed
+            .as_ref()
+            .map(|(person, object, _)| (*person, *object))
+    }
+
+    /// The person or object shown at `point` on the lot in the frame last
+    /// drawn.
+    pub fn under(&self, point: [i32; 2]) -> Option<u16> {
+        let world = self.lot.world();
+        self.people
+            .at(world, point)
+            .or_else(|| pick::object(world, &self.lot_shape, &self.view.camera, point))
+    }
+
+    /// Lists the selected Sim's pie menu on `object` (`Lot::pie_menu`,
+    /// which changes the lot), keeping its sounds for the host. True if
+    /// the simulation listed it, and so may have changed the lot.
+    fn list(&mut self, object: u16) -> bool {
+        let Some(person) = self.lot.world().selected() else {
+            return false;
+        };
+        let listing = menu::entries(&mut self.lot, &self.assets, person, object);
+        let changed = listing.as_ref().is_ok_and(|l| l.unchecked.is_none());
+        if let Ok(listing) = &listing {
+            self.keep_sounds(listing.sounds.clone());
+        }
+        self.listed = Some((person, object, listing));
+        changed
+    }
+
+    /// Opens the pie menu of `object` at `point` for the selected Sim:
+    /// the one listed when the pointer reached it, or, when it was not
+    /// listed then (the pointer did not move onto it first), one listed
+    /// now.
     fn open_menu(&mut self, object: u16, point: [i32; 2]) {
+        if self.stopped.is_some() {
+            self.note = Some("The lot has stopped, so it takes no orders.".into());
+            return;
+        }
         let Some(person) = self.lot.world().selected() else {
             self.note = Some("Nobody is selected to do anything.".into());
             return;
         };
-        match menu::entries(&self.lot, &self.assets, object) {
-            Ok(entries) if entries.is_empty() => {
-                self.note = Some(format!("Object {object} offers nothing to do."));
+        if !matches!(self.listed, Some((p, o, _)) if p == person && o == object) {
+            self.list(object);
+        }
+        self.reached = Some(object);
+        let Some((_, _, listing)) = self.listed.take() else {
+            return;
+        };
+        match listing {
+            Ok(listing) => {
+                // Where the simulation cannot list the menu yet, the note
+                // says so and why.
+                let why = listing
+                    .unchecked
+                    .map(|reason| format!("the simulation cannot list this menu yet: {reason}"));
+                if listing.entries.is_empty() {
+                    let line = format!("Object {object} offers nothing to do");
+                    self.note = Some(match why {
+                        Some(why) => format!("{line} ({why})."),
+                        None => format!("{line}."),
+                    });
+                } else {
+                    self.note = why.map(|why| format!("Every entry is shown, as {why}"));
+                    self.hud.menu = Some(Menu::new(person, object, listing.entries, point));
+                }
             }
-            Ok(entries) => self.hud.menu = Some(Menu::new(person, object, entries, point)),
-            Err(e) => self.note = Some(format!("Object {object}'s menu is not read: {e}")),
+            Err(e) => self.note = Some(format!("Object {object}'s menu is not listed: {e}")),
         }
     }
 
@@ -398,10 +502,17 @@ impl Game {
         self.hud.menu.take().is_some()
     }
 
-    /// Queues the entry `menu` of `object` for `person`, as choosing it
-    /// from the pie menu does. `label` names it in the note.
-    fn order(&mut self, person: u16, object: u16, menu: u32, label: &str) {
-        self.note = Some(match self.lot.queue_interaction(person, object, menu) {
+    /// Queues `entry` of the pie menu on `object` for `person`, as
+    /// choosing it does: the action the simulation offered
+    /// (`Lot::pick`), or for a fallback entry the entry's menu number
+    /// (`Lot::queue_interaction`).
+    fn order(&mut self, person: u16, object: u16, entry: &menu::Entry) {
+        let label = &entry.label;
+        let queued = match &entry.action {
+            Some(action) => self.lot.pick(person, action.clone()),
+            None => self.lot.queue_interaction(person, object, entry.menu),
+        };
+        self.note = Some(match queued {
             Ok(Some(_)) => format!("Queued \"{label}\" for person {person}."),
             Ok(None) => format!("Person {person}'s queue is full; \"{label}\" was not queued."),
             Err(e) => format!("\"{label}\" was not queued: {e}"),
@@ -456,10 +567,7 @@ impl Game {
             } => {
                 // `interaction` is the entry's index in the open menu.
                 match menu.and_then(|m| m.entries.get(usize::from(interaction))) {
-                    Some(entry) => {
-                        let (menu, label) = (entry.menu, entry.label.clone());
-                        self.order(sim, object, menu, &label);
-                    }
+                    Some(entry) => self.order(sim, object, entry),
                     None => self.note = Some(format!("No menu entry {interaction} to choose.")),
                 }
                 Outcome::redraw()
