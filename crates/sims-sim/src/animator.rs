@@ -198,8 +198,9 @@ pub struct Animator {
     pub head: Head,
     /// The carry slot (+0x13c): a clip Animate Sim plays there (flag 0x10
     /// alone, 0x589683), repeating at priority 10 while
-    /// [`Animator::carry_mode`] is 6. The carry clip the animator's tick
-    /// chooses (0x5903a3) would start here too; that is not ported.
+    /// [`Animator::carry_mode`] is 6, or the carry clip the animator's
+    /// tick chooses (0x5903a3), the posture's clip 0x26, which stops at
+    /// its end, at priority 10, while the carry selection is 0.
     pub carry: Option<Layer>,
     /// Whether the carry layer comes before the foreground layer in the
     /// skin's list (skin +0x7c), which the skin's update goes through in
@@ -209,8 +210,17 @@ pub struct Animator {
     /// priority 1 and sets its own priority after). So a carry layer goes
     /// before a foreground layer of raised priority (6) and after one of
     /// priority 1, and a new foreground layer always goes before the
-    /// carry layer (priority 10). The base layer, whose clip has no
-    /// events, is left out of this.
+    /// carry layer (priority 10). This is the order the layers were put
+    /// in. Before it updates any layer, a skin whose layers changed sorts
+    /// them by priority, lowest first, keeping the order of layers of the
+    /// same priority (0x5991fd, a bubble sort). Every change marks the
+    /// skin changed, so the layers always update by priority, and this
+    /// order decides only between layers of the same priority. (The
+    /// original's list keeps the sorted order. That differs from this one
+    /// only for layers whose priorities differed at a sort and are the
+    /// same later, which nothing ported makes: foreground layers take
+    /// priority 1, 5 or 6, carry layers 10.) The base layer, whose clip
+    /// has no events, is left out of this.
     pub carry_first: bool,
 }
 

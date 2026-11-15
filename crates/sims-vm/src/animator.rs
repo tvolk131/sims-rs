@@ -15,9 +15,10 @@
 //!    plays (+0x1a8 is 6), or a clip that picks something up plays
 //!    (+0x1a4), the person carries something when its first contained
 //!    slot holds an object (0x589fce); then the carry clip is 0, else -1.
-//!    A change clears the carry slot, which holds a layer only while a
-//!    script's carry clip plays and so is empty here, and a change to
-//!    clip 0 starts its clip (0x26), which is not ported.
+//!    A change clears the carry slot at once, and a change to clip 0
+//!    starts the posture's clip 0x26 there, forward, to stop at its end,
+//!    at priority 10 ([`Interpreter::start_carry`]). The layer is updated
+//!    with the skin's others in the tail.
 //! 4. The base layer is brought up to date (virtual function 0x58,
 //!    0x590430): a posture other than the one it was started for clears
 //!    it; then, unless the definition's word 102 has bit 2 set, or the
@@ -46,7 +47,9 @@
 //!    2). Any other state, and an animator in state 3 that has to turn or
 //!    walk, is not ported.
 //! 8. The tail: the skin's layers are updated once at the clock, in the
-//!    skin's order ([`Animator::carry_first`]; 0x5992b3, from 0x5a0ef5 or
+//!    skin's order: by priority, which a changed skin sorts its layers by
+//!    first (0x5991fd), then [`Animator::carry_first`] (0x5992b3, from
+//!    0x5a0ef5 or
 //!    from 0x58f8bf: the second call finds the skin updated at the same
 //!    clock and does nothing), the animator places
 //!    itself if it has not, and the head takes its step, measures where
@@ -142,20 +145,14 @@ impl Interpreter<'_> {
                 }
             }
             if next != a.carry_selection {
-                // A change clears the carry slot (virtual function 0x104),
-                // which holds a layer only while a script's carry clip
-                // plays, with the carry mode 6.
-                if a.carry.is_some() {
-                    return Err(Trap::Invalid(
-                        "the carry slot holds a layer while the carry mode is not 6".into(),
-                    ));
+                // A change clears the carry slot (virtual function 0x104,
+                // 0x592878: at once, which marks the skin's layers
+                // changed).
+                if a.carry.take().is_some() {
+                    a.skin_dirty = true;
                 }
                 if next == 0 {
-                    return Err(Trap::Unsupported(
-                        "a person starts carrying: its carry clip (0x26, 0x5903fc) is not \
-                         ported"
-                            .into(),
-                    ));
+                    self.start_carry(world, id, &mut a, now)?;
                 }
                 a.carry_selection = next;
             }
@@ -187,9 +184,21 @@ impl Interpreter<'_> {
 
         // 0x5992b3: the skin's update.
         if a.skin_dirty || now != a.skin_clock {
+            // 0x5991fd: a changed skin first sorts its layers by priority,
+            // lowest first, keeping the order of layers of the same
+            // priority. Every change marks the skin changed, so the layers
+            // are always in that order when they update: the list's own
+            // order (Animator::carry_first) decides only a tie.
+            let carry_first = match (&a.carry, &a.foreground) {
+                (Some(carry), Some(foreground)) => match carry.priority.cmp(&foreground.priority) {
+                    Ordering::Less => true,
+                    Ordering::Greater => false,
+                    Ordering::Equal => a.carry_first,
+                },
+                _ => a.carry_first,
+            };
             a.skin_dirty = false;
-            // The layers in the skin's order (Animator::carry_first).
-            if a.carry_first {
+            if carry_first {
                 self.update_carry(world, id, &mut a, now)?;
                 self.update_foreground(world, id, &mut a, now)?;
             } else {
@@ -311,6 +320,8 @@ const SPECIAL: usize = 64;
 /// The posture clip whose distance gives the walk's look-ahead (0x58831d,
 /// virtual function 0x120 with 0x14).
 const WALK: usize = 0x14;
+/// The posture clip the animator carries with (0x5903fe).
+const CARRY: usize = 0x26;
 /// The largest turn made walking, for a person of kind above 1
 /// (0x667454); otherwise it is 2 (0x6d07b4).
 const SMALL_TURN: F32 = F32::from_bits(0x3f4c_cccd);
@@ -785,6 +796,55 @@ impl Interpreter<'_> {
         a.foreground = Some(layer);
         // A new layer goes in before the carry layer (priority 10).
         a.carry_first = false;
+        Ok(())
+    }
+
+    /// Starts the animator's own carry clip in the carry slot, the slot
+    /// already empty (0x5903fc to 0x590421). The posture's clip 0x26 is
+    /// looked up (virtual function 0xf4, 0x592625, which first reads the
+    /// person's appearance again if the animator says so) and started in
+    /// the slot (virtual function 0x100, 0x592726) at the clock, forward,
+    /// at speed 1, to stop at its end (end mode 0, 0x592823): made at
+    /// priority 1, it goes in before the first layer of the skin whose
+    /// priority is above that (0x599128). Then it takes priority 10
+    /// (0x59867f), which marks the skin's layers changed. Unlike a
+    /// script's carry clip, the carry mode stays as the tick set it, so
+    /// the next tick chooses again.
+    ///
+    /// Fails for what is not ported: a clip that is not found. The
+    /// original leaves the slot empty then (0x59040a, or 0x592726 failing
+    /// at 0x59274a) and still notes the carry clip chosen.
+    fn start_carry(
+        &self,
+        world: &mut World,
+        id: u16,
+        a: &mut Animator,
+        now: i32,
+    ) -> Result<(), Trap> {
+        read_appearance_if_stale(world, self.program, id, &mut a.profile_stale)?;
+        let name = self.posture_clip(world, id, CARRY)?.ok_or_else(|| {
+            unsupported(
+                "0x59db2f",
+                &format!("has no name for its carry clip {CARRY:#x}"),
+            )
+        })?;
+        let clip =
+            self.program.animations.clip(&name).map_err(|e| {
+                unsupported("0x59dc32", &format!("finds no carry clip {name:?}: {e}"))
+            })?;
+        let mut layer = Layer::start(
+            &name,
+            F32::from_bits(clip.duration),
+            clip.frames,
+            clip.motions > 0,
+            clip.tracks.len(),
+            false,
+            now,
+        );
+        a.carry_first = a.foreground.as_ref().is_some_and(|l| l.priority > 1);
+        layer.priority = 10;
+        a.skin_dirty = true;
+        a.carry = Some(layer);
         Ok(())
     }
 

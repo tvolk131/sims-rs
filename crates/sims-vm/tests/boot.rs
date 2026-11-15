@@ -168,10 +168,11 @@ fn the_snack_order_pays_for_the_snack() {
         assert_eq!(lot.world().budget.funds, 2542, "step {step}");
     }
     // Step 820: Mortimer's tree 0x1007 spends 5 in category 3, and tree
-    // 0x104a names his running action. His animator then stops where he
-    // starts to carry the snack.
+    // 0x104a names his running action. His animator starts to carry the
+    // snack (0x5903a3): the posture's clip 0x26 in the carry slot.
     let update = lot.step_play().unwrap();
-    assert_eq!(lot.world().ticks, 89263);
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    assert_eq!(lot.world().ticks, 89264);
     assert_eq!(lot.world().budget.funds, 2537);
     assert_eq!(today(&lot), [20, 0, 0, 5, 0, 0, 15060, 33654]);
     assert_eq!(
@@ -180,12 +181,35 @@ fn the_snack_order_pays_for_the_snack() {
     );
     let person = lot.world().objects[&sim].person.as_ref().unwrap();
     assert_ne!(person.active.flags & 0x80, 0);
+    let a = &lot.world().animators[&sim];
+    assert_eq!((a.carry_mode, a.carry_selection), (1, 0));
+    let carry = a.carry.as_ref().unwrap();
+    assert_eq!(
+        (carry.clip.as_str(), carry.priority, carry.mode),
+        ("a2o-rarm-carry-loop", 10, 0)
+    );
+    assert_eq!(carry.speed.to_bits(), 0x3f80_0000);
+    // The rest of his tick hands person word 1, the 5 spent, to the
+    // interface (0x4a69aa) and clears it.
+    assert_eq!(person.data[1], 0);
+    // The carry clip stops at its end two steps later, and stays chosen.
+    for step in 821..836 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+    }
+    let a = &lot.world().animators[&sim];
+    assert_eq!(a.carry_selection, 0);
+    let carry = a.carry.as_ref().unwrap();
+    assert!(carry.ended && carry.finished());
+    // Step 836: walking with the snack, his animator turns by less than a
+    // step (0x58dfc0).
+    let update = lot.step_play().unwrap();
     let [error] = &update.errors[..] else {
         panic!("{:?}", update.errors);
     };
-    assert_eq!(error.object, sim);
+    assert_eq!((error.object, error.tick), (sim, 89279));
     assert!(
-        error.fault.to_string().contains("0x5903fc"),
+        error.fault.to_string().contains("0x58dfc0"),
         "{}",
         error.fault
     );
