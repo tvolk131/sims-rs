@@ -1457,6 +1457,7 @@ dependencies = [
  "sims-core",
  "sims-formats",
  "sims-sim",
+ "sims-vm",
  "softbuffer",
  "winit",
 ]
