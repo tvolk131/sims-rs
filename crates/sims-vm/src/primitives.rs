@@ -27,6 +27,7 @@ mod motive_change;
 mod named_tree;
 mod notify;
 mod object_type;
+mod push;
 mod random;
 mod refresh;
 mod relationship;
@@ -125,6 +126,7 @@ impl Machine<'_, '_> {
             10 => self.own_events(operands)?.into(),
             11 => self.get_distance_to(operands)?.into(),
             12 => self.get_direction_to(operands)?.into(),
+            13 => self.push_interaction(operands)?.into(),
             14 => self.find_best_object(operands)?.into(),
             16 => self.find_location(operands)?.into(),
             17 => self.idle_for_input(operands)?,

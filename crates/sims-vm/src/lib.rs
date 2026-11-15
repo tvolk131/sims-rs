@@ -47,6 +47,7 @@ mod load;
 mod memory;
 mod object_uses;
 mod objects;
+pub mod orders;
 mod people;
 mod person_factory;
 mod placement;
