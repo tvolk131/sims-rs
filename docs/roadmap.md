@@ -60,10 +60,10 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 871 on the Goth house**: our
+  there, as three captures recorded). **K = 877 on the Goth house**: our
   state after every one of ticks 1 to 608 equals the fourth capture of the
   original (full state after every update), and after every one of ticks
-  600 to 871 the fifth, in everything compared, but
+  600 to 877 the fifth, in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
   other captures agree where they hold a state, but for fields that also
@@ -1640,7 +1640,33 @@ for the head fields of "Ticks 334 to 366". Ticks 1 to 608 compare with
 the fourth capture as before.
 
 **Stops.** Tick 872: object 121 sets a balloon (Set Balloon/Headline,
-opcode 41), which is not ported.
+opcode 41), which is not ported. See "Ticks 872 to 877".
+
+### Ticks 872 to 877
+
+**Set Balloon/Headline** (opcode 41, `0x44b724`, `headline.rs`). An
+object's headlines are a list its construction fills: one for each SLOT
+entry of kind 1 (`0x46e2d1`, from the base constructor), and one more
+for a person (`0x459630`). Nothing in a house file restores one. The
+primitive acts on the first headline of me or, with byte 0 bit 0, of the
+stack object (native error 0x15 if there is none); an object with no
+headline is left alone. A duration of 0 clears the headline. Showing an
+icon (the sprite or picture, its frames, the options, the redraw and the
+note to the lot, `0x44574b`, which looks at the scheduler when the
+object sleeps) fails loudly. Since nothing here shows one, no headline
+ever has a duration, so clearing changes nothing that is kept, and no
+headline state is kept yet: the priority is read only while a headline
+shows. Sleep's test of the first headline (`0x44aa57`), the countdown
+after each thread run (`0x4521f7`) and the reset (`0x45e8af`) are
+unaffected for the same reason. In tick 872 object 121, a trash can,
+clears its headline.
+
+**K = 877.** Our state after every tick from 872 to 877 equals the fifth
+capture in everything compared, the three random streams included, but
+for the head fields of "Ticks 334 to 366".
+
+**Stops.** Tick 878: the hour turns (globals 0 and 5, the time of day,
+the lighting, signals 0xf8 and 0xdd), which is not ported.
 
 ## Track: drawing people (`crates/sims-people`)
 

@@ -17,6 +17,7 @@ mod find_location;
 mod found_action;
 mod generic;
 mod go_to_slot;
+mod headline;
 mod idle;
 mod in_way;
 mod interacting;
@@ -139,6 +140,7 @@ impl Machine<'_, '_> {
             29 => self.set_motive_change(operands)?.into(),
             30 => self.gosub_found_action()?,
             31 => self.set_to_next(operands)?.into(),
+            41 => self.set_headline(operands)?.into(),
             42 => self.create_object(operands)?.into(),
             44 => self.animate_sim(operands)?,
             45 => self.go_to_slot(operands)?,
