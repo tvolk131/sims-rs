@@ -2195,6 +2195,13 @@ through their public interfaces only; the simulation never depends on it.
   not ported); without an order it stops there too.
 
   not ported); without an order it runs to tick 3432.
+- **Done: a player's order from the window, in play mode.** With
+  `--play`, the pointer on the fridge lists its pie, a click opens it,
+  and Have A Snack queues the action the listing offered. A Goth test
+  drives this through the game's input layer: the action queued is the
+  scripted order's, and from step 150, when Mortimer takes it, the lot
+  is the scripted lot hash for hash through the snack's end at step
+  1136, with no error caught.
 - **Done: the speed and the pause.** The panel's speed buttons set the
   simulation's speed as the original's setter does (`0x46d697`, globals
   16 and 18, `sims_sim::speed`): 760, 924 and 994. The window ticks at
