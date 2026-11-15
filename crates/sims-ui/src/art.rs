@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 pub const KEY: [u8; 3] = [255, 0, 255];
 
 /// The font sizes the interface uses (`Fonts/variablesans_NN.ffn`).
-pub const FONT_SIZES: [u8; 6] = [8, 9, 10, 11, 12, 14];
+pub const FONT_SIZES: [u8; 7] = [7, 8, 9, 10, 11, 12, 14];
 
 /// Bitmaps by resource ID, and fonts by size.
 #[derive(Debug, Clone, Default)]
