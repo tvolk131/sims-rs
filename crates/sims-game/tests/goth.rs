@@ -336,7 +336,7 @@ fn the_sound_scripts_learn_about_the_goths() {
         assert_eq!(answers[13], room.map_or(100, |r| r.half_tiles / 2));
         match &object.person {
             // Motive 3 over 10, truncated.
-            Some(person) => assert_eq!(answers[14], (person.motives[3] / 10.0) as i32),
+            Some(person) => assert_eq!(answers[14], sims_game::sound::tenth(person.motives[3])),
             None => {
                 let mut rest = answers;
                 (rest[4], rest[13]) = (0, 0);

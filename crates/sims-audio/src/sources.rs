@@ -29,9 +29,12 @@
 //! toward zero (`idiv`).
 //!
 //! The original asks the live simulation when the script runs. Here the
-//! simulation's host takes a [`Snapshot`] of every answer between ticks
-//! and the player reads it while it renders; the answers can be a tick
-//! late, which nothing the sound does is known to depend on.
+//! simulation's host takes a [`Snapshot`] of every answer when it has run
+//! the lot, and the player reads the last one it was sent while it
+//! renders. A host that runs several ticks at once (as `sims-game` does
+//! after a slow frame) snapshots after the last, so a sound from an
+//! earlier tick of the batch hears a later state, and the mixer's own
+//! timing adds more. Nothing the sound does is known to depend on it.
 
 use crate::player::Sources;
 use std::collections::BTreeMap;
@@ -39,14 +42,29 @@ use std::collections::BTreeMap;
 /// How many fields the query answers (0x571127 refuses 21 and above).
 pub const FIELDS: usize = 21;
 
-/// The query's answers for every object, taken between ticks.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The query's answers for every object, taken between ticks. The
+/// default holds no object, with the hour 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     /// Each object's answers, by object ID.
     pub objects: BTreeMap<i32, [i32; FIELDS]>,
     /// The answers for an ID that names no object: field 4 is still the
     /// hour and field 13 is 100; the rest are 0.
     pub absent: [i32; FIELDS],
+}
+
+/// Field 13's answer for no object or no room (0x570fba).
+pub const NO_ROOM: i32 = 100;
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        let mut absent = [0; FIELDS];
+        absent[13] = NO_ROOM;
+        Self {
+            objects: BTreeMap::new(),
+            absent,
+        }
+    }
 }
 
 impl Sources for Snapshot {

@@ -23,7 +23,7 @@ use sims_audio::SoundEvent;
 use sims_audio::files::SoundFiles;
 use sims_audio::module::Module;
 use sims_audio::player::Player;
-use sims_audio::sources::{FIELDS, Snapshot};
+use sims_audio::sources::{FIELDS, NO_ROOM, Snapshot};
 use sims_audio::stations::StationLists;
 use sims_core::F32;
 use sims_sim::World;
@@ -74,6 +74,12 @@ const TENTHS: [(usize, usize); 13] = [
     (20, 7),
 ];
 
+/// Field 14's answer for a motive: the motive times the single 0.1 on
+/// the FPU, cut toward zero (`__ftol`).
+pub fn tenth(motive: f32) -> i32 {
+    (F32::from_f32(motive).ext() * TENTH.ext()).to_i32_truncate()
+}
+
 /// The original's answers to `getsrcdatafield` for every object on the
 /// lot (0x570e61; `sims_audio::sources` lists them). A word the object
 /// does not have reads as 0.
@@ -82,7 +88,7 @@ pub fn sources(world: &World) -> Snapshot {
     // 0x466fcc then 0x46810a: the room's half tiles over 2, as `idiv`.
     let room_tiles = |room: Option<i16>| {
         room.and_then(|id| world.rooms.rooms.get(&id))
-            .map_or(100, |room| room.half_tiles / 2)
+            .map_or(NO_ROOM, |room| room.half_tiles / 2)
     };
     let mut absent = [0; FIELDS];
     absent[4] = hour;
@@ -107,8 +113,7 @@ pub fn sources(world: &World) -> Snapshot {
                 for (field, i) in TENTHS {
                     answers[field] = word(i) / 10;
                 }
-                let motive = F32::from_f32(person.motives.get(MOTIVE).copied().unwrap_or(0.0));
-                answers[14] = (motive.ext() * TENTH.ext()).to_i32_truncate();
+                answers[14] = tenth(person.motives.get(MOTIVE).copied().unwrap_or(0.0));
             }
             (i32::from(object.id), answers)
         })
@@ -235,6 +240,16 @@ impl Mixer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_motive_is_scaled_on_the_fpu_not_in_single_precision() {
+        assert_eq!(tenth(81.57505), 8);
+        assert_eq!(tenth(-81.57505), -8);
+        assert_eq!(tenth(f32::NAN), 0);
+        // 167772176 times 0.1 is 16777217.6 on the FPU; a single
+        // precision division would round it to 16777218 first.
+        assert_eq!(tenth(f32::from_bits(0x4d20_0001)), 16_777_217);
+    }
 
     #[test]
     fn a_requests_object_is_widened_without_its_sign() {

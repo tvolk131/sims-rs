@@ -22,10 +22,11 @@ is global 10, the lot), 13 the size in tiles of the object's room, or 100.
 
 The original asks the live simulation; the sound here runs on its own
 thread. So `sims_game::sound::sources` reads every object's answers from
-the world between ticks into a `Snapshot`, which the window sends to the
-mixer before the tick's sound events when it changed. A script can hear
-the state of the tick before; nothing in the sound is known to depend on
-the difference. It only reads the world, so strict output is unchanged.
+the world into a `Snapshot` each time the window runs the lot, and sends
+it to the mixer before that run's sound events when it changed. A script
+can hear a later state than the one its sound was asked in (the window
+may run several ticks at once) or an earlier one (the mixer's timing);
+nothing in the sound is known to depend on the difference. It only reads the world, so strict output is unchanged.
 On the Goth house the answers are what the save holds: Cassandra 2,
 Bella 1 and Mortimer 0 for the voice, and their personalities.
 

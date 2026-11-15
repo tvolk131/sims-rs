@@ -268,13 +268,12 @@ impl App {
         let ran = self.game.advance(micros);
         let mut redraw = ran > 0;
         // What the tick's sounds may ask about their objects, before the
-        // sounds themselves.
-        if ran > 0 || self.told.is_none() {
-            let sources = sound::sources(self.game.lot().world());
-            if self.told.as_ref() != Some(&sources) {
-                self.sound.send(Input::Sources(sources.clone()));
-                self.told = Some(sources);
-            }
+        // sounds themselves. Read on every call, not only after a step
+        // that succeeded: a failed step may still have changed the lot.
+        let sources = sound::sources(self.game.lot().world());
+        if self.told.as_ref() != Some(&sources) {
+            self.sound.send(Input::Sources(sources.clone()));
+            self.told = Some(sources);
         }
         let sounds = self.game.take_sounds();
         if !sounds.is_empty() {

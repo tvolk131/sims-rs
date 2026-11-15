@@ -299,10 +299,11 @@ fn a_refused_field_leaves_the_register_and_is_a_fault() {
 #[test]
 fn a_snapshot_answers_by_object_and_field() {
     let mut snapshot = Snapshot::default();
+    // With nothing sent yet, no object is in a room.
+    assert_eq!(snapshot.field(9, 13), Some(100));
     let mut answers = [0; sims_audio::sources::FIELDS];
     answers[3] = 7;
     snapshot.objects.insert(9, answers);
-    snapshot.absent[13] = 100;
     assert_eq!(snapshot.field(9, 3), Some(7));
     assert_eq!(snapshot.field(9, 13), Some(0));
     assert_eq!(snapshot.field(10, 13), Some(100));
