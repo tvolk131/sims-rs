@@ -107,6 +107,14 @@ struct Held {
     occupant: i16,
 }
 
+/// The heights of the container slots a person adds after its
+/// definition's (0x45962b): the slot it carries in, its head, and three
+/// more. All are at its centre.
+const PERSON_RECORDS: [i32; crate::objects::PERSON_SLOTS] = [6, 0, 1, 1, 1];
+
+/// The person type in definition word 9.
+const PERSON_TYPE: i16 = 2;
+
 /// Person data word 68; bit 0 set means the person takes no room.
 const PERSON_NO_ROOM: usize = 68;
 
@@ -667,7 +675,8 @@ impl Interpreter<'_> {
     ///    not a person and has no data word 8 flag 0x2000 needs a slot at
     ///    the container's centre (an offset of 0 across), or a container
     ///    with only that slot (3).
-    /// 5. A person as the container takes nothing outside mode 0 (0xd).
+    /// 5. A container whose definition is a person's (word 9 is 2) takes
+    ///    nothing outside mode 0 (0xd).
     /// 6. For each slot at the same height holding another object, from
     ///    the last slot to the first, unless the object is a person: if
     ///    that slot is at the centre, its object needs data word 8 flag
@@ -715,8 +724,11 @@ impl Interpreter<'_> {
         if !person && unlinked && mode == 2 && !target.centre && slots.len() > 1 {
             return Ok(Err(Refusal::Other));
         }
-        // Step 5 cannot refuse: a person as the container has already
-        // failed loudly in reading its slots.
+        // Code 0xd: the container's definition type (+0x118, word 9) is
+        // read, not whether it has person data (0x432e57).
+        if self.kind(world, container)? == PERSON_TYPE && mode != 0 {
+            return Ok(Err(Refusal::Other));
+        }
         for other in slots.iter().rev() {
             if other.height != target.height || other.occupant == 0 || other.occupant == id as i16 {
                 continue;
@@ -774,17 +786,21 @@ impl Interpreter<'_> {
     /// SLOT entry of kind 0 of its definition, in order (0x46e2d1), each
     /// with the entry's offset and height (0x46debb), and the object the
     /// object's slot one further on holds. A height of 0 becomes 1 for an
-    /// entry at height 0 and 5 for any other (0x46def8). A person's
-    /// slots also count those its post-constructor adds (0x459630), which
-    /// are not ported, so a person as the container fails loudly.
+    /// entry at height 0 and 5 for any other (0x46def8).
+    ///
+    /// A person has five more after its definition's (its post-constructor
+    /// 0x45962b, after the base's 0x431aaf): records made by 0x46de93,
+    /// which sets an offset of 0 and a height of 0, with only the height
+    /// or the flags changed and none of them converted. In order: height
+    /// 6, the slot a person carries in; height 0 with flag 2 and the name
+    /// "HEAD" (0x6c4528); and three at height 1 ([`PERSON_RECORDS`]).
     fn container_slots(&self, world: &World, container: u16) -> Result<Vec<Held>, Trap> {
         let object = world.objects.get(&container).ok_or_else(missing)?;
-        if object.person.is_some() {
-            return Err(Trap::Unsupported(format!(
-                "the place test of a place in person {container}, whose slots include those its \
-                 post-constructor adds (0x459630), is not ported"
-            )));
-        }
+        let own: &[i32] = if object.person.is_some() {
+            &PERSON_RECORDS
+        } else {
+            &[]
+        };
         let definition = self
             .catalog
             .object(object.guid)
@@ -795,23 +811,33 @@ impl Interpreter<'_> {
             .iter()
             .filter(|entry| entry.kind == CONTAINER)
             .collect();
-        if entries.len() + 1 != object.slots.len() {
+        if entries.len() + own.len() + 1 != object.slots.len() {
             return Err(Trap::Invalid(format!(
-                "object {container} keeps {} slots, but its SLOT has {} containers",
+                "object {container} keeps {} slots, but its SLOT has {} containers and it \
+                 adds {} of its own",
                 object.slots.len(),
-                entries.len()
+                entries.len(),
+                own.len()
             )));
         }
-        Ok(entries
+        let records = entries
             .iter()
+            .map(|entry| {
+                (
+                    entry.offset[0] == 0.0 && entry.offset[1] == 0.0,
+                    match entry.height {
+                        0 if entry.offset[2] == 0.0 => 1,
+                        0 => 5,
+                        height => height,
+                    },
+                )
+            })
+            .chain(own.iter().map(|&height| (true, height)));
+        Ok(records
             .zip(&object.slots[1..])
-            .map(|(entry, held)| Held {
-                centre: entry.offset[0] == 0.0 && entry.offset[1] == 0.0,
-                height: match entry.height {
-                    0 if entry.offset[2] == 0.0 => 1,
-                    0 => 5,
-                    height => height,
-                },
+            .map(|((centre, height), held)| Held {
+                centre,
+                height,
                 occupant: held.object,
             })
             .collect())

@@ -182,11 +182,12 @@ impl Machine<'_, '_> {
     ///    function 0x58).
     ///
     /// A person type, which the original gives its record's traits and
-    /// sends through its own place test, an object whose definition names
-    /// a group (word 10), and a person as the container, whose slots are
-    /// not ported, fail loudly before anything is made. So does a
-    /// container that the new object's Init or first turn removed, which
-    /// the original would go on to read through a stale pointer.
+    /// sends through its own place test, and an object whose definition
+    /// names a group (word 10), fail loudly before anything is made. So
+    /// does a container that the new object's Init or first turn removed,
+    /// which the original would go on to read through a stale pointer. A
+    /// person as the container is tested against its own container slots
+    /// too (0x45962b), so its slot 0 is the one it carries in.
     fn create_in_stack_object(&mut self, guid: u32, flags: u8) -> Result<bool, Trap> {
         let source = self.frame()?.stack_object;
         let Some((container, [p0, p1, level], room)) = u16::try_from(source)
@@ -221,12 +222,6 @@ impl Machine<'_, '_> {
             return Err(Trap::Unsupported(format!(
                 "Create New Object Instance placing an object of type 0x{guid:08X}, \
                  which belongs to a group, is not ported"
-            )));
-        }
-        if self.world.objects[&container].person.is_some() {
-            return Err(Trap::Unsupported(format!(
-                "Create New Object Instance mode 4 into person {container}, whose slots \
-                 include those its post-constructor adds (0x459630), is not ported"
             )));
         }
         let created = self.make(guid)?;
