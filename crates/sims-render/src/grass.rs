@@ -14,7 +14,8 @@
 //!   around it, becomes a shade from 0 (lit) to 127, and is jittered by up
 //!   to two shades from the original's random generator, seeded the same
 //!   each time. A tile with a wall on its far edge in the view is 64 shades
-//!   darker along that edge. The sun turns with the camera.
+//!   darker along that edge. The sun stays where it is when the camera
+//!   turns: it always stands toward the view's +x, π/10 from the zenith.
 //! - **Grass color** (0x49cd43). Each corner averages the four tiles' grass
 //!   values around it and scales them to 0 to 31.
 //! - **Columns** (0x49dacd, 0x49da21). A tile is drawn in columns four
@@ -52,6 +53,9 @@ const DITHER: [i32; 4] = [0, 8, 0, 6];
 /// The jitter's seed and reach (`fJitterRandSeed`, `fJitterEnvelope`).
 const JITTER_SEED: u32 = 0x40de9;
 const JITTER: u32 = 3;
+/// The sun's angle from the zenith, as the grass's constructor stores it
+/// (0x49c187): about π/10.
+const LATITUDE_BITS: u32 = 0x3ea0_d973;
 /// Shades added along a wall.
 const WALL_SHADE: i32 = 64;
 
@@ -149,10 +153,19 @@ impl Random {
 
 /// Light on a slope, for height differences -5 to 5 along each axis
 /// (0x4c47f7): the squared cosine between the sun and the slope's normal.
-fn light_table(rotation: u8) -> [[f32; 11]; 11] {
-    // The sun's height from the zenith turns with the camera (0x4a4551).
-    let tenths = [0.1, 0.2, 0.3, 0.2][usize::from(rotation & 3)];
-    let latitude = (f64::from(std::f32::consts::PI) * tenths) as f32;
+fn light_table() -> [[f32; 11]; 11] {
+    // The sun's angle from the zenith: π/10, set by the grass's constructor
+    // (0x49c187, the float 0x3ea0d973). The base class has a setter that
+    // would tilt it by the camera's rotation (0x4a4551: 1, 2, 3 and 2
+    // tenths of π), but only a command handler reaches it (message 0xdd at
+    // 0x4c41bf), and turning the camera does not: at rotation 3 the
+    // original's grass matches π/10 and not 2π/10. The constant is 9 ulps
+    // below π/10 rounded to f32, and a slope can tell the difference.
+    light_table_at(f32::from_bits(LATITUDE_BITS))
+}
+
+/// The light table for a sun `latitude` radians from the zenith.
+fn light_table_at(latitude: f32) -> [[f32; 11]; 11] {
     // libm stands in for the x87's sine and cosine; both are within an
     // ulp of a double, far finer than the f32 they are rounded to.
     let (sin, cos) = (
@@ -317,7 +330,7 @@ impl Grass {
             let h = lot.heights[Lot::cell(lx as usize, ly as usize)];
             std::array::from_fn(|n| i32::from(h[(n + 4 - usize::from(rotation)) & 3]))
         };
-        let table = light_table(rotation);
+        let table = light_table();
         let sw = |c: [i32; 4]| lookup(&table, c[0] - c[3], c[1] - c[0]);
         let ne = |c: [i32; 4]| lookup(&table, c[1] - c[2], c[3] - c[2]);
         // The vertices run 1 to the lot's size less one, x outer, each
@@ -657,6 +670,22 @@ mod tests {
     }
 
     #[test]
+    fn the_sun_angle_is_the_constructors_exact_float() {
+        // π/10 rounded to f32 is 0x3ea0d97c; the original stores 9 ulps
+        // less. A vertex ringed by these slopes is shade 87 with the
+        // original's float and would be 88 with the rounded one.
+        let shade = |table: [[f32; 11]; 11]| {
+            let slopes = [(-5, -1), (-3, 1), (-2, -2), (-2, -3), (-5, -3), (-5, 3)];
+            let sum: f32 = slopes.iter().map(|&(a, b)| lookup(&table, a, b)).sum();
+            MAX_SHADE - times_127(f64::from(sum) * f64::from(1.0f32 / 6.0))
+        };
+        let rounded = (f64::from(std::f32::consts::PI) * 0.1) as f32;
+        assert_eq!(rounded.to_bits(), 0x3ea0_d97c);
+        assert_eq!(shade(light_table()), 87);
+        assert_eq!(shade(light_table_at(rounded)), 88);
+    }
+
+    #[test]
     fn random_matches_the_original_generator() {
         let mut r = Random(1);
         let a = r.next();
@@ -670,7 +699,7 @@ mod tests {
 
     #[test]
     fn flat_ground_is_evenly_lit_and_a_flat_tile_has_diamond_columns() {
-        let table = light_table(0);
+        let table = light_table();
         let flat = lookup(&table, 0, 0);
         // cos² of the sun's angle from the zenith, π/10.
         let cos = libm::cos(std::f64::consts::PI / 10.0);
@@ -790,8 +819,9 @@ mod tests {
                     let view = camera.rotate_tile([x, y]);
                     let (shades, _) = grass.tile(view).unwrap_or_default();
                     // Flat ground: 127 less 127 cos² of the sun's angle
-                    // from the zenith, within two shades of jitter.
-                    let flat = [13, 44, 84, 44][usize::from(rotation)];
+                    // from the zenith, within two shades of jitter. The sun
+                    // does not move when the camera turns.
+                    let flat = 13;
                     assert!(
                         shades.iter().all(|&s| (i32::from(s) - flat).abs() <= 2),
                         "{rotation} {view:?} {shades:?}"
