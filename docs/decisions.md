@@ -22,7 +22,10 @@ selection is written.
 
 The base slot used to be a flag, since only the posture's clip went
 there. It is now `Base`: empty, the posture's clip, or a clip a script
-started, with its name and direction. `Empty` and `Posture` encode as
+started, with its name, direction and the animator's clock at its
+start. Drawing plays it from that start (0x597a88: the layer's clock
+starts at the animator's, its phase at 0, or 1 backward), not from the
+clock's zero. `Empty` and `Posture` encode as
 `false` and `true` did, so existing states and snapshots hash and decode
 as before. The animator's base update (0x590430) treats a script's layer
 like any other: a change of posture clears it. Otherwise it stays for a
@@ -32,10 +35,11 @@ does not touch the posture noted (+0x198), so after clip 0 the next base
 update starts the posture's clip again. The head's measurement checks a
 script's base clip against the foreground as it checks the posture's.
 
-The base layer's clock and its place in the skin's list are still not
-kept. A new layer goes in before the first layer above priority 1
-(0x599128) and only then takes -10, so it may come before or after the
-foreground layer. That matters only for timed events, so a script's base
+Beyond a script's start, the base layer's clock and its place in the
+skin's list are still not kept. A new layer goes in before the first
+layer above priority 1 (0x599128) and only then takes -10, so it may
+come before or after the foreground layer; the skin's update sorts its
+layers by priority first (0x5991fd), so the base updates first anyway. That matters only for timed events, so a script's base
 clip with timed events fails loudly (0x5992b3), as the posture's does.
 The original goes on past a clip it cannot find (0x452bed reports it);
 here that fails, as it does for the other slots.

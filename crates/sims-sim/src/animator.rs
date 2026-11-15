@@ -215,16 +215,19 @@ pub struct Animator {
 }
 
 /// What the base slot (+0x14) holds. Its layer repeats at priority -10
-/// whoever started it. Its clock is not kept: a base clip with timed
-/// events, which the skin's update would handle (0x5992b3), fails before
-/// it is started, so nothing the simulation reads depends on it.
+/// whoever started it. Its clock is not kept beyond a script's start: a
+/// base clip with timed events, which the skin's update would handle
+/// (0x5992b3), fails before it is started, so nothing the simulation
+/// reads depends on it.
 ///
 /// Where the layer goes in the skin's list (skin +0x7c) is not kept
 /// either. Every start makes the layer at priority 1 and puts it before
 /// the first layer whose priority is above 1 (0x599128), then gives it
 /// -10 (0x59867f). It may then come before or after the foreground
 /// layer, depending on that layer's priority, and comes before the carry
-/// layer. With no timed events, its place changes nothing that is
+/// layer. The skin's update (0x5992b3) first sorts its layers by
+/// priority (0x5991fd), so the base layer updates before the foreground
+/// either way. With no timed events, its place changes nothing that is
 /// handled.
 ///
 /// The encoding of `Empty` and `Posture` is that of `false` and `true`,
@@ -246,6 +249,10 @@ pub enum Base {
         clip: String,
         /// Whether the clip plays backward (speed -1, from the end).
         reverse: bool,
+        /// The animator's clock when the clip started, which the layer's
+        /// clock starts at, with its phase 0, or 1 backward (0x597a88,
+        /// 0x59281b). Only drawing reads it.
+        start: i32,
     },
 }
 

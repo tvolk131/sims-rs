@@ -395,7 +395,8 @@ fn a_clip_starts_in_the_base_slot_and_repeats() {
         a.base,
         Base::Script {
             clip: CLIP.into(),
-            reverse: true
+            reverse: true,
+            start: a.clock_at(fx.world.ticks as i32),
         }
     );
     assert!(a.slow && a.skin_dirty && !a.profile_stale);
@@ -413,7 +414,8 @@ fn a_clip_starts_in_the_base_slot_and_repeats() {
         a.base,
         Base::Script {
             clip: CLIP.into(),
-            reverse: false
+            reverse: false,
+            start: a.clock_at(fx.world.ticks as i32),
         }
     );
     assert!(!a.slow);
@@ -429,6 +431,7 @@ fn clip_0_clears_the_base_slot() {
         Base::Script {
             clip: CLIP.into(),
             reverse: false,
+            start: 0,
         },
     ] {
         let mut fx = sim_animates(animate(0, 3, 0x01, 0, 0));
@@ -1592,6 +1595,7 @@ fn the_base_update_keeps_a_scripts_clip_until_the_posture_changes() {
     let script = || Base::Script {
         clip: CLIP.into(),
         reverse: false,
+        start: 0,
     };
     let base_after = |kind: i16, noted: i32, flags: i16| {
         let mut fx = standing();

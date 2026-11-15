@@ -446,6 +446,7 @@ impl Machine<'_, '_> {
         a.base = Base::Script {
             clip: name,
             reverse: flags & 0x02 != 0,
+            start: a.clock_at(self.world.ticks as i32),
         };
         a.skin_dirty = true;
         Ok(Flow::Branch(true))

@@ -183,16 +183,23 @@ impl<'a> Player<'a> {
         base: &str,
     ) -> Result<Pose, String> {
         let mut pose = Pose::rest(skeleton);
+        // A script's clip plays from when it started (0x597a88); the
+        // posture's from the clock's zero.
         let base = match &animator.base {
             Base::Empty => None,
-            Base::Posture => Some((base, false)),
-            Base::Script { clip, reverse } => Some((clip.as_str(), *reverse)),
+            Base::Posture => Some((base, false, 0)),
+            Base::Script {
+                clip,
+                reverse,
+                start,
+            } => Some((clip.as_str(), *reverse, *start)),
         };
-        if let Some((base, reverse)) = base {
+        if let Some((base, reverse, start)) = base {
             let clip = self.clip(base)?;
             let duration = f64::from(clip.animation.duration_ms);
+            let elapsed = f64::from(animator.clock) - f64::from(start);
             let mut phase = if duration > 0.0 {
-                (f64::from(animator.clock).rem_euclid(duration) / duration) as f32
+                (elapsed.rem_euclid(duration) / duration) as f32
             } else {
                 0.0
             };

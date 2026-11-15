@@ -388,6 +388,7 @@ fn the_base_slot_encodes_as_the_flag_it_was_unless_a_script_fills_it() {
     world.animators.get_mut(&5).unwrap().base = Base::Script {
         clip: "a2o-base".into(),
         reverse: true,
+        start: 1234,
     };
     let back = World::decode(&world.encode()).unwrap();
     assert_eq!(back.animators, world.animators);

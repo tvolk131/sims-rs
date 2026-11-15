@@ -215,6 +215,7 @@ fn based(moved: &str) -> Fixture {
     animator.base = Base::Script {
         clip: "base".into(),
         reverse: false,
+        start: 0,
     };
     fx
 }
