@@ -413,9 +413,11 @@ fn shadow_code(iff: &Iff, word: &impl Fn(usize) -> i16) -> Option<u8> {
         })
         .collect();
     let place = word(GROUP_PLACE);
-    let shaded = |x: i32, y: i32| {
-        x >= 0 && y >= 0 && x < 256 && y < 256 && places.contains(&(((x << 8) | y) as u16))
-    };
+    // The original refuses a negative place, then packs the rest as a
+    // word with only `y`'s low byte (0x43ac5c, 0x43185a), so a `y` of 256
+    // wraps to 0.
+    let shaded =
+        |x: i32, y: i32| x >= 0 && y >= 0 && places.contains(&(((x << 8) | (y & 0xff)) as u16));
     Some(shadows::group_code(
         i32::from(place >> 8),
         i32::from(place & 0xff),
@@ -533,4 +535,45 @@ fn load_group(iff: &Iff, group: u16, direction: u32, zoom: u32) -> Vec<Part> {
         });
     }
     parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An IFF holding an OBJD per word list, each set at the given words.
+    fn definitions(objects: &[&[(usize, i16)]]) -> Iff {
+        let mut bytes = vec![0; 64];
+        bytes[..13].copy_from_slice(b"IFF FILE 2.5:");
+        for (id, words) in objects.iter().enumerate() {
+            let mut data = vec![0u8; 2 * (SHADOW + 1)];
+            for &(n, w) in *words {
+                data[n * 2..n * 2 + 2].copy_from_slice(&w.to_le_bytes());
+            }
+            bytes.extend(b"OBJD");
+            bytes.extend((76 + data.len() as u32).to_be_bytes());
+            bytes.extend((id as u16 + 128).to_be_bytes());
+            bytes.extend(0u16.to_be_bytes());
+            bytes.extend([0; 64]);
+            bytes.extend(data);
+        }
+        Iff::parse(bytes).expect("a well-formed file")
+    }
+
+    #[test]
+    fn a_group_neighbour_wraps_in_the_places_low_byte() {
+        // Two tiles of one group: one at place 0x00ff, one at 0x0000. The
+        // first's neighbour one step along y is (0, 256), which the
+        // original packs as 0x0000, so it is shaded there (bit 2).
+        let first: &[(usize, i16)] = &[(GROUP, 1), (GROUP_PLACE, 0x00ff), (SHADOW, 0)];
+        let second: &[(usize, i16)] = &[(GROUP, 1), (GROUP_PLACE, 0), (SHADOW, 0)];
+        let iff = definitions(&[first, second]);
+        let word = |words: &'static [(usize, i16)]| {
+            move |n: usize| words.iter().find(|&&(m, _)| m == n).map_or(0, |&(_, w)| w)
+        };
+        assert_eq!(shadow_code(&iff, &word(first)), Some(4));
+        // The second's neighbour one step back along y is (0, -1), which
+        // the original refuses rather than wrapping to 0x00ff.
+        assert_eq!(shadow_code(&iff, &word(second)), Some(0));
+    }
 }

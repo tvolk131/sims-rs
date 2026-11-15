@@ -386,10 +386,14 @@ impl Painter<'_> {
         let index = (level - 1) as usize;
         let byte = self.lot.light_at(index, [x * 16 + 8, y * 16 + 8]);
         let strength = i32::from(strength) + 255 - Light::drawn_byte(byte).unwrap_or(255) as i32;
-        let Some(mask) = self.assets.shadow_mask(self.camera.zoom.index(), code) else {
+        let zoom = self.camera.zoom.index();
+        // The mask sits where the plain floor tile would, centred by the
+        // tile's width rather than its own.
+        let tile = self.assets.floor(0, zoom).map(|image| image.width);
+        let Some(mask) = self.assets.shadow_mask(zoom, code) else {
             return;
         };
-        let at = [p[0] - mask.width as i32 / 2, p[1]];
+        let at = [p[0] - tile.unwrap_or(mask.width) as i32 / 2, p[1]];
         for my in 0..mask.height {
             let row = at[1] + my as i32;
             let at_least = self.depth.shadow(view, height, level, at[1], row);
