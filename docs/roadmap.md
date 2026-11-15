@@ -60,10 +60,10 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 752 on the Goth house**: our
+  there, as three captures recorded). **K = 871 on the Goth house**: our
   state after every one of ticks 1 to 608 equals the fourth capture of the
   original (full state after every update), and after every one of ticks
-  600 to 752 the fifth, in everything compared, but
+  600 to 871 the fifth, in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
   other captures agree where they hold a state, but for fields that also
@@ -1606,7 +1606,41 @@ capture in everything compared, the three random streams included, but
 for the head fields of "Ticks 334 to 366".
 
 **Stops.** Tick 753: person 21's pose has a carry layer (`0x5992b3`),
-which the animator does not port.
+which the animator does not port. See "Ticks 753 to 871".
+
+### Ticks 753 to 871
+
+**A carry layer the head does not read** (`0x5992b3`, `head.rs`). A
+person carrying something plays the script's carry clip as a layer of
+priority 10. The pose is read only for the head: the bones from the
+root to the head's anchors and the head itself. A carry layer whose clip
+moves none of them leaves them as the foreground put them, so it is
+passed over. One that moves such a bone, and a carry clip chosen with no
+carry layer, still fail loudly. In tick 753, person 21 carries.
+
+**Set Motive Change** (opcode 29, `0x45a16f`, `motive_change.rs`). It is
+the person's own primitive. Flag bit 0 drops all of the person's motive
+changes. Otherwise the motive must be 5 to 9, 14 or 15 (native error
+0x1a), checked before the amount and the stop value are read. The
+change goes on the end of the list: the motive, the amount per hour
+times the float at `0x667408` (1/1800) for a change per tick, and the
+stop value. The person's tick applies the list in order. Person 18 sets
+one in tick 798.
+
+**The head relaxes by a float 0.8** (`0x590886`). With the follow off,
+the head's turn shrinks to 0.8 of itself each tick. The code multiplies
+by a double (`0x672030`). The original's runs follow the product with
+0.8 as a float in each of the five steps of the fifth capture where the
+two differ (person 21, ticks 814 to 833), and no step anywhere follows
+the double; see the decision.
+
+**K = 871.** Our state after every tick from 753 to 871 equals the fifth
+capture in everything compared, the three random streams included, but
+for the head fields of "Ticks 334 to 366". Ticks 1 to 608 compare with
+the fourth capture as before.
+
+**Stops.** Tick 872: object 121 sets a balloon (Set Balloon/Headline,
+opcode 41), which is not ported.
 
 ## Track: drawing people (`crates/sims-people`)
 
