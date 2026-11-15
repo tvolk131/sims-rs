@@ -20,6 +20,7 @@
 use crate::camera::Zoom;
 use crate::canvas::Image;
 use crate::pools::Pools;
+use crate::shadows::{self, Mask};
 use crate::{Error, Result};
 use sims_content::{Catalog, Index, Install};
 use sims_formats::execution::Slots;
@@ -67,6 +68,12 @@ pub struct Definition {
     /// sixteenths of a tile in the object's own frame, z is the height
     /// the entry's category sets, in height units (see [`slot_height`]).
     pub slots: Vec<[f32; 3]>,
+    /// The shadow it casts on the floor of its tile: its shadow code
+    /// before any turning, or None for no shadow (see [`crate::shadows`]).
+    pub shadow: Option<u8>,
+    /// How faint that shadow is: added to every mask byte (OBJD word 79,
+    /// byte 0x9e).
+    pub shadow_strength: i16,
 }
 
 impl Definition {
@@ -90,6 +97,7 @@ pub struct Assets {
     object_shapes: BTreeMap<(usize, u16, bool, usize), Option<[Image; 4]>>,
     trims: BTreeMap<(bool, usize), Vec<Image>>,
     pools: Option<Pools>,
+    shadow_masks: BTreeMap<(usize, u8), Option<Mask>>,
 }
 
 impl Assets {
@@ -114,6 +122,7 @@ impl Assets {
             object_shapes: BTreeMap::new(),
             trims: BTreeMap::new(),
             pools: read_pools(install),
+            shadow_masks: BTreeMap::new(),
         })
     }
 
@@ -145,6 +154,25 @@ impl Assets {
                 let data = floors.data(chunk);
                 let frame = SpriteSet::parse(data).ok()?.decode(data, 0, floors).ok()?;
                 Some(frame.into())
+            })
+            .as_ref()
+    }
+
+    /// The floor shadow mask of a shadow code at a zoom (0 far to 2 near),
+    /// or None if the code has none or the game lacks its sprites (see
+    /// [`crate::shadows`]).
+    pub fn shadow_mask(&mut self, zoom: usize, code: u8) -> Option<&Mask> {
+        let floors = &self.floors;
+        self.shadow_masks
+            .entry((zoom, code))
+            .or_insert_with(|| {
+                let step = u16::try_from(zoom).ok()?;
+                if let Some(drawn) = shadows::DRAWN.iter().position(|&c| c == code) {
+                    let id = 0x300 + 0x10 * drawn as u16 + 0x20 * step;
+                    return drawn_mask(floors, id);
+                }
+                let tile = tile_mask(floors, 0x100 * step)?;
+                shadows::generate(&tile, code)
             })
             .as_ref()
     }
@@ -251,6 +279,7 @@ impl Assets {
                     .collect()
             })
             .unwrap_or_default();
+        let shadow = shadow_code(iff, &word);
         Some(Definition {
             resource: object.resource,
             graphic: word(3) as u16,
@@ -260,6 +289,8 @@ impl Assets {
             wall_style: word(0x5c / 2),
             wall_shape: word(0xa2 / 2) as u16,
             slots,
+            shadow,
+            shadow_strength: word(SHADOW_STRENGTH),
         })
     }
 
@@ -348,6 +379,113 @@ pub fn slot_height(category: i32, z: f32) -> f32 {
 fn read_pools(install: &Install) -> Option<Pools> {
     let path = install.file("GameData/lightMap.dat").ok()?;
     Pools::parse(&std::fs::read(path).ok()?)
+}
+
+/// Definition words of the floor shadow: the tile's place in its group
+/// (high byte x, low byte y), the word that keeps a tile out of its
+/// neighbours' shadow, the shadow word and the strength.
+const GROUP: usize = 10;
+const GROUP_PLACE: usize = 11;
+const SHADOW_SKIP: usize = 56;
+const SHADOW: usize = 57;
+const SHADOW_STRENGTH: usize = 0x9e / 2;
+
+/// The shadow code of a definition whose words `word` gives, among the
+/// definitions of its file (0x4573e7, see [`crate::shadows`]).
+fn shadow_code(iff: &Iff, word: &impl Fn(usize) -> i16) -> Option<u8> {
+    if word(SHADOW) == -1 {
+        return None;
+    }
+    let group = word(GROUP);
+    if group == 0 {
+        return Some(word(SHADOW) as u8);
+    }
+    let places: Vec<u16> = iff
+        .all(b"OBJD")
+        .filter_map(|chunk| {
+            let data = iff.data(chunk);
+            let w = |n: usize| {
+                data.get(n * 2..n * 2 + 2)
+                    .map_or(0, |b| i16::from_le_bytes([b[0], b[1]]))
+            };
+            (w(GROUP) == group && w(SHADOW_SKIP) == 0 && w(SHADOW) != -1)
+                .then(|| w(GROUP_PLACE) as u16)
+        })
+        .collect();
+    let place = word(GROUP_PLACE);
+    let shaded = |x: i32, y: i32| {
+        x >= 0 && y >= 0 && x < 256 && y < 256 && places.contains(&(((x << 8) | y) as u16))
+    };
+    Some(shadows::group_code(
+        i32::from(place >> 8),
+        i32::from(place & 0xff),
+        shaded,
+    ))
+}
+
+/// One SPR2 frame of `floors.iff` as palette indices: its width, height,
+/// transparent index and, for each pixel, the index or None where the
+/// frame draws nothing.
+fn indices(floors: &Iff, id: u16) -> Option<(usize, usize, u8, Vec<Option<u8>>)> {
+    let data = floors.data(floors.get(b"SPR2", id)?);
+    let set = SpriteSet::parse(data).ok()?;
+    let frame = data.get(set.frames.first()?.clone())?;
+    let transparent = *frame.get(10)?;
+    let identity = Palette((0..=255u8).map(|i| [i; 3]).collect());
+    let decoded = sims_formats::sprite::Frame::decode(frame, &identity).ok()?;
+    let pixels = decoded
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| (p[3] != 0).then_some(p[0]))
+        .collect();
+    Some((
+        decoded.width as usize,
+        decoded.height as usize,
+        transparent,
+        pixels,
+    ))
+}
+
+/// A floor tile's shape for working out shadow masks: its indices, 255
+/// where it draws nothing or its transparent index (0x4a3cd3 and its
+/// decoder).
+fn tile_mask(floors: &Iff, id: u16) -> Option<Mask> {
+    let (width, height, transparent, pixels) = indices(floors, id)?;
+    let values = pixels
+        .into_iter()
+        .map(|p| p.filter(|&i| i != transparent).unwrap_or(255))
+        .collect();
+    Some(Mask {
+        width,
+        height,
+        values,
+    })
+}
+
+/// A hand-drawn shadow mask: its indices, with the transparent index
+/// where it draws nothing, and the runs of the transparent index at each
+/// row's two ends made 255 (0x4c90c1, 0x4c92af).
+fn drawn_mask(floors: &Iff, id: u16) -> Option<Mask> {
+    let (width, height, transparent, pixels) = indices(floors, id)?;
+    let mut values: Vec<u8> = pixels
+        .into_iter()
+        .map(|p| p.unwrap_or(transparent))
+        .collect();
+    for row in values.chunks_mut(width.max(1)) {
+        for v in row.iter_mut().take_while(|v| **v == transparent) {
+            *v = 255;
+        }
+        for v in row.iter_mut().rev().take_while(|v| **v == transparent) {
+            *v = 255;
+        }
+    }
+    Some(Mask {
+        width,
+        height,
+        values,
+    })
 }
 
 fn four(mut frame: impl FnMut(usize) -> Option<Image>) -> Option<[Image; 4]> {

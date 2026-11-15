@@ -12,30 +12,30 @@ use std::path::PathBuf;
 /// SHA-256 prefixes of the 16-bit-color images, by zoom, rotation and wall
 /// mode.
 const DIGESTS: &[(u32, u8, &str, &str)] = &[
-    (1, 0, "up", "54e2621655fd4a27"),
-    (1, 0, "cutaway", "e3b78dc4bf3f7f1b"),
-    (1, 1, "up", "f9714eb1d352181e"),
-    (1, 1, "cutaway", "8961a1ce1fc202bf"),
-    (1, 2, "up", "e0ac3dc00e5c81c4"),
-    (1, 2, "cutaway", "5ebaea8281b2d2c5"),
-    (1, 3, "up", "a9a4a0471eecadfc"),
-    (1, 3, "cutaway", "9fbc8e79d2c82ec7"),
-    (2, 0, "up", "a16a002443f5f7ad"),
-    (2, 0, "cutaway", "8a5dfa38fc77605f"),
-    (2, 1, "up", "031383489cd0201e"),
-    (2, 1, "cutaway", "637ce44aa32163ad"),
-    (2, 2, "up", "0a5aa9c3f0937f07"),
-    (2, 2, "cutaway", "ad62e54340174ebc"),
-    (2, 3, "up", "47784a20a0ef03fc"),
-    (2, 3, "cutaway", "c853eafa3d23261d"),
+    (1, 0, "up", "c02ffd52be0f4020"),
+    (1, 0, "cutaway", "8161dd22b9072349"),
+    (1, 1, "up", "6b1b54666cd6369a"),
+    (1, 1, "cutaway", "6ab23c0713539add"),
+    (1, 2, "up", "0c23946b1b0d62a6"),
+    (1, 2, "cutaway", "ab42c03675d369b8"),
+    (1, 3, "up", "50257ac7112e1089"),
+    (1, 3, "cutaway", "277e9ae90de423ab"),
+    (2, 0, "up", "cd107def71067342"),
+    (2, 0, "cutaway", "4f048b47c18e63a5"),
+    (2, 1, "up", "a5a6b05673d92486"),
+    (2, 1, "cutaway", "9afb0f7bc8d502ca"),
+    (2, 2, "up", "a08f208153492f12"),
+    (2, 2, "cutaway", "6c88362a2568df0c"),
+    (2, 3, "up", "db28ffc23ecf62eb"),
+    (2, 3, "cutaway", "fc047648adad175c"),
     (3, 0, "up", "ee27738e79627d30"),
     (3, 0, "cutaway", "7e00a434ec1318d5"),
-    (3, 1, "up", "6a8c50a608d21a5e"),
-    (3, 1, "cutaway", "4a2be1b592fc7c53"),
-    (3, 2, "up", "1d9f70bd44aa9b0f"),
-    (3, 2, "cutaway", "1d9f70bd44aa9b0f"),
-    (3, 3, "up", "e3098ea9898bd36f"),
-    (3, 3, "cutaway", "e3098ea9898bd36f"),
+    (3, 1, "up", "9dbeeaf9cf4ad84e"),
+    (3, 1, "cutaway", "cb2af648026d2261"),
+    (3, 2, "up", "f1029ce0059aea36"),
+    (3, 2, "cutaway", "f1029ce0059aea36"),
+    (3, 3, "up", "c383656350044d6b"),
+    (3, 3, "cutaway", "c383656350044d6b"),
 ];
 
 fn install() -> Option<PathBuf> {
@@ -154,4 +154,35 @@ fn hidden_objects_are_not_drawn() {
     );
     assert_eq!(after.objects, 0);
     assert_ne!(shown, hidden);
+}
+
+#[test]
+fn floor_shadows_fit_the_floor_tile_and_every_code_has_a_mask() {
+    let Some(root) = install() else {
+        return;
+    };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut opened = open_house(&root, &house).unwrap();
+    let guids: std::collections::BTreeSet<u32> =
+        opened.world.objects.values().map(|o| o.guid).collect();
+    let codes: std::collections::BTreeSet<u8> = guids
+        .iter()
+        .filter_map(|&g| opened.assets.definition(g)?.shadow)
+        .collect();
+    // Plants cast the first hand-drawn shadow; the bench, a group of two,
+    // casts worked-out ones across its shared side.
+    assert!(codes.contains(&0), "{codes:?}");
+    assert!(codes.iter().any(|&c| c != 0 && c != 16), "{codes:?}");
+    for zoom in 0..3 {
+        let tile = opened.assets.floor(0, zoom).unwrap();
+        let size = (tile.width, tile.height);
+        for &code in &codes {
+            for turns in 0..4 {
+                let code = sims_render::shadows::rotate(code, turns);
+                let mask = opened.assets.shadow_mask(zoom, code);
+                let mask = mask.unwrap_or_else(|| panic!("code {code} zoom {zoom}"));
+                assert_eq!((mask.width, mask.height), size, "code {code} zoom {zoom}");
+            }
+        }
+    }
 }

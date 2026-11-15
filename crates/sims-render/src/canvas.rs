@@ -333,6 +333,17 @@ impl Canvas {
         }
     }
 
+    /// Darkens what is at (`x`, `y`) by `light`, if it is at depth
+    /// `at_least` or farther, keeping its depth and ID: a shadow cast on
+    /// what is drawn there (0x4b10c4).
+    pub fn shade(&mut self, x: i32, y: i32, at_least: i32, light: Light) {
+        if let Some(i) = self.index(x, y)
+            && self.depth[i] >= at_least
+        {
+            self.color[i] = light.apply(self.color[i]);
+        }
+    }
+
     /// The image as the original shows it: 16-bit color (5 bits red, 6
     /// green, 5 blue), widened back to 8 bits a channel by repeating the
     /// high bits. The original runs its display in that mode, so a fair
