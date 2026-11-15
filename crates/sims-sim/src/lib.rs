@@ -31,6 +31,7 @@ pub mod pose;
 pub mod rooms;
 pub mod route;
 mod snapshot;
+pub mod speed;
 mod world;
 
 pub use error::Error;
