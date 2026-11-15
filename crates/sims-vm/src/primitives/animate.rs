@@ -48,8 +48,11 @@
 //! cleared, and the true branch is taken. It does not touch whether a
 //! clip plays (+0xa0), nor the base layer.
 //!
-//! **Not ported**, failing loudly: the base and carry slots (flag bits
-//! 0x01 and 0x10 alone), names
+//! The carry slot (flag bit 0x10 alone) plays its clip on its own, as
+//! `Machine::animate_carry` describes.
+//!
+//! **Not ported**, failing loudly: the base slot (flag bit 0x01 alone),
+//! names
 //! listed anywhere but the global animation tables and an object's own
 //! (byte 4 other than 3 and 0),
 //! a clip that is missing, the timed events `clip_events.rs` does not
@@ -123,11 +126,13 @@ impl Machine<'_, '_> {
                 .ok_or(Trap::native(8, "invalid Animate Sim parameter"))?;
         }
         let slot = (flags & 0x01) | if flags & 0x10 != 0 { 2 } else { 0 };
-        if slot == 1 || slot == 2 {
-            return Err(Trap::Unsupported(format!(
-                "Animate Sim on the {} slot (0x589571), which is not ported",
-                if slot == 1 { "base" } else { "carry" }
-            )));
+        if slot == 1 {
+            return Err(Trap::Unsupported(
+                "Animate Sim on the base slot (0x58957e), which is not ported".into(),
+            ));
+        }
+        if slot == 2 {
+            return self.animate_carry(a, operands, id);
         }
         if id == 0 {
             // 0x5897aa: the foreground slot is cleared as below (0x586b63),
@@ -173,11 +178,17 @@ impl Machine<'_, '_> {
             a.skin_dirty = true;
             layer.interruptible = i32::from(flags & 0x08 != 0);
             a.foreground = Some(layer);
+            // A new layer goes in before the carry layer (priority 10).
+            a.carry_first = false;
             a.slow = flags & 0x80 != 0;
             a.follow_rate = flags & 0x40 != 0;
             if slot == 3 {
-                // The carry slot is never filled here, so clearing it does
-                // nothing.
+                // The carry slot is cleared (virtual function 0x104,
+                // 0x592878): a layer there is removed at once, which marks
+                // the skin's layers changed.
+                if a.carry.take().is_some() {
+                    a.skin_dirty = true;
+                }
                 a.carry_selection = -1;
                 a.pickup = 1;
             }
@@ -319,6 +330,68 @@ impl Machine<'_, '_> {
     /// Fails for what is not ported: the other sources (1 and 2,
     /// 0x59defc and 0x59deb4), and a name that is not listed (the original
     /// reports a missing animation and plays its stand-in, 0x4f6e5b).
+    /// Animate Sim on the carry slot (flag 0x10 alone, 0x589683). It never
+    /// yields and always takes the true branch; the script's events are
+    /// not followed.
+    ///
+    /// Clip number 0 clears the carry slot (virtual function 0x104,
+    /// 0x592878: a layer there is removed at once, which marks the skin's
+    /// layers changed) and sets the carry mode (+0x1a8) to 0. Any other
+    /// clip is looked up as for the foreground (0x5893b3), the animator's
+    /// clock slowed or not by flag 0x80 (+0xa8), and the clip started in
+    /// the carry slot (0x592726), backward with flag 0x02: the slot is
+    /// cleared, the layer made at the animator's clock and put in the
+    /// skin's list ([`sims_sim::animator::Animator::carry_first`]). Then
+    /// the carry mode becomes 6, which keeps the animator's tick from
+    /// choosing a carry clip of its own (0x5903a3), and the layer repeats
+    /// at priority 10 (0x59867f, which marks the skin's layers changed).
+    /// Either way the carry selection (+0x1ac) becomes -1.
+    ///
+    /// The original goes on when the clip is not found (0x592726 then
+    /// fails, and 0x452bed reports it); here a clip that is not found
+    /// fails, as it does for the foreground.
+    fn animate_carry(
+        &mut self,
+        a: &mut Animator,
+        operands: &[u8; 8],
+        id: i16,
+    ) -> Result<Flow, Trap> {
+        let flags = operands[5];
+        if id == 0 {
+            if a.carry.take().is_some() {
+                a.skin_dirty = true;
+            }
+            a.carry_mode = 0;
+        } else {
+            read_appearance_if_stale(self.world, self.program, self.me, &mut a.profile_stale)?;
+            let (name, duration, frames, bound, tracks) = self.clip(operands, id)?;
+            a.slow = flags & 0x80 != 0;
+            if a.carry.take().is_some() {
+                a.skin_dirty = true;
+            }
+            let now = a.clock_at(self.world.ticks as i32);
+            let mut layer = Layer::start(
+                &name,
+                duration,
+                frames,
+                bound,
+                tracks,
+                flags & 0x02 != 0,
+                now,
+            );
+            // Made at priority 1, the layer goes in before the first layer
+            // whose priority is above that (0x599128).
+            a.carry_first = a.foreground.as_ref().is_some_and(|l| l.priority > 1);
+            layer.mode = 1;
+            layer.priority = 10;
+            a.skin_dirty = true;
+            a.carry = Some(layer);
+            a.carry_mode = 6;
+        }
+        a.carry_selection = -1;
+        Ok(Flow::Branch(true))
+    }
+
     fn clip(
         &self,
         operands: &[u8; 8],

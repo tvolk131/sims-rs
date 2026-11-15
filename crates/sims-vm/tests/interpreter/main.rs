@@ -23,6 +23,7 @@ mod presentation;
 mod random;
 mod removal;
 mod rooms;
+mod run_functional_tree;
 mod selection;
 mod services;
 mod set_to_next;

@@ -277,6 +277,102 @@ fn clip_0_stops_the_foreground_clip() {
     assert_eq!(fx.sim().person.as_ref().unwrap().data[19], 0);
 }
 
+/// A layer of the test clip, started at clock 0 with `tracks` motions
+/// with events.
+fn layer(tracks: usize) -> sims_sim::animator::Layer {
+    sims_sim::animator::Layer::start(CLIP, F32::from_bits(HUNDRED), 4, true, tracks, false, 0)
+}
+
+#[test]
+fn a_clip_starts_in_the_carry_slot_and_repeats() {
+    // 0x589683: the clip is looked up (reading the appearance again), the
+    // clock slowed by flag 0x80, and the clip started in the carry slot
+    // (0x592726), backward with flag 0x02; then the carry mode is 6 and
+    // the layer repeats at priority 10. The true branch is taken at once.
+    let mut fx = sim_animates(animate(1, 3, 0x10 | 0x80 | 0x02, 2, 0));
+    assert_eq!(turn(&mut fx).unwrap(), Status::Returned(true));
+    let a = &fx.world.animators[&SIM];
+    let carry = a.carry.as_ref().unwrap();
+    assert_eq!(carry.clip, CLIP);
+    assert_eq!(
+        (carry.priority, carry.mode, carry.interruptible),
+        (10, 1, -1)
+    );
+    assert_eq!((carry.current, carry.speed.to_bits()), (420, 0xbf80_0000));
+    assert_eq!(carry.phase.to_bits(), 0x3f80_0000);
+    assert_eq!((a.carry_mode, a.carry_selection), (6, -1));
+    assert!(a.slow && a.skin_dirty && !a.profile_stale && !a.carry_first);
+    // Nothing else changes: no foreground clip, nothing playing, and the
+    // next foreground layer still takes the raised priority.
+    assert!(a.foreground.is_none() && !a.playing && a.promote);
+    assert_eq!((a.state, a.selection), (3, -1));
+}
+
+#[test]
+fn the_carry_layer_goes_before_a_foreground_layer_of_raised_priority() {
+    // 0x599128: made at priority 1, the layer goes in before the first
+    // layer whose priority is above 1.
+    for (priority, first) in [(6, true), (1, false)] {
+        let mut fx = sim_animates(animate(1, 3, 0x10, 0, 0));
+        let mut foreground = layer(0);
+        foreground.priority = priority;
+        fx.world.animators.insert(
+            SIM,
+            sims_sim::animator::Animator {
+                foreground: Some(foreground),
+                ..LOADED
+            },
+        );
+        turn(&mut fx).unwrap();
+        assert_eq!(fx.world.animators[&SIM].carry_first, first);
+    }
+    // A new foreground layer goes in before the carry layer.
+    let mut fx = sim_animates(animate(1, 3, 0, 0, 0));
+    fx.world.animators.insert(
+        SIM,
+        sims_sim::animator::Animator {
+            carry: Some(layer(0)),
+            carry_mode: 6,
+            carry_first: true,
+            ..LOADED
+        },
+    );
+    turn(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert!(!a.carry_first && a.carry.is_some() && a.foreground.is_some());
+}
+
+#[test]
+fn clip_0_clears_the_carry_slot_and_a_pickup_clears_it_too() {
+    // 0x589693: the slot is cleared (0x592878), the carry mode 0 and the
+    // carry selection -1; the true branch is taken.
+    let carrying = || sims_sim::animator::Animator {
+        carry: Some(layer(0)),
+        carry_mode: 6,
+        carry_selection: 3,
+        ..LOADED
+    };
+    let mut fx = sim_animates(animate(0, 3, 0x10, 0, 0));
+    fx.world.animators.insert(SIM, carrying());
+    assert_eq!(turn(&mut fx).unwrap(), Status::Returned(true));
+    let a = &fx.world.animators[&SIM];
+    assert!(a.carry.is_none() && a.skin_dirty);
+    assert_eq!((a.carry_mode, a.carry_selection), (0, -1));
+    // A foreground clip that picks something up (flags 0x11) clears the
+    // carry slot as it starts (0x589907); the carry mode stays.
+    let mut fx = sim_animates(animate(1, 3, 0x11, 0, 0));
+    fx.world.animators.insert(SIM, carrying());
+    assert_eq!(turn(&mut fx).unwrap(), Status::Yielded);
+    let a = &fx.world.animators[&SIM];
+    assert!(a.carry.is_none() && a.foreground.is_some());
+    assert_eq!((a.carry_mode, a.carry_selection, a.pickup), (6, -1, 1));
+    // The reset (0x589220) empties the slot too.
+    let mut a = carrying();
+    a.reset().unwrap();
+    assert!(a.carry.is_none() && a.skin_dirty);
+    assert_eq!((a.carry_mode, a.carry_selection), (0, -1));
+}
+
 /// Marks the clip in the foreground slot as ended.
 fn end_clip(fx: &mut Fixture) {
     fx.world
@@ -293,7 +389,6 @@ fn end_clip(fx: &mut Fixture) {
 fn what_animate_sim_does_not_port_fails_loudly() {
     for (operands, what) in [
         (animate(1, 3, 0x01, 0, 0), "base slot"),
-        (animate(1, 3, 0x10, 0, 0), "carry slot"),
         (animate(1, 1, 0, 0, 0), "source 1"),
         (animate(2, 3, 0, 0, 0), "not listed"),
     ] {
@@ -765,6 +860,74 @@ fn a_clips_timed_events_are_handled_as_it_plays() {
     );
     let person = &fx.sim().person.as_ref().unwrap().data;
     assert_eq!((person[22], person[23], person[30]), (7, 3, 2));
+}
+
+#[test]
+fn the_carry_layer_plays_with_the_foreground_in_the_skins_order() {
+    // 0x5992b3 updates the skin's layers in its list's order, so the
+    // events of the layer that comes first are queued first. The carry
+    // layer repeats at its end (end mode 1).
+    for (carry_first, queued) in [(false, [1, 2]), (true, [2, 1])] {
+        let mut fx = standing();
+        fx.program.animations.insert(
+            "test.far",
+            Clip {
+                name: CLIP.into(),
+                skill: SKILL.into(),
+                duration: HUNDRED,
+                distance: 0,
+                moving: false,
+                frames: 4,
+                motions: 1,
+                tracks: vec![track(&[(0, &[("xevt", "1")])])],
+                channels: Vec::new(),
+                samples: [0, 0],
+            },
+        );
+        fx.program.animations.insert(
+            "carry.far",
+            Clip {
+                name: "carry-clip".into(),
+                skill: SKILL.into(),
+                duration: HUNDRED,
+                distance: 0,
+                moving: false,
+                frames: 4,
+                motions: 1,
+                tracks: vec![track(&[(0, &[("xevt", "2")])])],
+                channels: Vec::new(),
+                samples: [0, 0],
+            },
+        );
+        let start = |clip: &str, now| {
+            sims_sim::animator::Layer::start(clip, F32::from_bits(HUNDRED), 4, true, 1, false, now)
+        };
+        let mut carry = start("carry-clip", 500);
+        carry.mode = 1;
+        carry.priority = 10;
+        fx.world.animators.insert(
+            SIM,
+            sims_sim::animator::Animator {
+                foreground: Some(start(CLIP, 500)),
+                carry: Some(carry),
+                carry_mode: 6,
+                carry_first,
+                ..LOADED
+            },
+        );
+        tick(&mut fx).unwrap();
+        assert_eq!(fx.world.animators[&SIM].events, queued);
+        // Two more ticks reach the clips' end: the foreground clip stops,
+        // the carry clip goes on.
+        tick(&mut fx).unwrap();
+        tick(&mut fx).unwrap();
+        let a = &fx.world.animators[&SIM];
+        assert!(a.foreground.as_ref().unwrap().finished());
+        let carry = a.carry.as_ref().unwrap();
+        assert_eq!((carry.current, carry.speed.to_bits()), (600, 0x3f80_0000));
+        assert_eq!(carry.phase.to_bits(), 0x3f80_0000);
+        assert_eq!(a.carry_mode, 6);
+    }
 }
 
 #[test]

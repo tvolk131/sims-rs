@@ -154,16 +154,8 @@ impl Machine<'_, '_> {
         let Some(wanted) = wanted(function) else {
             return Ok(false);
         };
-        if function == PERSON_FUNCTION {
-            let Some(person) = self.me()?.person.as_ref() else {
-                return Ok(false);
-            };
-            let value = person.data.get(PERSON_WORD_65).copied().ok_or_else(|| {
-                Trap::Invalid(format!("person has no data word {PERSON_WORD_65}"))
-            })?;
-            if value > 1 {
-                return Ok(false);
-            }
+        if function == PERSON_FUNCTION && !self.may_ask_function_8()? {
+            return Ok(false);
         }
         let flags = operands[6];
         let origin = if flags & 8 != 0 {
@@ -293,6 +285,21 @@ impl Machine<'_, '_> {
     }
 
     /// Puts a score in my data word 66.
+    /// Whether the running object may ask for function 8: it is a person
+    /// (the original's `dynamic_cast` to its person class, 0x635abe) whose
+    /// data word 65 (+0x60e) is at most 1. Find Best Object for Function
+    /// and Run Functional Tree both ask.
+    pub(super) fn may_ask_function_8(&self) -> Result<bool, Trap> {
+        let Some(person) = self.me()?.person.as_ref() else {
+            return Ok(false);
+        };
+        let value =
+            person.data.get(PERSON_WORD_65).copied().ok_or_else(|| {
+                Trap::Invalid(format!("person has no data word {PERSON_WORD_65}"))
+            })?;
+        Ok(value <= 1)
+    }
+
     fn set_score(&mut self, score: i16) -> Result<(), Trap> {
         *self
             .me_mut()?

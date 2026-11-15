@@ -43,6 +43,91 @@ about 63% to 65%, 0.125π 28%, and 0.1π 99.4%. Rotation 0 is unchanged:
 constructor value applies to them. Sending message 0xdd (probably a
 debug command) would tilt the sun; it is not modelled.
 
+## 2026-11-14: Run Functional Tree, and K = 417
+
+Tick 417 of the Goth house stopped on Run Functional Tree (opcode 20),
+node 7 of person 21's bookcase tree (0x1014). The handler is `0x44f681`.
+It is reached through the general primitive table for every object; the
+person's dispatcher does not take opcode 20.
+
+- **The function table** is the jump table at `0x44f76a`:
+  - functions 0 to 7 name callbacks 0x12 to 0x19;
+  - 8 names 0x1a, 9 names 0x1b, 10 names 0x0e, 11 names 0x1c;
+  - 12 names 0x10, 13 names 0x11, 14 names 0x1d.
+
+  Any other function is false; the comparison is unsigned, so a function
+  below 0 is false too. Function 8 asks the same person check as Find
+  Best Object for Function (`may_ask_function_8`). Unlike that
+  primitive's table, functions 4, 5 and 9 have callbacks here.
+- **The action** is the first word of the callback's entry (`0x455fa9`),
+  and 0 past the table's end. An action of 0 is false.
+- **The push** is the running object's virtual function 0x34, the push
+  Run Tree By Name's mode 2 makes: the running object is woken, the tree
+  of the stack object's type gets the running object's temps (a null
+  arguments pointer, `0x47484a`), and a person starts using the stack
+  object (`0x45e59b`).
+- **The flag** (byte 2, bit 0) goes into the person's use. A set flag
+  also writes person +0xa54, which is not modeled, so it fails loudly.
+- **The return branches like a call.** The handler returns 3 without
+  writing the frame's state (`0x44f75c`), while Run Tree By Name writes
+  1 first (`0x44bc3d`). So the return takes the branch of the tree's
+  result, as a subroutine's does. This contradicts the legacy note that
+  Run Functional Tree resumes; the interpreter comment is corrected.
+- **Error codes.** A missing stack object is native error 0x15, thrown
+  before the function is read. A tree the type lacks fails loudly here;
+  the original's push would give false.
+- **K = 417.** After the tick, person 21's frames and object uses equal
+  the capture's: 174 at depth 7, 52 at depth 8.
+- **The verifier compares the carry layer now.** The capture shows the
+  carry slot filled, as ours is. The layer's own fields are on a page
+  the capture lacks, so they stay unverified.
+
+Reopen if a capture shows a functional tree's return resuming the
+primitive instead of branching.
+
+## 2026-11-14: Animate Sim on the carry slot
+
+Tick 417 of the Goth house stopped on an Animate Sim with flag 0x10
+alone: person 21's bookcase tree (0x1014, node 19) plays a clip on the
+carry slot (animator +0x13c). The original's path is `0x589683`.
+
+- **The animator keeps the carry layer** (`Animator::carry`, snapshot
+  format 21). Like the foreground layer, its update hands timed events
+  to the animator, which scripts can read (the event queue, the hands).
+  The base layer stays a flag because its clips have no events.
+- **The path, as the disassembly shows it.** Clip 0 clears the slot
+  (`0x592878`) and sets the carry mode to 0. Any other clip is looked up
+  as for the foreground (`0x5893b3`, which reads the appearance again
+  when stale). Flag 0x80 slows the clock. The clip starts in the slot
+  (`0x592726`), backward with flag 0x02. The carry mode becomes 6, and
+  the layer is set to repeat (mode 1) at priority 10 (`0x59867f`). Both
+  ways the carry selection becomes -1 and the true branch is taken, with
+  no yield and no events followed.
+- **The skin's list order is kept** (`Animator::carry_first`). The
+  skin's update goes through its layers in list order (`0x5992b3`), so
+  whichever layer comes first has its timed events handled first.
+  Every layer is made at priority 1 and put in before the first layer
+  whose priority is above 1 (`0x599128`); its own priority is set
+  afterwards. So a carry layer goes before a foreground layer of raised
+  priority (6) and after one of priority 1. A new foreground layer
+  always goes before the carry layer (10).
+- **Removal is immediate.** `0x592878` fades a layer out only when byte
+  0x6f6bd0 is set, which holds 0 in a running game. So the reset, a
+  pickup clip (flags 0x11) and clip 0 each remove the carry layer at
+  once.
+- **Still failing loudly:**
+  - a clip the lookup does not find (the original reports it and goes
+    on);
+  - the head's pose while a carry layer plays (its bones could share the
+    foreground's path to the head);
+  - the base slot (flag 0x01 alone);
+  - the animator's own carry clip (0x26).
+- **Unverified:** the carry layer's fields against a capture. The tick
+  stops before it ends, at Run Functional Tree.
+
+Reopen if a capture shows the carry layer elsewhere in the skin's list,
+or a carry clip that is not found and still plays.
+
 ## 2026-11-14: Two more cameras compared with the original
 
 The original was shot at two more cameras, walls up, after the load's
