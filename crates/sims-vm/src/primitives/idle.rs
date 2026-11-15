@@ -16,17 +16,39 @@
 //! - Nothing interrupts and the count is not 0: the count goes down by
 //!   one and the thread yields, to run this instruction again next turn.
 //! - Something interrupts: bit 0x40 is set. Without operand word 1, or
-//!   with an empty action queue, the branch is true. Otherwise the
-//!   original takes the front action off the queue and starts it
-//!   (0x45dc14 onwards: 0x45f77b, 0x4582ad, 0x458319, 0x45e6cd), which is
-//!   **not ported** and fails loudly. (When the frame resumes a dispatch,
-//!   only an action pushed to the front is started; resuming a primitive
-//!   already fails in the interpreter.)
+//!   with an empty action queue, the branch is true. When the frame's
+//!   primitive state is 1 (the instruction started an action whose tree
+//!   has returned), the branch is also true unless the front action was
+//!   pushed to the front (its flag 2). Otherwise the front action is
+//!   started (0x45dc14 to 0x45dd1f):
+//!
+//!   1. It is taken off the queue (0x45f77b). One with no target is
+//!      dropped, and the thread yields.
+//!   2. It is checked as the pie menu checks it
+//!      ([`Machine::check_chosen`], 0x4582ad and 0x458319 without
+//!      advertisements).
+//!   3. If the check leaves flag 8 and the action has an action tree, the
+//!      tree is pushed as the person's virtual function 0x34 does
+//!      (0x45e59b: the person is woken, the tree of the target's type is
+//!      pushed with the target as its stack object and the action's four
+//!      arguments, and the person starts using the target). The action
+//!      becomes the running one (0x45e6cd), the count parameter becomes
+//!      0, the frame's primitive state 1, and bit 0x40 stays set; the
+//!      pushed tree runs next. When it returns, the instruction runs
+//!      again (0x474daa).
+//!   4. Otherwise the target is asked to run its function 4, the action
+//!      cancelled, with me as its stack object (0x422d46), and the thread
+//!      yields; the instruction runs again next turn.
+//!
+//!   Either way the person's temps, if the check tree's run saved them,
+//!   are put back last (0x4582dd). A tree that cannot be pushed in step 3
+//!   (the original then takes step 4) fails loudly.
 //!
 //! Ported from the original's code (above) and checked against the old
 //! prototype's `idle_for_input`, `idle_decision` and `should_interrupt`
 //! (legacy/crates/sims-vm/src/action.rs), which agree on these paths.
 
+use crate::autonomy::checked;
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine, word};
 use sims_core::{Ext, F32};
@@ -50,6 +72,13 @@ const MOTIVE_9: usize = 9; // +0x7b0
 
 /// Action flag 2 (+0x40 of a queue entry): pushed to the front.
 const PUSHED_TO_FRONT: u32 = 2;
+
+/// The frame's primitive state once the instruction started an action
+/// (0x45dce4).
+pub(crate) const STARTED: i32 = 1;
+
+/// The object function that tells a target its action was cancelled.
+const CANCELLED: usize = 4;
 
 /// The global that holds the lot's house number.
 const LOT: usize = 10;
@@ -87,9 +116,96 @@ impl Machine<'_, '_> {
         if word(operands, 2) == 0 || !queued {
             return Ok(Flow::Branch(true));
         }
-        Err(Trap::Unsupported(
-            "Idle For Input starting the queued action (0x45dc14) is not ported".into(),
-        ))
+        if self.frame()?.primitive_state == STARTED {
+            let pushed = self
+                .me()?
+                .person
+                .as_ref()
+                .and_then(|p| p.queue.first())
+                .is_some_and(|front| front.flags & PUSHED_TO_FRONT != 0);
+            if !pushed {
+                return Ok(Flow::Branch(true));
+            }
+        }
+        self.start_queued(index)
+    }
+
+    /// Starts the front queued action (0x45dc14 to 0x45dd1f; see the
+    /// module's documentation). `index` is the count parameter's.
+    fn start_queued(&mut self, index: usize) -> Result<Flow, Trap> {
+        let action = self
+            .me_mut()?
+            .person
+            .as_mut()
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .queue
+            .remove(0);
+        if action.target == 0 {
+            return Ok(Flow::Yield);
+        }
+        let target = u16::try_from(action.target)
+            .ok()
+            .filter(|id| self.world.objects.contains_key(id))
+            .ok_or_else(|| {
+                Trap::Invalid(format!(
+                    "a queued action's target, object {}, is not there",
+                    action.target
+                ))
+            })?;
+        let mut saved = None;
+        let flow = self.check_and_start(action, target, index, &mut saved);
+        // The temps go back however the start ended (0x4582dd, also on
+        // the original's unwinding, 0x64e050).
+        if let Some(temps) = saved {
+            self.me_mut()?.temps = temps;
+        }
+        flow
+    }
+
+    /// Checks the action taken off the queue and starts or cancels it
+    /// (0x45dc74 to 0x45dd00).
+    fn check_and_start(
+        &mut self,
+        mut action: sims_formats::saved_objects::Interaction,
+        target: u16,
+        index: usize,
+        saved: &mut Option<Vec<i16>>,
+    ) -> Result<Flow, Trap> {
+        let me = self.me;
+        self.check_chosen(&mut action, saved)?;
+        let flow = if action.flags & checked::PASSED != 0 && action.action != 0 {
+            let frame = self.me()?.stack.len() - 1;
+            let tree = action.action;
+            self.wake(me)?;
+            self.enter_on(target, tree, &action.args).map_err(|fault| {
+                Trap::Unsupported(format!(
+                    "Idle For Input could not push tree {tree:#06x} of object {target}, where \
+                     the original cancels the action: {fault}"
+                ))
+            })?;
+            self.count_use(target)?;
+            let last_result = self.me()?.last_result;
+            self.set_action(action, last_result)?;
+            let object = self.me_mut()?;
+            let idle = &mut object.stack[frame];
+            idle.parameters[index] = 0;
+            idle.primitive_state = STARTED;
+            if let Some(top) = object.stack.last_mut() {
+                top.stack_object = target as i16;
+            }
+            self.flags_mut()?[FLAGS] |= INTERRUPTED;
+            Flow::Pushed
+        } else {
+            self.interpreter()
+                .callback(self.world, target, CANCELLED, me as i16)
+                .map_err(|fault| {
+                    Trap::Unsupported(format!(
+                        "cancelling a queued action on object {target} (0x45dcc8): {fault}"
+                    ))
+                })?;
+            Flow::Yield
+        };
+        Ok(flow)
     }
 
     fn flags_mut(&mut self) -> Result<&mut Vec<i16>, Trap> {

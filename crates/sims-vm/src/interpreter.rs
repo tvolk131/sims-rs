@@ -813,7 +813,8 @@ impl<'a> Machine<'a, '_> {
         // their route is at in the frame's primitive state and go on from
         // there (0x45abce, 0x45c634); Look Towards keeps whether its turn
         // started (0x45ab79).
-        if state != 0 && !matches!(instruction.opcode, 22 | 27 | 45) {
+        // Idle For Input keeps whether it started an action (0x45dce4).
+        if state != 0 && !matches!(instruction.opcode, 17 | 22 | 27 | 45) {
             return Err(Trap::Unsupported(format!(
                 "resuming primitive {} with saved state {state:#x}",
                 instruction.opcode
@@ -932,10 +933,12 @@ impl<'a> Machine<'a, '_> {
                         // The frame's next step finishes the primitive.
                         return Ok(Status::Running);
                     }
-                    if state != 0 && matches!(self.current()?.opcode, 27 | 45) {
+                    if state != 0 && matches!(self.current()?.opcode, 17 | 27 | 45) {
                         // A route that ran a door's tree goes on from the
-                        // step its frame holds (0x474daa: a frame with a
-                        // primitive state runs its instruction again).
+                        // step its frame holds, and Idle For Input that
+                        // started an action looks at the queue again
+                        // (0x474daa: a frame with a primitive state runs
+                        // its instruction again).
                         return Ok(Status::Running);
                     }
                     if state != 0 {
