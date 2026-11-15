@@ -2821,6 +2821,9 @@ fn the_goth_house_first_tick_matches_the_original() {
         let error = interpreter
             .lot_update(world, &tuning, &mut player)
             .unwrap_err();
-        assert!(error.to_string().contains("unsupported scope 33"), "{error}");
+        assert!(
+            error.to_string().contains("unsupported scope 33"),
+            "{error}"
+        );
     });
 }
