@@ -193,6 +193,11 @@ fn world() -> World {
             }],
             relationships_changed: true,
         },
+        advertisement_record: Some(std::array::from_fn(|i| sims_sim::Advertisement {
+            personality: i as i16,
+            minimum: -(i as i16),
+            delta: 100 + i as i16,
+        })),
         animators: BTreeMap::from([(5, animator())]),
         usage: HouseUsage {
             history: [
@@ -368,7 +373,24 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "23e9f53ef9c6129ef25795acb31d097cce39ddb0401b852212b4a4f96e49cdcd";
+const PINNED: &str = "a4e74a05e62ae6eaff009cb2b32fe752b07cc739492dc1d964c585d53e0d2d65";
+
+#[test]
+fn without_the_advertisement_record_the_encoding_is_format_21() {
+    // Snapshot format 22 added the advertisement record at the end.
+    assert_eq!(digest(&format_21_bytes(&world())), PINNED_21);
+}
+const PINNED_21: &str = "23e9f53ef9c6129ef25795acb31d097cce39ddb0401b852212b4a4f96e49cdcd";
+
+/// The encoding of `world` as snapshot format 21 wrote it: without the
+/// advertisement record ([`World::advertisement_record`]) that format 22
+/// added at the end. The older formats' encodings start from this one.
+fn format_21_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let record = postcard::to_allocvec(&world.advertisement_record).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - record.len()), record);
+    bytes
+}
 
 #[test]
 fn without_the_carry_layer_the_encoding_is_format_20() {
@@ -389,16 +411,16 @@ fn animator_20_bytes(animator: &Animator) -> Vec<u8> {
 }
 
 /// The encoding of `world` as snapshot format 20 wrote it: each animator
-/// as [`animator_20_bytes`] writes it. The older formats' encodings start
-/// from this one.
+/// as [`animator_20_bytes`] writes it. It starts from
+/// [`format_21_bytes`], and the older formats' encodings from this one.
 fn format_20_bytes(world: &World) -> Vec<u8> {
     let blank = World {
         animators: BTreeMap::new(),
         ..world.clone()
     };
     splice(
-        &world.encode(),
-        &blank.encode(),
+        &format_21_bytes(world),
+        &format_21_bytes(&blank),
         &postcard::to_allocvec(&world.animators).unwrap(),
         &[0],
         &map_bytes(&world.animators, animator_20_bytes),

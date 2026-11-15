@@ -420,18 +420,21 @@ impl Machine<'_, '_> {
                     ))
                 })?)
             }
-            // The advertisements Find Best Interaction copied for the
-            // check tree that runs (0x453a09, 0x453a42, 0x453a7a): six
-            // bytes each, the personality number (28), the minimum (29)
-            // and the delta (12). An index outside them is native error
-            // 0x1a. Outside a check tree the record holds the last ones
-            // copied, which are not kept.
+            // The advertisement record (0x453a09, 0x453a42, 0x453a7a read
+            // [0x6c437c], the record at 0x6e5100): the advertisements Find
+            // Best Interaction last copied, in a check tree or anywhere
+            // after. Six bytes each, the personality number (28), the
+            // minimum (29) and the delta (12). An index outside its count
+            // (16) is native error 0x1a. Before the first copy the record
+            // holds what the game's start left there, which is not read.
             12 | 28 | 29 => {
-                let count = self
-                    .advertisements
-                    .as_ref()
-                    .ok_or(unsupported(scope))?
-                    .len();
+                if self.world.advertisement_record.is_none() {
+                    return Err(Trap::Unsupported(format!(
+                        "scope {scope} reads the advertisement record (0x6e5100) before \
+                         Find Best Interaction first copies into it"
+                    )));
+                }
+                let count = sims_sim::ADVERTISEMENTS;
                 let field = match scope {
                     28 => 0,
                     29 => 1,
@@ -526,7 +529,8 @@ impl Machine<'_, '_> {
             }
             Cell::StackObject => Ok(self.frame()?.stack_object),
             Cell::Advertisement(i, field) => self
-                .advertisements
+                .world
+                .advertisement_record
                 .as_ref()
                 .and_then(|ads| ads.get(i))
                 .map(|ad| ad.field(field))
@@ -584,7 +588,8 @@ impl Machine<'_, '_> {
         }
         if let Cell::Advertisement(i, field) = cell {
             let ad = self
-                .advertisements
+                .world
+                .advertisement_record
                 .as_mut()
                 .and_then(|ads| ads.get_mut(i))
                 .ok_or_else(|| Trap::Invalid("no advertisement".into()))?;

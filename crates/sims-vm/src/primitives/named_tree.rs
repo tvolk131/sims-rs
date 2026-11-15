@@ -42,8 +42,9 @@
 //!   the tree runs above my frames and they are untouched. Mode 1 when the
 //!   stack object is me is the same run.
 //!
-//! In modes 0 and 1, the advertisements a check tree may change (the
-//! global record at 0x6c437c) stay the same record through the run.
+//! The advertisements a check tree may change are one global record
+//! (0x6c437c, [`sims_sim::World::advertisement_record`]), the same through
+//! any run.
 //!
 //! A string table other than 303 fails loudly.
 
@@ -100,9 +101,6 @@ impl Machine<'_, '_> {
             // Mode 0 runs on my thread and mode 1 on the stack object's.
             let thread = if operands[5] == 0 { self.me } else { target };
             let temps = self.world.objects[&thread].temps.clone();
-            // The advertisements a check tree changes are one global record
-            // (0x6c437c), which the run keeps.
-            let mut advertisements = self.advertisements.take();
             let result = self.interpreter().call_as(
                 self.world,
                 thread,
@@ -112,9 +110,8 @@ impl Machine<'_, '_> {
                 &temps,
                 temps.len(),
                 TURN_BUDGET,
-                &mut advertisements,
+                self.checking,
             );
-            self.advertisements = advertisements;
             let result = result.map_err(|fault| {
                 Trap::Unsupported(format!(
                     "Run Tree By Name mode {}: tree {tree:#06x} of object {target} on \
