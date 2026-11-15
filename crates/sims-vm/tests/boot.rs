@@ -640,6 +640,62 @@ fn the_player_cancels_the_snack_queued_and_running() {
     );
 }
 
+/// The player cancels the snack Mortimer is eating (play mode, the snack
+/// order, cancelled at step 900): his trees see the cancel and he puts
+/// the snack down with Drop (opcode 5, 0x454430), one tile in front of
+/// him, then stops.
+#[test]
+fn a_cancelled_snack_is_put_down_in_front_of_the_eater() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    let sim = lot.load_report().finished.unwrap().sim.unwrap();
+    let snack = 263;
+    for _ in 0..50 {
+        assert!(lot.step_play().unwrap().errors.is_empty());
+    }
+    assert!(lot.queue_interaction(sim, 118, 1).unwrap().is_some());
+    for step in 51..900 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+    }
+    let person = |lot: &Lot| lot.world().objects[&sim].person.clone().unwrap();
+    // He eats the snack he holds in his first container slot.
+    let eating = person(&lot).active;
+    assert_eq!((eating.uid, eating.target), (5, snack as i16));
+    let held = |lot: &Lot| lot.world().objects[&sim].slots[1].object;
+    assert_eq!(held(&lot), snack as i16);
+    assert!(lot.cancel(sim, eating.uid).unwrap().counts);
+    for step in 900..1009 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+        assert_eq!(held(&lot), snack as i16, "step {step}");
+    }
+    // Step 1009: his tree 0x0139 (node 14) drops it. He stands at (296,
+    // 456) facing 6, so it goes to (296, 440), on his level.
+    let update = lot.step_play().unwrap();
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    assert_eq!(held(&lot), 0);
+    let me = &lot.world().objects[&sim];
+    assert_eq!((me.position, me.data[1]), ([296, 456, 1], 6));
+    assert_eq!(lot.world().objects[&snack].position, [296, 440, 1]);
+    // Step 1028: the cancelled action ends, and he is free.
+    for step in 1010..1028 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+        assert_eq!(person(&lot).active.uid, 5, "step {step}");
+    }
+    let update = lot.step_play().unwrap();
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    let free = person(&lot);
+    assert_eq!(free.active.uid, 0);
+    assert!(free.queue.is_empty());
+}
+
 #[test]
 fn a_paused_goth_house_goes_on_updating_with_its_clock_standing() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
