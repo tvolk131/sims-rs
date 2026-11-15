@@ -1553,6 +1553,21 @@ mod tests {
     }
 
     #[test]
+    fn an_edge_on_diagonal_shows_the_side_facing_view_minus_one_one() {
+        // Face-on walls show the side facing the camera.
+        assert_eq!(shown_side([1, 0]), 0);
+        assert_eq!(shown_side([1, 1]), 0);
+        assert_eq!(shown_side([0, -1]), 1);
+        assert_eq!(shown_side([-1, -1]), 1);
+        // The Goths' bay ends: at rotation 0 the ascending diagonal's
+        // normal (1, -1) points away from (-1, 1), so its other side (the
+        // shingles) shows; at rotation 1 the descending one's turns to
+        // (-1, 1), and its own side shows. Both checked on screen.
+        assert_eq!(shown_side(rotate_direction(0, [1, -1])), 1);
+        assert_eq!(shown_side(rotate_direction(1, [1, 1])), 0);
+    }
+
+    #[test]
     fn view_directions_turn_with_the_camera() {
         assert_eq!(view_direction(0, &camera(0)), 1);
         assert_eq!(view_direction(2, &camera(0)), 4);
