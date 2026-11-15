@@ -217,7 +217,7 @@ impl Mixer {
         self.player.render_stereo(frames, &self.sources)
     }
 
-    /// Faults not reported yet, each once, up to [`REPORTED`] of them; a
+    /// Faults not reported yet, each once, up to `REPORTED` of them; a
     /// last line says when more are no longer shown. The player's list is
     /// emptied each time, so neither it nor this one grows without end.
     pub fn new_faults(&mut self) -> Vec<String> {
