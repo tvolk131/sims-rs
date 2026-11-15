@@ -76,6 +76,171 @@ player. The original does it on the lot in single player, and #138 made
 `Lot` do the same; the vision's rule is for multiplayer and is to be
 settled there. Reopen when multiplayer lists menus, or when a recording
 shows a listing at another moment.
+
+## 2026-11-15: The ambience follows the outdoor share of the screen, as the original works it out
+
+The camera value that moves the ambient score's row is ported from the
+original's code (0x570c3e, which its sound manager runs each frame at
+0x574161): `sims_audio::ambience::view`. It walks the screen in rows half
+a tile high (`height / (4 << zoom)` rows of `width / (16 << zoom)` tiles),
+from the view tile under the top left pixel, and counts the tiles on the
+floor shown whose tile flag 4 is set, "outside every enclosure" (read by
+0x489260, which first turns the view tile back by the camera's rotation).
+The value is `outside / counted * 100.0` on the FPU, cut toward zero; with
+nothing counted the division gives NaN, which `__ftol` makes 0. Below 30
+the player takes it as 0, as before.
+
+`sims_sim::World::outside(level, tile)` is the read: the tile's flag 4
+in arrays 8 and 108, as the last room rebuild left them. It only reads,
+so the world's hash and strict mode's output are unchanged. `sims-game`
+sends `Game::ambience_view` to the mixer with the hour and speed, in
+place of the fixed 50 it used. On the Goth house at 800 by 600 it gives
+about 92 at the far zoom, 79 at the medium zoom and 26 to 37 near.
+
+**Unverified.** Which tiles count: the walk takes a view column and row
+from one past the lot's bounds (lot +0x70 to +0x7c) to one short. The
+bounds are taken as the 64-tile arrays' 0 and 63 (tiles 1 to 62), which
+is the same in every rotation; `sims_vm`'s on-lot check makes the same
+compare with the same unverified values. The corner tile is asked of the
+original's camera (its function 4, with 1) and taken here as the ground
+level's fine position under the pixel; and the screen size is the house
+view's. None of the values has been compared with the running game.
+Reopen when a run with sound can be compared, or when the lot's bounds
+are read.
+
+## 2026-11-15: An edge-on diagonal wall stands 300 nearer, anchored halfway along
+
+At the bay's two ends the original shows the outside shingles; we showed
+the inside wallpaper at the left end. It is not a side the original
+picks. What the original shows there is mostly the straight bay walls'
+side faces, which come out from behind the diagonal; the edge-on
+diagonal (frame 3) is hidden behind them. We drew the diagonal too
+near, so it covered them.
+
+**The side (read, not ported).** Each run in the original stores two
+patterns per entry: ascending runs [p2, p3] and descending runs
+[p3, p2], slot 0 (0x53f6c1, 0x53f3e9). When the view rotates, the run is
+turned (0x53d93a). It is reversed when its end sorts before its start
+(0x44054c), which swaps every entry's sides, and the slot comes from the
+table at 0x53db21. So the original's edge-on diagonal shows the side
+facing view direction (−1, 1). Which lot side that is changes with the
+rotation.
+
+Ours shows `patterns[3]` for every edge-on diagonal at every rotation,
+so at some rotations it is the other side. That is not changed here.
+Where the original's diagonal does show (column x = 75 above), neither
+side's texels match the original's. That is the texel offset already
+recorded as unread, so the screenshots cannot check a side rule. Reopen
+with that offset.
+
+**The depth.** For wall kind 0x20 (edge-on), 0x4c7be2 stores −300.
+The row loop (0x4c4907) adds it to every row's depth. Each row's depth
+otherwise comes from 0x49a5d3, which is `Depth::stand`. Kind 0x10 (the
+diagonal face-on, frame 2) and the straight walls get 0.
+
+**The anchor.** With the −300 alone, the anchor has to be halfway
+between the wall's two ends on screen, not at its lower end. At the
+medium-zoom depth capture (rotation 0, origin [335, −560]) that gives
+the original's depth exactly:
+
+- in column x = 75, rows 180, 210, 240 and 270, the one column where the
+  original's diagonal shows: 42795, 43012, 43229 and 43446;
+- in the columns beside it at both bay ends, where the side walls now
+  win as they do in the original.
+
+The anchor itself was not read; it is fitted to these rows. At that
+point the height is the mean of the two ends' heights. That is
+**unverified**: the Goth bay stands on flat ground.
+
+**Gains (exact colour, whole screen):**
+
+| Camera | Before | After | Notes |
+|---|---|---|---|
+| Near zoom, rotation 0, [619, −1189] | 61.2% | 61.7% | both bay ends show the shingles; 4 blocks of 50 px went from 0 to 350 matching pixels |
+| Medium zoom, rotation 0 | 88.9% | 89.0% | non-green 87.9% → 88.3% |
+| Far zoom, rotation 2, [431, −245] | 88.4% | 88.4% | 60 pixels changed: 3 that matched no longer do, and none of the rest match either way |
+
+Still different at near zoom: rows 436 to 520 below the left end. There
+the original shows grass and a light sprite where we draw the wall's
+foot. That is not this wall's depth or side, and is left to the
+near-zoom work.
+
+## 2026-11-15: The Newbie house to tick 562: Generic Sims Call 2, a catalog picture headline; Breakpoint and Show String
+
+**Unverified.** No capture of the Newbie house (`House07.iff`) exists
+yet; each piece is ported from the original's code and checked by
+synthetic tests. The Goth house's strict output is unchanged line
+for line through tick 2881, hash eed688a0… included.
+
+The base neighborhood has two families, the Goths (House05) and the
+Newbies (House07); its other houses hold none. In strict mode the
+Newbie house stopped at tick 245; it now runs to tick 562.
+
+**Generic Sims Call routine 2** (0x44fb51 to 0x44fbd8). The stack
+object must be on the lot (the lot's object table, +0x18 of the
+running object's lot +0xdc; native error 0xa otherwise), checked before
+the running object is cast to a person (error 0x1c). If the person has
+a running action (+0xa84 not 0, the test the route's end uses), the
+stack object becomes that action's icon (+0xa54). The branch is true.
+
+**Set Balloon/Headline kind 7** (0x44b811 to 0x44b8d8): a catalog
+picture, picked by byte 2 as it is, not with the temp option bit 12
+adds (the code keeps both at 0x44b7d6 and adds the temp to one):
+
+- 0: the stack object's;
+- 2: the object a local names, the local being operand word 0 shifted
+  right by one, signed; not below the frame's local count (frame byte
+  6) is native error 0x33, and a negative local fails loudly, as the
+  original would read before the locals; so does a local that still
+  holds half of an old pointer in the frame storage, which the original
+  reads as it is;
+- 1: a neighbor's (0x4256f4, the neighborhood record's +8), which is
+  **not ported** and fails loudly: whether a record holds its picture
+  is presentation we do not model;
+- any other byte ends the call.
+
+An ID that names nothing on the lot (not positive, or a null entry of
+the lot's table) ends the call too, after the priority is written, as
+for an icon with no sprite. The picture is the definition's (+0x11c),
+loaded into its cache (+0x8c, 0x45728d) when first asked for, which is
+presentation. The record's frame count becomes 1 (0x46dfe9), so option
+bit 11 makes the duration 12 ticks a loop. The rest is the other kinds'
+path: backdrop, overlay, flag, duration, redraw, wake.
+
+**A head looking at an object that is not a person** (0x59058f to
+0x5905d0) was ported here and, at the same time, by #156 for the Goth
+house's tick 2837; #156's port is kept. The two disagree on the order
+of the coordinates, and **the disassembly reads as the opposite of
+#156's**: the caller copies the object's +0xf4, then +0xf8, into the
+point it hands 0x454f5c, which stores 3/16 of the first word (`fild
+[esi]`) as the target's first coordinate and 3/16 of the second (`fild
+[esi+4]`) as its third. +0xf4 is our second coordinate (`animator::place`,
+`direction.rs`, `route.rs`), so the target would be `[3/16 y, 0, 3/16
+x]`, as for a person's model matrix (`head::placement`), where #156
+writes `[3/16 x, 0, 3/16 y]`. The swap changes the Goth house's hash at
+tick 2881 (eed688a0… becomes cdd5b72c…; every tick's line is the same,
+so only the animator's head state differs so far). It is left as #156
+has it, and the strict output is unchanged; **reopen** with track 3,
+and with a capture past tick 2837, which would settle it.
+
+**Breakpoint and Show String** (opcodes 15 and 21), which `sims
+census` counts 1,489 and 27 times in the install's trees, are ported
+whole from the general table (0x45246a); no house has reached either
+yet. Breakpoint (0x451e34) reads the word operand word 1 (scope) and
+word 0 (index) name, with the reader every primitive uses (0x453141;
+a scope above 38, or a negative one, is native error 9), and a word
+that is not 0 is native error 0x3e. Show String (0x451ab7) formats a
+string from the running tree's file and sends it as signal 0xeb, which
+none of the game's eight subscribers takes (each handler's cases were
+read: 0x41637f, 0x43c0e4, 0x44302e, 0x46d2c2, 0x47b22a, 0x4a82db,
+0x4c3ea5, 0x4f65bf), and its string lookups fail on nothing; so it
+changes nothing kept, and its branch is true.
+
+**What stops the Newbie house now.** At tick 563 person 137's head is
+measured while its base clip (`a2o-standing-loop`) moves a bone its
+foreground clip (`a2o-disgusted2`) leaves alone: the skin's blend of
+the two layers (0x5992b3) is not ported.
+
 ## 2026-11-15: The pie menu is ported from the original's code
 
 `sims_ui::pie` lays out, hit-tests and draws the pie menu, and groups an

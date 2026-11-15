@@ -62,6 +62,11 @@ events, and what it asks for after them) come first.
   (the multi-tile factory is ported). At tick 2882 person 16's pose
   without a foreground layer (0x5992b3) is not ported. Step 2 continues
   from there.
+- Of the base neighborhood's houses only the Goths' and the Newbies'
+  (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
+  tick 562, with no recording to compare yet; at tick 563 a head's pose
+  blends a base clip under the foreground (0x5992b3), which is not
+  ported.
 
 ## Met goal: a headless lot boot that matches the original
 
@@ -1900,20 +1905,19 @@ Progress:
   buffer holds the lot without its people. The game does not use it
   yet, and how the original gives a person's mesh its depth is
   unverified.
-- Found, not ported: an edge-on diagonal wall shows the wrong side, not
-  only the wrong texels. At near zoom the original shows the outside
-  shingles at both edge-on ends of the bay; we show the inside
-  wallpaper at the left end. Both walls face the same way, but the
-  outside lies on opposite sides of them, so no rule by the wall's
-  facing matches both. Code at 0x53f8ce copies two wall-cell records
-  (the cell's, and its neighbour's or the same cell's again) and reads
-  a word from each at an index from the wall's direction and a stack
-  value (`[ebp-0x2c]`, through 0x43517c). What that value means, and
-  how those words map to our wallpaper per side, are not read yet; the
-  port waits on both.
-- Next: trace that stack value and map the words to the wallpaper per
-  side (0x53f8ce), then the edge-on texels; a screenshot with a marked
-  edge-on diagonal; upper-level depth.
+- Done: the bay's edge-on ends. The original draws an edge-on diagonal
+  wall 300 nearer, anchored halfway along it (0x4c7be2, 0x4c4907), so
+  the straight bay walls' side faces show in front of it. At near zoom
+  both bay ends now show the shingles (61.2% to 61.7% exact); at
+  medium zoom the depth at both ends is the original's.
+- Read, not ported: the side an edge-on diagonal shows. The original
+  shows the side facing view (−1, 1) (0x53f6c1, 0x53d93a); ours shows
+  the same lot side at every rotation. The one column where the wall
+  shows matches neither side until its texel offset is read.
+- Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
+  grass and a light sprite in the original); window light; the
+  edge-on texel offset and side; a screenshot with a marked edge-on
+  diagonal; upper-level depth.
 
 ## Track: sound (`crates/sims-audio`)
 
@@ -1952,10 +1956,14 @@ stop-sounds events.
 - **Done: live playback.** The `play` example plays events (and the
   ambience) on the default output device, behind the `playback`
   feature (cpal), off by default; tests and CI build none of it.
+- **Done: the ambience's inputs.** The simulation emits its sound
+  requests (`Update::sounds`), and the game plays them. The camera
+  value the ambience's row follows is ported (`ambience::view`, from
+  0x570c3e: the share of the screen's tiles that are outdoors, read
+  through `World::outside`), and the hour is the clock's.
 - **Next:**
-  - The simulation emits `SoundEvent`s (the interface is in the
-    decisions log), and gives the camera value and the hour for the
-    ambience's cursor.
+  - Positions for 3D sound, pause and unpause (103), reload (104), the
+    piano (43) and the music half of the music modes (36).
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)
@@ -2141,9 +2149,9 @@ through their public interfaces only; the simulation never depends on it.
     Sim makes, so strict mode can switch Sims.
   - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
     and dialogs are. `sims-game` draws a plain list until then.
-  - `sims-audio`: the inputs the game cannot give yet: the camera value
-    of the ambience's cursor (0x570c3e; `sims-game` passes a fixed 50),
-    what the sound scripts' `getsrcdatafield` fields are (`sims-game`
+  - `sims-audio`: the inputs the game cannot give yet (the camera
+    value of the ambience's cursor, 0x570c3e, is ported, #160): what
+    the sound scripts' `getsrcdatafield` fields are (`sims-game`
     answers 0 to every one; an object's place on screen, for its pan,
     is presumably among them, unread), and what
     pausing the game does to the sounds playing (the pause events are
