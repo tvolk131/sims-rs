@@ -44,6 +44,7 @@ use sims_sim::World;
 use sims_sim::animator::{Animator, Layer};
 use std::collections::BTreeSet;
 
+mod dynamic;
 mod find;
 pub(crate) use find::Rules;
 pub(crate) use find::{Refusal, closed_directions, pool_tile};

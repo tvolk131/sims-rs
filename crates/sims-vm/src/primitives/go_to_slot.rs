@@ -404,9 +404,16 @@ impl Machine<'_, '_> {
         };
         let mut state = self.frame()?.primitive_state;
         if state == NEW {
-            let (Some(target), Some(slot), false) = (target, slot, lost) else {
-                return Err(unsupported("0x45ae65", "with its stack object gone"));
+            // 0x45adb5: on the first run, a stack object that is gone or
+            // off the lot takes the false branch (0x45ae65) before any
+            // context is made. Go To Routing Slot has refused it already
+            // (0x45ac1d); Go To Relative Position has not.
+            let (Some(target), false) = (target, lost) else {
+                return Ok(Flow::Branch(false));
             };
+            let slot = slot.ok_or(Trap::Invalid(
+                "a route's first run with no slot record".into(),
+            ))?;
             let mut ctx = new_context(self.world, me, target, slot);
             if self.person_word(NO_ROOM)? & 1 == 1 {
                 ctx.slot.flags |= NO_ROOM_FLAG;

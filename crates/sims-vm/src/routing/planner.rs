@@ -299,9 +299,14 @@ impl Interpreter<'_> {
             }
         }
         let found = search(query(bounded.then_some(128))).map_err(fail)?;
-        let goal = found
-            .goal
-            .ok_or_else(|| fail(unsupported("a search that reaches no goal")))?;
+        let Some(goal) = found.goal else {
+            // 0x482b35: no goal reached, so no path. The chosen candidate
+            // is forgotten (0x481745), and with no path the context's
+            // result is 3 and the planner answers false (0x482e6d).
+            forget_chosen(&mut ctx.candidates, &mut ctx.chosen, &mut ctx.best);
+            ctx.result = NO_WAY;
+            return Ok(false);
+        };
         ctx.chosen = map[goal] as i32;
         if found.points.is_empty() {
             return Err(fail(unsupported("a search that finds no path")));
@@ -309,6 +314,24 @@ impl Interpreter<'_> {
         path.extend(found.points.iter().map(|p| [p[1], p[0]]));
         Ok(true)
     }
+}
+
+/// 0x481745: a context with a chosen candidate forgets it: that
+/// candidate's score (+8) becomes 0 when the index is one of the
+/// candidates', and the chosen index and best score (+0x50, +0x54)
+/// become -1. With none chosen (-1) nothing changes.
+fn forget_chosen(candidates: &mut [Candidate], chosen: &mut i32, best: &mut i32) {
+    if *chosen == -1 {
+        return;
+    }
+    if let Some(candidate) = usize::try_from(*chosen)
+        .ok()
+        .and_then(|i| candidates.get_mut(i))
+    {
+        candidate.score = 0;
+    }
+    *chosen = -1;
+    *best = -1;
 }
 
 /// What a free rectangle found while searching costs (0x4824d0 to
@@ -348,6 +371,34 @@ fn gives_up(candidates: &[Candidate], result: &mut i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_search_with_no_goal_forgets_the_chosen_candidate() {
+        let place = |score| Candidate {
+            position: [8, 8],
+            score,
+            word_c: 0,
+            word_e: None,
+        };
+        let mut candidates = vec![place(5), place(7)];
+        let (mut chosen, mut best) = (1, 7);
+        forget_chosen(&mut candidates, &mut chosen, &mut best);
+        assert_eq!((candidates[0].score, candidates[1].score), (5, 0));
+        assert_eq!((chosen, best), (-1, -1));
+        // An index past the candidates, or below 0 but not -1, is still
+        // forgotten; no candidate changes.
+        for index in [2, -2] {
+            let (mut chosen, mut best) = (index, 7);
+            let mut candidates = vec![place(5)];
+            forget_chosen(&mut candidates, &mut chosen, &mut best);
+            assert_eq!(candidates[0].score, 5);
+            assert_eq!((chosen, best), (-1, -1));
+        }
+        // With none chosen, the best score stays.
+        let (mut chosen, mut best) = (-1, 7);
+        forget_chosen(&mut candidates, &mut chosen, &mut best);
+        assert_eq!((chosen, best), (-1, 7));
+    }
 
     #[test]
     fn with_no_candidates_the_planner_gives_up() {

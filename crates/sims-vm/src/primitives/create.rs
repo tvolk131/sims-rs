@@ -73,6 +73,7 @@ use crate::factory::word::{GROUP, TYPE};
 use crate::fault::Trap;
 use crate::interpreter::Machine;
 use crate::placement::{Place, on_lot, standing_on};
+use crate::visits::function;
 use sims_sim::World;
 use sims_sim::rooms::NO_ROOM;
 
@@ -442,6 +443,7 @@ impl Machine<'_, '_> {
                 level,
             },
             flags,
+            false,
         )
     }
 
@@ -538,16 +540,20 @@ impl Machine<'_, '_> {
         }
         let words = self.definition_words(guid)?;
         let person = words[TYPE] == PERSON;
-        if words[GROUP] != 0 {
-            return Err(Trap::Unsupported(format!(
-                "Create New Object Instance placing an object of type 0x{guid:08X}, \
-                 which belongs to a group, is not ported"
-            )));
-        }
         let created = if person {
             self.make_person(guid)?
         } else {
             self.make(guid)?
+        };
+        if flags & FACE_AS_STACK_OBJECT != 0 {
+            self.face_as_stack_object(created, person)?;
+        }
+        let dynamic = self.dynamic_group(created)?;
+        let position = if dynamic {
+            // 0x44e770: the place is the middle of its tile.
+            position.map(|p| (p & !7) | 8)
+        } else {
+            position
         };
         let place = Place {
             on_lot: on_lot(position),
@@ -556,10 +562,24 @@ impl Machine<'_, '_> {
             slot: -1,
             level,
         };
-        if flags & FACE_AS_STACK_OBJECT != 0 {
-            self.face_as_stack_object(created, person)?;
-        }
-        self.place_new(created, place, flags)
+        self.place_new(created, place, flags, dynamic)
+    }
+
+    /// The tail's group test (0x44e736 to 0x44e76e, again at 0x44e7c3):
+    /// the new object's own definition word 10 (+0x118 +0x14) is not 0,
+    /// it is a tile of a group (the cast to 0x6c0ef8), and its type has
+    /// callback function 8 (0x42344e).
+    fn dynamic_group(&self, created: u16) -> Result<bool, Trap> {
+        let interpreter = self.interpreter();
+        Ok(interpreter.words(self.world, created)?[GROUP] != 0
+            && self
+                .world
+                .objects
+                .get(&created)
+                .ok_or(Trap::native(10, "missing object"))?
+                .multipart
+                .is_some()
+            && interpreter.has_function(self.world, created, function::DYNAMIC_GROUP))
     }
 
     /// Flag 0x20 (0x44e640 to 0x44e6b4), for the object `created` just
@@ -631,7 +651,13 @@ impl Machine<'_, '_> {
     /// the container's slot), and the put (virtual function 0x58). A
     /// refusal removes the new object at once (0x44123f) and takes the
     /// false branch; otherwise the tail ends ([`Machine::finish_new`]).
-    fn place_new(&mut self, created: u16, place: Place, flags: u8) -> Result<bool, Trap> {
+    fn place_new(
+        &mut self,
+        created: u16,
+        place: Place,
+        flags: u8,
+        dynamic: bool,
+    ) -> Result<bool, Trap> {
         self.check_new_person(created)?;
         let interpreter = self.interpreter();
         let unsupported = |fault| {
@@ -659,6 +685,11 @@ impl Machine<'_, '_> {
         interpreter
             .put(self.world, created, place, true)
             .map_err(unsupported)?;
+        if dynamic {
+            interpreter
+                .join_neighbours(self.world, created)
+                .map_err(unsupported)?;
+        }
         self.finish_new(created, flags)
     }
 
