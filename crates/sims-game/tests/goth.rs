@@ -410,3 +410,62 @@ fn the_ambience_follows_the_outdoor_share_of_the_screen() {
         assert_eq!(game.ambience_view(), 0);
     }
 }
+
+#[test]
+fn a_press_on_a_portrait_selects_that_goth() {
+    let Some(install) = install() else {
+        return;
+    };
+    // Play mode: in strict mode deselecting Mortimer fails on his
+    // animator's refresh, which the simulation has not ported.
+    let mut game = Game::open(&Options {
+        play: true,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    assert_eq!(game.run(20), 20);
+    game.resize([800, 600]);
+    game.render();
+    let world = game.lot().world();
+    let mortimer = world.selected().expect("a Sim is selected");
+    // The household: the people who live on the lot (person word 32 is
+    // 0) and are of Mortimer's family (word 61).
+    let family = world.objects[&mortimer].person.as_ref().unwrap().data[61];
+    let household: Vec<&sims_sim::Object> = world
+        .people
+        .iter()
+        .map(|id| &world.objects[id])
+        .filter(|o| {
+            let data = &o.person.as_ref().unwrap().data;
+            data[32] == 0 && data[61] == family
+        })
+        .collect();
+    let other = household
+        .iter()
+        .find(|o| o.id != mortimer)
+        .expect("another Goth")
+        .id;
+    let members: Vec<u32> = household.iter().map(|o| o.guid).collect();
+    // Where the panel shows the other Goth's portrait.
+    let controls = sims_ui::hud::Controls {
+        expanded: true,
+        ..sims_ui::hud::Controls::default()
+    };
+    let snapshot = sims_ui::household::Snapshot::read(world, &members);
+    let portrait = sims_ui::hud::layout([800, 600], &snapshot, &controls)
+        .into_iter()
+        .find(|item| item.command == Some(sims_ui::command::Command::Select { sim: other }))
+        .expect("the other Goth's portrait")
+        .rect;
+    game.press([
+        portrait.x + portrait.width / 2,
+        portrait.y + portrait.height / 2,
+    ]);
+    assert_eq!(game.lot().world().selected(), Some(other));
+    assert_eq!(game.lot().world().globals[3], other as i16);
+    // The lot goes on with the new selection.
+    assert_eq!(game.run(50), 50);
+    assert_eq!(game.stopped(), None);
+    game.select(mortimer);
+    assert_eq!(game.lot().world().selected(), Some(mortimer));
+}
