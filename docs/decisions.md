@@ -60,15 +60,17 @@ and button, and the same digest.
   - the width of a leftover line, which the original measures with an
     extra the font keeps (0x60b7e2) that is taken as 0;
   - a dialog bigger than the window: ours narrows it to the window
-    (down to the buttons' least width, whatever the title), then cuts
-    lines from the end so the buttons stay on screen, and centers the
-    title on the width it ends at;
+    (no narrower than its buttons side by side, whatever the title or
+    icon), cuts lines from the end, then keeps it to the window's
+    bottom, so its buttons are on screen in any window 100 a button
+    wide and 54 high; it centers the title on the width it ends at;
   - a text so tall the doubling never reaches twice its height: the
     original would not stop; ours stops at 2^20 pixels.
 - **Tests:** the measured "Magic Town" layout and digest; the button
   rows of two and three; the band, the lines beside and under it, and
   the line left over; the search's ratio; the title's place without an
-  icon; every button on screen for a message too tall for the window.
+  icon; every button on screen for long messages, tall icons and
+  narrow or short windows.
 
 What would reopen it: a screenshot of the "Help System" dialog, or of
 any dialog with two or three buttons, that disagrees.

@@ -311,9 +311,10 @@ impl Arranged {
 /// - The buttons are spread evenly across the text's width, an equal
 ///   gap before, between and after them, 18 under the text.
 ///
-/// A dialog bigger than the window is narrowed to it and loses lines
-/// from its end until the buttons are on screen, so it can always be
-/// answered; how the original handles one is **unverified**.
+/// A dialog bigger than the window is narrowed to it, loses lines from
+/// its end and keeps to the window's bottom, so its buttons are on
+/// screen in any window 100 a button wide and 54 high; how the original
+/// handles one is **unverified**.
 pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
     let (title_font, body) = (art.font(TITLE_FONT)?, art.font(BODY_FONT)?);
     let size = size.map(|n| n.clamp(0, 32768));
@@ -431,14 +432,14 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
         narrow
     });
 
-    // A dialog bigger than the window is narrowed to it, keeping only
-    // the buttons' least width, and loses lines from its end until the
-    // buttons are on screen. Neither is the original's: how it handles
-    // one is **unverified**.
+    // A dialog bigger than the window is narrowed to it, no narrower
+    // than its buttons side by side, loses lines from its end, and is
+    // then kept to the window's bottom, so that its buttons are on
+    // screen in any window 100 a button wide and 54 high. None of it is
+    // the original's: how it handles one is **unverified**.
     let room = size[0] - 2 * top;
     if a.size[0] > size[0] || a.size[1] > size[1] {
-        let floor = buttons * (BUTTON_SIZE[0] + BUTTON_ROOM);
-        a = arrange_within(a.text_width.min(room), floor.min(least));
+        a = arrange_within(a.text_width.min(room), buttons * BUTTON_SIZE[0]);
         before = a.size[0];
     }
     let mut height = a.size[1];
@@ -450,7 +451,8 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
         a.buttons -= line;
     }
     let width = a.size[0];
-    let rect = Rect::new((size[0] - width) / 2, (size[1] - height) / 2, width, height);
+    let y = ((size[1] - height) / 2).min(size[1] - height);
+    let rect = Rect::new((size[0] - width) / 2, y, width, height);
     let title_x = match (title, icon) {
         (Some(title), Some(_)) => {
             top - PAD + icon_width + GAP + (a.text_width - band[0] - title) / 2
@@ -636,15 +638,58 @@ mod tests {
                 for size in [[800, 600], [100, 50], [0, 0]] {
                     let layout = layout(size, &message(&text, buttons), &art).unwrap();
                     assert!(!layout.lines.is_empty());
-                    if size[1] < 200 {
-                        continue;
+                    if size[1] >= 200 {
+                        assert!(layout.rect.width <= size[0], "{:?}", layout.rect);
                     }
-                    // Narrowed to the window and cut to it, every button is
-                    // on screen.
-                    assert!(layout.rect.width <= size[0], "{:?}", layout.rect);
-                    for b in &layout.buttons {
-                        assert!(b.x >= 0 && b.x + b.width <= size[0], "{size:?} {b:?}");
-                        assert!(b.y >= 0 && b.y + b.height <= size[1], "{size:?} {b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_buttons_are_on_screen_in_any_window_wide_enough_for_them() {
+        let art = art();
+        let icon = |w: u32, h: u32| Image {
+            width: w,
+            height: h,
+            rgba: vec![255; (w * h * 4) as usize],
+        };
+        let texts = ["B".to_owned(), "A\n".repeat(60), vec!["B"; 3000].join(" ")];
+        let icons = [
+            None,
+            Some(icon(10, 7)),
+            Some(icon(124, 256)),
+            Some(icon(700, 900)),
+        ];
+        for text in &texts {
+            for picture in &icons {
+                for buttons in 1..=3 {
+                    let wide = 100 * buttons as i32;
+                    for size in [
+                        [800, 600],
+                        [800, 200],
+                        [wide, 54],
+                        [wide + 7, 600],
+                        [640, 54],
+                    ] {
+                        if size[0] < wide {
+                            continue;
+                        }
+                        let mut m = message(text, buttons);
+                        m.icon = picture.clone();
+                        let laid = layout(size, &m, &art).unwrap();
+                        assert_eq!(laid.buttons.len(), buttons);
+                        for b in &laid.buttons {
+                            let on = b.x >= 0
+                                && b.x + b.width <= size[0]
+                                && b.y >= 0
+                                && b.y + b.height <= size[1];
+                            assert!(
+                                on,
+                                "{size:?} {buttons} {:?} {b:?}",
+                                picture.as_ref().map(|i| i.height)
+                            );
+                        }
                     }
                 }
             }
