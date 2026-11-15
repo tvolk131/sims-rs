@@ -474,7 +474,7 @@ fn career_minus_one_always_reads_its_first_level() {
 
 #[test]
 fn job_data_errors() {
-    // No such career.
+    // No such career, even for field 0: the career is looked up first.
     assert_eq!(code(read(&mut jobs(3, 0), 33, 0)), Some(0x39));
     // No such level, unless the field is 0.
     for level in [2, -1] {
@@ -486,6 +486,14 @@ fn job_data_errors() {
     for field in [23, -1] {
         assert_eq!(code(read(&mut jobs(4, 0), 33, field)), Some(0x3a));
     }
+    // The lookup runs inside the operand resolver (0x4531fb returns
+    // through its tail, 0x453483), before the caller finds there is no
+    // word pointer to write: a write names the lookup's error, and only a
+    // field that exists gives 0x13.
+    assert_eq!(code(write(&mut jobs(3, 0), 33, 2, 1)), Some(0x39));
+    assert_eq!(code(write(&mut jobs(4, 2), 33, 2, 1)), Some(0x3a));
+    assert_eq!(code(write(&mut jobs(4, 0), 33, 23, 1)), Some(0x3a));
+    assert_eq!(code(write(&mut jobs(4, 0), 33, 0, 1)), Some(0x13));
 }
 
 #[test]
