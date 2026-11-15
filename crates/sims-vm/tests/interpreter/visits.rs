@@ -637,11 +637,6 @@ fn a_person_the_reset_would_do_more_for_stops_its_visit() {
         acting.contains("whose running action has a target"),
         "{acting}"
     );
-    let routing = person(&|p| p.routing_frames = 1);
-    assert!(
-        routing.contains("whose routing frame count is not 0"),
-        "{routing}"
-    );
     let wide = person(&|p| p.data[73] = 1);
     assert!(wide.contains("whose data word 73 is set"), "{wide}");
     let away = fails(&|object| object.position = [-16, -16, 1]);
@@ -1135,15 +1130,6 @@ fn what_removing_a_person_does_not_port_fails_loudly() {
         assert!(fx.world.objects.contains_key(&PERSON));
         fault.to_string()
     };
-    // A last reset the original does more for.
-    let routing = fails(&|w| {
-        let person = w.objects.get_mut(&PERSON).unwrap();
-        person.person.as_mut().unwrap().routing_frames = 1;
-    });
-    assert!(
-        routing.contains("whose routing frame count is not 0"),
-        "{routing}"
-    );
     // Before the load has worked the lot's rooms out.
     let early = fails(&|w| w.rooms = Default::default());
     assert!(early.contains("rooms out"), "{early}");

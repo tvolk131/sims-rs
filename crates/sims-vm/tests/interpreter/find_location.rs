@@ -11,6 +11,7 @@ use crate::factory::{WIDGET, widgets};
 use crate::person_factory::equip;
 use crate::rooms::{array, build};
 use crate::support::*;
+use sims_core::GameRng;
 use sims_vm::Trap;
 
 /// The opcodes under test.
@@ -242,16 +243,15 @@ fn mode_1_takes_the_object_off_the_lot() {
 fn other_find_location_modes_fail_loudly() {
     let (mut fx, _) = placeable();
     let id = widget(&mut fx);
-    for mode in [2, 5] {
-        let result = run(
-            &mut fx,
-            0,
-            id as i16,
-            FIND_LOCATION,
-            [mode, 0, 0, 0, 0, 0, 0, 0],
-        );
-        assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("not ported")));
-    }
+    // Mode 2, in front of the object.
+    let result = run(
+        &mut fx,
+        0,
+        id as i16,
+        FIND_LOCATION,
+        [2, 0, 0, 0, 0, 0, 0, 0],
+    );
+    assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("not ported")));
     // Modes 3 and 4 need an object to search from (flag bit 0): native
     // error 0x3d (0x44b676).
     for mode in [3, 4] {
@@ -524,4 +524,173 @@ fn mode_1_on_a_person_fails_loudly() {
     );
     assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("0x58da12")));
     assert_eq!(fx.world.objects[&id].position, [40, 40, 1]);
+}
+
+/// Find Location For in mode 5, with the view turned to `rotation`.
+fn find_random(
+    fx: &mut Fixture,
+    local: i16,
+    target: u16,
+    flags: u8,
+    rotation: u8,
+) -> Result<bool, sims_vm::Fault> {
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![
+            assign(scope::LOCALS, 0, scope::LITERAL, local, 1),
+            ins(
+                FIND_LOCATION,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [5, 0, flags, 0, 0, 0, 0, 0],
+            ),
+        ]),
+    );
+    let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.view_rotation = rotation;
+    interpreter.run_tree(&mut fx.world, LAMP, 4096, target as i16, &[], 1000)
+}
+
+/// The random start as 0x434921 works it out before the view's turn:
+/// tile offsets of a draw modulo 10 less 5, the first draw to the second
+/// coordinate, added up until the tile, cut to a byte, is inside the
+/// border.
+fn walked(rng: &mut GameRng, size: i32, from: [i32; 2]) -> [i32; 2] {
+    walked_turned(rng, size, 0, from).0
+}
+
+/// [`walked`] under a turned view, with the number of draws: the bounds
+/// are the lot's corners turned within the whole 64-tile square (0x4791a6
+/// through 0x407704's table), so a turn moves the first coordinate's,
+/// the second's or both to tiles 65 - size to 62.
+fn walked_turned(
+    rng: &mut GameRng,
+    size: i32,
+    rotation: u8,
+    [mut x, mut y]: [i32; 2],
+) -> ([i32; 2], u32) {
+    let near = 1..=size - 2;
+    let far = 65 - size..=62;
+    let (across, down) = match rotation {
+        1 => (near, far),
+        2 => (far.clone(), far),
+        3 => (far, near),
+        _ => (near.clone(), near),
+    };
+    let tile = |n: i32| i32::from((n >> 4) as i8);
+    let mut draws = 0;
+    loop {
+        let first = (rng.next_u32() % 10) as i32 - 5;
+        let second = (rng.next_u32() % 10) as i32 - 5;
+        draws += 2;
+        y += first * 16 + 8;
+        x += second * 16 + 8;
+        if across.contains(&tile(x)) && down.contains(&tile(y)) {
+            return ([x, y], draws);
+        }
+    }
+}
+
+#[test]
+fn mode_5_searches_from_a_random_walk_away_from_the_start() {
+    // From state 8 the first two draws move the start (16, 16) by tiles
+    // (1, 1) to (40, 40), inside the border; from state 2 the walk takes
+    // 84 draws and ends on tile (2, 1). The search then takes the start
+    // tile, which is free.
+    for (seed, draws, tile) in [(8, 2, [2, 2]), (2, 84, [2, 1])] {
+        let (mut fx, _) = placeable();
+        let id = widget(&mut fx);
+        fx.world.lot_rng = GameRng::from_state(seed);
+        let mut expected = fx.world.lot_rng;
+        let start = walked(&mut expected, i32::from(fx.world.size), [16, 16]);
+        assert_eq!([start[0] >> 4, start[1] >> 4], tile, "state {seed}");
+        let mut counted = GameRng::from_state(seed);
+        for _ in 0..draws {
+            counted.next_u32();
+        }
+        assert_eq!(counted, expected, "state {seed}");
+        assert_eq!(find_random(&mut fx, 0, id, 0, 0), Ok(true));
+        assert_eq!(fx.world.lot_rng, expected, "state {seed}");
+        let middle = tile.map(|t| (t << 4) | 8);
+        assert_eq!(fx.world.objects[&id].position, [middle[0], middle[1], 1]);
+    }
+}
+
+#[test]
+fn mode_5_draws_a_new_start_for_the_search_anywhere() {
+    // Room 1, tiles (2, 2) to (3, 3), is full, so the first search, which
+    // starts on (2, 2) and keeps to its room, finds nothing. The search
+    // anywhere walks again from (16, 16).
+    let (mut fx, _) = placeable();
+    fx.lamp_mut().position = [40, 40, 1];
+    for _ in 0..4 {
+        let id = widget(&mut fx);
+        assert_eq!(find(&mut fx, LAMP as i16, id, 1), Ok(true));
+        let [x, y, _] = fx.world.objects[&id].position;
+        assert!((2..=3).contains(&(x >> 4)) && (2..=3).contains(&(y >> 4)));
+    }
+    let id = widget(&mut fx);
+    fx.world.lot_rng = GameRng::from_state(8);
+    let mut expected = fx.world.lot_rng;
+    let size = i32::from(fx.world.size);
+    assert_eq!(walked(&mut expected, size, [16, 16]), [40, 40]);
+    let second = walked(&mut expected, size, [16, 16]);
+    assert_eq!(second.map(|n| n >> 4), [3, 2]);
+    assert_eq!(find_random(&mut fx, 0, id, 0, 0), Ok(true));
+    assert_eq!(fx.world.lot_rng, expected);
+    // (3, 2) is in the full room too; the spiral goes on through (2, 2),
+    // (2, 3) and (3, 3) to (4, 3).
+    assert_eq!(fx.world.objects[&id].position, [72, 56, 1]);
+}
+
+#[test]
+fn mode_5_from_exactly_1_1_draws_a_point_modulo_the_lots_size() {
+    // A start of (1, 1) (the lamp's own place, flag 1) is replaced by two
+    // draws modulo 6, read as a point: tile 0, clamped to tile 1.
+    let (mut fx, _) = placeable();
+    fx.lamp_mut().position = [1, 1, 1];
+    let id = widget(&mut fx);
+    let mut expected = fx.world.lot_rng;
+    expected.next_u32();
+    expected.next_u32();
+    assert_eq!(find_random(&mut fx, LAMP as i16, id, 1, 0), Ok(true));
+    assert_eq!(fx.world.lot_rng, expected);
+    assert_eq!(fx.world.objects[&id].position, [24, 24, 1]);
+}
+
+#[test]
+fn mode_5_turns_its_start_by_the_inverse_of_the_view() {
+    // From state 8 on the six-tile lot. Unturned, the walk ends at once on
+    // (40, 40). Turned, the bounds are on the 64-tile square's far side
+    // along one coordinate or both, so the walk goes round (the tile is
+    // cut to a byte) until it reaches them. View 1: (8216, 9160), tiles
+    // (1, 60), turned by 3 to (1023 - 9160, 8216), tiles (3, 1). View 2:
+    // (-3144, 984), tiles (59, 61), turned to (4167, 39), tiles (4, 2).
+    // View 3: (5088, 4128), tiles (62, 2), turned by 1 to (4128, -4065),
+    // tiles (2, 1). The lot is free, so the search takes the start tile.
+    for (rotation, walk, draws, tile) in [
+        (0, [40, 40], 2, [2, 2]),
+        (1, [8216, 9160], 51266, [3, 1]),
+        (2, [-3144, 984], 7526, [4, 2]),
+        (3, [5088, 4128], 40416, [2, 1]),
+    ] {
+        let (mut fx, _) = placeable();
+        let id = widget(&mut fx);
+        fx.world.lot_rng = GameRng::from_state(8);
+        let mut expected = fx.world.lot_rng;
+        assert_eq!(
+            walked_turned(&mut expected, 6, rotation, [16, 16]),
+            (walk, draws),
+            "view {rotation}"
+        );
+        assert_eq!(find_random(&mut fx, 0, id, 0, rotation), Ok(true));
+        assert_eq!(fx.world.lot_rng, expected, "view {rotation}");
+        let middle = tile.map(|t| (t << 4) | 8);
+        assert_eq!(
+            fx.world.objects[&id].position,
+            [middle[0], middle[1], 1],
+            "view {rotation}"
+        );
+    }
 }
