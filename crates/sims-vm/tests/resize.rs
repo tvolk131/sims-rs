@@ -45,6 +45,7 @@ fn with_goth_people(
     let mut program =
         Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid)).unwrap();
     program.zoning = neighborhood.zoning(context.expansions).unwrap();
+    program.expansions = context.expansions;
     program.animations = Animations::load(&install, &index).unwrap();
     // Every person type's skeleton and appearance, for the people a script
     // makes, as `sims boot` loads them.
@@ -417,11 +418,21 @@ fn routing_18_bytes(routing: &sims_sim::route::Routing) -> Vec<u8> {
     bytes
 }
 
+/// A lot's encoding as snapshot format 26 wrote it: without the
+/// neighborhood's data words ([`World::neighborhood_data`]) that format 27
+/// added at the end. The older formats' encodings start from this one.
+fn format_26_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let data = postcard::to_allocvec(&world.neighborhood_data).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - data.len()), data);
+    bytes
+}
+
 /// A lot's encoding as snapshot format 25 wrote it: without the record of
 /// the bones the skins moved ([`World::translated_bones`]) that format 26
-/// added at the end. The older formats' encodings start from this one.
+/// added at the end either. It starts from [`format_26_bytes`].
 fn format_25_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_26_bytes(world);
     let moved = postcard::to_allocvec(&world.translated_bones).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - moved.len()), moved);
     bytes

@@ -29,6 +29,12 @@ pub struct Neighborhood {
     /// the file's order, with its empty slots. Empty when the file has no
     /// NGBH chunk or an older one without inventories.
     pub inventories: Vec<Option<Inventory>>,
+    /// The neighborhood's sixteen data words (the NGBH chunk's, read by
+    /// 0x4254f6 into the neighborhood's +0x128): all sixteen from a chunk
+    /// of version 20 or later, only the first from an older one. The rest,
+    /// and all of them when the file has no NGBH chunk, are 0, as the
+    /// neighborhood's constructor leaves them (0x4244bc).
+    pub data: [i16; 16],
 }
 
 impl Neighborhood {
@@ -57,15 +63,14 @@ impl Neighborhood {
                 .map_err(|e| Error::format(&format!("{} NBRS #{}", path.display(), chunk.id), e))?;
             neighbors.extend(parsed.entries);
         }
-        let inventories = match iff.all(b"NGBH").next() {
+        let (inventories, data) = match iff.all(b"NGBH").next() {
             Some(chunk) => {
-                Header::parse(iff.data(chunk))
-                    .map_err(|e| {
-                        Error::format(&format!("{} NGBH #{}", path.display(), chunk.id), e)
-                    })?
-                    .inventories
+                let header = Header::parse(iff.data(chunk)).map_err(|e| {
+                    Error::format(&format!("{} NGBH #{}", path.display(), chunk.id), e)
+                })?;
+                (header.inventories, header.data)
             }
-            None => Vec::new(),
+            None => (Vec::new(), [0; 16]),
         };
         Ok(Self {
             directory: directory.to_path_buf(),
@@ -73,6 +78,7 @@ impl Neighborhood {
             type_attributes,
             neighbors,
             inventories,
+            data,
         })
     }
 

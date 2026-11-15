@@ -151,9 +151,15 @@ impl Interpreter<'_> {
         Ok(true)
     }
 
-    /// The room's rectangles (0x4818af with terrain asked for), the hard
-    /// ones first, each hard one grown by 7.
-    pub(crate) fn room_rects(&self, world: &World, room: i16) -> Result<Vec<Region>, Trap> {
+    /// The room's rectangles (0x4818af), the hard ones first, each hard
+    /// one grown by 7. `asked` is the call's third argument: without it
+    /// the terrain is left out (0x4818e0).
+    pub(crate) fn room_rects(
+        &self,
+        world: &World,
+        room: i16,
+        asked: bool,
+    ) -> Result<Vec<Region>, Trap> {
         // The level indexes the lot's room maps and wall arrays (0x481926,
         // 0x4795ea); the lot has two.
         let level = room_level(room);
@@ -181,11 +187,11 @@ impl Interpreter<'_> {
             .get(&room)
             .ok_or_else(|| Trap::Invalid(format!("room {room} is not on the lot")))?
             .outdoors;
-        // 0x4818e0: terrain counts only on the ground, outdoors, on a
-        // residential lot (the lot's zoning, 0x40745f).
+        // 0x4818e0: terrain counts only when asked for, on the ground,
+        // outdoors, on a residential lot (the lot's zoning, 0x40745f).
         let lot = world.globals.get(LOT).copied().unwrap_or(0);
         let residential = lot == 0 || self.program.zoning.get(&lot) == Some(&1);
-        let terrain = level == 1 && residential && outdoors;
+        let terrain = asked && level == 1 && residential && outdoors;
 
         let mut cache = vec![None; FULL * FULL];
         let mut available = |x: usize, y: usize| -> Result<bool, Trap> {
@@ -356,5 +362,97 @@ impl Interpreter<'_> {
             .enumerate()
             .map(|(i, r)| if i < hard { r.inflate(7) } else { r })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! A synthetic lot, built in memory: no game data. Ten flat tiles a
+    //! side with no walls or water, all one outdoor room on the ground
+    //! (room 0), on a residential lot (global 10 is 0), with a floor
+    //! covering on the tiles 3 to 4 by 4 to 6.
+    use super::*;
+    use crate::{Program, Stream};
+    use sims_content::Catalog;
+    use sims_formats::lot::Array;
+    use std::collections::BTreeMap;
+
+    fn array(stride: usize, fill: u8) -> Array {
+        Array {
+            width: 64,
+            height: 64,
+            stride,
+            encoding: 0,
+            data: vec![fill; FULL * FULL * stride],
+        }
+    }
+
+    fn program() -> Program {
+        Program {
+            global: 0,
+            semi_globals: BTreeMap::new(),
+            libraries: BTreeMap::new(),
+            careers: None,
+            zoning: BTreeMap::new(),
+            animations: Default::default(),
+            people: Default::default(),
+            icon_frames: None,
+            expansions: 0,
+        }
+    }
+
+    fn catalog() -> Catalog {
+        Catalog {
+            global: 0,
+            objects: Vec::new(),
+            by_guid: Default::default(),
+            semi_globals: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn world() -> World {
+        let mut world = World::empty();
+        world.size = 10;
+        world.arrays.insert(0, array(4, 0));
+        for (floors, walls, flags) in [(1, 2, 8), (101, 102, 108)] {
+            world.arrays.insert(floors, array(2, 0));
+            world.arrays.insert(walls, array(WALL_CELL, 0));
+            world.arrays.insert(flags, array(1, 0));
+        }
+        world.arrays.insert(3, array(2, 0));
+        world.arrays.insert(103, array(2, 0));
+        world.arrays.insert(9, array(1, 0xff));
+        world.arrays.insert(WATER, array(1, 0xff));
+        let floors = &mut world.arrays.get_mut(&FLOORS).unwrap().data;
+        for x in 3..5 {
+            for y in 4..7 {
+                floors[(x * FULL + y) * 2] = 1;
+            }
+        }
+        world.rebuild_rooms().unwrap();
+        world
+    }
+
+    #[test]
+    fn terrain_is_left_out_unless_asked_for() {
+        // 0x4818e0: on the ground, outdoors, on a residential lot, the
+        // covered tiles are a soft rectangle after the hard ones when the
+        // call's third argument asks for terrain (as 0x46795a does). The
+        // planner asks without it for a person whose data word 17 is set
+        // in an outdoor room on level 1 (0x4827f6).
+        let (program, catalog) = (program(), catalog());
+        let interpreter = Interpreter::new(&program, &catalog, Stream::Lot);
+        let world = world();
+        assert!(world.rooms.rooms[&0].outdoors);
+        let with = interpreter.room_rects(&world, 0, true).unwrap();
+        let without = interpreter.room_rects(&world, 0, false).unwrap();
+        // The room's border: four hard rectangles, grown by 7.
+        assert_eq!(without.len(), 4);
+        assert!(without.iter().all(|r| r.0[4] == HARD));
+        assert_eq!(with[..4], without[..]);
+        // The covering, tiles 3 to 4 by 4 to 6, costs nothing (no flag
+        // 0x20) and is not grown.
+        assert_eq!(with[4..], [Region([48, 64, 80, 112, 0])]);
     }
 }
