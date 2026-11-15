@@ -2012,9 +2012,16 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   The frame's corners are close but not exact. "Magic Town" is pinned by
   layout and digest, gated on `SIMS_INSTALL`. `sims-viewer --hud` shows a
   waiting dialog, and its answer is printed.
+- **Done: the pie menu.** `sims_ui::pie` lays out, hit-tests and draws
+  the menu and groups an object's actions into submenus, ported from the
+  original's menu window and object picker. The window and label boxes
+  agree to the pixel with two menus read from the running original
+  (gated on `SIMS_INSTALL`); the drawn look is not yet compared with a
+  screenshot. The host keeps a `pie::Pie` and renders the head.
 - **Next:** open houses through `sims_vm::boot::Lot` (which now runs the
   household load) in the tests and the viewer, in place of their
-  stand-in for steps 17 and 18; pie menus; a Yes/No dialog checked
+  stand-in for steps 17 and 18; a screenshot of an open pie menu; a
+  Yes/No dialog checked
   against the original (the "Help System" one at tick 2) for the layout
   of several buttons; text entry dialogs; the other live panels.
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
@@ -2105,7 +2112,8 @@ through their public interfaces only; the simulation never depends on it.
   Since #156 strict mode runs the order through step 3400 and stops at
   step 3401 (person 16 routes for an action that wants to be
   interrupted, 0x45afd2); without an order it runs to tick 2881.
-- **Next:** a real pie.
+- **Next:** draw the menu with `sims_ui::pie` (#157), which is ported
+  from the original's menu window, in place of the plain list.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
     on Manage Inventory operation 4 and scope 12. Every
@@ -2123,8 +2131,6 @@ through their public interfaces only; the simulation never depends on it.
   - `sims-people`: which person drew each pixel (`draw_on_lot` with an
     owner per pixel), so `sims-game` need not repeat its drawing loop
     to find the person a click lands on.
-  - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
-    and dialogs are. `sims-game` draws a plain list until then.
 
 ## Working rules
 
