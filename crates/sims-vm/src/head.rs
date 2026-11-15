@@ -312,7 +312,7 @@ impl Interpreter<'_> {
             .ok_or_else(|| Trap::native(10, "missing object"))?
             .guid;
         let skeleton = self.skeleton(guid)?;
-        if a.carry_selection != -1 {
+        if a.carry_selection != -1 || a.carry.is_some() {
             return Err(unsupported(
                 "0x5992b3",
                 &format!("person {id}'s pose with a carry layer"),

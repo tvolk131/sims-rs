@@ -1425,8 +1425,20 @@ stack object the fourth capture shows.
 **Not verified.** The primitive against a capture of its own; tick 417
 has not run to its end yet.
 
-**Stops.** Tick 417: the same tree then animates on the carry slot
-(Animate Sim, `0x589571`), which is not ported.
+**Animate Sim on the carry slot** (flag 0x10 alone, `0x589683`;
+`animate.rs`). The same tree then plays a clip on person 21's carry
+slot. The clip starts there and repeats at priority 10, the carry mode
+becomes 6 so the animator's tick leaves the slot alone, and the tree
+takes the true branch at once to node 7, as the capture does. Clip 0
+clears the slot. The animator keeps the carry layer (snapshot format
+21) and updates it with the foreground layer in the skin's list order.
+
+**Not verified.** The carry layer's fields against a capture; tick 417
+has not run to its end yet.
+
+**Stops.** Tick 417, node 7 of the same tree: Run Functional Tree
+(opcode 20), which is not ported. The capture runs tree 8215 of object
+174, then trees 4105 and 4112 of object 52.
 
 ## Track: drawing people (`crates/sims-people`)
 

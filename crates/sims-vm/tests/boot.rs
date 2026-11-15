@@ -6,8 +6,8 @@ use sims_vm::boot::{Frames, Lot, StepError};
 use std::path::PathBuf;
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 33 --answers 3`
-/// gives this hash with the default frames (snapshot format 20).
-const TICK_33: &str = "110684d928b681dd490df1ef48f4b06935c0f3ef6276b3e7ee89668816fcfc8f";
+/// gives this hash with the default frames (snapshot format 21).
+const TICK_33: &str = "f04b6b12f014338ffae07e2991a99d70791ef7bd9699fe9c659714804e846c1e";
 
 #[test]
 fn the_goth_house_steps_to_tick_33() {

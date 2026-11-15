@@ -12,7 +12,9 @@
 //! the animator's clock, the speed it plays at, its state, whether it has
 //! placed itself on the person's tile, the posture and carry bookkeeping,
 //! Animate Sim's progress through a clip's events, the queue of events,
-//! the foreground layer's clock, from which "done" is decided, and
+//! the foreground layer's clock, from which "done" is decided, the carry
+//! layer's clock, whose clip's timed events count like the foreground's,
+//! and
 //! whether the person's appearance is to be read again before the next
 //! clip.
 //!
@@ -107,6 +109,8 @@ pub const LOADED: Animator = Animator {
     undrawn: true,
     walking: false,
     head: Head::LOADED,
+    carry: None,
+    carry_first: false,
 };
 
 /// A person's animator: the fields of the object at person +0xadc that
@@ -192,6 +196,22 @@ pub struct Animator {
     /// +0x210 to +0x224: where the head looks and how far it is turned
     /// ([`crate::head`]).
     pub head: Head,
+    /// The carry slot (+0x13c): a clip Animate Sim plays there (flag 0x10
+    /// alone, 0x589683), repeating at priority 10 while
+    /// [`Animator::carry_mode`] is 6. The carry clip the animator's tick
+    /// chooses (0x5903a3) would start here too; that is not ported.
+    pub carry: Option<Layer>,
+    /// Whether the carry layer comes before the foreground layer in the
+    /// skin's list (skin +0x7c), which the skin's update goes through in
+    /// order (0x5992b3), so the earlier layer's timed events are handled
+    /// first. A new layer goes in before the first layer whose priority
+    /// is above 1 (0x599128, from 0x592726, which makes every layer at
+    /// priority 1 and sets its own priority after). So a carry layer goes
+    /// before a foreground layer of raised priority (6) and after one of
+    /// priority 1, and a new foreground layer always goes before the
+    /// carry layer (priority 10). The base layer, whose clip has no
+    /// events, is left out of this.
+    pub carry_first: bool,
 }
 
 /// What the animator keeps while it follows a route (states 3 to 10):
@@ -696,7 +716,9 @@ impl Animator {
     /// - The foreground clip is removed and the selection set to -1
     ///   (virtual function 0xfc, 0x586b63); the blend, carry and base
     ///   slots are emptied (0x592878). Removing a layer marks the skin's
-    ///   layers changed.
+    ///   layers changed. The carry layer is removed at once: 0x592878
+    ///   fades a layer out instead only when byte 0x6f6bd0 is set, which
+    ///   holds 0 in the memory image of a running game.
     /// - The event queue is emptied and nothing plays (+0xa0).
     ///
     /// The speed, its target, the clocks, the pickup flag, the count of
@@ -734,6 +756,9 @@ impl Animator {
         self.selection = -1;
         if self.base {
             self.base = false;
+            self.skin_dirty = true;
+        }
+        if self.carry.take().is_some() {
             self.skin_dirty = true;
         }
         self.events.clear();
