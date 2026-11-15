@@ -54,8 +54,8 @@ pub struct Candidate {
     pub position: [i32; 2],
     /// +8: how good it is; only candidates above 0 become goals.
     pub score: i32,
-    /// Word +0xc: nonzero sends the end of planning down a path that is
-    /// not ported.
+    /// Word +0xc: the seat beside the place, whose Sit tree ends the
+    /// route (0x45c430), or 0 for a place to stand.
     pub word_c: i16,
     /// Word +0xe, `None` where the original left it uninitialized.
     pub word_e: Option<i16>,
