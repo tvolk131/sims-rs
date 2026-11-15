@@ -191,7 +191,7 @@ fn function_8_needs_a_person_whose_word_65_is_at_most_1() {
 }
 
 #[test]
-fn a_missing_stack_object_is_error_0x15_and_flag_1_fails_loudly() {
+fn a_missing_stack_object_is_error_0x15() {
     let mut fx = sim_runs(functional(15, 0));
     fx.sim_mut().stack[0].stack_object = 77;
     let fault = turn(&mut fx).unwrap_err();
@@ -199,12 +199,37 @@ fn a_missing_stack_object_is_error_0x15_and_flag_1_fails_loudly() {
         matches!(fault.trap, Trap::Native { code: 0x15, .. }),
         "{fault:?}"
     );
-    // A person that notes the flag would note the object at person
-    // +0xa54, which is not modeled.
+}
+
+#[test]
+fn flag_1_makes_the_object_the_icon_of_the_running_action() {
     let mut fx = sim_runs(functional(0, 1));
-    let fault = turn(&mut fx).unwrap_err();
-    assert!(
-        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("+0xa54")),
-        "{fault:?}"
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    person.active.target = SIM as i16;
+    person.active.icon = 3;
+    // The use notes the flag, and the lamp becomes the icon of the Sim's
+    // running action (person +0xa54, 0x45e5d4).
+    assert_eq!(turn(&mut fx).unwrap(), Status::Yielded);
+    assert_eq!(uses(&fx), [(LAMP as i16, 2, 1)]);
+    assert_eq!(fx.sim().person.as_ref().unwrap().active.icon, LAMP as i16);
+    // The action returns. The flagged use ends, noting its object again
+    // (0x45e665), and with no use left the running action ends: it is
+    // the last action now, the lamp its icon.
+    assert_eq!(turn(&mut fx).unwrap(), Status::Returned(true));
+    assert_eq!(uses(&fx), []);
+    let person = fx.sim().person.as_ref().unwrap();
+    assert_eq!(
+        (person.last.target, person.last.icon),
+        (SIM as i16, LAMP as i16)
     );
+    assert_eq!(person.active.table_index, -1);
+    // An object that is not a person notes no use and no icon.
+    let mut fx = sim_runs(functional(0, 1));
+    fx.add(
+        LAMP_FILE,
+        4200,
+        tree(vec![ins(20, RETURN_TRUE, RETURN_FALSE, functional(0, 1))]),
+    );
+    assert_eq!(fx.run_with(LAMP, 4200, LAMP as i16, &[], 100), Ok(true));
+    assert_eq!(fx.sim().person.as_ref().unwrap().active.icon, 0);
 }

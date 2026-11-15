@@ -219,15 +219,62 @@ fn the_snack_order_pays_for_the_snack() {
     let carry = a.carry.as_ref().unwrap();
     assert!(carry.ended && carry.finished());
     // Step 836: walking with the snack, his animator turns by less than a
-    // step (0x58dfc0).
+    // step (0x58dfc0). It has arrived, so it faces its destination's
+    // direction at once (0x58dfcf) and stands.
+    let update = lot.step_play().unwrap();
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    let a = &lot.world().animators[&sim];
+    assert_eq!(a.state, 3);
+    assert_eq!(
+        a.position.map(|v| v.to_bits()),
+        [0x4394_0000, 0x43e0_0000, 0x3fb4_6fe8]
+    );
+    assert_eq!(a.destination, a.position);
+    for step in 837..1035 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+    }
+    // Step 1035: his tree 0x1050 runs object 121's function with flag 1
+    // (Run Functional Tree): the object becomes his running action's icon
+    // (person +0xa54, 0x45e5d4), and the use keeps the flag.
+    let person = |lot: &Lot| lot.world().objects[&sim].person.clone().unwrap();
+    assert_eq!(person(&lot).active.icon, 263);
+    let update = lot.step_play().unwrap();
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    let after = person(&lot);
+    assert_eq!((after.active.target, after.active.icon), (263, 121));
+    let uses: Vec<_> = after
+        .object_uses
+        .iter()
+        .map(|u| (u.target, u.unknown))
+        .collect();
+    assert_eq!(uses, [(263, 0), (121, 1)]);
+    for step in 1036..1088 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+    }
+    // Step 1088: his tree 0x1002 takes the snack (object 263, in his hand)
+    // off the lot (Find Location For mode 1, 0x44b519).
+    assert_eq!(lot.world().objects[&263].data[2], sim as i16);
+    let update = lot.step_play().unwrap();
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    let snack = &lot.world().objects[&263];
+    assert_eq!((snack.position, snack.data[2]), ([-16, -16, 1], 0));
+    for step in 1089..1104 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+    }
+    // Person 259 turns by less than a step too, at step 1103. At step 1104
+    // it removes itself (Remove Object Instance in tree 374), and taking a
+    // person off the lot is not ported.
     let update = lot.step_play().unwrap();
     let [error] = &update.errors[..] else {
         panic!("{:?}", update.errors);
     };
-    assert_eq!((error.object, error.tick), (sim, 89279));
+    assert_eq!((error.object, error.tick), (259, 89547));
+    let fault = error.fault.to_string();
     assert!(
-        error.fault.to_string().contains("0x58dfc0"),
-        "{}",
-        error.fault
+        fault.contains("taking a person off the lot") && fault.contains("tree 0x0176 node 27"),
+        "{fault}"
     );
 }

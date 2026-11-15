@@ -11,6 +11,7 @@ use crate::factory::{WIDGET, widgets};
 use crate::person_factory::equip;
 use crate::rooms::{array, build};
 use crate::support::*;
+use sims_formats::saved_objects::Multipart;
 use sims_vm::Trap;
 
 /// The opcodes under test.
@@ -149,10 +150,38 @@ fn find_location_needs_its_objects() {
 }
 
 #[test]
+fn mode_1_takes_the_object_off_the_lot() {
+    let (mut fx, _) = placeable();
+    let id = widget(&mut fx);
+    assert_eq!(find(&mut fx, 0, id, 0), Ok(true));
+    assert_eq!(fx.world.objects[&id].position, [24, 24, 1]);
+    // Its virtual function 0x50 (0x44b55f): off the lot, and the true
+    // branch.
+    let mode_1 =
+        |fx: &mut Fixture, target: i16| run(fx, 0, target, FIND_LOCATION, [1, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(mode_1(&mut fx, id as i16), Ok(true));
+    assert_eq!(fx.world.objects[&id].position, [-16, -16, 1]);
+    // The tile is free again.
+    let other = widget(&mut fx);
+    assert_eq!(find(&mut fx, 0, other, 0), Ok(true));
+    assert_eq!(fx.world.objects[&other].position, [24, 24, 1]);
+    // A tile of a group, which the original tests first (0x42344e), fails
+    // loudly.
+    fx.world.objects.get_mut(&other).unwrap().multipart = Some(Multipart {
+        offset: [0; 3],
+        group: [0; 3],
+        parent: 0,
+    });
+    let result = mode_1(&mut fx, other as i16);
+    assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("0x44b52a")));
+    assert_eq!(fx.world.objects[&other].position, [24, 24, 1]);
+}
+
+#[test]
 fn other_find_location_modes_fail_loudly() {
     let (mut fx, _) = placeable();
     let id = widget(&mut fx);
-    for mode in 1..=5 {
+    for mode in 2..=5 {
         let result = run(
             &mut fx,
             0,

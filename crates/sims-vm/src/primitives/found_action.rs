@@ -97,7 +97,7 @@ impl Machine<'_, '_> {
                  the original yields: {fault}"
             ))
         })?;
-        self.count_use(target)?;
+        self.count_use(target, false)?;
         let last_result = self.me()?.last_result;
         self.set_action(action, last_result)?;
         Ok(Flow::Pushed)
