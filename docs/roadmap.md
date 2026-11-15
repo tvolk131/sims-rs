@@ -60,8 +60,8 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 408 on the Goth house**: our
-  state after every one of ticks 1 to 408 equals the fourth capture of the
+  there, as three captures recorded). **K = 416 on the Goth house**: our
+  state after every one of ticks 1 to 416 equals the fourth capture of the
   original (full state after every update) in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
@@ -1381,12 +1381,52 @@ bind; that this matches the original's registry is not verified. The suit
 form and taking an accessory off are ported from the code but not
 reached.
 
-**Differs.** Tick 409: person 18's route plays "route waiting
-animation" (step 14), and person 18 looks at person 16 where the
-capture has it look at person 259 (person word 41 and the head's
-target). This is the first tick that differs, and it is silent: the
-route step it comes from was ported in "Ticks 367 to 367" but first
-runs here.
+**Differs.** Tick 409, until fixed in "Ticks 409 to 416".
+
+### Ticks 409 to 416
+
+**The person vector.** In tick 409 person 18's route plays "route
+waiting animation" (step 14). Its tree looks round the people in its
+room (Set To Next mode 1, then a draw for each), and the original looked
+at person 259 where ours looked at person 16. Set To Next walks the
+original's person vector (`0x44efb4`), not the list of objects, and
+person 259, made at run time, comes after the people the load read,
+where it heads the object list. The world now keeps that vector
+(`World::people`, snapshot format 20): the load's people in
+registration order, each person made since at the end, and a removed
+person out. Modes 1 and 12 walk it.
+
+**Compared with the original.** After every one of ticks 409 to 416 our
+state equals the fourth capture's in every field compared, with the
+same head exception. The two orders draw the same number of times, so
+the random streams agreed before the fix too; only the person looked at
+differed.
+
+**Not verified.** That a person made at run time joins the end of the
+vector is read from the draws in tick 409, not from the code that adds
+it, which was not found; nor is when in the making it joins. No capture
+page holds the vector.
+
+**Stops.** Tick 417: person 21 runs Find Best Object for Function
+(opcode 14), which is not ported.
+
+### Tick 417
+
+**Find Best Object for Function** (opcode 14, `0x44f2bf`,
+`find_best_object.rs`). Person 21's bookcase tree (0x1014) asks for the
+best object for function 8. The primitive walks the lot's objects in
+registration order and scores each that has an action for the
+function's callback: its score (an attribute, or 50) less the
+"functional distance attenuation" (3) times its distance, and at least
+1. Room flags, a check tree per entry, and an origin other than the
+running object narrow or change the walk. It picks object 174, the
+stack object the fourth capture shows.
+
+**Not verified.** The primitive against a capture of its own; tick 417
+has not run to its end yet.
+
+**Stops.** Tick 417: the same tree then animates on the carry slot
+(Animate Sim, `0x589571`), which is not ported.
 
 ## Track: drawing people (`crates/sims-people`)
 
@@ -1499,11 +1539,13 @@ stop-sounds events.
   the camera and the hour move, on the score's beat. The ambience modes
   (52) and the ambience half of the music modes (36) are ported, so 24
   events remain.
+- **Done: live playback.** The `play` example plays events (and the
+  ambience) on the default output device, behind the `playback`
+  feature (cpal), off by default; tests and CI build none of it.
 - **Next:**
   - The simulation emits `SoundEvent`s (the interface is in the
     decisions log), and gives the camera value and the hour for the
     ambience's cursor.
-  - Live playback behind a feature.
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)
@@ -1551,26 +1593,39 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   digest at 800×600 and 1280×720, gated on `SIMS_INSTALL`. `sims-viewer
   --hud` shows it over the lot. Camera buttons move the camera; the
   other commands are printed, since the simulation cannot take them yet.
-- **Next:** a message dialog with buttons drawn from a real dialog
-  string; pie menus; the other live panels.
+- **Done: message dialogs.** The dialog a script's Dialog instruction
+  shows (one, two or three buttons) is read from the record and the
+  caller's string table and drawn with the original's fonts, icon and
+  button art. Measured against two screenshots of the original
+  ("Magic Town", "Studio Town"). Inside the frame they match except for
+  5 pixels, and the button except for its white label under the pointer.
+  The frame's corners are close but not exact. "Magic Town" is pinned by
+  layout and digest, gated on `SIMS_INSTALL`. `sims-viewer --hud` shows a
+  waiting dialog, and its answer is printed.
+- **Next:** open houses through `sims_vm::boot::Lot` (which now runs the
+  household load) in the tests and the viewer, in place of their
+  stand-in for steps 17 and 18; pie menus; a Yes/No dialog checked
+  against the original (the "Help System" one at tick 2) for the layout
+  of several buttons; text entry dialogs; the other live panels.
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
   - A command intake, for example `World::apply(&mut self, command:
     sims_sim::Command) -> Result<(), CommandError>`, run between ticks,
     taking: select a Sim (object ID), set the speed, pause or run, go
     to a mode, answer a dialog (caller, button), and choose a pie menu
     entry (Sim, object, interaction).
-  - A library form of the boot's household load (`sims boot` steps 17
-    and 18): `World::load_household(&mut self, family: &Family)` that
-    sets the funds and selects the first member. Today the CLI does it
-    and a host that opens a house gets the house file's funds and no
-    selection.
   - The household's member order kept in the world, for example
     `World::household(&self) -> &[u32]` (GUIDs), so the portraits do
     not need the neighborhood file.
   - The game speed, for example `World::speed(&self) -> u8`.
-  - A pending dialog's text resolved: `Dialog::text(&self, world:
-    &World) -> DialogText` with the message, the button labels and the
-    title, read from the caller's tree's string table.
+  - A way to leave a dialog waiting: `sims boot` answers each dialog as
+    it is made, so no snapshot holds one for the viewer to show. For
+    example, an answer policy in the boot runner that stops at the first
+    dialog without an answer and leaves it at status 0. The intake then
+    answers it.
+  - The frame that ran the Dialog instruction, for example
+    `Dialog::owner(&self) -> u16` (the code owner's type). Today the
+    interface takes the caller's top stack frame, which is right only
+    while the caller waits on the dialog.
   - Each Sim's current action and its icon, for the icons over the
     portraits.
 

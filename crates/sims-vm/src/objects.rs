@@ -236,6 +236,7 @@ impl Interpreter<'_> {
         }
         world.objects = objects;
         world.order = order.clone();
+        world.people = world.registered_people();
         world.next_parts = next_parts;
         Ok(SavedRead {
             objects: order,
