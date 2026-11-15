@@ -490,11 +490,31 @@ impl Game {
                     });
                 } else {
                     self.note = why.map(|why| format!("Every entry is shown, as {why}"));
-                    self.hud.menu = Some(Menu::new(person, object, listing.entries, point));
+                    self.hud.menu = Some(Menu::new(
+                        person,
+                        object,
+                        listing.entries,
+                        point,
+                        &self.hud.art,
+                        self.view.size,
+                    ));
                 }
             }
             Err(e) => self.note = Some(format!("Object {object}'s menu is not listed: {e}")),
         }
+    }
+
+    /// The pie menu, while one is open. Its labels are placed when the
+    /// game is rendered.
+    pub fn menu(&self) -> Option<&Menu> {
+        self.hud.menu.as_ref()
+    }
+
+    /// Where the window is to move the pointer (canvas pixels), once:
+    /// the original moves it to the middle of a pie menu that opened
+    /// elsewhere than asked, and of a submenu that opens.
+    pub fn take_pointer(&mut self) -> Option<[i32; 2]> {
+        self.hud.take_pointer()
     }
 
     /// Closes the pie menu; false if none was open.
