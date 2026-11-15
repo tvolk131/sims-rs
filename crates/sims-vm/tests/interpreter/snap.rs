@@ -179,22 +179,81 @@ fn slot_flag_0x1000_turns_me_with_the_object() {
 #[test]
 fn upstairs_a_person_needs_a_floor() {
     let (mut fx, me) = snapper(SKIP_CHECKS);
-    fx.lamp_mut().position = [40, 40, 2];
+    // Tile (3, 2) on level 2: the floor cell is column 3, row 2.
+    fx.lamp_mut().position = [56, 40, 2];
     let start = fx.world.clone();
     // Without placement flag 0x200 a tile above the ground needs a floor
     // (0x4330b7). The person does not fit, and what the original does
-    // then is not ported.
+    // then is not ported. A floor on tile (2, 3) is not this tile's.
+    fx.world.arrays.get_mut(&101).unwrap().data[(2 * 64 + 3) * 2] = 1;
     let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
     assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454e09")));
-    // With a floor, and placement flag 1 to stand on one, it does.
-    fx.world = start;
-    let floors = &mut fx.world.arrays.get_mut(&101).unwrap().data;
-    floors[(2 * 64 + 2) * 2] = 1;
+    // With a floor (here in the word's high byte), and placement flag 1
+    // to stand on one, it does.
+    fx.world = start.clone();
+    fx.world.arrays.get_mut(&101).unwrap().data[(3 * 64 + 2) * 2 + 1] = 1;
     fx.world.objects.get_mut(&me).unwrap().data[42] |= 1;
     assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
     let person = &fx.world.objects[&me];
-    assert_eq!(person.position, [40, 40, 2]);
+    assert_eq!(person.position, [56, 40, 2]);
     assert_eq!(person.data[29], 1024);
+    // Placement flag 0x200 skips the test: no floor is needed.
+    fx.world = start;
+    fx.world.objects.get_mut(&me).unwrap().data[42] |= 0x200;
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+    assert_eq!(fx.world.objects[&me].position, [56, 40, 2]);
+}
+
+#[test]
+fn a_person_with_no_animator_entry_has_the_loaded_one() {
+    // A person whose animator has not run has no entry; Snap writes the
+    // loaded animator as its entry, unset and placed again.
+    let (mut fx, me) = snapper(SKIP_CHECKS);
+    fx.lamp_mut().position = [72, 24, 1];
+    fx.world.animators.remove(&me);
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+    let mut expected = sims_sim::animator::LOADED;
+    expected.position = floats([72, 24, 3]);
+    expected.destination = expected.position;
+    let animator = &fx.world.animators[&me];
+    assert_eq!(animator.position, expected.position);
+    assert_eq!(animator.destination, expected.destination);
+    assert_eq!(animator.clock, expected.clock);
+}
+
+#[test]
+fn the_slot_tables_own_record_and_flags_come_first() {
+    // Flags the table holds in place of the type's: here they add
+    // 0x1000, so the direction follows the lamp.
+    let (mut fx, me) = snapper(SKIP_CHECKS);
+    fx.lamp_mut().position = [56, 24, 1];
+    fx.lamp_mut().data[1] = 6;
+    fx.world
+        .routing
+        .slot_flags
+        .insert((LAMP, 0), (SKIP_CHECKS | TURNED) as i32);
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+    assert_eq!(fx.world.objects[&me].data[1], 6);
+    // A record written over the type's is used whole: here it has no
+    // flag 0x800.
+    let (mut fx, me) = snapper(SKIP_CHECKS);
+    fx.lamp_mut().position = [56, 24, 1];
+    let record = sims_sim::route::RouteSlot {
+        offset: [0; 3],
+        number: 1,
+        standing: 0,
+        sitting: 0,
+        ground: 0,
+        flags: 0,
+        snap_target: -1,
+        proximity: [16; 3],
+        gradient: 0,
+        facing: -2,
+        resolution: 16,
+    };
+    fx.world.routing.slots.insert((LAMP, 0), record);
+    let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x4550d8")));
 }
 
 #[test]

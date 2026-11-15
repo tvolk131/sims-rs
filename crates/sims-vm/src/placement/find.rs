@@ -521,13 +521,13 @@ impl Interpreter<'_> {
         }
         let index = level_index(level).map_err(fail)?;
         let at = cell(a, b).map_err(fail)?;
-        let floor = {
+        let floor = |world: &World| -> Result<u16, Fault> {
             let floors = array(world, FLOORS[index], 2).map_err(fail)?;
-            u16::from_le_bytes([floors[at * 2], floors[at * 2 + 1]])
+            Ok(u16::from_le_bytes([floors[at * 2], floors[at * 2 + 1]]))
         };
         // Codes 0x12 and 0x29: which of the two depends on the level the
         // player looks at (0x4a6757), which no caller here tells apart.
-        if placement & 0x200 == 0 && level > 1 && floor == 0 {
+        if placement & 0x200 == 0 && level > 1 && floor(world)? == 0 {
             return Ok(Err(Refusal::Other));
         }
         let water = level == 1 && array(world, WATER, 1).map_err(fail)?[at] != 0xff;
@@ -565,6 +565,7 @@ impl Interpreter<'_> {
                 return Ok(Err(Refusal::Other));
             }
         }
+        let floor = floor(world)?;
         // Codes 0x13 and 0x2a, then 0x14.
         if placement & 1 == 0 && (floor != 0 || (level == 1 && pool == 0x10)) {
             return Ok(Err(Refusal::Other));

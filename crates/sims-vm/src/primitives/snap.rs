@@ -36,19 +36,24 @@
 //!    lot's border, the room and the walls in the way (0x4550d8 to
 //!    0x4551e9); a slot without it fails loudly.
 //! 5. I am put there if I fit (the place test, virtual function 0x54,
-//!    `Interpreter::fits`): the lot is told (virtual function
-//!    0x58, `Interpreter::put`) and my facing (data word 1)
-//!    becomes the direction. If I am a person, my animator's position is
-//!    unset (its virtual function 0x20, 0x589361), and once Snap has
-//!    zeroed the animator's offset from me (+0x8c to +0x94, virtual
-//!    function 0x2c, 0x58933b) the animator places itself on my tile
-//!    again (virtual function 0x60, `animator::place`). The
-//!    branch is true.
+//!    `Interpreter::fits`), in this order:
+//!    - the lot is told (virtual function 0x58, `Interpreter::put`);
+//!    - my facing (data word 1) becomes the direction;
+//!    - if I am a person, my animator's position is unset (its virtual
+//!      function 0x20, 0x589361);
+//!    - object data word 52 (+0xb2) becomes 0;
+//!    - if I am a person, Snap zeroes the animator's offset from me (+0x8c
+//!      to +0x94, virtual function 0x2c, 0x58933b) and the animator places
+//!      itself on my tile again (virtual function 0x60, `animator::place`).
+//!      A person with no animator entry has the one the load leaves, which
+//!      the write makes its entry.
 //!
-//! Object data word 52 (+0xb2) then becomes 0. When I do not fit, the
-//! original sets it, and word 54 (+0xb6), from the placement error and
-//! the object collided with (0x454e09 to 0x454e9b), and the branch is
-//! false; that fails loudly.
+//!    The branch is true. An object that is not a person snaps the same
+//!    way, without the animator.
+//!
+//! When I do not fit, the original sets word 52, and word 54 (+0xb6),
+//! from the placement error and the object collided with (0x454e09 to
+//! 0x454e9b), and the branch is false; that fails loudly.
 //!
 //! Flag bit 0 makes the animator's offset my distance from the place
 //! (0x454c7a), which the animator's later placing adds to my position;
@@ -63,7 +68,7 @@ use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
 use crate::placement::{Place, on_lot};
 use crate::routing::slot::route_slot;
-use sims_sim::animator::UNSET;
+use sims_sim::animator::{Animator, LOADED, UNSET};
 
 /// The mode that names a routing slot of the stack object by word 0.
 const SLOT: i16 = 3;
@@ -154,9 +159,6 @@ impl Machine<'_, '_> {
             ));
         }
         let person = self.me()?.person.is_some();
-        if person {
-            self.animator()?;
-        }
         let to = [position[0], position[1]];
         let level = position[2];
         let interpreter = self.interpreter();
@@ -178,22 +180,19 @@ impl Machine<'_, '_> {
             .map_err(|f| f.trap)?;
         self.set_datum(FACING, direction as i16)?;
         if person {
-            self.animator()?.position = [UNSET; 3];
+            self.animator().position = [UNSET; 3];
         }
         self.set_datum(WORD_52, 0)?;
         if person {
             let own = self.me()?.position;
-            place(self.animator()?, own, direction as i16);
+            place(self.animator(), own, direction as i16);
         }
         Ok(true)
     }
 
-    /// My animator, which every person has.
-    fn animator(&mut self) -> Result<&mut sims_sim::animator::Animator, Trap> {
-        let me = self.me;
-        self.world
-            .animators
-            .get_mut(&me)
-            .ok_or_else(|| Trap::Invalid(format!("person {me} has no animator")))
+    /// My animator. A person with no entry has the one the load leaves
+    /// ([`LOADED`]), which is written here as the entry.
+    fn animator(&mut self) -> &mut Animator {
+        self.world.animators.entry(self.me).or_insert(LOADED)
     }
 }

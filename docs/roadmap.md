@@ -1527,14 +1527,15 @@ offset and flag 0x800, which skips the placement's own checks of the
 border, the room and the walls. The person runs the place test, is put
 where 207 stands (level 2, room 1025) and keeps its facing. Its animator
 is unset and places itself again. The original goes through floats
-(times 3/16 and back times 16/3); for a zero offset that round trip
-keeps the position exactly. A slot with an offset, a snap target, no
+(times 3/16 and back times 16/3); for a zero offset and coordinates up
+to 0x8000 that round trip keeps the position exactly. A slot with an offset, a snap target, no
 flag 0x800, operand flag 0, the other modes, and a person who does not
 fit, all fail loudly.
 
 **The upper level's floor test** (`0x4330b7`). Above the ground, an
-object without placement flag 0x200 needs a floor on its tile. That
-was the place test's last step left unported for a person.
+object without placement flag 0x200 needs a floor on its tile. It
+was the step of the place test that kept a person off an upper level;
+a person whose person word 84 has bit 0 still fails loudly there.
 
 **K = 608.** Our state after every tick from 584 to 608 equals the
 fourth capture in everything compared, the three random streams

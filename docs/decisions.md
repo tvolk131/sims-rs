@@ -135,7 +135,9 @@ shows the person afterwards where 207 stands, on level 2, in room 1025.
 
 **Decided.** Port only mode 3 (a routing slot of the stack object).
 Within it, port only the case the house reaches: no snap target, flag
-0x800, operand flag 0 clear, and a person who fits. Everything else
+0x800, operand flag 0 clear, and a snapping object that fits. That
+object is a person in the house; an object that is not one snaps the
+same way, without the animator. Everything else
 fails loudly with its address. Each of the other branches needs code
 we do not have:
 
