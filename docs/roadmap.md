@@ -68,6 +68,16 @@ events, and what it asks for after them) come first.
   the snack order's). Step 2 continues from there.
 - Of the base neighborhood's houses only the Goths' and the Newbies'
   (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
+  tick 1802; a route that gives up on a slot it may end near runs the
+  Route failure feedback tree (tick 1473). Against the recording of the
+  house (updates 0 to 935), every update's random streams, scheduler
+  cursor, action serial, globals and objects, and each object's data,
+  temps, attributes, frames and person data match, except the words the
+  original left from memory it never set (person word 37, locals on half
+  a pointer) and global 12 at updates 1 and 3 (the interface's tutorial
+  wait). At tick 1803 object 290 needs Create New Object Instance mode 6
+  with flag 0x4, which track 3 is porting for the Goths' snack order.
+
   tick 1472, with no recording to compare yet; at tick 1473 object 105
   gives up a route and needs the route-failure feedback tree (0x45af2a),
   which is not ported.
@@ -2013,11 +2023,11 @@ stop-sounds events.
   river loops and the slow fade into live mode. `play_trk` hands on the
   caller's arguments and `source`, and `kill_trk` ends the whole track.
 - **Done: the piano** (43). The piano track plays where its object is,
-  replaces the piano's instances with that object, and the skill track
-  starts with the object's skill (0x573e5a). A track's start now also
-  sets its levels from its arguments, as the track's `args` field says
-  (0x57db01). 2 events of kinds not ported remain, 103 and 104, which
-  are debug commands.
+  replaces the piano's instances with its track object's own object,
+  and the skill track starts with the object's skill (0x573e5a). A
+  track's start now also sets its levels from its arguments, as the
+  track's `args` field says (0x57db01). 2 events of kinds not ported
+  remain, 103 and 104, which are debug commands.
 - **Next:**
   - Placing the tracks again when the camera moves (kind 33), once the
     game sends it only then.
