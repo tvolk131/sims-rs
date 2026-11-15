@@ -1738,8 +1738,20 @@ Progress:
   Goths' lot until a step stops it (or 3000 ticks) and draws everyone
   placed every 30 ticks, centred on the root bone, which a clip such as
   the stair climb carries away from the animator's position.
-- Next: match the original's lighting (see its decisions entry); compare
-  Mortimer standing without his book. The base layer's clip and phase are
+- Done: people in the lot renderer's view (`sims_people::People`,
+  `View`). An app keeps one `People`, calls `update` with the live world
+  each frame (new people and changed clothes are loaded, people who left
+  are forgotten), then `draw` with the lot renderer's camera, any zoom
+  and rotation, into any `raster::Target`, with a depth function shaped
+  like the lot renderer's `Depth::point`. A person stands on the terrain
+  under them. A gated test draws the Goths' lot's people at all four
+  rotations every 30 ticks and checks each is drawn where the lot
+  renderer projects them.
+- Next: draw into the lot renderer's canvas and depth once it takes
+  people (with the render track: `Canvas::put`, `Depth::point`, then the
+  per-level interleave); a person on an upper level stands at the floor,
+  without the original's offset. Match the original's lighting (see its
+  decisions entry); compare Mortimer standing without his book. The base layer's clip and phase are
   not simulation state yet, so the saved record and the animator's clock
   stand in.
 
