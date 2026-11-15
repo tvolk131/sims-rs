@@ -73,7 +73,10 @@ pub use memory::scope_name;
 pub use objects::SavedRead;
 pub use people::{curve_table, persistent_fields, reload_profile};
 pub use primitives::primitive_name;
-pub use program::{Callback, Career, DEFINITION_WORDS, Library, Program, Tree};
+pub use program::{
+    Callback, Career, DEFINITION_WORDS, ICON_FILE, Library, Program, Tree, icon_frames,
+    sprite_frames,
+};
 pub use selection::selected;
 pub use sounds::SoundEvent;
 pub use tick::{Answers, Player, Shown, TICK_BUDGET, TickError, Update};

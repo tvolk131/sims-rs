@@ -236,6 +236,8 @@ impl Interpreter<'_> {
             deleted.borrow_mut().push(id);
         }
         world.frame_storage.remove(&id);
+        // So does its headline list (0x4323ce).
+        world.headlines.remove(&id);
         // The object's slot table goes with it.
         world
             .routing

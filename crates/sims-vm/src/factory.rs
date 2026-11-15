@@ -326,12 +326,14 @@ impl<'a> Machine<'a, '_> {
     }
 
     /// The tail of an object's turn (0x4521f7): the lockout word counts
-    /// down.
+    /// down, and so does the first headline's duration
+    /// ([`Machine::count_headline`]).
     pub(crate) fn end_turn(&mut self) -> Result<(), Trap> {
         let object = self.me_mut()?;
         if object.data[LOCKOUT] != 0 {
             object.data[LOCKOUT] = object.data[LOCKOUT].wrapping_sub(1);
         }
+        self.count_headline();
         Ok(())
     }
 

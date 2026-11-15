@@ -282,12 +282,14 @@ impl Interpreter<'_> {
     ///    person's appearance reloaded ([`reload_profile`]). The reset
     ///    leaves the animator noting that the appearance is to be read
     ///    again, which the reload directly after does not clear.
-    /// 3. Its thread restarts at Main, and its Reset function (3) runs on
+    /// 3. Its headlines are cleared (0x45e8af,
+    ///    [`sims_sim::World::headlines`]).
+    /// 4. Its thread restarts at Main, and its Reset function (3) runs on
     ///    top of that.
-    /// 4. Person data words 0, 40 and 59 and data words 34 and 9 are
+    /// 5. Person data words 0, 40 and 59 and data words 34 and 9 are
     ///    cleared. So are the motive changes an action left running and
     ///    person data words 33, 71, 72 and 73.
-    /// 5. Each queued action is dropped, first to last, and its target is
+    /// 6. Each queued action is dropped, first to last, and its target is
     ///    asked function 4 with the person as the stack object.
     ///
     /// These fail, because the original does more for them and none was
@@ -401,6 +403,8 @@ impl Interpreter<'_> {
             .and_then(|o| o.person.as_mut())
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
         reload_profile(&mut person.data, profile).map_err(fail)?;
+        // Every headline is cleared (0x45e8af).
+        world.headlines.remove(&id);
         self.machine(world, id, 0, false)
             .install_main()
             .map_err(fail)?;

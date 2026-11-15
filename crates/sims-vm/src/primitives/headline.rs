@@ -21,26 +21,36 @@
 //!    priority (+0x34).
 //! 3. A duration of 0 clears the headline: its duration and its tick
 //!    count (+0x28) become 0 (0x46e042).
-//! 4. Any other duration shows an icon: a sprite from the kind and index
-//!    (0x416a6f), sized by the global sprite's frame count, or for kind 7
-//!    the catalog picture of an object, a neighbor or a local; then the
-//!    backdrop, the overlay, the flag and the duration from the options,
-//!    and the object is redrawn (0x434101) and the lot told
-//!    (0x44574b, which looks at the scheduler when the object is in a
-//!    Sleep). That fails loudly.
+//! 4. Any other duration shows an icon (from 0x44b7ed). The index is
+//!    byte 2, plus my temp 0 (object +0x3a) when option bit 12 is set.
+//!    Kind 7 shows the catalog picture of an object, a neighbor or a local
+//!    (0x44b811), which is not ported and fails. Any other kind names a
+//!    sprite ([`icon_sprite`], 0x416a0c and 0x416a6f); with none (0) the
+//!    call ends here. The sprite's frame count, from the headlines'
+//!    sprite cache ([`crate::Program::icon_frames`], 0x4c8deb), divided by
+//!    three, is the record's frame count (+0x1c, 0x46dfb5); if that is 0
+//!    the call ends here too. Then the backdrop (option byte 0, 0x416bc5),
+//!    the overlay (option bit 9) and the flag (option bit 8) are kept, and
+//!    the duration set: -1 as it is, otherwise the duration times the
+//!    frame count times 12 when option bit 11 is set (0x46e050), or the
+//!    duration as it is (0x46e042). Either clears the tick count. The
+//!    object is redrawn (0x434101) and woken (0x44574b,
+//!    [`Machine::wake`]).
 //!
-//! The branch is always true.
+//! The branch is always true. A call that ends early has still written
+//! the priority, so a headline already showing goes on showing with it.
 //!
-//! Because showing an icon is not ported, no headline here ever has a
-//! duration other than 0, so step 2 always takes the new priority, and a
-//! clear changes nothing that is kept: the priority is read only while a
-//! duration is not 0, and every call that sets one writes the priority
-//! first. So no headline state is kept yet, only whether the object has
-//! a headline at all. The other code that reads the list is unaffected
-//! for the same reason: Sleep's test (0x44aa57) that the first headline
-//! is not showing, the step after each run of an object's thread
-//! (0x4521f7, which counts a showing headline down and moves its
-//! animation, 0x46e004), and a reset that clears them all (0x45e8af).
+//! What the simulation reads of the record is kept in
+//! [`sims_sim::World::headlines`]: the priority and the duration, while
+//! the duration is not 0. The rest (the sprite and its animation, the
+//! backdrop, the overlay and the flag, written by 0x46dfb5 and from
+//! 0x44b956 to 0x44b9b9) is drawn, and is left out. The record is read by
+//! Sleep's test that the first headline is not showing (0x44aa57), by the
+//! tail of an object's tick (0x4521f7, which counts a positive duration
+//! down and moves the animation, 0x46e004, redrawing the object when the
+//! frame changes), by a person's reset, which clears them all (0x45e8af),
+//! and by the drawn bounds of an object (0x437ce8) and a person
+//! (0x45a07b).
 //!
 //! Ported from the original's code (above); the old prototype's port
 //! (legacy/crates/sims-vm/src/headline.rs) agrees. The comparisons that
@@ -48,9 +58,39 @@
 
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
+use crate::program::ICON_FILE;
+use sims_sim::Headline;
 
 /// The SLOT entry kind that makes a headline.
 const HEADLINE: u16 = 1;
+
+/// The kind whose icon is a catalog picture (0x44b80b).
+const PICTURE: u8 = 7;
+
+/// The first sprite of each kind (the table at 0x6c1f98: kind, then the
+/// sprite ID at +4), or none (0xffff) for kinds 0 and 7.
+const KIND_SPRITES: [u16; 11] = [0xffff, 100, 400, 200, 300, 500, 600, 0xffff, 700, 800, 900];
+
+/// Kind 0's sprites, by index (the table at 0x666758).
+const KIND_0_SPRITES: [i16; 19] = [
+    200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 400, 401, 402, 403, 404,
+];
+
+/// The sprite an icon of kind `kind` (not 7) and index `index` shows, or 0
+/// for none (0x416a0c, 0x416a6f): the kind's first sprite plus the index,
+/// in 16 bits; for kind 0, the index's entry of its own table when the
+/// index is from 0 to 18; none for any other kind.
+pub(crate) fn icon_sprite(kind: u8, index: i32) -> i16 {
+    match KIND_SPRITES.get(usize::from(kind)) {
+        Some(&first) if first != 0xffff => first.wrapping_add(index as u16) as i16,
+        _ if kind == 0 => usize::try_from(index)
+            .ok()
+            .and_then(|i| KIND_0_SPRITES.get(i))
+            .copied()
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
 
 impl Machine<'_, '_> {
     pub(crate) fn set_headline(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
@@ -68,14 +108,90 @@ impl Machine<'_, '_> {
         if !self.has_headline(target)? {
             return Ok(true);
         }
-        if word(operands, 4) == 0 {
+        let kind = operands[3];
+        let priority = if kind == 4 { 2 } else { 1 };
+        if let Some(showing) = self.world.headlines.get_mut(&target) {
+            if showing.priority > priority {
+                return Ok(true);
+            }
+            showing.priority = priority;
+        }
+        let duration = i32::from(word(operands, 4));
+        if duration == 0 {
+            self.world.headlines.remove(&target);
             return Ok(true);
         }
-        Err(Trap::Unsupported(format!(
-            "Set Balloon/Headline showing an icon of kind {} on object {target} (0x44b7ed), \
-             which is not ported",
-            operands[3]
-        )))
+        let options = word(operands, 6) as u16;
+        let mut index = i32::from(operands[2]);
+        if options & 0x1000 != 0 {
+            let temp = *self
+                .me()?
+                .temps
+                .first()
+                .ok_or_else(|| Trap::Invalid("the running object has no temp 0".into()))?;
+            index += i32::from(temp);
+        }
+        if kind == PICTURE {
+            return Err(Trap::Unsupported(format!(
+                "Set Balloon/Headline showing a catalog picture (kind 7, index {index}) on \
+                 object {target} (0x44b811), which is not ported"
+            )));
+        }
+        let sprite = icon_sprite(kind, index);
+        if sprite == 0 {
+            return Ok(true);
+        }
+        let frames = self
+            .program
+            .icon_frames
+            .as_ref()
+            .ok_or_else(|| {
+                Trap::Unsupported(format!(
+                    "Set Balloon/Headline showing sprite {sprite}, but the headlines' \
+                     sprites ({ICON_FILE}) were not read"
+                ))
+            })?
+            .get(&u16::try_from(sprite).map_err(|_| {
+                Trap::Unsupported(format!(
+                    "Set Balloon/Headline showing sprite {sprite}: looking up a negative \
+                     sprite ID (0x4c8deb) is not ported"
+                ))
+            })?)
+            .copied()
+            .unwrap_or(0)
+            / 3;
+        if frames == 0 {
+            return Ok(true);
+        }
+        let duration = if duration != -1 && options & 0x800 != 0 {
+            frames.wrapping_mul(duration).wrapping_mul(12)
+        } else {
+            duration
+        };
+        if duration == 0 {
+            self.world.headlines.remove(&target);
+        } else {
+            self.world
+                .headlines
+                .insert(target, Headline { priority, duration });
+        }
+        self.wake(target)?;
+        Ok(true)
+    }
+
+    /// The tail of an object's tick (0x4521f7) for its first headline
+    /// (0x46e004): a positive duration counts down, and at 0 the headline
+    /// stops showing. Its animation moves too, which only decides when
+    /// the object is redrawn.
+    pub(crate) fn count_headline(&mut self) {
+        if let Some(showing) = self.world.headlines.get_mut(&self.me)
+            && showing.duration > 0
+        {
+            showing.duration -= 1;
+            if showing.duration == 0 {
+                self.world.headlines.remove(&self.me);
+            }
+        }
     }
 
     /// Whether object `id` has a headline: its definition's SLOT has an

@@ -443,3 +443,52 @@ fn the_catalog_lists_controllers_in_the_originals_order() {
         .collect();
     assert_eq!(digest, CAPTURED);
 }
+
+/// A sprite header: the version and the count, in either byte order.
+fn sprite(version: i32, count: i32, big_endian: bool) -> Vec<u8> {
+    let words = [version, count, 0];
+    if big_endian {
+        words.iter().flat_map(|w| w.to_be_bytes()).collect()
+    } else {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+}
+
+#[test]
+fn headline_sprites_count_their_frames_as_the_sprite_cache_does() {
+    let bytes = iff(&[
+        (b"SPR#", 600, sprite(502, 9, true)),
+        (b"SPR#", 601, sprite(503, 18, false)),
+        (b"SPR#", 602, sprite(506, 15, true)),
+        (b"SPR#", 603, sprite(501, 7, false)),
+        (b"SPR#", 604, sprite(499, 9, false)),
+        // An SPR2 counts only where no SPR# has the ID.
+        (b"SPR2", 600, sprite(1000, 30, false)),
+        (b"SPR2", 605, sprite(1000, 6, false)),
+    ]);
+    let frames = sims_vm::sprite_frames(&sims_formats::iff::Iff::parse(bytes).unwrap()).unwrap();
+    assert_eq!(
+        frames.into_iter().collect::<Vec<_>>(),
+        [(600, 9), (601, 9), (602, 3), (603, 3), (604, 0), (605, 6)]
+    );
+    // A header that is a small number in neither order is not guessed at.
+    let bytes = iff(&[(b"SPR#", 600, vec![1, 0, 0, 1, 9, 0, 0, 0])]);
+    let error = sims_vm::sprite_frames(&sims_formats::iff::Iff::parse(bytes).unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("SPR# #600"), "{error}");
+}
+
+#[test]
+fn an_install_without_the_headline_sprites_reads_none() {
+    let dir = Dir::new("icons");
+    let (_, _) = setup(&dir);
+    let install = Install::detect(&dir.0).unwrap();
+    assert_eq!(sims_vm::icon_frames(&install).unwrap(), None);
+    dir.file(
+        "GameData/Sprites.iff",
+        &iff(&[(b"SPR#", 616, sprite(502, 9, true))]),
+    );
+    let frames = sims_vm::icon_frames(&install).unwrap().unwrap();
+    assert_eq!(frames[&616], 9);
+}

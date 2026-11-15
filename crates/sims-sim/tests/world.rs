@@ -8,7 +8,7 @@ use sims_sim::neighbors::{Family, Inventory, Item, Neighbor, Neighbors, Row};
 use sims_sim::rooms::{Half, Room, Rooms};
 use sims_sim::route::{Candidate, Context, Route, RouteSlot, Routing};
 use sims_sim::{
-    Budget, Dialog, Dialogs, FrameStorage, HouseUsage, MagicHistory, Object, PersonTick,
+    Budget, Dialog, Dialogs, FrameStorage, Headline, HouseUsage, MagicHistory, Object, PersonTick,
     ReadOnlySnapshots, Snapshots, TypeAttributes, Usage, Whereabouts, World,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -214,6 +214,13 @@ fn world() -> World {
                 stale: true,
             },
         ],
+        headlines: BTreeMap::from([(
+            5,
+            Headline {
+                priority: 2,
+                duration: -1,
+            },
+        )]),
         animators: BTreeMap::from([(5, animator())]),
         usage: HouseUsage {
             history: [
@@ -389,7 +396,24 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "d73a66741337b2527a28c856d5d94f1a91a6f7137a7ee199fcfc289bd21dcadb";
+const PINNED: &str = "992789f0d0ba45f0e3a203b4cdff77c9b180f5a1da7b99061e521ca5ae5b3d38";
+
+#[test]
+fn without_the_headlines_the_encoding_is_format_23() {
+    // Snapshot format 24 added the headlines at the end.
+    assert_eq!(digest(&format_23_bytes(&world())), PINNED_23);
+}
+const PINNED_23: &str = "d73a66741337b2527a28c856d5d94f1a91a6f7137a7ee199fcfc289bd21dcadb";
+
+/// The encoding of `world` as snapshot format 23 wrote it: without the
+/// headlines ([`World::headlines`]) that format 24 added at the end. The
+/// older formats' encodings start from this one.
+fn format_23_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let headlines = postcard::to_allocvec(&world.headlines).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - headlines.len()), headlines);
+    bytes
+}
 
 #[test]
 fn without_the_families_the_encoding_is_format_22() {
@@ -399,10 +423,11 @@ fn without_the_families_the_encoding_is_format_22() {
 const PINNED_22: &str = "a4e74a05e62ae6eaff009cb2b32fe752b07cc739492dc1d964c585d53e0d2d65";
 
 /// The encoding of `world` as snapshot format 22 wrote it: without the
-/// families ([`World::families`]) that format 23 added at the end. The
-/// older formats' encodings start from this one.
+/// families ([`World::families`]) that format 23 added at the end. It
+/// starts from [`format_23_bytes`], and the older formats' encodings from
+/// this one.
 fn format_22_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_23_bytes(world);
     let families = postcard::to_allocvec(&world.families).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - families.len()), families);
     bytes
