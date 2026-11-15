@@ -250,8 +250,43 @@ pub fn draw_part<T: Target + ?Sized>(
     lighting: Lighting,
     project: impl Fn(Vec3) -> Vec3,
 ) {
+    let shade: Vec<Shade> = skinned
+        .normals
+        .iter()
+        .map(|&n| Shade::Grey(lighting.shade(n)))
+        .collect();
+    draw_shaded(target, part, skinned, &shade, project);
+}
+
+/// How much light a vertex takes: the same for every channel, or one
+/// factor each for red, green and blue (a coloured light).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Shade {
+    Grey(f32),
+    Colour([f32; 3]),
+}
+
+impl Shade {
+    fn channels(self) -> [f32; 3] {
+        match self {
+            Shade::Grey(s) => [s; 3],
+            Shade::Colour(c) => c,
+        }
+    }
+}
+
+/// Draws one skinned part into `target` with each vertex's [`Shade`]
+/// given (one per vertex of the part's mesh). A grey shade goes to the
+/// target as it is; a coloured one lights each channel of the texel
+/// before it is written, with the target's own factor 1.
+pub fn draw_shaded<T: Target + ?Sized>(
+    target: &mut T,
+    part: &Part,
+    skinned: &Skinned,
+    shade: &[Shade],
+    project: impl Fn(Vec3) -> Vec3,
+) {
     let screen: Vec<Vec3> = skinned.positions.iter().map(|&p| project(p)).collect();
-    let shade: Vec<f32> = skinned.normals.iter().map(|&n| lighting.shade(n)).collect();
     for t in &part.mesh.triangles {
         let [a, b, c] = t.map(|i| i as usize);
         // A mesh whose triangles name vertices it lacks draws nothing
@@ -271,11 +306,7 @@ pub fn draw_part<T: Target + ?Sized>(
             target,
             [pa, pb, pc],
             [va.uv, vb.uv, vc.uv],
-            [
-                shade.get(a).copied().unwrap_or(1.0),
-                shade.get(b).copied().unwrap_or(1.0),
-                shade.get(c).copied().unwrap_or(1.0),
-            ],
+            [a, b, c].map(|i| shade.get(i).copied().unwrap_or(Shade::Grey(1.0))),
             part,
         );
     }
@@ -285,9 +316,10 @@ fn triangle<T: Target + ?Sized>(
     target: &mut T,
     mut p: [Vec3; 3],
     mut uv: [[f32; 2]; 3],
-    mut shade: [f32; 3],
+    mut shade: [Shade; 3],
     part: &Part,
 ) {
+    let grey = shade.iter().all(|s| matches!(s, Shade::Grey(_)));
     let (width, height) = target.size();
     let mut area = edge(p[0], p[1], p[2]);
     if area.abs() < 1e-8 || !area.is_finite() {
@@ -301,6 +333,7 @@ fn triangle<T: Target + ?Sized>(
         shade.swap(1, 2);
         area = -area;
     }
+    let channels = shade.map(Shade::channels);
     // The top-left rule: a pixel centre exactly on an edge belongs to
     // the triangle only if that is its top or left edge, so a pixel on
     // an edge two triangles share is drawn once, not twice.
@@ -357,14 +390,20 @@ fn triangle<T: Target + ?Sized>(
             }
             let u = w0 * uv[0][0] + w1 * uv[1][0] + w2 * uv[2][0];
             let v = w0 * uv[0][1] + w1 * uv[1][1] + w2 * uv[2][1];
-            let s = w0 * shade[0] + w1 * shade[1] + w2 * shade[2];
+            let s =
+                [0, 1, 2].map(|k| w0 * channels[0][k] + w1 * channels[1][k] + w2 * channels[2][k]);
             let texel = part.texture.sample(u, v);
             // A transparent texel (such as one a run-length bitmap skips)
             // draws nothing and hides nothing.
             if texel[3] == 0 {
                 continue;
             }
-            target.write(x, y, z, texel, s);
+            if grey {
+                target.write(x, y, z, texel, s[0]);
+            } else {
+                let lit = |k: usize| (f32::from(texel[k]) * s[k]).clamp(0.0, 255.0) as u8;
+                target.write(x, y, z, [lit(0), lit(1), lit(2), texel[3]], 1.0);
+            }
         }
     }
 }
@@ -601,7 +640,13 @@ mod tests {
         let (glass, _) = square(crate::texture::Texture::solid([255, 255, 255, 128]));
         let mut canvas = Canvas::new(size, size, [0, 0, 0, 0]);
         for t in triangles {
-            triangle(&mut canvas, *t, [[0.5; 2]; 3], [1.0; 3], &glass.parts[0]);
+            triangle(
+                &mut canvas,
+                *t,
+                [[0.5; 2]; 3],
+                [Shade::Grey(1.0); 3],
+                &glass.parts[0],
+            );
         }
         canvas
     }

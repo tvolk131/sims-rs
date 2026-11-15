@@ -39,6 +39,10 @@
 //! [`Target`]. How the original gives a person's mesh its depth is
 //! **unverified**.
 //!
+//! **The plumb bob** ([`crate::bob`]) is drawn over the person who holds
+//! it in their head slot, right after them, by the original's own light
+//! and colour; [`People::set_clock`] spins it.
+//!
 //! **Light** is the original's standard light ([`STANDARD_LIGHT`]) at the
 //! person's level ([`level`]), lit as [`Lighting::standard`] says. The
 //! light keeps its place relative to the viewer as the view turns: the
@@ -55,10 +59,12 @@
 use crate::animation::{Clip, Library};
 use crate::appearance::Body;
 use crate::assets::Assets;
+use crate::bob::{self, Bob};
 use crate::house::Cast;
 use crate::math::{Transform, Vec3};
 use crate::person::{Player, UNITS_PER_TILE, base_clip, placement};
-use crate::raster::{Lighting, Target, draw_part};
+use crate::raster::{Lighting, Shade, Target, draw_part, draw_shaded};
+use crate::rig;
 use crate::skin::skin;
 use sims_core::F32;
 use sims_render::Camera;
@@ -261,6 +267,10 @@ pub struct People {
     /// Clips loaded so far, kept between frames.
     clips: BTreeMap<String, Clip>,
     people: BTreeMap<u16, Loaded>,
+    /// The plumb bob, once a person holds one: loaded the first time.
+    bob: Option<Result<Bob, String>>,
+    /// The game's clock in milliseconds, which spins the plumb bob.
+    clock: u32,
 }
 
 impl People {
@@ -280,7 +290,15 @@ impl People {
             cast,
             clips: BTreeMap::new(),
             people: BTreeMap::new(),
+            bob: None,
+            clock: 0,
         }
+    }
+
+    /// Sets the clock, in milliseconds, that spins the plumb bob (the
+    /// original's 0x6e54e0). It starts at 0, where the bob has not spun.
+    pub fn set_clock(&mut self, milliseconds: u32) {
+        self.clock = milliseconds;
     }
 
     /// Follows `world`: loads the body of each person who appeared or
@@ -405,7 +423,14 @@ impl People {
     ) -> Drawn {
         let view = View::new(camera);
         let light = view.light();
-        let (mut posed, problems) = self.posed(world, camera.level);
+        // The plumb bob is loaded the first time the lot has one.
+        let mut bob = self.bob.take();
+        if bob.is_none() && world.objects.values().any(|o| o.guid == bob::STANDARD) {
+            bob = Some(Bob::load(&self.assets));
+        }
+        let spin = bob::spin(self.clock);
+        let bob_light = bob::light(camera.rotation);
+        let (mut posed, mut problems) = self.posed(world, camera.level);
         // Far to near by the root's depth, then by ID, so nearer soft
         // edges blend over farther people.
         let far = |p: &Posed| {
@@ -414,23 +439,62 @@ impl People {
         };
         posed.sort_by(|a, b| far(b).total_cmp(&far(a)).then(a.id.cmp(&b.id)));
         for person in &posed {
+            let project = |p| {
+                let (fine, elevation) = view.place(p);
+                let [x, y] = view.screen(fine, elevation, person.level);
+                Vec3::new(x, y, depth(fine, elevation, person.level))
+            };
             // Each pixel the person draws names them, for a click.
             target.set_id(Some(person.id));
             let lighting = Lighting::standard(light, level(world, person.id));
             for part in person.body.parts.iter().filter(|p| p.censor == 0) {
                 let skinned = skin(part, &person.bones);
-                draw_part(target, part, &skinned, lighting, |p| {
-                    let (fine, elevation) = view.place(p);
-                    let [x, y] = view.screen(fine, elevation, person.level);
-                    Vec3::new(x, y, depth(fine, elevation, person.level))
-                });
+                draw_part(target, part, &skinned, lighting, project);
+            }
+            // The plumb bob over their head, if they hold it. Its pixels
+            // name the person too.
+            if bob::held_by(world, person.id).is_none() {
+                continue;
+            }
+            let Some(head) =
+                rig::bone(&person.body.skeleton, bob::HEAD_BONE).and_then(|i| person.bones.get(i))
+            else {
+                continue;
+            };
+            let loaded = match &bob {
+                Some(Ok(loaded)) => loaded,
+                Some(Err(e)) => {
+                    problems.push(format!(
+                        "person {}'s plumb bob is not drawn: {e}",
+                        person.id
+                    ));
+                    continue;
+                }
+                None => continue,
+            };
+            // The mood, cut to an integer as the original's `_ftol` does.
+            let mood = world
+                .objects
+                .get(&person.id)
+                .and_then(|o| o.person.as_ref())
+                .map_or(0, |p| p.motives[sims_sim::motives::MOOD] as i32);
+            let colour = bob::colour(mood);
+            let bones = [bob::root(*head, person.root, spin)];
+            for part in &loaded.parts {
+                let skinned = skin(part, &bones);
+                let shade: Vec<Shade> = skinned
+                    .normals
+                    .iter()
+                    .map(|&n| Shade::Colour(bob::shade(colour, n, bob_light)))
+                    .collect();
+                draw_shaded(target, part, &skinned, &shade, project);
             }
         }
         target.set_id(None);
-        Drawn {
-            people: posed.len(),
-            problems,
-        }
+        let people = posed.len();
+        drop(posed);
+        self.bob = bob;
+        Drawn { people, problems }
     }
 }
 

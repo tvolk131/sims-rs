@@ -303,10 +303,12 @@ fn a_tile_of_a_group_fails_loudly() {
 }
 
 #[test]
-fn a_person_is_taken_off_only_by_its_own_removal_that_yields() {
-    // The take-off's animator refresh (0x58da12) is not modeled, so a
-    // person removed by another object, or going on (flag bit 0), or in a
-    // synchronous tree, fails loudly and is not queued.
+fn a_person_removed_other_than_by_itself_yielding_needs_the_lot() {
+    // The take-off's animator refresh (0x58da12) is worked out on a copy
+    // of the lot through the placement, which this lot without rooms
+    // cannot give: a person removed by another object, or going on (flag
+    // bit 0), or in a synchronous tree, fails loudly and is not queued.
+    // On a lot with rooms: `create_person`.
     let (mut fx, file) = two();
     let person = fx.sim().person.clone();
     assert!(person.is_some());
@@ -317,21 +319,24 @@ fn a_person_is_taken_off_only_by_its_own_removal_that_yields() {
     let interpreter = fx.interpreter();
     let mut world = fx.world.clone();
     let fault = interpreter.turn(&mut world, 3, BUDGET).unwrap_err();
-    assert!(fault.to_string().contains("0x58da12"), "{fault}");
+    assert!(fault.to_string().contains("placement"), "{fault}");
     assert!(world.removals.is_empty());
     for (flags, synchronous) in [(1, false), (0, true)] {
         let (mut fx, file) = two();
         let person = fx.sim().person.clone();
         fx.world.objects.get_mut(&3).unwrap().person = person;
         fx.add(file, 4200, remover(0, flags));
-        let fault = if synchronous {
-            fx.run_with(3, 4200, 0, &[], BUDGET).unwrap_err()
+        let (fault, removals) = if synchronous {
+            let fault = fx.run_with(3, 4200, 0, &[], BUDGET).unwrap_err();
+            (fault, fx.world.removals.clone())
         } else {
             fx.thread(3, 4200, &[0; 4]);
             let interpreter = fx.interpreter();
             let mut world = fx.world.clone();
-            interpreter.turn(&mut world, 3, BUDGET).unwrap_err()
+            let fault = interpreter.turn(&mut world, 3, BUDGET).unwrap_err();
+            (fault, world.removals)
         };
-        assert!(fault.to_string().contains("0x58da12"), "{fault}");
+        assert!(fault.to_string().contains("placement"), "{fault}");
+        assert!(removals.is_empty());
     }
 }

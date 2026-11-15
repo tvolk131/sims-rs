@@ -1348,26 +1348,56 @@ fn what_the_animator_tick_does_not_port_fails_loudly() {
             .contains("walks to its destination")
     );
     let mut fx = standing();
-    fx.world.animators.insert(
-        SIM,
-        sims_sim::animator::Animator {
-            state: 11,
-            ..LOADED
+    fx.world
+        .animators
+        .insert(SIM, sims_sim::animator::Animator { state: 7, ..LOADED });
+    assert!(tick(&mut fx).unwrap_err().to_string().contains("state 7"));
+}
+
+/// Names the posture's clip `selection` in the global table 150, which
+/// grows to hold it, and adds a clip of that name moving `distance`
+/// (float bits; 0 moves nothing) per cycle of 100 milliseconds.
+fn name_clip(fx: &mut Fixture, selection: usize, name: &str, distance: u32) {
+    let names = fx
+        .program
+        .libraries
+        .get_mut(&GLOBAL)
+        .unwrap()
+        .strings
+        .entry(150)
+        .or_default();
+    if names.len() <= selection {
+        names.resize(selection + 1, String::new());
+    }
+    names[selection] = name.into();
+    fx.program.animations.insert(
+        "walk.far",
+        Clip {
+            name: name.into(),
+            skill: SKILL.into(),
+            duration: HUNDRED,
+            distance,
+            moving: distance != 0,
+            frames: 4,
+            motions: 1,
+            tracks: Vec::new(),
+            channels: Vec::new(),
+            samples: [0, 0],
         },
     );
-    assert!(tick(&mut fx).unwrap_err().to_string().contains("state 11"));
 }
 
 /// The standing Sim with a route to follow: the animator as the route's
 /// start leaves it (0x589c85: result 1, segment 0, standing on the
 /// person's tile and direction), facing direction 6, and a path east
 /// along the first coordinate. Global clip table 150 names the walk
-/// (clip 0x14, whose distance sets the look-ahead) and the half turn
-/// (clip 5).
+/// (clip 0x14, whose distance sets the look-ahead), the stop from a walk
+/// (clip 0x13) and the half turn (clip 5).
 fn routed() -> Fixture {
     let mut fx = standing();
     fx.sim_mut().data[1] = 6;
-    // Data word 17 picks another look-ahead (0x58e6d5).
+    // Data word 17 clear: the person walks (state 9), and looks ahead by
+    // the walk clip's distance, not the run's (0x58e6cb).
     fx.sim_mut().data[17] = 0;
     // An adult (word 58) of kind 0 (word 65), with no special clip
     // tables (word 64).
@@ -1375,41 +1405,9 @@ fn routed() -> Fixture {
     person.data[58] = 20;
     person.data[64] = 0;
     person.data[65] = 0;
-    let names = (0..=0x14)
-        .map(|i| match i {
-            5 => "test-half-turn".to_string(),
-            0x13 => "test-stop".to_string(),
-            0x14 => "test-walk".to_string(),
-            _ => String::new(),
-        })
-        .collect();
-    fx.program
-        .libraries
-        .get_mut(&GLOBAL)
-        .unwrap()
-        .strings
-        .insert(150, names);
-    for (name, distance) in [
-        ("test-half-turn", 0),
-        ("test-stop", 0x4200_0000),
-        ("test-walk", 0x4180_0000),
-    ] {
-        fx.program.animations.insert(
-            "walk.far",
-            Clip {
-                name: name.into(),
-                skill: SKILL.into(),
-                duration: HUNDRED,
-                distance,
-                moving: distance != 0,
-                frames: 4,
-                motions: 1,
-                tracks: Vec::new(),
-                channels: Vec::new(),
-                samples: [0, 0],
-            },
-        );
-    }
+    name_clip(&mut fx, 5, "test-half-turn", 0);
+    name_clip(&mut fx, 0x13, "test-stop", 0x4200_0000);
+    name_clip(&mut fx, 0x14, "test-walk", 0x4180_0000);
     let at = [100.0, 200.0, 6.0].map(F32::from_f32);
     let mut animator = LOADED;
     animator.position = at;
@@ -1668,9 +1666,8 @@ fn what_the_route_follow_does_not_port_fails_loudly() {
     // Facing the point ahead, a standing animator walks; but the point,
     // 21.33 away, is farther than the stop clip's stride (1 times 16/3),
     // so it starts with the stop clip instead (state 6, 0x58ed52, then
-    // 0x58e125), still standing. (With data word 17 set it would go to
-    // state 11, which is not ported; the look-ahead for that word fails
-    // loudly first, 0x58e6d5.)
+    // 0x58e125), still standing. (With data word 17 1 it goes to state 11
+    // instead; see a_run_starts_with_the_stop_from_a_run_then_runs.)
     let mut fx = routed();
     fx.sim_mut().data[1] = 2;
     fx.world.animators.get_mut(&SIM).unwrap().position[2] = F32::from_f32(2.0);
@@ -1718,6 +1715,169 @@ fn what_the_route_follow_does_not_port_fails_loudly() {
         .get_mut(&150)
         .unwrap()[0x14] = String::new();
     assert!(tick(&mut fx).unwrap_err().to_string().contains("clip 20"));
+}
+
+/// The routed Sim running: object data word 17 is 1, and table 150 also
+/// names the run (clip 0x15), moving 32 per cycle, twice the walk, and
+/// the stop from a run (clip 0x16), moving 1.
+fn running() -> Fixture {
+    let mut fx = routed();
+    fx.sim_mut().data[17] = 1;
+    name_clip(&mut fx, 0x15, "test-run", 0x4200_0000);
+    name_clip(&mut fx, 0x16, "test-stop-run", 0x3f80_0000);
+    fx
+}
+
+#[test]
+fn a_run_looks_ahead_by_the_run_clips_distance() {
+    // 0x58e6cb: with data word 17 set the look-ahead is half of +0x1fc,
+    // the run clip's (0x15) halved distance times 16/3: 32 halved, times
+    // 16/3, halved, 42.67, twice the walk's. Squared 1820.4, it is
+    // reached 43 units along segment 1 (progress 0.215, summed in single
+    // precision), where the walk's is reached at 0.11. The point lies
+    // behind, so the animator turns back as a walk does (state 4).
+    let mut fx = running();
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.motion.segment, a.state), (1, 4));
+    let progress = a.motion.progress.to_bits();
+    assert_eq!(progress, 0x3e5c_28f1);
+    // The walk clip's distance is not read: halving it changes nothing.
+    let mut fx = running();
+    name_clip(&mut fx, 0x14, "test-walk", 0x4100_0000);
+    tick(&mut fx).unwrap();
+    assert_eq!(fx.world.animators[&SIM].motion.progress.to_bits(), progress);
+}
+
+#[test]
+fn a_run_starts_with_the_stop_from_a_run_then_runs() {
+    // Facing the point ahead, 42.67 away, a standing animator with data
+    // word 17 1 is farther from it than the stride of the stop from a run
+    // (+0x204, clip 0x16: 1 times 16/3), so it goes to state 11
+    // (0x58ed52). The stop from a walk (clip 0x13, 32 times 16/3) would
+    // not have stopped it.
+    let mut fx = running();
+    fx.sim_mut().data[1] = 2;
+    let a = fx.world.animators.get_mut(&SIM).unwrap();
+    a.position[2] = F32::from_f32(2.0);
+    a.destination[2] = F32::from_f32(2.0);
+    tick(&mut fx).unwrap();
+    // State 11 (0x58e377) is state 6's code with clip 0x16: it starts
+    // that clip to stop at its end, still standing, at the speed wanted
+    // in state 11 (1.2 plus a fifth: above state 9, the base is 1), and
+    // heads for the clip's distance times 16/3 along direction 2, east:
+    // 105.33 (clip 0x13's would be 270.67).
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.state, a.selection, a.walking), (11, 0x16, false));
+    let layer = a.foreground.as_ref().unwrap();
+    assert_eq!((layer.clip.as_str(), layer.mode), ("test-stop-run", 0));
+    assert_eq!((a.rate, a.target), (layer.speed, layer.speed));
+    assert_eq!(a.rate.to_bits(), 0x3fb3_3334);
+    assert_eq!(a.motion.turn_from[0].to_bits(), 0x42c8_0000);
+    assert_eq!(
+        a.destination[..2]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        [0x42d2_aaab, 0x4348_0000]
+    );
+    // At the clip's end it stands at the destination and goes to state
+    // 10 (0x58e494), not 9, whose code runs: it runs on with clip 0x15,
+    // repeating.
+    let mut ticks = 0;
+    while fx.world.animators[&SIM].state == 11 {
+        tick(&mut fx).unwrap();
+        ticks += 1;
+        assert!(ticks < 10);
+    }
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.state, a.selection, a.walking), (10, 0x15, true));
+    let layer = a.foreground.as_ref().unwrap();
+    assert_eq!((layer.clip.as_str(), layer.mode), ("test-run", 1));
+    // With data word 17 clear the same walk stops with clip 0x13 in
+    // state 6 and ends in state 9, walking with clip 0x14.
+    let mut fx = routed();
+    fx.sim_mut().data[1] = 2;
+    let a = fx.world.animators.get_mut(&SIM).unwrap();
+    a.position[2] = F32::from_f32(2.0);
+    a.destination[2] = F32::from_f32(2.0);
+    name_clip(&mut fx, 0x13, "test-stop", 0x3f80_0000);
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.state, a.selection), (6, 0x13));
+    let mut ticks = 0;
+    while fx.world.animators[&SIM].state == 6 {
+        tick(&mut fx).unwrap();
+        ticks += 1;
+        assert!(ticks < 10);
+    }
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.state, a.selection, a.walking), (9, 0x14, true));
+}
+
+/// The standing Sim of kind `kind` (person word 65), arrived, facing
+/// `from` while its destination faces 2.5625, within the epsilon of its
+/// destination's coordinates: an adult (word 58) with no special tables
+/// (word 64), whose posture names clip 10, the turn of less than half a
+/// direction.
+fn facing(kind: i16, from: f32) -> Fixture {
+    let mut fx = standing();
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    person.data[58] = 20;
+    person.data[64] = 0;
+    person.data[65] = kind;
+    name_clip(&mut fx, 10, "test-small-turn", 0);
+    let [half, quarter] = [0x3f00_0000, 0x3e80_0000].map(F32::from_bits);
+    fx.world.animators.insert(
+        SIM,
+        sims_sim::animator::Animator {
+            arrival: -1,
+            position: [
+                F32::from_bits(0x3f00_0005),
+                F32::from_bits(0x3e80_0003),
+                F32::from_f32(from),
+            ],
+            destination: [half, quarter, F32::from_f32(2.5625)],
+            ..LOADED
+        },
+    );
+    fx
+}
+
+#[test]
+fn a_pet_turns_at_once_only_within_a_sixteenth_over_the_speed() {
+    // 0x58df67: a person of kind above 1 turns at once within 1 times
+    // 1/16 (0x667278) over the speed, not a quarter. An eighth of a
+    // direction is within a quarter over the speed for kinds 0 and 1:
+    // they face the destination at once and state 3 notes the route's
+    // end.
+    for kind in [0, 1] {
+        let mut fx = facing(kind, 2.4375);
+        tick(&mut fx).unwrap();
+        let a = &fx.world.animators[&SIM];
+        assert_eq!((a.state, a.arrival, a.selection), (3, 2, -1), "{kind}");
+        assert_eq!(a.position[2].to_bits(), 0x4024_0000);
+    }
+    // For kinds 2 and 3 it is not: they turn with clip 10 (state 4).
+    for kind in [2, 3] {
+        let mut fx = facing(kind, 2.4375);
+        tick(&mut fx).unwrap();
+        let a = &fx.world.animators[&SIM];
+        assert_eq!((a.state, a.selection), (4, 10), "{kind}");
+        assert_eq!(a.motion.turn_wanted.to_bits(), 0x3e00_0000);
+        let layer = a.foreground.as_ref().unwrap();
+        assert_eq!(
+            (layer.clip.as_str(), layer.priority),
+            ("test-small-turn", 5)
+        );
+    }
+    // A thirty-second of a direction is within the sixteenth over the
+    // speed: a pet faces the destination at once too.
+    let mut fx = facing(2, 2.53125);
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.state, a.arrival, a.selection), (3, 2, -1));
+    assert_eq!(a.position[2].to_bits(), 0x4024_0000);
 }
 
 fn draw(fx: &mut Fixture) -> Result<(), sims_vm::Fault> {
