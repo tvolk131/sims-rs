@@ -235,8 +235,9 @@ impl Font {
         lines
     }
 
-    /// How many characters of `text` start a line `width` wide (0x60b620).
-    fn fit(&self, text: &[char], width: i32) -> usize {
+    /// How many characters of `text` start a line `width` wide (0x60b620),
+    /// by the rules [`Font::break_lines`] gives; 0 for no text.
+    pub fn fit(&self, text: &[char], width: i32) -> usize {
         let glyph = |c: char| self.metric(c).map_or(0, |m| i32::from(m.atlas[2]));
         let advance = |c: char| self.metric(c).map_or(0, |m| m.advance);
         let Some(&first) = text.first() else {

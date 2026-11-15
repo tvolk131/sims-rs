@@ -2121,7 +2121,11 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   5 pixels, and the button except for its white label under the pointer.
   The frame's corners are close but not exact. "Magic Town" is pinned by
   layout and digest, gated on `SIMS_INSTALL`. `sims-viewer --hud` shows a
-  waiting dialog, and its answer is printed.
+  waiting dialog, and its answer is printed. The layout is the
+  original's, read from the exe: the width searched for a dialog twice
+  as wide as tall, the text beside and under the icon, and two or three
+  buttons spread evenly across the text; it gives the measured "Magic
+  Town" exactly.
 - **Done: the pie menu.** `sims_ui::pie` lays out, hit-tests and draws
   the menu and groups an object's actions into submenus, ported from the
   original's menu window and object picker. The window and label boxes
@@ -2155,9 +2159,8 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
 - **Next:** open houses through `sims_vm::boot::Lot` (which now runs the
   household load) in the tests and the viewer, in place of their
   stand-in for steps 17 and 18; a screenshot of an open pie menu; a
-  Yes/No dialog checked
-  against the original (the "Help System" one at tick 2) for the layout
-  of several buttons; text entry dialogs; the sign's help balloon
+  screenshot of the "Help System" dialog (tick 2) to check two buttons
+  against; text entry dialogs; the sign's help balloon
   (its compatible signs); the job panel's blinking performance and its
   tooltips; the relationship panel's Superstar filter and which people the original
   leaves out; the other live panels.
