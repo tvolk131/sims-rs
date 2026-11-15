@@ -339,7 +339,7 @@ impl Machine<'_, '_> {
                 &temps,
                 temps.len(),
                 TURN_BUDGET,
-                &mut None,
+                false,
             )
             .map_err(|fault| {
                 Trap::Unsupported(format!(
