@@ -8,6 +8,7 @@ use sims_formats::bitmap::{self, Image};
 use sims_formats::career::{Career, Level};
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
+use sims_formats::tuning::Constants;
 use sims_sim::World;
 use std::collections::BTreeMap;
 
@@ -284,6 +285,43 @@ impl Snapshot {
         }
         format!("{}${out}", if self.funds < 0 { "-" } else { "" })
     }
+}
+
+/// The autonomy tuning's friendship threshold, which
+/// [`Snapshot::with_relations`] takes, for a caller without the
+/// simulation's program: entry "friendship threshold" of the global
+/// file's tuning table 2 (`FCNS`), 25.0 when the table or entry is
+/// missing (or the global file), truncated toward zero as the original stores it (0x6c4398).
+/// It reads what `sims_vm::Program::autonomy_constants` reads.
+pub fn friendship_threshold(index: &Index, catalog: &Catalog) -> Result<i32> {
+    const AUTONOMY_TUNING: u16 = 2;
+    const DEFAULT: f32 = 25.0;
+    let mut table = None;
+    if let Some(file) = index.resources.get(catalog.global) {
+        let iff = Iff::parse(file.read().map_err(Error::Content)?).map_err(Error::Format)?;
+        // A later table of the same ID replaces an earlier one, as in the
+        // program's libraries.
+        for chunk in iff.resource_order(b"FCNS").map_err(Error::Format)? {
+            if chunk.id == AUTONOMY_TUNING {
+                table = Some(Constants::parse(iff.data(chunk)).map_err(Error::Format)?);
+            }
+        }
+    }
+    let value = table
+        .and_then(|table| {
+            table
+                .entries
+                .into_iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case("friendship threshold"))
+        })
+        .map_or(DEFAULT, |entry| entry.value);
+    // `__ftol`: toward zero; out of range gives the integer indefinite.
+    let value = value.trunc();
+    Ok(if (-2_147_483_648.0..2_147_483_648.0).contains(&value) {
+        value as i32
+    } else {
+        i32::MIN
+    })
 }
 
 /// The careers of `work.iff`, by the ID of their `CARR` resource, as

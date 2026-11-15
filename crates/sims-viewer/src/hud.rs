@@ -15,10 +15,10 @@ use crate::view::{Command as ViewCommand, View};
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_content::{Install, Neighborhood};
 use sims_render::{Assets, Canvas, Walls, Zoom};
-use sims_ui::command::{Camera, Command, Walls as UiWalls};
+use sims_ui::command::{Camera, Command, Panel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::Frame;
-use sims_ui::household::{Careers, Faces, Snapshot};
+use sims_ui::household::{self, Careers, Faces, Snapshot};
 use sims_ui::hud::{self, Controls, Item};
 use std::path::Path;
 
@@ -30,6 +30,9 @@ pub struct Hud {
     careers: Careers,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
+    /// The autonomy tuning's friendship threshold, for the relationship
+    /// panel's smileys.
+    friendship: i32,
     pub controls: Controls,
     items: Vec<Item>,
     /// The dialog the world waits on, until it is answered here.
@@ -39,8 +42,9 @@ pub struct Hud {
 
 impl Hud {
     /// Reads the art, the household of `house` from its neighborhood,
-    /// with the portraits from the people's files, and the dialog
-    /// `world` waits on. The viewer never runs the world, so the dialog
+    /// with the portraits from the people's files (everyone `world`'s
+    /// neighborhood records hold, for the relationship panel), and the
+    /// dialog `world` waits on. The viewer never runs the world, so the dialog
     /// is read once.
     pub fn open(
         install: &Path,
@@ -80,14 +84,23 @@ impl Hud {
             .and_then(|n| neighborhood.family_in(n))
             .map(|(_, f)| f.members.clone())
             .unwrap_or_default();
+        let mut people = members.clone();
+        for record in world.neighbors.slots.iter().flatten() {
+            if !people.contains(&record.guid) {
+                people.push(record.guid);
+            }
+        }
         let faces =
-            Faces::load(assets.index(), assets.catalog(), &members).map_err(|e| e.to_string())?;
+            Faces::load(assets.index(), assets.catalog(), &people).map_err(|e| e.to_string())?;
         let careers = Careers::load(assets.index()).map_err(|e| e.to_string())?;
+        let friendship = household::friendship_threshold(assets.index(), assets.catalog())
+            .map_err(|e| e.to_string())?;
         Ok(Self {
             art,
             faces,
             careers,
             members,
+            friendship,
             // The strip opens as if Live had been pressed.
             controls: Controls {
                 expanded: true,
@@ -113,7 +126,12 @@ impl Hud {
             zoom_in: camera.zoom != Zoom::Near,
             zoom_out: camera.zoom != Zoom::Far,
         };
-        let snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
+        let mut snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
+        // The lookup goes through every neighborhood record, so only
+        // while the panel shows it.
+        if self.controls.panel == Panel::Relationships {
+            snapshot = snapshot.with_relations(world, &self.members, self.friendship);
+        }
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         let (width, height) = (
             u32::try_from(canvas.width).unwrap_or(u32::MAX),

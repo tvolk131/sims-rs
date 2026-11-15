@@ -4,6 +4,22 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: The viewer's relationship panel reads the friendship threshold from the tuning
+
+`sims-viewer --hud` now fills the relationship panel as the window does
+(`Snapshot::with_relations`, read only while the panel is open). It loads
+the faces of everyone the world's neighborhood records hold, not only the
+household. The viewer has no simulation program, so the smileys'
+friendship threshold comes from `household::friendship_threshold`. It reads
+the same entry `Program::autonomy_constants` reads: "friendship threshold"
+in the global file's tuning table 2, defaulting to 25.0, truncated toward
+zero.
+
+- **Verified**: on the install, the reader and the program both give 50
+  (`crates/sims-game/tests/tuning.rs`).
+- **Unverified**: the viewer's panel has not been compared with the
+  original on screen. It shows the same snapshot the window's panel does.
+
 ## 2026-11-15: The personality panel shows the sign of the zodiac
 
 The personality panel now shows the selected Sim's sign of the zodiac
