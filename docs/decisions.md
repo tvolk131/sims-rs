@@ -4,7 +4,7 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
-## 2026-11-15: Wall caps follow the original's corner records
+## 2026-11-14: Wall caps follow the original's corner records
 
 Walls in the original are thick, and their sprites stop at the corners,
 so wherever a wall end shows, something must close it off. The original
@@ -80,7 +80,7 @@ the scores were the same or worse.
   than one line; the original searches the corner's walls for one on
   the cap's line (0x53c97f), and so do we.
 
-## 2026-11-15: Held objects stand on their holder's slot
+## 2026-11-14: Held objects stand on their holder's slot
 
 The lamps were missing because we drew them on the floor. The Goth
 house has three, all table lamps: one on a kitchen counter and two on
@@ -122,7 +122,7 @@ lamp: the lamps stand behind walls there.
 - The original draws held objects right after their holder; we sort
   them by depth with everything else, which puts them after it here.
 
-## 2026-11-15: Objects sit one pixel right of the walls
+## 2026-11-14: Objects sit one pixel right of the walls
 
 At every compared camera, objects were drawn one pixel left of where
 the original draws them, measured against the walls and floors around
@@ -164,7 +164,7 @@ frames also differ by one light step in places. The original's
 screenshot also has a cardboard box by the front door that a tick-1
 world does not have.
 
-## 2026-11-15: The sun does not turn with the camera
+## 2026-11-14: The sun does not turn with the camera
 
 The grass at far zoom, rotation 3, matched the original only 12.7%.
 The reason was the sun. We tilted it by the camera's rotation (1, 2, 3

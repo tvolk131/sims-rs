@@ -22,7 +22,7 @@ const GRASS_COLUMN: i32 = 1;
 /// origin is fitted to the tile art, and the original places the two
 /// kinds of art one pixel apart; at every compared camera (far and
 /// medium zoom) the gap is this same pixel. Near zoom is unverified (see
-/// the decisions log, 2026-11-15).
+/// the decisions log, 2026-11-14).
 const OBJECT_COLUMN: i32 = 1;
 
 /// What the window shows outside the lot: the original's grey (5-6-5
