@@ -60,10 +60,10 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 690 on the Goth house**: our
+  there, as three captures recorded). **K = 752 on the Goth house**: our
   state after every one of ticks 1 to 608 equals the fourth capture of the
   original (full state after every update), and after every one of ticks
-  600 to 690 the fifth, in everything compared, but
+  600 to 752 the fifth, in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
   other captures agree where they hold a state, but for fields that also
@@ -1589,6 +1589,24 @@ for the head fields of "Ticks 334 to 366".
 
 **Stops.** Tick 691: person 18 routes in a room upstairs (room 1025),
 and the room's rectangles above the ground (`0x4818af`) are not ported.
+See "Ticks 691 to 752".
+
+### Ticks 691 to 752
+
+**A room upstairs** (`0x4818af`, `routing/rooms.rs`). The room's
+rectangles are worked out the same way on both levels: the room's ID
+gives the level (`0x468756`), which picks the room map (`0x481926`) and
+the walls (`0x4795c5`, array 102 upstairs), and the tile test
+(`0x4821f3`) looks at the objects on that level. The ground's covering
+counts only on level 1 (`0x4818e0`), as water does (`0x478f4a`). In tick
+691 person 18 routes in room 1025, upstairs.
+
+**K = 752.** Our state after every tick from 691 to 752 equals the fifth
+capture in everything compared, the three random streams included, but
+for the head fields of "Ticks 334 to 366".
+
+**Stops.** Tick 753: person 21's pose has a carry layer (`0x5992b3`),
+which the animator does not port.
 
 ## Track: drawing people (`crates/sims-people`)
 

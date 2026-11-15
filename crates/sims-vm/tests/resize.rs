@@ -2190,7 +2190,7 @@ fn the_goth_house_first_tick_matches_the_original() {
     const TICK_466: &str = "7dd965a56f279614b46c16223faf1abad52290db1940fa293a082e559449b9cd";
     const TICK_583: &str = "95602638fb97031232502163ecded9078771357166b92166150eebfba73adb2d";
     const TICK_608: &str = "baef8063918e1a4bf5ba86408a3121db72ac29b0dfc9052afa5a63da07a9fddc";
-    const TICK_690: &str = "b76cdfd8f0b91c941eca95a4a191c5d393c85a1f36889c0b5406ec7fa43d23f4";
+    const TICK_752: &str = "54617024a0028ab8b0921719b0aca10db911aa2e2e2c173f6d5b692b40ab2639";
     const TICK_416_20: &str = "37ff5756ac5cf26769da735eadb955be4f78f64381ea8b847963298b51f8320b";
     const USES_233: [(i16, i32); 2] = [(132, 5), (51, 8)];
     const TREES_233: [u16; 9] = [
@@ -2792,17 +2792,16 @@ fn the_goth_house_first_tick_matches_the_original() {
         for _ in 610..=690 {
             interpreter.lot_update(world, &tuning, &mut player).unwrap();
         }
-        assert_eq!(world.ticks, before.ticks + 690);
-        assert_eq!(digest(&world.encode()), TICK_690);
-        // Tick 691: person 18 routes in a room upstairs.
+        // Tick 691: person 18 routes in a room upstairs (room 1025).
+        for _ in 691..=752 {
+            interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        }
+        assert_eq!(world.ticks, before.ticks + 752);
+        assert_eq!(digest(&world.encode()), TICK_752);
+        // Tick 753: person 21's pose has a carry layer.
         let error = interpreter
             .lot_update(world, &tuning, &mut player)
             .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("routing in a room above the ground"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("with a carry layer"), "{error}");
     });
 }
