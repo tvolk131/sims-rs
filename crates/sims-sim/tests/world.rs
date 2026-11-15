@@ -302,7 +302,21 @@ fn animator() -> Animator {
         from: F32::from_bits(0x3f80_0000),
         to: F32::from_bits(0x3e9a_6c1c),
     };
+    let mut carry = Layer::start(
+        "carry",
+        F32::from_bits(0x447a_0000),
+        12,
+        true,
+        1,
+        false,
+        4_422_250,
+    );
+    carry.mode = 1;
+    carry.priority = 10;
+    carry.cursors = vec![1];
     Animator {
+        carry: Some(carry),
+        carry_first: true,
         clock: 4_422_300,
         rate: F32::from_bits(0x3fb3_3333),
         state: 0,
@@ -354,7 +368,42 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "cde80db397840aa1122cd14801bcaf618d6476626e4aea7b29310e569134fdc5";
+const PINNED: &str = "23e9f53ef9c6129ef25795acb31d097cce39ddb0401b852212b4a4f96e49cdcd";
+
+#[test]
+fn without_the_carry_layer_the_encoding_is_format_20() {
+    // Snapshot format 21 added at the end of each animator its carry layer
+    // and where that stands in the skin's list.
+    assert_eq!(digest(&format_20_bytes(&world())), PINNED_20);
+}
+const PINNED_20: &str = "cde80db397840aa1122cd14801bcaf618d6476626e4aea7b29310e569134fdc5";
+
+/// An animator's encoding under snapshot format 20: without the carry
+/// layer ([`Animator::carry`]) and its place in the skin's list
+/// ([`Animator::carry_first`]) that format 21 added at its end.
+fn animator_20_bytes(animator: &Animator) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(animator).unwrap();
+    let added = postcard::to_allocvec(&(&animator.carry, animator.carry_first)).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - added.len()), added);
+    bytes
+}
+
+/// The encoding of `world` as snapshot format 20 wrote it: each animator
+/// as [`animator_20_bytes`] writes it. The older formats' encodings start
+/// from this one.
+fn format_20_bytes(world: &World) -> Vec<u8> {
+    let blank = World {
+        animators: BTreeMap::new(),
+        ..world.clone()
+    };
+    splice(
+        &world.encode(),
+        &blank.encode(),
+        &postcard::to_allocvec(&world.animators).unwrap(),
+        &[0],
+        &map_bytes(&world.animators, animator_20_bytes),
+    )
+}
 
 #[test]
 fn without_the_person_vector_the_encoding_is_format_19() {
@@ -366,7 +415,8 @@ const PINNED_19: &str = "e4a24ddfd65d8ccb54cc45b7d6f6c49ef4f1b06413842308c1977c7
 
 /// The encoding of `world` as snapshot format 19 wrote it: without the
 /// person vector ([`World::people`]) that format 20 added after the
-/// registration order. The older formats' encodings start from this one.
+/// registration order. It starts from [`format_20_bytes`], and the older
+/// formats' encodings from this one.
 fn format_19_bytes(world: &World) -> Vec<u8> {
     let marker = vec![0xbeef, 0xbeef, 0xbeef];
     let blank = World {
@@ -374,8 +424,8 @@ fn format_19_bytes(world: &World) -> Vec<u8> {
         ..world.clone()
     };
     splice(
-        &world.encode(),
-        &blank.encode(),
+        &format_20_bytes(world),
+        &format_20_bytes(&blank),
         &postcard::to_allocvec(&world.people).unwrap(),
         &postcard::to_allocvec(&marker).unwrap(),
         &[],
@@ -390,10 +440,11 @@ fn without_the_action_and_the_slot_records_the_encoding_is_format_18() {
 }
 const PINNED_18: &str = "52685edd0474b28f07deafcc89e3f8a34431542a20468adb23258ab344f0230b";
 
-/// An animator's encoding under snapshot format 17: without the head
-/// fields ([`Animator::head`]) that format 18 added at its end.
+/// An animator's encoding under snapshot format 17: as
+/// [`animator_20_bytes`] writes it, and without the head fields
+/// ([`Animator::head`]) that format 18 added at its end.
 fn animator_17_bytes(animator: &Animator) -> Vec<u8> {
-    let mut bytes = postcard::to_allocvec(animator).unwrap();
+    let mut bytes = animator_20_bytes(animator);
     let added = postcard::to_allocvec(&animator.head).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - added.len()), added);
     bytes
@@ -465,7 +516,7 @@ fn format_17_bytes(world: &World) -> Vec<u8> {
     splice(
         &format_18_bytes(world),
         &format_18_bytes(&blank),
-        &postcard::to_allocvec(&world.animators).unwrap(),
+        &map_bytes(&world.animators, animator_20_bytes),
         &[0],
         &map_bytes(&world.animators, animator_17_bytes),
     )
@@ -596,7 +647,7 @@ fn format_16_bytes(world: &World) -> Vec<u8> {
     splice(
         &format_18_bytes(world),
         &format_18_bytes(&blank),
-        &postcard::to_allocvec(&world.animators).unwrap(),
+        &map_bytes(&world.animators, animator_20_bytes),
         &[0],
         &map_bytes(&world.animators, |a| animator_old_bytes(a, motion_16_bytes)),
     )
@@ -618,7 +669,7 @@ fn without_motion_steps(world: &World) -> Vec<u8> {
     splice(
         &format_18_bytes(world),
         &format_18_bytes(&blank),
-        &postcard::to_allocvec(&world.animators).unwrap(),
+        &map_bytes(&world.animators, animator_20_bytes),
         &[0],
         &map_bytes(&world.animators, animator_15_bytes),
     )

@@ -15,8 +15,9 @@
 //!    plays (+0x1a8 is 6), or a clip that picks something up plays
 //!    (+0x1a4), the person carries something when its first contained
 //!    slot holds an object (0x589fce); then the carry clip is 0, else -1.
-//!    A change clears the carry slot, which is always empty here, and a
-//!    change to clip 0 starts its clip (0x26), which is not ported.
+//!    A change clears the carry slot, which holds a layer only while a
+//!    script's carry clip plays and so is empty here, and a change to
+//!    clip 0 starts its clip (0x26), which is not ported.
 //! 4. The base layer is brought up to date (virtual function 0x58,
 //!    0x590430): a posture other than the one it was started for clears
 //!    it; then, unless the definition's word 102 has bit 2 set, or the
@@ -43,9 +44,10 @@
 //!    should, notes the route's end (0x188: 0 stays 0; -1, 2 and 3 become
 //!    2). Any other state, and an animator in state 3 that has to turn or
 //!    walk, is not ported.
-//! 8. The tail: the skin's layers are updated once at the clock (0x5992b3,
-//!    from 0x5a0ef5 or from 0x58f8bf: the second call finds the skin
-//!    updated at the same clock and does nothing), the animator places
+//! 8. The tail: the skin's layers are updated once at the clock, in the
+//!    skin's order ([`Animator::carry_first`]; 0x5992b3, from 0x5a0ef5 or
+//!    from 0x58f8bf: the second call finds the skin updated at the same
+//!    clock and does nothing), the animator places
 //!    itself if it has not, and the head takes its step, measures where
 //!    it and its target are and takes its turn off again (0x590768,
 //!    0x5904d2, 0x590b27; see `crate::head`).
@@ -139,6 +141,14 @@ impl Interpreter<'_> {
                 }
             }
             if next != a.carry_selection {
+                // A change clears the carry slot (virtual function 0x104),
+                // which holds a layer only while a script's carry clip
+                // plays, with the carry mode 6.
+                if a.carry.is_some() {
+                    return Err(Trap::Invalid(
+                        "the carry slot holds a layer while the carry mode is not 6".into(),
+                    ));
+                }
                 if next == 0 {
                     return Err(Trap::Unsupported(
                         "a person starts carrying: its carry clip (0x26, 0x5903fc) is not \
@@ -177,10 +187,13 @@ impl Interpreter<'_> {
         // 0x5992b3: the skin's update.
         if a.skin_dirty || now != a.skin_clock {
             a.skin_dirty = false;
-            if let Some(mut layer) = a.foreground.take() {
-                let updated = self.update_layer(world, id, &mut a, &mut layer, now);
-                a.foreground = Some(layer);
-                updated?;
+            // The layers in the skin's order (Animator::carry_first).
+            if a.carry_first {
+                self.update_carry(world, id, &mut a, now)?;
+                self.update_foreground(world, id, &mut a, now)?;
+            } else {
+                self.update_foreground(world, id, &mut a, now)?;
+                self.update_carry(world, id, &mut a, now)?;
             }
             a.skin_clock = now;
         }
@@ -189,6 +202,42 @@ impl Interpreter<'_> {
         // 0x590768, 0x5904d2 and 0x590b27: the head.
         self.look(world, id, &mut a)?;
         world.animators.insert(id, a);
+        Ok(())
+    }
+}
+
+impl Interpreter<'_> {
+    /// Updates the foreground layer, if there is one, at clock `now`
+    /// ([`Interpreter::update_layer`]).
+    fn update_foreground(
+        &self,
+        world: &mut World,
+        id: u16,
+        a: &mut Animator,
+        now: i32,
+    ) -> Result<(), Trap> {
+        if let Some(mut layer) = a.foreground.take() {
+            let updated = self.update_layer(world, id, a, &mut layer, now);
+            a.foreground = Some(layer);
+            updated?;
+        }
+        Ok(())
+    }
+
+    /// Updates the carry layer, if there is one, at clock `now`
+    /// ([`Interpreter::update_layer`]).
+    fn update_carry(
+        &self,
+        world: &mut World,
+        id: u16,
+        a: &mut Animator,
+        now: i32,
+    ) -> Result<(), Trap> {
+        if let Some(mut layer) = a.carry.take() {
+            let updated = self.update_layer(world, id, a, &mut layer, now);
+            a.carry = Some(layer);
+            updated?;
+        }
         Ok(())
     }
 }
@@ -684,6 +733,8 @@ impl Interpreter<'_> {
         layer.mode = mode;
         a.skin_dirty = true;
         a.foreground = Some(layer);
+        // A new layer goes in before the carry layer (priority 10).
+        a.carry_first = false;
         Ok(())
     }
 

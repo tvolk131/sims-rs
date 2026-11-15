@@ -149,8 +149,12 @@ impl<'a> Player<'a> {
     /// The pose of `skeleton` for `animator`: the rest pose, then the base
     /// clip `base` (when the animator has a base layer) repeating at the
     /// animator's clock, then the foreground layer at its phase and
-    /// weight. A foreground layer repeats when its end mode is 1. Last,
-    /// the head turns as the simulation's head fields say
+    /// weight, then the carry layer the same way. A layer repeats when its
+    /// end mode is 1. The layers go on in the order of their priorities
+    /// (the base -10, the foreground 1 or 6, the carry 10), so a bone two
+    /// clips move takes the higher layer's motion, as the skin's bone
+    /// assignment does (0x5991fd); that blending is not modeled further.
+    /// Last, the head turns as the simulation's head fields say
     /// ([`Pose::turn_head`]).
     pub fn pose(
         &mut self,
@@ -169,7 +173,10 @@ impl<'a> Player<'a> {
             };
             clip.apply(skeleton, &mut pose, phase, true, 1.0);
         }
-        if let Some(layer) = &animator.foreground {
+        for layer in [&animator.foreground, &animator.carry]
+            .into_iter()
+            .flatten()
+        {
             let clip = self.clip(&layer.clip)?;
             clip.apply(
                 skeleton,
