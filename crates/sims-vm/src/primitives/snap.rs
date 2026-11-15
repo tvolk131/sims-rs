@@ -7,14 +7,21 @@
 //!
 //! The modes (0x4549c7 on): 2 is the tile in front of the object, 1 the
 //! object itself, 0 the routing slot a local names, 3 the routing slot
-//! word 0 names, and 4 one of the lot's own slots; any other is native
-//! error 0x24. Only mode 3 is ported:
+//! word 0 names, and 4 the lot's global routing slot word 0 names; any
+//! other is native error 0x24. Modes 3 and 4 are ported, and share all
+//! but the table (both reach 0x454ac5):
 //!
-//! 1. The routing slot is the stack object's (its routing slot table,
-//!    object +0x13c, which holds only the SLOT entries of kind 3, as Go
-//!    To Routing Slot reads it: a record written over or the type's entry
-//!    with the flags the table now has). An index outside the table is
-//!    native error 0x1b.
+//! 1. The routing slot is the stack object's in mode 3 (its routing slot
+//!    table, object +0x13c, which holds only the SLOT entries of kind 3,
+//!    as Go To Routing Slot reads it: a record written over or the type's
+//!    entry with the flags the table now has). In mode 4 it is the lot's
+//!    (0x454ab6: the stack object's lot, +0xdc, at +0x9c), the kind 3
+//!    entries of the global file's SLOT 100
+//!    ([`crate::Program::global_routing_slot`]), with the flags the lot's
+//!    one copy now has ([`GLOBAL_SLOTS`]), as Go To Routing Slot's source
+//!    2 reads it. Either way the place is still the stack object's. An
+//!    index outside the table (a negative one included) is native error
+//!    0x1b.
 //! 2. The direction: with slot flag 0x1000, the object's facing (data
 //!    word 1) turned by the number of the lowest of the flag's bits 0 to
 //!    6 that is set (0 for none); without it, my own facing. It is kept
@@ -88,6 +95,7 @@ use crate::animator::place;
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
 use crate::placement::{Place, closed_directions, on_lot};
+use crate::primitives::go_to_slot::GLOBAL_SLOTS;
 use crate::routing::slot::{direction, route_slot};
 use sims_sim::animator::{Animator, LOADED, UNSET};
 
@@ -96,6 +104,8 @@ const CONTAINER: u16 = 0;
 
 /// The mode that names a routing slot of the stack object by word 0.
 const SLOT: i16 = 3;
+/// The mode that names one of the lot's global routing slots by word 0.
+const GLOBAL: i16 = 4;
 /// Slot flags: the direction follows the object's facing (0x454aeb),
 /// and the placement skips its own checks (0x454b83).
 const TURNED: i32 = 0x1000;
@@ -121,23 +131,27 @@ impl Machine<'_, '_> {
             .filter(|id| self.world.objects.contains_key(id))
             .ok_or(Trap::native(0x15, "Snap has no stack object"))?;
         let mode = word(operands, 2);
-        match mode {
-            0..=2 | 4 => {
+        let owner = match mode {
+            0..=2 => {
                 return Err(unsupported("0x4549c7", &format!("in mode {mode}")));
             }
-            SLOT => {}
+            SLOT => target,
+            GLOBAL => GLOBAL_SLOTS,
             _ => return Err(Trap::native(0x24, "Snap has an unknown mode")),
-        }
+        };
         let guid = self.world.objects[&target].guid;
         let definition = self.definition(guid)?;
-        let (entry, type_slot) = usize::try_from(word(operands, 0))
-            .ok()
-            .and_then(|i| {
+        let index = usize::try_from(word(operands, 0)).ok();
+        let (entry, type_slot) = if owner == GLOBAL_SLOTS {
+            index.and_then(|i| self.program.global_routing_slot(i))
+        } else {
+            index.and_then(|i| {
                 self.program
                     .routing_slot(definition.resource, definition.chunk, i)
             })
-            .ok_or(Trap::native(0x1b, "Snap names no slot"))?;
-        let key = (target, word(operands, 0) as u16);
+        }
+        .ok_or(Trap::native(0x1b, "Snap names no slot"))?;
+        let key = (owner, word(operands, 0) as u16);
         let slot = match self.world.routing.slots.get(&key) {
             Some(record) => *record,
             None => route_slot(

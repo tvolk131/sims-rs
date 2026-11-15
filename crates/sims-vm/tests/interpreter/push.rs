@@ -168,12 +168,89 @@ fn what_the_queue_does_not_port_fails_loudly() {
         trap(push(&mut fx, &[LAMP as i16])),
         sims_vm::Trap::Unsupported(m) if m.contains("0x45d240") && m.contains("another person")
     ));
-    // The queue's front.
-    let mut fx = lot([3, 0, 1, 4, 0, 0, 0, 0]);
-    assert!(matches!(
-        trap(push(&mut fx, &[LAMP as i16])),
-        sims_vm::Trap::Unsupported(m) if m.contains("0x45d322")
-    ));
+}
+
+/// The numbers and flags of the Sim's queued actions.
+fn queued(fx: &Fixture) -> Vec<(i32, u32)> {
+    let queue = &fx.sim().person.as_ref().unwrap().queue;
+    queue.iter().map(|a| (a.uid, a.flags)).collect()
+}
+
+#[test]
+fn an_action_pushed_to_the_front_goes_before_the_queue() {
+    // Two actions of priority 100, then one of priority 50 with operand
+    // flag bit 2: it goes first, whatever its priority (0x45d322), and
+    // takes the next number.
+    let mut fx = lot([3, 0, 1, 0, 0, 0, 0, 0]);
+    for _ in 0..2 {
+        assert_eq!(push(&mut fx, &[LAMP as i16]), Ok(true));
+    }
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(
+            13,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [3, 0, 3, 4, 0, 0, 0, 0],
+        )]),
+    );
+    assert_eq!(push(&mut fx, &[LAMP as i16]), Ok(true));
+    assert_eq!(queued(&fx), [(3, 3), (1, 1), (2, 1)]);
+    let queue = &fx.sim().person.as_ref().unwrap().queue;
+    assert_eq!(
+        queue.iter().map(|a| a.priority).collect::<Vec<_>>(),
+        [50, 100, 100]
+    );
+    assert_eq!(fx.world.action_serial, 3);
+}
+
+#[test]
+fn a_full_queue_keeps_the_action_pushed_to_the_front_and_six_more() {
+    // Eight queued, numbers 1 to 8. The front's own queue takes the new
+    // action and the first seven, and gives back only seven: the last two
+    // queued are dropped (0x45d391 to 0x45d3e4).
+    let mut fx = lot([3, 0, 1, 0, 0, 0, 0, 0]);
+    for _ in 0..8 {
+        assert_eq!(push(&mut fx, &[LAMP as i16]), Ok(true));
+    }
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(
+            13,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [3, 0, 1, 4, 0, 0, 0, 0],
+        )]),
+    );
+    assert_eq!(push(&mut fx, &[LAMP as i16]), Ok(true));
+    let uids: Vec<i32> = queued(&fx).iter().map(|q| q.0).collect();
+    assert_eq!(uids, [9, 1, 2, 3, 4, 5, 6]);
+    // Seven queued is not full: the next goes before all seven.
+    assert_eq!(push(&mut fx, &[LAMP as i16]), Ok(true));
+    let uids: Vec<i32> = queued(&fx).iter().map(|q| q.0).collect();
+    assert_eq!(uids, [10, 9, 1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn flag_0x40_at_the_front_clears_the_running_actions_flag_0x80() {
+    // Operand flag bit 3 sets the action's flag 0x40, which at the front
+    // clears flag 0x80 of the running action (0x41f167); without it the
+    // running action is left alone. Taking the running action's name
+    // sets the pushed action's own flag 0x80 (0x41f1ae).
+    // The pushed action's flags: bit 0 from the entry, 2, 0x40 and 0x80.
+    for (operand, expected, pushed) in [(4, 0x84, 0x03), (4 | 8, 0x04, 0xc3)] {
+        let mut fx = lot([3, 0, 1, operand, 0, 0, 0, 0]);
+        fx.sim_mut().person.as_mut().unwrap().active.flags = 0x84;
+        assert_eq!(push(&mut fx, &[LAMP as i16]), Ok(true));
+        assert_eq!(
+            fx.sim().person.as_ref().unwrap().active.flags,
+            expected,
+            "operand flags {operand:#x}"
+        );
+        assert_eq!(queued(&fx), [(1, pushed)]);
+    }
 }
 
 /// A player's order queues the action the pie menu makes: priority 50,
@@ -1127,6 +1204,27 @@ fn an_action_queued_while_one_runs_at_once_takes_its_place() {
     let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 4), Ok(Some(1)));
     assert_eq!(fx.sim().person.as_ref().unwrap().queue.len(), 8);
+}
+
+/// An action pushed to the front while my action runs at once is queued:
+/// the front's branch never reaches 0x45d5a5.
+#[test]
+fn an_action_pushed_to_the_front_while_one_runs_at_once_is_queued() {
+    let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    fx.add(
+        LAMP_FILE,
+        ACTION,
+        tree(vec![
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, SIM as i16, 1),
+            assign(scope::LOCALS, 0, scope::LITERAL, LAMP as i16, 2),
+            ins(13, RETURN_TRUE, RETURN_TRUE, [3, 0, 1, 2 | 4, 0, 0, 0, 0]),
+        ]),
+    );
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    // The pushed action takes number 1; the action run at once, which
+    // had none, takes 2 afterwards.
+    assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 4), Ok(Some(2)));
+    assert_eq!(queued(&fx), [(1, 3)]);
 }
 
 /// An action run at once whose tree fails puts my priority back.

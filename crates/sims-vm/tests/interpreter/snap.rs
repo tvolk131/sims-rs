@@ -371,7 +371,7 @@ fn snap_checks_its_object_mode_and_slot() {
     assert_eq!(code(snap(&mut fx, me, LAMP as i16, 0, 5, 0)), Some(0x24));
     assert_eq!(code(snap(&mut fx, me, LAMP as i16, 1, 3, 0)), Some(0x1b));
     assert_eq!(code(snap(&mut fx, me, LAMP as i16, -1, 3, 0)), Some(0x1b));
-    for mode in [0, 1, 2, 4] {
+    for mode in [0, 1, 2] {
         let result = snap(&mut fx, me, LAMP as i16, 0, mode, 0);
         assert!(
             matches!(trap(result), Trap::Unsupported(ref m) if m.contains("mode")),
@@ -379,6 +379,108 @@ fn snap_checks_its_object_mode_and_slot() {
         );
     }
     assert_eq!(unmoved(&fx, me), start);
+}
+
+/// Sets the global file's SLOT 100, whose kind 3 entries are the lot's
+/// global routing slots.
+fn set_global_slots(fx: &mut Fixture, slots: Vec<Slot>) {
+    let global = fx.program.global;
+    fx.program
+        .libraries
+        .get_mut(&global)
+        .unwrap()
+        .slots
+        .insert(100, slots);
+}
+
+/// The snapper, with the lamp's one routing slot keeping my facing and
+/// the lot's global routing slots: a container entry, then routing
+/// slots turning by 1 (flag bit 1) and by 4 (bit 4) with the lamp. The
+/// lamp faces 5.
+fn global_snapper() -> (Fixture, u16) {
+    let (mut fx, me) = snapper(SKIP_CHECKS);
+    fx.lamp_mut().position = [56, 24, 1];
+    fx.lamp_mut().data[1] = 5;
+    set_global_slots(
+        &mut fx,
+        vec![
+            Slot { kind: 0, ..slot(0) },
+            slot(SKIP_CHECKS | TURNED | 2),
+            slot(SKIP_CHECKS | TURNED | 0x10),
+        ],
+    );
+    (fx, me)
+}
+
+#[test]
+fn mode_4_names_one_of_the_lots_global_routing_slots() {
+    // Mode 4 reads the lot's table (0x454ab6: the stack object's lot,
+    // +0x9c), counting only its routing entries: slot 0 turns me by 1
+    // from the lamp's facing, slot 1 by 4. The place is still the stack
+    // object's.
+    for (index, facing) in [(0, 6), (1, 1)] {
+        let (mut fx, me) = global_snapper();
+        assert_eq!(snap(&mut fx, me, LAMP as i16, index, 4, 0), Ok(true));
+        let person = &fx.world.objects[&me];
+        assert_eq!(person.position, [56, 24, 1], "slot {index}");
+        assert_eq!(person.data[1], facing, "slot {index}");
+        assert_eq!(person.data[52], 0);
+    }
+    // Mode 3 with the same index reads the lamp's own slot: my facing.
+    let (mut fx, me) = global_snapper();
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+    assert_eq!(fx.world.objects[&me].data[1], 3);
+}
+
+#[test]
+fn mode_4_reads_the_lots_flags_for_its_slot_not_the_objects() {
+    // The flags the lot's table holds in place of the type's are kept
+    // under object 0; the lamp's own for the same index are not read.
+    let (mut fx, me) = global_snapper();
+    fx.world
+        .routing
+        .slot_flags
+        .insert((LAMP, 0), (SKIP_CHECKS | TURNED | 8) as i32);
+    fx.world
+        .routing
+        .slot_flags
+        .insert((0, 0), (SKIP_CHECKS | TURNED | 4) as i32);
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 4, 0), Ok(true));
+    assert_eq!(fx.world.objects[&me].data[1], 7);
+}
+
+#[test]
+fn mode_4_past_the_lots_table_is_native_error_0x1b() {
+    // Two global routing slots, and the lamp's table is not looked at.
+    let (mut fx, me) = global_snapper();
+    set_slots(&mut fx, vec![slot(0), slot(0), slot(0)]);
+    let start = unmoved(&fx, me);
+    for index in [2, -1] {
+        assert_eq!(
+            code(snap(&mut fx, me, LAMP as i16, index, 4, 0)),
+            Some(0x1b),
+            "slot {index}"
+        );
+    }
+    // A lot with no global slots at all.
+    set_global_slots(&mut fx, Vec::new());
+    assert_eq!(code(snap(&mut fx, me, LAMP as i16, 0, 4, 0)), Some(0x1b));
+    assert_eq!(unmoved(&fx, me), start);
+}
+
+#[test]
+fn mode_4_on_myself_turns_me_where_i_stand() {
+    // As the snack order does: I am the stack object, and the global slot
+    // (flags 0x1010, with no 0x800) turns me by 4 from my own facing. The
+    // place is where I stand, so the walls are not looked at.
+    let (mut fx, me) = snapper(SKIP_CHECKS);
+    set_global_slots(&mut fx, vec![slot(TURNED | 0x10)]);
+    wall(&mut fx, [2, 2], 0xf);
+    assert_eq!(snap(&mut fx, me, me as i16, 0, 4, 0), Ok(true));
+    let person = &fx.world.objects[&me];
+    assert_eq!(person.position, [40, 40, 1]);
+    assert_eq!(person.data[1], 7);
+    assert_eq!(person.data[52], 0);
 }
 
 #[test]
