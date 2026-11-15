@@ -4,6 +4,7 @@
 
 use sims_game::game::goth_house;
 use sims_game::people::People;
+use sims_game::pick;
 use sims_game::view::View;
 use sims_game::{Game, Options};
 use sims_render::{Canvas, open_house};
@@ -41,11 +42,35 @@ fn the_goths_play_and_are_drawn() {
     game.resize([800, 600]);
     let canvas = game.render();
     assert_eq!((canvas.width, canvas.height), (800, 600));
-    // Paused, the lot owes no ticks however long it waits.
-    game.pace.toggle_pause();
-    assert_eq!(game.advance(10_000_000), 0);
-    game.pace.toggle_pause();
+    // A tick every 42 ms at normal speed.
     assert_eq!(game.advance(100_000), 2);
+    // Paused, the lot goes on ticking, but its clock stands.
+    let clock = |game: &Game| {
+        let world = game.lot().world();
+        (world.ticks, world.globals[5], world.globals[6])
+    };
+    let before = clock(&game);
+    game.toggle_pause();
+    assert!(game.paused());
+    assert_eq!(game.advance(420_000), 10);
+    assert_eq!(clock(&game), before);
+    game.toggle_pause();
+    assert!(!game.paused());
+    // Ultra speed is a tick every 2 ms, and the simulation's speed is 994.
+    game.set_speed(sims_ui::command::Speed::Ultra);
+    assert_eq!(game.lot().world().speed(), 994);
+    assert_eq!(game.advance(20_000), 10);
+    assert_eq!(game.lot().world().ticks, before.0.wrapping_add(10));
+    // A speed button runs a paused game again.
+    game.toggle_pause();
+    game.set_speed(sims_ui::command::Speed::Fast);
+    assert!(!game.paused());
+    assert_eq!(game.lot().world().speed(), 924);
+    // The button of the speed the game has does not start the time again.
+    assert_eq!(game.advance(13_000), 0);
+    game.set_speed(sims_ui::command::Speed::Fast);
+    assert_eq!(game.advance(1_000), 1);
+    assert_eq!(game.stopped(), None);
 }
 
 #[test]
@@ -71,7 +96,7 @@ fn people_stand_where_a_click_finds_them() {
     let view = View::new([800, 600], shape.built_center(), opened.rotation);
     let mut canvas = Canvas::new(800, 600, [0, 0, 0]);
     sims_render::draw(world, &shape, &mut opened.assets, &view.camera, &mut canvas);
-    let bare = canvas.color.clone();
+    let bare = canvas.clone();
     let mut theirs = canvas.clone();
     let mut people = People::open(&install, &house).expect("the people's files");
     people.refresh(world);
@@ -83,49 +108,110 @@ fn people_stand_where_a_click_finds_them() {
     let drawn = reference.draw_on_lot(world, &view.camera, &mut theirs);
     assert!(drawn.people > 0 && drawn.problems.is_empty(), "{drawn:?}");
     assert!(theirs.color == canvas.color && theirs.depth == canvas.depth);
-    let drawn = bare
+    let points: Vec<[i32; 2]> = (0..600)
+        .flat_map(|y| (0..800).map(move |x| [x, y]))
+        .collect();
+    let changed: Vec<[i32; 2]> = points
         .iter()
-        .zip(&canvas.color)
-        .filter(|(a, b)| a != b)
-        .count();
-    assert!(drawn > 200, "only {drawn} pixels of people drawn");
+        .copied()
+        .filter(|&[x, y]| {
+            let i = y as usize * 800 + x as usize;
+            bare.color[i] != canvas.color[i]
+        })
+        .collect();
+    assert!(
+        changed.len() > 200,
+        "only {} pixels of people drawn",
+        changed.len()
+    );
     // A click on a pixel a person was drawn in finds a person; one far
     // from every person finds none.
     let mut found = std::collections::BTreeSet::new();
-    let changed: Vec<usize> = (0..bare.len())
-        .filter(|&i| bare[i] != canvas.color[i])
-        .collect();
-    for &i in &changed {
-        let point = [(i % 800) as i32, (i / 800) as i32];
-        let id = people
-            .at(world, point)
+    for &point in &changed {
+        let id = pick::person(world, &canvas, point)
             .unwrap_or_else(|| panic!("nobody at {point:?}, which a person was drawn in"));
         assert!(world.objects[&id].person.is_some(), "object {id}");
         found.insert(id);
     }
     assert!(!found.is_empty(), "no drawn person is found by a click");
-    let far = (0..bare.len())
-        .find(|&i| {
-            let [x, y] = [(i % 800) as i32, (i / 800) as i32];
-            changed.iter().all(|&j| {
-                let [cx, cy] = [(j % 800) as i32, (j / 800) as i32];
-                (cx - x).abs() > 20 || (cy - y).abs() > 20
-            })
-        })
+    let far = |&[x, y]: &[i32; 2]| {
+        changed
+            .iter()
+            .all(|&[cx, cy]| (cx - x).abs() > 20 || (cy - y).abs() > 20)
+    };
+    let far_point = *points
+        .iter()
+        .find(|p| far(p))
         .expect("a pixel far from every person");
-    assert_eq!(
-        people.at(world, [(far % 800) as i32, (far / 800) as i32]),
-        None
-    );
+    assert_eq!(pick::person(world, &canvas, far_point), None);
+    // Far from everyone, a click finds the object shown at the pixel, as
+    // the lot alone shows it: each object on the lot that shows a pixel
+    // there is found by a click on it.
+    let mut objects = std::collections::BTreeSet::new();
+    for point in points.iter().filter(|p| far(p)) {
+        let shown = bare.id_at(point[0], point[1]);
+        assert_eq!(canvas.id_at(point[0], point[1]), shown, "{point:?}");
+        let picked = pick::at(world, &canvas, *point);
+        assert_eq!(picked, shown, "{point:?}");
+        if let Some(id) = picked {
+            assert!(world.objects[&id].person.is_none(), "object {id}");
+            objects.insert(id);
+        }
+    }
+    assert!(objects.len() > 20, "only {} objects found", objects.len());
     // Behind a lot nearer than everyone, nobody is drawn, and a click
     // where they stand finds nobody.
     let mut covered = Canvas::new(800, 600, [0, 0, 0]);
     covered.depth.fill(i32::MIN);
     people.draw(world, &view.camera, &mut covered);
-    for &i in changed.iter().step_by(7) {
-        let point = [(i % 800) as i32, (i / 800) as i32];
-        assert_eq!(people.at(world, point), None, "{point:?}");
+    for &point in changed.iter().step_by(7) {
+        assert_eq!(pick::at(world, &covered, point), None, "{point:?}");
     }
+}
+
+#[test]
+fn the_player_answers_the_help_dialog_from_the_window() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        answers: Vec::new(),
+        ..options(install.clone())
+    })
+    .expect("the Goth house opens");
+    // Tick 2 shows the Help System's dialog, Yes and No, and the lot
+    // waits; what was owed beyond it is dropped.
+    assert_eq!(game.advance(149_999), 1);
+    assert_eq!(game.stopped(), None);
+    let shown = game.asking().expect("a dialog waits").shown.clone();
+    assert_eq!(shown.answers, &[2, 3]);
+    let waiting = game.lot().world().hash();
+    // The lot does not go on while it waits.
+    assert_eq!(game.run(10), 0);
+    assert_eq!(game.lot().world().hash(), waiting);
+    game.resize([800, 600]);
+    game.render();
+    let layout = game.dialog().expect("the dialog is drawn");
+    assert_eq!(layout.caller, shown.object);
+    assert_eq!(layout.buttons.len(), 2);
+    // No, the second button: as `--answers 3`.
+    let no = layout.buttons[1];
+    game.press([no.x + no.width / 2, no.y + no.height / 2]);
+    assert!(game.asking().is_none(), "{:?}", game.stopped());
+    // The answered tick ran at once, and the 49.999 ms owed when the
+    // dialog came were dropped.
+    assert_eq!(game.lot().ticks(), 2);
+    assert_eq!(game.advance(1), 0);
+    // From there time is owed as before: with that 1 µs, a tick.
+    assert_eq!(game.advance(49_999), 1);
+    assert_eq!(game.run(197), 197);
+    assert_eq!(game.stopped(), None);
+    let mut listed = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(listed.run(200), 200);
+    assert_eq!(game.lot().world().hash(), listed.lot().world().hash());
+    // The dialog is gone once answered.
+    game.render();
+    assert!(game.dialog().is_none());
 }
 
 #[test]
@@ -650,4 +736,43 @@ fn a_press_on_a_portrait_selects_that_goth() {
     assert_eq!(game.stopped(), None);
     game.select(mortimer);
     assert_eq!(game.lot().world().selected(), Some(mortimer));
+}
+
+#[test]
+fn the_pie_shows_the_selected_goths_head() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    game.render();
+    let selected = game.lot().world().selected().expect("a Sim is selected");
+    let points: Vec<[i32; 2]> = (0..600)
+        .step_by(6)
+        .flat_map(|y| (0..800).step_by(6).map(move |x| [x, y]))
+        .filter(|&p| !game.over_panel(p))
+        .collect();
+    for point in points {
+        game.leave();
+        game.hover(point);
+        game.press(point);
+        if game.menu().is_some() {
+            break;
+        }
+    }
+    game.render();
+    let menu = game.menu().expect("the menu stays open");
+    assert_eq!(menu.person, selected);
+    let head = menu.head.as_ref().expect("the head is drawn");
+    assert_eq!([head.width, head.height], menu.face_size());
+    // The head fills much of the face, and is clear around it.
+    let opaque = head.rgba.chunks(4).filter(|p| p[3] == 255).count();
+    let area = (head.width * head.height) as usize;
+    assert!(
+        opaque > area / 5 && opaque < area * 4 / 5,
+        "{opaque} of {area}"
+    );
+    assert_eq!(head.rgba[3], 0);
+    assert!(game.problems().is_empty(), "{:?}", game.problems());
 }

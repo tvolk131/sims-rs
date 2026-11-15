@@ -316,13 +316,7 @@ fn scope_24_reads_other_fields_of_the_record() {
     );
     // Fields that read what the simulation does not keep fail loudly,
     // naming the original's code, even in a write.
-    for (index, address) in [
-        (0, "0x425baa"),
-        (1, "0x425be2"),
-        (5, "0x427148"),
-        (7, "0x425c5e"),
-        (8, "0x425cb4"),
-    ] {
+    for (index, address) in [(5, "0x427148"), (7, "0x425c5e"), (8, "0x425cb4")] {
         for operator in [op::EQUAL, op::ASSIGN] {
             let fault = fx
                 .expression(24, index, operator, scope::LITERAL, 0)
@@ -338,6 +332,69 @@ fn scope_24_reads_other_fields_of_the_record() {
     for index in [0, 1, 2, 5, 7, 8, 9] {
         assert_eq!(field(&mut fx, index), 0);
     }
+}
+
+#[test]
+fn scope_24_field_0_is_the_first_person_on_the_lot_of_the_records_type() {
+    let mut fx = Fixture::new();
+    fx.world.neighbors.slots = vec![None, Some(record(40, SIM_GUID))];
+    // The first in the lot's list of people, not the lowest ID.
+    fx.add_sim(9);
+    fx.world.people = vec![9, SIM];
+    assert_eq!(field(&mut fx, 0), 9);
+    // No person on the lot has the record's type.
+    fx.world.neighbors.slots[1].as_mut().unwrap().guid = LAMP_GUID;
+    assert_eq!(field(&mut fx, 0), 0);
+    // A type with two definitions: which the record is linked to is not
+    // kept.
+    let again = fx.catalog.objects[0].clone();
+    fx.catalog.objects.push(again);
+    let fault = fx
+        .expression(scope::TEMPS, 0, op::ASSIGN, 24, 0)
+        .unwrap_err();
+    let Trap::Unsupported(text) = &fault.trap else {
+        panic!("{fault}");
+    };
+    assert!(text.contains("0x425baa"), "{text}");
+}
+
+#[test]
+fn scope_24_field_1_is_whether_the_selected_family_has_the_records_type() {
+    let mut fx = Fixture::new();
+    fx.world.neighbors.slots = vec![None, Some(record(40, SIM_GUID))];
+    fx.world.families = vec![family(5, 1, &[LAMP_GUID, SIM_GUID]), family(6, 2, &[])];
+    // The selected family is the one whose ID global 9 holds.
+    fx.world.globals[9] = 5;
+    assert_eq!(field(&mut fx, 1), 1);
+    fx.world.globals[9] = 6;
+    assert_eq!(field(&mut fx, 1), 0);
+    // Global 9 at 0 may stand for no family or for family 0.
+    fx.world.globals[9] = 0;
+    let fault = fx
+        .expression(scope::TEMPS, 0, op::ASSIGN, 24, 1)
+        .unwrap_err();
+    let Trap::Unsupported(text) = &fault.trap else {
+        panic!("{fault}");
+    };
+    assert!(text.contains("global 9 at 0"), "{text}");
+    // Global 9 naming no family.
+    fx.world.globals[9] = 7;
+    assert!(matches!(
+        fx.expression(scope::TEMPS, 0, op::ASSIGN, 24, 1)
+            .unwrap_err()
+            .trap,
+        Trap::Invalid(_)
+    ));
+    // A record of a type with no definition.
+    fx.world.globals[9] = 5;
+    fx.world.neighbors.slots[1].as_mut().unwrap().guid = 0x9999;
+    let fault = fx
+        .expression(scope::TEMPS, 0, op::ASSIGN, 24, 1)
+        .unwrap_err();
+    let Trap::Unsupported(text) = &fault.trap else {
+        panic!("{fault}");
+    };
+    assert!(text.contains("0x425be2"), "{text}");
 }
 
 /// The Sim is neighbor 1. Slot 3 holds a record whose own ID is 7.
@@ -513,6 +570,75 @@ fn manage_inventory_finds_the_first_token_of_a_kind_in_the_owners_inventory() {
     fx.world.neighbors.inventories[1].items[1].count = 0;
     assert_eq!(sim_runs(&mut fx, 51, FIND, 0), Ok(false));
     assert_eq!(fx.sim().temps, [0; 8]);
+}
+
+/// Operation 4 for token kind 2: after the place in temp 3, the count
+/// into temp 1 and the place into temp 2; flag 0x1 off, so any GUID.
+const WALK: [u8; 8] = [4, 2, 0x20, 0x13, 0x11, 0x11, 0, 0];
+
+/// Runs operation 4 with temp 3 holding `after`: the branch, and temps 1
+/// and 2.
+fn walk(fx: &mut Fixture, operands: [u8; 8], after: i16) -> (bool, [i16; 2]) {
+    fx.sim_mut().temps = vec![0; 8];
+    fx.sim_mut().temps[3] = after;
+    let found = sim_runs(fx, 51, operands, 0).unwrap_or_else(|f| panic!("{f}"));
+    (found, [fx.sim().temps[1], fx.sim().temps[2]])
+}
+
+#[test]
+fn manage_inventory_walks_the_tokens_of_a_kind_after_a_place() {
+    let mut fx = inventories();
+    // Tokens: kind 1 (3), kind 2 (5), kind 2 (6).
+    assert_eq!(walk(&mut fx, WALK, -1), (true, [5, 1]));
+    assert_eq!(walk(&mut fx, WALK, 1), (true, [6, 2]));
+    // None after: count 0, place -1, false.
+    assert_eq!(walk(&mut fx, WALK, 2), (false, [0, -1]));
+    assert_eq!(walk(&mut fx, WALK, 40), (false, [0, -1]));
+    // A place after 0x7fff wraps negative and finds nothing (0x41f746).
+    assert_eq!(walk(&mut fx, WALK, 0x7fff), (false, [0, -1]));
+    // Unlike operation 3, a count of 0 is found.
+    fx.world.neighbors.inventories[1].items[2].count = 0;
+    assert_eq!(walk(&mut fx, WALK, 1), (true, [0, 2]));
+    // Without flag 0x1 the GUID is not compared; with it, it is.
+    fx.world.neighbors.inventories[1].items[1].guid = 0x9999;
+    assert_eq!(walk(&mut fx, WALK, -1), (true, [5, 1]));
+    let mut guid = WALK;
+    guid[2] |= 1;
+    assert_eq!(walk(&mut fx, guid, -1), (true, [0, 2]));
+    // A place past 0x7fff is cut to a word: at 32768 it is -32768, and at
+    // 65535 it is -1, which is false with the count written.
+    let far = |at: usize| {
+        let mut items = vec![
+            Item {
+                kind: 1,
+                guid: LAMP_GUID,
+                count: 1,
+            };
+            at
+        ];
+        items.push(Item {
+            kind: 2,
+            guid: LAMP_GUID,
+            count: 7,
+        });
+        items
+    };
+    let mut wide = inventories();
+    wide.world.neighbors.inventories[1].items = far(32768);
+    assert_eq!(walk(&mut wide, WALK, -1), (true, [7, -32768]));
+    wide.world.neighbors.inventories[1].items = far(65535);
+    assert_eq!(walk(&mut wide, WALK, -1), (false, [7, -1]));
+    // Operation 3 cuts it the same way.
+    wide.sim_mut().temps = vec![0; 8];
+    assert_eq!(sim_runs(&mut wide, 51, FIND, 0), Ok(true));
+    assert_eq!(wide.sim().temps[1..3], [7, -1]);
+    // The place is written after the count when both name one temp.
+    let mut same = WALK;
+    same[3] = 0x0b;
+    fx.sim_mut().temps = vec![0; 8];
+    fx.sim_mut().temps[3] = -1;
+    assert_eq!(sim_runs(&mut fx, 51, same, 0), Ok(true));
+    assert_eq!(fx.sim().temps[1], 1);
 }
 
 #[test]

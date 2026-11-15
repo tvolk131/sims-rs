@@ -1926,7 +1926,7 @@ Progress:
 - Done: which object or person drew each pixel, for clicks:
   `Canvas::id_at` after `sims_render::draw` and `People::draw_on_lot`.
   Objects name themselves, people their object ID, and terrain, floors
-  and walls nobody. The game window can pick by it instead of by tile.
+  and walls nobody. The game window picks by it.
   How the original finds what a click hit is not read.
 - Done: the pools of light lit lamps throw on the floor, from the
   game's `lightMap.dat`, and lit lamps drawn in full light, as the
@@ -2099,12 +2099,11 @@ for several minutes without the lot stopping. The crate joins the others
 through their public interfaces only; the simulation never depends on it.
 
 - **Done: the window.** `cargo run --release -p sims-game` boots the
-  Goths' house (`SIMS_INSTALL`, `House05.iff`, answering No to the Help
-  System) and runs it in strict mode, a tick every 50 ms at normal
-  speed. The lot, its people (hidden by the walls, furniture and floors
+  Goths' house (`SIMS_INSTALL`, `House05.iff`) and runs it in strict
+  mode at the original's pace (below). The lot, its people (hidden by
+  the walls, furniture and floors
   in front of them) and the panel over both are drawn every tick; the clock, funds and needs on the panel are the live
-  world's. The panel's speed, pause and camera buttons work (the game
-  paces the lot; the simulation's own speed global is not touched).
+  world's. The panel's speed, pause and camera buttons work.
   The first error stops the lot, which stays on screen as it was with
   the failure across the top. `--play` runs it in play mode instead: an
   object whose tick fails is reset and the lot goes on, and each new
@@ -2141,7 +2140,9 @@ through their public interfaces only; the simulation never depends on it.
   The menu is drawn as the original's pie, with `sims_ui::pie` (#157):
   the labels around the click, a name with a `/` in a submenu, at most
   12 shown; a test clicks the fridge and chooses Have A Snack from its
-  pie. The simulation lists the fridge itself: in the morning the house
+  pie. In its middle is the head of the Sim the menu is for, as posed
+  now, drawn by `sims-people`'s rasterizer from in front (its camera,
+  light and size are ours, not compared with the original's). The simulation lists the fridge itself: in the morning the house
   loads in, Have A Snack, Have Quick Breakfast, Have Breakfast and
   Serve Breakfast.
 - **Done: a Sim doing what he is told.** Have A Snack queued on the
@@ -2155,6 +2156,18 @@ through their public interfaces only; the simulation never depends on it.
   Strict mode now runs the order through step 3602 and stops at step
   3603 (object 354 uses Create New Object Instance mode 6 with flag 0x4,
   not ported); without an order it runs to tick 3432.
+- **Done: the speed and the pause.** The panel's speed buttons set the
+  simulation's speed as the original's setter does (`0x46d697`, globals
+  16 and 18, `sims_sim::speed`): 760, 924 and 994. The window ticks at
+  the setter's period for that speed: 42, 14 and 2 ms. The pause button
+  and space set global 17 (`0x46d813`, `0x46d83a`), and the lot goes on
+  ticking with its clock standing, as the original's does: every pass is
+  a partial one. The Goths' house runs 200 such ticks in strict mode.
+  The idle loop's own speed is ported too (`0x46d9d6`,
+  `World::idle_speed`). On a residential lot where nobody holds the
+  speed (`0x442f9b`, presumably everyone away or asleep), it runs at
+  1000 and keeps the speed to go back to in global 18. It goes back once
+  someone holds it. The window follows: 1 ms a tick at 1000.
 - **Done in play mode: selecting a Sim.** A press on a portrait selects
   that Sim (0x445449, between ticks): the Sim selected before is
   deselected, the indicators move, and the panel and the pie menus
@@ -2162,24 +2175,28 @@ through their public interfaces only; the simulation never depends on it.
   (0x58da12), which is not ported, so in strict mode (`Lot::select`)
   switching Sims fails and changes nothing; play mode
   (`Lot::select_play`) leaves the refresh out.
-- **Next:** the selected Sim's head in the middle of the pie; answering
-  a dialog from the window.
+- Done: a click picks what the frame shows at the pixel
+  (`Canvas::id_at`, `sims_game::pick`): the person shown there or
+  nearest within two pixels, else the object shown there. A tile of a
+  multi-tile object is picked as itself; the simulation sends its
+  interactions on (0x435286). How the original finds what a click hit
+  is not read.
+- **Done: answering a dialog from the window.** A dialog with a choice
+  waits for the player: the lot stops before the tick that shows it,
+  the dialog is drawn from the world as that tick left it, and a press
+  on a button answers it and the tick runs again with the answer
+  (`Lot::wait_for_answers`, `Lot::answer`). The Help System's dialog at
+  tick 2, answered No from the window, gives the lot `--answers 3`
+  gives, hash for hash, through tick 200. `--answers` still answers
+  first, and `--png` answers No to the Help System by default.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
     on Manage Inventory operation 4 and scope 12. A check tree's fault
     should keep its trap rather than become `Unsupported` text, which
     `sims-game` reads to tell unported from failed.
-  - `sims-render`: which object drew each pixel (an object ID buffer
-    beside the depth), so a click picks the object under it. Today
-    `sims-game` guesses from each object's tile.
-  - `sims-vm`: a way to answer a dialog from the window (the `Lot`'s
-    player is a fixed answer list given at load), and to change the
-    game's speed global. A play-mode step that fails should still hand
+  - `sims-vm`: a play-mode step that fails should still hand
     back the errors it caught before failing, and say which frame
     (before or after the tick) was skipped.
-  - `sims-people`: which person drew each pixel (`draw_on_lot` with an
-    owner per pixel), so `sims-game` need not repeat its drawing loop
-    to find the person a click lands on.
   - `sims-vm`: the animator's refresh (0x58da12), which deselecting a
     Sim makes, so strict mode can switch Sims.
   - `sims-people`: the selected Sim's head as an image, which the
