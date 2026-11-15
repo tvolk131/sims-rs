@@ -617,9 +617,10 @@ impl<S: Samples> Player<S> {
     }
 
     /// *(code)* What the game's kind 33 does, it seems once a frame
-    /// (0x574157): moves the current ambience's cursor. `view` is a
-    /// value the original computes from the camera (0x570c3e, not read
-    /// further; below 30 counts as 0, as does any value while a flag of
+    /// (0x574157): moves the current ambience's cursor. `view` is the
+    /// share of the screen's tiles that are outdoors, in percent, which
+    /// the original computes from the camera ([`crate::ambience::view`],
+    /// 0x570c3e; below 30 counts as 0, as does any value while a flag of
     /// the sound manager, not identified, is set): the row goes to `view
     /// * 10` per mille. `hour` picks the column from [`ambience::HOUR_COLUMNS`]
     /// (`column * 1000 / 13` per mille); an hour past 23 leaves it.

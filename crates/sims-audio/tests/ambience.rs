@@ -1,5 +1,6 @@
 //! The ambient-score player on hand-built scores and samples.
 
+use sims_audio::ambience;
 use sims_audio::fsc::Score;
 use sims_audio::module::Module;
 use sims_audio::player::{BLOCK, NoSources, Player, RATE};
@@ -481,4 +482,65 @@ fn an_update_far_in_the_future_does_not_overflow() {
     fresh.update(u64::MAX, &mut Silent);
     fresh.update(u64::MAX, &mut Silent);
     assert!(fresh.is_started());
+}
+
+/// The view tiles [`ambience::view`] visits, in order, for a screen of
+/// `columns` tiles across and `rows` half tiles down at the near zoom.
+fn walk(corner: [i32; 2], columns: i32, rows: i32) -> Vec<[i8; 2]> {
+    let mut seen = Vec::new();
+    ambience::view([columns * 128, rows * 32], 3, corner, |tile| {
+        seen.push(tile);
+        false
+    });
+    seen
+}
+
+#[test]
+fn the_view_walks_the_screen_in_half_tile_rows() {
+    // Along a row the column goes up and the row down; each row starts
+    // a step down, by the row first and then the column.
+    assert_eq!(
+        walk([10, 10], 2, 4),
+        [
+            [10, 10],
+            [11, 9],
+            [10, 11],
+            [11, 10],
+            [11, 11],
+            [12, 10],
+            [11, 12],
+            [12, 11],
+        ]
+    );
+    // Tiles beyond 1 to 62 are not asked about (nor counted).
+    assert_eq!(walk([0, 2], 3, 1), [[1, 1]]);
+    assert_eq!(walk([62, 5], 3, 1), [[62, 5]]);
+    // Coordinates wrap as signed bytes.
+    assert!(walk([127, 10], 2, 1).is_empty());
+    assert_eq!(walk([56 - 256, 10], 1, 1), [[56, 10]]);
+}
+
+#[test]
+fn the_view_is_the_outdoor_share_in_percent() {
+    // Every other tile outside.
+    let view = |screen, zoom| ambience::view(screen, zoom, [20, 20], |[x, _]| x % 2 == 0);
+    assert_eq!(view([800, 600], 3), 50);
+    // All outside, none outside.
+    assert_eq!(ambience::view([800, 600], 1, [20, 20], |_| true), 100);
+    assert_eq!(ambience::view([800, 600], 2, [20, 20], |_| false), 0);
+    // One of three: 33.33... cut to 33.
+    let mut n = 0;
+    let third = ambience::view([3 * 128, 32], 3, [20, 20], |_| {
+        n += 1;
+        n == 1
+    });
+    assert_eq!(third, 33);
+    // Nothing on the lot, or no screen: 0, as the original's NaN gives.
+    assert_eq!(ambience::view([800, 600], 3, [-100, -100], |_| true), 0);
+    assert_eq!(ambience::view([0, 0], 3, [20, 20], |_| true), 0);
+    assert_eq!(ambience::view([800, 600], 40, [20, 20], |_| true), 0);
+    assert_eq!(
+        ambience::view([i32::MIN, i32::MAX], 1, [20, 20], |_| true),
+        0
+    );
 }

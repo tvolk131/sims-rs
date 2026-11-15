@@ -199,8 +199,8 @@ struct App {
     /// How many of the game's caught errors are printed.
     printed: usize,
     sound: Sound,
-    /// The hour and speed the sound was last told.
-    heard: Option<(u32, Speed)>,
+    /// The hour, speed and ambience view the sound was last told.
+    heard: Option<(u32, Speed, i32)>,
 }
 
 impl App {
@@ -285,10 +285,15 @@ impl App {
             redraw = true;
         }
         self.changed(redraw);
-        let now = (self.game.hour(), self.game.pace.speed);
+        let now = (
+            self.game.hour(),
+            self.game.pace.speed,
+            self.game.ambience_view(),
+        );
         if self.heard != Some(now) {
             self.sound.send(Input::Hour(now.0));
             self.sound.send(Input::Speed(now.1));
+            self.sound.send(Input::View(now.2));
             self.heard = Some(now);
         }
     }

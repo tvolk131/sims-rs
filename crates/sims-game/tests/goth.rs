@@ -261,3 +261,39 @@ fn a_tile_offers_the_menu_of_the_tile_its_orders_go_to() {
         "tile {tile}, target {target}: {queue:?}"
     );
 }
+
+#[test]
+fn the_ambience_follows_the_outdoor_share_of_the_screen() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    let center = [400, 300];
+    let camera = game.view.camera;
+    let mut views = Vec::new();
+    for zoom in sims_render::Zoom::ALL {
+        for turns in 0..4 {
+            game.view.camera = camera.zoomed(zoom, center).rotated(turns, center);
+            views.push(game.ambience_view());
+        }
+    }
+    // The original's values are **unverified**.
+    // Zoomed in on the house, less of the screen is outdoors.
+    assert!(views.iter().all(|v| (0..=100).contains(v)), "{views:?}");
+    assert!(
+        views[8..].iter().sum::<i32>() < views[..4].iter().sum::<i32>(),
+        "{views:?}"
+    );
+    // Upstairs, where the house has fewer rooms, more of it is outdoors.
+    game.view.camera = camera.zoomed(sims_render::Zoom::Near, center);
+    let ground = game.ambience_view();
+    game.view.camera.level = 2;
+    let upstairs = game.ambience_view();
+    assert!(upstairs > ground, "{ground} {upstairs}");
+    // A camera far off the lot hears no outdoors, and does not panic.
+    for origin in [[i32::MIN, 0], [i32::MAX, i32::MAX], [0, i32::MIN]] {
+        game.view.camera.origin = origin;
+        assert_eq!(game.ambience_view(), 0);
+    }
+}

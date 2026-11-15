@@ -822,3 +822,28 @@ fn a_person_entering_a_dark_room_marks_it_to_be_counted_again() {
     assert!(world.rooms.rooms[&3].occupied);
     world.note_occupant(77, true);
 }
+
+#[test]
+fn a_tile_is_outside_unless_walls_enclose_it() {
+    let mut world = lot(10);
+    boxed(&mut world, 2);
+    world.rebuild_rooms().unwrap();
+    let hash = world.hash();
+    let outside: Vec<bool> = (0..10).map(|x| world.outside(1, [x, 3]).unwrap()).collect();
+    assert_eq!(
+        outside,
+        (0..10)
+            .map(|x| flags(&world, 1, x as usize, 3) & 4 != 0)
+            .collect::<Vec<_>>()
+    );
+    // Tiles 2 and 3 are walled in.
+    assert_eq!(&outside[1..5], [true, false, false, true]);
+    assert_eq!(world.outside(2, [1, 1]), Some(true));
+    assert_eq!(world.outside(0, [1, 1]), None);
+    assert_eq!(world.outside(3, [1, 1]), None);
+    assert_eq!(world.outside(1, [-1, 1]), None);
+    assert_eq!(world.outside(1, [1, 64]), None);
+    assert_eq!(world.hash(), hash);
+    world.arrays.remove(&8);
+    assert_eq!(world.outside(1, [1, 1]), None);
+}

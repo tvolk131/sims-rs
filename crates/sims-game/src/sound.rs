@@ -10,9 +10,10 @@
 //!   speed (`SimSpeed`). Which value the original gives at each speed is
 //!   **unverified**: normal is 1, as `sims-audio`'s `play` example uses,
 //!   fast 2 and ultra 3.
-//! - The ambience's view, a value the original works out from the camera
-//!   (0x570c3e, not read further). It is [`VIEW`] here, the value that
-//!   plays the backyard ambience in the `play` example: **unverified**.
+//! - The ambience's view, the share of the screen's tiles that are
+//!   outdoors, which the original works out from the camera each frame
+//!   (0x570c3e, `sims_audio::ambience::view`; the game sends
+//!   `Game::ambience_view`).
 
 use sims_audio::SoundEvent;
 use sims_audio::files::SoundFiles;
@@ -25,9 +26,6 @@ use std::path::Path;
 
 /// The register the sound scripts read the game's speed from.
 const SPEED_REGISTER: u8 = 100;
-
-/// The ambience's view input (see the module documentation).
-pub const VIEW: i32 = 50;
 
 /// The most distinct faults reported. Later ones are dropped unseen, so
 /// a long game's missing sounds do not grow without end.
@@ -70,6 +68,8 @@ pub enum Input {
     Events(Vec<SoundEvent>),
     /// The hour of the game's clock (global 0), for the ambience.
     Hour(u32),
+    /// The ambience's camera value (see the module documentation).
+    View(i32),
     Speed(Speed),
 }
 
@@ -78,6 +78,7 @@ pub enum Input {
 pub struct Mixer {
     player: Player<SoundFiles>,
     hour: u32,
+    view: i32,
     /// Faults already reported, so each is reported once.
     reported: BTreeSet<String>,
 }
@@ -95,6 +96,7 @@ impl Mixer {
         Ok(Self {
             player,
             hour: u32::MAX,
+            view: 0,
             reported: BTreeSet::new(),
         })
     }
@@ -108,6 +110,7 @@ impl Mixer {
                 }
             }
             Input::Hour(hour) => self.hour = hour,
+            Input::View(view) => self.view = view,
             Input::Speed(speed) => self
                 .player
                 .set_global(SPEED_REGISTER, speed_register(speed)),
@@ -118,7 +121,7 @@ impl Mixer {
     /// moving the ambience's cursor first, as the original does once a
     /// frame.
     pub fn render(&mut self, frames: usize) -> Vec<i16> {
-        self.player.set_ambience_view(VIEW, self.hour);
+        self.player.set_ambience_view(self.view, self.hour);
         self.player.render_stereo(frames, &NoSources)
     }
 

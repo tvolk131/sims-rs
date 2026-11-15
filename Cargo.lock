@@ -1575,6 +1575,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "sha2",
+ "sims-core",
  "sims-formats",
  "symphonia-bundle-mp3",
  "symphonia-core",
