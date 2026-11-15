@@ -17,7 +17,7 @@
 //!   0x2f, and a missing or empty string 0x30. The accessory goes on
 //!   through the animator's virtual function 0xd8 (0x58d88f, "dress")
 //!   with an empty binding, and comes off through 0xdc (0x58d919,
-//!   "undress"). Putting on a name no skeleton file defines fails
+//!   "undress"). Putting on a name no decoded avatar file defines fails
 //!   loudly: the original keeps an unnamed entry then, not ported.
 //!
 //! Any other operand 1 is native error 0x2f. The primitive always
@@ -52,10 +52,20 @@ impl Machine<'_, '_> {
             0 | 2 => {
                 let name = self.accessory_name(scope, index)?;
                 if !off && !self.program.people.suits.contains(&name) {
+                    let errors = &self.program.people.suit_errors;
+                    let unread = if errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " ({} avatar files stopped decoding: {})",
+                            errors.len(),
+                            errors.keys().cloned().collect::<Vec<_>>().join(", ")
+                        )
+                    };
                     return Err(Trap::Unsupported(format!(
-                        "Change Suit puts on accessory {name:?}, which no skeleton file \
-                         names: the original keeps an entry with an empty name when the \
-                         bind (0x583559) fails, which is not ported"
+                        "Change Suit puts on accessory {name:?}, which no decoded avatar \
+                         file names{unread}: the original keeps an entry with an empty name \
+                         when the suit lookup (0x5a044d) fails, which is not ported"
                     )));
                 }
                 let accessories = &mut self
@@ -166,12 +176,15 @@ impl Machine<'_, '_> {
 /// adds one at the end with an empty binding.
 ///
 /// The original adds the entry first and then binds its suit to the
-/// skeleton (0x583559), keeping the name only when the suit is found
-/// and binds; an entry that does not bind stays, with an empty name.
-/// Callers refuse a name no skeleton file defines (`People::suits`) and
-/// take the bind of any other to succeed. That is **unverified**: the
-/// capture shows the entry count, not its name, and the bind's other
-/// failures (0x599427) are not ported.
+/// skeleton (0x583559), keeping the name only when that works; an entry
+/// that does not bind stays, with an empty name. The bind fails only when
+/// the suit lookup (0x5a044d) does: the name is not in the avatar
+/// registry, or the registry's lazy load of it (0x5a38da) fails. The
+/// attach after it (0x599427, through 0x5954d8) has no failure path.
+/// Callers refuse a name no decoded avatar file defines (`People::suits`)
+/// and take any other to bind. That the registry holds exactly those
+/// names is **unverified**: the capture shows the entry count, not its
+/// name.
 pub(crate) fn dress(accessories: &mut Vec<Accessory>, name: String) {
     undress(accessories, &name);
     accessories.push(Accessory {

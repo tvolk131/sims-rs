@@ -20,17 +20,26 @@ to 408.
 
 What was decided:
 
-- **A suit no skeleton file names fails loudly; any other is taken to
-  bind.** The original adds the entry, then looks the accessory's suit
-  up by name and binds it to the skeleton (`0x583559`, through
-  `0x5a044d` and `0x599427`), storing the name and binding only when
-  that works. An entry that fails stays with an empty name. The content
-  loader now keeps the appearance names of every skeleton file
-  (`People::suits`, lowered), and putting on a name outside that set is
-  `Trap::Unsupported` before anything changes. **Unverified**: that this
-  set is what the original's registry searches, and that a found suit
-  always binds (the bind's other failures are not read). The capture
-  shows the entry count (one, from update 368), not the entry.
+- **A suit no decoded avatar file names fails loudly; any other is
+  taken to bind.** The original adds the entry, then binds its suit to
+  the skeleton (`0x583559`), storing the name and binding only when that
+  works; an entry that fails stays with an empty name. Read from the
+  code, the bind fails only when the suit lookup (`0x5a044d`) does: the
+  name is not in the avatar registry, or the registry's lazy load of it
+  (`0x5a38da`) fails. The attach after it (`0x599427`, through
+  `0x5954d8`) has no failure path. The content loader now reads every
+  avatar file's skeletons and suits record by record, as the original's
+  catalog reader does (so a file holding animations still gives its
+  suits), and keeps the suit names (`People::suits`, lowered) and the
+  files that stopped decoding (`People::suit_errors`). Putting on a
+  name outside that set is `Trap::Unsupported` before anything changes,
+  naming any such files. **Unverified**: that the registry holds exactly
+  these names (the install has no NDX index, so where it gets them is
+  not read) and that its lazy load succeeds whenever ours decodes. The
+  capture shows the entry count (one, from update 368), not the entry.
+  Sol asked that every bind fail loudly until the registry is ported;
+  rejected, since the code leaves only that registry question, and
+  refusing would stop the one case the capture shows.
 - **Only the words a branch reads must be known.** Suits 0 to 7 read no
   person data; others read the suit and age, and the variant only on
   the suit already worn. Writing the suit and variant makes them known.

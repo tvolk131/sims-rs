@@ -246,6 +246,7 @@ fn sim(id: u16, guid: u32) -> Instance {
 fn people() -> People {
     People {
         suits: Default::default(),
+        suit_errors: Default::default(),
         profiles: BTreeMap::new(),
         skeletons: BTreeMap::from([
             (

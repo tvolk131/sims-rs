@@ -180,7 +180,8 @@ fn an_accessory_no_skeleton_file_names_fails_before_any_change() {
     name_accessories(&mut fx);
     fx.program.people.suits.remove("hat");
     let error = trap(run_change(&mut fx, 2, 2, 0)).to_string();
-    assert!(error.contains("no skeleton file"), "{error}");
+    assert!(error.contains("no decoded avatar file"), "{error}");
+    assert!(!error.contains("stopped decoding"), "{error}");
     assert!(worn(&fx).is_empty());
     // Taking it off needs no bind.
     fx.sim_mut().person.as_mut().unwrap().accessories = vec![Accessory {
@@ -189,6 +190,16 @@ fn an_accessory_no_skeleton_file_names_fails_before_any_change() {
     }];
     assert!(run_change(&mut fx, 2, 2, 1).unwrap());
     assert!(worn(&fx).is_empty());
+    // Files that stopped decoding are named, since the suit may be in one.
+    fx.program
+        .people
+        .suit_errors
+        .insert("GameData/x.bcf".into(), "truncated".into());
+    let error = trap(run_change(&mut fx, 2, 2, 0)).to_string();
+    assert!(
+        error.contains("1 avatar files stopped decoding: GameData/x.bcf"),
+        "{error}"
+    );
 }
 
 #[test]

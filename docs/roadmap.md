@@ -1376,8 +1376,8 @@ lacks.
 **Not verified.** The original keeps an accessory's name only when its
 suit is found and binds to the skeleton (`0x583559`); otherwise the
 entry stays with an empty name. Ours refuses, loudly, a name that no
-skeleton file defines (`People::suits`) and takes any other to bind;
-that this matches the original's registry is not verified. The suit
+decoded avatar file defines (`People::suits`) and takes any other to
+bind; that this matches the original's registry is not verified. The suit
 form and taking an accessory off are ported from the code but not
 reached.
 

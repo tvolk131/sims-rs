@@ -387,6 +387,7 @@ fn resident(fx: &mut Fixture) -> People {
     })];
     People {
         suits: Default::default(),
+        suit_errors: Default::default(),
         profiles: [(
             RESIDENT,
             sims_content::Profile {
