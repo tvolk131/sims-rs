@@ -278,8 +278,11 @@ fn a_multi_tile_object_is_rebuilt_as_a_group() {
     let (mut fx, file) = lot();
     let lead = stand(&mut fx, [2, 2]);
     let tile = stand(&mut fx, [3, 2]);
-    // The definition is in a group (word 10).
+    // The definition is in a group (word 10), and is the group's master
+    // (word 11 -1, 0x43adf7): the door test on taking a tile off reads
+    // the master (0x45728d).
     fx.words(file)[10] = 5;
+    fx.words(file)[11] = -1;
     for (id, parent, place) in [(lead, 0, 0), (tile, lead as i16, 1)] {
         fx.world.objects.get_mut(&id).unwrap().multipart = Some(Multipart {
             offset: [place, 0, 0],
@@ -633,11 +636,6 @@ fn a_person_the_reset_would_do_more_for_stops_its_visit() {
     assert!(
         acting.contains("whose running action has a target"),
         "{acting}"
-    );
-    let routing = person(&|p| p.routing_frames = 1);
-    assert!(
-        routing.contains("whose routing frame count is not 0"),
-        "{routing}"
     );
     let wide = person(&|p| p.data[73] = 1);
     assert!(wide.contains("whose data word 73 is set"), "{wide}");
@@ -1132,15 +1130,6 @@ fn what_removing_a_person_does_not_port_fails_loudly() {
         assert!(fx.world.objects.contains_key(&PERSON));
         fault.to_string()
     };
-    // A last reset the original does more for.
-    let routing = fails(&|w| {
-        let person = w.objects.get_mut(&PERSON).unwrap();
-        person.person.as_mut().unwrap().routing_frames = 1;
-    });
-    assert!(
-        routing.contains("whose routing frame count is not 0"),
-        "{routing}"
-    );
     // Before the load has worked the lot's rooms out.
     let early = fails(&|w| w.rooms = Default::default());
     assert!(early.contains("rooms out"), "{early}");

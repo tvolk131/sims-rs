@@ -505,6 +505,49 @@ fn the_lot_hides_the_people_behind_it() {
     }
 }
 
+/// A person upstairs stands on the upper floor, which the terrain under
+/// the house lifts as it lifts the ground floor. At tick 1000 Bella
+/// (person 18) plays with the dollhouse on level 2; seen from there with
+/// the walls down, most of her shows over the floor she kneels on (the
+/// front wall's strip hides the rest). Standing at the floor's height
+/// without the terrain, the floor hid all of her.
+#[test]
+fn a_person_upstairs_stands_on_the_upper_floor() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut opened = sims_render::open_house(&root, &house).unwrap();
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    let mut people = People::open(&root, &house).unwrap();
+    while lot.ticks() < 1000 {
+        lot.step().unwrap();
+    }
+    let world = lot.world();
+    assert_eq!(World::tile(world.objects[&18].position), [25, 25, 2]);
+    assert_eq!(people.update(world), Vec::<String>::new());
+    let mut solo = world.clone();
+    solo.animators.retain(|&id, _| id == 18);
+    let camera = LotCamera {
+        zoom: Zoom::Medium,
+        rotation: 0,
+        level: 2,
+        origin: [400, -350],
+        walls: Walls::Down,
+        focus: Default::default(),
+    };
+    let shape = sims_render::Lot::from_world(world).unwrap();
+    let mut base = sims_render::Canvas::new(800, 600, [0, 0, 0]);
+    sims_render::draw(world, &shape, &mut opened.assets, &camera, &mut base);
+    let mut on = base.clone();
+    let report = people.draw_on_lot(&solo, &camera, &mut on);
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    assert_eq!(report.people, 1);
+    let mut over = base.clone();
+    people.draw(&solo, &camera, &mut over, |_, _, _| -1.0e9);
+    let [shown, laid] = [changed(&base, &on, None), changed(&base, &over, None)];
+    assert!(laid > 200, "{laid}");
+    assert!(shown * 3 >= laid * 2, "{shown} of {laid} pixels shown");
+}
+
 /// The bob's green: green well above red and blue, and bright.
 fn bob_green([r, g, b]: [u8; 3]) -> bool {
     let [r, g, b] = [r, g, b].map(i32::from);

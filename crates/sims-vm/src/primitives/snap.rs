@@ -1,15 +1,29 @@
 //! Snap (opcode 46, 0x454976): put me at a place an object names, at
 //! once, without walking there.
 //!
-//! Operands: word 0 names the slot or local, word 1 is the mode and byte
+//! Operands: word 0 names the slot or parameter, word 1 is the mode and byte
 //! 4 holds flags. The object is the stack object (native error 0x15 if it
 //! names none).
 //!
 //! The modes (0x4549c7 on): 2 is the tile in front of the object, 1 the
-//! object itself, 0 the routing slot a local names, 3 the routing slot
+//! object itself, 0 the routing slot a parameter names, 3 the routing slot
 //! word 0 names, and 4 the lot's global routing slot word 0 names; any
-//! other is native error 0x24. Modes 3 and 4 are ported, and share all
-//! but the table (both reach 0x454ac5):
+//! other is native error 0x24. All five are ported.
+//!
+//! Modes 1 and 2 name no slot (word 0 is not read) and go straight to the
+//! placement (0x454c70) from my own facing, with the place's checks
+//! (step 4) always on: mode 1 (0x454a1d) puts me into the object's
+//! container slot 0, as a slot whose snap target is 0 would but with no
+//! test that the object has that slot (0x454b19; an object with none
+//! fails loudly, as what the placement then does is not ported); mode 2
+//! (0x4549d1) puts me one tile in front of the object, its position plus
+//! one tile's step in its facing (0x42228a, the step's first word added
+//! to +0xf4, our second coordinate), on its level.
+//!
+//! Modes 0, 3 and 4 share all but where the slot's number and table come
+//! from (all reach 0x454ac5). Mode 0 is mode 3 with the number read from
+//! the parameter word 0 names (0x454a4b), which must be one of my frame's
+//! parameters (frame byte +7 counts them; native error 8 otherwise):
 //!
 //! 1. The routing slot is the stack object's in mode 3 (its routing slot
 //!    table, object +0x13c, which holds only the SLOT entries of kind 3,
@@ -118,6 +132,27 @@ enum NotFit {
 /// The SLOT entry kind of a container slot.
 const CONTAINER: u16 = 0;
 
+/// Where a mode puts me, before the place is tested (0x454c70 on).
+struct Spot {
+    /// My facing there, before it is kept in 0 to 7 (0x454d7a).
+    direction: i32,
+    /// The place and its level.
+    position: [i32; 3],
+    /// The object and container slot I go into, if any.
+    container: Option<(u16, i32)>,
+    /// Whether the placement checks the place itself first (step 4; slot
+    /// flag 0x800 skips them).
+    checks: bool,
+}
+
+/// The mode that puts me into the stack object's container slot 0.
+const OBJECT: i16 = 1;
+/// The mode that puts me one tile in front of the stack object.
+const FRONT: i16 = 2;
+
+/// The mode that names a routing slot of the stack object by the
+/// parameter word 0 names.
+const PARAMETER: i16 = 0;
 /// The mode that names a routing slot of the stack object by word 0.
 const SLOT: i16 = 3;
 /// The mode that names one of the lot's global routing slots by word 0.
@@ -212,45 +247,48 @@ impl Machine<'_, '_> {
             .filter(|id| self.world.objects.contains_key(id))
             .ok_or(Trap::native(0x15, "Snap has no stack object"))?;
         let mode = word(operands, 2);
-        let owner = match mode {
-            1 | 2 => None,
-            0 => return Err(unsupported("0x454a4b", "in mode 0")),
-            SLOT => Some(target),
-            GLOBAL => Some(GLOBAL_SLOTS),
-            _ => return Err(Trap::native(0x24, "Snap has an unknown mode")),
-        };
-        let facing = |machine: &Self, id: u16| -> Result<i32, Trap> {
-            machine.world.objects[&id]
-                .data
-                .get(FACING)
-                .copied()
-                .map(i32::from)
-                .ok_or_else(|| Trap::Invalid(format!("object {id} has no data word {FACING}")))
-        };
-        let (container, position, direction, skip_checks) = match owner {
-            None => {
-                // 0x4549d1 and 0x454a1d: the object's place, my own facing,
-                // and the placement's own checks.
-                let [p0, p1, level] = self.world.objects[&target].position;
-                let direction = facing(self, me)?;
-                if mode == 2 {
-                    let [first, second] = step(facing(self, target)?);
-                    let position = [p0.wrapping_add(second), p1.wrapping_add(first), level];
-                    (None, position, direction, false)
-                } else {
-                    if self.world.objects[&target].slots.len() < 2 {
-                        return Err(unsupported(
-                            "0x4550a0",
-                            "in mode 1 into an object with no container slot 0",
-                        ));
-                    }
-                    self.container_offset(target, 0)?;
-                    (Some((target, 0)), [p0, p1, level], direction, false)
+        let spot = match mode {
+            // 0x454a1d: into the object's container slot 0, from my own
+            // facing, with the place's checks; unlike a slot's snap
+            // target there is no test that the object has the slot
+            // (0x454b19).
+            OBJECT => {
+                if self.world.objects[&target].slots.len() < 2 {
+                    return Err(unsupported(
+                        "0x4550a0",
+                        "in mode 1 into an object with no container slot",
+                    ));
+                }
+                self.check_slot_place(target, 0)?;
+                Spot {
+                    direction: self.facing(me)?,
+                    position: self.world.objects[&target].position,
+                    container: Some((target, 0)),
+                    checks: true,
                 }
             }
-            Some(owner) => self.slot_place(owner, target, word(operands, 0))?,
+            // 0x4549d1: one tile in front of the object, on its level
+            // (0x42228a with its facing; the step's first word goes to
+            // +0xf4, our second coordinate), from my own facing, with the
+            // place's checks.
+            FRONT => {
+                let [p0, p1, level] = self.world.objects[&target].position;
+                let [first, second] = step(self.facing(target)?);
+                Spot {
+                    direction: self.facing(me)?,
+                    position: [p0.wrapping_add(second), p1.wrapping_add(first), level],
+                    container: None,
+                    checks: true,
+                }
+            }
+            _ => self.slot_spot(operands, mode, target)?,
         };
-        // 0x454d7a.
+        let Spot {
+            direction,
+            position,
+            container,
+            checks,
+        } = spot;
         let direction = direction.rem_euclid(8);
         if operands[4] & 1 != 0 {
             return Err(unsupported(
@@ -261,7 +299,7 @@ impl Machine<'_, '_> {
         let person = self.me()?.person.is_some();
         let to = [position[0], position[1]];
         let level = position[2];
-        let refusal = if !skip_checks && let Some(code) = self.may_stand(to, level)? {
+        let refusal = if checks && let Some(code) = self.may_stand(to, level)? {
             Some(NotFit::Code(code))
         } else {
             let interpreter = self.interpreter();
@@ -315,32 +353,41 @@ impl Machine<'_, '_> {
         Ok(true)
     }
 
-    /// The place of modes 3 and 4 (0x454ac5 to 0x454c6d), from the routing
-    /// slot `index` of `owner`'s table (the stack object `target`'s, or
-    /// [`GLOBAL_SLOTS`]): the slot or the place, my direction, and whether
-    /// the slot skips the placement's own checks (flag 0x800). See steps 1
-    /// to 3 of the module's doc.
-    #[allow(clippy::type_complexity)]
-    fn slot_place(
-        &self,
-        owner: u16,
-        target: u16,
-        index: i16,
-    ) -> Result<(Option<(u16, i32)>, [i32; 3], i32, bool), Trap> {
+    /// Where a slot mode (0, 3 or 4) puts me: the steps 1 to 3 of the
+    /// module documentation.
+    fn slot_spot(&mut self, operands: &[u8; 8], mode: i16, target: u16) -> Result<Spot, Trap> {
         let me = self.me;
+        let (owner, number) = match mode {
+            // 0x454a4b: word 0 names one of my frame's parameters (0 to
+            // its count of parameters, frame byte +7, less one; native
+            // error 8 otherwise; 0x47518b is the parameters' start), which
+            // holds the slot's number.
+            PARAMETER => {
+                let frame = self.frame()?;
+                let number = usize::try_from(word(operands, 0))
+                    .ok()
+                    .and_then(|parameter| frame.parameters.get(parameter))
+                    .copied()
+                    .ok_or(Trap::native(8, "Snap names no parameter"))?;
+                (target, number)
+            }
+            SLOT => (target, word(operands, 0)),
+            GLOBAL => (GLOBAL_SLOTS, word(operands, 0)),
+            _ => return Err(Trap::native(0x24, "Snap has an unknown mode")),
+        };
         let guid = self.world.objects[&target].guid;
         let definition = self.definition(guid)?;
-        let at = usize::try_from(index).ok();
+        let index = usize::try_from(number).ok();
         let (entry, type_slot) = if owner == GLOBAL_SLOTS {
-            at.and_then(|i| self.program.global_routing_slot(i))
+            index.and_then(|i| self.program.global_routing_slot(i))
         } else {
-            at.and_then(|i| {
+            index.and_then(|i| {
                 self.program
                     .routing_slot(definition.resource, definition.chunk, i)
             })
         }
         .ok_or(Trap::native(0x1b, "Snap names no slot"))?;
-        let key = (owner, index as u16);
+        let key = (owner, number as u16);
         let slot = match self.world.routing.slots.get(&key) {
             Some(record) => *record,
             None => route_slot(
@@ -349,49 +396,58 @@ impl Machine<'_, '_> {
                 self.world.routing.slot_flags.get(&key).copied(),
             ),
         };
-        let facing = |id: u16| -> Result<i32, Trap> {
-            self.world.objects[&id]
-                .data
-                .get(FACING)
-                .copied()
-                .map(i32::from)
-                .ok_or_else(|| Trap::Invalid(format!("object {id} has no data word {FACING}")))
-        };
         let direction = if slot.flags & TURNED != 0 {
             let turn = (0..7).find(|bit| slot.flags & (1 << bit) != 0).unwrap_or(0);
-            facing(target)?.wrapping_add(turn)
+            self.facing(target)?.wrapping_add(turn)
         } else {
-            facing(me)?
+            self.facing(me)?
         };
         let position = self.world.objects[&target].position;
-        let skip_checks = slot.flags & SKIP_CHECKS != 0;
-        if slot.snap_target >= 0 {
+        let container = if slot.snap_target >= 0 {
             // The object's container records, its tile's chain first.
             let records = self.world.objects[&target].slots.len();
             if usize::try_from(slot.snap_target).is_ok_and(|s| s + 1 >= records) {
                 return Err(Trap::native(0x20, "Snap names no slot of the object"));
             }
-            self.container_offset(target, slot.snap_target)?;
-            return Ok((
-                Some((target, slot.snap_target)),
-                position,
-                direction,
-                skip_checks,
-            ));
-        }
-        let [x, y] = place_by_offset(
-            [position[0], position[1]],
-            [slot.offset[0], slot.offset[1]],
-            facing(target)?,
-        );
-        Ok((None, [x, y, position[2]], direction, skip_checks))
+            self.check_slot_place(target, slot.snap_target)?;
+            Some((target, slot.snap_target))
+        } else {
+            None
+        };
+        let position = if container.is_none() {
+            let [x, y] = place_by_offset(
+                [position[0], position[1]],
+                [slot.offset[0], slot.offset[1]],
+                self.facing(target)?,
+            );
+            [x, y, position[2]]
+        } else {
+            position
+        };
+        Ok(Spot {
+            direction,
+            position,
+            container,
+            checks: slot.flags & SKIP_CHECKS == 0,
+        })
     }
 
-    /// The container slot `slot` of `target`: its offset across, turned
-    /// to the object's facing, is added to my animator's offset (0x454ceb
-    /// to 0x454d5e), which is not kept, so an offset that is not zero
-    /// fails loudly.
-    fn container_offset(&self, target: u16, slot: i32) -> Result<(), Trap> {
+    /// Object `id`'s facing (data word 1, +0x4c).
+    fn facing(&self, id: u16) -> Result<i32, Trap> {
+        self.world.objects[&id]
+            .data
+            .get(FACING)
+            .copied()
+            .map(i32::from)
+            .ok_or_else(|| Trap::Invalid(format!("object {id} has no data word {FACING}")))
+    }
+
+    /// What a place inside `target`'s container slot `slot` needs that is
+    /// not ported: a slot's offset across, turned to the object's facing,
+    /// is added to my animator's offset (0x454ceb to 0x454d5e), which is
+    /// not kept. (Flag bit 2's wall test is [`Machine::walls_in_the_way`],
+    /// after the place test.)
+    fn check_slot_place(&self, target: u16, slot: i32) -> Result<(), Trap> {
         let guid = self.world.objects[&target].guid;
         let definition = self.definition(guid)?;
         let held = self
@@ -522,7 +578,7 @@ impl Machine<'_, '_> {
             NotFit::Refused(Refusal::Wall, collided) => (Some(7), collided),
             NotFit::Refused(Refusal::Collision(_), collided) => (Some(11), collided),
             // A code other than 1, 7 and 11, which Snap does not test.
-            NotFit::Refused(Refusal::Other, collided) => (None, collided),
+            NotFit::Refused(Refusal::Other | Refusal::SameWall, collided) => (None, collided),
             NotFit::Refused(Refusal::Unrecorded, _) => {
                 return Err(unsupported(
                     "0x454e66",

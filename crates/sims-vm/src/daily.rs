@@ -222,7 +222,8 @@ pub(crate) fn depreciate(
             .ok_or_else(|| Trap::Invalid("object has no definition".into()))?;
         match interpreter
             .program
-            .catalog_master(definition.resource, definition.chunk)
+            .master_definition(definition.resource, definition.chunk)
+            .map_err(Trap::Invalid)?
         {
             Some(master) => master,
             None => return Ok(()),
@@ -425,7 +426,8 @@ impl Interpreter<'_> {
             .ok_or_else(|| Trap::Invalid(format!("object {id} has no definition")))?;
         let master = self
             .program
-            .catalog_master(definition.resource, definition.chunk)
+            .master_definition(definition.resource, definition.chunk)
+            .map_err(Trap::Invalid)?
             .ok_or_else(|| {
                 Trap::Unsupported(format!(
                     "object {id} has no catalog master, which 0x4354f9 reads through a null \

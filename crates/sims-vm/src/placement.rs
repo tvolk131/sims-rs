@@ -41,7 +41,7 @@ use crate::load::INDICATORS;
 use crate::program::DEFINITION_WORDS;
 use crate::visits::function;
 use sims_sim::World;
-use sims_sim::animator::{Animator, Layer};
+use sims_sim::animator::{Animator, HeldPose, Layer};
 use std::collections::BTreeSet;
 
 mod dynamic;
@@ -70,13 +70,15 @@ pub(crate) struct Pending {
     pub refreshed: Kept,
 }
 
-/// A person's animator, base layer and the bones its skin has moved
-/// ([`World::translated_bones`]).
+/// A person's animator, base layer, the bones its skin has moved
+/// ([`World::translated_bones`]) and the pose the load left in it
+/// ([`World::held_poses`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Kept {
     pub animator: Option<Animator>,
     pub base: Option<Layer>,
     pub translated: Option<BTreeSet<String>>,
+    pub held: Option<HeldPose>,
 }
 
 impl Kept {
@@ -85,6 +87,7 @@ impl Kept {
             animator: world.animators.get(&id).cloned(),
             base: world.base_layers.get(&id).cloned(),
             translated: world.translated_bones.get(&id).cloned(),
+            held: world.held_poses.get(&id).cloned(),
         }
     }
 
@@ -101,6 +104,10 @@ impl Kept {
         match &self.translated {
             Some(bones) => world.translated_bones.insert(id, bones.clone()),
             None => world.translated_bones.remove(&id),
+        };
+        match &self.held {
+            Some(held) => world.held_poses.insert(id, held.clone()),
+            None => world.held_poses.remove(&id),
         };
     }
 }
@@ -763,6 +770,32 @@ impl Interpreter<'_> {
         )
     }
 
+    /// The definition an object stands for (0x45728d): its own, or for a
+    /// tile of a group the group's master ([`crate::Program::master_definition`]).
+    /// A group with no master fails, naming `site`, since the original
+    /// reads through a null pointer there.
+    pub(crate) fn master_words(
+        &self,
+        world: &World,
+        id: u16,
+        site: &str,
+    ) -> Result<&[i16; DEFINITION_WORDS], Trap> {
+        let object = world.objects.get(&id).ok_or_else(missing)?;
+        let definition = self
+            .catalog
+            .object(object.guid)
+            .ok_or_else(|| Trap::Invalid(format!("object {id} has no definition")))?;
+        self.program
+            .master_definition(definition.resource, definition.chunk)
+            .map_err(Trap::Invalid)?
+            .ok_or_else(|| {
+                Trap::Unsupported(format!(
+                    "object {id}'s group has no master definition in its file, and {site} \
+                     reads through a null pointer (0x45728d)"
+                ))
+            })
+    }
+
     /// An object's footprint were it at `position` facing `facing`
     /// (0x433d16 with a position given, as Snap's wall test calls it with
     /// its facing set for the call, 0x455263).
@@ -1068,7 +1101,13 @@ impl Interpreter<'_> {
         if let Some(parent) = parent {
             self.callback(world, parent, function::PLACED, 0)?;
         }
-        if words[word::PORTAL] == 6 {
+        // 0x4332b7: the door test reads the definition the object stands
+        // for, not its own.
+        let door = self
+            .master_words(world, id, "taking a door off (0x4332af)")
+            .map_err(fail)?[word::PORTAL]
+            == 6;
+        if door {
             self.mark_portal(world, was, false).map_err(fail)?;
         }
         if notify {
@@ -1132,7 +1171,11 @@ impl Interpreter<'_> {
         if self.has_function(world, id, SEAT) {
             self.seats_beside(world, forward(was, old_facing).map_err(fail)?)?;
         }
-        let portal = words[word::PORTAL] == 6;
+        // 0x433427: as on taking off, the definition the object stands for.
+        let portal = self
+            .master_words(world, id, "placing a door (0x43341f)")
+            .map_err(fail)?[word::PORTAL]
+            == 6;
         if portal {
             self.mark_portal(world, was, false).map_err(fail)?;
         }

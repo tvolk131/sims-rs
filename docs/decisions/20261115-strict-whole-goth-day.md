@@ -4,10 +4,10 @@
 
 **Unverified past tick 2510, and wrong from tick 2515.** Strict mode on
 the Goth house now runs 43,200 updates, a whole day from the load, to
-06:30:44 on the next day (17 June 1997, one day played; hash 256292b7…)
+06:30:44 on the next day (17 June 1997, one day played; hash bc43e887…)
 with no stop. The state at every pinned tick up to 9906 is the same:
-snapshot format 28 appends `World::stops_asked` (below), and the
-format-27 hashes kept beside the new ones match.
+snapshot format 29 appends `World::stops_asked` (below), and the
+format-28 hashes kept beside the new ones match.
 
 Track 2's Goth day recording (`goth-day-20261115`) was still being made
 when this was written; it held updates 1 to 14,759. Against it, our
@@ -67,6 +67,7 @@ Two play-mode runs got further too, also unverified:
   (0x45b176) fails.
 - **Tick 14673: Drop Onto** (opcode 43, 0x44e96a) puts what I hold in
   one of my container slots into a container slot of the stack object.
+  Main's port (#212) came in first and is the one kept.
 - **Tick 15188: Snap's wall test**, flag bit 2 (0x45522c). My footprint
   at the object, facing the direction (0x433d16), crossed by a wall on
   its level (0x476dbc), sets word 54 to 0, and I am not put there.
@@ -78,8 +79,8 @@ Two play-mode runs got further too, also unverified:
   group's tile first takes the tile out of its group's chain (0x4228d6).
   Then the group it left and the tile work out their neighbours again.
 - **Tick 18788: Snap modes 1 and 2**, into a container slot of the stack
-  object (0x4549c7). A slot offset across that is not zero is added to
-  the animator's offset, which is not kept, and fails loudly.
+  object (0x4549c7). Main's port (#214) came in first and is the one
+  kept; the wall test and the make-way request below are added to it.
 - **Tick 25500: a route asked to stop while under way** (0x589e2d,
   0x45b3eb) does not stop at once. The request is kept (animator +0x284,
   `World::stops_asked`), and the walk stops the route at its next step

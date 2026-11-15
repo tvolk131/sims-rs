@@ -734,14 +734,13 @@ impl Interpreter<'_> {
         if tick % 10 == 0 && word(&person.data, person::VISITOR) == 0 && hidden == 0 && awake {
             // 0x45c349: the person's last route context, if it has any.
             // The routing primitives push and pop them (Go To Routing
-            // Slot, 0x45abce, pushes); the count the load read is kept
-            // too, as no ported primitive pops the contexts it stands for.
-            let routing = person.routing_frames != 0
-                || world
-                    .routing
-                    .routes
-                    .get(&id)
-                    .is_some_and(|r| !r.contexts.is_empty());
+            // Slot, 0x45abce, pushes); the load makes as many as the save
+            // counts (0x460443).
+            let routing = world
+                .routing
+                .routes
+                .get(&id)
+                .is_some_and(|r| !r.contexts.is_empty());
             world.usage.sample(routing);
         }
         // 0x45ce61: a nonzero person word 1 goes to the interface

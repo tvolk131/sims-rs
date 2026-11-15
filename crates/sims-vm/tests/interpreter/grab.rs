@@ -315,116 +315,122 @@ fn drop_takes_the_false_branch_when_nothing_is_held_or_the_place_refuses() {
 
 const DROP_ONTO: u16 = 43;
 
-/// Runs the Sim's tree 4096, whose one instruction is Drop Onto from the
-/// `source` pair of words into the `destination` pair, with the stack
-/// object `stack_object` and the tree's four arguments `args`.
+/// Runs Drop Onto as the Sim's tree 4096, with the lamp as the stack
+/// object (unless `stack_object` says otherwise) and the parameters.
 fn drop_onto(
     fx: &mut Fixture,
-    source: [i16; 2],
-    destination: [i16; 2],
     stack_object: i16,
-    args: &[i16],
+    words: [i16; 4],
+    parameters: &[i16],
 ) -> Result<bool, sims_vm::Fault> {
     let mut operands = [0; 8];
-    for (n, word) in source.into_iter().chain(destination).enumerate() {
-        operands[2 * n..2 * n + 2].copy_from_slice(&word.to_le_bytes());
+    for (i, w) in words.iter().enumerate() {
+        operands[2 * i..2 * i + 2].copy_from_slice(&w.to_le_bytes());
     }
     fx.add(
         SIM_FILE,
         4096,
-        tree(vec![ins(DROP_ONTO, RETURN_TRUE, RETURN_FALSE, operands)]),
+        shaped(
+            0x8002,
+            0,
+            parameters.len() as u8,
+            0,
+            vec![ins(DROP_ONTO, RETURN_TRUE, RETURN_FALSE, operands)],
+        ),
     );
-    fx.run_with(SIM, 4096, stack_object, args, 1000)
+    fx.run_with(SIM, 4096, stack_object, parameters, 1000)
 }
 
-/// The lot with the Sim carrying the widget in its slot 0.
+/// The lamp's lot with the widget in the Sim's slot 0. The Grab's true
+/// branch is forgotten, so a false branch after changes nothing.
 fn carrying() -> (Fixture, u16) {
     let (mut fx, id) = lot(true);
     assert_eq!(grab(&mut fx, SIM, id as i16), Ok(true));
+    fx.sim_mut().last_result = false;
     (fx, id)
 }
 
 #[test]
-fn drop_onto_puts_what_my_slot_holds_into_a_slot_of_the_stack_object() {
-    // Slots given as themselves (first word 0), or by argument: source
-    // argument 2 (0), destination argument 0 (1).
-    for (source, destination, args) in [([0, 0], [0, 1], [0; 4]), ([1, 2], [1, 0], [1, 0, 0, 0])] {
-        let (mut fx, id) = carrying();
-        let result = drop_onto(&mut fx, source, destination, LAMP as i16, &args);
-        assert_eq!(result, Ok(true), "{source:?} {destination:?}");
-        let widget = &fx.world.objects[&id];
-        // At the lamp's position, level 1, in its script slot 1.
-        assert_eq!(widget.position, [40, 40, 1]);
-        assert_eq!((widget.data[2], widget.data[3]), (LAMP as i16, 1));
-        assert_eq!(widget.data[26], LAMP as i16);
-        assert_eq!(held(fx.lamp()), [0, id as i16]);
-        assert_eq!(held(fx.sim()), [0; 5]);
-    }
+fn drop_onto_puts_what_i_hold_into_the_stack_objects_slot() {
+    // My slot 0 into the lamp's slot 1, both read as numbers.
+    let (mut fx, id) = carrying();
+    assert_eq!(drop_onto(&mut fx, LAMP as i16, [0, 0, 0, 1], &[]), Ok(true));
+    let widget = &fx.world.objects[&id];
+    assert_eq!(widget.position, [40, 40, 1]);
+    assert_eq!((widget.data[2], widget.data[3]), (LAMP as i16, 1));
+    assert_eq!(held(fx.lamp()), [0, id as i16]);
+    assert_eq!(held(fx.sim()), [0; 5]);
+    // The same with both numbers read from parameters (a first word other
+    // than 0): parameter 1 is my slot and parameter 0 the lamp's.
+    let (mut fx, id) = carrying();
+    let words = [7, 1, -1, 0];
+    assert_eq!(drop_onto(&mut fx, LAMP as i16, words, &[1, 0]), Ok(true));
+    assert_eq!(held(fx.lamp()), [0, id as i16]);
 }
 
 #[test]
-fn drop_onto_from_an_empty_slot_takes_the_false_branch() {
-    let (mut fx, _) = lot(true);
+fn drop_onto_with_nothing_held_or_a_slot_that_refuses_changes_nothing() {
+    // My slot 1 holds nothing.
+    let (mut fx, _) = carrying();
     let before = hash_without_frames(&fx.world);
     assert_eq!(
-        drop_onto(&mut fx, [0, 0], [0, 0], LAMP as i16, &[]),
+        drop_onto(&mut fx, LAMP as i16, [0, 1, 0, 1], &[]),
         Ok(false)
     );
     assert_eq!(hash_without_frames(&fx.world), before);
-}
-
-#[test]
-fn drop_onto_takes_the_false_branch_when_the_place_test_refuses() {
-    let refusals: [fn(&mut Fixture, u16); 2] = [
-        // The lamp's slot 1 holds another object.
-        |fx, _| fx.lamp_mut().slots[2].object = LAMP as i16,
-        // The widget may not go at height 1 (data word 4 bit 0).
-        |fx, id| fx.world.objects.get_mut(&id).unwrap().data[4] = 0x20,
-    ];
-    for (case, refuse) in refusals.into_iter().enumerate() {
-        let (mut fx, id) = carrying();
-        refuse(&mut fx, id);
-        // The Grab's true is the Sim's last result; the false branch
-        // leaves false.
-        fx.sim_mut().last_result = false;
+    // The lamp's slot holds another object, or it has no slot 2 (0xd).
+    for (slot, refuse) in [(1, true), (2, false)] {
+        let (mut fx, _) = carrying();
+        if refuse {
+            fx.lamp_mut().slots[2].object = SIM as i16;
+        }
         let before = hash_without_frames(&fx.world);
-        let result = drop_onto(&mut fx, [0, 0], [0, 1], LAMP as i16, &[]);
-        assert_eq!(result, Ok(false), "case {case}");
-        assert_eq!(hash_without_frames(&fx.world), before, "case {case}");
+        let result = drop_onto(&mut fx, LAMP as i16, [0, 0, 0, slot], &[]);
+        assert_eq!(result, Ok(false), "slot {slot}");
+        assert_eq!(hash_without_frames(&fx.world), before, "slot {slot}");
     }
 }
 
 #[test]
-fn drop_onto_names_a_slot_i_have_and_a_stack_object() {
-    // 0x44e9e6: the source slot must be from 0 to my records less 2 (the
-    // Sim has six: the tile chain and slots 0 to 4), before the stack
-    // object is looked at.
-    let (mut fx, _) = carrying();
-    for (slot, stack_object, expected) in [
-        (5, LAMP as i16, 0x1b),
-        (-1, LAMP as i16, 0x1b),
-        (5, 0, 0x1b),
-        (0, 0, 0x15),
-        (0, 77, 0x15),
-    ] {
-        let result = drop_onto(&mut fx, [0, slot], [0, 1], stack_object, &[]);
-        assert_eq!(code(result), Some(expected), "{slot} {stack_object}");
-    }
+fn drop_onto_tests_the_slot_on_level_1() {
+    // The original gives the place test level 1, whatever the container's
+    // level (0x44ea91). The lamp upstairs, on a tile with no floor, would
+    // refuse there (0x12); on level 1 it takes the widget.
+    let (mut fx, id) = carrying();
+    fx.lamp_mut().position[2] = 2;
+    assert_eq!(drop_onto(&mut fx, LAMP as i16, [0, 0, 0, 1], &[]), Ok(true));
+    assert_eq!(held(fx.lamp()), [0, id as i16]);
+    // The put takes the container's level.
+    assert_eq!(fx.world.objects[&id].position, [40, 40, 2]);
 }
 
 #[test]
-fn drop_onto_naming_an_argument_the_frame_does_not_have_is_native_error_8() {
-    // 0x44e983 and 0x44e9bb: an argument below 0 or past the frame's four,
-    // for either slot; the source is read first.
-    let (mut fx, _) = carrying();
-    for (source, destination) in [
-        ([1, 4], [0, 0]),
-        ([1, -1], [0, 0]),
-        ([0, 0], [1, 4]),
-        ([0, 0], [1, -1]),
-        ([1, 4], [0, 99]),
-    ] {
-        let result = drop_onto(&mut fx, source, destination, LAMP as i16, &[]);
-        assert_eq!(code(result), Some(8), "{source:?} {destination:?}");
+fn what_drop_onto_cannot_read_fails() {
+    // A parameter the frame does not have: native error 8, for either
+    // slot.
+    for words in [[1, 2, 0, 1], [0, 0, 1, -1]] {
+        let (mut fx, _) = carrying();
+        assert_eq!(
+            code(drop_onto(&mut fx, LAMP as i16, words, &[0, 1])),
+            Some(8)
+        );
     }
+    // A slot of mine that is not a container slot: native error 0x1b,
+    // before the stack object is looked up.
+    for slot in [5, -1] {
+        let (mut fx, _) = carrying();
+        let result = drop_onto(&mut fx, 77, [0, slot, 0, 1], &[]);
+        assert_eq!(code(result), Some(0x1b), "slot {slot}");
+    }
+    // No stack object: native error 0x15, even with nothing held.
+    for slot in [0, 1] {
+        let (mut fx, _) = carrying();
+        let result = drop_onto(&mut fx, 77, [0, slot, 0, 1], &[]);
+        assert_eq!(code(result), Some(0x15), "slot {slot}");
+    }
+    // My slot names an object that does not exist.
+    let (mut fx, _) = carrying();
+    fx.sim_mut().slots[1].object = 99;
+    let result = drop_onto(&mut fx, LAMP as i16, [0, 0, 0, 1], &[]);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x44ea78")));
 }

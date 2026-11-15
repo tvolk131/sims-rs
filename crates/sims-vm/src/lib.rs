@@ -59,6 +59,7 @@ pub mod play;
 mod primitives;
 mod program;
 mod removal;
+mod restore;
 mod rooms;
 mod routing;
 mod selection;
