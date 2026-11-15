@@ -22,6 +22,7 @@ mod object_uses;
 mod objects;
 mod person_factory;
 mod presentation;
+mod push;
 mod random;
 mod removal;
 mod rooms;

@@ -5,6 +5,7 @@
 //! The work is `sims_vm::boot`; this prints it.
 
 use sims_sim::Snapshots;
+use sims_vm::SoundEvent;
 pub use sims_vm::boot::Frames;
 use sims_vm::boot::{Lot, StepError};
 use std::error::Error;
@@ -227,6 +228,34 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
                 .first()
                 .map(|e| format!(" (the first: {e})"))
                 .unwrap_or_default()
+        );
+        let mut played = std::collections::BTreeMap::<&str, usize>::new();
+        let mut stopped = 0;
+        for event in ticked.iter().flat_map(|u| &u.sounds) {
+            match event {
+                SoundEvent::Play { name, .. } => *played.entry(name).or_default() += 1,
+                SoundEvent::Stop { .. } => stopped += 1,
+            }
+        }
+        let mut most: Vec<_> = played.iter().collect();
+        most.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let _ = writeln!(
+            out,
+            "Sounds:  {} played, {} stopped{}",
+            played.values().sum::<usize>(),
+            stopped,
+            if most.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (most played: {})",
+                    most.iter()
+                        .take(8)
+                        .map(|(name, count)| format!("{name} {count}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
         );
         for error in errors {
             let _ = writeln!(

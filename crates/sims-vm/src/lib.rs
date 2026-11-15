@@ -47,6 +47,7 @@ mod load;
 mod memory;
 mod object_uses;
 mod objects;
+pub mod orders;
 mod people;
 mod person_factory;
 mod placement;
@@ -57,6 +58,7 @@ mod removal;
 mod rooms;
 mod routing;
 mod selection;
+pub mod sounds;
 mod tick;
 mod visits;
 
@@ -72,6 +74,7 @@ pub use people::{curve_table, persistent_fields, reload_profile};
 pub use primitives::primitive_name;
 pub use program::{Callback, Career, DEFINITION_WORDS, Library, Program, Tree};
 pub use selection::selected;
+pub use sounds::SoundEvent;
 pub use tick::{Answers, Player, Shown, TICK_BUDGET, TickError, Update};
 pub use visits::Visited;
 

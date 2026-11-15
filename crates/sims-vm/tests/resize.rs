@@ -2833,11 +2833,11 @@ fn the_goth_house_first_tick_matches_the_original() {
         }
         assert_eq!(world.ticks, before.ticks + 991);
         assert_eq!(digest(&world.encode()), TICK_991);
-        // Tick 992: object 21 snaps to a slot whose placement checks the
-        // lot's border, the room and the walls.
+        // Tick 992: object 21 snaps into a slot of object 174: its
+        // routing slot 0, the second entry of its SLOT chunk.
         let error = interpreter
             .lot_update(world, &tuning, &mut player)
             .unwrap_err();
-        assert!(error.to_string().contains("0x4550d8"), "{error}");
+        assert!(error.to_string().contains("0x454b19"), "{error}");
     });
 }

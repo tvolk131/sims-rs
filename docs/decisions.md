@@ -28,6 +28,87 @@ compare with the original. This replaces
 the strict-mode half of "The game paces the lot itself, and runs it
 strictly"; the pacing half stands.
 
+## 2026-11-15: The lot notes its sound requests; sound changes nothing it keeps
+
+Each update now returns the requests the original makes of its sound
+manager (`Update::sounds`, `crates/sims-vm/src/sounds.rs`). There are
+two kinds: `Play { object, name }` (0x57a54c) and `Stop { object }`
+(0x57a6fb). The original never reads anything back from the sound
+manager that the simulation keeps, so the events sit outside `World` and
+the hash. The Goth house hashes the same at tick 870 with and without
+them.
+
+Where the requests come from, read from the code:
+
+- **Play Sound Event (0x452822).** It names an FWAV chunk, looked up by
+  ID in the running code's file and then the global file (frame +0xc's
+  +8, then +4). Change Suit reads the same record for those two files
+  (0x45da81, 0x45da8e), which settles the old prototype's unverified
+  "owner, then Global".
+- **Go To Routing Slot.** It plays "begin_route" as a route starts
+  (0x45b989) and "end_route" after every stop (0x45b3a0).
+- **Stops.** Stop All Sounds (0x45256e) stops sounds, and so do an
+  object's reset unless it is being deleted (0x4320b4) and the
+  destructor (0x4323c9). A person's reset makes no direct call.
+
+In 870 play ticks the Goth house plays 62 sounds and stops 50:
+begin_route 21, end_route 18, door_open 4, and so on.
+
+The sounds a clip's events play (footsteps, "sound" keys, 0x59175e) are
+not noted yet. They pick their sound from the person's state and the
+floor in code that is not ported; that is the next sound work. The
+hour for the ambience is global 0. The camera view is the interface's.
+
+## 2026-11-15: A player's order queues the pie menu's action, without its check
+
+`Lot::queue_interaction(person, object, menu)` (`crates/sims-vm/src/
+orders.rs`) queues the action the original's pie menu makes for that
+entry. The object becomes its interaction target, and the action is
+built by 0x41f00e with priority 50 (0x458633), then given flags 4 and 8
+as a check that passes leaves them. It is queued unchanged (0x48dd67 →
+0x45d20b), as a pick does. The check itself (0x458319 in the menu's mode:
+rules on the person and object, and the entry's check tree) belongs to
+listing the menu's entries, which comes next; until then an order can
+name an entry the menu would not offer. A failed order changes nothing,
+since the queue can fail partway (it numbers the action before it finds
+it cannot place it). Push Interaction (primitive 13, 0x44cd2b) is ported
+from the original's code; reading one word past a frame's parameters or
+locals, which its bound allows, fails loudly.
+
+## 2026-11-15: People are drawn over the finished lot, against its depth
+
+The original keeps its people out of the lot's depth buffer. Two dumps
+of the running game (far zoom with a Sim standing on the grass, medium
+zoom with two Sims on the porch bench) show the Sims in the colour
+buffer and only the lot in the depth buffer: plain grass under the
+standing Sim, the wall and the porch floor where the seated ones are.
+The bench they sit on is missing from the depth buffer too. So the
+original draws the lot first, then draws what moves, and what is in
+use, over it, tested against the lot's depth.
+
+`sims-render` takes the same order. After `draw`, a caller draws people
+a pixel at a time with `Canvas::put` (the sprite rule: fainter than the
+cutoff or farther than what is there is left out, a tie wins, the depth
+is written so a nearer part of the same mesh covers a farther one) at
+the depth `Depth::point` gives a point: the ground rows at the point's
+row, the level's offset, and the height curve for its elevation. It is
+an object anchor's depth without the rounding, in the same units as
+everything else. `Camera::project_fine_f32` is the projection without
+rounding, so the people's code does not keep its own copy.
+
+The interleaved draw planned with the people track (people sorted in
+with the lot's objects) is left out: the original does not interleave,
+and the depth test against the finished lot already hides a person
+behind a wall, a counter or a cut wall's stub. The original draws a bench
+in use with the people rather than with the lot; here it stays with the
+lot and people test against it, which matters only where a person is
+drawn in front of part of the bench and behind another part.
+
+How the original gives a person's mesh its depth is **unverified**:
+the dumps show where people are not, not their own depth. Reopen it
+with a frame in which a person is partly hidden, comparing the hidden
+pixels with `Depth::point`.
+
 ## 2026-11-15: Play mode resets an object after its error; strict mode is unchanged
 
 For a playable lot, `Lot::step_play` (and `sims boot --play`) catches a
@@ -144,6 +225,20 @@ orders. The lot runs in strict mode with the captured frame schedule
 check; the first failure stops it and is shown on screen. Clicks pick
 objects by their tile until `sims-render` can say which object drew a
 pixel. Reopen when the play-mode step and player orders land.
+
+## 2026-11-14: Routing slots count among the kind 3 entries
+
+Go To Routing Slot and Snap now name a routing slot by its place among
+the SLOT chunk's kind 3 entries, as the object's routing slot table
+holds them (0x46e2d1), not by its index in the whole chunk. Every route
+compared so far went to an object whose routing entries come first, so
+no earlier tick changes; object 174 in tick 992 is the first whose SLOT
+starts with a container entry. The per-object slot flags and records
+written over the type's (`Routing::slot_flags`, `Routing::slots`) are
+keyed the same way, as the table's index; the marker's first slot is
+the table's first. Snap's own checks of the place (0x4550d8 to
+0x4551e9) are ported from the code and not yet reached by a capture:
+**unverified** until tick 992's snap into object 174 runs them.
 
 ## 2026-11-14: Job data from the CARR chunks, a frame after tick 901, and K = 991
 

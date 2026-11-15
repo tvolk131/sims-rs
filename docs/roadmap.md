@@ -1735,9 +1735,26 @@ not the simulation: comparisons with the fifth capture past tick 901 draw
 equals the fifth capture in everything compared, but for the head fields
 of "Ticks 334 to 366".
 
-**Stops.** Tick 992: object 21 snaps (tree 0x2017 node 5) to a slot
-without flag 0x800, whose placement checks the lot's border, the room
-and the walls in the way (`0x4550d8`), which is not ported.
+**Routing slots are the SLOT entries of kind 3.** An object's routing
+slot table (`+0x13c`) holds only its SLOT chunk's entries of kind 3, in
+order, each numbered by its index in the chunk plus one (the parse at
+construction, `0x46e2d1`, which sends kind 0 to the containers and kind
+1 to the headlines). Go To Routing Slot and Snap named a slot by its
+index in the whole chunk, which is the same for every object the Goth
+house's routes reached before; they now count among the kind 3 entries
+(`Program::routing_slot`). Object 174's routing slot 0 is its SLOT
+entry 1, which snaps into the object.
+
+**Snap's checks of the place** (`0x4550d8` to `0x4551e9`, `snap.rs`).
+Without slot flag 0x800 the placement first checks the place: its tile
+inside the lot's border (else placement error 1), the room its tile's
+cell names the same as mine (object data word 29), and, when I stand
+inside the border and elsewhere, the direction to it open from my tile
+and the way back open from its tile (`0x4359ea`). A refusal fails loudly
+with the rest of not fitting.
+
+**Stops.** Tick 992: object 21 snaps (tree 0x2017 node 5) into slot 0
+of object 174 (`0x454b19`), which is not ported.
 
 ## Track: drawing people (`crates/sims-people`)
 
@@ -1868,7 +1885,27 @@ Progress:
   medium, 99.7% far, 97.2% at rotation 3). Faint sprite edge pixels
   are left out as the original does, which fixes the door jamb. Every
   compared camera rose, by 0.7 to 3.4 points.
-- Next: the edge-on diagonal's texels; a screenshot with a marked
+- Done: the API for drawing people over the lot. `Depth::point` gives
+  a point between pixels its depth in the same space, `Canvas::put`
+  draws one pixel by the sprite rule and `Camera::project_fine_f32`
+  projects without rounding. Drawn this way after the lot, people are
+  hidden by what is in front of them, as in the original, whose depth
+  buffer holds the lot without its people. The game does not use it
+  yet, and how the original gives a person's mesh its depth is
+  unverified.
+- Found, not ported: an edge-on diagonal wall shows the wrong side, not
+  only the wrong texels. At near zoom the original shows the outside
+  shingles at both edge-on ends of the bay; we show the inside
+  wallpaper at the left end. Both walls face the same way, but the
+  outside lies on opposite sides of them, so no rule by the wall's
+  facing matches both. Code at 0x53f8ce copies two wall-cell records
+  (the cell's, and its neighbour's or the same cell's again) and reads
+  a word from each at an index from the wall's direction and a stack
+  value (`[ebp-0x2c]`, through 0x43517c). What that value means, and
+  how those words map to our wallpaper per side, are not read yet; the
+  port waits on both.
+- Next: trace that stack value and map the words to the wallpaper per
+  side (0x53f8ce), then the edge-on texels; a screenshot with a marked
   edge-on diagonal; upper-level depth.
 
 ## Track: sound (`crates/sims-audio`)
