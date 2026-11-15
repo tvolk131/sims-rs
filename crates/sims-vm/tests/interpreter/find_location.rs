@@ -131,6 +131,31 @@ fn a_tile_with_another_object_is_allowed_with_flag_2() {
 }
 
 #[test]
+fn two_objects_that_are_not_solid_share_a_tile_unless_against_one_wall() {
+    // 0x433a7f: on the object's own tile, two objects that are both not
+    // solid (data word 8 flag 4) are not in each other's way; they clash
+    // (0x16) only when both stand against the same wall (0x4358c3),
+    // which an object with no wall rules (data word 13) does not.
+    let (mut fx, _) = placeable();
+    let (first, second) = (widget(&mut fx), widget(&mut fx));
+    for id in [first, second] {
+        fx.world.objects.get_mut(&id).unwrap().data[8] = 4;
+    }
+    assert_eq!(find(&mut fx, 0, first, 0), Ok(true));
+    assert_eq!(find(&mut fx, 0, second, 2), Ok(true));
+    assert_eq!(fx.world.objects[&second].position, [24, 24, 1]);
+    // Only one not solid: the two may share the tile too (0x433a9c).
+    fx.world.objects.get_mut(&first).unwrap().data[8] = 0;
+    assert_eq!(find(&mut fx, 0, second, 2), Ok(true));
+    assert_eq!(fx.world.objects[&second].position, [24, 24, 1]);
+    // Both with bit 0 of data word 63: they clash (0xb).
+    fx.world.objects.get_mut(&first).unwrap().data[63] = 1;
+    fx.world.objects.get_mut(&second).unwrap().data[63] = 1;
+    assert_eq!(find(&mut fx, 0, second, 2), Ok(true));
+    assert_eq!(fx.world.objects[&second].position, [24, 40, 1]);
+}
+
+#[test]
 fn an_object_that_fits_nowhere_takes_the_false_branch() {
     let (mut fx, _) = placeable();
     let id = widget(&mut fx);

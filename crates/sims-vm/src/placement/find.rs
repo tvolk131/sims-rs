@@ -62,24 +62,31 @@ const DEFINITION_KIND: usize = 0x8a / 2;
 /// the table's four turns and fails.
 fn wall_side(world: &World, id: u16) -> Result<u16, Trap> {
     let rules = datum(world, id, word::WALL_RULES)?;
+    let facing = datum(world, id, data::FACING)?;
+    side_of(rules, facing).ok_or_else(|| {
+        Trap::Unsupported(format!(
+            "object {id}'s facing {facing} turns its wall side past the table's four turns \
+             (0x4358f1)"
+        ))
+    })
+}
+
+/// [`wall_side`] from data words 13 and 1; None past the table.
+fn side_of(rules: i16, facing: i16) -> Option<u16> {
     let bit: u16 = match rules & 5 {
         1 => 2,
         4 => 8,
-        _ => return Ok(0),
+        _ => return Some(0),
     };
-    let facing = datum(world, id, data::FACING)?;
     if facing == 0 {
-        return Ok(bit);
+        return Some(bit);
     }
     let turn = facing / 2;
     if !(0..4).contains(&turn) {
-        return Err(Trap::Unsupported(format!(
-            "object {id}'s facing {facing} turns its wall side past the table's four turns \
-             (0x4358f1)"
-        )));
+        return None;
     }
     let turn = turn as u32;
-    Ok(((bit << turn) | (bit >> (4 - turn))) & 15)
+    Some(((bit << turn) | (bit >> (4 - turn))) & 15)
 }
 
 /// Why the place test refused a place: the placement error it leaves in
@@ -1397,9 +1404,33 @@ impl Interpreter<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WALLS, closed_directions, crosses_wall, spiral_step, turn};
+    use super::{WALLS, closed_directions, crosses_wall, side_of, spiral_step, turn};
     use sims_formats::lot::Array;
     use sims_sim::World;
+
+    #[test]
+    fn the_wall_side_turns_with_the_facing() {
+        // 0x4358c3: word 13 & 5 of 1 is bit 2, of 4 bit 8, else none.
+        assert_eq!(side_of(0, 0), Some(0));
+        assert_eq!(side_of(5, 2), Some(0));
+        assert_eq!(side_of(0x40, 6), Some(0));
+        assert_eq!(side_of(1, 0), Some(2));
+        assert_eq!(side_of(4 | 0x80, 0), Some(8));
+        // Facing 2, 4 and 6 turn it one, two and three places (0x53ba5f
+        // fills the table: shifted up, 16 wrapping to 1); an odd facing
+        // halves toward zero.
+        assert_eq!(side_of(1, 2), Some(4));
+        assert_eq!(side_of(1, 4), Some(8));
+        assert_eq!(side_of(1, 6), Some(1));
+        assert_eq!(side_of(4, 2), Some(1));
+        assert_eq!(side_of(4, 7), Some(4));
+        assert_eq!(side_of(1, 1), Some(2));
+        assert_eq!(side_of(1, -1), Some(2));
+        // Past the table's four turns.
+        assert_eq!(side_of(1, 8), None);
+        assert_eq!(side_of(1, -2), None);
+        assert_eq!(side_of(0, 8), Some(0));
+    }
 
     #[test]
     fn the_spiral_goes_round_each_ring_before_the_next() {

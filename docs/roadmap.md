@@ -105,7 +105,9 @@ events, and what it asks for after them) come first.
   no longer playing, 0x5992b3), the houses with no family stop at the
   household selection, and the community lots (UserData's houses 40 to
   48) where Create New Object Instance mode 6 makes a person (0x44e60e).
-  Four types grow their attribute arrays to the saved count (0x4342ae). The templates' `Patch` families are not
+  Four types grow their attribute arrays to the saved count (0x4342ae).
+  Two objects that are not solid share a tile unless both stand against
+  the same wall (0x433a7f). The templates' `Patch` families are not
   imported (see `docs/decisions.md`).
 
 ## Met goal: a headless lot boot that matches the original
