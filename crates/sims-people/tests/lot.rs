@@ -332,6 +332,40 @@ fn changed(
         .count()
 }
 
+/// The lot renderer's canvas, noting which pixels it takes by its sprite
+/// rule (not faint, no farther than what is there), apart from its IDs.
+struct Taken {
+    canvas: sims_render::Canvas,
+    taken: Vec<bool>,
+}
+
+impl Target for Taken {
+    fn size(&self) -> (u32, u32) {
+        Target::size(&self.canvas)
+    }
+
+    fn passes(&self, x: u32, y: u32, z: f32) -> bool {
+        Target::passes(&self.canvas, x, y, z)
+    }
+
+    fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32) {
+        if texel[3] >= sims_render::canvas::FAINT && Target::passes(&self.canvas, x, y, z) {
+            self.taken[y as usize * self.canvas.width + x as usize] = true;
+        }
+        Target::write(&mut self.canvas, x, y, z, texel, shade);
+    }
+
+    fn set_id(&mut self, id: Option<u16>) {
+        Target::set_id(&mut self.canvas, id);
+    }
+}
+
+/// Every pixel of `canvas`, as (x, y).
+fn pixels(canvas: &sims_render::Canvas) -> impl Iterator<Item = (i32, i32)> + use<> {
+    let [w, h] = [canvas.width as i32, canvas.height as i32];
+    (0..h).flat_map(move |y| (0..w).map(move |x| (x, y)))
+}
+
 /// Drawn over the lot the lot renderer drew, people are hidden by what
 /// stands in front of them, and not by the floor or ground they stand
 /// on. Each person is drawn alone and compared with the same person laid
@@ -367,6 +401,12 @@ fn the_lot_hides_the_people_behind_it() {
                 let view = View::new(&camera);
                 let mut base = sims_render::Canvas::new(800, 600, [0, 0, 0]);
                 sims_render::draw(world, &shape, &mut opened.assets, &camera, &mut base);
+                // The lot alone names objects at some pixels, never a
+                // person.
+                let named = pixels(&base).filter_map(|(x, y)| base.id_at(x, y));
+                let named: Vec<u16> = named.collect();
+                assert!(!named.is_empty());
+                assert!(named.iter().all(|i| world.objects[i].person.is_none()));
                 for &id in &ids {
                     let mut solo = world.clone();
                     solo.animators.retain(|&other, _| other == id);
@@ -381,6 +421,26 @@ fn the_lot_hides_the_people_behind_it() {
                     let mut on = base.clone();
                     let report = people.draw_on_lot(&solo, &camera, &mut on);
                     assert!(report.problems.is_empty(), "{:?}", report.problems);
+                    // Drawn again, noting apart from the IDs which pixels
+                    // the canvas took: those name the person, and every
+                    // other pixel names what it named before.
+                    let mut noted = Taken {
+                        canvas: base.clone(),
+                        taken: vec![false; base.width * base.height],
+                    };
+                    let depth = sims_render::depth::Depth::new(&camera);
+                    people.draw(&solo, &camera, &mut noted, |f, e, l| depth.point(f, e, l));
+                    assert_eq!(noted.canvas, on);
+                    for (x, y) in pixels(&on) {
+                        let i = y as usize * on.width + x as usize;
+                        let expected = if noted.taken[i] {
+                            Some(id)
+                        } else {
+                            assert_eq!(on.color[i], base.color[i], "{x}, {y}");
+                            base.id_at(x, y)
+                        };
+                        assert_eq!(on.id_at(x, y), expected, "{x}, {y}");
+                    }
                     // Laid over everything: nearer than any depth there is.
                     let mut over = base.clone();
                     people.draw(&solo, &camera, &mut over, |_, _, _| -1.0e9);

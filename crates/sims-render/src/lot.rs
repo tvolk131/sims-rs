@@ -80,6 +80,39 @@ pub struct Lot {
     /// or 2), column and row: which triangle (by the corner it holds: 1
     /// south-west, 2 south-east, 3 north-east, 4 north-west) and its room.
     pub halves: BTreeMap<[u8; 3], [(u8, i16); 2]>,
+    /// Each tile's lamps, by level (0 or 1) and cell: see [`Lamps`].
+    pub lamps: [Vec<Lamps>; 2],
+}
+
+/// The offsets from a tile to the two nearest lit lamps of its room, in
+/// tiles, or none (the original's 4-byte record per tile, 0x7f for none,
+/// which 0x4b4e8b fills).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Lamps(pub [Option<[i8; 2]>; 2]);
+
+/// How many tiles a lamp marks around it, each way: the light radius of 12
+/// over 3, rounded (0x4b4e8b).
+const LAMP_REACH: i32 = 4;
+
+impl Lamps {
+    /// Adds a lamp at `offset` (0x4b5037): into the first free place, or,
+    /// if both are taken, over the first if it is nearer than that, else
+    /// over the second if it is nearer than that.
+    fn add(&mut self, offset: [i8; 2]) {
+        let distance = |o: [i8; 2]| i32::from(o[0]).pow(2) + i32::from(o[1]).pow(2);
+        let new = distance(offset);
+        match self.0 {
+            [None, _] => self.0[0] = Some(offset),
+            [Some(_), None] => self.0[1] = Some(offset),
+            [Some(a), Some(b)] => {
+                if new < distance(a) {
+                    self.0[0] = Some(offset);
+                } else if new < distance(b) {
+                    self.0[1] = Some(offset);
+                }
+            }
+        }
+    }
 }
 
 impl Lot {
@@ -196,14 +229,17 @@ impl Lot {
             .iter()
             .map(|(&tile, h)| (tile, h.map(|h| (h.triangle, h.room))))
             .collect();
+        let levels = [level(0)?, level(1)?];
+        let lamps = [0, 1].map(|index| lamps(world, size, &levels[index], &halves, index));
         Ok(Self {
             size,
             heights,
             grass,
-            levels: [level(0)?, level(1)?],
+            levels,
             outdoor_rooms,
             room_lights,
             halves,
+            lamps,
         })
     }
 
@@ -280,6 +316,71 @@ impl Lot {
     }
 }
 
+/// The lamps of every tile of a level (`index` 0 or 1).
+///
+/// The original keeps the records as it counts the rooms (0x467e05): an
+/// object counted there that is a light source (data word 40 flag 0x400),
+/// gives light (word 51 not 0) and has word 16 set to 1 first takes its
+/// marks off the tiles around it (0x4b50b5), then marks them again
+/// (0x4b4e8b). Every tile within four tiles each way (a square), inside the
+/// lot's inner tiles and of the lamp tile's room (for a split tile, either
+/// half's), takes the offset from the lamp to it. An object counted with
+/// no light only takes its marks off.
+///
+/// Here the records are worked out afresh from the objects as they stand,
+/// lamps in object order. The original's records instead build up from
+/// the room counts, rooms in its own order; where three or more lamps
+/// reach a tile, or a lamp went dark, the two could differ. That has not
+/// been compared.
+fn lamps(
+    world: &World,
+    size: usize,
+    level: &Level,
+    halves: &BTreeMap<[u8; 3], [(u8, i16); 2]>,
+    index: usize,
+) -> Vec<Lamps> {
+    let mut records = vec![Lamps::default(); FULL * FULL];
+    let Some(rooms) = &level.rooms else {
+        return records;
+    };
+    let inner = |n: i32| n >= 1 && n < size as i32 - 1;
+    for object in world.objects.values() {
+        let word = |i: usize| object.data.get(i).copied().unwrap_or(0);
+        let lit = word(34) == 0
+            && word(29) >= 0
+            && word(40) as u16 & 0x400 != 0
+            && word(51) != 0
+            && word(16) == 1;
+        let [x, y, on] = object.position;
+        if !lit || on != index as i32 + 1 {
+            continue;
+        }
+        let [x, y] = [x, y].map(|f| f.div_euclid(16));
+        if !inner(x) || !inner(y) {
+            continue;
+        }
+        let room = rooms[Lot::cell(x as usize, y as usize)];
+        for dy in -LAMP_REACH..=LAMP_REACH {
+            for dx in -LAMP_REACH..=LAMP_REACH {
+                let [qx, qy] = [x + dx, y + dy];
+                if !inner(qx) || !inner(qy) {
+                    continue;
+                }
+                let cell = Lot::cell(qx as usize, qy as usize);
+                let same = rooms[cell] == room
+                    || (rooms[cell] == sims_sim::rooms::NO_ROOM
+                        && halves
+                            .get(&[index as u8 + 1, qx as u8, qy as u8])
+                            .is_some_and(|h| h.iter().any(|&(_, r)| r == room)));
+                if same {
+                    records[cell].add([dx as i8, dy as i8]);
+                }
+            }
+        }
+    }
+    records
+}
+
 /// A room's light as the byte the original stores for its tiles: the light
 /// times 255, plus a half, truncated, keeping the low byte (0x46772d, the
 /// old prototype's `light_byte` in
@@ -320,6 +421,24 @@ mod tests {
             encoding: 0,
             data: vec![0; len],
         }
+    }
+
+    #[test]
+    fn a_tile_keeps_its_two_nearest_lamps_as_the_original_does() {
+        let mut lamps = Lamps::default();
+        lamps.add([3, 0]);
+        lamps.add([0, 4]);
+        assert_eq!(lamps, Lamps([Some([3, 0]), Some([0, 4])]));
+        // Nearer than the first: it takes the first place, and the old
+        // first is lost rather than moved down.
+        lamps.add([1, 1]);
+        assert_eq!(lamps, Lamps([Some([1, 1]), Some([0, 4])]));
+        // Nearer than the second only.
+        lamps.add([-2, 2]);
+        assert_eq!(lamps, Lamps([Some([1, 1]), Some([-2, 2])]));
+        // As far as the second: no change.
+        lamps.add([2, -2]);
+        assert_eq!(lamps, Lamps([Some([1, 1]), Some([-2, 2])]));
     }
 
     #[test]
@@ -373,6 +492,73 @@ mod tests {
         let lot = Lot::from_world(&world).unwrap();
         assert_eq!(lot.light_at(0, [8, 8]), 255);
         assert_eq!(lot.light_at(0, [24, 24]), 0);
+    }
+
+    /// A lit lamp marks the tiles within four of it in its own room and
+    /// on the inner lot, each with its offset from the lamp; a dark one,
+    /// or one on another level, marks nothing.
+    #[test]
+    fn a_lit_lamp_marks_the_tiles_of_its_room_around_it() {
+        let mut world = World::empty();
+        let full = FULL * FULL;
+        for (id, stride) in [(0, 4), (1, 1), (2, 8), (101, 1), (102, 8)] {
+            world.arrays.insert(id, array(stride, full * stride));
+        }
+        // Room 1 is the tiles x < 6 (but the lot's edge); room 0 the rest.
+        let mut map = vec![0i16; full];
+        for y in 0..FULL {
+            for x in 0..6 {
+                map[Lot::cell(x, y)] = 1;
+            }
+        }
+        world.rooms.map = [map, vec![0; full]];
+        let lamp = |id: u16, tile: [i32; 2], level: i32, light: i16| {
+            let mut data = vec![0i16; 64];
+            (data[16], data[40], data[51]) = (1, 0x400, light);
+            sims_sim::Object {
+                id,
+                guid: 0,
+                footprint: [0; 4],
+                position: [tile[0] * 16 + 8, tile[1] * 16 + 8, level],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: Vec::new(),
+                data,
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: 0,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            }
+        };
+        world.objects.insert(1, lamp(1, [2, 10], 1, 1));
+        world.objects.insert(2, lamp(2, [20, 20], 1, 0));
+        world.objects.insert(3, lamp(3, [30, 30], 2, 1));
+        let lot = Lot::from_world(&world).unwrap();
+        let at = |level: usize, x, y| lot.lamps[level][Lot::cell(x, y)].0[0];
+        assert_eq!(at(0, 2, 10), Some([0, 0]));
+        assert_eq!(at(0, 5, 14), Some([3, 4]));
+        assert_eq!(at(0, 1, 6), Some([-1, -4]));
+        // Past four tiles, another room, the lot's edge row.
+        assert_eq!(at(0, 2, 15), None);
+        assert_eq!(at(0, 6, 10), None);
+        assert_eq!(at(0, 0, 10), None);
+        // The dark lamp marks nothing; the upstairs lamp only upstairs,
+        // where this lot has no rooms.
+        assert_eq!(at(0, 20, 20), None);
+        assert_eq!(at(0, 30, 30), None);
+        let marked = |level: usize| lot.lamps[level].iter().filter(|l| l.0[0].is_some()).count();
+        // Columns 1 to 5 (the edge and room 0 left out), rows 6 to 14.
+        assert_eq!(marked(0), 5 * 9);
     }
 
     #[test]
