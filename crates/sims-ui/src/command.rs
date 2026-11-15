@@ -42,6 +42,20 @@ pub enum Panel {
     House,
 }
 
+/// Which people the relationship panel lists: its four buttons, top to
+/// bottom (0x51d9aa, 0x4e9deb). The panel starts on everyone (0x51a8c3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Relations {
+    /// The selected Sim's family.
+    Family,
+    /// Friends: both ways at least the friendship level.
+    Friends,
+    /// A Superstar list; disabled without that expansion (0x51a7ea).
+    Stars,
+    #[default]
+    Everyone,
+}
+
 /// How walls are drawn: the cluster's three wall buttons.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Walls {
@@ -103,6 +117,11 @@ pub enum Command {
     TogglePanel,
     /// Open a live-mode panel (presentation only).
     OpenPanel(Panel),
+    /// List these people in the relationship panel (presentation only).
+    ShowRelations(Relations),
+    /// Show this page of the relationship panel, from 0 (presentation
+    /// only).
+    RelationsPage(u32),
     /// Move the camera (presentation only).
     Camera(Camera),
 }
@@ -135,5 +154,7 @@ mod tests {
         assert!(!Command::Camera(Camera::ZoomIn).changes_simulation());
         assert!(!Command::OpenPanel(Panel::Job).changes_simulation());
         assert!(!Command::TogglePanel.changes_simulation());
+        assert!(!Command::ShowRelations(Relations::Family).changes_simulation());
+        assert!(!Command::RelationsPage(1).changes_simulation());
     }
 }
