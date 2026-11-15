@@ -238,6 +238,23 @@ impl Interpreter<'_> {
         world.order = order.clone();
         world.people = world.registered_people();
         world.next_parts = next_parts;
+        // 0x41f320: reading an interaction (a person's running one, its
+        // last one and each queued one: 0x45d012, 0x45d01f, 0x45d08b)
+        // raises the action serial to its number when that is larger,
+        // compared signed. Nothing reads the serial between the reads, so
+        // the largest number counts.
+        let largest = world
+            .objects
+            .values()
+            .filter_map(|o| o.person.as_ref())
+            .flat_map(|p| [&p.active, &p.last].into_iter().chain(&p.queue))
+            .map(|action| action.uid)
+            .max();
+        if let Some(uid) = largest
+            && uid > world.action_serial
+        {
+            world.action_serial = uid;
+        }
         Ok(SavedRead {
             objects: order,
             draws: count,

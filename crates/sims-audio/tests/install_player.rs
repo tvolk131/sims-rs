@@ -64,10 +64,13 @@ fn the_phone_rings() {
     let Some(root) = install() else { return };
     let files = SoundFiles::scan(&root).unwrap();
     let mut player = player(&root, 1);
-    player.handle(&SoundEvent::Play {
-        object: 7,
-        name: "Phone_ring".into(),
-    });
+    player.handle(
+        &SoundEvent::Play {
+            object: 7,
+            name: "Phone_ring".into(),
+        },
+        &NoSources,
+    );
     let out = player.render_until_idle(10 * RATE as usize, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     assert!(player.is_idle());
@@ -94,10 +97,13 @@ fn a_sim_takes_a_soft_footstep() {
         let mut player = player(&root, seed);
         // `SimSpeed` (global 100) at 1: the routine goes on to play.
         player.set_global(100, 1);
-        player.handle(&SoundEvent::Play {
-            object: 3,
-            name: "footstep_soft".into(),
-        });
+        player.handle(
+            &SoundEvent::Play {
+                object: 3,
+                name: "footstep_soft".into(),
+            },
+            &NoSources,
+        );
         let out = player.render_until_idle(5 * RATE as usize, &NoSources);
         assert!(player.faults.is_empty(), "{:?}", player.faults);
         let trimmed = out.len() - out.iter().rev().take_while(|&&s| s == 0).count();
@@ -135,10 +141,13 @@ fn a_sim_takes_a_soft_footstep() {
     // At `SimSpeed` 2 the routine ends without a note.
     let mut player = player(&root, 1);
     player.set_global(100, 2);
-    player.handle(&SoundEvent::Play {
-        object: 3,
-        name: "footstep_soft".into(),
-    });
+    player.handle(
+        &SoundEvent::Play {
+            object: 3,
+            name: "footstep_soft".into(),
+        },
+        &NoSources,
+    );
     let out = player.render_until_idle(RATE as usize, &NoSources);
     assert!(player.is_idle() && player.faults.is_empty());
     assert!(out.is_empty());
@@ -177,9 +186,9 @@ fn every_event_definition_runs_without_a_bad_instruction() {
     let mut kinds: BTreeMap<i64, usize> = BTreeMap::new();
     let mut still_running = 0;
     for (module, name) in &definitions {
-        player.handle(&SoundEvent::StopAll);
+        player.handle(&SoundEvent::StopAll, &NoSources);
         player.faults.clear();
-        player.play_from(*module, 1, name);
+        player.play_from(*module, 1, name, &NoSources);
         player.render(20 * BLOCK, &NoSources);
         if !player.is_idle() {
             still_running += 1;
@@ -210,22 +219,24 @@ fn every_event_definition_runs_without_a_bad_instruction() {
     // No instruction is decoded wrong and none reached is unported. What
     // remains are the files' loose ends (see `install_tables.rs`), 12
     // events with an empty track field (the original's lookup of track 0
-    // finds nothing, as here) and the 24 events of kinds not ported:
-    // music modes (36, whose ambience half is ported), the piano (43),
+    // finds nothing, as here) and the 2 events of kinds not ported:
     // pausing (103) and reloading (104). The 5 ambience modes (52) start
-    // and stop scores, none of which this test loads. Of the 181 events
-    // still running after 20 blocks, the 60 that turn on a television or
+    // and stop scores, none of which this test loads. Of the 187 events
+    // still running after 20 blocks, 5 change the music mode (36) and
+    // start music or a river loop, or a slow fade of the music, that runs
+    // on; the piano (43) plays notes for ever; the 60 that turn on a
+    // television or
     // radio play their station for ever; 120 more loop (fires,
     // appliances, voices that loop) and one, `Grimreaper_loop_kill`,
     // fades its own vol for 21 blocks: the loop track it targets is not
     // running, so `target` is itself. (`shoo_tub_inside_vox` waits a
     // random time, which the station scripts' draws make short here.)
     assert_eq!(definitions.len(), 4494);
-    assert_eq!((still_running, format!("{unported:?}")), (181, "{}".into()));
-    assert_eq!(format!("{kinds:?}"), "{36: 21, 43: 1, 103: 1, 104: 1}");
+    assert_eq!((still_running, format!("{unported:?}")), (187, "{}".into()));
+    assert_eq!(format!("{kinds:?}"), "{103: 1, 104: 1}");
     assert_eq!(
         format!("{faults:?}"),
-        "{\"event names no track\": 14, \"event of a kind not ported\": 24, \
+        "{\"event names no track\": 14, \"event of a kind not ported\": 2, \
          \"hit list not found\": 1, \"patch not found\": 3, \"track entry point not found\": 10}"
     );
 }
@@ -313,10 +324,13 @@ fn a_television_plays_its_station() {
     let files = SoundFiles::scan(&root).unwrap();
     let mut player = player(&root, 1);
     player.add_stations(&StationLists::build(&files));
-    player.handle(&SoundEvent::Play {
-        object: 5,
-        name: "tv_action_cheap".into(),
-    });
+    player.handle(
+        &SoundEvent::Play {
+            object: 5,
+            name: "tv_action_cheap".into(),
+        },
+        &NoSources,
+    );
     let out = player.render(2 * RATE as usize, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     assert!(out.iter().any(|&s| s != 0));
@@ -325,7 +339,7 @@ fn a_television_plays_its_station() {
         "97ff325be5165800ba4cd9fc40679eb52741fb2cf9e2ddfe06f0d2eaaec5e9c1"
     );
     // The set going off ends it.
-    player.handle(&SoundEvent::StopObject { object: 5 });
+    player.handle(&SoundEvent::StopObject { object: 5 }, &NoSources);
     player.render(RATE as usize, &NoSources);
     assert!(player.is_idle());
 }
@@ -336,18 +350,20 @@ fn the_backyard_ambience_plays() {
     let files = SoundFiles::scan(&root).unwrap();
     let mut player = player(&root, 3);
     player.add_scores(&files);
+    player.add_stations(&sims_audio::stations::StationLists::build(&files));
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     // As on entering a lot from the neighbourhood: the music modes are
     // recorded only once the neighbourhood's has been set.
     for name in ["bkground_nhood1", "setambience_backyard", "bkground_live"] {
-        player.handle(&SoundEvent::Play {
-            object: 0,
-            name: name.into(),
-        });
+        player.handle(
+            &SoundEvent::Play {
+                object: 0,
+                name: name.into(),
+            },
+            &NoSources,
+        );
     }
-    // The music halves of the two kind 36 events.
-    assert_eq!(player.faults.len(), 2, "{:?}", player.faults);
-    player.faults.clear();
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
     // Noon, with the camera's value at 50: row 500 per mille.
     player.set_ambience_view(50, 12);
     let ambience = player.ambience().unwrap();
@@ -355,8 +371,11 @@ fn the_backyard_ambience_plays() {
     let out = player.render_stereo(60 * RATE as usize, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     let ambience = player.ambience().unwrap();
+    // The neighbourhood's music starts and live's fades it out within a
+    // second; its scripts draw on the random numbers the ambience's
+    // cells are picked with.
     let loud = out.iter().filter(|s| s.unsigned_abs() > 64).count();
-    assert!(loud > out.len() / 10, "{loud} of {}", out.len());
+    assert!(loud > out.len() / 20, "{loud} of {}", out.len());
     assert_eq!(
         format!(
             "{:?} {} {} {}",
@@ -365,6 +384,6 @@ fn the_backyard_ambience_plays() {
             out.len(),
             digest(&out)
         ),
-        "(13, 6) 2 2646000 f5ef8e68bac7cba7758d2a196de792133b29c4ad97d3dfc01b27e1c66b42abb6"
+        "(13, 6) 3 2646000 43a4d0f5cfcb9688209f7f1760202de8ddbe276b450fbd6b35484c700e24f055"
     );
 }

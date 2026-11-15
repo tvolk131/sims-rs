@@ -11,7 +11,6 @@ use crate::factory::{WIDGET, widgets};
 use crate::person_factory::equip;
 use crate::rooms::{array, build};
 use crate::support::*;
-use sims_formats::saved_objects::Multipart;
 use sims_vm::Trap;
 
 /// The opcodes under test.
@@ -165,16 +164,7 @@ fn mode_1_takes_the_object_off_the_lot() {
     let other = widget(&mut fx);
     assert_eq!(find(&mut fx, 0, other, 0), Ok(true));
     assert_eq!(fx.world.objects[&other].position, [24, 24, 1]);
-    // A tile of a group, which the original tests first (0x42344e), fails
-    // loudly.
-    fx.world.objects.get_mut(&other).unwrap().multipart = Some(Multipart {
-        offset: [0; 3],
-        group: [0; 3],
-        parent: 0,
-    });
-    let result = mode_1(&mut fx, other as i16);
-    assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("0x44b52a")));
-    assert_eq!(fx.world.objects[&other].position, [24, 24, 1]);
+    // A tile of a group: `group_factory`.
 }
 
 #[test]
