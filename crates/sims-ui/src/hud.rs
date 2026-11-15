@@ -12,10 +12,10 @@
 //! the original does when its window is wider than 800.
 
 use crate::art::Art;
-use crate::command::{Camera, Command, Mode, Panel, Speed, Walls};
+use crate::command::{Camera, Command, Mode, Panel, Relations, Speed, Walls};
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
-use crate::household::{Faces, Snapshot};
+use crate::household::{Faces, Relation, Snapshot};
 use sims_formats::bitmap::Image;
 
 /// The cluster's size, the size of its background (kUniversalBkgTGA).
@@ -64,6 +64,18 @@ pub mod id {
     /// A skill bar, full and empty, in a western language (0x52f356).
     pub const SKILL_FULL: i32 = 4901;
     pub const SKILL_EMPTY: i32 = 4920;
+    /// The relationship panel's page arrows (0x5193d6) and list buttons,
+    /// in the panel's order (0x51a5ba).
+    pub const PAGE_BACK: i32 = 100;
+    pub const PAGE_ON: i32 = 101;
+    pub const FAMILY: i32 = 4108;
+    pub const FRIENDS: i32 = 4109;
+    pub const STARS: i32 = 4111;
+    pub const EVERYONE: i32 = 4110;
+    /// A relationship's icons: friends, and the two hearts (0x5281cb).
+    pub const FRIENDS_ICON: i32 = 4105;
+    pub const PINK_HEART: i32 = 4106;
+    pub const RED_HEART: i32 = 4107;
     pub const TEMPLATE: i32 = crate::household::TEMPLATE;
     pub const NORMAL: i32 = 4705;
     pub const FAST: i32 = 4706;
@@ -75,7 +87,7 @@ pub mod id {
 }
 
 /// Every resource the panel may draw, for [`Art::load`].
-pub const RESOURCES: [i32; 41] = [
+pub const RESOURCES: [i32; 50] = [
     id::WALLS_DOWN,
     id::CUTAWAY,
     id::WALLS_UP,
@@ -108,6 +120,15 @@ pub const RESOURCES: [i32; 41] = [
     id::TRAIT_EMPTY,
     id::SKILL_FULL,
     id::SKILL_EMPTY,
+    id::PAGE_BACK,
+    id::PAGE_ON,
+    id::FAMILY,
+    id::FRIENDS,
+    id::STARS,
+    id::EVERYONE,
+    id::FRIENDS_ICON,
+    id::PINK_HEART,
+    id::RED_HEART,
     id::TEMPLATE,
     id::NORMAL,
     id::FAST,
@@ -133,6 +154,11 @@ pub struct Controls {
     pub camera: CameraState,
     /// The pointer's position, for the buttons' hover cells.
     pub pointer: Option<[i32; 2]>,
+    /// Whom the relationship panel lists, and its page, from 0. A page
+    /// past the list's end shows its last page, as the original steps
+    /// back to it (0x51db4b).
+    pub relations: Relations,
+    pub relations_page: u32,
 }
 
 /// What the camera buttons show. The host's camera owns it.
@@ -170,6 +196,8 @@ impl Default for Controls {
             speed: Speed::Normal,
             camera: CameraState::default(),
             pointer: None,
+            relations: Relations::default(),
+            relations_page: 0,
         }
     }
 }
@@ -181,6 +209,8 @@ impl Controls {
         match command {
             Command::TogglePanel => self.expanded = !self.expanded,
             Command::OpenPanel(panel) => self.panel = *panel,
+            Command::ShowRelations(list) => self.relations = *list,
+            Command::RelationsPage(page) => self.relations_page = *page,
             _ => {}
         }
     }
@@ -241,6 +271,10 @@ pub enum Kind {
     /// Sim's skills and what the next level of their career needs of
     /// each, in the panel's order ([`crate::household::SKILLS`]).
     Skills { skills: [i16; 6], needs: [i32; 6] },
+    /// A person in the relationship panel, `rect` the entry: their face
+    /// for the lifetime relationship, the two relationships as numbers
+    /// and bars, and the icons. `lit` while the pointer is on it.
+    Relation { relation: Relation, lit: bool },
     /// The first name of the person of type `guid`, in a box centered
     /// over `rect`'s bottom edge, while the pointer is on their portrait.
     Name { guid: u32 },
@@ -630,6 +664,10 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             command: None,
         });
     }
+    if let (Some(_), Panel::Relationships) = (selected, controls.panel) {
+        let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
+        relationships(items, panel, &snapshot.relations, controls);
+    }
     // The name of the person whose portrait the pointer is on, over the
     // strip above the portrait. Ours: where and how the original shows a
     // name there is **unverified**.
@@ -829,6 +867,294 @@ fn draw_skills(frame: &mut Frame, art: &Art, panel: Rect, skills: &[i16; 6], nee
     }
 }
 
+/// The relationship panel's list buttons, top to bottom, and whom each
+/// lists (0x51d9aa); the Superstar one is disabled (0x51a7ea).
+const RELATION_BUTTONS: [(i32, Relations); 4] = [
+    (id::FAMILY, Relations::Family),
+    (id::FRIENDS, Relations::Friends),
+    (id::STARS, Relations::Stars),
+    (id::EVERYONE, Relations::Everyone),
+];
+/// The height of the font the panel lays out by (font 6, 0x6f2adc).
+/// The install has no 6-point font, so the original gets an empty one:
+/// taken as 0 high (**unverified**).
+const RELATIONS_FONT_HEIGHT: i32 = 0;
+/// People a page (0x51926a). The original lists 10 in a window exactly
+/// 1024 wide; ours lists 5 at every size, as the subpanel's width there
+/// is **unverified**.
+const RELATIONS_PER_PAGE: usize = 5;
+/// The list's entries (0x5281cb, 0x51db6e): 45 by 90, in rows from (6
+/// right of the arrow and the first button, 18), to 2 short of the
+/// panel's right edge.
+const RELATION_SIZE: [i32; 2] = [45, 90];
+const RELATIONS_TOP: i32 = 18;
+
+/// Lays out the relationship panel in the subpanel `panel` (0x51d75b,
+/// in a western language): the four list buttons down its left, the
+/// page arrows when there is a page that way, and a page of entries.
+fn relationships(items: &mut Vec<Item>, panel: Rect, relations: &[Relation], controls: &Controls) {
+    let fh = RELATIONS_FONT_HEIGHT;
+    // 0x51dd1d: the first button 3 in, the others 2, each a pixel below
+    // the one before.
+    let mut y = fh + 1;
+    let mut button_w = 0;
+    for (n, (id, list)) in RELATION_BUTTONS.iter().enumerate() {
+        let rect = panel
+            .offset(if n == 0 { 3 } else { 2 }, y)
+            .with_size(20, 20);
+        if n == 0 {
+            button_w = rect.width;
+        }
+        y += rect.height + 1;
+        items.push(Item {
+            rect,
+            kind: Kind::Button {
+                id: *id,
+                cells: 4,
+                selected: controls.relations == *list,
+            },
+            command: (*list != Relations::Stars).then_some(Command::ShowRelations(*list)),
+        });
+    }
+    let shown: Vec<&Relation> = relations
+        .iter()
+        .filter(|r| match controls.relations {
+            Relations::Family => r.family,
+            Relations::Friends => r.friends,
+            Relations::Stars => false,
+            Relations::Everyone => true,
+        })
+        .collect();
+    // 0x51da2e: a page past the end steps back to the last one.
+    let pages = shown.len().div_ceil(RELATIONS_PER_PAGE).max(1);
+    let page = (controls.relations_page as usize).min(pages - 1);
+    // 0x51ddec: the arrows centred on the panel below the font's line.
+    let [arrow_w, arrow_h] = [9, 49];
+    let arrow_y = (panel.height - arrow_h - fh) / 2 + fh;
+    if page > 0 {
+        items.push(Item {
+            rect: panel
+                .offset(button_w + 4, arrow_y)
+                .with_size(arrow_w, arrow_h),
+            kind: Kind::Button {
+                id: id::PAGE_BACK,
+                cells: 4,
+                selected: false,
+            },
+            command: Some(Command::RelationsPage((page - 1) as u32)),
+        });
+    }
+    if (page + 1) * RELATIONS_PER_PAGE < shown.len() {
+        items.push(Item {
+            rect: panel
+                .offset(panel.width - arrow_w - 2, arrow_y)
+                .with_size(arrow_w, arrow_h),
+            kind: Kind::Button {
+                id: id::PAGE_ON,
+                cells: 4,
+                selected: false,
+            },
+            command: Some(Command::RelationsPage((page + 1) as u32)),
+        });
+    }
+    // 0x4ebdfa: left to right, a new row where the next would pass the
+    // right edge.
+    let [w, h] = RELATION_SIZE;
+    let left = arrow_w + button_w + 6;
+    let right = panel.width - 2;
+    let (mut x, mut row) = (left, 0);
+    for relation in shown
+        .iter()
+        .skip(page * RELATIONS_PER_PAGE)
+        .take(RELATIONS_PER_PAGE)
+    {
+        let rect = panel.offset(x, RELATIONS_TOP + h * row).with_size(w, h);
+        x += w;
+        if x + w > right {
+            row += 1;
+            x = left;
+        }
+        let lit = controls
+            .pointer
+            .is_some_and(|[px, py]| rect.contains(px, py));
+        items.push(Item {
+            rect,
+            kind: Kind::Relation {
+                relation: (*relation).clone(),
+                lit,
+            },
+            command: None,
+        });
+    }
+}
+
+/// The 16-bit colors the relationship entries are drawn in, made from
+/// the original's 8-bit values as its display does (0x4ff3c8): the
+/// numbers' background, the bars' base, the colors they lean to, green
+/// for the part filled and red for the rest, and the brighter pair of a
+/// lit entry (0x5285c7).
+const NUMBER_BACK: u16 = to565([0, 0, 0x4a]);
+const BAR_BASE: u16 = to565([0x40, 0x5d, 0x5f]);
+const BAR_GREEN: u16 = to565([0, 0xca, 0x39]);
+const BAR_RED: u16 = to565([0xd1, 0, 0]);
+const LIT_GREEN: u16 = to565([0, 0xff, 0]);
+const LIT_RED: u16 = to565([0xff, 0, 0]);
+/// The friends smiley's width in the install (4105), where the heart's
+/// place is measured from when the art has no smiley.
+const FRIENDS_ICON_WIDTH: i32 = 9;
+/// The entries' font (0x5281cb).
+const RELATION_FONT: u8 = 7;
+
+const fn to565([r, g, b]: [u8; 3]) -> u16 {
+    ((r as u16 >> 3) << 11) | ((g as u16 >> 2) << 5) | (b as u16 >> 3)
+}
+
+/// One channel of the original's blend table (built by 0x49a2fb): 5-bit
+/// `base` moved toward 5-bit `to` by `alpha` of 31, as the mean of the
+/// 512 8-bit colors each value stands for, each rounded.
+fn blend_channel(alpha: u16, to: u16, base: u16) -> u16 {
+    let step = f64::from(f32::from_bits(0x3b80_8081));
+    let mut sum = 0i64;
+    for u in 0..8 {
+        let a = f64::from(base * 8 + u);
+        for v in 0..8 {
+            let d = f64::from(to * 8 + v) - a;
+            for w in 0..8 {
+                let t = f64::from(alpha * 8 + w);
+                sum += (t * step * d + a + 0.5) as i64;
+            }
+        }
+    }
+    ((sum as f64 * (1.0 / 512.0) + 0.5) as i64 >> 3) as u16
+}
+
+/// `base` moved toward `to` by `alpha` of 31, a channel at a time, in
+/// the 16-bit display (0x49a60b); green keeps its top five bits.
+fn blend565(base: u16, to: u16, alpha: u16) -> u16 {
+    let alpha = alpha & 31;
+    let r = blend_channel(alpha, (to >> 11) & 31, (base >> 11) & 31);
+    let g = blend_channel(alpha, (to >> 6) & 31, (base >> 6) & 31);
+    let b = blend_channel(alpha, to & 31, base & 31);
+    (r << 11) | (g << 6) | b
+}
+
+/// The bars' two colors for a lifetime relationship (0x528565): the
+/// filled part leans to green by the relationship, the rest to red by
+/// what it lacks.
+fn relation_colors(lifetime: i32, lit: bool) -> ([u8; 3], [u8; 3]) {
+    let t = (f64::from(lifetime.saturating_add(100)) * f64::from(f32::from_bits(0x3fa3_3333)) + 0.5)
+        as i32;
+    let (green, red) = if lit {
+        (LIT_GREEN, LIT_RED)
+    } else {
+        (BAR_GREEN, BAR_RED)
+    };
+    let shade = |v: i32| (v >> 3) as u16;
+    (
+        rgb565(blend565(BAR_BASE, green, shade(t))),
+        rgb565(blend565(BAR_BASE, red, shade(255 - t))),
+    )
+}
+
+/// Draws a relationship entry (0x52838f) in `r`. The face is the one of
+/// five for the lifetime relationship, centred at the top; the daily
+/// relationship's number goes in a box across the entry two pixels over
+/// the face's bottom; under it the daily bar, 2 high, then 2 below that
+/// the lifetime bar, 4 high, each 40 wide and centred, a fifth of a
+/// pixel a point from -100; then the lifetime's number, and the icons
+/// a pixel below its box less the 3 the original takes off: the smiley
+/// for friends, then the red heart, or else the pink one, 3 pixels on.
+///
+/// **Unverified:** where the lifetime number's box starts (an
+/// instruction the copy protection hides; under the lifetime bar is
+/// taken) and so the icons' height; the numbers' color (the labels'
+/// is taken) and that they are centred in their boxes; that `lit` is
+/// the pointer on the entry (0x528598).
+fn draw_relation(
+    frame: &mut Frame,
+    art: &Art,
+    faces: &Faces,
+    r: Rect,
+    relation: &Relation,
+    lit: bool,
+) {
+    let mut bottom = r.y;
+    if let Some(moods) = faces.moods(relation.guid) {
+        let w = i32::try_from(moods.width / 5).unwrap_or(0);
+        let h = i32::try_from(moods.height).unwrap_or(0);
+        if w > 0 {
+            // The original divides by the strip's cell width, not by a
+            // fifth of the 200 points (0x5283fa..0x528424): with the
+            // install's 40-pixel cells, the same.
+            let face = ((relation.lifetime + 100) / w).min(4);
+            let source = Rect::new(face * w, 0, w, h);
+            frame.draw(moods, source, [r.x.saturating_add((r.width - w) / 2), r.y]);
+        }
+        bottom = r.y.saturating_add(h);
+    }
+    let font = art.font(RELATION_FONT);
+    let number = |frame: &mut Frame, value: i32, box_: Rect| {
+        let Some(font) = font else { return };
+        frame.fill(box_, rgb565(NUMBER_BACK));
+        let text = value.to_string();
+        let x = box_
+            .x
+            .saturating_add((box_.width - font.width(&text) + 1).div_euclid(2));
+        font.draw(frame, &text, [x, box_.y], LABEL);
+    };
+    let fh = font.map_or(0, |f| f.line_height);
+    if font.is_some() {
+        let top = bottom.saturating_sub(2);
+        number(frame, relation.daily, Rect::new(r.x, top, r.width, fh));
+        bottom = top.saturating_add(fh);
+    }
+    let (green, red) = relation_colors(relation.lifetime, lit);
+    let x0 = r.x.saturating_add((r.width - 40) / 2);
+    let x1 = r.x.saturating_add((r.width + 40) / 2);
+    let bar = |frame: &mut Frame, value: i32, top: i32, height: i32| {
+        let end = x0.saturating_add(
+            (f64::from(value + 100) * f64::from(f32::from_bits(0x3e4c_cccd))) as i32,
+        );
+        frame.fill(Rect::new(x0, top, end.saturating_sub(x0), height), green);
+        frame.fill(Rect::new(end, top, x1.saturating_sub(end), height), red);
+        // A dark line ends the filled part where two pixels or more are
+        // left (0x5287e9). Unlike the needs' meters (0x51376e) the
+        // original does not ask for a filled part: with none it draws the
+        // line a pixel left of the bar.
+        if x1.saturating_sub(end) > 1 {
+            frame.fill(Rect::new(end.saturating_sub(1), top, 1, height), [0, 0, 0]);
+        }
+    };
+    bar(frame, relation.daily, bottom, 2);
+    bar(frame, relation.lifetime, bottom.saturating_add(4), 4);
+    let top = bottom.saturating_add(8);
+    if font.is_some() {
+        number(frame, relation.lifetime, Rect::new(x0, top, 40, fh));
+    }
+    let y = top.saturating_add(fh - 2);
+    let friends = art.image(id::FRIENDS_ICON);
+    if relation.friends
+        && let Some(icon) = friends
+    {
+        frame.draw_all(icon, [x0, y]);
+    }
+    let heart = if relation.red_heart {
+        art.image(id::RED_HEART)
+    } else if relation.pink_heart {
+        art.image(id::PINK_HEART)
+    } else {
+        None
+    };
+    // The heart goes 3 past the smiley's width whether the smiley shows
+    // or not; art without a smiley takes the install's 9.
+    if let Some(heart) = heart {
+        let w = friends.map_or(FRIENDS_ICON_WIDTH, |f| {
+            i32::try_from(f.width).unwrap_or(FRIENDS_ICON_WIDTH)
+        });
+        frame.draw_all(heart, [x0.saturating_add(w.saturating_add(3)), y]);
+    }
+}
+
 /// The needs in the panel's order, left column first, with their motive
 /// numbers (`crates/sims-sim/src/motives.rs`). The order is the
 /// original's screen.
@@ -1021,6 +1347,7 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                 }
             }
             Kind::Skills { skills, needs } => draw_skills(frame, art, r, skills, needs),
+            Kind::Relation { relation, lit } => draw_relation(frame, art, faces, r, relation, *lit),
             Kind::Meter(value) => {
                 let (width, left, right) = meter(*value);
                 frame.fill(r, right);
@@ -1076,6 +1403,7 @@ impl Item {
                     | Kind::Name { .. }
                     | Kind::Personality { .. }
                     | Kind::Skills { .. }
+                    | Kind::Relation { .. }
             )
     }
 }
@@ -1133,6 +1461,7 @@ mod tests {
                 })
                 .collect(),
             selected: Some(21),
+            relations: Vec::new(),
         }
     }
 
@@ -1498,6 +1827,315 @@ mod tests {
         draw_personality(&mut frame, &art, far, &[1000; 5]);
         let near = Rect::new(i32::MIN, i32::MIN, 220, 100);
         draw_personality(&mut frame, &art, near, &[1000; 5]);
+    }
+
+    fn relation(id: i16, daily: i32, family: bool, friends: bool) -> Relation {
+        Relation {
+            guid: 1000 + id as u32,
+            id,
+            daily,
+            lifetime: -daily,
+            friends,
+            pink_heart: false,
+            red_heart: false,
+            family,
+        }
+    }
+
+    #[test]
+    fn the_relationship_panel_lists_a_page_of_people() {
+        let mut s = snapshot();
+        s.relations = (1..=7)
+            .map(|n| relation(n, 10 * i32::from(n), n <= 2, n % 2 == 1))
+            .collect();
+        let mut controls = Controls {
+            expanded: true,
+            panel: Panel::Relationships,
+            ..Controls::default()
+        };
+        let panel = Rect::new(521, 500, 279, 100);
+        let entries = |items: &[Item]| -> Vec<(Rect, i16)> {
+            items
+                .iter()
+                .filter_map(|i| match &i.kind {
+                    Kind::Relation { relation, .. } => Some((i.rect, relation.id)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let items = layout([800, 600], &s, &controls);
+        // The buttons down the left: everyone chosen, the Superstar one
+        // disabled.
+        let buttons: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i.kind {
+                Kind::Button { id, selected, .. } if (4108..=4111).contains(&id) => {
+                    Some((id, i.rect, selected, i.command.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            buttons,
+            [
+                (
+                    id::FAMILY,
+                    panel.offset(3, 1).with_size(20, 20),
+                    false,
+                    Some(Command::ShowRelations(Relations::Family))
+                ),
+                (
+                    id::FRIENDS,
+                    panel.offset(2, 22).with_size(20, 20),
+                    false,
+                    Some(Command::ShowRelations(Relations::Friends))
+                ),
+                (
+                    id::STARS,
+                    panel.offset(2, 43).with_size(20, 20),
+                    false,
+                    None
+                ),
+                (
+                    id::EVERYONE,
+                    panel.offset(2, 64).with_size(20, 20),
+                    true,
+                    Some(Command::ShowRelations(Relations::Everyone))
+                ),
+            ]
+        );
+        // Five a page, 45 apart from (35, 18); the arrow on.
+        let row = |ids: &[i16]| -> Vec<(Rect, i16)> {
+            ids.iter()
+                .enumerate()
+                .map(|(n, id)| (panel.offset(35 + 45 * n as i32, 18).with_size(45, 90), *id))
+                .collect()
+        };
+        assert_eq!(entries(&items), row(&[1, 2, 3, 4, 5]));
+        let arrows = |items: &[Item]| -> Vec<(i32, Rect, Option<Command>)> {
+            items
+                .iter()
+                .filter_map(|i| match i.kind {
+                    Kind::Button { id, .. } if id == id::PAGE_BACK || id == id::PAGE_ON => {
+                        Some((id, i.rect, i.command.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let on = (
+            id::PAGE_ON,
+            panel.offset(268, 25).with_size(9, 49),
+            Some(Command::RelationsPage(1)),
+        );
+        let back = (
+            id::PAGE_BACK,
+            panel.offset(24, 25).with_size(9, 49),
+            Some(Command::RelationsPage(0)),
+        );
+        assert_eq!(arrows(&items), std::slice::from_ref(&on));
+        assert_eq!(press(&items, [521 + 270, 530]), on.2.clone());
+        controls.apply(&Command::RelationsPage(1));
+        let items = layout([800, 600], &s, &controls);
+        assert_eq!(entries(&items), row(&[6, 7]));
+        assert_eq!(arrows(&items), std::slice::from_ref(&back));
+        // A page past the end shows the last.
+        controls.relations_page = 9;
+        assert_eq!(entries(&layout([800, 600], &s, &controls)), row(&[6, 7]));
+        // The family's list, and the friends'.
+        controls.apply(&Command::ShowRelations(Relations::Family));
+        let items = layout([800, 600], &s, &controls);
+        assert_eq!(entries(&items), row(&[1, 2]));
+        assert!(arrows(&items).is_empty());
+        controls.relations = Relations::Friends;
+        let items = layout([800, 600], &s, &controls);
+        assert_eq!(entries(&items), row(&[1, 3, 5, 7]));
+        // The pointer on an entry lights it.
+        controls.pointer = Some([521 + 35 + 45 + 10, 540]);
+        let lit: Vec<bool> = layout([800, 600], &s, &controls)
+            .iter()
+            .filter_map(|i| match i.kind {
+                Kind::Relation { lit, .. } => Some(lit),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lit, [false, true, false, false]);
+        // Nobody selected, no panel.
+        s.selected = None;
+        let items = layout([800, 600], &s, &controls);
+        assert!(entries(&items).is_empty());
+        assert!(arrows(&items).is_empty());
+    }
+
+    #[test]
+    fn relationship_bars_lean_from_the_panels_color_to_green_and_red() {
+        // From the original's blend table: none of the lean is the base
+        // (green losing its low bit), all of it the color.
+        assert_eq!(blend565(BAR_BASE, BAR_GREEN, 0), 0x42cb);
+        assert_eq!(blend565(BAR_BASE, BAR_GREEN, 31), BAR_GREEN);
+        assert_eq!(relation_colors(-100, false), ([66, 89, 90], [214, 0, 0]));
+        assert_eq!(relation_colors(0, false), ([33, 146, 74], [140, 40, 41]));
+        assert_eq!(relation_colors(0, true), ([33, 170, 49], [165, 40, 41]));
+        assert_eq!(relation_colors(100, false), ([0, 203, 57], [66, 89, 90]));
+    }
+
+    #[test]
+    fn a_relationship_entry_follows_the_originals_edges() {
+        let r = Rect::new(10, 10, 45, 90);
+        let relation = |daily: i32, lifetime: i32| Relation {
+            guid: 7,
+            id: 1,
+            daily,
+            lifetime,
+            friends: false,
+            pink_heart: false,
+            red_heart: true,
+            family: false,
+        };
+        // The face: lifetime plus 100 over the strip's cell width, as the
+        // original divides. With 40-pixel cells (the install's) 0 is the
+        // middle face; with 4-pixel ones, the last.
+        let strip = |cell: u32| {
+            let mut moods = solid(cell * 5, 2, [0; 3]);
+            for face in 0..5 {
+                for x in 0..cell {
+                    let i = ((face * cell + x) * 4) as usize;
+                    moods.rgba[i..i + 3].copy_from_slice(&[10 * (face as u8 + 1); 3]);
+                }
+            }
+            moods
+        };
+        for (cell, lifetime, face) in [(40, 0, 2), (40, -61, 0), (40, 60, 4), (4, 0, 4)] {
+            let mut faces = Faces::default();
+            faces.insert_moods(7, strip(cell));
+            let mut frame = Frame::new(80, 120, [0; 3]);
+            draw_relation(
+                &mut frame,
+                &Art::default(),
+                &faces,
+                r,
+                &relation(0, lifetime),
+                false,
+            );
+            let x = 10 + (45 - cell as i32) / 2;
+            assert_eq!(
+                frame.pixel(x, 10),
+                Some([10 * (face + 1); 3]),
+                "{cell} {lifetime}"
+            );
+        }
+        // An empty bar still gets its dark line, a pixel left of the bar
+        // (0x5287e9 asks only for room on the right); a full one none.
+        let back = [5; 3];
+        let mut frame = Frame::new(80, 120, back);
+        let faces = Faces::default();
+        draw_relation(
+            &mut frame,
+            &Art::default(),
+            &faces,
+            r,
+            &relation(-97, 100),
+            false,
+        );
+        let (green, red) = relation_colors(100, false);
+        assert_eq!(frame.pixel(11, 10), Some([0; 3]));
+        assert_eq!(frame.pixel(12, 10), Some(red));
+        assert_eq!(frame.pixel(11, 14), Some(back));
+        assert_eq!(frame.pixel(51, 14), Some(green));
+        assert_eq!(frame.pixel(52, 14), Some(back));
+        // A heart without the smiley's art goes where the install's
+        // 9-wide smiley would put it.
+        let mut art = Art::default();
+        art.insert(id::RED_HEART, solid(9, 9, [2, 2, 2]));
+        let mut frame = Frame::new(80, 120, [0; 3]);
+        draw_relation(&mut frame, &art, &faces, r, &relation(0, 0), false);
+        assert_eq!(frame.pixel(23, 18), Some([0; 3]));
+        assert_eq!(frame.pixel(24, 18), Some([2; 3]));
+    }
+
+    #[test]
+    fn a_relationship_entry_shows_the_face_numbers_bars_and_icons() {
+        // Five 4 by 6 faces, each its own color.
+        let mut moods = solid(20, 6, [0; 3]);
+        for face in 0..5u32 {
+            for y in 0..6 {
+                for x in 0..4 {
+                    let i = ((y * 20 + face * 4 + x) * 4) as usize;
+                    moods.rgba[i..i + 3].copy_from_slice(&[10 * (face as u8 + 1); 3]);
+                }
+            }
+        }
+        let mut faces = Faces::default();
+        faces.insert_moods(7, moods);
+        let mut art = Art::default();
+        art.insert(id::FRIENDS_ICON, solid(9, 9, [1, 1, 1]));
+        art.insert(id::RED_HEART, solid(9, 9, [2, 2, 2]));
+        art.insert(id::PINK_HEART, solid(9, 9, [3, 3, 3]));
+        let r = Rect::new(10, 10, 45, 90);
+        let draw = |relation: &Relation, art: &Art| {
+            let mut frame = Frame::new(80, 120, [0; 3]);
+            draw_relation(&mut frame, art, &faces, r, relation, false);
+            frame
+        };
+        let mut relation = Relation {
+            guid: 7,
+            id: 1,
+            daily: 50,
+            lifetime: 100,
+            friends: true,
+            pink_heart: true,
+            red_heart: true,
+            family: false,
+        };
+        // No font: no numbers, and the bars right under the face.
+        let frame = draw(&relation, &art);
+        // The face for 100 is the last, centred: x 30 to 33.
+        assert_eq!(frame.pixel(30, 10), Some([50; 3]));
+        assert_eq!(frame.pixel(29, 10), Some([0; 3]));
+        let (green, red) = relation_colors(100, false);
+        // The daily bar, 2 high at y 16 from x 12: 30 green, then red,
+        // with the dark line on the last green pixel.
+        assert_eq!(frame.pixel(12, 16), Some(green));
+        assert_eq!(frame.pixel(40, 17), Some(green));
+        assert_eq!(frame.pixel(41, 16), Some([0; 3]));
+        assert_eq!(frame.pixel(42, 16), Some(red));
+        assert_eq!(frame.pixel(51, 17), Some(red));
+        assert_eq!(frame.pixel(52, 16), Some([0; 3]));
+        assert_eq!(frame.pixel(12, 18), Some([0; 3]));
+        // The lifetime bar, 4 high from y 20, all of it green.
+        assert_eq!(frame.pixel(12, 20), Some(green));
+        assert_eq!(frame.pixel(51, 23), Some(green));
+        assert_eq!(frame.pixel(51, 24), Some([0; 3]));
+        // The icons at y 16 + 8 - 2: the smiley, and the red heart 3 on.
+        assert_eq!(frame.pixel(12, 22), Some([1; 3]));
+        assert_eq!(frame.pixel(24, 22), Some([2; 3]));
+        relation.red_heart = false;
+        assert_eq!(draw(&relation, &art).pixel(24, 22), Some([3; 3]));
+        // A font: the number over the face's last two rows, the bars
+        // under it.
+        let font = crate::font::tests::font();
+        let fh = font.line_height;
+        art.insert_font(RELATION_FONT, font);
+        let frame = draw(&relation, &art);
+        let back = rgb565(NUMBER_BACK);
+        assert_eq!(frame.pixel(10, 14), Some(back));
+        assert_eq!(frame.pixel(54, 14 + fh - 1), Some(back));
+        assert_eq!(frame.pixel(30, 13), Some([50; 3]));
+        assert_eq!(frame.pixel(12, 14 + fh), Some(green));
+        assert_eq!(frame.pixel(40, 14 + fh + 8), Some(back));
+        assert_eq!(frame.pixel(11, 14 + fh + 8), Some([0; 3]));
+        // Far coordinates do not overflow.
+        let mut frame = Frame::new(4, 4, [0; 3]);
+        for at in [i32::MAX - 10, i32::MIN + 10] {
+            draw_relation(
+                &mut frame,
+                &art,
+                &faces,
+                Rect::new(at, at, 45, 90),
+                &relation,
+                true,
+            );
+        }
     }
 
     #[test]
