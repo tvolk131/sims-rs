@@ -2251,6 +2251,17 @@ through their public interfaces only; the simulation never depends on it.
   them, and a press cancels one (`Lot::cancel`, 0x45d5f8) with the
   original's sound. Objects' catalog pictures are not made yet (a grey
   square stands in), and the icons do not slide into place.
+- **Done in play mode: a second order, and cancelling either.** Through
+  the window, the snack from the fridge's pie and then Water from a
+  plant's: the water waits behind the snack, its icon second. A press on
+  the water's icon takes it off. A press on the snack's icon while
+  Mortimer eats cancels it: he puts the snack down in front of him (Drop,
+  opcode 5, 0x454430, now ported) and goes to water the plant. A cancel
+  while he walks stops his thread on a route whose animator is still
+  moving (0x45b3eb, not ported; track 4's): on the snack order, a cancel
+  at steps 150 to 536 or 543 to 590 (to the fridge) or 821 to 829 (away
+  from it with the snack). Cancels at the other steps to 1136 catch no
+  error (a manual sweep, not a test).
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
     on Manage Inventory operation 4 and scope 12. A check tree's fault
