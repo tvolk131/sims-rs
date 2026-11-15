@@ -4,32 +4,43 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
-## 2026-11-15: A person upstairs stands on the terrain too
+## 2026-11-15: A person wears what their suit picks, a career's work clothes included
 
-A person on a level above the ground now stands on the terrain's
-altitude under their position, as a person on the ground does
-(`sims_people::lot`). The original's model matrix (0x592132) looks up
-the altitude (0x478dfe) whatever the person's level; it skips it only
-for a point off the lot (0x45ee1d). It then adds the level's offset from
-the view's table, which is still not ported: we keep projecting a level
-as the lot renderer does, a floor height per level above the first. The
-lot renderer lifts an upper level's floor by the terrain under it too,
-so before this a person upstairs stood that much below their floor. On
-the Goths' lot the house sits six terrain steps up, 48 pixels at medium
-zoom, and the floor hid Bella completely while she played with the
-dollhouse upstairs (ticks 798 to 1872, 6:56 to 7:32 AM).
+Mortimer Goth changes for work at 8:07 (the simulation sets his suit,
+person data 8, to 3 at tick 2906) and leaves in a white lab coat; we
+drew him in his everyday clothes until he came back. sims-people now
+follows the suit as the original's outfit choice (0x58a178) does, for
+the suits whose clothes come from the person type's body strings or
+from matched names (`sims_people::suit`): 1, 2, 4, 17 and 18 from
+their entries; 3 from the career level (0x45ee5f); 5 from entry 33 or
+matched pajamas (0x45f034); a body left without a name falls back to
+entry 2 (0x58d492). Suit 0 keeps the record's own clothes, as before.
+A person whose record names no clothes (one a script made) starts from
+their type's default outfit, and their suit is applied to that.
 
-Checked against a screenshot of the original at 7:29 AM (medium zoom,
-rotation 0, level 2, walls down, camera origin (335, −496)): Bella
-kneels at the dollhouse where we draw her at tick 1770, within a pixel
-or two, with the same rows hidden by the front wall's strip. So the
-view-table offset lifts a level by the floor height, at least at this
-zoom and rotation. The original draws her brighter there; that is the
-room's light ("A person is lit by the original's standard light, at
-their room's level"), not her place.
+A career level names a male and a female body and a texture, as
+templates (`Science$g$b_01`, `Science$g$c_01`): `$g` is the sex's
+letter or `u`, `$b` the body type from entry 2's name, `$c` the skin
+tone (entry 15). The body is the first appearance the template
+matches; the texture the best-ranked texture name, with entry 2's
+texture ending (`_rat`) as an optional tail, written `BODY=<name>`
+(0x40e5ce, 0x40e674, 0x472a25). For Mortimer, science level 0, that is
+`sciencemfit_01` with `BODY=sciencemlgt_01`, and the coat matches the
+original's screenshot at 8:11 in cut and colour. The template matching
+follows an earlier port (`crates/sims-sim/src/pose/clothing.rs` on the
+`alpha/playable-households` branch), checked against the disassembly
+for the career and pajama paths.
 
-The entry "People join the lot renderer's view through a depth hook"
-said such a person stands at the floor; this replaces that.
+Approximations, each reopening this if a case turns on it: the
+appearance and texture names are taken in name order, where the
+original keeps its registries' load order (only a tie between two
+equally good names depends on it; none of the careers tried has one),
+and TGA textures are not listed. Not ported: the costume suits 6 to 60
+other than 17 and 18 (the record's clothes are kept), the hands the
+hand words (data 22, 23) pick, the profile migrations run when a
+profile is bound (0x409315), the career cache that keeps old work
+clothes when only age or sex changes, and a `Careers.txt`, which the
+original reads in place of `work.iff`.
 
 ## 2026-11-15: The personality panel shows the sign of the zodiac
 
