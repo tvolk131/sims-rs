@@ -1681,6 +1681,7 @@ dependencies = [
  "libm",
  "sha2",
  "sims-content",
+ "sims-core",
  "sims-formats",
  "sims-sim",
 ]

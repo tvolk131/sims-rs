@@ -4,6 +4,7 @@
 use crate::art::Art;
 use crate::{Error, Result};
 use sims_content::{Catalog, Index};
+use sims_core::{Ext, F32};
 use sims_formats::bitmap::{self, Image};
 use sims_formats::career::{Career, Level};
 use sims_formats::iff::Iff;
@@ -289,39 +290,49 @@ impl Snapshot {
 
 /// The autonomy tuning's friendship threshold, which
 /// [`Snapshot::with_relations`] takes, for a caller without the
-/// simulation's program: entry "friendship threshold" of the global
-/// file's tuning table 2 (`FCNS`), 25.0 when the table or entry is
-/// missing (or the global file), truncated toward zero as the original stores it (0x6c4398).
-/// It reads what `sims_vm::Program::autonomy_constants` reads.
+/// simulation's program: [`friendship_threshold_in`] the global file, or
+/// 25 when the install has none.
 pub fn friendship_threshold(index: &Index, catalog: &Catalog) -> Result<i32> {
+    let Some(file) = index.resources.get(catalog.global) else {
+        return Ok(threshold(None));
+    };
+    let iff = Iff::parse(file.read().map_err(Error::Content)?).map_err(Error::Format)?;
+    friendship_threshold_in(&iff)
+}
+
+/// The friendship threshold `global` (the global file) gives, read as
+/// `sims_vm::Program` reads it, so the two agree. Every `FCNS` chunk is
+/// parsed in file order, deleted and replaced ones included, and a
+/// malformed one is an error (`Program::load`). The last chunk with ID 2
+/// is the table. Its entry "friendship threshold" (any case; 25.0 when
+/// the table or entry is missing) is truncated as the original stores it
+/// (`__ftol`, 0x6c4398; `Program::autonomy_constants`).
+pub fn friendship_threshold_in(global: &Iff) -> Result<i32> {
     const AUTONOMY_TUNING: u16 = 2;
-    const DEFAULT: f32 = 25.0;
     let mut table = None;
-    if let Some(file) = index.resources.get(catalog.global) {
-        let iff = Iff::parse(file.read().map_err(Error::Content)?).map_err(Error::Format)?;
-        // A later table of the same ID replaces an earlier one, as in the
-        // program's libraries.
-        for chunk in iff.resource_order(b"FCNS").map_err(Error::Format)? {
+    for chunk in &global.chunks {
+        if &chunk.tag == b"FCNS" {
+            let parsed = Constants::parse(global.data(chunk)).map_err(Error::Format)?;
             if chunk.id == AUTONOMY_TUNING {
-                table = Some(Constants::parse(iff.data(chunk)).map_err(Error::Format)?);
+                table = Some(parsed);
             }
         }
     }
-    let value = table
-        .and_then(|table| {
-            table
-                .entries
-                .into_iter()
-                .find(|entry| entry.name.eq_ignore_ascii_case("friendship threshold"))
-        })
-        .map_or(DEFAULT, |entry| entry.value);
-    // `__ftol`: toward zero; out of range gives the integer indefinite.
-    let value = value.trunc();
-    Ok(if (-2_147_483_648.0..2_147_483_648.0).contains(&value) {
-        value as i32
-    } else {
-        i32::MIN
-    })
+    let value = table.and_then(|table| {
+        table
+            .entries
+            .into_iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case("friendship threshold"))
+            .map(|entry| entry.value)
+    });
+    Ok(threshold(value))
+}
+
+/// `value`, or the default's bits 0x41c80000 (25.0), truncated as
+/// `Program::autonomy_constants` truncates it.
+fn threshold(value: Option<f32>) -> i32 {
+    let value = value.map_or(F32::from_bits(0x41c8_0000), F32::from_f32);
+    Ext::from_f32(value).to_i32_truncate()
 }
 
 /// The careers of `work.iff`, by the ID of their `CARR` resource, as
