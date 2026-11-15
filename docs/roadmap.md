@@ -2087,8 +2087,8 @@ through their public interfaces only; the simulation never depends on it.
 - **Done: the window.** `cargo run --release -p sims-game` boots the
   Goths' house (`SIMS_INSTALL`, `House05.iff`, answering No to the Help
   System) and runs it in strict mode, a tick every 50 ms at normal
-  speed. The lot, the people over it and the panel over both are drawn
-  every tick; the clock, funds and needs on the panel are the live
+  speed. The lot, its people (hidden by the walls, furniture and floors
+  in front of them) and the panel over both are drawn every tick; the clock, funds and needs on the panel are the live
   world's. The panel's speed, pause and camera buttons work (the game
   paces the lot; the simulation's own speed global is not touched).
   The first error stops the lot, which stays on screen as it was with

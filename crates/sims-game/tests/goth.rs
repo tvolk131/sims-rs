@@ -75,7 +75,7 @@ fn people_stand_where_a_click_finds_them() {
     let bare = canvas.color.clone();
     let mut people = People::open(&install, &house).expect("the people's files");
     people.refresh(world);
-    people.draw(world, &shape, &view.camera, &mut canvas);
+    people.draw(world, &view.camera, &mut canvas);
     assert!(people.problems.is_empty(), "{:?}", people.problems);
     let drawn = bare
         .iter()
@@ -95,7 +95,7 @@ fn people_stand_where_a_click_finds_them() {
         }
         let [x, y, _] = animator.position.map(|v| v.to_f32() as i32);
         let camera = &view.camera;
-        let ground = sims_game::people::terrain(&shape, [x as f32, y as f32]) as i32;
+        let ground = sims_game::pick::terrain(&shape, [x as f32, y as f32]) as i32;
         let [sx, sy] = camera.project_fine(camera.rotate_fine([x, y]), 1, ground);
         if (0..800).contains(&sx) && (0..600).contains(&sy) {
             assert!(pick::person(world, &shape, camera, [sx, sy - 4]).is_some());

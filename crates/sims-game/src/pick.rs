@@ -10,7 +10,6 @@
 //! click meant for the tall one. Drawing an object ID per pixel in
 //! `sims-render` would make this exact.
 
-use crate::people::terrain;
 use sims_render::{Camera, Lot};
 use sims_sim::World;
 use sims_sim::animator::UNSET;
@@ -102,4 +101,26 @@ pub fn person(world: &World, lot: &Lot, camera: &Camera, point: [i32; 2]) -> Opt
         }
     }
     best.map(|(_, id)| id)
+}
+
+/// The terrain's height under the fine position `fine`, in near-zoom
+/// pixels (16 a terrain step, as `sims-render` raises the ground):
+/// the tile's four corners, blended by where in the tile the position
+/// is. Off the lot it is 0.
+pub fn terrain(lot: &Lot, fine: [f32; 2]) -> f32 {
+    let [x, y] = fine.map(|v| v / 16.0);
+    let (tx, ty) = (x.floor(), y.floor());
+    let size = lot.size as f32;
+    if !(0.0..size).contains(&tx) || !(0.0..size).contains(&ty) {
+        return 0.0;
+    }
+    let (fx, fy) = (x - tx, y - ty);
+    // A tile's heights are its corners (0, 1), (0, 0), (1, 0) and (1, 1),
+    // in that order (`sims_render::scene`).
+    let h = lot.heights[Lot::cell(tx as usize, ty as usize)].map(f32::from);
+    let height = h[1] * (1.0 - fx) * (1.0 - fy)
+        + h[2] * fx * (1.0 - fy)
+        + h[0] * (1.0 - fx) * fy
+        + h[3] * fx * fy;
+    height * 16.0
 }

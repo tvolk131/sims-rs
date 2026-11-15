@@ -220,10 +220,8 @@ impl Game {
             match sims_render::Lot::from_world(world) {
                 Ok(shape) => self.lot_shape = shape,
                 Err(e) => {
-                    let line = format!("the lot is not redrawn: {e}");
-                    if !self.people.problems.contains(&line) {
-                        self.people.problems.push(line);
-                    }
+                    self.people
+                        .note(vec![format!("the lot is not redrawn: {e}")]);
                 }
             }
         }
@@ -278,8 +276,7 @@ impl Game {
             &self.view.camera,
             &mut self.canvas,
         );
-        self.people
-            .draw(world, &self.lot_shape, &self.view.camera, &mut self.canvas);
+        self.people.draw(world, &self.view.camera, &mut self.canvas);
         let status = self.status();
         self.hud.draw(
             world,

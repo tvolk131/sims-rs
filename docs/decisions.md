@@ -4,6 +4,20 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: The game draws people into the lot with sims-people's depth test
+
+`sims-game` no longer draws the people into an image of its own laid
+over the lot. Each frame it draws the lot with `sims_render::draw`, then
+the people with `sims_people::People::draw_on_lot` into the same canvas,
+which tests every pixel against the lot's depth, then the panel. Walls,
+furniture and the floor above now hide the people behind them, at every
+zoom and rotation; placement, terrain height and the light are
+`sims-people`'s. People on a level above the camera's are not drawn,
+and the camera's level stays the player's choice (Page Up and Page
+Down), so on the second floor the people downstairs are hidden with
+their rooms. How the original gives a person's mesh its depth is
+**unverified** (see "People's meshes go into the lot renderer's canvas").
+
 ## 2026-11-15: The game's pie menu is a list of the table's entries until the simulation offers them
 
 Clicking an object (or a person) in `sims-game` lists the entries of
@@ -300,6 +314,9 @@ waiting. Reopen when the original's view value or speed register is
 read.
 
 ## 2026-11-15: The game draws people over the lot with a matching 3D camera
+
+Superseded by "The game draws people into the lot with sims-people's
+depth test" above.
 
 `sims-game` draws the people with `sims-people`'s orthographic camera,
 built from the lot camera so that a ground point lands on the pixel the
