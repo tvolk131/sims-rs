@@ -26,9 +26,9 @@ objects and grass. Most of what is left is not drawing:
 - The shots were taken at 6:49 in the morning, later than the earlier
   ones. In the original the stair room (the one with the bay window)
   is drawn at about light-table level 20 (see `Light`), judged from its
-  pixels; ours uses level 16,
-  the half-light floor. Its walls, floor and stairs make up nearly all the misses at
-  rotations 1 and 2 and in the bay view. The room's light is the
+  pixels; ours uses level 16, the half-light floor. Its walls, floor
+  and stairs make up nearly all the misses at rotations 1 and 2 and in
+  the bay view. The room's light is the
   simulation's, so the render leaves it.
 - The Sims in the shots, which this crate does not draw.
 
