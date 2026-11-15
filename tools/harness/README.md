@@ -245,6 +245,15 @@ How the checks work (the addresses are in `input.py`):
   late (tens of updates under TCG), so that reading can be stale. The pie
   menu that opens is the real check: if its actions are aimed at another
   object, Escape closes it and the next aim point is tried.
+- **Pressing.** A press on the house view or a pie menu (`click`,
+  `click-object`, `choose`) keeps the button down until three lot
+  updates have returned, then lets it go. capture.py holds the game still
+  for seconds at each stop, and a short press (down and up 0.3 s apart)
+  that falls inside one stop is never seen: the game reads the button
+  between frames. Twice such a press, with the picker on the object,
+  opened no pie menu in 200 updates. The release is not waited on, so a
+  press that opens a modal dialog does not hold up the steps after it.
+  `press` and `answer-dialog` hold the button 3 s, as `answer.sh` does.
 - **Choosing.** `choose` reads the pie menu's items and their places on the
   screen, moves to the entry, waits until the menu shows it highlighted,
   and presses.

@@ -313,6 +313,33 @@ class RunnerTest(RunnerBase):
         self.assertEqual(len(self.agent.commands), 2)
         self.assertIn('mousedown 1', self.agent.commands[1])
 
+    def test_a_press_is_held_while_updates_return(self):
+        # A short press can fall inside one of capture.py's stops, where the
+        # game never sees the button down; the button stays down until
+        # HOLD_UPDATES updates have returned, then is let go.
+        r = self.runner('click 10 20')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        self.assertEqual(self.last_command(), 'xdotool mousedown 1')
+        down = self.update
+        self.tick_until(r, lambda: 'mouseup' in self.last_command())
+        self.assertEqual(self.last_command(), 'xdotool mouseup 1')
+        self.assertGreaterEqual(self.update - down, inp.HOLD_UPDATES)  # its end is seen at the first
+        self.assertEqual([c['what'] for c in self.rows('command')], ['move', 'press', 'release'])
+        self.tick(r)
+        self.assertTrue(r.finished)
+        self.assertIsNone(r.failed)
+
+    def test_a_dialog_while_the_button_is_down_still_releases_it(self):
+        r = self.runner('click 10 20\nanswer-dialog 400 400')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        r.on_dialog('dialog_show', self.update + 1)  # the press opened a modal dialog
+        self.assertEqual([c['what'] for c in self.rows('command')], ['move', 'press', 'release', 'press'])
+        self.assertIn('400 400', self.last_command())
+        self.agent.finish_all()
+        r.on_dialog('dialog_result', self.update + 1)
+        self.assertTrue(r.finished)
+        self.assertIsNone(r.failed)
+
     def test_click_object_choose_and_expect(self):
         g = self.g
         floor = g.add_object(29, [0, 0])
