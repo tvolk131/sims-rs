@@ -236,7 +236,16 @@ impl std::fmt::Display for StepError {
 
 impl std::error::Error for StepError {}
 
-/// Why a player's order was not queued ([`Lot::queue_interaction`]).
+/// What [`Lot::pie_menu`] lists: the actions offered, in the menu's
+/// order, and the requests to the sound system the check trees made.
+#[derive(Debug, Clone)]
+pub struct Menu {
+    pub actions: Vec<sims_formats::saved_objects::Interaction>,
+    pub sounds: Vec<crate::SoundEvent>,
+}
+
+/// Why a player's order was not queued or the pie menu not listed
+/// ([`Lot::queue_interaction`], [`Lot::pie_menu`], [`Lot::pick`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderError {
     /// The load did not complete.
@@ -602,12 +611,7 @@ impl Lot {
         object: u16,
         menu: u32,
     ) -> Result<Option<i32>, OrderError> {
-        if self.halted {
-            return Err(OrderError::Halted);
-        }
-        if self.load.finished.is_none() {
-            return Err(OrderError::Incomplete);
-        }
+        self.ready()?;
         let interpreter = Interpreter::new(&self.program, &self.catalog, Stream::Global);
         let mut world = self.world.clone();
         let queued = interpreter
@@ -615,6 +619,64 @@ impl Lot {
             .map_err(OrderError::Refused)?;
         self.world = world;
         Ok(queued)
+    }
+
+    /// Lists the pie menu `person` is offered on `object`
+    /// ([`Interpreter::pie_menu`]). Call it between steps, at the moments
+    /// the original lists it: when the cursor first reaches an object
+    /// (0x48c834), not on the click. Listing runs the entries' check trees,
+    /// which change the lot as the original's do, so a recording of play
+    /// must note each call.
+    ///
+    /// A listing that fails on something not ported changes nothing (the
+    /// original has no such failure), and does not halt the lot.
+    pub fn pie_menu(&mut self, person: u16, object: u16) -> Result<Menu, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let actions = interpreter
+            .pie_menu(&mut world, person, object)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        Ok(Menu {
+            actions,
+            sounds: sounds.into_inner(),
+        })
+    }
+
+    /// Queues on `person` an action [`Lot::pie_menu`] listed, as picking it
+    /// does ([`Interpreter::pick`]). Returns the action's number, or None
+    /// when the queue took nothing (it is full, or the action's entry is
+    /// gone). An order that fails changes nothing, as for
+    /// [`Lot::queue_interaction`].
+    pub fn pick(
+        &mut self,
+        person: u16,
+        action: sims_formats::saved_objects::Interaction,
+    ) -> Result<Option<i32>, OrderError> {
+        self.ready()?;
+        let interpreter = Interpreter::new(&self.program, &self.catalog, Stream::Global);
+        let mut world = self.world.clone();
+        let queued = interpreter
+            .pick(&mut world, person, action)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        Ok(queued)
+    }
+
+    /// Whether the lot takes a player's input.
+    fn ready(&self) -> Result<(), OrderError> {
+        if self.halted {
+            return Err(OrderError::Halted);
+        }
+        if self.load.finished.is_none() {
+            return Err(OrderError::Incomplete);
+        }
+        Ok(())
     }
 
     /// The lot's state.
