@@ -13,7 +13,7 @@ use sims_content::{Install, Neighborhood};
 use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_sim::World;
 use sims_ui::art::Art;
-use sims_ui::command::{Command, Walls as UiWalls};
+use sims_ui::command::{Command, Panel as UiPanel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::household::{Careers, Faces, Snapshot};
@@ -162,12 +162,16 @@ impl Hud {
     }
 
     /// What the panel shows of `world`: the household with what the next
-    /// level of each one's career needs, and the people the selected Sim
-    /// knows.
+    /// level of each one's career needs, and, while the relationship
+    /// panel is open, the people the selected Sim knows (read only then:
+    /// the lookup goes through every neighborhood record).
     pub fn snapshot(&self, world: &World) -> Snapshot {
-        Snapshot::read(world, &self.members)
-            .with_careers(&self.careers)
-            .with_relations(world, &self.members, self.friendship)
+        let snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
+        if self.controls.panel == UiPanel::Relationships {
+            snapshot.with_relations(world, &self.members, self.friendship)
+        } else {
+            snapshot
+        }
     }
 
     /// Draws the panel over the lot in `canvas`, from `world` as it is

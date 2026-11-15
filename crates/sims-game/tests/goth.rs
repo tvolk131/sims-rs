@@ -1370,19 +1370,22 @@ fn the_needs_panel_follows_the_selected_goths_motives() {
 /// world holds them (person data words 10, 12, 11, 17, 18 and 15:
 /// Cooking, Mechanical, Charisma, Body, Logic, Creativity) and what the
 /// next level of their career needs, and follows a press on another
-/// Goth's portrait. The Goths have no skill points yet, so this shows
-/// the panel reads the selected Sim, not that the values move;
+/// Sim's portrait. The Goths have no skill points yet, so this is
+/// checked in house 7, whose two Sims have different skills (Cooking 3
+/// and Mechanical 2 against none);
 /// `the_job_panel_shows_what_the_next_level_needs` checks the needs.
 #[test]
-fn the_job_panel_shows_the_selected_goths_skills() {
+fn the_job_panel_shows_the_selected_sims_skills() {
     let Some(install) = install() else {
         return;
     };
     let mut game = Game::open(&Options {
         play: true,
+        house: install.join("UserData/Houses/House07.iff"),
         ..options(install)
     })
-    .expect("the Goth house opens");
+    .expect("house 7 opens");
+    assert_eq!(game.stopped(), None, "the load completes");
     assert_eq!(game.run(20), 20);
     game.resize([800, 600]);
     game.render();
@@ -1422,30 +1425,33 @@ fn the_job_panel_shows_the_selected_goths_skills() {
             .needs;
         ([10, 12, 11, 17, 18, 15].map(|word| data[word]), needs)
     };
-    let mortimer = game.lot().world().selected().expect("a Sim is selected");
-    assert_eq!(shown(&mut game), held(&game, mortimer));
+    let first = game.lot().world().selected().expect("a Sim is selected");
+    let theirs = shown(&mut game);
+    assert_eq!(theirs, held(&game, first));
     let (other, portrait) = game
         .panel()
         .iter()
         .find_map(|item| match item.command {
-            Some(sims_ui::command::Command::Select { sim }) if sim != mortimer => {
+            Some(sims_ui::command::Command::Select { sim }) if sim != first => {
                 Some((sim, item.rect))
             }
             _ => None,
         })
-        .expect("another Goth's portrait");
+        .expect("the other Sim's portrait");
     game.press(centre(portrait));
     assert_eq!(game.lot().world().selected(), Some(other));
-    let hers = shown(&mut game);
-    assert_eq!(hers, held(&game, other));
+    let others = shown(&mut game);
+    assert_eq!(others, held(&game, other));
+    assert_ne!(others.0, theirs.0, "the two Sims' skills differ");
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
 
 /// The live panel's Relationships button lists the people the selected
 /// Sim knows, from the neighborhood records the booted lot holds: the
-/// family first, with the married Goths' pink heart, and each entry's
-/// numbers the selected Sim's row toward that person (values 0 and 2).
-/// The list follows a press on another Goth's portrait.
+/// Goths know only each other, the married ones with the pink heart, and
+/// each entry's numbers are the selected Sim's row toward that person
+/// (values 0 and 2). The list follows a press on another Goth's
+/// portrait.
 #[test]
 fn the_relationship_panel_lists_who_the_selected_goth_knows() {
     let Some(install) = install() else {
@@ -1498,37 +1504,57 @@ fn the_relationship_panel_lists_who_the_selected_goth_knows() {
             assert_eq!(relation.pink_heart, row.values[1] != 0);
         }
     };
-    let guid = |game: &Game, sim: u16| game.lot().world().objects[&sim].guid;
-    let mortimer = game.lot().world().selected().expect("a Sim is selected");
+    // Who is listed, in order: the type's GUID, the record, the daily
+    // and lifetime relationships, then the smiley, the pink and red
+    // hearts and the family mark.
+    let listed = |shown: &[sims_ui::household::Relation]| {
+        shown
+            .iter()
+            .map(|r| {
+                (
+                    r.guid,
+                    r.id,
+                    r.daily,
+                    r.lifetime,
+                    [r.friends, r.pink_heart, r.red_heart, r.family],
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let (mortimer, bella, cassandra) = (0xc07f_6184, 0xc0c6_298e, 0xc120_7913);
+    let selected = game.lot().world().selected().expect("a Sim is selected");
+    assert_eq!(game.lot().world().objects[&selected].guid, mortimer);
     let his = shown(&mut game);
-    assert!(!his.is_empty() && his.len() <= 5, "{his:?}");
-    check(&game, mortimer, &his);
-    let (bella, portrait) = game
+    check(&game, selected, &his);
+    // His family only, his wife first with the pink heart.
+    assert_eq!(
+        listed(&his),
+        [
+            (bella, 33, 100, 100, [true, true, false, true]),
+            (cassandra, 32, 75, 75, [true, false, false, true]),
+        ]
+    );
+    let (other, portrait) = game
         .panel()
         .iter()
         .find_map(|item| match item.command {
-            Some(sims_ui::command::Command::Select { sim }) if sim != mortimer => {
+            Some(sims_ui::command::Command::Select { sim }) if sim != selected => {
                 Some((sim, item.rect))
             }
             _ => None,
         })
         .expect("another Goth's portrait");
-    // The family comes first, and his wife has the pink heart.
-    let wife = his
-        .iter()
-        .find(|r| r.guid == guid(&game, bella))
-        .expect("he knows the other Goth");
-    assert!(wife.family, "{wife:?}");
-    assert!(his[0].family, "{his:?}");
+    assert_eq!(game.lot().world().objects[&other].guid, bella);
     game.press(centre(portrait));
-    assert_eq!(game.lot().world().selected(), Some(bella));
+    assert_eq!(game.lot().world().selected(), Some(other));
     let hers = shown(&mut game);
-    assert_ne!(hers, his);
-    check(&game, bella, &hers);
-    assert!(
-        hers.iter()
-            .any(|r| r.guid == guid(&game, mortimer) && r.family),
-        "{hers:?}"
+    check(&game, other, &hers);
+    assert_eq!(
+        listed(&hers),
+        [
+            (mortimer, 34, 100, 100, [true, true, false, true]),
+            (cassandra, 32, 85, 85, [true, false, false, true]),
+        ]
     );
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }

@@ -2111,11 +2111,12 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   follow the ticks (`sims-game` tests
   `the_personality_panel_shows_the_selected_goths_traits`,
   `the_needs_panel_follows_the_selected_goths_motives`,
-  `the_job_panel_shows_the_selected_goths_skills`,
+  `the_job_panel_shows_the_selected_sims_skills`, in house 7, whose
+  Sims have skills,
   `the_relationship_panel_lists_who_the_selected_goth_knows`). The
-  game's panel reads the relationships with the tuning's friendship
-  threshold and loads the faces of everyone in the neighborhood's
-  records.
+  game's panel reads the relationships, while that panel is open, with
+  the tuning's friendship threshold, and loads the faces of everyone in
+  the neighborhood's records.
 - **Done: the job panel's skills.** The Job button opens the selected
   Sim's six skill bars, with the labels of what the next level of
   their career needs underlined and a line marking how much (from
