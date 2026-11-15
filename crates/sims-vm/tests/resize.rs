@@ -2190,6 +2190,7 @@ fn the_goth_house_first_tick_matches_the_original() {
     const TICK_466: &str = "7dd965a56f279614b46c16223faf1abad52290db1940fa293a082e559449b9cd";
     const TICK_583: &str = "95602638fb97031232502163ecded9078771357166b92166150eebfba73adb2d";
     const TICK_608: &str = "baef8063918e1a4bf5ba86408a3121db72ac29b0dfc9052afa5a63da07a9fddc";
+    const TICK_690: &str = "b76cdfd8f0b91c941eca95a4a191c5d393c85a1f36889c0b5406ec7fa43d23f4";
     const TICK_416_20: &str = "37ff5756ac5cf26769da735eadb955be4f78f64381ea8b847963298b51f8320b";
     const USES_233: [(i16, i32); 2] = [(132, 5), (51, 8)];
     const TREES_233: [u16; 9] = [
@@ -2773,11 +2774,35 @@ fn the_goth_house_first_tick_matches_the_original() {
         }
         assert_eq!(world.ticks, before.ticks + 608);
         assert_eq!(digest(&world.encode()), TICK_608);
-        // Tick 609: object 260 is removed, which needs the lot's
-        // placement and callback services in the removal.
+        // Tick 609: object 260, on a tile of the lot, removes itself
+        // (Remove Object Instance): it leaves the lot through the
+        // placement and is queued.
+        assert_eq!(world.objects[&260].position, [408, 408, 1]);
+        interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        assert!(
+            world
+                .objects
+                .get(&260)
+                .is_none_or(|o| o.position == [-16, -16, 1]),
+            "object 260 is still on the lot"
+        );
+        // Tick 672: person 21's first, unbounded search finds no path, and
+        // In the Way asks person 16 to move, whose slot search keeps a
+        // random choice of its places.
+        for _ in 610..=690 {
+            interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        }
+        assert_eq!(world.ticks, before.ticks + 690);
+        assert_eq!(digest(&world.encode()), TICK_690);
+        // Tick 691: person 18 routes in a room upstairs.
         let error = interpreter
             .lot_update(world, &tuning, &mut player)
             .unwrap_err();
-        assert!(error.to_string().contains("removing object 260"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("routing in a room above the ground"),
+            "{error}"
+        );
     });
 }

@@ -60,9 +60,10 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 608 on the Goth house**: our
+  there, as three captures recorded). **K = 690 on the Goth house**: our
   state after every one of ticks 1 to 608 equals the fourth capture of the
-  original (full state after every update) in everything compared, but
+  original (full state after every update), and after every one of ticks
+  600 to 690 the fifth, in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
   other captures agree where they hold a state, but for fields that also
@@ -115,7 +116,10 @@ Each step is a few PRs, and each PR leaves `main` green.
   retained list that the registry did not hold. The list is a cache the
   game rebuilds before reading it when it is marked dirty, and removing
   an object marks it dirty without editing it; the reader now keeps a
-  dirty cache's pointers without identities (`tools/harness/README.md`). The first run does not choose in tick
+  dirty cache's pointers without identities (`tools/harness/README.md`).
+  A fifth run, with that reader, recorded 1000 lot updates with the full
+  state after updates 600 to 1000. Its streams equal the fourth run's
+  after every update both hold. The first run does not choose in tick
   233; the other three do (see "Tick 233"). Why is not known, and the
   captures do not hold what would tell. The likely cause, unverified,
   is the long pause the harness made in that run only; we follow the
@@ -1543,7 +1547,44 @@ included, but for the head fields of "Ticks 334 to 366".
 
 **Stops.** Tick 609: object 260 is removed, and removing it needs the
 lot's placement and callback services (the removal of an object that
-stands on the lot).
+stands on the lot). See "Ticks 609 to 690".
+
+### Ticks 609 to 690
+
+**The removal queue** (`0x442d70`, `remove.rs`). Remove Object Instance
+queues an object as the original does: it skips one that is queued, or
+whose holder (each container `capture` gives, up the chain) is queued,
+then takes it off the lot through the object's own remove-from-lot
+(virtual function 0x50, `Interpreter::take_off`, telling the registry),
+and queues it. In tick 609 object 260 removes itself from its tile.
+An object already off the lot, as the lot-wide controllers are, still
+leaves the narrower way of `Machine::leave_lot`, which the earlier ticks
+were compared through. A tile of a group may stand for its lead tile by
+a test (0x42344e, its function table's entry 8) not decoded yet, and
+fails loudly.
+
+**No way in the planner's first search** (`0x482abc`). In a room of more
+than 256 tiles the planner first searches without the width limit. When
+that search finds no path, the context's result becomes 3 and the
+planner answers false: the route to the slot drops its candidates and
+answers 0. In tick 672 this happens to person 21, whose route then
+finds person 16 in the way and asks it to move.
+
+**A random choice of slot places** (`0x483c57`). When the search by
+distance finds more places than the context's limit, it keeps a random
+choice: the places with word +0xc first, then, while fewer than the limit
+are kept, a draw from the active stream modulo the number found names a
+place, and the first from there on not yet taken is kept. A kept place's
+score in the copy becomes 0, which is the mark of a taken place (so a
+place that scored 0 is never chosen). Person 16, asked to move in tick
+672, chooses this way.
+
+**K = 690.** Our state after every tick from 600 to 690 equals the fifth
+capture in everything compared, the three random streams included, but
+for the head fields of "Ticks 334 to 366".
+
+**Stops.** Tick 691: person 18 routes in a room upstairs (room 1025),
+and the room's rectangles above the ground (`0x4818af`) are not ported.
 
 ## Track: drawing people (`crates/sims-people`)
 

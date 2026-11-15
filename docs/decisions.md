@@ -4,6 +4,25 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-14: The removal queue, no way in the planner, and K = 690
+
+Remove Object Instance now queues as the original's removal queue does
+(0x442d70), taking an object on the lot off through `take_off`. An object
+already off the lot keeps the narrower `leave_lot`: the general way
+looks up the room of the off-lot place, and during the load the rooms
+are not worked out yet. The original makes the same call for both, so
+the general way would be the faithful one if `room_at` answered "no
+room" for an off-lot place before the rooms exist; that was not checked
+against the original's room lookup, so the narrower path, which the load
+and the earlier ticks were compared through, stays. Reopen if an off-lot
+object with callbacks for leaving is removed.
+
+The first capture to 1000 updates stopped at 609 with a harness error the
+spatial-order reader fix (#47) already addressed; a fifth capture with
+that reader recorded the full state after updates 600 to 1000, and its
+streams equal the fourth's to 608, so ticks 600 to 690 are compared with
+it. K = 690.
+
 ## 2026-11-14: Wall caps follow the original's corner records
 
 Walls in the original are thick, and their sprites stop at the corners,

@@ -22,7 +22,8 @@
 //!    room without that limit.
 //!    The step limit is the tiles times the goals plus 50, at most 1000.
 //!    A room with the width limit and more than 256 tiles first searches
-//!    without it; that pass must find a path and is then thrown away.
+//!    without it. If that pass finds no path, the context's result is 3
+//!    and the planner answers false; otherwise the pass is thrown away.
 //! 6. The chosen candidate is the goal reached (context +0x50), and the
 //!    path's points, coordinates swapped, are the person's path.
 //!
@@ -52,6 +53,9 @@ const DIRECTION: usize = 1;
 /// are not ported.
 const NO_ROOM: usize = 68;
 const CARRIED: usize = 84;
+
+/// The context's result when the first, unbounded search finds no path.
+const NO_WAY: i32 = 3;
 
 /// The function an object is asked whether a person may pass it.
 const ALLOW_OVERLAP: usize = 5;
@@ -282,7 +286,10 @@ impl Interpreter<'_> {
         if tiles > 256 && bounded {
             let first = search(query(None)).map_err(fail)?;
             if first.points.is_empty() {
-                return Err(fail(unsupported("a first search that finds no path")));
+                // 0x482abc to 0x482af5: no way; the context's result is 3,
+                // and nothing else is chosen.
+                ctx.result = NO_WAY;
+                return Ok(false);
             }
         }
         let found = search(query(bounded.then_some(128))).map_err(fail)?;
