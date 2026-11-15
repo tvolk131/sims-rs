@@ -9,7 +9,7 @@ use crate::grass::{self, Grass};
 use crate::light::Light;
 use crate::lot::{self, Lot, WallCell};
 use sims_sim::{Object, World};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Rows between a tile's left corner and the top of its first grass
 /// column (matched against the original's screen).
@@ -631,9 +631,10 @@ impl Painter<'_> {
             }
             let assets = &mut *self.assets;
             let slot = |guid, i: usize| assets.definition(guid)?.slots.get(i).copied();
-            let Some(([x, y], lift)) = held(&self.world.objects, slot, id) else {
+            let Some(([dx, dy], lift)) = held(&self.world.objects, slot, id) else {
                 continue;
             };
+            let [x, y] = [x + dx, y + dy];
             let view = self.camera.rotate_fine([x, y]);
             // The ground under the object: the mean of its tile's corners.
             let ground = (0..4)
@@ -732,33 +733,40 @@ const HIDDEN: usize = 34;
 const CONTAINER: usize = 2;
 const CONTAINER_SLOT: usize = 3;
 
-/// Where an object stands: its fine position and how far it is lifted,
-/// in height units. An object another holds (a lamp on an end table, a
-/// sink in a counter) stands at its holder's place plus the slot's
-/// offset, turned by the holder's facing, and up by the slot's height;
-/// the original adds these while it draws the holder's contents
+/// How far a held object stands from its own position: a fine x and y
+/// offset and a lift in height units. An object another holds (a lamp on
+/// an end table, a sink in a counter) stands at its holder's place plus
+/// the slot's offset, turned by the holder's facing, and up by the slot's
+/// height; the original adds these while it draws the holder's contents
 /// (0x437fdd, read by the old prototype in
-/// `legacy/crates/sims-render/src/lib.rs`). None when a holder is hidden.
-/// Objects a Sim holds stay at their own position. `slot` gives a
-/// holder's slot by its GUID and the slot's index.
+/// `legacy/crates/sims-render/src/lib.rs`). The game stores a held object
+/// at its holder's place, so the offset is added to the object's own
+/// position and level, which the caller has checked. Objects a Sim holds
+/// get no offset. None when a holder is hidden. A chain of holders that
+/// loops gives no offset. Each part is clamped to a lot's width, so
+/// nonsense in a save cannot overflow anything. `slot` gives a holder's
+/// slot by its GUID and the slot's index.
 fn held(
     objects: &BTreeMap<u16, Object>,
     mut slot: impl FnMut(u32, usize) -> Option<[f32; 3]>,
     id: u16,
 ) -> Option<([i32; 2], f32)> {
     let mut cursor = objects.get(&id)?;
+    let mut seen = BTreeSet::from([id]);
     let mut offset = [0.0f32; 3];
-    // A chain longer than the lot has objects is a loop.
-    for _ in 0..objects.len() {
+    loop {
         let container = cursor.data.get(CONTAINER).copied().unwrap_or(0);
-        let Some(holder) = u16::try_from(container)
+        let Some((holder_id, holder)) = u16::try_from(container)
             .ok()
             .filter(|&c| c != 0)
-            .and_then(|c| objects.get(&c))
-            .filter(|h| h.person.is_none())
+            .and_then(|c| Some((c, objects.get(&c)?)))
+            .filter(|(_, h)| h.person.is_none())
         else {
             break;
         };
+        if !seen.insert(holder_id) {
+            return Some(([0, 0], 0.0));
+        }
         if holder.data.get(HIDDEN).is_some_and(|&w| w != 0) {
             return None;
         }
@@ -770,12 +778,11 @@ fn held(
         for _ in 0..(i32::from(holder.data.get(1).copied().unwrap_or(0)) / 2).rem_euclid(4) {
             (x, y) = (-y, x);
         }
-        offset = [offset[0] + x, offset[1] + y, offset[2] + z];
+        offset = sprite_offset([offset[0] + x, offset[1] + y, offset[2] + z]);
         cursor = holder;
     }
-    let [x, y, _] = cursor.position;
     Some((
-        [x + offset[0].round() as i32, y + offset[1].round() as i32],
+        [offset[0].round() as i32, offset[1].round() as i32],
         offset[2],
     ))
 }
@@ -1065,18 +1072,43 @@ mod tests {
             object(2, 9, [100, 200, 1], &[(CONTAINER, 1), (CONTAINER_SLOT, 1)]),
         );
         // The slot's x turns with the table into y; its height lifts.
-        assert_eq!(held(&objects, slot, 2), Some(([100, 204], 4.0)));
-        assert_eq!(held(&objects, slot, 1), Some(([100, 200], 0.0)));
+        assert_eq!(held(&objects, slot, 2), Some(([0, 4], 4.0)));
+        assert_eq!(held(&objects, slot, 1), Some(([0, 0], 0.0)));
         // A holder without that slot puts it at its own place.
         objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 5;
-        assert_eq!(held(&objects, slot, 2), Some(([100, 200], 0.0)));
+        assert_eq!(held(&objects, slot, 2), Some(([0, 0], 0.0)));
+        objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 1;
         // A hidden holder hides what it holds.
         objects.get_mut(&1).unwrap().data[HIDDEN] = 1;
         assert_eq!(held(&objects, slot, 2), None);
-        // Holders that hold each other end the walk.
         objects.get_mut(&1).unwrap().data[HIDDEN] = 0;
+        // Holders that hold each other, or an object that holds itself,
+        // give no offset, however many other objects there are.
         objects.get_mut(&1).unwrap().data[CONTAINER] = 2;
-        assert!(held(&objects, slot, 2).is_some());
+        assert_eq!(held(&objects, slot, 2), Some(([0, 0], 0.0)));
+        objects.insert(
+            3,
+            object(3, TABLE, [0, 0, 1], &[(CONTAINER, 3), (CONTAINER_SLOT, 1)]),
+        );
+        assert_eq!(held(&objects, slot, 3), Some(([0, 0], 0.0)));
+    }
+
+    #[test]
+    fn a_long_chain_of_huge_slots_stays_within_a_lot() {
+        let huge = |_: u32, _: usize| Some([f32::MAX, -1e30, f32::INFINITY]);
+        let mut objects = BTreeMap::new();
+        objects.insert(1, object(1, 1, [0, 0, 1], &[]));
+        for id in 2..200u16 {
+            let below = (id - 1) as i16;
+            objects.insert(
+                id,
+                object(id, 1, [0, 0, 1], &[(CONTAINER, below), (CONTAINER_SLOT, 0)]),
+            );
+        }
+        let limit = camera::ARRAY_SIZE * 16;
+        let ([x, y], lift) = held(&objects, huge, 199).unwrap();
+        assert!(x.abs() <= limit && y.abs() <= limit);
+        assert!(lift.abs() <= limit as f32);
     }
 
     #[test]

@@ -25,7 +25,12 @@ to the position, and adds the slot's height. We now do the same:
   the entry's own z;
 - the height adds to the sprite's own height, which raises it on screen
   and moves its depth;
+- the offset adds to the held object's own position and level, which
+  the game keeps at its holder's (the original starts from the
+  holder's; the two agree in this house);
 - a hidden holder hides what it holds;
+- a loop of holders gives no offset, and offsets and heights are
+  clamped to a lot's width, so a broken save cannot overflow anything;
 - objects a Sim holds stay where they were.
 
 **Result.** At far zoom, rotation 3, the end-table lamp now matches the
