@@ -68,8 +68,8 @@ below). Both are gone: the refresh is ported (`Interpreter::deselect`).
   0x51ea7a on a second press, when global 0x6f6bac (cast) is not the
   Sim. It closes the panel's window at +0x31c and calls 0x586db2 with 0,
   presumably ending a camera follow. It is left out. Also unverified: a
-  household member who is not on the lot (0x4e9652), and the lot's bounds used by 0x4a7af0 (taken
-  here as its 64 by 64 tiles).
+  household member who is not on the lot (0x4e9652), and the lot's
+  bounds used by 0x4a7af0 (taken here as its 64 by 64 tiles).
 
 ## 2026-11-15: The plumb bob is the original's mesh, coloured and lit as the original does
 
