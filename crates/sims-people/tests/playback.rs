@@ -118,7 +118,7 @@ fn the_goth_family_stands_and_walks() {
         ];
         let mut images = Vec::new();
         for (i, (kind, animator)) in cases.iter().enumerate() {
-            let pose = player.pose(&body.skeleton, animator, &base).unwrap();
+            let pose = player.pose(&body.skeleton, animator, None, &base).unwrap();
             let bones = pose.world(&body.skeleton, placement(animator).unwrap());
             let camera = Camera::house_view(60.0, Vec3::new(0.0, 2.8, 0.0));
             let mut canvas = Canvas::new(320, 400, [0, 0, 0, 0]);
@@ -178,7 +178,7 @@ fn a_scripts_base_clip_plays_from_its_start() {
     let mut pose = |clock: i32, base: Base| {
         let mut animator = Animator::new(clock);
         animator.base = base;
-        player.pose(&body.skeleton, &animator, &clip).unwrap()
+        player.pose(&body.skeleton, &animator, None, &clip).unwrap()
     };
     let script = |reverse: bool, start: i32| Base::Script {
         clip: clip.clone(),
@@ -195,4 +195,64 @@ fn a_scripts_base_clip_plays_from_its_start() {
     // Backward, it starts at its end whenever it started.
     assert_eq!(pose(500, script(true, 500)), pose(0, script(true, 0)));
     assert_eq!(pose(1250, script(true, 1000)), pose(250, script(true, 0)));
+}
+
+/// The base layer is the simulation's: a seated person's base slot plays
+/// the sit loop at the phase the simulation advanced it to, whatever the
+/// saved record's clip and the animator's clock say.
+#[test]
+fn the_base_layer_is_the_one_the_simulation_keeps() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let people = residents(&root, &house).unwrap();
+    let assets = Assets::scan(&root).unwrap();
+    let library = Library::scan(&assets).unwrap();
+    let mut player = Player::new(&assets, &library);
+    let resident = people
+        .iter()
+        .find(|r| r.skeleton.eq_ignore_ascii_case("adult"))
+        .unwrap();
+    let body = Body::load(&assets, &resident.skeleton, &resident.outfit).unwrap();
+    let standing = base_clip(&resident.person, &resident.skeleton);
+    assert_eq!(standing, "a2o-standing-loop");
+    let mut animator = Animator::new(1234);
+    animator.base = Base::Posture;
+    let sit = |phase: f32| {
+        let mut layer = Layer::start("a2o-sit-loop", F32::ZERO, 0, true, 0, false, 0);
+        layer.mode = 1;
+        layer.priority = -10;
+        layer.phase = F32::from_f32(phase);
+        layer
+    };
+    let mut pose = |layer: Option<&Layer>| {
+        player
+            .pose(&body.skeleton, &animator, layer, &standing)
+            .unwrap()
+    };
+    let without = pose(None);
+    let seated = pose(Some(&sit(0.25)));
+    assert_ne!(seated, without);
+    // The clip and the phase are the layer's.
+    assert_ne!(pose(Some(&sit(0.75))), seated);
+    let mut want = sims_people::rig::Pose::rest(&body.skeleton);
+    let clip = player.clip("a2o-sit-loop").unwrap();
+    clip.apply(&body.skeleton, &mut want, 0.25, true, 1.0);
+    assert_eq!(seated, want);
+    // The seated pelvis is lower than the standing one.
+    let pelvis = body
+        .skeleton
+        .bones
+        .iter()
+        .position(|b| b.name.eq_ignore_ascii_case("PELVIS"))
+        .unwrap();
+    let mut at = Animator::new(0);
+    at.position = [F32::ZERO; 3];
+    let root = placement(&at).unwrap();
+    let height = |p: &sims_people::rig::Pose| p.world(&body.skeleton, root)[pelvis].translation.y;
+    assert!(
+        height(&seated) < height(&without) - 0.3,
+        "{} {}",
+        height(&seated),
+        height(&without)
+    );
 }

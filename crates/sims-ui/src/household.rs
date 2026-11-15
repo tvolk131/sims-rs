@@ -5,6 +5,7 @@ use crate::art::Art;
 use crate::{Error, Result};
 use sims_content::{Catalog, Index};
 use sims_formats::bitmap::{self, Image};
+use sims_formats::career::{Career, Level};
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
 use sims_sim::World;
@@ -23,7 +24,35 @@ pub struct Resident {
     pub object: u16,
     pub guid: u32,
     pub motives: [f32; 16],
+    /// The personality in the panel's order ([`PERSONALITY`]), in
+    /// hundredths of a point (0 to 1000).
+    pub personality: [i16; 5],
+    /// The skills in the job panel's order ([`SKILLS`]), in hundredths
+    /// of a point (0 to 1000).
+    pub skills: [i16; 6],
+    /// The career (a `CARR` resource's ID; 0 for none) and the level in
+    /// it, person data 56 and 57.
+    pub job: [i16; 2],
+    /// What the next level of the career needs of each skill, where the
+    /// person has less: 0 elsewhere, and everywhere until
+    /// [`Snapshot::with_careers`] fills it in.
+    pub needs: [i32; 6],
 }
+
+/// The person data words of the personality, in the panel's order: Neat,
+/// Outgoing, Active, Playful and Nice (0x66c600).
+pub const PERSONALITY: [usize; 5] = [7, 6, 3, 5, 2];
+
+/// The person data words of the skills, in the job panel's order:
+/// Cooking, Mechanical, Charisma, Body, Logic and Creativity (0x66dfec).
+pub const SKILLS: [usize; 6] = [10, 12, 11, 17, 18, 15];
+
+/// The person data words of the career and the level in it.
+const JOB: [usize; 2] = [56, 57];
+
+/// Which of a career level's values is the need of each of [`SKILLS`]
+/// (0x4ea823).
+const SKILL_NEEDS: [usize; 6] = [1, 2, 3, 4, 5, 6];
 
 /// The simulation state the control panel shows, copied out of a
 /// [`World`] so drawing never holds the world.
@@ -55,14 +84,17 @@ impl Snapshot {
                 .values()
                 .find(|o| o.guid == guid && o.person.is_some())
             {
+                let person = object.person.as_ref();
+                let data =
+                    |word: usize| person.and_then(|p| p.data.get(word).copied()).unwrap_or(0);
                 residents.push(Resident {
                     object: object.id,
                     guid,
-                    motives: object
-                        .person
-                        .as_ref()
-                        .map(|p| p.motives)
-                        .unwrap_or_default(),
+                    motives: person.map(|p| p.motives).unwrap_or_default(),
+                    personality: PERSONALITY.map(data),
+                    skills: SKILLS.map(data),
+                    job: JOB.map(data),
+                    needs: [0; 6],
                 });
             }
         }
@@ -78,6 +110,29 @@ impl Snapshot {
                 .find(|o| o.selected && o.person.is_some())
                 .map(|o| o.id),
         }
+    }
+
+    /// Fills in each resident's [`Resident::needs`] from `careers`, as
+    /// the original's 0x4ea823 works them out: the value of the level
+    /// after the person's own, where it is more than the person's skill.
+    /// A person with no career, or at its top level, needs nothing.
+    #[must_use]
+    pub fn with_careers(mut self, careers: &Careers) -> Self {
+        for resident in &mut self.residents {
+            let [career, level] = resident.job;
+            let next = careers.level(career, i32::from(level) + 1);
+            resident.needs = std::array::from_fn(|n| {
+                let need = next
+                    .and_then(|l| l.values.get(SKILL_NEEDS[n]).copied())
+                    .unwrap_or(0);
+                if need > i32::from(resident.skills[n]) {
+                    need
+                } else {
+                    0
+                }
+            });
+        }
+        self
     }
 
     pub fn resident(&self, object: u16) -> Option<&Resident> {
@@ -111,6 +166,43 @@ impl Snapshot {
             out.push(c);
         }
         format!("{}${out}", if self.funds < 0 { "-" } else { "" })
+    }
+}
+
+/// The careers of `work.iff`, by the ID of their `CARR` resource, as
+/// the original looks a person's career up (0x404cb3).
+#[derive(Debug, Clone, Default)]
+pub struct Careers {
+    careers: BTreeMap<i16, Vec<Level>>,
+}
+
+impl Careers {
+    /// Reads every `CARR` of the install's `work.iff`. An install without
+    /// the file has no careers.
+    pub fn load(index: &Index) -> Result<Self> {
+        let mut careers = BTreeMap::new();
+        let Some((_, file)) = index.named("work.iff").next() else {
+            return Ok(Self { careers });
+        };
+        let iff = Iff::parse(file.read().map_err(Error::Content)?).map_err(Error::Format)?;
+        for chunk in iff.resource_order(b"CARR").map_err(Error::Format)? {
+            let career = Career::parse(iff.data(chunk)).map_err(Error::Format)?;
+            careers.insert(chunk.id as i16, career.levels);
+        }
+        Ok(Self { careers })
+    }
+
+    /// Adds or replaces a career, as tests do.
+    pub fn insert(&mut self, id: i16, levels: Vec<Level>) {
+        self.careers.insert(id, levels);
+    }
+
+    /// Level `level` (from 0) of career `career`, if both exist.
+    pub fn level(&self, career: i16, level: i32) -> Option<&Level> {
+        if career == 0 {
+            return None;
+        }
+        self.careers.get(&career)?.get(usize::try_from(level).ok()?)
     }
 }
 
@@ -253,5 +345,43 @@ mod tests {
         assert_eq!(snapshot(0, 0, 0).money(), "$0");
         assert_eq!(snapshot(0, 0, 1_234_567).money(), "$1,234,567");
         assert_eq!(snapshot(0, 0, i32::MIN).money(), "-$2,147,483,648");
+    }
+
+    #[test]
+    fn the_next_level_needs_what_the_person_lacks() {
+        let level = |values: [i32; 6]| {
+            let mut level = Level {
+                values: [0; 21],
+                strings: Default::default(),
+            };
+            level.values[1..7].copy_from_slice(&values);
+            level
+        };
+        let mut careers = Careers::default();
+        careers.insert(
+            9,
+            vec![level([0; 6]), level([100, 0, 300, 40_000, 200, -5])],
+        );
+        let resident = |job: [i16; 2]| Resident {
+            object: 1,
+            guid: 1,
+            motives: [0.0; 16],
+            personality: [0; 5],
+            skills: [0, 0, 300, 1000, 199, 0],
+            job,
+            needs: [7; 6],
+        };
+        let mut s = snapshot(0, 0, 0);
+        s.residents = vec![resident([9, 0]), resident([9, 1]), resident([0, 0])];
+        let needs: Vec<[i32; 6]> = s
+            .with_careers(&careers)
+            .residents
+            .iter()
+            .map(|r| r.needs)
+            .collect();
+        // Only more than the skill counts, and as the career has it, past
+        // the 16-bit range too; at the top level, or with no career,
+        // nothing.
+        assert_eq!(needs, [[100, 0, 0, 40_000, 200, 0], [0; 6], [0; 6]]);
     }
 }

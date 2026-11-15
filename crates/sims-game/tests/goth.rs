@@ -13,6 +13,7 @@ use sims_ui::household::Snapshot;
 use sims_ui::hud::Kind;
 use sims_ui::queue::Picture;
 use sims_vm::SoundEvent;
+use sims_vm::boot::{Frames, Lot};
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
@@ -670,6 +671,134 @@ fn a_press_on_an_actions_icon_cancels_it() {
     assert_eq!(mortimer(&game).queue.len(), before.queue.len());
 }
 
+/// Play mode, through the window: the player orders a snack from the
+/// fridge's pie and then the plant's Water from its pie. The water waits
+/// behind the snack, its icon second. A press on the queued water's icon
+/// takes it off; a press on the snack's icon while Mortimer eats it
+/// cancels it, he puts the snack down (Drop, 0x454430) and goes to water
+/// the plant. No error is caught on the way.
+#[test]
+fn a_second_order_waits_behind_the_first_and_a_press_cancels_either() {
+    let Some(install) = install() else {
+        return;
+    };
+    let open = || {
+        let mut game = Game::open(&Options {
+            play: true,
+            ..options(install.clone())
+        })
+        .expect("the Goth house opens");
+        assert_eq!(game.run(50), 50);
+        game.resize([800, 600]);
+        game.render();
+        game
+    };
+    let (fridge, plant) = (118, 162);
+    let mut game = open();
+    let sim = game.lot().world().selected().expect("a Sim is selected");
+    order(&mut game, fridge, "Have A Snack");
+    order(&mut game, plant, "Water");
+    let mortimer = |game: &Game| game.lot().world().objects[&sim].person.clone().unwrap();
+    let orders: Vec<(i32, i16)> = mortimer(&game)
+        .queue
+        .iter()
+        .map(|a| (a.uid, a.target))
+        .collect();
+    assert_eq!(orders, [(1, fridge as i16), (2, plant as i16)]);
+    let guid = |game: &Game, id: u16| game.lot().world().objects[&id].guid;
+    let icons = |game: &Game| -> Vec<(i32, Picture, i32)> {
+        game.queue()
+            .icons
+            .iter()
+            .map(|i| (i.uid, i.picture, i.rect.x))
+            .collect()
+    };
+    assert_eq!(
+        icons(&game),
+        [
+            (1, Picture::Object(guid(&game, fridge)), 32),
+            (2, Picture::Object(guid(&game, plant)), 82)
+        ]
+    );
+
+    // The queued water, taken off: the snack goes on to its end at step
+    // 1136, and nothing follows it.
+    let mut taken_off = open();
+    order(&mut taken_off, fridge, "Have A Snack");
+    order(&mut taken_off, plant, "Water");
+    taken_off.take_sounds();
+    taken_off.press([82 + 22, 32 + 22]);
+    assert_eq!(taken_off.take_sounds(), [delete()]);
+    assert_eq!(mortimer(&taken_off).queue.len(), 1);
+    assert_eq!(taken_off.run(1085), 1085);
+    assert_ne!(mortimer(&taken_off).active.uid, 0);
+    assert_eq!(taken_off.run(1), 1);
+    assert_eq!(mortimer(&taken_off).active.uid, 0);
+    assert!(mortimer(&taken_off).queue.is_empty());
+    assert_eq!(taken_off.caught(), 0, "{:?}", taken_off.errors());
+
+    // Step 899: he eats the snack (object 263), his sixth action, as the
+    // water took the second number; the water waits.
+    assert_eq!(game.run(849), 849);
+    game.render();
+    let snack = 263;
+    let eating = mortimer(&game).active.uid;
+    assert_eq!(eating, 6);
+    assert_eq!(
+        icons(&game),
+        [
+            (6, Picture::Object(guid(&game, snack)), 32),
+            (2, Picture::Object(guid(&game, plant)), 82)
+        ]
+    );
+    assert!(game.queue().icons[0].yellow);
+    game.take_sounds();
+    game.press([32 + 22, 32 + 22]);
+    assert_eq!(game.take_sounds(), [delete()]);
+    assert_ne!(mortimer(&game).active.flags & 0x100, 0);
+    // With the water queued, the cancel queues nothing of its own
+    // (0x45d7c0).
+    assert_eq!(mortimer(&game).queue.len(), 1);
+    // He puts the snack down in front of him at step 1009, and at step
+    // 1028 the water starts.
+    assert_eq!(game.run(128), 128);
+    assert_eq!(mortimer(&game).active.uid, eating);
+    assert_eq!(game.lot().world().objects[&snack].position, [280, 456, 1]);
+    assert_eq!(game.run(1), 1);
+    let watering = mortimer(&game).active;
+    assert_eq!((watering.uid, watering.target), (2, plant as i16));
+    game.render();
+    assert_eq!(icons(&game)[0].0, 2);
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// Moves the pointer straight onto `object` where the frame shows it
+/// (listing its pie), presses it, and presses `label` on the pie.
+fn order(game: &mut Game, object: u16, label: &str) {
+    let at = (0..600)
+        .step_by(4)
+        .flat_map(|y| (0..800).step_by(4).map(move |x| [x, y]))
+        .find(|&p| !game.over_panel(p) && game.under(p) == Some(object))
+        .unwrap_or_else(|| panic!("object {object} is not on screen"));
+    game.hover(at);
+    game.press(at);
+    game.render();
+    let entry = {
+        let menu = game
+            .menu()
+            .unwrap_or_else(|| panic!("object {object}'s pie"));
+        let (_, r) = menu
+            .labels()
+            .into_iter()
+            .find(|(text, _)| *text == label)
+            .unwrap_or_else(|| panic!("{label} on object {object}'s pie"));
+        [r.x + r.width / 2, r.y + r.height / 2]
+    };
+    game.press(entry);
+    assert!(game.menu().is_none());
+    game.render();
+}
+
 fn delete() -> SoundEvent {
     SoundEvent::Play {
         object: -4,
@@ -713,6 +842,108 @@ fn panel(game: &Game, person: u16) -> Shown {
         money,
         hunger,
     }
+}
+
+/// Play mode, as the window runs with `--play`: the snack ordered through
+/// the game's input layer is the scripted snack order (sims-vm's
+/// `the_snack_order_pays_for_the_snack`, `Lot::queue_interaction` after 50
+/// steps). The pointer moves onto the fridge, which lists its pie; a
+/// press opens it, and a press on Have A Snack queues the action the
+/// listing offered (`Lot::pick`). The action queued is the scripted one.
+/// The lots differ until Mortimer takes the order at step 150: the
+/// listing's check trees ran as him, and left his last result and his
+/// stack frame's words. From then on they are the same lot, step for
+/// step, through the snack's end at step 1136, and play mode catches no
+/// error on the way.
+#[test]
+fn the_snack_ordered_in_the_window_is_the_scripted_order() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        play: true,
+        ..options(install.clone())
+    })
+    .expect("the Goth house opens");
+    assert_eq!(game.run(50), 50);
+    game.resize([800, 600]);
+    game.render();
+    let sim = game.lot().world().selected().expect("a Sim is selected");
+    let fridge = 118;
+    // Where the frame shows the fridge, found without moving the pointer,
+    // whose every new object lists a menu that changes the lot.
+    let at = (0..600)
+        .step_by(4)
+        .flat_map(|y| (0..800).step_by(4).map(move |x| [x, y]))
+        .find(|&p| !game.over_panel(p) && game.under(p) == Some(fridge))
+        .expect("the fridge is on screen");
+    game.hover(at);
+    assert_eq!(game.listed(), Some((sim, fridge)));
+    game.press(at);
+    game.render();
+    let snack = {
+        let menu = game.menu().expect("the fridge's pie opens");
+        // The entry is one the fridge's check trees listed, not the
+        // fallback's, so choosing it goes through `Lot::pick`.
+        let entry = menu
+            .entries
+            .iter()
+            .find(|e| e.label == "Have A Snack")
+            .expect("Have A Snack listed");
+        assert!(entry.action.is_some(), "{entry:?}");
+        let (_, r) = menu
+            .labels()
+            .into_iter()
+            .find(|(text, _)| *text == "Have A Snack")
+            .expect("Have A Snack on the pie");
+        [r.x + r.width / 2, r.y + r.height / 2]
+    };
+    game.press(snack);
+    assert!(game.menu().is_none());
+
+    let mut scripted = Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
+    for _ in 0..50 {
+        assert!(scripted.step_play().unwrap().errors.is_empty());
+    }
+    let uid = scripted.queue_interaction(sim, fridge, 1).unwrap();
+    assert_eq!(uid, Some(1));
+    let queue = |lot: &Lot| {
+        format!(
+            "{:?}",
+            lot.world().objects[&sim].person.as_ref().unwrap().queue
+        )
+    };
+    assert_eq!(queue(game.lot()), queue(&scripted));
+    // The listing ran the check trees on the window's lot, which left
+    // Mortimer's last result and frame storage changed until step 150.
+    assert_ne!(game.lot().world().hash(), scripted.world().hash());
+    let doing = |lot: &Lot| {
+        lot.world().objects[&sim]
+            .person
+            .as_ref()
+            .unwrap()
+            .active
+            .uid
+    };
+    for step in 51..=1136 {
+        assert_eq!(game.run(1), 1, "step {step}");
+        let update = scripted.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+        let same = game.lot().world().hash() == scripted.world().hash();
+        assert_eq!(same, step >= 150, "step {step}");
+        match step {
+            150 => assert_eq!(doing(game.lot()), 1),
+            // He pays for the snack, whose action is his fifth.
+            820 => {
+                assert_eq!(game.lot().world().budget.funds, 2537);
+                assert_eq!(doing(game.lot()), 5);
+            }
+            1135 => assert_eq!(doing(game.lot()), 5),
+            1136 => assert_ne!(doing(game.lot()), 5),
+            _ => {}
+        }
+    }
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
 
 #[test]
@@ -966,4 +1197,35 @@ fn the_pie_shows_the_selected_goths_head() {
     );
     assert_eq!(head.rgba[3], 0);
     assert!(game.problems().is_empty(), "{:?}", game.problems());
+}
+
+#[test]
+fn the_job_panel_shows_what_the_next_level_needs() {
+    let Some(install) = install() else {
+        return;
+    };
+    let game = Game::open(&options(install)).expect("the Goth house opens");
+    let mut world = game.lot().world().clone();
+    let mortimer = world.selected().expect("a Sim is selected");
+    let needs = |world: &sims_sim::World| {
+        game.snapshot(world)
+            .resident(mortimer)
+            .expect("Mortimer lives here")
+            .needs
+    };
+    // A Science "Test Subject" moves on to a level that needs nothing.
+    assert_eq!(needs(&world), [0; 6]);
+    // A "Field Researcher" with two points of Logic: "Science Teacher"
+    // needs one of Charisma and three of Logic (work.iff).
+    let data = &mut world
+        .objects
+        .get_mut(&mortimer)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data;
+    data[57] = 2;
+    data[18] = 200;
+    assert_eq!(needs(&world), [0, 0, 100, 0, 300, 0]);
 }
