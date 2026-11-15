@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -97,7 +98,7 @@ class FakeMemory:
     def word(self, p):
         words = {0x20000 + 0xb0: 0x30000, 0x30000 + 0x18: 0x40000, 0x30000 + 0x1c: 0x40004, 0x40000: 0x50000,
                  0x50000 + 0x118: 0x60000, 0x50000 + 0xadc: self.remote.current.get('animator', 0x70000),
-                 0x20000 + 0x98: 100}
+                 0x20000 + 0x98: 100, 0x90010 + 4: self.remote.current.get('result', 0)}
         return words.get(p, 0)
 
     def words(self, p, n, width=4):
@@ -107,7 +108,8 @@ class FakeMemory:
         return 2
 
     def object_id(self, p):
-        return 259 if p == 0x50000 else 0
+        ids = self.remote.current.get('ids', {0x50000: 259})
+        return ids.get(p, 0)
 
     def byte(self, p):
         return 1
@@ -119,6 +121,12 @@ class FakeMemory:
 
     def summary(self, sim, teb):
         return dict(tick=100, lot_rng=1, global_rng=2, crt=3, scheduler_cursor=0)
+
+    def clock(self, sim):
+        return list(self.remote.current.get('clock', [6, 10, 0])), [16, 1, 21, 6, 1997]
+
+    def registry(self, sim):
+        return list(self.remote.current.get('objects', [0x50000]))
 
     def snapshot(self, kind, regs, sim, teb):
         return dict(tick=100), {}, {}
@@ -277,6 +285,281 @@ class CaptureTest(unittest.TestCase):
         missing = SimpleNamespace(returncode=1, stdout='')
         with patch.object(capture.subprocess, 'run', return_value=missing):
             self.assertIsNone(capture.game_identity('sims-harness-input'))
+
+
+class SparseTest(CaptureTest):
+    """--around and --before-hour: which updates are saved, and why."""
+
+    def updates(self, stops, extra, entry=None):
+        # By default update 1's entry has the first return's objects and clock (nothing changes in update 1).
+        if entry is None:
+            entry = {k: stops[0][k] for k in ('objects', 'clock', 'ids') if k in stops[0]}
+        _, output, _ = self.run_capture([dict(pc=0), dict(pc=capture.ENTRY, **entry)] + stops, extra)
+        return output, self.rows(output / 'updates.jsonl')
+
+    def saved(self, rows):
+        return {r['update']: r['saved_for'] for r in rows if 'saved' in r}
+
+    def test_updates_to_hour(self):
+        self.assertEqual(capture.updates_to_hour([6, 59, 58]), 1)
+        self.assertEqual(capture.updates_to_hour([6, 59, 56]), 2)
+        self.assertEqual(capture.updates_to_hour([6, 0, 0]), 1800)
+        self.assertEqual(capture.updates_to_hour([6, 50, 44]), 278)
+
+    def test_a_new_object_saves_its_update_and_the_next_ones(self):
+        stops = [dict(pc=capture.RETURN, objects=[0x50000])] * 2 + \
+                [dict(pc=capture.RETURN, objects=[0x50000, 0x51000])] * 5
+        output, rows = self.updates(stops, ['--updates', '7', '--around', '2', '--full', '1'])
+        self.assertEqual(self.saved(rows), {1: ['full'], 3: ['objects'], 4: ['around'], 5: ['around']})
+        changed = self.events(output, 'objects_changed')
+        self.assertEqual([(e['update'], e['added'], e['removed']) for e in changed],
+                         [(3, [dict(id=0, pointer=0x51000)], [])])
+        self.assertEqual([r['objects'] for r in rows], [1, 1, 2, 2, 2, 2, 2])
+
+    def test_a_removed_object_is_named(self):
+        stops = [dict(pc=capture.RETURN, objects=[0x50000, 0x51000]), dict(pc=capture.RETURN, objects=[0x51000])]
+        output, rows = self.updates(stops, ['--updates', '2', '--around', '1'])
+        changed = self.events(output, 'objects_changed')
+        self.assertEqual(changed[0]['removed'], [dict(id=259, pointer=0x50000)])
+        self.assertEqual(self.saved(rows), {2: ['objects']})
+
+    def test_the_hour_turning_and_a_dialog_save_too(self):
+        stops = [dict(pc=capture.RETURN, clock=[23, 59, 58]), dict(pc=capture.RETURN, clock=[24, 0, 0]),
+                 dict(pc=capture.RETURN, clock=[24, 0, 2]), dict(pc=capture.RETURN, clock=[24, 0, 4]),
+                 dict(pc=capture.DIALOG_SHOW), dict(pc=capture.RETURN, clock=[24, 0, 6]),
+                 dict(pc=capture.RETURN, clock=[24, 0, 8])]
+        output, rows = self.updates(stops, ['--updates', '6', '--around', '1'])
+        self.assertEqual(self.saved(rows), {2: ['hour'], 3: ['around'], 5: ['dialog'], 6: ['around']})
+        self.assertEqual([(e['update'], e['clock'], e['previous']) for e in self.events(output, 'hour_turned')],
+                         [(2, [24, 0, 0], [23, 59, 58])])
+        self.assertEqual(rows[0]['date'], [16, 1, 21, 6, 1997])
+
+    def test_the_last_updates_before_the_hour(self):
+        stops = [dict(pc=capture.RETURN, clock=[6, 59, s]) for s in (52, 54, 56, 58)] + \
+                [dict(pc=capture.RETURN, clock=[7, 0, 0])]
+        output, rows = self.updates(stops, ['--updates', '5', '--before-hour', '2'])
+        self.assertEqual(self.saved(rows), {3: ['before_hour'], 4: ['before_hour']})
+        self.assertEqual(self.events(output, 'objects_changed'), [])
+
+    def test_without_the_options_the_rows_are_as_before(self):
+        _, rows = self.updates([dict(pc=capture.RETURN)], ['--updates', '1', '--full', '1'])
+        self.assertEqual(set(rows[0]), {'update', 'advanced', 'tick', 'lot_rng', 'global_rng', 'crt',
+                                        'scheduler_cursor', 'saved', 'saved_for', 'seconds'})
+
+    def test_a_resumed_run_keeps_its_window(self):
+        def prepare(output):
+            (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
+            (output / 'updates.jsonl').write_text(json.dumps(dict(update=1, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0,
+                                                                  around_until=3, clock=[6, 10, 0])) + '\n')
+        _, output, _ = self.run_capture([dict(pc=capture.RETURN), dict(pc=capture.RETURN), dict(pc=capture.RETURN)],
+                                        ['--updates', '4', '--around', '2', '--resume'], prepare=prepare)
+        rows = self.rows(output / 'updates.jsonl')[1:]
+        self.assertEqual(self.saved(rows), {2: ['around'], 3: ['around']})
+
+    def test_an_object_made_at_a_freed_objects_address_is_another_object(self):
+        stops = [dict(pc=capture.RETURN, objects=[0x50000, 0x51000], ids={0x50000: 259, 0x51000: 7}),
+                 dict(pc=capture.RETURN, objects=[0x50000, 0x51000], ids={0x50000: 999, 0x51000: 7}),
+                 dict(pc=capture.RETURN, objects=[0x51000], ids={0x51000: 7})]
+        output, rows = self.updates(stops, ['--updates', '3', '--around', '1'])
+        changed = [(e['update'], e['added'], e['removed']) for e in self.events(output, 'objects_changed')]
+        self.assertEqual(changed, [(2, [dict(id=999, pointer=0x50000)], [dict(id=259, pointer=0x50000)]),
+                                   (3, [], [dict(id=999, pointer=0x50000)])])
+        self.assertEqual(self.saved(rows), {2: ['objects'], 3: ['objects']})
+
+    def test_a_change_in_update_1_is_seen(self):
+        stops = [dict(pc=capture.RETURN, objects=[0x50000], clock=[7, 0, 0])]
+        output, rows = self.updates(stops, ['--updates', '1', '--around', '1'],
+                                    entry=dict(objects=[0x50000, 0x51000], ids={0x50000: 259, 0x51000: 7},
+                                               clock=[6, 59, 58]))
+        self.assertEqual([e['removed'] for e in self.events(output, 'objects_changed')],
+                         [[dict(id=7, pointer=0x51000)]])
+        self.assertEqual([e['update'] for e in self.events(output, 'hour_turned')], [1])
+        self.assertEqual(self.saved(rows), {1: ['objects', 'hour']})
+
+    def test_the_result_is_the_argument(self):
+        _, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.DIALOG_SHOW),
+            dict(pc=capture.DIALOG_RESULT, result=3), dict(pc=capture.RETURN)], ['--updates', '1'])
+        self.assertEqual([e['result'] for e in self.events(output, 'dialog_result')], [3])
+        self.assertNotIn('result', self.events(output, 'dialog_show')[0])
+
+    def resumed_after(self, status, events=()):
+        """An earlier run recorded update 1 (registry [0x50000] -> 259) and was killed in update 2."""
+        def prepare(output):
+            rows = [dict(kind='baseline', cr3=GAME_CR3)] + list(events)
+            (output / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+            (output / 'updates.jsonl').write_text(json.dumps(dict(
+                update=1, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0, clock=[6, 59, 58])) + '\n')
+            (output / 'status.json').write_text(json.dumps(status))
+        return prepare
+
+    def test_a_resumed_run_knows_the_registry_and_redoes_the_return(self):
+        # Killed in update 2's return after its hour event was written: the event is dropped and written again.
+        hour = dict(kind='hour_turned', update=2, tick=100, clock=[7, 0, 0], previous=[6, 59, 58], time=1)
+        _, output, _ = self.run_capture(
+            [dict(pc=capture.RETURN, objects=[0x50000, 0x51000], ids={0x50000: 259, 0x51000: 7}, clock=[7, 0, 0])],
+            ['--updates', '2', '--around', '1', '--resume'],
+            prepare=self.resumed_after(dict(registry=[[0x50000, 259]], registry_update=1), [hour]))
+        self.assertEqual([e['update'] for e in self.events(output, 'hour_turned')], [2])
+        self.assertEqual([e['added'] for e in self.events(output, 'objects_changed')],
+                         [[dict(id=7, pointer=0x51000)]])
+        self.assertEqual(self.events(output, 'resume_dropped')[0]['events'], [dict(kind='hour_turned', update=2)])
+        status = json.loads((output / 'status.json').read_text())
+        self.assertEqual((status['registry'], status['registry_update']), ([[0x50000, 259], [0x51000, 7]], 2))
+
+    def test_a_registry_from_another_update_is_not_used(self):
+        # An older run's change in the update being redone is kept: this run cannot write it again.
+        change = dict(kind='objects_changed', update=2, tick=100, added=[dict(id=7, pointer=0x51000)], removed=[],
+                      count=2, time=1)
+        _, output, _ = self.run_capture(
+            [dict(pc=capture.RETURN, objects=[0x50000, 0x51000], ids={0x50000: 259, 0x51000: 7})],
+            ['--updates', '2', '--around', '1', '--resume'],
+            prepare=self.resumed_after(dict(registry=[], registry_update=0), [change]))
+        self.assertEqual([e['update'] for e in self.events(output, 'objects_changed')], [2])
+        self.assertEqual(self.events(output, 'resume_dropped'), [])
+        self.assertEqual(len(self.events(output, 'registry_unknown')), 1)
+
+    def test_a_resumed_run_keeps_the_registry_it_was_given(self):
+        # Taken over again before its first return, the next run still finds the registry.
+        _, output, _ = self.run_capture(
+            [dict(pc=capture.RETURN)], ['--updates', '1', '--around', '1', '--resume'],
+            prepare=self.resumed_after(dict(registry=[[0x50000, 259]], registry_update=1)))
+        status = json.loads((output / 'status.json').read_text())
+        self.assertEqual((status['registry'], status['registry_update']), ([[0x50000, 259]], 1))
+
+    def test_a_resumed_run_knows_the_open_dialog(self):
+        shown = dict(kind='dialog_show', update=2, record=0x4000, time=1)
+        pressed = dict(kind='dialog_auto_answer', update=2, record=0x4000, press=1, job=7, time=2)
+        with tempfile.TemporaryDirectory(prefix='sims-guest-test-') as guest_dir, \
+                patch.object(capture, 'DialogAnswerer') as answerer:
+            _, output, _ = self.run_capture(
+                [dict(pc=capture.RETURN, clock=[6, 59, 58])],
+                ['--updates', '2', '--around', '1', '--resume', '--answer-stuck', '100', '--answer-from', '2',
+                 '--guest-dir', guest_dir],
+                prepare=self.resumed_after(dict(registry=[[0x50000, 259]], registry_update=1), [shown, pressed]))
+        # The press the earlier run handed to the guest goes with it, so the dialog's result cancels it.
+        answerer.return_value.shown.assert_called_once_with(2, 0x4000, [7])
+        self.assertEqual(self.events(output, 'resume_open_dialogs')[0]['dialogs'],
+                         [dict(record=0x4000, update=2, jobs=[7])])
+        self.assertEqual(self.saved(self.rows(output / 'updates.jsonl')), {2: ['dialog']})
+
+    def test_negative_windows_are_refused(self):
+        with self.assertRaises(SystemExit), patch.object(sys, 'stderr', io.StringIO()):
+            self.run_capture([dict(pc=0)], ['--around', '-1'])
+
+
+class DialogAnswererTest(unittest.TestCase):
+    def answerer(self, after=0.05):
+        temporary = tempfile.TemporaryDirectory(prefix='sims-answer-test-')
+        self.addCleanup(temporary.cleanup)
+        events, jobs = [], []
+        a = capture.DialogAnswerer(Path(temporary.name), '0xe00013', after, lambda **r: events.append(r),
+                                   Path(temporary.name) / 'input-log.txt', tries=2)
+        self.addCleanup(a.close)
+        def submit(share, script):
+            (share / 'cmd').mkdir(exist_ok=True)
+            jobs.append(script)
+            return len(jobs)
+        patcher = patch.object(capture.guest_jobs, 'submit', side_effect=submit)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return a, events, jobs, Path(temporary.name) / 'input-log.txt'
+
+    def test_a_stuck_dialog_gets_return_twice(self):
+        a, events, jobs, log = self.answerer()
+        a.shown(901)
+        deadline = time.time() + 5
+        while len(events) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.15)
+        self.assertEqual([(e['update'], e['press']) for e in events], [(901, 1), (901, 2)])
+        self.assertIn('key Return', jobs[0])
+        self.assertIn('0xe00013', jobs[0])
+        self.assertIn('dialog of update 901', log.read_text())
+
+    def test_an_answered_dialog_gets_nothing(self):
+        a, events, jobs, _ = self.answerer(after=0.1)
+        a.shown(5)
+        a.answered()
+        time.sleep(0.3)
+        self.assertEqual((events, jobs), ([], []))
+
+    def test_a_result_ends_only_its_own_dialogs_presses(self):
+        a, events, jobs, _ = self.answerer(after=0.1)
+        a.shown(5, 0xa)
+        a.shown(6, 0xb)
+        a.answered(0xb)
+        time.sleep(0.15)
+        a.answered(0xa)
+        time.sleep(0.2)
+        self.assertEqual([(e['kind'], e['update'], e['record']) for e in events],
+                         [('dialog_auto_answer', 5, 0xa), ('dialog_auto_answer_cancelled', 5, 0xa)])
+
+    def test_a_result_cancels_a_press_already_handed_to_the_guest(self):
+        a, events, jobs, _ = self.answerer(after=0.05)
+        a.shown(5, 0xa)
+        deadline = time.time() + 5
+        while not jobs and time.time() < deadline:
+            time.sleep(0.01)
+        a.answered(0xa)
+        cancel = a.share / 'cmd' / '00001.cancel'
+        self.assertTrue(cancel.exists())
+        self.assertEqual(events[-1]['jobs'], [1])
+        # The job itself: with its .cancel file present it stops before the press.
+        bin_ = a.share / 'bin'
+        bin_.mkdir()
+        fake = bin_ / 'xdotool'
+        fake.write_text('#!/bin/sh\necho "$@" >> "$XDOTOOL_LOG"\n')
+        fake.chmod(0o755)
+        job = a.share / 'cmd' / '00001.sh'
+        job.write_text(jobs[0])
+        env = dict(os.environ, PATH=f'{bin_}:{os.environ["PATH"]}', XDOTOOL_LOG=str(a.share / 'xdotool.log'))
+        r = subprocess.run(['/bin/sh', str(job)], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 3)
+        self.assertNotIn('key Return', (a.share / 'xdotool.log').read_text())
+        cancel.unlink()
+        subprocess.run(['/bin/sh', str(job)], env=env, check=True)
+        self.assertIn('key Return', (a.share / 'xdotool.log').read_text())
+
+    def test_the_jobs_of_an_earlier_run_are_cancelled_and_counted(self):
+        a, events, jobs, _ = self.answerer(after=0.05)
+        (a.share / 'cmd').mkdir()
+        a.shown(5, 0xa, [3, 4])  # two of the two tries made already
+        time.sleep(0.15)
+        a.answered(0xa)
+        self.assertEqual(jobs, [])
+        self.assertTrue((a.share / 'cmd' / '00003.cancel').exists() and (a.share / 'cmd' / '00004.cancel').exists())
+        self.assertEqual(events[-1]['jobs'], [3, 4])
+
+    def test_no_return_when_the_window_cannot_be_focused(self):
+        a, events, jobs, _ = self.answerer(after=0.05)
+        a.shown(5, 0xa)
+        deadline = time.time() + 5
+        while not jobs and time.time() < deadline:
+            time.sleep(0.01)
+        a.close()
+        bin_ = a.share / 'bin'
+        bin_.mkdir()
+        (bin_ / 'xdotool').write_text('#!/bin/sh\necho "$@" >> "$XDOTOOL_LOG"\n[ "$1" != windowfocus ]\n')
+        (bin_ / 'xdotool').chmod(0o755)
+        job = a.share / 'cmd' / '00001.sh'
+        job.write_text(jobs[0])
+        log = a.share / 'xdotool.log'
+        env = dict(os.environ, PATH=f'{bin_}:{os.environ["PATH"]}', XDOTOOL_LOG=str(log))
+        r = subprocess.run(['/bin/sh', str(job)], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 4)
+        self.assertNotIn('key Return', log.read_text())
+
+    def test_only_the_open_dialog_is_pressed(self):
+        a, events, jobs, _ = self.answerer(after=0.1)
+        a.shown(5)
+        a.answered()
+        a.shown(6)
+        time.sleep(0.15)
+        a.answered()
+        time.sleep(0.2)
+        self.assertEqual([e['update'] for e in events if e['kind'] == 'dialog_auto_answer'], [6])
+        self.assertEqual([e['update'] for e in events if e['kind'] == 'dialog_auto_answer_cancelled'], [6])
 
 
 class PagesTest(unittest.TestCase):
