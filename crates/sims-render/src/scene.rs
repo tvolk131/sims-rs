@@ -862,9 +862,18 @@ impl Painter<'_> {
                     part_anchor(depth, self.camera, spot, facing, object, level, base)
                 };
                 let depth = &self.depth;
+                // A frame without a depth channel stands flat at its
+                // anchor's depth. None of the base game's objects has one,
+                // and this is not read from the original: it keeps such a
+                // frame drawn rather than lost to byte 255.
+                let flat = part.image.depth.is_none();
                 self.canvas
                     .draw_lit(&part.image, at, part.flip, light, |_, _, byte| {
-                        depth.sprite(anchor, byte)
+                        if flat {
+                            Some(anchor.depth)
+                        } else {
+                            depth.sprite(anchor, byte)
+                        }
                     });
             }
             self.stats.objects += 1;

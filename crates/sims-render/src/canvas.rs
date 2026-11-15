@@ -371,6 +371,69 @@ mod tests {
     }
 
     #[test]
+    fn pixels_fainter_than_the_cutoff_are_not_drawn() {
+        let mut c = Canvas::new(1, 1, [0, 0, 0]);
+        c.draw(
+            &image(1, 1, [255, 255, 255, FAINT - 1], None),
+            [0, 0],
+            false,
+            |_, _, _| 5,
+        );
+        assert_eq!((c.color[0], c.depth[0]), ([0, 0, 0], EMPTY));
+        c.draw(
+            &image(1, 1, [255, 255, 255, FAINT], None),
+            [0, 0],
+            false,
+            |_, _, _| 5,
+        );
+        assert_ne!(c.color[0], [0, 0, 0]);
+        assert_eq!(c.depth[0], 5);
+        // File alpha 8 of 31 (8 * 255 / 31 = 65) is the faintest drawn.
+        assert_eq!(FAINT, (8 * 255 / 31) as u8);
+    }
+
+    #[test]
+    fn walls_win_up_to_one_unit_behind_and_sprites_only_at_ties() {
+        let wall = image(1, 1, [0, 255, 0, 255], None);
+        for (d, wins) in [(9, true), (10, true), (11, true), (12, false)] {
+            let mut c = Canvas::new(1, 1, [0, 0, 0]);
+            c.draw(
+                &image(1, 1, [255, 0, 0, 255], None),
+                [0, 0],
+                false,
+                |_, _, _| 10,
+            );
+            c.draw_wall(&wall, [0, 0], Light::FULL, |_, _| d);
+            let expected = if wins {
+                ([0, 255, 0], d)
+            } else {
+                ([255, 0, 0], 10)
+            };
+            assert_eq!((c.color[0], c.depth[0]), expected, "wall at {d}");
+        }
+        for (d, wins) in [(9, true), (10, true), (11, false)] {
+            let mut c = Canvas::new(1, 1, [0, 0, 0]);
+            c.draw(
+                &image(1, 1, [255, 0, 0, 255], None),
+                [0, 0],
+                false,
+                |_, _, _| 10,
+            );
+            c.draw(&wall, [0, 0], false, |_, _, _| d);
+            let expected = if wins {
+                ([0, 255, 0], d)
+            } else {
+                ([255, 0, 0], 10)
+            };
+            assert_eq!((c.color[0], c.depth[0]), expected, "sprite at {d}");
+        }
+        // A pixel whose depth function gives None is not drawn.
+        let mut c = Canvas::new(1, 1, [0, 0, 0]);
+        c.draw_lit(&wall, [0, 0], false, Light::FULL, |_, _, _| None);
+        assert_eq!(c, Canvas::new(1, 1, [0, 0, 0]));
+    }
+
+    #[test]
     fn depth_bytes_reach_the_depth_function_and_flips_mirror() {
         let mut c = Canvas::new(3, 1, [0, 0, 0]);
         let mut img = image(3, 1, [9, 9, 9, 255], Some(0));
