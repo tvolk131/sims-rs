@@ -639,7 +639,7 @@ impl Machine<'_, '_> {
                         &args,
                         args.len(),
                         crate::TURN_BUDGET,
-                        &mut None,
+                        false,
                     )
                     .map_err(|fault| {
                         Trap::Unsupported(format!(

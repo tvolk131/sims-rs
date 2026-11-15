@@ -82,7 +82,7 @@ impl Machine<'_, '_> {
             });
             return Ok(true);
         }
-        if self.advertisements.is_none() {
+        if !self.checking {
             return Err(Trap::Unsupported(
                 "Add/Change Action String outside autonomy's check trees, where it names the \
                  running interaction (0x41f1ae)"

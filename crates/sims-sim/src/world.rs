@@ -122,6 +122,49 @@ pub struct World {
     /// house is entered and at the start of the Goth house's tick 233,
     /// the first that gives one, as captures of the original show.
     pub action_serial: i32,
+    /// The advertisements of the interaction entry the original keeps
+    /// one copy of (the record at 0x6e5100, which 0x6c437c points to).
+    /// Find Best Interaction copies each entry it may choose over it
+    /// (0x4763c5, from the check 0x458319), the entry's check tree reads
+    /// and writes it (scopes 12, 28 and 29), and the check then adjusts
+    /// it for the room. Nothing else copies over it, so a check tree the
+    /// pie menu runs finds what the last one left. The record always has
+    /// sixteen. None before the first copy: what the record holds then is
+    /// not read. It belongs to the running game, not to the lot.
+    pub advertisement_record: Option<[Advertisement; ADVERTISEMENTS]>,
+}
+
+/// How many advertisements the record of [`World::advertisement_record`]
+/// holds: its count (+4) is 16 in a memory image of the running game, and
+/// the copy (0x4763c5) never changes it.
+pub const ADVERTISEMENTS: usize = 16;
+
+/// One advertisement as the original holds it, in six bytes: a
+/// personality number, a minimum and an amount scaled by the personality.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Advertisement {
+    pub personality: i16,
+    pub minimum: i16,
+    pub delta: i16,
+}
+
+impl Advertisement {
+    /// A field by its place in the original's six bytes: 0 the
+    /// personality number, 1 the minimum, 2 the delta.
+    pub fn field(&self, field: usize) -> i16 {
+        *[self.personality, self.minimum, self.delta]
+            .get(field)
+            .unwrap_or(&self.delta)
+    }
+
+    /// A field to write, by its place as for [`Advertisement::field`].
+    pub fn field_mut(&mut self, field: usize) -> &mut i16 {
+        match field {
+            0 => &mut self.personality,
+            1 => &mut self.minimum,
+            _ => &mut self.delta,
+        }
+    }
 }
 
 /// The house's usage counts: five earlier days and today, each a count of
@@ -392,6 +435,7 @@ impl World {
             usage: HouseUsage::default(),
             routing: Routing::default(),
             action_serial: 0,
+            advertisement_record: None,
         }
     }
 

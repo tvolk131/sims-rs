@@ -414,6 +414,18 @@ fn routing_18_bytes(routing: &sims_sim::route::Routing) -> Vec<u8> {
     bytes
 }
 
+/// A lot's encoding as snapshot format 21 wrote it: without the
+/// advertisement record ([`World::advertisement_record`]) that format 22
+/// added at the end, so a state pinned under format 21 can be shown to be
+/// the same state but for the record. The older formats' encodings start
+/// from this one.
+fn format_21_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let record = postcard::to_allocvec(&world.advertisement_record).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - record.len()), record);
+    bytes
+}
+
 /// An animator's encoding under snapshot format 20: without the carry
 /// layer ([`sims_sim::animator::Animator::carry`]) and its place in the
 /// skin's list ([`sims_sim::animator::Animator::carry_first`]) that
@@ -427,16 +439,16 @@ fn animator_20_bytes(animator: &sims_sim::animator::Animator) -> Vec<u8> {
 
 /// A lot's encoding as snapshot format 20 wrote it: each animator as
 /// [`animator_20_bytes`] writes it, so a state pinned under format 20 can
-/// be shown to be the same state but for the carry layer. The older
-/// formats' encodings start from this one.
+/// be shown to be the same state but for the carry layer. It starts from
+/// [`format_21_bytes`], and the older formats' encodings from this one.
 fn format_20_bytes(world: &World) -> Vec<u8> {
     let blank = World {
         animators: Default::default(),
         ..world.clone()
     };
     splice(
-        &world.encode(),
-        &blank.encode(),
+        &format_21_bytes(world),
+        &format_21_bytes(&blank),
         &postcard::to_allocvec(&world.animators).unwrap(),
         &[0],
         &map_bytes(&world.animators, animator_20_bytes),
@@ -2711,7 +2723,7 @@ fn the_goth_house_first_tick_matches_the_original() {
                 .collect::<Vec<_>>(),
             [(132, 5), (174, 7), (52, 8)]
         );
-        assert_eq!(digest(&world.encode()), TICK_417);
+        assert_eq!(digest(&format_21_bytes(world)), TICK_417);
         // Tick 418: person 21's tree 4113 of object 52 routes to the
         // door's slot with two people in the way, walked in the order of
         // the person vector (0x45bb04). The route goes through, and the
@@ -2729,7 +2741,7 @@ fn the_goth_house_first_tick_matches_the_original() {
             interpreter.lot_update(world, &tuning, &mut player).unwrap();
         }
         assert_eq!(world.ticks, before.ticks + 436);
-        assert_eq!(digest(&world.encode()), TICK_436);
+        assert_eq!(digest(&format_21_bytes(world)), TICK_436);
         // Tick 437: person 16's animator finds its next step blocked, and
         // its route ends blocked (+0x188 = 3, 0x58f682), as the capture
         // shows.
@@ -2753,7 +2765,7 @@ fn the_goth_house_first_tick_matches_the_original() {
             interpreter.lot_update(world, &tuning, &mut player).unwrap();
         }
         assert_eq!(world.ticks, before.ticks + 466);
-        assert_eq!(digest(&world.encode()), TICK_466);
+        assert_eq!(digest(&format_21_bytes(world)), TICK_466);
         // Tick 467: person 21's tree 0x1017 looks for a door beside door
         // 93 with Get Direction To (opcode 12). The direction from 93 to
         // object 126, in the native order (+0xf4 first), is 0, not the 6
@@ -2766,7 +2778,7 @@ fn the_goth_house_first_tick_matches_the_original() {
             interpreter.lot_update(world, &tuning, &mut player).unwrap();
         }
         assert_eq!(world.ticks, before.ticks + 583);
-        assert_eq!(digest(&world.encode()), TICK_583);
+        assert_eq!(digest(&format_21_bytes(world)), TICK_583);
         // Tick 584: person 18's tree 0x1011 runs Snap (opcode 46) to the
         // routing slot of object 207, one level up, and stands where 207
         // stands, as in the capture.
@@ -2777,7 +2789,7 @@ fn the_goth_house_first_tick_matches_the_original() {
             interpreter.lot_update(world, &tuning, &mut player).unwrap();
         }
         assert_eq!(world.ticks, before.ticks + 608);
-        assert_eq!(digest(&world.encode()), TICK_608);
+        assert_eq!(digest(&format_21_bytes(world)), TICK_608);
         // Tick 609: object 260, on a tile of the lot, removes itself
         // (Remove Object Instance): it leaves the lot through the
         // placement and is queued.
@@ -2806,13 +2818,13 @@ fn the_goth_house_first_tick_matches_the_original() {
             interpreter.lot_update(world, &tuning, &mut player).unwrap();
         }
         assert_eq!(world.ticks, before.ticks + 871);
-        assert_eq!(digest(&world.encode()), TICK_871);
+        assert_eq!(digest(&format_21_bytes(world)), TICK_871);
         // Tick 872: object 121, a trash can, clears its headline.
         for _ in 872..=877 {
             interpreter.lot_update(world, &tuning, &mut player).unwrap();
         }
         assert_eq!(world.ticks, before.ticks + 877);
-        assert_eq!(digest(&world.encode()), TICK_877);
+        assert_eq!(digest(&format_21_bytes(world)), TICK_877);
         // Tick 878: the hour turns to 7:00. The save already holds day as
         // the time of day (global 4 is 0 at 6:30), so nothing more happens:
         // no room is marked and the lawn, though global 36 lets it, does not
@@ -2822,7 +2834,7 @@ fn the_goth_house_first_tick_matches_the_original() {
             interpreter.lot_update(world, &tuning, &mut player).unwrap();
         }
         assert_eq!(world.ticks, before.ticks + 900);
-        assert_eq!(digest(&world.encode()), TICK_900);
+        assert_eq!(digest(&format_21_bytes(world)), TICK_900);
         // Tick 901: object 8 reads job data. The capture drew a frame
         // after it, which counts the rooms waiting since earlier changes
         // (rooms 0, 1, 3 and 4 here); in tick 902 person 16's room motive
@@ -2833,7 +2845,7 @@ fn the_goth_house_first_tick_matches_the_original() {
             interpreter.lot_update(world, &tuning, &mut player).unwrap();
         }
         assert_eq!(world.ticks, before.ticks + 991);
-        assert_eq!(digest(&world.encode()), TICK_991);
+        assert_eq!(digest(&format_21_bytes(world)), TICK_991);
         // Tick 992: object 21 snaps into a slot of object 174: its
         // routing slot 0, the second entry of its SLOT chunk, which puts
         // it into the object's container slot. The fifth capture ends
@@ -2842,6 +2854,6 @@ fn the_goth_house_first_tick_matches_the_original() {
             interpreter.lot_update(world, &tuning, &mut player).unwrap();
         }
         assert_eq!(world.ticks, before.ticks + 1000);
-        assert_eq!(digest(&world.encode()), TICK_1000);
+        assert_eq!(digest(&format_21_bytes(world)), TICK_1000);
     });
 }

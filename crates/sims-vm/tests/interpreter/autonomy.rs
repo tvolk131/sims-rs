@@ -127,6 +127,17 @@ fn a_person_chooses_the_best_interaction_and_starts_it() {
     assert_eq!(turn(&mut fx), Status::Yielded);
     // The best entry, menu 5, has flag 0x100: no draw.
     assert_eq!(fx.world.lot_rng, rng);
+    // Each entry the scan may choose was copied over the one
+    // advertisement record. The scan takes a table's entries last to
+    // first, so menu 3's, checked last, stays there.
+    let record = fx.world.advertisement_record.unwrap();
+    assert_eq!(record[5].delta, 10000);
+    assert!(
+        record
+            .iter()
+            .enumerate()
+            .all(|(i, ad)| i == 5 || *ad == Default::default())
+    );
     // Find Best Interaction left the menu in data word 20 and the lamp
     // as the frame's stack object; Gosub Found Action pushed the entry's
     // action tree with the lamp as its stack object and four zero
@@ -443,7 +454,8 @@ fn the_primitives_check_trees_use_fail_loudly_elsewhere() {
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
     assert!(fault.to_string().contains("0x41f1ae"), "{fault}");
-    // The advertisement scopes outside a check tree.
+    // The advertisement scopes before Find Best Interaction first copies
+    // into the record.
     let mut fx = lot(0x100);
     fx.add(
         SIM_FILE,
@@ -451,7 +463,112 @@ fn the_primitives_check_trees_use_fail_loudly_elsewhere() {
         tree(vec![assign(12, 0, scope::LITERAL, 1, RETURN_TRUE)]),
     );
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    assert!(interpreter.turn(&mut fx.world, SIM, 100).is_err());
+    let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
+    assert!(fault.to_string().contains("0x6e5100"), "{fault}");
+}
+
+/// An entry with fewer than sixteen advertisements copies only its own
+/// over the record (0x4763c5); the rest stay as the last copy left them.
+#[test]
+fn an_entry_with_fewer_advertisements_keeps_the_rest_of_the_last_copy() {
+    let shorten = |fx: &mut Fixture, index: usize| {
+        let table = fx
+            .program
+            .libraries
+            .get_mut(&LAMP_FILE)
+            .unwrap()
+            .interactions
+            .get_mut(&TABLE)
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        table.interactions[index].motives.truncate(4);
+    };
+    // Menu 5 is copied first and menu 3, with four, over it: menu 5's
+    // energy delta stays.
+    let mut fx = lot(0x100);
+    shorten(&mut fx, 0);
+    assert_eq!(turn(&mut fx), Status::Yielded);
+    let record = fx.world.advertisement_record.unwrap();
+    assert_eq!(record[5].delta, 20000);
+    // The first copy of the game with fewer than sixteen would keep what
+    // the game's start left, which is not read.
+    let mut fx = lot(0x100);
+    shorten(&mut fx, 1);
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
+    assert!(fault.to_string().contains("0x6e5100"), "{fault}");
+}
+
+/// The room adjustment compares the rooms after the check tree (0x45852f,
+/// 0x458536), and changes the record whatever the check returned.
+#[test]
+fn the_room_adjustment_reads_the_rooms_the_check_left() {
+    const ROOM: i16 = 29;
+    let mut fx = lot(0x100);
+    // Menu 3's check, which runs on the Sim, moves the Sim to room 1 and
+    // fails.
+    fx.add(
+        LAMP_FILE,
+        CHECK,
+        tree(vec![assign(
+            scope::MY_DATA,
+            ROOM,
+            scope::LITERAL,
+            1,
+            RETURN_FALSE,
+        )]),
+    );
+    let table = fx
+        .program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .interactions
+        .get_mut(&TABLE)
+        .unwrap()
+        .as_mut()
+        .unwrap();
+    table.interactions[0].test = CHECK;
+    table.interactions[0].motives[13].minimum = 123;
+    table.interactions[0].motives[13].delta = 456;
+    // Both start in room 0.
+    fx.lamp_mut().data[ROOM as usize] = 0;
+    fx.sim_mut().data[ROOM as usize] = 0;
+    assert_eq!(turn(&mut fx), Status::Yielded);
+    assert_eq!(fx.sim().data[ROOM as usize], 1);
+    // Menu 5 was chosen; menu 3's failed check left its record, adjusted.
+    assert_eq!(fx.sim().data[20], 5);
+    let record = fx.world.advertisement_record.unwrap();
+    assert_eq!((record[13].minimum, record[13].delta), (123, -123));
+}
+
+/// Outside a check tree, the advertisement scopes read and write the
+/// record the last check left (0x453a09 always reads [0x6c437c]), as a
+/// check tree the pie menu runs does.
+#[test]
+fn a_tree_after_a_check_finds_the_record_it_left() {
+    let mut fx = lot(0x100);
+    assert_eq!(turn(&mut fx), Status::Yielded);
+    let mut record = fx.world.advertisement_record.unwrap();
+    fx.add(
+        SIM_FILE,
+        CHOOSE,
+        tree(vec![
+            ins(
+                2,
+                1,
+                RETURN_FALSE,
+                expr(12, 5, op::EQUAL, scope::LITERAL, 10000),
+            ),
+            assign(12, 0, scope::LITERAL, -9, RETURN_TRUE),
+        ]),
+    );
+    fx.world.objects.get_mut(&SIM).unwrap().stack.clear();
+    fx.thread(SIM, CHOOSE, &[]);
+    assert_eq!(turn(&mut fx), Status::Returned(true));
+    record[0].delta = -9;
+    assert_eq!(fx.world.advertisement_record, Some(record));
 }
 
 #[test]
