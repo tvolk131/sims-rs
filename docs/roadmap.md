@@ -66,9 +66,15 @@ events, and what it asks for after them) come first.
   2 continues from there.
 - Of the base neighborhood's houses only the Goths' and the Newbies'
   (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
-  tick 1472, with no recording to compare yet; at tick 1473 object 105
-  gives up a route and needs the route-failure feedback tree (0x45af2a),
-  which is not ported.
+  tick 1802; a route that gives up on a slot it may end near runs the
+  Route failure feedback tree (tick 1473). Against the recording of the
+  house (updates 0 to 935), every update's random streams, scheduler
+  cursor, action serial, globals and objects, and each object's data,
+  temps, attributes, frames and person data match, except the words the
+  original left from memory it never set (person word 37, locals on half
+  a pointer) and global 12 at updates 1 and 3 (the interface's tutorial
+  wait). At tick 1803 object 290 needs Create New Object Instance mode 6
+  with flag 0x4, which track 3 is porting for the Goths' snack order.
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
   read their arrays whole (Arry 11, 12, 111 and 112). UserData2's

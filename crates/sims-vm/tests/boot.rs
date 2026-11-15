@@ -565,3 +565,41 @@ fn strict_mode_runs_to_tick_3432_past_the_school_bus() {
         assert!(stopped.contains(part), "{stopped}");
     }
 }
+
+/// The Newbies' house (House07) after 1802 updates, with `--answers 3`.
+const NEWBIE_1802: &str = "d7980d86529f1b84be10c103d0d522e5484fc54ee2484859beba71b74c8c1d58";
+
+#[test]
+fn a_newbie_gives_up_on_a_route_with_its_failure_feedback() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House07.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    for _ in 1..=1472 {
+        lot.step().unwrap();
+    }
+    let person = |lot: &Lot| lot.world().objects[&105].person.as_ref().unwrap().data[62];
+    assert_eq!(person(&lot), 0);
+    // Tick 1473: person 105's tree 0x1017, on object 64, routes to a slot
+    // it may end near and gives up with result 3 (step 16). It runs
+    // the Route failure feedback tree (0x18e) on object 64 with the
+    // result, which returns in the same update; then the route ends
+    // failed (step 17) and the person's tree goes on.
+    lot.step().unwrap();
+    assert_eq!(person(&lot), 3);
+    let tail: Vec<_> = lot.world().objects[&105]
+        .stack
+        .iter()
+        .rev()
+        .take(2)
+        .map(|f| (f.tree, f.node, f.stack_object))
+        .collect();
+    assert_eq!(tail, [(8300, 5, 105), (8233, 9, 64)]);
+    for _ in 1474..=1802 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.world().hash_hex(), NEWBIE_1802);
+}
