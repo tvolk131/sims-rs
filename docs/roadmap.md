@@ -2100,8 +2100,8 @@ through their public interfaces only; the simulation never depends on it.
   selected Sim's menu on it with `Lot::pie_menu`, which changes the lot
   as the original's listing does; a click opens it. The entries are
   those whose check passes, named as the check tree named them or else
-  by the TTAs strings of the table they came from, with "*" before an
-  entry with flag 0x80; choosing one queues the offered action with
+  by the TTAs strings of the table they came from, with "*" before such
+  an entry with flag 0x80; choosing one queues the offered action with
   `Lot::pick`. Where the simulation has
   not ported something the listing needs, the menu falls back to every
   entry of the table, queued by menu number, and the note across the
@@ -2127,11 +2127,11 @@ through their public interfaces only; the simulation never depends on it.
   (0x58da12), which is not ported, so in strict mode (`Lot::select`)
   switching Sims fails and changes nothing; play mode
   (`Lot::select_play`) leaves the refresh out.
-- **Next:** a real pie.
+- **Next:** draw the menu with `sims_ui::pie` (#157), which is ported
+  from the original's menu window, in place of the plain list.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
-    on Manage Inventory operation 4 and scope 12. Every
-    entry on another person is refused at 0x45d240. A check tree's fault
+    on Manage Inventory operation 4 and scope 12. A check tree's fault
     should keep its trap rather than become `Unsupported` text, which
     `sims-game` reads to tell unported from failed.
   - `sims-render`: which object drew each pixel (an object ID buffer
@@ -2147,15 +2147,12 @@ through their public interfaces only; the simulation never depends on it.
     to find the person a click lands on.
   - `sims-vm`: the animator's refresh (0x58da12), which deselecting a
     Sim makes, so strict mode can switch Sims.
-  - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
-    and dialogs are. `sims-game` draws a plain list until then.
   - `sims-audio`: the inputs the game cannot give yet (the camera
     value of the ambience's cursor, 0x570c3e, is ported, #160): what
     the sound scripts' `getsrcdatafield` fields are (`sims-game`
     answers 0 to every one; an object's place on screen, for its pan,
-    is presumably among them, unread), and what
-    pausing the game does to the sounds playing (the pause events are
-    not ported).
+    is presumably among them, unread), and what pausing the game does
+    to the sounds playing (the pause events are not ported).
 
 ## Working rules
 

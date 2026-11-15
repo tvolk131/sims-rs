@@ -5,9 +5,9 @@
 //! ([`sims_vm::Interpreter::pie_menu`], 0x48d392): each entry of the
 //! object's interaction table whose check passes for that Sim, in order.
 //! Each is named by the name its check tree gave it (Add/Change Action
-//! String, 0x458789), or else by the TTAs strings with the ID of the
-//! TTAB it comes from, by its menu number, with "*" before it when the entry has flag
-//! 0x80, as the original names it. An entry with no string is named by
+//! String, 0x458789), as it is; or else by the TTAs strings with the ID
+//! of the TTAB it comes from, by its menu number, with "*" before it
+//! when the entry has flag 0x80, as the original names it (0x41f167). An entry with no string is named by
 //! its number; a person's TTAs names only its first entry (Talk), so a
 //! person's menu is mostly numbers, as where the original reads the rest
 //! is not found yet.
@@ -143,8 +143,9 @@ fn unported_message(message: &str) -> bool {
 }
 
 /// The entries the simulation's pie menu offered, named: by the name a
-/// check tree gave the entry (Add/Change Action String, 0x458789), or
-/// else by the TTAs strings.
+/// check tree gave the entry (Add/Change Action String, 0x458789), as it
+/// is, or else by the TTAs strings with "*" before a debug entry, as the
+/// original's getter does (0x41f167).
 fn named(lot: &Lot, assets: &Assets, offered: Vec<MenuEntry>) -> Result<Vec<Entry>, String> {
     let mut labels: BTreeMap<u16, Option<StringTable>> = BTreeMap::new();
     let mut out = Vec::new();
@@ -169,17 +170,22 @@ fn named(lot: &Lot, assets: &Assets, offered: Vec<MenuEntry>) -> Result<Vec<Entr
                 .find(|i| i.string_index == menu)
                 .is_some_and(|i| i.flags & DEBUG != 0)
         });
-        let name = match name {
+        // The name a check tree gave is shown as it is; an entry without
+        // one, or with an empty one, is named by the TTAs strings, with
+        // "*" before a debug entry (0x41f167).
+        let label = match name.filter(|n| !n.is_empty()) {
             Some(name) => name,
-            None => labels
-                .entry(target)
-                .or_insert_with(|| found.and_then(|f| self::labels(assets, f.resource, f.id)))
-                .as_ref()
-                .and_then(|l| l.get(menu as usize, LANGUAGE))
-                .filter(|l| !l.trim().is_empty())
-                .map_or_else(|| format!("Interaction {menu}"), str::to_owned),
+            None => {
+                let name = labels
+                    .entry(target)
+                    .or_insert_with(|| found.and_then(|f| self::labels(assets, f.resource, f.id)))
+                    .as_ref()
+                    .and_then(|l| l.get(menu as usize, LANGUAGE))
+                    .filter(|l| !l.trim().is_empty())
+                    .map_or_else(|| format!("Interaction {menu}"), str::to_owned);
+                if debug { format!("*{name}") } else { name }
+            }
         };
-        let label = if debug { format!("*{name}") } else { name };
         out.push(Entry {
             menu,
             label,

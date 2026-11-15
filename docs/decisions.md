@@ -45,6 +45,7 @@ selected Sim (0x44123f) reaches the new path, which still fails there
 Goth run removes no selected Sim. Reopen when 0x58da12 is ported, or
 when a recording of play selects a Sim.
 
+
 ## 2026-11-15: The game lists the pie menu on the lot when the pointer reaches an object
 
 When the pointer first reaches an object or a person on the lot, the
@@ -56,10 +57,12 @@ drawn, the object under the pointer is looked up again. Nothing is
 listed over the panel, a dialog or a menu, or once the lot has stopped.
 A click opens that listing (or lists now, when the pointer did not move
 onto the object first). Only the entries whose check passes are shown,
-in the original's order, each named by the TTAs strings with the ID of
-the TTAB the simulation reads, by its menu number (or by the name a
-check tree gave it with Add/Change Action String, #140, as the fridge's
-meals are named), with "*" before it when the entry has flag 0x80. Choosing one queues the very action
+in the original's order. An entry a check tree named with Add/Change
+Action String (#140, as the fridge's meals are named) shows that name as
+it is; any other, or one named with an empty string, is named by the
+TTAs strings with the ID of the TTAB the simulation reads, by its menu
+number, with "*" before it when the entry has flag 0x80, as the
+original's getter does (0x41f167). Choosing one queues the very action
 offered (`Lot::pick`). Where the simulation has not ported something the
 listing needs (a trap of an unsupported kind, scope or primitive: an object
 offers nothing; a version 0 table), the lot is unchanged, the menu shows every entry of the table
