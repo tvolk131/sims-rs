@@ -1565,8 +1565,12 @@ Progress:
 - Done: the grass at other rotations. The sun no longer turns with the
   camera, as in the original. At far zoom, rotation 3, open grass rose
   from 13% to 99% exact, and the whole screen from 23% to 81%.
-- Next: object placement and depth at medium zoom; lamps, which are not
-  drawn; the cap where a cut wall meets a standing one.
+- Done: objects sit one pixel right of the point the camera projects
+  them to, as in the original. At the three compared cameras the house
+  box rose from 74% to 89% (medium zoom), 76% to 89% (far zoom,
+  rotation 0) and 74% to 89% (far zoom, rotation 3).
+- Next: lamps, which are not drawn; the cap where a cut wall meets a
+  standing one.
 
 ## Track: sound (`crates/sims-audio`)
 
