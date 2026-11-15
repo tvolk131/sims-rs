@@ -138,15 +138,14 @@ fn the_player_answers_the_help_dialog_from_the_window() {
         ..options(install.clone())
     })
     .expect("the Goth house opens");
-    // Tick 2 shows the Help System's dialog, Yes and No, and the lot waits.
-    assert_eq!(game.run(10), 1);
+    // Tick 2 shows the Help System's dialog, Yes and No, and the lot
+    // waits; what was owed beyond it is dropped.
+    assert_eq!(game.advance(149_999), 1);
     assert_eq!(game.stopped(), None);
     let shown = game.asking().expect("a dialog waits").shown.clone();
     assert_eq!(shown.answers, &[2, 3]);
     let waiting = game.lot().world().hash();
-    // Time goes by, but the lot does not, and none of it is owed after.
-    assert_eq!(game.advance(1_000_000), 0);
-    assert_eq!(game.advance(49_999), 0);
+    // The lot does not go on while it waits.
     assert_eq!(game.run(10), 0);
     assert_eq!(game.lot().world().hash(), waiting);
     game.resize([800, 600]);
@@ -158,10 +157,13 @@ fn the_player_answers_the_help_dialog_from_the_window() {
     let no = layout.buttons[1];
     game.press([no.x + no.width / 2, no.y + no.height / 2]);
     assert!(game.asking().is_none(), "{:?}", game.stopped());
-    // The answered tick ran at once.
+    // The answered tick ran at once, and the 49.999 ms owed when the
+    // dialog came were dropped.
     assert_eq!(game.lot().ticks(), 2);
     assert_eq!(game.advance(1), 0);
-    assert_eq!(game.run(198), 198);
+    // From there time is owed as before: with that 1 µs, a tick.
+    assert_eq!(game.advance(49_999), 1);
+    assert_eq!(game.run(197), 197);
     assert_eq!(game.stopped(), None);
     let mut listed = Game::open(&options(install)).expect("the Goth house opens");
     assert_eq!(listed.run(200), 200);

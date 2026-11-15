@@ -252,8 +252,12 @@ impl Game {
                     }
                     self.keep_sounds(update.sounds);
                 }
-                // The tick shows a dialog: it runs once it is answered.
-                Err(StepError::Asking { .. }) => break,
+                // The tick shows a dialog: it runs once it is answered,
+                // and no time is owed from before the wait.
+                Err(StepError::Asking { .. }) => {
+                    self.pace.restart();
+                    break;
+                }
                 Err(error) => {
                     // A strict step whose frame failed after its tick ran
                     // still made that tick's sounds.
