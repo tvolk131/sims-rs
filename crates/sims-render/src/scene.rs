@@ -884,6 +884,9 @@ impl Painter<'_> {
                         .light_at((level - 1) as usize, [o.position[0], o.position[1]]),
                 )
             };
+            // Each pixel the object draws names it, for a click
+            // (`Canvas::id_at`).
+            self.canvas.set_id(Some(id));
             for part in parts {
                 if !sprite_visible(part.sprite, definition.dynamic_base, &o.dynamic_sprites) {
                     continue;
@@ -924,6 +927,7 @@ impl Painter<'_> {
                         }
                     });
             }
+            self.canvas.set_id(None);
             self.stats.objects += 1;
         }
     }

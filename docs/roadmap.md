@@ -1923,6 +1923,11 @@ Progress:
   shows the side facing view (−1, 1) (0x53f6c1, 0x53d93a); ours shows
   the same lot side at every rotation. The one column where the wall
   shows matches neither side until its texel offset is read.
+- Done: which object or person drew each pixel, for clicks:
+  `Canvas::id_at` after `sims_render::draw` and `People::draw_on_lot`.
+  Objects name themselves, people their object ID, and terrain, floors
+  and walls nobody. The game window can pick by it instead of by tile.
+  How the original finds what a click hit is not read.
 - Done: the pools of light lit lamps throw on the floor, from the
   game's `lightMap.dat`, and lit lamps drawn in full light, as the
   original does. With the world at the screenshots' time, near zoom

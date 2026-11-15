@@ -147,6 +147,11 @@ pub trait Target {
     /// Writes a texel that passed: its colour times `shade` (from 0.45 in
     /// shadow to 1 facing the light). Its alpha is never 0.
     fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32);
+    /// Says whose pixels are written from now on: a person's object ID,
+    /// or None once they are drawn. A target that keeps, per pixel, what
+    /// drew it (the lot renderer's canvas, `sims_render::Canvas::id_at`)
+    /// notes it; by default nothing does.
+    fn set_id(&mut self, _id: Option<u16>) {}
 }
 
 impl Target for Canvas {
