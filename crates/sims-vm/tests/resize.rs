@@ -2187,6 +2187,7 @@ fn the_goth_house_first_tick_matches_the_original() {
     const TICK_408_19: &str = "7a9c943eba9536e011feafaf60b611e9d9accad6a0a50f8c13856dc72d4cb4d1";
     const TICK_417: &str = "e5b71ee022f181d8de6c5e72b9877002cfc7ba466e898e0105220e6287df6938";
     const TICK_436: &str = "5a60a15adc651b9d00329105701dd6c7841ab0fcbfb45b579a4e6cf46d8ecb6b";
+    const TICK_466: &str = "7dd965a56f279614b46c16223faf1abad52290db1940fa293a082e559449b9cd";
     const TICK_416_20: &str = "37ff5756ac5cf26769da735eadb955be4f78f64381ea8b847963298b51f8320b";
     const USES_233: [(i16, i32); 2] = [(132, 5), (51, 8)];
     const TREES_233: [u16; 9] = [
@@ -2722,11 +2723,35 @@ fn the_goth_house_first_tick_matches_the_original() {
         }
         assert_eq!(world.ticks, before.ticks + 436);
         assert_eq!(digest(&world.encode()), TICK_436);
-        // Tick 437: person 16's animator finds its next step blocked
-        // (0x58f682), which is not ported.
+        // Tick 437: person 16's animator finds its next step blocked, and
+        // its route ends blocked (+0x188 = 3, 0x58f682), as the capture
+        // shows.
+        interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        assert_eq!(world.animators[&16].arrival, 3);
+        // Tick 438: the route stops short (step 10) and tries again (step
+        // 6), finds no way and gives up (step 16) with the result the
+        // planning left in the context, 13 (its refusals); the walk goes
+        // on to door 87, as in the capture.
+        interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        let person = &world.objects[&16];
+        assert_eq!(person.person.as_ref().unwrap().data[62], 13);
+        assert_eq!(
+            person.stack[person.stack.len() - 2..]
+                .iter()
+                .map(|f| (f.tree, f.node, f.stack_object))
+                .collect::<Vec<_>>(),
+            [(4105, 1, 87), (4112, 5, 87)]
+        );
+        for _ in 439..=466 {
+            interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        }
+        assert_eq!(world.ticks, before.ticks + 466);
+        assert_eq!(digest(&world.encode()), TICK_466);
+        // Tick 467: person 21's tree 0x1017 runs Get Direction To (opcode
+        // 12), which is not ported.
         let error = interpreter
             .lot_update(world, &tuning, &mut player)
             .unwrap_err();
-        assert!(error.to_string().contains("next step blocked"), "{error}");
+        assert!(error.to_string().contains("primitive 12"), "{error}");
     });
 }

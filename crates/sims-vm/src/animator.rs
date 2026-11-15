@@ -323,6 +323,9 @@ const SMALL_STEER: F32 = F32::from_bits(0x3d69_78d5);
 const THIRD: F32 = F32::from_bits(0x3eaa_aaab);
 const SIXTEEN: F32 = F32::from_bits(0x4180_0000);
 const TICK_MILLISECONDS: i32 = 42;
+/// The route's end (+0x188) when the walk's next step is blocked
+/// (0x58edeb, 0x58f682).
+const BLOCKED: i32 = 3;
 /// Bounds of the turn clips (0x6d07c4, 0x6d07c8; 3 is 0x6d07cc).
 const TURN_HALF: F32 = F32::from_bits(0x3f00_0000);
 const TURN_ONE_AND_HALF: F32 = F32::from_bits(0x3fc0_0000);
@@ -931,7 +934,8 @@ impl Interpreter<'_> {
     /// foreground clip it first takes its last step once more (0x58e897,
     /// [`Interpreter::walk_step`]), and then the destination becomes the new
     /// position, direction included (0x58f057). The state's code runs
-    /// again (0x58f089).
+    /// again (0x58f089). A blocked step goes to the update's tail
+    /// instead (0x58f682).
     ///
     /// For a person whose object data word 9 is clear the animator slows
     /// to a stop on a timer ([`Interpreter::stop_on_timer`], 0x58e8be).
@@ -1002,7 +1006,9 @@ impl Interpreter<'_> {
         }
         let [sx, sy] = a.motion.step.map(F32::ext);
         let square = ((sy * sy).single() + (sx * sx).single()).single();
-        self.walk_step(world, id, a, [sx, sy], square)?;
+        if !self.walk_step(world, id, a, [sx, sy], square)? {
+            return Ok(Next::Done);
+        }
         a.destination = a.position;
         Ok(Next::Again)
     }
@@ -1266,9 +1272,10 @@ impl Interpreter<'_> {
     ///    0x38, 0x585502), along the offset made one long. Its end,
     ///    rounded to whole units, is moved onto the person's path where
     ///    the path is nearer ([`snap_to_path`], 0x48313e), and the person must fit
-    ///    there (virtual function 0x54, [`Interpreter::fits`]; a person
-    ///    who does not goes to 0x58f682, not ported, and fails). The
-    ///    person is put there (virtual function 0x88, 0x45e4e9: the
+    ///    there (virtual function 0x54, [`Interpreter::fits`]). A person
+    ///    who does not stays put: the route's end becomes 3 (0x58f682)
+    ///    and the update goes to its tail. Otherwise the person is put
+    ///    there (virtual function 0x88, 0x45e4e9: the
     ///    placement, 0x433340, telling the registry, then the room,
     ///    0x45e43d) and the animator's position becomes the step's end,
     ///    unrounded.
@@ -1369,7 +1376,9 @@ impl Interpreter<'_> {
     /// step is kept ([`sims_sim::animator::Motion::step`]). Its end,
     /// rounded to whole units, is moved onto the person's path, the
     /// person must fit there, and is put there; the animator's position
-    /// becomes the step's end, unrounded. See [`Interpreter::walk`].
+    /// becomes the step's end, unrounded. Returns false, with the route's
+    /// end set to 3 and nothing moved, when the person does not fit
+    /// there. See [`Interpreter::walk`].
     fn walk_step(
         &self,
         world: &mut World,
@@ -1377,7 +1386,7 @@ impl Interpreter<'_> {
         a: &mut Animator,
         offset: [Ext; 2],
         distance: Ext,
-    ) -> Result<(), Trap> {
+    ) -> Result<bool, Trap> {
         let layer = a.foreground.as_ref().ok_or_else(|| {
             unsupported(
                 "0x58edf6",
@@ -1418,7 +1427,10 @@ impl Interpreter<'_> {
             .position[2];
         let to = [first, second];
         if !self.fits(world, id, to, level).map_err(|f| f.trap)? {
-            return Err(unsupported("0x58f682", "finds its next step blocked"));
+            // 0x58eecb to 0x58f682: the route ends blocked (3), and the
+            // update goes to its tail.
+            a.arrival = BLOCKED;
+            return Ok(false);
         }
         // What the placement runs may read the animator; it sees it as the
         // original's would be.
@@ -1429,7 +1441,7 @@ impl Interpreter<'_> {
         }
         a.position[0] = x.to_f32();
         a.position[1] = y.to_f32();
-        Ok(())
+        Ok(true)
     }
 
     /// A walking person put on a tile (the person's virtual function
