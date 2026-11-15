@@ -4,6 +4,41 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: Pausing holds the sounds playing, as the original's sound manager does
+
+The sound's pause and unpause, kinds 21 and 22, are ported from the
+original's dispatcher (0x573c20, 0x573c44), as `SoundEvent::Pause` and
+`SoundEvent::Unpause` and as HOT events of those kinds. The game sends them
+from its mode handler (0x4ce470, through 0x57a7f2 and 0x57a8e3): pause when
+it leaves live mode or pauses in it, unpause when it is back in live mode
+and not paused.
+
+A pause (0x57481e) marks every track that is running held (each track's
++0x1c8, through vtable +0x58, 0x57dc2e), except five: `ui_click`,
+`MainMusicLoop` and the three speed buttons' sounds (0x5748a2). A held
+track's update (0x57d7cd) does nothing, so its script waits and does not
+fade, and its buffer stops where it is. Here its threads are skipped and
+its notes neither advance nor sound. The pause also writes 0 to
+`main_duckpri` (0x57d361), which here drops every thread's ducking
+request. In music mode 0 the current ambience player is paused too
+(vtable +0x7c, 0x5773af): its update returns at once (0x577af9) until it
+is unpaused, while its cells' sounds play on. Starting a track
+(0x57d960) clears its hold, so a sound started while paused plays (the
+buy mode's clicks do). An unpause (0x574904) lets every track go
+(0x57cd2c, vtable +0x5c on each) and unpauses the current ambience
+player, whatever the music mode.
+
+Not ported: the day and night loop (0x574978), which the pause stops and
+the unpause restarts, and the music the unpause restarts (0x575155); this
+player has neither. The original stamps a resumed track with the manager's
+time (+0x198); what reads the stamp is not known, and nothing here
+replaces it. Where the original keeps one object per track, a track here
+can have several threads, and the hold is per track, so starting a
+track while paused lets its older threads go on as well.
+
+**Unverified:** nothing of this has been compared with the running game.
+Reopen when a capture with sound can be compared.
+
 ## 2026-11-15: Sound scripts ask about an object as the original answers
 
 `getsrcdatafield` passes the values of both its source registers, the
