@@ -129,8 +129,11 @@ pub struct World {
     /// and writes it (scopes 12, 28 and 29), and the check then adjusts
     /// it for the room. Nothing else copies over it, so a check tree the
     /// pie menu runs finds what the last one left. The record always has
-    /// sixteen. None before the first copy: what the record holds then is
-    /// not read. It belongs to the running game, not to the lot.
+    /// sixteen. None until something first writes it, which stands for
+    /// what the game's start leaves there: sixteen advertisements of 0
+    /// (the record's constructor 0x475e23, run by the static initializer
+    /// 0x458271 from the start-up table at 0x6c0154, zeroes each one). It
+    /// belongs to the running game, not to the lot.
     pub advertisement_record: Option<[Advertisement; ADVERTISEMENTS]>,
     /// The neighborhood's families, in the order the neighborhood's
     /// reload sorts them. See [`Family`]. Like the neighborhood's
