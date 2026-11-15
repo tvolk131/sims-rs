@@ -19,8 +19,28 @@
 //!   chosen (`routing/portals.rs`), and its door tree is pushed on the
 //!   person's thread; the step stays 2 while that tree runs.
 //! - **18**: the route there is planned (0x45c38e); with a route ready
-//!   (2), the next step is 12. With no way found (0) the next step is 6,
-//!   which is not ported.
+//!   (2), the next step is 12. With no way found (0) the next step is 6.
+//! - **6**, trying again (0x45b066), by the context's retry count
+//!   (+0x58, as a 16-bit number): at 0 the person's place is compared
+//!   with the one noted (+0x60, +0x64) and noted in its place; moved
+//!   more than 8 units (squared 0x40), the count stays 0 and the next
+//!   step is 1, else the count becomes 1 and step 6 runs again. At 1 the
+//!   count becomes 2; with no person asked yet (context +0x80) another
+//!   person in the way is looked for and asked to move
+//!   (`primitives/in_way.rs`): asked, the next step is 14, else 16. At 2
+//!   the count becomes 3 and the next step is 1; at 3 the next step is
+//!   16; any other count goes to step 7.
+//! - **14**, waiting for the person asked (0x45b475): with none asked
+//!   the next step is 1 (and the count goes back to 0 when the asked
+//!   person moved, context byte +0x84). Else, the first time, "route ask
+//!   to move animation" is pushed on the thread with the person asked as
+//!   its stack object and the tick noted (+0x5c); for the next 100 ticks
+//!   "route waiting animation" is pushed; after that the noted tick is
+//!   cleared and the next step is 6. The step stays 14 while those trees
+//!   run.
+//! - **16**, giving up (0x45aef7): the context's result becomes 1 when
+//!   it was 0, the next step is 7 and person word 62 takes the result.
+//! - **7**: the route ends as failed ([`Machine::end_route`]).
 //! - **12**: the animator starts the route (0x589c85); the next step is 3
 //!   and the thread yields.
 //! - **3**, on the ticks after: while the animator's route is under way
@@ -29,21 +49,36 @@
 //! - **9**: the animator stops (0x589e2d); the next step is 8.
 //! - **8**: the route ends ([`Machine::end_route`]): the result is true.
 //!
-//! The steps run one after another in a run until one yields. Every run
-//! works on the person's last context; its words +0x58, +0x60 and +0x64
-//! are put back as they were at the run's start when the run ends.
+//! The steps run one after another in a run until one yields or pushes a
+//! tree. Every run works on the person's last context. Its retry count
+//! (+0x58) and noted place (+0x60, +0x64) are read into the run at its
+//! start and written back when the run ends, before a door tree or an
+//! animation is pushed, and not after the route ended (0x45b9a0).
+//!
+//! When a route ends, every other person's last context that asked this
+//! person to move with this person's running action forgets it (byte
+//! +0x84 noting whether that route was under way), and the action this
+//! route asked another person to do is taken out of that person's queue
+//! (0x45d5f8), the action's object told it was cancelled.
 //!
 //! Go To Relative Position (opcode 27, 0x45c634) runs the same steps
 //! with a slot record it makes from its operands instead of one of the
 //! object's slots ([`relative_slot`]).
 //!
+//! A slot record an object holds in place of its type's (the move slot
+//! of the marker made to ask a person to move, `world.routing.slots`) is
+//! used instead of the type's slot.
+//!
 //! Ported from the original's code. What the Goth house's routes to
-//! update 261 do not reach fails loudly: slots named any way but by a
+//! update 367 do not reach fails loudly: slots named any way but by a
 //! literal, a stack object that is missing or off the lot in a later
 //! step, a person with bit 0 of word 68 set or other contexts, a person
 //! who wants to be interrupted, a person sitting (posture 1), no door to
 //! go through, a route that stops short of the path's end (step 10),
-//! every other step and every other result of the planning.
+//! giving up with the route's slot flags read (step 16 on a later run,
+//! 0x45af20, and the failure feedback tree, 0x45af2a), ending a route
+//! while the asked person runs the action (0x45d5f8), every other step
+//! and every other result of the planning.
 
 use crate::animator::stop_route;
 use crate::fault::{Fault, Trap};
@@ -76,12 +111,24 @@ const NEW: i32 = 0;
 const CANDIDATES: i32 = 1;
 const PORTAL: i32 = 2;
 const UNDER_WAY: i32 = 3;
+const RETRY: i32 = 6;
 const FAILED: i32 = 7;
 const SUCCEEDED: i32 = 8;
 const ARRIVED: i32 = 9;
 const STOPPED: i32 = 10;
 const START: i32 = 12;
+const ASK: i32 = 14;
+const GIVE_UP: i32 = 16;
 const PLAN: i32 = 18;
+
+/// The trees a person asking another to move plays (0x6c4554, 0x6c453c).
+const ASK_TREE: &str = "route ask to move animation";
+const WAIT_TREE: &str = "route waiting animation";
+/// How many ticks a person waits for one asked to move (0x45b56e).
+const WAIT: i32 = 100;
+/// The squared distance a person must have moved since the last try for
+/// step 6 to plan again at once (0x45b0a1).
+const MOVED: i32 = 0x40;
 
 /// An object's type: a door.
 const DOOR: i16 = 8;
@@ -203,6 +250,19 @@ impl Machine<'_, '_> {
             .filter(|&i| i < slots.len())
             .ok_or(Trap::native(0x25, "Go To Routing Slot names no slot"))?;
         let key = (target, index as u16);
+        let near = |flags: i32| {
+            if operands[4] & 1 == 0 {
+                flags | NEAR
+            } else {
+                flags & !NEAR
+            }
+        };
+        if let Some(record) = self.world.routing.slots.get_mut(&key) {
+            // A record written over (a marker's first slot, 0x45c2ab).
+            record.flags = near(record.flags);
+            let slot = *record;
+            return self.route_steps(Some(slot));
+        }
         let flags = self
             .world
             .routing
@@ -210,10 +270,7 @@ impl Machine<'_, '_> {
             .get(&key)
             .copied()
             .unwrap_or(slots[index].flags as i32);
-        let mut flags = flags & !NEAR;
-        if operands[4] & 1 == 0 {
-            flags |= NEAR;
-        }
+        let flags = near(flags);
         if flags == slots[index].flags as i32 {
             self.world.routing.slot_flags.remove(&key);
         } else {
@@ -239,6 +296,9 @@ impl Machine<'_, '_> {
     /// The route's steps (0x45ad63).
     fn route_steps(&mut self, slot: Option<sims_sim::route::RouteSlot>) -> Result<Flow, Trap> {
         let me = self.me;
+        // The slot record the first run is given; later runs are given
+        // none (0x45ad54).
+        let slot_record = slot;
         let target = self.frame()?.stack_object;
         let target = u16::try_from(target)
             .ok()
@@ -292,7 +352,11 @@ impl Machine<'_, '_> {
                 "with byte +0x78 of its context clear",
             ));
         }
-        let saved = (ctx.word_58, ctx.saved);
+        // The retry stage (+0x58) and the place of the last try (+0x60,
+        // +0x64) are the run's own; they are written back when the run
+        // yields or pushes a tree.
+        let mut retry = ctx.word_58;
+        let mut spot = ctx.saved;
         let mut result = 2;
         let interpreter = self.interpreter();
         let mut path = self
@@ -358,14 +422,9 @@ impl Machine<'_, '_> {
                         .map_err(inner)?;
                     result = planned;
                     if planned == 0 {
-                        // 0x45b2ab: no way; step 6 (0x45b066) tries again,
-                        // and asks a person in the way to move (0x45ba28,
-                        // step 14).
-                        return Err(unsupported(
-                            "0x45b066",
-                            "whose planning found no way: step 6, which tries again and asks \
-                             a person in the way to move (0x45ba28)",
-                        ));
+                        // 0x45b2ab: no way.
+                        state = RETRY;
+                        continue;
                     }
                     if planned != 2 {
                         return Err(unsupported(
@@ -407,8 +466,8 @@ impl Machine<'_, '_> {
                     // step and the context's saved words are written before
                     // the tree is pushed, as the frame changes with it.
                     ctx.word_68 = i32::from(door);
-                    ctx.word_58 = i32::from(saved.0 as i16);
-                    ctx.saved = saved.1;
+                    ctx.word_58 = i32::from(retry as i16);
+                    ctx.saved = spot;
                     self.store_route(&ctx, &path);
                     self.frame_mut()?.primitive_state = PORTAL;
                     self.enter_door(door, tree)?;
@@ -469,16 +528,120 @@ impl Machine<'_, '_> {
                     // which is not modeled.
                     state = SUCCEEDED;
                 }
-                SUCCEEDED => return self.end_route(state, ctx, &path),
+                RETRY => match retry as i16 {
+                    // 0x45b066: once the person has moved more than 8
+                    // since the last try, plan again at once; else go on.
+                    0 => {
+                        let [first, second, _] = self.me()?.position;
+                        let at = [second, first];
+                        let dx = at[0].wrapping_sub(spot[0]);
+                        let dy = at[1].wrapping_sub(spot[1]);
+                        spot = at;
+                        if dx.wrapping_mul(dx).wrapping_add(dy.wrapping_mul(dy)) > MOVED {
+                            retry = 0;
+                            state = CANDIDATES;
+                        } else {
+                            retry = 1;
+                        }
+                    }
+                    // 0x45b0b9: ask whoever is in the way to move.
+                    1 => {
+                        retry = 2;
+                        state = if ctx.objects[1] == 0 && self.find_in_way(&mut ctx)? {
+                            ASK
+                        } else {
+                            GIVE_UP
+                        };
+                    }
+                    2 => {
+                        retry = 3;
+                        state = CANDIDATES;
+                    }
+                    3 => state = GIVE_UP,
+                    _ => state = FAILED,
+                },
+                ASK => {
+                    // 0x45b475.
+                    if self.wants_interrupt()? {
+                        return Err(unsupported(
+                            "0x45b480",
+                            "for a person who wants to be interrupted",
+                        ));
+                    }
+                    if ctx.objects[1] == 0 {
+                        // Released by the person asked (0x45b8f4).
+                        state = CANDIDATES;
+                        if ctx.byte_84 {
+                            retry = 0;
+                        }
+                        ctx.time = 0;
+                        continue;
+                    }
+                    let clock = self.world.ticks as i32;
+                    let (name, stack_object) = if ctx.time == 0 {
+                        (ASK_TREE, Some(ctx.objects[1]))
+                    } else if clock.wrapping_sub(ctx.time) < WAIT {
+                        (WAIT_TREE, None)
+                    } else {
+                        ctx.time = 0;
+                        state = RETRY;
+                        continue;
+                    };
+                    let owner = self.definition(self.me()?.guid)?.resource;
+                    let Some(tree) = self
+                        .program
+                        .named_tree(owner, name)
+                        .map_err(Trap::Unsupported)?
+                    else {
+                        ctx.time = 0;
+                        state = RETRY;
+                        continue;
+                    };
+                    // The step stays 14 while the tree runs. The context
+                    // and the step are written before the tree is pushed,
+                    // as the frame changes with it.
+                    if stack_object.is_some() {
+                        ctx.time = clock;
+                    }
+                    ctx.word_58 = i32::from(retry as i16);
+                    ctx.saved = spot;
+                    self.store_route(&ctx, &path);
+                    self.frame_mut()?.primitive_state = ASK;
+                    self.play(tree, stack_object)?;
+                    return Ok(Flow::Pushed);
+                }
+                GIVE_UP => {
+                    // 0x45aef7.
+                    if ctx.result == 0 {
+                        ctx.result = 1;
+                    }
+                    state = FAILED;
+                    self.set_person_word(ROUTE_RESULT, ctx.result as i16)?;
+                    let Some(slot) = slot_record else {
+                        return Err(unsupported(
+                            "0x45af20",
+                            "giving up on a later run, where the original reads the slot \
+                             record through a null pointer",
+                        ));
+                    };
+                    if slot.flags & NEAR != 0 {
+                        return Err(unsupported(
+                            "0x45af2a",
+                            "giving up on a slot it may end near: the Route failure feedback \
+                             tree (step 17)",
+                        ));
+                    }
+                }
+                FAILED | SUCCEEDED => return self.end_route(state, ctx, &path),
                 other => {
                     return Err(unsupported("0x45aef0", &format!("at step {other}")));
                 }
             }
         }
-        // 0x45b9a0: the step is kept in the frame, and the context's words
-        // +0x58 (as a 16-bit word), +0x60 and +0x64 put back.
-        ctx.word_58 = i32::from(saved.0 as i16);
-        ctx.saved = saved.1;
+        // 0x45b9a0: the step is kept in the frame, and the run's retry
+        // stage (as a 16-bit word) and place written to the context.
+        ctx.word_58 = i32::from(retry as i16);
+        ctx.saved = spot;
         self.store_route(&ctx, &path);
         self.frame_mut()?.primitive_state = state;
         match result {
@@ -514,10 +677,14 @@ impl Machine<'_, '_> {
     ///    if it is 0; at step 8, 1 (true), and context +0x88 becomes 0.
     ///    Person word 62 takes context +0x88. With one context, word 39
     ///    becomes 1 if word 38 is 0. Object data word 9 becomes 0.
-    /// 4. Other people's contexts that wait on this person (+0x80, when
-    ///    person +0xa84 is set) would be released, and the context's own
-    ///    object +0x80 told (0x45d5f8). Nothing ported sets context +0x80,
-    ///    so a context naming one fails loudly.
+    /// 4. With a running action (person +0xa84 not 0), every other
+    ///    person's last context that asked this person (+0x80) to do it
+    ///    (+0x90) forgets the person and the action, its byte +0x84 noting
+    ///    whether this route was under way (state 8) (0x45b89b). When
+    ///    this context asked a person to move, that action is taken out
+    ///    of the person's queue (0x45d5f8,
+    ///    [`Machine::release_action`]); the person running it already
+    ///    fails loudly.
     /// 5. The context is removed (0x45f8e8); the path stays. The frame
     ///    keeps the step.
     fn end_route(
@@ -587,23 +754,36 @@ impl Machine<'_, '_> {
             self.set_person_word(WORD_39, 1)?;
         }
         self.set_datum(WORD_9, 0)?;
-        if ctx.objects[1] != 0 {
-            return Err(unsupported(
-                "0x45b91e",
-                "whose context names an object at +0x80",
-            ));
+        // 0x45b89b: with a running action, release the people whose last
+        // context waits on this person for it.
+        let running = self
+            .me()?
+            .person
+            .as_ref()
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .active
+            .uid;
+        if running != 0 {
+            for (_, route) in self
+                .world
+                .routing
+                .routes
+                .iter_mut()
+                .filter(|(id, _)| **id != me)
+            {
+                if let Some(last) = route.contexts.last_mut()
+                    && last.objects[1] == me
+                    && last.action == running
+                {
+                    last.byte_84 = state == SUCCEEDED;
+                    last.objects[1] = 0;
+                    last.action = 0;
+                }
+            }
         }
-        let waiting = self
-            .world
-            .routing
-            .routes
-            .iter()
-            .any(|(&id, r)| id != me && r.contexts.iter().any(|c| c.objects[1] == me));
-        if waiting {
-            return Err(unsupported(
-                "0x45b8be",
-                "that another person's context waits on",
-            ));
+        // 0x45b914: the person this one asked to move no longer needs to.
+        if ctx.objects[1] != 0 {
+            self.release_action(ctx.objects[1], ctx.action)?;
         }
         if let Some(route) = self.world.routing.routes.get_mut(&me) {
             route.contexts.pop();
@@ -660,6 +840,30 @@ impl Machine<'_, '_> {
             ))
         })?;
         self.count_use(door)
+    }
+
+    /// Plays a tree of the person's own on its thread, as its virtual
+    /// function 0x34 does (0x45e59b) with no arguments given: the person is
+    /// woken, the tree pushed with the person as its stack object and its
+    /// temps as the arguments, and the person counts a use of itself. Then
+    /// the new frame's stack object becomes `stack_object` if given
+    /// (0x45b53a). A tree that cannot be pushed, where the original goes
+    /// on to step 6, fails loudly.
+    fn play(&mut self, tree: u16, stack_object: Option<u16>) -> Result<(), Trap> {
+        let me = self.me;
+        let temps = self.me()?.temps.clone();
+        self.wake(me)?;
+        self.enter_on(me, tree, &temps).map_err(|fault| {
+            Trap::Unsupported(format!(
+                "a route's tree {tree:#06x} that cannot be pushed, where the original goes on \
+                 to step 6 (0x45b51e): {fault}"
+            ))
+        })?;
+        self.count_use(me)?;
+        if let Some(id) = stack_object {
+            self.frame_mut()?.stack_object = id as i16;
+        }
+        Ok(())
     }
 
     /// Sets person data word `index` of the running object.

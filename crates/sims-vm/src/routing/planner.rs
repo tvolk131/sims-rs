@@ -112,7 +112,7 @@ impl Interpreter<'_> {
     /// (one nearer is an obstacle),
     /// or the one the context names; and any other object that answers
     /// its function 5 true with the person as the stack object.
-    fn ignored(&self, world: &mut World, ctx: &Context, id: u16) -> Result<bool, Fault> {
+    pub(crate) fn ignored(&self, world: &mut World, ctx: &Context, id: u16) -> Result<bool, Fault> {
         let fail = |trap| Fault {
             object: ctx.person,
             at: None,

@@ -15,6 +15,7 @@ mod found_action;
 mod generic;
 mod go_to_slot;
 mod idle;
+mod in_way;
 mod interacting;
 mod inventory;
 mod look_towards;

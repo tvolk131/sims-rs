@@ -771,8 +771,9 @@ impl<'a> Machine<'a, '_> {
         }
         // Go To Routing Slot and Go To Relative Position keep the step
         // their route is at in the frame's primitive state and go on from
-        // there (0x45abce, 0x45c634).
-        if state != 0 && !matches!(instruction.opcode, 27 | 45) {
+        // there (0x45abce, 0x45c634); Look Towards keeps whether its turn
+        // started (0x45ab79).
+        if state != 0 && !matches!(instruction.opcode, 22 | 27 | 45) {
             return Err(Trap::Unsupported(format!(
                 "resuming primitive {} with saved state {state:#x}",
                 instruction.opcode
