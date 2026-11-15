@@ -3,7 +3,6 @@
 //! `SIMS_INSTALL`; skipped when it is unset. Nothing from the game is
 //! kept.
 
-use sims_people::math::Vec3;
 use sims_people::raster::{Camera, Canvas};
 use sims_people::{Assets, Body, Cast, Library, Player, base_clip, placement, residents_of};
 use sims_vm::boot::{Frames, Lot, StepError};
@@ -63,8 +62,13 @@ fn the_people_of_a_running_lot_are_drawn_from_its_state() {
                 let pose = player.pose(&body.skeleton, animator, base).unwrap();
                 let bones = pose.world(&body.skeleton, root);
                 // Drawn alone, with the camera on the person, it covers
-                // part of the frame, and only part.
-                let camera = Camera::house_view(40.0, root.translation + Vec3::new(0.0, 2.6, 0.0));
+                // part of the frame, and only part. The camera is on the
+                // skeleton's root bone, not on the animator's position: a
+                // clip can carry the body tiles away from it (climbing
+                // the stairs moves the pelvis four tiles from the foot of
+                // the stairs).
+                let pelvis = bones.first().map_or(root.translation, |b| b.translation);
+                let camera = Camera::house_view(40.0, pelvis);
                 let mut canvas = Canvas::new(200, 200, BACKGROUND);
                 canvas.draw_body(&camera, body, &bones);
                 let covered = canvas

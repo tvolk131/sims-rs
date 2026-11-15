@@ -1704,7 +1704,8 @@ Progress:
 - Done: the viewer runs a booted lot (`people-viewer --boot`, through
   `sims_vm::boot::Lot`) and draws its people after each tick, including
   people a script makes; it only reads the lot. A gated test runs the
-  Goths' lot to its end (tick 366 today) and draws everyone placed every
+  Goths' lot to its end and draws everyone placed (centred on the root
+  bone, which a clip such as the stair climb carries away) every
   30 ticks.
 - Next: match the original's lighting (see its decisions entry); compare
   Mortimer standing without his book. The base layer's clip and phase are
