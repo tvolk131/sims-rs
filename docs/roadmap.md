@@ -1502,8 +1502,13 @@ Progress:
   open grass matches the original pixel for pixel at the compared
   camera, and exact matches over the whole screen rose from 18% to 84%
   (walls up). Other zooms and rotations are unverified.
-- Next: the cut-wall cap, which rooms the cutaway cuts, and two more
-  cameras, each checked against the original.
+- Done: the cutaway cuts the rooms the original looks at: the last
+  three rooms the pointer passed over and the selected Sim's. Doors and
+  windows hide with their walls by the same mask. At the compared
+  camera, the house box rose from 61% to 64% exact (67% on a booted
+  world).
+- Next: the cut-wall cap, and two more cameras, each checked against the
+  original.
 
 ## Track: sound (`crates/sims-audio`)
 

@@ -12,6 +12,7 @@
 pub mod assets;
 pub mod camera;
 pub mod canvas;
+pub mod cutaway;
 pub mod depth;
 pub mod grass;
 pub mod light;
@@ -23,6 +24,7 @@ pub mod scene;
 pub use assets::Assets;
 pub use camera::{Camera, Walls, Zoom};
 pub use canvas::{Canvas, Image};
+pub use cutaway::{Focus, Selected};
 pub use light::Light;
 pub use lot::Lot;
 pub use open::{Opened, open_house};

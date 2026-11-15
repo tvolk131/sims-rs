@@ -6,36 +6,36 @@
 //! compared with the original is in `docs/decisions.md`.
 
 use sha2::{Digest, Sha256};
-use sims_render::{Camera, Canvas, Lot, Walls, Zoom, draw, open_house};
+use sims_render::{Camera, Canvas, Focus, Lot, Walls, Zoom, draw, open_house};
 use std::path::PathBuf;
 
 /// SHA-256 prefixes of the 16-bit-color images, by zoom, rotation and wall
 /// mode.
 const DIGESTS: &[(u32, u8, &str, &str)] = &[
     (1, 0, "up", "d48d3a69fd383377"),
-    (1, 0, "cutaway", "8f98c8eeeeceec58"),
+    (1, 0, "cutaway", "50d57ac61aaf588e"),
     (1, 1, "up", "e36969d769c16d34"),
-    (1, 1, "cutaway", "4f6f1efa7c9e545d"),
+    (1, 1, "cutaway", "16b9109c98cc0fae"),
     (1, 2, "up", "f23cc6603a376c9c"),
-    (1, 2, "cutaway", "dbf59f31e00aca5d"),
+    (1, 2, "cutaway", "802594c9bb3d13ff"),
     (1, 3, "up", "36b4f09f4f99b055"),
-    (1, 3, "cutaway", "0ff19815d9afbe0e"),
+    (1, 3, "cutaway", "7eda6c8eab3be3d0"),
     (2, 0, "up", "3c29c97799a9c138"),
-    (2, 0, "cutaway", "bbba05ed409f82c9"),
+    (2, 0, "cutaway", "d88bbde1c23e8b85"),
     (2, 1, "up", "91376466a563ef56"),
-    (2, 1, "cutaway", "fe9be6e4a3bc0e33"),
+    (2, 1, "cutaway", "1340f2d254ce40cb"),
     (2, 2, "up", "1e38c589c59a45c2"),
-    (2, 2, "cutaway", "41c2cb25c070d04a"),
+    (2, 2, "cutaway", "b22457c1a76230f6"),
     (2, 3, "up", "983eec1e9e8f8428"),
-    (2, 3, "cutaway", "e47b84e58e9c54cc"),
+    (2, 3, "cutaway", "7d88d418cf5f958c"),
     (3, 0, "up", "737d2bd955a5a6a6"),
-    (3, 0, "cutaway", "e498cb0f7788a172"),
+    (3, 0, "cutaway", "585dd575f1964213"),
     (3, 1, "up", "a4aef4fbf390b2c3"),
-    (3, 1, "cutaway", "5b6808251a09fba6"),
+    (3, 1, "cutaway", "1531d52285a1f02b"),
     (3, 2, "up", "48e2c6ae88a10133"),
-    (3, 2, "cutaway", "cc33ce60a0641dbd"),
+    (3, 2, "cutaway", "48e2c6ae88a10133"),
     (3, 3, "up", "e2ba3e02f260fe4d"),
-    (3, 3, "cutaway", "ef99a0cace3a3714"),
+    (3, 3, "cutaway", "e2ba3e02f260fe4d"),
 ];
 
 fn install() -> Option<PathBuf> {
@@ -60,6 +60,13 @@ fn goth_house_renders_the_same_at_every_zoom_and_rotation() {
     assert_eq!(opened.world.size, 52);
     let lot = Lot::from_world(&opened.world).unwrap();
     let before = opened.world.hash();
+    let upstairs: std::collections::BTreeSet<i16> = lot.levels[1]
+        .rooms
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|r| *r >= 0 && !lot.outdoor_rooms.contains(r))
+        .collect();
     let mut found = Vec::new();
     for zoom in Zoom::ALL {
         for rotation in 0..4u8 {
@@ -70,8 +77,13 @@ fn goth_house_renders_the_same_at_every_zoom_and_rotation() {
                     level: 2,
                     origin: [0, 0],
                     walls,
+                    focus: Focus::default(),
                 };
                 camera.center_on([22 * 16, 26 * 16], [200, 150]);
+                // The cutaway looks at three rooms upstairs.
+                for room in upstairs.iter().take(3) {
+                    camera.focus.visit(*room);
+                }
                 let mut canvas = Canvas::new(400, 300, [0, 0, 0]);
                 let stats = draw(
                     &opened.world,
@@ -91,6 +103,11 @@ fn goth_house_renders_the_same_at_every_zoom_and_rotation() {
     }
     // Drawing never changes the world.
     assert_eq!(opened.world.hash(), before);
+    // The cutaway cuts something in every view that shows the whole house
+    // (the near zoom's window shows only part of it).
+    for pair in found.chunks(2).filter(|p| p[0].0 < 3) {
+        assert_ne!(pair[0].3, pair[1].3, "{pair:?}");
+    }
     for (zoom, rotation, name, hex) in &found {
         eprintln!("    ({zoom}, {rotation}, \"{name}\", \"{hex}\"),");
     }
@@ -115,6 +132,7 @@ fn hidden_objects_are_not_drawn() {
         level: 1,
         origin: [0, 0],
         walls: Walls::Up,
+        focus: Focus::default(),
     };
     camera.center_on(lot.built_center(), [200, 150]);
     let mut shown = Canvas::new(400, 300, [0, 0, 0]);

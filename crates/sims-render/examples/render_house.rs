@@ -1,7 +1,7 @@
 //! Renders a house to PNG files: `render_house <install> <house> <out dir>
 //! [zoom rotation walls level width height]...`. A development tool; the
 //! images hold game art, so keep them out of the repository.
-use sims_render::{Camera, Canvas, Lot, Walls, Zoom, draw, open_house, png};
+use sims_render::{Camera, Canvas, Focus, Lot, Walls, Zoom, draw, open_house, png};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,8 +25,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     level: 2,
                     origin: [0, 0],
                     walls,
+                    focus: Focus::default(),
                 };
                 camera.center_on(lot.built_center(), [width / 2, height / 2]);
+                // The cutaway looks at the rooms under the middle of the
+                // picture, as if the pointer rested there.
+                let looking = camera;
+                camera.focus.point(&lot, &looking, [width / 2, height / 2]);
                 let mut canvas = Canvas::new(width as usize, height as usize, [0, 0, 0]);
                 let stats = draw(
                     &opened.world,

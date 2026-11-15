@@ -70,6 +70,7 @@ mod tests {
                 level: 1,
                 origin: [0, 37],
                 walls: Walls::Up,
+                focus: crate::Focus::default(),
             };
             for view in [[16, 16], [40, 8], [200, 300]] {
                 let elevation = 16 * c.zoom.near_scale();

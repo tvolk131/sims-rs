@@ -3,12 +3,13 @@
 use crate::assets::{Assets, Definition};
 use crate::camera::{self, Camera, Walls, Zoom};
 use crate::canvas::{Canvas, Image};
+use crate::cutaway::{self, Mask};
 use crate::depth;
 use crate::grass::{self, Grass};
 use crate::light::Light;
 use crate::lot::{self, Lot, WallCell};
 use sims_sim::World;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// Rows between a tile's left corner and the top of its first grass
 /// column (matched against the original's screen).
@@ -49,12 +50,31 @@ pub fn draw(
         grass: Grass::new(lot, camera),
         stats: Stats::default(),
     };
-    for level in 1..=camera.level.clamp(1, 2) {
+    let top = camera.level.clamp(1, 2);
+    for level in 1..=top {
         painter.floors(level);
-        let cut = painter.walls(level);
+        // Only the top floor shown is cut away; the floors below it stand
+        // (0x4a8895, the old prototype's `wall_view.rs`).
+        let cut = if level < top {
+            Cut::None
+        } else {
+            match camera.walls {
+                Walls::Up => Cut::None,
+                Walls::Down => Cut::All,
+                Walls::Cutaway => Cut::Mask(Box::new(Mask::new(lot, camera))),
+            }
+        };
+        painter.walls(level, &cut);
         painter.objects(level, &cut);
     }
     painter.stats
+}
+
+/// Which walls of a level are cut down, and which objects hide with them.
+enum Cut {
+    None,
+    All,
+    Mask(Box<Mask>),
 }
 
 /// A wall segment by its two lot corners, the lower first.
@@ -286,11 +306,11 @@ impl Painter<'_> {
         }
     }
 
-    /// The wallpaper on each side of a wall (first along its normal), and
-    /// the tile on each side (the old prototype's `faces` in
+    /// The wallpaper on each side of a wall, first along its normal (the
+    /// old prototype's `faces` in
     /// `legacy/crates/sims-render/src/walls.rs`, checked there against the
     /// original's wall records).
-    fn sides(&self, level: usize, x: i32, y: i32, bit: u8) -> ([u16; 2], [[i32; 2]; 2]) {
+    fn sides(&self, level: usize, x: i32, y: i32, bit: u8) -> [u16; 2] {
         let walls = &self.lot.levels[level].walls;
         let cell = |x: i32, y: i32| -> WallCell {
             if self.lot.contains(x, y) {
@@ -301,15 +321,9 @@ impl Painter<'_> {
         };
         let t = cell(x, y);
         match bit {
-            lot::WEST => (
-                [t.patterns[0], cell(x - 1, y).patterns[3]],
-                [[x, y], [x - 1, y]],
-            ),
-            lot::NORTH => (
-                [t.patterns[1], cell(x, y - 1).patterns[2]],
-                [[x, y], [x, y - 1]],
-            ),
-            _ => ([t.patterns[3], t.patterns[2]], [[x + 1, y], [x - 1, y]]),
+            lot::WEST => [t.patterns[0], cell(x - 1, y).patterns[3]],
+            lot::NORTH => [t.patterns[1], cell(x, y - 1).patterns[2]],
+            _ => [t.patterns[3], t.patterns[2]],
         }
     }
 
@@ -332,13 +346,12 @@ impl Painter<'_> {
         found
     }
 
-    /// Draws a level's walls and returns the ones drawn cut down.
-    fn walls(&mut self, level: i32) -> BTreeSet<Edge> {
+    /// Draws a level's walls.
+    fn walls(&mut self, level: i32, cut: &Cut) {
         let index = (level - 1) as usize;
         let zoom = self.camera.zoom.index();
         let base = level_elevation(level);
         let rise = 4 << self.camera.zoom.level();
-        let mut cut_edges = BTreeSet::new();
         let openings = self.wall_objects(level);
         for x in 0..self.lot.size as i32 {
             for y in 0..self.lot.size as i32 {
@@ -352,24 +365,16 @@ impl Painter<'_> {
                     } else {
                         wall.styles[1]
                     };
-                    let (patterns, tiles) = self.sides(index, x, y, s.bit);
+                    let patterns = self.sides(index, x, y, s.bit);
                     let n = self.rotate_direction(s.normal);
                     let front = usize::from(n[0] + n[1] < 0);
-                    let cut = match self.camera.walls {
-                        Walls::Up => false,
-                        Walls::Down => true,
-                        // Up only if it is the back wall of a room: indoors on
-                        // the camera's side and outdoors behind.
-                        Walls::Cutaway => {
-                            let [near, far] = [tiles[front], tiles[1 - front]];
-                            self.lot.outdoors(index, near[0], near[1])
-                                || !self.lot.outdoors(index, far[0], far[1])
-                        }
-                    };
+                    let cut = solid(style)
+                        && match cut {
+                            Cut::None => false,
+                            Cut::All => true,
+                            Cut::Mask(mask) => mask.cuts(self.camera, [x, y], s.bit),
+                        };
                     let key = edge(s.from, s.to);
-                    if cut {
-                        cut_edges.insert(key);
-                    }
                     // The frame from the wall's direction on screen.
                     let a = self.corner_screen(s.from, level);
                     let b = self.corner_screen(s.to, level);
@@ -424,10 +429,9 @@ impl Painter<'_> {
                 }
             }
         }
-        cut_edges
     }
 
-    fn objects(&mut self, level: i32, cut: &BTreeSet<Edge>) {
+    fn objects(&mut self, level: i32, cut: &Cut) {
         let zoom = self.camera.zoom.index();
         let mut list = Vec::new();
         for (&id, o) in &self.world.objects {
@@ -462,12 +466,19 @@ impl Painter<'_> {
                 self.stats.missing_objects += 1;
                 continue;
             };
-            // Doors and windows hide with their wall when it is cut down
-            // (simplified from the original's 0x4aa446; see the decisions
-            // log).
-            if definition.shapes_wall()
-                && object_edge(o.position, &o.data).is_some_and(|e| cut.contains(&e))
-            {
+            // Doors, windows and the like hide where the walls are cut
+            // (0x4aa446). Their scripts mark them when the lot loads; in a
+            // house read without running those, the objects that shape a
+            // wall still hide.
+            let tile = [o.position[0] >> 4, o.position[1] >> 4];
+            let walled = cutaway::hides_with_walls(&o.data) || definition.shapes_wall();
+            let hidden = walled
+                && match cut {
+                    Cut::None => false,
+                    Cut::All => true,
+                    Cut::Mask(mask) => mask.hides(self.camera, tile, &o.data),
+                };
+            if hidden {
                 continue;
             }
             let Some(group) = u16::try_from(o.data.first().copied().unwrap_or(0))
@@ -613,16 +624,24 @@ fn object_edge(position: [i32; 3], data: &[i16]) -> Option<Edge> {
     Some(edge(a, b))
 }
 
+/// Whether a wall style can be cut down: not a fence, railing or the
+/// like (styles 2, 12, 13, 14 and 255; 0x54059a).
+fn solid(style: u16) -> bool {
+    !matches!(style, 2 | 12 | 13 | 14 | 255)
+}
+
 /// The wall style whose cut-down shape a cut wall with a door or window in
 /// it takes.
 const PLAIN_STYLE: u16 = 1;
 
 /// A wall face: the pattern's frame cut to the shape's frame. A wall with
 /// style 22 or 23 takes its shape from the door or window in it when it is
-/// up. Cut down, it is a plain wall's stub: the opening's own cut sprites
-/// are one small outline shared by every door and window, and the
-/// original shows the same stub under a window as beside it (screenshot
-/// comparison, 2026-11-14; which style's stub it takes is unverified).
+/// up. Cut down, a wall of style 3, 5, 6, 15, 22 or 23 (the styles the
+/// original marks with bit 8 when it cuts them, 0x54059a; doors stand in
+/// style 3) is a plain wall's stub: the openings' own cut sprites are one
+/// small outline, and the original shows the same stub under a window or
+/// door as beside it (screenshot comparison, 2026-11-14; which style's
+/// stub it takes is unverified).
 fn wall_image(
     assets: &mut Assets,
     pattern: u16,
@@ -633,7 +652,7 @@ fn wall_image(
     frame: usize,
 ) -> Option<Image> {
     let shape = match opening {
-        Some(_) if cut && matches!(style, 22 | 23) => {
+        _ if cut && matches!(style, 3 | 5 | 6 | 15 | 22 | 23) => {
             assets.shape(PLAIN_STYLE, true, zoom)?[frame].clone()
         }
         Some(definition) if matches!(style, 22 | 23) => {
@@ -704,6 +723,7 @@ mod tests {
             level: 1,
             origin: [0, 0],
             walls: Walls::Up,
+            focus: crate::Focus::default(),
         }
     }
 

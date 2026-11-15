@@ -720,6 +720,7 @@ mod tests {
             level: 1,
             origin: [0, 0],
             walls: crate::Walls::Up,
+            focus: crate::Focus::default(),
         }
     }
 
