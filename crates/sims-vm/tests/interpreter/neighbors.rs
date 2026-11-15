@@ -1,6 +1,7 @@
 //! What a lot's scripts do with the neighborhood's records, and the
 //! person primitives the Goth house's second tick reaches: an
-//! expression's neighbor person data (scope 32), Relationship between
+//! expression's neighbor person data (scope 32) and neighbor fields
+//! (scope 24, with a family's friend count), Relationship between
 //! records, Manage Inventory, Idle For Input, Get Distance To and Get
 //! Direction To.
 //!
@@ -8,7 +9,7 @@
 //! from. These tests check the port's rules on synthetic data only.
 
 use crate::support::*;
-use sims_sim::neighbors::{Inventory, Item, Neighbor};
+use sims_sim::neighbors::{FAMILY, Family, Inventory, Item, KIND, Neighbor, Row};
 use sims_vm::{Status, Trap};
 
 const BUDGET: usize = 100;
@@ -66,12 +67,258 @@ fn an_expression_reads_the_person_data_of_the_stack_objects_record() {
     );
 }
 
+/// A family of the neighborhood, with its count out of date.
+fn family(id: i32, house: i32, members: &[u32]) -> Family {
+    Family {
+        id,
+        house,
+        members: members.to_vec(),
+        friends: 0,
+        stale: true,
+    }
+}
+
+/// A record of family `family` whose word 65 is 0.
+fn member(id: i16, guid: u32, family: i16) -> Neighbor {
+    let mut record = record(id, guid);
+    record.data[FAMILY] = family;
+    record.data[KIND] = 0;
+    record
+}
+
+/// Gives record `from` a row for record `to` whose first value is
+/// `value`.
+fn like(fx: &mut Fixture, from: i16, to: i16, value: i32) {
+    let target = i32::from(fx.world.neighbors.get(to).unwrap().id);
+    let record = fx.world.neighbors.get_mut(from).unwrap();
+    record.relationships.retain(|r| r.target != target);
+    record.relationships.push(Row {
+        target,
+        values: vec![value, -100],
+    });
+}
+
+const ANNE: u32 = 0xa;
+const BOB: u32 = 0xb;
+
+/// The family of Anne (record 1) and Bob (record 2, which the lamp's
+/// stack object, the Sim, names), with their friends. The friendship
+/// threshold is the default, 25.
+///
+/// - 3 likes Anne and Anne likes 3 (25 and 30): a friend.
+/// - 4 is the same but in no family (word 61 is 0): not counted.
+/// - 5 is the same but its word 65 is 2: not counted.
+/// - 6 and Anne like each other 30 and 24, but 6 and Bob 26 and 40: a
+///   friend, through Bob.
+/// - 7 is friends with both: counted once.
+/// - 8 is a second record of Anne's type, friends with Bob: a member's
+///   type, not counted.
+/// - 9 has a row for Anne with no values, and Anne one for 9: not
+///   counted.
+/// - 10 likes Anne 90 and Anne likes 10 only 24; 11 likes Bob 24 and Bob
+///   likes 11 90; 12 likes Anne 90 and Anne has no row for 12: none is
+///   counted.
+fn friends() -> Fixture {
+    let mut fx = Fixture::new();
+    let mut slots = vec![Some(member(1, ANNE, 5)), Some(member(2, BOB, 5))];
+    slots.extend((3..=12).map(|id| Some(member(id, 0x100 + id as u32, 7))));
+    fx.world.neighbors.slots = slots;
+    let set = |fx: &mut Fixture, id: i16, word: usize, value: i16| {
+        fx.world.neighbors.get_mut(id).unwrap().data[word] = value;
+    };
+    set(&mut fx, 4, FAMILY, 0);
+    set(&mut fx, 5, KIND, 2);
+    fx.world.neighbors.get_mut(8).unwrap().guid = ANNE;
+    for (a, b, ab, ba) in [
+        (3, 1, 25, 30),
+        (4, 1, 90, 90),
+        (5, 1, 90, 90),
+        (6, 1, 30, 24),
+        (6, 2, 26, 40),
+        (7, 1, 50, 50),
+        (7, 2, 50, 50),
+        (8, 2, 90, 90),
+        (10, 1, 90, 24),
+        (11, 2, 24, 90),
+    ] {
+        like(&mut fx, a, b, ab);
+        like(&mut fx, b, a, ba);
+    }
+    like(&mut fx, 12, 1, 90);
+    fx.world
+        .neighbors
+        .get_mut(9)
+        .unwrap()
+        .relationships
+        .push(Row {
+            target: 1,
+            values: Vec::new(),
+        });
+    like(&mut fx, 1, 9, 90);
+    fx.world.families = vec![family(7, 0, &[0x107]), family(5, 12, &[ANNE, BOB])];
+    fx
+}
+
+/// Field `index` of the record the lamp's stack object names, read into
+/// the lamp's temp 0.
+fn field(fx: &mut Fixture, index: i16) -> i16 {
+    fx.expression(scope::TEMPS, 0, op::ASSIGN, 24, index)
+        .unwrap_or_else(|f| panic!("{f}"));
+    fx.lamp().temps[0]
+}
+
+#[test]
+fn scope_24_field_9_counts_the_records_family_friends_and_keeps_the_count() {
+    let mut fx = friends();
+    assert_eq!(field(&mut fx, 9), 3);
+    let goths = &fx.world.families[1];
+    assert_eq!((goths.friends, goths.stale), (3, false));
+    // The other family is left as it was.
+    assert_eq!(
+        (fx.world.families[0].friends, fx.world.families[0].stale),
+        (0, true)
+    );
+    // A change the count reads that is not a relationship write leaves
+    // the cached count: 3 leaves its family, and Anne's row for 3 drops.
+    fx.world.neighbors.get_mut(3).unwrap().data[FAMILY] = 0;
+    like(&mut fx, 1, 3, 0);
+    assert_eq!(field(&mut fx, 9), 3);
+    // A relationship write of one of the family's people puts it out of
+    // date, and the next read counts again.
+    fx.sim_mut().person.as_mut().unwrap().data[31] = 7;
+    assert_eq!(
+        sim_runs(&mut fx, 26, [0, 0, 6, 0, scope::LITERAL, 0, 50, 0], 2),
+        Ok(true)
+    );
+    assert!(fx.world.families[1].stale);
+    assert_eq!(field(&mut fx, 9), 2);
+}
+
+#[test]
+fn scope_24_field_9_reads_the_friendship_threshold_truncated() {
+    let mut fx = friends();
+    let library = fx.program.libraries.get_mut(&GLOBAL).unwrap();
+    library.tuning.insert(
+        2,
+        sims_formats::tuning::Constants {
+            version: 1,
+            entries: vec![sims_formats::tuning::Constant {
+                name: "Friendship Threshold".into(),
+                value: 25.9,
+                comment: String::new(),
+            }],
+        },
+    );
+    assert_eq!(field(&mut fx, 9), 3, "25.9 is 25");
+    let mut fx = friends();
+    let library = fx.program.libraries.get_mut(&GLOBAL).unwrap();
+    library.tuning.insert(
+        2,
+        sims_formats::tuning::Constants {
+            version: 1,
+            entries: vec![sims_formats::tuning::Constant {
+                name: "friendship threshold".into(),
+                value: 26.0,
+                comment: String::new(),
+            }],
+        },
+    );
+    // 3 likes Anne only 25: 6 (through Bob) and 7 remain.
+    assert_eq!(field(&mut fx, 9), 2);
+}
+
+#[test]
+fn scope_24_field_9_is_0_without_a_family_with_a_house() {
+    // A family with no house: 0, and its count is not worked out.
+    let mut fx = friends();
+    fx.world.families[1].house = 0;
+    assert_eq!(field(&mut fx, 9), 0);
+    assert!(fx.world.families[1].stale);
+    // The record's word 61 names no family.
+    let mut fx = friends();
+    fx.world.neighbors.get_mut(2).unwrap().data[FAMILY] = 6;
+    assert_eq!(field(&mut fx, 9), 0);
+    // Word 61 is 0, even with a family 0 that has a house.
+    let mut fx = friends();
+    fx.world.families.push(family(0, 3, &[]));
+    fx.world.neighbors.get_mut(2).unwrap().data[FAMILY] = 0;
+    assert_eq!(field(&mut fx, 9), 0);
+    assert!(fx.world.families[2].stale);
+    // The first family of an ID is the one read.
+    let mut fx = friends();
+    fx.world.families.insert(0, family(5, 0, &[ANNE, BOB]));
+    assert_eq!(field(&mut fx, 9), 0);
+    assert!(fx.world.families[2].stale);
+}
+
+#[test]
+fn scope_24_reads_other_fields_of_the_record() {
+    let mut fx = friends();
+    // Word 58 of the record.
+    assert_eq!(field(&mut fx, 2), 1058);
+    assert_eq!(field(&mut fx, 3), 0);
+    assert_eq!(field(&mut fx, 4), 0);
+    // The house of the first family whose members include the record's
+    // type, whatever its word 61 says.
+    fx.world.neighbors.get_mut(2).unwrap().data[FAMILY] = 7;
+    assert_eq!(field(&mut fx, 6), 12);
+    fx.world.families[0].members.push(BOB);
+    fx.world.families[0].house = 40;
+    assert_eq!(field(&mut fx, 6), 40);
+    fx.world.families.iter_mut().for_each(|f| f.members.clear());
+    assert_eq!(field(&mut fx, 6), 0);
+    // A field above 9, compared unsigned.
+    for index in [10, 300, -1] {
+        assert_eq!(field(&mut fx, index), 0);
+    }
+    // The value has no word pointer: a write finds none (0x13).
+    assert_eq!(
+        code(fx.expression(24, 2, op::ASSIGN, scope::LITERAL, 1)),
+        Some(0x13)
+    );
+    // Fields that read what the simulation does not keep fail loudly,
+    // naming the original's code, even in a write.
+    for (index, address) in [
+        (0, "0x425baa"),
+        (1, "0x425be2"),
+        (5, "0x427148"),
+        (7, "0x425c5e"),
+        (8, "0x425cb4"),
+    ] {
+        for operator in [op::EQUAL, op::ASSIGN] {
+            let fault = fx
+                .expression(24, index, operator, scope::LITERAL, 0)
+                .unwrap_err();
+            let Trap::Unsupported(text) = &fault.trap else {
+                panic!("{fault}");
+            };
+            assert!(text.contains(address), "{text}");
+        }
+    }
+    // No record in the stack object's slot: every field is 0.
+    fx.world.neighbors.slots.truncate(1);
+    for index in [0, 1, 2, 5, 7, 8, 9] {
+        assert_eq!(field(&mut fx, index), 0);
+    }
+}
+
 /// The Sim is neighbor 1. Slot 3 holds a record whose own ID is 7.
+/// The families are up to date; the records' word 61 name families 1001
+/// and 1006 (the first family 1001 in order is the one marked).
 fn neighbors() -> Fixture {
     let mut fx = Fixture::new();
     fx.sim_mut().person.as_mut().unwrap().data[31] = 1;
     fx.sim_mut().temps = vec![0; 8];
     fx.world.neighbors.slots = vec![Some(record(1, SIM_GUID)), None, Some(record(7, LAMP_GUID))];
+    fx.world.neighbors.get_mut(1).unwrap().data[FAMILY] = 1001;
+    fx.world.neighbors.get_mut(3).unwrap().data[FAMILY] = 1006;
+    fx.world.families = [1000, 1001, 1002, 1001, 1006]
+        .into_iter()
+        .map(|id| Family {
+            stale: false,
+            ..family(id, 1, &[])
+        })
+        .collect();
     fx
 }
 
@@ -91,10 +338,22 @@ fn relationship_between_records_keys_the_row_by_the_targets_own_id() {
     );
     assert_eq!(row(&fx, 1, 7), Some(vec![0, 9]));
     assert_eq!(row(&fx, 1, 3), None);
-    // The write marked both records and the registry byte.
+    // The write marked both records, each record's family and the
+    // registry byte.
     assert!(fx.world.neighbors.get(1).unwrap().stale);
     assert!(fx.world.neighbors.get(3).unwrap().stale);
     assert!(fx.world.neighbors.relationships_changed);
+    let marked: Vec<(i32, bool)> = fx.world.families.iter().map(|f| (f.id, f.stale)).collect();
+    assert_eq!(
+        marked,
+        [
+            (1000, false),
+            (1001, true),
+            (1002, false),
+            (1001, false),
+            (1006, true)
+        ]
+    );
     // The other way round: record 3 keeps it, under my record's ID.
     assert_eq!(
         sim_runs(&mut fx, 26, [0, 1, 6, 0, scope::LITERAL, 0, 4, 0], 3),

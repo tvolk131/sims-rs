@@ -88,6 +88,11 @@ pub struct Constants {
     /// How much each tile of distance takes from an object's score in
     /// Find Best Object for Function (0x6c4394).
     pub distance_attenuation: F32,
+    /// The least value both of two people's relationship rows need for
+    /// them to be friends (0x6c4398), stored as a whole number,
+    /// truncated. Not read by Find Best Interaction: a family's friend
+    /// count reads it ([`sims_sim::World::count_family_friends`]).
+    pub friendship_threshold: i32,
 }
 
 /// The attenuation of an entry whose code is none of 0 to 4 (0x667368).

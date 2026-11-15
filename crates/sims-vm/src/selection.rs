@@ -302,17 +302,41 @@ impl Interpreter<'_> {
         set_global(world, MODE, 0)
     }
 
-    /// Load steps 21 and 22: what the game does to the simulation's state
-    /// before it draws a frame and runs a tick. The rooms that wait are
-    /// counted ([`Interpreter::update_pending_rooms`], 0x467094). Then
-    /// the interface's wait check (0x4764fe) writes what it found to
-    /// global 12: the control a tutorial is waiting for, or 0. There is
-    /// no interface here, so it is 0. Returns the rooms counted.
+    /// Load steps 20 to 22: what the game does to the simulation's state
+    /// before it draws a frame and runs a tick.
     ///
-    /// Between step 19 and these the original counts the family's
-    /// friends (0x427219, step 20), which changes nothing the simulation
-    /// holds.
+    /// 20. The interface's family panel shows the selected family's
+    ///     friend count (0x4cfcdb, 0x410260, 0x427219), which works the
+    ///     count out again, as it is out of date since the neighborhood
+    ///     was read ([`sims_sim::World::family_friends`]). The family is
+    ///     the one in global 9; for an empty lot (0) nothing is counted,
+    ///     which is **unverified**.
+    /// 21. The rooms that wait are counted
+    ///     ([`Interpreter::update_pending_rooms`], 0x467094).
+    /// 22. The interface's wait check (0x4764fe) writes what it found to
+    ///     global 12: the control a tutorial is waiting for, or 0. There
+    ///     is no interface here, so it is 0.
+    ///
+    /// Returns the rooms counted. In a capture of the original at the
+    /// Goth house's first tick, the Goth family's count is up to date
+    /// and every other family's is not.
+    ///
+    /// Not modeled: the panel shows the count again whenever the
+    /// interface redraws it, working it out again if a relationship write
+    /// put it out of date since. A count read later works it out the
+    /// same way, so this matters only when something it reads changes
+    /// without putting it out of date in between. The redraw is the
+    /// virtual method 0x53a01f; in a capture the Goth family's count is
+    /// up to date after every update, where ours stays out of date after
+    /// the first relationship write.
     pub fn before_frame(&self, world: &mut World) -> Result<Vec<i16>, Fault> {
+        let family = i32::from(world.globals.get(9).copied().unwrap_or(0));
+        if family != 0
+            && let Some(place) = world.families.iter().position(|f| f.id == family)
+        {
+            let threshold = self.program.autonomy_constants().friendship_threshold;
+            world.family_friends(place, threshold);
+        }
         let counted = self.update_pending_rooms(world)?;
         set_global(world, WAITED_FOR, 0)?;
         Ok(counted)

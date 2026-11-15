@@ -4,7 +4,7 @@ use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
 use sims_sim::animator::{Animator, Base, Fade, LOADED, Layer, Motion, UNSET};
 use sims_sim::head::Head;
-use sims_sim::neighbors::{Inventory, Item, Neighbor, Neighbors, Row};
+use sims_sim::neighbors::{Family, Inventory, Item, Neighbor, Neighbors, Row};
 use sims_sim::rooms::{Half, Room, Rooms};
 use sims_sim::route::{Candidate, Context, Route, RouteSlot, Routing};
 use sims_sim::{
@@ -198,6 +198,22 @@ fn world() -> World {
             minimum: -(i as i16),
             delta: 100 + i as i16,
         })),
+        families: vec![
+            Family {
+                id: 5,
+                house: 5,
+                members: vec![0x1234_5678, 0x9abc_def0],
+                friends: 3,
+                stale: false,
+            },
+            Family {
+                id: 0,
+                house: 0,
+                members: Vec::new(),
+                friends: -1,
+                stale: true,
+            },
+        ],
         animators: BTreeMap::from([(5, animator())]),
         usage: HouseUsage {
             history: [
@@ -373,7 +389,24 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "a4e74a05e62ae6eaff009cb2b32fe752b07cc739492dc1d964c585d53e0d2d65";
+const PINNED: &str = "d73a66741337b2527a28c856d5d94f1a91a6f7137a7ee199fcfc289bd21dcadb";
+
+#[test]
+fn without_the_families_the_encoding_is_format_22() {
+    // Snapshot format 23 added the families at the end.
+    assert_eq!(digest(&format_22_bytes(&world())), PINNED_22);
+}
+const PINNED_22: &str = "a4e74a05e62ae6eaff009cb2b32fe752b07cc739492dc1d964c585d53e0d2d65";
+
+/// The encoding of `world` as snapshot format 22 wrote it: without the
+/// families ([`World::families`]) that format 23 added at the end. The
+/// older formats' encodings start from this one.
+fn format_22_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let families = postcard::to_allocvec(&world.families).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - families.len()), families);
+    bytes
+}
 
 #[test]
 fn without_the_advertisement_record_the_encoding_is_format_21() {
@@ -384,9 +417,10 @@ const PINNED_21: &str = "23e9f53ef9c6129ef25795acb31d097cce39ddb0401b852212b4a4f
 
 /// The encoding of `world` as snapshot format 21 wrote it: without the
 /// advertisement record ([`World::advertisement_record`]) that format 22
-/// added at the end. The older formats' encodings start from this one.
+/// added at the end. It starts from [`format_22_bytes`], and the older
+/// formats' encodings from this one.
 fn format_21_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_22_bytes(world);
     let record = postcard::to_allocvec(&world.advertisement_record).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - record.len()), record);
     bytes

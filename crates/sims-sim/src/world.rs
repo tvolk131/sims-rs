@@ -1,5 +1,5 @@
 use crate::animator::Animator;
-use crate::neighbors::Neighbors;
+use crate::neighbors::{Family, Neighbors};
 use crate::rooms::Rooms;
 use crate::route::Routing;
 use crate::{Error, Result};
@@ -132,6 +132,10 @@ pub struct World {
     /// sixteen. None before the first copy: what the record holds then is
     /// not read. It belongs to the running game, not to the lot.
     pub advertisement_record: Option<[Advertisement; ADVERTISEMENTS]>,
+    /// The neighborhood's families, in the order the neighborhood's
+    /// reload sorts them. See [`Family`]. Like the neighborhood's
+    /// people, they belong to the running game, not to the lot.
+    pub families: Vec<Family>,
 }
 
 /// How many advertisements the record of [`World::advertisement_record`]
@@ -441,6 +445,7 @@ impl World {
             routing: Routing::default(),
             action_serial: 0,
             advertisement_record: None,
+            families: Vec::new(),
         }
     }
 

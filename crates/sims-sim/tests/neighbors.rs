@@ -135,6 +135,69 @@ fn the_family_word_is_rebuilt_in_family_order() {
 }
 
 #[test]
+fn the_families_are_kept_in_family_order_with_their_counts_out_of_date() {
+    let mut file = neighborhood();
+    let mut housed = family(2, &[ANNE, 0x99, BOB]);
+    (housed.house, housed.friends) = (12, 4);
+    file.families = BTreeMap::from([(1, family(2, &[CARL])), (2, housed), (3, family(5, &[]))]);
+    let world = read(&file, &[]).unwrap();
+    let kept: Vec<(i32, i32, &[u32], i32, bool)> = world
+        .families
+        .iter()
+        .map(|f| (f.id, f.house, f.members.as_slice(), f.friends, f.stale))
+        .collect();
+    // A member no record has is dropped; the added family 0 comes last.
+    assert_eq!(
+        kept,
+        [
+            (3, 0, &[][..], 0, true),
+            (2, 12, &[ANNE, BOB][..], 4, true),
+            (1, 0, &[CARL][..], 0, true),
+            (0, 0, &[][..], 0, true),
+        ]
+    );
+    // A file with a family 0 has no other.
+    file.families.insert(0, family(-3, &[BOB]));
+    let world = read(&file, &[]).unwrap();
+    let ids: Vec<i32> = world.families.iter().map(|f| f.id).collect();
+    assert_eq!(ids, [3, 2, 1, 0]);
+    assert_eq!(world.families[3].members, [BOB]);
+}
+
+#[test]
+fn a_family_counts_each_friend_of_a_member_once() {
+    use sims_sim::neighbors::{KIND, Row};
+    let mut file = neighborhood();
+    file.families = BTreeMap::from([(2, family(1, &[ANNE, BOB]))]);
+    let mut world = read(&file, &[]).unwrap();
+    let like = |world: &mut World, from: i16, to: i32, value: i32| {
+        let record = world.neighbors.get_mut(from).unwrap();
+        record.relationships = vec![Row {
+            target: to,
+            values: vec![value],
+        }];
+    };
+    // Carl (4) and Anne (1) like each other 30: Carl, in family 0 by his
+    // word 61, is not counted.
+    like(&mut world, 4, 1, 30);
+    like(&mut world, 1, 4, 30);
+    world.neighbors.get_mut(4).unwrap().data[KIND] = 1;
+    let place = 0;
+    assert_eq!(world.families[place].id, 2);
+    assert_eq!(world.family_friends(place, 30), Some(0));
+    // In a family of his own he is, but only up to the threshold.
+    world.neighbors.get_mut(4).unwrap().data[FAMILY] = 9;
+    world.mark_friends(1);
+    assert!(world.families[place].stale);
+    assert_eq!(world.family_friends(place, 31), Some(0));
+    world.mark_friends(4);
+    assert!(!world.families[place].stale, "Carl's family 9 is not kept");
+    world.mark_friends(1);
+    assert_eq!(world.family_friends(place, 30), Some(1));
+    assert_eq!(world.family_friends(4, 30), None);
+}
+
+#[test]
 fn a_person_type_without_a_record_is_not_ported() {
     let Err(LoadError::Neighborhood(text)) = read(&neighborhood(), &[ANNE, 0x99]) else {
         panic!("expected a neighborhood error");

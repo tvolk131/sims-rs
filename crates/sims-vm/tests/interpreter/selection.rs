@@ -421,3 +421,51 @@ fn the_room_constants_come_from_the_global_files_table_3() {
     assert_eq!(tuning.nighttime_bonus, sims_core::F32::from_f32(-5.0));
     assert_eq!(tuning.light_slope, defaults.light_slope);
 }
+
+#[test]
+fn before_the_frame_the_selected_familys_friend_count_is_worked_out() {
+    use sims_sim::neighbors::{FAMILY, Family, Neighbor, Row};
+    let (mut fx, _) = lot();
+    // Records 1 and 2 like each other 25, the default threshold: record
+    // 2, of family 7, is a friend of family 5's one member.
+    let record = |id: i16, guid: u32, family: i16, target: i32| {
+        let mut data = vec![0; 256];
+        data[FAMILY] = family;
+        Neighbor {
+            id,
+            guid,
+            revision: 5,
+            data,
+            relationships: vec![Row {
+                target,
+                values: vec![25],
+            }],
+            friends: 0,
+            stale: true,
+        }
+    };
+    fx.world.neighbors.slots = vec![Some(record(1, 0xa, 5, 2)), Some(record(2, 0xb, 7, 1))];
+    let family = |id: i32, members: &[u32]| Family {
+        id,
+        house: 0,
+        members: members.to_vec(),
+        friends: -1,
+        stale: true,
+    };
+    fx.world.families = vec![family(7, &[0xb]), family(5, &[0xa]), family(5, &[])];
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    // An empty lot counts nothing.
+    fx.world.globals[9] = 0;
+    interpreter.before_frame(&mut fx.world).unwrap();
+    assert!(fx.world.families.iter().all(|f| f.stale && f.friends == -1));
+    // The first family whose ID is in global 9, even with no house.
+    fx.world.globals[9] = 5;
+    interpreter.before_frame(&mut fx.world).unwrap();
+    let counts: Vec<(i32, bool)> = fx
+        .world
+        .families
+        .iter()
+        .map(|f| (f.friends, f.stale))
+        .collect();
+    assert_eq!(counts, [(-1, true), (1, false), (-1, true)]);
+}

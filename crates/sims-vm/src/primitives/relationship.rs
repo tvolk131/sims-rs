@@ -193,19 +193,13 @@ impl Machine<'_, '_> {
     }
 
     /// What a write to a relationship between people marks (0x44485b),
-    /// before the column is looked at, so even when it is absent: both
-    /// records' friend counts as out of date (0x4246b9), and the
+    /// before the column is looked at, so even when it is absent: for
+    /// both records, the record's friend count and its family's as out of
+    /// date (0x4246b9, [`sims_sim::World::mark_friends`]), and the
     /// registry's byte 0x12.
-    ///
-    /// Not modeled: 0x4246b9 also marks the friend count of the family
-    /// whose chunk ID is the record's person data word 61 (family +0x124).
-    /// The neighborhood's families are not kept; nothing ported reads
-    /// that count.
     fn mark_relationships(&mut self, source: i16, target: i16) {
         for id in [source, target] {
-            if let Some(record) = self.world.neighbors.get_mut(id) {
-                record.stale = true;
-            }
+            self.world.mark_friends(id);
         }
         self.world.neighbors.relationships_changed = true;
     }

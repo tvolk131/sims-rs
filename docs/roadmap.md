@@ -140,7 +140,7 @@ That starting lot is **unverified**; see the decision log.
 | 17 | Set the funds again | `0x4f1ae9`, `0x46d8dc` | Done (`Interpreter::select_resident`) |
 | 18 | Select the family's first member: the Sim's selected mark, the first indicator into the Sim's slot, global 3 | `0x4e97dc`, `0x4e989b`, `0x445449`, `0x44664c` | Done for a lot where nobody is selected and the Sim has no date (`Interpreter::select_resident`) |
 | 19 | Go to live mode: every room waits to be counted, the lot's statistics set global 37, then global 19 becomes 0 | `0x4cea5d`, `0x416534`, `0x416085`, `0x4ce44f` | Done (`Interpreter::go_live`); of the statistics only globals 23 and 37 |
-| 20 | Count the family's friends | `0x427219`, `0x427bd7` | Nothing to do: no state we hold changes |
+| 20 | Count the family's friends | `0x4cfcdb`, `0x427219`, `0x427bd7` | Done (`Interpreter::before_frame`, `World::family_friends`); an empty lot counts nothing (unverified) |
 | 21 | Count the rooms that wait | `0x467094`, `0x466c3c` | Done (`Interpreter::before_frame`) |
 | 22 | The interface's wait check clears global 12 | `0x4764fe` | Done (`Interpreter::before_frame`) |
 
@@ -756,8 +756,11 @@ trace they do not change, but they already hold what the house saved. In
 the trace the three rooms that were counted are marked, global 37 goes
 from 0 to 1, and global 19 from 3 to 0.
 
-**20. Friends.** The family's friends are counted. No state we hold
-changes.
+**20. Friends.** The interface's family panel shows the selected
+family's friend count, which works the count out again: every family's
+count is out of date from the neighborhood's read. In the capture the
+Goth family's count is 0 and up to date, and every other family's is
+out of date, as ours are.
 
 **21. Rooms.** Before it draws a frame the game counts the rooms that
 wait (`0x467094`), as in step 10a. All 11 rooms are counted. The five
