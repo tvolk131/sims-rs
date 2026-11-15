@@ -67,6 +67,13 @@ events, and what it asks for after them) come first.
   tick 562, with no recording to compare yet; at tick 563 a head's pose
   blends a base clip under the foreground (0x5992b3), which is not
   ported.
+- The houses of UserData2 to 8 get past the neighborhood: the reload
+  makes the records their template files lack. The version-63 houses
+  read their arrays whole (Arry 11, 12, 111 and 112). UserData2's
+  houses 1 and 9 then stop at their floor and wall maps
+  (`World::renumber_surfaces`), and the houses with no family stop at
+  the household selection. The templates' `Patch` families are not
+  imported (see `docs/decisions.md`).
 
 ## Met goal: a headless lot boot that matches the original
 
@@ -1967,9 +1974,14 @@ stop-sounds events.
   value the ambience's row follows is ported (`ambience::view`, from
   0x570c3e: the share of the screen's tiles that are outdoors, read
   through `World::outside`), and the hour is the clock's.
+- **Done: what scripts ask about an object.** `getsrcdatafield` gets the
+  original's answers (0x570e61: a person's voice, age, skills,
+  personality and motive 3, the hour, the size of the object's room),
+  read from the lot between ticks (`sims_game::sound::sources`).
 - **Next:**
-  - Positions for 3D sound, pause and unpause (103), reload (104), the
-    piano (43) and the music half of the music modes (36).
+  - Positions for 3D sound, pause and unpause (21 and 22; 103 and 104
+    are debug commands), the piano (43) and the music half of the music
+    modes (36).
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)
