@@ -34,13 +34,18 @@
 //! object weighted by its volume, in 32-bit arithmetic that wraps. The
 //! volume and pan an object leaves as they were are the previous
 //! object's; for the first, the pan is 0 and the volume is whatever a
-//! local held before (0x57475f: a word of the instance lookup's result,
-//! a heap address). Here that volume is [`STALE_VOL`], **unverified**. A
-//! track with no instance gets volume 0 and the centre.
+//! local held before: the instance lookup (0x576235) leaves the address
+//! of the instance map, the sound manager +0xd4, a heap address. Here it
+//! is [`STALE_VOL`], **unverified**. It is far above full volume, so the
+//! loudest is too (the player plays it at full), and it outweighs every
+//! other object in the pan; how the pan comes out depends on where the
+//! heap is (below 0x400000 the weighted sum does not wrap, and the pan is
+//! all the way left; above it wraps). A track with no instance gets
+//! volume 0 and the centre.
 //!
-//! The volume and pan are worked out when the event comes; here, at the
-//! next block, when the player has the game's [`Sources`], from the
-//! objects and `Spl` as they were when the event came.
+//! The volume and pan are worked out when the event comes, so the host
+//! gives the player its [`Sources`] with each event
+//! (`Player::handle`).
 //!
 //! Not ported: the original places every track again (0x57447f, each
 //! track through 0x5746d9, not read) on kind 33, which its game sends
@@ -50,8 +55,8 @@
 //! original does.
 //!
 //! The original keeps the instances in a hash multimap and goes through
-//! a track's in its order; here they go in object ID order, which only
-//! matters when an object is left as it was. **Unverified.**
+//! a track's in its order, which only matters when an object is left as
+//! it was; the player keeps that order (`Player::record`).
 
 use crate::player::Sources;
 
@@ -59,9 +64,11 @@ use crate::player::Sources;
 pub const FULL: i32 = 1024;
 /// The pan's centre.
 pub const CENTRE: i32 = 512;
-/// The volume the sum starts from before its first object is placed
-/// (see the module notes). **Unverified.**
-pub const STALE_VOL: i32 = 1024;
+/// The volume the sum starts from before its first object is placed:
+/// the address of the sound manager's instance map, a heap address (see
+/// the module notes). **Unverified:** an address in the range a heap
+/// holds, the one the review's run of the original's code used.
+pub const STALE_VOL: i32 = 0x0100_00d4;
 
 /// Where an object is on the screen, as the placement reads it when a
 /// track's `Spl` is not 0 (which it starts as).

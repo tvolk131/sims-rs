@@ -369,16 +369,6 @@ impl Sources for NoSources {
     }
 }
 
-/// *(code)* An `extvol` and `pan` to work out from where a track's objects
-/// are, at the next block, for the threads a start started or let go.
-/// The objects and `Spl` are as they were when the event came.
-#[derive(Debug, Clone)]
-struct Placing {
-    objects: Vec<u32>,
-    spl: i32,
-    threads: Vec<u32>,
-}
-
 #[derive(Debug, Clone)]
 struct Thread {
     id: u32,
@@ -543,8 +533,10 @@ pub struct Player<S> {
     master: i32,
     notes: Vec<Note>,
     /// *(code)* Object instances: a track and an object it plays for, as
-    /// the original records them (its map at manager +0xd4).
-    instances: BTreeSet<(u32, u32)>,
+    /// the original records them (its hash multimap at manager +0xd4),
+    /// each pair once, and each track's in the order the original goes
+    /// through them ([`Player::record`]).
+    instances: Vec<(u32, u32)>,
     /// The ambience scores, by mode (see [`crate::ambience`]).
     scores: BTreeMap<u32, Fresh>,
     /// *(code)* The current ambience (manager +0x100), by mode.
@@ -559,8 +551,6 @@ pub struct Player<S> {
     /// threads do not run or fade and their notes stay where they are,
     /// silent, until an unpause or until the track starts again.
     held: BTreeSet<u32>,
-    /// Volumes and pans to work out at the next block, in order.
-    placing: Vec<Placing>,
     /// The ambience cells' sounds.
     voices: Vec<AmbientVoice>,
     /// Ambience sample paths to their numbers in the patch cache.
@@ -610,14 +600,13 @@ impl<S: Samples> Player<S> {
             group_volumes: BTreeMap::new(),
             master: 1024,
             notes: Vec::new(),
-            instances: BTreeSet::new(),
+            instances: Vec::new(),
             scores: BTreeMap::new(),
             ambience: None,
             music_mode: 4,
             music_started: false,
             paused: false,
             held: BTreeSet::new(),
-            placing: Vec::new(),
             voices: Vec::new(),
             ambient_patches: BTreeMap::new(),
             ambient_cache: BTreeMap::new(),
@@ -864,10 +853,12 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// Acts on one event from the simulation.
-    pub fn handle(&mut self, event: &SoundEvent) {
+    /// Acts on one event from the simulation. `sources` is where the
+    /// lot's objects are: a sound started for an object is placed when
+    /// the event comes, as the original places it ([`crate::placement`]).
+    pub fn handle(&mut self, event: &SoundEvent, sources: &dyn Sources) {
         match event {
-            SoundEvent::Play { object, name } => self.play(*object, name),
+            SoundEvent::Play { object, name } => self.play(*object, name, sources),
             // What the game calls with kind 23 when an object goes.
             SoundEvent::StopObject { object } => self.kill_instance(*object),
             // Kind 20, as the game calls it.
@@ -878,9 +869,9 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    fn play(&mut self, object: u32, name: &str) {
+    fn play(&mut self, object: u32, name: &str, sources: &dyn Sources) {
         match (0..self.modules.len()).find(|&m| self.modules[m].hot.event(name).is_some()) {
-            Some(module) => self.play_from(module, object, name),
+            Some(module) => self.play_from(module, object, name, sources),
             None => self.report(format!("no event {name}")),
         }
     }
@@ -888,14 +879,14 @@ impl<S: Samples> Player<S> {
     /// Acts on the event of that name as one module defines it, whether
     /// or not an earlier module's definition would win in
     /// [`SoundEvent::Play`]. The module is an index into the modules
-    /// given to [`Player::new`].
+    /// given to [`Player::new`]. `sources` is as for [`Player::handle`].
     ///
     /// *(code)* As the original's event dispatcher (0x573617) does, the
     /// event's kind picks what happens, with its track and three
     /// arguments. Each argument is the event's own number after the
     /// track when that is not 0, and otherwise the caller's: the object
     /// for the first, 0 for the others.
-    pub fn play_from(&mut self, module: usize, object: u32, name: &str) {
+    pub fn play_from(&mut self, module: usize, object: u32, name: &str, sources: &dyn Sources) {
         let Some(event) = self.modules.get(module).and_then(|m| m.hot.event(name)) else {
             self.report(format!("no event {name}"));
             return;
@@ -931,7 +922,7 @@ impl<S: Samples> Player<S> {
         let args = [given(0, object), given(1, 0), given(2, 0)];
         let track = track as u32;
         match kind {
-            kind::PLAY => self.play_track(module, track, args),
+            kind::PLAY => self.play_track(module, track, args, sources),
             kind::FADE => self.fade_track(track, args),
             kind::CANCEL_NOTE => self.cancel_radio_notes(),
             kind::KILL_ALL => self.kill_all(),
@@ -945,7 +936,7 @@ impl<S: Samples> Player<S> {
                     "event {name}: kind {kind} is not one this player plays (its music half)"
                 ));
             }
-            kind::TURN_ON_TV => self.turn_on_tv(module, track, args),
+            kind::TURN_ON_TV => self.turn_on_tv(module, track, args, sources),
             kind::SEQUENCE_TRACK_HIT_LIST => self.sequence(track, args[1]),
             kind::KILL_OBJECT_SOUNDS => self.kill_object_sounds(),
             kind if kind::NOTHING_FOR_SOUND.contains(&kind) => {}
@@ -963,7 +954,7 @@ impl<S: Samples> Player<S> {
     /// first argument of 0 starts nothing; any other is recorded as an
     /// instance of the track, and the track's `extvol` and `pan` are set
     /// from where its objects are ([`crate::placement`]).
-    fn play_track(&mut self, module: usize, track: u32, args: [u32; 3]) {
+    fn play_track(&mut self, module: usize, track: u32, args: [u32; 3], sources: &dyn Sources) {
         if self.owner(module, track).is_none() {
             self.report(format!("no track {track}"));
             return;
@@ -981,21 +972,23 @@ impl<S: Samples> Player<S> {
             return;
         }
         self.record(track, args[0]);
-        let placing = self.placing(track);
+        let placed = self.placed(track, sources);
         let threads = self.start(args, module, track, false);
-        self.place_later(placing, threads);
+        self.place(&threads, placed);
     }
 
-    /// The objects of a track and its `Spl`, as the sum over them
-    /// (0x57473b) reads them: before the start. `Spl` is read from the
-    /// track's newest thread, through its `target`. When none runs it is
-    /// [`SPL_NORMAL`]: the original's track keeps its last run's
-    /// registers, and before its first run reads the default, but no
-    /// script writes `Spl`.
-    fn placing(&self, track: u32) -> Placing {
-        let objects = self
+    /// A track's volume and pan from where its objects are, as the sum
+    /// over them (0x57473b) works them out: before the start, with the
+    /// track's `Spl` read from its newest thread through its `target`.
+    /// When none runs `Spl` is [`SPL_NORMAL`]: the original's track keeps
+    /// its last run's registers, and before its first run reads the
+    /// default, but no script writes `Spl`. A fault is reported, and
+    /// gives `None`.
+    fn placed(&mut self, track: u32, sources: &dyn Sources) -> Option<(i32, i32)> {
+        let objects: Vec<u32> = self
             .instances
-            .range((track, 0)..=(track, u32::MAX))
+            .iter()
+            .filter(|&&(t, _)| t == track)
             .map(|&(_, object)| object)
             .collect();
         let spl = self
@@ -1005,53 +998,54 @@ impl<S: Samples> Player<S> {
             .filter(|t| t.track == track)
             .max_by_key(|t| t.id)
             .map_or(SPL_NORMAL, |t| self.read(t, i64::from(SPL)));
-        Placing {
-            objects,
-            spl,
-            threads: Vec::new(),
-        }
-    }
-
-    /// Sets the started threads' `extvol` and `pan` at the next block,
-    /// when the player has the game's [`Sources`].
-    fn place_later(&mut self, placing: Placing, threads: Vec<u32>) {
-        if !threads.is_empty() {
-            self.placing.push(Placing { threads, ..placing });
-        }
-    }
-
-    /// *(code)* Writes each placing's `extvol` (0x57d57a) then `pan`
-    /// (0x57d5a0), as the start left them pointing at themselves: the
-    /// comparison flags are the pan's. A fault leaves both as they were.
-    fn place(&mut self, sources: &dyn Sources) {
-        for placing in std::mem::take(&mut self.placing) {
-            let (vol, pan) = match placement::combine(&placing.objects, placing.spl, sources) {
-                Ok(placed) => placed,
-                Err(fault) => {
-                    self.report(fault);
-                    continue;
-                }
-            };
-            for thread in self
-                .threads
-                .iter_mut()
-                .chain(&mut self.pending)
-                .filter(|t| placing.threads.contains(&t.id))
-            {
-                thread.registers[usize::from(EXTVOL)] = vol;
-                thread.registers[usize::from(PAN)] = pan;
-                thread.kept = i64::from(pan);
+        match placement::combine(&objects, spl, sources) {
+            Ok(placed) => Some(placed),
+            Err(fault) => {
+                self.report(fault);
+                None
             }
         }
     }
 
-    /// Records an object instance, unless [`INSTANCES`] are recorded.
+    /// *(code)* Writes a placement's `extvol` (0x57d57a) then `pan`
+    /// (0x57d5a0) to the threads a start started or let go, as the start
+    /// left them pointing at themselves: the comparison flags are the
+    /// pan's. With no placement both stay as they were.
+    fn place(&mut self, threads: &[u32], placed: Option<(i32, i32)>) {
+        let Some((vol, pan)) = placed else {
+            return;
+        };
+        for thread in self
+            .threads
+            .iter_mut()
+            .chain(&mut self.pending)
+            .filter(|t| threads.contains(&t.id))
+        {
+            thread.registers[usize::from(EXTVOL)] = vol;
+            thread.registers[usize::from(PAN)] = pan;
+            thread.kept = i64::from(pan);
+        }
+    }
+
+    /// Records an object instance, unless it is already (0x57442d) or
+    /// [`INSTANCES`] are. *(code)* The original's multimap puts a new
+    /// pair right after the first of its track (0x5761c2), so a track's
+    /// instances go in the order first recorded, then the others newest
+    /// first; ending one keeps the others' order. **Unverified:** the
+    /// map's growth (0x5762c7) moves its nodes to new buckets, which may
+    /// turn a track's order around; that is not ported.
     fn record(&mut self, track: u32, object: u32) {
-        if self.instances.len() >= INSTANCES && !self.instances.contains(&(track, object)) {
+        if self.instances.contains(&(track, object)) {
+            return;
+        }
+        if self.instances.len() >= INSTANCES {
             self.report(format!("track {track}: more than {INSTANCES} instances"));
             return;
         }
-        self.instances.insert((track, object));
+        match self.instances.iter().position(|&(t, _)| t == track) {
+            Some(first) => self.instances.insert(first + 1, (track, object)),
+            None => self.instances.push((track, object)),
+        }
     }
 
     /// The `args` field of the track a module (or the first other)
@@ -1224,7 +1218,7 @@ impl<S: Samples> Player<S> {
             .map(|&(t, _)| t)
             .collect();
         for track in tracks {
-            self.instances.remove(&(track, object));
+            self.instances.retain(|&pair| pair != (track, object));
             let shared = self.instances.iter().any(|&(t, _)| t == track);
             self.fade_and_kill(track, shared.then_some(object));
         }
@@ -1237,8 +1231,9 @@ impl<S: Samples> Player<S> {
         let (killed, kept): (Vec<_>, Vec<_>) = self
             .instances
             .iter()
-            .partition(|&&(_, object)| (object as i32) > 0);
-        self.instances = kept.into_iter().collect();
+            .copied()
+            .partition(|&(_, object)| (object as i32) > 0);
+        self.instances = kept;
         for (track, _) in killed {
             self.fade_and_kill(track, None);
         }
@@ -1290,14 +1285,14 @@ impl<S: Samples> Player<S> {
     /// started anew is left held (the start ends by holding it, 0x57dbd6)
     /// and let go only when the sound is not paused (0x573d71), so a
     /// television turned on during a pause is silent until the unpause.
-    fn turn_on_tv(&mut self, module: usize, track: u32, args: [u32; 3]) {
+    fn turn_on_tv(&mut self, module: usize, track: u32, args: [u32; 3], sources: &dyn Sources) {
         self.kill_instance(args[0]);
         if self.owner(module, track).is_none() {
             self.report(format!("no track {track}"));
             return;
         }
         self.record(track, args[0]);
-        let placing = self.placing(track);
+        let placed = self.placed(track, sources);
         let resumes = self.held.contains(&track)
             && self
                 .threads
@@ -1308,7 +1303,7 @@ impl<S: Samples> Player<S> {
         if !threads.is_empty() && self.paused && !resumes {
             self.held.insert(track);
         }
-        self.place_later(placing, threads);
+        self.place(&threads, placed);
     }
 
     /// Kind 53 (`kSequenceTrackHitList`): *(code)* picks a patch from a
@@ -1630,7 +1625,6 @@ impl<S: Samples> Player<S> {
     }
 
     fn run(&mut self, sources: &dyn Sources) {
-        self.place(sources);
         let mut budget = BLOCK_STEPS;
         let mut index = 0;
         while index < self.threads.len() {

@@ -40,17 +40,21 @@ the holder without setting `fade_dest`, now fades it to 0, not 1.
 What the original does with an object it cannot place is kept: an ID
 that names no object, or an object with a first or second coordinate
 of 0, leaves the previous object's values, and the first object's are
-pan 0 (all the way left) and a volume a local held before, a heap
-address. Here that volume is 1024, **unverified**. A `kArgsIdVolPan`
+pan 0 and a volume a local held before: the address of the sound
+manager's instance map (0x576235), on the heap. Here that address is
+0x10000d4, **unverified**; it makes the track's volume full and
+outweighs the other objects in the pan, which comes out where the
+wrapping sum puts it. A `kArgsIdVolPan`
 kind 1 with object 0 now starts nothing (0x57375b), where it started
 the track; kind 30 records object 0 as an instance, where it skipped it.
 The writes leave the comparison flags the pan's.
 
-The volume and pan are worked out at the next block, when the player
-has the game's answers, from the objects and `Spl` as they were when the
-event came. The instances go in object ID order, where the original's
-hash multimap has its own; it only matters for an object that cannot be
-placed.
+The volume and pan are worked out when the event comes, as the original
+does, so `Player::handle` and `Player::play_from` now take the game's
+`Sources`. A track's instances go in the original's multimap's order
+(0x5761c2): the first recorded, then the others newest first. The
+order the map's growth gives them (0x5762c7) is not ported; it only
+matters for an object that cannot be placed.
 
 Not ported: placing every track again on kind 33 (0x57447f), which the
 original's game sends when the camera moves. The game here sends kind

@@ -264,8 +264,10 @@ impl Mixer {
     pub fn input(&mut self, input: Input) {
         match input {
             Input::Events(events) => {
+                // Placed where the last snapshot has their objects, which
+                // the game sends before a tick's events.
                 for event in &events {
-                    self.player.handle(event);
+                    self.player.handle(event, &self.sources);
                 }
             }
             Input::Hour(hour) => self.hour = hour,

@@ -112,10 +112,11 @@ fn the_sum_takes_the_loudest_and_weights_the_pans() {
 fn an_object_not_placed_takes_the_values_before_it() {
     let lot = lot(&[(5, [40, 56, 1])]);
     // The first object not found: the pan starts at 0 and the volume at
-    // the stand-in, all the way left.
-    assert_eq!(combine(&[4], 0, &lot), Ok((STALE_VOL, 0)));
+    // the stand-in heap address, the loudest. Its weight, -512 times it,
+    // wraps to -108544, which the volume divides to 0: the centre.
+    assert_eq!(STALE_VOL, 0x0100_00d4);
+    assert_eq!(combine(&[4], 0, &lot), Ok((STALE_VOL, CENTRE)));
+    assert_eq!(combine(&[4, 5], 0, &lot), Ok((STALE_VOL, CENTRE)));
     // After an object at the centre, it is at the centre too.
     assert_eq!(combine(&[5, 7], 0, &lot), Ok((FULL, CENTRE)));
-    // Before it, it pulls the pan halfway left.
-    assert_eq!(combine(&[4, 5], 0, &lot), Ok((FULL, 256)));
 }

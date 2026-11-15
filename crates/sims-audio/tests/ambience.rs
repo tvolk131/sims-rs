@@ -99,10 +99,13 @@ fn player(scores: &[(u32, Score)]) -> Player<BTreeMap<String, Pcm>> {
 }
 
 fn event(player: &mut Player<BTreeMap<String, Pcm>>, name: &str) {
-    player.handle(&SoundEvent::Play {
-        object: 0,
-        name: name.into(),
-    });
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: name.into(),
+        },
+        &NoSources,
+    );
 }
 
 /// The frames (stereo pairs) from `from` on where either channel is not
@@ -552,15 +555,15 @@ fn a_pause_holds_the_score_in_live_music_mode_only() {
     event(&mut player, "amb0");
     // The first music mode is 4: a pause leaves the score alone, though
     // an unpause would unpause it.
-    player.handle(&SoundEvent::Pause);
+    player.handle(&SoundEvent::Pause, &NoSources);
     assert!(player.is_paused());
     assert!(!player.ambience().unwrap().is_paused());
-    player.handle(&SoundEvent::Unpause);
+    player.handle(&SoundEvent::Unpause, &NoSources);
     // Live music (mode 0, once mode 3 has been set): the score pauses,
     // and no beat falls due while it is.
     event(&mut player, "music3");
     event(&mut player, "music0");
-    player.handle(&SoundEvent::Pause);
+    player.handle(&SoundEvent::Pause, &NoSources);
     assert!(
         player
             .ambience()
@@ -568,7 +571,7 @@ fn a_pause_holds_the_score_in_live_music_mode_only() {
     );
     let out = player.render_stereo(8 * RATE as usize, &NoSources);
     assert!(runs(&out, 0).is_empty(), "{:?}", runs(&out, 0));
-    player.handle(&SoundEvent::Unpause);
+    player.handle(&SoundEvent::Unpause, &NoSources);
     assert!(!player.ambience().unwrap().is_paused());
     let out = player.render_stereo(8 * RATE as usize, &NoSources);
     assert!(!runs(&out, 0).is_empty());
