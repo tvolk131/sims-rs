@@ -85,6 +85,9 @@ pub struct Constants {
     pub sitting_threshold: F32,
     /// How many of the best candidates the draw picks among (0x6c4390).
     pub random_count: i32,
+    /// How much each tile of distance takes from an object's score in
+    /// Find Best Object for Function (0x6c4394).
+    pub distance_attenuation: F32,
 }
 
 /// The attenuation of an entry whose code is none of 0 to 4 (0x667368).

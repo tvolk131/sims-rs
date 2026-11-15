@@ -2637,5 +2637,15 @@ fn the_goth_house_first_tick_matches_the_original() {
             interpreter.lot_update(world, &tuning, &mut player).unwrap();
         }
         assert_eq!(digest(&world.encode()), TICK_416);
+        // Tick 417: person 21's tree 0x1014 of the bookcase finds the best
+        // object for function 8 (Find Best Object for Function, opcode
+        // 14): object 174, the stack object the capture shows. The tree
+        // then animates on the carry slot, which is not ported.
+        let error = interpreter
+            .lot_update(world, &tuning, &mut player)
+            .unwrap_err();
+        assert!(error.to_string().contains("carry slot"), "{error}");
+        let frame = world.objects[&21].stack.last().unwrap();
+        assert_eq!((frame.tree, frame.stack_object), (0x1014, 174));
     });
 }

@@ -1410,6 +1410,24 @@ page holds the vector.
 **Stops.** Tick 417: person 21 runs Find Best Object for Function
 (opcode 14), which is not ported.
 
+### Tick 417
+
+**Find Best Object for Function** (opcode 14, `0x44f2bf`,
+`find_best_object.rs`). Person 21's bookcase tree (0x1014) asks for the
+best object for function 8. The primitive walks the lot's objects in
+registration order and scores each that has an action for the
+function's callback: its score (an attribute, or 50) less the
+"functional distance attenuation" (3) times its distance, and at least
+1. Room flags, a check tree per entry, and an origin other than the
+running object narrow or change the walk. It picks object 174, the
+stack object the fourth capture shows.
+
+**Not verified.** The primitive against a capture of its own; tick 417
+has not run to its end yet.
+
+**Stops.** Tick 417: the same tree then animates on the carry slot
+(Animate Sim, `0x589571`), which is not ported.
+
 ## Track: drawing people (`crates/sims-people`)
 
 Draw the Sims from the original's files, posed by the simulation's
