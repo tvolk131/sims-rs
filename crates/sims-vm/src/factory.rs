@@ -19,8 +19,9 @@
 //! `reset_base_storage`, `install_lifecycle` and `finish_object_factory`
 //! (legacy/crates/sims-vm/src/construction.rs, lifecycle.rs and
 //! registry_flags.rs), without its threads, hosts and frame arena. People
-//! (type 2) have their own path ([`Interpreter::create_person`]). The
-//! cursor types (8 and 9) and multi-tile objects have their own factories,
+//! (type 2) have their own path ([`Interpreter::create_person`]), and so
+//! do multi-tile objects ([`Interpreter::create_group`], the group branch
+//! of 0x440b2d). The cursor types (8 and 9) have their own factories,
 //! which are not ported: asking for one fails.
 
 use crate::fault::{Fault, Trap};
@@ -28,7 +29,7 @@ use crate::interpreter::{Interpreter, Machine};
 use crate::memory::LOCKOUT;
 use crate::objects::{PERSON_SLOTS, PERSON_WORDS};
 use crate::program::{Callback, DEFINITION_WORDS};
-use sims_formats::saved_objects::{Interaction, Person, Slot};
+use sims_formats::saved_objects::{Interaction, Multipart, Person, Slot};
 use sims_sim::animator::{Animator, LOADED};
 use sims_sim::{Object, World};
 
@@ -54,8 +55,21 @@ pub(crate) mod flag {
 
 /// Definition words the factory reads.
 pub(crate) mod word {
+    /// The interaction table's place in the group: a positive number
+    /// sends a tile's interactions to the tile with the number negated.
+    pub const TARGET: usize = 8;
     pub const TYPE: usize = 9;
     pub const GROUP: usize = 10;
+    /// A tile's place in its group (OBJD +0x16): the high byte, signed,
+    /// is its first offset and the low byte its second. -1 marks the
+    /// group's catalog master, which is never made.
+    pub const SUB_INDEX: usize = 11;
+    /// The GUID, low word first.
+    pub const GUID: usize = 14;
+    /// A tile's level in its group (OBJD +0x70).
+    pub const LEVEL: usize = 0x70 / 2;
+    /// Nonzero on the tile a group's factory makes first (OBJD +0x7e).
+    pub const LEAD: usize = 0x7e / 2;
     pub const PRICE: usize = 18;
     /// Copied into data word 58 on every reset (OBJD byte 0x62).
     pub const DATA_58: usize = 49;
@@ -77,6 +91,13 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
+        let group = self
+            .machine(world, 0, 0, false)
+            .definition_words(guid)
+            .map_err(|trap| fail(0, trap))?[word::GROUP];
+        if group != 0 {
+            return self.create_group(world, guid);
+        }
         let id = (1..=i16::MAX as u16)
             .find(|id| !world.objects.contains_key(id))
             .ok_or_else(|| fail(0, Trap::Unsupported("no unused object ID".into())))?;
@@ -128,6 +149,42 @@ impl<'a> Machine<'a, '_> {
         guid: u32,
         person: bool,
     ) -> Result<&'a [i16; DEFINITION_WORDS], Trap> {
+        self.build(guid, person, None)
+    }
+
+    /// Steps 1 to 3 for a tile of a multi-tile object: the group's
+    /// constructor (0x4227b3) and post-constructor (0x422872).
+    ///
+    /// The constructor builds an ordinary object's storage and then the
+    /// group's links (object +0x18c to +0x1ab, vtable 0x666c20): the lead
+    /// tile (+0x190, here [`Multipart::parent`]) is `lead`, or none for the
+    /// lead itself; the next tile (+0x18c) is none; and the new tile joins
+    /// the end of its lead's list of tiles (0x4227df to 0x4227f2, here
+    /// [`World::next_parts`]). Its place in the group and its offset from
+    /// the lead (+0x194 to +0x1a8) start at 0.
+    ///
+    /// The post-constructor (vtable +0x3c) runs an ordinary object's
+    /// (0x431aaf) and then reads the tile's place in its group from its
+    /// definition (0x43183c): the high byte of word 11, signed, the low
+    /// byte, unsigned, and word 56 ([`word::LEVEL`]), signed. The offset
+    /// stays 0 until the group's reset works it out (0x422a3b).
+    ///
+    /// A tile whose definition is a cursor's (type 8, 0x463050 from
+    /// 0x44099b) fails.
+    pub(crate) fn construct_tile(
+        &mut self,
+        guid: u32,
+        lead: Option<u16>,
+    ) -> Result<&'a [i16; DEFINITION_WORDS], Trap> {
+        self.build(guid, false, Some(lead))
+    }
+
+    fn build(
+        &mut self,
+        guid: u32,
+        person: bool,
+        tile: Option<Option<u16>>,
+    ) -> Result<&'a [i16; DEFINITION_WORDS], Trap> {
         let id = self.me;
         let definition = self.definition(guid)?;
         let words = self.definition_words(guid)?;
@@ -137,16 +194,31 @@ impl<'a> Machine<'a, '_> {
                 words[word::TYPE]
             )));
         }
-        if !person && matches!(words[word::TYPE], 2 | 8 | 9) {
-            return Err(Trap::Unsupported(format!(
-                "the factory for object type {} is not ported",
-                words[word::TYPE]
-            )));
-        }
-        if words[word::GROUP] != 0 {
-            return Err(Trap::Unsupported(
-                "the factory for multi-tile objects is not ported".into(),
-            ));
+        if tile.is_some() {
+            if words[word::GROUP] == 0 || words[word::SUB_INDEX] == -1 {
+                return Err(Trap::Invalid(format!(
+                    "0x{guid:08X} is not a tile of a multi-tile object"
+                )));
+            }
+            if words[word::TYPE] == 8 {
+                return Err(Trap::Unsupported(format!(
+                    "a multi-tile object of type 8 (0x{guid:08X}): the group's cursor \
+                     constructor (0x463050, from 0x44099b) is not ported"
+                )));
+            }
+        } else {
+            if !person && matches!(words[word::TYPE], 2 | 8 | 9) {
+                return Err(Trap::Unsupported(format!(
+                    "the factory for object type {} is not ported",
+                    words[word::TYPE]
+                )));
+            }
+            if words[word::GROUP] != 0 {
+                return Err(Trap::Unsupported(format!(
+                    "0x{guid:08X} belongs to a multi-tile group, whose tiles are made only \
+                     through the group's factory (0x440b63)"
+                )));
+            }
         }
         // The base constructor allocates the definition's attribute count,
         // read as a signed word, and never fewer than 8 (0x43189d).
@@ -207,7 +279,11 @@ impl<'a> Machine<'a, '_> {
                 slots
             ],
             dynamic_sprites: vec![0; sprites],
-            multipart: None,
+            multipart: tile.map(|lead| Multipart {
+                offset: [0; 3],
+                group: tile_place(words),
+                parent: lead.map_or(0, |lead| lead as i16),
+            }),
             portal: None,
             person: person.then(new_person),
             // Countdown -1 and no flags.
@@ -244,6 +320,18 @@ impl<'a> Machine<'a, '_> {
             }
         }
         self.world.objects.insert(id, object);
+        if let Some(Some(lead)) = tile {
+            let mut last = lead;
+            let mut steps = 0;
+            while let Some(&next) = self.world.next_parts.get(&last) {
+                last = next;
+                steps += 1;
+                if steps > self.world.objects.len() {
+                    return Err(Trap::Invalid("the tiles of a group form a loop".into()));
+                }
+            }
+            self.world.next_parts.insert(last, id);
+        }
         // New objects go to the head of the registration list, and to the
         // end of their type's instance list if it has been made.
         self.world.order.insert(0, id);
@@ -390,16 +478,28 @@ impl Machine<'_, '_> {
             .get(&id)
             .ok_or(Trap::native(0x15, "missing object"))?;
         let words = self.definition_words(object.guid)?;
-        if words[word::GROUP] != 0 && words[8] > 0 && object.multipart.is_some() {
+        if words[word::GROUP] != 0 && words[word::TARGET] > 0 && object.multipart.is_some() {
             for part in self.interpreter().parts(self.world, id)? {
                 let guid = self.world.objects[&part].guid;
-                if self.definition_words(guid)?[8] == -words[8] {
+                if self.definition_words(guid)?[word::TARGET] == -words[word::TARGET] {
                     return Ok(part);
                 }
             }
         }
         Ok(id)
     }
+}
+
+/// A tile's place in its group, from its definition (0x43183c and
+/// 0x422872): the high byte of word 11 as a signed number, its low byte,
+/// and word 56.
+fn tile_place(words: &[i16; DEFINITION_WORDS]) -> [i32; 3] {
+    let sub = words[word::SUB_INDEX];
+    [
+        i32::from(sub >> 8),
+        i32::from(sub as u16 & 0xff),
+        i32::from(words[word::LEVEL]),
+    ]
 }
 
 /// A new person's own storage (0x459327): no appearance or clips yet, 256

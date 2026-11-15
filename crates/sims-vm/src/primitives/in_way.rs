@@ -440,8 +440,8 @@ impl Machine<'_, '_> {
     /// 5. The person's temps, if the check's tree saved them, are put
     ///    back (0x4582dd).
     ///
-    /// Only the running person's own actions are run at once here: an
-    /// entry that runs at once queued on another person fails loudly.
+    /// An entry that runs at once queued on another person runs the same
+    /// way, on that person's stack.
     pub(crate) fn queue_action(
         &mut self,
         id: u16,
@@ -540,12 +540,19 @@ impl Machine<'_, '_> {
 
     /// Runs an action whose entry runs at once (0x45d240; see
     /// [`Machine::queue_action`]).
+    ///
+    /// The original's 0x45d20b is the person's own method and reads
+    /// nothing of whoever queues the action, so an action queued on
+    /// another person runs the same way, on that person's stack.
     fn run_at_once(&mut self, id: u16, mut action: Interaction) -> Result<Option<i32>, Trap> {
         if id != self.me {
-            return Err(unsupported(
-                "0x45d240",
-                "running at once an action queued on another person",
-            ));
+            if !self.world.objects.contains_key(&id) {
+                return Err(Trap::native(0x1c, "object is not a person"));
+            }
+            let interpreter = self.interpreter();
+            return interpreter
+                .machine(self.world, id, 0, false)
+                .run_at_once(id, action);
         }
         let mut saved = None;
         let result = self.check_and_run_at_once(id, &mut action, &mut saved);

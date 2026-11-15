@@ -26,8 +26,9 @@
 //! comments name each refusal's code, so the reason is on record.
 //!
 //! Only what an ordinary object or a person on the ground needs is
-//! ported. A person whose person word 84 has bit 0, a tile of a group, a
-//! place inside a person, an object that must stand against a wall (data
+//! ported, and a group's own test ([`Interpreter::fits`] of a tile of a
+//! group, 0x422abb) as far as its tiles leave codes. A person whose person
+//! word 84 has bit 0, a place inside a person, an object that must stand against a wall (data
 //! word 13 nonzero) and two objects that are both not solid on the same
 //! tile fail loudly.
 
@@ -59,6 +60,9 @@ pub(crate) enum Refusal {
     /// clash on the tile leaves 0x6e4ad0 as the caller set it (0x433b4a),
     /// None here.
     Collision(Option<u16>),
+    /// Code 1: the place is off the lot (0x432a68), or a group's origin
+    /// is (0x422adc).
+    OffLot,
     /// One of the other codes the steps of [`Interpreter::fits`] name.
     Other,
     /// A refusal whose code was not read from the original: the wall
@@ -296,6 +300,24 @@ fn spiral_step(dx: &mut i32, dy: &mut i32) {
     }
 }
 
+/// The next step of a search along a line (0x434be9 to 0x434c24): the
+/// step of the coordinate the direction names goes from n to -n when n is
+/// positive, and to 1 - n otherwise.
+fn line_step(direction: i32, dx: &mut i32, dy: &mut i32) {
+    let alternate = |n: &mut i32| {
+        *n = if *n > 0 {
+            n.wrapping_neg()
+        } else {
+            1i32.wrapping_sub(*n)
+        }
+    };
+    match direction {
+        0 | 4 => alternate(dy),
+        2 | 6 => alternate(dx),
+        _ => {}
+    }
+}
+
 /// Whether a footprint crosses a wall on the tiles it covers (0x476dbc).
 /// The footprint is in the lot's order: least first and second
 /// coordinates, then the greatest. On each tile, the wall segments are
@@ -385,6 +407,36 @@ impl Interpreter<'_> {
         level: i32,
         rules: Rules,
     ) -> Result<Option<[i32; 2]>, Fault> {
+        self.search_toward(world, id, from, level, rules, None)
+    }
+
+    /// [`Interpreter::search`] along a line instead of a spiral (search
+    /// record +0x10 not -1, 0x434be9): for a direction of 0 or 4 the second
+    /// coordinate's step goes 0, 1, -1, 2, -2 and so on, and for 2 or 6
+    /// the first's does. A direction of -1 is the spiral's. Any other
+    /// direction does not step, so the start tile is tried until the
+    /// search gives up. The rest is the spiral's.
+    pub(crate) fn search_line(
+        &self,
+        world: &mut World,
+        id: u16,
+        from: [i32; 2],
+        level: i32,
+        rules: Rules,
+        direction: i32,
+    ) -> Result<Option<[i32; 2]>, Fault> {
+        self.search_toward(world, id, from, level, rules, Some(direction))
+    }
+
+    fn search_toward(
+        &self,
+        world: &mut World,
+        id: u16,
+        from: [i32; 2],
+        level: i32,
+        rules: Rules,
+        direction: Option<i32>,
+    ) -> Result<Option<[i32; 2]>, Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -424,7 +476,13 @@ impl Interpreter<'_> {
                     return Ok(Some([(i32::from(a) << 4) | 8, (i32::from(b) << 4) | 8]));
                 }
             }
-            spiral_step(&mut dx, &mut dy);
+            // The record keeps the raw direction (0x434803 to 0x434817), and
+            // -1 there is the spiral (0x434ba9): a line search from an
+            // object facing -1 (or -3 turned by 2) spirals.
+            match direction {
+                None | Some(-1) => spiral_step(&mut dx, &mut dy),
+                Some(direction) => line_step(direction, &mut dx, &mut dy),
+            }
             count += 1;
             if outside >= limit {
                 return Ok(None);
@@ -540,6 +598,19 @@ impl Interpreter<'_> {
         self.test_place(world, id, position, level, None)
     }
 
+    /// [`Interpreter::fits_in`], with the reason for a refusal.
+    pub(crate) fn place_test_in(
+        &self,
+        world: &mut World,
+        id: u16,
+        container: u16,
+        slot: i32,
+        position: [i32; 2],
+        level: i32,
+    ) -> Result<Result<(), Refusal>, Fault> {
+        self.test_place(world, id, position, level, Some((container, slot)))
+    }
+
     /// The place test on the ground, or in a container's slot.
     fn test_place(
         &self,
@@ -555,24 +626,127 @@ impl Interpreter<'_> {
             trap,
         };
         let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
-        let person = object.person.is_some();
         if object.multipart.is_some() {
             // A tile of a group refuses any container at once (0x422ac8,
             // code 0x10).
             if container.is_some() {
                 return Ok(Err(Refusal::Other));
             }
-            return Err(fail(Trap::Unsupported(
-                "the place test of a tile of a group on the ground (0x422abb) is not ported".into(),
-            )));
+            return self.test_group(world, id, position, level);
         }
+        self.test_tile(world, id, position, level, container)
+    }
+
+    /// The place test of a group on the ground, asked of any of its tiles
+    /// (virtual function 0x54 of a group, 0x422abb), at the place
+    /// `position` and `level` for the tile `id`:
+    ///
+    /// 1. The group's origin is the place less the tile's offset from the
+    ///    lead (0x422022 makes sixteenths of it; the level offset is in
+    ///    levels). An origin off the lot's inner tiles (0x422632) refuses
+    ///    (code 1).
+    /// 2. Each tile, from the lead along the list, is tested at the
+    ///    origin plus its own offset with the ordinary place test
+    ///    (0x433311, [`Interpreter::fits`]'s steps).
+    /// 3. The group refuses when a tile does. The code it leaves is the
+    ///    first tile's refusal, replaced by any later one of 0x1e or 0x1f
+    ///    (0x422b9e to 0x422bb3).
+    ///
+    /// A tile that refuses without leaving a code ([`Refusal::Unrecorded`])
+    /// fails loudly: the group then reads whatever code an earlier test
+    /// left (0x422ba2), and a code of 0 would send it on to compare the
+    /// tiles' heights (0x422bbb to 0x422c01), which is not ported. So does
+    /// a later tile refusing with [`Refusal::Other`] after an earlier one
+    /// that is not: whether its code is 0x1e or 0x1f, which would replace
+    /// the earlier, is not told apart.
+    fn test_group(
+        &self,
+        world: &mut World,
+        id: u16,
+        position: [i32; 2],
+        level: i32,
+    ) -> Result<Result<(), Refusal>, Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let offset = |world: &World, part: u16| {
+            world
+                .objects
+                .get(&part)
+                .and_then(|o| o.multipart.as_ref())
+                .map(|m| m.offset)
+                .ok_or_else(|| fail(missing()))
+        };
+        let selected = offset(world, id)?;
+        let origin = [
+            position[0].wrapping_sub(selected[0].wrapping_mul(16)),
+            position[1].wrapping_sub(selected[1].wrapping_mul(16)),
+        ];
+        let origin_level = level.wrapping_sub(selected[2]);
+        if super::off_lot(world, origin) {
+            return Ok(Err(Refusal::OffLot));
+        }
+        let mut refusal: Option<Refusal> = None;
+        for part in self.parts(world, id).map_err(fail)? {
+            let at = offset(world, part)?;
+            let place = [
+                origin[0].wrapping_add(at[0].wrapping_mul(16)),
+                origin[1].wrapping_add(at[1].wrapping_mul(16)),
+            ];
+            let part_level = origin_level.wrapping_add(at[2]);
+            match self.test_tile(world, part, place, part_level, None)? {
+                Ok(()) => {}
+                Err(Refusal::Unrecorded) => {
+                    return Err(fail(Trap::Unsupported(format!(
+                        "the place test of a group: tile {part} refuses without leaving a \
+                         code, so the group reads the code an earlier test left (0x422ba2), \
+                         which is not kept"
+                    ))));
+                }
+                Err(later) => match refusal {
+                    None => refusal = Some(later),
+                    Some(first) if later == Refusal::Other && first != Refusal::Other => {
+                        return Err(fail(Trap::Unsupported(format!(
+                            "the place test of a group: tile {part} refuses after an earlier \
+                             tile did, and whether its code (0x1e or 0x1f) replaces the \
+                             earlier one's (0x422ba9) is not told apart"
+                        ))));
+                    }
+                    Some(_) => {}
+                },
+            }
+        }
+        Ok(refusal.map_or(Ok(()), Err))
+    }
+
+    /// The ordinary place test of one object (0x433311 and 0x4329c1).
+    fn test_tile(
+        &self,
+        world: &mut World,
+        id: u16,
+        position: [i32; 2],
+        level: i32,
+        container: Option<(u16, i32)>,
+    ) -> Result<Result<(), Refusal>, Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
+        let person = object.person.is_some();
         let read =
             |world: &World, index: usize| datum(world, id, index).map(|w| w as u16).map_err(fail);
         let placement = read(world, word::PLACEMENT)?;
         let levels = read(world, word::LEVELS)?;
         let [a, b, _] = World::tile([position[0], position[1], level]);
-        // Codes 1 and 2.
-        if !inside(world, a, b) || !(0..=3).contains(&level) {
+        // Code 1, then code 2 for a level outside 1 to 3 (0x433058).
+        if !inside(world, a, b) {
+            return Ok(Err(Refusal::OffLot));
+        }
+        if !(1..=3).contains(&level) {
             return Ok(Err(Refusal::Other));
         }
         // Code 0x1f.
@@ -880,7 +1054,8 @@ impl Interpreter<'_> {
     /// Its footprint there is worked out as the lot stores footprints. On
     /// its tile and the eight around it, every object linked from the
     /// tile's grid cell through slot 0 is looked at, the object itself
-    /// skipped.
+    /// skipped (virtual function 0x5c): for a tile of a multi-tile object,
+    /// every tile of its group (0x42314e).
     ///
     /// For a person being placed: one whose person data word 68 has bit 0
     /// collides with nothing; one whose word 84 has bit 0 goes on to steps
@@ -946,6 +1121,9 @@ impl Interpreter<'_> {
         )
         .map_err(fail)?;
         let tile = World::tile([position[0], position[1], level]);
+        // What counts as the object itself (virtual function 0x5c): the
+        // object alone (0x433ba9), or every tile of its group (0x42314e).
+        let own = self.parts(world, id).map_err(fail)?;
         for (index, (da, db)) in AROUND.iter().enumerate() {
             let a = tile[0].wrapping_add(*da);
             let b = tile[1].wrapping_add(*db);
@@ -966,7 +1144,8 @@ impl Interpreter<'_> {
                 } else {
                     self.in_way(world, id, other, not_solid, flags)?
                 };
-                if other != id && in_way {
+                let itself = own.contains(&other);
+                if !itself && in_way {
                     if !self.callback(world, id, ALLOW_OVERLAP, other as i16)?
                         && !self.callback(world, other, ALLOW_OVERLAP, id as i16)?
                     {
@@ -985,7 +1164,7 @@ impl Interpreter<'_> {
                             return Ok(Some(Refusal::Collision(Some(other))));
                         }
                     }
-                } else if other != id
+                } else if !itself
                     && person.is_none()
                     && index == 8
                     && self.exclusive_clash(world, id, other, not_solid, exclusive)?
