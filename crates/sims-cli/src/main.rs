@@ -12,7 +12,7 @@ const USAGE: &str = "usage: sims census <path>...
        sims install <install-root>
        sims houses <install-root> <neighborhood-dir>
        sims boot <install-root> <house-file> [--ticks N] [--answers A,B,...]
-                 [--frames LIST] [--snapshot FILE]
+                 [--frames LIST] [--snapshot FILE] [--play]
 
   census   Decode every resource under the given files or directories and
            report failures and resource types that have no reader yet.
@@ -27,7 +27,9 @@ const USAGE: &str = "usage: sims census <path>...
            house view draws a frame: tick numbers (0 for before the first
            tick), N+ for every tick from N on, N+S for N and every S-th
            tick from there, or none; the default is 0,1,2,3,33+30.
-           --snapshot saves that state to a REDB file as \"boot\".";
+           --snapshot saves that state to a REDB file as \"boot\". --play
+           steps in play mode: an object's error resets the object instead
+           of stopping the boot (not for comparing with the original).";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -77,9 +79,14 @@ fn main() -> ExitCode {
                 answers: Vec::new(),
                 snapshot: None,
                 frames: boot::Frames::default(),
+                play: false,
             };
             let mut rest = rest.iter();
             while let Some(flag) = rest.next() {
+                if flag == "--play" {
+                    options.play = true;
+                    continue;
+                }
                 match (flag.as_str(), rest.next()) {
                     ("--ticks", Some(n)) if n.parse::<u32>().is_ok() => {
                         options.ticks = n.parse().unwrap_or_default();
