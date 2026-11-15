@@ -114,6 +114,13 @@ fn unmoved(fx: &Fixture, me: u16) -> impl PartialEq + std::fmt::Debug + use<> {
     )
 }
 
+/// Sets what not fitting changes, so [`unmoved`] can compare the rest:
+/// only word 52, to 0 (the fixture's 7 is written over; no object is
+/// collided with, so word 54 stays 0).
+fn unfit(fx: &mut Fixture, me: u16) {
+    fx.world.objects.get_mut(&me).unwrap().data[52] = 0;
+}
+
 fn floats(values: [i32; 3]) -> [F32; 3] {
     values.map(|n| F32::from_bits((n as f32).to_bits()))
 }
@@ -183,11 +190,11 @@ fn upstairs_a_person_needs_a_floor() {
     fx.lamp_mut().position = [56, 40, 2];
     let start = fx.world.clone();
     // Without placement flag 0x200 a tile above the ground needs a floor
-    // (0x4330b7). The person does not fit, and what the original does
-    // then is not ported. A floor on tile (2, 3) is not this tile's.
+    // (0x4330b7). The person does not fit. A floor on tile (2, 3) is not
+    // this tile's.
     fx.world.arrays.get_mut(&101).unwrap().data[(2 * 64 + 3) * 2] = 1;
     let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454e09")));
+    assert_eq!(result, Ok(false));
     // With a floor (here in the word's high byte), and placement flag 1
     // to stand on one, it does.
     fx.world = start.clone();
@@ -256,9 +263,47 @@ fn the_slot_tables_own_record_and_flags_come_first() {
     assert!(refused(result));
 }
 
-/// Whether Snap failed loudly because its own checks refused the place.
+/// Whether Snap found that I do not fit: the false branch.
 fn refused(result: Result<bool, sims_vm::Fault>) -> bool {
-    matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x4550f9"))
+    result == Ok(false)
+}
+
+#[test]
+fn not_fitting_sets_words_52_and_54_from_the_placement_error() {
+    // The lot's border leaves placement error 1: word 52 becomes 2. My
+    // room refusing leaves the 0 Snap cleared it to (0x454d64): word 52
+    // becomes 0. Word 54 names no object either way.
+    for (place, word_52) in [([8, 40, 1], 2), ([56, 24, 1], 0)] {
+        let (mut fx, me) = snapper(0);
+        fx.world.objects.get_mut(&me).unwrap().data[54] = 9;
+        fx.lamp_mut().position = place;
+        assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(false));
+        let data = &fx.world.objects[&me].data;
+        assert_eq!((data[52], data[54]), (word_52, 0), "{place:?}");
+    }
+    // Another person stands on the place, in my way: the collision (code
+    // 11, 0x433b42) names it, and word 54 becomes its ID.
+    let (mut fx, me) = snapper(0);
+    fx.lamp_mut().position = [56, 56, 1];
+    let before: Vec<u16> = fx.world.objects.keys().copied().collect();
+    assert_eq!(create(&mut fx, 0, 0, SIM as i16), Ok(true));
+    let other = *fx
+        .world
+        .objects
+        .keys()
+        .find(|id| !before.contains(id))
+        .unwrap();
+    assert_eq!(fx.world.objects[&other].position, [56, 56, 1]);
+    let start = fx.world.clone();
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(false));
+    let data = &fx.world.objects[&me].data;
+    assert_eq!((data[52], data[54]), (0, other as i16));
+    assert_eq!(fx.world.objects[&me].position, [40, 40, 1]);
+    // With flag bit 1, whether that person lets me through (0x45bd5e) is
+    // not ported.
+    fx.world = start;
+    let result = snap(&mut fx, me, LAMP as i16, 0, 3, 2);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454e54")));
 }
 
 /// Sets wall segments on a tile of the ground level (lot array 2, 14
@@ -275,10 +320,12 @@ fn without_flag_0x800_the_place_must_be_inside_the_border_and_my_room() {
     fx.lamp_mut().position = [56, 56, 1];
     assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
     assert_eq!(fx.world.objects[&me].position, [56, 56, 1]);
-    // Tile (3, 1) is in room 0, and tile (0, 2) on the lot's border.
-    for place in [[56, 24, 1], [8, 40, 1]] {
+    // Tile (3, 1) is in room 0, and tile (0, 2) on the lot's border: the
+    // border's placement error, 1, makes word 52 2 (0x454e66).
+    for (place, word_52) in [([56, 24, 1], 0), ([8, 40, 1], 2)] {
         let (mut fx, me) = snapper(0);
         fx.lamp_mut().position = place;
+        fx.world.objects.get_mut(&me).unwrap().data[52] = word_52;
         let start = unmoved(&fx, me);
         assert!(
             refused(snap(&mut fx, me, LAMP as i16, 0, 3, 0)),
@@ -738,7 +785,7 @@ fn snap_into_a_container_slot_needs_the_slot_and_a_place_in_it() {
     assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x45522c")));
     // The place test refuses: the slot holds another object, the lamp
     // takes less than I weigh, or my data word 4 lacks the bit for the
-    // slot's height. Not fitting fails loudly and moves nothing.
+    // slot's height. I do not fit, and nothing moves.
     let refusals: [fn(&mut Fixture, u16); 3] = [
         |fx, _| fx.lamp_mut().slots[2].object = LAMP as i16,
         |fx, _| fx.lamp_mut().data[28] = 2,
@@ -747,12 +794,10 @@ fn snap_into_a_container_slot_needs_the_slot_and_a_place_in_it() {
     for (case, refuse) in refusals.into_iter().enumerate() {
         let (mut fx, me) = container_snapper();
         refuse(&mut fx, me);
+        unfit(&mut fx, me);
         let start = unmoved(&fx, me);
         let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
-        assert!(
-            matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454e09")),
-            "case {case}"
-        );
+        assert_eq!(result, Ok(false), "case {case}");
         assert_eq!(unmoved(&fx, me), start, "case {case}");
     }
 }
@@ -801,9 +846,10 @@ fn a_container_slot_at_height_0_raised_off_the_floor_is_height_5() {
     // Height 0 with a nonzero offset up is height 5: data word 4 needs
     // bit 4 (16), not bit 0.
     let (mut fx, me) = offset_container([0.0, 0.0, 2.0]);
+    unfit(&mut fx, me);
     let start = unmoved(&fx, me);
     let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454e09")));
+    assert_eq!(result, Ok(false));
     assert_eq!(unmoved(&fx, me), start);
     let (mut fx, me) = offset_container([0.0, 0.0, 2.0]);
     fx.world.objects.get_mut(&me).unwrap().data[4] = 16;
@@ -817,8 +863,9 @@ fn nothing_goes_into_an_object_it_holds() {
     let (mut fx, me) = container_snapper();
     fx.lamp_mut().data[26] = me as i16;
     fx.lamp_mut().data[14] = 1;
+    unfit(&mut fx, me);
     let start = unmoved(&fx, me);
     let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454e09")));
+    assert_eq!(result, Ok(false));
     assert_eq!(unmoved(&fx, me), start);
 }

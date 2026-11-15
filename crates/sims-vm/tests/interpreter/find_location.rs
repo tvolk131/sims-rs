@@ -181,7 +181,7 @@ fn mode_1_takes_the_object_off_the_lot() {
 fn other_find_location_modes_fail_loudly() {
     let (mut fx, _) = placeable();
     let id = widget(&mut fx);
-    for mode in 2..=5 {
+    for mode in [2, 5] {
         let result = run(
             &mut fx,
             0,
@@ -190,6 +190,42 @@ fn other_find_location_modes_fail_loudly() {
             [mode, 0, 0, 0, 0, 0, 0, 0],
         );
         assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("not ported")));
+    }
+    // Modes 3 and 4 need an object to search from (flag bit 0): native
+    // error 0x3d (0x44b676).
+    for mode in [3, 4] {
+        let result = run(
+            &mut fx,
+            0,
+            id as i16,
+            FIND_LOCATION,
+            [mode, 0, 0, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(trap(result).code(), Some(0x3d), "mode {mode}");
+    }
+}
+
+#[test]
+fn modes_3_and_4_search_along_a_line_by_the_objects_facing() {
+    // The lamp stands on tile (2, 2), facing 0. Mode 3 searches along its
+    // facing: the second tile coordinate steps 0, 1, -1 (0x434be9). Mode
+    // 4 turns it by 2: the first coordinate steps.
+    for (mode, second) in [(3, [40, 56, 1]), (4, [56, 40, 1])] {
+        let (mut fx, _) = placeable();
+        fx.lamp_mut().position = [40, 40, 1];
+        fx.lamp_mut().data[1] = 0;
+        let (first, other) = (widget(&mut fx), widget(&mut fx));
+        for (id, expected) in [(first, [40, 40, 1]), (other, second)] {
+            let result = run(
+                &mut fx,
+                LAMP as i16,
+                id as i16,
+                FIND_LOCATION,
+                [mode, 0, 1, 0, 0, 0, 0, 0],
+            );
+            assert_eq!(result, Ok(true), "mode {mode}");
+            assert_eq!(fx.world.objects[&id].position, expected, "mode {mode}");
+        }
     }
 }
 
