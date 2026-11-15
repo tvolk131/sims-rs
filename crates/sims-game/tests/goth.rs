@@ -1462,7 +1462,7 @@ fn the_personality_panel_shows_the_selected_goths_traits() {
             .panel()
             .iter()
             .filter_map(|item| match item.kind {
-                Kind::Personality(values) => Some(values),
+                Kind::Personality { traits, .. } => Some(traits),
                 _ => None,
             })
             .collect();
