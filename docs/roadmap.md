@@ -2123,7 +2123,7 @@ through their public interfaces only; the simulation never depends on it.
   Serve Meal; the bookshelf lists Read a Book and the studies.
 - **Blocked: a Sim doing what he is told.** Idle For Input now starts
   a queued order (#131): Have A Snack queued on the fridge at tick 51
-  leaves the queue by tick 151. Three ticks later, the other Goth
+  leaves the queue by tick 151. Three ticks later, another person
   (object 16) fails a route that names its slot from source 2 (tree
   0x2156 node 5; 0x45ac2e, not ported), which stops the lot in strict
   mode. Without an order, strict mode runs to tick 1102. That route is
