@@ -35,15 +35,22 @@ performance and the friends needed) is not drawn yet.
   Creativity. It counts only where it is more than the person's skill.
   - `household::Careers` reads the careers.
   - `Snapshot::with_careers` fills in each resident's needs; a host
-    calls it after `Snapshot::read`.
+    calls it after `Snapshot::read`. The game and the viewer load the
+    careers when they open and do (`sims_game::Game::snapshot` gives
+    what the panel is laid out from).
+  - A need is the career's whole 32-bit value, as 0x4ea883 returns it,
+    so a custom career past 32,767 still marks where it says.
 - **What a need draws** (0x530407), in the labels' color (0x6f2a94,
   which is the needs labels' 0xc679):
   - a line down the bar at the need's last pixel;
-  - a line along the bar's bottom row, from 16 left of the bar to it.
-  - The original shows a skill's label only where there is a need
-    (0x5e4c01 on the label gadget). Here a label without a need is not
-    drawn. **Unverified:** whether the original hides it or draws it
-    disabled.
+  - a line along the bar's bottom row, from 16 left of the bar to it;
+  - the skill's label underlined. Every label is drawn; where there is
+    a need, 0x5e4c01 sets the label gadget's +0x170, which 0x5e3ef1
+    passes to the font as flag 4. The font's glyph drawing (0x60bf62)
+    then lines each character, from where it starts to a pixel past
+    its advance (glyph +0x18), in the text's color, on the row just
+    under an `A` (0x60b927: `A`'s y bearing plus its height), when that
+    row is inside the line. `Font::draw_underlined` does this.
 - **Unverified:** the labels' vertical place in their box (centred on
   the font's line here) and the subpanel's x, as for the personality
   panel.
@@ -54,7 +61,9 @@ performance and the friends needed) is not drawn yet.
     has a skill, and Mortimer's next level (Science, "Lab Assistant")
     needs none;
   - a second digest moves Mortimer to "Field Researcher": the install's
-    "Science Teacher" then needs a point of Charisma and three of Logic.
+    "Science Teacher" then needs a point of Charisma and three of Logic;
+  - `sims-game`'s Goth test checks the same through the game's own
+    snapshot, so a host that skips the careers fails it.
 
 Reopen with a screenshot of the original's job panel.
 

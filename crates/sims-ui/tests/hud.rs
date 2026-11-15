@@ -161,7 +161,7 @@ fn the_goths_job_panel() {
     // screen (see docs/decisions.md).
     assert_eq!(
         draw(&opened.snapshot),
-        "853d8f5f84a87fe117699855df052fb7352ff573a0608630d309dab4ac09b1a9"
+        "3332eada844f300442b413d9994c5aab8b198314ec41292cd584e9261b6fed64"
     );
     // A level up the ladder, "Field Researcher": the next level, "Science
     // Teacher", needs a point of Charisma and three of Logic, and he has
@@ -173,6 +173,6 @@ fn the_goths_job_panel() {
     assert_eq!(snapshot.residents[0].needs, [0, 0, 100, 0, 300, 0]);
     assert_eq!(
         draw(&snapshot),
-        "0b6aa2fbe51928b75e2a87a9c581d6550ecb86cb0ee2526c756f5295b6e256bc"
+        "f31ded2b92e5ae9d45e42de2f78142b1f9ed22423feb4b6d702bb1cce3ba6e01"
     );
 }

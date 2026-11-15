@@ -2102,10 +2102,11 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   `SIMS_INSTALL`; it is not yet compared with a screenshot, and the
   zodiac sign under the bars is not drawn.
 - **Done: the job panel's skills.** The Job button opens the selected
-  Sim's six skill bars, with a line marking what the next level of
-  their career needs (from `work.iff`, through
-  `Snapshot::with_careers`), as the original's ordinary job panel draws
-  them (0x5301ca). The Goths' panel is pinned by digest, gated on
+  Sim's six skill bars, with the labels of what the next level of
+  their career needs underlined and a line marking how much (from
+  `work.iff`, through `Snapshot::with_careers`, which the game and the
+  viewer call), as the original's ordinary job panel draws them
+  (0x5301ca). The Goths' panel is pinned by digest, gated on
   `SIMS_INSTALL`; it is not yet compared with a screenshot.
 - **Next:** open houses through `sims_vm::boot::Lot` (which now runs the
   household load) in the tests and the viewer, in place of their

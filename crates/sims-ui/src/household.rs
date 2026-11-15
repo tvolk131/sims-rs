@@ -36,7 +36,7 @@ pub struct Resident {
     /// What the next level of the career needs of each skill, where the
     /// person has less: 0 elsewhere, and everywhere until
     /// [`Snapshot::with_careers`] fills it in.
-    pub needs: [i16; 6],
+    pub needs: [i32; 6],
 }
 
 /// The person data words of the personality, in the panel's order: Neat,
@@ -126,7 +126,7 @@ impl Snapshot {
                     .and_then(|l| l.values.get(SKILL_NEEDS[n]).copied())
                     .unwrap_or(0);
                 if need > i32::from(resident.skills[n]) {
-                    i16::try_from(need).unwrap_or(i16::MAX)
+                    need
                 } else {
                     0
                 }
@@ -345,5 +345,43 @@ mod tests {
         assert_eq!(snapshot(0, 0, 0).money(), "$0");
         assert_eq!(snapshot(0, 0, 1_234_567).money(), "$1,234,567");
         assert_eq!(snapshot(0, 0, i32::MIN).money(), "-$2,147,483,648");
+    }
+
+    #[test]
+    fn the_next_level_needs_what_the_person_lacks() {
+        let level = |values: [i32; 6]| {
+            let mut level = Level {
+                values: [0; 21],
+                strings: Default::default(),
+            };
+            level.values[1..7].copy_from_slice(&values);
+            level
+        };
+        let mut careers = Careers::default();
+        careers.insert(
+            9,
+            vec![level([0; 6]), level([100, 0, 300, 40_000, 200, -5])],
+        );
+        let resident = |job: [i16; 2]| Resident {
+            object: 1,
+            guid: 1,
+            motives: [0.0; 16],
+            personality: [0; 5],
+            skills: [0, 0, 300, 1000, 199, 0],
+            job,
+            needs: [7; 6],
+        };
+        let mut s = snapshot(0, 0, 0);
+        s.residents = vec![resident([9, 0]), resident([9, 1]), resident([0, 0])];
+        let needs: Vec<[i32; 6]> = s
+            .with_careers(&careers)
+            .residents
+            .iter()
+            .map(|r| r.needs)
+            .collect();
+        // Only more than the skill counts, and as the career has it, past
+        // the 16-bit range too; at the top level, or with no career,
+        // nothing.
+        assert_eq!(needs, [[100, 0, 0, 40_000, 200, 0], [0; 6], [0; 6]]);
     }
 }

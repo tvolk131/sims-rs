@@ -237,7 +237,7 @@ pub enum Kind {
     /// The job panel's skills, in `rect`, the subpanel: the selected
     /// Sim's skills and what the next level of their career needs of
     /// each, in the panel's order ([`crate::household::SKILLS`]).
-    Skills { skills: [i16; 6], needs: [i16; 6] },
+    Skills { skills: [i16; 6], needs: [i32; 6] },
     /// The first name of the person of type `guid`, in a box centered
     /// over `rect`'s bottom edge, while the pointer is on their portrait.
     Name { guid: u32 },
@@ -723,12 +723,13 @@ const SKILL_BAR: [i32; 2] = [157, 7];
 const SKILL_PITCH: i32 = 15;
 
 /// The job panel's skills as the original draws them (0x5301ca). Each
-/// skill's empty bar, then the full bar over it cut to 4 pixels a point
-/// (at 10 points, all of it). Where the next level of the career needs
-/// more of a skill, its label shows and a line marks the need: down the
+/// skill's label and empty bar, then the full bar over it cut to 4
+/// pixels a point (at 10 points, all of it). Where the next level of
+/// the career needs more of a skill, its label is underlined (0x5e4c01
+/// sets the label's font flag 4) and a line marks the need: down the
 /// bar at the need, and along the bar's bottom from 16 pixels left of
 /// the bar to it, in the labels' color (0x6f2a94).
-fn draw_skills(frame: &mut Frame, art: &Art, panel: Rect, skills: &[i16; 6], needs: &[i16; 6]) {
+fn draw_skills(frame: &mut Frame, art: &Art, panel: Rect, skills: &[i16; 6], needs: &[i32; 6]) {
     let (Some(font), Some(empty), Some(full)) = (
         art.font(SKILL_FONT),
         art.image(id::SKILL_EMPTY),
@@ -740,7 +741,10 @@ fn draw_skills(frame: &mut Frame, art: &Art, panel: Rect, skills: &[i16; 6], nee
     let full_h = i32::try_from(full.height).unwrap_or(0);
     for (n, ((name, skill), need)) in SKILL_NAMES.iter().zip(skills).zip(needs).enumerate() {
         let row = SKILL_PITCH * n as i32;
-        let bar = [panel.x + SKILL_BAR[0], panel.y + SKILL_BAR[1] + row];
+        let bar = [
+            panel.x.saturating_add(SKILL_BAR[0]),
+            panel.y.saturating_add(SKILL_BAR[1] + row),
+        ];
         frame.draw_all(empty, bar);
         let points = i32::from(*skill / 100).clamp(0, 10);
         let width = points * 4;
@@ -752,21 +756,37 @@ fn draw_skills(frame: &mut Frame, art: &Art, panel: Rect, skills: &[i16; 6], nee
             };
             frame.draw(full, Rect::new(0, 0, cut, full_h), bar);
         }
+        let [x, y, w, h] = SKILL_LABEL;
+        let label = Rect::new(
+            panel.x.saturating_add(x),
+            panel.y.saturating_add(y + row),
+            w,
+            h,
+        );
+        let at = [
+            label.x.saturating_add(label.width - font.width(name)),
+            label
+                .y
+                .saturating_add((label.height - font.line_height) / 2),
+        ];
         if *need <= 0 {
+            font.draw(frame, name, at, LABEL);
             continue;
         }
-        let [x, y, w, h] = SKILL_LABEL;
-        let label = Rect::new(panel.x + x, panel.y + y + row, w, h);
-        let at = [
-            label.x + label.width - font.width(name),
-            label.y + (label.height - font.line_height) / 2,
-        ];
-        font.draw(frame, name, at, LABEL);
-        let mark = bar[0] + i32::from(*need / 100) * 4 - 1;
-        let bottom = bar[1] + full_h - 1;
-        frame.fill(Rect::new(mark, bar[1], 1, bottom - bar[1] + 1), LABEL);
+        font.draw_underlined(frame, name, at, LABEL);
+        let mark = bar[0]
+            .saturating_add((*need / 100).saturating_mul(4))
+            .saturating_sub(1);
+        let bottom = bar[1].saturating_add(full_h - 1);
+        frame.fill(Rect::new(mark, bar[1], 1, full_h), LABEL);
         frame.fill(
-            Rect::new(bar[0] - 16, bottom, mark - (bar[0] - 16) + 1, 1),
+            Rect::new(
+                bar[0].saturating_sub(16),
+                bottom,
+                mark.saturating_sub(bar[0].saturating_sub(16))
+                    .saturating_add(1),
+                1,
+            ),
             LABEL,
         );
     }
@@ -1459,11 +1479,12 @@ mod tests {
         let items = layout([800, 600], &s, &controls);
         assert!(!items.iter().any(|i| matches!(i.kind, Kind::Skills { .. })));
 
-        // Bars 40 by 11 from (157, 7), 15 apart; labels in a font whose
-        // glyphs are 0 wide, so they draw nothing.
+        // Bars 40 by 11 from (157, 7), 15 apart. The labels' font has
+        // only a `g`, 1 wide and 2 high, hanging so that a line under
+        // an `A` falls inside the line: "Cooking" and "Logic" draw it.
         let (empty, full) = ([1, 1, 1], [2, 2, 2]);
         let mut art = Art::default();
-        art.insert_font(SKILL_FONT, crate::font::tests::font());
+        art.insert_font(SKILL_FONT, crate::font::tests::hanging_font());
         art.insert(id::SKILL_EMPTY, solid(40, 11, empty));
         art.insert(id::SKILL_FULL, solid(40, 11, full));
         let mut frame = Frame::new(220, 110, [0; 3]);
@@ -1471,11 +1492,11 @@ mod tests {
             &mut frame,
             &art,
             Rect::new(0, 0, 220, 100),
-            &[250, -5, 1000, 0, 999, 380],
-            &[0, 300, 0, 0, 0, 700],
+            &[250, -5, 1000, 0, 450, 380],
+            &[0, 300, 0, 0, 700, 700],
         );
-        // 4 pixels a point: 2, none, 10 (all 40), none, 9, 3.
-        for (n, points) in [2, 0, 10, 0, 9, 3].into_iter().enumerate() {
+        // 4 pixels a point: 2, none, 10 (all 40), none, 4, 3.
+        for (n, points) in [2, 0, 10, 0, 4, 3].into_iter().enumerate() {
             let y = 7 + 15 * n as i32 + 5;
             let row: Vec<_> = (140..200).map(|x| frame.pixel(x, y).unwrap()).collect();
             let at = |x: i32| row[(x - 140) as usize];
@@ -1485,7 +1506,8 @@ mod tests {
                 at(157 + 4 * points - 1),
                 if points > 0 { full } else { [0; 3] }
             );
-            if points < 10 {
+            // Logic's and Creativity's need lines are at 7 points.
+            if points < 10 && n < 4 {
                 assert_eq!(at(157 + 4 * points), empty, "bar {n}");
             }
             assert_eq!(at(196), if points == 10 { full } else { empty });
@@ -1507,5 +1529,45 @@ mod tests {
         assert_eq!(frame.pixel(157 + 28 - 1, 7 + 75 + 10), Some(LABEL));
         // No need, no line: Cooking's bottom row left of its bar is clear.
         assert_eq!(frame.pixel(150, 7 + 10), Some([0; 3]));
+        // Every label is drawn, right-aligned in its 62 by 16 box from
+        // (93, 6): the `g` at x 154, rows 2 and 3 of the 4-high line
+        // centred in the box. Logic's, with a need, is underlined (on the
+        // row under an `A`, 2 wide for the `g`'s advance); Cooking's is
+        // not.
+        let g = |row: i32| [154, 6 + 15 * row + 6 + 2];
+        for row in [0, 4] {
+            let [x, y] = g(row);
+            assert_eq!(frame.pixel(x, y), Some(LABEL), "row {row}");
+            assert_eq!(frame.pixel(x, y + 1), Some(LABEL), "row {row}");
+            assert_eq!(frame.pixel(x - 1, y), Some([0; 3]), "row {row}");
+        }
+        let [x, y] = g(0);
+        assert_eq!(frame.pixel(x + 1, y), Some([0; 3]));
+        let [x, y] = g(4);
+        assert_eq!(frame.pixel(x + 1, y), Some(LABEL));
+        assert_eq!(frame.pixel(x + 2, y), Some([0; 3]));
+        // A need past the panel's 16-bit range is kept: 400 points mark
+        // 1,600 pixels on.
+        let mut wide = Frame::new(1800, 110, [0; 3]);
+        draw_skills(
+            &mut wide,
+            &art,
+            Rect::new(0, 0, 220, 100),
+            &[0; 6],
+            &[0, 0, 0, 0, 40_000, 0],
+        );
+        assert_eq!(wide.pixel(157 + 1600 - 1, 67), Some(LABEL));
+        assert_eq!(wide.pixel(157 + 1600, 67), Some([0; 3]));
+        // Far coordinates do not overflow.
+        let mut frame = Frame::new(4, 4, [0; 3]);
+        for at in [i32::MAX - 10, i32::MIN + 200] {
+            draw_skills(
+                &mut frame,
+                &art,
+                Rect::new(at, at, 220, 100),
+                &[1000; 6],
+                &[i32::MAX; 6],
+            );
+        }
     }
 }
