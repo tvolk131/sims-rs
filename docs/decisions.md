@@ -39,11 +39,12 @@ button from rotation 0; origin [575, -203]). Exact matches:
 - Open grass (x 560 to 760, y 440 to 540): 12.7%. **The grass does not
   match at this rotation.** The shading has the same shape, but its
   dark streaks sit in other places, and the blades differ. Counting the
-  blade map from view tile 0, or from either rotated lot corner, instead
-  of from the lot's least view corner, reaches only 16%. So the
-  per-vertex shading itself turns wrongly with the camera, not only the
-  blade map. Reading how the original turns the heights and the sun at
-  0x4a4551 and 0x479567 is the next step.
+  vertex jitter and the blade map from view tile 0, or from either
+  rotated lot corner, instead of from the lot's least view corner,
+  reaches only 16%. The cause is **unverified**: the shading, the
+  jitter's coordinates or the blade map may each turn differently in
+  the original. Reading how it turns the heights (0x479567) and the sun
+  (0x4a4551) is the next step.
 
 **Seen at both cameras:** lamps are missing. The floor lamp in the
 upstairs-left room and the kitchen counter's lamp (also missing at the
