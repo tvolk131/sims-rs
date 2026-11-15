@@ -115,6 +115,314 @@ under the title (`household::zodiac`, `Resident::zodiac`, drawn by
   - the Goths' saved signs agree with the ones their traits give, and
     the panel's digest is pinned again.
 
+## 2026-11-15: The three more houses recorded are the Newbies, the Pleasants in 6 Sim Lane and the Roomies in 10 Sim Lane
+
+The roadmap's step 3 asks for 1000-update recordings of three more
+base-game houses, picked for code the Goths do not reach. In the
+install's base neighborhood (`UserData`) only the Goths (House05) and
+the Newbies (House07) live in a house; the other eight base houses are
+empty, and the three base families without a house (the Pleasants,
+the Roomies, the Bachelor) wait in the family bin. The houses in
+`UserData2` to `UserData8` belong to neighborhoods the game has not
+opened yet (their families are imported on the first visit) and do not
+load in strict mode yet. So two of the three are moves into empty base
+houses, made in the original and saved once before the recording.
+
+**The Newbies (House07).** The other resident base family: two adults,
+no job yet, a different lot, and objects the Goth house does not hold
+(by object file: `ShowerC`, `MedicineCabinet`, `Stereos`, `TVs`,
+`flamingo`, `lampgarden`, `comeandsee`, `HelpSystem`). No save is
+needed; the recording reads the install's own `UserData`.
+
+**The Pleasants in 6 Sim Lane (House06).** Two adults and two
+children. The Goths have one child (Cassandra). With two, the school
+bus can take two children, and child-to-child interactions and the
+siblings' relationship can run, which a one-child house never starts.
+**Unverified**: the 1000 updates cover 7:10 to 7:43 in the morning, and
+whether they reach this code has not been checked.
+House06 is the furnished empty base house the family can afford
+(§10,206 of their §20,000), with a bed, fridge, shower, toilet and
+phone; its objects are base game only. The move-in is a player action
+in the neighborhood view, made once (steps in the capture's
+`movein-input-log.txt`), then the game was saved and the whole
+`UserData` folder frozen next to the capture.
+
+**The Roomies in 10 Sim Lane (House10).** Two unrelated adults (no
+couple, no child), in a house with a fireplace (`Fireplaces.iff`, which no Goth
+object uses) and a different floor plan and lot. The Roomies bought it
+for §14,143 of their §20,000 and kept §5,856; the two larger empty
+houses (2 Sim Lane with the pool at §50,776 and 3 Sim Lane at §24,793)
+cost more than any family in the bin has. The Bachelor, the other
+family left, is one adult, which runs less than two. Moved in and saved
+in the original the same way as the Pleasants (steps in the capture's
+`movein-input-log.txt`); the save writes the house with SIMI version
+0x49.
+
+**What the save holds that is not lot content.** The Complete
+Collection adds the expansion packs' controller objects to every lot on
+load (the Goth house goes from 245 saved objects to 377 at update 1),
+and a save writes them into the house file: the saved House06 names
+objects from every expansion pack and from Downloads (controllers,
+phone plugins, inventory tokens such as gifts and collars) beside its
+103 base objects. A boot from the frozen snapshot has to load those
+definitions, as a load of an unsaved house makes them.
+
+**What our side reaches on them** (strict mode; for the Pleasants and
+the Roomies, with the frozen save as the neighborhood). The Newbies run
+all 1000 updates. Their first differences: the globals at two of updates
+1 to 3, the animators from update 1, positions from update 32 and
+motives from update 154. One neighborhood record differs from update 629
+on, in a record where the two neighborhood files themselves differ. The
+Roomies load equal to the original. The Pleasants also load equal, but
+for object 243 (data word 50 and its last result) and object 241's frame
+(tree 0x2029, against the original's 0xa029). Both stop in update 1 at
+the same place: a person's route with no route context (tree 0x0176 node
+26, 0x45ae65), which is not ported. At that stop, person word 27 is one
+behind the original's completed update 1, because that person's turn has
+not finished.
+
+**Reopen** if a house in `UserData2` to `UserData8` loads in strict mode
+and offers more unreached code than a move-in does.
+
+## 2026-11-15: A person is lit by the original's standard light, at their room's level
+
+People on a lot were drawn with our own light: a shade from 0.45 in
+shadow to 1 facing a light from the viewer's right. They are now lit as
+the original lights them, as far as it is read (`raster::Lighting`,
+`lot::level`, `lot::STANDARD_LIGHT`). The entry "How the original
+lights a person" (2026-11-14) has what was read before. This entry says
+what changed and what settled it.
+
+- **The light keeps its place relative to the viewer.** Before setting
+  the standard light, the original turns it by the view object's matrix
+  at +0x130 (0x4b49f5). That matrix is a turn about the vertical by
+  `((−rotation) & 3) × π/2`, built with the house camera (0x49b60e to
+  0x49b642). The camera turns by the same quarter turns, so the light
+  stays where it is relative to the viewer. Ours already did that.
+- **Its direction.** `stdlight.lgt` gives the light a position (6.79,
+  9.55, 6.79) and a direction (−0.644, −0.418, −0.641). The direction
+  points from that position towards the middle, so it is the way the
+  light shines, as Direct3D takes a directional light's direction. The
+  direction towards the light is therefore (0.644, 0.418, 0.641). The
+  drawing frame is the files' frame, so this needs no change of axes.
+  At rotation 0 the house camera's eye is along (0.61, 0.5, 0.61), so
+  the light is above and behind the viewer, a little lower than the eye
+  (about 25° above the ground to the eye's 30°).
+- **The level.** The person's level is their room's light, as the lot
+  renderer stores it for the room's tiles (`sims_render::lot::room_light`,
+  the room's shown light), over 255, held between 0.5 and 1. The
+  original reads the level from the drawing's lighting record
+  (0x4b4499). That record's only setter (0x4b4525) holds it between 0.5
+  (0x6c7420) and the brightest a lit tile may be (0x6c741c, 1 by day).
+  The lot's objects set it from the tile light map, the light byte over
+  255 (0x467482, 0x4b0e24). That a person's record is set the same way,
+  from the tile they stand on, is **unverified**.
+- **The shade.** The original sets the ambient light to the grey
+  `round(255 × level)` and the standard light's strength to the level,
+  and Direct3D adds them up per vertex, held to 1. So the shade is
+  `min(1, round(255 × level) / 255 + level × max(0, n · l))`. The
+  material is taken to be white: a person at full light matches the
+  screenshot below only if the ambient part is near 1.
+
+**What a screenshot shows.** The original's screenshot of Mortimer on
+the porch at medium zoom (outdoors, by day, so level 1) was compared
+with ours drawn at full light everywhere. Over his 768 pixels the
+original is 0.93 of ours at the median. The lot around him is 0.97,
+from colour depth and filtering. The ratio does not follow any light
+direction tried (eight signs of the standard light and five others; the
+largest correlation is 0.15). So the original draws him with no visible
+light side, as level 1 gives. Our old light drew his shadow side at
+0.45 and was visibly darker.
+
+**Unverified.**
+- That the vector is the way the light shines. A person at full light
+  shows no side, so only a person in a dim room in a screenshot can
+  settle it. A screenshot of Bella indoors (2026-11-14) is brighter on
+  the viewer's left, but she was walking at an unknown phase and was
+  not drawn to match.
+- The person's level coming from their tile.
+- The material's colours.
+
+**Not ported.**
+- The room's lamps: a light from each lamp of the room within 20
+  units, at full strength to 15.
+- The level's fade over 250 ms.
+- The cap of 0.8 after dark (the lot renderer does not have it either).
+- The person's flag (+0x114 bit 0) that draws them at full light.
+
+`Canvas::draw`, the offscreen renderer and the pie menu's head, keeps
+our own light, unchanged to the bit.
+
+## 2026-11-15: The queue's icons show their objects' catalog pictures
+
+An object's icon in the action queue now shows its type's catalog
+picture, as the original makes it (`sims_ui::thumbnail`). The earlier
+queue entry said the original renders the picture from the object's
+sprites. That is only its fallback. Read from the code:
+
+- **Which types have one** (0x4cd830): each definition in an object file
+  gets a catalog item (0x4cbd44, kept at definition +0x84). The
+  exceptions are a multi-tile object's tiles other than its lead, and
+  people. A definition also needs graphics (0x457588) or an interaction
+  table with entries (0x4575a1, 0x457cb0): the `TTAB` its `OBJD` word at
+  byte 0x0e names, from its own file or else its semi-global file. Stock
+  `ReserveTile` has neither, so it has no item (a Goth test checks
+  this). An object shows its own item, or for a multi-tile object, its
+  file's lead tile's (0x45728d, 0x43ae0a: same master ID, sub-index -1).
+  An object without one shows the dark grey square, as before.
+- **The thumbnail** (0x4cbdc3): the file's `BMP_` with the definition's
+  catalog strings ID (`OBJD` byte 0x52). For a type with graphics it is
+  kept only if it is 74 by 37: two 37 by 37 cells, the object on the
+  catalog's normal and highlighted backgrounds. Of the install's 1,835
+  items (one per lead definition), 1,656 ship a thumbnail that is kept,
+  and none uses the magenta key color; 69 types that are not people have
+  no item. A thumbnail that does not decode is reported, and its item is
+  kept without it, as the original keeps the item.
+- **The icon** (0x4ccaa0): the first 45 by 45 cell of `kCatalogTemplate`
+  (4300, `CPanel/Catalog/ThumbTemplate.bmp`), then the thumbnail's left
+  half (when wider than 45) centred over it, 4 pixels in for a 74 by 37
+  one. The icon frame goes over that.
+- **Verified (a Goth test,
+  `the_queues_icons_show_their_objects_catalog_pictures`):** the queued
+  fridge's icon and the running snack's show their own thumbnails' left
+  cells, pixel for pixel, inside the frame.
+- **Not ported:** the render (0x4e57a6) of a type whose thumbnail is
+  missing or the wrong size: 179 of the 1,835, mostly social
+  interactions, plus a few objects (cookbook, wall lamps, a display
+  case). Such an icon shows the empty template, which is what 0x4ccaa0
+  leaves when it has no thumbnail.
+- **Unverified:** that the table's word +4, which 0x4575a1 tests, is
+  its entries, so that an empty table counts as none. Global 0x6f2a3c,
+  which drops every kept thumbnail of a type with graphics, is 0 in our
+  capture. No capture shows a queue icon.
+
+## 2026-11-15: Switching the selected Sim refreshes the deselected Sim's animator; a second press centres the view
+
+A press on another Sim's portrait now switches the selection in strict
+mode too. Deselecting a Sim refreshes its animator (0x58da12 with 0,
+from 0x446921). That refresh failed in strict mode (`Refresh::Fail`) and
+was left out in play mode (`Refresh::Skip`, `Lot::select_play`; the
+entry "Deselecting a Sim is ported but for its animator's refresh"
+below). Both are gone: the refresh is ported (`Interpreter::deselect`).
+
+- **The refresh** (read from the code): with 0, the gate on animator
+  byte +0x109 (whether the house view drew the person) is skipped, so
+  it always runs. It is the same path a take-off takes when the view
+  drew the person: the clock read again (virtual function 0x34, the
+  lot's tick count), the skin forced up to date at it (0x5992b3 with 1),
+  the animator placed (virtual function 0x60), and the head's step,
+  measurement and restoration (0x590768, 0x5904d2, 0x590b27). Then the
+  head slot's holder is redrawn (0x58dae5 to 0x58dc55, the third
+  container entry). The marker has just left that slot (0x4468fd comes
+  first), so it is usually empty. A person or a group tile there fails
+  (`head_slot_redraw`). It reuses `Interpreter::refresh_animator`.
+- **The clock between ticks**: the selection runs between lot updates,
+  and the animator's clock is the lot's tick count times its per-tick
+  step (0x585483). Our `World::ticks` is raised after the lot's pass,
+  and the recordings compare it after every update. So between ticks
+  it is the count the original reads.
+- **The portrait press** (0x4cf9c4): on another Sim's portrait it
+  selects through 0x4e989b. On a residential lot (0x40745f), 0x4e989b
+  selects the person when person word 32 is 0, else nobody. Global
+  0x6e4f64 overrides this; it is set at 0x4f961d and not read further.
+  Then 0x445449 runs. On the selected Sim's own portrait it centres the
+  view on the Sim instead (0x434ced with 1). Both play `UI_click`
+  (0x4cfa51).
+- **The centring** (0x434ced): nothing unless object data word 34 is 0
+  and word 29 is not negative. A person on the floor shown is centred
+  above its feet by trunc(2√6 · 2.0 · 2^(zoom+1)) / 2: 19, 39 and 78
+  pixels from far to near. The zoom is the house view's virtual
+  function 0x14, which returns 0x6f00d8 (vtable 0x668744). The person's
+  screen point is the sound code's (0x47bc1f about 1023, 0x4a9dc7,
+  `sound::object_point`). The original slides the view there
+  (0x4c9a27); the window jumps. It also clamps to the scroll limits
+  (0x4a9fa9), which the window does not have. Those limits keep the
+  original's origin small enough for the point's 16-bit cut; the
+  window's origin can go further, so it works the point out from the
+  lot's corner and adds the origin after. Anything else, or a person
+  on another floor, shows its floor (0x4a80c7) and is centred without
+  the rise unless off the lot (0x4a7af0).
+- **Verified**: the Goth house in strict mode selects another Goth, back
+  again, and runs 50 more ticks with no error
+  (`the_player_selects_another_goth`). The deselected Sim's animator
+  clock is the tick count's. Through the window
+  (`a_press_on_a_portrait_selects_that_goth_who_then_takes_the_order`),
+  a press on another Goth's portrait at tick 50 selects her (person 18)
+  and plays `UI_click`. A second press centres the view on her and
+  changes nothing on the lot. Have A Snack from the fridge's pie goes to
+  her, not to Mortimer, and she takes it 52 ticks later. Strict mode then
+  runs to tick 454. At tick 455 Mortimer, left to himself, routes to a
+  door one of his routes goes through (0x45b176). That is not ported, and
+  it is track 4's routing.
+- **Unverified**: no recording yet compares the lot after a switch.
+  Track 2 is asked for one, with the switch, a second press, and an
+  order to the second Sim. Also unverified: the people panel's call
+  0x51ea7a on a second press, when global 0x6f6bac (cast) is not the
+  Sim. It closes the panel's window at +0x31c and calls 0x586db2 with 0,
+  presumably ending a camera follow. It is left out. Also unverified: a
+  household member who is not on the lot (0x4e9652), and the lot's
+  bounds used by 0x4a7af0 (taken here as its 64 by 64 tiles).
+
+## 2026-11-15: A press lists the pie menu again, and reaching an entry checks it again
+
+Track 2's recording of the original ordering Mortimer's snack with the
+pointer (the goth-snack scenario: the pointer reached the fridge before
+update 124, pressed before 154, reached "Have A Snack" on the pie before
+176 and chose it before 202) was replayed through the window's input
+layer, in strict mode, with the same input between the same ticks, and
+our full state after every update compared with the recording's (the
+tick verifier, from a throwaway dump of the window's lot). Two input
+steps did not do what the original does; both are fixed:
+
+- **A press lists the menu again.** The live mode's press handler
+  (0x48cbec, vtable 0x667f94) first sets the object under the pointer
+  to none (0x48c834 with 0), so its own pick lists the menu anew
+  (0x48c834 skips only the object it has). The window used to open the
+  listing made when the pointer reached the object. In the recording
+  Mortimer's last result goes false again in update 154, as a listing
+  leaves it. `Game::press` now lists at every press on the lot.
+- **Reaching an entry checks its action again.** The menu window's
+  handler (0x51bb9e) calls 0x48df28 for the entry the pointer is on: a
+  context made by 0x458293 with the byte 1 (put back by 0x4582dd) and
+  0x458319 on the entry's action with the advertisement record as its
+  output. That is autonomy's form of the check: the arguments 1, 0, 0,
+  0, the target's data word 25, the entry's advertisements copied over
+  the record, and the room rule (0x45853f, only with an output).
+  0x48df28 then scores the record for the interface (0x4214a1).
+  `Lot::highlight` (`Interpreter::highlight`, `Machine::highlight`)
+  runs it, and the window calls it each time the pointer reaches a
+  choice's entry of an open menu (`Game::highlight`). In the recording
+  Mortimer's last result goes true in update 176 (the snack's check
+  passes), and the locals the snack's frames start with are what Have A
+  Snack's check tree (0x1008) left in his stack, not the listing's last
+  entry's (0x1030).
+
+**Verified** (the recording, to update 941): with both fixes the
+window's lot equals the recording's after every update from 1 to 453
+in everything the verifier compares, but for two things the input does
+not change. Person 259's animator is marked drawn at update 33 where
+the original's is not, and in a free run of the window against the long
+capture too: the window draws every tick. Bella's (object 18) frame of
+tree 8292 starts with a local of 16104 at update 203 where ours is 0,
+until update 228; the free long capture has 0 there. From update 454
+the people's Room motive differs in spells of 18 updates (454, 514,
+604), then Mortimer's data word 50 (from 622) and his running action
+(from 892). The input steps are done by then, and the same happens
+without the entry check, so that is the simulation after the snack,
+not the input. `the_recorded_snack_order_replayed_in_the_window_matches_the_recording`
+pins what the recording showed the input doing.
+
+**Unverified**: the message that makes the menu window call 0x48df28
+(the recording shows only that it ran when the pointer reached the
+entry), whether a pointer that moves within one entry checks it again
+(the window checks once per entry reached; leaving the window forgets
+the entry, so coming back onto it checks it again), and whether a check
+tree's Add/Change Action String adds anything then (taken as in
+autonomy's check: no menu is being built). The original's pie in the recording
+sits 24 pixels to the right of the press, where ours is centred on it.
+This supersedes "A click opens that listing" in the entry "The game
+lists the pie menu on the lot when the pointer reaches an object".
+
 ## 2026-11-15: A split floor's halves are cut straight, by the screen's clip rectangle
 
 A floor tile a diagonal wall splits now draws each half as the whole
@@ -2201,7 +2509,8 @@ An object reaching a pointer that stands still counts too: each frame
 drawn, the object under the pointer is looked up again. Nothing is
 listed over the panel, a dialog or a menu, or once the lot has stopped.
 A click opens that listing (or lists now, when the pointer did not move
-onto the object first). Only the entries whose check passes are shown,
+onto the object first). (Superseded: a click lists again; see "A press
+lists the pie menu again, and reaching an entry checks it again".) Only the entries whose check passes are shown,
 in the original's order. An entry a check tree named with Add/Change
 Action String (#140, as the fridge's meals are named) shows that name as
 it is; any other, or one named with an empty string, is named by the

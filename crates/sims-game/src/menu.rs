@@ -460,6 +460,12 @@ impl Menu {
         (self.layouts.len(), Pie::hit(&self.layouts, point))
     }
 
+    /// The entry (its index in [`Menu::entries`]) highlighted under
+    /// `point`: the one a press there would choose.
+    pub fn highlighted(&self, point: [i32; 2]) -> Option<usize> {
+        self.pie.choice_at(&self.layouts, point)
+    }
+
     /// A press at `point`, as the picker takes it. A submenu opened or
     /// closed is laid out at once, so the next press finds it; the
     /// pointer is to move to the middle of a submenu that opens (where
