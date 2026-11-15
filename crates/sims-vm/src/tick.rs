@@ -987,11 +987,7 @@ impl Interpreter<'_> {
                     && object.multipart.is_some()
                     && self.has_function(world, id, function::DYNAMIC_GROUP)
                 {
-                    return Err(TickError::Unsupported(format!(
-                        "removing object {id}, a tile of a group whose type has the dynamic \
-                         group function (8), at the end of the lot update: it leaves its group \
-                         first (0x42346a), which is not ported"
-                    )));
+                    self.leave_group(world, id)?;
                 }
                 if world.dialogs.records.iter().any(|r| r.caller == id) {
                     return Err(TickError::Unsupported(format!(

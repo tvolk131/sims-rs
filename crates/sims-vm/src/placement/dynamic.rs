@@ -134,6 +134,106 @@ impl Interpreter<'_> {
     }
 }
 
+impl Interpreter<'_> {
+    /// 0x42346a: the tile `id` of a dynamic group leaves its group
+    /// ([`unlink_tile`], 0x4228d6). Then the group it leaves, from its
+    /// lead (the tile after it, if it led), and the tile itself, if it
+    /// stands on the lot, work out their neighbours again
+    /// ([`Interpreter::find_neighbours`]).
+    pub(crate) fn leave_group(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let parent = world
+            .objects
+            .get(&id)
+            .ok_or_else(|| fail(Trap::native(10, "missing object")))?
+            .multipart
+            .as_ref()
+            .ok_or_else(|| {
+                fail(Trap::Invalid(format!(
+                    "object {id} is not a tile of a group"
+                )))
+            })?
+            .parent;
+        let rest = if parent == 0 {
+            world.next_parts.get(&id).copied()
+        } else {
+            Some(parent as u16)
+        };
+        unlink_tile(world, id).map_err(fail)?;
+        if let Some(rest) = rest {
+            self.find_neighbours(world, rest)?;
+        }
+        if stands_on_lot(world, id).map_err(fail)? {
+            self.find_neighbours(world, id)?;
+        }
+        Ok(())
+    }
+}
+
+/// 0x4228d6: takes the tile `id` out of its group's chain (+0x18c) and
+/// makes it a group of its own (lead +0x190 and next both 0). A lead's
+/// tiles, itself and those after it, first take the tile after it as
+/// their lead, and that tile then leads (its lead 0). Any other tile is
+/// passed over by the tile before it, the others' leads unchanged.
+fn unlink_tile(world: &mut World, id: u16) -> Result<(), Trap> {
+    let set_parent = |world: &mut World, tile: u16, parent: u16| -> Result<(), Trap> {
+        world
+            .objects
+            .get_mut(&tile)
+            .and_then(|o| o.multipart.as_mut())
+            .ok_or_else(|| Trap::Invalid(format!("object {tile} is not a tile of a group")))?
+            .parent = parent as i16;
+        Ok(())
+    };
+    let parent = world
+        .objects
+        .get(&id)
+        .and_then(|o| o.multipart.as_ref())
+        .ok_or_else(|| Trap::Invalid(format!("object {id} is not a tile of a group")))?
+        .parent;
+    let mut seen = std::collections::BTreeSet::new();
+    if parent == 0 {
+        let next = world.next_parts.get(&id).copied();
+        let mut tile = Some(id);
+        while let Some(current) = tile {
+            if !seen.insert(current) {
+                return Err(Trap::Invalid("a group's tiles link in a loop".into()));
+            }
+            set_parent(world, current, next.unwrap_or(0))?;
+            tile = world.next_parts.get(&current).copied();
+        }
+        if let Some(next) = next {
+            set_parent(world, next, 0)?;
+        }
+    } else {
+        // The walk reads the link again after passing the tile over.
+        let mut before = parent as u16;
+        while let Some(&after) = world.next_parts.get(&before) {
+            if after == id {
+                match world.next_parts.get(&id).copied() {
+                    Some(next) if next == id => {
+                        return Err(Trap::Invalid("a group's tiles link in a loop".into()));
+                    }
+                    Some(next) => world.next_parts.insert(before, next),
+                    None => world.next_parts.remove(&before),
+                };
+                continue;
+            }
+            if !seen.insert(after) {
+                return Err(Trap::Invalid("a group's tiles link in a loop".into()));
+            }
+            before = after;
+        }
+    }
+    set_parent(world, id, 0)?;
+    world.next_parts.remove(&id);
+    Ok(())
+}
+
 /// The position one step in direction `dir` from `position` (0x42228a):
 /// the step's first word goes to +0xf4, which is position[1].
 fn beside([p0, p1, level]: [i32; 3], dir: i32) -> [i32; 3] {
