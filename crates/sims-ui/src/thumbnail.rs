@@ -7,7 +7,12 @@
 //!   definition +0x84, 0x457edf), except a tile of a multi-tile object
 //!   that is not its lead (0x4575b8) and a person (type 2, 0x4575d2). The
 //!   definition needs graphics (0x457588: a master ID or a graphics
-//!   count) or what 0x4575a1 finds in its file.
+//!   count) or an interaction table with entries (0x4575a1, 0x457cb0):
+//!   the `TTAB` named by the definition's word at byte 0x0e (0x45726a;
+//!   -1 takes the lead's, other negative numbers none), looked up in the
+//!   definition's own file and then in its semi-global file (0x4569a3),
+//!   with entries when its word +4 is not 0, which is taken here as the
+//!   table's count not being 0.
 //! - **Whose item an object shows** (0x45728d, 0x43ae0a): its own, or for
 //!   a tile of a multi-tile object, the item of the first definition in
 //!   the same file with the same master ID and sub-index -1 (0x43adf7).
@@ -26,9 +31,9 @@
 //!   item with no thumbnail leaves the template alone, and the queue
 //!   shows that.
 //!
-//! **Unverified:** what 0x4575a1 finds for a definition without graphics
-//! (0x457cb0, a cast of its file); here such a definition has an item. No
-//! capture shows a queue icon.
+//! **Unverified:** that word +4 of the table 0x457cb0 finds is its
+//! entries (an empty table's is taken to be 0). No capture shows a queue
+//! icon.
 
 use crate::art::Art;
 use crate::{Error, Result};
@@ -51,6 +56,7 @@ pub const THUMBNAIL: [u32; 2] = [74, 37];
 
 /// Definition words, by byte offset into an `OBJD`.
 const GRAPHICS: usize = 0x08;
+const TABLE: usize = 0x0e;
 const KIND: usize = 0x12;
 const MASTER: usize = 0x14;
 const SUB_INDEX: usize = 0x16;
@@ -73,15 +79,25 @@ pub struct Thumbnails {
 
 impl Thumbnails {
     /// Reads the catalog item `guid`'s objects show, if it was not read.
-    /// A type with no file, no definition or no item has none; a
-    /// thumbnail that does not decode is an error.
+    /// A type with no file, no definition or no item has none. A file
+    /// that cannot be read is an error, and the type is kept with no
+    /// item; a thumbnail that does not decode is an error too, but the
+    /// item is kept, without its thumbnail, as when it has none. Either
+    /// way the type is not read again.
     pub fn read(&mut self, index: &Index, catalog: &Catalog, guid: u32) -> Result<()> {
         if self.items.contains_key(&guid) {
             return Ok(());
         }
-        let item = item(index, catalog, guid)?;
-        self.items.insert(guid, item);
-        Ok(())
+        match item(index, catalog, guid) {
+            Ok((item, problem)) => {
+                self.items.insert(guid, item);
+                problem.map_or(Ok(()), Err)
+            }
+            Err(e) => {
+                self.items.insert(guid, None);
+                Err(e)
+            }
+        }
     }
 
     /// Sets `guid`'s item, as tests and hosts with their own art do.
@@ -143,32 +159,94 @@ fn paste(icon: &mut Image, thumbnail: &Image) {
     }
 }
 
-/// The catalog item `guid`'s objects show (see the module's notes).
-fn item(index: &Index, catalog: &Catalog, guid: u32) -> Result<Option<Item>> {
+/// The catalog item `guid`'s objects show (see the module's notes), and
+/// the error its thumbnail gave if it did not decode.
+fn item(index: &Index, catalog: &Catalog, guid: u32) -> Result<(Option<Item>, Option<Error>)> {
     let Some(object) = catalog.object(guid) else {
-        return Ok(None);
+        return Ok((None, None));
     };
-    let Some(resource) = index.resources.get(object.resource) else {
-        return Ok(None);
+    let read = |resource: usize| -> Result<Option<Iff>> {
+        let Some(resource) = index.resources.get(resource) else {
+            return Ok(None);
+        };
+        let bytes = resource.read().map_err(Error::Content)?;
+        Iff::parse(bytes).map(Some).map_err(Error::Format)
     };
-    let iff = Iff::parse(resource.read().map_err(Error::Content)?).map_err(Error::Format)?;
+    let Some(iff) = read(object.resource)? else {
+        return Ok((None, None));
+    };
     let Some(definition) = iff.get(b"OBJD", object.chunk).map(|c| iff.data(c)) else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let Some(lead) = lead(&iff, definition) else {
-        return Ok(None);
+        return Ok((None, None));
     };
     if word(lead, KIND) == Some(PERSON) {
-        return Ok(None);
+        return Ok((None, None));
     }
     let graphics = word(lead, MASTER).unwrap_or(0) != 0 || word(lead, GRAPHICS).unwrap_or(0) != 0;
-    let id = word(lead, CATALOG_STRINGS).unwrap_or(0) as u16;
-    let thumbnail = match iff.get(b"BMP_", id) {
-        Some(chunk) => Some(bitmap::bmp(iff.data(chunk)).map_err(Error::Format)?),
-        None => None,
+    if !graphics {
+        // The semi-global file is read only when the table is not in the
+        // definition's own.
+        let semi = match table(lead) {
+            Some(id) if iff.get(b"TTAB", id).is_none() => {
+                match catalog
+                    .semi_globals
+                    .get(&object.resource)
+                    .copied()
+                    .flatten()
+                {
+                    Some(resource) => read(resource)?,
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        if !interactions(&iff, semi.as_ref(), lead) {
+            return Ok((None, None));
+        }
     }
-    .filter(|image| !graphics || [image.width, image.height] == THUMBNAIL);
-    Ok(Some(Item { thumbnail }))
+    let (thumbnail, problem) = thumbnail(&iff, lead, graphics);
+    Ok((Some(Item { thumbnail }), problem))
+}
+
+/// The thumbnail kept for `definition`'s item (0x4cbdc3), and the error
+/// its `BMP_` gave if it did not decode, which keeps none.
+fn thumbnail(iff: &Iff, definition: &[u8], graphics: bool) -> (Option<Image>, Option<Error>) {
+    let id = word(definition, CATALOG_STRINGS).unwrap_or(0) as u16;
+    match iff.get(b"BMP_", id).map(|c| bitmap::bmp(iff.data(c))) {
+        Some(Ok(image)) => {
+            let kept = !graphics || [image.width, image.height] == THUMBNAIL;
+            (kept.then_some(image), None)
+        }
+        Some(Err(e)) => (None, Some(Error::Format(e))),
+        None => (None, None),
+    }
+}
+
+/// The ID of the interaction table `definition` names (0x45726a): its
+/// word at byte 0x0e when that is above 0. Here `definition` is a lead,
+/// so -1 (the lead's own) names none either.
+fn table(definition: &[u8]) -> Option<u16> {
+    word(definition, TABLE)
+        .filter(|&id| id > 0)
+        .map(|id| id as u16)
+}
+
+/// Whether `definition`'s interaction table has entries (0x4575a1): the
+/// table it names, from its own file or else the semi-global one
+/// (0x457cb0, 0x4569a3), whose count (its first word) is not 0.
+fn interactions(iff: &Iff, semi: Option<&Iff>, definition: &[u8]) -> bool {
+    let Some(id) = table(definition) else {
+        return false;
+    };
+    let chunk = iff
+        .get(b"TTAB", id)
+        .map(|c| iff.data(c))
+        .or_else(|| semi.and_then(|semi| semi.get(b"TTAB", id).map(|c| semi.data(c))));
+    chunk
+        .and_then(|data| word(data, 0))
+        .is_some_and(|count| count != 0)
 }
 
 /// The definition whose item `definition`'s objects show: itself, or for
@@ -276,5 +354,64 @@ mod tests {
         assert!(icon.rgba.chunks(4).all(|p| p == [0, 0, 90, 255]));
         assert!(thumbnails.icon(&art(), 8).is_none());
         assert!(thumbnails.icon(&art(), 9).is_none());
+    }
+
+    /// An IFF file of `chunks`, as the game's files are laid out.
+    fn iff(chunks: &[(&[u8; 4], u16, Vec<u8>)]) -> Iff {
+        let mut bytes = vec![0; 64];
+        bytes[..13].copy_from_slice(b"IFF FILE 2.5:");
+        for (tag, id, data) in chunks {
+            bytes.extend(*tag);
+            bytes.extend((76 + data.len() as u32).to_be_bytes());
+            bytes.extend(id.to_be_bytes());
+            bytes.extend(0u16.to_be_bytes());
+            bytes.extend([0; 64]);
+            bytes.extend(data);
+        }
+        Iff::parse(bytes).unwrap()
+    }
+
+    /// A definition naming interaction table `table`.
+    fn definition(table: i16) -> Vec<u8> {
+        let mut bytes = vec![0; 0x60];
+        bytes[TABLE..TABLE + 2].copy_from_slice(&table.to_le_bytes());
+        bytes
+    }
+
+    /// An interaction table's first words: its count, then its version.
+    fn table_chunk(count: u16) -> Vec<u8> {
+        [count.to_le_bytes(), 8u16.to_le_bytes()].concat()
+    }
+
+    #[test]
+    fn a_definition_without_graphics_needs_an_interaction_table_with_entries() {
+        let own = iff(&[
+            (b"TTAB", 300, table_chunk(2)),
+            (b"TTAB", 301, table_chunk(0)),
+        ]);
+        let semi = iff(&[(b"TTAB", 4096, table_chunk(1))]);
+        // Its own file's table, with entries or without.
+        assert!(interactions(&own, None, &definition(300)));
+        assert!(!interactions(&own, Some(&semi), &definition(301)));
+        // The semi-global file's, when its own has none of that ID.
+        assert!(interactions(&own, Some(&semi), &definition(4096)));
+        assert!(!interactions(&own, None, &definition(4096)));
+        // No table: 0, -1 on a lead, or another negative number.
+        for id in [0, -1, -2] {
+            assert!(!interactions(&own, Some(&semi), &definition(id)));
+        }
+    }
+
+    #[test]
+    fn a_thumbnail_that_does_not_decode_is_an_error_and_keeps_none() {
+        let mut definition = definition(0);
+        definition[CATALOG_STRINGS..CATALOG_STRINGS + 2].copy_from_slice(&5u16.to_le_bytes());
+        let file = iff(&[(b"BMP_", 5, b"XX not a bitmap".to_vec())]);
+        let (kept, problem) = thumbnail(&file, &definition, true);
+        assert!(kept.is_none());
+        assert!(problem.is_some());
+        // No BMP_ of that ID is no thumbnail and no error.
+        let (kept, problem) = thumbnail(&iff(&[]), &definition, true);
+        assert!(kept.is_none() && problem.is_none());
     }
 }

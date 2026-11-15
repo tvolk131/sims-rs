@@ -700,6 +700,25 @@ fn the_queues_icons_show_their_objects_catalog_pictures() {
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
 
+#[test]
+fn a_type_without_graphics_or_interactions_has_no_catalog_item() {
+    let Some(install) = install() else {
+        return;
+    };
+    let own = Thumbnails::new(&install);
+    let mut thumbnails = sims_ui::thumbnail::Thumbnails::default();
+    // ReserveTile: no graphics, and no interaction table (0x4575a1).
+    let reserve = 0x3929_AADC;
+    thumbnails.read(&own.index, &own.catalog, reserve).unwrap();
+    assert!(own.catalog.object(reserve).is_some());
+    assert_eq!(thumbnails.item(reserve), None);
+    // The fridge has graphics and its thumbnail.
+    let fridge = 0x675C_18AF;
+    thumbnails.read(&own.index, &own.catalog, fridge).unwrap();
+    let item = thumbnails.item(fridge).expect("the fridge's item");
+    assert_eq!(item.thumbnail.as_ref(), Some(&own.thumbnail(fridge)));
+}
+
 /// Object types' own thumbnails, read from the install apart from the
 /// game's reading.
 struct Thumbnails {

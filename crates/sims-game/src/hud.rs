@@ -179,9 +179,9 @@ impl Hud {
         self.pressed.keep(&self.queue);
         let objects: Vec<u32> = self.queue.objects().collect();
         for guid in objects {
+            // A type whose picture fails is kept as the error left it
+            // (`Thumbnails::read`), and not read again.
             if let Err(e) = self.thumbnails.read(assets.index(), assets.catalog(), guid) {
-                // Shown as a type without a catalog item, and not read again.
-                self.thumbnails.insert(guid, None);
                 self.problems
                     .push(format!("the catalog picture of type 0x{guid:08X}: {e}"));
             }
