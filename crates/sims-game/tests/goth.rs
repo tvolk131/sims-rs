@@ -8,6 +8,7 @@ use sims_game::pick;
 use sims_game::view::View;
 use sims_game::{Game, Options};
 use sims_render::{Canvas, open_house};
+use sims_vm::boot::{Frames, Lot};
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
@@ -522,6 +523,102 @@ fn a_snack_is_chosen_from_the_fridges_pie() {
     assert!(game.menu().is_none(), "choosing closes the pie");
     // Have A Snack, not another of the fridge's entries, is queued.
     assert_eq!(queued(&game), before + 1);
+}
+
+/// Play mode, as the window runs with `--play`: the snack ordered through
+/// the game's input layer is the scripted snack order (sims-vm's
+/// `the_snack_order_pays_for_the_snack`, `Lot::queue_interaction` after 50
+/// steps). The pointer moves onto the fridge, which lists its pie; a
+/// press opens it, and a press on Have A Snack queues the action the
+/// listing offered (`Lot::pick`). The action queued is the scripted one.
+/// The lots differ until Mortimer takes the order at step 150: the
+/// listing's check trees ran as him, and left his last result and his
+/// stack frame's words. From then on they are the same lot, step for
+/// step, through the snack's end at step 1136, and play mode catches no
+/// error on the way.
+#[test]
+fn the_snack_ordered_in_the_window_is_the_scripted_order() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        play: true,
+        ..options(install.clone())
+    })
+    .expect("the Goth house opens");
+    assert_eq!(game.run(50), 50);
+    game.resize([800, 600]);
+    game.render();
+    let sim = game.lot().world().selected().expect("a Sim is selected");
+    let fridge = 118;
+    // Where the frame shows the fridge, found without moving the pointer,
+    // whose every new object lists a menu that changes the lot.
+    let at = (0..600)
+        .step_by(4)
+        .flat_map(|y| (0..800).step_by(4).map(move |x| [x, y]))
+        .find(|&p| !game.over_panel(p) && game.under(p) == Some(fridge))
+        .expect("the fridge is on screen");
+    game.hover(at);
+    assert_eq!(game.listed(), Some((sim, fridge)));
+    game.press(at);
+    game.render();
+    let snack = {
+        let menu = game.menu().expect("the fridge's pie opens");
+        let (_, r) = menu
+            .labels()
+            .into_iter()
+            .find(|(text, _)| *text == "Have A Snack")
+            .expect("Have A Snack on the pie");
+        [r.x + r.width / 2, r.y + r.height / 2]
+    };
+    game.press(snack);
+    assert!(game.menu().is_none());
+
+    let mut scripted = Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
+    for _ in 0..50 {
+        assert!(scripted.step_play().unwrap().errors.is_empty());
+    }
+    let uid = scripted.queue_interaction(sim, fridge, 1).unwrap();
+    assert_eq!(uid, Some(1));
+    let queue = |lot: &Lot| {
+        format!(
+            "{:?}",
+            lot.world().objects[&sim].person.as_ref().unwrap().queue
+        )
+    };
+    assert_eq!(queue(game.lot()), queue(&scripted));
+    let doing = |lot: &Lot| {
+        lot.world().objects[&sim]
+            .person
+            .as_ref()
+            .unwrap()
+            .active
+            .uid
+    };
+    for step in 51..=1136 {
+        assert_eq!(game.run(1), 1, "step {step}");
+        let update = scripted.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+        if step >= 150 {
+            assert_eq!(
+                game.lot().world().hash(),
+                scripted.world().hash(),
+                "step {step}"
+            );
+        }
+        match step {
+            150 => assert_eq!(doing(game.lot()), 1),
+            // He pays for the snack, whose action is his fifth.
+            820 => {
+                assert_eq!(game.lot().world().budget.funds, 2537);
+                assert_eq!(doing(game.lot()), 5);
+            }
+            1135 => assert_eq!(doing(game.lot()), 5),
+            1136 => assert_ne!(doing(game.lot()), 5),
+            _ => {}
+        }
+    }
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
 
 #[test]
