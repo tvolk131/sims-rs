@@ -6,7 +6,7 @@ says what was decided, why, and what would reopen it. Entries marked
 
 ## 2026-11-15: The three more houses recorded are the Newbies, the Pleasants in 6 Sim Lane and the Roomies in 10 Sim Lane
 
-The roadmap's step 2 asks for 1000-update recordings of three more
+The roadmap's step 3 asks for 1000-update recordings of three more
 base-game houses, picked for code the Goths do not reach. In the
 install's base neighborhood (`UserData`) only the Goths (House05) and
 the Newbies (House07) live in a house; the other eight base houses are
@@ -24,9 +24,11 @@ no job yet, a different lot, and objects the Goth house does not hold
 needed; the recording reads the install's own `UserData`.
 
 **The Pleasants in 6 Sim Lane (House06).** Two adults and two
-children. The Goths have one child (Cassandra); with two, the school
-bus takes two children, and the child-to-child interactions and the
-siblings' relationships run, which a one-child house never starts.
+children. The Goths have one child (Cassandra). With two, the school
+bus can take two children, and child-to-child interactions and the
+siblings' relationship can run, which a one-child house never starts.
+**Unverified**: the 1000 updates cover 7:10 to 7:43 in the morning, and
+whether they reach this code has not been checked.
 House06 is the furnished empty base house the family can afford
 (§10,206 of their §20,000), with a bed, fridge, shower, toilet and
 phone; its objects are base game only. The move-in is a player action
@@ -54,18 +56,22 @@ phone plugins, inventory tokens such as gifts and collars) beside its
 103 base objects. A boot from the frozen snapshot has to load those
 definitions, as a load of an unsaved house makes them.
 
+**What our side reaches on them** (strict mode; for the Pleasants and
+the Roomies, with the frozen save as the neighborhood). The Newbies run
+all 1000 updates. Their first differences: the globals at two of updates
+1 to 3, the animators from update 1, positions from update 32 and
+motives from update 154. One neighborhood record differs from update 629
+on, in a record where the two neighborhood files themselves differ. The
+Roomies load equal to the original. The Pleasants also load equal, but
+for object 243 (data word 50 and its last result) and object 241's frame
+(tree 0x2029, against the original's 0xa029). Both stop in update 1 at
+the same place: a person's route with no route context (tree 0x0176 node
+26, 0x45ae65), which is not ported. At that stop, person word 27 is one
+behind the original's completed update 1, because that person's turn has
+not finished.
+
 **Reopen** if a house in `UserData2` to `UserData8` loads in strict mode
 and offers more unreached code than a move-in does.
-
-**What our side reaches on them** (strict mode, with the frozen save as
-the neighborhood). The Newbies run all 1000 updates; the first
-differences are in animators, motives and positions. The Roomies load
-equal to the original; the Pleasants do too but for object 243 (data
-word 50 and its last result) and object 241's frame (tree 0x2029, the
-original's 0xa029). Both stop in tick 1 at the same place: a person's route with no route
-context (tree 0x0176 node 26, 0x45ae65), which is not ported. Before
-that stop, person word 27 is one less than the original's in both
-houses.
 
 ## 2026-11-15: Switching the selected Sim refreshes the deselected Sim's animator; a second press centres the view
 
