@@ -41,6 +41,11 @@ pub struct Bone {
     pub translation: [u32; 3],
     /// Its rest rotation relative to its parent, a quaternion.
     pub rotation: [u32; 4],
+    /// Whether a layer below weight 1 blends with what the bone holds
+    /// (the third of the bone's flags, native bone +0x74, read by
+    /// 0x597fc0); a bone that does not blend takes the layer's sample
+    /// whatever its weight.
+    pub blends: bool,
 }
 
 /// What a person's reset reads from the person type's files when it
@@ -367,6 +372,7 @@ fn skeleton_files(
                         parent: b.parent,
                         translation: b.translation.map(f32::to_bits),
                         rotation: b.rotation.map(f32::to_bits),
+                        blends: b.flags[2] != 0,
                     })
                     .collect();
                 (s.name, scales, bones)

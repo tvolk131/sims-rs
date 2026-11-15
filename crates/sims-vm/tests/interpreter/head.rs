@@ -79,6 +79,7 @@ fn anchored(point: Option<&str>) -> Fixture {
                 parent: None,
                 translation: [0; 3],
                 rotation: [0, 0, 0, 1f32.to_bits()],
+                blends: true,
             }],
         },
     );
@@ -153,6 +154,7 @@ fn carrying(carried: &str) -> Fixture {
         parent,
         translation: [0; 3],
         rotation: [0, 0, 0, 1f32.to_bits()],
+        blends: true,
     };
     fx.program
         .people
