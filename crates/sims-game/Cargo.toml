@@ -18,6 +18,16 @@ sims-ui = { path = "../sims-ui" }
 sims-vm.workspace = true
 softbuffer = "0.4.8"
 winit = "0.30.13"
+# Sound output. On macOS it needs no system library, so it is always on;
+# elsewhere it is the `sound` feature, so the workspace build and CI need
+# no audio library.
+cpal = { version = "0.18.2", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = "0.18.2"
+
+[features]
+sound = ["dep:cpal"]
 
 [lints]
 workspace = true

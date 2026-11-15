@@ -1934,6 +1934,13 @@ through their public interfaces only; the simulation never depends on it.
   When a step fails, the lot stays on screen as it was and the failure
   is written across the top: today that is tick 878, where the hour
   turns. `--png <file> --ticks N` draws one frame without a window.
+- **Done: sound output.** The window plays `sims-audio`'s player on the
+  default device (on macOS; elsewhere with the `sound` feature, so CI
+  needs no audio library; `--mute` turns it off). A thread renders
+  22,050 Hz stereo ahead of the device and the game never waits on it.
+  The ambience follows the clock's hour (global 0), and the sound
+  scripts' speed register follows the game's speed. What plays waits on
+  the simulation's sound events.
 - **Next:** pie menus and player orders, once the simulation's hooks
   land: a play-mode step that resets an object on a script error, a
   `Lot` API to queue an interaction (person, object, TTAB entry) and

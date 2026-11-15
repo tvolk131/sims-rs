@@ -11,6 +11,9 @@
 //! - [`people`]: the people drawn over the lot.
 //! - [`hud`]: the control panel and dialogs over the lot.
 //! - [`pick`]: which object or person a click lands on.
+//! - [`sound`]: the simulation's sound events, mixed by `sims-audio`;
+//!   `output` plays them on the device (on macOS, or with the `sound`
+//!   feature).
 
 // An app shell: it reads the wall clock and draws with ordinary floats;
 // nothing it computes reaches the simulation (see the workspace lint
@@ -19,9 +22,12 @@
 
 pub mod game;
 pub mod hud;
+#[cfg(any(target_os = "macos", feature = "sound"))]
+pub mod output;
 pub mod pace;
 pub mod people;
 pub mod pick;
+pub mod sound;
 pub mod view;
 
 pub use game::{Game, Options, Outcome};
