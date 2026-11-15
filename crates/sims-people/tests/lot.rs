@@ -314,3 +314,72 @@ fn the_people_of_a_running_lot_are_drawn_in_the_lot_renderers_view() {
             .all(|(id, _)| *id != first)
     );
 }
+
+/// How many pixels of `canvas` differ from `base`.
+fn changed(base: &sims_render::Canvas, canvas: &sims_render::Canvas) -> usize {
+    base.color
+        .iter()
+        .zip(&canvas.color)
+        .filter(|(a, b)| a != b)
+        .count()
+}
+
+/// Drawn over the lot the lot renderer drew, people are hidden by what
+/// stands in front of them: fewer of their pixels show than when they are
+/// laid over everything, but most still show, as nothing hides their feet
+/// on the floor they stand on. The camera shows the ground level, where
+/// the Goths are, with the walls down; seen from upstairs, the upper
+/// floor hides everyone below it.
+#[test]
+fn the_lot_hides_the_people_behind_it() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut opened = sims_render::open_house(&root, &house).unwrap();
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    let mut people = People::open(&root, &house).unwrap();
+    let (mut shown, mut laid) = (0, 0);
+    let mut hidden_once = false;
+    while lot.ticks() < 600 {
+        if lot.ticks().is_multiple_of(120) {
+            let world = lot.world();
+            assert_eq!(people.update(world), Vec::<String>::new());
+            let shape = sims_render::Lot::from_world(world).unwrap();
+            for rotation in 0..4 {
+                let mut camera = LotCamera {
+                    zoom: Zoom::Medium,
+                    rotation,
+                    level: 1,
+                    origin: [0, 0],
+                    walls: Walls::Down,
+                    focus: Default::default(),
+                };
+                camera.center_on(shape.built_center(), [400, 300]);
+                let mut base = sims_render::Canvas::new(800, 600, [0, 0, 0]);
+                sims_render::draw(world, &shape, &mut opened.assets, &camera, &mut base);
+                let mut on = base.clone();
+                let report = people.draw_on_lot(world, &camera, &mut on);
+                assert!(report.problems.is_empty(), "{:?}", report.problems);
+                // Laid over everything: nearer than any depth there is.
+                let mut over = base.clone();
+                people.draw(world, &camera, &mut over, |_, _, _| -1.0e9);
+                let (a, b) = (changed(&base, &on), changed(&base, &over));
+                assert!(
+                    a <= b,
+                    "tick {}, rotation {rotation}: {a} > {b}",
+                    lot.ticks()
+                );
+                hidden_once |= a < b;
+                shown += a;
+                laid += b;
+            }
+        }
+        match lot.step() {
+            Ok(_) => {}
+            Err(StepError::Tick { .. } | StepError::Frame { .. }) => break,
+            Err(e) => panic!("tick {}: {e}", lot.ticks() + 1),
+        }
+    }
+    eprintln!("people's pixels: {shown} shown of {laid}");
+    assert!(hidden_once, "nobody was hidden");
+    assert!(shown > laid / 2, "{shown} of {laid} shown");
+}
