@@ -47,7 +47,9 @@ use std::collections::BTreeSet;
 mod dynamic;
 mod find;
 pub(crate) use find::Rules;
-pub(crate) use find::{Refusal, closed_directions, pool_tile};
+pub(crate) use find::{
+    Refusal, closed_directions, floor, pool_byte, pool_tile, segments, tile_flags,
+};
 
 /// A person's own tick while its thread runs: the person, and the
 /// animator refresh its taking itself off the lot left pending

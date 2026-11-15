@@ -7,7 +7,7 @@ use sims_core::F32;
 use sims_sim::motives::{Curve, Rates, Tuning};
 use sims_sim::{Dialog, HouseUsage, PersonTick, Usage};
 use sims_vm::play::{Play, Recovery};
-use sims_vm::{Answers, Player, Shown, SoundEvent, TickError, Update};
+use sims_vm::{Answers, Player, Shown, SoundEvent, TickError, Trap, Update};
 use std::collections::BTreeMap;
 
 /// Dialog (opcode 36) operands of `kind`, waiting for an answer, with the
@@ -350,13 +350,215 @@ fn the_time_of_day_follows_the_hour() {
     }
 }
 
-#[test]
-fn the_day_turning_fails_loudly() {
+/// A lot at 23:59:58 on 6 March 2000, the tenth day played, with six
+/// budget days, usage counts, empty level arrays on a lot 10 tiles wide,
+/// and a lamp worth its price of 100 that loses 10 the first day and 3
+/// after, down to 50. The lamp was made on 9 May 1999.
+fn before_midnight() -> Fixture {
+    use sims_formats::lot::Array;
     let mut fx = before_the_hour(23, 2);
-    assert!(matches!(
-        update(&mut fx, &mut answers(&[])),
-        Err(TickError::Unsupported(m)) if m.contains("the day turns")
-    ));
+    let g = &mut fx.world.globals;
+    (g[1], g[7], g[8], g[28], g[29]) = (6, 3, 2000, 10, 30);
+    fx.world.size = 10;
+    fx.world.budget.days = (1..=6).map(|n| Some([n; 8])).collect();
+    fx.world.usage = HouseUsage {
+        history: std::array::from_fn(|n| Usage {
+            total: n as i32 + 1,
+            routing: n as i32 + 1,
+        }),
+        today: Usage {
+            total: 9,
+            routing: 8,
+        },
+    };
+    let array = |stride: usize| Array {
+        width: 64,
+        height: 64,
+        stride,
+        encoding: 0,
+        data: vec![0; 64 * 64 * stride],
+    };
+    for (id, stride) in [(1, 2), (101, 2), (2, 14), (102, 14), (8, 1), (108, 1)] {
+        fx.world.arrays.insert(id, array(stride));
+    }
+    let words = fx.words(LAMP_FILE);
+    (words[18], words[35], words[36], words[37], words[38]) = (100, 10, 3, 0, 50);
+    let lamp = fx.lamp_mut();
+    lamp.data[41] = 100;
+    (lamp.data[45], lamp.data[46], lamp.data[47]) = (1999, 5, 9);
+    lamp.data[59] = 0;
+    fx.sim_mut().data[59] = 0;
+    fx
+}
+
+/// Puts a floor on tile (3, 3) of level 1.
+fn floor(fx: &mut Fixture) {
+    let at = (3 * 64 + 3) * 2;
+    fx.world.arrays.get_mut(&1).unwrap().data[at] = 7;
+}
+
+#[test]
+fn the_day_turns_the_date_and_ages_and_depreciates_the_objects() {
+    let mut fx = before_midnight();
+    floor(&mut fx);
+    let sim_value = fx.sim().data[41];
+    update(&mut fx, &mut answers(&[])).unwrap();
+    let g = &fx.world.globals;
+    // 0x46d3e9: the hours go back by 24, the day and the days played go
+    // up; the month stays.
+    assert_eq!((g[0], g[1], g[7], g[8], g[28]), (0, 7, 3, 2000, 11));
+    // Midnight is night, as 23:00 was: no new time of day.
+    assert_eq!(g[4], 2);
+    // 0x4322e7: from 9 May 1999 to 7 March 2000 is no whole year and 9
+    // whole months (the 7th is before the 9th).
+    let lamp = fx.lamp();
+    assert_eq!((lamp.data[18], lamp.data[48]), (0, 9));
+    // 0x432243: still at its price, the lamp loses its first day's 10.
+    assert_eq!(lamp.data[41], 90);
+    // The Sim's definition word 37 is set: it keeps its value.
+    assert_eq!(fx.sim().data[41], sim_value);
+    // 0x46d417: the four oldest days all take yesterday's (the forward
+    // copy), yesterday takes today's, and today is cleared.
+    let days: Vec<_> = fx.world.budget.days.iter().map(|d| d.unwrap()[0]).collect();
+    assert_eq!(days, [0, 1, 2, 2, 2, 2]);
+    // Signal 0xdc, 0x416453: the same for the usage counts.
+    let usage = &fx.world.usage;
+    assert_eq!((usage.today.total, usage.today.routing), (0, 0));
+    assert_eq!((usage.history[0].total, usage.history[0].routing), (9, 8));
+    assert!(
+        usage.history[1..]
+            .iter()
+            .all(|u| u.total == 1 && u.routing == 1)
+    );
+    // 0x416085: the floor counts for global 22; global 23 is the lot's
+    // size, and global 37 has no feature.
+    let g = &fx.world.globals;
+    assert_eq!((g[22], g[23], g[37]), (1, 10, 0));
+}
+
+#[test]
+fn the_lamp_loses_its_daily_value_down_to_its_limit() {
+    let mut fx = before_midnight();
+    floor(&mut fx);
+    // Below its price it loses word 36's 3 a day.
+    fx.lamp_mut().data[41] = 60;
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(fx.lamp().data[41], 57);
+    // But not below word 38's 50.
+    let mut fx = before_midnight();
+    floor(&mut fx);
+    fx.lamp_mut().data[41] = 52;
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(fx.lamp().data[41], 50);
+    // At its price with no first day's loss (word 35 at 0), the daily one.
+    let mut fx = before_midnight();
+    floor(&mut fx);
+    fx.words(LAMP_FILE)[35] = 0;
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(fx.lamp().data[41], 97);
+    // Word 37 set: it keeps its value.
+    let mut fx = before_midnight();
+    floor(&mut fx);
+    fx.words(LAMP_FILE)[37] = 1;
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(fx.lamp().data[41], 100);
+}
+
+#[test]
+fn the_month_turns_after_its_thirtieth_day_and_the_year_after_twelve() {
+    let mut fx = before_midnight();
+    floor(&mut fx);
+    (fx.world.globals[1], fx.world.globals[29]) = (30, 0);
+    update(&mut fx, &mut answers(&[])).unwrap();
+    let g = &fx.world.globals;
+    // 0x473544: every month has 30 days; global 29 takes the new one's.
+    assert_eq!((g[1], g[7], g[8], g[29]), (1, 4, 2000, 30));
+    let mut fx = before_midnight();
+    floor(&mut fx);
+    (fx.world.globals[1], fx.world.globals[7]) = (30, 12);
+    update(&mut fx, &mut answers(&[])).unwrap();
+    let g = &fx.world.globals;
+    assert_eq!((g[1], g[7], g[8]), (1, 1, 2001));
+    // The 29th turns to the 30th and global 29 is not written.
+    let mut fx = before_midnight();
+    floor(&mut fx);
+    (fx.world.globals[1], fx.world.globals[29]) = (29, 0);
+    update(&mut fx, &mut answers(&[])).unwrap();
+    let g = &fx.world.globals;
+    assert_eq!((g[1], g[7], g[29]), (30, 3, 0));
+}
+
+#[test]
+fn global_22_counts_floors_and_objects_off_tiles_with_flag_0x20() {
+    let tile = (5 * 64 + 5) as usize;
+    // No floor, no wall and no object on the lot: 0.
+    let mut fx = before_midnight();
+    fx.world.globals[22] = 7;
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(fx.world.globals[22], 0);
+    // A floor on a tile with flag 0x20 does not count.
+    let mut fx = before_midnight();
+    floor(&mut fx);
+    fx.world.arrays.get_mut(&8).unwrap().data[3 * 64 + 3] = 0x20;
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(fx.world.globals[22], 0);
+    // The Sim on tile (5, 5) of the lot counts: its definition's words 39,
+    // 40 and 69 are set and its type is not 7.
+    let mut fx = before_midnight();
+    fx.sim_mut().position = [5 * 16 + 8, 5 * 16 + 8, 1];
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(fx.world.globals[22], 1);
+    // Not on a tile with flag 0x20.
+    let mut fx = before_midnight();
+    fx.sim_mut().position = [5 * 16 + 8, 5 * 16 + 8, 1];
+    fx.world.arrays.get_mut(&8).unwrap().data[tile] = 0x20;
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(fx.world.globals[22], 0);
+    // The lamp is of type 7: passed over wherever it is.
+    let mut fx = before_midnight();
+    fx.words(LAMP_FILE)[9] = 7;
+    fx.lamp_mut().position = [5 * 16 + 8, 5 * 16 + 8, 1];
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(fx.world.globals[22], 0);
+    // A pool byte up to 0x10 on the ground level counts.
+    use sims_formats::lot::Array;
+    let mut fx = before_midnight();
+    let mut pool = vec![0xffu8; 64 * 64];
+    pool[tile] = 0x10;
+    fx.world.arrays.insert(
+        9,
+        Array {
+            width: 64,
+            height: 64,
+            stride: 1,
+            encoding: 0,
+            data: pool,
+        },
+    );
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(fx.world.globals[22], 1);
+}
+
+#[test]
+fn what_the_day_turn_does_not_port_fails_loudly() {
+    let unsupported = |fx: &mut Fixture, what: &str| {
+        let result = update(fx, &mut answers(&[]));
+        assert!(
+            matches!(&result, Err(TickError::Fault(f)) if matches!(&f.trap, Trap::Unsupported(m) if m.contains(what))),
+            "{result:?}"
+        );
+    };
+    // Walls with no floor: whether they count (0x4795c5) is not ported.
+    let mut fx = before_midnight();
+    fx.world.arrays.get_mut(&2).unwrap().data[(4 * 64 + 4) * 14] = 1;
+    unsupported(&mut fx, "walls");
+    // Budget days not all kept.
+    let mut fx = before_midnight();
+    fx.world.budget.days.pop();
+    unsupported(&mut fx, "budget days");
+    let mut fx = before_midnight();
+    fx.world.budget.days[1] = None;
+    unsupported(&mut fx, "not saved");
 }
 
 #[test]

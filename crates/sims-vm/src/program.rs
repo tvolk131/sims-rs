@@ -499,6 +499,24 @@ impl Program {
         self.libraries.get(&resource)?.definitions.get(&chunk)
     }
 
+    /// The catalog master of the multi-tile group an object definition
+    /// belongs to (0x45728d, 0x43ae0a): the definition itself when its
+    /// word 10 is 0, else the first definition of its file, in the
+    /// catalog's order, with the same word 10 and word 11 at -1. None when
+    /// there is no such definition.
+    pub fn catalog_master(&self, resource: usize, chunk: u16) -> Option<&[i16; DEFINITION_WORDS]> {
+        let library = self.libraries.get(&resource)?;
+        let words = library.definitions.get(&chunk)?;
+        if words[10] == 0 {
+            return Some(words);
+        }
+        library
+            .definition_order
+            .iter()
+            .filter_map(|id| library.definitions.get(id))
+            .find(|master| master[10] == words[10] && master[11] == -1)
+    }
+
     /// The interaction table an object definition uses: the TTAB its word 7
     /// names, in its own file or else its semi-global file. A tile of a
     /// multi-tile object whose word 7 is -1 uses its group's catalog

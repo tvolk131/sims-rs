@@ -38,6 +38,7 @@ mod autonomy;
 pub mod boot;
 mod cancel;
 mod clip_events;
+mod daily;
 mod error;
 mod factory;
 mod fault;
