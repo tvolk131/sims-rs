@@ -98,11 +98,12 @@ pub struct Interpreter<'a> {
     /// the making the original appends a person to the person vector is
     /// not read, so a walk of the vector meanwhile is refused.
     pub(crate) making_person: Option<u16>,
-    /// Whether the player's pie menu is being listed (the original's three
-    /// pointers at 0x6e5130, 0x6e50fc and 0x6e50f8 are set), through every
-    /// tree that the listing runs, nested ones included. Add/Change Action
-    /// String reads it.
-    pub(crate) building_menu: bool,
+    /// The pie menu's listing, while it checks an action (the original's
+    /// three pointers at 0x6e5130, 0x6e50fc and 0x6e50f8 are set), through
+    /// every tree the check runs, nested ones included: the action being
+    /// checked, and the entries the check adds to the menu. None
+    /// otherwise. Add/Change Action String reads and writes it.
+    pub(crate) menu: Option<&'a RefCell<crate::orders::Checking>>,
     /// The people in the middle of letting go of an object (object flag
     /// 0x800, [`crate::forget`]), whom a broadcast it sets off skips. None
     /// outside one.
@@ -129,7 +130,7 @@ impl<'a> Interpreter<'a> {
             deleted: None,
             sounds: None,
             making_person: None,
-            building_menu: false,
+            menu: None,
             letting_go: None,
         }
     }
@@ -269,7 +270,7 @@ impl<'a> Interpreter<'a> {
             base,
             synchronous,
             making_person: self.making_person,
-            building_menu: self.building_menu,
+            menu: self.menu,
             letting_go: self.letting_go,
             advertisements: None,
         }
@@ -334,8 +335,8 @@ pub(crate) struct Machine<'a, 'w> {
     pub advertisements: Option<Advertisements>,
     /// See [`Interpreter::making_person`].
     pub making_person: Option<u16>,
-    /// See [`Interpreter::building_menu`].
-    pub building_menu: bool,
+    /// See [`Interpreter::menu`].
+    pub menu: Option<&'a RefCell<crate::orders::Checking>>,
     /// See [`Interpreter::letting_go`].
     pub letting_go: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
 }
@@ -355,7 +356,7 @@ impl<'a> Machine<'a, '_> {
             deleted: self.deleted,
             sounds: self.sounds,
             making_person: self.making_person,
-            building_menu: self.building_menu,
+            menu: self.menu,
             letting_go: self.letting_go,
         }
     }
