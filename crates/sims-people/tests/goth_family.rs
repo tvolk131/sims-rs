@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use sims_people::appearance::load_appearance;
 use sims_people::math::{Transform, Vec3};
 use sims_people::raster::{Camera, Canvas};
-use sims_people::{Assets, Body, Cast, residents, rig};
+use sims_people::{Assets, Body, Cast, Outfit, residents, rig, suit};
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
@@ -252,4 +252,55 @@ fn an_appearance_in_two_catalogs_comes_from_the_first_folder_searched() {
     assert_ne!(bindings(&from_text), bindings(&from_binary));
     let chosen = load_appearance(&assets, "B200MAFit_CTB").unwrap();
     assert_eq!(bindings(&chosen), bindings(&from_text));
+}
+
+/// Mortimer Goth dressed for work (suit 3, set when he changes for his
+/// job) wears his career level's clothes: the science track's first
+/// level names `Science$g$b_01` with the texture `Science$g$c_01`, which
+/// for a man of fit build and light skin match these files.
+#[test]
+fn mortimer_in_his_work_clothes() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let cast = Cast::of_house(&root, &house).unwrap();
+    let assets = Assets::scan(&root).unwrap();
+    let people = residents(&root, &house).unwrap();
+    let mortimer = people.iter().find(|r| r.id == 21).unwrap();
+    let mut data = mortimer.person.data.clone();
+    assert_eq!(
+        [data[suit::JOB], data[suit::JOB_LEVEL]],
+        [9, 0],
+        "Mortimer's career"
+    );
+    data[suit::SUIT] = 3;
+    let worn = suit::Clothes::of(&mortimer.person);
+    let rows = cast.body_strings(mortimer.guid).unwrap();
+    let clothes = suit::dress(
+        &worn,
+        &data,
+        &rows,
+        cast.careers(),
+        &suit::Wardrobe::of(&assets),
+    )
+    .unwrap();
+    assert_eq!(
+        clothes.body,
+        ("sciencemfit_01".into(), "BODY=sciencemlgt_01".into())
+    );
+    assert_eq!(clothes.hands, worn.hands);
+    let mut person = mortimer.person.clone();
+    person.data = data;
+    let outfit = clothes.wear(&person);
+    assert_eq!(outfit.parts[0], clothes.body);
+    assert_eq!(
+        outfit.parts.len(),
+        Outfit::from_person(&mortimer.person).parts.len()
+    );
+    let body = Body::load(&assets, &mortimer.skeleton, &outfit).unwrap();
+    assert!(
+        body.parts
+            .iter()
+            .any(|p| p.texture_name.as_deref() == Some("sciencemlgt_01")),
+        "the coat is drawn with its texture"
+    );
 }

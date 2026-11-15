@@ -45,14 +45,16 @@
 //! light and lamps are not applied.
 
 use crate::animation::{Clip, Library};
-use crate::appearance::Body;
+use crate::appearance::{Body, Outfit};
 use crate::assets::Assets;
 use crate::house::Cast;
 use crate::math::{Transform, Vec3};
 use crate::person::{Player, UNITS_PER_TILE, base_clip, placement};
 use crate::raster::{LIGHT, Target, draw_part};
 use crate::skin::skin;
+use crate::suit::{AGE, Clothes, GENDER, JOB, JOB_LEVEL, SUIT, Wardrobe, dress};
 use sims_core::F32;
+use sims_formats::saved_objects::Person;
 use sims_render::Camera;
 use sims_render::depth::Depth;
 use sims_sim::World;
@@ -153,14 +155,16 @@ fn rotate(rotation: u8, [x, y]: [f32; 2], size: f32) -> [f32; 2] {
     }
 }
 
-/// What makes a person's body: their type, and the appearances and
-/// accessories their record names. When any of it changes, the body is
-/// loaded again.
+/// What makes a person's body: their type, the appearances and
+/// accessories their record names, and the data words their suit's
+/// clothes are chosen by ([`crate::suit`]). When any of it changes, the
+/// body is loaded again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Key {
     guid: u32,
     appearance: [String; 10],
     accessories: Vec<(String, String)>,
+    suit: [i16; 5],
 }
 
 impl Key {
@@ -173,6 +177,8 @@ impl Key {
                 .iter()
                 .map(|a| (a.name.clone(), a.binding.clone()))
                 .collect(),
+            suit: [SUIT, JOB, JOB_LEVEL, AGE, GENDER]
+                .map(|n| person.data.get(n).copied().unwrap_or(0)),
         }
     }
 }
@@ -218,6 +224,9 @@ pub struct People {
     /// Clips loaded so far, kept between frames.
     clips: BTreeMap<String, Clip>,
     people: BTreeMap<u16, Loaded>,
+    /// The names a suit's templates are matched against, gathered the
+    /// first time a person wears a suit.
+    wardrobe: Option<Wardrobe>,
 }
 
 impl People {
@@ -237,13 +246,16 @@ impl People {
             cast,
             clips: BTreeMap::new(),
             people: BTreeMap::new(),
+            wardrobe: None,
         }
     }
 
     /// Follows `world`: loads the body of each person who appeared or
-    /// changed clothes, and forgets people who are gone. Returns one line
-    /// for each person whose body could not be loaded now (each is said
-    /// once, until the person changes again).
+    /// changed clothes, and forgets people who are gone. A person wears
+    /// what their suit picks ([`crate::suit::dress`]). Returns one line
+    /// for each person whose body could not be loaded now, or whose suit
+    /// could not be followed and who is drawn in their record's clothes
+    /// (each is said once, until the person changes again).
     pub fn update(&mut self, world: &World) -> Vec<String> {
         let mut problems = Vec::new();
         self.people
@@ -264,7 +276,17 @@ impl People {
                         .into_iter()
                         .next()
                         .ok_or_else(|| format!("person {id} is not a person type"))?;
-                    let body = Body::load(&self.assets, &resident.skeleton, &resident.outfit)?;
+                    let outfit = match self.dress(object.guid, person) {
+                        Ok(Some(outfit)) => outfit,
+                        Ok(None) => resident.outfit,
+                        Err(e) => {
+                            problems.push(format!(
+                                "person {id} is drawn in their record's clothes: {e}"
+                            ));
+                            resident.outfit
+                        }
+                    };
+                    let body = Body::load(&self.assets, &resident.skeleton, &outfit)?;
                     Ok((body, resident.skeleton))
                 })
                 .map_err(|e| format!("person {id} is not drawn: {e}"));
@@ -274,6 +296,29 @@ impl People {
             self.people.insert(id, Loaded { key, body });
         }
         problems
+    }
+
+    /// What `person` (of the type `guid`) wears for their suit, or None
+    /// when they wear their record's clothes: for suit 0, and for a person
+    /// whose record names no body (one no clothes were chosen for yet,
+    /// who wears their type's default outfit).
+    fn dress(&mut self, guid: u32, person: &Person) -> Result<Option<Outfit>, String> {
+        if person.data.get(SUIT).copied().unwrap_or(0) == 0
+            || person.appearance[0].trim().is_empty()
+        {
+            return Ok(None);
+        }
+        let assets = &self.assets;
+        let wardrobe = self.wardrobe.get_or_insert_with(|| Wardrobe::of(assets));
+        let rows = self.cast.body_strings(guid)?;
+        let clothes = dress(
+            &Clothes::of(person),
+            &person.data,
+            &rows,
+            self.cast.careers(),
+            wardrobe,
+        )?;
+        Ok(Some(clothes.wear(person)))
     }
 
     /// Each placed person whose body is loaded, posed as the world has

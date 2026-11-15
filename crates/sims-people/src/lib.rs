@@ -5,7 +5,8 @@
 //! This is presentation. It reads the simulation's state and never
 //! changes it, and the simulation never depends on it, so its math is
 //! ordinary `f32`. [`assets`] finds the files, [`texture`] decodes skins,
-//! [`rig`] poses a skeleton, [`appearance`] resolves what a person wears,
+//! [`rig`] poses a skeleton, [`appearance`] resolves what a person wears
+//! and [`suit`] what their suit changes it to,
 //! [`animation`] poses it from a clip, [`person`] places it and picks the
 //! clips from the simulation's animator, [`skin()`] blends the mesh vertices
 //! over the posed bones, and [`raster`] draws the result.
@@ -23,6 +24,7 @@ pub mod person;
 pub mod raster;
 pub mod rig;
 pub mod skin;
+pub mod suit;
 pub mod texture;
 
 pub use animation::{Clip, Library};
