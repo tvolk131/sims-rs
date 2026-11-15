@@ -12,6 +12,7 @@
 //! `sims boot` prints what this does; presentation crates use it to
 //! watch a lot run.
 
+use crate::play::Play;
 use crate::{Answers, Callback, Interpreter, Program, Stream, Update};
 use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People};
 use sims_sim::World;
@@ -181,6 +182,9 @@ pub struct Lot {
     /// Set when a tick or a frame failed. The lot is then as the failure
     /// left it, partway through a tick or a frame, so no later step runs.
     halted: bool,
+    /// Play mode's own state ([`crate::play`]), used by
+    /// [`Lot::step_play`] only.
+    play: Play,
 }
 
 /// Why a step could not run, or stopped partway.
@@ -442,6 +446,7 @@ impl Lot {
             start,
             load,
             halted: false,
+            play: Play::default(),
         })
     }
 
@@ -454,6 +459,23 @@ impl Lot {
     /// before it starts ([`StepError::Incomplete`], [`StepError::Tuning`])
     /// changes nothing either.
     pub fn step(&mut self) -> Result<Update, StepError> {
+        self.step_in(false)
+    }
+
+    /// Runs the next tick in play mode ([`crate::play`]): an error in an
+    /// object's tick, such as an unported primitive, resets the object as
+    /// the original does on a SimAntics error, and the lot goes on. The
+    /// errors caught are in [`Update::errors`]. Any other failure halts
+    /// the lot as [`Lot::step`] does.
+    ///
+    /// Play mode is not the original's behaviour wherever a caught error
+    /// comes from something not ported, so a lot stepped this way is not
+    /// one to compare with the original. [`Lot::step`] is unchanged by it.
+    pub fn step_play(&mut self) -> Result<Update, StepError> {
+        self.step_in(true)
+    }
+
+    fn step_in(&mut self, play: bool) -> Result<Update, StepError> {
         if self.halted {
             return Err(StepError::Halted);
         }
@@ -467,7 +489,7 @@ impl Lot {
                 .map_err(|error| StepError::Tuning(error.to_string()))?;
             self.tuning = Some(tuning);
         }
-        let result = self.advance();
+        let result = self.advance(play);
         if result.is_err() {
             self.halted = true;
         }
@@ -475,30 +497,48 @@ impl Lot {
     }
 
     /// The tick and its frames, for a lot that can step.
-    fn advance(&mut self) -> Result<Update, StepError> {
+    fn advance(&mut self, play: bool) -> Result<Update, StepError> {
         let tuning = self.tuning.as_ref().ok_or(StepError::Incomplete)?;
         let interpreter = Interpreter::new(&self.program, &self.catalog, Stream::Global);
-        if self.ticks == 0 && self.frames.after(0) {
-            interpreter
-                .draw_frame(&mut self.world, VIEW_LEVEL)
-                .map_err(|error| StepError::Frame {
+        let mut first_frame = None;
+        if self.ticks == 0
+            && self.frames.after(0)
+            && let Err(error) = interpreter.draw_frame(&mut self.world, VIEW_LEVEL)
+        {
+            if !play {
+                return Err(StepError::Frame {
                     tick: 0,
                     error: error.to_string(),
                     update: None,
-                })?;
+                });
+            }
+            first_frame = Some(error.to_string());
         }
         let tick = self.ticks + 1;
         let update = interpreter
-            .lot_update(&mut self.world, tuning, &mut self.player)
+            .lot_update_with(
+                &mut self.world,
+                tuning,
+                &mut self.player,
+                play.then_some(&mut self.play),
+            )
             .map_err(|error| StepError::Tick {
                 tick,
                 start: self.start.wrapping_add(self.ticks),
                 error: error.to_string(),
             })?;
+        let mut update = Update {
+            frame_errors: first_frame.into_iter().collect(),
+            ..update
+        };
         self.ticks = tick;
         if self.frames.after(tick)
             && let Err(error) = interpreter.draw_frame(&mut self.world, VIEW_LEVEL)
         {
+            if play {
+                update.frame_errors.push(error.to_string());
+                return Ok(update);
+            }
             return Err(StepError::Frame {
                 tick,
                 error: error.to_string(),
@@ -537,6 +577,7 @@ impl Lot {
 mod tests {
     use super::{Answers, Finished, Frames, LoadReport, Lot, StepError};
     use crate::Program;
+    use crate::play::Play;
     use sims_content::Catalog;
     use sims_sim::World;
     use sims_sim::motives::{Curve, Rates, Tuning};
@@ -579,6 +620,7 @@ mod tests {
             start,
             load,
             halted: false,
+            play: Play::default(),
         }
     }
 
@@ -607,6 +649,17 @@ mod tests {
         }
         assert_eq!(lot.world().hash_hex(), failed);
         assert_eq!(lot.ticks(), 0);
+    }
+
+    #[test]
+    fn play_mode_still_halts_on_a_failure_outside_an_objects_tick() {
+        let mut lot = lot(World::empty(), true, Frames::default());
+        lot.tuning = Some(tuning());
+        let Err(StepError::Tick { tick: 1, .. }) = lot.step_play() else {
+            panic!("the tick should fail");
+        };
+        assert_eq!(lot.step_play().unwrap_err(), StepError::Halted);
+        assert_eq!(lot.play, Play::default());
     }
 
     #[test]

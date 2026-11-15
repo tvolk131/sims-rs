@@ -269,6 +269,9 @@ impl Interpreter<'_> {
             )));
         }
         world.objects.remove(&id);
+        if let Some(deleted) = self.deleted {
+            deleted.borrow_mut().push(id);
+        }
         world.frame_storage.remove(&id);
         // The object's slot table goes with it.
         world
