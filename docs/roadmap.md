@@ -1997,7 +1997,9 @@ through their public interfaces only; the simulation never depends on it.
     `sims-game` guesses from each object's tile.
   - `sims-vm`: a way to answer a dialog from the window (the `Lot`'s
     player is a fixed answer list given at load), and to change the
-    game's speed global.
+    game's speed global. A play-mode step that fails should still hand
+    back the errors it caught before failing, and say which frame
+    (before or after the tick) was skipped.
   - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
     and dialogs are.
 

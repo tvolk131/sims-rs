@@ -170,12 +170,8 @@ impl Game {
                 Ok(update) => {
                     ran += 1;
                     let at = self.lot.ticks();
-                    for error in &update.errors {
-                        self.errors.push(at, describe(error));
-                    }
-                    for error in &update.frame_errors {
-                        self.errors
-                            .push(at, format!("a frame was skipped: {error}"));
+                    for line in in_order(at == 1, &update.errors, &update.frame_errors) {
+                        self.errors.push(at, line);
                     }
                 }
                 Err(error) => self.stop(&error),
@@ -412,6 +408,23 @@ impl Errors {
     }
 }
 
+/// The lines for one update's caught errors, in the order they happened.
+/// An update lists the frame drawn before the lot's first tick (only on
+/// the `first` step) ahead of the one drawn after its tick, and the
+/// objects' errors happen between the two. On the first step a single
+/// skipped frame could be either; it is taken to be the one before the
+/// tick (the update does not say).
+fn in_order(first: bool, errors: &[ScriptError], frames: &[String]) -> Vec<String> {
+    let before = if first { frames.len().min(1) } else { 0 };
+    let frame = |error: &String| format!("a frame was skipped: {error}");
+    frames[..before]
+        .iter()
+        .map(frame)
+        .chain(errors.iter().map(describe))
+        .chain(frames[before..].iter().map(frame))
+        .collect()
+}
+
 /// One line for an error play mode caught: when, what failed, and what
 /// was done about it.
 fn describe(error: &ScriptError) -> String {
@@ -476,13 +489,64 @@ mod tests {
         let line = describe(&error);
         assert!(line.starts_with("tick 900, object 12: object 12, tree 0x1002 node 7"));
         assert!(line.ends_with("; it was reset"), "{line}");
-        error.in_thread = false;
+        // A caught thread fault, then one in the rest of the tick.
         error.then = Some(fault(13));
+        error.recovery = Recovery::Restarted(fault(12));
+        let line = describe(&error);
+        assert!(
+            line.starts_with("tick 900, object 12: object 12,"),
+            "{line}"
+        );
+        assert!(line.contains("; then, outside its thread, object 13"));
+        assert!(line.ends_with("its thread restarted at Main"), "{line}");
+        error.then = None;
+        error.in_thread = false;
         error.recovery = Recovery::Parked(None);
         let line = describe(&error);
         assert!(line.starts_with("tick 900, object 12 outside its thread:"));
-        assert!(line.contains("; then, outside its thread, object 13"));
         assert!(line.ends_with("it failed again after a reset, so it stops"));
+        error.recovery = Recovery::Parked(Some(fault(12)));
+        let line = describe(&error);
+        assert!(
+            line.contains("restarting its thread failed (object 12,"),
+            "{line}"
+        );
+        assert!(line.ends_with("so it stops"));
+    }
+
+    #[test]
+    fn an_updates_errors_are_logged_in_the_order_they_happened() {
+        let error = ScriptError {
+            tick: 1,
+            object: 12,
+            fault: fault(12),
+            in_thread: true,
+            then: None,
+            recovery: Recovery::Reset,
+        };
+        let frames =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| (*n).to_string()).collect() };
+        let starts = |lines: Vec<String>| -> Vec<String> {
+            lines.into_iter().map(|l| l[..9].to_string()).collect()
+        };
+        let errors = std::slice::from_ref(&error);
+        // The first step: the frame before the tick, the tick, the frame
+        // after it.
+        assert_eq!(
+            starts(in_order(true, errors, &frames(&["b", "a"]))),
+            ["a frame w", "tick 1, o", "a frame w"]
+        );
+        assert!(in_order(true, errors, &frames(&["b", "a"]))[2].ends_with(": a"));
+        assert_eq!(
+            starts(in_order(true, errors, &frames(&["b"]))),
+            ["a frame w", "tick 1, o"]
+        );
+        // Later steps draw only after the tick.
+        assert_eq!(
+            starts(in_order(false, errors, &frames(&["a"]))),
+            ["tick 1, o", "a frame w"]
+        );
+        assert!(in_order(false, &[], &[]).is_empty());
     }
 
     #[test]
