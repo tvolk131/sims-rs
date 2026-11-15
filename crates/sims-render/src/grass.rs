@@ -53,6 +53,9 @@ const DITHER: [i32; 4] = [0, 8, 0, 6];
 /// The jitter's seed and reach (`fJitterRandSeed`, `fJitterEnvelope`).
 const JITTER_SEED: u32 = 0x40de9;
 const JITTER: u32 = 3;
+/// The sun's angle from the zenith, as the grass's constructor stores it
+/// (0x49c187): about π/10.
+const LATITUDE_BITS: u32 = 0x3ea0_d973;
 /// Shades added along a wall.
 const WALL_SHADE: i32 = 64;
 
@@ -156,8 +159,13 @@ fn light_table() -> [[f32; 11]; 11] {
     // would tilt it by the camera's rotation (0x4a4551: 1, 2, 3 and 2
     // tenths of π), but only a command handler reaches it (message 0xdd at
     // 0x4c41bf), and turning the camera does not: at rotation 3 the
-    // original's grass matches π/10 and not 2π/10.
-    let latitude = (f64::from(std::f32::consts::PI) * 0.1) as f32;
+    // original's grass matches π/10 and not 2π/10. The constant is 9 ulps
+    // below π/10 rounded to f32, and a slope can tell the difference.
+    light_table_at(f32::from_bits(LATITUDE_BITS))
+}
+
+/// The light table for a sun `latitude` radians from the zenith.
+fn light_table_at(latitude: f32) -> [[f32; 11]; 11] {
     // libm stands in for the x87's sine and cosine; both are within an
     // ulp of a double, far finer than the f32 they are rounded to.
     let (sin, cos) = (
@@ -659,6 +667,22 @@ mod tests {
         // The last shade sits one 128th short of dark.
         let last = p[0][127][0];
         assert_eq!(last, rgb565(blend(LIGHT_BROWN, DARK_BROWN, 127.0 / 128.0)));
+    }
+
+    #[test]
+    fn the_sun_angle_is_the_constructors_exact_float() {
+        // π/10 rounded to f32 is 0x3ea0d97c; the original stores 9 ulps
+        // less. A vertex ringed by these slopes is shade 87 with the
+        // original's float and would be 88 with the rounded one.
+        let shade = |table: [[f32; 11]; 11]| {
+            let slopes = [(-5, -1), (-3, 1), (-2, -2), (-2, -3), (-5, -3), (-5, 3)];
+            let sum: f32 = slopes.iter().map(|&(a, b)| lookup(&table, a, b)).sum();
+            MAX_SHADE - times_127(f64::from(sum) * f64::from(1.0f32 / 6.0))
+        };
+        let rounded = (f64::from(std::f32::consts::PI) * 0.1) as f32;
+        assert_eq!(rounded.to_bits(), 0x3ea0_d97c);
+        assert_eq!(shade(light_table()), 87);
+        assert_eq!(shade(light_table_at(rounded)), 88);
     }
 
     #[test]
