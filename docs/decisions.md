@@ -4,6 +4,23 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: The game's pie menu is a list of the table's entries until the simulation offers them
+
+Clicking an object (or a person) in `sims-game` lists the entries of its
+interaction table, the table `Lot::queue_interaction` queues from
+(`Program::interactions`), each menu number once in table order, named
+by the TTAs string table with the TTAB's ID in the same file (found by
+matching the TTAB that reads as the simulation's table, in the object's
+file or its semi-global file). The original offers only the entries
+whose check passes for the selected Sim; that check is not run, so the
+list can hold entries the original would not offer, and choosing one
+queues it anyway. Entries with flag 0x80 are hidden: every Debug and
+Force entry of the Goths' house has it and nothing a player is offered
+there does (**unverified** as the original's debug flag). The menu is a
+plain list at the pointer, in columns when taller than the view, not
+the original's pie. Reopen when the simulation can list the entries it
+would offer, or `sims-ui` draws the pie.
+
 ## 2026-11-15: The game plays the lot's sound requests as it wakes
 
 `sims-game` takes each step's `Update::sounds` and hands them, in

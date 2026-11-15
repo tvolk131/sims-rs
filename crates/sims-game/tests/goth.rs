@@ -121,3 +121,60 @@ fn play_mode_runs_the_goths_past_the_hour() {
     assert_eq!(game.stopped(), None);
     assert!(game.errors().len() as u64 <= game.caught());
 }
+
+#[test]
+fn the_fridge_and_the_bookshelf_offer_their_interactions() {
+    let Some(install) = install() else {
+        return;
+    };
+    let house = goth_house(&install);
+    let mut lot =
+        sims_vm::boot::Lot::load(&install, &house, &[3], sims_vm::boot::Frames::default())
+            .expect("the Goth house boots");
+    let assets = open_house(&install, &house)
+        .expect("the house opens")
+        .assets;
+    let person = lot.world().selected().expect("a Sim is selected");
+    let labels = |lot: &sims_vm::boot::Lot, id: u16| -> Vec<String> {
+        sims_game::menu::entries(lot, &assets, id)
+            .expect("the menu is read")
+            .into_iter()
+            .map(|e| e.label)
+            .collect()
+    };
+    let find = |label: &str| {
+        lot.world()
+            .objects
+            .keys()
+            .copied()
+            .find(|&id| labels(&lot, id).iter().any(|l| l == label))
+            .unwrap_or_else(|| panic!("nothing offers {label}"))
+    };
+    let fridge = find("Have A Snack");
+    let shelf = find("Read a Book");
+    let fridge_menu = labels(&lot, fridge);
+    assert!(
+        fridge_menu.iter().any(|l| l == "Have A Meal"),
+        "{fridge_menu:?}"
+    );
+    assert!(
+        !fridge_menu.iter().any(|l| l.starts_with("Debug")),
+        "{fridge_menu:?}"
+    );
+    let entry = sims_game::menu::entries(&lot, &assets, shelf)
+        .expect("the menu is read")
+        .into_iter()
+        .find(|e| e.label == "Read a Book")
+        .expect("Read a Book");
+    assert!(matches!(
+        lot.queue_interaction(person, shelf, entry.menu),
+        Ok(Some(_))
+    ));
+    let queue = &lot.world().objects[&person].person.as_ref().unwrap().queue;
+    assert!(
+        queue
+            .iter()
+            .any(|a| a.target == shelf as i16 && a.table_index == entry.menu as i32),
+        "{queue:?}"
+    );
+}

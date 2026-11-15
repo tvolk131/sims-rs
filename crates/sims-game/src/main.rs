@@ -392,7 +392,12 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if event.logical_key == Key::Named(NamedKey::Escape) {
-                    event_loop.exit();
+                    // Escape closes the pie menu, else quits.
+                    if self.game.close_menu() {
+                        self.changed(true);
+                    } else {
+                        event_loop.exit();
+                    }
                 } else {
                     self.key(&event.logical_key);
                 }

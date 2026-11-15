@@ -13,6 +13,7 @@
 //! failure play mode does not catch stops the lot.
 
 use crate::hud::Hud;
+use crate::menu::{self, Menu};
 use crate::pace::Pace;
 use crate::people::People;
 use crate::pick;
@@ -337,33 +338,60 @@ impl Game {
     pub fn press(&mut self, point: [i32; 2]) -> Outcome {
         let cleared = self.note.take().is_some();
         if self.hud.covers(point) {
+            // The menu's labels, to say what a choice queued.
+            let menu = self.hud.menu.clone();
             return match self.hud.press(point) {
-                Some(command) => self.command(command),
+                Some(command) => self.command(command, menu.as_ref()),
                 None => Outcome::redraw(),
             };
         }
         let world = self.lot.world();
         let camera = &self.view.camera;
-        if let Some(id) = pick::person(world, &self.lot_shape, camera, point) {
-            self.note = Some(format!(
-                "Person {id}: choosing a Sim needs the simulation's player orders."
-            ));
-        } else if let Some(id) = pick::object(world, &self.lot_shape, camera, point) {
-            let guid = world.objects.get(&id).map_or(0, |o| o.guid);
-            self.note = Some(format!(
-                "Object {id} (type {guid:#010x}): its pie menu needs the simulation's player orders."
-            ));
-        } else {
+        let target = pick::person(world, &self.lot_shape, camera, point)
+            .or_else(|| pick::object(world, &self.lot_shape, camera, point));
+        let Some(target) = target else {
             return Outcome {
                 redraw: cleared,
                 photo: false,
             };
-        }
+        };
+        self.open_menu(target, point);
         Outcome::redraw()
     }
 
-    /// Carries out a panel command.
-    fn command(&mut self, command: Command) -> Outcome {
+    /// Opens the pie menu of `object` at `point` for the selected Sim.
+    fn open_menu(&mut self, object: u16, point: [i32; 2]) {
+        let Some(person) = self.lot.world().selected() else {
+            self.note = Some("Nobody is selected to do anything.".into());
+            return;
+        };
+        match menu::entries(&self.lot, &self.assets, object) {
+            Ok(entries) if entries.is_empty() => {
+                self.note = Some(format!("Object {object} offers nothing to do."));
+            }
+            Ok(entries) => self.hud.menu = Some(Menu::new(person, object, entries, point)),
+            Err(e) => self.note = Some(format!("Object {object}'s menu is not read: {e}")),
+        }
+    }
+
+    /// Closes the pie menu; false if none was open.
+    pub fn close_menu(&mut self) -> bool {
+        self.hud.menu.take().is_some()
+    }
+
+    /// Queues the entry `menu` of `object` for `person`, as choosing it
+    /// from the pie menu does. `label` names it in the note.
+    fn order(&mut self, person: u16, object: u16, menu: u32, label: &str) {
+        self.note = Some(match self.lot.queue_interaction(person, object, menu) {
+            Ok(Some(_)) => format!("Queued \"{label}\" for person {person}."),
+            Ok(None) => format!("Person {person}'s queue is full; \"{label}\" was not queued."),
+            Err(e) => format!("\"{label}\" was not queued: {e}"),
+        });
+    }
+
+    /// Carries out a panel command. `menu` is the pie menu that was open
+    /// when it was pressed.
+    fn command(&mut self, command: Command, menu: Option<&Menu>) -> Outcome {
         let moved = |view: &mut View, m: Move| {
             view.apply(m);
             Outcome::redraw()
@@ -402,6 +430,18 @@ impl Game {
                     Outcome::redraw()
                 }
             },
+            Command::ChooseInteraction {
+                sim,
+                object,
+                interaction,
+            } => {
+                let menu_number = u32::from(interaction);
+                let label = menu
+                    .and_then(|m| m.entries.iter().find(|e| e.menu == menu_number))
+                    .map_or_else(|| format!("interaction {interaction}"), |e| e.label.clone());
+                self.order(sim, object, menu_number, &label);
+                Outcome::redraw()
+            }
             Command::TogglePanel | Command::OpenPanel(_) => Outcome::redraw(),
             other => {
                 self.note = Some(format!(

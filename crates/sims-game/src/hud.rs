@@ -4,6 +4,7 @@
 //! The panel turns presses into `sims_ui` commands; [`Hud::press`] hands
 //! them to the game, which carries out what it can.
 
+use crate::menu::{self, Menu};
 use crate::pace::Pace;
 use crate::view::View;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
@@ -35,6 +36,8 @@ pub struct Hud {
     /// (its caller and the operands), so it is read once.
     message: Option<(Message, (u16, [u8; 8]))>,
     dialog: Option<dialog::Layout>,
+    /// The pie menu, while one is open.
+    pub menu: Option<Menu>,
 }
 
 impl Hud {
@@ -80,6 +83,7 @@ impl Hud {
             items: Vec::new(),
             message: None,
             dialog: None,
+            menu: None,
         })
     }
 
@@ -166,6 +170,10 @@ impl Hud {
                 self.controls.pointer,
             );
         }
+        if let (Some(menu), Some(font)) = (&mut self.menu, self.art.font(menu::SIZE)) {
+            menu.layout(font, view.size);
+            menu.draw(&mut frame, font, self.controls.pointer);
+        }
         if let Some(status) = status {
             self.status(&mut frame, status);
         }
@@ -188,10 +196,10 @@ impl Hud {
         }
     }
 
-    /// Whether the panel covers `point` (canvas pixels), or a dialog is
-    /// shown and takes every press.
+    /// Whether the panel covers `point` (canvas pixels), or a dialog or a
+    /// pie menu is shown and takes every press.
     pub fn covers(&self, point: [i32; 2]) -> bool {
-        self.dialog.is_some() || hud::covers(&self.items, point)
+        self.dialog.is_some() || self.menu.is_some() || hud::covers(&self.items, point)
     }
 
     /// Moves the pointer; true if what it hovers changed.
@@ -201,14 +209,20 @@ impl Hud {
             let [x, y] = pointer?;
             layout.buttons.iter().position(|b| b.contains(x, y))
         };
+        let entry = |pointer: Option<[i32; 2]>| {
+            let menu = self.menu.as_ref()?;
+            menu.press(pointer?)
+        };
         let before = (
             hud::hovered(&self.items, self.controls.pointer),
             button(self.controls.pointer),
+            entry(self.controls.pointer),
         );
         self.controls.pointer = Some(point);
         (
             hud::hovered(&self.items, self.controls.pointer),
             button(self.controls.pointer),
+            entry(self.controls.pointer),
         ) != before
     }
 
@@ -217,6 +231,15 @@ impl Hud {
     pub fn press(&mut self, point: [i32; 2]) -> Option<Command> {
         if let Some(layout) = &self.dialog {
             return dialog::press(layout, point);
+        }
+        // A press anywhere closes the menu; one on an entry chooses it.
+        if let Some(menu) = self.menu.take() {
+            let interaction = u16::try_from(menu.press(point)?).ok()?;
+            return Some(Command::ChooseInteraction {
+                sim: menu.person,
+                object: menu.object,
+                interaction,
+            });
         }
         let command = hud::press(&self.items, point)?;
         self.controls.apply(&command);

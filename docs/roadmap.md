@@ -2069,9 +2069,20 @@ through their public interfaces only; the simulation never depends on it.
   a book comes off the shelf, the fountain tinkles. `begin_route` and
   `end_route` have no event in the install's sound files and play
   nothing.
-- **Next:** pie menus and player orders, once the simulation's hooks
-  land: a `Lot` API to queue an interaction (person, object, TTAB entry)
-  and read an object's pie-menu entries.
+- **Done: a stopgap pie menu.** Clicking an object or a person opens a
+  list of its interactions at the pointer (each menu number once, named
+  by the object's TTAs strings, debug entries hidden); choosing one
+  queues it for the selected Sim with `Lot::queue_interaction`, and the
+  note across the top says whether it was queued. Escape closes the
+  menu. The fridge lists Have A Snack, Have Lite Meal, Have A Meal,
+  Serve Meal; the bookshelf lists Read a Book and the studies.
+- **Blocked: Mortimer doing what he is told.** The order is queued, but
+  on his next tick Idle For Input fails on starting the queued action
+  (0x45dc14, not ported); play mode resets him and the queue empties.
+  That is the simulation's next step toward the done criterion.
+- **Next:** the menu from the simulation's pie-menu entries (the check
+  each entry runs, which the stopgap skips) once that accessor lands;
+  then a real pie.
 - **Needs from other crates:**
   - `sims-render`: which object drew each pixel (an object ID buffer
     beside the depth), so a click picks the object under it. Today
@@ -2082,7 +2093,9 @@ through their public interfaces only; the simulation never depends on it.
     back the errors it caught before failing, and say which frame
     (before or after the tick) was skipped.
   - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
-    and dialogs are.
+    and dialogs are. `sims-game` draws a plain list until then.
+  - `sims-vm`: Idle For Input starting a queued action (0x45dc14), and
+    the entries the pie menu offers a person on an object.
 
 ## Working rules
 
