@@ -505,11 +505,25 @@ impl Machine<'_, '_> {
                             // cleared (0x45b962). The step and the
                             // context's saved words are written before the
                             // tree is pushed, as the frame changes with it.
+                            // A Sit tree that cannot be pushed fails loudly,
+                            // so what was written for it is put back first.
+                            let kept = (
+                                self.me()?.clone(),
+                                self.world.routing.routes.get(&me).cloned(),
+                            );
                             ctx.word_58 = i32::from(retry as i16);
                             ctx.saved = spot;
                             self.store_route(&ctx, &path);
                             self.frame_mut()?.primitive_state = SITTING;
-                            self.sit(seat, tree)?;
+                            if let Err(trap) = self.sit(seat, tree) {
+                                let (object, route) = kept;
+                                self.world.objects.insert(me, object);
+                                match route {
+                                    Some(route) => self.world.routing.routes.insert(me, route),
+                                    None => self.world.routing.routes.remove(&me),
+                                };
+                                return Err(trap);
+                            }
                             self.set_person_word(WORD_72, 0)?;
                             return Ok(Flow::Pushed);
                         }

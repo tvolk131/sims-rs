@@ -262,3 +262,25 @@ fn the_place_itself_comes_first_when_standing_weighs_at_least_as_much() {
     assert_eq!(go_to(&mut fx, me), Ok(true));
     assert!(sat(&fx));
 }
+
+#[test]
+fn a_sit_tree_that_cannot_be_pushed_fails_loudly_and_leaves_the_route_as_it_was() {
+    // The seat's Sit callback names a tree its file lacks. The route's
+    // step 4 and its saved context are put back before the failure.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    let file = fx.catalog.object(SEAT_GUID).unwrap().resource;
+    fx.program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .callbacks
+        .get_mut(&128)
+        .unwrap()[SIT]
+        .action = SIT_TREE + 1;
+    let result = go_to(&mut fx, me);
+    assert!(matches!(trap(result), sims_vm::Trap::Unsupported(m) if m.contains("0x45c4a8")),);
+    let sim = &fx.world.objects[&me];
+    assert!(sim.stack.iter().all(|frame| frame.tree != SIT_TREE + 1));
+    assert!(sim.stack.iter().all(|frame| frame.primitive_state != 4));
+    assert!(!sat(&fx));
+}
