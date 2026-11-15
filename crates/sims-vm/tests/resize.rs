@@ -2812,15 +2812,20 @@ fn the_goth_house_first_tick_matches_the_original() {
         }
         assert_eq!(world.ticks, before.ticks + 877);
         assert_eq!(digest(&world.encode()), TICK_877);
-        // Tick 878: the hour turns, from dawn to day.
+        // Tick 878: the hour turns to 7:00. The save already holds day as
+        // the time of day (global 4 is 0 at 6:30), so nothing more happens:
+        // no room is marked and the lawn, though global 36 lets it, does not
+        // grow. The capture holds the same two globals.
+        assert_eq!((world.globals[4], world.globals[36]), (0, 1));
         for _ in 878..=900 {
             interpreter.lot_update(world, &tuning, &mut player).unwrap();
         }
         assert_eq!(world.ticks, before.ticks + 900);
         assert_eq!(digest(&world.encode()), TICK_900);
         // Tick 901: object 8 reads job data. The capture drew a frame
-        // after it, which counts the rooms the hour marked; in tick 902
-        // person 16's room motive follows.
+        // after it, which counts the rooms waiting since earlier changes
+        // (rooms 0, 1, 3 and 4 here); in tick 902 person 16's room motive
+        // follows.
         interpreter.lot_update(world, &tuning, &mut player).unwrap();
         interpreter.draw_frame(world, 1).unwrap();
         for _ in 902..=991 {

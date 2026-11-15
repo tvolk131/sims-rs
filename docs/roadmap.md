@@ -1687,14 +1687,16 @@ tile may be, which only the drawing reads (`0x6c741c`, `0x4b4525`), and
 marks every room for counting and both levels as waiting. The next frame
 draw counts them with the new daylight. What the other subscribers do
 with 0xf8 and 0xdd is **unverified**. In tick 878 the clock goes from
-6:59 to 7:00, dawn to day.
+6:59 to 7:00, but the save already holds day as the time of day (global
+4 is 0 at 6:30, in the capture too), so no signal goes out: no room is
+marked and the lawn does not grow. The first change of the time of day
+is at 18:00.
 
 **K = 900.** Our state after every tick from 878 to 900 equals the fifth
 capture in everything compared, the three random streams included, but
-for the head fields of "Ticks 334 to 366". The rooms marked at 7:00 are
-counted at the next frame draw, which in the fifth capture came after
-tick 901 (see "Ticks 901 to 991"), so these ticks compare the clock and
-the time of day but not yet the recount; the capture holds no rooms, and
+for the head fields of "Ticks 334 to 366". Rooms marked by earlier
+changes wait for the next frame draw, which in the fifth capture came
+after tick 901 (see "Ticks 901 to 991"); the capture holds no rooms, and
 the recount shows in what reads it, each person's room motive (taken
 every tick) and global 27.
 
@@ -1718,10 +1720,10 @@ sign-extended (`0x403e3f` to `0x403f1f`), with the levels the chunk holds
 (`0x4036e8`), and then the scope fails loudly.
 
 **The frame after tick 901.** In the fifth capture person 16's room
-motive goes from 19.29 to 36.94 in tick 902, the rooms marked at 7:00
-having been counted before it. A frame drawn after tick 901 gives that;
-the default schedule's next frame, after tick 903, gives it two ticks
-late. A frame after tick 601 instead gives a room motive in ticks 602 and
+motive goes from 19.29 to 36.94 in tick 902, the rooms waiting since
+earlier changes (0, 1, 3 and 4 in ours) having been counted before it.
+A frame drawn after tick 901 gives that; the default schedule's next
+frame, after tick 903, gives it two ticks late. A frame after tick 601 instead gives a room motive in ticks 602 and
 603 that the capture does not have, so the fifth capture still drew after
 tick 603, and its schedule moved by two ticks somewhere between 603 and
 901 (whether it also drew after tick 873 cannot be told: nothing waited).
@@ -1773,10 +1775,23 @@ Progress:
 - Done: the viewer runs a booted lot (`people-viewer --boot`, through
   `sims_vm::boot::Lot`) and draws its people after each tick, including
   people a script makes; it only reads the lot. A gated test runs the
-  Goths' lot to its end (tick 366 today) and draws everyone placed every
-  30 ticks.
-- Next: match the original's lighting (see its decisions entry); compare
-  Mortimer standing without his book. The base layer's clip and phase are
+  Goths' lot until a step stops it (or 3000 ticks) and draws everyone
+  placed every 30 ticks, centred on the root bone, which a clip such as
+  the stair climb carries away from the animator's position.
+- Done: people in the lot renderer's view (`sims_people::People`,
+  `View`). An app keeps one `People`, calls `update` with the live world
+  each frame (new people and changed clothes are loaded, people who left
+  are forgotten), then `draw` with the lot renderer's camera, any zoom
+  and rotation, into any `raster::Target`, with a depth function shaped
+  like the lot renderer's `Depth::point`. A person stands on the terrain
+  under them. A gated test draws the Goths' lot's people at all four
+  rotations every 30 ticks and checks each is drawn where the lot
+  renderer projects them.
+- Next: draw into the lot renderer's canvas and depth once it takes
+  people (with the render track: `Canvas::put`, `Depth::point`, then the
+  per-level interleave); a person on an upper level stands at the floor,
+  without the original's offset. Match the original's lighting (see its
+  decisions entry); compare Mortimer standing without his book. The base layer's clip and phase are
   not simulation state yet, so the saved record and the animator's clock
   stand in.
 
@@ -1841,8 +1856,6 @@ Progress:
 - Done: light levels use the original's colour tables, which shift blue
   by a step; at the compared cameras the house box rose by 0.7 to 1.3
   points (medium zoom 90.4%, cutaway 87.1%).
-- Found: the door's left jamb loses a depth contest with the wall; a fix
-  needs the original's per-zoom depth tables.
 - Done: far zoom at rotations 1 and 2, and near zoom, compared with the
   original. The geometry lines up at all of them; the house box is
   56.2% to 90.4% exact. Most misses are one room the original lit
@@ -1850,8 +1863,13 @@ Progress:
   edge-on diagonal wall's texels also differ.
 - Read, not ported: the original's strip on a marked edge-on diagonal;
   no screenshot shows one.
-- Next: the edge-on diagonal's texels; the original's per-zoom depth
-  tables (the door jamb); a screenshot with a marked edge-on diagonal.
+- Done: depth in the original's own values for grass, floors, walls,
+  trims and objects, checked against the game's depth buffer (99.1%
+  medium, 99.7% far, 97.2% at rotation 3). Faint sprite edge pixels
+  are left out as the original does, which fixes the door jamb. Every
+  compared camera rose, by 0.7 to 3.4 points.
+- Next: the edge-on diagonal's texels; a screenshot with a marked
+  edge-on diagonal; upper-level depth.
 
 ## Track: sound (`crates/sims-audio`)
 
@@ -1976,6 +1994,49 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
     while the caller waits on the dialog.
   - Each Sim's current action and its icon, for the icons over the
     portraits.
+
+## Track: integration (`crates/sims-game`)
+
+Goal: a first human-playable Goth house. One window runs
+`sims_vm::boot::Lot` at the original's tick rate and draws the lot
+(`sims-render`), its people (`sims-people`) and the live-mode panel
+(`sims-ui`); clicks on objects open pie menus that queue interactions;
+the panel's speed, pause and camera buttons work; the simulation's sound
+events play through `sims-audio`. Done when a human can launch it, click
+the fridge or the bookshelf, and watch Mortimer go and do it, with sound,
+for several minutes without the lot stopping. The crate joins the others
+through their public interfaces only; the simulation never depends on it.
+
+- **Done: the window.** `cargo run --release -p sims-game` boots the
+  Goths' house (`SIMS_INSTALL`, `House05.iff`, answering No to the Help
+  System) and runs it in strict mode, a tick every 50 ms at normal
+  speed. The lot, the people over it and the panel over both are drawn
+  every tick; the clock, funds and needs on the panel are the live
+  world's. The panel's speed, pause and camera buttons work (the game
+  paces the lot; the simulation's own speed global is not touched).
+  When a step fails, the lot stays on screen as it was and the failure
+  is written across the top: today that is tick 878, where the hour
+  turns. `--png <file> --ticks N` draws one frame without a window.
+- **Done: sound output.** The window plays `sims-audio`'s player on the
+  default device (on macOS; elsewhere with the `sound` feature, so CI
+  needs no audio library; `--mute` turns it off). A thread renders
+  22,050 Hz stereo ahead of the device and the game never waits on it.
+  The ambience follows the clock's hour (global 0), and the sound
+  scripts' speed register follows the game's speed. What plays waits on
+  the simulation's sound events.
+- **Next:** pie menus and player orders, once the simulation's hooks
+  land: a play-mode step that resets an object on a script error, a
+  `Lot` API to queue an interaction (person, object, TTAB entry) and
+  read an object's pie-menu entries, and sound events drained each tick.
+- **Needs from other crates:**
+  - `sims-render`: which object drew each pixel (an object ID buffer
+    beside the depth), so a click picks the object under it. Today
+    `sims-game` guesses from each object's tile.
+  - `sims-vm`: a way to answer a dialog from the window (the `Lot`'s
+    player is a fixed answer list given at load), and to change the
+    game's speed global.
+  - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
+    and dialogs are.
 
 ## Working rules
 

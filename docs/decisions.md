@@ -4,6 +4,82 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: People join the lot renderer's view through a depth hook
+
+sims-people draws a live lot's people in sims-render's camera rather
+than its own (`sims_people::People`, `View`). It depends on sims-render,
+and not the other way round, so the render track can take people later
+through a trait of its own. Placement: a person's fine position (x, y)
+sits at world (−3y/16, 0, −3x/16), and a unit of height is 32√6/3 ≈ 26.13
+near-zoom pixels, from the original's house camera (0x49b0de: tilted
+30°, 3√2/(16 << zoom) units to a pixel). Checked: a person's root
+projects to the pixel the renderer's `project_fine` gives, at every zoom,
+rotation and level, for elevations that are whole pixels of the zoom;
+one step of altitude lifts a person exactly as it lifts the renderer's
+ground (16 near-zoom pixels). The mesh is projected without rounding, so
+at other elevations a point can fall a pixel above where `project_fine`,
+which rounds the elevation on its own, would put it. In the booted Goths'
+lot each person, drawn alone, is drawn where the renderer projects their
+position, at all four rotations. People are drawn one
+column right, as the renderer draws objects; **unverified** for people.
+
+A person stands on the terrain under their position, found as the
+original finds it (0x478dfe, the same lookup as `sims_vm`'s head model,
+which is private, so it is repeated here). On an upper level the original
+adds an offset from the view's table, which is not ported: such a person
+stands at the floor. A person whose object is off the lot (taken off, at
+tile −1, −1) is not drawn, wherever their animator was left;
+**unverified** against the original.
+
+Depth is the caller's. `People::draw` takes a function from a point's
+fine view position, elevation and level to a depth, the signature agreed
+with the render track for its coming `Depth::point`, and interpolates it
+across each triangle; people are drawn far to near by their root's depth.
+How the original gives a person's mesh its depth is **unverified**; reopen
+when it is read. Until the renderer takes people, an app draws them over
+the lot, and they overlap walls and furniture wrongly.
+
+## 2026-11-15: The game's sound inputs are guesses until measured
+
+`sims-game` feeds `sims-audio`'s player two inputs the simulation does
+not own. The sound scripts' speed register (global register 100,
+`SimSpeed`) is 1 at normal speed, as `sims-audio`'s `play` example
+uses, 2 at fast and 3 at ultra; the ambience's view, which the original
+works out from the camera (0x570c3e, not read), is held at 50, the
+value that plays the backyard ambience in that example. Both are
+**unverified**. The ambience's hour is the clock's (global 0). The
+mixer runs on its own thread, a fifth of a second ahead of the device;
+when it falls behind, the device plays silence rather than the game
+waiting. Reopen when the original's view value or speed register is
+read.
+
+## 2026-11-15: The game draws people over the lot with a matching 3D camera
+
+`sims-game` draws the people with `sims-people`'s orthographic camera,
+built from the lot camera so that a ground point lands on the pixel the
+lot's 2:1 projection gives it (within the lot camera's rounding, at every
+zoom and rotation; pinned by a test). Heights take the scale a
+horizontal length gets; a person upstairs is raised one storey's
+screen height, and every person by the terrain under them (the tile's
+corners blended by where in the tile they stand). The people are drawn into their own image and laid over
+the lot whole, so walls and furniture in front of a person do not hide
+it yet; occlusion belongs to the render and people tracks. That the
+original draws its people at this scale is **unverified**.
+
+## 2026-11-15: The game paces the lot itself, and runs it strictly
+
+A tick runs every 50 ms at normal speed, the animator clock's step.
+Fast and ultra run three and ten times as often (**unverified**: the
+original's are not measured). At most 20 ticks run for one wake of the
+window; time beyond that is dropped, so a stall never makes the lot
+race. Pause stops stepping the lot; the panel's pause button shows it.
+The speed and pause stay outside the simulation until it takes player
+orders. The lot runs in strict mode with the captured frame schedule
+(`Frames::default()`), so it plays exactly the states the captures
+check; the first failure stops it and is shown on screen. Clicks pick
+objects by their tile until `sims-render` can say which object drew a
+pixel. Reopen when the play-mode step and player orders land.
+
 ## 2026-11-14: Job data from the CARR chunks, a frame after tick 901, and K = 991
 
 Scope 33 reads a field of a career level from the careers `work.iff`
@@ -20,21 +96,41 @@ is the original's main loop, not the simulation, so the default
 which would replace the inferred schedule. K = 991; tick 992 snaps to a
 slot whose placement checks the border, the room and the walls.
 
-## 2026-11-14: The hour turns; the signals' other subscribers taken as presentation, and K = 900
+## 2026-11-14: The hour turns, a new time of day grows the lawn, and K = 900
 
 The hour's turn is ported from the lot update (0x46d3cc to 0x46d51d).
 When the time of day changes, the game tells the interface (0x4c4648)
-and sends signals 0xf8 and 0xdd. Of what they reach, only the lot's
-subscriber is read: it has no case for 0xf8, and on 0xdd it marks every
-room and sets a light ceiling only the drawing reads. The interface call
-picks a panel's look. The other subscribers' handling of the two signals
-is not read, and is taken to change no simulation state. Ticks 878 to
-900, which cross 7:00, equal the fifth capture, but the rooms marked then
-are counted only at the next frame draw (after tick 903), so the recount
-is not yet compared. **Unverified**; reopen if the room motives differ
-after tick 903, or a later tick differs after a change of the time of day
-(the next at 18:00). The day's turn still fails loudly. K = 900;
-tick 901 reads job data (scope 33).
+and sends signals 0xf8 and 0xdd. The interface call picks a panel's look.
+On 0xdd the lot's subscriber marks every room and sets a light ceiling
+only the drawing reads.
+
+Signal 0xf8 is not presentation, as a first reading had it (the review
+caught this). The architecture's subscriber (0x47b22a) takes it and,
+when global 36 is not 0, grows the lawn (0x47b3c8): each tile inside the
+lot's border whose grass (Arry 6) is below its target (Arry 7), and that
+has a diagonal neighbour already at its target, grows by 20, up to the
+target. The sweep changes the array as it goes, row by row, and adds in
+32 bits as the original does. It then sends 0x86 and 0x83: the
+interface's panels (0x4c3ea5) set a refresh flag on 0x86, and the house
+viewer redraws on 0x83. This is ported (`World::grow_grass`) from the
+code; the original's direction table was read from a memory image. If
+the lot lacks the two arrays the update fails before the time of day or
+the rooms change.
+
+Only the architecture takes 0xf8. Besides the lot, the interface's
+panels take 0xdd (0x4c4189: the current mode's time-of-day look, then
+0x83). That the panels' and the house viewer's handling of these signals
+changes nothing the simulation keeps is **unverified** (the review
+corrected an earlier, wrong census).
+
+Ticks 878 to 900 cross 7:00 but do not change the time of day: the save
+already holds day (global 4 is 0 at 6:30, in the capture and here), so
+neither the lawn nor the rooms change, and they equal the fifth capture.
+The first change comes at 18:00. The tick captures do not hold the lot's
+arrays, so the lawn's growth is **unverified** against the original;
+the full day's recording must capture the grass array at 18:00. The
+day's turn still fails loudly. K = 900; tick 901 reads job data
+(scope 33).
 
 ## 2026-11-14: No headline state until a headline can show, and K = 877
 
@@ -82,6 +178,55 @@ only on level 1. So routing upstairs is the ground's code with the
 level's arrays, not a port of its own. A room ID naming level 3 or 4
 fails as invalid state, as the lot holds two. K = 752: ticks 691 to 752
 equal the fifth capture; tick 753 needs a pose with a carry layer.
+
+## 2026-11-14: The render uses the original's depth values
+
+The lot is now depth-tested in the original's own depth space: 16-bit,
+cleared to 65535, smaller is nearer. Every surface computes the number
+the original would store. Checked pixel by pixel against depth buffers
+read from the running game at three cameras (memory dumps, never
+written):
+
+| Camera | Depth exact | Screen exact (before → after) |
+|---|---|---|
+| Medium zoom, rotation 0 | 99.1% | 88.0% → 88.9% |
+| Far zoom, rotation 0 | 99.7% | 89.9% → 90.6% |
+| Medium zoom, rotation 3 (night) | 97.2% | (lighting differs) |
+
+House box at the screenshot cameras, exact in 565 space, before → after:
+medium 90.4% → 91.9%, far 90.2% → 92.4%, far rotation 3 90.0% → 92.5%,
+cutaway 87.1% → 89.0%, rotation 1 85.5% → 86.8%, rotation 2 86.1% →
+87.6%, near zoom 90.4% → 93.8%, 80.5% → 81.8% and 56.2% → 56.9%.
+
+How each surface gets its depth (all exact against the dumps unless
+noted):
+
+- **Tables.** Five per zoom, generated from formulas and checked entry
+  by entry against the game's own (digests in `depth.rs` tests): a row
+  table R (the ground's depth by screen row from the origin), an
+  upright table L (height above an anchor), a column table C (across a
+  wall), a terrain height curve H, and the 255 sprite depth bytes T.
+- **Grass and floors**: R at the tile's row plus H for its height, plus
+  80 for grass (the caller's own offset); floors follow the ground row
+  by row, plus 65.
+- **Walls**: an anchor at the wall's lower end on screen, then L by row
+  and C by column (0x4c4907); a wall pixel wins at up to one more than
+  what is there. Diagonal walls use no column table.
+- **Objects**: the object's anchor (0x4c9ceb) plus the sprite's depth
+  byte. The original reads L at the sprite context's own row, so a
+  sprite's height above its anchor adds nothing (0x49a5d3).
+- **Faint sprite pixels**: a sprite pixel with alpha under 8 of 31 is
+  not drawn at all, colour or depth. This is fitted, not read: it is
+  the threshold that matches best (alpha under 6 or 9 matches less).
+
+The door's left jamb now matches: the column the wall covered was a
+faint door pixel in front of the wall, which the original never draws.
+At medium zoom the door boxes rose from 86.4% to 88.5% exact.
+
+**Unverified:** upper-level floors and anchors (the dumps show level 1
+only), and the wall depth the original takes off for its mask 32. What
+is left at rotation 3 is mostly the fountain, a bench and stairs on the
+upper level, and sprite edges.
 
 ## 2026-11-14: Rotations 1 and 2 and near zoom, compared with the original
 
@@ -1293,7 +1438,6 @@ What would reopen it: a capture where a slot search with flag 0x2000
 draws a different number of times, or a house with two people in a
 route's way.
 
-
 ## 2026-11-14: The ambient scores play as the original's score player does
 
 `crates/sims-audio/src/ambience.rs` plays the FSC scores (backyard,
@@ -2251,6 +2395,7 @@ libraries at run time, so CI needs no new system packages.
 What would reopen it: the UI track needing a GPU, text or widgets that
 softbuffer cannot give, at which point the window code moves to wgpu
 or another toolkit, still outside `sims-render`.
+
 ## 2026-11-14: One table of IFF resources, with the prototype's rules (unverified)
 
 `Iff::get`, `Iff::all` and `Iff::resource_order` now read one table built
