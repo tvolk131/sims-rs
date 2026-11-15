@@ -203,6 +203,78 @@ about 63% to 65%, 0.125π 28%, and 0.1π 99.4%. Rotation 0 is unchanged:
 constructor value applies to them. Sending message 0xdd (probably a
 debug command) would tilt the sun; it is not modelled.
 
+## 2026-11-14: Get Direction To, and K = 583
+
+Tick 467 of the Goth house stopped at Get Direction To (opcode 12).
+
+- **Ported from the original's code** (`0x452003`). The destination
+  is resolved for writing first, as Random Number does. Then come the
+  object to look from (my object data word 11, or an operand with
+  flag 1) and the stack object, missing as native errors 0x17 and
+  0x15. The result is the route slots' direction (`0x4520e9`), plus 8,
+  modulo 8. Global 34 aliases the destination as in Random Number. A
+  destination with no word behind it (a literal, or a motive) fails
+  loudly, because the original writes through a null pointer there.
+- **The positions go in the native order.** The original passes +0xf4
+  first, which is our position's second coordinate, as the slot code
+  already knew (`pos = [target[1], target[0]]`). A first port that
+  passed ours in order matched every object for 117 more ticks but
+  left the lot stream one draw behind from tick 467 on. With the wrong
+  direction, person 21's tree 0x1017 found object 126 beside door 93,
+  so tree 0x100a skipped its Random Number.
+- **How it was found.** A new capture of the original with a write
+  watch on the active random state (`0x6e54ac`, `--watch`) logged each
+  draw with its stack. Tick 467 had one, from Random Number
+  (`0x451edd`) in person 21's thread. Our trace showed the tree that
+  draws it is reached only when 0x1017 returns false. The capture
+  matched the earlier one tick for tick, which also shows the
+  original's runs are repeatable here.
+- **K = 583.** Ticks 467 to 583 equal the capture, the three random
+  streams included, but for the known last-place head fields. Tick 584
+  stops at Snap (opcode 46).
+- **What would reopen it:** a Get Direction To with a destination or
+  object scope the Goth run has not reached.
+
+## 2026-11-14: A blocked step, and K = 466
+
+Tick 437 of the Goth house stopped where person 16's walk found its
+next step blocked (`0x58f682`). Porting that led through two more
+route steps in tick 438.
+
+- **A blocked step ends the route blocked.** The walk checks that the
+  person fits where the step ends (virtual function 0x54). If not
+  (`0x58eecb`), it writes 3 to the route's end (+0x188; `esi` holds 3
+  from `0x58edeb`) and goes straight to the update's tail (`0x58f688`).
+  The step (+0x294, +0x298) is already written; the person and the
+  animator's position stay where they were. That holds for the end of
+  a path's extra step too. The stand's earlier writes stay (the
+  destination's first two coordinates, the near-end and finishing
+  flags, the state and the progress). Only the final copy of the whole
+  position into the destination is skipped, and the state does not run
+  again, so the standing animator never turns the 3 into 2. The capture's animator holds 3 after tick
+  437.
+- **Step 10 tries again.** A route whose animator stopped short of the
+  path's end (0x589d47 gives 0, as it does for an end of 3) stops the
+  animator (0x589e2d). If that fails, the run ends. Otherwise the next
+  step is 6 (`0x45b371`). This was ported as a loud failure before.
+- **Step 16 reads the context's slot, not a null one.** The route
+  steps function reuses its slot argument (`[ebp+0xc]`): at `0x45aec6`
+  every run sets it to the context's copy of the slot record
+  (0x5c354f returns context +0xc). Giving up reads that copy's flag
+  0x4000. The earlier entry's "null slot record on a later run" was
+  wrong, and the loud failure is gone. A slot the route may end near
+  still fails loudly (the failure feedback tree, `0x45af2a`).
+- **Tick 438.** Person 16's route stops short, re-plans and finds no
+  way, finds nobody in the way, and gives up. Word 62 takes the
+  context's result, 13, left by the planning. The walk then goes on to
+  door 87. The capture holds the same frames and word 62.
+- **K = 466.** Ticks 437 to 466 equal the capture, but for the known
+  last-place head fields. Tick 467 stops at Get Direction To (opcode
+  12), not ported yet.
+
+Reopen if a capture shows a blocked step that moves the person, or a
+step-16 slot that differs from the context's copy.
+
 ## 2026-11-14: People in the way in the person vector's order, and K = 436
 
 Tick 418 of the Goth house stopped where a route asked who is in its
@@ -871,7 +943,8 @@ What was decided:
   at its end (0x45b9a0), not put back as they were. Step 16 fails
   loudly where it would read the route's slot flags on a later run,
   because the original reads them through a null slot record there
-  (0x45ad54 passes 0 after the first run).
+  (0x45ad54 passes 0 after the first run). *Superseded by "A blocked
+  step, and K = 466": every run reads the context's copy.*
 - **The person in the way and the marker are ported** (0x45ba28,
   0x45bf2e), in `primitives/in_way.rs`. The lot's own list of people is
   not modeled, so more than one candidate fails loudly (0x45bb04): the

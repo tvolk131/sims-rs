@@ -588,14 +588,11 @@ fn flagged_calls_are_unsupported() {
 #[test]
 fn unimplemented_primitives_name_themselves() {
     let mut fx = Fixture::new();
-    fx.add(LAMP_FILE, 4096, tree(vec![ins(12, 1, 1, [0; 8])]));
+    fx.add(LAMP_FILE, 4096, tree(vec![ins(46, 1, 1, [0; 8])]));
     let fault = fx.run().unwrap_err();
-    assert_eq!(fault.trap, Trap::Unimplemented { opcode: 12 });
+    assert_eq!(fault.trap, Trap::Unimplemented { opcode: 46 });
     let text = fault.to_string();
-    assert!(
-        text.contains("unimplemented primitive 12 (Get Direction To)"),
-        "{text}"
-    );
+    assert!(text.contains("unimplemented primitive 46 (Snap)"), "{text}");
     for (opcode, name) in [
         (3, "Find Best Interaction"),
         (13, "Push Interaction"),

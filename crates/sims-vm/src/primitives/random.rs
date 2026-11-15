@@ -70,7 +70,7 @@ impl Machine<'_, '_> {
 
     /// Reads a cell only to fault where the original's read would: a
     /// local is checked for range, not for what it holds.
-    fn probe(&self, cell: Cell) -> Result<(), Trap> {
+    pub(super) fn probe(&self, cell: Cell) -> Result<(), Trap> {
         match cell {
             Cell::Local(i) => self
                 .frame()?

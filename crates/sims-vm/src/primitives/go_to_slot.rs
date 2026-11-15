@@ -47,6 +47,8 @@
 //!   (0x589d47 gives 2), the thread yields. When it reached the path's
 //!   end (1) the next step is 9, else 10.
 //! - **9**: the animator stops (0x589e2d); the next step is 8.
+//! - **10**: the animator stops short of the path's end, as when its
+//!   next step was blocked (0x45b371); the next step is 6.
 //! - **8**: the route ends ([`Machine::end_route`]): the result is true.
 //!
 //! The steps run one after another in a run until one yields or pushes a
@@ -70,15 +72,14 @@
 //! used instead of the type's slot.
 //!
 //! Ported from the original's code. What the Goth house's routes to
-//! update 367 do not reach fails loudly: slots named any way but by a
+//! update 438 do not reach fails loudly: slots named any way but by a
 //! literal, a stack object that is missing or off the lot in a later
 //! step, a person with bit 0 of word 68 set or other contexts, a person
 //! who wants to be interrupted, a person sitting (posture 1), no door to
-//! go through, a route that stops short of the path's end (step 10),
-//! giving up with the route's slot flags read (step 16 on a later run,
-//! 0x45af20, and the failure feedback tree, 0x45af2a), ending a route
-//! while the asked person runs the action (0x45d5f8), every other step
-//! and every other result of the planning.
+//! go through, giving up on a slot the route may end near (the failure
+//! feedback tree, 0x45af2a), ending a route while the asked person runs
+//! the action (0x45d5f8), every other step and every other result of the
+//! planning.
 
 use crate::animator::stop_route;
 use crate::fault::{Fault, Trap};
@@ -297,8 +298,7 @@ impl Machine<'_, '_> {
     fn route_steps(&mut self, slot: Option<sims_sim::route::RouteSlot>) -> Result<Flow, Trap> {
         let me = self.me;
         // The slot record the first run is given; later runs are given
-        // none (0x45ad54).
-        let slot_record = slot;
+        // none (0x45ad54), and every run reads the context's copy.
         let target = self.frame()?.stack_object;
         let target = u16::try_from(target)
             .ok()
@@ -517,16 +517,11 @@ impl Machine<'_, '_> {
                             "whose animator is still under way when it is to stop",
                         ));
                     }
-                    if state == STOPPED {
-                        return Err(unsupported(
-                            "0x45b384",
-                            "whose animator's route ended without reaching the path's end \
-                             (step 6)",
-                        ));
-                    }
                     // The original notes the step in its log (0x57a54c),
-                    // which is not modeled.
-                    state = SUCCEEDED;
+                    // which is not modeled. A route that stopped short of
+                    // the path's end (a blocked step) tries again
+                    // (0x45b384).
+                    state = if state == STOPPED { RETRY } else { SUCCEEDED };
                 }
                 RETRY => match retry as i16 {
                     // 0x45b066: once the person has moved more than 8
@@ -617,14 +612,10 @@ impl Machine<'_, '_> {
                     }
                     state = FAILED;
                     self.set_person_word(ROUTE_RESULT, ctx.result as i16)?;
-                    let Some(slot) = slot_record else {
-                        return Err(unsupported(
-                            "0x45af20",
-                            "giving up on a later run, where the original reads the slot \
-                             record through a null pointer",
-                        ));
-                    };
-                    if slot.flags & NEAR != 0 {
+                    // 0x45af1d: the slot record here is the context's
+                    // copy (0x5c354f, set at 0x45aec6 on every run), not
+                    // the one the first run is given.
+                    if ctx.slot.flags & NEAR != 0 {
                         return Err(unsupported(
                             "0x45af2a",
                             "giving up on a slot it may end near: the Route failure feedback \
