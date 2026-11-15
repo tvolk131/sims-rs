@@ -27,6 +27,10 @@ pub struct Resident {
     /// The personality in the panel's order ([`PERSONALITY`]), in
     /// hundredths of a point (0 to 1000).
     pub personality: [i16; 5],
+    /// The person's sign of the zodiac, 1 (Aries) to 12 (Pisces), as
+    /// the personality panel shows it ([`zodiac`]); none for a person
+    /// the panel shows no sign for.
+    pub zodiac: Option<u8>,
     /// The skills in the job panel's order ([`SKILLS`]), in hundredths
     /// of a point (0 to 1000).
     pub skills: [i16; 6],
@@ -42,6 +46,74 @@ pub struct Resident {
 /// The person data words of the personality, in the panel's order: Neat,
 /// Outgoing, Active, Playful and Nice (0x66c600).
 pub const PERSONALITY: [usize; 5] = [7, 6, 3, 5, 2];
+
+/// Person data word 70: the person's sign of the zodiac, 1 to 12, or
+/// 0 until the personality panel works it out.
+pub const ZODIAC: usize = 70;
+
+/// The person data words the sign is worked out from (0x6c5be4):
+/// Outgoing, Nice, Playful, Neat and Active.
+const ZODIAC_TRAITS: [usize; 5] = [6, 2, 5, 7, 3];
+
+/// Each sign's traits, in [`ZODIAC_TRAITS`]' order, in points
+/// (0x6c5bf8), Aries first.
+const ZODIAC_PROFILES: [[f32; 5]; 12] = [
+    [8.0, 3.0, 3.0, 5.0, 6.0],
+    [5.0, 4.0, 8.0, 5.0, 3.0],
+    [7.0, 3.0, 3.0, 4.0, 8.0],
+    [3.0, 6.0, 4.0, 6.0, 6.0],
+    [10.0, 3.0, 4.0, 4.0, 4.0],
+    [2.0, 5.0, 3.0, 9.0, 6.0],
+    [8.0, 7.0, 6.0, 2.0, 2.0],
+    [5.0, 3.0, 3.0, 6.0, 8.0],
+    [3.0, 4.0, 7.0, 2.0, 9.0],
+    [4.0, 5.0, 8.0, 7.0, 1.0],
+    [4.0, 6.0, 7.0, 4.0, 4.0],
+    [3.0, 7.0, 3.0, 5.0, 7.0],
+];
+
+/// The sign the personality panel shows for a person whose data word
+/// `n` is `data(n)` (0x51cd11). A person of a kind above 1 (person data
+/// 65) gets none. Otherwise the saved sign, held to 1 to 12 as the
+/// name lookup holds it (0x4842de); where none is saved (0), the sign
+/// whose traits are nearest (0x4841fc).
+///
+/// The original saves the sign it works out into the person's data
+/// (0x51cd44); the panel here only reads, so a host that wants the
+/// original's data writes it.
+pub fn zodiac(data: impl Fn(usize) -> i16) -> Option<u8> {
+    if data(sims_sim::neighbors::KIND) > 1 {
+        return None;
+    }
+    Some(match data(ZODIAC) {
+        0 => nearest_sign(ZODIAC_TRAITS.map(&data)),
+        // Held to 1..=12 just above, so it fits.
+        sign => sign.clamp(1, 12) as u8,
+    })
+}
+
+/// The sign whose traits are nearest `traits` (in hundredths of a point,
+/// [`ZODIAC_TRAITS`]' order), as 0x4841fc measures: each trait times the
+/// float 0.01 kept as a float, the squared distances summed in the
+/// x87's 53-bit precision, the least sum kept as a float, the first
+/// sign kept on a tie.
+fn nearest_sign(traits: [i16; 5]) -> u8 {
+    let scale = f64::from(f32::from_bits(0x3c23_d70a));
+    let points = traits.map(|t| (f64::from(t) * scale) as f32);
+    let mut best = f32::from_bits(0x7e96_7699);
+    let mut sign = 1;
+    for (n, profile) in ZODIAC_PROFILES.iter().enumerate() {
+        let distance = points.iter().zip(profile).fold(0.0f64, |sum, (p, q)| {
+            let d = f64::from(*p) - f64::from(*q);
+            d * d + sum
+        });
+        if distance < f64::from(best) {
+            best = distance as f32;
+            sign = n as u8 + 1;
+        }
+    }
+    sign
+}
 
 /// The person data words of the skills, in the job panel's order:
 /// Cooking, Mechanical, Charisma, Body, Logic and Creativity (0x66dfec).
@@ -92,6 +164,7 @@ impl Snapshot {
                     guid,
                     motives: person.map(|p| p.motives).unwrap_or_default(),
                     personality: PERSONALITY.map(data),
+                    zodiac: zodiac(data),
                     skills: SKILLS.map(data),
                     job: JOB.map(data),
                     needs: [0; 6],
@@ -335,6 +408,33 @@ mod tests {
     }
 
     #[test]
+    fn the_sign_is_the_nearest_profile_or_the_saved_one() {
+        // Each sign's own traits give it.
+        for (n, profile) in ZODIAC_PROFILES.iter().enumerate() {
+            let traits = profile.map(|p| (p * 100.0) as i16);
+            assert_eq!(nearest_sign(traits), n as u8 + 1);
+        }
+        // Equally near two signs, the first is kept: no traits at all are
+        // 133 from both Cancer and Aquarius.
+        assert_eq!(nearest_sign([0; 5]), 4);
+        // Through the person data: the traits by their words, a saved
+        // sign held to 1..=12, and none for a kind above 1.
+        let person = |words: &[(usize, i16)]| {
+            let words = words.to_vec();
+            move |n: usize| words.iter().find(|w| w.0 == n).map_or(0, |w| w.1)
+        };
+        let leo = [(6, 1000), (2, 300), (5, 400), (7, 400), (3, 400)];
+        assert_eq!(zodiac(person(&leo)), Some(5));
+        let mut saved = leo.to_vec();
+        saved.push((ZODIAC, 2));
+        assert_eq!(zodiac(person(&saved)), Some(2));
+        assert_eq!(zodiac(person(&[(ZODIAC, 40)])), Some(12));
+        assert_eq!(zodiac(person(&[(ZODIAC, -3)])), Some(1));
+        assert_eq!(zodiac(person(&[(65, 2)])), None);
+        assert_eq!(zodiac(person(&[(65, 1), (ZODIAC, 4)])), Some(4));
+    }
+
+    #[test]
     fn clock_and_money_text() {
         assert_eq!(snapshot(6, 30, 0).clock(), "AM 6:30");
         assert_eq!(snapshot(0, 5, 0).clock(), "AM 12:05");
@@ -367,6 +467,7 @@ mod tests {
             guid: 1,
             motives: [0.0; 16],
             personality: [0; 5],
+            zodiac: None,
             skills: [0, 0, 300, 1000, 199, 0],
             job,
             needs: [7; 6],
