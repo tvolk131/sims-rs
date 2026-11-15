@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use sims_audio::files::SoundFiles;
 use sims_audio::module::Module;
 use sims_audio::player::{BLOCK, NoSources, Player, RATE, Samples};
+use sims_audio::stations::StationLists;
 use sims_audio::{Pcm, SoundEvent};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -170,8 +171,10 @@ fn every_event_definition_runs_without_a_bad_instruction() {
         .flat_map(|(index, m)| m.hot.events.iter().map(move |(n, _)| (index, n.clone())))
         .collect();
     let mut player = Player::new(modules, Stub, 1);
+    player.add_stations(&StationLists::build(&files));
     let mut faults: BTreeMap<String, usize> = BTreeMap::new();
     let mut unported: BTreeMap<String, usize> = BTreeMap::new();
+    let mut kinds: BTreeMap<i64, usize> = BTreeMap::new();
     let mut still_running = 0;
     for (module, name) in &definitions {
         player.handle(&SoundEvent::StopAll);
@@ -182,15 +185,16 @@ fn every_event_definition_runs_without_a_bad_instruction() {
             still_running += 1;
         }
         for fault in &player.faults {
+            if let Some(at) = fault.find(" is not one this player plays") {
+                let kind = fault[..at].rsplit(' ').next().unwrap();
+                *kinds.entry(kind.parse().unwrap()).or_default() += 1;
+            }
             if let Some(at) = fault.find(" is not supported") {
                 let instruction = fault[..at].rsplit(' ').next().unwrap();
                 *unported.entry(instruction.to_owned()).or_default() += 1;
             }
             let kind = [
-                (
-                    "is not one this player plays",
-                    "event of a kind other than play",
-                ),
+                ("is not one this player plays", "event of a kind not ported"),
                 ("is not supported", "instruction not ported"),
                 ("entry point not found", "track entry point not found"),
                 ("no track", "event names no track"),
@@ -204,17 +208,24 @@ fn every_event_definition_runs_without_a_bad_instruction() {
         }
     }
     // No instruction is decoded wrong and none reached is unported. What
-    // remains are the files' loose ends (see `install_tables.rs`) and the
-    // 190 events of other kinds (music modes, television, sequenced hit
-    // lists and more). Of the 122 events still running after 20 blocks,
-    // 121 loop (fires, appliances, voices that loop) and one,
-    // `Grimreaper_loop_kill`, fades its own vol for 21 blocks: the loop
-    // track it targets is not running, so `target` is itself.
+    // remains are the files' loose ends (see `install_tables.rs`), 12
+    // events with an empty track field (the original's lookup of track 0
+    // finds nothing, as here) and the 24 events of kinds not ported:
+    // music modes (36, whose ambience half is ported), the piano (43),
+    // pausing (103) and reloading (104). The 5 ambience modes (52) start
+    // and stop scores, none of which this test loads. Of the 181 events
+    // still running after 20 blocks, the 60 that turn on a television or
+    // radio play their station for ever; 120 more loop (fires,
+    // appliances, voices that loop) and one, `Grimreaper_loop_kill`,
+    // fades its own vol for 21 blocks: the loop track it targets is not
+    // running, so `target` is itself. (`shoo_tub_inside_vox` waits a
+    // random time, which the station scripts' draws make short here.)
     assert_eq!(definitions.len(), 4494);
-    assert_eq!((still_running, format!("{unported:?}")), (122, "{}".into()));
+    assert_eq!((still_running, format!("{unported:?}")), (181, "{}".into()));
+    assert_eq!(format!("{kinds:?}"), "{36: 21, 43: 1, 103: 1, 104: 1}");
     assert_eq!(
         format!("{faults:?}"),
-        "{\"event names no track\": 2, \"event of a kind other than play\": 190, \
+        "{\"event names no track\": 14, \"event of a kind not ported\": 24, \
          \"hit list not found\": 1, \"patch not found\": 3, \"track entry point not found\": 10}"
     );
 }
@@ -249,4 +260,111 @@ fn the_first_module_defining_an_event_name_wins() {
         }
     }
     assert_eq!((shadowed.len(), differ), (13, 5), "{shadowed:#?}");
+}
+
+#[test]
+fn the_stations_are_built_from_their_directories() {
+    let Some(root) = install() else { return };
+    let files = SoundFiles::scan(&root).unwrap();
+    let lists = StationLists::build(&files);
+    // Each station's sub lists and patches.
+    let counts: Vec<String> = sims_audio::stations::STATIONS
+        .iter()
+        .map(|&(number, _)| {
+            let subs = &lists.hit_lists[&number];
+            let patches: usize = subs.iter().map(|s| lists.hit_lists[s].len()).sum();
+            format!("{number}:{}/{patches}", subs.len())
+        })
+        .collect();
+    let listing: String = lists
+        .hit_lists
+        .iter()
+        .map(|(id, list)| format!("{id}={list:?}\n"))
+        .chain(
+            lists
+                .patches
+                .iter()
+                .map(|(id, path)| format!("{id}={path}\n")),
+        )
+        .collect();
+    let digest: String = Sha256::digest(listing.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    // Music stations and modes are one directory each; the television
+    // stations have a subdirectory per programme.
+    assert_eq!(
+        counts.join(" "),
+        "232:1/7 233:1/5 234:1/5 235:1/5 221:1/4 222:1/6 223:1/5 103100:1/7 103101:1/1 \
+         103102:1/7 103104:1/5 103000:9/33 103001:7/22 103002:6/26 103003:7/23 100100:1/5 \
+         100102:1/6 100101:1/5 20900:1/8 20901:1/6 20902:1/6 14093:1/8 6100:1/8 65536:1/9 \
+         65537:1/5 529:5/20 530:11/60 528:5/18 531:5/16 1586:1/5 1587:1/5 1588:1/5 1589:1/5 \
+         1590:1/5"
+    );
+    assert_eq!(
+        digest,
+        "75cec23ec070f8669924b6d6a0c8750f38025ee86dc211b0f1c719abb6e73ad2"
+    );
+}
+
+#[test]
+fn a_television_plays_its_station() {
+    let Some(root) = install() else { return };
+    let files = SoundFiles::scan(&root).unwrap();
+    let mut player = player(&root, 1);
+    player.add_stations(&StationLists::build(&files));
+    player.handle(&SoundEvent::Play {
+        object: 5,
+        name: "tv_action_cheap".into(),
+    });
+    let out = player.render(2 * RATE as usize, &NoSources);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    assert!(out.iter().any(|&s| s != 0));
+    assert_eq!(
+        digest(&out),
+        "97ff325be5165800ba4cd9fc40679eb52741fb2cf9e2ddfe06f0d2eaaec5e9c1"
+    );
+    // The set going off ends it.
+    player.handle(&SoundEvent::StopObject { object: 5 });
+    player.render(RATE as usize, &NoSources);
+    assert!(player.is_idle());
+}
+
+#[test]
+fn the_backyard_ambience_plays() {
+    let Some(root) = install() else { return };
+    let files = SoundFiles::scan(&root).unwrap();
+    let mut player = player(&root, 3);
+    player.add_scores(&files);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    // As on entering a lot from the neighbourhood: the music modes are
+    // recorded only once the neighbourhood's has been set.
+    for name in ["bkground_nhood1", "setambience_backyard", "bkground_live"] {
+        player.handle(&SoundEvent::Play {
+            object: 0,
+            name: name.into(),
+        });
+    }
+    // The music halves of the two kind 36 events.
+    assert_eq!(player.faults.len(), 2, "{:?}", player.faults);
+    player.faults.clear();
+    // Noon, with the camera's value at 50: row 500 per mille.
+    player.set_ambience_view(50, 12);
+    let ambience = player.ambience().unwrap();
+    assert_eq!((ambience.mode(), ambience.is_started()), (0, true));
+    let out = player.render_stereo(60 * RATE as usize, &NoSources);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    let ambience = player.ambience().unwrap();
+    let loud = out.iter().filter(|s| s.unsigned_abs() > 64).count();
+    assert!(loud > out.len() / 10, "{loud} of {}", out.len());
+    assert_eq!(
+        format!(
+            "{:?} {} {} {}",
+            ambience.cursor(),
+            ambience.active(),
+            out.len(),
+            digest(&out)
+        ),
+        "(13, 6) 2 2646000 f5ef8e68bac7cba7758d2a196de792133b29c4ad97d3dfc01b27e1c66b42abb6"
+    );
 }

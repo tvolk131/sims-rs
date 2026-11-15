@@ -13,14 +13,17 @@ sims-content.workspace = true
 sims-formats.workspace = true
 sims-core.workspace = true
 sims-sim.workspace = true
-# The viewer's window, only with the `viewer` feature (see src/bin).
+# The viewer's window, and the simulation it can run a lot with, only
+# with the `viewer` feature (see src/bin). The library itself reads the
+# simulation's state and never runs it.
+sims-vm = { workspace = true, optional = true }
 softbuffer = { version = "0.4.8", optional = true }
 winit = { version = "0.30.13", optional = true }
 
 [features]
 # A small window that plays the people of a house. Off by default, so the
 # workspace build and CI need no windowing libraries.
-viewer = ["dep:softbuffer", "dep:winit"]
+viewer = ["dep:sims-vm", "dep:softbuffer", "dep:winit"]
 
 [[bin]]
 name = "people-viewer"
@@ -28,6 +31,7 @@ required-features = ["viewer"]
 
 [dev-dependencies]
 sha2.workspace = true
+sims-vm.workspace = true
 
 [lints]
 workspace = true
