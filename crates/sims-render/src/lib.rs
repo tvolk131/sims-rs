@@ -22,6 +22,7 @@ pub mod open;
 pub mod png;
 pub mod pools;
 pub mod scene;
+pub mod shadows;
 
 pub use assets::Assets;
 pub use camera::{Camera, Walls, Zoom};
