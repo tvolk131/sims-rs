@@ -2192,6 +2192,15 @@ through their public interfaces only; the simulation never depends on it.
   tick 2, answered No from the window, gives the lot `--answers 3`
   gives, hash for hash, through tick 200. `--answers` still answers
   first, and `--png` answers No to the Help System by default.
+- **Done: the panel follows the lot.** Every frame the panel reads the
+  world as it is: the clock (globals 0 and 5), the household's funds,
+  the portraits with the selected Sim's lit, and the selected Sim's mood
+  bars and needs meters. A Goth test queues the snack and runs 850 ticks:
+  the funds go from $2,542 to $2,537 when Mortimer pays, the clock moves,
+  and the hunger meter is his hunger. The pointer on a portrait shows
+  that person's first name (catalog strings, `OBJD` word 41) in a box
+  over it; that box is ours (**unverified**). The original's action queue
+  in the top-left corner is not drawn yet.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
     on Manage Inventory operation 4 and scope 12. A check tree's fault
