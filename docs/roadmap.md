@@ -2105,10 +2105,16 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   (0x51df31). The Goths' panel is pinned by digest, gated on
   `SIMS_INSTALL`; it is not yet compared with a screenshot, and the
   zodiac sign under the bars is not drawn. In the window, the
-  personality and needs panels show the selected Sim's live person data
-  and motives, through the ticks and after a press on another portrait
-  (`sims-game` tests `the_personality_panel_shows_the_selected_goths_traits`,
-  `the_needs_panel_follows_the_selected_goths_motives`).
+  personality, needs, job and relationship panels show the selected
+  Sim's live person data, motives, skills and relationship rows, through
+  the ticks and after a press on another portrait (`sims-game` tests
+  `the_personality_panel_shows_the_selected_goths_traits`,
+  `the_needs_panel_follows_the_selected_goths_motives`,
+  `the_job_panel_shows_the_selected_goths_skills`,
+  `the_relationship_panel_lists_who_the_selected_goth_knows`). The
+  game's panel reads the relationships with the tuning's friendship
+  threshold and loads the faces of everyone in the neighborhood's
+  records.
 - **Done: the job panel's skills.** The Job button opens the selected
   Sim's six skill bars, with the labels of what the next level of
   their career needs underlined and a line marking how much (from
