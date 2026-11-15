@@ -62,10 +62,13 @@ fn with_goth_people(
     .0;
     let interpreter = Interpreter::new(&program, &catalog, Stream::Global);
     let mut world = World::empty();
-    let characters = catalog.objects.iter().filter(|o| o.kind == 2);
     world
-        .read_neighbors(&neighborhood, characters.map(|o| o.guid))
+        .read_neighbors(
+            &neighborhood,
+            &sims_sim::neighbors::registry(&index, &catalog),
+        )
         .unwrap();
+    world.drop_empty_families().unwrap();
     world.type_attributes = program.type_attributes(&catalog).unwrap();
     world.read_type_attributes(neighborhood.type_attributes.as_ref().unwrap());
     assert_eq!(interpreter.create_indicators(&mut world), Ok([1, 2]));
@@ -414,12 +417,35 @@ fn routing_18_bytes(routing: &sims_sim::route::Routing) -> Vec<u8> {
     bytes
 }
 
+/// A lot's encoding as snapshot format 25 wrote it: without the record of
+/// the bones the skins moved ([`World::translated_bones`]) that format 26
+/// added at the end. The older formats' encodings start from this one.
+fn format_25_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let moved = postcard::to_allocvec(&world.translated_bones).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - moved.len()), moved);
+    bytes
+}
+
+/// A lot's encoding as snapshot format 24 wrote it: without the base
+/// slots' layers ([`World::base_layers`]) that format 25 added at the end,
+/// so a state pinned under format 24 can be shown to be the same state
+/// but for those layers. It starts from [`format_25_bytes`], and the older
+/// formats' encodings from this one.
+fn format_24_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = format_25_bytes(world);
+    let layers = postcard::to_allocvec(&world.base_layers).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - layers.len()), layers);
+    bytes
+}
+
 /// A lot's encoding as snapshot format 23 wrote it: without the headlines
 /// ([`World::headlines`]) that format 24 added at the end, so a state
 /// pinned under format 23 can be shown to be the same state but for the
-/// headlines. The older formats' encodings start from this one.
+/// headlines. It starts from [`format_24_bytes`], and the older formats'
+/// encodings from this one.
 fn format_23_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_24_bytes(world);
     let headlines = postcard::to_allocvec(&world.headlines).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - headlines.len()), headlines);
     bytes
@@ -1225,10 +1251,13 @@ fn the_goth_house_type_table_marks_the_changed_types() {
 /// another capture, of the same house four ticks after its load: all 142
 /// tiles name the same next tile.
 ///
-/// One thing differed and is not explained: in one frame of object 19 the
-/// capture's tree ID has bit 15 set (0x8118) where the save, and this
-/// state, have 0x118. Object 17 has the same type and thread and no such
-/// bit.
+/// One thing differed: in one frame of object 19 the capture's tree ID
+/// has bit 15 set (0x8118) where the save, and this state, have 0x118.
+/// Object 17 has the same type and thread and no such bit. The frame
+/// reader (0x474694) writes only the low 15 bits and keeps bit 15 from the
+/// frame arena's memory, which is freshly allocated and not cleared
+/// (0x4750ed), and every reader masks the bit off (0x4746c0, 0x4747ea,
+/// 0x474f79), so it is left over from the heap and nothing reads it.
 ///
 /// The C runtime stream and six type attribute words belong to the game
 /// that was running, as in the tests above. With those copied from the
@@ -1326,6 +1355,59 @@ fn the_goth_house_objects_are_constructed_and_read() {
     );
 }
 
+/// Reading a person's interactions raises the action serial to the
+/// largest number among them, compared signed (0x41f320): each person's
+/// active, last and queued interactions. The Goth people's are all 0;
+/// here some are given others.
+#[test]
+fn reading_the_people_raises_the_action_serial() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    with_goth_people(
+        std::path::Path::new(&root),
+        |house, interpreter, world, _, people| {
+            world.clear_family().unwrap();
+            interpreter.clear(world).unwrap();
+            world.read_arrays(&house.arrays, 62).unwrap();
+            world
+                .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+                .unwrap();
+            interpreter.read_types(world, &house.types).unwrap();
+            interpreter.clear(world).unwrap();
+            let before = world.clone();
+            let mut objects = house.objects.clone();
+            let mut persons = objects
+                .instances
+                .values_mut()
+                .filter_map(|i| i.person.as_mut());
+            persons.next().unwrap().last.uid = 7;
+            persons.next().unwrap().active.uid = -9;
+            interpreter.read_objects(world, &objects, people).unwrap();
+            assert_eq!(world.action_serial, 7);
+            // A larger serial stays.
+            *world = before.clone();
+            world.action_serial = 8;
+            interpreter.read_objects(world, &objects, people).unwrap();
+            assert_eq!(world.action_serial, 8);
+            // A queued interaction counts too.
+            *world = before;
+            let third = objects
+                .instances
+                .values_mut()
+                .filter_map(|i| i.person.as_mut())
+                .nth(2)
+                .unwrap();
+            let mut queued = third.active.clone();
+            queued.uid = 12;
+            third.queue.push(queued);
+            interpreter.read_objects(world, &objects, people).unwrap();
+            assert_eq!(world.action_serial, 12);
+        },
+    );
+}
+
 /// Load steps 8 and 9: the lot-wide controllers are reconciled among the
 /// 245 saved objects, which creates the 137 the house did not save, and
 /// the ground level's object grid is checked, which clears nothing.
@@ -1354,9 +1436,9 @@ fn the_goth_house_objects_are_constructed_and_read() {
 /// memory the trace holds at this stop or the one before, and was equal.
 /// Those hold 30 of the 32 links between objects here.
 ///
-/// One thing differed, as after the object read, and is still not
-/// explained: object 19's second frame has tree ID 0x8118 in the trace and
-/// 0x118 here.
+/// One thing differed, as after the object read: object 19's second frame
+/// has tree ID 0x8118 in the trace and 0x118 here, a bit left over from the
+/// heap that nothing reads (see the object read's test).
 ///
 /// The C runtime stream and six type attribute words belong to the game
 /// that was running. With those copied from the trace's state at the
@@ -1752,6 +1834,25 @@ fn selected(root: &std::path::Path, then: impl FnOnce(&Interpreter, &mut World, 
 ///
 /// The digests are of our own state, as built here. The first is the
 /// state after visit 201, pinned when the step stopped there.
+/// Load step 15 on the Goth lot (`World::finish_selection`). Its people
+/// are all of the family and the lot (house 5) is zoned residential, so
+/// which types are
+/// the neighborhood's characters does not matter, and the residents noted
+/// before the selection are the people on the lot now.
+fn finish_goth_selection(world: &mut World, family: &sims_formats::neighborhood::Family) {
+    let residents = world.residents();
+    world
+        .finish_selection(&sims_sim::load::Household {
+            house: 5,
+            flags: family.flags,
+            members: &family.members,
+            characters: &std::collections::BTreeSet::new(),
+            residents: &residents,
+            zoning: &std::collections::BTreeMap::from([(5, 1)]),
+        })
+        .unwrap();
+}
+
 #[test]
 fn the_goth_house_objects_are_all_visited() {
     const VISIT_201: &str = "680e6caf3382eff8f069b64920efdc6bd49de3c7458733f9df65076cdf22e02d";
@@ -1768,7 +1869,7 @@ fn the_goth_house_objects_are_all_visited() {
     let root = std::path::Path::new(&root);
     let install = Install::detect(root).unwrap();
     let neighborhood = Neighborhood::open(&install.file("UserData").unwrap()).unwrap();
-    let flags = neighborhood.family_in(5).unwrap().1.flags;
+    let family = neighborhood.family_in(5).unwrap().1.clone();
     selected(root, |interpreter, world, people| {
         let asked = std::cell::RefCell::new(Vec::new());
         let mut interpreter = *interpreter;
@@ -1861,7 +1962,7 @@ fn the_goth_house_objects_are_all_visited() {
         // Steps 14 and 15 change nothing on this lot, and neither does
         // asking for the indicators again in step 16.
         assert_eq!(interpreter.ensure_indicators(world), Ok(None));
-        world.finish_selection(flags).unwrap();
+        finish_goth_selection(world, &family);
         assert_eq!(interpreter.ensure_indicators(world), Ok(None));
         assert_eq!(digest(&format_16_bytes(world)), VISITED_16);
         pinned(&without_room_notes(world), VISITED, VISITED_7);
@@ -1934,7 +2035,7 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
         let mut interpreter = *interpreter;
         assert_eq!(interpreter.visit_objects(world, people).stopped, None);
         interpreter.ensure_indicators(world).unwrap();
-        world.finish_selection(family.flags).unwrap();
+        finish_goth_selection(world, &family);
         // Step 16. Nobody is selected, so the saved selection in global 3
         // is cleared. Nothing else changes.
         let mut expected = world.clone();
@@ -2308,7 +2409,7 @@ fn the_goth_house_first_tick_matches_the_original() {
     selected(root, |interpreter, world, people| {
         assert_eq!(interpreter.visit_objects(world, people).stopped, None);
         interpreter.ensure_indicators(world).unwrap();
-        world.finish_selection(family.flags).unwrap();
+        finish_goth_selection(world, &family);
         interpreter.announce_house(world).unwrap();
         interpreter
             .select_resident(world, family.budget, &family.members)

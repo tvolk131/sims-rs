@@ -27,6 +27,8 @@
 //! - [`player`]: the HIT virtual machine and a mixer. It takes
 //!   [`SoundEvent`]s, the simulation's only link to sound, and renders
 //!   PCM.
+//! - [`sources`]: what the sound scripts may ask the simulation about an
+//!   object.
 
 pub mod ambience;
 pub mod decode;
@@ -41,7 +43,9 @@ pub mod levels;
 pub mod module;
 pub mod mp3;
 mod pcm;
+pub mod placement;
 pub mod player;
+pub mod sources;
 pub mod stations;
 pub mod wav;
 pub mod xa;

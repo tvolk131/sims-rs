@@ -7,6 +7,7 @@ mod animate;
 mod budget;
 mod change_suit;
 mod create;
+mod debug;
 pub(crate) mod dialog;
 mod direction;
 pub(crate) mod distance;
@@ -38,6 +39,7 @@ mod set_to_next;
 mod sleep;
 mod snap;
 mod sound;
+mod special_effect;
 
 pub(crate) use distance::distance;
 
@@ -130,10 +132,12 @@ impl Machine<'_, '_> {
             12 => self.get_direction_to(operands)?.into(),
             13 => self.push_interaction(operands)?.into(),
             14 => self.find_best_object(operands)?.into(),
+            15 => self.breakpoint(operands)?.into(),
             16 => self.find_location(operands)?.into(),
             17 => self.idle_for_input(operands)?,
             18 => self.remove(operands)?,
             20 => self.run_functional_tree(operands)?,
+            21 => self.show_string().into(),
             22 => self.look_towards(operands)?,
             23 => self.play_sound(operands)?.into(),
             24 => self.old_relationship(operands)?.into(),
@@ -151,6 +155,7 @@ impl Machine<'_, '_> {
             46 => self.snap(operands)?.into(),
             48 => self.stop_all_sounds(operands)?.into(),
             32 => self.test_object_type(operands)?.into(),
+            35 => self.special_effect(operands)?,
             36 => self.dialog(operands)?,
             37 => self.sim_interacting_with(operands)?.into(),
             49 => self.notify()?.into(),

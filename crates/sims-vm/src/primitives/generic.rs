@@ -27,9 +27,23 @@
 //!   data word 72 and clears word 73 (0x44fe72 to 0x44fe7d). When temp 0
 //!   is 0 its footprint is then worked out again where it stands
 //!   (0x433d16, through 0x43519f), with word 73 already clear.
+//! - 2 (0x44fb51): the stack object becomes the icon of the running
+//!   person's action (person +0xa54), if the person has a running action
+//!   (+0xa84 not 0). The stack object must be on the lot (native error
+//!   0xa otherwise, checked first: the lot's object table at +0x18 of the
+//!   person's lot, +0xdc), and the running object a person (error 0x1c).
+//! - 12: how far the stack object's tile is from the back of the view
+//!   (0x44fd4b). Temp 0 becomes minus the sum of the tile's two
+//!   coordinates (object bytes +0xfc and +0xfd), each first turned by the
+//!   house view's rotation (0x434f58) through the table 0x407704 builds:
+//!   the coordinates (x, y) become (63 - y, x) at rotation 1, (63 - x,
+//!   63 - y) at 2 and (y, 63 - x) at 3, and stay at 0. The sum is a
+//!   16-bit word. A stack object that is not there throws native error
+//!   0xa. Routine 12 takes the true branch.
 
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
+use sims_sim::World;
 
 impl Machine<'_, '_> {
     pub(crate) fn generic_call(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
@@ -63,6 +77,19 @@ impl Machine<'_, '_> {
                 }
                 Ok(true)
             }
+            2 => {
+                self.set_action_icon()?;
+                Ok(true)
+            }
+            12 => {
+                let depth = self.tile_depth()?;
+                *self
+                    .me_mut()?
+                    .temps
+                    .first_mut()
+                    .ok_or_else(|| Trap::Invalid("object has no temps".into()))? = depth;
+                Ok(true)
+            }
             15 => {
                 self.copy_temp_to_person()?;
                 Ok(true)
@@ -75,6 +102,63 @@ impl Machine<'_, '_> {
                 "Generic Sims Call routine {routine}"
             ))),
         }
+    }
+}
+
+impl Machine<'_, '_> {
+    /// Routine 2 (0x44fb51 to 0x44fbd8).
+    fn set_action_icon(&mut self) -> Result<(), Trap> {
+        let stack_object = self.frame()?.stack_object;
+        if stack_object <= 0 || !self.world.objects.contains_key(&(stack_object as u16)) {
+            return Err(Trap::native(0xa, "the stack object is not on the lot"));
+        }
+        let action = &mut self
+            .me_mut()?
+            .person
+            .as_mut()
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .active;
+        if action.uid != 0 {
+            action.icon = stack_object;
+        }
+        Ok(())
+    }
+
+    /// Routine 12's value (0x44fd4b): minus the sum of the stack object's
+    /// tile coordinates as the view's rotation turns them.
+    fn tile_depth(&self) -> Result<i16, Trap> {
+        let target = self.frame()?.stack_object;
+        let object = u16::try_from(target)
+            .ok()
+            .filter(|&id| id > 0)
+            .and_then(|id| self.world.objects.get(&id))
+            .ok_or_else(|| Trap::native(0xa, "Generic Sims Call 12 has no stack object"))?;
+        let [x, y, _] = World::tile(object.position);
+        let [x, y] = turn_tile([x, y], self.view_rotation)?;
+        Ok((i16::from(x) + i16::from(y)).wrapping_neg())
+    }
+}
+
+/// A tile's coordinates as the house view at `rotation` sees them
+/// (0x434f58): the table at 0x6de86c that 0x407704 builds, 64 by 64 for
+/// each of rotations 1 to 3; rotation 0 leaves them. The original reads a
+/// coordinate outside 0 to 63 from outside the rotation's table, so that
+/// fails.
+pub(crate) fn turn_tile([x, y]: [i8; 2], rotation: u8) -> Result<[i8; 2], Trap> {
+    if rotation == 0 {
+        return Ok([x, y]);
+    }
+    if !(0..64).contains(&x) || !(0..64).contains(&y) {
+        return Err(Trap::Unsupported(format!(
+            "turning tile ({x}, {y}) by the view's rotation {rotation} (0x434f58) reads outside \
+             its table, which is not ported"
+        )));
+    }
+    match rotation {
+        1 => Ok([63 - y, x]),
+        2 => Ok([63 - x, 63 - y]),
+        3 => Ok([y, 63 - x]),
+        _ => Err(Trap::Invalid(format!("the view's rotation {rotation}"))),
     }
 }
 

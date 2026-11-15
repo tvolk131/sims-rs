@@ -107,6 +107,12 @@ fn lot(at: [i32; 2], facing: i16, entries: i16) -> (Fixture, u16) {
 
 /// Runs Go To Routing Slot for the lamp's routing slot 0 as `me`.
 fn go_to(fx: &mut Fixture, me: u16) -> Result<bool, sims_vm::Fault> {
+    go_to_with(fx, me, 0)
+}
+
+/// Runs Go To Routing Slot for the lamp's routing slot 0 as `me`, with
+/// operand byte 4 `byte_4` (bit 0: the route may not end near the slot).
+fn go_to_with(fx: &mut Fixture, me: u16, byte_4: u8) -> Result<bool, sims_vm::Fault> {
     let guid = fx.world.objects[&me].guid;
     let file = fx.catalog.object(guid).unwrap().resource;
     fx.add(
@@ -116,7 +122,7 @@ fn go_to(fx: &mut Fixture, me: u16) -> Result<bool, sims_vm::Fault> {
             GO_TO_SLOT,
             RETURN_TRUE,
             RETURN_FALSE,
-            [0, 0, 1, 0, 0, 0, 0, 0],
+            [0, 0, 1, 0, byte_4, 0, 0, 0],
         )]),
     );
     fx.run_with(me, TREE, LAMP as i16, &[], 100)
@@ -148,8 +154,38 @@ fn refuse_to_sit(fx: &mut Fixture) {
     );
 }
 
+/// Whether the route failed: Go To Routing Slot's false return.
 fn gives_up(result: Result<bool, sims_vm::Fault>) -> bool {
-    matches!(trap(result), sims_vm::Trap::Unsupported(m) if m.contains("0x45af2a"))
+    result == Ok(false)
+}
+
+/// The lamp's "Route failure feedback" tree: it writes its two arguments
+/// and the lamp's use count (data word 62) to the stack object's data
+/// words 51 to 53, and returns false.
+const FEEDBACK_TREE: u16 = 0x1200;
+
+fn give_feedback_tree(fx: &mut Fixture) {
+    fx.add(
+        LAMP_FILE,
+        FEEDBACK_TREE,
+        tree(vec![
+            assign(scope::STACK_DATA, 51, scope::PARAMETERS, 0, 1),
+            assign(scope::STACK_DATA, 52, scope::PARAMETERS, 1, 2),
+            assign(scope::STACK_DATA, 53, scope::STACK_DATA, 62, RETURN_FALSE),
+        ]),
+    );
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .names
+        .insert(FEEDBACK_TREE, "Route failure feedback".to_owned());
+}
+
+/// The lamp's data words 51 to 53, which the feedback tree writes.
+fn feedback(fx: &Fixture) -> [i16; 3] {
+    let data = &fx.lamp().data;
+    [data[51], data[52], data[53]]
 }
 
 #[test]
@@ -168,8 +204,8 @@ fn a_free_seat_beside_a_place_is_sat_in_through_its_sit_tree() {
 
 #[test]
 fn a_sit_tree_that_returns_false_gives_up_with_result_5() {
-    // 0x45b3fa: person word 62 is 0, so the result is 5. Giving up then
-    // runs the failure feedback tree, which is not ported.
+    // 0x45b3fa: person word 62 is 0, so the result is 5. The lamp has no
+    // failure feedback tree, so giving up fails the route at once.
     let (mut fx, me) = lot([56, 40], 4, 1 << 2);
     refuse_to_sit(&mut fx);
     assert!(gives_up(go_to(&mut fx, me)));
@@ -285,30 +321,33 @@ fn a_sit_tree_that_cannot_be_pushed_fails_loudly_and_leaves_the_route_as_it_was(
     assert!(!sat(&fx));
 }
 
+/// Puts an action at the front of `me`'s queue (flag 2), so that it wants
+/// to be interrupted (0x45d7c0).
+fn interrupting(fx: &mut Fixture, me: u16) {
+    let person = fx
+        .world
+        .objects
+        .get_mut(&me)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person.data[71] = 0;
+    person.queue.insert(
+        0,
+        sims_formats::saved_objects::Interaction {
+            flags: 2,
+            ..person.active.clone()
+        },
+    );
+}
+
 #[test]
 fn a_person_who_wants_to_be_interrupted_fails_with_result_4_if_its_animator_may_stop() {
     // 0x45b18b: an action pushed to the front of the queue (flag 2)
     // interrupts (0x45d7c0). With no animator, the loaded one's state (3)
     // may stop (0x589ead): the route fails with result 4 before any
     // search, and no failure feedback runs.
-    let interrupting = |fx: &mut Fixture, me: u16| {
-        let person = fx
-            .world
-            .objects
-            .get_mut(&me)
-            .unwrap()
-            .person
-            .as_mut()
-            .unwrap();
-        person.data[71] = 0;
-        person.queue.insert(
-            0,
-            sims_formats::saved_objects::Interaction {
-                flags: 2,
-                ..person.active.clone()
-            },
-        );
-    };
     let (mut fx, me) = lot([56, 40], 4, 1 << 2);
     interrupting(&mut fx, me);
     assert_eq!(go_to(&mut fx, me), Ok(false));
@@ -326,4 +365,91 @@ fn a_person_who_wants_to_be_interrupted_fails_with_result_4_if_its_animator_may_
     );
     assert_eq!(go_to(&mut fx, me), Ok(true));
     assert!(sat(&fx));
+}
+
+#[test]
+fn on_the_way_to_a_door_an_interrupted_person_fails_with_result_4() {
+    // The lamp is in room 2 (data word 29), so the route goes through a
+    // door (step 2, 0x45afd0), which first tests for an interruption as
+    // step 1 does: the route fails with result 4 before any door is
+    // chosen.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    fx.lamp_mut().data[29] = 2;
+    interrupting(&mut fx, me);
+    assert_eq!(go_to(&mut fx, me), Ok(false));
+    assert_eq!(route_result(&fx, me), 4);
+}
+
+#[test]
+fn giving_up_near_the_slot_runs_the_failure_feedback_tree() {
+    // 0x45aef7: the route may end near the slot, and the slot's object,
+    // the frame's stack object, has a "Route failure feedback" tree. It
+    // runs on the lamp with the result (5) and the context's word +0x8c
+    // (0) as its arguments, while the person uses the lamp. Person word
+    // 72 is cleared, and back from the tree (step 17, 0x45afb7) the route
+    // fails whatever the tree returned.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    refuse_to_sit(&mut fx);
+    give_feedback_tree(&mut fx);
+    fx.lamp_mut().data[62] = 3;
+    fx.world
+        .objects
+        .get_mut(&me)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[72] = 7;
+    assert!(gives_up(go_to(&mut fx, me)));
+    assert_eq!(feedback(&fx), [5, 0, 4]);
+    assert_eq!(route_result(&fx, me), 5);
+    assert_eq!(fx.world.objects[&me].person.as_ref().unwrap().data[72], 0);
+    // The use ended with the tree.
+    assert_eq!(fx.lamp().data[62], 3);
+    assert!(fx.world.routing.routes[&me].contexts.is_empty());
+}
+
+#[test]
+fn a_route_that_may_not_end_near_gives_no_feedback() {
+    // Operand byte 4 bit 0 clears the slot's flag 0x4000, so giving up
+    // goes to step 7 at once (0x45af1d).
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    refuse_to_sit(&mut fx);
+    give_feedback_tree(&mut fx);
+    let before = feedback(&fx);
+    assert!(gives_up(go_to_with(&mut fx, me, 1)));
+    assert_eq!(feedback(&fx), before);
+    assert_eq!(route_result(&fx, me), 5);
+}
+
+#[test]
+fn a_feedback_tree_that_cannot_be_pushed_fails_loudly() {
+    // A feedback tree with more than four arguments: 0x47484a would read
+    // past the four it is given.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    refuse_to_sit(&mut fx);
+    give_feedback_tree(&mut fx);
+    fx.add(
+        LAMP_FILE,
+        FEEDBACK_TREE,
+        shaped(
+            0x8002,
+            0,
+            8,
+            0,
+            vec![ins(2, RETURN_TRUE, RETURN_TRUE, [0; 8])],
+        ),
+    );
+    let fault = trap(go_to(&mut fx, me));
+    assert!(
+        matches!(&fault, sims_vm::Trap::Unsupported(m) if m.contains("0x45afb2")),
+        "{fault:?}"
+    );
+    // Nothing was pushed and step 17 was not written: the original
+    // writes it only after the push (0x45afac, then 0x45b6ba and
+    // 0x45b9a0). The routing frame is on top, at the step it had saved.
+    let person = &fx.world.objects[&me];
+    let routing = person.stack.last().unwrap();
+    assert_eq!(routing.tree, TREE);
+    assert_eq!(routing.primitive_state, 4);
 }

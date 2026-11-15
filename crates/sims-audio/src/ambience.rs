@@ -13,7 +13,8 @@
 //! and a window around it (`SelY` rows and `SelX` columns either side)
 //! say which cells may play. The game moves the cursor: the column with
 //! the hour (see [`HOUR_COLUMNS`]) and the row with a value it computes
-//! from the camera (see [`crate::player::Player::set_ambience_view`]).
+//! from the camera ([`view`], given to
+//! [`crate::player::Player::set_ambience_view`]).
 //!
 //! *(code)* How it plays:
 //!
@@ -62,11 +63,16 @@
 //! (`fin`, `fout`: a cell plays and stops at once), the `fast?` cells'
 //! beat counter, and the delays and quantising fields (`dly`, `quant`,
 //! the third `rand?`, `stereo?`). The player's own fade (vtable +0x28)
-//! and tempo change (+0x74), pausing (which follows the game's pause,
-//! kinds 21 and 22, not ported), and the second cursor fields of the
-//! score data (+0x3c, +0x40, always 0) are left out too.
+//! and tempo change (+0x74) and the second cursor fields of the score
+//! data (+0x3c, +0x40, always 0) are left out too.
+//!
+//! Pausing follows the game's pause (kinds 21 and 22, see
+//! [`crate::player::Player::pause`]): a paused player (+0x40a8, set
+//! through vtable +0x7c, 0x5773af) picks no cells (0x577af9) until it is
+//! unpaused, while the sounds of cells it already picked play on.
 
 use crate::fsc::Score;
+use sims_core::{Ext, F32};
 use std::collections::BTreeSet;
 
 /// The scores the original loads when the sound starts, by ambience mode
@@ -87,6 +93,71 @@ pub const SCORES: [(u32, &str, &str); 4] = [
 pub const HOUR_COLUMNS: [i32; 24] = [
     12, 12, 12, 12, 12, 1, 2, 3, 4, 4, 5, 6, 6, 7, 8, 9, 10, 11, 11, 11, 12, 12, 12, 12,
 ];
+
+/// *(code)* The tiles [`view`] counts: a view column and row each from
+/// one past the lot's bounds (lot +0x70 and +0x74, +0x78 and +0x7c) to
+/// one short of them, as 0x570d05 to 0x570d2a compare. The bounds are
+/// taken as the 64-tile arrays' 0 and 63, the same in every rotation,
+/// which is **unverified** (`sims_vm`'s on-lot check, the same compare,
+/// takes the same values and is unverified too).
+pub const VIEW_TILES: std::ops::RangeInclusive<i32> = 1..=62;
+
+/// *(code)* The camera value the ambience's row follows (0x570c3e, run
+/// each frame by the sound manager at 0x574161): the share, in percent,
+/// of the tiles on the screen that are outside every enclosure, on the
+/// floor shown.
+///
+/// - `screen` is the house view's size in pixels and `zoom` the
+///   original's zoom number (1 far, 2 medium, 3 near).
+/// - `corner` is the view tile under the screen's top left pixel: the
+///   view's fine position there (16 to a tile, after the camera's
+///   rotation) shifted down by 4, as the original asks its camera for
+///   it (camera function 4, with 1).
+/// - `outside` answers for a view tile (column, row) on the floor shown:
+///   the host turns it back by the camera's rotation and reads the lot
+///   (`sims_sim::World::outside`).
+///
+/// The walk covers the screen in rows half a tile high (`screen[1] / (4
+/// << zoom)` of them) of tiles a whole tile wide (`screen[0] / (16 <<
+/// zoom)`): along a row the column goes up and the row down by one; each
+/// row starts a step down from the last, by the row and the column in
+/// turn. Coordinates are kept in signed bytes and wrap, as the
+/// original's do. Only tiles in [`VIEW_TILES`] count. The share is
+/// `outside / counted * 100.0` on the FPU, cut toward zero; with no tile
+/// counted it is 0 (the division gives NaN, which `__ftol` makes 0).
+pub fn view(
+    screen: [i32; 2],
+    zoom: u32,
+    corner: [i32; 2],
+    mut outside: impl FnMut([i8; 2]) -> bool,
+) -> i32 {
+    let step = |base: i32| base.checked_shl(zoom).filter(|&n| n > 0);
+    let (Some(row_height), Some(column_width)) = (step(4), step(16)) else {
+        return 0;
+    };
+    let rows = screen[1] / row_height;
+    let columns = screen[0] / column_width;
+    let [mut x, mut y] = corner.map(|n| n as i8);
+    let (mut out, mut counted) = (0i32, 0i32);
+    for row in 0..rows {
+        let (mut column, mut line) = (x, y);
+        for _ in 0..columns {
+            let inside = |n: i8| VIEW_TILES.contains(&i32::from(n));
+            if inside(column) && inside(line) {
+                counted = counted.wrapping_add(1);
+                if outside([column, line]) {
+                    out = out.wrapping_add(1);
+                }
+            }
+            column = column.wrapping_add(1);
+            line = line.wrapping_sub(1);
+        }
+        x = x.wrapping_add((row & 1) as i8);
+        y = y.wrapping_add((row.wrapping_sub(1) & 1) as i8);
+    }
+    let share = Ext::from_i32(out) / Ext::from_i32(counted) * Ext::from_f32(F32::from_f32(100.0));
+    share.to_i32_truncate()
+}
 
 /// *(code)* A cell's chance by `prob` (table 0x6cf0f8), out of 32,768
 /// times the cells in the window.
@@ -233,6 +304,10 @@ pub struct Fresh {
     first: i32,
     percent: i32,
     started: bool,
+    /// *(code)* Set by the sound's pause (+0x40a8, vtable +0x7c,
+    /// 0x5773af). Only the constructor clears it otherwise; starting and
+    /// stopping leave it.
+    paused: bool,
     /// The frame the timer counts from.
     timer: u64,
     rate: u32,
@@ -310,6 +385,7 @@ impl Fresh {
             first: 0,
             percent: 100,
             started: false,
+            paused: false,
             timer: 0,
             rate,
         })
@@ -323,6 +399,19 @@ impl Fresh {
     /// Whether it is started.
     pub fn is_started(&self) -> bool {
         self.started
+    }
+
+    /// *(code)* vtable +0x7c (0x5773af): pauses or unpauses it. A paused
+    /// player's update does nothing (0x577af9): no beat falls due and no
+    /// cell starts or stops, while the cells' sounds play on. Its timer
+    /// keeps counting, so on unpausing the beats it missed fall due.
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
+    /// Whether it is paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused
     }
 
     /// The cursor: row and column.
@@ -492,7 +581,7 @@ impl Fresh {
     pub fn update(&mut self, frame: u64, host: &mut dyn Host) {
         let target = self.target();
         let limit = self.limit();
-        if !self.started {
+        if !self.started || self.paused {
             return;
         }
         let elapsed =

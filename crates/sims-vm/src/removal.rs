@@ -22,15 +22,18 @@
 //! legacy/crates/sims-vm/src/loading.rs), without its suspension points:
 //! here each removal runs to its end.
 //!
-//! Two cases are ported. One is what the lot-wide controllers and the
+//! Three cases are ported. One is what the lot-wide controllers and the
 //! indicators need: an object that is off the lot, one tile, not a
 //! person, held by nothing, with no callbacks for leaving the lot, and
-//! that no person on the lot is using. The other is a person on its way
+//! that no person on the lot is using. Another is a person on its way
 //! out (Remove Object Instance on itself, then the removal at the end of
 //! the lot update), which leaves through the lot's placement
 //! (`Interpreter::take_off_to_remove`) and resets in its own way
-//! (`Interpreter::reset_person_to_delete`). Anything else fails with an
-//! error that says what is missing.
+//! (`Interpreter::reset_person_to_delete`). The third is a multi-tile
+//! object, which leaves through the lot's placement too
+//! (`Interpreter::take_off`, 0x422d86) and is deleted tile by tile
+//! (0x440f37). Anything else fails with an error that says what is
+//! missing.
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Machine};
@@ -151,11 +154,14 @@ impl Interpreter<'_> {
     /// Removes an object at once (0x44123f): it leaves the lot (its
     /// virtual function 0x50 with 1, 0x4412a4) and is then deleted.
     ///
-    /// An object that is not a person leaves the narrow way of
-    /// [`Machine::leave_lot`], which the load was compared through. A
-    /// person leaves through [`Interpreter::take_off_to_remove`], which
-    /// needs the lot's rooms worked out; before the load has done so it
-    /// fails.
+    /// An object of one tile that is not a person leaves the narrow way
+    /// of [`Machine::leave_lot`], which the load was compared through. A
+    /// tile of a group takes its whole group off through the lot's
+    /// placement (its vtable 0x666c20's function 0x50, 0x422d86,
+    /// [`Interpreter::take_off`]), which also needs the rooms worked out.
+    /// A person leaves through
+    /// [`Interpreter::take_off_to_remove`], which needs the lot's rooms
+    /// worked out; before the load has done so it fails.
     ///
     /// The original remembers the room of an object that lights it (data
     /// word 7 nonzero) and marks that room for redrawing afterwards
@@ -184,6 +190,22 @@ impl Interpreter<'_> {
             // could read what the refresh writes (see
             // `Interpreter::take_off_to_remove`).
             self.take_off_to_remove(world, id, true)?;
+        } else if world
+            .objects
+            .get(&id)
+            .is_some_and(|o| o.multipart.is_some())
+        {
+            if matches!(
+                world.room_at([OFF_LOT, OFF_LOT, 1]),
+                Err(RoomError::NoRooms)
+            ) {
+                return Err(fail(Trap::Unsupported(
+                    "removing a tile of a group (0x422d86, from 0x4412a4) before the load has \
+                     worked the lot's rooms out is not ported"
+                        .into(),
+                )));
+            }
+            self.take_off(world, id, true)?;
         } else {
             let mut machine = self.machine(world, id, 0, false);
             machine.leave_lot(id).map_err(fail)?;
@@ -219,9 +241,18 @@ impl Interpreter<'_> {
     ///
     /// A person using the object fails in step 3 (`crate::forget`). A
     /// route aimed at the object fails before anything changes: the
-    /// original leaves the route a pointer to the freed object. A tile of
-    /// a multi-tile object has its own deletion (0x440f37, through the
-    /// group), which fails.
+    /// original leaves the route a pointer to the freed object.
+    ///
+    /// A tile of a multi-tile object is deleted with its whole group
+    /// (0x440f37 to 0x440ffa): a tile that is not the lead deletes its
+    /// lead instead; the lead marks every tile for deletion (object flag
+    /// 0x40, not kept) and then deletes each tile in turn, from itself
+    /// along the group's list, each through the steps above
+    /// (0x440eeb with 1). The next tile is read before a tile goes. Each
+    /// tile's reset, if its type has no Reset tree, takes what is left of
+    /// its group off the lot once more ([`Interpreter::reset`]), and its
+    /// destructor (0x42283a) takes it out of its group first
+    /// (`leave_group`, 0x4228d6), so that the next tile leads the rest.
     ///
     /// The ID stays in [`World::removals`] if it is queued there. The
     /// original's queue holds bare IDs and whoever drains it skips the ones
@@ -252,11 +283,43 @@ impl Interpreter<'_> {
             .objects
             .get(&id)
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
-        if object.multipart.is_some() {
-            return Err(fail(Trap::Unsupported(
-                "deleting a tile of a multi-tile object (0x440f37) is not ported".into(),
-            )));
+        let Some(part) = &object.multipart else {
+            return self.delete_one(world, id);
+        };
+        if part.parent != 0 {
+            let lead = part.parent as u16;
+            if world
+                .objects
+                .get(&lead)
+                .and_then(|o| o.multipart.as_ref())
+                .is_none_or(|p| p.parent != 0)
+            {
+                return Err(fail(Trap::Invalid(format!(
+                    "object {id}'s lead tile {lead} is no lead of a group"
+                ))));
+            }
+            return self.delete(world, lead);
         }
+        let mut tile = Some(id);
+        while let Some(this) = tile {
+            tile = world.next_parts.get(&this).copied();
+            self.delete_one(world, this)?;
+        }
+        Ok(())
+    }
+
+    /// One object's deletion (0x440fff on, 0x440eeb with 1): the steps of
+    /// [`Interpreter::delete`].
+    fn delete_one(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let object = world
+            .objects
+            .get(&id)
+            .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
         let person = object.person.is_some();
         let selected = object.selected;
         // A route context holds a pointer to its slot's object
@@ -305,6 +368,15 @@ impl Interpreter<'_> {
                 self.remove_now(world, held)?;
             }
         }
+        // A tile's destructor leaves its group (0x42283a, 0x4228d6) before
+        // the base destructor runs.
+        if world
+            .objects
+            .get(&id)
+            .is_some_and(|o| o.multipart.is_some())
+        {
+            leave_group(world, id).map_err(fail)?;
+        }
         // The object's destructor stops its sounds (0x4323c9).
         self.sound(SoundEvent::Stop { object: id as i16 });
         world.objects.remove(&id);
@@ -330,6 +402,8 @@ impl Interpreter<'_> {
         if person {
             // The person's destructor (0x459511).
             world.animators.remove(&id);
+            world.base_layers.remove(&id);
+            world.translated_bones.remove(&id);
             world.routing.routes.remove(&id);
             world.person_ticks.remove(&id);
             world
@@ -348,14 +422,19 @@ impl Interpreter<'_> {
     /// cleared and the thread restarts at Main.
     ///
     /// Without one, an object that is being deleted is taken off the lot
-    /// and that is all. Any other is rebuilt ([`Interpreter::rebuild`]):
+    /// (its virtual function 0x50 with 1, 0x432055) and that is all: a
+    /// tile of a group takes what is left of its group off
+    /// ([`Interpreter::take_off`], 0x422d86), so each of its tiles is
+    /// asked function 10 again; any other object leaves the narrow way of
+    /// [`Machine::leave_lot`]. Any other is rebuilt ([`Interpreter::rebuild`]):
     /// taken off the lot, its storage reset, its Init and a first turn
     /// run, and put back where it was.
     ///
-    /// Either way the scheduler's countdown for the object is dropped and
-    /// the object gives up the ownership of interface events. An object
-    /// that is not being deleted has its sounds stopped (0x4320b4,
-    /// [`crate::sounds`]).
+    /// Either way the scheduler's countdown for the object is dropped, its
+    /// sounds are stopped (0x4320b4, [`crate::sounds`]), and the object
+    /// gives up the ownership of interface events. Being deleted (object
+    /// flag 0x40) only spares the rebuild (0x432063): the deletion's reset
+    /// stops the object's sounds too, and its destructor then once more.
     ///
     /// A Reset entry whose tree is missing runs nothing but still counts
     /// as a Reset tree.
@@ -383,6 +462,8 @@ impl Interpreter<'_> {
             object.data[8] &= !0x20;
             object.data[62] = 0;
             machine.install_main().map_err(fail)?;
+        } else if deleting && object.multipart.is_some() {
+            self.take_off(world, id, true)?;
         } else if deleting {
             self.machine(world, id, 0, false)
                 .leave_lot(id)
@@ -393,14 +474,60 @@ impl Interpreter<'_> {
         if let Some(object) = world.objects.get_mut(&id) {
             object.set_countdown(-1);
         }
-        // A reset that does not delete stops the object's sounds
+        // Every path meets at 0x43208b and stops the object's sounds
         // (0x4320b4).
-        if !deleting {
-            self.sound(SoundEvent::Stop { object: id as i16 });
-        }
+        self.sound(SoundEvent::Stop { object: id as i16 });
         if world.event_owner == id {
             world.event_owner = 0;
         }
         Ok(())
     }
+}
+
+/// A tile of a group leaves it, as its destructor does (0x4228d6). The
+/// lead hands the group to the next tile: every tile after it takes that
+/// tile as its lead, and that tile leads (0x4228e6 to 0x42290d). The
+/// tile's own links are cleared; it is deleted right after.
+///
+/// Another tile would be taken out of its lead's list (0x422919 to
+/// 0x422935), but [`Interpreter::delete`] deletes a group from its lead,
+/// so that tile is always the lead by then; another is refused.
+fn leave_group(world: &mut World, id: u16) -> Result<(), Trap> {
+    let parent = world
+        .objects
+        .get(&id)
+        .and_then(|o| o.multipart.as_ref())
+        .ok_or_else(|| Trap::Invalid(format!("object {id} is no tile of a group")))?
+        .parent;
+    if parent != 0 {
+        return Err(Trap::Invalid(format!(
+            "tile {id} is deleted before its lead {parent}"
+        )));
+    }
+    let next = world.next_parts.remove(&id);
+    let mut steps = world.objects.len();
+    let mut step = || {
+        steps = steps
+            .checked_sub(1)
+            .ok_or_else(|| Trap::Invalid("the tiles of a group form a loop".into()))?;
+        Ok::<_, Trap>(())
+    };
+    let set_lead = |world: &mut World, tile: u16, lead: u16| {
+        world
+            .objects
+            .get_mut(&tile)
+            .and_then(|o| o.multipart.as_mut())
+            .ok_or_else(|| Trap::Invalid(format!("object {tile} is no tile of a group")))
+            .map(|part| part.parent = lead as i16)
+    };
+    if let Some(next) = next {
+        let mut tile = Some(next);
+        while let Some(this) = tile {
+            step()?;
+            set_lead(world, this, next)?;
+            tile = world.next_parts.get(&this).copied();
+        }
+        set_lead(world, next, 0)?;
+    }
+    Ok(())
 }

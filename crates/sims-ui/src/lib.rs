@@ -2,6 +2,8 @@
 //!
 //! - [`hud`]: the live-mode control panel.
 //! - [`dialog`]: the dialogs scripts show.
+//! - [`pie`]: the pie menu of what a Sim can do with an object.
+//! - [`queue`]: the selected Sim's actions, which a press cancels.
 //! - [`command`]: what the player's clicks ask for.
 //! - [`household`]: what the panel shows, read from the simulation.
 //! - [`art`] and [`font`]: the original bitmaps and fonts.
@@ -19,6 +21,8 @@ pub mod font;
 pub mod frame;
 pub mod household;
 pub mod hud;
+pub mod pie;
+pub mod queue;
 
 /// Why art could not be loaded.
 #[derive(Debug)]

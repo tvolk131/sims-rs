@@ -16,8 +16,10 @@
 //!   0x589ead) fails with result 4, the next step 7 (0x45b18b). Else the
 //!   places the person could stand are found (0x48235a); the next step is
 //!   18.
-//! - **2**, the way through a door (0x45afd0): once the person is in
-//!   the object's room, back to step 1. Otherwise a door tree that
+//! - **2**, the way through a door (0x45afd0): a person who wants to be
+//!   interrupted and whose animator may stop fails with result 4, the
+//!   next step 7, as in step 1. Once the person is in the object's room,
+//!   back to step 1. Otherwise a door tree that
 //!   returned false marks its door failed, the door to go through is
 //!   chosen (`routing/portals.rs`), and its door tree is pushed on the
 //!   person's thread; the step stays 2 while that tree runs.
@@ -40,7 +42,9 @@
 //!   (`primitives/in_way.rs`): asked, the next step is 14, else 16. At 2
 //!   the count becomes 3 and the next step is 1; at 3 the next step is
 //!   16; any other count goes to step 7.
-//! - **14**, waiting for the person asked (0x45b475): with none asked
+//! - **14**, waiting for the person asked (0x45b475): a person who
+//!   wants to be interrupted and whose animator may stop fails with
+//!   result 4, the next step 7, as in step 1. With none asked
 //!   the next step is 1 (and the count goes back to 0 when the asked
 //!   person moved, context byte +0x84). Else, the first time, "route ask
 //!   to move animation" is pushed on the thread with the person asked as
@@ -50,15 +54,27 @@
 //!   run.
 //! - **16**, giving up (0x45aef7): the context's result becomes 1 when
 //!   it was 0, the next step is 7 and person word 62 takes the result.
+//!   When the route may end near the slot (slot flag 0x4000) and the
+//!   slot's object's file has a "Route failure feedback" tree (0x45af2a),
+//!   that tree is pushed on the person's thread with the object as its
+//!   stack object and the arguments (the result, context word +0x8c, 0,
+//!   0), the person starts using the object, person word 72 is cleared
+//!   and the next step is 17 (0x45b6ba).
+//! - **17**, back from that tree (0x45afb7), whatever it returned: person
+//!   word 62 takes the result again and the next step is 7.
 //! - **7**: the route ends as failed ([`Machine::end_route`]).
 //! - **12**: the animator starts the route (0x589c85); the next step is 3
 //!   and the thread yields.
-//! - **3**, on the ticks after: while the animator's route is under way
+//! - **3**, on the ticks after (0x45b2b7): a person who wants to be
+//!   interrupted and whose animator may stop takes result 4 and the next
+//!   step is 11. Otherwise, while the animator's route is under way
 //!   (0x589d47 gives 2), the thread yields. When it reached the path's
 //!   end (1) the next step is 9, else 10.
 //! - **9**: the animator stops (0x589e2d); the next step is 8.
 //! - **10**: the animator stops short of the path's end, as when its
 //!   next step was blocked (0x45b371); the next step is 6.
+//! - **11**, interrupted on the way (0x45b3c2): the animator stops; the
+//!   next step is 7.
 //! - **8**: the route ends ([`Machine::end_route`]): the result is true.
 //!
 //! The steps run one after another in a run until one yields or pushes a
@@ -96,10 +112,8 @@
 //! update 438 do not reach fails loudly: a parameter number past the
 //! frame's parameters, a stack object that is missing or off the lot in a later
 //! step, a person with bit 0 of word 68 set or other contexts, a person
-//! who wants to be interrupted at a door, on the way or while waiting
-//! for a person asked (steps 2, 3 and 14), a person sitting (posture 1), no door to
-//! go through, giving up on a slot the route may end near (the failure
-//! feedback tree, 0x45af2a), ending a route while the asked person runs
+//! sitting (posture 1), no door to
+//! go through, ending a route while the asked person runs
 //! the action (0x45d5f8), every other step and every other result of the
 //! planning.
 
@@ -146,6 +160,7 @@ const FAILED: i32 = 7;
 const SUCCEEDED: i32 = 8;
 const ARRIVED: i32 = 9;
 const STOPPED: i32 = 10;
+const INTERRUPTED: i32 = 11;
 const START: i32 = 12;
 
 /// The sound events a route plays as it starts and after it stops
@@ -154,11 +169,15 @@ const BEGIN_ROUTE: &str = "begin_route";
 const END_ROUTE: &str = "end_route";
 const ASK: i32 = 14;
 const GIVE_UP: i32 = 16;
+const FEEDBACK: i32 = 17;
 const PLAN: i32 = 18;
 
 /// The trees a person asking another to move plays (0x6c4554, 0x6c453c).
 const ASK_TREE: &str = "route ask to move animation";
 const WAIT_TREE: &str = "route waiting animation";
+/// The tree of the slot's object a person giving up on a slot it may end
+/// near plays (0x6c457c).
+const FEEDBACK_TREE: &str = "Route failure feedback";
 /// How many ticks a person waits for one asked to move (0x45b56e).
 const WAIT: i32 = 100;
 /// The squared distance a person must have moved since the last try for
@@ -467,14 +486,7 @@ impl Machine<'_, '_> {
                     // 0x45b18b: a person who wants to be interrupted, and
                     // whose animator may stop (0x589ead), fails with
                     // context +0x88 = 4.
-                    if self.wants_interrupt()?
-                        && self
-                            .world
-                            .animators
-                            .get(&me)
-                            .unwrap_or(&LOADED)
-                            .interruptible()
-                    {
+                    if self.interrupted()? {
                         ctx.result = 4;
                         state = FAILED;
                         continue;
@@ -560,12 +572,13 @@ impl Machine<'_, '_> {
                     }
                 }
                 PORTAL => {
-                    // 0x45afd0.
-                    if self.wants_interrupt()? {
-                        return Err(unsupported(
-                            "0x45afd2",
-                            "for a person who wants to be interrupted",
-                        ));
+                    // 0x45afd0: a person who wants to be interrupted, and
+                    // whose animator may stop, fails with result 4
+                    // (0x45afea), as in step 1.
+                    if self.interrupted()? {
+                        ctx.result = 4;
+                        state = FAILED;
+                        continue;
                     }
                     if self.room(ctx.target)? == self.room(me)? {
                         // Through: person word 72 goes back to what it was
@@ -612,11 +625,13 @@ impl Machine<'_, '_> {
                     break;
                 }
                 UNDER_WAY => {
-                    if self.wants_interrupt()? {
-                        return Err(unsupported(
-                            "0x45b2c2",
-                            "for a person who wants to be interrupted",
-                        ));
+                    // 0x45b2b7: a person who wants to be interrupted, and
+                    // whose animator may stop, stops with result 4
+                    // (0x45b1ac) and step 11.
+                    if self.interrupted()? {
+                        ctx.result = 4;
+                        state = INTERRUPTED;
+                        continue;
                     }
                     if path.is_empty() {
                         return Err(unsupported("0x45b2f7", "with no path"));
@@ -632,8 +647,9 @@ impl Machine<'_, '_> {
                         _ => state = STOPPED,
                     }
                 }
-                ARRIVED | STOPPED => {
-                    // 0x45b3de, 0x45b371: the animator stops (0x589e2d).
+                ARRIVED | STOPPED | INTERRUPTED => {
+                    // 0x45b3de, 0x45b371, 0x45b3c2: the animator stops
+                    // (0x589e2d).
                     let animator = self
                         .world
                         .animators
@@ -647,12 +663,17 @@ impl Machine<'_, '_> {
                     }
                     // 0x45b3a0: "end_route" plays for me. A route that
                     // stopped short of the path's end (a blocked step)
-                    // tries again (0x45b384).
+                    // tries again (0x45b384); one interrupted fails
+                    // (0x45b3d5).
                     self.sound(SoundEvent::Play {
                         object: me as i16,
                         name: END_ROUTE.into(),
                     });
-                    state = if state == STOPPED { RETRY } else { SUCCEEDED };
+                    state = match state {
+                        STOPPED => RETRY,
+                        INTERRUPTED => FAILED,
+                        _ => SUCCEEDED,
+                    };
                 }
                 RETRY => match retry as i16 {
                     // 0x45b066: once the person has moved more than 8
@@ -687,12 +708,13 @@ impl Machine<'_, '_> {
                     _ => state = FAILED,
                 },
                 ASK => {
-                    // 0x45b475.
-                    if self.wants_interrupt()? {
-                        return Err(unsupported(
-                            "0x45b480",
-                            "for a person who wants to be interrupted",
-                        ));
+                    // 0x45b475: a person who wants to be interrupted, and
+                    // whose animator may stop, fails with result 4
+                    // (0x45b48d to 0x45afea), as in step 1.
+                    if self.interrupted()? {
+                        ctx.result = 4;
+                        state = FAILED;
+                        continue;
                     }
                     if ctx.objects[1] == 0 {
                         // Released by the person asked (0x45b8f4).
@@ -746,13 +768,39 @@ impl Machine<'_, '_> {
                     // 0x45af1d: the slot record here is the context's
                     // copy (0x5c354f, set at 0x45aec6 on every run), not
                     // the one the first run is given.
-                    if ctx.slot.flags & NEAR != 0 {
-                        return Err(unsupported(
-                            "0x45af2a",
-                            "giving up on a slot it may end near: the Route failure feedback \
-                             tree (step 17)",
-                        ));
+                    if ctx.slot.flags & NEAR != 0
+                        && let Some((object, tree)) = self.feedback_tree()?
+                    {
+                        // 0x45af2a: the slot's object's "Route failure
+                        // feedback" tree, with the result and word +0x8c
+                        // as its first two arguments (0x45afac). Only
+                        // once it is pushed does the step become 17 and
+                        // person word 72 get cleared (0x45b6ba), and the
+                        // context get written (0x45b9a0), so a tree that
+                        // cannot be pushed leaves the route as it was.
+                        // The routing frame is now the one below the top.
+                        let args = [ctx.result as i16, ctx.word_8c, 0, 0];
+                        self.give_feedback(object, tree, &args)?;
+                        self.set_person_word(WORD_72, 0)?;
+                        ctx.word_58 = i32::from(retry as i16);
+                        ctx.saved = spot;
+                        self.store_route(&ctx, &path);
+                        let stack = &mut self.me_mut()?.stack;
+                        let below = stack.len().checked_sub(2);
+                        below
+                            .and_then(|at| stack.get_mut(at))
+                            .ok_or_else(|| {
+                                Trap::Invalid("no routing frame below the feedback tree".into())
+                            })?
+                            .primitive_state = FEEDBACK;
+                        return Ok(Flow::Pushed);
                     }
+                }
+                FEEDBACK => {
+                    // 0x45afb7: back from the feedback tree, whatever it
+                    // returned.
+                    self.set_person_word(ROUTE_RESULT, ctx.result as i16)?;
+                    state = FAILED;
                 }
                 FAILED | SUCCEEDED => return self.end_route(state, ctx, &path),
                 other => {
@@ -916,6 +964,19 @@ impl Machine<'_, '_> {
     }
 
     /// An object's room: its data word 29.
+    /// The route's interrupt test (0x45b18b, 0x45afd0, 0x45b2b7,
+    /// 0x45b475): the person wants to be interrupted (0x45d7c0) and its
+    /// animator may stop (virtual function 0x30, 0x589ead).
+    fn interrupted(&self) -> Result<bool, Trap> {
+        Ok(self.wants_interrupt()?
+            && self
+                .world
+                .animators
+                .get(&self.me)
+                .unwrap_or(&LOADED)
+                .interruptible())
+    }
+
     fn room(&self, id: u16) -> Result<i16, Trap> {
         self.world
             .objects
@@ -1005,6 +1066,49 @@ impl Machine<'_, '_> {
             self.frame_mut()?.stack_object = id as i16;
         }
         Ok(())
+    }
+
+    /// The "Route failure feedback" tree of the frame's stack object, the
+    /// slot's object (0x45af5b, 0x4021f2 in the object's own file), with
+    /// that object; None when its file has no tree of that name, where the
+    /// route goes on to step 7. A stack object that is gone, which the
+    /// original would read through a null pointer, fails loudly.
+    fn feedback_tree(&self) -> Result<Option<(u16, u16)>, Trap> {
+        let stack_object = self.frame()?.stack_object;
+        let object = u16::try_from(stack_object)
+            .ok()
+            .filter(|id| self.world.objects.contains_key(id))
+            .ok_or_else(|| {
+                unsupported(
+                    "0x45af5b",
+                    &format!("a route giving up with its stack object {stack_object} gone"),
+                )
+            })?;
+        let owner = self.definition(self.world.objects[&object].guid)?.resource;
+        let tree = self
+            .program
+            .named_tree(owner, FEEDBACK_TREE)
+            .map_err(Trap::Unsupported)?;
+        Ok(tree.map(|tree| (object, tree)))
+    }
+
+    /// Plays the slot's object's feedback tree on the person's thread, as
+    /// the person's virtual function 0x34 does (0x45e59b) with arguments
+    /// and no flag: the person is woken, the tree of the object's type is
+    /// pushed with the object as its stack object and the four arguments
+    /// (0x452b98, 0x47484a), and the person starts using the object. A
+    /// tree that cannot be pushed, where the original goes on to step 7
+    /// (0x45afb2), fails loudly, as does one with more than four
+    /// arguments (0x47484a would read past the four it is given).
+    fn give_feedback(&mut self, object: u16, tree: u16, args: &[i16; 4]) -> Result<(), Trap> {
+        self.wake(self.me)?;
+        self.enter_on(object, tree, args).map_err(|fault| {
+            Trap::Unsupported(format!(
+                "a Route failure feedback tree {tree:#06x} of object {object} that cannot be \
+                 pushed, where the original goes on to step 7 (0x45afb2): {fault}"
+            ))
+        })?;
+        self.count_use(object, false)
     }
 
     /// Sets person data word `index` of the running object.

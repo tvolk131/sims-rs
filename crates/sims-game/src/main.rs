@@ -7,18 +7,29 @@
 //!
 //! The install defaults to `SIMS_INSTALL`, and the house to the Goths'
 //! (`UserData/Houses/House05.iff`). `--answers` answers the dialogs that
-//! offer a choice, in order, as `sims boot` does; for the Goths' house it
-//! defaults to `3` (No to the Help System).
+//! offer a choice, in order, as `sims boot` does. Once they run out, a
+//! dialog waits for the player, as the original's does, and a press on
+//! one of its buttons answers it. `--png` has nobody to answer, so there
+//! the Goths' house defaults to `3` (No to the Help System).
 //!
-//! The lot runs at normal speed, a tick every 50 milliseconds. The
-//! panel's speed, pause and camera buttons work. Keys: `+`/`-` or the
+//! The lot runs at the original's pace: a tick every 42 milliseconds at
+//! normal speed, 14 at fast and 2 at ultra. The panel's speed, pause and
+//! camera buttons work; a paused lot goes on ticking with its clock
+//! standing, as the original's does. Keys: `+`/`-` or the
 //! wheel zoom, `[`/`]` or `,`/`.` rotate, Page Up and Page Down change the
 //! floor, `1`/`2`/`3` walls up, cutaway and down, the arrows or a
 //! right-button drag scroll, space pauses, Escape quits.
 //!
-//! A left click on a person or an object opens its menu for the selected
-//! Sim; a click on an entry queues it, and a click anywhere else, or
-//! Escape, closes the menu. Escape quits only when no menu is open, and a
+//! A press on a portrait selects that Sim. In strict mode switching Sims
+//! fails, as the simulation has not ported the deselected Sim's
+//! animator refresh; play mode leaves it out (`Lot::select_play`).
+//!
+//! A left click on a person or an object opens its pie menu for the
+//! selected Sim (`sims_ui::pie`, around the click); a click on an entry
+//! queues it, one on a submenu's entry opens the submenu, and a click
+//! anywhere else, or Escape, closes the menu. The pointer moves to the
+//! middle of a submenu that opens, and of a menu that had to move to
+//! stay in the window, as the original moves it. Escape quits only when no menu is open, and a
 //! held Escape's repeats do nothing.
 //!
 //! The lot runs in strict mode: the first error stops it, and the error
@@ -170,7 +181,14 @@ fn options() -> Result<(Options, Option<Still>, bool), String> {
     if paths.next().is_some() {
         return Err(usage.into());
     }
-    let answers = answers.unwrap_or_else(|| if house == goths { vec![3] } else { Vec::new() });
+    // In the window the player answers; a still has nobody to.
+    let answers = answers.unwrap_or_else(|| {
+        if house == goths && png.is_some() {
+            vec![3]
+        } else {
+            Vec::new()
+        }
+    });
     let still = png.map(|file| Still { file, ticks, size });
     Ok((
         Options {
@@ -199,14 +217,37 @@ struct App {
     /// How many of the game's caught errors are printed.
     printed: usize,
     sound: Sound,
-    /// The hour and speed the sound was last told.
-    heard: Option<(u32, Speed)>,
+    /// The hour, speed and ambience view the sound was last told.
+    heard: Option<(u32, Speed, i32)>,
+    /// The object answers the sound was last told.
+    told: Option<sims_audio::sources::Snapshot>,
 }
 
 impl App {
     fn point(&self, position: PhysicalPosition<f64>) -> [i32; 2] {
         let scale = f64::from(self.scale.max(1));
         [(position.x / scale) as i32, (position.y / scale) as i32]
+    }
+
+    /// Moves the pointer where the game asks, as the original moves it
+    /// to the middle of a pie menu.
+    fn move_pointer(&mut self) {
+        let Some([x, y]) = self.game.take_pointer() else {
+            return;
+        };
+        // The middle of that canvas pixel, so it reads back as the same.
+        let scale = f64::from(self.scale.max(1));
+        let position =
+            PhysicalPosition::new((f64::from(x) + 0.5) * scale, (f64::from(y) + 0.5) * scale);
+        if let Some(w) = &self.window {
+            // Not every platform lets a program move the pointer; the
+            // menu still works where it is.
+            if w.set_cursor_position(position).is_ok() {
+                self.cursor = position;
+            }
+        }
+        let redraw = self.game.hover(self.point(self.cursor));
+        self.changed(redraw);
     }
 
     fn changed(&mut self, redraw: bool) {
@@ -237,7 +278,7 @@ impl App {
             Key::Named(NamedKey::PageUp) => Move::LevelUp,
             Key::Named(NamedKey::PageDown) => Move::LevelDown,
             Key::Named(NamedKey::Space) => {
-                self.game.pace.toggle_pause();
+                self.game.toggle_pause();
                 self.changed(true);
                 return;
             }
@@ -263,8 +304,18 @@ impl App {
         let elapsed = now.duration_since(self.last);
         self.last = now;
         let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let waited = self.game.asking().is_some();
         let ran = self.game.advance(micros);
-        let mut redraw = ran > 0;
+        // A dialog shown at the first tick due is drawn though none ran.
+        let mut redraw = ran > 0 || (!waited && self.game.asking().is_some());
+        // What the tick's sounds may ask about their objects, before the
+        // sounds themselves. Read on every call, not only after a step
+        // that succeeded: a failed step may still have changed the lot.
+        let sources = self.game.sound_sources();
+        if self.told.as_ref() != Some(&sources) {
+            self.sound.send(Input::Sources(sources.clone()));
+            self.told = Some(sources);
+        }
         let sounds = self.game.take_sounds();
         if !sounds.is_empty() {
             self.sound.send(Input::Events(
@@ -285,10 +336,15 @@ impl App {
             redraw = true;
         }
         self.changed(redraw);
-        let now = (self.game.hour(), self.game.pace.speed);
+        let now = (
+            self.game.hour(),
+            self.game.pace.speed,
+            self.game.ambience_view(),
+        );
         if self.heard != Some(now) {
             self.sound.send(Input::Hour(now.0));
             self.sound.send(Input::Speed(now.1));
+            self.sound.send(Input::View(now.2));
             self.heard = Some(now);
         }
     }
@@ -316,7 +372,7 @@ impl App {
                 lot.ticks(),
                 if self.game.stopped().is_some() {
                     ", stopped"
-                } else if self.game.pace.paused {
+                } else if self.game.paused() {
                     ", paused"
                 } else {
                     ""
@@ -429,6 +485,7 @@ impl ApplicationHandler for App {
                 (MouseButton::Left, ElementState::Pressed) => {
                     let outcome = self.game.press(self.point(self.cursor));
                     self.changed(outcome.redraw);
+                    self.move_pointer();
                     if outcome.photo {
                         self.photo();
                     }
@@ -437,6 +494,10 @@ impl ApplicationHandler for App {
                 (MouseButton::Right, ElementState::Released) => self.drag = None,
                 _ => {}
             },
+            WindowEvent::CursorLeft { .. } => {
+                let redraw = self.game.leave();
+                self.changed(redraw);
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
                 let point = self.point(position);
@@ -521,6 +582,7 @@ fn run() -> Result<(), String> {
         printed: 0,
         sound: Sound::start(&options.install, mute),
         heard: None,
+        told: None,
     };
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     event_loop.run_app(&mut app).map_err(|e| e.to_string())

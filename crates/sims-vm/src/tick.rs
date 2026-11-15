@@ -66,10 +66,12 @@
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Status, Stream};
+use crate::placement::Refreshing;
 use crate::play::{Play, Recovery, ScriptError};
 use crate::primitives::dialog::{self, DONE, NEW, SHOWN};
 use crate::selection::selected;
 use crate::sounds::SoundEvent;
+use crate::visits::function;
 use sims_sim::motives::{self, Tuning};
 use sims_sim::rooms::Room;
 use sims_sim::{PersonTick, World};
@@ -605,7 +607,25 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        if !self.object_tick(world, id, catch)? {
+        let refreshing = RefCell::new(Refreshing {
+            person: id,
+            pending: None,
+        });
+        let ticked = Interpreter {
+            refreshing: Some(&refreshing),
+            ..*self
+        }
+        .object_tick(world, id, catch)?;
+        let pending = refreshing.into_inner().pending;
+        if !ticked {
+            if pending.is_some() {
+                return Err(fail(Trap::Unsupported(
+                    "a person that took itself off the lot ends its tick before its \
+                     animator's: its animator's refresh at the take-off (0x58da12) is then not \
+                     redone at the same clock"
+                        .into(),
+                )));
+            }
             return Ok(false);
         }
         let hour = world.globals.get(HOURS).copied().unwrap_or(0);
@@ -636,7 +656,11 @@ impl Interpreter<'_> {
         // The animator's walk notes the room too (0x45e4e9), so the state
         // goes back before it ticks.
         world.person_ticks.insert(id, state);
-        self.tick_animator(world, id).map_err(fail)?;
+        match pending {
+            None => self.tick_animator(world, id),
+            Some(pending) => self.tick_animator_after_take_off(world, id, pending),
+        }
+        .map_err(fail)?;
         self.note_room(world, id).map_err(fail)?;
         let state = world
             .person_ticks
@@ -807,9 +831,7 @@ impl Interpreter<'_> {
         };
         // A person's animator is reset too where it can be, as a person's
         // own reset does; one it cannot reset is left as it is.
-        if let Some(animator) = world.animators.get_mut(&id) {
-            let _ = animator.reset();
-        }
+        let _ = world.reset_animator(id);
         let mut machine = self.machine(world, id, 0, false);
         match machine.install_main() {
             Ok(()) => Recovery::Restarted(failed),
@@ -833,7 +855,9 @@ impl Interpreter<'_> {
     /// 2. After a full pass, the queued removals, oldest first: each ID is
     ///    taken off the queue and, if it still names an object, the
     ///    object is removed at once ([`Interpreter::remove_now`],
-    ///    0x44123f). A tile of a multi-tile object is not ported. A partial
+    ///    0x44123f), a tile of a group with its whole group. A tile whose
+    ///    type has the dynamic group function (8, 0x42344e) would first
+    ///    leave its group (0x42346a), which is not ported. A partial
     ///    pass leaves the queue as it is; one that leaves a person queued
     ///    fails, since that person's animator would live on past the
     ///    refresh its take-off skipped
@@ -932,10 +956,16 @@ impl Interpreter<'_> {
                         at: None,
                         trap: Trap::Invalid(format!("no definition for GUID 0x{guid:08X}")),
                     })?;
-                if master != 0 {
+                // 0x442450 to 0x4424b0: a tile of a group whose type has
+                // the dynamic group function leaves its group first.
+                if master != 0
+                    && object.multipart.is_some()
+                    && self.has_function(world, id, function::DYNAMIC_GROUP)
+                {
                     return Err(TickError::Unsupported(format!(
-                        "removing object {id}, a tile of a multi-tile object, at the end of the \
-                         lot update is not ported"
+                        "removing object {id}, a tile of a group whose type has the dynamic \
+                         group function (8), at the end of the lot update: it leaves its group \
+                         first (0x42346a), which is not ported"
                     )));
                 }
                 if world.dialogs.records.iter().any(|r| r.caller == id) {

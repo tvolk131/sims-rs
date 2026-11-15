@@ -121,6 +121,20 @@ pub struct Interpreter<'a> {
     /// 0x800, [`crate::forget`]), whom a broadcast it sets off skips. None
     /// outside one.
     pub(crate) letting_go: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
+    /// The house view's rotation, 0 to 3 (the scene at 0x6e5528, +0x84),
+    /// which Generic Sims Call routine 12 reads. It is the player's
+    /// choice, not the lot's, so it is an input here: [`Interpreter::new`]
+    /// gives 0, and a booted lot passes its own
+    /// ([`crate::boot::Lot::set_view_rotation`]).
+    pub view_rotation: u8,
+    /// While a person's own tick runs its thread, the person and the
+    /// animator refresh pending from its taking itself off the lot
+    /// ([`crate::placement::Refreshing`]). None otherwise.
+    pub(crate) refreshing: Option<&'a RefCell<crate::placement::Refreshing>>,
+    /// Whether this is a person's animator refresh at its taking itself
+    /// off the lot (`Interpreter::refresh_at_take_off`), where a timed
+    /// event that would play a sound fails ([`crate::clip_events`]).
+    pub(crate) take_off_refresh: bool,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -146,6 +160,9 @@ impl<'a> Interpreter<'a> {
             menu: None,
             running_at_once: None,
             letting_go: None,
+            view_rotation: 0,
+            refreshing: None,
+            take_off_refresh: false,
         }
     }
 
@@ -285,6 +302,8 @@ impl<'a> Interpreter<'a> {
             menu: self.menu,
             running_at_once: self.running_at_once,
             letting_go: self.letting_go,
+            view_rotation: self.view_rotation,
+            refreshing: self.refreshing,
             checking: false,
         }
     }
@@ -354,6 +373,10 @@ pub(crate) struct Machine<'a, 'w> {
     pub running_at_once: Option<AtOnce<'a>>,
     /// See [`Interpreter::letting_go`].
     pub letting_go: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
+    /// See [`Interpreter::view_rotation`].
+    pub view_rotation: u8,
+    /// See [`Interpreter::refreshing`].
+    pub(crate) refreshing: Option<&'a RefCell<crate::placement::Refreshing>>,
 }
 
 impl<'a> Machine<'a, '_> {
@@ -371,6 +394,9 @@ impl<'a> Machine<'a, '_> {
             menu: self.menu,
             running_at_once: self.running_at_once,
             letting_go: self.letting_go,
+            view_rotation: self.view_rotation,
+            refreshing: self.refreshing,
+            take_off_refresh: false,
         }
     }
 
@@ -830,6 +856,22 @@ impl<'a> Machine<'a, '_> {
             self.call(instruction)?;
             return Ok(Status::Running);
         }
+        if let Some(refreshing) = self.refreshing
+            && let Some(person) = refreshing
+                .borrow()
+                .pending
+                .as_ref()
+                .map(|_| refreshing.borrow().person)
+            && !crate::placement::reads_no_animator(instruction.opcode, &instruction.operands)
+        {
+            return Err(Trap::Unsupported(format!(
+                "{} (opcode {}) after person {person} took itself off the lot and before its \
+                 animator's tick: the animator's refresh at the take-off (0x58da12), if the \
+                 house view drew the person, may have written what it reads",
+                crate::primitives::primitive_name(instruction.opcode),
+                instruction.opcode
+            )));
+        }
         let state = self.frame()?.primitive_state;
         if state == RAN_TREE && instruction.opcode == 28 {
             // Run Tree By Name ran its tree: it takes the branch of the
@@ -847,7 +889,8 @@ impl<'a> Machine<'a, '_> {
         // there (0x45abce, 0x45c634); Look Towards keeps whether its turn
         // started (0x45ab79).
         // Idle For Input keeps whether it started an action (0x45dce4).
-        if state != 0 && !matches!(instruction.opcode, 17 | 22 | 27 | 45) {
+        // Special Effect keeps its step (0x44aaa6).
+        if state != 0 && !matches!(instruction.opcode, 17 | 22 | 27 | 35 | 45) {
             return Err(Trap::Unsupported(format!(
                 "resuming primitive {} with saved state {state:#x}",
                 instruction.opcode

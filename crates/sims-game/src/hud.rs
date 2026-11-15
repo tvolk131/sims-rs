@@ -1,10 +1,11 @@
 //! The live-mode control panel (`sims-ui`) over the lot, read from the
-//! running world each frame, and the dialog the world waits on.
+//! running world each frame, the selected Sim's queue of actions, and
+//! the dialog the world waits on.
 //!
 //! The panel turns presses into `sims_ui` commands; [`Hud::press`] hands
 //! them to the game, which carries out what it can.
 
-use crate::menu::{self, Menu};
+use crate::menu::{Menu, Press};
 use crate::pace::Pace;
 use crate::view::View;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
@@ -17,12 +18,23 @@ use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::household::{Faces, Snapshot};
 use sims_ui::hud::{self, Controls, Item};
+use sims_ui::pie;
+use sims_ui::queue::Queue;
+use sims_vm::SoundEvent;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// The status line's font size and colors.
 const STATUS_SIZE: u8 = 10;
 const STATUS_TEXT: [u8; 3] = [255, 255, 255];
 const STATUS_BACK: [u8; 3] = [96, 24, 24];
+
+/// The object the interface's own sounds are played for (0x4cb171).
+pub const INTERFACE: i16 = -4;
+/// What a press on an action's icon plays when it counts, and when it
+/// does not or is a pet's (0x4cb16e).
+pub const QUEUE_DELETE: &str = "UI_queue_delete";
+pub const ERROR: &str = "UI_error";
 
 pub struct Hud {
     pub art: Art,
@@ -40,6 +52,12 @@ pub struct Hud {
     pub menu: Option<Menu>,
     /// The status band across the top, as last drawn.
     band: Option<Rect>,
+    /// The selected Sim's actions, as last drawn.
+    queue: Queue,
+    /// The actions whose icons were pressed while they show.
+    pressed: Pressed,
+    /// The interface's sounds, until the game takes them.
+    sounds: Vec<SoundEvent>,
 }
 
 impl Hud {
@@ -51,6 +69,8 @@ impl Hud {
         let resources: Vec<i32> = hud::RESOURCES
             .iter()
             .chain(&dialog::RESOURCES)
+            .chain(&pie::RESOURCES)
+            .chain(&sims_ui::queue::RESOURCES)
             .copied()
             .collect();
         let art = Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
@@ -87,11 +107,16 @@ impl Hud {
             dialog: None,
             menu: None,
             band: None,
+            queue: Queue::default(),
+            pressed: Pressed::default(),
+            sounds: Vec::new(),
         })
     }
 
-    /// Reads the dialog `world` waits on, if it changed.
-    fn read_dialog(&mut self, world: &World, assets: &Assets) {
+    /// Reads the dialog `world` waits on, if it changed. The lot's world,
+    /// or, while the lot waits for the player, the world as the tick left
+    /// it when it showed the dialog.
+    pub fn read_dialog(&mut self, world: &World, assets: &Assets) {
         let Some(pending) = dialog::pending(world) else {
             self.message = None;
             return;
@@ -113,12 +138,12 @@ impl Hud {
     }
 
     /// Draws the panel over the lot in `canvas`, from `world` as it is
-    /// now, with the speed and pause of `pace`, and `status` (a line
-    /// across the top) if there is one.
+    /// now, with the speed of `pace`, and `status` (a line across the
+    /// top) if there is one; the dialog is the one [`Hud::read_dialog`]
+    /// last read.
     pub fn draw(
         &mut self,
         world: &World,
-        assets: &Assets,
         view: &View,
         pace: &Pace,
         status: Option<&str>,
@@ -137,11 +162,11 @@ impl Hud {
             zoom_out: camera.zoom != Zoom::Far,
         };
         self.controls.speed = pace.speed;
-        let mut snapshot = Snapshot::read(world, &self.members);
-        // The game pauses by not stepping the lot; the button shows it.
-        snapshot.paused |= pace.paused;
+        // The pause button shows global 17, which the game's pause sets.
+        let snapshot = Snapshot::read(world, &self.members);
         self.items = hud::layout(view.size, &snapshot, &self.controls);
-        self.read_dialog(world, assets);
+        self.queue = Queue::read(world, snapshot.selected);
+        self.pressed.keep(&self.queue);
         let (width, height) = (
             u32::try_from(canvas.width).unwrap_or(u32::MAX),
             u32::try_from(canvas.height).unwrap_or(u32::MAX),
@@ -160,6 +185,7 @@ impl Hud {
             &self.items,
             &self.controls,
         );
+        self.queue.draw(&mut frame, &self.art, &self.faces);
         self.dialog = self
             .message
             .as_ref()
@@ -178,9 +204,9 @@ impl Hud {
                 self.controls.pointer,
             );
         }
-        if let (Some(menu), Some(font)) = (&mut self.menu, self.art.font(menu::SIZE)) {
-            menu.layout(font, view.size);
-            menu.draw(&mut frame, font, self.controls.pointer);
+        if let Some(menu) = &mut self.menu {
+            menu.layout(&self.art, view.size);
+            menu.draw(&mut frame, &self.art, self.controls.pointer);
         }
         self.band = status.and_then(|status| self.status(&mut frame, status));
         canvas.color = frame.into_rgb();
@@ -202,6 +228,21 @@ impl Hud {
         Some(band)
     }
 
+    /// The panel as it was last laid out.
+    pub fn items(&self) -> &[Item] {
+        &self.items
+    }
+
+    /// The first name of people of type `guid`, from their file.
+    pub fn name(&self, guid: u32) -> Option<&str> {
+        self.faces.name(guid)
+    }
+
+    /// Where the dialog drawn last is, and its buttons.
+    pub fn dialog(&self) -> Option<&dialog::Layout> {
+        self.dialog.as_ref()
+    }
+
     /// Whether the panel or the status band covers `point` (canvas
     /// pixels), or a dialog or a pie menu is shown and takes every press.
     pub fn covers(&self, point: [i32; 2]) -> bool {
@@ -209,6 +250,53 @@ impl Hud {
             || self.menu.is_some()
             || self.band.is_some_and(|b| b.contains(point[0], point[1]))
             || hud::covers(&self.items, point)
+            || self.queue.at(point).is_some()
+    }
+
+    /// The selected Sim's actions as last drawn.
+    pub fn queue(&self) -> &Queue {
+        &self.queue
+    }
+
+    /// The interface's sounds since the last call.
+    pub fn take_sounds(&mut self) -> Vec<SoundEvent> {
+        std::mem::take(&mut self.sounds)
+    }
+
+    /// Plays one of the interface's sounds.
+    pub fn play(&mut self, name: &str) {
+        self.sounds.push(SoundEvent::Play {
+            object: INTERFACE,
+            name: name.into(),
+        });
+    }
+
+    /// A press on the icon of the selected Sim's action at `point`
+    /// (0x4cb126): the cancel it asks for, if any. A pet's icon only
+    /// plays `UI_error`; an icon already pressed, or whose action is
+    /// already cancelled, does nothing.
+    fn press_queue(&mut self, point: [i32; 2]) -> Option<Option<Command>> {
+        let icon = self.queue.at(point)?;
+        let (uid, cancelled) = (icon.uid, icon.cancelled);
+        let person = self.queue.person?;
+        if self.queue.pet {
+            self.play(ERROR);
+            return Some(None);
+        }
+        if cancelled || !self.pressed.press(uid) {
+            return Some(None);
+        }
+        Some(Some(Command::CancelAction {
+            sim: person,
+            action: uid,
+        }))
+    }
+
+    /// Forgets the press on `uid`'s icon, whose cancel never reached the
+    /// simulation (the lot refused it, or has stopped), so that the icon
+    /// takes the next press. In the original a cancel cannot fail.
+    pub fn release(&mut self, uid: i32) {
+        self.pressed.release(uid);
     }
 
     /// Moves the pointer; true if what it hovers changed.
@@ -220,7 +308,7 @@ impl Hud {
         };
         let entry = |pointer: Option<[i32; 2]>| {
             let menu = self.menu.as_ref()?;
-            menu.row(pointer?)
+            Some(menu.hovered(pointer?))
         };
         let before = (
             hud::hovered(&self.items, self.controls.pointer),
@@ -235,25 +323,113 @@ impl Hud {
         ) != before
     }
 
+    /// The pointer left the window: no button is hovered and no name
+    /// shows. True if the pointer was in it, so the frame changes.
+    pub fn leave(&mut self) -> bool {
+        self.controls.pointer.take().is_some()
+    }
+
+    /// Where the pointer is to be moved, as the original moves it when a
+    /// pie menu opens; the panel's pointer is moved there.
+    pub fn take_pointer(&mut self) -> Option<[i32; 2]> {
+        let point = self.menu.as_mut()?.take_pointer()?;
+        self.controls.pointer = Some(point);
+        Some(point)
+    }
+
     /// A press at `point`: the command it asks for, if any. Commands that
     /// change only the panel are applied here too.
     pub fn press(&mut self, point: [i32; 2]) -> Option<Command> {
         if let Some(layout) = &self.dialog {
             return dialog::press(layout, point);
         }
-        // A press anywhere closes the menu; one on an entry chooses it.
+        // A press on an entry chooses it, one on a submenu's entry or
+        // back from it keeps the menu open, and one elsewhere closes it.
         // `interaction` is the entry's index in the menu; the game reads
         // its menu number from the menu it had open.
-        if let Some(menu) = self.menu.take() {
-            let interaction = u16::try_from(menu.row(point)?).ok()?;
-            return Some(Command::ChooseInteraction {
-                sim: menu.person,
-                object: menu.object,
-                interaction,
-            });
+        if let Some(mut menu) = self.menu.take() {
+            return match menu.press(&self.art, point) {
+                Press::Chose(choice) => Some(Command::ChooseInteraction {
+                    sim: menu.person,
+                    object: menu.object,
+                    interaction: u16::try_from(choice).ok()?,
+                }),
+                Press::Stays => {
+                    self.menu = Some(menu);
+                    None
+                }
+                Press::Closed => None,
+            };
+        }
+        // The status band is drawn over everything else on the lot,
+        // the icons too, and takes the press.
+        if self.band.is_some_and(|b| b.contains(point[0], point[1])) {
+            return None;
+        }
+        if let Some(command) = self.press_queue(point) {
+            return command;
         }
         let command = hud::press(&self.items, point)?;
         self.controls.apply(&command);
         Some(command)
+    }
+}
+
+/// The actions whose icons were pressed while they show: a second press
+/// on an icon does nothing (0x4cb148, the icon's +0xf1).
+#[derive(Debug, Default)]
+struct Pressed(BTreeSet<i32>);
+
+impl Pressed {
+    /// Notes a press on `uid`'s icon; false if it was pressed already.
+    fn press(&mut self, uid: i32) -> bool {
+        self.0.insert(uid)
+    }
+
+    /// Forgets the press on `uid`'s icon.
+    fn release(&mut self, uid: i32) {
+        self.0.remove(&uid);
+    }
+
+    /// Keeps the presses of the icons `queue` shows: an icon gone takes
+    /// its press with it.
+    fn keep(&mut self, queue: &Queue) {
+        self.0
+            .retain(|uid| queue.icons.iter().any(|icon| icon.uid == *uid));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sims_ui::frame::Rect;
+    use sims_ui::queue::{Icon, Picture};
+
+    #[test]
+    fn an_icon_takes_one_press_until_released_or_gone() {
+        let icon = |uid| Icon {
+            uid,
+            picture: Picture::Object(1),
+            yellow: false,
+            cancelled: false,
+            rect: Rect::new(32, 32, 45, 45),
+        };
+        let mut pressed = Pressed::default();
+        assert!(pressed.press(7));
+        assert!(!pressed.press(7));
+        // A cancel that failed lets the icon be pressed again.
+        pressed.release(7);
+        assert!(pressed.press(7));
+        // Shown again, the press stays; gone, it goes.
+        let mut queue = Queue {
+            person: Some(1),
+            pet: false,
+            icons: vec![icon(7)],
+        };
+        pressed.keep(&queue);
+        assert!(!pressed.press(7));
+        queue.icons.clear();
+        pressed.keep(&queue);
+        assert!(pressed.press(7));
     }
 }

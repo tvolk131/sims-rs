@@ -56,9 +56,47 @@ events, and what it asks for after them) come first.
   (#131), the pie menu and picking from it (#132), and Go To Routing
   Slot's parameter and global slots (#134), which a player's snack order
   reached.
-- Strict mode on the Goth house runs to tick 2702. At tick 2703 the
-  carpool (object 8) makes the school bus, and the factory for
-  multi-tile objects is not ported. Step 2 starts there.
+- Strict mode on the Goth house runs to tick 3602, 08:30 on the first
+  day. One tick is two game seconds, so a day is 43,200 ticks (measured
+  from the clock globals). The carpool makes the school bus at tick 2703
+  (the multi-tile factory is ported). The base layer is kept and the
+  pose composed from it, and a person may take itself off the lot in
+  its own tick. A multi-tile object may snap where it does not fit
+  (0x454e82), and a group is deleted (0x440f37): at tick 3434 the car
+  junk's 18 tiles go. At tick 3603 object 354 uses Create New Object
+  Instance mode 6 with flag 0x4, which is not ported (the same stop as
+  the snack order's). Step 2 continues from there.
+- Of the base neighborhood's houses only the Goths' and the Newbies'
+  (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
+  tick 1802; a route that gives up on a slot it may end near runs the
+  Route failure feedback tree (tick 1473). Against the recording of the
+  house (updates 0 to 935), every update's random streams, scheduler
+  cursor, action serial, globals and objects, and each object's data,
+  temps, attributes, frames and person data match, except the words the
+  original left from memory it never set (person word 37, locals on half
+  a pointer) and global 12 at updates 1 and 3 (the interface's tutorial
+  wait). At tick 1803 object 290 needs Create New Object Instance mode 6
+  with flag 0x4, which track 3 is porting for the Goths' snack order.
+
+  tick 1472, with no recording to compare yet; at tick 1473 object 105
+  gives up a route and needs the route-failure feedback tree (0x45af2a),
+  which is not ported.
+- The Pleasants (`House06.iff` as the original saved it after moving
+  them in, with the Traveling Salesman on the lot) load to the state the
+  first tick starts from: the end of the household selection works out
+  again who is a visitor, and reading the people raises the action
+  serial. Their load equals the capture's but for one person's data word
+  50 and last result, which something in the original's load sets and
+  which is not found yet. The first frame then stops: person 242's head
+  follows person 241, whose animator has never been ticked or drawn, and
+  what the original reads for it is not ported.
+- The houses of UserData2 to 8 get past the neighborhood: the reload
+  makes the records their template files lack. The version-63 houses
+  read their arrays whole (Arry 11, 12, 111 and 112). UserData2's
+  houses 1 and 9 then stop at their floor and wall maps
+  (`World::renumber_surfaces`), and the houses with no family stop at
+  the household selection. The templates' `Patch` families are not
+  imported (see `docs/decisions.md`).
 
 ## Met goal: a headless lot boot that matches the original
 
@@ -1897,20 +1935,34 @@ Progress:
   buffer holds the lot without its people. The game does not use it
   yet, and how the original gives a person's mesh its depth is
   unverified.
-- Found, not ported: an edge-on diagonal wall shows the wrong side, not
-  only the wrong texels. At near zoom the original shows the outside
-  shingles at both edge-on ends of the bay; we show the inside
-  wallpaper at the left end. Both walls face the same way, but the
-  outside lies on opposite sides of them, so no rule by the wall's
-  facing matches both. Code at 0x53f8ce copies two wall-cell records
-  (the cell's, and its neighbour's or the same cell's again) and reads
-  a word from each at an index from the wall's direction and a stack
-  value (`[ebp-0x2c]`, through 0x43517c). What that value means, and
-  how those words map to our wallpaper per side, are not read yet; the
-  port waits on both.
-- Next: trace that stack value and map the words to the wallpaper per
-  side (0x53f8ce), then the edge-on texels; a screenshot with a marked
-  edge-on diagonal; upper-level depth.
+- Done: the bay's edge-on ends. The original draws an edge-on diagonal
+  wall 300 nearer, anchored halfway along it (0x4c7be2, 0x4c4907), so
+  the straight bay walls' side faces show in front of it. At near zoom
+  both bay ends now show the shingles (61.2% to 61.7% exact); at
+  medium zoom the depth at both ends is the original's.
+- Read, not ported: the side an edge-on diagonal shows. The original
+  shows the side facing view (−1, 1) (0x53f6c1, 0x53d93a); ours shows
+  the same lot side at every rotation. The one column where the wall
+  shows matches neither side until its texel offset is read.
+- Done: which object or person drew each pixel, for clicks:
+  `Canvas::id_at` after `sims_render::draw` and `People::draw_on_lot`.
+  Objects name themselves, people their object ID, and terrain, floors
+  and walls nobody. The game window picks by it.
+  How the original finds what a click hit is not read.
+- Done: the pools of light lit lamps throw on the floor, from the
+  game's `lightMap.dat`, and lit lamps drawn in full light, as the
+  original does. With the world at the screenshots' time, near zoom
+  rose from 85.2% to 86.1% exact and far zoom at rotation 2 from 89.9%
+  to 90.1%. Pools on walls (the file's wall tables) are read in part,
+  not ported.
+- Done: lamp pools on straight walls, from `lightMap.dat`'s wall
+  tables (grass takes none in the original). Far zoom at rotation 2
+  rose from 90.1% to 90.3% exact; of the pixels they change, 70% now
+  match exactly and the rest are mostly a step off.
+- Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
+  grass and a light sprite in the original); the
+  edge-on texel offset and side; a screenshot with a marked edge-on
+  diagonal; upper-level depth.
 
 ## Track: sound (`crates/sims-audio`)
 
@@ -1949,10 +2001,35 @@ stop-sounds events.
 - **Done: live playback.** The `play` example plays events (and the
   ambience) on the default output device, behind the `playback`
   feature (cpal), off by default; tests and CI build none of it.
+- **Done: the ambience's inputs.** The simulation emits its sound
+  requests (`Update::sounds`), and the game plays them. The camera
+  value the ambience's row follows is ported (`ambience::view`, from
+  0x570c3e: the share of the screen's tiles that are outdoors, read
+  through `World::outside`), and the hour is the clock's.
+- **Done: pause and unpause** (21 and 22): the sounds playing are held
+  where they are, but for the interface's and the main music's, and the
+  live ambience stops picking cells.
+- **Done: what scripts ask about an object.** `getsrcdatafield` gets the
+  original's answers (0x570e61: a person's voice, age, skills,
+  personality and motive 3, the hour, the size of the object's room),
+  read from the lot between ticks (`sims_game::sound::sources`).
+- **Done: where a sound's objects are.** Kinds 1 and 30 set a track's
+  volume and pan from where its objects are on the screen (0x5730b6,
+  0x57473b, 0x570e09), which the game sends with the answers, from its
+  camera.
+- **Done: the music modes** (36). A change of mode starts and stops the
+  music tracks as the original's sound manager does (0x575170): the
+  buy, build and neighbourhood lists, the expansions', the credits', the
+  river loops and the slow fade into live mode. `play_trk` hands on the
+  caller's arguments and `source`, and `kill_trk` ends the whole track.
+  3 events of kinds not ported remain: the piano (43), and 103 and 104,
+  which are debug commands.
 - **Next:**
-  - The simulation emits `SoundEvent`s (the interface is in the
-    decisions log), and gives the camera value and the hour for the
-    ambience's cursor.
+  - The piano (43).
+  - Placing the tracks again when the camera moves (kind 33), once the
+    game sends it only then.
+  - Tracks and fades step once a block (64 frames, about 2.9 ms); the
+    original's sound manager steps them once a millisecond (0x57cf37).
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)
@@ -2009,9 +2086,16 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   The frame's corners are close but not exact. "Magic Town" is pinned by
   layout and digest, gated on `SIMS_INSTALL`. `sims-viewer --hud` shows a
   waiting dialog, and its answer is printed.
+- **Done: the pie menu.** `sims_ui::pie` lays out, hit-tests and draws
+  the menu and groups an object's actions into submenus, ported from the
+  original's menu window and object picker. The window and label boxes
+  agree to the pixel with two menus read from the running original
+  (gated on `SIMS_INSTALL`); the drawn look is not yet compared with a
+  screenshot. The host keeps a `pie::Pie` and renders the head.
 - **Next:** open houses through `sims_vm::boot::Lot` (which now runs the
   household load) in the tests and the viewer, in place of their
-  stand-in for steps 17 and 18; pie menus; a Yes/No dialog checked
+  stand-in for steps 17 and 18; a screenshot of an open pie menu; a
+  Yes/No dialog checked
   against the original (the "Help System" one at tick 2) for the layout
   of several buttons; text entry dialogs; the other live panels.
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
@@ -2049,12 +2133,11 @@ for several minutes without the lot stopping. The crate joins the others
 through their public interfaces only; the simulation never depends on it.
 
 - **Done: the window.** `cargo run --release -p sims-game` boots the
-  Goths' house (`SIMS_INSTALL`, `House05.iff`, answering No to the Help
-  System) and runs it in strict mode, a tick every 50 ms at normal
-  speed. The lot, its people (hidden by the walls, furniture and floors
+  Goths' house (`SIMS_INSTALL`, `House05.iff`) and runs it in strict
+  mode at the original's pace (below). The lot, its people (hidden by
+  the walls, furniture and floors
   in front of them) and the panel over both are drawn every tick; the clock, funds and needs on the panel are the live
-  world's. The panel's speed, pause and camera buttons work (the game
-  paces the lot; the simulation's own speed global is not touched).
+  world's. The panel's speed, pause and camera buttons work.
   The first error stops the lot, which stays on screen as it was with
   the failure across the top. `--play` runs it in play mode instead: an
   object whose tick fails is reset and the lot goes on, and each new
@@ -2062,8 +2145,8 @@ through their public interfaces only; the simulation never depends on it.
   play mode does not catch stops it. In play mode the Goths' house runs
   12,000 ticks (ten minutes at normal speed) without stopping, through
   about a dozen different caught errors; in strict mode it stops after
-  tick 2702 (at tick 2703 the carpool makes the school bus, and the
-  factory for multi-tile objects is not ported).
+  tick 3602 (at tick 3603 Create New Object Instance mode 6 is not
+  ported).
   `--png <file>
   --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
@@ -2077,44 +2160,97 @@ through their public interfaces only; the simulation never depends on it.
   a book comes off the shelf, the fountain tinkles. `begin_route` and
   `end_route` have no event in the install's sound files and play
   nothing.
-- **Done: a stopgap pie menu.** Clicking an object or a person opens a
-  list of the interactions an order on it is queued from (those of the
-  tile the simulation sends a multi-tile object's orders to; each menu
-  number once, named by that table's TTAs strings, debug entries
-  hidden); choosing one
-  queues it for the selected Sim with `Lot::queue_interaction`, and the
-  note across the top says whether it was queued. Escape closes the
-  menu. The fridge lists Have A Snack, Have Lite Meal, Have A Meal,
-  Serve Meal; the bookshelf lists Read a Book and the studies.
-- **Blocked: a Sim doing what he is told.** Idle For Input now starts
-  a queued order (#131): Have A Snack queued on the fridge at tick 51
-  leaves the queue by tick 151. Three ticks later, another person
-  (object 16) fails a route that names its slot from source 2 (tree
-  0x2156 node 5; 0x45ac2e, not ported), which stops the lot in strict
-  mode. Without an order, strict mode runs to tick 2702. That route is
-  the simulation's next step toward the done criterion.
-- **Next:** the menu from the simulation's pie-menu entries (the check
-  each entry runs, which the stopgap skips) once that accessor lands;
-  then a real pie.
+- **Done: the pie menu from the simulation's listing.** When the
+  pointer first reaches an object or a person, the game lists the
+  selected Sim's menu on it with `Lot::pie_menu`, which changes the lot
+  as the original's listing does; a click opens it. The entries are
+  those whose check passes, named as the check tree named them or else
+  by the TTAs strings of the table they came from, with "*" before such
+  an entry with flag 0x80; choosing one queues the offered action with
+  `Lot::pick`. Where the simulation has
+  not ported something the listing needs, the menu falls back to every
+  entry of the table, queued by menu number, and the note across the
+  top says why; any other failure shows no menu. Escape closes the menu.
+  The menu is drawn as the original's pie, with `sims_ui::pie` (#157):
+  the labels around the click, a name with a `/` in a submenu, at most
+  12 shown; a test clicks the fridge and chooses Have A Snack from its
+  pie. In its middle is the head of the Sim the menu is for, as posed
+  now, drawn by `sims-people`'s rasterizer from in front (its camera,
+  light and size are ours, not compared with the original's). The simulation lists the fridge itself: in the morning the house
+  loads in, Have A Snack, Have Quick Breakfast, Have Breakfast and
+  Serve Breakfast.
+- **Done: a Sim doing what he is told.** Have A Snack queued on the
+  fridge at tick 51 (the snack order, run 2026-11-15 on main d46c93ab,
+  in play mode and in strict mode alike): Mortimer takes the order at
+  tick 150, the fridge makes the snack (object 263) at tick 615, he
+  takes it at 748, pays 5 at 820 and eats it (menu 2 on the snack) while
+  his hunger goes from 94.5 to 100.0 (tick 936); at 1088 the snack goes
+  off the lot and at 1136 it is deleted, and he is free again. He goes
+  on to other things (object 71 at tick 1497, object 132 at 2292).
+  Strict mode now runs the order through step 3602 and stops at step
+  3603 (object 354 uses Create New Object Instance mode 6 with flag 0x4,
+  not ported); without an order it stops there too.
+
+  not ported); without an order it runs to tick 3432.
+- **Done: the speed and the pause.** The panel's speed buttons set the
+  simulation's speed as the original's setter does (`0x46d697`, globals
+  16 and 18, `sims_sim::speed`): 760, 924 and 994. The window ticks at
+  the setter's period for that speed: 42, 14 and 2 ms. The pause button
+  and space set global 17 (`0x46d813`, `0x46d83a`), and the lot goes on
+  ticking with its clock standing, as the original's does: every pass is
+  a partial one. The Goths' house runs 200 such ticks in strict mode.
+  The idle loop's own speed is ported too (`0x46d9d6`,
+  `World::idle_speed`). On a residential lot where nobody holds the
+  speed (`0x442f9b`, presumably everyone away or asleep), it runs at
+  1000 and keeps the speed to go back to in global 18. It goes back once
+  someone holds it. The window follows: 1 ms a tick at 1000.
+- **Done in play mode: selecting a Sim.** A press on a portrait selects
+  that Sim (0x445449, between ticks): the Sim selected before is
+  deselected, the indicators move, and the panel and the pie menus
+  follow the new Sim. Deselecting refreshes the old Sim's animator
+  (0x58da12), which is not ported, so in strict mode (`Lot::select`)
+  switching Sims fails and changes nothing; play mode
+  (`Lot::select_play`) leaves the refresh out.
+- Done: a click picks what the frame shows at the pixel
+  (`Canvas::id_at`, `sims_game::pick`): the person shown there or
+  nearest within two pixels, else the object shown there. A tile of a
+  multi-tile object is picked as itself; the simulation sends its
+  interactions on (0x435286). How the original finds what a click hit
+  is not read.
+- **Done: answering a dialog from the window.** A dialog with a choice
+  waits for the player: the lot stops before the tick that shows it,
+  the dialog is drawn from the world as that tick left it, and a press
+  on a button answers it and the tick runs again with the answer
+  (`Lot::wait_for_answers`, `Lot::answer`). The Help System's dialog at
+  tick 2, answered No from the window, gives the lot `--answers 3`
+  gives, hash for hash, through tick 200. `--answers` still answers
+  first, and `--png` answers No to the Help System by default.
+- **Done: the panel follows the lot.** Every frame the panel reads the
+  world as it is: the clock (globals 0 and 5), the household's funds,
+  the portraits with the selected Sim's lit, and the selected Sim's mood
+  bars and needs meters. A Goth test queues the snack and runs 850 ticks:
+  the funds go from $2,542 to $2,537 when Mortimer pays, the clock moves,
+  and the hunger meter is his hunger. The pointer on a portrait shows
+  that person's first name (catalog strings, `OBJD` word 41) in a box
+  over it; that box is ours (**unverified**).
+- **Done: the action queue.** The selected Sim's running and queued
+  actions show as icons in the top left, framed as the original frames
+  them, and a press cancels one (`Lot::cancel`, 0x45d5f8) with the
+  original's sound. Objects' catalog pictures are not made yet (a grey
+  square stands in), and the icons do not slide into place.
 - **Needs from other crates:**
-  - `sims-render`: which object drew each pixel (an object ID buffer
-    beside the depth), so a click picks the object under it. Today
-    `sims-game` guesses from each object's tile.
-  - `sims-vm`: a way to answer a dialog from the window (the `Lot`'s
-    player is a fixed answer list given at load), and to change the
-    game's speed global. A play-mode step that fails should still hand
+  - `sims-vm`: listings that fail today on the Goth house: check trees
+    on Manage Inventory operation 4 and scope 12. A check tree's fault
+    should keep its trap rather than become `Unsupported` text, which
+    `sims-game` reads to tell unported from failed.
+  - `sims-vm`: a play-mode step that fails should still hand
     back the errors it caught before failing, and say which frame
     (before or after the tick) was skipped.
-  - `sims-people`: which person drew each pixel (`draw_on_lot` with an
-    owner per pixel), so `sims-game` need not repeat its drawing loop
-    to find the person a click lands on.
-  - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
-    and dialogs are. `sims-game` draws a plain list until then.
-  - `sims-vm`: a route naming its slot from source 2 (0x45ac2e), and
-    the entries the pie menu offers a person on an object, with their
-    labels' table. Until then, the tile an order on an object goes to
-    (`interaction_target`) and the ID and file of the TTAB it is queued
-    from, which `sims-game` now repeats from the program's data.
+  - `sims-vm`: the animator's refresh (0x58da12), which deselecting a
+    Sim makes, so strict mode can switch Sims.
+  - `sims-people`: the selected Sim's head as an image, which the
+    original renders live into the pie's face bitmap; the middle of the
+    pie is empty until then.
 
 ## Working rules
 

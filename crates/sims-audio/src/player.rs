@@ -18,9 +18,12 @@
 //!
 //! - Registers below 100 belong to a thread; 100 and above are globals
 //!   shared by every thread (`SimSpeed` is 100). A new thread's `patch`
-//!   register (50) holds its track's patch. When the track's arguments
-//!   are `kArgsIdVolPan` (2, nearly every track), `arg1` holds the object
-//!   that started it: routines pass it to `getsrcdatafield`.
+//!   register (50) holds its track's patch. *(code)* `arg1` to `arg3`
+//!   (registers 1 to 3) hold the arguments it was started with, whatever
+//!   the track's argument kind (0x57d9cb): the first is the object that
+//!   started it, which routines pass to `getsrcdatafield`
+//!   ([`crate::sources`]). A track a script starts (`play_trk`) gets
+//!   the caller's own `arg1` to `arg3` (0x57f1f2).
 //! - *(code)* The registers in [`DEFAULTS`] start as the original's
 //!   default register bank holds them, then `vol` (18) and `duckpri` (25)
 //!   take the HOT track's volume and duck priority; every other starts
@@ -74,10 +77,11 @@
 //! event's own number when not 0, else the caller's (the object for the
 //! first, 0 for the others). [`kind`] lists them; ported are:
 //!
-//! - 1, play: starts the track. Its object is recorded as an *instance*
-//!   of the track when the track's arguments are `kArgsIdVolPan` and the
-//!   object is not 0; a track with no running thread loses its stale
-//!   instances first.
+//! - 1, play: starts the track. When the track's arguments are
+//!   `kArgsIdVolPan`, its object is recorded as an *instance* of the
+//!   track, and the track's `extvol` and `pan` are set from where all its
+//!   objects are ([`crate::placement`]); an object of 0 starts nothing.
+//!   A track with no running thread loses its stale instances first.
 //! - 18, fade: fades the track's `extvol` to 0 (see [`Player::play_from`]
 //!   for the speed), ending it after when the third argument says so.
 //! - 19, `radio_next_song`: stops the radio tracks' notes.
@@ -87,16 +91,23 @@
 //!   object still has fades out at speed 100 and ends, or ends at once
 //!   when it has no note playing (0x57dca3). Kill all also stops every
 //!   ambient score.
+//! - 21, pause, and 22, unpause ([`SoundEvent::Pause`] and
+//!   [`SoundEvent::Unpause`], what the game sends): a pause holds every
+//!   track that runs or plays, but for the interface's clicks, the speed
+//!   buttons and the main music loop ([`PAUSE_SPARES`]), and the live
+//!   ambience; an unpause lets them all go on from where they were. See
+//!   [`Player::pause`].
 //! - 30, `kTurnOnTv` (radios too): kills the object's instances, then
-//!   records the object as an instance of the track and starts it.
+//!   records the object as an instance of the track (even 0), starts it
+//!   and sets its `extvol` and `pan` as kind 1 does.
 //! - 53, `kSequenceTrackHitList`: picks a patch from a hit list and
 //!   chains it to the note the track is playing, to start with no gap
 //!   when that one ends; with no note playing, starts it.
 //! - 52, `kSetAmbienceMode`: makes a score current and starts it,
 //!   stopping the one before (see [`crate::ambience`] and
 //!   [`Player::add_scores`]); a mode with no score stops the current one.
-//! - 36, `kSetMusicMode`: only its ambience half (see
-//!   `Player::set_music_mode`); the music half is reported as a fault.
+//! - 36, `kSetMusicMode`: changes the music for the game's mode, then
+//!   the ambience (see `Player::set_music_mode`).
 //!
 //! The game's code also calls kind 33 to move the ambience's cursor from
 //! the camera and the hour: [`Player::set_ambience_view`]. The scores'
@@ -115,13 +126,14 @@
 //! thread where the original would use its one object. When an object
 //! lets go of a track others still have, the original re-evaluates the
 //! shared track (0x5746d9, not read); here that object's threads fade
-//! out and end. Kinds not ported (the music, the piano, pausing, reloading, and the sound object calls only the game's
+//! out and end. Kinds not ported (the music, the piano, reloading, and the sound object calls only the game's
 //! code makes) are reported as faults; kinds whose case does nothing for
 //! sound are ignored.
 //!
 //! **Unverified** against the original at run time: all of the above.
-//! Left out: priorities, 3D position (a 3D track is centred), the track
-//! group's own volume beyond the host's [`Player::set_group_volume`], and
+//! Left out: priorities, and the limit of 16 voices kind 1 checks first
+//! (0x574a87); placing every track again when the camera moves (kind 33,
+//! see [`crate::placement`]); the track group's own volume beyond the host's [`Player::set_group_volume`], and
 //! the second pitch the original adds (taken as 3600).
 //! `seqgroup_wait`, `add_to_group`, `remove_from_group` and `test1` to
 //! `test4` are not ported: a thread that reaches one ends with a fault.
@@ -146,6 +158,7 @@ use crate::fsc::Score;
 use crate::hit::{Instruction, Operand};
 use crate::levels::{self, Inputs, Levels};
 use crate::module::Module;
+use crate::placement::{self, Projection};
 use crate::stations::StationLists;
 use crate::{Pcm, SoundEvent};
 use std::collections::{BTreeMap, BTreeSet};
@@ -188,10 +201,20 @@ pub const FADE_DEST: u8 = 40;
 pub const FADE_VAR: u8 = 41;
 pub const FADE_SPEED: u8 = 42;
 pub const FADE_ON: u8 = 45;
+/// `source`, which `play_trk` hands on to the track it starts.
+pub const SOURCE: u8 = 47;
+/// `isplaying`, which a fresh start sets to 1.
+pub const ISPLAYING: u8 = 46;
+/// `Spl`, which the placement reads ([`crate::placement`]).
+pub const SPL: u8 = 57;
 /// A new thread's registers that do not start at 0, as the original's
-/// default register bank holds them: `priority`, `vol`, `extvol`, `pan`,
-/// `pitch`, `MinDistance`, `MaxDistance` and `fade_dest`.
-pub const DEFAULTS: [(u8, i32); 8] = [
+/// default register banks hold them (written at 0x57c83a to 0x57c97b):
+/// `priority`, `vol`, `extvol`, `pan`, `pitch`, `MinDistance`,
+/// `MaxDistance`, `BufSizeMult`, `tempo` and `Spl`. A fresh start copies
+/// both banks into the track's registers 17 to 47 and 50 to 62
+/// (0x57da3a to 0x57da87); a register never written reads the bank's
+/// value too (0x5802cf).
+pub const DEFAULTS: [(u8, i32); 10] = [
     (17, 32),
     (18, 1024),
     (EXTVOL, 1024),
@@ -199,8 +222,12 @@ pub const DEFAULTS: [(u8, i32); 8] = [
     (21, 3600),
     (28, 100),
     (29, 10000),
-    (FADE_DEST, 1),
+    (39, 1),
+    (52, 120),
+    (SPL, SPL_NORMAL),
 ];
+/// `Spl`'s default, the HSM files' `spl_normal`.
+pub const SPL_NORMAL: i32 = 20;
 /// Registers with side effects: `vol`, `duckpri`, 3D, `target` and the
 /// global `main_duckpri`.
 pub const VOL: u8 = 18;
@@ -210,6 +237,56 @@ pub const DUCKPRI: u8 = 25;
 pub const THREE_D: u8 = 26;
 pub const TARGET: u8 = 53;
 pub const MAIN_DUCKPRI: u8 = 123;
+/// The music tracks and hit lists kind 36 uses (0x575170).
+pub mod music {
+    /// `MainMusicLoop`.
+    pub const MAIN_MUSIC_LOOP: u32 = 515;
+    /// `SetMainMusicSongAndHitList`.
+    pub const SET_MAIN_MUSIC: u32 = 516;
+    /// `SetMainAndHitListKillFirst`.
+    pub const SET_MAIN_KILL_FIRST: u32 = 517;
+    /// `FadeAndKillTrackSlow`, which fades out the track its first
+    /// argument names.
+    pub const FADE_AND_KILL_SLOW: u32 = 519;
+    /// `river_loop`.
+    pub const RIVER_LOOP: u32 = 2957;
+    /// `Grimreaper_loop`.
+    pub const GRIM_REAPER_LOOP: u32 = 5323;
+    /// `mt_river_loop`.
+    pub const MT_RIVER_LOOP: u32 = 114_370;
+    /// `ui_nhood_bdoze_loop`.
+    pub const NHOOD_DOZE_LOOP: u32 = 1551;
+    /// The buy, build and neighbourhood mode lists.
+    pub const BUY: u32 = 221;
+    pub const BUILD: u32 = 222;
+    pub const NEIGHBOURHOOD: u32 = 223;
+    /// The lists of modes 10 to 18: `dt_nhood`, `Vacation`, `UnlSpeak`,
+    /// Superstar's mode and station lists, then Makin' Magic's, its
+    /// credits', build's and buy's.
+    pub const EXPANSION_LISTS: [u32; 9] = [
+        6_100, 14_093, 20_902, 100_102, 100_101, 103_100, 103_101, 103_102, 103_104,
+    ];
+    /// The expansions in, as a byte of the configuration
+    /// (`[0x6e48bc]+0x66`) has them: every one, as in the memory image
+    /// read (as [`crate::stations`] registers them all).
+    pub const EXPANSIONS: u8 = 0xff;
+
+    /// The credits' list (mode 6) for the expansions in: the newest's.
+    pub fn credits(expansions: u8) -> u32 {
+        [
+            (0x80, 103_101),
+            (0x40, 100_102),
+            (0x20, 20_902),
+            (0x08, 14_093),
+            (0x02, 1_589),
+            (0x04, 6_100),
+        ]
+        .into_iter()
+        .find(|&(bit, _)| expansions & bit != 0)
+        .map_or(NEIGHBOURHOOD, |(_, list)| list)
+    }
+}
+
 /// How long `seqgroup_kill` waits after starting a fade, in milliseconds.
 const SEQGROUP_WAIT_MS: u64 = 2;
 /// Frames one call renders at most: an hour.
@@ -227,6 +304,11 @@ pub const RADIO_TRACKS: [u32; 10] = [
     0x104, 0x10d, 0x10e, 0x118, 0x1a19, 0x1a1a, 0x1a1b, 0x1a1c, 0x1a1d, 0x18704,
 ];
 
+/// *(code)* The tracks a pause leaves playing (0x5748a2 to 0x5748c3):
+/// `ui_click` (1541), `MainMusicLoop` (515) and the speed buttons'
+/// `ui_speed_1top` to `ui_speed_3top` (2727, 2733, 2739).
+pub const PAUSE_SPARES: [u32; 5] = [0x605, 0x203, 0xaa7, 0xaad, 0xab3];
+
 /// Event kinds: the HOT files' `kSndob` equates, and how the original's
 /// dispatcher (0x573617) treats the rest.
 pub mod kind {
@@ -234,6 +316,8 @@ pub mod kind {
     pub const FADE: i64 = 18;
     pub const CANCEL_NOTE: i64 = 19;
     pub const KILL_ALL: i64 = 20;
+    pub const PAUSE: i64 = 21;
+    pub const UNPAUSE: i64 = 22;
     pub const KILL_INSTANCE: i64 = 23;
     pub const TURN_ON_TV: i64 = 30;
     pub const SET_MUSIC_MODE: i64 = 36;
@@ -249,11 +333,9 @@ pub mod kind {
         [27, 28, 29, 31, 44, 45, 46, 47, 48, 49, 50, 51, 101, 102];
     /// Kinds the original does something for that this player does not:
     /// reported when an event has one.
-    /// Kind 36 is listed though its ambience half is ported (see
-    /// `Player::set_music_mode`).
-    pub const NOT_PORTED: [i64; 35] = [
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 24, 25, 26, 32, 33, 34, 35,
-        36, 37, 38, 39, 40, 41, 42, 43, 103, 104,
+    pub const NOT_PORTED: [i64; 32] = [
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 24, 25, 26, 32, 33, 34, 35, 37, 38,
+        39, 40, 41, 42, 43, 103, 104,
     ];
 }
 
@@ -276,19 +358,63 @@ impl Samples for BTreeMap<String, Pcm> {
     }
 }
 
-/// What scripts may ask about the object that started them
-/// (`getsrcdatafield`). The simulation would answer through a read-only
-/// view; the field numbers' meanings are **unverified**.
+/// What the player asks the game about objects. [`crate::sources`]
+/// has the original's answers.
 pub trait Sources {
-    fn field(&self, object: u32, source: i32, field: i32) -> i32;
+    /// What a script asks about an object (`getsrcdatafield`): the
+    /// answer for an object ID and a field, as both source registers hold
+    /// them, or None for a field the original refuses (the destination
+    /// then keeps its value).
+    fn field(&self, source: i32, field: i32) -> Option<i32>;
+
+    /// Where an object is, for its sound's volume and pan
+    /// ([`crate::placement`]): `sims_sim::Object::position` (the
+    /// original's object +0xf8, +0xf4 and +0x110, 0x570dc9), or None for
+    /// an ID that names no object.
+    fn position(&self, object: i32) -> Option<[i32; 3]>;
+
+    /// Where an object is on the screen, with the view: asked for a
+    /// track whose `Spl` (register 57) is not 0, which is every track,
+    /// since `Spl` starts at 20 and no script writes it. Without it the
+    /// placement is a fault, and the track keeps its `extvol` and `pan`.
+    fn projection(&self, object: i32) -> Option<Projection>;
 }
 
-/// Answers 0 to everything.
+/// *(code)* Writes a starting track's argument registers 1 to 3, as the
+/// original's start does whatever the track's argument kind (0x57d9cb to
+/// 0x57d9eb, each a register write that sets the comparison flags).
+fn set_arguments(thread: &mut Thread, args: [u32; 3]) {
+    thread.target = Target::Own;
+    for (register, value) in (1..=3).zip(args) {
+        thread.registers[register] = value as i32;
+    }
+    thread.kept = i64::from(args[2] as i32);
+}
+
+/// Answers 0 to every field, and has every object on the lot, at 1, 1
+/// on the ground floor, in the middle of an 800 by 600 screen at the
+/// near zoom: where the placement gives full volume in the centre.
 pub struct NoSources;
 
+/// Where [`NoSources`] has every object on the screen.
+pub const MIDDLE: Projection = Projection {
+    at: [400, 300],
+    screen: [800, 600],
+    zoom: 3,
+    shown_level: 1,
+};
+
 impl Sources for NoSources {
-    fn field(&self, _: u32, _: i32, _: i32) -> i32 {
-        0
+    fn field(&self, _: i32, _: i32) -> Option<i32> {
+        Some(0)
+    }
+
+    fn position(&self, _: i32) -> Option<[i32; 3]> {
+        Some([1, 1, 1])
+    }
+
+    fn projection(&self, _: i32) -> Option<Projection> {
+        Some(MIDDLE)
     }
 }
 
@@ -456,8 +582,10 @@ pub struct Player<S> {
     master: i32,
     notes: Vec<Note>,
     /// *(code)* Object instances: a track and an object it plays for, as
-    /// the original records them (its map at manager +0xd4).
-    instances: BTreeSet<(u32, u32)>,
+    /// the original records them (its hash multimap at manager +0xd4),
+    /// each pair once, and each track's in the order the original goes
+    /// through them ([`Player::record`]).
+    instances: Vec<(u32, u32)>,
     /// The ambience scores, by mode (see [`crate::ambience`]).
     scores: BTreeMap<u32, Fresh>,
     /// *(code)* The current ambience (manager +0x100), by mode.
@@ -466,6 +594,12 @@ pub struct Player<S> {
     /// mode 3 has been set, after which modes are recorded (0x6f6428).
     music_mode: i64,
     music_started: bool,
+    /// *(code)* Whether the sound is paused (manager +0xd).
+    paused: bool,
+    /// *(code)* The tracks a pause holds (each track's +0x1c8): their
+    /// threads do not run or fade and their notes stay where they are,
+    /// silent, until an unpause or until the track starts again.
+    held: BTreeSet<u32>,
     /// The ambience cells' sounds.
     voices: Vec<AmbientVoice>,
     /// Ambience sample paths to their numbers in the patch cache.
@@ -515,11 +649,13 @@ impl<S: Samples> Player<S> {
             group_volumes: BTreeMap::new(),
             master: 1024,
             notes: Vec::new(),
-            instances: BTreeSet::new(),
+            instances: Vec::new(),
             scores: BTreeMap::new(),
             ambience: None,
             music_mode: 4,
             music_started: false,
+            paused: false,
+            held: BTreeSet::new(),
             voices: Vec::new(),
             ambient_patches: BTreeMap::new(),
             ambient_cache: BTreeMap::new(),
@@ -617,9 +753,10 @@ impl<S: Samples> Player<S> {
     }
 
     /// *(code)* What the game's kind 33 does, it seems once a frame
-    /// (0x574157): moves the current ambience's cursor. `view` is a
-    /// value the original computes from the camera (0x570c3e, not read
-    /// further; below 30 counts as 0, as does any value while a flag of
+    /// (0x574157): moves the current ambience's cursor. `view` is the
+    /// share of the screen's tiles that are outdoors, in percent, which
+    /// the original computes from the camera ([`crate::ambience::view`],
+    /// 0x570c3e; below 30 counts as 0, as does any value while a flag of
     /// the sound manager, not identified, is set): the row goes to `view
     /// * 10` per mille. `hour` picks the column from [`ambience::HOUR_COLUMNS`]
     /// (`column * 1000 / 13` per mille); an hour past 23 leaves it.
@@ -679,20 +816,22 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// *(code)* The ambience half of kind 36 (0x573fe2): the music mode is
-    /// recorded (once mode 3 has been set) and then, in mode 0 (live),
+    /// Kind 36 (0x573fe2): *(code)* the music mode is recorded (once mode
+    /// 3 has been set), with its music ([`Player::change_music`]) when it
+    /// changes, and then, on every event (the same mode again included),
+    /// for the ambience, in mode 0 (live),
     /// the current ambience starts if it is stopped; in mode 3 (the
     /// neighbourhood) the backyard score becomes current and starts, its
     /// cursor first set to (1000, 500) per mille, which starting resets
     /// when it was stopped; in any other mode the current ambience stops.
-    /// The music half is not ported.
-    fn set_music_mode(&mut self, mode: i64) {
+    fn set_music_mode(&mut self, module: usize, mode: i64) {
         if mode != self.music_mode {
             if mode == 3 {
                 self.music_started = true;
             }
             if self.music_started {
-                self.music_mode = mode;
+                let previous = std::mem::replace(&mut self.music_mode, mode);
+                self.change_music(module, mode, previous);
             }
         }
         let frame = self.frame;
@@ -722,6 +861,116 @@ impl<S: Samples> Player<S> {
                 }
             }
         }
+    }
+
+    /// The music half of kind 36 (0x575170): *(code)* what a change of
+    /// music mode does to the music tracks, which their scripts then play
+    /// from the music hit lists ([`crate::stations`]).
+    ///
+    /// - The river loops stop at once ([`Player::kill_track`]):
+    ///   `river_loop` but in mode 3 (the neighbourhood), and
+    ///   `mt_river_loop` but in mode 15 (Makin' Magic's). In mode 3 the
+    ///   Grim Reaper's loop stops too, when the first expansion is in
+    ///   ([`EXPANSIONS`]).
+    /// - Modes 0 (live), 4 and 9 (`bkground_fade`): `MainMusicLoop` stops
+    ///   at once after buy or build (modes 1, 2, 17, 18), and otherwise
+    ///   `FadeAndKillTrackSlow` starts for it.
+    /// - Modes 1 (buy) and 2 (build): `SetMainMusicSongAndHitList`
+    ///   starts for the hit list 221 or 222.
+    /// - Mode 3: unless the mode before was 8 (the family screen), a slow
+    ///   fade in progress stops and `SetMainAndHitListKillFirst` starts
+    ///   for the neighbourhood's list, 223; then `river_loop` starts.
+    /// - Mode 6 (the credits): `SetMainAndHitListKillFirst` for the list
+    ///   of the newest expansion in (by [`EXPANSIONS`]), or 223.
+    /// - Mode 8: the river loops and `ui_nhood_bdoze_loop` fade out and
+    ///   end ([`Player::fade_and_kill`]).
+    /// - Modes 10 to 18, the expansions': a slow fade in progress stops
+    ///   and `SetMainAndHitListKillFirst` starts for the mode's list;
+    ///   mode 15 then starts `mt_river_loop`. 17 and 18 (Makin' Magic's
+    ///   build and buy) do nothing after each other.
+    /// - Modes 5 (`bkground_load`) and 7 (the options): nothing.
+    ///
+    /// The tracks are started as kind 1 starts them, with the hit list as
+    /// the first argument (vtable +0x2c). The original waits 100 ms on
+    /// its own thread around most of these starts (`Sleep`), so its
+    /// sound thread runs between; here the events are acted on at once,
+    /// in order, with nothing between.
+    fn change_music(&mut self, module: usize, mode: i64, previous: i64) {
+        use music::*;
+        if mode == 3 {
+            if EXPANSIONS & 1 != 0 {
+                self.kill_track(GRIM_REAPER_LOOP);
+            }
+        } else {
+            self.kill_track(RIVER_LOOP);
+        }
+        if mode != 15 {
+            self.kill_track(MT_RIVER_LOOP);
+        }
+        let start = |player: &mut Self, track: u32, list: u32| {
+            player.start([list, 0, 0], module, track, false);
+        };
+        let switch = |player: &mut Self, list: u32| {
+            player.kill_track(FADE_AND_KILL_SLOW);
+            start(player, SET_MAIN_KILL_FIRST, list);
+        };
+        match mode {
+            0 | 4 | 9 => {
+                if matches!(previous, 1 | 2 | 17 | 18) {
+                    self.kill_track(MAIN_MUSIC_LOOP);
+                } else {
+                    start(self, FADE_AND_KILL_SLOW, MAIN_MUSIC_LOOP);
+                }
+            }
+            1 => start(self, SET_MAIN_MUSIC, BUY),
+            2 => start(self, SET_MAIN_MUSIC, BUILD),
+            3 => {
+                if previous != 8 {
+                    switch(self, NEIGHBOURHOOD);
+                }
+                start(self, RIVER_LOOP, 0);
+            }
+            6 => start(self, SET_MAIN_KILL_FIRST, credits(EXPANSIONS)),
+            8 => {
+                for track in [RIVER_LOOP, MT_RIVER_LOOP, NHOOD_DOZE_LOOP] {
+                    self.fade_and_kill(track, None);
+                }
+            }
+            10..=14 | 16 => switch(self, EXPANSION_LISTS[(mode - 10) as usize]),
+            15 => {
+                switch(self, EXPANSION_LISTS[5]);
+                start(self, MT_RIVER_LOOP, 0);
+            }
+            17 | 18 if !matches!(previous, 17 | 18) => {
+                switch(self, EXPANSION_LISTS[(mode - 10) as usize]);
+            }
+            _ => {}
+        }
+    }
+
+    /// Ends a track at once (vtable +0x38, 0x57dd3e): *(code)* its
+    /// threads and its notes, whether or not they were fading. A track
+    /// that is not running is left alone.
+    fn kill_track(&mut self, track: u32) {
+        self.end_track(track, None);
+    }
+
+    /// [`Player::kill_track`], sparing the thread running (`kill_trk`
+    /// ends it on its own).
+    fn end_track(&mut self, track: u32, running: Option<u32>) {
+        let spared = |id: u32| running == Some(id);
+        let ended: Vec<u32> = self
+            .threads
+            .iter()
+            .chain(&self.pending)
+            .filter(|t| t.track == track && !spared(t.id))
+            .map(|t| t.id)
+            .collect();
+        self.threads.retain(|t| !ended.contains(&t.id));
+        self.pending.retain(|t| !ended.contains(&t.id));
+        self.notes
+            .retain(|n| !(n.track == track && !spared(n.thread)));
+        self.forget_ended();
     }
 
     /// Updates every started ambience player, once per block.
@@ -765,20 +1014,25 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// Acts on one event from the simulation.
-    pub fn handle(&mut self, event: &SoundEvent) {
+    /// Acts on one event from the simulation. `sources` is where the
+    /// lot's objects are: a sound started for an object is placed when
+    /// the event comes, as the original places it ([`crate::placement`]).
+    pub fn handle(&mut self, event: &SoundEvent, sources: &dyn Sources) {
         match event {
-            SoundEvent::Play { object, name } => self.play(*object, name),
+            SoundEvent::Play { object, name } => self.play(*object, name, sources),
             // What the game calls with kind 23 when an object goes.
             SoundEvent::StopObject { object } => self.kill_instance(*object),
             // Kind 20, as the game calls it.
             SoundEvent::StopAll => self.kill_all(),
+            // Kinds 21 and 22, as the game calls them (0x57a7f2, 0x57a8e3).
+            SoundEvent::Pause => self.pause(),
+            SoundEvent::Unpause => self.unpause(),
         }
     }
 
-    fn play(&mut self, object: u32, name: &str) {
+    fn play(&mut self, object: u32, name: &str, sources: &dyn Sources) {
         match (0..self.modules.len()).find(|&m| self.modules[m].hot.event(name).is_some()) {
-            Some(module) => self.play_from(module, object, name),
+            Some(module) => self.play_from(module, object, name, sources),
             None => self.report(format!("no event {name}")),
         }
     }
@@ -786,14 +1040,14 @@ impl<S: Samples> Player<S> {
     /// Acts on the event of that name as one module defines it, whether
     /// or not an earlier module's definition would win in
     /// [`SoundEvent::Play`]. The module is an index into the modules
-    /// given to [`Player::new`].
+    /// given to [`Player::new`]. `sources` is as for [`Player::handle`].
     ///
     /// *(code)* As the original's event dispatcher (0x573617) does, the
     /// event's kind picks what happens, with its track and three
     /// arguments. Each argument is the event's own number after the
     /// track when that is not 0, and otherwise the caller's: the object
     /// for the first, 0 for the others.
-    pub fn play_from(&mut self, module: usize, object: u32, name: &str) {
+    pub fn play_from(&mut self, module: usize, object: u32, name: &str, sources: &dyn Sources) {
         let Some(event) = self.modules.get(module).and_then(|m| m.hot.event(name)) else {
             self.report(format!("no event {name}"));
             return;
@@ -829,19 +1083,16 @@ impl<S: Samples> Player<S> {
         let args = [given(0, object), given(1, 0), given(2, 0)];
         let track = track as u32;
         match kind {
-            kind::PLAY => self.play_track(module, track, args),
+            kind::PLAY => self.play_track(module, track, args, sources),
             kind::FADE => self.fade_track(track, args),
             kind::CANCEL_NOTE => self.cancel_radio_notes(),
             kind::KILL_ALL => self.kill_all(),
+            kind::PAUSE => self.pause(),
+            kind::UNPAUSE => self.unpause(),
             kind::KILL_INSTANCE => self.kill_instance(track),
             kind::SET_AMBIENCE_MODE => self.set_ambience_mode(track),
-            kind::SET_MUSIC_MODE => {
-                self.set_music_mode(i64::from(track as i32));
-                self.report(format!(
-                    "event {name}: kind {kind} is not one this player plays (its music half)"
-                ));
-            }
-            kind::TURN_ON_TV => self.turn_on_tv(module, track, args),
+            kind::SET_MUSIC_MODE => self.set_music_mode(module, i64::from(track as i32)),
+            kind::TURN_ON_TV => self.turn_on_tv(module, track, args, sources),
             kind::SEQUENCE_TRACK_HIT_LIST => self.sequence(track, args[1]),
             kind::KILL_OBJECT_SOUNDS => self.kill_object_sounds(),
             kind if kind::NOTHING_FOR_SOUND.contains(&kind) => {}
@@ -853,31 +1104,104 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// Kind 1: starts a track. *(code)* When nothing of the track runs or
-    /// plays, the object instances recorded for it are dropped first; when the
-    /// track's arguments are `kArgsIdVolPan` and the first is not 0, the
-    /// track and that object are recorded as an instance.
-    fn play_track(&mut self, module: usize, track: u32, args: [u32; 3]) {
+    /// Kind 1: starts a track (0x5736ee). *(code)* When nothing of the
+    /// track runs or plays, the object instances recorded for it are
+    /// dropped first. When the track's arguments are `kArgsIdVolPan`, a
+    /// first argument of 0 starts nothing; any other is recorded as an
+    /// instance of the track, and the track's `extvol` and `pan` are set
+    /// from where its objects are ([`crate::placement`]).
+    fn play_track(&mut self, module: usize, track: u32, args: [u32; 3], sources: &dyn Sources) {
+        if self.owner(module, track).is_none() {
+            self.report(format!("no track {track}"));
+            return;
+        }
         let alive = self.threads.iter().any(|t| t.track == track)
             || self.notes.iter().any(|n| n.track == track);
         if !alive {
             self.instances.retain(|&(t, _)| t != track);
         }
-        if self.start(args[0], module, track, false)
-            && self.track_args(module, track) == Some(ARGS_ID_VOL_PAN)
-            && args[0] != 0
-        {
-            self.record(track, args[0]);
+        if self.track_args(module, track) != Some(ARGS_ID_VOL_PAN) {
+            self.start(args, module, track, false);
+            return;
+        }
+        if args[0] == 0 {
+            return;
+        }
+        self.record(track, args[0]);
+        let placed = self.placed(track, sources);
+        let threads = self.start(args, module, track, false);
+        self.place(&threads, placed);
+    }
+
+    /// A track's volume and pan from where its objects are, as the sum
+    /// over them (0x57473b) works them out: before the start, with the
+    /// track's `Spl` read from its newest thread through its `target`.
+    /// When none runs `Spl` is [`SPL_NORMAL`]: the original's track keeps
+    /// its last run's registers, and before its first run reads the
+    /// default, but no script writes `Spl`. A fault is reported, and
+    /// gives `None`.
+    fn placed(&mut self, track: u32, sources: &dyn Sources) -> Option<(i32, i32)> {
+        let objects: Vec<u32> = self
+            .instances
+            .iter()
+            .filter(|&&(t, _)| t == track)
+            .map(|&(_, object)| object)
+            .collect();
+        let spl = self
+            .threads
+            .iter()
+            .chain(&self.pending)
+            .filter(|t| t.track == track)
+            .max_by_key(|t| t.id)
+            .map_or(SPL_NORMAL, |t| self.read(t, i64::from(SPL)));
+        match placement::combine(&objects, spl, sources) {
+            Ok(placed) => Some(placed),
+            Err(fault) => {
+                self.report(fault);
+                None
+            }
         }
     }
 
-    /// Records an object instance, unless [`INSTANCES`] are recorded.
+    /// *(code)* Writes a placement's `extvol` (0x57d57a) then `pan`
+    /// (0x57d5a0) to the threads a start started or let go, as the start
+    /// left them pointing at themselves: the comparison flags are the
+    /// pan's. With no placement both stay as they were.
+    fn place(&mut self, threads: &[u32], placed: Option<(i32, i32)>) {
+        let Some((vol, pan)) = placed else {
+            return;
+        };
+        for thread in self
+            .threads
+            .iter_mut()
+            .chain(&mut self.pending)
+            .filter(|t| threads.contains(&t.id))
+        {
+            thread.registers[usize::from(EXTVOL)] = vol;
+            thread.registers[usize::from(PAN)] = pan;
+            thread.kept = i64::from(pan);
+        }
+    }
+
+    /// Records an object instance, unless it is already (0x57442d) or
+    /// [`INSTANCES`] are. *(code)* The original's multimap puts a new
+    /// pair right after the first of its track (0x5761c2), so a track's
+    /// instances go in the order first recorded, then the others newest
+    /// first; ending one keeps the others' order. **Unverified:** the
+    /// map's growth (0x5762c7) moves its nodes to new buckets, which may
+    /// turn a track's order around; that is not ported.
     fn record(&mut self, track: u32, object: u32) {
-        if self.instances.len() >= INSTANCES && !self.instances.contains(&(track, object)) {
+        if self.instances.contains(&(track, object)) {
+            return;
+        }
+        if self.instances.len() >= INSTANCES {
             self.report(format!("track {track}: more than {INSTANCES} instances"));
             return;
         }
-        self.instances.insert((track, object));
+        match self.instances.iter().position(|&(t, _)| t == track) {
+            Some(first) => self.instances.insert(first + 1, (track, object)),
+            None => self.instances.push((track, object)),
+        }
     }
 
     /// The `args` field of the track a module (or the first other)
@@ -956,6 +1280,65 @@ impl<S: Samples> Player<S> {
         }
     }
 
+    /// Kind 21: *(code)* pauses the sound (0x573c20, 0x57481e). The
+    /// manager is marked paused; `main_duckpri` becomes 0 (0x57d361),
+    /// which here drops every thread's ducking request; every track
+    /// that runs or plays is held except [`PAUSE_SPARES`]; and in music
+    /// mode 0 the current ambience player is paused (see
+    /// [`crate::ambience::Fresh::set_paused`]). A held track's threads
+    /// do not run or fade, and its notes stay where they are, silent. A
+    /// track started while paused plays: starting a track (0x57d960)
+    /// clears its hold, and a held track whose script still runs is let
+    /// go rather than started again. The original also stops its day and night
+    /// loop (0x574978), which this player does not have.
+    pub fn pause(&mut self) {
+        self.paused = true;
+        self.duck.clear();
+        self.update_main_duckpri();
+        let tracks: BTreeSet<u32> = self
+            .threads
+            .iter()
+            .chain(&self.pending)
+            .map(|t| t.track)
+            .chain(self.notes.iter().map(|n| n.track))
+            .filter(|t| !PAUSE_SPARES.contains(t))
+            .collect();
+        self.held.extend(tracks);
+        if self.music_mode == 0
+            && let Some(current) = self.ambience
+        {
+            self.with_score(current, |score, _| score.set_paused(true));
+        }
+    }
+
+    /// Kind 22: *(code)* unpauses the sound (0x573c44, 0x574904): every
+    /// track is let go (0x57cd2c) and the current ambience player, in
+    /// any music mode, unpaused. Letting a track go (vtable +0x5c,
+    /// 0x57dc63) also moves its wait deadline (+0x198, which `wait`
+    /// sets at 0x57e453) to now, so every running thread's wait ends at
+    /// the next update, whether or not it was held, and whether or not
+    /// the sound was paused. (The original does this only while the
+    /// sound is on, manager +0xc, which this player always is; it also
+    /// restarts its day and night loop and its music, 0x575155, which
+    /// this player does not have.) `main_duckpri` stays as the pause
+    /// left it until a thread asks again.
+    pub fn unpause(&mut self) {
+        self.paused = false;
+        self.held.clear();
+        let now = self.frame;
+        for thread in self.threads.iter_mut().chain(&mut self.pending) {
+            thread.wake = now;
+        }
+        if let Some(current) = self.ambience {
+            self.with_score(current, |score, _| score.set_paused(false));
+        }
+    }
+
+    /// Whether the sound is paused (kind 21 since the last 22).
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
     /// Kind 20: *(code)* ends every track at once, forgets every object
     /// instance and stops every ambience player (the current one stays
     /// current). (The original also stops its music stations, which this
@@ -964,6 +1347,7 @@ impl<S: Samples> Player<S> {
         self.threads.clear();
         self.pending.clear();
         self.notes.clear();
+        self.held.clear();
         self.seqgroups.clear();
         self.instances.clear();
         let modes: Vec<u32> = self.scores.keys().copied().collect();
@@ -990,7 +1374,7 @@ impl<S: Samples> Player<S> {
             .map(|&(t, _)| t)
             .collect();
         for track in tracks {
-            self.instances.remove(&(track, object));
+            self.instances.retain(|&pair| pair != (track, object));
             let shared = self.instances.iter().any(|&(t, _)| t == track);
             self.fade_and_kill(track, shared.then_some(object));
         }
@@ -1003,8 +1387,9 @@ impl<S: Samples> Player<S> {
         let (killed, kept): (Vec<_>, Vec<_>) = self
             .instances
             .iter()
-            .partition(|&&(_, object)| (object as i32) > 0);
-        self.instances = kept.into_iter().collect();
+            .copied()
+            .partition(|&(_, object)| (object as i32) > 0);
+        self.instances = kept;
         for (track, _) in killed {
             self.fade_and_kill(track, None);
         }
@@ -1052,17 +1437,29 @@ impl<S: Samples> Player<S> {
 
     /// Kind 30 (`kTurnOnTv`, which radios use too): *(code)* lets go of
     /// whatever the object (the first argument) had playing, records it
-    /// as an instance of the track, and starts the track for it.
-    fn turn_on_tv(&mut self, module: usize, track: u32, args: [u32; 3]) {
+    /// as an instance of the track, and starts the track for it. A track
+    /// started anew is left held (the start ends by holding it, 0x57dbd6)
+    /// and let go only when the sound is not paused (0x573d71), so a
+    /// television turned on during a pause is silent until the unpause.
+    fn turn_on_tv(&mut self, module: usize, track: u32, args: [u32; 3], sources: &dyn Sources) {
         self.kill_instance(args[0]);
         if self.owner(module, track).is_none() {
             self.report(format!("no track {track}"));
             return;
         }
-        if args[0] != 0 {
-            self.record(track, args[0]);
+        self.record(track, args[0]);
+        let placed = self.placed(track, sources);
+        let resumes = self.held.contains(&track)
+            && self
+                .threads
+                .iter()
+                .chain(&self.pending)
+                .any(|t| t.track == track);
+        let threads = self.start(args, module, track, false);
+        if !threads.is_empty() && self.paused && !resumes {
+            self.held.insert(track);
         }
-        self.start(args[0], module, track, false);
+        self.place(&threads, placed);
     }
 
     /// Kind 53 (`kSequenceTrackHitList`): *(code)* picks a patch from a
@@ -1106,7 +1503,7 @@ impl<S: Samples> Player<S> {
                     .rposition(|n| n.thread == 0 && n.track == track);
                 if let Some(note) = idle {
                     self.chain(note, track, patch);
-                } else if let Some(mut thread) = self.thread(0, owner, track) {
+                } else if let Some(mut thread) = self.thread([0; 3], owner, track) {
                     thread.id = 0;
                     thread.registers[usize::from(PATCH)] = patch as i32;
                     self.note_on(&thread);
@@ -1129,30 +1526,66 @@ impl<S: Samples> Player<S> {
 
     /// Starts a track's routine for an object. The module given is tried
     /// first, then every other. A deferred thread first runs in the next
-    /// block. False when it could not start.
-    fn start(&mut self, object: u32, module: usize, track: u32, defer: bool) -> bool {
-        if self.threads.len() + self.pending.len() >= THREADS {
-            self.report(format!("track {track}: more than {THREADS} threads"));
-            return false;
-        }
+    /// block. The threads started or let go: none when it could not
+    /// start.
+    fn start(&mut self, args: [u32; 3], module: usize, track: u32, defer: bool) -> Vec<u32> {
         let Some(module) = self.owner(module, track) else {
             self.report(format!("no track {track}"));
-            return false;
+            return Vec::new();
         };
-        let Some(thread) = self.thread(object, module, track) else {
-            return false;
+        // *(code)* Starting a track the pause holds while its script runs
+        // does not start it again (0x57d9f1 to 0x57da12): it lets it go
+        // (vtable +0x5c), so the script goes on from where it was, its
+        // wait ended, with the new arguments. No thread is made, so the
+        // thread limit does not apply.
+        if self.held.remove(&track) {
+            let resumed = self.resume_held(args, track);
+            if !resumed.is_empty() {
+                return resumed;
+            }
+        }
+        if self.threads.len() + self.pending.len() >= THREADS {
+            self.report(format!("track {track}: more than {THREADS} threads"));
+            return Vec::new();
+        }
+        let Some(thread) = self.thread(args, module, track) else {
+            return Vec::new();
         };
+        let id = thread.id;
         if defer {
             self.pending.push(thread);
         } else {
             self.threads.push(thread);
         }
-        true
+        vec![id]
+    }
+
+    /// Lets a held track's running threads go on, as starting it does
+    /// (see [`Player::start`]). Each one's `target` points back at itself
+    /// (0x57d9c3), its argument registers take `args` (see
+    /// [`Player::thread`]) and its wait ends. The threads let go: none
+    /// when none of the track runs, so it is started anew. (A held thread
+    /// does not run, so none of these is the thread running `play_trk`.)
+    fn resume_held(&mut self, args: [u32; 3], track: u32) -> Vec<u32> {
+        let now = self.frame;
+        let mut resumed = Vec::new();
+        for thread in self
+            .threads
+            .iter_mut()
+            .chain(&mut self.pending)
+            .filter(|t| t.track == track)
+        {
+            set_arguments(thread, args);
+            thread.wake = now;
+            resumed.push(thread.id);
+        }
+        resumed
     }
 
     /// A new thread of a track the module defines, with its starting
     /// registers, or `None` (reported) when the track has no entry point.
-    fn thread(&mut self, object: u32, module: usize, track: u32) -> Option<Thread> {
+    fn thread(&mut self, args: [u32; 3], module: usize, track: u32) -> Option<Thread> {
+        let object = args[0];
         let owner = &self.modules[module];
         let Some(pc) = owner.entry(track).and_then(|entry| owner.address(entry)) else {
             self.report(format!("track {track}: entry point not found"));
@@ -1172,11 +1605,8 @@ impl<S: Samples> Player<S> {
         registers[usize::from(DUCKPRI)] = owner.number(&fields.duck_priority).unwrap_or(0) as i32;
         let group = owner.number(&fields.group).unwrap_or(0);
         registers[usize::from(PATCH)] = patch as i32;
-        if owner.number(&fields.args) == Some(ARGS_ID_VOL_PAN) {
-            registers[1] = object as i32;
-        }
         let id = self.id();
-        Some(Thread {
+        let mut thread = Thread {
             id,
             object,
             module,
@@ -1192,7 +1622,15 @@ impl<S: Samples> Player<S> {
             group,
             target: Target::Own,
             kill_after_fade: false,
-        })
+        };
+        set_arguments(&mut thread, args);
+        // *(code)* A fresh start then writes `isplaying` 1 (0x57dbc5),
+        // which leaves the comparison flags positive. (It also sets the
+        // wait deadline to now and holds the track, 0x57dbd6, which its
+        // callers let go; kind 1 always does.)
+        thread.registers[usize::from(ISPLAYING)] = 1;
+        thread.kept = 1;
+        Some(thread)
     }
 
     /// Records a fault, up to [`FAULTS`] of them; later ones are dropped,
@@ -1276,8 +1714,10 @@ impl<S: Samples> Player<S> {
         let mut sums = vec![0i64; 2 * frames];
         let cache = &self.cache;
         let ambient_cache = &self.ambient_cache;
+        let held = &self.held;
+        // A held track's notes keep their place and are not heard.
         self.notes
-            .retain_mut(|note| mix_note(note, cache, &mut sums));
+            .retain_mut(|note| held.contains(&note.track) || mix_note(note, cache, &mut sums));
         self.voices
             .retain_mut(|voice| mix_note(&mut voice.note, ambient_cache, &mut sums));
         out.extend(sums.iter().map(|&s| s.clamp(-32768, 32767) as i16));
@@ -1344,6 +1784,11 @@ impl<S: Samples> Player<S> {
         let mut budget = BLOCK_STEPS;
         let mut index = 0;
         while index < self.threads.len() {
+            // A held track's threads wait, without fading (0x57d7f3).
+            if self.held.contains(&self.threads[index].track) {
+                index += 1;
+                continue;
+            }
             if budget == 0 {
                 if !self.over_budget {
                     self.over_budget = true;
@@ -1354,6 +1799,9 @@ impl<S: Samples> Player<S> {
                 // The threads not reached still fade, and run first next
                 // block, so busy threads cannot starve them.
                 for at in index..self.threads.len() {
+                    if self.held.contains(&self.threads[at].track) {
+                        continue;
+                    }
                     let mut thread = self.threads[at].clone();
                     self.fade(&mut thread);
                     self.threads[at] = thread;
@@ -1814,25 +2262,38 @@ impl<S: Samples> Player<S> {
                 Flow::Next
             }
             "play_trk" => {
+                // *(code)* 0x57f1f2: the track starts (and is let go,
+                // vtable +0x2c) with the caller's own argument registers
+                // (read straight from its bank at +0x178), then takes
+                // the caller's `source` (47), read as any register is,
+                // through its `target` (vtable +0x88), which sets its
+                // flags. The new thread's `target` is itself.
                 let track = self.read(thread, arg(0)) as u32;
-                self.start(thread.object, thread.module, track, true);
+                let args = [1, 2, 3].map(|r| thread.registers[r] as u32);
+                let source = self.read(thread, i64::from(SOURCE));
+                let started = self.start(args, thread.module, track, true);
+                for started in self
+                    .threads
+                    .iter_mut()
+                    .chain(&mut self.pending)
+                    .filter(|t| started.contains(&t.id))
+                {
+                    started.registers[usize::from(SOURCE)] = source;
+                    started.kept = i64::from(source);
+                }
                 Flow::Next
             }
             "kill_trk" => {
+                // *(code)* 0x57f284: the track ends at once (vtable
+                // +0x38), whatever object it plays for; one track
+                // object plays for all of them in the original.
                 let track = self.read(thread, arg(0)) as u32;
-                let (object, me) = (thread.object, thread.id);
-                let killed: Vec<u32> = self
-                    .threads
-                    .iter()
-                    .filter(|t| t.object == object && t.track == track && t.id != me)
-                    .map(|t| t.id)
-                    .collect();
-                self.threads.retain(|t| !killed.contains(&t.id));
-                self.pending
-                    .retain(|t| !(t.object == object && t.track == track));
-                self.notes.retain(|n| !killed.contains(&n.thread));
-                self.forget_ended();
-                Flow::Next
+                self.end_track(track, Some(thread.id));
+                if track == thread.track {
+                    Flow::Kill
+                } else {
+                    Flow::Next
+                }
             }
             "seqgroup_kill" => {
                 let group = self.seqgroup(thread, instruction, true)?;
@@ -1899,9 +2360,16 @@ impl<S: Samples> Player<S> {
                 Flow::Next
             }
             "getsrcdatafield" => {
+                // The original passes both registers' values (0x57f2e8)
+                // and logs a refused field, going on to the next
+                // instruction either way.
                 let (source, field) = (self.read(thread, arg(1)), self.read(thread, arg(2)));
-                let value = sources.field(thread.object, source, field);
-                self.write(thread, arg(0), value);
+                match sources.field(source, field) {
+                    Some(value) => self.write(thread, arg(0), value),
+                    None => {
+                        self.fault(thread, "Illegal source parameter request");
+                    }
+                }
                 Flow::Next
             }
             "waiteq" => wait_until(self, thread, |a, b| a == b),

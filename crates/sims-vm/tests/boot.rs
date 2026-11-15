@@ -8,10 +8,17 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 33 --answers 3`
-/// gives this hash with the default frames (snapshot format 24).
-const TICK_33: &str = "da80de5807a89da3fdae78c8759d3e411bdd87c5dc7aae0bafceec963cf59796";
+/// gives this hash with the default frames (snapshot format 26).
+const TICK_33: &str = "915a9af271f2d48b191c3c1d7f4d0add337aef4c5a5899fae0a1ba02c5657e11";
+/// The same state's hash under snapshot format 25, which had no record of
+/// the bones the skins moved ([`sims_sim::World::translated_bones`]) at
+/// the end.
+const TICK_33_25: &str = "3900ae00e04dd717ef5d4a03d9e7629f7843f95d22e54c97733349d16cd147f3";
+/// The same state's hash under snapshot format 24, which had no base
+/// layers ([`sims_sim::World::base_layers`]) either.
+const TICK_33_24: &str = "da80de5807a89da3fdae78c8759d3e411bdd87c5dc7aae0bafceec963cf59796";
 /// The same state's hash under snapshot format 23, which had no headlines
-/// ([`sims_sim::World::headlines`]) at the end.
+/// ([`sims_sim::World::headlines`]) either.
 const TICK_33_23: &str = "9d5a04c006c0e77b014642afe9113d5b5ec7c250787caf001b6ede4a16bc9e99";
 /// The same state's hash under snapshot format 22, which had no families
 /// ([`sims_sim::World::families`]) either.
@@ -19,7 +26,40 @@ const TICK_33_22: &str = "041181badfd4d6953814b6c46612398df1004fa583b1d2aa5bd11c
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 1103 --answers
 /// 3` gives this hash, the tick before the salesman leaves.
-const TICK_1103: &str = "714496702b0ff2dbda94c299c217e2ae7414172e6a71775950901b0cfa6222b5";
+const TICK_1103: &str = "ce627e5ef44b7133e74322f8d5dcf1929821114529b846a4c1e442475470399a";
+/// The same state's hash under snapshot format 25.
+const TICK_1103_25: &str = "54a5adc12bd7ae9641a7029acb435272121c6678fc938ac95036f788b6b5bc86";
+/// The same state's hash under snapshot format 24.
+const TICK_1103_24: &str = "714496702b0ff2dbda94c299c217e2ae7414172e6a71775950901b0cfa6222b5";
+
+fn digest(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The lot's encoding as snapshot format 25 wrote it: without the record
+/// of the bones the skins moved ([`sims_sim::World::translated_bones`])
+/// that format 26 added at the end, so a state pinned under format 25 can
+/// be shown to be the same state but for it.
+fn format_25_bytes(lot: &Lot) -> Vec<u8> {
+    let mut bytes = lot.world().encode();
+    let moved = postcard::to_allocvec(&lot.world().translated_bones).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - moved.len()), moved);
+    bytes
+}
+
+/// The lot's encoding as snapshot format 24 wrote it: without the base
+/// layers ([`sims_sim::World::base_layers`]) that format 25 added at the
+/// end either. It starts from [`format_25_bytes`].
+fn format_24_bytes(lot: &Lot) -> Vec<u8> {
+    let mut bytes = format_25_bytes(lot);
+    let layers = postcard::to_allocvec(&lot.world().base_layers).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - layers.len()), layers);
+    bytes
+}
 
 #[test]
 fn the_goth_house_steps_to_tick_33() {
@@ -32,6 +72,9 @@ fn the_goth_house_steps_to_tick_33() {
     let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
     assert!(lot.load_report().stopped.is_none());
     assert!(lot.load_report().finished.is_some());
+    // The house saved camera direction 0, and the comparison harness saw
+    // it open at rotation 0; Generic Sims Call 12 reads it.
+    assert_eq!(lot.view_rotation(), 0);
     let start = lot.world().ticks;
     for tick in 1..=33 {
         lot.step().unwrap();
@@ -45,14 +88,9 @@ fn the_goth_house_steps_to_tick_33() {
     // No headline shows.
     assert!(lot.world().headlines.is_empty());
     assert_eq!(lot.world().hash_hex(), TICK_33);
-    use sha2::Digest;
-    let digest = |bytes: &[u8]| -> String {
-        sha2::Sha256::digest(bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
-    };
-    let mut bytes = lot.world().encode();
+    assert_eq!(digest(&format_25_bytes(&lot)), TICK_33_25);
+    let mut bytes = format_24_bytes(&lot);
+    assert_eq!(digest(&bytes), TICK_33_24);
     let headlines = postcard::to_allocvec(&lot.world().headlines).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - headlines.len()), headlines);
     assert_eq!(digest(&bytes), TICK_33_23);
@@ -96,17 +134,17 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
             .clone()
     };
 
-    // Object 18's listing runs check trees and fails partway: one reads
-    // the advertisement record (scope 12) before Find Best Interaction
-    // has first copied into it, which the load does not reach. The lot is
-    // as it was.
+    // Object 10's listing runs check trees and fails partway, on an
+    // action string with a token, whose formatter is not ported. The lot
+    // is as it was.
     let before = lot.world().hash();
-    let refused = lot.pie_menu(sim, 18).unwrap_err().to_string();
-    assert!(
-        refused.contains("scope 12") && refused.contains("0x6e5100"),
-        "{refused}"
-    );
+    let refused = lot.pie_menu(sim, 10).unwrap_err().to_string();
+    assert!(refused.contains("0x44bf1a"), "{refused}");
     assert_eq!(lot.world().hash(), before);
+    // Object 18's check tree reads the advertisement record (scope 12)
+    // before Find Best Interaction first copies into it: the game's start
+    // left it zeroed.
+    lot.pie_menu(sim, 18).unwrap_or_else(|e| panic!("{e}"));
 
     // Person 16: listing changes the lot (its check trees' work), and
     // the change is kept.
@@ -330,18 +368,53 @@ fn the_snack_order_pays_for_the_snack() {
         let update = lot.step_play().unwrap();
         assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
     }
-    // Step 2703: the carpool (object 8) makes the school bus, a multi-tile
-    // object, whose factory is not ported.
+    // Step 2703: the carpool (object 8, tree 0x1017 node 4) makes the
+    // school bus, a multi-tile object.
+    let update = lot.step_play().unwrap();
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    assert_school_bus(&lot);
+    for step in 2704..3603 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+    }
+    // Step 3603: object 354 makes an object with Create New Object
+    // Instance's flag 0x4, which is not ported.
     let update = lot.step_play().unwrap();
     let [error] = &update.errors[..] else {
         panic!("{:?}", update.errors);
     };
-    assert_eq!((error.object, error.tick), (8, 91146));
+    assert_eq!(error.object, 354);
     let fault = error.fault.to_string();
     assert!(
-        fault.contains("tree 0x1017 node 4") && fault.contains("multi-tile objects"),
+        fault.contains("tree 0x1022 node 29") && fault.contains("mode 6 with flags 0x4"),
         "{fault}"
     );
+}
+
+/// The school bus (SchoolBus.iff) the carpool makes at tick 2703: its lead
+/// tile, object 12, and 29 more tiles of its group, three across and ten
+/// long, with the lead at the group's origin.
+fn assert_school_bus(lot: &Lot) {
+    let world = lot.world();
+    let lead = &world.objects[&12];
+    assert_eq!(lead.guid, 0x50AE_1B48);
+    assert_eq!(lead.position, [728, 488, 1]);
+    let tiles: Vec<_> = world
+        .objects
+        .values()
+        .filter_map(|o| o.multipart.as_ref().filter(|m| m.parent == 12))
+        .map(|m| m.group)
+        .collect();
+    assert_eq!(tiles.len(), 29);
+    for a in 0..3 {
+        for b in 0..10 {
+            assert_eq!(
+                tiles.contains(&[a, b, 0]),
+                [a, b] != [0, 0],
+                "tile {a}, {b}"
+            );
+        }
+    }
 }
 
 /// Person `id` is off the lot and out of every list the sim keeps of it.
@@ -369,9 +442,377 @@ fn strict_mode_takes_the_salesman_off_the_lot_at_tick_1104() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_1103);
+    assert_eq!(digest(&format_25_bytes(&lot)), TICK_1103_25);
+    assert_eq!(digest(&format_24_bytes(&lot)), TICK_1103_24);
     // The salesman (GUID 0x44A86A6C, made by object 382 at tick 6).
     assert_eq!(lot.world().objects[&259].guid, 0x44A8_6A6C);
     let update = lot.step().unwrap();
     assert_eq!(update.removed, [259]);
     assert_gone(&lot, 259);
+}
+
+#[test]
+fn the_player_selects_another_goth() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    for _ in 0..10 {
+        lot.step().unwrap();
+    }
+    let mortimer = lot.world().selected().unwrap();
+    let [first, _] = lot.world().indicators;
+    // Another person who lives on the lot (person word 32 is 0) and is of
+    // the Goths' family (word 61).
+    let family = lot.world().objects[&mortimer].person.as_ref().unwrap().data[61];
+    let other = lot
+        .world()
+        .people
+        .iter()
+        .copied()
+        .find(|&id| {
+            let data = &lot.world().objects[&id].person.as_ref().unwrap().data;
+            id != mortimer && data[32] == 0 && data[61] == family
+        })
+        .unwrap();
+    // In strict mode deselecting Mortimer fails on his animator's refresh
+    // (0x58da12), which is not ported, and changes nothing.
+    let before = lot.world().hash();
+    let refused = lot.select(other).unwrap_err().to_string();
+    assert!(refused.contains("0x58da12"), "{refused}");
+    assert_eq!(lot.world().hash(), before);
+    // Play mode leaves the refresh out.
+    lot.select_play(other).unwrap();
+    let world = lot.world();
+    assert_eq!(world.selected(), Some(other));
+    assert!(!world.objects[&mortimer].selected);
+    assert_eq!(world.globals[3], other as i16);
+    assert_eq!(world.objects[&first].data[2], other as i16);
+    assert_eq!(world.objects[&other].slots[2].object, first as i16);
+    assert_eq!(world.objects[&mortimer].slots[2].object, 0);
+    // Selecting him back gives the indicator back.
+    lot.select_play(mortimer).unwrap();
+    assert_eq!(lot.world().selected(), Some(mortimer));
+    assert_eq!(lot.world().objects[&first].data[2], mortimer as i16);
+    // A selection that fails changes nothing.
+    let before = lot.world().hash();
+    assert!(lot.select_play(first).is_err());
+    assert_eq!(lot.world().hash(), before);
+    for _ in 0..50 {
+        assert!(lot.step_play().unwrap().errors.is_empty());
+    }
+}
+
+/// `sims boot <install> UserData/Houses/House05.iff --ticks 2881
+/// --answers 3` gives this hash.
+const TICK_2881: &str = "16c83a8e5f49c088dce71c67874ba7ccbb367c952b4fde8a4b3d7c78ad7a081f";
+/// The same state's hash under snapshot format 25.
+const TICK_2881_25: &str = "677bfb1d0fef771671a6b2881729604bb50d3fd2dc6ea18ca829d6cca7861aef";
+/// The same state's hash under snapshot format 24.
+const TICK_2881_24: &str = "cdd5b72c0ed8481f4db525817d1145f5445b6d2562c2ea4abfbfbfcfae4e26bf";
+
+/// `sims boot <install> UserData/Houses/House05.iff --ticks 3432
+/// --answers 3` gives this hash.
+const TICK_3432: &str = "359095d7d0e8a141ac07a3662a3aec4de888d755c663754aa624e057a6596f5b";
+/// The same state's hash under snapshot format 25.
+const TICK_3432_25: &str = "fbb3d6685e20066970fce710ca97e397b921bad0384876d05a6bcb530a62d9a9";
+/// The same state's hash under snapshot format 24.
+const TICK_3432_24: &str = "c8d4fccd905caec7a03bb6d2872d83ba0ce462ffbc6c3e0bc1432034dade3f9a";
+
+/// `sims boot <install> UserData/Houses/House05.iff --ticks 3602
+/// --answers 3` gives this hash.
+const TICK_3602: &str = "07ce1fc95d4c26d2b5466524759ddaa0d9cf6fbcde3c631c9b60e907c8bbe6a0";
+
+#[test]
+fn strict_mode_runs_to_tick_3602_past_the_school_bus() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    // The clock: globals 0, 5 and 6 are the hour, minute and second.
+    let clock = |lot: &Lot| {
+        let globals = &lot.world().globals;
+        (globals[0], globals[5], globals[6])
+    };
+    assert_eq!(clock(&lot), (6, 30, 44));
+    for _ in 1..=2703 {
+        lot.step().unwrap();
+    }
+    assert_school_bus(&lot);
+    for _ in 2704..=2881 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.world().hash_hex(), TICK_2881);
+    assert_eq!(digest(&format_25_bytes(&lot)), TICK_2881_25);
+    assert_eq!(digest(&format_24_bytes(&lot)), TICK_2881_24);
+    // Each update is two game seconds, 30 a game minute, so a day is
+    // 43,200 updates.
+    assert_eq!(clock(&lot), (8, 6, 46));
+    for _ in 2882..=3432 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.world().hash_hex(), TICK_3432);
+    assert_eq!(digest(&format_25_bytes(&lot)), TICK_3432_25);
+    assert_eq!(digest(&format_24_bytes(&lot)), TICK_3432_24);
+    assert_eq!(clock(&lot), (8, 25, 8));
+    // Tick 3433: object 334, the lead of the car junk's group, snaps
+    // itself to a place where it does not fit (0x454e82).
+    lot.step().unwrap();
+    // Tick 3434: its group is taken off the lot (Find Location mode 1)
+    // and queued for removal, and at the end of the update all 18 tiles
+    // are deleted (0x440f37).
+    let junk = [
+        334, 336, 340, 342, 348, 349, 350, 351, 352, 355, 356, 357, 368, 369, 370, 371, 372, 373,
+    ];
+    assert!(junk.iter().all(|id| lot.world().objects.contains_key(id)));
+    let tick = lot.step().unwrap();
+    assert_eq!(tick.removed, [334]);
+    assert!(junk.iter().all(|id| !lot.world().objects.contains_key(id)));
+    for _ in 3435..=3602 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.world().hash_hex(), TICK_3602);
+    assert_eq!(clock(&lot), (8, 30, 48));
+    // Tick 3603: object 354 asks Create New Object Instance mode 6, which
+    // is not ported.
+    let stopped = lot.step().unwrap_err().to_string();
+    for part in ["tick 3603,", "object 354", "mode 6"] {
+        assert!(stopped.contains(part), "{stopped}");
+    }
+}
+
+/// The Newbies' house (House07) after 1802 updates, with `--answers 3`.
+const NEWBIE_1802: &str = "d7980d86529f1b84be10c103d0d522e5484fc54ee2484859beba71b74c8c1d58";
+
+#[test]
+fn a_newbie_gives_up_on_a_route_with_its_failure_feedback() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House07.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    for _ in 1..=1472 {
+        lot.step().unwrap();
+    }
+    let person = |lot: &Lot| lot.world().objects[&105].person.as_ref().unwrap().data[62];
+    assert_eq!(person(&lot), 0);
+    // Tick 1473: person 105's tree 0x1017, on object 64, routes to a slot
+    // it may end near and gives up with result 3 (step 16). It runs
+    // the Route failure feedback tree (0x18e) on object 64 with the
+    // result, which returns in the same update; then the route ends
+    // failed (step 17) and the person's tree goes on.
+    lot.step().unwrap();
+    assert_eq!(person(&lot), 3);
+    let tail: Vec<_> = lot.world().objects[&105]
+        .stack
+        .iter()
+        .rev()
+        .take(2)
+        .map(|f| (f.tree, f.node, f.stack_object))
+        .collect();
+    assert_eq!(tail, [(8300, 5, 105), (8233, 9, 64)]);
+    for _ in 1474..=1802 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.world().hash_hex(), NEWBIE_1802);
+}
+
+/// The player cancels the snack from its icon in the queue
+/// (`Lot::cancel`, 0x45d5f8): queued, then running.
+#[test]
+fn the_player_cancels_the_snack_queued_and_running() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    let sim = lot.load_report().finished.unwrap().sim.unwrap();
+    let person = |lot: &Lot| lot.world().objects[&sim].person.clone().unwrap();
+    for _ in 0..50 {
+        assert!(lot.step_play().unwrap().errors.is_empty());
+    }
+    // Queued: it is taken off, and the fridge runs its function 4 (it has
+    // no tree there). A second press finds nothing to take.
+    let uid = lot.queue_interaction(sim, 118, 1).unwrap().unwrap();
+    assert_eq!(person(&lot).queue.len(), 1);
+    let cancelled = lot.cancel(sim, uid).unwrap();
+    assert!(cancelled.counts);
+    assert!(person(&lot).queue.is_empty());
+    assert!(!lot.cancel(sim, uid).unwrap().counts);
+    // Running: Mortimer takes the order in step 150.
+    let uid = lot.queue_interaction(sim, 118, 1).unwrap().unwrap();
+    let mut step = 50;
+    while person(&lot).active.uid != uid {
+        step += 1;
+        assert!(lot.step_play().unwrap().errors.is_empty(), "step {step}");
+    }
+    assert_eq!(step, 150);
+    let before = person(&lot);
+    assert_eq!(before.active.flags & 0x100, 0);
+    assert_ne!(before.data[33], 0);
+    assert!(lot.cancel(sim, uid).unwrap().counts);
+    // The running action is flagged and its priority word cleared; he
+    // would not be interrupted anyway, so his own menu 33 is queued, with
+    // no icon.
+    let after = person(&lot);
+    assert_eq!(after.active.uid, uid);
+    assert_eq!(after.active.flags, before.active.flags | 0x100);
+    assert_eq!(after.data[33], 0);
+    let [queued] = &after.queue[..] else {
+        panic!("{:?}", after.queue);
+    };
+    assert_eq!(
+        (
+            queued.caller,
+            queued.target,
+            queued.icon,
+            queued.table_index
+        ),
+        (sim as i16, sim as i16, 0, 33)
+    );
+    assert_eq!((queued.priority, queued.uid), (50, uid + 1));
+    // He is walking to the fridge, and stopping a route whose animator is
+    // under way is not ported: play mode parks him at step 182.
+    for at in step + 1..182 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {at}: {:?}", update.errors);
+    }
+    let update = lot.step_play().unwrap();
+    let [error] = &update.errors[..] else {
+        panic!("{:?}", update.errors);
+    };
+    assert_eq!(error.object, sim);
+    assert!(
+        error.fault.to_string().contains("0x45b3eb"),
+        "{}",
+        error.fault
+    );
+}
+
+#[test]
+fn a_paused_goth_house_goes_on_updating_with_its_clock_standing() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    // The house loads at normal speed, with no speed to go back to.
+    assert_eq!(lot.world().speed(), sims_sim::speed::NORMAL);
+    assert_eq!(lot.world().globals[18], -1);
+    for _ in 0..40 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.set_speed(924), Ok(14));
+    assert_eq!(lot.world().speed(), 924);
+    assert_eq!(lot.world().globals[18], -1);
+    assert_eq!(lot.pause(), Ok(true));
+    assert_eq!(lot.pause(), Ok(false));
+    let clock = |lot: &Lot| {
+        let g = &lot.world().globals;
+        (lot.world().ticks, g[0], g[5], g[6])
+    };
+    let before = clock(&lot);
+    for tick in 41..=240 {
+        let update = lot.step().unwrap();
+        assert!(!update.full, "tick {tick}");
+        assert_eq!(lot.ticks(), tick);
+    }
+    assert_eq!(clock(&lot), before);
+    assert_eq!(lot.unpause(), Ok(true));
+    for _ in 0..100 {
+        assert!(lot.step().unwrap().full);
+    }
+    assert_eq!(lot.world().ticks, before.0.wrapping_add(100));
+}
+
+#[test]
+fn the_player_answers_a_dialog_when_it_is_shown() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    // Answered at load, as `sims boot --answers 3` does.
+    let mut listed = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    // Answered when it is shown, as the window does.
+    let mut asked = Lot::load(&root, &house, &[], Frames::default()).unwrap();
+    asked.wait_for_answers();
+    listed.step().unwrap();
+    asked.step().unwrap();
+    // Tick 2 shows the Help System dialog, which offers two answers.
+    let before = asked.world().hash();
+    assert_eq!(asked.step().unwrap_err(), StepError::Asking { tick: 2 });
+    let asking = asked.asking().expect("a dialog waits");
+    assert_eq!(asking.shown.answers, [2, 3]);
+    assert!(
+        asking.world.dialogs.records.iter().any(|r| r.status == 1),
+        "the dialog's record, shown"
+    );
+    // The lot is as it was before the tick, and stays so: it is not
+    // halted, a step asks again, and it takes no orders.
+    assert_eq!(asked.ticks(), 1);
+    assert_eq!(asked.world().hash(), before);
+    assert_eq!(asked.step().unwrap_err(), StepError::Asking { tick: 2 });
+    let person = asked.world().selected().unwrap();
+    assert_eq!(
+        asked.queue_interaction(person, person, 0).unwrap_err(),
+        sims_vm::boot::OrderError::Asking
+    );
+    assert_eq!(asked.world().hash(), before);
+    // Only an answer it offers is taken.
+    assert!(matches!(
+        asked.answer(4),
+        Err(sims_vm::boot::AnswerError::NotOffered { answer: 4, .. })
+    ));
+    asked.answer(3).unwrap();
+    assert!(asked.asking().is_none());
+    assert_eq!(asked.answer(3), Err(sims_vm::boot::AnswerError::NotAsked));
+    // Until the tick runs again, the lot is as it was before it, and an
+    // order would be given to that lot: it takes none.
+    assert_eq!(
+        asked.pie_menu(person, person).unwrap_err(),
+        sims_vm::boot::OrderError::Asking
+    );
+    assert_eq!(asked.world().hash(), before);
+    // From there the two lots are the same, tick for tick.
+    for tick in 2..=200 {
+        let a = listed.step().unwrap();
+        let b = asked.step().unwrap();
+        assert_eq!(asked.ticks(), tick);
+        assert_eq!(asked.world().hash(), listed.world().hash(), "tick {tick}");
+        assert_eq!(a.answered, b.answered, "tick {tick}");
+        assert_eq!(a.sounds, b.sounds, "tick {tick}");
+    }
+}
+
+#[test]
+fn a_lot_that_does_not_wait_halts_at_an_unanswered_dialog() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[], Frames::default()).unwrap();
+    lot.step().unwrap();
+    let stopped = lot.step().unwrap_err();
+    assert!(
+        matches!(stopped, StepError::Tick { tick: 2, .. }),
+        "{stopped}"
+    );
+    assert!(lot.asking().is_none());
+    assert_eq!(lot.step().unwrap_err(), StepError::Halted);
 }

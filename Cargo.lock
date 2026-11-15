@@ -1575,6 +1575,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "sha2",
+ "sims-core",
  "sims-formats",
  "symphonia-bundle-mp3",
  "symphonia-core",
@@ -1622,6 +1623,7 @@ dependencies = [
  "cpal",
  "sims-audio",
  "sims-content",
+ "sims-core",
  "sims-formats",
  "sims-people",
  "sims-render",
@@ -1676,6 +1678,7 @@ dependencies = [
 name = "sims-ui"
 version = "0.1.0"
 dependencies = [
+ "libm",
  "sha2",
  "sims-content",
  "sims-formats",

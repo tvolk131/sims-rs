@@ -54,7 +54,7 @@
 //!      the opposite direction from the place's tile on my level, or I do
 //!      not fit.
 //!
-//!    Not fitting fails loudly (below).
+//!    Not fitting takes the false branch (below).
 //! 5. I am put there if I fit (the place test, virtual function 0x54,
 //!    `Interpreter::fits` or `Interpreter::fits_in`), in this order:
 //!    - the lot is told (virtual function 0x58, `Interpreter::put`), with
@@ -72,9 +72,11 @@
 //!    The branch is true. An object that is not a person snaps the same
 //!    way, without the animator.
 //!
-//! When I do not fit, the original sets word 52, and word 54 (+0xb6),
-//! from the placement error and the object collided with (0x454e09 to
-//! 0x454e9b), and the branch is false; that fails loudly.
+//! When I do not fit, word 52 and word 54 (+0xb6) are set from the
+//! placement error and the object collided with (0x454e09 to 0x454e9b,
+//! `not_fit`), and the branch is false; for a multi-tile object the
+//! object collided with is the last that any of its tiles' tests wrote. A
+//! person blocked by another person with flag bit 1 fails loudly.
 //!
 //! Flag bit 0 makes the animator's offset my distance from the place
 //! (0x454c7a), which the animator's later placing adds to my position;
@@ -89,11 +91,20 @@
 use crate::animator::place;
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
-use crate::placement::{Place, closed_directions, on_lot};
+use crate::placement::{Place, Refusal, closed_directions, on_lot};
 use crate::primitives::go_to_slot::GLOBAL_SLOTS;
 use crate::routing::slot::{direction, facing_cos_sin, route_slot, to_lot_units, to_world_units};
 use sims_core::{Ext, F32};
 use sims_sim::animator::{Animator, LOADED, UNSET};
+
+/// Why Snap found that I do not fit.
+enum NotFit {
+    /// Its own checks of the place refused, leaving this placement error.
+    Code(u32),
+    /// The place test refused, leaving the object it last wrote as
+    /// collided with (0x6e4ad0), if any.
+    Refused(Refusal, Option<u16>),
+}
 
 /// The SLOT entry kind of a container slot.
 const CONTAINER: u16 = 0;
@@ -106,9 +117,13 @@ const GLOBAL: i16 = 4;
 /// and the placement skips its own checks (0x454b83).
 const TURNED: i32 = 0x1000;
 const SKIP_CHECKS: i32 = 0x800;
-/// Object data words: the facing, and the word Snap clears (+0xb2).
+/// Object data words: the facing, and the word Snap clears (+0xb2) or
+/// sets when I do not fit.
 const FACING: usize = 1;
 const WORD_52: usize = 52;
+/// Object data word 54 (+0xb6): the object a Snap that did not fit
+/// collided with.
+const WORD_54: usize = 54;
 /// Object data word 29: the room the object is in (+0x84).
 const ROOM: usize = 29;
 
@@ -287,19 +302,30 @@ impl Machine<'_, '_> {
         let person = self.me()?.person.is_some();
         let to = [position[0], position[1]];
         let level = position[2];
-        if slot.flags & SKIP_CHECKS == 0 && !self.may_stand(to, level)? {
-            return Err(unsupported(
-                "0x4550f9",
-                "to a place the lot's border, the room or a wall refuses",
-            ));
-        }
-        let interpreter = self.interpreter();
-        let fits = match container {
-            Some((target, slot)) => interpreter.fits_in(self.world, me, target, slot, to, level),
-            None => interpreter.fits(self.world, me, to, level),
+        let refusal = if slot.flags & SKIP_CHECKS == 0
+            && let Some(code) = self.may_stand(to, level)?
+        {
+            Some(NotFit::Code(code))
+        } else {
+            let interpreter = self.interpreter();
+            let (test, collided) = match container {
+                Some((target, slot)) => interpreter
+                    .place_test_in(self.world, me, target, slot, to, level)
+                    .map(|test| {
+                        let collided = match test {
+                            Err(Refusal::Collision(other)) => other,
+                            _ => None,
+                        };
+                        (test, collided)
+                    }),
+                None => interpreter.place_test_collided(self.world, me, to, level),
+            }
+            .map_err(|f| f.nested(me))?;
+            test.err().map(|refusal| NotFit::Refused(refusal, collided))
         };
-        if !fits.map_err(|f| f.nested(me))? {
-            return Err(unsupported("0x454e09", "to a place where I do not fit"));
+        if let Some(refusal) = refusal {
+            self.not_fit(refusal, operands[4] & 2 != 0)?;
+            return Ok(false);
         }
         let place_at = Place {
             on_lot: on_lot(to),
@@ -308,7 +334,7 @@ impl Machine<'_, '_> {
             slot: container.map_or(-1, |(_, slot)| slot),
             level,
         };
-        interpreter
+        self.interpreter()
             .put(self.world, me, place_at, true)
             .map_err(|f| f.nested(me))?;
         self.set_datum(FACING, direction as i16)?;
@@ -324,15 +350,18 @@ impl Machine<'_, '_> {
     }
 
     /// The placement's own checks of the place `to` on `level` (0x4550d8
-    /// to 0x4551e9), which slot flag 0x800 skips; see step 4.
-    fn may_stand(&self, to: [i32; 2], level: i32) -> Result<bool, Trap> {
+    /// to 0x4551e9), which slot flag 0x800 skips; see step 4. A refusal
+    /// gives the placement error it leaves: 1 for the lot's border
+    /// (0x4550f9), and 0, as Snap cleared it (0x454d64), for the room and
+    /// the walls.
+    fn may_stand(&self, to: [i32; 2], level: i32) -> Result<Option<u32>, Trap> {
         let world = &*self.world;
         let tile = |p: [i32; 2]| [(p[0] >> 4) as i8, (p[1] >> 4) as i8];
         let size = i32::from(world.size);
         let inside = |t: [i8; 2]| t.iter().all(|&n| n >= 1 && i32::from(n) < size - 1);
         let [a, b] = tile(to);
         if !inside([a, b]) {
-            return Ok(false);
+            return Ok(Some(1));
         }
         let me = self.me()?;
         let room = *me
@@ -347,21 +376,84 @@ impl Machine<'_, '_> {
                 Trap::Invalid(format!("Snap to level {level}, which has no room map"))
             })?;
         if map[a as usize * 64 + b as usize] != room {
-            return Ok(false);
+            return Ok(Some(0));
         }
         let own = me.position;
         let from = [own[0], own[1]];
         let mine = tile(from);
         if !inside(mine) || from == to {
-            return Ok(true);
+            return Ok(None);
         }
         // The direction works on the original's order of coordinates.
         let dir = direction([from[1], from[0]], [to[1], to[0]]);
         let own_level = own[2] as i8;
-        if closed_directions(world, [mine[0], mine[1], own_level], dir)? & 1 != 0 {
-            return Ok(false);
+        if closed_directions(world, [mine[0], mine[1], own_level], dir)? & 1 != 0
+            || closed_directions(world, [a, b, own_level], (dir + 4) % 8)? & 1 != 0
+        {
+            return Ok(Some(0));
         }
-        Ok(closed_directions(world, [a, b, own_level], (dir + 4) % 8)? & 1 == 0)
+        Ok(None)
+    }
+
+    /// What Snap does when I do not fit (0x454dd1, 0x454e09 to 0x454e9b),
+    /// from the placement error and the object collided with (0x6e4acc
+    /// and 0x6e4ad0, both cleared first at 0x454d64; only a collision,
+    /// 0x433b42, writes an object):
+    ///
+    /// 1. Object data word 52 (+0xb2) becomes 0.
+    /// 2. If I am a person, flag bit 1 (`blocked_by_person`) is set, and
+    ///    another person is in the way (code 11), word 52 becomes 1 when
+    ///    0x45bd5e says so of that person with mine at person +0xa64;
+    ///    that test is not ported and fails loudly.
+    /// 3. If word 52 is still 0 and the error is 1 (off the lot), it
+    ///    becomes 2.
+    /// 4. Word 54 (+0xb6) becomes the ID of the object collided with, or
+    ///    0.
+    ///
+    /// The branch is then false. For a multi-tile object the code is the
+    /// one its group's test keeps and the object the last collision any
+    /// of its tiles wrote (0x422abb,
+    /// [`crate::Interpreter`]`::place_test_collided`). Fails loudly for a
+    /// refusal that leaves whatever code an earlier test left
+    /// ([`Refusal::Unrecorded`]).
+    fn not_fit(&mut self, refusal: NotFit, blocked_by_person: bool) -> Result<(), Trap> {
+        let (code, collided) = match refusal {
+            NotFit::Code(code) => (Some(code), None),
+            NotFit::Refused(Refusal::OffLot, collided) => (Some(1), collided),
+            NotFit::Refused(Refusal::Wall, collided) => (Some(7), collided),
+            NotFit::Refused(Refusal::Collision(_), collided) => (Some(11), collided),
+            // A code other than 1, 7 and 11, which Snap does not test.
+            NotFit::Refused(Refusal::Other, collided) => (None, collided),
+            NotFit::Refused(Refusal::Unrecorded, _) => {
+                return Err(unsupported(
+                    "0x454e66",
+                    "to a place where I do not fit, refused with whatever placement error an \
+                     earlier test left",
+                ));
+            }
+        };
+        let code = code.unwrap_or(0);
+        self.set_datum(WORD_52, 0)?;
+        if self.me()?.person.is_some()
+            && blocked_by_person
+            && code == 11
+            && collided.is_some_and(|id| {
+                self.world
+                    .objects
+                    .get(&id)
+                    .is_some_and(|o| o.person.is_some())
+            })
+        {
+            return Err(unsupported(
+                "0x454e54",
+                "to a place another person is in, with flag bit 1, which asks 0x45bd5e",
+            ));
+        }
+        if code == 1 {
+            self.set_datum(WORD_52, 2)?;
+        }
+        self.set_datum(WORD_54, collided.map_or(0, |id| id as i16))?;
+        Ok(())
     }
 
     /// My animator. A person with no entry has the one the load leaves

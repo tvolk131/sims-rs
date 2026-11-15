@@ -36,12 +36,14 @@
 mod animator;
 mod autonomy;
 pub mod boot;
+mod cancel;
 mod clip_events;
 mod error;
 mod factory;
 mod fault;
 mod forget;
 mod frame;
+mod group_factory;
 mod head;
 mod interpreter;
 mod load;
@@ -77,7 +79,7 @@ pub use program::{
     Callback, Career, DEFINITION_WORDS, ICON_FILE, Library, Program, Tree, icon_frames,
     sprite_frames,
 };
-pub use selection::selected;
+pub use selection::{Refresh, selected};
 pub use sounds::SoundEvent;
 pub use tick::{Answers, Player, Shown, TICK_BUDGET, TickError, Update};
 pub use visits::Visited;

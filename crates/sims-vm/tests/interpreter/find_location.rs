@@ -11,7 +11,6 @@ use crate::factory::{WIDGET, widgets};
 use crate::person_factory::equip;
 use crate::rooms::{array, build};
 use crate::support::*;
-use sims_formats::saved_objects::Multipart;
 use sims_vm::Trap;
 
 /// The opcodes under test.
@@ -165,23 +164,14 @@ fn mode_1_takes_the_object_off_the_lot() {
     let other = widget(&mut fx);
     assert_eq!(find(&mut fx, 0, other, 0), Ok(true));
     assert_eq!(fx.world.objects[&other].position, [24, 24, 1]);
-    // A tile of a group, which the original tests first (0x42344e), fails
-    // loudly.
-    fx.world.objects.get_mut(&other).unwrap().multipart = Some(Multipart {
-        offset: [0; 3],
-        group: [0; 3],
-        parent: 0,
-    });
-    let result = mode_1(&mut fx, other as i16);
-    assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("0x44b52a")));
-    assert_eq!(fx.world.objects[&other].position, [24, 24, 1]);
+    // A tile of a group: `group_factory`.
 }
 
 #[test]
 fn other_find_location_modes_fail_loudly() {
     let (mut fx, _) = placeable();
     let id = widget(&mut fx);
-    for mode in 2..=5 {
+    for mode in [2, 5] {
         let result = run(
             &mut fx,
             0,
@@ -190,6 +180,68 @@ fn other_find_location_modes_fail_loudly() {
             [mode, 0, 0, 0, 0, 0, 0, 0],
         );
         assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("not ported")));
+    }
+    // Modes 3 and 4 need an object to search from (flag bit 0): native
+    // error 0x3d (0x44b676).
+    for mode in [3, 4] {
+        let result = run(
+            &mut fx,
+            0,
+            id as i16,
+            FIND_LOCATION,
+            [mode, 0, 0, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(trap(result).code(), Some(0x3d), "mode {mode}");
+    }
+}
+
+#[test]
+fn modes_3_and_4_spiral_when_the_line_direction_is_minus_1() {
+    // The search record keeps the raw direction, and -1 there is the
+    // spiral (0x434ba9): mode 3 from a facing of -1, and mode 4 from -3
+    // (turned by 2, remainder 8). The start tile is taken, so the spiral
+    // finds the free tile (2, 3); a line of direction -1 would never step
+    // and would give up.
+    for (mode, facing) in [(3, -1), (4, -3)] {
+        let (mut fx, _) = placeable();
+        fx.lamp_mut().position = [40, 40, 1];
+        fx.lamp_mut().data[1] = facing;
+        let (first, other) = (widget(&mut fx), widget(&mut fx));
+        for (id, expected) in [(first, [40, 40, 1]), (other, [40, 56, 1])] {
+            let result = run(
+                &mut fx,
+                LAMP as i16,
+                id as i16,
+                FIND_LOCATION,
+                [mode, 0, 1, 0, 0, 0, 0, 0],
+            );
+            assert_eq!(result, Ok(true), "mode {mode}");
+            assert_eq!(fx.world.objects[&id].position, expected, "mode {mode}");
+        }
+    }
+}
+
+#[test]
+fn modes_3_and_4_search_along_a_line_by_the_objects_facing() {
+    // The lamp stands on tile (2, 2), facing 0. Mode 3 searches along its
+    // facing: the second tile coordinate steps 0, 1, -1 (0x434be9). Mode
+    // 4 turns it by 2: the first coordinate steps.
+    for (mode, second) in [(3, [40, 56, 1]), (4, [56, 40, 1])] {
+        let (mut fx, _) = placeable();
+        fx.lamp_mut().position = [40, 40, 1];
+        fx.lamp_mut().data[1] = 0;
+        let (first, other) = (widget(&mut fx), widget(&mut fx));
+        for (id, expected) in [(first, [40, 40, 1]), (other, second)] {
+            let result = run(
+                &mut fx,
+                LAMP as i16,
+                id as i16,
+                FIND_LOCATION,
+                [mode, 0, 1, 0, 0, 0, 0, 0],
+            );
+            assert_eq!(result, Ok(true), "mode {mode}");
+            assert_eq!(fx.world.objects[&id].position, expected, "mode {mode}");
+        }
     }
 }
 

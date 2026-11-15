@@ -1,5 +1,6 @@
 //! The ambient-score player on hand-built scores and samples.
 
+use sims_audio::ambience;
 use sims_audio::fsc::Score;
 use sims_audio::module::Module;
 use sims_audio::player::{BLOCK, NoSources, Player, RATE};
@@ -98,10 +99,13 @@ fn player(scores: &[(u32, Score)]) -> Player<BTreeMap<String, Pcm>> {
 }
 
 fn event(player: &mut Player<BTreeMap<String, Pcm>>, name: &str) {
-    player.handle(&SoundEvent::Play {
-        object: 0,
-        name: name.into(),
-    });
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: name.into(),
+        },
+        &NoSources,
+    );
 }
 
 /// The frames (stereo pairs) from `from` on where either channel is not
@@ -298,13 +302,12 @@ fn killing_all_stops_the_ambience_and_the_music_mode_starts_it() {
     assert!(player.ambience().is_some_and(|a| a.is_started()));
     event(&mut player, "music7");
     assert!(player.ambience().is_some_and(|a| !a.is_started()));
-    // Each kind 36 is reported: its music half is not ported.
-    assert_eq!(player.faults.len(), 4, "{:?}", player.faults);
-    assert!(
-        player
-            .faults
-            .iter()
-            .all(|f| f.contains("kind 36 is not one this player plays (its music half)"))
+    // The music half asks for music tracks this module does not have:
+    // the neighbourhood's music and river, then live's slow fade. Mode 7
+    // starts none.
+    assert_eq!(
+        player.faults,
+        ["no track 517", "no track 2957", "no track 519"]
     );
 }
 
@@ -481,4 +484,99 @@ fn an_update_far_in_the_future_does_not_overflow() {
     fresh.update(u64::MAX, &mut Silent);
     fresh.update(u64::MAX, &mut Silent);
     assert!(fresh.is_started());
+}
+
+/// The view tiles [`ambience::view`] visits, in order, for a screen of
+/// `columns` tiles across and `rows` half tiles down at the near zoom.
+fn walk(corner: [i32; 2], columns: i32, rows: i32) -> Vec<[i8; 2]> {
+    let mut seen = Vec::new();
+    ambience::view([columns * 128, rows * 32], 3, corner, |tile| {
+        seen.push(tile);
+        false
+    });
+    seen
+}
+
+#[test]
+fn the_view_walks_the_screen_in_half_tile_rows() {
+    // Along a row the column goes up and the row down; each row starts
+    // a step down, by the row first and then the column.
+    assert_eq!(
+        walk([10, 10], 2, 4),
+        [
+            [10, 10],
+            [11, 9],
+            [10, 11],
+            [11, 10],
+            [11, 11],
+            [12, 10],
+            [11, 12],
+            [12, 11],
+        ]
+    );
+    // Tiles beyond 1 to 62 are not asked about (nor counted).
+    assert_eq!(walk([0, 2], 3, 1), [[1, 1]]);
+    assert_eq!(walk([62, 5], 3, 1), [[62, 5]]);
+    // Coordinates wrap as signed bytes.
+    assert!(walk([127, 10], 2, 1).is_empty());
+    assert_eq!(walk([56 - 256, 10], 1, 1), [[56, 10]]);
+}
+
+#[test]
+fn the_view_is_the_outdoor_share_in_percent() {
+    // Every other tile outside.
+    let view = |screen, zoom| ambience::view(screen, zoom, [20, 20], |[x, _]| x % 2 == 0);
+    assert_eq!(view([800, 600], 3), 50);
+    // All outside, none outside.
+    assert_eq!(ambience::view([800, 600], 1, [20, 20], |_| true), 100);
+    assert_eq!(ambience::view([800, 600], 2, [20, 20], |_| false), 0);
+    // One of three: 33.33... cut to 33.
+    let mut n = 0;
+    let third = ambience::view([3 * 128, 32], 3, [20, 20], |_| {
+        n += 1;
+        n == 1
+    });
+    assert_eq!(third, 33);
+    // Nothing on the lot, or no screen: 0, as the original's NaN gives.
+    assert_eq!(ambience::view([800, 600], 3, [-100, -100], |_| true), 0);
+    assert_eq!(ambience::view([0, 0], 3, [20, 20], |_| true), 0);
+    assert_eq!(ambience::view([800, 600], 40, [20, 20], |_| true), 0);
+    assert_eq!(
+        ambience::view([i32::MIN, i32::MAX], 1, [20, 20], |_| true),
+        0
+    );
+}
+
+#[test]
+fn a_pause_holds_the_score_in_live_music_mode_only() {
+    let cells = vec![Some(cell(20, "a.xa")); 9];
+    let mut player = player(&[(0, score(header(3, 3, 1, 1, 1), &cells))]);
+    event(&mut player, "amb0");
+    // The first music mode is 4: a pause leaves the score alone, though
+    // an unpause would unpause it.
+    player.handle(&SoundEvent::Pause, &NoSources);
+    assert!(player.is_paused());
+    assert!(!player.ambience().unwrap().is_paused());
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    // Live music (mode 0, once mode 3 has been set): the score pauses,
+    // and no beat falls due while it is.
+    event(&mut player, "music3");
+    event(&mut player, "music0");
+    player.handle(&SoundEvent::Pause, &NoSources);
+    assert!(
+        player
+            .ambience()
+            .is_some_and(|a| a.is_paused() && a.is_started())
+    );
+    let out = player.render_stereo(8 * RATE as usize, &NoSources);
+    assert!(runs(&out, 0).is_empty(), "{:?}", runs(&out, 0));
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    assert!(!player.ambience().unwrap().is_paused());
+    let out = player.render_stereo(8 * RATE as usize, &NoSources);
+    assert!(!runs(&out, 0).is_empty());
+    // Only the music tracks this module does not have.
+    assert_eq!(
+        player.faults,
+        ["no track 517", "no track 2957", "no track 519"]
+    );
 }

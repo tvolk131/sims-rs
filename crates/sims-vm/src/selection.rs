@@ -35,6 +35,9 @@ mod person {
     pub const FAMILY: usize = 61;
     /// The Sim's date: negative while the second indicator marks someone.
     pub const DATE: usize = 77;
+    /// With the Superstar pack, 10 or more gives a person who is not
+    /// selected a star marker (0x446c15).
+    pub const FAME: usize = 81;
 }
 
 fn fault(object: u16, trap: Trap) -> Fault {
@@ -47,6 +50,20 @@ fn fault(object: u16, trap: Trap) -> Fault {
 
 fn unsupported(object: u16, what: &str) -> Fault {
     fault(object, Trap::Unsupported(what.into()))
+}
+
+/// What deselecting a Sim does about its animator's refresh (0x58da12
+/// with 0, from 0x446921), which is not ported: see
+/// [`Interpreter::select_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refresh {
+    /// Fail loudly, as for anything not ported: the default.
+    Fail,
+    /// Leave the refresh out, so the deselected Sim's animator, head and
+    /// person words do not move as the original's would. For play mode
+    /// only (`Lot::select_play`); a lot that did this is not one to
+    /// compare with the original.
+    Skip,
 }
 
 /// The selected Sim (0x4456e4): [`World::selected`].
@@ -178,24 +195,35 @@ impl Interpreter<'_> {
     }
 
     /// Selects a Sim, or nobody (0x445449). Nothing happens if the target
-    /// is already what is selected. Otherwise the target gets the
-    /// selected mark, the indicators are moved for it (0x44664c), and the
-    /// selection is announced (signal 0xe4), which writes the Sim's ID,
-    /// or 0, to global 3 (0x46d2c2).
+    /// is already what is selected. Otherwise the Sim selected before, if
+    /// any, is deselected (`Interpreter::deselect`); then the target
+    /// gets the selected mark, the indicators are moved for it
+    /// (0x44664c), and the selection is announced (signal 0xe4), which
+    /// writes the Sim's ID, or 0, to global 3 (0x46d2c2).
     ///
-    /// Deselecting a Sim that is selected is not ported and fails: the
-    /// original takes the mark off and moves the indicators for that Sim
-    /// first. After a load nobody is selected.
+    /// After a load nobody is selected. The player selects a Sim from the
+    /// interface (a portrait), between ticks.
+    ///
+    /// Deselecting a Sim while the lot has indicators refreshes its
+    /// animator, which is not ported, so that fails ([`Refresh::Fail`]).
     pub fn select(&self, world: &mut World, target: Option<u16>) -> Result<(), Fault> {
+        self.select_with(world, target, Refresh::Fail)
+    }
+
+    /// [`Interpreter::select`], with `refresh` saying what deselecting
+    /// does about the deselected Sim's animator refresh.
+    pub fn select_with(
+        &self,
+        world: &mut World,
+        target: Option<u16>,
+        refresh: Refresh,
+    ) -> Result<(), Fault> {
         let previous = selected(world);
         if previous == target {
             return Ok(());
         }
         if let Some(previous) = previous {
-            return Err(unsupported(
-                previous,
-                "deselecting the selected Sim is not ported",
-            ));
+            self.deselect(world, previous, refresh)?;
         }
         let Some(sim) = target else {
             return set_global(world, SELECTED, 0);
@@ -212,6 +240,70 @@ impl Interpreter<'_> {
         self.move_indicators(world, sim)?;
         // The original reads the Sim's ID again here, after the callbacks.
         set_global(world, SELECTED, sim as i16)
+    }
+
+    /// Deselects the selected Sim `sim`, the first half of 0x445449: its
+    /// selected mark is taken off (0x4320da with the flags' low five bits
+    /// less bit 1), and the indicators are moved for a Sim without the
+    /// mark (0x44664c from 0x4468c3). With nobody selected now:
+    ///
+    /// 1. The first indicator is taken off the lot (its virtual function
+    ///    0x50 with 1, 0x4468fd), as `Interpreter::take_off` takes it.
+    /// 2. The person's animator is refreshed (its virtual function 0x54
+    ///    with 0, 0x446921, 0x58da12). With 0 the refresh always runs: it
+    ///    reads the clock again (virtual function 0x34), brings the skin
+    ///    up to date at that clock (0x5992b3), places the animator
+    ///    (virtual function 0x60), runs the head's step, measurement and
+    ///    restoration (0x590768, 0x5904d2, 0x590b27), which can count
+    ///    person word 45 down and write word 42, and redraws what the
+    ///    person carries in its slot 1. Between ticks the clock has moved
+    ///    on from the animator's, so this changes what the simulation
+    ///    reads. It is not ported: with [`Refresh::Fail`] it fails; with
+    ///    [`Refresh::Skip`] it is left out.
+    /// 3. The second indicator is taken off the lot too (0x446be8).
+    /// 4. With the Superstar pack (bit 0x40 of the installed-expansions
+    ///    mask, application field +0x66, set on a Complete Collection
+    ///    install and not modeled), a person whose word 81 is 10 or more
+    ///    gets a star marker (0x446c15). That is not ported and fails,
+    ///    whatever the mask, as `Interpreter::placed_from_outside`
+    ///    does.
+    ///
+    /// Not modeled, being presentation: the object is redrawn (0x434101
+    /// with 0, from the outermost object holding it; that it writes
+    /// nothing the simulation reads is **unverified**). A lot without
+    /// indicators does nothing more than take the mark off (0x44667f).
+    fn deselect(&self, world: &mut World, sim: u16, refresh: Refresh) -> Result<(), Fault> {
+        let object = world
+            .objects
+            .get_mut(&sim)
+            .ok_or_else(|| fault(sim, Trap::native(10, "missing object")))?;
+        object.selected = false;
+        let [first, second] = world.indicators;
+        if first == 0 {
+            return Ok(());
+        }
+        if selected(world).is_none() {
+            self.take_off(world, first, true)?;
+            if refresh == Refresh::Fail {
+                return Err(unsupported(
+                    sim,
+                    "deselecting a Sim refreshes its animator (0x58da12 with 0, from 0x446921), \
+                     which reads the clock again, updates the skin and steps the head; not \
+                     ported",
+                ));
+            }
+        }
+        if selected(world).is_none() && second != 0 {
+            self.take_off(world, second, true)?;
+        }
+        if person_word(world, sim, person::FAME)? >= 10 {
+            return Err(unsupported(
+                sim,
+                "a Sim deselected whose person word 81 is 10 or more takes a star marker \
+                 (0x446c15); not ported",
+            ));
+        }
+        Ok(())
     }
 
     /// Moves the indicators for a Sim that has just been selected

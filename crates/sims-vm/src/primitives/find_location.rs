@@ -26,19 +26,27 @@
 //! Mode 1 takes the object off the lot (0x44b519 to 0x44b565): its virtual
 //! function 0x50 runs, asked to tell the registry (as Remove Object
 //! Instance's queue does, [`crate::Interpreter::take_off`]), and the true
-//! branch is taken. The original first tests a tile of a group (definition
-//! +0x14 set) with 0x42344e and may then call 0x42346a on it. That is not
-//! decoded, so a tile of a group fails loudly, as it does for Remove
-//! Object Instance.
+//! branch is taken. A person can take only itself off, during its own
+//! tick (`Interpreter::take_self_off`, for its animator's refresh). A
+//! tile of a group (definition word 10, +0x14, set, and the object one of
+//! a group, 0x44b52a to 0x44b545) is first asked whether its type names
+//! function 8 (0x42344e). If it does, the tile leaves its group and the
+//! group's offsets are worked out again (0x42346a: 0x4228d6, 0x4234ab),
+//! which is not ported and fails loudly. If not, nothing happens before
+//! the take-off, which takes the whole group off
+//! ([`crate::Interpreter::take_off`], 0x422d86).
 //!
-//! Mode 2 (in front of the object), 3 and 4 (searches in one line) and 5
-//! (a search from a random start, which draws random numbers) fail
-//! loudly.
+//! Modes 3 and 4 search along a line through the object the local names,
+//! following its facing (see `Machine::find_in_line`).
+//!
+//! Mode 2 (in front of the object) and 5 (a search from a random start,
+//! which draws random numbers) fail loudly.
 
-use crate::factory::word::GRAPHICS;
+use crate::factory::word::{GRAPHICS, GROUP};
 use crate::fault::Trap;
 use crate::interpreter::Machine;
 use crate::placement::{Place, Rules, on_lot};
+use crate::visits::function;
 
 impl Machine<'_, '_> {
     pub(crate) fn find_location(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
@@ -73,23 +81,29 @@ impl Machine<'_, '_> {
             level = p[2];
         }
         if mode == 1 {
-            if self.world.objects[&target].multipart.is_some() {
+            let me = self.me;
+            let interpreter = self.interpreter();
+            if self.world.objects[&target].multipart.is_some()
+                && interpreter.words(self.world, target)?[GROUP] != 0
+                && interpreter.has_function(self.world, target, function::DYNAMIC_GROUP)
+            {
                 return Err(Trap::Unsupported(
-                    "Find Location For mode 1 on a tile of a group, which the original tests \
-                     first (0x44b52a, 0x42344e)"
+                    "Find Location For mode 1 on a tile of a group whose type has the dynamic \
+                     group function (8): the tile leaves its group first and the group's \
+                     offsets are worked out again (0x42346a), which is not ported"
                         .into(),
                 ));
             }
-            let me = self.me;
-            self.interpreter()
-                .take_off(self.world, target, true)
-                .map_err(|fault| fault.nested(me))?;
+            if target == me && self.world.objects[&target].person.is_some() {
+                interpreter
+                    .take_self_off(self.world, target)
+                    .map_err(|fault| fault.nested(me))?;
+            } else {
+                interpreter
+                    .take_off(self.world, target, true)
+                    .map_err(|fault| fault.nested(me))?;
+            }
             return Ok(true);
-        }
-        if (2..=5).contains(&mode) {
-            return Err(Trap::Unsupported(format!(
-                "Find Location For mode {mode} is not ported"
-            )));
         }
         let rules = Rules {
             same_room: true,
@@ -99,6 +113,14 @@ impl Machine<'_, '_> {
         let interpreter = self.interpreter();
         let unsupported =
             |fault| Trap::Unsupported(format!("Find Location For on object {target}: {fault}"));
+        if mode == 3 || mode == 4 {
+            return self.find_in_line(target, mode, flags, local, from, level, rules);
+        }
+        if (2..=5).contains(&mode) {
+            return Err(Trap::Unsupported(format!(
+                "Find Location For mode {mode} is not ported"
+            )));
+        }
         let mut found = interpreter
             .search(self.world, target, from, level, rules)
             .map_err(unsupported)?;
@@ -144,6 +166,82 @@ impl Machine<'_, '_> {
                  refreshing them (0x433bb3) is not ported"
             )));
         }
+        Ok(true)
+    }
+
+    /// Modes 3 and 4 (0x44b676 to 0x44b716): a search along a line
+    /// through the object the local names.
+    ///
+    /// 1. Without flag bit 0 there is no such object: native error 0x3d.
+    /// 2. The line follows that object's facing (data word 1), or, in mode
+    ///    4, its facing plus 2, remainder 8.
+    /// 3. One search, in the start tile's room
+    ///    ([`crate::Interpreter::search_line`]). No tile found takes the
+    ///    false branch.
+    /// 4. The place test once more at the tile found
+    ///    ([`crate::Interpreter::fits`]); a refusal takes the false branch.
+    /// 5. The object is put there with the lot told (virtual function
+    ///    0x58) and the true branch is taken. Unlike mode 0, virtual
+    ///    function 0x74 does not run.
+    #[allow(clippy::too_many_arguments)]
+    fn find_in_line(
+        &mut self,
+        target: u16,
+        mode: u8,
+        flags: u8,
+        local: usize,
+        from: [i32; 2],
+        level: i32,
+        rules: Rules,
+    ) -> Result<bool, Trap> {
+        if flags & 1 == 0 {
+            return Err(Trap::native(
+                0x3d,
+                "Find Location For along a line has no object to search from",
+            ));
+        }
+        let reference = u16::try_from(self.frame()?.locals[local])
+            .map_err(|_| Trap::native(0x17, "Find Location For has no object to search from"))?;
+        let facing = i32::from(
+            self.world
+                .objects
+                .get(&reference)
+                .ok_or(Trap::native(
+                    0x17,
+                    "Find Location For has no object to search from",
+                ))?
+                .data[1],
+        );
+        let direction = if mode == 4 { (facing + 2) % 8 } else { facing };
+        let interpreter = self.interpreter();
+        let unsupported =
+            |fault| Trap::Unsupported(format!("Find Location For on object {target}: {fault}"));
+        let Some(position) = interpreter
+            .search_line(self.world, target, from, level, rules, direction)
+            .map_err(unsupported)?
+        else {
+            return Ok(false);
+        };
+        if !interpreter
+            .fits(self.world, target, position, level)
+            .map_err(unsupported)?
+        {
+            return Ok(false);
+        }
+        interpreter
+            .put(
+                self.world,
+                target,
+                Place {
+                    on_lot: on_lot(position),
+                    position,
+                    container: None,
+                    slot: -1,
+                    level,
+                },
+                true,
+            )
+            .map_err(unsupported)?;
         Ok(true)
     }
 }
