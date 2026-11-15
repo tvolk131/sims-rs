@@ -8,6 +8,21 @@
 //! Depth is the original's 16-bit depth (see [`crate::depth`]): what a
 //! pixel stores is held to 0 to 65535, where the original keeps the low
 //! 16 bits; the two differ only off the original's tables.
+//!
+//! # Which object drew a pixel
+//!
+//! The canvas also keeps, for each pixel, the ID of the object or person
+//! that drew it last, for finding what a click hit:
+//! [`Canvas::id_at`]. Whatever draws sets the pen first with
+//! [`Canvas::set_id`]; every pixel the canvas takes after that (one that
+//! passes the depth test and is not fainter than [`FAINT`], blended or
+//! not) takes the pen's ID with it. [`crate::draw`] gives each object
+//! sprite its object ID (the key in `World::objects`) and terrain, floors,
+//! walls and trims none; `sims_people::People::draw_on_lot` gives each
+//! person's pixels the person's object ID. So after the lot and its people
+//! are drawn, `id_at` names the object or person shown at a pixel, and a
+//! person or object hidden behind a wall is named nowhere. Each tile of a
+//! multi-tile object is its own object and names itself.
 
 pub use crate::depth::EMPTY;
 use crate::light::Light;
@@ -93,6 +108,10 @@ pub struct Canvas {
     pub height: usize,
     pub color: Vec<[u8; 3]>,
     pub depth: Vec<i32>,
+    /// For each pixel, the ID of what drew it last ([`Canvas::id_at`]).
+    ids: Vec<Option<u16>>,
+    /// The ID the pixels drawn now take ([`Canvas::set_id`]).
+    pen: Option<u16>,
 }
 
 impl Canvas {
@@ -102,13 +121,33 @@ impl Canvas {
             height,
             color: vec![background; width * height],
             depth: vec![EMPTY; width * height],
+            ids: vec![None; width * height],
+            pen: None,
         }
     }
 
-    /// Clears to `background` and empty depth, keeping the size.
+    /// Clears to `background`, empty depth and no IDs, keeping the size,
+    /// and puts the pen down (no ID).
     pub fn clear(&mut self, background: [u8; 3]) {
         self.color.fill(background);
         self.depth.fill(EMPTY);
+        self.ids.fill(None);
+        self.pen = None;
+    }
+
+    /// Sets the ID the pixels drawn from now on take, until it is set
+    /// again: an object's or a person's object ID, or None for what is
+    /// nobody's (terrain, floors, walls). See [the module
+    /// docs](self#which-object-drew-a-pixel).
+    pub fn set_id(&mut self, id: Option<u16>) {
+        self.pen = id;
+    }
+
+    /// The ID of the object or person that drew the pixel at (`x`, `y`)
+    /// last, if any did and the pixel is on the canvas: what a click there
+    /// hit.
+    pub fn id_at(&self, x: i32, y: i32) -> Option<u16> {
+        self.ids[self.index(x, y)?]
     }
 
     /// Draws `image` with its top-left corner at `at`, mirrored left to
@@ -244,6 +283,7 @@ impl Canvas {
     fn write(&mut self, target: usize, rgb: [u8; 3], a: u8, d: i32) {
         let pixel = &mut self.color[target];
         self.depth[target] = d.clamp(0, EMPTY);
+        self.ids[target] = self.pen;
         if a == 255 {
             *pixel = rgb;
         } else {
@@ -545,6 +585,45 @@ mod tests {
         assert_eq!(c.color[0], dark.apply([200; 3]));
         assert_eq!(c.color[1], [200; 3]);
         assert_ne!(c.color[0], c.color[1]);
+    }
+
+    #[test]
+    fn each_pixel_names_what_drew_it_last() {
+        let mut c = Canvas::new(3, 1, [0, 0, 0]);
+        // Nobody's floor, then object 7 over two pixels.
+        c.draw(
+            &image(3, 1, [1, 1, 1, 255], None),
+            [0, 0],
+            false,
+            |_, _, _| 50,
+        );
+        c.set_id(Some(7));
+        c.draw(
+            &image(2, 1, [2, 2, 2, 255], None),
+            [0, 0],
+            false,
+            |_, _, _| 40,
+        );
+        // Person 9 behind object 7 on pixel 0, soft in front on pixel 1,
+        // and too faint to count on pixel 2.
+        c.set_id(Some(9));
+        assert!(!c.put(0, 0, [3, 3, 3, 255], 45));
+        assert!(c.put(1, 0, [3, 3, 3, 128], 30));
+        assert!(!c.put(2, 0, [3, 3, 3, FAINT - 1], 0));
+        assert_eq!(
+            [c.id_at(0, 0), c.id_at(1, 0), c.id_at(2, 0)],
+            [Some(7), Some(9), None]
+        );
+        // Off the canvas names nothing; a pen set to None draws nobody's
+        // pixels; clearing forgets every ID and the pen.
+        assert_eq!([c.id_at(-1, 0), c.id_at(3, 0), c.id_at(0, 1)], [None; 3]);
+        c.set_id(None);
+        c.plot(1, 0, 0, [4, 4, 4]);
+        assert_eq!(c.id_at(1, 0), None);
+        c.set_id(Some(7));
+        c.clear([0, 0, 0]);
+        c.plot(2, 0, 0, [4, 4, 4]);
+        assert_eq!([c.id_at(0, 0), c.id_at(2, 0)], [None, None]);
     }
 
     #[test]
