@@ -32,6 +32,7 @@ mod remove;
 mod run_functional_tree;
 mod set_to_next;
 mod sleep;
+mod snap;
 mod sound;
 
 pub(crate) use distance::distance;
@@ -139,6 +140,7 @@ impl Machine<'_, '_> {
             42 => self.create_object(operands)?.into(),
             44 => self.animate_sim(operands)?,
             45 => self.go_to_slot(operands)?,
+            46 => self.snap(operands)?.into(),
             48 => self.stop_all_sounds(operands)?.into(),
             32 => self.test_object_type(operands)?.into(),
             36 => self.dialog(operands)?,

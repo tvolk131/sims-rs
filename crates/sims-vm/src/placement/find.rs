@@ -27,7 +27,7 @@
 //!
 //! Only what an ordinary object or a person on the ground needs is
 //! ported. A person whose person word 84 has bit 0, a tile of a group, a
-//! place inside a container, the upper level's floor test, an object that
+//! place inside a container, an object that
 //! must stand against a wall (data word 13 nonzero) and two objects that
 //! are both not solid on the same tile fail loudly.
 
@@ -450,8 +450,8 @@ impl Interpreter<'_> {
     /// 2. Above the ground level, placement flag 0x1000 is clear (0x1f).
     /// 3. The tile's diagonal wall is one the object may stand against
     ///    ([`Self::against_walls`], 0x476f5a). A person skips this.
-    /// 4. Above the ground level without placement flag 0x200: the upper
-    ///    level's floor test, which is not ported.
+    /// 4. Above the ground level without placement flag 0x200, the tile
+    ///    has a floor (0x4330b7; 0x12 or 0x29).
     /// 5. On water (the ground level, water byte not 0xff) without
     ///    placement flag 4, an object on the tile has data word 8 flag
     ///    0x1000 (0x1d). Off water, placement flag 0x2000 is clear (0x2f).
@@ -520,12 +520,16 @@ impl Interpreter<'_> {
             return Ok(Err(Refusal::Unrecorded));
         }
         let index = level_index(level).map_err(fail)?;
-        if placement & 0x200 == 0 && level > 1 {
-            return Err(fail(Trap::Unsupported(
-                "the upper level's floor test (0x4330b7) is not ported".into(),
-            )));
-        }
         let at = cell(a, b).map_err(fail)?;
+        let floor = {
+            let floors = array(world, FLOORS[index], 2).map_err(fail)?;
+            u16::from_le_bytes([floors[at * 2], floors[at * 2 + 1]])
+        };
+        // Codes 0x12 and 0x29: which of the two depends on the level the
+        // player looks at (0x4a6757), which no caller here tells apart.
+        if placement & 0x200 == 0 && level > 1 && floor == 0 {
+            return Ok(Err(Refusal::Other));
+        }
         let water = level == 1 && array(world, WATER, 1).map_err(fail)?[at] != 0xff;
         if water {
             if placement & 4 == 0 {
@@ -561,10 +565,6 @@ impl Interpreter<'_> {
                 return Ok(Err(Refusal::Other));
             }
         }
-        let floor = {
-            let floors = array(world, FLOORS[index], 2).map_err(fail)?;
-            u16::from_le_bytes([floors[at * 2], floors[at * 2 + 1]])
-        };
         // Codes 0x13 and 0x2a, then 0x14.
         if placement & 1 == 0 && (floor != 0 || (level == 1 && pool == 0x10)) {
             return Ok(Err(Refusal::Other));

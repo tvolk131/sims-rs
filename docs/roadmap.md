@@ -60,8 +60,8 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 583 on the Goth house**: our
-  state after every one of ticks 1 to 583 equals the fourth capture of the
+  there, as three captures recorded). **K = 608 on the Goth house**: our
+  state after every one of ticks 1 to 608 equals the fourth capture of the
   original (full state after every update) in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
@@ -1515,8 +1515,34 @@ stream one draw behind with every object still equal.
 fourth capture in everything compared, the three random streams
 included, but for the head fields of "Ticks 334 to 366".
 
-**Stops.** Tick 584: person 18's tree 0x1011 runs Snap (opcode 46),
-which is not ported.
+**Then.** Tick 584 stopped at Snap; see "Ticks 584 to 608".
+
+### Ticks 584 to 608
+
+**Snap** (opcode 46, `0x454976`, `snap.rs`). It puts a person straight
+onto a place an object names, without walking. Only mode 3 is ported:
+the stack object's routing slot named by word 0. In tick 584 person 18's
+tree 0x1011 snaps to slot 0 of object 207, one level up. The slot has no
+offset and flag 0x800, which skips the placement's own checks of the
+border, the room and the walls. The person runs the place test, is put
+where 207 stands (level 2, room 1025) and keeps its facing. Its animator
+is unset and places itself again. The original goes through floats
+(times 3/16 and back times 16/3); for a zero offset that round trip
+keeps the position exactly. A slot with an offset, a snap target, no
+flag 0x800, operand flag 0, the other modes, and a person who does not
+fit, all fail loudly.
+
+**The upper level's floor test** (`0x4330b7`). Above the ground, an
+object without placement flag 0x200 needs a floor on its tile. That
+was the place test's last step left unported for a person.
+
+**K = 608.** Our state after every tick from 584 to 608 equals the
+fourth capture in everything compared, the three random streams
+included, but for the head fields of "Ticks 334 to 366".
+
+**Stops.** Tick 609: object 260 is removed, and removing it needs the
+lot's placement and callback services (the removal of an object that
+stands on the lot).
 
 ## Track: drawing people (`crates/sims-people`)
 

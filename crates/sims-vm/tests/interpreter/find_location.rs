@@ -19,7 +19,7 @@ const CREATE: u16 = 42;
 
 /// A widget's Init: it may be placed on level 1 (data word 4 bit 0) and
 /// stand on a tile with no floor (data word 42 flag 2).
-fn placeable() -> (Fixture, usize) {
+pub fn placeable() -> (Fixture, usize) {
     let (mut fx, file) = widgets();
     fx.add(
         file,
@@ -77,7 +77,7 @@ fn find(fx: &mut Fixture, local: i16, target: u16, flags: u8) -> Result<bool, si
     )
 }
 
-fn create(
+pub fn create(
     fx: &mut Fixture,
     local: u8,
     flags: u8,
@@ -251,7 +251,7 @@ fn mode_8_with_other_flags_or_a_person_it_cannot_make_fails_loudly() {
 
 /// The widget as a person type, [`equip`]ped, with records whose words
 /// are all 12 (bits 0 and 1 clear).
-fn person_widget() -> Fixture {
+pub fn person_widget() -> Fixture {
     let (mut fx, file) = placeable();
     fx.words(file)[9] = 2;
     equip(&mut fx, WIDGET, "widget", 12);

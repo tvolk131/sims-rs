@@ -883,7 +883,7 @@ impl Machine<'_, '_> {
     }
 
     /// Sets object data word `index` of the running object.
-    fn set_datum(&mut self, index: usize, value: i16) -> Result<(), Trap> {
+    pub(super) fn set_datum(&mut self, index: usize, value: i16) -> Result<(), Trap> {
         *self
             .me_mut()?
             .data

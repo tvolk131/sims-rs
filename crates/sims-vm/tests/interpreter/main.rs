@@ -28,6 +28,7 @@ mod selection;
 mod services;
 mod set_to_next;
 mod sleep;
+mod snap;
 mod support;
 mod tick;
 mod visits;
