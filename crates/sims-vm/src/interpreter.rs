@@ -131,6 +131,10 @@ pub struct Interpreter<'a> {
     /// animator refresh pending from its taking itself off the lot
     /// ([`crate::placement::Refreshing`]). None otherwise.
     pub(crate) refreshing: Option<&'a RefCell<crate::placement::Refreshing>>,
+    /// Whether this is a person's animator refresh at its taking itself
+    /// off the lot (`Interpreter::refresh_at_take_off`), where a timed
+    /// event that would play a sound fails ([`crate::clip_events`]).
+    pub(crate) take_off_refresh: bool,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -158,6 +162,7 @@ impl<'a> Interpreter<'a> {
             letting_go: None,
             view_rotation: 0,
             refreshing: None,
+            take_off_refresh: false,
         }
     }
 
@@ -391,6 +396,7 @@ impl<'a> Machine<'a, '_> {
             letting_go: self.letting_go,
             view_rotation: self.view_rotation,
             refreshing: self.refreshing,
+            take_off_refresh: false,
         }
     }
 

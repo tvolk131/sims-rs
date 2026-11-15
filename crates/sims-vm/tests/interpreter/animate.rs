@@ -2036,6 +2036,35 @@ fn taking_itself_off_then(then: Vec<sims_formats::behavior::Instruction>) -> Fix
     fx
 }
 
+/// The person plays a clip, in its foreground layer, with one timed event
+/// `key` = `value` due at the first tick's clock.
+fn playing_an_event(fx: &mut Fixture, key: &str, value: &str) {
+    fx.program.animations.insert(
+        "test.far",
+        Clip {
+            name: CLIP.into(),
+            skill: SKILL.into(),
+            duration: HUNDRED,
+            distance: 0,
+            moving: false,
+            frames: 4,
+            motions: 1,
+            tracks: vec![track(&[(0, &[(key, value)])])],
+            channels: Vec::new(),
+            samples: [0, 0],
+        },
+    );
+    let mut foreground = Layer::start(CLIP, F32::from_bits(HUNDRED), 4, true, 1, false, 500);
+    foreground.priority = 10;
+    fx.world.animators.insert(
+        SIM,
+        sims_sim::animator::Animator {
+            foreground: Some(foreground),
+            ..LOADED
+        },
+    );
+}
+
 /// Sleep for the tree's parameter.
 fn sleep() -> sims_formats::behavior::Instruction {
     ins(0, RETURN_TRUE, RETURN_FALSE, [0; 8])
@@ -2094,30 +2123,7 @@ fn a_refresh_whose_event_writes_a_hand_fails_at_the_take_off() {
         assign(18, 22, scope::LITERAL, 3, 3),
         sleep(),
     ]);
-    fx.program.animations.insert(
-        "test.far",
-        Clip {
-            name: CLIP.into(),
-            skill: SKILL.into(),
-            duration: HUNDRED,
-            distance: 0,
-            moving: false,
-            frames: 4,
-            motions: 1,
-            tracks: vec![track(&[(0, &[("lefthand", "3")])])],
-            channels: Vec::new(),
-            samples: [0, 0],
-        },
-    );
-    let mut foreground = Layer::start(CLIP, F32::from_bits(HUNDRED), 4, true, 1, false, 500);
-    foreground.priority = 10;
-    fx.world.animators.insert(
-        SIM,
-        sims_sim::animator::Animator {
-            foreground: Some(foreground),
-            ..LOADED
-        },
-    );
+    playing_an_event(&mut fx, "lefthand", "3");
     fx.sim_mut().person.as_mut().unwrap().data[22] = 0;
     let fault = tick(&mut fx).unwrap_err().to_string();
     assert!(
@@ -2125,6 +2131,25 @@ fn a_refresh_whose_event_writes_a_hand_fails_at_the_take_off() {
         "{fault}"
     );
     assert_eq!(fx.sim().stack[0].node, 0, "the thread went no further");
+}
+
+#[test]
+fn a_refresh_whose_event_plays_a_sound_fails_at_the_take_off() {
+    // For a selected person, "selectedsound" plays (0x59158c, 0x59175e,
+    // 0x57a54c); the sounds of timed events are not modeled, so in the
+    // refresh any sound key fails. The tick alone passes over it.
+    for key in ["sound", "selectedsound", "deselectedsound", "footstep"] {
+        let mut fx = taking_itself_off(sleep());
+        playing_an_event(&mut fx, key, "x");
+        let fault = tick(&mut fx).unwrap_err().to_string();
+        assert!(
+            fault.contains("0x58da12") && fault.contains(&format!("{key:?}")),
+            "{fault}"
+        );
+        let mut alone = standing();
+        playing_an_event(&mut alone, key, "x");
+        tick(&mut alone).unwrap();
+    }
 }
 
 #[test]

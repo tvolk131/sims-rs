@@ -20,7 +20,9 @@
 //!   is picked (from the person's view, its selection, or the floor under
 //!   it, 0x432595, 0x45e50e, 0x58900f) and played through the sound
 //!   events (0x57a54c). Neither the pick nor the play is ported yet
-//!   ([`crate::sounds`]). None of 0x57a54c, 0x58900f,
+//!   ([`crate::sounds`]), except that in a person's animator refresh at
+//!   its taking itself off the lot such an event fails (`timed_event`).
+//!   None of 0x57a54c, 0x58900f,
 //!   0x432595 and 0x45e50e calls the C runtime's random function
 //!   (0x636c74) directly or through direct calls five deep; that nothing
 //!   else the simulation keeps changes is **unverified**. "sound" also
@@ -92,7 +94,14 @@ impl Interpreter<'_> {
                         .map(|e| (e.time, !e.properties.is_empty()))
                         .collect();
                     for due in layer.due(track, &times).map_err(Trap::Unsupported)? {
-                        timed_event(world, id, a, layer, &motion.events[due].properties)?;
+                        timed_event(
+                            world,
+                            id,
+                            a,
+                            layer,
+                            &motion.events[due].properties,
+                            self.take_off_refresh,
+                        )?;
                     }
                 }
             }
@@ -103,12 +112,21 @@ impl Interpreter<'_> {
 }
 
 /// One timed event's properties (0x5912fd; the module documentation).
+///
+/// In a person's animator refresh at its taking itself off the lot
+/// (`refresh`; `Interpreter::refresh_at_take_off`), a sound key fails: the
+/// refresh is made only if the house view drew the person, which is not
+/// kept, and the sound it would play (for a selected person
+/// "selectedsound" reaches 0x57a54c through 0x59158c and 0x59175e) is not
+/// one the animator's tick alone plays. When the original plays nothing
+/// there is not worked out.
 fn timed_event(
     world: &mut World,
     id: u16,
     a: &mut Animator,
     layer: &mut Layer,
     properties: &[(String, String)],
+    refresh: bool,
 ) -> Result<(), Trap> {
     for (key, value) in properties {
         let number = atoi(value);
@@ -124,6 +142,14 @@ fn timed_event(
             "lefthand" => LEFT_HAND,
             "righthand" => RIGHT_HAND,
             "censor" => CENSOR,
+            "sound" | "selectedsound" | "deselectedsound" | "footstep" if refresh => {
+                return Err(Trap::Unsupported(format!(
+                    "the clip {:?} has a timed event {key:?} (0x5912fd) due in person {id}'s \
+                     animator refresh at its taking itself off the lot (0x58da12), which plays \
+                     a sound only if the house view drew the person; that is not kept",
+                    layer.clip
+                )));
+            }
             "dress" | "undress" => {
                 return Err(Trap::Unsupported(format!(
                     "the clip {:?} has a timed event {key:?} (0x5912fd), which is not ported",

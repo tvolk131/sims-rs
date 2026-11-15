@@ -373,6 +373,11 @@ choosing a branch, both must agree. This is exactly what is checked:
    nothing but those two, judged on the state it would really have
    read. A running head countdown (word 45) fails here, and so does a
    timed event that writes a hand or the censor word to a new value.
+   The sound list does not hear the sounds of timed events, which are
+   not modeled. So a timed event due in the refresh with a sound key
+   ("sound", "selectedsound", "deselectedsound", "footstep") fails
+   too: for a selected person "selectedsound" plays (0x59158c, 0x59175e,
+   0x57a54c), and when the original plays nothing is not worked out.
    The lot goes on without the refresh.
 2. Until the animator's tick, the person's thread may run only Sleep,
    Expression, Set Motive Change, Set To Next, and Change Suit with
@@ -386,8 +391,8 @@ choosing a branch, both must agree. This is exactly what is checked:
    sounds, as the tick alone.
 
 What this does not cover: anything the refresh does that the port
-leaves out (the draw state, the face, the pose), and whatever the
-sound list does not record.
+leaves out (the draw state, the face, the pose). In the tick itself the
+sounds of timed events are still not modeled, in both branches.
 
 The tick alone is kept. A person carrying something (slot 1) fails
 (0x58dae5 redraws it), and so does a multi-tile person. The draw state

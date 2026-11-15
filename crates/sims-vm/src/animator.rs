@@ -273,11 +273,14 @@ impl Interpreter<'_> {
     /// as the take-off leaves it. It fails unless the refresh writes
     /// nothing but the person's animator and base layer and plays no
     /// sound, so that what runs before the person's animator tick sees
-    /// the same lot whether or not the original made it.
+    /// the same lot whether or not the original made it. The sounds of
+    /// timed events are not modeled, so a timed event with a sound key
+    /// fails here ([`crate::clip_events`]).
     pub(crate) fn refresh_at_take_off(&self, world: &World, id: u16) -> Result<Pending, Trap> {
         let sounds = RefCell::new(Vec::new());
         let apart = Interpreter {
             sounds: self.sounds.map(|_| &sounds),
+            take_off_refresh: true,
             ..*self
         };
         let mut refreshed = world.clone();
