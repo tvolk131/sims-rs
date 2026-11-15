@@ -2165,10 +2165,8 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   their career needs underlined and a line marking how much (from
   `work.iff`, through `Snapshot::with_careers`, which the game and the
   viewer call), as the original's ordinary job panel draws them
-  (0x5301ca). Its left column shows the career's icon and the level's
-  title, the salary, the performance and the family friends the next
-  level needs (0x530501). The Goths' panel is pinned by digest, gated
-  on `SIMS_INSTALL`; it is not yet compared with a screenshot.
+  (0x5301ca). The Goths' panel is pinned by digest, gated on
+  `SIMS_INSTALL`; it is not yet compared with a screenshot.
 - **Done: the relationship panel.** The Relationships button opens the
   people the selected Sim knows, five a page with arrows, each with the
   face for the lifetime relationship, the day's and the lifetime's
@@ -2183,8 +2181,9 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   Yes/No dialog checked
   against the original (the "Help System" one at tick 2) for the layout
   of several buttons; text entry dialogs; the sign's help balloon
-  (its compatible signs); the job panel's blinking performance and its
-  tooltips; the relationship panel's Superstar filter and which people the original
+  (its compatible signs); the job panel's left column (the career's icon and
+  title, the salary, the performance and the friends needed); the
+  relationship panel's Superstar filter and which people the original
   leaves out; the other live panels.
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
   - A command intake, for example `World::apply(&mut self, command:
