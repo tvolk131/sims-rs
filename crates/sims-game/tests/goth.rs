@@ -221,6 +221,40 @@ fn the_player_answers_the_help_dialog_from_the_window() {
 }
 
 #[test]
+fn the_plumb_bob_spins_by_the_time_passed_in() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    let before = game.render().rgb565();
+    assert!(!game.spin_due());
+    let standing = game.lot().world().hash();
+    // Short of a tick each time, so the lot stands still while half a
+    // second passes: a quarter turn of the bob (half a turn a second).
+    for _ in 0..12 {
+        game.pace.restart();
+        assert_eq!(game.advance(40_000), 0);
+    }
+    assert_eq!(game.lot().world().hash(), standing);
+    // No tick ran, but the bob is due a new frame, so the window draws.
+    assert!(game.spin_due());
+    let after = game.render().rgb565();
+    assert!(!game.spin_due());
+    let changed: Vec<usize> = (0..before.len())
+        .filter(|&i| before[i] != after[i])
+        .collect();
+    assert!(!changed.is_empty(), "the bob did not spin");
+    let xs = changed.iter().map(|i| i % 800);
+    let ys = changed.iter().map(|i| i / 800);
+    let (x0, x1) = (xs.clone().min().unwrap(), xs.max().unwrap());
+    let (y0, y1) = (ys.clone().min().unwrap(), ys.max().unwrap());
+    // A few pixels of the bob, over Mortimer's head, and nothing else.
+    assert!(x1 - x0 < 16 && y1 - y0 < 30, "x {x0}..={x1}, y {y0}..={y1}");
+}
+
+#[test]
 fn play_mode_runs_the_goths_past_the_hour() {
     let Some(install) = install() else {
         return;

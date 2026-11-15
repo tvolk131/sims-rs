@@ -179,6 +179,104 @@ and 336, below 354, so neither ticks again. In the snack order they are
 The old tests that pinned flag 0x4 and a mode-6 person as unported now
 pin what still fails.
 
+## 2026-11-15: The plumb bob is the original's mesh, coloured and lit as the original does
+
+The selected person's plumb bob is now drawn (`sims_people::bob`, from
+`People::draw`). Everything below was read from the original's code in
+a memory image, except where it says otherwise.
+
+- **What it is.** An ordinary object (`PlumbBob.iff`, GUID 0x2F726FFF)
+  in the person's head slot (their container slot 2), with no sprites.
+  Its object string 200 names the skeleton `root` and the suit
+  `head-arrow,ROOT=white`. The suit's mesh, `xskin-head-arrow-ROOT-ARROW`,
+  is in `Animation.far`, 2.1 units long on its z axis. No
+  `root-skeleton.cmx.bcf` or `white.bmp` exists, so we make a one-bone
+  skeleton and draw the mesh white.
+- **Where.** The head slot's redraw (0x58dbd8 to 0x58dc03) gives the
+  bob's graphic the `HEAD` bone's position times the person's
+  placement, without the bone's own turn. The draw (0x585dc5) sets the
+  root bone at (0, 3, 0), turned by the original's Euler routine
+  (0x5c4bb0, run in an emulator to fix its order) a quarter turn about
+  x and the spin about z. So the bob stands upright from three units
+  over the head and spins about its length.
+- **Spin.** The game's clock in milliseconds (0x6e54e0) × 0.001 × π, or
+  half a turn a second. We have no such clock, so the game window passes
+  the time it has run (`People::set_clock`, from `Game::advance`). That
+  time runs on while the lot is paused or a dialog waits; whether the
+  original's clock does is **unverified**. While a bob is on the lot,
+  the window draws a new frame every 50 ms even when no tick runs (our
+  choice; the original's frame rate is not ported).
+- **Colour.** The suit's name sets a mode (`head-arrow` 1,
+  `head-arrow-date` 2, `head-star` 3, 0x5856db to 0x58579f). In mode 1,
+  m is the mood (motive 3 cut to an integer) × 0.012, held to −1..1.
+  - From 0 up, r = b = 1 − m and g = 1, with b lowered a further
+    0.4 − m below 0.4.
+  - Below 0, r = 1 and g = b = 1 − m², with b lowered a further m + 0.4
+    above −0.4.
+  - So the bob runs red, pale yellow, green.
+- **Light.** The colour is a light of intensity 1, and the ambient light
+  is a quarter of the colour plus 0.05. The light's vector is the house
+  camera's unit vector from its eye to the centre (+0x184, set at
+  0x49b2aa), turned 80° about y and then 30° about x (0x6f6b38). That
+  turn is in the lot's terms, so the light falls from another side at
+  each rotation of the view.
+
+**Taken from the screenshot, not read.** In the original's screenshot
+(medium zoom, 7:38 AM, Mortimer reading on the porch bench), the bob is
+brightest on the viewer's left and lit on its lower half. That is what
+we get by taking the vector as pointing towards the light. Taken the
+other way, the left side is dark. With that choice our bob's green
+pixels span the original's box (x 427 to 434, y 74 to 97), each edge
+within a pixel, as a gated test checks; the pixels inside the box are
+not compared one by one.
+
+**Unverified.**
+- Which bone the slot names (its +0x20); `HEAD` puts the bob where the
+  screenshot has it.
+- Rotations other than 0.
+- The bob's pixels name the person who holds it, for a click; what the
+  original does on a click there was not checked.
+
+**Not ported.** Modes 2 and 3, the date and star bobs.
+
+## 2026-11-15: A split floor tile's grass keeps the blades of the tile drawn before it
+
+The grass's blade count is now worked out tile by tile in the order the
+original draws the tiles, and carried from one to the next, as the
+original keeps it in the grass object between tiles (0x49d0da to
+0x49d215). The tiles are drawn in runs along the view's diagonals, x + y
+rising, and x rising along each run (0x4ad4bd calling 0x4ad8ac). A tile:
+
+- with no floor counts its blades by its grass value, as before;
+- with a floor and no diagonal wall counts none (0x49d155) and keeps the
+  previous tile's short-blade flag;
+- with a floor split by a diagonal wall (wall byte 0 & 0x30) keeps the
+  count and the flag of the tile drawn before it, whatever its own grass
+  (0x49d14b);
+- off the lot's inner tiles (1 to size − 2 in x and y) returns before
+  any of this and leaves the count as it was (0x49cecc); it draws no
+  blades here, as before.
+
+So the floorless half of a split tile beside a porch shows flat grass,
+and beside a lawn a full lawn. Before, it counted by its own grass.
+
+**Checked.** Against the original at the tick-570 world: near zoom (the
+porch view, origin 619, −1189) rose from 86.5% to 87.0% exact; of the
+2,402 pixels the change touches, 2,115 now match exactly (3 did before),
+and the mean channel error there fell from 21.1 to 4.6. Medium zoom
+(cutaway): 82.7% to 82.8%; of 771 pixels changed, 715 match (none did),
+error 16.6 to 0.3. At far zoom only a few pixels change: 8 at rotation
+1, all now exact (none were), and 9 at rotation 2, which match neither
+way. Tile (27, 28) on the Goth
+porch is one: the tile drawn before it, (26, 29), has a floor, so its
+empty half is flat in both.
+
+**Not ported.** The original clips each run to the screen before drawing
+it, so a tile off screen is not drawn and does not pass its count on;
+here every tile is in the order. A split tile at the screen's edge could
+take a count from a different tile. The pool test (0x47c16d), which
+gives a tile in a pool none, is still not looked at.
+
 ## 2026-11-15: The relationship panel lists who the Sim knows
 
 The live panel's Relationships button now opens the selected Sim's
@@ -4549,9 +4647,9 @@ control panel in the bottom-left corner.
   One depth model for floors and ground would settle it.
 - Grass on a pool, which the original leaves bare. Pools are not looked
   at.
-- A floor tile split by a diagonal wall. The original keeps the blade
-  count of whichever tile it drew before; here it counts by its own
-  grass.
+- A floor tile split by a diagonal wall. Now ported; see "A split floor
+  tile's grass keeps the blades of the tile drawn before it"
+  (2026-11-15).
 - Seasons, which swap the blade-height tables (0x6c629c, 0x6c62a8).
 - A flag at 0x8d that blanks the colors of tiles on the lot's edge. It
   is off in this capture and not modelled.

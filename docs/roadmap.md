@@ -1853,6 +1853,13 @@ Progress:
   the Goths' people alone over their lot every 120 ticks at four
   rotations and checks that something hides them at times, that their
   feet show in most views, and that nobody is hidden throughout.
+- Done: the plumb bob (`sims_people::bob`) over the person whose head
+  slot holds it: the original's `head-arrow` mesh, three units over the
+  head bone, spinning half a turn a second by a clock the app gives
+  (`People::set_clock`), coloured by the person's mood and lit by the
+  original's own light for it. A gated test checks it covers the pixels
+  the original's does in a screenshot, within a pixel. The date and star
+  bobs are not drawn, and only rotation 0 was compared.
 - Next: compare a person behind furniture with the original; a person on
   an upper level stands at the floor, without the original's offset.
   Match the original's lighting (see its decisions entry); compare
@@ -1969,6 +1976,10 @@ Progress:
   tables (grass takes none in the original). Far zoom at rotation 2
   rose from 90.1% to 90.3% exact; of the pixels they change, 70% now
   match exactly and the rest are mostly a step off.
+- Done: a floor tile split by a diagonal wall takes the blade count of
+  the tile drawn before it, as the original carries it from tile to
+  tile. Near zoom rose from 86.5% to 87.0% exact; of the 2,402 pixels it
+  changes, 2,115 now match.
 - Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
   grass and a light sprite in the original); the
   edge-on texel offset and side; a screenshot with a marked edge-on
