@@ -1676,6 +1676,7 @@ dependencies = [
 name = "sims-ui"
 version = "0.1.0"
 dependencies = [
+ "libm",
  "sha2",
  "sims-content",
  "sims-formats",
