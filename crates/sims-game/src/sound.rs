@@ -46,6 +46,23 @@ pub fn speed_register(speed: Speed) -> i32 {
     }
 }
 
+/// The sound player's event for one of the simulation's. The
+/// simulation's object ID is 16 bits, as the script named it; it is
+/// widened without its sign, so -1 is 65535 (which the original passes is
+/// **unverified**).
+pub fn event(event: sims_vm::SoundEvent) -> SoundEvent {
+    let widen = |object: i16| u32::from(object as u16);
+    match event {
+        sims_vm::SoundEvent::Play { object, name } => SoundEvent::Play {
+            object: widen(object),
+            name,
+        },
+        sims_vm::SoundEvent::Stop { object } => SoundEvent::StopObject {
+            object: widen(object),
+        },
+    }
+}
+
 /// What the mixer is told between blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {

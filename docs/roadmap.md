@@ -2063,12 +2063,15 @@ through their public interfaces only; the simulation never depends on it.
   needs no audio library; `--mute` turns it off). A thread renders
   22,050 Hz stereo ahead of the device and the game never waits on it.
   The ambience follows the clock's hour (global 0), and the sound
-  scripts' speed register follows the game's speed. What plays waits on
-  the simulation's sound events.
+  scripts' speed register follows the game's speed.
+- **Done: the lot's sounds.** Each step's sound requests
+  (`Update::sounds`) go to the player as the window wakes: a door opens,
+  a book comes off the shelf, the fountain tinkles. `begin_route` and
+  `end_route` have no event in the install's sound files and play
+  nothing.
 - **Next:** pie menus and player orders, once the simulation's hooks
   land: a `Lot` API to queue an interaction (person, object, TTAB entry)
-  and read an object's pie-menu entries, and sound events drained each
-  tick.
+  and read an object's pie-menu entries.
 - **Needs from other crates:**
   - `sims-render`: which object drew each pixel (an object ID buffer
     beside the depth), so a click picks the object under it. Today

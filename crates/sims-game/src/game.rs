@@ -19,9 +19,10 @@ use crate::pick;
 use crate::view::{Move, View};
 use sims_render::{Canvas, Selected, Walls, open_house};
 use sims_ui::command::{Camera as UiCamera, Command, Walls as UiWalls};
+use sims_vm::SoundEvent;
 use sims_vm::boot::{Frames, Lot, StepError};
 use sims_vm::play::{Recovery, ScriptError};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 /// The room word of an object in no room.
@@ -37,6 +38,10 @@ const LOGGED: usize = 256;
 /// The most different errors remembered, to show each once. Errors
 /// after that are only counted.
 const SEEN: usize = 4096;
+
+/// The most sound requests kept for the host to take; the oldest go
+/// first. A host that plays sound takes them every wake.
+const SOUNDS_KEPT: usize = 4096;
 
 /// What the game is started with.
 #[derive(Debug, Clone)]
@@ -85,6 +90,8 @@ pub struct Game {
     /// Why the lot stopped, once it has.
     stopped: Option<String>,
     errors: Errors,
+    /// The steps' sound requests, in order, until the host takes them.
+    sounds: VecDeque<SoundEvent>,
     /// A short message about the last press, until the next one.
     note: Option<String>,
     canvas: Canvas,
@@ -120,6 +127,7 @@ impl Game {
             play: options.play,
             stopped,
             errors: Errors::default(),
+            sounds: VecDeque::new(),
             note: None,
             canvas: Canvas::new(1, 1, [0, 0, 0]),
         })
@@ -147,6 +155,12 @@ impl Game {
     /// caught.
     pub fn errors(&self) -> &[String] {
         &self.errors.lines
+    }
+
+    /// The sound requests of the steps run since the last call, in
+    /// order, for the sound system ([`crate::sound::event`]).
+    pub fn take_sounds(&mut self) -> Vec<SoundEvent> {
+        self.sounds.drain(..).collect()
     }
 
     /// How many errors play mode caught.
@@ -182,6 +196,9 @@ impl Game {
                     for line in in_order(at == 1, &update.errors, &update.frame_errors) {
                         self.errors.push(at, line);
                     }
+                    self.sounds.extend(update.sounds);
+                    let over = self.sounds.len().saturating_sub(SOUNDS_KEPT);
+                    self.sounds.drain(..over);
                 }
                 Err(error) => self.stop(&error),
             }

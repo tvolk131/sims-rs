@@ -4,6 +4,20 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: The game plays the lot's sound requests as it wakes
+
+`sims-game` takes each step's `Update::sounds` and hands them, in
+order, to `sims-audio`'s player the next time the window wakes (every
+few milliseconds), so a sound starts within a wake of its tick. `Play`
+is `Play` and `Stop` is `StopObject`. The simulation's 16-bit object ID
+is widened without its sign (**unverified**: what the original passes
+for a negative ID). Until the host takes them, the game keeps at most
+4096 requests, dropping the oldest, so a host that never plays sound
+does not grow without end. `begin_route` and `end_route`, which Go To
+Routing Slot requests, find no event in the install's sound files; the
+player records a fault and plays nothing, which may be what the
+original does too (**unverified**).
+
 ## 2026-11-15: The game can run the lot in play mode; strict stays the default
 
 `sims-game` steps the lot with `Lot::step` by default, which stops at

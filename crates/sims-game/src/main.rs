@@ -34,7 +34,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use sims_game::game::goth_house;
-use sims_game::sound::Input;
+use sims_game::sound::{self, Input};
 use sims_game::view::Move;
 use sims_game::{Game, Options};
 use sims_render::{Walls, png};
@@ -260,6 +260,12 @@ impl App {
         let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         let ran = self.game.advance(micros);
         let mut redraw = ran > 0;
+        let sounds = self.game.take_sounds();
+        if !sounds.is_empty() {
+            self.sound.send(Input::Events(
+                sounds.into_iter().map(sound::event).collect(),
+            ));
+        }
         for error in &self.game.errors()[self.printed..] {
             eprintln!("sims-game: error caught: {error}");
         }
@@ -470,6 +476,10 @@ fn run() -> Result<(), String> {
         );
         for error in game.errors() {
             eprintln!("sims-game: error caught: {error}");
+        }
+        let sounds = game.take_sounds();
+        if !sounds.is_empty() {
+            eprintln!("sims-game: {} sound requests, not played", sounds.len());
         }
         if let Some(stop) = game.stopped() {
             eprintln!("sims-game: {stop}");
