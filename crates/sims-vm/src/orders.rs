@@ -231,7 +231,7 @@ impl Machine<'_, '_> {
     /// of `target`'s table (0x41f00e), before its check, and whether the
     /// entry runs at once. None when the table has no entry with that
     /// number.
-    fn menu_action(
+    pub(crate) fn menu_action(
         &self,
         person: u16,
         target: u16,

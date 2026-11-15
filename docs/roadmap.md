@@ -68,9 +68,28 @@ events, and what it asks for after them) come first.
   the snack order's). Step 2 continues from there.
 - Of the base neighborhood's houses only the Goths' and the Newbies'
   (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
+  tick 1802; a route that gives up on a slot it may end near runs the
+  Route failure feedback tree (tick 1473). Against the recording of the
+  house (updates 0 to 935), every update's random streams, scheduler
+  cursor, action serial, globals and objects, and each object's data,
+  temps, attributes, frames and person data match, except the words the
+  original left from memory it never set (person word 37, locals on half
+  a pointer) and global 12 at updates 1 and 3 (the interface's tutorial
+  wait). At tick 1803 object 290 needs Create New Object Instance mode 6
+  with flag 0x4, which track 3 is porting for the Goths' snack order.
+
   tick 1472, with no recording to compare yet; at tick 1473 object 105
   gives up a route and needs the route-failure feedback tree (0x45af2a),
   which is not ported.
+- The Pleasants (`House06.iff` as the original saved it after moving
+  them in, with the Traveling Salesman on the lot) load to the state the
+  first tick starts from: the end of the household selection works out
+  again who is a visitor, and reading the people raises the action
+  serial. Their load equals the capture's but for one person's data word
+  50 and last result, which something in the original's load sets and
+  which is not found yet. The first frame then stops: person 242's head
+  follows person 241, whose animator has never been ticked or drawn, and
+  what the original reads for it is not ported.
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
   read their arrays whole (Arry 11, 12, 111 and 112). UserData2's
@@ -1998,10 +2017,19 @@ stop-sounds events.
   volume and pan from where its objects are on the screen (0x5730b6,
   0x57473b, 0x570e09), which the game sends with the answers, from its
   camera.
+- **Done: the music modes** (36). A change of mode starts and stops the
+  music tracks as the original's sound manager does (0x575170): the
+  buy, build and neighbourhood lists, the expansions', the credits', the
+  river loops and the slow fade into live mode. `play_trk` hands on the
+  caller's arguments and `source`, and `kill_trk` ends the whole track.
+  3 events of kinds not ported remain: the piano (43), and 103 and 104,
+  which are debug commands.
 - **Next:**
-  - The piano (43) and the music half of the music modes (36). 103 and
-    104 are debug commands. Placing the tracks again when the camera
-    moves (kind 33), once the game sends it only then.
+  - The piano (43).
+  - Placing the tracks again when the camera moves (kind 33), once the
+    game sends it only then.
+  - Tracks and fades step once a block (64 frames, about 2.9 ms); the
+    original's sound manager steps them once a millisecond (0x57cf37).
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)
@@ -2211,8 +2239,12 @@ through their public interfaces only; the simulation never depends on it.
   the funds go from $2,542 to $2,537 when Mortimer pays, the clock moves,
   and the hunger meter is his hunger. The pointer on a portrait shows
   that person's first name (catalog strings, `OBJD` word 41) in a box
-  over it; that box is ours (**unverified**). The original's action queue
-  in the top-left corner is not drawn yet.
+  over it; that box is ours (**unverified**).
+- **Done: the action queue.** The selected Sim's running and queued
+  actions show as icons in the top left, framed as the original frames
+  them, and a press cancels one (`Lot::cancel`, 0x45d5f8) with the
+  original's sound. Objects' catalog pictures are not made yet (a grey
+  square stands in), and the icons do not slide into place.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
     on Manage Inventory operation 4 and scope 12. A check tree's fault
