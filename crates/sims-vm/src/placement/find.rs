@@ -28,9 +28,8 @@
 //! Only what an ordinary object or a person on the ground needs is
 //! ported, and a group's own test ([`Interpreter::fits`] of a tile of a
 //! group, 0x422abb) as far as its tiles leave codes. A person whose person
-//! word 84 has bit 0, a place inside a person, an object that must stand against a wall (data
-//! word 13 nonzero) and two objects that are both not solid on the same
-//! tile fail loudly.
+//! word 84 has bit 0, a place inside a person and an object that must
+//! stand against a wall (data word 13 nonzero) fail loudly.
 
 use super::{FLAGS, FULL, GRIDS, data, datum, footprint, missing, registered, slot};
 use crate::fault::{Fault, Trap};
@@ -49,6 +48,40 @@ const WALL_CELL: usize = 14;
 /// the other object as the stack object (function 5).
 const ALLOW_OVERLAP: usize = 5;
 
+/// Definition word 69 (+0x8a), which two objects that are not solid on
+/// one tile compare (0x433ace): 2 in both or in neither lets them clash.
+const DEFINITION_KIND: usize = 0x8a / 2;
+
+/// The wall an object stands against, as a wall bit of its tile (1, 2, 4
+/// or 8), or 0 for none (0x4358c3): bit 0 of data word 13 is the side of
+/// bit 2, bit 2 of data word 13 the side of bit 8 (bit 0 first when both
+/// are set: data word 13 & 5 must be exactly 1 or 4), turned by the
+/// object's facing (data word 1) halved, toward zero: the turn table
+/// (0x6f4670, filled by 0x53ba5f) turns an edge bit one place up per turn,
+/// 8 becoming 1. A facing whose half is outside 0 to 3 would read past
+/// the table's four turns and fails.
+fn wall_side(world: &World, id: u16) -> Result<u16, Trap> {
+    let rules = datum(world, id, word::WALL_RULES)?;
+    let bit: u16 = match rules & 5 {
+        1 => 2,
+        4 => 8,
+        _ => return Ok(0),
+    };
+    let facing = datum(world, id, data::FACING)?;
+    if facing == 0 {
+        return Ok(bit);
+    }
+    let turn = facing / 2;
+    if !(0..4).contains(&turn) {
+        return Err(Trap::Unsupported(format!(
+            "object {id}'s facing {facing} turns its wall side past the table's four turns \
+             (0x4358f1)"
+        )));
+    }
+    let turn = turn as u32;
+    Ok(((bit << turn) | (bit >> (4 - turn))) & 15)
+}
+
 /// Why the place test refused a place: the placement error it leaves in
 /// global 0x6e4acc, as far as a caller tells the codes apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +96,10 @@ pub(crate) enum Refusal {
     /// Code 1: the place is off the lot (0x432a68), or a group's origin
     /// is (0x422adc).
     OffLot,
+    /// Code 0x16: on the object's own tile, another object that is not
+    /// solid either stands against the same wall (0x433b56). It leaves
+    /// 0x6e4ad0 as the caller set it.
+    SameWall,
     /// One of the other codes the steps of [`Interpreter::fits`] name.
     Other,
     /// A refusal whose code was not read from the original: the wall
@@ -1122,8 +1159,8 @@ impl Interpreter<'_> {
     ///   no data word 8 flag 0x10, or is not solid and has no flag 2.
     /// - Another object is in the way when both are solid. Otherwise, on
     ///   the object's own tile only, the two may not both have bit 0 of
-    ///   data word 63 (0xb); two objects that are both not solid go on to
-    ///   tests that are not ported.
+    ///   data word 63 (0xb), and two objects that are both not solid may
+    ///   not stand against the same wall ([`Self::tile_clash`], 0x16).
     ///
     /// One in the way collides unless either answers its callback 5 with
     /// true, asked with the other as the stack object, or their footprints
@@ -1218,12 +1255,12 @@ impl Interpreter<'_> {
                             return Ok(Some(Refusal::Collision(Some(other))));
                         }
                     }
-                } else if !itself
-                    && person.is_none()
-                    && index == 8
-                    && self.exclusive_clash(world, id, other, not_solid, exclusive)?
-                {
-                    return Ok(Some(Refusal::Collision(None)));
+                } else if !itself && person.is_none() && index == 8 {
+                    if let Some(refusal) =
+                        self.tile_clash(world, id, other, not_solid, exclusive)?
+                    {
+                        return Ok(Some(refusal));
+                    }
                 }
                 current = slot(world, other, 0).map_err(fail)?;
             }
@@ -1292,16 +1329,20 @@ impl Interpreter<'_> {
 
     /// The test of an object on the placed object's own tile when one of
     /// the two is not solid (0x433a7f): both with bit 0 of data word 63
-    /// clash. Two objects that are both not solid go on to a comparison of
-    /// their routing data (0x4358c3, 0x45728d), which is not ported.
-    fn exclusive_clash(
+    /// clash (0xb, [`Refusal::Collision`] with no object). Two objects
+    /// that are both not solid then clash (0x16, [`Refusal::SameWall`])
+    /// when they stand against the same wall ([`wall_side`], 0x4358c3,
+    /// not none) and the word 69 (+0x8a) of the definitions they stand
+    /// for ([`crate::Program::master_definition`], 0x45728d) is 2 in both
+    /// or in neither (0x433ab7 to 0x433b13).
+    fn tile_clash(
         &self,
         world: &World,
         id: u16,
         other: u16,
         not_solid: bool,
         exclusive: u16,
-    ) -> Result<bool, Fault> {
+    ) -> Result<Option<Refusal>, Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -1314,20 +1355,43 @@ impl Interpreter<'_> {
             .person
             .is_some()
         {
-            return Ok(false);
+            return Ok(None);
         }
         let theirs = datum(world, other, word::EXCLUSIVE).map_err(fail)? as u16;
         if theirs & exclusive & 1 != 0 {
-            return Ok(true);
+            return Ok(Some(Refusal::Collision(None)));
         }
         let other_not_solid = datum(world, other, word::FLAGS).map_err(fail)? as u16 & 4 != 0;
-        if not_solid && other_not_solid {
-            return Err(fail(Trap::Unsupported(format!(
-                "objects {id} and {other} are both not solid on one tile; the test that \
-                 follows (0x4358c3, 0x45728d) is not ported"
-            ))));
+        if !(not_solid && other_not_solid) {
+            return Ok(None);
         }
-        Ok(false)
+        let mine = wall_side(world, id).map_err(fail)?;
+        let their_side = wall_side(world, other).map_err(fail)?;
+        let kind = |object: u16| -> Result<bool, Fault> {
+            let guid = world
+                .objects
+                .get(&object)
+                .ok_or_else(|| fail(missing()))?
+                .guid;
+            let definition = self
+                .catalog
+                .object(guid)
+                .ok_or_else(|| fail(Trap::Invalid(format!("object {object} has no definition"))))?;
+            let words = self
+                .program
+                .master_definition(definition.resource, definition.chunk)
+                .map_err(|e| fail(Trap::Invalid(e)))?
+                .ok_or_else(|| {
+                    fail(Trap::Unsupported(format!(
+                        "object {object}'s group has no master definition in its file, and \
+                         the test of two objects that are not solid reads through a null \
+                         pointer (0x45728d, 0x433ac5)"
+                    )))
+                })?;
+            Ok(words[DEFINITION_KIND] == 2)
+        };
+        let same_kind = kind(id)? == kind(other)?;
+        Ok((same_kind && mine == their_side && mine != 0).then_some(Refusal::SameWall))
     }
 }
 

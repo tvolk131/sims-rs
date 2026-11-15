@@ -511,11 +511,9 @@ impl Program {
         };
         let mut table = words[7];
         if table == -1 {
-            table = library
-                .definition_order
-                .iter()
-                .filter_map(|id| library.definitions.get(id))
-                .find(|parent| words[10] != 0 && parent[10] == words[10] && parent[11] == -1)
+            table = (words[10] != 0)
+                .then(|| group_master(library, words))
+                .flatten()
                 .map_or(0, |parent| parent[7]);
         }
         if table <= 0 {
@@ -535,6 +533,29 @@ impl Program {
                 "TTAB #{id} for OBJD #{chunk} of resource {resource} has no reader"
             )),
         }
+    }
+
+    /// The definition an object's definition stands for (0x45728d, through
+    /// 0x43ae0a): itself when its word 10 (the group) is 0; otherwise the
+    /// first definition of its file, in the file's order, of the same
+    /// group whose word 11 is -1 (0x43adf7), the group's master. Ok(None)
+    /// is a tile whose group has no master, for which the original's
+    /// callers read through a null pointer.
+    pub fn master_definition(
+        &self,
+        resource: usize,
+        chunk: u16,
+    ) -> std::result::Result<Option<&[i16; DEFINITION_WORDS]>, String> {
+        let Some(library) = self.libraries.get(&resource) else {
+            return Err(format!("resource {resource} is not linked"));
+        };
+        let Some(words) = library.definitions.get(&chunk) else {
+            return Err(format!("resource {resource} has no OBJD #{chunk}"));
+        };
+        if words[10] == 0 {
+            return Ok(Some(words));
+        }
+        Ok(group_master(library, words))
     }
 
     /// How many objects an object definition's slots can hold: the kind 0
@@ -801,6 +822,20 @@ pub fn sprite_frames(iff: &Iff) -> Result<BTreeMap<u16, i32>> {
         frames.insert(chunk.id, if version >= 500 { count } else { 0 });
     }
     Ok(frames)
+}
+
+/// The master of a tile's group in its file (0x43ae0a): the first
+/// definition, in the file's order, of the same group (word 10) whose word
+/// 11 is -1 (0x43adf7).
+fn group_master<'a>(
+    library: &'a Library,
+    words: &[i16; DEFINITION_WORDS],
+) -> Option<&'a [i16; DEFINITION_WORDS]> {
+    library
+        .definition_order
+        .iter()
+        .filter_map(|id| library.definitions.get(id))
+        .find(|parent| parent[10] == words[10] && parent[11] == -1)
 }
 
 fn careers(index: &Index) -> Result<Option<Vec<Career>>> {
