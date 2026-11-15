@@ -481,8 +481,9 @@ impl Machine<'_, '_> {
     /// 0x41f158) and goes after every queued action of at least its
     /// priority. A full queue takes nothing. An action with flag 2 goes
     /// at the front instead ([`Machine::queue_at_front`]). One that goes
-    /// before queued actions (which are dropped, each object told with its
-    /// function 4) fails loudly.
+    /// before queued actions drops them, each target told with its
+    /// function 4 ([`Machine::drop_queued_from`]), and then goes at the
+    /// end as any other.
     ///
     /// An action queued, not at the front, on the person whose action runs
     /// at once, while it runs, is copied over the running action (0x45d5a5,
@@ -531,6 +532,14 @@ impl Machine<'_, '_> {
         if action.flags & TO_FRONT != 0 {
             return self.queue_at_front(id, action);
         }
+        let queue = &self.queue(id)?;
+        let mut at = queue.len();
+        while at > 0 && queue[at - 1].priority < action.priority {
+            at -= 1;
+        }
+        if at < queue.len() {
+            self.drop_queued_from(id, at)?;
+        }
         let queue = &mut self
             .world
             .objects
@@ -538,16 +547,6 @@ impl Machine<'_, '_> {
             .and_then(|o| o.person.as_mut())
             .ok_or(Trap::native(0x1c, "object is not a person"))?
             .queue;
-        let mut at = queue.len();
-        while at > 0 && queue[at - 1].priority < action.priority {
-            at -= 1;
-        }
-        if at < queue.len() {
-            return Err(unsupported(
-                "0x45d4c8",
-                "queueing an action before others, which are dropped",
-            ));
-        }
         // While the person's action runs at once, the new action is copied
         // over it, number and all, and is queued as well (0x45d5a5).
         if let Some(running) = self.running_at_once.filter(|r| r.person == id) {
@@ -564,6 +563,62 @@ impl Machine<'_, '_> {
         let uid = action.uid;
         queue.push(action);
         Ok(Some(uid))
+    }
+
+    /// The queue of person `id`.
+    fn queue(&self, id: u16) -> Result<&Vec<Interaction>, Trap> {
+        Ok(&self
+            .world
+            .objects
+            .get(&id)
+            .and_then(|o| o.person.as_ref())
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .queue)
+    }
+
+    /// Drops the queued actions of person `id` from place `kept` on, so
+    /// that a new action of a higher priority goes after the first `kept`
+    /// (0x45d4c8 to 0x45d5a0, in [`Machine::queue_action`]):
+    ///
+    /// 1. A queue of its own (0x45f71b) takes the first `kept` actions
+    ///    (0x45f744).
+    /// 2. From place `kept` to the end of the person's queue, its length
+    ///    read again at each place, each action's target (entry +8), when
+    ///    it names an object, is asked to run its function 4, the action
+    ///    cancelled, with the person as its stack object and no argument
+    ///    buffer (0x422d46).
+    /// 3. The person's queue is emptied and takes the kept actions back
+    ///    in order (0x45d54b to 0x45d58a).
+    ///
+    /// The original holds the target as a pointer; a target that names no
+    /// object here is taken as a null one and not asked.
+    fn drop_queued_from(&mut self, id: u16, kept: usize) -> Result<(), Trap> {
+        let saved: Vec<Interaction> = self.queue(id)?[..kept].to_vec();
+        let mut place = kept;
+        while let Some(action) = self.queue(id)?.get(place) {
+            let target = action.target;
+            if let Ok(target) = u16::try_from(target)
+                && target != 0
+                && self.world.objects.contains_key(&target)
+            {
+                self.interpreter()
+                    .callback(self.world, target, CANCELLED, id as i16)
+                    .map_err(|fault| {
+                        Trap::Unsupported(format!(
+                            "telling object {target} its queued action was dropped \
+                             (0x45d541): {fault}"
+                        ))
+                    })?;
+            }
+            place += 1;
+        }
+        self.world
+            .objects
+            .get_mut(&id)
+            .and_then(|o| o.person.as_mut())
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .queue = saved;
+        Ok(())
     }
 
     /// Puts an action, already numbered, at the front of a person's queue
