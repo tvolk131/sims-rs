@@ -73,6 +73,172 @@ light side, as level 1 gives. Our old light drew his shadow side at
 `Canvas::draw`, the offscreen renderer and the pie menu's head, keeps
 our own light, unchanged to the bit.
 
+## 2026-11-15: Drop is ported; a second order waits, and a press cancels either, in the window
+
+**Drop** (opcode 5, 0x454430, from the general table at 0x45246a) is
+ported from the original's code, as the inverse of Grab:
+1. The object in my first container slot (+0x130, its second record) is
+   looked up. Nothing there takes the false branch.
+2. The place is my position plus one tile's step in my facing (data
+   word 1; 0x42228a), on my level.
+3. The object's place test runs on the ground there (virtual function
+   0x54, no container). A refusal takes the false branch, and nothing
+   changes.
+4. The object is put there with the lot told (virtual function 0x58),
+   and the true branch is taken.
+
+- **Verified (Goth tests, play mode):**
+  - The snack order, cancelled at step 900 while Mortimer eats
+    (`a_cancelled_snack_is_put_down_in_front_of_the_eater`). His tree
+    0x0139 (node 14) drops the snack at step 1009. He stands at (296,
+    456) facing 6, and it goes to (296, 440). At step 1028 the
+    cancelled action ends, and he is free. No error is caught.
+  - Through the window
+    (`a_second_order_waits_behind_the_first_and_a_press_cancels_either`):
+    - The snack, then Water on plant 162: the water queues behind, its
+      icon second, at x 82.
+    - A press on the water's icon takes it off. The snack goes on to its
+      end at step 1136.
+    - A press on the snack's icon at step 899 (his sixth action, eating)
+      cancels it. With the water queued, the cancel queues nothing of
+      its own (0x45d7c0). He drops the snack at step 1009, and starts
+      the water at step 1028.
+  - A cancel at step 825, as he walks away from the fridge with the
+    snack, stops at the unported route stop below
+    (`a_snack_cancelled_on_the_way_to_the_chair_stops_at_the_unported_route_stop`,
+    a known gap pinned so it is not mistaken for fixed).
+- **A manual sweep, not a test:** the snack order cancelled at each
+  step from 150 to 1136 (every tenth step, then every step near each
+  edge), run 400 steps on. Cancels at steps 150 to 536, 543 to 590 and
+  821 to 829 stop at 0x45b3eb; all the rest catch no error. Too slow to
+  keep as a test (a full lot run per step).
+- **Unverified:** no capture covers a Drop or a cancel. Which tree runs
+  Drop and when is the scripts' own; only the primitive is ported.
+- **Not ported (track 4):** cancelling while Mortimer walks, to the
+  fridge or away from it with the snack, stops his thread at a route
+  whose animator is still under way (0x45b3eb). Sol's review found the
+  walk away (step 825), which the first sweep had missed by sampling
+  steps 760 and 830.
+
+## 2026-11-15: A snack ordered in the window is the scripted snack order
+
+In play mode, the window's order path is the one the original takes:
+the pointer reaching the fridge lists its pie (`Lot::pie_menu`, which
+runs the check trees), a press opens it, and a press on Have A Snack
+queues the action the listing offered (`Lot::pick`). The scripted snack
+order (sims-vm's `the_snack_order_pays_for_the_snack`) queues the same
+action by menu number (`Lot::queue_interaction`) without listing first.
+
+- **Verified (a Goth test, `the_snack_ordered_in_the_window_is_the_scripted_order`):**
+  the action queued at step 51 is the same, field for field. From step
+  150, when Mortimer takes the order, the two lots hash the same at
+  every step through step 1136, when the snack ends. Play mode catches no
+  error. Mortimer pays 5 at step 820. The test also checks that the
+  chosen entry carries the action the check trees listed (not the
+  fallback's menu number), and that the lots differ at every step
+  before 150, so it fails if the window skips the listing (from Sol's
+  review, which found the test passed with the fridge forced onto the
+  fallback menu).
+- **The difference before step 150:** the listing's check trees run as
+  Mortimer. They leave his last result and his saved stack frame's
+  words, and nothing else (compared field by field at step 51). His
+  first tree at step 150 rewrites both. The original lists the menu
+  when the pointer reaches an object (0x48c834), so the window's lot is
+  the more faithful of the two. Whether the original's listing leaves
+  the same words in Mortimer's frame is **unverified**: no capture
+  covers a listing.
+- The test finds the fridge on screen without moving the pointer, since
+  each new object the pointer reaches lists a menu and changes the lot.
+  A player's pointer that crossed other objects first would list their
+  menus too.
+
+## 2026-11-15: The piano plays where its object is, and a start sets a track's levels
+
+Kind 43 (`kPlayPiano`) is ported from the sound manager's case for it
+(0x573e5a). The event's own track is not used: the piano is track 1906
+(`Piano`, in `SimsGeneratedHitSource`), and nothing happens without it.
+
+- **The piano's start:** the object (the first argument) is placed as
+  one object with the piano's `Spl` (0x5730b6, as kinds 1 and 30 place
+  each of their objects), into the second and third arguments. When it
+  is not placed they keep the event's values. The piano then starts and
+  is let go (vtable +0x2c), as kind 1 starts a track.
+- **Its instances:** all of the piano's recorded objects are dropped
+  (0x581f8e on the map at +0xd4), and the track object's own object
+  (vtable +0x24, the field at +0xb0) is recorded. Only a fresh start of
+  a `kArgsIdVolPan` track sets that field (vtable +0x20, 0x57db2e). So
+  a start that lets a held piano go, or one refused at the thread
+  limit, leaves the object of the last fresh start, and before any it
+  is 0. The player now keeps that field for every track.
+- **The skill:** the object's source field 5 is asked for (0x570e61),
+  before track 1907 (`SetPianoSkill`) is looked up. When that track
+  exists it starts with the skill as its first argument. Its script
+  writes it into the piano's register 5.
+- **A start sets the track's levels** (0x57db01): a fresh start writes
+  `extvol` and `pan` from the arguments, as the track's `args` field
+  says: the first two for `kArgsVolPan` (the stations), the second and
+  third for `kArgsIdVolPan`. The player left them at their defaults.
+  Kinds 1 and 30 place the track after its start: an object that cannot
+  be placed still takes the sum's values (see the entry on placement),
+  so only a placement fault now leaves them the event's levels. `play_trk`
+  now hands a started `kArgsIdVolPan` track the caller's registers 2
+  and 3 as its levels. A held track let go by a start, and the idle
+  track kind 53 plays on, keep theirs, as in the original.
+- **Model limit:** the original has one piano track object, so a second
+  piano event restarts it; here it runs a second thread (as for every
+  track; see the entry on the sound player's model).
+- **Tests:** hand-built modules check:
+  - the placement, and the event's levels kept;
+  - the skill asked for, with and without its track, and its start;
+  - the instances replaced, also when the start lets a held piano go or
+    is refused at the thread limit;
+  - the levels a fresh start sets for `kArgsVolPan` and for a
+    `kArgsIdVolPan` track that `play_trk` starts. On the
+  install every event still runs without a bad instruction, and
+  `piano_play` now plays notes for ever.
+
+## 2026-11-15: The music modes start and stop the music tracks
+
+Kind 36's music half is ported from the sound manager's mode change
+(0x575170), so the game's modes now play their music. Its ambience half
+was already ported. The music half runs only when the mode changes,
+and only once the neighbourhood (mode 3) has been shown, as in the
+original. The ambience half runs on every kind 36 event, the same mode
+again included: after a stop, a second live (0) event starts the live
+ambience again though the music does not change.
+
+- **What each mode does** is listed on `Player::change_music`. Each
+  start is a track start as kind 1 makes it (vtable +0x2c), with the hit
+  list as the first argument; the scripts (`SetMainMusicSongAndHitList`,
+  `MainMusicLoop`, ...) do the rest.
+- **The expansions in** are a byte of the configuration
+  (`[0x6e48bc]+0x66`), which picks the credits' list and whether the
+  neighbourhood stops the Grim Reaper's loop. It is taken as every
+  expansion (0xff), as the station lists already are; the Complete
+  Collection has them all.
+- **`play_trk`** (0x57f1f2) now starts the track with the caller's own
+  argument registers (1 to 3), not zeros, and copies the caller's
+  `source` (register 47), read through the caller's `target` as any
+  register read is (vtable +0x88), into the new thread. `MainMusicLoop` reads the
+  list its starter was given this way.
+- **`kill_trk`** (0x57f284) now ends the whole track, whatever object
+  it plays for. It ended only the caller's object's threads, which was a
+  guess; the original finds one track object by number and kills it.
+- **Not ported:** the 100 ms `Sleep` the original's game thread takes
+  around most of these starts, which lets its sound thread run between
+  them. Here they happen at once, in order. What that changes is
+  **unverified**.
+- **Known difference:** the original's sound manager steps its tracks
+  and fades once a millisecond (0x57cf37); the player steps them once a
+  block (64 frames, about 2.9 ms). The slow fade into live mode is
+  therefore about three times slower here. This is left for its own
+  change.
+- **Tests:** a hand-built module checks each mode's starts and stops,
+  and `play_trk`'s and `kill_trk`'s. On the install, every event still
+  runs without a bad instruction. 5 more of them leave music or a river
+  playing, and the backyard's ambience test now also plays the
+  neighbourhood's music, which shares the player's random draws.
+
 ## 2026-11-15: A route that gives up near its slot runs the failure feedback tree
 
 Go To Routing Slot and Go To Relative Position share the route steps of
@@ -251,6 +417,7 @@ is the band's, even where a wrapped note covers an icon. A cancel that
 never reaches the simulation (the lot refuses it, or has stopped) leaves
 the icon to take another press. In the original a cancel cannot fail,
 and it has no such band.
+
 ## 2026-11-15: A sound's volume and pan come from where its objects are on the screen
 
 Kinds 1 (for a `kArgsIdVolPan` track) and 30 now set the track's
