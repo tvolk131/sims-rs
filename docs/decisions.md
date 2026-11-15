@@ -4,12 +4,15 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
-## 2026-11-15: Snap in mode 0 takes the routing slot's number from a local
+## 2026-11-15: Snap in mode 0 takes the routing slot's number from a parameter
 
 UserData2's house 9 stopped at tick 232 on Snap in mode 0. The original
-(0x454a4b) reads word 0 as the number of one of my frame's locals: from 0
-to the tree's count of locals (frame byte +7) less one, compared signed,
-or native error 8. The local's value is the slot's number, and from there
+(0x454a4b) reads word 0 as the number of one of my frame's parameters:
+from 0 to the frame's count of parameters (frame byte +7) less one,
+compared signed, or native error 8. It reads the value through 0x47518b,
+which is the start of the parameters (`lea eax, [ecx + 0x10]`); the
+locals start after them (0x47518f adds byte +7 words), so it is not a
+local. The parameter's value is the slot's number, and from there
 it is mode 3: the stack object's routing slot table (+0x13c), the same
 range check (native error 0x1b), the same placement (0x454ac5 on). The
 slot's own record and flags are looked up by that number too.

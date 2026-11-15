@@ -6,13 +6,13 @@
 //! names none).
 //!
 //! The modes (0x4549c7 on): 2 is the tile in front of the object, 1 the
-//! object itself, 0 the routing slot a local names, 3 the routing slot
+//! object itself, 0 the routing slot a parameter names, 3 the routing slot
 //! word 0 names, and 4 the lot's global routing slot word 0 names; any
 //! other is native error 0x24. Modes 0, 3 and 4 are ported, and share
 //! all but where the slot's number and table come from (all reach
-//! 0x454ac5). Mode 0 is mode 3 with the number read from the local word
-//! 0 names (0x454a4b), which must be one of my frame's locals (native
-//! error 8 otherwise):
+//! 0x454ac5). Mode 0 is mode 3 with the number read from the parameter
+//! word 0 names (0x454a4b), which must be one of my frame's parameters
+//! (frame byte +7 counts them; native error 8 otherwise):
 //!
 //! 1. The routing slot is the stack object's in mode 3 (its routing slot
 //!    table, object +0x13c, which holds only the SLOT entries of kind 3,
@@ -112,9 +112,9 @@ enum NotFit {
 /// The SLOT entry kind of a container slot.
 const CONTAINER: u16 = 0;
 
-/// The mode that names a routing slot of the stack object by the local
-/// word 0 names.
-const LOCAL: i16 = 0;
+/// The mode that names a routing slot of the stack object by the
+/// parameter word 0 names.
+const PARAMETER: i16 = 0;
 /// The mode that names a routing slot of the stack object by word 0.
 const SLOT: i16 = 3;
 /// The mode that names one of the lot's global routing slots by word 0.
@@ -213,16 +213,17 @@ impl Machine<'_, '_> {
             1 | 2 => {
                 return Err(unsupported("0x4549c7", &format!("in mode {mode}")));
             }
-            // 0x454a4b: word 0 names a local of my frame (0 to the tree's
-            // count of locals, frame byte +7, less one; native error 8
-            // otherwise), which holds the slot's number.
-            LOCAL => {
+            // 0x454a4b: word 0 names one of my frame's parameters (0 to
+            // its count of parameters, frame byte +7, less one; native
+            // error 8 otherwise; 0x47518b is the parameters' start), which
+            // holds the slot's number.
+            PARAMETER => {
                 let frame = self.frame()?;
                 let number = usize::try_from(word(operands, 0))
                     .ok()
-                    .and_then(|local| frame.locals.get(local))
+                    .and_then(|parameter| frame.parameters.get(parameter))
                     .copied()
-                    .ok_or(Trap::native(8, "Snap names no local"))?;
+                    .ok_or(Trap::native(8, "Snap names no parameter"))?;
                 (target, number)
             }
             SLOT => (target, word(operands, 0)),
