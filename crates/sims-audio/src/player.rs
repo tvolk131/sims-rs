@@ -20,7 +20,8 @@
 //!   shared by every thread (`SimSpeed` is 100). A new thread's `patch`
 //!   register (50) holds its track's patch. When the track's arguments
 //!   are `kArgsIdVolPan` (2, nearly every track), `arg1` holds the object
-//!   that started it: routines pass it to `getsrcdatafield`.
+//!   that started it: routines pass it to `getsrcdatafield`
+//!   ([`crate::sources`]).
 //! - *(code)* The registers in [`DEFAULTS`] start as the original's
 //!   default register bank holds them, then `vol` (18) and `duckpri` (25)
 //!   take the HOT track's volume and duck priority; every other starts
@@ -276,19 +277,20 @@ impl Samples for BTreeMap<String, Pcm> {
     }
 }
 
-/// What scripts may ask about the object that started them
-/// (`getsrcdatafield`). The simulation would answer through a read-only
-/// view; the field numbers' meanings are **unverified**.
+/// What scripts may ask about an object (`getsrcdatafield`): the
+/// answer for an object ID and a field, as both source registers hold
+/// them, or None for a field the original refuses (the destination then
+/// keeps its value). [`crate::sources`] has the original's answers.
 pub trait Sources {
-    fn field(&self, object: u32, source: i32, field: i32) -> i32;
+    fn field(&self, source: i32, field: i32) -> Option<i32>;
 }
 
 /// Answers 0 to everything.
 pub struct NoSources;
 
 impl Sources for NoSources {
-    fn field(&self, _: u32, _: i32, _: i32) -> i32 {
-        0
+    fn field(&self, _: i32, _: i32) -> Option<i32> {
+        Some(0)
     }
 }
 
@@ -1900,9 +1902,16 @@ impl<S: Samples> Player<S> {
                 Flow::Next
             }
             "getsrcdatafield" => {
+                // The original passes both registers' values (0x57f2e8)
+                // and logs a refused field, going on to the next
+                // instruction either way.
                 let (source, field) = (self.read(thread, arg(1)), self.read(thread, arg(2)));
-                let value = sources.field(thread.object, source, field);
-                self.write(thread, arg(0), value);
+                match sources.field(source, field) {
+                    Some(value) => self.write(thread, arg(0), value),
+                    None => {
+                        self.fault(thread, "Illegal source parameter request");
+                    }
+                }
                 Flow::Next
             }
             "waiteq" => wait_until(self, thread, |a, b| a == b),

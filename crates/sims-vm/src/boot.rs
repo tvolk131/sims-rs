@@ -319,7 +319,11 @@ impl Lot {
             // The lot the game holds before the load: empty, with the
             // neighborhood's people, the type attributes the neighborhood
             // saved and the two indicator objects.
-            world.read_neighbors(&neighborhood, person_types())?;
+            world.read_neighbors(
+                &neighborhood,
+                &sims_sim::neighbors::registry(&index, &catalog),
+            )?;
+            world.drop_empty_families()?;
             world.type_attributes = program.type_attributes(&catalog)?;
             if let Some(saved) = &neighborhood.type_attributes {
                 world.read_type_attributes(saved);

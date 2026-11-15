@@ -1623,6 +1623,7 @@ dependencies = [
  "cpal",
  "sims-audio",
  "sims-content",
+ "sims-core",
  "sims-formats",
  "sims-people",
  "sims-render",
