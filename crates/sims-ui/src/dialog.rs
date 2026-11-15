@@ -23,6 +23,7 @@ use sims_formats::bitmap::{self, Image};
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
 use sims_sim::{Dialog, World};
+use std::cell::Cell;
 
 /// The string table a private dialog's text comes from.
 pub const STRINGS: u16 = 301;
@@ -213,6 +214,8 @@ const ASPECT: f64 = 2.0;
 const CLOSE: f64 = 0.05f32 as f64;
 const STEP: i32 = 20;
 const TRIES: i32 = 10;
+/// The dialog's width before it is first laid out (0x524001).
+const FIRST_WIDTH: i32 = 300;
 /// The widest text tried. The original doubles without end until the
 /// dialog is wide enough; a text of many short lines never gets there.
 const WIDEST: i32 = 1 << 20;
@@ -308,9 +311,9 @@ impl Arranged {
 /// - The buttons are spread evenly across the text's width, an equal
 ///   gap before, between and after them, 18 under the text.
 ///
-/// A message too tall for the window loses lines from its end until the
-/// buttons are on screen, so the dialog can always be answered; how the
-/// original handles one is **unverified**.
+/// A dialog bigger than the window is narrowed to it and loses lines
+/// from its end until the buttons are on screen, so it can always be
+/// answered; how the original handles one is **unverified**.
 pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
     let (title_font, body) = (art.font(TITLE_FONT)?, art.font(BODY_FONT)?);
     let size = size.map(|n| n.clamp(0, 32768));
@@ -357,7 +360,10 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
         };
         [w + GAP, lines * line]
     });
-    let arrange = |width: i32| {
+    // The dialog's width as the last pass left it: the title is
+    // centered on it (0x5243b5). It is 300 before the first (0x524001).
+    let last_width = Cell::new(FIRST_WIDTH);
+    let arrange_within = |width: i32, least: i32| {
         let text_width = width.clamp(least, WIDEST);
         let text = text_box(body, &text, text_width, band);
         let buttons_top = text_top.saturating_add(text.height).saturating_add(GAP);
@@ -366,13 +372,16 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
         } else {
             buttons_top
         };
+        let size = [text_width + 2 * top, bottom.saturating_add(INSET)];
+        last_width.set(size[0]);
         Arranged {
             text_width,
             text,
             buttons: buttons_top,
-            size: [text_width + 2 * top, bottom.saturating_add(INSET)],
+            size,
         }
     };
+    let arrange = |width: i32| arrange_within(width, least);
 
     // The width search (0x523fe3). The text starts with no width.
     let first = arrange(0);
@@ -415,13 +424,23 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
         }
     }
     let off = |ratio: f32| (f64::from(ratio) - ASPECT).abs();
+    let mut before = last_width.get();
     let mut a = arrange(if off(wide_ratio) <= off(narrow_ratio) {
         wide
     } else {
         narrow
     });
 
-    // Lines cut from the end until the buttons fit the window.
+    // A dialog bigger than the window is narrowed to it, keeping only
+    // the buttons' least width, and loses lines from its end until the
+    // buttons are on screen. Neither is the original's: how it handles
+    // one is **unverified**.
+    let room = size[0] - 2 * top;
+    if a.size[0] > size[0] || a.size[1] > size[1] {
+        let floor = buttons * (BUTTON_SIZE[0] + BUTTON_ROOM);
+        a = arrange_within(a.text_width.min(room), floor.min(least));
+        before = a.size[0];
+    }
     let mut height = a.size[1];
     while height > size[1] && a.text.below.len() + a.text.beside.len() > 1 {
         if a.text.below.pop().is_none() {
@@ -436,7 +455,7 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
         (Some(title), Some(_)) => {
             top - PAD + icon_width + GAP + (a.text_width - band[0] - title) / 2
         }
-        (title, _) => (width - title.unwrap_or(0)) / 2,
+        (title, _) => (before - title.unwrap_or(0)) / 2,
     };
     let beside = a.text.beside.into_iter().enumerate().map(|(n, text)| {
         let y = text_top + line * n as i32;
@@ -612,15 +631,33 @@ mod tests {
     #[test]
     fn a_long_message_leaves_the_buttons_on_screen() {
         let art = art();
-        let text = "A\n".repeat(10_000);
-        for size in [[800, 600], [100, 50], [0, 0]] {
-            let layout = layout(size, &message(&text, 1), &art).unwrap();
-            let button = layout.buttons[0];
-            if size[1] >= 200 {
-                assert!(button.y + button.height <= size[1], "{size:?} {button:?}");
+        for text in ["A\n".repeat(60), "A\n".repeat(10_000)] {
+            for buttons in 1..=3 {
+                for size in [[800, 600], [100, 50], [0, 0]] {
+                    let layout = layout(size, &message(&text, buttons), &art).unwrap();
+                    assert!(!layout.lines.is_empty());
+                    if size[1] < 200 {
+                        continue;
+                    }
+                    // Narrowed to the window and cut to it, every button is
+                    // on screen.
+                    assert!(layout.rect.width <= size[0], "{:?}", layout.rect);
+                    for b in &layout.buttons {
+                        assert!(b.x >= 0 && b.x + b.width <= size[0], "{size:?} {b:?}");
+                        assert!(b.y >= 0 && b.y + b.height <= size[1], "{size:?} {b:?}");
+                    }
+                }
             }
-            assert!(!layout.lines.is_empty());
         }
+    }
+
+    #[test]
+    fn the_title_is_centered_on_the_last_passs_width() {
+        // With no icon the title is centered on the dialog's width as the
+        // search's last pass left it, not the width it ends at (0x5243b5).
+        let laid = layout([800, 600], &message("B", 1), &art()).unwrap();
+        assert_eq!(laid.title[0] - laid.rect.x, 106);
+        assert_eq!(laid.title[1] - laid.rect.y, 21);
     }
 
     #[test]

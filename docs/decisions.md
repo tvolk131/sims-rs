@@ -16,7 +16,10 @@ and button, and the same digest.
   identified.
   - The icon is at the top left.
   - The title is 21 down. With an icon it is centered by its box over
-    the text beside the icon; without one, across the dialog.
+    the text beside the icon. Without one it is centered across the
+    dialog as the search's last pass left it (0x5243b5), before the
+    final pass resizes it; the dialog is 300 wide before the first
+    pass (0x524001).
   - The text starts 18 under the title's line, or at the top without
     a title. The dialog is the text's width and 42 wide.
   - The buttons are 18 under the text and 21 from the bottom, spread
@@ -56,13 +59,16 @@ and button, and the same digest.
     for its label is not read);
   - the width of a leftover line, which the original measures with an
     extra the font keeps (0x60b7e2) that is taken as 0;
-  - a dialog taller than the window: ours cuts lines from the end so
-    the buttons stay on screen;
+  - a dialog bigger than the window: ours narrows it to the window
+    (down to the buttons' least width, whatever the title), then cuts
+    lines from the end so the buttons stay on screen, and centers the
+    title on the width it ends at;
   - a text so tall the doubling never reaches twice its height: the
     original would not stop; ours stops at 2^20 pixels.
 - **Tests:** the measured "Magic Town" layout and digest; the button
   rows of two and three; the band, the lines beside and under it, and
-  the line left over; the search's ratio.
+  the line left over; the search's ratio; the title's place without an
+  icon; every button on screen for a message too tall for the window.
 
 What would reopen it: a screenshot of the "Help System" dialog, or of
 any dialog with two or three buttons, that disagrees.
