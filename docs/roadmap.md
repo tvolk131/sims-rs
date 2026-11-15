@@ -1934,6 +1934,10 @@ Progress:
   rose from 85.2% to 86.1% exact and far zoom at rotation 2 from 89.9%
   to 90.1%. Pools on walls (the file's wall tables) are read in part,
   not ported.
+- Done: a floor tile split by a diagonal wall takes the blade count of
+  the tile drawn before it, as the original carries it from tile to
+  tile. Near zoom rose from 86.5% to 87.0% exact; of the 2,402 pixels it
+  changes, 2,115 now match.
 - Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
   grass and a light sprite in the original); lamp pools on walls; the
   edge-on texel offset and side; a screenshot with a marked edge-on
