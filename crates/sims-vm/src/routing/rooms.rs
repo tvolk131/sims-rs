@@ -2,6 +2,12 @@
 //! the room's border, the tiles a person of the room cannot stand on and
 //! the walls, then soft rectangles for the ground's covering.
 //!
+//! It is the same on both levels: the room's ID gives the level
+//! (0x468756), which picks the room map (0x481926) and the walls
+//! (0x4795c5, array 2 or 102), and the tile test (0x4821f3) looks at the
+//! objects on that level. The ground's covering counts only on level 1,
+//! and so does water (0x478f4a).
+//!
 //! The original keeps the result in the room (0x46795a) and works it out
 //! again only when the room changes. It is worked out on each use here:
 //! nothing ported changes walls, floors, tile flags or doors between two
@@ -148,21 +154,24 @@ impl Interpreter<'_> {
     /// The room's rectangles (0x4818af with terrain asked for), the hard
     /// ones first, each hard one grown by 7.
     pub(crate) fn room_rects(&self, world: &World, room: i16) -> Result<Vec<Region>, Trap> {
+        // The level indexes the lot's room maps and wall arrays (0x481926,
+        // 0x4795ea); the lot has two.
         let level = room_level(room);
-        if level != 1 {
-            return Err(Trap::Unsupported(
-                "routing in a room above the ground (0x4818af) is not ported".into(),
-            ));
+        if level > 2 {
+            return Err(Trap::Invalid(format!(
+                "room {room} is on level {level}, and the lot has two"
+            )));
         }
+        let floor = (level - 1) as usize;
         let size = usize::try_from(world.size)
             .ok()
             .filter(|s| (3..=FULL).contains(s))
             .ok_or_else(|| Trap::Invalid("the lot's size is out of range".into()))?;
-        let map = &world.rooms.map[0];
+        let map = &world.rooms.map[floor];
         if map.len() != FULL * FULL {
             return Err(Trap::Invalid("the lot has no room map".into()));
         }
-        let walls = array(world, WALLS[0], WALL_CELL)?;
+        let walls = array(world, WALLS[floor], WALL_CELL)?;
         let floors = array(world, FLOORS, 2)?;
         let flags = array(world, FLAGS, 1)?;
         let index = |x: usize, y: usize| x * FULL + y;
@@ -172,10 +181,11 @@ impl Interpreter<'_> {
             .get(&room)
             .ok_or_else(|| Trap::Invalid(format!("room {room} is not on the lot")))?
             .outdoors;
-        // 0x40745f: the lot's zoning; terrain counts on a residential lot.
+        // 0x4818e0: terrain counts only on the ground, outdoors, on a
+        // residential lot (the lot's zoning, 0x40745f).
         let lot = world.globals.get(LOT).copied().unwrap_or(0);
         let residential = lot == 0 || self.program.zoning.get(&lot) == Some(&1);
-        let terrain = residential && outdoors;
+        let terrain = level == 1 && residential && outdoors;
 
         let mut cache = vec![None; FULL * FULL];
         let mut available = |x: usize, y: usize| -> Result<bool, Trap> {
