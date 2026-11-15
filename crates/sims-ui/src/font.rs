@@ -260,7 +260,11 @@ impl Font {
                 if matches!(c, ' ' | '-') && measured <= width {
                     end = i;
                 }
-                measured = measured - glyph(c) + advance(c) + glyph(text[i]);
+                // The original's 32-bit sum wraps.
+                measured = measured
+                    .wrapping_sub(glyph(c))
+                    .wrapping_add(advance(c))
+                    .wrapping_add(glyph(text[i]));
                 if measured > width {
                     break;
                 }
@@ -447,5 +451,32 @@ pub(crate) mod tests {
         assert_eq!(lines("AA B", 1), ["AA ", "B"]);
         assert_eq!(lines("A\nB", 9), ["A", "B"]);
         assert!(lines("", 5).is_empty());
+    }
+
+    #[test]
+    fn a_line_measure_wraps_as_the_originals_does() {
+        // 255 wide and 382 to the next: about 5.6 million of them pass
+        // i32::MAX, where the original's sum wraps negative and keeps
+        // fitting.
+        let f = Font::new(ffn::Font {
+            flags: 9,
+            glyphs: vec![ffn::Glyph {
+                code: 65,
+                width: 255,
+                height: 1,
+                atlas_x: 0,
+                atlas_y: 0,
+                first_bearing: 0,
+                bearing_x: 127,
+                bearing_y: 0,
+            }],
+            width: 255,
+            height: 1,
+            coverage: vec![15; 255],
+        });
+        let n = usize::try_from(i32::MAX / 382).unwrap() + 10;
+        let lines = f.break_lines(&"A".repeat(n), i32::MAX);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), n);
     }
 }
