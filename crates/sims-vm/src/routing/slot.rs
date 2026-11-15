@@ -451,7 +451,7 @@ fn place_answer(
         Err(Refusal::Collision(Some(other))) => {
             (if is_person(other)? { 5 } else { 1 }, Some(other))
         }
-        Err(Refusal::OffLot | Refusal::Other) => (0, None),
+        Err(Refusal::OffLot | Refusal::Other | Refusal::SameWall) => (0, None),
         Err(Refusal::Unrecorded) => {
             return Err(unsupported(
                 "0x48158c",

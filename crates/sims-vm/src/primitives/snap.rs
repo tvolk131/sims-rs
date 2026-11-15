@@ -533,7 +533,7 @@ impl Machine<'_, '_> {
             NotFit::Refused(Refusal::Wall, collided) => (Some(7), collided),
             NotFit::Refused(Refusal::Collision(_), collided) => (Some(11), collided),
             // A code other than 1, 7 and 11, which Snap does not test.
-            NotFit::Refused(Refusal::Other, collided) => (None, collided),
+            NotFit::Refused(Refusal::Other | Refusal::SameWall, collided) => (None, collided),
             NotFit::Refused(Refusal::Unrecorded, _) => {
                 return Err(unsupported(
                     "0x454e66",
