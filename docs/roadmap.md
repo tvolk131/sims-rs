@@ -2095,12 +2095,19 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   agree to the pixel with two menus read from the running original
   (gated on `SIMS_INSTALL`); the drawn look is not yet compared with a
   screenshot. The host keeps a `pie::Pie` and renders the head.
+- **Done: the personality panel.** The Personality button opens the
+  selected Sim's five trait bars (Neat, Outgoing, Active, Playful,
+  Nice) in the subpanel, laid out as the original's bar maker does
+  (0x51df31). The Goths' panel is pinned by digest, gated on
+  `SIMS_INSTALL`; it is not yet compared with a screenshot, and the
+  zodiac sign under the bars is not drawn.
 - **Next:** open houses through `sims_vm::boot::Lot` (which now runs the
   household load) in the tests and the viewer, in place of their
   stand-in for steps 17 and 18; a screenshot of an open pie menu; a
   Yes/No dialog checked
   against the original (the "Help System" one at tick 2) for the layout
-  of several buttons; text entry dialogs; the other live panels.
+  of several buttons; text entry dialogs; the personality panel's
+  zodiac sign; the job and relationship panels; the other live panels.
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
   - A command intake, for example `World::apply(&mut self, command:
     sims_sim::Command) -> Result<(), CommandError>`, run between ticks,
