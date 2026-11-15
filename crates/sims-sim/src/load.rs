@@ -5,11 +5,11 @@
 //! lists every step of the original's lot load in order; the ones that run
 //! scripts live in `sims-vm`.
 
-use crate::{FULL_SIZE, MagicHistory, World};
+use crate::{FULL_SIZE, MagicHistory, Object, World};
 use serde::{Deserialize, Serialize};
 use sims_formats::lot::{Array, SurfaceMapping};
 use sims_formats::tatt::Tatt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What the running game, rather than the house file, supplies to a lot
 /// load.
@@ -180,6 +180,38 @@ fn renumbered(id: u16, wall: bool) -> bool {
 
 /// The global that holds the budget mode. Funds change only while it is 0.
 const BUDGET_MODE: usize = 32;
+/// Person data word 32 (+0x5cc): whether the person is a visitor.
+const VISITOR: usize = 32;
+/// Person data word 61 (+0x606): the person's family.
+const FAMILY: usize = 61;
+/// Person data word 67 (+0x612), which the household selection compares
+/// with the house number.
+const HOME: usize = 67;
+
+/// What the end of the household selection reads besides the lot. See
+/// [`World::finish_selection`].
+#[derive(Debug, Clone, Copy)]
+pub struct Household<'a> {
+    /// The house number the selection was given (0x428265, stored at
+    /// +0x164 of the neighborhood).
+    pub house: i32,
+    /// The selected family record's flags (+0x138).
+    pub flags: u32,
+    /// The GUIDs of the family's members (+0x12c).
+    pub members: &'a [u32],
+    /// The GUIDs of the types registered from the neighborhood's
+    /// `Characters` folder (kind 1: bits 2 and 3 of the type record's
+    /// +0xb4 hold 1, 0x43bd19).
+    pub characters: &'a BTreeSet<u32>,
+    /// The people who were residents before the family was selected: see
+    /// [`World::residents`].
+    pub residents: &'a BTreeSet<u16>,
+    /// The neighborhood's zoning by house number. The lot is residential
+    /// when global 10, as it stands when the step runs, is 0 or a house
+    /// zoned 1 (0x40745f, 0x42b9e3). An object's Load or Init tree may
+    /// have changed global 10 since the house was chosen.
+    pub zoning: &'a BTreeMap<i16, i32>,
+}
 
 /// The ground level's object grid: for each tile, the ID of the first
 /// object standing on it, or 0. Each object names the next one on its tile
@@ -713,53 +745,76 @@ impl World {
         Ok(())
     }
 
-    /// Load step 15: what the household selection (0x428041) does once
-    /// every object has been visited, for a lot it has nothing to do on.
-    /// It changes nothing. The original, in this order:
+    /// The people on the lot whose visitor word (person data word 32) is
+    /// 0: the household selection notes them before the family is
+    /// selected and the objects are visited (0x42821a), and
+    /// [`World::finish_selection`] reads the note.
+    pub fn residents(&self) -> BTreeSet<u16> {
+        self.people
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.objects
+                    .get(id)
+                    .and_then(|o| o.person.as_ref())
+                    .is_some_and(|p| p.data.get(VISITOR).copied().unwrap_or(0) == 0)
+            })
+            .collect()
+    }
+
+    /// Load step 15: the end of the household selection (0x428041, from
+    /// 0x4283cf), once every object has been visited. In this order:
     ///
-    /// 1. Deletes each person that belongs to no family and is on another
-    ///    lot's list (person data words 61 and 67).
-    /// 2. In some game modes, creates a controller object (GUID
-    ///    0xC3249A1D) if global 26 is not 0.
-    /// 3. If the family's record asks for it (flag 4), resets the budget,
-    ///    the statistics, the globals and the lot.
-    /// 4. Works out again which people are visitors (0x42a2b4).
-    /// 5. Deletes each person that lived here before the visits and is
-    ///    now a visitor (person data word 32).
-    /// 6. Updates the lot's lighting (0x4c4648), which is not modeled.
+    /// 1. Each person whose type is a neighborhood character (registered
+    ///    from the neighborhood's `Characters` folder, the folder of kind
+    ///    1, 0x43c228), who belongs to no family (person data word 61)
+    ///    and whose word 67 is not this house, is deleted (0x4283e1).
+    /// 2. In some game modes a controller object (GUID 0xC3249A1D) is
+    ///    created if global 26 is not 0 (0x42842e).
+    /// 3. If the family's record asks for it (flag 4), the budget, the
+    ///    statistics, the globals and the lot are reset (0x42848d).
+    /// 4. Who is a visitor is worked out again (0x42a2b4): each person's
+    ///    word 32 becomes 0 if its type is one of the family's members
+    ///    (0x41019b), and otherwise stays as it was, or 1 if it was 0; on
+    ///    a lot not zoned residential (0x40745f, read from global 10 now)
+    ///    a 0 becomes 1 too.
+    /// 5. Each neighborhood character who was a resident before (in
+    ///    `household.residents`, see [`World::residents`]) and is now a
+    ///    visitor is deleted (0x428550). The original then checks the
+    ///    person's family number for a range that no number is in (below
+    ///    3000 and from 3010 on, 0x428598), so that check deletes no one.
+    /// 6. The lot's lighting is updated (0x4c4648), which is not modeled.
     ///
-    /// None of 1 to 5 is ported. This fails if any could do something:
-    /// a person whose family (word 61) is not the selected one, or whose
-    /// visitor word (32) is set; global 26 not 0; or `family_flags` with
-    /// flag 4. `family_flags` is the selected family record's flags.
-    ///
-    /// The order and the conditions are the old prototype's
-    /// (legacy/crates/sims-vm/src/load_completion.rs), which compared
-    /// them with the original's code run alone. In a trace of the
-    /// original loading the Goth house nothing compared changes between
-    /// the return of step 13 and the return of the lighting update: no
-    /// object, global, random stream, array, queue or room mark. The
-    /// rule for step 4 is not known beyond that; a household whose
-    /// people are all its own members is taken to have no visitors.
-    pub fn finish_selection(&self, family_flags: u32) -> Result<(), LoadError> {
+    /// Step 4 is ported. A deletion in steps 1 and 5, step 2 when global
+    /// 26 is set and step 3 when flag 4 is set are not: they fail before
+    /// anything is written.
+    pub fn finish_selection(&mut self, household: &Household<'_>) -> Result<(), LoadError> {
         self.context_applied()?;
-        let family = self.globals[9];
-        for (&id, object) in &self.objects {
-            let Some(person) = &object.person else {
-                continue;
-            };
-            let word = |index: usize| person.data.get(index).copied().unwrap_or(0);
-            if word(61) != family {
+        let character = |object: &Object| household.characters.contains(&object.guid);
+        let word = |object: &Object, index: usize| {
+            object
+                .person
+                .as_ref()
+                .and_then(|p| p.data.get(index).copied())
+                .unwrap_or(0)
+        };
+        let people: Vec<u16> = self
+            .people
+            .iter()
+            .copied()
+            .filter(|id| self.objects.get(id).is_some_and(|o| o.person.is_some()))
+            .collect();
+        for id in &people {
+            let object = &self.objects[id];
+            if character(object)
+                && word(object, FAMILY) == 0
+                && i32::from(word(object, HOME)) != household.house
+            {
                 return Err(LoadError::Selection(format!(
-                    "person {id} is of family {}, not the selected family {family}; a person \
-                     of another family on the lot may be a visitor or be deleted",
-                    word(61)
-                )));
-            }
-            if word(32) != 0 {
-                return Err(LoadError::Selection(format!(
-                    "person {id} is a visitor (person data word 32); a member of the \
-                     household who is a visitor is deleted"
+                    "person {id}, a neighborhood character of no family whose word 67 is {}, \
+                     not house {}, is deleted (0x42841a)",
+                    word(object, HOME),
+                    household.house
                 )));
             }
         }
@@ -768,10 +823,43 @@ impl World {
                 "global 26 is set; the load then may create a controller object".into(),
             ));
         }
-        if family_flags & 4 != 0 {
+        if household.flags & 4 != 0 {
             return Err(LoadError::Selection(
                 "the family's record asks for the lot to be reset (flag 4)".into(),
             ));
+        }
+        let lot = self.globals[10];
+        let residential = lot == 0 || household.zoning.get(&lot) == Some(&1);
+        let mut visitors = BTreeMap::new();
+        for id in &people {
+            let object = &self.objects[id];
+            let mut visitor = word(object, VISITOR);
+            if visitor == 0 {
+                visitor = 1;
+            }
+            if household.members.contains(&object.guid) {
+                visitor = 0;
+            }
+            if !residential && visitor == 0 {
+                visitor = 1;
+            }
+            if character(object) && household.residents.contains(id) && visitor != 0 {
+                return Err(LoadError::Selection(format!(
+                    "person {id}, a neighborhood character who lived here, is now a visitor and \
+                     is deleted (0x4285e2)"
+                )));
+            }
+            visitors.insert(*id, visitor);
+        }
+        for (id, visitor) in visitors {
+            if let Some(data) = self
+                .objects
+                .get_mut(&id)
+                .and_then(|o| o.person.as_mut())
+                .and_then(|p| p.data.get_mut(VISITOR))
+            {
+                *data = visitor;
+            }
         }
         Ok(())
     }

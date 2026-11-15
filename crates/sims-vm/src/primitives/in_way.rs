@@ -702,7 +702,11 @@ impl Machine<'_, '_> {
     ///
     /// When the action is the person's running one, the original instead
     /// lowers its priority and may queue the person's own interaction 0x21;
-    /// that fails loudly. So does a function 4 that changes the queue.
+    /// that fails loudly here. So does a function 4 that changes the queue.
+    /// The player's cancel ([`Interpreter::cancel`]) uses this for a queued
+    /// action and ports the running one's branch itself.
+    ///
+    /// [`Interpreter::cancel`]: crate::Interpreter::cancel
     pub(crate) fn release_action(&mut self, id: u16, uid: i32) -> Result<bool, Trap> {
         let person = self
             .world

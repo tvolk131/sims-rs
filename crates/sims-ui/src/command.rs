@@ -93,6 +93,12 @@ pub enum Command {
         object: u16,
         interaction: u16,
     },
+    /// Cancel `sim`'s action numbered `action`, from its icon in the
+    /// queue ([`crate::queue`]).
+    CancelAction {
+        sim: u16,
+        action: i32,
+    },
     /// Show or hide the control panel's strip (presentation only).
     TogglePanel,
     /// Open a live-mode panel (presentation only).
@@ -113,6 +119,7 @@ impl Command {
                 | Self::SetMode(_)
                 | Self::AnswerDialog { .. }
                 | Self::ChooseInteraction { .. }
+                | Self::CancelAction { .. }
         )
     }
 }
