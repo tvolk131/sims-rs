@@ -177,6 +177,25 @@ impl Interpreter<'_> {
         machine.pie_menu(object).map_err(|trap| machine.fault(trap))
     }
 
+    /// Checks again, for `person`, the action of the pie menu's entry the
+    /// pointer has reached, as the original does when the pointer reaches
+    /// an entry (0x48df28). Returns the action with the flags the check
+    /// left. The check runs the entry's check tree on the lot, as
+    /// autonomy's check does, and is not undone but for the person's
+    /// temps.
+    pub fn highlight(
+        &self,
+        world: &mut World,
+        person: u16,
+        mut action: Interaction,
+    ) -> Result<Interaction, Fault> {
+        let mut machine = self.machine(world, person, 0, false);
+        machine
+            .highlight(&mut action)
+            .map_err(|trap| machine.fault(trap))?;
+        Ok(action)
+    }
+
     /// Queues on `person` the action of an entry [`Self::pie_menu`]
     /// offered, unchanged,
     /// as picking it does (0x48dd67, 0x45d20b). Returns the action's

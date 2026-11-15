@@ -51,6 +51,12 @@ events, and what it asks for after them) come first.
 ### Progress
 
 - Step 1 is done.
+- Step 4: the first player-order recording (track 2's goth-snack
+  scenario) replayed through the window's input layer equals the
+  original's state after every update to 453, once a press lists the
+  menu again and reaching an entry checks it again. From update 454 the
+  snack's simulation differs (the Room motive, then Mortimer's data
+  word 50): see the decisions log.
 - The integration hooks are merged: play mode (#120), player orders
   (#121), sound events (#122), Idle For Input starting a queued action
   (#131), the pie menu and picking from it (#132), and Go To Routing
@@ -1857,6 +1863,12 @@ Progress:
   the Goths' people alone over their lot every 120 ticks at four
   rotations and checks that something hides them at times, that their
   feet show in most views, and that nobody is hidden throughout.
+- Done: people are lit by the original's standard light at their room's
+  level (`Lighting::standard`, `sims_people::lot::level`): a person in
+  full light is drawn at full light all over, as the original draws
+  Mortimer on the porch in a screenshot, and one in a dim room shows the
+  side towards the light, which stays behind the viewer as the view
+  turns. Room lamps, the level's fade and the night cap are not ported.
 - Done: the plumb bob (`sims_people::bob`) over the person whose head
   slot holds it: the original's `head-arrow` mesh, three units over the
   head bone, spinning half a turn a second by a clock the app gives
@@ -2121,11 +2133,7 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   5 pixels, and the button except for its white label under the pointer.
   The frame's corners are close but not exact. "Magic Town" is pinned by
   layout and digest, gated on `SIMS_INSTALL`. `sims-viewer --hud` shows a
-  waiting dialog, and its answer is printed. The layout is the
-  original's, read from the exe: the width searched for a dialog twice
-  as wide as tall, the text beside and under the icon, and two or three
-  buttons spread evenly across the text; it gives the measured "Magic
-  Town" exactly.
+  waiting dialog, and its answer is printed.
 - **Done: the pie menu.** `sims_ui::pie` lays out, hit-tests and draws
   the menu and groups an object's actions into submenus, ported from the
   original's menu window and object picker. The window and label boxes
@@ -2138,16 +2146,27 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   (0x51df31). The Goths' panel is pinned by digest, gated on
   `SIMS_INSTALL`; it is not yet compared with a screenshot. The sign of
   the zodiac shows at the panel's bottom left: the one saved in the
-  person's data, or else the one nearest their traits (0x4841fc).
+  person's data, or else the one nearest their traits (0x4841fc). In
+  the window, the
+  personality, needs, job and relationship panels show the selected
+  Sim's live person data, motives, skills and relationship rows, and
+  follow a press on another portrait; the needs are also checked to
+  follow the ticks (`sims-game` tests
+  `the_personality_panel_shows_the_selected_goths_traits`,
+  `the_needs_panel_follows_the_selected_goths_motives`,
+  `the_job_panel_shows_the_selected_sims_skills`, in house 7, whose
+  Sims have skills,
+  `the_relationship_panel_lists_who_the_selected_goth_knows`). The
+  game's panel reads the relationships, while that panel is open, with
+  the tuning's friendship threshold, and loads the faces of everyone in
+  the neighborhood's records.
 - **Done: the job panel's skills.** The Job button opens the selected
   Sim's six skill bars, with the labels of what the next level of
   their career needs underlined and a line marking how much (from
   `work.iff`, through `Snapshot::with_careers`, which the game and the
   viewer call), as the original's ordinary job panel draws them
-  (0x5301ca). Its left column shows the career's icon and the level's
-  title, the salary, the performance and the family friends the next
-  level needs (0x530501). The Goths' panel is pinned by digest, gated
-  on `SIMS_INSTALL`; it is not yet compared with a screenshot.
+  (0x5301ca). The Goths' panel is pinned by digest, gated on
+  `SIMS_INSTALL`; it is not yet compared with a screenshot.
 - **Done: the relationship panel.** The Relationships button opens the
   people the selected Sim knows, five a page with arrows, each with the
   face for the lifetime relationship, the day's and the lifetime's
@@ -2159,10 +2178,12 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
 - **Next:** open houses through `sims_vm::boot::Lot` (which now runs the
   household load) in the tests and the viewer, in place of their
   stand-in for steps 17 and 18; a screenshot of an open pie menu; a
-  screenshot of the "Help System" dialog (tick 2) to check two buttons
-  against; text entry dialogs; the sign's help balloon
-  (its compatible signs); the job panel's blinking performance and its
-  tooltips; the relationship panel's Superstar filter and which people the original
+  Yes/No dialog checked
+  against the original (the "Help System" one at tick 2) for the layout
+  of several buttons; text entry dialogs; the sign's help balloon
+  (its compatible signs); the job panel's left column (the career's icon and
+  title, the salary, the performance and the friends needed); the
+  relationship panel's Superstar filter and which people the original
   leaves out; the other live panels.
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
   - A command intake, for example `World::apply(&mut self, command:
@@ -2275,13 +2296,19 @@ through their public interfaces only; the simulation never depends on it.
   speed (`0x442f9b`, presumably everyone away or asleep), it runs at
   1000 and keeps the speed to go back to in global 18. It goes back once
   someone holds it. The window follows: 1 ms a tick at 1000.
-- **Done in play mode: selecting a Sim.** A press on a portrait selects
-  that Sim (0x445449, between ticks): the Sim selected before is
-  deselected, the indicators move, and the panel and the pie menus
-  follow the new Sim. Deselecting refreshes the old Sim's animator
-  (0x58da12), which is not ported, so in strict mode (`Lot::select`)
-  switching Sims fails and changes nothing; play mode
-  (`Lot::select_play`) leaves the refresh out.
+- **Done: selecting a Sim.** A press on a portrait selects that Sim
+  (0x4cf9c4, 0x445449, between ticks), in strict mode as in play mode:
+  the Sim selected before is deselected and its animator refreshed at
+  the tick count (0x58da12 with 0, now ported), the indicators move,
+  and the panel, the queue and the pie menus follow the new Sim. A
+  second press on the selected Sim's portrait centres the view on her
+  (0x434ced; the original's slide is left out). Both play `UI_click`.
+  A Goth test switches to another Goth through the window and orders
+  her a snack from the fridge's pie: she takes it 52 ticks later, and
+  strict mode runs to tick 454. At tick 455 Mortimer, left to himself,
+  routes to a door one of his routes goes through (0x45b176), which is
+  not ported. No recording compares a switch yet; track 2 is asked for
+  one.
 - Done: a click picks what the frame shows at the pixel
   (`Canvas::id_at`, `sims_game::pick`): the person shown there or
   nearest within two pixels, else the object shown there. A tile of a
@@ -2307,8 +2334,9 @@ through their public interfaces only; the simulation never depends on it.
 - **Done: the action queue.** The selected Sim's running and queued
   actions show as icons in the top left, framed as the original frames
   them, and a press cancels one (`Lot::cancel`, 0x45d5f8) with the
-  original's sound. Objects' catalog pictures are not made yet (a grey
-  square stands in), and the icons do not slide into place.
+  original's sound. An object's icon shows its type's catalog picture,
+  from the thumbnail its file ships; the original's render of a missing
+  thumbnail (0x4e57a6) is not ported. The icons do not slide into place.
 - **Done in play mode: a second order, and cancelling either.** Through
   the window, the snack from the fridge's pie and then Water from a
   plant's: the water waits behind the snack, its icon second. A press on
