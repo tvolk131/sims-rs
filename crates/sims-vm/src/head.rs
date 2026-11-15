@@ -160,6 +160,7 @@ impl Interpreter<'_> {
             return Ok(());
         };
         let target = word(person_data(world, id)?, TARGET);
+        let mut at_itself = false;
         if target != 0 {
             let found = u16::try_from(target)
                 .ok()
@@ -176,13 +177,21 @@ impl Interpreter<'_> {
                         // (0x454f5c, with height 0).
                         a.head.target = Some(world_point(object.position));
                     } else if t == id {
-                        return Err(Trap::Unsupported(format!(
-                            "person {id} looks at itself (0x59293d on its own animator, with \
-                             its head turned): not ported"
-                        )));
+                        if world.removals.contains(&id) {
+                            return Err(Trap::Unsupported(format!(
+                                "person {id}, queued for removal, looks at itself: its \
+                                 animator's refresh as it left the lot (0x58da12) is not kept"
+                            )));
+                        }
+                        // 0x59293d with 1 on its own animator: the matrix
+                        // of its +0x144 anchor as the step left the skin,
+                        // its head turned (0x59640d reads the same words
+                        // of 0x59638f's matrix as the measurement below).
+                        at_itself = true;
                     }
                     let level = World::tile(object.position)[2];
                     if object.person.is_some()
+                        && !at_itself
                         && let Some(point) = self.top_of(world, t)?
                     {
                         a.head.target = Some(point);
@@ -203,6 +212,11 @@ impl Interpreter<'_> {
         let bones = self.posed(world, id, a, &[top.0, front.0], turned)?;
         let model = self.model(world, id, a)?;
         let at = head::anchor_point(bones[top.0], top.1, &model);
+        if at_itself {
+            // The target is the point the heading is measured from, so
+            // the target's heading (from a difference of 0 and 0) stays.
+            a.head.target = Some(at);
+        }
         let ahead = head::anchor_point(bones[front.0], front.1, &model);
         if let Some(heading) = head::heading(
             head::difference(ahead[0], at[0]),

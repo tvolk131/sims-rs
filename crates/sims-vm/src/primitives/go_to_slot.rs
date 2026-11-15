@@ -487,7 +487,10 @@ impl Machine<'_, '_> {
                     if self.person_word(NO_ROOM)? & 1 != 1
                         && self.room(ctx.target)? != self.room(me)?
                     {
-                        // 0x45b140: to another room, through a door.
+                        // 0x45b140: to another room, through a door; but
+                        // a route to a door one of the person's routes
+                        // goes through (context +0x68) fails (0x45b176).
+                        state = PORTAL;
                         if interpreter.kind(self.world, ctx.target)? == DOOR {
                             let routes = &self.world.routing.routes[&me];
                             if routes
@@ -495,13 +498,9 @@ impl Machine<'_, '_> {
                                 .iter()
                                 .any(|c| c.word_68 == i32::from(ctx.target))
                             {
-                                return Err(unsupported(
-                                    "0x45b176",
-                                    "to a door one of its routes goes through",
-                                ));
+                                state = FAILED;
                             }
                         }
-                        state = PORTAL;
                         continue;
                     }
                     // 0x45b18b: a person who wants to be interrupted, and
