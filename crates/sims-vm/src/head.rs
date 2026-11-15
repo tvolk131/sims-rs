@@ -25,12 +25,10 @@
 //! 1. With person word 41 not 0, the object it names is looked up
 //!    (0x40743b). One that is missing clears word 41 and sets word 42 to
 //!    0x10. For a person, the target becomes the point on top of its head
-//!    (0x59293d with 1, its +0x144 anchor). For any other object (its
-//!    type, +0x118 +0x12, not 2) the target is its position in world
-//!    units at height 0 (0x59058f: 0x454f5c on +0xf4 and +0xf8, our
-//!    second and first coordinates, with level 0.0): the first
-//!    coordinate 3/16 of its second, the third 3/16 of its first, each
-//!    rounded to single precision ([`to_world_units`]). Then a target on another level than the person (object +0x110)
+//!    (0x59293d with 1, its +0x144 anchor). For any other object the
+//!    target is its position in world units, at height 0 (0x59058f,
+//!    0x454f5c).
+//!    Then a target on another level than the person (object +0x110)
 //!    clears word 41 and sets word 42 to 0x10.
 //! 2. The head's heading: from the point on top of the head to the point
 //!    100 units in front of it ([`sims_sim::head::heading`]).
@@ -167,21 +165,20 @@ impl Interpreter<'_> {
                     set(data, HEAD_MODE, 0x10)?;
                 }
                 Some((t, object)) => {
-                    let level = World::tile(object.position)[2];
                     if object.person.is_none() {
-                        // 0x59058f to 0x5905d0.
-                        let [first, second, _] = object.position;
-                        a.head.target = Some([
-                            to_world_units(Ext::from_i32(second)).to_f32(),
-                            F32::ZERO,
-                            to_world_units(Ext::from_i32(first)).to_f32(),
-                        ]);
+                        // 0x59058f: the object's position in world units
+                        // (0x454f5c, with height 0).
+                        a.head.target = Some(world_point(object.position));
                     } else if t == id {
                         return Err(Trap::Unsupported(format!(
                             "person {id} looks at itself (0x59293d on its own animator, with \
                              its head turned): not ported"
                         )));
-                    } else if let Some(point) = self.top_of(world, t)? {
+                    }
+                    let level = World::tile(object.position)[2];
+                    if object.person.is_some()
+                        && let Some(point) = self.top_of(world, t)?
+                    {
                         a.head.target = Some(point);
                     }
                     let own = world
@@ -587,4 +584,15 @@ impl Interpreter<'_> {
 struct Rig {
     top: Option<Bound>,
     front: Option<Bound>,
+}
+
+/// A position in the lot as a point in world units (0x454f5c): the first
+/// coordinate (+0xf8) and the second (+0xf4) times 3/16, each stored as a
+/// float, with the height between them 0 (0x454f29 of 0, times 3).
+fn world_point(position: [i32; 3]) -> [F32; 3] {
+    [
+        to_world_units(Ext::from_i32(position[0])).to_f32(),
+        F32::from_bits(0),
+        to_world_units(Ext::from_i32(position[1])).to_f32(),
+    ]
 }
