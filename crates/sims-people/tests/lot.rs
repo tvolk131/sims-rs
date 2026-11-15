@@ -7,7 +7,7 @@ use sims_people::lot::NEAR_PIXELS_PER_UNIT;
 use sims_people::raster::Target;
 use sims_people::raster::{Camera, Canvas};
 use sims_people::{
-    Assets, Body, Cast, Library, People, Player, base_clip, placement, residents_of,
+    Assets, Body, Cast, Library, People, Player, View, base_clip, placement, residents_of,
 };
 use sims_render::{Camera as LotCamera, Walls, Zoom};
 use sims_sim::World;
@@ -313,4 +313,132 @@ fn the_people_of_a_running_lot_are_drawn_in_the_lot_renderers_view() {
             .iter()
             .all(|(id, _)| *id != first)
     );
+}
+
+/// How many pixels of `canvas` differ from `base`, within `area` (left,
+/// top, right, bottom; all of it when None).
+fn changed(
+    base: &sims_render::Canvas,
+    canvas: &sims_render::Canvas,
+    area: Option<[i32; 4]>,
+) -> usize {
+    let [l, t, r, b] = area.unwrap_or([0, 0, base.width as i32, base.height as i32]);
+    (t.max(0)..b.min(base.height as i32))
+        .flat_map(|y| (l.max(0)..r.min(base.width as i32)).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let i = y as usize * base.width + x as usize;
+            base.color[i] != canvas.color[i]
+        })
+        .count()
+}
+
+/// Drawn over the lot the lot renderer drew, people are hidden by what
+/// stands in front of them, and not by the floor or ground they stand
+/// on. Each person is drawn alone and compared with the same person laid
+/// over everything. The camera shows the ground level, where the Goths
+/// are, with the walls down; seen from upstairs, the upper floor hides
+/// everyone below it.
+#[test]
+fn the_lot_hides_the_people_behind_it() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut opened = sims_render::open_house(&root, &house).unwrap();
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    let mut people = People::open(&root, &house).unwrap();
+    // Per person and view: pixels shown and laid, of the whole body and
+    // of the feet.
+    let mut seen: Vec<(u16, [usize; 4])> = Vec::new();
+    while lot.ticks() < 600 {
+        if lot.ticks().is_multiple_of(120) {
+            let world = lot.world();
+            assert_eq!(people.update(world), Vec::<String>::new());
+            let shape = sims_render::Lot::from_world(world).unwrap();
+            let ids: Vec<u16> = world.animators.keys().copied().collect();
+            for rotation in 0..4 {
+                let mut camera = LotCamera {
+                    zoom: Zoom::Medium,
+                    rotation,
+                    level: 1,
+                    origin: [0, 0],
+                    walls: Walls::Down,
+                    focus: Default::default(),
+                };
+                camera.center_on(shape.built_center(), [400, 300]);
+                let view = View::new(&camera);
+                let mut base = sims_render::Canvas::new(800, 600, [0, 0, 0]);
+                sims_render::draw(world, &shape, &mut opened.assets, &camera, &mut base);
+                for &id in &ids {
+                    let mut solo = world.clone();
+                    solo.animators.retain(|&other, _| other == id);
+                    let (posed, _) = people.posed(&solo, camera.level);
+                    let Some(feet) = posed.first().map(|p| {
+                        let (fine, elevation) = view.place(p.root.translation);
+                        view.screen(fine, elevation, p.level).map(|v| v as i32)
+                    }) else {
+                        continue;
+                    };
+                    drop(posed);
+                    let mut on = base.clone();
+                    let report = people.draw_on_lot(&solo, &camera, &mut on);
+                    assert!(report.problems.is_empty(), "{:?}", report.problems);
+                    // Laid over everything: nearer than any depth there is.
+                    let mut over = base.clone();
+                    people.draw(&solo, &camera, &mut over, |_, _, _| -1.0e9);
+                    // The feet: a band a few pixels above the point the
+                    // person stands on.
+                    let [x, y] = feet;
+                    let band = Some([x - 16, y - 10, x + 16, y + 3]);
+                    let counts = [
+                        changed(&base, &on, None),
+                        changed(&base, &over, None),
+                        changed(&base, &on, band),
+                        changed(&base, &over, band),
+                    ];
+                    let [shown, laid, ..] = counts;
+                    assert!(
+                        shown <= laid,
+                        "tick {}, rotation {rotation}, person {id}: {shown} > {laid}",
+                        lot.ticks()
+                    );
+                    seen.push((id, counts));
+                }
+            }
+        }
+        match lot.step() {
+            Ok(_) => {}
+            Err(StepError::Tick { .. } | StepError::Frame { .. }) => break,
+            Err(e) => panic!("tick {}: {e}", lot.ticks() + 1),
+        }
+    }
+    // Something in front of someone hides them at times (in this run, a
+    // hedge, the porch railing, a bookcase, a bed's posts).
+    assert!(seen.iter().any(|(_, [shown, laid, ..])| shown < laid));
+    // Their feet show on the floor and grass they stand on, unless
+    // something stands in front of them: in most views, some of the feet
+    // are drawn. A floor or ground drawn nearer than the person would
+    // hide nearly all of them.
+    let feet: Vec<bool> = seen
+        .iter()
+        .filter(|(_, c)| c[3] > 0)
+        .map(|(_, c)| c[2] > 0)
+        .collect();
+    let shown = feet.iter().filter(|&&f| f).count();
+    assert!(
+        feet.len() >= 20 && shown * 4 >= feet.len() * 3,
+        "feet shown in {shown} of {} views",
+        feet.len()
+    );
+    // Nobody is hidden through the whole run.
+    let mut by_person: BTreeMap<u16, [usize; 2]> = BTreeMap::new();
+    for (id, [shown, laid, ..]) in &seen {
+        let total = by_person.entry(*id).or_default();
+        total[0] += shown;
+        total[1] += laid;
+    }
+    for (id, [shown, laid]) in by_person {
+        assert!(
+            shown * 4 >= laid,
+            "person {id}: {shown} of {laid} pixels shown"
+        );
+    }
 }
