@@ -19,7 +19,8 @@
 //! - "sound", "selectedsound", "deselectedsound" and "footstep": a sound
 //!   is picked (from the person's view, its selection, or the floor under
 //!   it, 0x432595, 0x45e50e, 0x58900f) and played through the sound
-//!   events (0x57a54c). Sound is not modeled. None of 0x57a54c, 0x58900f,
+//!   events (0x57a54c). Neither the pick nor the play is ported yet
+//!   ([`crate::sounds`]). None of 0x57a54c, 0x58900f,
 //!   0x432595 and 0x45e50e calls the C runtime's random function
 //!   (0x636c74) directly or through direct calls five deep; that nothing
 //!   else the simulation keeps changes is **unverified**. "sound" also

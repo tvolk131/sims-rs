@@ -46,6 +46,10 @@ pub struct Library {
     /// Each string table (STR#) by chunk ID: its entries in the first
     /// language, in order.
     pub strings: BTreeMap<u16, Vec<String>>,
+    /// The sound event each FWAV chunk names, by chunk ID: what Play
+    /// Sound Event plays (0x582c57). The name is the chunk's bytes up to
+    /// the first zero, read as Latin-1.
+    pub sounds: BTreeMap<u16, String>,
 }
 
 /// The string table Run Tree By Name instructions name their trees in.
@@ -197,6 +201,11 @@ impl Program {
                         library.tree_names.clone_from(&entries);
                     }
                     library.strings.insert(chunk.id, entries);
+                }
+                b"FWAV" => {
+                    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+                    let name = data[..end].iter().map(|&b| char::from(b)).collect();
+                    library.sounds.insert(chunk.id, name);
                 }
                 b"BCON" => {
                     let constants =
