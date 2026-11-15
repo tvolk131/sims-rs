@@ -45,17 +45,34 @@ disassembly; none of it is checked against a run.
     our cap of 20 ticks a call.
   - Message 0xc2, which the setter and the pause send to the interface,
     and its effect on the sounds, are not ported.
-- **Not ported:** on the household's home lot (`0x40745f`), the idle
-  loop sets a speed of 1000 for a while (`0x46d790`, keeping the speed
-  to go back to in global 18) whenever a check over the registry's
-  people (`0x442f9b`) fails. It goes back (`0x46d7db`) when the check
-  passes. What the check asks was not read in full. It reads people's
-  `+0x8e` and `+0x60e` and calls `0x45edc5`, which looks like asking
-  whether everyone is asleep or away. Whether it sets the speed during
-  the Goths' morning in the original was not checked, nor whether a
-  full day does.
-- Strict `sims boot` never calls any of these, so its output is
-  unchanged.
+- **Not ported, and failing loudly where it is seen:** the idle loop's
+  own speed.
+  - What it does: before its updates, on a residential lot (`0x40745f`:
+    zoning 1, `0x42b9e3`), the idle loop sets a speed of 1000 for a
+    while (`0x46d790`, keeping the speed to go back to in global 18).
+    It does so whenever none of the registry's people passes
+    `0x442f9b`, and goes back (`0x46d7db`) once one does.
+  - Who passes: a person whose object word `+0x8e` is 0, whose person
+    data word 65 (`+0x60e`) is at most 1, whose float at `+0x7b8` is not
+    below 0 (`0x45edc5`), and whose person data word 32 (`+0x5cc`) is 0,
+    meaning they live on the lot.
+  - What `+0x8e` and `+0x7b8` are was not found, and neither is kept.
+    The capture has `+0x8e` at 0 for every person. They presumably mark
+    a Sim who is away or asleep: the full Goth day will need this when
+    the household goes to work, to school or to bed.
+  - What fails: `Lot::step` checks before every tick, in strict and
+    play mode. When nobody passes on words 32 and 65 alone, the original
+    certainly runs at 1000, and the step fails, saying so. When someone
+    passes on those words, `+0x8e` or `+0x7b8` may still turn them all
+    away. That is **not** detected, and the lot goes on at the player's
+    speed where the original's globals 16 and 18 would differ.
+  - Whether the Goths' morning sets the speed in the original was not
+    checked. On our side the Goths always pass on words 32 and 65 through
+    tick 2881, so nothing that ran before fails now. An empty residential
+    lot now stops at its first tick for this reason, before anything
+    else.
+- Strict `sims boot` never calls the speed or pause hooks. The idle
+  loop's check never fails for the Goths, so the output is unchanged.
 
 ## 2026-11-15: The reload makes a record for each person type without one; UserData2 to 8 load
 
