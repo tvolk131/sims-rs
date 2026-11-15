@@ -80,6 +80,11 @@ const ENTRY_FLAG: u32 = 0x100;
 const TO_FRONT: u32 = 2;
 /// How many actions a person's queue holds (+0x820, 0x45f744).
 const QUEUE: usize = 8;
+/// The action flag that gives an action put at the front the running
+/// action's name (0x45d322), and the running action's flag that 0x41f167
+/// clears (0x41f1a4).
+const NAME_FROM_RUNNING: u32 = 0x40;
+const NAMED: u32 = 0x80;
 /// The function an object runs when an action on it is cancelled.
 const CANCELLED: usize = 4;
 
@@ -401,17 +406,18 @@ impl Machine<'_, '_> {
     ///
     /// The action takes the next number ([`sims_sim::World::action_serial`],
     /// 0x41f158) and goes after every queued action of at least its
-    /// priority. A full queue takes nothing. An action put at the front
-    /// (flag 2), and one that goes before queued actions (which are
-    /// dropped, each object told with its function 4) fail loudly.
+    /// priority. A full queue takes nothing. An action with flag 2 goes
+    /// at the front instead ([`Machine::queue_at_front`]). One that goes
+    /// before queued actions (which are dropped, each object told with its
+    /// function 4) fails loudly.
     ///
-    /// An action queued on the person whose action runs at once, while it
-    /// runs, is copied over the running action (0x45d5a5, 0x41edbf: every
-    /// field, its number and flags too), and is queued as well, or not when
-    /// the queue is full. With the new action's flag 0x40, the original
-    /// first gives it the running action's name (0x41f167, 0x41f1ae),
-    /// which sets its flag 0x80; the flag is set here, but the names of
-    /// queued actions are not kept.
+    /// An action queued, not at the front, on the person whose action runs
+    /// at once, while it runs, is copied over the running action (0x45d5a5,
+    /// 0x41edbf: every field, its number and flags too), and is queued as
+    /// well, or not when the queue is full. With the new action's flag
+    /// 0x40, the original first gives it the running action's name
+    /// (0x41f167, 0x41f1ae), which sets its flag 0x80; the flag is set
+    /// here, but the names of queued actions are not kept.
     ///
     /// An entry that runs at once is not queued (0x45d240):
     ///
@@ -450,10 +456,7 @@ impl Machine<'_, '_> {
         self.world.action_serial = self.world.action_serial.wrapping_add(1);
         action.uid = self.world.action_serial;
         if action.flags & TO_FRONT != 0 {
-            return Err(unsupported(
-                "0x45d322",
-                "queueing an action at the queue's front",
-            ));
+            return self.queue_at_front(id, action);
         }
         let queue = &mut self
             .world
@@ -487,6 +490,51 @@ impl Machine<'_, '_> {
         }
         let uid = action.uid;
         queue.push(action);
+        Ok(Some(uid))
+    }
+
+    /// Puts an action, already numbered, at the front of a person's queue
+    /// (0x45d322 to 0x45d47f; see [`Machine::queue_action`]) and returns
+    /// its number.
+    ///
+    /// 1. With action flag 0x40, the person's running action (+0xa48) has
+    ///    its flag 0x80 cleared, and the new action takes its name
+    ///    (0x41f167, 0x41f1ae), which sets the new action's flag 0x80. The queue keeps no names, so only the flag
+    ///    is ported; 0x41f167 makes the running action's name first if it
+    ///    has none, which changes nothing else.
+    /// 2. A queue of its own (0x45f71b) takes the new action, then the
+    ///    person's queued actions in order (0x45f744), and the person's
+    ///    queue is emptied and given that queue's actions in order.
+    /// 3. A full queue (eight actions) passes only its first seven, and
+    ///    only the first seven of the eight are given back (0x45d391 to
+    ///    0x45d3e4): the new action and the first six queued. The last two
+    ///    are dropped, with no object told.
+    ///
+    /// The action is always queued, and nothing here looks at an action
+    /// running at once (the branch to 0x45d5a5 is not taken).
+    fn queue_at_front(&mut self, id: u16, mut action: Interaction) -> Result<Option<i32>, Trap> {
+        let uid = action.uid;
+        let person = self
+            .world
+            .objects
+            .get_mut(&id)
+            .and_then(|o| o.person.as_mut())
+            .ok_or(Trap::native(0x1c, "object is not a person"))?;
+        if action.flags & NAME_FROM_RUNNING != 0 {
+            person.active.flags &= !NAMED;
+            // Taking the running action's name sets the new action's flag
+            // 0x80 (0x41f1ae, 0x41f1bd).
+            action.flags |= NAMED;
+        }
+        let kept = if person.queue.len() >= QUEUE {
+            QUEUE - 2
+        } else {
+            person.queue.len()
+        };
+        let mut queue = Vec::with_capacity(kept + 1);
+        queue.push(action);
+        queue.extend(person.queue.drain(..).take(kept));
+        person.queue = queue;
         Ok(Some(uid))
     }
 
