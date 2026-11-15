@@ -1136,63 +1136,122 @@ fn the_sound_scripts_see_the_goths_where_the_camera_shows_them() {
     assert!(medium.0 > far.0, "{medium:?} {far:?}");
 }
 
+/// Strict mode, through the window: a press on another Goth's portrait
+/// selects her (0x4cf9c4, 0x445449), refreshing Mortimer's animator as he
+/// is deselected (0x58da12 with 0), and plays `UI_click`. A second press
+/// on her portrait centres the view on her (0x434ced). An order from the
+/// fridge's pie then goes to her, not to him, and she takes it.
 #[test]
-fn a_press_on_a_portrait_selects_that_goth() {
+fn a_press_on_a_portrait_selects_that_goth_who_then_takes_the_order() {
     let Some(install) = install() else {
         return;
     };
-    // Play mode: in strict mode deselecting Mortimer fails on his
-    // animator's refresh, which the simulation has not ported.
-    let mut game = Game::open(&Options {
-        play: true,
-        ..options(install)
-    })
-    .expect("the Goth house opens");
-    assert_eq!(game.run(20), 20);
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(50), 50);
     game.resize([800, 600]);
     game.render();
-    let world = game.lot().world();
-    let mortimer = world.selected().expect("a Sim is selected");
-    // The household: the people who live on the lot (person word 32 is
-    // 0) and are of Mortimer's family (word 61).
-    let family = world.objects[&mortimer].person.as_ref().unwrap().data[61];
-    let household: Vec<&sims_sim::Object> = world
-        .people
-        .iter()
-        .map(|id| &world.objects[id])
-        .filter(|o| {
-            let data = &o.person.as_ref().unwrap().data;
-            data[32] == 0 && data[61] == family
-        })
-        .collect();
-    let other = household
-        .iter()
-        .find(|o| o.id != mortimer)
-        .expect("another Goth")
-        .id;
-    let members: Vec<u32> = household.iter().map(|o| o.guid).collect();
-    // Where the panel shows the other Goth's portrait.
-    let controls = sims_ui::hud::Controls {
-        expanded: true,
-        ..sims_ui::hud::Controls::default()
+    let mortimer = game.lot().world().selected().expect("a Sim is selected");
+    let portrait = |game: &Game, sim: u16| {
+        let r = game
+            .panel()
+            .iter()
+            .find(|item| item.command == Some(sims_ui::command::Command::Select { sim }))
+            .unwrap_or_else(|| panic!("person {sim}'s portrait"))
+            .rect;
+        [r.x + r.width / 2, r.y + r.height / 2]
     };
-    let snapshot = sims_ui::household::Snapshot::read(world, &members);
-    let portrait = sims_ui::hud::layout([800, 600], &snapshot, &controls)
-        .into_iter()
-        .find(|item| item.command == Some(sims_ui::command::Command::Select { sim: other }))
-        .expect("the other Goth's portrait")
-        .rect;
-    game.press([
-        portrait.x + portrait.width / 2,
-        portrait.y + portrait.height / 2,
-    ]);
-    assert_eq!(game.lot().world().selected(), Some(other));
-    assert_eq!(game.lot().world().globals[3], other as i16);
-    // The lot goes on with the new selection.
-    assert_eq!(game.run(50), 50);
-    assert_eq!(game.stopped(), None);
-    game.select(mortimer);
-    assert_eq!(game.lot().world().selected(), Some(mortimer));
+    let other = game
+        .panel()
+        .iter()
+        .find_map(|item| match item.command {
+            Some(sims_ui::command::Command::Select { sim }) if sim != mortimer => Some(sim),
+            _ => None,
+        })
+        .expect("another Goth's portrait");
+    let click = SoundEvent::Play {
+        object: -4,
+        name: "UI_click".into(),
+    };
+    game.take_sounds();
+    let camera = game.view.camera;
+    game.press(portrait(&game, other));
+    let world = game.lot().world();
+    assert_eq!(world.selected(), Some(other));
+    assert_eq!(world.globals[3], other as i16);
+    assert!(!world.objects[&mortimer].selected);
+    // His animator's clock was read again at the tick count.
+    let animator = &world.animators[&mortimer];
+    assert_eq!(animator.clock, animator.clock_at(world.ticks as i32));
+    assert_eq!(game.take_sounds().last(), Some(&click));
+    assert_eq!(
+        game.view.camera, camera,
+        "a first press does not move the view"
+    );
+    // The panel and the queue follow her.
+    game.render();
+    assert_eq!(game.queue().person, Some(other));
+    // A second press centres the view on her, a little above her feet,
+    // and changes nothing on the lot.
+    let hash = game.lot().world().hash();
+    game.press(portrait(&game, other));
+    assert_eq!(game.lot().world().hash(), hash);
+    assert_eq!(game.take_sounds(), [click]);
+    let camera = game.view.camera;
+    let position = game.lot().world().objects[&other].position;
+    assert_eq!(position[2], camera.level);
+    let at = sims_game::sound::object_point(&camera, position);
+    let rise = [19, 39, 78][camera.zoom.level() as usize - 1];
+    assert_eq!([at[0], at[1] - rise], [400, 300]);
+    // An order from the fridge's pie goes to her.
+    let fridge = 118;
+    let before = game.lot().world().objects[&mortimer]
+        .person
+        .as_ref()
+        .unwrap()
+        .queue
+        .len();
+    order(&mut game, fridge, "Have A Snack");
+    let queued = |game: &Game, sim: u16| {
+        let me = game.lot().world().objects[&sim].person.as_ref().unwrap();
+        std::iter::once(&me.active)
+            .chain(&me.queue)
+            .any(|action| action.target == fridge as i16 && action.caller == sim as i16)
+    };
+    assert!(queued(&game, other));
+    assert_eq!(
+        game.lot().world().objects[&mortimer]
+            .person
+            .as_ref()
+            .unwrap()
+            .queue
+            .len(),
+        before
+    );
+    // She takes it: it becomes her running action, in strict mode.
+    let mut taken = None;
+    for step in 0..400 {
+        assert_eq!(game.run(1), 1, "{:?}", game.stopped());
+        let me = game.lot().world().objects[&other].person.as_ref().unwrap();
+        if me.active.target == fridge as i16 {
+            taken = Some(step);
+            break;
+        }
+    }
+    assert!(taken.is_some(), "she never took the order");
+    // Strict mode runs on to tick 454. At tick 455 Mortimer (object 21),
+    // now left to himself, routes to a door one of his routes goes
+    // through (0x45b176), which the simulation has not ported; without
+    // the switch and the order the lot runs past it.
+    while game.lot().ticks() < 454 {
+        assert_eq!(game.run(1), 1, "{:?}", game.stopped());
+    }
+    assert_eq!(game.run(1), 0);
+    let stop = game.stopped().expect("the stop at tick 455");
+    assert_eq!(mortimer, 21);
+    assert!(
+        stop.contains("object 21") && stop.contains("0x45b176"),
+        "{stop}"
+    );
 }
 
 #[test]
@@ -1263,6 +1322,60 @@ fn the_job_panel_shows_what_the_next_level_needs() {
     data[57] = 2;
     data[18] = 200;
     assert_eq!(needs(&world), [0, 0, 100, 0, 300, 0]);
+}
+
+/// A press on the selected Sim's portrait centres the view on him even
+/// after the view has been scrolled further than 16 bits of screen hold:
+/// where the drawing puts him then is the middle of the screen, a little
+/// above his feet.
+#[test]
+fn a_press_on_the_selected_goths_portrait_centres_him_after_a_long_scroll() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(50), 50);
+    game.resize([800, 600]);
+    game.render();
+    let mortimer = game.lot().world().selected().expect("a Sim is selected");
+    let portrait = game
+        .panel()
+        .iter()
+        .find(|item| item.command == Some(sims_ui::command::Command::Select { sim: mortimer }))
+        .expect("his portrait")
+        .rect;
+    let press = [
+        portrait.x + portrait.width / 2,
+        portrait.y + portrait.height / 2,
+    ];
+    for scroll in [[40_000, 0], [-40_000, 50_000], [0, -60_000]] {
+        let origin = game.view.camera.origin;
+        game.view.apply(sims_game::view::Move::Scroll(scroll));
+        assert!(
+            game.view
+                .camera
+                .origin
+                .iter()
+                .zip(origin)
+                .any(|(n, o)| (n - o).abs() > 1 << 15),
+            "{:?}",
+            game.view.camera.origin
+        );
+        game.press(press);
+        let camera = game.view.camera;
+        let position = game.lot().world().objects[&mortimer].position;
+        let drawn = camera.project_fine(
+            camera.rotate_fine([position[0], position[1]]),
+            position[2],
+            0,
+        );
+        let rise = [19, 39, 78][camera.zoom.level() as usize - 1];
+        assert!(
+            (drawn[0] - 400).abs() <= 1 && (drawn[1] - rise - 300).abs() <= 1,
+            "{scroll:?}: drawn at {drawn:?}"
+        );
+    }
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
 
 /// Track 2's recording of the original (the goth-snack scenario) ordered

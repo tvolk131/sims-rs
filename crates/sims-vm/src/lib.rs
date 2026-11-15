@@ -79,7 +79,7 @@ pub use program::{
     Callback, Career, DEFINITION_WORDS, ICON_FILE, Library, Program, Tree, icon_frames,
     sprite_frames,
 };
-pub use selection::{Refresh, selected};
+pub use selection::selected;
 pub use sounds::SoundEvent;
 pub use tick::{Answers, Player, Shown, TICK_BUDGET, TickError, Update};
 pub use visits::Visited;
