@@ -35,6 +35,8 @@ pub const INTERFACE: i16 = -4;
 /// does not or is a pet's (0x4cb16e).
 pub const QUEUE_DELETE: &str = "UI_queue_delete";
 pub const ERROR: &str = "UI_error";
+/// A press on a portrait (0x4cfa51).
+pub const CLICK: &str = "UI_click";
 
 pub struct Hud {
     pub art: Art,
