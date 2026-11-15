@@ -25,7 +25,7 @@
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Stream};
-use crate::placement::{Refusal, capture, closed_directions, first_kept_on};
+use crate::placement::{Refusal, capture, closed_directions, first_kept_on, off_lot};
 use sims_core::{Ext, F32};
 use sims_formats::execution::Slot;
 use sims_sim::World;
@@ -400,18 +400,6 @@ enum Beside {
     Seat(u16),
 }
 
-/// Whether a point is off the lot's inner tiles (0x422632): either
-/// coordinate's tile, as a signed byte, below 1 or not below the lot's
-/// size less 1.
-fn off_lot(world: &World, point: [i32; 2]) -> bool {
-    let size = i32::from(world.size);
-    let ok = |c: i32| {
-        let n = i32::from((c >> 4) as i8);
-        n >= 1 && n < size - 1
-    };
-    !ok(point[0]) || !ok(point[1])
-}
-
 /// Whether a seat index's point (`at`, before turning, in the search's
 /// row and column units) lies inside the part of the search the row
 /// covers (0x4838e7): on the row's own tile row, from the row to `last`;
@@ -463,7 +451,7 @@ fn place_answer(
         Err(Refusal::Collision(Some(other))) => {
             (if is_person(other)? { 5 } else { 1 }, Some(other))
         }
-        Err(Refusal::Other) => (0, None),
+        Err(Refusal::OffLot | Refusal::Other) => (0, None),
         Err(Refusal::Unrecorded) => {
             return Err(unsupported(
                 "0x48158c",

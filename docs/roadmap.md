@@ -56,9 +56,12 @@ events, and what it asks for after them) come first.
   (#131), the pie menu and picking from it (#132), and Go To Routing
   Slot's parameter and global slots (#134), which a player's snack order
   reached.
-- Strict mode on the Goth house runs to tick 2702. At tick 2703 the
-  carpool (object 8) makes the school bus, and the factory for
-  multi-tile objects is not ported. Step 2 starts there.
+- Strict mode on the Goth house runs to tick 2881, 08:06 on the first
+  day. One tick is two game seconds, so a day is 43,200 ticks (measured
+  from the clock globals). The carpool makes the school bus at tick 2703
+  (the multi-tile factory is ported). At tick 2882 person 16's pose
+  without a foreground layer (0x5992b3) is not ported. Step 2 continues
+  from there.
 
 ## Met goal: a headless lot boot that matches the original
 
@@ -2008,9 +2011,16 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   The frame's corners are close but not exact. "Magic Town" is pinned by
   layout and digest, gated on `SIMS_INSTALL`. `sims-viewer --hud` shows a
   waiting dialog, and its answer is printed.
+- **Done: the pie menu.** `sims_ui::pie` lays out, hit-tests and draws
+  the menu and groups an object's actions into submenus, ported from the
+  original's menu window and object picker. The window and label boxes
+  agree to the pixel with two menus read from the running original
+  (gated on `SIMS_INSTALL`); the drawn look is not yet compared with a
+  screenshot. The host keeps a `pie::Pie` and renders the head.
 - **Next:** open houses through `sims_vm::boot::Lot` (which now runs the
   household load) in the tests and the viewer, in place of their
-  stand-in for steps 17 and 18; pie menus; a Yes/No dialog checked
+  stand-in for steps 17 and 18; a screenshot of an open pie menu; a
+  Yes/No dialog checked
   against the original (the "Help System" one at tick 2) for the layout
   of several buttons; text entry dialogs; the other live panels.
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
@@ -2061,8 +2071,8 @@ through their public interfaces only; the simulation never depends on it.
   play mode does not catch stops it. In play mode the Goths' house runs
   12,000 ticks (ten minutes at normal speed) without stopping, through
   about a dozen different caught errors; in strict mode it stops after
-  tick 2702 (at tick 2703 the carpool makes the school bus, and the
-  factory for multi-tile objects is not ported).
+  tick 2881 (at tick 2882 a person's pose without a foreground layer,
+  0x5992b3, is not ported).
   `--png <file>
   --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
@@ -2090,7 +2100,7 @@ through their public interfaces only; the simulation never depends on it.
   leaves the queue by tick 151. Three ticks later, another person
   (object 16) fails a route that names its slot from source 2 (tree
   0x2156 node 5; 0x45ac2e, not ported), which stops the lot in strict
-  mode. Without an order, strict mode runs to tick 2702. That route is
+  mode. Without an order, strict mode runs to tick 2881. That route is
   the simulation's next step toward the done criterion.
 - **Next:** the menu from the simulation's pie-menu entries (the check
   each entry runs, which the stopgap skips) once that accessor lands;

@@ -1954,3 +1954,30 @@ fn postures_1_and_2_start_their_base_clip_once_it_is_found() {
         }
     }
 }
+
+#[test]
+fn a_seated_animator_clears_a_clip_still_playing_and_stops_walking() {
+    // States 1 and 2 (0x58f0eb, 0x58f12e): the foreground clip is cleared
+    // and the base layer brought up to date, then the animator stops
+    // walking. In state 1, person word 78 holds the clip.
+    let seated = |state: i32, hold: i16| {
+        let mut fx = standing();
+        fx.sim_mut().person.as_mut().unwrap().data[78] = hold;
+        fx.world.animators.insert(
+            SIM,
+            sims_sim::animator::Animator {
+                state,
+                walking: true,
+                foreground: Some(layer(0)),
+                ..LOADED
+            },
+        );
+        tick(&mut fx).unwrap();
+        let a = &fx.world.animators[&SIM];
+        (a.foreground.is_some(), a.walking, a.state)
+    };
+    assert_eq!(seated(1, 0), (false, false, 1));
+    assert_eq!(seated(2, 0), (false, false, 2));
+    assert_eq!(seated(1, 1), (true, false, 1));
+    assert_eq!(seated(2, 1), (false, false, 2));
+}

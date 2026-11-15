@@ -65,6 +65,8 @@ mod data {
     pub const LIGHTS_ROOM: usize = 7;
     pub const FLAGS: usize = 8;
     pub const SLOT: usize = 14;
+    /// The eighths a group turns by at each step (object +0x78).
+    pub const TURN_STEP: usize = 23;
     pub const BEFORE: usize = 26;
     pub const ROOM: usize = 29;
     pub const FLAGS_2: usize = 40;
@@ -164,6 +166,18 @@ pub(crate) fn on_lot(position: [i32; 2]) -> bool {
         n > 0 && n < FULL - 1
     };
     inside(position[0]) && inside(position[1])
+}
+
+/// Whether a point is off the lot's inner tiles (0x422632): either
+/// coordinate's tile, as a signed byte, below 1 or not below the lot's
+/// size less 1.
+pub(crate) fn off_lot(world: &World, point: [i32; 2]) -> bool {
+    let size = i32::from(world.size);
+    let ok = |c: i32| {
+        let n = i32::from((c >> 4) as i8);
+        n >= 1 && n < size - 1
+    };
+    !ok(point[0]) || !ok(point[1])
 }
 
 fn tile_on_lot(tile: [i8; 3]) -> bool {
@@ -1265,6 +1279,64 @@ impl Interpreter<'_> {
         }
         if was_outside && notify {
             self.placed_from_outside(world, id)?;
+        }
+        Ok(())
+    }
+
+    /// Turns a group by `steps` times its turn step (a group's virtual
+    /// function 0x4c, 0x422937), keeping the tile `id` where it stands:
+    ///
+    /// 1. The tile's position and level are noted, and the group is taken
+    ///    off the lot with the lot told ([`Interpreter::take_off`],
+    ///    0x422d86).
+    /// 2. The turn is the tile's data word 23 times `steps`, in eighths.
+    ///    A turn of 0 ends here, with the group off the lot.
+    /// 3. Each tile, from the lead along the list, turns by it (data word
+    ///    1, kept to 0 to 7), and the offsets are worked out again
+    ///    ([`Interpreter::update_offsets`], vtable +0x88).
+    /// 4. If the group does not fit where the tile was
+    ///    ([`Interpreter::fits`], 0x422abb) and that place is on the lot
+    ///    (0x422632), each tile turns back and the offsets are worked out
+    ///    again.
+    /// 5. If the group fits where the tile was, it is put there with the
+    ///    lot told ([`Interpreter::put`], 0x422c2f).
+    ///
+    /// Not modeled, being presentation: each tile's redraw (0x434101) and
+    /// the lighting around it (0x434ed6).
+    pub(crate) fn turn_group(&self, world: &mut World, id: u16, steps: i32) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let [x, y, level] = position(world, id).map_err(fail)?;
+        self.take_off(world, id, true)?;
+        let step = (i32::from(datum(world, id, data::TURN_STEP).map_err(fail)?).wrapping_mul(steps)
+            & 7) as i16;
+        if step == 0 {
+            return Ok(());
+        }
+        let parts = self.parts(world, id).map_err(fail)?;
+        let turn = |world: &mut World, by: i16| -> Result<(), Fault> {
+            for &part in &parts {
+                let facing = datum(world, part, data::FACING).map_err(fail)?;
+                set_datum(world, part, data::FACING, facing.wrapping_add(by) & 7).map_err(fail)?;
+            }
+            self.update_offsets(world, id).map_err(fail)
+        };
+        turn(world, step)?;
+        if !self.fits(world, id, [x, y], level)? && !off_lot(world, [x, y]) {
+            turn(world, step.wrapping_neg())?;
+        }
+        if self.fits(world, id, [x, y], level)? {
+            let to = Place {
+                on_lot: on_lot([x, y]),
+                position: [x, y],
+                container: None,
+                slot: -1,
+                level,
+            };
+            self.put(world, id, to, true)?;
         }
         Ok(())
     }

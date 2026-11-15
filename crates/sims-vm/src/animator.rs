@@ -44,8 +44,11 @@
 //!    its person's tile (virtual function 0x60, 0x592132); one placed
 //!    puts both directions into 0 to 8 and, arrived and facing the way it
 //!    should, notes the route's end (0x188: 0 stays 0; -1, 2 and 3 become
-//!    2). Any other state, and an animator in state 3 that has to turn or
-//!    walk, is not ported.
+//!    2). In states 1 and 2 a clip still playing is cleared and the base
+//!    layer started again, unless person word 78 holds it in state 1
+//!    (0x58f0eb, 0x58f12e; [`Interpreter::seated`]). States 4, 6 and 9
+//!    are ported below. Any other state, and an animator in state 3 that
+//!    has to walk, is not ported.
 //! 8. The tail: the skin's layers are updated once at the clock, in the
 //!    skin's order: by priority, which a changed skin sorts its layers by
 //!    first (0x5991fd), then [`Animator::carry_first`] (0x5992b3, from
@@ -317,6 +320,9 @@ const OWN_NAMES: u16 = 150;
 /// Person words the name lookup reads (0x59db2f).
 const AGE: usize = 58;
 const SPECIAL: usize = 64;
+/// Person word 78 (+0x628): while set, a sitting animator (state 1) keeps
+/// its foreground clip (0x58f0f6).
+const SEATED_HOLD: usize = 78;
 /// The posture clip whose distance gives the walk's look-ahead (0x58831d,
 /// virtual function 0x120 with 0x14).
 const WALK: usize = 0x14;
@@ -480,6 +486,7 @@ impl Interpreter<'_> {
                     }
                     Next::Done
                 }
+                1 | 2 => self.seated(world, id, a)?,
                 3 => {
                     if a.position.iter().any(|&p| p.ext() == UNSET.ext()) {
                         place(a, position, direction);
@@ -594,6 +601,27 @@ impl Interpreter<'_> {
             .ok_or_else(|| Trap::native(10, "missing object"))?
             .guid;
         Ok(self.machine(world, id, 0, false).definition_words(guid)?[DEFINITION_FLAGS])
+    }
+
+    /// States 1 and 2, sitting and the posture after it (0x58f0eb,
+    /// 0x58f12e): a foreground clip that still plays is cleared (virtual
+    /// function 0xfc, 0x586b63; see [`clear_foreground`]), the base
+    /// layer's posture forgotten (+0x198 = -1) and the base layer brought
+    /// up to date (virtual function 0x58, [`Interpreter::update_base`]),
+    /// except in state 1 while person word 78 (+0x628) is set. Either way
+    /// the animator stops walking ([`Animator::walking`], 0x58f117); the
+    /// route's position fields (+0x24, +0x28) and +0x290, cleared with
+    /// it, are not kept.
+    fn seated(&self, world: &mut World, id: u16, a: &mut Animator) -> Result<Next, Trap> {
+        let held = a.state == 1 && person_word(world, id, SEATED_HOLD)? != 0;
+        if a.foreground.is_some() && !held {
+            clear_foreground(a);
+            a.posture = -1;
+            let flags = self.base_flags(world, id)?;
+            self.update_base(world, id, a, flags)?;
+        }
+        a.walking = false;
+        Ok(Next::Done)
     }
 
     /// State 3 for a placed animator (0x58ddbf). Both directions are put
