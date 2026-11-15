@@ -418,13 +418,6 @@ fn snap_checks_its_object_mode_and_slot() {
     assert_eq!(code(snap(&mut fx, me, LAMP as i16, 0, 5, 0)), Some(0x24));
     assert_eq!(code(snap(&mut fx, me, LAMP as i16, 1, 3, 0)), Some(0x1b));
     assert_eq!(code(snap(&mut fx, me, LAMP as i16, -1, 3, 0)), Some(0x1b));
-    for mode in [0, 1, 2] {
-        let result = snap(&mut fx, me, LAMP as i16, 0, mode, 0);
-        assert!(
-            matches!(trap(result), Trap::Unsupported(ref m) if m.contains("mode")),
-            "mode {mode}"
-        );
-    }
     assert_eq!(unmoved(&fx, me), start);
 }
 
@@ -930,4 +923,124 @@ fn a_group_that_does_not_fit_names_the_last_object_its_tiles_collided_with() {
     assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(false));
     let data = &fx.world.objects[&me].data;
     assert_eq!((data[52], data[54]), (0, blockers[0] as i16));
+}
+
+/// Runs Snap in mode 0 as `me` on the lamp, naming local `local`, after
+/// setting local 2 to `value`.
+/// Snaps in mode 0 with word 0 `parameter`, from a tree with three
+/// parameters and four locals: the parameters are `args`, and every local
+/// is set to 1, past the lamp's one slot.
+fn snap_by_parameter(
+    fx: &mut Fixture,
+    me: u16,
+    parameter: i16,
+    args: &[i16],
+) -> Result<bool, sims_vm::Fault> {
+    let [p0, p1] = parameter.to_le_bytes();
+    let guid = fx.world.objects[&me].guid;
+    let file = fx.catalog.object(guid).unwrap().resource;
+    fx.add(
+        file,
+        TREE,
+        shaped(
+            0x8002,
+            0,
+            3,
+            4,
+            vec![
+                assign(scope::LOCALS, 0, scope::LITERAL, 1, 1),
+                assign(scope::LOCALS, 1, scope::LITERAL, 1, 2),
+                assign(scope::LOCALS, 2, scope::LITERAL, 1, 3),
+                assign(scope::LOCALS, 3, scope::LITERAL, 1, 4),
+                ins(SNAP, RETURN_TRUE, RETURN_FALSE, [p0, p1, 0, 0, 0, 0, 0, 0]),
+            ],
+        ),
+    );
+    fx.run_with(me, TREE, LAMP as i16, args, 100)
+}
+
+#[test]
+fn mode_0_reads_the_slots_number_from_a_parameter() {
+    // 0x454a4b: word 0 names a parameter (0x47518b is the parameters'
+    // start, and frame byte +7, the count it is checked against, is the
+    // count of parameters); the parameter holds the number of the stack
+    // object's routing slot, which is then taken as mode 3 takes it.
+    let (mut fx, me) = snapper(SKIP_CHECKS);
+    fx.lamp_mut().position = [72, 24, 1];
+    let start = unmoved(&fx, me);
+    // Parameter 2 holds 1: past the lamp's one slot.
+    assert_eq!(
+        code(snap_by_parameter(&mut fx, me, 2, &[0, 0, 1])),
+        Some(0x1b)
+    );
+    // A parameter the tree does not have (it has three, and four locals)
+    // is native error 8.
+    assert_eq!(code(snap_by_parameter(&mut fx, me, 3, &[0, 0, 0])), Some(8));
+    assert_eq!(
+        code(snap_by_parameter(&mut fx, me, -1, &[0, 0, 0])),
+        Some(8)
+    );
+    assert_eq!(unmoved(&fx, me), start);
+    // Parameter 2 holds 0: the lamp's slot 0, though word 0 is 2 and
+    // local 2 holds 1.
+    assert_eq!(snap_by_parameter(&mut fx, me, 2, &[1, 1, 0]), Ok(true));
+    assert_eq!(fx.world.objects[&me].position, [72, 24, 1]);
+}
+
+#[test]
+fn mode_2_puts_me_one_tile_in_front_of_the_object_after_the_checks() {
+    // 0x4549d1: the object's position and level plus one tile's step in
+    // its facing (0x42228a), facing my own way, with the place's checks
+    // whatever the slot's flags; word 0 names no slot.
+    let (mut fx, me) = snapper(SKIP_CHECKS);
+    fx.lamp_mut().position = [56, 40, 1];
+    fx.lamp_mut().data[1] = 4;
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 9, 2, 0), Ok(true));
+    let person = &fx.world.objects[&me];
+    assert_eq!(person.position, [56, 56, 1]);
+    assert_eq!(person.data[1], 3);
+    // Facing 0, the tile in front is (3, 1), outside my room: I do not
+    // fit, though the lamp's one slot has flag 0x800.
+    let (mut fx, me) = snapper(SKIP_CHECKS);
+    fx.lamp_mut().position = [56, 40, 1];
+    fx.lamp_mut().data[1] = 0;
+    unfit(&mut fx, me);
+    let start = unmoved(&fx, me);
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 2, 0), Ok(false));
+    assert_eq!(unmoved(&fx, me), start);
+}
+
+#[test]
+fn mode_1_puts_me_into_the_objects_first_container_slot() {
+    // 0x454a1d: the object's container slot 0, as a slot whose snap
+    // target is 0 would, with the place's checks; word 0 names no slot.
+    let (mut fx, me) = container_snapper();
+    fx.lamp_mut().position = [56, 56, 1];
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 9, 1, 0), Ok(true));
+    let person = &fx.world.objects[&me];
+    assert_eq!(person.position, [56, 56, 1]);
+    assert_eq!(person.data[1], 3);
+    let held: Vec<i16> = fx.world.objects[&LAMP].slots[1..]
+        .iter()
+        .map(|s| s.object)
+        .collect();
+    assert_eq!(held, [me as i16, 0]);
+    // The checks: the lamp outside my room, and I do not fit.
+    let (mut fx, me) = container_snapper();
+    unfit(&mut fx, me);
+    let start = unmoved(&fx, me);
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 1, 0), Ok(false));
+    assert_eq!(unmoved(&fx, me), start);
+    // Flag bit 2 tests the walls around the object (0x45522c).
+    let (mut fx, me) = container_snapper();
+    fx.lamp_mut().position = [56, 56, 1];
+    let result = snap(&mut fx, me, LAMP as i16, 0, 1, 4);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x45522c")));
+    // An object with no container slot: mode 1 does not test for one
+    // (0x454b19 is not on its way), and what follows is not ported.
+    let (mut fx, me) = container_snapper();
+    fx.lamp_mut().position = [56, 56, 1];
+    fx.lamp_mut().slots.truncate(1);
+    let result = snap(&mut fx, me, LAMP as i16, 0, 1, 0);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("mode 1")));
 }
