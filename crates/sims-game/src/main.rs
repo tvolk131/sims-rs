@@ -1,7 +1,7 @@
 //! The game's window.
 //!
 //! ```text
-//! sims-game [<install>] [<house file>] [--answers A,B,...]
+//! sims-game [<install>] [<house file>] [--answers A,B,...] [--mute]
 //!           [--png <file> [--ticks N] [--size WxH]]
 //! ```
 //!
@@ -16,6 +16,9 @@
 //! floor, `1`/`2`/`3` walls up, cutaway and down, the arrows or a
 //! right-button drag scroll, space pauses, Escape quits.
 //!
+//! Sound plays on the default output device (on macOS, or built with the
+//! `sound` feature) unless `--mute` is given.
+//!
 //! `--png` opens no window: it runs `--ticks` ticks (default 0) as fast as
 //! they go, draws one frame of `--size` (default 800x600) and saves it.
 //!
@@ -26,9 +29,11 @@
 #![allow(clippy::disallowed_methods)]
 
 use sims_game::game::goth_house;
+use sims_game::sound::Input;
 use sims_game::view::Move;
 use sims_game::{Game, Options};
 use sims_render::{Walls, png};
+use sims_ui::command::Speed;
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -44,6 +49,49 @@ use winit::window::{Window, WindowId};
 /// How often the loop wakes to step the lot when nothing else happens.
 const WAKE: Duration = Duration::from_millis(5);
 
+/// The sound the window plays, or none.
+#[cfg(any(target_os = "macos", feature = "sound"))]
+struct Sound(Option<sims_game::output::Output>);
+
+#[cfg(any(target_os = "macos", feature = "sound"))]
+impl Sound {
+    fn start(install: &std::path::Path, mute: bool) -> Self {
+        if mute {
+            return Self(None);
+        }
+        let started =
+            sims_game::sound::Mixer::open(install).and_then(sims_game::output::Output::start);
+        match started {
+            Ok(output) => Self(Some(output)),
+            Err(e) => {
+                eprintln!("sims-game: playing without sound: {e}");
+                Self(None)
+            }
+        }
+    }
+
+    fn send(&self, input: Input) {
+        if let Some(output) = &self.0 {
+            output.send(input);
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", feature = "sound")))]
+struct Sound;
+
+#[cfg(not(any(target_os = "macos", feature = "sound")))]
+impl Sound {
+    fn start(_: &std::path::Path, mute: bool) -> Self {
+        if !mute {
+            eprintln!("sims-game: built without sound (the `sound` feature)");
+        }
+        Self
+    }
+
+    fn send(&self, _: Input) {}
+}
+
 /// A frame drawn without a window.
 struct Still {
     file: PathBuf,
@@ -51,14 +99,15 @@ struct Still {
     size: [i32; 2],
 }
 
-fn options() -> Result<(Options, Option<Still>), String> {
-    let usage = "usage: sims-game [<install>] [<house file>] [--answers A,B,...] \
+fn options() -> Result<(Options, Option<Still>, bool), String> {
+    let usage = "usage: sims-game [<install>] [<house file>] [--answers A,B,...] [--mute] \
                  [--png <file> [--ticks N] [--size WxH]]";
     let mut paths = Vec::new();
     let mut answers = None;
     let mut png = None;
     let mut ticks = 0;
     let mut size = [800, 600];
+    let mut mute = false;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         let mut text = |name: &str| -> Result<String, String> {
@@ -66,7 +115,9 @@ fn options() -> Result<(Options, Option<Still>), String> {
                 .and_then(|a| a.into_string().ok())
                 .ok_or_else(|| format!("{name} needs a value"))
         };
-        if arg == "--png" {
+        if arg == "--mute" {
+            mute = true;
+        } else if arg == "--png" {
             png = Some(PathBuf::from(text("--png")?));
         } else if arg == "--ticks" {
             let n = text("--ticks")?;
@@ -115,6 +166,7 @@ fn options() -> Result<(Options, Option<Still>), String> {
             answers,
         },
         still,
+        mute,
     ))
 }
 
@@ -130,6 +182,9 @@ struct App {
     photos: usize,
     /// The stop already printed, so it is printed once.
     reported: bool,
+    sound: Sound,
+    /// The hour and speed the sound was last told.
+    heard: Option<(u32, Speed)>,
 }
 
 impl App {
@@ -204,6 +259,12 @@ impl App {
             redraw = true;
         }
         self.changed(redraw);
+        let now = (self.game.hour(), self.game.pace.speed);
+        if self.heard != Some(now) {
+            self.sound.send(Input::Hour(now.0));
+            self.sound.send(Input::Speed(now.1));
+            self.heard = Some(now);
+        }
     }
 
     fn redraw(&mut self) {
@@ -374,7 +435,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let (options, still) = options()?;
+    let (options, still, mute) = options()?;
     eprintln!("sims-game: booting {}", options.house.display());
     let started = Instant::now();
     let mut game = Game::open(&options)?;
@@ -416,6 +477,8 @@ fn run() -> Result<(), String> {
         dirty: true,
         photos: 0,
         reported: false,
+        sound: Sound::start(&options.install, mute),
+        heard: None,
     };
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     event_loop.run_app(&mut app).map_err(|e| e.to_string())
