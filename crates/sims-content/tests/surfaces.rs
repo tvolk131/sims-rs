@@ -6,7 +6,8 @@ use sims_content::{Install, Surfaces};
 /// A pattern file in a subdirectory is in the catalog (the scan goes into
 /// every directory, 0x412699), under its file name alone, and a name with
 /// a character outside ASCII is read in Windows-1252, as a house's map
-/// names it.
+/// names it. Every byte is a character, so a name that starts with the
+/// bytes of a byte-order mark stays apart from the name without them.
 #[test]
 fn a_catalog_holds_nested_files_under_their_windows_1252_names() {
     let pattern = iff(&[(b"SPR2", 1, b""), (b"SPR2", 2, b""), (b"SPR2", 3, b"")]);
@@ -14,11 +15,19 @@ fn a_catalog_holds_nested_files_under_their_windows_1252_names() {
     tree.file("GameData/Behavior.iff", b"")
         .dir("GameData/Objects")
         .file("GameData/Floors/custom/deeper/tile.flr", &pattern)
-        .file("GameData/Floors/caf\u{e9}.flr", &pattern);
+        .file("GameData/Floors/caf\u{e9}.flr", &pattern)
+        .file("GameData/Floors/plain.flr", &pattern)
+        .file("GameData/Floors/\u{ef}\u{bb}\u{bf}plain.flr", &pattern);
     let install = Install::detect(&tree.0).unwrap();
     let surfaces = Surfaces::build(&install).unwrap();
     let floors = &surfaces.floors;
-    assert_eq!(floors.files.len(), 3);
+    assert_eq!(floors.files.len(), 5);
+    let plain = floors.file("PLAIN.FLR").expect("the plain name");
+    let marked = floors
+        .file("\u{ef}\u{bb}\u{bf}PLAIN.FLR")
+        .expect("the marked name");
+    assert_ne!(plain, marked);
+    assert_eq!(floors.files[plain].name, "plain.flr");
     let tile = floors.file("TILE.FLR").expect("the nested file");
     let cafe = floors.file("CAF\u{e9}.FLR").expect("the Windows-1252 name");
     assert_eq!(floors.files[cafe].name, "caf\u{e9}.flr");

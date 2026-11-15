@@ -83,3 +83,144 @@ fn the_goths_panel_from_the_original_art() {
     let digests: Vec<(&str, &str)> = digests.iter().map(|(n, d)| (*n, d.as_str())).collect();
     assert_eq!(digests, expected);
 }
+
+#[test]
+fn the_goths_personality_panel() {
+    let Some(root) = common::install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to draw the control panel");
+        return;
+    };
+    let opened = common::open(&root, common::GOTH_HOUSE);
+    // Neat, Outgoing, Active, Playful and Nice, from the house file.
+    let traits: Vec<[i16; 5]> = opened
+        .snapshot
+        .residents
+        .iter()
+        .map(|r| r.personality)
+        .collect();
+    assert_eq!(
+        traits,
+        [
+            [400, 600, 400, 700, 400],
+            [700, 300, 500, 300, 700],
+            [700, 200, 500, 700, 400],
+        ]
+    );
+    let controls = Controls {
+        expanded: true,
+        panel: Panel::Personality,
+        ..Controls::default()
+    };
+    let mut frame = Frame::new(800, 600, [0, 0, 0]);
+    let items = hud::layout([800, 600], &opened.snapshot, &controls);
+    hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
+    // Pins the drawing; it has not been compared with the original's
+    // screen (see docs/decisions.md).
+    assert_eq!(
+        digest(&frame),
+        "03a79c67d3eba682f47cc87003a67069728a7892f241bac48c6917f245c20060"
+    );
+}
+
+#[test]
+fn the_goths_job_panel() {
+    let Some(root) = common::install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to draw the control panel");
+        return;
+    };
+    let opened = common::open(&root, common::GOTH_HOUSE);
+    // Mortimer is a Science "Test Subject" (career 9, level 0), Bella has
+    // no career, and Cassandra is at school (-1); nobody has a skill yet,
+    // and the next level of Mortimer's career needs none.
+    let jobs: Vec<_> = opened
+        .snapshot
+        .residents
+        .iter()
+        .map(|r| (r.job, r.skills, r.needs))
+        .collect();
+    assert_eq!(
+        jobs,
+        [
+            ([9, 0], [0; 6], [0; 6]),
+            ([0, 0], [0; 6], [0; 6]),
+            ([-1, 4], [0; 6], [0; 6])
+        ]
+    );
+    let controls = Controls {
+        expanded: true,
+        panel: Panel::Job,
+        ..Controls::default()
+    };
+    let draw = |snapshot| {
+        let mut frame = Frame::new(800, 600, [0, 0, 0]);
+        let items = hud::layout([800, 600], snapshot, &controls);
+        hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
+        digest(&frame)
+    };
+    // Pins the drawing; it has not been compared with the original's
+    // screen (see docs/decisions.md).
+    assert_eq!(
+        draw(&opened.snapshot),
+        "3332eada844f300442b413d9994c5aab8b198314ec41292cd584e9261b6fed64"
+    );
+    // A level up the ladder, "Field Researcher": the next level, "Science
+    // Teacher", needs a point of Charisma and three of Logic, and he has
+    // two of Logic.
+    let mut snapshot = opened.snapshot.clone();
+    snapshot.residents[0].job = [9, 2];
+    snapshot.residents[0].skills = [0, 0, 0, 0, 200, 0];
+    let snapshot = snapshot.with_careers(&opened.careers);
+    assert_eq!(snapshot.residents[0].needs, [0, 0, 100, 0, 300, 0]);
+    assert_eq!(
+        draw(&snapshot),
+        "f31ded2b92e5ae9d45e42de2f78142b1f9ed22423feb4b6d702bb1cce3ba6e01"
+    );
+}
+
+#[test]
+fn the_goths_relationship_panel() {
+    let Some(root) = common::install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to draw the control panel");
+        return;
+    };
+    let opened = common::open(&root, common::GOTH_HOUSE);
+    // Mortimer, selected, knows his wife and daughter: friends both ways,
+    // the family first by the day's feeling, and Bella with the heart.
+    let relations: Vec<_> = opened
+        .snapshot
+        .relations
+        .iter()
+        .map(|r| {
+            (
+                r.id,
+                r.daily,
+                r.lifetime,
+                r.friends,
+                r.pink_heart,
+                r.red_heart,
+                r.family,
+            )
+        })
+        .collect();
+    assert_eq!(
+        relations,
+        [
+            (33, 100, 0, true, true, false, true),
+            (32, 75, 0, true, false, false, true),
+        ]
+    );
+    let controls = Controls {
+        expanded: true,
+        panel: Panel::Relationships,
+        ..Controls::default()
+    };
+    let mut frame = Frame::new(800, 600, [0, 0, 0]);
+    let items = hud::layout([800, 600], &opened.snapshot, &controls);
+    hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
+    // Pins the drawing; it has not been compared with the original's
+    // screen (see docs/decisions.md).
+    assert_eq!(
+        digest(&frame),
+        "4b764150a46580163fb484f70c5eac2db568672649d2e2bf8d05af09c2667c4c"
+    );
+}

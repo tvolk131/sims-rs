@@ -5,13 +5,14 @@
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_content::{Catalog, House, Index, Install, Neighborhood};
 use sims_ui::art::Art;
-use sims_ui::household::{Faces, Snapshot};
+use sims_ui::household::{Careers, Faces, Snapshot};
 use std::path::{Path, PathBuf};
 
 /// The Goth family's house in the install's first neighborhood.
 pub const GOTH_HOUSE: &str = "UserData/Houses/House05.iff";
 
 pub struct Opened {
+    pub careers: Careers,
     pub snapshot: Snapshot,
     pub art: Art,
     pub faces: Faces,
@@ -43,6 +44,14 @@ pub fn open(root: &Path, house: &str) -> Opened {
     let catalog = Catalog::build(&index).unwrap();
     let file = House::load(&house, &catalog).unwrap();
     let mut world = sims_sim::World::from_house(&file, &catalog).unwrap();
+    // The neighborhood's people, as the load holds them before the lot
+    // (crates/sims-vm/src/boot.rs), for the relationship panel.
+    world
+        .read_neighbors(
+            &neighborhood,
+            &sims_sim::neighbors::registry(&index, &catalog),
+        )
+        .unwrap();
     let number = neighborhood
         .houses()
         .unwrap()
@@ -60,11 +69,16 @@ pub fn open(root: &Path, house: &str) -> Opened {
     {
         object.selected = true;
     }
-    let snapshot = Snapshot::read(&world, &family.members);
+    let careers = Careers::load(&index).unwrap();
+    // The friendship threshold the original's tuning gives (0x6c4398).
+    let snapshot = Snapshot::read(&world, &family.members)
+        .with_careers(&careers)
+        .with_relations(&world, &family.members, 50);
     let ui = UiGraphics::open(&install).unwrap();
     let art = Art::load(&ui, US_ENGLISH, &sims_ui::hud::RESOURCES).unwrap();
     let faces = Faces::load(&index, &catalog, &family.members).unwrap();
     Opened {
+        careers,
         snapshot,
         art,
         faces,

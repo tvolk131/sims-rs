@@ -63,9 +63,11 @@ pub fn encode_name(name: &str) -> Option<Vec<u8>> {
     (!unmappable).then(|| bytes.into_owned())
 }
 /// The reverse of [`encode_name`]: a name the original holds, read in the
-/// Windows-1252 code page.
+/// Windows-1252 code page. Every byte is read as itself: a leading
+/// byte-order mark is three characters of the name, as the original's
+/// byte comparison sees it, not a sign of another encoding.
 pub fn decode_name(name: &[u8]) -> String {
-    encoding_rs::WINDOWS_1252.decode(name).0.into_owned()
+    western(name)
 }
 pub fn directory(data: &[u8], file_len: u64) -> Result<Vec<Entry>> {
     let mut r = Reader::new(data);
@@ -96,4 +98,21 @@ pub fn directory(data: &[u8], file_len: u64) -> Result<Vec<Entry>> {
         });
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_member_name_keeps_a_leading_byte_order_mark() {
+        let name = b"\xef\xbb\xbfplain.flr";
+        let mut b = Vec::new();
+        b.extend(1u32.to_le_bytes());
+        for word in [0u32, 0, 0, name.len() as u32] {
+            b.extend(word.to_le_bytes());
+        }
+        b.extend(name);
+        let entries = super::directory(&b, 0).unwrap();
+        assert_eq!(entries[0].name, "\u{ef}\u{bb}\u{bf}plain.flr");
+        assert_eq!(entries[0].raw_name, name);
+    }
 }
