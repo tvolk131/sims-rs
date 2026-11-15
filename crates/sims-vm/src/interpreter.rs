@@ -79,6 +79,15 @@ impl From<bool> for Flow {
 /// Runs object scripts against a lot. It holds only what doesn't change
 /// while scripts run: the linked code, the catalog, and the active random
 /// stream.
+/// An action running at once: the person whose queue it was put on, and
+/// the action, which an action queued on that person while it runs is
+/// copied over (0x45d5a5).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AtOnce<'a> {
+    pub person: u16,
+    pub action: &'a RefCell<sims_formats::saved_objects::Interaction>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Interpreter<'a> {
     pub program: &'a Program,
@@ -104,11 +113,10 @@ pub struct Interpreter<'a> {
     /// checked, and the entries the check adds to the menu. None
     /// otherwise. Add/Change Action String reads and writes it.
     pub(crate) menu: Option<&'a RefCell<crate::orders::Checking>>,
-    /// The person whose queued action runs at once, while its tree runs
-    /// (the original's 0x6e5298, with the action at 0x6e5294), through
-    /// every tree it runs. None otherwise. See
-    /// [`Machine::queue_action`].
-    pub(crate) running_at_once: Option<u16>,
+    /// The person whose queued action runs at once, and that action, while
+    /// its tree runs (the original's 0x6e5298 and 0x6e5294), through every
+    /// tree it runs. None otherwise. See [`Machine::queue_action`].
+    pub(crate) running_at_once: Option<AtOnce<'a>>,
     /// The people in the middle of letting go of an object (object flag
     /// 0x800, [`crate::forget`]), whom a broadcast it sets off skips. None
     /// outside one.
@@ -345,7 +353,7 @@ pub(crate) struct Machine<'a, 'w> {
     /// See [`Interpreter::menu`].
     pub menu: Option<&'a RefCell<crate::orders::Checking>>,
     /// See [`Interpreter::running_at_once`].
-    pub running_at_once: Option<u16>,
+    pub running_at_once: Option<AtOnce<'a>>,
     /// See [`Interpreter::letting_go`].
     pub letting_go: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
 }

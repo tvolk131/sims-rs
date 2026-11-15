@@ -77,21 +77,12 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     let menu = lot.pie_menu(sim, 16).unwrap_or_else(|e| panic!("{e}"));
     assert_ne!(lot.world().hash(), before);
 
-    // Every entry queues an action that runs at once (0x45d240), whose
-    // tree runs a tree by name on another object (0x44ba26), which is not
-    // ported, and each refusal leaves the lot as it was.
     assert!(!menu.entries.is_empty());
     assert!(
         menu.entries
             .iter()
             .all(|e| e.action.caller == sim as i16 && e.action.uid == 0)
     );
-    let before = lot.world().hash();
-    for entry in menu.entries {
-        let refused = lot.pick(sim, entry.action).unwrap_err().to_string();
-        assert!(refused.contains("0x44ba26"), "{refused}");
-        assert_eq!(lot.world().hash(), before);
-    }
 
     // The fridge's check tree names its entries, one for each meal.
     let menu = lot.pie_menu(sim, 118).unwrap_or_else(|e| panic!("{e}"));
@@ -112,4 +103,20 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     assert!(queued.is_some());
     assert_eq!(queue(&lot).last().map(|a| a.uid), queued);
     lot.step().unwrap();
+
+    // Person 16's entries run at once (0x45d240). The first one's tree
+    // runs a tree by name on my thread (0x44ba26 mode 0), which queues
+    // the social on me, through the object it made, and that action is
+    // copied over the running one (0x45d5a5): the pick returns the queued
+    // action's number.
+    let menu = lot.pie_menu(sim, 16).unwrap_or_else(|e| panic!("{e}"));
+    let first = menu.entries[0].action.clone();
+    let queued = lot.pick(sim, first).unwrap_or_else(|e| panic!("{e}"));
+    let last = queue(&lot).last().cloned().unwrap();
+    assert_eq!(Some(last.uid), queued);
+    assert_eq!((last.caller, last.icon), (sim as i16, 16));
+    assert_ne!(last.target, 16);
+    // The social then stops on what is not ported yet.
+    let stopped = lot.step().unwrap_err().to_string();
+    assert!(stopped.contains("0x58957e"), "{stopped}");
 }
