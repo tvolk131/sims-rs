@@ -18,7 +18,13 @@ the empty action, or loses the icon; the running action naming it ends.
 When the object is a person, route contexts asking it to move forget it.
 A person nested in a broadcast it set off is skipped, as the original's
 object flag 0x800 skips it; that flag is carried by the interpreter for
-the broadcast's length, not kept in the world.
+the broadcast's length, not kept in the world. A person's own reset sets
+the same flag for its length, so its callbacks' broadcasts skip it too,
+and a reset of a person already flagged, which the original skips, fails
+loudly. A broadcast while the factory makes a person fails loudly, as
+any walk of the list of people does then. A cancel's fault keeps the
+tree and node it happened at, and a failure partway leaves the queue no
+longer than its ring of 8.
 
 A person using the object, or whose running action shows its icon, is
 reset fully by the original: its uses unwound and each used object reset,

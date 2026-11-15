@@ -395,3 +395,65 @@ fn only_the_lots_people_are_told() {
     assert_eq!(interpreter.delete(&mut world, 1), Ok(()));
     assert_eq!(world.objects[&9].person.as_ref().unwrap().last.target, 1);
 }
+
+#[test]
+fn a_failed_cancel_keeps_its_place_and_the_queue_its_ring() {
+    // Widget 2's function 4 (cancelled) queues widget 1's menu 3 on the
+    // person eight times, filling the queue, then runs a tree that does
+    // not exist.
+    let (mut fx, file) = lot(2, false);
+    let library = fx.program.libraries.get_mut(&file).unwrap();
+    library.definitions.get_mut(&128).unwrap()[7] = 1007;
+    library.interactions.insert(
+        1007,
+        Some(sims_formats::behavior::InteractionTable {
+            version: 7,
+            interactions: vec![sims_formats::behavior::Interaction {
+                action: 4302,
+                test: 0,
+                string_index: 3,
+                flags: 0,
+                autonomy: 50,
+                attenuation_code: 0,
+                attenuation: 0.0,
+                joining_index: -1,
+                motives: Vec::new(),
+                flags2: 0,
+            }],
+        }),
+    );
+    callback(&mut fx, file, 4, 4301);
+    let mut nodes = vec![assign(scope::LOCALS, 0, scope::LITERAL, 1, 1)];
+    for node in 1..=8u8 {
+        nodes.push(ins(13, node + 1, ERROR, [3, 0, 1, 2, 0, 0, 0, 0]));
+    }
+    nodes.push(ins(0x1fff, RETURN_TRUE, RETURN_TRUE, [0; 8]));
+    fx.add(file, 4301, tree(nodes));
+    fx.add_sim(9);
+    let person = fx
+        .world
+        .objects
+        .get_mut(&9)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person.data[32] = 0;
+    let action = |target: i16, uid: i32| {
+        let mut action = person.last.clone();
+        (action.target, action.icon, action.uid) = (target, target, uid);
+        action
+    };
+    // One kept on widget 1, then one on widget 2.
+    person.queue = vec![action(1, 1), action(2, 2)];
+    let interpreter = fx.interpreter();
+    let mut world = fx.world.clone();
+    let fault = interpreter.delete(&mut world, 2).unwrap_err();
+    // The fault names the cancel's tree, not the person.
+    assert_eq!(fault.object, 2, "{fault}");
+    assert_eq!(fault.at.map(|at| at.tree), Some(4301), "{fault}");
+    // The kept action goes back in front, and the queue holds 8.
+    let queue = &world.objects[&9].person.as_ref().unwrap().queue;
+    assert_eq!(queue.len(), 8, "{fault}");
+    assert_eq!(queue[0].uid, 1);
+}

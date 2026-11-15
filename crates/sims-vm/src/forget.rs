@@ -27,10 +27,16 @@
 //!      the empty action; with T as its icon the icon becomes 0.
 //!    - **The running action** (0x45ec3d): with T as its target P's
 //!      running action becomes the empty action ([`Machine::set_action`]),
-//!      which makes the old one the last action, naming T again.
+//!      which makes the old one the last action, naming T again; with T
+//!      only as its icon (a cancel above can start such an action), the
+//!      icon becomes 0 (0x45ec70).
 //!    - **Routes** (0x45ec81), when T is a person: each of P's route
 //!      contexts that names T as the person asked to move (+0x80) forgets
 //!      it: byte +0x84 is set and +0x80 and +0x90 are cleared.
+//!
+//! A cancel's fault keeps the place it happened. A failure partway leaves
+//! the queue no longer than its ring of 8. A broadcast while the factory
+//! makes a person is refused, as for any walk of the list of people then.
 //!
 //! What the filter leaves naming T, the original leaves as a pointer to
 //! the freed object: the last action after the running action ended,
@@ -68,6 +74,16 @@ impl Interpreter<'_> {
             };
             return outer.drop_references(world, id);
         };
+        if let Some(making) = self.making_person {
+            return Err(Fault {
+                object: id,
+                at: None,
+                trap: Trap::Unsupported(format!(
+                    "people letting go of object {id} while the factory makes person {making}; \
+                     when in the making the original appends a person is not read (0x444306)"
+                )),
+            });
+        }
         let person_target = world.objects.get(&id).is_some_and(|o| o.person.is_some());
         // The original's cursor reads the list's end again at each step.
         let mut at = 0;
@@ -79,11 +95,7 @@ impl Interpreter<'_> {
             busy.borrow_mut().insert(other);
             let result = self.let_go(world, other, id, person_target);
             busy.borrow_mut().remove(&other);
-            result.map_err(|trap| Fault {
-                object: other,
-                at: None,
-                trap,
-            })?;
+            result?;
         }
         Ok(())
     }
@@ -95,22 +107,27 @@ impl Interpreter<'_> {
         me: u16,
         target: u16,
         person_target: bool,
-    ) -> Result<(), Trap> {
+    ) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: me,
+            at: None,
+            trap,
+        };
         let t = target as i16;
         let names = |action: &Interaction| action.target == t || action.icon == t;
         let Some(person) = world.objects.get(&me).and_then(|o| o.person.as_ref()) else {
             return Ok(());
         };
         if person.object_uses.iter().any(|u| u.target == t) || person.active.icon == t {
-            return Err(Trap::Unsupported(format!(
+            return Err(fail(Trap::Unsupported(format!(
                 "person {me} is using object {target} as it resets or goes, which resets the \
                  person fully (0x45e814); not ported"
-            )));
+            ))));
         }
         if person.queue.iter().any(names) {
             self.filter_queue(world, me, target)?;
         }
-        let person = person_of(world, me)?;
+        let person = person_of(world, me).map_err(fail)?;
         if person.last.target == t {
             person.last = no_action();
         } else if person.last.icon == t {
@@ -118,8 +135,11 @@ impl Interpreter<'_> {
         }
         if person.active.target == t {
             let mut machine = self.machine(world, me, 0, false);
-            let last_result = machine.me()?.last_result;
-            machine.end_action(last_result)?;
+            let last_result = machine.me().map_err(fail)?.last_result;
+            machine.end_action(last_result).map_err(fail)?;
+        } else if person.active.icon == t {
+            // A cancel above can start an action showing T's icon.
+            person.active.icon = 0;
         }
         if person_target && let Some(route) = world.routing.routes.get_mut(&me) {
             for context in &mut route.contexts {
@@ -134,12 +154,17 @@ impl Interpreter<'_> {
     }
 
     /// The queue's filter (0x45eac7 to 0x45ebfb).
-    fn filter_queue(&self, world: &mut World, me: u16, target: u16) -> Result<(), Trap> {
+    fn filter_queue(&self, world: &mut World, me: u16, target: u16) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: me,
+            at: None,
+            trap,
+        };
         let t = target as i16;
         let mut kept = Vec::new();
         let result = (|| {
             loop {
-                let queue = &mut person_of(world, me)?.queue;
+                let queue = &mut person_of(world, me).map_err(fail)?.queue;
                 if queue.is_empty() {
                     return Ok(());
                 }
@@ -150,14 +175,16 @@ impl Interpreter<'_> {
                         kept.push(front);
                     }
                 } else if front.target != 0 {
-                    self.callback(world, front.target as u16, CANCELLED, me as i16)
-                        .map_err(|fault| fault.trap)?;
+                    self.callback(world, front.target as u16, CANCELLED, me as i16)?;
                 }
             }
         })();
-        // The kept actions go back, in front of any a failed cancel left.
-        let queue = &mut person_of(world, me)?.queue;
+        // The kept actions go back, in front of any a failed cancel left,
+        // and the queue holds no more than its ring. (Only a failure can
+        // leave more; the original has none.)
+        let queue = &mut person_of(world, me).map_err(fail)?.queue;
         kept.append(queue);
+        kept.truncate(KEPT);
         *queue = kept;
         result
     }
