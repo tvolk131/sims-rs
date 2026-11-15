@@ -29,6 +29,12 @@ autonomy already takes it. A tree that cannot be pushed, where the
 original cancels the action, fails loudly. Reopen with a recording of a
 player's order (goal step 4).
 
+A check tree the file lacks now writes the synchronous run's mark above
+the top frame before it fails (0x4749d9), in this check and in
+autonomy's, as `Interpreter::callback` already did; its words can
+become a later frame's locals. The Goth house's first 1000 ticks are
+unchanged by it.
+
 ## 2026-11-15: Snap into a container slot, the base clips of postures 1 and 2, and K = 1000
 
 Snap into an object's container slot is ported, with the place test for
