@@ -11,7 +11,8 @@
 //! - **The picture** (0x4ea203): for a person (definition type 2), the
 //!   portrait the household's table keeps for its type, cell 0 of the
 //!   portrait frame; a person outside the household has none. For any
-//!   other object, its catalog picture (0x4ccaa0).
+//!   other object, its catalog picture (0x4ccaa0, [`crate::thumbnail`]);
+//!   an object whose type has no catalog item has none.
 //! - **The frame** (0x4cabe0, `kIconFrame`, `CPanel/Buttons/IconFrame.bmp`,
 //!   two 45 by 45 cells): the picture is drawn, then the frame over it,
 //!   blue showing the picture and magenta cutting the corners. A queued
@@ -34,9 +35,10 @@
 //! **Not done here.** The icons slide into their places over 500 ms
 //! (0x4cb1df, 0x4cb260), and a new action's icon starts where its pie
 //! menu was; here they stand in their places at once. The action's name
-//! as a tooltip (0x5ddabc) is left out: the queue keeps no names. The
-//! catalog picture of an object is not made yet, so an object's icon
-//! shows its frame over the dark grey of a missing picture.
+//! as a tooltip (0x5ddabc) is left out: the queue keeps no names. An
+//! object without a thumbnail of its own is not rendered into one
+//! ([`crate::thumbnail`]), so its icon shows the catalog's empty
+//! template.
 //!
 //! [`Interaction::icon`]: sims_formats::saved_objects::Interaction::icon
 //! [`Command::CancelAction`]: crate::command::Command::CancelAction
@@ -44,6 +46,7 @@
 use crate::art::Art;
 use crate::frame::{Frame, Rect};
 use crate::household::Faces;
+use crate::thumbnail::Thumbnails;
 use sims_formats::saved_objects::Interaction;
 use sims_sim::World;
 
@@ -146,10 +149,19 @@ impl Queue {
             .find(|icon| icon.rect.contains(point[0], point[1]))
     }
 
+    /// The GUIDs of the object types whose catalog pictures the icons
+    /// show, for [`Thumbnails::read`].
+    pub fn objects(&self) -> impl Iterator<Item = u32> + '_ {
+        self.icons.iter().filter_map(|icon| match icon.picture {
+            Picture::Object(guid) => Some(guid),
+            Picture::Person(_) => None,
+        })
+    }
+
     /// Draws the icons.
-    pub fn draw(&self, frame: &mut Frame, art: &Art, faces: &Faces) {
+    pub fn draw(&self, frame: &mut Frame, art: &Art, faces: &Faces, thumbnails: &Thumbnails) {
         for icon in &self.icons {
-            draw_icon(frame, art, faces, icon);
+            draw_icon(frame, art, faces, thumbnails, icon);
         }
     }
 }
@@ -166,22 +178,16 @@ fn picture(world: &World, action: &Interaction) -> Option<Picture> {
     })
 }
 
-fn draw_icon(frame: &mut Frame, art: &Art, faces: &Faces, icon: &Icon) {
+fn draw_icon(frame: &mut Frame, art: &Art, faces: &Faces, thumbnails: &Thumbnails, icon: &Icon) {
     let picture = match icon.picture {
         Picture::Person(guid) => faces.portrait(art, guid, 0),
-        // Catalog pictures are not made yet: the frame goes over the
-        // missing picture's grey.
-        Picture::Object(_) => None,
+        Picture::Object(guid) => thumbnails.icon(art, guid),
     };
     let [x, y] = [icon.rect.x, icon.rect.y];
-    let Some(cells) = art.image(FRAME) else {
+    let (Some(cells), Some(picture)) = (art.image(FRAME), picture) else {
         frame.fill(icon.rect, NO_PICTURE);
         return;
     };
-    if picture.is_none() && matches!(icon.picture, Picture::Person(_)) {
-        frame.fill(icon.rect, NO_PICTURE);
-        return;
-    }
     let cell = if icon.yellow { SIZE as u32 } else { 0 };
     for dy in 0..SIZE as u32 {
         for dx in 0..SIZE as u32 {
@@ -192,12 +198,8 @@ fn draw_icon(frame: &mut Frame, art: &Art, faces: &Faces, icon: &Icon) {
             if [r, g, b] != SHOW {
                 // The frame, or a cut corner (keyed when loaded).
                 frame.blend(px, py, [r, g, b], a);
-            } else if let Some(picture) = &picture {
-                if let Some([r, g, b, a]) = picture.pixel(dx, dy) {
-                    frame.blend(px, py, [r, g, b], a);
-                }
-            } else {
-                frame.blend(px, py, NO_PICTURE, 255);
+            } else if let Some([r, g, b, a]) = picture.pixel(dx, dy) {
+                frame.blend(px, py, [r, g, b], a);
             }
         }
     }
@@ -211,7 +213,20 @@ fn draw_icon(frame: &mut Frame, art: &Art, faces: &Faces, icon: &Icon) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thumbnail::{self, Item};
     use sims_formats::bitmap::Image;
+
+    /// The catalog template's first cell's color in [`art`].
+    const TEMPLATE: [u8; 3] = [0, 0, 90];
+
+    /// Object type 7 has a catalog item without a thumbnail; type 8 has
+    /// no item.
+    fn thumbnails() -> Thumbnails {
+        let mut thumbnails = Thumbnails::default();
+        thumbnails.insert(7, Some(Item { thumbnail: None }));
+        thumbnails.insert(8, None);
+        thumbnails
+    }
 
     fn image(width: u32, height: u32, at: impl Fn(u32, u32) -> [u8; 4]) -> Image {
         let mut rgba = Vec::new();
@@ -249,6 +264,13 @@ mod tests {
             }),
         );
         art.insert(
+            thumbnail::TEMPLATE,
+            image(180, 45, |_, _| {
+                let [r, g, b] = TEMPLATE;
+                [r, g, b, 255]
+            }),
+        );
+        art.insert(
             CANCEL_OVERLAY,
             image(45, 45, |x, y| {
                 if x == y {
@@ -279,13 +301,30 @@ mod tests {
             icons: vec![icon(32, true, false), icon(82, false, false)],
         };
         let mut frame = Frame::new(200, 100, [9, 9, 9]);
-        queue.draw(&mut frame, &art(), &Faces::default());
+        queue.draw(&mut frame, &art(), &Faces::default(), &thumbnails());
         assert_eq!(frame.pixel(32 + 1, 32), Some([255, 255, 0]));
         assert_eq!(frame.pixel(82 + 1, 32), Some([128, 128, 128]));
-        // Inside: the missing picture's grey. The cut corner shows what
-        // was under it.
-        assert_eq!(frame.pixel(32 + 20, 32 + 20), Some(NO_PICTURE));
+        // Inside: the catalog picture, here the bare template. The cut
+        // corner shows what was under it.
+        assert_eq!(frame.pixel(32 + 20, 32 + 20), Some(TEMPLATE));
         assert_eq!(frame.pixel(32, 32), Some([9, 9, 9]));
+    }
+
+    #[test]
+    fn an_object_without_a_catalog_item_shows_a_dark_grey_square() {
+        let mut icon = icon(32, true, false);
+        icon.picture = Picture::Object(8);
+        let queue = Queue {
+            person: Some(1),
+            pet: false,
+            icons: vec![icon],
+        };
+        let mut frame = Frame::new(200, 100, [9, 9, 9]);
+        queue.draw(&mut frame, &art(), &Faces::default(), &thumbnails());
+        // No frame, no cut corner.
+        assert_eq!(frame.pixel(32, 32), Some(NO_PICTURE));
+        assert_eq!(frame.pixel(32 + 1, 32), Some(NO_PICTURE));
+        assert_eq!(frame.pixel(32 + 20, 32 + 20), Some(NO_PICTURE));
     }
 
     #[test]
@@ -296,9 +335,9 @@ mod tests {
             icons: vec![icon(32, true, true)],
         };
         let mut frame = Frame::new(200, 100, [9, 9, 9]);
-        queue.draw(&mut frame, &art(), &Faces::default());
+        queue.draw(&mut frame, &art(), &Faces::default(), &thumbnails());
         assert_eq!(frame.pixel(32 + 20, 32 + 20), Some([255, 0, 0]));
-        assert_eq!(frame.pixel(32 + 21, 32 + 20), Some(NO_PICTURE));
+        assert_eq!(frame.pixel(32 + 21, 32 + 20), Some(TEMPLATE));
     }
 
     #[test]

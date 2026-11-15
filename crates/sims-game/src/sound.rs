@@ -160,20 +160,12 @@ pub fn screen(world: &World, camera: &Camera, size: [i32; 2]) -> BTreeMap<i32, P
     if camera.origin.iter().any(|n| n.unsigned_abs() >= 1 << 26) {
         return BTreeMap::new();
     }
-    let m = 1023;
     world
         .objects
         .values()
         .filter(|object| object.id > 0)
         .map(|object| {
-            let [x, y, level] = object.position.map(i32::from);
-            let rotated = match camera.rotation & 3 {
-                1 => [m - y, x],
-                2 => [m - x, m - y],
-                3 => [y, m - x],
-                _ => [x, y],
-            };
-            let at = fine_point(camera, rotated, level);
+            let at = object_point(camera, object.position);
             let view = Projection {
                 at,
                 screen: size,
@@ -183,6 +175,22 @@ pub fn screen(world: &World, camera: &Camera, size: [i32; 2]) -> BTreeMap<i32, P
             (i32::from(object.id), view)
         })
         .collect()
+}
+
+/// The screen point of an object at `position` (fine, fine, level), as
+/// the original's view works it out for an object (0x4071a3, 0x47bc1f,
+/// 0x4a9dc7): the fine position rotated into the view about 1023, not
+/// the drawing's 1024, then projected on its level by [`fine_point`].
+pub fn object_point(camera: &Camera, position: [i32; 3]) -> [i32; 2] {
+    let m = 1023;
+    let [x, y, level] = position;
+    let rotated = match camera.rotation & 3 {
+        1 => [m - y, x],
+        2 => [m - x, m - y],
+        3 => [y, m - x],
+        _ => [x, y],
+    };
+    fine_point(camera, rotated, level)
 }
 
 /// The screen point of a fine view position on `level`, as the
