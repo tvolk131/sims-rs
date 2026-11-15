@@ -278,8 +278,12 @@ fn relations(world: &World, guid: u32, members: &[u32], friendship: i32) -> Vec<
         if record.id == viewer.id {
             continue;
         }
-        // 0x4ea042 reads both ways between the first records of the two
-        // types.
+        // As the original (0x4e9e77..0x4e9f69), a record stands for its
+        // type: its GUID gives a person (0x4e9753), and the row asked for
+        // is toward that person's record, the first of the type
+        // (0x4ea192). So a second record of a type is listed with the
+        // first's row, or not at all where only it has a row; 0x4ea042
+        // reads friendship between the first records too.
         let Some(target) = neighbors.first_of(record.guid) else {
             continue;
         };
@@ -462,6 +466,46 @@ mod tests {
             selected: None,
             relations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_record_stands_for_its_type_in_the_relationship_list() {
+        let record = |id: i16, guid: u32, rows: &[(i32, i32)]| sims_sim::neighbors::Neighbor {
+            id,
+            guid,
+            revision: 1,
+            data: vec![0; sims_sim::neighbors::PERSON_WORDS],
+            relationships: rows
+                .iter()
+                .map(|&(target, daily)| sims_sim::neighbors::Row {
+                    target,
+                    values: vec![daily, 0, 0, 0],
+                })
+                .collect(),
+            friends: 0,
+            stale: false,
+        };
+        let listed = |viewer_rows: &[(i32, i32)]| {
+            let mut world = World::empty();
+            world.neighbors.slots = vec![
+                Some(record(1, 100, viewer_rows)),
+                Some(record(2, 200, &[])),
+                Some(record(3, 200, &[])),
+                Some(record(4, 300, &[])),
+            ];
+            relations(&world, 100, &[], 50)
+                .iter()
+                .map(|r| (r.id, r.daily))
+                .collect::<Vec<_>>()
+        };
+        // Records 2 and 3 are one type: both are listed with the row
+        // toward 2, the type's first record, and a row toward 3 alone
+        // lists neither, as the original's list does.
+        assert_eq!(listed(&[(2, 40), (4, 10)]), [(2, 40), (3, 40), (4, 10)]);
+        assert_eq!(listed(&[(3, 40), (4, 10)]), [(4, 10)]);
+        // Nobody known, or a viewer without a record: an empty list.
+        assert_eq!(listed(&[]), []);
+        assert!(relations(&World::empty(), 100, &[], 50).is_empty());
     }
 
     #[test]

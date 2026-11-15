@@ -11,7 +11,12 @@ relationships in the subpanel (`sims_ui::hud`, `Kind::Relation`), read
 from the exe; no screenshot of this panel was available.
 
 - **The list** (0x4e9deb): every neighbor record but the Sim's own that
-  the Sim has a relationship row toward, in slot order.
+  the Sim has a relationship row toward, in slot order. A record stands
+  for its type: its GUID gives a person (0x4e9753), and the row asked
+  for is toward that person's record, the type's first (0x4ea192). So
+  a second record of the same type is listed with the first's row, and
+  not at all where only it has one. This is the original's behaviour,
+  kept, not a slip.
   - The buttons filter it (0x51a7ea, 0x51a8c3): Family (4108) keeps the
     people with the Sim's family word (person data 61), Friends (4109)
     the mutual friends (value 0 at the friendship threshold or more
@@ -36,10 +41,19 @@ from the exe; no screenshot of this panel was available.
   wide, a fifth of a pixel a point from -100, with the dark line
   closing the filled part as the needs' meters have; the lifetime's
   number; the smiley for friends and the red heart (value 3) or else
-  the pink one (value 1). The bars' green and red lean from the
+  the pink one (value 1), 3 past the smiley's width whether the smiley
+  shows or not. The bars' green and red lean from the
   panel's color by the lifetime relationship, through the original's
   16-bit blend table (0x49a2fb, 0x49a60b), ported with its float
   constants.
+- **Edges kept from the original** (Sol's review asked about them):
+  - The face is lifetime plus 100 over the strip's cell width (the
+    bitmap's width over 5), not over a fixed 40 points
+    (0x5283fa..0x528424). The install's cells are 40 wide, so the two
+    agree there.
+  - The dark line after a bar's filled part needs only two pixels left
+    on the right (0x5287e9). An empty bar (-100 to -96) gets it a pixel
+    left of the bar, where the needs' meters draw none.
 - **Unverified:**
   - Font 6, which sets the buttons' and arrows' heights, is not in the
     install; its height is taken as 0.

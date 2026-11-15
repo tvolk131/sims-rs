@@ -942,6 +942,9 @@ const BAR_GREEN: u16 = to565([0, 0xca, 0x39]);
 const BAR_RED: u16 = to565([0xd1, 0, 0]);
 const LIT_GREEN: u16 = to565([0, 0xff, 0]);
 const LIT_RED: u16 = to565([0xff, 0, 0]);
+/// The friends smiley's width in the install (4105), where the heart's
+/// place is measured from when the art has no smiley.
+const FRIENDS_ICON_WIDTH: i32 = 9;
 /// The entries' font (0x5281cb).
 const RELATION_FONT: u8 = 7;
 
@@ -1023,6 +1026,9 @@ fn draw_relation(
         let w = i32::try_from(moods.width / 5).unwrap_or(0);
         let h = i32::try_from(moods.height).unwrap_or(0);
         if w > 0 {
+            // The original divides by the strip's cell width, not by a
+            // fifth of the 200 points (0x5283fa..0x528424): with the
+            // install's 40-pixel cells, the same.
             let face = ((relation.lifetime + 100) / w).min(4);
             let source = Rect::new(face * w, 0, w, h);
             frame.draw(moods, source, [r.x.saturating_add((r.width - w) / 2), r.y]);
@@ -1054,8 +1060,10 @@ fn draw_relation(
         );
         frame.fill(Rect::new(x0, top, end.saturating_sub(x0), height), green);
         frame.fill(Rect::new(end, top, x1.saturating_sub(end), height), red);
-        // As the needs' meters (0x51376e), a dark line ends the filled
-        // part where two pixels or more are left.
+        // A dark line ends the filled part where two pixels or more are
+        // left (0x5287e9). Unlike the needs' meters (0x51376e) the
+        // original does not ask for a filled part: with none it draws the
+        // line a pixel left of the bar.
         if x1.saturating_sub(end) > 1 {
             frame.fill(Rect::new(end.saturating_sub(1), top, 1, height), [0, 0, 0]);
         }
@@ -1080,9 +1088,13 @@ fn draw_relation(
     } else {
         None
     };
-    if let (Some(heart), Some(friends)) = (heart, friends) {
-        let w = i32::try_from(friends.width).unwrap_or(0);
-        frame.draw_all(heart, [x0.saturating_add(w + 3), y]);
+    // The heart goes 3 past the smiley's width whether the smiley shows
+    // or not; art without a smiley takes the install's 9.
+    if let Some(heart) = heart {
+        let w = friends.map_or(FRIENDS_ICON_WIDTH, |f| {
+            i32::try_from(f.width).unwrap_or(FRIENDS_ICON_WIDTH)
+        });
+        frame.draw_all(heart, [x0.saturating_add(w.saturating_add(3)), y]);
     }
 }
 
@@ -1890,6 +1902,80 @@ mod tests {
         assert_eq!(relation_colors(0, false), ([33, 146, 74], [140, 40, 41]));
         assert_eq!(relation_colors(0, true), ([33, 170, 49], [165, 40, 41]));
         assert_eq!(relation_colors(100, false), ([0, 203, 57], [66, 89, 90]));
+    }
+
+    #[test]
+    fn a_relationship_entry_follows_the_originals_edges() {
+        let r = Rect::new(10, 10, 45, 90);
+        let relation = |daily: i32, lifetime: i32| Relation {
+            guid: 7,
+            id: 1,
+            daily,
+            lifetime,
+            friends: false,
+            pink_heart: false,
+            red_heart: true,
+            family: false,
+        };
+        // The face: lifetime plus 100 over the strip's cell width, as the
+        // original divides. With 40-pixel cells (the install's) 0 is the
+        // middle face; with 4-pixel ones, the last.
+        let strip = |cell: u32| {
+            let mut moods = solid(cell * 5, 2, [0; 3]);
+            for face in 0..5 {
+                for x in 0..cell {
+                    let i = ((face * cell + x) * 4) as usize;
+                    moods.rgba[i..i + 3].copy_from_slice(&[10 * (face as u8 + 1); 3]);
+                }
+            }
+            moods
+        };
+        for (cell, lifetime, face) in [(40, 0, 2), (40, -61, 0), (40, 60, 4), (4, 0, 4)] {
+            let mut faces = Faces::default();
+            faces.insert_moods(7, strip(cell));
+            let mut frame = Frame::new(80, 120, [0; 3]);
+            draw_relation(
+                &mut frame,
+                &Art::default(),
+                &faces,
+                r,
+                &relation(0, lifetime),
+                false,
+            );
+            let x = 10 + (45 - cell as i32) / 2;
+            assert_eq!(
+                frame.pixel(x, 10),
+                Some([10 * (face + 1); 3]),
+                "{cell} {lifetime}"
+            );
+        }
+        // An empty bar still gets its dark line, a pixel left of the bar
+        // (0x5287e9 asks only for room on the right); a full one none.
+        let back = [5; 3];
+        let mut frame = Frame::new(80, 120, back);
+        let faces = Faces::default();
+        draw_relation(
+            &mut frame,
+            &Art::default(),
+            &faces,
+            r,
+            &relation(-97, 100),
+            false,
+        );
+        let (green, red) = relation_colors(100, false);
+        assert_eq!(frame.pixel(11, 10), Some([0; 3]));
+        assert_eq!(frame.pixel(12, 10), Some(red));
+        assert_eq!(frame.pixel(11, 14), Some(back));
+        assert_eq!(frame.pixel(51, 14), Some(green));
+        assert_eq!(frame.pixel(52, 14), Some(back));
+        // A heart without the smiley's art goes where the install's
+        // 9-wide smiley would put it.
+        let mut art = Art::default();
+        art.insert(id::RED_HEART, solid(9, 9, [2, 2, 2]));
+        let mut frame = Frame::new(80, 120, [0; 3]);
+        draw_relation(&mut frame, &art, &faces, r, &relation(0, 0), false);
+        assert_eq!(frame.pixel(23, 18), Some([0; 3]));
+        assert_eq!(frame.pixel(24, 18), Some([2; 3]));
     }
 
     #[test]
