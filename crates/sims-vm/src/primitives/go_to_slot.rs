@@ -67,6 +67,10 @@
 //! with a slot record it makes from its operands instead of one of the
 //! object's slots ([`relative_slot`]).
 //!
+//! The slot is named by its index in the object's routing slot table,
+//! which holds only the SLOT entries of kind 3
+//! ([`crate::Program::routing_slot`]); none is native error 0x25.
+//!
 //! A slot record an object holds in place of its type's (the move slot
 //! of the marker made to ask a person to move, `world.routing.slots`) is
 //! used instead of the type's slot.
@@ -86,6 +90,7 @@ use crate::fault::{Fault, Trap};
 use crate::interpreter::{Flow, Machine, word};
 use crate::placement::stands_on_lot;
 use crate::routing::slot::{direction, new_context, route_slot};
+use crate::sounds::SoundEvent;
 use sims_sim::route::RouteSlot;
 
 /// Object data words.
@@ -118,6 +123,11 @@ const SUCCEEDED: i32 = 8;
 const ARRIVED: i32 = 9;
 const STOPPED: i32 = 10;
 const START: i32 = 12;
+
+/// The sound events a route plays as it starts and after it stops
+/// (0x6c4530, 0x6c4570).
+const BEGIN_ROUTE: &str = "begin_route";
+const END_ROUTE: &str = "end_route";
 const ASK: i32 = 14;
 const GIVE_UP: i32 = 16;
 const PLAN: i32 = 18;
@@ -245,12 +255,15 @@ impl Machine<'_, '_> {
         }
         let guid = self.world.objects[&target].guid;
         let definition = self.definition(guid)?;
-        let slots = self.program.slots(definition.resource, definition.chunk);
-        let index = usize::try_from(word(operands, 0))
-            .ok()
-            .filter(|&i| i < slots.len())
+        let index = usize::try_from(word(operands, 0)).ok();
+        let (entry, type_slot) = index
+            .and_then(|i| {
+                self.program
+                    .routing_slot(definition.resource, definition.chunk, i)
+            })
             .ok_or(Trap::native(0x25, "Go To Routing Slot names no slot"))?;
-        let key = (target, index as u16);
+        let type_slot = type_slot.clone();
+        let key = (target, word(operands, 0) as u16);
         let near = |flags: i32| {
             if operands[4] & 1 == 0 {
                 flags | NEAR
@@ -270,14 +283,14 @@ impl Machine<'_, '_> {
             .slot_flags
             .get(&key)
             .copied()
-            .unwrap_or(slots[index].flags as i32);
+            .unwrap_or(type_slot.flags as i32);
         let flags = near(flags);
-        if flags == slots[index].flags as i32 {
+        if flags == type_slot.flags as i32 {
             self.world.routing.slot_flags.remove(&key);
         } else {
             self.world.routing.slot_flags.insert(key, flags);
         }
-        let slot = route_slot(&slots[index], index, Some(flags));
+        let slot = route_slot(&type_slot, entry, Some(flags));
         self.route_steps(Some(slot))
     }
 
@@ -476,8 +489,11 @@ impl Machine<'_, '_> {
                     return Ok(Flow::Pushed);
                 }
                 START => {
-                    // The original notes the route in its log here
-                    // (0x57a54c), which is not modeled.
+                    // 0x45b989: "begin_route" plays for me.
+                    self.sound(SoundEvent::Play {
+                        object: me as i16,
+                        name: BEGIN_ROUTE.into(),
+                    });
                     self.store_route(&ctx, &path);
                     interpreter.start_route(self.world, me)?;
                     state = UNDER_WAY;
@@ -517,10 +533,13 @@ impl Machine<'_, '_> {
                             "whose animator is still under way when it is to stop",
                         ));
                     }
-                    // The original notes the step in its log (0x57a54c),
-                    // which is not modeled. A route that stopped short of
-                    // the path's end (a blocked step) tries again
-                    // (0x45b384).
+                    // 0x45b3a0: "end_route" plays for me. A route that
+                    // stopped short of the path's end (a blocked step)
+                    // tries again (0x45b384).
+                    self.sound(SoundEvent::Play {
+                        object: me as i16,
+                        name: END_ROUTE.into(),
+                    });
                     state = if state == STOPPED { RETRY } else { SUCCEEDED };
                 }
                 RETRY => match retry as i16 {

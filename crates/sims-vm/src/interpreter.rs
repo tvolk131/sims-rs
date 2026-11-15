@@ -9,6 +9,7 @@
 
 use crate::fault::{Fault, Location, Trap};
 use crate::program::{DEFINITION_WORDS, Program, Tree};
+use crate::sounds::SoundEvent;
 use sims_content::Catalog;
 use sims_formats::behavior::{Behavior, Instruction};
 use sims_formats::saved_objects::Frame;
@@ -90,6 +91,9 @@ pub struct Interpreter<'a> {
     /// nothing. Play mode reads it to tell an object reset from a later
     /// one given the same ID ([`crate::play`]).
     pub deleted: Option<&'a RefCell<Vec<u16>>>,
+    /// Where to note each request to the sound system, or None to note
+    /// nothing. See [`crate::sounds`].
+    pub sounds: Option<&'a RefCell<Vec<SoundEvent>>>,
     /// The person the factory is making, while its scripts run. When in
     /// the making the original appends a person to the person vector is
     /// not read, so a walk of the vector meanwhile is refused.
@@ -114,7 +118,15 @@ impl<'a> Interpreter<'a> {
             stream,
             asked: None,
             deleted: None,
+            sounds: None,
             making_person: None,
+        }
+    }
+
+    /// Notes a request to the sound system ([`crate::sounds`]).
+    pub(crate) fn sound(&self, event: SoundEvent) {
+        if let Some(sounds) = self.sounds {
+            sounds.borrow_mut().push(event);
         }
     }
 
@@ -242,6 +254,7 @@ impl<'a> Interpreter<'a> {
             stream: self.stream,
             asked: self.asked,
             deleted: self.deleted,
+            sounds: self.sounds,
             base,
             synchronous,
             making_person: self.making_person,
@@ -295,6 +308,7 @@ pub(crate) struct Machine<'a, 'w> {
     pub asked: Option<&'a RefCell<Vec<Asked>>>,
     /// See [`Interpreter::deleted`].
     pub deleted: Option<&'a RefCell<Vec<u16>>>,
+    pub sounds: Option<&'a RefCell<Vec<SoundEvent>>>,
     /// The stack depth below the frames this run owns. When a return pops
     /// the stack down to it, the run is over and the frame below is not
     /// branched.
@@ -322,7 +336,15 @@ impl<'a> Machine<'a, '_> {
             stream: self.stream,
             asked: self.asked,
             deleted: self.deleted,
+            sounds: self.sounds,
             making_person: self.making_person,
+        }
+    }
+
+    /// Notes a request to the sound system ([`crate::sounds`]).
+    pub(crate) fn sound(&self, event: SoundEvent) {
+        if let Some(sounds) = self.sounds {
+            sounds.borrow_mut().push(event);
         }
     }
 

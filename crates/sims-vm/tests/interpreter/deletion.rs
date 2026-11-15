@@ -5,7 +5,8 @@ use crate::factory::{WIDGET, widgets};
 use crate::support::*;
 use sims_formats::execution::ObjectFunction;
 use sims_formats::saved_objects::Slot;
-use sims_vm::{Interpreter, Trap};
+use sims_vm::{Interpreter, SoundEvent, Trap};
+use std::cell::RefCell;
 
 /// The widget's Reset tree.
 const RESET: u16 = 4300;
@@ -281,4 +282,24 @@ fn people_who_do_not_refer_to_a_deleted_object_are_left_alone() {
     assert!(matches!(fault.trap, Trap::Unsupported(_)), "{fault}");
     assert!(fault.to_string().contains("person 9 refers to object 2"));
     assert_eq!(world.encode(), before.encode(), "nothing ran");
+}
+
+#[test]
+fn a_reset_stops_the_objects_sounds_and_a_deletion_stops_them_once() {
+    let (fx, _) = lot(2, true);
+    let sink = RefCell::new(Vec::new());
+    let mut interpreter = fx.interpreter();
+    interpreter.sounds = Some(&sink);
+    let mut world = fx.world.clone();
+    assert_eq!(interpreter.reset(&mut world, 1, false), Ok(()));
+    assert_eq!(sink.take(), [SoundEvent::Stop { object: 1 }]);
+    // The deletion's own reset stops nothing; its destructor does.
+    assert_eq!(interpreter.delete(&mut world, 2), Ok(()));
+    assert_eq!(sink.take(), [SoundEvent::Stop { object: 2 }]);
+    // Without a sink nothing is noted, and the lot ends the same.
+    let mut quiet = fx.world.clone();
+    let plain = fx.interpreter();
+    assert_eq!(plain.reset(&mut quiet, 1, false), Ok(()));
+    assert_eq!(plain.delete(&mut quiet, 2), Ok(()));
+    assert_eq!(quiet.hash(), world.hash());
 }
