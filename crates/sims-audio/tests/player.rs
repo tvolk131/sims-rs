@@ -1343,6 +1343,111 @@ fn the_piano_plays_where_its_object_is_and_sets_the_skill() {
 }
 
 #[test]
+fn a_piano_let_go_from_a_pause_keeps_its_object() {
+    use sims_audio::player::{PIANO, PIANO_SKILL};
+    let mut piano = vec![SET_LOOP];
+    piano.extend([GETSRCDATAFIELD, 6, 1, 19, LOOP]);
+    let skill = [END];
+    let events = "piano=43,0\nunplaced=43,0,8,300,600\nkill9=23,9\nkill8=23,8\n";
+    let module = module_of_tracks(&[(PIANO, &piano), (PIANO_SKILL, &skill)], events);
+    let room = PianoRoom::default();
+    let event = |name: &str, object| SoundEvent::Play {
+        object,
+        name: name.into(),
+    };
+    // The piano plays for 9, then is held by a pause; the start for 8
+    // lets it go, and the piano's one instance is still 9.
+    let mut player = Player::new(vec![module], samples(), 1);
+    player.handle(&event("piano", 9), &room);
+    player.render(BLOCK, &room);
+    player.handle(&SoundEvent::Pause, &room);
+    player.handle(&event("unplaced", 0), &room);
+    player.handle(&SoundEvent::Unpause, &room);
+    play(&mut player, "kill8");
+    player.render(12 * BLOCK, &room);
+    assert!(!player.is_idle());
+    play(&mut player, "kill9");
+    player.render(12 * BLOCK, &room);
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_piano_start_refused_at_the_thread_limit_keeps_its_object() {
+    use sims_audio::player::{PIANO, THREADS};
+    // The piano asks about its object every block; track 20 loops.
+    let mut piano = vec![SET_LOOP];
+    piano.extend([GETSRCDATAFIELD, 6, 1, 19, LOOP]);
+    let filler = [SET_LOOP, LOOP];
+    let events = "piano=43,0\nunplaced=43,0,8,300,600\nkill9=23,9\nkill8=23,8\n";
+    let module = module_of_tracks(&[(PIANO, &piano), (20, &filler)], events);
+    let room = PianoRoom::default();
+    let event = |name: &str, object| SoundEvent::Play {
+        object,
+        name: name.into(),
+    };
+    let mut player = Player::new(vec![module], samples(), 1);
+    player.handle(&event("piano", 9), &room);
+    for _ in 1..THREADS {
+        play(&mut player, "e20");
+    }
+    // The start for 8 is refused: the piano's instance stays 9.
+    player.handle(&event("unplaced", 0), &room);
+    assert_eq!(player.faults.len(), 1);
+    assert!(player.faults[0].contains("threads"));
+    play(&mut player, "kill8");
+    player.render(12 * BLOCK, &room);
+    room.0.take();
+    player.render(BLOCK, &room);
+    assert!(room.0.take().iter().any(|&(object, _)| object == 9));
+    play(&mut player, "kill9");
+    player.render(12 * BLOCK, &room);
+    room.0.take();
+    player.render(BLOCK, &room);
+    assert!(room.0.take().iter().all(|&(object, _)| object != 9));
+}
+
+#[test]
+fn the_piano_asks_the_skill_even_with_no_skill_track() {
+    use sims_audio::player::PIANO;
+    let module = module_of_tracks(&[(PIANO, &[END])], "piano=43,0\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    let room = PianoRoom::default();
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "piano".into(),
+        },
+        &room,
+    );
+    assert_eq!(room.0.take(), [(9, 5)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_fresh_start_sets_the_levels_from_the_arguments() {
+    // Each track asks about its `extvol`, as the field its `pan`.
+    let asker = [GETSRCDATAFIELD, 6, 19, 20, END];
+    // Track 12 sets arg2 = 7, arg3 = 8 and plays track 11.
+    let mut starter = [loadb(2, 7), loadb(3, 8), loadb(5, 11)].concat();
+    starter.extend([PLAY_TRK, 5, END]);
+    let module = module_of_kinds(
+        &[(10, 1, &asker), (11, 2, &asker), (12, 2, &starter)],
+        "levels=1,10,300,600\n",
+    );
+    let mut player = Player::new(vec![module], samples(), 1);
+    // `kArgsVolPan`: the first two arguments.
+    play(&mut player, "levels");
+    assert_eq!(asked_in_a_block(&mut player), [(300, 600)]);
+    // `kArgsIdVolPan`, started by `play_trk` for the next block: the
+    // caller's second and third.
+    play(&mut player, "e12");
+    assert_eq!(asked_in_a_block(&mut player), []);
+    assert_eq!(asked_in_a_block(&mut player), [(7, 8)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
 fn the_piano_without_its_track_does_nothing() {
     let module = module_with(&[&GENERIC], 1, 10, "piano=43,10\n");
     let mut player = Player::new(vec![module], samples(), 1);
@@ -1356,21 +1461,28 @@ const KILL_TRK: u8 = 51;
 /// A module with each routine run by the track given with it, and event
 /// `e{track}` (`kSndobPlay`) for each.
 fn module_of_tracks(tracks: &[(u32, &[u8])], events: &str) -> Module {
-    let routines: Vec<&[u8]> = tracks.iter().map(|&(_, routine)| routine).collect();
+    let tracks: Vec<(u32, u8, &[u8])> = tracks.iter().map(|&(t, r)| (t, 2, r)).collect();
+    module_of_kinds(&tracks, events)
+}
+
+/// As [`module_of_tracks`], each track with its argument kind
+/// (`kArgsVolPan` 1, `kArgsIdVolPan` 2).
+fn module_of_kinds(tracks: &[(u32, u8, &[u8])], events: &str) -> Module {
+    let routines: Vec<&[u8]> = tracks.iter().map(|&(_, _, routine)| routine).collect();
     let (hit, addresses) = assemble(&routines);
     let mut hot = String::from("[EventMappingEquate]\nkSndobPlay=1\n[TrackData]\n");
     for (i, address) in addresses.iter().enumerate() {
         hot.push_str(&format!("{:#x}={address:#x}\n", 0x100 + i));
     }
     hot.push_str("[Patch]\n1=0,one,\"one.xa\"\n[Track]\n");
-    for (i, (track, _)) in tracks.iter().enumerate() {
+    for (i, (track, arguments, _)) in tracks.iter().enumerate() {
         hot.push_str(&format!(
-            "{track}=0,t{track},1024,2,0,0,0,{:#x},1\n",
+            "{track}=0,t{track},1024,{arguments},0,0,0,{:#x},1\n",
             0x100 + i
         ));
     }
     hot.push_str("[EventMapping]\n");
-    for (track, _) in tracks {
+    for (track, _, _) in tracks {
         hot.push_str(&format!("e{track}=kSndobPlay,{track}\n"));
     }
     hot.push_str(events);

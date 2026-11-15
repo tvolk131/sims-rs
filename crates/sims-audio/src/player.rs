@@ -599,6 +599,11 @@ pub struct Player<S> {
     /// each pair once, and each track's in the order the original goes
     /// through them ([`Player::record`]).
     instances: Vec<(u32, u32)>,
+    /// *(code)* Each track object's own object (+0xb0, read by vtable
+    /// +0x24): set only by a fresh start of a `kArgsIdVolPan` track
+    /// (0x57db2e), so a start that lets a held track go or is refused
+    /// leaves it. 0 until then, as the track's constructor leaves it.
+    track_objects: BTreeMap<u32, u32>,
     /// The ambience scores, by mode (see [`crate::ambience`]).
     scores: BTreeMap<u32, Fresh>,
     /// *(code)* The current ambience (manager +0x100), by mode.
@@ -663,6 +668,7 @@ impl<S: Samples> Player<S> {
             master: 1024,
             notes: Vec::new(),
             instances: Vec::new(),
+            track_objects: BTreeMap::new(),
             scores: BTreeMap::new(),
             ambience: None,
             music_mode: 4,
@@ -1487,10 +1493,12 @@ impl<S: Samples> Player<S> {
     /// one object, with the piano's `Spl` ([`placement::place`]), into
     /// the second and third arguments, which keep the event's values when
     /// it is not placed; the piano starts (and is let go) with them. The
-    /// piano's instances are then replaced by the one object the start
-    /// left on its track: the object for a `kArgsIdVolPan` track, else
-    /// none (0). Last, [`PIANO_SKILL`] starts, when it exists, with the
-    /// object's source field 5 as its first argument.
+    /// piano's instances are then replaced by the one object the track
+    /// object holds: the object of the last fresh start, which a start
+    /// that lets a held piano go or is refused does not change, and 0
+    /// before any. Last, the object's source field 5 is asked for, and
+    /// [`PIANO_SKILL`] starts, when it exists, with it as its first
+    /// argument.
     fn play_piano(&mut self, module: usize, args: [u32; 3], sources: &dyn Sources) {
         if self.owner(module, PIANO).is_none() {
             return;
@@ -1505,14 +1513,12 @@ impl<S: Samples> Player<S> {
             Err(fault) => self.report(fault),
         }
         self.start(args, module, PIANO, false);
-        let object = match self.track_args(module, PIANO) {
-            Some(ARGS_ID_VOL_PAN) => args[0],
-            _ => 0,
-        };
+        let object = self.track_objects.get(&PIANO).copied().unwrap_or(0);
         self.instances.retain(|&(t, _)| t != PIANO);
         self.record(PIANO, object);
+        // The skill is asked for before the skill track is looked up.
+        let skill = sources.field(args[0] as i32, 5).unwrap_or(0);
         if self.owner(module, PIANO_SKILL).is_some() {
-            let skill = sources.field(args[0] as i32, 5).unwrap_or(0);
             self.start([skill as u32, 0, 0], module, PIANO_SKILL, false);
         }
     }
@@ -1611,9 +1617,14 @@ impl<S: Samples> Player<S> {
         // and `pan` in the first two, `kArgsIdVolPan` in the last two
         // (after the object). The stores leave the flags alone. (A track
         // never started, as kind 53 plays on, keeps its defaults.)
+        // A `kArgsIdVolPan` start also makes the object the track
+        // object's own (vtable +0x20).
         let levels = match self.track_args(module, track) {
             Some(ARGS_VOL_PAN) => Some((args[0], args[1])),
-            Some(ARGS_ID_VOL_PAN) => Some((args[1], args[2])),
+            Some(ARGS_ID_VOL_PAN) => {
+                self.track_objects.insert(track, args[0]);
+                Some((args[1], args[2]))
+            }
             _ => None,
         };
         if let Some((vol, pan)) = levels {
