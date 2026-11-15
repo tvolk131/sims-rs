@@ -31,6 +31,38 @@ search picks a place to stand, so the Sit route is covered only by
 synthetic tests. Reopen when a capture of a route that sits disagrees,
 or when a rounding at x.5 after the matrix lands on the other side.
 
+## 2026-11-15: A pie menu that offers nothing lists the other objects on the tile
+
+When the listing on an object offers nothing, the original lists each
+other object on that object's tile in turn (0x48d423, walking the tile
+with 0x43f331 and 0x43f379, the links read again after each listing,
+nothing outside the lot's size) and adds what they offer. Each listing
+checks again whether the person is a pet. It leaves out an
+object of type 8 and one whose definition word 91 lacks bit 0. Each of
+those listings saves and restores the person's temps itself, and the
+first listing's temps go back last. A menu that still offers nothing
+is an empty menu, not a failure. The tile is the one the object's
+position is on; for an object held in a slot, whether the original's
+object +0xfc names the same tile is **unverified**. On the Goth house
+283 objects now give an empty menu instead of failing, 75 offer
+actions, and 19 fail in check trees on Add/Change Action String,
+Manage Inventory operation 4, and scopes 24 and 12.
+
+## 2026-11-15: An empty interaction table keeps its version and loads
+
+A TTAB chunk with no entries was read as version 0, which the
+interpreter refuses as a table older than 7. The original's reader
+(0x475cc0) reads the version whatever the count, and the loader
+(0x475a24) succeeds with no entries. So an empty table now has its own
+version, and loads as a table with no entries. A chunk that ends before
+the version word, which the original reads past its end, is rejected;
+the install has none. In the Complete Collection install there are 270 such chunks:
+225 of version 9, 44 of version 8, and one of version 6
+(PoolLadder.iff), which the refusal of tables older than 7 still
+catches. On the Goth house this moves 32 objects' pie menus past the
+refusal; most now reach the tile fallback for an object that offers
+nothing (0x48d423).
+
 ## 2026-11-15: The lot lists pie menus and takes picks on the real lot
 
 `Lot::pie_menu(person, object)` and `Lot::pick(person, action)` run the
