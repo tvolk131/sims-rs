@@ -204,6 +204,16 @@ impl Hud {
         Some(band)
     }
 
+    /// The panel as it was last laid out.
+    pub fn items(&self) -> &[Item] {
+        &self.items
+    }
+
+    /// The first name of people of type `guid`, from their file.
+    pub fn name(&self, guid: u32) -> Option<&str> {
+        self.faces.name(guid)
+    }
+
     /// Whether the panel or the status band covers `point` (canvas
     /// pixels), or a dialog or a pie menu is shown and takes every press.
     pub fn covers(&self, point: [i32; 2]) -> bool {

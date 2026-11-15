@@ -2157,6 +2157,15 @@ through their public interfaces only; the simulation never depends on it.
   (0x58da12), which is not ported, so in strict mode (`Lot::select`)
   switching Sims fails and changes nothing; play mode
   (`Lot::select_play`) leaves the refresh out.
+- **Done: the panel follows the lot.** Every frame the panel reads the
+  world as it is: the clock (globals 0 and 5), the household's funds,
+  the portraits with the selected Sim's lit, and the selected Sim's mood
+  bars and needs meters. A Goth test queues the snack and runs 850 ticks:
+  the funds go from $2,542 to $2,537 when Mortimer pays, the clock moves,
+  and the hunger meter is his hunger. The pointer on a portrait shows
+  that person's first name (catalog strings, `OBJD` word 41) in a box
+  over it; that box is ours (**unverified**). The original's action queue
+  in the top-left corner is not drawn yet.
 - **Next:** the selected Sim's head in the middle of the pie; answering
   a dialog from the window.
 - **Needs from other crates:**

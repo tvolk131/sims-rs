@@ -217,6 +217,9 @@ pub enum Kind {
     },
     /// A motive meter.
     Meter(f32),
+    /// The first name of the person of type `guid`, in a box centered
+    /// over `rect`'s bottom edge, while the pointer is on their portrait.
+    Name { guid: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,6 +467,7 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
     // four columns at 800 by 600, so a family of eight fits. The second
     // row is **unverified**; people past the two rows are left out.
     let columns = ((gadget.x - strip.x - 9) / 45).max(1);
+    let mut named = None;
     for (n, resident) in snapshot.residents.iter().enumerate() {
         let n = i32::try_from(n).unwrap_or(i32::MAX);
         if n >= columns.saturating_mul(2) {
@@ -472,8 +476,15 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         let x = strip.x + 9 + 45 * (n % columns);
         let y = strip.y + 5 + 45 * (n / columns);
         let selected = snapshot.selected == Some(resident.object);
+        let rect = Rect::new(x, y, 45, 45);
+        if controls
+            .pointer
+            .is_some_and(|[px, py]| rect.contains(px, py))
+        {
+            named = Some((rect, resident.guid));
+        }
         items.push(Item {
-            rect: Rect::new(x, y, 45, 45),
+            rect,
             kind: Kind::Portrait {
                 guid: resident.guid,
                 selected,
@@ -551,7 +562,23 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             });
         }
     }
+    // The name of the person whose portrait the pointer is on, over the
+    // strip above the portrait. Ours: where and how the original shows a
+    // name there is **unverified**.
+    if let Some((rect, guid)) = named {
+        items.push(Item {
+            rect: Rect::new(rect.x, strip.y - NAME_HEIGHT - 2, rect.width, NAME_HEIGHT),
+            kind: Kind::Name { guid },
+            command: None,
+        });
+    }
 }
+
+/// The name box's height and font size, and its colors: the needs
+/// panel's label color on black.
+const NAME_HEIGHT: i32 = 16;
+const NAME_SIZE: u8 = 8;
+const NAME_BACK: [u8; 3] = [0, 0, 0];
 
 /// The needs in the panel's order, left column first, with their motive
 /// numbers (`crates/sims-sim/src/motives.rs`). The order is the
@@ -733,6 +760,22 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                     font.draw(frame, text, [x, r.y], *rgb);
                 }
             }
+            Kind::Name { guid } => {
+                let (Some(name), Some(font)) = (faces.name(*guid), art.font(NAME_SIZE)) else {
+                    continue;
+                };
+                let width = font.width(name).saturating_add(8);
+                let x = r.x + (r.width - width).div_euclid(2);
+                let right = i32::try_from(frame.width()).unwrap_or(i32::MAX);
+                let x = x.clamp(0, (right - width).max(0));
+                let box_ = Rect::new(x, r.y, width, r.height);
+                frame.fill(box_, LABEL);
+                frame.fill(
+                    Rect::new(x + 1, r.y + 1, width - 2, r.height - 2),
+                    NAME_BACK,
+                );
+                font.draw(frame, name, [x + 4, r.y + 2], LABEL);
+            }
             Kind::Meter(value) => {
                 let (width, left, right) = meter(*value);
                 frame.fill(r, right);
@@ -755,7 +798,7 @@ impl Item {
         self.command.is_some()
             || !matches!(
                 self.kind,
-                Kind::Text { .. } | Kind::Bars { .. } | Kind::Meter(_)
+                Kind::Text { .. } | Kind::Bars { .. } | Kind::Meter(_) | Kind::Name { .. }
             )
     }
 }
@@ -776,7 +819,10 @@ pub fn press(items: &[Item], point: [i32; 2]) -> Option<Command> {
 /// Whether the panel covers `point`, so a press there is the panel's and
 /// not the lot's.
 pub fn covers(items: &[Item], point: [i32; 2]) -> bool {
-    items.iter().any(|i| i.rect.contains(point[0], point[1]))
+    // A name box floats over the lot and takes nothing from it.
+    items
+        .iter()
+        .any(|i| !matches!(i.kind, Kind::Name { .. }) && i.rect.contains(point[0], point[1]))
 }
 
 /// The item under `point` that a press would act on, for hover changes.
@@ -850,6 +896,34 @@ mod tests {
         let narrow = layout([400, 600], &snapshot(), &controls);
         assert_eq!(press(&narrow, [60, 530]), None);
         assert_eq!(hovered(&narrow, Some([60, 530])), None);
+    }
+
+    #[test]
+    fn the_pointer_on_a_portrait_shows_that_persons_name_over_it() {
+        let on = |pointer| Controls {
+            expanded: true,
+            pointer: Some(pointer),
+            ..Controls::default()
+        };
+        let names = |items: &[Item]| -> Vec<(Rect, u32)> {
+            items
+                .iter()
+                .filter_map(|i| match i.kind {
+                    Kind::Name { guid } => Some((i.rect, guid)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The second portrait, from x 274: its name over the strip.
+        let items = layout([800, 600], &snapshot(), &on([280, 520]));
+        assert_eq!(names(&items), [(Rect::new(274, 482, 45, 16), 18)]);
+        // The box takes nothing from the lot under it.
+        assert!(!covers(&items, [290, 490]));
+        assert_eq!(press(&items, [290, 490]), None);
+        // Off the portraits, no name.
+        for pointer in [[400, 300], [90, 555], [320, 560]] {
+            assert!(names(&layout([800, 600], &snapshot(), &on(pointer))).is_empty());
+        }
     }
 
     #[test]

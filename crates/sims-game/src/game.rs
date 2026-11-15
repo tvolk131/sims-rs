@@ -507,6 +507,17 @@ impl Game {
         }
     }
 
+    /// The control panel as it was last laid out, from the world as it
+    /// was when the frame was drawn ([`Game::render`]).
+    pub fn panel(&self) -> &[sims_ui::hud::Item] {
+        self.hud.items()
+    }
+
+    /// The first name the panel shows for people of type `guid`.
+    pub fn name(&self, guid: u32) -> Option<&str> {
+        self.hud.name(guid)
+    }
+
     /// The pie menu, while one is open. Its labels are placed when the
     /// game is rendered.
     pub fn menu(&self) -> Option<&Menu> {
