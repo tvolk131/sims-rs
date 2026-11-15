@@ -1981,14 +1981,16 @@ stop-sounds events.
   value the ambience's row follows is ported (`ambience::view`, from
   0x570c3e: the share of the screen's tiles that are outdoors, read
   through `World::outside`), and the hour is the clock's.
+- **Done: pause and unpause** (21 and 22): the sounds playing are held
+  where they are, but for the interface's and the main music's, and the
+  live ambience stops picking cells.
 - **Done: what scripts ask about an object.** `getsrcdatafield` gets the
   original's answers (0x570e61: a person's voice, age, skills,
   personality and motive 3, the hour, the size of the object's room),
   read from the lot between ticks (`sims_game::sound::sources`).
 - **Next:**
-  - Positions for 3D sound, pause and unpause (21 and 22; 103 and 104
-    are debug commands), the piano (43) and the music half of the music
-    modes (36).
+  - Positions for 3D sound, the piano (43) and the music half of the
+    music modes (36). 103 and 104 are debug commands.
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)

@@ -316,6 +316,208 @@ fn a_snapshot_answers_by_object_and_field() {
 }
 
 #[test]
+fn a_pause_holds_a_playing_note_where_it_is() {
+    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
+    let mut player = Player::new(vec![module(&[generic], 1)], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(
+        player.render(40, &NoSources),
+        (1..=40).collect::<Vec<i16>>()
+    );
+    player.handle(&SoundEvent::Pause);
+    assert!(player.is_paused());
+    // Held: silent, and the thread waits, however long.
+    assert!(player.render(3 * BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(!player.is_idle());
+    player.handle(&SoundEvent::Unpause);
+    assert!(!player.is_paused());
+    // It goes on from where it was.
+    assert_eq!(
+        player.render(60, &NoSources),
+        (41..=100).collect::<Vec<i16>>()
+    );
+    player.render_until_idle(4 * BLOCK, &NoSources);
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+/// Waits a second (loadl v1, 1000; wait v1), then plays.
+fn waits_a_second() -> Vec<u8> {
+    [
+        &[LOADL, 5][..],
+        &long(1000),
+        &[WAIT, 5],
+        &[2, 5, WAIT_SAMP, END],
+    ]
+    .concat()
+}
+
+#[test]
+fn an_unpause_ends_a_wait_held_by_the_pause() {
+    let routine = waits_a_second();
+    let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+    play(&mut player, "e0");
+    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    player.handle(&SoundEvent::Pause);
+    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    // Letting the track go moves its deadline to now (0x57dc8e): the
+    // thread runs at the next block, long before its second is up.
+    player.handle(&SoundEvent::Unpause);
+    assert_eq!(
+        player.render(10, &NoSources),
+        (1..=10).collect::<Vec<i16>>()
+    );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn an_unpause_without_a_pause_ends_every_wait() {
+    let routine = waits_a_second();
+    let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+    play(&mut player, "e0");
+    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    player.handle(&SoundEvent::Unpause);
+    assert_eq!(
+        player.render(10, &NoSources),
+        (1..=10).collect::<Vec<i16>>()
+    );
+}
+
+#[test]
+fn a_pause_spares_the_interface_and_lets_new_sounds_play() {
+    // Tracks 0x604 and 0x605 (`ui_click`, which a pause spares).
+    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
+    let mut player = Player::new(
+        vec![module_with(&[generic, generic], 1, 0x604, "")],
+        samples(),
+        1,
+    );
+    play(&mut player, "e0");
+    play(&mut player, "e1");
+    let both: Vec<i16> = (1..=10).map(|v| 2 * v).collect();
+    assert_eq!(player.render(10, &NoSources), both);
+    player.handle(&SoundEvent::Pause);
+    assert_eq!(
+        player.render(10, &NoSources),
+        (11..=20).collect::<Vec<i16>>()
+    );
+    // Starting a held track whose script still runs lets it go on
+    // (0x57da05): its note goes on at once and no second thread
+    // starts, so nothing new joins at the next block (frame 64).
+    play(&mut player, "e0");
+    let out = player.render(100, &NoSources);
+    let resumed: Vec<i16> = (0..100)
+        .map(|i| {
+            let held = if i < 90 { 11 + i } else { 0 };
+            let click = if i < 80 { 21 + i } else { 0 };
+            held + click
+        })
+        .collect();
+    assert_eq!(out, resumed);
+    player.handle(&SoundEvent::Unpause);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+/// Records what the scripts ask (`getsrcdatafield`) and answers 0.
+#[derive(Default)]
+struct Asked(std::cell::RefCell<Vec<(i32, i32)>>);
+
+impl Sources for Asked {
+    fn field(&self, source: i32, field: i32) -> Option<i32> {
+        self.0.borrow_mut().push((source, field));
+        Some(0)
+    }
+}
+
+#[test]
+fn starting_a_held_track_gives_its_script_the_new_arguments_and_ends_its_wait() {
+    // arg2 = 8, arg3 = 9; wait a second; ask field arg2 of arg1.
+    let routine: Vec<u8> = [
+        &[4, 2, 8][..], // loadb arg2, 8
+        &[4, 3, 9],     // loadb arg3, 9
+        &[LOADL, 5],
+        &long(1000), // loadl v1, 1000
+        &[WAIT, 5],
+        &[72, 6, 1, 2], // getsrcdatafield v2, arg1, arg2
+        &[END],
+    ]
+    .concat();
+    let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+    let asked = Asked::default();
+    play(&mut player, "e0");
+    player.render(BLOCK, &asked);
+    player.handle(&SoundEvent::Pause);
+    // Started again for object 4 while held: the same script goes on,
+    // with arguments 4, 0 and 0 (0x57d9cb to 0x57d9eb), at the next
+    // block, its second's wait cut short (0x57dc8e).
+    play_for(&mut player, 4, "e0");
+    player.render(BLOCK, &asked);
+    assert_eq!(*asked.0.borrow(), [(4, 0)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn starting_a_held_track_needs_no_free_thread() {
+    let routine = waits_a_second();
+    let mut player = Player::new(vec![module(&[&routine, &routine], 1)], samples(), 1);
+    play(&mut player, "e0");
+    for _ in 1..sims_audio::player::THREADS {
+        play(&mut player, "e1");
+    }
+    player.render(BLOCK, &NoSources);
+    player.handle(&SoundEvent::Pause);
+    // Every thread is taken, but the held e0 is let go, not started.
+    play(&mut player, "e0");
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    assert_eq!(
+        player.render(10, &NoSources),
+        (1..=10).collect::<Vec<i16>>()
+    );
+}
+
+#[test]
+fn a_held_track_with_no_script_left_starts_anew() {
+    // A note alone holds the track: its thread has ended (note_on, end).
+    let note_only: &[u8] = &[2, 5, END];
+    let mut player = Player::new(vec![module(&[note_only], 1)], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(
+        player.render(10, &NoSources),
+        (1..=10).collect::<Vec<i16>>()
+    );
+    player.handle(&SoundEvent::Pause);
+    assert!(player.render(10, &NoSources).iter().all(|&s| s == 0));
+    // Starting it clears the hold, so the old note goes on at once, and
+    // a new thread starts a second note at the next block (frame 64).
+    play(&mut player, "e0");
+    let out = player.render(50, &NoSources);
+    let expected: Vec<i16> = (0..50)
+        .map(|i| {
+            let new = if 20 + i >= 64 { 20 + i - 63 } else { 0 };
+            (11 + i) + new
+        })
+        .collect();
+    assert_eq!(out, expected);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn kinds_21_and_22_pause_and_unpause() {
+    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
+    let module = module_with(&[generic], 1, 10, "pause=21,0\nunpause=22,0\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e0");
+    player.render(10, &NoSources);
+    play(&mut player, "pause");
+    assert!(player.is_paused());
+    assert!(player.render(10, &NoSources).iter().all(|&s| s == 0));
+    play(&mut player, "unpause");
+    assert!(!player.is_paused());
+    assert_eq!(player.render(5, &NoSources), [11, 12, 13, 14, 15]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
 fn unknown_events_and_bad_code_are_faults_not_panics() {
     let bad: &[u8] = &[26];
     let spin: &[u8] = &[13, 1, 1, 0, 0]; // jump 0x101: itself, forever
@@ -1146,4 +1348,39 @@ fn event_numbers_past_32_bits_are_faults() {
     // -1 fits (as 0xffffffff): no such hit list.
     play(&mut player, "ok");
     assert!(player.faults[2].contains("no hit list 4294967295"));
+}
+
+const IFLE: u8 = 67;
+
+#[test]
+fn a_fresh_start_leaves_positive_flags_whatever_its_third_argument() {
+    // Branch to the silent routine 0x101 unless the flags are positive; the
+    // event's third argument is -1. A fresh start writes isplaying (46)
+    // last (0x57dbc5), so the flags are positive and the note plays.
+    let mut branches = vec![IFLE];
+    branches.extend(long(0x101));
+    branches.extend([2, 5, WAIT_SAMP, END]);
+    let silent: &[u8] = &[END];
+    let module = module_with(&[&branches, silent], 1, 10, "neg=1,10,0,0,-1\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "neg");
+    assert_eq!(player.render(5, &NoSources), [1, 2, 3, 4, 5]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_television_turned_on_during_a_pause_waits_for_the_unpause() {
+    // Kind 30 starts the track but resumes it only when the game is not
+    // paused (0x573d71); the start held it (0x57dc2e).
+    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
+    let module = module_with(&[generic], 1, 10, "on=30,10,3\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    player.handle(&SoundEvent::Pause);
+    play(&mut player, "on");
+    assert!(player.render(2 * BLOCK, &NoSources).iter().all(|&s| s == 0));
+    player.handle(&SoundEvent::Unpause);
+    let out = player.render(2 * BLOCK, &NoSources);
+    let first = out.iter().position(|&s| s != 0).expect("the note plays");
+    assert_eq!(&out[first..first + 5], [1, 2, 3, 4, 5]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
