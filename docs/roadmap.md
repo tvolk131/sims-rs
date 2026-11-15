@@ -69,9 +69,11 @@ events, and what it asks for after them) come first.
   ported.
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
-  stop at the arrays, and the version-62 ones have no family. The
-  templates' `Patch` families are not imported (see
-  `docs/decisions.md`).
+  read their arrays whole (Arry 11, 12, 111 and 112). UserData2's
+  houses 1 and 9 then stop at their floor and wall maps
+  (`World::renumber_surfaces`), and the houses with no family stop at
+  the household selection. The templates' `Patch` families are not
+  imported (see `docs/decisions.md`).
 
 ## Met goal: a headless lot boot that matches the original
 
