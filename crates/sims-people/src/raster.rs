@@ -9,7 +9,10 @@ use crate::math::{Transform, Vec3};
 use crate::skin::{Skinned, skin};
 
 /// The direction the light comes from in the offscreen renders: above,
-/// a little to the side and behind the viewer of the house view.
+/// a little to the side and behind the viewer of the house view. This is
+/// our own light, not the original's. The original lights a person by a
+/// level from 0 to 1, the standard light turned by the view, and the room's
+/// lamps (see the decisions entry "How the original lights a person").
 pub const LIGHT: Vec3 = Vec3::new(0.3, 1.0, -0.5);
 
 /// An orthographic camera. The view turns about the vertical axis by an
