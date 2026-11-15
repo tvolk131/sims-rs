@@ -3,7 +3,7 @@
 //! `SIMS_INSTALL`; skipped when it is unset. Nothing from the game is
 //! kept.
 
-use sims_people::lot::{NEAR_PIXELS_PER_UNIT, ground_height};
+use sims_people::lot::NEAR_PIXELS_PER_UNIT;
 use sims_people::raster::Target;
 use sims_people::raster::{Camera, Canvas};
 use sims_people::{
@@ -222,7 +222,10 @@ fn the_people_of_a_running_lot_are_drawn_in_the_lot_renderers_view() {
                     .map(|p| {
                         let [x, y, _] = world.animators[&p.id].position.map(|v| v.to_f32());
                         let fine = [x, y].map(|v| v.round() as i32);
-                        let ground = ground_height(world, [x, y]).unwrap_or(0.0);
+                        let [p0, p1, _] = world.animators[&p.id].position;
+                        let ground = sims_sim::head::ground_height(world, [p0, p1])
+                            .map(|h| h.to_f32())
+                            .unwrap_or(0.0);
                         let elevation = (ground * NEAR_PIXELS_PER_UNIT).round() as i32;
                         let level = if p.level <= 1 { 1 } else { p.level };
                         let [sx, sy] =
