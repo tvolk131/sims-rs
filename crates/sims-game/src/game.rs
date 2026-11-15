@@ -476,10 +476,7 @@ impl Game {
     /// The person or object shown at `point` on the lot in the frame last
     /// drawn.
     pub fn under(&self, point: [i32; 2]) -> Option<u16> {
-        let world = self.lot.world();
-        self.people
-            .at(world, point)
-            .or_else(|| pick::object(world, &self.lot_shape, &self.view.camera, point))
+        pick::at(self.lot.world(), &self.canvas, point)
     }
 
     /// Lists the selected Sim's pie menu on `object` (`Lot::pie_menu`,
