@@ -383,15 +383,7 @@ fn snap_checks_its_object_mode_and_slot() {
 
 #[test]
 fn what_snap_does_not_port_fails_loudly() {
-    let cases: [(Slot, u8, &str); 4] = [
-        (
-            Slot {
-                snap_target: 0,
-                ..slot(SKIP_CHECKS)
-            },
-            0,
-            "0x454b19",
-        ),
+    let cases: [(Slot, u8, &str); 3] = [
         (
             Slot {
                 offset: [8.0, 0.0, 0.0],
@@ -481,4 +473,154 @@ fn go_to_routing_slot_numbers_its_slot_across_the_whole_chunk() {
         let keys: Vec<_> = fx.world.routing.slot_flags.keys().copied().collect();
         assert_eq!(keys, [(LAMP, routing as u16)], "routing slot {routing}");
     }
+}
+
+/// The lamp's SLOT chunk: a routing slot that snaps into container slot
+/// `into`, then two container slots at its centre, at height 1.
+fn into_lamp(fx: &mut Fixture, into: i32) {
+    let container = Slot { kind: 0, ..slot(0) };
+    set_slots(
+        fx,
+        vec![
+            Slot {
+                snap_target: into,
+                ..slot(SKIP_CHECKS)
+            },
+            container.clone(),
+            container,
+        ],
+    );
+    fx.lamp_mut().position = [56, 24, 1];
+}
+
+/// The snapper, able to go into the lamp: its data word 4 has the bit for
+/// height 1, and its weight (data word 27) is the lamp's capacity (data
+/// word 28).
+fn container_snapper() -> (Fixture, u16) {
+    let (mut fx, me) = snapper(SKIP_CHECKS);
+    into_lamp(&mut fx, 1);
+    let person = fx.world.objects.get_mut(&me).unwrap();
+    person.data[4] = 1;
+    person.data[27] = 3;
+    fx.lamp_mut().data[28] = 3;
+    // The fixture's lamp holds objects in its script slots; empty them.
+    for held in &mut fx.lamp_mut().slots[1..] {
+        held.object = 0;
+    }
+    (fx, me)
+}
+
+#[test]
+fn snap_into_a_container_slot_puts_me_in_the_object() {
+    let (mut fx, me) = container_snapper();
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+    // I stand at the lamp's position, in its script slot 1 (saved slot 2),
+    // facing my own way.
+    let person = &fx.world.objects[&me];
+    assert_eq!(person.position, [56, 24, 1]);
+    assert_eq!(person.data[1], 3);
+    let held: Vec<i16> = fx.world.objects[&LAMP].slots[1..]
+        .iter()
+        .map(|s| s.object)
+        .collect();
+    assert_eq!(held, [0, me as i16]);
+}
+
+#[test]
+fn snap_into_a_container_slot_needs_the_slot_and_a_place_in_it() {
+    // One past the lamp's last container slot is native error 0x20.
+    let (mut fx, me) = container_snapper();
+    into_lamp(&mut fx, 2);
+    let start = unmoved(&fx, me);
+    assert_eq!(code(snap(&mut fx, me, LAMP as i16, 0, 3, 0)), Some(0x20));
+    assert_eq!(unmoved(&fx, me), start);
+    // Flag bit 2 tests the walls around the object instead (0x45522c).
+    let (mut fx, me) = container_snapper();
+    let result = snap(&mut fx, me, LAMP as i16, 0, 3, 4);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x45522c")));
+    // The place test refuses: the slot holds another object, the lamp
+    // takes less than I weigh, or my data word 4 lacks the bit for the
+    // slot's height. Not fitting fails loudly and moves nothing.
+    let refusals: [fn(&mut Fixture, u16); 3] = [
+        |fx, _| fx.lamp_mut().slots[2].object = LAMP as i16,
+        |fx, _| fx.lamp_mut().data[28] = 2,
+        |fx, me| fx.world.objects.get_mut(&me).unwrap().data[4] = 2,
+    ];
+    for (case, refuse) in refusals.into_iter().enumerate() {
+        let (mut fx, me) = container_snapper();
+        refuse(&mut fx, me);
+        let start = unmoved(&fx, me);
+        let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
+        assert!(
+            matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454e09")),
+            "case {case}"
+        );
+        assert_eq!(unmoved(&fx, me), start, "case {case}");
+    }
+}
+
+/// The container snapper, with the lamp's container slot 1 (the one it
+/// snaps into) at `offset`.
+fn offset_container(offset: [f32; 3]) -> (Fixture, u16) {
+    let (mut fx, me) = container_snapper();
+    let container = Slot { kind: 0, ..slot(0) };
+    set_slots(
+        &mut fx,
+        vec![
+            Slot {
+                snap_target: 1,
+                ..slot(SKIP_CHECKS)
+            },
+            container.clone(),
+            Slot {
+                offset,
+                ..container
+            },
+        ],
+    );
+    (fx, me)
+}
+
+#[test]
+fn a_container_slot_offset_across_fails_loudly_but_negative_zero_does_not() {
+    // The offset across moves my animator (0x454ceb), which is not kept.
+    for offset in [[8.0, 0.0, 0.0], [0.0, -0.5, 0.0]] {
+        let (mut fx, me) = offset_container(offset);
+        let start = unmoved(&fx, me);
+        let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
+        assert!(
+            matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454ceb")),
+            "{offset:?}"
+        );
+        assert_eq!(unmoved(&fx, me), start, "{offset:?}");
+    }
+    let (mut fx, me) = offset_container([-0.0, -0.0, 0.0]);
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+}
+
+#[test]
+fn a_container_slot_at_height_0_raised_off_the_floor_is_height_5() {
+    // Height 0 with a nonzero offset up is height 5: data word 4 needs
+    // bit 4 (16), not bit 0.
+    let (mut fx, me) = offset_container([0.0, 0.0, 2.0]);
+    let start = unmoved(&fx, me);
+    let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454e09")));
+    assert_eq!(unmoved(&fx, me), start);
+    let (mut fx, me) = offset_container([0.0, 0.0, 2.0]);
+    fx.world.objects.get_mut(&me).unwrap().data[4] = 16;
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+}
+
+#[test]
+fn nothing_goes_into_an_object_it_holds() {
+    // The lamp is in my slot (its data word 26 names me), so I cannot go
+    // into it.
+    let (mut fx, me) = container_snapper();
+    fx.lamp_mut().data[26] = me as i16;
+    fx.lamp_mut().data[14] = 1;
+    let start = unmoved(&fx, me);
+    let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454e09")));
+    assert_eq!(unmoved(&fx, me), start);
 }

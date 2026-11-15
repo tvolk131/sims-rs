@@ -61,10 +61,10 @@ Each step is a few PRs, and each PR leaves `main` green.
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
   there, as three captures recorded; the fifth also drew after tick 901,
-  see "Ticks 901 to 991"). **K = 991 on the Goth house**: our
+  see "Ticks 901 to 991"). **K = 1000 on the Goth house**: our
   state after every one of ticks 1 to 608 equals the fourth capture of the
   original (full state after every update), and after every one of ticks
-  600 to 991 the fifth, in everything compared, but
+  600 to 1000 the fifth, in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
   other captures agree where they hold a state, but for fields that also
@@ -1753,8 +1753,43 @@ inside the border and elsewhere, the direction to it open from my tile
 and the way back open from its tile (`0x4359ea`). A refusal fails loudly
 with the rest of not fitting.
 
-**Stops.** Tick 992: object 21 snaps (tree 0x2017 node 5) into slot 0
-of object 174 (`0x454b19`), which is not ported.
+### Ticks 992 to 1000
+
+**Snap into a container slot** (`0x454b19`, `snap.rs`). A routing slot
+whose snap target is 0 or more puts me into that container slot of the
+object. Scripts count an object's container slots from its saved slot 1
+(slot 0 is its tile's chain), so one past the last is native error 0x20.
+The place is the object's position and level, and the place test is the
+one for a slot (`0x432d62` to `0x432fb8`, `fits_container` in
+`placement/find.rs`), refusing at the first of these that fails:
+neither object has data word 8 flag 4; the slot exists; it holds nothing
+or me; in mode 2 (global 19) an object without flag 0x2000 needs a slot
+at the centre, or a container with no other slot; the other slots at the
+same height that hold something leave room (a centre slot's object needs
+flag 0x2000, and so does mine for a centre slot); the container's data
+word 28 is at least my data word 27; I am neither the container nor
+anything around it; and my data word 4 has the bit for the slot's
+height. Before these, the test's first steps on the ground run, without
+the wall rules. A container slot off the object's centre (an offset
+across that is not zero) would also move my animator offset
+(`0x454ceb`), which is not kept, so it fails loudly. Snap's flag bit 2 (test the walls around the object
+instead, `0x45522c`) and a person as the container fail loudly.
+
+**The base clips of postures 1 and 2** (`0x590497`). When a person's
+posture becomes 1 or 2, the animator starts the posture's base clip:
+clip 1 or 2 of the posture's clip names (posture 0's is clip 3). The
+clip is looked up (`0x5904af`, `0x59dc32`); one that is not found, or
+that has timed events (which the skin's update would play, `0x5992b3`),
+fails loudly. Posture 0's clip is still not looked up, as before: the
+captures always show its layer after a start.
+
+**K = 1000.** In tick 992 person 21 sits: it snaps (tree 0x2017 node 5)
+into container slot 0 of object 174 (GUID 0x24E25E86), its posture
+becomes 1, and its base clip starts; it sits there through tick 1000.
+Our state after every tick from 992 to 1000 equals the fifth capture in
+everything compared, but for the head fields of "Ticks 334 to 366"
+(the target height of persons 16, 18 and 21, one unit in the last place
+lower). The fifth capture ends after tick 1000.
 
 ## Track: drawing people (`crates/sims-people`)
 
