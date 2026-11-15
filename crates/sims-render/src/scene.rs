@@ -251,18 +251,6 @@ impl Painter<'_> {
         }
     }
 
-    /// Turns a view corner back into the lot (the inverse of
-    /// `rotate_corner`).
-    fn unrotate_corner(&self, [x, y]: [i32; 2]) -> [i32; 2] {
-        let m = lot::FULL as i32;
-        match self.camera.rotation & 3 {
-            1 => [y, m - x],
-            2 => [m - x, m - y],
-            3 => [m - y, x],
-            _ => [x, y],
-        }
-    }
-
     /// Rotates a lot direction into the view.
     fn rotate_direction(&self, [x, y]: [i32; 2]) -> [i32; 2] {
         match self.camera.rotation & 3 {
@@ -469,7 +457,9 @@ impl Painter<'_> {
                     let key = edge(s.from, s.to);
                     let opening = openings.get(&key);
                     let pattern = patterns[front];
-                    let frame = self.wall_frame(s.from, s.to, level);
+                    let ends = [s.from, s.to].map(|c| self.corner_screen(c, level));
+                    let elevation = level_elevation(level) + self.corner_elevation(s.from);
+                    let frame = wall_frame(ends);
                     // A cut wall marked for a cap at one end stands full
                     // height there: the original draws it in shape 7 or 8,
                     // then lays a strip of trim-coloured pattern (252 or
@@ -496,21 +486,14 @@ impl Painter<'_> {
                     // that side: sampled just beside the wall's middle, so
                     // a split tile gives the triangle touching the wall.
                     let light = self.light(index, wall_side(&s, front));
-                    self.place_wall(&image, frame, [s.from, s.to], level, light, None);
+                    self.place_wall(&image, frame, ends, elevation, light, None);
                     if let Some(shape) = capped {
                         let (trim, mask) = if shape == 7 { (252, 9) } else { (253, 10) };
                         if let Some(strip) =
                             wall_image(self.assets, trim, mask, None, false, zoom, frame)
                         {
                             // At full light, like the trim along the top.
-                            self.place_wall(
-                                &strip,
-                                frame,
-                                [s.from, s.to],
-                                level,
-                                Light::FULL,
-                                None,
-                            );
+                            self.place_wall(&strip, frame, ends, elevation, Light::FULL, None);
                         }
                     }
                     self.stats.walls += 1;
@@ -519,37 +502,19 @@ impl Painter<'_> {
         }
     }
 
-    /// The frame of a wall from lot corner `from` to `to`, by its
-    /// direction on screen.
-    fn wall_frame(&self, from: [i32; 2], to: [i32; 2], level: i32) -> usize {
-        let a = self.corner_screen(from, level);
-        let b = self.corner_screen(to, level);
-        let (left, right) = if a[0] <= b[0] { (a, b) } else { (b, a) };
-        if left[0] == right[0] {
-            3
-        } else if left[1] == right[1] {
-            2
-        } else if left[1] > right[1] {
-            0
-        } else {
-            1
-        }
-    }
-
-    /// Draws a wall face standing between two lot corners, only within
+    /// Draws a wall face standing between the screen points `a` and `b`
+    /// of its ends, its foot `elevation` near-zoom pixels up, only within
     /// screen columns `columns` (from, to) when given.
     fn place_wall(
         &mut self,
         image: &Image,
         frame: usize,
-        [from, to]: [[i32; 2]; 2],
-        level: i32,
+        [a, b]: [[i32; 2]; 2],
+        elevation: i32,
         light: Light,
         columns: Option<[i32; 2]>,
     ) {
         let rise = 4 << self.camera.zoom.level();
-        let a = self.corner_screen(from, level);
-        let b = self.corner_screen(to, level);
         let left = if a[0] <= b[0] { a } else { b };
         let (w, h) = (image.width as i32, image.height as i32);
         // The sprite's bottom row sits one pixel above the corner's
@@ -564,14 +529,16 @@ impl Painter<'_> {
             }
         };
         let clipped;
-        let image = match columns {
+        let (image, at) = match columns {
             Some(columns) => {
-                clipped = within(image, at[0], columns);
-                &clipped
+                let Some((part, skip)) = within(image, at[0], columns) else {
+                    return;
+                };
+                clipped = part;
+                (&clipped, [at[0].saturating_add(skip), at[1]])
             }
-            None => image,
+            None => (image, at),
         };
-        let elevation = level_elevation(level) + self.corner_elevation(from);
         let camera = self.camera;
         self.canvas.draw_lit(image, at, false, light, |sx, sy, _| {
             let row = match frame {
@@ -679,9 +646,12 @@ impl Painter<'_> {
                     let Some(image) = self.assets.trim(set, zoom).get(frame).cloned() else {
                         continue;
                     };
-                    let image = match columns {
-                        Some(columns) => within(&image, x, columns),
-                        None => image,
+                    let (image, x) = match columns {
+                        Some(columns) => match within(&image, x, columns) {
+                            Some((part, skip)) => (part, x.saturating_add(skip)),
+                            None => continue,
+                        },
+                        None => (image, x),
                     };
                     let rise = zoom.tile_height() / 2 + height + lift;
                     let Some(y) = at[1].checked_sub(rise) else {
@@ -750,24 +720,42 @@ impl Painter<'_> {
             Line::X => [[tx, ty], [tx + 1, ty]],
             Line::Rising => [[tx, ty], [tx + 1, ty + 1]],
             Line::Falling => [[tx + 1, ty], [tx, ty + 1]],
+        };
+        // The phantom face stays within the lot's corners.
+        let full = lot::FULL as i32;
+        if ends.iter().flatten().any(|v| !(0..=full).contains(v)) {
+            return;
         }
-        .map(|v| self.unrotate_corner(v));
+        // It stands on the corner's own ground (0x53c7e2 projects the
+        // corner's position).
+        let ground = self.corner_elevation(corner);
+        let ends = ends.map(|[x, y]| self.camera.project_fine([x * 16, y * 16], level, ground));
         let zoom = self.camera.zoom.index();
-        let frame = self.wall_frame(ends[0], ends[1], level);
-        let Some(image) = wall_image(self.assets, pattern, PLAIN_STYLE, None, low, zoom, frame)
-        else {
+        let frame = wall_frame(ends);
+        // The plain wall's shape, or style 255's for a wall of that style
+        // (0x53c8c1).
+        let style = if corners.walls[owner].style == 255 {
+            255
+        } else {
+            PLAIN_STYLE
+        };
+        let Some(image) = wall_image(self.assets, pattern, style, None, low, zoom, frame) else {
             return;
         };
         // The column beside the corner, in the original's corner point
         // (one pixel right of ours).
-        let cx = self.corner_screen(corner, level)[0] + 1;
+        let cx = self.corner_screen(corner, level)[0].saturating_add(1);
         let width = cap.width << zoom;
         let columns = if cap.right {
-            [cx - 1, cx - 1 + width]
+            [
+                cx.saturating_sub(1),
+                cx.saturating_sub(1).saturating_add(width),
+            ]
         } else {
-            [cx - width, cx]
+            [cx.saturating_sub(width), cx]
         };
-        self.place_wall(&image, frame, ends, level, light, Some(columns));
+        let elevation = level_elevation(level) + ground;
+        self.place_wall(&image, frame, ends, elevation, light, Some(columns));
     }
 
     fn objects(&mut self, level: i32, cut: &Cut) {
@@ -1067,20 +1055,53 @@ fn wall_image(
     assets.pattern(pattern, zoom)?[frame].masked(&shape)
 }
 
+/// The frame of a wall by its direction on screen, from the screen points
+/// of its two ends.
+fn wall_frame([a, b]: [[i32; 2]; 2]) -> usize {
+    let (left, right) = if a[0] <= b[0] { (a, b) } else { (b, a) };
+    if left[0] == right[0] {
+        3
+    } else if left[1] == right[1] {
+        2
+    } else if left[1] > right[1] {
+        0
+    } else {
+        1
+    }
+}
+
 /// The part of an image drawn with its left edge at screen column `x`
 /// that falls within screen columns `from` (inclusive) to `to`
-/// (exclusive); the rest is left out.
-fn within(image: &Image, x: i32, [from, to]: [i32; 2]) -> Image {
-    let mut out = image.clone();
-    for px in 0..out.width {
-        let column = x.saturating_add(px as i32);
-        if column < from || column >= to {
-            for py in 0..out.height {
-                out.rgba[(py * out.width + px) * 4 + 3] = 0;
-            }
+/// (exclusive), and how many columns were cut off its left; None if
+/// nothing is left.
+fn within(image: &Image, x: i32, [from, to]: [i32; 2]) -> Option<(Image, i32)> {
+    let width = i64::try_from(image.width).ok()?;
+    let left = (i64::from(from) - i64::from(x)).clamp(0, width);
+    let right = (i64::from(to) - i64::from(x)).clamp(left, width);
+    if left == right {
+        return None;
+    }
+    let (left, right) = (usize::try_from(left).ok()?, usize::try_from(right).ok()?);
+    let w = right - left;
+    let mut rgba = Vec::with_capacity(w * image.height * 4);
+    let mut depth = image
+        .depth
+        .as_ref()
+        .map(|_| Vec::with_capacity(w * image.height));
+    for row in 0..image.height {
+        let start = row * image.width;
+        rgba.extend_from_slice(image.rgba.get((start + left) * 4..(start + right) * 4)?);
+        if let (Some(out), Some(d)) = (depth.as_mut(), image.depth.as_ref()) {
+            out.extend_from_slice(d.get(start + left..start + right)?);
         }
     }
-    out
+    let part = Image {
+        width: w,
+        height: image.height,
+        rgba,
+        depth,
+    };
+    Some((part, i32::try_from(left).ok()?))
 }
 
 /// One half of a floor image for a tile a diagonal wall splits: half 0
@@ -1360,6 +1381,25 @@ mod tests {
         assert_eq!(object_edge(at, &data), Some([[5, 8], [6, 8]]));
         data[13] = 0;
         assert_eq!(object_edge(at, &data), None);
+    }
+
+    #[test]
+    fn within_keeps_only_the_columns_asked_for() {
+        let image = Image {
+            width: 4,
+            height: 2,
+            rgba: (0..32).collect(),
+            depth: Some((0..8).collect()),
+        };
+        let (part, skip) = within(&image, 10, [11, 13]).unwrap();
+        assert_eq!((part.width, part.height, skip), (2, 2, 1));
+        assert_eq!(part.rgba[..8], image.rgba[4..12]);
+        assert_eq!(part.depth, Some(vec![1, 2, 5, 6]));
+        // Nothing left, and bounds at the integer limits.
+        assert_eq!(within(&image, 10, [0, 10]), None);
+        assert_eq!(within(&image, i32::MAX, [i32::MIN, i32::MAX]), None);
+        let (all, skip) = within(&image, i32::MIN, [i32::MIN, i32::MAX]).unwrap();
+        assert_eq!((all.width, skip), (4, 0));
     }
 
     #[test]

@@ -30,8 +30,10 @@ each record, which walls stand, which are cut, and which need a cap:
 **The cap at a corner** (0x53c6b7) is a slice of a wall face, 3 pixels
 wide at the far zoom (2 at some diagonal corners), doubling at each
 zoom. It lies across the wall's end, beside the corner, in the plain
-wall shape and the pattern of the wall it closes, lit like the wall at
-the corner that lies along it, if any, else like the wall it closes.
+wall shape (style 255's for a wall of that style) and the pattern of the
+wall it closes, lit like the wall at the corner that lies along it, if
+any, else like the wall it closes. It stands on the corner's own ground,
+as the original projects the corner's position.
 
 **A marked cut wall** (0x53ea55) is drawn in wall shape 7 or 8 (by which
 end is marked) instead of its cut shape. Those shapes stand full height
