@@ -159,15 +159,27 @@ fn what_is_missing_is_a_native_error() {
     ));
 }
 
+/// An entry that runs at once, pushed by an object other than the person,
+/// runs on the person's stack all the same (0x45d240 is the person's own
+/// method and reads nothing of who queues the action): the lamp's push
+/// runs the action with the pushed priority, and nothing is queued.
 #[test]
-fn what_the_queue_does_not_port_fails_loudly() {
-    // An entry that runs at once, queued by an object other than the
-    // person.
+fn an_entry_pushed_by_another_object_runs_at_once_on_the_person() {
     let mut fx = lot([4, 0, 1, 0, 0, 0, 0, 0]);
-    assert!(matches!(
-        trap(push(&mut fx, &[LAMP as i16])),
-        sims_vm::Trap::Unsupported(m) if m.contains("0x45d240") && m.contains("another person")
-    ));
+    // A grown resident, as the pie menu's tests make it, whom the entry
+    // fits.
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    (person.data[73], person.data[58], person.data[65]) = (0, 30, 0);
+    recording_action(&mut fx);
+    let result = push(&mut fx, &[LAMP as i16]);
+    assert_eq!(fx.world.objects[&LAMP].data[23], ACTION as i16);
+    // Priority 1 is 100, the Sim's for the run; its own 7 is back after.
+    assert_eq!(fx.world.objects[&LAMP].data[20], 100);
+    assert_eq!(fx.sim().temps[0], 99);
+    let person = fx.sim().person.as_ref().unwrap();
+    assert!(person.queue.is_empty());
+    assert_eq!(person.data[33], 7);
+    assert_eq!(result, Ok(true));
 }
 
 /// The numbers and flags of the Sim's queued actions.

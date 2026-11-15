@@ -56,9 +56,12 @@ events, and what it asks for after them) come first.
   (#131), the pie menu and picking from it (#132), and Go To Routing
   Slot's parameter and global slots (#134), which a player's snack order
   reached.
-- Strict mode on the Goth house runs to tick 2702. At tick 2703 the
-  carpool (object 8) makes the school bus, and the factory for
-  multi-tile objects is not ported. Step 2 starts there.
+- Strict mode on the Goth house runs to tick 2881, 08:06 on the first
+  day. One tick is two game seconds, so a day is 43,200 ticks (measured
+  from the clock globals). The carpool makes the school bus at tick 2703
+  (the multi-tile factory is ported). At tick 2882 person 16's pose
+  without a foreground layer (0x5992b3) is not ported. Step 2 continues
+  from there.
 
 ## Met goal: a headless lot boot that matches the original
 
@@ -2062,8 +2065,8 @@ through their public interfaces only; the simulation never depends on it.
   play mode does not catch stops it. In play mode the Goths' house runs
   12,000 ticks (ten minutes at normal speed) without stopping, through
   about a dozen different caught errors; in strict mode it stops after
-  tick 2702 (at tick 2703 the carpool makes the school bus, and the
-  factory for multi-tile objects is not ported).
+  tick 2881 (at tick 2882 a person's pose without a foreground layer,
+  0x5992b3, is not ported).
   `--png <file>
   --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
@@ -2091,15 +2094,17 @@ through their public interfaces only; the simulation never depends on it.
   The simulation lists the fridge itself: in the morning the house
   loads in, Have A Snack, Have Quick Breakfast, Have Breakfast and
   Serve Breakfast.
-- **Blocked: a Sim doing what he is told.** Have A Snack queued on the
-  fridge at tick 51 leaves the queue by tick 151. Strict mode stops at
-  tick 154: another person (object 16, tree 0x2156 node 5) runs a slot
-  search with seats (0x4835f0). Play mode runs 20,000 ticks after the
-  order without stopping, but at tick 634 Mortimer's snack fails on
-  Create New Object Instance mode 4 with flags 0x1 (tree 0x1019 node 1)
-  and he is parked ("dropping the frames of a person that is using an
-  object"); at tick 20051 his running interaction is still the snack.
-  Without an order, strict mode runs to tick 2702.
+- **Done: a Sim doing what he is told.** Have A Snack queued on the
+  fridge at tick 51 (the snack order, run 2026-11-15 on main d46c93ab,
+  in play mode and in strict mode alike): Mortimer takes the order at
+  tick 150, the fridge makes the snack (object 263) at tick 615, he
+  takes it at 748, pays 5 at 820 and eats it (menu 2 on the snack) while
+  his hunger goes from 94.5 to 100.0 (tick 936); at 1088 the snack goes
+  off the lot and at 1136 it is deleted, and he is free again. He goes
+  on to other things (object 71 at tick 1497, object 132 at 2292).
+  Since #156 strict mode runs the order through step 3400 and stops at
+  step 3401 (person 16 routes for an action that wants to be
+  interrupted, 0x45afd2); without an order it runs to tick 2881.
 - **Next:** a real pie.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
@@ -2107,8 +2112,6 @@ through their public interfaces only; the simulation never depends on it.
     entry on another person is refused at 0x45d240. A check tree's fault
     should keep its trap rather than become `Unsupported` text, which
     `sims-game` reads to tell unported from failed.
-  - `sims-vm`: a slot search with seats (0x4835f0), and Create New
-    Object Instance mode 4 with flags 0x1, which the snack makes.
   - `sims-render`: which object drew each pixel (an object ID buffer
     beside the depth), so a click picks the object under it. Today
     `sims-game` guesses from each object's tile.

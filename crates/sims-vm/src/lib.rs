@@ -42,6 +42,7 @@ mod factory;
 mod fault;
 mod forget;
 mod frame;
+mod group_factory;
 mod head;
 mod interpreter;
 mod load;
