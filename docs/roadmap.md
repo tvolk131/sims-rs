@@ -1994,10 +1994,13 @@ Progress:
   them, as the original works them out and draws them. Near zoom rose
   from 86.3% to 87.6% exact, and nine in ten of the pixels the shadows
   change match the original exactly.
-- Next: flat grass on a split tile's empty half; the dashed row along
-  a floor's lower edge at near zoom; near-zoom fidelity below the bay's
-  left end (rows 436 to 520, grass and a light sprite in the original);
-  the edge-on texel offset and side; a screenshot with a marked edge-on
+- Done: a split floor's halves are cut straight along the corners' row
+  or half a tile in, as the original's clip rectangle cuts them; the
+  dashed row along a porch's diagonal edge is gone.
+- Next: flat grass on a split tile's empty half; near-zoom fidelity
+  below the bay's left end (rows 436 to 520, grass and a light sprite
+  in the original); the edge-on texel offset and side; a screenshot
+  with a marked edge-on
   diagonal; upper-level depth.
 
 ## Track: sound (`crates/sims-audio`)
