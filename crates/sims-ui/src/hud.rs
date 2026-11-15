@@ -16,6 +16,7 @@ use crate::command::{Camera, Command, Mode, Panel, Speed, Walls};
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
 use crate::household::{Faces, Snapshot};
+use sims_formats::bitmap::Image;
 
 /// The cluster's size, the size of its background (kUniversalBkgTGA).
 pub const CLUSTER: [i32; 2] = [220, 183];
@@ -57,6 +58,9 @@ pub mod id {
     pub const GREEN_BARS: i32 = 4506;
     pub const GIFTS: i32 = 4507;
     pub const RED_BARS: i32 = 4510;
+    /// A personality bar, full and empty (0x520f67).
+    pub const TRAIT_FULL: i32 = 4900;
+    pub const TRAIT_EMPTY: i32 = 4903;
     pub const TEMPLATE: i32 = crate::household::TEMPLATE;
     pub const NORMAL: i32 = 4705;
     pub const FAST: i32 = 4706;
@@ -68,7 +72,7 @@ pub mod id {
 }
 
 /// Every resource the panel may draw, for [`Art::load`].
-pub const RESOURCES: [i32; 37] = [
+pub const RESOURCES: [i32; 39] = [
     id::WALLS_DOWN,
     id::CUTAWAY,
     id::WALLS_UP,
@@ -97,6 +101,8 @@ pub const RESOURCES: [i32; 37] = [
     id::GREEN_BARS,
     id::GIFTS,
     id::RED_BARS,
+    id::TRAIT_FULL,
+    id::TRAIT_EMPTY,
     id::TEMPLATE,
     id::NORMAL,
     id::FAST,
@@ -218,6 +224,11 @@ pub enum Kind {
     },
     /// A motive meter.
     Meter(f32),
+    /// The personality panel's bars, in `rect`, the subpanel: the
+    /// selected Sim's traits in the panel's order
+    /// ([`crate::household::PERSONALITY`]). Laid out when drawn, from the
+    /// labels' font.
+    Personality([i16; 5]),
     /// The first name of the person of type `guid`, in a box centered
     /// over `rect`'s bottom edge, while the pointer is on their portrait.
     Name { guid: u32 },
@@ -563,6 +574,24 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             });
         }
     }
+    if let (Some(resident), Panel::Personality) = (selected, controls.panel) {
+        let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
+        items.push(Item {
+            rect: panel.offset(6, 2).with_size(100, 20),
+            kind: Kind::Text {
+                text: "Personality".into(),
+                size: 11,
+                rgb: LABEL,
+                align: Align::Left,
+            },
+            command: None,
+        });
+        items.push(Item {
+            rect: panel,
+            kind: Kind::Personality(resident.personality),
+            command: None,
+        });
+    }
     // The name of the person whose portrait the pointer is on, over the
     // strip above the portrait. Ours: where and how the original shows a
     // name there is **unverified**.
@@ -583,6 +612,60 @@ const NAME_HEIGHT: i32 = 16;
 const NAME_SIZE: u8 = 8;
 const NAME_PAD: [i32; 2] = [4, 2];
 const NAME_BACK: [u8; 3] = [0, 0, 0];
+
+/// The personality's labels in the panel's order (Live.iff STR# 131).
+const TRAITS: [&str; 5] = ["Neat", "Outgoing", "Active", "Playful", "Nice"];
+/// The labels' font (0x6f2ae4, font 8).
+const TRAIT_FONT: u8 = 8;
+/// Where the bars end and start in the subpanel, and how far apart they
+/// are (0x519cc8, not the CJK languages').
+const TRAITS_RIGHT: i32 = 202;
+const TRAITS_TOP: i32 = 8;
+const TRAITS_PITCH: i32 = 18;
+
+/// Draws the personality bars (0x51df31, 0x521491, 0x5211bd) in the
+/// subpanel `panel`. Each bar is a label and an empty bar with the full
+/// one drawn over it, cut to 4 pixels a point. Every bar's label is as
+/// wide as the widest, plus 3, and its bar starts 3 after that; the bars
+/// end at [`TRAITS_RIGHT`]. The shorter of the label's line and the bar
+/// is centred on the other. A trait is `value / 100` points, 0 to 10.
+///
+/// **Unverified:** the labels' color (the needs' is taken) and their
+/// alignment (right, against the bar); which of the font's heights the
+/// original compares (the line's is taken).
+fn draw_personality(frame: &mut Frame, art: &Art, panel: Rect, values: &[i16; 5]) {
+    let (Some(font), Some(empty), Some(full)) = (
+        art.font(TRAIT_FONT),
+        art.image(id::TRAIT_EMPTY),
+        art.image(id::TRAIT_FULL),
+    ) else {
+        return;
+    };
+    let size = |image: &Image| [image.width, image.height].map(|v| i32::try_from(v).unwrap_or(0));
+    let ([empty_w, empty_h], [full_w, full_h]) = (size(empty), size(full));
+    let widest = TRAITS.iter().map(|t| font.width(t)).max().unwrap_or(0);
+    let label = widest.saturating_add(3);
+    let bar_x = label.saturating_add(3);
+    let width = bar_x.saturating_add(empty_w).saturating_add(3);
+    let line = font.line_height;
+    let (text_y, bar_y) = if line < empty_h {
+        ((empty_h - line) / 2, 0)
+    } else {
+        (0, (line - empty_h) / 2)
+    };
+    let left = panel.x.saturating_add(TRAITS_RIGHT - width);
+    for (n, (name, value)) in TRAITS.iter().zip(values).enumerate() {
+        let top = panel.y + TRAITS_TOP + TRAITS_PITCH * n as i32;
+        let x = left.saturating_add(label - font.width(name));
+        font.draw(frame, name, [x, top + text_y], LABEL);
+        let at = [left.saturating_add(bar_x), top + bar_y];
+        frame.draw_all(empty, at);
+        let points = i32::from(*value / 100).clamp(0, 10);
+        if points > 0 {
+            frame.draw(full, Rect::new(0, 0, (points * 4).min(full_w), full_h), at);
+        }
+    }
+}
 
 /// The needs in the panel's order, left column first, with their motive
 /// numbers (`crates/sims-sim/src/motives.rs`). The order is the
@@ -769,6 +852,7 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                     draw_name(frame, font, name, r);
                 }
             }
+            Kind::Personality(values) => draw_personality(frame, art, r, values),
             Kind::Meter(value) => {
                 let (width, left, right) = meter(*value);
                 frame.fill(r, right);
@@ -818,7 +902,11 @@ impl Item {
         self.command.is_some()
             || !matches!(
                 self.kind,
-                Kind::Text { .. } | Kind::Bars { .. } | Kind::Meter(_) | Kind::Name { .. }
+                Kind::Text { .. }
+                    | Kind::Bars { .. }
+                    | Kind::Meter(_)
+                    | Kind::Name { .. }
+                    | Kind::Personality(_)
             )
     }
 }
@@ -855,7 +943,6 @@ pub fn hovered(items: &[Item], point: Option<[i32; 2]>) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::household::Resident;
-    use sims_formats::bitmap::Image;
 
     fn snapshot() -> Snapshot {
         Snapshot {
@@ -869,6 +956,7 @@ mod tests {
                     object,
                     guid: u32::from(object),
                     motives: [50.; 16],
+                    personality: [0; 5],
                 })
                 .collect(),
             selected: Some(21),
@@ -954,6 +1042,7 @@ mod tests {
                 object,
                 guid: u32::from(object),
                 motives: [0.; 16],
+                personality: [0; 5],
             })
             .collect();
         let controls = Controls {
@@ -1140,6 +1229,69 @@ mod tests {
                 &items,
                 &open,
             );
+        }
+    }
+
+    /// An image of one color.
+    fn solid(width: u32, height: u32, rgb: [u8; 3]) -> Image {
+        Image {
+            width,
+            height,
+            rgba: [rgb[0], rgb[1], rgb[2], 255].repeat((width * height) as usize),
+        }
+    }
+
+    #[test]
+    fn the_personality_panel_shows_the_selected_sims_traits() {
+        let mut s = snapshot();
+        s.residents[0].personality = [250, -5, 1500, 0, 999];
+        let controls = Controls {
+            expanded: true,
+            panel: Panel::Personality,
+            ..Controls::default()
+        };
+        let items = layout([800, 600], &s, &controls);
+        let panels: Vec<&Item> = items
+            .iter()
+            .filter(|i| matches!(i.kind, Kind::Personality(_)))
+            .collect();
+        // The subpanel, as the needs' is.
+        assert_eq!(panels.len(), 1);
+        assert_eq!(panels[0].rect, Rect::new(521, 500, 279, 100));
+        assert_eq!(panels[0].kind, Kind::Personality([250, -5, 1500, 0, 999]));
+        // Presses go through it; nobody selected, no panel.
+        assert_eq!(press(&items, [700, 520]), None);
+        s.selected = None;
+        let items = layout([800, 600], &s, &controls);
+        assert!(!items.iter().any(|i| matches!(i.kind, Kind::Personality(_))));
+
+        // Drawn with a font whose labels are 0 wide: every bar's label is
+        // 3 wide and its bar starts 3 after, so the 40-pixel bars run from
+        // 159, and 3 more pixels end the bar's gadget at 202.
+        let (empty, full) = ([1, 1, 1], [2, 2, 2]);
+        let mut art = Art::default();
+        art.insert_font(TRAIT_FONT, crate::font::tests::font());
+        art.insert(id::TRAIT_EMPTY, solid(40, 14, empty));
+        art.insert(id::TRAIT_FULL, solid(40, 16, full));
+        let line = art.font(TRAIT_FONT).unwrap().line_height;
+        assert!(line < 14);
+        let mut frame = Frame::new(220, 110, [0; 3]);
+        draw_personality(
+            &mut frame,
+            &art,
+            Rect::new(0, 0, 220, 100),
+            &[250, -5, 1500, 0, 999],
+        );
+        // 4 pixels a point: 2, none, 10 (all 40), none, 9.
+        for (n, points) in [2, 0, 10, 0, 9].into_iter().enumerate() {
+            let y = 8 + 18 * n as i32;
+            let row: Vec<_> = (150..210).map(|x| frame.pixel(x, y).unwrap()).collect();
+            let filled = row.iter().filter(|&&p| p == full).count();
+            assert_eq!(filled, 4 * points, "bar {n}");
+            assert_eq!(row[159 - 150], if points > 0 { full } else { empty });
+            assert_eq!(row[158 - 150], [0; 3]);
+            assert_eq!(row[198 - 150], if points == 10 { full } else { empty });
+            assert_eq!(row[199 - 150], [0; 3]);
         }
     }
 }

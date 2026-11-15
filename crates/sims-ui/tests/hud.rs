@@ -83,3 +83,41 @@ fn the_goths_panel_from_the_original_art() {
     let digests: Vec<(&str, &str)> = digests.iter().map(|(n, d)| (*n, d.as_str())).collect();
     assert_eq!(digests, expected);
 }
+
+#[test]
+fn the_goths_personality_panel() {
+    let Some(root) = common::install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to draw the control panel");
+        return;
+    };
+    let opened = common::open(&root, common::GOTH_HOUSE);
+    // Neat, Outgoing, Active, Playful and Nice, from the house file.
+    let traits: Vec<[i16; 5]> = opened
+        .snapshot
+        .residents
+        .iter()
+        .map(|r| r.personality)
+        .collect();
+    assert_eq!(
+        traits,
+        [
+            [400, 600, 400, 700, 400],
+            [700, 300, 500, 300, 700],
+            [700, 200, 500, 700, 400],
+        ]
+    );
+    let controls = Controls {
+        expanded: true,
+        panel: Panel::Personality,
+        ..Controls::default()
+    };
+    let mut frame = Frame::new(800, 600, [0, 0, 0]);
+    let items = hud::layout([800, 600], &opened.snapshot, &controls);
+    hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
+    // Pins the drawing; it has not been compared with the original's
+    // screen (see docs/decisions.md).
+    assert_eq!(
+        digest(&frame),
+        "6918f761eeafd0f57e77727e1ff1c63d0be1aed8cf3cd08b978e6bd57fbcd853"
+    );
+}
