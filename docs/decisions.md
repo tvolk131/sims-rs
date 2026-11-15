@@ -34,13 +34,22 @@ ported from the original's code, as the inverse of Grab:
       cancels it. With the water queued, the cancel queues nothing of
       its own (0x45d7c0). He drops the snack at step 1009, and starts
       the water at step 1028.
-  - A sweep of cancels at steps 650, 760, 830, 900 and 1000, through
-    step 2400, caught no error.
+  - A cancel at step 825, as he walks away from the fridge with the
+    snack, stops at the unported route stop below
+    (`a_snack_cancelled_on_the_way_to_the_chair_stops_at_the_unported_route_stop`,
+    a known gap pinned so it is not mistaken for fixed).
+- **A manual sweep, not a test:** the snack order cancelled at each
+  step from 150 to 1136 (every tenth step, then every step near each
+  edge), run 400 steps on. Cancels at steps 150 to 536, 543 to 590 and
+  821 to 829 stop at 0x45b3eb; all the rest catch no error. Too slow to
+  keep as a test (a full lot run per step).
 - **Unverified:** no capture covers a Drop or a cancel. Which tree runs
   Drop and when is the scripts' own; only the primitive is ported.
-- **Not ported (track 4):** cancelling while Mortimer walks to the
-  fridge (step 400) stops his thread at a route whose animator is still
-  under way (0x45b3eb).
+- **Not ported (track 4):** cancelling while Mortimer walks, to the
+  fridge or away from it with the snack, stops his thread at a route
+  whose animator is still under way (0x45b3eb). Sol's review found the
+  walk away (step 825), which the first sweep had missed by sampling
+  steps 760 and 830.
 
 ## 2026-11-15: The selected Sim's actions show in the top left, and a press cancels one
 

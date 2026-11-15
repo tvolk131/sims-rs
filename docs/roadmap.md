@@ -2215,10 +2215,12 @@ through their public interfaces only; the simulation never depends on it.
   plant's: the water waits behind the snack, its icon second. A press on
   the water's icon takes it off. A press on the snack's icon while
   Mortimer eats cancels it: he puts the snack down in front of him (Drop,
-  opcode 5, 0x454430, now ported) and goes to water the plant. Cancelled
-  anywhere from the fridge to the last bite, no error is caught.
-  Cancelling while he walks to the fridge stops his thread on a route
-  whose animator is still moving (0x45b3eb), which is not ported.
+  opcode 5, 0x454430, now ported) and goes to water the plant. A cancel
+  while he walks stops his thread on a route whose animator is still
+  moving (0x45b3eb, not ported; track 4's): on the snack order, a cancel
+  at steps 150 to 536 or 543 to 590 (to the fridge) or 821 to 829 (away
+  from it with the snack). Cancels at the other steps to 1136 catch no
+  error (a manual sweep, not a test).
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
     on Manage Inventory operation 4 and scope 12. A check tree's fault
