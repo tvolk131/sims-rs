@@ -503,3 +503,76 @@ fn strict_mode_runs_to_tick_2881_past_the_school_bus() {
         assert!(stopped.contains(part), "{stopped}");
     }
 }
+
+#[test]
+fn the_player_answers_a_dialog_when_it_is_shown() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    // Answered at load, as `sims boot --answers 3` does.
+    let mut listed = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    // Answered when it is shown, as the window does.
+    let mut asked = Lot::load(&root, &house, &[], Frames::default()).unwrap();
+    asked.wait_for_answers();
+    listed.step().unwrap();
+    asked.step().unwrap();
+    // Tick 2 shows the Help System dialog, which offers two answers.
+    let before = asked.world().hash();
+    assert_eq!(asked.step().unwrap_err(), StepError::Asking { tick: 2 });
+    let asking = asked.asking().expect("a dialog waits");
+    assert_eq!(asking.shown.answers, [2, 3]);
+    assert!(
+        asking.world.dialogs.records.iter().any(|r| r.status == 1),
+        "the dialog's record, shown"
+    );
+    // The lot is as it was before the tick, and stays so: it is not
+    // halted, a step asks again, and it takes no orders.
+    assert_eq!(asked.ticks(), 1);
+    assert_eq!(asked.world().hash(), before);
+    assert_eq!(asked.step().unwrap_err(), StepError::Asking { tick: 2 });
+    let person = asked.world().selected().unwrap();
+    assert_eq!(
+        asked.queue_interaction(person, person, 0).unwrap_err(),
+        sims_vm::boot::OrderError::Asking
+    );
+    assert_eq!(asked.world().hash(), before);
+    // Only an answer it offers is taken.
+    assert!(matches!(
+        asked.answer(4),
+        Err(sims_vm::boot::AnswerError::NotOffered { answer: 4, .. })
+    ));
+    asked.answer(3).unwrap();
+    assert!(asked.asking().is_none());
+    assert_eq!(asked.answer(3), Err(sims_vm::boot::AnswerError::NotAsked));
+    // From there the two lots are the same, tick for tick.
+    for tick in 2..=200 {
+        let a = listed.step().unwrap();
+        let b = asked.step().unwrap();
+        assert_eq!(asked.ticks(), tick);
+        assert_eq!(asked.world().hash(), listed.world().hash(), "tick {tick}");
+        assert_eq!(a.answered, b.answered, "tick {tick}");
+        assert_eq!(a.sounds, b.sounds, "tick {tick}");
+    }
+}
+
+#[test]
+fn a_lot_that_does_not_wait_halts_at_an_unanswered_dialog() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[], Frames::default()).unwrap();
+    lot.step().unwrap();
+    let stopped = lot.step().unwrap_err();
+    assert!(
+        matches!(stopped, StepError::Tick { tick: 2, .. }),
+        "{stopped}"
+    );
+    assert!(lot.asking().is_none());
+    assert_eq!(lot.step().unwrap_err(), StepError::Halted);
+}

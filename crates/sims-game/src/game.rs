@@ -53,7 +53,8 @@ pub struct Options {
     pub house: PathBuf,
     /// Answers to the dialogs that offer a choice, in order, as with
     /// `sims boot --answers` (the Goths' house takes `3`, No to the Help
-    /// System). The player cannot answer them yet.
+    /// System). A dialog shown once they run out waits for the player
+    /// (`Lot::wait_for_answers`).
     pub answers: Vec<u8>,
     /// Step in play mode ([`Lot::step_play`]), which resets an object
     /// after its error and goes on, instead of strict mode ([`Lot::step`]),
@@ -111,8 +112,10 @@ impl Game {
     pub fn open(options: &Options) -> Result<Self, String> {
         let house = &options.house;
         let opened = open_house(&options.install, house).map_err(|e| e.to_string())?;
-        let lot = Lot::load(&options.install, house, &options.answers, Frames::default())
+        let mut lot = Lot::load(&options.install, house, &options.answers, Frames::default())
             .map_err(|e| format!("{}: {e}", house.display()))?;
+        // The player answers a dialog when it is shown.
+        lot.wait_for_answers();
         let stopped = lot
             .load_report()
             .stopped
@@ -209,12 +212,28 @@ impl Game {
 
     /// Runs the ticks owed after `elapsed_us` more microseconds. Returns
     /// how many ran.
+    /// While a dialog waits for the player, no time is owed: the game
+    /// waits, as the original does.
     pub fn advance(&mut self, elapsed_us: u64) -> u32 {
         let due = self.pace.due(elapsed_us);
+        if self.lot.asking().is_some() {
+            return 0;
+        }
         self.run(due)
     }
 
-    /// Runs up to `ticks` ticks, stopping at the first that fails.
+    /// The dialog the lot waits on, if it waits for the player.
+    pub fn asking(&self) -> Option<&sims_vm::boot::Asking> {
+        self.lot.asking()
+    }
+
+    /// Where the dialog shown in the last frame drawn is, and its buttons.
+    pub fn dialog(&self) -> Option<&sims_ui::dialog::Layout> {
+        self.hud.dialog()
+    }
+
+    /// Runs up to `ticks` ticks, stopping at the first that fails or that
+    /// shows a dialog the player has to answer.
     pub fn run(&mut self, ticks: u32) -> u32 {
         let mut ran = 0;
         while ran < ticks && self.stopped.is_none() {
@@ -232,6 +251,8 @@ impl Game {
                     }
                     self.keep_sounds(update.sounds);
                 }
+                // The tick shows a dialog: it runs once it is answered.
+                Err(StepError::Asking { .. }) => break,
                 Err(error) => {
                     // A strict step whose frame failed after its tick ran
                     // still made that tick's sounds.
@@ -323,9 +344,12 @@ impl Game {
         );
         self.people.draw(world, &self.view.camera, &mut self.canvas);
         let status = self.status();
+        // A dialog the lot waits on is in the lot as the tick left it when
+        // it was shown.
+        let dialogs = self.lot.asking().map_or(world, |a| &a.world);
+        self.hud.read_dialog(dialogs, &self.assets);
         self.hud.draw(
             world,
-            &self.assets,
             &self.view,
             &self.pace,
             status.as_deref(),
@@ -539,6 +563,30 @@ impl Game {
         });
     }
 
+    /// Answers the dialog `caller` shows with its button `button` (0 the
+    /// first): the answer the button gives (`Shown::answers`) goes to the
+    /// lot, which runs the tick that showed it at the next step.
+    pub fn answer(&mut self, caller: u16, button: u8) {
+        let Some(asking) = self.lot.asking() else {
+            self.note = Some("No dialog waits for an answer.".into());
+            return;
+        };
+        if asking.shown.object != caller {
+            self.note = Some(format!(
+                "The dialog shown is object {}'s, not object {caller}'s.",
+                asking.shown.object
+            ));
+            return;
+        }
+        let Some(&answer) = asking.shown.answers.get(usize::from(button)) else {
+            self.note = Some(format!("The dialog has no button {button}."));
+            return;
+        };
+        if let Err(e) = self.lot.answer(answer) {
+            self.note = Some(format!("The answer was not taken: {e}"));
+        }
+    }
+
     /// Selects the Sim `sim`, as a press on its portrait does
     /// (`Lot::select`, 0x445449), keeping the sounds that made. A menu
     /// listed for the Sim selected before is dropped.
@@ -615,6 +663,10 @@ impl Game {
             }
             Command::Select { sim } => {
                 self.select(sim);
+                Outcome::redraw()
+            }
+            Command::AnswerDialog { caller, button } => {
+                self.answer(caller, button);
                 Outcome::redraw()
             }
             Command::TogglePanel | Command::OpenPanel(_) => Outcome::redraw(),

@@ -129,6 +129,45 @@ fn people_stand_where_a_click_finds_them() {
 }
 
 #[test]
+fn the_player_answers_the_help_dialog_from_the_window() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        answers: Vec::new(),
+        ..options(install.clone())
+    })
+    .expect("the Goth house opens");
+    // Tick 2 shows the Help System's dialog, Yes and No, and the lot waits.
+    assert_eq!(game.run(10), 1);
+    assert_eq!(game.stopped(), None);
+    let shown = game.asking().expect("a dialog waits").shown.clone();
+    assert_eq!(shown.answers, &[2, 3]);
+    let waiting = game.lot().world().hash();
+    // Time goes by, but the lot does not.
+    assert_eq!(game.advance(1_000_000), 0);
+    assert_eq!(game.run(10), 0);
+    assert_eq!(game.lot().world().hash(), waiting);
+    game.resize([800, 600]);
+    game.render();
+    let layout = game.dialog().expect("the dialog is drawn");
+    assert_eq!(layout.caller, shown.object);
+    assert_eq!(layout.buttons.len(), 2);
+    // No, the second button: as `--answers 3`.
+    let no = layout.buttons[1];
+    game.press([no.x + no.width / 2, no.y + no.height / 2]);
+    assert!(game.asking().is_none(), "{:?}", game.stopped());
+    assert_eq!(game.run(199), 199);
+    assert_eq!(game.stopped(), None);
+    let mut listed = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(listed.run(200), 200);
+    assert_eq!(game.lot().world().hash(), listed.lot().world().hash());
+    // The dialog is gone once answered.
+    game.render();
+    assert!(game.dialog().is_none());
+}
+
+#[test]
 fn play_mode_runs_the_goths_past_the_hour() {
     let Some(install) = install() else {
         return;

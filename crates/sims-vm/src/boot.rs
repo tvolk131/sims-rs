@@ -13,7 +13,7 @@
 //! watch a lot run.
 
 use crate::play::Play;
-use crate::{Answers, Callback, Interpreter, Program, Stream, Update};
+use crate::{Answers, Callback, Interpreter, Program, Stream, TickError, Update};
 use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People};
 use sims_sim::World;
 use sims_sim::load::Context;
@@ -186,7 +186,71 @@ pub struct Lot {
     /// Play mode's own state ([`crate::play`]), used by
     /// [`Lot::step_play`] only.
     play: Play,
+    /// Whether a dialog that offers a choice, with no answer left in the
+    /// list given at load, waits for the player ([`Lot::wait_for_answers`])
+    /// rather than halting the lot.
+    asks: bool,
+    /// The dialog the lot waits on, while it waits.
+    asking: Option<Box<Asking>>,
 }
+
+/// A dialog the lot waits on ([`Lot::asking`]). The tick that showed it
+/// has not happened: the lot is as it was before that tick, and
+/// [`Lot::answer`] then a step runs the tick again, which gives the
+/// answer where the original waits for it (0x436da0).
+#[derive(Debug, Clone)]
+pub struct Asking {
+    pub shown: crate::Shown,
+    /// The lot partway through the tick, as it was when the dialog was
+    /// shown: its record ([`sims_sim::World::dialogs`]) and the object
+    /// that asked, for drawing the dialog. Not the lot's state.
+    pub world: World,
+}
+
+/// How [`Lot::advance`] stopped: a failure, or a dialog that waits for
+/// the player.
+enum Stop {
+    Step(StepError),
+    Asks { tick: u32, shown: crate::Shown },
+}
+
+impl From<StepError> for Stop {
+    fn from(error: StepError) -> Self {
+        Self::Step(error)
+    }
+}
+
+impl Stop {
+    /// As a step's error, for a lot that does not wait for answers.
+    fn into_step(self) -> StepError {
+        match self {
+            Self::Step(error) => error,
+            Self::Asks { tick, .. } => StepError::Asking { tick },
+        }
+    }
+}
+
+/// Why an answer was not taken ([`Lot::answer`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerError {
+    /// No dialog waits for an answer.
+    NotAsked,
+    /// The dialog does not offer that answer.
+    NotOffered { answer: u8, offered: &'static [u8] },
+}
+
+impl std::fmt::Display for AnswerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAsked => write!(f, "no dialog waits for an answer"),
+            Self::NotOffered { answer, offered } => {
+                write!(f, "the dialog offers {offered:?}, not {answer}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AnswerError {}
 
 /// Why a step could not run, or stopped partway.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +262,11 @@ pub enum StepError {
     /// An earlier step failed, leaving the lot partway through a tick or a
     /// frame; the lot is unchanged since.
     Halted,
+    /// Tick `tick` shows a dialog that waits for the player
+    /// ([`Lot::wait_for_answers`], [`Lot::asking`]). The lot is as it was
+    /// before the tick, and is not halted: answer ([`Lot::answer`]) and
+    /// step again.
+    Asking { tick: u32 },
     /// The lot update of tick `tick` failed; the lot is as the failure
     /// left it.
     Tick {
@@ -220,6 +289,12 @@ impl std::fmt::Display for StepError {
             Self::Incomplete => write!(f, "ticks were asked for, but the load did not complete"),
             Self::Tuning(error) => write!(f, "{error}"),
             Self::Halted => write!(f, "an earlier step failed, so no more ticks run"),
+            Self::Asking { tick } => {
+                write!(
+                    f,
+                    "tick {tick} shows a dialog that waits for the player's answer"
+                )
+            }
             Self::Tick { tick, start, error } => write!(
                 f,
                 "tick {tick}, the lot update that starts at tick count {start}, failed: {error}"
@@ -253,6 +328,9 @@ pub enum OrderError {
     Incomplete,
     /// An earlier step failed and halted the lot.
     Halted,
+    /// The lot waits for the player to answer a dialog ([`Lot::asking`]);
+    /// as in the original, nothing else is taken until it is answered.
+    Asking,
     /// The order names no such person or interaction, or the queue fails
     /// on something it does not port.
     Refused(crate::Fault),
@@ -263,6 +341,7 @@ impl std::fmt::Display for OrderError {
         match self {
             Self::Incomplete => write!(f, "the load did not complete"),
             Self::Halted => write!(f, "an earlier step failed, so the lot takes no orders"),
+            Self::Asking => write!(f, "the lot waits for the player to answer a dialog"),
             Self::Refused(fault) => write!(f, "the order was refused: {fault}"),
         }
     }
@@ -487,6 +566,8 @@ impl Lot {
             load,
             halted: false,
             play: Play::default(),
+            asks: false,
+            asking: None,
         })
     }
 
@@ -532,16 +613,53 @@ impl Lot {
                 .map_err(|error| StepError::Tuning(error.to_string()))?;
             self.tuning = Some(tuning);
         }
-        let result = self.advance(play);
-        if result.is_err() {
-            self.halted = true;
+        if !self.asks {
+            let result = self.advance(play).map_err(Stop::into_step);
+            if result.is_err() {
+                self.halted = true;
+            }
+            return result;
         }
-        result
+        if self.asking.is_some() {
+            return Err(StepError::Asking {
+                tick: self.ticks + 1,
+            });
+        }
+        // The tick may stop at a dialog the player has not answered; it
+        // then runs again from here once they have.
+        let before = (
+            self.world.clone(),
+            self.play.clone(),
+            self.ticks,
+            self.player.clone(),
+        );
+        match self.advance(play) {
+            Err(Stop::Asks { tick, shown }) => {
+                let (world, play, ticks, player) = before;
+                let partway = std::mem::replace(&mut self.world, world);
+                self.play = play;
+                self.ticks = ticks;
+                self.player = player;
+                self.asking = Some(Box::new(Asking {
+                    shown,
+                    world: partway,
+                }));
+                Err(StepError::Asking { tick })
+            }
+            result => {
+                let result = result.map_err(Stop::into_step);
+                if result.is_err() {
+                    self.halted = true;
+                }
+                result
+            }
+        }
     }
 
     /// The tick and its frames, for a lot that can step.
-    fn advance(&mut self, play: bool) -> Result<Update, StepError> {
+    fn advance(&mut self, play: bool) -> Result<Update, Stop> {
         let tuning = self.tuning.as_ref().ok_or(StepError::Incomplete)?;
+        let asks = self.asks;
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
@@ -557,7 +675,8 @@ impl Lot {
                     tick: 0,
                     error: error.to_string(),
                     update: None,
-                });
+                }
+                .into());
             }
             first_frame = Some(error.to_string());
         }
@@ -569,10 +688,15 @@ impl Lot {
                 &mut self.player,
                 play.then_some(&mut self.play),
             )
-            .map_err(|error| StepError::Tick {
-                tick,
-                start: self.start.wrapping_add(self.ticks),
-                error: error.to_string(),
+            .map_err(|error| match error {
+                // Nobody has answered: the player is asked.
+                TickError::Unanswered { shown, given: None } if asks => Stop::Asks { tick, shown },
+                error => StepError::Tick {
+                    tick,
+                    start: self.start.wrapping_add(self.ticks),
+                    error: error.to_string(),
+                }
+                .into(),
             })?;
         let mut update = Update {
             frame_errors: first_frame.into_iter().collect(),
@@ -599,7 +723,8 @@ impl Lot {
                 tick,
                 error: error.to_string(),
                 update: Some(Box::new(update)),
-            });
+            }
+            .into());
         }
         Ok(update)
     }
@@ -723,10 +848,46 @@ impl Lot {
         Ok(sounds.into_inner())
     }
 
+    /// From now on, a dialog that offers a choice when no answer is left
+    /// in the list given at load waits for the player, as the original
+    /// waits (0x436da0): the step returns [`StepError::Asking`] and the
+    /// lot stays as it was before that tick, not halted. The window turns
+    /// this on; `sims boot` and the comparisons do not, and halt there.
+    ///
+    /// The tick runs again once [`Lot::answer`] has the answer. A tick
+    /// runs the same from the same lot, so it reaches the same dialog,
+    /// and the lot then goes on exactly as if the answer had been in the
+    /// list at load.
+    pub fn wait_for_answers(&mut self) {
+        self.asks = true;
+    }
+
+    /// The dialog the lot waits on, if it waits.
+    pub fn asking(&self) -> Option<&Asking> {
+        self.asking.as_deref()
+    }
+
+    /// Answers the dialog the lot waits on with `answer` (the status its
+    /// button gives: 2 the first, 3 the second, 4 the third). The next
+    /// step runs the tick again and gives it this answer.
+    pub fn answer(&mut self, answer: u8) -> Result<(), AnswerError> {
+        let asking = self.asking.as_ref().ok_or(AnswerError::NotAsked)?;
+        let offered = asking.shown.answers;
+        if !offered.contains(&answer) {
+            return Err(AnswerError::NotOffered { answer, offered });
+        }
+        self.player.queue.push_back(answer);
+        self.asking = None;
+        Ok(())
+    }
+
     /// Whether the lot takes a player's input.
     fn ready(&self) -> Result<(), OrderError> {
         if self.halted {
             return Err(OrderError::Halted);
+        }
+        if self.asking.is_some() {
+            return Err(OrderError::Asking);
         }
         if self.load.finished.is_none() {
             return Err(OrderError::Incomplete);
@@ -808,6 +969,8 @@ mod tests {
             load,
             halted: false,
             play: Play::default(),
+            asks: false,
+            asking: None,
         }
     }
 
