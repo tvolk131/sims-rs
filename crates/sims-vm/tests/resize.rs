@@ -2188,6 +2188,7 @@ fn the_goth_house_first_tick_matches_the_original() {
     const TICK_417: &str = "e5b71ee022f181d8de6c5e72b9877002cfc7ba466e898e0105220e6287df6938";
     const TICK_436: &str = "5a60a15adc651b9d00329105701dd6c7841ab0fcbfb45b579a4e6cf46d8ecb6b";
     const TICK_466: &str = "7dd965a56f279614b46c16223faf1abad52290db1940fa293a082e559449b9cd";
+    const TICK_583: &str = "95602638fb97031232502163ecded9078771357166b92166150eebfba73adb2d";
     const TICK_416_20: &str = "37ff5756ac5cf26769da735eadb955be4f78f64381ea8b847963298b51f8320b";
     const USES_233: [(i16, i32); 2] = [(132, 5), (51, 8)];
     const TREES_233: [u16; 9] = [
@@ -2747,11 +2748,24 @@ fn the_goth_house_first_tick_matches_the_original() {
         }
         assert_eq!(world.ticks, before.ticks + 466);
         assert_eq!(digest(&world.encode()), TICK_466);
-        // Tick 467: person 21's tree 0x1017 runs Get Direction To (opcode
-        // 12), which is not ported.
+        // Tick 467: person 21's tree 0x1017 looks for a door beside door
+        // 93 with Get Direction To (opcode 12). The direction from 93 to
+        // object 126, in the native order (+0xf4 first), is 0, not the 6
+        // it looks for, so the scan runs out and tree 0x100a draws a
+        // Random Number of 2 (0x451ed8): one draw from the lot's stream,
+        // as the capture's stream shows.
+        interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        assert_eq!(world.lot_rng.state(), 3_991_923_174);
+        for _ in 468..=583 {
+            interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        }
+        assert_eq!(world.ticks, before.ticks + 583);
+        assert_eq!(digest(&world.encode()), TICK_583);
+        // Tick 584: person 18's tree 0x1011 runs Snap (opcode 46), which
+        // is not ported.
         let error = interpreter
             .lot_update(world, &tuning, &mut player)
             .unwrap_err();
-        assert!(error.to_string().contains("primitive 12"), "{error}");
+        assert!(error.to_string().contains("primitive 46"), "{error}");
     });
 }
