@@ -327,6 +327,14 @@ pub struct Menu {
     pub sounds: Vec<crate::SoundEvent>,
 }
 
+/// What [`Lot::cancel`] did: whether the press counts, and the trees'
+/// requests to the sound system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cancelled {
+    pub counts: bool,
+    pub sounds: Vec<crate::SoundEvent>,
+}
+
 /// Why a player's order was not queued or the pie menu not listed
 /// ([`Lot::queue_interaction`], [`Lot::pie_menu`], [`Lot::pick`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -851,6 +859,31 @@ impl Lot {
             .map_err(OrderError::Refused)?;
         self.world = world;
         Ok(queued)
+    }
+
+    /// Cancels `person`'s action numbered `uid`, as a press on its icon
+    /// in the queue does ([`Interpreter::cancel`], 0x45d5f8), between
+    /// steps. Returns whether the press counts (the original then plays
+    /// `UI_queue_delete`, else `UI_error`), and the requests to the sound
+    /// system the trees it ran made. A cancel that fails changes nothing,
+    /// as for [`Lot::queue_interaction`].
+    pub fn cancel(&mut self, person: u16, uid: i32) -> Result<Cancelled, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let counts = interpreter
+            .cancel(&mut world, person, uid)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        Ok(Cancelled {
+            counts,
+            sounds: sounds.into_inner(),
+        })
     }
 
     /// Selects the Sim `person` as the player does from a portrait,
