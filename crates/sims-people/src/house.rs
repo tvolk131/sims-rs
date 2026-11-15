@@ -2,7 +2,9 @@
 //! snapshot holds now, each with its skeleton and what it wears.
 
 use crate::appearance::Outfit;
+use crate::suit::Careers;
 use sims_content::{Catalog, House, Index, Install, Neighborhood, People};
+use sims_formats::career::Career;
 use sims_formats::iff::Iff;
 use sims_formats::saved_objects::Person;
 use sims_formats::strings::StringTable;
@@ -31,6 +33,10 @@ pub struct Cast {
     install: Install,
     index: Index,
     catalog: Catalog,
+    /// The careers of `work.iff`, or None when the install has a
+    /// `Careers.txt`, which the original reads in their place (not
+    /// ported, as in `sims_vm::program::Program::careers`).
+    careers: Option<Careers>,
 }
 
 /// The word of a person type's definition that names its body strings
@@ -50,11 +56,19 @@ impl Cast {
             index.add_characters(&characters).map_err(|e| fail(&e))?;
         }
         let catalog = Catalog::build(&index).map_err(|e| fail(&e))?;
+        let careers = careers(&index)?;
         Ok(Self {
             install,
             index,
             catalog,
+            careers,
         })
+    }
+
+    /// The careers of the install's `work.iff`, by CARR chunk ID; None
+    /// when the install has a `Careers.txt`.
+    pub fn careers(&self) -> Option<&Careers> {
+        self.careers.as_ref()
     }
 
     /// The cast of the house file `house`, which must be in a
@@ -71,8 +85,10 @@ impl Cast {
     /// in the order given. Each one's skeleton comes from its type's body
     /// strings; what it wears comes from its record, or, when the record
     /// names no body, from the type's default outfit (see
-    /// [`Outfit::from_body_strings`]). A type that is not a person, or
-    /// whose skeleton cannot be chosen, is an error.
+    /// [`Outfit::from_body_strings`]). The suit a running simulation
+    /// dresses a person in is not applied here; [`crate::People`] applies
+    /// it ([`crate::suit`]). A type that is not a person, or whose
+    /// skeleton cannot be chosen, is an error.
     pub fn residents<'a>(
         &self,
         people: impl IntoIterator<Item = (u16, u32, &'a Person)>,
@@ -140,6 +156,30 @@ impl Cast {
             .map(|e| e.text)
             .collect())
     }
+}
+
+/// Every CARR of the install's `work.iff` (none without the file), or
+/// None when the install has a `Careers.txt`.
+fn careers(index: &Index) -> Result<Option<Careers>, String> {
+    if index.named("Careers.txt").next().is_some() {
+        return Ok(None);
+    }
+    let mut careers = Careers::new();
+    let Some((_, file)) = index.named("work.iff").next() else {
+        return Ok(Some(careers));
+    };
+    let location = file.location(&index.root);
+    let iff = Iff::parse(file.read().map_err(|e| e.to_string())?)
+        .map_err(|e| format!("{location}: {e}"))?;
+    for chunk in iff
+        .resource_order(b"CARR")
+        .map_err(|e| format!("{location}: {e}"))?
+    {
+        let career = Career::parse(iff.data(chunk))
+            .map_err(|e| format!("{location} CARR #{}: {e}", chunk.id))?;
+        careers.insert(chunk.id as i16, career.levels);
+    }
+    Ok(Some(careers))
 }
 
 /// Reads the people of the house file `house`, which must be in a

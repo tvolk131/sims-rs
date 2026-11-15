@@ -20,9 +20,7 @@
 //! floor, `1`/`2`/`3` walls up, cutaway and down, the arrows or a
 //! right-button drag scroll, space pauses, Escape quits.
 //!
-//! A press on a portrait selects that Sim. In strict mode switching Sims
-//! fails, as the simulation has not ported the deselected Sim's
-//! animator refresh; play mode leaves it out (`Lot::select_play`).
+//! A press on a portrait selects that Sim.
 //!
 //! A left click on a person or an object opens its pie menu for the
 //! selected Sim (`sims_ui::pie`, around the click); a click on an entry

@@ -15,6 +15,11 @@ pub enum Move {
     Walls(Walls),
     /// Move the lot by screen pixels.
     Scroll([i32; 2]),
+    /// Move the lot so this screen point comes to the middle of the
+    /// screen (0x4a7777 and 0x4a7996 at once, as without the slide).
+    Centre([i32; 2]),
+    /// Show this floor, 1 or 2 (0x4a80c7).
+    Floor(i32),
 }
 
 /// How far the lot's origin may move from the screen's corner, in pixels,
@@ -88,6 +93,11 @@ impl View {
                 self.camera.origin[0] = self.camera.origin[0].saturating_add(dx);
                 self.camera.origin[1] = self.camera.origin[1].saturating_add(dy);
             }
+            Move::Centre([x, y]) => {
+                self.camera.origin[0] = self.camera.origin[0].saturating_add(middle[0] - x);
+                self.camera.origin[1] = self.camera.origin[1].saturating_add(middle[1] - y);
+            }
+            Move::Floor(level) => self.camera.level = level.clamp(1, 2),
         }
         // The original forgets the pointer's rooms when the floor changes.
         if self.camera.level != before.level {
@@ -135,5 +145,17 @@ mod tests {
         assert!(v.camera.origin.iter().all(|n| n.abs() <= ORIGIN_LIMIT));
         v.resize([i32::MAX, 0]);
         assert_eq!(v.size, [SIZE_LIMIT, 1]);
+    }
+
+    #[test]
+    fn centring_brings_a_screen_point_to_the_middle() {
+        let mut v = View::new([800, 600], [400, 400], 0);
+        let fine = v.camera.unproject_fine([100, 50]);
+        assert!(v.apply(Move::Centre([100, 50])));
+        assert_eq!(v.camera.unproject_fine([400, 300]), fine);
+        assert!(!v.apply(Move::Centre([400, 300])));
+        assert!(v.apply(Move::Floor(2)));
+        assert_eq!(v.camera.level, 2);
+        assert!(!v.apply(Move::Floor(5)));
     }
 }

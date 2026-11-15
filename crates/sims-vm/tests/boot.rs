@@ -287,6 +287,65 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     }
 }
 
+/// The pie's entry the pointer reaches is checked again (0x48df28) as
+/// autonomy checks: its check tree runs on the lot with the argument 1,
+/// the advertisement record takes the entry's, and the person's temps
+/// are put back.
+#[test]
+fn reaching_a_pie_entry_checks_its_action_again() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    let sim = lot.load_report().finished.unwrap().sim.unwrap();
+    for _ in 0..50 {
+        lot.step().unwrap();
+    }
+    let menu = lot.pie_menu(sim, 118).unwrap_or_else(|e| panic!("{e}"));
+    let snack = menu
+        .entries
+        .iter()
+        .find(|e| e.name.is_none() && e.action.table_index == 1)
+        .expect("Have A Snack")
+        .action
+        .clone();
+    // The listing's last check (the fridge's last entry) failed.
+    assert!(!lot.world().objects[&sim].last_result);
+    let temps = lot.world().objects[&sim].temps.clone();
+    let before = lot.world().hash();
+    let checked = lot
+        .highlight(sim, snack.clone())
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(checked.action.flags, 12, "{:?}", checked.action);
+    // Only its flags are the check's.
+    assert_eq!(
+        format!(
+            "{:?}",
+            sims_formats::saved_objects::Interaction {
+                flags: snack.flags,
+                ..checked.action.clone()
+            }
+        ),
+        format!("{snack:?}")
+    );
+    let me = &lot.world().objects[&sim];
+    assert!(me.last_result, "the entry's check tree passed");
+    assert_eq!(me.temps, temps);
+    assert_ne!(lot.world().hash(), before);
+    assert!(lot.world().advertisement_record.is_some());
+    // A target that is not there is refused, and the lot is unchanged.
+    let before = lot.world().hash();
+    let gone = sims_formats::saved_objects::Interaction {
+        target: 30000,
+        ..snack
+    };
+    assert!(lot.highlight(sim, gone).is_err());
+    assert_eq!(lot.world().hash(), before);
+}
+
 #[test]
 fn the_snack_order_pays_for_the_snack() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
@@ -535,14 +594,12 @@ fn the_player_selects_another_goth() {
             id != mortimer && data[32] == 0 && data[61] == family
         })
         .unwrap();
-    // In strict mode deselecting Mortimer fails on his animator's refresh
-    // (0x58da12), which is not ported, and changes nothing.
-    let before = lot.world().hash();
-    let refused = lot.select(other).unwrap_err().to_string();
-    assert!(refused.contains("0x58da12"), "{refused}");
-    assert_eq!(lot.world().hash(), before);
-    // Play mode leaves the refresh out.
-    lot.select_play(other).unwrap();
+    // Deselecting Mortimer refreshes his animator at the tick count
+    // (0x58da12 with 0).
+    lot.select(other).unwrap();
+    let ticks = lot.world().ticks as i32;
+    let animator = &lot.world().animators[&mortimer];
+    assert_eq!(animator.clock, animator.clock_at(ticks));
     let world = lot.world();
     assert_eq!(world.selected(), Some(other));
     assert!(!world.objects[&mortimer].selected);
@@ -551,15 +608,16 @@ fn the_player_selects_another_goth() {
     assert_eq!(world.objects[&other].slots[2].object, first as i16);
     assert_eq!(world.objects[&mortimer].slots[2].object, 0);
     // Selecting him back gives the indicator back.
-    lot.select_play(mortimer).unwrap();
+    lot.select(mortimer).unwrap();
     assert_eq!(lot.world().selected(), Some(mortimer));
     assert_eq!(lot.world().objects[&first].data[2], mortimer as i16);
     // A selection that fails changes nothing.
     let before = lot.world().hash();
-    assert!(lot.select_play(first).is_err());
+    assert!(lot.select(first).is_err());
     assert_eq!(lot.world().hash(), before);
+    // The lot goes on in strict mode.
     for _ in 0..50 {
-        assert!(lot.step_play().unwrap().errors.is_empty());
+        lot.step().unwrap();
     }
 }
 

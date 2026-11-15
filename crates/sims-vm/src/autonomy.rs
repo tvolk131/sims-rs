@@ -927,6 +927,84 @@ impl Machine<'_, '_> {
     }
 }
 
+impl Machine<'_, '_> {
+    /// The check the pie menu runs on the entry the pointer reaches
+    /// (0x48df28, from the menu window's handler at 0x51bb9e): 0x458319 on
+    /// the entry's action with a context that 0x458293 makes with the
+    /// byte 1, and the advertisement record as its output. So it is
+    /// autonomy's check ([`Machine::autonomy_allows`]): the arguments 1,
+    /// 0, 0, 0, a target whose data word 25 is above 0 fails, the entry's
+    /// advertisements are copied over the one record, and the room rule
+    /// applies. The person's temps are saved before the check tree and
+    /// put back after it (0x4582dd).
+    ///
+    /// The action's flags are written as 0x458319 writes them: 8 cleared
+    /// and 4 set; then, if the target's table has the action's entry, 8
+    /// set if it passed and 0x10 by the person's object data word 50. The
+    /// target is the action's interaction target (0x458300 through
+    /// 0x435286). What 0x48df28 does with the result is the interface's:
+    /// it scores the record for the entry (0x4214a1) and shows it.
+    pub(crate) fn highlight(
+        &mut self,
+        action: &mut sims_formats::saved_objects::Interaction,
+    ) -> Result<(), Trap> {
+        action.flags = (action.flags & !checked::PASSED) | checked::RAN;
+        let Some(target) = u16::try_from(action.target).ok().filter(|&t| t != 0) else {
+            return Ok(());
+        };
+        let target = self.interaction_target(target)?;
+        let menu = action.table_index as u32;
+        let Some(table) = self.table(target)? else {
+            return Ok(());
+        };
+        if find(table, menu).is_none() {
+            return Ok(());
+        }
+        let me = self.me;
+        let person = self
+            .me()?
+            .person
+            .as_ref()
+            .ok_or(Trap::native(0x1c, "object is not a person"))?;
+        let word = |index: usize| person.data.get(index).copied().unwrap_or(0);
+        let (kind, age) = (word(person::KIND), word(person::AGE));
+        let lot = self.world.globals.get(LOT).copied().unwrap_or(0);
+        let chooser = Chooser {
+            me,
+            visitor: word(person::VISITOR) != 0,
+            child: age != 0 && age < 18,
+            dog: kind & 2 != 0,
+            cat: kind & 4 != 0,
+            pets_outside: word(person::PETS_OUTSIDE) != 0,
+            autonomy: word(person::AUTONOMY),
+            residential: self.zoning(lot) == 1,
+            constants: self.program.autonomy_constants(),
+        };
+        let entry = Entry {
+            target,
+            menu,
+            attenuation: F32::ZERO,
+            first: false,
+            join: false,
+        };
+        let mut saved = None;
+        let allowed = self.autonomy_allows(&chooser, entry, &mut saved);
+        if let Some(temps) = saved {
+            self.me_mut()?.temps = temps;
+        }
+        let passed = allowed?.is_some();
+        let marked = self.me()?.data.get(data::CHECKED).is_some_and(|&w| w != 0);
+        action.flags &= !(checked::PASSED | checked::MARKED);
+        if passed {
+            action.flags |= checked::PASSED;
+        }
+        if marked {
+            action.flags |= checked::MARKED;
+        }
+        Ok(())
+    }
+}
+
 /// An entry's attenuation by its code (0x475ec6): 0 the entry's own, 1
 /// none, 2 to 4 the low, moderate and high constants (a visitor's own),
 /// and any other code 0.02.
