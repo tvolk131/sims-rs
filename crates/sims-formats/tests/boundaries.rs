@@ -286,11 +286,15 @@ fn compressed_ttab_signed_field_widths_and_truncation() {
     assert!(InteractionTable::parse(&b[..b.len() - 1]).is_err());
 }
 #[test]
-fn an_empty_interaction_table_keeps_its_version_or_9() {
-    for (bytes, version) in [(&[0, 0, 8, 0][..], 8), (&[0, 0, 9, 0, 0], 9), (&[0, 0], 9)] {
+fn an_empty_interaction_table_keeps_its_version() {
+    for (bytes, version) in [(&[0, 0, 8, 0][..], 8), (&[0, 0, 9, 0, 0], 9)] {
         let table = InteractionTable::parse(bytes).unwrap();
         assert_eq!(table.version, version);
         assert!(table.interactions.is_empty());
+    }
+    // One that ends before its version word is rejected.
+    for bytes in [&[0, 0][..], &[0, 0, 6]] {
+        assert!(InteractionTable::parse(bytes).is_err());
     }
 }
 #[test]
