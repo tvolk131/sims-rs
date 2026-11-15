@@ -4,7 +4,7 @@
 //! The panel turns presses into `sims_ui` commands; [`Hud::press`] hands
 //! them to the game, which carries out what it can.
 
-use crate::menu::{self, Menu};
+use crate::menu::{Menu, Press};
 use crate::pace::Pace;
 use crate::view::View;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
@@ -17,6 +17,7 @@ use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::household::{Faces, Snapshot};
 use sims_ui::hud::{self, Controls, Item};
+use sims_ui::pie;
 use std::path::Path;
 
 /// The status line's font size and colors.
@@ -51,6 +52,7 @@ impl Hud {
         let resources: Vec<i32> = hud::RESOURCES
             .iter()
             .chain(&dialog::RESOURCES)
+            .chain(&pie::RESOURCES)
             .copied()
             .collect();
         let art = Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
@@ -178,9 +180,9 @@ impl Hud {
                 self.controls.pointer,
             );
         }
-        if let (Some(menu), Some(font)) = (&mut self.menu, self.art.font(menu::SIZE)) {
-            menu.layout(font, view.size);
-            menu.draw(&mut frame, font, self.controls.pointer);
+        if let Some(menu) = &mut self.menu {
+            menu.layout(&self.art, view.size);
+            menu.draw(&mut frame, &self.art, self.controls.pointer);
         }
         self.band = status.and_then(|status| self.status(&mut frame, status));
         canvas.color = frame.into_rgb();
@@ -220,7 +222,7 @@ impl Hud {
         };
         let entry = |pointer: Option<[i32; 2]>| {
             let menu = self.menu.as_ref()?;
-            menu.row(pointer?)
+            Some(menu.hovered(pointer?))
         };
         let before = (
             hud::hovered(&self.items, self.controls.pointer),
@@ -241,16 +243,23 @@ impl Hud {
         if let Some(layout) = &self.dialog {
             return dialog::press(layout, point);
         }
-        // A press anywhere closes the menu; one on an entry chooses it.
+        // A press on an entry chooses it, one on a submenu's entry or
+        // back from it keeps the menu open, and one elsewhere closes it.
         // `interaction` is the entry's index in the menu; the game reads
         // its menu number from the menu it had open.
-        if let Some(menu) = self.menu.take() {
-            let interaction = u16::try_from(menu.row(point)?).ok()?;
-            return Some(Command::ChooseInteraction {
-                sim: menu.person,
-                object: menu.object,
-                interaction,
-            });
+        if let Some(mut menu) = self.menu.take() {
+            return match menu.press(point) {
+                Press::Chose(choice) => Some(Command::ChooseInteraction {
+                    sim: menu.person,
+                    object: menu.object,
+                    interaction: u16::try_from(choice).ok()?,
+                }),
+                Press::Stays => {
+                    self.menu = Some(menu);
+                    None
+                }
+                Press::Closed => None,
+            };
         }
         let command = hud::press(&self.items, point)?;
         self.controls.apply(&command);

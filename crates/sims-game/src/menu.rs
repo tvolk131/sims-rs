@@ -27,8 +27,8 @@
 //! queues it by its menu number (`Lot::queue_interaction`). Any other
 //! failure (a person who is not one, a check tree taking its error branch
 //! or running out of instructions, a halted lot) is an error: no menu is
-//! shown. The menu is a plain list at the pointer, in columns when it is
-//! taller than the view, not the original's pie.
+//! shown. The menu is shown as the original's pie (`sims_ui::pie`), at
+//! the pointer.
 //!
 //! Which TTAB an object's entries come from, and which tile of a
 //! multi-tile object they go to, the simulation decides in code it keeps
@@ -42,8 +42,9 @@ use sims_formats::saved_objects::Interaction;
 use sims_formats::strings::StringTable;
 use sims_render::Assets;
 use sims_sim::World;
-use sims_ui::font::Font;
+use sims_ui::art::Art;
 use sims_ui::frame::{Frame, Rect};
+use sims_ui::pie::{self, Pie, Pressed};
 use sims_vm::DEFINITION_WORDS;
 use sims_vm::boot::Lot;
 use sims_vm::boot::OrderError;
@@ -375,135 +376,88 @@ fn labels(assets: &Assets, resource: usize, id: u16) -> Option<StringTable> {
     StringTable::parse(iff.data(strings)).ok()
 }
 
-/// The menu's text size and colors.
-pub const SIZE: u8 = 10;
-const ROW: i32 = SIZE as i32 + 9;
-const PAD: i32 = 8;
-const BACK: [u8; 3] = [24, 40, 88];
-const HOVER: [u8; 3] = [64, 96, 176];
-const TEXT: [u8; 3] = [255, 255, 255];
-const FAINT: [u8; 3] = [160, 170, 200];
-const EDGE: [u8; 3] = [200, 210, 240];
-
-/// The rows `count` entries `width` pixels wide take, opened at `at` on a
-/// canvas of `size`: columns of as many rows as fit, left to right, as
-/// many columns as fit, moved to stay on the canvas where they can. Fewer
-/// rows than `count` when they do not all fit.
-fn place(count: usize, width: i32, at: [i32; 2], size: [i32; 2]) -> Vec<Rect> {
-    let count = i32::try_from(count).unwrap_or(i32::MAX);
-    let per_column = (size[1] / ROW).clamp(1, count.max(1));
-    let fit = (size[0] / width.max(1)).max(1);
-    let columns = ((count + per_column - 1) / per_column).min(fit);
-    let count = count.min(per_column.saturating_mul(columns));
-    let x = at[0].min(size[0] - width * columns).max(0);
-    let y = at[1].min(size[1] - ROW * per_column).max(0);
-    (0..count)
-        .map(|i| {
-            let (column, row) = (i / per_column, i % per_column);
-            Rect::new(x + width * column, y + ROW * row, width, ROW)
-        })
-        .collect()
-}
-
-/// An open menu: who it is for, what it is on, and where it is drawn.
+/// An open menu: who it is for, what it is on, and the pie it is shown
+/// as (`sims_ui::pie`, the original's menu window and object picker).
 #[derive(Debug, Clone)]
 pub struct Menu {
     pub person: u16,
     pub object: u16,
     pub entries: Vec<Entry>,
-    /// Where it was opened (canvas pixels).
-    pub at: [i32; 2],
-    /// The rows of the entries shown, first to last, once laid out.
-    rows: Vec<Rect>,
-    /// When not every entry fits: the last row, which says how many are
-    /// not shown and chooses nothing.
-    more: Option<(Rect, usize)>,
+    pie: Pie,
+    /// The pie's menus as last laid out, the first menu first.
+    layouts: Vec<pie::Layout>,
+}
+
+/// What a press on an open [`Menu`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Press {
+    /// The player chose this entry (its index in [`Menu::entries`]); the
+    /// menu is closed.
+    Chose(usize),
+    /// A submenu opened, or the press went back from one; the menu stays.
+    Stays,
+    /// The press was elsewhere: the menu is closed.
+    Closed,
 }
 
 impl Menu {
+    /// The menu of `entries` opened at `at`, the pointer where the player
+    /// clicked. An entry whose name has a `/` goes into a submenu, and
+    /// only the first [`pie::SHOWN`] of a menu are shown, as the
+    /// original's picker does.
     pub fn new(person: u16, object: u16, entries: Vec<Entry>, at: [i32; 2]) -> Self {
+        let names: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
+        let pie = Pie::new(&names, at);
         Self {
             person,
             object,
             entries,
-            at,
-            rows: Vec::new(),
-            more: None,
+            pie,
+            layouts: Vec::new(),
         }
     }
 
-    /// The label of the row that stands for the entries not shown.
-    fn more_label(hidden: usize) -> String {
-        format!("({hidden} more not shown)")
+    /// Lays the menus out on a screen of `size` with `art` (which holds
+    /// [`pie::RESOURCES`] and the label font). Nothing is laid out
+    /// without the font.
+    pub fn layout(&mut self, art: &Art, size: [i32; 2]) {
+        self.layouts = self.pie.layout(size, art).unwrap_or_default();
     }
 
-    /// Lays the rows out with `font` on a canvas of `size`: columns of
-    /// as many rows as fit, at the pointer, moved to stay on the canvas.
-    /// If they do not all fit, the last row that does says how many more
-    /// there are.
-    pub fn layout(&mut self, font: &Font, size: [i32; 2]) {
-        let width = self
-            .entries
-            .iter()
-            .map(|e| font.width(&e.label))
-            .chain(std::iter::once(
-                font.width(&Self::more_label(self.entries.len())),
-            ))
-            .max()
-            .unwrap_or(0)
-            + 2 * PAD;
-        self.arrange(width, size);
+    /// Which menu is open and the entry of it under `point`, to tell
+    /// when the highlight changes.
+    pub fn hovered(&self, point: [i32; 2]) -> (usize, Option<usize>) {
+        (self.layouts.len(), Pie::hit(&self.layouts, point))
     }
 
-    fn arrange(&mut self, width: i32, size: [i32; 2]) {
-        let mut rows = place(self.entries.len(), width, self.at, size);
-        self.more = None;
-        if rows.len() < self.entries.len()
-            && let Some(last) = rows.pop()
-        {
-            self.more = Some((last, self.entries.len() - rows.len()));
+    /// A press at `point`, as the picker takes it.
+    pub fn press(&mut self, point: [i32; 2]) -> Press {
+        match self.pie.press(&self.layouts, point) {
+            Pressed::Chose(choice) => Press::Chose(choice),
+            Pressed::Opened { .. } | Pressed::Back => Press::Stays,
+            Pressed::Closed => Press::Closed,
         }
-        self.rows = rows;
     }
 
-    /// The index of the entry whose row is under `point`.
-    pub fn row(&self, point: [i32; 2]) -> Option<usize> {
-        self.rows
-            .iter()
-            .position(|r| r.contains(point[0], point[1]))
+    /// The labels of the menu on top as last laid out, with their boxes:
+    /// the ones a press can choose.
+    pub fn labels(&self) -> Vec<(&str, Rect)> {
+        self.layouts
+            .last()
+            .map(|top| {
+                top.labels
+                    .iter()
+                    .filter(|l| l.enabled)
+                    .map(|l| (l.text.as_str(), l.rect))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    /// Whether the menu covers `point`.
-    pub fn covers(&self, point: [i32; 2]) -> bool {
-        self.row(point).is_some()
-            || self
-                .more
-                .is_some_and(|(r, _)| r.contains(point[0], point[1]))
-    }
-
-    pub fn draw(&self, frame: &mut Frame, font: &Font, pointer: Option<[i32; 2]>) {
-        let hovered = pointer.and_then(|p| self.row(p));
-        let all = || self.rows.iter().chain(self.more.as_ref().map(|(r, _)| r));
-        if let Some(first) = self.rows.first().or(self.more.as_ref().map(|(r, _)| r)) {
-            let right = all().map(|r| r.x + r.width).max().unwrap_or(0);
-            let bottom = all().map(|r| r.y + r.height).max().unwrap_or(0);
-            let (x, y) = (first.x - 1, first.y - 1);
-            frame.fill(Rect::new(x, y, right - x + 1, bottom - y + 1), EDGE);
-        }
-        for (i, (row, entry)) in self.rows.iter().zip(&self.entries).enumerate() {
-            let back = if hovered == Some(i) { HOVER } else { BACK };
-            frame.fill(*row, back);
-            font.draw(frame, &entry.label, [row.x + PAD, row.y + 2], TEXT);
-        }
-        if let Some((row, hidden)) = self.more {
-            frame.fill(row, BACK);
-            font.draw(
-                frame,
-                &Self::more_label(hidden),
-                [row.x + PAD, row.y + 2],
-                FAINT,
-            );
-        }
+    /// Draws the menus as last laid out. The middle shows the face
+    /// bitmap without the selected Sim's head, which is not rendered yet.
+    pub fn draw(&self, frame: &mut Frame, art: &Art, pointer: Option<[i32; 2]>) {
+        Pie::draw(frame, art, &self.layouts, None, pointer, false);
     }
 }
 
@@ -562,53 +516,75 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_tall_menu_wraps_into_columns_on_the_canvas() {
-        // Four rows fit; ten entries take three columns, moved left and up
-        // to stay on the canvas.
-        let rows = place(10, 40, [500, 500], [200, 4 * ROW + 3]);
-        assert_eq!(rows.len(), 10);
-        assert_eq!((rows[0].x, rows[0].y), (80, 3));
-        assert_eq!((rows[3].x, rows[3].y), (80, 3 + 3 * ROW));
-        assert_eq!((rows[4].x, rows[4].y), (120, 3));
-        assert_eq!((rows[9].x, rows[9].y), (160, 3 + ROW));
-        // A short menu stays where it was opened.
-        let rows = place(2, 40, [10, 20], [200, 200]);
-        assert_eq!((rows[1].x, rows[1].y), (10, 20 + ROW));
-        assert!(place(0, 40, [10, 20], [200, 200]).is_empty());
+    /// Art with only the pie's label font: every glyph 4 wide, lines 23
+    /// high, as `variablesans_12`'s are.
+    fn art() -> Art {
+        let glyphs = (32u16..127)
+            .map(|code| sims_formats::ffn::Glyph {
+                code,
+                width: 4,
+                height: 23,
+                atlas_x: 0,
+                atlas_y: 0,
+                first_bearing: 0,
+                bearing_x: 0,
+                bearing_y: 0,
+            })
+            .collect();
+        let mut art = Art::default();
+        art.insert_font(
+            pie::FONT,
+            sims_ui::font::Font::new(sims_formats::ffn::Font {
+                flags: 9,
+                glyphs,
+                width: 4,
+                height: 23,
+                coverage: vec![15; 4 * 23],
+            }),
+        );
+        art
     }
 
     #[test]
-    fn a_menu_wider_than_the_canvas_shows_what_fits() {
-        // Four rows and two columns fit: eight of twenty entries.
-        let rows = place(20, 40, [500, 500], [90, 4 * ROW]);
-        assert_eq!(rows.len(), 8);
-        assert!(rows.iter().all(|r| r.x >= 0 && r.x + r.width <= 90));
-        // A column wider than the canvas still shows one column.
-        assert_eq!(place(20, 400, [0, 0], [90, 4 * ROW]).len(), 4);
+    fn a_press_chooses_an_entry_by_its_place_in_the_listing() {
+        let named = |labels: &[&str]| -> Vec<Entry> {
+            labels
+                .iter()
+                .enumerate()
+                .map(|(n, l)| Entry {
+                    label: (*l).into(),
+                    ..entry(u32::try_from(n).unwrap())
+                })
+                .collect()
+        };
+        let centre = |r: sims_ui::frame::Rect| [r.x + r.width / 2, r.y + r.height / 2];
+        let mut menu = Menu::new(
+            1,
+            2,
+            named(&["Read a Book", "Study/Cooking", "Study/Mechanical"]),
+            [400, 300],
+        );
+        let art = art();
+        menu.layout(&art, [800, 600]);
+        // Two entries in the first menu: the book, and the studies'
+        // submenu.
+        assert_eq!(menu.layouts.len(), 1);
+        assert_eq!(menu.layouts[0].labels.len(), 2);
+        let study = centre(menu.layouts[0].labels[1].rect);
+        assert_eq!(menu.hovered(study), (1, Some(1)));
+        assert_eq!(menu.press(study), Press::Stays);
+        menu.layout(&art, [800, 600]);
+        assert_eq!(menu.layouts.len(), 2);
+        // Mechanical, the second entry of the submenu, is the third entry
+        // listed.
+        let mechanical = centre(menu.layouts[1].labels[1].rect);
+        assert_eq!(menu.hovered(mechanical), (2, Some(1)));
+        assert_eq!(menu.press(mechanical), Press::Chose(2));
 
-        // The menu gives the last row that fits to how many are not shown,
-        // and a press there chooses nothing.
-        let mut menu = Menu::new(1, 2, (0..20).map(entry).collect(), [500, 500]);
-        menu.arrange(40, [90, 4 * ROW]);
-        assert_eq!(menu.rows.len(), 7);
-        let (more, hidden) = menu.more.unwrap();
-        assert_eq!(hidden, 13);
-        let inside = [more.x + 1, more.y + 1];
-        assert!(menu.covers(inside));
-        assert_eq!(menu.row(inside), None);
-        // All of them fit on a big canvas.
-        menu.arrange(40, [400, 400]);
-        assert_eq!((menu.rows.len(), menu.more), (20, None));
-    }
-
-    #[test]
-    fn a_press_on_a_row_chooses_its_entry() {
-        let mut menu = Menu::new(1, 2, vec![entry(0), entry(3)], [10, 20]);
-        menu.rows = vec![Rect::new(10, 20, 50, ROW), Rect::new(10, 20 + ROW, 50, ROW)];
-        assert_eq!(menu.row([11, 21]), Some(0));
-        assert_eq!(menu.row([11, 21 + ROW]), Some(1));
-        assert_eq!(menu.row([5, 21]), None);
-        assert!(!menu.covers([11, 20 + 2 * ROW]));
+        let mut menu = Menu::new(1, 2, named(&["Read a Book"]), [400, 300]);
+        menu.layout(&art, [800, 600]);
+        let book = centre(menu.layouts[0].labels[0].rect);
+        assert_eq!(menu.press(book), Press::Chose(0));
+        assert_eq!(menu.press([5, 5]), Press::Closed);
     }
 }

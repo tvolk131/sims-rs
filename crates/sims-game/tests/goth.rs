@@ -376,6 +376,58 @@ fn the_pointer_reaching_an_object_lists_its_menu_once_and_a_click_opens_it() {
 }
 
 #[test]
+fn a_snack_is_chosen_from_the_fridges_pie() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(50), 50);
+    game.resize([800, 600]);
+    game.render();
+    let person = game.lot().world().selected().expect("a Sim is selected");
+    // A click on each object on the lot, until one opens a pie with Have A
+    // Snack (the fridge).
+    let points: Vec<([i32; 2], u16)> = (0..600)
+        .step_by(6)
+        .flat_map(|y| (0..800).step_by(6).map(move |x| [x, y]))
+        .filter(|&p| !game.over_panel(p))
+        .filter_map(|p| game.under(p).map(|id| (p, id)))
+        .collect();
+    let mut tried = std::collections::BTreeSet::new();
+    let mut fridge = None;
+    for (point, id) in points {
+        if !tried.insert(id) {
+            continue;
+        }
+        game.hover(point);
+        game.press(point);
+        // The pie is laid out when it is drawn.
+        game.render();
+        let snack = game.menu().and_then(|menu| {
+            assert!(!menu.labels().is_empty(), "object {id}'s pie shows nothing");
+            menu.labels()
+                .into_iter()
+                .find(|(text, _)| *text == "Have A Snack")
+                .map(|(_, r)| [r.x + r.width / 2, r.y + r.height / 2])
+        });
+        if let Some(snack) = snack {
+            fridge = Some((id, snack));
+            break;
+        }
+        game.close_menu();
+    }
+    let (fridge, snack) = fridge.expect("the fridge's pie offers Have A Snack");
+    game.press(snack);
+    assert!(game.menu().is_none(), "choosing closes the pie");
+    let queue = &game.lot().world().objects[&person]
+        .person
+        .as_ref()
+        .unwrap()
+        .queue;
+    assert!(queue.iter().any(|a| a.target == fridge as i16), "{queue:?}");
+}
+
+#[test]
 fn a_press_on_a_portrait_selects_that_goth() {
     let Some(install) = install() else {
         return;

@@ -475,6 +475,12 @@ impl Game {
         }
     }
 
+    /// The pie menu, while one is open. Its labels are placed when the
+    /// game is rendered.
+    pub fn menu(&self) -> Option<&Menu> {
+        self.hud.menu.as_ref()
+    }
+
     /// Closes the pie menu; false if none was open.
     pub fn close_menu(&mut self) -> bool {
         self.hud.menu.take().is_some()
