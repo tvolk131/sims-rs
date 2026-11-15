@@ -144,7 +144,20 @@ impl Canvas {
         light: Light,
         depth: impl Fn(i32, i32, u8) -> Option<i32>,
     ) {
-        self.blit(image, at, flip, light, 0, depth);
+        self.blit(image, at, flip, |_, _| light, 0, depth);
+    }
+
+    /// Draws an image whose light changes from pixel to pixel: `light`
+    /// gives it for each image pixel (column, row), as a lamp's pool does
+    /// on a floor. Otherwise as [`Canvas::draw_lit`], unflipped.
+    pub fn draw_shaded(
+        &mut self,
+        image: &Image,
+        at: [i32; 2],
+        light: impl Fn(usize, usize) -> Light,
+        depth: impl Fn(i32, i32, u8) -> Option<i32>,
+    ) {
+        self.blit(image, at, false, light, 0, depth);
     }
 
     /// Draws a wall: as [`Canvas::draw_lit`], but a pixel up to one unit
@@ -157,7 +170,14 @@ impl Canvas {
         light: Light,
         depth: impl Fn(i32, i32) -> i32,
     ) {
-        self.blit(image, at, false, light, 1, |x, y, _| Some(depth(x, y)));
+        self.blit(
+            image,
+            at,
+            false,
+            |_, _| light,
+            1,
+            |x, y, _| Some(depth(x, y)),
+        );
     }
 
     fn blit(
@@ -165,7 +185,7 @@ impl Canvas {
         image: &Image,
         at: [i32; 2],
         flip: bool,
-        light: Light,
+        light: impl Fn(usize, usize) -> Light,
         slack: i32,
         depth: impl Fn(i32, i32, u8) -> Option<i32>,
     ) {
@@ -213,7 +233,7 @@ impl Canvas {
                     continue;
                 }
                 let s = &image.rgba[source * 4..source * 4 + 3];
-                let rgb = light.apply([s[0], s[1], s[2]]);
+                let rgb = light(ix, iy).apply([s[0], s[1], s[2]]);
                 self.write(target, rgb, a, d);
             }
         }

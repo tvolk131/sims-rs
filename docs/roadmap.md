@@ -1880,6 +1880,12 @@ Progress:
 - Done: light levels use the original's colour tables, which shift blue
   by a step; at the compared cameras the house box rose by 0.7 to 1.3
   points (medium zoom 90.4%, cutaway 87.1%).
+- Done: the pools of light lit lamps throw on the floor, from the
+  game's `lightMap.dat`, and lit lamps drawn in full light, as the
+  original does. With the world at the screenshots' time, near zoom
+  rose from 85.2% to 86.1% exact and far zoom at rotation 2 from 89.9%
+  to 90.1%. Pools on walls (the file's wall tables) are read in part,
+  not ported.
 - Done: far zoom at rotations 1 and 2, and near zoom, compared with the
   original. The geometry lines up at all of them; the house box is
   56.2% to 90.4% exact. Most misses are one room the original lit
