@@ -48,34 +48,38 @@ pub enum SurfaceKind {
     Wall,
 }
 
+/// What differs between the two catalogs.
+struct Profile {
+    /// The built-in file, file 0.
+    builtin: &'static str,
+    /// The suffix the scan keeps, in key form.
+    suffix: &'static [u8],
+    /// The base game's own directory.
+    own: &'static str,
+    /// The sprite chunk counted.
+    sprite: [u8; 4],
+    /// The free key ranges, in the order they are seeded (0x49ff66,
+    /// 0x4c4c93).
+    seeds: [(u16, u16); 2],
+}
+
 impl SurfaceKind {
-    /// The built-in file, the suffix the scan keeps, the base game's own
-    /// directory, the sprite chunk counted, and the free key ranges in the
-    /// order they are seeded (0x49ff66, 0x4c4c93).
-    fn profile(
-        self,
-    ) -> (
-        &'static str,
-        &'static [u8],
-        &'static str,
-        [u8; 4],
-        [(u16, u16); 2],
-    ) {
+    fn profile(self) -> Profile {
         match self {
-            Self::Floor => (
-                "floors.iff",
-                b".flr",
-                "GameData/Floors/",
-                *b"SPR2",
-                [(30, 254), (256, 65534)],
-            ),
-            Self::Wall => (
-                "walls.iff",
-                b".wll",
-                "GameData/Walls/",
-                *b"SPR#",
-                [(31, 247), (256, 65534)],
-            ),
+            Self::Floor => Profile {
+                builtin: "floors.iff",
+                suffix: b".flr",
+                own: "GameData/Floors/",
+                sprite: *b"SPR2",
+                seeds: [(30, 254), (256, 65534)],
+            },
+            Self::Wall => Profile {
+                builtin: "walls.iff",
+                suffix: b".wll",
+                own: "GameData/Walls/",
+                sprite: *b"SPR#",
+                seeds: [(31, 247), (256, 65534)],
+            },
         }
     }
 }
@@ -101,7 +105,13 @@ pub struct SurfaceCatalog {
 impl SurfaceCatalog {
     /// Builds the catalog of `kind` for an install.
     pub fn build(install: &Install, kind: SurfaceKind) -> Result<Self> {
-        let (builtin, suffix, own, sprite, seeds) = kind.profile();
+        let Profile {
+            builtin,
+            suffix,
+            own,
+            sprite,
+            seeds,
+        } = kind.profile();
         let mut files = vec![SurfaceFile {
             name: builtin.to_owned(),
             location: format!("GameData/{builtin}"),
