@@ -43,6 +43,7 @@ pub mod levels;
 pub mod module;
 pub mod mp3;
 mod pcm;
+pub mod placement;
 pub mod player;
 pub mod sources;
 pub mod stations;
