@@ -1641,8 +1641,14 @@ Progress:
 - Done: objects held by others (lamps on end tables and counters, the
   sink in a counter) stand on their holder's slot. The lamps were drawn
   on the floor, inside their tables.
-- Next: the cap where a cut wall meets a standing one, and the extra
-  trim pieces at diagonal cut corners.
+- Done: wall caps, as the original's corner records lay them: a narrow
+  slice of wall closes each exposed wall end, and a cut wall meeting a
+  standing one keeps a full-height stub with a trim edge. At the
+  cutaway camera the house box rose from 84% to 86% exact; the walls-up
+  cameras rose by up to half a point.
+- Next: the door frame's left jamb, which our wall covers at medium
+  zoom; the window frames' one-step light difference; near zoom and
+  rotations 1 and 2, which have no screenshot yet.
 
 ## Track: sound (`crates/sims-audio`)
 
