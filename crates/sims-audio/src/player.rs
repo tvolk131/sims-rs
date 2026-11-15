@@ -830,8 +830,9 @@ impl<S: Samples> Player<S> {
     }
 
     /// Kind 36 (0x573fe2): *(code)* the music mode is recorded (once mode
-    /// 3 has been set), with its music ([`Player::change_music`]), and
-    /// then, for the ambience, in mode 0 (live),
+    /// 3 has been set), with its music ([`Player::change_music`]) when it
+    /// changes, and then, on every event (the same mode again included),
+    /// for the ambience, in mode 0 (live),
     /// the current ambience starts if it is stopped; in mode 3 (the
     /// neighbourhood) the backyard score becomes current and starts, its
     /// cursor first set to (1000, 500) per mille, which starting resets
@@ -2331,12 +2332,14 @@ impl<S: Samples> Player<S> {
             }
             "play_trk" => {
                 // *(code)* 0x57f1f2: the track starts (and is let go,
-                // vtable +0x2c) with the caller's own argument registers,
-                // then takes the caller's `source` (47), which sets its
+                // vtable +0x2c) with the caller's own argument registers
+                // (read straight from its bank at +0x178), then takes
+                // the caller's `source` (47), read as any register is,
+                // through its `target` (vtable +0x88), which sets its
                 // flags. The new thread's `target` is itself.
                 let track = self.read(thread, arg(0)) as u32;
                 let args = [1, 2, 3].map(|r| thread.registers[r] as u32);
-                let source = thread.registers[usize::from(SOURCE)];
+                let source = self.read(thread, i64::from(SOURCE));
                 let started = self.start(args, thread.module, track, true);
                 for started in self
                     .threads

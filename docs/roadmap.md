@@ -71,6 +71,15 @@ events, and what it asks for after them) come first.
   tick 1472, with no recording to compare yet; at tick 1473 object 105
   gives up a route and needs the route-failure feedback tree (0x45af2a),
   which is not ported.
+- The Pleasants (`House06.iff` as the original saved it after moving
+  them in, with the Traveling Salesman on the lot) load to the state the
+  first tick starts from: the end of the household selection works out
+  again who is a visitor, and reading the people raises the action
+  serial. Their load equals the capture's but for one person's data word
+  50 and last result, which something in the original's load sets and
+  which is not found yet. The first frame then stops: person 242's head
+  follows person 241, whose animator has never been ticked or drawn, and
+  what the original reads for it is not ported.
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
   read their arrays whole (Arry 11, 12, 111 and 112). UserData2's
@@ -2216,8 +2225,12 @@ through their public interfaces only; the simulation never depends on it.
   the funds go from $2,542 to $2,537 when Mortimer pays, the clock moves,
   and the hunger meter is his hunger. The pointer on a portrait shows
   that person's first name (catalog strings, `OBJD` word 41) in a box
-  over it; that box is ours (**unverified**). The original's action queue
-  in the top-left corner is not drawn yet.
+  over it; that box is ours (**unverified**).
+- **Done: the action queue.** The selected Sim's running and queued
+  actions show as icons in the top left, framed as the original frames
+  them, and a press cancels one (`Lot::cancel`, 0x45d5f8) with the
+  original's sound. Objects' catalog pictures are not made yet (a grey
+  square stands in), and the icons do not slide into place.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
     on Manage Inventory operation 4 and scope 12. A check tree's fault
