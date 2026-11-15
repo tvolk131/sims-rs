@@ -45,6 +45,7 @@ use crate::interpreter::{Interpreter, Status, Stream};
 use crate::play::{Play, Recovery, ScriptError};
 use crate::primitives::dialog::{self, DONE, NEW, SHOWN};
 use crate::selection::selected;
+use crate::sounds::SoundEvent;
 use sims_sim::motives::{self, Tuning};
 use sims_sim::rooms::Room;
 use sims_sim::{PersonTick, World};
@@ -200,6 +201,10 @@ pub struct Update {
     /// that failed, and were skipped ([`crate::boot::Lot::step_play`]), in
     /// the order they were drawn. Always empty in strict mode.
     pub frame_errors: Vec<String>,
+    /// The requests to the sound system made during the update, in order
+    /// ([`crate::sounds`]). Empty when the interpreter carries its own
+    /// sink ([`Interpreter::sounds`]), which then has them.
+    pub sounds: Vec<SoundEvent>,
 }
 
 impl Interpreter<'_> {
@@ -229,12 +234,14 @@ impl Interpreter<'_> {
         // In play mode the deletions are noted, so that an object reset
         // and a later one given its ID are told apart (Interpreter::recover).
         let deleted = RefCell::new(Vec::new());
-        let this = match play {
-            Some(_) => Interpreter {
-                deleted: Some(&deleted),
-                ..*self
+        let sink = RefCell::new(Vec::new());
+        let this = Interpreter {
+            sounds: Some(self.sounds.unwrap_or(&sink)),
+            deleted: match play {
+                Some(_) => Some(&deleted),
+                None => self.deleted,
             },
-            None => Interpreter { ..*self },
+            ..*self
         };
         let mut play = play;
         let lot = Interpreter {
@@ -275,6 +282,7 @@ impl Interpreter<'_> {
         // Signal 0xdb reaches only the interface among the subscribers
         // (see the module's documentation).
         let _ = signal;
+        update.sounds = sink.into_inner();
         Ok(update)
     }
 

@@ -7,7 +7,7 @@ use sims_core::F32;
 use sims_sim::motives::{Curve, Rates, Tuning};
 use sims_sim::{Dialog, HouseUsage, PersonTick, Usage};
 use sims_vm::play::{Play, Recovery};
-use sims_vm::{Answers, Player, Shown, TickError, Update};
+use sims_vm::{Answers, Player, Shown, SoundEvent, TickError, Update};
 
 /// Dialog (opcode 36) operands of `kind`, waiting for an answer, with the
 /// temp a three-button dialog writes in bits 4 to 6 of operand 7.
@@ -649,4 +649,61 @@ fn play_mode_without_an_error_is_strict_mode() {
         assert_eq!(a, b);
     }
     assert_eq!(strict.world.hash_hex(), played.world.hash_hex());
+}
+
+#[test]
+fn an_update_returns_its_sound_events_in_order_without_changing_the_lot() {
+    // The lamp plays sound 5, stops its sounds, then sleeps.
+    let lamp = tree(vec![
+        ins(23, 1, 1, [5, 0, 0, 0, 0, 0, 0, 0]),
+        ins(48, 2, 2, [0; 8]),
+        ins(0, 2, 2, [0; 8]),
+    ]);
+    let mut fx = lot(lamp.clone());
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .sounds
+        .insert(5, "lamp_on".into());
+    let mut quiet = lot(lamp.clone());
+    let mut player = answers(&[]);
+    let first = update(&mut fx, &mut player).unwrap();
+    assert_eq!(
+        first.sounds,
+        [
+            SoundEvent::Play {
+                object: LAMP as i16,
+                name: "lamp_on".into()
+            },
+            SoundEvent::Stop {
+                object: LAMP as i16
+            },
+        ]
+    );
+    // A lot whose sound plays nothing ends the same.
+    let second = update(&mut quiet, &mut player).unwrap();
+    assert_eq!(
+        second.sounds,
+        [SoundEvent::Stop {
+            object: LAMP as i16
+        }]
+    );
+    assert_eq!(fx.world.hash(), quiet.world.hash());
+    // An interpreter with its own sink gets them instead.
+    let mut own = lot(lamp);
+    let sink = std::cell::RefCell::new(Vec::new());
+    let tuning = tuning();
+    let mut interpreter = sims_vm::Interpreter::new(&own.program, &own.catalog, own.stream);
+    interpreter.sounds = Some(&sink);
+    let third = interpreter
+        .lot_update(&mut own.world, &tuning, &mut player)
+        .unwrap();
+    assert!(third.sounds.is_empty());
+    assert_eq!(
+        sink.into_inner(),
+        [SoundEvent::Stop {
+            object: LAMP as i16
+        }]
+    );
 }
