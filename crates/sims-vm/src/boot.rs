@@ -916,17 +916,28 @@ impl Lot {
     /// selected before is deselected, and the indicators move. Returns
     /// the requests to the sound system the indicators' trees made.
     ///
-    /// Deselecting refreshes the deselected Sim's animator, which is not
-    /// ported, so selecting another Sim while one is selected fails here
-    /// ([`crate::Refresh::Fail`]); [`Lot::select_play`] leaves the
-    /// refresh out.
+    /// Deselecting refreshes the deselected Sim's animator at the lot's
+    /// tick count (0x58da12 with 0), which can move its head and person
+    /// words 42 and 45.
     ///
     /// A selection that fails changes nothing, as for
     /// [`Lot::queue_interaction`]. Only a person can be selected; which
     /// people the interface lets the player select (the portraits of the
     /// household) is the caller's to decide.
     pub fn select(&mut self, person: u16) -> Result<Vec<crate::SoundEvent>, OrderError> {
-        self.select_with(person, crate::Refresh::Fail)
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        interpreter
+            .select(&mut world, Some(person))
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        Ok(sounds.into_inner())
     }
 
     /// Sets the idle loop's own speed between ticks (`0x46d9d6`,
@@ -966,35 +977,6 @@ impl Lot {
     pub fn unpause(&mut self) -> Result<bool, OrderError> {
         self.ready()?;
         Ok(self.world.unpause())
-    }
-
-    /// [`Lot::select`] for play mode: the deselected Sim's animator
-    /// refresh, which is not ported, is left out
-    /// ([`crate::Refresh::Skip`]), so its animator, head and person words
-    /// do not move as the original's would. A lot selected this way is not
-    /// one to compare with the original.
-    pub fn select_play(&mut self, person: u16) -> Result<Vec<crate::SoundEvent>, OrderError> {
-        self.select_with(person, crate::Refresh::Skip)
-    }
-
-    fn select_with(
-        &mut self,
-        person: u16,
-        refresh: crate::Refresh,
-    ) -> Result<Vec<crate::SoundEvent>, OrderError> {
-        self.ready()?;
-        let sounds = RefCell::new(Vec::new());
-        let interpreter = Interpreter {
-            sounds: Some(&sounds),
-            view_rotation: self.view_rotation,
-            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
-        };
-        let mut world = self.world.clone();
-        interpreter
-            .select_with(&mut world, Some(person), refresh)
-            .map_err(OrderError::Refused)?;
-        self.world = world;
-        Ok(sounds.into_inner())
     }
 
     /// From now on, a dialog that offers a choice when no answer is left

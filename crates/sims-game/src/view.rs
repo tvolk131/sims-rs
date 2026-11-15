@@ -15,6 +15,11 @@ pub enum Move {
     Walls(Walls),
     /// Move the lot by screen pixels.
     Scroll([i32; 2]),
+    /// Move the lot so this screen point comes to the middle of the
+    /// screen (0x4a7777 and 0x4a7996 at once, as without the slide).
+    Centre([i32; 2]),
+    /// Show this floor, 1 or 2 (0x4a80c7).
+    Floor(i32),
 }
 
 /// How far the lot's origin may move from the screen's corner, in pixels,
@@ -88,6 +93,11 @@ impl View {
                 self.camera.origin[0] = self.camera.origin[0].saturating_add(dx);
                 self.camera.origin[1] = self.camera.origin[1].saturating_add(dy);
             }
+            Move::Centre([x, y]) => {
+                self.camera.origin[0] = self.camera.origin[0].saturating_add(middle[0] - x);
+                self.camera.origin[1] = self.camera.origin[1].saturating_add(middle[1] - y);
+            }
+            Move::Floor(level) => self.camera.level = level.clamp(1, 2),
         }
         // The original forgets the pointer's rooms when the floor changes.
         if self.camera.level != before.level {

@@ -292,8 +292,9 @@ impl Interpreter<'_> {
     /// the animator's tick leaves out (the draw state, the face, the pose)
     /// is left out here too, and so is the redraw of what the head slot
     /// holds (`crate::placement::head_slot_redraw`), which is checked
-    /// before.
-    fn refresh_animator(&self, world: &mut World, id: u16) -> Result<(), Trap> {
+    /// apart. Deselecting a Sim makes the same refresh, always
+    /// (0x58da12 with 0, `Interpreter::deselect`).
+    pub(crate) fn refresh_animator(&self, world: &mut World, id: u16) -> Result<(), Trap> {
         let object = world
             .objects
             .get(&id)
