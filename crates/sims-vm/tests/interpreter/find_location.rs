@@ -131,6 +131,77 @@ fn a_tile_with_another_object_is_allowed_with_flag_2() {
 }
 
 #[test]
+fn two_objects_that_are_not_solid_share_a_tile_unless_against_one_wall() {
+    // 0x433a7f: on the object's own tile, two objects that are both not
+    // solid (data word 8 flag 4) are not in each other's way; they clash
+    // (0x16) only when both stand against the same wall (0x4358c3),
+    // which an object with no wall rules (data word 13) does not.
+    let (mut fx, _) = placeable();
+    let (first, second) = (widget(&mut fx), widget(&mut fx));
+    for id in [first, second] {
+        fx.world.objects.get_mut(&id).unwrap().data[8] = 4;
+    }
+    assert_eq!(find(&mut fx, 0, first, 0), Ok(true));
+    assert_eq!(find(&mut fx, 0, second, 2), Ok(true));
+    assert_eq!(fx.world.objects[&second].position, [24, 24, 1]);
+    // Only one not solid: the two may share the tile too (0x433a9c).
+    fx.world.objects.get_mut(&first).unwrap().data[8] = 0;
+    assert_eq!(find(&mut fx, 0, second, 2), Ok(true));
+    assert_eq!(fx.world.objects[&second].position, [24, 24, 1]);
+    // Both with bit 0 of data word 63: they clash (0xb).
+    fx.world.objects.get_mut(&first).unwrap().data[63] = 1;
+    fx.world.objects.get_mut(&second).unwrap().data[63] = 1;
+    assert_eq!(find(&mut fx, 0, second, 2), Ok(true));
+    assert_eq!(fx.world.objects[&second].position, [24, 40, 1]);
+}
+
+#[test]
+fn a_tile_is_a_door_when_its_groups_master_is() {
+    // 0x433427 and 0x4332b7: whether a placed or removed object marks its
+    // tile as a door's (tile flag 8) is word 69 of the definition it
+    // stands for (0x45728d), which for a tile of a group is the group's
+    // master, not its own.
+    let (mut fx, file) = placeable();
+    // Made first: making a tile of a group is not ported.
+    let id = widget(&mut fx);
+    let library = fx.program.libraries.get_mut(&file).unwrap();
+    let tile = library.definitions.get_mut(&128).unwrap();
+    tile[10] = 5;
+    tile[11] = 0x0101;
+    let mut master = *tile;
+    master[11] = -1;
+    master[69] = 6;
+    library.definitions.insert(129, master);
+    library.definition_order.push(129);
+    let doors = |fx: &Fixture| {
+        fx.world.arrays[&8]
+            .data
+            .iter()
+            .filter(|&&f| f & 8 != 0)
+            .count()
+    };
+    assert_eq!(find(&mut fx, 0, id, 0), Ok(true));
+    assert_eq!(fx.world.objects[&id].position, [24, 24, 1]);
+    assert_eq!(doors(&fx), 1);
+    // Taken off the lot, the tile is no longer a door's.
+    let off = run(
+        &mut fx,
+        0,
+        id as i16,
+        FIND_LOCATION,
+        [1, 0, 0, 0, 0, 0, 0, 0],
+    );
+    assert_eq!(off, Ok(true));
+    assert_eq!(doors(&fx), 0);
+    // The other way round: the tile's own word 69 is 6, its master's not.
+    let library = fx.program.libraries.get_mut(&file).unwrap();
+    library.definitions.get_mut(&128).unwrap()[69] = 6;
+    library.definitions.get_mut(&129).unwrap()[69] = 0;
+    assert_eq!(find(&mut fx, 0, id, 0), Ok(true));
+    assert_eq!(doors(&fx), 0);
+}
+
+#[test]
 fn an_object_that_fits_nowhere_takes_the_false_branch() {
     let (mut fx, _) = placeable();
     let id = widget(&mut fx);
