@@ -1,11 +1,15 @@
 use crate::{Error, Result};
 use sims_content::{Animations, Catalog, Index, Object, People};
 use sims_formats::behavior::{Behavior, InteractionTable};
+use sims_formats::career::Level;
 use sims_formats::execution::{self, ObjectFunction, ObjectFunctions, Slots};
 use sims_formats::iff::Iff;
 use sims_sim::TypeAttributes;
 use sims_sim::rooms::Tuning;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// The SLOT entry kind that makes a routing slot (0x46e3a0).
+const ROUTING_SLOT: u16 = 3;
 
 /// The code and constants one IFF file provides.
 #[derive(Debug, Clone, Default)]
@@ -108,12 +112,11 @@ pub struct Program {
     pub libraries: BTreeMap<usize, Library>,
     /// Each object file's semi-global file, from the catalog.
     pub semi_globals: BTreeMap<usize, Option<usize>>,
-    /// Career IDs in the original's order: the CARR chunks of `work.iff`
-    /// in resource order, each chunk ID sign-extended (legacy
-    /// legacy/crates/sims-content/src/careers.rs). None when the install has no
-    /// `work.iff`, or has a `Careers.txt`, which overrides the table
-    /// through a loader that is not ported.
-    pub careers: Option<Vec<i32>>,
+    /// The careers in the original's order: one for each CARR chunk of
+    /// `work.iff`, in resource order (0x403e3f to 0x403f1f). None when the
+    /// install has no `work.iff`, or has a `Careers.txt`, which overrides
+    /// the table through a loader that is not ported (0x4036e8).
+    pub careers: Option<Vec<Career>>,
     /// Each lot's zoning, by lot number: 1 residential, 2 community. It
     /// comes from the neighborhood ([`sims_content::Neighborhood::zoning`]),
     /// so [`Program::link`] leaves it empty for the caller to fill.
@@ -541,6 +544,24 @@ impl Program {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// Routing slot `index` of an object definition, with its index in the
+    /// SLOT chunk: an object's routing slot table (+0x13c) holds the
+    /// chunk's entries of kind 3, in order, each with its index plus one
+    /// as its number (the SLOT parse at construction, 0x46e2d1). None
+    /// when there is no such entry.
+    pub fn routing_slot(
+        &self,
+        resource: usize,
+        chunk: u16,
+        index: usize,
+    ) -> Option<(usize, &sims_formats::execution::Slot)> {
+        self.slots(resource, chunk)
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.kind == ROUTING_SLOT)
+            .nth(index)
+    }
+
     /// The type attribute records the catalog makes, all zero: one for
     /// every definition whose word 90 asks for a number of words, in
     /// catalog order, two definitions with one GUID included (0x43ba52,
@@ -650,9 +671,20 @@ impl Program {
     }
 }
 
-/// The career IDs of `work.iff`, or None when the table cannot be had from
+/// A career as the original holds it (a record of 0x74 bytes in the list
+/// at 0x6de848).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Career {
+    /// The CARR chunk's ID, sign-extended (0x403eff).
+    pub id: i32,
+    /// Its levels, as the chunk holds them (0x4035e7; records of 0x3c0
+    /// bytes, the 21 numbers first, then the strings from +0x54).
+    pub levels: Vec<Level>,
+}
+
+/// The careers of `work.iff`, or None when the table cannot be had from
 /// it. See [`Program::careers`].
-fn careers(index: &Index) -> Result<Option<Vec<i32>>> {
+fn careers(index: &Index) -> Result<Option<Vec<Career>>> {
     if index.named("Careers.txt").next().is_some() {
         return Ok(None);
     }
@@ -664,12 +696,21 @@ fn careers(index: &Index) -> Result<Option<Vec<i32>>> {
     let chunks = iff
         .resource_order(b"CARR")
         .map_err(|e| sims_content::Error::format(&location, e))?;
-    Ok(Some(
-        chunks
-            .iter()
-            .map(|chunk| i32::from(chunk.id as i16))
-            .collect(),
-    ))
+    chunks
+        .iter()
+        .map(|chunk| {
+            let levels = sims_formats::career::Career::parse(iff.data(chunk))
+                .map_err(|e| {
+                    sims_content::Error::format(&format!("{location} CARR #{}", chunk.id), e)
+                })?
+                .levels;
+            Ok(Career {
+                id: i32::from(chunk.id as i16),
+                levels,
+            })
+        })
+        .collect::<Result<_>>()
+        .map(Some)
 }
 
 /// An OBJD's words as the original holds them. Registration (0x43ba52)

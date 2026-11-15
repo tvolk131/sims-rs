@@ -67,6 +67,10 @@
 //! with a slot record it makes from its operands instead of one of the
 //! object's slots ([`relative_slot`]).
 //!
+//! The slot is named by its index in the object's routing slot table,
+//! which holds only the SLOT entries of kind 3
+//! ([`crate::Program::routing_slot`]); none is native error 0x25.
+//!
 //! A slot record an object holds in place of its type's (the move slot
 //! of the marker made to ask a person to move, `world.routing.slots`) is
 //! used instead of the type's slot.
@@ -251,12 +255,15 @@ impl Machine<'_, '_> {
         }
         let guid = self.world.objects[&target].guid;
         let definition = self.definition(guid)?;
-        let slots = self.program.slots(definition.resource, definition.chunk);
-        let index = usize::try_from(word(operands, 0))
-            .ok()
-            .filter(|&i| i < slots.len())
+        let index = usize::try_from(word(operands, 0)).ok();
+        let (entry, type_slot) = index
+            .and_then(|i| {
+                self.program
+                    .routing_slot(definition.resource, definition.chunk, i)
+            })
             .ok_or(Trap::native(0x25, "Go To Routing Slot names no slot"))?;
-        let key = (target, index as u16);
+        let type_slot = type_slot.clone();
+        let key = (target, word(operands, 0) as u16);
         let near = |flags: i32| {
             if operands[4] & 1 == 0 {
                 flags | NEAR
@@ -276,14 +283,14 @@ impl Machine<'_, '_> {
             .slot_flags
             .get(&key)
             .copied()
-            .unwrap_or(slots[index].flags as i32);
+            .unwrap_or(type_slot.flags as i32);
         let flags = near(flags);
-        if flags == slots[index].flags as i32 {
+        if flags == type_slot.flags as i32 {
             self.world.routing.slot_flags.remove(&key);
         } else {
             self.world.routing.slot_flags.insert(key, flags);
         }
-        let slot = route_slot(&slots[index], index, Some(flags));
+        let slot = route_slot(&type_slot, entry, Some(flags));
         self.route_steps(Some(slot))
     }
 

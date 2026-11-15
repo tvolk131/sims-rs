@@ -10,10 +10,11 @@
 //! word 0 names, and 4 one of the lot's own slots; any other is native
 //! error 0x24. Only mode 3 is ported:
 //!
-//! 1. The routing slot is the stack object's (its slot table, object
-//!    +0x13c, as Go To Routing Slot reads it: a record written over or
-//!    the type's entry with the flags the table now has). An index
-//!    outside the table is native error 0x1b.
+//! 1. The routing slot is the stack object's (its routing slot table,
+//!    object +0x13c, which holds only the SLOT entries of kind 3, as Go
+//!    To Routing Slot reads it: a record written over or the type's entry
+//!    with the flags the table now has). An index outside the table is
+//!    native error 0x1b.
 //! 2. The direction: with slot flag 0x1000, the object's facing (data
 //!    word 1) turned by the number of the lowest of the flag's bits 0 to
 //!    6 that is set (0 for none); without it, my own facing. It is kept
@@ -32,9 +33,21 @@
 //!    far less than a half for any position up to [`FAR`]). An offset
 //!    that is not zero turns through a sine and a cosine and fails
 //!    loudly, as does a position further out than [`FAR`].
-//! 4. Slot flag 0x800 lets the placement skip its own checks of the
-//!    lot's border, the room and the walls in the way (0x4550d8 to
-//!    0x4551e9); a slot without it fails loudly.
+//! 4. Without slot flag 0x800 the placement first checks the place
+//!    itself (0x4550d8 to 0x4551e9), in this order:
+//!    - its tile must be inside the lot's border (both tile coordinates
+//!      from 1 to the lot's size minus 2), or the placement error
+//!      (0x6e4acc) becomes 1 and I do not fit;
+//!    - the room its tile's cell names on its level (0x435b25, the map
+//!      as it is, with no look at diagonal walls) must be mine (object
+//!      data word 29), or I do not fit;
+//!    - if my own tile is inside the border and the place is not where I
+//!      stand, the direction from me to it (0x4520e9) must not be closed
+//!      off from my tile (0x4359ea, bit 0 turned to that direction), nor
+//!      the opposite direction from the place's tile on my level, or I do
+//!      not fit.
+//!
+//!    Not fitting fails loudly (below).
 //! 5. I am put there if I fit (the place test, virtual function 0x54,
 //!    `Interpreter::fits`), in this order:
 //!    - the lot is told (virtual function 0x58, `Interpreter::put`);
@@ -66,8 +79,8 @@
 use crate::animator::place;
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
-use crate::placement::{Place, on_lot};
-use crate::routing::slot::route_slot;
+use crate::placement::{Place, closed_directions, on_lot};
+use crate::routing::slot::{direction, route_slot};
 use sims_sim::animator::{Animator, LOADED, UNSET};
 
 /// The mode that names a routing slot of the stack object by word 0.
@@ -79,6 +92,8 @@ const SKIP_CHECKS: i32 = 0x800;
 /// Object data words: the facing, and the word Snap clears (+0xb2).
 const FACING: usize = 1;
 const WORD_52: usize = 52;
+/// Object data word 29: the room the object is in (+0x84).
+const ROOM: usize = 29;
 /// How far out a coordinate may be for the round trip through world
 /// units to keep it.
 const FAR: i32 = 0x8000;
@@ -104,17 +119,19 @@ impl Machine<'_, '_> {
         }
         let guid = self.world.objects[&target].guid;
         let definition = self.definition(guid)?;
-        let slots = self.program.slots(definition.resource, definition.chunk);
-        let index = usize::try_from(word(operands, 0))
+        let (entry, type_slot) = usize::try_from(word(operands, 0))
             .ok()
-            .filter(|&i| i < slots.len())
+            .and_then(|i| {
+                self.program
+                    .routing_slot(definition.resource, definition.chunk, i)
+            })
             .ok_or(Trap::native(0x1b, "Snap names no slot"))?;
-        let key = (target, index as u16);
+        let key = (target, word(operands, 0) as u16);
         let slot = match self.world.routing.slots.get(&key) {
             Some(record) => *record,
             None => route_slot(
-                &slots[index],
-                index,
+                type_slot,
+                entry,
                 self.world.routing.slot_flags.get(&key).copied(),
             ),
         };
@@ -152,15 +169,15 @@ impl Machine<'_, '_> {
                 "keeping my distance from the place in the animator",
             ));
         }
-        if slot.flags & SKIP_CHECKS == 0 {
-            return Err(unsupported(
-                "0x4550d8",
-                "to a slot whose placement checks the border, the room and the walls",
-            ));
-        }
         let person = self.me()?.person.is_some();
         let to = [position[0], position[1]];
         let level = position[2];
+        if slot.flags & SKIP_CHECKS == 0 && !self.may_stand(to, level)? {
+            return Err(unsupported(
+                "0x4550f9",
+                "to a place the lot's border, the room or a wall refuses",
+            ));
+        }
         let interpreter = self.interpreter();
         if !interpreter
             .fits(self.world, me, to, level)
@@ -188,6 +205,47 @@ impl Machine<'_, '_> {
             place(self.animator(), own, direction as i16);
         }
         Ok(true)
+    }
+
+    /// The placement's own checks of the place `to` on `level` (0x4550d8
+    /// to 0x4551e9), which slot flag 0x800 skips; see step 4.
+    fn may_stand(&self, to: [i32; 2], level: i32) -> Result<bool, Trap> {
+        let world = &*self.world;
+        let tile = |p: [i32; 2]| [(p[0] >> 4) as i8, (p[1] >> 4) as i8];
+        let size = i32::from(world.size);
+        let inside = |t: [i8; 2]| t.iter().all(|&n| n >= 1 && i32::from(n) < size - 1);
+        let [a, b] = tile(to);
+        if !inside([a, b]) {
+            return Ok(false);
+        }
+        let me = self.me()?;
+        let room = *me
+            .data
+            .get(ROOM)
+            .ok_or_else(|| Trap::Invalid(format!("object {} has no data word {ROOM}", self.me)))?;
+        let map = usize::try_from(level - 1)
+            .ok()
+            .and_then(|l| world.rooms.map.get(l))
+            .filter(|map| map.len() == 64 * 64)
+            .ok_or_else(|| {
+                Trap::Invalid(format!("Snap to level {level}, which has no room map"))
+            })?;
+        if map[a as usize * 64 + b as usize] != room {
+            return Ok(false);
+        }
+        let own = me.position;
+        let from = [own[0], own[1]];
+        let mine = tile(from);
+        if !inside(mine) || from == to {
+            return Ok(true);
+        }
+        // The direction works on the original's order of coordinates.
+        let dir = direction([from[1], from[0]], [to[1], to[0]]);
+        let own_level = own[2] as i8;
+        if closed_directions(world, [mine[0], mine[1], own_level], dir)? & 1 != 0 {
+            return Ok(false);
+        }
+        Ok(closed_directions(world, [a, b, own_level], (dir + 4) % 8)? & 1 == 0)
     }
 
     /// My animator. A person with no entry has the one the load leaves

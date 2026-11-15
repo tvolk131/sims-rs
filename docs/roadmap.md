@@ -60,10 +60,11 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 877 on the Goth house**: our
+  there, as three captures recorded; the fifth also drew after tick 901,
+  see "Ticks 901 to 991"). **K = 991 on the Goth house**: our
   state after every one of ticks 1 to 608 equals the fourth capture of the
   original (full state after every update), and after every one of ticks
-  600 to 877 the fifth, in everything compared, but
+  600 to 991 the fifth, in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
   other captures agree where they hold a state, but for fields that also
@@ -831,9 +832,8 @@ original and found equal.
    and the stream is swapped back.
 2. If the pass was a full one, global 6 (seconds) goes up by 2 and the
    tick count by 1. At 60 seconds global 5 (minutes) goes up and signal
-   0xdb is sent. Ported up to here. At 60 minutes the hour turns (global
-   0), and with it the time of day, the lighting, every room's mark and,
-   at 24 hours, the new day. That is not ported and fails loudly.
+   0xdb is sent. At 60 minutes the hour turns (global 0); at 24 hours
+   the day turns, which is not ported and fails loudly.
 3. The registry's pass at the end of the update (`0x4412d1`,
    `Interpreter::end_of_update`). It is not only the removals, as this
    file said before. In order: the dialogs (a new one is shown, and a
@@ -844,6 +844,9 @@ original and found equal.
    selected (selecting another, `0x445501`, is not ported and fails).
 4. Signal 0xdb goes to the game's eight subscribers. Only the interface
    takes it (a sound on the hour), so it changes nothing here.
+5. If the hour turned and the time of day changes with it (`0x46d525`),
+   global 4 takes the new one and the lot marks every room for counting
+   (signal 0xdd). See "Ticks 878 to 900".
 
 **One scheduler pass** (`0x46d553`, `Interpreter::scheduler_pass`). The
 pass is partial if global 17 is not 0, or globals 19 and 10 both are not.
@@ -1666,7 +1669,92 @@ capture in everything compared, the three random streams included, but
 for the head fields of "Ticks 334 to 366".
 
 **Stops.** Tick 878: the hour turns (globals 0 and 5, the time of day,
-the lighting, signals 0xf8 and 0xdd), which is not ported.
+the lighting, signals 0xf8 and 0xdd), which is not ported. See "Ticks
+878 to 900".
+
+### Ticks 878 to 900
+
+**The hour turns** (`0x46d3cc` to `0x46d51d`, `tick.rs`). At 60 minutes
+the minutes go back by 60 and global 0 (hours) goes up; at 24 the day
+turns, which still fails loudly. After the registry's pass and signal
+0xdb, the time of day for the new hour (`0x46d525`: night before 6, dawn
+at 6, day from 7 to 17, dusk at 18, night from 19) is compared with
+global 4. If it differs, global 4 takes it, the interface is told
+(`0x4c4648`, the day or night look of the current mode's panel), and
+signals 0xf8 (with 5) and 0xdd go out. The lot's subscriber has no case
+for 0xf8; on 0xdd (`0x416446`, `0x466ba3`) it sets the brightest a lit
+tile may be, which only the drawing reads (`0x6c741c`, `0x4b4525`), and
+marks every room for counting and both levels as waiting. The next frame
+draw counts them with the new daylight. What the other subscribers do
+with 0xf8 and 0xdd is **unverified**. In tick 878 the clock goes from
+6:59 to 7:00, but the save already holds day as the time of day (global
+4 is 0 at 6:30, in the capture too), so no signal goes out: no room is
+marked and the lawn does not grow. The first change of the time of day
+is at 18:00.
+
+**K = 900.** Our state after every tick from 878 to 900 equals the fifth
+capture in everything compared, the three random streams included, but
+for the head fields of "Ticks 334 to 366". Rooms marked by earlier
+changes wait for the next frame draw, which in the fifth capture came
+after tick 901 (see "Ticks 901 to 991"); the capture holds no rooms, and
+the recount shows in what reads it, each person's room motive (taken
+every tick) and global 27.
+
+**Stops.** Tick 901: object 8 reads job data indexed by temps 0 and 1
+(scope 33), which is not ported.
+
+### Ticks 901 to 991
+
+**Job data** (scope 33, `0x4531fb`, `memory.rs`). My temp 0 names a
+career and temp 1 its level; for career -1 the level is 0. The career is
+looked up by ID in the list at `0x6de848` (`0x404cb3`; none is native
+error 0x39), and a field of the level read (`0x40362f`; no such level or
+field is 0x3a), as a value with no word pointer, cut to a word. Field 0
+is the number of levels, whatever the level; fields 1 to 21 are the
+level's 21 numbers in another order, and field 22 whether its second
+string is not empty (`job_field`). The list holds one career for each CARR
+chunk of `work.iff`, in resource order, its ID the chunk's ID
+sign-extended (`0x403e3f` to `0x403f1f`), with the levels the chunk holds
+(`0x4035e7`); `Program::careers` now keeps the levels too. A
+`Careers.txt` replaces the list through a loader that is not ported
+(`0x4036e8`), and then the scope fails loudly.
+
+**The frame after tick 901.** In the fifth capture person 16's room
+motive goes from 19.29 to 36.94 in tick 902, the rooms waiting since
+earlier changes (0, 1, 3 and 4 in ours) having been counted before it.
+A frame drawn after tick 901 gives that; the default schedule's next
+frame, after tick 903, gives it two ticks late. A frame after tick 601 instead gives a room motive in ticks 602 and
+603 that the capture does not have, so the fifth capture still drew after
+tick 603, and its schedule moved by two ticks somewhere between 603 and
+901 (whether it also drew after tick 873 cannot be told: nothing waited).
+When the game draws is its main loop's business, so this is the input,
+not the simulation: comparisons with the fifth capture past tick 901 draw
+`0,1,2,3,33+30,901`.
+
+**K = 991.** With that frame, our state after every tick from 901 to 991
+equals the fifth capture in everything compared, but for the head fields
+of "Ticks 334 to 366".
+
+**Routing slots are the SLOT entries of kind 3.** An object's routing
+slot table (`+0x13c`) holds only its SLOT chunk's entries of kind 3, in
+order, each numbered by its index in the chunk plus one (the parse at
+construction, `0x46e2d1`, which sends kind 0 to the containers and kind
+1 to the headlines). Go To Routing Slot and Snap named a slot by its
+index in the whole chunk, which is the same for every object the Goth
+house's routes reached before; they now count among the kind 3 entries
+(`Program::routing_slot`). Object 174's routing slot 0 is its SLOT
+entry 1, which snaps into the object.
+
+**Snap's checks of the place** (`0x4550d8` to `0x4551e9`, `snap.rs`).
+Without slot flag 0x800 the placement first checks the place: its tile
+inside the lot's border (else placement error 1), the room its tile's
+cell names the same as mine (object data word 29), and, when I stand
+inside the border and elsewhere, the direction to it open from my tile
+and the way back open from its tile (`0x4359ea`). A refusal fails loudly
+with the rest of not fitting.
+
+**Stops.** Tick 992: object 21 snaps (tree 0x2017 node 5) into slot 0
+of object 174 (`0x454b19`), which is not ported.
 
 ## Track: drawing people (`crates/sims-people`)
 
@@ -1707,8 +1795,20 @@ Progress:
   Goths' lot until a step stops it (or 3000 ticks) and draws everyone
   placed every 30 ticks, centred on the root bone, which a clip such as
   the stair climb carries away from the animator's position.
-- Next: match the original's lighting (see its decisions entry); compare
-  Mortimer standing without his book. The base layer's clip and phase are
+- Done: people in the lot renderer's view (`sims_people::People`,
+  `View`). An app keeps one `People`, calls `update` with the live world
+  each frame (new people and changed clothes are loaded, people who left
+  are forgotten), then `draw` with the lot renderer's camera, any zoom
+  and rotation, into any `raster::Target`, with a depth function shaped
+  like the lot renderer's `Depth::point`. A person stands on the terrain
+  under them. A gated test draws the Goths' lot's people at all four
+  rotations every 30 ticks and checks each is drawn where the lot
+  renderer projects them.
+- Next: draw into the lot renderer's canvas and depth once it takes
+  people (with the render track: `Canvas::put`, `Depth::point`, then the
+  per-level interleave); a person on an upper level stands at the floor,
+  without the original's offset. Match the original's lighting (see its
+  decisions entry); compare Mortimer standing without his book. The base layer's clip and phase are
   not simulation state yet, so the saved record and the animator's clock
   stand in.
 
@@ -1785,6 +1885,14 @@ Progress:
   medium, 99.7% far, 97.2% at rotation 3). Faint sprite edge pixels
   are left out as the original does, which fixes the door jamb. Every
   compared camera rose, by 0.7 to 3.4 points.
+- Done: the API for drawing people over the lot. `Depth::point` gives
+  a point between pixels its depth in the same space, `Canvas::put`
+  draws one pixel by the sprite rule and `Camera::project_fine_f32`
+  projects without rounding. Drawn this way after the lot, people are
+  hidden by what is in front of them, as in the original, whose depth
+  buffer holds the lot without its people. The game does not use it
+  yet, and how the original gives a person's mesh its depth is
+  unverified.
 - Next: the edge-on diagonal's texels; a screenshot with a marked
   edge-on diagonal; upper-level depth.
 

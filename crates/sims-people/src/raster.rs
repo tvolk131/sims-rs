@@ -100,38 +100,15 @@ impl Canvas {
     /// Draws one skinned part, lit by a light from `light` (a direction
     /// towards the light) with some ambient light.
     pub fn draw(&mut self, camera: &Camera, part: &Part, skinned: &Skinned, light: Vec3) {
-        let light = light.normalize();
         let (w, h) = (self.width as f32, self.height as f32);
-        let screen: Vec<Vec3> = skinned
-            .positions
-            .iter()
-            .map(|&p| {
-                let v = camera.view(p);
-                Vec3::new(
-                    w * 0.5 + v.x * camera.scale,
-                    h * 0.5 - v.y * camera.scale,
-                    v.z,
-                )
-            })
-            .collect();
-        let shade: Vec<f32> = skinned
-            .normals
-            .iter()
-            .map(|n| 0.45 + 0.55 * n.dot(light).max(0.0))
-            .collect();
-        for t in &part.mesh.triangles {
-            let [a, b, c] = t.map(|i| i as usize);
-            self.triangle(
-                [screen[a], screen[b], screen[c]],
-                [
-                    part.mesh.vertices[a].uv,
-                    part.mesh.vertices[b].uv,
-                    part.mesh.vertices[c].uv,
-                ],
-                [shade[a], shade[b], shade[c]],
-                part,
-            );
-        }
+        draw_part(self, part, skinned, light, |p| {
+            let v = camera.view(p);
+            Vec3::new(
+                w * 0.5 + v.x * camera.scale,
+                h * 0.5 - v.y * camera.scale,
+                v.z,
+            )
+        });
     }
 
     /// Draws every part of `body` on the bones `world` (one per skeleton
@@ -140,115 +117,6 @@ impl Canvas {
     pub fn draw_body(&mut self, camera: &Camera, body: &Body, world: &[Transform]) {
         for part in body.parts.iter().filter(|p| p.censor == 0) {
             self.draw(camera, part, &skin(part, world), LIGHT);
-        }
-    }
-
-    fn triangle(
-        &mut self,
-        mut p: [Vec3; 3],
-        mut uv: [[f32; 2]; 3],
-        mut shade: [f32; 3],
-        part: &Part,
-    ) {
-        let mut area = edge(p[0], p[1], p[2]);
-        if area.abs() < 1e-8 || !area.is_finite() {
-            return;
-        }
-        // Wind every triangle the same way, so the fill rule below can
-        // tell which side of each edge is inside.
-        if area < 0.0 {
-            p.swap(1, 2);
-            uv.swap(1, 2);
-            shade.swap(1, 2);
-            area = -area;
-        }
-        // The top-left rule: a pixel centre exactly on an edge belongs to
-        // the triangle only if that is its top or left edge, so a pixel on
-        // an edge two triangles share is drawn once, not twice.
-        let top_left = |a: Vec3, b: Vec3| {
-            let (dx, dy) = (b.x - a.x, b.y - a.y);
-            dy < 0.0 || (dy == 0.0 && dx > 0.0)
-        };
-        let owns = [
-            top_left(p[1], p[2]),
-            top_left(p[2], p[0]),
-            top_left(p[0], p[1]),
-        ];
-        let min_x = p
-            .iter()
-            .map(|v| v.x)
-            .fold(f32::INFINITY, f32::min)
-            .floor()
-            .max(0.0) as i64;
-        let max_x = p
-            .iter()
-            .map(|v| v.x)
-            .fold(f32::NEG_INFINITY, f32::max)
-            .ceil()
-            .min(self.width as f32 - 1.0) as i64;
-        let min_y = p
-            .iter()
-            .map(|v| v.y)
-            .fold(f32::INFINITY, f32::min)
-            .floor()
-            .max(0.0) as i64;
-        let max_y = p
-            .iter()
-            .map(|v| v.y)
-            .fold(f32::NEG_INFINITY, f32::max)
-            .ceil()
-            .min(self.height as f32 - 1.0) as i64;
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let q = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, 0.0);
-                let e = [
-                    side(p[1], p[2], q),
-                    side(p[2], p[0], q),
-                    side(p[0], p[1], q),
-                ];
-                let outside = |w: f32, owned: bool| w < 0.0 || (w == 0.0 && !owned);
-                if outside(e[0], owns[0]) || outside(e[1], owns[1]) || outside(e[2], owns[2]) {
-                    continue;
-                }
-                let [w0, w1, w2] = e.map(|e| e / area);
-                let z = w0 * p[0].z + w1 * p[1].z + w2 * p[2].z;
-                let i = (y as u32 * self.width + x as u32) as usize;
-                if z >= self.depth[i] {
-                    continue;
-                }
-                let u = w0 * uv[0][0] + w1 * uv[1][0] + w2 * uv[2][0];
-                let v = w0 * uv[0][1] + w1 * uv[1][1] + w2 * uv[2][1];
-                let s = w0 * shade[0] + w1 * shade[1] + w2 * shade[2];
-                let texel = part.texture.sample(u, v);
-                let alpha = texel[3];
-                // A transparent texel (such as one a run-length bitmap
-                // skips) draws nothing and hides nothing.
-                if alpha == 0 {
-                    continue;
-                }
-                let lit = |c: u8| (f32::from(c) * s).min(255.0);
-                if alpha == 255 {
-                    self.depth[i] = z;
-                    for (out, &c) in self.rgba[i * 4..i * 4 + 3].iter_mut().zip(&texel) {
-                        *out = lit(c) as u8;
-                    }
-                    self.rgba[i * 4 + 3] = 255;
-                    continue;
-                }
-                // A partly transparent texel is blended over what is drawn
-                // and leaves the depth alone, so it never hides what is
-                // drawn behind it later. (The game's skins are opaque or
-                // fully transparent; this only keeps other textures sane.)
-                // The canvas holds straight (not premultiplied) colour, as
-                // a PNG does, so what is below counts by its own alpha.
-                let a = f32::from(alpha) / 255.0;
-                let below = f32::from(self.rgba[i * 4 + 3]) / 255.0 * (1.0 - a);
-                let total = a + below;
-                for (out, &c) in self.rgba[i * 4..i * 4 + 3].iter_mut().zip(&texel) {
-                    *out = ((lit(c) * a + f32::from(*out) * below) / total).round() as u8;
-                }
-                self.rgba[i * 4 + 3] = (total * 255.0).round() as u8;
-            }
         }
     }
 
@@ -261,6 +129,195 @@ impl Canvas {
     /// The image as a PNG file (8-bit RGBA, stored without compression).
     pub fn png(&self) -> Vec<u8> {
         png(self.width, self.height, &self.rgba)
+    }
+}
+
+/// What the rasterizer draws into: an image with a depth per pixel. A
+/// target keeps its own depth units (the projection gives each vertex its
+/// depth in them, and the rasterizer interpolates it linearly across a
+/// triangle) and its own rule for writing a texel. [`Canvas`] is one; an
+/// app draws people into its lot's image through another.
+pub trait Target {
+    /// Width and height in pixels.
+    fn size(&self) -> (u32, u32);
+    /// Whether a texel at depth `z` on pixel (`x`, `y`) would be in front
+    /// of what is there. Asked before the texture is sampled, so a hidden
+    /// pixel costs little; [`Target::write`] may still test again.
+    fn passes(&self, x: u32, y: u32, z: f32) -> bool;
+    /// Writes a texel that passed: its colour times `shade` (from 0.45 in
+    /// shadow to 1 facing the light). Its alpha is never 0.
+    fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32);
+}
+
+impl Target for Canvas {
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    fn passes(&self, x: u32, y: u32, z: f32) -> bool {
+        z < self.depth[(y * self.width + x) as usize]
+    }
+
+    fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], s: f32) {
+        let i = (y * self.width + x) as usize;
+        let alpha = texel[3];
+        let lit = |c: u8| (f32::from(c) * s).min(255.0);
+        if alpha == 255 {
+            self.depth[i] = z;
+            for (out, &c) in self.rgba[i * 4..i * 4 + 3].iter_mut().zip(&texel) {
+                *out = lit(c) as u8;
+            }
+            self.rgba[i * 4 + 3] = 255;
+            return;
+        }
+        // A partly transparent texel is blended over what is drawn and
+        // leaves the depth alone, so it never hides what is drawn behind
+        // it later. (The game's skins are opaque or fully transparent;
+        // this only keeps other textures sane.) The canvas holds straight
+        // (not premultiplied) colour, as a PNG does, so what is below
+        // counts by its own alpha.
+        let a = f32::from(alpha) / 255.0;
+        let below = f32::from(self.rgba[i * 4 + 3]) / 255.0 * (1.0 - a);
+        let total = a + below;
+        for (out, &c) in self.rgba[i * 4..i * 4 + 3].iter_mut().zip(&texel) {
+            *out = ((lit(c) * a + f32::from(*out) * below) / total).round() as u8;
+        }
+        self.rgba[i * 4 + 3] = (total * 255.0).round() as u8;
+    }
+}
+
+/// Draws one skinned part into `target`, lit by a light from `light` (a
+/// direction towards the light) with some ambient light. `project` takes a
+/// world point to the target: x and y in pixels, z its depth in the
+/// target's units.
+pub fn draw_part<T: Target + ?Sized>(
+    target: &mut T,
+    part: &Part,
+    skinned: &Skinned,
+    light: Vec3,
+    project: impl Fn(Vec3) -> Vec3,
+) {
+    let light = light.normalize();
+    let screen: Vec<Vec3> = skinned.positions.iter().map(|&p| project(p)).collect();
+    let shade: Vec<f32> = skinned
+        .normals
+        .iter()
+        .map(|n| 0.45 + 0.55 * n.dot(light).max(0.0))
+        .collect();
+    for t in &part.mesh.triangles {
+        let [a, b, c] = t.map(|i| i as usize);
+        // A mesh whose triangles name vertices it lacks draws nothing
+        // there rather than panicking.
+        let (Some(&pa), Some(&pb), Some(&pc)) = (screen.get(a), screen.get(b), screen.get(c))
+        else {
+            continue;
+        };
+        let (Some(va), Some(vb), Some(vc)) = (
+            part.mesh.vertices.get(a),
+            part.mesh.vertices.get(b),
+            part.mesh.vertices.get(c),
+        ) else {
+            continue;
+        };
+        triangle(
+            target,
+            [pa, pb, pc],
+            [va.uv, vb.uv, vc.uv],
+            [
+                shade.get(a).copied().unwrap_or(1.0),
+                shade.get(b).copied().unwrap_or(1.0),
+                shade.get(c).copied().unwrap_or(1.0),
+            ],
+            part,
+        );
+    }
+}
+
+fn triangle<T: Target + ?Sized>(
+    target: &mut T,
+    mut p: [Vec3; 3],
+    mut uv: [[f32; 2]; 3],
+    mut shade: [f32; 3],
+    part: &Part,
+) {
+    let (width, height) = target.size();
+    let mut area = edge(p[0], p[1], p[2]);
+    if area.abs() < 1e-8 || !area.is_finite() {
+        return;
+    }
+    // Wind every triangle the same way, so the fill rule below can
+    // tell which side of each edge is inside.
+    if area < 0.0 {
+        p.swap(1, 2);
+        uv.swap(1, 2);
+        shade.swap(1, 2);
+        area = -area;
+    }
+    // The top-left rule: a pixel centre exactly on an edge belongs to
+    // the triangle only if that is its top or left edge, so a pixel on
+    // an edge two triangles share is drawn once, not twice.
+    let top_left = |a: Vec3, b: Vec3| {
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        dy < 0.0 || (dy == 0.0 && dx > 0.0)
+    };
+    let owns = [
+        top_left(p[1], p[2]),
+        top_left(p[2], p[0]),
+        top_left(p[0], p[1]),
+    ];
+    let min_x = p
+        .iter()
+        .map(|v| v.x)
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as i64;
+    let max_x = p
+        .iter()
+        .map(|v| v.x)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min(width as f32 - 1.0) as i64;
+    let min_y = p
+        .iter()
+        .map(|v| v.y)
+        .fold(f32::INFINITY, f32::min)
+        .floor()
+        .max(0.0) as i64;
+    let max_y = p
+        .iter()
+        .map(|v| v.y)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min(height as f32 - 1.0) as i64;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let q = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, 0.0);
+            let e = [
+                side(p[1], p[2], q),
+                side(p[2], p[0], q),
+                side(p[0], p[1], q),
+            ];
+            let outside = |w: f32, owned: bool| w < 0.0 || (w == 0.0 && !owned);
+            if outside(e[0], owns[0]) || outside(e[1], owns[1]) || outside(e[2], owns[2]) {
+                continue;
+            }
+            let [w0, w1, w2] = e.map(|e| e / area);
+            let z = w0 * p[0].z + w1 * p[1].z + w2 * p[2].z;
+            let (x, y) = (x as u32, y as u32);
+            if !target.passes(x, y, z) {
+                continue;
+            }
+            let u = w0 * uv[0][0] + w1 * uv[1][0] + w2 * uv[2][0];
+            let v = w0 * uv[0][1] + w1 * uv[1][1] + w2 * uv[2][1];
+            let s = w0 * shade[0] + w1 * shade[1] + w2 * shade[2];
+            let texel = part.texture.sample(u, v);
+            // A transparent texel (such as one a run-length bitmap skips)
+            // draws nothing and hides nothing.
+            if texel[3] == 0 {
+                continue;
+            }
+            target.write(x, y, z, texel, s);
+        }
     }
 }
 
@@ -496,7 +553,7 @@ mod tests {
         let (glass, _) = square(crate::texture::Texture::solid([255, 255, 255, 128]));
         let mut canvas = Canvas::new(size, size, [0, 0, 0, 0]);
         for t in triangles {
-            canvas.triangle(*t, [[0.5; 2]; 3], [1.0; 3], &glass.parts[0]);
+            triangle(&mut canvas, *t, [[0.5; 2]; 3], [1.0; 3], &glass.parts[0]);
         }
         canvas
     }
