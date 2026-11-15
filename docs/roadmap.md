@@ -1773,8 +1773,6 @@ Progress:
 - Done: light levels use the original's colour tables, which shift blue
   by a step; at the compared cameras the house box rose by 0.7 to 1.3
   points (medium zoom 90.4%, cutaway 87.1%).
-- Found: the door's left jamb loses a depth contest with the wall; a fix
-  needs the original's per-zoom depth tables.
 - Done: far zoom at rotations 1 and 2, and near zoom, compared with the
   original. The geometry lines up at all of them; the house box is
   56.2% to 90.4% exact. Most misses are one room the original lit
@@ -1782,8 +1780,13 @@ Progress:
   edge-on diagonal wall's texels also differ.
 - Read, not ported: the original's strip on a marked edge-on diagonal;
   no screenshot shows one.
-- Next: the edge-on diagonal's texels; the original's per-zoom depth
-  tables (the door jamb); a screenshot with a marked edge-on diagonal.
+- Done: depth in the original's own values for grass, floors, walls,
+  trims and objects, checked against the game's depth buffer (99.1%
+  medium, 99.7% far, 97.2% at rotation 3). Faint sprite edge pixels
+  are left out as the original does, which fixes the door jamb. Every
+  compared camera rose, by 0.7 to 3.4 points.
+- Next: the edge-on diagonal's texels; a screenshot with a marked
+  edge-on diagonal; upper-level depth.
 
 ## Track: sound (`crates/sims-audio`)
 
