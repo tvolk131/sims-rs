@@ -26,7 +26,12 @@ is unpaused, while its cells' sounds play on. Starting a track
 (0x57d960) clears its hold, so a sound started while paused plays (the
 buy mode's clicks do); a held track whose script still runs is not
 started again but let go, as an unpause lets it go (0x57d9f1 to
-0x57da12), with the new object in its argument register. An unpause (0x574904) lets every track go
+0x57da12), and needs no free thread. Before that check, the start
+points the track's `target` back at itself (0x57d9c3) and writes its
+argument registers 1 to 3 (0x57d9cb to 0x57d9eb) whatever its argument
+kind, so a resumed script sees the new arguments; a new thread here
+now gets all three too, where it had only `arg1`, and only for
+`kArgsIdVolPan` tracks. An unpause (0x574904) lets every track go
 (0x57cd2c, vtable +0x5c on each) and unpauses the current ambience
 player, whatever the music mode. Letting a track go also sets its wait
 deadline (+0x198, which `wait` sets at 0x57e453 and the update reads at

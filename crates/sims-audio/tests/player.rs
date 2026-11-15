@@ -418,6 +418,63 @@ fn a_pause_spares_the_interface_and_lets_new_sounds_play() {
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
+/// Records what the scripts ask (`getsrcdatafield`) and answers 0.
+#[derive(Default)]
+struct Asked(std::cell::RefCell<Vec<(i32, i32)>>);
+
+impl Sources for Asked {
+    fn field(&self, source: i32, field: i32) -> Option<i32> {
+        self.0.borrow_mut().push((source, field));
+        Some(0)
+    }
+}
+
+#[test]
+fn starting_a_held_track_gives_its_script_the_new_arguments_and_ends_its_wait() {
+    // arg2 = 8, arg3 = 9; wait a second; ask field arg2 of arg1.
+    let routine: Vec<u8> = [
+        &[4, 2, 8][..], // loadb arg2, 8
+        &[4, 3, 9],     // loadb arg3, 9
+        &[LOADL, 5],
+        &long(1000), // loadl v1, 1000
+        &[WAIT, 5],
+        &[72, 6, 1, 2], // getsrcdatafield v2, arg1, arg2
+        &[END],
+    ]
+    .concat();
+    let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+    let asked = Asked::default();
+    play(&mut player, "e0");
+    player.render(BLOCK, &asked);
+    player.handle(&SoundEvent::Pause);
+    // Started again for object 4 while held: the same script goes on,
+    // with arguments 4, 0 and 0 (0x57d9cb to 0x57d9eb), at the next
+    // block, its second's wait cut short (0x57dc8e).
+    play_for(&mut player, 4, "e0");
+    player.render(BLOCK, &asked);
+    assert_eq!(*asked.0.borrow(), [(4, 0)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn starting_a_held_track_needs_no_free_thread() {
+    let routine = waits_a_second();
+    let mut player = Player::new(vec![module(&[&routine, &routine], 1)], samples(), 1);
+    play(&mut player, "e0");
+    for _ in 1..sims_audio::player::THREADS {
+        play(&mut player, "e1");
+    }
+    player.render(BLOCK, &NoSources);
+    player.handle(&SoundEvent::Pause);
+    // Every thread is taken, but the held e0 is let go, not started.
+    play(&mut player, "e0");
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    assert_eq!(
+        player.render(10, &NoSources),
+        (1..=10).collect::<Vec<i16>>()
+    );
+}
+
 #[test]
 fn a_held_track_with_no_script_left_starts_anew() {
     // A note alone holds the track: its thread has ended (note_on, end).

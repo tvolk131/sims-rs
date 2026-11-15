@@ -18,10 +18,13 @@
 //!
 //! - Registers below 100 belong to a thread; 100 and above are globals
 //!   shared by every thread (`SimSpeed` is 100). A new thread's `patch`
-//!   register (50) holds its track's patch. When the track's arguments
-//!   are `kArgsIdVolPan` (2, nearly every track), `arg1` holds the object
-//!   that started it: routines pass it to `getsrcdatafield`
-//!   ([`crate::sources`]).
+//!   register (50) holds its track's patch. *(code)* `arg1` to `arg3`
+//!   (registers 1 to 3) hold the arguments it was started with, whatever
+//!   the track's argument kind (0x57d9cb): the first is the object that
+//!   started it, which routines pass to `getsrcdatafield`
+//!   ([`crate::sources`]). A track a script starts (`play_trk`) gets
+//!   its object and two zeros; what the original passes there is not
+//!   read.
 //! - *(code)* The registers in [`DEFAULTS`] start as the original's
 //!   default register bank holds them, then `vol` (18) and `duckpri` (25)
 //!   take the HOT track's volume and duck priority; every other starts
@@ -122,7 +125,7 @@
 //! thread where the original would use its one object. When an object
 //! lets go of a track others still have, the original re-evaluates the
 //! shared track (0x5746d9, not read); here that object's threads fade
-//! out and end. Kinds not ported (the music, the piano, pausing, reloading, and the sound object calls only the game's
+//! out and end. Kinds not ported (the music, the piano, reloading, and the sound object calls only the game's
 //! code makes) are reported as faults; kinds whose case does nothing for
 //! sound are ignored.
 //!
@@ -296,6 +299,17 @@ impl Samples for BTreeMap<String, Pcm> {
 /// keeps its value). [`crate::sources`] has the original's answers.
 pub trait Sources {
     fn field(&self, source: i32, field: i32) -> Option<i32>;
+}
+
+/// *(code)* Writes a starting track's argument registers 1 to 3, as the
+/// original's start does whatever the track's argument kind (0x57d9cb to
+/// 0x57d9eb, each a register write that sets the comparison flags).
+fn set_arguments(thread: &mut Thread, args: [u32; 3]) {
+    thread.target = Target::Own;
+    for (register, value) in (1..=3).zip(args) {
+        thread.registers[register] = value as i32;
+    }
+    thread.kept = i64::from(args[2] as i32);
 }
 
 /// Answers 0 to everything.
@@ -892,7 +906,7 @@ impl<S: Samples> Player<S> {
         if !alive {
             self.instances.retain(|&(t, _)| t != track);
         }
-        if self.start(args[0], module, track, false)
+        if self.start(args, module, track, false)
             && self.track_args(module, track) == Some(ARGS_ID_VOL_PAN)
             && args[0] != 0
         {
@@ -1151,7 +1165,7 @@ impl<S: Samples> Player<S> {
         if args[0] != 0 {
             self.record(track, args[0]);
         }
-        self.start(args[0], module, track, false);
+        self.start(args, module, track, false);
     }
 
     /// Kind 53 (`kSequenceTrackHitList`): *(code)* picks a patch from a
@@ -1195,7 +1209,7 @@ impl<S: Samples> Player<S> {
                     .rposition(|n| n.thread == 0 && n.track == track);
                 if let Some(note) = idle {
                     self.chain(note, track, patch);
-                } else if let Some(mut thread) = self.thread(0, owner, track) {
+                } else if let Some(mut thread) = self.thread([0; 3], owner, track) {
                     thread.id = 0;
                     thread.registers[usize::from(PATCH)] = patch as i32;
                     self.note_on(&thread);
@@ -1219,11 +1233,7 @@ impl<S: Samples> Player<S> {
     /// Starts a track's routine for an object. The module given is tried
     /// first, then every other. A deferred thread first runs in the next
     /// block. False when it could not start.
-    fn start(&mut self, object: u32, module: usize, track: u32, defer: bool) -> bool {
-        if self.threads.len() + self.pending.len() >= THREADS {
-            self.report(format!("track {track}: more than {THREADS} threads"));
-            return false;
-        }
+    fn start(&mut self, args: [u32; 3], module: usize, track: u32, defer: bool) -> bool {
         let Some(module) = self.owner(module, track) else {
             self.report(format!("no track {track}"));
             return false;
@@ -1231,11 +1241,16 @@ impl<S: Samples> Player<S> {
         // *(code)* Starting a track the pause holds while its script runs
         // does not start it again (0x57d9f1 to 0x57da12): it lets it go
         // (vtable +0x5c), so the script goes on from where it was, its
-        // wait ended, with the new object in its argument register.
-        if self.held.remove(&track) && self.resume_held(object, module, track) {
+        // wait ended, with the new arguments. No thread is made, so the
+        // thread limit does not apply.
+        if self.held.remove(&track) && self.resume_held(args, track) {
             return true;
         }
-        let Some(thread) = self.thread(object, module, track) else {
+        if self.threads.len() + self.pending.len() >= THREADS {
+            self.report(format!("track {track}: more than {THREADS} threads"));
+            return false;
+        }
+        let Some(thread) = self.thread(args, module, track) else {
             return false;
         };
         if defer {
@@ -1247,26 +1262,21 @@ impl<S: Samples> Player<S> {
     }
 
     /// Lets a held track's running threads go on, as starting it does
-    /// (see [`Player::start`]): each one's wait ends and, for a track
-    /// whose arguments are `kArgsIdVolPan`, register 1 takes the object.
-    /// False when none of the track runs, so it is started anew.
-    fn resume_held(&mut self, object: u32, module: usize, track: u32) -> bool {
-        let positioned = self.track_args(module, track) == Some(ARGS_ID_VOL_PAN);
+    /// (see [`Player::start`]). Each one's `target` points back at itself
+    /// (0x57d9c3), its argument registers take `args` (see
+    /// [`Player::thread`]) and its wait ends. False when none of the
+    /// track runs, so it is started anew. (A held thread does not run,
+    /// so none of these is the thread running `play_trk`.)
+    fn resume_held(&mut self, args: [u32; 3], track: u32) -> bool {
         let now = self.frame;
         let mut resumed = false;
-        for at in 0..self.threads.len() {
-            if self.threads[at].track == track {
-                if positioned {
-                    self.write_at(at, 1, object as i32);
-                }
-                self.threads[at].wake = now;
-                resumed = true;
-            }
-        }
-        for thread in self.pending.iter_mut().filter(|t| t.track == track) {
-            if positioned {
-                thread.registers[1] = object as i32;
-            }
+        for thread in self
+            .threads
+            .iter_mut()
+            .chain(&mut self.pending)
+            .filter(|t| t.track == track)
+        {
+            set_arguments(thread, args);
             thread.wake = now;
             resumed = true;
         }
@@ -1275,7 +1285,8 @@ impl<S: Samples> Player<S> {
 
     /// A new thread of a track the module defines, with its starting
     /// registers, or `None` (reported) when the track has no entry point.
-    fn thread(&mut self, object: u32, module: usize, track: u32) -> Option<Thread> {
+    fn thread(&mut self, args: [u32; 3], module: usize, track: u32) -> Option<Thread> {
+        let object = args[0];
         let owner = &self.modules[module];
         let Some(pc) = owner.entry(track).and_then(|entry| owner.address(entry)) else {
             self.report(format!("track {track}: entry point not found"));
@@ -1295,11 +1306,8 @@ impl<S: Samples> Player<S> {
         registers[usize::from(DUCKPRI)] = owner.number(&fields.duck_priority).unwrap_or(0) as i32;
         let group = owner.number(&fields.group).unwrap_or(0);
         registers[usize::from(PATCH)] = patch as i32;
-        if owner.number(&fields.args) == Some(ARGS_ID_VOL_PAN) {
-            registers[1] = object as i32;
-        }
         let id = self.id();
-        Some(Thread {
+        let mut thread = Thread {
             id,
             object,
             module,
@@ -1315,7 +1323,9 @@ impl<S: Samples> Player<S> {
             group,
             target: Target::Own,
             kill_after_fade: false,
-        })
+        };
+        set_arguments(&mut thread, args);
+        Some(thread)
     }
 
     /// Records a fault, up to [`FAULTS`] of them; later ones are dropped,
@@ -1948,7 +1958,7 @@ impl<S: Samples> Player<S> {
             }
             "play_trk" => {
                 let track = self.read(thread, arg(0)) as u32;
-                self.start(thread.object, thread.module, track, true);
+                self.start([thread.object, 0, 0], thread.module, track, true);
                 Flow::Next
             }
             "kill_trk" => {
