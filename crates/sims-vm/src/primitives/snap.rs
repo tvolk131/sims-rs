@@ -252,7 +252,7 @@ impl Machine<'_, '_> {
                         "in mode 1 into an object with no container slot",
                     ));
                 }
-                self.into_slot(operands, target, 0)?;
+                self.check_slot_place(operands, target, 0)?;
                 Spot {
                     direction: self.facing(me)?,
                     position: self.world.objects[&target].position,
@@ -393,7 +393,7 @@ impl Machine<'_, '_> {
             if usize::try_from(slot.snap_target).is_ok_and(|s| s + 1 >= records) {
                 return Err(Trap::native(0x20, "Snap names no slot of the object"));
             }
-            self.into_slot(operands, target, slot.snap_target)?;
+            self.check_slot_place(operands, target, slot.snap_target)?;
             Some((target, slot.snap_target))
         } else {
             None
@@ -431,7 +431,7 @@ impl Machine<'_, '_> {
     /// (0x45522c), and a slot's offset across, turned to the object's
     /// facing, is added to my animator's offset (0x454ceb to 0x454d5e),
     /// which is not kept.
-    fn into_slot(&self, operands: &[u8; 8], target: u16, slot: i32) -> Result<(), Trap> {
+    fn check_slot_place(&self, operands: &[u8; 8], target: u16, slot: i32) -> Result<(), Trap> {
         if operands[4] & 4 != 0 {
             return Err(unsupported(
                 "0x45522c",
