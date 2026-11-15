@@ -602,7 +602,8 @@ impl Interpreter<'_> {
     /// become 2, 0x58f135) and stops walking ([`Animator::walking`] and
     /// +0x24, +0x28 and +0x290 cleared, 0x58f117), or, with any other
     /// route result, follows the route (state 9). One arrived that has to
-    /// turn starts a turn (0x58df01).
+    /// turn starts a turn, or turns at once by less than a step (0x58df01,
+    /// [`Interpreter::start_turn`]).
     fn stand(&self, world: &mut World, id: u16, a: &mut Animator, now: i32) -> Result<Next, Trap> {
         a.destination[2] = wrap(a.destination[2]);
         a.position[2] = wrap(a.position[2]);
@@ -629,12 +630,11 @@ impl Interpreter<'_> {
                 "in state 3 walks to its destination",
             ));
         }
-        self.start_turn(world, id, a, now)?;
-        Ok(Next::Done)
+        self.start_turn(world, id, a, now)
     }
 
-    /// The start of a turn on the spot (0x58df01 to 0x58f5f9), for a turn
-    /// of at least a step either way.
+    /// The start of a turn on the spot (0x58df01 to 0x58f5f9), for an
+    /// animator that has arrived.
     ///
     /// The turn d is the destination's direction less the position's, put
     /// into -4 to 4 by whole turns (0x58e013 to 0x58e041). The smallest
@@ -656,6 +656,21 @@ impl Interpreter<'_> {
     /// A bound belongs to the row nearer 0 (-1.5 and 1.5 to the rows of
     /// clips 9 and 8, -0.5 and 0.5 to clip 10).
     ///
+    /// A turn of less than a step either way is made at once (0x58dfc0).
+    /// The distance to the destination, 0 for an animator that has
+    /// arrived (0x58df1a), is below 0.5 (0x6d07e4), so the animator is put
+    /// at its destination (0x58dfcf): the position takes the
+    /// destination's two coordinates, and the direction takes the
+    /// destination's (virtual function 0xd0, 0x58488b), which goes to
+    /// object data word 1 (0x5920e8, [`direction_word`]). The state stays
+    /// 3 and its code runs again (0x58f089), which finds the animator
+    /// arrived and facing its destination's direction
+    /// ([`Interpreter::stand`]). No clip plays. The original also sets
+    /// global 0x6f6d64 to 4, which is not kept. Only an animator that has
+    /// not arrived can be 0.5 or more away. It would take a step by
+    /// heading (0x58f312) or turn with a clip (0x58f4ee), and its state 3
+    /// fails at 0x58df1e.
+    ///
     /// The turn is noted (+0x1f0, the clip's turn +0x1f4, the destination
     /// +0x1dc to +0x1e4, the position +0x1d0 to +0x1d8); the destination's
     /// direction becomes the position's plus d less the clip's turn; the
@@ -663,17 +678,16 @@ impl Interpreter<'_> {
     /// and priority 5 (0x59867f), and the animator turns (state 4). The
     /// original also sets global 0x6f6d6c to 2, which is not kept.
     ///
-    /// Fails for what is not ported: a turn of less than a step
-    /// (0x58dfc0), a person of kind above 1, whose bounds are scaled
-    /// (0x58df72), and a turn that is not a number, for which the original
-    /// would loop forever (0x58e039).
+    /// Fails for what is not ported: a person of kind above 1, whose
+    /// bounds are scaled (0x58df72), and a turn that is not a number, for
+    /// which the original would loop forever (0x58e039).
     fn start_turn(
         &self,
         world: &mut World,
         id: u16,
         a: &mut Animator,
         now: i32,
-    ) -> Result<(), Trap> {
+    ) -> Result<Next, Trap> {
         let eight = EIGHT.ext();
         let mut d = (a.destination[2].ext() - a.position[2].ext()).single();
         if d.is_nan() {
@@ -690,7 +704,12 @@ impl Interpreter<'_> {
             return Err(unsupported("0x58df72", "turns a person of kind above 1"));
         }
         if d < step && d > (-step).single() {
-            return Err(unsupported("0x58dfc0", "turns by less than a step"));
+            // 0x58dfc0: arrived, so 0 away, below 0.5 (0x6d07e4).
+            a.position[0] = a.destination[0];
+            a.position[1] = a.destination[1];
+            a.position[2] = a.destination[2];
+            set_datum(world, id, DIRECTION, direction_word(a.position[2]))?;
+            return Ok(Next::Again);
         }
         let [half, one_and_half, three] = [TURN_HALF, TURN_ONE_AND_HALF, THREE].map(F32::ext);
         let (selection, clip_turn) = if !at_least(d, (-three).single()) {
@@ -728,7 +747,7 @@ impl Interpreter<'_> {
         layer.priority = 5;
         a.skin_dirty = true;
         a.state = 4;
-        Ok(())
+        Ok(Next::Done)
     }
 
     /// Plays one of the posture's clips in the foreground (virtual

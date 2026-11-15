@@ -820,6 +820,62 @@ fn an_arrival_after_a_route_is_noted_and_directions_wrap() {
 }
 
 #[test]
+fn a_turn_of_less_than_a_step_faces_the_destination_at_once() {
+    // Arrived, an eighth of a direction short of the destination's: less
+    // than a step (a quarter over the speed), and within the epsilon of
+    // its destination's coordinates. The animator is put at its
+    // destination (0x58dfcf), the direction goes to data word 1, and state
+    // 3 runs again, which notes the route's end. No clip plays. The person
+    // is of kind 0 (word 65), whose bounds are not scaled.
+    let mut fx = standing();
+    fx.sim_mut().person.as_mut().unwrap().data[65] = 0;
+    let [half, quarter] = [0x3f00_0000, 0x3e80_0000].map(F32::from_bits);
+    fx.world.animators.insert(
+        SIM,
+        sims_sim::animator::Animator {
+            arrival: -1,
+            position: [
+                F32::from_bits(0x3f00_0005),
+                F32::from_bits(0x3e80_0003),
+                F32::from_f32(2.4375),
+            ],
+            destination: [half, quarter, F32::from_f32(2.5625)],
+            ..LOADED
+        },
+    );
+    tick(&mut fx).unwrap();
+    let a = &fx.world.animators[&SIM];
+    assert_eq!((a.state, a.arrival, a.selection), (3, 2, -1));
+    assert!(a.foreground.is_none());
+    let bits = |v: [F32; 3]| v.map(F32::to_bits);
+    assert_eq!(bits(a.position), [0x3f00_0000, 0x3e80_0000, 0x4024_0000]);
+    assert_eq!(bits(a.destination), bits(a.position));
+    assert_eq!(fx.sim().data[1], 3);
+    // Half a direction is a step at least: a turn with a clip, which this
+    // Sim's tables do not name (an adult, word 58, with no special
+    // tables, word 64).
+    let mut fx = standing();
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    person.data[58] = 20;
+    person.data[64] = 0;
+    person.data[65] = 0;
+    fx.world.animators.insert(
+        SIM,
+        sims_sim::animator::Animator {
+            position: [half, quarter, F32::from_f32(2.0)],
+            destination: [half, quarter, F32::from_f32(2.5)],
+            ..LOADED
+        },
+    );
+    assert!(
+        tick(&mut fx)
+            .unwrap_err()
+            .to_string()
+            .contains("has no name for its clip 10")
+    );
+}
+
+#[test]
 fn off_the_lot_the_animator_only_places_itself() {
     let mut fx = standing();
     fx.sim_mut().position = [-16, -16, 1];

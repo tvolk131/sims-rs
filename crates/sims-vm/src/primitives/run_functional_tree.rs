@@ -30,8 +30,9 @@
 //! stack object's type, runs with the stack object as its stack object
 //! and, the arguments pointer being null, the running object's temps as
 //! its arguments (0x47484a). A person also starts using the stack object
-//! (0x45e59b), noting the flag with the use; a set flag also notes the
-//! object at person +0xa54, which is not modeled, so it fails loudly.
+//! (0x45e59b), noting the flag with the use; with the flag set, the stack
+//! object first becomes the icon of the person's running action (person
+//! +0xa54, 0x45e5d4).
 //!
 //! Unlike Run Tree By Name, the primitive leaves its frame's state alone
 //! (0x44f75c returns 3 without writing frame +8), so when the tree returns
@@ -91,18 +92,11 @@ impl Machine<'_, '_> {
         }
         let flag = operands[2] & 1 != 0;
         let person = self.me()?.person.is_some();
-        if person && flag {
-            return Err(Trap::Unsupported(
-                "Run Functional Tree with flag 1 notes the object at person +0xa54 \
-                 (0x45e5d4), which is not modeled"
-                    .into(),
-            ));
-        }
         let temps = self.me()?.temps.clone();
         self.wake(self.me)?;
         self.enter_on(target, tree, &temps)?;
         if person {
-            self.count_use(target)?;
+            self.count_use(target, flag)?;
         }
         Ok(Flow::Pushed)
     }

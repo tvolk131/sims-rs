@@ -947,7 +947,7 @@ impl Machine<'_, '_> {
                  original goes on without the door (0x45c827): {fault}"
             ))
         })?;
-        self.count_use(door)
+        self.count_use(door, false)
     }
 
     /// Runs a seat's Sit tree on the person's thread, as the person's
@@ -966,7 +966,7 @@ impl Machine<'_, '_> {
                  original's route gives result 5 (0x45c4a8): {fault}"
             ))
         })?;
-        self.count_use(seat)
+        self.count_use(seat, false)
     }
 
     /// Plays a tree of the person's own on its thread, as its virtual
@@ -986,7 +986,7 @@ impl Machine<'_, '_> {
                  to step 6 (0x45b51e): {fault}"
             ))
         })?;
-        self.count_use(me)?;
+        self.count_use(me, false)?;
         if let Some(id) = stack_object {
             self.frame_mut()?.stack_object = id as i16;
         }

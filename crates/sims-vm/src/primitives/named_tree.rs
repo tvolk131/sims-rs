@@ -126,7 +126,7 @@ impl Machine<'_, '_> {
         self.frame_mut()?.primitive_state = RAN_TREE;
         self.enter_on(target, tree, &temps)?;
         if self.me()?.person.is_some() {
-            self.count_use(target)?;
+            self.count_use(target, false)?;
         }
         Ok(Flow::Pushed)
     }

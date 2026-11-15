@@ -72,11 +72,20 @@ pub(crate) fn no_action() -> Interaction {
 
 impl Machine<'_, '_> {
     /// The running person starts using object `target`, whose tree it has
-    /// just pushed (0x45e5bd to 0x45e5e9). The entry's flag is the
-    /// argument Run Tree By Name passes as 0; with it set the original
-    /// would also note the object at person +0xa54.
-    pub(crate) fn count_use(&mut self, target: u16) -> Result<(), Trap> {
+    /// just pushed (0x45e5bd to 0x45e5e9). The entry keeps `flag` (entry
+    /// +8). Run Tree By Name passes 0; Run Functional Tree passes its
+    /// flag. With the flag set, the object first becomes the icon of the
+    /// person's running action (person +0xa54, 0x45e5d4).
+    pub(crate) fn count_use(&mut self, target: u16, flag: bool) -> Result<(), Trap> {
         let depth = self.me()?.stack.len() as i32;
+        if flag {
+            self.me_mut()?
+                .person
+                .as_mut()
+                .ok_or(Trap::native(0x1c, "object is not a person"))?
+                .active
+                .icon = target as i16;
+        }
         let object = self
             .world
             .objects
@@ -95,7 +104,7 @@ impl Machine<'_, '_> {
         person.object_uses.push(ObjectUse {
             target: target as i16,
             stack_depth: depth,
-            unknown: 0,
+            unknown: u8::from(flag),
         });
         Ok(())
     }
@@ -103,10 +112,11 @@ impl Machine<'_, '_> {
     /// After the running person's thread has popped a frame (0x45e5fd).
     /// With `n` frames left and the last entry made at depth `d`:
     ///
-    /// - if `n` is `d - 1`, the entry's object's count goes down, and the
-    ///   entry is removed (with the original, after it notes at person
-    ///   +0xa54 the object of each entry whose flag is set; an entry with
-    ///   the flag fails, as nothing ported makes one);
+    /// - if `n` is `d - 1`, the entry's object's count goes down, the
+    ///   object of each entry whose flag is set, first to last, becomes
+    ///   the icon of the running action (person +0xa54, 0x45e65d to
+    ///   0x45e665), so the last such entry's object stays there, and the
+    ///   entry is removed;
     /// - if `n` is less than that, the same, without the noting;
     /// - otherwise nothing changes.
     ///
@@ -124,13 +134,16 @@ impl Machine<'_, '_> {
         };
         let (target, depth) = (last.target, last.stack_depth);
         let release = frames == depth.wrapping_sub(1) || frames < depth;
-        if frames == depth.wrapping_sub(1) && person.object_uses.iter().any(|u| u.unknown != 0) {
-            return Err(Trap::Unsupported(
-                "an object use with its flag set ends; the original then notes the object at \
-                 person +0xa54, which is not modeled"
-                    .into(),
-            ));
-        }
+        let icon = if frames == depth.wrapping_sub(1) {
+            person
+                .object_uses
+                .iter()
+                .rev()
+                .find(|u| u.unknown != 0)
+                .map(|u| u.target)
+        } else {
+            None
+        };
         if release {
             let object = u16::try_from(target)
                 .ok()
@@ -148,6 +161,9 @@ impl Machine<'_, '_> {
                 .person
                 .as_mut()
                 .ok_or(Trap::native(0x1c, "object is not a person"))?;
+            if let Some(icon) = icon {
+                person.active.icon = icon;
+            }
             person.object_uses.pop();
         }
         let emptied = self
