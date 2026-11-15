@@ -2121,11 +2121,13 @@ through their public interfaces only; the simulation never depends on it.
   note across the top says whether it was queued. Escape closes the
   menu. The fridge lists Have A Snack, Have Lite Meal, Have A Meal,
   Serve Meal; the bookshelf lists Read a Book and the studies.
-- **Blocked: Mortimer doing what he is told.** The order is queued, but
-  on his next tick Idle For Input fails on starting the queued action
-  (0x45dc14, not ported). In strict mode that stops the lot; in play
-  mode he is reset and the queue empties.
-  That is the simulation's next step toward the done criterion.
+- **Blocked: a Sim doing what he is told.** Idle For Input now starts
+  a queued order (#131): Have A Snack queued on the fridge at tick 51
+  leaves the queue by tick 151. Three ticks later, the other Goth
+  (object 16) fails a route that names its slot from source 2 (tree
+  0x2156 node 5; 0x45ac2e, not ported), which stops the lot in strict
+  mode. Without an order, strict mode runs to tick 1102. That route is
+  the simulation's next step toward the done criterion.
 - **Next:** the menu from the simulation's pie-menu entries (the check
   each entry runs, which the stopgap skips) once that accessor lands;
   then a real pie.
@@ -2140,7 +2142,7 @@ through their public interfaces only; the simulation never depends on it.
     (before or after the tick) was skipped.
   - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
     and dialogs are. `sims-game` draws a plain list until then.
-  - `sims-vm`: Idle For Input starting a queued action (0x45dc14), and
+  - `sims-vm`: a route naming its slot from source 2 (0x45ac2e), and
     the entries the pie menu offers a person on an object, with their
     labels' table. Until then, the tile an order on an object goes to
     (`interaction_target`) and the ID and file of the TTAB it is queued
