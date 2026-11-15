@@ -122,20 +122,21 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     assert_eq!((last.caller, last.icon), (sim as i16, 16));
     assert_ne!(last.target, 16);
     // The social clears person 16's base slot (Animate Sim clip 0,
-    // 0x58957e) and runs on, until it stops on what is not ported yet.
+    // 0x58957e), sets person 21's word 72 (Generic Sims Call routine 15,
+    // 0x44fe3c) and runs on, until it stops on what is not ported yet.
     let mut steps = 0;
     let stopped = loop {
         steps += 1;
-        assert!(steps <= 100, "the social did not stop");
+        assert!(steps <= 300, "the social did not stop");
         if let Err(e) = lot.step() {
             break e.to_string();
         }
     };
-    assert_eq!(steps, 46, "{stopped}");
+    assert_eq!(steps, 259, "{stopped}");
     for part in [
-        "tick 48,",
-        "object 21, tree 0x2025 node 13",
-        "Generic Sims Call routine 15",
+        "tick 261,",
+        "object 21, tree 0x201a node 11",
+        "unsupported scope 24",
     ] {
         assert!(stopped.contains(part), "{stopped}");
     }

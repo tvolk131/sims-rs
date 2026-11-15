@@ -592,6 +592,37 @@ impl Interpreter<'_> {
         footprint(OFF_LOT, words, datum(world, id, data::FACING)?, None)
     }
 
+    /// An object's footprint worked out again where it stands: 0x433d16
+    /// with the object's own position (+0xf4), whose result the caller
+    /// stores at +0x100. `person` stands in for the person's data words,
+    /// so a caller can work it out as it will be after changing them; it
+    /// is None for an object that is not a person.
+    pub(crate) fn standing_footprint(
+        &self,
+        world: &World,
+        id: u16,
+        person: Option<&[i16]>,
+    ) -> Result<[i32; 4], Trap> {
+        let words = self.words(world, id)?;
+        let object = world.objects.get(&id).ok_or_else(missing)?;
+        if object.person.is_some() != person.is_some() {
+            return Err(Trap::Invalid(
+                "person data given for an object that is not a person, or none for one".into(),
+            ));
+        }
+        if person.is_some() != (words[word::TYPE] == 2) {
+            return Err(Trap::Invalid(
+                "an object and its definition disagree on whether it is a person".into(),
+            ));
+        }
+        footprint(
+            object.position,
+            words,
+            datum(world, id, data::FACING)?,
+            person,
+        )
+    }
+
     pub(crate) fn words(&self, world: &World, id: u16) -> Result<&[i16; DEFINITION_WORDS], Trap> {
         let object = world.objects.get(&id).ok_or_else(missing)?;
         let definition = self
