@@ -167,6 +167,24 @@ impl Camera {
         ]
     }
 
+    /// [`Camera::project_fine`] without its rounding, for points between
+    /// pixels (a person's mesh): the screen position of fine view position
+    /// `fine` on `level`, raised `elevation` near-zoom pixels. The pixel a
+    /// point falls in is the floor of each coordinate. At whole positions
+    /// this agrees with `project_fine` when the elevation is a whole
+    /// number of this zoom's pixels; otherwise `project_fine` drops the
+    /// elevation's fraction (it floors it on its own) and this keeps it.
+    pub fn project_fine_f32(&self, [x, y]: [f32; 2], level: i32, elevation: f32) -> [f32; 2] {
+        let shift = self.zoom.level();
+        let scale = self.zoom.near_scale() as f32;
+        [
+            (x - y) * (8 << shift) as f32 / 16.0 + self.origin[0] as f32,
+            (x + y) * (4 << shift) as f32 / 16.0 + self.origin[1] as f32
+                - (self.zoom.floor_height() * (level - 1)) as f32
+                - elevation / scale,
+        ]
+    }
+
     /// The camera rotated a quarter turn, keeping the screen point
     /// `center` over the same spot of the lot.
     pub fn rotated(&self, turns: u8, center: [i32; 2]) -> Self {
@@ -229,6 +247,40 @@ mod tests {
             origin: [400, 100],
             walls: Walls::Up,
             focus: Focus::default(),
+        }
+    }
+
+    #[test]
+    fn float_projection_floors_to_the_whole_one() {
+        for zoom in Zoom::ALL {
+            let c = Camera {
+                zoom,
+                origin: [-37, 411],
+                ..camera(0)
+            };
+            for level in 1..=3 {
+                for (x, y) in [(0, 0), (5, 3), (17, 900), (1023, 1), (-9, 40)] {
+                    for elevation in [0, 8, 16, 88, -24] {
+                        let whole = c.project_fine([x, y], level, elevation);
+                        let fine =
+                            c.project_fine_f32([x as f32, y as f32], level, elevation as f32);
+                        assert_eq!(fine.map(|v| v.floor() as i32), whole, "{zoom:?} ({x}, {y})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn float_projection_keeps_fractions() {
+        for zoom in Zoom::ALL {
+            let c = Camera { zoom, ..camera(0) };
+            let scale = zoom.near_scale() as f32;
+            let [x0, y0] = c.project_fine_f32([10.0, 20.0], 2, 0.0);
+            let [x1, y1] = c.project_fine_f32([10.5, 20.25], 2, 3.0);
+            let across = (8 << zoom.level()) as f32 / 16.0;
+            assert_eq!(x1 - x0, 0.25 * across);
+            assert_eq!(y1 - y0, 0.75 * across / 2.0 - 3.0 / scale);
         }
     }
 

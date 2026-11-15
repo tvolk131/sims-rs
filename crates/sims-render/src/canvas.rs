@@ -214,29 +214,62 @@ impl Canvas {
                 }
                 let s = &image.rgba[source * 4..source * 4 + 3];
                 let rgb = light.apply([s[0], s[1], s[2]]);
-                let pixel = &mut self.color[target];
-                self.depth[target] = d.clamp(0, EMPTY);
-                if a == 255 {
-                    *pixel = rgb;
-                } else {
-                    let a = u32::from(a);
-                    for (c, &s) in pixel.iter_mut().zip(&rgb) {
-                        *c = ((u32::from(s) * a + u32::from(*c) * (255 - a) + 127) / 255) as u8;
-                    }
-                }
+                self.write(target, rgb, a, d);
             }
         }
     }
 
+    /// Writes a pixel that passed its depth test: its depth, and its
+    /// colour, blended by `a` if it is not opaque.
+    fn write(&mut self, target: usize, rgb: [u8; 3], a: u8, d: i32) {
+        let pixel = &mut self.color[target];
+        self.depth[target] = d.clamp(0, EMPTY);
+        if a == 255 {
+            *pixel = rgb;
+        } else {
+            let a = u32::from(a);
+            for (c, &s) in pixel.iter_mut().zip(&rgb) {
+                *c = ((u32::from(s) * a + u32::from(*c) * (255 - a) + 127) / 255) as u8;
+            }
+        }
+    }
+
+    /// The index of pixel (`x`, `y`), if it is on the canvas.
+    fn index(&self, x: i32, y: i32) -> Option<usize> {
+        let (x, y) = (usize::try_from(x).ok()?, usize::try_from(y).ok()?);
+        (x < self.width && y < self.height).then(|| y * self.width + x)
+    }
+
+    /// Whether a sprite pixel at depth `d` on (`x`, `y`) would be drawn:
+    /// it is on the canvas and no farther than what is there.
+    pub fn passes(&self, x: i32, y: i32, d: i32) -> bool {
+        self.index(x, y).is_some_and(|i| d <= self.depth[i])
+    }
+
+    /// Draws one straight-alpha pixel at depth `d` by the sprite rule, for
+    /// what is drawn over the finished lot a pixel at a time (a person's
+    /// mesh, with [`crate::depth::Depth::point`]): left out if fainter
+    /// than [`FAINT`] or farther than what is there, otherwise blended and
+    /// its depth written, so a nearer part of the same mesh drawn later
+    /// covers it. Returns whether it was drawn.
+    pub fn put(&mut self, x: i32, y: i32, rgba: [u8; 4], d: i32) -> bool {
+        let [r, g, b, a] = rgba;
+        if a < FAINT || !self.passes(x, y, d) {
+            return false;
+        }
+        let Some(target) = self.index(x, y) else {
+            return false;
+        };
+        self.write(target, [r, g, b], a, d);
+        true
+    }
+
     /// Fills one pixel if `d` passes the depth test.
     pub fn plot(&mut self, x: i32, y: i32, d: i32, rgb: [u8; 3]) {
-        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
-            return;
-        }
-        let target = y as usize * self.width + x as usize;
-        if d <= self.depth[target] {
-            self.color[target] = rgb;
-            self.depth[target] = d.clamp(0, EMPTY);
+        if let Some(target) = self.index(x, y)
+            && d <= self.depth[target]
+        {
+            self.write(target, rgb, 255, d);
         }
     }
 
@@ -431,6 +464,27 @@ mod tests {
         let mut c = Canvas::new(1, 1, [0, 0, 0]);
         c.draw_lit(&wall, [0, 0], false, Light::FULL, |_, _, _| None);
         assert_eq!(c, Canvas::new(1, 1, [0, 0, 0]));
+    }
+
+    #[test]
+    fn put_draws_one_pixel_by_the_sprite_rule() {
+        let mut c = Canvas::new(2, 2, [0, 0, 0]);
+        c.plot(1, 0, 100, [10, 20, 30]);
+        // Farther than what is there, too faint, or off the canvas: nothing.
+        assert!(!c.put(1, 0, [255, 255, 255, 255], 101));
+        assert!(!c.put(0, 0, [255, 255, 255, FAINT - 1], 5));
+        for (x, y) in [(-1, 0), (0, -1), (2, 0), (0, 2), (i32::MAX, i32::MIN)] {
+            assert!(!c.passes(x, y, 0));
+            assert!(!c.put(x, y, [255, 255, 255, 255], 0));
+        }
+        assert_eq!(c.color, vec![[0, 0, 0], [10, 20, 30], [0, 0, 0], [0, 0, 0]]);
+        assert_eq!(c.depth, vec![EMPTY, 100, EMPTY, EMPTY]);
+        // A tie wins; a soft pixel blends and writes its depth.
+        assert!(c.passes(1, 0, 100) && !c.passes(1, 0, 101));
+        assert!(c.put(1, 0, [255, 255, 255, 255], 100));
+        assert!(c.put(0, 1, [255, 255, 255, 128], -7));
+        assert_eq!(c.color[1], [255, 255, 255]);
+        assert_eq!((c.color[2], c.depth[2]), ([128, 128, 128], 0));
     }
 
     #[test]
