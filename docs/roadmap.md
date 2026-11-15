@@ -112,7 +112,7 @@ events, and what it asks for after them) come first.
   household selection, and the community lots (UserData's houses 40 to
   48) where Create New Object Instance mode 6 makes a person (0x44e60e).
   Four types grow their attribute arrays to the saved count (0x4342ae). The templates' `Patch` families are not
-  imported (see `docs/decisions.md`).
+  imported (see `docs/decisions/`).
 
 ## Met goal: a headless lot boot that matches the original
 
@@ -140,7 +140,7 @@ How it was reached:
    Five runs of the Goth house were recorded; the first covered 1000 lot
    updates, tick counts 88445 to 89444. The first does not choose in
    tick 233 and the other four do; we follow those
-   (`docs/decisions.md`). With the install's own UserData, the C
+   (`docs/decisions/`). With the install's own UserData, the C
    runtime's random stream and all 463 neighborhood records match too.
    The original first draws from the C runtime's stream in tick 6, 1,466
    times, when it makes a person; ours draws the same.
@@ -931,7 +931,7 @@ with flag 2 or between two people (`0x44d17c`), and Manage Inventory
 operation 3 (`0x4552f8`). After tick 1 all 463 records and the
 inventories equal the capture's, when ours reads the same neighborhood
 file as the capture's game; the install's file differs from that one in
-five records (see `docs/decisions.md`). One registry byte that a
+five records (see `docs/decisions/`). One registry byte that a
 relationship write sets is 1 in the capture and 0 here; what sets it
 during the original's load is not known.
 
@@ -1144,7 +1144,7 @@ Its state after tick 230 equals ours as far as compared, and the
 original's code run in an emulator on its memory from update 47 chooses
 in 233. So something outside the lot updates, after update 47, changed
 the outcome in that run only. What it was is not known (see
-`docs/decisions.md`). We follow the three runs that agree.
+`docs/decisions/`). We follow the three runs that agree.
 
 ### Ticks 233 to 261
 
@@ -2370,8 +2370,12 @@ through their public interfaces only; the simulation never depends on it.
 - Nothing from the original game is committed. Fixtures that need game data
   stay private and are skipped when the data is absent.
 - Choices about format details, unverified guesses, and the order of work
-  are made in the PR and recorded in `docs/decisions.md`. Guesses are
-  marked unverified in the code until the harness confirms them.
+  are made in the PR and recorded as a new file under `docs/decisions/`
+  (see its README). Guesses are marked unverified in the code until the
+  harness confirms them.
+- Only the coordinator edits this roadmap. A track's PR does not touch it;
+  its body ends with a **Roadmap** section saying which lines should change.
+  After merging, the coordinator applies those changes in one docs commit.
 - Stop and ask the maintainer only when:
   - something only they can provide is needed (a login, or files not on
     this machine);

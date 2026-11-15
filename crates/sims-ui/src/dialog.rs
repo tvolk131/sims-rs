@@ -9,7 +9,7 @@
 //!
 //! The layout was measured on two screenshots of the original at 800 by
 //! 600 (the Magic Town and Studio Town notices on the Goth house). The
-//! numbers are in `docs/decisions.md`; how the original sizes a dialog it
+//! numbers are in `docs/decisions/`; how the original sizes a dialog it
 //! was not measured on is **unverified**.
 
 use crate::art::{Art, KEY};

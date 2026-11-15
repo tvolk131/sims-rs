@@ -40,7 +40,7 @@
 !/docs/vision.md
 !/docs/salvage-audit.md
 !/docs/roadmap.md
-!/docs/decisions.md
+!/docs/decisions/
 
 # Local credentials and environment overrides
 .env
