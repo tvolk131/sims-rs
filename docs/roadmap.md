@@ -2112,6 +2112,14 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   viewer call), as the original's ordinary job panel draws them
   (0x5301ca). The Goths' panel is pinned by digest, gated on
   `SIMS_INSTALL`; it is not yet compared with a screenshot.
+- **Done: the relationship panel.** The Relationships button opens the
+  people the selected Sim knows, five a page with arrows, each with the
+  face for the lifetime relationship, the day's and the lifetime's
+  numbers and bars, and the friends and love icons, filtered by the
+  family, friends and everyone buttons, as the original lays them out
+  (0x51db56) and draws them (0x52838f). The host fills the list with
+  `Snapshot::with_relations`. The Goths' panel is pinned by digest,
+  gated on `SIMS_INSTALL`; it is not yet compared with a screenshot.
 - **Next:** open houses through `sims_vm::boot::Lot` (which now runs the
   household load) in the tests and the viewer, in place of their
   stand-in for steps 17 and 18; a screenshot of an open pie menu; a
@@ -2120,7 +2128,8 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   of several buttons; text entry dialogs; the personality panel's
   zodiac sign; the job panel's left column (the career's icon and
   title, the salary, the performance and the friends needed); the
-  relationship panel; the other live panels.
+  relationship panel's Superstar filter and which people the original
+  leaves out; the other live panels.
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
   - A command intake, for example `World::apply(&mut self, command:
     sims_sim::Command) -> Result<(), CommandError>`, run between ticks,
