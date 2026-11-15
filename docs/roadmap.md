@@ -56,31 +56,37 @@ events, and what it asks for after them) come first.
   (#131), the pie menu and picking from it (#132), and Go To Routing
   Slot's parameter and global slots (#134), which a player's snack order
   reached.
-- Strict mode on the Goth house runs to tick 3602, 08:30 on the first
+- Strict mode on the Goth house runs to tick 9906, 12:00 on the first
   day. One tick is two game seconds, so a day is 43,200 ticks (measured
   from the clock globals). The carpool makes the school bus at tick 2703
   (the multi-tile factory is ported). The base layer is kept and the
   pose composed from it, and a person may take itself off the lot in
   its own tick. A multi-tile object may snap where it does not fit
   (0x454e82), and a group is deleted (0x440f37): at tick 3434 the car
-  junk's 18 tiles go. At tick 3603 object 354 uses Create New Object
-  Instance mode 6 with flag 0x4, which is not ported (the same stop as
-  the snack order's). Step 2 continues from there.
+  junk's 18 tiles go. At tick 3603 object 354 makes two neighbors'
+  people off the lot (Create New Object Instance mode 6, flag 0x4) and
+  removes them. At tick 3913 a seated person's route stands it up
+  first; at tick 6756 a pet is made (the expansions installed allow
+  pets) and walks, runs and turns at its own pace; an inventory count
+  goes up at 7702 and a route with no door gives up at 9337. Past tick
+  1000 this is unverified: there is no capture. At tick 9907 object 5
+  walks the neighborhood's lots in order of distance (Set To Next mode
+  11), which needs a lot-position table the simulation does not hold
+  (the snack order stops on it at the same step). Step 2 continues from
+  there.
 - Of the base neighborhood's houses only the Goths' and the Newbies'
   (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
-  tick 1802; a route that gives up on a slot it may end near runs the
+  tick 4052; a route that gives up on a slot it may end near runs the
   Route failure feedback tree (tick 1473). Against the recording of the
   house (updates 0 to 935), every update's random streams, scheduler
   cursor, action serial, globals and objects, and each object's data,
   temps, attributes, frames and person data match, except the words the
   original left from memory it never set (person word 37, locals on half
   a pointer) and global 12 at updates 1 and 3 (the interface's tutorial
-  wait). At tick 1803 object 290 needs Create New Object Instance mode 6
-  with flag 0x4, which track 3 is porting for the Goths' snack order.
-
-  tick 1472, with no recording to compare yet; at tick 1473 object 105
-  gives up a route and needs the route-failure feedback tree (0x45af2a),
-  which is not ported.
+  wait). At tick 1803 object 290 makes two neighbors' people off the lot
+  (Create New Object Instance mode 6, flag 0x4), unverified past update
+  935. The frame drawn after tick 4053 finds person 140's skin waiting
+  for its update (0x590d26), which is not ported.
 - The Pleasants (`House06.iff` as the original saved it after moving
   them in, with the Traveling Salesman on the lot) load to the state the
   first tick starts from: the end of the household selection works out
@@ -92,10 +98,14 @@ events, and what it asks for after them) come first.
   what the original reads for it is not ported.
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
-  read their arrays whole (Arry 11, 12, 111 and 112). UserData2's
-  houses 1 and 9 then stop at their floor and wall maps
-  (`World::renumber_surfaces`), and the houses with no family stop at
-  the household selection. The templates' `Patch` families are not
+  read their arrays whole (Arry 11, 12, 111 and 112). Their floor
+  and wall maps are renumbered through the game's pattern catalogs
+  (`sims_content::Surfaces`, `World::renumber_surfaces`). UserData2's
+  house 9 then stops at the first frame (a bone last turned by a layer
+  no longer playing, 0x5992b3), the houses with no family stop at the
+  household selection, and the community lots (UserData's houses 40 to
+  48) where Create New Object Instance mode 6 makes a person (0x44e60e).
+  Four types grow their attribute arrays to the saved count (0x4342ae). The templates' `Patch` families are not
   imported (see `docs/decisions.md`).
 
 ## Met goal: a headless lot boot that matches the original
@@ -161,7 +171,7 @@ That starting lot is **unverified**; see the decision log.
 | 4 | Clear the family global | `0x415eff` | Done (`World::clear_family`) |
 | 5 | Clear the lot: remove every object on it | `0x44279a`, `0x445f84`, `0x44123f`, `0x440eeb` | Done for objects that are off the lot (`Interpreter::clear`) |
 | 6a | Read the house's lot arrays | `0x478599` | Done for house versions 53 to 62 (`World::read_arrays`) |
-| 6b | Renumber the saved floor and wall IDs | `0x4a0e3b`, `0x4c5d35` | Done for a house whose maps are empty (`World::renumber_surfaces`) |
+| 6b | Renumber the saved floor and wall IDs | `0x4a0e3b`, `0x4c5d35` | Done but for a pattern matched by colour (0x4a0bbd) (`World::renumber_surfaces`, `sims_content::Surfaces`) |
 | 6c, 7 | Read the house's type table, marking the object types whose scripts changed since the save | `0x43dd76`, `0x43a516` | Done (`Interpreter::read_types`) |
 | 6d | Clear the lot again | `0x445f84`, `0x44279a` | Done (step 5) |
 | 6e | Construct the house's objects on the cleared lot and read their saved fields | `0x449c5e`, `0x43fe0a` | Done (`Interpreter::read_objects`); a person's graphics only as far as they draw random numbers |
@@ -2195,8 +2205,8 @@ through their public interfaces only; the simulation never depends on it.
   play mode does not catch stops it. In play mode the Goths' house runs
   12,000 ticks (ten minutes at normal speed) without stopping, through
   about a dozen different caught errors; in strict mode it stops after
-  tick 3602 (at tick 3603 Create New Object Instance mode 6 is not
-  ported).
+  tick 9906 (at tick 9907 Set To Next mode 11 needs the neighborhood's
+  lot order).
   `--png <file>
   --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
@@ -2237,11 +2247,9 @@ through their public interfaces only; the simulation never depends on it.
   his hunger goes from 94.5 to 100.0 (tick 936); at 1088 the snack goes
   off the lot and at 1136 it is deleted, and he is free again. He goes
   on to other things (object 71 at tick 1497, object 132 at 2292).
-  Strict mode now runs the order through step 3602 and stops at step
-  3603 (object 354 uses Create New Object Instance mode 6 with flag 0x4,
-  not ported); without an order it stops there too.
-
-  not ported); without an order it runs to tick 3432.
+  Strict mode now runs the order through step 9906 and stops at step
+  9907 (Set To Next mode 11 needs the neighborhood's lot order); without
+  an order it stops on the same at tick 9907.
 - **Done: a player's order from the window, in play mode.** With
   `--play`, the pointer on the fridge lists its pie, a click opens it,
   and Have A Snack queues the action the listing offered. A Goth test

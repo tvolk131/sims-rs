@@ -320,7 +320,7 @@ fn flag_0x20_turns_the_new_object_only_when_it_already_faces_right() {
 fn mode_8_with_other_flags_or_a_person_it_cannot_make_fails_loudly() {
     let (mut fx, _) = placeable();
     fx.lamp_mut().position = [40, 40, 1];
-    let result = create(&mut fx, 0, 0x04, SIM as i16);
+    let result = create(&mut fx, 0, 0x02, SIM as i16);
     assert!(matches!(trap(result), Trap::Unsupported(_)));
     // A person type with no skeleton supplied.
     let (mut fx, file) = placeable();

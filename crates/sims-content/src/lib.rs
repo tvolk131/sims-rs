@@ -17,6 +17,7 @@ mod index;
 mod install;
 mod neighborhood;
 mod people;
+mod surfaces;
 pub mod ui_graphics;
 
 pub use animations::{Animations, Channel, Clip, Event, Track};
@@ -26,5 +27,6 @@ pub use index::{Index, Member, Resource, far_members};
 pub use install::{Expansions, Install, Layout, Mount};
 pub use neighborhood::{House, Neighborhood};
 pub use people::{Bone, People, Profile, Skeleton};
+pub use surfaces::{SurfaceCatalog, SurfaceFile, SurfaceKind, Surfaces};
 
 pub type Result<T> = std::result::Result<T, Error>;

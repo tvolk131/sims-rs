@@ -797,7 +797,7 @@ fn a_second_order_waits_behind_the_first_and_a_press_cancels_either() {
     // 1028 the water starts.
     assert_eq!(game.run(128), 128);
     assert_eq!(mortimer(&game).active.uid, eating);
-    assert_eq!(game.lot().world().objects[&snack].position, [296, 440, 1]);
+    assert_eq!(game.lot().world().objects[&snack].position, [280, 456, 1]);
     assert_eq!(game.run(1), 1);
     let watering = mortimer(&game).active;
     assert_eq!((watering.uid, watering.target), (2, plant as i16));

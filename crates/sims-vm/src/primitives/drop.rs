@@ -4,45 +4,41 @@
 //!
 //! The original ignores the operands. In order:
 //!
-//! 1. The object in my first container slot (object +0x130, its second
-//!    record, the slot scripts count as 0; a list of one record or none
-//!    holds nothing) is looked up in the registry (0x40743b). Nothing
-//!    there takes the false branch.
-//! 2. The place is my position (+0xf4, +0xf8) with one tile's step in
-//!    my facing (data word 1, +0x4c; 0x42228a) added, on my level
-//!    (+0x110).
-//! 3. The held object's place test there, on the ground (virtual
-//!    function 0x54 with no container; [`crate::Interpreter::fits`]). If
-//!    it refuses, the false branch is taken and nothing changes.
-//! 4. The object is put there with the lot told (virtual function 0x58,
-//!    its last argument 1; [`crate::Interpreter::put`]), and the true
-//!    branch is taken. What the put returns is not read. The original
-//!    passes slot 0 with no container, which a put on the ground does
-//!    not read.
+//! 1. My first container slot (slot 0 as scripts count it; object +0x130,
+//!    its second record of 0x24 bytes, when there is one) names the held
+//!    object by its ID (record +0x10), which is looked up in the registry
+//!    (0x40743b). No such slot, or an ID that is not above 0 or names no
+//!    object, takes the false branch.
+//! 2. The place is one tile from mine (+0xf4, +0xf8) in my direction
+//!    (data word 1, +0x4c; 0x42228a), on my level (+0x110).
+//! 3. The held object's place test (virtual function 0x54) there, with no
+//!    container ([`crate::Interpreter::fits`]). If it refuses, the false
+//!    branch is taken and nothing changes.
+//! 4. The held object is put there with the lot told (virtual function
+//!    0x58, its last argument 1; [`crate::Interpreter::put`]), and the
+//!    true branch is taken. What the put returns is not read.
 //!
-//! A put that fails partway (on what the port does not model) leaves the
-//! lot as it was before the Drop, so the fault reports a consistent lot.
+//! As for Grab, a put that fails partway (on what the port does not
+//! model) leaves the lot as it was before the Drop, so the fault reports
+//! a consistent lot.
 //!
-//! **Unverified**: no capture covers a Drop. The first one reached is a
-//! person's tree 0x0139 (node 14) after the player cancels the snack the
-//! person is eating: the person puts the snack down.
+//! **Unverified**: no capture covers a Drop. The first reached is the
+//! Goth house's tick 5310 (object 12, tree 0x1006 node 12), past the
+//! last capture. In play mode, a person's tree 0x0139 (node 14) drops
+//! the snack it is eating when the player cancels it.
 
 use crate::fault::Trap;
 use crate::interpreter::Machine;
 use crate::placement::{Place, on_lot};
 use crate::routing::slot::step;
 
-/// Object data word 1: the facing, 0 to 7.
+/// Data word 1: the direction an object faces (+0x4c).
 const DIRECTION: usize = 1;
 
 impl Machine<'_, '_> {
     pub(crate) fn drop_held(&mut self) -> Result<bool, Trap> {
         let me = self.me;
-        let object = self
-            .world
-            .objects
-            .get(&me)
-            .ok_or(Trap::native(10, "missing object"))?;
+        let object = self.me()?;
         let Some(held) = object
             .slots
             .get(1)
@@ -52,13 +48,13 @@ impl Machine<'_, '_> {
             return Ok(false);
         };
         let [p0, p1, level] = object.position;
-        let facing = object
+        let facing = *object
             .data
             .get(DIRECTION)
-            .copied()
-            .ok_or_else(|| Trap::Invalid(format!("object data has no word {DIRECTION}")))?;
-        let [d0, d1] = step(i32::from(facing));
-        let position = [p0.wrapping_add(d0), p1.wrapping_add(d1)];
+            .ok_or_else(|| Trap::Invalid(format!("object {me} has no data word {DIRECTION}")))?;
+        // The step's first word goes to +0xf4, which is position[1].
+        let [first, second] = step(i32::from(facing));
+        let position = [p0.wrapping_add(second), p1.wrapping_add(first)];
         let interpreter = self.interpreter();
         let unsupported =
             |fault| Trap::Unsupported(format!("Drop of object {held} by object {me}: {fault}"));
