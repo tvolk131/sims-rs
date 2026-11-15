@@ -29,6 +29,9 @@
 //! temp `(flags >> 11) & 3` its place. When there is none, they take 0
 //! and -1 and the branch is false; a count of 0 is still found. A place
 //! after 0x7fff wraps to a negative one, which finds nothing (0x41f746).
+//! The branch tests the place written, so a token found at index 65535,
+//! whose place is cut to -1 like every place (both operations store the
+//! index's low word), is false with its count written.
 //!
 //! The other operations fail loudly. Ported from the original's code
 //! (above) and checked against the old prototype's `inventory`
@@ -106,11 +109,9 @@ impl Machine<'_, '_> {
             .get_mut(&self.me)
             .ok_or(Trap::native(10, "missing object"))?
             .temps;
-        let place_word = |index: usize| {
-            i16::try_from(index).map_err(|_| {
-                Trap::Invalid("an inventory holds more tokens than a word counts".into())
-            })
-        };
+        // The place is the token's index cut to a word, with no check
+        // (0x41f677 to 0x41f684, 0x41f6d5 to 0x41f6e1).
+        let place_word = |index: usize| index as i16;
         if operation == 3 {
             let found = items
                 .iter()
@@ -120,7 +121,7 @@ impl Machine<'_, '_> {
             let Some((index, count)) = found.filter(|&(_, count)| count != 0) else {
                 return Ok(false);
             };
-            let index = place_word(index)?;
+            let index = place_word(index);
             temps[usize::from((flags >> 5) & 3)] = count as i16;
             temps[usize::from((flags >> 11) & 3)] = index;
             return Ok(true);
@@ -138,7 +139,7 @@ impl Machine<'_, '_> {
                 .map(|(index, item)| (index, item.count))
         });
         let (index, count) = match found {
-            Some((index, count)) => (place_word(index)?, count as i16),
+            Some((index, count)) => (place_word(index), count as i16),
             None => (-1, 0),
         };
         temps[usize::from((flags >> 5) & 3)] = count;

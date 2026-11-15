@@ -368,9 +368,15 @@ fn scope_24_field_1_is_whether_the_selected_family_has_the_records_type() {
     assert_eq!(field(&mut fx, 1), 1);
     fx.world.globals[9] = 6;
     assert_eq!(field(&mut fx, 1), 0);
-    // None selected.
+    // Global 9 at 0 may stand for no family or for family 0.
     fx.world.globals[9] = 0;
-    assert_eq!(field(&mut fx, 1), 0);
+    let fault = fx
+        .expression(scope::TEMPS, 0, op::ASSIGN, 24, 1)
+        .unwrap_err();
+    let Trap::Unsupported(text) = &fault.trap else {
+        panic!("{fault}");
+    };
+    assert!(text.contains("global 9 at 0"), "{text}");
     // Global 9 naming no family.
     fx.world.globals[9] = 7;
     assert!(matches!(
@@ -599,6 +605,33 @@ fn manage_inventory_walks_the_tokens_of_a_kind_after_a_place() {
     let mut guid = WALK;
     guid[2] |= 1;
     assert_eq!(walk(&mut fx, guid, -1), (true, [0, 2]));
+    // A place past 0x7fff is cut to a word: at 32768 it is -32768, and at
+    // 65535 it is -1, which is false with the count written.
+    let far = |at: usize| {
+        let mut items = vec![
+            Item {
+                kind: 1,
+                guid: LAMP_GUID,
+                count: 1,
+            };
+            at
+        ];
+        items.push(Item {
+            kind: 2,
+            guid: LAMP_GUID,
+            count: 7,
+        });
+        items
+    };
+    let mut wide = inventories();
+    wide.world.neighbors.inventories[1].items = far(32768);
+    assert_eq!(walk(&mut wide, WALK, -1), (true, [7, -32768]));
+    wide.world.neighbors.inventories[1].items = far(65535);
+    assert_eq!(walk(&mut wide, WALK, -1), (false, [7, -1]));
+    // Operation 3 cuts it the same way.
+    wide.sim_mut().temps = vec![0; 8];
+    assert_eq!(sim_runs(&mut wide, 51, FIND, 0), Ok(true));
+    assert_eq!(wide.sim().temps[1..3], [7, -1]);
     // The place is written after the count when both name one temp.
     let mut same = WALK;
     same[3] = 0x0b;

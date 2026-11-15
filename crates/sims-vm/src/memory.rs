@@ -212,12 +212,15 @@ impl Machine<'_, '_> {
     ///   the GUID of the definition the record is linked to (0x4572af),
     ///   which is the record's own, else 0; 0 with no family selected
     ///   (0x425be2). The original reads the selected family's pointer
-    ///   (game +0x10), which the selection sets together with global 9,
-    ///   the family's ID (0x4f2218, 0x4f222b). Scripts cannot write global
-    ///   9, so the family here is the one whose ID global 9 holds, as for
-    ///   the family panel; that the game's other setters of global 9
-    ///   (0x415fc6, 0x4164f6, 0x4278f6, 0x428317) keep the two together is
-    ///   **unverified**. A record of a GUID with no definition fails, as
+    ///   (game +0x10). Every setter of global 9 to a family's ID stores
+    ///   that family's pointer with it (0x4f2218 with 0x4f222b, 0x4282b7
+    ///   with 0x428317), and scripts cannot write global 9, so a global 9
+    ///   other than 0 names the selected family. A global 9 of 0 does not:
+    ///   0x415fc6 and 0x4164f6 clear it and select family 0 (0x415fd7,
+    ///   0x416509), 0x4278f6 clears it and leaves the pointer, and the
+    ///   game's start and end set the pointer alone (0x415bd2, 0x415d21,
+    ///   0x415ecd). The World keeps no pointer, so field 1 with global 9 at
+    ///   0 fails loudly. A record of a GUID with no definition fails, as
     ///   the original would read through a null pointer.
     /// - 2: the record's person data word 58.
     /// - 3 and 4: 0.
@@ -275,7 +278,11 @@ impl Machine<'_, '_> {
             1 => {
                 let selected = self.world.globals.get(9).copied().unwrap_or(0);
                 if selected == 0 {
-                    return Ok(0);
+                    return Err(Trap::Unsupported(
+                        "scope 24 field 1 (0x425be2) with global 9 at 0: the selected family \
+                         (game +0x10) may be none or family 0, which is not kept"
+                            .into(),
+                    ));
                 }
                 let family = families
                     .iter()
