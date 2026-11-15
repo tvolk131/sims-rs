@@ -2,7 +2,7 @@
 //! four-pixel columns from a dithered palette.
 //!
 //! Read from the original's code (addresses are in the game's recovered
-//! image; see `docs/decisions.md`):
+//! image; see `docs/decisions/`):
 //!
 //! - **Palette** (0x49c8d3, 0x49e6cf). 32 grass colors run from brown to
 //!   green by the tile's grass value. Each has 128 shades running from a

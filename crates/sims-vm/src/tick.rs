@@ -62,7 +62,7 @@
 //! Read from the original's code; the old prototype
 //! (legacy/crates/sims-vm/src/lib.rs, legacy/crates/sims-sim/src/clock.rs,
 //! legacy/crates/sims-sim/src/removal.rs) was the guide. What a capture of
-//! the original running these ticks confirms is in `docs/decisions.md`.
+//! the original running these ticks confirms is in `docs/decisions/`.
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Status, Stream};

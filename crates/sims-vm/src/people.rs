@@ -8,7 +8,7 @@
 //! (legacy/crates/sims-vm/src/person_reset.rs), `clear_person_action`
 //! (legacy/crates/sims-vm/src/action.rs), and `score_table`
 //! (legacy/crates/sims-vm/src/person_loading.rs). The prototype compared
-//! each with the original's code run alone. `docs/decisions.md` says what
+//! each with the original's code run alone. `docs/decisions/` says what
 //! a trace of the original loading the Goth house confirms.
 
 use std::cell::RefCell;

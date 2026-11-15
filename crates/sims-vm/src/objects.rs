@@ -29,7 +29,7 @@
 //! (legacy/crates/sims-vm/src/person_factory.rs and loading.rs).
 //!
 //! For the Goth house the result was compared with a capture of the
-//! original taken when the read returns; `docs/decisions.md` says what was
+//! original taken when the read returns; `docs/decisions/` says what was
 //! equal.
 
 use crate::fault::{Fault, Trap};

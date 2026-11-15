@@ -35,6 +35,21 @@ review. The old large-capture exceptions have been removed. Individual blobs hav
 a 5 MiB limit and the public checkout has a 64 MiB budget. These size limits are
 not evidence of copyright clearance.
 
+## Decisions and the roadmap in pull requests
+
+Many tracks open pull requests at once. Two rules keep their docs from
+conflicting:
+
+- **One file per decision.** A PR records each choice as a new file under
+  `docs/decisions/`, named `YYYYMMDD-short-slug.md` (see
+  [decisions/README.md](decisions/README.md)). It does not edit a shared log
+  or an index, so two PRs never touch the same lines.
+- **Only the coordinator edits `docs/roadmap.md`.** A track's PR leaves the
+  roadmap alone. Its body ends with a **Roadmap** section naming the lines
+  that should change: what moves to Done, what to add to Next, and what
+  becomes unverified. After merging, the coordinator applies the changes
+  from every merged PR in one docs commit.
+
 ## Local gates
 
 Activate versioned hooks once per clone:

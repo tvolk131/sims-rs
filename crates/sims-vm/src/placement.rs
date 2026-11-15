@@ -30,7 +30,7 @@
 //! (legacy/crates/sims-sim/src/spatial.rs) and `placement` and
 //! `update_offsets` (legacy/crates/sims-vm/src/multitile.rs). The
 //! prototype compared each with the original's code run alone.
-//! `docs/decisions.md` says what a trace of the running game confirms.
+//! `docs/decisions/` says what a trace of the running game confirms.
 //!
 //! Not modeled, being presentation: the redrawing an object asks for as it
 //! moves, its shadow, and the lighting around a light source.

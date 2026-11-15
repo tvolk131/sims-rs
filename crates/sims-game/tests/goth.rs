@@ -706,6 +706,108 @@ fn a_press_on_an_actions_icon_cancels_it() {
     assert_eq!(mortimer(&game).queue.len(), before.queue.len());
 }
 
+/// The fridge's icon, queued, and the snack's, running, show their
+/// types' catalog pictures: the left cell of each one's own 74 by 37
+/// thumbnail (`BMP_` of its catalog strings ID), centred in the icon
+/// (0x4cbdc3, 0x4ccaa0).
+#[test]
+fn the_queues_icons_show_their_objects_catalog_pictures() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install.clone())).expect("the Goth house opens");
+    assert_eq!(game.run(50), 50);
+    game.resize([800, 600]);
+    game.render();
+    let (_, snack, _) = snack_pie(&mut game);
+    game.press(snack);
+    game.render();
+    let thumbnails = Thumbnails::new(&install);
+    let fridge = game.lot().world().objects[&118].guid;
+    assert_eq!(game.queue().icons[0].picture, Picture::Object(fridge));
+    thumbnails.check(&game, fridge);
+    // He eats the snack (object 263), its icon now the running one.
+    assert_eq!(game.run(850), 850);
+    game.render();
+    let snack = game.lot().world().objects[&263].guid;
+    assert_eq!(game.queue().icons[0].picture, Picture::Object(snack));
+    assert_ne!(snack, fridge);
+    thumbnails.check(&game, snack);
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+#[test]
+fn a_type_without_graphics_or_interactions_has_no_catalog_item() {
+    let Some(install) = install() else {
+        return;
+    };
+    let own = Thumbnails::new(&install);
+    let mut thumbnails = sims_ui::thumbnail::Thumbnails::default();
+    // ReserveTile: no graphics, and no interaction table (0x4575a1).
+    let reserve = 0x3929_AADC;
+    thumbnails.read(&own.index, &own.catalog, reserve).unwrap();
+    assert!(own.catalog.object(reserve).is_some());
+    assert_eq!(thumbnails.item(reserve), None);
+    // The fridge has graphics and its thumbnail.
+    let fridge = 0x675C_18AF;
+    thumbnails.read(&own.index, &own.catalog, fridge).unwrap();
+    let item = thumbnails.item(fridge).expect("the fridge's item");
+    assert_eq!(item.thumbnail.as_ref(), Some(&own.thumbnail(fridge)));
+}
+
+/// Object types' own thumbnails, read from the install apart from the
+/// game's reading.
+struct Thumbnails {
+    index: sims_content::Index,
+    catalog: sims_content::Catalog,
+}
+
+impl Thumbnails {
+    fn new(install: &std::path::Path) -> Self {
+        let install = sims_content::Install::detect(install).unwrap();
+        let index = sims_content::Index::build(&install).unwrap();
+        let catalog = sims_content::Catalog::build(&index).unwrap();
+        Self { index, catalog }
+    }
+
+    /// The `BMP_` of `guid`'s catalog strings ID, for a single-tile type.
+    fn thumbnail(&self, guid: u32) -> sims_formats::bitmap::Image {
+        use sims_formats::behavior::ObjectDefinition;
+        use sims_formats::iff::Iff;
+        let object = self.catalog.object(guid).expect("a known type");
+        let iff = Iff::parse(self.index.resources[object.resource].read().unwrap()).unwrap();
+        let definition =
+            ObjectDefinition::parse(iff.data(iff.get(b"OBJD", object.chunk).unwrap())).unwrap();
+        assert_eq!(definition.master_id, 0);
+        let chunk = iff.get(b"BMP_", definition.catalog).expect("a thumbnail");
+        let image = sims_formats::bitmap::bmp(iff.data(chunk)).unwrap();
+        assert_eq!([image.width, image.height], [74, 37]);
+        image
+    }
+
+    /// The first icon shows `guid`'s thumbnail's left cell, 4 pixels in.
+    fn check(&self, game: &Game, guid: u32) {
+        let thumbnail = self.thumbnail(guid);
+        let icon = &game.queue().icons[0];
+        let canvas = game.canvas();
+        for [dx, dy] in [[12, 12], [22, 22], [30, 18], [18, 33], [33, 33], [8, 25]] {
+            let x = usize::try_from(icon.rect.x + dx).unwrap();
+            let y = usize::try_from(icon.rect.y + dy).unwrap();
+            let [r, g, b, _] = thumbnail
+                .pixel(
+                    u32::try_from(dx - 4).unwrap(),
+                    u32::try_from(dy - 4).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                canvas.color[y * canvas.width + x],
+                [r, g, b],
+                "type 0x{guid:08X} at ({dx}, {dy})"
+            );
+        }
+    }
+}
+
 /// Play mode, through the window: the player orders a snack from the
 /// fridge's pie and then the plant's Water from its pie. The water waits
 /// behind the snack, its icon second. A press on the queued water's icon
@@ -1360,7 +1462,7 @@ fn the_personality_panel_shows_the_selected_goths_traits() {
             .panel()
             .iter()
             .filter_map(|item| match item.kind {
-                Kind::Personality(values) => Some(values),
+                Kind::Personality { traits, .. } => Some(traits),
                 _ => None,
             })
             .collect();
@@ -1713,7 +1815,7 @@ fn a_press_on_the_selected_goths_portrait_centres_him_after_a_long_scroll() {
 /// and chose it before 202. The window, given the same input between the
 /// same ticks in strict mode, matched the recording's full state after
 /// every update from 1 to 453 but for two things the input does not
-/// change (see docs/decisions.md). This pins what the recording showed
+/// change (see docs/decisions/). This pins what the recording showed
 /// the input doing: Mortimer's last result after each step, and what the
 /// fridge's check trees left in his frames when the snack starts.
 #[test]
