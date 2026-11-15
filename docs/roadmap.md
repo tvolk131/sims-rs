@@ -1934,8 +1934,12 @@ Progress:
   rose from 85.2% to 86.1% exact and far zoom at rotation 2 from 89.9%
   to 90.1%. Pools on walls (the file's wall tables) are read in part,
   not ported.
+- Done: lamp pools on straight walls, from `lightMap.dat`'s wall
+  tables (grass takes none in the original). Far zoom at rotation 2
+  rose from 90.1% to 90.3% exact; of the pixels they change, 70% now
+  match exactly and the rest are mostly a step off.
 - Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
-  grass and a light sprite in the original); lamp pools on walls; the
+  grass and a light sprite in the original); the
   edge-on texel offset and side; a screenshot with a marked edge-on
   diagonal; upper-level depth.
 
