@@ -7,6 +7,10 @@
 //!   only its alpha is used, as a mask. A wall's *pattern* (wallpaper) is
 //!   the SPR# `id` plus 1536, 1792 or 2048 by zoom. Each has four frames:
 //!   the two edge directions, then the two diagonals.
+//! - The wood trim along the top of walls is SPR# 4096 to 4098 by zoom for
+//!   standing walls and 5120 to 5122 for cut ones (6144 to 6146 hold their
+//!   depth), each with its own palette: 46 frames, one per way the walls
+//!   meeting at a corner can run (the original's 0x53c227).
 //! - Objects are drawn from their definition's draw groups (DGRP) and SPR2
 //!   sprites, found through the content catalog by GUID.
 //!
@@ -74,6 +78,7 @@ pub struct Assets {
     shapes: BTreeMap<(u16, bool, usize), Option<[Image; 4]>>,
     groups: BTreeMap<(usize, u16, u32, usize), Vec<Part>>,
     object_shapes: BTreeMap<(usize, u16, bool, usize), Option<[Image; 4]>>,
+    trims: BTreeMap<(bool, usize), Vec<Image>>,
 }
 
 impl Assets {
@@ -96,6 +101,7 @@ impl Assets {
             shapes: BTreeMap::new(),
             groups: BTreeMap::new(),
             object_shapes: BTreeMap::new(),
+            trims: BTreeMap::new(),
         })
     }
 
@@ -159,6 +165,26 @@ impl Assets {
                 })
             })
             .as_ref()
+    }
+
+    /// The wall-top trim frames at a zoom, for standing or cut walls. Empty
+    /// if the game lacks them.
+    pub fn trim(&mut self, cut: bool, zoom: usize) -> &[Image] {
+        let walls = &self.walls;
+        self.trims.entry((cut, zoom)).or_insert_with(|| {
+            let id = if cut { 5120 } else { 4096 } + zoom as u16;
+            let Some(chunk) = walls.get(b"SPR#", id) else {
+                return Vec::new();
+            };
+            let data = walls.data(chunk);
+            let Ok(set) = LegacySpriteSet::parse(data) else {
+                return Vec::new();
+            };
+            (0..set.frames.len())
+                .map(|i| set.decode(data, i, walls).map(Image::from))
+                .collect::<std::result::Result<_, _>>()
+                .unwrap_or_default()
+        })
     }
 
     /// The parts of an object's definition the renderer uses.
