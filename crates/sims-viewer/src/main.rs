@@ -351,8 +351,10 @@ impl ApplicationHandler for Viewer {
                     redraw = true;
                 }
                 // The cutaway follows the rooms the pointer passes over;
-                // the original looks only while the cutaway is on.
-                if self.drag.is_none() && self.view.camera.walls == Walls::Cutaway {
+                // the original looks only while the cutaway is on, and
+                // only over the lot's view, not its panel.
+                let over_panel = self.hud.as_ref().is_some_and(|h| h.covers(point));
+                if self.drag.is_none() && !over_panel && self.view.camera.walls == Walls::Cutaway {
                     let camera = self.view.camera;
                     self.view.camera.focus.point(&self.lot, &camera, point);
                     redraw |= self.view.camera.focus != camera.focus;
