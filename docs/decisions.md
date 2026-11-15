@@ -4,6 +4,21 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: The game runs the lot in play mode
+
+`sims-game` steps the lot with `Lot::step_play`, not `Lot::step`: an
+object whose tick fails is reset (as the original resets an object after
+a SimAntics error) and the lot goes on, so a human can play past the
+first unported primitive. Each error caught is printed and written
+across the top for 200 ticks (10 s at normal speed) with a running
+count; the first 256 are kept in a list, later ones only counted. A
+failure play mode does not catch still stops the lot, as before.
+`--strict` (`Options::strict`) steps with `Lot::step` and stops at the
+first error, for looking at exactly what the captures check. A lot
+played this way is not one to compare with the original. This replaces
+the strict-mode half of "The game paces the lot itself, and runs it
+strictly"; the pacing half stands.
+
 ## 2026-11-15: Play mode resets an object after its error; strict mode is unchanged
 
 For a playable lot, `Lot::step_play` (and `sims boot --play`) catches a

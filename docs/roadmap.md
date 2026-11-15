@@ -1969,14 +1969,17 @@ through their public interfaces only; the simulation never depends on it.
 
 - **Done: the window.** `cargo run --release -p sims-game` boots the
   Goths' house (`SIMS_INSTALL`, `House05.iff`, answering No to the Help
-  System) and runs it in strict mode, a tick every 50 ms at normal
+  System) and runs it in play mode, a tick every 50 ms at normal
   speed. The lot, the people over it and the panel over both are drawn
   every tick; the clock, funds and needs on the panel are the live
   world's. The panel's speed, pause and camera buttons work (the game
   paces the lot; the simulation's own speed global is not touched).
-  When a step fails, the lot stays on screen as it was and the failure
-  is written across the top: today that is tick 878, where the hour
-  turns. `--png <file> --ticks N` draws one frame without a window.
+  An object whose tick fails is reset and the lot goes on; the error is
+  printed and shown across the top for a while (`--strict` stops at the
+  first error instead). A failure play mode does not catch stops the
+  lot, which stays on screen as it was with the failure across the top:
+  today that is tick 878, where the hour turns. `--png <file> --ticks
+  N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
   default device (on macOS; elsewhere with the `sound` feature, so CI
   needs no audio library; `--mute` turns it off). A thread renders
@@ -1985,9 +1988,9 @@ through their public interfaces only; the simulation never depends on it.
   scripts' speed register follows the game's speed. What plays waits on
   the simulation's sound events.
 - **Next:** pie menus and player orders, once the simulation's hooks
-  land: a play-mode step that resets an object on a script error, a
-  `Lot` API to queue an interaction (person, object, TTAB entry) and
-  read an object's pie-menu entries, and sound events drained each tick.
+  land: a `Lot` API to queue an interaction (person, object, TTAB entry)
+  and read an object's pie-menu entries, and sound events drained each
+  tick.
 - **Needs from other crates:**
   - `sims-render`: which object drew each pixel (an object ID buffer
     beside the depth), so a click picks the object under it. Today

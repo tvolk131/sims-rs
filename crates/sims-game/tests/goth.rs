@@ -25,6 +25,7 @@ fn options(install: PathBuf) -> Options {
         house: goth_house(&install),
         install,
         answers: vec![3],
+        strict: false,
     }
 }
 

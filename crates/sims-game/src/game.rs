@@ -2,10 +2,14 @@
 //! speed asks, drawn with its people and the live-mode panel, and the
 //! player's presses turned into what they ask for.
 //!
-//! The simulation runs in strict mode: the first step that fails stops
-//! the lot, which stays on screen as the failure left it, with the
-//! failure written across the top. Usually that is the first thing the
-//! simulation does not do yet.
+//! The simulation runs in play mode ([`Lot::step_play`]): an object whose
+//! tick fails, usually on something the simulation does not do yet, is
+//! reset as the original resets an object after a SimAntics error, and
+//! the lot goes on. Each error caught is logged and shown across the top
+//! for a while. A failure play mode does not catch stops the lot, which
+//! stays on screen as the failure left it, with the failure written
+//! across the top. [`Options::strict`] steps with [`Lot::step`] instead,
+//! which stops at the first error of any kind.
 
 use crate::hud::Hud;
 use crate::pace::Pace;
@@ -15,10 +19,18 @@ use crate::view::{Move, View};
 use sims_render::{Canvas, Selected, Walls, open_house};
 use sims_ui::command::{Camera as UiCamera, Command, Walls as UiWalls};
 use sims_vm::boot::{Frames, Lot, StepError};
+use sims_vm::play::{Recovery, ScriptError};
 use std::path::{Path, PathBuf};
 
 /// The room word of an object in no room.
 const NO_ROOM: i16 = -5;
+
+/// How many ticks an error caught stays across the top: 10 seconds at
+/// normal speed.
+const SHOWN_TICKS: u32 = 200;
+
+/// The most errors kept in the log; later ones are only counted.
+const LOGGED: usize = 256;
 
 /// What the game is started with.
 #[derive(Debug, Clone)]
@@ -31,6 +43,9 @@ pub struct Options {
     /// `sims boot --answers` (the Goths' house takes `3`, No to the Help
     /// System). The player cannot answer them yet.
     pub answers: Vec<u8>,
+    /// Step in strict mode ([`Lot::step`]), which stops the lot at the
+    /// first error, instead of play mode.
+    pub strict: bool,
 }
 
 /// What the host should do after an input.
@@ -59,8 +74,10 @@ pub struct Game {
     people: People,
     hud: Hud,
     pub pace: Pace,
+    strict: bool,
     /// Why the lot stopped, once it has.
     stopped: Option<String>,
+    errors: Errors,
     /// A short message about the last press, until the next one.
     note: Option<String>,
     canvas: Canvas,
@@ -93,7 +110,9 @@ impl Game {
             people,
             hud,
             pace: Pace::default(),
+            strict: options.strict,
             stopped,
+            errors: Errors::default(),
             note: None,
             canvas: Canvas::new(1, 1, [0, 0, 0]),
         })
@@ -115,6 +134,17 @@ impl Game {
         self.stopped.as_deref()
     }
 
+    /// The errors play mode caught and recovered from, one line each, in
+    /// order: the first [`LOGGED`], then a line saying more were caught.
+    pub fn errors(&self) -> &[String] {
+        &self.errors.lines
+    }
+
+    /// How many errors play mode caught.
+    pub fn caught(&self) -> u64 {
+        self.errors.count
+    }
+
     /// Problems drawing the people, one line each.
     pub fn problems(&self) -> &[String] {
         &self.people.problems
@@ -131,8 +161,23 @@ impl Game {
     pub fn run(&mut self, ticks: u32) -> u32 {
         let mut ran = 0;
         while ran < ticks && self.stopped.is_none() {
-            match self.lot.step() {
-                Ok(_) => ran += 1,
+            let step = if self.strict {
+                self.lot.step()
+            } else {
+                self.lot.step_play()
+            };
+            match step {
+                Ok(update) => {
+                    ran += 1;
+                    let at = self.lot.ticks();
+                    for error in &update.errors {
+                        self.errors.push(at, describe(error));
+                    }
+                    for error in &update.frame_errors {
+                        self.errors
+                            .push(at, format!("a frame was skipped: {error}"));
+                    }
+                }
                 Err(error) => self.stop(&error),
             }
         }
@@ -161,10 +206,14 @@ impl Game {
         });
     }
 
-    /// The status line across the top: why the lot stopped, else the
-    /// last press's note.
+    /// The status line across the top: why the lot stopped, else the last
+    /// error caught for a while after it, then the last press's note.
     fn status(&self) -> Option<String> {
-        match (&self.stopped, &self.note) {
+        let stopped = self
+            .stopped
+            .clone()
+            .or_else(|| self.errors.recent(self.lot.ticks()));
+        match (&stopped, &self.note) {
             (Some(stop), Some(note)) => Some(format!("{stop}  —  {note}")),
             (Some(line), None) | (None, Some(line)) => Some(line.clone()),
             (None, None) => None,
@@ -325,8 +374,137 @@ impl Game {
     }
 }
 
+/// The errors play mode caught.
+#[derive(Debug, Default)]
+struct Errors {
+    /// One line each, the first [`LOGGED`], then one saying more came.
+    lines: Vec<String>,
+    /// How many were caught, listed or not.
+    count: u64,
+    /// The last caught and the tick count after the step that caught it.
+    last: Option<(u32, String)>,
+}
+
+impl Errors {
+    fn push(&mut self, at: u32, line: String) {
+        self.count += 1;
+        if self.lines.len() < LOGGED {
+            self.lines.push(line.clone());
+        } else if self.lines.len() == LOGGED {
+            self.lines
+                .push("further errors are counted, not listed".into());
+        }
+        self.last = Some((at, line));
+    }
+
+    /// The line across the top at tick count `now`: the last error, for
+    /// [`SHOWN_TICKS`] after it was caught.
+    fn recent(&self, now: u32) -> Option<String> {
+        let (at, line) = self.last.as_ref()?;
+        if now.saturating_sub(*at) >= SHOWN_TICKS {
+            return None;
+        }
+        let count = match self.count {
+            1 => String::new(),
+            n => format!(" ({n} so far)"),
+        };
+        Some(format!("Error caught{count}: {line}"))
+    }
+}
+
+/// One line for an error play mode caught: when, what failed, and what
+/// was done about it.
+fn describe(error: &ScriptError) -> String {
+    let place = if error.in_thread {
+        ""
+    } else {
+        " outside its thread"
+    };
+    let then = error
+        .then
+        .as_ref()
+        .map(|then| format!("; then, outside its thread, {then}"))
+        .unwrap_or_default();
+    let recovery = match &error.recovery {
+        Recovery::Reset => "it was reset".to_string(),
+        Recovery::Restarted(fault) => {
+            format!("its reset failed ({fault}), so its thread restarted at Main")
+        }
+        Recovery::Parked(None) => "it failed again after a reset, so it stops".to_string(),
+        Recovery::Parked(Some(fault)) => {
+            format!("restarting its thread failed ({fault}), so it stops")
+        }
+    };
+    format!(
+        "tick {}, object {}{place}: {}{then}; {recovery}",
+        error.tick, error.object, error.fault
+    )
+}
+
 /// The Goths' house in an install at `root`, the house the boot goal
 /// checks against the original.
 pub fn goth_house(root: &Path) -> PathBuf {
     root.join("UserData/Houses/House05.iff")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sims_vm::{Fault, Location, Trap};
+
+    fn fault(object: u16) -> Fault {
+        Fault {
+            object,
+            at: Some(Location {
+                tree: 0x1002,
+                node: 7,
+            }),
+            trap: Trap::Unimplemented { opcode: 0x2a },
+        }
+    }
+
+    #[test]
+    fn an_error_says_what_failed_and_what_was_done() {
+        let mut error = ScriptError {
+            tick: 900,
+            object: 12,
+            fault: fault(12),
+            in_thread: true,
+            then: None,
+            recovery: Recovery::Reset,
+        };
+        let line = describe(&error);
+        assert!(line.starts_with("tick 900, object 12: object 12, tree 0x1002 node 7"));
+        assert!(line.ends_with("; it was reset"), "{line}");
+        error.in_thread = false;
+        error.then = Some(fault(13));
+        error.recovery = Recovery::Parked(None);
+        let line = describe(&error);
+        assert!(line.starts_with("tick 900, object 12 outside its thread:"));
+        assert!(line.contains("; then, outside its thread, object 13"));
+        assert!(line.ends_with("it failed again after a reset, so it stops"));
+    }
+
+    #[test]
+    fn errors_show_for_a_while_and_the_log_is_bounded() {
+        let mut errors = Errors::default();
+        assert_eq!(errors.recent(0), None);
+        errors.push(100, "first".into());
+        assert_eq!(errors.recent(100).as_deref(), Some("Error caught: first"));
+        errors.push(110, "second".into());
+        assert_eq!(
+            errors.recent(110 + SHOWN_TICKS - 1).as_deref(),
+            Some("Error caught (2 so far): second")
+        );
+        assert_eq!(errors.recent(110 + SHOWN_TICKS), None);
+        for n in 0..LOGGED * 2 {
+            errors.push(200, n.to_string());
+        }
+        assert_eq!(errors.lines.len(), LOGGED + 1);
+        assert_eq!(errors.count, LOGGED as u64 * 2 + 2);
+        assert_eq!(
+            errors.lines.last().unwrap(),
+            "further errors are counted, not listed"
+        );
+    }
 }

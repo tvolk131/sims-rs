@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! sims-game [<install>] [<house file>] [--answers A,B,...] [--mute]
-//!           [--png <file> [--ticks N] [--size WxH]]
+//!           [--strict] [--png <file> [--ticks N] [--size WxH]]
 //! ```
 //!
 //! The install defaults to `SIMS_INSTALL`, and the house to the Goths'
@@ -15,6 +15,10 @@
 //! wheel zoom, `[`/`]` or `,`/`.` rotate, Page Up and Page Down change the
 //! floor, `1`/`2`/`3` walls up, cutaway and down, the arrows or a
 //! right-button drag scroll, space pauses, Escape quits.
+//!
+//! The lot runs in play mode: an object whose tick fails is reset and the
+//! lot goes on, and each error is printed and shown across the top for a
+//! while. `--strict` stops the lot at the first error instead.
 //!
 //! Sound plays on the default output device (on macOS, or built with the
 //! `sound` feature) unless `--mute` is given.
@@ -101,13 +105,14 @@ struct Still {
 
 fn options() -> Result<(Options, Option<Still>, bool), String> {
     let usage = "usage: sims-game [<install>] [<house file>] [--answers A,B,...] [--mute] \
-                 [--png <file> [--ticks N] [--size WxH]]";
+                 [--strict] [--png <file> [--ticks N] [--size WxH]]";
     let mut paths = Vec::new();
     let mut answers = None;
     let mut png = None;
     let mut ticks = 0;
     let mut size = [800, 600];
     let mut mute = false;
+    let mut strict = false;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         let mut text = |name: &str| -> Result<String, String> {
@@ -117,6 +122,8 @@ fn options() -> Result<(Options, Option<Still>, bool), String> {
         };
         if arg == "--mute" {
             mute = true;
+        } else if arg == "--strict" {
+            strict = true;
         } else if arg == "--png" {
             png = Some(PathBuf::from(text("--png")?));
         } else if arg == "--ticks" {
@@ -164,6 +171,7 @@ fn options() -> Result<(Options, Option<Still>, bool), String> {
             install,
             house,
             answers,
+            strict,
         },
         still,
         mute,
@@ -182,6 +190,8 @@ struct App {
     photos: usize,
     /// The stop already printed, so it is printed once.
     reported: bool,
+    /// How many of the game's caught errors are printed.
+    printed: usize,
     sound: Sound,
     /// The hour and speed the sound was last told.
     heard: Option<(u32, Speed)>,
@@ -249,6 +259,10 @@ impl App {
         let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         let ran = self.game.advance(micros);
         let mut redraw = ran > 0;
+        for error in &self.game.errors()[self.printed..] {
+            eprintln!("sims-game: error caught: {error}");
+        }
+        self.printed = self.game.errors().len();
         if !self.reported
             && let Some(stop) = self.game.stopped()
         {
@@ -453,6 +467,9 @@ fn run() -> Result<(), String> {
             "sims-game: ran {ran} ticks in {:.1} s",
             started.elapsed().as_secs_f32()
         );
+        for error in game.errors() {
+            eprintln!("sims-game: error caught: {error}");
+        }
         if let Some(stop) = game.stopped() {
             eprintln!("sims-game: {stop}");
         }
@@ -477,6 +494,7 @@ fn run() -> Result<(), String> {
         dirty: true,
         photos: 0,
         reported: false,
+        printed: 0,
         sound: Sound::start(&options.install, mute),
         heard: None,
     };
