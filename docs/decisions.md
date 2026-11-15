@@ -18,6 +18,12 @@ Down), so on the second floor the people downstairs are hidden with
 their rooms. How the original gives a person's mesh its depth is
 **unverified** (see "People's meshes go into the lot renderer's canvas").
 
+A click finds a person only on a pixel they were drawn in the last frame
+(or within 2 pixels of one), the nearest whose standing box, placed as
+`sims-people` places them, holds the click. A person hidden behind a
+bookcase no longer takes a click meant for it, and one off the lot or
+upstairs of the view is not found.
+
 ## 2026-11-15: The game's pie menu is a list of the table's entries until the simulation offers them
 
 Clicking an object (or a person) in `sims-game` lists the entries of

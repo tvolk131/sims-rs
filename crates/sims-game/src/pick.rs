@@ -12,7 +12,6 @@
 
 use sims_render::{Camera, Lot};
 use sims_sim::World;
-use sims_sim::animator::UNSET;
 
 /// How high above its tile an object is taken to reach, in storeys.
 const RISE: f32 = 0.75;
@@ -22,7 +21,7 @@ const RISE: f32 = 0.75;
 const HIDDEN: usize = 34;
 
 /// The object a press at `point` (canvas pixels) lands on, if any.
-/// People are left out: they are picked on their own.
+/// People are left out: [`crate::people::People::at`] finds them.
 pub fn object(world: &World, lot: &Lot, camera: &Camera, point: [i32; 2]) -> Option<u16> {
     let width = camera.zoom.tile_width();
     let height = camera.zoom.tile_height();
@@ -60,47 +59,6 @@ pub fn object(world: &World, lot: &Lot, camera: &Camera, point: [i32; 2]) -> Opt
         }
     }
     best.map(|(_, _, id)| id)
-}
-
-/// The person a press at `point` lands on, if any: the frontmost whose
-/// standing box (half a tile wide, most of a storey tall, over where it
-/// stands) holds the point.
-pub fn person(world: &World, lot: &Lot, camera: &Camera, point: [i32; 2]) -> Option<u16> {
-    let half = camera.zoom.tile_width() / 4;
-    let tall = (camera.zoom.floor_height() as f32 * 0.8) as i32;
-    let mut best: Option<(i32, u16)> = None;
-    for (&id, object) in &world.objects {
-        if object.person.is_none() {
-            continue;
-        }
-        let Some(animator) = world.animators.get(&id) else {
-            continue;
-        };
-        if animator.position.contains(&UNSET) {
-            continue;
-        }
-        let [x, y, _] = animator.position.map(|v| v.to_f32());
-        if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
-            continue;
-        }
-        let level = object.position[2].max(1);
-        if level > camera.level {
-            continue;
-        }
-        let fine = [x as i32, y as i32];
-        let view = camera.rotate_fine(fine);
-        let ground = terrain(lot, [x, y]) as i32;
-        let [sx, sy] = camera.project_fine(view, level, ground);
-        let (dx, dy) = (point[0] - sx, sy - point[1]);
-        if dx.abs() > half || dy < -half / 2 || dy > tall {
-            continue;
-        }
-        let near = view[0] + view[1] + 2048 * level;
-        if best.is_none_or(|b| near > b.0) {
-            best = Some((near, id));
-        }
-    }
-    best.map(|(_, id)| id)
 }
 
 /// The terrain's height under the fine position `fine`, in near-zoom

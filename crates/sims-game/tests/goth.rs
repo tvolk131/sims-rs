@@ -5,9 +5,8 @@
 use sims_game::game::goth_house;
 use sims_game::people::People;
 use sims_game::view::View;
-use sims_game::{Game, Options, pick};
+use sims_game::{Game, Options};
 use sims_render::{Canvas, open_house};
-use sims_sim::animator::UNSET;
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
@@ -83,26 +82,46 @@ fn people_stand_where_a_click_finds_them() {
         .filter(|(a, b)| a != b)
         .count();
     assert!(drawn > 200, "only {drawn} pixels of people drawn");
-    // Each placed person on the ground floor is found by a click on its
-    // feet, a little above where it stands.
-    let mut found = 0;
-    for (&id, animator) in &world.animators {
-        let Some(object) = world.objects.get(&id) else {
-            continue;
-        };
-        if object.person.is_none() || animator.position.contains(&UNSET) {
-            continue;
-        }
-        let [x, y, _] = animator.position.map(|v| v.to_f32() as i32);
-        let camera = &view.camera;
-        let ground = sims_game::pick::terrain(&shape, [x as f32, y as f32]) as i32;
-        let [sx, sy] = camera.project_fine(camera.rotate_fine([x, y]), 1, ground);
-        if (0..800).contains(&sx) && (0..600).contains(&sy) {
-            assert!(pick::person(world, &shape, camera, [sx, sy - 4]).is_some());
-            found += 1;
+    // A click on a pixel a person was drawn in finds a person; one far
+    // from every person finds none.
+    let mut found = std::collections::BTreeSet::new();
+    let changed: Vec<usize> = (0..bare.len())
+        .filter(|&i| bare[i] != canvas.color[i])
+        .collect();
+    for &i in changed.iter().step_by(7) {
+        let point = [(i % 800) as i32, (i / 800) as i32];
+        if let Some(id) = people.at(world, &view.camera, point) {
+            assert!(world.objects[&id].person.is_some(), "object {id}");
+            found.insert(id);
         }
     }
-    assert!(found > 0, "no person stands in view");
+    assert!(!found.is_empty(), "no drawn person is found by a click");
+    let far = (0..bare.len())
+        .find(|&i| {
+            let [x, y] = [(i % 800) as i32, (i / 800) as i32];
+            changed.iter().all(|&j| {
+                let [cx, cy] = [(j % 800) as i32, (j / 800) as i32];
+                (cx - x).abs() > 20 || (cy - y).abs() > 20
+            })
+        })
+        .expect("a pixel far from every person");
+    assert_eq!(
+        people.at(
+            world,
+            &view.camera,
+            [(far % 800) as i32, (far / 800) as i32]
+        ),
+        None
+    );
+    // Behind a lot nearer than everyone, nobody is drawn, and a click
+    // where they stand finds nobody.
+    let mut covered = Canvas::new(800, 600, [0, 0, 0]);
+    covered.depth.fill(i32::MIN);
+    people.draw(world, &view.camera, &mut covered);
+    for &i in changed.iter().step_by(7) {
+        let point = [(i % 800) as i32, (i / 800) as i32];
+        assert_eq!(people.at(world, &view.camera, point), None, "{point:?}");
+    }
 }
 
 #[test]
