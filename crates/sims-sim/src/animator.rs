@@ -418,7 +418,74 @@ impl Fade {
     };
 }
 
+/// What a person's skin holds from the load while it has sampled no layer
+/// since ([`crate::World::held_poses`]).
+///
+/// The load reads the animator's three saved layers (0x5918ba: the
+/// foreground +0xc, the carry slot +0x13c and the base slot +0x14, each
+/// through 0x591eec), updates the skin with them at once (0x5992b3,
+/// forced) and places the animator on the person's tile (0x592132). The
+/// person's reset then takes the layers out of the skin (0x589220,
+/// 0x592878) but not what they posed: the skin keeps those bones until a
+/// layer it samples writes them again (0x5992b3 does not put the bones
+/// back at rest). The skin's model matrix stays the placement's until the
+/// animator is placed again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldPose {
+    /// The restored layers, in the order the skin sampled them: by
+    /// priority, lowest first, and in the order they were read (the
+    /// foreground, the carry slot, the base slot) for the same priority
+    /// (0x599128, 0x5991fd).
+    pub layers: Vec<Layer>,
+    /// Where the load placed the animator (+0x80, +0x84, +0x88): the
+    /// person's position and direction then.
+    pub position: [F32; 3],
+}
+
 impl Layer {
+    /// A layer as the skin makes it (0x597874: 0x5978ef, then 0x597a88)
+    /// for a clip at `priority`, `speed` and `weight` and clock `now`: at
+    /// the clip's start (phase 0), to repeat at its end (end mode 1), not
+    /// fading. `frames` is the frame count of the clip's first motion,
+    /// `bound` says whether a motion binds to a bone of the skeleton, and
+    /// `tracks` is how many motions have timed events.
+    #[allow(clippy::too_many_arguments)]
+    pub fn make(
+        clip: &str,
+        clip_duration: F32,
+        frames: u32,
+        bound: bool,
+        tracks: usize,
+        priority: i32,
+        speed: F32,
+        weight: F32,
+        now: i32,
+    ) -> Self {
+        let mut layer = Self {
+            clip: clip.to_owned(),
+            clip_duration,
+            bound,
+            priority,
+            current: now,
+            previous: now,
+            duration: F32::ZERO,
+            speed: F32::ZERO,
+            phase: F32::ZERO,
+            weight,
+            event_time: 0,
+            previous_event_time: 0,
+            frames,
+            ended: false,
+            mode: 1,
+            fading: false,
+            interruptible: -1,
+            cursors: vec![0; tracks],
+            fade: Fade::NEW,
+        };
+        layer.set_speed(speed);
+        layer
+    }
+
     /// A new layer (0x5978ef, then 0x597a88 from 0x592726): priority 1,
     /// weight 1, at the clip's start or, backward, at its end, stopped
     /// at the end of the clip. `frames` is the frame count of the clip's

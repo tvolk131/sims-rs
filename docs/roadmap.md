@@ -75,7 +75,9 @@ events, and what it asks for after them) come first.
   first; at tick 6756 a pet is made (the expansions installed allow
   pets) and walks, runs and turns at its own pace; an inventory count
   goes up at 7702 and a route with no door gives up at 9337. Past tick
-  1000 this is unverified: there is no capture. At tick 9907 object 5
+  1000 this is unverified: there is no capture. In a live run of the
+  original Cassandra walks to the school bus at 8:06 AM, while ours keeps
+  her on the bench, a gap in the simulation's timing. At tick 9907 object 5
   walks the neighborhood's lots in order of distance (Set To Next mode
   11), which needs a lot-position table the simulation does not hold
   (the snack order stops on it at the same step). Step 2 continues from
@@ -93,22 +95,30 @@ events, and what it asks for after them) come first.
   (Create New Object Instance mode 6, flag 0x4), unverified past update
   935. The frame drawn after tick 4053 finds person 140's skin waiting
   for its update (0x590d26), which is not ported.
-- The Pleasants (`House06.iff` as the original saved it after moving
-  them in, with the Traveling Salesman on the lot) load to the state the
-  first tick starts from: the end of the household selection works out
-  again who is a visitor, and reading the people raises the action
-  serial. Their load equals the capture's but for one person's data word
-  50 and last result, which something in the original's load sets and
-  which is not found yet. The first frame then stops: person 242's head
-  follows person 241, whose animator has never been ticked or drawn, and
-  what the original reads for it is not ported.
+- Before #208's animator restore, the Pleasants (`House06.iff` as the
+  original saved it after moving them in, with the Traveling Salesman on
+  the lot) loaded to the state the first tick starts from: the end of
+  the household selection works out again who is a visitor, and reading
+  the people raises the action serial. That load equals the capture's
+  but for one person's data word 50 and last result, which something in
+  the original's load sets and which is not found yet. The load now
+  restores a reset person's animator and the pose its saved layers left
+  in the skin (0x5918ba, #208). No Pleasant's type changed since the
+  save, so the load resets none of them, and their animators keep what
+  the restore read: clips playing on from their saved phase, saved
+  routing states and route contexts. That is not ported, so the load
+  stops on person 117. Next: the live animator restore for persons the
+  load does not reset (the Pleasants, the Roomies). **Unverified:** the
+  restored target point's height differs from the capture's in the last
+  place (0x4187338d here, 0x4187338e there); nothing reads it before the
+  next measurement writes it.
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
   read their arrays whole (Arry 11, 12, 111 and 112). Their floor
   and wall maps are renumbered through the game's pattern catalogs
   (`sims_content::Surfaces`, `World::renumber_surfaces`). UserData2's
-  house 9 then stops at the first frame (a bone last turned by a layer
-  no longer playing, 0x5992b3), the houses with no family stop at the
+  house 9 then gets past its first frame and stops at tick 232 on Snap
+  mode 0 (0x4549c7), which has its own PR; the houses with no family stop at the
   household selection, and the community lots (UserData's houses 40 to
   48) where Create New Object Instance mode 6 makes a person (0x44e60e).
   Four types grow their attribute arrays to the saved count (0x4342ae). The templates' `Patch` families are not
@@ -1876,11 +1886,18 @@ Progress:
   original's own light for it. A gated test checks it covers the pixels
   the original's does in a screenshot, within a pixel. The date and star
   bobs are not drawn, and only rotation 0 was compared.
-- Next: compare a person behind furniture with the original; a person on
-  an upper level stands at the floor, without the original's offset.
-  Match the original's lighting (see its decisions entry); compare
-  Mortimer standing without his book. The plumb bob over the selected
-  Sim (the head slot's object) is not drawn.
+- Done: a person on an upper level stands on the terrain under them, as
+  the floor there does (0x592132, #206). Checked against the original
+  at 7:29 AM, within a pixel or two. **Unverified:** the view table's
+  per-level offset is not ported; the floor height matched it at medium
+  zoom, rotation 0, and other zooms and rotations are unchecked.
+- Over 7:29 to 8:11 AM the Goths are drawn as the original draws them
+  (reading on the bench and sofa, sitting, Mortimer's lab coat, the
+  bus). Eating and sleeping fall outside that span and wait on track 2's
+  Goth day recording.
+- Next: compare a person behind furniture with the original. Match the
+  original's lighting (see its decisions entry); compare Mortimer
+  standing without his book.
 - Done: a person's base layer is the simulation's (`World::base_layers`):
   the posture's loop or a script's clip, at the phase the simulation
   advanced it to. Over the Goths' first 3,400 ticks a person is seated

@@ -189,11 +189,27 @@ impl Interpreter<'_> {
     /// objects; an object or a multi-tile lead without a definition; saved
     /// attributes beyond what the constructor allocates, for a type the
     /// house read does not let grow (`GROWN`); a person type with
-    /// no skeleton in `people`; and a person with no neighborhood record,
-    /// for which the original makes one.
+    /// no skeleton in `people`; a person with no neighborhood record,
+    /// for which the original makes one; and a person whose saved
+    /// animator the restore does not port (`crate::restore`), among them
+    /// every person whose type's scripts did not change since the save,
+    /// which load step 13 does not reset.
+    ///
+    /// Each person's animator is restored as far as the simulation reads
+    /// it (`crate::restore`): what differs from
+    /// [`sims_sim::animator::LOADED`] goes into [`World::animators`], and
+    /// the pose its saved layers left in the skin into
+    /// [`World::held_poses`].
+    ///
+    /// A person saved part way through a route keeps only the number of
+    /// its route contexts; the load makes that many, each as its default
+    /// constructor makes it
+    /// ([`crate::routing::slot::loaded_context`], 0x460443), and the
+    /// first run of the route's steps pops it (0x45ae71). A negative
+    /// count fails.
     ///
     /// Not modeled: object flags (the constructor sets 0x200 and the read
-    /// 0x80), each person's animator and its saved animations, the count
+    /// 0x80), the count
     /// of queued interactions the game keeps, and graphics for objects
     /// that have their own (definition byte 0xcc bit 0), which fail.
     ///
@@ -249,6 +265,47 @@ impl Interpreter<'_> {
             order.push(id);
         }
         let next_parts = link_parts(&objects, &order).map_err(|(id, trap)| fail(id, trap))?;
+        // Each person's animator, as its read restores it (0x5918ba) and
+        // the person's reset in load step 13 leaves it.
+        let mut animators = BTreeMap::new();
+        let mut held_poses = BTreeMap::new();
+        for &id in &order {
+            let restored = self
+                .restore_animator(
+                    id,
+                    &objects[&id],
+                    world.ticks,
+                    world.changed_types.contains(&objects[&id].guid),
+                )
+                .map_err(|trap| fail(id, trap))?;
+            if let Some(a) = restored.animator {
+                animators.insert(id, a);
+            }
+            if let Some(held) = restored.held {
+                held_poses.insert(id, held);
+            }
+        }
+        // Each person's route contexts: as many as the save counts, each
+        // as the load makes it (0x460443). A negative count, which the
+        // original's resize would take as erasing before the start, fails.
+        let mut contexts = BTreeMap::new();
+        for &id in &order {
+            let Some(person) = objects[&id].person.as_ref() else {
+                continue;
+            };
+            let frames = usize::try_from(person.routing_frames).map_err(|_| {
+                fail(
+                    id,
+                    Trap::Unsupported(format!(
+                        "the person's saved route context count is {} (0x460443)",
+                        person.routing_frames
+                    )),
+                )
+            })?;
+            if frames != 0 {
+                contexts.insert(id, vec![crate::routing::slot::loaded_context(); frames]);
+            }
+        }
         let count = draws.count;
         world.crt_rng = crt;
         world.skeleton_files = files;
@@ -261,6 +318,11 @@ impl Interpreter<'_> {
         world.order = order.clone();
         world.people = world.registered_people();
         world.next_parts = next_parts;
+        world.animators.extend(animators);
+        world.held_poses.extend(held_poses);
+        for (id, contexts) in contexts {
+            world.routing.routes.entry(id).or_default().contexts = contexts;
+        }
         // 0x41f320: reading an interaction (a person's running one, its
         // last one and each queued one: 0x45d012, 0x45d01f, 0x45d08b)
         // raises the action serial to its number when that is larger,

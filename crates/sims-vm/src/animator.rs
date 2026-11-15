@@ -241,21 +241,42 @@ impl Interpreter<'_> {
             self.update_carry(world, id, a, now)?;
         }
         a.skin_clock = now;
-        self.note_translations(world, id, a)
+        // The pose the load left (World::held_poses) lasts until the skin
+        // samples a layer: from here the bones are what the layers playing
+        // now write, and what they do not write is what the load's layers
+        // left, which is no longer kept. The bones those moved count as
+        // moved since the skin was made.
+        if (a.base.is_filled() || a.foreground.is_some() || a.carry.is_some())
+            && let Some(held) = world.held_poses.remove(&id)
+        {
+            let moved = self.translated_by(id, held.layers.iter())?;
+            Self::note_moved(world, id, moved);
+        }
+        let base = world.base_layers.get(&id);
+        let moved = self.translated_by(
+            id,
+            [base, a.foreground.as_ref(), a.carry.as_ref()]
+                .into_iter()
+                .flatten(),
+        )?;
+        Self::note_moved(world, id, moved);
+        Ok(())
     }
 
-    /// Notes in [`World::translated_bones`] the bones whose translation a
-    /// layer of person `id`'s skin could have written at its update:
-    /// every motion with positions of each layer with something bound,
-    /// frames and weight (0x597c4c, 0x598226). The original samples only
-    /// when its update is asked to pose (0x59820a), and a motion's
-    /// positions only up to the clip's count; neither is told apart here,
-    /// so the set may hold more than the original moved.
-    fn note_translations(&self, world: &mut World, id: u16, a: &Animator) -> Result<(), Trap> {
-        let base = world.base_layers.get(&id);
-        let layers = [base, a.foreground.as_ref(), a.carry.as_ref()];
+    /// The bones whose translation a layer of person `id`'s skin could
+    /// write at its update, for [`World::translated_bones`]: every motion
+    /// with positions of each of `layers` with something bound, frames and
+    /// weight (0x597c4c, 0x598226). The original samples only when its
+    /// update is asked to pose (0x59820a), and a motion's positions only
+    /// up to the clip's count; neither is told apart here, so the set may
+    /// hold more than the original moved.
+    fn translated_by<'l>(
+        &self,
+        id: u16,
+        layers: impl Iterator<Item = &'l Layer>,
+    ) -> Result<Vec<String>, Trap> {
         let mut moved = Vec::new();
-        for layer in layers.into_iter().flatten() {
+        for layer in layers {
             if !layer.bound || layer.frames == 0 || layer.weight.ext() <= Ext::ZERO {
                 continue;
             }
@@ -269,19 +290,21 @@ impl Interpreter<'_> {
                 clip.channels
                     .iter()
                     .filter(|c| c.translation.is_some())
-                    .map(|c| &c.bone),
+                    .map(|c| c.bone.clone()),
             );
         }
+        Ok(moved)
+    }
+
+    /// Notes `moved` in person `id`'s [`World::translated_bones`].
+    fn note_moved(world: &mut World, id: u16, moved: Vec<String>) {
         if moved.is_empty() {
-            return Ok(());
+            return;
         }
         let known = world.translated_bones.entry(id).or_default();
         for bone in moved {
-            if !known.contains(bone) {
-                known.insert(bone.clone());
-            }
+            known.insert(bone);
         }
-        Ok(())
     }
 
     /// Person `id`'s animator refresh as a take-off makes it when the
@@ -516,6 +539,11 @@ const REDISPATCH: usize = 16;
 const NAMES: u16 = 150;
 const CHILD_NAMES: u16 = 151;
 const ADULT_NAMES: u16 = 152;
+/// The tables for a person whose word 64 is set (in a pool, 0x58da12),
+/// at indices 10 to 12 (0x59d974): the adult's by sex (158, 159), then
+/// the child's (160).
+const POOL_NAMES: u16 = 158;
+const POOL_CHILD_NAMES: u16 = 160;
 /// The type's own table of clip names, read first (0x457b84: STR# 0x96
 /// of the definition's file).
 const OWN_NAMES: u16 = 150;
@@ -1118,10 +1146,15 @@ impl Interpreter<'_> {
     }
 
     /// The name of one of the posture's clips (0x59db2f), counted from 0:
-    /// the type's own table first; then, for a person whose word 64 is
-    /// set, the special tables (not ported); then the global table for the
-    /// person's age (word 58 at most 17) or, for an adult, sex (bit 0 of
-    /// word 65); then the global table 150. An empty name counts as none.
+    /// the type's own table first; then the global table for the person's
+    /// age (word 58 at most 17) or, for an adult, sex (bit 0 of word 65);
+    /// then the global table 150. An empty name counts as none.
+    ///
+    /// For a person whose word 64 is set (in a pool) the pool's table for
+    /// its age or sex (158, 159, 160) comes first instead, and the type's
+    /// own table is not used: the lookup there replaces the own table's
+    /// name whatever it finds (0x59dba7 to 0x59dbbc), and when it finds
+    /// none the lookup goes on to the global tables (0x59dbba, 0x59dbbe).
     /// The old prototype's `posture_name`
     /// (legacy/crates/sims-vm/src/animation.rs) reads the same tables.
     pub(crate) fn posture_clip(
@@ -1130,12 +1163,7 @@ impl Interpreter<'_> {
         id: u16,
         selection: usize,
     ) -> Result<Option<String>, Trap> {
-        if person_word(world, id, SPECIAL)? != 0 {
-            return Err(unsupported(
-                "0x59db44",
-                "names a clip for a person whose word 64 is set",
-            ));
-        }
+        let pool = person_word(world, id, SPECIAL)? != 0;
         let object = world
             .objects
             .get(&id)
@@ -1152,15 +1180,25 @@ impl Interpreter<'_> {
                 .filter(|name| !name.is_empty())
                 .cloned()
         };
-        if let Some(name) = lookup(definition.resource, OWN_NAMES) {
+        let child = person_word(world, id, AGE)? <= 17;
+        let global = self.program.global;
+        if pool {
+            let table = if child {
+                POOL_CHILD_NAMES
+            } else {
+                POOL_NAMES + (person_word(world, id, KIND)? as u16 & 1)
+            };
+            if let Some(name) = lookup(global, table) {
+                return Ok(Some(name));
+            }
+        } else if let Some(name) = lookup(definition.resource, OWN_NAMES) {
             return Ok(Some(name));
         }
-        let table = if person_word(world, id, AGE)? <= 17 {
+        let table = if child {
             CHILD_NAMES
         } else {
             ADULT_NAMES + (person_word(world, id, KIND)? as u16 & 1)
         };
-        let global = self.program.global;
         Ok(lookup(global, table).or_else(|| lookup(global, NAMES)))
     }
 
