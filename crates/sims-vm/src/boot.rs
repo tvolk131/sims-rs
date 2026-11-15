@@ -328,6 +328,14 @@ pub struct Menu {
     pub sounds: Vec<crate::SoundEvent>,
 }
 
+/// What [`Lot::highlight`] did: the entry's action as the check left it,
+/// and the check tree's requests to the sound system.
+#[derive(Debug, Clone)]
+pub struct Highlight {
+    pub action: sims_formats::saved_objects::Interaction,
+    pub sounds: Vec<crate::SoundEvent>,
+}
+
 /// What [`Lot::cancel`] did: whether the press counts, and the trees'
 /// requests to the sound system.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -859,6 +867,36 @@ impl Lot {
         self.world = world;
         Ok(Menu {
             entries,
+            sounds: sounds.into_inner(),
+        })
+    }
+
+    /// Checks again the action of the pie menu's entry the pointer has
+    /// reached ([`Interpreter::highlight`], 0x48df28). Call it between
+    /// steps when the pointer reaches an entry of an open menu: the check
+    /// tree changes the lot, so a recording of play must note each call.
+    /// Returns the action as the check left it, and the requests to the
+    /// sound system its tree made. A check that fails on something not
+    /// ported changes nothing, as for [`Lot::pie_menu`].
+    pub fn highlight(
+        &mut self,
+        person: u16,
+        action: sims_formats::saved_objects::Interaction,
+    ) -> Result<Highlight, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let action = interpreter
+            .highlight(&mut world, person, action)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        Ok(Highlight {
+            action,
             sounds: sounds.into_inner(),
         })
     }
