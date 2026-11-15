@@ -993,7 +993,8 @@ impl<S: Samples> Player<S> {
     /// [`crate::ambience::Fresh::set_paused`]). A held track's threads
     /// do not run or fade, and its notes stay where they are, silent. A
     /// track started while paused plays: starting a track (0x57d960)
-    /// clears its hold. The original also stops its day and night
+    /// clears its hold, and a held track whose script still runs is let
+    /// go rather than started again. The original also stops its day and night
     /// loop (0x574978), which this player does not have.
     pub fn pause(&mut self) {
         self.paused = true;
@@ -1227,17 +1228,49 @@ impl<S: Samples> Player<S> {
             self.report(format!("no track {track}"));
             return false;
         };
+        // *(code)* Starting a track the pause holds while its script runs
+        // does not start it again (0x57d9f1 to 0x57da12): it lets it go
+        // (vtable +0x5c), so the script goes on from where it was, its
+        // wait ended, with the new object in its argument register.
+        if self.held.remove(&track) && self.resume_held(object, module, track) {
+            return true;
+        }
         let Some(thread) = self.thread(object, module, track) else {
             return false;
         };
-        // *(code)* Starting a track (0x57d960) clears its hold.
-        self.held.remove(&track);
         if defer {
             self.pending.push(thread);
         } else {
             self.threads.push(thread);
         }
         true
+    }
+
+    /// Lets a held track's running threads go on, as starting it does
+    /// (see [`Player::start`]): each one's wait ends and, for a track
+    /// whose arguments are `kArgsIdVolPan`, register 1 takes the object.
+    /// False when none of the track runs, so it is started anew.
+    fn resume_held(&mut self, object: u32, module: usize, track: u32) -> bool {
+        let positioned = self.track_args(module, track) == Some(ARGS_ID_VOL_PAN);
+        let now = self.frame;
+        let mut resumed = false;
+        for at in 0..self.threads.len() {
+            if self.threads[at].track == track {
+                if positioned {
+                    self.write_at(at, 1, object as i32);
+                }
+                self.threads[at].wake = now;
+                resumed = true;
+            }
+        }
+        for thread in self.pending.iter_mut().filter(|t| t.track == track) {
+            if positioned {
+                thread.registers[1] = object as i32;
+            }
+            thread.wake = now;
+            resumed = true;
+        }
+        resumed
     }
 
     /// A new thread of a track the module defines, with its starting

@@ -24,7 +24,9 @@ request. In music mode 0 the current ambience player is paused too
 (vtable +0x7c, 0x5773af): its update returns at once (0x577af9) until it
 is unpaused, while its cells' sounds play on. Starting a track
 (0x57d960) clears its hold, so a sound started while paused plays (the
-buy mode's clicks do). An unpause (0x574904) lets every track go
+buy mode's clicks do); a held track whose script still runs is not
+started again but let go, as an unpause lets it go (0x57d9f1 to
+0x57da12), with the new object in its argument register. An unpause (0x574904) lets every track go
 (0x57cd2c, vtable +0x5c on each) and unpauses the current ambience
 player, whatever the music mode. Letting a track go also sets its wait
 deadline (+0x198, which `wait` sets at 0x57e453 and the update reads at
@@ -35,9 +37,9 @@ wait short too. Here every thread's wake is set to now.
 
 Not ported: the day and night loop (0x574978), which the pause stops and
 the unpause restarts, and the music the unpause restarts (0x575155); this
-player has neither. Where the original keeps one object per track, a track here
-can have several threads, and the hold is per track, so starting a
-track while paused lets its older threads go on as well.
+player has neither. Where the original keeps one object per track, a
+track here can have several threads, and the hold is per track, so
+starting a held track lets every thread of it go on.
 
 **Unverified:** nothing of this has been compared with the running game.
 Reopen when a capture with sound can be compared.

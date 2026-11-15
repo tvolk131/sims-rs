@@ -401,14 +401,46 @@ fn a_pause_spares_the_interface_and_lets_new_sounds_play() {
         player.render(10, &NoSources),
         (11..=20).collect::<Vec<i16>>()
     );
-    // A track started while paused plays: starting it lets the track
-    // go, so its held note goes on at once, and the new thread's note
-    // starts when the threads next run, at the next block.
+    // Starting a held track whose script still runs lets it go on
+    // (0x57da05): its note goes on at once and no second thread
+    // starts, so nothing new joins at the next block (frame 64).
     play(&mut player, "e0");
-    let out = player.render(10, &NoSources);
-    let resumed: Vec<i16> = (11..=20).map(|v| v + v + 10).collect();
+    let out = player.render(100, &NoSources);
+    let resumed: Vec<i16> = (0..100)
+        .map(|i| {
+            let held = if i < 90 { 11 + i } else { 0 };
+            let click = if i < 80 { 21 + i } else { 0 };
+            held + click
+        })
+        .collect();
     assert_eq!(out, resumed);
     player.handle(&SoundEvent::Unpause);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_held_track_with_no_script_left_starts_anew() {
+    // A note alone holds the track: its thread has ended (note_on, end).
+    let note_only: &[u8] = &[2, 5, END];
+    let mut player = Player::new(vec![module(&[note_only], 1)], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(
+        player.render(10, &NoSources),
+        (1..=10).collect::<Vec<i16>>()
+    );
+    player.handle(&SoundEvent::Pause);
+    assert!(player.render(10, &NoSources).iter().all(|&s| s == 0));
+    // Starting it clears the hold, so the old note goes on at once, and
+    // a new thread starts a second note at the next block (frame 64).
+    play(&mut player, "e0");
+    let out = player.render(50, &NoSources);
+    let expected: Vec<i16> = (0..50)
+        .map(|i| {
+            let new = if 20 + i >= 64 { 20 + i - 63 } else { 0 };
+            (11 + i) + new
+        })
+        .collect();
+    assert_eq!(out, expected);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
