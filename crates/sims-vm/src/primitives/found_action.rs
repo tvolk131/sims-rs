@@ -34,7 +34,7 @@
 //! Ported from the original's code at the addresses given; the old
 //! prototype's `gosub_found_action` (legacy/crates/sims-vm/src/action.rs)
 //! was not trusted. Compared with captures of the original in the Goth
-//! house's tick 233 (`docs/decisions.md`).
+//! house's tick 233 (`docs/decisions/`).
 
 use crate::autonomy::{attenuation, data, find, person};
 use crate::fault::Trap;

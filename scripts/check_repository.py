@@ -17,7 +17,10 @@ PRIVATE_COMPONENTS = {".aws", ".gnupg", ".ssh"}
 PUBLIC_DOCUMENTS = {
     "docs/legal-and-provenance.md", "docs/dependency-licenses.md",
     "docs/repository-workflow.md", "docs/vision.md", "docs/salvage-audit.md",
-    "docs/roadmap.md", "docs/decisions.md",
+    "docs/roadmap.md",
+    # The old single decisions log, still public in history; entries now
+    # live one per file under docs/decisions/.
+    "docs/decisions.md",
 }
 PRIVATE_PATHS = {
     "crates/sims-app/src/original_viewer/exploration/startup_play/host_journey/tutorial_camera/go_here/walking/tests.rs",
@@ -87,7 +90,9 @@ def path_violation(name):
         return "private reference fixture corpus"
     if path.as_posix() in PRIVATE_PATHS or path.name == "private_tests.rs":
         return "private source-level reference evidence"
-    if path.parts[0] == "docs" and path.as_posix() not in PUBLIC_DOCUMENTS:
+    if path.parts[0] == "docs" and path.as_posix() not in PUBLIC_DOCUMENTS and not (
+        len(path.parts) == 3 and path.parts[1] == "decisions" and path.suffix == ".md"
+    ):
         return "unreviewed historical research document"
     if path.name == "sims-rs.local.toml":
         return "local configuration"

@@ -33,7 +33,7 @@
 //!
 //! Compared with the original: the Goth house's tick 6, in which object
 //! 382 makes person 259. The whole state after it, the C runtime's random
-//! stream included, equals the capture's (`docs/decisions.md`). What
+//! stream included, equals the capture's (`docs/decisions/`). What
 //! that person does not reach (a pet, a lot that is not residential, a
 //! failure) is checked only by the synthetic tests.
 //!
