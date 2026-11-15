@@ -581,13 +581,17 @@ impl Painter<'_> {
                     0
                 };
                 let set = is_cut && !diagonal;
-                let Some(image) = self.assets.trim(set, zoom.index()).get(frame).cloned() else {
+                let Some(image) = self.assets.trim(set, zoom).get(frame).cloned() else {
                     continue;
                 };
                 // The original subtracts one more pixel from x; its corner
                 // point sits one to the right of ours (fitted to the
                 // screenshot).
-                let top = [at[0] - half, at[1] - zoom.tile_height() / 2 - height - lift];
+                let rise = zoom.tile_height() / 2 + height + lift;
+                let (Some(x), Some(y)) = (at[0].checked_sub(half), at[1].checked_sub(rise)) else {
+                    continue;
+                };
+                let top = [x, y];
                 let camera = self.camera;
                 // The trim lies on the wall tops: each pixel as deep as
                 // the wall under it.
