@@ -1828,6 +1828,14 @@ Progress:
   medium, 99.7% far, 97.2% at rotation 3). Faint sprite edge pixels
   are left out as the original does, which fixes the door jamb. Every
   compared camera rose, by 0.7 to 3.4 points.
+- Done: the API for drawing people over the lot. `Depth::point` gives
+  a point between pixels its depth in the same space, `Canvas::put`
+  draws one pixel by the sprite rule and `Camera::project_fine_f32`
+  projects without rounding. Drawn this way after the lot, people are
+  hidden by what is in front of them, as in the original, whose depth
+  buffer holds the lot without its people. The game does not use it
+  yet, and how the original gives a person's mesh its depth is
+  unverified.
 - Next: the edge-on diagonal's texels; a screenshot with a marked
   edge-on diagonal; upper-level depth.
 
