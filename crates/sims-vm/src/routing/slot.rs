@@ -94,8 +94,9 @@ pub(crate) fn route_slot(slot: &Slot, index: usize, flags: Option<i32>) -> Route
 }
 
 /// A slot record as its default constructor makes it (0x46dd48): no
-/// offset, number and snap target -1, gradient 0.1875 (0x3e400000),
-/// facing -2, every other word 0.
+/// offset, number and snap target -1, proximity and resolution 16 (the
+/// 0x10 pushed at 0x46dd4a and stored at 0x46dd7f to 0x46dd88), gradient
+/// 0.1875 (0x3e400000), facing -2, every other word 0.
 pub(crate) const DEFAULT_SLOT: RouteSlot = RouteSlot {
     offset: [0; 3],
     number: -1,
@@ -104,10 +105,10 @@ pub(crate) const DEFAULT_SLOT: RouteSlot = RouteSlot {
     ground: 0,
     flags: 0,
     snap_target: -1,
-    proximity: [0; 3],
+    proximity: [16; 3],
     gradient: 0x3e40_0000,
     facing: -2,
-    resolution: 0,
+    resolution: 16,
 };
 
 /// A route context as the load makes it (0x460443): a copy of one made by
