@@ -114,8 +114,10 @@ impl Hud {
         })
     }
 
-    /// Reads the dialog `world` waits on, if it changed.
-    fn read_dialog(&mut self, world: &World, assets: &Assets) {
+    /// Reads the dialog `world` waits on, if it changed. The lot's world,
+    /// or, while the lot waits for the player, the world as the tick left
+    /// it when it showed the dialog.
+    pub fn read_dialog(&mut self, world: &World, assets: &Assets) {
         let Some(pending) = dialog::pending(world) else {
             self.message = None;
             return;
@@ -137,12 +139,12 @@ impl Hud {
     }
 
     /// Draws the panel over the lot in `canvas`, from `world` as it is
-    /// now, with the speed and pause of `pace`, and `status` (a line
-    /// across the top) if there is one.
+    /// now, with the speed of `pace`, and `status` (a line across the
+    /// top) if there is one; the dialog is the one [`Hud::read_dialog`]
+    /// last read.
     pub fn draw(
         &mut self,
         world: &World,
-        assets: &Assets,
         view: &View,
         pace: &Pace,
         status: Option<&str>,
@@ -161,15 +163,13 @@ impl Hud {
             zoom_out: camera.zoom != Zoom::Far,
         };
         self.controls.speed = pace.speed;
-        let mut snapshot = Snapshot::read(world, &self.members);
-        // The game pauses by not stepping the lot; the button shows it.
-        snapshot.paused |= pace.paused;
+        // The pause button shows global 17, which the game's pause sets.
+        let snapshot = Snapshot::read(world, &self.members);
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         self.queue = Queue::read(world, snapshot.selected);
         // An icon gone takes its press with it.
         let shown: BTreeSet<i32> = self.queue.icons.iter().map(|i| i.uid).collect();
         self.pressed.retain(|uid| shown.contains(uid));
-        self.read_dialog(world, assets);
         let (width, height) = (
             u32::try_from(canvas.width).unwrap_or(u32::MAX),
             u32::try_from(canvas.height).unwrap_or(u32::MAX),
@@ -239,6 +239,11 @@ impl Hud {
     /// The first name of people of type `guid`, from their file.
     pub fn name(&self, guid: u32) -> Option<&str> {
         self.faces.name(guid)
+    }
+
+    /// Where the dialog drawn last is, and its buttons.
+    pub fn dialog(&self) -> Option<&dialog::Layout> {
+        self.dialog.as_ref()
     }
 
     /// Whether the panel or the status band covers `point` (canvas
@@ -312,6 +317,12 @@ impl Hud {
             button(self.controls.pointer),
             entry(self.controls.pointer),
         ) != before
+    }
+
+    /// The pointer left the window: no button is hovered and no name
+    /// shows. True if the pointer was in it, so the frame changes.
+    pub fn leave(&mut self) -> bool {
+        self.controls.pointer.take().is_some()
     }
 
     /// Where the pointer is to be moved, as the original moves it when a
