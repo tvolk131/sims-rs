@@ -1,0 +1,23 @@
+[package]
+name = "sims-game"
+description = "The game: one window that runs a lot and draws it with its people and the live-mode interface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+sims-audio = { path = "../sims-audio" }
+sims-content.workspace = true
+sims-people = { path = "../sims-people" }
+sims-render = { path = "../sims-render" }
+sims-sim.workspace = true
+sims-ui = { path = "../sims-ui" }
+sims-vm.workspace = true
+softbuffer = "0.4.8"
+winit = "0.30.13"
+
+[lints]
+workspace = true

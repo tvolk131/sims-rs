@@ -1704,8 +1704,9 @@ Progress:
 - Done: the viewer runs a booted lot (`people-viewer --boot`, through
   `sims_vm::boot::Lot`) and draws its people after each tick, including
   people a script makes; it only reads the lot. A gated test runs the
-  Goths' lot to its end (tick 366 today) and draws everyone placed every
-  30 ticks.
+  Goths' lot until a step stops it (or 3000 ticks) and draws everyone
+  placed every 30 ticks, centred on the root bone, which a clip such as
+  the stair climb carries away from the animator's position.
 - Next: match the original's lighting (see its decisions entry); compare
   Mortimer standing without his book. The base layer's clip and phase are
   not simulation state yet, so the saved record and the animator's clock
@@ -1910,6 +1911,42 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
     while the caller waits on the dialog.
   - Each Sim's current action and its icon, for the icons over the
     portraits.
+
+## Track: integration (`crates/sims-game`)
+
+Goal: a first human-playable Goth house. One window runs
+`sims_vm::boot::Lot` at the original's tick rate and draws the lot
+(`sims-render`), its people (`sims-people`) and the live-mode panel
+(`sims-ui`); clicks on objects open pie menus that queue interactions;
+the panel's speed, pause and camera buttons work; the simulation's sound
+events play through `sims-audio`. Done when a human can launch it, click
+the fridge or the bookshelf, and watch Mortimer go and do it, with sound,
+for several minutes without the lot stopping. The crate joins the others
+through their public interfaces only; the simulation never depends on it.
+
+- **Done: the window.** `cargo run --release -p sims-game` boots the
+  Goths' house (`SIMS_INSTALL`, `House05.iff`, answering No to the Help
+  System) and runs it in strict mode, a tick every 50 ms at normal
+  speed. The lot, the people over it and the panel over both are drawn
+  every tick; the clock, funds and needs on the panel are the live
+  world's. The panel's speed, pause and camera buttons work (the game
+  paces the lot; the simulation's own speed global is not touched).
+  When a step fails, the lot stays on screen as it was and the failure
+  is written across the top: today that is tick 878, where the hour
+  turns. `--png <file> --ticks N` draws one frame without a window.
+- **Next:** pie menus and player orders, once the simulation's hooks
+  land: a play-mode step that resets an object on a script error, a
+  `Lot` API to queue an interaction (person, object, TTAB entry) and
+  read an object's pie-menu entries, and sound events drained each tick.
+- **Needs from other crates:**
+  - `sims-render`: which object drew each pixel (an object ID buffer
+    beside the depth), so a click picks the object under it. Today
+    `sims-game` guesses from each object's tile.
+  - `sims-vm`: a way to answer a dialog from the window (the `Lot`'s
+    player is a fixed answer list given at load), and to change the
+    game's speed global.
+  - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
+    and dialogs are.
 
 ## Working rules
 
