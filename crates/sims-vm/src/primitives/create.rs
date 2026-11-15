@@ -213,7 +213,8 @@ impl Machine<'_, '_> {
         if words[TYPE] == PERSON {
             return Err(Trap::Unsupported(format!(
                 "Create New Object Instance mode 4 making a person (type 0x{guid:08X}) \
-                 in object {container}'s slot is not ported"
+                 in object {container}'s slot, which takes the person path at 0x44e60e, is \
+                 not ported"
             )));
         }
         if words[GROUP] != 0 {
