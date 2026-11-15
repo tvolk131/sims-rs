@@ -11,6 +11,9 @@
 //! each with the original's code run alone. `docs/decisions.md` says what
 //! a trace of the original loading the Goth house confirms.
 
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
 use crate::placement::capture;
@@ -297,14 +300,44 @@ impl Interpreter<'_> {
     /// So does an animator the reset cannot handle (see
     /// [`sims_sim::animator::Animator::reset`]).
     ///
-    /// Not modeled: the person's graphics and action icons, and the guard
-    /// against a reset inside a reset (object flag 0x800).
+    /// The person is marked as in the middle of a reset (object flag
+    /// 0x800) throughout, so a broadcast to let go of an object that its
+    /// callbacks set off skips it ([`crate::forget`]). A reset of a person
+    /// already marked, which the original skips, is refused, as none was
+    /// seen.
+    ///
+    /// Not modeled: the person's graphics and action icons.
     pub(crate) fn reset_person(
         &self,
         world: &mut World,
         id: u16,
         people: &People,
     ) -> Result<(), Fault> {
+        let Some(busy) = self.letting_go else {
+            let busy = RefCell::new(BTreeSet::new());
+            let outer = Interpreter {
+                letting_go: Some(&busy),
+                ..*self
+            };
+            return outer.reset_person(world, id, people);
+        };
+        if busy.borrow().contains(&id) {
+            return Err(Fault {
+                object: id,
+                at: None,
+                trap: Trap::Unsupported(format!(
+                    "a reset of person {id} while it is letting go of an object or resetting \
+                     (object flag 0x800), which the original skips; not ported"
+                )),
+            });
+        }
+        busy.borrow_mut().insert(id);
+        let result = self.reset_marked(world, id, people);
+        busy.borrow_mut().remove(&id);
+        result
+    }
+
+    fn reset_marked(&self, world: &mut World, id: u16, people: &People) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,

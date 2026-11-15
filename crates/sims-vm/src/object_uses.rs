@@ -55,7 +55,7 @@ mod person {
 
 /// The running action a person has when it has none (0x41ed43): no
 /// target, menu entry -1, everything else zero.
-fn no_action() -> Interaction {
+pub(crate) fn no_action() -> Interaction {
     Interaction {
         uid: 0,
         caller: 0,

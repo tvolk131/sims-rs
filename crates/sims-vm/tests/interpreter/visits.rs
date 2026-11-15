@@ -317,21 +317,18 @@ fn a_multi_tile_object_is_rebuilt_as_a_group() {
 }
 
 #[test]
-fn a_person_referring_to_a_changed_object_stops_its_visit() {
+fn a_person_using_a_changed_object_stops_its_visit() {
     let (mut fx, _) = lot();
     let id = stand(&mut fx, [2, 2]);
     fx.world.changed_types.insert(WIDGET);
-    let mut sim = object(PERSON, SIM_GUID);
-    let mut person = person();
-    person.active.target = id as i16;
-    sim.person = Some(person);
-    fx.world.objects.insert(PERSON, sim);
+    let sim = fx.add_sim(PERSON);
+    sim.person.as_mut().unwrap().active.icon = id as i16;
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     let fault = interpreter
         .visit(&mut fx.world, id, &People::default())
         .unwrap_err();
     assert!(
-        fault.to_string().contains("person 50 refers to object"),
+        fault.to_string().contains("person 50 is using object"),
         "{fault}"
     );
 }
