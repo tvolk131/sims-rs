@@ -243,9 +243,11 @@ impl View<'_> {
         let y = at[1] - camera.origin[1];
         let shift = camera.zoom.level() + 3;
         let mut best = [(y + x) >> shift, (y - x) >> shift];
+        // The first guess ignores height, which can lift a tile by up to
+        // 255 quarter tiles plus a storey: allow for that much.
         if best
             .iter()
-            .any(|v| !(-ARRAY_SIZE..2 * ARRAY_SIZE).contains(v))
+            .any(|v| !(-2 * ARRAY_SIZE..3 * ARRAY_SIZE).contains(v))
         {
             return None;
         }
@@ -781,6 +783,25 @@ mod tests {
     }
 
     #[test]
+    fn the_pointer_finds_tiles_raised_as_high_as_terrain_goes_upstairs() {
+        let mut lot = house();
+        for x in 1..SIZE - 1 {
+            for y in 1..SIZE - 1 {
+                lot.heights[Lot::cell(x, y)] = [255; 4];
+            }
+        }
+        for rotation in 0..4 {
+            let mut c = camera(rotation);
+            c.level = 2;
+            let tile = c.rotate_tile([1, 1]);
+            let [x, y] = c.project(tile, 2, 255);
+            let at = [x, y + c.zoom.tile_height() / 2];
+            let fine = View::new(&lot, &c).fine(at).map(|f| f.map(|v| v >> 4));
+            assert_eq!(fine, Some(tile), "rotation {rotation}");
+        }
+    }
+
+    #[test]
     fn an_outdoor_sim_and_the_pointer_mark_squares_of_tiles() {
         let lot = house();
         let mut c = camera(0);
@@ -809,6 +830,11 @@ mod tests {
         let mask = Mask::new(&lot, &c);
         assert!(mask.contains([11, 11]) && mask.contains([14, 14]));
         assert!(!mask.contains([15, 15]) && !mask.contains([10, 10]));
+        // An outdoor selected Sim turns the square on too: both set the
+        // flag the square tests (0x4aba79, 0x4abb32; tested at 0x4abe87).
+        c.focus.forget();
+        c.focus.selected = Some(outdoors);
+        assert!(Mask::new(&lot, &c).contains([12, 12]));
     }
 
     #[test]
