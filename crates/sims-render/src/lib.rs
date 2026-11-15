@@ -12,6 +12,7 @@
 pub mod assets;
 pub mod camera;
 pub mod canvas;
+pub mod caps;
 pub mod cutaway;
 pub mod depth;
 pub mod grass;
