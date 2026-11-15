@@ -5,7 +5,9 @@
 `sims-viewer --hud` now fills the relationship panel as the window does
 (`Snapshot::with_relations`, read only while the panel is open). It loads
 the faces of everyone the world's neighborhood records hold, not only the
-household. The viewer has no simulation program, so the smileys'
+household. Moving the pointer onto, off or between entries redraws the
+panel (`hud::lit_relation`), since an entry is drawn lit under the
+pointer though it takes no press. The viewer has no simulation program, so the smileys'
 friendship threshold comes from `household::friendship_threshold`. It reads
 the global file as `Program` does: every `FCNS` chunk parsed in file
 order, deleted and replaced ones included (a malformed one is an error,
