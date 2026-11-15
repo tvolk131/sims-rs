@@ -14,6 +14,7 @@ mod find_location;
 mod head;
 mod load;
 mod memory;
+mod motive_change;
 mod neighbors;
 mod object_type;
 mod object_uses;
