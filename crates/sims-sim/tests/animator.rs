@@ -221,17 +221,36 @@ fn a_reset_unplaces_the_animator_and_drops_its_posture() {
 }
 
 #[test]
-fn a_reset_with_a_clip_playing_or_a_route_result_is_refused() {
+fn a_reset_with_a_clip_playing_is_refused() {
     let mut a = Animator {
         foreground: Some(Layer::start("c", THOUSAND, 30, true, 0, false, 0)),
         ..LOADED
     };
     assert!(a.reset().unwrap_err().contains("0x592878"));
-    let mut a = Animator {
-        arrival: 2,
-        ..LOADED
-    };
-    assert!(a.reset().unwrap_err().contains("0x589e2d"));
+}
+
+#[test]
+fn a_reset_stops_a_route_after_unsetting_the_position() {
+    // 0x5892dd: the stop (0x589e2d) comes after the position is unset
+    // (0x589361), so an ended route's destination becomes unset too.
+    let to = [1.0, 2.0, 3.0].map(F32::from_f32);
+    let at = [4.0, 5.0, 6.0].map(F32::from_f32);
+    for (arrival, destination) in [(2, [UNSET; 3]), (3, [UNSET; 3]), (1, to), (-1, to)] {
+        let mut a = Animator {
+            arrival,
+            position: at,
+            destination: to,
+            state: 9,
+            ..LOADED
+        };
+        a.motion.segment = 4;
+        a.motion.timer = 7;
+        a.reset().unwrap();
+        assert_eq!(a.arrival, 0, "{arrival}");
+        assert_eq!(a.destination, destination, "{arrival}");
+        assert_eq!(a.position, [UNSET; 3]);
+        assert_eq!((a.state, a.motion.segment, a.motion.timer), (3, -1, 0));
+    }
 }
 
 /// A motion's events for [`Layer::due`]: (time, has a property). Index 3

@@ -17,6 +17,10 @@ const TICK_33_23: &str = "9d5a04c006c0e77b014642afe9113d5b5ec7c250787caf001b6ede
 /// ([`sims_sim::World::families`]) either.
 const TICK_33_22: &str = "041181badfd4d6953814b6c46612398df1004fa583b1d2aa5bd11c59715d65c0";
 
+/// `sims boot <install> UserData/Houses/House05.iff --ticks 1103 --answers
+/// 3` gives this hash, the tick before the salesman leaves.
+const TICK_1103: &str = "714496702b0ff2dbda94c299c217e2ae7414172e6a71775950901b0cfa6222b5";
+
 #[test]
 fn the_goth_house_steps_to_tick_33() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
@@ -189,9 +193,11 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     assert_eq!(lot.world().headlines, BTreeMap::from([(16, shown(1))]));
     lot.step().unwrap_or_else(|e| panic!("{e}"));
     assert!(lot.world().headlines.is_empty());
-    // The lot runs on until person 259's route to a slot fails, as it
-    // wants to be interrupted (0x45b18b), and its tree takes it off the
-    // lot, which is not ported.
+    // The lot runs on until person 259 (the salesman), whose route to a
+    // slot failed as it wants to be interrupted (0x45b18b), is taken off
+    // the lot while its animator plays a door knock: the reset that
+    // deletes it would remove that clip, which can fade it out, and that
+    // is not ported.
     let mut steps = 359;
     let stopped = loop {
         steps += 1;
@@ -201,11 +207,7 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
         }
     };
     assert_eq!(steps, 595, "{stopped}");
-    for part in [
-        "tick 597,",
-        "object 259, tree 0x0176 node 27",
-        "taking a person off the lot is not ported",
-    ] {
+    for part in ["tick 597,", "object 259", "A2O-door-knock", "0x592878"] {
         assert!(stopped.contains(part), "{stopped}");
     }
 }
@@ -315,17 +317,61 @@ fn the_snack_order_pays_for_the_snack() {
         let update = lot.step_play().unwrap();
         assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
     }
-    // Person 259 turns by less than a step too, at step 1103. At step 1104
-    // it removes itself (Remove Object Instance in tree 374), and taking a
-    // person off the lot is not ported.
+    // Person 259, the traveling salesman, turns by less than a step too,
+    // at step 1103. At step 1104 it removes itself (Remove Object Instance
+    // in tree 374), and is gone at the end of the update.
+    let update = lot.step_play().unwrap();
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    assert_eq!(update.removed, [259]);
+    // The update started at tick count 89547.
+    assert_eq!(lot.world().ticks, 89548);
+    assert_gone(&lot, 259);
+    for step in 1105..2703 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+    }
+    // Step 2703: the carpool (object 8) makes the school bus, a multi-tile
+    // object, whose factory is not ported.
     let update = lot.step_play().unwrap();
     let [error] = &update.errors[..] else {
         panic!("{:?}", update.errors);
     };
-    assert_eq!((error.object, error.tick), (259, 89547));
+    assert_eq!((error.object, error.tick), (8, 91146));
     let fault = error.fault.to_string();
     assert!(
-        fault.contains("taking a person off the lot") && fault.contains("tree 0x0176 node 27"),
+        fault.contains("tree 0x1017 node 4") && fault.contains("multi-tile objects"),
         "{fault}"
     );
+}
+
+/// Person `id` is off the lot and out of every list the sim keeps of it.
+fn assert_gone(lot: &Lot, id: u16) {
+    let world = lot.world();
+    assert!(!world.objects.contains_key(&id));
+    assert!(!world.people.contains(&id));
+    assert!(!world.order.contains(&id));
+    assert!(!world.animators.contains_key(&id));
+    assert!(!world.routing.routes.contains_key(&id));
+    assert!(!world.person_ticks.contains_key(&id));
+    assert!(!world.removals.contains(&id));
+}
+
+#[test]
+fn strict_mode_takes_the_salesman_off_the_lot_at_tick_1104() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    for _ in 1..1104 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.world().hash_hex(), TICK_1103);
+    // The salesman (GUID 0x44A86A6C, made by object 382 at tick 6).
+    assert_eq!(lot.world().objects[&259].guid, 0x44A8_6A6C);
+    let update = lot.step().unwrap();
+    assert_eq!(update.removed, [259]);
+    assert_gone(&lot, 259);
 }

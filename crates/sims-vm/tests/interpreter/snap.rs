@@ -484,44 +484,58 @@ fn mode_4_on_myself_turns_me_where_i_stand() {
 }
 
 #[test]
-fn what_snap_does_not_port_fails_loudly() {
-    let cases: [(Slot, u8, &str); 3] = [
-        (
-            Slot {
-                offset: [8.0, 0.0, 0.0],
-                ..slot(SKIP_CHECKS)
-            },
-            0,
-            "0x455070",
-        ),
-        (
-            Slot {
-                offset: [0.0, -2.0, 0.0],
-                ..slot(SKIP_CHECKS)
-            },
-            0,
-            "0x455070",
-        ),
-        (slot(SKIP_CHECKS), 1, "0x454c7a"),
+fn an_offset_turns_with_the_objects_facing() {
+    // The offset's first coordinate goes along the second of the
+    // position, its second along the first, turned by the lamp's facing
+    // through a matrix in world units and rounded back half away from
+    // zero (0x454b93 to 0x454c54).
+    // The lamp stands where I do, in the middle of tile (2, 2).
+    let cases: [([f32; 2], i16, [i32; 2]); 7] = [
+        ([4.0, 0.0], 0, [40, 44]),
+        ([4.0, 0.0], 2, [44, 40]),
+        ([4.0, 0.0], 4, [40, 36]),
+        ([4.0, 0.0], 6, [36, 40]),
+        // 0.75 times the root of a half, 0.53033, on 7.5 in world units:
+        // 42.828 back in the lot's.
+        ([4.0, 0.0], 1, [43, 43]),
+        ([0.0, -2.0], 0, [38, 40]),
+        // The facing is the raw data word: 10 turns as 2 does.
+        ([4.0, 0.0], 10, [44, 40]),
     ];
-    for (entry, flags, address) in cases {
+    for (offset, facing, place) in cases {
         let (mut fx, me) = snapper(SKIP_CHECKS);
-        fx.lamp_mut().position = [56, 24, 1];
-        set_slots(&mut fx, vec![entry]);
-        let start = unmoved(&fx, me);
-        let result = snap(&mut fx, me, LAMP as i16, 0, 3, flags);
-        assert!(
-            matches!(trap(result), Trap::Unsupported(ref m) if m.contains(address)),
-            "{address}"
+        fx.lamp_mut().position = [40, 40, 1];
+        fx.lamp_mut().data[1] = facing;
+        set_slots(
+            &mut fx,
+            vec![Slot {
+                offset: [offset[0], offset[1], 5.0],
+                ..slot(SKIP_CHECKS)
+            }],
         );
-        assert_eq!(unmoved(&fx, me), start, "{address}");
+        assert_eq!(
+            snap(&mut fx, me, LAMP as i16, 0, 3, 0),
+            Ok(true),
+            "{offset:?} {facing}"
+        );
+        let person = &fx.world.objects[&me];
+        assert_eq!(
+            person.position,
+            [place[0], place[1], 1],
+            "{offset:?} {facing}"
+        );
     }
-    // A position further out than the round trip through world units is
-    // known to keep.
+}
+
+#[test]
+fn what_snap_does_not_port_fails_loudly() {
     let (mut fx, me) = snapper(SKIP_CHECKS);
-    fx.lamp_mut().position = [0x8001, 24, 1];
-    let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454fb9")));
+    fx.lamp_mut().position = [56, 24, 1];
+    set_slots(&mut fx, vec![slot(SKIP_CHECKS)]);
+    let start = unmoved(&fx, me);
+    let result = snap(&mut fx, me, LAMP as i16, 0, 3, 1);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454c7a")));
+    assert_eq!(unmoved(&fx, me), start);
 }
 
 #[test]

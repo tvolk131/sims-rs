@@ -834,3 +834,22 @@ fn an_update_returns_its_sound_events_in_order_without_changing_the_lot() {
         }]
     );
 }
+
+#[test]
+fn a_person_queued_for_removal_after_a_partial_pass_fails_loudly() {
+    // The queue waits for a full pass, and the person's animator is not
+    // refreshed meanwhile (0x58da12), which depends on whether the view
+    // drew it.
+    let mut fx = lot(sleeper());
+    fx.thread(LAMP, 4096, &[3]);
+    fx.world.globals[17] = 1;
+    fx.lamp_mut().registry_word = Some(0x0003_ffff);
+    fx.world.removals.push(SIM);
+    let error = update(&mut fx, &mut answers(&[])).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("stays queued for removal after a partial pass"),
+        "{error}"
+    );
+}

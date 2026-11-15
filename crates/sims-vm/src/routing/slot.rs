@@ -268,32 +268,59 @@ pub(crate) fn transform(pos: [i32; 2], a: F32, b: F32, dir: i32) -> [i32; 2] {
 ///
 /// Every add, multiply and divide is rounded to single precision.
 fn turn_by_matrix(a: F32, b: F32, dir: i32) -> (Ext, Ext) {
-    const PI: F32 = F32::from_bits(0x4049_0fdb);
-    const QUARTER: F32 = F32::from_bits(0x3e80_0000);
-    const THREE: F32 = F32::from_bits(0x4040_0000);
-    const HALF: F32 = F32::from_bits(0x3f00_0000);
-    let angle = ((Ext::from_i32(dir) * PI.ext()).single() * QUARTER.ext()).to_f32();
-    let c = Ext::cos(angle).to_f32().ext();
-    let s = Ext::sin(angle).to_f32().ext();
+    let (c, s) = facing_cos_sin(dir);
     // 0x454ecc.
-    let k = (THREE.ext() * SIXTEENTH.ext()).to_f32().ext();
-    let v0 = (k * b.ext()).to_f32().ext();
-    let v2 = (k * a.ext()).to_f32().ext();
+    let v0 = to_world_units(b.ext());
+    let v2 = to_world_units(a.ext());
     // 0x5c4510: the fourth coordinate is 1, so its reciprocal is 1.
     let first = ((s * v2).single() + (v0 * c).single()).single();
     let third = ((-s * v0).single() + (c * v2).single()).single();
     // 0x454fb9.
+    (
+        Ext::from_i32(to_lot_units(third)),
+        Ext::from_i32(to_lot_units(first)),
+    )
+}
+
+/// The cosine and sine of a facing `dir` as the original's rotation
+/// matrix holds them (0x455070, 0x5c3a20 axis 1): the angle is `dir`
+/// times pi (0x673438) times 1/4 (0x666a48), stored as a float, and its
+/// cosine and sine are stored as floats. They come from libm (see
+/// [`Ext::cos`] for the **unverified** caveat).
+pub(crate) fn facing_cos_sin(dir: i32) -> (Ext, Ext) {
+    const PI: F32 = F32::from_bits(0x4049_0fdb);
+    const QUARTER: F32 = F32::from_bits(0x3e80_0000);
+    let angle = ((Ext::from_i32(dir) * PI.ext()).single() * QUARTER.ext()).to_f32();
+    (
+        Ext::cos(angle).to_f32().ext(),
+        Ext::sin(angle).to_f32().ext(),
+    )
+}
+
+/// A coordinate in the lot's units (16 to a tile) in world units, as
+/// 0x454ecc and 0x454f5c take it: times 3/16 (3 times 1/16, stored once
+/// at 0x703f34 and 0x703f24), rounded to single precision and stored.
+pub(crate) fn to_world_units(n: Ext) -> Ext {
+    const THREE: F32 = F32::from_bits(0x4040_0000);
+    let k = (THREE.ext() * SIXTEENTH.ext()).to_f32().ext();
+    (k * n).to_f32().ext()
+}
+
+/// A coordinate in world units back in the lot's units (0x454fb9): times
+/// 16/3 (stored once at 0x703f1c), rounded half away from zero (0.5
+/// added and floored, 0x636ac9, or taken away and ceiled, 0x636b98) and
+/// truncated to an integer (0x636128).
+pub(crate) fn to_lot_units(v: Ext) -> i32 {
+    const THREE: F32 = F32::from_bits(0x4040_0000);
+    const HALF: F32 = F32::from_bits(0x3f00_0000);
     let scale = (SIXTEEN.ext() / THREE.ext()).to_f32().ext();
-    let round = |v: Ext| {
-        let v = (scale * v).single();
-        let whole = if v >= Ext::from_i32(0) {
-            (v + HALF.ext()).single().floor()
-        } else {
-            -(-(v - HALF.ext()).single()).floor()
-        };
-        Ext::from_i32(whole.to_i32_truncate())
+    let v = (scale * v).single();
+    let whole = if v >= Ext::from_i32(0) {
+        (v + HALF.ext()).single().floor()
+    } else {
+        -(-(v - HALF.ext()).single()).floor()
     };
-    (round(third), round(first))
+    whole.to_i32_truncate()
 }
 
 /// The person turns for a slot place (0x483e63): with no flags in the

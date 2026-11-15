@@ -236,3 +236,23 @@ fn a_scripts_base_clip_is_checked_against_the_foreground() {
         "{fault}"
     );
 }
+
+#[test]
+fn a_head_looking_at_a_person_queued_for_removal_fails_loudly() {
+    // The person left the lot without its animator's refresh, which the
+    // original makes only if the view drew it (0x58da12).
+    const OTHER: u16 = 77;
+    let mut fx = anchored(Some("Top"));
+    let mut other = fx.world.objects[&SIM].clone();
+    other.id = OTHER;
+    fx.world.objects.insert(OTHER, other);
+    let animator = fx.world.animators[&SIM].clone();
+    fx.world.animators.insert(OTHER, animator);
+    fx.sim_mut().person.as_mut().unwrap().data[41] = OTHER as i16;
+    fx.world.removals.push(OTHER);
+    let fault = draw(fx).unwrap_err();
+    assert!(
+        matches!(&fault.trap, sims_vm::Trap::Unsupported(m) if m.contains("queued for removal")),
+        "{fault}"
+    );
+}

@@ -292,12 +292,20 @@ impl Interpreter<'_> {
     /// 6. Each queued action is dropped, first to last, and its target is
     ///    asked function 4 with the person as the stack object.
     ///
+    /// Between steps 2 and 3 the person's route contexts (person +0xaf0)
+    /// are erased (0x45e8aa, 0x45fad7), whose destructors (0x5d5653) only
+    /// free memory. Its path (+0xae0) stays. Its headlines are cleared
+    /// (0x45e8c3, 0x46e042), which changes nothing kept
+    /// (`primitives::headline`).
+    ///
     /// These fail, because the original does more for them and none was
     /// seen: a person that is using an object or whose running action has
-    /// a target; a person in the middle of a route; a person inside
-    /// another object or off the lot, which the original moves; and a
-    /// person whose data word 73 is set, whose footprint the original
-    /// then works out again.
+    /// a target; a person whose routing frame count
+    /// ([`sims_formats::saved_objects::Person::routing_frames`]) is not 0;
+    /// a person inside another object (0x45e8dd) or, unless it is being
+    /// deleted ([`Interpreter::reset_person_to_delete`]), off the lot
+    /// (0x45e977), which the original moves; and a person whose data word
+    /// 73 is set, whose footprint the original then works out again.
     ///
     /// So does an animator the reset cannot handle (see
     /// [`sims_sim::animator::Animator::reset`]).
@@ -315,13 +323,31 @@ impl Interpreter<'_> {
         id: u16,
         people: &People,
     ) -> Result<(), Fault> {
+        self.reset_person_as(world, id, people, false)
+    }
+
+    /// A person's last reset, as its deletion asks it (virtual function
+    /// 0x38 with 0 from 0x4410a5): [`Interpreter::reset_person`] with the
+    /// person's deletion mark (object flag 0x40) set, which skips the
+    /// move back onto the lot (0x45e95d) and leaves it where it is.
+    pub(crate) fn reset_person_to_delete(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        self.reset_person_as(world, id, &self.program.people, true)
+    }
+
+    fn reset_person_as(
+        &self,
+        world: &mut World,
+        id: u16,
+        people: &People,
+        deleting: bool,
+    ) -> Result<(), Fault> {
         let Some(busy) = self.letting_go else {
             let busy = RefCell::new(BTreeSet::new());
             let outer = Interpreter {
                 letting_go: Some(&busy),
                 ..*self
             };
-            return outer.reset_person(world, id, people);
+            return outer.reset_person_as(world, id, people, deleting);
         };
         if busy.borrow().contains(&id) {
             return Err(Fault {
@@ -334,12 +360,18 @@ impl Interpreter<'_> {
             });
         }
         busy.borrow_mut().insert(id);
-        let result = self.reset_marked(world, id, people);
+        let result = self.reset_marked(world, id, people, deleting);
         busy.borrow_mut().remove(&id);
         result
     }
 
-    fn reset_marked(&self, world: &mut World, id: u16, people: &People) -> Result<(), Fault> {
+    fn reset_marked(
+        &self,
+        world: &mut World,
+        id: u16,
+        people: &People,
+        deleting: bool,
+    ) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -365,14 +397,8 @@ impl Interpreter<'_> {
         if person.active.target != 0 {
             return Err(unsupported("whose running action has a target"));
         }
-        if person.routing_frames != 0
-            || world
-                .routing
-                .routes
-                .get(&id)
-                .is_some_and(|r| !r.contexts.is_empty())
-        {
-            return Err(unsupported("in the middle of a route"));
+        if person.routing_frames != 0 {
+            return Err(unsupported("whose routing frame count is not 0"));
         }
         if person.data.get(73).is_none_or(|&word| word != 0) {
             return Err(unsupported("whose data word 73 is set"));
@@ -383,8 +409,13 @@ impl Interpreter<'_> {
             )))
         })?;
         let place = capture(world, id).map_err(fail)?;
-        if place.container.is_some() || !place.on_lot {
-            return Err(unsupported("that is inside an object or off the lot"));
+        if place.container.is_some() {
+            return Err(unsupported("that is inside an object (0x45e8dd)"));
+        }
+        if !place.on_lot && !deleting {
+            return Err(unsupported(
+                "that is off the lot, which puts it back on the lot (0x45e977)",
+            ));
         }
         let person = world
             .objects
@@ -403,6 +434,10 @@ impl Interpreter<'_> {
             .and_then(|o| o.person.as_mut())
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
         reload_profile(&mut person.data, profile).map_err(fail)?;
+        // 0x45e8aa: the route contexts are erased (0x45fad7).
+        if let Some(route) = world.routing.routes.get_mut(&id) {
+            route.contexts.clear();
+        }
         // Every headline is cleared (0x45e8af).
         world.headlines.remove(&id);
         self.machine(world, id, 0, false)
