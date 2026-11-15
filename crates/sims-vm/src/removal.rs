@@ -120,7 +120,7 @@ impl Interpreter<'_> {
     /// lot's size do not change.
     ///
     /// For the Goth house this was compared with a capture of the original
-    /// at the moment the clear returns; see `docs/decisions.md`.
+    /// at the moment the clear returns; see `docs/decisions/`.
     ///
     /// Not modeled: the interface is switched off for the duration, each
     /// indicator's graphics are released, and the lot's pools of spare

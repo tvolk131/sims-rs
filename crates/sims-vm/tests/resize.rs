@@ -2257,10 +2257,10 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// simulation's state (`frame.rs`). The frames come before tick 1, after
 /// each of ticks 1 to 3, after tick 33 and after every 30th tick from
 /// there (63, 93, ...). That schedule is an input, not something the
-/// simulation decides (`sims boot --frames`, `docs/decisions.md`).
+/// simulation decides (`sims boot --frames`, `docs/decisions/`).
 ///
 /// Four private captures of the original on the same install and house,
-/// outside the repository (`docs/decisions.md`), each read the install's
+/// outside the repository (`docs/decisions/`), each read the install's
 /// own neighborhood file. Each holds one line per lot update in
 /// `updates.jsonl` (the tick count, the lot's and the game's random
 /// streams, the C runtime's random stream and the scheduler cursor) and
@@ -2390,14 +2390,14 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// The first capture does not choose in tick 233: its one draw from the
 /// lot's stream in ticks 233 and 234 comes in tick 234, and after tick
 /// 240 person 21 runs tree 0x208a and has no running action. Why is
-/// **unknown**; `docs/decisions.md` says what was ruled out. The other
+/// **unknown**; `docs/decisions/` says what was ruled out. The other
 /// three captures, and the original's code run in an emulator on the
 /// first capture's state from update 47, choose in tick 233.
 ///
 /// Object 15's two-button dialog in tick 2 is answered with 3, the answer
 /// the captures' events show. People 18 and 21's clip in tick 3 is named
 /// "-Rstand" in the script and found only by ignoring case; the original
-/// plays the library's "-rstand" (`docs/decisions.md`). That the five
+/// plays the library's "-rstand" (`docs/decisions/`). That the five
 /// controllers' dialogs in tick 1 were answered with their only button is
 /// what the captures show.
 ///
