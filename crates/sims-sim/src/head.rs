@@ -351,8 +351,9 @@ const ALTITUDE: u16 = 0;
 pub enum Unplaced {
     /// No object with the person's ID.
     Missing,
-    /// The person is on a level above the ground. The original adds an
-    /// offset from the view's table there (0x5922ad), which is not ported.
+    /// The person is on a level other than the ground (1). Above it the
+    /// original adds an offset from the view's table (0x5922ad), which is
+    /// not ported; level 0 and below are refused too.
     Level(i8),
     /// The rounded position falls off the lot (0x45ee1d).
     OffLot,
@@ -400,8 +401,8 @@ pub fn ground_height(world: &World, position: [F32; 2]) -> Result<F32, Unplaced>
 /// Person `id`'s model matrix (0x592132) with the animator at `position`
 /// (+0x80 to +0x88: the two coordinates and the direction): turned to the
 /// direction and standing on the terrain there ([`ground_height`],
-/// [`placement`]). Fails for a person on an upper level, whose offset is
-/// not ported. Only reads the world.
+/// [`placement`]). Fails for a person on any level but the ground: the
+/// upper levels' offset is not ported. Only reads the world.
 pub fn model(world: &World, id: u16, position: [F32; 3]) -> Result<Matrix, Unplaced> {
     let object = world.objects.get(&id).ok_or(Unplaced::Missing)?;
     let level = World::tile(object.position)[2];
@@ -621,6 +622,38 @@ mod tests {
         assert_eq!(
             ground_height(&World::empty(), [F32::ZERO; 2]),
             Err(Unplaced::NoAltitude)
+        );
+    }
+
+    /// The cell is the first coordinate's tile times 64 plus the
+    /// second's; the rounding is in single precision; a tile is cut to a
+    /// signed byte.
+    #[test]
+    fn the_terrain_lookup_follows_the_originals_cell_rounding_and_wrap() {
+        let mut world = lot([0, 0, 0, 0], [0, 0, 1]);
+        let full = FULL_SIZE as usize;
+        let cell = |world: &mut World, [a, b]: [usize; 2], corners: [u8; 4]| {
+            let at = (a * full + b) * 4;
+            world.arrays.get_mut(&ALTITUDE).unwrap().data[at..at + 4].copy_from_slice(&corners);
+        };
+        cell(&mut world, [5, 9], [4, 4, 4, 4]);
+        cell(&mut world, [9, 5], [8, 8, 8, 8]);
+        // Byte 1 is the corner at offsets (0, 0), byte 3 at (16, 16).
+        cell(&mut world, [0, 0], [0, 0, 0, 16]);
+        let at = |world: &World, p: [F32; 2]| ground_height(world, p).unwrap();
+        let height = |altitude: f32| terrain_height(F32::from_f32(altitude));
+        let tile = |a: f32, b: f32| [a * 16.0 + 8.0, b * 16.0 + 8.0].map(F32::from_f32);
+        assert_eq!(at(&world, tile(5.0, 9.0)), height(4.0));
+        assert_eq!(at(&world, tile(9.0, 5.0)), height(8.0));
+        // Just under a half rounds up once added in single precision (it
+        // would not in double): offsets (1, 1), one sixteenth of the climb.
+        let under_half = F32::from_bits(0x3eff_ffff);
+        assert_eq!(at(&world, [under_half; 2]), height(1.0));
+        // 4096 is tile 256, which the signed byte makes tile 0.
+        assert_eq!(at(&world, [4096.0, 0.0].map(F32::from_f32)), height(0.0));
+        assert_eq!(
+            at(&world, [4096.0 + 1.0, 1.0].map(F32::from_f32)),
+            height(1.0)
         );
     }
 
