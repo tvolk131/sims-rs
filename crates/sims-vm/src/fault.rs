@@ -101,3 +101,25 @@ impl fmt::Display for Fault {
 }
 
 impl std::error::Error for Fault {}
+
+impl Fault {
+    /// The trap an instruction reports for a fault in work it started,
+    /// such as another object's callback: the trap itself when the fault
+    /// names only `me` and no frame, and otherwise one that keeps the
+    /// object, tree and node the fault happened at. An unsupported trap
+    /// stays unsupported; any other becomes invalid state with the whole
+    /// fault as its message.
+    pub(crate) fn nested(self, me: u16) -> Trap {
+        if self.object == me && self.at.is_none() {
+            return self.trap;
+        }
+        let mut place = format!("object {}", self.object);
+        if let Some(at) = self.at {
+            place.push_str(&format!(", tree {:#06x} node {}", at.tree, at.node));
+        }
+        match self.trap {
+            Trap::Unsupported(message) => Trap::Unsupported(format!("{message} (in {place})")),
+            trap => Trap::Invalid(format!("{place}: {trap}")),
+        }
+    }
+}

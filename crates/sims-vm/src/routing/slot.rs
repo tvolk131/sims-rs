@@ -532,9 +532,10 @@ impl Interpreter<'_> {
     /// random stream (0x46f457) modulo 20, less 10, before the additions
     /// for the sides and the start (0x483b02).
     ///
-    /// Fails loudly for a slot with a sitting weight (seats) and for more
-    /// candidates than the context's limit (a random choice among them,
-    /// 0x483c57).
+    /// More candidates than the context's limit leave a random choice of
+    /// them ([`choose_at_random`]).
+    ///
+    /// Fails loudly for a slot with a sitting weight (seats).
     fn search_by_distance(
         &self,
         world: &mut World,
@@ -676,12 +677,13 @@ impl Interpreter<'_> {
                 row -= 1;
             }
         }
-        let limit = usize::try_from(ctx.limit).unwrap_or(0);
-        if ctx.candidates.len() > limit {
-            return Err(fail(unsupported(
-                "0x483c57",
-                "more slot places than the context's limit: a random choice among them",
-            )));
+        // The count is compared with the limit unsigned (0x483c4b).
+        if ctx.candidates.len() > ctx.limit as u32 as usize {
+            let stream = self.stream;
+            choose_at_random(&mut ctx.candidates, ctx.limit, || match stream {
+                Stream::Lot => world.lot_rng.next_u32(),
+                Stream::Global => world.global_rng.next_u32(),
+            });
         }
         if ctx.candidates.is_empty() {
             ctx.result = refusals.result();
@@ -869,6 +871,42 @@ fn finish(path: &mut Vec<[i32; 2]>, last: [i32; 2], next: [i32; 2]) -> i32 {
     2
 }
 
+/// Keeps a random choice of the candidates when there are more than the
+/// context's limit (0x483c57 to 0x483cee):
+///
+/// 1. The candidates are copied and cleared. Each with word +0xc set is
+///    kept first, in order, and its score in the copy becomes 0.
+/// 2. Then, as many times as the kept count is below the limit (signed,
+///    counted from the count after step 1): a draw from the active stream,
+///    modulo the number copied, names a candidate, and the first from
+///    there on whose score in the copy is not 0 is kept and its score
+///    there becomes 0. A draw that finds none keeps nothing and still
+///    counts.
+///
+/// A score of 0 marks a candidate as taken, so one that scored 0 is never
+/// chosen. The context's best score stays as it was.
+fn choose_at_random(candidates: &mut Vec<Candidate>, limit: i32, mut draw: impl FnMut() -> u32) {
+    let mut copy = std::mem::take(candidates);
+    if copy.is_empty() {
+        return;
+    }
+    for candidate in &mut copy {
+        if candidate.word_c != 0 {
+            candidates.push(*candidate);
+            candidate.score = 0;
+        }
+    }
+    let mut kept = candidates.len() as i32;
+    while kept < limit {
+        let start = (draw() % copy.len() as u32) as usize;
+        if let Some(candidate) = copy[start..].iter_mut().find(|c| c.score != 0) {
+            candidates.push(*candidate);
+            candidate.score = 0;
+        }
+        kept += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -998,5 +1036,44 @@ mod tests {
         assert_eq!(path, [[0, 0], [16, 0]]);
         assert_eq!(finish(&mut path, [16, 0], [16, 16]), 2);
         assert_eq!(path, [[0, 0], [16, 0], [16, 16]]);
+    }
+
+    fn place(x: i32, score: i32, word_c: i16) -> Candidate {
+        Candidate {
+            position: [x, 0],
+            score,
+            word_c,
+            word_e: None,
+        }
+    }
+
+    #[test]
+    fn a_random_choice_keeps_marked_places_first_then_draws() {
+        let mut places = vec![
+            place(0, 5, 0),
+            place(1, 7, 1),
+            place(2, 0, 0),
+            place(3, 9, 0),
+            place(4, 4, 0),
+        ];
+        // Draws name places 1 (taken by its mark), 2 (scored 0), then 0.
+        let mut draws = [6, 2, 5].into_iter();
+        choose_at_random(&mut places, 4, || draws.next().unwrap());
+        let kept: Vec<i32> = places.iter().map(|c| c.position[0]).collect();
+        // 1 by its mark; draw 6 % 5 = 1 is taken, so the next untaken is
+        // 3; draw 2 is scored 0, so 3 is taken and then 4; draw 5 % 5 = 0.
+        assert_eq!(kept, [1, 3, 4, 0]);
+        assert!(draws.next().is_none());
+    }
+
+    #[test]
+    fn a_draw_past_every_untaken_place_keeps_nothing_and_still_counts() {
+        let mut places = vec![place(0, 5, 0), place(1, 3, 0), place(2, 0, 0)];
+        let mut draws = [2, 2, 1].into_iter();
+        choose_at_random(&mut places, 2, || draws.next().unwrap());
+        // Draw 2 finds only the place that scored 0: nothing is kept.
+        // Draw 2 again: nothing. The limit is reached after two draws.
+        assert!(places.is_empty());
+        assert_eq!(draws.next(), Some(1));
     }
 }

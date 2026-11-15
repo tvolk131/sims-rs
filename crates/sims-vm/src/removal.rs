@@ -49,7 +49,9 @@ impl Machine<'_, '_> {
     /// moves, and the words that say where it is are reset. An object on a
     /// tile, in a container or holding something needs the lot's placement
     /// services, and one with a callback for leaving the lot needs that
-    /// callback run; both fail.
+    /// callback run; both fail. Its footprint is worked out again at the
+    /// off-lot place, as the original's move does (0x433e50), since the
+    /// factory's may differ.
     pub(crate) fn leave_lot(&mut self, id: u16) -> Result<(), Trap> {
         let object = self
             .world
@@ -57,6 +59,10 @@ impl Machine<'_, '_> {
             .get(&id)
             .ok_or(Trap::native(10, "missing object"))?;
         let definition = self.definition(object.guid)?;
+        // Taking it off the lot works its footprint out again (0x433e50),
+        // which changes one the factory left otherwise.
+        let footprint = self.interpreter().off_lot_footprint(self.world, id)?;
+        let object = &self.world.objects[&id];
         let callbacks = self
             .program
             .libraries
@@ -84,6 +90,7 @@ impl Machine<'_, '_> {
             .objects
             .get_mut(&id)
             .ok_or(Trap::native(10, "missing object"))?;
+        object.footprint = footprint;
         // Detached: no container, no slot, no room.
         for (word, value) in [(2, 0), (3, -1), (14, -1), (26, 0), (29, -5)] {
             object.data[word] = value;

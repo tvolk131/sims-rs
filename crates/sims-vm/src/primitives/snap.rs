@@ -164,7 +164,7 @@ impl Machine<'_, '_> {
         let interpreter = self.interpreter();
         if !interpreter
             .fits(self.world, me, to, level)
-            .map_err(|f| f.trap)?
+            .map_err(|f| f.nested(me))?
         {
             return Err(unsupported("0x454e09", "to a place where I do not fit"));
         }
@@ -177,7 +177,7 @@ impl Machine<'_, '_> {
         };
         interpreter
             .put(self.world, me, place_at, true)
-            .map_err(|f| f.trap)?;
+            .map_err(|f| f.nested(me))?;
         self.set_datum(FACING, direction as i16)?;
         if person {
             self.animator().position = [UNSET; 3];

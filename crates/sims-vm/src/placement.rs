@@ -528,6 +528,13 @@ fn footprint(
 }
 
 impl Interpreter<'_> {
+    /// The footprint an object that is not a person gets off the lot,
+    /// as taking it off the lot works it out (`move_tree`).
+    pub(crate) fn off_lot_footprint(&self, world: &World, id: u16) -> Result<[i32; 4], Trap> {
+        let words = self.words(world, id)?;
+        footprint(OFF_LOT, words, datum(world, id, data::FACING)?, None)
+    }
+
     pub(crate) fn words(&self, world: &World, id: u16) -> Result<&[i16; DEFINITION_WORDS], Trap> {
         let object = world.objects.get(&id).ok_or_else(missing)?;
         let definition = self
