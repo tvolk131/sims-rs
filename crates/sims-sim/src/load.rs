@@ -106,7 +106,7 @@ impl std::fmt::Display for LoadError {
             }
             Self::ArrayVersion(version) => write!(
                 f,
-                "house version {version}: only the array layout of versions 53 to 62 is ported"
+                "house version {version}: the array layout before version 53 is not ported"
             ),
             Self::SurfaceCatalog => write!(
                 f,
@@ -130,10 +130,17 @@ impl std::error::Error for LoadError {}
 /// version is 53 to 62. The order is from the old prototype's reading of
 /// the original's code (legacy/docs/research/
 /// retained-saved-source-prefix-audit-20261026.md), not from a trace of the
-/// reads. From version 63 the floors and walls have other IDs (11, 111, 12
-/// and 112), and before 53 some arrays are made instead of read; neither
-/// is ported.
+/// reads. From version 63 the floors and walls are read from other IDs
+/// ([`WIDE_SURFACES`]). Before 53 some arrays are made instead of read,
+/// which is not ported.
 pub const SAVED_ARRAYS: [u16; 14] = [0, 4, 1, 2, 3, 8, 101, 102, 103, 108, 6, 7, 9, 10];
+
+/// From version 63 (0x47861d to 0x478652), the Arry chunk each floor and
+/// wall array of the lot is read from, as the lot holds it (16-bit floor
+/// IDs, 14-byte wall cells): the level's base (0 or 100) plus 11 for the
+/// floors and 12 for the walls, in place of 1 and 2. Pairs of the
+/// lot's array ID and the chunk ID.
+pub const WIDE_SURFACES: [(u16, u16); 4] = [(1, 11), (2, 12), (101, 111), (102, 112)];
 
 /// The last two of [`SAVED_ARRAYS`]: the original ignores whether reading
 /// them worked.
@@ -274,6 +281,17 @@ impl World {
     /// water, and of the others the cells the trace holds, was equal.
     /// Arrays 4, 6 and 7 are **unverified**.
     ///
+    /// From version 63 the floors and walls are saved as the lot holds
+    /// them, and the original reads each into the lot's array whole, as it
+    /// reads every other array (0x431005 takes the chunk's size and cell
+    /// size, then copies all of it): the lot's floors from Arry 11 and
+    /// 111, its walls from 12 and 112 ([`WIDE_SURFACES`]). Arrays 1, 2, 101
+    /// and 102 of such a file are not read. A floor whose cells are not 2
+    /// bytes, or a wall whose cells are not 14, is an error here; the
+    /// original would take it, and what it then does with one is not
+    /// known. No later version changes the layout: the loader's other
+    /// version tests all fall below 53.
+    ///
     /// Two things differ from the original. It stops at the first array
     /// that fails to read and goes on with the load; here a missing array
     /// is an error. And every array must be 64 by 64, as the original's are
@@ -287,13 +305,38 @@ impl World {
         saved: &BTreeMap<u16, Array>,
         version: u32,
     ) -> Result<(), LoadError> {
-        if !(53..=62).contains(&version) {
+        if version < 53 {
             return Err(LoadError::ArrayVersion(version));
         }
         let full = FULL_SIZE as usize;
         let active = usize::try_from(self.size).unwrap_or(0).min(full);
+        let wide = version >= 63;
         let mut read = Vec::new();
         for id in SAVED_ARRAYS {
+            let surface = WIDE_SURFACES.iter().find(|&&(lot, _)| lot == id);
+            if let (true, Some(&(lot, chunk))) = (wide, surface) {
+                let array = saved.get(&chunk).ok_or(LoadError::MissingArray(chunk))?;
+                if array.width != full || array.height != full {
+                    return Err(LoadError::ArraySize {
+                        array: chunk,
+                        width: array.width,
+                        height: array.height,
+                    });
+                }
+                let cell = if FLOORS.contains(&lot) {
+                    FLOOR_CELL
+                } else {
+                    WALL_CELL
+                };
+                if array.stride != cell || array.data.len() != full * full * cell {
+                    return Err(LoadError::ArrayStride {
+                        array: chunk,
+                        stride: array.stride,
+                    });
+                }
+                read.push((lot, array.clone()));
+                continue;
+            }
             let Some(array) = saved.get(&id) else {
                 if OPTIONAL_ARRAYS.contains(&id) {
                     continue;
