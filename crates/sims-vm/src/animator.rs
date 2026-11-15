@@ -72,7 +72,7 @@ use crate::people::read_appearance_if_stale;
 use crate::placement::{Place, on_lot, pool_tile};
 use sims_core::{Ext, F32};
 use sims_sim::World;
-use sims_sim::animator::{Animator, EPSILON, LOADED, Layer, UNSET};
+use sims_sim::animator::{Animator, Base, EPSILON, LOADED, Layer, UNSET};
 use sims_sim::pose;
 use std::cmp::Ordering;
 
@@ -513,13 +513,17 @@ impl Interpreter<'_> {
             .data;
         let posture = i32::from(words.get(POSTURE).copied().unwrap_or(0));
         let kind = words.get(KIND).copied().unwrap_or(0);
-        if a.posture != posture && a.base {
+        if a.posture != posture && a.base.is_filled() {
             // 0x592878 removes the base slot's layer at once (0x5a0a7b),
-            // which marks the skin's layers changed (0x5991d4).
-            a.base = false;
+            // which marks the skin's layers changed (0x5991d4). A clip
+            // Animate Sim put there goes the same way.
+            a.base = Base::Empty;
             a.skin_dirty = true;
         }
-        if flags & 4 == 0 && !(a.base && kind <= 1) {
+        // A layer in the slot stays for a person of kind at most 1,
+        // whoever started it; for any other kind the posture's clip
+        // replaces it, a clip Animate Sim put there included.
+        if flags & 4 == 0 && !(a.base.is_filled() && kind <= 1) {
             a.posture = posture;
             if let Some(selection) = base_selection(posture) {
                 read_appearance_if_stale(world, self.program, id, &mut a.profile_stale)?;
@@ -530,9 +534,10 @@ impl Interpreter<'_> {
                 if posture != 0 {
                     self.check_base_clip(world, id, posture, selection)?;
                 }
-                // 0x592726 empties the slot first (it is empty here) and
-                // adds the new layer to the skin.
-                a.base = true;
+                // 0x592726 empties the slot first (0x592878, at once) and
+                // adds the new layer to the skin; either marks the skin's
+                // layers changed.
+                a.base = Base::Posture;
                 a.skin_dirty = true;
             }
         }

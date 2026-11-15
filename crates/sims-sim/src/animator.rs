@@ -90,7 +90,7 @@ pub const LOADED: Animator = Animator {
     destination: [F32::ZERO; 3],
     head_clock: 0,
     posture: -1,
-    base: false,
+    base: Base::Empty,
     pickup: 0,
     carry_mode: 0,
     carry_selection: -1,
@@ -139,8 +139,8 @@ pub struct Animator {
     pub head_clock: i32,
     /// +0x198: the posture the base layer was started for.
     pub posture: i32,
-    /// Whether the base slot (+0x14) holds a layer.
-    pub base: bool,
+    /// What the base slot (+0x14) holds ([`Base`]).
+    pub base: Base,
     /// +0x1a4: set while a clip that picks something up plays, which keeps
     /// the carry selection as it is.
     pub pickup: i32,
@@ -212,6 +212,48 @@ pub struct Animator {
     /// carry layer (priority 10). The base layer, whose clip has no
     /// events, is left out of this.
     pub carry_first: bool,
+}
+
+/// What the base slot (+0x14) holds. Its layer repeats at priority -10
+/// whoever started it. Its clock is not kept: a base clip with timed
+/// events, which the skin's update would handle (0x5992b3), fails before
+/// it is started, so nothing the simulation reads depends on it.
+///
+/// Where the layer goes in the skin's list (skin +0x7c) is not kept
+/// either. Every start makes the layer at priority 1 and puts it before
+/// the first layer whose priority is above 1 (0x599128), then gives it
+/// -10 (0x59867f). It may then come before or after the foreground
+/// layer, depending on that layer's priority, and comes before the carry
+/// layer. With no timed events, its place changes nothing that is
+/// handled.
+///
+/// The encoding of `Empty` and `Posture` is that of `false` and `true`,
+/// which this slot was before a script could fill it, so states and
+/// snapshots that hold neither of the others encode as they did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Base {
+    /// The slot is empty.
+    Empty,
+    /// The clip of the posture [`Animator::posture`] names, which the
+    /// animator's base update starts (virtual function 0x58, 0x590430).
+    Posture,
+    /// A clip Animate Sim started there (flag 0x01 alone, 0x58957e),
+    /// backward when `reverse` is set. The base update leaves it until the
+    /// person's posture changes, or replaces it with the posture's clip
+    /// for a person of kind (word 65) above 1.
+    Script {
+        /// The clip's name.
+        clip: String,
+        /// Whether the clip plays backward (speed -1, from the end).
+        reverse: bool,
+    },
+}
+
+impl Base {
+    /// Whether the slot holds a layer.
+    pub fn is_filled(&self) -> bool {
+        !matches!(self, Base::Empty)
+    }
 }
 
 /// What the animator keeps while it follows a route (states 3 to 10):
@@ -754,8 +796,8 @@ impl Animator {
         self.walking = false;
         self.profile_stale = true;
         self.selection = -1;
-        if self.base {
-            self.base = false;
+        if self.base.is_filled() {
+            self.base = Base::Empty;
             self.skin_dirty = true;
         }
         if self.carry.take().is_some() {

@@ -2,7 +2,7 @@ use sims_content::{Catalog, House, Index, Install, Neighborhood};
 use sims_core::{CrtRng, F32, GameRng};
 use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
-use sims_sim::animator::{Animator, Fade, LOADED, Layer, Motion, UNSET};
+use sims_sim::animator::{Animator, Base, Fade, LOADED, Layer, Motion, UNSET};
 use sims_sim::head::Head;
 use sims_sim::neighbors::{Inventory, Item, Neighbor, Neighbors, Row};
 use sims_sim::rooms::{Half, Room, Rooms};
@@ -328,7 +328,7 @@ fn animator() -> Animator {
         ],
         destination: [UNSET; 3],
         posture: 0,
-        base: true,
+        base: Base::Posture,
         events: vec![7, -2],
         foreground: Some(layer),
         playing: true,
@@ -369,6 +369,30 @@ fn the_hash_is_the_same_on_every_platform() {
     assert_eq!(world().hash_hex(), PINNED);
 }
 const PINNED: &str = "23e9f53ef9c6129ef25795acb31d097cce39ddb0401b852212b4a4f96e49cdcd";
+
+#[test]
+fn the_base_slot_encodes_as_the_flag_it_was_unless_a_script_fills_it() {
+    // An empty slot and the posture's clip encode as false and true did,
+    // so format 21 needs no new version for them.
+    let bytes = |result: Result<Vec<u8>, postcard::Error>| result.unwrap();
+    assert_eq!(
+        bytes(postcard::to_allocvec(&Base::Empty)),
+        bytes(postcard::to_allocvec(&false))
+    );
+    assert_eq!(
+        bytes(postcard::to_allocvec(&Base::Posture)),
+        bytes(postcard::to_allocvec(&true))
+    );
+    // A script's clip comes back as it went.
+    let mut world = world();
+    world.animators.get_mut(&5).unwrap().base = Base::Script {
+        clip: "a2o-base".into(),
+        reverse: true,
+    };
+    let back = World::decode(&world.encode()).unwrap();
+    assert_eq!(back.animators, world.animators);
+    assert_eq!(back.hash(), world.hash());
+}
 
 #[test]
 fn without_the_carry_layer_the_encoding_is_format_20() {

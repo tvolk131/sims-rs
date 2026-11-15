@@ -38,7 +38,7 @@ use crate::math::{Quat, Transform, Vec3};
 use crate::rig::Pose;
 use sims_formats::avatar::Skeleton;
 use sims_formats::saved_objects::Person;
-use sims_sim::animator::{Animator, UNSET};
+use sims_sim::animator::{Animator, Base, UNSET};
 use std::collections::BTreeMap;
 
 /// Model units per tile. A walk step moves the person by the clip's
@@ -166,8 +166,9 @@ impl<'a> Player<'a> {
     }
 
     /// The pose of `skeleton` for `animator`: the rest pose, then the base
-    /// clip `base` (when the animator has a base layer) repeating at the
-    /// animator's clock, then the foreground layer at its phase and
+    /// clip repeating at the animator's clock (`base` for the posture's
+    /// clip, or the clip a script put in the base slot, backward when it
+    /// plays backward), then the foreground layer at its phase and
     /// weight, then the carry layer the same way. A layer repeats when its
     /// end mode is 1. The layers go on in the order of their priorities
     /// (the base -10, the foreground 1 or 6, the carry 10), so a bone two
@@ -182,14 +183,22 @@ impl<'a> Player<'a> {
         base: &str,
     ) -> Result<Pose, String> {
         let mut pose = Pose::rest(skeleton);
-        if animator.base {
+        let base = match &animator.base {
+            Base::Empty => None,
+            Base::Posture => Some((base, false)),
+            Base::Script { clip, reverse } => Some((clip.as_str(), *reverse)),
+        };
+        if let Some((base, reverse)) = base {
             let clip = self.clip(base)?;
             let duration = f64::from(clip.animation.duration_ms);
-            let phase = if duration > 0.0 {
+            let mut phase = if duration > 0.0 {
                 (f64::from(animator.clock).rem_euclid(duration) / duration) as f32
             } else {
                 0.0
             };
+            if reverse {
+                phase = 1.0 - phase;
+            }
             clip.apply(skeleton, &mut pose, phase, true, 1.0);
         }
         for layer in [&animator.foreground, &animator.carry]

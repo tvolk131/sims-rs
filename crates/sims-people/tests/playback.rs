@@ -9,7 +9,7 @@ use sims_core::F32;
 use sims_people::math::Vec3;
 use sims_people::raster::{Camera, Canvas};
 use sims_people::{Assets, Body, Library, Player, base_clip, placement, residents};
-use sims_sim::animator::{Animator, Layer};
+use sims_sim::animator::{Animator, Base, Layer};
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
@@ -71,7 +71,7 @@ fn the_standing_loop_and_the_walk_load_with_their_samples() {
 fn animator(clock: i32, walk: Option<(&str, f32)>, library: &Library, assets: &Assets) -> Animator {
     let mut animator = Animator::new(clock);
     animator.position = [0.0, 0.0, 3.0].map(F32::from_f32);
-    animator.base = true;
+    animator.base = Base::Posture;
     if let Some((clip, phase)) = walk {
         let loaded = library.load(assets, clip).unwrap();
         let mut layer = Layer::start(

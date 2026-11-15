@@ -60,7 +60,7 @@ use crate::fault::Trap;
 use crate::interpreter::Interpreter;
 use sims_core::{Ext, F32};
 use sims_sim::World;
-use sims_sim::animator::Animator;
+use sims_sim::animator::{Animator, Base};
 use sims_sim::head::{self, Anchor, Matrix};
 use sims_sim::pose;
 
@@ -378,8 +378,11 @@ impl Interpreter<'_> {
                 }
             }
         }
-        if a.base {
-            let name = self.base_clip(world, id, a.posture)?;
+        if a.base.is_filled() {
+            let name = match &a.base {
+                Base::Script { clip, .. } => clip.clone(),
+                _ => self.base_clip(world, id, a.posture)?,
+            };
             let base =
                 self.program.animations.clip(&name).map_err(|e| {
                     unsupported("0x59dc32", &format!("finds no clip {name:?}: {e}"))

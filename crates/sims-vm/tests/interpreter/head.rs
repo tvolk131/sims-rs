@@ -4,7 +4,7 @@
 use crate::support::*;
 use sims_content::{Bone, Clip, Profile, Skeleton};
 use sims_core::F32;
-use sims_sim::animator::{Animator, LOADED, Layer};
+use sims_sim::animator::{Animator, Base, LOADED, Layer};
 
 /// A person with one bone, "HEAD", whose rig names `point` for the top
 /// anchor, playing a one-frame clip, with a head target off to the side.
@@ -184,4 +184,54 @@ fn a_carry_layer_that_moves_the_head_or_its_root_fails_loudly() {
             "{bone}: {fault}"
         );
     }
+}
+
+/// [`carrying`] with no carry layer and, in the base slot, a clip a script
+/// put there (0x58957e) that moves `moved`.
+fn based(moved: &str) -> Fixture {
+    let mut fx = carrying("ARM");
+    fx.program.animations.insert(
+        "test",
+        Clip {
+            name: "base".into(),
+            skill: "skill".into(),
+            duration: 100f32.to_bits(),
+            distance: 0,
+            moving: false,
+            frames: 1,
+            motions: 1,
+            tracks: vec![],
+            channels: vec![sims_content::Channel {
+                bone: moved.into(),
+                translation: None,
+                rotation: Some(0),
+            }],
+            samples: [0, 0],
+        },
+    );
+    let animator = fx.world.animators.get_mut(&SIM).unwrap();
+    animator.carry = None;
+    animator.carry_selection = -1;
+    animator.base = Base::Script {
+        clip: "base".into(),
+        reverse: false,
+    };
+    fx
+}
+
+#[test]
+fn a_scripts_base_clip_is_checked_against_the_foreground() {
+    // A base clip that moves only the arm leaves the head as the
+    // foreground put it.
+    let heading = draw(based("ARM")).unwrap();
+    let mut alone = based("ARM");
+    alone.world.animators.get_mut(&SIM).unwrap().base = Base::Empty;
+    assert_eq!(heading, draw(alone).unwrap());
+    // One that moves the head, which the foreground leaves alone, would
+    // show through, and fails loudly naming the script's clip.
+    let fault = draw(based("HEAD")).unwrap_err();
+    assert!(
+        matches!(&fault.trap, sims_vm::Trap::Unsupported(m) if m.contains("base clip \"base\"")),
+        "{fault}"
+    );
 }
