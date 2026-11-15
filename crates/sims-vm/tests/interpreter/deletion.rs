@@ -294,7 +294,7 @@ fn people_let_go_of_a_deleted_object_and_others_are_left_alone() {
 }
 
 #[test]
-fn a_reset_stops_the_objects_sounds_and_a_deletion_stops_them_once() {
+fn a_reset_stops_the_objects_sounds_and_a_deletion_stops_them_twice() {
     let (fx, _) = lot(2, true);
     let sink = RefCell::new(Vec::new());
     let mut interpreter = fx.interpreter();
@@ -302,9 +302,11 @@ fn a_reset_stops_the_objects_sounds_and_a_deletion_stops_them_once() {
     let mut world = fx.world.clone();
     assert_eq!(interpreter.reset(&mut world, 1, false), Ok(()));
     assert_eq!(sink.take(), [SoundEvent::Stop { object: 1 }]);
-    // The deletion's own reset stops nothing; its destructor does.
+    // The deletion's own reset stops them (0x4320b4), and so does its
+    // destructor (0x4323c9).
     assert_eq!(interpreter.delete(&mut world, 2), Ok(()));
-    assert_eq!(sink.take(), [SoundEvent::Stop { object: 2 }]);
+    let stop = SoundEvent::Stop { object: 2 };
+    assert_eq!(sink.take(), [stop.clone(), stop]);
     // Without a sink nothing is noted, and the lot ends the same.
     let mut quiet = fx.world.clone();
     let plain = fx.interpreter();
