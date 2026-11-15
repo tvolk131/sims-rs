@@ -24,11 +24,11 @@
 //!   of 0.2 degrees, while the direction itself swings by up to 12
 //!   degrees from tick to tick. Direction 3 faces the viewer.
 //! - **What.** The foreground layer (`Animator::foreground`) is drawn
-//!   over the base layer, which plays the posture's loop. The simulation
-//!   keeps whether the base layer exists (`Animator::base`) but not its
-//!   clip or phase, so the clip comes from the saved person record and the
-//!   phase from the animator's clock. Both are stand-ins until the
-//!   simulation exposes them.
+//!   over the base layer, which plays the posture's loop or a script's
+//!   clip, with its clip and phase as the simulation keeps them
+//!   (`World::base_layers`). A state kept before the simulation held them
+//!   falls back to the saved person record's clip at the animator's
+//!   clock.
 //!
 //! The image is the original's, not its mirror image: see [`crate::rig`].
 
@@ -38,7 +38,7 @@ use crate::math::{Quat, Transform, Vec3};
 use crate::rig::Pose;
 use sims_formats::avatar::Skeleton;
 use sims_formats::saved_objects::Person;
-use sims_sim::animator::{Animator, Base, UNSET};
+use sims_sim::animator::{Animator, Base, Layer, UNSET};
 use std::collections::BTreeMap;
 
 /// Model units per tile. A walk step moves the person by the clip's
@@ -166,47 +166,66 @@ impl<'a> Player<'a> {
     }
 
     /// The pose of `skeleton` for `animator`: the rest pose, then the base
-    /// clip repeating at the animator's clock (`base` for the posture's
-    /// clip, or the clip a script put in the base slot, backward when it
-    /// plays backward), then the foreground layer at its phase and
-    /// weight, then the carry layer the same way. A layer repeats when its
-    /// end mode is 1. The layers go on in the order of their priorities
-    /// (the base -10, the foreground 1 or 6, the carry 10), so a bone two
-    /// clips move takes the higher layer's motion, as the skin's bone
-    /// assignment does (0x5991fd); that blending is not modeled further.
-    /// Last, the head turns as the simulation's head fields say
-    /// ([`Pose::turn_head`]).
+    /// layer, then the foreground layer at its phase and weight, then the
+    /// carry layer the same way. A layer repeats when its end mode is 1.
+    ///
+    /// The base layer is `layer`, the simulation's playback of the clip in
+    /// the animator's base slot ([`sims_sim::World::base_layers`]), at its
+    /// phase: the posture's loop (sitting, standing) or the clip a script
+    /// put there. A state kept before the simulation held it has none, and
+    /// then the slot's clip repeats at the animator's clock instead: `base`
+    /// for the posture's clip, or the script's clip from when it started,
+    /// backward when it plays backward.
+    ///
+    /// The layers go on in the order of their priorities (the base -10,
+    /// the foreground 1 or 6, the carry 10), so a bone two clips move
+    /// takes the higher layer's motion, as the skin's bone assignment does
+    /// (0x5991fd); that blending is not modeled further. Last, the head
+    /// turns as the simulation's head fields say ([`Pose::turn_head`]).
     pub fn pose(
         &mut self,
         skeleton: &Skeleton,
         animator: &Animator,
+        layer: Option<&Layer>,
         base: &str,
     ) -> Result<Pose, String> {
         let mut pose = Pose::rest(skeleton);
-        // A script's clip plays from when it started (0x597a88); the
-        // posture's from the clock's zero.
-        let base = match &animator.base {
-            Base::Empty => None,
-            Base::Posture => Some((base, false, 0)),
-            Base::Script {
-                clip,
-                reverse,
-                start,
-            } => Some((clip.as_str(), *reverse, *start)),
-        };
-        if let Some((base, reverse, start)) = base {
-            let clip = self.clip(base)?;
-            let duration = f64::from(clip.animation.duration_ms);
-            let elapsed = f64::from(animator.clock) - f64::from(start);
-            let mut phase = if duration > 0.0 {
-                (elapsed.rem_euclid(duration) / duration) as f32
-            } else {
-                0.0
-            };
-            if reverse {
-                phase = 1.0 - phase;
+        match (&animator.base, layer) {
+            (Base::Empty, _) => {}
+            (_, Some(layer)) => {
+                let clip = self.clip(&layer.clip)?;
+                clip.apply(
+                    skeleton,
+                    &mut pose,
+                    layer.phase.to_f32(),
+                    layer.mode == 1,
+                    layer.weight.to_f32(),
+                );
             }
-            clip.apply(skeleton, &mut pose, phase, true, 1.0);
+            (filled, None) => {
+                // A script's clip plays from when it started (0x597a88);
+                // the posture's from the clock's zero.
+                let (base, reverse, start) = match filled {
+                    Base::Script {
+                        clip,
+                        reverse,
+                        start,
+                    } => (clip.as_str(), *reverse, *start),
+                    _ => (base, false, 0),
+                };
+                let clip = self.clip(base)?;
+                let duration = f64::from(clip.animation.duration_ms);
+                let elapsed = f64::from(animator.clock) - f64::from(start);
+                let mut phase = if duration > 0.0 {
+                    (elapsed.rem_euclid(duration) / duration) as f32
+                } else {
+                    0.0
+                };
+                if reverse {
+                    phase = 1.0 - phase;
+                }
+                clip.apply(skeleton, &mut pose, phase, true, 1.0);
+            }
         }
         for layer in [&animator.foreground, &animator.carry]
             .into_iter()
@@ -327,10 +346,10 @@ mod tests {
         let mut player = Player::new(&assets, &library);
         // No base layer and no foreground: only the rest pose and the head.
         let mut animator = Animator::new(0);
-        let still = player.pose(&skeleton, &animator, "unused").unwrap();
+        let still = player.pose(&skeleton, &animator, None, "unused").unwrap();
         assert_eq!(still, Pose::rest(&skeleton));
         animator.head.turn = F32::from_f32(1.0);
-        let turned = player.pose(&skeleton, &animator, "unused").unwrap();
+        let turned = player.pose(&skeleton, &animator, None, "unused").unwrap();
         let mut want = Pose::rest(&skeleton);
         want.turn_head(&skeleton, animator.head.turn);
         assert_eq!(turned, want);

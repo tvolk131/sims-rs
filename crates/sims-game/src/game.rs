@@ -81,6 +81,11 @@ impl Outcome {
     }
 }
 
+/// How often the window draws the plumb bob's spin when nothing else
+/// changes: 20 frames a second, this crate's choice (the original's frame
+/// rate is not ported).
+pub const SPIN_FRAME_US: u64 = 50_000;
+
 pub struct Game {
     lot: Lot,
     lot_shape: sims_render::Lot,
@@ -105,6 +110,11 @@ pub struct Game {
     /// The pie menu listed when the pointer reached an object: for whom,
     /// on what, and the listing, until a click opens it.
     listed: Option<(u16, u16, Result<Listing, String>)>,
+    /// The time the window has passed in, in microseconds: the clock
+    /// that spins the plumb bob.
+    clock_us: u64,
+    /// `clock_us` when the frame was last drawn.
+    drawn_us: u64,
     canvas: Canvas,
 }
 
@@ -145,6 +155,8 @@ impl Game {
             reached: None,
             listed: None,
             note: None,
+            clock_us: 0,
+            drawn_us: 0,
             canvas: Canvas::new(1, 1, [0, 0, 0]),
         })
     }
@@ -269,6 +281,19 @@ impl Game {
         }
     }
 
+    /// Whether the plumb bob has spun enough since the frame was drawn to
+    /// draw it again, though no tick ran (as while a dialog waits): a
+    /// plumb bob is on the lot and [`SPIN_FRAME_US`] have passed.
+    pub fn spin_due(&self) -> bool {
+        self.clock_us.saturating_sub(self.drawn_us) >= SPIN_FRAME_US
+            && self
+                .lot
+                .world()
+                .objects
+                .values()
+                .any(|o| o.guid == sims_people::bob::STANDARD)
+    }
+
     /// Runs the ticks owed after `elapsed_us` more microseconds at the
     /// simulation's speed. Returns how many ran.
     ///
@@ -288,6 +313,7 @@ impl Game {
     /// (`0x46da1b`); here the next tick waits a period of the new speed
     /// (**unverified**, and the window's timing, not the simulation's).
     pub fn advance(&mut self, elapsed_us: u64) -> u32 {
+        self.clock_us = self.clock_us.saturating_add(elapsed_us);
         if self.lot.asking().is_some() {
             self.pace.restart();
             return 0;
@@ -442,6 +468,13 @@ impl Game {
             &self.view.camera,
             &mut self.canvas,
         );
+        // The plumb bob spins by the game's clock in milliseconds (the
+        // original's 0x6e54e0); here the time passed in, which runs on
+        // while the lot is paused or a dialog waits (**unverified**
+        // whether the original's does).
+        self.drawn_us = self.clock_us;
+        let milliseconds = (self.clock_us / 1000) as u32;
+        self.people.set_clock(milliseconds);
         self.people.draw(world, &self.view.camera, &mut self.canvas);
         // The pie menu shows the head of the Sim it is for, as posed now.
         if let Some(menu) = &mut self.hud.menu {
@@ -648,6 +681,12 @@ impl Game {
     /// was when the frame was drawn ([`Game::render`]).
     pub fn panel(&self) -> &[sims_ui::hud::Item] {
         self.hud.items()
+    }
+
+    /// What the control panel shows of `world`: [`Game::render`] lays
+    /// the panel out from this for the lot's world.
+    pub fn snapshot(&self, world: &sims_sim::World) -> sims_ui::household::Snapshot {
+        self.hud.snapshot(world)
     }
 
     /// The first name the panel shows for people of type `guid`.
@@ -895,7 +934,10 @@ impl Game {
                 self.answer(caller, button);
                 Outcome::redraw()
             }
-            Command::TogglePanel | Command::OpenPanel(_) => Outcome::redraw(),
+            Command::TogglePanel
+            | Command::OpenPanel(_)
+            | Command::ShowRelations(_)
+            | Command::RelationsPage(_) => Outcome::redraw(),
             other => {
                 self.note = Some(format!("Not carried out yet: {other:?}"));
                 Outcome::redraw()

@@ -306,6 +306,8 @@ impl App {
         let ran = self.game.advance(micros);
         // A dialog shown at the first tick due is drawn though none ran.
         let mut redraw = ran > 0 || (!waited && self.game.asking().is_some());
+        // The plumb bob spins by the time passed, ticks or not.
+        redraw |= self.game.spin_due();
         // What the tick's sounds may ask about their objects, before the
         // sounds themselves. Read on every call, not only after a step
         // that succeeded: a failed step may still have changed the lot.

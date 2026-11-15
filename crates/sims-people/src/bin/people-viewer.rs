@@ -313,12 +313,12 @@ impl Viewer {
         let mut canvas = Canvas::new(width, height, BACKGROUND);
         let player = &mut self.player;
         // Each person's animator and the body it is drawn with.
-        let mut scene: Vec<(&Person, Animator)> = Vec::new();
+        let mut scene: Vec<(&Person, Animator, Option<Layer>)> = Vec::new();
         match self.source.world() {
             Some(world) => {
                 for (id, animator) in &world.animators {
                     if let Some(person) = self.people.iter().find(|p| p.resident.id == *id) {
-                        scene.push((person, animator.clone()));
+                        scene.push((person, animator.clone(), world.base_layers.get(id).cloned()));
                     }
                 }
             }
@@ -336,16 +336,21 @@ impl Viewer {
                         None
                     };
                     let walk = walk.as_ref().map(|(n, d, f)| (n.as_str(), *d, *f));
-                    scene.push((person, demonstration(x, clock, walk)));
+                    scene.push((person, demonstration(x, clock, walk), None));
                 }
             }
         }
         let mut posed = Vec::new();
-        for (person, animator) in &scene {
+        for (person, animator, layer) in &scene {
             let Some(root) = placement(animator) else {
                 continue;
             };
-            let pose = player.pose(&person.body.skeleton, animator, &person.base)?;
+            let pose = player.pose(
+                &person.body.skeleton,
+                animator,
+                layer.as_ref(),
+                &person.base,
+            )?;
             posed.push((*person, pose.world(&person.body.skeleton, root), root));
         }
         let center = if posed.is_empty() {
