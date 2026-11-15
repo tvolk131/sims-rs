@@ -522,3 +522,231 @@ fn idle_for_input_keeps_its_state_when_it_yields() {
     assert_eq!(idle_turn(&mut fx).0, Status::Returned(true));
     assert_eq!(fx.sim().person.as_ref().unwrap().queue.len(), 1);
 }
+
+/// The lot with an adult resident Sim, not a pet, and the lamp's table
+/// set to `entries`.
+fn menu_lot(entries: Vec<Interaction>) -> Fixture {
+    let mut fx = lot([0; 8]);
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    (person.data[73], person.data[58], person.data[65]) = (0, 30, 0);
+    let table = fx
+        .program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .interactions
+        .get_mut(&TABLE)
+        .unwrap()
+        .as_mut()
+        .unwrap();
+    table.interactions = entries;
+    fx
+}
+
+fn with_test(menu: u32, flags: u32, test: u16) -> Interaction {
+    Interaction {
+        test,
+        ..entry(menu, flags)
+    }
+}
+
+#[test]
+fn the_pie_menu_lists_each_entry_whose_check_passes_in_order() {
+    // Menu 5 is refused by its check tree; menu 3 appears twice, and the
+    // second makes the first's action (its flags and tree), as find-first
+    // does; menu 0x80's flag is only a name prefix.
+    let mut second = entry(3, 0);
+    second.action = 4201;
+    let mut fx = menu_lot(vec![
+        with_test(5, 0, 4301),
+        entry(3, 0x100),
+        entry(9, 0x80),
+        second,
+        with_test(4, 4, 4300),
+    ]);
+    temp_writing_check(&mut fx);
+    fx.add(
+        LAMP_FILE,
+        4301,
+        tree(vec![ins(0, RETURN_FALSE, RETURN_FALSE, [0; 8])]),
+    );
+    fx.sim_mut().temps[0] = 11;
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let listed = interpreter
+        .pie_menu(&mut fx.world, SIM, LAMP)
+        .unwrap_or_else(|f| panic!("{f}"));
+    let shown: Vec<_> = listed
+        .iter()
+        .map(|a| (a.table_index, a.flags, a.action, a.uid, a.priority))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (3, 0xd, ACTION, 0, 50),
+            (9, 0xc, ACTION, 0, 50),
+            (3, 0xd, ACTION, 0, 50),
+            (4, 0xc, ACTION, 0, 50),
+        ]
+    );
+    // The check trees' temps are put back; nothing is queued or numbered.
+    assert_eq!(fx.sim().temps[0], 11);
+    assert!(fx.sim().person.as_ref().unwrap().queue.is_empty());
+    assert_eq!(fx.world.action_serial, 0);
+}
+
+#[test]
+fn a_picked_action_is_queued_as_listed() {
+    let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let listed = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap();
+    assert_eq!(
+        interpreter.pick(&mut fx.world, SIM, listed[0].clone()),
+        Ok(Some(1))
+    );
+    let queue = &fx.sim().person.as_ref().unwrap().queue;
+    let [queued] = queue.as_slice() else {
+        panic!("{queue:?}");
+    };
+    let mut expected = listed[0].clone();
+    expected.uid = 1;
+    assert_eq!(format!("{queued:?}"), format!("{expected:?}"));
+    // The same as an order for the entry.
+    let mut ordered = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    assert_eq!(
+        interpreter.order(&mut ordered.world, SIM, LAMP, 3),
+        Ok(Some(1))
+    );
+    assert_eq!(
+        format!("{:?}", ordered.sim().person.as_ref().unwrap().queue),
+        format!("{queue:?}")
+    );
+    // An entry that runs at once is not ported.
+    let fault = interpreter
+        .pick(&mut fx.world, SIM, listed[1].clone())
+        .unwrap_err();
+    assert!(
+        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x45d240")),
+        "{fault}"
+    );
+}
+
+#[test]
+fn what_the_pie_menu_does_not_port_fails_loudly() {
+    let unsupported = |fx: &mut Fixture, object: u16, address: &str| {
+        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        let fault = interpreter
+            .pie_menu(&mut fx.world, SIM, object)
+            .unwrap_err();
+        assert!(
+            matches!(&fault.trap, Trap::Unsupported(m) if m.contains(address)),
+            "{fault}"
+        );
+    };
+    // A pet.
+    let mut fx = menu_lot(vec![entry(3, 0)]);
+    fx.sim_mut().person.as_mut().unwrap().data[65] = 2;
+    unsupported(&mut fx, LAMP, "0x4585b1");
+    // Nothing offered: the objects on the tile are listed instead.
+    let mut fx = menu_lot(vec![with_test(3, 0, 4301)]);
+    fx.add(
+        LAMP_FILE,
+        4301,
+        tree(vec![ins(0, RETURN_FALSE, RETURN_FALSE, [0; 8])]),
+    );
+    unsupported(&mut fx, LAMP, "0x48d423");
+    // Another person, while my running interaction may be joined.
+    let mut fx = menu_lot(vec![entry(3, 2)]);
+    fx.add_sim(7);
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    (person.active.target, person.active.table_index) = (LAMP as i16, 3);
+    unsupported(&mut fx, 7, "0x45866d");
+    // Not a person.
+    let mut fx = menu_lot(vec![entry(3, 0)]);
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let fault = interpreter.pie_menu(&mut fx.world, LAMP, LAMP).unwrap_err();
+    assert!(matches!(fault.trap, Trap::Invalid(_)), "{fault}");
+}
+
+#[test]
+fn a_picked_action_whose_entry_is_gone_is_not_queued() {
+    let mut fx = menu_lot(vec![entry(3, 0x100)]);
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let listed = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap();
+    // Its menu number is no longer in the table, or its target has no
+    // table: nothing is queued and no number is used (0x45d22a).
+    let mut renumbered = listed[0].clone();
+    renumbered.table_index = 9;
+    let mut on_sim = listed[0].clone();
+    on_sim.target = SIM as i16;
+    for action in [renumbered, on_sim] {
+        assert_eq!(interpreter.pick(&mut fx.world, SIM, action), Ok(None));
+    }
+    assert!(fx.sim().person.as_ref().unwrap().queue.is_empty());
+    assert_eq!(fx.world.action_serial, 0);
+}
+
+#[test]
+fn each_listed_action_reads_whether_i_am_a_visitor_after_the_checks_before_it() {
+    // Low attenuation (code 2) differs for visitors. Menu 3's check makes
+    // me a visitor (person data word 32); menu 4, allowed to visitors
+    // (flag 1), is then made with the visitors' attenuation.
+    let low = |name: &str, value| sims_formats::tuning::Constant {
+        name: name.into(),
+        value,
+        comment: String::new(),
+    };
+    let coded = |menu, flags, test| Interaction {
+        attenuation_code: 2,
+        ..with_test(menu, flags, test)
+    };
+    let mut fx = menu_lot(vec![coded(3, 0, 4300), coded(4, 1, 0)]);
+    let global = fx.program.global;
+    fx.program
+        .libraries
+        .get_mut(&global)
+        .unwrap()
+        .tuning
+        .insert(
+            2,
+            sims_formats::tuning::Constants {
+                version: 0,
+                entries: vec![
+                    low("low attenuation", 0.25),
+                    low("visitor low attenuation", 0.75),
+                ],
+            },
+        );
+    fx.add(
+        LAMP_FILE,
+        4300,
+        tree(vec![assign(18, 32, scope::LITERAL, 1, RETURN_TRUE)]),
+    );
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let listed = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap();
+    let made: Vec<_> = listed
+        .iter()
+        .map(|a| (a.table_index, a.attenuation))
+        .collect();
+    assert_eq!(made, [(3, 0.25), (4, 0.75)]);
+}
+
+#[test]
+fn an_action_string_while_the_menu_is_listed_fails_loudly_and_temps_come_back() {
+    // Menu 3's check writes temp 0, then menu 4's runs Add/Change Action
+    // String, which would add an entry to the menu (0x458789).
+    let mut fx = menu_lot(vec![with_test(3, 0, 4300), with_test(4, 0, 4302)]);
+    temp_writing_check(&mut fx);
+    fx.add(
+        LAMP_FILE,
+        4302,
+        tree(vec![ins(50, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
+    );
+    fx.sim_mut().temps[0] = 11;
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let fault = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap_err();
+    assert!(
+        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x458789")),
+        "{fault}"
+    );
+    assert_eq!(fx.sim().temps[0], 11);
+}

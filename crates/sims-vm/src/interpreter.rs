@@ -98,6 +98,11 @@ pub struct Interpreter<'a> {
     /// the making the original appends a person to the person vector is
     /// not read, so a walk of the vector meanwhile is refused.
     pub(crate) making_person: Option<u16>,
+    /// Whether the player's pie menu is being listed (the original's three
+    /// pointers at 0x6e5130, 0x6e50fc and 0x6e50f8 are set), through every
+    /// tree that the listing runs, nested ones included. Add/Change Action
+    /// String reads it.
+    pub(crate) building_menu: bool,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -120,6 +125,7 @@ impl<'a> Interpreter<'a> {
             deleted: None,
             sounds: None,
             making_person: None,
+            building_menu: false,
         }
     }
 
@@ -258,6 +264,7 @@ impl<'a> Interpreter<'a> {
             base,
             synchronous,
             making_person: self.making_person,
+            building_menu: self.building_menu,
             advertisements: None,
         }
     }
@@ -321,6 +328,8 @@ pub(crate) struct Machine<'a, 'w> {
     pub advertisements: Option<Advertisements>,
     /// See [`Interpreter::making_person`].
     pub making_person: Option<u16>,
+    /// See [`Interpreter::building_menu`].
+    pub building_menu: bool,
 }
 
 /// See [`Machine::advertisements`].
@@ -338,6 +347,7 @@ impl<'a> Machine<'a, '_> {
             deleted: self.deleted,
             sounds: self.sounds,
             making_person: self.making_person,
+            building_menu: self.building_menu,
         }
     }
 
