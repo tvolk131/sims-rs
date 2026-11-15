@@ -2191,6 +2191,7 @@ fn the_goth_house_first_tick_matches_the_original() {
     const TICK_583: &str = "95602638fb97031232502163ecded9078771357166b92166150eebfba73adb2d";
     const TICK_608: &str = "baef8063918e1a4bf5ba86408a3121db72ac29b0dfc9052afa5a63da07a9fddc";
     const TICK_871: &str = "9f87c3362a000543a2e3283da523261e51253e3a9c63184832bb10c62120a1f6";
+    const TICK_877: &str = "a1a7d5d98711415cfe740d946f4ca561104f070ef18da034e5d4bbd16c9692fa";
     const TICK_416_20: &str = "37ff5756ac5cf26769da735eadb955be4f78f64381ea8b847963298b51f8320b";
     const USES_233: [(i16, i32); 2] = [(132, 5), (51, 8)];
     const TREES_233: [u16; 9] = [
@@ -2803,13 +2804,16 @@ fn the_goth_house_first_tick_matches_the_original() {
         }
         assert_eq!(world.ticks, before.ticks + 871);
         assert_eq!(digest(&world.encode()), TICK_871);
-        // Tick 872: object 121 sets a balloon.
+        // Tick 872: object 121, a trash can, clears its headline.
+        for _ in 872..=877 {
+            interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        }
+        assert_eq!(world.ticks, before.ticks + 877);
+        assert_eq!(digest(&world.encode()), TICK_877);
+        // Tick 878: the hour turns.
         let error = interpreter
             .lot_update(world, &tuning, &mut player)
             .unwrap_err();
-        assert!(
-            error.to_string().contains("unimplemented primitive 41"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("the hour turns"), "{error}");
     });
 }
