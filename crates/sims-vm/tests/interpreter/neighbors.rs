@@ -1,7 +1,8 @@
 //! What a lot's scripts do with the neighborhood's records, and the
 //! person primitives the Goth house's second tick reaches: an
 //! expression's neighbor person data (scope 32), Relationship between
-//! records, Manage Inventory, Idle For Input and Get Distance To.
+//! records, Manage Inventory, Idle For Input, Get Distance To and Get
+//! Direction To.
 //!
 //! Each primitive's doc comment cites the original's code it was ported
 //! from. These tests check the port's rules on synthetic data only.
@@ -462,4 +463,123 @@ fn get_distance_to_checks_its_temp_and_objects() {
         tree(vec![ins(11, RETURN_TRUE, RETURN_FALSE, TO_TEMP_3)]),
     );
     assert_eq!(code(fx.run_with(LAMP, 4096, 60, &[], BUDGET)), Some(0x17));
+}
+
+/// The lamp looks from the object its data word 11 names, or with flag 1
+/// from the one an operand names, towards the Sim, into a temp.
+fn direction(fx: &mut Fixture, operands: [u8; 8]) -> Result<i16, sims_vm::Fault> {
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(12, RETURN_TRUE, RETURN_FALSE, operands)]),
+    );
+    fx.run_with(LAMP, 4096, SIM as i16, &[], BUDGET)?;
+    Ok(fx.lamp().temps[usize::from(operands[0])])
+}
+
+const DIRECTION_TO_TEMP_3: [u8; 8] = [3, 0, scope::TEMPS, 0, 0, 0, 0, 0];
+
+#[test]
+fn get_direction_to_turns_the_offset_into_eighths() {
+    let mut fx = Fixture::new();
+    fx.lamp_mut().data[11] = LAMP as i16;
+    fx.lamp_mut().position = [64, 64, 1];
+    // The position's second coordinate is the original's first (+0xf4),
+    // as in route slots. Mostly along it, forwards and backwards.
+    fx.sim_mut().position = [80, 160, 1];
+    assert_eq!(direction(&mut fx, DIRECTION_TO_TEMP_3), Ok(4));
+    fx.sim_mut().position = [64, 0, 1];
+    assert_eq!(direction(&mut fx, DIRECTION_TO_TEMP_3), Ok(0));
+    // Mostly along the second, forwards and backwards.
+    fx.sim_mut().position = [160, 64, 1];
+    assert_eq!(direction(&mut fx, DIRECTION_TO_TEMP_3), Ok(2));
+    fx.sim_mut().position = [0, 64, 1];
+    assert_eq!(direction(&mut fx, DIRECTION_TO_TEMP_3), Ok(6));
+    // The diagonals.
+    fx.sim_mut().position = [96, 96, 1];
+    assert_eq!(direction(&mut fx, DIRECTION_TO_TEMP_3), Ok(3));
+    fx.sim_mut().position = [96, 32, 1];
+    assert_eq!(direction(&mut fx, DIRECTION_TO_TEMP_3), Ok(1));
+    fx.sim_mut().position = [32, 96, 1];
+    assert_eq!(direction(&mut fx, DIRECTION_TO_TEMP_3), Ok(5));
+    fx.sim_mut().position = [32, 32, 1];
+    assert_eq!(direction(&mut fx, DIRECTION_TO_TEMP_3), Ok(7));
+    // The level does not count.
+    fx.sim_mut().position = [80, 160, 2];
+    assert_eq!(direction(&mut fx, DIRECTION_TO_TEMP_3), Ok(4));
+    // With flag 1, from the object a literal names: the Sim to itself,
+    // two equal points, is 3.
+    assert_eq!(
+        direction(
+            &mut fx,
+            [3, 0, scope::TEMPS, 0, 1, scope::LITERAL, SIM as u8, 0]
+        ),
+        Ok(3)
+    );
+}
+
+#[test]
+fn get_direction_to_checks_its_objects_and_destination() {
+    let mut fx = Fixture::new();
+    // My data word 11 names no object.
+    fx.lamp_mut().data[11] = 50;
+    assert_eq!(
+        code(direction(&mut fx, DIRECTION_TO_TEMP_3).map(|_| true)),
+        Some(0x17)
+    );
+    fx.lamp_mut().data[11] = LAMP as i16;
+    // The stack object is missing.
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(
+            12,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            DIRECTION_TO_TEMP_3,
+        )]),
+    );
+    assert_eq!(code(fx.run_with(LAMP, 4096, 60, &[], BUDGET)), Some(0x15));
+    // A literal destination has no word behind it.
+    assert!(matches!(
+        trap(direction(&mut fx, [3, 0, scope::LITERAL, 0, 0, 0, 0, 0]).map(|_| true)),
+        Trap::Unsupported(_)
+    ));
+}
+
+#[test]
+fn get_direction_to_from_global_34_writes_global_34() {
+    // Global 34 resolves with a word pointer even read-only, and that
+    // pointer replaces the destination, as in Random Number: the
+    // direction lands in global 34, not the temp, even for a literal
+    // destination.
+    let mut fx = Fixture::new();
+    fx.lamp_mut().position = [64, 64, 1];
+    fx.sim_mut().position = [80, 160, 1];
+    fx.world.globals[34] = LAMP as i16;
+    assert_eq!(
+        direction(&mut fx, [3, 0, scope::TEMPS, 0, 1, scope::GLOBAL, 34, 0]),
+        Ok(0)
+    );
+    assert_eq!(fx.world.globals[34], 4);
+    fx.world.globals[34] = LAMP as i16;
+    assert_eq!(
+        direction(&mut fx, [3, 0, scope::LITERAL, 0, 1, scope::GLOBAL, 34, 0]),
+        Ok(0)
+    );
+    assert_eq!(fx.world.globals[34], 4);
+}
+
+#[test]
+fn get_direction_to_into_a_motive_fails_loudly() {
+    // A motive has no word behind it: the original writes through a null
+    // pointer. The motive keeps its value.
+    let mut fx = Fixture::new();
+    fx.lamp_mut().data[11] = LAMP as i16;
+    let before = fx.sim().person.as_ref().unwrap().motives[3];
+    assert!(matches!(
+        trap(direction(&mut fx, [3, 0, 15, 0, 0, 0, 0, 0]).map(|_| true)),
+        Trap::Unsupported(_)
+    ));
+    assert_eq!(fx.sim().person.as_ref().unwrap().motives[3], before);
 }

@@ -60,8 +60,8 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 466 on the Goth house**: our
-  state after every one of ticks 1 to 466 equals the fourth capture of the
+  there, as three captures recorded). **K = 583 on the Goth house**: our
+  state after every one of ticks 1 to 583 equals the fourth capture of the
   original (full state after every update) in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
@@ -1494,8 +1494,29 @@ Word 62 takes the planning's result, 13, and the walk goes on to door
 fourth capture in everything compared, but for the head fields of
 "Ticks 334 to 366".
 
-**Stops.** Tick 467: person 21's tree 0x1017 runs Get Direction To
-(opcode 12), which is not ported.
+**Then.** Tick 467 stopped at Get Direction To; see "Ticks 467 to
+583".
+
+### Ticks 467 to 583
+
+**Get Direction To** (opcode 12, `0x452003`, `direction.rs`). The
+direction from an object to the stack object, in eighths, from the
+same function route slots use (`0x4520e9`). It takes the positions in
+the native order, +0xf4 first, which is the second coordinate of ours.
+In tick 467 person 21's tree 0x1017 looks for a door beside door 93
+in a given direction. The direction to object 126 is 0, not the 6 it
+wants, so the scan runs out and tree 0x100a draws a Random Number of
+2. A capture with a write watch on the random state showed that draw
+(return address `0x451edd`, person 21's thread). A first port with
+the coordinates swapped found 126, skipped the draw, and left the lot
+stream one draw behind with every object still equal.
+
+**K = 583.** Our state after every tick from 467 to 583 equals the
+fourth capture in everything compared, the three random streams
+included, but for the head fields of "Ticks 334 to 366".
+
+**Stops.** Tick 584: person 18's tree 0x1011 runs Snap (opcode 46),
+which is not ported.
 
 ## Track: drawing people (`crates/sims-people`)
 

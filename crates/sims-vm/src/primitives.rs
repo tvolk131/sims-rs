@@ -8,6 +8,7 @@ mod budget;
 mod change_suit;
 mod create;
 pub(crate) mod dialog;
+mod direction;
 pub(crate) mod distance;
 mod events;
 mod expression;
@@ -120,6 +121,7 @@ impl Machine<'_, '_> {
             8 => self.random(operands)?.into(),
             10 => self.own_events(operands)?.into(),
             11 => self.get_distance_to(operands)?.into(),
+            12 => self.get_direction_to(operands)?.into(),
             14 => self.find_best_object(operands)?.into(),
             16 => self.find_location(operands)?.into(),
             17 => self.idle_for_input(operands)?,
