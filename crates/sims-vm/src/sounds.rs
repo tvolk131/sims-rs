@@ -18,10 +18,11 @@
 //!   does the end of a route (steps 7 and 8, 0x45b6ea, which goes straight
 //!   to the primitive's exit at 0x45b952). Steps 11 and 15 are not ported.
 //!   The steps are read from the state table at 0x45b9d4.
-//! - Stop All Sounds (opcode 48, 0x45256e), the reset of an object that
-//!   is not being deleted (0x431fbe at 0x4320b4) and an object's
+//! - Stop All Sounds (opcode 48, 0x45256e), an object's reset (0x431fbe
+//!   at 0x4320b4, also when it is being deleted) and an object's
 //!   destruction (0x4323c9) stop the object's sounds ([`SoundEvent::Stop`],
-//!   0x57a6fb). A person's reset (0x45e791) does not call it.
+//!   0x57a6fb). So a deleted object's sounds are stopped twice. A
+//!   person's reset (0x45e791) does not call it.
 //!
 //! Not noted yet: the sounds a clip's events play ("sound", "selectedsound",
 //! "deselectedsound" and "footstep", 0x59175e and nearby; see
