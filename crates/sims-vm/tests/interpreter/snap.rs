@@ -558,3 +558,69 @@ fn snap_into_a_container_slot_needs_the_slot_and_a_place_in_it() {
         assert_eq!(unmoved(&fx, me), start, "case {case}");
     }
 }
+
+/// The container snapper, with the lamp's container slot 1 (the one it
+/// snaps into) at `offset`.
+fn offset_container(offset: [f32; 3]) -> (Fixture, u16) {
+    let (mut fx, me) = container_snapper();
+    let container = Slot { kind: 0, ..slot(0) };
+    set_slots(
+        &mut fx,
+        vec![
+            Slot {
+                snap_target: 1,
+                ..slot(SKIP_CHECKS)
+            },
+            container.clone(),
+            Slot {
+                offset,
+                ..container
+            },
+        ],
+    );
+    (fx, me)
+}
+
+#[test]
+fn a_container_slot_offset_across_fails_loudly_but_negative_zero_does_not() {
+    // The offset across moves my animator (0x454ceb), which is not kept.
+    for offset in [[8.0, 0.0, 0.0], [0.0, -0.5, 0.0]] {
+        let (mut fx, me) = offset_container(offset);
+        let start = unmoved(&fx, me);
+        let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
+        assert!(
+            matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454ceb")),
+            "{offset:?}"
+        );
+        assert_eq!(unmoved(&fx, me), start, "{offset:?}");
+    }
+    let (mut fx, me) = offset_container([-0.0, -0.0, 0.0]);
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+}
+
+#[test]
+fn a_container_slot_at_height_0_raised_off_the_floor_is_height_5() {
+    // Height 0 with a nonzero offset up is height 5: data word 4 needs
+    // bit 4 (16), not bit 0.
+    let (mut fx, me) = offset_container([0.0, 0.0, 2.0]);
+    let start = unmoved(&fx, me);
+    let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454e09")));
+    assert_eq!(unmoved(&fx, me), start);
+    let (mut fx, me) = offset_container([0.0, 0.0, 2.0]);
+    fx.world.objects.get_mut(&me).unwrap().data[4] = 16;
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 0), Ok(true));
+}
+
+#[test]
+fn nothing_goes_into_an_object_it_holds() {
+    // The lamp is in my slot (its data word 26 names me), so I cannot go
+    // into it.
+    let (mut fx, me) = container_snapper();
+    fx.lamp_mut().data[26] = me as i16;
+    fx.lamp_mut().data[14] = 1;
+    let start = unmoved(&fx, me);
+    let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454e09")));
+    assert_eq!(unmoved(&fx, me), start);
+}

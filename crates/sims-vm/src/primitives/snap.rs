@@ -91,6 +91,9 @@ use crate::placement::{Place, closed_directions, on_lot};
 use crate::routing::slot::{direction, route_slot};
 use sims_sim::animator::{Animator, LOADED, UNSET};
 
+/// The SLOT entry kind of a container slot.
+const CONTAINER: u16 = 0;
+
 /// The mode that names a routing slot of the stack object by word 0.
 const SLOT: i16 = 3;
 /// Slot flags: the direction follows the object's facing (0x454aeb),
@@ -169,6 +172,25 @@ impl Machine<'_, '_> {
                 return Err(unsupported(
                     "0x45522c",
                     "into a slot with flag bit 2, which tests the walls around the object",
+                ));
+            }
+            // The container slot's offset across, turned to the object's
+            // facing, is added to my animator's offset (0x454ceb to
+            // 0x454d5e), which is not kept.
+            let held = self
+                .program
+                .slots(definition.resource, definition.chunk)
+                .iter()
+                .filter(|entry| entry.kind == CONTAINER)
+                .nth(slot.snap_target as usize);
+            if held.is_some_and(|entry| {
+                entry.offset[..2]
+                    .iter()
+                    .any(|n| n.to_bits() & 0x7fff_ffff != 0)
+            }) {
+                return Err(unsupported(
+                    "0x454ceb",
+                    "into a container slot whose offset across moves my animator",
                 ));
             }
             Some((target, slot.snap_target))

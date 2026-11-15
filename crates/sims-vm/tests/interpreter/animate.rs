@@ -1513,4 +1513,26 @@ fn postures_1_and_2_start_their_base_clip_once_it_is_found() {
         },
     );
     assert!(tick(&mut fx).unwrap_err().to_string().contains("0x5992b3"));
+    // Posture 2's base clip is its clip 2, not clip 1: with the name at
+    // clip 2 the layer starts, and with it at clip 1 only, clip 2 has no
+    // name.
+    for (names, found) in [(["", "x", CLIP], true), (["", CLIP, ""], false)] {
+        let mut fx = sitting("");
+        fx.sim_mut().person.as_mut().unwrap().data[0] = 2;
+        for table in [152, 153] {
+            fx.program
+                .libraries
+                .get_mut(&GLOBAL)
+                .unwrap()
+                .strings
+                .insert(table, names.iter().map(|n| n.to_string()).collect());
+        }
+        if found {
+            tick(&mut fx).unwrap();
+            let animator = &fx.world.animators[&SIM];
+            assert_eq!((animator.posture, animator.base), (2, true));
+        } else {
+            assert!(tick(&mut fx).unwrap_err().to_string().contains("0x5904af"));
+        }
+    }
 }

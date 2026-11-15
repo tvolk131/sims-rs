@@ -424,6 +424,15 @@ fn stop_walk_step(from: [F32; 2], to: [F32; 2], t: F32) -> Option<[F32; 2]> {
 /// counts them, for postures 0 to 2 (0x59048c).
 const BASE_CLIPS: [usize; 3] = [3, 1, 2];
 
+/// The clip of `posture`'s base layer among the posture's clips
+/// (0x59048c to 0x5904a1), or None for a posture with no base layer.
+pub(crate) fn base_selection(posture: i32) -> Option<usize> {
+    usize::try_from(posture)
+        .ok()
+        .and_then(|p| BASE_CLIPS.get(p))
+        .copied()
+}
+
 fn unsupported(at: &str, what: &str) -> Trap {
     Trap::Unsupported(format!("the animator {what} ({at}), which is not ported"))
 }
@@ -512,10 +521,7 @@ impl Interpreter<'_> {
         }
         if flags & 4 == 0 && !(a.base && kind <= 1) {
             a.posture = posture;
-            if let Some(&selection) = usize::try_from(posture)
-                .ok()
-                .and_then(|p| BASE_CLIPS.get(p))
-            {
+            if let Some(selection) = base_selection(posture) {
                 read_appearance_if_stale(world, self.program, id, &mut a.profile_stale)?;
                 // Posture 0's clip was found every time the captures show
                 // (a base layer after each start), so it is not looked up

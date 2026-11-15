@@ -75,9 +75,6 @@ const HEAD_COUNTDOWN: usize = 45;
 /// (legacy/crates/sims-sim/src/head_look/rig.rs; the table is filled when
 /// the game starts and was not read here).
 const TURNED_BONE: &str = "HEAD";
-/// The clip the base layer plays for posture 0, counted from 0 among
-/// the posture's clips (0x59049f).
-const BASE_CLIP: usize = 3;
 /// The lot array of the terrain's corner heights (Arry 0; the altitude
 /// array, legacy/crates/sims-sim/src/native_world/arrays.rs).
 const ALTITUDE: u16 = 0;
@@ -382,7 +379,7 @@ impl Interpreter<'_> {
             }
         }
         if a.base {
-            let name = self.base_clip(world, id)?;
+            let name = self.base_clip(world, id, a.posture)?;
             let base =
                 self.program.animations.clip(&name).map_err(|e| {
                     unsupported("0x59dc32", &format!("finds no clip {name:?}: {e}"))
@@ -496,9 +493,15 @@ impl Interpreter<'_> {
         Ok(placed)
     }
 
-    /// The name of the clip the base layer plays for posture 0.
-    fn base_clip(&self, world: &World, id: u16) -> Result<String, Trap> {
-        self.posture_clip(world, id, BASE_CLIP)?.ok_or_else(|| {
+    /// The name of the clip the base layer plays for `posture`
+    /// ([`crate::animator::base_selection`]).
+    fn base_clip(&self, world: &World, id: u16, posture: i32) -> Result<String, Trap> {
+        let selection = crate::animator::base_selection(posture).ok_or_else(|| {
+            Trap::Invalid(format!(
+                "person {id}'s base layer plays for posture {posture}"
+            ))
+        })?;
+        self.posture_clip(world, id, selection)?.ok_or_else(|| {
             unsupported(
                 "0x59db2f",
                 &format!("person {id}'s base layer has no name for its clip"),
