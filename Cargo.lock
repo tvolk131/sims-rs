@@ -1683,6 +1683,7 @@ dependencies = [
  "sims-content",
  "sims-formats",
  "sims-sim",
+ "sims-vm",
 ]
 
 [[package]]
