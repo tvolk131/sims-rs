@@ -8,7 +8,7 @@ use crate::{Catalog, Error, Index, Install, Resource, Result};
 use sims_formats::avatar::read_bcf;
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The skeleton a type of person is built on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +69,12 @@ pub struct People {
     pub skeletons: BTreeMap<u32, Skeleton>,
     /// Each person type's profile, by the type's GUID.
     pub profiles: BTreeMap<u32, Profile>,
+    /// The names of the suits (appearances) the skeleton files define,
+    /// lowered in ASCII: what an accessory put on by name can be. They
+    /// come from the same files as the skeletons, so the same caveat
+    /// holds: that these are the files the original's avatar registry
+    /// searches is **unverified**.
+    pub suits: BTreeSet<String>,
 }
 
 /// The string table an object definition of type 2 names its body in: the
@@ -163,8 +169,10 @@ impl People {
             names.insert(guid, name);
         }
         let mut skeletons = BTreeMap::new();
+        let avatar_files = avatar_files(install, index)?;
+        let suits = suit_names(&avatar_files)?;
         if !names.is_empty() {
-            let files = skeleton_files(install, index)?;
+            let files = skeleton_files(install, &avatar_files)?;
             for (guid, name) in names {
                 let mut found = files.iter().flat_map(|(file, skeletons)| {
                     skeletons
@@ -208,6 +216,7 @@ impl People {
             Self {
                 skeletons,
                 profiles,
+                suits,
             },
             unresolved,
         ))
@@ -257,7 +266,10 @@ type Skeletons = Vec<(String, Vec<i32>, Vec<Bone>)>;
 
 /// Every skeleton file the lookup searches, by path relative to the
 /// install, in path order.
-fn skeleton_files(install: &Install, index: &Index) -> Result<BTreeMap<String, Skeletons>> {
+/// The avatar files (`.bcf`) the skeletons and suits are looked up in:
+/// the archives' members in `GameData/Animation`, then the indexed
+/// object directories' files.
+fn avatar_files(install: &Install, index: &Index) -> Result<Vec<Resource>> {
     let mut resources = Vec::new();
     if let Some(directory) = resolve(&install.root, "GameData/Animation")? {
         for path in sorted_entries(&directory)? {
@@ -276,11 +288,34 @@ fn skeleton_files(install: &Install, index: &Index) -> Result<BTreeMap<String, S
         }
     }
     resources.extend(index.resources.iter().cloned());
+    resources.retain(|resource| resource.name().to_ascii_lowercase().ends_with(".bcf"));
+    Ok(resources)
+}
+
+/// The suit names the avatar files define, lowered. A file that does
+/// not decode is skipped, as for the skeletons.
+fn suit_names(files: &[Resource]) -> Result<BTreeSet<String>> {
+    let mut suits = BTreeSet::new();
+    for resource in files {
+        let Ok(parsed) = read_bcf(&resource.read()?) else {
+            continue;
+        };
+        suits.extend(
+            parsed
+                .appearances
+                .into_iter()
+                .map(|a| a.name.to_ascii_lowercase()),
+        );
+    }
+    Ok(suits)
+}
+
+fn skeleton_files(
+    install: &Install,
+    resources: &[Resource],
+) -> Result<BTreeMap<String, Skeletons>> {
     let mut files = BTreeMap::new();
     for resource in resources {
-        if !resource.name().to_ascii_lowercase().ends_with(".bcf") {
-            continue;
-        }
         let bytes = resource.read()?;
         // A file starts with how many skeletons it holds. Most hold none.
         if bytes.first_chunk::<4>().is_none_or(|n| *n == [0; 4]) {

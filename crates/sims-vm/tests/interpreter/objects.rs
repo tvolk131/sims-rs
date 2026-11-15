@@ -245,6 +245,7 @@ fn sim(id: u16, guid: u32) -> Instance {
 /// second, and one with the child's.
 fn people() -> People {
     People {
+        suits: Default::default(),
         profiles: BTreeMap::new(),
         skeletons: BTreeMap::from([
             (

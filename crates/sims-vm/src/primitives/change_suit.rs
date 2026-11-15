@@ -7,7 +7,7 @@
 //!   Otherwise the index becomes the person's suit (person data word 8,
 //!   +0x59c), and word 21 (+0x5b6) its variant: 0 for suits 0 to 7, else
 //!   drawn from the active random stream (0x45d994). A child (word 58,
-//!   the age, from 1 to 17) gets variant 0 or 1: on the suit it already
+//!   the age, nonzero and below 18 signed) gets variant 0 or 1: on the suit it already
 //!   wears, the other one; on a new suit, a draw's low bit. Anyone else
 //!   gets a draw modulo 10, and on the suit it already wears, draws again
 //!   until the variant differs.
@@ -17,7 +17,8 @@
 //!   0x2f, and a missing or empty string 0x30. The accessory goes on
 //!   through the animator's virtual function 0xd8 (0x58d88f, "dress")
 //!   with an empty binding, and comes off through 0xdc (0x58d919,
-//!   "undress").
+//!   "undress"). Putting on a name no skeleton file defines fails
+//!   loudly: the original keeps an unnamed entry then, not ported.
 //!
 //! Any other operand 1 is native error 0x2f. The primitive always
 //! branches true.
@@ -50,6 +51,13 @@ impl Machine<'_, '_> {
             1 => self.change_into(index)?,
             0 | 2 => {
                 let name = self.accessory_name(scope, index)?;
+                if !off && !self.program.people.suits.contains(&name) {
+                    return Err(Trap::Unsupported(format!(
+                        "Change Suit puts on accessory {name:?}, which no skeleton file \
+                         names: the original keeps an entry with an empty name when the \
+                         bind (0x583559) fails, which is not ported"
+                    )));
+                }
                 let accessories = &mut self
                     .me_mut()?
                     .person
@@ -67,60 +75,70 @@ impl Machine<'_, '_> {
         Ok(true)
     }
 
-    /// Puts on suit `index` (0x45d98e to 0x45da0d).
+    /// Puts on suit `index` (0x45d98e to 0x45da0d). It reads only the
+    /// words its branch needs: none for suits 0 to 7, the suit and age
+    /// otherwise, and the variant only when the suit is the one worn.
     fn change_into(&mut self, index: u8) -> Result<(), Trap> {
-        let me = self.me;
-        let data = &self
-            .me()?
-            .person
-            .as_ref()
-            .ok_or(Trap::native(0x1c, "object is not a person"))?
-            .data;
-        let word = |i: usize| {
-            data.get(i)
-                .copied()
-                .ok_or_else(|| Trap::Invalid(format!("person data has no word {i}")))
-        };
-        let (suit, variant, age) = (word(SUIT)?, word(VARIANT)?, word(AGE)?);
-        for i in [SUIT, VARIANT, AGE] {
-            if self.world.routing.unknown_words.contains(&(me, i)) {
-                return Err(Trap::Unsupported(format!(
-                    "Change Suit reads person {me}'s data word {i}, which is not known"
-                )));
-            }
-        }
-        let child = age != 0 && age < 18;
         let variant = if index < 8 {
             0
-        } else if i16::from(index) == suit {
-            if child {
-                i16::from(variant == 0)
-            } else {
-                // Draws until the variant differs (0x45d9c3).
-                loop {
-                    let drawn = (self.draw() % 10) as i16;
-                    if drawn != variant {
-                        break drawn;
+        } else {
+            // A signed compare (0x45d9b4): a negative age is a child's.
+            let age = self.known_word(AGE)?;
+            let child = age != 0 && age < 18;
+            if i16::from(index) == self.known_word(SUIT)? {
+                let variant = self.known_word(VARIANT)?;
+                if child {
+                    i16::from(variant == 0)
+                } else {
+                    // Draws until the variant differs (0x45d9c3).
+                    loop {
+                        let drawn = (self.draw() % 10) as i16;
+                        if drawn != variant {
+                            break drawn;
+                        }
                     }
                 }
+            } else if child {
+                (self.draw() & 1) as i16
+            } else {
+                (self.draw() % 10) as i16
             }
-        } else if child {
-            (self.draw() & 1) as i16
-        } else {
-            (self.draw() % 10) as i16
         };
+        let me = self.me;
         let data = &mut self
             .me_mut()?
             .person
             .as_mut()
             .ok_or(Trap::native(0x1c, "object is not a person"))?
             .data;
-        data[VARIANT] = variant;
-        data[SUIT] = i16::from(index);
-        for i in [SUIT, VARIANT] {
+        for (i, value) in [(VARIANT, variant), (SUIT, i16::from(index))] {
+            *data
+                .get_mut(i)
+                .ok_or_else(|| Trap::Invalid(format!("person data has no word {i}")))? = value;
+        }
+        for i in [VARIANT, SUIT] {
             self.world.routing.unknown_words.remove(&(me, i));
         }
         Ok(())
+    }
+
+    /// Person data word `i` of the running object, failing when the
+    /// snapshot left it unknown.
+    fn known_word(&self, i: usize) -> Result<i16, Trap> {
+        let me = self.me;
+        if self.world.routing.unknown_words.contains(&(me, i)) {
+            return Err(Trap::Unsupported(format!(
+                "Change Suit reads person {me}'s data word {i}, which is not known"
+            )));
+        }
+        self.me()?
+            .person
+            .as_ref()
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .data
+            .get(i)
+            .copied()
+            .ok_or_else(|| Trap::Invalid(format!("person data has no word {i}")))
     }
 
     /// The accessory named by string `index` of table 304 in the global
@@ -149,9 +167,11 @@ impl Machine<'_, '_> {
 ///
 /// The original adds the entry first and then binds its suit to the
 /// skeleton (0x583559), keeping the name only when the suit is found
-/// and binds; an entry that does not bind stays, with an empty name. The
-/// suit registry is not ported, so the bind is taken to succeed. That
-/// is **unverified**: the capture shows the entry count, not its name.
+/// and binds; an entry that does not bind stays, with an empty name.
+/// Callers refuse a name no skeleton file defines (`People::suits`) and
+/// take the bind of any other to succeed. That is **unverified**: the
+/// capture shows the entry count, not its name, and the bind's other
+/// failures (0x599427) are not ported.
 pub(crate) fn dress(accessories: &mut Vec<Accessory>, name: String) {
     undress(accessories, &name);
     accessories.push(Accessory {

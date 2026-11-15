@@ -11,27 +11,39 @@ Tick 368 of the Goth house stopped on Change Suit/Accessory (opcode 6,
 animator's "dress" and "undress" (virtual functions 0xd8 and 0xdc,
 `0x58d88f` and `0x58d919`) as functions on the person's accessory list,
 which the world already keeps from the saved file. Our state then
-equals the fourth capture through tick 408. K goes from 367 to 408.
+equals the fourth capture through tick 408 in every field the verifier
+compares, with two known exceptions: person 16's head target height is
+one ULP low on some ticks, and its head turn a few ULP with it (as
+before this step), and the capture holds
+the accessory count, not the entry's name or binding. K goes from 367
+to 408.
 
 What was decided:
 
-- **The bind is taken to succeed.** The original adds the entry, then
-  looks the accessory's suit up by name and binds it to the skeleton
-  (`0x583559`, through `0x5a044d` and `0x599427`), storing the name and
-  binding only when that works. An entry that fails stays with an empty
-  name. The simulation has no suit registry (the people track's lookup
-  is presentation code), so every accessory with a name is taken to
-  bind. **Unverified**: the capture shows the entry count (one, from
-  update 368), not the entry.
+- **A suit no skeleton file names fails loudly; any other is taken to
+  bind.** The original adds the entry, then looks the accessory's suit
+  up by name and binds it to the skeleton (`0x583559`, through
+  `0x5a044d` and `0x599427`), storing the name and binding only when
+  that works. An entry that fails stays with an empty name. The content
+  loader now keeps the appearance names of every skeleton file
+  (`People::suits`, lowered), and putting on a name outside that set is
+  `Trap::Unsupported` before anything changes. **Unverified**: that this
+  set is what the original's registry searches, and that a found suit
+  always binds (the bind's other failures are not read). The capture
+  shows the entry count (one, from update 368), not the entry.
+- **Only the words a branch reads must be known.** Suits 0 to 7 read no
+  person data; others read the suit and age, and the variant only on
+  the suit already worn. Writing the suit and variant makes them known.
+  The age compare is signed (`0x45d9b4`), so a negative age is a
+  child's.
 - **Clip events "dress" and "undress" still fail loudly.** They call the
   same functions, but how the event's value becomes a name and binding
   (`0x5912fd`) is not read yet.
 - **The variant draws use the active stream** (`0x46f457`, as Find Best
   Interaction's draws), so `Machine::draw` is now shared.
 
-What would reopen it: an accessory whose suit no file defines (the
-original would keep an empty name), or a capture page holding the
-entry.
+What would reopen it: a lot that puts on a suit no skeleton file
+defines (it stops loudly now), or a capture page holding the entry.
 
 The first difference is in tick 409, where person 18's route plays its
 waiting tree and looks at another person than the original does. It is
