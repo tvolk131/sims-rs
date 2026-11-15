@@ -110,6 +110,24 @@ impl Machine<'_, '_> {
         if self.world.removals.contains(&id) {
             return Ok(());
         }
+        // A person's take-off refreshes its animator (0x58da12), which
+        // for a person the view drew advances its head and writes its
+        // data words (0x590768). That is not modeled, so only the case
+        // whose effects cannot be read before the person goes is
+        // taken: the person removing itself and yielding, whose own
+        // tick follows at once and whose deletion ends the update.
+        let person = self
+            .world
+            .objects
+            .get(&id)
+            .is_some_and(|o| o.person.is_some());
+        if person && (id != self.me || flags & 1 != 0 || self.synchronous) {
+            return Err(Trap::Unsupported(format!(
+                "taking person {id} off the lot other than by its own Remove Object \
+                 Instance that yields: its animator's refresh (0x58da12) can write what a \
+                 script reads, which is not ported"
+            )));
+        }
         if matches!(
             self.world.room_at([OFF_LOT, OFF_LOT, 1]),
             Err(RoomError::NoRooms)

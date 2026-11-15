@@ -1164,7 +1164,19 @@ impl Interpreter<'_> {
     /// 0x590b27), and redraws what the person carries in its slot 1.
     ///
     /// Here the refresh returns at once, as for a person the view did not
-    /// draw: **unverified**. Either way it writes only the person's own
+    /// draw: **unverified**. The byte is not always set for a drawn
+    /// person (in a capture the salesman has 1 at update 900 and 0 at
+    /// updates 950 to 1000), and the animator's tick writes it too. When
+    /// set, the head's step (0x590768) advances the head's clock and
+    /// counts person word 45 down, which a script could read. So the
+    /// callers take only the cases where that cannot be read first: the
+    /// Remove Object Instance queue takes a person only when it removes
+    /// itself and yields (`Machine::queue_removal`). Removal at once
+    /// ([`Interpreter::remove_now`], which the end of the update runs for
+    /// the queued person, so the original refreshes it a second time)
+    /// deletes the person right after, so only the deletion's last reset
+    /// could read what the refresh wrote (**unverified** that it does
+    /// not). Other cases fail loudly. Either way it writes only the person's own
     /// animator and data words, and the drawing of what it carries, and
     /// the removal at the end of the same lot update destroys the
     /// animator and the person. Before that, the person's own tick (after

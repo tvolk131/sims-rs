@@ -24,13 +24,29 @@ take-off an object gets, plus one call: the person's animator (virtual
 function 0x2c, 0x4594de) is refreshed (its function 0x54 with 1,
 0x58da12). The refresh returns at once unless animator byte +0x109 is
 set (0x58da2c), which is whether the house view's last draw found the
-person on screen (0x590b8b). That is presentation and not kept. We take
-the "not drawn" branch, which is **unverified**. Either way the refresh
-writes only the person's own animator, data words and what its hand
-draws, and the removal at the end of the update destroys them. What
-could still differ is read only by a head looking at the queued person
-(0x59293d) or by a person still queued after a partial pass. Both fail
-loudly, and so does taking a person off the lot for any other reason.
+person on screen (0x590b8b). That is presentation and not kept, and the
+animator's tick writes it too. It is not always set for a drawn person:
+in the captures the salesman has 1 at update 900 and 0 at updates 950
+to 1000. We take the "not drawn" branch, which is **unverified**. When
+it is set, the head's step (0x590768) advances the head's clock and
+counts person word 45 down, which a script can read. So only the cases
+where that cannot be read first are taken:
+
+- Remove Object Instance takes a person only when it removes itself and
+  yields (not with flag bit 0, not in a synchronous tree). Its own tick
+  follows at once and runs the head's step at the same clock, and the
+  removal at the end of the update destroys it.
+- Removal at once (0x44123f, which the end of the update also runs for
+  the queued person, refreshing it a second time) deletes the person
+  right after, so only the deletion's last reset could read what the
+  refresh wrote. That it does not is **unverified**.
+
+Every other way of taking a person off fails loudly, naming 0x58da12.
+Whether the head's step done twice at one clock (refresh, then tick)
+counts word 45 down once or twice is not read; a reader before the end
+of the update is the only way to tell. What could still differ is also
+read by a head looking at the queued person (0x59293d) or by a person
+still queued after a partial pass, and both fail loudly.
 
 **Deleting a person** (0x440eeb) runs in this order:
 

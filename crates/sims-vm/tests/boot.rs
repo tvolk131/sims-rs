@@ -207,12 +207,7 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
         }
     };
     assert_eq!(steps, 595, "{stopped}");
-    for part in [
-        "tick 597,",
-        "object 259",
-        "A2O-door-knock",
-        "0x592878",
-    ] {
+    for part in ["tick 597,", "object 259", "A2O-door-knock", "0x592878"] {
         assert!(stopped.contains(part), "{stopped}");
     }
 }

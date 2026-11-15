@@ -179,6 +179,10 @@ impl Interpreter<'_> {
                         .into(),
                 )));
             }
+            // The take-off's animator refresh (0x58da12) is not modeled:
+            // the person is deleted right after, so only its last reset
+            // could read what the refresh writes (see
+            // `Interpreter::take_off_to_remove`).
             self.take_off_to_remove(world, id, true)?;
         } else {
             let mut machine = self.machine(world, id, 0, false);
