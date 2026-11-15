@@ -88,6 +88,12 @@
 //!   object still has fades out at speed 100 and ends, or ends at once
 //!   when it has no note playing (0x57dca3). Kill all also stops every
 //!   ambient score.
+//! - 21, pause, and 22, unpause ([`SoundEvent::Pause`] and
+//!   [`SoundEvent::Unpause`], what the game sends): a pause holds every
+//!   track that runs or plays, but for the interface's clicks, the speed
+//!   buttons and the main music loop ([`PAUSE_SPARES`]), and the live
+//!   ambience; an unpause lets them all go on from where they were. See
+//!   [`Player::pause`].
 //! - 30, `kTurnOnTv` (radios too): kills the object's instances, then
 //!   records the object as an instance of the track and starts it.
 //! - 53, `kSequenceTrackHitList`: picks a patch from a hit list and
@@ -228,6 +234,11 @@ pub const RADIO_TRACKS: [u32; 10] = [
     0x104, 0x10d, 0x10e, 0x118, 0x1a19, 0x1a1a, 0x1a1b, 0x1a1c, 0x1a1d, 0x18704,
 ];
 
+/// *(code)* The tracks a pause leaves playing (0x5748a2 to 0x5748c3):
+/// `ui_click` (1541), `MainMusicLoop` (515) and the speed buttons'
+/// `ui_speed_1top` to `ui_speed_3top` (2727, 2733, 2739).
+pub const PAUSE_SPARES: [u32; 5] = [0x605, 0x203, 0xaa7, 0xaad, 0xab3];
+
 /// Event kinds: the HOT files' `kSndob` equates, and how the original's
 /// dispatcher (0x573617) treats the rest.
 pub mod kind {
@@ -235,6 +246,8 @@ pub mod kind {
     pub const FADE: i64 = 18;
     pub const CANCEL_NOTE: i64 = 19;
     pub const KILL_ALL: i64 = 20;
+    pub const PAUSE: i64 = 21;
+    pub const UNPAUSE: i64 = 22;
     pub const KILL_INSTANCE: i64 = 23;
     pub const TURN_ON_TV: i64 = 30;
     pub const SET_MUSIC_MODE: i64 = 36;
@@ -252,9 +265,9 @@ pub mod kind {
     /// reported when an event has one.
     /// Kind 36 is listed though its ambience half is ported (see
     /// `Player::set_music_mode`).
-    pub const NOT_PORTED: [i64; 35] = [
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 24, 25, 26, 32, 33, 34, 35,
-        36, 37, 38, 39, 40, 41, 42, 43, 103, 104,
+    pub const NOT_PORTED: [i64; 33] = [
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 24, 25, 26, 32, 33, 34, 35, 36, 37,
+        38, 39, 40, 41, 42, 43, 103, 104,
     ];
 }
 
@@ -468,6 +481,12 @@ pub struct Player<S> {
     /// mode 3 has been set, after which modes are recorded (0x6f6428).
     music_mode: i64,
     music_started: bool,
+    /// *(code)* Whether the sound is paused (manager +0xd).
+    paused: bool,
+    /// *(code)* The tracks a pause holds (each track's +0x1c8): their
+    /// threads do not run or fade and their notes stay where they are,
+    /// silent, until an unpause or until the track starts again.
+    held: BTreeSet<u32>,
     /// The ambience cells' sounds.
     voices: Vec<AmbientVoice>,
     /// Ambience sample paths to their numbers in the patch cache.
@@ -522,6 +541,8 @@ impl<S: Samples> Player<S> {
             ambience: None,
             music_mode: 4,
             music_started: false,
+            paused: false,
+            held: BTreeSet::new(),
             voices: Vec::new(),
             ambient_patches: BTreeMap::new(),
             ambient_cache: BTreeMap::new(),
@@ -776,6 +797,9 @@ impl<S: Samples> Player<S> {
             SoundEvent::StopObject { object } => self.kill_instance(*object),
             // Kind 20, as the game calls it.
             SoundEvent::StopAll => self.kill_all(),
+            // Kinds 21 and 22, as the game calls them (0x57a7f2, 0x57a8e3).
+            SoundEvent::Pause => self.pause(),
+            SoundEvent::Unpause => self.unpause(),
         }
     }
 
@@ -836,6 +860,8 @@ impl<S: Samples> Player<S> {
             kind::FADE => self.fade_track(track, args),
             kind::CANCEL_NOTE => self.cancel_radio_notes(),
             kind::KILL_ALL => self.kill_all(),
+            kind::PAUSE => self.pause(),
+            kind::UNPAUSE => self.unpause(),
             kind::KILL_INSTANCE => self.kill_instance(track),
             kind::SET_AMBIENCE_MODE => self.set_ambience_mode(track),
             kind::SET_MUSIC_MODE => {
@@ -959,6 +985,56 @@ impl<S: Samples> Player<S> {
         }
     }
 
+    /// Kind 21: *(code)* pauses the sound (0x573c20, 0x57481e). The
+    /// manager is marked paused; `main_duckpri` becomes 0 (0x57d361),
+    /// which here drops every thread's ducking request; every track
+    /// that runs or plays is held except [`PAUSE_SPARES`]; and in music
+    /// mode 0 the current ambience player is paused (see
+    /// [`crate::ambience::Fresh::set_paused`]). A held track's threads
+    /// do not run or fade, and its notes stay where they are, silent. A
+    /// track started while paused plays: starting a track (0x57d960)
+    /// clears its hold. The original also stops its day and night
+    /// loop (0x574978), which this player does not have.
+    pub fn pause(&mut self) {
+        self.paused = true;
+        self.duck.clear();
+        self.update_main_duckpri();
+        let tracks: BTreeSet<u32> = self
+            .threads
+            .iter()
+            .chain(&self.pending)
+            .map(|t| t.track)
+            .chain(self.notes.iter().map(|n| n.track))
+            .filter(|t| !PAUSE_SPARES.contains(t))
+            .collect();
+        self.held.extend(tracks);
+        if self.music_mode == 0
+            && let Some(current) = self.ambience
+        {
+            self.with_score(current, |score, _| score.set_paused(true));
+        }
+    }
+
+    /// Kind 22: *(code)* unpauses the sound (0x573c44, 0x574904): every
+    /// track is let go (0x57cd2c) and the current ambience player, in
+    /// any music mode, unpaused. (The original does this only while the
+    /// sound is on, manager +0xc, which this player always is; it also
+    /// restarts its day and night loop and its music, 0x575155, which
+    /// this player does not have.) `main_duckpri` stays as the pause
+    /// left it until a thread asks again.
+    pub fn unpause(&mut self) {
+        self.paused = false;
+        self.held.clear();
+        if let Some(current) = self.ambience {
+            self.with_score(current, |score, _| score.set_paused(false));
+        }
+    }
+
+    /// Whether the sound is paused (kind 21 since the last 22).
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
     /// Kind 20: *(code)* ends every track at once, forgets every object
     /// instance and stops every ambience player (the current one stays
     /// current). (The original also stops its music stations, which this
@@ -967,6 +1043,7 @@ impl<S: Samples> Player<S> {
         self.threads.clear();
         self.pending.clear();
         self.notes.clear();
+        self.held.clear();
         self.seqgroups.clear();
         self.instances.clear();
         let modes: Vec<u32> = self.scores.keys().copied().collect();
@@ -1145,6 +1222,8 @@ impl<S: Samples> Player<S> {
         let Some(thread) = self.thread(object, module, track) else {
             return false;
         };
+        // *(code)* Starting a track (0x57d960) clears its hold.
+        self.held.remove(&track);
         if defer {
             self.pending.push(thread);
         } else {
@@ -1279,8 +1358,10 @@ impl<S: Samples> Player<S> {
         let mut sums = vec![0i64; 2 * frames];
         let cache = &self.cache;
         let ambient_cache = &self.ambient_cache;
+        let held = &self.held;
+        // A held track's notes keep their place and are not heard.
         self.notes
-            .retain_mut(|note| mix_note(note, cache, &mut sums));
+            .retain_mut(|note| held.contains(&note.track) || mix_note(note, cache, &mut sums));
         self.voices
             .retain_mut(|voice| mix_note(&mut voice.note, ambient_cache, &mut sums));
         out.extend(sums.iter().map(|&s| s.clamp(-32768, 32767) as i16));
@@ -1347,6 +1428,11 @@ impl<S: Samples> Player<S> {
         let mut budget = BLOCK_STEPS;
         let mut index = 0;
         while index < self.threads.len() {
+            // A held track's threads wait, without fading (0x57d7f3).
+            if self.held.contains(&self.threads[index].track) {
+                index += 1;
+                continue;
+            }
             if budget == 0 {
                 if !self.over_budget {
                     self.over_budget = true;
@@ -1357,6 +1443,9 @@ impl<S: Samples> Player<S> {
                 // The threads not reached still fade, and run first next
                 // block, so busy threads cannot starve them.
                 for at in index..self.threads.len() {
+                    if self.held.contains(&self.threads[at].track) {
+                        continue;
+                    }
                     let mut thread = self.threads[at].clone();
                     self.fade(&mut thread);
                     self.threads[at] = thread;

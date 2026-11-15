@@ -316,6 +316,77 @@ fn a_snapshot_answers_by_object_and_field() {
 }
 
 #[test]
+fn a_pause_holds_a_playing_note_where_it_is() {
+    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
+    let mut player = Player::new(vec![module(&[generic], 1)], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(
+        player.render(40, &NoSources),
+        (1..=40).collect::<Vec<i16>>()
+    );
+    player.handle(&SoundEvent::Pause);
+    assert!(player.is_paused());
+    // Held: silent, and the thread waits, however long.
+    assert!(player.render(3 * BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(!player.is_idle());
+    player.handle(&SoundEvent::Unpause);
+    assert!(!player.is_paused());
+    // It goes on from where it was.
+    assert_eq!(
+        player.render(60, &NoSources),
+        (41..=100).collect::<Vec<i16>>()
+    );
+    player.render_until_idle(4 * BLOCK, &NoSources);
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_pause_spares_the_interface_and_lets_new_sounds_play() {
+    // Tracks 0x604 and 0x605 (`ui_click`, which a pause spares).
+    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
+    let mut player = Player::new(
+        vec![module_with(&[generic, generic], 1, 0x604, "")],
+        samples(),
+        1,
+    );
+    play(&mut player, "e0");
+    play(&mut player, "e1");
+    let both: Vec<i16> = (1..=10).map(|v| 2 * v).collect();
+    assert_eq!(player.render(10, &NoSources), both);
+    player.handle(&SoundEvent::Pause);
+    assert_eq!(
+        player.render(10, &NoSources),
+        (11..=20).collect::<Vec<i16>>()
+    );
+    // A track started while paused plays: starting it lets the track
+    // go, so its held note goes on at once, and the new thread's note
+    // starts when the threads next run, at the next block.
+    play(&mut player, "e0");
+    let out = player.render(10, &NoSources);
+    let resumed: Vec<i16> = (11..=20).map(|v| v + v + 10).collect();
+    assert_eq!(out, resumed);
+    player.handle(&SoundEvent::Unpause);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn kinds_21_and_22_pause_and_unpause() {
+    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
+    let module = module_with(&[generic], 1, 10, "pause=21,0\nunpause=22,0\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e0");
+    player.render(10, &NoSources);
+    play(&mut player, "pause");
+    assert!(player.is_paused());
+    assert!(player.render(10, &NoSources).iter().all(|&s| s == 0));
+    play(&mut player, "unpause");
+    assert!(!player.is_paused());
+    assert_eq!(player.render(5, &NoSources), [11, 12, 13, 14, 15]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
 fn unknown_events_and_bad_code_are_faults_not_panics() {
     let bad: &[u8] = &[26];
     let spin: &[u8] = &[13, 1, 1, 0, 0]; // jump 0x101: itself, forever

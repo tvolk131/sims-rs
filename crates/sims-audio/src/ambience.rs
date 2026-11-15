@@ -300,6 +300,10 @@ pub struct Fresh {
     first: i32,
     percent: i32,
     started: bool,
+    /// *(code)* Set by the sound's pause (+0x40a8, vtable +0x7c,
+    /// 0x5773af). Only the constructor clears it otherwise; starting and
+    /// stopping leave it.
+    paused: bool,
     /// The frame the timer counts from.
     timer: u64,
     rate: u32,
@@ -377,6 +381,7 @@ impl Fresh {
             first: 0,
             percent: 100,
             started: false,
+            paused: false,
             timer: 0,
             rate,
         })
@@ -390,6 +395,19 @@ impl Fresh {
     /// Whether it is started.
     pub fn is_started(&self) -> bool {
         self.started
+    }
+
+    /// *(code)* vtable +0x7c (0x5773af): pauses or unpauses it. A paused
+    /// player's update does nothing (0x577af9): no beat falls due and no
+    /// cell starts or stops, while the cells' sounds play on. Its timer
+    /// keeps counting, so on unpausing the beats it missed fall due.
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
+    /// Whether it is paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused
     }
 
     /// The cursor: row and column.
@@ -559,7 +577,7 @@ impl Fresh {
     pub fn update(&mut self, frame: u64, host: &mut dyn Host) {
         let target = self.target();
         let limit = self.limit();
-        if !self.started {
+        if !self.started || self.paused {
             return;
         }
         let elapsed =
