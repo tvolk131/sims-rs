@@ -4,10 +4,13 @@
 //! sims-viewer <install> <house file> [--snapshot <file.redb> [name]] [--save-dir <dir>] [--hud]
 //! ```
 //!
-//! Without `--snapshot` the house file is read into a fresh world. With
-//! it, the world saved by `sims boot --snapshot` (named `boot` unless
-//! another name is given) is shown instead; the house file still names the
-//! neighborhood the art is read with.
+//! Without `--snapshot` the house file is read into a fresh world, or,
+//! with `--hud`, loaded as the game loads it (`sims_vm::boot::Lot`, up to
+//! the frame before the first tick), so the panel shows the family's
+//! funds and its first member selected. With `--snapshot`, the world
+//! saved by `sims boot --snapshot` (named `boot` unless another name is
+//! given) is shown instead; the house file still names the neighborhood
+//! the art is read with.
 //!
 //! Keys: `+`/`-` or the wheel zoom, `[`/`]` or `,`/`.` rotate, Page Up and
 //! Page Down change the floor, `1`/`2`/`3` choose walls up, cutaway and
@@ -396,6 +399,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some((path, name)) => sims_sim::Snapshots::open(path)?
             .load(name)?
             .ok_or_else(|| format!("{} holds no world named {name}", path.display()))?,
+        // The panel shows what the load's steps 17 and 18 set: the
+        // family's funds and its first member selected.
+        None if options.hud => sims_vm::boot::Lot::load(
+            &options.install,
+            &options.house,
+            &[],
+            sims_vm::boot::Frames {
+                after: Vec::new(),
+                every: Vec::new(),
+            },
+        )
+        .map_err(|e| e.to_string())?
+        .world()
+        .clone(),
         None => opened.world,
     };
     let lot = Lot::from_world(&world)?;
