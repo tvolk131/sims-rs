@@ -68,6 +68,7 @@ pub fn lot() -> (Fixture, usize) {
     function(&mut fx, file, 10, LEAVING);
     // The visits here are the widgets'.
     fx.world.order.clear();
+    fx.world.people.clear();
     fx.world.objects.remove(&SIM);
     fx.lamp_mut().attributes = vec![0; 8];
     (fx, file)
@@ -372,6 +373,7 @@ fn resident(fx: &mut Fixture) -> People {
     sim.registry_word = Some(0xffff);
     fx.world.objects.insert(PERSON, sim);
     fx.world.order.push(PERSON);
+    fx.world.people.push(PERSON);
     fx.thread(PERSON, RESIDENT_MAIN, &[0; 4]);
     let cell = (3 * 64 + 3) * 2;
     let grid = &mut fx.world.arrays.get_mut(&3).unwrap().data;

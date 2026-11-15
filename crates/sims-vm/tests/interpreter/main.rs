@@ -9,6 +9,7 @@ mod change_suit;
 mod deletion;
 mod expression;
 mod factory;
+mod find_best_object;
 mod find_location;
 mod head;
 mod load;

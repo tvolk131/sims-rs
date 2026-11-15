@@ -36,6 +36,11 @@ pub struct World {
     /// list of objects, which the load's passes walk. The scheduler does
     /// not use it: it goes by ID (0x46d553).
     pub order: Vec<u16>,
+    /// The original's person vector, which Set To Next walks for people
+    /// (mode 1, 0x44efb4; mode 12, 0x44f0d4): the people a load reads,
+    /// in registration order, then each person made since, at the end.
+    /// A person removed leaves it.
+    pub people: Vec<u16>,
     /// The lot's object type table (objt): type ID to GUID. Script frames
     /// name the object whose code they run by type ID.
     pub types: BTreeMap<u16, u32>,
@@ -335,6 +340,7 @@ impl World {
                 days: Vec::new(),
             },
             order: Vec::new(),
+            people: Vec::new(),
             types: BTreeMap::new(),
             objects: BTreeMap::new(),
             arrays: BTreeMap::new(),
@@ -427,7 +433,18 @@ impl World {
             world.objects.insert(id, Object::from_instance(instance));
         }
         world.order = house.objects.order.clone();
+        world.people = world.registered_people();
         Ok(world)
+    }
+
+    /// The people in registration order: the person vector a load
+    /// leaves.
+    pub fn registered_people(&self) -> Vec<u16> {
+        self.order
+            .iter()
+            .copied()
+            .filter(|id| self.objects.get(id).is_some_and(|o| o.person.is_some()))
+            .collect()
     }
 
     /// The canonical encoding: postcard, which writes fields in declaration
