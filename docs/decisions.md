@@ -52,6 +52,16 @@ whose word 64 is set instead plays the stop clip (state 7, clip 0x13,
 - Reopen if a recording interrupts a route under way and the original
   takes another tick, or none, to stop.
 
+**The snack cancels again.** Track 1's sweep had cancels at steps 150
+to 536, 543 to 590 and 821 to 829 stop here. Cancels at steps 150, 151,
+200, 300, 500, 536, 543, 560, 590, 821, 822, 825 and 829, each run 400
+steps on, now catch no error (a manual check, not a test). The one at
+step 400 runs to step 729, where person 18's walk blends a layer
+below weight 1 into what the bones held (0x597c4c, not ported).
+The test of the cancel at step 825 now says what follows: the stop at
+step 828, the route's result 4 at step 829, the snack put down at step
+894 and Mortimer free at step 913.
+
 ## 2026-11-15: The personality panel draws its bars as the original's bar maker lays them out
 
 The live panel's Personality button now opens the selected Sim's
@@ -126,9 +136,10 @@ ported from the original's code, as the inverse of Grab:
       its own (0x45d7c0). He drops the snack at step 1009, and starts
       the water at step 1028.
   - A cancel at step 825, as he walks away from the fridge with the
-    snack, stops at the unported route stop below
-    (`a_snack_cancelled_on_the_way_to_the_chair_stops_at_the_unported_route_stop`,
-    a known gap pinned so it is not mistaken for fixed).
+    snack, stopped at the unported route stop below; since the route
+    stop is ported, he stops the walk, carries the snack to (296, 456)
+    and puts it down
+    (`a_snack_cancelled_on_the_way_to_the_chair_stops_the_walk_and_is_put_down`).
 - **A manual sweep, not a test:** the snack order cancelled at each
   step from 150 to 1136 (every tenth step, then every step near each
   edge), run 400 steps on. Cancels at steps 150 to 536, 543 to 590 and

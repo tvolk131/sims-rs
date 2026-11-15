@@ -799,14 +799,14 @@ fn a_cancelled_snack_is_put_down_in_front_of_the_eater() {
     assert!(free.queue.is_empty());
 }
 
-/// A known gap, not the original's behaviour: the snack order cancelled
-/// at step 825, as Mortimer walks away from the fridge with the snack,
-/// stops his route while its animator is still under way (0x45b3eb),
-/// which is not ported (track 4's). Cancels at steps 150 to 536 and 543
-/// to 590, on his way to the fridge, stop the same way. When 0x45b3eb is
-/// ported, this test is to say what the original does instead.
+/// The snack order cancelled at step 825, as Mortimer walks away from
+/// the fridge with the snack. His route's step 11 (0x45b3c2) finds the
+/// animator under way at step 828 and only asks it to stop (0x45b3eb,
+/// 0x589e2d); at step 829 the stop succeeds and the route fails with
+/// result 4 (word 62). His tree 0x0139 then walks him to (296, 456),
+/// puts the snack down at step 894 and he is free at step 913.
 #[test]
-fn a_snack_cancelled_on_the_way_to_the_chair_stops_at_the_unported_route_stop() {
+fn a_snack_cancelled_on_the_way_to_the_chair_stops_the_walk_and_is_put_down() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -827,24 +827,67 @@ fn a_snack_cancelled_on_the_way_to_the_chair_stops_at_the_unported_route_stop() 
     let snack = me.person.as_ref().unwrap().active.uid;
     assert_eq!((snack, me.slots[1].object), (5, 263));
     assert!(lot.cancel(sim, snack).unwrap().counts);
+    let held = |lot: &Lot| lot.world().objects[&sim].slots[1].object;
+    let route = |lot: &Lot| {
+        let me = &lot.world().objects[&sim];
+        me.stack
+            .last()
+            .map(|frame| (frame.tree, frame.primitive_state))
+    };
     for step in 825..828 {
         let update = lot.step_play().unwrap();
         assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+        assert_eq!(route(&lot), Some((0x104a, 3)), "step {step}");
     }
+    // Step 828: the route wants to stop while the animator walks; the
+    // stop is asked for and the route waits in step 11.
     let update = lot.step_play().unwrap();
-    let [error] = update.errors.as_slice() else {
-        panic!("{:?}", update.errors);
-    };
-    let fault = &error.fault;
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    assert!(lot.world().stop_requests.contains(&sim));
+    assert_eq!(lot.world().animators[&sim].arrival, 3);
+    assert_eq!(route(&lot), Some((0x104a, 11)));
+    // Step 829: the route fails with result 4, and his tree 0x0139 walks
+    // him on with the snack.
+    let update = lot.step_play().unwrap();
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    assert!(!lot.world().stop_requests.contains(&sim));
     assert_eq!(
-        fault.at.map(|at| (at.tree, at.node)),
-        Some((0x104a, 4)),
-        "{error:?}"
+        lot.world().objects[&sim].person.as_ref().unwrap().data[62],
+        4
     );
-    assert!(
-        matches!(&fault.trap, sims_vm::Trap::Unsupported(why) if why.contains("0x45b3eb")),
-        "{error:?}"
-    );
+    assert_eq!(route(&lot), Some((0x139, 3)));
+    for step in 830..894 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+        assert_eq!(held(&lot), 263, "step {step}");
+    }
+    // Step 894: he stands at (296, 456) facing 6 and puts it down in
+    // front of him.
+    let update = lot.step_play().unwrap();
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    assert_eq!(held(&lot), 0);
+    let me = &lot.world().objects[&sim];
+    assert_eq!((me.position, me.data[1]), ([296, 456, 1], 6));
+    assert_eq!(lot.world().objects[&263].position, [296, 440, 1]);
+    for step in 895..913 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+        assert_eq!(
+            lot.world().objects[&sim]
+                .person
+                .as_ref()
+                .unwrap()
+                .active
+                .uid,
+            5
+        );
+    }
+    // Step 913: the cancelled action ends, and he is free.
+    let update = lot.step_play().unwrap();
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    let free = lot.world().objects[&sim].person.clone().unwrap();
+    assert_eq!(free.active.uid, 0);
+    assert!(free.queue.is_empty());
 }
 
 #[test]
