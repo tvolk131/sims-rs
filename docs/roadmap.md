@@ -2098,7 +2098,10 @@ through their public interfaces only; the simulation never depends on it.
   not ported something the listing needs, the menu falls back to every
   entry of the table, queued by menu number, and the note across the
   top says why; any other failure shows no menu. Escape closes the menu.
-  The simulation lists the fridge itself: in the morning the house
+  The menu is drawn as the original's pie, with `sims_ui::pie` (#157):
+  the labels around the click, a name with a `/` in a submenu, at most
+  12 shown; a test clicks the fridge and chooses Have A Snack from its
+  pie. The simulation lists the fridge itself: in the morning the house
   loads in, Have A Snack, Have Quick Breakfast, Have Breakfast and
   Serve Breakfast.
 - **Done: a Sim doing what he is told.** Have A Snack queued on the
@@ -2119,7 +2122,8 @@ through their public interfaces only; the simulation never depends on it.
   (0x58da12), which is not ported, so in strict mode (`Lot::select`)
   switching Sims fails and changes nothing; play mode
   (`Lot::select_play`) leaves the refresh out.
-- **Next:** a real pie.
+- **Next:** the selected Sim's head in the middle of the pie; answering
+  a dialog from the window.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
     on Manage Inventory operation 4 and scope 12. Every
@@ -2139,8 +2143,9 @@ through their public interfaces only; the simulation never depends on it.
     to find the person a click lands on.
   - `sims-vm`: the animator's refresh (0x58da12), which deselecting a
     Sim makes, so strict mode can switch Sims.
-  - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
-    and dialogs are. `sims-game` draws a plain list until then.
+  - `sims-people`: the selected Sim's head as an image, which the
+    original renders live into the pie's face bitmap; the middle of the
+    pie is empty until then.
   - `sims-audio`: the inputs the game cannot give yet: the camera value
     of the ambience's cursor (0x570c3e; `sims-game` passes a fixed 50),
     what the sound scripts' `getsrcdatafield` fields are (`sims-game`

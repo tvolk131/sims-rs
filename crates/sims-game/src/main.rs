@@ -20,9 +20,10 @@
 //! fails, as the simulation has not ported the deselected Sim's
 //! animator refresh; play mode leaves it out (`Lot::select_play`).
 //!
-//! A left click on a person or an object opens its menu for the selected
-//! Sim; a click on an entry queues it, and a click anywhere else, or
-//! Escape, closes the menu. Escape quits only when no menu is open, and a
+//! A left click on a person or an object opens its pie menu for the
+//! selected Sim (`sims_ui::pie`, around the click); a click on an entry
+//! queues it, one on a submenu's entry opens the submenu, and a click
+//! anywhere else, or Escape, closes the menu. Escape quits only when no menu is open, and a
 //! held Escape's repeats do nothing.
 //!
 //! The lot runs in strict mode: the first error stops it, and the error

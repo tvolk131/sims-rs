@@ -4,6 +4,31 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: The game draws its pie menu with `sims_ui::pie`
+
+The window's pie menu is now `sims_ui::pie::Pie` (#157), the port of the
+original's menu window and object picker, in place of the plain list
+`sims-game` drew. The game hands it the entry names in the listing's
+order and keeps it while the menu is open; the pie groups a name with a
+`/` into a submenu and shows at most 12 entries, and a choice is the
+entry's index in the listing, which the game queues as before. A press
+on a submenu's entry, or back out of one, keeps the menu open; one
+elsewhere closes it.
+
+**Verified:** a unit test chooses an entry, opens a submenu and chooses
+from it, and closes the menu; on the Goth house a test clicks the
+fridge, finds Have A Snack on its pie and presses it, and the order is
+in Mortimer's queue. The placement itself is `sims-ui`'s, checked there
+against the running original.
+
+**Not verified or not done:** the middle of the pie shows the face
+bitmap, which is all colour key, without the selected Sim's head; the
+original renders the head into it live, which needs `sims-people`. The
+game takes a press when the button goes down and never draws a label
+in the held colour (`pressed` is always false); which of down or up the
+original's picker answers on is not checked here. Reopen when a
+screenshot of an open pie disagrees, or when the head is rendered.
+
 ## 2026-11-15: Deselecting a Sim is ported but for its animator's refresh; play mode switches Sims
 
 Selecting a Sim (0x445449) now ports the deselection of the Sim selected
