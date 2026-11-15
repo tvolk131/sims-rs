@@ -438,6 +438,43 @@ fn an_offset_of_negative_zero_or_a_height_is_no_offset() {
     assert_eq!(fx.world.objects[&me].position, [56, 24, 1]);
 }
 
+#[test]
+fn go_to_routing_slot_numbers_its_slot_across_the_whole_chunk() {
+    // Kinds 0, 3, 0, 1, 3: routing slots 0 and 1 are the chunk's entries
+    // 1 and 4, which the slot table numbers 2 and 5 (0x46e343 numbers
+    // every entry), while the flags it keeps are keyed by routing slot.
+    for (routing, number) in [(0i16, 2), (1, 5)] {
+        let (mut fx, me) = snapper(0);
+        let kinds = [0u16, 3, 0, 1, 3];
+        set_slots(
+            &mut fx,
+            kinds.iter().map(|&kind| Slot { kind, ..slot(0) }).collect(),
+        );
+        fx.lamp_mut().position = [56, 24, 1];
+        let [i0, i1] = routing.to_le_bytes();
+        let guid = fx.world.objects[&me].guid;
+        let file = fx.catalog.object(guid).unwrap().resource;
+        fx.add(
+            file,
+            TREE,
+            tree(vec![ins(
+                45,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [i0, i1, 1, 0, 0, 0, 0, 0],
+            )]),
+        );
+        // The route then stops at a step not ported for this person; the
+        // context it made first holds the slot's record.
+        assert!(fx.run_with(me, TREE, LAMP as i16, &[], 1).is_err());
+        let contexts = &fx.world.routing.routes[&me].contexts;
+        let numbers: Vec<i32> = contexts.iter().map(|c| c.slot.number).collect();
+        assert_eq!(numbers, [number], "routing slot {routing}");
+        let keys: Vec<_> = fx.world.routing.slot_flags.keys().copied().collect();
+        assert_eq!(keys, [(LAMP, routing as u16)], "routing slot {routing}");
+    }
+}
+
 /// The lamp's SLOT chunk: a routing slot that snaps into container slot
 /// `into`, then two container slots at its centre, at height 1.
 fn into_lamp(fx: &mut Fixture, into: i32) {
