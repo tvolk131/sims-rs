@@ -64,10 +64,22 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
             .clone()
     };
 
-    // Person 16: every entry routes through a queued action that runs at
+    // Object 18's listing runs check trees and fails partway, at a scope
+    // not ported, and the lot is as it was.
+    let before = lot.world().hash();
+    let refused = lot.pie_menu(sim, 18).unwrap_err().to_string();
+    assert!(refused.contains("scope 12"), "{refused}");
+    assert_eq!(lot.world().hash(), before);
+
+    // Person 16: listing changes the lot (its check trees' work), and
+    // the change is kept.
+    let before = lot.world().hash();
+    let menu = lot.pie_menu(sim, 16).unwrap_or_else(|e| panic!("{e}"));
+    assert_ne!(lot.world().hash(), before);
+
+    // Every entry routes through a queued action that runs at
     // once (0x45d240), which is not ported, and each refusal leaves the
     // lot as it was.
-    let menu = lot.pie_menu(sim, 16).unwrap_or_else(|e| panic!("{e}"));
     assert!(!menu.actions.is_empty());
     assert!(
         menu.actions
