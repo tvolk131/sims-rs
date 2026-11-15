@@ -7,12 +7,17 @@
 //!   only its alpha is used, as a mask. A wall's *pattern* (wallpaper) is
 //!   the SPR# `id` plus 1536, 1792 or 2048 by zoom. Each has four frames:
 //!   the two edge directions, then the two diagonals.
+//! - The wood trim along the top of walls is SPR# 4096 to 4098 by zoom for
+//!   standing walls and 5120 to 5122 for cut ones (6144 to 6146 hold their
+//!   depth), each with its own palette: 46 frames, one per way the walls
+//!   meeting at a corner can run (the original's 0x53c227).
 //! - Objects are drawn from their definition's draw groups (DGRP) and SPR2
 //!   sprites, found through the content catalog by GUID.
 //!
 //! The same layout is read by the old prototype in
 //! `legacy/crates/sims-render/src/walls.rs` and `floors.rs`.
 
+use crate::camera::Zoom;
 use crate::canvas::Image;
 use crate::{Error, Result};
 use sims_content::{Catalog, Index, Install};
@@ -74,6 +79,7 @@ pub struct Assets {
     shapes: BTreeMap<(u16, bool, usize), Option<[Image; 4]>>,
     groups: BTreeMap<(usize, u16, u32, usize), Vec<Part>>,
     object_shapes: BTreeMap<(usize, u16, bool, usize), Option<[Image; 4]>>,
+    trims: BTreeMap<(bool, usize), Vec<Image>>,
 }
 
 impl Assets {
@@ -96,6 +102,7 @@ impl Assets {
             shapes: BTreeMap::new(),
             groups: BTreeMap::new(),
             object_shapes: BTreeMap::new(),
+            trims: BTreeMap::new(),
         })
     }
 
@@ -159,6 +166,40 @@ impl Assets {
                 })
             })
             .as_ref()
+    }
+
+    /// The wall-top trim frames at a zoom, for standing or cut walls. Empty
+    /// if the game lacks them, or if they hold far more pixels than the
+    /// game's do.
+    pub fn trim(&mut self, cut: bool, zoom: Zoom) -> &[Image] {
+        /// The frames the corner table can name.
+        const FRAMES: usize = 46;
+        /// The game's trims are a few thousand pixels at the near zoom.
+        const BUDGET: usize = 1 << 20;
+        let walls = &self.walls;
+        self.trims.entry((cut, zoom.index())).or_insert_with(|| {
+            let id = if cut { 5120 } else { 4096 } + zoom.index() as u16;
+            let Some(chunk) = walls.get(b"SPR#", id) else {
+                return Vec::new();
+            };
+            let data = walls.data(chunk);
+            let Ok(set) = LegacySpriteSet::parse(data) else {
+                return Vec::new();
+            };
+            let mut images = Vec::new();
+            let mut pixels = 0usize;
+            for i in 0..set.frames.len().min(FRAMES) {
+                let Ok(frame) = set.decode(data, i, walls) else {
+                    return Vec::new();
+                };
+                pixels = pixels.saturating_add(frame.rgba.len() / 4);
+                if pixels > BUDGET {
+                    return Vec::new();
+                }
+                images.push(Image::from(frame));
+            }
+            images
+        })
     }
 
     /// The parts of an object's definition the renderer uses.
