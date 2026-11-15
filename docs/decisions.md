@@ -31,6 +31,59 @@ search picks a place to stand, so the Sit route is covered only by
 synthetic tests. Reopen when a capture of a route that sits disagrees,
 or when a rounding at x.5 after the matrix lands on the other side.
 
+## 2026-11-15: Create New Object Instance mode 4 makes the object in the stack object's first slot; flag 0x1 skips a tile with its type
+
+Mode 4 of opcode 42 (0x44e3a2) takes the stack object as the container,
+and its position, level and room (data word 29). The new object goes
+into the container's first container slot (slot 0 as scripts count it).
+Before it is made, the common tail (0x44e4c5) runs three tests, any of
+which takes the false branch:
+
+- with flag 0x1 (0x44e4e1), an object of the same type stands on the
+  container's tile, or is held there however deep (0x43f331, 0x43f379);
+- the position is off the lot (0x422632);
+- the container's room is not -5, and the lot's room map gives its tile
+  another room (0x44e582).
+
+Then come the slot's place test (`fits_in`), the removal of an object
+the slot refuses, and the put. Flag 0x1 is the same tail code for every
+mode, so it is ported for modes 6 and 8 too. Mode 6's tile is off the
+arrays, where it finds nothing. Mode 8 keeps the room filter at -5, so
+its room test never runs. Making a person, a type that belongs to a
+group, a person as the container, and a container that the new object's
+Init removes still fail loudly, as do the other modes and flags.
+
+The fridge's snack tree (0x1019 node 1) runs mode 4 with flag 0x1 on
+the fridge. In play mode, after a player's Have A Snack order at tick
+51, Mortimer now puts the snack in the fridge at tick 634. He stops at
+tick 748, on Grab (primitive 4, tree 0x100d node 9). Strict mode on the
+Goth house is unchanged. **Unverified**: no capture covers a mode 4
+creation. Reopen when a recording of the snack order disagrees.
+
+## 2026-11-15: A check tree names pie menu entries with Add/Change Action String
+
+While the pie menu's listing checks an action, Add/Change Action String
+adds an entry to the menu (0x458789): a copy of the action being checked,
+with flags 4 and 8 set and 0x10 clear, the string as its name, and the
+string's four arguments, the first being the frame's stack object when
+the formatter left it 0 (0x44cca3). The entry goes into the menu at once,
+whether or not the check passes, and the action itself is then left out
+(0x458724 compares the list's length). The menu's entries are now
+`MenuEntry` values, an action and an optional name; picking one queues
+its action. The queue does not keep the name, which the original keeps in
+the action (+0x28) for the interface.
+
+The string's formatter (0x44bf1a) is not ported. Each of its passes looks
+for a token starting with "$" and does nothing without one, so a string
+with no "$" comes out unchanged and so do the arguments; a string with
+"$" fails loudly. A string the running code's file lacks also fails
+loudly, since what the original does with the null string 0x4704fa
+returns for it is not read. On the Goth house the fridge now offers "Have
+Quick Breakfast", "Have Breakfast" and "Serve Breakfast", and each
+staircase "Go Upstairs"; 85 objects offer entries, and 9 fail in check
+trees on Manage Inventory operation 4 and scopes 24 and 12. Reopen when a
+string with a token is reached.
+
 ## 2026-11-15: A pie menu that offers nothing lists the other objects on the tile
 
 When the listing on an object offers nothing, the original lists each
