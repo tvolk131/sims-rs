@@ -34,7 +34,7 @@
 //! are shown and answered inside the end of the lot update, so none is
 //! open while scripts run.
 //!
-//! The evidence (`docs/decisions.md`): on the Goth house five controllers
+//! The evidence (`docs/decisions/`): on the Goth house five controllers
 //! reach a one-button dialog in the first tick and yield; the run of the
 //! original answered each, and in the next tick each took the true
 //! branch. Object 15 then made a two-button dialog, answered with the

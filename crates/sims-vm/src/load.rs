@@ -161,7 +161,7 @@ impl Interpreter<'_> {
     /// the original asks all 382 objects in registration order, the same
     /// 62 have a tree here as change their thread there, no data word
     /// changes in either pass, and the lot afterwards equals the trace's.
-    /// See `docs/decisions.md`.
+    /// See `docs/decisions/`.
     ///
     /// Not modeled: the first pass also tells the room a person stands in
     /// that it is occupied, which lights the room. The original's level
@@ -281,7 +281,7 @@ impl Interpreter<'_> {
     /// (legacy/crates/sims-sim/src/saved_types.rs), which was compared with
     /// the original's 0x43a516 run in isolation on authored records. Three
     /// results were also compared with a capture of the original loading
-    /// the Goth house; see `docs/decisions.md`. The rest is
+    /// the Goth house; see `docs/decisions/`. The rest is
     /// **unverified**.
     ///
     /// Not ported: a GUID translation table in the house file
@@ -346,7 +346,7 @@ impl Interpreter<'_> {
     ///
     /// For the Goth house the creation was compared with captures of the
     /// original, on a bare lot (step 3) and among the saved objects and
-    /// people (step 8); see `docs/decisions.md`. That house has no
+    /// people (step 8); see `docs/decisions/`. That house has no
     /// duplicate. Removing duplicates is **unverified** against the
     /// running game: it follows the old prototype, which compared its
     /// selection loop with the original's 0x442b9f run alone on made-up

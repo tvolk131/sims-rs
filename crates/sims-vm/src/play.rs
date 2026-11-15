@@ -37,7 +37,7 @@
 //! Here the error word is never kept: a reset that succeeds clears it in
 //! the same pass, so step 4 always finds it 0, as strict mode assumes.
 //!
-//! **Approximations**, play mode only (`docs/decisions.md`):
+//! **Approximations**, play mode only (`docs/decisions/`):
 //!
 //! - An unported primitive or service ([`crate::Trap::Unsupported`]) is
 //!   handled like a SimAntics error, as is a thread that returns from its
