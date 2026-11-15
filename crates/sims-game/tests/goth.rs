@@ -104,3 +104,16 @@ fn people_stand_where_a_click_finds_them() {
     }
     assert!(found > 0, "no person stands in view");
 }
+
+#[test]
+fn play_mode_runs_the_goths_past_the_hour() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    // Past the hour turning at tick 878, through the errors play mode
+    // catches.
+    assert_eq!(game.run(3000), 3000);
+    assert_eq!(game.stopped(), None);
+    assert!(game.errors().len() as u64 <= game.caught());
+}

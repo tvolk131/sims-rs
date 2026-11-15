@@ -1974,12 +1974,13 @@ through their public interfaces only; the simulation never depends on it.
   every tick; the clock, funds and needs on the panel are the live
   world's. The panel's speed, pause and camera buttons work (the game
   paces the lot; the simulation's own speed global is not touched).
-  An object whose tick fails is reset and the lot goes on; the error is
-  printed and shown across the top for a while (`--strict` stops at the
-  first error instead). A failure play mode does not catch stops the
-  lot, which stays on screen as it was with the failure across the top:
-  today that is tick 878, where the hour turns. `--png <file> --ticks
-  N` draws one frame without a window.
+  An object whose tick fails is reset and the lot goes on; each new
+  error is printed and shown across the top for a while (`--strict`
+  stops at the first error instead). A failure play mode does not catch
+  stops the lot, which stays on screen as it was with the failure across
+  the top. The Goths' house now runs 12,000 ticks (ten minutes at normal
+  speed) without stopping, through about a dozen different caught
+  errors. `--png <file> --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
   default device (on macOS; elsewhere with the `sound` feature, so CI
   needs no audio library; `--mute` turns it off). A thread renders

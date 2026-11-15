@@ -5,8 +5,8 @@
 //! The simulation runs in play mode ([`Lot::step_play`]): an object whose
 //! tick fails, usually on something the simulation does not do yet, is
 //! reset as the original resets an object after a SimAntics error, and
-//! the lot goes on. Each error caught is logged and shown across the top
-//! for a while. A failure play mode does not catch stops the lot, which
+//! the lot goes on. Each new error caught is logged and shown across the
+//! top for a while. A failure play mode does not catch stops the lot, which
 //! stays on screen as the failure left it, with the failure written
 //! across the top. [`Options::strict`] steps with [`Lot::step`] instead,
 //! which stops at the first error of any kind.
@@ -20,6 +20,7 @@ use sims_render::{Canvas, Selected, Walls, open_house};
 use sims_ui::command::{Camera as UiCamera, Command, Walls as UiWalls};
 use sims_vm::boot::{Frames, Lot, StepError};
 use sims_vm::play::{Recovery, ScriptError};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// The room word of an object in no room.
@@ -31,6 +32,9 @@ const SHOWN_TICKS: u32 = 200;
 
 /// The most errors kept in the log; later ones are only counted.
 const LOGGED: usize = 256;
+
+/// The most different errors remembered, to show each once.
+const SEEN: usize = 4096;
 
 /// What the game is started with.
 #[derive(Debug, Clone)]
@@ -135,7 +139,9 @@ impl Game {
     }
 
     /// The errors play mode caught and recovered from, one line each, in
-    /// order: the first [`LOGGED`], then a line saying more were caught.
+    /// order: the first [`LOGGED`] different ones (an error again at a
+    /// later tick is not listed again), then a line saying more were
+    /// caught.
     pub fn errors(&self) -> &[String] {
         &self.errors.lines
     }
@@ -373,17 +379,34 @@ impl Game {
 /// The errors play mode caught.
 #[derive(Debug, Default)]
 struct Errors {
-    /// One line each, the first [`LOGGED`], then one saying more came.
+    /// One line each for the first [`LOGGED`] different errors, then one
+    /// saying more came. An error that differs from one listed only in
+    /// its tick is counted, not listed again.
     lines: Vec<String>,
+    /// The different errors seen, without their ticks, the first
+    /// [`SEEN`].
+    seen: BTreeSet<String>,
     /// How many were caught, listed or not.
     count: u64,
-    /// The last caught and the tick count after the step that caught it.
+    /// The last new error and the tick count after the step that caught
+    /// it. Repeats are not shown again.
     last: Option<(u32, String)>,
 }
 
 impl Errors {
     fn push(&mut self, at: u32, line: String) {
         self.count += 1;
+        // A line starts with its tick: "tick 95647, object 5: ...".
+        let what = line
+            .strip_prefix("tick ")
+            .and_then(|rest| rest.split_once(", "))
+            .map_or(line.as_str(), |(_, what)| what);
+        if self.seen.contains(what) {
+            return;
+        }
+        if self.seen.len() < SEEN {
+            self.seen.insert(what.to_owned());
+        }
         if self.lines.len() < LOGGED {
             self.lines.push(line.clone());
         } else if self.lines.len() == LOGGED {
@@ -561,11 +584,19 @@ mod tests {
             Some("Error caught (2 so far): second")
         );
         assert_eq!(errors.recent(110 + SHOWN_TICKS), None);
+        // The same error at another tick is counted, not listed or shown
+        // again.
+        errors.push(300, "tick 7, object 2: x".into());
+        errors.push(310 + SHOWN_TICKS, "tick 8, object 2: x".into());
+        assert_eq!(errors.lines.len(), 3);
+        assert_eq!(errors.lines[2], "tick 7, object 2: x");
+        assert_eq!(errors.count, 4);
+        assert_eq!(errors.recent(310 + SHOWN_TICKS), None);
         for n in 0..LOGGED * 2 {
             errors.push(200, n.to_string());
         }
         assert_eq!(errors.lines.len(), LOGGED + 1);
-        assert_eq!(errors.count, LOGGED as u64 * 2 + 2);
+        assert_eq!(errors.count, LOGGED as u64 * 2 + 4);
         assert_eq!(
             errors.lines.last().unwrap(),
             "further errors are counted, not listed"

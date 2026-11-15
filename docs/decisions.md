@@ -9,18 +9,21 @@ says what was decided, why, and what would reopen it. Entries marked
 `sims-game` steps the lot with `Lot::step_play`, not `Lot::step`: an
 object whose tick fails is reset (as the original resets an object after
 a SimAntics error) and the lot goes on, so a human can play past the
-first unported primitive. Each error caught is printed and written
+first unported primitive. Each new error caught is printed and written
 across the top for 200 ticks (10 s at normal speed) with a running
-count; the first 256 are kept in a list, later ones only counted. A
-failure play mode does not catch still stops the lot, as before. An
-error caught in a step that then fails is not logged: `Lot::step_play`
-returns the failure without the step's update. Within a step the log
-keeps the order things happened in: the frame before the first tick,
-the objects' errors, the frame after the tick (a single skipped frame
-on the first step is taken to be the one before it, which the update
-does not say). `--strict` (`Options::strict`) steps with `Lot::step` and stops at the
-first error, for looking at exactly what the captures check. A lot
-played this way is not one to compare with the original. This replaces
+count. The same error again at a later tick (or a frame skipped the
+same way again) is only counted, so one that recurs every frame does
+not hold the line open. The first 256 different errors are listed,
+later ones only counted. A failure play mode does not catch still stops
+the lot, as before. An error caught in a step that then fails is not
+logged: `Lot::step_play` returns the failure without the step's update.
+Within a step the log keeps the order things happened in: the frame
+before the first tick, the objects' errors, the frame after the tick (a
+single skipped frame on the first step is taken to be the one before
+it, which the update does not say). `--strict` (`Options::strict`)
+steps with `Lot::step` and stops at the first error, for looking at
+exactly what the captures check. A lot played this way is not one to
+compare with the original. This replaces
 the strict-mode half of "The game paces the lot itself, and runs it
 strictly"; the pacing half stands.
 

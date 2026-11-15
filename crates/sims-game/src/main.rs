@@ -17,8 +17,8 @@
 //! right-button drag scroll, space pauses, Escape quits.
 //!
 //! The lot runs in play mode: an object whose tick fails is reset and the
-//! lot goes on, and each error is printed and shown across the top for a
-//! while. `--strict` stops the lot at the first error instead.
+//! lot goes on, and each new error is printed and shown across the top
+//! for a while. `--strict` stops the lot at the first error instead.
 //!
 //! Sound plays on the default output device (on macOS, or built with the
 //! `sound` feature) unless `--mute` is given.
