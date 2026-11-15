@@ -15,7 +15,7 @@ use crate::support::*;
 use sims_formats::behavior::Behavior;
 use sims_formats::execution::ObjectFunction;
 use sims_sim::World;
-use sims_vm::{DEFINITION_WORDS, Library, Trap};
+use sims_vm::{DEFINITION_WORDS, Library};
 use std::collections::BTreeMap;
 
 const CREATE: u16 = 42;
@@ -282,7 +282,7 @@ fn newest(fx: &Fixture) -> u16 {
 }
 
 #[test]
-fn a_puddle_beside_one_of_its_own_type_would_join_its_group_which_fails_loudly() {
+fn a_puddle_beside_others_of_its_own_type_joins_each_of_their_groups() {
     let mut fx = lot();
     puddles(&mut fx);
     fx.lamp_mut().position = [40, 40, 1];
@@ -296,15 +296,67 @@ fn a_puddle_beside_one_of_its_own_type_would_join_its_group_which_fails_loudly()
     let second = newest(&fx);
     assert_ne!(second, first);
     assert_eq!(told(&fx.world, second), ([0; 4], 0, 1));
-    // Beside the first (direction 0 from (2, 3)): joining its group
-    // (0x423368) is not ported. The place is the middle of the tile
-    // (0x44e770).
+    assert!(fx.world.next_parts.is_empty());
+    // A third on tile (2, 3), in the middle of it (0x44e770): the first
+    // is beside it in direction 0 and the second in direction 2. It joins
+    // the first's group (0x423368), then the second's group takes that
+    // whole group: the second's chain goes on to the first's lead, and
+    // the first and the third take the second as their lead, with their
+    // offsets from it, in tiles.
     fx.lamp_mut().position = [33, 63, 1];
-    let result = create_where_the_lamp_stands(&mut fx, PUDDLE);
-    assert!(
-        matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x423368")),
-        "beside"
+    assert_eq!(create_where_the_lamp_stands(&mut fx, PUDDLE), Ok(true));
+    let third = newest(&fx);
+    assert_eq!(fx.world.objects[&third].position, [40, 56, 1]);
+    assert_eq!(
+        fx.world.next_parts,
+        BTreeMap::from([(second, first), (first, third)])
     );
+    let part = |id: u16| fx.world.objects[&id].multipart.clone().unwrap();
+    assert_eq!(part(second).parent, 0);
+    for (id, offset) in [(first, [-1, -1]), (third, [-1, 0])] {
+        let part = part(id);
+        assert_eq!(part.parent, second as i16, "{id}");
+        assert_eq!(part.offset[..2], offset, "{id}");
+        // Facing 0: the place in the group is the offset.
+        assert_eq!(part.group[..2], offset, "{id}");
+    }
+    // Each tile of the group, from the lead, is told which of the eight
+    // tiles around it hold the group: the second (3, 3) the first in
+    // direction 7 and the third in 6; the first (2, 2) the second in 3
+    // and the third in 4; the third the first in 0 and the second in 2.
+    assert_eq!(told(&fx.world, second), ([0xc0, 0, 0, 0], 0, 2));
+    assert_eq!(told(&fx.world, first), ([0x18, 0, 0, 0], 0, 2));
+    assert_eq!(told(&fx.world, third), ([0x05, 0, 0, 0], 0, 1));
+}
+
+#[test]
+fn a_group_joined_takes_its_new_leads_facing_and_turns_its_places_back() {
+    // As above, with the second puddle facing 2: the first and the third
+    // take that facing, and their places in the group are their offsets
+    // turned by -2 (0x42369d with 6): (x, y) becomes (y, -x).
+    let mut fx = lot();
+    puddles(&mut fx);
+    fx.lamp_mut().position = [40, 40, 1];
+    create_where_the_lamp_stands(&mut fx, PUDDLE).unwrap();
+    let first = newest(&fx);
+    fx.lamp_mut().position = [56, 56, 1];
+    create_where_the_lamp_stands(&mut fx, PUDDLE).unwrap();
+    let second = newest(&fx);
+    fx.world.objects.get_mut(&second).unwrap().data[1] = 2;
+    fx.lamp_mut().position = [33, 63, 1];
+    create_where_the_lamp_stands(&mut fx, PUDDLE).unwrap();
+    let third = newest(&fx);
+    for (id, offset, place) in [(first, [-1, -1], [-1, 1]), (third, [-1, 0], [0, 1])] {
+        let object = &fx.world.objects[&id];
+        assert_eq!(object.data[1], 2, "{id}");
+        let part = object.multipart.as_ref().unwrap();
+        assert_eq!(part.offset[..2], offset, "{id}");
+        assert_eq!(part.group[..2], place, "{id}");
+    }
+    // Bit d of a mask is direction (2 + d) % 8 now.
+    assert_eq!(told(&fx.world, second).0[0], 0x30);
+    assert_eq!(told(&fx.world, first).0[0], 0x06);
+    assert_eq!(told(&fx.world, third).0[0], 0x41);
 }
 
 #[test]
