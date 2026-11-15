@@ -611,9 +611,9 @@ const TICK_9906: &str = "1e87830c107bef2b188791d6c9482e8afdfe1da341131b4482dfaac
 const TICK_9906_27: &str = "c8240fc703c03716105cd4d2e554ef225259aac9799c8d3e91de604f25cee599";
 /// The first update of the next day, when the day turns. Unverified: no
 /// capture reaches it.
-const TICK_31478: &str = "6bf514d7454e7fb7e7ad6bb3d88b87f7f48f77676278a23febb58f629aa44a5b";
+const TICK_31478: &str = "3f7c7f129bbdd04cf9fd6ec5c014a00f1217591e211ff5213365f69d97b7b1fa";
 /// A whole day, 43,200 updates, from the load. Unverified.
-const TICK_43200: &str = "2dd1601267938348fef7e293e71049f902799f94742cf082a42d65fc935eb87b";
+const TICK_43200: &str = "256292b76bf0c403e4ce40ab43702171697baf7a603122c129de83c4f61ad33b";
 
 #[test]
 fn strict_mode_runs_the_goth_houses_whole_day() {
@@ -724,9 +724,21 @@ fn strict_mode_runs_the_goth_houses_whole_day() {
         lot.step().unwrap();
     }
     assert_eq!(clock(&lot), (23, 59, 58));
+    // The values the house was saved with: the objects' (simulator
+    // +0xa0) and the architecture's (+0xa4).
+    let values = |lot: &Lot| {
+        let budget = &lot.world().budget;
+        (budget.objects_value, budget.architecture_value)
+    };
+    assert_eq!(values(&lot), (14660, 15277));
     // Tick 31478: the hours reach 24 and the day turns (0x46d3e9): the
     // date, the objects' daily update, the budget, and signal 0xdc.
     lot.step().unwrap();
+    // The statistics work the objects' value out again after the objects
+    // lost value for the day. Before the loss the sum is the saved 14660,
+    // which a probe of this run checked. The architecture's value is not
+    // ported and keeps the saved one.
+    assert_eq!(values(&lot), (12524, 15277));
     assert_eq!(lot.world().hash_hex(), TICK_31478);
     assert_eq!((date(&lot), clock(&lot)), ((17, 6, 1997, 1), (0, 0, 0)));
     // Tick 34719: a Snap blocked by a person asks it to make way

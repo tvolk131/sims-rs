@@ -727,3 +727,30 @@ fn a_person_going_through_everything_plans_to_a_slot_outside_its_walled_room() {
     assert!(gives_up(go_to(&mut fx, me)));
     assert_eq!(route_result(&fx, me), 2);
 }
+
+#[test]
+fn a_search_that_reaches_no_goal_gives_up_with_result_3() {
+    // 0x482b35: the person stands at (72, 72), outside the walls of room
+    // 1, which its room word names, so the room's own rectangles leave no
+    // way to any of the four candidates (all with positive scores). The
+    // search ends with no goal: the chosen candidate is forgotten
+    // (0x481745; none was chosen, so nothing changes), the context's
+    // result is 3 and the planner answers false (0x482e6d). The route
+    // gives up with that result and its context goes.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    set_slots(
+        &mut fx,
+        vec![Slot {
+            standing: 5,
+            sitting: 0,
+            ..seats_slot()
+        }],
+    );
+    let person = fx.world.objects.get_mut(&me).unwrap();
+    person.position = [72, 72, 1];
+    person.footprint = [69, 69, 75, 75];
+    assert!(gives_up(go_to(&mut fx, me)));
+    assert_eq!(route_result(&fx, me), 3);
+    let route = &fx.world.routing.routes[&me];
+    assert!(route.contexts.is_empty() && route.path.is_empty());
+}

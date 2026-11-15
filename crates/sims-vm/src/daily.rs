@@ -58,8 +58,12 @@ pub(crate) const DAYS_IN_MONTH: i16 = 30;
 mod data {
     /// Age in years (+0x6e).
     pub const YEARS: usize = 18;
+    /// Nonzero: the object's value counts half (+0x68, 0x43219a).
+    pub const HALVED: usize = 15;
     /// The object's current value (+0x9c).
     pub const VALUE: usize = 41;
+    /// The object's flags (+0xa0, 0x4354d5).
+    pub const FLAGS: usize = 43;
     /// The date the object was made: year, month, day (+0xa4 to +0xa8).
     pub const MADE: usize = 45;
     /// Age in months (+0xaa).
@@ -81,7 +85,18 @@ mod def {
     /// The three words any of which makes an object count for global 22
     /// (+0x4e, +0x50, +0x8a).
     pub const BUILT: [usize; 3] = [39, 40, 69];
+    /// Word 69 of the catalog master, which keeps an object out of the
+    /// objects' value (0x4354d5) and, but for 0 and 4, puts it in the
+    /// architecture's (0x4451ad).
+    pub const BUILD_KIND: usize = 69;
 }
+
+/// The object flag (data word 43) that keeps an object out of the
+/// objects' value (0x4354d8).
+const NOT_VALUED: i16 = 0x10;
+
+/// Definition word 9 of a person (0x4354e7).
+const PERSON: i16 = 2;
 
 /// Definition word 9 of an object the statistics pass over (0x44508a).
 const SKIPPED_TYPE: i16 = 7;
@@ -306,14 +321,28 @@ impl Interpreter<'_> {
     ///    counted and else 0, and global 37 the lot's features, as at a
     ///    load ([`World::update_statistics`]).
     ///
-    /// The same pass works out the value of the lot's objects and of its
-    /// architecture (simulator +0xa0 and +0xa4, [`sims_sim::Budget`]) and
-    /// two flags of the selected family (+0x138: bit 1 when an object of
+    /// The object pass also sums values ([`value`], 0x43219a). An object
+    /// it does not pass over that stands on the lot (its third ask,
+    /// 0x445112) and is valued ([`valued`], 0x4354d5) adds to the
+    /// objects' value. Any other adds to the architecture's when its
+    /// catalog master's word 69 is not 0 or 4 (0x445190 to 0x445223).
+    /// The objects' value becomes the budget's
+    /// ([`sims_sim::Budget::objects_value`], simulator +0xa0, 0x416118).
+    ///
+    /// **Not ported: the architecture's value** (+0xa4, 0x416126), the
+    /// objects' sum above plus what 0x47b006 returns: half the prices of
+    /// the walls' styles (0x6e5838), the wall patterns' prices (0x4c63cf),
+    /// the floors' prices (0x4a1439, half for a diagonal half floor) and
+    /// the pool's (0x6c5ff8). The pattern catalogs here hold no prices, so
+    /// [`sims_sim::Budget::architecture_value`] keeps the value the house
+    /// was saved with. Nothing ported reads it; a save written after a day
+    /// turns would hold a stale value. This is a known gap, not the
+    /// original's behaviour.
+    ///
+    /// Two flags of the selected family (+0x138: bit 1 when an object of
     /// category 1 stands on the lot, bit 2 when there is one of category
-    /// 9). Those are left as they are: nothing ported reads the values,
-    /// and the family's flags are not kept (a script that reads them fails
-    /// loudly, `memory.rs`). Prices of walls, floors and pools are not
-    /// ported.
+    /// 9) are not kept either (a script that reads them fails loudly,
+    /// `memory.rs`).
     pub(crate) fn day_statistics(&self, world: &mut World) -> Result<(), Fault> {
         let fail = |object, trap| Fault {
             object,
@@ -321,6 +350,7 @@ impl Interpreter<'_> {
             trap,
         };
         let mut built = false;
+        let mut objects_value = 0i32;
         for id in world.order.clone() {
             let object = world.objects.get(&id).ok_or_else(|| {
                 fail(id, Trap::Invalid("object on the lot's list is gone".into()))
@@ -347,8 +377,15 @@ impl Interpreter<'_> {
                     built = true;
                 }
             }
-            stands_on_lot(world, id).map_err(|trap| fail(id, trap))?;
+            let on_lot = stands_on_lot(world, id).map_err(|trap| fail(id, trap))?;
+            if on_lot && self.valued(world, id).map_err(|trap| fail(id, trap))? {
+                let value = value(world, &words, id).map_err(|trap| fail(id, trap))?;
+                objects_value = objects_value.wrapping_add(i32::from(value));
+            }
+            // Otherwise the object's value goes to the architecture's,
+            // which is not ported (above).
         }
+        world.budget.objects_value = objects_value;
         if !built {
             built = architecture_counts(world).map_err(|trap| fail(0, trap))?;
         }
@@ -362,6 +399,89 @@ impl Interpreter<'_> {
             i16::from(built);
         Ok(())
     }
+}
+
+impl Interpreter<'_> {
+    /// Whether object `id` counts in the objects' value (0x4354d5): not
+    /// with flag 0x10 in its data word 43; a person (definition word 9 is
+    /// 2) does; any other only when its catalog master's word 69 is 0
+    /// (0x45728d, `+0x60`, +0x8a). The test of flag 8 after it returns
+    /// true here, flag 0x10 being clear.
+    fn valued(&self, world: &World, id: u16) -> Result<bool, Trap> {
+        let object = world
+            .objects
+            .get(&id)
+            .ok_or_else(|| Trap::Invalid(format!("object {id} on the lot's list is gone")))?;
+        let flags = object.data.get(data::FLAGS).copied().unwrap_or(0);
+        if flags & NOT_VALUED != 0 {
+            return Ok(false);
+        }
+        if self.words(world, id)?[word::TYPE] == PERSON {
+            return Ok(true);
+        }
+        let definition = self
+            .catalog
+            .object(object.guid)
+            .ok_or_else(|| Trap::Invalid(format!("object {id} has no definition")))?;
+        let master = self
+            .program
+            .catalog_master(definition.resource, definition.chunk)
+            .ok_or_else(|| {
+                Trap::Unsupported(format!(
+                    "object {id} has no catalog master, which 0x4354f9 reads through a null \
+                     pointer"
+                ))
+            })?;
+        Ok(master[def::BUILD_KIND] == 0)
+    }
+}
+
+/// An object's value as the statistics count it (0x43219a). For an
+/// object whose definition word 10 is 0, its data word 41. For a tile
+/// of a group: none when it is not a multi-tile object (the cast to
+/// 0x6c0ef8 fails), else its lead's word 41 (+0x190; the tile itself
+/// when 0). Either way the value is halved, toward zero, when data word
+/// 15 is not 0: for a group, on any tile from the lead along the chain
+/// (+0x18c).
+fn value(world: &World, words: &[i16], id: u16) -> Result<i16, Trap> {
+    let object = |id: u16| {
+        world
+            .objects
+            .get(&id)
+            .ok_or_else(|| Trap::Invalid(format!("object {id} of a group is gone")))
+    };
+    let word_of = |id: u16, index: usize| -> Result<i16, Trap> {
+        Ok(object(id)?.data.get(index).copied().unwrap_or(0))
+    };
+    let (value, halved) = if words[word::GROUP] == 0 {
+        (word_of(id, data::VALUE)?, word_of(id, data::HALVED)? != 0)
+    } else {
+        let Some(part) = &object(id)?.multipart else {
+            return Ok(0);
+        };
+        let lead = if part.parent == 0 {
+            id
+        } else {
+            part.parent as u16
+        };
+        let mut halved = false;
+        let mut tile = lead;
+        let mut steps = 0;
+        loop {
+            halved |= word_of(tile, data::HALVED)? != 0;
+            let next = world.next_parts.get(&tile).copied().unwrap_or(0);
+            if next == 0 {
+                break;
+            }
+            steps += 1;
+            if steps > world.objects.len() {
+                return Err(Trap::Invalid(format!("the group of object {id} loops")));
+            }
+            tile = next;
+        }
+        (word_of(lead, data::VALUE)?, halved)
+    };
+    Ok(if halved { value / 2 } else { value })
 }
 
 /// Whether the lot's architecture counts for global 22 (0x47b006's flag).

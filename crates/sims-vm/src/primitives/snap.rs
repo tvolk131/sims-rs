@@ -76,7 +76,9 @@
 //! placement error and the object collided with (0x454e09 to 0x454e9b,
 //! `not_fit`), and the branch is false; for a multi-tile object the
 //! object collided with is the last that any of its tiles' tests wrote. A
-//! person blocked by another person with flag bit 1 fails loudly.
+//! person blocked by another person with flag bit 1 asks that person to
+//! make way (0x45bd5e, `Machine::ask_to_make_way`), which may queue a
+//! move action on it; word 52 becomes 1 when it is asked (`not_fit`).
 //!
 //! Flag bit 0 makes the animator's offset my distance from the place
 //! (0x454c7a), which the animator's later placing adds to my position;

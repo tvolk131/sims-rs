@@ -540,6 +540,84 @@ fn global_22_counts_floors_and_objects_off_tiles_with_flag_0x20() {
 }
 
 #[test]
+fn the_objects_value_is_worked_out_again_after_the_days_loss() {
+    // 0x444cb9, 0x416118: the objects that stand on the lot and are valued
+    // (0x4354d5) sum their values (0x43219a) into simulator +0xa0, after
+    // the loss of value. The architecture's value (+0xa4) is not ported
+    // and keeps what it held.
+    let at = |a: i32| [a * 16 + 8, 5 * 16 + 8, 1];
+    let run = |change: &dyn Fn(&mut Fixture)| {
+        let mut fx = before_midnight();
+        floor(&mut fx);
+        fx.lamp_mut().position = at(5);
+        fx.sim_mut().position = [-16, -16, 1];
+        // The lamp's catalog master (itself) has word 69 clear, and
+        // neither has flag 0x10 nor counts half.
+        fx.words(LAMP_FILE)[69] = 0;
+        for id in [LAMP, SIM] {
+            let object = fx.world.objects.get_mut(&id).unwrap();
+            (object.data[15], object.data[43]) = (0, 0);
+        }
+        let budget = &mut fx.world.budget;
+        (budget.objects_value, budget.architecture_value) = (1234, 5678);
+        change(&mut fx);
+        update(&mut fx, &mut answers(&[])).unwrap();
+        let budget = &fx.world.budget;
+        (budget.objects_value, budget.architecture_value)
+    };
+    // The lamp, at its price of 100, lost its first day's 10.
+    assert_eq!(run(&|_| {}), (90, 5678));
+    // The Sim on the lot adds its 82: a person (definition word 9 is 2) is
+    // valued whatever its master's word 69.
+    assert_eq!(run(&|fx| fx.sim_mut().position = at(6)), (172, 5678));
+    // Off the lot, the lamp counts for neither.
+    assert_eq!(run(&|fx| fx.lamp_mut().position = [-16, -16, 1]), (0, 5678));
+    // Flag 0x10 of data word 43 keeps it out; flag 8 alone does not.
+    assert_eq!(run(&|fx| fx.lamp_mut().data[43] = 0x10), (0, 5678));
+    assert_eq!(run(&|fx| fx.lamp_mut().data[43] = 8), (90, 5678));
+    // Its master's word 69 not 0 keeps it out (it goes to the
+    // architecture's value, which is not ported).
+    assert_eq!(run(&|fx| fx.words(LAMP_FILE)[69] = 4), (0, 5678));
+    // Data word 15 not 0 halves the value, toward zero.
+    assert_eq!(run(&|fx| fx.lamp_mut().data[15] = 1), (45, 5678));
+    let negative = |fx: &mut Fixture| {
+        fx.words(LAMP_FILE)[37] = 1;
+        (fx.lamp_mut().data[41], fx.lamp_mut().data[15]) = (-7, -1);
+    };
+    assert_eq!(run(&negative), (-3, 5678));
+    // A tile of a group whose definition says so (word 10; word 11 -1 makes
+    // it its own catalog master) but that is no multi-tile object counts
+    // 0.
+    let unlinked = |fx: &mut Fixture| {
+        let words = fx.words(LAMP_FILE);
+        (words[10], words[11]) = (1, -1);
+    };
+    assert_eq!(run(&unlinked), (0, 5678));
+    // A group: its lead, the lamp, counts its own value, halved because a
+    // later tile of its chain has word 15 set. The tile, not a lead, is
+    // passed over.
+    let group = |fx: &mut Fixture| {
+        use sims_formats::saved_objects::Multipart;
+        let words = fx.words(LAMP_FILE);
+        (words[10], words[11]) = (1, -1);
+        let tile = |parent| {
+            Some(Multipart {
+                offset: [0; 3],
+                group: [0; 3],
+                parent,
+            })
+        };
+        fx.lamp_mut().multipart = tile(0);
+        let other = fx.add_object(50);
+        other.position = at(6);
+        other.multipart = tile(LAMP as i16);
+        (other.data[15], other.data[41], other.data[43]) = (1, 1000, 0);
+        fx.world.next_parts.insert(LAMP, 50);
+    };
+    assert_eq!(run(&group), (45, 5678));
+}
+
+#[test]
 fn what_the_day_turn_does_not_port_fails_loudly() {
     let unsupported = |fx: &mut Fixture, what: &str| {
         let result = update(fx, &mut answers(&[]));
@@ -559,6 +637,14 @@ fn what_the_day_turn_does_not_port_fails_loudly() {
     let mut fx = before_midnight();
     fx.world.budget.days[1] = None;
     unsupported(&mut fx, "not saved");
+    // A tile of a group with no catalog master on the lot: the original
+    // reads its master through a null pointer (0x4354f9).
+    let mut fx = before_midnight();
+    floor(&mut fx);
+    fx.words(LAMP_FILE)[10] = 1;
+    fx.lamp_mut().position = [5 * 16 + 8, 5 * 16 + 8, 1];
+    fx.lamp_mut().data[43] = 0;
+    unsupported(&mut fx, "no catalog master");
 }
 
 #[test]

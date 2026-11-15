@@ -8,7 +8,7 @@ says what was decided, why, and what would reopen it. Entries marked
 
 **Unverified.** Strict mode on the Goth house now runs 43,200 updates,
 a whole day from the load, to 06:30:44 on the next day (17 June 1997,
-one day played; hash 2dd16012…) with no stop. No capture of the
+one day played; hash 256292b7…) with no stop. No capture of the
 original goes past update 8699, so everything from tick 9907 on is read
 from the original's code and not compared. The state at every pinned
 tick up to 9906 is the same: snapshot format 28 appends
@@ -109,6 +109,27 @@ Two play-mode runs got further too, also unverified:
   - signal 0xdc is sent instead of 0xdb. The lot's handler (0x41637f)
     moves the usage counts back a day and works out the lot's statistics
     again (0x416085, global 22).
+  - the same statistics pass works out the objects' value again
+    (simulator +0xa0, `Budget::objects_value`, 0x416118). Each object it
+    does not pass over adds its value (0x43219a) when it stands on the lot
+    and is valued (0x4354d5). It is not valued with flag 0x10 in data
+    word 43, or when it is not a person and its catalog master's word 69
+    is set. A group counts its lead's value, and the value is halved when
+    data word 15 is set on any tile. **Checked against the save:** worked
+    out at the Goth house's day turn before the objects lose value, the
+    sum is 14660, the value the original saved with the house. After the
+    loss it is 12524.
+
+  **Not ported: the architecture's value** (+0xa4, 0x416126). It is the
+  objects that are not valued but whose master's word 69 is neither 0
+  nor 4, plus what 0x47b006 returns from the walls' style prices
+  (0x6e5838), the wall and floor patterns' prices (0x4c63cf, 0x4a1439)
+  and the pool's (0x6c5ff8). The pattern catalogs hold no prices, so the
+  value keeps what the house was saved with (15277 for the Goths).
+  Nothing ported reads it, so a run is not affected, but a save written
+  after a day turns would hold a stale value. Failing loudly here would
+  stop every lot at its first midnight, so the gap is documented instead.
+  Reopen when the catalogs carry prices.
 
   The neighborhood's daily record of the household (0x429f14) is left
   out: it appends to a list of the family's that nothing ported reads.
