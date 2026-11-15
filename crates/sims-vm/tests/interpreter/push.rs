@@ -237,9 +237,10 @@ fn a_full_queue_keeps_the_action_pushed_to_the_front_and_six_more() {
 fn flag_0x40_at_the_front_clears_the_running_actions_flag_0x80() {
     // Operand flag bit 3 sets the action's flag 0x40, which at the front
     // clears flag 0x80 of the running action (0x41f167); without it the
-    // running action is left alone.
-    // The pushed action's flags: bit 0 from the entry, 2, and 0x40.
-    for (operand, expected, pushed) in [(4, 0x84, 0x03), (4 | 8, 0x04, 0x43)] {
+    // running action is left alone. Taking the running action's name
+    // sets the pushed action's own flag 0x80 (0x41f1ae).
+    // The pushed action's flags: bit 0 from the entry, 2, 0x40 and 0x80.
+    for (operand, expected, pushed) in [(4, 0x84, 0x03), (4 | 8, 0x04, 0xc3)] {
         let mut fx = lot([3, 0, 1, operand, 0, 0, 0, 0]);
         fx.sim_mut().person.as_mut().unwrap().active.flags = 0x84;
         assert_eq!(push(&mut fx, &[LAMP as i16]), Ok(true));

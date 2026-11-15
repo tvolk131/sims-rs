@@ -18,7 +18,9 @@ included, is native error 0x1b. Modes 0 to 2 still fail loudly.
 Queueing an action with flag 2 (0x45d322 to 0x45d47f) no longer fails.
 The action has already taken its number. With flag 0x40, the person's
 running action (+0xa48) loses its flag 0x80 (0x41f167), and the new
-action takes that action's name, which the queue does not keep. A queue
+action takes that action's name (0x41f1ae). Taking the name sets the new
+action's flag 0x80, which is ported; the name itself is not, since the
+queue does not keep names. A queue
 of the routine's own takes the new action and then the queued ones in
 order, and the person's queue is given them back. A full queue passes
 only its first seven, and only seven are given back, so the new action

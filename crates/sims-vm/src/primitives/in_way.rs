@@ -499,7 +499,7 @@ impl Machine<'_, '_> {
     ///
     /// 1. With action flag 0x40, the person's running action (+0xa48) has
     ///    its flag 0x80 cleared, and the new action takes its name
-    ///    (0x41f167, 0x41f1ae). The queue keeps no names, so only the flag
+    ///    (0x41f167, 0x41f1ae), which sets the new action's flag 0x80. The queue keeps no names, so only the flag
     ///    is ported; 0x41f167 makes the running action's name first if it
     ///    has none, which changes nothing else.
     /// 2. A queue of its own (0x45f71b) takes the new action, then the
@@ -512,7 +512,7 @@ impl Machine<'_, '_> {
     ///
     /// The action is always queued, and nothing here looks at an action
     /// running at once (the branch to 0x45d5a5 is not taken).
-    fn queue_at_front(&mut self, id: u16, action: Interaction) -> Result<Option<i32>, Trap> {
+    fn queue_at_front(&mut self, id: u16, mut action: Interaction) -> Result<Option<i32>, Trap> {
         let uid = action.uid;
         let person = self
             .world
@@ -522,6 +522,9 @@ impl Machine<'_, '_> {
             .ok_or(Trap::native(0x1c, "object is not a person"))?;
         if action.flags & NAME_FROM_RUNNING != 0 {
             person.active.flags &= !NAMED;
+            // Taking the running action's name sets the new action's flag
+            // 0x80 (0x41f1ae, 0x41f1bd).
+            action.flags |= NAMED;
         }
         let kept = if person.queue.len() >= QUEUE {
             QUEUE - 2
