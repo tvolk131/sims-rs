@@ -450,10 +450,11 @@ fn a_named_tree_a_check_tree_runs_may_change_its_advertisements() {
 }
 
 #[test]
-fn the_advertisement_scopes_fail_loudly_before_the_first_copy() {
-    // The advertisement scopes before Find Best Interaction first copies
-    // into the record. (Add/Change Action String outside a check tree is
-    // in action_string.rs.)
+fn the_advertisement_scopes_find_the_games_start_before_the_first_copy() {
+    // Before Find Best Interaction first copies into the record, it holds
+    // the sixteen zeroed advertisements the game's start leaves.
+    // (Add/Change Action String outside a check tree is in
+    // action_string.rs.)
     let mut fx = lot(0x100);
     fx.add(
         SIM_FILE,
@@ -461,8 +462,12 @@ fn the_advertisement_scopes_fail_loudly_before_the_first_copy() {
         tree(vec![assign(12, 0, scope::LITERAL, 1, RETURN_TRUE)]),
     );
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
-    assert!(fault.to_string().contains("0x6e5100"), "{fault}");
+    interpreter
+        .turn(&mut fx.world, SIM, 100)
+        .unwrap_or_else(|f| panic!("{f}"));
+    let record = fx.world.advertisement_record.unwrap();
+    assert_eq!(record[0].delta, 1);
+    assert!(record[1..].iter().all(|ad| *ad == Default::default()));
 }
 
 /// An entry with fewer than sixteen advertisements copies only its own
@@ -489,13 +494,15 @@ fn an_entry_with_fewer_advertisements_keeps_the_rest_of_the_last_copy() {
     assert_eq!(turn(&mut fx), Status::Yielded);
     let record = fx.world.advertisement_record.unwrap();
     assert_eq!(record[5].delta, 20000);
-    // The first copy of the game with fewer than sixteen would keep what
-    // the game's start left, which is not read.
+    // With both entries short, the first copies of the game keep the
+    // zeroes the game's start left in the rest. (Neither entry then
+    // advertises enough to be chosen.)
     let mut fx = lot(0x100);
+    shorten(&mut fx, 0);
     shorten(&mut fx, 1);
-    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
-    assert!(fault.to_string().contains("0x6e5100"), "{fault}");
+    turn(&mut fx);
+    let record = fx.world.advertisement_record.unwrap();
+    assert!(record[4..].iter().all(|ad| *ad == Default::default()));
 }
 
 /// The room adjustment compares the rooms after the check tree (0x45852f,
