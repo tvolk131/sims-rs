@@ -4,139 +4,96 @@ The current goal and how work toward it runs. `docs/vision.md` says what we
 are building. This file says what we are building *next*, and when it counts
 as done.
 
-## Current goal: a headless lot boot that matches the original
+## Current goal: the simulation matches the original across what a real player does
 
-Point `sims` at an install. It finds the files, loads one base-game
-neighborhood house, runs the objects' setup scripts, and then runs N ticks
-with no window. Every run gives the same state hash, and the state matches
-the original game, run in the emulator, for the first K ticks.
+The bar is the same as before: field for field against recordings of the
+original run in the emulator, with every difference explained. What
+widens is what is recorded: a whole game day, more houses, a player's
+orders, every primitive the install uses, and an expansion-pack lot.
 
-Done when:
+Done when, in strict mode (the default, unchanged):
 
-- `sims boot <install> <house> --ticks N` prints a state hash that is the same
-  on every run and on both CI platforms (x86_64 Linux, aarch64 macOS).
-- For that house, a captured run of the original agrees field for field with
-  ours at every compared tick up to K. K starts small and grows. The goal is
-  met at K = 1000 ticks, with no unexplained differences.
+- a recording of the Goth house through a full game day agrees with ours
+  at every compared tick;
+- three more base-game houses agree for their first 1000 ticks;
+- recordings in which a player gives orders (scripted clicks and pie
+  menu choices in the original) agree with ours given the same orders
+  through the player-order API;
+- every one of the 49 primitives the install's trees use (`sims census`)
+  is ported, for the cases recordings or targeted scenarios reach;
+- one expansion-pack lot agrees for its first 1000 ticks.
 
 ### Steps
 
-Each step is a few PRs, and each PR leaves `main` green.
+In this order; a step may interleave with the next while a recording is
+pending. The integration track's hooks (play mode, player orders, sound
+events, and what it asks for after them) come first.
 
-1. **Install detection and content lookup.** Recognize a Complete
-   Collection install (from its ISO) by its files. Bind every game file and
-   resource by name, and fail loudly on anything missing. The layout is
-   checked against the real installed tree in the emulator image.
-2. **Lot loading.** Read a house file into simulation state: objects, their
-   attributes, the scheduler, both RNG streams, the budget and the lot
-   arrays. Snapshots save to and load from REDB and survive a round trip
-   bit for bit.
-3. **Script interpreter core.** BHAV execution with stack frames, the
-   operand and variable model, and the primitives that this lot's setup and
-   first ticks actually reach. Unimplemented primitives fail loudly and
-   name themselves. Arithmetic goes through `sims-core`.
-4. **Comparison harness.** Run the original under QEMU and Wine, load the
-   same house, advance to tick N, and dump the state we compare. Captures
-   are private and are not committed.
-5. **Match.** Diff our state against the capture, fix the causes one by
-   one, and raise K.
+1. **K = 1000 on the Goth house.** Done (#129, 2026-11-15): see the met
+   goal below.
+2. **A full game day on the Goth house**: midnight and the day's turn,
+   both jobs, the carpool and the school bus, mail and bills, sleep.
+   Measure the ticks a day takes rather than guess. Record the full
+   state sparsely (every tenth update, and every update around events)
+   and the random streams every update. Delete the captures and dumps it
+   supersedes, and say which.
+3. **1000 ticks on three more base-game houses**, picked for code the
+   Goths do not reach (for example the Newbies and a family with
+   children).
+4. **Player orders.** Recordings of the original with the input track's
+   scripted clicks and pie-menu choices, matched through
+   `Interpreter::pie_menu`, `Interpreter::pick` and `Interpreter::order`.
+   These also check the integration track's game.
+5. **All 49 primitives**: port the remaining ones as recordings reach
+   them, or with targeted scenarios.
+6. **One expansion-pack lot**, after steps 1 to 5.
 
 ### Progress
 
-- Step 1 is done: `sims install` detects a Complete Collection install and
-  builds the object catalog.
-- Step 2 is done: the Goth house reads into `World`, which has a state
-  hash and REDB snapshots. `sims boot <install> <house>` prints the hash of
-  the state its load reaches.
-- Step 3 is in progress. The interpreter runs saved frames, creates
-  objects through the original's factory, and puts them to sleep. The load
-  sequence below tracks the load steps that must run before the first
-  tick. **The load is complete for the Goth house**: `sims boot` runs all
-  22 steps, and the state it ends in equals a trace of the original at
-  the entry of its first tick, in everything the trace holds of what we
-  keep. Six type attribute words are the exception: they belong to the
-  game that was running before the load.
-- Ticks run. `sims boot --ticks N` runs N lot updates after the load and
-  prints the hash. Between updates it draws the house view's frames as far
-  as they write the simulation's state (`--frames`, by default before tick
-  1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded; the fifth also drew after tick 901,
-  see "Ticks 901 to 991"). **K = 1000 on the Goth house**: our
-  state after every one of ticks 1 to 608 equals the fourth capture of the
-  original (full state after every update), and after every one of ticks
-  600 to 1000 the fifth, in everything compared, but
-  for the last place of one head field, which nothing reads (see "Ticks
-  334 to 366"). The
-  other captures agree where they hold a state, but for fields that also
-  differ between the original's own runs (see "Ticks 233 to 261").
-  The simulation holds the neighborhood's people (their records, person
-  data, relationships and inventories) and each person's animator, as
-  far as scripts read it. Find Location For (primitive 16) is ported for
-  the modes the house reaches, and so is making a new person (Create New
-  Object Instance mode 8, tick 6). Go To Routing Slot (primitive 45)
-  is ported for the routes the house takes to tick 366, with the
-  planner, the search of places by distance, the animator's turn on the
-  spot, its walk along the path and the end of the path, including the
-  stop on a timer that needs the walk's strides (see "Ticks 262 to
-  333"). Clips' timed
-  events are ported. In tick 233 person 21 chooses an interaction by
-  itself (Find Best Interaction, primitive 3) and starts it (Gosub Found
-  Action, primitive 30). Its tree routes to an object in another room
-  (Go To Relative Position, primitive 27): the routing between rooms
-  chooses a door, and the person walks through it. A person entering a
-  room tells the room (it is lit as if it had a lamp), and each frame
-  counts the rooms that wait. A person's head follows what it looks at
-  (see "Ticks 334 to 366"). Tick 367 stops loudly where person 18's
-  route finds a person in the way, which is not ported, and the boot says
-  so and at which tick.
-- Step 4 is in progress. `tools/harness/` runs the original under Wine
-  in a QEMU guest and stops it at every lot update. It saves the state
-  at the entry of the first tick and after each lot update: every
-  update to 100, then every tenth. A run on the Goth house recorded
-  1000 lot updates (tick counts 88445 to 89444), with the game reading
-  the install's own UserData. Its
-  dialogs were answered as in the first capture: OK to the five notices
-  in tick 1, and No to the Help System in tick 2. Compared with that
-  run, our state at the entry of tick 1 and after each compared tick to
-  230 matches in everything compared, one line aside:
-  - After tick 1, global 12 is 17 in the original. It is the interface's
-    wait check, which we do not run.
-  - **Unverified:** that global 12 comes from the open dialog.
-  `--watch` sets hardware write watchpoints and logs each write with the
-  writer's address and call chain (`tools/harness/README.md`). It found
-  what writes person 259's direction and registry byte 0x12 (see "Ticks
-  34 to 232").
-  A second run recorded 240 lot updates, with the full state after
-  updates 1 to 5, 30 to 35 and 225 to 240, a watchpoint on the house
-  view's draw guard (the frames), watchpoints on Find Best Interaction's
-  candidates, its choice and the action numbers, and a memory image at
-  the entry of update 233. A third run recorded 300 lot updates (full
-  state after 1 to 100 and every tenth), and a fourth the full state
-  after every update to 608, both with the draw guard watched. The
-  fourth stopped at update 609: the harness found an object in a
-  retained list that the registry did not hold. The list is a cache the
-  game rebuilds before reading it when it is marked dirty, and removing
-  an object marks it dirty without editing it; the reader now keeps a
-  dirty cache's pointers without identities (`tools/harness/README.md`).
-  A fifth run, with that reader, recorded 1000 lot updates with the full
-  state after updates 600 to 1000. Its streams equal the fourth run's
-  after every update both hold. The first run does not choose in tick
-  233; the other three do (see "Tick 233"). Why is not known, and the
-  captures do not hold what would tell. The likely cause, unverified,
-  is the long pause the harness made in that run only; we follow the
-  other three runs (`docs/decisions.md`).
-  With the install's UserData, the C runtime's random stream and all
-  463 neighborhood records match as well. The 52-draw offset and the
-  five differing records came from the first capture's guest files. The
-  original first draws from the C runtime's stream in tick 6, 1,466
-  times, when it makes a person; ours draws the same, and the stream is
-  equal after every tick to 366 (fourth capture).
+- Step 1 is done.
+- The integration hooks are merged: play mode (#120), player orders
+  (#121), sound events (#122), Idle For Input starting a queued action
+  (#131), the pie menu and picking from it (#132), and Go To Routing
+  Slot's parameter and global slots (#134), which a player's snack order
+  reached.
+- Strict mode on the Goth house runs to tick 1102, where the animator
+  turns by less than a step (0x58dfc0, not ported). Step 2 starts there.
+
+## Met goal: a headless lot boot that matches the original
+
+Met 2026-11-15 (#129). `sims boot <install> <house> --ticks N` loads a
+base-game house, runs its setup scripts and N ticks with no window, and
+prints a state hash that is the same on every run and on both CI
+platforms. For the Goth house, our state after every one of ticks 1 to
+608 equals the fourth capture of the original (full state after every
+update), and after every one of ticks 600 to 1000 the fifth, in
+everything compared, but for the last place of one head field that
+nothing reads (see "Ticks 334 to 366").
+
+How it was reached:
+
+1. **Install detection and content lookup**: `sims install` detects a
+   Complete Collection install and builds the object catalog.
+2. **Lot loading**: a house file reads into `World`, with a state hash
+   and REDB snapshots that survive a round trip bit for bit.
+3. **The interpreter**: the load's 22 steps, then the ticks, run the
+   original's trees. Unported paths fail loudly and name themselves.
+4. **The comparison harness** (`tools/harness/`): the original under Wine
+   in a QEMU guest, stopped at every lot update, saving the state at the
+   entry of the first tick and after chosen updates, with write
+   watchpoints (`--watch`) and memory images. The captures are private.
+   Five runs of the Goth house were recorded. The first does not choose
+   in tick 233 and the other four do; we follow those
+   (`docs/decisions.md`). With the install's own UserData, the C
+   runtime's random stream and all 463 neighborhood records match too.
+5. **Matching**: the sections below record, load step by load step and
+   tick range by tick range, what each needed and what was found.
 
 ### Load sequence
 
 What the original does between opening a house file and running the first
-tick, in order, and how much of each step `sims boot` does. The goal
-above needs every step: a step skipped or run out of order
+tick, in order, and how much of each step `sims boot` does. The met goal
+needed every step: a step skipped or run out of order
 changes the state the first tick sees.
 
 The order and the addresses come from the old prototype's research on the
