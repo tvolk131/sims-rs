@@ -72,8 +72,9 @@
 //! Location, [`Interpreter::take_self_off`]) has its animator refreshed
 //! there if the house view drew it (0x58da12, animator byte +0x109): a
 //! small tick of the clock, the skin forced, the place and the head.
-//! Whether the view drew it is not kept, so the animator's tick then
-//! checks that the refresh would write nothing but the animator and that
+//! Whether the view drew it is not kept, so the take-off checks that the
+//! refresh would write nothing but the animator and its base layer
+//! ([`Interpreter::refresh_at_take_off`]), and the animator's tick that
 //! the refresh then the tick reach what the tick alone does
 //! ([`Interpreter::tick_animator_after_take_off`]); anything else fails.
 //!
@@ -85,7 +86,7 @@
 use crate::fault::Trap;
 use crate::interpreter::Interpreter;
 use crate::people::read_appearance_if_stale;
-use crate::placement::{Pending, Place, on_lot, pool_tile};
+use crate::placement::{Kept, Pending, Place, on_lot, pool_tile};
 use sims_core::{Ext, F32};
 use sims_sim::World;
 use sims_sim::animator::{Animator, Base, EPSILON, LOADED, Layer, UNSET};
@@ -267,20 +268,48 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    /// Person `id`'s animator refresh at its taking itself off the lot
+    /// ([`Interpreter::take_self_off`]), worked out on a copy of `world`
+    /// as the take-off leaves it. It fails unless the refresh writes
+    /// nothing but the person's animator and base layer and plays no
+    /// sound, so that what runs before the person's animator tick sees
+    /// the same lot whether or not the original made it.
+    pub(crate) fn refresh_at_take_off(&self, world: &World, id: u16) -> Result<Pending, Trap> {
+        let sounds = RefCell::new(Vec::new());
+        let apart = Interpreter {
+            sounds: self.sounds.map(|_| &sounds),
+            ..*self
+        };
+        let mut refreshed = world.clone();
+        apart.refresh_animator(&mut refreshed, id)?;
+        let pending = Pending {
+            left: Kept::of(world, id),
+            refreshed: Kept::of(&refreshed, id),
+        };
+        pending.left.restore(&mut refreshed, id);
+        if refreshed.encode() != world.encode() || !sounds.borrow().is_empty() {
+            return Err(Trap::Unsupported(format!(
+                "person {id} took itself off the lot, and its animator's refresh there (0x58da12), \
+                 made only if the house view drew it (animator byte +0x109, which is not kept), \
+                 would write more than its animator or play a sound"
+            )));
+        }
+        Ok(pending)
+    }
+
     /// Person `id`'s animator tick after it took itself off the lot in its
-    /// thread's run ([`Interpreter::take_self_off`]), with the refresh at
-    /// the take-off pending. Whether the original made the refresh is not
-    /// known, so both branches must agree:
+    /// thread's run, with its animator's refresh there worked out
+    /// (`pending`, [`Interpreter::refresh_at_take_off`]). Whether the
+    /// original made the refresh is not known, so both branches must
+    /// agree:
     ///
-    /// 1. The animator, its base layer and the head's person words are as
-    ///    the take-off left them (`pending`), so a refresh made then would
-    ///    have worked from what it works from now.
-    /// 2. The refresh alone writes nothing but the person's animator and
-    ///    base layer, and plays no sound, so nothing between the take-off
-    ///    and here could have read what it wrote (the primitives allowed
-    ///    in between read no animator, [`crate::placement::reads_no_animator`]).
-    /// 3. The refresh then the tick reaches the same world, and the same
-    ///    sounds, as the tick alone.
+    /// 1. The animator and its base layer are as the take-off left them,
+    ///    so nothing in between wrote them (the primitives allowed in
+    ///    between, [`crate::placement::reads_no_animator`], read none of
+    ///    them).
+    /// 2. The tick from the refreshed animator and base layer, on the lot
+    ///    as it is now, reaches the same world, and the same sounds, as
+    ///    the tick alone.
     ///
     /// The tick alone is what is kept. Anything else fails.
     pub(crate) fn tick_animator_after_take_off(
@@ -296,9 +325,9 @@ impl Interpreter<'_> {
                  byte +0x109), matters; that is not kept"
             ))
         };
-        if Pending::of(world, id)? != pending {
+        if Kept::of(world, id) != pending.left {
             return Err(refused(
-                "its animator or head words changed before its animator's tick",
+                "its animator or base layer changed before its animator's tick",
             ));
         }
         let sounds = RefCell::new(Vec::new());
@@ -307,18 +336,7 @@ impl Interpreter<'_> {
             ..*self
         };
         let mut refreshed = world.clone();
-        apart.refresh_animator(&mut refreshed, id)?;
-        let without = |world: &World| {
-            let mut world = world.clone();
-            world.animators.remove(&id);
-            world.base_layers.remove(&id);
-            world.encode()
-        };
-        if without(&refreshed) != without(world) || !sounds.borrow().is_empty() {
-            return Err(refused(
-                "the refresh would write more than its animator, or play a sound",
-            ));
-        }
+        pending.refreshed.restore(&mut refreshed, id);
         apart.tick_animator(&mut refreshed, id)?;
         let before = self.sounds.map_or(0, |s| s.borrow().len());
         self.tick_animator(world, id)?;

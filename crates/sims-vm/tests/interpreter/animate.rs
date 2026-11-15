@@ -2018,18 +2018,15 @@ fn a_seated_animator_clears_a_clip_still_playing_and_stops_walking() {
 /// takes the person off the lot (Find Location For mode 1 on itself) and
 /// then runs `next`.
 fn taking_itself_off(next: sims_formats::behavior::Instruction) -> Fixture {
+    taking_itself_off_then(vec![next])
+}
+
+/// [`taking_itself_off`], then the nodes `then` (from node 1).
+fn taking_itself_off_then(then: Vec<sims_formats::behavior::Instruction>) -> Fixture {
     let mut fx = standing();
-    fx.add(
-        SIM_FILE,
-        4098,
-        shaped(
-            0x8002,
-            0,
-            1,
-            0,
-            vec![ins(16, 1, 1, [1, 0, 0, 0, 0, 0, 0, 0]), next],
-        ),
-    );
+    let mut nodes = vec![ins(16, 1, 1, [1, 0, 0, 0, 0, 0, 0, 0])];
+    nodes.extend(then);
+    fx.add(SIM_FILE, 4098, shaped(0x8002, 0, 1, 0, nodes));
     fx.thread(SIM, 4098, &[5]);
     fx.sim_mut().stack[0].stack_object = SIM as i16;
     // The head's countdown (person word 45) has run out: the refresh's
@@ -2082,6 +2079,52 @@ fn a_person_carrying_something_taking_itself_off_fails_loudly() {
     fx.sim_mut().slots[1].object = LAMP as i16;
     let fault = tick(&mut fx).unwrap_err().to_string();
     assert!(fault.contains("0x58dae5"), "{fault}");
+}
+
+#[test]
+fn a_refresh_whose_event_writes_a_hand_fails_at_the_take_off() {
+    // The person's playing clip has a "lefthand" event due at the clock:
+    // the refresh at the take-off (0x58da12) writes person word 22 there
+    // (0x5914ab), before the thread reads it. The thread copies word 22
+    // and then sets it to what the event writes, so at the animator's
+    // tick nothing tells the branches apart; the refresh is worked out at
+    // the take-off, and fails there.
+    let mut fx = taking_itself_off_then(vec![
+        assign(scope::TEMPS, 0, 18, 22, 2),
+        assign(18, 22, scope::LITERAL, 3, 3),
+        sleep(),
+    ]);
+    fx.program.animations.insert(
+        "test.far",
+        Clip {
+            name: CLIP.into(),
+            skill: SKILL.into(),
+            duration: HUNDRED,
+            distance: 0,
+            moving: false,
+            frames: 4,
+            motions: 1,
+            tracks: vec![track(&[(0, &[("lefthand", "3")])])],
+            channels: Vec::new(),
+            samples: [0, 0],
+        },
+    );
+    let mut foreground = Layer::start(CLIP, F32::from_bits(HUNDRED), 4, true, 1, false, 500);
+    foreground.priority = 10;
+    fx.world.animators.insert(
+        SIM,
+        sims_sim::animator::Animator {
+            foreground: Some(foreground),
+            ..LOADED
+        },
+    );
+    fx.sim_mut().person.as_mut().unwrap().data[22] = 0;
+    let fault = tick(&mut fx).unwrap_err().to_string();
+    assert!(
+        fault.contains("0x58da12") && fault.contains("write more than its animator"),
+        "{fault}"
+    );
+    assert_eq!(fx.sim().stack[0].node, 0, "the thread went no further");
 }
 
 #[test]

@@ -57,29 +57,41 @@ pub(crate) struct Refreshing {
     pub pending: Option<Pending>,
 }
 
-/// What a person's animator refresh reads and writes, as the take-off left
-/// it: the animator, its base layer, and the head's person words (41, 42,
-/// 44 and 45).
-#[derive(Debug, PartialEq, Eq)]
+/// A person's animator refresh at its taking itself off the lot, worked
+/// out then (`Interpreter::refresh_at_take_off`): the animator and base
+/// layer the take-off left, and those the refresh would have left
+/// instead. The refresh writes nothing else.
+#[derive(Debug)]
 pub(crate) struct Pending {
-    animator: Option<Animator>,
-    base: Option<Layer>,
-    words: [Option<i16>; 4],
+    pub left: Kept,
+    pub refreshed: Kept,
 }
 
-impl Pending {
-    pub(crate) fn of(world: &World, id: u16) -> Result<Self, Trap> {
-        let data = &world
-            .objects
-            .get(&id)
-            .and_then(|o| o.person.as_ref())
-            .ok_or_else(|| Trap::native(0x1c, "object is not a person"))?
-            .data;
-        Ok(Self {
+/// A person's animator and base layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Kept {
+    pub animator: Option<Animator>,
+    pub base: Option<Layer>,
+}
+
+impl Kept {
+    pub(crate) fn of(world: &World, id: u16) -> Self {
+        Self {
             animator: world.animators.get(&id).cloned(),
             base: world.base_layers.get(&id).cloned(),
-            words: [41, 42, 44, 45].map(|i| data.get(i).copied()),
-        })
+        }
+    }
+
+    /// Puts them back as person `id`'s.
+    pub(crate) fn restore(&self, world: &mut World, id: u16) {
+        match &self.animator {
+            Some(a) => world.animators.insert(id, a.clone()),
+            None => world.animators.remove(&id),
+        };
+        match &self.base {
+            Some(layer) => world.base_layers.insert(id, layer.clone()),
+            None => world.base_layers.remove(&id),
+        };
     }
 }
 
@@ -1228,18 +1240,19 @@ impl Interpreter<'_> {
     /// redraws what the person carries in its slot 1 (0x58dae5 to
     /// 0x58dc52), which writes the carried object's +0x100.
     ///
-    /// The person's own animator tick follows in the same tick, at the
-    /// same clock, after its thread yields. So here the refresh is left
-    /// out and noted as pending ([`Refreshing`]), and the tick settles
-    /// it (`Interpreter::tick_animator_after_take_off`): if the animator,
-    /// its base layer and the person's head words are as the take-off
-    /// left them, it works out both branches, the refresh then the tick
-    /// and the tick alone, and fails unless they reach the same world.
-    /// Until then only primitives that read nothing of an animator may
-    /// run ([`reads_no_animator`]), since they would see the refresh's
-    /// writes in one branch and not the other. A person that carries
-    /// something fails, and so does a take-off outside the person's own
-    /// tick.
+    /// Whether the byte was set is not known, so both branches are kept
+    /// apart until they meet. The refresh is worked out here, on a copy
+    /// of the lot as the take-off leaves it
+    /// (`Interpreter::refresh_at_take_off`), and fails unless it writes
+    /// nothing but the person's animator and base layer and plays no
+    /// sound. The lot goes on without it. The person's own animator tick
+    /// follows in the same tick, at the same clock, after its thread
+    /// yields; until then only primitives that read nothing of an
+    /// animator may run ([`reads_no_animator`]), so they cannot tell the
+    /// branches apart. The tick settles it
+    /// (`Interpreter::tick_animator_after_take_off`). A person that
+    /// carries something fails, and so does a take-off outside the
+    /// person's own tick.
     pub(crate) fn take_self_off(&self, world: &mut World, id: u16) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: id,
@@ -1264,8 +1277,12 @@ impl Interpreter<'_> {
                     .into(),
             )));
         }
-        self.take_off_one(world, id, true)?;
-        let pending = Pending::of(world, id).map_err(fail)?;
+        // 0x4332e0 to 0x4332ed: the refresh comes after the holder's
+        // function 9 and the portal's tiles, before the registry is told,
+        // which changes nothing for a person (`left_lot`).
+        self.take_off_one(world, id, false)?;
+        let pending = self.refresh_at_take_off(world, id).map_err(fail)?;
+        self.left_lot(world, id)?;
         refreshing.borrow_mut().pending = Some(pending);
         Ok(())
     }

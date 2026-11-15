@@ -362,19 +362,32 @@ byte +0x109 is set. That byte is the house view's last draw test
 (0x590b8b), which is presentation and is not kept. The refresh is a
 small animator tick: the clock, the blend slot, the skin forced, the
 place, and the head's step, measurement and restoration. Instead of
-choosing a branch, both must agree:
+choosing a branch, both must agree. This is exactly what is checked:
 
-1. Until the animator's tick, the person's thread may run only
-   primitives that read no animator. These are Sleep, Expression, Set
-   Motive Change, Set To Next, and Change Suit with operand 1 set to 1.
-   Anything else fails, naming 0x58da12.
-2. At the animator's tick, the animator, its base layer and person
-   words 41, 42, 44 and 45 must be as the take-off left them.
-3. The refresh alone must write nothing but the animator and its base
-   layer, and play no sound. A running head countdown (word 45) fails
-   here.
-4. The refresh then the tick must reach the world, and the sounds, the
-   tick alone does.
+1. At the take-off, the refresh is worked out on a copy of the lot as
+   the take-off leaves it (after the holder's function 9 and the
+   portal's tiles, before the registry, which does nothing for a
+   person). The copy, with the person's animator and base layer put
+   back, must encode byte for byte as the lot does, and the refresh
+   must play no sound into the sound list. So the refresh writes
+   nothing but those two, judged on the state it would really have
+   read. A running head countdown (word 45) fails here, and so does a
+   timed event that writes a hand or the censor word to a new value.
+   The lot goes on without the refresh.
+2. Until the animator's tick, the person's thread may run only Sleep,
+   Expression, Set Motive Change, Set To Next, and Change Suit with
+   operand 1 set to 1. Anything else fails, naming 0x58da12. That these
+   read no animator and no base layer is from their ports, not proven
+   for the original.
+3. At the animator's tick, the animator and its base layer must be
+   those the take-off left (compared field by field).
+4. The tick from the refreshed animator and base layer, on the lot as
+   it is then, must reach the same encoded world, and append the same
+   sounds, as the tick alone.
+
+What this does not cover: anything the refresh does that the port
+leaves out (the draw state, the face, the pose), and whatever the
+sound list does not record.
 
 The tick alone is kept. A person carrying something (slot 1) fails
 (0x58dae5 redraws it), and so does a multi-tile person. The draw state
