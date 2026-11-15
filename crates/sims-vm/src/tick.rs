@@ -76,7 +76,7 @@ use sims_sim::motives::{self, Tuning};
 use sims_sim::rooms::Room;
 use sims_sim::{PersonTick, World};
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 /// How many instructions a thread may run in one tick. The original
@@ -418,6 +418,11 @@ impl Interpreter<'_> {
         let start = u16::try_from(world.scheduler_cursor).map_err(|_| {
             TickError::Unsupported(format!("a scheduler cursor of {}", world.scheduler_cursor))
         })?;
+        let taken_off = RefCell::new(BTreeMap::new());
+        let this = Interpreter {
+            taken_off: Some(&taken_off),
+            ..*self
+        };
         for id in start..=end {
             world.scheduler_cursor = id as i16;
             let Some(object) = world.objects.get_mut(&id) else {
@@ -442,9 +447,9 @@ impl Interpreter<'_> {
             let mut caught = None;
             let catch = play.is_some().then_some(&mut caught);
             let result = if is_person {
-                self.person_tick(world, id, tick, tuning, catch)
+                this.person_tick(world, id, tick, tuning, catch)
             } else {
-                self.object_tick(world, id, catch)
+                this.object_tick(world, id, catch)
             };
             // The fault caught in the thread, whether it was, and a fault
             // in the rest of the tick after it.
@@ -607,9 +612,29 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
+        // A person queued before its tick was queued by another's removal
+        // (one that removes itself queues during its tick). Its animator's
+        // refresh as it left the lot, worked out then
+        // (`Interpreter::refresh_before_removal`), is pending until its
+        // animator's tick, as for a person that takes itself off.
+        let pending = if world.removals.contains(&id) {
+            let pending = self
+                .taken_off
+                .and_then(|taken_off| taken_off.borrow_mut().remove(&id));
+            if pending.is_none() {
+                return Err(fail(Trap::Unsupported(format!(
+                    "person {id} starts its tick while queued for removal, with no animator's \
+                     refresh worked out as it left the lot: that refresh (0x58da12) depends on \
+                     whether the view drew it (animator byte +0x109), which is not kept"
+                ))));
+            }
+            pending
+        } else {
+            None
+        };
         let refreshing = RefCell::new(Refreshing {
             person: id,
-            pending: None,
+            pending,
         });
         let ticked = Interpreter {
             refreshing: Some(&refreshing),
@@ -620,7 +645,7 @@ impl Interpreter<'_> {
         if !ticked {
             if pending.is_some() {
                 return Err(fail(Trap::Unsupported(
-                    "a person that took itself off the lot ends its tick before its \
+                    "a person that left the lot ends its tick before its \
                      animator's: its animator's refresh at the take-off (0x58da12) is then not \
                      redone at the same clock"
                         .into(),
@@ -1019,7 +1044,7 @@ fn below_zero(value: sims_core::F32) -> bool {
 }
 
 /// A room by ID (0x466fcc).
-fn world_room(rooms: &std::collections::BTreeMap<i16, Room>, id: i16) -> Option<&Room> {
+fn world_room(rooms: &BTreeMap<i16, Room>, id: i16) -> Option<&Room> {
     rooms.get(&id)
 }
 
