@@ -641,6 +641,79 @@ fn manage_inventory_walks_the_tokens_of_a_kind_after_a_place() {
     assert_eq!(fx.sim().temps[1], 1);
 }
 
+/// Operation 0 for token kind 2 of the lamp's type: one token, or with
+/// flag 0x2 the count in temp `(flags >> 2) & 3`.
+const ADD: [u8; 8] = [0, 2, 0, 0, 0x11, 0x11, 0, 0];
+
+/// The owner's tokens: (kind, count) of each.
+fn tokens(fx: &Fixture) -> Vec<(i32, i16)> {
+    fx.world.neighbors.inventories[1]
+        .items
+        .iter()
+        .map(|i| (i.kind, i.count as i16))
+        .collect()
+}
+
+#[test]
+fn manage_inventory_adds_tokens_to_the_first_of_a_kind_or_at_the_end() {
+    let mut fx = inventories();
+    // 0x41f38d: the first token of kind 2 (count 5) takes one more.
+    assert_eq!(sim_runs(&mut fx, 51, ADD, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 3), (2, 6), (2, 6)]);
+    // Flag 0x2: the count is in temp 3 ((0x0e >> 2) & 3).
+    let mut from_temp = ADD;
+    from_temp[2] = 0x0e;
+    fx.sim_mut().temps[3] = 10;
+    assert_eq!(sim_runs(&mut fx, 51, from_temp, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 3), (2, 16), (2, 6)]);
+    // A count of 0 adds nothing and is true.
+    fx.sim_mut().temps[3] = 0;
+    assert_eq!(sim_runs(&mut fx, 51, from_temp, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 3), (2, 16), (2, 6)]);
+    // 0x41f3f6: a sum of 0x7fff or more is 0x7fff.
+    fx.sim_mut().temps[3] = 0x7ff0;
+    assert_eq!(sim_runs(&mut fx, 51, from_temp, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 3), (2, 0x7fff), (2, 6)]);
+    // The counts are signed words: a negative count takes some away.
+    fx.sim_mut().temps[3] = -7;
+    assert_eq!(sim_runs(&mut fx, 51, from_temp, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 3), (2, 0x7ff8), (2, 6)]);
+    // A kind it does not hold: a token of that kind, GUID and count is
+    // added at the end (0x41f7c8). The GUID must match too.
+    let mut other = ADD;
+    other[1] = 3;
+    assert_eq!(sim_runs(&mut fx, 51, other, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 3), (2, 0x7ff8), (2, 6), (3, 1)]);
+    let mut guid = ADD;
+    guid[4] = 0x22;
+    assert_eq!(sim_runs(&mut fx, 51, guid, 0), Ok(true));
+    let last = fx.world.neighbors.inventories[1].items.last().unwrap();
+    assert_eq!((last.kind, last.guid, last.count), (2, 0x1122, 1));
+}
+
+#[test]
+fn manage_inventory_adds_no_token_to_a_full_inventory() {
+    // 0x41f3cb: with 0x7fff tokens and none of the kind, the branch is
+    // false and nothing is added; one of the kind still takes the count.
+    let mut fx = inventories();
+    fx.world.neighbors.inventories[1].items = vec![
+        Item {
+            kind: 1,
+            guid: LAMP_GUID,
+            count: 1,
+        };
+        0x7fff
+    ];
+    let mut other = ADD;
+    other[1] = 3;
+    assert_eq!(sim_runs(&mut fx, 51, other, 0), Ok(false));
+    assert_eq!(fx.world.neighbors.inventories[1].items.len(), 0x7fff);
+    let mut ones = ADD;
+    ones[1] = 1;
+    assert_eq!(sim_runs(&mut fx, 51, ones, 0), Ok(true));
+    assert_eq!(fx.world.neighbors.inventories[1].items[0].count, 2);
+}
+
 #[test]
 fn manage_inventory_makes_an_inventory_for_an_owner_without_one() {
     let mut fx = inventories();

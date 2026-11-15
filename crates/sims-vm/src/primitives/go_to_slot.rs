@@ -108,19 +108,24 @@
 //! of the marker made to ask a person to move, `world.routing.slots`) is
 //! used instead of the type's slot.
 //!
-//! Ported from the original's code. What the Goth house's routes to
-//! update 438 do not reach fails loudly: a parameter number past the
-//! frame's parameters, a stack object that is missing or off the lot in a later
-//! step, a person with bit 0 of word 68 set or other contexts, a person
-//! sitting (posture 1), no door to
-//! go through, ending a route while the asked person runs
-//! the action (0x45d5f8), every other step and every other result of the
-//! planning.
+//! A person sitting (posture 1) is there if it sits in the seat beside a
+//! candidate; otherwise it runs its seat's Stand tree first (step 5,
+//! 0x45b1d7 to 0x45b6d4). No door to go through gives up with result 2
+//! (0x45b036). Giving up on a slot the route may end near runs the stack
+//! object's "Route failure feedback" tree (step 17, 0x45af2a).
+//!
+//! Ported from the original's code. What the Goth house's routes to tick
+//! 9906 do not reach fails loudly: a parameter number past the frame's
+//! parameters, a stack object that is missing or off the lot in a later
+//! step, a person with bit 0 of word 68 set or other contexts, ending a
+//! route while the asked person runs the action (0x45d5f8), every other
+//! step and every other result of the planning. Past tick 1000 the routes
+//! are **unverified**: there is no capture.
 
 use crate::animator::stop_route;
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Flow, Machine, word};
-use crate::placement::stands_on_lot;
+use crate::placement::{capture, stands_on_lot};
 use crate::routing::slot::{SlotRoute, direction, new_context, route_slot};
 use crate::sounds::SoundEvent;
 use sims_sim::animator::LOADED;
@@ -132,6 +137,10 @@ pub(crate) const GLOBAL_SLOTS: u16 = 0;
 
 /// Object data words.
 const DIRECTION: usize = 1;
+/// The object functions of a seat: Sit (callback 0x1a) and Stand
+/// (callback 0x1b).
+const SIT: usize = 26;
+const STAND: usize = 27;
 const FLAGS: usize = 8;
 const ROOM: usize = 29;
 /// Person words.
@@ -141,6 +150,9 @@ const NO_ROOM: usize = 68;
 /// Takes the route's result as the route ends (0x45b869).
 const ROUTE_RESULT: usize = 62;
 /// Read and set as the route ends (0x45b885).
+/// Person word 37: the seat side a person stood up on (0x45b6de), or the
+/// chosen candidate's word +0xe.
+const WORD_37: usize = 37;
 const WORD_38: usize = 38;
 const WORD_39: usize = 39;
 /// The footprint's extension, which the place test reads; the end of a
@@ -155,6 +167,8 @@ const CANDIDATES: i32 = 1;
 const PORTAL: i32 = 2;
 const UNDER_WAY: i32 = 3;
 const SITTING: i32 = 4;
+/// Step 5: the seat's Stand tree runs before the route (0x45b439).
+const STANDING: i32 = 5;
 const RETRY: i32 = 6;
 const FAILED: i32 = 7;
 const SUCCEEDED: i32 = 8;
@@ -496,7 +510,68 @@ impl Machine<'_, '_> {
                         .map_err(inner)?;
                     state = PLAN;
                     if self.person_word(POSTURE)? == 1 {
-                        return Err(unsupported("0x45b1d7", "for a person sitting"));
+                        // 0x45b1d7: a person sitting in a seat beside a
+                        // candidate is there; else it stands up first.
+                        if interpreter
+                            .seated_beside_candidate(self.world, &ctx)
+                            .map_err(inner)?
+                        {
+                            state = SUCCEEDED;
+                            continue;
+                        }
+                        // 0x45b1ef: no seat, or one without a Sit and a
+                        // Stand function, fails the route.
+                        state = FAILED;
+                        let Some(seat) = capture(self.world, me)?.container else {
+                            continue;
+                        };
+                        let tree = interpreter.function_tree(self.world, seat, STAND);
+                        if !interpreter.has_function(self.world, seat, SIT) || tree == 0 {
+                            continue;
+                        }
+                        // 0x45b6d4: the route waits at step 5 while the
+                        // seat's Stand tree runs, person word 37 takes the
+                        // context's third start word and word 72 is
+                        // cleared (0x45b962). As for the Sit tree, the
+                        // step and the context's saved words are written
+                        // before the tree is pushed, and put back if it
+                        // cannot be.
+                        let side = ctx.start[2] as i16;
+                        let kept = (
+                            self.me()?.clone(),
+                            self.world.routing.routes.get(&me).cloned(),
+                        );
+                        ctx.word_58 = i32::from(retry as i16);
+                        ctx.saved = spot;
+                        self.store_route(&ctx, &path);
+                        self.frame_mut()?.primitive_state = STANDING;
+                        if let Err(trap) = self.stand_up(seat, tree, side) {
+                            let (object, route) = kept;
+                            self.world.objects.insert(me, object);
+                            match route {
+                                Some(route) => self.world.routing.routes.insert(me, route),
+                                None => self.world.routing.routes.remove(&me),
+                            };
+                            return Err(trap);
+                        }
+                        self.set_person_word(WORD_37, side)?;
+                        self.world.routing.unknown_words.remove(&(me, WORD_37));
+                        self.set_person_word(WORD_72, 0)?;
+                        return Ok(Flow::Pushed);
+                    }
+                }
+                STANDING => {
+                    // 0x45b439: person word 72 goes back to what it was
+                    // when the route began. The Stand tree returned true
+                    // (person +0x1c is 0xfe, 0x474e79) and the person
+                    // stands (posture 0): the candidates are found again.
+                    // Else it gives up with result 6.
+                    self.set_person_word(WORD_72, ctx.word_94)?;
+                    if self.me()?.last_result && self.person_word(POSTURE)? == 0 {
+                        state = CANDIDATES;
+                    } else {
+                        ctx.result = 6;
+                        state = GIVE_UP;
                     }
                 }
                 PLAN => {
@@ -594,10 +669,11 @@ impl Machine<'_, '_> {
                         interpreter.fail_portal(self.world, me, door)?;
                     }
                     let Some((door, tree)) = self.choose_door(&ctx)? else {
-                        return Err(unsupported(
-                            "0x45b036",
-                            "with no door to go through (the route fails with result 2)",
-                        ));
+                        // 0x45b036: no door to go through; the route gives
+                        // up with result 2.
+                        ctx.result = 2;
+                        state = GIVE_UP;
+                        continue;
                     };
                     // 0x45b954: the route stays at this step, and person
                     // word 72 is cleared, while the door's tree runs. The
@@ -1042,6 +1118,42 @@ impl Machine<'_, '_> {
             ))
         })?;
         self.count_use(seat, false)
+    }
+
+    /// Runs a seat's Stand tree on the person's thread, as the person's
+    /// virtual function 0x34 does (0x45e59b) with no flag (0x45b26a): the
+    /// person is woken, the tree of the seat's type is pushed with the
+    /// seat as its stack object and the arguments `side`, 0, 0, 0
+    /// (0x45b247), and the person starts using the seat. A tree that
+    /// cannot be pushed, where the original's route fails (step 7), fails
+    /// loudly, as does one with more than four arguments (0x47484a would
+    /// read them past the four it is given).
+    fn stand_up(&mut self, seat: u16, tree: u16, side: i16) -> Result<(), Trap> {
+        self.push_on(seat, tree, &[side, 0, 0, 0], "0x45b26f")
+    }
+
+    /// Runs tree `tree` of object `target`'s type on the person's thread
+    /// with the arguments `args`, as the person's virtual function 0x34
+    /// does (0x45e59b) with no flag: the person is woken, the tree pushed
+    /// with `target` as its stack object, and the person starts using
+    /// `target`. A tree that cannot be pushed, where the original's route
+    /// fails (at `address`), fails loudly, as does one with more
+    /// arguments than `args` holds (0x47484a would read past them).
+    fn push_on(
+        &mut self,
+        target: u16,
+        tree: u16,
+        args: &[i16; 4],
+        address: &str,
+    ) -> Result<(), Trap> {
+        self.wake(self.me)?;
+        self.enter_on(target, tree, args).map_err(|fault| {
+            Trap::Unsupported(format!(
+                "a tree {tree:#06x} of object {target} that cannot be pushed, where the \
+                 original's route fails ({address}): {fault}"
+            ))
+        })?;
+        self.count_use(target, false)
     }
 
     /// Plays a tree of the person's own on its thread, as its virtual
