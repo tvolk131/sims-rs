@@ -67,6 +67,11 @@ events, and what it asks for after them) come first.
   tick 562, with no recording to compare yet; at tick 563 a head's pose
   blends a base clip under the foreground (0x5992b3), which is not
   ported.
+- The houses of UserData2 to 8 get past the neighborhood: the reload
+  makes the records their template files lack. The version-63 houses
+  stop at the arrays, and the version-62 ones have no family. The
+  templates' `Patch` families are not imported (see
+  `docs/decisions.md`).
 
 ## Met goal: a headless lot boot that matches the original
 
