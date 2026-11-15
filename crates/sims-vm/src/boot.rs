@@ -235,6 +235,30 @@ impl std::fmt::Display for StepError {
 
 impl std::error::Error for StepError {}
 
+/// Why a player's order was not queued ([`Lot::queue_interaction`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderError {
+    /// The load did not complete.
+    Incomplete,
+    /// An earlier step failed and halted the lot.
+    Halted,
+    /// The order names no such person or interaction, or the queue fails
+    /// on something it does not port.
+    Refused(crate::Fault),
+}
+
+impl std::fmt::Display for OrderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Incomplete => write!(f, "the load did not complete"),
+            Self::Halted => write!(f, "an earlier step failed, so the lot takes no orders"),
+            Self::Refused(fault) => write!(f, "the order was refused: {fault}"),
+        }
+    }
+}
+
+impl std::error::Error for OrderError {}
+
 impl Lot {
     /// Loads the house file `house` (inside a neighborhood's `Houses`
     /// directory) from the install at `root`. `answers` answers, in order,
@@ -548,6 +572,37 @@ impl Lot {
         Ok(update)
     }
 
+    /// Queues on `person` the interaction of `object` with menu number
+    /// `menu`, as picking it from the pie menu does ([`crate::orders`]).
+    /// Returns the action's number, or None when the person's queue took
+    /// nothing. Call it between steps, as the original takes the player's
+    /// input between lot updates.
+    ///
+    /// An order that fails changes nothing, and does not halt the lot. One
+    /// the full queue does not take still changes it: the action took its
+    /// number before the queue was checked (0x45d30d, before 0x45d4c8's
+    /// count), as in the original.
+    pub fn queue_interaction(
+        &mut self,
+        person: u16,
+        object: u16,
+        menu: u32,
+    ) -> Result<Option<i32>, OrderError> {
+        if self.halted {
+            return Err(OrderError::Halted);
+        }
+        if self.load.finished.is_none() {
+            return Err(OrderError::Incomplete);
+        }
+        let interpreter = Interpreter::new(&self.program, &self.catalog, Stream::Global);
+        let mut world = self.world.clone();
+        let queued = interpreter
+            .order(&mut world, person, object, menu)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        Ok(queued)
+    }
+
     /// The lot's state.
     pub fn world(&self) -> &World {
         &self.world
@@ -575,7 +630,7 @@ impl Lot {
 
 #[cfg(test)]
 mod tests {
-    use super::{Answers, Finished, Frames, LoadReport, Lot, StepError};
+    use super::{Answers, Finished, Frames, LoadReport, Lot, OrderError, StepError};
     use crate::Program;
     use crate::play::Play;
     use sims_content::Catalog;
@@ -660,6 +715,25 @@ mod tests {
         };
         assert_eq!(lot.step_play().unwrap_err(), StepError::Halted);
         assert_eq!(lot.play, Play::default());
+    }
+
+    #[test]
+    fn an_order_that_fails_changes_nothing_and_a_halted_lot_takes_none() {
+        let mut lot = lot(World::empty(), true, Frames::default());
+        let before = lot.world().hash_hex();
+        assert!(matches!(
+            lot.queue_interaction(1, 2, 3),
+            Err(OrderError::Refused(_))
+        ));
+        assert_eq!(lot.world().hash_hex(), before);
+        assert!(!lot.halted);
+        lot.halted = true;
+        assert_eq!(lot.queue_interaction(1, 2, 3), Err(OrderError::Halted));
+        let mut unloaded = super::tests::lot(World::empty(), false, Frames::default());
+        assert_eq!(
+            unloaded.queue_interaction(1, 2, 3),
+            Err(OrderError::Incomplete)
+        );
     }
 
     #[test]

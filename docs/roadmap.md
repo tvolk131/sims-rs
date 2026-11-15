@@ -1770,7 +1770,9 @@ flag 0x2000, and so does mine for a centre slot); the container's data
 word 28 is at least my data word 27; I am neither the container nor
 anything around it; and my data word 4 has the bit for the slot's
 height. Before these, the test's first steps on the ground run, without
-the wall rules. Snap's flag bit 2 (test the walls around the object
+the wall rules. A container slot off the object's centre (an offset
+across that is not zero) would also move my animator offset
+(`0x454ceb`), which is not kept, so it fails loudly. Snap's flag bit 2 (test the walls around the object
 instead, `0x45522c`) and a person as the container fail loudly.
 
 **The base clips of postures 1 and 2** (`0x590497`). When a person's
@@ -1918,6 +1920,14 @@ Progress:
   medium, 99.7% far, 97.2% at rotation 3). Faint sprite edge pixels
   are left out as the original does, which fixes the door jamb. Every
   compared camera rose, by 0.7 to 3.4 points.
+- Done: the API for drawing people over the lot. `Depth::point` gives
+  a point between pixels its depth in the same space, `Canvas::put`
+  draws one pixel by the sprite rule and `Camera::project_fine_f32`
+  projects without rounding. Drawn this way after the lot, people are
+  hidden by what is in front of them, as in the original, whose depth
+  buffer holds the lot without its people. The game does not use it
+  yet, and how the original gives a person's mesh its depth is
+  unverified.
 - Next: the edge-on diagonal's texels; a screenshot with a marked
   edge-on diagonal; upper-level depth.
 

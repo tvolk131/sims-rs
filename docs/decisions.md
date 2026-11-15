@@ -9,7 +9,9 @@ says what was decided, why, and what would reopen it. Entries marked
 Snap into an object's container slot is ported, with the place test for
 a slot (0x432d62 to 0x432fb8), from the original's code. Only one
 container placement is reached so far: person 21 sitting in object 174
-in tick 992. The steps it does not reach (mode 2's centre rule, the
+in tick 992. A container slot off the object's centre would move the
+person's animator offset (0x454ceb), which is not kept, so it fails
+loudly. The steps it does not reach (mode 2's centre rule, the
 other slots at the same height, the containers around the object) are
 ported from the code alone and **unverified**. The base clips of
 postures 1 and 2 are looked up and fail loudly when missing or when
@@ -18,6 +20,56 @@ every capture shows its layer after a start. A clip that is never looked
 up cannot fail, so reopen this if a person's posture-0 clip could be
 missing. K = 1000 on the Goth house. That is step 1 of the goal; next is
 a full game day.
+
+## 2026-11-15: A player's order queues the pie menu's action, without its check
+
+`Lot::queue_interaction(person, object, menu)` (`crates/sims-vm/src/
+orders.rs`) queues the action the original's pie menu makes for that
+entry. The object becomes its interaction target, and the action is
+built by 0x41f00e with priority 50 (0x458633), then given flags 4 and 8
+as a check that passes leaves them. It is queued unchanged (0x48dd67 →
+0x45d20b), as a pick does. The check itself (0x458319 in the menu's mode:
+rules on the person and object, and the entry's check tree) belongs to
+listing the menu's entries, which comes next; until then an order can
+name an entry the menu would not offer. A failed order changes nothing,
+since the queue can fail partway (it numbers the action before it finds
+it cannot place it). Push Interaction (primitive 13, 0x44cd2b) is ported
+from the original's code; reading one word past a frame's parameters or
+locals, which its bound allows, fails loudly.
+
+## 2026-11-15: People are drawn over the finished lot, against its depth
+
+The original keeps its people out of the lot's depth buffer. Two dumps
+of the running game (far zoom with a Sim standing on the grass, medium
+zoom with two Sims on the porch bench) show the Sims in the colour
+buffer and only the lot in the depth buffer: plain grass under the
+standing Sim, the wall and the porch floor where the seated ones are.
+The bench they sit on is missing from the depth buffer too. So the
+original draws the lot first, then draws what moves, and what is in
+use, over it, tested against the lot's depth.
+
+`sims-render` takes the same order. After `draw`, a caller draws people
+a pixel at a time with `Canvas::put` (the sprite rule: fainter than the
+cutoff or farther than what is there is left out, a tie wins, the depth
+is written so a nearer part of the same mesh covers a farther one) at
+the depth `Depth::point` gives a point: the ground rows at the point's
+row, the level's offset, and the height curve for its elevation. It is
+an object anchor's depth without the rounding, in the same units as
+everything else. `Camera::project_fine_f32` is the projection without
+rounding, so the people's code does not keep its own copy.
+
+The interleaved draw planned with the people track (people sorted in
+with the lot's objects) is left out: the original does not interleave,
+and the depth test against the finished lot already hides a person
+behind a wall, a counter or a cut wall's stub. The original draws a bench
+in use with the people rather than with the lot; here it stays with the
+lot and people test against it, which matters only where a person is
+drawn in front of part of the bench and behind another part.
+
+How the original gives a person's mesh its depth is **unverified**:
+the dumps show where people are not, not their own depth. Reopen it
+with a frame in which a person is partly hidden, comparing the hidden
+pixels with `Depth::point`.
 
 ## 2026-11-15: Play mode resets an object after its error; strict mode is unchanged
 
