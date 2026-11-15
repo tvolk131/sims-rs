@@ -24,8 +24,9 @@ rotation 0, level 2, walls down, camera origin (335, −496)): Bella
 kneels at the dollhouse where we draw her at tick 1770, within a pixel
 or two, with the same rows hidden by the front wall's strip. So the
 view-table offset lifts a level by the floor height, at least at this
-zoom and rotation. The original draws her brighter; that is the room's
-light, not her place.
+zoom and rotation. The original draws her brighter there; that is the
+room's light ("A person is lit by the original's standard light, at
+their room's level"), not her place.
 
 The entry "People join the lot renderer's view through a depth hook"
 said such a person stands at the floor; this replaces that.
