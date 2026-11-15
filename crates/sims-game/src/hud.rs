@@ -204,6 +204,16 @@ impl Hud {
         Some(band)
     }
 
+    /// The panel as it was last laid out.
+    pub fn items(&self) -> &[Item] {
+        &self.items
+    }
+
+    /// The first name of people of type `guid`, from their file.
+    pub fn name(&self, guid: u32) -> Option<&str> {
+        self.faces.name(guid)
+    }
+
     /// Where the dialog drawn last is, and its buttons.
     pub fn dialog(&self) -> Option<&dialog::Layout> {
         self.dialog.as_ref()
@@ -240,6 +250,12 @@ impl Hud {
             button(self.controls.pointer),
             entry(self.controls.pointer),
         ) != before
+    }
+
+    /// The pointer left the window: no button is hovered and no name
+    /// shows. True if the pointer was in it, so the frame changes.
+    pub fn leave(&mut self) -> bool {
+        self.controls.pointer.take().is_some()
     }
 
     /// Where the pointer is to be moved, as the original moves it when a
