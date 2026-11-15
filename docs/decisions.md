@@ -23,9 +23,9 @@ subpanel is empty, as for the needs.
     (0x519cc8). The CJK languages use 15 and 25, which are not ported.
   - The shorter of the label's line and the bar is centred on the
     other.
-- **A bar** (0x5211bd) draws the empty bar (4903), then the full one
-  (4900) cut to 4 pixels a point. A trait is the data word over 100,
-  clamped to 0 to 10.
+- **A bar** (0x5211bd) draws the empty bar (4903, 40 by 14), then the
+  full one (4900, 40 by 16) cut to 4 pixels a point and a pixel higher
+  (0x5212b2). A trait is the data word over 100, clamped to 0 to 10.
 - **Labels and fonts:** the labels are font 8 (0x6f2ae4) and the title
   is font 11 at the needs title's place. The labels are English, as the
   needs' are (Live.iff STR# 131 has them).
@@ -40,7 +40,8 @@ subpanel is empty, as for the needs.
 - **Not drawn yet:** the zodiac sign and its text under the bars (a
   text gadget in font 12, filled from UIText.iff STR# 165).
 - **Tests:** a unit test checks the layout, presses passing through,
-  and each bar's fill with stand-in art. The Goths' panel is pinned by
+  each bar's fill and its rows with stand-in art, and that coordinates
+  at the edge of `i32` do not panic. The Goths' panel is pinned by
   digest, gated on `SIMS_INSTALL`, with Mortimer's, Bella's and
   Cassandra's traits read from the house.
 
