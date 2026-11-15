@@ -320,26 +320,60 @@ fn interaction_tables_and_slots_are_found_through_the_definition() {
     assert!(error.to_string().contains("SLOT #5"), "{error}");
 }
 
+/// An unpacked CARR chunk with `levels` levels, each numbered 100 + i
+/// with the second string "title".
+fn carr(levels: i32) -> Vec<u8> {
+    let mut bytes = [0u32.to_le_bytes(), 1u32.to_le_bytes(), *b"RRAC"].concat();
+    // Not packed, then an empty name (a byte, which keeps the stream even).
+    bytes.extend([0, 0]);
+    bytes.extend(levels.to_le_bytes());
+    for _ in 0..levels {
+        for i in 0..21i32 {
+            bytes.extend((100 + i).to_le_bytes());
+        }
+        // The strings, each padded to an even length.
+        bytes.extend([0, 0]);
+        bytes.extend(b"title\0");
+        bytes.extend([0, 0, 0, 0, 0, 0]);
+    }
+    bytes
+}
+
 #[test]
 fn careers_come_from_work_iff_in_resource_order() {
     let dir = Dir::new("careers");
     let (index, catalog) = setup(&dir);
     assert_eq!(Program::link(&index, &catalog, []).unwrap().careers, None);
-    // Chunk IDs are sign-extended. The chunks' contents are not read.
+    // Chunk IDs are sign-extended, and each chunk's levels are kept.
     dir.file(
         "GameData/Objects/work.iff",
         &iff(&[
-            (b"CARR", 3, vec![]),
-            (b"CARR", 0xffff, vec![]),
+            (b"CARR", 3, carr(1)),
+            (b"CARR", 0xffff, carr(0)),
             (b"STR#", 5, vec![]),
-            (b"CARR", 1, vec![]),
+            (b"CARR", 1, carr(2)),
         ]),
     );
     let index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
     let catalog = Catalog::build(&index).unwrap();
     let program = Program::link(&index, &catalog, []).unwrap();
-    assert_eq!(program.careers, Some(vec![3, -1, 1]));
+    let careers = program.careers.unwrap();
+    let ids: Vec<_> = careers.iter().map(|c| c.id).collect();
+    assert_eq!(ids, [3, -1, 1]);
+    let levels: Vec<_> = careers.iter().map(|c| c.levels.len()).collect();
+    assert_eq!(levels, [1, 0, 2]);
+    assert_eq!(careers[2].levels[1].values[20], 120);
+    assert_eq!(careers[2].levels[1].strings[1], "title");
     assert!(program.zoning.is_empty());
+    // A CARR chunk that does not decode stops the link.
+    dir.file(
+        "GameData/Objects/work.iff",
+        &iff(&[(b"CARR", 7, vec![0; 4])]),
+    );
+    let index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
+    let catalog = Catalog::build(&index).unwrap();
+    let error = Program::link(&index, &catalog, []).unwrap_err();
+    assert!(error.to_string().contains("CARR #7"), "{error}");
     // A Careers.txt overrides the table through a loader that is not
     // ported, so there is no list to give.
     dir.file("GameData/Objects/Careers.txt", b"");
