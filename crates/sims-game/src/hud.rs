@@ -13,7 +13,7 @@ use sims_content::{Install, Neighborhood};
 use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_sim::World;
 use sims_ui::art::Art;
-use sims_ui::command::{Command, Walls as UiWalls};
+use sims_ui::command::{Command, Panel as UiPanel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::household::{Careers, Faces, Snapshot};
@@ -44,6 +44,9 @@ pub struct Hud {
     /// The careers of `work.iff`, for what the job panel shows the next
     /// level needs.
     careers: Careers,
+    /// The autonomy tuning's friendship threshold (0x6c4398), for the
+    /// relationship panel's smileys.
+    friendship: i32,
     labels: Labels,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
@@ -67,8 +70,17 @@ pub struct Hud {
 
 impl Hud {
     /// Reads the art, and the household of `house` from its neighborhood
-    /// with the portraits from the people's files.
-    pub fn open(install: &Path, house: &Path, assets: &Assets) -> Result<Self, String> {
+    /// with the portraits from the people's files. `world` is the booted
+    /// lot's: the faces of everyone its neighborhood records hold are
+    /// read, for the relationship panel. `friendship` is the autonomy
+    /// tuning's friendship threshold.
+    pub fn open(
+        install: &Path,
+        house: &Path,
+        assets: &Assets,
+        world: &World,
+        friendship: i32,
+    ) -> Result<Self, String> {
         let install = Install::detect(install).map_err(|e| e.to_string())?;
         let ui = UiGraphics::open(&install).map_err(|e| e.to_string())?;
         let resources: Vec<i32> = hud::RESOURCES
@@ -95,13 +107,20 @@ impl Hud {
             .and_then(|n| neighborhood.family_in(n))
             .map(|(_, f)| f.members.clone())
             .unwrap_or_default();
+        let mut people = members.clone();
+        for record in world.neighbors.slots.iter().flatten() {
+            if !people.contains(&record.guid) {
+                people.push(record.guid);
+            }
+        }
         let faces =
-            Faces::load(assets.index(), assets.catalog(), &members).map_err(|e| e.to_string())?;
+            Faces::load(assets.index(), assets.catalog(), &people).map_err(|e| e.to_string())?;
         let careers = Careers::load(assets.index()).map_err(|e| e.to_string())?;
         Ok(Self {
             art,
             faces,
             careers,
+            friendship,
             labels,
             members,
             // The strip opens as if Live had been pressed.
@@ -145,9 +164,16 @@ impl Hud {
     }
 
     /// What the panel shows of `world`: the household with what the next
-    /// level of each one's career needs.
+    /// level of each one's career needs, and, while the relationship
+    /// panel is open, the people the selected Sim knows (read only then:
+    /// the lookup goes through every neighborhood record).
     pub fn snapshot(&self, world: &World) -> Snapshot {
-        Snapshot::read(world, &self.members).with_careers(&self.careers)
+        let snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
+        if self.controls.panel == UiPanel::Relationships {
+            snapshot.with_relations(world, &self.members, self.friendship)
+        } else {
+            snapshot
+        }
     }
 
     /// Draws the panel over the lot in `canvas`, from `world` as it is
