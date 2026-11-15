@@ -138,7 +138,13 @@ impl Game {
         // The booted world, not the file as read: some objects (doors,
         // windows) set how they are drawn in their own init scripts.
         let lot_shape = sims_render::Lot::from_world(lot.world()).map_err(|e| e.to_string())?;
-        let hud = Hud::open(&options.install, house, &opened.assets)?;
+        let hud = Hud::open(
+            &options.install,
+            house,
+            &opened.assets,
+            lot.world(),
+            lot.program().autonomy_constants().friendship_threshold,
+        )?;
         let mut people = People::open(&options.install, house)?;
         people.refresh(lot.world());
         let view = View::new([800, 600], lot_shape.built_center(), opened.rotation);
@@ -498,11 +504,14 @@ impl Game {
         self.hud.read_dialog(dialogs, &self.assets);
         self.hud.draw(
             world,
+            &self.assets,
             &self.view,
             &self.pace,
             status.as_deref(),
             &mut self.canvas,
         );
+        let problems = self.hud.take_problems();
+        self.people.note(problems);
     }
 
     /// The canvas last drawn.

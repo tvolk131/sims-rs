@@ -2139,7 +2139,19 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   Nice) in the subpanel, laid out as the original's bar maker does
   (0x51df31). The Goths' panel is pinned by digest, gated on
   `SIMS_INSTALL`; it is not yet compared with a screenshot, and the
-  zodiac sign under the bars is not drawn.
+  zodiac sign under the bars is not drawn. In the window, the
+  personality, needs, job and relationship panels show the selected
+  Sim's live person data, motives, skills and relationship rows, and
+  follow a press on another portrait; the needs are also checked to
+  follow the ticks (`sims-game` tests
+  `the_personality_panel_shows_the_selected_goths_traits`,
+  `the_needs_panel_follows_the_selected_goths_motives`,
+  `the_job_panel_shows_the_selected_sims_skills`, in house 7, whose
+  Sims have skills,
+  `the_relationship_panel_lists_who_the_selected_goth_knows`). The
+  game's panel reads the relationships, while that panel is open, with
+  the tuning's friendship threshold, and loads the faces of everyone in
+  the neighborhood's records.
 - **Done: the job panel's skills.** The Job button opens the selected
   Sim's six skill bars, with the labels of what the next level of
   their career needs underlined and a line marking how much (from
@@ -2314,8 +2326,9 @@ through their public interfaces only; the simulation never depends on it.
 - **Done: the action queue.** The selected Sim's running and queued
   actions show as icons in the top left, framed as the original frames
   them, and a press cancels one (`Lot::cancel`, 0x45d5f8) with the
-  original's sound. Objects' catalog pictures are not made yet (a grey
-  square stands in), and the icons do not slide into place.
+  original's sound. An object's icon shows its type's catalog picture,
+  from the thumbnail its file ships; the original's render of a missing
+  thumbnail (0x4e57a6) is not ported. The icons do not slide into place.
 - **Done in play mode: a second order, and cancelling either.** Through
   the window, the snack from the fridge's pie and then Water from a
   plant's: the water waits behind the snack, its icon second. A press on
