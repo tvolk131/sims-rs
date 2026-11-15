@@ -5,7 +5,7 @@
 //! (a multi-tile object is one object per tile), and its sprite covers
 //! that tile's diamond and rises above it. A click inside a tile's
 //! diamond picks the frontmost object on that tile; otherwise the
-//! frontmost object whose tile the click is above, within [`RISE`] of a
+//! frontmost object whose tile the click is above, within `RISE` of a
 //! storey, is picked. A short object in front of a tall one can take a
 //! click meant for the tall one. Drawing an object ID per pixel in
 //! `sims-render` would make this exact.

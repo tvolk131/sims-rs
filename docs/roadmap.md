@@ -1956,10 +1956,14 @@ stop-sounds events.
 - **Done: live playback.** The `play` example plays events (and the
   ambience) on the default output device, behind the `playback`
   feature (cpal), off by default; tests and CI build none of it.
+- **Done: the ambience's inputs.** The simulation emits its sound
+  requests (`Update::sounds`), and the game plays them. The camera
+  value the ambience's row follows is ported (`ambience::view`, from
+  0x570c3e: the share of the screen's tiles that are outdoors, read
+  through `World::outside`), and the hour is the clock's.
 - **Next:**
-  - The simulation emits `SoundEvent`s (the interface is in the
-    decisions log), and gives the camera value and the hour for the
-    ambience's cursor.
+  - Positions for 3D sound, pause and unpause (103), reload (104), the
+    piano (43) and the music half of the music modes (36).
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)
@@ -2091,26 +2095,45 @@ through their public interfaces only; the simulation never depends on it.
   a book comes off the shelf, the fountain tinkles. `begin_route` and
   `end_route` have no event in the install's sound files and play
   nothing.
-- **Done: a stopgap pie menu.** Clicking an object or a person opens a
-  list of the interactions an order on it is queued from (those of the
-  tile the simulation sends a multi-tile object's orders to; each menu
-  number once, named by that table's TTAs strings, debug entries
-  hidden); choosing one
-  queues it for the selected Sim with `Lot::queue_interaction`, and the
-  note across the top says whether it was queued. Escape closes the
-  menu. The fridge lists Have A Snack, Have Lite Meal, Have A Meal,
-  Serve Meal; the bookshelf lists Read a Book and the studies.
-- **Blocked: a Sim doing what he is told.** Idle For Input now starts
-  a queued order (#131): Have A Snack queued on the fridge at tick 51
-  leaves the queue by tick 151. Three ticks later, another person
-  (object 16) fails a route that names its slot from source 2 (tree
-  0x2156 node 5; 0x45ac2e, not ported), which stops the lot in strict
-  mode. Without an order, strict mode runs to tick 2881. That route is
-  the simulation's next step toward the done criterion.
-- **Next:** the menu from the simulation's pie-menu entries (the check
-  each entry runs, which the stopgap skips) once that accessor lands;
-  then a real pie.
+- **Done: the pie menu from the simulation's listing.** When the
+  pointer first reaches an object or a person, the game lists the
+  selected Sim's menu on it with `Lot::pie_menu`, which changes the lot
+  as the original's listing does; a click opens it. The entries are
+  those whose check passes, named as the check tree named them or else
+  by the TTAs strings of the table they came from, with "*" before such
+  an entry with flag 0x80; choosing one queues the offered action with
+  `Lot::pick`. Where the simulation has
+  not ported something the listing needs, the menu falls back to every
+  entry of the table, queued by menu number, and the note across the
+  top says why; any other failure shows no menu. Escape closes the menu.
+  The simulation lists the fridge itself: in the morning the house
+  loads in, Have A Snack, Have Quick Breakfast, Have Breakfast and
+  Serve Breakfast.
+- **Done: a Sim doing what he is told.** Have A Snack queued on the
+  fridge at tick 51 (the snack order, run 2026-11-15 on main d46c93ab,
+  in play mode and in strict mode alike): Mortimer takes the order at
+  tick 150, the fridge makes the snack (object 263) at tick 615, he
+  takes it at 748, pays 5 at 820 and eats it (menu 2 on the snack) while
+  his hunger goes from 94.5 to 100.0 (tick 936); at 1088 the snack goes
+  off the lot and at 1136 it is deleted, and he is free again. He goes
+  on to other things (object 71 at tick 1497, object 132 at 2292).
+  Since #156 strict mode runs the order through step 3400 and stops at
+  step 3401 (person 16 routes for an action that wants to be
+  interrupted, 0x45afd2); without an order it runs to tick 2881.
+- **Done in play mode: selecting a Sim.** A press on a portrait selects
+  that Sim (0x445449, between ticks): the Sim selected before is
+  deselected, the indicators move, and the panel and the pie menus
+  follow the new Sim. Deselecting refreshes the old Sim's animator
+  (0x58da12), which is not ported, so in strict mode (`Lot::select`)
+  switching Sims fails and changes nothing; play mode
+  (`Lot::select_play`) leaves the refresh out.
+- **Next:** draw the menu with `sims_ui::pie` (#157), which is ported
+  from the original's menu window, in place of the plain list.
 - **Needs from other crates:**
+  - `sims-vm`: listings that fail today on the Goth house: check trees
+    on Manage Inventory operation 4 and scope 12. A check tree's fault
+    should keep its trap rather than become `Unsupported` text, which
+    `sims-game` reads to tell unported from failed.
   - `sims-render`: which object drew each pixel (an object ID buffer
     beside the depth), so a click picks the object under it. Today
     `sims-game` guesses from each object's tile.
@@ -2122,13 +2145,14 @@ through their public interfaces only; the simulation never depends on it.
   - `sims-people`: which person drew each pixel (`draw_on_lot` with an
     owner per pixel), so `sims-game` need not repeat its drawing loop
     to find the person a click lands on.
-  - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
-    and dialogs are. `sims-game` draws a plain list until then.
-  - `sims-vm`: a route naming its slot from source 2 (0x45ac2e), and
-    the entries the pie menu offers a person on an object, with their
-    labels' table. Until then, the tile an order on an object goes to
-    (`interaction_target`) and the ID and file of the TTAB it is queued
-    from, which `sims-game` now repeats from the program's data.
+  - `sims-vm`: the animator's refresh (0x58da12), which deselecting a
+    Sim makes, so strict mode can switch Sims.
+  - `sims-audio`: the inputs the game cannot give yet (the camera
+    value of the ambience's cursor, 0x570c3e, is ported, #160): what
+    the sound scripts' `getsrcdatafield` fields are (`sims-game`
+    answers 0 to every one; an object's place on screen, for its pan,
+    is presumably among them, unread), and what pausing the game does
+    to the sounds playing (the pause events are not ported).
 
 ## Working rules
 

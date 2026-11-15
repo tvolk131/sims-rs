@@ -16,6 +16,10 @@
 //! floor, `1`/`2`/`3` walls up, cutaway and down, the arrows or a
 //! right-button drag scroll, space pauses, Escape quits.
 //!
+//! A press on a portrait selects that Sim. In strict mode switching Sims
+//! fails, as the simulation has not ported the deselected Sim's
+//! animator refresh; play mode leaves it out (`Lot::select_play`).
+//!
 //! A left click on a person or an object opens its menu for the selected
 //! Sim; a click on an entry queues it, and a click anywhere else, or
 //! Escape, closes the menu. Escape quits only when no menu is open, and a
@@ -199,8 +203,8 @@ struct App {
     /// How many of the game's caught errors are printed.
     printed: usize,
     sound: Sound,
-    /// The hour and speed the sound was last told.
-    heard: Option<(u32, Speed)>,
+    /// The hour, speed and ambience view the sound was last told.
+    heard: Option<(u32, Speed, i32)>,
 }
 
 impl App {
@@ -285,10 +289,15 @@ impl App {
             redraw = true;
         }
         self.changed(redraw);
-        let now = (self.game.hour(), self.game.pace.speed);
+        let now = (
+            self.game.hour(),
+            self.game.pace.speed,
+            self.game.ambience_view(),
+        );
         if self.heard != Some(now) {
             self.sound.send(Input::Hour(now.0));
             self.sound.send(Input::Speed(now.1));
+            self.sound.send(Input::View(now.2));
             self.heard = Some(now);
         }
     }
@@ -437,6 +446,7 @@ impl ApplicationHandler for App {
                 (MouseButton::Right, ElementState::Released) => self.drag = None,
                 _ => {}
             },
+            WindowEvent::CursorLeft { .. } => self.game.leave(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
                 let point = self.point(position);
