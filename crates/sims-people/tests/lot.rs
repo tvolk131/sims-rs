@@ -3,11 +3,11 @@
 //! `SIMS_INSTALL`; skipped when it is unset. Nothing from the game is
 //! kept.
 
-use sims_people::math::Vec3;
+use sims_people::lot::{NEAR_PIXELS_PER_UNIT, ground_height};
 use sims_people::raster::Target;
 use sims_people::raster::{Camera, Canvas};
 use sims_people::{
-    Assets, Body, Cast, Library, People, Player, View, base_clip, placement, residents_of,
+    Assets, Body, Cast, Library, People, Player, base_clip, placement, residents_of,
 };
 use sims_render::{Camera as LotCamera, Walls, Zoom};
 use sims_sim::World;
@@ -176,10 +176,22 @@ fn the_people_of_a_running_lot_are_drawn_in_the_lot_renderers_view() {
     let mut people = People::open(&root, &house).unwrap();
     let mut drawn = 0;
     let mut most = 0;
+    let mut checked = 0;
     loop {
         if lot.ticks().is_multiple_of(EVERY) {
             let world = lot.world();
             assert_eq!(people.update(world), Vec::<String>::new());
+            // Each person drawn alone, in a world holding only them, so
+            // the pixels near where they stand are theirs.
+            let ids: Vec<u16> = world.animators.keys().copied().collect();
+            let solos: Vec<(u16, World)> = ids
+                .iter()
+                .map(|&id| {
+                    let mut solo = world.clone();
+                    solo.animators.retain(|&other, _| other == id);
+                    (id, solo)
+                })
+                .collect();
             for rotation in 0..4 {
                 let mut camera = LotCamera {
                     zoom: Zoom::Far,
@@ -193,29 +205,47 @@ fn the_people_of_a_running_lot_are_drawn_in_the_lot_renderers_view() {
                 // pixels at the far zoom, its depth 128 of 8. People stand
                 // on the road at the lot's corners.
                 camera.center_on([32 * 16, 32 * 16], [1200, 700]);
-                let view = View::new(&camera);
-                // Each person is drawn around where the lot renderer
-                // projects their skeleton's root.
                 let (posed, problems) = people.posed(world, camera.level);
                 assert!(problems.is_empty(), "{problems:?}");
-                let roots: Vec<(u16, i32, Vec3)> = posed
+                // Where the lot renderer puts each person's position: its
+                // own projection, the animator's position rounded to a
+                // sixteenth, raised by the ground, one column right as it
+                // draws objects. A clip may carry the body away from the
+                // position (the stair climb carries it four tiles); such
+                // people are left out.
+                let stands: Vec<(u16, [i32; 2])> = posed
                     .iter()
-                    .map(|p| (p.id, p.level, p.bones[0].translation))
+                    .filter(|p| {
+                        let [r, b] = [p.root.translation, p.bones[0].translation];
+                        (r.x - b.x).abs().max((r.z - b.z).abs()) < 1.5
+                    })
+                    .map(|p| {
+                        let [x, y, _] = world.animators[&p.id].position.map(|v| v.to_f32());
+                        let fine = [x, y].map(|v| v.round() as i32);
+                        let ground = ground_height(world, [x, y]).unwrap_or(0.0);
+                        let elevation = (ground * NEAR_PIXELS_PER_UNIT).round() as i32;
+                        let level = if p.level <= 1 { 1 } else { p.level };
+                        let [sx, sy] =
+                            camera.project_fine(camera.rotate_fine(fine), level, elevation);
+                        (p.id, [sx + 1, sy])
+                    })
                     .collect();
-                most = most.max(roots.len());
-                let mut frame = Frame::new(2400, 1400);
-                let report = people.draw(world, &camera, &mut frame, stand_in_depth);
-                assert_eq!(report.people, roots.len());
-                assert!(report.problems.is_empty(), "{:?}", report.problems);
-                for (id, level, at) in roots {
-                    let (fine, elevation) = view.place(at);
-                    let [x, y] = view.screen(fine, elevation, level);
-                    let near = frame.near([x, y], 20.0);
+                let placed = posed.len();
+                drop(posed);
+                most = most.max(placed);
+                for (id, [x, y]) in stands {
+                    let solo = &solos.iter().find(|(other, _)| *other == id).unwrap().1;
+                    let mut frame = Frame::new(2400, 1400);
+                    let report = people.draw(solo, &camera, &mut frame, stand_in_depth);
+                    assert_eq!(report.people, 1);
+                    assert!(report.problems.is_empty(), "{:?}", report.problems);
+                    let near = frame.near([x as f32, y as f32], 20.0);
                     assert!(
                         near > 20,
                         "tick {}, rotation {rotation}: person {id} at {x}, {y}: {near} pixels",
                         lot.ticks(),
                     );
+                    checked += 1;
                 }
             }
             drawn += 1;
@@ -231,6 +261,7 @@ fn the_people_of_a_running_lot_are_drawn_in_the_lot_renderers_view() {
     }
     assert!(most >= 3, "at most {most} people placed");
     assert!(drawn >= 1);
+    assert!(checked >= 4 * 3, "{checked} people checked");
 
     // People who change clothes are dressed again; people who leave are
     // forgotten.

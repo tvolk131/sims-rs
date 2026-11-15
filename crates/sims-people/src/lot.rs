@@ -149,7 +149,8 @@ pub fn ground_height(world: &World, position: [f32; 2]) -> Option<f32> {
         return None;
     }
     let point = point.map(|v| v as i32);
-    let size = i32::from(world.size);
+    // The arrays are always FULL tiles on a side, whatever the lot's size.
+    let size = i32::from(world.size).min(FULL as i32);
     let [first, second] = point.map(|p| p >> 4);
     if !(0..size).contains(&first) || !(0..size).contains(&second) {
         return None;
@@ -290,8 +291,8 @@ impl People {
     }
 
     /// Each placed person whose body is loaded, posed as the world has
-    /// them now, in object ID order. A person on a level above `top` is
-    /// left out. Call [`People::update`] first, so new people are loaded.
+    /// them now, in object ID order. A person on a level above `top`, or
+    /// whose object is off the lot, is left out. Call [`People::update`] first, so new people are loaded.
     pub fn posed(&mut self, world: &World, top: i32) -> (Vec<Posed<'_>>, Vec<String>) {
         let mut player =
             Player::with_clips(&self.assets, &self.library, std::mem::take(&mut self.clips));
@@ -314,8 +315,11 @@ impl People {
             let Some(mut root) = placement(animator) else {
                 continue;
             };
-            let level = World::tile(object.position)[2] as i32;
-            if level > top {
+            // An object taken off the lot is at tile (-1, -1); a person
+            // there is not drawn, wherever their animator was left.
+            let [x, y, level] = World::tile(object.position).map(i32::from);
+            let size = i32::from(world.size);
+            if !(0..size).contains(&x) || !(0..size).contains(&y) || level > top {
                 continue;
             }
             if level <= 1 {
@@ -494,5 +498,9 @@ mod tests {
         assert_eq!(ground_height(&world, [64.0 * 16.0, 0.0]), None);
         assert_eq!(ground_height(&world, [f32::NAN, 0.0]), None);
         assert_eq!(ground_height(&World::empty(), [40.0, 40.0]), None);
+        // A size beyond the arrays does not reach past them.
+        let mut wide = world.clone();
+        wide.size = 65;
+        assert_eq!(ground_height(&wide, [64.0 * 16.0, 0.0]), None);
     }
 }
