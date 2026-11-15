@@ -1,5 +1,5 @@
 //! Manage Inventory (opcode 51, 0x4552f8): look up a token in a person's
-//! inventory.
+//! inventory, or walk it.
 //!
 //! Operands: the operation (byte 0); the token kind (byte 1, unsigned);
 //! flags (bytes 2 and 3); and the token's GUID (bytes 4 to 7), or zero for
@@ -22,6 +22,14 @@
 //! the count and then temp `(flags >> 11) & 3` the token's place in the
 //! inventory, and the branch is true.
 //!
+//! Operation 4 (0x455462) walks the inventory: from the place after the
+//! one in the caller's temp `(flags >> 8) & 3`, it finds the next token of
+//! that kind, and of that GUID too with flag 0x1, any GUID without
+//! (0x41f69c). Temp `(flags >> 5) & 3` takes the token's count, and then
+//! temp `(flags >> 11) & 3` its place. When there is none, they take 0
+//! and -1 and the branch is false; a count of 0 is still found. A place
+//! after 0x7fff wraps to a negative one, which finds nothing (0x41f746).
+//!
 //! The other operations fail loudly. Ported from the original's code
 //! (above) and checked against the old prototype's `inventory`
 //! (legacy/crates/sims-vm/src/person.rs), whose operation 3 agrees.
@@ -35,11 +43,13 @@ use sims_sim::neighbors::Inventory;
 
 /// Flag 0x2000: the owner is the object the caller's temp 4 names.
 const OWNER_IN_TEMP_4: u16 = 0x2000;
+/// Flag 0x1: operation 4 finds only tokens of the GUID too.
+const MATCH_GUID: u16 = 0x1;
 
 impl Machine<'_, '_> {
     pub(crate) fn manage_inventory(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
         let operation = operands[0];
-        if operation != 3 {
+        if !matches!(operation, 3 | 4) {
             return Err(Trap::Unsupported(format!(
                 "Manage Inventory operation {operation} is not ported"
             )));
@@ -89,27 +99,51 @@ impl Machine<'_, '_> {
                 inventories.len() - 1
             }
         };
-        let found = inventories[place]
-            .items
-            .iter()
-            .enumerate()
-            .find(|(_, item)| item.kind == kind && item.guid == guid)
-            .map(|(index, item)| (index, item.count));
-        let Some((index, count)) = found.filter(|&(_, count)| count != 0) else {
-            return Ok(false);
-        };
-        let index = i16::try_from(index).map_err(|_| {
-            Trap::Invalid("an inventory holds more tokens than a word counts".into())
-        })?;
+        let items = &inventories[place].items;
         let temps = &mut self
             .world
             .objects
             .get_mut(&self.me)
             .ok_or(Trap::native(10, "missing object"))?
             .temps;
-        temps[usize::from((flags >> 5) & 3)] = count as i16;
+        let place_word = |index: usize| {
+            i16::try_from(index).map_err(|_| {
+                Trap::Invalid("an inventory holds more tokens than a word counts".into())
+            })
+        };
+        if operation == 3 {
+            let found = items
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item.kind == kind && item.guid == guid)
+                .map(|(index, item)| (index, item.count));
+            let Some((index, count)) = found.filter(|&(_, count)| count != 0) else {
+                return Ok(false);
+            };
+            let index = place_word(index)?;
+            temps[usize::from((flags >> 5) & 3)] = count as i16;
+            temps[usize::from((flags >> 11) & 3)] = index;
+            return Ok(true);
+        }
+        // Operation 4: the next token after the place in a temp.
+        let guid = if flags & MATCH_GUID != 0 { guid } else { 0 };
+        let after = temps[usize::from((flags >> 8) & 3)];
+        let start = after.wrapping_add(1);
+        let found = usize::try_from(start).ok().and_then(|start| {
+            items
+                .iter()
+                .enumerate()
+                .skip(start)
+                .find(|(_, item)| item.kind == kind && (guid == 0 || item.guid == guid))
+                .map(|(index, item)| (index, item.count))
+        });
+        let (index, count) = match found {
+            Some((index, count)) => (place_word(index)?, count as i16),
+            None => (-1, 0),
+        };
+        temps[usize::from((flags >> 5) & 3)] = count;
         temps[usize::from((flags >> 11) & 3)] = index;
-        Ok(true)
+        Ok(index != -1)
     }
 
     /// The ID of the first neighborhood record whose linked definition has

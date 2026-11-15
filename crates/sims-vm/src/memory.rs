@@ -200,6 +200,25 @@ impl Machine<'_, '_> {
     /// reads 0 for every field, and so does a field above 9 (a negative
     /// one too: the original compares it unsigned).
     ///
+    /// - 0: the ID of the first person in the lot's list of people
+    ///   ([`sims_sim::World::people`], lot +0x84) whose definition
+    ///   (+0x11c) is the one the record is linked to (+8), or 0 if none
+    ///   (0x425baa; the ID is object +0xf0). A record is linked to the
+    ///   definition its GUID resolves to, so this compares GUIDs. When
+    ///   more than one definition has the record's GUID, the reload can
+    ///   link a record it made to one another replaced, which is not kept,
+    ///   so that fails loudly.
+    /// - 1: 1 if the selected family's members (+0x12c, 0x4101f2) include
+    ///   the GUID of the definition the record is linked to (0x4572af),
+    ///   which is the record's own, else 0; 0 with no family selected
+    ///   (0x425be2). The original reads the selected family's pointer
+    ///   (game +0x10), which the selection sets together with global 9,
+    ///   the family's ID (0x4f2218, 0x4f222b). Scripts cannot write global
+    ///   9, so the family here is the one whose ID global 9 holds, as for
+    ///   the family panel; that the game's other setters of global 9
+    ///   (0x415fc6, 0x4164f6, 0x4278f6, 0x428317) keep the two together is
+    ///   **unverified**. A record of a GUID with no definition fails, as
+    ///   the original would read through a null pointer.
     /// - 2: the record's person data word 58.
     /// - 3 and 4: 0.
     /// - 6: the house of the first family, in the families' order, whose
@@ -212,7 +231,7 @@ impl Machine<'_, '_> {
     ///   count out again when it is out of date, so it can change the
     ///   family.
     ///
-    /// Fields 0, 1 and 5 read what the record's +8 points to, and 7 and 8
+    /// Field 5 reads what the record's +8 points to, and 7 and 8
     /// the family's flags (+0x138), which the simulation does not hold;
     /// they fail loudly.
     fn neighbor_field(&mut self, index: i16) -> Result<i16, Trap> {
@@ -231,8 +250,48 @@ impl Machine<'_, '_> {
             )))
         };
         Ok(match index {
-            0 => return unsupported(0x425baa, "the lot person whose type is the record's (+8)"),
-            1 => return unsupported(0x425be2, "the record's type (+8) in the selected family"),
+            0 => {
+                let guid = record.guid;
+                let definitions = self.catalog.objects.iter().filter(|o| o.guid == guid);
+                if definitions.count() > 1 {
+                    return Err(Trap::Unsupported(format!(
+                        "scope 24 field 0 (0x425baa) for a record of the GUID 0x{guid:08X}, \
+                         which more than one definition has: which one the record is linked \
+                         to (+8) is not kept"
+                    )));
+                }
+                let mut found = 0;
+                for &id in &self.world.people {
+                    let person = self.world.objects.get(&id).ok_or_else(|| {
+                        Trap::Invalid(format!("person {id} in the list of people is gone"))
+                    })?;
+                    if person.guid == guid {
+                        found = id as i16;
+                        break;
+                    }
+                }
+                found
+            }
+            1 => {
+                let selected = self.world.globals.get(9).copied().unwrap_or(0);
+                if selected == 0 {
+                    return Ok(0);
+                }
+                let family = families
+                    .iter()
+                    .find(|f| f.id == i32::from(selected))
+                    .ok_or_else(|| {
+                        Trap::Invalid(format!("global 9 names family {selected}, which is gone"))
+                    })?;
+                if self.catalog.object(record.guid).is_none() {
+                    return Err(Trap::Unsupported(format!(
+                        "scope 24 field 1 (0x425be2) for a record of the GUID 0x{:08X}, which \
+                         no definition has: the original reads through a null pointer",
+                        record.guid
+                    )));
+                }
+                i16::from(family.members.contains(&record.guid))
+            }
             2 => record.data[58],
             3 | 4 => 0,
             5 => return unsupported(0x427148, "the record's own friend count, by its type (+8)"),
@@ -496,14 +555,9 @@ impl Machine<'_, '_> {
             // after. Six bytes each, the personality number (28), the
             // minimum (29) and the delta (12). An index outside its count
             // (16) is native error 0x1a. Before the first copy the record
-            // holds what the game's start left there, which is not read.
+            // holds the sixteen zeroed advertisements the game's start
+            // leaves (see [`sims_sim::World::advertisement_record`]).
             12 | 28 | 29 => {
-                if self.world.advertisement_record.is_none() {
-                    return Err(Trap::Unsupported(format!(
-                        "scope {scope} reads the advertisement record (0x6e5100) before \
-                         Find Best Interaction first copies into it"
-                    )));
-                }
                 let count = sims_sim::ADVERTISEMENTS;
                 let field = match scope {
                     28 => 0,
@@ -606,8 +660,8 @@ impl Machine<'_, '_> {
             Cell::Advertisement(i, field) => self
                 .world
                 .advertisement_record
-                .as_ref()
-                .and_then(|ads| ads.get(i))
+                .unwrap_or_default()
+                .get(i)
                 .map(|ad| ad.field(field))
                 .ok_or_else(|| Trap::Invalid("no advertisement".into())),
             Cell::Motive(id, i) => {
@@ -665,8 +719,8 @@ impl Machine<'_, '_> {
             let ad = self
                 .world
                 .advertisement_record
-                .as_mut()
-                .and_then(|ads| ads.get_mut(i))
+                .get_or_insert_default()
+                .get_mut(i)
                 .ok_or_else(|| Trap::Invalid("no advertisement".into()))?;
             *ad.field_mut(field) = value;
             return Ok(true);

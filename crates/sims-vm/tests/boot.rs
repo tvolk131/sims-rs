@@ -96,17 +96,17 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
             .clone()
     };
 
-    // Object 18's listing runs check trees and fails partway: one reads
-    // the advertisement record (scope 12) before Find Best Interaction
-    // has first copied into it, which the load does not reach. The lot is
-    // as it was.
+    // Object 10's listing runs check trees and fails partway, on an
+    // action string with a token, whose formatter is not ported. The lot
+    // is as it was.
     let before = lot.world().hash();
-    let refused = lot.pie_menu(sim, 18).unwrap_err().to_string();
-    assert!(
-        refused.contains("scope 12") && refused.contains("0x6e5100"),
-        "{refused}"
-    );
+    let refused = lot.pie_menu(sim, 10).unwrap_err().to_string();
+    assert!(refused.contains("0x44bf1a"), "{refused}");
     assert_eq!(lot.world().hash(), before);
+    // Object 18's check tree reads the advertisement record (scope 12)
+    // before Find Best Interaction first copies into it: the game's start
+    // left it zeroed.
+    lot.pie_menu(sim, 18).unwrap_or_else(|e| panic!("{e}"));
 
     // Person 16: listing changes the lot (its check trees' work), and
     // the change is kept.
