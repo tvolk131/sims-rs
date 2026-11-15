@@ -19,7 +19,7 @@ use crate::people::People;
 use crate::pick;
 use crate::sound;
 use crate::view::{Move, View};
-use sims_render::{Canvas, Selected, Walls, open_house};
+use sims_render::{Camera, Canvas, Selected, Walls, open_house};
 use sims_ui::command::{Camera as UiCamera, Command, Speed, Walls as UiWalls};
 use sims_vm::SoundEvent;
 use sims_vm::boot::{Frames, Lot, StepError};
@@ -138,7 +138,13 @@ impl Game {
         // The booted world, not the file as read: some objects (doors,
         // windows) set how they are drawn in their own init scripts.
         let lot_shape = sims_render::Lot::from_world(lot.world()).map_err(|e| e.to_string())?;
-        let hud = Hud::open(&options.install, house, &opened.assets)?;
+        let hud = Hud::open(
+            &options.install,
+            house,
+            &opened.assets,
+            lot.world(),
+            lot.program().autonomy_constants().friendship_threshold,
+        )?;
         let mut people = People::open(&options.install, house)?;
         people.refresh(lot.world());
         let view = View::new([800, 600], lot_shape.built_center(), opened.rotation);
@@ -498,11 +504,14 @@ impl Game {
         self.hud.read_dialog(dialogs, &self.assets);
         self.hud.draw(
             world,
+            &self.assets,
             &self.view,
             &self.pace,
             status.as_deref(),
             &mut self.canvas,
         );
+        let problems = self.hud.take_problems();
+        self.people.note(problems);
     }
 
     /// The canvas last drawn.
@@ -834,25 +843,77 @@ impl Game {
         self.run(1);
     }
 
-    /// Selects the Sim `sim`, as a press on its portrait does
-    /// (`Lot::select`, 0x445449), keeping the sounds that made. A menu
-    /// listed for the Sim selected before is dropped.
+    /// A press on the portrait of the Sim `sim` (0x4cf9c4). On another
+    /// Sim's portrait it selects `sim` (`Lot::select`, through 0x4e989b
+    /// and 0x445449), keeping the sounds that made, and drops a menu
+    /// listed for the Sim selected before. On the selected Sim's own
+    /// portrait it centres the view on the Sim instead
+    /// ([`Game::centre_on`]). Either way it then plays `UI_click`
+    /// (0x4cfa51).
     ///
-    /// In strict mode selecting another Sim fails, as deselecting
-    /// refreshes the Sim's animator, which the simulation has not ported;
-    /// play mode leaves the refresh out (`Lot::select_play`).
+    /// On a residential lot 0x4e989b selects the person only when person
+    /// word 32 is 0 (it lives here), and nobody otherwise; the portraits
+    /// show only the household's people, whose word is 0, so that is not
+    /// checked here. Not ported: a person the household's table names
+    /// but who is not on the lot (0x4e9652), and the people panel's call
+    /// on a press on the selected Sim's portrait (0x51ea7a, behind a
+    /// check of global 0x6f6bac) whose effect has not been read.
     pub fn select(&mut self, sim: u16) {
-        let selected = if self.play {
-            self.lot.select_play(sim)
-        } else {
-            self.lot.select(sim)
-        };
-        match selected {
-            Ok(sounds) => self.keep_sounds(sounds),
+        if self.lot.world().selected() == Some(sim) {
+            self.centre_on(sim);
+            self.hud.play(crate::hud::CLICK);
+            return;
+        }
+        match self.lot.select(sim) {
+            Ok(sounds) => {
+                self.keep_sounds(sounds);
+                self.hud.play(crate::hud::CLICK);
+            }
             Err(e) => self.note = Some(format!("Person {sim} was not selected: {e}")),
         }
         self.listed = None;
         self.reached = None;
+    }
+
+    /// Centres the view on the object `id` as 0x434ced does with 1, but
+    /// at once: the original slides the view there over a while
+    /// (0x4c9a27, the time at 0x6c7788), which is left out.
+    ///
+    /// Nothing happens unless object data word 34 is 0 and word 29 is not
+    /// negative. A person on the floor shown is centred a little above
+    /// its feet: its screen point ([`sound::object_point`]) raised by
+    /// half of 2 √6 times 2.0 times 2 to the power of the zoom plus one,
+    /// cut to a whole number (19, 39 and 78 pixels from far to near),
+    /// comes to the middle of the screen (0x4a7777). The original then
+    /// holds the view inside its scroll limits (0x4a9fa9), which the
+    /// window does not have. Anything else, or a person on another floor,
+    /// shows its floor (0x4a80c7) and, unless it stands off the lot
+    /// (0x4a7af0), its screen point on that floor comes to the middle
+    /// (0x4a7996).
+    pub fn centre_on(&mut self, id: u16) {
+        let Some(object) = self.lot.world().objects.get(&id) else {
+            return;
+        };
+        let word = |i: usize| object.data.get(i).copied().unwrap_or(0);
+        if word(34) != 0 || word(29) < 0 {
+            return;
+        }
+        let position = object.position;
+        let level = position[2];
+        if object.person.is_some() && level == self.view.camera.level {
+            let mut at = lot_point(&self.view.camera, position);
+            at[1] -= person_rise(self.view.camera.zoom.level());
+            self.view.apply(Move::Centre(at));
+            return;
+        }
+        self.view.apply(Move::Floor(level));
+        // The lot's bounds (0x4a7af0 reads them from the scene) are taken
+        // as its tiles, which is **unverified** at the edges.
+        if position[..2].iter().any(|&n| !(0..64 * 16).contains(&n)) {
+            return;
+        }
+        let at = lot_point(&self.view.camera, position);
+        self.view.apply(Move::Centre(at));
     }
 
     /// Carries out a panel command. `menu` is the pie menu that was open
@@ -1053,6 +1114,30 @@ pub fn goth_house(root: &Path) -> PathBuf {
     root.join("UserData/Houses/House05.iff")
 }
 
+/// How far above its feet a centred person is (0x434d64 to 0x434da7):
+/// 2 √6 (single precision, 0x434df6) times 2.0 (1/3 times 6, single)
+/// times 2 to the power of the zoom plus one, cut toward zero, halved.
+/// The screen point of a fine lot position ([`sound::object_point`]),
+/// worked out from the lot's own corner and then moved by the origin:
+/// the original cuts the point to 16 bits, and its scroll limits
+/// (0x4a9fa9) keep its origin small enough for that, where the window's
+/// origin may go much further.
+fn lot_point(camera: &Camera, position: [i32; 3]) -> [i32; 2] {
+    let at = sound::object_point(
+        &Camera {
+            origin: [0, 0],
+            ..*camera
+        },
+        position,
+    );
+    [at[0] + camera.origin[0], at[1] + camera.origin[1]]
+}
+
+fn person_rise(zoom: u32) -> i32 {
+    let rise = (2.0 * 6f64.sqrt()) as f32 * 2.0 * (1u32 << (zoom + 1)) as f32;
+    rise as i32 / 2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1069,6 +1154,11 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_centred_person_is_raised_by_half_its_zooms_height() {
+        // trunc(2 sqrt 6 * 2.0 * 2^(zoom + 1)) / 2 for far, medium, near.
+        assert_eq!([1, 2, 3].map(super::person_rise), [19, 39, 78]);
+    }
     #[test]
     fn an_error_says_what_failed_and_what_was_done() {
         let mut error = ScriptError {
