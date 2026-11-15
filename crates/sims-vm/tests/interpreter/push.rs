@@ -1082,3 +1082,39 @@ fn an_action_run_at_once_does_not_nest() {
         "{fault}"
     );
 }
+
+/// An action run at once whose tree fails puts my priority back.
+#[test]
+fn an_action_run_at_once_that_fails_puts_my_priority_back() {
+    let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    // The tree names a primitive.
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .interactions
+        .get_mut(&TABLE)
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .interactions[1]
+        .action = 4;
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert!(interpreter.order(&mut fx.world, SIM, LAMP, 4).is_err());
+    assert_eq!(fx.sim().person.as_ref().unwrap().data[33], 7);
+
+    // The tree queues an action on me while it runs.
+    let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    fx.add(
+        LAMP_FILE,
+        ACTION,
+        tree(vec![
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, SIM as i16, 1),
+            assign(scope::LOCALS, 0, scope::LITERAL, LAMP as i16, 2),
+            ins(13, RETURN_TRUE, RETURN_TRUE, [3, 0, 1, 2, 0, 0, 0, 0]),
+        ]),
+    );
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert!(interpreter.order(&mut fx.world, SIM, LAMP, 4).is_err());
+    assert_eq!(fx.sim().person.as_ref().unwrap().data[33], 7);
+}

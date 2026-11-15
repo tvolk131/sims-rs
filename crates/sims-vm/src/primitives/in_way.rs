@@ -518,9 +518,30 @@ impl Machine<'_, '_> {
                     action.target
                 ))
             })?;
+        let resource = self.definition(self.world.objects[&target].guid)?.resource;
         let kept = self.person_data(id, PRIORITY)?;
         self.set_person_data(id, PRIORITY, action.priority as i16)?;
-        let resource = self.definition(self.world.objects[&target].guid)?.resource;
+        // The priority is put back however the run ends.
+        let ran = self.run_tree_at_once(id, target, resource, action);
+        self.set_person_data(id, PRIORITY, kept)?;
+        ran?;
+        if action.uid == 0 {
+            self.world.action_serial = self.world.action_serial.wrapping_add(1);
+            action.uid = self.world.action_serial;
+        }
+        Ok(Some(action.uid))
+    }
+
+    /// Runs the action tree of an action run at once on its target, with
+    /// the four arguments, the priority's two halves and the tree as its
+    /// parameters (0x474afb, 0x4749b5).
+    fn run_tree_at_once(
+        &mut self,
+        id: u16,
+        target: u16,
+        resource: usize,
+        action: &Interaction,
+    ) -> Result<(), Trap> {
         let tree = action.action;
         match self.program.tree(resource, tree) {
             crate::program::Tree::Missing => {
@@ -566,12 +587,7 @@ impl Machine<'_, '_> {
                     })?;
             }
         }
-        self.set_person_data(id, PRIORITY, kept)?;
-        if action.uid == 0 {
-            self.world.action_serial = self.world.action_serial.wrapping_add(1);
-            action.uid = self.world.action_serial;
-        }
-        Ok(Some(action.uid))
+        Ok(())
     }
 
     /// Person data word `index` of person `id`.
