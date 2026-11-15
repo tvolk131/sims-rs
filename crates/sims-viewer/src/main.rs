@@ -15,8 +15,9 @@
 //! as a PNG, Escape quits.
 //!
 //! `--hud` draws the original's live-mode control panel over the lot
-//! (`sims-ui`); its camera buttons work, and the commands it would send
-//! the simulation are printed instead.
+//! (`sims-ui`), and the dialog the world waits on if there is one (a
+//! snapshot taken while a script shows one); its camera buttons work,
+//! and the commands it would send the simulation are printed instead.
 //!
 //! The window is drawn at the original's pixel size and scaled up by whole
 //! pixels on high-DPI screens, so it keeps the original's look.
@@ -389,6 +390,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &options.install,
             &options.house,
             &opened.assets,
+            &world,
         )?)
     } else {
         None
