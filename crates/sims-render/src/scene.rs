@@ -65,6 +65,7 @@ pub fn draw(
             }
         };
         painter.walls(level, &cut);
+        painter.trims(level, &cut);
         painter.objects(level, &cut);
     }
     painter.stats
@@ -75,6 +76,91 @@ enum Cut {
     None,
     All,
     Mask(Box<Mask>),
+}
+
+impl Cut {
+    /// Whether the wall with segment bit `bit` and style `style` of lot
+    /// cell `cell` is cut down. Fences never are.
+    fn cuts(&self, camera: &Camera, cell: [i32; 2], bit: u8, style: u16) -> bool {
+        solid(style)
+            && match self {
+                Cut::None => false,
+                Cut::All => true,
+                Cut::Mask(mask) => mask.cuts(camera, cell, bit),
+            }
+    }
+}
+
+/// The trim frame for the walls meeting at a corner, by the directions
+/// they leave it in (the original's table at 0x6cd468, less one): bits 1,
+/// 2, 4 and 8 are view -y, -x, +y and +x, and 0x10 to 0x80 the diagonals
+/// between them, from (-1, -1) round to (1, -1). Combinations the game
+/// has no frame for are None.
+fn trim_frame(mask: u8) -> Option<usize> {
+    const DIAGONALS: [(u8, usize); 30] = [
+        (0x14, 16),
+        (0x18, 17),
+        (0x1c, 18),
+        (0x20, 19),
+        (0x21, 20),
+        (0x28, 21),
+        (0x29, 22),
+        (0x30, 23),
+        (0x38, 24),
+        (0x40, 25),
+        (0x41, 26),
+        (0x42, 27),
+        (0x43, 28),
+        (0x50, 29),
+        (0x60, 30),
+        (0x61, 31),
+        (0x70, 32),
+        (0x80, 33),
+        (0x82, 34),
+        (0x84, 35),
+        (0x86, 36),
+        (0x90, 37),
+        (0x94, 38),
+        (0xa0, 39),
+        (0xb0, 40),
+        (0xc0, 41),
+        (0xc2, 42),
+        (0xd0, 43),
+        (0xe0, 44),
+        (0xf0, 45),
+    ];
+    match mask {
+        0 => None,
+        1..=0x10 => Some(usize::from(mask) - 1),
+        _ => DIAGONALS
+            .iter()
+            .find(|&&(m, _)| m == mask)
+            .map(|&(_, frame)| frame),
+    }
+}
+
+/// The trim bit for a wall leaving a view corner in view direction `d`.
+fn trim_bit(d: [i32; 2]) -> u8 {
+    match d {
+        [0, -1] => 1,
+        [-1, 0] => 2,
+        [0, 1] => 4,
+        [1, 0] => 8,
+        [-1, -1] => 0x10,
+        [-1, 1] => 0x20,
+        [1, 1] => 0x40,
+        [1, -1] => 0x80,
+        _ => 0,
+    }
+}
+
+/// The walls meeting at one corner, for its trim.
+#[derive(Default)]
+struct Meeting {
+    /// Bits of the standing walls.
+    up: u8,
+    /// Bits of the cut walls that take trim.
+    cut: u8,
 }
 
 /// A wall segment by its two lot corners, the lower first.
@@ -368,12 +454,7 @@ impl Painter<'_> {
                     let patterns = self.sides(index, x, y, s.bit);
                     let n = self.rotate_direction(s.normal);
                     let front = usize::from(n[0] + n[1] < 0);
-                    let cut = solid(style)
-                        && match cut {
-                            Cut::None => false,
-                            Cut::All => true,
-                            Cut::Mask(mask) => mask.cuts(self.camera, [x, y], s.bit),
-                        };
+                    let cut = cut.cuts(self.camera, [x, y], s.bit, style);
                     let key = edge(s.from, s.to);
                     // The frame from the wall's direction on screen.
                     let a = self.corner_screen(s.from, level);
@@ -427,6 +508,97 @@ impl Painter<'_> {
                     });
                     self.stats.walls += 1;
                 }
+            }
+        }
+    }
+
+    /// The wood trim along the tops of a level's walls (0x53c227). Each
+    /// corner a wall touches takes one sprite whose frame shows the walls
+    /// meeting there: standing walls' trim at the storey's height, cut
+    /// walls' at the cut height. A cut wall that meets a standing one ends
+    /// in a cap instead, which is not drawn yet (0x53c6b7 draws a slice of
+    /// the wall's own pattern there). Cut walls in a door-like style (3, 5,
+    /// 6, 15, 23) and fences take no trim. The original draws the trim at
+    /// full light, whatever the room's light.
+    fn trims(&mut self, level: i32, cut: &Cut) {
+        let index = (level - 1) as usize;
+        let mut corners: BTreeMap<[i32; 2], Meeting> = BTreeMap::new();
+        let size = self.lot.size as i32;
+        for x in 0..size {
+            for y in 0..size {
+                let wall = self.lot.levels[index].walls[Lot::cell(x as usize, y as usize)];
+                for s in segments(x, y) {
+                    if wall.segments & s.bit == 0 {
+                        continue;
+                    }
+                    let style = if s.bit == lot::WEST {
+                        wall.styles[0]
+                    } else {
+                        wall.styles[1]
+                    };
+                    if !solid(style) {
+                        continue;
+                    }
+                    let is_cut = cut.cuts(self.camera, [x, y], s.bit, style);
+                    let [a, b] = [s.from, s.to].map(|c| self.rotate_corner(c));
+                    for (at, other, corner) in [(a, b, s.from), (b, a, s.to)] {
+                        let bit = trim_bit([other[0] - at[0], other[1] - at[1]]);
+                        let m = corners.entry(corner).or_default();
+                        if !is_cut {
+                            m.up |= bit;
+                        } else if !matches!(style, 3 | 5 | 6 | 15 | 23) {
+                            m.cut |= bit;
+                        }
+                    }
+                }
+            }
+        }
+        let zoom = self.camera.zoom;
+        let half = zoom.tile_width() / 2;
+        let cut_height = [6, 12, 23][zoom.index()];
+        let base = level_elevation(level);
+        for (corner, m) in corners {
+            // A cut wall meeting a standing one ends in a cap.
+            let cut_bits = if m.up != 0 { 0 } else { m.cut };
+            let at = self.corner_screen(corner, level);
+            let elevation = base + self.corner_elevation(corner);
+            for (bits, is_cut, height) in [
+                (cut_bits, true, cut_height),
+                (m.up, false, zoom.floor_height()),
+            ] {
+                let Some(frame) = trim_frame(bits) else {
+                    continue;
+                };
+                // Cut trim running along a view diagonal through the
+                // corner's top or bottom (bits 0x10 and 0x40) comes from the
+                // standing walls' set; lone 0x10 sits a little higher when
+                // zoomed in. The extra pieces the original adds for bits 8
+                // and 4 there are not drawn yet.
+                let diagonal = is_cut && bits & 0x50 != 0;
+                let lift = if is_cut && bits == 0x10 {
+                    [0, 2, 5][zoom.index()]
+                } else {
+                    0
+                };
+                let set = is_cut && !diagonal;
+                let Some(image) = self.assets.trim(set, zoom).get(frame).cloned() else {
+                    continue;
+                };
+                // The original subtracts one more pixel from x; its corner
+                // point sits one to the right of ours (fitted to the
+                // screenshot).
+                let rise = zoom.tile_height() / 2 + height + lift;
+                let (Some(x), Some(y)) = (at[0].checked_sub(half), at[1].checked_sub(rise)) else {
+                    continue;
+                };
+                let top = [x, y];
+                let camera = self.camera;
+                // The trim lies on the wall tops: each pixel as deep as
+                // the wall under it.
+                self.canvas
+                    .draw_lit(&image, top, false, Light::FULL, |_, sy, _| {
+                        depth::upright(camera, sy, sy + height, elevation)
+                    });
             }
         }
     }
@@ -725,6 +897,34 @@ mod tests {
             walls: Walls::Up,
             focus: crate::Focus::default(),
         }
+    }
+
+    #[test]
+    fn trim_frames_follow_the_original_table() {
+        assert_eq!(trim_frame(0), None);
+        assert_eq!(trim_frame(1), Some(0));
+        // A straight wall through a corner, each way.
+        assert_eq!(trim_frame(1 | 4), Some(4));
+        assert_eq!(trim_frame(2 | 8), Some(9));
+        assert_eq!(trim_frame(0x10), Some(15));
+        assert_eq!(trim_frame(0x14), Some(16));
+        assert_eq!(trim_frame(0x10 | 0x40), Some(29));
+        assert_eq!(trim_frame(0xf0), Some(45));
+        // No frame for a diagonal with a wall at right angles to it.
+        assert_eq!(trim_frame(0x11), None);
+        assert_eq!(trim_frame(0xff), None);
+    }
+
+    #[test]
+    fn a_wall_marks_opposite_bits_at_its_two_ends() {
+        for d in [[0, -1], [-1, 0], [-1, -1], [-1, 1]] {
+            let (a, b) = (trim_bit(d), trim_bit([-d[0], -d[1]]));
+            assert_ne!(a, 0);
+            // Both ends of a wall, straight through a corner, have a frame.
+            assert!(trim_frame(a | b).is_some(), "{d:?}");
+            assert_eq!(a.count_ones() + b.count_ones(), (a | b).count_ones());
+        }
+        assert_eq!(trim_bit([2, 0]), 0);
     }
 
     #[test]

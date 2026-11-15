@@ -1517,10 +1517,13 @@ Progress:
 - Done: the cutaway cuts the rooms the original looks at: the last
   three rooms the pointer passed over and the selected Sim's. Doors and
   windows hide with their walls by the same mask. At the compared
-  camera, the house box rose from 61% to 64% exact (67% on a booted
+  camera, the house box rose from 61% to 66% exact (67% on a booted
   world).
-- Next: the cut-wall cap, and two more cameras, each checked against the
-  original.
+- Done: the wood trim along the tops of standing and cut walls; at the
+  compared camera the house box rose from 72% to 76% exact (walls up)
+  and from 67% to 69% (cutaway).
+- Next: the cap where a cut wall meets a standing one, and two more
+  cameras, each checked against the original.
 
 ## Track: sound (`crates/sims-audio`)
 
