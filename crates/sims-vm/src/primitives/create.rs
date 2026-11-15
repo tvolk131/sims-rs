@@ -364,10 +364,12 @@ impl Machine<'_, '_> {
     /// made: when the frame's stack object names an object, a new person
     /// takes its data word 1 whole and does not turn (0x44e684); any other
     /// new object turns to its facing with the lowest bit cleared, up to
-    /// four calls of virtual function 0x4c, one step each. Nothing turns
-    /// when the stack object names no object. Only the case with nothing
-    /// to turn is ported; a turn (0x433f75, which redraws, updates seats
-    /// and the walls beside) fails loudly.
+    /// four calls of virtual function 0x4c, one step each, while its
+    /// facing differs. Nothing turns when the stack object names no
+    /// object. A group turns ([`crate::Interpreter::turn_group`],
+    /// 0x422937); a one-tile object only when there is nothing to turn, as
+    /// its turn (0x433f75, which redraws, updates seats and the walls
+    /// beside) fails loudly.
     fn face_as_stack_object(&mut self, created: u16, person: bool) -> Result<(), Trap> {
         let source = self.frame()?.stack_object;
         let Some(source) = u16::try_from(source)
@@ -388,6 +390,29 @@ impl Machine<'_, '_> {
             return Ok(());
         }
         let wanted = facing & 6;
+        if object.multipart.is_some() {
+            // A group turns by its own virtual function 0x4c (0x422937).
+            let interpreter = self.interpreter();
+            for _ in 0..4 {
+                let now = self
+                    .world
+                    .objects
+                    .get(&created)
+                    .ok_or(Trap::native(10, "missing object"))?
+                    .data[1];
+                if now == wanted {
+                    break;
+                }
+                interpreter
+                    .turn_group(self.world, created, 1)
+                    .map_err(|fault| {
+                        Trap::Unsupported(format!(
+                            "Create New Object Instance turning group {created}: {fault}"
+                        ))
+                    })?;
+            }
+            return Ok(());
+        }
         if object.data[1] != wanted {
             return Err(Trap::Unsupported(format!(
                 "Create New Object Instance turning object {created} from facing {} to \

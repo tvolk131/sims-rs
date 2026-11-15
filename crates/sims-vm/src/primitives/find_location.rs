@@ -31,9 +31,11 @@
 //! decoded, so a tile of a group fails loudly, as it does for Remove
 //! Object Instance.
 //!
-//! Mode 2 (in front of the object), 3 and 4 (searches in one line) and 5
-//! (a search from a random start, which draws random numbers) fail
-//! loudly.
+//! Modes 3 and 4 search along a line through the object the local names,
+//! following its facing (see `Machine::find_in_line`).
+//!
+//! Mode 2 (in front of the object) and 5 (a search from a random start,
+//! which draws random numbers) fail loudly.
 
 use crate::factory::word::GRAPHICS;
 use crate::fault::Trap;
@@ -86,11 +88,6 @@ impl Machine<'_, '_> {
                 .map_err(|fault| fault.nested(me))?;
             return Ok(true);
         }
-        if (2..=5).contains(&mode) {
-            return Err(Trap::Unsupported(format!(
-                "Find Location For mode {mode} is not ported"
-            )));
-        }
         let rules = Rules {
             same_room: true,
             empty: flags & 2 == 0,
@@ -99,6 +96,14 @@ impl Machine<'_, '_> {
         let interpreter = self.interpreter();
         let unsupported =
             |fault| Trap::Unsupported(format!("Find Location For on object {target}: {fault}"));
+        if mode == 3 || mode == 4 {
+            return self.find_in_line(target, mode, flags, local, from, level, rules);
+        }
+        if (2..=5).contains(&mode) {
+            return Err(Trap::Unsupported(format!(
+                "Find Location For mode {mode} is not ported"
+            )));
+        }
         let mut found = interpreter
             .search(self.world, target, from, level, rules)
             .map_err(unsupported)?;
@@ -144,6 +149,82 @@ impl Machine<'_, '_> {
                  refreshing them (0x433bb3) is not ported"
             )));
         }
+        Ok(true)
+    }
+
+    /// Modes 3 and 4 (0x44b676 to 0x44b716): a search along a line
+    /// through the object the local names.
+    ///
+    /// 1. Without flag bit 0 there is no such object: native error 0x3d.
+    /// 2. The line follows that object's facing (data word 1), or, in mode
+    ///    4, its facing plus 2, remainder 8.
+    /// 3. One search, in the start tile's room
+    ///    ([`crate::Interpreter::search_line`]). No tile found takes the
+    ///    false branch.
+    /// 4. The place test once more at the tile found
+    ///    ([`crate::Interpreter::fits`]); a refusal takes the false branch.
+    /// 5. The object is put there with the lot told (virtual function
+    ///    0x58) and the true branch is taken. Unlike mode 0, virtual
+    ///    function 0x74 does not run.
+    #[allow(clippy::too_many_arguments)]
+    fn find_in_line(
+        &mut self,
+        target: u16,
+        mode: u8,
+        flags: u8,
+        local: usize,
+        from: [i32; 2],
+        level: i32,
+        rules: Rules,
+    ) -> Result<bool, Trap> {
+        if flags & 1 == 0 {
+            return Err(Trap::native(
+                0x3d,
+                "Find Location For along a line has no object to search from",
+            ));
+        }
+        let reference = u16::try_from(self.frame()?.locals[local])
+            .map_err(|_| Trap::native(0x17, "Find Location For has no object to search from"))?;
+        let facing = i32::from(
+            self.world
+                .objects
+                .get(&reference)
+                .ok_or(Trap::native(
+                    0x17,
+                    "Find Location For has no object to search from",
+                ))?
+                .data[1],
+        );
+        let direction = if mode == 4 { (facing + 2) % 8 } else { facing };
+        let interpreter = self.interpreter();
+        let unsupported =
+            |fault| Trap::Unsupported(format!("Find Location For on object {target}: {fault}"));
+        let Some(position) = interpreter
+            .search_line(self.world, target, from, level, rules, direction)
+            .map_err(unsupported)?
+        else {
+            return Ok(false);
+        };
+        if !interpreter
+            .fits(self.world, target, position, level)
+            .map_err(unsupported)?
+        {
+            return Ok(false);
+        }
+        interpreter
+            .put(
+                self.world,
+                target,
+                Place {
+                    on_lot: on_lot(position),
+                    position,
+                    container: None,
+                    slot: -1,
+                    level,
+                },
+                true,
+            )
+            .map_err(unsupported)?;
         Ok(true)
     }
 }
