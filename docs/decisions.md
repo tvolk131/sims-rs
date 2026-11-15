@@ -55,8 +55,11 @@ function 10, so at tick 3434 those take-offs run no tree; all 18 tiles
 go.
 
 **A deletion's reset stops the object's sounds.** Every path of an
-object's reset (0x431fbe) meets at 0x43208b and asks the sound system
-to stop the object's sounds (0x4320b4); the deletion's mark (flag
+object's reset (0x431fbe) with argument 0, which the deletion
+(0x4410a5), error recovery (0x439acc) and the load's visit (0x431f68)
+all pass, meets at 0x43208b and asks the sound system to stop the
+object's sounds (0x4320b4); a nonzero argument jumps straight to the
+exit (0x431fc7 to 0x4320d4); the deletion's mark (flag
 0x40) only spares the rebuild (0x432063). The port had left that stop
 out for a deletion, so a deleted object now notes `SoundEvent::Stop`
 twice, from its reset and from its destructor (0x4323c9). Sound
