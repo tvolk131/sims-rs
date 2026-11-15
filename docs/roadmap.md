@@ -1876,8 +1876,18 @@ Progress:
   buffer holds the lot without its people. The game does not use it
   yet, and how the original gives a person's mesh its depth is
   unverified.
-- Next: the edge-on diagonal's texels; a screenshot with a marked
-  edge-on diagonal; upper-level depth.
+- Found, not ported: an edge-on diagonal wall shows the wrong side, not
+  only the wrong texels. At near zoom the original shows the outside
+  shingles at both edge-on ends of the bay; we show the inside
+  wallpaper at the left end. Both walls face the same way, but the
+  outside lies on opposite sides of them, so no rule by the wall's
+  facing matches both. The original's choice (0x53f8ce) reads the wall
+  records of the cell and its neighbour at an index set by the wall's
+  direction and a view value (0x43517c). What that view value holds is
+  not read yet; the port waits on it.
+- Next: read the edge-on side's view value (0x53f8ce), then its
+  texels; a screenshot with a marked edge-on diagonal; upper-level
+  depth.
 
 ## Track: sound (`crates/sims-audio`)
 
