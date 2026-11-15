@@ -13,12 +13,19 @@ order and keeps it while the menu is open; the pie groups a name with a
 `/` into a submenu and shows at most 12 entries, and a choice is the
 entry's index in the listing, which the game queues as before. A press
 on a submenu's entry, or back out of one, keeps the menu open; one
-elsewhere closes it.
+elsewhere closes it. The pie is laid out as it opens and again after
+each press that keeps it, so a second press finds what the first
+opened. As `sims_ui::pie` says the original does, the window moves the
+pointer to the middle of a submenu that opens, and of a menu that had
+to move to stay on the screen; where the platform refuses to move the
+pointer, it stays.
 
-**Verified:** a unit test chooses an entry, opens a submenu and chooses
-from it, and closes the menu; on the Goth house a test clicks the
-fridge, finds Have A Snack on its pie and presses it, and the order is
-in Mortimer's queue. The placement itself is `sims-ui`'s, checked there
+**Verified:** unit tests choose an entry, open a submenu and choose
+from it, press twice with no drawing between, move the pointer for a
+menu moved on the screen, and close the menu; on the Goth house a test
+clicks the fridge, finds Have A Snack on its pie and presses it, and
+Have A Snack (its menu number on the fridge) is queued for Mortimer.
+Moving the real pointer is not tested; no test opens a window. The placement itself is `sims-ui`'s, checked there
 against the running original.
 
 **Not verified or not done:** the middle of the pie shows the face

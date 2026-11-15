@@ -237,6 +237,14 @@ impl Hud {
         ) != before
     }
 
+    /// Where the pointer is to be moved, as the original moves it when a
+    /// pie menu opens; the panel's pointer is moved there.
+    pub fn take_pointer(&mut self) -> Option<[i32; 2]> {
+        let point = self.menu.as_mut()?.take_pointer()?;
+        self.controls.pointer = Some(point);
+        Some(point)
+    }
+
     /// A press at `point`: the command it asks for, if any. Commands that
     /// change only the panel are applied here too.
     pub fn press(&mut self, point: [i32; 2]) -> Option<Command> {
@@ -248,7 +256,7 @@ impl Hud {
         // `interaction` is the entry's index in the menu; the game reads
         // its menu number from the menu it had open.
         if let Some(mut menu) = self.menu.take() {
-            return match menu.press(point) {
+            return match menu.press(&self.art, point) {
                 Press::Chose(choice) => Some(Command::ChooseInteraction {
                     sim: menu.person,
                     object: menu.object,

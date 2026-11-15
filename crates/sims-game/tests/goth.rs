@@ -405,26 +405,37 @@ fn a_snack_is_chosen_from_the_fridges_pie() {
         game.render();
         let snack = game.menu().and_then(|menu| {
             assert!(!menu.labels().is_empty(), "object {id}'s pie shows nothing");
-            menu.labels()
+            let at = menu
+                .labels()
                 .into_iter()
                 .find(|(text, _)| *text == "Have A Snack")
-                .map(|(_, r)| [r.x + r.width / 2, r.y + r.height / 2])
+                .map(|(_, r)| [r.x + r.width / 2, r.y + r.height / 2])?;
+            let entry = menu.entries.iter().find(|e| e.label == "Have A Snack")?;
+            Some((at, entry.menu))
         });
-        if let Some(snack) = snack {
-            fridge = Some((id, snack));
+        if let Some((at, number)) = snack {
+            fridge = Some((id, at, number));
             break;
         }
         game.close_menu();
     }
-    let (fridge, snack) = fridge.expect("the fridge's pie offers Have A Snack");
+    let (fridge, snack, number) = fridge.expect("the fridge's pie offers Have A Snack");
+    let queued = |game: &Game| {
+        let queue = &game.lot().world().objects[&person]
+            .person
+            .as_ref()
+            .unwrap()
+            .queue;
+        queue
+            .iter()
+            .filter(|a| a.target == fridge as i16 && a.table_index == number as i32)
+            .count()
+    };
+    let before = queued(&game);
     game.press(snack);
     assert!(game.menu().is_none(), "choosing closes the pie");
-    let queue = &game.lot().world().objects[&person]
-        .person
-        .as_ref()
-        .unwrap()
-        .queue;
-    assert!(queue.iter().any(|a| a.target == fridge as i16), "{queue:?}");
+    // Have A Snack, not another of the fridge's entries, is queued.
+    assert_eq!(queued(&game), before + 1);
 }
 
 #[test]

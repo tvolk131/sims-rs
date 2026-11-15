@@ -386,6 +386,11 @@ pub struct Menu {
     pie: Pie,
     /// The pie's menus as last laid out, the first menu first.
     layouts: Vec<pie::Layout>,
+    /// The screen they were laid out on.
+    size: [i32; 2],
+    /// Where the pointer is to be moved, as the original moves it, until
+    /// the host takes it.
+    pointer: Option<[i32; 2]>,
 }
 
 /// What a press on an open [`Menu`] did.
@@ -402,25 +407,39 @@ pub enum Press {
 
 impl Menu {
     /// The menu of `entries` opened at `at`, the pointer where the player
-    /// clicked. An entry whose name has a `/` goes into a submenu, and
-    /// only the first [`pie::SHOWN`] of a menu are shown, as the
-    /// original's picker does.
-    pub fn new(person: u16, object: u16, entries: Vec<Entry>, at: [i32; 2]) -> Self {
+    /// clicked, and laid out on a screen of `size` with `art` (which
+    /// holds [`pie::RESOURCES`] and the label font; nothing is laid out
+    /// without the font). An entry whose name has a `/` goes into a
+    /// submenu, and only the first [`pie::SHOWN`] of a menu are shown, as
+    /// the original's picker does. Where the menu had to move to stay on
+    /// the screen, the pointer is to move to its middle.
+    pub fn new(
+        person: u16,
+        object: u16,
+        entries: Vec<Entry>,
+        at: [i32; 2],
+        art: &Art,
+        size: [i32; 2],
+    ) -> Self {
         let names: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
         let pie = Pie::new(&names, at);
-        Self {
+        let mut menu = Self {
             person,
             object,
             entries,
             pie,
             layouts: Vec::new(),
-        }
+            size,
+            pointer: None,
+        };
+        menu.layout(art, size);
+        menu.pointer = menu.layouts.first().filter(|l| l.moved).map(|l| l.center);
+        menu
     }
 
-    /// Lays the menus out on a screen of `size` with `art` (which holds
-    /// [`pie::RESOURCES`] and the label font). Nothing is laid out
-    /// without the font.
+    /// Lays the menus out again on a screen of `size`.
     pub fn layout(&mut self, art: &Art, size: [i32; 2]) {
+        self.size = size;
         self.layouts = self.pie.layout(size, art).unwrap_or_default();
     }
 
@@ -430,13 +449,28 @@ impl Menu {
         (self.layouts.len(), Pie::hit(&self.layouts, point))
     }
 
-    /// A press at `point`, as the picker takes it.
-    pub fn press(&mut self, point: [i32; 2]) -> Press {
+    /// A press at `point`, as the picker takes it. A submenu opened or
+    /// closed is laid out at once, so the next press finds it; the
+    /// pointer is to move to the middle of a submenu that opens (where
+    /// the picker moves it, 0x48d9c0, or where the submenu had to move to
+    /// stay on the screen).
+    pub fn press(&mut self, art: &Art, point: [i32; 2]) -> Press {
         match self.pie.press(&self.layouts, point) {
             Pressed::Chose(choice) => Press::Chose(choice),
-            Pressed::Opened { .. } | Pressed::Back => Press::Stays,
+            pressed @ (Pressed::Opened { .. } | Pressed::Back) => {
+                self.layout(art, self.size);
+                if matches!(pressed, Pressed::Opened { .. }) {
+                    self.pointer = self.layouts.last().map(|l| l.center);
+                }
+                Press::Stays
+            }
             Pressed::Closed => Press::Closed,
         }
+    }
+
+    /// Where the pointer is to be moved, once.
+    pub fn take_pointer(&mut self) -> Option<[i32; 2]> {
+        self.pointer.take()
     }
 
     /// The labels of the menu on top as last laid out, with their boxes:
@@ -545,46 +579,87 @@ mod tests {
         art
     }
 
+    fn named(labels: &[&str]) -> Vec<Entry> {
+        labels
+            .iter()
+            .enumerate()
+            .map(|(n, l)| Entry {
+                label: (*l).into(),
+                ..entry(u32::try_from(n).unwrap())
+            })
+            .collect()
+    }
+
+    fn centre(r: Rect) -> [i32; 2] {
+        [r.x + r.width / 2, r.y + r.height / 2]
+    }
+
+    const STUDIES: [&str; 3] = ["Read a Book", "Study/Cooking", "Study/Mechanical"];
+
     #[test]
     fn a_press_chooses_an_entry_by_its_place_in_the_listing() {
-        let named = |labels: &[&str]| -> Vec<Entry> {
-            labels
-                .iter()
-                .enumerate()
-                .map(|(n, l)| Entry {
-                    label: (*l).into(),
-                    ..entry(u32::try_from(n).unwrap())
-                })
-                .collect()
-        };
-        let centre = |r: sims_ui::frame::Rect| [r.x + r.width / 2, r.y + r.height / 2];
-        let mut menu = Menu::new(
-            1,
-            2,
-            named(&["Read a Book", "Study/Cooking", "Study/Mechanical"]),
-            [400, 300],
-        );
         let art = art();
-        menu.layout(&art, [800, 600]);
+        let mut menu = Menu::new(1, 2, named(&STUDIES), [400, 300], &art, [800, 600]);
+        // Laid out where it opened: the pointer stays.
+        assert_eq!(menu.take_pointer(), None);
         // Two entries in the first menu: the book, and the studies'
         // submenu.
         assert_eq!(menu.layouts.len(), 1);
         assert_eq!(menu.layouts[0].labels.len(), 2);
         let study = centre(menu.layouts[0].labels[1].rect);
         assert_eq!(menu.hovered(study), (1, Some(1)));
-        assert_eq!(menu.press(study), Press::Stays);
-        menu.layout(&art, [800, 600]);
+        assert_eq!(menu.press(&art, study), Press::Stays);
+        // The submenu is laid out at once, and the pointer goes to its
+        // middle.
         assert_eq!(menu.layouts.len(), 2);
+        assert_eq!(menu.take_pointer(), Some(menu.layouts[1].center));
+        assert_eq!(menu.take_pointer(), None);
         // Mechanical, the second entry of the submenu, is the third entry
         // listed.
         let mechanical = centre(menu.layouts[1].labels[1].rect);
         assert_eq!(menu.hovered(mechanical), (2, Some(1)));
-        assert_eq!(menu.press(mechanical), Press::Chose(2));
+        assert_eq!(menu.press(&art, mechanical), Press::Chose(2));
 
-        let mut menu = Menu::new(1, 2, named(&["Read a Book"]), [400, 300]);
-        menu.layout(&art, [800, 600]);
+        let mut menu = Menu::new(1, 2, named(&["Read a Book"]), [400, 300], &art, [800, 600]);
         let book = centre(menu.layouts[0].labels[0].rect);
-        assert_eq!(menu.press(book), Press::Chose(0));
-        assert_eq!(menu.press([5, 5]), Press::Closed);
+        assert_eq!(menu.press(&art, book), Press::Chose(0));
+        assert_eq!(menu.press(&art, [5, 5]), Press::Closed);
+    }
+
+    #[test]
+    fn a_second_press_finds_the_submenu_the_first_opened() {
+        let art = art();
+        let mut menu = Menu::new(1, 2, named(&STUDIES), [400, 300], &art, [800, 600]);
+        let study = centre(menu.layouts[0].labels[1].rect);
+        assert_eq!(menu.press(&art, study), Press::Stays);
+        // Pressed again where Study was, with no drawing between: that is
+        // the submenu's middle, which goes back.
+        assert_eq!(menu.press(&art, study), Press::Stays);
+        assert_eq!(menu.layouts.len(), 1);
+    }
+
+    #[test]
+    fn a_menu_moved_to_stay_on_the_screen_moves_the_pointer() {
+        let art = art();
+        // Opened near the top: the first menu moves down, and so does the
+        // pointer.
+        let mut menu = Menu::new(1, 2, named(&STUDIES), [400, 20], &art, [800, 600]);
+        let first = menu.layouts[0].clone();
+        assert!(first.moved);
+        assert_eq!(menu.take_pointer(), Some(first.center));
+        // A submenu opened from the top entry, near the top, moves down;
+        // the pointer goes to where it moved, not to the entry.
+        let names = ["Study/Cooking", "Study/Mechanical", "Read a Book"];
+        let mut menu = Menu::new(1, 2, named(&names), [400, 130], &art, [800, 600]);
+        assert_eq!(menu.take_pointer(), None);
+        let study = centre(menu.layouts[0].labels[0].rect);
+        assert_eq!(menu.press(&art, study), Press::Stays);
+        let submenu = menu.layouts[1].clone();
+        assert!(submenu.moved, "{submenu:?}");
+        assert_ne!(submenu.center, study);
+        assert_eq!(menu.take_pointer(), Some(submenu.center));
+        // There a press goes back, as it does in the original.
+        assert_eq!(menu.press(&art, submenu.center), Press::Stays);
+        assert_eq!(menu.layouts.len(), 1);
     }
 }
