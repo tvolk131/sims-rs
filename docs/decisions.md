@@ -35,8 +35,9 @@ foreground leaves bones to the base layer. The original's people are
 drawn lighter than ours, and it shows the plumb bob over the selected
 Sim, which is not drawn here; neither is about the base layer.
 
-A state kept before the simulation held the layer (encodings before
-format 25) has none, and the drawing falls back to the stand-in.
+A caller that has no layers for a person (passes None) gets the
+stand-in as before. A state kept before the simulation held the layer
+(encodings before format 25) is refused when loaded, not migrated.
 
 ## 2026-11-15: A lit lamp's pool reaches the walls beside it; grass takes none
 
