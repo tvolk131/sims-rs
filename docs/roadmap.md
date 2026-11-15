@@ -60,10 +60,11 @@ Each step is a few PRs, and each PR leaves `main` green.
   prints the hash. Between updates it draws the house view's frames as far
   as they write the simulation's state (`--frames`, by default before tick
   1, after ticks 1 to 3, after tick 33 and after every 30th tick from
-  there, as three captures recorded). **K = 900 on the Goth house**: our
+  there, as three captures recorded; the fifth also drew after tick 901,
+  see "Ticks 901 to 991"). **K = 991 on the Goth house**: our
   state after every one of ticks 1 to 608 equals the fourth capture of the
   original (full state after every update), and after every one of ticks
-  600 to 900 the fifth, in everything compared, but
+  600 to 991 the fifth, in everything compared, but
   for the last place of one head field, which nothing reads (see "Ticks
   334 to 366"). The
   other captures agree where they hold a state, but for fields that also
@@ -1686,18 +1687,57 @@ tile may be, which only the drawing reads (`0x6c741c`, `0x4b4525`), and
 marks every room for counting and both levels as waiting. The next frame
 draw counts them with the new daylight. What the other subscribers do
 with 0xf8 and 0xdd is **unverified**. In tick 878 the clock goes from
-6:59 to 7:00, dawn to day.
+6:59 to 7:00, but the save already holds day as the time of day (global
+4 is 0 at 6:30, in the capture too), so no signal goes out: no room is
+marked and the lawn does not grow. The first change of the time of day
+is at 18:00.
 
 **K = 900.** Our state after every tick from 878 to 900 equals the fifth
 capture in everything compared, the three random streams included, but
-for the head fields of "Ticks 334 to 366". The rooms marked at 7:00 are
-counted at the next frame draw, after tick 903 in the captures' schedule,
-so these ticks compare the clock and the time of day but not yet the
-recount; the capture holds no rooms, and the recount shows in what reads
-it, each person's room motive (taken every tick) and global 27.
+for the head fields of "Ticks 334 to 366". Rooms marked by earlier
+changes wait for the next frame draw, which in the fifth capture came
+after tick 901 (see "Ticks 901 to 991"); the capture holds no rooms, and
+the recount shows in what reads it, each person's room motive (taken
+every tick) and global 27.
 
 **Stops.** Tick 901: object 8 reads job data indexed by temps 0 and 1
 (scope 33), which is not ported.
+
+### Ticks 901 to 991
+
+**Job data** (scope 33, `0x4531fb`, `memory.rs`). My temp 0 names a
+career and temp 1 its level; for career -1 the level is 0. The career is
+looked up by ID in the list at `0x6de848` (`0x404cb3`; none is native
+error 0x39), and a field of the level read (`0x40362f`; no such level or
+field is 0x3a), as a value with no word pointer, cut to a word. Field 0
+is the number of levels, whatever the level; fields 1 to 21 are the
+level's 21 numbers in another order, and field 22 whether its second
+string is not empty (`job_field`). The list holds one career for each CARR
+chunk of `work.iff`, in resource order, its ID the chunk's ID
+sign-extended (`0x403e3f` to `0x403f1f`), with the levels the chunk holds
+(`0x4035e7`); `Program::careers` now keeps the levels too. A
+`Careers.txt` replaces the list through a loader that is not ported
+(`0x4036e8`), and then the scope fails loudly.
+
+**The frame after tick 901.** In the fifth capture person 16's room
+motive goes from 19.29 to 36.94 in tick 902, the rooms waiting since
+earlier changes (0, 1, 3 and 4 in ours) having been counted before it.
+A frame drawn after tick 901 gives that; the default schedule's next
+frame, after tick 903, gives it two ticks late. A frame after tick 601 instead gives a room motive in ticks 602 and
+603 that the capture does not have, so the fifth capture still drew after
+tick 603, and its schedule moved by two ticks somewhere between 603 and
+901 (whether it also drew after tick 873 cannot be told: nothing waited).
+When the game draws is its main loop's business, so this is the input,
+not the simulation: comparisons with the fifth capture past tick 901 draw
+`0,1,2,3,33+30,901`.
+
+**K = 991.** With that frame, our state after every tick from 901 to 991
+equals the fifth capture in everything compared, but for the head fields
+of "Ticks 334 to 366".
+
+**Stops.** Tick 992: object 21 snaps (tree 0x2017 node 5) to a slot
+without flag 0x800, whose placement checks the lot's border, the room
+and the walls in the way (`0x4550d8`), which is not ported.
 
 ## Track: drawing people (`crates/sims-people`)
 
