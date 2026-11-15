@@ -63,9 +63,14 @@ pub fn encode_name(name: &str) -> Option<Vec<u8>> {
     (!unmappable).then(|| bytes.into_owned())
 }
 /// The reverse of [`encode_name`]: a name the original holds, read in the
-/// Windows-1252 code page.
+/// Windows-1252 code page. Every byte is read as itself: a leading
+/// byte-order mark is three characters of the name, as the original's
+/// byte comparison sees it, not a sign of another encoding.
 pub fn decode_name(name: &[u8]) -> String {
-    encoding_rs::WINDOWS_1252.decode(name).0.into_owned()
+    encoding_rs::WINDOWS_1252
+        .decode_without_bom_handling(name)
+        .0
+        .into_owned()
 }
 pub fn directory(data: &[u8], file_len: u64) -> Result<Vec<Entry>> {
     let mut r = Reader::new(data);

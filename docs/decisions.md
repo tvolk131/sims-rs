@@ -20,7 +20,8 @@ the way the original builds them at start-up (floors 0x4a01cb, walls
   its file-table order, going into each subdirectory where its name
   falls (0x412699; the catalog scan asks for every directory, 0x412863).
   A file is known by its file name alone, read in Windows-1252 as a
-  house's map names it.
+  house's map names it, byte for byte: a leading byte-order mark is part
+  of the name, as the original's byte comparison sees it.
 - A file's pattern count is a third of its `SPR2` (floors) or `SPR#`
   (walls) chunks, and a file with none is left out.
 - Each pattern takes the next key from a free list seeded with
