@@ -1436,6 +1436,35 @@ fn play_trk_hands_on_the_arguments_and_source_and_kill_trk_ends_the_whole_track(
 }
 
 #[test]
+fn play_trk_reads_source_through_the_target_but_the_arguments_from_its_own() {
+    // Track 10 asks about arg1's field arg2, then arg3's field `source`,
+    // every block. Track 14 holds `source` 6 and loops.
+    let mut asker = vec![SET_LOOP];
+    asker.extend([GETSRCDATAFIELD, 6, 1, 2, GETSRCDATAFIELD, 6, 3, 47, LOOP]);
+    let mut holder = loadb(47, 6).to_vec();
+    holder.extend([SET_LOOP, LOOP]);
+    // Track 15: arg2 = 7, arg3 = 8, source = 5, all its own, then targets
+    // track 14 and plays track 10.
+    let mut starter = [
+        loadb(2, 7),
+        loadb(3, 8),
+        loadb(47, 5),
+        loadb(53, 14),
+        loadb(5, 10),
+    ]
+    .concat();
+    starter.extend([PLAY_TRK, 5, END]);
+    let module = module_of_tracks(&[(10, &asker), (14, &holder), (15, &starter)], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e14");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "e15");
+    assert_eq!(asked_in_a_block(&mut player), []);
+    assert_eq!(asked_in_a_block(&mut player), [(8, 6), (9, 7)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
 fn mp3_patches_play_at_the_output_rate() {
     use sims_audio::player::resample;
     let pcm = Pcm {
