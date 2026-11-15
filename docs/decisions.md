@@ -35,6 +35,72 @@ autonomy's, as `Interpreter::callback` already did; its words can
 become a later frame's locals. The Goth house's first 1000 ticks are
 unchanged by it.
 
+## 2026-11-15: The game's pie menu is a list of the table's entries until the simulation offers them
+
+Clicking an object (or a person) in `sims-game` lists the entries of
+the interaction table `Lot::queue_interaction` queues from: that of the
+tile the simulation sends the order to (a multi-tile object's tile whose
+definition's word 8 is positive sends it to the tile whose word 8 is
+that number negated, as `interaction_target`, 0x435286, does), read with
+`Program::interactions`. Each menu number is listed once, in table
+order, named by the TTAs string table with the same ID as that TTAB, in
+the file that holds it. The game repeats the simulation's choice of
+tile and of TTAB ID from the program's public data, because the
+simulation keeps both private; it names the entries only when the table
+it finds is the very one `Program::interactions` returns.
+
+The original offers only the entries whose check passes for the selected
+Sim; that check is not run, so the list can hold entries the original
+would not offer, and choosing one queues it anyway. Entries with flag
+0x80 are hidden: every Debug and Force entry of the Goths' house has it
+and nothing a player is offered there does (**unverified** as the
+original's debug flag). The menu is a plain list at the pointer, not the
+original's pie: in columns when taller than the view, and as many
+columns as fit, the last row then saying how many entries are not shown.
+A dialog closes it. Reopen when the simulation can list the entries it
+would offer, or `sims-ui` draws the pie.
+
+## 2026-11-15: The game plays the lot's sound requests as it wakes
+
+`sims-game` takes each step's `Update::sounds` and hands them, in
+order, to `sims-audio`'s player in the same wake of the window that ran
+the step (it wakes every few milliseconds). What is heard comes later by
+the output the player has already rendered, up to about 0.2 s. In strict
+mode, a step whose frame fails after its tick still hands its sounds
+over. `Play`
+is `Play` and `Stop` is `StopObject`. The simulation's 16-bit object ID
+is widened without its sign (**unverified**: what the original passes
+for a negative ID). Until the host takes them, the game keeps at most
+4096 requests, dropping the oldest, so a host that never plays sound
+does not grow without end. `begin_route` and `end_route`, which Go To
+Routing Slot requests, find no event in the install's sound files; the
+player records a fault and plays nothing, which may be what the
+original does too (**unverified**).
+
+## 2026-11-15: The game can run the lot in play mode; strict stays the default
+
+`sims-game` steps the lot with `Lot::step` by default, which stops at
+the first error, so what it plays is exactly what the captures check.
+`--play` (`Options::play`) steps with `Lot::step_play` instead: an
+object whose tick fails is reset (as the original resets an object after
+a SimAntics error) and the lot goes on, so a human can play past the
+first unported primitive. A lot played that way is not one to compare
+with the original.
+
+In play mode each new error caught is printed and written across the top
+for 200 ticks (10 s at normal speed) with a running count. The same
+error again at a later tick (or a frame skipped the same way again) is
+only counted, so one that recurs every frame does not hold the line
+open. The first 256 different errors are listed, later ones only
+counted; after 4096 different errors every new one is only counted, as
+it can no longer be told from its repeats. A failure play mode does not
+catch still stops the lot. An error caught in a step that then fails is
+not logged: `Lot::step_play` returns the failure without the step's
+update. Within a step the log keeps the order things happened in: the
+frame before the first tick, the objects' errors, the frame after the
+tick (a single skipped frame on the first step is taken to be the one
+before it, which the update does not say).
+
 ## 2026-11-15: People's meshes go into the lot renderer's canvas
 
 `People::draw_on_lot` draws a lot's people into the canvas

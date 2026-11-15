@@ -2091,29 +2091,60 @@ through their public interfaces only; the simulation never depends on it.
   every tick; the clock, funds and needs on the panel are the live
   world's. The panel's speed, pause and camera buttons work (the game
   paces the lot; the simulation's own speed global is not touched).
-  When a step fails, the lot stays on screen as it was and the failure
-  is written across the top: today that is tick 878, where the hour
-  turns. `--png <file> --ticks N` draws one frame without a window.
+  The first error stops the lot, which stays on screen as it was with
+  the failure across the top. `--play` runs it in play mode instead: an
+  object whose tick fails is reset and the lot goes on, and each new
+  error is printed and shown across the top for a while; only a failure
+  play mode does not catch stops it. In play mode the Goths' house runs
+  12,000 ticks (ten minutes at normal speed) without stopping, through
+  about a dozen different caught errors; in strict mode it stops after
+  tick 1102 (the animator turning by less than a step, 0x58dfc0).
+  `--png <file>
+  --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
   default device (on macOS; elsewhere with the `sound` feature, so CI
   needs no audio library; `--mute` turns it off). A thread renders
   22,050 Hz stereo ahead of the device and the game never waits on it.
   The ambience follows the clock's hour (global 0), and the sound
-  scripts' speed register follows the game's speed. What plays waits on
-  the simulation's sound events.
-- **Next:** pie menus and player orders, once the simulation's hooks
-  land: a play-mode step that resets an object on a script error, a
-  `Lot` API to queue an interaction (person, object, TTAB entry) and
-  read an object's pie-menu entries, and sound events drained each tick.
+  scripts' speed register follows the game's speed.
+- **Done: the lot's sounds.** Each step's sound requests
+  (`Update::sounds`) go to the player as the window wakes: a door opens,
+  a book comes off the shelf, the fountain tinkles. `begin_route` and
+  `end_route` have no event in the install's sound files and play
+  nothing.
+- **Done: a stopgap pie menu.** Clicking an object or a person opens a
+  list of the interactions an order on it is queued from (those of the
+  tile the simulation sends a multi-tile object's orders to; each menu
+  number once, named by that table's TTAs strings, debug entries
+  hidden); choosing one
+  queues it for the selected Sim with `Lot::queue_interaction`, and the
+  note across the top says whether it was queued. Escape closes the
+  menu. The fridge lists Have A Snack, Have Lite Meal, Have A Meal,
+  Serve Meal; the bookshelf lists Read a Book and the studies.
+- **Blocked: Mortimer doing what he is told.** The order is queued, but
+  on his next tick Idle For Input fails on starting the queued action
+  (0x45dc14, not ported). In strict mode that stops the lot; in play
+  mode he is reset and the queue empties.
+  That is the simulation's next step toward the done criterion.
+- **Next:** the menu from the simulation's pie-menu entries (the check
+  each entry runs, which the stopgap skips) once that accessor lands;
+  then a real pie.
 - **Needs from other crates:**
   - `sims-render`: which object drew each pixel (an object ID buffer
     beside the depth), so a click picks the object under it. Today
     `sims-game` guesses from each object's tile.
   - `sims-vm`: a way to answer a dialog from the window (the `Lot`'s
     player is a fixed answer list given at load), and to change the
-    game's speed global.
+    game's speed global. A play-mode step that fails should still hand
+    back the errors it caught before failing, and say which frame
+    (before or after the tick) was skipped.
   - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
-    and dialogs are.
+    and dialogs are. `sims-game` draws a plain list until then.
+  - `sims-vm`: Idle For Input starting a queued action (0x45dc14), and
+    the entries the pie menu offers a person on an object, with their
+    labels' table. Until then, the tile an order on an object goes to
+    (`interaction_target`) and the ID and file of the TTAB it is queued
+    from, which `sims-game` now repeats from the program's data.
 
 ## Working rules
 

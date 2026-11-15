@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! sims-game [<install>] [<house file>] [--answers A,B,...] [--mute]
-//!           [--png <file> [--ticks N] [--size WxH]]
+//!           [--play] [--png <file> [--ticks N] [--size WxH]]
 //! ```
 //!
 //! The install defaults to `SIMS_INSTALL`, and the house to the Goths'
@@ -15,6 +15,16 @@
 //! wheel zoom, `[`/`]` or `,`/`.` rotate, Page Up and Page Down change the
 //! floor, `1`/`2`/`3` walls up, cutaway and down, the arrows or a
 //! right-button drag scroll, space pauses, Escape quits.
+//!
+//! A left click on a person or an object opens its menu for the selected
+//! Sim; a click on an entry queues it, and a click anywhere else, or
+//! Escape, closes the menu. Escape quits only when no menu is open, and a
+//! held Escape's repeats do nothing.
+//!
+//! The lot runs in strict mode: the first error stops it, and the error
+//! is written across the top. `--play` runs it in play mode instead: an
+//! object whose tick fails is reset and the lot goes on, and each new
+//! error is printed and shown across the top for a while.
 //!
 //! Sound plays on the default output device (on macOS, or built with the
 //! `sound` feature) unless `--mute` is given.
@@ -29,7 +39,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use sims_game::game::goth_house;
-use sims_game::sound::Input;
+use sims_game::sound::{self, Input};
 use sims_game::view::Move;
 use sims_game::{Game, Options};
 use sims_render::{Walls, png};
@@ -101,13 +111,14 @@ struct Still {
 
 fn options() -> Result<(Options, Option<Still>, bool), String> {
     let usage = "usage: sims-game [<install>] [<house file>] [--answers A,B,...] [--mute] \
-                 [--png <file> [--ticks N] [--size WxH]]";
+                 [--play] [--png <file> [--ticks N] [--size WxH]]";
     let mut paths = Vec::new();
     let mut answers = None;
     let mut png = None;
     let mut ticks = 0;
     let mut size = [800, 600];
     let mut mute = false;
+    let mut play = false;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         let mut text = |name: &str| -> Result<String, String> {
@@ -117,6 +128,8 @@ fn options() -> Result<(Options, Option<Still>, bool), String> {
         };
         if arg == "--mute" {
             mute = true;
+        } else if arg == "--play" {
+            play = true;
         } else if arg == "--png" {
             png = Some(PathBuf::from(text("--png")?));
         } else if arg == "--ticks" {
@@ -164,6 +177,7 @@ fn options() -> Result<(Options, Option<Still>, bool), String> {
             install,
             house,
             answers,
+            play,
         },
         still,
         mute,
@@ -182,6 +196,8 @@ struct App {
     photos: usize,
     /// The stop already printed, so it is printed once.
     reported: bool,
+    /// How many of the game's caught errors are printed.
+    printed: usize,
     sound: Sound,
     /// The hour and speed the sound was last told.
     heard: Option<(u32, Speed)>,
@@ -249,6 +265,16 @@ impl App {
         let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         let ran = self.game.advance(micros);
         let mut redraw = ran > 0;
+        let sounds = self.game.take_sounds();
+        if !sounds.is_empty() {
+            self.sound.send(Input::Events(
+                sounds.into_iter().map(sound::event).collect(),
+            ));
+        }
+        for error in &self.game.errors()[self.printed..] {
+            eprintln!("sims-game: error caught: {error}");
+        }
+        self.printed = self.game.errors().len();
         if !self.reported
             && let Some(stop) = self.game.stopped()
         {
@@ -371,7 +397,15 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if event.logical_key == Key::Named(NamedKey::Escape) {
-                    event_loop.exit();
+                    // Escape closes the pie menu, else quits. A repeat
+                    // does neither, so holding Escape to close a menu does
+                    // not quit.
+                    if event.repeat {
+                    } else if self.game.close_menu() {
+                        self.changed(true);
+                    } else {
+                        event_loop.exit();
+                    }
                 } else {
                     self.key(&event.logical_key);
                 }
@@ -453,6 +487,13 @@ fn run() -> Result<(), String> {
             "sims-game: ran {ran} ticks in {:.1} s",
             started.elapsed().as_secs_f32()
         );
+        for error in game.errors() {
+            eprintln!("sims-game: error caught: {error}");
+        }
+        let sounds = game.take_sounds();
+        if !sounds.is_empty() {
+            eprintln!("sims-game: {} sound requests, not played", sounds.len());
+        }
         if let Some(stop) = game.stopped() {
             eprintln!("sims-game: {stop}");
         }
@@ -477,6 +518,7 @@ fn run() -> Result<(), String> {
         dirty: true,
         photos: 0,
         reported: false,
+        printed: 0,
         sound: Sound::start(&options.install, mute),
         heard: None,
     };
