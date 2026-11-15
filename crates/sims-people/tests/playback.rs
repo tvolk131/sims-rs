@@ -9,7 +9,7 @@ use sims_core::F32;
 use sims_people::math::Vec3;
 use sims_people::raster::{Camera, Canvas};
 use sims_people::{Assets, Body, Library, Player, base_clip, placement, residents};
-use sims_sim::animator::{Animator, Layer};
+use sims_sim::animator::{Animator, Base, Layer};
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
@@ -71,7 +71,7 @@ fn the_standing_loop_and_the_walk_load_with_their_samples() {
 fn animator(clock: i32, walk: Option<(&str, f32)>, library: &Library, assets: &Assets) -> Animator {
     let mut animator = Animator::new(clock);
     animator.position = [0.0, 0.0, 3.0].map(F32::from_f32);
-    animator.base = true;
+    animator.base = Base::Posture;
     if let Some((clip, phase)) = walk {
         let loaded = library.load(assets, clip).unwrap();
         let mut layer = Layer::start(
@@ -159,4 +159,40 @@ fn the_goth_family_stands_and_walks() {
             "21 walk c142d22ffc41627349475badbb628e67f7ac9390538cb8a0f0753bd0e3bb351b",
         ]
     );
+}
+
+/// A clip a script put in the base slot plays from when it started
+/// (0x597a88: the layer's clock starts at the animator's, its phase at 0,
+/// or 1 backward), not from the clock's zero as the posture's clip does.
+#[test]
+fn a_scripts_base_clip_plays_from_its_start() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let people = residents(&root, &house).unwrap();
+    let assets = Assets::scan(&root).unwrap();
+    let library = Library::scan(&assets).unwrap();
+    let mut player = Player::new(&assets, &library);
+    let resident = &people[0];
+    let body = Body::load(&assets, &resident.skeleton, &resident.outfit).unwrap();
+    let clip = base_clip(&resident.person, &resident.skeleton);
+    let mut pose = |clock: i32, base: Base| {
+        let mut animator = Animator::new(clock);
+        animator.base = base;
+        player.pose(&body.skeleton, &animator, &clip).unwrap()
+    };
+    let script = |reverse: bool, start: i32| Base::Script {
+        clip: clip.clone(),
+        reverse,
+        start,
+    };
+    // Forward, started at 500, it is at its first frame at 500, as the
+    // posture's clip is at 0, and not 500 ms in.
+    let posture_start = pose(0, Base::Posture);
+    assert_eq!(pose(500, script(false, 500)), posture_start);
+    assert_ne!(pose(500, script(false, 0)), posture_start);
+    // 250 ms after its start it is where the posture's clip is at 250.
+    assert_eq!(pose(750, script(false, 500)), pose(250, Base::Posture));
+    // Backward, it starts at its end whenever it started.
+    assert_eq!(pose(500, script(true, 500)), pose(0, script(true, 0)));
+    assert_eq!(pose(1250, script(true, 1000)), pose(250, script(true, 0)));
 }

@@ -79,6 +79,81 @@ carry clip (0x26, 0x5903fc) is not ported". An install test pins this.
 Strict mode on the Goth house is unchanged. Reopen when a recording of
 the snack order disagrees, or when a script spends in category 8.
 
+## 2026-11-15: Generic Sims Call routine 15 copies temp 0 into person word 72; the footprint is worked out after word 73 is cleared
+
+**Unverified.**
+
+Routine 15 (0x44fe3c; the Generic Sims Call jump table at 0x45143a)
+casts the running object to a person (0x635abe; a failed cast throws,
+native error 0x1c). It copies temp 0 (object +0x3a, the word routine 28
+reads its lot from) into person data word 72 (+0x61c) and clears word 73
+(+0x61e). When temp 0 is 0 it then works out the person's footprint
+again where it stands (0x433d16 with +0xf4 and +0x100, its width through
+0x43519f). That reuses the footprint that placement already ports. Word
+73 is cleared first, so the footprint never takes the even-facing
+extension from it. When temp 0 is set the footprint is kept, whatever
+word 73 held before.
+
+The port works the footprint out before it writes anything, from the
+person's words as they will be, so a footprint that fails loudly (a
+facing outside 0 to 7) leaves the person as it was. The original cannot
+fail there.
+
+The Goth house's social pick runs it once, at tick 48, on person 21 with
+temp 0 at 8, so only the copy and the clear are reached. The footprint
+branch is checked only by the synthetic tests. No capture covers the
+pick. The social now runs to tick 261, where it stops on scope 24 field
+9 (a neighbor's family's friend count, through the family friend-count
+cache). That needs state the World does not hold yet. Reopen if a
+capture of the pick disagrees.
+
+## 2026-11-15: Animate Sim on the base slot is the carry slot's twin; a script's base clip stays until the posture changes
+
+**Unverified.**
+
+Animate Sim with flag bit 0x01 alone (0x58957e; the slot picker 0x47ec4c
+returns 1) works on the base slot (animator +0x14) the way flag 0x10
+works on the carry slot. It never yields and always takes the true branch
+(0x589c4e). Clip 0 clears the slot (virtual function 0x104, 0x592878).
+The base slot's layer is always removed at once, even where the other
+slots could fade (0x592890). Any other clip is looked up (virtual
+function 0x12c, 0x5893b3), the slow flag (+0xa8) set from flag 0x80, and
+the clip started in the base slot (virtual function 0x100, 0x592726),
+backward with flag 0x02, to repeat at priority -10 (0x59867f). That is
+what the posture's own base clip gets. Unlike the carry slot, no mode or
+selection is written.
+
+The base slot used to be a flag, since only the posture's clip went
+there. It is now `Base`: empty, the posture's clip, or a clip a script
+started, with its name, direction and the animator's clock at its
+start. Drawing plays it from that start (0x597a88: the layer's clock
+starts at the animator's, its phase at 0, or 1 backward), not from the
+clock's zero. `Empty` and `Posture` encode as
+`false` and `true` did, so existing states and snapshots hash and decode
+as before. The animator's base update (0x590430) treats a script's layer
+like any other: a change of posture clears it. Otherwise it stays for a
+person of kind (word 65) at most 1, and for any other kind the posture's
+clip replaces it, unless bit 2 of definition word 102 is set. Animate Sim
+does not touch the posture noted (+0x198), so after clip 0 the next base
+update starts the posture's clip again. The head's measurement checks a
+script's base clip against the foreground as it checks the posture's.
+
+Beyond a script's start, the base layer's clock and its place in the
+skin's list are still not kept. A new layer goes in before the first
+layer above priority 1 (0x599128) and only then takes -10, so it may
+come before or after the foreground layer; the skin's update sorts its
+layers by priority first (0x5991fd), so the base updates first anyway. That matters only for timed events, so a script's base
+clip with timed events fails loudly (0x5992b3), as the posture's does.
+The original goes on past a clip it cannot find (0x452bed reports it);
+here that fails, as it does for the other slots.
+
+**On Goth.** The social person 16 picks clears object 16's base slot
+(clip 0, source byte 2, which clip 0 never reads) in the next update.
+The lot then runs 46 updates and stops at tick 48 on object 21, tree
+0x2025 node 13, Generic Sims Call routine 15 (0x44fe3c). Strict mode on
+the Goth house is unchanged. Reopen when the harness records a social,
+or when a script plays a base clip with timed events.
+
 ## 2026-11-15: Snap mode 4 snaps to one of the lot's global routing slots; an action pushed to the front goes first
 
 **Unverified.** Snap (opcode 46) mode 4 (0x454ab6) names its slot by

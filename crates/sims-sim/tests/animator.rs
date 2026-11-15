@@ -2,7 +2,7 @@
 //! 0x598636, 0x597c4c). Synthetic; no game data.
 
 use sims_core::{Ext, F32};
-use sims_sim::animator::{Advance, Animator, LOADED, Layer, UNSET};
+use sims_sim::animator::{Advance, Animator, Base, LOADED, Layer, UNSET};
 
 const THOUSAND: F32 = F32::from_bits(0x447a_0000);
 
@@ -176,7 +176,7 @@ fn a_new_animator_stands_unplaced_with_no_posture() {
     assert_eq!((a.state, a.arrival, a.posture), (3, 0, -1));
     assert_eq!(a.position, [UNSET; 3]);
     assert_eq!(a.destination, [F32::ZERO; 3]);
-    assert!(!a.base && a.foreground.is_none() && !a.playing);
+    assert!(!a.base.is_filled() && a.foreground.is_none() && !a.playing);
     assert_eq!((a.selection, a.carry_selection, a.carry_mode), (-1, -1, 0));
     // Only a reset raises the next foreground clip's priority.
     assert!(!a.promote);
@@ -194,7 +194,7 @@ fn a_reset_unplaces_the_animator_and_drops_its_posture() {
         position: [off_lot, off_lot, F32::ZERO],
         destination: [off_lot, off_lot, F32::ZERO],
         posture: 0,
-        base: true,
+        base: Base::Posture,
         carry_mode: 1,
         state: 0,
         events: vec![3],
@@ -211,7 +211,7 @@ fn a_reset_unplaces_the_animator_and_drops_its_posture() {
         (a.posture, a.carry_mode, a.carry_selection, a.state),
         (-1, 0, -1, 3)
     );
-    assert!(!a.base && a.skin_dirty);
+    assert!(!a.base.is_filled() && a.skin_dirty);
     assert!(a.events.is_empty() && !a.playing);
     assert!(a.promote && a.profile_stale);
     // The load's state is a new animator reset.

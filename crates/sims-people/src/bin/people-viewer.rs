@@ -46,7 +46,7 @@ use sims_people::{
     Assets, Body, Cast, Library, Player, Resident, base_clip, placement, residents, walk_clip,
 };
 use sims_sim::World;
-use sims_sim::animator::{Animator, Layer};
+use sims_sim::animator::{Animator, Base, Layer};
 use sims_vm::boot::{Frames, Lot};
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
@@ -227,7 +227,7 @@ fn demonstration(x: f32, clock: i32, walk: Option<(&str, f32, u32)>) -> Animator
     let mut animator = Animator::new(clock);
     // Direction 3 faces the viewer.
     animator.position = [x, -x, 3.0].map(F32::from_f32);
-    animator.base = true;
+    animator.base = Base::Posture;
     if let Some((clip, duration, frames)) = walk {
         let mut layer = Layer::start(clip, F32::from_f32(duration), frames, true, 0, false, clock);
         layer.mode = 1;
