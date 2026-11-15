@@ -72,7 +72,7 @@ fn magic_town_as_the_original_shows_it() {
         })
     );
 
-    // The digest pins the drawing; docs/decisions.md says how it compares
+    // The digest pins the drawing; docs/decisions/ says how it compares
     // with the original's screen.
     let mut frame = Frame::new(800, 600, [0, 0, 0]);
     dialog::draw(&mut frame, &art, &message, &layout, None);

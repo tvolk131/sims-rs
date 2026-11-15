@@ -9,8 +9,9 @@
 //!
 //! The layout is the original's (0x523fe3, 0x524257, 0x535266), read
 //! from the exe and checked against a screenshot of the original at 800
-//! by 600 (the Magic Town notice on the Goth house); `docs/decisions.md`
-//! says what is read and what is inferred.
+//! by 600 (the Magic Town notice on the Goth house);
+//! `docs/decisions/20261115-message-dialog-layout.md` says what is read
+//! and what is inferred.
 
 use crate::art::{Art, KEY};
 use crate::command::Command;
