@@ -196,11 +196,20 @@ impl Game {
                     for line in in_order(at == 1, &update.errors, &update.frame_errors) {
                         self.errors.push(at, line);
                     }
-                    self.sounds.extend(update.sounds);
-                    let over = self.sounds.len().saturating_sub(SOUNDS_KEPT);
-                    self.sounds.drain(..over);
+                    self.keep_sounds(update.sounds);
                 }
-                Err(error) => self.stop(&error),
+                Err(error) => {
+                    // A strict step whose frame failed after its tick ran
+                    // still made that tick's sounds.
+                    if let StepError::Frame {
+                        update: Some(update),
+                        ..
+                    } = &error
+                    {
+                        self.keep_sounds(update.sounds.clone());
+                    }
+                    self.stop(&error);
+                }
             }
         }
         if ran > 0 || self.stopped.is_some() {
@@ -218,6 +227,14 @@ impl Game {
             }
         }
         ran
+    }
+
+    /// Keeps a step's sound requests for the host, at most
+    /// [`SOUNDS_KEPT`], the oldest dropped first.
+    fn keep_sounds(&mut self, sounds: Vec<SoundEvent>) {
+        self.sounds.extend(sounds);
+        let over = self.sounds.len().saturating_sub(SOUNDS_KEPT);
+        self.sounds.drain(..over);
     }
 
     fn stop(&mut self, error: &StepError) {

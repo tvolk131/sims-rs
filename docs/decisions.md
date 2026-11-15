@@ -8,7 +8,8 @@ says what was decided, why, and what would reopen it. Entries marked
 
 `sims-game` takes each step's `Update::sounds` and hands them, in
 order, to `sims-audio`'s player the next time the window wakes (every
-few milliseconds), so a sound starts within a wake of its tick. `Play`
+few milliseconds), so a sound starts within a wake of its tick; in strict mode, a step
+whose frame fails after its tick still hands its sounds over. `Play`
 is `Play` and `Stop` is `StopObject`. The simulation's 16-bit object ID
 is widened without its sign (**unverified**: what the original passes
 for a negative ID). Until the host takes them, the game keeps at most
