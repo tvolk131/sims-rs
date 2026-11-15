@@ -34,6 +34,12 @@ An object with wall rules is still refused before this test, except in
 a container, so for now only the other object's side can be other than
 none, and the two only share the tile.
 
+The door test when an object is placed or taken off (0x433427,
+0x4332b7) reads word 69 of the same definition the object stands for,
+not its own, and now does too (`master_words`). A tile of a group whose
+own word 69 differs from its master's would otherwise mark or clear its
+tile's door flag wrongly. No house run changed.
+
 With it the house runs to tick 641, where object 195 (tree 0x1009 node
 11) runs Snap in mode 1, which is not ported.
 

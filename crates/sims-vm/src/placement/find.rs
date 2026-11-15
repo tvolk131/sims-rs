@@ -1376,26 +1376,13 @@ impl Interpreter<'_> {
         let mine = wall_side(world, id).map_err(fail)?;
         let their_side = wall_side(world, other).map_err(fail)?;
         let kind = |object: u16| -> Result<bool, Fault> {
-            let guid = world
-                .objects
-                .get(&object)
-                .ok_or_else(|| fail(missing()))?
-                .guid;
-            let definition = self
-                .catalog
-                .object(guid)
-                .ok_or_else(|| fail(Trap::Invalid(format!("object {object} has no definition"))))?;
             let words = self
-                .program
-                .master_definition(definition.resource, definition.chunk)
-                .map_err(|e| fail(Trap::Invalid(e)))?
-                .ok_or_else(|| {
-                    fail(Trap::Unsupported(format!(
-                        "object {object}'s group has no master definition in its file, and \
-                         the test of two objects that are not solid reads through a null \
-                         pointer (0x45728d, 0x433ac5)"
-                    )))
-                })?;
+                .master_words(
+                    world,
+                    object,
+                    "the test of two objects that are not solid (0x433ac5)",
+                )
+                .map_err(fail)?;
             Ok(words[DEFINITION_KIND] == 2)
         };
         let same_kind = kind(id)? == kind(other)?;
