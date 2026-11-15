@@ -31,10 +31,14 @@ disassembly; none of it is checked against a run.
   and the clock stands. `Lot::pause` and `Lot::unpause` do this. The
   window goes on stepping a paused lot. Strict mode on the Goths' house
   runs 200 paused ticks, and its clock stands through them.
-- The speed buttons run a paused game again before they set the speed
-  (`0x53a62a`, `0x53a6ad`, `0x53a728`, in live mode). A button for the
-  speed the game already has does not call the setter (`0x4ce588`), so
-  the time owed carries on. Sol's review found both.
+- In live mode the speed buttons (`0x53a62a`, `0x53a6ad`, `0x53a728`)
+  also run a paused game again. They ask the interface for it
+  (`0x4cee4a`), which applies the speed first and then the unpause
+  (`0x4ce5cc`, `0x46d83a`). `Game::set_speed` does the two the other
+  way round. Both clear the same clocks with no tick between, so the
+  order makes no difference. A button for the speed the game already
+  has does not call the setter (`0x4ce588`), so the time owed carries
+  on. Sol's review found both.
 - **Unverified:**
   - The pause is refused while a field of the interface
     (`[0x6f2a58]+0x7c`) is not 0. Here it is never refused.

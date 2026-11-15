@@ -209,7 +209,8 @@ impl Game {
 
     /// Sets the game's speed, as the panel's speed buttons do in live
     /// mode (`0x53a62a`, `0x53a6ad`, `0x53a728`): a paused game runs
-    /// again, then the simulation's speed ([`Lot::set_speed`]) and the
+    /// again (the original applies it after the speed; both restart the
+    /// same clocks, so the order does not matter), and the simulation's speed ([`Lot::set_speed`]) and the
     /// time between ticks with it are set, unless the speed is already
     /// the one asked for (`0x4ce588`), when the time owed carries on. A
     /// lot that cannot take it keeps its speed, and the note across the
