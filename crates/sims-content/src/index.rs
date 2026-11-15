@@ -117,6 +117,9 @@ pub struct Index {
 }
 
 impl Index {
+    /// The name of the mount [`Index::add_characters`] adds.
+    pub const CHARACTERS: &'static str = "Characters";
+
     /// Lists the install's mounts in the order the original scans them for
     /// objects.
     ///
@@ -155,7 +158,7 @@ impl Index {
         self.mounts.insert(
             number,
             Mount {
-                path: "Characters".to_owned(),
+                path: Self::CHARACTERS.to_owned(),
                 recursive: true,
             },
         );

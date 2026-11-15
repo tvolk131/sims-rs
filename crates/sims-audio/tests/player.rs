@@ -1251,18 +1251,416 @@ fn kill_all_and_kill_object_sounds_events() {
 
 #[test]
 fn kinds_that_do_nothing_and_kinds_not_ported() {
-    let events = "debug=44,0\nempty=29,10\nnone=1907,10\nmusic=36,0,1\npiano=43,10\n";
+    let events = "debug=44,0\nempty=29,10\nnone=1907,10\nreload=104,10\n";
     let module = module_with(&[&GENERIC], 1, 10, events);
     let mut player = Player::new(vec![module], samples(), 1);
     for name in ["debug", "empty", "none"] {
         play(&mut player, name);
     }
     assert!(player.faults.is_empty() && player.is_idle());
-    play(&mut player, "music");
+    play(&mut player, "reload");
+    assert_eq!(player.faults.len(), 1);
+    assert!(player.faults[0].contains("kind 104 is not one"));
+}
+
+/// Object 9 is on the screen right of the middle; every object's field 5
+/// is 42. Records what is asked, as [`Asked`] does.
+#[derive(Default)]
+struct PianoRoom(std::cell::RefCell<Vec<(i32, i32)>>);
+
+impl Sources for PianoRoom {
+    fn field(&self, source: i32, field: i32) -> Option<i32> {
+        self.0.borrow_mut().push((source, field));
+        Some(if field == 5 { 42 } else { 0 })
+    }
+
+    fn position(&self, object: i32) -> Option<[i32; 3]> {
+        (object == 9).then_some([40, 56, 1])
+    }
+
+    fn projection(&self, object: i32) -> Option<Projection> {
+        (object == 9).then_some(Projection {
+            at: [600, 300],
+            screen: [800, 600],
+            zoom: 1,
+            shown_level: 1,
+        })
+    }
+}
+
+#[test]
+fn the_piano_plays_where_its_object_is_and_sets_the_skill() {
+    use sims_audio::player::{PIANO, PIANO_SKILL};
+    // Both tracks ask about their first argument, as the fields their
+    // `extvol` and `pan`: the piano every block, the skill once.
+    let mut piano = vec![SET_LOOP];
+    piano.extend([GETSRCDATAFIELD, 6, 1, 19, GETSRCDATAFIELD, 6, 1, 20, LOOP]);
+    let skill = [GETSRCDATAFIELD, 6, 1, 19, GETSRCDATAFIELD, 6, 1, 20, END];
+    let events = "piano=43,0\nunplaced=43,0,8,300,600\nkill9=23,9\nkill8=23,8\n";
+    let module = module_of_tracks(&[(PIANO, &piano), (PIANO_SKILL, &skill)], events);
+    let mut player = Player::new(vec![module], samples(), 1);
+    let room = PianoRoom::default();
+    let asked = || {
+        let mut asked = std::mem::take(&mut *room.0.borrow_mut());
+        asked.sort();
+        asked
+    };
+    // Object 9 is placed with the piano's `Spl` (20): 464 at 527. The
+    // skill (its field 5, asked at once) starts the skill track, whose
+    // levels are its (0) second and third arguments.
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "piano".into(),
+        },
+        &room,
+    );
+    assert_eq!(asked(), [(9, 5)]);
+    player.render(BLOCK, &room);
+    assert_eq!(asked(), [(9, 464), (9, 527), (42, 0), (42, 0)]);
+    // Object 8 is not on the lot: the event's levels stay. The piano's
+    // one instance is now 8, so letting go of 9 leaves it playing.
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "unplaced".into(),
+        },
+        &room,
+    );
+    assert_eq!(asked(), [(8, 5)]);
+    player.render(BLOCK, &room);
+    assert_eq!(
+        asked(),
+        [(8, 300), (8, 600), (9, 464), (9, 527), (42, 0), (42, 0)]
+    );
+    play(&mut player, "kill9");
+    player.render(12 * BLOCK, &room);
+    assert!(!player.is_idle());
+    play(&mut player, "kill8");
+    player.render(12 * BLOCK, &room);
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_piano_let_go_from_a_pause_keeps_its_object() {
+    use sims_audio::player::{PIANO, PIANO_SKILL};
+    let mut piano = vec![SET_LOOP];
+    piano.extend([GETSRCDATAFIELD, 6, 1, 19, LOOP]);
+    let skill = [END];
+    let events = "piano=43,0\nunplaced=43,0,8,300,600\nkill9=23,9\nkill8=23,8\n";
+    let module = module_of_tracks(&[(PIANO, &piano), (PIANO_SKILL, &skill)], events);
+    let room = PianoRoom::default();
+    let event = |name: &str, object| SoundEvent::Play {
+        object,
+        name: name.into(),
+    };
+    // The piano plays for 9, then is held by a pause; the start for 8
+    // lets it go, and the piano's one instance is still 9.
+    let mut player = Player::new(vec![module], samples(), 1);
+    player.handle(&event("piano", 9), &room);
+    player.render(BLOCK, &room);
+    player.handle(&SoundEvent::Pause, &room);
+    player.handle(&event("unplaced", 0), &room);
+    player.handle(&SoundEvent::Unpause, &room);
+    play(&mut player, "kill8");
+    player.render(12 * BLOCK, &room);
+    assert!(!player.is_idle());
+    play(&mut player, "kill9");
+    player.render(12 * BLOCK, &room);
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_piano_start_refused_at_the_thread_limit_keeps_its_object() {
+    use sims_audio::player::{PIANO, THREADS};
+    // The piano asks about its object every block; track 20 loops.
+    let mut piano = vec![SET_LOOP];
+    piano.extend([GETSRCDATAFIELD, 6, 1, 19, LOOP]);
+    let filler = [SET_LOOP, LOOP];
+    let events = "piano=43,0\nunplaced=43,0,8,300,600\nkill9=23,9\nkill8=23,8\n";
+    let module = module_of_tracks(&[(PIANO, &piano), (20, &filler)], events);
+    let room = PianoRoom::default();
+    let event = |name: &str, object| SoundEvent::Play {
+        object,
+        name: name.into(),
+    };
+    let mut player = Player::new(vec![module], samples(), 1);
+    player.handle(&event("piano", 9), &room);
+    for _ in 1..THREADS {
+        play(&mut player, "e20");
+    }
+    // The start for 8 is refused: the piano's instance stays 9.
+    player.handle(&event("unplaced", 0), &room);
+    assert_eq!(player.faults.len(), 1);
+    assert!(player.faults[0].contains("threads"));
+    play(&mut player, "kill8");
+    player.render(12 * BLOCK, &room);
+    room.0.take();
+    player.render(BLOCK, &room);
+    assert!(room.0.take().iter().any(|&(object, _)| object == 9));
+    play(&mut player, "kill9");
+    player.render(12 * BLOCK, &room);
+    room.0.take();
+    player.render(BLOCK, &room);
+    assert!(room.0.take().iter().all(|&(object, _)| object != 9));
+}
+
+#[test]
+fn the_piano_asks_the_skill_even_with_no_skill_track() {
+    use sims_audio::player::PIANO;
+    let module = module_of_tracks(&[(PIANO, &[END])], "piano=43,0\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    let room = PianoRoom::default();
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "piano".into(),
+        },
+        &room,
+    );
+    assert_eq!(room.0.take(), [(9, 5)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_fresh_start_sets_the_levels_from_the_arguments() {
+    // Each track asks about its `extvol`, as the field its `pan`.
+    let asker = [GETSRCDATAFIELD, 6, 19, 20, END];
+    // Track 12 sets arg2 = 7, arg3 = 8 and plays track 11.
+    let mut starter = [loadb(2, 7), loadb(3, 8), loadb(5, 11)].concat();
+    starter.extend([PLAY_TRK, 5, END]);
+    let module = module_of_kinds(
+        &[(10, 1, &asker), (11, 2, &asker), (12, 2, &starter)],
+        "levels=1,10,300,600\n",
+    );
+    let mut player = Player::new(vec![module], samples(), 1);
+    // `kArgsVolPan`: the first two arguments.
+    play(&mut player, "levels");
+    assert_eq!(asked_in_a_block(&mut player), [(300, 600)]);
+    // `kArgsIdVolPan`, started by `play_trk` for the next block: the
+    // caller's second and third.
+    play(&mut player, "e12");
+    assert_eq!(asked_in_a_block(&mut player), []);
+    assert_eq!(asked_in_a_block(&mut player), [(7, 8)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn the_piano_without_its_track_does_nothing() {
+    let module = module_with(&[&GENERIC], 1, 10, "piano=43,10\n");
+    let mut player = Player::new(vec![module], samples(), 1);
     play(&mut player, "piano");
-    assert_eq!(player.faults.len(), 2);
-    assert!(player.faults[0].contains("kind 36 is not one"));
-    assert!(player.faults[1].contains("kind 43 is not one"));
+    assert!(player.faults.is_empty() && player.is_idle());
+}
+
+const GETSRCDATAFIELD: u8 = 72;
+const KILL_TRK: u8 = 51;
+
+/// A module with each routine run by the track given with it, and event
+/// `e{track}` (`kSndobPlay`) for each.
+fn module_of_tracks(tracks: &[(u32, &[u8])], events: &str) -> Module {
+    let tracks: Vec<(u32, u8, &[u8])> = tracks.iter().map(|&(t, r)| (t, 2, r)).collect();
+    module_of_kinds(&tracks, events)
+}
+
+/// As [`module_of_tracks`], each track with its argument kind
+/// (`kArgsVolPan` 1, `kArgsIdVolPan` 2).
+fn module_of_kinds(tracks: &[(u32, u8, &[u8])], events: &str) -> Module {
+    let routines: Vec<&[u8]> = tracks.iter().map(|&(_, _, routine)| routine).collect();
+    let (hit, addresses) = assemble(&routines);
+    let mut hot = String::from("[EventMappingEquate]\nkSndobPlay=1\n[TrackData]\n");
+    for (i, address) in addresses.iter().enumerate() {
+        hot.push_str(&format!("{:#x}={address:#x}\n", 0x100 + i));
+    }
+    hot.push_str("[Patch]\n1=0,one,\"one.xa\"\n[Track]\n");
+    for (i, (track, arguments, _)) in tracks.iter().enumerate() {
+        hot.push_str(&format!(
+            "{track}=0,t{track},1024,{arguments},0,0,0,{:#x},1\n",
+            0x100 + i
+        ));
+    }
+    hot.push_str("[EventMapping]\n");
+    for (track, _, _) in tracks {
+        hot.push_str(&format!("e{track}=kSndobPlay,{track}\n"));
+    }
+    hot.push_str(events);
+    Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap()
+}
+
+/// Asks the simulation about field `field` of the object its first
+/// argument names (getsrcdatafield v2, arg1, v1), then ends, or, with
+/// `again`, asks again every block.
+fn asks(field: u32, again: bool) -> Vec<u8> {
+    let mut routine = vec![LOADL, 5];
+    routine.extend(long(field));
+    if again {
+        routine.push(SET_LOOP);
+    }
+    routine.extend([GETSRCDATAFIELD, 6, 1, 5]);
+    routine.push(if again { LOOP } else { END });
+    routine
+}
+
+/// Renders a block; returns what the scripts asked in it, sorted.
+fn asked_in_a_block(player: &mut Player<BTreeMap<String, Pcm>>) -> Vec<(i32, i32)> {
+    let asked = Asked::default();
+    player.render(BLOCK, &asked);
+    let mut asked = asked.0.into_inner();
+    asked.sort();
+    asked
+}
+
+#[test]
+fn the_music_mode_starts_and_stops_the_music_tracks() {
+    use sims_audio::player::music::*;
+    // Each music track asks about its first argument, as the field the
+    // track's own number: the ones that set the music once, the loops
+    // (and the main music, which they start in the game) every block.
+    let once = |t| (t, asks(t, false));
+    let loops = |t| (t, asks(t, true));
+    let tracks = [
+        once(SET_MAIN_MUSIC),
+        once(SET_MAIN_KILL_FIRST),
+        once(FADE_AND_KILL_SLOW),
+        loops(MAIN_MUSIC_LOOP),
+        loops(RIVER_LOOP),
+        loops(MT_RIVER_LOOP),
+    ];
+    let tracks: Vec<(u32, &[u8])> = tracks.iter().map(|(t, r)| (*t, &r[..])).collect();
+    let events: String = (0..=18).map(|m| format!("m{m}=36,{m}\n")).collect();
+    let module = module_of_tracks(&tracks, &events);
+    let mut player = Player::new(vec![module], samples(), 1);
+    let mode = |player: &mut Player<_>, m: u32| {
+        play(player, &format!("m{m}"));
+        asked_in_a_block(player)
+    };
+    let main = (9, MAIN_MUSIC_LOOP as i32);
+    let river = (0, RIVER_LOOP as i32);
+    let set = |list: u32, track: u32| (list as i32, track as i32);
+
+    // Nothing until the neighbourhood (mode 3) has been shown.
+    assert_eq!(mode(&mut player, 1), []);
+    assert!(player.is_idle());
+    // The neighbourhood's list, and the river.
+    assert_eq!(
+        mode(&mut player, 3),
+        [river, set(NEIGHBOURHOOD, SET_MAIN_KILL_FIRST)]
+    );
+    assert_eq!(asked_in_a_block(&mut player), [river]);
+    // Makin' Magic's neighbourhood: its list and river, and not the
+    // other river.
+    assert_eq!(
+        mode(&mut player, 15),
+        [
+            (0, MT_RIVER_LOOP as i32),
+            set(EXPANSION_LISTS[5], SET_MAIN_KILL_FIRST)
+        ]
+    );
+    // Buy: its list, and no river.
+    assert_eq!(mode(&mut player, 1), [set(BUY, SET_MAIN_MUSIC)]);
+    assert!(player.is_idle());
+    // Live after buy: the main music stops at once.
+    play(&mut player, &format!("e{MAIN_MUSIC_LOOP}"));
+    assert_eq!(asked_in_a_block(&mut player), [main]);
+    assert_eq!(mode(&mut player, 0), []);
+    assert!(player.is_idle());
+    // The neighbourhood again, then live: the river stops and the main
+    // music fades out (by its script).
+    play(&mut player, &format!("e{MAIN_MUSIC_LOOP}"));
+    assert_eq!(
+        mode(&mut player, 3),
+        [river, main, set(NEIGHBOURHOOD, SET_MAIN_KILL_FIRST)]
+    );
+    assert_eq!(
+        mode(&mut player, 0),
+        [main, set(MAIN_MUSIC_LOOP, FADE_AND_KILL_SLOW)]
+    );
+    // The credits play the newest expansion's list.
+    assert_eq!(credits(EXPANSIONS), 103_101);
+    assert_eq!(credits(0), NEIGHBOURHOOD);
+    assert_eq!(credits(0x06), 1_589);
+    assert_eq!(
+        mode(&mut player, 6),
+        [main, set(103_101, SET_MAIN_KILL_FIRST)]
+    );
+    // Makin' Magic's build, then its buy: the list changes once.
+    assert_eq!(
+        mode(&mut player, 17),
+        [main, set(EXPANSION_LISTS[7], SET_MAIN_KILL_FIRST)]
+    );
+    assert_eq!(mode(&mut player, 18), [main]);
+    // Options: nothing; the same mode again: nothing.
+    assert_eq!(mode(&mut player, 7), [main]);
+    assert_eq!(mode(&mut player, 7), [main]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn play_trk_hands_on_the_arguments_and_source_and_kill_trk_ends_the_whole_track() {
+    // Track 10 asks about arg1's field arg2, then arg3's field `source`,
+    // every block.
+    let mut asker = vec![SET_LOOP];
+    asker.extend([GETSRCDATAFIELD, 6, 1, 2, GETSRCDATAFIELD, 6, 3, 47, LOOP]);
+    // Track 11: arg2 = 7, arg3 = 8, source = 5, then play_trk 10.
+    let mut starter = [loadb(2, 7), loadb(3, 8), loadb(47, 5), loadb(5, 10)].concat();
+    starter.extend([PLAY_TRK, 5, END]);
+    // Track 12: kill_trk 10; track 13: kill_trk 13, then ask.
+    let mut killer = loadb(5, 10).to_vec();
+    killer.extend([KILL_TRK, 5, END]);
+    let mut suicide = loadb(5, 13).to_vec();
+    suicide.extend([KILL_TRK, 5, GETSRCDATAFIELD, 6, 1, 5, END]);
+    let module = module_of_tracks(
+        &[(10, &asker), (11, &starter), (12, &killer), (13, &suicide)],
+        "",
+    );
+    let mut player = Player::new(vec![module], samples(), 1);
+    // Started for object 9: the caller's own arguments go on. Track 11
+    // runs in the first block, and track 10 from the next.
+    play(&mut player, "e11");
+    assert_eq!(asked_in_a_block(&mut player), []);
+    assert_eq!(asked_in_a_block(&mut player), [(8, 5), (9, 7)]);
+    // Another object's kill_trk ends it all the same: track 10 asks in
+    // that block before track 12 runs, and not after.
+    play_for(&mut player, 4, "e12");
+    assert_eq!(asked_in_a_block(&mut player), [(8, 5), (9, 7)]);
+    assert_eq!(asked_in_a_block(&mut player), []);
+    assert!(player.is_idle());
+    // A script that ends its own track ends there.
+    play(&mut player, "e13");
+    assert_eq!(asked_in_a_block(&mut player), []);
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn play_trk_reads_source_through_the_target_but_the_arguments_from_its_own() {
+    // Track 10 asks about arg1's field arg2, then arg3's field `source`,
+    // every block. Track 14 holds `source` 6 and loops.
+    let mut asker = vec![SET_LOOP];
+    asker.extend([GETSRCDATAFIELD, 6, 1, 2, GETSRCDATAFIELD, 6, 3, 47, LOOP]);
+    let mut holder = loadb(47, 6).to_vec();
+    holder.extend([SET_LOOP, LOOP]);
+    // Track 15: arg2 = 7, arg3 = 8, source = 5, all its own, then targets
+    // track 14 and plays track 10.
+    let mut starter = [
+        loadb(2, 7),
+        loadb(3, 8),
+        loadb(47, 5),
+        loadb(53, 14),
+        loadb(5, 10),
+    ]
+    .concat();
+    starter.extend([PLAY_TRK, 5, END]);
+    let module = module_of_tracks(&[(10, &asker), (14, &holder), (15, &starter)], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e14");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "e15");
+    assert_eq!(asked_in_a_block(&mut player), []);
+    assert_eq!(asked_in_a_block(&mut player), [(8, 6), (9, 7)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
 #[test]

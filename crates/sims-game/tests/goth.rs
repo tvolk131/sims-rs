@@ -13,6 +13,7 @@ use sims_ui::household::Snapshot;
 use sims_ui::hud::Kind;
 use sims_ui::queue::Picture;
 use sims_vm::SoundEvent;
+use sims_vm::boot::{Frames, Lot};
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
@@ -841,6 +842,108 @@ fn panel(game: &Game, person: u16) -> Shown {
         money,
         hunger,
     }
+}
+
+/// Play mode, as the window runs with `--play`: the snack ordered through
+/// the game's input layer is the scripted snack order (sims-vm's
+/// `the_snack_order_pays_for_the_snack`, `Lot::queue_interaction` after 50
+/// steps). The pointer moves onto the fridge, which lists its pie; a
+/// press opens it, and a press on Have A Snack queues the action the
+/// listing offered (`Lot::pick`). The action queued is the scripted one.
+/// The lots differ until Mortimer takes the order at step 150: the
+/// listing's check trees ran as him, and left his last result and his
+/// stack frame's words. From then on they are the same lot, step for
+/// step, through the snack's end at step 1136, and play mode catches no
+/// error on the way.
+#[test]
+fn the_snack_ordered_in_the_window_is_the_scripted_order() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        play: true,
+        ..options(install.clone())
+    })
+    .expect("the Goth house opens");
+    assert_eq!(game.run(50), 50);
+    game.resize([800, 600]);
+    game.render();
+    let sim = game.lot().world().selected().expect("a Sim is selected");
+    let fridge = 118;
+    // Where the frame shows the fridge, found without moving the pointer,
+    // whose every new object lists a menu that changes the lot.
+    let at = (0..600)
+        .step_by(4)
+        .flat_map(|y| (0..800).step_by(4).map(move |x| [x, y]))
+        .find(|&p| !game.over_panel(p) && game.under(p) == Some(fridge))
+        .expect("the fridge is on screen");
+    game.hover(at);
+    assert_eq!(game.listed(), Some((sim, fridge)));
+    game.press(at);
+    game.render();
+    let snack = {
+        let menu = game.menu().expect("the fridge's pie opens");
+        // The entry is one the fridge's check trees listed, not the
+        // fallback's, so choosing it goes through `Lot::pick`.
+        let entry = menu
+            .entries
+            .iter()
+            .find(|e| e.label == "Have A Snack")
+            .expect("Have A Snack listed");
+        assert!(entry.action.is_some(), "{entry:?}");
+        let (_, r) = menu
+            .labels()
+            .into_iter()
+            .find(|(text, _)| *text == "Have A Snack")
+            .expect("Have A Snack on the pie");
+        [r.x + r.width / 2, r.y + r.height / 2]
+    };
+    game.press(snack);
+    assert!(game.menu().is_none());
+
+    let mut scripted = Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
+    for _ in 0..50 {
+        assert!(scripted.step_play().unwrap().errors.is_empty());
+    }
+    let uid = scripted.queue_interaction(sim, fridge, 1).unwrap();
+    assert_eq!(uid, Some(1));
+    let queue = |lot: &Lot| {
+        format!(
+            "{:?}",
+            lot.world().objects[&sim].person.as_ref().unwrap().queue
+        )
+    };
+    assert_eq!(queue(game.lot()), queue(&scripted));
+    // The listing ran the check trees on the window's lot, which left
+    // Mortimer's last result and frame storage changed until step 150.
+    assert_ne!(game.lot().world().hash(), scripted.world().hash());
+    let doing = |lot: &Lot| {
+        lot.world().objects[&sim]
+            .person
+            .as_ref()
+            .unwrap()
+            .active
+            .uid
+    };
+    for step in 51..=1136 {
+        assert_eq!(game.run(1), 1, "step {step}");
+        let update = scripted.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+        let same = game.lot().world().hash() == scripted.world().hash();
+        assert_eq!(same, step >= 150, "step {step}");
+        match step {
+            150 => assert_eq!(doing(game.lot()), 1),
+            // He pays for the snack, whose action is his fifth.
+            820 => {
+                assert_eq!(game.lot().world().budget.funds, 2537);
+                assert_eq!(doing(game.lot()), 5);
+            }
+            1135 => assert_eq!(doing(game.lot()), 5),
+            1136 => assert_ne!(doing(game.lot()), 5),
+            _ => {}
+        }
+    }
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
 
 #[test]
