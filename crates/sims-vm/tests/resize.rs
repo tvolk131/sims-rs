@@ -2162,8 +2162,8 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
 /// ([`format_18_bytes`]), which pinned the states after ticks 367 and
 /// 408. Those still hold under format 20 ([`format_19_bytes`]), which
 /// pinned the state after tick 416; that still holds under format 21
-/// ([`format_20_bytes`]). The digests are of our own state, as built
-/// here.
+/// ([`format_20_bytes`]), which pins the state after tick 417. The
+/// digests are of our own state, as built here.
 #[test]
 fn the_goth_house_first_tick_matches_the_original() {
     const TICK_1_9: &str = "62fc28f5e7689d166791a620dbed066fb8a7d707ea79017fbadf0eed3da5c937";
@@ -2185,6 +2185,7 @@ fn the_goth_house_first_tick_matches_the_original() {
     const TICK_366_18: &str = "d9bcf685db4e2c1186715bf7a674c640bd8c4cbd6cbed374644c370b242667f0";
     const TICK_367_19: &str = "0a9a7c29774c3b5cee673ab0bc94f319a95b72fb9787e282ec9cbedc9975e82a";
     const TICK_408_19: &str = "7a9c943eba9536e011feafaf60b611e9d9accad6a0a50f8c13856dc72d4cb4d1";
+    const TICK_417: &str = "e5b71ee022f181d8de6c5e72b9877002cfc7ba466e898e0105220e6287df6938";
     const TICK_416_20: &str = "37ff5756ac5cf26769da735eadb955be4f78f64381ea8b847963298b51f8320b";
     const USES_233: [(i16, i32); 2] = [(132, 5), (51, 8)];
     const TREES_233: [u16; 9] = [
@@ -2672,21 +2673,42 @@ fn the_goth_house_first_tick_matches_the_original() {
         // object for function 8 (Find Best Object for Function, opcode
         // 14): object 174, the stack object the capture shows. The tree
         // then plays a clip on the carry slot (Animate Sim, flag 0x10),
-        // which repeats there, and takes the true branch to node 7, as the
-        // capture does: Run Functional Tree (opcode 20), which is not
-        // ported.
-        let error = interpreter
-            .lot_update(world, &tuning, &mut player)
-            .unwrap_err();
-        assert!(error.to_string().contains("primitive 20"), "{error}");
-        let frame = world.objects[&21].stack.last().unwrap();
-        assert_eq!(
-            (frame.tree, frame.node, frame.stack_object),
-            (0x1014, 7, 174)
-        );
+        // which repeats there, and takes the true branch to node 7: Run
+        // Functional Tree (opcode 20) runs object 174's action (tree 8215),
+        // which runs trees 4105 and 4112 of object 52. The
+        // capture shows the same frames and object uses after the tick.
+        interpreter.lot_update(world, &tuning, &mut player).unwrap();
+        assert_eq!(world.ticks, before.ticks + 417);
         let a = &world.animators[&21];
         let carry = a.carry.as_ref().unwrap();
         assert_eq!((carry.mode, carry.priority), (1, 10));
         assert_eq!((a.carry_mode, a.carry_selection), (6, -1));
+        let person = &world.objects[&21];
+        assert_eq!(
+            person.stack[6..]
+                .iter()
+                .map(|f| (f.tree, f.node, f.stack_object))
+                .collect::<Vec<_>>(),
+            [(8215, 2, 174), (4105, 1, 52), (4112, 5, 52)]
+        );
+        assert_eq!(
+            person
+                .person
+                .as_ref()
+                .unwrap()
+                .object_uses
+                .iter()
+                .map(|u| (u.target, u.stack_depth))
+                .collect::<Vec<_>>(),
+            [(132, 5), (174, 7), (52, 8)]
+        );
+        assert_eq!(digest(&world.encode()), TICK_417);
+        // Tick 418: person 21's tree 4113 of object 52 routes with two
+        // people in the way, which is not ported. (The capture goes on in
+        // tree 4112 with object 92 instead; that is the next step.)
+        let error = interpreter
+            .lot_update(world, &tuning, &mut player)
+            .unwrap_err();
+        assert!(error.to_string().contains("people in the way"), "{error}");
     });
 }

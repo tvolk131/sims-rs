@@ -28,6 +28,7 @@ mod random;
 mod refresh;
 mod relationship;
 mod remove;
+mod run_functional_tree;
 mod set_to_next;
 mod sleep;
 mod sound;
@@ -123,6 +124,7 @@ impl Machine<'_, '_> {
             16 => self.find_location(operands)?.into(),
             17 => self.idle_for_input(operands)?,
             18 => self.remove(operands)?,
+            20 => self.run_functional_tree(operands)?,
             22 => self.look_towards(operands)?,
             23 => self.play_sound(operands)?.into(),
             24 => self.old_relationship(operands)?.into(),
