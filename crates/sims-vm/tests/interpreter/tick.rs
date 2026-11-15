@@ -530,7 +530,43 @@ fn usage_after(ticks: u32, visitor: i16, alertness: f32, routes: i32) -> Usage {
     let person = fx.sim_mut().person.as_mut().unwrap();
     person.data[32] = visitor;
     person.motives[11] = alertness;
-    person.routing_frames = routes;
+    let context = sims_sim::route::Context {
+        candidates: Vec::new(),
+        slot: sims_sim::route::RouteSlot {
+            offset: [0; 3],
+            number: -1,
+            standing: 0,
+            sitting: 0,
+            ground: 0,
+            flags: 0,
+            snap_target: -1,
+            proximity: [0; 3],
+            gradient: 0x3e40_0000,
+            facing: -2,
+            resolution: 0,
+        },
+        target: 0,
+        person: 0,
+        chosen: -1,
+        best: -1,
+        word_58: 0,
+        time: 0,
+        saved: [0; 2],
+        word_68: 0,
+        start: [0; 3],
+        byte_78: true,
+        objects: [0; 2],
+        byte_84: false,
+        result: 0,
+        word_8c: 0,
+        byte_8e: false,
+        word_94: 0,
+        limit: 0x30,
+        action: 0,
+    };
+    if routes > 0 {
+        fx.world.routing.routes.entry(SIM).or_default().contexts = vec![context; routes as usize];
+    }
     update(&mut fx, &mut answers(&[])).unwrap();
     assert_eq!(fx.world.usage.history, [Usage::default(); 5]);
     fx.world.usage.today

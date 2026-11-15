@@ -500,3 +500,44 @@ fn the_load_restores_the_head_as_saved_and_relaxes_its_turn_after_tick_0() {
         );
     }
 }
+
+#[test]
+fn a_person_saved_on_a_route_gets_as_many_empty_contexts_as_it_counted() {
+    // 0x460443: the save keeps only the count; each context is a copy of
+    // one the default constructor makes (0x4815f1, 0x46dd48, 0x481693).
+    let mut fx = lot();
+    let mut walking = sim(3, ADULT);
+    walking.person.as_mut().unwrap().routing_frames = 2;
+    let objects = file(vec![walking, sim(5, ADULT)]);
+    read(&mut fx, &objects, &people()).unwrap();
+    let contexts = &fx.world.routing.routes[&3].contexts;
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(contexts[0], contexts[1]);
+    let c = &contexts[0];
+    assert!(c.candidates.is_empty());
+    assert_eq!((c.target, c.person, c.chosen, c.best), (0, 0, -1, -1));
+    assert_eq!(
+        (c.slot.number, c.slot.snap_target, c.slot.facing),
+        (-1, -1, -2)
+    );
+    assert_eq!((c.slot.gradient, c.slot.flags), (0x3e40_0000, 0));
+    assert_eq!(
+        (c.byte_78, c.limit, c.saved, c.word_94),
+        (true, 0x30, [0; 2], 0)
+    );
+    // A person that counted none has none.
+    assert!(!fx.world.routing.routes.contains_key(&5));
+
+    // A negative count fails, and the lot is unchanged.
+    let mut fx = lot();
+    let before = fx.world.clone();
+    let mut odd = sim(3, ADULT);
+    odd.person.as_mut().unwrap().routing_frames = -1;
+    let (object, cause) = trap(read(&mut fx, &file(vec![odd]), &people()));
+    assert_eq!(object, 3);
+    assert!(
+        matches!(&cause, Trap::Unsupported(text) if text.contains("0x460443")),
+        "{cause:?}"
+    );
+    assert_eq!(fx.world.encode(), before.encode());
+}

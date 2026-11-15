@@ -201,6 +201,13 @@ impl Interpreter<'_> {
     /// the pose its saved layers left in the skin into
     /// [`World::held_poses`].
     ///
+    /// A person saved part way through a route keeps only the number of
+    /// its route contexts; the load makes that many, each as its default
+    /// constructor makes it
+    /// ([`crate::routing::slot::loaded_context`], 0x460443), and the
+    /// first run of the route's steps pops it (0x45ae71). A negative
+    /// count fails.
+    ///
     /// Not modeled: object flags (the constructor sets 0x200 and the read
     /// 0x80), the count
     /// of queued interactions the game keeps, and graphics for objects
@@ -278,6 +285,27 @@ impl Interpreter<'_> {
                 held_poses.insert(id, held);
             }
         }
+        // Each person's route contexts: as many as the save counts, each
+        // as the load makes it (0x460443). A negative count, which the
+        // original's resize would take as erasing before the start, fails.
+        let mut contexts = BTreeMap::new();
+        for &id in &order {
+            let Some(person) = objects[&id].person.as_ref() else {
+                continue;
+            };
+            let frames = usize::try_from(person.routing_frames).map_err(|_| {
+                fail(
+                    id,
+                    Trap::Unsupported(format!(
+                        "the person's saved route context count is {} (0x460443)",
+                        person.routing_frames
+                    )),
+                )
+            })?;
+            if frames != 0 {
+                contexts.insert(id, vec![crate::routing::slot::loaded_context(); frames]);
+            }
+        }
         let count = draws.count;
         world.crt_rng = crt;
         world.skeleton_files = files;
@@ -292,6 +320,9 @@ impl Interpreter<'_> {
         world.next_parts = next_parts;
         world.animators.extend(animators);
         world.held_poses.extend(held_poses);
+        for (id, contexts) in contexts {
+            world.routing.routes.entry(id).or_default().contexts = contexts;
+        }
         // 0x41f320: reading an interaction (a person's running one, its
         // last one and each queued one: 0x45d012, 0x45d01f, 0x45d08b)
         // raises the action serial to its number when that is larger,

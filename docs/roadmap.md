@@ -104,7 +104,9 @@ events, and what it asks for after them) come first.
   Pleasant's type changed since the save, so the load resets none of
   them and their animators keep what the restore read: clips playing on
   from their saved phase, saved routing states and route contexts. That
-  is not ported, so the load stops on person 117.
+  is not ported, so the load stops on person 117. The load makes the
+  route contexts the save counts (0x460443), and a route's first run
+  pops one that names no object and starts again (0x45ae71).
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
   read their arrays whole (Arry 11, 12, 111 and 112). Their floor

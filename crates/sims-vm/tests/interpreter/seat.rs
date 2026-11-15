@@ -601,3 +601,113 @@ fn with_no_door_to_go_through_the_route_gives_up_with_result_2() {
     assert!(!sat(&fx));
     assert_eq!(route_result(&fx, me), 2);
 }
+
+/// A route context as the load makes it for a person saved part way
+/// through a route (0x460443): it names no object.
+fn loaded_context() -> sims_sim::route::Context {
+    sims_sim::route::Context {
+        candidates: Vec::new(),
+        slot: sims_sim::route::RouteSlot {
+            offset: [0; 3],
+            number: -1,
+            standing: 0,
+            sitting: 0,
+            ground: 0,
+            flags: 0,
+            snap_target: -1,
+            proximity: [0; 3],
+            gradient: 0x3e40_0000,
+            facing: -2,
+            resolution: 0,
+        },
+        target: 0,
+        person: 0,
+        chosen: -1,
+        best: -1,
+        word_58: 0,
+        time: 0,
+        saved: [0; 2],
+        word_68: 0,
+        start: [0; 3],
+        byte_78: true,
+        objects: [0; 2],
+        byte_84: false,
+        result: 0,
+        word_8c: 0,
+        byte_8e: false,
+        word_94: 0,
+        limit: 0x30,
+        action: 0,
+    }
+}
+
+/// `me`'s thread at Go To Routing Slot for the lamp's slot 0, at route
+/// step `state`. Its true branch marks `me`'s data word 50 with 1 and its
+/// false branch with 2; either then sleeps.
+fn walking(fx: &mut Fixture, me: u16, state: i32) {
+    let guid = fx.world.objects[&me].guid;
+    let file = fx.catalog.object(guid).unwrap().resource;
+    fx.add(
+        file,
+        TREE,
+        shaped(
+            0x8002,
+            0,
+            1,
+            0,
+            vec![
+                ins(GO_TO_SLOT, 1, 2, [0, 0, 1, 0, 0, 0, 0, 0]),
+                assign(scope::MY_DATA, MARK as i16, scope::LITERAL, 1, 3),
+                assign(scope::MY_DATA, MARK as i16, scope::LITERAL, 2, 3),
+                ins(0, RETURN_TRUE, RETURN_FALSE, [0; 8]),
+            ],
+        ),
+    );
+    fx.thread(me, TREE, &[100]);
+    let frame = &mut fx.world.objects.get_mut(&me).unwrap().stack[0];
+    frame.stack_object = LAMP as i16;
+    frame.primitive_state = state;
+}
+
+fn tick(fx: &mut Fixture, me: u16) {
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.tick_object(&mut fx.world, me).unwrap();
+}
+
+#[test]
+fn a_route_context_the_load_made_is_popped_and_the_route_starts_again() {
+    // 0x45ae71: the person was saved at route step 3 with two contexts.
+    // The run pops the last, which names no object, puts the step back to
+    // 0 and yields; the next run starts the route again on top of the
+    // context left.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    walking(&mut fx, me, 3);
+    fx.world.routing.routes.entry(me).or_default().contexts = vec![loaded_context(); 2];
+    tick(&mut fx, me);
+    let frame = &fx.world.objects[&me].stack[0];
+    assert_eq!((frame.node, frame.primitive_state), (0, 0));
+    assert_eq!(fx.world.routing.routes[&me].contexts, [loaded_context()]);
+    assert_eq!(fx.world.objects[&me].data[MARK], 0);
+    // The route runs as a fresh one: the person sits in the seat, the
+    // route's context is popped and the true branch is taken.
+    tick(&mut fx, me);
+    assert!(sat(&fx));
+    assert_eq!(fx.world.routing.routes[&me].contexts, [loaded_context()]);
+    assert_eq!(fx.world.objects[&me].data[MARK], 1);
+}
+
+#[test]
+fn a_route_with_no_context_or_no_object_gives_false() {
+    // 0x45ae65: past step 0 with no context left (a reset erased them),
+    // the run gives false and writes nothing.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    walking(&mut fx, me, 3);
+    tick(&mut fx, me);
+    assert_eq!(fx.world.objects[&me].data[MARK], 2);
+    assert!(!fx.world.routing.routes.contains_key(&me));
+    // At step 0 with the stack object off the lot, the same.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    fx.lamp_mut().position = [-16, -16, 1];
+    assert_eq!(go_to(&mut fx, me), Ok(false));
+    assert!(!fx.world.routing.routes.contains_key(&me));
+}
