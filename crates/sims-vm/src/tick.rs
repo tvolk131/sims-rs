@@ -10,8 +10,11 @@
 //!    [`World::global_rng`].
 //! 2. After a full pass, global 6 (seconds) goes up by 2 and the tick
 //!    count by 1. At 60 seconds the seconds go back by 60 and global 5
-//!    (minutes) goes up, and signal 0xdb is sent. Each further rollover
-//!    (the hour, the day, the month) is not ported and fails.
+//!    (minutes) goes up, and signal 0xdb is sent. At 60 minutes the
+//!    minutes go back by 60 and global 0 (hours) goes up. At 24 hours the
+//!    day turns (0x46d3e9: the date, the day's statistics, the daily
+//!    updates of the objects and the neighborhood, signal 0xdc instead of
+//!    0xdb); that is not ported and fails.
 //! 3. The registry's pass at the end of the update (0x4412d1,
 //!    [`Interpreter::end_of_update`]): the dialogs, then the queued
 //!    removals, then a check that a Sim is selected.
@@ -19,17 +22,37 @@
 //!    subscribers (0x40760d). Of those only the interface takes signal
 //!    0xdb (0x4f65bf; a sound when the minutes are 0), so it changes
 //!    nothing here.
+//! 5. If the hour turned, the time of day for the new hour (0x46d525) is
+//!    compared with global 4. If it differs, global 4 takes it, the
+//!    interface is told (0x4c4648, which picks the day or night look of
+//!    the panel of the current mode), and signals 0xf8 (with 5) and 0xdd
+//!    are sent. Of the subscribers only the architecture takes 0xf8
+//!    (0x47b22a): when global 36 is not 0 it grows the lawn
+//!    ([`World::grow_grass`] by 5, 0x47b3c8), and then sends 0x86 and
+//!    0x83: the interface's panels (0x4c3ea5) set a refresh flag on 0x86
+//!    and the house viewer (0x4a82db) redraws on 0x83. The panels also
+//!    take 0xdd (0x4c4189): the current mode's time-of-day look, then
+//!    0x83 again. On 0xdd the lot
+//!    marks every room as not counted and both levels as waiting
+//!    ([`World::mark_all_rooms`]), after setting the brightest a lit
+//!    tile may be, 1 by day and 0.8 otherwise (0x466ba3, at 0x6c741c,
+//!    which only the drawing's light clamp reads, 0x4b4525). The next
+//!    frame draw counts the rooms with the new time of day's daylight.
 //!
 //! **Not modeled**, being presentation as far as the original's code
-//! shows: an object's animated sprites (the list at object 0x148, stepped
-//! after each thread run and redrawn), the parts of a person's animator
+//! shows: an object's headlines (the list at object 0x148, stepped after
+//! each thread run; see `primitives/headline.rs` for why no headline
+//! shows here), the parts of a person's animator
 //! that only pose and draw the person (see [`crate::animator`]), the
 //! graphics work every tenth tick (0x5a0932), and signal 0xf7, which a person's tick sends when the
 //! selected Sim changes room and which only the house viewer takes
 //! (0x4a82db, 0x4ab992). That none of these changes simulation state is
 //! **unverified**. The lot's subscriber forwards each signal to a second
 //! subscriber at lot 0x10 (0x416393) before its own cases; what that one
-//! is, and what it does with 0xdb and 0xf7, is **unverified**. The
+//! is, and what it does with 0xdb and 0xf7, is **unverified**, and so is
+//! whether the panels' and the house viewer's handling of these signals
+//! (taken as presentation) changes anything the simulation keeps; the
+//! house viewer's handler was not read in full. The
 //! registry's pass also opens the game's special panels (registry words
 //! 0xe8 to 0x108) when a script asked for one; no ported primitive asks,
 //! so they never open here. When the pass showed a modal dialog the lot
@@ -61,12 +84,31 @@ pub const TICK_BUDGET: usize = 458_605;
 
 /// Globals the clock uses.
 const HOURS: usize = 0;
+/// Global 4: the time of day (0 day, 1 dusk, 2 night, 3 dawn).
+const TIME_OF_DAY: usize = 4;
 const MINUTES: usize = 5;
+/// The global that lets the lawn grow when the time of day changes
+/// (0x47b2e8: simulator +0x58), and the amount it grows by: signal
+/// 0xf8's parameter, which the clock sends as 5.
+const GROW_LAWN: usize = 36;
+const LAWN_GROWTH: i32 = 5;
 const SECONDS: usize = 6;
 /// Globals that make the scheduler's pass partial: 17, or 19 and 10 both.
 const PAUSED: usize = 17;
 const MODE: usize = 19;
 const LOT: usize = 10;
+
+/// The time of day for an hour (0x46d525): night before 6, dawn at 6, day
+/// from 7 to 17, dusk at 18 and night from 19.
+fn time_of_day(hours: i16) -> i16 {
+    match hours {
+        ..=5 => 2,
+        6 => 3,
+        7..=17 => 0,
+        18 => 1,
+        _ => 2,
+    }
+}
 
 /// Scheduler flags (the registry word's high half).
 const READY: u16 = 1;
@@ -213,6 +255,7 @@ impl Interpreter<'_> {
             ..*self
         };
         let mut signal = None;
+        let mut hour_turned = false;
         if update.full {
             world.ticks = world.ticks.wrapping_add(1);
             let seconds = global(world, SECONDS)?.wrapping_add(2);
@@ -223,12 +266,18 @@ impl Interpreter<'_> {
                 set_global(world, MINUTES, minutes)?;
                 signal = Some(0xdb);
                 if minutes >= 60 {
-                    return Err(TickError::Unsupported(format!(
-                        "the hour turns at tick {} (globals 0 and 5, the time of day, the \
-                         lighting, signals 0xf8 and 0xdd, and the day's rollover), which is \
-                         not ported",
-                        world.ticks
-                    )));
+                    set_global(world, MINUTES, minutes.wrapping_sub(60))?;
+                    let hours = global(world, HOURS)?.wrapping_add(1);
+                    set_global(world, HOURS, hours)?;
+                    hour_turned = true;
+                    if hours >= 24 {
+                        return Err(TickError::Unsupported(format!(
+                            "the day turns at tick {} (0x46d3e9: the date, the day's \
+                             statistics, the objects' and the neighborhood's daily update, \
+                             signal 0xdc), which is not ported",
+                            world.ticks
+                        )));
+                    }
                 }
             }
         }
@@ -236,6 +285,25 @@ impl Interpreter<'_> {
         // Signal 0xdb reaches only the interface among the subscribers
         // (see the module's documentation).
         let _ = signal;
+        if hour_turned {
+            let period = time_of_day(global(world, HOURS)?);
+            if period != global(world, TIME_OF_DAY)? {
+                // The interface's call (0x4c4648) changes nothing kept
+                // here. Signal 0xf8 grows the lawn when global 36 is set
+                // (0x47b2e0), and signal 0xdd makes the lot mark every
+                // room (0x416446, 0x466ba3). See the module's
+                // documentation. The original sets global 4 first; neither
+                // the growth nor the marking reads it, so growing first,
+                // which leaves the lot unchanged when it fails, is the same.
+                if global(world, GROW_LAWN)? != 0 {
+                    world
+                        .grow_grass(LAWN_GROWTH)
+                        .map_err(TickError::Unsupported)?;
+                }
+                set_global(world, TIME_OF_DAY, period)?;
+                world.mark_all_rooms();
+            }
+        }
         Ok(update)
     }
 
