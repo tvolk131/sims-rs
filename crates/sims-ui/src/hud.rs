@@ -685,16 +685,18 @@ fn draw_personality(frame: &mut Frame, art: &Art, panel: Rect, values: &[i16; 5]
     } else {
         (0, (line - empty_h) / 2)
     };
-    let left = panel.x.saturating_add(TRAITS_RIGHT - width);
+    let left = panel.x.saturating_add(TRAITS_RIGHT.saturating_sub(width));
     for (n, (name, value)) in TRAITS.iter().zip(values).enumerate() {
-        let top = panel.y + TRAITS_TOP + TRAITS_PITCH * n as i32;
-        let x = left.saturating_add(label - font.width(name));
-        font.draw(frame, name, [x, top + text_y], LABEL);
-        let at = [left.saturating_add(bar_x), top + bar_y];
+        let top = panel.y.saturating_add(TRAITS_TOP + TRAITS_PITCH * n as i32);
+        let x = left.saturating_add(label.saturating_sub(font.width(name)));
+        font.draw(frame, name, [x, top.saturating_add(text_y)], LABEL);
+        let at = [left.saturating_add(bar_x), top.saturating_add(bar_y)];
         frame.draw_all(empty, at);
         let points = i32::from(*value / 100).clamp(0, 10);
         if points > 0 {
-            frame.draw(full, Rect::new(0, 0, (points * 4).min(full_w), full_h), at);
+            // The full bar goes a pixel above the empty one (0x5212b2).
+            let source = Rect::new(0, 0, (points * 4).min(full_w), full_h);
+            frame.draw(full, source, [at[0], at[1].saturating_sub(1)]);
         }
     }
 }
@@ -1403,7 +1405,24 @@ mod tests {
             assert_eq!(row[158 - 150], [0; 3]);
             assert_eq!(row[198 - 150], if points == 10 { full } else { empty });
             assert_eq!(row[199 - 150], [0; 3]);
+            // The empty bar is 14 high from the row's top; the full one,
+            // 16 high, starts a pixel above it (0x5212b2).
+            let top = 8 + 18 * n as i32;
+            let filled = if points > 0 { full } else { [0; 3] };
+            assert_eq!(frame.pixel(159, top - 1), Some(filled), "bar {n}");
+            assert_eq!(frame.pixel(159, top + 14), Some(filled), "bar {n}");
+            assert_eq!(frame.pixel(159, top + 15), Some([0; 3]), "bar {n}");
+            assert_eq!(frame.pixel(198, top + 13), Some(row[198 - 150]));
+            assert_eq!(
+                frame.pixel(198, top - 1),
+                Some(if points == 10 { full } else { [0; 3] })
+            );
         }
+        // Coordinates at the edge of i32 draw nothing rather than panic.
+        let far = Rect::new(i32::MAX, i32::MAX, 220, 100);
+        draw_personality(&mut frame, &art, far, &[1000; 5]);
+        let near = Rect::new(i32::MIN, i32::MIN, 220, 100);
+        draw_personality(&mut frame, &art, near, &[1000; 5]);
     }
 
     #[test]

@@ -302,13 +302,12 @@ fn killing_all_stops_the_ambience_and_the_music_mode_starts_it() {
     assert!(player.ambience().is_some_and(|a| a.is_started()));
     event(&mut player, "music7");
     assert!(player.ambience().is_some_and(|a| !a.is_started()));
-    // Each kind 36 is reported: its music half is not ported.
-    assert_eq!(player.faults.len(), 4, "{:?}", player.faults);
-    assert!(
-        player
-            .faults
-            .iter()
-            .all(|f| f.contains("kind 36 is not one this player plays (its music half)"))
+    // The music half asks for music tracks this module does not have:
+    // the neighbourhood's music and river, then live's slow fade. Mode 7
+    // starts none.
+    assert_eq!(
+        player.faults,
+        ["no track 517", "no track 2957", "no track 519"]
     );
 }
 
@@ -575,10 +574,9 @@ fn a_pause_holds_the_score_in_live_music_mode_only() {
     assert!(!player.ambience().unwrap().is_paused());
     let out = player.render_stereo(8 * RATE as usize, &NoSources);
     assert!(!runs(&out, 0).is_empty());
-    // Only the music half of kind 36, which is not ported.
-    assert!(
-        player.faults.iter().all(|f| f.contains("music half")),
-        "{:?}",
-        player.faults
+    // Only the music tracks this module does not have.
+    assert_eq!(
+        player.faults,
+        ["no track 517", "no track 2957", "no track 519"]
     );
 }

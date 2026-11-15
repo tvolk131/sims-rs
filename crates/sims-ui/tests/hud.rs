@@ -118,7 +118,7 @@ fn the_goths_personality_panel() {
     // screen (see docs/decisions.md).
     assert_eq!(
         digest(&frame),
-        "6918f761eeafd0f57e77727e1ff1c63d0be1aed8cf3cd08b978e6bd57fbcd853"
+        "03a79c67d3eba682f47cc87003a67069728a7892f241bac48c6917f245c20060"
     );
 }
 
