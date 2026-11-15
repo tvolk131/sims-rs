@@ -40,6 +40,7 @@ mod clip_events;
 mod error;
 mod factory;
 mod fault;
+mod forget;
 mod frame;
 mod head;
 mod interpreter;

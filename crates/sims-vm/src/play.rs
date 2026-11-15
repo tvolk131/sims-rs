@@ -21,11 +21,11 @@
 //!    and the cursor stays on the object.
 //! 3. 0x439a6f, with the pending bit set and the error word not 0, clears
 //!    the bit. With the debug byte 0x6c2983 clear (it is, in a memory
-//!    image of the running game) it then tells every other object that
-//!    this one resets (0x444306: their virtual function 0x38 with the
-//!    object; an object that is not a person ignores it, 0x431fbe, and a
-//!    person drops its references to it, 0x45e791;
-//!    [`Interpreter::drop_references`]), and resets the object (its own
+//!    image of the running game) it then tells every other person that
+//!    this object resets (0x444306: their virtual function 0x38 with the
+//!    object, 0x45e791, by which a person lets go of it;
+//!    [`crate::forget`]; objects that are not people are not told), and
+//!    resets the object (its own
 //!    virtual function 0x38 with 0: [`Interpreter::reset`], or
 //!    [`Interpreter::reset_person`] for a person). The reset restarts the
 //!    thread at Main (0x47480c), which clears the error word. With the

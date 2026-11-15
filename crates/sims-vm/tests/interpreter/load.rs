@@ -213,22 +213,64 @@ fn duplicates_are_removed_on_a_lot_with_people_who_do_not_refer_to_them() {
 }
 
 #[test]
-fn a_duplicate_a_person_refers_to_fails_and_changes_nothing() {
+fn a_person_lets_go_of_a_duplicate_and_one_using_it_fails() {
     type Refer = fn(&mut sims_formats::saved_objects::Person);
-    let cases: [Refer; 6] = [
-        |p| p.active.target = 1,
+    type Check = fn(&sims_formats::saved_objects::Person);
+    // Each way of naming duplicate 1, and the person after.
+    let cases: [(Refer, Check); 4] = [
+        // The running action ends and becomes the last action.
+        (
+            |p| p.active.target = 1,
+            |p| {
+                assert_eq!((p.active.target, p.active.table_index), (0, -1));
+                assert_eq!(p.last.target, 1);
+            },
+        ),
+        (
+            |p| p.last.target = 1,
+            |p| assert_eq!((p.last.target, p.last.table_index), (0, -1)),
+        ),
+        (
+            |p| {
+                let mut queued = p.last.clone();
+                queued.target = 1;
+                p.queue.push(queued);
+            },
+            |p| assert!(p.queue.is_empty()),
+        ),
+        (
+            |p| {
+                let mut queued = p.last.clone();
+                queued.icon = 1;
+                p.queue.push(queued);
+            },
+            |p| assert!(p.queue.is_empty()),
+        ),
+    ];
+    let make = |refer: Refer| {
+        let mut fx = lot();
+        give_reset(&mut fx, 0xA1, counting_reset());
+        let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        for _ in 0..2 {
+            interpreter.create(&mut fx.world, 0xA1).unwrap();
+        }
+        let person = fx.add_sim(9).person.as_mut().unwrap();
+        // Word 73 clear: a running action can end.
+        person.data[73] = 0;
+        refer(person);
+        fx
+    };
+    for (refer, check) in cases {
+        let mut fx = make(refer);
+        let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        let done = interpreter.reconcile_controllers(&mut fx.world).unwrap();
+        assert_eq!(done.removed, [1]);
+        check(fx.world.objects[&9].person.as_ref().unwrap());
+    }
+    // Using it, or showing its icon in the running action, resets the
+    // person fully, which is not ported; it fails before anything changes.
+    let using: [Refer; 2] = [
         |p| p.active.icon = 1,
-        |p| p.last.target = 1,
-        |p| {
-            let mut queued = p.last.clone();
-            queued.target = 1;
-            p.queue.push(queued);
-        },
-        |p| {
-            let mut queued = p.last.clone();
-            queued.icon = 1;
-            p.queue.push(queued);
-        },
         |p| {
             p.object_uses.push(sims_formats::saved_objects::ObjectUse {
                 target: 1,
@@ -237,21 +279,15 @@ fn a_duplicate_a_person_refers_to_fails_and_changes_nothing() {
             });
         },
     ];
-    for refer in cases {
-        let mut fx = lot();
-        give_reset(&mut fx, 0xA1, counting_reset());
-        let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-        for _ in 0..2 {
-            interpreter.create(&mut fx.world, 0xA1).unwrap();
-        }
-        refer(fx.add_sim(9).person.as_mut().unwrap());
+    for refer in using {
+        let mut fx = make(refer);
         let before = fx.world.clone();
         let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
         let fault = interpreter
             .reconcile_controllers(&mut fx.world)
             .unwrap_err();
         assert!(matches!(fault.trap, Trap::Unsupported(_)), "{fault}");
-        assert!(fault.to_string().contains("person 9 refers"), "{fault}");
+        assert!(fault.to_string().contains("using object 1"), "{fault}");
         assert_eq!(fx.world.encode(), before.encode(), "nothing ran");
         // A reference to the instance that is kept is no obstacle.
         let person = fx.world.objects.get_mut(&9).unwrap().person.as_mut();
