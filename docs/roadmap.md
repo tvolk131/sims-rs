@@ -2022,10 +2022,13 @@ stop-sounds events.
   buy, build and neighbourhood lists, the expansions', the credits', the
   river loops and the slow fade into live mode. `play_trk` hands on the
   caller's arguments and `source`, and `kill_trk` ends the whole track.
-  3 events of kinds not ported remain: the piano (43), and 103 and 104,
-  which are debug commands.
+- **Done: the piano** (43). The piano track plays where its object is,
+  replaces the piano's instances with its track object's own object,
+  and the skill track starts with the object's skill (0x573e5a). A
+  track's start now also sets its levels from its arguments, as the
+  track's `args` field says (0x57db01). 2 events of kinds not ported
+  remain, 103 and 104, which are debug commands.
 - **Next:**
-  - The piano (43).
   - Placing the tracks again when the camera moves (kind 33), once the
     game sends it only then.
   - Tracks and fades step once a block (64 frames, about 2.9 ms); the

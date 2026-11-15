@@ -23,7 +23,10 @@
 //!   the track's argument kind (0x57d9cb): the first is the object that
 //!   started it, which routines pass to `getsrcdatafield`
 //!   ([`crate::sources`]). A track a script starts (`play_trk`) gets
-//!   the caller's own `arg1` to `arg3` (0x57f1f2).
+//!   the caller's own `arg1` to `arg3` (0x57f1f2). A fresh start also
+//!   writes `extvol` and `pan` from the arguments as the argument kind
+//!   says (0x57db01): `arg1` and `arg2` for `kArgsVolPan`, `arg2` and
+//!   `arg3` for `kArgsIdVolPan`.
 //! - *(code)* The registers in [`DEFAULTS`] start as the original's
 //!   default register bank holds them, then `vol` (18) and `duckpri` (25)
 //!   take the HOT track's volume and duck priority; every other starts
@@ -108,6 +111,9 @@
 //!   [`Player::add_scores`]); a mode with no score stops the current one.
 //! - 36, `kSetMusicMode`: changes the music for the game's mode, then
 //!   the ambience (see `Player::set_music_mode`).
+//! - 43, `kPlayPiano`: starts the piano (track [`PIANO`]) where its
+//!   object is, and the skill track [`PIANO_SKILL`] (see
+//!   `Player::play_piano`).
 //!
 //! The game's code also calls kind 33 to move the ambience's cursor from
 //! the camera and the hour: [`Player::set_ambience_view`]. The scores'
@@ -126,9 +132,9 @@
 //! thread where the original would use its one object. When an object
 //! lets go of a track others still have, the original re-evaluates the
 //! shared track (0x5746d9, not read); here that object's threads fade
-//! out and end. Kinds not ported (the music, the piano, reloading, and the sound object calls only the game's
-//! code makes) are reported as faults; kinds whose case does nothing for
-//! sound are ignored.
+//! out and end. Kinds not ported (pausing, reloading, and the sound
+//! object calls only the game's code makes) are reported as faults;
+//! kinds whose case does nothing for sound are ignored.
 //!
 //! **Unverified** against the original at run time: all of the above.
 //! Left out: priorities, and the limit of 16 voices kind 1 checks first
@@ -191,8 +197,15 @@ pub const GLOBALS: u8 = 100;
 /// The register a new note's patch is read from.
 pub const PATCH: u8 = 50;
 
+/// The track argument kind `kArgsVolPan`: `arg1` and `arg2` are the
+/// levels.
+pub const ARGS_VOL_PAN: i64 = 1;
 /// The track argument kind `kArgsIdVolPan`: `arg1` is the object.
 pub const ARGS_ID_VOL_PAN: i64 = 2;
+/// The piano's track, which kind 43 starts (0x573e5a).
+pub const PIANO: u32 = 1906;
+/// The track kind 43 starts after the piano, with the player's skill.
+pub const PIANO_SKILL: u32 = 1907;
 /// The `extvol` register, which `seqgroup_kill` fades out.
 pub const EXTVOL: u8 = 19;
 /// The fade registers: the value to reach, the register that moves, how
@@ -333,9 +346,9 @@ pub mod kind {
         [27, 28, 29, 31, 44, 45, 46, 47, 48, 49, 50, 51, 101, 102];
     /// Kinds the original does something for that this player does not:
     /// reported when an event has one.
-    pub const NOT_PORTED: [i64; 32] = [
+    pub const NOT_PORTED: [i64; 31] = [
         2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 24, 25, 26, 32, 33, 34, 35, 37, 38,
-        39, 40, 41, 42, 43, 103, 104,
+        39, 40, 41, 42, 103, 104,
     ];
 }
 
@@ -586,6 +599,11 @@ pub struct Player<S> {
     /// each pair once, and each track's in the order the original goes
     /// through them ([`Player::record`]).
     instances: Vec<(u32, u32)>,
+    /// *(code)* Each track object's own object (+0xb0, read by vtable
+    /// +0x24): set only by a fresh start of a `kArgsIdVolPan` track
+    /// (0x57db2e), so a start that lets a held track go or is refused
+    /// leaves it. 0 until then, as the track's constructor leaves it.
+    track_objects: BTreeMap<u32, u32>,
     /// The ambience scores, by mode (see [`crate::ambience`]).
     scores: BTreeMap<u32, Fresh>,
     /// *(code)* The current ambience (manager +0x100), by mode.
@@ -650,6 +668,7 @@ impl<S: Samples> Player<S> {
             master: 1024,
             notes: Vec::new(),
             instances: Vec::new(),
+            track_objects: BTreeMap::new(),
             scores: BTreeMap::new(),
             ambience: None,
             music_mode: 4,
@@ -1093,6 +1112,7 @@ impl<S: Samples> Player<S> {
             kind::SET_AMBIENCE_MODE => self.set_ambience_mode(track),
             kind::SET_MUSIC_MODE => self.set_music_mode(module, i64::from(track as i32)),
             kind::TURN_ON_TV => self.turn_on_tv(module, track, args, sources),
+            kind::PLAY_PIANO => self.play_piano(module, args, sources),
             kind::SEQUENCE_TRACK_HIT_LIST => self.sequence(track, args[1]),
             kind::KILL_OBJECT_SOUNDS => self.kill_object_sounds(),
             kind if kind::NOTHING_FOR_SOUND.contains(&kind) => {}
@@ -1147,13 +1167,7 @@ impl<S: Samples> Player<S> {
             .filter(|&&(t, _)| t == track)
             .map(|&(_, object)| object)
             .collect();
-        let spl = self
-            .threads
-            .iter()
-            .chain(&self.pending)
-            .filter(|t| t.track == track)
-            .max_by_key(|t| t.id)
-            .map_or(SPL_NORMAL, |t| self.read(t, i64::from(SPL)));
+        let spl = self.spl(track);
         match placement::combine(&objects, spl, sources) {
             Ok(placed) => Some(placed),
             Err(fault) => {
@@ -1161,6 +1175,17 @@ impl<S: Samples> Player<S> {
                 None
             }
         }
+    }
+
+    /// A track's `Spl`, read from its newest thread through its `target`;
+    /// [`SPL_NORMAL`] when none runs (see [`Player::placed`]).
+    fn spl(&self, track: u32) -> i32 {
+        self.threads
+            .iter()
+            .chain(&self.pending)
+            .filter(|t| t.track == track)
+            .max_by_key(|t| t.id)
+            .map_or(SPL_NORMAL, |t| self.read(t, i64::from(SPL)))
     }
 
     /// *(code)* Writes a placement's `extvol` (0x57d57a) then `pan`
@@ -1462,6 +1487,42 @@ impl<S: Samples> Player<S> {
         self.place(&threads, placed);
     }
 
+    /// Kind 43 (`kPlayPiano`, 0x573e5a): *(code)* the event's track is
+    /// not used; the piano is track [`PIANO`]. With no such track nothing
+    /// happens. Otherwise the object (the first argument) is placed as
+    /// one object, with the piano's `Spl` ([`placement::place`]), into
+    /// the second and third arguments, which keep the event's values when
+    /// it is not placed; the piano starts (and is let go) with them. The
+    /// piano's instances are then replaced by the one object the track
+    /// object holds: the object of the last fresh start, which a start
+    /// that lets a held piano go or is refused does not change, and 0
+    /// before any. Last, the object's source field 5 is asked for, and
+    /// [`PIANO_SKILL`] starts, when it exists, with it as its first
+    /// argument.
+    fn play_piano(&mut self, module: usize, args: [u32; 3], sources: &dyn Sources) {
+        if self.owner(module, PIANO).is_none() {
+            return;
+        }
+        let mut args = args;
+        match placement::place(args[0] as i32, self.spl(PIANO), sources) {
+            Ok(Some((vol, pan))) => {
+                args[1] = vol as u32;
+                args[2] = pan as u32;
+            }
+            Ok(None) => {}
+            Err(fault) => self.report(fault),
+        }
+        self.start(args, module, PIANO, false);
+        let object = self.track_objects.get(&PIANO).copied().unwrap_or(0);
+        self.instances.retain(|&(t, _)| t != PIANO);
+        self.record(PIANO, object);
+        // The skill is asked for before the skill track is looked up.
+        let skill = sources.field(args[0] as i32, 5).unwrap_or(0);
+        if self.owner(module, PIANO_SKILL).is_some() {
+            self.start([skill as u32, 0, 0], module, PIANO_SKILL, false);
+        }
+    }
+
     /// Kind 53 (`kSequenceTrackHitList`): *(code)* picks a patch from a
     /// hit list (the second argument) and chains it on a track
     /// (0x57e088): when the track's newest thread has a note playing, the
@@ -1548,9 +1609,28 @@ impl<S: Samples> Player<S> {
             self.report(format!("track {track}: more than {THREADS} threads"));
             return Vec::new();
         }
-        let Some(thread) = self.thread(args, module, track) else {
+        let Some(mut thread) = self.thread(args, module, track) else {
             return Vec::new();
         };
+        // *(code)* A fresh start sets the levels from the arguments as the
+        // track's `args` field says (0x57db01): `kArgsVolPan` has `extvol`
+        // and `pan` in the first two, `kArgsIdVolPan` in the last two
+        // (after the object). The stores leave the flags alone. (A track
+        // never started, as kind 53 plays on, keeps its defaults.)
+        // A `kArgsIdVolPan` start also makes the object the track
+        // object's own (vtable +0x20).
+        let levels = match self.track_args(module, track) {
+            Some(ARGS_VOL_PAN) => Some((args[0], args[1])),
+            Some(ARGS_ID_VOL_PAN) => {
+                self.track_objects.insert(track, args[0]);
+                Some((args[1], args[2]))
+            }
+            _ => None,
+        };
+        if let Some((vol, pan)) = levels {
+            thread.registers[usize::from(EXTVOL)] = vol as i32;
+            thread.registers[usize::from(PAN)] = pan as i32;
+        }
         let id = thread.id;
         if defer {
             self.pending.push(thread);
