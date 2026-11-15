@@ -93,6 +93,26 @@ impl<'a> Reader<'a> {
         }
     }
 }
+/// Text the original holds, read in the Windows-1252 code page. Every byte
+/// is read as itself: a leading byte-order mark is three characters of the
+/// text, as the original's byte comparisons see it, not a sign of another
+/// encoding.
 pub(crate) fn western(bytes: &[u8]) -> String {
-    encoding_rs::WINDOWS_1252.decode(bytes).0.into_owned()
+    encoding_rs::WINDOWS_1252
+        .decode_without_bom_handling(bytes)
+        .0
+        .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_byte_order_mark_is_read_as_three_characters() {
+        assert_eq!(
+            super::western(b"\xef\xbb\xbfplain.flr"),
+            "\u{ef}\u{bb}\u{bf}plain.flr"
+        );
+        assert_eq!(super::western(b"\xff\xfeA"), "\u{ff}\u{fe}A");
+        assert_eq!(super::western(b"plain.flr"), "plain.flr");
+    }
 }

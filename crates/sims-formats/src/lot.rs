@@ -428,4 +428,17 @@ mod simulator_tests {
             assert!(Simulator::parse(&simulator(version)).is_err());
         }
     }
+
+    #[test]
+    fn a_saved_surface_name_keeps_a_leading_byte_order_mark() {
+        let mut b = Vec::new();
+        b.extend(0u32.to_le_bytes());
+        b.extend(0u32.to_le_bytes());
+        b.extend(b"mRLF");
+        b.extend(1u32.to_le_bytes());
+        b.extend(b"\xef\xbb\xbfplain.flr\0\0");
+        b.extend(0u32.to_le_bytes());
+        let map = surface_map(&b, 1, true).unwrap();
+        assert_eq!(map[0].name, "\u{ef}\u{bb}\u{bf}plain.flr");
+    }
 }
