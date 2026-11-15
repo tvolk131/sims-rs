@@ -122,16 +122,30 @@ choosing a branch, both must agree. This is exactly what is checked:
    tick alone.
 
 What this does not cover: anything the refresh does that the port
-leaves out (the draw state, the face, the pose). In the tick itself the
-sounds of timed events are still not modeled, in both branches.
+leaves out (the draw state, the face, the pose, the head slot's
+redraw). In the tick itself the sounds of timed events are still not
+modeled, in both branches.
 
-The tick alone is kept. A person holding something fails: the refresh
-reads the container entry at begin + 0x48, our slot 2 (the head's
-attachment), and redraws what it holds (0x58dae5 to 0x58dc52); it is
-checked before and after the take-off's callbacks. A held hand (slot 1)
-fails too, which can only add stops. A multi-tile person fails. The draw state
-(0x434101) and the face (0x58faf6) are taken as presentation, as in the
-tick; that is unverified. Person 21 passes all four checks at tick 3356.
+The tick alone is kept. The refresh then redraws what the head slot
+holds (0x58dae5 to 0x58dc55): the container entry at begin + 0x48, our
+slot 2, read when the person has more than two entries. For an ordinary
+object (vtable 0x666d34) every write lands on its graphic ([obj+0x120],
+from vtable +0x2c, 0x4215c3): the head bone's transform (animator +0xac,
+0x5990e0, times animator +0xb0) through graphic +0xac, +0x64 and +0xb8,
+and graphic +0x100 = the person's motive 3 as an integer (0x45d117 reads
++0x78c + 3 * 4; 0x636128 is the C runtime's `_ftol`, not a clock or a
+random draw). Its +0x78 call is 0x51d372, `ret 4`. The animator tick's
+tail (0x58f908 to 0x58fa7f) makes the same redraw every tick, which the
+port already leaves out as presentation, so the take-off's redraw is
+left out too; that is unverified. A person or a tile of a group in the
+head slot fails, since their classes' functions (0x58dc08 to 0x58dc52)
+are not read; this is checked before and after the take-off's
+callbacks. A held hand (slot 1) fails too, though the refresh does not
+read it, which can only add stops. A multi-tile person fails. The draw
+state (0x434101) and the face (0x58faf6) are taken as presentation, as
+in the tick; that is unverified. At tick 3356 person 21's head slot
+holds its plumb bob (object 383, GUID 0x2F726FFF), an ordinary object;
+person 21 then passes all four checks.
 
 **Go To Routing Slot's interrupt tests** (stop at tick 3370):
 

@@ -102,6 +102,54 @@ impl Kept {
     }
 }
 
+/// What a person's animator refresh at its taking itself off the lot
+/// does with its head slot (0x58dae5 to 0x58dc55), when the house view
+/// drew the person ([`Interpreter::take_self_off`]). The refresh reads the
+/// person's container entry at begin + 0x48 when there are more than two
+/// (our slot 2, the head's attachment; it holds the marker over the
+/// selected Sim, GUID 0x2F726FFF). Unless the entry names no bone (+0x20)
+/// or its object (+0x10) is not found, it takes the object's graphic
+/// (virtual function 0x2c; 0x4215c3 for an ordinary object, +0x120), sets
+/// the graphic's transform to the bone's place in the person's frame
+/// (0x5990e0, 0x462aab; the graphic's virtual functions 0xac, 0x64 with
+/// 1 and 0xb8), sets the graphic's +0x100 to the person's motive 3
+/// truncated (0x45d117 with 3, +0x798; 0x636128 is the C runtime's float
+/// to integer), and calls the object's virtual function 0x78 with (0, 0),
+/// which for an ordinary object (vtable 0x666d34) is 0x51d372, a bare
+/// `ret 4`.
+///
+/// So for an ordinary object it writes only the graphic, which nothing
+/// the simulation keeps holds. The animator's tick, which follows in the
+/// same tick, makes the same calls on the same graphic in its tail
+/// (0x58f908 to 0x58fa7f, ending with the graphic's virtual function 0x50
+/// instead), and that redraw is left out as presentation (`crate::animator`);
+/// this one is too, which is as unverified. A person or a tile of a group
+/// in the slot has another class (0x667378, 0x666c20), whose functions
+/// there are not read, so it fails.
+fn head_slot_redraw(world: &World, id: u16) -> Result<(), Trap> {
+    let person = world.objects.get(&id).ok_or_else(missing)?;
+    let Some(slot) = person.slots.get(2).filter(|slot| slot.object > 0) else {
+        return Ok(());
+    };
+    let Some(held) = world.objects.get(&(slot.object as u16)) else {
+        return Ok(());
+    };
+    if held.person.is_some() || held.multipart.is_some() {
+        return Err(Trap::Unsupported(format!(
+            "person {id} takes itself off the lot with {} {} in its head slot: its animator's \
+             refresh, if the house view drew it, redraws it through that class's functions \
+             (0x58dc08 to 0x58dc52), which are not read",
+            if held.person.is_some() {
+                "the person"
+            } else {
+                "the group tile"
+            },
+            slot.object
+        )));
+    }
+    Ok(())
+}
+
 /// Whether a primitive reads nothing of any animator, so it may run while
 /// an animator refresh is pending ([`Interpreter::take_self_off`]): Sleep,
 /// Expression, Change Suit/Accessory on a suit (operand 1 = 1, which
@@ -1244,8 +1292,8 @@ impl Interpreter<'_> {
     /// with 1; its second argument only gates the pose, 0x59820a), places
     /// the animator (virtual function 0x60), and runs the head's step,
     /// measurement and restoration (0x590768, 0x5904d2, 0x590b27). Then it
-    /// redraws what the person carries in its slot 1 (0x58dae5 to
-    /// 0x58dc52), which writes the carried object's +0x100.
+    /// redraws what the person's head slot holds (0x58dae5 to 0x58dc55;
+    /// [`head_slot_redraw`]).
     ///
     /// Whether the byte was set is not known, so both branches are kept
     /// apart until they meet. The refresh is worked out here, on a copy
@@ -1257,9 +1305,10 @@ impl Interpreter<'_> {
     /// yields; until then only primitives that read nothing of an
     /// animator may run ([`reads_no_animator`]), so they cannot tell the
     /// branches apart. The tick settles it
-    /// (`Interpreter::tick_animator_after_take_off`). A person that
-    /// carries something fails, and so does a take-off outside the
-    /// person's own tick.
+    /// (`Interpreter::tick_animator_after_take_off`). A person whose head
+    /// slot holds a person or a tile of a group fails
+    /// ([`head_slot_redraw`]), and so does one whose hand (slot 1) holds
+    /// anything, and a take-off outside the person's own tick.
     pub(crate) fn take_self_off(&self, world: &mut World, id: u16) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: id,
@@ -1276,26 +1325,22 @@ impl Interpreter<'_> {
         if object.multipart.is_some() {
             return Err(fail(Trap::Invalid("a person with several tiles".into())));
         }
-        // At the refresh (0x58dae5 to 0x58db0e) the animator reads the
-        // container entry at begin + 0x48, our slot 2 (the head's
-        // attachment, logical slot 1), and redraws what it holds
-        // (0x58dc08 to 0x58dc52), which is not ported. The refresh comes
-        // after the callbacks below, so the slot is read there; it is
-        // read before them too, which can only add stops. A person whose
-        // hand holds something (slot 1) also fails: what its refresh does
-        // with that is not read.
+        // The refresh comes after the callbacks below, so its head slot
+        // redraw reads the slot there ([`head_slot_redraw`]); it is read
+        // before them too, which can only add stops. A person whose hand
+        // holds something (slot 1) also fails, which can only add stops:
+        // the refresh reads no other container entry.
         let holding = |world: &World| {
             let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
-            let held = |n: usize| object.slots.get(n).is_some_and(|slot| slot.object != 0);
-            if held(2) || held(1) {
+            if object.slots.get(1).is_some_and(|slot| slot.object != 0) {
                 return Err(fail(Trap::Unsupported(
-                    "a person holding something taking itself off the lot: its animator's \
-                     refresh, if the house view drew it, redraws what its head slot holds \
-                     (0x58dae5 to 0x58dc52), which is not ported"
+                    "a person whose hand holds something taking itself off the lot: its \
+                     animator's refresh, if the house view drew it, is taken to read only its \
+                     head slot (0x58dae5 to 0x58dc55)"
                         .into(),
                 )));
             }
-            Ok(())
+            head_slot_redraw(world, id).map_err(fail)
         };
         holding(world)?;
         // 0x4332e0 to 0x4332ed: the refresh comes after the holder's

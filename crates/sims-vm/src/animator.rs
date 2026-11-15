@@ -290,7 +290,9 @@ impl Interpreter<'_> {
     /// update forced at it, the animator placed, and the head's step,
     /// measurement and restoration. What the original also does there and
     /// the animator's tick leaves out (the draw state, the face, the pose)
-    /// is left out here too; a carried object's redraw is refused before.
+    /// is left out here too, and so is the redraw of what the head slot
+    /// holds (`crate::placement::head_slot_redraw`), which is checked
+    /// before.
     fn refresh_animator(&self, world: &mut World, id: u16) -> Result<(), Trap> {
         let object = world
             .objects
