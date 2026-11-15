@@ -61,6 +61,9 @@ pub mod id {
     /// A personality bar, full and empty (0x520f67).
     pub const TRAIT_FULL: i32 = 4900;
     pub const TRAIT_EMPTY: i32 = 4903;
+    /// A skill bar, full and empty, in a western language (0x52f356).
+    pub const SKILL_FULL: i32 = 4901;
+    pub const SKILL_EMPTY: i32 = 4920;
     pub const TEMPLATE: i32 = crate::household::TEMPLATE;
     pub const NORMAL: i32 = 4705;
     pub const FAST: i32 = 4706;
@@ -72,7 +75,7 @@ pub mod id {
 }
 
 /// Every resource the panel may draw, for [`Art::load`].
-pub const RESOURCES: [i32; 39] = [
+pub const RESOURCES: [i32; 41] = [
     id::WALLS_DOWN,
     id::CUTAWAY,
     id::WALLS_UP,
@@ -103,6 +106,8 @@ pub const RESOURCES: [i32; 39] = [
     id::RED_BARS,
     id::TRAIT_FULL,
     id::TRAIT_EMPTY,
+    id::SKILL_FULL,
+    id::SKILL_EMPTY,
     id::TEMPLATE,
     id::NORMAL,
     id::FAST,
@@ -229,6 +234,10 @@ pub enum Kind {
     /// ([`crate::household::PERSONALITY`]). Laid out when drawn, from the
     /// labels' font.
     Personality([i16; 5]),
+    /// The job panel's skills, in `rect`, the subpanel: the selected
+    /// Sim's skills and what the next level of their career needs of
+    /// each, in the panel's order ([`crate::household::SKILLS`]).
+    Skills { skills: [i16; 6], needs: [i16; 6] },
     /// The first name of the person of type `guid`, in a box centered
     /// over `rect`'s bottom edge, while the pointer is on their portrait.
     Name { guid: u32 },
@@ -592,6 +601,29 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             command: None,
         });
     }
+    if let (Some(resident), Panel::Job) = (selected, controls.panel) {
+        let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
+        // The title where the job panel's draw puts it in a western
+        // language (0x530340).
+        items.push(Item {
+            rect: panel.offset(JOB_TITLE[0], JOB_TITLE[1]).with_size(100, 20),
+            kind: Kind::Text {
+                text: "Job".into(),
+                size: 11,
+                rgb: LABEL,
+                align: Align::Left,
+            },
+            command: None,
+        });
+        items.push(Item {
+            rect: panel,
+            kind: Kind::Skills {
+                skills: resident.skills,
+                needs: resident.needs,
+            },
+            command: None,
+        });
+    }
     // The name of the person whose portrait the pointer is on, over the
     // strip above the portrait. Ours: where and how the original shows a
     // name there is **unverified**.
@@ -664,6 +696,77 @@ fn draw_personality(frame: &mut Frame, art: &Art, panel: Rect, values: &[i16; 5]
         if points > 0 {
             frame.draw(full, Rect::new(0, 0, (points * 4).min(full_w), full_h), at);
         }
+    }
+}
+
+/// The job panel's title, from the subpanel (0x530340).
+const JOB_TITLE: [i32; 2] = [35, 3];
+/// The job panel's skill labels, in a western language (Live.iff STR#
+/// 136, strings 1 to 6).
+const SKILL_NAMES: [&str; 6] = [
+    "Cooking",
+    "Mechanical",
+    "Charisma",
+    "Body",
+    "Logic",
+    "Creativity",
+];
+/// The skill labels' font (0x6f2ae0) and the boxes they are right
+/// aligned in: 62 by 16, the first at (93, 6), 15 apart (0x6f4420).
+const SKILL_FONT: u8 = 7;
+const SKILL_LABEL: [i32; 4] = [93, 6, 62, 16];
+/// The first skill bar, from the subpanel; the others are 15 below each
+/// other (0x6f4300).
+const SKILL_BAR: [i32; 2] = [157, 7];
+const SKILL_PITCH: i32 = 15;
+
+/// The job panel's skills as the original draws them (0x5301ca). Each
+/// skill's empty bar, then the full bar over it cut to 4 pixels a point
+/// (at 10 points, all of it). Where the next level of the career needs
+/// more of a skill, its label shows and a line marks the need: down the
+/// bar at the need, and along the bar's bottom from 16 pixels left of
+/// the bar to it, in the labels' color (0x6f2a94).
+fn draw_skills(frame: &mut Frame, art: &Art, panel: Rect, skills: &[i16; 6], needs: &[i16; 6]) {
+    let (Some(font), Some(empty), Some(full)) = (
+        art.font(SKILL_FONT),
+        art.image(id::SKILL_EMPTY),
+        art.image(id::SKILL_FULL),
+    ) else {
+        return;
+    };
+    let full_w = i32::try_from(full.width).unwrap_or(0);
+    let full_h = i32::try_from(full.height).unwrap_or(0);
+    for (n, ((name, skill), need)) in SKILL_NAMES.iter().zip(skills).zip(needs).enumerate() {
+        let row = SKILL_PITCH * n as i32;
+        let bar = [panel.x + SKILL_BAR[0], panel.y + SKILL_BAR[1] + row];
+        frame.draw_all(empty, bar);
+        let points = i32::from(*skill / 100).clamp(0, 10);
+        let width = points * 4;
+        if points > 0 {
+            let cut = if width <= full_w && points != 10 {
+                width
+            } else {
+                full_w
+            };
+            frame.draw(full, Rect::new(0, 0, cut, full_h), bar);
+        }
+        if *need <= 0 {
+            continue;
+        }
+        let [x, y, w, h] = SKILL_LABEL;
+        let label = Rect::new(panel.x + x, panel.y + y + row, w, h);
+        let at = [
+            label.x + label.width - font.width(name),
+            label.y + (label.height - font.line_height) / 2,
+        ];
+        font.draw(frame, name, at, LABEL);
+        let mark = bar[0] + i32::from(*need / 100) * 4 - 1;
+        let bottom = bar[1] + full_h - 1;
+        frame.fill(Rect::new(mark, bar[1], 1, bottom - bar[1] + 1), LABEL);
+        frame.fill(
+            Rect::new(bar[0] - 16, bottom, mark - (bar[0] - 16) + 1, 1),
+            LABEL,
+        );
     }
 }
 
@@ -853,6 +956,7 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                 }
             }
             Kind::Personality(values) => draw_personality(frame, art, r, values),
+            Kind::Skills { skills, needs } => draw_skills(frame, art, r, skills, needs),
             Kind::Meter(value) => {
                 let (width, left, right) = meter(*value);
                 frame.fill(r, right);
@@ -907,6 +1011,7 @@ impl Item {
                     | Kind::Meter(_)
                     | Kind::Name { .. }
                     | Kind::Personality(_)
+                    | Kind::Skills { .. }
             )
     }
 }
@@ -957,6 +1062,9 @@ mod tests {
                     guid: u32::from(object),
                     motives: [50.; 16],
                     personality: [0; 5],
+                    skills: [0; 6],
+                    job: [0; 2],
+                    needs: [0; 6],
                 })
                 .collect(),
             selected: Some(21),
@@ -1043,6 +1151,9 @@ mod tests {
                 guid: u32::from(object),
                 motives: [0.; 16],
                 personality: [0; 5],
+                skills: [0; 6],
+                job: [0; 2],
+                needs: [0; 6],
             })
             .collect();
         let controls = Controls {
@@ -1293,5 +1404,89 @@ mod tests {
             assert_eq!(row[198 - 150], if points == 10 { full } else { empty });
             assert_eq!(row[199 - 150], [0; 3]);
         }
+    }
+
+    #[test]
+    fn the_job_panel_shows_the_skills_and_what_the_next_level_needs() {
+        let mut s = snapshot();
+        s.residents[0].skills = [250, -5, 1000, 0, 999, 380];
+        s.residents[0].needs = [0, 300, 0, 0, 0, 700];
+        let controls = Controls {
+            expanded: true,
+            panel: Panel::Job,
+            ..Controls::default()
+        };
+        let items = layout([800, 600], &s, &controls);
+        let panels: Vec<&Item> = items
+            .iter()
+            .filter(|i| matches!(i.kind, Kind::Skills { .. }))
+            .collect();
+        assert_eq!(panels.len(), 1);
+        assert_eq!(panels[0].rect, Rect::new(521, 500, 279, 100));
+        assert_eq!(
+            panels[0].kind,
+            Kind::Skills {
+                skills: [250, -5, 1000, 0, 999, 380],
+                needs: [0, 300, 0, 0, 0, 700],
+            }
+        );
+        let title = items
+            .iter()
+            .find(|i| matches!(&i.kind, Kind::Text { text, .. } if text == "Job"))
+            .unwrap();
+        assert_eq!((title.rect.x, title.rect.y), (521 + 35, 500 + 3));
+        assert_eq!(press(&items, [700, 520]), None);
+        s.selected = None;
+        let items = layout([800, 600], &s, &controls);
+        assert!(!items.iter().any(|i| matches!(i.kind, Kind::Skills { .. })));
+
+        // Bars 40 by 11 from (157, 7), 15 apart; labels in a font whose
+        // glyphs are 0 wide, so they draw nothing.
+        let (empty, full) = ([1, 1, 1], [2, 2, 2]);
+        let mut art = Art::default();
+        art.insert_font(SKILL_FONT, crate::font::tests::font());
+        art.insert(id::SKILL_EMPTY, solid(40, 11, empty));
+        art.insert(id::SKILL_FULL, solid(40, 11, full));
+        let mut frame = Frame::new(220, 110, [0; 3]);
+        draw_skills(
+            &mut frame,
+            &art,
+            Rect::new(0, 0, 220, 100),
+            &[250, -5, 1000, 0, 999, 380],
+            &[0, 300, 0, 0, 0, 700],
+        );
+        // 4 pixels a point: 2, none, 10 (all 40), none, 9, 3.
+        for (n, points) in [2, 0, 10, 0, 9, 3].into_iter().enumerate() {
+            let y = 7 + 15 * n as i32 + 5;
+            let row: Vec<_> = (140..200).map(|x| frame.pixel(x, y).unwrap()).collect();
+            let at = |x: i32| row[(x - 140) as usize];
+            assert_eq!(at(156), [0; 3], "bar {n}");
+            assert_eq!(at(157), if points > 0 { full } else { empty });
+            assert_eq!(
+                at(157 + 4 * points - 1),
+                if points > 0 { full } else { [0; 3] }
+            );
+            if points < 10 {
+                assert_eq!(at(157 + 4 * points), empty, "bar {n}");
+            }
+            assert_eq!(at(196), if points == 10 { full } else { empty });
+            assert_eq!(at(197), [0; 3]);
+        }
+        // Mechanical needs 3 points: a line down the bar's last pixel of
+        // the third point (168), and along its bottom row (y 32) from 141.
+        for y in 22..=32 {
+            assert_eq!(frame.pixel(168, y), Some(LABEL), "y {y}");
+        }
+        assert_eq!(frame.pixel(168, 21), Some([0; 3]));
+        for x in 141..=168 {
+            assert_eq!(frame.pixel(x, 32), Some(LABEL), "x {x}");
+        }
+        assert_eq!(frame.pixel(140, 32), Some([0; 3]));
+        assert_eq!(frame.pixel(169, 32), Some(empty));
+        // Creativity needs 7, past its 3: the line is on the empty part.
+        assert_eq!(frame.pixel(157 + 28 - 1, 7 + 75), Some(LABEL));
+        assert_eq!(frame.pixel(157 + 28 - 1, 7 + 75 + 10), Some(LABEL));
+        // No need, no line: Cooking's bottom row left of its bar is clear.
+        assert_eq!(frame.pixel(150, 7 + 10), Some([0; 3]));
     }
 }

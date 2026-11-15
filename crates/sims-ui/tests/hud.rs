@@ -121,3 +121,58 @@ fn the_goths_personality_panel() {
         "6918f761eeafd0f57e77727e1ff1c63d0be1aed8cf3cd08b978e6bd57fbcd853"
     );
 }
+
+#[test]
+fn the_goths_job_panel() {
+    let Some(root) = common::install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to draw the control panel");
+        return;
+    };
+    let opened = common::open(&root, common::GOTH_HOUSE);
+    // Mortimer is a Science "Test Subject" (career 9, level 0), Bella has
+    // no career, and Cassandra is at school (-1); nobody has a skill yet,
+    // and the next level of Mortimer's career needs none.
+    let jobs: Vec<_> = opened
+        .snapshot
+        .residents
+        .iter()
+        .map(|r| (r.job, r.skills, r.needs))
+        .collect();
+    assert_eq!(
+        jobs,
+        [
+            ([9, 0], [0; 6], [0; 6]),
+            ([0, 0], [0; 6], [0; 6]),
+            ([-1, 4], [0; 6], [0; 6])
+        ]
+    );
+    let controls = Controls {
+        expanded: true,
+        panel: Panel::Job,
+        ..Controls::default()
+    };
+    let draw = |snapshot| {
+        let mut frame = Frame::new(800, 600, [0, 0, 0]);
+        let items = hud::layout([800, 600], snapshot, &controls);
+        hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
+        digest(&frame)
+    };
+    // Pins the drawing; it has not been compared with the original's
+    // screen (see docs/decisions.md).
+    assert_eq!(
+        draw(&opened.snapshot),
+        "853d8f5f84a87fe117699855df052fb7352ff573a0608630d309dab4ac09b1a9"
+    );
+    // A level up the ladder, "Field Researcher": the next level, "Science
+    // Teacher", needs a point of Charisma and three of Logic, and he has
+    // two of Logic.
+    let mut snapshot = opened.snapshot.clone();
+    snapshot.residents[0].job = [9, 2];
+    snapshot.residents[0].skills = [0, 0, 0, 0, 200, 0];
+    let snapshot = snapshot.with_careers(&opened.careers);
+    assert_eq!(snapshot.residents[0].needs, [0, 0, 100, 0, 300, 0]);
+    assert_eq!(
+        draw(&snapshot),
+        "0b6aa2fbe51928b75e2a87a9c581d6550ecb86cb0ee2526c756f5295b6e256bc"
+    );
+}
