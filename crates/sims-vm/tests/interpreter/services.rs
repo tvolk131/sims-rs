@@ -527,7 +527,7 @@ fn generic_call_2_names_the_running_actions_icon() {
 }
 
 #[test]
-fn generic_call_2_needs_a_stack_object_then_a_person() {
+fn generic_call_2_from_a_tree_checks_the_stack_object_then_the_person() {
     // The stack object is checked first (native error 0xa), then that the
     // caller is a person (0x1c).
     let mut fx = Fixture::new();
