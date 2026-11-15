@@ -16,8 +16,9 @@ The project is being re-founded. An earlier prototype mirrored the original
 executable's internals. That code now lives under [legacy/](legacy/README.md)
 as reference material and is not built. The
 [salvage audit](docs/salvage-audit.md) records what is being carried forward.
-The [roadmap](docs/roadmap.md) sets the current goal: a headless lot boot that
-matches the original game tick for tick.
+The [roadmap](docs/roadmap.md) sets the current goal: a simulation that matches
+the original game across what a real player does. A headless lot boot that
+matches it tick for tick, for the first 1000 ticks of the Goth house, is done.
 
 | Crate | Responsibility |
 | --- | --- |
