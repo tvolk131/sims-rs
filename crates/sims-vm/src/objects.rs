@@ -29,7 +29,7 @@
 //! (legacy/crates/sims-vm/src/person_factory.rs and loading.rs).
 //!
 //! For the Goth house the result was compared with a capture of the
-//! original taken when the read returns; `docs/decisions.md` says what was
+//! original taken when the read returns; `docs/decisions/` says what was
 //! equal.
 
 use crate::fault::{Fault, Trap};
@@ -142,6 +142,20 @@ impl Draws<'_> {
     }
 }
 
+/// The types whose saved attributes may outnumber what their constructor
+/// allocates (0x43df98, 0x43dfa3, 0x43dfae and 0x43dfb9, read at
+/// 0x43fe49): the house read lets each of these grow its attribute array to
+/// the saved count. The last two only when the configuration's expansions
+/// byte (`[0x6e48bc]+0x66`, the mask global 20 is set from) has Unleashed's
+/// bit, 0x20; without it both slots hold the first type (0x43fe9d).
+const GROWN: [u32; 4] = [0x3C08_965F, 0x7FD9_6B54, 0x4A70_DF92, 0x7BEA_0977];
+
+/// Whether the house read lets type `guid` grow its attribute array.
+fn grows(guid: u32, expansions: i16) -> bool {
+    let types = if expansions & 0x20 != 0 { 4 } else { 2 };
+    GROWN[..types].contains(&guid)
+}
+
 impl Interpreter<'_> {
     /// Load step 6e: reads a house's saved objects onto the lot (0x449c5e).
     /// The lot must hold no objects: the original clears it first.
@@ -173,12 +187,29 @@ impl Interpreter<'_> {
     ///
     /// On an error the lot is unchanged. These fail: a lot that holds
     /// objects; an object or a multi-tile lead without a definition; saved
-    /// attributes beyond what the constructor allocates; a person type with
-    /// no skeleton in `people`; and a person with no neighborhood record,
-    /// for which the original makes one.
+    /// attributes beyond what the constructor allocates, for a type the
+    /// house read does not let grow (`GROWN`); a person type with
+    /// no skeleton in `people`; a person with no neighborhood record,
+    /// for which the original makes one; and a person whose saved
+    /// animator the restore does not port (`crate::restore`), among them
+    /// every person whose type's scripts did not change since the save,
+    /// which load step 13 does not reset.
+    ///
+    /// Each person's animator is restored as far as the simulation reads
+    /// it (`crate::restore`): what differs from
+    /// [`sims_sim::animator::LOADED`] goes into [`World::animators`], and
+    /// the pose its saved layers left in the skin into
+    /// [`World::held_poses`].
+    ///
+    /// A person saved part way through a route keeps only the number of
+    /// its route contexts; the load makes that many, each as its default
+    /// constructor makes it
+    /// ([`crate::routing::slot::loaded_context`], 0x460443), and the
+    /// first run of the route's steps pops it (0x45ae71). A negative
+    /// count fails.
     ///
     /// Not modeled: object flags (the constructor sets 0x200 and the read
-    /// 0x80), each person's animator and its saved animations, the count
+    /// 0x80), the count
     /// of queued interactions the game keeps, and graphics for objects
     /// that have their own (definition byte 0xcc bit 0), which fail.
     ///
@@ -208,6 +239,7 @@ impl Interpreter<'_> {
             count: 0,
         };
         let mut files = world.skeleton_files.clone();
+        let expansions = world.globals.get(20).copied().unwrap_or(0);
         let mut objects = BTreeMap::new();
         let mut order = Vec::new();
         // First every object is constructed, then every object is read.
@@ -218,7 +250,14 @@ impl Interpreter<'_> {
                 continue;
             };
             let object = self
-                .construct_saved(instance, people, &world.neighbors, &mut draws, &mut files)
+                .construct_saved(
+                    instance,
+                    people,
+                    &world.neighbors,
+                    &mut draws,
+                    &mut files,
+                    expansions,
+                )
                 .map_err(|trap| fail(id, trap))?;
             if objects.insert(id, object).is_some() {
                 return Err(fail(id, Trap::Invalid("a saved ID is listed twice".into())));
@@ -226,6 +265,47 @@ impl Interpreter<'_> {
             order.push(id);
         }
         let next_parts = link_parts(&objects, &order).map_err(|(id, trap)| fail(id, trap))?;
+        // Each person's animator, as its read restores it (0x5918ba) and
+        // the person's reset in load step 13 leaves it.
+        let mut animators = BTreeMap::new();
+        let mut held_poses = BTreeMap::new();
+        for &id in &order {
+            let restored = self
+                .restore_animator(
+                    id,
+                    &objects[&id],
+                    world.ticks,
+                    world.changed_types.contains(&objects[&id].guid),
+                )
+                .map_err(|trap| fail(id, trap))?;
+            if let Some(a) = restored.animator {
+                animators.insert(id, a);
+            }
+            if let Some(held) = restored.held {
+                held_poses.insert(id, held);
+            }
+        }
+        // Each person's route contexts: as many as the save counts, each
+        // as the load makes it (0x460443). A negative count, which the
+        // original's resize would take as erasing before the start, fails.
+        let mut contexts = BTreeMap::new();
+        for &id in &order {
+            let Some(person) = objects[&id].person.as_ref() else {
+                continue;
+            };
+            let frames = usize::try_from(person.routing_frames).map_err(|_| {
+                fail(
+                    id,
+                    Trap::Unsupported(format!(
+                        "the person's saved route context count is {} (0x460443)",
+                        person.routing_frames
+                    )),
+                )
+            })?;
+            if frames != 0 {
+                contexts.insert(id, vec![crate::routing::slot::loaded_context(); frames]);
+            }
+        }
         let count = draws.count;
         world.crt_rng = crt;
         world.skeleton_files = files;
@@ -238,6 +318,11 @@ impl Interpreter<'_> {
         world.order = order.clone();
         world.people = world.registered_people();
         world.next_parts = next_parts;
+        world.animators.extend(animators);
+        world.held_poses.extend(held_poses);
+        for (id, contexts) in contexts {
+            world.routing.routes.entry(id).or_default().contexts = contexts;
+        }
         // 0x41f320: reading an interaction (a person's running one, its
         // last one and each queued one: 0x45d012, 0x45d01f, 0x45d08b)
         // raises the action serial to its number when that is larger,
@@ -269,6 +354,7 @@ impl Interpreter<'_> {
         neighbors: &Neighbors,
         draws: &mut Draws<'_>,
         files: &mut BTreeSet<String>,
+        expansions: i16,
     ) -> Result<Object, Trap> {
         let definition = self
             .catalog
@@ -311,13 +397,25 @@ impl Interpreter<'_> {
         if person {
             construct_person(saved.guid, people, neighbors, draws, files)?;
         }
-        // The read (the object's function at vtable offset 0x7c).
-        if saved.attributes.len() > attributes {
-            return Err(Trap::Unsupported(format!(
-                "{} saved attributes, more than the {attributes} the constructor allocates",
-                saved.attributes.len()
-            )));
-        }
+        // The read (the object's function at vtable offset 0x7c, 0x4342ae).
+        // From version 0x18 the saved attribute count comes first; when it
+        // is larger than the array, the array is made that long, zeroed and
+        // read whole if the house read asks for it (0x434345), and the
+        // house read (0x4400a7) asks only for the types in `GROWN`.
+        let attributes = if saved.attributes.len() > attributes {
+            if !grows(saved.guid, expansions) {
+                return Err(Trap::Unsupported(format!(
+                    "{} saved attributes of type 0x{:08X}, more than the {attributes} the \
+                     constructor allocates: the original reads them past the array's end \
+                     (0x43437b)",
+                    saved.attributes.len(),
+                    saved.guid
+                )));
+            }
+            saved.attributes.len()
+        } else {
+            attributes
+        };
         let mut object = Object {
             id: saved.id,
             guid: saved.guid,

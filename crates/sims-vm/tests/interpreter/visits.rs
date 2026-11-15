@@ -278,8 +278,11 @@ fn a_multi_tile_object_is_rebuilt_as_a_group() {
     let (mut fx, file) = lot();
     let lead = stand(&mut fx, [2, 2]);
     let tile = stand(&mut fx, [3, 2]);
-    // The definition is in a group (word 10).
+    // The definition is in a group (word 10), and is the group's master
+    // (word 11 -1, 0x43adf7): the door test on taking a tile off reads
+    // the master (0x45728d).
     fx.words(file)[10] = 5;
+    fx.words(file)[11] = -1;
     for (id, parent, place) in [(lead, 0, 0), (tile, lead as i16, 1)] {
         fx.world.objects.get_mut(&id).unwrap().multipart = Some(Multipart {
             offset: [place, 0, 0],
@@ -537,6 +540,39 @@ fn a_changed_person_resets_in_its_own_way_and_then_runs_init() {
 }
 
 #[test]
+fn a_changed_person_using_an_object_lets_it_go_and_the_object_resets() {
+    // 0x45e814: the person's thread pops frames down to the use's frame
+    // count less one, the last pop releasing the use; then the object it
+    // used resets (its function 3 here), before the person's own reset.
+    let (mut fx, file) = lot();
+    let people = resident(&mut fx);
+    let widget = stand(&mut fx, [2, 2]);
+    fx.add(file, CANCELLED, note(7, scope::LITERAL, 8));
+    function(&mut fx, file, 3, CANCELLED);
+    fx.world.changed_types.insert(RESIDENT);
+    let person = fx
+        .world
+        .objects
+        .get_mut(&PERSON)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person
+        .object_uses
+        .push(sims_formats::saved_objects::ObjectUse {
+            target: widget as i16,
+            stack_depth: 1,
+            unknown: 0,
+        });
+    let visited = visit_with(&mut fx, PERSON, &people);
+    assert_eq!(visited, [(widget, 3), (PERSON, 3), (PERSON, 0)]);
+    assert_eq!(fx.lamp().attributes[7], 8);
+    let person = fx.world.objects[&PERSON].person.as_ref().unwrap();
+    assert!(person.object_uses.is_empty());
+}
+
+#[test]
 fn a_profile_string_that_is_missing_leaves_its_word() {
     let profile =
         |gender: Option<&str>, age: Option<&str>, skin: Option<&str>| sims_content::Profile {
@@ -596,23 +632,10 @@ fn a_person_the_reset_would_do_more_for_stops_its_visit() {
     let person = |change: &dyn Fn(&mut sims_formats::saved_objects::Person)| {
         fails(&|object| change(object.person.as_mut().unwrap()))
     };
-    let using = person(&|p| {
-        p.object_uses.push(sims_formats::saved_objects::ObjectUse {
-            target: 1,
-            stack_depth: 1,
-            unknown: 0,
-        })
-    });
-    assert!(using.contains("that is using an object"), "{using}");
     let acting = person(&|p| p.active.target = 77);
     assert!(
         acting.contains("whose running action has a target"),
         "{acting}"
-    );
-    let routing = person(&|p| p.routing_frames = 1);
-    assert!(
-        routing.contains("whose routing frame count is not 0"),
-        "{routing}"
     );
     let wide = person(&|p| p.data[73] = 1);
     assert!(wide.contains("whose data word 73 is set"), "{wide}");
@@ -1107,15 +1130,6 @@ fn what_removing_a_person_does_not_port_fails_loudly() {
         assert!(fx.world.objects.contains_key(&PERSON));
         fault.to_string()
     };
-    // A last reset the original does more for.
-    let routing = fails(&|w| {
-        let person = w.objects.get_mut(&PERSON).unwrap();
-        person.person.as_mut().unwrap().routing_frames = 1;
-    });
-    assert!(
-        routing.contains("whose routing frame count is not 0"),
-        "{routing}"
-    );
     // Before the load has worked the lot's rooms out.
     let early = fails(&|w| w.rooms = Default::default());
     assert!(early.contains("rooms out"), "{early}");

@@ -51,50 +51,78 @@ events, and what it asks for after them) come first.
 ### Progress
 
 - Step 1 is done.
+- Step 4: the first player-order recording (track 2's goth-snack
+  scenario) replayed through the window's input layer equals the
+  original's state after every update to 453, once a press lists the
+  menu again and reaching an entry checks it again. From update 454 the
+  snack's simulation differs (the Room motive, then Mortimer's data
+  word 50): see the decisions log.
 - The integration hooks are merged: play mode (#120), player orders
   (#121), sound events (#122), Idle For Input starting a queued action
   (#131), the pie menu and picking from it (#132), and Go To Routing
   Slot's parameter and global slots (#134), which a player's snack order
-  reached. A route interrupted while its animator is under way (an order
-  given or cancelled mid-walk) asks the animator to stop and waits a
-  tick, as the original does (0x45b3c2, 0x58eeeb).
-- Strict mode on the Goth house runs to tick 3602, 08:30 on the first
+  reached.
+- Strict mode on the Goth house runs to tick 9906, 12:00 on the first
   day. One tick is two game seconds, so a day is 43,200 ticks (measured
   from the clock globals). The carpool makes the school bus at tick 2703
   (the multi-tile factory is ported). The base layer is kept and the
   pose composed from it, and a person may take itself off the lot in
   its own tick. A multi-tile object may snap where it does not fit
   (0x454e82), and a group is deleted (0x440f37): at tick 3434 the car
-  junk's 18 tiles go. At tick 3603 object 354 uses Create New Object
-  Instance mode 6 with flag 0x4, which is not ported (the same stop as
-  the snack order's). Step 2 continues from there.
+  junk's 18 tiles go. At tick 3603 object 354 makes two neighbors'
+  people off the lot (Create New Object Instance mode 6, flag 0x4) and
+  removes them. At tick 3913 a seated person's route stands it up
+  first; at tick 6756 a pet is made (the expansions installed allow
+  pets) and walks, runs and turns at its own pace; an inventory count
+  goes up at 7702 and a route with no door gives up at 9337. Past tick
+  1000 this is unverified: there is no capture. In a live run of the
+  original Cassandra walks to the school bus at 8:06 AM, while ours keeps
+  her on the bench, a gap in the simulation's timing. At tick 9907 object 5
+  walks the neighborhood's lots in order of distance (Set To Next mode
+  11), which needs a lot-position table the simulation does not hold
+  (the snack order stops on it at the same step). Step 2 continues from
+  there.
 - Of the base neighborhood's houses only the Goths' and the Newbies'
   (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
-  tick 1802; a route that gives up on a slot it may end near runs the
+  tick 4052; a route that gives up on a slot it may end near runs the
   Route failure feedback tree (tick 1473). Against the recording of the
   house (updates 0 to 935), every update's random streams, scheduler
   cursor, action serial, globals and objects, and each object's data,
   temps, attributes, frames and person data match, except the words the
   original left from memory it never set (person word 37, locals on half
   a pointer) and global 12 at updates 1 and 3 (the interface's tutorial
-  wait). At tick 1803 object 290 needs Create New Object Instance mode 6
-  with flag 0x4, which track 3 is porting for the Goths' snack order.
-- The Pleasants (`House06.iff` as the original saved it after moving
-  them in, with the Traveling Salesman on the lot) load to the state the
-  first tick starts from: the end of the household selection works out
-  again who is a visitor, and reading the people raises the action
-  serial. Their load equals the capture's but for one person's data word
-  50 and last result, which something in the original's load sets and
-  which is not found yet. The first frame then stops: person 242's head
-  follows person 241, whose animator has never been ticked or drawn, and
-  what the original reads for it is not ported.
+  wait). At tick 1803 object 290 makes two neighbors' people off the lot
+  (Create New Object Instance mode 6, flag 0x4), unverified past update
+  935. The frame drawn after tick 4053 finds person 140's skin waiting
+  for its update (0x590d26), which is not ported.
+- Before #208's animator restore, the Pleasants (`House06.iff` as the
+  original saved it after moving them in, with the Traveling Salesman on
+  the lot) loaded to the state the first tick starts from: the end of
+  the household selection works out again who is a visitor, and reading
+  the people raises the action serial. That load equals the capture's
+  but for one person's data word 50 and last result, which something in
+  the original's load sets and which is not found yet. The load now
+  restores a reset person's animator and the pose its saved layers left
+  in the skin (0x5918ba, #208). No Pleasant's type changed since the
+  save, so the load resets none of them, and their animators keep what
+  the restore read: clips playing on from their saved phase, saved
+  routing states and route contexts. That is not ported, so the load
+  stops on person 117. Next: the live animator restore for persons the
+  load does not reset (the Pleasants, the Roomies). **Unverified:** the
+  restored target point's height differs from the capture's in the last
+  place (0x4187338d here, 0x4187338e there); nothing reads it before the
+  next measurement writes it.
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
-  read their arrays whole (Arry 11, 12, 111 and 112). UserData2's
-  houses 1 and 9 then stop at their floor and wall maps
-  (`World::renumber_surfaces`), and the houses with no family stop at
-  the household selection. The templates' `Patch` families are not
-  imported (see `docs/decisions.md`).
+  read their arrays whole (Arry 11, 12, 111 and 112). Their floor
+  and wall maps are renumbered through the game's pattern catalogs
+  (`sims_content::Surfaces`, `World::renumber_surfaces`). UserData2's
+  house 9 then gets past its first frame and stops at tick 232 on Snap
+  mode 0 (0x4549c7), which has its own PR; the houses with no family stop at the
+  household selection, and the community lots (UserData's houses 40 to
+  48) where Create New Object Instance mode 6 makes a person (0x44e60e).
+  Four types grow their attribute arrays to the saved count (0x4342ae). The templates' `Patch` families are not
+  imported (see `docs/decisions/`).
 
 ## Met goal: a headless lot boot that matches the original
 
@@ -122,7 +150,7 @@ How it was reached:
    Five runs of the Goth house were recorded; the first covered 1000 lot
    updates, tick counts 88445 to 89444. The first does not choose in
    tick 233 and the other four do; we follow those
-   (`docs/decisions.md`). With the install's own UserData, the C
+   (`docs/decisions/`). With the install's own UserData, the C
    runtime's random stream and all 463 neighborhood records match too.
    The original first draws from the C runtime's stream in tick 6, 1,466
    times, when it makes a person; ours draws the same.
@@ -159,7 +187,7 @@ That starting lot is **unverified**; see the decision log.
 | 4 | Clear the family global | `0x415eff` | Done (`World::clear_family`) |
 | 5 | Clear the lot: remove every object on it | `0x44279a`, `0x445f84`, `0x44123f`, `0x440eeb` | Done for objects that are off the lot (`Interpreter::clear`) |
 | 6a | Read the house's lot arrays | `0x478599` | Done for house versions 53 to 62 (`World::read_arrays`) |
-| 6b | Renumber the saved floor and wall IDs | `0x4a0e3b`, `0x4c5d35` | Done for a house whose maps are empty (`World::renumber_surfaces`) |
+| 6b | Renumber the saved floor and wall IDs | `0x4a0e3b`, `0x4c5d35` | Done but for a pattern matched by colour (0x4a0bbd) (`World::renumber_surfaces`, `sims_content::Surfaces`) |
 | 6c, 7 | Read the house's type table, marking the object types whose scripts changed since the save | `0x43dd76`, `0x43a516` | Done (`Interpreter::read_types`) |
 | 6d | Clear the lot again | `0x445f84`, `0x44279a` | Done (step 5) |
 | 6e | Construct the house's objects on the cleared lot and read their saved fields | `0x449c5e`, `0x43fe0a` | Done (`Interpreter::read_objects`); a person's graphics only as far as they draw random numbers |
@@ -913,7 +941,7 @@ with flag 2 or between two people (`0x44d17c`), and Manage Inventory
 operation 3 (`0x4552f8`). After tick 1 all 463 records and the
 inventories equal the capture's, when ours reads the same neighborhood
 file as the capture's game; the install's file differs from that one in
-five records (see `docs/decisions.md`). One registry byte that a
+five records (see `docs/decisions/`). One registry byte that a
 relationship write sets is 1 in the capture and 0 here; what sets it
 during the original's load is not known.
 
@@ -1126,7 +1154,7 @@ Its state after tick 230 equals ours as far as compared, and the
 original's code run in an emulator on its memory from update 47 chooses
 in 233. So something outside the lot updates, after update 47, changed
 the outcome in that run only. What it was is not known (see
-`docs/decisions.md`). We follow the three runs that agree.
+`docs/decisions/`). We follow the three runs that agree.
 
 ### Ticks 233 to 261
 
@@ -1845,11 +1873,31 @@ Progress:
   the Goths' people alone over their lot every 120 ticks at four
   rotations and checks that something hides them at times, that their
   feet show in most views, and that nobody is hidden throughout.
-- Next: compare a person behind furniture with the original; a person on
-  an upper level stands at the floor, without the original's offset.
-  Match the original's lighting (see its decisions entry); compare
-  Mortimer standing without his book. The plumb bob over the selected
-  Sim (the head slot's object) is not drawn.
+- Done: people are lit by the original's standard light at their room's
+  level (`Lighting::standard`, `sims_people::lot::level`): a person in
+  full light is drawn at full light all over, as the original draws
+  Mortimer on the porch in a screenshot, and one in a dim room shows the
+  side towards the light, which stays behind the viewer as the view
+  turns. Room lamps, the level's fade and the night cap are not ported.
+- Done: the plumb bob (`sims_people::bob`) over the person whose head
+  slot holds it: the original's `head-arrow` mesh, three units over the
+  head bone, spinning half a turn a second by a clock the app gives
+  (`People::set_clock`), coloured by the person's mood and lit by the
+  original's own light for it. A gated test checks it covers the pixels
+  the original's does in a screenshot, within a pixel. The date and star
+  bobs are not drawn, and only rotation 0 was compared.
+- Done: a person on an upper level stands on the terrain under them, as
+  the floor there does (0x592132, #206). Checked against the original
+  at 7:29 AM, within a pixel or two. **Unverified:** the view table's
+  per-level offset is not ported; the floor height matched it at medium
+  zoom, rotation 0, and other zooms and rotations are unchecked.
+- Over 7:29 to 8:11 AM the Goths are drawn as the original draws them
+  (reading on the bench and sofa, sitting, Mortimer's lab coat, the
+  bus). Eating and sleeping fall outside that span and wait on track 2's
+  Goth day recording.
+- Next: compare a person behind furniture with the original. Match the
+  original's lighting (see its decisions entry); compare Mortimer
+  standing without his book.
 - Done: a person's base layer is the simulation's (`World::base_layers`):
   the posture's loop or a script's clip, at the phase the simulation
   advanced it to. Over the Goths' first 3,400 ticks a person is seated
@@ -1965,9 +2013,17 @@ Progress:
   the tile drawn before it, as the original carries it from tile to
   tile. Near zoom rose from 86.5% to 87.0% exact; of the 2,402 pixels it
   changes, 2,115 now match.
-- Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
-  grass and a light sprite in the original); the
-  edge-on texel offset and side; a screenshot with a marked edge-on
+- Done: the soft shadows objects cast on the floor and grass under
+  them, as the original works them out and draws them. Near zoom rose
+  from 86.3% to 87.6% exact, and nine in ten of the pixels the shadows
+  change match the original exactly.
+- Done: a split floor's halves are cut straight along the corners' row
+  or half a tile in, as the original's clip rectangle cuts them; the
+  dashed row along a porch's diagonal edge is gone.
+- Next: flat grass on a split tile's empty half; near-zoom fidelity
+  below the bay's left end (rows 436 to 520, grass and a light sprite
+  in the original); the edge-on texel offset and side; a screenshot
+  with a marked edge-on
   diagonal; upper-level depth.
 
 ## Track: sound (`crates/sims-audio`)
@@ -2105,8 +2161,22 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   selected Sim's five trait bars (Neat, Outgoing, Active, Playful,
   Nice) in the subpanel, laid out as the original's bar maker does
   (0x51df31). The Goths' panel is pinned by digest, gated on
-  `SIMS_INSTALL`; it is not yet compared with a screenshot, and the
-  zodiac sign under the bars is not drawn.
+  `SIMS_INSTALL`; it is not yet compared with a screenshot. The sign of
+  the zodiac shows at the panel's bottom left: the one saved in the
+  person's data, or else the one nearest their traits (0x4841fc). In
+  the window, the
+  personality, needs, job and relationship panels show the selected
+  Sim's live person data, motives, skills and relationship rows, and
+  follow a press on another portrait; the needs are also checked to
+  follow the ticks (`sims-game` tests
+  `the_personality_panel_shows_the_selected_goths_traits`,
+  `the_needs_panel_follows_the_selected_goths_motives`,
+  `the_job_panel_shows_the_selected_sims_skills`, in house 7, whose
+  Sims have skills,
+  `the_relationship_panel_lists_who_the_selected_goth_knows`). The
+  game's panel reads the relationships, while that panel is open, with
+  the tuning's friendship threshold, and loads the faces of everyone in
+  the neighborhood's records.
 - **Done: the job panel's skills.** The Job button opens the selected
   Sim's six skill bars, with the labels of what the next level of
   their career needs underlined and a line marking how much (from
@@ -2127,8 +2197,8 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   stand-in for steps 17 and 18; a screenshot of an open pie menu; a
   Yes/No dialog checked
   against the original (the "Help System" one at tick 2) for the layout
-  of several buttons; text entry dialogs; the personality panel's
-  zodiac sign; the job panel's left column (the career's icon and
+  of several buttons; text entry dialogs; the sign's help balloon
+  (its compatible signs); the job panel's left column (the career's icon and
   title, the salary, the performance and the friends needed); the
   relationship panel's Superstar filter and which people the original
   leaves out; the other live panels.
@@ -2179,8 +2249,8 @@ through their public interfaces only; the simulation never depends on it.
   play mode does not catch stops it. In play mode the Goths' house runs
   12,000 ticks (ten minutes at normal speed) without stopping, through
   about a dozen different caught errors; in strict mode it stops after
-  tick 3602 (at tick 3603 Create New Object Instance mode 6 is not
-  ported).
+  tick 9906 (at tick 9907 Set To Next mode 11 needs the neighborhood's
+  lot order).
   `--png <file>
   --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
@@ -2221,11 +2291,9 @@ through their public interfaces only; the simulation never depends on it.
   his hunger goes from 94.5 to 100.0 (tick 936); at 1088 the snack goes
   off the lot and at 1136 it is deleted, and he is free again. He goes
   on to other things (object 71 at tick 1497, object 132 at 2292).
-  Strict mode now runs the order through step 3602 and stops at step
-  3603 (object 354 uses Create New Object Instance mode 6 with flag 0x4,
-  not ported); without an order it stops there too.
-
-  not ported); without an order it runs to tick 3432.
+  Strict mode now runs the order through step 9906 and stops at step
+  9907 (Set To Next mode 11 needs the neighborhood's lot order); without
+  an order it stops on the same at tick 9907.
 - **Done: a player's order from the window, in play mode.** With
   `--play`, the pointer on the fridge lists its pie, a click opens it,
   and Have A Snack queues the action the listing offered. A Goth test
@@ -2245,13 +2313,19 @@ through their public interfaces only; the simulation never depends on it.
   speed (`0x442f9b`, presumably everyone away or asleep), it runs at
   1000 and keeps the speed to go back to in global 18. It goes back once
   someone holds it. The window follows: 1 ms a tick at 1000.
-- **Done in play mode: selecting a Sim.** A press on a portrait selects
-  that Sim (0x445449, between ticks): the Sim selected before is
-  deselected, the indicators move, and the panel and the pie menus
-  follow the new Sim. Deselecting refreshes the old Sim's animator
-  (0x58da12), which is not ported, so in strict mode (`Lot::select`)
-  switching Sims fails and changes nothing; play mode
-  (`Lot::select_play`) leaves the refresh out.
+- **Done: selecting a Sim.** A press on a portrait selects that Sim
+  (0x4cf9c4, 0x445449, between ticks), in strict mode as in play mode:
+  the Sim selected before is deselected and its animator refreshed at
+  the tick count (0x58da12 with 0, now ported), the indicators move,
+  and the panel, the queue and the pie menus follow the new Sim. A
+  second press on the selected Sim's portrait centres the view on her
+  (0x434ced; the original's slide is left out). Both play `UI_click`.
+  A Goth test switches to another Goth through the window and orders
+  her a snack from the fridge's pie: she takes it 52 ticks later, and
+  strict mode runs to tick 454. At tick 455 Mortimer, left to himself,
+  routes to a door one of his routes goes through (0x45b176), which is
+  not ported. No recording compares a switch yet; track 2 is asked for
+  one.
 - Done: a click picks what the frame shows at the pixel
   (`Canvas::id_at`, `sims_game::pick`): the person shown there or
   nearest within two pixels, else the object shown there. A tile of a
@@ -2277,19 +2351,20 @@ through their public interfaces only; the simulation never depends on it.
 - **Done: the action queue.** The selected Sim's running and queued
   actions show as icons in the top left, framed as the original frames
   them, and a press cancels one (`Lot::cancel`, 0x45d5f8) with the
-  original's sound. Objects' catalog pictures are not made yet (a grey
-  square stands in), and the icons do not slide into place.
+  original's sound. An object's icon shows its type's catalog picture,
+  from the thumbnail its file ships; the original's render of a missing
+  thumbnail (0x4e57a6) is not ported. The icons do not slide into place.
 - **Done in play mode: a second order, and cancelling either.** Through
   the window, the snack from the fridge's pie and then Water from a
   plant's: the water waits behind the snack, its icon second. A press on
   the water's icon takes it off. A press on the snack's icon while
   Mortimer eats cancels it: he puts the snack down in front of him (Drop,
   opcode 5, 0x454430, now ported) and goes to water the plant. A cancel
-  while he walks stops his route (0x45b3eb, ported): he stops the walk
-  and, with the snack, puts it down. Of the cancels rechecked at
-  steps 150 to 829 (14 of them), only the one at step 400 catches an
-  error, later, at step 729: a pose blend below weight 1 (0x597c4c, not
-  ported).
+  while he walks stops his thread on a route whose animator is still
+  moving (0x45b3eb, not ported; track 4's): on the snack order, a cancel
+  at steps 150 to 536 or 543 to 590 (to the fridge) or 821 to 829 (away
+  from it with the snack). Cancels at the other steps to 1136 catch no
+  error (a manual sweep, not a test).
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
     on Manage Inventory operation 4 and scope 12. A check tree's fault
@@ -2312,8 +2387,12 @@ through their public interfaces only; the simulation never depends on it.
 - Nothing from the original game is committed. Fixtures that need game data
   stay private and are skipped when the data is absent.
 - Choices about format details, unverified guesses, and the order of work
-  are made in the PR and recorded in `docs/decisions.md`. Guesses are
-  marked unverified in the code until the harness confirms them.
+  are made in the PR and recorded as a new file under `docs/decisions/`
+  (see its README). Guesses are marked unverified in the code until the
+  harness confirms them.
+- Only the coordinator edits this roadmap. A track's PR does not touch it;
+  its body ends with a **Roadmap** section saying which lines should change.
+  After merging, the coordinator applies those changes in one docs commit.
 - Stop and ask the maintainer only when:
   - something only they can provide is needed (a login, or files not on
     this machine);

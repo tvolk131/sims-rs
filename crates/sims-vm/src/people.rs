@@ -8,7 +8,7 @@
 //! (legacy/crates/sims-vm/src/person_reset.rs), `clear_person_action`
 //! (legacy/crates/sims-vm/src/action.rs), and `score_table`
 //! (legacy/crates/sims-vm/src/person_loading.rs). The prototype compared
-//! each with the original's code run alone. `docs/decisions.md` says what
+//! each with the original's code run alone. `docs/decisions/` says what
 //! a trace of the original loading the Goth house confirms.
 
 use std::cell::RefCell;
@@ -300,9 +300,7 @@ impl Interpreter<'_> {
     ///
     /// These fail, because the original does more for them and none was
     /// seen: a person that is using an object or whose running action has
-    /// a target; a person whose routing frame count
-    /// ([`sims_formats::saved_objects::Person::routing_frames`]) is not 0;
-    /// a person inside another object (0x45e8dd) or, unless it is being
+    /// a target; a person inside another object (0x45e8dd) or, unless it is being
     /// deleted ([`Interpreter::reset_person_to_delete`]), off the lot
     /// (0x45e977), which the original moves; and a person whose data word
     /// 73 is set, whose footprint the original then works out again.
@@ -360,9 +358,100 @@ impl Interpreter<'_> {
             });
         }
         busy.borrow_mut().insert(id);
-        let result = self.reset_marked(world, id, people, deleting);
+        // A reset that releases uses and then fails leaves the lot as it
+        // was before the reset, so the fault reports a consistent lot.
+        let using = world
+            .objects
+            .get(&id)
+            .and_then(|o| o.person.as_ref())
+            .is_some_and(|p| !p.object_uses.is_empty());
+        let before = using.then(|| world.clone());
+        let result = self
+            .release_uses(world, id)
+            .and_then(|()| self.reset_marked(world, id, people, deleting));
+        if result.is_err()
+            && let Some(before) = before
+        {
+            *world = before;
+        }
         busy.borrow_mut().remove(&id);
         result
+    }
+
+    /// The first step of a person's reset with no object named (0x45e814
+    /// to 0x45e871): while the person uses an object (person +0xb00), the
+    /// last use is ended.
+    ///
+    /// 1. The person's thread pops frames (0x4752f6, then the person's
+    ///    virtual function 8, [`crate::interpreter::Machine::pop_frame`])
+    ///    while it has more than the use's frame count less one. The last
+    ///    pop releases the use ([`crate::interpreter::Machine::release_use`]),
+    ///    and the person's running action ends when the list empties.
+    /// 2. Unless the person has object flag 0x1000, every person lets go
+    ///    of the object ([`Interpreter::drop_references`], 0x444306), which
+    ///    skips this one, being in the middle of its reset, and the object
+    ///    resets (its virtual function 0x38 with 0: [`Interpreter::reset`],
+    ///    or [`Interpreter::reset_person`] for a person). Flag 0x1000 is
+    ///    set only at 0x42de09, just before that object's own reset, which
+    ///    is not ported, so it is clear here.
+    ///
+    /// The object is the one the entry pointed to when the step began.
+    /// One that is gone by then fails loudly, as does a step that leaves
+    /// the list as long as it was, which the original repeats forever.
+    fn release_uses(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let uses = |world: &World| {
+            world
+                .objects
+                .get(&id)
+                .and_then(|o| o.person.as_ref())
+                .map(|p| (p.object_uses.len(), p.object_uses.last().cloned()))
+                .ok_or_else(|| fail(Trap::native(10, "missing object")))
+        };
+        loop {
+            let (count, Some(last)) = uses(world)? else {
+                return Ok(());
+            };
+            let target = u16::try_from(last.target)
+                .ok()
+                .filter(|t| *t > 0 && world.objects.contains_key(t))
+                .ok_or_else(|| {
+                    fail(Trap::Invalid(format!(
+                        "the object {} person {id} uses is gone",
+                        last.target
+                    )))
+                })?;
+            let mut machine = self.machine(world, id, 0, false);
+            while (machine.me().map_err(fail)?.stack.len() as i32) > last.stack_depth - 1 {
+                machine.pop_frame().map_err(|trap| machine.fault(trap))?;
+            }
+            if !world.objects.contains_key(&target) {
+                return Err(fail(Trap::Unsupported(format!(
+                    "person {id}'s reset: object {target}, which it used, went as its frames \
+                     were popped; the original resets it through a stale pointer (0x45e86e)"
+                ))));
+            }
+            self.drop_references(world, target)?;
+            if world
+                .objects
+                .get(&target)
+                .is_some_and(|o| o.person.is_some())
+            {
+                self.reset_person(world, target, &self.program.people)?;
+            } else {
+                self.reset(world, target, false)?;
+            }
+            if uses(world)?.0 >= count {
+                return Err(fail(Trap::Unsupported(format!(
+                    "person {id}'s reset: ending its use of object {target} left as many uses, \
+                     which the original repeats forever (0x45e814)"
+                ))));
+            }
+        }
     }
 
     fn reset_marked(
@@ -392,13 +481,12 @@ impl Interpreter<'_> {
             .as_ref()
             .ok_or_else(|| fail(Trap::native(0x1c, "object is not a person")))?;
         if !person.object_uses.is_empty() {
-            return Err(unsupported("that is using an object"));
+            return Err(fail(Trap::Invalid(
+                "a person still uses an object after its uses were released".into(),
+            )));
         }
         if person.active.target != 0 {
             return Err(unsupported("whose running action has a target"));
-        }
-        if person.routing_frames != 0 {
-            return Err(unsupported("whose routing frame count is not 0"));
         }
         if person.data.get(73).is_none_or(|&word| word != 0) {
             return Err(unsupported("whose data word 73 is set"));

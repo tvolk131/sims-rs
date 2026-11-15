@@ -93,6 +93,60 @@ pub(crate) fn route_slot(slot: &Slot, index: usize, flags: Option<i32>) -> Route
     }
 }
 
+/// A slot record as its default constructor makes it (0x46dd48): no
+/// offset, number and snap target -1, proximity and resolution 16 (the
+/// 0x10 pushed at 0x46dd4a and stored at 0x46dd7f to 0x46dd88), gradient
+/// 0.1875 (0x3e400000), facing -2, every other word 0.
+pub(crate) const DEFAULT_SLOT: RouteSlot = RouteSlot {
+    offset: [0; 3],
+    number: -1,
+    standing: 0,
+    sitting: 0,
+    ground: 0,
+    flags: 0,
+    snap_target: -1,
+    proximity: [16; 3],
+    gradient: 0x3e40_0000,
+    facing: -2,
+    resolution: 16,
+};
+
+/// A route context as the load makes it (0x460443): a copy of one made by
+/// the default constructor (0x4815f1), which makes the default slot record
+/// (0x46dd48) and calls 0x481693 with no person, no object and no slot.
+/// The save keeps only how many contexts a person had; each is then
+/// "read" by a function that reads nothing (0x5fe4ae, `ret 8`).
+///
+/// Two words are left as the stack held them: +0x74 (the third word of
+/// [`Context::start`]) and +0x90 ([`Context::action`]). They are 0 here.
+/// The first run of the route's steps on such a context pops it
+/// (0x45ae71), and nothing ported reads either word of a context that
+/// names no object.
+pub(crate) fn loaded_context() -> Context {
+    Context {
+        candidates: Vec::new(),
+        slot: DEFAULT_SLOT,
+        target: 0,
+        person: 0,
+        chosen: -1,
+        best: -1,
+        word_58: 0,
+        time: 0,
+        saved: [0; 2],
+        word_68: 0,
+        start: [0; 3],
+        byte_78: true,
+        objects: [0; 2],
+        byte_84: false,
+        result: 0,
+        word_8c: 0,
+        byte_8e: false,
+        word_94: 0,
+        limit: 0x30,
+        action: 0,
+    }
+}
+
 /// A new route context for a person and a slot of an object (0x48163e,
 /// 0x481693).
 pub(crate) fn new_context(world: &World, person: u16, target: u16, slot: RouteSlot) -> Context {
@@ -451,7 +505,7 @@ fn place_answer(
         Err(Refusal::Collision(Some(other))) => {
             (if is_person(other)? { 5 } else { 1 }, Some(other))
         }
-        Err(Refusal::OffLot | Refusal::Other) => (0, None),
+        Err(Refusal::OffLot | Refusal::Other | Refusal::SameWall) => (0, None),
         Err(Refusal::Unrecorded) => {
             return Err(unsupported(
                 "0x48158c",
@@ -568,7 +622,7 @@ impl Interpreter<'_> {
     /// searched by distance ([`Self::search_by_distance`]). A place the person may not
     /// stand at leaves the context's result (+0x88) saying why
     /// ([`Refusals`]) if no place is found.
-    fn candidates(&self, world: &mut World, ctx: &mut Context) -> Result<(), Fault> {
+    fn candidates(&self, world: &mut World, ctx: &mut Context, seats: bool) -> Result<(), Fault> {
         let person = ctx.person;
         let fail = |trap| Fault {
             object: person,
@@ -591,7 +645,7 @@ impl Interpreter<'_> {
             return Err(fail(unsupported("0x483479", "a slot with flag 0x10000")));
         }
         if flags & 0xff != 0 {
-            return self.search_by_distance(world, ctx, rot, pos);
+            return self.search_by_distance(world, ctx, rot, pos, seats);
         }
         let [ox, oy, _] = ctx.slot.offset.map(F32::from_bits);
         let out = transform(pos, ox, oy, rot);
@@ -660,19 +714,13 @@ impl Interpreter<'_> {
         if i32::from(datum(world, seat, DIRECTION)?) != dir.wrapping_add(4) % 8 {
             return Ok(Beside::Nothing);
         }
+        if self.seat_entries(world, seat)? & (1 << index) == 0 {
+            return Ok(Beside::Nothing);
+        }
         let object = world
             .objects
             .get(&seat)
             .ok_or_else(|| Trap::native(10, "missing object"))?;
-        let entries = self
-            .catalog
-            .object(object.guid)
-            .and_then(|d| self.program.definition(d.resource, d.chunk))
-            .ok_or_else(|| Trap::Invalid(format!("seat {seat} has no definition")))?[SEAT_ENTRIES]
-            as u16;
-        if entries & (1 << index) == 0 {
-            return Ok(Beside::Nothing);
-        }
         let occupant = object
             .slots
             .get(1)
@@ -685,9 +733,9 @@ impl Interpreter<'_> {
     }
 
     /// The search by distance (0x483598). The sitting weight is 10 times
-    /// slot +0x14 when the call's argument (person word 65 at most 1,
-    /// 0x4823d0) is set, which it always is here, as kinds above 1 fail
-    /// loudly before ([`Self::find_candidates`]); the standing weight is
+    /// slot +0x14 when `seats`, the call's argument (person word 65 at
+    /// most 1, 0x4823d0), is set, and 0 otherwise (0x4835f8); the
+    /// standing weight is
     /// 10 times the greater of slot +0x10 and +0x18. With a sitting
     /// weight the search goes tile by tile (resolution 16, not slot
     /// +0x38), and one row further in and out (0x48378b; the nearest row
@@ -740,6 +788,7 @@ impl Interpreter<'_> {
         ctx: &mut Context,
         rot: i32,
         pos: [i32; 2],
+        seats: bool,
     ) -> Result<(), Fault> {
         let person = ctx.person;
         let fail = |trap| Fault {
@@ -757,8 +806,13 @@ impl Interpreter<'_> {
         {
             return Ok(());
         }
-        // 0x4835f0: the weights.
-        let sitting = slot.sitting.wrapping_mul(10);
+        // 0x4835f0: the weights; no sitting weight without seats
+        // (0x4835f8).
+        let sitting = if seats {
+            slot.sitting.wrapping_mul(10)
+        } else {
+            0
+        };
         let weight = slot.standing.max(slot.ground).wrapping_mul(10);
         // 0x483660: the directions the target's tile is closed off in,
         // turned to the target's facing, and those beside them.
@@ -939,7 +993,128 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    /// Fills a context's candidates (0x48235a).
+    /// Where the person starts its route (0x4832d4), in the context's
+    /// +0x6c, +0x70 and +0x74: its own place (+0xf4, +0xf8) and 0.
+    ///
+    /// A person in a container with a Sit function (callback 0x1a; the
+    /// container as `capture` gives it, 0x43265e) starts instead from a
+    /// place beside the seat. For each bit `i` of the seat's definition
+    /// word 66 ([`SEAT_ENTRIES`], OBJD +0x84) that is set, the place is
+    /// one tile from the person's place (0x42228a) in the seat's direction
+    /// (its data word 1, +0x4c) turned by `i`, modulo 8. Each is tested
+    /// as the slot search tests a place ([`Self::classify`], 0x481439,
+    /// approached from that direction, which may note an object in the
+    /// context's word +0x8c). Of those that answer 6 or 5, the one
+    /// nearest the slot's object (+0x48), by the squared distance in whole
+    /// units, wins, the first of equals; the context's third word is then
+    /// `1 << i`. With none the person's own place stands.
+    fn start_place(&self, world: &mut World, ctx: &mut Context) -> Result<(), Fault> {
+        let person = ctx.person;
+        let fail = |trap| Fault {
+            object: person,
+            at: None,
+            trap,
+        };
+        let native = |world: &World, id: u16| {
+            world
+                .objects
+                .get(&id)
+                .map(|o| [o.position[1], o.position[0]])
+                .ok_or_else(|| fail(Trap::native(10, "missing object")))
+        };
+        let here = native(world, person)?;
+        ctx.start = [here[0], here[1], 0];
+        let Some(seat) = capture(world, person).map_err(fail)?.container else {
+            return Ok(());
+        };
+        if !self.has_function(world, seat, SIT) {
+            return Ok(());
+        }
+        let entries = self.seat_entries(world, seat).map_err(fail)?;
+        let target = native(world, ctx.target)?;
+        let mut nearest: Option<i32> = None;
+        for i in 0..8 {
+            let bit = 1 << i;
+            if entries & bit == 0 {
+                continue;
+            }
+            let rot = i32::from(datum(world, seat, DIRECTION).map_err(fail)?);
+            let dir = rot.wrapping_add(i) & 7;
+            let [dx, dy] = step(dir);
+            let point = [here[0].wrapping_add(dx), here[1].wrapping_add(dy)];
+            let answer = self.classify(world, ctx, point, dir)?;
+            if answer != 6 && answer != 5 {
+                continue;
+            }
+            let [a, b] = [
+                target[0].wrapping_sub(point[0]),
+                target[1].wrapping_sub(point[1]),
+            ];
+            let squared = a.wrapping_mul(a).wrapping_add(b.wrapping_mul(b));
+            if nearest.is_none_or(|n| squared < n) {
+                ctx.start = [point[0], point[1], bit];
+                nearest = Some(squared);
+            }
+        }
+        Ok(())
+    }
+
+    /// A seat's definition word 66 ([`SEAT_ENTRIES`], OBJD +0x84): from
+    /// which of the eight places around it it may be sat in.
+    fn seat_entries(&self, world: &World, seat: u16) -> Result<i32, Trap> {
+        let object = world
+            .objects
+            .get(&seat)
+            .ok_or_else(|| Trap::native(10, "missing object"))?;
+        Ok(i32::from(
+            self.catalog
+                .object(object.guid)
+                .and_then(|d| self.program.definition(d.resource, d.chunk))
+                .ok_or_else(|| Trap::Invalid(format!("seat {seat} has no definition")))?
+                [SEAT_ENTRIES],
+        ))
+    }
+
+    /// Whether the person sits in the seat beside one of the context's
+    /// candidates (0x48177b): a candidate's word +0xc names a seat that
+    /// is there, has a Sit function (callback 0x1a), and is the person's
+    /// container as `capture` gives it (0x43265e).
+    pub(crate) fn seated_beside_candidate(
+        &self,
+        world: &mut World,
+        ctx: &Context,
+    ) -> Result<bool, Fault> {
+        let person = ctx.person;
+        for candidate in &ctx.candidates {
+            let Some(seat) = u16::try_from(candidate.word_c)
+                .ok()
+                .filter(|id| *id > 0 && world.objects.contains_key(id))
+            else {
+                continue;
+            };
+            if !self.has_function(world, seat, SIT) {
+                continue;
+            }
+            let container = capture(world, person)
+                .map_err(|trap| Fault {
+                    object: person,
+                    at: None,
+                    trap,
+                })?
+                .container;
+            if container == Some(seat) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Fills a context's candidates (0x48235a): the start
+    /// ([`Self::start_place`]), a limit of 8 in a room of more than 250
+    /// tiles, and the search ([`Self::candidates`]), with seats only for
+    /// a person of kind 1 or less (0x4823d0). Person word 73 holds the
+    /// context's word +0x94 during the search, and the person's direction
+    /// is put back after it.
     pub(crate) fn find_candidates(
         &self,
         world: &mut World,
@@ -951,19 +1126,7 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        // 0x4832d4: where the person starts.
-        if capture(world, person).map_err(fail)?.container.is_some() {
-            return Err(fail(unsupported(
-                "0x4832d4",
-                "a route from inside a container",
-            )));
-        }
-        let position = world
-            .objects
-            .get(&person)
-            .ok_or_else(|| fail(Trap::native(10, "missing object")))?
-            .position;
-        ctx.start = [position[1], position[0], 0];
+        self.start_place(world, ctx)?;
         let room = datum(world, person, ROOM).map_err(fail)?;
         if world
             .rooms
@@ -975,13 +1138,10 @@ impl Interpreter<'_> {
         }
         let facing = datum(world, person, DIRECTION).map_err(fail)?;
         set_person_word(world, person, WORD_73, ctx.word_94).map_err(fail)?;
-        if person_word(world, person, KIND).map_err(fail)? > 1 {
-            return Err(fail(unsupported(
-                "0x48235a",
-                "a slot search for a person of kind above 1",
-            )));
-        }
-        let found = self.candidates(world, ctx);
+        // 0x4823d0: only a person of kind 1 or less (not a pet) is
+        // offered seats.
+        let seats = person_word(world, person, KIND).map_err(fail)? <= 1;
+        let found = self.candidates(world, ctx, seats);
         set_person_word(world, person, WORD_73, 0).map_err(fail)?;
         set_datum(world, person, DIRECTION, facing).map_err(fail)?;
         found

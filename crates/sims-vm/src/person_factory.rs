@@ -5,8 +5,11 @@
 //!
 //! 1. The pet guard (0x440d63): a person type whose skeleton is named
 //!    `dog` or `kat` (body string 1) is not made unless the
-//!    installed-expansions mask (application field +0x66) has bit 0x20 or
-//!    0x80. The mask is not modeled, so a pet fails here.
+//!    installed-expansions mask (application field +0x66,
+//!    [`crate::Program::expansions`]) has bit 0x20 (Unleashed) or 0x80
+//!    (Makin' Magic). A pet the mask does not allow fails here: the
+//!    original returns 0, no person, and what its callers do then is not
+//!    ported.
 //! 2. The lowest unused object ID, the storage, and registration at the
 //!    head of the registration list (0x44099b, 0x459327, 0x4434cd); see
 //!    [`Machine::construct`].
@@ -30,7 +33,7 @@
 //!
 //! Compared with the original: the Goth house's tick 6, in which object
 //! 382 makes person 259. The whole state after it, the C runtime's random
-//! stream included, equals the capture's (`docs/decisions.md`). What
+//! stream included, equals the capture's (`docs/decisions/`). What
 //! that person does not reach (a pet, a lot that is not residential, a
 //! failure) is checked only by the synthetic tests.
 //!
@@ -60,6 +63,13 @@ mod person {
     /// 0 for a member of the household that lives on the lot; 1 for a
     /// visitor; 2 kept as it is on a lot that is not residential.
     pub const VISITOR: usize = 32;
+}
+
+/// The pet guard's test of the installed-expansions mask (0x440d8b to
+/// 0x440dab): with bit 0x20 (Unleashed) or bit 0x80 (Makin' Magic) set, a
+/// pet is made like any other person.
+fn pets_allowed(expansions: u16) -> bool {
+    expansions & (0x20 | 0x80) != 0
 }
 
 /// Whether interests 46 to 53 are all 10 or less, compared as signed
@@ -96,16 +106,19 @@ impl Interpreter<'_> {
                 )),
             )
         })?;
-        if ["dog", "kat"]
-            .iter()
-            .any(|pet| skeleton.name.eq_ignore_ascii_case(pet))
+        if !pets_allowed(self.program.expansions)
+            && ["dog", "kat"]
+                .iter()
+                .any(|pet| skeleton.name.eq_ignore_ascii_case(pet))
         {
             return Err(fail(
                 0,
                 Trap::Unsupported(format!(
-                    "the person type 0x{guid:08X} is a pet ({:?}); whether the factory makes it \
-                     depends on the installed-expansions mask, which is not modeled",
-                    skeleton.name
+                    "0x440dd5: the person type 0x{guid:08X} is a pet ({:?}) and the \
+                     installed-expansions mask 0x{:04X} has neither Unleashed (0x20) nor \
+                     Makin' Magic (0x80), so the factory makes no person; what its caller does \
+                     then is not ported",
+                    skeleton.name, self.program.expansions
                 )),
             ));
         }

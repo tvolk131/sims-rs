@@ -30,7 +30,7 @@
 //! (legacy/crates/sims-sim/src/spatial.rs) and `placement` and
 //! `update_offsets` (legacy/crates/sims-vm/src/multitile.rs). The
 //! prototype compared each with the original's code run alone.
-//! `docs/decisions.md` says what a trace of the running game confirms.
+//! `docs/decisions/` says what a trace of the running game confirms.
 //!
 //! Not modeled, being presentation: the redrawing an object asks for as it
 //! moves, its shadow, and the lighting around a light source.
@@ -41,7 +41,7 @@ use crate::load::INDICATORS;
 use crate::program::DEFINITION_WORDS;
 use crate::visits::function;
 use sims_sim::World;
-use sims_sim::animator::{Animator, Layer};
+use sims_sim::animator::{Animator, HeldPose, Layer};
 use std::collections::BTreeSet;
 
 mod find;
@@ -67,13 +67,15 @@ pub(crate) struct Pending {
     pub refreshed: Kept,
 }
 
-/// A person's animator, base layer and the bones its skin has moved
-/// ([`World::translated_bones`]).
+/// A person's animator, base layer, the bones its skin has moved
+/// ([`World::translated_bones`]) and the pose the load left in it
+/// ([`World::held_poses`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Kept {
     pub animator: Option<Animator>,
     pub base: Option<Layer>,
     pub translated: Option<BTreeSet<String>>,
+    pub held: Option<HeldPose>,
 }
 
 impl Kept {
@@ -82,6 +84,7 @@ impl Kept {
             animator: world.animators.get(&id).cloned(),
             base: world.base_layers.get(&id).cloned(),
             translated: world.translated_bones.get(&id).cloned(),
+            held: world.held_poses.get(&id).cloned(),
         }
     }
 
@@ -99,12 +102,18 @@ impl Kept {
             Some(bones) => world.translated_bones.insert(id, bones.clone()),
             None => world.translated_bones.remove(&id),
         };
+        match &self.held {
+            Some(held) => world.held_poses.insert(id, held.clone()),
+            None => world.held_poses.remove(&id),
+        };
     }
 }
 
-/// What a person's animator refresh at its taking itself off the lot
-/// does with its head slot (0x58dae5 to 0x58dc55), when the house view
-/// drew the person ([`Interpreter::take_self_off`]). The refresh reads the
+/// What a person's animator refresh does with its head slot (0x58dae5 to
+/// 0x58dc55): at its taking itself off the lot when the house view drew
+/// the person ([`Interpreter::take_self_off`]), and always at its
+/// deselection (`Interpreter::deselect`), where the marker has just left
+/// the slot. The refresh reads the
 /// person's container entry at begin + 0x48 when there are more than two
 /// (our slot 2, the head's attachment; it holds the marker over the
 /// selected Sim, GUID 0x2F726FFF). Unless the entry names no bone (+0x20)
@@ -126,7 +135,7 @@ impl Kept {
 /// this one is too, which is as unverified. A person or a tile of a group
 /// in the slot has another class (0x667378, 0x666c20), whose functions
 /// there are not read, so it fails.
-fn head_slot_redraw(world: &World, id: u16) -> Result<(), Trap> {
+pub(crate) fn head_slot_redraw(world: &World, id: u16) -> Result<(), Trap> {
     let person = world.objects.get(&id).ok_or_else(missing)?;
     let Some(slot) = person.slots.get(2).filter(|slot| slot.object > 0) else {
         return Ok(());
@@ -136,8 +145,8 @@ fn head_slot_redraw(world: &World, id: u16) -> Result<(), Trap> {
     };
     if held.person.is_some() || held.multipart.is_some() {
         return Err(Trap::Unsupported(format!(
-            "person {id} takes itself off the lot with {} {} in its head slot: its animator's \
-             refresh, if the house view drew it, redraws it through that class's functions \
+            "person {id}'s animator refresh (0x58da12, at its taking itself off the lot or its \
+             deselection) redraws {} {} in its head slot through that class's functions \
              (0x58dc08 to 0x58dc52), which are not read",
             if held.person.is_some() {
                 "the person"
@@ -752,6 +761,32 @@ impl Interpreter<'_> {
         )
     }
 
+    /// The definition an object stands for (0x45728d): its own, or for a
+    /// tile of a group the group's master ([`crate::Program::master_definition`]).
+    /// A group with no master fails, naming `site`, since the original
+    /// reads through a null pointer there.
+    pub(crate) fn master_words(
+        &self,
+        world: &World,
+        id: u16,
+        site: &str,
+    ) -> Result<&[i16; DEFINITION_WORDS], Trap> {
+        let object = world.objects.get(&id).ok_or_else(missing)?;
+        let definition = self
+            .catalog
+            .object(object.guid)
+            .ok_or_else(|| Trap::Invalid(format!("object {id} has no definition")))?;
+        self.program
+            .master_definition(definition.resource, definition.chunk)
+            .map_err(Trap::Invalid)?
+            .ok_or_else(|| {
+                Trap::Unsupported(format!(
+                    "object {id}'s group has no master definition in its file, and {site} \
+                     reads through a null pointer (0x45728d)"
+                ))
+            })
+    }
+
     pub(crate) fn words(&self, world: &World, id: u16) -> Result<&[i16; DEFINITION_WORDS], Trap> {
         let object = world.objects.get(&id).ok_or_else(missing)?;
         let definition = self
@@ -1036,7 +1071,13 @@ impl Interpreter<'_> {
         if let Some(parent) = parent {
             self.callback(world, parent, function::PLACED, 0)?;
         }
-        if words[word::PORTAL] == 6 {
+        // 0x4332b7: the door test reads the definition the object stands
+        // for, not its own.
+        let door = self
+            .master_words(world, id, "taking a door off (0x4332af)")
+            .map_err(fail)?[word::PORTAL]
+            == 6;
+        if door {
             self.mark_portal(world, was, false).map_err(fail)?;
         }
         if notify {
@@ -1100,7 +1141,11 @@ impl Interpreter<'_> {
         if self.has_function(world, id, SEAT) {
             self.seats_beside(world, forward(was, old_facing).map_err(fail)?)?;
         }
-        let portal = words[word::PORTAL] == 6;
+        // 0x433427: as on taking off, the definition the object stands for.
+        let portal = self
+            .master_words(world, id, "placing a door (0x43341f)")
+            .map_err(fail)?[word::PORTAL]
+            == 6;
         if portal {
             self.mark_portal(world, was, false).map_err(fail)?;
         }
@@ -1273,6 +1318,39 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    /// Person `id`'s animator refresh at a take-off on its way to removal
+    /// that is not its own Remove Object Instance that yields (0x4332e0
+    /// to 0x4332ed, 0x58da12). The refresh runs only if the house view
+    /// drew the person (animator byte +0x109), which is not kept. It is
+    /// worked out on a copy of the lot as the take-off left it
+    /// (`Interpreter::refresh_at_take_off`), after the head slot and hand
+    /// are checked as for [`Interpreter::take_self_off`], and must write
+    /// nothing but the person's animator and base layer and play no
+    /// sound. The lot goes on without it.
+    ///
+    /// The two branches then differ only in that person's animator until
+    /// its deletion at the end of the update destroys it, and nothing may
+    /// read it before: a person queued for removal fails if it starts its
+    /// tick (`Interpreter::tick_person`) or runs a primitive that reads an
+    /// animator ([`reads_no_animator`]), and so does a head that looks at
+    /// it (`crate::head`) and a person left queued after a partial pass
+    /// (`Interpreter::end_of_update`). That the deletion's last reset
+    /// (0x45e791) reads none of it is **unverified**, as for every removal
+    /// of a person ([`Interpreter::take_off_to_remove`]).
+    pub(crate) fn refresh_before_removal(&self, world: &World, id: u16) -> Result<Pending, Trap> {
+        let object = world.objects.get(&id).ok_or_else(missing)?;
+        if object.slots.get(1).is_some_and(|slot| slot.object != 0) {
+            return Err(Trap::Unsupported(format!(
+                "person {id}, whose hand holds something, taken off the lot on its way to \
+                 removal other than by its own Remove Object Instance that yields: its \
+                 animator's refresh (0x58da12), made only if the house view drew it, is taken \
+                 to read only its head slot (0x58dae5 to 0x58dc55)"
+            )));
+        }
+        head_slot_redraw(world, id)?;
+        self.refresh_at_take_off(world, id)
+    }
+
     /// Person `id` takes itself off the lot, while its own tick runs its
     /// thread (Find Location For mode 1 on itself, 0x44b519). The take-off
     /// is the one-tile path of [`Interpreter::take_off`] (0x433125, which
@@ -1380,8 +1458,10 @@ impl Interpreter<'_> {
     /// set, the head's step (0x590768) advances the head's clock and
     /// counts person word 45 down, which a script could read. So the
     /// callers take only the cases where that cannot be read first: the
-    /// Remove Object Instance queue takes a person only when it removes
-    /// itself and yields (`Machine::queue_removal`). Removal at once
+    /// Remove Object Instance queue takes a person as it is when it
+    /// removes itself and yields (`Machine::queue_removal`), and otherwise
+    /// works the refresh out on a copy and holds it until the person's
+    /// animator's tick ([`Interpreter::refresh_before_removal`]). Removal at once
     /// ([`Interpreter::remove_now`], which the end of the update runs for
     /// the queued person, so the original refreshes it a second time)
     /// deletes the person right after, so only the deletion's last reset

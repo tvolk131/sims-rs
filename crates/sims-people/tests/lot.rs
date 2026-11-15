@@ -504,3 +504,151 @@ fn the_lot_hides_the_people_behind_it() {
         );
     }
 }
+
+/// A person upstairs stands on the upper floor, which the terrain under
+/// the house lifts as it lifts the ground floor. At tick 1000 Bella
+/// (person 18) plays with the dollhouse on level 2; seen from there with
+/// the walls down, most of her shows over the floor she kneels on (the
+/// front wall's strip hides the rest). Standing at the floor's height
+/// without the terrain, the floor hid all of her.
+#[test]
+fn a_person_upstairs_stands_on_the_upper_floor() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut opened = sims_render::open_house(&root, &house).unwrap();
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    let mut people = People::open(&root, &house).unwrap();
+    while lot.ticks() < 1000 {
+        lot.step().unwrap();
+    }
+    let world = lot.world();
+    assert_eq!(World::tile(world.objects[&18].position), [25, 25, 2]);
+    assert_eq!(people.update(world), Vec::<String>::new());
+    let mut solo = world.clone();
+    solo.animators.retain(|&id, _| id == 18);
+    let camera = LotCamera {
+        zoom: Zoom::Medium,
+        rotation: 0,
+        level: 2,
+        origin: [400, -350],
+        walls: Walls::Down,
+        focus: Default::default(),
+    };
+    let shape = sims_render::Lot::from_world(world).unwrap();
+    let mut base = sims_render::Canvas::new(800, 600, [0, 0, 0]);
+    sims_render::draw(world, &shape, &mut opened.assets, &camera, &mut base);
+    let mut on = base.clone();
+    let report = people.draw_on_lot(&solo, &camera, &mut on);
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+    assert_eq!(report.people, 1);
+    let mut over = base.clone();
+    people.draw(&solo, &camera, &mut over, |_, _, _| -1.0e9);
+    let [shown, laid] = [changed(&base, &on, None), changed(&base, &over, None)];
+    assert!(laid > 200, "{laid}");
+    assert!(shown * 3 >= laid * 2, "{shown} of {laid} pixels shown");
+}
+
+/// The bob's green: green well above red and blue, and bright.
+fn bob_green([r, g, b]: [u8; 3]) -> bool {
+    let [r, g, b] = [r, g, b].map(i32::from);
+    g > r + 50 && g > b + 50 && g > 120
+}
+
+/// The plumb bob over the selected person: in a state where Mortimer
+/// (person 21) reads on the porch bench, as in a screenshot of the
+/// original at medium zoom (7:38 AM, camera origin (335, −560), cutaway),
+/// its green pixels span the box the original's do, x 427 to 434 and
+/// y 74 to 97, each edge within a pixel; the pixels inside the box are
+/// not compared one by one. Taken out of his head slot, it is not drawn.
+#[test]
+fn the_plumb_bob_floats_over_the_selected_persons_head() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut opened = sims_render::open_house(&root, &house).unwrap();
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    let mut people = People::open(&root, &house).unwrap();
+    while lot.ticks() < 1100 {
+        lot.step().unwrap();
+    }
+    let world = lot.world();
+    assert_eq!(world.selected(), Some(21));
+    assert_eq!(sims_people::bob::held_by(world, 21), Some(383));
+    let camera = LotCamera {
+        zoom: Zoom::Medium,
+        rotation: 0,
+        level: 1,
+        origin: [335, -560],
+        walls: Walls::Cutaway,
+        focus: Default::default(),
+    };
+    let shape = sims_render::Lot::from_world(world).unwrap();
+    let mut base = sims_render::Canvas::new(800, 600, [0, 0, 0]);
+    sims_render::draw(world, &shape, &mut opened.assets, &camera, &mut base);
+    assert_eq!(people.update(world), Vec::<String>::new());
+    let mut green = |world: &World| {
+        let mut canvas = base.clone();
+        let drawn = people.draw_on_lot(world, &camera, &mut canvas);
+        assert!(drawn.problems.is_empty(), "{:?}", drawn.problems);
+        let found: Vec<(i32, i32)> = pixels(&canvas)
+            .filter(|&(x, y)| (400..470).contains(&x) && (50..130).contains(&y))
+            .filter(|&(x, y)| bob_green(canvas.color[y as usize * canvas.width + x as usize]))
+            .collect();
+        (found, canvas)
+    };
+    let (found, canvas) = green(world);
+    assert!(found.len() > 60, "{}", found.len());
+    let xs = found.iter().map(|p| p.0);
+    let ys = found.iter().map(|p| p.1);
+    let [x0, x1, y0, y1] = [
+        xs.clone().min().unwrap(),
+        xs.max().unwrap(),
+        ys.clone().min().unwrap(),
+        ys.max().unwrap(),
+    ];
+    assert!(
+        (x0 - 427).abs() <= 1 && (x1 - 434).abs() <= 1,
+        "x {x0}..{x1}"
+    );
+    assert!((y0 - 74).abs() <= 1 && (y1 - 97).abs() <= 1, "y {y0}..{y1}");
+    // Brighter on the viewer's left than on the right, as in the
+    // screenshot.
+    let middle = (x0 + x1) / 2;
+    let mean = |side: &dyn Fn(i32) -> bool| {
+        let g: Vec<u32> = found
+            .iter()
+            .filter(|p| side(p.0))
+            .map(|&(x, y)| u32::from(canvas.color[y as usize * canvas.width + x as usize][1]))
+            .collect();
+        g.iter().sum::<u32>() / g.len() as u32
+    };
+    assert!(mean(&|x| x < middle) > mean(&|x| x > middle));
+    // Its pixels name Mortimer.
+    assert!(found.iter().all(|&(x, y)| canvas.id_at(x, y) == Some(21)));
+    // Out of the slot, no bob.
+    let mut without = world.clone();
+    without.objects.get_mut(&21).unwrap().slots[2].object = 0;
+    assert_eq!(green(&without).0, Vec::new());
+}
+
+/// Each Goth is lit at the light of the room they stand in, held between
+/// a half and full light. A little after 7 in the morning (tick 1100)
+/// Mortimer reads on the porch, outdoors in daylight; Cassandra is
+/// indoors in room 4, at its light; and Bella is upstairs in a room whose
+/// light is 0, which shows 0.8 because someone is in it.
+#[test]
+fn each_person_is_lit_at_their_rooms_light() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    while lot.ticks() < 1100 {
+        lot.step().unwrap();
+    }
+    let world = lot.world();
+    let level = |id| sims_people::lot::level(world, id);
+    let room = |id: u16| world.room_at(world.objects[&id].position).unwrap();
+    assert_eq!((room(21), level(21)), (0, 1.0));
+    let kitchen = sims_render::lot::room_light(&world.rooms.rooms[&room(16)]);
+    assert_eq!((room(16), level(16)), (4, f32::from(kitchen) / 255.0));
+    assert!(level(16) > 0.5 && level(16) < 1.0, "{}", level(16));
+    assert_eq!((room(18), level(18)), (1025, 204.0 / 255.0));
+}

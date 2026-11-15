@@ -115,7 +115,11 @@ impl Machine<'_, '_> {
     /// 3. If the object itself is queued, nothing happens.
     /// 4. It leaves the lot (its virtual function 0x50, 0x433125, asked to
     ///    tell the registry: `Interpreter::take_off_to_remove`, which for a
-    ///    person also covers its animator's refresh). While the load has
+    ///    person also covers its animator's refresh). For a person that is
+    ///    not removing itself and yielding, the refresh, which runs only if
+    ///    the house view drew it, must write nothing but its animator, which
+    ///    nothing may then read before the person is deleted
+    ///    (`Interpreter::refresh_before_removal`). While the load has
     ///    not worked the lot's rooms out yet, that way cannot find the
     ///    room of the off-lot place, so an object then goes the narrower
     ///    way of `Machine::leave_lot`, which the load was compared
@@ -146,22 +150,20 @@ impl Machine<'_, '_> {
         }
         // A person's take-off refreshes its animator (0x58da12), which
         // for a person the view drew advances its head and writes its
-        // data words (0x590768). That is not modeled, so only the case
-        // whose effects cannot be read before the person goes is
-        // taken: the person removing itself and yielding, whose own
-        // tick follows at once and whose deletion ends the update.
+        // data words (0x590768). Whether the view drew it is not kept.
+        // The person removing itself and yielding is taken as it is: its
+        // own tick follows at once and its deletion ends the update. Any
+        // other take-off of a person is taken only when the refresh would
+        // write nothing but its animator. Its own thread may then read no
+        // animator until its animator's tick settles the refresh; another
+        // object reading that animator before the deletion is not checked
+        // (docs/decisions/).
         let person = self
             .world
             .objects
             .get(&id)
             .is_some_and(|o| o.person.is_some());
-        if person && (id != self.me || flags & 1 != 0 || self.synchronous) {
-            return Err(Trap::Unsupported(format!(
-                "taking person {id} off the lot other than by its own Remove Object \
-                 Instance that yields: its animator's refresh (0x58da12) can write what a \
-                 script reads, which is not ported"
-            )));
-        }
+        let unseen_refresh = person && (id != self.me || flags & 1 != 0 || self.synchronous);
         if matches!(
             self.world.room_at([OFF_LOT, OFF_LOT, 1]),
             Err(RoomError::NoRooms)
@@ -172,6 +174,33 @@ impl Machine<'_, '_> {
             self.interpreter()
                 .take_off_to_remove(self.world, id, true)
                 .map_err(|fault| fault.nested(me))?;
+        }
+        if unseen_refresh {
+            let pending = self.interpreter().refresh_before_removal(self.world, id)?;
+            // A person removing itself during its own tick without
+            // yielding (flag bit 0, or a synchronous run) has its
+            // animator's tick still to come in this tick, at the same
+            // clock: the refresh waits for it there, as for a person
+            // that takes itself off (`Interpreter::take_self_off`).
+            // Another person's waits for that person's tick.
+            match self.refreshing.filter(|r| r.borrow().person == id) {
+                Some(refreshing) => {
+                    let mut refreshing = refreshing.borrow_mut();
+                    if refreshing.pending.is_some() {
+                        return Err(Trap::Unsupported(format!(
+                            "person {id} queued for removal during its own tick after taking \
+                             itself off the lot: two animator refreshes (0x58da12) pending \
+                             for one animator tick"
+                        )));
+                    }
+                    refreshing.pending = Some(pending);
+                }
+                None => {
+                    if let Some(taken_off) = self.taken_off {
+                        taken_off.borrow_mut().insert(id, pending);
+                    }
+                }
+            }
         }
         let object = self
             .world

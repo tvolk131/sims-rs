@@ -15,7 +15,8 @@ const STOOL: u32 = 0x5004;
 
 /// A cleared lot whose catalog has a chair (12 attributes, 3 dynamic
 /// sprites), two person types, and a stool whose definition asks for
-/// nothing.
+/// nothing. Both person types' scripts changed since the save, so load
+/// step 13 resets their people.
 fn lot() -> Fixture {
     let mut fx = Fixture::new();
     fx.world.objects.clear();
@@ -28,6 +29,7 @@ fn lot() -> Fixture {
     fx.add_type(CHILD, 2, 0, 4097);
     fx.add_type(STOOL, 4, 0, 4097);
     fx.world.neighbors = records(11);
+    fx.world.changed_types = [ADULT, CHILD].into();
     fx
 }
 
@@ -191,6 +193,53 @@ fn a_read_that_cannot_be_done_changes_nothing() {
     assert_eq!(object, 9);
     assert!(matches!(cause, Trap::Unsupported(_)), "{cause:?}");
     assert_eq!(fx.world.encode(), held.encode());
+}
+
+/// Four types may keep more saved attributes than their constructor
+/// allocates (0x43fe49, 0x434345): the array grows to the saved count.
+/// The last two only with Unleashed's bit in the expansions (0x43fe9d).
+#[test]
+fn the_types_the_house_read_names_grow_their_attributes() {
+    const FIRST: u32 = 0x3C08_965F;
+    const THIRD: u32 = 0x4A70_DF92;
+    let mut fx = lot();
+    fx.add_type(FIRST, 4, 0, 4097);
+    fx.add_type(THIRD, 4, 0, 4097);
+    let long = |id, guid| {
+        let mut object = saved(id, guid);
+        object.attributes = (1..=11).collect();
+        object
+    };
+    fx.world.globals[20] = 0x20;
+    read(
+        &mut fx,
+        &file(vec![long(5, FIRST), long(6, THIRD)]),
+        &People::default(),
+    )
+    .unwrap();
+    for id in [5, 6] {
+        assert_eq!(
+            fx.world.objects[&id].attributes,
+            (1..=11).collect::<Vec<i16>>()
+        );
+    }
+    // Without the bit only the first two grow.
+    let mut fx = lot();
+    fx.add_type(FIRST, 4, 0, 4097);
+    fx.add_type(THIRD, 4, 0, 4097);
+    fx.world.globals[20] = 0xdf;
+    let before = fx.world.encode();
+    let (object, cause) = trap(read(
+        &mut fx,
+        &file(vec![long(5, FIRST), long(6, THIRD)]),
+        &People::default(),
+    ));
+    assert_eq!(object, 6);
+    assert!(
+        matches!(&cause, Trap::Unsupported(m) if m.contains("0x4A70DF92")),
+        "{cause:?}"
+    );
+    assert_eq!(fx.world.encode(), before);
 }
 
 fn tile(id: u16, lead: i16) -> Instance {
@@ -392,5 +441,103 @@ fn people_the_read_cannot_construct_fail_loudly() {
     let (_, cause) = trap(read(&mut fx, &file(vec![saved(3, ADULT)]), &people()));
     assert!(matches!(cause, Trap::Invalid(_)), "{cause:?}");
     // The stream and the files read are as they were.
+    assert_eq!(fx.world.encode(), before.encode());
+}
+
+#[test]
+fn a_person_the_load_does_not_reset_fails() {
+    // Load step 13 resets a person only when its type's scripts changed
+    // since the save; otherwise its animator keeps what the restore read,
+    // which is not ported.
+    let mut fx = lot();
+    fx.world.changed_types.remove(&CHILD);
+    let before = fx.world.clone();
+    let objects = file(vec![sim(3, ADULT), sim(2, CHILD)]);
+    let (object, cause) = trap(read(&mut fx, &objects, &people()));
+    assert_eq!(object, 2);
+    assert!(
+        matches!(&cause, Trap::Unsupported(text) if text.contains("not reset by the load")),
+        "{cause:?}"
+    );
+    assert_eq!(fx.world.encode(), before.encode());
+}
+
+#[test]
+fn the_load_restores_the_head_as_saved_and_relaxes_its_turn_after_tick_0() {
+    // The saved heading, target heading, turn and target point (0x5918ba).
+    // The target point is kept: a measurement whose target is gone reads
+    // it (0x5906bc). The constructor zeroed the head clock and set the
+    // animator's clock to the clock at the load's tick count, so the
+    // head's step relaxes the turn unless that is 0 (0x590788).
+    let bits = |f: sims_core::F32| f.to_bits();
+    for (ticks, relaxed) in [(0, false), (88444, true)] {
+        let mut fx = lot();
+        fx.world.ticks = ticks;
+        let mut adult = sim(3, ADULT);
+        adult.person.as_mut().unwrap().floats = [1.0, 2.0, 1.0, 70.0, 16.0, 80.0, 0.0, 0.0, 0.0];
+        read(&mut fx, &file(vec![adult]), &people()).unwrap();
+        let head = fx.world.animators[&3].head;
+        let mut turn = sims_sim::head::Head {
+            turn: sims_core::F32::from_f32(1.0),
+            ..sims_sim::head::Head::LOADED
+        };
+        if relaxed {
+            turn.relax();
+        }
+        assert_ne!(turn.turn.to_bits(), 0);
+        assert_eq!(
+            (
+                bits(head.heading),
+                bits(head.target_heading),
+                bits(head.turn)
+            ),
+            (1.0f32.to_bits(), 2.0f32.to_bits(), bits(turn.turn)),
+            "tick {ticks}"
+        );
+        assert_eq!(
+            head.target.map(|t| t.map(bits)),
+            Some([70.0f32, 16.0, 80.0].map(f32::to_bits))
+        );
+    }
+}
+
+#[test]
+fn a_person_saved_on_a_route_gets_as_many_empty_contexts_as_it_counted() {
+    // 0x460443: the save keeps only the count; each context is a copy of
+    // one the default constructor makes (0x4815f1, 0x46dd48, 0x481693).
+    let mut fx = lot();
+    let mut walking = sim(3, ADULT);
+    walking.person.as_mut().unwrap().routing_frames = 2;
+    let objects = file(vec![walking, sim(5, ADULT)]);
+    read(&mut fx, &objects, &people()).unwrap();
+    let contexts = &fx.world.routing.routes[&3].contexts;
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(contexts[0], contexts[1]);
+    let c = &contexts[0];
+    assert!(c.candidates.is_empty());
+    assert_eq!((c.target, c.person, c.chosen, c.best), (0, 0, -1, -1));
+    assert_eq!(
+        (c.slot.number, c.slot.snap_target, c.slot.facing),
+        (-1, -1, -2)
+    );
+    assert_eq!((c.slot.gradient, c.slot.flags), (0x3e40_0000, 0));
+    assert_eq!(
+        (c.byte_78, c.limit, c.saved, c.word_94),
+        (true, 0x30, [0; 2], 0)
+    );
+    // A person that counted none has none.
+    assert!(!fx.world.routing.routes.contains_key(&5));
+
+    // A negative count fails, and the lot is unchanged.
+    let mut fx = lot();
+    let before = fx.world.clone();
+    let mut odd = sim(3, ADULT);
+    odd.person.as_mut().unwrap().routing_frames = -1;
+    let (object, cause) = trap(read(&mut fx, &file(vec![odd]), &people()));
+    assert_eq!(object, 3);
+    assert!(
+        matches!(&cause, Trap::Unsupported(text) if text.contains("0x460443")),
+        "{cause:?}"
+    );
     assert_eq!(fx.world.encode(), before.encode());
 }

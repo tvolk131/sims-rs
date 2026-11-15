@@ -603,9 +603,19 @@ impl Machine<'_, '_> {
                     "scope 24 is resolved before it is located".into(),
                 ));
             }
-            // Neighborhood data (34) and scope 38 need state the
-            // simulation doesn't hold yet.
-            34 | 38 => {
+            // Neighborhood data (0x4531bf): word `index` of the
+            // neighborhood's sixteen, for an index from 1 to 15, as a
+            // value with no word pointer. Any other index is native error
+            // 0x3c.
+            34 => {
+                let i = usize::try_from(index)
+                    .ok()
+                    .filter(|&i| (1..16).contains(&i))
+                    .ok_or(Trap::native(0x3c, "neighborhood data index out of bounds"))?;
+                Cell::Literal(self.world.neighborhood_data[i])
+            }
+            // Scope 38 needs state the simulation doesn't hold yet.
+            38 => {
                 return Err(unsupported(scope));
             }
             2 | 5 | 39..=255 => return Err(Trap::native(9, "invalid memory scope")),

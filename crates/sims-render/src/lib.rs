@@ -7,7 +7,7 @@
 //! image with a depth buffer, so tests run without a window or GPU.
 //!
 //! What was compared with the original, and what is not yet, is in
-//! `docs/decisions.md`.
+//! `docs/decisions/`.
 
 pub mod assets;
 pub mod camera;
@@ -22,6 +22,7 @@ pub mod open;
 pub mod png;
 pub mod pools;
 pub mod scene;
+pub mod shadows;
 
 pub use assets::Assets;
 pub use camera::{Camera, Walls, Zoom};

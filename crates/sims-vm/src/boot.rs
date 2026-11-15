@@ -14,7 +14,7 @@
 
 use crate::play::Play;
 use crate::{Answers, Callback, Interpreter, Program, Stream, TickError, Update};
-use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People};
+use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People, Surfaces};
 use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
@@ -35,7 +35,7 @@ const VIEW_LEVEL: i8 = 1;
 ///
 /// The default, `0,1,2,3,33+30`, is what three captures of the original
 /// running the Goth house recorded, with a hardware watchpoint on the
-/// house view's draw guard (`docs/decisions.md`): a frame before the
+/// house view's draw guard (`docs/decisions/`): a frame before the
 /// first lot update, after updates 1, 2 and 3 (many times while a dialog
 /// waited), after update 33, and after every 30th update from there (63,
 /// 93, ...). Frames write two things: the first frame that draws a
@@ -328,6 +328,14 @@ pub struct Menu {
     pub sounds: Vec<crate::SoundEvent>,
 }
 
+/// What [`Lot::highlight`] did: the entry's action as the check left it,
+/// and the check tree's requests to the sound system.
+#[derive(Debug, Clone)]
+pub struct Highlight {
+    pub action: sims_formats::saved_objects::Interaction,
+    pub sounds: Vec<crate::SoundEvent>,
+}
+
 /// What [`Lot::cancel`] did: whether the press counts, and the trees'
 /// requests to the sound system.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -419,6 +427,7 @@ impl Lot {
         // step walks them all, so the whole catalog is linked.
         let mut program = Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid))?;
         program.zoning = neighborhood.zoning(context.expansions)?;
+        program.expansions = context.expansions;
         program.animations = Animations::load(&install, &index)?;
         let person_types = || {
             catalog
@@ -471,8 +480,14 @@ impl Lot {
                 .version()
                 .ok_or("the house file has no HOUS 1 chunk, which holds its version")?;
             world.read_arrays(&file.arrays, version)?;
-            load.renumbered =
-                world.renumber_surfaces(file.floor_map.as_deref(), file.wall_map.as_deref())?;
+            // The floor and wall catalogs, which the original builds at
+            // start-up.
+            let surfaces = Surfaces::build(&install)?;
+            load.renumbered = world.renumber_surfaces(
+                file.floor_map.as_deref(),
+                file.wall_map.as_deref(),
+                &surfaces,
+            )?;
             // 6c and 7: the type table, which marks the types whose scripts
             // changed.
             if file.guid_table {
@@ -863,6 +878,36 @@ impl Lot {
         })
     }
 
+    /// Checks again the action of the pie menu's entry the pointer has
+    /// reached ([`Interpreter::highlight`], 0x48df28). Call it between
+    /// steps when the pointer reaches an entry of an open menu: the check
+    /// tree changes the lot, so a recording of play must note each call.
+    /// Returns the action as the check left it, and the requests to the
+    /// sound system its tree made. A check that fails on something not
+    /// ported changes nothing, as for [`Lot::pie_menu`].
+    pub fn highlight(
+        &mut self,
+        person: u16,
+        action: sims_formats::saved_objects::Interaction,
+    ) -> Result<Highlight, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let action = interpreter
+            .highlight(&mut world, person, action)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        Ok(Highlight {
+            action,
+            sounds: sounds.into_inner(),
+        })
+    }
+
     /// Queues on `person` the action of an entry [`Lot::pie_menu`] listed,
     /// as picking it does ([`Interpreter::pick`]). Returns the action's number, or None
     /// when the queue took nothing (it is full, or the action's entry is
@@ -916,17 +961,28 @@ impl Lot {
     /// selected before is deselected, and the indicators move. Returns
     /// the requests to the sound system the indicators' trees made.
     ///
-    /// Deselecting refreshes the deselected Sim's animator, which is not
-    /// ported, so selecting another Sim while one is selected fails here
-    /// ([`crate::Refresh::Fail`]); [`Lot::select_play`] leaves the
-    /// refresh out.
+    /// Deselecting refreshes the deselected Sim's animator at the lot's
+    /// tick count (0x58da12 with 0), which can move its head and person
+    /// words 42 and 45.
     ///
     /// A selection that fails changes nothing, as for
     /// [`Lot::queue_interaction`]. Only a person can be selected; which
     /// people the interface lets the player select (the portraits of the
     /// household) is the caller's to decide.
     pub fn select(&mut self, person: u16) -> Result<Vec<crate::SoundEvent>, OrderError> {
-        self.select_with(person, crate::Refresh::Fail)
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        interpreter
+            .select(&mut world, Some(person))
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        Ok(sounds.into_inner())
     }
 
     /// Sets the idle loop's own speed between ticks (`0x46d9d6`,
@@ -966,35 +1022,6 @@ impl Lot {
     pub fn unpause(&mut self) -> Result<bool, OrderError> {
         self.ready()?;
         Ok(self.world.unpause())
-    }
-
-    /// [`Lot::select`] for play mode: the deselected Sim's animator
-    /// refresh, which is not ported, is left out
-    /// ([`crate::Refresh::Skip`]), so its animator, head and person words
-    /// do not move as the original's would. A lot selected this way is not
-    /// one to compare with the original.
-    pub fn select_play(&mut self, person: u16) -> Result<Vec<crate::SoundEvent>, OrderError> {
-        self.select_with(person, crate::Refresh::Skip)
-    }
-
-    fn select_with(
-        &mut self,
-        person: u16,
-        refresh: crate::Refresh,
-    ) -> Result<Vec<crate::SoundEvent>, OrderError> {
-        self.ready()?;
-        let sounds = RefCell::new(Vec::new());
-        let interpreter = Interpreter {
-            sounds: Some(&sounds),
-            view_rotation: self.view_rotation,
-            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
-        };
-        let mut world = self.world.clone();
-        interpreter
-            .select_with(&mut world, Some(person), refresh)
-            .map_err(OrderError::Refused)?;
-        self.world = world;
-        Ok(sounds.into_inner())
     }
 
     /// From now on, a dialog that offers a choice when no answer is left
@@ -1119,6 +1146,7 @@ mod tests {
                 animations: Default::default(),
                 people: Default::default(),
                 icon_frames: None,
+                expansions: 0,
             },
             catalog: Catalog {
                 global: 0,

@@ -262,8 +262,9 @@ pub fn registry(index: &sims_content::Index, catalog: &sims_content::Catalog) ->
 }
 
 impl World {
-    /// Reads the neighborhood's records (NBRS, 0x430ad6) and inventories
-    /// (NGBH, 0x4254f6, which reads them with 0x42feb2), and does what the
+    /// Reads the neighborhood's records (NBRS, 0x430ad6), inventories
+    /// (NGBH, 0x4254f6, which reads them with 0x42feb2) and data words
+    /// ([`World::neighborhood_data`], NGBH), and does what the
     /// neighborhood's reload (0x424806) does to the records before a lot
     /// loads. `registry` is every
     /// definition the game has registered, in order ([`registry`]).
@@ -318,7 +319,7 @@ impl World {
     /// file, every record's word 61 equals the capture's at the Goth
     /// house's first tick. The capture's game read another neighborhood
     /// file, which differs from the install's in five records (47, 48,
-    /// 301, 344 and 351); see `docs/decisions.md`. So do the families'
+    /// 301, 344 and 351); see `docs/decisions/`. So do the families'
     /// IDs, houses, members and order, and every friend count but the
     /// Goth family's, which the load counts again (load step 20). That
     /// neighborhood has a record for every registered definition, so step
@@ -331,6 +332,7 @@ impl World {
         registry: &[Registered],
     ) -> Result<(), LoadError> {
         let families = &neighborhood.families;
+        self.neighborhood_data = neighborhood.data;
         let mut inventories = Vec::new();
         for inventory in &neighborhood.inventories {
             let inventory = inventory.as_ref().ok_or_else(|| {

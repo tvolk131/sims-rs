@@ -1,4 +1,4 @@
-use crate::animator::{Animator, Layer};
+use crate::animator::{Animator, HeldPose, Layer};
 use crate::neighbors::{Family, Neighbors};
 use crate::rooms::Rooms;
 use crate::route::Routing;
@@ -162,6 +162,22 @@ pub struct World {
     /// from the animator so that the encodings of the states before it
     /// was kept stay a prefix of the new ones.
     pub translated_bones: BTreeMap<u16, BTreeSet<String>>,
+    /// The neighborhood's sixteen data words (the neighborhood's +0x128),
+    /// as the neighborhood file's NGBH chunk gives them. Scripts read
+    /// words 1 to 15 through scope 34 (0x4531bf) and cannot write them;
+    /// a Generic Sims Call (0x429c7d, from 0x44f7eb) writes words 1 and
+    /// 2. Like the neighborhood's people, they belong to the running
+    /// game, not to the lot.
+    pub neighborhood_data: [i16; 16],
+    /// The pose each person's skin holds from the load, for each person
+    /// whose skin has sampled no layer since (see [`HeldPose`]). The load
+    /// restores the saved layers, poses the skin with them and places it
+    /// (0x5918ba), and the person's reset then takes the layers away
+    /// (0x589220) but leaves the bones; the skin's next update that
+    /// samples a layer ends it. Kept apart from the animator so that the
+    /// encodings of the states before it was kept stay a prefix of the new
+    /// ones.
+    pub held_poses: BTreeMap<u16, HeldPose>,
     /// The people whose animator was asked to stop its route while the
     /// route was under way (animator +0x284): the stop (0x589e2d) then
     /// stops nothing and only notes the request, and the walk's next step
@@ -510,6 +526,8 @@ impl World {
             headlines: BTreeMap::new(),
             base_layers: BTreeMap::new(),
             translated_bones: BTreeMap::new(),
+            neighborhood_data: [0; 16],
+            held_poses: BTreeMap::new(),
             stop_requests: BTreeSet::new(),
         }
     }

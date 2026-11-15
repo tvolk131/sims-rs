@@ -45,6 +45,9 @@ use sims_sim::route::{Candidate, Context};
 /// Object data words.
 const FLAGS: usize = 8;
 const COST: usize = 10;
+/// Set, the planner leaves out what the ground of an outdoor room on
+/// level 1 costs: free rectangles cost 0 and the room's terrain is not
+/// read (0x48245e, 0x482505, 0x4827f6).
 const PACE: usize = 17;
 const ROOM: usize = 29;
 const WALL_MASK: usize = 53;
@@ -192,9 +195,8 @@ impl Interpreter<'_> {
                 "a person with bit 0 of person word 84 or 68",
             )));
         }
-        if datum(world, person, PACE).map_err(fail)? != 0 {
-            return Err(fail(unsupported("a person whose data word 17 is set")));
-        }
+        // 0x482458: data word 17 set, the ground is not costed.
+        let ground = datum(world, person, PACE).map_err(fail)? == 0;
         let room = datum(world, person, ROOM).map_err(fail)?;
         if datum(world, ctx.target, ROOM).map_err(fail)? != room {
             return Err(fail(unsupported("a slot in another room than the person")));
@@ -203,7 +205,7 @@ impl Interpreter<'_> {
             Some(r) => (r.outdoors, r.half_tiles, r.objects),
             None => return Err(fail(unsupported("a person in no room"))),
         };
-        let free_cost = free_cost(room, outdoors);
+        let free_cost = free_cost(room, outdoors, ground);
         let actor = me.footprint;
 
         // The objects' obstacles.
@@ -247,7 +249,11 @@ impl Interpreter<'_> {
             dynamic.extend(obstacle(fp, cost, kind, actor));
         }
 
-        let fixed = self.room_rects(world, room).map_err(fail)?;
+        // 0x4827f6: the room's own rectangles (0x46795a, with terrain), or,
+        // for an outdoor room on level 1 with the ground not costed, the
+        // room's rectangles made again without terrain (0x4818af with 0).
+        let terrain = ground || !(super::rooms::room_level(room) == 1 && outdoors);
+        let fixed = self.room_rects(world, room, terrain).map_err(fail)?;
 
         // The goals.
         let mut goals = Vec::new();
@@ -306,9 +312,10 @@ impl Interpreter<'_> {
 }
 
 /// What a free rectangle found while searching costs (0x4824d0 to
-/// 0x48253e): 3 in a room outdoors on the ground, else 0.
-fn free_cost(room: i16, outdoors: bool) -> i32 {
-    if super::rooms::room_level(room) == 1 && outdoors {
+/// 0x48253e): 3 in a room outdoors on the ground when the ground is
+/// costed (person data word 17 is 0), else 0.
+fn free_cost(room: i16, outdoors: bool, ground: bool) -> i32 {
+    if ground && super::rooms::room_level(room) == 1 && outdoors {
         3
     } else {
         0
@@ -394,10 +401,11 @@ mod tests {
 
     #[test]
     fn a_free_rectangle_costs_3_only_outdoors_on_the_ground() {
-        assert_eq!(free_cost(0, true), 3);
-        assert_eq!(free_cost(5, false), 0);
+        assert_eq!(free_cost(0, true, true), 3);
+        assert_eq!(free_cost(0, true, false), 0);
+        assert_eq!(free_cost(5, false, true), 0);
         // Room 1024 is on the second level.
-        assert_eq!(free_cost(1024, true), 0);
+        assert_eq!(free_cost(1024, true, true), 0);
     }
 
     #[test]

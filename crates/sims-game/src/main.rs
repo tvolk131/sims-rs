@@ -20,9 +20,7 @@
 //! floor, `1`/`2`/`3` walls up, cutaway and down, the arrows or a
 //! right-button drag scroll, space pauses, Escape quits.
 //!
-//! A press on a portrait selects that Sim. In strict mode switching Sims
-//! fails, as the simulation has not ported the deselected Sim's
-//! animator refresh; play mode leaves it out (`Lot::select_play`).
+//! A press on a portrait selects that Sim.
 //!
 //! A left click on a person or an object opens its pie menu for the
 //! selected Sim (`sims_ui::pie`, around the click); a click on an entry
@@ -308,6 +306,8 @@ impl App {
         let ran = self.game.advance(micros);
         // A dialog shown at the first tick due is drawn though none ran.
         let mut redraw = ran > 0 || (!waited && self.game.asking().is_some());
+        // The plumb bob spins by the time passed, ticks or not.
+        redraw |= self.game.spin_due();
         // What the tick's sounds may ask about their objects, before the
         // sounds themselves. Read on every call, not only after a step
         // that succeeded: a failed step may still have changed the lot.

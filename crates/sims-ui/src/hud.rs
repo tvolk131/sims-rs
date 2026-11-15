@@ -6,7 +6,7 @@
 //! captured them from the running game's windows
 //! (legacy/crates/sims-app/src/hud_cluster.rs and original_hud.rs); the
 //! rest were measured on a screenshot of the original (see
-//! `docs/decisions.md`). At another size the cluster keeps to the bottom
+//! `docs/decisions/`). At another size the cluster keeps to the bottom
 //! left, the strip runs from it to the right edge, the needs keep to the
 //! right edge and the strip's background stretches its last column, as
 //! the original does when its window is wider than 800.
@@ -15,7 +15,7 @@ use crate::art::Art;
 use crate::command::{Camera, Command, Mode, Panel, Relations, Speed, Walls};
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
-use crate::household::{Faces, Relation, Snapshot};
+use crate::household::{Faces, Relation, Snapshot, Work, money};
 use sims_formats::bitmap::Image;
 
 /// The cluster's size, the size of its background (kUniversalBkgTGA).
@@ -64,6 +64,12 @@ pub mod id {
     /// A skill bar, full and empty, in a western language (0x52f356).
     pub const SKILL_FULL: i32 = 4901;
     pub const SKILL_EMPTY: i32 = 4920;
+    /// The job panel's career icons, and the salary's, performance's and
+    /// friends' icons (0x52fc27, 0x66dfdc).
+    pub const CAREERS: i32 = 4902;
+    pub const SALARY: i32 = 4981;
+    pub const PERFORMANCE: i32 = 4982;
+    pub const FRIENDS_NEEDED: i32 = 4983;
     /// The relationship panel's page arrows (0x5193d6) and list buttons,
     /// in the panel's order (0x51a5ba).
     pub const PAGE_BACK: i32 = 100;
@@ -87,7 +93,7 @@ pub mod id {
 }
 
 /// Every resource the panel may draw, for [`Art::load`].
-pub const RESOURCES: [i32; 50] = [
+pub const RESOURCES: [i32; 54] = [
     id::WALLS_DOWN,
     id::CUTAWAY,
     id::WALLS_UP,
@@ -120,6 +126,10 @@ pub const RESOURCES: [i32; 50] = [
     id::TRAIT_EMPTY,
     id::SKILL_FULL,
     id::SKILL_EMPTY,
+    id::CAREERS,
+    id::SALARY,
+    id::PERFORMANCE,
+    id::FRIENDS_NEEDED,
     id::PAGE_BACK,
     id::PAGE_ON,
     id::FAMILY,
@@ -263,11 +273,23 @@ pub enum Kind {
     /// selected Sim's traits in the panel's order
     /// ([`crate::household::PERSONALITY`]). Laid out when drawn, from the
     /// labels' font.
-    Personality([i16; 5]),
+    Personality {
+        traits: [i16; 5],
+        zodiac: Option<u8>,
+    },
     /// The job panel's skills, in `rect`, the subpanel: the selected
     /// Sim's skills and what the next level of their career needs of
     /// each, in the panel's order ([`crate::household::SKILLS`]).
     Skills { skills: [i16; 6], needs: [i32; 6] },
+    /// The job panel's left column, in `rect`, the subpanel: the selected
+    /// Sim's career icon and title, salary, performance, and the family
+    /// friends the next level needs where the family has fewer than
+    /// `family_friends`.
+    Work {
+        work: Work,
+        performance: i16,
+        family_friends: i32,
+    },
     /// A person in the relationship panel, `rect` the entry: their face
     /// for the lifetime relationship, the two relationships as numbers
     /// and bars, and the icons. `lit` while the pointer is on it.
@@ -631,7 +653,10 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         });
         items.push(Item {
             rect: panel,
-            kind: Kind::Personality(resident.personality),
+            kind: Kind::Personality {
+                traits: resident.personality,
+                zodiac: resident.zodiac,
+            },
             command: None,
         });
     }
@@ -654,6 +679,15 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             kind: Kind::Skills {
                 skills: resident.skills,
                 needs: resident.needs,
+            },
+            command: None,
+        });
+        items.push(Item {
+            rect: panel,
+            kind: Kind::Work {
+                work: resident.work.clone(),
+                performance: resident.performance,
+                family_friends: snapshot.family_friends,
             },
             command: None,
         });
@@ -737,6 +771,37 @@ fn draw_personality(frame: &mut Frame, art: &Art, panel: Rect, values: &[i16; 5]
             frame.draw(full, source, [at[0], at[1].saturating_sub(1)]);
         }
     }
+}
+
+/// The signs of the zodiac, Aries first (UIText.iff STR# 164, strings 1
+/// to 12, read by 0x48410b), and their font (0x6f2af4).
+const ZODIAC_NAMES: [&str; 12] = [
+    "Aries",
+    "Taurus",
+    "Gemini",
+    "Cancer",
+    "Leo",
+    "Virgo",
+    "Libra",
+    "Scorpio",
+    "Sagittarius",
+    "Capricorn",
+    "Aquarius",
+    "Pisces",
+];
+const ZODIAC_FONT: u8 = 12;
+
+/// The personality panel's sign of the zodiac (0x51cd11..0x51cdfe): its
+/// name, sized to the text, 5 from the panel's left and 5 above its
+/// bottom less the line. **Unverified:** the color (the labels' is
+/// taken).
+fn draw_zodiac(frame: &mut Frame, art: &Art, panel: Rect, sign: u8) {
+    let Some(font) = art.font(ZODIAC_FONT) else {
+        return;
+    };
+    let name = ZODIAC_NAMES[usize::from(sign.clamp(1, 12) - 1)];
+    let y = panel.y.saturating_add(panel.height - font.line_height - 5);
+    font.draw(frame, name, [panel.x.saturating_add(5), y], LABEL);
 }
 
 /// The job panel's title, from the subpanel (0x530340).
@@ -827,6 +892,143 @@ fn draw_skills(frame: &mut Frame, art: &Art, panel: Rect, skills: &[i16; 6], nee
             ),
             LABEL,
         );
+    }
+}
+
+/// The job panel's left column (0x52f2ff): four gadgets, the first at
+/// (3, 4) in the subpanel and each of the others under the one before
+/// (0x52fe37), 95 wide; their fonts (0x6ccce4: the career's, the
+/// salary's, the performance's and the friends'); and the strings the
+/// panel shows in a western language (Live.iff STR# 136, strings 7 to
+/// 10; work.iff STR# 4096, strings 1 to 5, 0x4034fd).
+const WORK_LEFT: [i32; 2] = [3, 4];
+const WORK_WIDTH: i32 = 95;
+const WORK_FONTS: [u8; 4] = [7, 8, 7, 7];
+const UNEMPLOYED: &str = "Unemployed";
+const NOT_AVAILABLE: &str = "n/a";
+const PERFORMANCE_NAMES: [&str; 5] = ["Dismal", "Poor", "Average", "Good", "Excellent"];
+/// The career icons' grid: four states across and 22 careers down
+/// (0x52fc27); the other icons have the four states alone (0x52fc64).
+const WORK_ICON_STATES: u32 = 4;
+const CAREER_ROWS: u32 = 22;
+/// The bottom of the career title's box, from the gadget's top: the
+/// gadget's first height (0x6f4210).
+const TITLE_BOTTOM: i32 = 45;
+
+/// The performance's name (0x4034fd): below -60, -30, 30 and 60, then
+/// the best.
+fn performance_name(performance: i16) -> &'static str {
+    let n = [-60, -30, 30, 60]
+        .iter()
+        .position(|&bound| performance < bound)
+        .unwrap_or(4);
+    PERFORMANCE_NAMES[n]
+}
+
+/// Cell `cell` of the icons `id`, `rows` careers down: four states
+/// across, and the gadgets show the first (0x5e4b0f).
+fn work_icon(art: &Art, id: i32, rows: u32, row: u32) -> Option<(&Image, Rect)> {
+    let image = art.image(id)?;
+    let (w, h) = (image.width / WORK_ICON_STATES, image.height / rows.max(1));
+    let (w, h) = (i32::try_from(w).ok()?, i32::try_from(h).ok()?);
+    Some((
+        image,
+        Rect::new(0, h.checked_mul(i32::try_from(row).ok()?)?, w, h),
+    ))
+}
+
+/// The job panel's left column as the original draws it (0x530501), top
+/// to bottom:
+/// - the career: its icon (the row of [`Work::icon`]; none for a row the
+///   icons lack) and under it the level's title, wrapped to the
+///   gadget's width, or "Unemployed" (0x5303b3, 0x530674);
+/// - the salary in money, or "n/a", after its icon, centered down the
+///   line (0x5305f7, 0x52fdbb);
+/// - the performance's name, or "n/a", after its icon (0x530563);
+/// - "Need" and the family friends the next level needs, where the
+///   family has fewer, with the icon after it, 2 down (0x531050).
+///
+/// Text is in the labels' color. **Not drawn:** the performance's blink
+/// below 0 (0x5306df, every 333 ms), and the tooltips. Which lines of a
+/// title that wraps past its box show is **unverified**: here the lines
+/// that fit.
+fn draw_work(
+    frame: &mut Frame,
+    art: &Art,
+    panel: Rect,
+    work: &Work,
+    performance: i16,
+    family_friends: i32,
+) {
+    let [Some(career), Some(salary), Some(rating), Some(friends)] =
+        WORK_FONTS.map(|size| art.font(size))
+    else {
+        return;
+    };
+    let x = panel.x.saturating_add(WORK_LEFT[0]);
+    let mut y = panel.y.saturating_add(WORK_LEFT[1]);
+
+    let row = u32::try_from(work.icon).ok().filter(|&r| r < CAREER_ROWS);
+    let icon = work_icon(art, id::CAREERS, CAREER_ROWS, row.unwrap_or(0));
+    let cell = icon.map_or(22, |(_, source)| source.height);
+    if let (Some((image, source)), Some(_)) = (icon, row) {
+        frame.draw(image, source, [x, y]);
+    }
+    let title = work.level.as_ref().map_or(UNEMPLOYED, |l| l.title.as_str());
+    // A line shows when its top is above the box's bottom, as the
+    // original's wrapped text does (0x60b510), however far it reaches.
+    let mut top = cell;
+    for line in career.break_lines(title, WORK_WIDTH) {
+        if top >= TITLE_BOTTOM {
+            break;
+        }
+        career.draw(frame, &line, [x, y.saturating_add(top)], LABEL);
+        top = top.saturating_add(career.line_height.max(1));
+    }
+    y = y.saturating_add(cell.saturating_add(career.line_height.saturating_mul(2)));
+
+    for (font, id, text) in [
+        (
+            salary,
+            id::SALARY,
+            work.level
+                .as_ref()
+                .map_or_else(|| NOT_AVAILABLE.to_owned(), |l| money(l.salary)),
+        ),
+        (
+            rating,
+            id::PERFORMANCE,
+            if work.level.is_some() {
+                performance_name(performance)
+            } else {
+                NOT_AVAILABLE
+            }
+            .to_owned(),
+        ),
+    ] {
+        let mut text_x = x;
+        if let Some((image, source)) = work_icon(art, id, 1, 0) {
+            // The salary's icon is centered down its line; the
+            // performance's is at the top (0x52fdfd).
+            let down = if id == id::SALARY {
+                (font.line_height - source.height) / 2
+            } else {
+                0
+            };
+            frame.draw(image, source, [x, y.saturating_add(down)]);
+            text_x = x.saturating_add(source.width + 3);
+        }
+        font.draw(frame, &text, [text_x, y], LABEL);
+        y = y.saturating_add(font.line_height);
+    }
+
+    if work.friends > family_friends {
+        let text = format!("Need {}", work.friends);
+        friends.draw(frame, &text, [x, y], LABEL);
+        if let Some((image, source)) = work_icon(art, id::FRIENDS_NEEDED, 1, 0) {
+            let at = x.saturating_add(friends.width(&text)).saturating_add(3);
+            frame.draw(image, source, [at, y.saturating_add(2)]);
+        }
     }
 }
 
@@ -1303,8 +1505,18 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                     draw_name(frame, font, name, r);
                 }
             }
-            Kind::Personality(values) => draw_personality(frame, art, r, values),
+            Kind::Personality { traits, zodiac } => {
+                draw_personality(frame, art, r, traits);
+                if let Some(sign) = zodiac {
+                    draw_zodiac(frame, art, r, *sign);
+                }
+            }
             Kind::Skills { skills, needs } => draw_skills(frame, art, r, skills, needs),
+            Kind::Work {
+                work,
+                performance,
+                family_friends,
+            } => draw_work(frame, art, r, work, *performance, *family_friends),
             Kind::Relation { relation, lit } => draw_relation(frame, art, faces, r, relation, *lit),
             Kind::Meter(value) => {
                 let (width, left, right) = meter(*value);
@@ -1359,8 +1571,9 @@ impl Item {
                     | Kind::Bars { .. }
                     | Kind::Meter(_)
                     | Kind::Name { .. }
-                    | Kind::Personality(_)
+                    | Kind::Personality { .. }
                     | Kind::Skills { .. }
+                    | Kind::Work { .. }
                     | Kind::Relation { .. }
             )
     }
@@ -1412,12 +1625,18 @@ mod tests {
                     guid: u32::from(object),
                     motives: [50.; 16],
                     personality: [0; 5],
+                    zodiac: None,
                     skills: [0; 6],
                     job: [0; 2],
                     needs: [0; 6],
+                    child: false,
+                    female: false,
+                    performance: 0,
+                    work: Work::default(),
                 })
                 .collect(),
             selected: Some(21),
+            family_friends: 0,
             relations: Vec::new(),
         }
     }
@@ -1502,9 +1721,14 @@ mod tests {
                 guid: u32::from(object),
                 motives: [0.; 16],
                 personality: [0; 5],
+                zodiac: None,
                 skills: [0; 6],
                 job: [0; 2],
                 needs: [0; 6],
+                child: false,
+                female: false,
+                performance: 0,
+                work: Work::default(),
             })
             .collect();
         let controls = Controls {
@@ -1707,6 +1931,7 @@ mod tests {
     fn the_personality_panel_shows_the_selected_sims_traits() {
         let mut s = snapshot();
         s.residents[0].personality = [250, -5, 1500, 0, 999];
+        s.residents[0].zodiac = Some(9);
         let controls = Controls {
             expanded: true,
             panel: Panel::Personality,
@@ -1715,17 +1940,27 @@ mod tests {
         let items = layout([800, 600], &s, &controls);
         let panels: Vec<&Item> = items
             .iter()
-            .filter(|i| matches!(i.kind, Kind::Personality(_)))
+            .filter(|i| matches!(i.kind, Kind::Personality { .. }))
             .collect();
         // The subpanel, as the needs' is.
         assert_eq!(panels.len(), 1);
         assert_eq!(panels[0].rect, Rect::new(521, 500, 279, 100));
-        assert_eq!(panels[0].kind, Kind::Personality([250, -5, 1500, 0, 999]));
+        assert_eq!(
+            panels[0].kind,
+            Kind::Personality {
+                traits: [250, -5, 1500, 0, 999],
+                zodiac: Some(9)
+            }
+        );
         // Presses go through it; nobody selected, no panel.
         assert_eq!(press(&items, [700, 520]), None);
         s.selected = None;
         let items = layout([800, 600], &s, &controls);
-        assert!(!items.iter().any(|i| matches!(i.kind, Kind::Personality(_))));
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i.kind, Kind::Personality { .. }))
+        );
 
         // Drawn with a font whose labels are 0 wide: every bar's label is
         // 3 wide and its bar starts 3 after, so the 40-pixel bars run from
@@ -2081,6 +2316,191 @@ mod tests {
                 true,
             );
         }
+    }
+
+    #[test]
+    fn the_sign_of_the_zodiac_goes_at_the_panels_bottom_left() {
+        let mut art = Art::default();
+        art.insert_font(ZODIAC_FONT, crate::font::tests::font());
+        let line = art.font(ZODIAC_FONT).unwrap().line_height;
+        // "Aries": only its `A` is in the test font, drawn a pixel in
+        // (its bearing) from 5 in, at 100 - line - 5 down.
+        let mut frame = Frame::new(40, 110, [0; 3]);
+        draw_zodiac(&mut frame, &art, Rect::new(0, 0, 279, 100), 1);
+        let top = 100 - line - 5;
+        assert_eq!(frame.pixel(6, top), Some(LABEL));
+        assert_eq!(frame.pixel(5, top), Some([0; 3]));
+        assert_eq!(frame.pixel(6, top - 1), Some([0; 3]));
+        // Without the font nothing is drawn, and far places do not
+        // overflow.
+        let mut frame = Frame::new(4, 4, [0; 3]);
+        draw_zodiac(&mut frame, &Art::default(), Rect::new(0, 0, 279, 100), 1);
+        assert!(frame.rgb().iter().all(|p| *p == [0; 3]));
+        for at in [i32::MAX - 2, i32::MIN + 2] {
+            draw_zodiac(&mut frame, &art, Rect::new(at, at, 279, 100), 12);
+        }
+    }
+
+    #[test]
+    fn the_job_panels_left_column_follows_the_original() {
+        use crate::household::WorkLevel;
+        let mut s = snapshot();
+        s.residents[0].performance = -31;
+        s.residents[0].work = Work {
+            icon: 9,
+            level: Some(WorkLevel {
+                title: "Test Subject".into(),
+                salary: 155,
+            }),
+            friends: 1,
+        };
+        s.family_friends = 4;
+        let controls = Controls {
+            expanded: true,
+            panel: Panel::Job,
+            ..Controls::default()
+        };
+        let items = layout([800, 600], &s, &controls);
+        let work: Vec<&Item> = items
+            .iter()
+            .filter(|i| matches!(i.kind, Kind::Work { .. }))
+            .collect();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].rect, Rect::new(521, 500, 279, 100));
+        assert_eq!(
+            work[0].kind,
+            Kind::Work {
+                work: s.residents[0].work.clone(),
+                performance: -31,
+                family_friends: 4,
+            }
+        );
+        assert_eq!(press(&items, [530, 510]), None);
+
+        // The names of performance, at the original's bounds.
+        let names: Vec<_> = [i16::MIN, -61, -60, -31, -30, 29, 30, 59, 60, i16::MAX]
+            .map(performance_name)
+            .into();
+        assert_eq!(
+            names,
+            [
+                "Dismal",
+                "Dismal",
+                "Poor",
+                "Poor",
+                "Average",
+                "Average",
+                "Good",
+                "Good",
+                "Excellent",
+                "Excellent"
+            ]
+        );
+
+        // The icons: the career's grid colored by (state, row), the
+        // others plain. The fonts have only an `M`, 3 by 4, so a line is
+        // 4 high.
+        let mut careers = Image {
+            width: 112,
+            height: 484,
+            rgba: Vec::new(),
+        };
+        for y in 0..484u32 {
+            for x in 0..112u32 {
+                careers
+                    .rgba
+                    .extend_from_slice(&[(x / 28) as u8 + 1, (y / 22) as u8 + 1, 9, 255]);
+            }
+        }
+        let (salary, rating, friends) = ([3, 3, 3], [4, 4, 4], [5, 5, 5]);
+        let mut art = art_with_a_font();
+        let font = art.font(NAME_SIZE).unwrap().clone();
+        art.insert_font(7, font.clone());
+        art.insert_font(8, font.clone());
+        art.insert(id::CAREERS, careers);
+        art.insert(id::SALARY, solid(52, 11, salary));
+        art.insert(id::PERFORMANCE, solid(52, 12, rating));
+        art.insert(id::FRIENDS_NEEDED, solid(40, 11, friends));
+        let draw = |work: &Work, family_friends: i32| {
+            let mut frame = Frame::new(120, 60, [0; 3]);
+            draw_work(
+                &mut frame,
+                &art,
+                Rect::new(0, 0, 120, 60),
+                work,
+                0,
+                family_friends,
+            );
+            frame
+        };
+        let mut work = Work {
+            icon: 9,
+            level: Some(WorkLevel {
+                title: "M".into(),
+                salary: 155,
+            }),
+            friends: 5,
+        };
+        let frame = draw(&work, 4);
+        // Row 9, state 0, 28 by 22 at (3, 4), and the title under it.
+        assert_eq!(frame.pixel(3, 4), Some([1, 10, 9]));
+        assert_eq!(frame.pixel(30, 25), Some([1, 10, 9]));
+        assert_eq!(frame.pixel(31, 4), Some([0; 3]));
+        assert_eq!(frame.pixel(3, 26), Some(LABEL));
+        assert_eq!(frame.pixel(5, 29), Some(LABEL));
+        // The gadget is 22 and two lines high: the salary's line from 34,
+        // its icon (13 by 11) centered on it, from 31; the font has none
+        // of the text's characters.
+        assert_eq!(frame.pixel(3, 30), Some([0; 3]));
+        assert_eq!(frame.pixel(3, 31), Some(salary));
+        assert_eq!(frame.pixel(15, 37), Some(salary));
+        assert_eq!(frame.pixel(16, 37), Some([0; 3]));
+        // The performance's line from 38, its icon (13 by 12) at its top.
+        assert_eq!(frame.pixel(3, 38), Some(rating));
+        assert_eq!(frame.pixel(3, 49), Some(rating));
+        assert_eq!(frame.pixel(3, 50), Some([0; 3]));
+        // "Need 5" from 42; its icon (10 by 11) 3 past the text, 2 down.
+        let at = 3 + font.width("Need 5") + 3;
+        assert_eq!(frame.pixel(at, 43), Some(rating));
+        assert_eq!(frame.pixel(at, 44), Some(friends));
+        assert_eq!(frame.pixel(at + 9, 54), Some(friends));
+        // A family with enough friends: none.
+        assert_eq!(draw(&work, 5).pixel(at + 9, 54), Some([0; 3]));
+        assert_eq!(draw(&work, 5).pixel(at, 44), Some(rating));
+        // A title wraps at 95: seven lines of 16 `M`s, of which the six
+        // that start above the box's bottom (45) show.
+        let word = "M".repeat(16);
+        let mut title = |title: String| {
+            work.level = Some(WorkLevel { title, salary: 0 });
+            draw(&work, 5)
+        };
+        let frame = title([word.as_str(); 7].join(" "));
+        for n in 0..6 {
+            assert_eq!(frame.pixel(40, 26 + 4 * n), Some(LABEL), "line {n}");
+        }
+        assert_eq!(frame.pixel(40, 50), Some([0; 3]));
+        // After a hyphen, and mid-word when a word is wider than the box.
+        let frame = title(format!("{word}-{word}"));
+        assert_eq!(frame.pixel(40, 30), Some(LABEL));
+        let frame = title("M".repeat(40));
+        assert_eq!(frame.pixel(3, 30), Some(LABEL));
+        assert_eq!(frame.pixel(98, 26), Some([0; 3]));
+        // Rows the icons lack, school's -1 and past the 22, draw none.
+        for icon in [-1, 22] {
+            work.icon = icon;
+            let frame = draw(&work, 5);
+            assert_eq!(frame.pixel(3, 4), Some([0; 3]), "icon {icon}");
+            assert_eq!(frame.pixel(3, 26), Some(LABEL));
+        }
+        // Without a level, "Unemployed" and "n/a": the font has none of
+        // their letters, so only the icons show.
+        work.level = None;
+        work.icon = 0;
+        let frame = draw(&work, 5);
+        assert_eq!(frame.pixel(3, 4), Some([1, 1, 9]));
+        assert_eq!(frame.pixel(3, 26), Some([0; 3]));
+        assert_eq!(frame.pixel(3, 31), Some(salary));
+        assert_eq!(frame.pixel(3, 38), Some(rating));
     }
 
     #[test]

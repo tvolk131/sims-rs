@@ -7,6 +7,7 @@
 
 use crate::{FULL_SIZE, MagicHistory, Object, World};
 use serde::{Deserialize, Serialize};
+use sims_content::{SurfaceCatalog, Surfaces};
 use sims_formats::lot::{Array, SurfaceMapping};
 use sims_formats::tatt::Tatt;
 use std::collections::{BTreeMap, BTreeSet};
@@ -73,12 +74,15 @@ pub enum LoadError {
     ArrayStride { array: u16, stride: usize },
     /// A house version whose array layout is not ported.
     ArrayVersion(u32),
-    /// The house maps saved floor or wall IDs to pattern files. Resolving
-    /// them needs the game's loaded floor and wall patterns, which are
-    /// not ported.
-    SurfaceCatalog,
-    /// The renumbering would rewrite this wall cell, or cannot read its
-    /// segments. Writing a wall cell is not ported.
+    /// A saved floor or wall ID of the house's maps that no pattern file
+    /// gives a key: the original then takes the pattern of the nearest
+    /// colour (0x4a0bbd), which is not ported. Also an ID of 65535, which
+    /// is past the original's table.
+    SurfaceColour { name: String, id: u16 },
+    /// The renumbering would write this wall cell back, and the write needs
+    /// a style the cell does not have (the original writes whatever its
+    /// stack held), or the cell's lowest segment is above 0x20. Neither is
+    /// ported.
     SurfaceRewrite { level: u8, x: usize, y: usize },
     /// The end of the household selection would do something that is not
     /// ported. See [`World::finish_selection`].
@@ -108,16 +112,16 @@ impl std::fmt::Display for LoadError {
                 f,
                 "house version {version}: the array layout before version 53 is not ported"
             ),
-            Self::SurfaceCatalog => write!(
+            Self::SurfaceColour { name, id } => write!(
                 f,
-                "the house maps saved floor or wall IDs to pattern files; resolving them is \
-                 not ported"
+                "no pattern file gives saved ID {id} of {name:?} a key; matching it by colour \
+                 (0x4a0bbd) is not ported"
             ),
             Self::Selection(what) => write!(f, "{what}, which is not ported"),
             Self::SurfaceRewrite { level, x, y } => write!(
                 f,
-                "renumbering would rewrite the wall cell at {x}, {y} on level {level}; that is \
-                 not ported"
+                "renumbering would write back the wall cell at {x}, {y} on level {level} in a \
+                 way that is not ported"
             ),
         }
     }
@@ -176,6 +180,258 @@ pub const BARE_GROUND_WALL: [u8; WALL_CELL] = [0, 0x0f, 1, 0, 1, 0, 0, 0, 0, 0, 
 fn renumbered(id: u16, wall: bool) -> bool {
     let low = if wall { 31..=247 } else { 30..=254 };
     low.contains(&id) || (256..=65534).contains(&id)
+}
+
+/// The table from saved ID to catalog key that one of a house's maps gives
+/// (0x4a0f00 to 0x4a0fca; the wall step 0x4c5d35 builds its own the same
+/// way): 65535 entries, each 65535 until a group lists it.
+fn surface_table(map: &[SurfaceMapping], catalog: &SurfaceCatalog) -> Result<Vec<u16>, LoadError> {
+    let mut table = vec![u16::MAX; usize::from(u16::MAX)];
+    for group in map {
+        // 0 when no file has the name: file 0 is never looked in.
+        let file = catalog.file(&group.name).unwrap_or(0);
+        for entry in &group.entries {
+            let slot =
+                table
+                    .get_mut(usize::from(entry.id))
+                    .ok_or_else(|| LoadError::SurfaceColour {
+                        name: group.name.clone(),
+                        id: entry.id,
+                    })?;
+            if file != 0 {
+                // Written even when the file lacks the pattern, over what
+                // an earlier group gave the same ID.
+                *slot = catalog.key(file, entry.local).unwrap_or(u16::MAX);
+            }
+            if *slot == u16::MAX {
+                return Err(LoadError::SurfaceColour {
+                    name: group.name.clone(),
+                    id: entry.id,
+                });
+            }
+        }
+    }
+    Ok(table)
+}
+
+/// The patterns the wall step renumbers in a wall cell (0x4c5d35), as
+/// indices into [`ExpandedWall::patterns`], or None for a cell whose lowest
+/// segment is above the last one, 0x20, which is not ported. The step
+/// starts at the lowest segment and stops once it has moved on to 0x20, so
+/// 0x20's patterns count only when it is the lowest.
+fn wall_patterns(segments: u8) -> Option<Vec<usize>> {
+    let lowest = segments & segments.wrapping_neg();
+    if lowest > 0x20 {
+        return None;
+    }
+    let mut patterns = Vec::new();
+    let mut segment = lowest;
+    while segment != 0 && segment < 0x40 {
+        patterns.extend_from_slice(match segment {
+            1 => &[0][..],
+            2 => &[1],
+            4 => &[2],
+            8 => &[3],
+            0x10 => &[4, 5],
+            _ => &[6, 7],
+        });
+        segment <<= 1;
+        while segment < 0x20 && segments & segment == 0 {
+            segment <<= 1;
+        }
+        if segment >= 0x20 {
+            break;
+        }
+    }
+    Some(patterns)
+}
+
+/// A wall cell as the original's wall service hands it out (0x4795c5) and
+/// takes it back (0x4797e2), for the cell at x, y of a level's wall array.
+///
+/// A lot keeps a wall cell in 14 bytes: the segments, a flags byte, then
+/// six words: the west and north styles (2, 4) and the west, north, south
+/// and east patterns (6, 8, 10, 12); a diagonal keeps its two patterns in
+/// 10 and 12. A tile owns its west and north walls; its east and south
+/// ones are the neighbours' west and north.
+///
+/// Ported from the old prototype's native_wall_io.rs (rotation 0), which
+/// was compared with the original's code run in isolation. The service
+/// also writes four bytes of a vertex map beside the walls (0x479c58),
+/// which only the wall drawing reads and which is not kept here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpandedWall {
+    pub segments: u8,
+    /// The cell's flags, with bits 4 and 5 the east neighbour's 0 and 1,
+    /// and bits 6 and 7 the south neighbour's 2 and 3, when they own them.
+    pub flags: u8,
+    /// West, north, east, south, then north twice. East and south are None
+    /// when the neighbour does not own the wall: the original leaves them
+    /// as whatever its stack held.
+    pub styles: [Option<u16>; 6],
+    /// West, north, east, south, then the descending diagonal's two and
+    /// the ascending diagonal's two (0 when the cell lacks them).
+    pub patterns: [u16; 8],
+}
+
+impl ExpandedWall {
+    fn at(x: usize, y: usize) -> usize {
+        (x * FULL_SIZE as usize + y) * WALL_CELL
+    }
+
+    fn word(cells: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes([cells[at], cells[at + 1]])
+    }
+
+    fn set(cells: &mut [u8], at: usize, value: u16) {
+        cells[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// 0x4795c5. A neighbour to the east or south counts only inside the
+    /// lot's size `active`.
+    pub fn get(cells: &[u8], active: usize, x: usize, y: usize) -> Self {
+        let c = Self::at(x, y);
+        let word = |at| Self::word(cells, at);
+        let segments = cells[c];
+        let mut flags = cells[c + 1];
+        let mut styles = [
+            Some(word(c + 2)),
+            Some(word(c + 4)),
+            None,
+            None,
+            Some(word(c + 4)),
+            Some(word(c + 4)),
+        ];
+        let diagonal = |bit: u8| {
+            if segments & bit != 0 {
+                [word(c + 10), word(c + 12)]
+            } else {
+                [0, 0]
+            }
+        };
+        let [a, b] = diagonal(0x10);
+        let [d, e] = diagonal(0x20);
+        let patterns = [
+            word(c + 6),
+            word(c + 8),
+            word(c + 12),
+            word(c + 10),
+            a,
+            b,
+            d,
+            e,
+        ];
+        if y + 1 < active {
+            let south = Self::at(x, y + 1);
+            if cells[south] & 2 != 0 {
+                styles[3] = Some(word(south + 4));
+                flags = (flags & !0xc0) | ((cells[south + 1] & 12) << 4);
+            }
+        }
+        if x + 1 < active {
+            let east = Self::at(x + 1, y);
+            if cells[east] & 1 != 0 {
+                styles[2] = Some(word(east + 2));
+                flags = (flags & !0x30) | ((cells[east + 1] & 3) << 4);
+            }
+        }
+        Self {
+            segments,
+            flags,
+            styles,
+            patterns,
+        }
+    }
+
+    /// 0x4797e2: writes the cell and its neighbours back, in the
+    /// original's order: the diagonals, then west, north, east and south.
+    /// A segment the cell lacks is cleared, with its neighbour's side, only
+    /// when the cell still has it. None, with the cells partly written,
+    /// when a write needs an east or south style the cell does not have.
+    pub fn put(&self, cells: &mut [u8], active: usize, x: usize, y: usize) -> Option<()> {
+        let c = Self::at(x, y);
+        let mask = self.segments & 0x3f;
+        let p = self.patterns;
+        for (bit, style, [first, second]) in [(0x10u8, 4, [4, 5]), (0x20, 5, [6, 7])] {
+            if mask & bit != 0 {
+                cells[c] = bit;
+                Self::set(cells, c + 4, self.styles[style]?);
+                Self::set(cells, c + 10, p[first]);
+                Self::set(cells, c + 12, p[second]);
+                Self::set(cells, c + 2, self.styles[0]?);
+                Self::set(cells, c + 6, p[0]);
+            } else {
+                cells[c] &= !bit;
+            }
+        }
+        if mask & 1 != 0 {
+            cells[c] |= 1;
+            Self::set(cells, c + 2, self.styles[0]?);
+            Self::set(cells, c + 6, p[0]);
+            cells[c + 1] |= self.flags & 3;
+            if x > 0 {
+                cells[Self::at(x - 1, y)] |= 4;
+            }
+        } else if cells[c] & 1 != 0 {
+            cells[c] &= !1;
+            if x > 0 {
+                let west = Self::at(x - 1, y);
+                cells[west] &= !4;
+                Self::set(cells, west + 12, 0);
+            }
+        }
+        if mask & 2 != 0 {
+            cells[c] |= 2;
+            Self::set(cells, c + 4, self.styles[1]?);
+            Self::set(cells, c + 8, p[1]);
+            cells[c + 1] |= self.flags & 12;
+            if y > 0 {
+                cells[Self::at(x, y - 1)] |= 8;
+            }
+        } else if cells[c] & 2 != 0 {
+            cells[c] &= !2;
+            if y > 0 {
+                let north = Self::at(x, y - 1);
+                cells[north] &= !8;
+                Self::set(cells, north + 10, 0);
+            }
+        }
+        if mask & 4 != 0 {
+            cells[c] |= 4;
+            Self::set(cells, c + 12, p[2]);
+            if x + 1 < active {
+                let east = Self::at(x + 1, y);
+                cells[east] |= 1;
+                Self::set(cells, east + 2, self.styles[2]?);
+                cells[east + 1] |= (self.flags & 0x30) >> 4;
+            }
+        } else if cells[c] & 4 != 0 {
+            cells[c] &= !4;
+            if x + 1 < active {
+                let east = Self::at(x + 1, y);
+                cells[east] &= !1;
+                Self::set(cells, east + 6, 0);
+            }
+        }
+        if mask & 8 != 0 {
+            cells[c] |= 8;
+            Self::set(cells, c + 10, p[3]);
+            if y + 1 < active {
+                let south = Self::at(x, y + 1);
+                cells[south] |= 2;
+                Self::set(cells, south + 4, self.styles[3]?);
+                cells[south + 1] |= (self.flags & 0xc0) >> 4;
+            }
+        } else if cells[c] & 8 != 0 {
+            cells[c] &= !8;
+            if y + 1 < active {
+                let south = Self::at(x, y + 1);
+                cells[south] &= !2;
+                Self::set(cells, south + 8, 0);
+            }
+        }
+        Some(())
+    }
 }
 
 /// The global that holds the budget mode. Funds change only while it is 0.
@@ -306,7 +562,7 @@ impl World {
     /// For the Goth house the cells inside the lot's size of arrays 0, 1,
     /// 2, 3, 8, 101, 102, 103, 108, 9 and 10 were compared with a capture
     /// of the original taken after this step and the renumbering; see
-    /// `docs/decisions.md`. Outside the size, the same arrays were
+    /// `docs/decisions/`. Outside the size, the same arrays were
     /// compared with the memory a later trace holds, at the start of load
     /// step 10 and at the end of the load: every cell of both levels'
     /// walls and flags, the ground level's object grid, the pool and the
@@ -446,45 +702,49 @@ impl World {
     /// Renumbers the saved floor and wall pattern IDs (0x4a0e3b, then
     /// 0x4c5d35). A house names the patterns it uses beyond the built-in
     /// ones by IDs of its own, and lists in two maps (FLRm, WALm) which
-    /// pattern file each ID means. The original turns each map into a
-    /// table from saved ID to the ID of the pattern it has loaded, and
-    /// rewrites every cell inside the lot's size, both levels.
+    /// pattern file and which pattern in it each ID means. The original
+    /// turns each map into a table from saved ID to the key the pattern has
+    /// in its catalog ([`Surfaces`]), then rewrites every cell inside the
+    /// lot's size, level 1 then 2, row by row: floors first, then walls.
     ///
     /// `floors` and `walls` are the house's maps, or None for a map the
     /// file lacks; the original then leaves that kind alone. Returns how
-    /// many floor cells changed. Call it after [`World::read_arrays`]. On an
-    /// error the lot is unchanged.
+    /// many cells changed: floor cells, plus wall cells written back. Call
+    /// it after [`World::read_arrays`]. On an error the lot is unchanged.
     ///
-    /// Only an empty map is ported. A map with entries needs the game's
-    /// loaded patterns to resolve them, and fails. With an empty map no
-    /// saved ID is listed, and the original gives an unlisted ID that
-    /// [`renumbered`] covers the ID 65535. A floor cell is rewritten that
-    /// way here. A wall cell is not: the original writes one through a
-    /// service that also updates its neighbours, which is not ported, so a
-    /// wall pattern or a diagonal wall's half floor that would change is an
-    /// error.
+    /// **The table** (0x4a0f00 to 0x4a0fca). Every saved ID starts out as
+    /// 65535. For each group of a map, the first catalog file whose name is
+    /// the group's, ignoring case, gives each entry's ID the key of the
+    /// pattern with the entry's number, or 65535 when the file has none.
+    /// File 0, the built-in one, is never looked in. An ID still at 65535
+    /// then takes the pattern nearest the entry's colour (0x4a0bbd), or 1;
+    /// that match is not ported and fails ([`LoadError::SurfaceColour`]).
     ///
-    /// For the Goth house both maps are empty and no cell holds an ID the
-    /// renumbering covers, so nothing changes. A capture of the original
-    /// taken after this step agrees: its floors and walls are the saved
-    /// ones (see [`World::read_arrays`]). The rewrite to 65535 is
-    /// **unverified** against the running game. It follows the old
-    /// prototype's port (legacy/crates/sims-sim/src/surface_remap.rs),
-    /// which was compared with the original's code run in isolation on 24
-    /// made-up lots (legacy/docs/research/surface-remap-native-20261026.md).
+    /// **The cells.** An ID [`renumbered`] covers becomes its table entry,
+    /// so an ID no group lists becomes 65535. A floor cell holds its ID; a
+    /// floor of 255 is cut by a diagonal wall, and its two halves are the
+    /// first style and first pattern words of the wall cell when the wall
+    /// cell's lowest segment is a diagonal. A wall cell holds a pattern per
+    /// segment ([`wall_patterns`]). A wall cell that changes is written back
+    /// through the original's wall service (0x4795c5, 0x4797e2; see
+    /// [`ExpandedWall`]), which also writes its neighbours.
+    ///
+    /// The cell walk is the old prototype's port
+    /// (legacy/crates/sims-sim/src/surface_remap.rs), which was compared with
+    /// the original's code run in isolation on 24 made-up lots
+    /// (legacy/docs/research/surface-remap-native-20261026.md); so is the
+    /// wall service (native_wall_io.rs, 33 cases). The Goth house's maps
+    /// are empty and none of its cells holds an ID the renumbering covers,
+    /// and a capture of the original after this step agrees.
     pub fn renumber_surfaces(
         &mut self,
         floors: Option<&[SurfaceMapping]>,
         walls: Option<&[SurfaceMapping]>,
+        surfaces: &Surfaces,
     ) -> Result<usize, LoadError> {
         let full = FULL_SIZE as usize;
         let active = usize::try_from(self.size).unwrap_or(0).min(full);
-        for map in [floors, walls].into_iter().flatten() {
-            if map.iter().any(|group| !group.entries.is_empty()) {
-                return Err(LoadError::SurfaceCatalog);
-            }
-        }
-        let array = |id: u16, stride: usize| -> Result<&Array, LoadError> {
+        let array = |id: u16, stride: usize| -> Result<Vec<u8>, LoadError> {
             let array = self.arrays.get(&id).ok_or(LoadError::MissingArray(id))?;
             if array.stride != stride || array.data.len() != full * full * stride {
                 return Err(LoadError::ArrayStride {
@@ -492,80 +752,91 @@ impl World {
                     stride: array.stride,
                 });
             }
-            Ok(array)
+            Ok(array.data.clone())
         };
-        let word = |cell: &[u8], at: usize| u16::from_le_bytes([cell[at], cell[at + 1]]);
-        let mut rewrites = Vec::new();
-        for level in 0..2 {
-            let floor = array(FLOORS[level], FLOOR_CELL)?;
-            let wall = array(WALLS[level], WALL_CELL)?;
-            for y in 0..active {
-                for x in 0..active {
-                    let cell = x * full + y;
-                    let stop = LoadError::SurfaceRewrite {
-                        level: level as u8 + 1,
-                        x,
-                        y,
-                    };
-                    let wall = &wall.data[cell * WALL_CELL..(cell + 1) * WALL_CELL];
-                    let segments = wall[0];
-                    // The lowest segment the cell has, or 0 for none.
-                    let lowest = segments & segments.wrapping_neg();
-                    if floors.is_some() {
-                        let id = word(&floor.data, cell * FLOOR_CELL);
+        let mut floor_cells = [array(FLOORS[0], FLOOR_CELL)?, array(FLOORS[1], FLOOR_CELL)?];
+        let mut wall_cells = [array(WALLS[0], WALL_CELL)?, array(WALLS[1], WALL_CELL)?];
+        let mut changed = 0;
+        if let Some(map) = floors {
+            let table = surface_table(map, &surfaces.floors)?;
+            for (level, (floor, wall)) in floor_cells.iter_mut().zip(&mut wall_cells).enumerate() {
+                for y in 0..active {
+                    for x in 0..active {
+                        let at = (x * full + y) * FLOOR_CELL;
+                        let id = u16::from_le_bytes([floor[at], floor[at + 1]]);
                         if renumbered(id, false) {
-                            rewrites.push((FLOORS[level], cell));
-                        } else if id == 255 && matches!(lowest, 0x10 | 0x20) {
-                            // A diagonal wall splits the cell: its two
-                            // half floors are the wall's first style and
-                            // first pattern words.
-                            if renumbered(word(wall, 2), false) || renumbered(word(wall, 6), false)
-                            {
-                                return Err(stop);
+                            let new = table[usize::from(id)];
+                            if new != id {
+                                floor[at..at + 2].copy_from_slice(&new.to_le_bytes());
+                                changed += 1;
                             }
-                        }
-                    }
-                    if walls.is_some() && lowest != 0 {
-                        // The original starts at the lowest segment and
-                        // stops once it has moved on to the last one
-                        // (0x20). Segments above that have no pattern.
-                        if lowest > 0x20 {
-                            return Err(stop);
-                        }
-                        let mut segment = lowest;
-                        loop {
-                            // Each segment's pattern words, as offsets in
-                            // the cell: one for a straight segment, two
-                            // for a diagonal one.
-                            let patterns: &[usize] = match segment {
-                                1 => &[6],
-                                2 => &[8],
-                                4 => &[12],
-                                8 => &[10],
-                                _ => &[10, 12],
+                        } else if id == 255 {
+                            let stop = LoadError::SurfaceRewrite {
+                                level: level as u8 + 1,
+                                x,
+                                y,
                             };
-                            if patterns.iter().any(|&at| renumbered(word(wall, at), true)) {
-                                return Err(stop);
-                            }
-                            segment <<= 1;
-                            while segment < 0x20 && segments & segment == 0 {
-                                segment <<= 1;
-                            }
-                            if segment >= 0x20 {
-                                break;
+                            let mut cell = ExpandedWall::get(wall, active, x, y);
+                            let lowest = cell.segments & cell.segments.wrapping_neg();
+                            if matches!(lowest, 0x10 | 0x20) {
+                                // The two halves: the first style and the
+                                // first pattern word.
+                                let halves =
+                                    [cell.styles[0].ok_or(stop.clone())?, cell.patterns[0]];
+                                let [style, pattern] = halves.map(|id| {
+                                    if renumbered(id, false) {
+                                        table[usize::from(id)]
+                                    } else {
+                                        id
+                                    }
+                                });
+                                if [style, pattern] != halves {
+                                    cell.styles[0] = Some(style);
+                                    cell.patterns[0] = pattern;
+                                    cell.put(wall, active, x, y).ok_or(stop)?;
+                                    changed += 1;
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        for &(id, cell) in &rewrites {
-            if let Some(array) = self.arrays.get_mut(&id) {
-                array.data[cell * FLOOR_CELL..(cell + 1) * FLOOR_CELL]
-                    .copy_from_slice(&u16::MAX.to_le_bytes());
+        if let Some(map) = walls {
+            let table = surface_table(map, &surfaces.walls)?;
+            for (level, wall) in wall_cells.iter_mut().enumerate() {
+                for y in 0..active {
+                    for x in 0..active {
+                        let stop = LoadError::SurfaceRewrite {
+                            level: level as u8 + 1,
+                            x,
+                            y,
+                        };
+                        let mut cell = ExpandedWall::get(wall, active, x, y);
+                        let mut any = false;
+                        for at in wall_patterns(cell.segments).ok_or(stop.clone())? {
+                            let id = cell.patterns[at];
+                            if renumbered(id, true) && table[usize::from(id)] != id {
+                                cell.patterns[at] = table[usize::from(id)];
+                                any = true;
+                            }
+                        }
+                        if any {
+                            cell.put(wall, active, x, y).ok_or(stop)?;
+                            changed += 1;
+                        }
+                    }
+                }
             }
         }
-        Ok(rewrites.len())
+        for (ids, cells) in [(FLOORS, floor_cells), (WALLS, wall_cells)] {
+            for (id, data) in ids.into_iter().zip(cells) {
+                if let Some(array) = self.arrays.get_mut(&id) {
+                    array.data = data;
+                }
+            }
+        }
+        Ok(changed)
     }
 
     /// The tile an object stands on and its level, as the original keeps
@@ -675,7 +946,7 @@ impl World {
     /// In a trace of the original loading the Goth house the queue holds
     /// four IDs before this step and none after, and nothing else the
     /// trace holds changes. Our state before and after the step was
-    /// compared with the trace's and was equal; see `docs/decisions.md`.
+    /// compared with the trace's and was equal; see `docs/decisions/`.
     pub fn discard_removals(&mut self) -> Vec<u16> {
         std::mem::take(&mut self.removals)
     }

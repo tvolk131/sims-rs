@@ -55,20 +55,26 @@
 //! writes (0x598226 and 0x598450 skip a motion with no positions) is what
 //! an earlier layer left: it fails if any layer has moved the bone since
 //! the skin was made ([`World::translated_bones`]), and is taken at rest
-//! otherwise. That the skin starts at rest when the person is made or
-//! loaded is unverified. The bones
-//! are then placed from the root (0x5994c3), which stands at the origin.
+//! otherwise. That the skin starts at rest when the person is made is
+//! unverified.
+//!
+//! A loaded person's skin holds the pose its saved layers left
+//! ([`World::held_poses`], `crate::restore`) until it samples a layer
+//! again: those layers are sampled first, at their saved phases, under
+//! whatever plays now. The bones are then placed from the root
+//! (0x5994c3), which stands at the origin.
 //!
 //! The person's model matrix (0x592132) turns the skeleton to the
 //! person's direction and moves it to its position and the terrain's
-//! height there ([`Interpreter::model`]).
+//! height there ([`Interpreter::model`]). For a person whose animator was
+//! not placed since the load, it is the placement the load made.
 
 use crate::fault::Trap;
 use crate::interpreter::Interpreter;
 use crate::routing::slot::to_world_units;
 use sims_core::{Ext, F32};
 use sims_sim::World;
-use sims_sim::animator::Animator;
+use sims_sim::animator::{Animator, EPSILON, LOADED, UNSET};
 use sims_sim::head::{self, Anchor, Matrix};
 use sims_sim::pose;
 
@@ -95,6 +101,12 @@ type Bound = (usize, Anchor);
 
 fn unsupported(at: &str, what: &str) -> Trap {
     Trap::Unsupported(format!("{what} ({at}), which is not ported"))
+}
+
+/// Whether an animator's position component is unset (within
+/// [`EPSILON`] of [`UNSET`]).
+fn unset(v: F32) -> bool {
+    (v.ext() - UNSET.ext()).single().abs() <= EPSILON.ext()
 }
 
 fn person_data(world: &mut World, id: u16) -> Result<&mut Vec<i16>, Trap> {
@@ -244,15 +256,28 @@ impl Interpreter<'_> {
         let Some(top) = self.anchors(world, id)?.top else {
             return Ok(None);
         };
-        let a = world.animators.get(&id).ok_or_else(|| {
-            Trap::Unsupported(format!(
-                "person {id}'s head is measured before its animator was ever ticked or drawn: \
-                 the original reads the anchor's bone matrices as the skin's construction at \
-                 load left them (0x59640d, 0x59638f), which is not ported"
-            ))
-        })?;
-        let bones = self.posed(world, id, a, &[top.0], None)?;
-        let model = self.model(world, id, a)?;
+        let held = world.held_poses.get(&id);
+        let mut a = match (world.animators.get(&id), held) {
+            (Some(a), _) => a.clone(),
+            (None, Some(_)) => LOADED,
+            (None, None) => {
+                return Err(Trap::Unsupported(format!(
+                    "person {id}'s head is measured before its animator was ever ticked or \
+                     drawn, and the load left no pose in its skin: the original reads the \
+                     anchor's bone matrices as the skin's construction left them (0x59640d, \
+                     0x59638f), which is not ported"
+                )));
+            }
+        };
+        // Until the animator is placed again, the skin's model matrix is
+        // the one the load placed it with.
+        if let Some(held) = held
+            && a.position.iter().all(|&v| unset(v))
+        {
+            a.position = held.position;
+        }
+        let bones = self.posed(world, id, &a, &[top.0], None)?;
+        let model = self.model(world, id, &a)?;
         Ok(Some(head::anchor_point(bones[top.0], top.1, &model)))
     }
 
@@ -391,6 +416,12 @@ impl Interpreter<'_> {
             (a.foreground.as_ref(), a.carry.as_ref())
         };
         let layers = [base, first, second];
+        // The pose the load left (World::held_poses) lies under them: the
+        // skin has sampled no layer since, and its bones hold it.
+        let held = world
+            .held_poses
+            .get(&id)
+            .map_or(&[][..], |h| h.layers.as_slice());
 
         let bad = |e: pose::Error| unsupported("0x5992b3", &format!("cannot pose: {}", e.0));
         let mut locals: Vec<pose::Bone> = skeleton
@@ -403,8 +434,12 @@ impl Interpreter<'_> {
             .collect();
         let mut rotated = vec![false; parents.len()];
         let mut translated = vec![false; parents.len()];
-        for layer in layers.into_iter().flatten() {
-            if a.skin_dirty || layer.current != a.skin_clock {
+        let sampled = held
+            .iter()
+            .map(|layer| (layer, true))
+            .chain(layers.into_iter().flatten().map(|layer| (layer, false)));
+        for (layer, from_load) in sampled {
+            if !from_load && (a.skin_dirty || layer.current != a.skin_clock) {
                 return Err(Trap::Unsupported(format!(
                     "person {id}'s pose is read while its skin waits for its update (0x5992b3)"
                 )));

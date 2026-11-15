@@ -10,10 +10,59 @@ use crate::skin::{Skinned, skin};
 
 /// The direction the light comes from in the offscreen renders: above,
 /// a little to the side and behind the viewer of the house view. This is
-/// our own light, not the original's. The original lights a person by a
-/// level from 0 to 1, the standard light turned by the view, and the room's
-/// lamps (see the decisions entry "How the original lights a person").
+/// our own light, not the original's; a person on a lot is lit as the
+/// original lights them ([`Lighting::standard`]).
 pub const LIGHT: Vec3 = Vec3::new(0.3, 1.0, -0.5);
+
+/// How a part is lit: a light from `towards` (a direction towards the
+/// light), and per vertex a shade of `ambient + diffuse × max(0, n · l)`,
+/// where `n` is the vertex's normal and `l` the unit direction; the
+/// original's light holds it to 1, as Direct3D holds a vertex's colour.
+/// A texel's colour is multiplied by its shade.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Lighting {
+    pub towards: Vec3,
+    pub ambient: f32,
+    pub diffuse: f32,
+    /// Whether the shade is held to 1. Our own light is not, so the
+    /// offscreen renders pinned before it existed keep their bits.
+    pub held: bool,
+}
+
+impl Lighting {
+    /// Our own light for offscreen renders: a shade from 0.45 in shadow
+    /// to 1 facing the light.
+    pub fn ours(towards: Vec3) -> Self {
+        Self {
+            towards,
+            ambient: 0.45,
+            diffuse: 0.55,
+            held: false,
+        }
+    }
+
+    /// The original's light for a person at `level` (0.5 to 1; see
+    /// [`crate::lot::level`]), with the standard light from `towards`.
+    /// The original sets the ambient light to the grey
+    /// `round(255 × level)` and the standard light's strength to the level
+    /// (0x4b49c7), and Direct3D adds them up per vertex. The material is
+    /// taken to be white (decisions entry "A person is lit by the
+    /// original's standard light, at their room's level").
+    pub fn standard(towards: Vec3, level: f32) -> Self {
+        Self {
+            towards,
+            ambient: (255.0 * level).round() / 255.0,
+            diffuse: level,
+            held: true,
+        }
+    }
+
+    /// A vertex's shade, for its unit normal.
+    pub fn shade(&self, normal: Vec3) -> f32 {
+        let shade = self.ambient + self.diffuse * normal.dot(self.towards.normalize()).max(0.0);
+        if self.held { shade.min(1.0) } else { shade }
+    }
+}
 
 /// An orthographic camera. The view turns about the vertical axis by an
 /// angle given as its sine and cosine (`yaw`), then tilts down by another
@@ -101,7 +150,7 @@ impl Canvas {
     /// towards the light) with some ambient light.
     pub fn draw(&mut self, camera: &Camera, part: &Part, skinned: &Skinned, light: Vec3) {
         let (w, h) = (self.width as f32, self.height as f32);
-        draw_part(self, part, skinned, light, |p| {
+        draw_part(self, part, skinned, Lighting::ours(light), |p| {
             let v = camera.view(p);
             Vec3::new(
                 w * 0.5 + v.x * camera.scale,
@@ -144,8 +193,8 @@ pub trait Target {
     /// of what is there. Asked before the texture is sampled, so a hidden
     /// pixel costs little; [`Target::write`] may still test again.
     fn passes(&self, x: u32, y: u32, z: f32) -> bool;
-    /// Writes a texel that passed: its colour times `shade` (from 0.45 in
-    /// shadow to 1 facing the light). Its alpha is never 0.
+    /// Writes a texel that passed: its colour times `shade` (0 to 1, see
+    /// [`Lighting`]). Its alpha is never 0.
     fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32);
     /// Says whose pixels are written from now on: a person's object ID,
     /// or None once they are drawn. A target that keeps, per pixel, what
@@ -191,24 +240,53 @@ impl Target for Canvas {
     }
 }
 
-/// Draws one skinned part into `target`, lit by a light from `light` (a
-/// direction towards the light) with some ambient light. `project` takes a
-/// world point to the target: x and y in pixels, z its depth in the
-/// target's units.
+/// Draws one skinned part into `target`, lit by `lighting`. `project`
+/// takes a world point to the target: x and y in pixels, z its depth in
+/// the target's units.
 pub fn draw_part<T: Target + ?Sized>(
     target: &mut T,
     part: &Part,
     skinned: &Skinned,
-    light: Vec3,
+    lighting: Lighting,
     project: impl Fn(Vec3) -> Vec3,
 ) {
-    let light = light.normalize();
-    let screen: Vec<Vec3> = skinned.positions.iter().map(|&p| project(p)).collect();
-    let shade: Vec<f32> = skinned
+    let shade: Vec<Shade> = skinned
         .normals
         .iter()
-        .map(|n| 0.45 + 0.55 * n.dot(light).max(0.0))
+        .map(|&n| Shade::Grey(lighting.shade(n)))
         .collect();
+    draw_shaded(target, part, skinned, &shade, project);
+}
+
+/// How much light a vertex takes: the same for every channel, or one
+/// factor each for red, green and blue (a coloured light).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Shade {
+    Grey(f32),
+    Colour([f32; 3]),
+}
+
+impl Shade {
+    fn channels(self) -> [f32; 3] {
+        match self {
+            Shade::Grey(s) => [s; 3],
+            Shade::Colour(c) => c,
+        }
+    }
+}
+
+/// Draws one skinned part into `target` with each vertex's [`Shade`]
+/// given (one per vertex of the part's mesh). A grey shade goes to the
+/// target as it is; a coloured one lights each channel of the texel
+/// before it is written, with the target's own factor 1.
+pub fn draw_shaded<T: Target + ?Sized>(
+    target: &mut T,
+    part: &Part,
+    skinned: &Skinned,
+    shade: &[Shade],
+    project: impl Fn(Vec3) -> Vec3,
+) {
+    let screen: Vec<Vec3> = skinned.positions.iter().map(|&p| project(p)).collect();
     for t in &part.mesh.triangles {
         let [a, b, c] = t.map(|i| i as usize);
         // A mesh whose triangles name vertices it lacks draws nothing
@@ -228,11 +306,7 @@ pub fn draw_part<T: Target + ?Sized>(
             target,
             [pa, pb, pc],
             [va.uv, vb.uv, vc.uv],
-            [
-                shade.get(a).copied().unwrap_or(1.0),
-                shade.get(b).copied().unwrap_or(1.0),
-                shade.get(c).copied().unwrap_or(1.0),
-            ],
+            [a, b, c].map(|i| shade.get(i).copied().unwrap_or(Shade::Grey(1.0))),
             part,
         );
     }
@@ -242,9 +316,10 @@ fn triangle<T: Target + ?Sized>(
     target: &mut T,
     mut p: [Vec3; 3],
     mut uv: [[f32; 2]; 3],
-    mut shade: [f32; 3],
+    mut shade: [Shade; 3],
     part: &Part,
 ) {
+    let grey = shade.iter().all(|s| matches!(s, Shade::Grey(_)));
     let (width, height) = target.size();
     let mut area = edge(p[0], p[1], p[2]);
     if area.abs() < 1e-8 || !area.is_finite() {
@@ -258,6 +333,7 @@ fn triangle<T: Target + ?Sized>(
         shade.swap(1, 2);
         area = -area;
     }
+    let channels = shade.map(Shade::channels);
     // The top-left rule: a pixel centre exactly on an edge belongs to
     // the triangle only if that is its top or left edge, so a pixel on
     // an edge two triangles share is drawn once, not twice.
@@ -314,14 +390,20 @@ fn triangle<T: Target + ?Sized>(
             }
             let u = w0 * uv[0][0] + w1 * uv[1][0] + w2 * uv[2][0];
             let v = w0 * uv[0][1] + w1 * uv[1][1] + w2 * uv[2][1];
-            let s = w0 * shade[0] + w1 * shade[1] + w2 * shade[2];
+            let s =
+                [0, 1, 2].map(|k| w0 * channels[0][k] + w1 * channels[1][k] + w2 * channels[2][k]);
             let texel = part.texture.sample(u, v);
             // A transparent texel (such as one a run-length bitmap skips)
             // draws nothing and hides nothing.
             if texel[3] == 0 {
                 continue;
             }
-            target.write(x, y, z, texel, s);
+            if grey {
+                target.write(x, y, z, texel, s[0]);
+            } else {
+                let lit = |k: usize| (f32::from(texel[k]) * s[k]).clamp(0.0, 255.0) as u8;
+                target.write(x, y, z, [lit(0), lit(1), lit(2), texel[3]], 1.0);
+            }
         }
     }
 }
@@ -558,7 +640,13 @@ mod tests {
         let (glass, _) = square(crate::texture::Texture::solid([255, 255, 255, 128]));
         let mut canvas = Canvas::new(size, size, [0, 0, 0, 0]);
         for t in triangles {
-            triangle(&mut canvas, *t, [[0.5; 2]; 3], [1.0; 3], &glass.parts[0]);
+            triangle(
+                &mut canvas,
+                *t,
+                [[0.5; 2]; 3],
+                [Shade::Grey(1.0); 3],
+                &glass.parts[0],
+            );
         }
         canvas
     }
