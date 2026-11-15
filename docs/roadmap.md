@@ -2204,8 +2204,12 @@ through their public interfaces only; the simulation never depends on it.
   the funds go from $2,542 to $2,537 when Mortimer pays, the clock moves,
   and the hunger meter is his hunger. The pointer on a portrait shows
   that person's first name (catalog strings, `OBJD` word 41) in a box
-  over it; that box is ours (**unverified**). The original's action queue
-  in the top-left corner is not drawn yet.
+  over it; that box is ours (**unverified**).
+- **Done: the action queue.** The selected Sim's running and queued
+  actions show as icons in the top left, framed as the original frames
+  them, and a press cancels one (`Lot::cancel`, 0x45d5f8) with the
+  original's sound. Objects' catalog pictures are not made yet (a grey
+  square stands in), and the icons do not slide into place.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
     on Manage Inventory operation 4 and scope 12. A check tree's fault

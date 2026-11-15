@@ -8,8 +8,11 @@ use sims_game::pick;
 use sims_game::view::View;
 use sims_game::{Game, Options};
 use sims_render::{Canvas, open_house};
+use sims_ui::frame::Rect;
 use sims_ui::household::Snapshot;
 use sims_ui::hud::Kind;
+use sims_ui::queue::Picture;
+use sims_vm::SoundEvent;
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
@@ -473,41 +476,7 @@ fn a_snack_is_chosen_from_the_fridges_pie() {
     game.resize([800, 600]);
     game.render();
     let person = game.lot().world().selected().expect("a Sim is selected");
-    // A click on each object on the lot, until one opens a pie with Have A
-    // Snack (the fridge).
-    let points: Vec<([i32; 2], u16)> = (0..600)
-        .step_by(6)
-        .flat_map(|y| (0..800).step_by(6).map(move |x| [x, y]))
-        .filter(|&p| !game.over_panel(p))
-        .filter_map(|p| game.under(p).map(|id| (p, id)))
-        .collect();
-    let mut tried = std::collections::BTreeSet::new();
-    let mut fridge = None;
-    for (point, id) in points {
-        if !tried.insert(id) {
-            continue;
-        }
-        game.hover(point);
-        game.press(point);
-        // The pie is laid out when it is drawn.
-        game.render();
-        let snack = game.menu().and_then(|menu| {
-            assert!(!menu.labels().is_empty(), "object {id}'s pie shows nothing");
-            let at = menu
-                .labels()
-                .into_iter()
-                .find(|(text, _)| *text == "Have A Snack")
-                .map(|(_, r)| [r.x + r.width / 2, r.y + r.height / 2])?;
-            let entry = menu.entries.iter().find(|e| e.label == "Have A Snack")?;
-            Some((at, entry.menu))
-        });
-        if let Some((at, number)) = snack {
-            fridge = Some((id, at, number));
-            break;
-        }
-        game.close_menu();
-    }
-    let (fridge, snack, number) = fridge.expect("the fridge's pie offers Have A Snack");
+    let (fridge, snack, number) = snack_pie(&mut game);
     let queued = |game: &Game| {
         let queue = &game.lot().world().objects[&person]
             .person
@@ -533,6 +502,22 @@ fn a_snack_is_chosen_from_the_fridges_pie() {
     game.render();
     let fed = panel(&game, person);
     assert_eq!(fed.money, "$2,537");
+    // He eats: the fridge gave him the action, whose icon is the snack
+    // (object 263), yellow now that it is under way (person data word 39,
+    // set at tick 837).
+    let snack_guid = game.lot().world().objects[&263].guid;
+    let running = &game.queue().icons[0];
+    assert_eq!(
+        running.uid,
+        game.lot().world().objects[&person]
+            .person
+            .as_ref()
+            .unwrap()
+            .active
+            .uid
+    );
+    assert_eq!(running.picture, Picture::Object(snack_guid));
+    assert!(running.yellow);
     assert_ne!(fed.clock, start.clock);
     assert_ne!(fed.hunger, start.hunger);
     // The pointer on Mortimer's portrait shows his name over it.
@@ -566,6 +551,132 @@ fn a_snack_is_chosen_from_the_fridges_pie() {
 
 /// What the panel shows of the lot, as text, and the selected Sim's
 /// hunger meter, which must be what the world holds.
+/// Clicks each object on the lot until one opens a pie with Have A Snack
+/// (the fridge), and leaves that pie open. Returns the object clicked,
+/// where Have A Snack is, and its menu number.
+fn snack_pie(game: &mut Game) -> (u16, [i32; 2], u32) {
+    let points: Vec<([i32; 2], u16)> = (0..600)
+        .step_by(6)
+        .flat_map(|y| (0..800).step_by(6).map(move |x| [x, y]))
+        .filter(|&p| !game.over_panel(p))
+        .filter_map(|p| game.under(p).map(|id| (p, id)))
+        .collect();
+    let mut tried = std::collections::BTreeSet::new();
+    for (point, id) in points {
+        if !tried.insert(id) {
+            continue;
+        }
+        game.hover(point);
+        game.press(point);
+        // The pie is laid out when it is drawn.
+        game.render();
+        let snack = game.menu().and_then(|menu| {
+            assert!(!menu.labels().is_empty(), "object {id}'s pie shows nothing");
+            let at = menu
+                .labels()
+                .into_iter()
+                .find(|(text, _)| *text == "Have A Snack")
+                .map(|(_, r)| [r.x + r.width / 2, r.y + r.height / 2])?;
+            let entry = menu.entries.iter().find(|e| e.label == "Have A Snack")?;
+            Some((at, entry.menu))
+        });
+        if let Some((at, number)) = snack {
+            return (id, at, number);
+        }
+        game.close_menu();
+    }
+    panic!("no pie offers Have A Snack");
+}
+
+/// The snack queued from the fridge's pie shows as an icon in the top
+/// left; a press on it cancels it, and so does a press on the icon of the
+/// snack Mortimer is doing (`Lot::cancel`, 0x4cb126).
+#[test]
+fn a_press_on_an_actions_icon_cancels_it() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(50), 50);
+    game.resize([800, 600]);
+    game.render();
+    let person = game.lot().world().selected().expect("a Sim is selected");
+    let mortimer = |game: &Game| game.lot().world().objects[&person].person.clone().unwrap();
+    // He is doing nothing, so nothing shows.
+    assert!(game.queue().icons.is_empty());
+    let (_, snack, _) = snack_pie(&mut game);
+    game.press(snack);
+    game.render();
+    let [queued] = &mortimer(&game).queue[..] else {
+        panic!("{:?}", mortimer(&game).queue);
+    };
+    // The icon is the fridge's (object 118), grey, at (32, 32).
+    let fridge = game.lot().world().objects[&118].guid;
+    let [icon] = game
+        .queue()
+        .icons
+        .clone()
+        .try_into()
+        .unwrap_or_else(|icons| {
+            panic!("{icons:?}");
+        });
+    assert_eq!(icon.uid, queued.uid);
+    assert_eq!(icon.picture, Picture::Object(fridge));
+    assert!(!icon.yellow && !icon.cancelled);
+    assert_eq!(icon.rect, Rect::new(32, 32, 45, 45));
+    let centre = [icon.rect.x + 22, icon.rect.y + 22];
+    // In a narrow window the note the order left across the top wraps
+    // down over the icon; a press there is the band's, and cancels
+    // nothing. The press clears the note.
+    game.resize([80, 600]);
+    game.render();
+    game.take_sounds();
+    let under_band = [icon.rect.x + 22, icon.rect.y + 8];
+    assert_eq!(game.queue().at(under_band).map(|i| i.uid), Some(icon.uid));
+    game.press(under_band);
+    assert_eq!(mortimer(&game).queue.len(), 1);
+    assert!(game.take_sounds().is_empty());
+    game.resize([800, 600]);
+    game.render();
+    // A press on it takes it off the queue, with the interface's sound.
+    assert!(game.over_panel(centre));
+    game.press(centre);
+    assert!(mortimer(&game).queue.is_empty());
+    assert_eq!(game.take_sounds(), [delete()]);
+    game.render();
+    assert!(game.queue().icons.is_empty());
+    // Queued again, he takes it 100 ticks later.
+    let (_, snack, _) = snack_pie(&mut game);
+    game.press(snack);
+    let uid = mortimer(&game).queue[0].uid;
+    for _ in 0..100 {
+        assert_eq!(game.run(1), 1);
+    }
+    assert_eq!(mortimer(&game).active.uid, uid);
+    game.render();
+    let icon = game.queue().icons[0].clone();
+    assert_eq!((icon.uid, icon.yellow, icon.cancelled), (uid, false, false));
+    // A press on the running snack cancels it: the cross shows, and a
+    // second press does nothing.
+    game.take_sounds();
+    game.press([icon.rect.x + 22, icon.rect.y + 22]);
+    assert_ne!(mortimer(&game).active.flags & 0x100, 0);
+    assert_eq!(game.take_sounds(), [delete()]);
+    game.render();
+    assert!(game.queue().icons[0].cancelled);
+    let before = mortimer(&game);
+    game.press([icon.rect.x + 22, icon.rect.y + 22]);
+    assert!(game.take_sounds().is_empty());
+    assert_eq!(mortimer(&game).queue.len(), before.queue.len());
+}
+
+fn delete() -> SoundEvent {
+    SoundEvent::Play {
+        object: -4,
+        name: "UI_queue_delete".into(),
+    }
+}
+
 struct Shown {
     clock: String,
     money: String,
