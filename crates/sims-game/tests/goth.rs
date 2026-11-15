@@ -60,6 +60,15 @@ fn the_goths_play_and_are_drawn() {
     assert_eq!(game.lot().world().speed(), 994);
     assert_eq!(game.advance(20_000), 10);
     assert_eq!(game.lot().world().ticks, before.0.wrapping_add(10));
+    // A speed button runs a paused game again.
+    game.toggle_pause();
+    game.set_speed(sims_ui::command::Speed::Fast);
+    assert!(!game.paused());
+    assert_eq!(game.lot().world().speed(), 924);
+    // The button of the speed the game has does not start the time again.
+    assert_eq!(game.advance(13_000), 0);
+    game.set_speed(sims_ui::command::Speed::Fast);
+    assert_eq!(game.advance(1_000), 1);
     assert_eq!(game.stopped(), None);
 }
 

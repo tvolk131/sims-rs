@@ -31,6 +31,10 @@ disassembly; none of it is checked against a run.
   and the clock stands. `Lot::pause` and `Lot::unpause` do this. The
   window goes on stepping a paused lot. Strict mode on the Goths' house
   runs 200 paused ticks, and its clock stands through them.
+- The speed buttons run a paused game again before they set the speed
+  (`0x53a62a`, `0x53a6ad`, `0x53a728`, in live mode). A button for the
+  speed the game already has does not call the setter (`0x4ce588`), so
+  the time owed carries on. Sol's review found both.
 - **Unverified:**
   - The pause is refused while a field of the interface
     (`[0x6f2a58]+0x7c`) is not 0. Here it is never refused.
@@ -47,8 +51,9 @@ disassembly; none of it is checked against a run.
   people (`0x442f9b`) fails. It goes back (`0x46d7db`) when the check
   passes. What the check asks was not read in full. It reads people's
   `+0x8e` and `+0x60e` and calls `0x45edc5`, which looks like asking
-  whether everyone is asleep or away. The Goths' morning never sets it,
-  since global 18 stays −1. A full day might.
+  whether everyone is asleep or away. Whether it sets the speed during
+  the Goths' morning in the original was not checked, nor whether a
+  full day does.
 - Strict `sims boot` never calls any of these, so its output is
   unchanged.
 

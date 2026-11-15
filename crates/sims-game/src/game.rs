@@ -207,14 +207,31 @@ impl Game {
         &self.people.problems
     }
 
-    /// Sets the game's speed, as the panel's speed buttons do: the
-    /// simulation's speed ([`Lot::set_speed`]) and the time between ticks
-    /// with it. A lot that cannot take it keeps its speed, and the note
-    /// across the top says why.
+    /// Sets the game's speed, as the panel's speed buttons do in live
+    /// mode (`0x53a62a`, `0x53a6ad`, `0x53a728`): a paused game runs
+    /// again, then the simulation's speed ([`Lot::set_speed`]) and the
+    /// time between ticks with it are set, unless the speed is already
+    /// the one asked for (`0x4ce588`), when the time owed carries on. A
+    /// lot that cannot take it keeps its speed, and the note across the
+    /// top says why.
     pub fn set_speed(&mut self, speed: Speed) {
-        match self.lot.set_speed(i32::from(pace::level(speed))) {
-            Ok(_) => self.pace.set_speed(speed),
-            Err(e) => self.note = Some(format!("The speed was not changed: {e}")),
+        let level = pace::level(speed);
+        let result = if self.paused() {
+            self.lot.unpause().map(|_| self.pace.restart())
+        } else {
+            Ok(())
+        };
+        let result = result.and_then(|()| {
+            if self.lot.world().speed() == level {
+                self.pace.speed = speed;
+                return Ok(());
+            }
+            self.lot
+                .set_speed(i32::from(level))
+                .map(|_| self.pace.set_speed(speed))
+        });
+        if let Err(e) = result {
+            self.note = Some(format!("The speed was not changed: {e}"));
         }
     }
 
