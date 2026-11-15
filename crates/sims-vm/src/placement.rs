@@ -364,13 +364,37 @@ fn relink(world: &mut World, id: u16, place: Place) -> Result<(), Trap> {
 /// Walks an object and everything linked below it, slot by slot, slot 0
 /// included (0x43f364, 0x43f379). The next object is read after the
 /// caller has dealt with the current one.
-struct Cursor {
+pub(crate) struct Cursor {
     root: u16,
     current: Option<u16>,
 }
 
 impl Cursor {
-    fn advance(&mut self, world: &World) -> Result<(), Trap> {
+    /// A walk of the objects on a tile, as 0x43f331 starts it from a
+    /// three-byte location (column, row, level; 0x432500): none for a tile
+    /// outside the lot's size (lot +0x10) or off levels 1 and 2.
+    pub(crate) fn on_tile(world: &World, at: [i8; 3]) -> Cursor {
+        let size = i32::from(world.size);
+        let inside = |n: i8| n >= 0 && i32::from(n) < size;
+        let root = if inside(at[0]) && inside(at[1]) && (1..=2).contains(&at[2]) {
+            head(world, at)
+        } else {
+            None
+        };
+        Cursor {
+            root: root.unwrap_or(0),
+            current: root,
+        }
+    }
+
+    /// The object the walk is at; None when it has ended.
+    pub(crate) fn current(&self) -> Option<u16> {
+        self.current
+    }
+
+    /// Moves to the next object (0x43f379), reading the links as they are
+    /// now.
+    pub(crate) fn advance(&mut self, world: &World) -> Result<(), Trap> {
         let Some(mut node) = self.current else {
             return Ok(());
         };
