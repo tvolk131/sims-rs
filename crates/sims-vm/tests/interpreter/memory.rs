@@ -541,7 +541,7 @@ fn the_advertisement_record_is_the_one_find_best_interaction_last_copied() {
 
 #[test]
 fn unsupported_scopes_name_themselves() {
-    for scope in [24, 34, 38] {
+    for scope in [34, 38] {
         let mut fx = Fixture::new();
         let fault = read(&mut fx, scope, 0).unwrap_err();
         assert_eq!(fault.trap, Trap::UnsupportedScope { scope });

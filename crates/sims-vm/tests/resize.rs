@@ -414,13 +414,24 @@ fn routing_18_bytes(routing: &sims_sim::route::Routing) -> Vec<u8> {
     bytes
 }
 
+/// A lot's encoding as snapshot format 22 wrote it: without the families
+/// ([`World::families`]) that format 23 added at the end, so a state
+/// pinned under format 22 can be shown to be the same state but for the
+/// families. The older formats' encodings start from this one.
+fn format_22_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let families = postcard::to_allocvec(&world.families).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - families.len()), families);
+    bytes
+}
+
 /// A lot's encoding as snapshot format 21 wrote it: without the
 /// advertisement record ([`World::advertisement_record`]) that format 22
 /// added at the end, so a state pinned under format 21 can be shown to be
-/// the same state but for the record. The older formats' encodings start
-/// from this one.
+/// the same state but for the record. It starts from [`format_22_bytes`],
+/// and the older formats' encodings from this one.
 fn format_21_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_22_bytes(world);
     let record = postcard::to_allocvec(&world.advertisement_record).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - record.len()), record);
     bytes
@@ -1982,6 +1993,57 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
         }
         expected.rooms = world.rooms.clone();
         expected.globals[12] = 0;
+        // Step 20. The Goth family's friend count is worked out: 0. In
+        // the capture of the original at the first tick (whose friendship
+        // threshold, 0x6c4398, is 50) the families are these, and only
+        // the Goth family's count is up to date.
+        assert_eq!(
+            interpreter
+                .program
+                .autonomy_constants()
+                .friendship_threshold,
+            50
+        );
+        let goths = expected.families.iter_mut().find(|f| f.id == 5).unwrap();
+        (goths.friends, goths.stale) = (0, false);
+        let families: Vec<(i32, i32, usize, i32, bool)> = world
+            .families
+            .iter()
+            .map(|f| (f.id, f.house, f.members.len(), f.friends, f.stale))
+            .collect();
+        let captured = [
+            (4000, 0, 8),
+            (6, 56, 5),
+            (10, 76, 5),
+            (12, 77, 4),
+            (13, 69, 2),
+            (11, 63, 4),
+            (4, 0, 4),
+            (3, 0, 2),
+            (2, 0, 1),
+            (5, 5, 3),
+            (1, 7, 2),
+            (6000, 0, 30),
+            (5500, 0, 18),
+            (5000, 0, 12),
+            (3009, 0, 4),
+            (3008, 0, 2),
+            (3007, 0, 4),
+            (3006, 0, 4),
+            (3005, 0, 2),
+            (3004, 0, 3),
+            (3003, 0, 4),
+            (3002, 0, 4),
+            (3001, 0, 3),
+            (3000, 0, 4),
+            (2000, 0, 30),
+            (0, 0, 0),
+        ];
+        let captured: Vec<(i32, i32, usize, i32, bool)> = captured
+            .into_iter()
+            .map(|(id, house, members)| (id, house, members, 0, id != 5))
+            .collect();
+        assert_eq!(families, captured);
         assert_eq!(world.encode(), expected.encode());
         // No tree ran in any of this, the clock stands and no random
         // stream moved.

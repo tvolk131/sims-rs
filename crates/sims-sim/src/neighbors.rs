@@ -28,6 +28,10 @@ pub const PERSON_WORDS: usize = 256;
 /// family's FAMI chunk ID.
 pub const FAMILY: usize = 61;
 
+/// Person data word 65: the person's kind. A record whose kind is above
+/// 1 is never counted as a family's friend (0x427c69).
+pub const KIND: usize = 65;
+
 /// The neighborhood's records and the one registry byte their
 /// relationships mark.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +80,32 @@ pub struct Neighbor {
 pub struct Row {
     pub target: i32,
     pub values: Vec<i32>,
+}
+
+/// One family of the neighborhood, as far as the simulation reads it.
+///
+/// The original keeps the families in the neighborhood object
+/// (`[[0x6e48bc]+0x24]`), in a vector of record pointers at +0x154, in
+/// the order the reload sorts them ([`World::read_neighbors`]). A record
+/// holds much more than this; these are the parts a lot's scripts reach,
+/// through scope 24 ("neighbor in stack object", 0x425b5d).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Family {
+    /// The family's ID: its FAMI chunk ID (+0x10c). A record's person
+    /// data word 61 names a family by it.
+    pub id: i32,
+    /// The house the family lives in, 0 for none (+0x110).
+    pub house: i32,
+    /// The GUIDs of its members' person types, in order (+0x12c).
+    pub members: Vec<u32>,
+    /// The cached count of the family's friends (+0x120): what the file
+    /// saved, until the count is worked out again
+    /// ([`World::family_friends`]).
+    pub friends: i32,
+    /// Whether that count is out of date (+0x124). The family's
+    /// constructor (0x41003c) sets it and the file's reader (0x4104ce)
+    /// leaves it, so every family starts out of date.
+    pub stale: bool,
 }
 
 /// A neighbor's inventory (16 bytes in the original).
@@ -194,14 +224,16 @@ impl World {
     ///
     /// Ported from the old prototype (legacy/crates/sims-vm/src/neighborhood.rs,
     /// `prepare_family_reload` and `rebuild_family_links`). The families
-    /// themselves are not kept: nothing a lot has been seen to run reads
-    /// them yet.
+    /// are kept, in that order, as far as [`Family`] holds them: each
+    /// with its friend count as the file saved it and out of date.
     ///
     /// Checked against the original: from the install's neighborhood
     /// file, every record's word 61 equals the capture's at the Goth
     /// house's first tick. The capture's game read another neighborhood
     /// file, which differs from the install's in five records (47, 48,
-    /// 301, 344 and 351); see `docs/decisions.md`.
+    /// 301, 344 and 351); see `docs/decisions.md`. So do the families'
+    /// IDs, houses, members and order, and every friend count but the
+    /// Goth family's, which the load counts again (load step 20).
     pub fn read_neighbors(
         &mut self,
         neighborhood: &Neighborhood,
@@ -249,22 +281,46 @@ impl World {
                 )));
             }
         }
-        let mut ordered: Vec<(i32, i32, &[u32])> = families
+        // The added family 0 has number -1, no house, no members, and the
+        // friend count its constructor gives (0).
+        let mut ordered: Vec<(i32, Family)> = families
             .iter()
-            .map(|(&id, f)| (f.number, i32::from(id), f.members.as_slice()))
+            .map(|(&id, f)| {
+                let family = Family {
+                    id: i32::from(id),
+                    house: f.house,
+                    members: f
+                        .members
+                        .iter()
+                        .copied()
+                        .filter(|guid| first.contains_key(guid))
+                        .collect(),
+                    friends: f.friends,
+                    stale: true,
+                };
+                (f.number, family)
+            })
             .collect();
         if !families.contains_key(&0) {
-            ordered.push((-1, 0, &[]));
+            let family = Family {
+                id: 0,
+                house: 0,
+                members: Vec::new(),
+                friends: 0,
+                stale: true,
+            };
+            ordered.push((-1, family));
         }
-        ordered.sort_unstable_by_key(|&(number, id, _)| std::cmp::Reverse((number, id)));
+        ordered.sort_unstable_by_key(|(number, family)| std::cmp::Reverse((*number, family.id)));
         for record in neighbors.slots.iter_mut().flatten() {
             record.data[FAMILY] = 0;
         }
-        for (_, id, members) in ordered {
+        for (_, family) in &ordered {
+            let id = family.id;
             let word = i16::try_from(id).map_err(|_| {
                 LoadError::Neighborhood(format!("family chunk ID {id} is not a word"))
             })?;
-            for guid in members {
+            for guid in &family.members {
                 if let Some(&place) = first.get(guid)
                     && let Some(record) = &mut neighbors.slots[place]
                 {
@@ -273,6 +329,85 @@ impl World {
             }
         }
         self.neighbors = neighbors;
+        self.families = ordered.into_iter().map(|(_, family)| family).collect();
         Ok(())
+    }
+}
+
+/// Whether two records are friends both ways (0x4271c5): each has a row
+/// for the other with at least one value, and the first value of each
+/// row is at least `threshold` (the autonomy tuning's friendship
+/// threshold, 0x6c4398).
+pub fn mutual_friends(a: &Neighbor, b: &Neighbor, threshold: i32) -> bool {
+    let first = |from: &Neighbor, to: &Neighbor| {
+        from.row(i32::from(to.id))
+            .and_then(|row| row.values.first().copied())
+    };
+    match (first(a, b), first(b, a)) {
+        (Some(ab), Some(ba)) => ab >= threshold && ba >= threshold,
+        _ => false,
+    }
+}
+
+impl World {
+    /// The friend count of the family at `place` in [`World::families`]
+    /// (0x427219): the cached count, worked out again first when it is
+    /// out of date ([`World::count_family_friends`]). `threshold` is the
+    /// autonomy tuning's friendship threshold (0x6c4398).
+    ///
+    /// The count is only worked out when it is read, and it goes out of
+    /// date only when a relationship of one of the family's people is
+    /// written ([`World::mark_friends`]); a change to anything else it
+    /// reads leaves the cached count as it was, as in the original.
+    pub fn family_friends(&mut self, place: usize, threshold: i32) -> Option<i32> {
+        let family = self.families.get(place)?;
+        if family.stale {
+            let friends = self.count_family_friends(family, threshold);
+            let family = &mut self.families[place];
+            family.friends = friends;
+            family.stale = false;
+        }
+        Some(self.families[place].friends)
+    }
+
+    /// Counts a family's friends (0x427bd7): the records, in slot order,
+    /// that are not of a member's type, belong to some family (word 61),
+    /// are of kind (word 65) at most 1 and are friends both ways
+    /// ([`mutual_friends`]) with the first record of some member's type.
+    /// Each record counts once.
+    pub fn count_family_friends(&self, family: &Family, threshold: i32) -> i32 {
+        let neighbors = &self.neighbors;
+        let mut count = 0i32;
+        for candidate in neighbors.slots.iter().flatten() {
+            if family.members.contains(&candidate.guid) || candidate.data[FAMILY] == 0 {
+                continue;
+            }
+            for &guid in &family.members {
+                // The member's record (0x42571f): none for GUID 0.
+                let Some(member) = neighbors.first_of(guid).filter(|_| guid != 0) else {
+                    continue;
+                };
+                if mutual_friends(candidate, member, threshold) && candidate.data[KIND] <= 1 {
+                    count = count.wrapping_add(1);
+                    break;
+                }
+            }
+        }
+        count
+    }
+
+    /// What a write to a relationship marks out of date about one of its
+    /// two records (0x4246b9): the record's own friend count, and the
+    /// friend count of the first family whose ID is the record's word 61.
+    /// Nothing for a record that does not exist.
+    pub fn mark_friends(&mut self, id: i16) {
+        let Some(record) = self.neighbors.get_mut(id) else {
+            return;
+        };
+        record.stale = true;
+        let family = i32::from(record.data[FAMILY]);
+        if let Some(family) = self.families.iter_mut().find(|f| f.id == family) {
+            family.stale = true;
+        }
     }
 }

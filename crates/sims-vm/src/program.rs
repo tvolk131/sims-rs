@@ -382,6 +382,8 @@ impl Program {
             random_count: Ext::from_f32(value("random selection count", 0x4120_0000))
                 .to_i32_truncate(),
             distance_attenuation: value("functional distance attenuation", 0x4040_0000),
+            friendship_threshold: Ext::from_f32(value("friendship threshold", 0x41c8_0000))
+                .to_i32_truncate(),
         }
     }
 

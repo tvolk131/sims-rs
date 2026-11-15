@@ -574,6 +574,9 @@ impl Lot {
             ..update
         };
         self.ticks = tick;
+        // Between lot updates the game handles its messages, which
+        // redraws the family panel.
+        interpreter.refresh_family_panel(&mut self.world);
         let frame = if self.frames.after(tick) {
             interpreter.draw_frame(&mut self.world, VIEW_LEVEL).err()
         } else {

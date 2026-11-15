@@ -21,6 +21,9 @@ use sims_sim::{Object, World};
 /// to the scheduler.
 pub(crate) const LOCKOUT: usize = 25;
 
+/// Scope 24: a field of the neighborhood record the stack object names.
+const NEIGHBOR: u8 = 24;
+
 /// Scope names, by scope number.
 const SCOPE_NAMES: [&str; 39] = [
     "my attributes",
@@ -129,6 +132,11 @@ impl Machine<'_, '_> {
         index: i16,
         write: bool,
     ) -> Result<(Cell, bool), Trap> {
+        if scope == NEIGHBOR {
+            // A field's value, with no word pointer: with write intent the
+            // original clears the pointer it would hand back (0x425b8e).
+            return Ok((Cell::Literal(self.neighbor_field(index)?), false));
+        }
         let resolved = self.locate(scope, index, write)?;
         if let Cell::Data(id, LOCKOUT) = resolved.0 {
             self.wake(id)?;
@@ -184,6 +192,68 @@ impl Machine<'_, '_> {
                 countdown;
         }
         Ok(())
+    }
+
+    /// Scope 24, "neighbor in stack object" (0x453389, 0x425b5d): field
+    /// `index` of the neighborhood record the stack object names, by its
+    /// place plus one as Set To Next and scope 32 name it. No such record
+    /// reads 0 for every field, and so does a field above 9 (a negative
+    /// one too: the original compares it unsigned).
+    ///
+    /// - 2: the record's person data word 58.
+    /// - 3 and 4: 0.
+    /// - 6: the house of the first family, in the families' order, whose
+    ///   members include the record's type (0x425be2 walks +0x154 with
+    ///   0x4101f2), whatever the record's word 61 says; 0 if none.
+    /// - 9: the friend count ([`sims_sim::World::family_friends`],
+    ///   0x410260, 0x427219) of the first family whose ID is the record's
+    ///   word 61, with or without a house (0x425cfa does not read
+    ///   +0x110), if that word is not 0; else 0. Reading it works the
+    ///   count out again when it is out of date, so it can change the
+    ///   family.
+    ///
+    /// Fields 0, 1 and 5 read what the record's +8 points to, and 7 and 8
+    /// the family's flags (+0x138), which the simulation does not hold;
+    /// they fail loudly.
+    fn neighbor_field(&mut self, index: i16) -> Result<i16, Trap> {
+        let stack_object = self.frame()?.stack_object;
+        let Some(record) = self.world.neighbors.get(stack_object) else {
+            return Ok(0);
+        };
+        let families = &self.world.families;
+        let family = || {
+            let id = i32::from(record.data[sims_sim::neighbors::FAMILY]);
+            families.iter().position(|f| id != 0 && f.id == id)
+        };
+        let unsupported = |address: u32, what: &str| {
+            Err(Trap::Unsupported(format!(
+                "scope 24 field {index} (0x{address:x}) reads {what}, which is not kept"
+            )))
+        };
+        Ok(match index {
+            0 => return unsupported(0x425baa, "the lot person whose type is the record's (+8)"),
+            1 => return unsupported(0x425be2, "the record's type (+8) in the selected family"),
+            2 => record.data[58],
+            3 | 4 => 0,
+            5 => return unsupported(0x427148, "the record's own friend count, by its type (+8)"),
+            6 => families
+                .iter()
+                .find(|f| f.members.contains(&record.guid))
+                .map_or(0, |f| f.house as i16),
+            7 => return unsupported(0x425c5e, "the family's flags (+0x138)"),
+            8 => return unsupported(0x425cb4, "the family's flags (+0x138)"),
+            9 => match family() {
+                Some(place) => {
+                    let threshold = self.program.autonomy_constants().friendship_threshold;
+                    self.world
+                        .family_friends(place, threshold)
+                        .ok_or_else(|| Trap::Invalid("family vanished".into()))?
+                        as i16
+                }
+                None => 0,
+            },
+            _ => 0,
+        })
     }
 
     /// Where an operand lives, without the side effects of resolving it.
@@ -467,9 +537,14 @@ impl Machine<'_, '_> {
                         .ok_or(Trap::native(0x3a, "job data names no level or field"))?,
                 )
             }
-            // Neighbor fields (24), neighborhood data (34) and scope 38
-            // need state the simulation doesn't hold yet.
-            24 | 34 | 38 => {
+            NEIGHBOR => {
+                return Err(Trap::Invalid(
+                    "scope 24 is resolved before it is located".into(),
+                ));
+            }
+            // Neighborhood data (34) and scope 38 need state the
+            // simulation doesn't hold yet.
+            34 | 38 => {
                 return Err(unsupported(scope));
             }
             2 | 5 | 39..=255 => return Err(Trap::native(9, "invalid memory scope")),

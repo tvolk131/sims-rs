@@ -825,7 +825,9 @@ impl Interpreter<'_> {
     /// 1. The dialogs, from the first record, starting over after each
     ///    one it acts on: a new record is shown (0x436da0: status 1) and,
     ///    if it stops the game, answered by the player then and there; a
-    ///    finished one (status 5) is destroyed (0x448663).
+    ///    finished one (status 5) is destroyed (0x448663). While a dialog
+    ///    waits, the family panel is redrawn
+    ///    ([`Interpreter::refresh_family_panel`]).
     /// 2. After a full pass, the queued removals, oldest first: each ID is
     ///    taken off the queue and, if it still names an object, the
     ///    object is removed at once ([`Interpreter::remove_now`],
@@ -876,10 +878,14 @@ impl Interpreter<'_> {
                 object: record.caller,
                 answers,
             };
+            // While the dialog waits, the game handles its messages, which
+            // redraws the family panel.
+            self.refresh_family_panel(world);
             let given = player.answer(&shown);
             let Some(answer) = given.filter(|answer| answers.contains(answer)) else {
                 return Err(TickError::Unanswered { shown, given });
             };
+            let record = &mut world.dialogs.records[index];
             // 0x4370be: the button's result, or done at once for a dialog
             // that only informs.
             record.status = if dialog::informs(&record.operands) {
