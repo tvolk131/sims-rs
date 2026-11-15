@@ -330,18 +330,53 @@ fn the_snack_order_pays_for_the_snack() {
         let update = lot.step_play().unwrap();
         assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
     }
-    // Step 2703: the carpool (object 8) makes the school bus, a multi-tile
-    // object, whose factory is not ported.
+    // Step 2703: the carpool (object 8, tree 0x1017 node 4) makes the
+    // school bus, a multi-tile object.
+    let update = lot.step_play().unwrap();
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    assert_school_bus(&lot);
+    for step in 2704..3401 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+    }
+    // Step 3401: person 16 routes for an action that wants to be
+    // interrupted, which is not ported.
     let update = lot.step_play().unwrap();
     let [error] = &update.errors[..] else {
         panic!("{:?}", update.errors);
     };
-    assert_eq!((error.object, error.tick), (8, 91146));
+    assert_eq!(error.object, 16);
     let fault = error.fault.to_string();
     assert!(
-        fault.contains("tree 0x1017 node 4") && fault.contains("multi-tile objects"),
+        fault.contains("tree 0x1013 node 1") && fault.contains("0x45afd2"),
         "{fault}"
     );
+}
+
+/// The school bus (SchoolBus.iff) the carpool makes at tick 2703: its lead
+/// tile, object 12, and 29 more tiles of its group, three across and ten
+/// long, with the lead at the group's origin.
+fn assert_school_bus(lot: &Lot) {
+    let world = lot.world();
+    let lead = &world.objects[&12];
+    assert_eq!(lead.guid, 0x50AE_1B48);
+    assert_eq!(lead.position, [728, 488, 1]);
+    let tiles: Vec<_> = world
+        .objects
+        .values()
+        .filter_map(|o| o.multipart.as_ref().filter(|m| m.parent == 12))
+        .map(|m| m.group)
+        .collect();
+    assert_eq!(tiles.len(), 29);
+    for a in 0..3 {
+        for b in 0..10 {
+            assert_eq!(
+                tiles.contains(&[a, b, 0]),
+                [a, b] != [0, 0],
+                "tile {a}, {b}"
+            );
+        }
+    }
 }
 
 /// Person `id` is off the lot and out of every list the sim keeps of it.
@@ -428,5 +463,43 @@ fn the_player_selects_another_goth() {
     assert_eq!(lot.world().hash(), before);
     for _ in 0..50 {
         assert!(lot.step_play().unwrap().errors.is_empty());
+    }
+}
+
+/// `sims boot <install> UserData/Houses/House05.iff --ticks 2881
+/// --answers 3` gives this hash.
+const TICK_2881: &str = "eed688a01a1720100e2d11b8f97f903c258837025276036a33436f05a9100f92";
+
+#[test]
+fn strict_mode_runs_to_tick_2881_past_the_school_bus() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    // The clock: globals 0, 5 and 6 are the hour, minute and second.
+    let clock = |lot: &Lot| {
+        let globals = &lot.world().globals;
+        (globals[0], globals[5], globals[6])
+    };
+    assert_eq!(clock(&lot), (6, 30, 44));
+    for _ in 1..=2703 {
+        lot.step().unwrap();
+    }
+    assert_school_bus(&lot);
+    for _ in 2704..=2881 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.world().hash_hex(), TICK_2881);
+    // Each update is two game seconds, 30 a game minute, so a day is
+    // 43,200 updates.
+    assert_eq!(clock(&lot), (8, 6, 46));
+    // Tick 2882: person 16, who stood up from the sofa, has a pose with no
+    // foreground layer, which is not ported.
+    let stopped = lot.step().unwrap_err().to_string();
+    for part in ["tick 2882,", "object 16", "0x5992b3"] {
+        assert!(stopped.contains(part), "{stopped}");
     }
 }
