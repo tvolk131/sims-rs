@@ -1652,11 +1652,12 @@ Progress:
 - Found: the door's left jamb loses a depth contest with the wall; a fix
   needs the original's per-zoom depth tables.
 - Done: far zoom at rotations 1 and 2, and near zoom, compared with the
-  original. The geometry lines up at all of them (85.5% to 90.4% of the
-  house box exact where the room lights agree); the misses are a room
-  the morning sun lit, and the Sims.
-- Read, not drawn: the strip on a marked edge-on diagonal; no
-  screenshot shows one.
+  original. The geometry lines up at all of them; the house box is
+  56.2% to 90.4% exact. Most misses are one room the original lit
+  brighter (the shots are from later in the morning) and the Sims; an
+  edge-on diagonal wall's texels also differ.
+- Read, not ported: the original's strip on a marked edge-on diagonal;
+  no screenshot shows one.
 - Next: the edge-on diagonal's texels; the original's per-zoom depth
   tables (the door jamb); a screenshot with a marked edge-on diagonal.
 

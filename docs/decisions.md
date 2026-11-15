@@ -25,13 +25,14 @@ objects and grass. Most of what is left is not drawing:
 
 - The shots were taken at 6:49 in the morning, later than the earlier
   ones. In the original the stair room (the one with the bay window)
-  is about a fifth brighter than in our world: light level 20 against
-  16. Its walls, floor and stairs make up nearly all the misses at
+  is drawn with light-table level 20 (see `Light`); ours uses level 16,
+  the half-light floor. Its walls, floor and stairs make up nearly all the misses at
   rotations 1 and 2 and in the bay view. The room's light is the
   simulation's, so the render leaves it.
 - The Sims in the shots, which this crate does not draw.
 
-One drawing difference is left: a diagonal wall seen edge-on (frame 3,
+One drawing difference remains in these new views (the door jamb's
+depth, recorded below, is separate): a diagonal wall seen edge-on (frame 3,
 the bay's left end) shows other texels than ours over its width, 4
 pixels at far zoom and 16 at near. Showing the wall's other side did
 not match either, so it is not only the side. The original picks the
@@ -39,7 +40,7 @@ side from the run's direction (0x53fd47), and for an edge-on line looks
 up its own side's wallpaper by a fixed view direction (0x53f8ce); the
 texel offset was not read. Reopen with that offset.
 
-## 2026-11-14: The strip on a marked edge-on diagonal is read, not drawn
+## 2026-11-14: The original's strip on a marked edge-on diagonal is read, not ported
 
 The last unported piece of the wall caps is the strip the original lays
 on a marked cut wall that runs edge-on (a "rising" diagonal, frame 3).
@@ -59,8 +60,9 @@ to (the marked wall's shape 7 or 8 is only the stub for this frame), so
 either part of the placement is still unread or the case does not come
 up. None of our screenshots has one, and the Goth house has five
 diagonal walls, none marked in the compared cutaway at any rotation.
-It stays undrawn.
-Reopen with a screenshot of a cut edge-on diagonal meeting a standing
+So the original's rule is not ported: if such a wall does come up, we
+draw it like any marked cut wall (pattern 252 in shape 9 or 253 in
+shape 10, by which end is marked, not moved). Reopen with a screenshot of a cut edge-on diagonal meeting a standing
 wall.
 
 Caps on diagonal corners (the 2-pixel slices) are drawn as the corner
