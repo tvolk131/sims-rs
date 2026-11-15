@@ -2236,8 +2236,9 @@ through their public interfaces only; the simulation never depends on it.
 - **Done: the action queue.** The selected Sim's running and queued
   actions show as icons in the top left, framed as the original frames
   them, and a press cancels one (`Lot::cancel`, 0x45d5f8) with the
-  original's sound. Objects' catalog pictures are not made yet (a grey
-  square stands in), and the icons do not slide into place.
+  original's sound. An object's icon shows its type's catalog picture,
+  from the thumbnail its file ships; the original's render of a missing
+  thumbnail (0x4e57a6) is not ported. The icons do not slide into place.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
     on Manage Inventory operation 4 and scope 12. A check tree's fault

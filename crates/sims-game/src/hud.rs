@@ -20,6 +20,7 @@ use sims_ui::household::{Faces, Snapshot};
 use sims_ui::hud::{self, Controls, Item};
 use sims_ui::pie;
 use sims_ui::queue::Queue;
+use sims_ui::thumbnail::{self, Thumbnails};
 use sims_vm::SoundEvent;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -39,6 +40,10 @@ pub const ERROR: &str = "UI_error";
 pub struct Hud {
     pub art: Art,
     faces: Faces,
+    /// The catalog pictures of the object types the queue has shown.
+    thumbnails: Thumbnails,
+    /// What could not be read while drawing, until the game takes it.
+    problems: Vec<String>,
     labels: Labels,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
@@ -71,6 +76,7 @@ impl Hud {
             .chain(&dialog::RESOURCES)
             .chain(&pie::RESOURCES)
             .chain(&sims_ui::queue::RESOURCES)
+            .chain(&thumbnail::RESOURCES)
             .copied()
             .collect();
         let art = Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
@@ -95,6 +101,8 @@ impl Hud {
         Ok(Self {
             art,
             faces,
+            thumbnails: Thumbnails::default(),
+            problems: Vec::new(),
             labels,
             members,
             // The strip opens as if Live had been pressed.
@@ -140,10 +148,12 @@ impl Hud {
     /// Draws the panel over the lot in `canvas`, from `world` as it is
     /// now, with the speed of `pace`, and `status` (a line across the
     /// top) if there is one; the dialog is the one [`Hud::read_dialog`]
-    /// last read.
+    /// last read. The catalog pictures the queue shows are read from
+    /// `assets` the first time each type shows.
     pub fn draw(
         &mut self,
         world: &World,
+        assets: &Assets,
         view: &View,
         pace: &Pace,
         status: Option<&str>,
@@ -167,6 +177,15 @@ impl Hud {
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         self.queue = Queue::read(world, snapshot.selected);
         self.pressed.keep(&self.queue);
+        let objects: Vec<u32> = self.queue.objects().collect();
+        for guid in objects {
+            if let Err(e) = self.thumbnails.read(assets.index(), assets.catalog(), guid) {
+                // Shown as a type without a catalog item, and not read again.
+                self.thumbnails.insert(guid, None);
+                self.problems
+                    .push(format!("the catalog picture of type 0x{guid:08X}: {e}"));
+            }
+        }
         let (width, height) = (
             u32::try_from(canvas.width).unwrap_or(u32::MAX),
             u32::try_from(canvas.height).unwrap_or(u32::MAX),
@@ -185,7 +204,8 @@ impl Hud {
             &self.items,
             &self.controls,
         );
-        self.queue.draw(&mut frame, &self.art, &self.faces);
+        self.queue
+            .draw(&mut frame, &self.art, &self.faces, &self.thumbnails);
         self.dialog = self
             .message
             .as_ref()
@@ -256,6 +276,16 @@ impl Hud {
     /// The selected Sim's actions as last drawn.
     pub fn queue(&self) -> &Queue {
         &self.queue
+    }
+
+    /// The catalog pictures read so far.
+    pub fn thumbnails(&self) -> &Thumbnails {
+        &self.thumbnails
+    }
+
+    /// What could not be read while drawing since this was last asked.
+    pub fn take_problems(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.problems)
     }
 
     /// The interface's sounds since the last call.

@@ -461,11 +461,14 @@ impl Game {
         self.hud.read_dialog(dialogs, &self.assets);
         self.hud.draw(
             world,
+            &self.assets,
             &self.view,
             &self.pace,
             status.as_deref(),
             &mut self.canvas,
         );
+        let problems = self.hud.take_problems();
+        self.people.note(problems);
     }
 
     /// The canvas last drawn.
