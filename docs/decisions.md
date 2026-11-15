@@ -131,7 +131,7 @@ without the refresh. Here it would place the never-placed animator at
 the off-lot position and clear its skin's update mark.
 
 The branches then differ only in that animator, which the deletion at
-the end of the update destroys. Nothing may read it before then:
+the end of the update destroys. What is checked before then:
 
 - A person with an ID above the remover's has its tick in the same
   pass (the scheduler walks IDs in order). The refresh is held for that
@@ -139,13 +139,18 @@ the end of the update destroys. Nothing may read it before then:
   a person that takes itself off. Until its animator's tick, its thread
   may run only primitives that read no animator. The refresh then the
   tick must reach what the tick alone does.
+- A person that removes itself in its own tick and goes on (flag bit
+  0, or a synchronous run) has its animator's tick still to come at
+  the same clock. The refresh is held in that tick
+  (`Interpreter::refreshing`) and settled the same way.
 - A queued person whose tick starts with no refresh held, or whose
   thread runs a primitive that reads an animator, fails.
 - A head that looks at it fails, as before.
 - A person left queued after a partial pass fails, as before.
 
-That the deletion's last reset reads none of it is **unverified**, as
-for every removal of a person. In strict mode the two people are 334
+Not checked, and **unverified** as for every removal of a person:
+another object's primitive that reads the queued person's animator
+before the deletion, and the deletion's last reset. In strict mode the two people are 334
 and 336, below 354, so neither ticks again. In the snack order they are
 374 and 375, so both tick while queued, and the branches agree.
 

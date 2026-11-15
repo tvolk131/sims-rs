@@ -344,3 +344,57 @@ fn a_person_another_took_off_ticks_with_its_refresh_pending() {
     let error = result.unwrap_err().to_string();
     assert!(error.contains("left the lot and before its"), "{error}");
 }
+
+#[test]
+fn a_person_removing_itself_and_going_on_settles_its_refresh_at_its_animators_tick() {
+    // The visitor (ID 3) removes itself in its own tick with flag bit 0,
+    // so its tree goes on. Its animator's refresh at the take-off is
+    // pending for its animator's tick later in the same tick, as for a
+    // person that takes itself off: until then its thread may run only
+    // what reads no animator.
+    let (mut fx, id, file) = placed_visitor();
+    fx.world.globals = vec![0; 64];
+    for object in fx.world.objects.values_mut() {
+        // Only the visitor is ready, with no countdown (-1).
+        object.registry_word = Some(if object.id == id { 0x0001_ffff } else { 0xffff });
+    }
+    let pass = |fx: &mut Fixture| {
+        let tuning = crate::tick::tuning();
+        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        let mut update = sims_vm::Update::default();
+        let result = interpreter.scheduler_pass(&mut fx.world, &tuning, &mut update);
+        (result, update)
+    };
+    let ready = fx.world.clone();
+    // Then it sleeps, which reads no animator: its animator's tick
+    // settles the refresh.
+    fx.add(
+        file,
+        4205,
+        tree(vec![
+            ins(REMOVE, 1, 1, [0, 0, 1, 0, 0, 0, 0, 0]),
+            ins(0, RETURN_TRUE, RETURN_FALSE, [0; 8]),
+        ]),
+    );
+    fx.thread(id, 4205, &[5, 0, 0, 0]);
+    let (result, update) = pass(&mut fx);
+    assert_eq!(result, Ok(true));
+    assert_eq!(update.ticked, [id]);
+    assert_eq!(fx.world.removals, [id]);
+    assert_eq!(fx.world.objects[&id].position, [-16, -16, 1]);
+    // Then Random (opcode 8), which reads an animator: it fails on the
+    // pending refresh.
+    fx.world = ready;
+    fx.add(
+        file,
+        4206,
+        tree(vec![
+            ins(REMOVE, 1, 1, [0, 0, 1, 0, 0, 0, 0, 0]),
+            ins(8, RETURN_TRUE, RETURN_FALSE, [0; 8]),
+        ]),
+    );
+    fx.thread(id, 4206, &[0; 4]);
+    let (result, _) = pass(&mut fx);
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("left the lot and before its"), "{error}");
+}

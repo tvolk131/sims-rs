@@ -154,8 +154,10 @@ impl Machine<'_, '_> {
         // The person removing itself and yielding is taken as it is: its
         // own tick follows at once and its deletion ends the update. Any
         // other take-off of a person is taken only when the refresh would
-        // write nothing but its animator, which nothing may then read
-        // before the deletion destroys it.
+        // write nothing but its animator. Its own thread may then read no
+        // animator until its animator's tick settles the refresh; another
+        // object reading that animator before the deletion is not checked
+        // (docs/decisions.md).
         let person = self
             .world
             .objects
@@ -175,8 +177,29 @@ impl Machine<'_, '_> {
         }
         if unseen_refresh {
             let pending = self.interpreter().refresh_before_removal(self.world, id)?;
-            if let Some(taken_off) = self.taken_off {
-                taken_off.borrow_mut().insert(id, pending);
+            // A person removing itself during its own tick without
+            // yielding (flag bit 0, or a synchronous run) has its
+            // animator's tick still to come in this tick, at the same
+            // clock: the refresh waits for it there, as for a person
+            // that takes itself off (`Interpreter::take_self_off`).
+            // Another person's waits for that person's tick.
+            match self.refreshing.filter(|r| r.borrow().person == id) {
+                Some(refreshing) => {
+                    let mut refreshing = refreshing.borrow_mut();
+                    if refreshing.pending.is_some() {
+                        return Err(Trap::Unsupported(format!(
+                            "person {id} queued for removal during its own tick after taking \
+                             itself off the lot: two animator refreshes (0x58da12) pending \
+                             for one animator tick"
+                        )));
+                    }
+                    refreshing.pending = Some(pending);
+                }
+                None => {
+                    if let Some(taken_off) = self.taken_off {
+                        taken_off.borrow_mut().insert(id, pending);
+                    }
+                }
             }
         }
         let object = self
