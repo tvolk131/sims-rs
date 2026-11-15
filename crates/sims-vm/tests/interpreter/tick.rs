@@ -8,6 +8,7 @@ use sims_sim::motives::{Curve, Rates, Tuning};
 use sims_sim::{Dialog, HouseUsage, PersonTick, Usage};
 use sims_vm::play::{Play, Recovery};
 use sims_vm::{Answers, Player, Shown, SoundEvent, TickError, Update};
+use std::collections::BTreeMap;
 
 /// Dialog (opcode 36) operands of `kind`, waiting for an answer, with the
 /// temp a three-button dialog writes in bits 4 to 6 of operand 7.
@@ -407,34 +408,54 @@ fn queued_removals_go_after_a_full_pass_only() {
 
 #[test]
 fn a_queued_tile_goes_with_its_whole_group() {
-    use crate::group_factory::{MASTER, counting, create, dynamic, group};
-    let made = |dynamic_group: bool| {
-        let mut fx = lot(sleeper());
-        crate::rooms::build(&mut fx);
-        let file = group(&mut fx);
-        counting(&mut fx, file, false);
-        if dynamic_group {
-            dynamic(&mut fx, file);
-        }
-        assert_eq!(create(&mut fx, MASTER), Ok(3));
-        fx.world.removals = vec![4];
-        fx
-    };
+    use crate::group_factory::{MASTER, counting, create, group};
+    let mut fx = lot(sleeper());
+    crate::rooms::build(&mut fx);
+    let file = group(&mut fx);
+    counting(&mut fx, file, false);
+    assert_eq!(create(&mut fx, MASTER), Ok(3));
+    fx.world.removals = vec![4];
     // 0x4424c1: the immediate removal, which deletes the group from its
     // lead (0x440f37).
-    let mut fx = made(false);
     let tick = update(&mut fx, &mut answers(&[])).unwrap();
     assert_eq!(tick.removed, vec![4]);
     for id in [3, 4, 5] {
         assert!(!fx.world.objects.contains_key(&id), "tile {id}");
     }
     assert!(fx.world.next_parts.is_empty());
-    // A tile whose type has the dynamic group function leaves its group
-    // first (0x4424b0, 0x42346a), which is not ported.
-    let mut fx = made(true);
-    let stopped = update(&mut fx, &mut answers(&[])).unwrap_err().to_string();
-    assert!(stopped.contains("0x42346a"), "{stopped}");
-    assert!(fx.world.objects.contains_key(&4));
+}
+
+#[test]
+fn a_queued_tile_of_a_dynamic_group_leaves_its_group_and_goes_alone() {
+    use crate::group_factory::{MASTER, counting, create, dynamic, group};
+    let made = |queued: u16| {
+        let mut fx = lot(sleeper());
+        crate::rooms::build(&mut fx);
+        let file = group(&mut fx);
+        counting(&mut fx, file, false);
+        dynamic(&mut fx, file);
+        assert_eq!(create(&mut fx, MASTER), Ok(3));
+        fx.world.removals = vec![queued];
+        fx
+    };
+    let lead = |fx: &Fixture, id: u16| fx.world.objects[&id].multipart.as_ref().unwrap().parent;
+    // 0x442450 to 0x4424b0: the tile's type (tile 4's) has the dynamic
+    // group function, so it leaves its group first (0x42346a, 0x4228d6),
+    // and the deletion then takes it alone. The lead keeps tile 5.
+    let mut fx = made(4);
+    let tick = update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(tick.removed, vec![4]);
+    assert!(!fx.world.objects.contains_key(&4));
+    assert_eq!(fx.world.next_parts, BTreeMap::from([(3, 5)]));
+    assert_eq!((lead(&fx, 3), lead(&fx, 5)), (0, 3));
+    // The lead's type has no function 8: the deletion goes from the lead
+    // and takes the whole group (0x440f37).
+    let mut fx = made(3);
+    let tick = update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(tick.removed, vec![3]);
+    for id in [3, 4, 5] {
+        assert!(!fx.world.objects.contains_key(&id), "tile {id}");
+    }
 }
 
 #[test]

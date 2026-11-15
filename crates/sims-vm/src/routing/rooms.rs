@@ -492,6 +492,7 @@ mod tests {
             people: Default::default(),
             icon_frames: None,
             expansions: 0,
+            characters: Default::default(),
         }
     }
 
@@ -548,5 +549,118 @@ mod tests {
         // The covering, tiles 3 to 4 by 4 to 6, costs nothing (no flag
         // 0x20) and is not grown.
         assert_eq!(with[4..], [Region([48, 64, 80, 112, 0])]);
+    }
+
+    /// Sets the wall cell of tile (`x`, `y`) (the `+0xf8` tile first) on
+    /// `level`: its segments, and its two style words.
+    fn wall(world: &mut World, level: usize, [x, y]: [usize; 2], segments: u8, styles: [u16; 2]) {
+        let walls = &mut world.arrays.get_mut(&WALLS[level - 1]).unwrap().data;
+        let cell = (x * FULL + y) * WALL_CELL;
+        walls[cell] = segments;
+        walls[cell + 2..cell + 4].copy_from_slice(&styles[0].to_le_bytes());
+        walls[cell + 4..cell + 6].copy_from_slice(&styles[1].to_le_bytes());
+    }
+
+    /// A footprint in the original's order from its `+0xf4` (`a`) and
+    /// `+0xf8` (`b`) ranges.
+    fn footprint(a: [i32; 2], b: [i32; 2]) -> [i32; 4] {
+        [a[1], b[1], a[0], b[0]]
+    }
+
+    #[test]
+    fn a_wall_crosses_a_footprint_when_its_line_lies_strictly_inside() {
+        // 0x476dbc. Segment 1 of tile (3, 1): the line +0xf8 = 48, styled
+        // by the first style word.
+        let mut lot = world();
+        wall(&mut lot, 1, [3, 1], 1, [0, 3]);
+        assert_eq!(
+            walls_cross(&lot, footprint([21, 27], [45, 51]), 1),
+            Ok(true)
+        );
+        // On the line's edge, or on another level, it does not.
+        assert_eq!(
+            walls_cross(&lot, footprint([21, 27], [48, 54]), 1),
+            Ok(false)
+        );
+        assert_eq!(
+            walls_cross(&lot, footprint([21, 27], [45, 51]), 2),
+            Ok(false)
+        );
+        // Style 3 is one a person crosses.
+        wall(&mut lot, 1, [3, 1], 1, [3, 0]);
+        assert_eq!(
+            walls_cross(&lot, footprint([21, 27], [45, 51]), 1),
+            Ok(false)
+        );
+        // Segment 2 of tile (2, 2): the line +0xf4 = 32, styled by the
+        // second style word.
+        let mut lot = world();
+        wall(&mut lot, 2, [2, 2], 2, [3, 0]);
+        let across = footprint([29, 35], [37, 43]);
+        assert_eq!(walls_cross(&lot, across, 2), Ok(true));
+        wall(&mut lot, 2, [2, 2], 2, [0, 3]);
+        assert_eq!(walls_cross(&lot, across, 2), Ok(false));
+    }
+
+    #[test]
+    fn the_diagonals_compare_sums_and_differences() {
+        // Segment 0x10 of tile (3, 1): +0xf4 + +0xf8 = 16 x (1 + 3 + 1) =
+        // 80, against 21 + 53 and 27 + 59.
+        let mut lot = world();
+        wall(&mut lot, 1, [3, 1], 0x10, [3, 0]);
+        let centred = footprint([21, 27], [53, 59]);
+        assert_eq!(walls_cross(&lot, centred, 1), Ok(true));
+        assert_eq!(
+            walls_cross(&lot, footprint([17, 23], [49, 55]), 1),
+            Ok(false)
+        );
+        // Segment 0x20 of tile (3, 5): +0xf4 - +0xf8 = 16 x (5 - 3) = 32,
+        // against 85 - 59 and 91 - 53.
+        let mut lot = world();
+        wall(&mut lot, 1, [3, 5], 0x20, [3, 0]);
+        let centred = footprint([85, 91], [53, 59]);
+        assert_eq!(walls_cross(&lot, centred, 1), Ok(true));
+        assert_eq!(
+            walls_cross(&lot, footprint([81, 87], [57, 63]), 1),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn segments_4_and_8_are_never_tested_and_0x20_only_when_lowest() {
+        let mut lot = world();
+        let centred = footprint([85, 91], [53, 59]);
+        // 4 and 8 would mirror 1 and 2 on the next tile; they are not
+        // read.
+        wall(&mut lot, 1, [3, 5], 4 | 8, [0, 0]);
+        assert_eq!(walls_cross(&lot, centred, 1), Ok(false));
+        // The search for the next segment stops at 0x20 (0x476f0e), so
+        // after segment 1 (whose line, 48, is outside 53 to 59) the
+        // crossing diagonal is not read.
+        wall(&mut lot, 1, [3, 5], 1 | 0x20, [0, 0]);
+        assert_eq!(walls_cross(&lot, centred, 1), Ok(false));
+        wall(&mut lot, 1, [3, 5], 0x20, [0, 0]);
+        assert_eq!(walls_cross(&lot, centred, 1), Ok(true));
+        // 0x10 after 1 is read.
+        let mut lot = world();
+        wall(&mut lot, 1, [3, 1], 1 | 0x10, [0, 0]);
+        assert_eq!(
+            walls_cross(&lot, footprint([21, 27], [53, 59]), 1),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn a_wall_test_off_the_walls_arrays_fails_loudly() {
+        let lot = world();
+        for level in [0, 3] {
+            let result = walls_cross(&lot, footprint([21, 27], [45, 51]), level);
+            assert!(
+                matches!(&result, Err(Trap::Unsupported(m)) if m.contains("0x4795c5")),
+                "{level}: {result:?}"
+            );
+        }
+        let result = walls_cross(&lot, footprint([-5, 3], [45, 51]), 1);
+        assert!(matches!(&result, Err(Trap::Unsupported(m)) if m.contains("off the lot")));
     }
 }

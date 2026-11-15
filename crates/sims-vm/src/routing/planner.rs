@@ -398,6 +398,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_person_goes_through_everything_with_bit_0_of_person_word_84_or_68() {
+        let with = |word: usize, value: i16| {
+            let mut words = vec![0; 90];
+            words[word] = value;
+            through(&words)
+        };
+        assert!(with(84, 1));
+        assert!(with(68, 1));
+        assert!(with(68, -1));
+        // Only bit 0 counts, and only those words.
+        assert!(!with(84, 2));
+        assert!(!with(68, 0x7ffe));
+        assert!(!with(74, 1));
+        assert!(!through(&[0; 90]));
+        // A person with no person words that far does not.
+        assert!(!through(&[1; 68]));
+    }
+
+    #[test]
     fn a_search_with_no_goal_forgets_the_chosen_candidate() {
         let place = |score| Candidate {
             position: [8, 8],

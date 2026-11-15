@@ -473,6 +473,7 @@ mod tests {
             people: Default::default(),
             icon_frames: None,
             expansions: 0,
+            characters: Default::default(),
         }
     }
 

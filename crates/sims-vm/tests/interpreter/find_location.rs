@@ -13,6 +13,9 @@ use crate::rooms::{array, build};
 use crate::support::*;
 use sims_vm::Trap;
 
+/// The GUID of the lot's second indicator type.
+const INDICATOR_GUID: u32 = 0x0baa_71c5;
+
 /// The opcodes under test.
 const FIND_LOCATION: u16 = 16;
 const CREATE: u16 = 42;
@@ -401,34 +404,67 @@ fn a_person_is_kept_off_a_tile_by_a_solid_object_without_flag_0x10() {
     refused(&mut fx);
 }
 
+/// The person widget with the record's person word `word` set to `value`.
+fn recorded(word: usize, value: i16) -> Fixture {
+    let mut fx = person_widget();
+    let record = fx
+        .world
+        .neighbors
+        .slots
+        .last_mut()
+        .unwrap()
+        .as_mut()
+        .unwrap();
+    record.revision = 10;
+    record.data[word] = value;
+    fx
+}
+
 #[test]
-fn what_placing_a_new_person_does_not_port_fails_loudly() {
-    // Person word 68, 74 or 84 (from the record) sends the original
-    // through 0x45810c. Person word 81 of 10 or more, once the person is
-    // on the lot, has the interface move a pooled object to it (0x447a82).
-    for (word, value, address) in [
-        (68, 1, "0x45810c"),
-        (74, 2, "0x45810c"),
-        (84, 1, "0x45810c"),
-        (81, 10, "0x447a82"),
-    ] {
-        let mut fx = person_widget();
-        let record = fx
-            .world
+fn a_new_person_with_person_word_68_74_or_84_set_is_placed_as_any_other() {
+    // The person test (0x44e6b6 to 0x44e727) sends the original through
+    // 0x45810c, which touches only the screen.
+    for (word, value) in [(68, 1), (74, 2)] {
+        let mut fx = recorded(word, value);
+        fx.world
             .neighbors
             .slots
             .last_mut()
             .unwrap()
             .as_mut()
+            .unwrap()
+            .data[81] = 0;
+        let before: Vec<u16> = fx.world.objects.keys().copied().collect();
+        assert_eq!(create(&mut fx, 0, 0, SIM as i16), Ok(true), "word {word}");
+        let id = *fx
+            .world
+            .objects
+            .keys()
+            .find(|id| !before.contains(id))
             .unwrap();
-        record.revision = 10;
-        record.data[word] = value;
-        let result = create(&mut fx, 0, 0, SIM as i16);
-        assert!(
-            matches!(trap(result), Trap::Unsupported(ref m) if m.contains(address)),
-            "word {word}"
-        );
+        assert_eq!(fx.world.objects[&id].position, [40, 40, 1]);
     }
+}
+
+#[test]
+fn what_placing_a_new_person_does_not_port_fails_loudly() {
+    // Person word 81 of 10 or more, once the person is on the lot, has
+    // the interface move a pooled object to it (0x447a82).
+    let result = create(&mut recorded(81, 10), 0, 0, SIM as i16);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x447a82")));
+    // Bit 0 of person word 84 changes the place test's collision test
+    // (0x43383f).
+    let mut fx = recorded(84, 1);
+    fx.world
+        .neighbors
+        .slots
+        .last_mut()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .data[81] = 0;
+    let result = create(&mut fx, 0, 0, SIM as i16);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x43383f")));
 }
 
 #[test]
@@ -453,4 +489,113 @@ fn mode_1_on_a_person_fails_loudly() {
     );
     assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("0x58da12")));
     assert_eq!(fx.world.objects[&id].position, [40, 40, 1]);
+}
+
+/// The marker over the selected Sim: the lot's first indicator, object
+/// 60, off the lot.
+const MARKER: u16 = 60;
+
+/// A selected person made off the lot (Create mode 6), and the marker.
+fn selected_off_the_lot() -> (Fixture, u16) {
+    let mut fx = person_widget();
+    let before: Vec<u16> = fx.world.objects.keys().copied().collect();
+    let [g0, g1, g2, g3] = WIDGET.to_le_bytes();
+    assert_eq!(
+        run(&mut fx, 0, 0, CREATE, [g0, g1, g2, g3, 6, 0, 0, 0]),
+        Ok(true)
+    );
+    let id = *fx
+        .world
+        .objects
+        .keys()
+        .find(|id| !before.contains(id))
+        .unwrap();
+    fx.world.objects.get_mut(&id).unwrap().selected = true;
+    let marker = fx.add_object(MARKER);
+    marker.position = [-16, -16, 1];
+    for slot in &mut marker.slots {
+        slot.object = 0;
+    }
+    fx.world.indicators[0] = MARKER;
+    (fx, id)
+}
+
+/// Puts object 61 of type `guid` off the lot, in the person's head slot
+/// (record 2): data words 2 and 3 its container and slot, 26 and 14 the
+/// link to it.
+fn held_in_the_head(fx: &mut Fixture, id: u16, guid: u32) {
+    fx.add_type(guid, 4, 0, 0);
+    let held = fx.add_object(61);
+    held.guid = guid;
+    held.position = [-16, -16, 1];
+    held.data[2] = id as i16;
+    held.data[3] = 1;
+    held.data[26] = id as i16;
+    held.data[14] = 2;
+    for slot in &mut held.slots {
+        slot.object = 0;
+    }
+    fx.world.objects.get_mut(&id).unwrap().slots[2].object = 61;
+}
+
+#[test]
+fn the_selected_sim_coming_onto_the_lot_takes_the_first_indicator_into_its_head_slot() {
+    // 0x4475d2: the marker is put into the person's slot 1 (record 2).
+    let (mut fx, id) = selected_off_the_lot();
+    assert_eq!(find(&mut fx, 0, id, 0), Ok(true));
+    let person = &fx.world.objects[&id];
+    assert_eq!(person.position, [24, 24, 1]);
+    assert_eq!(person.slots[2].object, MARKER as i16);
+    let marker = &fx.world.objects[&MARKER];
+    assert_eq!(marker.position, [24, 24, 1]);
+    assert_eq!((marker.data[2], marker.data[3]), (id as i16, 1));
+    // A person that is not selected does not.
+    let (mut fx, id) = selected_off_the_lot();
+    fx.world.objects.get_mut(&id).unwrap().selected = false;
+    assert_eq!(find(&mut fx, 0, id, 0), Ok(true));
+    assert_eq!(fx.world.objects[&id].slots[2].object, 0);
+    assert_eq!(fx.world.objects[&MARKER].position, [-16, -16, 1]);
+}
+
+#[test]
+fn the_selected_sim_lets_an_indicator_in_its_head_slot_go_first() {
+    // 0x4481eb: an object of an indicator's type in the head slot leaves
+    // the lot unannounced; the marker takes its place. An object of any
+    // other type is left as it is.
+    let (mut fx, id) = selected_off_the_lot();
+    held_in_the_head(&mut fx, id, INDICATOR_GUID);
+    assert_eq!(find(&mut fx, 0, id, 0), Ok(true));
+    assert_eq!(fx.world.objects[&id].slots[2].object, MARKER as i16);
+    let held = &fx.world.objects[&61];
+    assert_eq!((held.data[2], held.data[3]), (0, -1));
+    let (mut fx, id) = selected_off_the_lot();
+    held_in_the_head(&mut fx, id, 0x1234_5678);
+    assert_eq!(find(&mut fx, 0, id, 0), Ok(true));
+    assert_eq!(fx.world.objects[&id].slots[2].object, MARKER as i16);
+    let held = &fx.world.objects[&61];
+    assert_eq!((held.data[2], held.data[3]), (id as i16, 1));
+}
+
+#[test]
+fn what_the_selected_sim_coming_onto_the_lot_does_not_port_fails_loudly() {
+    // A pooled object (type 0xE9337020) in the head slot leaves the
+    // interface's pooled list first (0x4483e7).
+    let (mut fx, id) = selected_off_the_lot();
+    held_in_the_head(&mut fx, id, 0xE933_7020);
+    let result = find(&mut fx, 0, id, 0);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x4483e7")));
+    // A person whose definition has container slots of its own: its slot
+    // 1 (0x4476a2) is then one of them.
+    let (mut fx, id) = selected_off_the_lot();
+    let file = fx.catalog.object(WIDGET).unwrap().resource;
+    fx.words(file)[20] = 77;
+    fx.program.libraries.get_mut(&file).unwrap().slots.insert(
+        77,
+        vec![sims_formats::execution::Slot {
+            kind: 0,
+            ..crate::snap::slot(0)
+        }],
+    );
+    let result = find(&mut fx, 0, id, 0);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x4476a2")));
 }

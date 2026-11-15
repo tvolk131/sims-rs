@@ -109,10 +109,8 @@ impl Machine<'_, '_> {
         if result == 0 {
             result = 1;
         }
-        if result != 2 {
-            if !ask_stop(self.world, me)? {
-                result = 2;
-            }
+        if result != 2 && !ask_stop(self.world, me)? {
+            result = 2;
         }
         match result {
             1 => Ok(Flow::Branch(true)),

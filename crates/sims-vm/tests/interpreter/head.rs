@@ -216,17 +216,31 @@ fn a_carry_layer_turns_the_head_over_the_foreground() {
     }
 }
 
-#[test]
-fn a_layer_below_full_weight_fails_loudly() {
-    // Below weight 1 a layer blends with what the bones held (0x597c4c).
-    let mut fx = carrying("ARM");
+/// [`carrying`] with the carry layer turning the head at `weight`, the
+/// head bone blending or not.
+fn carrying_head(weight: f32, blends: bool) -> Fixture {
+    let mut fx = carrying("HEAD");
     let animator = fx.world.animators.get_mut(&SIM).unwrap();
-    animator.carry.as_mut().unwrap().weight = F32::from_f32(0.5);
-    let fault = draw(fx).unwrap_err();
-    assert!(
-        matches!(&fault.trap, sims_vm::Trap::Unsupported(m) if m.contains("0x597c4c")),
-        "{fault}"
-    );
+    animator.carry.as_mut().unwrap().weight = F32::from_f32(weight);
+    let skeleton = fx.program.people.skeletons.get_mut(&SIM_GUID).unwrap();
+    skeleton.bones[1].blends = blends;
+    fx
+}
+
+#[test]
+fn a_layer_below_full_weight_blends_with_what_the_bones_held() {
+    // 0x598226 to 0x5985f9: at weight 0.5 the head's turn is half the
+    // carry layer's over the foreground's rest, neither of the two.
+    let full = draw(carrying_head(1.0, true)).unwrap();
+    let none = draw(without_carry(carrying("HEAD"))).unwrap();
+    let half = draw(carrying_head(0.5, true)).unwrap();
+    assert_ne!(half, full);
+    assert_ne!(half, none);
+    // A bone that does not blend (native bone +0x74) takes the layer's
+    // sample whatever its weight.
+    assert_eq!(draw(carrying_head(0.5, false)).unwrap(), full);
+    // Above 1 is whole.
+    assert_eq!(draw(carrying_head(2.0, true)).unwrap(), full);
 }
 
 #[test]
@@ -350,4 +364,43 @@ fn a_head_looking_at_an_object_aims_at_its_position_on_the_floor() {
     let target = fx.world.animators[&SIM].head.target.unwrap();
     assert_eq!(target.map(F32::to_f32), [60.0, 0.0, 30.0]);
     assert_eq!(target[1].to_bits(), 0, "positive zero");
+}
+
+#[test]
+fn a_head_looking_at_itself_aims_at_its_own_top_and_keeps_its_target_heading() {
+    // 0x59293d with 1 on its own animator: the target is the top anchor
+    // the heading is measured from, so the target's heading, from a
+    // difference of 0 and 0, stays as it was. The heading is measured as
+    // for any target.
+    let mut fx = anchored(Some("Top"));
+    fx.sim_mut().person.as_mut().unwrap().data[41] = SIM as i16;
+    let kept = F32::from_f32(1.25);
+    fx.world
+        .animators
+        .get_mut(&SIM)
+        .unwrap()
+        .head
+        .target_heading = kept;
+    let vm = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    vm.draw_frame(&mut fx.world, 1).unwrap();
+    let head = &fx.world.animators[&SIM].head;
+    assert_eq!(head.target_heading, kept);
+    assert_eq!(head.heading, heading(Some("Top")));
+    assert_ne!(head.target, Some([F32::from_f32(100.); 3]));
+    assert!(head.target.is_some());
+    // The person still looks at itself: its target word is kept.
+    assert_eq!(fx.sim().person.as_ref().unwrap().data[41], SIM as i16);
+}
+
+#[test]
+fn a_head_looking_at_itself_queued_for_removal_fails_loudly() {
+    let mut fx = anchored(Some("Top"));
+    fx.sim_mut().person.as_mut().unwrap().data[41] = SIM as i16;
+    fx.world.removals.push(SIM);
+    let fault = draw(fx).unwrap_err();
+    assert!(
+        matches!(&fault.trap, sims_vm::Trap::Unsupported(m)
+            if m.contains("looks at itself") && m.contains("0x58da12")),
+        "{fault}"
+    );
 }

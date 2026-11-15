@@ -2612,6 +2612,27 @@ mod tests {
         assert_eq!(a.destination, a.position);
     }
 
+    #[test]
+    fn a_stop_asked_of_a_route_under_way_is_kept_for_the_walks_next_step() {
+        let mut world = World::empty();
+        let mut a = sims_sim::animator::LOADED;
+        a.arrival = 1;
+        world.animators.insert(7, a.clone());
+        // Under way, the route does not stop, and the request is kept
+        // (+0x284).
+        assert_eq!(ask_stop(&mut world, 7), Ok(false));
+        assert!(world.stops_asked.contains(&7));
+        assert_eq!(world.animators[&7], a);
+        // Ended, it stops, and nothing is kept.
+        world.stops_asked.clear();
+        world.animators.get_mut(&7).unwrap().arrival = 2;
+        assert_eq!(ask_stop(&mut world, 7), Ok(true));
+        assert!(world.stops_asked.is_empty());
+        assert_eq!(world.animators[&7].arrival, 0);
+        // A person with no animator is an error.
+        assert!(matches!(ask_stop(&mut world, 8), Err(Trap::Invalid(_))));
+    }
+
     fn feet() -> Footfalls {
         Footfalls {
             first: F32::from_f32(0.25),
