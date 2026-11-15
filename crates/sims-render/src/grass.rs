@@ -29,6 +29,9 @@
 //!   zoom), starting at an offset from a random map the lot's size on a
 //!   side. A blade is one to four pixels tall and up to 30 shades either
 //!   side of 30 shades darker than the ground under it.
+//!   A floor grows none, but a floor split by a diagonal wall keeps the
+//!   count of the tile drawn before it (0x49d14b), the tiles taken in
+//!   the original's drawing order.
 //!
 //! The vertex jitter and the blade map both depend on the lot's size (52
 //! for the Goth house, not the arrays' 64): each draws from its stream
@@ -409,29 +412,49 @@ impl Grass {
         let zoom = camera.zoom.level();
         let mut blades = vec![(0, 0); N * N];
         let mut short = vec![false; N * N];
-        for x in 0..ARRAY_SIZE {
-            for y in 0..ARRAY_SIZE {
+        // The original works a tile's count out as it draws the tile, and
+        // keeps it from tile to tile (0x49d0da to 0x49d215). It draws the
+        // tiles in runs along the view's diagonals, x + y rising, x rising
+        // along each (0x4ad4bd, 0x4ad8ac), so that is the order here.
+        let inner = 1..lot.size as i32 - 1;
+        let mut carried = (0, false);
+        for k in 0..2 * ARRAY_SIZE - 1 {
+            for x in (k - (ARRAY_SIZE - 1)).max(0)..=k.min(ARRAY_SIZE - 1) {
+                let y = k - x;
                 let i = x as usize * N + y as usize;
                 let [lx, ly] = camera.unrotate_tile([x, y]);
-                let cell = Lot::cell(lx as usize, ly as usize);
-                // A floor grows none (0x49d109). The original also gives a
-                // pool tile none, and a floor tile a diagonal wall splits
-                // keeps the count of the tile drawn before it; here a split
-                // tile counts by its own grass and pools are not looked at.
-                let level = &lot.levels[0];
-                if level.floors[cell] != 0 && level.walls[cell].segments & 0x30 == 0 {
+                // A tile off the lot's inner tiles counts nothing and
+                // leaves the count as it was (0x49cecc).
+                if !inner.contains(&lx) || !inner.contains(&ly) {
                     continue;
                 }
-                let value = grass(x, y);
-                let count = if value >= DENSE {
-                    MOST
-                } else if value <= SPARSE {
-                    short[i] = true;
-                    FEWEST
+                let cell = Lot::cell(lx as usize, ly as usize);
+                // A floor grows none (0x49d109), but a floor tile a
+                // diagonal wall splits keeps the count of the tile drawn
+                // before it, whatever its own grass (0x49d14b). That is
+                // how its floorless half shows flat grass beside a porch
+                // and a lawn full of blades beside a lawn. The original
+                // also gives a pool tile none (0x47c16d); pools are not
+                // looked at here.
+                let level = &lot.levels[0];
+                let (count, sparse) = if level.floors[cell] == 0 {
+                    let value = grass(x, y);
+                    let (count, sparse) = if value >= DENSE {
+                        (MOST, false)
+                    } else if value <= SPARSE {
+                        (FEWEST, true)
+                    } else {
+                        let count = (MOST - FEWEST) * (value - SPARSE) / (DENSE - SPARSE) + FEWEST;
+                        (count, false)
+                    };
+                    (if zoom == 1 { count / 4 } else { count }, sparse)
+                } else if level.walls[cell].segments & 0x30 == 0 {
+                    (0, carried.1)
                 } else {
-                    (MOST - FEWEST) * (value - SPARSE) / (DENSE - SPARSE) + FEWEST
+                    carried
                 };
-                let count = if zoom == 1 { count / 4 } else { count };
+                carried = (count, sparse);
+                short[i] = sparse;
                 if count == 0 {
                     continue;
                 }
@@ -791,19 +814,48 @@ mod tests {
         let middle = Grass::new(&lot(64, 6), &camera(crate::Zoom::Near));
         assert_eq!(middle.blades[10 * N + 10].0, 850);
         // The random map is the lot's size on a side: on a smaller lot a
-        // tile past the first row reads another entry, and tiles off the
-        // lot grow none.
+        // tile reads the entry a tile of a larger lot reads elsewhere
+        // (entry 2 * 52 + 3 is 64 + 43), and tiles off the lot, or on its
+        // edge, grow none.
         let small = Grass::new(&lot(52, 100), &camera(crate::Zoom::Near));
-        assert_eq!(small.blades[0], near.blades[0]);
-        assert_eq!(small.blades[51], near.blades[51]);
-        assert_ne!(small.blades[N + 1], near.blades[N + 1]);
-        assert_eq!(small.blades[N + 1].1, near.blades[52 + 1].1);
+        assert_eq!(small.blades[2 * N + 3].1, near.blades[N + 43].1);
+        assert_ne!(small.blades[2 * N + 3], near.blades[2 * N + 3]);
         assert_eq!(small.blades[52 * N].0, 0);
+        assert_eq!(near.blades[0].0, 0);
+        assert_eq!(near.blades[63 * N + 10].0, 0);
         // A floor grows none.
         let mut floored = lot(64, 100);
         floored.levels[0].floors[Lot::cell(10, 10)] = 1;
         let floored = Grass::new(&floored, &camera(crate::Zoom::Near));
         assert_eq!(floored.blades[10 * N + 10].0, 0);
+    }
+
+    #[test]
+    fn a_split_floor_tile_keeps_the_count_of_the_tile_drawn_before_it() {
+        // Tile (10, 10) has a floor split by a diagonal wall. The tile
+        // drawn before it is (9, 11), on the same view diagonal.
+        let split = |before_floored: bool, grass: i8| {
+            let mut lot = lot(64, grass);
+            let level = &mut lot.levels[0];
+            level.floors[Lot::cell(10, 10)] = lot::SPLIT_FLOOR;
+            level.walls[Lot::cell(10, 10)].segments = lot::DESCENDING;
+            if before_floored {
+                level.floors[Lot::cell(9, 11)] = 1;
+            }
+            Grass::new(&lot, &camera(crate::Zoom::Near))
+        };
+        assert_eq!(split(false, 100).blades[10 * N + 10].0, 1200);
+        assert_eq!(split(false, -100).blades[10 * N + 10].0, 500);
+        assert!(split(false, -100).short[10 * N + 10]);
+        // Beside a floor it grows none, though its own grass is green.
+        assert_eq!(split(true, 100).blades[10 * N + 10].0, 0);
+        // A floor tile without a diagonal grows none either way.
+        let mut plain = lot(64, 100);
+        plain.levels[0].floors[Lot::cell(10, 10)] = 1;
+        assert_eq!(
+            Grass::new(&plain, &camera(crate::Zoom::Near)).blades[10 * N + 10].0,
+            0
+        );
     }
 
     #[test]
