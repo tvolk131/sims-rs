@@ -2221,13 +2221,19 @@ through their public interfaces only; the simulation never depends on it.
   speed (`0x442f9b`, presumably everyone away or asleep), it runs at
   1000 and keeps the speed to go back to in global 18. It goes back once
   someone holds it. The window follows: 1 ms a tick at 1000.
-- **Done in play mode: selecting a Sim.** A press on a portrait selects
-  that Sim (0x445449, between ticks): the Sim selected before is
-  deselected, the indicators move, and the panel and the pie menus
-  follow the new Sim. Deselecting refreshes the old Sim's animator
-  (0x58da12), which is not ported, so in strict mode (`Lot::select`)
-  switching Sims fails and changes nothing; play mode
-  (`Lot::select_play`) leaves the refresh out.
+- **Done: selecting a Sim.** A press on a portrait selects that Sim
+  (0x4cf9c4, 0x445449, between ticks), in strict mode as in play mode:
+  the Sim selected before is deselected and its animator refreshed at
+  the tick count (0x58da12 with 0, now ported), the indicators move,
+  and the panel, the queue and the pie menus follow the new Sim. A
+  second press on the selected Sim's portrait centres the view on her
+  (0x434ced; the original's slide is left out). Both play `UI_click`.
+  A Goth test switches to another Goth through the window and orders
+  her a snack from the fridge's pie: she takes it 52 ticks later, and
+  strict mode runs to tick 454. At tick 455 Mortimer, left to himself,
+  routes to a door one of his routes goes through (0x45b176), which is
+  not ported. No recording compares a switch yet; track 2 is asked for
+  one.
 - Done: a click picks what the frame shows at the pixel
   (`Canvas::id_at`, `sims_game::pick`): the person shown there or
   nearest within two pixels, else the object shown there. A tile of a

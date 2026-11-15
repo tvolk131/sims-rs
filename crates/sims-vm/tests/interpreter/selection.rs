@@ -163,7 +163,9 @@ fn deselecting_refreshes_the_animator_at_the_tick_count() {
 fn selecting_another_sim_deselects_the_first() {
     let mut fx = two_residents();
     let [first, second] = fx.world.indicators;
-    let ((), calls) = asking(&mut fx, |i, world| i.select(world, Some(PERSON + 1)).unwrap());
+    let ((), calls) = asking(&mut fx, |i, world| {
+        i.select(world, Some(PERSON + 1)).unwrap()
+    });
     // With nobody selected, both indicators are taken off the lot
     // (0x4468fd, 0x446be8), each twice as an indicator is: the first
     // leaves the Sim's slot, which tells the Sim. Then the new Sim is

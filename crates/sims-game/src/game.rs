@@ -1044,6 +1044,11 @@ mod tests {
     }
 
     #[test]
+    fn a_centred_person_is_raised_by_half_its_zooms_height() {
+        // trunc(2 sqrt 6 * 2.0 * 2^(zoom + 1)) / 2 for far, medium, near.
+        assert_eq!([1, 2, 3].map(super::person_rise), [19, 39, 78]);
+    }
+    #[test]
     fn an_error_says_what_failed_and_what_was_done() {
         let mut error = ScriptError {
             tick: 900,

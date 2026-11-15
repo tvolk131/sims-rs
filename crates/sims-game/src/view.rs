@@ -146,4 +146,16 @@ mod tests {
         v.resize([i32::MAX, 0]);
         assert_eq!(v.size, [SIZE_LIMIT, 1]);
     }
+
+    #[test]
+    fn centring_brings_a_screen_point_to_the_middle() {
+        let mut v = View::new([800, 600], [400, 400], 0);
+        let fine = v.camera.unproject_fine([100, 50]);
+        assert!(v.apply(Move::Centre([100, 50])));
+        assert_eq!(v.camera.unproject_fine([400, 300]), fine);
+        assert!(!v.apply(Move::Centre([400, 300])));
+        assert!(v.apply(Move::Floor(2)));
+        assert_eq!(v.camera.level, 2);
+        assert!(!v.apply(Move::Floor(5)));
+    }
 }
