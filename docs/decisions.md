@@ -47,6 +47,394 @@ sprites. That is only its fallback. Read from the code:
   which drops every kept thumbnail of a type with graphics, is 0 in our
   capture. No capture shows a queue icon.
 
+## 2026-11-15: Four types keep more saved attributes than their constructor allocates
+
+A house read used to fail when a saved object held more attributes than
+its constructor allocates (the larger of the definition's count and 8).
+UserData's houses 21, 53 and 58, and most of the template houses of
+UserData2 to 8, stopped there.
+
+The object read (vtable 0x7c, 0x4342ae) reads the saved count from house
+version 0x18. When the count is larger than the array and the read's
+third argument is set, it frees the array, allocates one of the saved
+length, zeroes it and reads the attributes into it (0x434345). Otherwise
+it reads them past the end of the array (0x43437b). The house read
+(0x43fe0a) sets that argument only for an object whose definition is one
+of four types (0x43df98, 0x43dfa3, 0x43dfae, 0x43dfb9, compared at
+0x4400a7):
+
+- 0x3C08965F, the `*Placeholder` object;
+- 0x7FD96B54;
+- 0x4A70DF92 and 0x7BEA0977, only when the configuration's expansions
+  byte (`[0x6e48bc]+0x66`) has Unleashed's bit (0x20). Without that bit
+  both slots hold the first type (0x43fe9d).
+
+The port takes the expansions from global 20, which the load sets from
+the same mask (0xff in every boot here). An object of any other type
+with too many attributes still fails loudly, and the message now names
+its type.
+
+**Unverified:** no capture holds a house with such an object.
+
+What the houses do now (`sims boot`, 1000 ticks, answers 3): no surveyed
+house stops at the attributes. Most stop at the household selection (no
+family). The community lots, UserData's houses 40 to 48, stop where
+Create New Object Instance mode 6 makes a person (0x44e60e).
+
+Reopen if a capture shows an object of another type with more saved
+attributes than its array holds.
+
+## 2026-11-15: The floor and wall pattern catalogs, and a house's maps renumbered through them
+
+A house saves its floor and wall patterns as IDs and maps each ID to a
+file and a number in that file. The load turns them into the keys of the
+game's pattern catalogs (0x4a0e3b, 0x4c5d35). Both catalogs are now built
+the way the original builds them at start-up (floors 0x4a01cb, walls
+0x4c512d; `sims_content::Surfaces`):
+
+- File 0 is the built-in `floors.iff` or `walls.iff`.
+- Then come the `.FLR` or `.WLL` files of each installed pack's
+  `WallsAndFloors/` (in edition-bit order), then
+  `ExpansionShared/WallsAndFloors/` (edition above 3), then
+  `GameData/Floors/` or `GameData/Walls/`. Each directory is listed in
+  its file-table order, going into each subdirectory where its name
+  falls (0x412699; the catalog scan asks for every directory, 0x412863).
+  A file is known by its file name alone, read in Windows-1252 as a
+  house's map names it, byte for byte: a leading byte-order mark is part
+  of the name, as the original's byte comparison sees it. The same holds
+  for the Windows-1252 text `sims-formats` reads through its shared
+  reader (a house's surface map and roofs, FAR member names, chunk
+  labels, field strings, tuning and career values): none is sniffed for
+  a byte-order mark. The language-aware string tables (`STR#`,
+  `strings::decode`) still go through the encoding's own decode, which
+  sniffs one; nothing on the catalogs' path reads them, and the
+  original's handling there is not checked.
+- A file's pattern count is a third of its `SPR2` (floors) or `SPR#`
+  (walls) chunks, and a file with none is left out.
+- Each pattern takes the next key from a free list seeded with
+  [30, 254] and [256, 65534] for floors, or [31, 247] and [256, 65534]
+  for walls. A key taken for a missing sprite is lost.
+
+**Verified** against the catalogs in the guest's memory on the Complete
+Collection: 209 floor and 273 wall files, the file at every place whose
+name the guest still held (150 of 208 floor files, 186 of 272 wall
+files), and every key (`crates/sims-content/tests/surfaces.rs`). The
+directory listing order on disk would only matter for two names sharing
+a file-table bucket, and none do in this install.
+
+The renumbering (`World::renumber_surfaces`):
+
+- **Lookup.** Each map group finds the first catalog file of its name
+  (any case), and each saved ID listed in the group takes that file's key
+  for its number. A missing pattern gives 0xffff, and a later group
+  overwrites an earlier one's ID unconditionally, as in the original.
+- **IDs left 0xffff.** An ID still at 0xffff would be matched to a
+  pattern by colour (0x4a0bbd). That is not ported and fails loudly
+  (`LoadError::SurfaceColour`).
+- **Unlisted IDs.** An ID no group lists becomes 1.
+- **Floors** are renumbered first: each floor cell, then the half floors
+  of a diagonal wall.
+- **Walls** come next. Each wall cell is read through the wall service
+  (0x4795c5) and written back (0x4797e2) with its neighbours, as
+  `legacy/crates/sims-vm/src/native_wall_io.rs` did. A write-back the
+  port does not know fails loudly (`LoadError::SurfaceRewrite`). The
+  wall vertex map that the put also refreshes (world +0x4c/+0x50,
+  0x479c58) is drawing state and is left out.
+
+**Unverified:** no capture holds a house whose maps have entries, so
+the renumbered cells are not yet compared with the original's. The Goth
+and Newbie houses' maps are empty and their pins are unchanged.
+
+What the houses do now (`sims boot`, 1000 ticks, no answers):
+
+- UserData2's houses 1 and 9 now get past the renumbering.
+  - House 1 stops at the household selection (no family).
+  - House 9 stops at the first frame: person 195's ROOT bone was last
+    turned by a layer that no longer plays (0x5992b3).
+- Of the 474 houses surveyed (UserData to UserData5 and 69 of
+  UserData6), none stops at the renumbering. 306 stop at an object with
+  more saved attributes than the 8 its constructor allocates.
+
+Reopen if a capture of a house with map entries renumbers a cell
+differently, or another install lists two pattern files in one bucket.
+
+## 2026-11-15: Objects cast the original's soft shadows on the floor under them
+
+At near zoom the most visible difference left was the shadow under
+plants, benches and other furniture, which the original darkens into the
+floor or grass after drawing each tile and before any object (its floor
+shadow pass, 0x4ae844 in the tile draw 0x4ad8ac). It is now ported in
+`crates/sims-render/src/shadows.rs`, from the code:
+
+- **One object a tile.** The first object of the tile's object grid cell
+  (lot arrays 3 and 103), or the next on the tile through slot 0, that is
+  not hidden, has no zero-extent flag (data word 8, value 4), is not of
+  type 2 or 9 and has a shadow (0x434e23).
+- **The shadow code** (0x4573e7). A one-tile object's is its OBJD word
+  57, -1 for none. A tile of a group builds one from which of its eight
+  neighbours in the group's grid (OBJD word 11) also have a shadow and
+  have OBJD word 56 at 0 (0x43ac5c); a code the masks cannot draw
+  becomes 0. It is turned by the object's facing and then the view's
+  rotation (the tables 0x53d2fc fills); code 16 never turns.
+- **The masks.** Codes 0 and 16 are hand-drawn, SPR2 0x300 and 0x310
+  (plus 0x20 a zoom) in `floors.iff`, read as palette indices. Every
+  other code's mask is worked out over floor 0's tile shape from four
+  curves, one a side, as the original's float code does it (0x4a3cd3,
+  0x4a3914, 0x4a3993).
+- **Drawing** (0x4b10c4). Mask byte plus strength (OBJD word 79, plus
+  255 less the tile's drawn light byte) gives a light level for the
+  pixel, which is drawn through the lighting's tables; 248 and up leaves
+  it alone. Only pixels at or behind the floor's ground depth change.
+
+**Checked** against the original's screenshots, with the world at their
+time. Near zoom rose from 86.3% to 87.6% exact (two other near cameras
+86.8% to 88.3% and 86.5% to 87.1%); far zoom at rotations 1 and 2 by
+0.1 to 0.2 points and medium zoom from 82.7% to 83.1%. Of the pixels the
+shadows changed, 6,359 of 7,149 now match exactly at near zoom (950 of
+1,186 at far rotation 1, 449 of 574 at rotation 2, 2,046 of 2,755 at
+medium); before, almost none did. The bench's two halves meet in one
+shadow, which checks the turning's sense.
+
+**Not ported:** the option that turns shadows off (the "shadows" cheat)
+and the drawing flags that allow them, taken as on; the faint shadow
+under an object the player is placing (0x438a48). The pass runs in the
+tile order of our floor loop, after all grass, where the original runs it
+tile by tile in its own order, so a later tile's grass blade can cover a
+shadow there and not here.
+
+**Seen, not yet read:** on a split tile whose other half has no floor,
+the original draws that half as flat grass (two tones, no blades); we
+draw the bladed grass. The dashed row along the porch's lower edge at
+near zoom is ours alone.
+
+## 2026-11-15: The plumb bob is the original's mesh, coloured and lit as the original does
+
+The selected person's plumb bob is now drawn (`sims_people::bob`, from
+`People::draw`). Everything below was read from the original's code in
+a memory image, except where it says otherwise.
+
+- **What it is.** An ordinary object (`PlumbBob.iff`, GUID 0x2F726FFF)
+  in the person's head slot (their container slot 2), with no sprites.
+  Its object string 200 names the skeleton `root` and the suit
+  `head-arrow,ROOT=white`. The suit's mesh, `xskin-head-arrow-ROOT-ARROW`,
+  is in `Animation.far`, 2.1 units long on its z axis. No
+  `root-skeleton.cmx.bcf` or `white.bmp` exists, so we make a one-bone
+  skeleton and draw the mesh white.
+- **Where.** The head slot's redraw (0x58dbd8 to 0x58dc03) gives the
+  bob's graphic the `HEAD` bone's position times the person's
+  placement, without the bone's own turn. The draw (0x585dc5) sets the
+  root bone at (0, 3, 0), turned by the original's Euler routine
+  (0x5c4bb0, run in an emulator to fix its order) a quarter turn about
+  x and the spin about z. So the bob stands upright from three units
+  over the head and spins about its length.
+- **Spin.** The game's clock in milliseconds (0x6e54e0) × 0.001 × π, or
+  half a turn a second. We have no such clock, so the game window passes
+  the time it has run (`People::set_clock`, from `Game::advance`). That
+  time runs on while the lot is paused or a dialog waits; whether the
+  original's clock does is **unverified**. While a bob is on the lot,
+  the window draws a new frame every 50 ms even when no tick runs (our
+  choice; the original's frame rate is not ported).
+- **Colour.** The suit's name sets a mode (`head-arrow` 1,
+  `head-arrow-date` 2, `head-star` 3, 0x5856db to 0x58579f). In mode 1,
+  m is the mood (motive 3 cut to an integer) × 0.012, held to −1..1.
+  - From 0 up, r = b = 1 − m and g = 1, with b lowered a further
+    0.4 − m below 0.4.
+  - Below 0, r = 1 and g = b = 1 − m², with b lowered a further m + 0.4
+    above −0.4.
+  - So the bob runs red, pale yellow, green.
+- **Light.** The colour is a light of intensity 1, and the ambient light
+  is a quarter of the colour plus 0.05. The light's vector is the house
+  camera's unit vector from its eye to the centre (+0x184, set at
+  0x49b2aa), turned 80° about y and then 30° about x (0x6f6b38). That
+  turn is in the lot's terms, so the light falls from another side at
+  each rotation of the view.
+
+**Taken from the screenshot, not read.** In the original's screenshot
+(medium zoom, 7:38 AM, Mortimer reading on the porch bench), the bob is
+brightest on the viewer's left and lit on its lower half. That is what
+we get by taking the vector as pointing towards the light. Taken the
+other way, the left side is dark. With that choice our bob's green
+pixels span the original's box (x 427 to 434, y 74 to 97), each edge
+within a pixel, as a gated test checks; the pixels inside the box are
+not compared one by one.
+
+**Unverified.**
+- Which bone the slot names (its +0x20); `HEAD` puts the bob where the
+  screenshot has it.
+- Rotations other than 0.
+- The bob's pixels name the person who holds it, for a click; what the
+  original does on a click there was not checked.
+
+**Not ported.** Modes 2 and 3, the date and star bobs.
+
+## 2026-11-15: A split floor tile's grass keeps the blades of the tile drawn before it
+
+The grass's blade count is now worked out tile by tile in the order the
+original draws the tiles, and carried from one to the next, as the
+original keeps it in the grass object between tiles (0x49d0da to
+0x49d215). The tiles are drawn in runs along the view's diagonals, x + y
+rising, and x rising along each run (0x4ad4bd calling 0x4ad8ac). A tile:
+
+- with no floor counts its blades by its grass value, as before;
+- with a floor and no diagonal wall counts none (0x49d155) and keeps the
+  previous tile's short-blade flag;
+- with a floor split by a diagonal wall (wall byte 0 & 0x30) keeps the
+  count and the flag of the tile drawn before it, whatever its own grass
+  (0x49d14b);
+- off the lot's inner tiles (1 to size − 2 in x and y) returns before
+  any of this and leaves the count as it was (0x49cecc); it draws no
+  blades here, as before.
+
+So the floorless half of a split tile beside a porch shows flat grass,
+and beside a lawn a full lawn. Before, it counted by its own grass.
+
+**Checked.** Against the original at the tick-570 world: near zoom (the
+porch view, origin 619, −1189) rose from 86.5% to 87.0% exact; of the
+2,402 pixels the change touches, 2,115 now match exactly (3 did before),
+and the mean channel error there fell from 21.1 to 4.6. Medium zoom
+(cutaway): 82.7% to 82.8%; of 771 pixels changed, 715 match (none did),
+error 16.6 to 0.3. At far zoom only a few pixels change: 8 at rotation
+1, all now exact (none were), and 9 at rotation 2, which match neither
+way. Tile (27, 28) on the Goth
+porch is one: the tile drawn before it, (26, 29), has a floor, so its
+empty half is flat in both.
+
+**Not ported.** The original clips each run to the screen before drawing
+it, so a tile off screen is not drawn and does not pass its count on;
+here every tile is in the order. A split tile at the screen's edge could
+take a count from a different tile. The pool test (0x47c16d), which
+gives a tile in a pool none, is still not looked at.
+
+## 2026-11-15: The relationship panel lists who the Sim knows
+
+The live panel's Relationships button now opens the selected Sim's
+relationships in the subpanel (`sims_ui::hud`, `Kind::Relation`), read
+from the exe; no screenshot of this panel was available.
+
+- **The list** (0x4e9deb): every neighbor record but the Sim's own that
+  the Sim has a relationship row toward, in slot order. A record stands
+  for its type: its GUID gives a person (0x4e9753), and the row asked
+  for is toward that person's record, the type's first (0x4ea192). So
+  a second record of the same type is listed with the first's row, and
+  not at all where only it has one. This is the original's behaviour,
+  kept, not a slip.
+  - The buttons filter it (0x51a7ea, 0x51a8c3): Family (4108) keeps the
+    people with the Sim's family word (person data 61), Friends (4109)
+    the mutual friends (value 0 at the friendship threshold or more
+    both ways), Everyone (4110, the default) all of them. The Superstar
+    button (4111) is drawn disabled, as without the expansion's flag.
+  - The order (0x4e9fad): the household first, then the people on the
+    lot, then by the day's relationship (row value 0), highest first.
+  - `Snapshot::with_relations(world, members, friendship)` fills it.
+    The host passes the friendship threshold from the tuning
+    (`autonomy_constants().friendship_threshold`): 50 in the original's
+    capture, though the exe's default is 25.
+- **The layout** (0x51db56), on the 279 by 100 subpanel: the four 20 by
+  20 buttons down the left at (3, 1), (2, 22), (2, 43) and (2, 64); the
+  entries 45 by 90 from (35, 18), 45 apart, five a page; the page arrows
+  (100 and 101, 9 by 49) at (24, 25) and (268, 25), each shown only
+  when there is a page that way. A page past the end shows the last
+  (0x51db4b).
+- **An entry** (0x52838f), font 7: the face is one of five in the
+  person's BMP_ 2003, by the lifetime relationship (value 2), centred
+  at the top; the day's number on a dark blue box two pixels over the
+  face's bottom; the day's bar 2 high and the lifetime's 4 high, 40
+  wide, a fifth of a pixel a point from -100, with the dark line
+  closing the filled part as the needs' meters have; the lifetime's
+  number; the smiley for friends and the red heart (value 3) or else
+  the pink one (value 1), 3 past the smiley's width whether the smiley
+  shows or not. The bars' green and red lean from the
+  panel's color by the lifetime relationship, through the original's
+  16-bit blend table (0x49a2fb, 0x49a60b), ported with its float
+  constants.
+- **Edges kept from the original** (Sol's review asked about them):
+  - The face is lifetime plus 100 over the strip's cell width (the
+    bitmap's width over 5), not over a fixed 40 points
+    (0x5283fa..0x528424). The install's cells are 40 wide, so the two
+    agree there.
+  - The dark line after a bar's filled part needs only two pixels left
+    on the right (0x5287e9). An empty bar (-100 to -96) gets it a pixel
+    left of the bar, where the needs' meters draw none.
+- **Unverified:**
+  - Font 6, which sets the buttons' and arrows' heights, is not in the
+    install; its height is taken as 0.
+  - Where the lifetime number's box starts (an instruction the copy
+    protection hides; under the lifetime bar is taken), and so the
+    icons' height.
+  - That the numbers are centred, in the labels' color.
+  - That an entry is lit (the purer green and red) when the pointer is
+    on it.
+  - Ties in the order go by the original's per-person UI index; the
+    record ID stands in.
+  - The original's check of who may be listed (0x423f30, and the
+    on-lot person words) and its Superstar filter are not ported; at
+    exactly 1024 wide it shows ten a page, not modelled.
+- **Reopen** when a screenshot of the panel is available, or the hidden
+  instructions are read from a clean image.
+
+## 2026-11-15: The job panel draws the skills and what the next level needs
+
+The live panel's Job button now opens the selected Sim's skills in the
+subpanel (`sims_ui::hud`, `Kind::Skills`), with the title "Job". The
+panel's left column (the career's icon and title, the salary, the
+performance and the friends needed) is not drawn yet.
+
+- **Which panel:** the exe has two job panels. The one at 0x52bb86 is
+  Superstar's fame panel (fame stars, fame.iff strings). The ordinary
+  one is built at 0x52f2ff and drawn at 0x5301ca; this is that one.
+- **Where the numbers come from** (read from the exe; no screenshot of
+  this panel was available):
+  - The title is font 11 at (35, 3) of the subpanel, through 0x51eaad,
+    in a western language.
+  - The skills are person data 10, 12, 11, 17, 18 and 15 (0x66dfec):
+    Cooking, Mechanical, Charisma, Body, Logic and Creativity.
+  - A skill's empty bar (4920) is at (157, 7), the next 15 below. The
+    full bar (4901) is cut to 4 pixels a point, and drawn whole at 10
+    points. A point is the data word over 100, clamped to 0 to 10. The
+    CJK languages use 4919 and 4900 and other places; they are not
+    ported.
+  - A skill's label is font 7 (0x6f2ae0), right-aligned in a 62 by 16
+    box at (93, 6), the next 15 below (0x6f4420). The font is now
+    loaded with the others.
+- **What the next level needs** (0x4ea823): the career is person data
+  56 and the level 57. The career is the `CARR` of `work.iff` with
+  that ID (0x404cb3). Value 1 to 6 of the level after the person's own
+  is the need for Cooking, Mechanical, Charisma, Body, Logic and
+  Creativity. It counts only where it is more than the person's skill.
+  - `household::Careers` reads the careers.
+  - `Snapshot::with_careers` fills in each resident's needs; a host
+    calls it after `Snapshot::read`. The game and the viewer load the
+    careers when they open and do (`sims_game::Game::snapshot` gives
+    what the panel is laid out from).
+  - A need is the career's whole 32-bit value, as 0x4ea883 returns it,
+    so a custom career past 32,767 still marks where it says.
+- **What a need draws** (0x530407), in the labels' color (0x6f2a94,
+  which is the needs labels' 0xc679):
+  - a line down the bar at the need's last pixel;
+  - a line along the bar's bottom row, from 16 left of the bar to it;
+  - the skill's label underlined. Every label is drawn; where there is
+    a need, 0x5e4c01 sets the label gadget's +0x170, which 0x5e3ef1
+    passes to the font as flag 4. The font's glyph drawing (0x60bf62)
+    then lines each character, from where it starts to a pixel past
+    its advance (glyph +0x18), in the text's color, on the row just
+    under an `A` (0x60b927: `A`'s y bearing plus its height), when that
+    row is inside the line. `Font::draw_underlined` does this.
+- **Unverified:** the labels' vertical place in their box (centred on
+  the font's line here) and the subpanel's x, as for the personality
+  panel.
+- **Tests:**
+  - a unit test checks the layout, presses passing through, and each
+    bar's fill and the need lines with stand-in art;
+  - the Goths' panel is pinned by digest, gated on `SIMS_INSTALL`. Nobody
+    has a skill, and Mortimer's next level (Science, "Lab Assistant")
+    needs none;
+  - a second digest moves Mortimer to "Field Researcher": the install's
+    "Science Teacher" then needs a point of Charisma and three of Logic;
+  - `sims-game`'s Goth test checks the same through the game's own
+    snapshot, so a host that skips the careers fails it.
+
+Reopen with a screenshot of the original's job panel.
+
 ## 2026-11-15: A person's base layer is drawn as the simulation keeps it
 
 `sims_people` now poses a person's base layer from the simulation's
@@ -4286,9 +4674,9 @@ control panel in the bottom-left corner.
   One depth model for floors and ground would settle it.
 - Grass on a pool, which the original leaves bare. Pools are not looked
   at.
-- A floor tile split by a diagonal wall. The original keeps the blade
-  count of whichever tile it drew before; here it counts by its own
-  grass.
+- A floor tile split by a diagonal wall. Now ported; see "A split floor
+  tile's grass keeps the blades of the tile drawn before it"
+  (2026-11-15).
 - Seasons, which swap the blade-height tables (0x6c629c, 0x6c62a8).
 - A flag at 0x8d that blanks the colors of tiles on the lot's edge. It
   is off in this capture and not modelled.

@@ -92,10 +92,14 @@ events, and what it asks for after them) come first.
   what the original reads for it is not ported.
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
-  read their arrays whole (Arry 11, 12, 111 and 112). UserData2's
-  houses 1 and 9 then stop at their floor and wall maps
-  (`World::renumber_surfaces`), and the houses with no family stop at
-  the household selection. The templates' `Patch` families are not
+  read their arrays whole (Arry 11, 12, 111 and 112). Their floor
+  and wall maps are renumbered through the game's pattern catalogs
+  (`sims_content::Surfaces`, `World::renumber_surfaces`). UserData2's
+  house 9 then stops at the first frame (a bone last turned by a layer
+  no longer playing, 0x5992b3), the houses with no family stop at the
+  household selection, and the community lots (UserData's houses 40 to
+  48) where Create New Object Instance mode 6 makes a person (0x44e60e).
+  Four types grow their attribute arrays to the saved count (0x4342ae). The templates' `Patch` families are not
   imported (see `docs/decisions.md`).
 
 ## Met goal: a headless lot boot that matches the original
@@ -161,7 +165,7 @@ That starting lot is **unverified**; see the decision log.
 | 4 | Clear the family global | `0x415eff` | Done (`World::clear_family`) |
 | 5 | Clear the lot: remove every object on it | `0x44279a`, `0x445f84`, `0x44123f`, `0x440eeb` | Done for objects that are off the lot (`Interpreter::clear`) |
 | 6a | Read the house's lot arrays | `0x478599` | Done for house versions 53 to 62 (`World::read_arrays`) |
-| 6b | Renumber the saved floor and wall IDs | `0x4a0e3b`, `0x4c5d35` | Done for a house whose maps are empty (`World::renumber_surfaces`) |
+| 6b | Renumber the saved floor and wall IDs | `0x4a0e3b`, `0x4c5d35` | Done but for a pattern matched by colour (0x4a0bbd) (`World::renumber_surfaces`, `sims_content::Surfaces`) |
 | 6c, 7 | Read the house's type table, marking the object types whose scripts changed since the save | `0x43dd76`, `0x43a516` | Done (`Interpreter::read_types`) |
 | 6d | Clear the lot again | `0x445f84`, `0x44279a` | Done (step 5) |
 | 6e | Construct the house's objects on the cleared lot and read their saved fields | `0x449c5e`, `0x43fe0a` | Done (`Interpreter::read_objects`); a person's graphics only as far as they draw random numbers |
@@ -1847,6 +1851,13 @@ Progress:
   the Goths' people alone over their lot every 120 ticks at four
   rotations and checks that something hides them at times, that their
   feet show in most views, and that nobody is hidden throughout.
+- Done: the plumb bob (`sims_people::bob`) over the person whose head
+  slot holds it: the original's `head-arrow` mesh, three units over the
+  head bone, spinning half a turn a second by a clock the app gives
+  (`People::set_clock`), coloured by the person's mood and lit by the
+  original's own light for it. A gated test checks it covers the pixels
+  the original's does in a screenshot, within a pixel. The date and star
+  bobs are not drawn, and only rotation 0 was compared.
 - Next: compare a person behind furniture with the original; a person on
   an upper level stands at the floor, without the original's offset.
   Match the original's lighting (see its decisions entry); compare
@@ -1963,9 +1974,18 @@ Progress:
   tables (grass takes none in the original). Far zoom at rotation 2
   rose from 90.1% to 90.3% exact; of the pixels they change, 70% now
   match exactly and the rest are mostly a step off.
-- Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
-  grass and a light sprite in the original); the
-  edge-on texel offset and side; a screenshot with a marked edge-on
+- Done: a floor tile split by a diagonal wall takes the blade count of
+  the tile drawn before it, as the original carries it from tile to
+  tile. Near zoom rose from 86.5% to 87.0% exact; of the 2,402 pixels it
+  changes, 2,115 now match.
+- Done: the soft shadows objects cast on the floor and grass under
+  them, as the original works them out and draws them. Near zoom rose
+  from 86.3% to 87.6% exact, and nine in ten of the pixels the shadows
+  change match the original exactly.
+- Next: flat grass on a split tile's empty half; the dashed row along
+  a floor's lower edge at near zoom; near-zoom fidelity below the bay's
+  left end (rows 436 to 520, grass and a light sprite in the original);
+  the edge-on texel offset and side; a screenshot with a marked edge-on
   diagonal; upper-level depth.
 
 ## Track: sound (`crates/sims-audio`)
@@ -2105,13 +2125,31 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   (0x51df31). The Goths' panel is pinned by digest, gated on
   `SIMS_INSTALL`; it is not yet compared with a screenshot, and the
   zodiac sign under the bars is not drawn.
+- **Done: the job panel's skills.** The Job button opens the selected
+  Sim's six skill bars, with the labels of what the next level of
+  their career needs underlined and a line marking how much (from
+  `work.iff`, through `Snapshot::with_careers`, which the game and the
+  viewer call), as the original's ordinary job panel draws them
+  (0x5301ca). The Goths' panel is pinned by digest, gated on
+  `SIMS_INSTALL`; it is not yet compared with a screenshot.
+- **Done: the relationship panel.** The Relationships button opens the
+  people the selected Sim knows, five a page with arrows, each with the
+  face for the lifetime relationship, the day's and the lifetime's
+  numbers and bars, and the friends and love icons, filtered by the
+  family, friends and everyone buttons, as the original lays them out
+  (0x51db56) and draws them (0x52838f). The host fills the list with
+  `Snapshot::with_relations`. The Goths' panel is pinned by digest,
+  gated on `SIMS_INSTALL`; it is not yet compared with a screenshot.
 - **Next:** open houses through `sims_vm::boot::Lot` (which now runs the
   household load) in the tests and the viewer, in place of their
   stand-in for steps 17 and 18; a screenshot of an open pie menu; a
   Yes/No dialog checked
   against the original (the "Help System" one at tick 2) for the layout
   of several buttons; text entry dialogs; the personality panel's
-  zodiac sign; the job and relationship panels; the other live panels.
+  zodiac sign; the job panel's left column (the career's icon and
+  title, the salary, the performance and the friends needed); the
+  relationship panel's Superstar filter and which people the original
+  leaves out; the other live panels.
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
   - A command intake, for example `World::apply(&mut self, command:
     sims_sim::Command) -> Result<(), CommandError>`, run between ticks,

@@ -14,7 +14,7 @@
 
 use crate::play::Play;
 use crate::{Answers, Callback, Interpreter, Program, Stream, TickError, Update};
-use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People};
+use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People, Surfaces};
 use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
@@ -471,8 +471,14 @@ impl Lot {
                 .version()
                 .ok_or("the house file has no HOUS 1 chunk, which holds its version")?;
             world.read_arrays(&file.arrays, version)?;
-            load.renumbered =
-                world.renumber_surfaces(file.floor_map.as_deref(), file.wall_map.as_deref())?;
+            // The floor and wall catalogs, which the original builds at
+            // start-up.
+            let surfaces = Surfaces::build(&install)?;
+            load.renumbered = world.renumber_surfaces(
+                file.floor_map.as_deref(),
+                file.wall_map.as_deref(),
+                &surfaces,
+            )?;
             // 6c and 7: the type table, which marks the types whose scripts
             // changed.
             if file.guid_table {

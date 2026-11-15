@@ -1164,7 +1164,11 @@ fn the_goth_house_arrays_are_read_and_nothing_is_renumbered() {
             assert_eq!(house.wall_map.as_deref(), Some(&[][..]));
             let before = world.arrays.clone();
             let changed = world
-                .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+                .renumber_surfaces(
+                    house.floor_map.as_deref(),
+                    house.wall_map.as_deref(),
+                    &Default::default(),
+                )
                 .unwrap();
             assert_eq!(changed, 0);
             assert_eq!(world.arrays, before);
@@ -1207,7 +1211,9 @@ fn the_goth_house_type_table_marks_the_changed_types() {
             world.clear_family().unwrap();
             interpreter.clear(world).unwrap();
             world.read_arrays(&house.arrays, 62).unwrap();
-            world.renumber_surfaces(Some(&[]), Some(&[])).unwrap();
+            world
+                .renumber_surfaces(Some(&[]), Some(&[]), &Default::default())
+                .unwrap();
             let before = world.clone();
             let changed = interpreter.read_types(world, &house.types).unwrap();
             assert_eq!((changed.len(), house.types.entries.len()), (77, 113));
@@ -1300,7 +1306,11 @@ fn the_goth_house_objects_are_constructed_and_read() {
             interpreter.clear(world).unwrap();
             world.read_arrays(&house.arrays, 62).unwrap();
             world
-                .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+                .renumber_surfaces(
+                    house.floor_map.as_deref(),
+                    house.wall_map.as_deref(),
+                    &Default::default(),
+                )
                 .unwrap();
             interpreter.read_types(world, &house.types).unwrap();
             assert_eq!(interpreter.clear(world), Ok(vec![]));
@@ -1372,7 +1382,11 @@ fn reading_the_people_raises_the_action_serial() {
             interpreter.clear(world).unwrap();
             world.read_arrays(&house.arrays, 62).unwrap();
             world
-                .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+                .renumber_surfaces(
+                    house.floor_map.as_deref(),
+                    house.wall_map.as_deref(),
+                    &Default::default(),
+                )
                 .unwrap();
             interpreter.read_types(world, &house.types).unwrap();
             interpreter.clear(world).unwrap();
@@ -1474,7 +1488,11 @@ fn the_goth_house_controllers_are_reconciled_and_the_grid_is_checked() {
             interpreter.clear(world).unwrap();
             world.read_arrays(&house.arrays, 62).unwrap();
             world
-                .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+                .renumber_surfaces(
+                    house.floor_map.as_deref(),
+                    house.wall_map.as_deref(),
+                    &Default::default(),
+                )
                 .unwrap();
             interpreter.read_types(world, &house.types).unwrap();
             interpreter.clear(world).unwrap();
@@ -1629,7 +1647,11 @@ fn the_goth_house_gets_its_rooms_and_its_household() {
         interpreter.clear(world).unwrap();
         world.read_arrays(&house.arrays, 62).unwrap();
         world
-            .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+            .renumber_surfaces(
+                house.floor_map.as_deref(),
+                house.wall_map.as_deref(),
+                &Default::default(),
+            )
             .unwrap();
         interpreter.read_types(world, &house.types).unwrap();
         interpreter.clear(world).unwrap();
@@ -1747,7 +1769,11 @@ fn selected(root: &std::path::Path, then: impl FnOnce(&Interpreter, &mut World, 
         interpreter.clear(world).unwrap();
         world.read_arrays(&house.arrays, 62).unwrap();
         world
-            .renumber_surfaces(house.floor_map.as_deref(), house.wall_map.as_deref())
+            .renumber_surfaces(
+                house.floor_map.as_deref(),
+                house.wall_map.as_deref(),
+                &Default::default(),
+            )
             .unwrap();
         interpreter.read_types(world, &house.types).unwrap();
         interpreter.clear(world).unwrap();

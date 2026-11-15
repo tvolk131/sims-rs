@@ -16,7 +16,7 @@ use sims_ui::art::Art;
 use sims_ui::command::{Command, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
-use sims_ui::household::{Faces, Snapshot};
+use sims_ui::household::{Careers, Faces, Snapshot};
 use sims_ui::hud::{self, Controls, Item};
 use sims_ui::pie;
 use sims_ui::queue::Queue;
@@ -44,6 +44,9 @@ pub struct Hud {
     thumbnails: Thumbnails,
     /// What could not be read while drawing, until the game takes it.
     problems: Vec<String>,
+    /// The careers of `work.iff`, for what the job panel shows the next
+    /// level needs.
+    careers: Careers,
     labels: Labels,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
@@ -98,11 +101,13 @@ impl Hud {
             .unwrap_or_default();
         let faces =
             Faces::load(assets.index(), assets.catalog(), &members).map_err(|e| e.to_string())?;
+        let careers = Careers::load(assets.index()).map_err(|e| e.to_string())?;
         Ok(Self {
             art,
             faces,
             thumbnails: Thumbnails::default(),
             problems: Vec::new(),
+            careers,
             labels,
             members,
             // The strip opens as if Live had been pressed.
@@ -145,6 +150,12 @@ impl Hud {
         .map(|m| (m, key));
     }
 
+    /// What the panel shows of `world`: the household with what the next
+    /// level of each one's career needs.
+    pub fn snapshot(&self, world: &World) -> Snapshot {
+        Snapshot::read(world, &self.members).with_careers(&self.careers)
+    }
+
     /// Draws the panel over the lot in `canvas`, from `world` as it is
     /// now, with the speed of `pace`, and `status` (a line across the
     /// top) if there is one; the dialog is the one [`Hud::read_dialog`]
@@ -173,7 +184,7 @@ impl Hud {
         };
         self.controls.speed = pace.speed;
         // The pause button shows global 17, which the game's pause sets.
-        let snapshot = Snapshot::read(world, &self.members);
+        let snapshot = self.snapshot(world);
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         self.queue = Queue::read(world, snapshot.selected);
         self.pressed.keep(&self.queue);
