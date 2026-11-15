@@ -28,12 +28,15 @@ drew between updates, not from the simulation.
   the default).
 - **The queue** (read from the code). `DDDSimsView::Draw()` (0x4d1b37)
   brings the control panel's action queue up to date (0x4d28df) before it
-  draws the house view. While the panel's mode word is 2, it lists the
+  draws the house view. In live mode (the panel's mode word is 2: the
+  mode switch, 0x4cea5d, logs "Entering Live Mode" for 2, and Build 0,
+  Buy 1, Camera 4, Options the rest), it lists the
   selected Sim's running action and then the queued ones, each whose icon
   object is set (0x4ea31c, 0x4ea203). Copying each into the list works out
   its name (0x4e87b7 → 0x41f167), which clears the action's flag 0x80 (the
-  flag set when an action is named). `Interpreter::draw_frame` now does
-  this first. Mortimer's action chosen in update 872 (routine 4170 on
+  flag set when an action is named). `Interpreter::draw_frame_in` now
+  does this first in live mode, and in no other (`PanelMode`);
+  `draw_frame`, which the window uses, is a live-mode frame. Mortimer's action chosen in update 872 (routine 4170 on
   object 263) has flags 0x9e; the recording has 0x1e from update 892,
   after the frame that follows 891.
 - **Verified**: with the schedule and the queue, the window's lot equals
@@ -72,8 +75,6 @@ drew between updates, not from the simulation.
 - **Unverified**:
   - The frames before update 171. The recording shows nothing that tells
     them apart; the test keeps the default's.
-  - Which mode the queue's mode word 2 is (taken as live mode, the only
-    mode in which the lot runs).
   - The writer of Mortimer's data word 50 in update 622 (cleared before
     each check and set by check trees, `autonomy::data::CHECKED`). His own
     frames do not move then, and the running action's flags keep no 0x10,
