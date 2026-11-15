@@ -22,6 +22,11 @@
 //!   instance list if it has none (0x445857), and each of the first
 //!   instance's first six attributes becomes the larger of itself and the
 //!   family's word.
+//! - 15: the running object, which must be a person (else the original's
+//!   cast throws, error 0x1c), copies temp 0 (object +0x3a) into person
+//!   data word 72 and clears word 73 (0x44fe72 to 0x44fe7d). When temp 0
+//!   is 0 its footprint is then worked out again where it stands
+//!   (0x433d16, through 0x43519f), with word 73 already clear.
 
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
@@ -58,6 +63,10 @@ impl Machine<'_, '_> {
                 }
                 Ok(true)
             }
+            15 => {
+                self.copy_temp_to_person()?;
+                Ok(true)
+            }
             43 => {
                 self.restore_magic_history();
                 Ok(true)
@@ -66,6 +75,51 @@ impl Machine<'_, '_> {
                 "Generic Sims Call routine {routine}"
             ))),
         }
+    }
+}
+
+/// Person data words routine 15 sets (person +0x61c, +0x61e).
+const COPIED: usize = 72;
+const CLEARED: usize = 73;
+
+impl Machine<'_, '_> {
+    /// Routine 15 (0x44fe3c). The footprint is worked out before anything
+    /// changes, from the person's data words as they will be, so that a
+    /// footprint that is not ported leaves the person as it was.
+    fn copy_temp_to_person(&mut self) -> Result<(), Trap> {
+        let me = self.me;
+        let object = self.me()?;
+        let temp = *object
+            .temps
+            .first()
+            .ok_or_else(|| Trap::Invalid("object has no temps".into()))?;
+        let mut data = object
+            .person
+            .as_ref()
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .data
+            .clone();
+        for (word, value) in [(COPIED, temp), (CLEARED, 0)] {
+            *data
+                .get_mut(word)
+                .ok_or_else(|| Trap::Invalid(format!("a person has no data word {word}")))? = value;
+        }
+        let footprint = if temp == 0 {
+            Some(
+                self.interpreter()
+                    .standing_footprint(self.world, me, Some(&data))?,
+            )
+        } else {
+            None
+        };
+        let object = self.me_mut()?;
+        if let Some(footprint) = footprint {
+            object.footprint = footprint;
+        }
+        if let Some(person) = object.person.as_mut() {
+            person.data = data;
+        }
+        Ok(())
     }
 }
 
