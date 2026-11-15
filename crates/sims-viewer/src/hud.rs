@@ -18,13 +18,16 @@ use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_ui::command::{Camera, Command, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::Frame;
-use sims_ui::household::{Faces, Snapshot};
+use sims_ui::household::{Careers, Faces, Snapshot};
 use sims_ui::hud::{self, Controls, Item};
 use std::path::Path;
 
 pub struct Hud {
     art: sims_ui::art::Art,
     faces: Faces,
+    /// The careers of `work.iff`, for what the job panel shows the next
+    /// level needs.
+    careers: Careers,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
     pub controls: Controls,
@@ -79,9 +82,11 @@ impl Hud {
             .unwrap_or_default();
         let faces =
             Faces::load(assets.index(), assets.catalog(), &members).map_err(|e| e.to_string())?;
+        let careers = Careers::load(assets.index()).map_err(|e| e.to_string())?;
         Ok(Self {
             art,
             faces,
+            careers,
             members,
             // The strip opens as if Live had been pressed.
             controls: Controls {
@@ -108,7 +113,7 @@ impl Hud {
             zoom_in: camera.zoom != Zoom::Near,
             zoom_out: camera.zoom != Zoom::Far,
         };
-        let snapshot = Snapshot::read(world, &self.members);
+        let snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         let (width, height) = (
             u32::try_from(canvas.width).unwrap_or(u32::MAX),

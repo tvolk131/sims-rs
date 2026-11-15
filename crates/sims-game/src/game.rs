@@ -650,6 +650,12 @@ impl Game {
         self.hud.items()
     }
 
+    /// What the control panel shows of `world`: [`Game::render`] lays
+    /// the panel out from this for the lot's world.
+    pub fn snapshot(&self, world: &sims_sim::World) -> sims_ui::household::Snapshot {
+        self.hud.snapshot(world)
+    }
+
     /// The first name the panel shows for people of type `guid`.
     pub fn name(&self, guid: u32) -> Option<&str> {
         self.hud.name(guid)

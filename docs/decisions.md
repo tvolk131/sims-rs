@@ -102,15 +102,22 @@ performance and the friends needed) is not drawn yet.
   Creativity. It counts only where it is more than the person's skill.
   - `household::Careers` reads the careers.
   - `Snapshot::with_careers` fills in each resident's needs; a host
-    calls it after `Snapshot::read`.
+    calls it after `Snapshot::read`. The game and the viewer load the
+    careers when they open and do (`sims_game::Game::snapshot` gives
+    what the panel is laid out from).
+  - A need is the career's whole 32-bit value, as 0x4ea883 returns it,
+    so a custom career past 32,767 still marks where it says.
 - **What a need draws** (0x530407), in the labels' color (0x6f2a94,
   which is the needs labels' 0xc679):
   - a line down the bar at the need's last pixel;
-  - a line along the bar's bottom row, from 16 left of the bar to it.
-  - The original shows a skill's label only where there is a need
-    (0x5e4c01 on the label gadget). Here a label without a need is not
-    drawn. **Unverified:** whether the original hides it or draws it
-    disabled.
+  - a line along the bar's bottom row, from 16 left of the bar to it;
+  - the skill's label underlined. Every label is drawn; where there is
+    a need, 0x5e4c01 sets the label gadget's +0x170, which 0x5e3ef1
+    passes to the font as flag 4. The font's glyph drawing (0x60bf62)
+    then lines each character, from where it starts to a pixel past
+    its advance (glyph +0x18), in the text's color, on the row just
+    under an `A` (0x60b927: `A`'s y bearing plus its height), when that
+    row is inside the line. `Font::draw_underlined` does this.
 - **Unverified:** the labels' vertical place in their box (centred on
   the font's line here) and the subpanel's x, as for the personality
   panel.
@@ -121,9 +128,46 @@ performance and the friends needed) is not drawn yet.
     has a skill, and Mortimer's next level (Science, "Lab Assistant")
     needs none;
   - a second digest moves Mortimer to "Field Researcher": the install's
-    "Science Teacher" then needs a point of Charisma and three of Logic.
+    "Science Teacher" then needs a point of Charisma and three of Logic;
+  - `sims-game`'s Goth test checks the same through the game's own
+    snapshot, so a host that skips the careers fails it.
 
 Reopen with a screenshot of the original's job panel.
+
+## 2026-11-15: A person's base layer is drawn as the simulation keeps it
+
+`sims_people` now poses a person's base layer from the simulation's
+playback of it (`World::base_layers`, the layer in the animator's base
+slot): its clip, its phase, its end mode and its weight. Before, the
+simulation did not keep the layer, so the drawing stood in with the
+saved person record's base clip (the standing loop, for each Goth)
+repeating at the animator's clock, or a script's clip from when it
+started. A seated person was posed on the standing loop under the
+foreground clip.
+
+Sampled every 50 ticks over the Goths' first 3,400 ticks (strict mode),
+a person sits in 94 of 226 samples; the base clip is `a2o-sit-loop`
+there, and `a2o-standing-loop` or `c2o-standing-loop` otherwise. The
+child sits on the adult's sit loop too: that is the clip the posture's
+tables name for him (`posture_clip`), which the drawing takes as it is.
+In every one of those samples a foreground clip plays at full weight,
+and those clips move every bone, so the drawn day hardly changes: at
+ticks 500, 1100, 1300, 2900 and 3050 (medium zoom, the porch and the
+living room) the people are the same pixel for pixel. The change counts
+where a foreground clip is partial, fading or absent, and it removes a
+stand-in.
+
+**Checked** only in part. Against the original at medium zoom (Mortimer
+and Alexander reading on the porch bench at 7:38), both sit as the
+original's do, but they did before too: the reading clip drives every
+bone. No screenshot of the original yet shows a seated person whose
+foreground leaves bones to the base layer. The original's people are
+drawn lighter than ours, and it shows the plumb bob over the selected
+Sim, which is not drawn here; neither is about the base layer.
+
+A caller that has no layers for a person (passes None) gets the
+stand-in as before. A state kept before the simulation held the layer
+(encodings before format 25) is refused when loaded, not migrated.
 
 ## 2026-11-15: The personality panel draws its bars as the original's bar maker lays them out
 

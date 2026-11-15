@@ -1850,9 +1850,13 @@ Progress:
 - Next: compare a person behind furniture with the original; a person on
   an upper level stands at the floor, without the original's offset.
   Match the original's lighting (see its decisions entry); compare
-  Mortimer standing without his book. The base layer's clip and phase
-  are not simulation state yet, so the saved record and the animator's
-  clock stand in.
+  Mortimer standing without his book. The plumb bob over the selected
+  Sim (the head slot's object) is not drawn.
+- Done: a person's base layer is the simulation's (`World::base_layers`):
+  the posture's loop or a script's clip, at the phase the simulation
+  advanced it to. Over the Goths' first 3,400 ticks a person is seated
+  in 94 of 226 samples, which before were posed on the standing loop;
+  a full-weight foreground clip hides the difference in all of them.
 
 ## Track: lot rendering (`crates/sims-render`)
 
@@ -2102,10 +2106,11 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   `SIMS_INSTALL`; it is not yet compared with a screenshot, and the
   zodiac sign under the bars is not drawn.
 - **Done: the job panel's skills.** The Job button opens the selected
-  Sim's six skill bars, with a line marking what the next level of
-  their career needs (from `work.iff`, through
-  `Snapshot::with_careers`), as the original's ordinary job panel draws
-  them (0x5301ca). The Goths' panel is pinned by digest, gated on
+  Sim's six skill bars, with the labels of what the next level of
+  their career needs underlined and a line marking how much (from
+  `work.iff`, through `Snapshot::with_careers`, which the game and the
+  viewer call), as the original's ordinary job panel draws them
+  (0x5301ca). The Goths' panel is pinned by digest, gated on
   `SIMS_INSTALL`; it is not yet compared with a screenshot.
 - **Done: the relationship panel.** The Relationships button opens the
   people the selected Sim knows, five a page with arrows, each with the

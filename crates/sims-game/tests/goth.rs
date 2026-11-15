@@ -1198,3 +1198,34 @@ fn the_pie_shows_the_selected_goths_head() {
     assert_eq!(head.rgba[3], 0);
     assert!(game.problems().is_empty(), "{:?}", game.problems());
 }
+
+#[test]
+fn the_job_panel_shows_what_the_next_level_needs() {
+    let Some(install) = install() else {
+        return;
+    };
+    let game = Game::open(&options(install)).expect("the Goth house opens");
+    let mut world = game.lot().world().clone();
+    let mortimer = world.selected().expect("a Sim is selected");
+    let needs = |world: &sims_sim::World| {
+        game.snapshot(world)
+            .resident(mortimer)
+            .expect("Mortimer lives here")
+            .needs
+    };
+    // A Science "Test Subject" moves on to a level that needs nothing.
+    assert_eq!(needs(&world), [0; 6]);
+    // A "Field Researcher" with two points of Logic: "Science Teacher"
+    // needs one of Charisma and three of Logic (work.iff).
+    let data = &mut world
+        .objects
+        .get_mut(&mortimer)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data;
+    data[57] = 2;
+    data[18] = 200;
+    assert_eq!(needs(&world), [0, 0, 100, 0, 300, 0]);
+}
