@@ -61,6 +61,12 @@ pub struct Options {
     /// after its error and goes on, instead of strict mode ([`Lot::step`]),
     /// which stops the lot at the first error.
     pub play: bool,
+    /// After which ticks the house view's frame is drawn, as far as it
+    /// writes the simulation's state (`sims_vm::frame`). When the
+    /// original draws one is up to its main loop, not the simulation; the
+    /// default is the schedule of the captures of the Goth house without
+    /// input. A replay of a recording takes the recording's.
+    pub frames: Frames,
 }
 
 /// What the host should do after an input.
@@ -126,8 +132,13 @@ impl Game {
     pub fn open(options: &Options) -> Result<Self, String> {
         let house = &options.house;
         let opened = open_house(&options.install, house).map_err(|e| e.to_string())?;
-        let mut lot = Lot::load(&options.install, house, &options.answers, Frames::default())
-            .map_err(|e| format!("{}: {e}", house.display()))?;
+        let mut lot = Lot::load(
+            &options.install,
+            house,
+            &options.answers,
+            options.frames.clone(),
+        )
+        .map_err(|e| format!("{}: {e}", house.display()))?;
         // The player answers a dialog when it is shown.
         lot.wait_for_answers();
         let stopped = lot

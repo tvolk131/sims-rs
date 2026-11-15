@@ -2,7 +2,7 @@
 //! interpreter. Each returns which branch to take. A primitive with no
 //! implementation fails with [`Trap::Unimplemented`], which names it.
 
-mod action_string;
+pub(crate) mod action_string;
 mod animate;
 mod budget;
 mod change_suit;

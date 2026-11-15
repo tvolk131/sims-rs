@@ -57,6 +57,7 @@ use crate::autonomy::{attenuation, find, person};
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Machine;
 use crate::placement::{Place, on_lot};
+use crate::primitives::action_string::NAMED;
 use crate::routing::slot::{direction, new_context};
 use sims_core::{Ext, F32};
 use sims_formats::saved_objects::Interaction;
@@ -81,10 +82,8 @@ const TO_FRONT: u32 = 2;
 /// How many actions a person's queue holds (+0x820, 0x45f744).
 const QUEUE: usize = 8;
 /// The action flag that gives an action put at the front the running
-/// action's name (0x45d322), and the running action's flag that 0x41f167
-/// clears (0x41f1a4).
+/// action's name (0x45d322).
 const NAME_FROM_RUNNING: u32 = 0x40;
-const NAMED: u32 = 0x80;
 /// The function an object runs when an action on it is cancelled.
 const CANCELLED: usize = 4;
 

@@ -606,28 +606,28 @@ const TICK_2881_24: &str = "cdd5b72c0ed8481f4db525817d1145f5445b6d2562c2ea4abfbf
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 3432
 /// --answers 3` gives this hash.
-const TICK_3432: &str = "59dc53999c14e69ba5e83f556ff1135c75c60baa92b4701d844a5879ce983acc";
+const TICK_3432: &str = "a7ae7852f9dd2bed313fa52d2e009ad982d9319671283a255d3058a0ba1e7b34";
 /// The same state's hash under snapshot format 26.
-const TICK_3432_26: &str = "359095d7d0e8a141ac07a3662a3aec4de888d755c663754aa624e057a6596f5b";
+const TICK_3432_26: &str = "aae456183509cb39ac4d4d8ea2344447d6576ce5fb78b3abb306521910a89a2e";
 /// The same state's hash under snapshot format 25.
-const TICK_3432_25: &str = "fbb3d6685e20066970fce710ca97e397b921bad0384876d05a6bcb530a62d9a9";
+const TICK_3432_25: &str = "07f6cf0f77bf97ba83dadd9c7e3edae0e49f0b68c1cfa71f776a12e34bafb2c8";
 /// The same state's hash under snapshot format 24.
-const TICK_3432_24: &str = "c8d4fccd905caec7a03bb6d2872d83ba0ce462ffbc6c3e0bc1432034dade3f9a";
+const TICK_3432_24: &str = "2f6a3e0a511139e9aa60dc6608781532c711b6dd81fded9494299cbe77ca9e19";
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 3602
 /// --answers 3` gives this hash.
-const TICK_3602: &str = "d20b5848afafab4f927b77f6762af0e2152e7a90c61325a807398c77868a1741";
+const TICK_3602: &str = "37d883099817ec1245a6fa846f32c9a9c41162b84ae22bab0cc78884412a2545";
 /// The same state's hash under snapshot format 26.
-const TICK_3602_26: &str = "07ce1fc95d4c26d2b5466524759ddaa0d9cf6fbcde3c631c9b60e907c8bbe6a0";
-const TICK_3603: &str = "95156650bf0372faec254d37e4002e3c7341a67a71fbbd82254fbc28baa9b2e9";
+const TICK_3602_26: &str = "d8f8996e6f704201e3fa70293833c4cf1b9e2f9f5217c48ce2150dee653943f4";
+const TICK_3603: &str = "4437c349eb19d67049a4677efbba1a7e2996de10a78c6cc3a0ca76ee6a8b8506";
 /// The same state's hash under snapshot format 26.
-const TICK_3603_26: &str = "82ff7567a2b43e03b5be77f7f547b8e8859c74657edecb66ce65514b42e144db";
-const TICK_3912: &str = "0045276c46ed63146dac1d55f0042b964bfb169fb1f0e26e5987f6b3c760e11c";
+const TICK_3603_26: &str = "5b35e77976b10510d000990b6898a758029bbbe0ce176fccfec9aa90ef8d23d3";
+const TICK_3912: &str = "bf8537130628fae3d3557c87d3b53e50a1c3574c2f56a3068b67b38265948bc3";
 /// The same state's hash under snapshot format 26.
-const TICK_3912_26: &str = "41652f2fbb6dad9eec17b3fcb49d4546da8f2fa6b4bab1957cd831491f6cc285";
+const TICK_3912_26: &str = "4bc0bc671978c8ccf79abc8e6acdcc177d85a3e49577ccfcb738b9b54c4df2f0";
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 9906
 /// --answers 3` gives this hash, the last tick strict mode reaches.
-const TICK_9906: &str = "c8240fc703c03716105cd4d2e554ef225259aac9799c8d3e91de604f25cee599";
+const TICK_9906: &str = "f745dc46550f483711e0f904cce6197a91cf2c8c7beb95f0cafeceae5ebdec06";
 
 #[test]
 fn strict_mode_runs_to_tick_9906_past_noon() {

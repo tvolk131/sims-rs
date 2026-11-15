@@ -194,6 +194,7 @@ fn options() -> Result<(Options, Option<Still>, bool), String> {
             house,
             answers,
             play,
+            frames: sims_game::Frames::default(),
         },
         still,
         mute,

@@ -1,8 +1,27 @@
 //! What drawing a frame of the house view does to the simulation's state.
 //!
-//! Between two lot updates the game may draw the lot. The house view's
-//! draw (vtable function 0x3c, 0x4a8935, from `DDDSimsView::Draw()`,
-//! 0x4d1b37) first counts the rooms that wait (0x4a8895 at 0x4a8b03,
+//! Between two lot updates the game may draw the lot. `DDDSimsView::Draw()`
+//! (0x4d1b37) first brings the action queue on the control panel up to
+//! date (0x4d28df, at 0x4d1b8e), then draws the house view.
+//!
+//! The queue (0x4d28df), while the panel's mode (word +8 of the object at
+//! +0x11c) is 2, lists the selected Sim's actions again (0x4ea31c on
+//! 0x4e986d's Sim): the running action, then each queued one in order,
+//! each only if its icon object is set (0x4ea203; for an icon that is not
+//! a person 0x45728d must also find the type's lead definition, which
+//! 0x43ae0a always does for an object on the lot). Each action listed is
+//! copied into the list (0x4eb1a2, 0x4e87b7), and the copy works out its
+//! name (0x41f167), which clears the action's flag 0x80 ([`NAMED`], set
+//! when Add/Change Action String or a put-at-the-front names it). The
+//! name itself and the queue's pictures are presentation. Which mode 2
+//! is, is **unverified**; it is taken to be live mode, the only mode in
+//! which the lot runs, so the queue is brought up to date at every frame.
+//! In the recording of a snack order, Mortimer's running action from the
+//! fridge keeps flag 0x80 from update 872, when he took it, to the frame
+//! after update 891.
+//!
+//! The house view's draw (vtable function 0x3c, 0x4a8935) then counts the
+//! rooms that wait (0x4a8895 at 0x4a8b03,
 //! which calls 0x467094; [`Interpreter::update_pending_rooms`]). Every
 //! path through the draw reaches that call. The rest of 0x4a8895 updates
 //! the view's levels and its graphics, which is presentation. The draw
@@ -69,6 +88,7 @@ use crate::animator::place;
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
 use crate::people::read_appearance_if_stale;
+use crate::primitives::action_string::NAMED;
 use sims_core::F32;
 use sims_sim::World;
 use sims_sim::animator::{EPSILON, LOADED, UNSET};
@@ -92,6 +112,7 @@ impl Interpreter<'_> {
     /// animator drawn. `level` is the level the view shows (1 for the
     /// ground).
     pub fn draw_frame(&self, world: &mut World, level: i8) -> Result<(), Fault> {
+        list_queue(world);
         self.update_pending_rooms(world)?;
         let people: Vec<u16> = world
             .order
@@ -196,5 +217,23 @@ impl Interpreter<'_> {
         self.look(world, id, &mut a)?;
         world.animators.insert(id, a);
         Ok(())
+    }
+}
+
+/// The control panel's action queue listing the selected Sim's actions
+/// again (0x4d28df, the module documentation): each action it lists, the
+/// running one and the queued ones whose icon object is set, has its flag
+/// [`NAMED`] cleared.
+fn list_queue(world: &mut World) {
+    let Some(sim) = world.selected() else {
+        return;
+    };
+    let Some(person) = world.objects.get_mut(&sim).and_then(|o| o.person.as_mut()) else {
+        return;
+    };
+    for action in std::iter::once(&mut person.active).chain(person.queue.iter_mut()) {
+        if action.icon != 0 {
+            action.flags &= !NAMED;
+        }
     }
 }
