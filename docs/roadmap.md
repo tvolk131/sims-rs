@@ -56,22 +56,26 @@ events, and what it asks for after them) come first.
   (#131), the pie menu and picking from it (#132), and Go To Routing
   Slot's parameter and global slots (#134), which a player's snack order
   reached.
-- Strict mode on the Goth house runs to tick 2881, 08:06 on the first
+- Strict mode on the Goth house runs to tick 3432, 08:25 on the first
   day. One tick is two game seconds, so a day is 43,200 ticks (measured
   from the clock globals). The carpool makes the school bus at tick 2703
-  (the multi-tile factory is ported). At tick 2882 person 16's pose
-  without a foreground layer (0x5992b3) is not ported. Step 2 continues
-  from there.
+  (the multi-tile factory is ported). The base layer is kept and the
+  pose composed from it, and a person may take itself off the lot in
+  its own tick. At tick 3433, Snap of a multi-tile object that does not
+  fit (object 334; the collided object of 0x454e82) is not ported. Step
+  2 continues from there.
 - Of the base neighborhood's houses only the Goths' and the Newbies'
   (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
-  tick 562, with no recording to compare yet; at tick 563 a head's pose
-  blends a base clip under the foreground (0x5992b3), which is not
-  ported.
+  tick 1472, with no recording to compare yet; at tick 1473 object 105
+  gives up a route and needs the route-failure feedback tree (0x45af2a),
+  which is not ported.
 - The houses of UserData2 to 8 get past the neighborhood: the reload
   makes the records their template files lack. The version-63 houses
-  stop at the arrays, and the version-62 ones have no family. The
-  templates' `Patch` families are not imported (see
-  `docs/decisions.md`).
+  read their arrays whole (Arry 11, 12, 111 and 112). UserData2's
+  houses 1 and 9 then stop at their floor and wall maps
+  (`World::renumber_surfaces`), and the houses with no family stop at
+  the household selection. The templates' `Patch` families are not
+  imported (see `docs/decisions.md`).
 
 ## Met goal: a headless lot boot that matches the original
 
@@ -1919,8 +1923,19 @@ Progress:
   shows the side facing view (−1, 1) (0x53f6c1, 0x53d93a); ours shows
   the same lot side at every rotation. The one column where the wall
   shows matches neither side until its texel offset is read.
+- Done: which object or person drew each pixel, for clicks:
+  `Canvas::id_at` after `sims_render::draw` and `People::draw_on_lot`.
+  Objects name themselves, people their object ID, and terrain, floors
+  and walls nobody. The game window can pick by it instead of by tile.
+  How the original finds what a click hit is not read.
+- Done: the pools of light lit lamps throw on the floor, from the
+  game's `lightMap.dat`, and lit lamps drawn in full light, as the
+  original does. With the world at the screenshots' time, near zoom
+  rose from 85.2% to 86.1% exact and far zoom at rotation 2 from 89.9%
+  to 90.1%. Pools on walls (the file's wall tables) are read in part,
+  not ported.
 - Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
-  grass and a light sprite in the original); window light; the
+  grass and a light sprite in the original); lamp pools on walls; the
   edge-on texel offset and side; a screenshot with a marked edge-on
   diagonal; upper-level depth.
 
@@ -1966,14 +1981,16 @@ stop-sounds events.
   value the ambience's row follows is ported (`ambience::view`, from
   0x570c3e: the share of the screen's tiles that are outdoors, read
   through `World::outside`), and the hour is the clock's.
+- **Done: pause and unpause** (21 and 22): the sounds playing are held
+  where they are, but for the interface's and the main music's, and the
+  live ambience stops picking cells.
 - **Done: what scripts ask about an object.** `getsrcdatafield` gets the
   original's answers (0x570e61: a person's voice, age, skills,
   personality and motive 3, the hour, the size of the object's room),
   read from the lot between ticks (`sims_game::sound::sources`).
 - **Next:**
-  - Positions for 3D sound, pause and unpause (21 and 22; 103 and 104
-    are debug commands), the piano (43) and the music half of the music
-    modes (36).
+  - Positions for 3D sound, the piano (43) and the music half of the
+    music modes (36). 103 and 104 are debug commands.
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)
@@ -2090,8 +2107,8 @@ through their public interfaces only; the simulation never depends on it.
   play mode does not catch stops it. In play mode the Goths' house runs
   12,000 ticks (ten minutes at normal speed) without stopping, through
   about a dozen different caught errors; in strict mode it stops after
-  tick 2881 (at tick 2882 a person's pose without a foreground layer,
-  0x5992b3, is not ported).
+  tick 3432 (at tick 3433 a multi-tile Snap that does not fit, 0x454e82,
+  is not ported).
   `--png <file>
   --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
@@ -2130,9 +2147,9 @@ through their public interfaces only; the simulation never depends on it.
   his hunger goes from 94.5 to 100.0 (tick 936); at 1088 the snack goes
   off the lot and at 1136 it is deleted, and he is free again. He goes
   on to other things (object 71 at tick 1497, object 132 at 2292).
-  Since #156 strict mode runs the order through step 3400 and stops at
-  step 3401 (person 16 routes for an action that wants to be
-  interrupted, 0x45afd2); without an order it runs to tick 2881.
+  Strict mode now runs the order through step 3602 and stops at step
+  3603 (object 354 uses Create New Object Instance mode 6 with flag 0x4,
+  not ported); without an order it runs to tick 3432.
 - **Done in play mode: selecting a Sim.** A press on a portrait selects
   that Sim (0x445449, between ticks): the Sim selected before is
   deselected, the indicators move, and the panel and the pie menus

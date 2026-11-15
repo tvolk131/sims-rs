@@ -63,9 +63,13 @@
 //! (`fin`, `fout`: a cell plays and stops at once), the `fast?` cells'
 //! beat counter, and the delays and quantising fields (`dly`, `quant`,
 //! the third `rand?`, `stereo?`). The player's own fade (vtable +0x28)
-//! and tempo change (+0x74), pausing (which follows the game's pause,
-//! kinds 21 and 22, not ported), and the second cursor fields of the
-//! score data (+0x3c, +0x40, always 0) are left out too.
+//! and tempo change (+0x74) and the second cursor fields of the score
+//! data (+0x3c, +0x40, always 0) are left out too.
+//!
+//! Pausing follows the game's pause (kinds 21 and 22, see
+//! [`crate::player::Player::pause`]): a paused player (+0x40a8, set
+//! through vtable +0x7c, 0x5773af) picks no cells (0x577af9) until it is
+//! unpaused, while the sounds of cells it already picked play on.
 
 use crate::fsc::Score;
 use sims_core::{Ext, F32};
@@ -300,6 +304,10 @@ pub struct Fresh {
     first: i32,
     percent: i32,
     started: bool,
+    /// *(code)* Set by the sound's pause (+0x40a8, vtable +0x7c,
+    /// 0x5773af). Only the constructor clears it otherwise; starting and
+    /// stopping leave it.
+    paused: bool,
     /// The frame the timer counts from.
     timer: u64,
     rate: u32,
@@ -377,6 +385,7 @@ impl Fresh {
             first: 0,
             percent: 100,
             started: false,
+            paused: false,
             timer: 0,
             rate,
         })
@@ -390,6 +399,19 @@ impl Fresh {
     /// Whether it is started.
     pub fn is_started(&self) -> bool {
         self.started
+    }
+
+    /// *(code)* vtable +0x7c (0x5773af): pauses or unpauses it. A paused
+    /// player's update does nothing (0x577af9): no beat falls due and no
+    /// cell starts or stops, while the cells' sounds play on. Its timer
+    /// keeps counting, so on unpausing the beats it missed fall due.
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
+    /// Whether it is paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused
     }
 
     /// The cursor: row and column.
@@ -559,7 +581,7 @@ impl Fresh {
     pub fn update(&mut self, frame: u64, host: &mut dyn Host) {
         let target = self.target();
         let limit = self.limit();
-        if !self.started {
+        if !self.started || self.paused {
             return;
         }
         let elapsed =

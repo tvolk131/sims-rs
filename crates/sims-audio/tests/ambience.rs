@@ -544,3 +544,38 @@ fn the_view_is_the_outdoor_share_in_percent() {
         0
     );
 }
+
+#[test]
+fn a_pause_holds_the_score_in_live_music_mode_only() {
+    let cells = vec![Some(cell(20, "a.xa")); 9];
+    let mut player = player(&[(0, score(header(3, 3, 1, 1, 1), &cells))]);
+    event(&mut player, "amb0");
+    // The first music mode is 4: a pause leaves the score alone, though
+    // an unpause would unpause it.
+    player.handle(&SoundEvent::Pause);
+    assert!(player.is_paused());
+    assert!(!player.ambience().unwrap().is_paused());
+    player.handle(&SoundEvent::Unpause);
+    // Live music (mode 0, once mode 3 has been set): the score pauses,
+    // and no beat falls due while it is.
+    event(&mut player, "music3");
+    event(&mut player, "music0");
+    player.handle(&SoundEvent::Pause);
+    assert!(
+        player
+            .ambience()
+            .is_some_and(|a| a.is_paused() && a.is_started())
+    );
+    let out = player.render_stereo(8 * RATE as usize, &NoSources);
+    assert!(runs(&out, 0).is_empty(), "{:?}", runs(&out, 0));
+    player.handle(&SoundEvent::Unpause);
+    assert!(!player.ambience().unwrap().is_paused());
+    let out = player.render_stereo(8 * RATE as usize, &NoSources);
+    assert!(!runs(&out, 0).is_empty());
+    // Only the music half of kind 36, which is not ported.
+    assert!(
+        player.faults.iter().all(|f| f.contains("music half")),
+        "{:?}",
+        player.faults
+    );
+}

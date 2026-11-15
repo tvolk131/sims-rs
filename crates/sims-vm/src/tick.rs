@@ -66,6 +66,7 @@
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Status, Stream};
+use crate::placement::Refreshing;
 use crate::play::{Play, Recovery, ScriptError};
 use crate::primitives::dialog::{self, DONE, NEW, SHOWN};
 use crate::selection::selected;
@@ -605,7 +606,25 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        if !self.object_tick(world, id, catch)? {
+        let refreshing = RefCell::new(Refreshing {
+            person: id,
+            pending: None,
+        });
+        let ticked = Interpreter {
+            refreshing: Some(&refreshing),
+            ..*self
+        }
+        .object_tick(world, id, catch)?;
+        let pending = refreshing.into_inner().pending;
+        if !ticked {
+            if pending.is_some() {
+                return Err(fail(Trap::Unsupported(
+                    "a person that took itself off the lot ends its tick before its \
+                     animator's: its animator's refresh at the take-off (0x58da12) is then not \
+                     redone at the same clock"
+                        .into(),
+                )));
+            }
             return Ok(false);
         }
         let hour = world.globals.get(HOURS).copied().unwrap_or(0);
@@ -636,7 +655,11 @@ impl Interpreter<'_> {
         // The animator's walk notes the room too (0x45e4e9), so the state
         // goes back before it ticks.
         world.person_ticks.insert(id, state);
-        self.tick_animator(world, id).map_err(fail)?;
+        match pending {
+            None => self.tick_animator(world, id),
+            Some(pending) => self.tick_animator_after_take_off(world, id, pending),
+        }
+        .map_err(fail)?;
         self.note_room(world, id).map_err(fail)?;
         let state = world
             .person_ticks
@@ -807,9 +830,7 @@ impl Interpreter<'_> {
         };
         // A person's animator is reset too where it can be, as a person's
         // own reset does; one it cannot reset is left as it is.
-        if let Some(animator) = world.animators.get_mut(&id) {
-            let _ = animator.reset();
-        }
+        let _ = world.reset_animator(id);
         let mut machine = self.machine(world, id, 0, false);
         match machine.install_main() {
             Ok(()) => Recovery::Restarted(failed),

@@ -15,6 +15,15 @@
 //!   (0x570c3e, `sims_audio::ambience::view`; the game sends
 //!   `Game::ambience_view`).
 //!
+//! The game pauses the sound as the original's does (its mode handler,
+//! 0x4ce470): it sends `sims_audio::SoundEvent::Pause` (in
+//! [`Input::Events`]) when the game pauses in live mode and when it
+//! leaves live mode for another (buy, build, ...), and
+//! `SoundEvent::Unpause` when it is back in live mode and not paused.
+//! Sounds playing then are held where they are; sounds started while
+//! paused play. `SoundEvent::StopObject` is what to send when an object
+//! goes, and `SoundEvent::StopAll` stops everything at once.
+//!
 //! What the sound scripts ask about an object (`getsrcdatafield`) is
 //! read from the lot between ticks ([`sources`]) and sent as a
 //! [`Snapshot`].

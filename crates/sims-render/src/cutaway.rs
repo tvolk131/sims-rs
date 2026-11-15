@@ -644,6 +644,7 @@ mod tests {
             outdoor_rooms: [OUTSIDE].into(),
             room_lights: Default::default(),
             halves: Default::default(),
+            lamps: Default::default(),
         }
     }
 
