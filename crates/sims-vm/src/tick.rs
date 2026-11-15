@@ -482,8 +482,10 @@ impl Interpreter<'_> {
 
     /// An object's tick (0x4521f7): its thread runs (0x474e88) until it
     /// yields. If that returns true, data word 25 is counted down when it
-    /// is not 0, and the object's animated sprites step (not modeled; see
-    /// the module's documentation).
+    /// is not 0, and the object's headlines step (0x46e004): the first
+    /// one's duration counts down ([`sims_sim::World::headlines`]); its
+    /// animation, which only decides when the object is redrawn, is not
+    /// modeled.
     ///
     /// The thread returns true when it yields. Returning from its
     /// outermost frame is error 0x3e9 in the original, which the object's

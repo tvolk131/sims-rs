@@ -293,3 +293,28 @@ fn backward_events_are_due_down_to_the_event_time_and_wrap_round() {
     assert_eq!(layer.due(0, &EVENTS).unwrap(), [5]);
     assert_eq!(layer.cursors, [4]);
 }
+
+#[test]
+fn whether_a_route_may_be_interrupted_follows_the_animators_state() {
+    // 0x589ead: states 1 to 3 may; 0, 9 and 10 ask the foreground layer,
+    // or may with none; any other state may not.
+    let at = |state, foreground: Option<i32>| Animator {
+        state,
+        foreground: foreground.map(|interruptible| Layer {
+            interruptible,
+            ..Layer::start("c", THOUSAND, 30, true, 0, false, 1000)
+        }),
+        ..LOADED
+    };
+    for state in [1, 2, 3] {
+        assert!(at(state, Some(0)).interruptible(), "state {state}");
+    }
+    for state in [0, 9, 10] {
+        assert!(at(state, None).interruptible(), "state {state}");
+        assert!(at(state, Some(-1)).interruptible(), "state {state}");
+        assert!(!at(state, Some(0)).interruptible(), "state {state}");
+    }
+    for state in [-1, 4, 5, 6, 7, 8, 11, 12, 13] {
+        assert!(!at(state, Some(1)).interruptible(), "state {state}");
+    }
+}

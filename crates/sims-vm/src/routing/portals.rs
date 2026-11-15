@@ -471,6 +471,7 @@ mod tests {
             zoning: BTreeMap::new(),
             animations: Default::default(),
             people: Default::default(),
+            icon_frames: None,
         }
     }
 

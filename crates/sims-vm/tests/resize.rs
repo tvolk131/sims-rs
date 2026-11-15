@@ -414,12 +414,24 @@ fn routing_18_bytes(routing: &sims_sim::route::Routing) -> Vec<u8> {
     bytes
 }
 
+/// A lot's encoding as snapshot format 23 wrote it: without the headlines
+/// ([`World::headlines`]) that format 24 added at the end, so a state
+/// pinned under format 23 can be shown to be the same state but for the
+/// headlines. The older formats' encodings start from this one.
+fn format_23_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let headlines = postcard::to_allocvec(&world.headlines).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - headlines.len()), headlines);
+    bytes
+}
+
 /// A lot's encoding as snapshot format 22 wrote it: without the families
 /// ([`World::families`]) that format 23 added at the end, so a state
 /// pinned under format 22 can be shown to be the same state but for the
-/// families. The older formats' encodings start from this one.
+/// families. It starts from [`format_23_bytes`], and the older formats'
+/// encodings from this one.
 fn format_22_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_23_bytes(world);
     let families = postcard::to_allocvec(&world.families).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - families.len()), families);
     bytes

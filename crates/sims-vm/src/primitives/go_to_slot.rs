@@ -11,8 +11,11 @@
 //!   the person's contexts (+0xaf0); the next step is 1.
 //! - **1**: when the slot's object is in another room than the person
 //!   (and bit 0 of person word 68 is clear), the next step is 2.
-//!   Otherwise the places the person could stand are found (0x48235a);
-//!   the next step is 18.
+//!   Otherwise, a person who wants to be interrupted (0x45d7c0) and whose
+//!   animator may stop ([`sims_sim::animator::Animator::interruptible`],
+//!   0x589ead) fails with result 4, the next step 7 (0x45b18b). Else the
+//!   places the person could stand are found (0x48235a); the next step is
+//!   18.
 //! - **2**, the way through a door (0x45afd0): once the person is in
 //!   the object's room, back to step 1. Otherwise a door tree that
 //!   returned false marks its door failed, the door to go through is
@@ -93,7 +96,8 @@
 //! update 438 do not reach fails loudly: a parameter number past the
 //! frame's parameters, a stack object that is missing or off the lot in a later
 //! step, a person with bit 0 of word 68 set or other contexts, a person
-//! who wants to be interrupted, a person sitting (posture 1), no door to
+//! who wants to be interrupted at a door, on the way or while waiting
+//! for a person asked (steps 2, 3 and 14), a person sitting (posture 1), no door to
 //! go through, giving up on a slot the route may end near (the failure
 //! feedback tree, 0x45af2a), ending a route while the asked person runs
 //! the action (0x45d5f8), every other step and every other result of the
@@ -105,6 +109,7 @@ use crate::interpreter::{Flow, Machine, word};
 use crate::placement::stands_on_lot;
 use crate::routing::slot::{SlotRoute, direction, new_context, route_slot};
 use crate::sounds::SoundEvent;
+use sims_sim::animator::LOADED;
 use sims_sim::route::RouteSlot;
 
 /// The object ID under which the slot flags of the lot's global routing
@@ -459,11 +464,20 @@ impl Machine<'_, '_> {
                         state = PORTAL;
                         continue;
                     }
-                    if self.wants_interrupt()? {
-                        return Err(unsupported(
-                            "0x45b196",
-                            "for a person who wants to be interrupted",
-                        ));
+                    // 0x45b18b: a person who wants to be interrupted, and
+                    // whose animator may stop (0x589ead), fails with
+                    // context +0x88 = 4.
+                    if self.wants_interrupt()?
+                        && self
+                            .world
+                            .animators
+                            .get(&me)
+                            .unwrap_or(&LOADED)
+                            .interruptible()
+                    {
+                        ctx.result = 4;
+                        state = FAILED;
+                        continue;
                     }
                     interpreter
                         .find_candidates(self.world, &mut ctx)

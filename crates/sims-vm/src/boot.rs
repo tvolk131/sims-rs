@@ -311,6 +311,7 @@ impl Lot {
         // script makes. A type whose skeleton cannot be chosen is left
         // out; making a person of it fails.
         program.people = People::load_each(&install, &index, &catalog, person_types())?.0;
+        program.icon_frames = crate::program::icon_frames(&install)?;
         let mut world = World::empty();
         let mut load = LoadReport::default();
         {
@@ -739,6 +740,7 @@ mod tests {
                 zoning: BTreeMap::new(),
                 animations: Default::default(),
                 people: Default::default(),
+                icon_frames: None,
             },
             catalog: Catalog {
                 global: 0,

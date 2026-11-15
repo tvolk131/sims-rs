@@ -443,3 +443,93 @@ fn the_catalog_lists_controllers_in_the_originals_order() {
         .collect();
     assert_eq!(digest, CAPTURED);
 }
+
+/// A sprite header: the version and the count, in either byte order.
+fn sprite(version: i32, count: i32, big_endian: bool) -> Vec<u8> {
+    let words = [version, count, 0];
+    if big_endian {
+        words.iter().flat_map(|w| w.to_be_bytes()).collect()
+    } else {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+}
+
+/// [`iff`] with each chunk's flags.
+fn flagged(chunks: &[(&[u8; 4], u16, u16, Vec<u8>)]) -> sims_formats::iff::Iff {
+    let mut bytes = vec![0; 64];
+    bytes[..13].copy_from_slice(b"IFF FILE 2.5:");
+    for (tag, id, flags, data) in chunks {
+        bytes.extend(*tag);
+        bytes.extend((76 + data.len() as u32).to_be_bytes());
+        bytes.extend(id.to_be_bytes());
+        bytes.extend(flags.to_be_bytes());
+        bytes.extend([0; 64]);
+        bytes.extend(data);
+    }
+    sims_formats::iff::Iff::parse(bytes).unwrap()
+}
+
+#[test]
+fn headline_sprites_count_their_frames_as_the_sprite_cache_does() {
+    // Without the conversion flag (0x10) an SPR#'s header is swapped:
+    // big-endian. With it, little-endian.
+    let frames = sims_vm::sprite_frames(&flagged(&[
+        (b"SPR#", 600, 0, sprite(502, 9, true)),
+        (b"SPR#", 601, 0x10, sprite(503, 18, false)),
+        (b"SPR#", 602, 0, sprite(506, 15, true)),
+        (b"SPR#", 603, 0x10, sprite(501, 7, false)),
+        (b"SPR#", 604, 0x10, sprite(499, 9, false)),
+        // Any version from 500 up keeps its count, read in the flag's
+        // order whatever it looks like in the other.
+        (b"SPR#", 606, 0, sprite(65536, 9, true)),
+        (b"SPR#", 607, 0x10, sprite(0x1f6 << 16, 9, false)),
+        // An SPR2 counts only where no SPR# has the ID.
+        (b"SPR2", 600, 0, sprite(1000, 30, false)),
+        (b"SPR2", 605, 0, sprite(1000, 6, false)),
+    ]))
+    .unwrap();
+    assert_eq!(
+        frames.into_iter().collect::<Vec<_>>(),
+        [
+            (600, 9),
+            (601, 9),
+            (602, 3),
+            (603, 3),
+            (604, 0),
+            (605, 6),
+            (606, 9),
+            (607, 9)
+        ]
+    );
+    // The cache looks sprites up as resources: a deleted SPR# (flag 4),
+    // even a truncated one, or one of another variant (a high byte in its
+    // flags) is not one, and the SPR2 of the ID counts.
+    let frames = sims_vm::sprite_frames(&flagged(&[
+        (b"SPR#", 600, 4, sprite(502, 9, true)),
+        (b"SPR#", 601, 4, vec![1, 2]),
+        (b"SPR#", 602, 0x100, sprite(502, 9, true)),
+        (b"SPR2", 600, 0, sprite(1000, 6, false)),
+        (b"SPR2", 602, 0, sprite(1000, 4, false)),
+    ]))
+    .unwrap();
+    assert_eq!(frames.into_iter().collect::<Vec<_>>(), [(600, 6), (602, 4)]);
+    // A live SPR# too short for its header fails.
+    let error = sims_vm::sprite_frames(&flagged(&[(b"SPR#", 600, 0, vec![1, 0, 0])]))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("SPR# #600"), "{error}");
+}
+
+#[test]
+fn an_install_without_the_headline_sprites_reads_none() {
+    let dir = Dir::new("icons");
+    let (_, _) = setup(&dir);
+    let install = Install::detect(&dir.0).unwrap();
+    assert_eq!(sims_vm::icon_frames(&install).unwrap(), None);
+    dir.file(
+        "GameData/Sprites.iff",
+        &iff(&[(b"SPR#", 616, sprite(502, 9, true))]),
+    );
+    let frames = sims_vm::icon_frames(&install).unwrap().unwrap();
+    assert_eq!(frames[&616], 9);
+}

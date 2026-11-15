@@ -136,6 +136,10 @@ pub struct World {
     /// reload sorts them. See [`Family`]. Like the neighborhood's
     /// people, they belong to the running game, not to the lot.
     pub families: Vec<Family>,
+    /// The first headline of each object that shows one. See
+    /// [`Headline`]. An object with no entry shows none: its first
+    /// headline, if it has any, has a duration of 0.
+    pub headlines: BTreeMap<u16, Headline>,
 }
 
 /// How many advertisements the record of [`World::advertisement_record`]
@@ -240,6 +244,31 @@ pub struct Dialog {
     /// Record word 0x74: 0 new, 1 shown, 2 to 4 answered with the first,
     /// second or third button, 5 done.
     pub status: u8,
+}
+
+/// What the simulation reads of an object's first headline (object
+/// +0x148, a record of 0x3c bytes) while it shows: Set Balloon/Headline
+/// sets it (0x44b724), the tail of the object's tick counts it down
+/// (0x4521f7, 0x46e004), Sleep keeps a showing object out of the
+/// scheduler's hands (0x44aa57), and a person's reset clears it
+/// (0x45e8af). No save holds it.
+///
+/// The record's other fields are presentation: the sprite, its frame
+/// count and the frame shown, with the step and the tick count that move
+/// it (+0x14 to +0x28, which only decide when the object is redrawn,
+/// 0x434101), the backdrop and the overlay (+0x2c, +0x30) and the flag
+/// (+0x38, which the person's drawn bounds read, 0x45a092). So does the
+/// priority while the duration is 0: every call that reads it while a
+/// headline shows, and every call that shows one writes it first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Headline {
+    /// The priority (+0x34): 2 for an icon of kind 4, 1 for any other. A
+    /// headline of a higher priority than a new one keeps showing.
+    pub priority: i32,
+    /// The duration (+0x10), never 0: the ticks left, or a negative
+    /// number for a headline that shows until it is cleared (the tick
+    /// counts down only a positive duration).
+    pub duration: i32,
 }
 
 /// What a person's tick keeps that no save holds (person fields 0x810 and
@@ -446,6 +475,7 @@ impl World {
             action_serial: 0,
             advertisement_record: None,
             families: Vec::new(),
+            headlines: BTreeMap::new(),
         }
     }
 

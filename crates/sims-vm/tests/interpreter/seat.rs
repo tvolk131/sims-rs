@@ -284,3 +284,46 @@ fn a_sit_tree_that_cannot_be_pushed_fails_loudly_and_leaves_the_route_as_it_was(
     assert!(sim.stack.iter().all(|frame| frame.primitive_state != 4));
     assert!(!sat(&fx));
 }
+
+#[test]
+fn a_person_who_wants_to_be_interrupted_fails_with_result_4_if_its_animator_may_stop() {
+    // 0x45b18b: an action pushed to the front of the queue (flag 2)
+    // interrupts (0x45d7c0). With no animator, the loaded one's state (3)
+    // may stop (0x589ead): the route fails with result 4 before any
+    // search, and no failure feedback runs.
+    let interrupting = |fx: &mut Fixture, me: u16| {
+        let person = fx
+            .world
+            .objects
+            .get_mut(&me)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        person.data[71] = 0;
+        person.queue.insert(
+            0,
+            sims_formats::saved_objects::Interaction {
+                flags: 2,
+                ..person.active.clone()
+            },
+        );
+    };
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    interrupting(&mut fx, me);
+    assert_eq!(go_to(&mut fx, me), Ok(false));
+    assert!(!sat(&fx));
+    assert_eq!(route_result(&fx, me), 4);
+    // An animator in a state that may not stop (4) goes on to the seat.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    interrupting(&mut fx, me);
+    fx.world.animators.insert(
+        me,
+        sims_sim::animator::Animator {
+            state: 4,
+            ..sims_sim::animator::LOADED
+        },
+    );
+    assert_eq!(go_to(&mut fx, me), Ok(true));
+    assert!(sat(&fx));
+}

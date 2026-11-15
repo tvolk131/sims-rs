@@ -2,14 +2,19 @@
 //! Goth house loads and steps one tick at a time to the state `sims boot`
 //! reaches.
 
+use sims_sim::Headline;
 use sims_vm::boot::{Frames, Lot, StepError};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 33 --answers 3`
-/// gives this hash with the default frames (snapshot format 23).
-const TICK_33: &str = "9d5a04c006c0e77b014642afe9113d5b5ec7c250787caf001b6ede4a16bc9e99";
+/// gives this hash with the default frames (snapshot format 24).
+const TICK_33: &str = "da80de5807a89da3fdae78c8759d3e411bdd87c5dc7aae0bafceec963cf59796";
+/// The same state's hash under snapshot format 23, which had no headlines
+/// ([`sims_sim::World::headlines`]) at the end.
+const TICK_33_23: &str = "9d5a04c006c0e77b014642afe9113d5b5ec7c250787caf001b6ede4a16bc9e99";
 /// The same state's hash under snapshot format 22, which had no families
-/// ([`sims_sim::World::families`]) at the end.
+/// ([`sims_sim::World::families`]) either.
 const TICK_33_22: &str = "041181badfd4d6953814b6c46612398df1004fa583b1d2aa5bd11c59715d65c0";
 
 #[test]
@@ -33,16 +38,23 @@ fn the_goth_house_steps_to_tick_33() {
     // friend count is up to date, as in every capture of the original.
     let goths = lot.world().families.iter().find(|f| f.id == 5).unwrap();
     assert_eq!((goths.friends, goths.stale), (0, false));
+    // No headline shows.
+    assert!(lot.world().headlines.is_empty());
     assert_eq!(lot.world().hash_hex(), TICK_33);
     use sha2::Digest;
+    let digest = |bytes: &[u8]| -> String {
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
     let mut bytes = lot.world().encode();
+    let headlines = postcard::to_allocvec(&lot.world().headlines).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - headlines.len()), headlines);
+    assert_eq!(digest(&bytes), TICK_33_23);
     let families = postcard::to_allocvec(&lot.world().families).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - families.len()), families);
-    let digest: String = sha2::Sha256::digest(&bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    assert_eq!(digest, TICK_33_22);
+    assert_eq!(digest(&bytes), TICK_33_22);
 }
 
 #[test]
@@ -139,21 +151,60 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     assert_ne!(last.target, 16);
     // The social clears person 16's base slot (Animate Sim clip 0,
     // 0x58957e), sets person 21's word 72 (Generic Sims Call routine 15,
-    // 0x44fe3c), reads the Goth family's friend count (scope 24 field 9,
-    // 0x425b5d) and runs on, until it stops on what is not ported yet.
-    let mut steps = 0;
+    // 0x44fe3c) and reads the Goth family's friend count (scope 24 field
+    // 9, 0x425b5d).
+    for _ in 0..258 {
+        lot.step().unwrap_or_else(|e| panic!("{e}"));
+        assert!(lot.world().headlines.is_empty());
+    }
+    // Tick 261: tree 0x200e shows the icon "+ " (kind 6, index 16:
+    // sprite 616, 9 frames) over me for 100 ticks, and my tick's tail
+    // counts it down once.
+    lot.step().unwrap_or_else(|e| panic!("{e}"));
+    let shown = |duration| Headline {
+        priority: 1,
+        duration,
+    };
+    assert_eq!(lot.world().headlines, BTreeMap::from([(sim, shown(99))]));
+    // Tick 262: person 16 shows one too.
+    lot.step().unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        lot.world().headlines,
+        BTreeMap::from([(16, shown(99)), (sim, shown(98))])
+    );
+    // Tick 264: the social ends. Person word 73 was set, so it is cleared
+    // and my footprint worked out again (0x45e756).
+    lot.step().unwrap_or_else(|e| panic!("{e}"));
+    assert_ne!(
+        lot.world().objects[&sim].person.as_ref().unwrap().data[73],
+        0
+    );
+    lot.step().unwrap_or_else(|e| panic!("{e}"));
+    let person = lot.world().objects[&sim].person.as_ref().unwrap();
+    assert_eq!((person.active.target, person.data[73]), (0, 0));
+    // The headlines count down to 0 and stop showing.
+    for _ in 0..96 {
+        lot.step().unwrap_or_else(|e| panic!("{e}"));
+    }
+    assert_eq!(lot.world().headlines, BTreeMap::from([(16, shown(1))]));
+    lot.step().unwrap_or_else(|e| panic!("{e}"));
+    assert!(lot.world().headlines.is_empty());
+    // The lot runs on until person 259's route to a slot fails, as it
+    // wants to be interrupted (0x45b18b), and its tree takes it off the
+    // lot, which is not ported.
+    let mut steps = 359;
     let stopped = loop {
         steps += 1;
-        assert!(steps <= 300, "the social did not stop");
+        assert!(steps <= 1000, "the lot did not stop");
         if let Err(e) = lot.step() {
             break e.to_string();
         }
     };
-    assert_eq!(steps, 259, "{stopped}");
+    assert_eq!(steps, 595, "{stopped}");
     for part in [
-        "tick 261,",
-        "object 21, tree 0x200e node 21",
-        "Set Balloon/Headline showing an icon of kind 6",
+        "tick 597,",
+        "object 259, tree 0x0176 node 27",
+        "taking a person off the lot is not ported",
     ] {
         assert!(stopped.contains(part), "{stopped}");
     }

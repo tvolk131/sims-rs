@@ -17,8 +17,7 @@
 //! keeps running every tick and lowers its own parameter.
 //!
 //! The original also keeps an object whose first headline is showing out
-//! of the scheduler's hands (0x44aa57). Showing a headline is not ported
-//! (see `headline.rs`), so none ever shows and that test is left out.
+//! of the scheduler's hands (0x44aa57, [`sims_sim::World::headlines`]).
 
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine, word};
@@ -41,7 +40,9 @@ impl Machine<'_, '_> {
             count = 0;
         }
         count = count.max(0);
-        let passive = me.person.is_none() && me.data.get(LOCKOUT) == Some(&0);
+        let passive = me.person.is_none()
+            && !self.world.headlines.contains_key(&self.me)
+            && me.data.get(LOCKOUT) == Some(&0);
         if count == 0 {
             self.frame_mut()?.parameters[index] = 0;
             if finished {
