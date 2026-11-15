@@ -512,9 +512,9 @@ fn bob_green([r, g, b]: [u8; 3]) -> bool {
 /// The plumb bob over the selected person: in a state where Mortimer
 /// (person 21) reads on the porch bench, as in a screenshot of the
 /// original at medium zoom (7:38 AM, camera origin (335, −560), cutaway),
-/// it covers the pixels the original's does, x 427 to 434 and y 74 to
-/// 97, within one column and one row. Taken out of his head slot, it is
-/// not drawn.
+/// its green pixels span the box the original's do, x 427 to 434 and
+/// y 74 to 97, each edge within a pixel; the pixels inside the box are
+/// not compared one by one. Taken out of his head slot, it is not drawn.
 #[test]
 fn the_plumb_bob_floats_over_the_selected_persons_head() {
     let Some(root) = install() else { return };

@@ -25,8 +25,10 @@ a memory image, except where it says otherwise.
   x and the spin about z. So the bob stands upright from three units
   over the head and spins about its length.
 - **Spin.** The game's clock in milliseconds (0x6e54e0) × 0.001 × π, or
-  half a turn a second. We have no such clock, so the app gives one
-  (`People::set_clock`); it starts at 0.
+  half a turn a second. We have no such clock, so the game window passes
+  the time it has run (`People::set_clock`, from `Game::advance`). That
+  time runs on while the lot is paused or a dialog waits; whether the
+  original's clock does is **unverified**.
 - **Colour.** The suit's name sets a mode (`head-arrow` 1,
   `head-arrow-date` 2, `head-star` 3, 0x5856db to 0x58579f). In mode 1,
   m is the mood (motive 3 cut to an integer) × 0.012, held to −1..1.
@@ -46,9 +48,10 @@ a memory image, except where it says otherwise.
 (medium zoom, 7:38 AM, Mortimer reading on the porch bench), the bob is
 brightest on the viewer's left and lit on its lower half. That is what
 we get by taking the vector as pointing towards the light. Taken the
-other way, the left side is dark. With that choice our bob covers the
-original's pixels (x 427 to 434, y 74 to 97) within one column and one
-row, as a gated test checks.
+other way, the left side is dark. With that choice our bob's green
+pixels span the original's box (x 427 to 434, y 74 to 97), each edge
+within a pixel, as a gated test checks; the pixels inside the box are
+not compared one by one.
 
 **Unverified.**
 - Which bone the slot names (its +0x20); `HEAD` puts the bob where the
