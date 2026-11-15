@@ -20,6 +20,40 @@ it cannot place it). Push Interaction (primitive 13, 0x44cd2b) is ported
 from the original's code; reading one word past a frame's parameters or
 locals, which its bound allows, fails loudly.
 
+## 2026-11-15: People are drawn over the finished lot, against its depth
+
+The original keeps its people out of the lot's depth buffer. Two dumps
+of the running game (far zoom with a Sim standing on the grass, medium
+zoom with two Sims on the porch bench) show the Sims in the colour
+buffer and only the lot in the depth buffer: plain grass under the
+standing Sim, the wall and the porch floor where the seated ones are.
+The bench they sit on is missing from the depth buffer too. So the
+original draws the lot first, then draws what moves, and what is in
+use, over it, tested against the lot's depth.
+
+`sims-render` takes the same order. After `draw`, a caller draws people
+a pixel at a time with `Canvas::put` (the sprite rule: fainter than the
+cutoff or farther than what is there is left out, a tie wins, the depth
+is written so a nearer part of the same mesh covers a farther one) at
+the depth `Depth::point` gives a point: the ground rows at the point's
+row, the level's offset, and the height curve for its elevation. It is
+an object anchor's depth without the rounding, in the same units as
+everything else. `Camera::project_fine_f32` is the projection without
+rounding, so the people's code does not keep its own copy.
+
+The interleaved draw planned with the people track (people sorted in
+with the lot's objects) is left out: the original does not interleave,
+and the depth test against the finished lot already hides a person
+behind a wall, a counter or a cut wall's stub. The original draws a bench
+in use with the people rather than with the lot; here it stays with the
+lot and people test against it, which matters only where a person is
+drawn in front of part of the bench and behind another part.
+
+How the original gives a person's mesh its depth is **unverified**:
+the dumps show where people are not, not their own depth. Reopen it
+with a frame in which a person is partly hidden, comparing the hidden
+pixels with `Depth::point`.
+
 ## 2026-11-15: Play mode resets an object after its error; strict mode is unchanged
 
 For a playable lot, `Lot::step_play` (and `sims boot --play`) catches a
@@ -136,6 +170,22 @@ orders. The lot runs in strict mode with the captured frame schedule
 check; the first failure stops it and is shown on screen. Clicks pick
 objects by their tile until `sims-render` can say which object drew a
 pixel. Reopen when the play-mode step and player orders land.
+
+## 2026-11-14: Job data from the CARR chunks, a frame after tick 901, and K = 991
+
+Scope 33 reads a field of a career level from the careers `work.iff`
+holds, as the original's list is built from its CARR chunks (0x403e3f)
+and read by 0x40362f; the field order is ported from that code, and
+field 22 (whether the level's second string is not empty) takes the
+string's first virtual function as its length, as the old prototype did:
+**unverified**, reopen if a script reads field 22. An install with a
+`Careers.txt` still fails loudly. The fifth capture's room motives show
+that it drew a frame after tick 901, two ticks off the schedule the
+earlier captures share, so the comparison draws one there. The schedule
+is the original's main loop, not the simulation, so the default
+(`0,1,2,3,33+30`) is unchanged; reopen if a capture can record its draws,
+which would replace the inferred schedule. K = 991; tick 992 snaps to a
+slot whose placement checks the border, the room and the walls.
 
 ## 2026-11-14: The hour turns, a new time of day grows the lawn, and K = 900
 
@@ -2436,6 +2486,7 @@ libraries at run time, so CI needs no new system packages.
 What would reopen it: the UI track needing a GPU, text or widgets that
 softbuffer cannot give, at which point the window code moves to wgpu
 or another toolkit, still outside `sims-render`.
+
 ## 2026-11-14: One table of IFF resources, with the prototype's rules (unverified)
 
 `Iff::get`, `Iff::all` and `Iff::resource_order` now read one table built
