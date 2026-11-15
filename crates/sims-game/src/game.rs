@@ -12,10 +12,13 @@ use crate::pace::Pace;
 use crate::people::People;
 use crate::pick;
 use crate::view::{Move, View};
-use sims_render::{Canvas, Walls, open_house};
+use sims_render::{Canvas, Selected, Walls, open_house};
 use sims_ui::command::{Camera as UiCamera, Command, Walls as UiWalls};
 use sims_vm::boot::{Frames, Lot, StepError};
 use std::path::{Path, PathBuf};
+
+/// The room word of an object in no room.
+const NO_ROOM: i16 = -5;
 
 /// What the game is started with.
 #[derive(Debug, Clone)]
@@ -127,8 +130,19 @@ impl Game {
                 Err(error) => self.stop(&error),
             }
         }
-        if ran > 0 {
-            self.people.refresh(self.lot.world());
+        if ran > 0 || self.stopped.is_some() {
+            let world = self.lot.world();
+            self.people.refresh(world);
+            // The room lights change as lamps and the time of day do.
+            match sims_render::Lot::from_world(world) {
+                Ok(shape) => self.lot_shape = shape,
+                Err(e) => {
+                    let line = format!("the lot is not redrawn: {e}");
+                    if !self.people.problems.contains(&line) {
+                        self.people.problems.push(line);
+                    }
+                }
+            }
         }
         ran
     }
@@ -158,6 +172,12 @@ impl Game {
             self.canvas = Canvas::new(w, h, [0, 0, 0]);
         }
         let world = self.lot.world();
+        // The cutaway also opens the room the selected Sim is in.
+        self.view.camera.focus.selected = world.selected_whereabouts().map(|w| Selected {
+            tile: [i32::from(w.tile[0]), i32::from(w.tile[1])],
+            level: w.level,
+            room: w.room.unwrap_or(NO_ROOM),
+        });
         sims_render::draw(
             world,
             &self.lot_shape,
@@ -165,7 +185,8 @@ impl Game {
             &self.view.camera,
             &mut self.canvas,
         );
-        self.people.draw(world, &self.view.camera, &mut self.canvas);
+        self.people
+            .draw(world, &self.lot_shape, &self.view.camera, &mut self.canvas);
         let status = self.status();
         self.hud.draw(
             world,
@@ -220,7 +241,7 @@ impl Game {
 
     /// A left press at `point`, which is over the panel or the lot.
     pub fn press(&mut self, point: [i32; 2]) -> Outcome {
-        self.note = None;
+        let cleared = self.note.take().is_some();
         if self.hud.covers(point) {
             return match self.hud.press(point) {
                 Some(command) => self.command(command),
@@ -229,17 +250,20 @@ impl Game {
         }
         let world = self.lot.world();
         let camera = &self.view.camera;
-        if let Some(id) = pick::person(world, camera, point) {
+        if let Some(id) = pick::person(world, &self.lot_shape, camera, point) {
             self.note = Some(format!(
                 "Person {id}: choosing a Sim needs the simulation's player orders."
             ));
-        } else if let Some(id) = pick::object(world, camera, point) {
+        } else if let Some(id) = pick::object(world, &self.lot_shape, camera, point) {
             let guid = world.objects.get(&id).map_or(0, |o| o.guid);
             self.note = Some(format!(
                 "Object {id} (type {guid:#010x}): its pie menu needs the simulation's player orders."
             ));
         } else {
-            return Outcome::default();
+            return Outcome {
+                redraw: cleared,
+                photo: false,
+            };
         }
         Outcome::redraw()
     }

@@ -193,13 +193,17 @@ impl App {
         self.last = now;
         let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         let ran = self.game.advance(micros);
+        let mut redraw = ran > 0;
         if !self.reported
             && let Some(stop) = self.game.stopped()
         {
             eprintln!("sims-game: {stop}");
             self.reported = true;
+            // The failed step may have changed the lot, and the banner
+            // shows now.
+            redraw = true;
         }
-        self.changed(ran > 0);
+        self.changed(redraw);
     }
 
     fn redraw(&mut self) {

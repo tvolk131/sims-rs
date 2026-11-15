@@ -10,8 +10,9 @@ says what was decided, why, and what would reopen it. Entries marked
 built from the lot camera so that a ground point lands on the pixel the
 lot's 2:1 projection gives it (within the lot camera's rounding, at every
 zoom and rotation; pinned by a test). Heights take the scale a
-horizontal length gets, and a person upstairs is raised one storey's
-screen height. The people are drawn into their own image and laid over
+horizontal length gets; a person upstairs is raised one storey's
+screen height, and every person by the terrain under them (the tile's
+corners blended by where in the tile they stand). The people are drawn into their own image and laid over
 the lot whole, so walls and furniture in front of a person do not hide
 it yet; occlusion belongs to the render and people tracks. That the
 original draws its people at this scale is **unverified**.

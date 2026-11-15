@@ -17,7 +17,7 @@ use sims_people::math::{Transform, Vec3};
 use sims_people::person::UNITS_PER_TILE;
 use sims_people::raster::{self, Camera as PeopleCamera};
 use sims_people::{Assets, Body, Cast, Library, Player, Resident, base_clip, placement};
-use sims_render::{Camera, Canvas};
+use sims_render::{Camera, Canvas, Lot};
 use sims_sim::World;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -75,12 +75,36 @@ fn ground(x: f32, y: f32) -> Vec3 {
     Vec3::new(-y * UNITS_PER_FINE, 0.0, -x * UNITS_PER_FINE)
 }
 
-/// Model units a person is raised to stand on level `level`, so its feet
-/// are drawn where the lot draws that floor.
-fn level_height(camera: &PeopleCamera, lot: &Camera, level: i32) -> f32 {
-    let pixels = (lot.zoom.floor_height() * (level - 1)) as f32;
+/// Model units a person is raised to stand on level `level`, `ground`
+/// near-zoom pixels of terrain above the lot's base, so its feet are
+/// drawn where the lot draws that floor.
+fn level_height(camera: &PeopleCamera, lot: &Camera, level: i32, ground: f32) -> f32 {
+    let pixels =
+        (lot.zoom.floor_height() * (level - 1)) as f32 + ground / lot.zoom.near_scale() as f32;
     // A unit up is drawn cos 30° * scale pixels up.
     pixels / (camera.pitch[1] * camera.scale)
+}
+
+/// The terrain's height under the fine position `fine`, in near-zoom
+/// pixels (16 a terrain step, as `sims-render` raises the ground):
+/// the tile's four corners, blended by where in the tile the position
+/// is. Off the lot it is 0.
+pub fn terrain(lot: &Lot, fine: [f32; 2]) -> f32 {
+    let [x, y] = fine.map(|v| v / 16.0);
+    let (tx, ty) = (x.floor(), y.floor());
+    let size = lot.size as f32;
+    if !(0.0..size).contains(&tx) || !(0.0..size).contains(&ty) {
+        return 0.0;
+    }
+    let (fx, fy) = (x - tx, y - ty);
+    // A tile's heights are its corners (0, 1), (0, 0), (1, 0) and (1, 1),
+    // in that order (`sims_render::scene`).
+    let h = lot.heights[Lot::cell(tx as usize, ty as usize)].map(f32::from);
+    let height = h[1] * (1.0 - fx) * (1.0 - fy)
+        + h[2] * fx * (1.0 - fy)
+        + h[0] * (1.0 - fx) * fy
+        + h[3] * fx * fy;
+    height * 16.0
 }
 
 struct Drawn {
@@ -152,7 +176,7 @@ impl People {
 
     /// Draws every placed person on the levels `camera` shows over the
     /// lot in `canvas`.
-    pub fn draw(&mut self, world: &World, camera: &Camera, canvas: &mut Canvas) {
+    pub fn draw(&mut self, world: &World, lot: &Lot, camera: &Camera, canvas: &mut Canvas) {
         let size = [canvas.width, canvas.height];
         let view = self::camera(camera, size);
         let mut image = raster::Canvas::new(
@@ -174,7 +198,8 @@ impl People {
             let Some(mut root) = placement(animator) else {
                 continue;
             };
-            root.translation.y += level_height(&view, camera, level);
+            let fine = [animator.position[0].to_f32(), animator.position[1].to_f32()];
+            root.translation.y += level_height(&view, camera, level, terrain(lot, fine));
             let pose = match self
                 .player
                 .pose(&drawn.body.skeleton, animator, &drawn.base)
@@ -271,8 +296,9 @@ mod tests {
         };
         let size = [640, 480];
         let people = camera(&lot, size);
-        let raised = ground(300.0, 200.0) + Vec3::new(0.0, level_height(&people, &lot, 2), 0.0);
-        let expected = lot.project_fine(lot.rotate_fine([300, 200]), 2, 0);
+        let raised =
+            ground(300.0, 200.0) + Vec3::new(0.0, level_height(&people, &lot, 2, 32.0), 0.0);
+        let expected = lot.project_fine(lot.rotate_fine([300, 200]), 2, 32);
         let [x, y] = screen(&people, size, raised);
         assert!((x - expected[0] as f32).abs() <= 1.01, "{x} {expected:?}");
         assert!((y - expected[1] as f32).abs() <= 1.01, "{y} {expected:?}");
