@@ -1961,6 +1961,10 @@ Progress:
   tables (grass takes none in the original). Far zoom at rotation 2
   rose from 90.1% to 90.3% exact; of the pixels they change, 70% now
   match exactly and the rest are mostly a step off.
+- Done: a floor tile split by a diagonal wall takes the blade count of
+  the tile drawn before it, as the original carries it from tile to
+  tile. Near zoom rose from 86.5% to 87.0% exact; of the 2,402 pixels it
+  changes, 2,115 now match.
 - Next: near-zoom fidelity below the bay's left end (rows 436 to 520,
   grass and a light sprite in the original); the
   edge-on texel offset and side; a screenshot with a marked edge-on
@@ -2103,13 +2107,31 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   (0x51df31). The Goths' panel is pinned by digest, gated on
   `SIMS_INSTALL`; it is not yet compared with a screenshot, and the
   zodiac sign under the bars is not drawn.
+- **Done: the job panel's skills.** The Job button opens the selected
+  Sim's six skill bars, with the labels of what the next level of
+  their career needs underlined and a line marking how much (from
+  `work.iff`, through `Snapshot::with_careers`, which the game and the
+  viewer call), as the original's ordinary job panel draws them
+  (0x5301ca). The Goths' panel is pinned by digest, gated on
+  `SIMS_INSTALL`; it is not yet compared with a screenshot.
+- **Done: the relationship panel.** The Relationships button opens the
+  people the selected Sim knows, five a page with arrows, each with the
+  face for the lifetime relationship, the day's and the lifetime's
+  numbers and bars, and the friends and love icons, filtered by the
+  family, friends and everyone buttons, as the original lays them out
+  (0x51db56) and draws them (0x52838f). The host fills the list with
+  `Snapshot::with_relations`. The Goths' panel is pinned by digest,
+  gated on `SIMS_INSTALL`; it is not yet compared with a screenshot.
 - **Next:** open houses through `sims_vm::boot::Lot` (which now runs the
   household load) in the tests and the viewer, in place of their
   stand-in for steps 17 and 18; a screenshot of an open pie menu; a
   Yes/No dialog checked
   against the original (the "Help System" one at tick 2) for the layout
   of several buttons; text entry dialogs; the personality panel's
-  zodiac sign; the job and relationship panels; the other live panels.
+  zodiac sign; the job panel's left column (the career's icon and
+  title, the salary, the performance and the friends needed); the
+  relationship panel's Superstar filter and which people the original
+  leaves out; the other live panels.
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
   - A command intake, for example `World::apply(&mut self, command:
     sims_sim::Command) -> Result<(), CommandError>`, run between ticks,
