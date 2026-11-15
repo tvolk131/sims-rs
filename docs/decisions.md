@@ -4,6 +4,25 @@ Choices made while working toward `docs/roadmap.md`, newest first. Each entry
 says what was decided, why, and what would reopen it. Entries marked
 **unverified** wait on the comparison harness.
 
+## 2026-11-15: The game's pie menu is the simulation's listing, on a copy of the lot
+
+A click on an object or a person lists its menu with
+`Interpreter::pie_menu` (0x48d392): only the entries whose check passes
+for the selected Sim, in the original's order. Each is named by the
+TTAs strings with the ID of the TTAB the simulation reads, by its menu
+number, with "*" before it when the entry has flag 0x80. `Lot` offers
+no way to run the listing on its own world, so the game lists on a copy
+and drops the copy's changes, although the original's check trees change
+the lot (person word 50 is left as the last check left it), and it lists
+on the click, where the original lists when the pointer reaches the
+object (0x48c834). Choosing an entry still queues it by its menu number
+(`Lot::queue_interaction`), not the offered action itself
+(`Interpreter::pick`). Where the simulation cannot list a menu yet (the
+fridge's check tree adds an entry; an object offers nothing; a version 0
+table), the menu shows every entry of the table without checks, debug
+entries hidden, and the note says why. Reopen when `Lot` lists the menu
+and picks from it on its own world.
+
 ## 2026-11-15: The game draws people into the lot with sims-people's depth test
 
 `sims-game` no longer draws the people into an image of its own laid
@@ -112,6 +131,9 @@ become a later frame's locals. The Goth house's first 1000 ticks are
 unchanged by it.
 
 ## 2026-11-15: The game's pie menu is a list of the table's entries until the simulation offers them
+
+Superseded by "The game's pie menu is the simulation's listing, on a
+copy of the lot" above, except where the simulation cannot list a menu.
 
 Clicking an object (or a person) in `sims-game` lists the entries of
 the interaction table `Lot::queue_interaction` queues from: that of the

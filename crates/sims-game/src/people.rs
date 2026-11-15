@@ -169,7 +169,7 @@ impl People {
             .filter(|id| world.objects.get(id).is_some_and(|o| o.person.is_some()))
     }
 
-    /// Keeps the problems not kept yet, up to [`KEPT`].
+    /// Keeps the problems not kept yet, up to `KEPT` (256).
     pub fn note(&mut self, problems: Vec<String>) {
         for line in problems {
             if self.problems.len() < KEPT && !self.problems.contains(&line) {

@@ -2112,26 +2112,37 @@ through their public interfaces only; the simulation never depends on it.
   a book comes off the shelf, the fountain tinkles. `begin_route` and
   `end_route` have no event in the install's sound files and play
   nothing.
-- **Done: a stopgap pie menu.** Clicking an object or a person opens a
-  list of the interactions an order on it is queued from (those of the
-  tile the simulation sends a multi-tile object's orders to; each menu
-  number once, named by that table's TTAs strings, debug entries
-  hidden); choosing one
-  queues it for the selected Sim with `Lot::queue_interaction`, and the
-  note across the top says whether it was queued. Escape closes the
-  menu. The fridge lists Have A Snack, Have Lite Meal, Have A Meal,
-  Serve Meal; the bookshelf lists Read a Book and the studies.
-- **Blocked: a Sim doing what he is told.** Idle For Input now starts
-  a queued order (#131): Have A Snack queued on the fridge at tick 51
-  leaves the queue by tick 151. Three ticks later, another person
-  (object 16) fails a route that names its slot from source 2 (tree
-  0x2156 node 5; 0x45ac2e, not ported), which stops the lot in strict
-  mode. Without an order, strict mode runs to tick 1102. That route is
-  the simulation's next step toward the done criterion.
-- **Next:** the menu from the simulation's pie-menu entries (the check
-  each entry runs, which the stopgap skips) once that accessor lands;
-  then a real pie.
+- **Done: the pie menu from the simulation's listing.** Clicking an
+  object or a person opens the entries `Interpreter::pie_menu` offers
+  the selected Sim (each entry's check run, named by the TTAs strings of
+  the table it came from, with "*" before an entry with flag 0x80). The
+  listing runs on a copy of the lot, as `Lot` lends its world only to
+  read, so its changes are dropped. Where the simulation cannot list a
+  menu yet, the menu falls back to every entry of the table (the
+  stopgap of #126) and the note across the top says why. Choosing an
+  entry queues it for the selected Sim with `Lot::queue_interaction`.
+  Escape closes the menu. The fridge (fallback) lists Have A Snack and
+  the meals; the bookshelf lists Read a Book and the studies.
+- **Blocked: a Sim doing what he is told.** Idle For Input starts a
+  queued order (#131) and a route names its slot from the global slots
+  (#134): Have A Snack queued on the fridge at tick 51 leaves the queue
+  by tick 151. At tick 154, another person (object 16, tree 0x2156
+  node 5) runs a slot search with seats (0x4835f0, not ported), which
+  stops the lot in strict mode. Without an order, strict mode runs to
+  tick 1102. Play mode with the order reaches tick 834, where a person
+  must drop an object being deleted (0x444306).
+- **Next:** list the menu on hover and queue the offered action with
+  `pick`, once `Lot` can do both on its own world; then a real pie.
 - **Needs from other crates:**
+  - `sims-vm`: `Lot::pie_menu(person, object)` and `Lot::pick(person,
+    action)`, so the listing changes the lot as the original's does
+    (and a recording can note it). The listing fails today for the
+    fridge (Add/Change Action String in check tree 0x1012, 0x458789),
+    for objects offering nothing such as beds and walls (0x48d423), for
+    32 objects whose interaction table is version 0, and for object 18
+    (scope 12 in a check tree).
+  - `sims-vm`: a slot search with seats (0x4835f0) and dropping an
+    object being deleted (0x444306).
   - `sims-render`: which object drew each pixel (an object ID buffer
     beside the depth), so a click picks the object under it. Today
     `sims-game` guesses from each object's tile.
@@ -2145,11 +2156,6 @@ through their public interfaces only; the simulation never depends on it.
     to find the person a click lands on.
   - `sims-ui`: a pie menu (layout, drawing and presses), as the panel
     and dialogs are. `sims-game` draws a plain list until then.
-  - `sims-vm`: a route naming its slot from source 2 (0x45ac2e), and
-    the entries the pie menu offers a person on an object, with their
-    labels' table. Until then, the tile an order on an object goes to
-    (`interaction_target`) and the ID and file of the TTAB it is queued
-    from, which `sims-game` now repeats from the program's data.
 
 ## Working rules
 

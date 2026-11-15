@@ -151,7 +151,7 @@ impl Game {
     }
 
     /// The errors play mode caught and recovered from, one line each, in
-    /// order: the first [`LOGGED`] different ones (an error again at a
+    /// order: the first `LOGGED` (256) different ones (an error again at a
     /// later tick is not listed again), then a line saying more were
     /// caught.
     pub fn errors(&self) -> &[String] {
@@ -362,12 +362,25 @@ impl Game {
             self.note = Some("Nobody is selected to do anything.".into());
             return;
         };
-        match menu::entries(&self.lot, &self.assets, object) {
-            Ok(entries) if entries.is_empty() => {
-                self.note = Some(format!("Object {object} offers nothing to do."));
+        match menu::entries(&self.lot, &self.assets, person, object) {
+            Ok(listing) => {
+                // Where the simulation cannot list the menu yet, the note
+                // says so and why.
+                let why = listing
+                    .unchecked
+                    .map(|reason| format!("the simulation cannot list this menu yet: {reason}"));
+                if listing.entries.is_empty() {
+                    let line = format!("Object {object} offers nothing to do");
+                    self.note = Some(match why {
+                        Some(why) => format!("{line} ({why})."),
+                        None => format!("{line}."),
+                    });
+                } else {
+                    self.note = why.map(|why| format!("Every entry is shown, as {why}"));
+                    self.hud.menu = Some(Menu::new(person, object, listing.entries, point));
+                }
             }
-            Ok(entries) => self.hud.menu = Some(Menu::new(person, object, entries, point)),
-            Err(e) => self.note = Some(format!("Object {object}'s menu is not read: {e}")),
+            Err(e) => self.note = Some(format!("Object {object}'s menu is not listed: {e}")),
         }
     }
 
