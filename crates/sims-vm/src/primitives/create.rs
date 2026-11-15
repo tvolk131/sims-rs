@@ -15,8 +15,10 @@
 //! - Mode 4 (0x44e3a2), with no flag or flag 0x1: the new object goes into
 //!   the stack object's first container slot. See
 //!   `Machine::create_in_stack_object`.
-//! - Mode 6 (0x44e4b5), with no flag or flag 0x1: the new object stays off
-//!   the lot.
+//! - Mode 6 (0x44e4b5), with no flag, flag 0x1, flag 0x20 or both: the
+//!   new object stays off the lot. It is not placed (the tail skips the
+//!   place test and the put, 0x44e72c). Making a person this way fails
+//!   loudly.
 //! - Mode 8 (0x44e430), with no flag, flag 0x1, flag 0x20 or both: the new
 //!   object goes where the object the local names stands. See
 //!   `Machine::create_at_local`.
@@ -68,8 +70,8 @@ impl Machine<'_, '_> {
         let guid = u32::from_le_bytes([operands[0], operands[1], operands[2], operands[3]]);
         let (mode, flags) = (operands[4], operands[5]);
         let supported = match mode {
-            4 | 6 => flags & !NOT_BESIDE_ITS_TYPE == 0,
-            8 => flags & !(NOT_BESIDE_ITS_TYPE | FACE_AS_STACK_OBJECT) == 0,
+            4 => flags & !NOT_BESIDE_ITS_TYPE == 0,
+            6 | 8 => flags & !(NOT_BESIDE_ITS_TYPE | FACE_AS_STACK_OBJECT) == 0,
             _ => false,
         };
         if !supported {
@@ -92,7 +94,16 @@ impl Machine<'_, '_> {
                 {
                     return Ok(false);
                 }
+                if self.definition_words(guid)?[TYPE] == PERSON {
+                    return Err(Trap::Unsupported(format!(
+                        "Create New Object Instance mode 6 making a person of type \
+                         0x{guid:08X} (0x44e60e) is not ported"
+                    )));
+                }
                 let created = self.make(guid)?;
+                if flags & FACE_AS_STACK_OBJECT != 0 {
+                    self.face_as_stack_object(created, false)?;
+                }
                 self.frame_mut()?.stack_object = created as i16;
                 Ok(true)
             }
@@ -344,34 +355,47 @@ impl Machine<'_, '_> {
             level,
         };
         if flags & FACE_AS_STACK_OBJECT != 0 {
-            let source = self.frame()?.stack_object;
-            if let Some(source) = u16::try_from(source)
-                .ok()
-                .filter(|id| *id > 0)
-                .and_then(|id| self.world.objects.get(&id))
-            {
-                if person {
-                    // A person takes the stack object's data word 1 whole
-                    // and does not turn (0x44e684).
-                    let facing = source.data[1];
-                    self.world
-                        .objects
-                        .get_mut(&created)
-                        .ok_or(Trap::native(10, "missing object"))?
-                        .data[1] = facing;
-                    return self.place_new(created, place);
-                }
-                let wanted = source.data[1] & 6;
-                let facing = self.world.objects[&created].data[1];
-                if facing != wanted {
-                    return Err(Trap::Unsupported(format!(
-                        "Create New Object Instance turning object {created} from facing \
-                         {facing} to {wanted}: turning (0x433f75) is not ported"
-                    )));
-                }
-            }
+            self.face_as_stack_object(created, person)?;
         }
         self.place_new(created, place)
+    }
+
+    /// Flag 0x20 (0x44e640 to 0x44e6b4), for the object `created` just
+    /// made: when the frame's stack object names an object, a new person
+    /// takes its data word 1 whole and does not turn (0x44e684); any other
+    /// new object turns to its facing with the lowest bit cleared, up to
+    /// four calls of virtual function 0x4c, one step each. Nothing turns
+    /// when the stack object names no object. Only the case with nothing
+    /// to turn is ported; a turn (0x433f75, which redraws, updates seats
+    /// and the walls beside) fails loudly.
+    fn face_as_stack_object(&mut self, created: u16, person: bool) -> Result<(), Trap> {
+        let source = self.frame()?.stack_object;
+        let Some(source) = u16::try_from(source)
+            .ok()
+            .filter(|id| *id > 0)
+            .and_then(|id| self.world.objects.get(&id))
+        else {
+            return Ok(());
+        };
+        let facing = source.data[1];
+        let object = self
+            .world
+            .objects
+            .get_mut(&created)
+            .ok_or(Trap::native(10, "missing object"))?;
+        if person {
+            object.data[1] = facing;
+            return Ok(());
+        }
+        let wanted = facing & 6;
+        if object.data[1] != wanted {
+            return Err(Trap::Unsupported(format!(
+                "Create New Object Instance turning object {created} from facing {} to \
+                 {wanted}: turning (0x433f75) is not ported",
+                object.data[1]
+            )));
+        }
+        Ok(())
     }
 
     /// The tail's last steps (from 0x44e6b6) for the object `created` just

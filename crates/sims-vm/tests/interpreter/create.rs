@@ -347,3 +347,44 @@ fn what_mode_4_does_not_port_fails_loudly() {
         );
     }
 }
+
+#[test]
+fn mode_6_with_flag_0x20_keeps_a_new_object_that_already_faces_right() {
+    // The stack object faces 1: the new object is to face 0 (bit 0
+    // cleared), as it does when made.
+    let (mut fx, _) = container();
+    fx.lamp_mut().data[1] = 1;
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 6, 0x20, LAMP as i16), Ok(true));
+    let id = new_object(&fx, &before);
+    let object = &fx.world.objects[&id];
+    assert_eq!((object.position, object.data[1]), ([-16, -16, 1], 0));
+    // With no stack object nothing turns.
+    let (mut fx, _) = container();
+    assert_eq!(create(&mut fx, 6, 0x21, 0), Ok(true));
+}
+
+#[test]
+fn what_mode_6_does_not_port_fails_loudly() {
+    // A turn (0x433f75): the stack object faces 2.
+    let (mut fx, _) = container();
+    fx.lamp_mut().data[1] = 2;
+    let result = create(&mut fx, 6, 0x20, LAMP as i16);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x433f75")));
+    // A person (0x44e60e): nothing is made.
+    let (mut fx, file) = container();
+    fx.words(file)[9] = 2;
+    let before = ids(&fx);
+    let result = create(&mut fx, 6, 0, LAMP as i16);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x44e60e")));
+    assert_eq!(ids(&fx), before);
+    // Other flags.
+    for flags in [0x2, 0x4, 0x8, 0x10, 0x40] {
+        let (mut fx, _) = container();
+        let result = create(&mut fx, 6, flags, LAMP as i16);
+        assert!(
+            matches!(trap(result), Trap::Unsupported(ref m) if m.contains("mode 6")),
+            "flags {flags:#x}"
+        );
+    }
+}
