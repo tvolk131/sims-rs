@@ -785,6 +785,25 @@ impl World {
         Ok(())
     }
 
+    /// Whether a tile of level 1 or 2 is outside every enclosure: its
+    /// tile flag 4, as the last rebuild ([`World::rebuild_rooms`]) left
+    /// it. `tile` is the lot's own column and row, not the view's.
+    ///
+    /// The original's tile flag read (0x489260) is given a tile in the
+    /// view and turns it back by the camera's rotation first; the caller
+    /// does that here. The sound's ambience counts these tiles on the
+    /// screen (0x570c3e, `sims_audio::ambience::view`). Only reads: the
+    /// world and its hash are unchanged.
+    ///
+    /// None for a level other than 1 or 2, a tile off the 64-tile
+    /// arrays, or a lot without its flag arrays.
+    pub fn outside(&self, level: u8, tile: [i32; 2]) -> Option<bool> {
+        let id = *FLAGS.get(usize::from(level).checked_sub(1)?)?;
+        let [x, y] = tile.map(|n| usize::try_from(n).ok().filter(|&n| n < FULL));
+        let flags = array(&self.arrays, id, 1).ok()?;
+        Some(flags[at(x?, y?)] & flag::OUTSIDE != 0)
+    }
+
     /// The room an object at `position` is in (0x433bc5), or [`NO_ROOM`].
     ///
     /// The object's tile is its position divided by 16 ([`World::tile`]).

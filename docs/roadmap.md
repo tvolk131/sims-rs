@@ -1952,10 +1952,14 @@ stop-sounds events.
 - **Done: live playback.** The `play` example plays events (and the
   ambience) on the default output device, behind the `playback`
   feature (cpal), off by default; tests and CI build none of it.
+- **Done: the ambience's inputs.** The simulation emits its sound
+  requests (`Update::sounds`), and the game plays them. The camera
+  value the ambience's row follows is ported (`ambience::view`, from
+  0x570c3e: the share of the screen's tiles that are outdoors, read
+  through `World::outside`), and the hour is the clock's.
 - **Next:**
-  - The simulation emits `SoundEvent`s (the interface is in the
-    decisions log), and gives the camera value and the hour for the
-    ambience's cursor.
+  - Positions for 3D sound, pause and unpause (103), reload (104), the
+    piano (43) and the music half of the music modes (36).
   - Checking any of it against the original.
 
 ## Track: recording tool input (`tools/harness`)

@@ -261,3 +261,28 @@ fn a_tile_offers_the_menu_of_the_tile_its_orders_go_to() {
         "tile {tile}, target {target}: {queue:?}"
     );
 }
+
+#[test]
+fn the_ambience_follows_the_outdoor_share_of_the_screen() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    let center = [400, 300];
+    let camera = game.view.camera;
+    let mut views = Vec::new();
+    for zoom in sims_render::Zoom::ALL {
+        for turns in 0..4 {
+            game.view.camera = camera.zoomed(zoom, center).rotated(turns, center);
+            views.push(game.ambience_view());
+        }
+    }
+    // Pinned from this port; the original's values are **unverified**.
+    // Zoomed in on the house, less of the screen is outdoors.
+    assert!(views.iter().all(|v| (0..=100).contains(v)), "{views:?}");
+    assert!(
+        views[8..].iter().sum::<i32>() < views[..4].iter().sum::<i32>(),
+        "{views:?}"
+    );
+}

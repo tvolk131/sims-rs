@@ -145,6 +145,23 @@ impl Game {
         u32::try_from(hour.rem_euclid(24)).unwrap_or(0)
     }
 
+    /// The ambience's camera value (`sims_audio::ambience::view`): the
+    /// share, in percent, of the tiles on the screen that are outdoors,
+    /// on the floor shown. The original works it out each frame from its
+    /// camera (0x570c3e).
+    pub fn ambience_view(&self) -> i32 {
+        let camera = &self.view.camera;
+        let corner = camera
+            .rotate_fine(camera.unproject_fine([0, 0]))
+            .map(|n| n >> 4);
+        let level = u8::try_from(camera.level).unwrap_or(0);
+        let world = self.lot.world();
+        sims_audio::ambience::view(self.view.size, camera.zoom.level(), corner, |tile| {
+            let tile = camera.unrotate_tile(tile.map(i32::from));
+            world.outside(level, tile).unwrap_or(false)
+        })
+    }
+
     /// Why the lot stopped, if it has.
     pub fn stopped(&self) -> Option<&str> {
         self.stopped.as_deref()
