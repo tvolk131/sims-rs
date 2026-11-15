@@ -254,7 +254,7 @@ fn deletions_that_need_more_of_the_lot_fail_loudly() {
 }
 
 #[test]
-fn people_who_do_not_refer_to_a_deleted_object_are_left_alone() {
+fn people_let_go_of_a_deleted_object_and_others_are_left_alone() {
     let (mut fx, _) = lot(2, true);
     fx.add_sim(9);
     // The person's actions name the other widget and nothing.
@@ -275,13 +275,22 @@ fn people_who_do_not_refer_to_a_deleted_object_are_left_alone() {
     assert_eq!(world.globals[36], 1, "its Reset ran");
     assert_eq!(world.order, [2, 9]);
     assert_eq!(format!("{:?}", world.objects[&9]), format!("{sim:?}"));
-    // Deleting the widget the person does refer to fails before its Reset
-    // tree runs.
-    let before = world.clone();
-    let fault = interpreter.delete(&mut world, 2).unwrap_err();
-    assert!(matches!(fault.trap, Trap::Unsupported(_)), "{fault}");
-    assert!(fault.to_string().contains("person 9 refers to object 2"));
-    assert_eq!(world.encode(), before.encode(), "nothing ran");
+    // Deleting the widget the person does refer to: the person lets go of
+    // it before its Reset runs. The last action shows it as its icon,
+    // which is cleared; then the running action ends and becomes the last.
+    world
+        .objects
+        .get_mut(&9)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[73] = 0;
+    assert_eq!(interpreter.delete(&mut world, 2), Ok(()));
+    let person = world.objects[&9].person.as_ref().unwrap();
+    assert_eq!((person.active.target, person.active.table_index), (0, -1));
+    assert_eq!((person.last.target, person.last.icon), (2, 0));
+    assert_eq!(world.order, [9]);
 }
 
 #[test]
@@ -302,4 +311,87 @@ fn a_reset_stops_the_objects_sounds_and_a_deletion_stops_them_once() {
     assert_eq!(plain.reset(&mut quiet, 1, false), Ok(()));
     assert_eq!(plain.delete(&mut quiet, 2), Ok(()));
     assert_eq!(quiet.hash(), world.hash());
+}
+
+#[test]
+fn a_person_lets_go_of_queued_actions_on_a_deleted_object_telling_each_target() {
+    // The widget's function 4 (cancelled) notes its stack object in global
+    // 34 and counts in global 36.
+    let (mut fx, file) = lot(2, false);
+    callback(&mut fx, file, 4, 4301);
+    fx.add(
+        file,
+        4301,
+        tree(vec![
+            assign(scope::GLOBAL, 34, scope::STACK_OBJECT, 0, 1),
+            ins(
+                2,
+                RETURN_TRUE,
+                RETURN_TRUE,
+                expr(scope::GLOBAL, 36, op::ADD, scope::LITERAL, 1),
+            ),
+        ]),
+    );
+    fx.add_sim(9);
+    let person = fx
+        .world
+        .objects
+        .get_mut(&9)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    let action = |target: i16, icon: i16, uid: i32| {
+        let mut action = person.last.clone();
+        (action.target, action.icon, action.uid) = (target, icon, uid);
+        action
+    };
+    // On widget 2; on widget 1, kept; on widget 1 showing widget 2's icon;
+    // on nothing showing widget 2's icon.
+    person.queue = vec![
+        action(2, 2, 1),
+        action(1, 1, 2),
+        action(1, 2, 3),
+        action(0, 2, 4),
+    ];
+    let asked = RefCell::new(Vec::new());
+    let mut interpreter = fx.interpreter();
+    interpreter.asked = Some(&asked);
+    let mut world = fx.world.clone();
+    assert_eq!(interpreter.delete(&mut world, 2), Ok(()));
+    let queue = &world.objects[&9].person.as_ref().unwrap().queue;
+    let uids: Vec<i32> = queue.iter().map(|a| a.uid).collect();
+    assert_eq!(uids, [2]);
+    // Widget 2 is told of its own action, then widget 1 of the one showing
+    // widget 2; the action on nothing tells no one.
+    let cancels: Vec<(u16, usize)> = asked
+        .take()
+        .into_iter()
+        .filter(|a| a.function == 4)
+        .map(|a| (a.object, a.function))
+        .collect();
+    assert_eq!(cancels, [(2, 4), (1, 4)]);
+    assert_eq!((world.globals[34], world.globals[36]), (9, 2));
+}
+
+#[test]
+fn only_the_lots_people_are_told() {
+    // A person object that is not on the lot's list of people keeps its
+    // action on the deleted widget.
+    let (mut fx, _) = lot(1, false);
+    fx.add_sim(9);
+    fx.world.people.clear();
+    let person = fx
+        .world
+        .objects
+        .get_mut(&9)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person.last.target = 1;
+    let interpreter = fx.interpreter();
+    let mut world = fx.world.clone();
+    assert_eq!(interpreter.delete(&mut world, 1), Ok(()));
+    assert_eq!(world.objects[&9].person.as_ref().unwrap().last.target, 1);
 }
