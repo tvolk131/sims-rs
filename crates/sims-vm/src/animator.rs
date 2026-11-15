@@ -1869,9 +1869,9 @@ impl Interpreter<'_> {
     ///    is moved onto the path ([`snap_to_path`], all its segments).
     /// 3. If the person fits there (virtual function 0x54) it is put there
     ///    (virtual function 0x88, [`Self::put_person`]). A person that does
-    ///    not fit would have the animator's position unset (virtual
-    ///    function 0x20) and be put back on its own tile with result 0;
-    ///    that fails loudly.
+    ///    not fit has the animator's position unset (virtual function 0x20
+    ///    with 1, 0x589361; byte +0xd9, which it also sets, is not kept)
+    ///    and is put back on its own tile (0x589dee), and the result is 0.
     pub(crate) fn route_result(&self, world: &mut World, id: u16) -> Result<i32, Trap> {
         let a = world
             .animators
@@ -1900,10 +1900,19 @@ impl Interpreter<'_> {
             .position[2];
         let to = [first, second];
         if !self.fits(world, id, to, level).map_err(|f| f.trap)? {
-            return Err(unsupported(
-                "0x589dee",
-                "ends its route where its person does not fit",
-            ));
+            // 0x589dee: the animator's position is unset (virtual function
+            // 0x20 with 1, 0x589361), and the person is put back on its
+            // own tile.
+            if let Some(a) = world.animators.get_mut(&id) {
+                a.position = [UNSET; 3];
+            }
+            let own = world
+                .objects
+                .get(&id)
+                .ok_or_else(|| Trap::native(10, "missing object"))?
+                .position;
+            self.put_person(world, id, [own[0], own[1]], level)?;
+            return Ok(0);
         }
         self.put_person(world, id, to, level)?;
         Ok(1)
