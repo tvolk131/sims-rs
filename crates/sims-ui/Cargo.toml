@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 libm.workspace = true
 sims-content.workspace = true
+sims-core.workspace = true
 sims-formats.workspace = true
 sims-sim.workspace = true
 

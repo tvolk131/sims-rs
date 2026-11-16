@@ -15,6 +15,7 @@ use crate::art::Art;
 use crate::command::{Camera, Command, Mode, Panel, Relations, Speed, Walls};
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
+use crate::house::{self, House};
 use crate::household::{Faces, Relation, Snapshot, Work, money};
 use sims_formats::bitmap::Image;
 
@@ -64,6 +65,9 @@ pub mod id {
     /// A skill bar, full and empty, in a western language (0x52f356).
     pub const SKILL_FULL: i32 = 4901;
     pub const SKILL_EMPTY: i32 = 4920;
+    /// The house panel's empty rating bar (0x52dd4e); its full one is
+    /// [`TRAIT_FULL`].
+    pub const RATING_EMPTY: i32 = 4919;
     /// The job panel's career icons, and the salary's, performance's and
     /// friends' icons (0x52fc27, 0x66dfdc).
     pub const CAREERS: i32 = 4902;
@@ -93,7 +97,7 @@ pub mod id {
 }
 
 /// Every resource the panel may draw, for [`Art::load`].
-pub const RESOURCES: [i32; 54] = [
+pub const RESOURCES: [i32; 55] = [
     id::WALLS_DOWN,
     id::CUTAWAY,
     id::WALLS_UP,
@@ -126,6 +130,7 @@ pub const RESOURCES: [i32; 54] = [
     id::TRAIT_EMPTY,
     id::SKILL_FULL,
     id::SKILL_EMPTY,
+    id::RATING_EMPTY,
     id::CAREERS,
     id::SALARY,
     id::PERFORMANCE,
@@ -294,6 +299,8 @@ pub enum Kind {
     /// for the lifetime relationship, the two relationships as numbers
     /// and bars, and the icons. `lit` while the pointer is on it.
     Relation { relation: Relation, lit: bool },
+    /// The house panel's ratings and facts, in `rect`, the subpanel.
+    House { house: House },
     /// The first name of the person of type `guid`, in a box centered
     /// over `rect`'s bottom edge, while the pointer is on their portrait.
     Name { guid: u32 },
@@ -696,6 +703,29 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
         relationships(items, panel, snapshot, controls);
     }
+    // The house panel needs no selected Sim (0x52e49e).
+    if controls.panel == Panel::House {
+        let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
+        items.push(Item {
+            rect: panel
+                .offset(HOUSE_TITLE[0], HOUSE_TITLE[1])
+                .with_size(100, 20),
+            kind: Kind::Text {
+                text: "House".into(),
+                size: 11,
+                rgb: LABEL,
+                align: Align::Left,
+            },
+            command: None,
+        });
+        items.push(Item {
+            rect: panel,
+            kind: Kind::House {
+                house: snapshot.house.clone(),
+            },
+            command: None,
+        });
+    }
     // The name of the person whose portrait the pointer is on, over the
     // strip above the portrait. Ours: where and how the original shows a
     // name there is **unverified**.
@@ -892,6 +922,83 @@ fn draw_skills(frame: &mut Frame, art: &Art, panel: Rect, skills: &[i16; 6], nee
             ),
             LABEL,
         );
+    }
+}
+
+/// The house panel's title, where its draw puts it in a western language
+/// (0x52e7af: (5, 0), font 11).
+const HOUSE_TITLE: [i32; 2] = [5, 0];
+/// The house panel's labels' font (0x6f2ae4, font 8; Japanese takes
+/// 0x6f2ae0 for the lot's).
+const HOUSE_FONT: u8 = 8;
+/// Where each rating's label starts down the subpanel, the label's right
+/// end being 3 left of its bar (0x52e0bb), and where each bar is
+/// (0x6f4170, 0x6f3f30).
+const RATING_TOPS: [i32; 5] = [7, 25, 43, 61, 79];
+const RATING_BARS: [[i32; 2]; 5] = [[157, 6], [157, 24], [157, 42], [157, 60], [157, 79]];
+/// The facts' boxes, 80 by 16, at x 0 (0x6f4170, 0x6f4008), the text
+/// right aligned in each (0x5e4bf4 sets alignment 2).
+const FACT_TOPS: [i32; 4] = [18, 38, 58, 78];
+const FACT_SIZE: [i32; 2] = [80, 16];
+
+/// Draws the house panel (0x52e49e) in the subpanel `panel`.
+///
+/// - **Ratings:** each rating's label, in the labels' font, sized to its
+///   text with its right end 3 left of its bar (0x52e0bb); the empty bar
+///   ([`id::RATING_EMPTY`]); and the full bar ([`id::TRAIT_FULL`]) over
+///   it, cut to 4 pixels a tenth: the rating kept to 0 to 100, over 10,
+///   times 4, at most the bar's width. A rating not ported draws its
+///   empty bar.
+/// - **Facts:** "Sq. Ft.", "Bedrooms", "Bathrooms" and "Lot" with their
+///   values (Live.iff `STR#` 133, strings 6 to 9; the lot's size from
+///   `STR#` 138), right aligned in their boxes. The square feet are not
+///   converted to square meters, as the original does where the
+///   language measures in meters.
+///
+/// **Unverified:** the labels' color (the needs labels' is taken), and
+/// how a label sits in its box down the panel (the rating labels at
+/// their top; the facts centred by the font's line height, where the
+/// original centres by the height of an "A").
+fn draw_house(frame: &mut Frame, art: &Art, panel: Rect, house: &House) {
+    let (Some(font), Some(empty), Some(full)) = (
+        art.font(HOUSE_FONT),
+        art.image(id::RATING_EMPTY),
+        art.image(id::TRAIT_FULL),
+    ) else {
+        return;
+    };
+    let full_w = i32::try_from(full.width).unwrap_or(0);
+    let full_h = i32::try_from(full.height).unwrap_or(0);
+    let at = |[x, y]: [i32; 2]| [panel.x.saturating_add(x), panel.y.saturating_add(y)];
+    for (n, name) in house::RATINGS.iter().enumerate() {
+        let bar = at(RATING_BARS[n]);
+        let label = [
+            bar[0].saturating_sub(3).saturating_sub(font.width(name)),
+            panel.y.saturating_add(RATING_TOPS[n]),
+        ];
+        font.draw(frame, name, label, LABEL);
+        frame.draw_all(empty, bar);
+        let tenths = house.ratings[n].map_or(0, |r| r.clamp(0, 100) / 10);
+        if tenths > 0 {
+            let width = (tenths * 4).min(full_w);
+            frame.draw(full, Rect::new(0, 0, width, full_h), bar);
+        }
+    }
+    let lot = house::LOT_SIZES.get(house.lot).copied().unwrap_or("");
+    let facts = [
+        format!("Sq. Ft.: {}", house.square_feet),
+        format!("Bedrooms: {}", house.bedrooms),
+        format!("Bathrooms: {}", house.bathrooms),
+        format!("Lot: {lot}"),
+    ];
+    for (text, top) in facts.iter().zip(FACT_TOPS) {
+        let [w, h] = FACT_SIZE;
+        let [x, y] = at([0, top]);
+        let place = [
+            x.saturating_add(w - font.width(text)),
+            y.saturating_add((h - font.line_height) / 2),
+        ];
+        font.draw(frame, text, place, LABEL);
     }
 }
 
@@ -1521,6 +1628,7 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                 family_friends,
             } => draw_work(frame, art, r, work, *performance, *family_friends),
             Kind::Relation { relation, lit } => draw_relation(frame, art, faces, r, relation, *lit),
+            Kind::House { house } => draw_house(frame, art, r, house),
             Kind::Meter(value) => {
                 let (width, left, right) = meter(*value);
                 frame.fill(r, right);
@@ -1610,6 +1718,16 @@ pub fn hovered(items: &[Item], point: Option<[i32; 2]>) -> Option<usize> {
     items[n].command.is_some().then_some(n)
 }
 
+/// The relationship entry under `point`, which is drawn lit while the
+/// pointer is on it, so that moving onto, off or between entries changes
+/// the frame although the entries take no presses.
+pub fn lit_relation(items: &[Item], point: Option<[i32; 2]>) -> Option<usize> {
+    let [x, y] = point?;
+    items
+        .iter()
+        .rposition(|i| matches!(i.kind, Kind::Relation { .. }) && i.rect.contains(x, y))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1642,6 +1760,7 @@ mod tests {
             family_friends: 0,
             relations: Vec::new(),
             superstar: false,
+            house: crate::house::House::default(),
         }
     }
 
@@ -2160,6 +2279,18 @@ mod tests {
             })
             .collect();
         assert_eq!(lit, [false, true, false, false]);
+        // Moving between entries, or off them, changes what is lit,
+        // though no entry takes a press.
+        let items = layout([800, 600], &s, &controls);
+        let second = lit_relation(&items, controls.pointer).expect("an entry under the pointer");
+        assert!(matches!(
+            items[second].kind,
+            Kind::Relation { lit: true, .. }
+        ));
+        assert_eq!(hovered(&items, controls.pointer), None);
+        let first = lit_relation(&items, Some([521 + 35 + 10, 540]));
+        assert!(first.is_some_and(|n| n != second));
+        assert_eq!(lit_relation(&items, Some([0, 0])), None);
         // Nobody selected, no panel.
         s.selected = None;
         let items = layout([800, 600], &s, &controls);
@@ -2523,6 +2654,65 @@ mod tests {
         assert_eq!(frame.pixel(3, 26), Some([0; 3]));
         assert_eq!(frame.pixel(3, 31), Some(salary));
         assert_eq!(frame.pixel(3, 38), Some(rating));
+    }
+
+    #[test]
+    fn the_house_panel_draws_each_rating_in_tenths() {
+        let mut s = snapshot();
+        s.selected = None;
+        s.house = House {
+            ratings: [Some(75), None, Some(150), Some(-3), Some(9)],
+            square_feet: 1836,
+            bedrooms: 2,
+            bathrooms: 1,
+            lot: 2,
+        };
+        let controls = Controls {
+            expanded: true,
+            panel: Panel::House,
+            ..Controls::default()
+        };
+        // With nobody selected too.
+        let items = layout([800, 600], &s, &controls);
+        let panel = items
+            .iter()
+            .find(|i| matches!(i.kind, Kind::House { .. }))
+            .unwrap();
+        assert_eq!(panel.rect, Rect::new(521, 500, 279, 100));
+        let title = items
+            .iter()
+            .find(|i| matches!(&i.kind, Kind::Text { text, .. } if text == "House"))
+            .unwrap();
+        assert_eq!((title.rect.x, title.rect.y), (521 + 5, 500));
+        assert_eq!(press(&items, [700, 520]), None);
+
+        // Empty bars 40 by 14 and full ones 40 by 16, from (157, y).
+        let (empty, full) = ([1, 1, 1], [2, 2, 2]);
+        let mut art = Art::default();
+        art.insert_font(HOUSE_FONT, crate::font::tests::hanging_font());
+        art.insert(id::RATING_EMPTY, solid(40, 14, empty));
+        art.insert(id::TRAIT_FULL, solid(40, 16, full));
+        let mut frame = Frame::new(220, 110, [0; 3]);
+        draw_house(&mut frame, &art, Rect::new(0, 0, 220, 100), &s.house);
+        // 7 tenths, none, all 10, none (kept to 0), none (9 is 0 tenths).
+        for (n, tenths) in [7, 0, 10, 0, 0].into_iter().enumerate() {
+            let [x, y] = RATING_BARS[n];
+            let y = y + 5;
+            assert_eq!(frame.pixel(x - 1, y), Some([0; 3]), "bar {n}");
+            let first = if tenths > 0 { full } else { empty };
+            assert_eq!(frame.pixel(x, y), Some(first), "bar {n}");
+            if tenths > 0 {
+                assert_eq!(frame.pixel(x + 4 * tenths - 1, y), Some(full));
+            }
+            if tenths < 10 {
+                assert_eq!(frame.pixel(x + 4 * tenths, y), Some(empty));
+            }
+            assert_eq!(frame.pixel(x + 40, y), Some([0; 3]));
+            // The full bar is drawn from the empty one's top, and runs
+            // two rows below it.
+            let below = if tenths > 0 { full } else { [0; 3] };
+            assert_eq!(frame.pixel(x, y - 5 + 15), Some(below), "bar {n}");
+        }
     }
 
     #[test]
