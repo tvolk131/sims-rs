@@ -5,13 +5,14 @@
 //! "process" tree reaches it when a baby grows into a child (tree 0x1010),
 //! and a debug interaction for pets.
 //!
-//! **Operands.** Bytes 0, 1 and 2 index the frame's locals, read in that
-//! order (0x47518f): the skin tone (string local + 1 of STR# 0x2000), the
-//! age in years (below 18 a child; negative copies the running object's
-//! own body, 0x44b23c), and the sex (0 male, any other female). An index
-//! past the locals throws native error 8 (b0 at 0x44b3b3, b2 at 0x44b39e,
-//! b1 at 0x44b389, checked in that order). Byte 3 picks the template
-//! (0 TemplatePerson, 1 TemplateDog, 2 TemplateCat).
+//! **Operands.** Bytes 0, 1 and 2 index the frame's locals (0x47518f):
+//! the skin tone (string local + 1 of STR# 0x2000), the age in years
+//! (below 18 a child; negative copies the running object's own body,
+//! 0x44b23c), and the sex (0 male, any other female). They are read in
+//! the order b0, b2, b1 (0x44ae23, 0x44ae49, 0x44ae70), and an index past
+//! the locals throws native error 8 (b0 at 0x44b3b3, b2 at 0x44b39e, b1
+//! at 0x44b389). Byte 3 picks the template (1 TemplateDog, 2
+//! TemplateCat, any other value TemplatePerson, 0x4260fa).
 //!
 //! **Not ported, and failing loudly.** Everything after the operands
 //! starts with 0x4260e1, which copies the template to a new character file

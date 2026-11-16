@@ -8,8 +8,8 @@ where the original makes a new person definition while the game runs.
 - Bytes 0, 1 and 2 index the frame's locals: the skin tone, the age in
   years and the sex. The original reads them in the order b0, b2, b1
   (0x44ae23, 0x44ae49, 0x44ae70); an index past the locals throws native
-  error 8 (0x44b3b3, 0x44b39e, 0x44b389). Byte 3 picks the template:
-  TemplatePerson, TemplateDog or TemplateCat.
+  error 8 (0x44b3b3, 0x44b39e, 0x44b389). Byte 3 picks the template (0x4260fa):
+  1 TemplateDog, 2 TemplateCat, any other value TemplatePerson.
 - Next, 0x4260e1 copies the template to `Characters/User%05d.iff`,
   gives the copy a new GUID ((timeGetTime << 16) XOR one C runtime
   draw, 0x4725d5), registers it and makes a neighbour record for it. The
