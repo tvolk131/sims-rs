@@ -5,6 +5,7 @@
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_content::{Index, Install, Neighborhood};
 use sims_ui::art::Art;
+use sims_ui::house;
 use sims_ui::household::{Acquaintances, Careers, Faces, Snapshot};
 use sims_vm::boot::{Frames, Lot};
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ pub const GOTH_HOUSE: &str = "UserData/Houses/House05.iff";
 
 pub struct Opened {
     pub careers: Careers,
+    pub house: house::Tuning,
     pub snapshot: Snapshot,
     pub art: Art,
     pub faces: Faces,
@@ -73,11 +75,14 @@ pub fn open(root: &Path, house: &str) -> Opened {
     let snapshot = Snapshot::read(world, &family.members)
         .with_careers(&careers)
         .with_relations(world, &family.members, &known);
+    let house = house::Tuning::load(&index, catalog).unwrap();
+    let snapshot = snapshot.with_house(world, &house);
     let ui = UiGraphics::open(&install).unwrap();
     let art = Art::load(&ui, US_ENGLISH, &sims_ui::hud::RESOURCES).unwrap();
     let faces = Faces::load(&index, catalog, &family.members).unwrap();
     Opened {
         careers,
+        house,
         snapshot,
         art,
         faces,

@@ -16,6 +16,7 @@ use sims_ui::art::Art;
 use sims_ui::command::{Command, Panel as UiPanel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
+use sims_ui::house;
 use sims_ui::household::{Acquaintances, Careers, Faces, Snapshot};
 use sims_ui::hud::{self, Controls, Item};
 use sims_ui::pie;
@@ -49,6 +50,9 @@ pub struct Hud {
     /// The careers of `work.iff`, for what the job panel shows the next
     /// level needs.
     careers: Careers,
+    /// The curves and constants the house panel's ratings are worked out
+    /// with.
+    house: house::Tuning,
     /// What the relationship panel needs from outside the world: the
     /// autonomy tuning's friendship threshold (0x6c4398) for its
     /// smileys, the neighborhood's characters, and the Superstar pack.
@@ -123,6 +127,8 @@ impl Hud {
         let faces =
             Faces::load(assets.index(), assets.catalog(), &people).map_err(|e| e.to_string())?;
         let careers = Careers::load(assets.index()).map_err(|e| e.to_string())?;
+        let house =
+            house::Tuning::load(assets.index(), assets.catalog()).map_err(|e| e.to_string())?;
         let known = Acquaintances::read(
             assets.index(),
             assets.catalog(),
@@ -135,6 +141,7 @@ impl Hud {
             thumbnails: Thumbnails::default(),
             problems: Vec::new(),
             careers,
+            house,
             known,
             labels,
             members,
@@ -191,13 +198,14 @@ impl Hud {
     /// What the panel shows of `world`: the household with what the next
     /// level of each one's career needs, and, while the relationship
     /// panel is open, the people the selected Sim knows (read only then:
-    /// the lookup goes through every neighborhood record).
+    /// the lookup goes through every neighborhood record), or while the
+    /// house panel shows (the strip open on it), the house's ratings.
     pub fn snapshot(&self, world: &World) -> Snapshot {
         let snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
-        if self.controls.panel == UiPanel::Relationships {
-            snapshot.with_relations(world, &self.members, &self.known)
-        } else {
-            snapshot
+        match self.controls.panel {
+            UiPanel::Relationships => snapshot.with_relations(world, &self.members, &self.known),
+            UiPanel::House if self.controls.expanded => snapshot.with_house(world, &self.house),
+            _ => snapshot,
         }
     }
 
