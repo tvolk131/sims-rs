@@ -44,8 +44,8 @@ works it out as `House::read` does the other ratings.
 - **When the types are read:**
   - The game reads them for types it has not seen yet, at each draw
     while the house panel shows.
-  - The viewer's world does not change, so it reads them once when it
-    opens.
+  - The viewer's world does not change, so it reads them once, the
+    first time the house panel shows.
   - A type that has not been read counts for nothing.
 - **The Goths' house:** after the load, 73 of the lot's 253 object
   types count. Nothing is dirty or broken, so Upkeep is 100.
