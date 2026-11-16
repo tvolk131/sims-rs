@@ -322,3 +322,45 @@ fn a_content_without_the_fire_type_fails_loudly() {
         "{trap:?}"
     );
 }
+
+#[test]
+fn the_fire_goes_to_the_level_the_place_test_left_its_object_on() {
+    // Sol's review reproduction: the fire's function 5 (may overlap) runs
+    // during its place test and moves the catching widget upstairs with
+    // Find Location For. The put reads the widget's level again
+    // (0x44e065, 0x44e06f), so the fire goes upstairs too.
+    let (mut fx, widgets) = lot_and_widget_file();
+    let w = widget(&mut fx, [3, 3], true);
+    fx.world.objects.get_mut(&w).unwrap().data[4] = 3;
+    fx.world.objects.get_mut(&w).unwrap().data[42] = 3;
+    fx.words(widgets)[16] = 0;
+    fx.lamp_mut().position = [56, 56, 2];
+    let at = (3 * 64 + 3) * 2;
+    fx.world.arrays.get_mut(&101).unwrap().data[at] = 1;
+    let file = fx.catalog.object(FIRE).unwrap().resource;
+    fx.add(
+        file,
+        FIRE_INIT,
+        tree(vec![
+            assign(scope::MY_DATA, 4, scope::LITERAL, 3, 1),
+            assign(scope::MY_DATA, 42, scope::LITERAL, 3, RETURN_TRUE),
+        ]),
+    );
+    const OVERLAP: u16 = 4200;
+    crate::visits::function(&mut fx, file, 5, OVERLAP);
+    fx.add(
+        file,
+        OVERLAP,
+        tree(vec![
+            // Not solid from here on, so moving the widget does not call
+            // this again.
+            assign(scope::MY_DATA, 8, scope::LITERAL, 4, 1),
+            assign(scope::LOCALS, 0, scope::LITERAL, LAMP as i16, 2),
+            // Find Location For: the widget goes upstairs, by the lamp.
+            ins(16, RETURN_TRUE, ERROR, [0, 0, 3, 0, 0, 0, 0, 0]),
+        ]),
+    );
+    assert_eq!(burn(&mut fx, w, 0, 0), Ok(true));
+    assert_eq!(fx.world.objects[&w].position, [56, 56, 2]);
+    assert_eq!(fires(&fx), [[56, 56, 2]]);
+}

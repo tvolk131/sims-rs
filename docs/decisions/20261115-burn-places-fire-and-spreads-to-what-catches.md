@@ -35,7 +35,10 @@ opcode 9 to 0x44d96f.
   Any gathered object with data word 8 flag 0x800 takes the false branch,
   and so, without byte 1 bit 0, does one with flag 0x20 or data word 62
   above 0. Then each one whose tile has no fire gets one at its tile's
-  centre. The branch is true when any fire was placed.
+  centre. The place test takes the object's level as it was, and the put
+  reads it again (0x44e065, 0x44e06f): a callback that moved the object
+  during the test takes the fire with it. The branch is true when any
+  fire was placed.
 - **The footprint's order.** The original keeps a footprint at +0x100 as
   the greatest coordinates, then the least (0x433d16); the port keeps
   them the other way round. Burn's neighbour test (0x44de31) is an

@@ -592,7 +592,10 @@ fn unimplemented_primitives_name_themselves() {
     let fault = fx.run().unwrap_err();
     assert_eq!(fault.trap, Trap::Unimplemented { opcode: 34 });
     let text = fault.to_string();
-    assert!(text.contains("unimplemented primitive 34 (UI Effect)"), "{text}");
+    assert!(
+        text.contains("unimplemented primitive 34 (UI Effect)"),
+        "{text}"
+    );
     for (opcode, name) in [
         (3, "Find Best Interaction"),
         (13, "Push Interaction"),

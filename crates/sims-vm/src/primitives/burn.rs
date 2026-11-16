@@ -44,8 +44,10 @@
 //!    functions 0x38, 0x58 and 0x74, 0x44df25). That is not ported and
 //!    fails loudly.
 //! 9. **Each gathered object** whose tile has no fire on it gets one, made
-//!    and placed at the centre of its tile on its level, as in step 5. A
-//!    fire refused is removed at once. The branch is true when any fire
+//!    and placed at the centre of its tile, as in step 5. The place test
+//!    takes the object's level as it was; the put reads it again
+//!    (0x44e06f), in case the test's callbacks moved the object. A fire
+//!    refused is removed at once. The branch is true when any fire
 //!    was placed. (When the factory gives 0 the original takes the false
 //!    branch at once; the port's factory faults instead, which fails
 //!    loudly.)
@@ -156,7 +158,7 @@ impl Machine<'_, '_> {
         }
         let Some(first) = catching else {
             let fire = self.make_fire()?;
-            return self.put_fire(fire, [p0, p1], level);
+            return self.put_fire(fire, [p0, p1], level, None);
         };
         let gathered = self.gather(first)?;
         for &id in &gathered {
@@ -302,7 +304,9 @@ impl Machine<'_, '_> {
     }
 
     /// Step 9 for one gathered object: a fire at the centre of its tile,
-    /// on its level, read after the fire is made.
+    /// read after the fire is made. The place test takes its level as it
+    /// is then; the put reads it again (0x44e050, 0x44e06f), so an object
+    /// the test moved takes the fire to its new level.
     fn place_fire_under(&mut self, id: u16) -> Result<bool, Trap> {
         let fire = self.make_fire()?;
         let [p0, p1, level] = self
@@ -317,7 +321,7 @@ impl Machine<'_, '_> {
             })?
             .position;
         let centre = |n: i32| (n & !0xf) | 8;
-        self.put_fire(fire, [centre(p0), centre(p1)], level)
+        self.put_fire(fire, [centre(p0), centre(p1)], level, Some(id))
     }
 
     /// A fire, made by the factory (0x440b2d), its Init and first turn
@@ -330,8 +334,15 @@ impl Machine<'_, '_> {
     }
 
     /// The place test, then the put with the lot told, or the fire's
-    /// removal at once.
-    fn put_fire(&mut self, fire: u16, position: [i32; 2], level: i32) -> Result<bool, Trap> {
+    /// removal at once. With `under`, the put takes that object's level
+    /// as it is after the test.
+    fn put_fire(
+        &mut self,
+        fire: u16,
+        position: [i32; 2],
+        level: i32,
+        under: Option<u16>,
+    ) -> Result<bool, Trap> {
         let interpreter = self.interpreter();
         let unsupported = |fault| Trap::Unsupported(format!("Burn placing fire {fire}: {fault}"));
         if !interpreter
@@ -343,6 +354,21 @@ impl Machine<'_, '_> {
                 .map_err(unsupported)?;
             return Ok(false);
         }
+        let level = match under {
+            None => level,
+            Some(id) => {
+                self.world
+                    .objects
+                    .get(&id)
+                    .ok_or_else(|| {
+                        Trap::Unsupported(format!(
+                            "Burn: object {id} went away while fire {fire} was place-tested, \
+                             and the original reads its level after it is freed (0x44e06f)"
+                        ))
+                    })?
+                    .position[2]
+            }
+        };
         interpreter
             .put(
                 self.world,
