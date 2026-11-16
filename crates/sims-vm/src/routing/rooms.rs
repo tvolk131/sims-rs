@@ -46,6 +46,11 @@ const DOOR: i16 = 8;
 const PAIRING: usize = 0x8a / 2;
 /// Object data word 29: the room.
 const ROOM: usize = 29;
+/// Object data word 8, the object's flags (+0x5a).
+const OBJECT_FLAGS: usize = 8;
+/// The flag of data word 8 that makes a tile with water one a person can
+/// stand on (0x482321).
+const ON_WATER: i16 = 0x1000;
 /// Global 10: the lot's number.
 const LOT: usize = 10;
 
@@ -202,7 +207,8 @@ impl Interpreter<'_> {
 
     /// Whether a person of room `room` may stand on a tile (0x4821f3):
     /// the tile is the room's, split by a diagonal wall, or holds a door
-    /// whose other side is in the room; and the tile has no water.
+    /// whose other side is in the room; and the tile has no water, or an
+    /// object on it with flag 0x1000 of data word 8.
     fn available(
         &self,
         world: &World,
@@ -235,12 +241,22 @@ impl Interpreter<'_> {
                 return Ok(false);
             }
         }
-        // 0x478f4a: a tile with water needs an object that makes it
-        // standable.
+        // 0x478f4a: a tile with water (array 10 not 0xff, on the ground)
+        // is one only when an object on it, as the lot links them
+        // (0x43f331, 0x43f379), has flag 0x1000 of data word 8 (+0x5a,
+        // 0x48231d).
         if level == 1 && array(world, WATER, 1)?[x * FULL + y] != 0xff {
-            return Err(Trap::Unsupported(
-                "a tile with water in a room the planner reads (0x482301) is not ported".into(),
-            ));
+            for id in standing_on(world, [x as u8, y as u8, 1])? {
+                let flags = world
+                    .objects
+                    .get(&id)
+                    .and_then(|o| o.data.get(OBJECT_FLAGS).copied())
+                    .ok_or_else(|| Trap::Invalid(format!("object {id} has no data word 8")))?;
+                if flags & ON_WATER != 0 {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
         }
         Ok(true)
     }
@@ -662,5 +678,74 @@ mod tests {
         }
         let result = walls_cross(&lot, footprint([-5, 3], [45, 51]), 1);
         assert!(matches!(&result, Err(Trap::Unsupported(m)) if m.contains("off the lot")));
+    }
+
+    /// A world with water on tile (5, 5), and, when `flags` is given, an
+    /// object standing there with those flags in data word 8.
+    fn watered(flags: Option<i16>) -> World {
+        let mut world = world();
+        world.arrays.get_mut(&WATER).unwrap().data[5 * FULL + 5] = 0;
+        if let Some(flags) = flags {
+            let mut data = vec![0; 72];
+            data[OBJECT_FLAGS] = flags;
+            world.objects.insert(
+                40,
+                sims_sim::Object {
+                    id: 40,
+                    guid: 0x7001,
+                    footprint: [0; 4],
+                    position: [5 * 16 + 8, 5 * 16 + 8, 1],
+                    unknown_short: 0,
+                    attributes: Vec::new(),
+                    temps: vec![0; 8],
+                    data,
+                    obsolete_word: 0,
+                    stack_capacity_bytes: 0,
+                    stack: Vec::new(),
+                    relationship_flag: -1,
+                    relationships: Vec::new(),
+                    slots: Vec::new(),
+                    dynamic_sprites: Vec::new(),
+                    multipart: None,
+                    portal: None,
+                    person: None,
+                    registry_word: None,
+                    last_result: false,
+                    removal_skips_resets: false,
+                    selected: false,
+                },
+            );
+            world.order.push(40);
+            // The object grid (array 3) names it first on the tile.
+            let cell = (5 * FULL + 5) * 2;
+            world.arrays.get_mut(&3).unwrap().data[cell..cell + 2]
+                .copy_from_slice(&40u16.to_le_bytes());
+        }
+        world
+    }
+
+    #[test]
+    fn a_tile_with_water_needs_an_object_that_lets_a_person_stand_there() {
+        // 0x4822f8 to 0x482332: a tile with water (0x478f4a) is the room's
+        // only when an object on it has flag 0x1000 of data word 8 (+0x5a).
+        let (program, catalog) = (program(), catalog());
+        let interpreter = Interpreter::new(&program, &catalog, Stream::Lot);
+        let dry = interpreter.room_rects(&world(), 0, false).unwrap();
+        // Water alone: the tile is hard, one more rectangle round it.
+        let wet = interpreter.room_rects(&watered(None), 0, false).unwrap();
+        assert_eq!(wet.len(), dry.len() + 1, "{wet:?}");
+        let tile = wet.iter().find(|r| !dry.contains(r)).unwrap();
+        assert_eq!(tile.0[4], HARD);
+        assert!(tile.0[0] <= 5 * 16 && tile.0[2] >= 6 * 16, "{tile:?}");
+        // An object there without the flag changes nothing.
+        let other = interpreter
+            .room_rects(&watered(Some(0x0fff)), 0, false)
+            .unwrap();
+        assert_eq!(other, wet);
+        // With it, the tile is as if dry.
+        let standable = interpreter
+            .room_rects(&watered(Some(0x1000)), 0, false)
+            .unwrap();
+        assert_eq!(standable, dry);
     }
 }

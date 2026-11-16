@@ -16,11 +16,12 @@
 //!    the turn and +0x21c the target point; then the placement's
 //!    compensation (+0x8c, three floats).
 //!
-//! Everything here assumes the person's reset in load step 13, which
-//! runs only when the person's type's scripts changed since the save
-//! ([`sims_sim::World::changed_types`]). On the Goth house and the Newbie
-//! house every person's type has; on the Pleasants' none has. A person
-//! the load does not reset fails ([`Interpreter::restore_animator`]).
+//! The person's reset in load step 13 runs only when the person's type's
+//! scripts changed since the save ([`sims_sim::World::changed_types`]).
+//! On the Goth house and the Newbie house every person's type has; on the
+//! Pleasants' none has. Most of what follows is for a person the load
+//! resets; one it does not reset keeps a live animator (see "A person the
+//! load does not reset" below).
 //!
 //! Then (0x591c2e on): the clock is read (0x434101 with 0), the skin is
 //! updated with the layers at once (0x5992b3, forced), the animator is
@@ -45,22 +46,56 @@
 //! is gone reads it (0x5906bc). Not kept: a layer's +0x5c, +0x78 and +0x7c, which the
 //! restore sets and nothing ported reads. A compensation other than 0
 //! fails, since the placement adds it and that is not ported.
+//!
+//! **A person the load does not reset** keeps what the read and the
+//! constructor left ([`Interpreter::restore_live`]):
+//!
+//! - The constructor's fields (0x587d..): [`LOADED`]'s, but the reset's
+//!   own writes are not made, so [`Animator::promote`] stays 0.
+//! - Its clock (+0xb4): the clock at the load's tick count (0x585483,
+//!   from 0x587f5a).
+//! - +0xa4 and +0xa0 as saved: the events seen and whether Animate Sim's
+//!   clip plays ([`Animator::playing`]).
+//! - The three layers, live in their slots: the foreground, the carry
+//!   and the base ([`sims_sim::animator::Base::Loaded`]). Each is made at
+//!   the clock, with the saved phase and end mode.
+//! - The routing state as saved if it is 0 to 3; any other becomes 3
+//!   (0x591d44 to 0x591d64, after the read of +0x190).
+//! - The skin updated with the layers at the clock (0x5992b3, forced): no
+//!   time passes, so each layer's phase stays and its event time becomes
+//!   the phase's. A timed event that update reaches would be handled
+//!   (0x5912fd) before the person's data words are read; that fails.
+//! - Placed on the person's tile (0x592132), and the head's step taken,
+//!   which sets the head's clock to the animator's.
+//!
+//! The capture `house06-pleasants-ticks-20261115` shows this at entry 0:
+//! persons 117 and 240, saved in states 4 and 9, are in state 3, with
+//! their destinations at their positions; persons 241 to 243 are in state
+//! 0 with Animate Sim's clip playing, the foreground layer's clocks both
+//! at the load's clock and its event times at its phase.
 
 use crate::fault::Trap;
 use crate::interpreter::Interpreter;
 use sims_core::{Ext, F32};
 use sims_sim::Object;
-use sims_sim::animator::{Animator, HeldPose, LOADED, Layer};
+use sims_sim::animator::{Advance, Animator, Base, HeldPose, LOADED, Layer};
 
 /// The descriptors' scale (0x666a24): 0.001.
 const MILLI: F32 = F32::from_bits(0x3a83_126f);
 
 /// What the load leaves of one person's animator: the animator itself
-/// when it differs from [`LOADED`], and the pose its skin holds.
+/// when it differs from [`LOADED`], the pose its skin holds, and the
+/// layer in its base slot ([`sims_sim::World::base_layers`]).
 #[derive(Debug, Default)]
 pub(crate) struct Restored {
     pub animator: Option<Animator>,
     pub held: Option<HeldPose>,
+    pub base: Option<Layer>,
+    /// The bones whose translation the restore's skin update could write
+    /// (0x5992b3, 0x598226), for [`sims_sim::World::translated_bones`]:
+    /// for a person the load does not reset. A reset person's are noted
+    /// when its held pose ends.
+    pub moved: Vec<String>,
 }
 
 /// One layer descriptor as the restore reads it (0x591eec; the save
@@ -141,10 +176,8 @@ impl Interpreter<'_> {
     /// its type's scripts changed since the save
     /// ([`sims_sim::World::changed_types`], `crate::visits`).
     ///
-    /// A person the load does not reset fails: its animator keeps what
-    /// the read left (its clips play on in their slots, Animate Sim's
-    /// clip is still playing, its state stays the saved one, it stays
-    /// placed), which is not ported.
+    /// A person the load does not reset keeps a live animator
+    /// ([`Interpreter::restore_live`]).
     pub(crate) fn restore_animator(
         &self,
         id: u16,
@@ -155,14 +188,6 @@ impl Interpreter<'_> {
         let Some(person) = object.person.as_ref() else {
             return Ok(Restored::default());
         };
-        if !reset {
-            return Err(Trap::Unsupported(format!(
-                "person {id} is not reset by the load (its type's scripts are unchanged since \
-                 the save, 0x459bf6), so its animator keeps what the restore read (0x5918ba): \
-                 its clips play on and it stays in state {}; not ported",
-                person.routing_state
-            )));
-        }
         let floats = person.floats;
         if floats[6..].iter().any(|&v| v != 0.0) {
             return Err(Trap::Unsupported(format!(
@@ -170,6 +195,9 @@ impl Interpreter<'_> {
                  0x5918ba): the placement adds it (0x592132), which is not ported",
                 &floats[6..]
             )));
+        }
+        if !reset {
+            return self.restore_live(id, object, person, ticks);
         }
         // The layers, each read (0x591eec) and inserted into the skin
         // before the first layer of a higher priority (0x599128): by
@@ -224,25 +252,182 @@ impl Interpreter<'_> {
 
         let mut a = LOADED;
         a.seen = person.animation_events;
-        a.head.heading = F32::from_f32(floats[0]);
-        a.head.target_heading = F32::from_f32(floats[1]);
-        a.head.turn = F32::from_f32(floats[2]);
-        a.head.target = Some([3, 4, 5].map(|i| F32::from_f32(floats[i])));
-        // 0x590768: the constructor zeroed the head clock (+0x164,
-        // 0x587d80) and set the animator's clock (+0xb4) to the clock at
-        // the load's tick count (0x585483, from 0x587f5a). The step runs
-        // when the two differ (0x590788): word 45 is 0, so nothing counts
-        // down, and bit 0 of word 42 is clear, so the turn relaxes. At
-        // tick 0 they are the same and it only settles.
-        if LOADED.clock_at(ticks as i32) != LOADED.head_clock {
-            a.head.relax();
-        }
-        a.head.settle();
+        restore_head(&mut a, &floats, ticks);
         Ok(Restored {
             animator: (a != LOADED).then_some(a),
             held,
+            base: None,
+            moved: Vec::new(),
         })
     }
+
+    /// The animator of person `id`, which the load does not reset (the
+    /// module documentation, "A person the load does not reset").
+    ///
+    /// Fails for what is not ported: a timed event the restore's skin
+    /// update reaches, and a base clip with timed events, which the base
+    /// slot's layers are kept from having ([`Base`]).
+    fn restore_live(
+        &self,
+        id: u16,
+        object: &Object,
+        person: &sims_formats::saved_objects::Person,
+        ticks: u32,
+    ) -> Result<Restored, Trap> {
+        let clock = LOADED.clock_at(ticks as i32);
+        // The foreground (+0xc), carry (+0x13c) and base (+0x14) slots,
+        // in the order read.
+        let mut slots: [Option<Layer>; 3] = Default::default();
+        for (slot, text) in slots.iter_mut().zip(&person.animations) {
+            let Some(d) = descriptor(text.as_bytes()) else {
+                continue;
+            };
+            let clip = self.program.animations.clip(&d.name).map_err(|e| {
+                Trap::Unsupported(format!(
+                    "person {id}'s saved layer names a clip {:?} that is not found (0x592613, \
+                     0x5a03e4): {e}",
+                    d.name
+                ))
+            })?;
+            let mut layer = Layer::make(
+                &d.name,
+                F32::from_bits(clip.duration),
+                clip.frames,
+                clip.motions > 0,
+                clip.tracks.len(),
+                d.priority,
+                d.speed,
+                d.weight,
+                clock,
+            );
+            layer.phase = d.phase;
+            layer.mode = d.mode;
+            *slot = Some(layer);
+        }
+        let [foreground, carry, base] = slots;
+        if let Some(base) = &base
+            && !base.cursors.is_empty()
+        {
+            return Err(Trap::Unsupported(format!(
+                "person {id}'s saved base layer plays {:?}, whose clip has timed events, at the \
+                 load's skin update (0x5992b3): the base slot's layer is not ported to handle \
+                 them",
+                base.clip
+            )));
+        }
+
+        let mut a = LOADED;
+        // The reset sets +0x1a0 (0x589220); the constructor clears it.
+        a.promote = false;
+        a.clock = clock;
+        a.seen = person.animation_events;
+        a.playing = person.engaged != 0;
+        a.state = if (0..=3).contains(&person.routing_state) {
+            person.routing_state
+        } else {
+            3
+        };
+        a.foreground = foreground;
+        a.carry = carry;
+        if base.is_some() {
+            a.base = Base::Loaded;
+        }
+        let mut base = base;
+        // 0x5992b3, forced: the layers by priority, the carry before a
+        // foreground of higher priority (the order read decides a tie:
+        // the foreground was read first).
+        let carry_first = crate::animator::carry_first(&a);
+        let mut order: Vec<&mut Layer> = Vec::new();
+        order.extend(base.as_mut());
+        let (first, second) = if carry_first {
+            (a.carry.as_mut(), a.foreground.as_mut())
+        } else {
+            (a.foreground.as_mut(), a.carry.as_mut())
+        };
+        order.extend(first);
+        order.extend(second);
+        for layer in order {
+            self.update_restored(id, layer, clock)?;
+        }
+        // The forced update poses the skin with every layer (0x5992b3), so
+        // the bones they move count as moved since the skin was made, as
+        // at any skin update.
+        let moved = self.translated_by(
+            id,
+            [base.as_ref(), a.foreground.as_ref(), a.carry.as_ref()]
+                .into_iter()
+                .flatten(),
+        )?;
+        a.skin_clock = clock;
+        a.skin_dirty = false;
+        let direction = object.data.get(1).copied().unwrap_or(0);
+        crate::animator::place(&mut a, object.position, direction);
+        restore_head(&mut a, &person.floats, ticks);
+        a.head_clock = a.clock;
+        Ok(Restored {
+            animator: Some(a),
+            held: None,
+            base,
+            moved,
+        })
+    }
+
+    /// One layer's update at the restore's skin update (0x597c4c at clock
+    /// `now`, the clock it was made at). A timed event it reaches fails:
+    /// the animator would handle it (0x5912fd) before the person's data
+    /// words are read, which is not ported.
+    fn update_restored(&self, id: u16, layer: &mut Layer, now: i32) -> Result<(), Trap> {
+        match layer.update(now).map_err(Trap::Unsupported)? {
+            Advance::Unbound => return Ok(()),
+            Advance::Silent => {}
+            Advance::Events => {
+                let clip = self
+                    .program
+                    .animations
+                    .clip(&layer.clip)
+                    .map_err(|e| Trap::Unsupported(format!("a layer's clip: {e}")))?;
+                for (track, motion) in clip.tracks.iter().enumerate() {
+                    let times: Vec<(i32, bool)> = motion
+                        .events
+                        .iter()
+                        .map(|e| (e.time, !e.properties.is_empty()))
+                        .collect();
+                    if !layer
+                        .due(track, &times)
+                        .map_err(Trap::Unsupported)?
+                        .is_empty()
+                    {
+                        return Err(Trap::Unsupported(format!(
+                            "person {id}'s restored layer {:?} reaches a timed event at the \
+                             load's skin update (0x5992b3), before the person's data words \
+                             are read: not ported",
+                            layer.clip
+                        )));
+                    }
+                }
+            }
+        }
+        layer.commit();
+        Ok(())
+    }
+}
+
+/// The head's saved fields, and the step the restore then takes
+/// (0x590768): the constructor zeroed the head clock (+0x164, 0x587d80)
+/// and set the animator's clock (+0xb4) to the clock at the load's tick
+/// count (0x585483, from 0x587f5a). The step runs when the two differ
+/// (0x590788): word 45 is 0, so nothing counts down, and bit 0 of word 42
+/// is clear, so the turn relaxes. At tick 0 they are the same and it only
+/// settles.
+fn restore_head(a: &mut Animator, floats: &[f32; 9], ticks: u32) {
+    a.head.heading = F32::from_f32(floats[0]);
+    a.head.target_heading = F32::from_f32(floats[1]);
+    a.head.turn = F32::from_f32(floats[2]);
+    a.head.target = Some([3, 4, 5].map(|i| F32::from_f32(floats[i])));
+    if LOADED.clock_at(ticks as i32) != LOADED.head_clock {
+        a.head.relax();
+    }
+    a.head.settle();
 }
 
 #[cfg(test)]
