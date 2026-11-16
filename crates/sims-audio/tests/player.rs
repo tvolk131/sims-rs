@@ -2085,51 +2085,65 @@ fn long_sample(name: &str) -> BTreeMap<String, Pcm> {
 
 #[test]
 fn a_camera_move_does_not_follow_a_target_a_later_start_reset() {
-    // Track 10's first start plays a long note, sets its `target` to
-    // track 11 and ends; global 110 marks it. Its second start sees the
-    // mark and waits, its `target` itself, as a fresh start leaves the
-    // original's track object. Track 11 waits 10 ms for object 8, which
-    // does not move, then asks with its extvol and pan. The camera move
-    // places track 10's ended thread itself: track 11 keeps the full
-    // volume and the centre its own start gave it.
-    let mut first = vec![TEST, 110, IFNE];
-    first.extend(long(0x102));
-    first.extend(loadl(110, 1));
-    first.extend(NOTE_ON_V1);
-    first.extend(loadl(53, 11));
-    first.push(END);
+    // Track 10's first start sets its `target` to track 11; global 110
+    // marks it, and its second start sees the mark and goes to routine
+    // 2, its `target` itself, as a fresh start leaves the original's
+    // track object. Track 11 waits 10 ms for object 8, which does not
+    // move, then asks with its extvol and pan. Whichever of track 10's
+    // threads still runs or plays, the camera move places the older one
+    // itself: track 11 keeps the full volume and the centre its own
+    // start gave it. Cases (Sol's reviews):
+    // - the first plays a long note and ends; the second waits;
+    // - the first plays a long note and ends; the second ends at once;
+    // - the first waits; the second plays a long note and ends.
+    let mark = |then: &[u8]| {
+        let mut first = vec![TEST, 110, IFNE];
+        first.extend(long(0x102));
+        first.extend(loadl(110, 1));
+        first.extend(loadl(53, 11));
+        first.extend(then);
+        first
+    };
+    let note_and_end = [NOTE_ON_V1[0], NOTE_ON_V1[1], END];
+    let wait: &[u8] = &[SET_LOOP, LOOP];
+    let cases: [(Vec<u8>, &[u8]); 3] = [
+        (mark(&note_and_end), wait),
+        (mark(&note_and_end), &[END]),
+        (mark(wait), &note_and_end),
+    ];
     let mut asks = loadl(5, 10);
     asks.extend([WAIT, 5]);
     asks.extend([72, 6, 1, 19, 72, 6, 1, 20, END]);
-    let waiting: &[u8] = &[SET_LOOP, LOOP];
     let start = on_lot(&[(8, 400), (9, 400)]);
-    let probe = Probe {
-        lot: on_lot(&[(8, 400), (9, 800)]),
-        asked: Default::default(),
-    };
-    let mut player = Player::new(
-        vec![module(&[&first, &asks, waiting], 1)],
-        long_sample("one.xa"),
-        1,
-    );
-    let play = |player: &mut Player<_>, object: u32, name: &str| {
-        player.handle(
-            &SoundEvent::Play {
-                object,
-                name: name.into(),
-            },
-            &start,
+    for (case, (first, second)) in cases.iter().enumerate() {
+        let probe = Probe {
+            lot: on_lot(&[(8, 400), (9, 800)]),
+            asked: Default::default(),
+        };
+        let mut player = Player::new(
+            vec![module(&[first, &asks, second], 1)],
+            long_sample("one.xa"),
+            1,
         );
-    };
-    play(&mut player, 8, "e1");
-    play(&mut player, 9, "e0");
-    player.render(BLOCK, &start);
-    play(&mut player, 9, "e0");
-    player.render(BLOCK, &start);
-    player.camera_moved(0, u32::MAX, &probe);
-    player.render(8 * BLOCK, &probe);
-    assert_eq!(*probe.asked.borrow(), [(8, 1024), (8, 512)]);
-    assert!(player.faults.is_empty(), "{:?}", player.faults);
+        let play = |player: &mut Player<_>, object: u32, name: &str| {
+            player.handle(
+                &SoundEvent::Play {
+                    object,
+                    name: name.into(),
+                },
+                &start,
+            );
+        };
+        play(&mut player, 8, "e1");
+        play(&mut player, 9, "e0");
+        player.render(BLOCK, &start);
+        play(&mut player, 9, "e0");
+        player.render(BLOCK, &start);
+        player.camera_moved(0, u32::MAX, &probe);
+        player.render(8 * BLOCK, &probe);
+        assert_eq!(*probe.asked.borrow(), [(8, 1024), (8, 512)], "case {case}");
+        assert!(player.faults.is_empty(), "{:?}", player.faults);
+    }
 }
 
 #[test]
