@@ -58,6 +58,7 @@
 //! port. The original also notes an unexpected
 //! event in its log when logging is on (0x6f2a44); that is not modeled.
 
+use super::reach::start_foreground;
 use crate::animator::clear_base;
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine, word};
@@ -166,17 +167,8 @@ impl Machine<'_, '_> {
             a.slow = flags & 0x80 != 0;
             let now = a.clock_at(self.world.ticks as i32);
             let mut layer = Layer::start(&name, duration, frames, bound, tracks, reverse, now);
-            // 0x592726: the foreground slot's layer takes the raised
-            // priority once. The blend slot (+0x10) is never filled here.
-            if a.promote {
-                a.promote = false;
-                layer.priority += 5;
-            }
-            a.skin_dirty = true;
             layer.interruptible = i32::from(flags & 0x08 != 0);
-            a.foreground = Some(layer);
-            // A new layer goes in before the carry layer (priority 10).
-            a.carry_first = false;
+            start_foreground(a, layer);
             a.slow = flags & 0x80 != 0;
             a.follow_rate = flags & 0x40 != 0;
             if slot == 3 {
@@ -237,7 +229,7 @@ impl Machine<'_, '_> {
 
     /// The state of the person's posture (0x592904): 3 standing, 1 or 2
     /// for postures 1 and 2; any other posture leaves the state.
-    fn posture_state(&self, a: &mut Animator) -> Result<(), Trap> {
+    pub(super) fn posture_state(&self, a: &mut Animator) -> Result<(), Trap> {
         match self.person_word(POSTURE)? {
             0 => a.state = 3,
             1 => a.state = 1,
