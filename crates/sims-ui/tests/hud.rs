@@ -275,16 +275,20 @@ fn the_goths_relationship_panel() {
                 r.pink_heart,
                 r.red_heart,
                 r.family,
+                r.star,
             )
         })
         .collect();
     assert_eq!(
         relations,
         [
-            (33, 100, 0, true, true, false, true),
-            (32, 75, 0, true, false, false, true),
+            (33, 100, 0, true, true, false, true, false),
+            (32, 75, 0, true, false, false, true, false),
         ]
     );
+    // The install has the Superstar pack, so its button can be pressed
+    // (0x51a7ea).
+    assert!(opened.snapshot.superstar);
     let controls = Controls {
         expanded: true,
         panel: Panel::Relationships,
@@ -297,6 +301,6 @@ fn the_goths_relationship_panel() {
     // screen (see docs/decisions/).
     assert_eq!(
         digest(&frame),
-        "4b764150a46580163fb484f70c5eac2db568672649d2e2bf8d05af09c2667c4c"
+        "24af5346170f6ff5a621af7725e99d1b6c03b15c8b1ae61d5b1cbd65e52c90d9"
     );
 }

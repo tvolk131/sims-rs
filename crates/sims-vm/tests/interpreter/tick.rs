@@ -517,9 +517,10 @@ fn a_person_with_no_room_yet_keeps_motive_13() {
 }
 
 /// The house's usage counts after one update at tick count `ticks` of a
-/// person with person word 32 `visitor`, alertness `alertness` and
-/// `routes` route contexts, starting from today's counts 7 and 3.
-fn usage_after(ticks: u32, visitor: i16, alertness: f32, routes: i32) -> Usage {
+/// person with person word 32 `visitor`, alertness `alertness`, `routes`
+/// route contexts and `frames` saved routing frames, starting from today's
+/// counts 7 and 3.
+fn usage_after(ticks: u32, visitor: i16, alertness: f32, routes: i32, frames: i32) -> Usage {
     let mut fx = lot(sleeper());
     fx.thread(LAMP, 4096, &[3]);
     fx.world.ticks = ticks;
@@ -530,7 +531,44 @@ fn usage_after(ticks: u32, visitor: i16, alertness: f32, routes: i32) -> Usage {
     let person = fx.sim_mut().person.as_mut().unwrap();
     person.data[32] = visitor;
     person.motives[11] = alertness;
-    person.routing_frames = routes;
+    person.routing_frames = frames;
+    let context = sims_sim::route::Context {
+        candidates: Vec::new(),
+        slot: sims_sim::route::RouteSlot {
+            offset: [0; 3],
+            number: -1,
+            standing: 0,
+            sitting: 0,
+            ground: 0,
+            flags: 0,
+            snap_target: -1,
+            proximity: [16; 3],
+            gradient: 0x3e40_0000,
+            facing: -2,
+            resolution: 16,
+        },
+        target: 0,
+        person: 0,
+        chosen: -1,
+        best: -1,
+        word_58: 0,
+        time: 0,
+        saved: [0; 2],
+        word_68: 0,
+        start: [0; 3],
+        byte_78: true,
+        objects: [0; 2],
+        byte_84: false,
+        result: 0,
+        word_8c: 0,
+        byte_8e: false,
+        word_94: 0,
+        limit: 0x30,
+        action: 0,
+    };
+    if routes > 0 {
+        fx.world.routing.routes.entry(SIM).or_default().contexts = vec![context; routes as usize];
+    }
     update(&mut fx, &mut answers(&[])).unwrap();
     assert_eq!(fx.world.usage.history, [Usage::default(); 5]);
     fx.world.usage.today
@@ -547,19 +585,23 @@ fn every_tenth_tick_an_awake_member_of_the_household_is_counted() {
         total: 7,
         routing: 3,
     };
-    assert_eq!(usage_after(10, 0, 0.0, 0), counted);
+    assert_eq!(usage_after(10, 0, 0.0, 0, 0), counted);
     // With a route context the routing count goes up too.
     assert_eq!(
-        usage_after(10, 0, 0.0, 1),
+        usage_after(10, 0, 0.0, 1, 0),
         Usage {
             total: 8,
             routing: 4
         }
     );
+    // The count reads the contexts the person has now (0x45ce45 calls
+    // 0x45c349, which tests the vector, 0x45c349 to 0x45c363), not how
+    // many the save said it had.
+    assert_eq!(usage_after(10, 0, 0.0, 0, 2), counted);
     // Not on other ticks, nor for a visitor or a person who is asleep.
-    assert_eq!(usage_after(11, 0, 0.0, 0), unchanged);
-    assert_eq!(usage_after(10, 1, 0.0, 0), unchanged);
-    assert_eq!(usage_after(10, 0, -1.0, 0), unchanged);
+    assert_eq!(usage_after(11, 0, 0.0, 0, 0), unchanged);
+    assert_eq!(usage_after(10, 1, 0.0, 0, 0), unchanged);
+    assert_eq!(usage_after(10, 0, -1.0, 0, 0), unchanged);
 }
 
 #[test]

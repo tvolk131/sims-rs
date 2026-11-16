@@ -543,15 +543,48 @@ fn what_animate_sim_does_not_port_fails_loudly() {
     let layer = &fx.world.base_layers[&SIM];
     assert_eq!((layer.mode, layer.priority), (1, -10));
     assert!(matches!(&fx.world.animators[&SIM].base, Base::Script { clip, .. } if clip == CLIP));
+}
+
+#[test]
+fn a_person_in_a_pool_takes_its_clip_names_from_the_pools_tables() {
     // A clip that ends with the person sitting starts posture 1's base
-    // clip, whose name this person's word 64 makes the lookup take from
-    // the special tables (0x59db44).
-    let mut fx = sim_animates(animate(1, 3, 0, 0, 0));
-    turn(&mut fx).unwrap();
-    end_clip(&mut fx);
-    sim_definition(&mut fx)[102] = 0;
-    fx.sim_mut().person.as_mut().unwrap().data[0] = 1;
-    assert!(unsupported(turn(&mut fx)).contains("0x59db44"));
+    // clip. With person word 64 set (in a pool) its name comes from the
+    // pool's table for the person's sex (0x59db44: STR# 158 plus bit 0 of
+    // word 65), and the type's own table is not read.
+    let names = |fx: &mut Fixture, file: usize, table: u16, name: &str| {
+        let names = vec![String::new(), name.to_string()];
+        let library = fx.program.libraries.get_mut(&file).unwrap();
+        library.strings.insert(table, names);
+    };
+    let sitting = |pool: i16, kind: i16, age: i16| {
+        let mut fx = sim_animates(animate(1, 3, 0, 0, 0));
+        turn(&mut fx).unwrap();
+        end_clip(&mut fx);
+        sim_definition(&mut fx)[102] = 0;
+        let person = fx.sim_mut().person.as_mut().unwrap();
+        (person.data[0], person.data[64], person.data[65]) = (1, pool, kind);
+        person.data[58] = age;
+        names(&mut fx, SIM_FILE, 150, "own");
+        names(&mut fx, GLOBAL, 152, "adult");
+        names(&mut fx, GLOBAL, 158, "pool 0");
+        names(&mut fx, GLOBAL, 159, "pool 1");
+        names(&mut fx, GLOBAL, 160, "pool child");
+        fx
+    };
+    let base = |mut fx: Fixture| {
+        let result = turn(&mut fx);
+        // The fixture holds no such clip, so starting it fails, naming it.
+        unsupported(result)
+    };
+    assert!(base(sitting(0, 0, 174)).contains("\"own\""));
+    assert!(base(sitting(1, 0, 174)).contains("\"pool 0\""));
+    assert!(base(sitting(1, 1, 174)).contains("\"pool 1\""));
+    assert!(base(sitting(1, 1, 17)).contains("\"pool child\""));
+    // A pool table with no name for the clip: the global tables, still
+    // not the type's own.
+    let mut fx = sitting(1, 0, 174);
+    names(&mut fx, GLOBAL, 158, "");
+    assert!(base(fx).contains("\"adult\""));
 }
 
 #[test]
