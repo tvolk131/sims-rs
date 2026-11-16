@@ -25,8 +25,11 @@ works it out as `House::read` does the other ratings.
   room flags, the function flags and the build mode type. This corrects
   the earlier guess of words 38, 39 and 68.
   `house::Kinds` reads them for each GUID on the lot from the install's
-  definitions. A word past a short definition reads as 0, as the
-  original's record is padded with zeros (0x431759).
+  definitions, as the original holds them (0x431759, as `sims-vm`
+  reads them): a version 136 or 137 definition shorter than 216 bytes
+  and of odd length loses its last byte, then every definition is
+  filled out with zeros to 216 bytes. A word cut in half keeps its low
+  byte.
 - **The rating** (0x4168d4):
   - It is the count less the penalties, over the count. The ratio is
     kept to 0 to 1, with an unordered value taken as 0, then multiplied
@@ -53,7 +56,8 @@ works it out as `House::read` does the other ratings.
   that is also dirty, an object that isn't counted but takes a
   penalty, a type that hasn't been read, more penalty than count, and a
   negative penalty.
-- Which definition words count, including short definitions.
+- Which definition words count, including short definitions, a word
+  cut in half, and versions 136 and 137.
 - The tuning's penalties: the defaults, and the table's values cut
   toward zero.
 - The Goths' panel digest.

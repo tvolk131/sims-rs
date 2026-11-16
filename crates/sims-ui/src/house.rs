@@ -133,12 +133,14 @@ pub struct Kinds {
 /// The definition's bytes the Upkeep count tests, each a 16-bit word.
 const COUNTED_WORDS: [usize; 3] = [0x4e, 0x50, 0x8a];
 
+/// The length the original fills a definition out to (0x431759).
+const DEFINITION_BYTES: usize = 216;
+
 impl Kinds {
     /// Reads the definition of every object type in `world` not read
     /// yet. A type the catalog lacks, or whose file or definition cannot
-    /// be read, counts for nothing. A definition shorter than a word
-    /// reads that word as 0, as the original's record is filled out with
-    /// zeros (0x431759).
+    /// be read, counts for nothing. The definition is read as the
+    /// original holds it ([`Kinds::counts`]).
     pub fn learn(&mut self, world: &World, index: &Index, catalog: &Catalog) {
         let mut files: BTreeMap<usize, Option<Iff>> = BTreeMap::new();
         for object in world.objects.values() {
@@ -161,12 +163,27 @@ impl Kinds {
         }
     }
 
-    /// Whether a definition's bytes make its objects count.
+    /// Whether a definition's bytes make its objects count. As the
+    /// original holds a definition (0x431759, as `sims-vm` reads one): a
+    /// version 136 or 137 definition shorter than 216 bytes and odd has
+    /// its last byte cleared, and every definition is filled out with
+    /// zeros to 216 bytes, so a word cut in half keeps its low byte.
     pub fn counts(definition: &[u8]) -> bool {
-        COUNTED_WORDS.iter().any(|&at| {
-            let word = definition.get(at..at + 2).map_or([0, 0], |b| [b[0], b[1]]);
-            i16::from_le_bytes(word) != 0
-        })
+        let mut bytes = definition.to_vec();
+        let version = bytes.first_chunk::<4>().map(|&b| u32::from_le_bytes(b));
+        if matches!(version, Some(136 | 137))
+            && bytes.len() < DEFINITION_BYTES
+            && !bytes.len().is_multiple_of(2)
+            && let Some(last) = bytes.last_mut()
+        {
+            *last = 0;
+        }
+        if bytes.len() < DEFINITION_BYTES {
+            bytes.resize(DEFINITION_BYTES, 0);
+        }
+        COUNTED_WORDS
+            .iter()
+            .any(|&at| i16::from_le_bytes([bytes[at], bytes[at + 1]]) != 0)
     }
 }
 
@@ -526,9 +543,22 @@ mod tests {
         definition[0x8c] = 1;
         assert!(!Kinds::counts(&definition));
         // A short definition reads the words it lacks as 0, and half a
-        // word as none.
+        // word as its low byte (Sol's review: a version 138 definition
+        // ending at 0x8b).
+        definition.fill(0);
+        definition[..4].copy_from_slice(&138u32.to_le_bytes());
+        definition[0x8a] = 1;
+        assert!(Kinds::counts(&definition[..0x8b]));
+        assert!(!Kinds::counts(&definition[..0x8a]));
+        definition[0x8a] = 0;
         definition[0x4e] = 1;
-        assert!(!Kinds::counts(&definition[..0x4f]));
-        assert!(Kinds::counts(&definition[..0x50]));
+        assert!(Kinds::counts(&definition[..0x4f]));
+        // A version 136 or 137 definition of odd length loses its last
+        // byte; an even one keeps it.
+        for version in [136u32, 137] {
+            definition[..4].copy_from_slice(&version.to_le_bytes());
+            assert!(!Kinds::counts(&definition[..0x4f]), "{version}");
+            assert!(Kinds::counts(&definition[..0x50]), "{version}");
+        }
     }
 }
