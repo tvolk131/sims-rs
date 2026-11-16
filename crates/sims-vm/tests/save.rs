@@ -2,7 +2,7 @@
 //! a lot restored from a save steps exactly as the saved lot went on to.
 
 use sims_vm::boot::save::{SaveError, Saved};
-use sims_vm::boot::{Frames, Lot, StepError};
+use sims_vm::boot::{Frames, Lot, OrderError, StepError};
 use std::path::PathBuf;
 
 fn goth_house() -> Option<(PathBuf, PathBuf)> {
@@ -75,6 +75,32 @@ fn a_lot_saved_while_asking_asks_again_when_restored() {
             listed.world().hash(),
             "tick {tick}"
         );
+    }
+}
+
+#[test]
+fn a_lot_saved_once_answered_takes_no_input_until_its_step() {
+    let Some((root, house)) = goth_house() else {
+        return;
+    };
+    let mut asked = Lot::load(&root, &house, &[], Frames::default()).unwrap();
+    asked.wait_for_answers();
+    asked.step().unwrap();
+    assert_eq!(asked.step().unwrap_err(), StepError::Asking { tick: 2 });
+    asked.answer(3).unwrap();
+    let saved = Saved::decode(&asked.save().unwrap().encode()).unwrap();
+
+    let mut restored = Lot::load(&root, &house, &[], Frames::default()).unwrap();
+    restored.wait_for_answers();
+    restored.restore(saved).unwrap();
+    // As the saved lot: the answer is given and the tick has not run
+    // again, so no order is taken.
+    assert_eq!(restored.pause().unwrap_err(), OrderError::Asking);
+    assert_eq!(asked.pause().unwrap_err(), OrderError::Asking);
+    for tick in 2..=100 {
+        asked.step().unwrap();
+        restored.step().unwrap();
+        assert_eq!(restored.world().hash(), asked.world().hash(), "tick {tick}");
     }
 }
 
