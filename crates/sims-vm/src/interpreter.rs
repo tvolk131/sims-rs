@@ -914,8 +914,9 @@ impl<'a> Machine<'a, '_> {
         // there (0x45abce, 0x45c634); Look Towards keeps whether its turn
         // started (0x45ab79).
         // Idle For Input keeps whether it started an action (0x45dce4).
-        // Special Effect keeps its step (0x44aaa6).
-        if state != 0 && !matches!(instruction.opcode, 17 | 22 | 27 | 35 | 45) {
+        // Special Effect keeps its step (0x44aaa6), and Reach its
+        // (0x45c9ba).
+        if state != 0 && !matches!(instruction.opcode, 17 | 22 | 27 | 35 | 45 | 47) {
             return Err(Trap::Unsupported(format!(
                 "resuming primitive {} with saved state {state:#x}",
                 instruction.opcode
