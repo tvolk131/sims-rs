@@ -55,6 +55,38 @@ pub struct Message {
     /// second and third.
     pub buttons: Vec<String>,
     pub icon: Option<Image>,
+    /// The text typed into a dialog that asks for text (kind 3), which
+    /// the player edits with [`type_into`] and [`erase`]; None for any
+    /// other kind.
+    pub entry: Option<String>,
+}
+
+/// What a dialog that asks for text holds when it opens: the original
+/// passes this string to its entry field (0x436c48, 0x523808).
+pub const ENTRY_START: &str = "Hello world";
+/// The most characters the entry field holds (0x5238a1, field +0x138,
+/// checked by 0x5f334f and 0x5f33be). The original counts bytes of its
+/// text encoding, the same as characters in a single-byte one.
+pub const ENTRY_MOST: usize = 64;
+/// The entry field's height (0x524420).
+const ENTRY_HEIGHT: i32 = 36;
+
+/// Types `typed` at the end of the dialog's entry, if it asks for text,
+/// is not full and `typed` is not a control character. Returns whether
+/// the text changed.
+pub fn type_into(message: &mut Message, typed: char) -> bool {
+    match &mut message.entry {
+        Some(text) if !typed.is_control() && text.chars().count() < ENTRY_MOST => {
+            text.push(typed);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Erases the entry's last character. Returns whether the text changed.
+pub fn erase(message: &mut Message) -> bool {
+    message.entry.as_mut().and_then(String::pop).is_some()
 }
 
 /// The default button labels.
@@ -151,8 +183,11 @@ impl Message {
         let text = |n: u8, default: &str| entry(n).unwrap_or(default).to_owned();
         // From the original's button setup (0x43601c), as the old
         // prototype read it (legacy/crates/sims-vm/src/dialog/presentation.rs).
-        let buttons = match operands[5] & 0x7f {
-            0 | 4 => vec![text(operands[3], labels.get(1))],
+        let kind = operands[5] & 0x7f;
+        let buttons = match kind {
+            // Kind 3 asks for text: the first button and an entry field
+            // under the text (0x436a52).
+            0 | 3 | 4 => vec![text(operands[3], labels.get(1))],
             1 => vec![
                 text(operands[3], labels.get(3)),
                 text(operands[4], labels.get(4)),
@@ -184,6 +219,7 @@ impl Message {
             text: text(operands[2], MISSING),
             buttons,
             icon,
+            entry: (kind == 3).then(|| ENTRY_START.to_owned()),
         }))
     }
 }
@@ -231,6 +267,8 @@ pub struct Layout {
     /// Each line of the message and where it starts.
     pub lines: Vec<(String, [i32; 2])>,
     pub buttons: Vec<Rect>,
+    /// The entry field of a dialog that asks for text.
+    pub entry: Option<Rect>,
 }
 
 /// The message box at `width` (0x535266): the lines beside the icon,
@@ -368,7 +406,17 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
     let arrange_within = |width: i32, least: i32| {
         let text_width = width.clamp(least, WIDEST);
         let text = text_box(body, &text, text_width, band);
-        let buttons_top = text_top.saturating_add(text.height).saturating_add(GAP);
+        // An entry field goes 9 under the text, as wide as it and 36 high,
+        // and the buttons 18 under where they would have been and its
+        // height lower (0x52440d).
+        let entry_room = if message.entry.is_some() {
+            ENTRY_HEIGHT + GAP
+        } else {
+            0
+        };
+        let buttons_top = text_top
+            .saturating_add(text.height)
+            .saturating_add(GAP + entry_room);
         let bottom = if count > 0 {
             buttons_top.saturating_add(BUTTON_SIZE[1] + PAD)
         } else {
@@ -484,6 +532,14 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
         caller: message.caller,
         rect,
         icon: icon.map(|_| [rect.x + top, rect.y + top]),
+        entry: message.entry.as_ref().map(|_| {
+            Rect::new(
+                rect.x + top,
+                rect.y + a.buttons - GAP - ENTRY_HEIGHT - GAP + PAD,
+                a.text_width,
+                ENTRY_HEIGHT,
+            )
+        }),
         title: [rect.x + title_x, rect.y + top],
         lines,
         buttons,
@@ -549,6 +605,11 @@ pub fn draw(
             font.draw(frame, text, *at, LABEL);
         }
     }
+    if let (Some(field), Some(text), Some(font)) =
+        (layout.entry, &message.entry, art.font(BODY_FONT))
+    {
+        draw_entry(frame, font, field, text);
+    }
     for (rect, label) in layout.buttons.iter().zip(&message.buttons) {
         let hover = pointer.is_some_and(|[x, y]| rect.contains(x, y));
         // Cell 0 is the button at rest, 2 under the pointer.
@@ -574,6 +635,78 @@ pub fn draw(
             let x = (i64::from(rect.x) + offset).clamp(i64::from(i32::MIN), i64::from(i32::MAX));
             let rgb = if hover { [255; 3] } else { LABEL };
             font.draw(frame, label, [x as i32, rect.y.saturating_add(5)], rgb);
+        }
+    }
+}
+
+/// The entry field: an outline, the text from its left, and the caret
+/// after it. **An approximation**: how the original's field (0x5f19f5)
+/// draws is not read, and it is not compared with a screenshot.
+fn draw_entry(frame: &mut Frame, font: &Font, field: Rect, text: &str) {
+    let [right, bottom] = [
+        field.x.saturating_add(field.width - 1),
+        field.y.saturating_add(field.height - 1),
+    ];
+    // Only the part inside the frame is visited.
+    let wide = i32::try_from(frame.width()).unwrap_or(i32::MAX);
+    let high = i32::try_from(frame.height()).unwrap_or(i32::MAX);
+    let mut dot = |x: i32, y: i32| frame.blend(x, y, LABEL, 255);
+    for x in field.x.max(0)..=right.min(wide) {
+        dot(x, field.y);
+        dot(x, bottom);
+    }
+    for y in field.y.max(0)..=bottom.min(high) {
+        dot(field.x, y);
+        dot(right, y);
+    }
+    // The text and the caret are drawn inside the outline only: on a copy
+    // of what is under it, put back after. A text wider than the field
+    // slides left so the caret stays in view (an approximation: the
+    // original's scrolling is not read).
+    let inside = Rect::new(
+        field.x.saturating_add(1),
+        field.y.saturating_add(1),
+        (field.width - 2).max(0),
+        (field.height - 2).max(0),
+    );
+    // Only the part of the inside within the frame is copied.
+    let left = inside.x.max(0);
+    let top = inside.y.max(0);
+    let end_x = inside.x.saturating_add(inside.width).min(wide);
+    let end_y = inside.y.saturating_add(inside.height).min(high);
+    let (Ok(w), Ok(h)) = (u32::try_from(end_x - left), u32::try_from(end_y - top)) else {
+        return;
+    };
+    if w == 0 || h == 0 {
+        return;
+    }
+    let mut under = Frame::new(w, h, [0; 3]);
+    for y in 0..end_y - top {
+        for x in 0..end_x - left {
+            if let Some(rgb) = frame.pixel(left + x, top + y) {
+                under.blend(x, y, rgb, 255);
+            }
+        }
+    }
+    let line = font.line_height.clamp(0, inside.height);
+    let caret = 3i32.saturating_add(font.width(text)).saturating_add(1);
+    let slide = caret.saturating_sub(inside.width - 3).max(0);
+    // Where the inside's corner falls in the copy.
+    let [ox, oy] = [inside.x.saturating_sub(left), inside.y.saturating_sub(top)];
+    let at = [
+        ox.saturating_add(3 - slide),
+        oy.saturating_add((inside.height - line) / 2),
+    ];
+    font.draw(&mut under, text, at, LABEL);
+    let caret_x = ox.saturating_add(caret - slide);
+    for y in at[1]..at[1].saturating_add(line) {
+        under.blend(caret_x, y, LABEL, 255);
+    }
+    for y in 0..end_y - top {
+        for x in 0..end_x - left {
+            if let Some(rgb) = under.pixel(x, y) {
+                frame.blend(left + x, top + y, rgb, 255);
+            }
         }
     }
 }
@@ -628,6 +761,7 @@ mod tests {
             text: text.into(),
             buttons: vec!["AB".into(); buttons],
             icon: None,
+            entry: None,
         }
     }
 
@@ -695,6 +829,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_dialog_that_asks_for_text_has_an_entry_under_it() {
+        let art = art();
+        let mut m = message("B", 1);
+        let plain = layout([800, 600], &m, &art).unwrap();
+        assert_eq!(plain.entry, None);
+        m.entry = Some(ENTRY_START.to_owned());
+        let laid = layout([800, 600], &m, &art).unwrap();
+        // 9 under the text (21 + 2 + 18 + 2 high), as wide as it, 36
+        // high; the button 18 + 36 + 18 under the text.
+        let field = laid.entry.unwrap();
+        let text_bottom = laid.rect.y + 21 + 2 + 18 + 2;
+        assert_eq!(field.y, text_bottom + 9);
+        assert_eq!(
+            (field.x, field.width),
+            (laid.rect.x + 21, laid.rect.width - 42)
+        );
+        assert_eq!(field.height, 36);
+        assert_eq!(laid.buttons[0].y, text_bottom + 18 + 36 + 18);
+        assert_eq!(laid.rect.height, plain.rect.height + 54);
+        // Drawn: its outline, at any place, without a panic.
+        let mut frame = Frame::new(800, 600, [0, 0, 0]);
+        draw(&mut frame, &art, &m, &laid, None);
+        assert_eq!(frame.pixel(field.x, field.y), Some(LABEL));
+        let mut far = laid.clone();
+        far.entry = Some(Rect::new(i32::MAX - 3, i32::MIN, i32::MAX, i32::MAX));
+        draw(&mut frame, &art, &m, &far, None);
+    }
+
+    #[test]
+    fn the_entry_takes_64_characters_and_no_control_characters() {
+        let mut m = message("B", 1);
+        assert!(!type_into(&mut m, 'a'));
+        assert!(!erase(&mut m));
+        m.entry = Some(String::new());
+        for _ in 0..70 {
+            type_into(&mut m, 'é');
+        }
+        assert_eq!(m.entry.as_ref().unwrap().chars().count(), ENTRY_MOST);
+        assert!(!type_into(&mut m, 'x'));
+        assert!(erase(&mut m));
+        assert!(!type_into(&mut m, '\n'));
+        assert!(type_into(&mut m, 'x'));
+        assert!(m.entry.as_ref().unwrap().ends_with('x'));
+        m.entry = Some(String::new());
+        assert!(!erase(&mut m));
+    }
+
+    #[test]
+    fn a_long_entry_stays_inside_its_field_with_the_caret_in_view() {
+        let font = crate::font::tests::font();
+        let field = Rect::new(10, 10, 30, 36);
+        let mut frame = Frame::new(100, 60, [0, 0, 0]);
+        draw_entry(&mut frame, &font, field, &"A".repeat(ENTRY_MOST));
+        for y in 0..60 {
+            for x in 0..100 {
+                if !field.contains(x, y) {
+                    assert_eq!(frame.pixel(x, y), Some([0, 0, 0]), "{x}, {y}");
+                }
+            }
+        }
+        // The caret 3 short of the inside's right edge: x 11 + 28 - 3.
+        assert!((11..45).any(|y| frame.pixel(36, y) == Some(LABEL)));
+        assert!((11..45).all(|y| frame.pixel(37, y) == Some([0, 0, 0])));
+        // A short entry starts 4 in, its caret right after it.
+        let mut frame = Frame::new(100, 60, [0, 0, 0]);
+        draw_entry(&mut frame, &font, field, "");
+        assert!((11..45).any(|y| frame.pixel(15, y) == Some(LABEL)));
     }
 
     #[test]
@@ -795,6 +999,7 @@ mod tests {
             icon: None,
             title: [0, 0],
             lines: Vec::new(),
+            entry: None,
             buttons: vec![
                 Rect::new(i32::MAX - 5, i32::MAX - 2, i32::MAX, 33),
                 Rect::new(i32::MIN, i32::MIN, i32::MAX, i32::MAX),
@@ -827,6 +1032,7 @@ mod tests {
             icon: None,
             title: [0, 0],
             lines: Vec::new(),
+            entry: None,
             buttons: vec![Rect::new(10, 150, 100, 33), Rect::new(128, 150, 100, 33)],
         };
         assert_eq!(
