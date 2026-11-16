@@ -2,6 +2,8 @@
 //! Needs `SIMS_INSTALL`; skipped when it is unset.
 
 use sims_game::game::goth_house;
+use sims_game::pace;
+use sims_game::view::Move;
 use sims_game::{Game, Options};
 use sims_ui::command::Speed;
 use std::path::PathBuf;
@@ -77,9 +79,15 @@ fn the_window_goes_back_to_its_save_and_plays_on_as_from_there() {
     game.render();
     game.save_to(&store, "goths");
 
-    // Then the player goes on: a pie menu open, ultra speed, more ticks.
+    let rotation = game.lot().view_rotation();
+    assert_eq!(game.view.camera.rotation, rotation);
+
+    // Then the player goes on: a pie menu open, ultra speed, the view
+    // turned, more ticks.
     open_a_menu(&mut game);
     game.set_speed(Speed::Ultra);
+    game.apply(Move::Rotate(true));
+    assert_ne!(game.lot().view_rotation(), rotation);
     assert_eq!(game.run(100), 100);
     assert!(game.menu().is_some());
 
@@ -87,6 +95,9 @@ fn the_window_goes_back_to_its_save_and_plays_on_as_from_there() {
     assert_eq!(game.lot().ticks(), 50);
     assert!(game.menu().is_none(), "the menu is the lot's before");
     assert_eq!(game.pace.speed, Speed::Normal);
+    // The view shows the lot turned as the code the lot runs reads it.
+    assert_eq!(game.lot().view_rotation(), rotation);
+    assert_eq!(game.view.camera.rotation, rotation);
     assert_eq!(game.stopped(), None);
     assert!(game.errors().is_empty());
     game.render();
@@ -130,4 +141,22 @@ fn a_save_made_while_the_help_dialog_waits_shows_it_again() {
     assert_eq!(game.asking().expect("asked again").shown, shown);
     game.render();
     assert_eq!(game.dialog().expect("drawn again").caller, shown.object);
+}
+
+#[test]
+fn the_panel_shows_the_players_speed_while_the_idle_loop_holds_the_game() {
+    let Some(install) = install() else {
+        return;
+    };
+    let game = Game::open(&options(install)).expect("the Goth house opens");
+    let mut world = game.lot().world().clone();
+    world.set_speed(i32::from(pace::level(Speed::Fast)));
+    assert_eq!(pace::shown(&world), Some(Speed::Fast));
+    // The idle loop's speed, with the player's kept in global 18.
+    world.globals[18] = pace::level(Speed::Fast);
+    world.globals[16] = sims_sim::speed::IDLE;
+    assert_eq!(world.return_speed(), pace::level(Speed::Fast));
+    assert_eq!(pace::shown(&world), Some(Speed::Fast));
+    world.globals[18] = -1;
+    assert_eq!(pace::shown(&world), None);
 }

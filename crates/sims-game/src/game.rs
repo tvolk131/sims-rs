@@ -959,8 +959,9 @@ impl Game {
     /// of the lot before is dropped: why it stopped, the errors caught,
     /// the sounds not yet taken, an open or listed pie menu, the icons
     /// pressed and the dialog read. The panel's speed follows the saved
-    /// lot's, and its people and rooms are read again. Sounds already
-    /// playing are not stopped (**unverified** what a long one does once
+    /// lot's ([`pace::shown`]), the view turns to the saved lot's
+    /// rotation, which the lot's code reads, and its people and rooms are
+    /// read again. Sounds already playing are not stopped (**unverified** what a long one does once
     /// its object is gone).
     pub fn restore(&mut self, saved: Saved) -> Result<(), String> {
         self.lot.restore(saved).map_err(|e| e.to_string())?;
@@ -972,8 +973,17 @@ impl Game {
         self.highlighted = None;
         self.hud.forget();
         let world = self.lot.world();
-        if let Some(speed) = pace::chosen(world.speed()) {
+        if let Some(speed) = pace::shown(world) {
             self.pace.speed = speed;
+        }
+        // The view turns as the turn keys do, keeping the middle of the
+        // screen, until it shows the lot as the saved lot was turned.
+        let rotation = self.lot.view_rotation();
+        for _ in 0..4 {
+            if self.view.camera.rotation == rotation {
+                break;
+            }
+            self.view.apply(Move::Rotate(true));
         }
         self.pace.restart();
         self.people.refresh(world);

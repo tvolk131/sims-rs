@@ -23,12 +23,19 @@ Going back to a save drops everything the window kept of the lot before:
 - the icons pressed;
 - the dialog read.
 
-The panel's speed follows the saved lot's, unless that is the idle loop's
-own speed. The people and the rooms are read again. Sounds already
+The panel's speed follows the saved lot's. While the idle loop holds the
+game at its own speed, the panel shows the speed the game goes back to
+(global 18), which the player chose. The view turns to the saved lot's
+rotation, keeping the middle of the screen, because the lot's code reads
+that rotation (Generic Sims Call 12, Find Location). Keeping the window's
+rotation would make the picture and the simulation disagree. The people
+and the rooms are read again. Sounds already
 playing are not stopped. What a long sound does once its object is gone
 is unverified.
 
 The window's tests check two things. Going back to a save made at update
-50, after a pie menu, ultra speed and 100 more updates, plays on to match a
-lot that ran 250 updates straight. A save made while the Help System
+50, after a pie menu, ultra speed, a turn of the view and 100 more
+updates, turns the view back and plays on to match a lot that ran 250
+updates straight. The panel shows the player's speed while the idle loop's
+holds. A save made while the Help System
 dialog waits shows the dialog again.

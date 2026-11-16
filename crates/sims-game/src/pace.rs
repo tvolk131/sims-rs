@@ -47,6 +47,13 @@ pub fn chosen(level: i16) -> Option<Speed> {
         .find(|&speed| self::level(speed) == level)
 }
 
+/// The panel's button for the speed of `world`: global 16's, or, while
+/// the idle loop holds the game at its own speed, the speed it goes back
+/// to (global 18), which the player chose.
+pub fn shown(world: &sims_sim::World) -> Option<Speed> {
+    chosen(world.speed()).or_else(|| chosen(world.return_speed()))
+}
+
 /// Microseconds of one tick at the simulation's speed `level`.
 pub fn period_us(level: i16) -> u64 {
     u64::from(speed::period_ms(level)) * 1000
