@@ -5,6 +5,7 @@ mod action_string;
 mod animate;
 mod autonomy;
 mod budget;
+mod burn;
 mod calls;
 mod change_suit;
 mod create;
