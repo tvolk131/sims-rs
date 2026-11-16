@@ -105,6 +105,29 @@ fn a_lot_saved_once_answered_takes_no_input_until_its_step() {
 }
 
 #[test]
+fn an_answered_save_takes_input_after_its_step_in_a_lot_that_does_not_wait() {
+    let Some((root, house)) = goth_house() else {
+        return;
+    };
+    let mut asked = Lot::load(&root, &house, &[], Frames::default()).unwrap();
+    asked.wait_for_answers();
+    asked.step().unwrap();
+    assert_eq!(asked.step().unwrap_err(), StepError::Asking { tick: 2 });
+    asked.answer(3).unwrap();
+    let saved = asked.save().unwrap();
+
+    // Restored into a lot that does not wait: the saved answer is given at
+    // the tick, and the lot then takes input.
+    let mut restored = Lot::load(&root, &house, &[], Frames::default()).unwrap();
+    restored.restore(saved).unwrap();
+    assert_eq!(restored.pause().unwrap_err(), OrderError::Asking);
+    restored.step().unwrap();
+    asked.step().unwrap();
+    assert_eq!(restored.world().hash(), asked.world().hash());
+    restored.pause().unwrap();
+}
+
+#[test]
 fn a_save_goes_back_only_into_the_house_it_came_from() {
     let Some((root, house)) = goth_house() else {
         return;

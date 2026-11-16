@@ -708,6 +708,9 @@ impl Lot {
             self.tuning = Some(tuning);
         }
         if !self.asks {
+            // A lot restored from a save made once a dialog was answered
+            // takes input again after this step, as the saved lot would.
+            self.answered = false;
             let result = self.advance(play).map_err(Stop::into_step);
             if result.is_err() {
                 self.halted = true;
