@@ -65,6 +65,100 @@ fn array(world: &World, id: u16, stride: usize) -> Result<&[u8], Trap> {
     Ok(&array.data)
 }
 
+/// Whether a wall crosses a footprint (0x476dbc), given in the original's
+/// order (`[greatest +0xf4, greatest +0xf8, least +0xf4, least +0xf8]`)
+/// on `level`. Each tile it covers, `+0xf4` tiles in the outer loop and
+/// `+0xf8` tiles in the inner (each from the least coordinate's tile to
+/// the tile of the greatest less one), is read as 0x4795c5 expands it:
+/// its segments are the cell's first byte, the style of segment 1 its
+/// first style word and that of segments 2, 0x10 and 0x20 its second
+/// (0x53b98f). From the lowest segment the tile has, through each higher
+/// one below 0x20, a segment whose style is not one a person crosses
+/// ([`CROSSABLE`]) crosses the footprint when its line lies strictly
+/// between the footprint's two values for it:
+///
+/// - segment 1, the line `+0xf8` = 16 × the `+0xf8` tile, against the
+///   least and greatest `+0xf8`;
+/// - segment 2, `+0xf4` = 16 × the `+0xf4` tile, against the `+0xf4`s;
+/// - segment 0x10, `+0xf4 + +0xf8` = 16 × (the two tiles' sum + 1),
+///   against the sums of the greatest and of the least;
+/// - segment 0x20, `+0xf4 - +0xf8` = 16 × (the tiles' difference),
+///   against least `+0xf4` less greatest `+0xf8` and greatest less least.
+///
+/// Segments 4 and 8 are never tested, and 0x20 only when it is the
+/// tile's lowest (the search for the next segment stops at 0x20).
+pub(crate) fn walls_cross(world: &World, footprint: [i32; 4], level: i32) -> Result<bool, Trap> {
+    let floor = usize::try_from(level - 1)
+        .ok()
+        .filter(|&f| f < WALLS.len())
+        .ok_or_else(|| {
+            Trap::Unsupported(format!(
+                "a wall test on level {level}, whose walls the original reads past its arrays \
+                 (0x4795c5)"
+            ))
+        })?;
+    let walls = array(world, WALLS[floor], WALL_CELL)?;
+    let [top_a, top_b, low_a, low_b] = footprint;
+    let between = |line: i32, one: i32, other: i32| {
+        (one < line && line < other) || (other < line && line < one)
+    };
+    for a in (low_a >> 4)..=((top_a - 1) >> 4) {
+        for b in (low_b >> 4)..=((top_b - 1) >> 4) {
+            let (x, y) = (b as i8, a as i8);
+            let inside = |n: i8| (0..FULL as i8).contains(&n);
+            if !inside(x) || !inside(y) {
+                return Err(Trap::Unsupported(format!(
+                    "a wall test over tile ({x}, {y}), off the lot's arrays (0x4795c5)"
+                )));
+            }
+            let cell = (x as usize * FULL + y as usize) * WALL_CELL;
+            let mask = u32::from(walls[cell]);
+            let style = |word: usize| {
+                u16::from_le_bytes([walls[cell + 2 + word * 2], walls[cell + 3 + word * 2]])
+            };
+            if mask == 0 {
+                continue;
+            }
+            let mut bit = mask & mask.wrapping_neg();
+            loop {
+                let line = match bit {
+                    1 => Some((style(0), i32::from(x) << 4, low_b, top_b)),
+                    2 => Some((style(1), i32::from(y) << 4, low_a, top_a)),
+                    0x10 => Some((
+                        style(1),
+                        (i32::from(y) + i32::from(x) + 1) << 4,
+                        top_a + top_b,
+                        low_a + low_b,
+                    )),
+                    0x20 => Some((
+                        style(1),
+                        (i32::from(y) - i32::from(x)) << 4,
+                        low_a - top_b,
+                        top_a - low_b,
+                    )),
+                    _ => None,
+                };
+                if let Some((style, line, one, other)) = line
+                    && !CROSSABLE.contains(&style)
+                    && between(line, one, other)
+                {
+                    return Ok(true);
+                }
+                loop {
+                    bit <<= 1;
+                    if bit & mask == bit || bit >= 0x20 {
+                        break;
+                    }
+                }
+                if bit >= 0x20 {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// The level a room is on, from its ID (0x468756).
 pub(crate) fn room_level(room: i16) -> i32 {
     i32::from((room as u16 >> 10) & 3) + 1
@@ -414,6 +508,7 @@ mod tests {
             people: Default::default(),
             icon_frames: None,
             expansions: 0,
+            characters: Default::default(),
         }
     }
 
@@ -470,6 +565,119 @@ mod tests {
         // The covering, tiles 3 to 4 by 4 to 6, costs nothing (no flag
         // 0x20) and is not grown.
         assert_eq!(with[4..], [Region([48, 64, 80, 112, 0])]);
+    }
+
+    /// Sets the wall cell of tile (`x`, `y`) (the `+0xf8` tile first) on
+    /// `level`: its segments, and its two style words.
+    fn wall(world: &mut World, level: usize, [x, y]: [usize; 2], segments: u8, styles: [u16; 2]) {
+        let walls = &mut world.arrays.get_mut(&WALLS[level - 1]).unwrap().data;
+        let cell = (x * FULL + y) * WALL_CELL;
+        walls[cell] = segments;
+        walls[cell + 2..cell + 4].copy_from_slice(&styles[0].to_le_bytes());
+        walls[cell + 4..cell + 6].copy_from_slice(&styles[1].to_le_bytes());
+    }
+
+    /// A footprint in the original's order from its `+0xf4` (`a`) and
+    /// `+0xf8` (`b`) ranges.
+    fn footprint(a: [i32; 2], b: [i32; 2]) -> [i32; 4] {
+        [a[1], b[1], a[0], b[0]]
+    }
+
+    #[test]
+    fn a_wall_crosses_a_footprint_when_its_line_lies_strictly_inside() {
+        // 0x476dbc. Segment 1 of tile (3, 1): the line +0xf8 = 48, styled
+        // by the first style word.
+        let mut lot = world();
+        wall(&mut lot, 1, [3, 1], 1, [0, 3]);
+        assert_eq!(
+            walls_cross(&lot, footprint([21, 27], [45, 51]), 1),
+            Ok(true)
+        );
+        // On the line's edge, or on another level, it does not.
+        assert_eq!(
+            walls_cross(&lot, footprint([21, 27], [48, 54]), 1),
+            Ok(false)
+        );
+        assert_eq!(
+            walls_cross(&lot, footprint([21, 27], [45, 51]), 2),
+            Ok(false)
+        );
+        // Style 3 is one a person crosses.
+        wall(&mut lot, 1, [3, 1], 1, [3, 0]);
+        assert_eq!(
+            walls_cross(&lot, footprint([21, 27], [45, 51]), 1),
+            Ok(false)
+        );
+        // Segment 2 of tile (2, 2): the line +0xf4 = 32, styled by the
+        // second style word.
+        let mut lot = world();
+        wall(&mut lot, 2, [2, 2], 2, [3, 0]);
+        let across = footprint([29, 35], [37, 43]);
+        assert_eq!(walls_cross(&lot, across, 2), Ok(true));
+        wall(&mut lot, 2, [2, 2], 2, [0, 3]);
+        assert_eq!(walls_cross(&lot, across, 2), Ok(false));
+    }
+
+    #[test]
+    fn the_diagonals_compare_sums_and_differences() {
+        // Segment 0x10 of tile (3, 1): +0xf4 + +0xf8 = 16 x (1 + 3 + 1) =
+        // 80, against 21 + 53 and 27 + 59.
+        let mut lot = world();
+        wall(&mut lot, 1, [3, 1], 0x10, [3, 0]);
+        let centred = footprint([21, 27], [53, 59]);
+        assert_eq!(walls_cross(&lot, centred, 1), Ok(true));
+        assert_eq!(
+            walls_cross(&lot, footprint([17, 23], [49, 55]), 1),
+            Ok(false)
+        );
+        // Segment 0x20 of tile (3, 5): +0xf4 - +0xf8 = 16 x (5 - 3) = 32,
+        // against 85 - 59 and 91 - 53.
+        let mut lot = world();
+        wall(&mut lot, 1, [3, 5], 0x20, [3, 0]);
+        let centred = footprint([85, 91], [53, 59]);
+        assert_eq!(walls_cross(&lot, centred, 1), Ok(true));
+        assert_eq!(
+            walls_cross(&lot, footprint([81, 87], [57, 63]), 1),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn segments_4_and_8_are_never_tested_and_0x20_only_when_lowest() {
+        let mut lot = world();
+        let centred = footprint([85, 91], [53, 59]);
+        // 4 and 8 would mirror 1 and 2 on the next tile; they are not
+        // read.
+        wall(&mut lot, 1, [3, 5], 4 | 8, [0, 0]);
+        assert_eq!(walls_cross(&lot, centred, 1), Ok(false));
+        // The search for the next segment stops at 0x20 (0x476f0e), so
+        // after segment 1 (whose line, 48, is outside 53 to 59) the
+        // crossing diagonal is not read.
+        wall(&mut lot, 1, [3, 5], 1 | 0x20, [0, 0]);
+        assert_eq!(walls_cross(&lot, centred, 1), Ok(false));
+        wall(&mut lot, 1, [3, 5], 0x20, [0, 0]);
+        assert_eq!(walls_cross(&lot, centred, 1), Ok(true));
+        // 0x10 after 1 is read.
+        let mut lot = world();
+        wall(&mut lot, 1, [3, 1], 1 | 0x10, [0, 0]);
+        assert_eq!(
+            walls_cross(&lot, footprint([21, 27], [53, 59]), 1),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn a_wall_test_off_the_walls_arrays_fails_loudly() {
+        let lot = world();
+        for level in [0, 3] {
+            let result = walls_cross(&lot, footprint([21, 27], [45, 51]), level);
+            assert!(
+                matches!(&result, Err(Trap::Unsupported(m)) if m.contains("0x4795c5")),
+                "{level}: {result:?}"
+            );
+        }
+        let result = walls_cross(&lot, footprint([-5, 3], [45, 51]), 1);
+        assert!(matches!(&result, Err(Trap::Unsupported(m)) if m.contains("off the lot")));
     }
 
     /// A world with water on tile (5, 5), and, when `flags` is given, an

@@ -128,7 +128,7 @@
 //! step and every other result of the planning. Past tick 1000 the routes
 //! are **unverified**: there is no capture.
 
-use crate::animator::stop_route;
+use crate::animator::ask_stop;
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Flow, Machine, word};
 use crate::placement::{capture, stands_on_lot};
@@ -501,7 +501,10 @@ impl Machine<'_, '_> {
                     if self.person_word(NO_ROOM)? & 1 != 1
                         && self.room(ctx.target)? != self.room(me)?
                     {
-                        // 0x45b140: to another room, through a door.
+                        // 0x45b140: to another room, through a door; but
+                        // a route to a door one of the person's routes
+                        // goes through (context +0x68) fails (0x45b176).
+                        state = PORTAL;
                         if interpreter.kind(self.world, ctx.target)? == DOOR {
                             let routes = &self.world.routing.routes[&me];
                             if routes
@@ -509,13 +512,9 @@ impl Machine<'_, '_> {
                                 .iter()
                                 .any(|c| c.word_68 == i32::from(ctx.target))
                             {
-                                return Err(unsupported(
-                                    "0x45b176",
-                                    "to a door one of its routes goes through",
-                                ));
+                                state = FAILED;
                             }
                         }
-                        state = PORTAL;
                         continue;
                     }
                     // 0x45b18b: a person who wants to be interrupted, and
@@ -747,16 +746,11 @@ impl Machine<'_, '_> {
                 ARRIVED | STOPPED | INTERRUPTED => {
                     // 0x45b3de, 0x45b371, 0x45b3c2: the animator stops
                     // (0x589e2d).
-                    let animator = self
-                        .world
-                        .animators
-                        .get_mut(&me)
-                        .ok_or_else(|| Trap::Invalid(format!("person {me} has no animator")))?;
-                    if !stop_route(animator) {
-                        return Err(unsupported(
-                            "0x45b3eb",
-                            "whose animator is still under way when it is to stop",
-                        ));
+                    // A route under way does not stop: the request is kept
+                    // for the walk's next step (+0x284), and the run
+                    // yields at this step to try again (0x45b9a0).
+                    if !ask_stop(self.world, me)? {
+                        break;
                     }
                     // 0x45b3a0: "end_route" plays for me. A route that
                     // stopped short of the path's end (a blocked step)
@@ -996,10 +990,13 @@ impl Machine<'_, '_> {
                 }
             }
         }
-        if let Some(animator) = self.world.animators.get_mut(&me)
-            && animator.arrival != 0
+        if self
+            .world
+            .animators
+            .get(&me)
+            .is_some_and(|animator| animator.arrival != 0)
         {
-            stop_route(animator);
+            ask_stop(self.world, me)?;
         }
         let result = if state == FAILED {
             if ctx.result == 0 {

@@ -246,6 +246,64 @@ fn a_full_queue_keeps_the_action_pushed_to_the_front_and_six_more() {
 }
 
 #[test]
+fn an_action_of_a_higher_priority_drops_the_queued_actions_below_it() {
+    // Queued: priority 100 on the lamp, then priority 50 on the lamp, on
+    // nothing and on an object not on the lot. A push of priority 100
+    // goes after the first (0x45d47f); the three after it are dropped
+    // (0x45d4c8), and the lamp, the target of one, runs its function 4
+    // with the Sim as its stack object: it notes that in global 34 and
+    // counts in global 36. The new action then goes at the end.
+    let mut fx = lot([3, 0, 1, 0, 0, 0, 0, 0]);
+    let library = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+    let table = library.callbacks.get_mut(&128).unwrap();
+    table.resize(
+        5,
+        sims_formats::execution::ObjectFunction {
+            condition: 0,
+            action: 0,
+        },
+    );
+    table[4].action = 4301;
+    fx.add(
+        LAMP_FILE,
+        4301,
+        tree(vec![
+            assign(scope::GLOBAL, 34, scope::STACK_OBJECT, 0, 1),
+            ins(
+                2,
+                RETURN_TRUE,
+                RETURN_TRUE,
+                expr(scope::GLOBAL, 36, op::ADD, scope::LITERAL, 1),
+            ),
+        ]),
+    );
+    let person = fx.sim_mut().person.as_mut().unwrap();
+    let action = |uid: i32, priority: i32, target: i16| {
+        let mut action = person.active.clone();
+        (action.uid, action.priority, action.target) = (uid, priority, target);
+        action
+    };
+    person.queue = vec![
+        action(11, 100, LAMP as i16),
+        action(12, 50, LAMP as i16),
+        action(13, 50, 0),
+        action(14, 50, 999),
+    ];
+    let count = fx.world.globals[36];
+    assert_eq!(push(&mut fx, &[LAMP as i16]), Ok(true));
+    let queue = &fx.sim().person.as_ref().unwrap().queue;
+    assert_eq!(
+        queue
+            .iter()
+            .map(|a| (a.uid, a.priority))
+            .collect::<Vec<_>>(),
+        [(11, 100), (1, 100)]
+    );
+    assert_eq!(fx.world.globals[34], SIM as i16);
+    assert_eq!(fx.world.globals[36], count + 1);
+}
+
+#[test]
 fn flag_0x40_at_the_front_clears_the_running_actions_flag_0x80() {
     // Operand flag bit 3 sets the action's flag 0x40, which at the front
     // clears flag 0x80 of the running action (0x41f167); without it the
