@@ -2,6 +2,7 @@
 //! portraits and first names of the household's people.
 
 use crate::art::Art;
+use crate::house::{self, House};
 use crate::{Error, Result};
 use sims_content::{Catalog, Expansions, Index};
 use sims_formats::bitmap::{self, Image};
@@ -209,6 +210,9 @@ pub struct Snapshot {
     /// the Superstar pack is installed ([`Acquaintances::superstar`]).
     /// False until [`Snapshot::with_relations`] reads it.
     pub superstar: bool,
+    /// What the house panel shows: nothing until [`Snapshot::with_house`]
+    /// works it out.
+    pub house: House,
 }
 
 /// What the relationship panel needs from outside the world: the
@@ -334,6 +338,7 @@ impl Snapshot {
             family_friends: lot_family(world).map_or(0, |f| f.friends),
             relations: Vec::new(),
             superstar: false,
+            house: House::default(),
         }
     }
 
@@ -377,6 +382,13 @@ impl Snapshot {
                 }
             });
         }
+        self
+    }
+
+    /// Works out [`Snapshot::house`] from `world` ([`House::read`]).
+    #[must_use]
+    pub fn with_house(mut self, world: &World, tuning: &house::Tuning) -> Self {
+        self.house = House::read(world, tuning);
         self
     }
 
@@ -795,6 +807,7 @@ mod tests {
             family_friends: 0,
             relations: Vec::new(),
             superstar: false,
+            house: House::default(),
         }
     }
 

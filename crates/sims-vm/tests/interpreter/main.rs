@@ -32,6 +32,7 @@ mod person_factory;
 mod presentation;
 mod push;
 mod random;
+mod reach;
 mod removal;
 mod rooms;
 mod run_functional_tree;
