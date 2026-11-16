@@ -21,7 +21,6 @@ use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Anything that stops a boot, with a message that says where.
@@ -434,6 +433,18 @@ impl Lot {
         let mut program = Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid))?;
         program.zoning = neighborhood.zoning(context.expansions)?;
         program.expansions = context.expansions;
+        // The types registered from the neighborhood's Characters folder,
+        // which the original registers with kind 1 (0x424a8b, 0x43c228).
+        program.characters = catalog
+            .objects
+            .iter()
+            .map(|o| o.guid)
+            .filter(|&guid| {
+                catalog.object(guid).is_some_and(|o| {
+                    index.mounts[index.resources[o.resource].mount].path == Index::CHARACTERS
+                })
+            })
+            .collect();
         program.animations = Animations::load(&install, &index)?;
         let person_types = || {
             catalog
@@ -601,25 +612,11 @@ impl Lot {
             // clears global 12.
             if load.stopped.is_none() {
                 let made = interpreter.ensure_indicators(&mut world)?.is_some();
-                // The types registered from the neighborhood's
-                // Characters folder, which the original registers with
-                // kind 1 (0x424a8b, 0x43c228).
-                let characters: BTreeSet<u32> = catalog
-                    .objects
-                    .iter()
-                    .map(|o| o.guid)
-                    .filter(|&guid| {
-                        catalog.object(guid).is_some_and(|o| {
-                            index.mounts[index.resources[o.resource].mount].path
-                                == Index::CHARACTERS
-                        })
-                    })
-                    .collect();
                 world.finish_selection(&Household {
                     house: i32::try_from(number)?,
                     flags: record.flags,
                     members: &record.members,
-                    characters: &characters,
+                    characters: &program.characters,
                     residents: &residents,
                     zoning: &program.zoning,
                 })?;
@@ -1159,6 +1156,7 @@ mod tests {
                 people: Default::default(),
                 icon_frames: None,
                 expansions: 0,
+                characters: Default::default(),
             },
             catalog: Catalog {
                 global: 0,

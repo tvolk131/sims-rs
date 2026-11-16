@@ -47,8 +47,9 @@
 //! and the carry layer in the order the skin's list holds them. Each
 //! layer at weight 1 or more replaces what the bones held with its
 //! motions; one with nothing bound, no frames or no weight samples
-//! nothing, and one below weight 1, which blends (0x597c4c), is not
-//! ported. The skin does not put the bones back at rest first, so a bone
+//! nothing, and one below weight 1 blends with what the bones held where
+//! a bone blends ([`pose::sample_weighted`], 0x598226 to 0x5985f9). The
+//! skin does not put the bones back at rest first, so a bone
 //! on the way from the root to a bone measured or turned whose rotation
 //! no layer playing now writes holds what an earlier layer left, which is
 //! not kept and fails. Likewise a translation no layer playing now
@@ -172,6 +173,7 @@ impl Interpreter<'_> {
             return Ok(());
         };
         let target = word(person_data(world, id)?, TARGET);
+        let mut at_itself = false;
         if target != 0 {
             let found = u16::try_from(target)
                 .ok()
@@ -188,13 +190,21 @@ impl Interpreter<'_> {
                         // (0x454f5c, with height 0).
                         a.head.target = Some(world_point(object.position));
                     } else if t == id {
-                        return Err(Trap::Unsupported(format!(
-                            "person {id} looks at itself (0x59293d on its own animator, with \
-                             its head turned): not ported"
-                        )));
+                        if world.removals.contains(&id) {
+                            return Err(Trap::Unsupported(format!(
+                                "person {id}, queued for removal, looks at itself: its \
+                                 animator's refresh as it left the lot (0x58da12) is not kept"
+                            )));
+                        }
+                        // 0x59293d with 1 on its own animator: the matrix
+                        // of its +0x144 anchor as the step left the skin,
+                        // its head turned (0x59640d reads the same words
+                        // of 0x59638f's matrix as the measurement below).
+                        at_itself = true;
                     }
                     let level = World::tile(object.position)[2];
                     if object.person.is_some()
+                        && !at_itself
                         && let Some(point) = self.top_of(world, t)?
                     {
                         a.head.target = Some(point);
@@ -215,6 +225,11 @@ impl Interpreter<'_> {
         let bones = self.posed(world, id, a, &[top.0, front.0], turned)?;
         let model = self.model(world, id, a)?;
         let at = head::anchor_point(bones[top.0], top.1, &model);
+        if at_itself {
+            // The target is the point the heading is measured from, so
+            // the target's heading (from a difference of 0 and 0) stays.
+            a.head.target = Some(at);
+        }
         let ahead = head::anchor_point(bones[front.0], front.1, &model);
         if let Some(heading) = head::heading(
             head::difference(ahead[0], at[0]),
@@ -449,16 +464,7 @@ impl Interpreter<'_> {
             if !layer.bound || layer.frames == 0 || layer.weight.ext() <= Ext::ZERO {
                 continue;
             }
-            if layer.weight.ext() < Ext::from_i32(1) {
-                return Err(unsupported(
-                    "0x597c4c",
-                    &format!(
-                        "person {id}'s pose with its layer of {:?} below weight 1: the blend \
-                         with what the bones held",
-                        layer.clip
-                    ),
-                ));
-            }
+            let whole = layer.weight.ext() >= Ext::from_i32(1);
             let clip = self.program.animations.clip(&layer.clip).map_err(|e| {
                 unsupported("0x59dc32", &format!("finds no clip {:?}: {e}", layer.clip))
             })?;
@@ -499,13 +505,20 @@ impl Interpreter<'_> {
                         .map(|s| &translations[s..]),
                     rotations: from(channel.rotation, rotations.len()).map(|s| &rotations[s..]),
                 };
-                if motion.rotations.is_some() {
-                    rotated[bone] = true;
+                // A layer below weight 1 blends with what the bone held
+                // (0x598226 to 0x5985f9), which is known only as far as
+                // it was before.
+                let blends = skeleton.bones[bone].blends;
+                if whole || !blends {
+                    if motion.rotations.is_some() {
+                        rotated[bone] = true;
+                    }
+                    if motion.translations.is_some() {
+                        translated[bone] = true;
+                    }
                 }
-                if motion.translations.is_some() {
-                    translated[bone] = true;
-                }
-                pose::sample(&mut locals[bone], motion, at).map_err(bad)?;
+                pose::sample_weighted(&mut locals[bone], motion, at, layer.weight, blends)
+                    .map_err(bad)?;
             }
         }
         // 0x5992b3 does not put the bones back at rest before it samples:

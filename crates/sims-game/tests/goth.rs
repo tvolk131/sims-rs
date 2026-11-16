@@ -1340,18 +1340,20 @@ fn a_press_on_a_portrait_selects_that_goth_who_then_takes_the_order() {
         }
     }
     assert!(taken.is_some(), "she never took the order");
-    // Strict mode runs on to tick 454. At tick 455 Mortimer (object 21),
+    // Strict mode runs on to tick 509. At tick 455 Mortimer (object 21),
     // now left to himself, routes to a door one of his routes goes
-    // through (0x45b176), which the simulation has not ported; without
-    // the switch and the order the lot runs past it.
-    while game.lot().ticks() < 454 {
+    // through, and the route fails (0x45b176). At tick 510 the salesman
+    // (object 259) is reset while his animator plays a walk, whose
+    // removal can fade it out (0x592878), which is not ported; without
+    // the switch and the order the lot runs past it. Unverified.
+    while game.lot().ticks() < 509 {
         assert_eq!(game.run(1), 1, "{:?}", game.stopped());
     }
-    assert_eq!(game.run(1), 0);
-    let stop = game.stopped().expect("the stop at tick 455");
     assert_eq!(mortimer, 21);
+    assert_eq!(game.run(1), 0);
+    let stop = game.stopped().expect("the stop at tick 510");
     assert!(
-        stop.contains("object 21") && stop.contains("0x45b176"),
+        stop.contains("object 259") && stop.contains("0x592878"),
         "{stop}"
     );
 }
