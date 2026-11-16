@@ -5,6 +5,7 @@
 mod action_string;
 mod animate;
 mod budget;
+mod burn;
 mod change_suit;
 mod create;
 mod debug;
@@ -131,6 +132,7 @@ impl Machine<'_, '_> {
             6 => self.change_suit(operands)?.into(),
             7 => self.refresh(operands)?.into(),
             8 => self.random(operands)?.into(),
+            9 => self.burn(operands)?.into(),
             10 => self.own_events(operands)?.into(),
             11 => self.get_distance_to(operands)?.into(),
             12 => self.get_direction_to(operands)?.into(),
