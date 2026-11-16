@@ -28,11 +28,14 @@
 //!    names, the local being operand word 0 shifted right by one, signed
 //!    (native error 0x33 when it is not below the frame's local count,
 //!    frame byte 6; a local still holding half of an old pointer fails
-//!    loudly); 1, a neighbor's (0x4256f4, record +8), which is not
-//!    ported and fails, since whether the record holds a picture is
-//!    presentation we do not model. An object ID that names nothing on
-//!    the lot (not positive, or a null entry of the lot's table), or any
-//!    other byte 2, ends the call. The picture is the object's
+//!    loudly); 1, the neighbor record the stack object names (0x4256f4:
+//!    slot `id - 1`), whose type (record +8) is the picture. The reader
+//!    sets that type from the catalog by the record's GUID (0x423ef2,
+//!    0x43ac10), and a record made in play takes the definition it is
+//!    made from (0x4237a1); the reload (0x424806) only reads it. A
+//!    missing record or a GUID the catalog lacks ends the call. An
+//!    object ID that names nothing on the lot (not positive, or a null
+//!    entry of the lot's table), or any other byte 2, ends the call. The picture is the object's
 //!    definition's (+0x11c), loaded into its cache (+0x8c, 0x45728d) when
 //!    first asked for, and the record's frame count becomes 1 (0x46dfe9);
 //!    the backdrop and what follows are as below. Any other kind names a
@@ -143,7 +146,7 @@ impl Machine<'_, '_> {
             index += i32::from(temp);
         }
         let frames = if kind == PICTURE {
-            if !self.has_picture(operands, target)? {
+            if !self.has_picture(operands)? {
                 return Ok(true);
             }
             1
@@ -174,16 +177,23 @@ impl Machine<'_, '_> {
     }
 
     /// Whether kind 7 finds a catalog picture to show (0x44b811 to
-    /// 0x44b8d8), by byte 2: the stack object's (0), a neighbor's (1, not
-    /// ported) or a local's object's (2).
-    fn has_picture(&self, operands: &[u8; 8], target: u16) -> Result<bool, Trap> {
+    /// 0x44b8d8), by byte 2: the stack object's (0), the neighbor record
+    /// the stack object names (1) or a local's object's (2).
+    fn has_picture(&self, operands: &[u8; 8]) -> Result<bool, Trap> {
         let id = match operands[2] {
             0 => i32::from(self.frame()?.stack_object),
             1 => {
-                return Err(Trap::Unsupported(format!(
-                    "Set Balloon/Headline showing a neighbor's picture (kind 7, mode 1) on \
-                     object {target} (0x44b862), which is not ported"
-                )));
+                // The record the stack object names (0x4256f4) shows its
+                // type, record +8: what the catalog held for the record's
+                // GUID when the neighborhood was read (0x423ef2, 0x43ac10),
+                // or the definition a record made in play was made from
+                // (0x4237a1). Only whether there is one is simulation.
+                let id = self.frame()?.stack_object;
+                return Ok(self
+                    .world
+                    .neighbors
+                    .get(id)
+                    .is_some_and(|record| self.catalog.object(record.guid).is_some()));
             }
             2 => {
                 let local = word(operands, 0) >> 1;
