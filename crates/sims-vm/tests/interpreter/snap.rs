@@ -1145,11 +1145,12 @@ fn mode_1_puts_me_into_the_objects_first_container_slot() {
     let start = unmoved(&fx, me);
     assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 1, 0), Ok(false));
     assert_eq!(unmoved(&fx, me), start);
-    // Flag bit 2 tests the walls around the object (0x45522c).
+    // Flag bit 2 tests the walls around the object (0x45522c): with none
+    // there, I go in.
     let (mut fx, me) = container_snapper();
     fx.lamp_mut().position = [56, 56, 1];
-    let result = snap(&mut fx, me, LAMP as i16, 0, 1, 4);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x45522c")));
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 1, 4), Ok(true));
+    assert_eq!(fx.world.objects[&me].position, [56, 56, 1]);
     // An object with no container slot: mode 1 does not test for one
     // (0x454b19 is not on its way), and what follows is not ported.
     let (mut fx, me) = container_snapper();
