@@ -30,11 +30,12 @@
 //! tick (`Interpreter::take_self_off`, for its animator's refresh). A
 //! tile of a group (definition word 10, +0x14, set, and the object one of
 //! a group, 0x44b52a to 0x44b545) is first asked whether its type names
-//! function 8 (0x42344e). If it does, the tile leaves its group and the
-//! group's offsets are worked out again (0x42346a: 0x4228d6, 0x4234ab),
-//! which is not ported and fails loudly. If not, nothing happens before
-//! the take-off, which takes the whole group off
-//! ([`crate::Interpreter::take_off`], 0x422d86).
+//! function 8 (0x42344e). If it does, the tile leaves its group, and the
+//! group it left and the tile work out their neighbours again (0x42346a:
+//! 0x4228d6, 0x4234ab; `Interpreter::leave_group`), so the take-off
+//! takes the tile alone. If not, nothing happens before the take-off,
+//! which takes the whole group off ([`crate::Interpreter::take_off`],
+//! 0x422d86).
 //!
 //! Modes 3 and 4 search along a line through the object the local names,
 //! following its facing (see `Machine::find_in_line`).
@@ -90,12 +91,9 @@ impl Machine<'_, '_> {
                 && interpreter.words(self.world, target)?[GROUP] != 0
                 && interpreter.has_function(self.world, target, function::DYNAMIC_GROUP)
             {
-                return Err(Trap::Unsupported(
-                    "Find Location For mode 1 on a tile of a group whose type has the dynamic \
-                     group function (8): the tile leaves its group first and the group's \
-                     offsets are worked out again (0x42346a), which is not ported"
-                        .into(),
-                ));
+                interpreter
+                    .leave_group(self.world, target)
+                    .map_err(|fault| fault.nested(me))?;
             }
             if target == me && self.world.objects[&target].person.is_some() {
                 interpreter

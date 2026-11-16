@@ -299,11 +299,87 @@ fn not_fitting_sets_words_52_and_54_from_the_placement_error() {
     let data = &fx.world.objects[&me].data;
     assert_eq!((data[52], data[54]), (0, other as i16));
     assert_eq!(fx.world.objects[&me].position, [40, 40, 1]);
-    // With flag bit 1, whether that person lets me through (0x45bd5e) is
-    // not ported.
+    // With flag bit 1 that person would be asked to make way (0x45bd5e),
+    // but the catalog has no marker type (0x43ac10): not asked.
+    fx.world = start.clone();
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 2), Ok(false));
+    let data = &fx.world.objects[&me].data;
+    assert_eq!((data[52], data[54]), (0, other as i16));
+    // With the marker type, whose menu entry 3 moves the person.
+    let marker_file = fx.add_type(0x7c4, 4, 0, 0x1006);
+    fx.add(
+        marker_file,
+        0x1006,
+        tree(vec![
+            assign(scope::PARAMETERS, 0, scope::LITERAL, 100, 1),
+            ins(0, 0, 0, [0; 8]),
+        ]),
+    );
+    let library = fx.program.libraries.get_mut(&marker_file).unwrap();
+    library.definitions.get_mut(&128).unwrap()[7] = 1007;
+    let entry = sims_formats::behavior::Interaction {
+        action: 4302,
+        test: 0,
+        string_index: 3,
+        flags: 0,
+        autonomy: 50,
+        attenuation_code: 0,
+        attenuation: 0.0,
+        joining_index: -1,
+        motives: Vec::new(),
+        flags2: 0,
+    };
+    library.interactions.insert(
+        1007,
+        Some(sims_formats::behavior::InteractionTable {
+            version: 7,
+            interactions: vec![entry; 4],
+        }),
+    );
     fx.world = start;
-    let result = snap(&mut fx, me, LAMP as i16, 0, 3, 2);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x454e54")));
+    fx.world
+        .objects
+        .get_mut(&me)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .active
+        .priority = 77;
+    let before: Vec<u16> = fx.world.objects.keys().copied().collect();
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 2), Ok(false));
+    let data = &fx.world.objects[&me].data;
+    assert_eq!((data[52], data[54]), (1, other as i16));
+    // A marker stands where the other person does, its slot written
+    // over: the four straight directions, resolution 16.
+    let marker = *fx
+        .world
+        .objects
+        .keys()
+        .find(|id| !before.contains(id))
+        .unwrap();
+    assert_eq!(fx.world.objects[&marker].guid, 0x7c4);
+    assert_eq!(fx.world.objects[&marker].position, [56, 56, 1]);
+    let slot = fx.world.routing.slots[&(marker, 0)];
+    assert_eq!(slot.flags, 0x55 | 0x100 | 0x2000);
+    assert_eq!((slot.proximity, slot.resolution), ([16, 80, 16], 16));
+    // The other person has the marker's move action, at my running
+    // action's priority.
+    let queue = &fx.world.objects[&other].person.as_ref().unwrap().queue;
+    assert!(
+        queue.iter().any(|a| a.target == marker as i16
+            && a.table_index == 3
+            && a.priority == 77
+            && a.action == 4302),
+        "{queue:?}"
+    );
+    // Asked once, the person is not asked again.
+    let data = fx.world.objects.get_mut(&me).unwrap();
+    data.data[52] = 9;
+    let count = fx.world.objects.len();
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 3, 2), Ok(false));
+    assert_eq!(fx.world.objects[&me].data[52], 0);
+    assert_eq!(fx.world.objects.len(), count);
 }
 
 /// Sets wall segments on a tile of the ground level (lot array 2, 14
@@ -772,10 +848,6 @@ fn snap_into_a_container_slot_needs_the_slot_and_a_place_in_it() {
     let start = unmoved(&fx, me);
     assert_eq!(code(snap(&mut fx, me, LAMP as i16, 0, 3, 0)), Some(0x20));
     assert_eq!(unmoved(&fx, me), start);
-    // Flag bit 2 tests the walls around the object instead (0x45522c).
-    let (mut fx, me) = container_snapper();
-    let result = snap(&mut fx, me, LAMP as i16, 0, 3, 4);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x45522c")));
     // The place test refuses: the slot holds another object, the lamp
     // takes less than I weigh, or my data word 4 lacks the bit for the
     // slot's height. I do not fit, and nothing moves.
@@ -792,6 +864,48 @@ fn snap_into_a_container_slot_needs_the_slot_and_a_place_in_it() {
         let result = snap(&mut fx, me, LAMP as i16, 0, 3, 0);
         assert_eq!(result, Ok(false), "case {case}");
         assert_eq!(unmoved(&fx, me), start, "case {case}");
+    }
+}
+
+#[test]
+fn flag_bit_2_keeps_me_out_of_a_slot_where_a_wall_crosses_my_footprint() {
+    // 0x45522c: my footprint at the lamp (a person 6 wide, so 45 to 51 in
+    // the first coordinate at 48), facing the direction, crossed by a
+    // wall on the lamp's level (0x476dbc): segment 1 of tile (3, 1), the
+    // line 48 in the first coordinate, whose style (0) a person does not
+    // cross.
+    let crossed = |segments: u8, style: u16, flags: u8, facing: i16| {
+        let (mut fx, me) = container_snapper();
+        fx.lamp_mut().position = [48, 24, 1];
+        let walls = fx.world.arrays.get_mut(&2).unwrap();
+        let cell = (3 * 64 + 1) * 14;
+        walls.data[cell] |= segments;
+        walls.data[cell + 2..cell + 4].copy_from_slice(&style.to_le_bytes());
+        let person = fx.world.objects.get_mut(&me).unwrap();
+        person.data[1] = facing;
+        person.data[54] = 9;
+        let result = snap(&mut fx, me, LAMP as i16, 0, 3, flags);
+        (result, fx, me)
+    };
+    // My facing, 11, is the direction 3.
+    let (result, fx, me) = crossed(1, 0, 4, 11);
+    assert_eq!(result, Ok(false));
+    let person = &fx.world.objects[&me];
+    assert_eq!(person.position, [40, 40, 1]);
+    // My facing is put back reduced to 0 to 7 (0x45527f), and words 52 and
+    // 54 are 0: no placement error and no object collided with.
+    assert_eq!(
+        (person.data[1], person.data[52], person.data[54]),
+        (3, 0, 0)
+    );
+    assert!(fx.lamp().slots[1..].iter().all(|s| s.object == 0));
+    // Without flag bit 2, a style a person crosses (3), or a segment that
+    // is not tested (4): I go into the slot.
+    for (segments, style, flags) in [(1, 0, 0), (1, 3, 4), (4, 0, 4)] {
+        let (result, fx, me) = crossed(segments, style, flags, 3);
+        assert_eq!(result, Ok(true), "{segments} {style} {flags}");
+        assert_eq!(fx.world.objects[&me].position, [48, 24, 1]);
+        assert_eq!(fx.world.objects[&me].data[1], 3);
     }
 }
 
@@ -1031,11 +1145,12 @@ fn mode_1_puts_me_into_the_objects_first_container_slot() {
     let start = unmoved(&fx, me);
     assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 1, 0), Ok(false));
     assert_eq!(unmoved(&fx, me), start);
-    // Flag bit 2 tests the walls around the object (0x45522c).
+    // Flag bit 2 tests the walls around the object (0x45522c): with none
+    // there, I go in.
     let (mut fx, me) = container_snapper();
     fx.lamp_mut().position = [56, 56, 1];
-    let result = snap(&mut fx, me, LAMP as i16, 0, 1, 4);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x45522c")));
+    assert_eq!(snap(&mut fx, me, LAMP as i16, 0, 1, 4), Ok(true));
+    assert_eq!(fx.world.objects[&me].position, [56, 56, 1]);
     // An object with no container slot: mode 1 does not test for one
     // (0x454b19 is not on its way), and what follows is not ported.
     let (mut fx, me) = container_snapper();

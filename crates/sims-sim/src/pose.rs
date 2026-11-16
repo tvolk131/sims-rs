@@ -169,6 +169,56 @@ pub fn sample(bone: &mut Bone, motion: Motion<'_>, at: Selection) -> Result<(), 
     Ok(())
 }
 
+/// A bone's pose from one motion of a layer at `weight` (0x598226 to
+/// 0x5985f9): the motion's sample ([`sample`]) replaces what the bone
+/// holds when the weight is 1 or more or the bone does
+/// not blend (`blends`, native bone +0x74). Otherwise each channel the
+/// motion has blends with what the bone holds:
+///
+/// - the translation becomes, coordinate by coordinate, the sample times
+///   the weight plus what it held times 1 minus the weight;
+/// - the rotation is left as it is for a weight of 0.01 or less, or when
+///   the sample is the same as what it holds; otherwise it becomes the
+///   blend of the sample, at the weight, with what it holds ([`blend`],
+///   whose result in the bounds is the identity, [`ORIGIN`]).
+///
+/// A layer at weight 0 or below is not sampled at all (0x597c4c).
+pub fn sample_weighted(
+    bone: &mut Bone,
+    motion: Motion<'_>,
+    at: Selection,
+    weight: F32,
+    blends: bool,
+) -> Result<(), Error> {
+    let mut sampled = *bone;
+    sample(&mut sampled, motion, at)?;
+    let w = weight.ext();
+    // 0x5982b2: `w >= 1.0`, an x87 compare with a double; not a number
+    // compares unordered and blends.
+    let whole = w >= one();
+    if whole || !blends {
+        *bone = sampled;
+        return Ok(());
+    }
+    if motion.translations.is_some() {
+        let rest = s(one() - w);
+        bone.translation = std::array::from_fn(|i| {
+            s(s(sampled.translation[i].ext() * w) + s(bone.translation[i].ext() * rest)).to_f32()
+        });
+    }
+    if motion.rotations.is_some() {
+        let differ = sampled
+            .rotation
+            .iter()
+            .zip(&bone.rotation)
+            .any(|(x, y)| x.ext() != y.ext());
+        if w > SMALL.ext() && differ {
+            bone.rotation = blend(weight, sampled.rotation, bone.rotation, ORIGIN.rotation);
+        }
+    }
+    Ok(())
+}
+
 /// Blends rotation `a`, at `weight`, with `b` (0x593989): a weight within
 /// 0.01 of 1 gives `a`, within 0.01 of 0 gives `b`, and any other weight
 /// at or beyond those bounds leaves `destination`. Otherwise the sum is

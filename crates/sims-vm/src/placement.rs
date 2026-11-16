@@ -44,9 +44,12 @@ use sims_sim::World;
 use sims_sim::animator::{Animator, HeldPose, Layer};
 use std::collections::BTreeSet;
 
+mod dynamic;
 mod find;
 pub(crate) use find::Rules;
-pub(crate) use find::{Refusal, closed_directions, pool_tile};
+pub(crate) use find::{
+    Refusal, closed_directions, floor, pool_byte, pool_tile, segments, tile_flags,
+};
 
 /// A person's own tick while its thread runs: the person, and the
 /// animator refresh its taking itself off the lot left pending
@@ -173,6 +176,12 @@ pub(crate) fn reads_no_animator(opcode: u16, operands: &[u8; 8]) -> bool {
 
 /// The side of the lot's arrays.
 const FULL: i32 = 64;
+
+/// The type the interface keeps a pooled list of (0x448307).
+const POOLED: u32 = 0xE933_7020;
+
+/// A container entry in a definition's SLOT list.
+const CONTAINER_SLOT: u16 = 0;
 /// The object grids of the two levels.
 const GRIDS: [u16; 2] = [3, 103];
 /// The tile flags of the two levels.
@@ -787,6 +796,27 @@ impl Interpreter<'_> {
             })
     }
 
+    /// An object's footprint were it at `position` facing `facing`
+    /// (0x433d16 with a position given, as Snap's wall test calls it with
+    /// its facing set for the call, 0x455263).
+    pub(crate) fn footprint_at(
+        &self,
+        world: &World,
+        id: u16,
+        position: [i32; 3],
+        facing: i16,
+    ) -> Result<[i32; 4], Trap> {
+        let words = self.words(world, id)?;
+        let object = world.objects.get(&id).ok_or_else(missing)?;
+        let person = object.person.as_ref().map(|p| p.data.as_slice());
+        if person.is_some() != (words[word::TYPE] == 2) {
+            return Err(Trap::Invalid(
+                "an object and its definition disagree on whether it is a person".into(),
+            ));
+        }
+        footprint(position, words, facing, person)
+    }
+
     pub(crate) fn words(&self, world: &World, id: u16) -> Result<&[i16; DEFINITION_WORDS], Trap> {
         let object = world.objects.get(&id).ok_or_else(missing)?;
         let definition = self
@@ -1208,37 +1238,48 @@ impl Interpreter<'_> {
     /// What the interface does when an object comes onto the lot from
     /// outside (0x44752e). If the lot has no indicator objects yet it
     /// creates them ([`Interpreter::ensure_indicators`], 0x445e4a). For a
-    /// person it then does more in three cases, none of them ported, which
-    /// fail:
+    /// person it then does more, in this order:
     ///
-    /// - the person is the selected Sim: the first indicator moves to it
-    ///   (0x4475d2);
+    /// - the person is the selected Sim: the first indicator goes into its
+    ///   head slot ([`Interpreter::mark_selected`], 0x4475d2);
     /// - person word 77 names an object (is above 0): the second
-    ///   indicator moves to that object (0x4477fb);
+    ///   indicator moves to that object (0x4477fb), which is not ported
+    ///   and fails;
     /// - the person is not selected and person word 81 is 10 or more:
     ///   with bit 0x40 of the installed-expansions mask (application field
     ///   +0x66, set on a Complete Collection install and not modeled), a
-    ///   pooled object moves to the person (0x447a82). This fails whatever
-    ///   the mask.
+    ///   pooled object moves to the person (0x447a82). This is not ported
+    ///   and fails whatever the mask.
     ///
-    /// Otherwise nothing more happens. A person word 77 below 0 names no
-    /// object and does nothing.
+    /// A person word 77 below 0 names no object and does nothing.
     fn placed_from_outside(&self, world: &mut World, id: u16) -> Result<(), Fault> {
         self.ensure_indicators(world)?;
         let Some(object) = world.objects.get(&id) else {
             return Ok(());
         };
-        let Some(person) = &object.person else {
+        if object.person.is_none() {
             return Ok(());
-        };
+        }
+        let selected = object.selected;
+        if selected {
+            self.mark_selected(world, id)?;
+        }
+        let object = world.objects.get(&id).ok_or_else(|| Fault {
+            object: id,
+            at: None,
+            trap: missing(),
+        })?;
+        let person = object.person.as_ref().ok_or_else(|| Fault {
+            object: id,
+            at: None,
+            trap: Trap::Invalid("a person stopped being one".into()),
+        })?;
         let word = |index: usize| person.data.get(index).copied().unwrap_or(0);
-        let case = if object.selected {
-            Some("the selected Sim coming onto the lot moves the first indicator to it (0x4475d2)")
-        } else if word(77) > 0 {
+        let case = if word(77) > 0 {
             Some(
                 "a person whose person word 77 names an object moves the second indicator there (0x4477fb)",
             )
-        } else if word(81) >= 10 {
+        } else if !selected && word(81) >= 10 {
             Some("a person whose person word 81 is 10 or more takes a pooled object (0x447a82)")
         } else {
             None
@@ -1251,6 +1292,125 @@ impl Interpreter<'_> {
             }),
             None => Ok(()),
         }
+    }
+
+    /// The selected Sim `id` has come onto the lot (0x4475d2 to 0x4477bb),
+    /// with the lot's first indicator (the marker over the selected Sim;
+    /// none, nothing happens):
+    ///
+    /// 1. An indicator that is not in the person (0x43265e) leaves the lot
+    ///    (its virtual function 0x50 with 1, [`Interpreter::take_off`]).
+    /// 2. A person on the lot's border tiles (0x422632: a tile below 1 or
+    ///    at the lot's size less 1 or more) stops here.
+    /// 3. The person's slot 1 as scripts count it (record 2) is its head
+    ///    slot, when its definition has no container slots of its own
+    ///    (the person's records, 0x45962b); one with any fails loudly.
+    ///    The head slot has flag 2 (record +0x1c), so the step goes on.
+    /// 4. The object the head slot holds, if any, is let go
+    ///    ([`Interpreter::release_from_head`], 0x4481eb).
+    /// 5. The indicator is put into the head slot with the lot told
+    ///    (virtual function 0x58: the person's position and level, slot 1,
+    ///    last argument 1).
+    ///
+    /// The rest (0x447719 to 0x4477bb) is drawing: the indicator's sprite
+    /// is told the person's draw group and shown.
+    fn mark_selected(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let indicator = world.indicators[0];
+        if indicator == 0 || !world.objects.contains_key(&indicator) {
+            return Ok(());
+        }
+        if capture(world, indicator).map_err(fail)?.container != Some(id) {
+            self.take_off(world, indicator, true)?;
+        }
+        let [p0, p1, level] = position(world, id).map_err(fail)?;
+        let size = i32::from(world.size);
+        let border = |p: i32| {
+            let t = i32::from((p >> 4) as i8);
+            t < 1 || t >= size - 1
+        };
+        if border(p0) || border(p1) {
+            return Ok(());
+        }
+        let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
+        let definition = self
+            .catalog
+            .object(object.guid)
+            .ok_or_else(|| fail(Trap::Invalid("object has no definition".into())))?;
+        let own = self
+            .program
+            .slots(definition.resource, definition.chunk)
+            .iter()
+            .filter(|entry| entry.kind == CONTAINER_SLOT)
+            .count();
+        if own != 0 {
+            return Err(fail(Trap::Unsupported(format!(
+                "the selected Sim {id} comes onto the lot with {own} container slots of its \
+                 own: its slot 1 (0x4476a2) is then one of them, whose flags are not read"
+            ))));
+        }
+        let held = object
+            .slots
+            .get(2)
+            .ok_or_else(|| fail(Trap::Invalid(format!("person {id} has no head slot"))))?
+            .object;
+        if let Some(held) = registered(world, held) {
+            self.release_from_head(world, held)?;
+        }
+        self.put(
+            world,
+            indicator,
+            Place {
+                on_lot: on_lot([p0, p1]),
+                position: [p0, p1],
+                container: Some(id),
+                slot: 1,
+                level,
+            },
+            true,
+        )
+    }
+
+    /// 0x4481eb, for an object in the selected Sim's head slot: for a
+    /// person, the object in its own head slot instead (record 2; none,
+    /// nothing happens). Then by the first object's GUID: an indicator's
+    /// leaves the lot unannounced (virtual function 0x50 with 0); type
+    /// 0xE9337020 first comes out of the interface's pooled list
+    /// (0x4483e7, 0x448663), which is not ported and fails; any other
+    /// does nothing.
+    fn release_from_head(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
+        let guid = object.guid;
+        let target = if self.words(world, id).map_err(fail)?[word::TYPE] == 2 {
+            object
+                .slots
+                .get(2)
+                .and_then(|s| registered(world, s.object))
+        } else {
+            Some(id)
+        };
+        let Some(target) = target else {
+            return Ok(());
+        };
+        if guid == POOLED {
+            return Err(fail(Trap::Unsupported(format!(
+                "object {id} of type 0x{POOLED:08X} let go from the selected Sim's head slot: \
+                 it leaves the interface's pooled list first (0x4483e7, 0x448663); not ported"
+            ))));
+        }
+        if INDICATORS.contains(&guid) {
+            self.take_off(world, target, false)?;
+        }
+        Ok(())
     }
 
     /// The tiles of the group an object belongs to, lead tile first, or

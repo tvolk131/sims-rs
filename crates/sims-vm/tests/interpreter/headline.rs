@@ -5,6 +5,7 @@
 use crate::support::*;
 use sims_formats::execution::Slot;
 use sims_sim::Headline;
+use sims_sim::neighbors::{Neighbor, Neighbors};
 use sims_vm::{Status, Trap};
 use std::collections::BTreeMap;
 
@@ -214,13 +215,6 @@ fn option_bit_12_adds_my_temp_0_to_the_index() {
 
 #[test]
 fn what_is_not_ported_fails() {
-    // A neighbor's catalog picture (kind 7, mode 1).
-    let mut fx = fixture();
-    let fault = run(&mut fx, SIM, 0, icon(false, 7, 1, 10, 0)).unwrap_err();
-    assert!(
-        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x44b862")),
-        "{fault}"
-    );
     // Sprites that were not read.
     let mut fx = Fixture::new();
     let fault = run(&mut fx, SIM, 0, headline(false, 10)).unwrap_err();
@@ -286,6 +280,39 @@ fn a_catalog_picture_of_nothing_on_the_lot_shows_nothing() {
     // when the picture is not found.
     assert_eq!(run(&mut fx, SIM, 999, icon(false, 7, 0, 20, 0)), Ok(true));
     assert_eq!(fx.world.headlines[&SIM], shown(1, 10));
+}
+
+#[test]
+fn a_neighbors_picture_needs_the_record_and_its_type() {
+    // Kind 7, mode 1: the stack object names a neighbor record by its
+    // place plus one (0x4256f4); its type (record +8) is the catalog's
+    // for its GUID. Records 1 (the lamp's type), 2 (a GUID the catalog
+    // lacks) and an empty slot 3.
+    let record = |id: i16, guid| Neighbor {
+        id,
+        guid,
+        revision: 5,
+        data: vec![0; 256],
+        relationships: Vec::new(),
+        friends: 0,
+        stale: true,
+    };
+    let mut fx = Fixture::new();
+    fx.world.neighbors = Neighbors {
+        slots: vec![Some(record(1, LAMP_GUID)), Some(record(2, 0x9999)), None],
+        ..Neighbors::default()
+    };
+    for stack in [2, 3, 4, 0, -1] {
+        assert_eq!(
+            run(&mut fx, SIM, stack, icon(false, 7, 1, 10, 0)),
+            Ok(true),
+            "{stack}"
+        );
+        assert!(fx.world.headlines.is_empty(), "{stack}");
+    }
+    // One frame, as for the stack object's picture.
+    assert_eq!(run(&mut fx, SIM, 1, icon(false, 7, 1, 5, 0x800)), Ok(true));
+    assert_eq!(fx.world.headlines, BTreeMap::from([(SIM, shown(1, 60))]));
 }
 
 /// Runs Set Balloon/Headline as the Sim's tree 4096, after an Expression
