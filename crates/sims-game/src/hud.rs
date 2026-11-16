@@ -189,12 +189,12 @@ impl Hud {
     /// level of each one's career needs, and, while the relationship
     /// panel is open, the people the selected Sim knows (read only then:
     /// the lookup goes through every neighborhood record), or while the
-    /// house panel is open, the house's ratings.
+    /// house panel shows (the strip open on it), the house's ratings.
     pub fn snapshot(&self, world: &World) -> Snapshot {
         let snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
         match self.controls.panel {
             UiPanel::Relationships => snapshot.with_relations(world, &self.members, &self.known),
-            UiPanel::House => snapshot.with_house(world, &self.house),
+            UiPanel::House if self.controls.expanded => snapshot.with_house(world, &self.house),
             _ => snapshot,
         }
     }

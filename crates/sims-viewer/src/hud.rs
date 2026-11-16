@@ -15,7 +15,7 @@ use crate::view::{Command as ViewCommand, View};
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_content::{Install, Neighborhood};
 use sims_render::{Assets, Canvas, Walls, Zoom};
-use sims_ui::command::{Camera, Command, Walls as UiWalls};
+use sims_ui::command::{Camera, Command, Panel as UiPanel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::Frame;
 use sims_ui::house;
@@ -120,9 +120,11 @@ impl Hud {
             zoom_in: camera.zoom != Zoom::Near,
             zoom_out: camera.zoom != Zoom::Far,
         };
-        let snapshot = Snapshot::read(world, &self.members)
-            .with_careers(&self.careers)
-            .with_house(world, &self.house);
+        let mut snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
+        // The house's ratings only while its panel shows.
+        if self.controls.expanded && self.controls.panel == UiPanel::House {
+            snapshot = snapshot.with_house(world, &self.house);
+        }
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         let (width, height) = (
             u32::try_from(canvas.width).unwrap_or(u32::MAX),
