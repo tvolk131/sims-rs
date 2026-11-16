@@ -387,8 +387,13 @@ impl Snapshot {
 
     /// Works out [`Snapshot::house`] from `world` ([`House::read`]).
     #[must_use]
-    pub fn with_house(mut self, world: &World, tuning: &house::Tuning) -> Self {
-        self.house = House::read(world, tuning);
+    pub fn with_house(
+        mut self,
+        world: &World,
+        tuning: &house::Tuning,
+        kinds: &house::Kinds,
+    ) -> Self {
+        self.house = House::read(world, tuning, kinds);
         self
     }
 

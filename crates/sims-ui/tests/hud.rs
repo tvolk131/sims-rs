@@ -319,8 +319,8 @@ fn the_goths_house_panel() {
     assert_eq!(opened.house.yard, sims_core::F32::from_f32(0.33));
     // After the load: 1,836 square feet, two bedrooms and a bathroom on
     // a large lot. Size: 612 square feet for each of three members;
-    // Yard: the outdoor rooms' score times 0.33. The other three are not
-    // ported.
+    // Yard: the outdoor rooms' score times 0.33. Furnishings and Layout
+    // are not ported.
     let house = &opened.snapshot.house;
     assert_eq!(
         (
@@ -331,7 +331,13 @@ fn the_goths_house_panel() {
         ),
         (1836, 2, 1, 2)
     );
-    assert_eq!(house.ratings, [Some(75), None, Some(76), None, None]);
+    // Upkeep: 73 of the lot's 253 object types count, and nothing is
+    // dirty or broken after the load, so it is 100 whatever the
+    // penalties, which the install's table sets to 3 and 6.
+    let counted = opened.kinds.counted.values().filter(|c| **c).count();
+    assert_eq!((counted, opened.kinds.counted.len()), (73, 253));
+    assert_eq!((opened.house.dirty, opened.house.broken), (3, 6));
+    assert_eq!(house.ratings, [Some(75), None, Some(76), Some(100), None]);
     let controls = Controls {
         expanded: true,
         panel: Panel::House,
@@ -344,6 +350,6 @@ fn the_goths_house_panel() {
     // screen (see docs/decisions/).
     assert_eq!(
         digest(&frame),
-        "bbbf3165e5205438ef6c5a2e6a6da34a7b09d8fc7eb165c67636ac3e3b46a17a"
+        "c0d6ae63d03a10dc4b50717da2f6f145de43560ee3c59cec6c95b4f8dc143897"
     );
 }

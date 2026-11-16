@@ -77,14 +77,9 @@ from the exe.
     simulator's +0xa4 over its +0xa0. Those two come from the lot's
     object scan (0x444cb9) and the architecture's value (0x47b006),
     stored at 0x416118.
-  - **Upkeep** (0x4168d4): (counted − penalty) over counted, kept to 0 to
-    1, times 100. The scan is 0x4452eb, over the lot's objects:
-    - An object adds the broken penalty if its data word 15 is not 0.
-      Otherwise it adds the dirty penalty if its data word 39 is above 0.
-    - It is counted if its type record's +0x4e, +0x50 or +0x8a is not 0.
-      That is **unverified**: they are read as definition words 38, 39
-      and 68 (room flags, function flags, build mode type), if the record
-      holds the words from +2.
+  - **Upkeep** is now ported: see
+    `20261115-house-panel-upkeep-rating.md`. It also corrects the words
+    this file guessed for the count.
   - **Layout** (lot +0x18): worked out from the lot's routing history,
     +0x3c to +0x64, filled to the "fill value for layout history".
 - **Unverified:**

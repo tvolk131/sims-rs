@@ -16,6 +16,7 @@ pub const GOTH_HOUSE: &str = "UserData/Houses/House05.iff";
 pub struct Opened {
     pub careers: Careers,
     pub house: house::Tuning,
+    pub kinds: house::Kinds,
     pub snapshot: Snapshot,
     pub art: Art,
     pub faces: Faces,
@@ -76,13 +77,16 @@ pub fn open(root: &Path, house: &str) -> Opened {
         .with_careers(&careers)
         .with_relations(world, &family.members, &known);
     let house = house::Tuning::load(&index, catalog).unwrap();
-    let snapshot = snapshot.with_house(world, &house);
+    let mut kinds = house::Kinds::default();
+    kinds.learn(world, &index, catalog);
+    let snapshot = snapshot.with_house(world, &house, &kinds);
     let ui = UiGraphics::open(&install).unwrap();
     let art = Art::load(&ui, US_ENGLISH, &sims_ui::hud::RESOURCES).unwrap();
     let faces = Faces::load(&index, catalog, &family.members).unwrap();
     Opened {
         careers,
         house,
+        kinds,
         snapshot,
         art,
         faces,

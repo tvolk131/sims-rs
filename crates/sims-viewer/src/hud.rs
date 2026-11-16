@@ -32,6 +32,9 @@ pub struct Hud {
     /// The curves and constants the house panel's ratings are worked out
     /// with.
     house: house::Tuning,
+    /// Which of the lot's object types the Upkeep rating counts: the
+    /// viewer's world does not change, so they are read once.
+    kinds: house::Kinds,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
     /// What the relationship panel needs from outside the world.
@@ -98,6 +101,8 @@ impl Hud {
         let careers = Careers::load(assets.index()).map_err(|e| e.to_string())?;
         let house =
             house::Tuning::load(assets.index(), assets.catalog()).map_err(|e| e.to_string())?;
+        let mut kinds = house::Kinds::default();
+        kinds.learn(world, assets.index(), assets.catalog());
         let known = Acquaintances::read(
             assets.index(),
             assets.catalog(),
@@ -109,6 +114,7 @@ impl Hud {
             faces,
             careers,
             house,
+            kinds,
             members,
             known,
             // The strip opens as if Live had been pressed.
@@ -144,7 +150,7 @@ impl Hud {
         }
         // The house's ratings only while its panel shows.
         if self.controls.expanded && self.controls.panel == Panel::House {
-            snapshot = snapshot.with_house(world, &self.house);
+            snapshot = snapshot.with_house(world, &self.house, &self.kinds);
         }
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         let (width, height) = (

@@ -53,6 +53,9 @@ pub struct Hud {
     /// The curves and constants the house panel's ratings are worked out
     /// with.
     house: house::Tuning,
+    /// Which of the lot's object types the Upkeep rating counts, read as
+    /// they show up while the house panel shows.
+    kinds: house::Kinds,
     /// What the relationship panel needs from outside the world: the
     /// autonomy tuning's friendship threshold (0x6c4398) for its
     /// smileys, the neighborhood's characters, and the Superstar pack.
@@ -142,6 +145,7 @@ impl Hud {
             problems: Vec::new(),
             careers,
             house,
+            kinds: house::Kinds::default(),
             known,
             labels,
             members,
@@ -194,7 +198,9 @@ impl Hud {
         let snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
         match self.controls.panel {
             UiPanel::Relationships => snapshot.with_relations(world, &self.members, &self.known),
-            UiPanel::House if self.controls.expanded => snapshot.with_house(world, &self.house),
+            UiPanel::House if self.controls.expanded => {
+                snapshot.with_house(world, &self.house, &self.kinds)
+            }
             _ => snapshot,
         }
     }
@@ -226,6 +232,9 @@ impl Hud {
             zoom_out: camera.zoom != Zoom::Far,
         };
         self.controls.speed = pace.speed;
+        if self.controls.expanded && self.controls.panel == UiPanel::House {
+            self.kinds.learn(world, assets.index(), assets.catalog());
+        }
         // The pause button shows global 17, which the game's pause sets.
         let snapshot = self.snapshot(world);
         self.items = hud::layout(view.size, &snapshot, &self.controls);
