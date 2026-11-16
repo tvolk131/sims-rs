@@ -42,6 +42,7 @@ mod sleep;
 mod snap;
 mod sound;
 mod special_effect;
+mod worst_motives;
 
 pub(crate) use distance::distance;
 
@@ -159,6 +160,7 @@ impl Machine<'_, '_> {
             46 => self.snap(operands)?.into(),
             48 => self.stop_all_sounds(operands)?.into(),
             32 => self.test_object_type(operands)?.into(),
+            33 => self.find_worst_motives(operands)?.into(),
             35 => self.special_effect(operands)?,
             36 => self.dialog(operands)?,
             37 => self.sim_interacting_with(operands)?.into(),
