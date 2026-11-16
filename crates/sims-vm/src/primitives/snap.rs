@@ -90,14 +90,20 @@
 //! placement error and the object collided with (0x454e09 to 0x454e9b,
 //! `not_fit`), and the branch is false; for a multi-tile object the
 //! object collided with is the last that any of its tiles' tests wrote. A
-//! person blocked by another person with flag bit 1 fails loudly.
+//! person blocked by another person with flag bit 1 asks that person to
+//! make way (0x45bd5e, `Machine::ask_to_make_way`), which may queue a
+//! move action on it; word 52 becomes 1 when it is asked (`not_fit`).
 //!
 //! Flag bit 0 makes the animator's offset my distance from the place
 //! (0x454c7a), which the animator's later placing adds to my position;
 //! that fails loudly, as the offset is not kept. Flag bit 1 only matters
-//! when I do not fit. Bit 2, for a place inside an object, tests the walls
-//! around the object instead of putting me there (0x45522c: 0x433d16 and
-//! 0x476dbc); that fails loudly.
+//! when I do not fit. Bit 2, for a place inside an object, then tests the
+//! walls there once the place test has passed (0x45522c: my footprint at
+//! the object, facing the direction, 0x433d16, crossed by a wall on its
+//! level, 0x476dbc; `Machine::walls_in_the_way`). My facing is put back
+//! reduced to 0 to 7. A wall in the way sets word 54 to 0 and goes on as
+//! when I do not fit, with no placement error and no object collided
+//! with: word 52 and word 54 become 0 and the branch is false.
 //!
 //! Ported from the original's code (above). The comparisons that cover
 //! it are whole ticks of the Goth house.
@@ -110,6 +116,7 @@ use crate::primitives::go_to_slot::GLOBAL_SLOTS;
 use crate::routing::slot::{
     direction, facing_cos_sin, route_slot, step, to_lot_units, to_world_units,
 };
+use crate::routing::walls_cross;
 use sims_core::{Ext, F32};
 use sims_sim::animator::{Animator, LOADED, UNSET};
 
@@ -252,7 +259,7 @@ impl Machine<'_, '_> {
                         "in mode 1 into an object with no container slot",
                     ));
                 }
-                self.check_slot_place(operands, target, 0)?;
+                self.check_slot_place(target, 0)?;
                 Spot {
                     direction: self.facing(me)?,
                     position: self.world.objects[&target].position,
@@ -313,6 +320,15 @@ impl Machine<'_, '_> {
         };
         if let Some(refusal) = refusal {
             self.not_fit(refusal, operands[4] & 2 != 0)?;
+            return Ok(false);
+        }
+        if let Some((target, _)) = container
+            && operands[4] & 4 != 0
+            && self.walls_in_the_way(target, direction)?
+        {
+            // The test passed, so the placement error and the object
+            // collided with are as Snap cleared them (0x454d64).
+            self.not_fit(NotFit::Code(0), operands[4] & 2 != 0)?;
             return Ok(false);
         }
         let place_at = Place {
@@ -393,7 +409,7 @@ impl Machine<'_, '_> {
             if usize::try_from(slot.snap_target).is_ok_and(|s| s + 1 >= records) {
                 return Err(Trap::native(0x20, "Snap names no slot of the object"));
             }
-            self.check_slot_place(operands, target, slot.snap_target)?;
+            self.check_slot_place(target, slot.snap_target)?;
             Some((target, slot.snap_target))
         } else {
             None
@@ -427,17 +443,11 @@ impl Machine<'_, '_> {
     }
 
     /// What a place inside `target`'s container slot `slot` needs that is
-    /// not ported: flag bit 2 tests the walls around the object instead
-    /// (0x45522c), and a slot's offset across, turned to the object's
-    /// facing, is added to my animator's offset (0x454ceb to 0x454d5e),
-    /// which is not kept.
-    fn check_slot_place(&self, operands: &[u8; 8], target: u16, slot: i32) -> Result<(), Trap> {
-        if operands[4] & 4 != 0 {
-            return Err(unsupported(
-                "0x45522c",
-                "into a slot with flag bit 2, which tests the walls around the object",
-            ));
-        }
+    /// not ported: a slot's offset across, turned to the object's facing,
+    /// is added to my animator's offset (0x454ceb to 0x454d5e), which is
+    /// not kept. (Flag bit 2's wall test is [`Machine::walls_in_the_way`],
+    /// after the place test.)
+    fn check_slot_place(&self, target: u16, slot: i32) -> Result<(), Trap> {
         let guid = self.world.objects[&target].guid;
         let definition = self.definition(guid)?;
         let held = self
@@ -457,6 +467,40 @@ impl Machine<'_, '_> {
             ));
         }
         Ok(())
+    }
+
+    /// Flag bit 2's wall test for a place in a slot of `target` (0x45522c
+    /// to 0x455289), after the place test has passed: my footprint at
+    /// `target`'s position, facing `direction` (my facing is set for the
+    /// call, 0x455263, and 0x433d16 reads it), crossed by a wall on
+    /// `target`'s level ([`crate::routing::walls_cross`], 0x476dbc). My
+    /// facing is then put back reduced to 0 to 7 (0x45522c, 0x45527f).
+    /// When a wall crosses it, word 54 (+0xb6) becomes 0 and the answer
+    /// is true: I am not put there.
+    fn walls_in_the_way(&mut self, target: u16, direction: i32) -> Result<bool, Trap> {
+        let me = self.me;
+        let saved = self
+            .me()?
+            .data
+            .get(FACING)
+            .copied()
+            .ok_or_else(|| Trap::Invalid(format!("object {me} has no data word {FACING}")))?
+            .rem_euclid(8);
+        let at = self
+            .world
+            .objects
+            .get(&target)
+            .ok_or(Trap::native(10, "missing object"))?
+            .position;
+        let ours = self
+            .interpreter()
+            .footprint_at(self.world, me, at, direction as i16)?;
+        let crossed = walls_cross(self.world, [ours[3], ours[2], ours[1], ours[0]], at[2])?;
+        self.set_datum(FACING, saved)?;
+        if crossed {
+            self.set_datum(WORD_54, 0)?;
+        }
+        Ok(crossed)
     }
 
     /// The placement's own checks of the place `to` on `level` (0x4550d8
@@ -513,8 +557,9 @@ impl Machine<'_, '_> {
     /// 1. Object data word 52 (+0xb2) becomes 0.
     /// 2. If I am a person, flag bit 1 (`blocked_by_person`) is set, and
     ///    another person is in the way (code 11), word 52 becomes 1 when
-    ///    0x45bd5e says so of that person with mine at person +0xa64;
-    ///    that test is not ported and fails loudly.
+    ///    that person is asked to make way (0x45bd5e,
+    ///    [`Machine::ask_to_make_way`]) at my running action's priority
+    ///    (person +0xa64).
     /// 3. If word 52 is still 0 and the error is 1 (off the lot), it
     ///    becomes 2.
     /// 4. Word 54 (+0xb6) becomes the ID of the object collided with, or
@@ -544,22 +589,24 @@ impl Machine<'_, '_> {
         };
         let code = code.unwrap_or(0);
         self.set_datum(WORD_52, 0)?;
-        if self.me()?.person.is_some()
+        let mut asked = false;
+        if let Some(me) = self.me()?.person.as_ref()
             && blocked_by_person
             && code == 11
-            && collided.is_some_and(|id| {
+            && let Some(other) = collided.filter(|id| {
                 self.world
                     .objects
-                    .get(&id)
+                    .get(id)
                     .is_some_and(|o| o.person.is_some())
             })
         {
-            return Err(unsupported(
-                "0x454e54",
-                "to a place another person is in, with flag bit 1, which asks 0x45bd5e",
-            ));
+            let priority = me.active.priority;
+            asked = self.ask_to_make_way(other, priority)?;
+            if asked {
+                self.set_datum(WORD_52, 1)?;
+            }
         }
-        if code == 1 {
+        if !asked && code == 1 {
             self.set_datum(WORD_52, 2)?;
         }
         self.set_datum(WORD_54, collided.map_or(0, |id| id as i16))?;

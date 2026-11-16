@@ -12,6 +12,7 @@ mod create;
 mod create_person;
 mod debug;
 mod deletion;
+mod dynamic_group;
 mod expression;
 mod factory;
 mod find_best_object;

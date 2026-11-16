@@ -234,9 +234,12 @@ impl Machine<'_, '_> {
     ///   count out again when it is out of date, so it can change the
     ///   family.
     ///
-    /// Field 5 reads what the record's +8 points to, and 7 and 8
-    /// the family's flags (+0x138), which the simulation does not hold;
-    /// they fail loudly.
+    /// - 5: the record's own friend count
+    ///   ([`sims_sim::World::record_friends`], 0x427148), worked out again
+    ///   while it is out of date.
+    ///
+    /// Fields 7 and 8 read the family's flags (+0x138), which the
+    /// simulation does not hold; they fail loudly.
     fn neighbor_field(&mut self, index: i16) -> Result<i16, Trap> {
         let stack_object = self.frame()?.stack_object;
         let Some(record) = self.world.neighbors.get(stack_object) else {
@@ -301,7 +304,13 @@ impl Machine<'_, '_> {
             }
             2 => record.data[58],
             3 | 4 => 0,
-            5 => return unsupported(0x427148, "the record's own friend count, by its type (+8)"),
+            5 => {
+                let threshold = self.program.autonomy_constants().friendship_threshold;
+                let characters = &self.program.characters;
+                self.world
+                    .record_friends(stack_object, threshold, characters)
+                    .ok_or_else(|| Trap::Invalid("record vanished".into()))? as i16
+            }
             6 => families
                 .iter()
                 .find(|f| f.members.contains(&record.guid))
