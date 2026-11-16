@@ -340,6 +340,35 @@ class RunnerTest(RunnerBase):
         self.assertTrue(r.finished)
         self.assertIsNone(r.failed)
 
+    def test_a_capture_ending_while_the_button_is_down_releases_it(self):
+        r = self.runner('click 10 20')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        self.tick(r)  # the press has ended; the hold goes on
+        r.close()
+        self.runners.remove(r)
+        self.assertEqual(self.last_command(), 'xdotool mouseup 1')
+        self.assertEqual(self.rows('command')[-1]['reason'], 'capture ended')
+        self.assertEqual(self.rows('scenario')[-1]['status'], 'unfinished')
+
+    def test_a_failure_while_the_button_is_down_releases_it(self):
+        r = self.runner('click 10 20')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        self.agent.finish_all()
+        r.on_update(self.update + 1, None, self.g.sim)  # memory cannot be read: the step fails
+        self.assertTrue(r.failed)
+        self.assertEqual(self.last_command(), 'xdotool mouseup 1')
+        self.assertEqual(self.rows('command')[-1]['reason'], 'step failed')
+        r.close()
+        self.runners.remove(r)
+        self.assertEqual(sum('mouseup' in c for c in self.agent.commands), 1)
+
+    def test_a_released_press_is_not_released_again(self):
+        r = self.runner('click 10 20\nwait 5')
+        self.tick_until(r, lambda: 'mouseup' in self.last_command())
+        r.close()
+        self.runners.remove(r)
+        self.assertEqual(sum('mouseup' in c for c in self.agent.commands), 1)
+
     def test_click_object_choose_and_expect(self):
         g = self.g
         floor = g.add_object(29, [0, 0])

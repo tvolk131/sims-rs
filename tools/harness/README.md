@@ -253,6 +253,8 @@ How the checks work (the addresses are in `input.py`):
   between frames. Twice such a press, with the picker on the object,
   opened no pie menu in 200 updates. The release is not waited on, so a
   press that opens a modal dialog does not hold up the steps after it.
+  If the step fails or the capture ends while the button is down, it is
+  let go then (a `command` row with a `reason`).
   `press` and `answer-dialog` hold the button 3 s, as `answer.sh` does.
 - **Choosing.** `choose` reads the pie menu's items and their places on the
   screen, moves to the entry, waits until the menu shows it highlighted,

@@ -525,6 +525,7 @@ class Runner:
         self.push_cursor = 0  # pushes before it were matched by an expect-queued
         self.fresh = False  # self.m was read at this update return (not at a dialog stop)
         self.unchecked = []  # (n, row): commands whose exit code is still to be checked
+        self.held = None  # the info of a held press whose release is not yet submitted
         self.dialogs = []
         self.finished = False
         self.failed = None
@@ -537,6 +538,7 @@ class Runner:
         self.known = None
 
     def close(self):
+        self.let_go('capture ended')
         if not self.finished:
             self.write(kind='scenario', status='unfinished', index=self.index,
                        unchecked=[n for n, _ in self.unchecked])
@@ -693,6 +695,10 @@ class Runner:
                 self.fail(str(e))
                 return
             if isinstance(want, Job):
+                if want.command == press_down_command():
+                    self.held = want.info
+                elif want.command == press_up_command():
+                    self.held = None
                 n = self.agent.submit(want.command)
                 row = dict(kind='command', id=n, what=want.kind, command=want.command, **want.info)
                 self.write(**row)
@@ -719,6 +725,21 @@ class Runner:
         self.finished = True
         self.gen = None
         self.write(kind='step', status='failed', index=self.index, error=error)
+        self.let_go('step failed')
+
+    def let_go(self, reason):
+        """Let the button go if a held press's release was never submitted (the
+        step failed, or the capture ended, while it was down). Its exit code is
+        not checked: no stop is left to check it at."""
+        if self.held is None:
+            return
+        info, self.held = self.held, None
+        try:
+            n = self.agent.submit(press_up_command())
+        except Exception as e:  # letting go must never end the capture
+            self.write(kind='release_failed', reason=reason, error=f'{type(e).__name__}: {e}', **info)
+            return
+        self.write(kind='command', id=n, what='release', command=press_up_command(), reason=reason, **info)
 
     # The steps. Each is a generator; after each yield self.m reads the game at
     # the update return where the wait ended.
