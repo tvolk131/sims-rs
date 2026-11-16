@@ -39,6 +39,21 @@ pub fn level(speed: Speed) -> i16 {
     }
 }
 
+/// The panel's button whose speed is `level`, if one sets it: not the
+/// idle loop's own.
+pub fn chosen(level: i16) -> Option<Speed> {
+    [Speed::Normal, Speed::Fast, Speed::Ultra]
+        .into_iter()
+        .find(|&speed| self::level(speed) == level)
+}
+
+/// The panel's button for the speed of `world`: global 16's, or, while
+/// the idle loop holds the game at its own speed, the speed it goes back
+/// to (global 18), which the player chose.
+pub fn shown(world: &sims_sim::World) -> Option<Speed> {
+    chosen(world.speed()).or_else(|| chosen(world.return_speed()))
+}
+
 /// Microseconds of one tick at the simulation's speed `level`.
 pub fn period_us(level: i16) -> u64 {
     u64::from(speed::period_ms(level)) * 1000
@@ -113,6 +128,8 @@ mod tests {
         let mut pace = Pace::default();
         assert_eq!(level(Speed::Fast), FAST);
         assert_eq!(level(Speed::Ultra), ULTRA);
+        assert_eq!(chosen(FAST), Some(Speed::Fast));
+        assert_eq!(chosen(IDLE), None);
         assert_eq!(pace.due(100_000, FAST), 7);
         pace.restart();
         assert_eq!(pace.due(30_000, ULTRA), 15);
