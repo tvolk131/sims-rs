@@ -340,9 +340,11 @@ impl Machine<'_, '_> {
     ///
     /// The original also works out whether the person's hand holds
     /// something (0x589fce) and hands it to 0x59265c, which does not read
-    /// it. A name that is not listed, or a clip our content lacks, fails
-    /// loudly (the original reports a missing animation and plays a
-    /// stand-in, as for Animate Sim).
+    /// it. A name that is not listed, or is empty, is no clip (0x59dd09
+    /// hands 0x59dc32 a null name, 0x59dc45 skips the load), so the start
+    /// fails (0x589f45) after the appearance re-read, with no other write.
+    /// A listed clip our content lacks fails loudly (the original reports
+    /// a missing animation and plays a stand-in, as for Animate Sim).
     fn start_reach(&mut self, height: F32) -> Result<bool, Trap> {
         let me = self.me;
         let Some(number) = band(height, self.person_word(POSTURE)? == 1) else {
@@ -355,21 +357,18 @@ impl Machine<'_, '_> {
         } else {
             ADULT_REACHES
         };
-        let name = self
+        let Some(name) = self
             .program
             .libraries
             .get(&self.program.global)
             .and_then(|g| g.strings.get(&table))
             .and_then(|s| s.get(number))
             .filter(|name| !name.is_empty())
-            .ok_or_else(|| {
-                Trap::Unsupported(format!(
-                    "reach clip {number} is not listed in string table {table}: the original \
-                     reports a missing animation and plays its stand-in (0x4f6e5b), which is not \
-                     ported"
-                ))
-            })?
-            .clone();
+            .cloned()
+        else {
+            self.world.animators.insert(me, a);
+            return Ok(false);
+        };
         let clip = self
             .program
             .animations

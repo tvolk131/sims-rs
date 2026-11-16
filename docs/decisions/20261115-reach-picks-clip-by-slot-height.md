@@ -42,6 +42,9 @@ ported (`primitives/reach.rs`) from the person's own dispatcher
     sitting variants.
   - At 4 or above no clip starts. The branch is then true when nothing
     is to move and false otherwise.
+  - A number the table does not list, or lists as an empty name, is no
+    clip either (0x59dd09 hands on a null name, 0x589f45 fails the
+    start), with the same branch.
 - **The clip's start** (0x592726) is shared with Animate Sim
   (`start_foreground`), which now calls it instead of its own copy. The
   steps are the same.
@@ -50,9 +53,9 @@ ported (`primitives/reach.rs`) from the person's own dispatcher
   moved object's "CT - Grab" or "CT - Put" tree runs at once on my stack
   (0x452bed), with my temps as its arguments.
 
-**Fails loudly:** a reach clip that is not listed or that our content
-lacks (the original plays a stand-in), and a put that fails on what the
-port does not model.
+**Fails loudly:** a listed reach clip that our content lacks (the
+original reports a missing animation and plays a stand-in), and a put
+that fails on what the port does not model.
 
 **Unverified.** No capture covers a Reach yet. The tests are synthetic.
 A run that reaches it (a meal in a day recording) should check the clip

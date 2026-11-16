@@ -351,6 +351,35 @@ fn too_high_a_slot_starts_no_clip() {
 }
 
 #[test]
+fn an_unlisted_or_empty_reach_name_starts_no_clip() {
+    // The widget sits at slot height 0, clip 1 ("floor"). With that entry
+    // empty, or the table too short, 0x59dcd4 gives no name and the start
+    // fails (0x589f45): the false branch, or the true one when nothing is
+    // to move.
+    for short in [false, true] {
+        for (moves, branch) in [(1, false), (0, true)] {
+            let (mut fx, id) = lot(reach(0, moves, 0));
+            let names = fx
+                .program
+                .libraries
+                .get_mut(&GLOBAL)
+                .unwrap()
+                .strings
+                .get_mut(&REACHES)
+                .unwrap();
+            if short {
+                names.truncate(1);
+            } else {
+                names[1].clear();
+            }
+            assert_eq!(turn(&mut fx), Ok(Status::Returned(branch)));
+            assert!(playing(&fx).is_none());
+            assert_eq!(held(fx.lamp()), [id as i16, 0]);
+        }
+    }
+}
+
+#[test]
 fn mode_2_reaches_under_with_nothing_to_move() {
     let (mut fx, _) = lot(reach(2, 1, 0));
     assert_eq!(turn(&mut fx), Ok(Status::Yielded));
