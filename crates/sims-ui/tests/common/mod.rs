@@ -3,9 +3,10 @@
 #![allow(dead_code)]
 
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
-use sims_content::{Catalog, House, Index, Install, Neighborhood};
+use sims_content::{Index, Install, Neighborhood};
 use sims_ui::art::Art;
 use sims_ui::household::{Careers, Faces, Snapshot};
+use sims_vm::boot::{Frames, Lot};
 use std::path::{Path, PathBuf};
 
 /// The Goth family's house in the install's first neighborhood.
@@ -27,12 +28,12 @@ pub fn install_root() -> Option<PathBuf> {
 /// Opens `house` below the install at `root` and reads what the control
 /// panel shows.
 ///
-/// The full load (`sims boot`, crates/sims-cli/src/boot.rs) lives in the
-/// command-line tool, not in a library, so this stands in for its two
-/// steps the panel shows: step 17 sets the funds to the family's, and
-/// step 18 selects the family's first member. The original showed
-/// $2,542 and Mortimer selected after loading this house, and the house
-/// file alone says 2,515 and nobody.
+/// The house is loaded as the game loads it (`sims_vm::boot::Lot`), up to
+/// the frame before the first tick: steps 17 and 18 set the funds to the
+/// family's and select its first member, and the neighborhood's people
+/// are read for the relationship panel. The original showed $2,542 and
+/// Mortimer selected after loading the Goths' house, and the house file
+/// alone says 2,515 and nobody.
 pub fn open(root: &Path, house: &str) -> Opened {
     let install = Install::detect(root).unwrap();
     let mut index = Index::build(&install).unwrap();
@@ -41,17 +42,23 @@ pub fn open(root: &Path, house: &str) -> Opened {
     if let Some(characters) = neighborhood.characters().unwrap() {
         index.add_characters(&characters).unwrap();
     }
-    let catalog = Catalog::build(&index).unwrap();
-    let file = House::load(&house, &catalog).unwrap();
-    let mut world = sims_sim::World::from_house(&file, &catalog).unwrap();
-    // The neighborhood's people, as the load holds them before the lot
-    // (crates/sims-vm/src/boot.rs), for the relationship panel.
-    world
-        .read_neighbors(
-            &neighborhood,
-            &sims_sim::neighbors::registry(&index, &catalog),
-        )
-        .unwrap();
+    let lot = Lot::load(
+        root,
+        &house,
+        &[],
+        Frames {
+            after: Vec::new(),
+            every: Vec::new(),
+        },
+    )
+    .unwrap();
+    let report = lot.load_report();
+    assert!(
+        report.finished.is_some(),
+        "the load stopped: {:?}",
+        report.stopped
+    );
+    let (world, catalog) = (lot.world(), lot.catalog());
     let number = neighborhood
         .houses()
         .unwrap()
@@ -60,23 +67,14 @@ pub fn open(root: &Path, house: &str) -> Opened {
         .map(|(n, _)| n)
         .unwrap();
     let (_, family) = neighborhood.family_in(number).unwrap();
-    world.budget.funds = family.budget;
-    if let Some(first) = family.members.first()
-        && let Some(object) = world
-            .objects
-            .values_mut()
-            .find(|o| o.guid == *first && o.person.is_some())
-    {
-        object.selected = true;
-    }
     let careers = Careers::load(&index).unwrap();
     // The friendship threshold the original's tuning gives (0x6c4398).
-    let snapshot = Snapshot::read(&world, &family.members)
+    let snapshot = Snapshot::read(world, &family.members)
         .with_careers(&careers)
-        .with_relations(&world, &family.members, 50);
+        .with_relations(world, &family.members, 50);
     let ui = UiGraphics::open(&install).unwrap();
     let art = Art::load(&ui, US_ENGLISH, &sims_ui::hud::RESOURCES).unwrap();
-    let faces = Faces::load(&index, &catalog, &family.members).unwrap();
+    let faces = Faces::load(&index, catalog, &family.members).unwrap();
     Opened {
         careers,
         snapshot,
