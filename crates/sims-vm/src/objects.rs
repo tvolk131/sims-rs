@@ -269,6 +269,8 @@ impl Interpreter<'_> {
         // the person's reset in load step 13 leaves it.
         let mut animators = BTreeMap::new();
         let mut held_poses = BTreeMap::new();
+        let mut base_layers = BTreeMap::new();
+        let mut moved = BTreeMap::new();
         for &id in &order {
             let restored = self
                 .restore_animator(
@@ -284,6 +286,10 @@ impl Interpreter<'_> {
             if let Some(held) = restored.held {
                 held_poses.insert(id, held);
             }
+            if let Some(base) = restored.base {
+                base_layers.insert(id, base);
+            }
+            moved.insert(id, restored.moved);
         }
         // Each person's route contexts: as many as the save counts, each
         // as the load makes it (0x460443). A negative count, which the
@@ -320,6 +326,10 @@ impl Interpreter<'_> {
         world.next_parts = next_parts;
         world.animators.extend(animators);
         world.held_poses.extend(held_poses);
+        world.base_layers.extend(base_layers);
+        for (id, bones) in moved {
+            Self::note_moved(world, id, bones);
+        }
         for (id, contexts) in contexts {
             world.routing.routes.entry(id).or_default().contexts = contexts;
         }
