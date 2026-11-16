@@ -209,6 +209,88 @@ impl Font {
         }
     }
 
+    /// Breaks `text` into the lines the original's wrapped text gives in
+    /// a box `width` wide (0x60b4a1, fitting each line with 0x60b620).
+    /// A line is measured by the advances of its characters but the
+    /// last, plus that one's glyph width. It ends after the last space or
+    /// hyphen that fits, or mid-word when there is none (one character
+    /// before the first that does not fit), or after a line break; a
+    /// first character too wide for the box takes its whole word. The
+    /// spaces after a line's end stay on it. Lines here drop their line
+    /// break. Characters the font cannot show take no room.
+    ///
+    /// The original also stops at a line that starts with a character
+    /// outside the font's range (0x60b898); the range is **unverified**,
+    /// so here only the end of the text stops it.
+    pub fn break_lines(&self, text: &str, width: i32) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut lines = Vec::new();
+        let mut start = 0;
+        while start < chars.len() {
+            let rest = &chars[start..];
+            let n = self.fit(rest, width).clamp(1, rest.len());
+            lines.push(rest[..n].iter().filter(|&&c| c != '\n').collect());
+            start += n;
+        }
+        lines
+    }
+
+    /// How many characters of `text` start a line `width` wide (0x60b620),
+    /// by the rules [`Font::break_lines`] gives; 0 for no text.
+    pub fn fit(&self, text: &[char], width: i32) -> usize {
+        let glyph = |c: char| self.metric(c).map_or(0, |m| i32::from(m.atlas[2]));
+        let advance = |c: char| self.metric(c).map_or(0, |m| m.advance);
+        let Some(&first) = text.first() else {
+            return 0;
+        };
+        let (mut end, mut broken) = (0, false);
+        let mut measured = glyph(first);
+        let mut whole_word = measured > width;
+        if !whole_word {
+            let mut i = 0;
+            loop {
+                i += 1;
+                if i >= text.len() {
+                    return i;
+                }
+                let c = text[i - 1];
+                if c == '\n' {
+                    (end, broken) = (i, true);
+                    break;
+                }
+                if matches!(c, ' ' | '-') && measured <= width {
+                    end = i;
+                }
+                // The original's 32-bit sum wraps.
+                measured = measured
+                    .wrapping_sub(glyph(c))
+                    .wrapping_add(advance(c))
+                    .wrapping_add(glyph(text[i]));
+                if measured > width {
+                    break;
+                }
+            }
+            if end == 0 {
+                if i > 1 {
+                    end = i - 1;
+                } else {
+                    whole_word = true;
+                }
+            }
+        }
+        if whole_word {
+            while end < text.len() && !matches!(text[end], '\0' | '\n' | ' ') {
+                end += 1;
+            }
+        }
+        if !broken {
+            while end < text.len() && text[end] == ' ' {
+                end += 1;
+            }
+        }
+        end.max(1)
+    }
+
     /// Breaks `text` into lines no wider than `width`, at spaces where it
     /// can; a word wider than a line stands alone. Line breaks in the
     /// text are kept.
@@ -350,5 +432,52 @@ pub(crate) mod tests {
         assert_eq!(f.wrap("AB AB AB", 9), ["AB AB", "AB"]);
         assert_eq!(f.wrap("ABABAB B", 2), ["ABABAB", "B"]);
         f.draw(&mut frame, "AAAA", [i32::MAX - 2, i32::MAX - 1], [1, 1, 1]);
+    }
+
+    #[test]
+    fn lines_break_as_the_original_fits_them() {
+        let f = font();
+        // A takes 3 (2 of glyph), B 1, the space 1 and no glyph; the
+        // hyphen is not in the font.
+        let lines = |text: &str, width: i32| f.break_lines(text, width);
+        // After a hyphen that fits; the A after it would reach 6.
+        assert_eq!(lines("AB-AB", 5), ["AB-", "AB"]);
+        // After a space, which stays on its line.
+        assert_eq!(lines("AB AB", 5), ["AB ", "AB"]);
+        assert_eq!(lines("AB  AB", 5), ["AB  ", "AB"]);
+        // Mid-word, one character before the one that does not fit; the
+        // last two fit (3 + 2).
+        assert_eq!(lines("AAAA", 5), ["A", "A", "AA"]);
+        // A first glyph wider than the box takes its whole word.
+        assert_eq!(lines("AA B", 1), ["AA ", "B"]);
+        assert_eq!(lines("A\nB", 9), ["A", "B"]);
+        assert!(lines("", 5).is_empty());
+    }
+
+    #[test]
+    fn a_line_measure_wraps_as_the_originals_does() {
+        // 255 wide and 382 to the next: about 5.6 million of them pass
+        // i32::MAX, where the original's sum wraps negative and keeps
+        // fitting.
+        let f = Font::new(ffn::Font {
+            flags: 9,
+            glyphs: vec![ffn::Glyph {
+                code: 65,
+                width: 255,
+                height: 1,
+                atlas_x: 0,
+                atlas_y: 0,
+                first_bearing: 0,
+                bearing_x: 127,
+                bearing_y: 0,
+            }],
+            width: 255,
+            height: 1,
+            coverage: vec![15; 255],
+        });
+        let n = usize::try_from(i32::MAX / 382).unwrap() + 10;
+        let lines = f.break_lines(&"A".repeat(n), i32::MAX);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), n);
     }
 }

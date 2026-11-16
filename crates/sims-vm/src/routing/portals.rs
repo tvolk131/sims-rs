@@ -28,7 +28,7 @@
 //! - up to 1000: the cost (0x667464 caps it).
 //!
 //! The arithmetic is the FPU's, which runs in single precision during a
-//! lot update (`docs/decisions.md`): every add and square root is rounded
+//! lot update (`docs/decisions/`): every add and square root is rounded
 //! to single precision, and every value is stored as a float.
 //!
 //! Ported from the original's code at the addresses given. The old
@@ -473,6 +473,7 @@ mod tests {
             people: Default::default(),
             icon_frames: None,
             expansions: 0,
+            characters: Default::default(),
         }
     }
 

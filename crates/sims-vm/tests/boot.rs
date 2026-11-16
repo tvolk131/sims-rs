@@ -2,14 +2,24 @@
 //! Goth house loads and steps one tick at a time to the state `sims boot`
 //! reaches.
 
-use sims_sim::Headline;
+use sims_sim::{Headline, World};
 use sims_vm::boot::{Frames, Lot, StepError};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 33 --answers 3`
-/// gives this hash with the default frames (snapshot format 27).
-const TICK_33: &str = "db1ce596748d8f9c5a39ba4197203ad261f354d545cc71a4ef8897d92bafba7d";
+/// gives this hash with the default frames (snapshot format 29).
+const TICK_33: &str = "9249815b8077306c96d733178dcab54436baf719a1383f9bc70c83ee8f50c9b6";
+/// The same state's hash under snapshot format 28, which had no record
+/// of the people whose animator was asked to stop its route
+/// ([`sims_sim::World::stops_asked`]) at the end.
+const TICK_33_28: &str = "33259a54e8ab263c1167787fd11a9a16edfea06fa3ce7f3d354a6f65792fe3fc";
+/// The same state's hash under snapshot format 28 before the load kept
+/// the people's saved head targets ([`without_saved_targets`]).
+const TICK_33_UNTARGETED: &str = "a2acc40dd00ab2d31b32a04f087a3b03ee26d360b1c443fcd159dd0c7d9df1a1";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
+const TICK_33_27: &str = "db1ce596748d8f9c5a39ba4197203ad261f354d545cc71a4ef8897d92bafba7d";
 /// The same state's hash under snapshot format 26, which had no
 /// neighborhood data words ([`sims_sim::World::neighborhood_data`]) at
 /// the end.
@@ -30,7 +40,14 @@ const TICK_33_22: &str = "041181badfd4d6953814b6c46612398df1004fa583b1d2aa5bd11c
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 1103 --answers
 /// 3` gives this hash, the tick before the salesman leaves.
-const TICK_1103: &str = "f5330f8aed627dda3529a1132e90fc15feb7584ae2757133b3d95074b1084f7a";
+const TICK_1103: &str = "df971523b4a1263f417dae2dbbab87df48de82a8bdf0ef91ae216472ccdfb17f";
+/// The same state's hash under snapshot format 28, which had no record
+/// of the people whose animator was asked to stop its route
+/// ([`sims_sim::World::stops_asked`]) at the end.
+const TICK_1103_28: &str = "509fdba01d87a907a13b367a81ee677ed8b4f09bca0fdc88881af7f5bb56ae12";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
+const TICK_1103_27: &str = "f5330f8aed627dda3529a1132e90fc15feb7584ae2757133b3d95074b1084f7a";
 /// The same state's hash under snapshot format 26.
 const TICK_1103_26: &str = "ce627e5ef44b7133e74322f8d5dcf1929821114529b846a4c1e442475470399a";
 /// The same state's hash under snapshot format 25.
@@ -46,37 +63,78 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// The lot's encoding as snapshot format 26 wrote it: without the
+/// The world's encoding as snapshot format 28 wrote it: without the
+/// people whose animator was asked to stop its route
+/// ([`sims_sim::World::stops_asked`]) that format 29 added at the end, so
+/// a state pinned under format 28 can be shown to be the same state but
+/// for them.
+fn format_28_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let asked = postcard::to_allocvec(&world.stops_asked).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - asked.len()), asked);
+    bytes
+}
+
+/// The world's encoding as snapshot format 27 wrote it: without the poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) that
+/// format 28 added at the end either. It starts from [`format_28_bytes`].
+fn format_27_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = format_28_bytes(world);
+    let held = postcard::to_allocvec(&world.held_poses).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - held.len()), held);
+    bytes
+}
+
+/// The world's encoding as snapshot format 26 wrote it: without the
 /// neighborhood's data words ([`sims_sim::World::neighborhood_data`]) that
 /// format 27 added at the end, so a state pinned under format 26 can be
 /// shown to be the same state but for them.
-fn format_26_bytes(lot: &Lot) -> Vec<u8> {
-    let mut bytes = lot.world().encode();
-    let data = postcard::to_allocvec(&lot.world().neighborhood_data).unwrap();
+fn format_26_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = format_27_bytes(world);
+    let data = postcard::to_allocvec(&world.neighborhood_data).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - data.len()), data);
     bytes
 }
 
-/// The lot's encoding as snapshot format 25 wrote it: without the record
+/// The world's encoding as snapshot format 25 wrote it: without the record
 /// of the bones the skins moved ([`sims_sim::World::translated_bones`])
 /// that format 26 added at the end either, so a state pinned under format
 /// 25 can be shown to be the same state but for it. It starts from
 /// [`format_26_bytes`].
-fn format_25_bytes(lot: &Lot) -> Vec<u8> {
-    let mut bytes = format_26_bytes(lot);
-    let moved = postcard::to_allocvec(&lot.world().translated_bones).unwrap();
+fn format_25_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = format_26_bytes(world);
+    let moved = postcard::to_allocvec(&world.translated_bones).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - moved.len()), moved);
     bytes
 }
 
-/// The lot's encoding as snapshot format 24 wrote it: without the base
+/// The world's encoding as snapshot format 24 wrote it: without the base
 /// layers ([`sims_sim::World::base_layers`]) that format 25 added at the
 /// end either. It starts from [`format_25_bytes`].
-fn format_24_bytes(lot: &Lot) -> Vec<u8> {
-    let mut bytes = format_25_bytes(lot);
-    let layers = postcard::to_allocvec(&lot.world().base_layers).unwrap();
+fn format_24_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = format_25_bytes(world);
+    let layers = postcard::to_allocvec(&world.base_layers).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - layers.len()), layers);
     bytes
+}
+
+/// The state as it was before the load kept each person's saved head
+/// target (animator +0x21c, 0x5918ba): every target still the one the
+/// load restored in `loaded` is cleared, as no measurement has written it,
+/// and an animator then equal to [`sims_sim::animator::LOADED`] is dropped.
+/// A state pinned before that change can be shown to be the same state but
+/// for those targets.
+fn without_saved_targets(world: &World, loaded: &World) -> World {
+    let mut old = world.clone();
+    for (id, animator) in old.animators.iter_mut() {
+        let saved = loaded.animators.get(id).and_then(|a| a.head.target);
+        if saved.is_some() && animator.head.target == saved {
+            animator.head.target = None;
+        }
+    }
+    old.animators
+        .retain(|_, animator| *animator != sims_sim::animator::LOADED);
+    old
 }
 
 #[test]
@@ -93,6 +151,7 @@ fn the_goth_house_steps_to_tick_33() {
     // The house saved camera direction 0, and the comparison harness saw
     // it open at rotation 0; Generic Sims Call 12 reads it.
     assert_eq!(lot.view_rotation(), 0);
+    let loaded = lot.world().clone();
     let start = lot.world().ticks;
     for tick in 1..=33 {
         lot.step().unwrap();
@@ -106,14 +165,20 @@ fn the_goth_house_steps_to_tick_33() {
     // No headline shows.
     assert!(lot.world().headlines.is_empty());
     assert_eq!(lot.world().hash_hex(), TICK_33);
-    assert_eq!(digest(&format_26_bytes(&lot)), TICK_33_26);
-    assert_eq!(digest(&format_25_bytes(&lot)), TICK_33_25);
-    let mut bytes = format_24_bytes(&lot);
+    assert_eq!(digest(&format_28_bytes(lot.world())), TICK_33_28);
+    // A person whose head has not measured since the load still holds the
+    // target the save held; without them it is the state pinned before.
+    let old = without_saved_targets(lot.world(), &loaded);
+    assert_eq!(digest(&format_28_bytes(&old)), TICK_33_UNTARGETED);
+    assert_eq!(digest(&format_27_bytes(&old)), TICK_33_27);
+    assert_eq!(digest(&format_26_bytes(&old)), TICK_33_26);
+    assert_eq!(digest(&format_25_bytes(&old)), TICK_33_25);
+    let mut bytes = format_24_bytes(&old);
     assert_eq!(digest(&bytes), TICK_33_24);
-    let headlines = postcard::to_allocvec(&lot.world().headlines).unwrap();
+    let headlines = postcard::to_allocvec(&old.headlines).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - headlines.len()), headlines);
     assert_eq!(digest(&bytes), TICK_33_23);
-    let families = postcard::to_allocvec(&lot.world().families).unwrap();
+    let families = postcard::to_allocvec(&old.families).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - families.len()), families);
     assert_eq!(digest(&bytes), TICK_33_22);
 }
@@ -464,19 +529,27 @@ fn the_snack_order_pays_for_the_snack() {
     assert!(update.errors.is_empty(), "{:?}", update.errors);
     assert_eq!(update.removed, [374, 375]);
     assert!(update.ticked.contains(&374) && update.ticked.contains(&375));
-    for step in 3604..9907 {
+    for step in 3604..13199 {
         let update = lot.step_play().unwrap();
         assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
     }
-    // Step 9907: object 5 walks the neighborhood's lots in order of
-    // distance (Set To Next mode 11), which the simulation does not hold.
+    // Step 13199: object 18 (tree 0x101c node 15) sets something alight
+    // with Burn (opcode 9), which is not ported. Unverified: the strict
+    // run, without the snack, does not get there.
     let update = lot.step_play().unwrap();
     let [error] = &update.errors[..] else {
         panic!("{:?}", update.errors);
     };
-    assert_eq!(error.object, 5);
-    let fault = error.fault.to_string();
-    assert!(fault.contains("0x44f08d"), "{fault}");
+    assert_eq!(error.object, 18);
+    assert_eq!(
+        error.fault.at.map(|at| (at.tree, at.node)),
+        Some((0x101c, 15)),
+        "{error:?}"
+    );
+    assert!(
+        matches!(error.fault.trap, sims_vm::Trap::Unimplemented { opcode: 9 }),
+        "{error:?}"
+    );
 }
 
 /// The school bus (SchoolBus.iff) the carpool makes at tick 2703: its lead
@@ -530,9 +603,11 @@ fn strict_mode_takes_the_salesman_off_the_lot_at_tick_1104() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_1103);
-    assert_eq!(digest(&format_26_bytes(&lot)), TICK_1103_26);
-    assert_eq!(digest(&format_25_bytes(&lot)), TICK_1103_25);
-    assert_eq!(digest(&format_24_bytes(&lot)), TICK_1103_24);
+    assert_eq!(digest(&format_28_bytes(lot.world())), TICK_1103_28);
+    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_1103_27);
+    assert_eq!(digest(&format_26_bytes(lot.world())), TICK_1103_26);
+    assert_eq!(digest(&format_25_bytes(lot.world())), TICK_1103_25);
+    assert_eq!(digest(&format_24_bytes(lot.world())), TICK_1103_24);
     // The salesman (GUID 0x44A86A6C, made by object 382 at tick 6).
     assert_eq!(lot.world().objects[&259].guid, 0x44A8_6A6C);
     let update = lot.step().unwrap();
@@ -596,7 +671,14 @@ fn the_player_selects_another_goth() {
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 2881
 /// --answers 3` gives this hash.
-const TICK_2881: &str = "e727213029f1e8560551ab8a4f8526994f21d862e167b3106f877ac3b70ff03b";
+const TICK_2881: &str = "841c0f85fdc10a4243dbfe5c2ed0038599a51ae12140b676c2b737759d237dea";
+/// The same state's hash under snapshot format 28, which had no record
+/// of the people whose animator was asked to stop its route
+/// ([`sims_sim::World::stops_asked`]) at the end.
+const TICK_2881_28: &str = "f9866cb5c07966e41f015df5cf5d7b71e66741c3d5973d8c9e997977285ef30a";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
+const TICK_2881_27: &str = "e727213029f1e8560551ab8a4f8526994f21d862e167b3106f877ac3b70ff03b";
 /// The same state's hash under snapshot format 26.
 const TICK_2881_26: &str = "16c83a8e5f49c088dce71c67874ba7ccbb367c952b4fde8a4b3d7c78ad7a081f";
 /// The same state's hash under snapshot format 25.
@@ -606,7 +688,14 @@ const TICK_2881_24: &str = "cdd5b72c0ed8481f4db525817d1145f5445b6d2562c2ea4abfbf
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 3432
 /// --answers 3` gives this hash.
-const TICK_3432: &str = "a7ae7852f9dd2bed313fa52d2e009ad982d9319671283a255d3058a0ba1e7b34";
+const TICK_3432: &str = "23289f424eb909c687de877e741271fd71a2d9b01788ade987719cbae2458a11";
+/// The same state's hash under snapshot format 28, which had no record
+/// of the people whose animator was asked to stop its route
+/// ([`sims_sim::World::stops_asked`]) at the end.
+const TICK_3432_28: &str = "2c49ae1969abb915bbe24735d199528578611cd83e5dff2130f60e0ee774e41b";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
+const TICK_3432_27: &str = "a7ae7852f9dd2bed313fa52d2e009ad982d9319671283a255d3058a0ba1e7b34";
 /// The same state's hash under snapshot format 26.
 const TICK_3432_26: &str = "aae456183509cb39ac4d4d8ea2344447d6576ce5fb78b3abb306521910a89a2e";
 /// The same state's hash under snapshot format 25.
@@ -616,21 +705,54 @@ const TICK_3432_24: &str = "2f6a3e0a511139e9aa60dc6608781532c711b6dd81fded949429
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 3602
 /// --answers 3` gives this hash.
-const TICK_3602: &str = "37d883099817ec1245a6fa846f32c9a9c41162b84ae22bab0cc78884412a2545";
+const TICK_3602: &str = "f80de46894bf5fb12eeff25175aeca31856e29994c33ff7109567408b98a6794";
+/// The same state's hash under snapshot format 28, which had no record
+/// of the people whose animator was asked to stop its route
+/// ([`sims_sim::World::stops_asked`]) at the end.
+const TICK_3602_28: &str = "7e38eab8b65ba8a942f1cde1ed84b52b6bc4cc0e7fa619f5fdc17cb4bf48e79e";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
+const TICK_3602_27: &str = "37d883099817ec1245a6fa846f32c9a9c41162b84ae22bab0cc78884412a2545";
 /// The same state's hash under snapshot format 26.
 const TICK_3602_26: &str = "d8f8996e6f704201e3fa70293833c4cf1b9e2f9f5217c48ce2150dee653943f4";
-const TICK_3603: &str = "4437c349eb19d67049a4677efbba1a7e2996de10a78c6cc3a0ca76ee6a8b8506";
+const TICK_3603: &str = "0368793a038fd8214fd11af64bfe88105b780af8dea013af395a77a521dc035b";
+/// The same state's hash under snapshot format 28, which had no record
+/// of the people whose animator was asked to stop its route
+/// ([`sims_sim::World::stops_asked`]) at the end.
+const TICK_3603_28: &str = "8b265a754e239421566e67eb0d92e490fb64994a2177ff29bc2de38c715f8279";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
+const TICK_3603_27: &str = "4437c349eb19d67049a4677efbba1a7e2996de10a78c6cc3a0ca76ee6a8b8506";
 /// The same state's hash under snapshot format 26.
 const TICK_3603_26: &str = "5b35e77976b10510d000990b6898a758029bbbe0ce176fccfec9aa90ef8d23d3";
-const TICK_3912: &str = "bf8537130628fae3d3557c87d3b53e50a1c3574c2f56a3068b67b38265948bc3";
+const TICK_3912: &str = "008e11c60c08d1cc5224b113284f731a1e02df270f68167e00c867a848f2eaaf";
+/// The same state's hash under snapshot format 28, which had no record
+/// of the people whose animator was asked to stop its route
+/// ([`sims_sim::World::stops_asked`]) at the end.
+const TICK_3912_28: &str = "c23e6b9bbd294fc4430a1643460bbda07df2505d611044720b8b60630bd4a066";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
+const TICK_3912_27: &str = "bf8537130628fae3d3557c87d3b53e50a1c3574c2f56a3068b67b38265948bc3";
 /// The same state's hash under snapshot format 26.
 const TICK_3912_26: &str = "4bc0bc671978c8ccf79abc8e6acdcc177d85a3e49577ccfcb738b9b54c4df2f0";
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 9906
-/// --answers 3` gives this hash, the last tick strict mode reaches.
-const TICK_9906: &str = "f745dc46550f483711e0f904cce6197a91cf2c8c7beb95f0cafeceae5ebdec06";
+/// --answers 3` gives this hash, the last before tick 9907.
+const TICK_9906: &str = "cfc262d4f8e5205da0de7f182f6df167313bc556be127124d68e9be72c0016a5";
+/// The same state's hash under snapshot format 28, which had no record
+/// of the people whose animator was asked to stop its route
+/// ([`sims_sim::World::stops_asked`]) at the end.
+const TICK_9906_28: &str = "a4d92991d8fef2be97743657544a2c54ca10abd23245d6e6ce51f15b04d0320c";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
+const TICK_9906_27: &str = "f745dc46550f483711e0f904cce6197a91cf2c8c7beb95f0cafeceae5ebdec06";
+/// The first update of the next day, when the day turns. Unverified: no
+/// capture reaches it.
+const TICK_31478: &str = "4f258bafed1a396b119e3117d7c300d657b6d0c95b5b22e35b87c06f87b13f23";
+/// A whole day, 43,200 updates, from the load. Unverified.
+const TICK_43200: &str = "bc43e887614700e6ac2da54f2895bc1b8f7987a79535547af40ce35f5db33591";
 
 #[test]
-fn strict_mode_runs_to_tick_9906_past_noon() {
+fn strict_mode_runs_the_goth_houses_whole_day() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -652,9 +774,11 @@ fn strict_mode_runs_to_tick_9906_past_noon() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_2881);
-    assert_eq!(digest(&format_26_bytes(&lot)), TICK_2881_26);
-    assert_eq!(digest(&format_25_bytes(&lot)), TICK_2881_25);
-    assert_eq!(digest(&format_24_bytes(&lot)), TICK_2881_24);
+    assert_eq!(digest(&format_28_bytes(lot.world())), TICK_2881_28);
+    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_2881_27);
+    assert_eq!(digest(&format_26_bytes(lot.world())), TICK_2881_26);
+    assert_eq!(digest(&format_25_bytes(lot.world())), TICK_2881_25);
+    assert_eq!(digest(&format_24_bytes(lot.world())), TICK_2881_24);
     // Each update is two game seconds, 30 a game minute, so a day is
     // 43,200 updates.
     assert_eq!(clock(&lot), (8, 6, 46));
@@ -662,9 +786,11 @@ fn strict_mode_runs_to_tick_9906_past_noon() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_3432);
-    assert_eq!(digest(&format_26_bytes(&lot)), TICK_3432_26);
-    assert_eq!(digest(&format_25_bytes(&lot)), TICK_3432_25);
-    assert_eq!(digest(&format_24_bytes(&lot)), TICK_3432_24);
+    assert_eq!(digest(&format_28_bytes(lot.world())), TICK_3432_28);
+    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_3432_27);
+    assert_eq!(digest(&format_26_bytes(lot.world())), TICK_3432_26);
+    assert_eq!(digest(&format_25_bytes(lot.world())), TICK_3432_25);
+    assert_eq!(digest(&format_24_bytes(lot.world())), TICK_3432_24);
     assert_eq!(clock(&lot), (8, 25, 8));
     // Tick 3433: object 334, the lead of the car junk's group, snaps
     // itself to a place where it does not fit (0x454e82).
@@ -683,7 +809,9 @@ fn strict_mode_runs_to_tick_9906_past_noon() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_3602);
-    assert_eq!(digest(&format_26_bytes(&lot)), TICK_3602_26);
+    assert_eq!(digest(&format_28_bytes(lot.world())), TICK_3602_28);
+    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_3602_27);
+    assert_eq!(digest(&format_26_bytes(lot.world())), TICK_3602_26);
     assert_eq!(clock(&lot), (8, 30, 48));
     // Tick 3603: object 354 (tree 0x1022) picks two neighbor records at
     // random, makes the person of each off the lot (Create New Object
@@ -695,12 +823,16 @@ fn strict_mode_runs_to_tick_9906_past_noon() {
     assert!(!lot.world().objects.contains_key(&334));
     assert!(!lot.world().objects.contains_key(&336));
     assert_eq!(lot.world().hash_hex(), TICK_3603);
-    assert_eq!(digest(&format_26_bytes(&lot)), TICK_3603_26);
+    assert_eq!(digest(&format_28_bytes(lot.world())), TICK_3603_28);
+    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_3603_27);
+    assert_eq!(digest(&format_26_bytes(lot.world())), TICK_3603_26);
     for _ in 3604..=3912 {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_3912);
-    assert_eq!(digest(&format_26_bytes(&lot)), TICK_3912_26);
+    assert_eq!(digest(&format_28_bytes(lot.world())), TICK_3912_28);
+    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_3912_27);
+    assert_eq!(digest(&format_26_bytes(lot.world())), TICK_3912_26);
     assert_eq!(clock(&lot), (8, 41, 8));
     // Tick 3913: object 16, seated, asks for a route, and stands up first
     // (0x4832d4). Tick 6756: a pet is made (the pet guard 0x440d63 lets it
@@ -715,22 +847,76 @@ fn strict_mode_runs_to_tick_9906_past_noon() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_9906);
+    assert_eq!(digest(&format_28_bytes(lot.world())), TICK_9906_28);
+    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_9906_27);
     assert_eq!(clock(&lot), (12, 0, 56));
     // Tick 9907: object 5 walks the neighborhood's lots in order of
-    // distance (Set To Next mode 11), which the simulation does not hold.
-    let stopped = lot.step().unwrap_err().to_string();
-    for part in ["tick 9907,", "object 5", "0x44f08d"] {
-        assert!(stopped.contains(part), "{stopped}");
+    // distance (Set To Next mode 11). Tick 30320: object 243 makes person
+    // 36 (Create New Object Instance), with person words the original
+    // hands to 0x45810c, which the port leaves out as only what is drawn
+    // (unverified).
+    // The date: globals 1, 7 and 8 are the day, month and year, global 28
+    // the days played.
+    let date = |lot: &Lot| {
+        let globals = &lot.world().globals;
+        (globals[1], globals[7], globals[8], globals[28])
+    };
+    assert_eq!(date(&lot), (16, 6, 1997, 0));
+    for _ in 9907..=31477 {
+        lot.step().unwrap();
     }
+    assert_eq!(clock(&lot), (23, 59, 58));
+    // The values the house was saved with: the objects' (simulator
+    // +0xa0) and the architecture's (+0xa4).
+    let values = |lot: &Lot| {
+        let budget = &lot.world().budget;
+        (budget.objects_value, budget.architecture_value)
+    };
+    assert_eq!(values(&lot), (14660, 15277));
+    // Tick 31478: the hours reach 24 and the day turns (0x46d3e9): the
+    // date, the objects' daily update, the budget, and signal 0xdc.
+    lot.step().unwrap();
+    // The statistics work the objects' value out again after the objects
+    // lost value for the day. Before the loss the sum is the saved 14660,
+    // which a probe of this run checked. The architecture's value is not
+    // ported and keeps the saved one.
+    assert_eq!(values(&lot), (12524, 15277));
+    assert_eq!(lot.world().hash_hex(), TICK_31478);
+    assert_eq!((date(&lot), clock(&lot)), ((17, 6, 1997, 1), (0, 0, 0)));
+    // Tick 34719: a Snap blocked by a person asks it to make way
+    // (0x45bd5e). Tick 35102: a balloon shows a neighbor's picture
+    // (0x44b862). Tick 37426: a puddle is made on the tile in front of its
+    // maker (Create mode 9) and joins the group beside it (0x423368).
+    // Tick 40935: an action queued before others drops them (0x45d4c8).
+    for _ in 31479..=43200 {
+        lot.step().unwrap();
+    }
+    // A whole day from the load: the clock is back where it started.
+    assert_eq!(lot.world().hash_hex(), TICK_43200);
+    assert_eq!((date(&lot), clock(&lot)), ((17, 6, 1997, 1), (6, 30, 44)));
 }
 
 /// The Newbies' house (House07) after 1802 updates, with `--answers 3`.
-const NEWBIE_1802: &str = "561330e47a0f5f0a1553e4382c16c87a15ff8878fff533fd375a36f24fbf177b";
+const NEWBIE_1802: &str = "477ad5cf8a137143d15448487786dbdfac30dd59e6bdf2aa5eca9f82b7381bb9";
+/// The same state's hash under snapshot format 28, which had no record
+/// of the people whose animator was asked to stop its route
+/// ([`sims_sim::World::stops_asked`]) at the end.
+const NEWBIE_1802_28: &str = "dbc6f3b365d70897ebc5d07bdeb086e9819880e83eddb954ba3b12672ac65d50";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
+const NEWBIE_1802_27: &str = "561330e47a0f5f0a1553e4382c16c87a15ff8878fff533fd375a36f24fbf177b";
 /// The same state's hash under snapshot format 26.
 const NEWBIE_1802_26: &str = "d7980d86529f1b84be10c103d0d522e5484fc54ee2484859beba71b74c8c1d58";
 /// The Newbies' house after 4052 updates, the last whose frame strict
 /// mode draws.
-const NEWBIE_4052: &str = "39b2fb2f49cdda87cfa0f1c6a56acc5a2aaac8e72fdf82ac1d02ef8e6b590d14";
+const NEWBIE_4052: &str = "e4cba62b5344fa29526919fccf72069dac72442ad111c06a979dddf32d56a23b";
+/// The same state's hash under snapshot format 28, which had no record
+/// of the people whose animator was asked to stop its route
+/// ([`sims_sim::World::stops_asked`]) at the end.
+const NEWBIE_4052_28: &str = "f89e3f50e2670999480dd1d852b0ea22e125db6d060e80d10f37a62ee7b8e25f";
+/// The same state's hash under snapshot format 27, which had no poses
+/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
+const NEWBIE_4052_27: &str = "39b2fb2f49cdda87cfa0f1c6a56acc5a2aaac8e72fdf82ac1d02ef8e6b590d14";
 
 #[test]
 fn a_newbie_gives_up_on_a_route_with_its_failure_feedback() {
@@ -765,7 +951,9 @@ fn a_newbie_gives_up_on_a_route_with_its_failure_feedback() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), NEWBIE_1802);
-    assert_eq!(digest(&format_26_bytes(&lot)), NEWBIE_1802_26);
+    assert_eq!(digest(&format_28_bytes(lot.world())), NEWBIE_1802_28);
+    assert_eq!(digest(&format_27_bytes(lot.world())), NEWBIE_1802_27);
+    assert_eq!(digest(&format_26_bytes(lot.world())), NEWBIE_1802_26);
     // Tick 1803: object 290 (tree 0x1022) makes two neighbors' people off
     // the lot (Create New Object Instance mode 6, flag 0x4) and removes
     // them, as the Goths' object 354 does at tick 3603. Unverified: the
@@ -776,6 +964,8 @@ fn a_newbie_gives_up_on_a_route_with_its_failure_feedback() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), NEWBIE_4052);
+    assert_eq!(digest(&format_28_bytes(lot.world())), NEWBIE_4052_28);
+    assert_eq!(digest(&format_27_bytes(lot.world())), NEWBIE_4052_27);
     // The frame drawn after tick 4053 finds person 140's skin waiting for
     // its update (0x590d26), which is not ported.
     let stopped = lot.step().unwrap_err().to_string();
@@ -840,22 +1030,22 @@ fn the_player_cancels_the_snack_queued_and_running() {
         (sim as i16, sim as i16, 0, 33)
     );
     assert_eq!((queued.priority, queued.uid), (50, uid + 1));
-    // He is walking to the fridge, and stopping a route whose animator is
-    // under way is not ported: play mode parks him at step 182.
-    for at in step + 1..182 {
+    // He is walking to the fridge. Step 182: his route, asked to stop
+    // while its animator is under way, stops at the walk's next step
+    // (+0x284), at (433, 392); step 183: the cancelled action ends, his
+    // menu 33 with it, and he is free. Unverified.
+    for at in step + 1..=182 {
         let update = lot.step_play().unwrap();
         assert!(update.errors.is_empty(), "step {at}: {:?}", update.errors);
+        assert_eq!(person(&lot).active.uid, uid, "step {at}");
     }
+    assert_eq!(lot.world().objects[&sim].position, [433, 392, 1]);
     let update = lot.step_play().unwrap();
-    let [error] = &update.errors[..] else {
-        panic!("{:?}", update.errors);
-    };
-    assert_eq!(error.object, sim);
-    assert!(
-        error.fault.to_string().contains("0x45b3eb"),
-        "{}",
-        error.fault
-    );
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    let free = person(&lot);
+    assert_eq!(free.active.uid, 0);
+    assert!(free.queue.is_empty());
+    assert_eq!(lot.world().objects[&sim].position, [433, 392, 1]);
 }
 
 /// The player cancels the snack Mortimer is eating (play mode, the snack
@@ -915,14 +1105,14 @@ fn a_cancelled_snack_is_put_down_in_front_of_the_eater() {
     assert!(free.queue.is_empty());
 }
 
-/// A known gap, not the original's behaviour: the snack order cancelled
-/// at step 825, as Mortimer walks away from the fridge with the snack,
-/// stops his route while its animator is still under way (0x45b3eb),
-/// which is not ported (track 4's). Cancels at steps 150 to 536 and 543
-/// to 590, on his way to the fridge, stop the same way. When 0x45b3eb is
-/// ported, this test is to say what the original does instead.
+/// The snack order cancelled at step 825, as Mortimer walks away from
+/// the fridge with the snack: his route, asked to stop while its
+/// animator is under way (0x45b3eb), stops at the walk's next step, the
+/// tile's centre at (296, 456). There he puts the snack down in front of
+/// him at step 894, as when he is cancelled eating it, and he is free at
+/// step 913. Unverified.
 #[test]
-fn a_snack_cancelled_on_the_way_to_the_chair_stops_at_the_unported_route_stop() {
+fn a_snack_cancelled_on_the_way_to_the_chair_is_put_down_at_the_next_tile() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -943,24 +1133,28 @@ fn a_snack_cancelled_on_the_way_to_the_chair_stops_at_the_unported_route_stop() 
     let snack = me.person.as_ref().unwrap().active.uid;
     assert_eq!((snack, me.slots[1].object), (5, 263));
     assert!(lot.cancel(sim, snack).unwrap().counts);
-    for step in 825..828 {
+    let held = |lot: &Lot| lot.world().objects[&sim].slots[1].object;
+    for step in 825..894 {
         let update = lot.step_play().unwrap();
         assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+        assert_eq!(held(&lot), 263, "step {step}");
+    }
+    assert_eq!(lot.world().objects[&sim].position, [296, 456, 1]);
+    let update = lot.step_play().unwrap();
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    assert_eq!(held(&lot), 0);
+    assert_eq!(lot.world().objects[&263].position, [280, 456, 1]);
+    let person = |lot: &Lot| lot.world().objects[&sim].person.clone().unwrap();
+    for step in 895..913 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+        assert_eq!(person(&lot).active.uid, 5, "step {step}");
     }
     let update = lot.step_play().unwrap();
-    let [error] = update.errors.as_slice() else {
-        panic!("{:?}", update.errors);
-    };
-    let fault = &error.fault;
-    assert_eq!(
-        fault.at.map(|at| (at.tree, at.node)),
-        Some((0x104a, 4)),
-        "{error:?}"
-    );
-    assert!(
-        matches!(&fault.trap, sims_vm::Trap::Unsupported(why) if why.contains("0x45b3eb")),
-        "{error:?}"
-    );
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    let free = person(&lot);
+    assert_eq!(free.active.uid, 0);
+    assert!(free.queue.is_empty());
 }
 
 #[test]

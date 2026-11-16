@@ -8,7 +8,7 @@
 //! (legacy/crates/sims-vm/src/person_reset.rs), `clear_person_action`
 //! (legacy/crates/sims-vm/src/action.rs), and `score_table`
 //! (legacy/crates/sims-vm/src/person_loading.rs). The prototype compared
-//! each with the original's code run alone. `docs/decisions.md` says what
+//! each with the original's code run alone. `docs/decisions/` says what
 //! a trace of the original loading the Goth house confirms.
 
 use std::cell::RefCell;
@@ -300,9 +300,7 @@ impl Interpreter<'_> {
     ///
     /// These fail, because the original does more for them and none was
     /// seen: a person that is using an object or whose running action has
-    /// a target; a person whose routing frame count
-    /// ([`sims_formats::saved_objects::Person::routing_frames`]) is not 0;
-    /// a person inside another object (0x45e8dd) or, unless it is being
+    /// a target; a person inside another object (0x45e8dd) or, unless it is being
     /// deleted ([`Interpreter::reset_person_to_delete`]), off the lot
     /// (0x45e977), which the original moves; and a person whose data word
     /// 73 is set, whose footprint the original then works out again.
@@ -489,9 +487,6 @@ impl Interpreter<'_> {
         }
         if person.active.target != 0 {
             return Err(unsupported("whose running action has a target"));
-        }
-        if person.routing_frames != 0 {
-            return Err(unsupported("whose routing frame count is not 0"));
         }
         if person.data.get(73).is_none_or(|&word| word != 0) {
             return Err(unsupported("whose data word 73 is set"));

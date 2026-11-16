@@ -12,16 +12,17 @@
 //!    count by 1. At 60 seconds the seconds go back by 60 and global 5
 //!    (minutes) goes up, and signal 0xdb is sent. At 60 minutes the
 //!    minutes go back by 60 and global 0 (hours) goes up. At 24 hours the
-//!    day turns (0x46d3e9: the date, the day's statistics, the daily
-//!    updates of the objects and the neighborhood, signal 0xdc instead of
-//!    0xdb); that is not ported and fails.
+//!    hours go back by 24 and the day turns (0x46d3e9, [`crate::daily`]:
+//!    the date, the objects' daily update, the budget's days), and the
+//!    signal is 0xdc instead of 0xdb.
 //! 3. The registry's pass at the end of the update (0x4412d1,
 //!    [`Interpreter::end_of_update`]): the dialogs, then the queued
 //!    removals, then a check that a Sim is selected.
 //! 4. The signal from step 2, if any, goes to the game's eight
 //!    subscribers (0x40760d). Of those only the interface takes signal
 //!    0xdb (0x4f65bf; a sound when the minutes are 0), so it changes
-//!    nothing here.
+//!    nothing here. On 0xdc the lot moves the usage counts back a day and
+//!    works out its statistics again ([`crate::daily`]).
 //! 5. If the hour turned, the time of day for the new hour (0x46d525) is
 //!    compared with global 4. If it differs, global 4 takes it, the
 //!    interface is told (0x4c4648, which picks the day or night look of
@@ -62,8 +63,9 @@
 //! Read from the original's code; the old prototype
 //! (legacy/crates/sims-vm/src/lib.rs, legacy/crates/sims-sim/src/clock.rs,
 //! legacy/crates/sims-sim/src/removal.rs) was the guide. What a capture of
-//! the original running these ticks confirms is in `docs/decisions.md`.
+//! the original running these ticks confirms is in `docs/decisions/`.
 
+use crate::daily;
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Status, Stream};
 use crate::placement::Refreshing;
@@ -322,12 +324,9 @@ impl Interpreter<'_> {
                     set_global(world, HOURS, hours)?;
                     hour_turned = true;
                     if hours >= 24 {
-                        return Err(TickError::Unsupported(format!(
-                            "the day turns at tick {} (0x46d3e9: the date, the day's \
-                             statistics, the objects' and the neighborhood's daily update, \
-                             signal 0xdc), which is not ported",
-                            world.ticks
-                        )));
+                        set_global(world, HOURS, hours.wrapping_sub(24))?;
+                        signal = Some(0xdc);
+                        daily::turn_day(&game, world).map_err(TickError::Fault)?;
                     }
                 }
             }
@@ -339,8 +338,12 @@ impl Interpreter<'_> {
             }
         }
         // Signal 0xdb reaches only the interface among the subscribers
-        // (see the module's documentation).
-        let _ = signal;
+        // (see the module's documentation). Of 0xdc the lot's subscriber
+        // takes its part (see `daily`).
+        if signal == Some(0xdc) {
+            daily::shift_usage(world);
+            game.day_statistics(world).map_err(TickError::Fault)?;
+        }
         if hour_turned {
             let period = time_of_day(global(world, HOURS)?);
             if period != global(world, TIME_OF_DAY)? {
@@ -731,14 +734,13 @@ impl Interpreter<'_> {
         if tick % 10 == 0 && word(&person.data, person::VISITOR) == 0 && hidden == 0 && awake {
             // 0x45c349: the person's last route context, if it has any.
             // The routing primitives push and pop them (Go To Routing
-            // Slot, 0x45abce, pushes); the count the load read is kept
-            // too, as no ported primitive pops the contexts it stands for.
-            let routing = person.routing_frames != 0
-                || world
-                    .routing
-                    .routes
-                    .get(&id)
-                    .is_some_and(|r| !r.contexts.is_empty());
+            // Slot, 0x45abce, pushes); the load makes as many as the save
+            // counts (0x460443).
+            let routing = world
+                .routing
+                .routes
+                .get(&id)
+                .is_some_and(|r| !r.contexts.is_empty());
             world.usage.sample(routing);
         }
         // 0x45ce61: a nonzero person word 1 goes to the interface
@@ -987,11 +989,7 @@ impl Interpreter<'_> {
                     && object.multipart.is_some()
                     && self.has_function(world, id, function::DYNAMIC_GROUP)
                 {
-                    return Err(TickError::Unsupported(format!(
-                        "removing object {id}, a tile of a group whose type has the dynamic \
-                         group function (8), at the end of the lot update: it leaves its group \
-                         first (0x42346a), which is not ported"
-                    )));
+                    self.leave_group(world, id)?;
                 }
                 if world.dialogs.records.iter().any(|r| r.caller == id) {
                     return Err(TickError::Unsupported(format!(

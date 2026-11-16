@@ -7,13 +7,15 @@
 //! entries of the caller's code owner's `STR#` 301, picked by the
 //! operands, and the icon is one of its `BMP_` chunks.
 //!
-//! The layout was measured on two screenshots of the original at 800 by
-//! 600 (the Magic Town and Studio Town notices on the Goth house). The
-//! numbers are in `docs/decisions.md`; how the original sizes a dialog it
-//! was not measured on is **unverified**.
+//! The layout is the original's (0x523fe3, 0x524257, 0x535266), read
+//! from the exe and checked against a screenshot of the original at 800
+//! by 600 (the Magic Town notice on the Goth house);
+//! `docs/decisions/20261115-message-dialog-layout.md` says what is read
+//! and what is inferred.
 
 use crate::art::{Art, KEY};
 use crate::command::Command;
+use crate::font::Font;
 use crate::frame::{Frame, Rect};
 use crate::hud::{LABEL, rgb565};
 use crate::{Error, Result};
@@ -22,6 +24,7 @@ use sims_formats::bitmap::{self, Image};
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
 use sims_sim::{Dialog, World};
+use std::cell::Cell;
 
 /// The string table a private dialog's text comes from.
 pub const STRINGS: u16 = 301;
@@ -52,6 +55,38 @@ pub struct Message {
     /// second and third.
     pub buttons: Vec<String>,
     pub icon: Option<Image>,
+    /// The text typed into a dialog that asks for text (kind 3), which
+    /// the player edits with [`type_into`] and [`erase`]; None for any
+    /// other kind.
+    pub entry: Option<String>,
+}
+
+/// What a dialog that asks for text holds when it opens: the original
+/// passes this string to its entry field (0x436c48, 0x523808).
+pub const ENTRY_START: &str = "Hello world";
+/// The most characters the entry field holds (0x5238a1, field +0x138,
+/// checked by 0x5f334f and 0x5f33be). The original counts bytes of its
+/// text encoding, the same as characters in a single-byte one.
+pub const ENTRY_MOST: usize = 64;
+/// The entry field's height (0x524420).
+const ENTRY_HEIGHT: i32 = 36;
+
+/// Types `typed` at the end of the dialog's entry, if it asks for text,
+/// is not full and `typed` is not a control character. Returns whether
+/// the text changed.
+pub fn type_into(message: &mut Message, typed: char) -> bool {
+    match &mut message.entry {
+        Some(text) if !typed.is_control() && text.chars().count() < ENTRY_MOST => {
+            text.push(typed);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Erases the entry's last character. Returns whether the text changed.
+pub fn erase(message: &mut Message) -> bool {
+    message.entry.as_mut().and_then(String::pop).is_some()
 }
 
 /// The default button labels.
@@ -148,8 +183,11 @@ impl Message {
         let text = |n: u8, default: &str| entry(n).unwrap_or(default).to_owned();
         // From the original's button setup (0x43601c), as the old
         // prototype read it (legacy/crates/sims-vm/src/dialog/presentation.rs).
-        let buttons = match operands[5] & 0x7f {
-            0 | 4 => vec![text(operands[3], labels.get(1))],
+        let kind = operands[5] & 0x7f;
+        let buttons = match kind {
+            // Kind 3 asks for text: the first button and an entry field
+            // under the text (0x436a52).
+            0 | 3 | 4 => vec![text(operands[3], labels.get(1))],
             1 => vec![
                 text(operands[3], labels.get(3)),
                 text(operands[4], labels.get(4)),
@@ -181,6 +219,7 @@ impl Message {
             text: text(operands[2], MISSING),
             buttons,
             icon,
+            entry: (kind == 3).then(|| ENTRY_START.to_owned()),
         }))
     }
 }
@@ -188,20 +227,35 @@ impl Message {
 /// The fonts: the title in `variablesans_14`, the rest in `_12`.
 const TITLE_FONT: u8 = 14;
 const BODY_FONT: u8 = 12;
-/// Space between the frame and what is inside it.
-const MARGIN: i32 = 21;
-/// Space between the icon and the text, the title and the text, and the
-/// text and the buttons.
+/// How far in from the frame's edge the parts are laid out: a third of
+/// the frame's art (0x524a31) and 9 more (0x524257). The frame's art is
+/// not identified; 12 gives the 21 pixels measured.
+const INSET: i32 = 12;
+const PAD: i32 = 9;
+/// Space between the title, the text and the buttons, and beside the
+/// icon (0x524257).
 const GAP: i32 = 18;
-/// Where the title's centering starts when there is an icon: the title
-/// is centered between this and the right margin.
-const TITLE_LEFT: i32 = 141;
+/// A button is at least 100 wide (0x52373c); its height is the art's.
 const BUTTON_SIZE: [i32; 2] = [100, 33];
-/// Widths go up in steps of 10, all ending in 7, until the dialog is at
-/// least twice as wide as tall: the rule that gives both measured widths
-/// (557 and 567). **Unverified** beyond those two.
-const WIDTH_STEP: i32 = 10;
-const MIN_WIDTH: i32 = 207;
+/// The text is at least 30 wider than each button, together (0x524257).
+const BUTTON_ROOM: i32 = 30;
+/// The text's least width with neither title nor icon (0x524257).
+const PLAIN_WIDTH: i32 = 100;
+/// The title's box is its text and 4 more across: inferred from where
+/// the measured title sits, since the title is centered by its box.
+const TITLE_BOX: i32 = 4;
+/// The width search (0x523fe3) aims at a dialog twice as wide as tall
+/// (0x523409), is done within 0.05 of it, and halves the gap until it
+/// is 20 or less, for at most 10 tries.
+const ASPECT: f64 = 2.0;
+const CLOSE: f64 = 0.05f32 as f64;
+const STEP: i32 = 20;
+const TRIES: i32 = 10;
+/// The dialog's width before it is first laid out (0x524001).
+const FIRST_WIDTH: i32 = 300;
+/// The widest text tried. The original doubles without end until the
+/// dialog is wide enough; a text of many short lines never gets there.
+const WIDEST: i32 = 1 << 20;
 
 /// A laid-out dialog.
 #[derive(Debug, Clone, PartialEq)]
@@ -213,38 +267,93 @@ pub struct Layout {
     /// Each line of the message and where it starts.
     pub lines: Vec<(String, [i32; 2])>,
     pub buttons: Vec<Rect>,
+    /// The entry field of a dialog that asks for text.
+    pub entry: Option<Rect>,
 }
 
-/// Wraps `text` with line `n` allowed `width(n)` pixels. Words longer than
-/// a line get a line of their own.
-fn wrap(font: &crate::font::Font, text: &str, width: impl Fn(usize) -> i32) -> Vec<String> {
-    let mut lines = Vec::new();
-    for paragraph in text.split('\n') {
-        let mut line = String::new();
-        for word in paragraph.split(' ') {
-            let candidate = if line.is_empty() {
-                word.to_owned()
-            } else {
-                format!("{line} {word}")
-            };
-            if line.is_empty() || font.width(&candidate) <= width(lines.len()) {
-                line = candidate;
-            } else {
-                lines.push(std::mem::replace(&mut line, word.to_owned()));
-            }
-        }
-        lines.push(line);
+/// The message box at `width` (0x535266): the lines beside the icon,
+/// those under it, and its height. `band` is the room the icon takes,
+/// across and down, in whole lines; the lines that fit down it go beside
+/// the icon, the rest under the band.
+struct TextBox {
+    beside: Vec<String>,
+    below: Vec<String>,
+    height: i32,
+}
+
+/// Splits `text` into the lines a box `width` wide gives, at most
+/// `most` of them, and how many characters they take.
+fn split(font: &Font, text: &[char], width: i32, most: usize) -> (Vec<String>, usize) {
+    let (mut lines, mut at) = (Vec::new(), 0);
+    while at < text.len() && lines.len() < most {
+        let n = font.fit(&text[at..], width).clamp(1, text.len() - at);
+        lines.push(text[at..at + n].iter().filter(|&&c| c != '\n').collect());
+        at += n;
     }
-    lines
+    (lines, at)
 }
 
-/// Lays `message` out centered in a window of `size`. None without the
-/// fonts.
+fn text_box(font: &Font, text: &[char], width: i32, band: [i32; 2]) -> TextBox {
+    let line = font.line_height.max(1);
+    let fits = usize::try_from(band[1] / line).unwrap_or(0);
+    let narrow = width.saturating_sub(band[0]);
+    let (all, _) = split(font, text, narrow, fits.saturating_add(1));
+    if all.len() <= fits {
+        return TextBox {
+            beside: all,
+            below: Vec::new(),
+            height: band[1],
+        };
+    }
+    let (mut beside, used) = split(font, text, narrow, fits);
+    let (mut below, _) = split(font, &text[used..], width, usize::MAX);
+    let rows = i32::try_from(below.len()).unwrap_or(i32::MAX);
+    // One line left over that fits beside the icon is drawn there, on
+    // down from the others (0x534fe5).
+    if below.len() == 1 && font.width(&text[used..].iter().collect::<String>()) <= narrow {
+        beside.append(&mut below);
+    }
+    TextBox {
+        beside,
+        below,
+        height: band[1].saturating_add(rows.saturating_mul(line)),
+    }
+}
+
+/// The dialog with its text `width` wide (or the least it may be).
+struct Arranged {
+    text_width: i32,
+    text: TextBox,
+    /// The buttons' top, from the dialog's.
+    buttons: i32,
+    size: [i32; 2],
+}
+
+impl Arranged {
+    fn ratio(&self) -> f64 {
+        f64::from(self.size[0]) / f64::from(self.size[1].max(1))
+    }
+}
+
+/// Lays `message` out centered in a window of `size`, as the original's
+/// message dialog lays itself out (0x523fe3, 0x524257). None without
+/// the fonts.
 ///
-/// A message too long for the window is cut after the last line that
-/// leaves the buttons on screen, so the dialog can always be answered.
-/// How the original handles one is **unverified**; its messages are a
-/// few lines.
+/// - The text is at least as wide as the title, the icon and 18
+///   between them, or the icon, or 100, and as the buttons with 30 more
+///   each. Its width is then searched for a dialog twice as wide as
+///   tall: doubled until it is at least that, halved until it is at
+///   most that, then the two halved toward each other; the closer of the
+///   last two is kept.
+/// - The icon is at the top left; the text's lines that fit down the
+///   icon's band go beside it, the rest under the band.
+/// - The buttons are spread evenly across the text's width, an equal
+///   gap before, between and after them, 18 under the text.
+///
+/// A dialog bigger than the window is narrowed to it, loses lines from
+/// its end and keeps to the window's bottom, so its buttons are on
+/// screen in any window 100 a button wide and 54 high; how the original
+/// handles one is **unverified**.
 pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
     let (title_font, body) = (art.font(TITLE_FONT)?, art.font(BODY_FONT)?);
     let size = size.map(|n| n.clamp(0, 32768));
@@ -256,62 +365,164 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
     });
     // Line heights come from the font files: keep them sane so nothing
     // below can overflow.
-    let body_top = MARGIN + title_font.line_height.clamp(0, 1024) + GAP;
+    let title_line = title_font.line_height.clamp(0, 1024);
     let line = body.line_height.clamp(1, 1024);
-    // The most lines that leave the buttons inside the window.
-    let room = size[1] - body_top - GAP - BUTTON_SIZE[1] - MARGIN;
-    let most = usize::try_from(room / line).unwrap_or(0).max(1);
-    // Lines that start above the icon's bottom go beside it.
-    let beside = |n: usize| {
-        icon.is_some_and(|[_, h]| {
-            let top = i64::from(body_top) + i64::from(line) * n as i64;
-            top < i64::from(MARGIN + h)
-        })
-    };
-    let text_left = icon.map_or(MARGIN, |[w, _]| MARGIN + w + GAP);
-    let lay = |width: i32| {
-        let mut lines = wrap(body, &message.text, |n| {
-            width - MARGIN - if beside(n) { text_left } else { MARGIN }
-        });
-        lines.truncate(most);
-        // At most 32768 lines of at most 1024 pixels: no overflow.
-        let text_bottom = body_top + line * i32::try_from(lines.len()).unwrap_or(1);
-        let content = text_bottom.max(icon.map_or(0, |[_, h]| MARGIN + h));
-        let height = content + GAP + BUTTON_SIZE[1] + MARGIN;
-        (lines, height)
-    };
-    let count = i32::try_from(message.buttons.len()).unwrap_or(0).min(3);
-    let row = count * BUTTON_SIZE[0] + (count - 1).max(0) * GAP;
-    // Wide enough for the buttons, keeping to the steps.
-    let narrowest = MIN_WIDTH
-        + ((row + 2 * MARGIN - MIN_WIDTH).max(0) + WIDTH_STEP - 1) / WIDTH_STEP * WIDTH_STEP;
-    let widest = (size[0] - 1).max(narrowest);
-    let mut width = narrowest;
-    let (mut lines, mut height) = lay(width);
-    while width < widest && width < 2 * height {
-        width = (width + WIDTH_STEP).min(widest);
-        (lines, height) = lay(width);
+    let title = (!message.title.is_empty())
+        .then(|| title_font.width(&message.title).clamp(0, 1 << 16) + TITLE_BOX);
+    let text: Vec<char> = message.text.chars().collect();
+    let count = message.buttons.len().min(3);
+    let buttons = i32::try_from(count).unwrap_or(0);
+    let icon_width = icon.map_or(0, |[w, _]| w);
+    let least = match title {
+        Some(title) => title + icon_width + GAP,
+        None if icon_width != 0 => icon_width,
+        None => PLAIN_WIDTH,
     }
-    let rect = Rect::new((size[0] - width) / 2, (size[1] - height) / 2, width, height);
-    let title_width = title_font.width(&message.title);
-    let title_x = match icon {
-        Some(_) => (TITLE_LEFT + width - MARGIN - title_width).div_euclid(2),
-        None => (width - title_width).div_euclid(2),
+    .max(buttons * (BUTTON_SIZE[0] + BUTTON_ROOM));
+    let top = INSET + PAD;
+    let text_top = match title {
+        Some(_) => top + title_line + GAP,
+        None => top,
     };
-    let lines = lines
-        .into_iter()
-        .enumerate()
-        .map(|(n, text)| {
-            let x = if beside(n) { text_left } else { MARGIN };
-            let y = body_top + line * n as i32;
-            (text, [rect.x + x, rect.y + y])
-        })
-        .collect();
-    let buttons = (0..count)
+    // The icon's band reaches 18 under it, from where the text is first
+    // put (0x523fe3), rounded to the nearest whole line, down on a tie
+    // (0x5351cc). The text is first put under the title's box as it was
+    // made, which is **unverified**; here it is the title's line, and
+    // anything from 6 less to 16 more gives the measured dialog.
+    let band = icon.map_or([0, 0], |[w, h]| {
+        let reach = top + h + GAP - text_top;
+        let lines = reach / line;
+        let over = reach - lines * line;
+        let lines = if over > (lines + 1) * line - reach {
+            lines + 1
+        } else {
+            lines
+        };
+        [w + GAP, lines * line]
+    });
+    // The dialog's width as the last pass left it: the title is
+    // centered on it (0x5243b5). It is 300 before the first (0x524001).
+    let last_width = Cell::new(FIRST_WIDTH);
+    let arrange_within = |width: i32, least: i32| {
+        let text_width = width.clamp(least, WIDEST);
+        let text = text_box(body, &text, text_width, band);
+        // An entry field goes 9 under the text, as wide as it and 36 high,
+        // and the buttons 18 under where they would have been and its
+        // height lower (0x52440d).
+        let entry_room = if message.entry.is_some() {
+            ENTRY_HEIGHT + GAP
+        } else {
+            0
+        };
+        let buttons_top = text_top
+            .saturating_add(text.height)
+            .saturating_add(GAP + entry_room);
+        let bottom = if count > 0 {
+            buttons_top.saturating_add(BUTTON_SIZE[1] + PAD)
+        } else {
+            buttons_top
+        };
+        let size = [text_width + 2 * top, bottom.saturating_add(INSET)];
+        last_width.set(size[0]);
+        Arranged {
+            text_width,
+            text,
+            buttons: buttons_top,
+            size,
+        }
+    };
+    let arrange = |width: i32| arrange_within(width, least);
+
+    // The width search (0x523fe3). The text starts with no width.
+    let first = arrange(0);
+    let start = first.text_width;
+    let (mut wide, mut narrow) = (start, start);
+    let (mut wide_ratio, mut narrow_ratio) = (first.ratio() as f32, first.ratio() as f32);
+    if (first.ratio() - ASPECT).abs() > CLOSE {
+        loop {
+            let a = arrange(wide);
+            wide_ratio = a.ratio() as f32;
+            if a.ratio() >= ASPECT || a.text_width >= WIDEST {
+                break;
+            }
+            wide = a.text_width.saturating_mul(2).min(WIDEST);
+        }
+        for tries in 1.. {
+            let a = arrange(narrow);
+            narrow_ratio = a.ratio() as f32;
+            if a.ratio() <= ASPECT {
+                break;
+            }
+            narrow = a.text_width / 2;
+            if tries + 1 >= TRIES {
+                break;
+            }
+        }
+        for tries in 1.. {
+            if (wide - narrow).abs() <= STEP {
+                break;
+            }
+            let a = arrange((wide + narrow) / 2);
+            if a.ratio() >= ASPECT {
+                (wide, wide_ratio) = (a.text_width, a.ratio() as f32);
+            } else {
+                (narrow, narrow_ratio) = (a.text_width, a.ratio() as f32);
+            }
+            if tries + 1 >= TRIES {
+                break;
+            }
+        }
+    }
+    let off = |ratio: f32| (f64::from(ratio) - ASPECT).abs();
+    let mut before = last_width.get();
+    let mut a = arrange(if off(wide_ratio) <= off(narrow_ratio) {
+        wide
+    } else {
+        narrow
+    });
+
+    // A dialog bigger than the window is narrowed to it, no narrower
+    // than its buttons side by side, loses lines from its end, and is
+    // then kept to the window's bottom, so that its buttons are on
+    // screen in any window 100 a button wide and 54 high. None of it is
+    // the original's: how it handles one is **unverified**.
+    let room = size[0] - 2 * top;
+    if a.size[0] > size[0] || a.size[1] > size[1] {
+        a = arrange_within(a.text_width.min(room), buttons * BUTTON_SIZE[0]);
+        before = a.size[0];
+    }
+    let mut height = a.size[1];
+    while height > size[1] && a.text.below.len() + a.text.beside.len() > 1 {
+        if a.text.below.pop().is_none() {
+            break;
+        }
+        height -= line;
+        a.buttons -= line;
+    }
+    let width = a.size[0];
+    let y = ((size[1] - height) / 2).min(size[1] - height);
+    let rect = Rect::new((size[0] - width) / 2, y, width, height);
+    let title_x = match (title, icon) {
+        (Some(title), Some(_)) => {
+            top - PAD + icon_width + GAP + (a.text_width - band[0] - title) / 2
+        }
+        (title, _) => (before - title.unwrap_or(0)) / 2,
+    };
+    let beside = a.text.beside.into_iter().enumerate().map(|(n, text)| {
+        let y = text_top + line * n as i32;
+        (text, [rect.x + top + band[0], rect.y + y])
+    });
+    let below = a.text.below.into_iter().enumerate().map(|(n, text)| {
+        let y = text_top + band[1] + line * n as i32;
+        (text, [rect.x + top, rect.y + y])
+    });
+    let lines = beside.chain(below).collect();
+    let gap = (a.text_width - buttons * BUTTON_SIZE[0]) / (buttons + 1);
+    let buttons = (0..buttons)
         .map(|n| {
             Rect::new(
-                rect.x + (width - row) / 2 + n * (BUTTON_SIZE[0] + GAP),
-                rect.y + height - MARGIN - BUTTON_SIZE[1],
+                rect.x + top + gap * (n + 1) + BUTTON_SIZE[0] * n,
+                rect.y + a.buttons,
                 BUTTON_SIZE[0],
                 BUTTON_SIZE[1],
             )
@@ -320,8 +531,16 @@ pub fn layout(size: [i32; 2], message: &Message, art: &Art) -> Option<Layout> {
     Some(Layout {
         caller: message.caller,
         rect,
-        icon: icon.map(|_| [rect.x + MARGIN, rect.y + MARGIN]),
-        title: [rect.x + title_x, rect.y + MARGIN],
+        icon: icon.map(|_| [rect.x + top, rect.y + top]),
+        entry: message.entry.as_ref().map(|_| {
+            Rect::new(
+                rect.x + top,
+                rect.y + a.buttons - GAP - ENTRY_HEIGHT - GAP + PAD,
+                a.text_width,
+                ENTRY_HEIGHT,
+            )
+        }),
+        title: [rect.x + title_x, rect.y + top],
         lines,
         buttons,
     })
@@ -386,6 +605,11 @@ pub fn draw(
             font.draw(frame, text, *at, LABEL);
         }
     }
+    if let (Some(field), Some(text), Some(font)) =
+        (layout.entry, &message.entry, art.font(BODY_FONT))
+    {
+        draw_entry(frame, font, field, text);
+    }
     for (rect, label) in layout.buttons.iter().zip(&message.buttons) {
         let hover = pointer.is_some_and(|[x, y]| rect.contains(x, y));
         // Cell 0 is the button at rest, 2 under the pointer.
@@ -411,6 +635,78 @@ pub fn draw(
             let x = (i64::from(rect.x) + offset).clamp(i64::from(i32::MIN), i64::from(i32::MAX));
             let rgb = if hover { [255; 3] } else { LABEL };
             font.draw(frame, label, [x as i32, rect.y.saturating_add(5)], rgb);
+        }
+    }
+}
+
+/// The entry field: an outline, the text from its left, and the caret
+/// after it. **An approximation**: how the original's field (0x5f19f5)
+/// draws is not read, and it is not compared with a screenshot.
+fn draw_entry(frame: &mut Frame, font: &Font, field: Rect, text: &str) {
+    let [right, bottom] = [
+        field.x.saturating_add(field.width - 1),
+        field.y.saturating_add(field.height - 1),
+    ];
+    // Only the part inside the frame is visited.
+    let wide = i32::try_from(frame.width()).unwrap_or(i32::MAX);
+    let high = i32::try_from(frame.height()).unwrap_or(i32::MAX);
+    let mut dot = |x: i32, y: i32| frame.blend(x, y, LABEL, 255);
+    for x in field.x.max(0)..=right.min(wide) {
+        dot(x, field.y);
+        dot(x, bottom);
+    }
+    for y in field.y.max(0)..=bottom.min(high) {
+        dot(field.x, y);
+        dot(right, y);
+    }
+    // The text and the caret are drawn inside the outline only: on a copy
+    // of what is under it, put back after. A text wider than the field
+    // slides left so the caret stays in view (an approximation: the
+    // original's scrolling is not read).
+    let inside = Rect::new(
+        field.x.saturating_add(1),
+        field.y.saturating_add(1),
+        (field.width - 2).max(0),
+        (field.height - 2).max(0),
+    );
+    // Only the part of the inside within the frame is copied.
+    let left = inside.x.max(0);
+    let top = inside.y.max(0);
+    let end_x = inside.x.saturating_add(inside.width).min(wide);
+    let end_y = inside.y.saturating_add(inside.height).min(high);
+    let (Ok(w), Ok(h)) = (u32::try_from(end_x - left), u32::try_from(end_y - top)) else {
+        return;
+    };
+    if w == 0 || h == 0 {
+        return;
+    }
+    let mut under = Frame::new(w, h, [0; 3]);
+    for y in 0..end_y - top {
+        for x in 0..end_x - left {
+            if let Some(rgb) = frame.pixel(left + x, top + y) {
+                under.blend(x, y, rgb, 255);
+            }
+        }
+    }
+    let line = font.line_height.clamp(0, inside.height);
+    let caret = 3i32.saturating_add(font.width(text)).saturating_add(1);
+    let slide = caret.saturating_sub(inside.width - 3).max(0);
+    // Where the inside's corner falls in the copy.
+    let [ox, oy] = [inside.x.saturating_sub(left), inside.y.saturating_sub(top)];
+    let at = [
+        ox.saturating_add(3 - slide),
+        oy.saturating_add((inside.height - line) / 2),
+    ];
+    font.draw(&mut under, text, at, LABEL);
+    let caret_x = ox.saturating_add(caret - slide);
+    for y in at[1]..at[1].saturating_add(line) {
+        under.blend(caret_x, y, LABEL, 255);
+    }
+    for y in 0..end_y - top {
+        for x in 0..end_x - left {
+            if let Some(rgb) = under.pixel(x, y) {
+                frame.blend(left + x, top + y, rgb, 255);
+            }
         }
     }
 }
@@ -465,32 +761,232 @@ mod tests {
             text: text.into(),
             buttons: vec!["AB".into(); buttons],
             icon: None,
+            entry: None,
         }
     }
 
     #[test]
     fn a_long_message_leaves_the_buttons_on_screen() {
         let art = art();
-        let text = "A\n".repeat(100_000);
-        for size in [[800, 600], [100, 50], [0, 0]] {
-            let layout = layout(size, &message(&text, 1), &art).unwrap();
-            let button = layout.buttons[0];
-            if size[1] >= 200 {
-                assert!(button.y + button.height <= size[1], "{size:?} {button:?}");
+        for text in ["A\n".repeat(60), "A\n".repeat(10_000)] {
+            for buttons in 1..=3 {
+                for size in [[800, 600], [100, 50], [0, 0]] {
+                    let layout = layout(size, &message(&text, buttons), &art).unwrap();
+                    assert!(!layout.lines.is_empty());
+                    if size[1] >= 200 {
+                        assert!(layout.rect.width <= size[0], "{:?}", layout.rect);
+                    }
+                }
             }
-            assert!(!layout.lines.is_empty());
         }
     }
 
     #[test]
-    fn three_buttons_fit_inside_the_frame() {
-        let layout = layout([800, 600], &message("B", 3), &art()).unwrap();
-        let r = layout.rect;
-        assert!(r.width >= 3 * 100 + 2 * 18 + 2 * MARGIN);
-        assert_eq!((r.width - MIN_WIDTH) % WIDTH_STEP, 0);
-        for b in &layout.buttons {
-            assert!(b.x >= r.x + MARGIN && b.x + b.width <= r.x + r.width - MARGIN);
+    fn the_buttons_are_on_screen_in_any_window_wide_enough_for_them() {
+        let art = art();
+        let icon = |w: u32, h: u32| Image {
+            width: w,
+            height: h,
+            rgba: vec![255; (w * h * 4) as usize],
+        };
+        let texts = ["B".to_owned(), "A\n".repeat(60), vec!["B"; 3000].join(" ")];
+        let icons = [
+            None,
+            Some(icon(10, 7)),
+            Some(icon(124, 256)),
+            Some(icon(700, 900)),
+        ];
+        for text in &texts {
+            for picture in &icons {
+                for buttons in 1..=3 {
+                    let wide = 100 * buttons as i32;
+                    for size in [
+                        [800, 600],
+                        [800, 200],
+                        [wide, 54],
+                        [wide + 7, 600],
+                        [640, 54],
+                    ] {
+                        if size[0] < wide {
+                            continue;
+                        }
+                        let mut m = message(text, buttons);
+                        m.icon = picture.clone();
+                        let laid = layout(size, &m, &art).unwrap();
+                        assert_eq!(laid.buttons.len(), buttons);
+                        for b in &laid.buttons {
+                            let on = b.x >= 0
+                                && b.x + b.width <= size[0]
+                                && b.y >= 0
+                                && b.y + b.height <= size[1];
+                            assert!(
+                                on,
+                                "{size:?} {buttons} {:?} {b:?}",
+                                picture.as_ref().map(|i| i.height)
+                            );
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    #[test]
+    fn a_dialog_that_asks_for_text_has_an_entry_under_it() {
+        let art = art();
+        let mut m = message("B", 1);
+        let plain = layout([800, 600], &m, &art).unwrap();
+        assert_eq!(plain.entry, None);
+        m.entry = Some(ENTRY_START.to_owned());
+        let laid = layout([800, 600], &m, &art).unwrap();
+        // 9 under the text (21 + 2 + 18 + 2 high), as wide as it, 36
+        // high; the button 18 + 36 + 18 under the text.
+        let field = laid.entry.unwrap();
+        let text_bottom = laid.rect.y + 21 + 2 + 18 + 2;
+        assert_eq!(field.y, text_bottom + 9);
+        assert_eq!(
+            (field.x, field.width),
+            (laid.rect.x + 21, laid.rect.width - 42)
+        );
+        assert_eq!(field.height, 36);
+        assert_eq!(laid.buttons[0].y, text_bottom + 18 + 36 + 18);
+        assert_eq!(laid.rect.height, plain.rect.height + 54);
+        // Drawn: its outline, at any place, without a panic.
+        let mut frame = Frame::new(800, 600, [0, 0, 0]);
+        draw(&mut frame, &art, &m, &laid, None);
+        assert_eq!(frame.pixel(field.x, field.y), Some(LABEL));
+        let mut far = laid.clone();
+        far.entry = Some(Rect::new(i32::MAX - 3, i32::MIN, i32::MAX, i32::MAX));
+        draw(&mut frame, &art, &m, &far, None);
+    }
+
+    #[test]
+    fn the_entry_takes_64_characters_and_no_control_characters() {
+        let mut m = message("B", 1);
+        assert!(!type_into(&mut m, 'a'));
+        assert!(!erase(&mut m));
+        m.entry = Some(String::new());
+        for _ in 0..70 {
+            type_into(&mut m, 'é');
+        }
+        assert_eq!(m.entry.as_ref().unwrap().chars().count(), ENTRY_MOST);
+        assert!(!type_into(&mut m, 'x'));
+        assert!(erase(&mut m));
+        assert!(!type_into(&mut m, '\n'));
+        assert!(type_into(&mut m, 'x'));
+        assert!(m.entry.as_ref().unwrap().ends_with('x'));
+        m.entry = Some(String::new());
+        assert!(!erase(&mut m));
+    }
+
+    #[test]
+    fn a_long_entry_stays_inside_its_field_with_the_caret_in_view() {
+        let font = crate::font::tests::font();
+        let field = Rect::new(10, 10, 30, 36);
+        let mut frame = Frame::new(100, 60, [0, 0, 0]);
+        draw_entry(&mut frame, &font, field, &"A".repeat(ENTRY_MOST));
+        for y in 0..60 {
+            for x in 0..100 {
+                if !field.contains(x, y) {
+                    assert_eq!(frame.pixel(x, y), Some([0, 0, 0]), "{x}, {y}");
+                }
+            }
+        }
+        // The caret 3 short of the inside's right edge: x 11 + 28 - 3.
+        assert!((11..45).any(|y| frame.pixel(36, y) == Some(LABEL)));
+        assert!((11..45).all(|y| frame.pixel(37, y) == Some([0, 0, 0])));
+        // A short entry starts 4 in, its caret right after it.
+        let mut frame = Frame::new(100, 60, [0, 0, 0]);
+        draw_entry(&mut frame, &font, field, "");
+        assert!((11..45).any(|y| frame.pixel(15, y) == Some(LABEL)));
+    }
+
+    #[test]
+    fn the_title_is_centered_on_the_last_passs_width() {
+        // With no icon the title is centered on the dialog's width as the
+        // search's last pass left it, not the width it ends at (0x5243b5).
+        let laid = layout([800, 600], &message("B", 1), &art()).unwrap();
+        assert_eq!(laid.title[0] - laid.rect.x, 106);
+        assert_eq!(laid.title[1] - laid.rect.y, 21);
+    }
+
+    #[test]
+    fn buttons_spread_evenly_across_the_text() {
+        // The text is at least 130 a button wide: 390 for three, so the
+        // dialog is 432, with gaps of (390 - 300) / 4 = 22 around them.
+        let laid = layout([800, 600], &message("B", 3), &art()).unwrap();
+        let r = laid.rect;
+        assert_eq!(r.width, 432);
+        let starts: Vec<i32> = laid.buttons.iter().map(|b| b.x - r.x).collect();
+        assert_eq!(starts, [21 + 22, 21 + 22 + 100 + 22, 21 + 22 + 200 + 44]);
+        // Two: (260 - 200) / 3 = 20.
+        let laid = layout([800, 600], &message("B", 2), &art()).unwrap();
+        let starts: Vec<i32> = laid.buttons.iter().map(|b| b.x - laid.rect.x).collect();
+        assert_eq!(laid.rect.width, 302);
+        assert_eq!(starts, [41, 161]);
+        // 18 under the text, and 21 from the bottom.
+        for b in &laid.buttons {
+            assert_eq!(b.y + b.height, laid.rect.y + laid.rect.height - 21);
+        }
+    }
+
+    #[test]
+    fn lines_go_beside_the_icon_then_under_it() {
+        let font = crate::font::tests::font();
+        let chars = |t: &str| t.chars().collect::<Vec<char>>();
+        // A 2-high line, a band of one line and 1 across: "B " beside
+        // (2 wide), then "B B" under it at the full 3.
+        let b = text_box(&font, &chars("B B B"), 3, [1, 2]);
+        assert_eq!(
+            (b.beside, b.below, b.height),
+            (vec!["B ".to_owned()], vec!["B B".to_owned()], 4)
+        );
+        // One line left over that fits beside the icon stays there.
+        let b = text_box(&font, &chars("B B"), 3, [1, 2]);
+        assert_eq!(b.beside, ["B ", "B"]);
+        assert!(b.below.is_empty());
+        assert_eq!(b.height, 4);
+        // All of it beside: the band's height.
+        let b = text_box(&font, &chars("B"), 3, [1, 6]);
+        assert_eq!((b.beside.len(), b.height), (1, 6));
+        // No text, no icon: nothing.
+        assert_eq!(text_box(&font, &[], 3, [0, 0]).height, 0);
+    }
+
+    #[test]
+    fn the_icons_band_rounds_to_whole_lines() {
+        // An icon 10 by 7: it reaches 7 + 18 past the text's top, which is
+        // 21 + 2 + 18 down, so 5, which rounds down to 2 lines (4).
+        let mut m = message(&vec!["B"; 2000].join(" "), 1);
+        m.icon = Some(Image {
+            width: 10,
+            height: 7,
+            rgba: vec![255; 10 * 7 * 4],
+        });
+        let laid = layout([800, 600], &m, &art()).unwrap();
+        let at: Vec<[i32; 2]> = laid
+            .lines
+            .iter()
+            .map(|(_, [x, y])| [x - laid.rect.x, y - laid.rect.y])
+            .collect();
+        assert_eq!(&at[..3], [[49, 41], [49, 43], [21, 45]]);
+        assert_eq!(laid.icon, Some([laid.rect.x + 21, laid.rect.y + 21]));
+    }
+
+    #[test]
+    fn the_width_is_searched_for_twice_the_height() {
+        // A dialog of a 2-high line per `B` 1 wide: the search ends within
+        // 20 of where the dialog is twice as wide as tall.
+        let text = vec!["B"; 400].join(" ");
+        let laid = layout([4000, 3000], &message(&text, 1), &art()).unwrap();
+        let r = laid.rect;
+        let ratio = f64::from(r.width) / f64::from(r.height);
+        assert!((1.8..2.4).contains(&ratio), "{r:?}");
+        // A short one grows to it: 21 + 2 + 18 + 2 + 18 + 33 + 21 = 115
+        // high, from 172 wide (the 130 one button needs and 42).
+        let laid = layout([800, 600], &message("B", 1), &art()).unwrap();
+        assert_eq!(laid.rect.height, 115);
+        assert!((210..=250).contains(&laid.rect.width), "{:?}", laid.rect);
     }
 
     #[test]
@@ -503,6 +999,7 @@ mod tests {
             icon: None,
             title: [0, 0],
             lines: Vec::new(),
+            entry: None,
             buttons: vec![
                 Rect::new(i32::MAX - 5, i32::MAX - 2, i32::MAX, 33),
                 Rect::new(i32::MIN, i32::MIN, i32::MAX, i32::MAX),
@@ -535,6 +1032,7 @@ mod tests {
             icon: None,
             title: [0, 0],
             lines: Vec::new(),
+            entry: None,
             buttons: vec![Rect::new(10, 150, 100, 33), Rect::new(128, 150, 100, 33)],
         };
         assert_eq!(

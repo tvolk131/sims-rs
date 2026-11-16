@@ -50,8 +50,9 @@
 //! The candidates keep the list's order (0x45bb04 appends each to a
 //! static vector), so the first one that agrees to move in step 2, and
 //! the first whose footprint holds a sample in step 3, are found in
-//! that order. An action that runs at once (interaction flag 4) and one
-//! that pushes queued actions out fail loudly.
+//! that order. An action that runs at once (interaction flag 4) fails
+//! loudly. One that goes in before queued actions drops them, each
+//! target told ([`Machine::queue_action`], 0x45d4c8).
 
 use crate::autonomy::{attenuation, find, person};
 use crate::fault::{Fault, Trap};
@@ -347,6 +348,82 @@ impl Machine<'_, '_> {
             .and_then(|o| o.person.as_ref())
             .and_then(|p| p.data.get(PRIORITY).copied())
             .ok_or_else(|| Trap::Invalid("the routing person has no data word 33".into()))?;
+        let Some(uid) = self.queue_move(asked, marker, i32::from(priority), wrap)? else {
+            return Ok(false);
+        };
+        ctx.byte_84 = false;
+        ctx.objects[1] = asked;
+        ctx.action = uid;
+        Ok(true)
+    }
+
+    /// Asks a person who is in the way of my Snap to move (0x45bd5e, from
+    /// 0x454e54), with `priority` the priority of my running action
+    /// (+0xa64). Returns whether the person was asked:
+    ///
+    /// 1. Not when the person's running or queued actions already include
+    ///    the marker's move interaction (0x45bec1), nor when the catalog
+    ///    has no marker type (0x43ac10).
+    /// 2. A marker is made (0x440b2d) and put at the person's position and
+    ///    level (virtual function 0x58), as for a route.
+    /// 3. Its first slot is written over: as for a route
+    ///    ([`move_slot`]), but with all four straight directions allowed
+    ///    (0, 2, 4 and 6: the calls to 0x46ddf1) and the resolution the
+    ///    slot starts with, 16 (0x46dd48), not 8. Nothing is planned.
+    /// 4. The person gets the marker's move action at that priority and
+    ///    it is queued, as for a route; if it cannot be, the marker is
+    ///    removed at once and the person is not asked.
+    pub(crate) fn ask_to_make_way(&mut self, asked: u16, priority: i32) -> Result<bool, Trap> {
+        if self.asked_to_move(asked)? || self.catalog.object(MARKER).is_none() {
+            return Ok(false);
+        }
+        let position = self
+            .world
+            .objects
+            .get(&asked)
+            .ok_or(Trap::native(10, "missing object"))?
+            .position;
+        let interpreter = self.interpreter();
+        let wrap = |fault: Fault| {
+            Trap::Unsupported(format!(
+                "asking person {asked} to make way for a Snap (0x45bd5e): {fault}"
+            ))
+        };
+        let marker = interpreter.create(self.world, MARKER).map_err(wrap)?;
+        let at = [position[0], position[1]];
+        interpreter
+            .put(
+                self.world,
+                marker,
+                Place {
+                    on_lot: on_lot(at),
+                    position: at,
+                    container: None,
+                    slot: -1,
+                    level: position[2],
+                },
+                true,
+            )
+            .map_err(wrap)?;
+        let mut slot = move_slot(0, false);
+        slot.flags |= 1 | 0x10;
+        slot.resolution = 16;
+        self.world.routing.slots.insert((marker, 0), slot);
+        Ok(self.queue_move(asked, marker, priority, wrap)?.is_some())
+    }
+
+    /// Gives a person asked to move the marker's move action at
+    /// `priority` and queues it (0x41f00e, 0x45d20b). Returns its number,
+    /// or None when it could not be queued, after removing the marker at
+    /// once (0x44123f).
+    fn queue_move(
+        &mut self,
+        asked: u16,
+        marker: u16,
+        priority: i32,
+        wrap: impl Fn(Fault) -> Trap,
+    ) -> Result<Option<i32>, Trap> {
+        let interpreter = self.interpreter();
         let visitor = self
             .world
             .objects
@@ -364,20 +441,17 @@ impl Machine<'_, '_> {
             icon: marker as i16,
             table_index: MOVE,
             args: [0; 4],
-            priority: i32::from(priority),
+            priority,
             action: entry.map_or(0, |e| e.action),
             attenuation: entry.map_or(0.0, |e| attenuation(&constants, visitor, e).to_f32()),
             flags: entry.map_or(0, |e| u32::from(e.flags & ENTRY_FLAG != 0)),
         };
         let at_once = entry.map(|e| e.flags & AT_ONCE != 0);
-        let Some(uid) = self.queue_action(asked, action, at_once)? else {
+        let uid = self.queue_action(asked, action, at_once)?;
+        if uid.is_none() {
             interpreter.remove_now(self.world, marker).map_err(wrap)?;
-            return Ok(false);
-        };
-        ctx.byte_84 = false;
-        ctx.objects[1] = asked;
-        ctx.action = uid;
-        Ok(true)
+        }
+        Ok(uid)
     }
 
     /// Whether a person's running action or a queued one is a marker's
@@ -407,8 +481,9 @@ impl Machine<'_, '_> {
     /// 0x41f158) and goes after every queued action of at least its
     /// priority. A full queue takes nothing. An action with flag 2 goes
     /// at the front instead ([`Machine::queue_at_front`]). One that goes
-    /// before queued actions (which are dropped, each object told with its
-    /// function 4) fails loudly.
+    /// before queued actions drops them, each target told with its
+    /// function 4 ([`Machine::drop_queued_from`]), and then goes at the
+    /// end as any other.
     ///
     /// An action queued, not at the front, on the person whose action runs
     /// at once, while it runs, is copied over the running action (0x45d5a5,
@@ -457,6 +532,14 @@ impl Machine<'_, '_> {
         if action.flags & TO_FRONT != 0 {
             return self.queue_at_front(id, action);
         }
+        let queue = &self.queue(id)?;
+        let mut at = queue.len();
+        while at > 0 && queue[at - 1].priority < action.priority {
+            at -= 1;
+        }
+        if at < queue.len() {
+            self.drop_queued_from(id, at)?;
+        }
         let queue = &mut self
             .world
             .objects
@@ -464,16 +547,6 @@ impl Machine<'_, '_> {
             .and_then(|o| o.person.as_mut())
             .ok_or(Trap::native(0x1c, "object is not a person"))?
             .queue;
-        let mut at = queue.len();
-        while at > 0 && queue[at - 1].priority < action.priority {
-            at -= 1;
-        }
-        if at < queue.len() {
-            return Err(unsupported(
-                "0x45d4c8",
-                "queueing an action before others, which are dropped",
-            ));
-        }
         // While the person's action runs at once, the new action is copied
         // over it, number and all, and is queued as well (0x45d5a5).
         if let Some(running) = self.running_at_once.filter(|r| r.person == id) {
@@ -490,6 +563,62 @@ impl Machine<'_, '_> {
         let uid = action.uid;
         queue.push(action);
         Ok(Some(uid))
+    }
+
+    /// The queue of person `id`.
+    fn queue(&self, id: u16) -> Result<&Vec<Interaction>, Trap> {
+        Ok(&self
+            .world
+            .objects
+            .get(&id)
+            .and_then(|o| o.person.as_ref())
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .queue)
+    }
+
+    /// Drops the queued actions of person `id` from place `kept` on, so
+    /// that a new action of a higher priority goes after the first `kept`
+    /// (0x45d4c8 to 0x45d5a0, in [`Machine::queue_action`]):
+    ///
+    /// 1. A queue of its own (0x45f71b) takes the first `kept` actions
+    ///    (0x45f744).
+    /// 2. From place `kept` to the end of the person's queue, its length
+    ///    read again at each place, each action's target (entry +8), when
+    ///    it names an object, is asked to run its function 4, the action
+    ///    cancelled, with the person as its stack object and no argument
+    ///    buffer (0x422d46).
+    /// 3. The person's queue is emptied and takes the kept actions back
+    ///    in order (0x45d54b to 0x45d58a).
+    ///
+    /// The original holds the target as a pointer; a target that names no
+    /// object here is taken as a null one and not asked.
+    fn drop_queued_from(&mut self, id: u16, kept: usize) -> Result<(), Trap> {
+        let saved: Vec<Interaction> = self.queue(id)?[..kept].to_vec();
+        let mut place = kept;
+        while let Some(action) = self.queue(id)?.get(place) {
+            let target = action.target;
+            if let Ok(target) = u16::try_from(target)
+                && target != 0
+                && self.world.objects.contains_key(&target)
+            {
+                self.interpreter()
+                    .callback(self.world, target, CANCELLED, id as i16)
+                    .map_err(|fault| {
+                        Trap::Unsupported(format!(
+                            "telling object {target} its queued action was dropped \
+                             (0x45d541): {fault}"
+                        ))
+                    })?;
+            }
+            place += 1;
+        }
+        self.world
+            .objects
+            .get_mut(&id)
+            .and_then(|o| o.person.as_mut())
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .queue = saved;
+        Ok(())
     }
 
     /// Puts an action, already numbered, at the front of a person's queue

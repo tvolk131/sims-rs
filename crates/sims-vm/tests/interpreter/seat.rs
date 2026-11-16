@@ -314,6 +314,11 @@ fn a_sit_tree_that_cannot_be_pushed_fails_loudly_and_leaves_the_route_as_it_was(
         .unwrap()[SIT]
         .action = SIT_TREE + 1;
     let result = go_to(&mut fx, me);
+    eprintln!(
+        "{result:?} {} {:?}",
+        route_result(&fx, me),
+        fx.world.routing.routes[&me].contexts.len()
+    );
     assert!(matches!(trap(result), sims_vm::Trap::Unsupported(m) if m.contains("0x45c4a8")),);
     let sim = &fx.world.objects[&me];
     assert!(sim.stack.iter().all(|frame| frame.tree != SIT_TREE + 1));
@@ -499,6 +504,11 @@ fn a_pet_looks_for_no_seat() {
         .unwrap();
     person.data[KIND] = 2;
     let result = go_to(&mut fx, me);
+    eprintln!(
+        "{result:?} {} {:?}",
+        route_result(&fx, me),
+        fx.world.routing.routes[&me].contexts.len()
+    );
     assert!(matches!(trap(result), sims_vm::Trap::Unsupported(ref m) if m.contains("0x46de84")),);
     assert!(!sat(&fx));
 }
@@ -600,4 +610,257 @@ fn with_no_door_to_go_through_the_route_gives_up_with_result_2() {
     assert!(gives_up(go_to(&mut fx, me)));
     assert!(!sat(&fx));
     assert_eq!(route_result(&fx, me), 2);
+}
+
+/// Go To Relative Position (opcode 27).
+const GO_TO_RELATIVE: u16 = 27;
+
+/// Runs Go To Relative Position as `me` with stack object `target`, to
+/// any place (location and facing 0xfe).
+fn go_relative(fx: &mut Fixture, me: u16, target: i16) -> Result<bool, sims_vm::Fault> {
+    let guid = fx.world.objects[&me].guid;
+    let file = fx.catalog.object(guid).unwrap().resource;
+    fx.add(
+        file,
+        TREE,
+        tree(vec![ins(
+            GO_TO_RELATIVE,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, 0xfe, 0xfe, 0, 0, 0, 0],
+        )]),
+    );
+    fx.run_with(me, TREE, target, &[], 100)
+}
+
+#[test]
+fn a_relative_route_whose_stack_object_is_gone_takes_the_false_branch_on_its_first_run() {
+    // 0x45adb5: before any context is made (0x45ae65).
+    for target in [0, 99] {
+        let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+        assert_eq!(go_relative(&mut fx, me, target), Ok(false), "{target}");
+        assert!(
+            fx.world
+                .routing
+                .routes
+                .get(&me)
+                .is_none_or(|route| route.contexts.is_empty())
+        );
+    }
+}
+
+/// The lot with the lamp a door (definition word 9 8) in room 0, the
+/// person being in room 1, and the person already on a route whose
+/// context goes through door `door`.
+fn to_a_door(door: u16) -> (Fixture, u16) {
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    fx.words(LAMP_FILE)[9] = 8;
+    fx.lamp_mut().data[29] = 0;
+    let mut outer = crate::visits::context(me);
+    outer.word_68 = i32::from(door);
+    outer.slot.flags |= 0x4000;
+    fx.world.routing.routes.insert(
+        me,
+        sims_sim::route::Route {
+            contexts: vec![outer],
+            path: Vec::new(),
+        },
+    );
+    (fx, me)
+}
+
+#[test]
+fn a_route_to_a_door_one_of_my_routes_goes_through_fails_with_result_1() {
+    // 0x45b140, 0x45b176: the slot is in another room, and its object is
+    // a door the outer route goes through (context +0x68). The route
+    // fails at once: result 1, the false branch, and its context goes.
+    let (mut fx, me) = to_a_door(LAMP);
+    assert!(gives_up(go_to(&mut fx, me)));
+    assert_eq!(route_result(&fx, me), 1);
+    let route = &fx.world.routing.routes[&me];
+    assert_eq!(route.contexts.len(), 1);
+    assert_eq!(route.contexts[0].word_68, i32::from(LAMP));
+}
+
+#[test]
+fn a_route_to_a_door_no_route_of_mine_goes_through_looks_for_a_way_in() {
+    // Through another door, the route goes on to choose a door into the
+    // slot's room (0x45b140); the lot has none, so it gives up with
+    // result 2 (0x45b036) rather than failing as above.
+    let (mut fx, me) = to_a_door(SEAT);
+    assert!(gives_up(go_to(&mut fx, me)));
+    assert_eq!(route_result(&fx, me), 2);
+}
+
+#[test]
+fn a_person_going_through_everything_plans_to_a_slot_outside_its_walled_room() {
+    // Bit 0 of person word 68: Go To Routing Slot looks for no door
+    // (0x45b140 is skipped), and the planner neither fails for a slot in
+    // another room (0x4824a0) nor keeps the room's own rectangles, walls
+    // included (0x4827e3). The lamp stands outside room 1, on tile (4, 2);
+    // the path leaves the walled room across its wall, and the route is
+    // under way, so the synchronous run cannot wait (error 0x44f).
+    // **Unverified** path: no capture covers such a person.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    set_slots(
+        &mut fx,
+        vec![Slot {
+            standing: 5,
+            sitting: 0,
+            ..seats_slot()
+        }],
+    );
+    fx.lamp_mut().position = [72, 40, 1];
+    fx.lamp_mut().data[29] = 0;
+    let person = fx.world.objects.get_mut(&me).unwrap();
+    person.person.as_mut().unwrap().data[68] = 1;
+    assert_eq!(code(go_to(&mut fx, me)), Some(0x44f));
+    assert_eq!(
+        fx.world.routing.routes[&me].path,
+        vec![[40, 40], [24, 72], [40, 72]]
+    );
+    // Without the bit, the route looks for a door into room 0; the lot
+    // has none, so it gives up with result 2 (0x45b036).
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    fx.lamp_mut().position = [72, 40, 1];
+    fx.lamp_mut().data[29] = 0;
+    assert!(gives_up(go_to(&mut fx, me)));
+    assert_eq!(route_result(&fx, me), 2);
+}
+
+#[test]
+fn a_search_that_reaches_no_goal_gives_up_with_result_3() {
+    // 0x482b35: the person stands at (72, 72), outside the walls of room
+    // 1, which its room word names, so the room's own rectangles leave no
+    // way to any of the four candidates (all with positive scores). The
+    // search ends with no goal: the chosen candidate is forgotten
+    // (0x481745; none was chosen, so nothing changes), the context's
+    // result is 3 and the planner answers false (0x482e6d). The route
+    // gives up with that result and its context goes.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    set_slots(
+        &mut fx,
+        vec![Slot {
+            standing: 5,
+            sitting: 0,
+            ..seats_slot()
+        }],
+    );
+    let person = fx.world.objects.get_mut(&me).unwrap();
+    person.position = [72, 72, 1];
+    person.footprint = [69, 69, 75, 75];
+    assert!(gives_up(go_to(&mut fx, me)));
+    assert_eq!(route_result(&fx, me), 3);
+    let route = &fx.world.routing.routes[&me];
+    assert!(route.contexts.is_empty() && route.path.is_empty());
+}
+
+/// A route context as the load makes it for a person saved part way
+/// through a route (0x460443): it names no object.
+fn loaded_context() -> sims_sim::route::Context {
+    sims_sim::route::Context {
+        candidates: Vec::new(),
+        slot: sims_sim::route::RouteSlot {
+            offset: [0; 3],
+            number: -1,
+            standing: 0,
+            sitting: 0,
+            ground: 0,
+            flags: 0,
+            snap_target: -1,
+            proximity: [16; 3],
+            gradient: 0x3e40_0000,
+            facing: -2,
+            resolution: 16,
+        },
+        target: 0,
+        person: 0,
+        chosen: -1,
+        best: -1,
+        word_58: 0,
+        time: 0,
+        saved: [0; 2],
+        word_68: 0,
+        start: [0; 3],
+        byte_78: true,
+        objects: [0; 2],
+        byte_84: false,
+        result: 0,
+        word_8c: 0,
+        byte_8e: false,
+        word_94: 0,
+        limit: 0x30,
+        action: 0,
+    }
+}
+
+/// `me`'s thread at Go To Routing Slot for the lamp's slot 0, at route
+/// step `state`. Its true branch marks `me`'s data word 50 with 1 and its
+/// false branch with 2; either then sleeps.
+fn walking(fx: &mut Fixture, me: u16, state: i32) {
+    let guid = fx.world.objects[&me].guid;
+    let file = fx.catalog.object(guid).unwrap().resource;
+    fx.add(
+        file,
+        TREE,
+        shaped(
+            0x8002,
+            0,
+            1,
+            0,
+            vec![
+                ins(GO_TO_SLOT, 1, 2, [0, 0, 1, 0, 0, 0, 0, 0]),
+                assign(scope::MY_DATA, MARK as i16, scope::LITERAL, 1, 3),
+                assign(scope::MY_DATA, MARK as i16, scope::LITERAL, 2, 3),
+                ins(0, RETURN_TRUE, RETURN_FALSE, [0; 8]),
+            ],
+        ),
+    );
+    fx.thread(me, TREE, &[100]);
+    let frame = &mut fx.world.objects.get_mut(&me).unwrap().stack[0];
+    frame.stack_object = LAMP as i16;
+    frame.primitive_state = state;
+}
+
+fn tick(fx: &mut Fixture, me: u16) {
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.tick_object(&mut fx.world, me).unwrap();
+}
+
+#[test]
+fn a_route_context_the_load_made_is_popped_and_the_route_starts_again() {
+    // 0x45ae71: the person was saved at route step 3 with two contexts.
+    // The run pops the last, which names no object, puts the step back to
+    // 0 and yields; the next run starts the route again on top of the
+    // context left.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    walking(&mut fx, me, 3);
+    fx.world.routing.routes.entry(me).or_default().contexts = vec![loaded_context(); 2];
+    tick(&mut fx, me);
+    let frame = &fx.world.objects[&me].stack[0];
+    assert_eq!((frame.node, frame.primitive_state), (0, 0));
+    assert_eq!(fx.world.routing.routes[&me].contexts, [loaded_context()]);
+    assert_eq!(fx.world.objects[&me].data[MARK], 0);
+    // The route runs as a fresh one: the person sits in the seat, the
+    // route's context is popped and the true branch is taken.
+    tick(&mut fx, me);
+    assert!(sat(&fx));
+    assert_eq!(fx.world.routing.routes[&me].contexts, [loaded_context()]);
+    assert_eq!(fx.world.objects[&me].data[MARK], 1);
+}
+
+#[test]
+fn a_route_with_no_context_or_no_object_gives_false() {
+    // 0x45ae65: past step 0 with no context left (a reset erased them),
+    // the run gives false and writes nothing.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    walking(&mut fx, me, 3);
+    tick(&mut fx, me);
+    assert_eq!(fx.world.objects[&me].data[MARK], 2);
+    assert!(!fx.world.routing.routes.contains_key(&me));
+    // At step 0 with the stack object off the lot, the same.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    fx.lamp_mut().position = [-16, -16, 1];
+    assert_eq!(go_to(&mut fx, me), Ok(false));
+    assert!(!fx.world.routing.routes.contains_key(&me));
 }

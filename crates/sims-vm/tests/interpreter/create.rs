@@ -361,6 +361,72 @@ fn mode_5_puts_the_new_object_where_the_running_object_stands() {
     assert_eq!(ids(&fx), before);
 }
 
+/// Runs the lamp's tree 4096: local 0 is set to `turn`, then Create New
+/// Object Instance of the widget in mode 9, its turn from local 0.
+fn create_in_front(fx: &mut Fixture, turn: i16) -> Result<bool, sims_vm::Fault> {
+    let [g0, g1, g2, g3] = WIDGET.to_le_bytes();
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![
+            assign(scope::LOCALS, 0, scope::LITERAL, turn, 1),
+            ins(
+                CREATE,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [g0, g1, g2, g3, 9, 0, 0, 0],
+            ),
+        ]),
+    );
+    fx.run_with(LAMP, 4096, 0, &[], 1000)
+}
+
+#[test]
+fn mode_9_puts_the_new_object_on_the_tile_in_front_of_me() {
+    // 0x44e157: the lamp on tile (2, 2) faces `facing`, turned by local
+    // 0. Directions 0, 2, 4 and 6 are one tile along position word 1
+    // back, word 0 on, word 1 on and word 0 back; an odd one is my own
+    // tile. Each place is open towards the lamp.
+    for (facing, turn, place) in [
+        (2, 0, [56, 40]),
+        (0, 2, [56, 40]),
+        (0, -6, [56, 40]),
+        (0, 4, [40, 56]),
+        (1, 0, [40, 40]),
+        (4, 3, [40, 40]),
+    ] {
+        let (mut fx, _) = container();
+        fx.lamp_mut().data[1] = facing;
+        let before = ids(&fx);
+        assert_eq!(create_in_front(&mut fx, turn), Ok(true), "{facing} {turn}");
+        let id = new_object(&fx, &before);
+        let widget = &fx.world.objects[&id];
+        assert_eq!(widget.position, [place[0], place[1], 1], "{facing} {turn}");
+        assert_eq!(widget.data[2], 0);
+    }
+}
+
+#[test]
+fn mode_9_makes_nothing_on_a_tile_walled_off_from_me() {
+    // Facing 0, the tile is (2, 1), whose wall segment 8 closes direction
+    // 4, the way back to me (0x4359ea). Facing 6, it is (1, 2), whose
+    // segment 4 closes direction 2.
+    for facing in [0, 6] {
+        let (mut fx, _) = container();
+        fx.lamp_mut().data[1] = facing;
+        let before = ids(&fx);
+        assert_eq!(create_in_front(&mut fx, 0), Ok(false), "{facing}");
+        assert_eq!(ids(&fx), before, "{facing}");
+    }
+    // Off the lot, nothing is made either: tile (1, 0) is on the border.
+    let (mut fx, _) = container();
+    fx.lamp_mut().position = [24, 8, 1];
+    fx.lamp_mut().data[1] = 0;
+    let before = ids(&fx);
+    assert_eq!(create_in_front(&mut fx, 0), Ok(false));
+    assert_eq!(ids(&fx), before);
+}
+
 #[test]
 fn flag_0x10_puts_my_temp_0_in_the_new_objects_bottom_frame() {
     // 0x44e8e1 to 0x44e90c: without 0x2, the running object's temp 0
@@ -444,7 +510,7 @@ fn what_mode_4_does_not_port_fails_loudly() {
         assert_eq!(ids(&fx), before, "word {word}");
     }
     // The modes not ported.
-    for mode in [0, 1, 3, 7, 9, 15] {
+    for mode in [0, 1, 3, 7, 10, 15] {
         let (mut fx, _) = container();
         let result = create(&mut fx, mode, 0, LAMP as i16);
         assert!(

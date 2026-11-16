@@ -9,7 +9,7 @@
 //! Operands: the GUID (bytes 0..4), where the object goes (byte 4), flags
 //! (byte 5) and a local (byte 6). The jump table at 0x44e92e picks where
 //! the object goes; every mode then runs one common tail (0x44e4c5) that
-//! tests the place, makes the object and puts it there. Five modes are
+//! tests the place, makes the object and puts it there. Six modes are
 //! ported:
 //!
 //! - Mode 2 (0x44e22f), with no flag or any of 0x1, 0x4 and 0x10: the new
@@ -27,6 +27,9 @@
 //! - Mode 8 (0x44e430), with no flag or any of 0x1, 0x4, 0x10 and 0x20: the new
 //!   object goes where the object the local names stands. See
 //!   `Machine::create_at_local`.
+//! - Mode 9 (0x44e157), with the same flags: the new object goes on the
+//!   tile in front of me, turned by a local, unless that tile is closed
+//!   off towards me. See `Machine::create_in_front`.
 //!
 //! Flag 0x4 does two things. At the start (0x44e0e6) the type is not the
 //! GUID operand's but that of the neighbor record the stack object names
@@ -51,6 +54,20 @@
 //! (however deep) by one that does, nothing is made and the false branch
 //! is taken. See `Machine::same_type_on_tile`.
 //!
+//! The person test (0x44e6b6 to 0x44e727) is left out. When the new
+//! object is a person (definition type 2) with bit 0 of person word 84
+//! (+0x634) or 68 (+0x614) set, or bit 0 or 1 of word 74 (+0x620), the
+//! original calls 0x45810c with 1, then sets bit 0x20000000 of the
+//! screen's flags (`[[0x6f2a58]+0xb0]+0xc`, 0x4ceceb). 0x45810c looks
+//! its type's handle up (0x4eb0eb) in the table at 0x6f2698 (0x44-byte
+//! entries, which only the interface code reads) and, when it is there,
+//! resets seven of the entry's members (0x4e895e, 0x5a5f79) and sets the
+//! same screen flag. Nothing the sim reads is written, so the port does
+//! nothing.
+//! **Unverified** that the table is only what is drawn: no capture covers
+//! a person made with these words set (the Goth house's tick 30320,
+//! object 243 making person 36).
+//!
 //! The object is made by [`crate::Interpreter::create`] (0x440b2d), or a
 //! person by [`crate::Interpreter::create_person`], so its Init and first
 //! turn have run before it is placed. It becomes the stack object and the
@@ -58,7 +75,7 @@
 //!
 //! Mode 8 making a person is what the Goth house's tick 6 does (object
 //! 382 makes person 259). The state after it, and after ticks 7 to 13 in
-//! which that person runs, equals the capture's (`docs/decisions.md`).
+//! which that person runs, equals the capture's (`docs/decisions/`).
 //! Mode 6 with flag 0x4 is what its tick 3603 does (object 354, tree
 //! 0x1022, makes two neighbors' people off the lot), which is
 //! **unverified**: there is no capture past tick 1000.
@@ -72,7 +89,8 @@ use crate::factory::TURN_BUDGET;
 use crate::factory::word::{GROUP, TYPE};
 use crate::fault::Trap;
 use crate::interpreter::Machine;
-use crate::placement::{Place, on_lot, standing_on};
+use crate::placement::{Place, closed_directions, on_lot, standing_on};
+use crate::visits::function;
 use sims_sim::World;
 use sims_sim::rooms::NO_ROOM;
 
@@ -105,6 +123,9 @@ const PERSON: i16 = 2;
 /// Data word 29: the room an object is in (object +0x84).
 const ROOM: usize = 29;
 
+/// The scope mode 9 reads its turn from (0x44e164): a local.
+const LOCAL_SCOPE: u8 = 0x19;
+
 /// Where mode 6 leaves the new object (0x44e4b5): off the lot, on level 1.
 const OFF_LOT: ([i32; 2], i32) = ([-16, -16], 1);
 
@@ -114,7 +135,7 @@ impl Machine<'_, '_> {
         let (mode, flags) = (operands[4], operands[5]);
         let supported = match mode {
             2 | 4 => flags & !(NOT_BESIDE_ITS_TYPE | FROM_RECORD | TEMP_0_TO_NEW) == 0,
-            5 | 6 | 8 => {
+            5 | 6 | 8 | 9 => {
                 flags & !(NOT_BESIDE_ITS_TYPE | FACE_AS_STACK_OBJECT | FROM_RECORD | TEMP_0_TO_NEW)
                     == 0
             }
@@ -145,9 +166,10 @@ impl Machine<'_, '_> {
             5 => {
                 // 0x44e3e9: where I stand, on my level (+0x110, 0x44e132).
                 let [p0, p1, level] = self.me()?.position;
-                self.create_at(guid, flags, [p0, p1], level)
+                self.create_at(guid, flags, [p0, p1], level, None)
             }
             8 => self.create_at_local(guid, flags, operands[6] as i8),
+            9 => self.create_in_front(guid, flags, operands[6] as i8),
             _ => self.create_off_lot(guid, flags),
         }
     }
@@ -164,9 +186,8 @@ impl Machine<'_, '_> {
     ///    path and then takes its record's interests and personality
     ///    ([`Machine::make_person`], 0x44e608).
     /// 4. Flag 0x20 turns it ([`Machine::face_as_stack_object`]).
-    /// 5. A new person with bit 0 of person word 84 or 68 set, or bit 0 or
-    ///    1 of word 74, goes through 0x45810c, which is not ported and
-    ///    fails ([`Machine::check_new_person`]).
+    /// 5. A new person's person test (see the module's note) touches only the
+    ///    screen, and is left out.
     /// 6. The place test and the put are skipped (0x44e72c): the object
     ///    stays off the lot where it was made.
     /// 7. Flag 0x4 runs a visitor's "init visitor" tree
@@ -186,7 +207,6 @@ impl Machine<'_, '_> {
         if flags & FACE_AS_STACK_OBJECT != 0 {
             self.face_as_stack_object(created, person)?;
         }
-        self.check_new_person(created)?;
         self.finish_new(created, flags)
     }
 
@@ -442,6 +462,7 @@ impl Machine<'_, '_> {
                 level,
             },
             flags,
+            false,
         )
     }
 
@@ -483,9 +504,8 @@ impl Machine<'_, '_> {
     ///    object. Only the case with nothing to turn is ported; a turn
     ///    (0x433f75, which redraws, updates seats and the walls beside)
     ///    fails loudly.
-    /// 6. A new person with bit 0 of person word 84 or 68 set, or bit 0 or
-    ///    1 of word 74, goes through 0x45810c, which is not ported and
-    ///    fails.
+    /// 6. A new person's person test (see the module's note) touches only the
+    ///    screen, and is left out.
     /// 7. The place test (virtual function 0x54, with no container) at the
     ///    exact position. If it refuses, the new object is removed at once
     ///    (0x44123f) and the false branch is taken. Removing a person is
@@ -518,7 +538,42 @@ impl Machine<'_, '_> {
             return Ok(false);
         };
         let [p0, p1, level] = reference.position;
-        self.create_at(guid, flags, [p0, p1], level)
+        self.create_at(guid, flags, [p0, p1], level, None)
+    }
+
+    /// Mode 9 of 0x44e0c8 (0x44e157, then the common tail): the tile in
+    /// front of me, turned by a local.
+    ///
+    /// 1. The turn is local `local` (0x453141 with scope 0x19, the byte
+    ///    sign-extended); the direction is my data word 1 (+0x4c) plus the
+    ///    turn, taken mod 8 (a signed remainder masked with 7).
+    /// 2. Directions 0, 2, 4 and 6 move the place one tile (0x422022, 16
+    ///    units) from where I stand, on my level (+0x110): to my position
+    ///    word 1 less 16, word 0 plus 16, word 1 plus 16 and word 0 less
+    ///    16. An odd direction does not move it.
+    /// 3. The facing the tail tests (`[ebp-0x1c]`) is my facing plus the
+    ///    turn plus 4, as a signed remainder of 8, so it may be negative:
+    ///    the way back towards me. The new object does not take it.
+    /// 4. The tail is mode 5's ([`Machine::create_at`]), with one more
+    ///    test after the place is found on the lot (0x44e5ae): if the
+    ///    tile is closed off in that facing (bit 0 of
+    ///    [`crate::placement::closed_directions`], 0x4359ea), nothing is
+    ///    made and the false branch is taken.
+    fn create_in_front(&mut self, guid: u32, flags: u8, local: i8) -> Result<bool, Trap> {
+        let turn = i32::from(self.read(LOCAL_SCOPE, i16::from(local))?);
+        let me = self.me()?;
+        let [p0, p1, level] = me.position;
+        let direction = i32::from(me.data[1]) + turn;
+        let (step0, step1) = match (direction % 8) & 7 {
+            0 => (0, -1),
+            2 => (1, 0),
+            4 => (0, 1),
+            6 => (-1, 0),
+            _ => (0, 0),
+        };
+        let position = [p0.wrapping_add(step0 * 16), p1.wrapping_add(step1 * 16)];
+        let facing = (direction + 4) % 8;
+        self.create_at(guid, flags, position, level, Some(facing))
     }
 
     /// Modes 5 and 8 of 0x44e0c8 from the position and level the mode
@@ -529,6 +584,7 @@ impl Machine<'_, '_> {
         flags: u8,
         position: [i32; 2],
         level: i32,
+        facing: Option<i32>,
     ) -> Result<bool, Trap> {
         if flags & NOT_BESIDE_ITS_TYPE != 0 && self.same_type_on_tile(guid, position, level)? {
             return Ok(false);
@@ -536,18 +592,32 @@ impl Machine<'_, '_> {
         if self.off_lot(position) {
             return Ok(false);
         }
+        if let Some(facing) = facing {
+            let tile = [
+                (position[0] >> 4) as i8,
+                (position[1] >> 4) as i8,
+                level as i8,
+            ];
+            if closed_directions(self.world, tile, facing)? & 1 != 0 {
+                return Ok(false);
+            }
+        }
         let words = self.definition_words(guid)?;
         let person = words[TYPE] == PERSON;
-        if words[GROUP] != 0 {
-            return Err(Trap::Unsupported(format!(
-                "Create New Object Instance placing an object of type 0x{guid:08X}, \
-                 which belongs to a group, is not ported"
-            )));
-        }
         let created = if person {
             self.make_person(guid)?
         } else {
             self.make(guid)?
+        };
+        if flags & FACE_AS_STACK_OBJECT != 0 {
+            self.face_as_stack_object(created, person)?;
+        }
+        let dynamic = self.dynamic_group(created)?;
+        let position = if dynamic {
+            // 0x44e770: the place is the middle of its tile.
+            position.map(|p| (p & !7) | 8)
+        } else {
+            position
         };
         let place = Place {
             on_lot: on_lot(position),
@@ -556,10 +626,24 @@ impl Machine<'_, '_> {
             slot: -1,
             level,
         };
-        if flags & FACE_AS_STACK_OBJECT != 0 {
-            self.face_as_stack_object(created, person)?;
-        }
-        self.place_new(created, place, flags)
+        self.place_new(created, place, flags, dynamic)
+    }
+
+    /// The tail's group test (0x44e736 to 0x44e76e, again at 0x44e7c3):
+    /// the new object's own definition word 10 (+0x118 +0x14) is not 0,
+    /// it is a tile of a group (the cast to 0x6c0ef8), and its type has
+    /// callback function 8 (0x42344e).
+    fn dynamic_group(&self, created: u16) -> Result<bool, Trap> {
+        let interpreter = self.interpreter();
+        Ok(interpreter.words(self.world, created)?[GROUP] != 0
+            && self
+                .world
+                .objects
+                .get(&created)
+                .ok_or(Trap::native(10, "missing object"))?
+                .multipart
+                .is_some()
+            && interpreter.has_function(self.world, created, function::DYNAMIC_GROUP))
     }
 
     /// Flag 0x20 (0x44e640 to 0x44e6b4), for the object `created` just
@@ -626,13 +710,17 @@ impl Machine<'_, '_> {
     }
 
     /// The tail's last steps (from 0x44e6b6) for the object `created` just
-    /// made: the person test ([`Machine::check_new_person`]), then the
-    /// place test of `place` (virtual function 0x54: on the ground, or in
+    /// made: the place test of `place` (virtual function 0x54: on the ground, or in
     /// the container's slot), and the put (virtual function 0x58). A
     /// refusal removes the new object at once (0x44123f) and takes the
     /// false branch; otherwise the tail ends ([`Machine::finish_new`]).
-    fn place_new(&mut self, created: u16, place: Place, flags: u8) -> Result<bool, Trap> {
-        self.check_new_person(created)?;
+    fn place_new(
+        &mut self,
+        created: u16,
+        place: Place,
+        flags: u8,
+        dynamic: bool,
+    ) -> Result<bool, Trap> {
         let interpreter = self.interpreter();
         let unsupported = |fault| {
             Trap::Unsupported(format!(
@@ -659,27 +747,11 @@ impl Machine<'_, '_> {
         interpreter
             .put(self.world, created, place, true)
             .map_err(unsupported)?;
-        self.finish_new(created, flags)
-    }
-
-    /// The tail's person test (0x44e6b6 to 0x44e727): a new person with
-    /// bit 0 of person word 84 or 68 set, or bit 0 or 1 of word 74, goes
-    /// through 0x45810c, which is not ported and fails.
-    fn check_new_person(&self, created: u16) -> Result<(), Trap> {
-        if let Some(person) = self
-            .world
-            .objects
-            .get(&created)
-            .and_then(|o| o.person.as_ref())
-        {
-            let word = |index: usize| person.data.get(index).copied().unwrap_or(0);
-            if word(84) & 1 != 0 || word(68) & 1 != 0 || word(74) & 3 != 0 {
-                return Err(Trap::Unsupported(format!(
-                    "Create New Object Instance making person {created}, whose person word 84, \
-                     68 or 74 is set: 0x45810c is not ported"
-                )));
-            }
+        if dynamic {
+            interpreter
+                .join_neighbours(self.world, created)
+                .map_err(unsupported)?;
         }
-        Ok(())
+        self.finish_new(created, flags)
     }
 }

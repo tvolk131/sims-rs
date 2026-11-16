@@ -16,10 +16,12 @@ use sims_ui::art::Art;
 use sims_ui::command::{Command, Panel as UiPanel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
-use sims_ui::household::{Careers, Faces, Snapshot};
+use sims_ui::house;
+use sims_ui::household::{Acquaintances, Careers, Faces, Snapshot};
 use sims_ui::hud::{self, Controls, Item};
 use sims_ui::pie;
 use sims_ui::queue::Queue;
+use sims_ui::thumbnail::{self, Thumbnails};
 use sims_vm::SoundEvent;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -41,12 +43,20 @@ pub const CLICK: &str = "UI_click";
 pub struct Hud {
     pub art: Art,
     faces: Faces,
+    /// The catalog pictures of the object types the queue has shown.
+    thumbnails: Thumbnails,
+    /// What could not be read while drawing, until the game takes it.
+    problems: Vec<String>,
     /// The careers of `work.iff`, for what the job panel shows the next
     /// level needs.
     careers: Careers,
-    /// The autonomy tuning's friendship threshold (0x6c4398), for the
-    /// relationship panel's smileys.
-    friendship: i32,
+    /// The curves and constants the house panel's ratings are worked out
+    /// with.
+    house: house::Tuning,
+    /// What the relationship panel needs from outside the world: the
+    /// autonomy tuning's friendship threshold (0x6c4398) for its
+    /// smileys, the neighborhood's characters, and the Superstar pack.
+    known: Acquaintances,
     labels: Labels,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
@@ -88,6 +98,7 @@ impl Hud {
             .chain(&dialog::RESOURCES)
             .chain(&pie::RESOURCES)
             .chain(&sims_ui::queue::RESOURCES)
+            .chain(&thumbnail::RESOURCES)
             .copied()
             .collect();
         let art = Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
@@ -116,11 +127,22 @@ impl Hud {
         let faces =
             Faces::load(assets.index(), assets.catalog(), &people).map_err(|e| e.to_string())?;
         let careers = Careers::load(assets.index()).map_err(|e| e.to_string())?;
+        let house =
+            house::Tuning::load(assets.index(), assets.catalog()).map_err(|e| e.to_string())?;
+        let known = Acquaintances::read(
+            assets.index(),
+            assets.catalog(),
+            install.expansions,
+            friendship,
+        );
         Ok(Self {
             art,
             faces,
+            thumbnails: Thumbnails::default(),
+            problems: Vec::new(),
             careers,
-            friendship,
+            house,
+            known,
             labels,
             members,
             // The strip opens as if Live had been pressed.
@@ -166,23 +188,26 @@ impl Hud {
     /// What the panel shows of `world`: the household with what the next
     /// level of each one's career needs, and, while the relationship
     /// panel is open, the people the selected Sim knows (read only then:
-    /// the lookup goes through every neighborhood record).
+    /// the lookup goes through every neighborhood record), or while the
+    /// house panel shows (the strip open on it), the house's ratings.
     pub fn snapshot(&self, world: &World) -> Snapshot {
         let snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
-        if self.controls.panel == UiPanel::Relationships {
-            snapshot.with_relations(world, &self.members, self.friendship)
-        } else {
-            snapshot
+        match self.controls.panel {
+            UiPanel::Relationships => snapshot.with_relations(world, &self.members, &self.known),
+            UiPanel::House if self.controls.expanded => snapshot.with_house(world, &self.house),
+            _ => snapshot,
         }
     }
 
     /// Draws the panel over the lot in `canvas`, from `world` as it is
     /// now, with the speed of `pace`, and `status` (a line across the
     /// top) if there is one; the dialog is the one [`Hud::read_dialog`]
-    /// last read.
+    /// last read. The catalog pictures the queue shows are read from
+    /// `assets` the first time each type shows.
     pub fn draw(
         &mut self,
         world: &World,
+        assets: &Assets,
         view: &View,
         pace: &Pace,
         status: Option<&str>,
@@ -206,6 +231,15 @@ impl Hud {
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         self.queue = Queue::read(world, snapshot.selected);
         self.pressed.keep(&self.queue);
+        let objects: Vec<u32> = self.queue.objects().collect();
+        for guid in objects {
+            // A type whose picture fails is kept as the error left it
+            // (`Thumbnails::read`), and not read again.
+            if let Err(e) = self.thumbnails.read(assets.index(), assets.catalog(), guid) {
+                self.problems
+                    .push(format!("the catalog picture of type 0x{guid:08X}: {e}"));
+            }
+        }
         let (width, height) = (
             u32::try_from(canvas.width).unwrap_or(u32::MAX),
             u32::try_from(canvas.height).unwrap_or(u32::MAX),
@@ -224,7 +258,8 @@ impl Hud {
             &self.items,
             &self.controls,
         );
-        self.queue.draw(&mut frame, &self.art, &self.faces);
+        self.queue
+            .draw(&mut frame, &self.art, &self.faces, &self.thumbnails);
         self.dialog = self
             .message
             .as_ref()
@@ -297,6 +332,16 @@ impl Hud {
         &self.queue
     }
 
+    /// The catalog pictures read so far.
+    pub fn thumbnails(&self) -> &Thumbnails {
+        &self.thumbnails
+    }
+
+    /// What could not be read while drawing since this was last asked.
+    pub fn take_problems(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.problems)
+    }
+
     /// The interface's sounds since the last call.
     pub fn take_sounds(&mut self) -> Vec<SoundEvent> {
         std::mem::take(&mut self.sounds)
@@ -351,12 +396,14 @@ impl Hud {
         };
         let before = (
             hud::hovered(&self.items, self.controls.pointer),
+            hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
             entry(self.controls.pointer),
         );
         self.controls.pointer = Some(point);
         (
             hud::hovered(&self.items, self.controls.pointer),
+            hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
             entry(self.controls.pointer),
         ) != before

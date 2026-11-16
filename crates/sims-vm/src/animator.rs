@@ -241,21 +241,42 @@ impl Interpreter<'_> {
             self.update_carry(world, id, a, now)?;
         }
         a.skin_clock = now;
-        self.note_translations(world, id, a)
+        // The pose the load left (World::held_poses) lasts until the skin
+        // samples a layer: from here the bones are what the layers playing
+        // now write, and what they do not write is what the load's layers
+        // left, which is no longer kept. The bones those moved count as
+        // moved since the skin was made.
+        if (a.base.is_filled() || a.foreground.is_some() || a.carry.is_some())
+            && let Some(held) = world.held_poses.remove(&id)
+        {
+            let moved = self.translated_by(id, held.layers.iter())?;
+            Self::note_moved(world, id, moved);
+        }
+        let base = world.base_layers.get(&id);
+        let moved = self.translated_by(
+            id,
+            [base, a.foreground.as_ref(), a.carry.as_ref()]
+                .into_iter()
+                .flatten(),
+        )?;
+        Self::note_moved(world, id, moved);
+        Ok(())
     }
 
-    /// Notes in [`World::translated_bones`] the bones whose translation a
-    /// layer of person `id`'s skin could have written at its update:
-    /// every motion with positions of each layer with something bound,
-    /// frames and weight (0x597c4c, 0x598226). The original samples only
-    /// when its update is asked to pose (0x59820a), and a motion's
-    /// positions only up to the clip's count; neither is told apart here,
-    /// so the set may hold more than the original moved.
-    fn note_translations(&self, world: &mut World, id: u16, a: &Animator) -> Result<(), Trap> {
-        let base = world.base_layers.get(&id);
-        let layers = [base, a.foreground.as_ref(), a.carry.as_ref()];
+    /// The bones whose translation a layer of person `id`'s skin could
+    /// write at its update, for [`World::translated_bones`]: every motion
+    /// with positions of each of `layers` with something bound, frames and
+    /// weight (0x597c4c, 0x598226). The original samples only when its
+    /// update is asked to pose (0x59820a), and a motion's positions only
+    /// up to the clip's count; neither is told apart here, so the set may
+    /// hold more than the original moved.
+    pub(crate) fn translated_by<'l>(
+        &self,
+        id: u16,
+        layers: impl Iterator<Item = &'l Layer>,
+    ) -> Result<Vec<String>, Trap> {
         let mut moved = Vec::new();
-        for layer in layers.into_iter().flatten() {
+        for layer in layers {
             if !layer.bound || layer.frames == 0 || layer.weight.ext() <= Ext::ZERO {
                 continue;
             }
@@ -269,19 +290,21 @@ impl Interpreter<'_> {
                 clip.channels
                     .iter()
                     .filter(|c| c.translation.is_some())
-                    .map(|c| &c.bone),
+                    .map(|c| c.bone.clone()),
             );
         }
+        Ok(moved)
+    }
+
+    /// Notes `moved` in person `id`'s [`World::translated_bones`].
+    pub(crate) fn note_moved(world: &mut World, id: u16, moved: Vec<String>) {
         if moved.is_empty() {
-            return Ok(());
+            return;
         }
         let known = world.translated_bones.entry(id).or_default();
         for bone in moved {
-            if !known.contains(bone) {
-                known.insert(bone.clone());
-            }
+            known.insert(bone);
         }
-        Ok(())
     }
 
     /// Person `id`'s animator refresh as a take-off makes it when the
@@ -516,6 +539,11 @@ const REDISPATCH: usize = 16;
 const NAMES: u16 = 150;
 const CHILD_NAMES: u16 = 151;
 const ADULT_NAMES: u16 = 152;
+/// The tables for a person whose word 64 is set (in a pool, 0x58da12),
+/// at indices 10 to 12 (0x59d974): the adult's by sex (158, 159), then
+/// the child's (160).
+const POOL_NAMES: u16 = 158;
+const POOL_CHILD_NAMES: u16 = 160;
 /// The type's own table of clip names, read first (0x457b84: STR# 0x96
 /// of the definition's file).
 const OWN_NAMES: u16 = 150;
@@ -1118,10 +1146,15 @@ impl Interpreter<'_> {
     }
 
     /// The name of one of the posture's clips (0x59db2f), counted from 0:
-    /// the type's own table first; then, for a person whose word 64 is
-    /// set, the special tables (not ported); then the global table for the
-    /// person's age (word 58 at most 17) or, for an adult, sex (bit 0 of
-    /// word 65); then the global table 150. An empty name counts as none.
+    /// the type's own table first; then the global table for the person's
+    /// age (word 58 at most 17) or, for an adult, sex (bit 0 of word 65);
+    /// then the global table 150. An empty name counts as none.
+    ///
+    /// For a person whose word 64 is set (in a pool) the pool's table for
+    /// its age or sex (158, 159, 160) comes first instead, and the type's
+    /// own table is not used: the lookup there replaces the own table's
+    /// name whatever it finds (0x59dba7 to 0x59dbbc), and when it finds
+    /// none the lookup goes on to the global tables (0x59dbba, 0x59dbbe).
     /// The old prototype's `posture_name`
     /// (legacy/crates/sims-vm/src/animation.rs) reads the same tables.
     pub(crate) fn posture_clip(
@@ -1130,12 +1163,7 @@ impl Interpreter<'_> {
         id: u16,
         selection: usize,
     ) -> Result<Option<String>, Trap> {
-        if person_word(world, id, SPECIAL)? != 0 {
-            return Err(unsupported(
-                "0x59db44",
-                "names a clip for a person whose word 64 is set",
-            ));
-        }
+        let pool = person_word(world, id, SPECIAL)? != 0;
         let object = world
             .objects
             .get(&id)
@@ -1152,15 +1180,25 @@ impl Interpreter<'_> {
                 .filter(|name| !name.is_empty())
                 .cloned()
         };
-        if let Some(name) = lookup(definition.resource, OWN_NAMES) {
+        let child = person_word(world, id, AGE)? <= 17;
+        let global = self.program.global;
+        if pool {
+            let table = if child {
+                POOL_CHILD_NAMES
+            } else {
+                POOL_NAMES + (person_word(world, id, KIND)? as u16 & 1)
+            };
+            if let Some(name) = lookup(global, table) {
+                return Ok(Some(name));
+            }
+        } else if let Some(name) = lookup(definition.resource, OWN_NAMES) {
             return Ok(Some(name));
         }
-        let table = if person_word(world, id, AGE)? <= 17 {
+        let table = if child {
             CHILD_NAMES
         } else {
             ADULT_NAMES + (person_word(world, id, KIND)? as u16 & 1)
         };
-        let global = self.program.global;
         Ok(lookup(global, table).or_else(|| lookup(global, NAMES)))
     }
 
@@ -1816,6 +1854,25 @@ impl Interpreter<'_> {
         }
         a.position[0] = x.to_f32();
         a.position[1] = y.to_f32();
+        // 0x58eeeb: a route under way that was asked to stop
+        // ([`ask_stop`]) stops here, unless its foreground clip may not be
+        // interrupted (layer +0x68 0): the route ends blocked (3, 0x58f682)
+        // and the update goes to its tail.
+        if world.stops_asked.contains(&id)
+            && a.arrival == 1
+            && a.foreground
+                .as_ref()
+                .is_none_or(|layer| layer.interruptible != 0)
+        {
+            if person_word(world, id, SPECIAL)? != 0 {
+                return Err(unsupported(
+                    "0x58ef2f",
+                    "stops its route where it was asked to, for a person whose word 64 is set",
+                ));
+            }
+            a.arrival = BLOCKED;
+            return Ok(false);
+        }
         Ok(true)
     }
 
@@ -1851,9 +1908,9 @@ impl Interpreter<'_> {
     ///    is moved onto the path ([`snap_to_path`], all its segments).
     /// 3. If the person fits there (virtual function 0x54) it is put there
     ///    (virtual function 0x88, [`Self::put_person`]). A person that does
-    ///    not fit would have the animator's position unset (virtual
-    ///    function 0x20) and be put back on its own tile with result 0;
-    ///    that fails loudly.
+    ///    not fit has the animator's position unset (virtual function 0x20
+    ///    with 1, 0x589361; byte +0xd9, which it also sets, is not kept)
+    ///    and is put back on its own tile (0x589dee), and the result is 0.
     pub(crate) fn route_result(&self, world: &mut World, id: u16) -> Result<i32, Trap> {
         let a = world
             .animators
@@ -1882,10 +1939,19 @@ impl Interpreter<'_> {
             .position[2];
         let to = [first, second];
         if !self.fits(world, id, to, level).map_err(|f| f.trap)? {
-            return Err(unsupported(
-                "0x589dee",
-                "ends its route where its person does not fit",
-            ));
+            // 0x589dee: the animator's position is unset (virtual function
+            // 0x20 with 1, 0x589361), and the person is put back on its
+            // own tile.
+            if let Some(a) = world.animators.get_mut(&id) {
+                a.position = [UNSET; 3];
+            }
+            let own = world
+                .objects
+                .get(&id)
+                .ok_or_else(|| Trap::native(10, "missing object"))?
+                .position;
+            self.put_person(world, id, [own[0], own[1]], level)?;
+            return Ok(0);
         }
         self.put_person(world, id, to, level)?;
         Ok(1)
@@ -2128,6 +2194,7 @@ impl Interpreter<'_> {
         let scale = (ONE.ext() * SCALE_UNIT.ext()).single().to_i32_truncate();
         set_datum(world, id, SCALE_WORD, scale as i16)?;
         a.arrival = 1;
+        world.stops_asked.remove(&id);
         a.motion.progress = F32::ZERO;
         a.motion.segment = 0;
         a.motion.near_end = 0;
@@ -2215,10 +2282,12 @@ fn end_turn(world: &mut World, id: u16, a: &mut Animator) -> Result<(), Trap> {
 
 /// The animator stops following its route (0x589e2d), as the route's
 /// steps 9 and 10 and its end ask. While the route is under way (its end,
-/// +0x188, is 1 or -1) nothing stops: +0x284 is set to 1, which nothing
-/// ported reads, and the answer is false. Otherwise the end becomes 0,
+/// +0x188, is 1 or -1) nothing stops: +0x284 is set to 1, the request
+/// [`ask_stop`] keeps, and the answer is false. Otherwise the end becomes 0,
 /// the segment -1, the destination the position, and the animator
 /// stands (state 3); the answer is true.
+///
+/// Callers on a lot use [`ask_stop`], which keeps the request.
 ///
 /// The timer of a stop at the end of a path (+0x1c0) becomes 0 too
 /// (0x589e56). The original also sets +0x18c to 1 and the global
@@ -2233,6 +2302,21 @@ pub(crate) fn stop_route(a: &mut Animator) -> bool {
     a.destination = a.position;
     a.state = 3;
     true
+}
+
+/// Person `id`'s animator stops following its route ([`stop_route`],
+/// 0x589e2d). A route under way does not stop, and the request is kept
+/// ([`World::stops_asked`], +0x284) for the walk's next step.
+pub(crate) fn ask_stop(world: &mut World, id: u16) -> Result<bool, Trap> {
+    let animator = world
+        .animators
+        .get_mut(&id)
+        .ok_or_else(|| Trap::Invalid(format!("person {id} has no animator")))?;
+    let stopped = stop_route(animator);
+    if !stopped {
+        world.stops_asked.insert(id);
+    }
+    Ok(stopped)
 }
 
 /// The start of a stop at the end of a path, with no timer set yet
@@ -2565,6 +2649,27 @@ mod tests {
         assert!(stop_route(&mut a));
         assert_eq!((a.arrival, a.motion.segment, a.state), (0, -1, 3));
         assert_eq!(a.destination, a.position);
+    }
+
+    #[test]
+    fn a_stop_asked_of_a_route_under_way_is_kept_for_the_walks_next_step() {
+        let mut world = World::empty();
+        let mut a = sims_sim::animator::LOADED;
+        a.arrival = 1;
+        world.animators.insert(7, a.clone());
+        // Under way, the route does not stop, and the request is kept
+        // (+0x284).
+        assert_eq!(ask_stop(&mut world, 7), Ok(false));
+        assert!(world.stops_asked.contains(&7));
+        assert_eq!(world.animators[&7], a);
+        // Ended, it stops, and nothing is kept.
+        world.stops_asked.clear();
+        world.animators.get_mut(&7).unwrap().arrival = 2;
+        assert_eq!(ask_stop(&mut world, 7), Ok(true));
+        assert!(world.stops_asked.is_empty());
+        assert_eq!(world.animators[&7].arrival, 0);
+        // A person with no animator is an error.
+        assert!(matches!(ask_stop(&mut world, 8), Err(Trap::Invalid(_))));
     }
 
     fn feet() -> Footfalls {

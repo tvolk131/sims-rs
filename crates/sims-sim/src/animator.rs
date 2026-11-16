@@ -264,6 +264,11 @@ pub enum Base {
         /// 0x59281b). Only drawing reads it.
         start: i32,
     },
+    /// The layer the load's restore read into the slot (0x591eec into
+    /// +0x14) for a person the load does not reset, with the saved phase.
+    /// The constructor's posture is -1, so the first base update clears
+    /// it unless the person's posture is -1 too.
+    Loaded,
 }
 
 impl Base {
@@ -286,10 +291,11 @@ impl Base {
 /// flags; the route start clears the first.
 ///
 /// The route start also writes +0x8c to +0x94, +0x18c and +0x284, and
-/// the turn +0x19c, +0x24, +0x28 and +0x290, all to 0. The walk sets
-/// +0x290 to 1, and only the end of a path for a person whose word 64 is
-/// set reads it (0x58ef8e), which is not ported. Nothing ported reads the
-/// others, and they are left out.
+/// the turn +0x19c, +0x24, +0x28 and +0x290, all to 0; +0x284 is kept
+/// apart ([`crate::World::stops_asked`]). The walk sets +0x290 to 1, and
+/// only a walk asked to stop for a person whose word 64 is set reads it
+/// (0x58ef8e), which is not ported. Nothing ported reads the others, and
+/// they are left out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Motion {
     /// +0x180: the index of the path point the animator is heading for.
@@ -418,7 +424,74 @@ impl Fade {
     };
 }
 
+/// What a person's skin holds from the load while it has sampled no layer
+/// since ([`crate::World::held_poses`]).
+///
+/// The load reads the animator's three saved layers (0x5918ba: the
+/// foreground +0xc, the carry slot +0x13c and the base slot +0x14, each
+/// through 0x591eec), updates the skin with them at once (0x5992b3,
+/// forced) and places the animator on the person's tile (0x592132). The
+/// person's reset then takes the layers out of the skin (0x589220,
+/// 0x592878) but not what they posed: the skin keeps those bones until a
+/// layer it samples writes them again (0x5992b3 does not put the bones
+/// back at rest). The skin's model matrix stays the placement's until the
+/// animator is placed again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldPose {
+    /// The restored layers, in the order the skin sampled them: by
+    /// priority, lowest first, and in the order they were read (the
+    /// foreground, the carry slot, the base slot) for the same priority
+    /// (0x599128, 0x5991fd).
+    pub layers: Vec<Layer>,
+    /// Where the load placed the animator (+0x80, +0x84, +0x88): the
+    /// person's position and direction then.
+    pub position: [F32; 3],
+}
+
 impl Layer {
+    /// A layer as the skin makes it (0x597874: 0x5978ef, then 0x597a88)
+    /// for a clip at `priority`, `speed` and `weight` and clock `now`: at
+    /// the clip's start (phase 0), to repeat at its end (end mode 1), not
+    /// fading. `frames` is the frame count of the clip's first motion,
+    /// `bound` says whether a motion binds to a bone of the skeleton, and
+    /// `tracks` is how many motions have timed events.
+    #[allow(clippy::too_many_arguments)]
+    pub fn make(
+        clip: &str,
+        clip_duration: F32,
+        frames: u32,
+        bound: bool,
+        tracks: usize,
+        priority: i32,
+        speed: F32,
+        weight: F32,
+        now: i32,
+    ) -> Self {
+        let mut layer = Self {
+            clip: clip.to_owned(),
+            clip_duration,
+            bound,
+            priority,
+            current: now,
+            previous: now,
+            duration: F32::ZERO,
+            speed: F32::ZERO,
+            phase: F32::ZERO,
+            weight,
+            event_time: 0,
+            previous_event_time: 0,
+            frames,
+            ended: false,
+            mode: 1,
+            fading: false,
+            interruptible: -1,
+            cursors: vec![0; tracks],
+            fade: Fade::NEW,
+        };
+        layer.set_speed(speed);
+        layer
+    }
+
     /// A new layer (0x5978ef, then 0x597a88 from 0x592726): priority 1,
     /// weight 1, at the clip's start or, backward, at its end, stopped
     /// at the end of the clip. `frames` is the frame count of the clip's
@@ -802,7 +875,8 @@ impl Animator {
     ///   or -1 the destination becomes the unset position too (0x589e5d).
     ///   Its other writes (the segment -1, the timer of a stop 0, the
     ///   state 3) the reset makes anyway. For 1 or -1, a route under way,
-    ///   the stop only sets +0x284, which is not kept. It also sets +0x18c
+    ///   the stop only sets +0x284 ([`crate::World::stops_asked`]), which
+    ///   nothing reads before a route's start clears it. It also sets +0x18c
     ///   and global 0x6f6d68, which nothing ported reads.
     ///
     /// The speed, its target, the clocks, the pickup flag, the count of

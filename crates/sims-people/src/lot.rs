@@ -24,10 +24,13 @@
 //!
 //! A person stands on the terrain under it (`sims_sim::head::ground_height`:
 //! the tile's altitude where its position falls, as the original finds it,
-//! 0x478dfe).
-//! On a level above the ground the original adds an offset from the
-//! view's table, which is not ported: such a person stands at the level's
-//! floor.
+//! 0x478dfe), on every level: the original's model matrix (0x592132) adds
+//! the altitude whatever the level, and the renderer lifts an upper
+//! level's floor by the terrain under it too. On a level above the ground
+//! the original then adds its view's level offset ([`LEVEL_OFFSET`]) once
+//! per level above the first: up, and a sixth of a tile towards the viewer
+//! along both of the view's axes, whatever the rotation
+//! ([`View::place_on`]).
 //!
 //! **Depth.** [`People::draw_on_lot`] draws over a lot `sims_render` has
 //! drawn, as the original does: the lot first, then the people, each
@@ -43,22 +46,32 @@
 //! it in their head slot, right after them, by the original's own light
 //! and colour; [`People::set_clock`] spins it.
 //!
-//! **Light** is our own ([`crate::raster::LIGHT`]), held fixed relative
-//! to the viewer as the view turns, as the original's standard light is
-//! (see the decisions entry "How the original lights a person"). Room
-//! light and lamps are not applied.
+//! **Light** is the original's standard light ([`STANDARD_LIGHT`]) at the
+//! person's level ([`level`]), lit as [`Lighting::standard`] says. The
+//! light keeps its place relative to the viewer as the view turns: the
+//! original turns it by the view's matrix (+0x130 of the view object, a
+//! turn about the vertical by a quarter turn per rotation, built at
+//! 0x49b60e) before it sets it (0x4b49c7). A person in a room at full
+//! light is drawn in full light all over; one in a dark room shows the
+//! light's side. The room's lamps (one light each, from the lamp to the
+//! person), the level's fade over 250 ms, the dimmer daylight cap after
+//! dark (0.8) and the person's flag that draws them at full light are
+//! not ported (decisions entry "A person is lit by the original's
+//! standard light, at their room's level").
 
 use crate::animation::{Clip, Library};
-use crate::appearance::Body;
+use crate::appearance::{Body, Outfit};
 use crate::assets::Assets;
 use crate::bob::{self, Bob};
 use crate::house::Cast;
 use crate::math::{Transform, Vec3};
 use crate::person::{Player, UNITS_PER_TILE, base_clip, placement};
-use crate::raster::{LIGHT, Shade, Target, draw_part, draw_shaded};
+use crate::raster::{Lighting, Shade, Target, draw_part, draw_shaded};
 use crate::rig;
 use crate::skin::skin;
+use crate::suit::{AGE, Clothes, GENDER, JOB, JOB_LEVEL, SUIT, Wardrobe, dress};
 use sims_core::F32;
+use sims_formats::saved_objects::Person;
 use sims_render::Camera;
 use sims_render::depth::Depth;
 use sims_sim::World;
@@ -70,6 +83,20 @@ pub const NEAR_PIXELS_PER_UNIT: f32 = 26.127_89;
 
 /// Fine units (sixteenths of a tile) per unit.
 const FINE_PER_UNIT: f32 = 16.0 / UNITS_PER_TILE;
+
+/// What the original adds to a person's position for each level above the
+/// first, in model units in the view (x and z along the view's two axes
+/// towards the viewer, y up): the three floats at the house view's
+/// +0x170 − 12·zoom (0x5922d2, through the view's virtual +0x24, which is
+/// +0xb8). The table is filled at run time; these values are read from the
+/// running original's memory, and are the same at all three zooms. The
+/// original turns the vector by the view's quarter turns back into the
+/// lot (0x5c3a20 by −rotation × π/2, the turn it builds the view's own
+/// matrix from at 0x49b60e), so it stays the same in the view at every
+/// rotation. On screen it nets out to 232.33 near-zoom pixels up, a
+/// third of a pixel more than the renderer's floor height, and it puts the
+/// person a sixth of a tile nearer.
+pub const LEVEL_OFFSET: [f32; 3] = [0.5, 9.300_511, 0.5];
 
 /// The side of the lot's arrays in fine units, on which the rotation is
 /// defined (the lot renderer's `ARRAY_SIZE` tiles).
@@ -102,6 +129,28 @@ impl View {
         )
     }
 
+    /// A world point's fine position in the view and its elevation, as
+    /// [`View::place`] has them, for a person on `level`: moved by the
+    /// original's [`LEVEL_OFFSET`] once per level above the first, less
+    /// the floor height the lot renderer already raises `level` by. The
+    /// offset's sideways parts go along the view's own axes, so they are
+    /// the same at every rotation.
+    pub fn place_on(&self, p: Vec3, level: i32) -> ([f32; 2], f32) {
+        let (fine, elevation) = self.place(p);
+        let above = (level - 1).max(0) as f32;
+        // Fine x is the original's model z, fine y its model x.
+        let toward = |unit: f32| unit * FINE_PER_UNIT * above;
+        let floor = sims_render::Zoom::Near.floor_height() as f32;
+        let lift = (LEVEL_OFFSET[1] * NEAR_PIXELS_PER_UNIT - floor) * above;
+        (
+            [
+                fine[0] + toward(LEVEL_OFFSET[2]),
+                fine[1] + toward(LEVEL_OFFSET[0]),
+            ],
+            elevation + lift,
+        )
+    }
+
     /// The screen position of a fine view position on `level`, raised
     /// `elevation` near-zoom pixels: the lot renderer's
     /// [`Camera::project_fine_f32`], one column right as objects are
@@ -111,16 +160,51 @@ impl View {
         [x + OBJECT_COLUMN, y]
     }
 
-    /// The direction towards the light: [`LIGHT`] as it is at rotation 0,
-    /// turned with the view so it stays where it is relative to the
-    /// viewer.
+    /// The direction towards the standard light: [`STANDARD_LIGHT`] as it
+    /// is at rotation 0, turned with the view so it stays where it is
+    /// relative to the viewer.
     pub fn light(&self) -> Vec3 {
-        // LIGHT's direction in the view at rotation 0, then back out
+        // The light's direction in the view at rotation 0, then back out
         // through this rotation.
-        let fine = [-LIGHT.z, -LIGHT.x];
+        let light = STANDARD_LIGHT;
+        let fine = [-light.z, -light.x];
         let back = rotate((4 - (self.camera.rotation & 3)) & 3, fine, 0.0);
-        Vec3::new(-back[1], LIGHT.y, -back[0])
+        Vec3::new(-back[1], light.y, -back[0])
     }
+}
+
+/// The direction towards the original's standard light at rotation 0, in
+/// the drawing frame (the files' frame, [`crate::rig`]). The light is
+/// `GameData/Lights/stdlight.lgt`: one white directional light of
+/// intensity 1 whose direction, the way it shines, is (−0.644, −0.418,
+/// −0.641). Towards it is the opposite: up, and back towards the house
+/// camera at rotation 0, whose eye is along (0.61, 0.5, 0.61) (0x49b0de).
+/// That direction is also the way to the position the file gives the
+/// light, (6.79, 9.55, 6.79): a light above and behind the viewer. That
+/// the direction is the way the light shines, as Direct3D takes a
+/// directional light's, is read from the file's own position, not from
+/// the running game; a person at full light, the only kind compared,
+/// shows no side.
+pub const STANDARD_LIGHT: Vec3 = Vec3::new(0.644_362_6, 0.417_676, 0.640_580_7);
+
+/// The level a person is lit at, 0.5 to 1: the light byte of the room
+/// at their position as the lot renderer draws it
+/// ([`sims_render::lot::room_light`]; full light off the lot and outside
+/// every room), over 255, held between 0.5 and 1. The original reads the
+/// level from the drawing's lighting record (0x4b4499), whose only setter
+/// holds it between 0.5 and the brightest a lit tile may be, 1 by day
+/// (0x4b4525); the lot's objects set it from the tile's light byte over
+/// 255 (0x467482). That a person's record is set the same way, from the
+/// tile they stand on, is **unverified**.
+pub fn level(world: &World, person: u16) -> f32 {
+    let byte = world
+        .objects
+        .get(&person)
+        .and_then(|o| world.room_at(o.position).ok())
+        .filter(|&room| room >= 0)
+        .and_then(|room| world.rooms.rooms.get(&room))
+        .map_or(255, sims_render::lot::room_light);
+    (f32::from(byte) / 255.0).clamp(0.5, 1.0)
 }
 
 /// The lot renderer's canvas takes people pixel by pixel, by its sprite
@@ -159,14 +243,16 @@ fn rotate(rotation: u8, [x, y]: [f32; 2], size: f32) -> [f32; 2] {
     }
 }
 
-/// What makes a person's body: their type, and the appearances and
-/// accessories their record names. When any of it changes, the body is
-/// loaded again.
+/// What makes a person's body: their type, the appearances and
+/// accessories their record names, and the data words their suit's
+/// clothes are chosen by ([`crate::suit`]). When any of it changes, the
+/// body is loaded again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Key {
     guid: u32,
     appearance: [String; 10],
     accessories: Vec<(String, String)>,
+    suit: [i16; 5],
 }
 
 impl Key {
@@ -179,6 +265,8 @@ impl Key {
                 .iter()
                 .map(|a| (a.name.clone(), a.binding.clone()))
                 .collect(),
+            suit: [SUIT, JOB, JOB_LEVEL, AGE, GENDER]
+                .map(|n| person.data.get(n).copied().unwrap_or(0)),
         }
     }
 }
@@ -224,6 +312,9 @@ pub struct People {
     /// Clips loaded so far, kept between frames.
     clips: BTreeMap<String, Clip>,
     people: BTreeMap<u16, Loaded>,
+    /// The names a suit's templates are matched against, gathered the
+    /// first time a person wears a suit.
+    wardrobe: Option<Wardrobe>,
     /// The plumb bob, once a person holds one: loaded the first time.
     bob: Option<Result<Bob, String>>,
     /// The game's clock in milliseconds, which spins the plumb bob.
@@ -247,6 +338,7 @@ impl People {
             cast,
             clips: BTreeMap::new(),
             people: BTreeMap::new(),
+            wardrobe: None,
             bob: None,
             clock: 0,
         }
@@ -259,9 +351,11 @@ impl People {
     }
 
     /// Follows `world`: loads the body of each person who appeared or
-    /// changed clothes, and forgets people who are gone. Returns one line
-    /// for each person whose body could not be loaded now (each is said
-    /// once, until the person changes again).
+    /// changed clothes, and forgets people who are gone. A person wears
+    /// what their suit picks ([`crate::suit::dress`]). Returns one line
+    /// for each person whose body could not be loaded now, or whose suit
+    /// could not be followed and who is drawn in their record's clothes
+    /// (each is said once, until the person changes again).
     pub fn update(&mut self, world: &World) -> Vec<String> {
         let mut problems = Vec::new();
         self.people
@@ -282,7 +376,17 @@ impl People {
                         .into_iter()
                         .next()
                         .ok_or_else(|| format!("person {id} is not a person type"))?;
-                    let body = Body::load(&self.assets, &resident.skeleton, &resident.outfit)?;
+                    let outfit = match self.dress(object.guid, person) {
+                        Ok(Some(outfit)) => outfit,
+                        Ok(None) => resident.outfit,
+                        Err(e) => {
+                            problems.push(format!(
+                                "person {id} is drawn in their record's clothes: {e}"
+                            ));
+                            resident.outfit
+                        }
+                    };
+                    let body = Body::load(&self.assets, &resident.skeleton, &outfit)?;
                     Ok((body, resident.skeleton))
                 })
                 .map_err(|e| format!("person {id} is not drawn: {e}"));
@@ -292,6 +396,26 @@ impl People {
             self.people.insert(id, Loaded { key, body });
         }
         problems
+    }
+
+    /// What `person` (of the type `guid`) wears for their suit, or None
+    /// for suit 0, whose clothes are the record's (or, for a record that
+    /// names no body, the type's default outfit).
+    fn dress(&mut self, guid: u32, person: &Person) -> Result<Option<Outfit>, String> {
+        if person.data.get(SUIT).copied().unwrap_or(0) == 0 {
+            return Ok(None);
+        }
+        let assets = &self.assets;
+        let wardrobe = self.wardrobe.get_or_insert_with(|| Wardrobe::of(assets));
+        let rows = self.cast.body_strings(guid)?;
+        let clothes = dress(
+            &Clothes::of(person, &rows),
+            &person.data,
+            &rows,
+            self.cast.careers(),
+            wardrobe,
+        )?;
+        Ok(Some(clothes.wear(person, &rows)))
     }
 
     /// Each placed person whose body is loaded, posed as the world has
@@ -326,12 +450,13 @@ impl People {
             if !(0..size).contains(&x) || !(0..size).contains(&y) || level > top {
                 continue;
             }
-            if level <= 1 {
-                let at = [animator.position[0], animator.position[1]];
-                root.translation.y = sims_sim::head::ground_height(world, at)
-                    .map(F32::to_f32)
-                    .unwrap_or(0.0);
-            }
+            // The terrain lifts a person on every level, as it lifts the
+            // floors the renderer draws there (0x592132 adds the altitude
+            // whatever the level).
+            let at = [animator.position[0], animator.position[1]];
+            root.translation.y = sims_sim::head::ground_height(world, at)
+                .map(F32::to_f32)
+                .unwrap_or(0.0);
             let base = base_clip(person, skeleton);
             match player.pose(&body.skeleton, animator, world.base_layers.get(&id), &base) {
                 Ok(pose) => posed.push(Posed {
@@ -391,21 +516,22 @@ impl People {
         // Far to near by the root's depth, then by ID, so nearer soft
         // edges blend over farther people.
         let far = |p: &Posed| {
-            let (fine, elevation) = view.place(p.root.translation);
+            let (fine, elevation) = view.place_on(p.root.translation, p.level);
             depth(fine, elevation, p.level)
         };
         posed.sort_by(|a, b| far(b).total_cmp(&far(a)).then(a.id.cmp(&b.id)));
         for person in &posed {
             let project = |p| {
-                let (fine, elevation) = view.place(p);
+                let (fine, elevation) = view.place_on(p, person.level);
                 let [x, y] = view.screen(fine, elevation, person.level);
                 Vec3::new(x, y, depth(fine, elevation, person.level))
             };
             // Each pixel the person draws names them, for a click.
             target.set_id(Some(person.id));
+            let lighting = Lighting::standard(light, level(world, person.id));
             for part in person.body.parts.iter().filter(|p| p.censor == 0) {
                 let skinned = skin(part, &person.bones);
-                draw_part(target, part, &skinned, light, project);
+                draw_part(target, part, &skinned, lighting, project);
             }
             // The plumb bob over their head, if they hold it. Its pixels
             // name the person too.
@@ -510,6 +636,41 @@ mod tests {
         }
     }
 
+    /// A person upstairs stands where the original's level offset puts
+    /// them: 232.33 near-zoom pixels above where they would stand on the
+    /// ground floor, straight up, and a sixth of a tile nearer along both
+    /// of the view's axes, at every zoom and rotation.
+    #[test]
+    fn a_person_upstairs_takes_the_originals_level_offset() {
+        for zoom in Zoom::ALL {
+            for rotation in 0..4 {
+                let view = View::new(&camera(zoom, rotation));
+                let p = Vec3::new(-7.0, 0.25, -11.0);
+                let (low, low_up) = view.place_on(p, 1);
+                assert_eq!((low, low_up), view.place(p));
+                let (high, high_up) = view.place_on(p, 2);
+                for axis in 0..2 {
+                    assert!(
+                        (high[axis] - low[axis] - 8.0 / 3.0).abs() < 1e-3,
+                        "{zoom:?} {rotation}"
+                    );
+                }
+                let a = view.screen(low, low_up, 1);
+                let b = view.screen(high, high_up, 2);
+                let scale = zoom.near_scale() as f32;
+                assert!(
+                    (b[0] - a[0]).abs() < 1e-3,
+                    "{zoom:?} {rotation}: {a:?} {b:?}"
+                );
+                assert!(
+                    (a[1] - b[1] - 232.33 / scale).abs() < 0.01,
+                    "{zoom:?} {rotation}: {} px up",
+                    a[1] - b[1]
+                );
+            }
+        }
+    }
+
     /// A step of the lot's altitude lifts a person as far on screen as it
     /// lifts the lot renderer's ground: 16 near-zoom pixels.
     #[test]
@@ -566,6 +727,47 @@ mod tests {
             assert!((d[0] - first.0[0]).abs() < 1e-4 && (d[1] - first.0[1]).abs() < 1e-4);
             assert_eq!(y, first.1);
         }
-        assert_eq!(View::new(&camera(Zoom::Far, 0)).light(), LIGHT);
+        assert_eq!(View::new(&camera(Zoom::Far, 0)).light(), STANDARD_LIGHT);
+    }
+
+    /// At every rotation the standard light is above and behind the
+    /// viewer, straight back along the view: its fine x and y in the view
+    /// are equal and fall towards the viewer, as the house camera's eye
+    /// does.
+    #[test]
+    fn the_standard_light_is_above_and_behind_the_viewer() {
+        for rotation in 0..4 {
+            let view = View::new(&camera(Zoom::Medium, rotation));
+            let light = view.light();
+            let (a, _) = view.place(light);
+            let (o, _) = view.place(Vec3::ZERO);
+            let [x, y] = [a[0] - o[0], a[1] - o[1]];
+            assert!(
+                x < 0.0 && y < 0.0 && (x - y).abs() < 0.1 * x.abs(),
+                "{x} {y}"
+            );
+            assert!(light.y > 0.0);
+        }
+    }
+
+    /// At full light a person is at full light all over; at half light
+    /// the side away from the light is at the ambient grey, 128/255, and
+    /// the side facing it at full light. A person the world does not know
+    /// is at full light.
+    #[test]
+    fn the_level_sets_the_ambient_grey_and_the_lights_strength() {
+        assert_eq!(level(&World::empty(), 7), 1.0);
+        let towards = STANDARD_LIGHT.normalize();
+        let full = Lighting::standard(STANDARD_LIGHT, 1.0);
+        assert_eq!(full.shade(-towards), 1.0);
+        let half = Lighting::standard(STANDARD_LIGHT, 0.5);
+        assert_eq!(half.shade(-towards), 128.0 / 255.0);
+        assert_eq!(half.shade(towards), 1.0);
+        // At an angle, the light adds its strength times the cosine: at
+        // 60° from the light, half its strength.
+        let side = Vec3::new(towards.z, 0.0, -towards.x).normalize();
+        let tilted = (towards * 0.5 + side * (3.0f32.sqrt() / 2.0)).normalize();
+        assert!((tilted.dot(towards) - 0.5).abs() < 1e-6);
+        assert!((half.shade(tilted) - (128.0 / 255.0 + 0.25)).abs() < 1e-6);
     }
 }

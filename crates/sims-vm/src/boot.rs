@@ -19,7 +19,6 @@ use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Anything that stops a boot, with a message that says where.
@@ -35,7 +34,7 @@ const VIEW_LEVEL: i8 = 1;
 ///
 /// The default, `0,1,2,3,33+30`, is what three captures of the original
 /// running the Goth house recorded, with a hardware watchpoint on the
-/// house view's draw guard (`docs/decisions.md`): a frame before the
+/// house view's draw guard (`docs/decisions/`): a frame before the
 /// first lot update, after updates 1, 2 and 3 (many times while a dialog
 /// waited), after update 33, and after every 30th update from there (63,
 /// 93, ...). Frames write two things: the first frame that draws a
@@ -428,6 +427,18 @@ impl Lot {
         let mut program = Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid))?;
         program.zoning = neighborhood.zoning(context.expansions)?;
         program.expansions = context.expansions;
+        // The types registered from the neighborhood's Characters folder,
+        // which the original registers with kind 1 (0x424a8b, 0x43c228).
+        program.characters = catalog
+            .objects
+            .iter()
+            .map(|o| o.guid)
+            .filter(|&guid| {
+                catalog.object(guid).is_some_and(|o| {
+                    index.mounts[index.resources[o.resource].mount].path == Index::CHARACTERS
+                })
+            })
+            .collect();
         program.animations = Animations::load(&install, &index)?;
         let person_types = || {
             catalog
@@ -595,25 +606,11 @@ impl Lot {
             // clears global 12.
             if load.stopped.is_none() {
                 let made = interpreter.ensure_indicators(&mut world)?.is_some();
-                // The types registered from the neighborhood's
-                // Characters folder, which the original registers with
-                // kind 1 (0x424a8b, 0x43c228).
-                let characters: BTreeSet<u32> = catalog
-                    .objects
-                    .iter()
-                    .map(|o| o.guid)
-                    .filter(|&guid| {
-                        catalog.object(guid).is_some_and(|o| {
-                            index.mounts[index.resources[o.resource].mount].path
-                                == Index::CHARACTERS
-                        })
-                    })
-                    .collect();
                 world.finish_selection(&Household {
                     house: i32::try_from(number)?,
                     flags: record.flags,
                     members: &record.members,
-                    characters: &characters,
+                    characters: &program.characters,
                     residents: &residents,
                     zoning: &program.zoning,
                 })?;
@@ -1147,6 +1144,7 @@ mod tests {
                 people: Default::default(),
                 icon_frames: None,
                 expansions: 0,
+                characters: Default::default(),
             },
             catalog: Catalog {
                 global: 0,

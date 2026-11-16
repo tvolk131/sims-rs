@@ -64,8 +64,8 @@ impl Machine<'_, '_> {
     /// The object the removal queue takes for `id` (0x442d9d to 0x442e38):
     /// for an object whose definition names a group (word 10, +0x14), and
     /// that is a tile of one, the group's lead tile, unless the type names
-    /// function 8 (0x42344e), when the tile goes alone. Fails loudly for
-    /// that tile alone, which is not ported, and for an object that is a
+    /// function 8 (0x42344e), when the tile goes alone (0x442def). Fails
+    /// loudly for an object that is a
     /// tile of a group without its definition naming one, or names one
     /// without being a tile (the original then does nothing, 0x442ddd);
     /// neither is a state the factory makes.
@@ -80,12 +80,11 @@ impl Machine<'_, '_> {
         match (&object.multipart, group) {
             (None, false) => Ok(id),
             (Some(part), true) => {
+                // 0x442def: such a tile is queued itself. Its take-off is
+                // still its group's (0x422d86), and it leaves the group
+                // when it is deleted (0x42346a, from 0x4424a6).
                 if interpreter.has_function(self.world, id, function::DYNAMIC_GROUP) {
-                    return Err(Trap::Unsupported(
-                        "removing a tile of a group whose type has the dynamic group function \
-                         (8): the tile goes alone (0x442def), which is not ported"
-                            .into(),
-                    ));
+                    return Ok(id);
                 }
                 Ok(if part.parent == 0 {
                     id
@@ -157,7 +156,7 @@ impl Machine<'_, '_> {
         // write nothing but its animator. Its own thread may then read no
         // animator until its animator's tick settles the refresh; another
         // object reading that animator before the deletion is not checked
-        // (docs/decisions.md).
+        // (docs/decisions/).
         let person = self
             .world
             .objects

@@ -3,7 +3,7 @@
 //! shows up. Needs the game: set `SIMS_INSTALL` to the install folder.
 //!
 //! The digests pin this renderer's output, not the original's. What was
-//! compared with the original is in `docs/decisions.md`.
+//! compared with the original is in `docs/decisions/`.
 
 use sha2::{Digest, Sha256};
 use sims_render::{Camera, Canvas, Focus, Lot, Walls, Zoom, draw, open_house};
@@ -12,24 +12,24 @@ use std::path::PathBuf;
 /// SHA-256 prefixes of the 16-bit-color images, by zoom, rotation and wall
 /// mode.
 const DIGESTS: &[(u32, u8, &str, &str)] = &[
-    (1, 0, "up", "47cd9a8f0796d771"),
-    (1, 0, "cutaway", "ea307b5311133bca"),
-    (1, 1, "up", "00171054ededffff"),
-    (1, 1, "cutaway", "ab113c947d3991c4"),
-    (1, 2, "up", "0077fcf4d11f8011"),
-    (1, 2, "cutaway", "7ccd3b056578d745"),
-    (1, 3, "up", "4aa18f9709223fe4"),
-    (1, 3, "cutaway", "7ca37ab615bd577c"),
-    (2, 0, "up", "e50dfe1c2399c201"),
-    (2, 0, "cutaway", "de3fc707a88ce23d"),
+    (1, 0, "up", "fd2afd33b8643c1b"),
+    (1, 0, "cutaway", "be75acc7a2b2722c"),
+    (1, 1, "up", "54fc72c31e26c582"),
+    (1, 1, "cutaway", "963ceb4b2b6fe8f0"),
+    (1, 2, "up", "d883b6fd3718e904"),
+    (1, 2, "cutaway", "ea76e69b0b488c90"),
+    (1, 3, "up", "626bc21c90688346"),
+    (1, 3, "cutaway", "36167660452c4750"),
+    (2, 0, "up", "c39cc76d5119c1f3"),
+    (2, 0, "cutaway", "505f1d6d8a125667"),
     (2, 1, "up", "481994faf9bd74c2"),
     (2, 1, "cutaway", "fed3c7621a679ab1"),
     (2, 2, "up", "e2fe61e798de3441"),
     (2, 2, "cutaway", "56bc11df4983e4b8"),
-    (2, 3, "up", "ad4edbdf5ae6d1f3"),
-    (2, 3, "cutaway", "ab8e054cf8c29204"),
-    (3, 0, "up", "0bb9100cf10cbcd5"),
-    (3, 0, "cutaway", "8d102ae8446f7c56"),
+    (2, 3, "up", "7ec749444a62d40f"),
+    (2, 3, "cutaway", "59b05b35ebf6b680"),
+    (3, 0, "up", "6f47a1b76a8aaac5"),
+    (3, 0, "cutaway", "c20bc69f9dad7be8"),
     (3, 1, "up", "9dbeeaf9cf4ad84e"),
     (3, 1, "cutaway", "cb2af648026d2261"),
     (3, 2, "up", "8a82a31011820d9d"),

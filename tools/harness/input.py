@@ -168,9 +168,23 @@ def move_command(x, y, window=WINDOW):
     return f'xdotool mousemove --window {window} {x - 1} {y} sleep 0.2 mousemove --window {window} {x} {y}'
 
 
-def press_command():
-    """Press and release the left button where the pointer is."""
-    return 'xdotool mousedown 1 sleep 0.3 mouseup 1'
+# A press on the house view or a pie menu is held while lot updates return.
+# capture.py holds the game still for seconds at each stop; a short press
+# (down and up 0.3 s apart) can fall inside one stop, and the game, which
+# reads the button between frames, then never sees it down. Seen twice: a
+# press on the porch bench and one on the bookcase, each with the picker on
+# the object, opened no pie menu in 200 updates. The settling counts the
+# update return at which the press is seen to have ended, so at least
+# HOLD_UPDATES - 1 whole updates run with the button down.
+HOLD_UPDATES = 3
+
+
+def press_down_command():
+    return 'xdotool mousedown 1'
+
+
+def press_up_command():
+    return 'xdotool mouseup 1'
 
 
 def dialog_press_command(x, y, window=WINDOW):
@@ -511,6 +525,7 @@ class Runner:
         self.push_cursor = 0  # pushes before it were matched by an expect-queued
         self.fresh = False  # self.m was read at this update return (not at a dialog stop)
         self.unchecked = []  # (n, row): commands whose exit code is still to be checked
+        self.held = None  # the info of a held press whose release is not yet submitted
         self.dialogs = []
         self.finished = False
         self.failed = None
@@ -523,6 +538,7 @@ class Runner:
         self.known = None
 
     def close(self):
+        self.let_go('capture ended')
         if not self.finished:
             self.write(kind='scenario', status='unfinished', index=self.index,
                        unchecked=[n for n, _ in self.unchecked])
@@ -679,7 +695,11 @@ class Runner:
                 self.fail(str(e))
                 return
             if isinstance(want, Job):
-                n = self.agent.submit(want.command)
+                n = self.agent.submit(want.command)  # if it raises, the step fails (and let_go retries a release)
+                if want.command == press_down_command():
+                    self.held = want.info
+                elif want.command == press_up_command():
+                    self.held = None
                 row = dict(kind='command', id=n, what=want.kind, command=want.command, **want.info)
                 self.write(**row)
                 if want.wait:
@@ -705,6 +725,23 @@ class Runner:
         self.finished = True
         self.gen = None
         self.write(kind='step', status='failed', index=self.index, error=error)
+        self.let_go('step failed')
+
+    def let_go(self, reason):
+        """Let the button go if a held press's release was never submitted (the
+        step failed, or the capture ended, while it was down). Its exit code is
+        not checked: no stop is left to check it at. If the submission fails,
+        the release is still owed and the next call tries again."""
+        if self.held is None:
+            return
+        info = self.held
+        try:
+            n = self.agent.submit(press_up_command())
+        except Exception as e:  # letting go must never end the capture
+            self.write(kind='release_failed', reason=reason, error=f'{type(e).__name__}: {e}', **info)
+            return
+        self.held = None
+        self.write(kind='command', id=n, what='release', command=press_up_command(), reason=reason, **info)
 
     # The steps. Each is a generator; after each yield self.m reads the game at
     # the update return where the wait ended.
@@ -721,7 +758,16 @@ class Runner:
 
     def step_click(self, x, y):
         yield Job('move', move_command(x, y, self.agent.window), x=x, y=y)
-        yield Job('press', press_command(), x=x, y=y)
+        yield from self.held_press(x=x, y=y)
+
+    def held_press(self, **info):
+        """Press the left button where the pointer is, keep it down until
+        HOLD_UPDATES lot updates have returned, then let it go. The release
+        is not waited on (its exit code is still checked): the press can open
+        a modal dialog, which stops update returns, and the agent runs
+        commands in order, so a later press still comes after the release."""
+        yield Job('press', press_down_command(), settle=HOLD_UPDATES, **info)
+        yield Job('release', press_up_command(), wait=False, **info)
 
     def step_answer_dialog(self, x, y):
         """Wait for a dialog to be up, press (x, y) once, and wait for the
@@ -803,7 +849,7 @@ class Runner:
             tried.append((point, hover))
             if hover != oid:
                 continue
-            yield Job('press', press_command(), x=point[0], y=point[1], object=oid)
+            yield from self.held_press(x=point[0], y=point[1], object=oid)
             yield Fresh()
             entries = yield from self.wait_entries(200)
             if not entries:
@@ -875,7 +921,7 @@ class Runner:
             yield Updates(1)
         else:
             raise StepFailed(f'entry {label!r} ({i}) is not highlighted: {pie and pie["highlighted"]}')
-        yield Job('press', press_command(), x=point[0], y=point[1], entry=label)
+        yield from self.held_press(x=point[0], y=point[1], entry=label)
         for _ in range(200):
             if len(self.pushes) > pushes:  # known without reading memory (a dialog may be up)
                 return

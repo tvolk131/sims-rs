@@ -543,15 +543,48 @@ fn what_animate_sim_does_not_port_fails_loudly() {
     let layer = &fx.world.base_layers[&SIM];
     assert_eq!((layer.mode, layer.priority), (1, -10));
     assert!(matches!(&fx.world.animators[&SIM].base, Base::Script { clip, .. } if clip == CLIP));
+}
+
+#[test]
+fn a_person_in_a_pool_takes_its_clip_names_from_the_pools_tables() {
     // A clip that ends with the person sitting starts posture 1's base
-    // clip, whose name this person's word 64 makes the lookup take from
-    // the special tables (0x59db44).
-    let mut fx = sim_animates(animate(1, 3, 0, 0, 0));
-    turn(&mut fx).unwrap();
-    end_clip(&mut fx);
-    sim_definition(&mut fx)[102] = 0;
-    fx.sim_mut().person.as_mut().unwrap().data[0] = 1;
-    assert!(unsupported(turn(&mut fx)).contains("0x59db44"));
+    // clip. With person word 64 set (in a pool) its name comes from the
+    // pool's table for the person's sex (0x59db44: STR# 158 plus bit 0 of
+    // word 65), and the type's own table is not read.
+    let names = |fx: &mut Fixture, file: usize, table: u16, name: &str| {
+        let names = vec![String::new(), name.to_string()];
+        let library = fx.program.libraries.get_mut(&file).unwrap();
+        library.strings.insert(table, names);
+    };
+    let sitting = |pool: i16, kind: i16, age: i16| {
+        let mut fx = sim_animates(animate(1, 3, 0, 0, 0));
+        turn(&mut fx).unwrap();
+        end_clip(&mut fx);
+        sim_definition(&mut fx)[102] = 0;
+        let person = fx.sim_mut().person.as_mut().unwrap();
+        (person.data[0], person.data[64], person.data[65]) = (1, pool, kind);
+        person.data[58] = age;
+        names(&mut fx, SIM_FILE, 150, "own");
+        names(&mut fx, GLOBAL, 152, "adult");
+        names(&mut fx, GLOBAL, 158, "pool 0");
+        names(&mut fx, GLOBAL, 159, "pool 1");
+        names(&mut fx, GLOBAL, 160, "pool child");
+        fx
+    };
+    let base = |mut fx: Fixture| {
+        let result = turn(&mut fx);
+        // The fixture holds no such clip, so starting it fails, naming it.
+        unsupported(result)
+    };
+    assert!(base(sitting(0, 0, 174)).contains("\"own\""));
+    assert!(base(sitting(1, 0, 174)).contains("\"pool 0\""));
+    assert!(base(sitting(1, 1, 174)).contains("\"pool 1\""));
+    assert!(base(sitting(1, 1, 17)).contains("\"pool child\""));
+    // A pool table with no name for the clip: the global tables, still
+    // not the type's own.
+    let mut fx = sitting(1, 0, 174);
+    names(&mut fx, GLOBAL, 158, "");
+    assert!(base(fx).contains("\"adult\""));
 }
 
 #[test]
@@ -2440,4 +2473,116 @@ fn a_refresh_that_would_count_the_head_down_fails_loudly() {
         fault.contains("0x58da12") && fault.contains("write more than its animator"),
         "{fault}"
     );
+}
+
+/// The routed Sim facing along its path (direction 2), so that its first
+/// tick walks a step (to [150, 200, 1]).
+fn facing_along() -> Fixture {
+    let mut fx = routed();
+    fx.sim_mut().data[1] = 2;
+    let a = fx.world.animators.get_mut(&SIM).unwrap();
+    a.position[2] = F32::from_f32(2.0);
+    a.destination[2] = F32::from_f32(2.0);
+    fx
+}
+
+#[test]
+fn a_route_asked_to_stop_stops_blocked_after_the_walks_next_step() {
+    // Not asked, the step is taken and the route goes on (+0x188 1).
+    let mut walked = facing_along();
+    tick(&mut walked).unwrap();
+    let a = &walked.world.animators[&SIM];
+    assert_eq!(a.arrival, 1);
+    assert_ne!(walked.sim().position, [100, 200, 1]);
+    // Asked (+0x284, 0x58eeeb): the same step is still taken, the person
+    // put at its end and the animator moved, but the route ends blocked
+    // (3, 0x58f682). The request is kept until a route starts.
+    let mut fx = facing_along();
+    fx.world.stops_asked.insert(SIM);
+    tick(&mut fx).unwrap();
+    let stopped = &fx.world.animators[&SIM];
+    assert_eq!(stopped.arrival, 3);
+    assert_eq!(stopped.position, a.position);
+    assert_eq!(fx.sim().position, walked.sim().position);
+    assert!(fx.world.stops_asked.contains(&SIM));
+}
+
+/// The standing Sim on the flat lot, its thread at Look Towards in mode 2
+/// (tree 4098) with the lamp, at [130, 210, 1], as its stack object.
+fn looking_at_the_lamp() -> Fixture {
+    let mut fx = standing();
+    flat_lot(&mut fx);
+    fx.lamp_mut().position = [130, 210, 1];
+    fx.add(
+        SIM_FILE,
+        4098,
+        tree(vec![ins(
+            22,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [2, 0, 0, 0, 0, 0, 0, 0],
+        )]),
+    );
+    fx.thread(SIM, 4098, &[]);
+    fx.sim_mut().stack[0].stack_object = LAMP as i16;
+    fx
+}
+
+#[test]
+fn a_route_starting_forgets_a_stop_asked_before() {
+    // Look Towards starts its route (0x589c85), which clears the request
+    // (+0x284); the route is under way, so the thread waits for it.
+    let mut fx = looking_at_the_lamp();
+    fx.world.stops_asked.insert(SIM);
+    assert_eq!(turn(&mut fx).unwrap(), Status::Yielded);
+    assert_eq!(fx.world.animators[&SIM].arrival, 1);
+    assert!(fx.world.stops_asked.is_empty());
+}
+
+/// Look Towards started, then its route ended (+0x188 2) with the
+/// animator at the lamp's place facing 2, and the thread run again. The
+/// path's first leg is made to reach the lamp: the route's result moves
+/// the place onto the legs before the last (path index -1, 0x48313e), and
+/// Look Towards' own first leg has no length.
+fn arrived(data_42: i16) -> (Fixture, Status) {
+    let mut fx = looking_at_the_lamp();
+    assert_eq!(turn(&mut fx).unwrap(), Status::Yielded);
+    fx.world.routing.routes.get_mut(&SIM).unwrap().path = vec![[200, 100], [210, 130], [210, 130]];
+    let a = fx.world.animators.get_mut(&SIM).unwrap();
+    a.arrival = 2;
+    a.position = [130.0, 210.0, 2.0].map(F32::from_f32);
+    fx.sim_mut().data[42] = data_42;
+    fx.sim_mut().data[1] = 6;
+    let status = turn(&mut fx).unwrap();
+    (fx, status)
+}
+
+#[test]
+fn a_route_ending_where_the_person_fits_puts_it_there() {
+    // The route's result (0x589d3b): the direction is written, the
+    // animator's place moved onto the path, and the person put there;
+    // Look Towards takes the true branch.
+    let (fx, status) = arrived(2);
+    assert_eq!(status, Status::Returned(true));
+    assert_eq!(fx.sim().position, [130, 210, 1]);
+    assert_eq!(fx.sim().data[1], 2);
+    let a = &fx.world.animators[&SIM];
+    assert_eq!(a.position, [130.0, 210.0, 2.0].map(F32::from_f32));
+}
+
+#[test]
+fn a_route_ending_where_the_person_does_not_fit_puts_it_back_on_its_own_tile() {
+    // 0x589dee: without data word 42 flag 2 the person may not stand
+    // where there is no floor. The animator's place is unset and the
+    // person put back on its own tile; the result is 0, which Look
+    // Towards takes as 1, the true branch, and the stop that follows
+    // stands the animator where it is (unset).
+    let (fx, status) = arrived(0);
+    assert_eq!(status, Status::Returned(true));
+    assert_eq!(fx.sim().position, [100, 200, 1]);
+    assert_eq!(fx.sim().data[1], 2);
+    let a = &fx.world.animators[&SIM];
+    assert_eq!(a.position, [UNSET; 3]);
+    assert_eq!(a.destination, [UNSET; 3]);
+    assert_eq!((a.arrival, a.state, a.motion.segment), (0, 3, -1));
 }

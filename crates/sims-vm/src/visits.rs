@@ -36,7 +36,7 @@
 //! Ported from the old prototype's visit loop
 //! (legacy/crates/sims-content/src/house_loading.rs), `PostLoad`
 //! (legacy/crates/sims-vm/src/loading.rs) and `Reset`
-//! (legacy/crates/sims-sim/src/lot_reset.rs). `docs/decisions.md` says
+//! (legacy/crates/sims-sim/src/lot_reset.rs). `docs/decisions/` says
 //! what a trace of the original loading the Goth house confirms.
 
 use crate::factory::TURN_BUDGET;
@@ -84,6 +84,21 @@ impl Interpreter<'_> {
         function: usize,
         stack_object: i16,
     ) -> Result<bool, Fault> {
+        self.callback_with(world, id, function, stack_object, None)
+    }
+
+    /// [`Interpreter::callback`] with the caller's argument buffer (0x422d46
+    /// with a third argument that is not null): the tree takes its
+    /// arguments from `args`, and a tree that takes more words than the
+    /// buffer holds is refused. With `None`, the object's temps.
+    pub(crate) fn callback_with(
+        &self,
+        world: &mut World,
+        id: u16,
+        function: usize,
+        stack_object: i16,
+        args: Option<&[i16]>,
+    ) -> Result<bool, Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -121,8 +136,13 @@ impl Interpreter<'_> {
                 .map_err(fail)?;
             return Ok(false);
         }
-        let temps = object.temps.clone();
-        self.call(world, id, tree, stack_object, &temps, 8, TURN_BUDGET)
+        match args {
+            Some(args) => self.call(world, id, tree, stack_object, args, args.len(), TURN_BUDGET),
+            None => {
+                let temps = object.temps.clone();
+                self.call(world, id, tree, stack_object, &temps, 8, TURN_BUDGET)
+            }
+        }
     }
 
     /// Load step 13: visits every object in registration order

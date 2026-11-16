@@ -7,8 +7,14 @@
 //! Then it runs the route's steps (0x45ad63), each run going on from the
 //! step the frame's primitive state holds:
 //!
-//! - **0**: a route context for the slot is made (0x48163e) and pushed on
-//!   the person's contexts (+0xaf0); the next step is 1.
+//! - **0**: with the stack object gone or off the lot the run gives false
+//!   (0x45ae65). Else a route context for the slot is made (0x48163e) and
+//!   pushed on the person's contexts (+0xaf0); the next step is 1.
+//!
+//! Every run then takes the person's last context (0x45c349). With none
+//! (a reset erased them) it gives false. A context that names no object
+//! (one the load made for a person saved part way through a route) is
+//! popped, the step goes back to 0 and the thread yields (0x45ae71).
 //! - **1**: when the slot's object is in another room than the person
 //!   (and bit 0 of person word 68 is clear), the next step is 2.
 //!   Otherwise, a person who wants to be interrupted (0x45d7c0) and whose
@@ -122,7 +128,7 @@
 //! step and every other result of the planning. Past tick 1000 the routes
 //! are **unverified**: there is no capture.
 
-use crate::animator::stop_route;
+use crate::animator::ask_stop;
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Flow, Machine, word};
 use crate::placement::{capture, stands_on_lot};
@@ -404,8 +410,10 @@ impl Machine<'_, '_> {
         };
         let mut state = self.frame()?.primitive_state;
         if state == NEW {
+            // 0x45ae65: with its stack object gone or off the lot, the run
+            // gives false and writes nothing.
             let (Some(target), Some(slot), false) = (target, slot, lost) else {
-                return Err(unsupported("0x45ae65", "with its stack object gone"));
+                return Ok(Flow::Branch(false));
             };
             let mut ctx = new_context(self.world, me, target, slot);
             if self.person_word(NO_ROOM)? & 1 == 1 {
@@ -430,13 +438,26 @@ impl Machine<'_, '_> {
             .and_then(|r| r.contexts.last())
             .cloned()
         else {
-            return Err(unsupported(
-                "0x45ae65",
-                "for a person with no route context",
-            ));
+            // 0x45c349 finds no context (a reset erased them): the run
+            // gives false and writes nothing (0x45ae65).
+            return Ok(Flow::Branch(false));
         };
         if ctx.target == 0 {
-            return Err(unsupported("0x45ae71", "whose context lost its object"));
+            // 0x45ae71: a context that names no object, as the load makes
+            // them (`crate::routing::slot::loaded_context`): the step goes
+            // back to 0, the context is popped (0x45f8d9) and the thread
+            // yields. The next run starts the route again.
+            self.frame_mut()?.primitive_state = NEW;
+            if let Some(route) = self.world.routing.routes.get_mut(&me) {
+                route.contexts.pop();
+            }
+            if self.synchronous {
+                return Err(Trap::native(
+                    0x44f,
+                    "a synchronous tree yielded in Go To Routing Slot",
+                ));
+            }
+            return Ok(Flow::Yield);
         }
         if lost {
             return Err(unsupported("0x45ae8d", "with its stack object gone"));
@@ -480,7 +501,10 @@ impl Machine<'_, '_> {
                     if self.person_word(NO_ROOM)? & 1 != 1
                         && self.room(ctx.target)? != self.room(me)?
                     {
-                        // 0x45b140: to another room, through a door.
+                        // 0x45b140: to another room, through a door; but
+                        // a route to a door one of the person's routes
+                        // goes through (context +0x68) fails (0x45b176).
+                        state = PORTAL;
                         if interpreter.kind(self.world, ctx.target)? == DOOR {
                             let routes = &self.world.routing.routes[&me];
                             if routes
@@ -488,13 +512,9 @@ impl Machine<'_, '_> {
                                 .iter()
                                 .any(|c| c.word_68 == i32::from(ctx.target))
                             {
-                                return Err(unsupported(
-                                    "0x45b176",
-                                    "to a door one of its routes goes through",
-                                ));
+                                state = FAILED;
                             }
                         }
-                        state = PORTAL;
                         continue;
                     }
                     // 0x45b18b: a person who wants to be interrupted, and
@@ -726,16 +746,11 @@ impl Machine<'_, '_> {
                 ARRIVED | STOPPED | INTERRUPTED => {
                     // 0x45b3de, 0x45b371, 0x45b3c2: the animator stops
                     // (0x589e2d).
-                    let animator = self
-                        .world
-                        .animators
-                        .get_mut(&me)
-                        .ok_or_else(|| Trap::Invalid(format!("person {me} has no animator")))?;
-                    if !stop_route(animator) {
-                        return Err(unsupported(
-                            "0x45b3eb",
-                            "whose animator is still under way when it is to stop",
-                        ));
+                    // A route under way does not stop: the request is kept
+                    // for the walk's next step (+0x284), and the run
+                    // yields at this step to try again (0x45b9a0).
+                    if !ask_stop(self.world, me)? {
+                        break;
                     }
                     // 0x45b3a0: "end_route" plays for me. A route that
                     // stopped short of the path's end (a blocked step)
@@ -975,10 +990,13 @@ impl Machine<'_, '_> {
                 }
             }
         }
-        if let Some(animator) = self.world.animators.get_mut(&me)
-            && animator.arrival != 0
+        if self
+            .world
+            .animators
+            .get(&me)
+            .is_some_and(|animator| animator.arrival != 0)
         {
-            stop_route(animator);
+            ask_stop(self.world, me)?;
         }
         let result = if state == FAILED {
             if ctx.result == 0 {

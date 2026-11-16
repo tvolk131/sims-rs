@@ -93,6 +93,60 @@ pub(crate) fn route_slot(slot: &Slot, index: usize, flags: Option<i32>) -> Route
     }
 }
 
+/// A slot record as its default constructor makes it (0x46dd48): no
+/// offset, number and snap target -1, proximity and resolution 16 (the
+/// 0x10 pushed at 0x46dd4a and stored at 0x46dd7f to 0x46dd88), gradient
+/// 0.1875 (0x3e400000), facing -2, every other word 0.
+pub(crate) const DEFAULT_SLOT: RouteSlot = RouteSlot {
+    offset: [0; 3],
+    number: -1,
+    standing: 0,
+    sitting: 0,
+    ground: 0,
+    flags: 0,
+    snap_target: -1,
+    proximity: [16; 3],
+    gradient: 0x3e40_0000,
+    facing: -2,
+    resolution: 16,
+};
+
+/// A route context as the load makes it (0x460443): a copy of one made by
+/// the default constructor (0x4815f1), which makes the default slot record
+/// (0x46dd48) and calls 0x481693 with no person, no object and no slot.
+/// The save keeps only how many contexts a person had; each is then
+/// "read" by a function that reads nothing (0x5fe4ae, `ret 8`).
+///
+/// Two words are left as the stack held them: +0x74 (the third word of
+/// [`Context::start`]) and +0x90 ([`Context::action`]). They are 0 here.
+/// The first run of the route's steps on such a context pops it
+/// (0x45ae71), and nothing ported reads either word of a context that
+/// names no object.
+pub(crate) fn loaded_context() -> Context {
+    Context {
+        candidates: Vec::new(),
+        slot: DEFAULT_SLOT,
+        target: 0,
+        person: 0,
+        chosen: -1,
+        best: -1,
+        word_58: 0,
+        time: 0,
+        saved: [0; 2],
+        word_68: 0,
+        start: [0; 3],
+        byte_78: true,
+        objects: [0; 2],
+        byte_84: false,
+        result: 0,
+        word_8c: 0,
+        byte_8e: false,
+        word_94: 0,
+        limit: 0x30,
+        action: 0,
+    }
+}
+
 /// A new route context for a person and a slot of an object (0x48163e,
 /// 0x481693).
 pub(crate) fn new_context(world: &World, person: u16, target: u16, slot: RouteSlot) -> Context {
@@ -451,7 +505,7 @@ fn place_answer(
         Err(Refusal::Collision(Some(other))) => {
             (if is_person(other)? { 5 } else { 1 }, Some(other))
         }
-        Err(Refusal::OffLot | Refusal::Other) => (0, None),
+        Err(Refusal::OffLot | Refusal::Other | Refusal::SameWall) => (0, None),
         Err(Refusal::Unrecorded) => {
             return Err(unsupported(
                 "0x48158c",

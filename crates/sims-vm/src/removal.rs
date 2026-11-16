@@ -120,7 +120,7 @@ impl Interpreter<'_> {
     /// lot's size do not change.
     ///
     /// For the Goth house this was compared with a capture of the original
-    /// at the moment the clear returns; see `docs/decisions.md`.
+    /// at the moment the clear returns; see `docs/decisions/`.
     ///
     /// Not modeled: the interface is switched off for the duration, each
     /// indicator's graphics are released, and the lot's pools of spare
@@ -404,6 +404,8 @@ impl Interpreter<'_> {
             world.animators.remove(&id);
             world.base_layers.remove(&id);
             world.translated_bones.remove(&id);
+            world.held_poses.remove(&id);
+            world.stops_asked.remove(&id);
             world.routing.routes.remove(&id);
             world.person_ticks.remove(&id);
             world

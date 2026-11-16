@@ -1,4 +1,4 @@
-use crate::animator::{Animator, Layer};
+use crate::animator::{Animator, HeldPose, Layer};
 use crate::neighbors::{Family, Neighbors};
 use crate::rooms::Rooms;
 use crate::route::Routing;
@@ -169,6 +169,25 @@ pub struct World {
     /// 2. Like the neighborhood's people, they belong to the running
     /// game, not to the lot.
     pub neighborhood_data: [i16; 16],
+    /// The pose each person's skin holds from the load, for each person
+    /// whose skin has sampled no layer since (see [`HeldPose`]). The load
+    /// restores the saved layers, poses the skin with them and places it
+    /// (0x5918ba), and the person's reset then takes the layers away
+    /// (0x589220) but leaves the bones; the skin's next update that
+    /// samples a layer ends it. Kept apart from the animator so that the
+    /// encodings of the states before it was kept stay a prefix of the new
+    /// ones.
+    pub held_poses: BTreeMap<u16, HeldPose>,
+    /// The people whose animator was asked to stop its route while the
+    /// route was under way (animator +0x284 set by 0x589e2d), since the
+    /// route started: a route's start clears it (0x589d38), and the walk
+    /// stops the route at its next step when it is set (0x58eeeb). A new
+    /// animator's constructor sets it too (0x5887b7), and the reset can
+    /// (0x5892dd); neither is kept, as the walk reads it only on a route
+    /// under way (+0x188 1), which only a route's start makes. Kept apart
+    /// from the animator so that the encodings of the states before it
+    /// was kept stay a prefix of the new ones.
+    pub stops_asked: BTreeSet<u16>,
 }
 
 /// How many advertisements the record of [`World::advertisement_record`]
@@ -508,6 +527,8 @@ impl World {
             base_layers: BTreeMap::new(),
             translated_bones: BTreeMap::new(),
             neighborhood_data: [0; 16],
+            held_poses: BTreeMap::new(),
+            stops_asked: BTreeSet::new(),
         }
     }
 

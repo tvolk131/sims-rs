@@ -1681,8 +1681,10 @@ dependencies = [
  "libm",
  "sha2",
  "sims-content",
+ "sims-core",
  "sims-formats",
  "sims-sim",
+ "sims-vm",
 ]
 
 [[package]]
@@ -1693,6 +1695,7 @@ dependencies = [
  "sims-render",
  "sims-sim",
  "sims-ui",
+ "sims-vm",
  "softbuffer",
  "winit",
 ]
