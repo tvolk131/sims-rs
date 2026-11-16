@@ -5,7 +5,7 @@
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_content::{Index, Install, Neighborhood};
 use sims_ui::art::Art;
-use sims_ui::household::{Careers, Faces, Snapshot};
+use sims_ui::household::{Acquaintances, Careers, Faces, Snapshot};
 use sims_vm::boot::{Frames, Lot};
 use std::path::{Path, PathBuf};
 
@@ -69,9 +69,10 @@ pub fn open(root: &Path, house: &str) -> Opened {
     let (_, family) = neighborhood.family_in(number).unwrap();
     let careers = Careers::load(&index).unwrap();
     // The friendship threshold the original's tuning gives (0x6c4398).
+    let known = Acquaintances::read(&index, catalog, install.expansions, 50);
     let snapshot = Snapshot::read(world, &family.members)
         .with_careers(&careers)
-        .with_relations(world, &family.members, 50);
+        .with_relations(world, &family.members, &known);
     let ui = UiGraphics::open(&install).unwrap();
     let art = Art::load(&ui, US_ENGLISH, &sims_ui::hud::RESOURCES).unwrap();
     let faces = Faces::load(&index, catalog, &family.members).unwrap();

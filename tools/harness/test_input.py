@@ -313,6 +313,81 @@ class RunnerTest(RunnerBase):
         self.assertEqual(len(self.agent.commands), 2)
         self.assertIn('mousedown 1', self.agent.commands[1])
 
+    def test_a_press_is_held_while_updates_return(self):
+        # A short press can fall inside one of capture.py's stops, where the
+        # game never sees the button down; the button stays down until
+        # HOLD_UPDATES updates have returned, then is let go.
+        r = self.runner('click 10 20')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        self.assertEqual(self.last_command(), 'xdotool mousedown 1')
+        down = self.update
+        self.tick_until(r, lambda: 'mouseup' in self.last_command())
+        self.assertEqual(self.last_command(), 'xdotool mouseup 1')
+        self.assertGreaterEqual(self.update - down, inp.HOLD_UPDATES)  # its end is seen at the first
+        self.assertEqual([c['what'] for c in self.rows('command')], ['move', 'press', 'release'])
+        self.tick(r)
+        self.assertTrue(r.finished)
+        self.assertIsNone(r.failed)
+
+    def test_a_dialog_while_the_button_is_down_still_releases_it(self):
+        r = self.runner('click 10 20\nanswer-dialog 400 400')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        r.on_dialog('dialog_show', self.update + 1)  # the press opened a modal dialog
+        self.assertEqual([c['what'] for c in self.rows('command')], ['move', 'press', 'release', 'press'])
+        self.assertIn('400 400', self.last_command())
+        self.agent.finish_all()
+        r.on_dialog('dialog_result', self.update + 1)
+        self.assertTrue(r.finished)
+        self.assertIsNone(r.failed)
+
+    def test_a_capture_ending_while_the_button_is_down_releases_it(self):
+        r = self.runner('click 10 20')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        self.tick(r)  # the press has ended; the hold goes on
+        r.close()
+        self.runners.remove(r)
+        self.assertEqual(self.last_command(), 'xdotool mouseup 1')
+        self.assertEqual(self.rows('command')[-1]['reason'], 'capture ended')
+        self.assertEqual(self.rows('scenario')[-1]['status'], 'unfinished')
+
+    def test_a_failure_while_the_button_is_down_releases_it(self):
+        r = self.runner('click 10 20')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        self.agent.finish_all()
+        r.on_update(self.update + 1, None, self.g.sim)  # memory cannot be read: the step fails
+        self.assertTrue(r.failed)
+        self.assertEqual(self.last_command(), 'xdotool mouseup 1')
+        self.assertEqual(self.rows('command')[-1]['reason'], 'step failed')
+        r.close()
+        self.runners.remove(r)
+        self.assertEqual(sum('mouseup' in c for c in self.agent.commands), 1)
+
+    def test_a_release_that_cannot_be_submitted_is_tried_again(self):
+        r = self.runner('click 10 20')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        submit, broken = self.agent.submit, [2]
+
+        def flaky(command):  # the next two submissions fail (the hold's release, then fail()'s)
+            if broken[0]:
+                broken[0] -= 1
+                raise OSError('rename failed')
+            return submit(command)
+        self.agent.submit = flaky
+        self.tick_until(r, lambda: r.failed)  # the hold's release could not be submitted
+        self.assertNotIn('mouseup', self.last_command())
+        self.assertEqual(self.rows('release_failed')[-1]['reason'], 'step failed')
+        r.close()
+        self.runners.remove(r)
+        self.assertEqual(self.last_command(), 'xdotool mouseup 1')
+        self.assertEqual(self.rows('command')[-1]['reason'], 'capture ended')
+
+    def test_a_released_press_is_not_released_again(self):
+        r = self.runner('click 10 20\nwait 5')
+        self.tick_until(r, lambda: 'mouseup' in self.last_command())
+        r.close()
+        self.runners.remove(r)
+        self.assertEqual(sum('mouseup' in c for c in self.agent.commands), 1)
+
     def test_click_object_choose_and_expect(self):
         g = self.g
         floor = g.add_object(29, [0, 0])

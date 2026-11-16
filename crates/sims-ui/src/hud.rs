@@ -694,7 +694,7 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
     }
     if let (Some(_), Panel::Relationships) = (selected, controls.panel) {
         let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
-        relationships(items, panel, &snapshot.relations, controls);
+        relationships(items, panel, snapshot, controls);
     }
     // The name of the person whose portrait the pointer is on, over the
     // strip above the portrait. Ours: where and how the original shows a
@@ -1033,7 +1033,8 @@ fn draw_work(
 }
 
 /// The relationship panel's list buttons, top to bottom, and whom each
-/// lists (0x51d9aa); the Superstar one is disabled (0x51a7ea).
+/// lists (0x51d9aa); the Superstar one is disabled without that pack
+/// (0x51a7ea, [`Snapshot::superstar`]).
 const RELATION_BUTTONS: [(i32, Relations); 4] = [
     (id::FAMILY, Relations::Family),
     (id::FRIENDS, Relations::Friends),
@@ -1057,7 +1058,7 @@ const RELATIONS_TOP: i32 = 18;
 /// Lays out the relationship panel in the subpanel `panel` (0x51d75b,
 /// in a western language): the four list buttons down its left, the
 /// page arrows when there is a page that way, and a page of entries.
-fn relationships(items: &mut Vec<Item>, panel: Rect, relations: &[Relation], controls: &Controls) {
+fn relationships(items: &mut Vec<Item>, panel: Rect, snapshot: &Snapshot, controls: &Controls) {
     let fh = RELATIONS_FONT_HEIGHT;
     // 0x51dd1d: the first button 3 in, the others 2, each a pixel below
     // the one before.
@@ -1078,15 +1079,17 @@ fn relationships(items: &mut Vec<Item>, panel: Rect, relations: &[Relation], con
                 cells: 4,
                 selected: controls.relations == *list,
             },
-            command: (*list != Relations::Stars).then_some(Command::ShowRelations(*list)),
+            command: (*list != Relations::Stars || snapshot.superstar)
+                .then_some(Command::ShowRelations(*list)),
         });
     }
-    let shown: Vec<&Relation> = relations
+    let shown: Vec<&Relation> = snapshot
+        .relations
         .iter()
         .filter(|r| match controls.relations {
             Relations::Family => r.family,
             Relations::Friends => r.friends,
-            Relations::Stars => false,
+            Relations::Stars => r.star,
             Relations::Everyone => true,
         })
         .collect();
@@ -1607,6 +1610,16 @@ pub fn hovered(items: &[Item], point: Option<[i32; 2]>) -> Option<usize> {
     items[n].command.is_some().then_some(n)
 }
 
+/// The relationship entry under `point`, which is drawn lit while the
+/// pointer is on it, so that moving onto, off or between entries changes
+/// the frame although the entries take no presses.
+pub fn lit_relation(items: &[Item], point: Option<[i32; 2]>) -> Option<usize> {
+    let [x, y] = point?;
+    items
+        .iter()
+        .rposition(|i| matches!(i.kind, Kind::Relation { .. }) && i.rect.contains(x, y))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1638,6 +1651,7 @@ mod tests {
             selected: Some(21),
             family_friends: 0,
             relations: Vec::new(),
+            superstar: false,
         }
     }
 
@@ -2018,6 +2032,7 @@ mod tests {
             friends,
             pink_heart: false,
             red_heart: false,
+            star: id == 4,
             family,
         }
     }
@@ -2130,6 +2145,21 @@ mod tests {
         controls.relations = Relations::Friends;
         let items = layout([800, 600], &s, &controls);
         assert_eq!(entries(&items), row(&[1, 3, 5, 7]));
+        // With the Superstar pack its button can be pressed, and lists
+        // those with fame.
+        s.superstar = true;
+        let items = layout([800, 600], &s, &controls);
+        let stars = items
+            .iter()
+            .find(|i| matches!(i.kind, Kind::Button { id, .. } if id == id::STARS));
+        assert_eq!(
+            stars.and_then(|i| i.command.clone()),
+            Some(Command::ShowRelations(Relations::Stars))
+        );
+        controls.apply(&Command::ShowRelations(Relations::Stars));
+        assert_eq!(entries(&layout([800, 600], &s, &controls)), row(&[4]));
+        s.superstar = false;
+        controls.relations = Relations::Friends;
         // The pointer on an entry lights it.
         controls.pointer = Some([521 + 35 + 45 + 10, 540]);
         let lit: Vec<bool> = layout([800, 600], &s, &controls)
@@ -2140,6 +2170,18 @@ mod tests {
             })
             .collect();
         assert_eq!(lit, [false, true, false, false]);
+        // Moving between entries, or off them, changes what is lit,
+        // though no entry takes a press.
+        let items = layout([800, 600], &s, &controls);
+        let second = lit_relation(&items, controls.pointer).expect("an entry under the pointer");
+        assert!(matches!(
+            items[second].kind,
+            Kind::Relation { lit: true, .. }
+        ));
+        assert_eq!(hovered(&items, controls.pointer), None);
+        let first = lit_relation(&items, Some([521 + 35 + 10, 540]));
+        assert!(first.is_some_and(|n| n != second));
+        assert_eq!(lit_relation(&items, Some([0, 0])), None);
         // Nobody selected, no panel.
         s.selected = None;
         let items = layout([800, 600], &s, &controls);
@@ -2170,6 +2212,7 @@ mod tests {
             friends: false,
             pink_heart: false,
             red_heart: true,
+            star: false,
             family: false,
         };
         // The face: lifetime plus 100 over the strip's cell width, as the
@@ -2265,6 +2308,7 @@ mod tests {
             friends: true,
             pink_heart: true,
             red_heart: true,
+            star: false,
             family: false,
         };
         // No font: no numbers, and the bars right under the face.

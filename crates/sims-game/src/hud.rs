@@ -16,7 +16,7 @@ use sims_ui::art::Art;
 use sims_ui::command::{Command, Panel as UiPanel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
-use sims_ui::household::{Careers, Faces, Snapshot};
+use sims_ui::household::{Acquaintances, Careers, Faces, Snapshot};
 use sims_ui::hud::{self, Controls, Item};
 use sims_ui::pie;
 use sims_ui::queue::Queue;
@@ -49,9 +49,10 @@ pub struct Hud {
     /// The careers of `work.iff`, for what the job panel shows the next
     /// level needs.
     careers: Careers,
-    /// The autonomy tuning's friendship threshold (0x6c4398), for the
-    /// relationship panel's smileys.
-    friendship: i32,
+    /// What the relationship panel needs from outside the world: the
+    /// autonomy tuning's friendship threshold (0x6c4398) for its
+    /// smileys, the neighborhood's characters, and the Superstar pack.
+    known: Acquaintances,
     labels: Labels,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
@@ -122,13 +123,19 @@ impl Hud {
         let faces =
             Faces::load(assets.index(), assets.catalog(), &people).map_err(|e| e.to_string())?;
         let careers = Careers::load(assets.index()).map_err(|e| e.to_string())?;
+        let known = Acquaintances::read(
+            assets.index(),
+            assets.catalog(),
+            install.expansions,
+            friendship,
+        );
         Ok(Self {
             art,
             faces,
             thumbnails: Thumbnails::default(),
             problems: Vec::new(),
             careers,
-            friendship,
+            known,
             labels,
             members,
             // The strip opens as if Live had been pressed.
@@ -178,7 +185,7 @@ impl Hud {
     pub fn snapshot(&self, world: &World) -> Snapshot {
         let snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
         if self.controls.panel == UiPanel::Relationships {
-            snapshot.with_relations(world, &self.members, self.friendship)
+            snapshot.with_relations(world, &self.members, &self.known)
         } else {
             snapshot
         }
@@ -381,12 +388,14 @@ impl Hud {
         };
         let before = (
             hud::hovered(&self.items, self.controls.pointer),
+            hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
             entry(self.controls.pointer),
         );
         self.controls.pointer = Some(point);
         (
             hud::hovered(&self.items, self.controls.pointer),
+            hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
             entry(self.controls.pointer),
         ) != before

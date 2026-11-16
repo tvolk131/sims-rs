@@ -607,7 +607,7 @@ impl Painter<'_> {
                     };
                     let patterns = self.sides(index, x, y, s.bit);
                     let n = self.rotate_direction(s.normal);
-                    let front = usize::from(n[0] + n[1] < 0);
+                    let front = shown_side(n);
                     let cut = cut.cuts(self.camera, [x, y], s.bit, style);
                     let key = edge(s.from, s.to);
                     let opening = openings.get(&key);
@@ -688,9 +688,15 @@ impl Painter<'_> {
         let at = match frame {
             0 | 2 => [left[0], left[1] - h],
             1 => [left[0], left[1] - (h - rise)],
+            // An edge-on diagonal stands centred on its column, a pixel
+            // higher at far zoom, two at medium and four at near than the
+            // other frames (fitted to the original's screen: its column
+            // shows the pattern's first texel column from these rows,
+            // 2026-11-15).
             _ => {
                 let bottom = if a[1] > b[1] { a } else { b };
-                [bottom[0] - w / 2, bottom[1] - h]
+                let lift = 1 << self.camera.zoom.index();
+                [bottom[0] - w / 2, bottom[1] - h - lift]
             }
         };
         let anchor = match (frame, a[1].cmp(&b[1])) {
@@ -1306,6 +1312,20 @@ fn wall_image(
     assets.pattern(pattern, zoom)?[frame].masked(&shape)
 }
 
+/// Which side of a wall shows, as an index into `Scene::sides` (0 the
+/// side its normal points to, 1 the other), from its normal turned into
+/// the view. A wall shows the side facing the camera. An edge-on
+/// diagonal (normal (1, −1) or (−1, 1) in the view) faces neither way and
+/// shows the side facing view direction (−1, 1), as the original's runs
+/// store it (0x53f6c1, turned with the view at 0x53d93a).
+fn shown_side(normal: [i32; 2]) -> usize {
+    if normal[0] + normal[1] == 0 {
+        usize::from(normal != [-1, 1])
+    } else {
+        usize::from(normal[0] + normal[1] < 0)
+    }
+}
+
 /// The frame of a wall by its direction on screen, from the screen points
 /// of its two ends.
 fn wall_frame([a, b]: [[i32; 2]; 2]) -> usize {
@@ -1530,6 +1550,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_edge_on_diagonal_shows_the_side_facing_view_minus_one_one() {
+        // Face-on walls show the side facing the camera.
+        assert_eq!(shown_side([1, 0]), 0);
+        assert_eq!(shown_side([1, 1]), 0);
+        assert_eq!(shown_side([0, -1]), 1);
+        assert_eq!(shown_side([-1, -1]), 1);
+        // The Goths' bay ends: at rotation 0 the ascending diagonal's
+        // normal (1, -1) points away from (-1, 1), so its other side (the
+        // shingles) shows; at rotation 1 the descending one's turns to
+        // (-1, 1), and its own side shows. Both checked on screen.
+        assert_eq!(shown_side(rotate_direction(0, [1, -1])), 1);
+        assert_eq!(shown_side(rotate_direction(1, [1, 1])), 0);
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! Load step 6e: saved objects are constructed, then read.
 
 use crate::support::*;
-use sims_content::{People, Skeleton};
+use sims_content::{Clip, Event, People, Skeleton, Track};
 use sims_core::CrtRng;
+use sims_core::F32;
 use sims_formats::saved_objects::{Instance, Multipart, Objects, Slot};
+use sims_sim::animator::{Base, LOADED};
 use sims_sim::neighbors::{Neighbor, Neighbors};
 use sims_vm::{Fault, SavedRead, Trap};
 use std::collections::BTreeMap;
@@ -15,7 +17,8 @@ const STOOL: u32 = 0x5004;
 
 /// A cleared lot whose catalog has a chair (12 attributes, 3 dynamic
 /// sprites), two person types, and a stool whose definition asks for
-/// nothing.
+/// nothing. Both person types' scripts changed since the save, so load
+/// step 13 resets their people.
 fn lot() -> Fixture {
     let mut fx = Fixture::new();
     fx.world.objects.clear();
@@ -28,6 +31,7 @@ fn lot() -> Fixture {
     fx.add_type(CHILD, 2, 0, 4097);
     fx.add_type(STOOL, 4, 0, 4097);
     fx.world.neighbors = records(11);
+    fx.world.changed_types = [ADULT, CHILD].into();
     fx
 }
 
@@ -439,5 +443,254 @@ fn people_the_read_cannot_construct_fail_loudly() {
     let (_, cause) = trap(read(&mut fx, &file(vec![saved(3, ADULT)]), &people()));
     assert!(matches!(cause, Trap::Invalid(_)), "{cause:?}");
     // The stream and the files read are as they were.
+    assert_eq!(fx.world.encode(), before.encode());
+}
+
+/// A clip of 100 ms with one bound motion, and a motion with these events
+/// (time, and whether it has a property).
+fn clip(name: &str, events: &[(i32, bool)]) -> Clip {
+    let tracks = if events.is_empty() {
+        Vec::new()
+    } else {
+        vec![Track {
+            bone: "ROOT".into(),
+            events: events
+                .iter()
+                .map(|&(time, any)| Event {
+                    time,
+                    properties: if any {
+                        vec![("xevt".into(), "1".into())]
+                    } else {
+                        Vec::new()
+                    },
+                })
+                .collect(),
+        }]
+    };
+    Clip {
+        name: name.into(),
+        skill: "loaded-skill".into(),
+        duration: 0x42c8_0000,
+        distance: 0,
+        moving: false,
+        frames: 4,
+        motions: 1,
+        tracks,
+        channels: Vec::new(),
+        samples: [0, 0],
+    }
+}
+
+/// The lot, with the child's type unchanged since the save, so the load
+/// does not reset the child (0x459bf6), at tick 88444, with a foreground
+/// clip whose one event comes at 80 ms and a base clip without events
+/// that moves ROOT.
+fn unreset_lot() -> Fixture {
+    let mut fx = lot();
+    fx.world.changed_types.remove(&CHILD);
+    fx.world.ticks = 88444;
+    fx.program
+        .animations
+        .insert("test.far", clip("fg-clip", &[(80, true)]));
+    // The base clip moves ROOT and only turns PELVIS.
+    let mut base = clip("base-clip", &[]);
+    base.channels = vec![
+        sims_content::Channel {
+            bone: "ROOT".into(),
+            translation: Some(0),
+            rotation: Some(0),
+        },
+        sims_content::Channel {
+            bone: "PELVIS".into(),
+            translation: None,
+            rotation: Some(1),
+        },
+    ];
+    fx.program.animations.insert("test.far", base);
+    fx.program.animations.insert_samples("loaded-skill");
+    fx
+}
+
+/// A child saved with the foreground and base layers at these phases (in
+/// thousandths), a routing state, engaged and 7 events seen.
+fn playing_child(foreground: i32, base: i32, routing_state: i32) -> Instance {
+    let mut child = sim(2, CHILD);
+    let person = child.person.as_mut().unwrap();
+    person.animations = [
+        format!("fg-clip;1;1000;{foreground};1000;1;0;0"),
+        String::new(),
+        format!("base-clip;-10;1000;{base};1000;1;0;0"),
+    ];
+    person.routing_state = routing_state;
+    person.engaged = 1;
+    person.animation_events = 7;
+    child
+}
+
+#[test]
+fn a_person_the_load_does_not_reset_plays_on_from_its_saved_layers() {
+    // Its animator keeps what the restore read (0x5918ba): the layers at
+    // the saved phases, updated once at the load's clock with no time
+    // gone by (0x5992b3), the events seen (+0xa4), whether it plays
+    // (+0xa0), and its routing state (+0x190) when that is 0 to 3.
+    let bits = |f: F32| f.to_bits();
+    for (saved, state) in [(0, 0), (2, 2), (4, 3), (-1, 3)] {
+        let mut fx = unreset_lot();
+        let objects = file(vec![sim(3, ADULT), playing_child(500, 250, saved)]);
+        read(&mut fx, &objects, &people()).unwrap();
+        let clock = LOADED.clock_at(88444);
+        assert_ne!(clock, 0);
+        let a = &fx.world.animators[&2];
+        assert_eq!(a.state, state, "saved {saved}");
+        assert!(a.playing);
+        assert_eq!(a.seen, 7);
+        // The reset sets +0x1a0; the constructor's 0 stays.
+        assert!(!a.promote);
+        assert_eq!((a.clock, a.skin_clock, a.head_clock), (clock, clock, clock));
+        assert!(!a.skin_dirty);
+        let fg = a.foreground.as_ref().unwrap();
+        assert_eq!((fg.current, fg.previous), (clock, clock));
+        assert_eq!(bits(fg.phase), 0.5f32.to_bits());
+        // The event at 80 ms is still to come.
+        assert_eq!((fg.event_time, fg.previous_event_time), (50, 50));
+        assert_eq!((fg.cursors.clone(), fg.mode, fg.priority), (vec![0], 1, 1));
+        assert!(a.carry.is_none());
+        // The base layer waits in the base slot; the constructor's posture
+        // is -1, so the first base update clears it.
+        assert_eq!(a.base, Base::Loaded);
+        let base = &fx.world.base_layers[&2];
+        assert_eq!((base.current, base.event_time), (clock, 25));
+        assert_eq!(bits(base.phase), 0.25f32.to_bits());
+        // Placed on the person's tile, its destination there too.
+        assert_eq!(a.destination, a.position);
+        // The skin's update at load posed it with the base layer, which
+        // moved ROOT (0x5992b3, 0x598226): the bone counts as moved since
+        // the skin was made.
+        assert_eq!(
+            fx.world.translated_bones.get(&2),
+            Some(&std::collections::BTreeSet::from(["ROOT".to_owned()]))
+        );
+        assert!(!fx.world.translated_bones.contains_key(&3));
+        // Nothing is held for a skin the load did not reset.
+        assert!(!fx.world.held_poses.contains_key(&2));
+        // The adult, whose type changed, is reset as before.
+        assert!(fx.world.animators[&3].promote);
+    }
+}
+
+#[test]
+fn a_saved_layer_the_restore_cannot_play_fails_loudly() {
+    // A foreground layer saved past its event: the update at load reaches
+    // it before the person's data words are read.
+    let mut fx = unreset_lot();
+    let before = fx.world.clone();
+    let objects = file(vec![sim(3, ADULT), playing_child(900, 250, 3)]);
+    let (object, cause) = trap(read(&mut fx, &objects, &people()));
+    assert_eq!(object, 2);
+    assert!(
+        matches!(&cause, Trap::Unsupported(text) if text.contains("0x5992b3")),
+        "{cause:?}"
+    );
+    assert_eq!(fx.world.encode(), before.encode());
+
+    // A base clip with timed events.
+    let mut fx = unreset_lot();
+    let mut child = playing_child(500, 250, 3);
+    child.person.as_mut().unwrap().animations[2] = "fg-clip;-10;1000;0;1000;1;0;0".into();
+    let (object, cause) = trap(read(&mut fx, &file(vec![child]), &people()));
+    assert_eq!(object, 2);
+    assert!(
+        matches!(&cause, Trap::Unsupported(text) if text.contains("timed events")),
+        "{cause:?}"
+    );
+
+    // A clip our content lacks.
+    let mut fx = unreset_lot();
+    let mut child = playing_child(500, 250, 3);
+    child.person.as_mut().unwrap().animations[0] = "no-such-clip;1;1000;0;1000;1;0;0".into();
+    let (_, cause) = trap(read(&mut fx, &file(vec![child]), &people()));
+    assert!(
+        matches!(&cause, Trap::Unsupported(text) if text.contains("not found")),
+        "{cause:?}"
+    );
+}
+
+#[test]
+fn the_load_restores_the_head_as_saved_and_relaxes_its_turn_after_tick_0() {
+    // The saved heading, target heading, turn and target point (0x5918ba).
+    // The target point is kept: a measurement whose target is gone reads
+    // it (0x5906bc). The constructor zeroed the head clock and set the
+    // animator's clock to the clock at the load's tick count, so the
+    // head's step relaxes the turn unless that is 0 (0x590788).
+    let bits = |f: sims_core::F32| f.to_bits();
+    for (ticks, relaxed) in [(0, false), (88444, true)] {
+        let mut fx = lot();
+        fx.world.ticks = ticks;
+        let mut adult = sim(3, ADULT);
+        adult.person.as_mut().unwrap().floats = [1.0, 2.0, 1.0, 70.0, 16.0, 80.0, 0.0, 0.0, 0.0];
+        read(&mut fx, &file(vec![adult]), &people()).unwrap();
+        let head = fx.world.animators[&3].head;
+        let mut turn = sims_sim::head::Head {
+            turn: sims_core::F32::from_f32(1.0),
+            ..sims_sim::head::Head::LOADED
+        };
+        if relaxed {
+            turn.relax();
+        }
+        assert_ne!(turn.turn.to_bits(), 0);
+        assert_eq!(
+            (
+                bits(head.heading),
+                bits(head.target_heading),
+                bits(head.turn)
+            ),
+            (1.0f32.to_bits(), 2.0f32.to_bits(), bits(turn.turn)),
+            "tick {ticks}"
+        );
+        assert_eq!(
+            head.target.map(|t| t.map(bits)),
+            Some([70.0f32, 16.0, 80.0].map(f32::to_bits))
+        );
+    }
+}
+
+#[test]
+fn a_person_saved_on_a_route_gets_as_many_empty_contexts_as_it_counted() {
+    // 0x460443: the save keeps only the count; each context is a copy of
+    // one the default constructor makes (0x4815f1, 0x46dd48, 0x481693).
+    let mut fx = lot();
+    let mut walking = sim(3, ADULT);
+    walking.person.as_mut().unwrap().routing_frames = 2;
+    let objects = file(vec![walking, sim(5, ADULT)]);
+    read(&mut fx, &objects, &people()).unwrap();
+    let contexts = &fx.world.routing.routes[&3].contexts;
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(contexts[0], contexts[1]);
+    let c = &contexts[0];
+    assert!(c.candidates.is_empty());
+    assert_eq!((c.target, c.person, c.chosen, c.best), (0, 0, -1, -1));
+    assert_eq!(
+        (c.slot.number, c.slot.snap_target, c.slot.facing),
+        (-1, -1, -2)
+    );
+    assert_eq!((c.slot.gradient, c.slot.flags), (0x3e40_0000, 0));
+    assert_eq!(
+        (c.byte_78, c.limit, c.saved, c.word_94),
+        (true, 0x30, [0; 2], 0)
+    );
+    // A person that counted none has none.
+    assert!(!fx.world.routing.routes.contains_key(&5));
+
+    // A negative count fails, and the lot is unchanged.
+    let mut fx = lot();
+    let before = fx.world.clone();
+    let mut odd = sim(3, ADULT);
+    odd.person.as_mut().unwrap().routing_frames = -1;
+    let (object, cause) = trap(read(&mut fx, &file(vec![odd]), &people()));
+    assert_eq!(object, 3);
+    assert!(
+        matches!(&cause, Trap::Unsupported(text) if text.contains("0x460443")),
+        "{cause:?}"
+    );
     assert_eq!(fx.world.encode(), before.encode());
 }
