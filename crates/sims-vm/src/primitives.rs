@@ -12,6 +12,7 @@ pub(crate) mod dialog;
 mod direction;
 pub(crate) mod distance;
 mod drop;
+mod drop_onto;
 mod events;
 mod expression;
 mod find_best_object;
@@ -152,6 +153,7 @@ impl Machine<'_, '_> {
             31 => self.set_to_next(operands)?.into(),
             41 => self.set_headline(operands)?.into(),
             42 => self.create_object(operands)?.into(),
+            43 => self.drop_onto(operands)?.into(),
             44 => self.animate_sim(operands)?,
             45 => self.go_to_slot(operands)?,
             46 => self.snap(operands)?.into(),
