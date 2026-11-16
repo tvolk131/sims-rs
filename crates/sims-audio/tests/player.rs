@@ -2020,9 +2020,9 @@ fn a_camera_move_places_every_track_again() {
 
 #[test]
 fn a_camera_move_leaves_a_track_that_has_ended() {
-    // The track's thread has ended, so the camera move has nothing to
-    // write to, asks nothing and faults nothing; its next start is
-    // placed afresh.
+    // The track's thread has ended with no note playing, so the camera
+    // move has nothing to write to, asks nothing and faults nothing; its
+    // next start is placed afresh.
     let generic: &[u8] = &[72, 6, 1, 20, END]; // getsrcdatafield v2, arg1, pan
     let probe = Probe {
         lot: on_lot(&[(9, 800)]),
@@ -2039,4 +2039,40 @@ fn a_camera_move_leaves_a_track_that_has_ended() {
     player.render(BLOCK, &probe);
     assert_eq!(*probe.asked.borrow(), [(9, 512), (9, 542)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_camera_move_places_a_note_that_outlived_its_script() {
+    // `note_on; end`: the thread ends at once and its long note plays
+    // on. The original's track object outlives the script, and kind 33's
+    // write reaches the note it plays: started in the middle of the
+    // screen, it is level both sides; once the camera has moved and the
+    // object is at the right edge, it is louder on the right.
+    let routine: &[u8] = &[2, 5, END];
+    let mut long = samples();
+    long.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![10_000; 20 * BLOCK],
+        },
+    );
+    let start = on_lot(&[(9, 400)]);
+    let right = on_lot(&[(9, 800)]);
+    for moved in [true, false] {
+        let mut player = Player::new(vec![module(&[routine], 1)], long.clone(), 1);
+        play_on(&mut player, 9, &start);
+        let out = player.render_stereo(2 * BLOCK, &start);
+        let last = out.len() - 2;
+        assert_eq!(out[last], out[last + 1], "{out:?}");
+        assert_ne!(out[last], 0);
+        if moved {
+            player.camera_moved(0, u32::MAX, &right);
+        }
+        let out = player.render_stereo(2 * BLOCK, &right);
+        let last = out.len() - 2;
+        assert_eq!(out[last + 1] > out[last], moved, "{:?}", &out[last..]);
+        assert!(player.faults.is_empty(), "{:?}", player.faults);
+    }
 }

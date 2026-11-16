@@ -598,6 +598,11 @@ pub struct Player<S> {
     /// The master volume, 0 to 1024.
     master: i32,
     notes: Vec<Note>,
+    /// The registers of threads that ended while their notes play on, by
+    /// thread ID, kept while those notes play: what the original's track
+    /// object keeps after its script ends, for a camera move to set
+    /// again ([`Player::camera_moved`]).
+    ended: BTreeMap<u32, Thread>,
     /// *(code)* Object instances: a track and an object it plays for, as
     /// the original records them (its hash multimap at manager +0xd4),
     /// each pair once, and each track's in the order the original goes
@@ -671,6 +676,7 @@ impl<S: Samples> Player<S> {
             group_volumes: BTreeMap::new(),
             master: 1024,
             notes: Vec::new(),
+            ended: BTreeMap::new(),
             instances: Vec::new(),
             track_objects: BTreeMap::new(),
             scores: BTreeMap::new(),
@@ -792,10 +798,17 @@ impl<S: Samples> Player<S> {
     /// (0x57de57), so it goes to the newest running thread of the track,
     /// which stands for the original's one track object, and on through
     /// its `target`, as kind 18's fade does. A fade on `extvol` is
-    /// undone by it and goes on from the new volume. A track with
-    /// instances but no running thread gets nothing (the original writes
-    /// to its idle track object, whose registers the next start sets
-    /// again).
+    /// undone by it and goes on from the new volume.
+    ///
+    /// The original's track object outlives its script, and a note it
+    /// started plays on after the script ends (`note_on` then `end`);
+    /// the write reaches that note too. Here a thread that ends with
+    /// notes playing keeps its registers while they play, and the write
+    /// goes to every such thread of the track as well (through its
+    /// `target`), whose notes take their new levels at once. When no
+    /// thread of the track runs, `Spl` is the newest ended one's. A
+    /// track with neither gets nothing: the original writes to its idle
+    /// track object, whose registers the next start sets again.
     ///
     /// Not ported: after a kind 25 that turns the sound on (0x573c64),
     /// the original writes the volume less 1 (or 1 for a volume of 0;
@@ -810,10 +823,18 @@ impl<S: Samples> Player<S> {
             }
         }
         for track in tracks {
-            if self.newest(track).is_none() {
-                continue;
-            }
-            let Some((vol, pan)) = self.placed(track, sources) else {
+            let ended: Vec<u32> = self
+                .ended
+                .values()
+                .filter(|t| t.track == track)
+                .map(|t| t.id)
+                .collect();
+            let spl = match (self.newest(track), ended.last()) {
+                (Some(_), _) => self.spl(track),
+                (None, Some(id)) => self.read(&self.ended[id], i64::from(SPL)),
+                (None, None) => continue,
+            };
+            let Some((vol, pan)) = self.placed_with(track, spl, sources) else {
                 continue;
             };
             if let Some(at) = self.newest(track) {
@@ -821,6 +842,19 @@ impl<S: Samples> Player<S> {
             }
             if let Some(at) = self.newest(track) {
                 self.write_at(at, PAN, pan);
+            }
+            for id in ended {
+                let Some(mut thread) = self.ended.remove(&id) else {
+                    continue;
+                };
+                self.write(&mut thread, i64::from(EXTVOL), vol);
+                self.write(&mut thread, i64::from(PAN), pan);
+                let levels = self.levels(&thread);
+                for note in self.notes.iter_mut().filter(|n| n.thread == id) {
+                    note.gains = levels.gains;
+                    note.step = step(levels.rate);
+                }
+                self.ended.insert(id, thread);
             }
         }
         self.set_ambience_view(view, hour);
@@ -1216,13 +1250,18 @@ impl<S: Samples> Player<S> {
     /// default, but no script writes `Spl`. A fault is reported, and
     /// gives `None`.
     fn placed(&mut self, track: u32, sources: &dyn Sources) -> Option<(i32, i32)> {
+        let spl = self.spl(track);
+        self.placed_with(track, spl, sources)
+    }
+
+    /// [`Player::placed`] with the given `Spl`.
+    fn placed_with(&mut self, track: u32, spl: i32, sources: &dyn Sources) -> Option<(i32, i32)> {
         let objects: Vec<u32> = self
             .instances
             .iter()
             .filter(|&&(t, _)| t == track)
             .map(|&(_, object)| object)
             .collect();
-        let spl = self.spl(track);
         match placement::combine(&objects, spl, sources) {
             Ok(placed) => Some(placed),
             Err(fault) => {
@@ -1427,6 +1466,7 @@ impl<S: Samples> Player<S> {
         self.threads.clear();
         self.pending.clear();
         self.notes.clear();
+        self.ended.clear();
         self.held.clear();
         self.seqgroups.clear();
         self.instances.clear();
@@ -1853,6 +1893,9 @@ impl<S: Samples> Player<S> {
         // A held track's notes keep their place and are not heard.
         self.notes
             .retain_mut(|note| held.contains(&note.track) || mix_note(note, cache, &mut sums));
+        let notes = &self.notes;
+        self.ended
+            .retain(|id, _| notes.iter().any(|note| note.thread == *id));
         self.voices
             .retain_mut(|voice| mix_note(&mut voice.note, ambient_cache, &mut sums));
         out.extend(sums.iter().map(|&s| s.clamp(-32768, 32767) as i16));
@@ -1960,6 +2003,9 @@ impl<S: Samples> Player<S> {
                     for note in self.notes.iter_mut().filter(|n| n.thread == thread.id) {
                         note.gains = levels.gains;
                         note.step = step(levels.rate);
+                    }
+                    if self.notes.iter().any(|n| n.thread == thread.id) {
+                        self.ended.insert(thread.id, thread.clone());
                     }
                     self.threads.remove(at);
                     // Its ducking request goes now, before the threads

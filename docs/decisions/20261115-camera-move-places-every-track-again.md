@@ -23,9 +23,16 @@ kind 33 only when the camera moves, and the player does the whole case.
     goes to the track's newest running thread. That thread stands for
     the original's one track object, as kind 18's fade does. A fade in
     progress goes on from the new volume.
-  - A track with no running thread gets nothing. The original writes
-    to its idle track object, and the next start sets those registers
-    again anyway.
+  - The original's track object outlives its script. A note started
+    with `note_on` then `end` plays on, and the write reaches that note
+    too. Here a thread that ends with notes still playing keeps its
+    registers while they play. The write also goes to every such thread
+    of the track, through its `target`, and their notes take the new
+    levels at once. When no thread of the track runs, `Spl` comes from
+    the newest of these ended threads.
+  - A track with neither a running thread nor such a note gets nothing.
+    The original writes to its idle track object, and the next start
+    sets those registers again anyway.
 - **A quirk not ported:**
   - After a kind 25 that turns the sound on (0x573c64), the manager's
     +0x114 is 100 for good. Kind 33 then writes the volume less 1, or 1
@@ -55,8 +62,10 @@ kind 33 only when the camera moves, and the player does the whole case.
 - After a camera move, a track started in the middle of the screen is
   at the volume and pan of the object's new place (750 and 542 at the
   right edge). Without a move, it stays where it started.
-- A track whose thread has ended gets nothing, and its next start is
-  placed afresh.
+- A note that plays on after its script ended moves to the object's
+  new place.
+- A track whose thread has ended and left no note gets nothing, and its
+  next start is placed afresh.
 - The Goths' lot plays with the camera scrolling every second.
 - A change of walls sends nothing.
 
