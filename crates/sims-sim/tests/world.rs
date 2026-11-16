@@ -1261,6 +1261,29 @@ fn snapshots_round_trip_through_redb() {
     assert!(store.load("missing").unwrap().is_none());
 }
 
+#[test]
+fn saved_lots_round_trip_through_redb_apart_from_the_snapshots() {
+    let file = Temp::new("lots");
+    let world = world();
+    {
+        let store = Snapshots::open(&file.0).unwrap();
+        // No lot table yet: nothing is saved.
+        assert!(store.load_lot("slot").unwrap().is_none());
+        store.save("slot", &world).unwrap();
+        store.save_lot("slot", b"first").unwrap();
+        store.save_lot("slot", b"second").unwrap();
+    }
+    let store = Snapshots::open(&file.0).unwrap();
+    // The later save replaced the earlier, and the snapshot of the same
+    // name is its own.
+    assert_eq!(store.load_lot("slot").unwrap().unwrap(), b"second");
+    assert_eq!(
+        store.load("slot").unwrap().unwrap().encode(),
+        world.encode()
+    );
+    assert!(store.load_lot("missing").unwrap().is_none());
+}
+
 fn person() -> sims_formats::saved_objects::Person {
     let interaction = sims_formats::saved_objects::Interaction {
         uid: 0,

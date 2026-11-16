@@ -12,6 +12,8 @@
 //! `sims boot` prints what this does; presentation crates use it to
 //! watch a lot run.
 
+pub mod save;
+
 use crate::play::Play;
 use crate::{Answers, Callback, Interpreter, Program, Stream, TickError, Update};
 use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People, Surfaces};

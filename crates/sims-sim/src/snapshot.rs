@@ -6,6 +6,10 @@ use std::path::Path;
 /// followed by the world's canonical encoding.
 const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
 
+/// Saved lots by name: what `sims_vm::boot::save` encodes, the world with
+/// the lot's own state, kept as its bytes.
+const LOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lots");
+
 /// Bumped whenever [`World`]'s encoding changes, so an old snapshot is
 /// refused instead of misread.
 pub const FORMAT: u32 = 28;
@@ -42,6 +46,31 @@ impl Snapshots {
     /// The snapshot saved under `name`, if any.
     pub fn load(&self, name: &str) -> Result<Option<World>> {
         load(&self.db, name)
+    }
+
+    /// Keeps a saved lot's bytes under `name`, replacing any of that name.
+    /// The lots are a table of their own, apart from the snapshots.
+    pub fn save_lot(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let txn = self.db.begin_write().map_err(store)?;
+        {
+            let mut table = txn.open_table(LOTS).map_err(store)?;
+            table.insert(name, bytes).map_err(store)?;
+        }
+        txn.commit().map_err(store)
+    }
+
+    /// The saved lot's bytes kept under `name`, if any.
+    pub fn load_lot(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let txn = self.db.begin_read().map_err(store)?;
+        let table = match txn.open_table(LOTS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(store(error)),
+        };
+        Ok(table
+            .get(name)
+            .map_err(store)?
+            .map(|value| value.value().to_vec()))
     }
 }
 
