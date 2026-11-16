@@ -91,6 +91,11 @@ pub(crate) struct Restored {
     pub animator: Option<Animator>,
     pub held: Option<HeldPose>,
     pub base: Option<Layer>,
+    /// The bones whose translation the restore's skin update could write
+    /// (0x5992b3, 0x598226), for [`sims_sim::World::translated_bones`]:
+    /// for a person the load does not reset. A reset person's are noted
+    /// when its held pose ends.
+    pub moved: Vec<String>,
 }
 
 /// One layer descriptor as the restore reads it (0x591eec; the save
@@ -252,6 +257,7 @@ impl Interpreter<'_> {
             animator: (a != LOADED).then_some(a),
             held,
             base: None,
+            moved: Vec::new(),
         })
     }
 
@@ -303,8 +309,9 @@ impl Interpreter<'_> {
             && !base.cursors.is_empty()
         {
             return Err(Trap::Unsupported(format!(
-                "person {id}'s saved base layer plays {:?}, whose clip has timed events, which \
-                 the base slot's layer is not ported to handle",
+                "person {id}'s saved base layer plays {:?}, whose clip has timed events, at the \
+                 load's skin update (0x5992b3): the base slot's layer is not ported to handle \
+                 them",
                 base.clip
             )));
         }
@@ -342,6 +349,15 @@ impl Interpreter<'_> {
         for layer in order {
             self.update_restored(id, layer, clock)?;
         }
+        // The forced update poses the skin with every layer (0x5992b3), so
+        // the bones they move count as moved since the skin was made, as
+        // at any skin update.
+        let moved = self.translated_by(
+            id,
+            [base.as_ref(), a.foreground.as_ref(), a.carry.as_ref()]
+                .into_iter()
+                .flatten(),
+        )?;
         a.skin_clock = clock;
         a.skin_dirty = false;
         let direction = object.data.get(1).copied().unwrap_or(0);
@@ -352,6 +368,7 @@ impl Interpreter<'_> {
             animator: Some(a),
             held: None,
             base,
+            moved,
         })
     }
 

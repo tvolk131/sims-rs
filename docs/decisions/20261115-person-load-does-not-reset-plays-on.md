@@ -26,6 +26,12 @@ constructor left (`Interpreter::restore_live`):
   slot (`Base::Loaded`, its layer in `World::base_layers`). The
   constructor's posture is -1, so the first base update (0x590430) takes
   it out unless the person's posture word is -1 too.
+- **The bones the layers move.** That update poses the skin, so each
+  bone a restored layer's motion translates counts as moved since the
+  skin was made (`World::translated_bones`, 0x598226), as at any skin
+  update. A head measurement later reading such a bone that no layer
+  then playing moves fails loudly, instead of taking it at rest. The
+  first review found this missing.
 - **The placement** (0x592132) sets the unset position and the
   destination from the person's tile. The head then takes its step as
   after a reset, and the head clock is the clock.

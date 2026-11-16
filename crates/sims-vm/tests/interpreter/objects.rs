@@ -483,7 +483,8 @@ fn clip(name: &str, events: &[(i32, bool)]) -> Clip {
 
 /// The lot, with the child's type unchanged since the save, so the load
 /// does not reset the child (0x459bf6), at tick 88444, with a foreground
-/// clip whose one event comes at 80 ms and a base clip without events.
+/// clip whose one event comes at 80 ms and a base clip without events
+/// that moves ROOT.
 fn unreset_lot() -> Fixture {
     let mut fx = lot();
     fx.world.changed_types.remove(&CHILD);
@@ -491,9 +492,21 @@ fn unreset_lot() -> Fixture {
     fx.program
         .animations
         .insert("test.far", clip("fg-clip", &[(80, true)]));
-    fx.program
-        .animations
-        .insert("test.far", clip("base-clip", &[]));
+    // The base clip moves ROOT and only turns PELVIS.
+    let mut base = clip("base-clip", &[]);
+    base.channels = vec![
+        sims_content::Channel {
+            bone: "ROOT".into(),
+            translation: Some(0),
+            rotation: Some(0),
+        },
+        sims_content::Channel {
+            bone: "PELVIS".into(),
+            translation: None,
+            rotation: Some(1),
+        },
+    ];
+    fx.program.animations.insert("test.far", base);
     fx.program.animations.insert_samples("loaded-skill");
     fx
 }
@@ -550,6 +563,14 @@ fn a_person_the_load_does_not_reset_plays_on_from_its_saved_layers() {
         assert_eq!(bits(base.phase), 0.25f32.to_bits());
         // Placed on the person's tile, its destination there too.
         assert_eq!(a.destination, a.position);
+        // The skin's update at load posed it with the base layer, which
+        // moved ROOT (0x5992b3, 0x598226): the bone counts as moved since
+        // the skin was made.
+        assert_eq!(
+            fx.world.translated_bones.get(&2),
+            Some(&std::collections::BTreeSet::from(["ROOT".to_owned()]))
+        );
+        assert!(!fx.world.translated_bones.contains_key(&3));
         // Nothing is held for a skin the load did not reset.
         assert!(!fx.world.held_poses.contains_key(&2));
         // The adult, whose type changed, is reset as before.
