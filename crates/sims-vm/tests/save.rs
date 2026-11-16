@@ -105,6 +105,29 @@ fn a_lot_saved_once_answered_takes_no_input_until_its_step() {
 }
 
 #[test]
+fn an_answered_save_takes_input_after_its_step_in_a_lot_that_does_not_wait() {
+    let Some((root, house)) = goth_house() else {
+        return;
+    };
+    let mut asked = Lot::load(&root, &house, &[], Frames::default()).unwrap();
+    asked.wait_for_answers();
+    asked.step().unwrap();
+    assert_eq!(asked.step().unwrap_err(), StepError::Asking { tick: 2 });
+    asked.answer(3).unwrap();
+    let saved = asked.save().unwrap();
+
+    // Restored into a lot that does not wait: the saved answer is given at
+    // the tick, and the lot then takes input.
+    let mut restored = Lot::load(&root, &house, &[], Frames::default()).unwrap();
+    restored.restore(saved).unwrap();
+    assert_eq!(restored.pause().unwrap_err(), OrderError::Asking);
+    restored.step().unwrap();
+    asked.step().unwrap();
+    assert_eq!(restored.world().hash(), asked.world().hash());
+    restored.pause().unwrap();
+}
+
+#[test]
 fn a_save_goes_back_only_into_the_house_it_came_from() {
     let Some((root, house)) = goth_house() else {
         return;
@@ -142,4 +165,9 @@ fn bytes_of_another_layout_are_refused() {
     header.extend(sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
     let refused = Saved::decode(&header).unwrap_err().to_string();
     assert!(refused.contains("save format 2"), "{refused}");
+    // The world's encoding is checked as well.
+    let mut header = sims_vm::boot::save::FORMAT.to_le_bytes().to_vec();
+    header.extend((sims_sim::SNAPSHOT_FORMAT - 1).to_le_bytes());
+    let refused = Saved::decode(&header).unwrap_err().to_string();
+    assert!(refused.contains("world format"), "{refused}");
 }

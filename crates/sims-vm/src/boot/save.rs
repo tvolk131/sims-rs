@@ -13,8 +13,13 @@
 //!
 //! The program is not saved. A save goes back into a lot loaded from the
 //! same install and house: [`Lot::restore`] checks the house and family
-//! the load selected, and the world's hash as the load left it, which
-//! the install, the neighborhood and the house file decide. Saving is this reimplementation's, not the
+//! the load selected, and the world's hash as the load left it. That hash
+//! tells apart another house file or neighborhood, and anything else the
+//! load puts in the world. It does not cover the install's code and
+//! constants, which the world does not hold: a save restored into a lot
+//! of an install whose code or tuning differs is not refused, and is not
+//! known to step as the saved lot would have. A save trusts that it goes
+//! back onto the same install. Saving is this reimplementation's, not the
 //! original's: the original saves the house file and the neighborhood,
 //! which is not ported.
 
@@ -23,8 +28,11 @@ use serde::{Deserialize, Serialize};
 use sims_sim::World;
 use std::collections::{BTreeSet, VecDeque};
 
-/// The version of [`Saved::encode`]'s layout, bumped when it changes. The
-/// world inside keeps [`sims_sim::SNAPSHOT_FORMAT`], which is written too.
+/// The version of [`Saved::encode`]'s layout: the fields of [`Saved`],
+/// their order and their types (postcard is not self-describing). Bump it
+/// in the commit that changes any of them. The world inside is versioned
+/// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. A save of
+/// another version is refused, not migrated.
 pub const FORMAT: u32 = 1;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
@@ -56,7 +64,9 @@ pub enum SaveError {
         loaded: (u32, u16),
     },
     /// The save is of the same house number and family, but of a lot the
-    /// load left otherwise: another neighborhood, install or house file.
+    /// load left otherwise: another neighborhood or house file, or a
+    /// version of this program that loads the house differently. A change
+    /// to the install's code or tuning alone is not seen.
     OtherLoad,
     /// The bytes are not a save this version reads.
     Format(String),
@@ -74,7 +84,8 @@ impl std::fmt::Display for SaveError {
             ),
             Self::OtherLoad => write!(
                 f,
-                "the save is of a lot loaded from other files (another neighborhood or install)"
+                "the save is of a lot loaded otherwise (another neighborhood or house \
+                 file, or a version that loads the house differently)"
             ),
             Self::Format(reason) => write!(f, "not a readable save: {reason}"),
         }
