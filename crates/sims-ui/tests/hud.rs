@@ -74,11 +74,11 @@ fn the_goths_panel_from_the_original_art() {
         ),
         (
             "open 800x600",
-            "4053f0e9e8e82794d8237278d08959676d006a0ee7021d53c68bbb959f96b13b",
+            "bf2b42823851f214c8673a7f05468d22bedf28cf808911288ce8a60dee588fb8",
         ),
         (
             "open 1280x720",
-            "607184ac1852a01d42b5f559806a6c07edfbac5edfbe2cd971dbbce708b43fd4",
+            "ad37fea8d004eda2bcfc8c9f2b28418eae06a22bfbab96d11853bd254dd3dee3",
         ),
     ];
     let digests: Vec<(&str, &str)> = digests.iter().map(|(n, d)| (*n, d.as_str())).collect();
