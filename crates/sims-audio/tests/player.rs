@@ -2049,20 +2049,109 @@ fn a_camera_move_places_a_note_that_outlived_its_script() {
     // screen, it is level both sides; once the camera has moved and the
     // object is at the right edge, it is louder on the right.
     let routine: &[u8] = &[2, 5, END];
-    let mut long = samples();
-    long.insert(
-        "one.xa".to_owned(),
+    let long = long_sample("one.xa");
+    let start = on_lot(&[(9, 400)]);
+    let right = on_lot(&[(9, 800)]);
+    for moved in [true, false] {
+        let mut player = Player::new(vec![module(&[routine], 1)], long.clone(), 1);
+        play_on(&mut player, 9, &start);
+        let out = player.render_stereo(2 * BLOCK, &start);
+        let last = out.len() - 2;
+        assert_eq!(out[last], out[last + 1], "{out:?}");
+        assert_ne!(out[last], 0);
+        if moved {
+            player.camera_moved(0, u32::MAX, &right);
+        }
+        let out = player.render_stereo(2 * BLOCK, &right);
+        let last = out.len() - 2;
+        assert_eq!(out[last + 1] > out[last], moved, "{:?}", &out[last..]);
+        assert!(player.faults.is_empty(), "{:?}", player.faults);
+    }
+}
+
+/// The test samples with `name` replaced by 20 blocks of 10,000.
+fn long_sample(name: &str) -> BTreeMap<String, Pcm> {
+    let mut map = samples();
+    map.insert(
+        name.to_owned(),
         Pcm {
             rate: RATE,
             channels: 1,
             samples: vec![10_000; 20 * BLOCK],
         },
     );
+    map
+}
+
+#[test]
+fn a_camera_move_does_not_follow_a_target_a_later_start_reset() {
+    // Track 10's first start plays a long note, sets its `target` to
+    // track 11 and ends; global 110 marks it. Its second start sees the
+    // mark and waits, its `target` itself, as a fresh start leaves the
+    // original's track object. Track 11 waits 10 ms for object 8, which
+    // does not move, then asks with its extvol and pan. The camera move
+    // places track 10's ended thread itself: track 11 keeps the full
+    // volume and the centre its own start gave it.
+    let mut first = vec![TEST, 110, IFNE];
+    first.extend(long(0x102));
+    first.extend(loadl(110, 1));
+    first.extend(NOTE_ON_V1);
+    first.extend(loadl(53, 11));
+    first.push(END);
+    let mut asks = loadl(5, 10);
+    asks.extend([WAIT, 5]);
+    asks.extend([72, 6, 1, 19, 72, 6, 1, 20, END]);
+    let waiting: &[u8] = &[SET_LOOP, LOOP];
+    let start = on_lot(&[(8, 400), (9, 400)]);
+    let probe = Probe {
+        lot: on_lot(&[(8, 400), (9, 800)]),
+        asked: Default::default(),
+    };
+    let mut player = Player::new(
+        vec![module(&[&first, &asks, waiting], 1)],
+        long_sample("one.xa"),
+        1,
+    );
+    let play = |player: &mut Player<_>, object: u32, name: &str| {
+        player.handle(
+            &SoundEvent::Play {
+                object,
+                name: name.into(),
+            },
+            &start,
+        );
+    };
+    play(&mut player, 8, "e1");
+    play(&mut player, 9, "e0");
+    player.render(BLOCK, &start);
+    play(&mut player, 9, "e0");
+    player.render(BLOCK, &start);
+    player.camera_moved(0, u32::MAX, &probe);
+    player.render(8 * BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(8, 1024), (8, 512)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_camera_move_places_a_sequenced_note_with_no_thread() {
+    // Track 10's routine ends at once, so kind 53 plays its long patch
+    // on the idle track object (thread 0). Started in the middle of the
+    // screen it is level both sides; once the camera has moved and the
+    // object is at the right edge, it is louder on the right.
     let start = on_lot(&[(9, 400)]);
     let right = on_lot(&[(9, 800)]);
     for moved in [true, false] {
-        let mut player = Player::new(vec![module(&[routine], 1)], long.clone(), 1);
+        let module = module_with(&[&[END]], 1, 10, "seq=53,10,0,6\n");
+        let mut player = Player::new(vec![module], long_sample("two.xa"), 1);
         play_on(&mut player, 9, &start);
+        player.render(BLOCK, &start);
+        player.handle(
+            &SoundEvent::Play {
+                object: 9,
+                name: "seq".into(),
+            },
+            &start,
+        );
         let out = player.render_stereo(2 * BLOCK, &start);
         let last = out.len() - 2;
         assert_eq!(out[last], out[last + 1], "{out:?}");

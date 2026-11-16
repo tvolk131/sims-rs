@@ -27,12 +27,23 @@ kind 33 only when the camera moves, and the player does the whole case.
     with `note_on` then `end` plays on, and the write reaches that note
     too. Here a thread that ends with notes still playing keeps its
     registers while they play. The write also goes to every such thread
-    of the track, through its `target`, and their notes take the new
-    levels at once. When no thread of the track runs, `Spl` comes from
-    the newest of these ended threads.
-  - A track with neither a running thread nor such a note gets nothing.
-    The original writes to its idle track object, and the next start
-    sets those registers again anyway.
+    of the track, and their notes take the new levels at once.
+  - Only the thread of the track's last start writes through its
+    `target`. A later start set the original's track object again, with
+    its `target` back to itself, so an older ended thread takes the
+    write itself. Otherwise a `target` that thread had set would carry
+    the write to another track.
+  - A note kind 53 played with no thread of the track running (thread
+    0, the original's idle track object) is placed too, from the
+    registers it started with, kept while it plays.
+  - `Spl` comes from the thread of the track's last start, running or
+    ended, or else from the kind 53 note's registers.
+  - A track with none of these gets nothing. The original writes to its
+    idle track object, and the next start sets those registers again
+    anyway.
+  - **Unverified:** the original's older notes follow its one track
+    object, so they would take the newest start's levels. Here each
+    keeps its own thread's, as notes do elsewhere in the player.
 - **A quirk not ported:**
   - After a kind 25 that turns the sound on (0x573c64), the manager's
     +0x114 is 100 for good. Kind 33 then writes the volume less 1, or 1
@@ -63,7 +74,9 @@ kind 33 only when the camera moves, and the player does the whole case.
   at the volume and pan of the object's new place (750 and 542 at the
   right edge). Without a move, it stays where it started.
 - A note that plays on after its script ended moves to the object's
-  new place.
+  new place, and so does a kind 53 note played with no thread running.
+- An ended thread whose track started again does not carry the write
+  through the `target` it had set: the other track keeps its levels.
 - A track whose thread has ended and left no note gets nothing, and its
   next start is placed afresh.
 - The Goths' lot plays with the camera scrolling every second.
