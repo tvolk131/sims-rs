@@ -533,21 +533,45 @@ fn the_snack_order_pays_for_the_snack() {
         let update = lot.step_play().unwrap();
         assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
     }
-    // Step 13199: object 18 (tree 0x101c node 15) sets something alight
-    // with Burn (opcode 9), which is not ported. Unverified: the strict
-    // run, without the snack, does not get there.
-    let update = lot.step_play().unwrap();
-    let [error] = &update.errors[..] else {
-        panic!("{:?}", update.errors);
+    // Step 13199: object 18, in the stove's cooking (tree 0x101c node 15),
+    // starts a fire with Burn (opcode 9, 0x44d96f): fire 41 at (296, 488).
+    // The fire spreads to the tiles around it as the fires' own trees run,
+    // five fires by step 15865. Unverified: no recording has this fire.
+    let fires = |lot: &Lot| -> Vec<(u16, [i32; 3])> {
+        lot.world()
+            .objects
+            .values()
+            .filter(|o| o.guid == 0x24c9_5f99)
+            .map(|o| (o.id, o.position))
+            .collect()
     };
-    assert_eq!(error.object, 18);
+    let mut lit = Vec::new();
+    for step in 13199..15925 {
+        let before = fires(&lot).len();
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+        if fires(&lot).len() != before {
+            lit.push(step);
+        }
+    }
+    assert_eq!(lit, [13199, 14388, 15009, 15288, 15865]);
     assert_eq!(
-        error.fault.at.map(|at| (at.tree, at.node)),
-        Some((0x101c, 15)),
-        "{error:?}"
+        fires(&lot),
+        [
+            (36, [280, 488, 1]),
+            (41, [296, 488, 1]),
+            (46, [296, 472, 1]),
+            (119, [312, 488, 1]),
+            (218, [264, 488, 1]),
+        ]
     );
+    // Step 15925: object 116, under fire 36 and holding object 120 in a
+    // slot, is taken off the lot, which needs the placement services the
+    // port's removal does not have yet (`removal.rs`).
+    let error = lot.step_play().unwrap_err();
     assert!(
-        matches!(error.fault.trap, sims_vm::Trap::Unimplemented { opcode: 9 }),
+        format!("{error:?}")
+            .contains("removing object 116 needs the lot's placement and callback services"),
         "{error:?}"
     );
 }
