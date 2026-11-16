@@ -27,9 +27,10 @@
 //! 0x478dfe), on every level: the original's model matrix (0x592132) adds
 //! the altitude whatever the level, and the renderer lifts an upper
 //! level's floor by the terrain under it too. On a level above the ground
-//! the original then adds an offset from the view's table, which is not
-//! ported: such a person stands that many floor heights above the ground,
-//! as the renderer projects the level.
+//! the original then adds its view's level offset ([`LEVEL_OFFSET`]) once
+//! per level above the first: up, and a sixth of a tile towards the viewer
+//! along both of the view's axes, whatever the rotation
+//! ([`View::place_on`]).
 //!
 //! **Depth.** [`People::draw_on_lot`] draws over a lot `sims_render` has
 //! drawn, as the original does: the lot first, then the people, each
@@ -83,6 +84,20 @@ pub const NEAR_PIXELS_PER_UNIT: f32 = 26.127_89;
 /// Fine units (sixteenths of a tile) per unit.
 const FINE_PER_UNIT: f32 = 16.0 / UNITS_PER_TILE;
 
+/// What the original adds to a person's position for each level above the
+/// first, in model units in the view (x and z along the view's two axes
+/// towards the viewer, y up): the three floats at the house view's
+/// +0x170 − 12·zoom (0x5922d2, through the view's virtual +0x24, which is
+/// +0xb8). The table is filled at run time; these values are read from the
+/// running original's memory, and are the same at all three zooms. The
+/// original turns the vector by the view's quarter turns back into the
+/// lot (0x5c3a20 by −rotation × π/2, the turn it builds the view's own
+/// matrix from at 0x49b60e), so it stays the same in the view at every
+/// rotation. On screen it nets out to 232.33 near-zoom pixels up, a
+/// third of a pixel more than the renderer's floor height, and it puts the
+/// person a sixth of a tile nearer.
+pub const LEVEL_OFFSET: [f32; 3] = [0.5, 9.300_511, 0.5];
+
 /// The side of the lot's arrays in fine units, on which the rotation is
 /// defined (the lot renderer's `ARRAY_SIZE` tiles).
 const ARRAY_FINE: f32 = sims_render::camera::ARRAY_SIZE as f32 * 16.0;
@@ -111,6 +126,28 @@ impl View {
         (
             rotate(self.camera.rotation, fine, ARRAY_FINE),
             p.y * NEAR_PIXELS_PER_UNIT,
+        )
+    }
+
+    /// A world point's fine position in the view and its elevation, as
+    /// [`View::place`] has them, for a person on `level`: moved by the
+    /// original's [`LEVEL_OFFSET`] once per level above the first, less
+    /// the floor height the lot renderer already raises `level` by. The
+    /// offset's sideways parts go along the view's own axes, so they are
+    /// the same at every rotation.
+    pub fn place_on(&self, p: Vec3, level: i32) -> ([f32; 2], f32) {
+        let (fine, elevation) = self.place(p);
+        let above = (level - 1).max(0) as f32;
+        // Fine x is the original's model z, fine y its model x.
+        let toward = |unit: f32| unit * FINE_PER_UNIT * above;
+        let floor = sims_render::Zoom::Near.floor_height() as f32;
+        let lift = (LEVEL_OFFSET[1] * NEAR_PIXELS_PER_UNIT - floor) * above;
+        (
+            [
+                fine[0] + toward(LEVEL_OFFSET[2]),
+                fine[1] + toward(LEVEL_OFFSET[0]),
+            ],
+            elevation + lift,
         )
     }
 
@@ -479,13 +516,13 @@ impl People {
         // Far to near by the root's depth, then by ID, so nearer soft
         // edges blend over farther people.
         let far = |p: &Posed| {
-            let (fine, elevation) = view.place(p.root.translation);
+            let (fine, elevation) = view.place_on(p.root.translation, p.level);
             depth(fine, elevation, p.level)
         };
         posed.sort_by(|a, b| far(b).total_cmp(&far(a)).then(a.id.cmp(&b.id)));
         for person in &posed {
             let project = |p| {
-                let (fine, elevation) = view.place(p);
+                let (fine, elevation) = view.place_on(p, person.level);
                 let [x, y] = view.screen(fine, elevation, person.level);
                 Vec3::new(x, y, depth(fine, elevation, person.level))
             };
@@ -595,6 +632,41 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// A person upstairs stands where the original's level offset puts
+    /// them: 232.33 near-zoom pixels above where they would stand on the
+    /// ground floor, straight up, and a sixth of a tile nearer along both
+    /// of the view's axes, at every zoom and rotation.
+    #[test]
+    fn a_person_upstairs_takes_the_originals_level_offset() {
+        for zoom in Zoom::ALL {
+            for rotation in 0..4 {
+                let view = View::new(&camera(zoom, rotation));
+                let p = Vec3::new(-7.0, 0.25, -11.0);
+                let (low, low_up) = view.place_on(p, 1);
+                assert_eq!((low, low_up), view.place(p));
+                let (high, high_up) = view.place_on(p, 2);
+                for axis in 0..2 {
+                    assert!(
+                        (high[axis] - low[axis] - 8.0 / 3.0).abs() < 1e-3,
+                        "{zoom:?} {rotation}"
+                    );
+                }
+                let a = view.screen(low, low_up, 1);
+                let b = view.screen(high, high_up, 2);
+                let scale = zoom.near_scale() as f32;
+                assert!(
+                    (b[0] - a[0]).abs() < 1e-3,
+                    "{zoom:?} {rotation}: {a:?} {b:?}"
+                );
+                assert!(
+                    (a[1] - b[1] - 232.33 / scale).abs() < 0.01,
+                    "{zoom:?} {rotation}: {} px up",
+                    a[1] - b[1]
+                );
             }
         }
     }
