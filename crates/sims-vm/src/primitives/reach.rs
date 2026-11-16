@@ -58,6 +58,7 @@ use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine, word};
 use crate::people::read_appearance_if_stale;
 use crate::placement::{Place, capture, on_lot};
+use core::cmp::Ordering;
 use sims_core::{Ext, F32};
 use sims_sim::animator::{Animator, LOADED, Layer};
 
@@ -535,7 +536,12 @@ fn unit() -> F32 {
 /// `fcomp`, so a height that is not a number counts as below 0.
 pub(crate) fn band(height: F32, sitting: bool) -> Option<usize> {
     let h = height.ext();
-    let below = |bits: u32| !(h >= F32::from_bits(bits).ext());
+    let below = |bits: u32| {
+        !matches!(
+            h.partial_cmp(&F32::from_bits(bits).ext()),
+            Some(Ordering::Greater | Ordering::Equal)
+        )
+    };
     let number = if below(0) {
         9
     } else if below(0x3f40_0000) {
