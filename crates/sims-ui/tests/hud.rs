@@ -304,3 +304,46 @@ fn the_goths_relationship_panel() {
         "24af5346170f6ff5a621af7725e99d1b6c03b15c8b1ae61d5b1cbd65e52c90d9"
     );
 }
+
+#[test]
+fn the_goths_house_panel() {
+    let Some(root) = common::install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to draw the control panel");
+        return;
+    };
+    let opened = common::open(&root, common::GOTH_HOUSE);
+    // The global file's curves (STR# 505) and yard multiplier (tuning
+    // table 4), as the original's capture holds the multiplier.
+    assert_eq!(opened.house.size.points.len(), 5);
+    assert_eq!(opened.house.furnishings.points.len(), 6);
+    assert_eq!(opened.house.yard, sims_core::F32::from_f32(0.33));
+    // After the load: 1,836 square feet, two bedrooms and a bathroom on
+    // a large lot. Size: 612 square feet for each of three members;
+    // Yard: the outdoor rooms' score times 0.33. The other three are not
+    // ported.
+    let house = &opened.snapshot.house;
+    assert_eq!(
+        (
+            house.square_feet,
+            house.bedrooms,
+            house.bathrooms,
+            house.lot
+        ),
+        (1836, 2, 1, 2)
+    );
+    assert_eq!(house.ratings, [Some(75), None, Some(76), None, None]);
+    let controls = Controls {
+        expanded: true,
+        panel: Panel::House,
+        ..Controls::default()
+    };
+    let mut frame = Frame::new(800, 600, [0, 0, 0]);
+    let items = hud::layout([800, 600], &opened.snapshot, &controls);
+    hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
+    // Pins the drawing; it has not been compared with the original's
+    // screen (see docs/decisions/).
+    assert_eq!(
+        digest(&frame),
+        "bbbf3165e5205438ef6c5a2e6a6da34a7b09d8fc7eb165c67636ac3e3b46a17a"
+    );
+}

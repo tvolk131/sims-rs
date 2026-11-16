@@ -34,6 +34,7 @@ mod notify;
 mod object_type;
 mod push;
 mod random;
+mod reach;
 mod refresh;
 mod relationship;
 mod remove;
@@ -159,6 +160,7 @@ impl Machine<'_, '_> {
             44 => self.animate_sim(operands)?,
             45 => self.go_to_slot(operands)?,
             46 => self.snap(operands)?.into(),
+            47 => self.reach(operands)?,
             48 => self.stop_all_sounds(operands)?.into(),
             32 => self.test_object_type(operands)?.into(),
             35 => self.special_effect(operands)?,
