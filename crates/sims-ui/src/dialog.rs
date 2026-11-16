@@ -65,7 +65,8 @@ pub struct Message {
 /// passes this string to its entry field (0x436c48, 0x523808).
 pub const ENTRY_START: &str = "Hello world";
 /// The most characters the entry field holds (0x5238a1, field +0x138,
-/// checked by 0x5f334f and 0x5f33be).
+/// checked by 0x5f334f and 0x5f33be). The original counts bytes of its
+/// text encoding, the same as characters in a single-byte one.
 pub const ENTRY_MOST: usize = 64;
 /// The entry field's height (0x524420).
 const ENTRY_HEIGHT: i32 = 36;
@@ -658,15 +659,55 @@ fn draw_entry(frame: &mut Frame, font: &Font, field: Rect, text: &str) {
         dot(field.x, y);
         dot(right, y);
     }
-    let line = font.line_height.clamp(0, field.height);
+    // The text and the caret are drawn inside the outline only: on a copy
+    // of what is under it, put back after. A text wider than the field
+    // slides left so the caret stays in view (an approximation: the
+    // original's scrolling is not read).
+    let inside = Rect::new(
+        field.x.saturating_add(1),
+        field.y.saturating_add(1),
+        (field.width - 2).max(0),
+        (field.height - 2).max(0),
+    );
+    // Only the part of the inside within the frame is copied.
+    let left = inside.x.max(0);
+    let top = inside.y.max(0);
+    let end_x = inside.x.saturating_add(inside.width).min(wide);
+    let end_y = inside.y.saturating_add(inside.height).min(high);
+    let (Ok(w), Ok(h)) = (u32::try_from(end_x - left), u32::try_from(end_y - top)) else {
+        return;
+    };
+    if w == 0 || h == 0 {
+        return;
+    }
+    let mut under = Frame::new(w, h, [0; 3]);
+    for y in 0..end_y - top {
+        for x in 0..end_x - left {
+            if let Some(rgb) = frame.pixel(left + x, top + y) {
+                under.blend(x, y, rgb, 255);
+            }
+        }
+    }
+    let line = font.line_height.clamp(0, inside.height);
+    let caret = 3i32.saturating_add(font.width(text)).saturating_add(1);
+    let slide = caret.saturating_sub(inside.width - 3).max(0);
+    // Where the inside's corner falls in the copy.
+    let [ox, oy] = [inside.x.saturating_sub(left), inside.y.saturating_sub(top)];
     let at = [
-        field.x.saturating_add(4),
-        field.y.saturating_add((field.height - line) / 2),
+        ox.saturating_add(3 - slide),
+        oy.saturating_add((inside.height - line) / 2),
     ];
-    font.draw(frame, text, at, LABEL);
-    let caret = at[0].saturating_add(font.width(text)).saturating_add(1);
+    font.draw(&mut under, text, at, LABEL);
+    let caret_x = ox.saturating_add(caret - slide);
     for y in at[1]..at[1].saturating_add(line) {
-        frame.blend(caret, y, LABEL, 255);
+        under.blend(caret_x, y, LABEL, 255);
+    }
+    for y in 0..end_y - top {
+        for x in 0..end_x - left {
+            if let Some(rgb) = under.pixel(x, y) {
+                frame.blend(left + x, top + y, rgb, 255);
+            }
+        }
     }
 }
 
@@ -803,7 +844,10 @@ mod tests {
         let field = laid.entry.unwrap();
         let text_bottom = laid.rect.y + 21 + 2 + 18 + 2;
         assert_eq!(field.y, text_bottom + 9);
-        assert_eq!((field.x, field.width), (laid.rect.x + 21, laid.rect.width - 42));
+        assert_eq!(
+            (field.x, field.width),
+            (laid.rect.x + 21, laid.rect.width - 42)
+        );
         assert_eq!(field.height, 36);
         assert_eq!(laid.buttons[0].y, text_bottom + 18 + 36 + 18);
         assert_eq!(laid.rect.height, plain.rect.height + 54);
@@ -833,6 +877,28 @@ mod tests {
         assert!(m.entry.as_ref().unwrap().ends_with('x'));
         m.entry = Some(String::new());
         assert!(!erase(&mut m));
+    }
+
+    #[test]
+    fn a_long_entry_stays_inside_its_field_with_the_caret_in_view() {
+        let font = crate::font::tests::font();
+        let field = Rect::new(10, 10, 30, 36);
+        let mut frame = Frame::new(100, 60, [0, 0, 0]);
+        draw_entry(&mut frame, &font, field, &"A".repeat(ENTRY_MOST));
+        for y in 0..60 {
+            for x in 0..100 {
+                if !field.contains(x, y) {
+                    assert_eq!(frame.pixel(x, y), Some([0, 0, 0]), "{x}, {y}");
+                }
+            }
+        }
+        // The caret 3 short of the inside's right edge: x 11 + 28 - 3.
+        assert!((11..45).any(|y| frame.pixel(36, y) == Some(LABEL)));
+        assert!((11..45).all(|y| frame.pixel(37, y) == Some([0, 0, 0])));
+        // A short entry starts 4 in, its caret right after it.
+        let mut frame = Frame::new(100, 60, [0, 0, 0]);
+        draw_entry(&mut frame, &font, field, "");
+        assert!((11..45).any(|y| frame.pixel(15, y) == Some(LABEL)));
     }
 
     #[test]
