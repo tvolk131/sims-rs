@@ -15,6 +15,19 @@
 //!   (0x570c3e, `sims_audio::ambience::view`; the game sends
 //!   `Game::ambience_view`).
 //!
+//! The game sends [`Input::Camera`] when the camera moves: scrolled,
+//! zoomed, turned, to another floor, or the window resized (a
+//! [`Shot`] that changes). The mixer then does what the original's kind
+//! 33 does (`sims_audio::player::Player::camera_moved`): every track is
+//! placed again from where its objects are on the moved screen, and the
+//! ambience's cursor moves. The original sends kind 33 from five places
+//! in its view code, which are not all read; that these are the moves
+//! that send it is **unverified**. The ambience's cursor also follows
+//! the hour and the view once a frame, as before, so the ambience keeps
+//! to the clock while the camera is still: the original moves it only
+//! on kind 33 as far as is read, and whether anything sends kind 33 when
+//! the hour changes is **unverified**.
+//!
 //! The game pauses the sound as the original's does (its mode handler,
 //! 0x4ce470): it sends `sims_audio::SoundEvent::Pause` (in
 //! [`Input::Events`]) when the game pauses in live mode and when it
@@ -256,6 +269,32 @@ pub fn event(event: sims_vm::SoundEvent) -> SoundEvent {
     }
 }
 
+/// What of the camera, when it changes, sends kind 33
+/// ([`Input::Camera`]): where the view is, its zoom, turn and floor, and
+/// the screen's size. The walls and what the cutaway looks at leave
+/// every object where it is on the screen, so they are not in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shot {
+    pub origin: [i32; 2],
+    pub zoom: u32,
+    pub rotation: u8,
+    pub level: i32,
+    pub size: [i32; 2],
+}
+
+impl Shot {
+    /// The shot of `camera` on a screen `size` pixels wide and high.
+    pub fn of(camera: &Camera, size: [i32; 2]) -> Self {
+        Self {
+            origin: camera.origin,
+            zoom: camera.zoom.level(),
+            rotation: camera.rotation,
+            level: camera.level,
+            size,
+        }
+    }
+}
+
 /// What the mixer is told between blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
@@ -268,6 +307,9 @@ pub enum Input {
     Speed(Speed),
     /// What the sound scripts may ask about the lot's objects.
     Sources(Snapshot),
+    /// The camera moved (kind 33): sent after the [`Input::Sources`]
+    /// and [`Input::View`] that show the lot through the moved camera.
+    Camera,
 }
 
 /// The sound player with every module, station and ambient score of an
@@ -313,6 +355,9 @@ impl Mixer {
             Input::Hour(hour) => self.hour = hour,
             Input::View(view) => self.view = view,
             Input::Sources(sources) => self.sources = sources,
+            Input::Camera => self
+                .player
+                .camera_moved(self.view, self.hour, &self.sources),
             Input::Speed(speed) => self
                 .player
                 .set_global(SPEED_REGISTER, speed_register(speed)),

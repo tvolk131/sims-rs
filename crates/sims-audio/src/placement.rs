@@ -50,12 +50,9 @@
 //! gives the player its [`Sources`] with each event
 //! (`Player::handle`).
 //!
-//! Not ported: the original places every track again (0x57447f, each
-//! track through 0x5746d9, not read) on kind 33, which its game sends
-//! when the camera moves. The game here sends kind 33 every frame
-//! (`Player::set_ambience_view`), where placing again would undo a
-//! fading `extvol` each frame; it waits for the game to send it as the
-//! original does.
+//! The original also places every track again (0x57447f, each track
+//! through 0x5746d9) on kind 33, which its game sends when the camera
+//! moves: `Player::camera_moved`.
 //!
 //! The original keeps the instances in a hash multimap and goes through
 //! a track's in its order, which only matters when an object is left as

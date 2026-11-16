@@ -115,8 +115,11 @@
 //!   object is, and the skill track [`PIANO_SKILL`] (see
 //!   `Player::play_piano`).
 //!
-//! The game's code also calls kind 33 to move the ambience's cursor from
-//! the camera and the hour: [`Player::set_ambience_view`]. The scores'
+//! The game's code also calls kind 33 when the camera moves: it places
+//! every track again from where its objects are now, and moves the
+//! ambience's cursor from the camera and the hour
+//! ([`Player::camera_moved`]; the cursor alone is
+//! [`Player::set_ambience_view`]). The scores'
 //! voices mix with the notes, at the effects group's volume.
 //!
 //! The radio, television and music hit lists are built from directories
@@ -138,8 +141,7 @@
 //!
 //! **Unverified** against the original at run time: all of the above.
 //! Left out: priorities, and the limit of 16 voices kind 1 checks first
-//! (0x574a87); placing every track again when the camera moves (kind 33,
-//! see [`crate::placement`]); the track group's own volume beyond the host's [`Player::set_group_volume`], and
+//! (0x574a87); the track group's own volume beyond the host's [`Player::set_group_volume`], and
 //! the second pitch the original adds (taken as 3600).
 //! `seqgroup_wait`, `add_to_group`, `remove_from_group` and `test1` to
 //! `test4` are not ported: a thread that reaches one ends with a fault.
@@ -345,7 +347,9 @@ pub mod kind {
     pub const NOTHING_FOR_SOUND: [i64; 14] =
         [27, 28, 29, 31, 44, 45, 46, 47, 48, 49, 50, 51, 101, 102];
     /// Kinds the original does something for that this player does not:
-    /// reported when an event has one.
+    /// reported when an event has one. (Kind 33 is ported for the game's
+    /// own calls, [`super::Player::camera_moved`], which carry the
+    /// camera; no event in the install has it.)
     pub const NOT_PORTED: [i64; 31] = [
         2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 24, 25, 26, 32, 33, 34, 35, 37, 38,
         39, 40, 41, 42, 103, 104,
@@ -771,8 +775,59 @@ impl<S: Samples> Player<S> {
         self.ambience.and_then(|mode| self.scores.get(&mode))
     }
 
-    /// *(code)* What the game's kind 33 does, it seems once a frame
-    /// (0x574157): moves the current ambience's cursor. `view` is the
+    /// *(code)* Kind 33 (0x574157), which the original's game sends when
+    /// the camera moves (from five places: 0x4a80bb, 0x4a8d38, 0x4ce50a,
+    /// 0x4ced58 and 0x4f66c6, through 0x57a9d4 and 0x57aac5). It places
+    /// every track with object instances again from where its objects
+    /// are now (0x57447f), then moves the ambience's cursor as
+    /// [`Player::set_ambience_view`] does. `sources` is as for
+    /// [`Player::handle`], with the screen as the moved camera shows it.
+    ///
+    /// The tracks go a track's instances at a time, in the order of the
+    /// instance map (0x5746d9 for each). For each, the volume and pan
+    /// come from the same sum as kind 1's ([`crate::placement`]), with
+    /// the track's `Spl`, and are written as the track writes them,
+    /// `extvol` then `pan` (vtable +0x40 and +0x48, 0x57d57a and
+    /// 0x57d5a0). The write goes through the track's `target`
+    /// (0x57de57), so it goes to the newest running thread of the track,
+    /// which stands for the original's one track object, and on through
+    /// its `target`, as kind 18's fade does. A fade on `extvol` is
+    /// undone by it and goes on from the new volume. A track with
+    /// instances but no running thread gets nothing (the original writes
+    /// to its idle track object, whose registers the next start sets
+    /// again).
+    ///
+    /// Not ported: after a kind 25 that turns the sound on (0x573c64),
+    /// the original writes the volume less 1 (or 1 for a volume of 0;
+    /// the manager's +0x114, 0x574701). Kind 25 is not ported, and the
+    /// flag starts clear. Nor is the day and night loop that kind 33
+    /// picks last (0x574978).
+    pub fn camera_moved(&mut self, view: i32, hour: u32, sources: &dyn Sources) {
+        let mut tracks: Vec<u32> = Vec::new();
+        for &(track, _) in &self.instances {
+            if !tracks.contains(&track) {
+                tracks.push(track);
+            }
+        }
+        for track in tracks {
+            if self.newest(track).is_none() {
+                continue;
+            }
+            let Some((vol, pan)) = self.placed(track, sources) else {
+                continue;
+            };
+            if let Some(at) = self.newest(track) {
+                self.write_at(at, EXTVOL, vol);
+            }
+            if let Some(at) = self.newest(track) {
+                self.write_at(at, PAN, pan);
+            }
+        }
+        self.set_ambience_view(view, hour);
+    }
+
+    /// *(code)* The ambience half of kind 33 (0x574157): moves the
+    /// current ambience's cursor. `view` is the
     /// share of the screen's tiles that are outdoors, in percent, which
     /// the original computes from the camera ([`crate::ambience::view`],
     /// 0x570c3e; below 30 counts as 0, as does any value while a flag of

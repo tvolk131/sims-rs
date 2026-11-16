@@ -1987,3 +1987,56 @@ fn the_placement_s_pan_sets_the_comparison_flags_when_the_event_comes() {
         assert!(player.faults.is_empty(), "{:?}", player.faults);
     }
 }
+
+#[test]
+fn a_camera_move_places_every_track_again() {
+    // The script waits 10 ms, then asks about its object with the field
+    // its extvol and then its pan name. Started for object 9 in the
+    // middle of the screen, the track is at full volume and the centre.
+    // When the camera moves and the object is at the right edge, kind 33
+    // places it again (0x57447f): 750 at 542 (0x5730b6). A camera that
+    // has not moved leaves it where the start put it.
+    let mut routine = vec![LOADL, 5];
+    routine.extend(long(10));
+    routine.extend([WAIT, 5]);
+    routine.extend([72, 6, 1, 19, 72, 6, 1, 20, END]);
+    for (moved, extvol, pan) in [(true, 750, 542), (false, 1024, 512)] {
+        let start = on_lot(&[(9, 400)]);
+        let probe = Probe {
+            lot: on_lot(&[(9, 800)]),
+            asked: Default::default(),
+        };
+        let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+        play_on(&mut player, 9, &start);
+        player.render(BLOCK, &probe);
+        if moved {
+            player.camera_moved(0, u32::MAX, &probe);
+        }
+        player.render(8 * BLOCK, &probe);
+        assert_eq!(*probe.asked.borrow(), [(9, extvol), (9, pan)], "{moved}");
+        assert!(player.faults.is_empty(), "{:?}", player.faults);
+    }
+}
+
+#[test]
+fn a_camera_move_leaves_a_track_that_has_ended() {
+    // The track's thread has ended, so the camera move has nothing to
+    // write to, asks nothing and faults nothing; its next start is
+    // placed afresh.
+    let generic: &[u8] = &[72, 6, 1, 20, END]; // getsrcdatafield v2, arg1, pan
+    let probe = Probe {
+        lot: on_lot(&[(9, 800)]),
+        asked: Default::default(),
+    };
+    let mut player = Player::new(vec![module(&[generic], 1)], samples(), 1);
+    play_on(&mut player, 9, &on_lot(&[(9, 400)]));
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(9, 512)]);
+    player.camera_moved(0, u32::MAX, &probe);
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(9, 512)]);
+    play_on(&mut player, 9, &probe.lot);
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(9, 512), (9, 542)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
