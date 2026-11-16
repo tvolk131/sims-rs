@@ -396,12 +396,14 @@ impl Hud {
         };
         let before = (
             hud::hovered(&self.items, self.controls.pointer),
+            hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
             entry(self.controls.pointer),
         );
         self.controls.pointer = Some(point);
         (
             hud::hovered(&self.items, self.controls.pointer),
+            hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
             entry(self.controls.pointer),
         ) != before

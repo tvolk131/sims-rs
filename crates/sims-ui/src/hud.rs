@@ -1718,6 +1718,16 @@ pub fn hovered(items: &[Item], point: Option<[i32; 2]>) -> Option<usize> {
     items[n].command.is_some().then_some(n)
 }
 
+/// The relationship entry under `point`, which is drawn lit while the
+/// pointer is on it, so that moving onto, off or between entries changes
+/// the frame although the entries take no presses.
+pub fn lit_relation(items: &[Item], point: Option<[i32; 2]>) -> Option<usize> {
+    let [x, y] = point?;
+    items
+        .iter()
+        .rposition(|i| matches!(i.kind, Kind::Relation { .. }) && i.rect.contains(x, y))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2269,6 +2279,18 @@ mod tests {
             })
             .collect();
         assert_eq!(lit, [false, true, false, false]);
+        // Moving between entries, or off them, changes what is lit,
+        // though no entry takes a press.
+        let items = layout([800, 600], &s, &controls);
+        let second = lit_relation(&items, controls.pointer).expect("an entry under the pointer");
+        assert!(matches!(
+            items[second].kind,
+            Kind::Relation { lit: true, .. }
+        ));
+        assert_eq!(hovered(&items, controls.pointer), None);
+        let first = lit_relation(&items, Some([521 + 35 + 10, 540]));
+        assert!(first.is_some_and(|n| n != second));
+        assert_eq!(lit_relation(&items, Some([0, 0])), None);
         // Nobody selected, no panel.
         s.selected = None;
         let items = layout([800, 600], &s, &controls);
