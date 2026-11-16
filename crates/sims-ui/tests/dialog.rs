@@ -58,9 +58,10 @@ fn magic_town_as_the_original_shows_it() {
             [137, 343]
         ]
     );
+    // A line keeps the space it breaks after, as the original's do.
     assert_eq!(
         layout.lines[0].0,
-        "Recently, there's been talk of strange happenings"
+        "Recently, there's been talk of strange happenings "
     );
     assert_eq!(layout.buttons, [Rect::new(349, 384, 100, 33)]);
     assert_eq!(

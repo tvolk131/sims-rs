@@ -74,11 +74,11 @@ fn the_goths_panel_from_the_original_art() {
         ),
         (
             "open 800x600",
-            "4053f0e9e8e82794d8237278d08959676d006a0ee7021d53c68bbb959f96b13b",
+            "bf2b42823851f214c8673a7f05468d22bedf28cf808911288ce8a60dee588fb8",
         ),
         (
             "open 1280x720",
-            "607184ac1852a01d42b5f559806a6c07edfbac5edfbe2cd971dbbce708b43fd4",
+            "ad37fea8d004eda2bcfc8c9f2b28418eae06a22bfbab96d11853bd254dd3dee3",
         ),
     ];
     let digests: Vec<(&str, &str)> = digests.iter().map(|(n, d)| (*n, d.as_str())).collect();
@@ -275,16 +275,20 @@ fn the_goths_relationship_panel() {
                 r.pink_heart,
                 r.red_heart,
                 r.family,
+                r.star,
             )
         })
         .collect();
     assert_eq!(
         relations,
         [
-            (33, 100, 0, true, true, false, true),
-            (32, 75, 0, true, false, false, true),
+            (33, 100, 0, true, true, false, true, false),
+            (32, 75, 0, true, false, false, true, false),
         ]
     );
+    // The install has the Superstar pack, so its button can be pressed
+    // (0x51a7ea).
+    assert!(opened.snapshot.superstar);
     let controls = Controls {
         expanded: true,
         panel: Panel::Relationships,
@@ -297,6 +301,6 @@ fn the_goths_relationship_panel() {
     // screen (see docs/decisions/).
     assert_eq!(
         digest(&frame),
-        "4b764150a46580163fb484f70c5eac2db568672649d2e2bf8d05af09c2667c4c"
+        "24af5346170f6ff5a621af7725e99d1b6c03b15c8b1ae61d5b1cbd65e52c90d9"
     );
 }

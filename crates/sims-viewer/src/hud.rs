@@ -18,7 +18,7 @@ use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_ui::command::{Camera, Command, Panel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::Frame;
-use sims_ui::household::{self, Careers, Faces, Snapshot};
+use sims_ui::household::{Acquaintances, Careers, Faces, Snapshot};
 use sims_ui::hud::{self, Controls, Item};
 use std::path::Path;
 
@@ -30,9 +30,8 @@ pub struct Hud {
     careers: Careers,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
-    /// The autonomy tuning's friendship threshold, for the relationship
-    /// panel's smileys.
-    friendship: i32,
+    /// What the relationship panel needs from outside the world.
+    known: Acquaintances,
     pub controls: Controls,
     items: Vec<Item>,
     /// The dialog the world waits on, until it is answered here.
@@ -93,14 +92,18 @@ impl Hud {
         let faces =
             Faces::load(assets.index(), assets.catalog(), &people).map_err(|e| e.to_string())?;
         let careers = Careers::load(assets.index()).map_err(|e| e.to_string())?;
-        let friendship = household::friendship_threshold(assets.index(), assets.catalog())
-            .map_err(|e| e.to_string())?;
+        let known = Acquaintances::read(
+            assets.index(),
+            assets.catalog(),
+            install.expansions,
+            friendship(assets)?,
+        );
         Ok(Self {
             art,
             faces,
             careers,
             members,
-            friendship,
+            known,
             // The strip opens as if Live had been pressed.
             controls: Controls {
                 expanded: true,
@@ -130,7 +133,7 @@ impl Hud {
         // The lookup goes through every neighborhood record, so only
         // while the panel shows it.
         if self.controls.panel == Panel::Relationships {
-            snapshot = snapshot.with_relations(world, &self.members, self.friendship);
+            snapshot = snapshot.with_relations(world, &self.members, &self.known);
         }
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         let (width, height) = (
@@ -237,4 +240,15 @@ impl Hud {
         self.controls.apply(&command);
         (view, self.controls != before)
     }
+}
+
+/// The autonomy tuning's friendship threshold, which the relationship
+/// panel's smileys need. The viewer may show a snapshot or a house file
+/// it did not boot, so it links the global file alone, which holds the
+/// tuning, and reads it as the lot does
+/// (`sims_vm::Program::autonomy_constants`).
+fn friendship(assets: &Assets) -> Result<i32, String> {
+    let program =
+        sims_vm::Program::link(assets.index(), assets.catalog(), []).map_err(|e| e.to_string())?;
+    Ok(program.autonomy_constants().friendship_threshold)
 }

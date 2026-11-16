@@ -3,15 +3,13 @@
 
 use crate::art::Art;
 use crate::{Error, Result};
-use sims_content::{Catalog, Index};
-use sims_core::{Ext, F32};
+use sims_content::{Catalog, Expansions, Index};
 use sims_formats::bitmap::{self, Image};
 use sims_formats::career::{Career, Level};
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
-use sims_formats::tuning::Constants;
 use sims_sim::World;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Globals the clock reads (`crates/sims-vm/src/tick.rs`).
 const HOURS: usize = 0;
@@ -207,6 +205,54 @@ pub struct Snapshot {
     /// relationship panel's order ([`Relation`]): none until
     /// [`Snapshot::with_relations`] reads them.
     pub relations: Vec<Relation>,
+    /// Whether the relationship panel's Superstar button can be pressed:
+    /// the Superstar pack is installed ([`Acquaintances::superstar`]).
+    /// False until [`Snapshot::with_relations`] reads it.
+    pub superstar: bool,
+}
+
+/// What the relationship panel needs from outside the world: the
+/// install's packs, the catalog's types and the autonomy tuning.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Acquaintances {
+    /// The autonomy tuning's friendship threshold (0x6c4398, read from
+    /// the tuning: 50 in the original's capture), which the smiley needs.
+    pub friendship: i32,
+    /// The GUIDs of the neighborhood's characters: the types whose
+    /// definition comes from its `Characters` folder. The original
+    /// registers that folder with kind 1, which 0x43ba52 keeps in bits 2
+    /// and 3 of the type's record (+0xb4); 0x423f30 tests for 4 there
+    /// (`docs/decisions/20261115-household-selection-works-out-again-who-visitor.md`).
+    pub characters: BTreeSet<u32>,
+    /// Whether the Superstar pack is installed: the installed packs'
+    /// mask (`[0x6e48bc]+0x66`) has its bit, 0x40 (0x51a7ea).
+    pub superstar: bool,
+}
+
+impl Acquaintances {
+    /// The bit of the Superstar pack in the installed packs' mask.
+    pub const SUPERSTAR: u8 = 0x40;
+
+    /// Reads the characters from `catalog` as `index` mounts them (each
+    /// GUID's definition, the one it resolves to), and the Superstar
+    /// pack from `expansions`.
+    pub fn read(index: &Index, catalog: &Catalog, expansions: Expansions, friendship: i32) -> Self {
+        let characters = catalog
+            .objects
+            .iter()
+            .map(|o| o.guid)
+            .filter(|&guid| {
+                catalog.object(guid).is_some_and(|o| {
+                    index.mounts[index.resources[o.resource].mount].path == Index::CHARACTERS
+                })
+            })
+            .collect();
+        Self {
+            friendship,
+            characters,
+            superstar: expansions.contains(Self::SUPERSTAR),
+        }
+    }
 }
 
 /// A person in the relationship panel: what 0x4ea042 reads of the
@@ -229,6 +275,9 @@ pub struct Relation {
     /// Between the married Goths value 1 is 1.
     pub pink_heart: bool,
     pub red_heart: bool,
+    /// Whether their person data word 81 is set: the Superstar button's
+    /// list (0x4e9f22). Superstar keeps a person's fame there.
+    pub star: bool,
     /// Whether they belong to the selected Sim's family (person data
     /// word 61, [`sims_sim::neighbors::FAMILY`]): the family button's
     /// list.
@@ -284,6 +333,7 @@ impl Snapshot {
                 .map(|o| o.id),
             family_friends: lot_family(world).map_or(0, |f| f.friends),
             relations: Vec::new(),
+            superstar: false,
         }
     }
 
@@ -330,22 +380,22 @@ impl Snapshot {
         self
     }
 
-    /// Reads the selected Sim's [`Snapshot::relations`] from `world`.
-    /// `members` is as for [`Snapshot::read`]; `friendship` is the
-    /// autonomy tuning's friendship threshold (0x6c4398, read from the
-    /// tuning: 50 in the original's capture), which the smiley needs.
-    #[must_use]
+    /// Reads the selected Sim's [`Snapshot::relations`] from `world`,
+    /// and [`Snapshot::superstar`]. `members` is as for
+    /// [`Snapshot::read`].
     ///
     /// Works [`Snapshot::family_friends`] out again too where the count
     /// is out of date, as reading it does in the original (0x427219).
-    pub fn with_relations(mut self, world: &World, members: &[u32], friendship: i32) -> Self {
+    #[must_use]
+    pub fn with_relations(mut self, world: &World, members: &[u32], known: &Acquaintances) -> Self {
         if let Some(family) = lot_family(world).filter(|f| f.stale) {
-            self.family_friends = world.count_family_friends(family, friendship);
+            self.family_friends = world.count_family_friends(family, known.friendship);
         }
         let selected = self.selected.and_then(|id| world.objects.get(&id));
         self.relations = selected
-            .map(|o| relations(world, o.guid, members, friendship))
+            .map(|o| relations(world, o.guid, members, known))
             .unwrap_or_default();
+        self.superstar = known.superstar;
         self
     }
 
@@ -373,53 +423,6 @@ impl Snapshot {
     pub fn money(&self) -> String {
         money(self.funds)
     }
-}
-
-/// The autonomy tuning's friendship threshold, which
-/// [`Snapshot::with_relations`] takes, for a caller without the
-/// simulation's program: [`friendship_threshold_in`] the global file, or
-/// 25 when the install has none.
-pub fn friendship_threshold(index: &Index, catalog: &Catalog) -> Result<i32> {
-    let Some(file) = index.resources.get(catalog.global) else {
-        return Ok(threshold(None));
-    };
-    let iff = Iff::parse(file.read().map_err(Error::Content)?).map_err(Error::Format)?;
-    friendship_threshold_in(&iff)
-}
-
-/// The friendship threshold `global` (the global file) gives, read as
-/// `sims_vm::Program` reads it, so the two agree. Every `FCNS` chunk is
-/// parsed in file order, deleted and replaced ones included, and a
-/// malformed one is an error (`Program::load`). The last chunk with ID 2
-/// is the table. Its entry "friendship threshold" (any case; 25.0 when
-/// the table or entry is missing) is truncated as the original stores it
-/// (`__ftol`, 0x6c4398; `Program::autonomy_constants`).
-pub fn friendship_threshold_in(global: &Iff) -> Result<i32> {
-    const AUTONOMY_TUNING: u16 = 2;
-    let mut table = None;
-    for chunk in &global.chunks {
-        if &chunk.tag == b"FCNS" {
-            let parsed = Constants::parse(global.data(chunk)).map_err(Error::Format)?;
-            if chunk.id == AUTONOMY_TUNING {
-                table = Some(parsed);
-            }
-        }
-    }
-    let value = table.and_then(|table| {
-        table
-            .entries
-            .into_iter()
-            .find(|entry| entry.name.eq_ignore_ascii_case("friendship threshold"))
-            .map(|entry| entry.value)
-    });
-    Ok(threshold(value))
-}
-
-/// `value`, or the default's bits 0x41c80000 (25.0), truncated as
-/// `Program::autonomy_constants` truncates it.
-fn threshold(value: Option<f32>) -> i32 {
-    let value = value.map_or(F32::from_bits(0x41c8_0000), F32::from_f32);
-    Ext::from_f32(value).to_i32_truncate()
 }
 
 /// An amount as the panel writes money: `$2,542` ([`Snapshot::money`]).
@@ -550,7 +553,31 @@ fn lot_family(world: &World) -> Option<&sims_sim::neighbors::Family> {
 /// of the person on the lot), so a record the original leaves out may be
 /// listed; and the original breaks the last tie by its own list of
 /// people (0x6f2698), not by record (**unverified** that they agree).
-fn relations(world: &World, guid: u32, members: &[u32], friendship: i32) -> Vec<Relation> {
+/// Person data word 32: whether the person lives on the lot. A 6 keeps
+/// anyone in the relationship panel (0x4e9eae); what a 6 stands for is
+/// not known.
+const VISITOR: usize = 32;
+const LISTED_ANYWAY: i16 = 6;
+/// Person data word 81: the Superstar button lists those with it set
+/// (0x4e9f2a).
+const FAME: usize = 81;
+
+/// A person's data as the relationship panel reads it (0x4ea662): the
+/// first person on the lot of the record's type, in the lot's people
+/// order (0x4e9608 walks the lot's people for the first of the GUID),
+/// or else the first record of the type.
+fn person_data(world: &World, guid: u32) -> Option<&[i16]> {
+    world
+        .people
+        .iter()
+        .filter_map(|id| world.objects.get(id))
+        .find_map(|o| o.person.as_ref().filter(|_| o.guid == guid))
+        .map(|p| p.data.as_slice())
+        .or_else(|| world.neighbors.first_of(guid).map(|r| r.data.as_slice()))
+}
+
+fn relations(world: &World, guid: u32, members: &[u32], known: &Acquaintances) -> Vec<Relation> {
+    let friendship = known.friendship;
     let neighbors = &world.neighbors;
     let Some(viewer) = neighbors.first_of(guid) else {
         return Vec::new();
@@ -565,6 +592,17 @@ fn relations(world: &World, guid: u32, members: &[u32], friendship: i32) -> Vec<
     let mut listed = Vec::new();
     for record in neighbors.slots.iter().flatten() {
         if record.id == viewer.id {
+            continue;
+        }
+        // 0x4e9e9b..0x4e9ed8: a person the panel lists is a neighborhood
+        // character of a family, or anyone whose word 32 is 6. Their data
+        // is the person's on the lot, or else the first record's.
+        let data = person_data(world, record.guid).unwrap_or_default();
+        let word = |n: usize| data.get(n).copied().unwrap_or(0);
+        let anyway = word(VISITOR) == LISTED_ANYWAY;
+        if !anyway
+            && (!known.characters.contains(&record.guid) || word(sims_sim::neighbors::FAMILY) == 0)
+        {
             continue;
         }
         // As the original (0x4e9e77..0x4e9f69), a record stands for its
@@ -591,6 +629,7 @@ fn relations(world: &World, guid: u32, members: &[u32], friendship: i32) -> Vec<
             friends: sims_sim::neighbors::mutual_friends(viewer, target, friendship),
             pink_heart: value(1) != 0,
             red_heart: value(3) != 0,
+            star: word(FAME) != 0,
             family: family.is_some()
                 && record.data.get(sims_sim::neighbors::FAMILY).copied() == family,
         };
@@ -755,6 +794,39 @@ mod tests {
             selected: None,
             family_friends: 0,
             relations: Vec::new(),
+            superstar: false,
+        }
+    }
+
+    /// A neighbor record of a family (word 61 set) with rows toward
+    /// `rows` (target, daily value).
+    fn record(id: i16, guid: u32, rows: &[(i32, i32)]) -> sims_sim::neighbors::Neighbor {
+        let mut data = vec![0; sims_sim::neighbors::PERSON_WORDS];
+        data[sims_sim::neighbors::FAMILY] = 7;
+        sims_sim::neighbors::Neighbor {
+            id,
+            guid,
+            revision: 1,
+            data,
+            relationships: rows
+                .iter()
+                .map(|&(target, daily)| sims_sim::neighbors::Row {
+                    target,
+                    values: vec![daily, 0, 0, 0],
+                })
+                .collect(),
+            friends: 0,
+            stale: false,
+        }
+    }
+
+    /// The tuning's threshold, with every GUID from 100 to 999 a
+    /// neighborhood character.
+    fn known() -> Acquaintances {
+        Acquaintances {
+            friendship: 50,
+            characters: (100..1000).collect(),
+            superstar: true,
         }
     }
 
@@ -791,21 +863,6 @@ mod tests {
 
     #[test]
     fn a_record_stands_for_its_type_in_the_relationship_list() {
-        let record = |id: i16, guid: u32, rows: &[(i32, i32)]| sims_sim::neighbors::Neighbor {
-            id,
-            guid,
-            revision: 1,
-            data: vec![0; sims_sim::neighbors::PERSON_WORDS],
-            relationships: rows
-                .iter()
-                .map(|&(target, daily)| sims_sim::neighbors::Row {
-                    target,
-                    values: vec![daily, 0, 0, 0],
-                })
-                .collect(),
-            friends: 0,
-            stale: false,
-        };
         let listed = |viewer_rows: &[(i32, i32)]| {
             let mut world = World::empty();
             world.neighbors.slots = vec![
@@ -814,7 +871,7 @@ mod tests {
                 Some(record(3, 200, &[])),
                 Some(record(4, 300, &[])),
             ];
-            relations(&world, 100, &[], 50)
+            relations(&world, 100, &[], &known())
                 .iter()
                 .map(|r| (r.id, r.daily))
                 .collect::<Vec<_>>()
@@ -826,7 +883,94 @@ mod tests {
         assert_eq!(listed(&[(3, 40), (4, 10)]), [(4, 10)]);
         // Nobody known, or a viewer without a record: an empty list.
         assert_eq!(listed(&[]), []);
-        assert!(relations(&World::empty(), 100, &[], 50).is_empty());
+        assert!(relations(&World::empty(), 100, &[], &known()).is_empty());
+    }
+
+    #[test]
+    fn the_relationship_list_leaves_out_who_the_original_leaves_out() {
+        let rows: Vec<(i32, i32)> = (2..=6).map(|id| (id, 10 * id)).collect();
+        let mut world = World::empty();
+        world.neighbors.slots = vec![Some(record(1, 100, &rows))];
+        // 2 is a character of a family; 3 has no family; 4's type is not
+        // a character; 5 is neither, but its word 32 is 6; 6 has fame.
+        let mut people: Vec<_> = (2..=6).map(|id| record(id, 100 * id as u32, &[])).collect();
+        people[1].data[sims_sim::neighbors::FAMILY] = 0;
+        people[3].data[sims_sim::neighbors::FAMILY] = 0;
+        people[3].data[VISITOR] = LISTED_ANYWAY;
+        people[4].data[FAME] = 3;
+        world.neighbors.slots.extend(people.into_iter().map(Some));
+        let mut known = known();
+        known.characters.remove(&400);
+        known.characters.remove(&500);
+        let listed = relations(&world, 100, &[], &known);
+        let ids: Vec<_> = listed.iter().map(|r| (r.id, r.star)).collect();
+        assert_eq!(ids, [(6, true), (5, false), (2, false)]);
+
+        // A person on the lot is judged by their own data, not the
+        // record's: give person 300 a family on the lot.
+        use sims_formats::saved_objects::{Interaction, Person};
+        let idle = Interaction {
+            uid: 0,
+            caller: 0,
+            target: 0,
+            icon: 0,
+            table_index: -1,
+            args: [0; 4],
+            priority: 0,
+            action: 0,
+            attenuation: 0.0,
+            flags: 0,
+        };
+        let mut data = vec![0; sims_sim::neighbors::PERSON_WORDS];
+        data[sims_sim::neighbors::FAMILY] = 7;
+        data[FAME] = 1;
+        let person = Person {
+            animation_events: 0,
+            engaged: 0,
+            appearance: Default::default(),
+            accessories: Vec::new(),
+            animations: Default::default(),
+            routing_state: 0,
+            floats: [0.0; 9],
+            previous_motives: [0.0; 16],
+            motives: [0.0; 16],
+            data,
+            routing_frames: 0,
+            active: idle.clone(),
+            last: idle,
+            queue: Vec::new(),
+            object_uses: Vec::new(),
+            motive_deltas: Vec::new(),
+        };
+        let object = sims_sim::Object {
+            id: 30,
+            guid: 300,
+            footprint: [0; 4],
+            position: [0; 3],
+            unknown_short: 0,
+            attributes: Vec::new(),
+            temps: Vec::new(),
+            data: vec![0; 128],
+            obsolete_word: 0,
+            stack_capacity_bytes: 0,
+            stack: Vec::new(),
+            relationship_flag: 0,
+            relationships: Vec::new(),
+            slots: Vec::new(),
+            dynamic_sprites: Vec::new(),
+            multipart: None,
+            portal: None,
+            person: Some(person),
+            registry_word: None,
+            last_result: false,
+            removal_skips_resets: false,
+            selected: false,
+        };
+        world.objects.insert(30, object);
+        world.people.push(30);
+        let listed = relations(&world, 100, &[], &known);
+        let ids: Vec<_> = listed.iter().map(|r| (r.id, r.star)).collect();
+        assert_eq!(ids, [(3, true), (6, true), (5, false), (2, false)]);
     }
 
     #[test]

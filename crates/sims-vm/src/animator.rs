@@ -270,7 +270,7 @@ impl Interpreter<'_> {
     /// update is asked to pose (0x59820a), and a motion's positions only
     /// up to the clip's count; neither is told apart here, so the set may
     /// hold more than the original moved.
-    fn translated_by<'l>(
+    pub(crate) fn translated_by<'l>(
         &self,
         id: u16,
         layers: impl Iterator<Item = &'l Layer>,
@@ -297,7 +297,7 @@ impl Interpreter<'_> {
     }
 
     /// Notes `moved` in person `id`'s [`World::translated_bones`].
-    fn note_moved(world: &mut World, id: u16, moved: Vec<String>) {
+    pub(crate) fn note_moved(world: &mut World, id: u16, moved: Vec<String>) {
         if moved.is_empty() {
             return;
         }
