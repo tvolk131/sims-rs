@@ -695,11 +695,11 @@ class Runner:
                 self.fail(str(e))
                 return
             if isinstance(want, Job):
+                n = self.agent.submit(want.command)  # if it raises, the step fails (and let_go retries a release)
                 if want.command == press_down_command():
                     self.held = want.info
                 elif want.command == press_up_command():
                     self.held = None
-                n = self.agent.submit(want.command)
                 row = dict(kind='command', id=n, what=want.kind, command=want.command, **want.info)
                 self.write(**row)
                 if want.wait:
@@ -730,15 +730,17 @@ class Runner:
     def let_go(self, reason):
         """Let the button go if a held press's release was never submitted (the
         step failed, or the capture ended, while it was down). Its exit code is
-        not checked: no stop is left to check it at."""
+        not checked: no stop is left to check it at. If the submission fails,
+        the release is still owed and the next call tries again."""
         if self.held is None:
             return
-        info, self.held = self.held, None
+        info = self.held
         try:
             n = self.agent.submit(press_up_command())
         except Exception as e:  # letting go must never end the capture
             self.write(kind='release_failed', reason=reason, error=f'{type(e).__name__}: {e}', **info)
             return
+        self.held = None
         self.write(kind='command', id=n, what='release', command=press_up_command(), reason=reason, **info)
 
     # The steps. Each is a generator; after each yield self.m reads the game at

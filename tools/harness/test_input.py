@@ -362,6 +362,25 @@ class RunnerTest(RunnerBase):
         self.runners.remove(r)
         self.assertEqual(sum('mouseup' in c for c in self.agent.commands), 1)
 
+    def test_a_release_that_cannot_be_submitted_is_tried_again(self):
+        r = self.runner('click 10 20')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        submit, broken = self.agent.submit, [2]
+
+        def flaky(command):  # the next two submissions fail (the hold's release, then fail()'s)
+            if broken[0]:
+                broken[0] -= 1
+                raise OSError('rename failed')
+            return submit(command)
+        self.agent.submit = flaky
+        self.tick_until(r, lambda: r.failed)  # the hold's release could not be submitted
+        self.assertNotIn('mouseup', self.last_command())
+        self.assertEqual(self.rows('release_failed')[-1]['reason'], 'step failed')
+        r.close()
+        self.runners.remove(r)
+        self.assertEqual(self.last_command(), 'xdotool mouseup 1')
+        self.assertEqual(self.rows('command')[-1]['reason'], 'capture ended')
+
     def test_a_released_press_is_not_released_again(self):
         r = self.runner('click 10 20\nwait 5')
         self.tick_until(r, lambda: 'mouseup' in self.last_command())
