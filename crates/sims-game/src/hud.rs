@@ -154,6 +154,16 @@ impl Hud {
         })
     }
 
+    /// Forgets what the panel kept of the lot it showed, for a lot put
+    /// back to a save: the pie menu, the dialog read and the icons
+    /// pressed. The rest is read from the lot at the next frame.
+    pub fn forget(&mut self) {
+        self.menu = None;
+        self.message = None;
+        self.dialog = None;
+        self.pressed = Pressed::default();
+    }
+
     /// Reads the dialog `world` waits on, if it changed. The lot's world,
     /// or, while the lot waits for the player, the world as the tick left
     /// it when it showed the dialog.
