@@ -608,9 +608,10 @@ pub struct Player<S> {
     /// that note (thread 0) plays: the original's idle track object, for
     /// a camera move to place.
     idle: BTreeMap<u32, Thread>,
-    /// The thread each track's last fresh start made, by track: the one
-    /// whose `target` the original's track object still has
-    /// ([`Player::camera_moved`]).
+    /// The thread each track's last start made or let go, by track: the
+    /// one whose `target` the original's track object still has
+    /// ([`Player::camera_moved`]). Every start sets that `target` back
+    /// to itself (0x57d9c3).
     last_start: BTreeMap<u32, u32>,
     /// *(code)* Object instances: a track and an object it plays for, as
     /// the original records them (its hash multimap at manager +0xd4),
@@ -819,7 +820,8 @@ impl<S: Samples> Player<S> {
     /// their new levels at once.
     ///
     /// Only the thread of the track's last start, running or ended,
-    /// writes and reads through its `target`. A later start set the
+    /// writes and reads through its `target` (a held track let go by a
+    /// start counts: the newest thread let go). A later start set the
     /// original's track object's `target` back to itself, so an older
     /// thread takes the write itself, ended or the newest still running
     /// when the last start's has gone. That holds after the last start's
@@ -1850,6 +1852,9 @@ impl<S: Samples> Player<S> {
     /// [`Player::thread`]) and its wait ends. The threads let go: none
     /// when none of the track runs, so it is started anew. (A held thread
     /// does not run, so none of these is the thread running `play_trk`.)
+    /// The original sets its track object's `target` back to itself on
+    /// every start, this one too, so the newest thread let go becomes
+    /// the one [`Player::camera_moved`] writes through.
     fn resume_held(&mut self, args: [u32; 3], track: u32) -> Vec<u32> {
         let now = self.frame;
         let mut resumed = Vec::new();
@@ -1862,6 +1867,9 @@ impl<S: Samples> Player<S> {
             set_arguments(thread, args);
             thread.wake = now;
             resumed.push(thread.id);
+        }
+        if let Some(&newest) = resumed.iter().max() {
+            self.last_start.insert(track, newest);
         }
         resumed
     }

@@ -19,10 +19,10 @@ kind 33 only when the camera moves, and the player does the whole case.
     the volume and pan come from the same sum kind 1 uses (0x57473b).
   - The results are written as the track writes them: `extvol` then
     `pan` (vtable +0x40 and +0x48, 0x57d57a and 0x57d5a0).
-  - The register write follows the track's `target` (0x57de57), so it
-    goes to the track's newest running thread. That thread stands for
-    the original's one track object, as kind 18's fade does. A fade in
-    progress goes on from the new volume.
+  - The register write follows the track's `target` (0x57de57). Here
+    it goes to the thread the track's last start made, which stands for
+    the original's one track object (see below), and on through its
+    `target`. A fade in progress goes on from the new volume.
   - The original's track object outlives its script. A note started
     with `note_on` then `end` plays on, and the write reaches that note
     too. Here a thread that ends with notes still playing keeps its
@@ -36,6 +36,11 @@ kind 33 only when the camera moves, and the player does the whole case.
     `target` that thread had set would carry the write to another
     track. The player keeps which thread each track's last start made,
     so this holds after that thread has gone with nothing left playing.
+  - Every start sets the track object's `target` back to itself
+    (0x57d9c3), before it checks for a hold. So a start that lets a
+    held track go, rather than starting it again, counts too: the
+    newest thread it lets go becomes the one written through. Unpausing
+    lets every track go without that reset (0x57dc63).
   - A note kind 53 played with no thread of the track running (thread
     0, the original's idle track object) is placed too, from the
     registers it started with, kept while it plays.
@@ -82,7 +87,8 @@ kind 33 only when the camera moves, and the player does the whole case.
 - A thread whose track started again does not carry the write through
   the `target` it had set, whether it ended with a note playing while
   the new one waits or ends at once, or it still runs while the new one
-  ended with a note playing: the other track keeps its levels.
+  ended with a note playing, or the new start let a held thread go: the
+  other track keeps its levels.
 - A track whose thread has ended and left no note gets nothing, and its
   next start is placed afresh.
 - The Goths' lot plays with the camera scrolling every second.

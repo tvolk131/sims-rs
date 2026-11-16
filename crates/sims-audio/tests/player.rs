@@ -2179,3 +2179,54 @@ fn a_camera_move_places_a_sequenced_note_with_no_thread() {
         assert!(player.faults.is_empty(), "{:?}", player.faults);
     }
 }
+
+#[test]
+fn a_camera_move_follows_a_held_track_let_go_by_a_start() {
+    // Track 10's first start marks global 110 and loops; its second plays
+    // a long note, sets its `target` to track 11 and ends. With the sound
+    // paused, a third start lets the held loop go (0x57d9f1), and every
+    // start sets the track object's `target` back to itself (0x57d9c3):
+    // the camera move then places the loop itself, and track 11 (object
+    // 8, which does not move) keeps its own levels (Sol's review).
+    let mut first = vec![TEST, 110, IFNE];
+    first.extend(long(0x102));
+    first.extend(loadl(110, 1));
+    first.extend([SET_LOOP, LOOP]);
+    let mut second = NOTE_ON_V1.to_vec();
+    second.extend(loadl(53, 11));
+    second.push(END);
+    let mut asks = loadl(5, 10);
+    asks.extend([WAIT, 5]);
+    asks.extend([72, 6, 1, 19, 72, 6, 1, 20, END]);
+    let start = on_lot(&[(8, 400), (9, 400)]);
+    let probe = Probe {
+        lot: on_lot(&[(8, 400), (9, 800)]),
+        asked: Default::default(),
+    };
+    let mut player = Player::new(
+        vec![module(&[&first, &asks, &second], 1)],
+        long_sample("one.xa"),
+        1,
+    );
+    let play = |player: &mut Player<_>, object: u32, name: &str| {
+        player.handle(
+            &SoundEvent::Play {
+                object,
+                name: name.into(),
+            },
+            &start,
+        );
+    };
+    play(&mut player, 8, "e1");
+    play(&mut player, 9, "e0");
+    player.render(BLOCK, &start);
+    play(&mut player, 9, "e0");
+    player.render(BLOCK, &start);
+    player.handle(&SoundEvent::Pause, &start);
+    play(&mut player, 9, "e0");
+    player.camera_moved(0, u32::MAX, &probe);
+    player.handle(&SoundEvent::Unpause, &probe);
+    player.render(8 * BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(8, 1024), (8, 512)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
