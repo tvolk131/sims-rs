@@ -39,7 +39,8 @@ events, and what it asks for after them) come first.
    supersedes, and say which.
 3. **1000 ticks on three more base-game houses**, picked for code the
    Goths do not reach (for example the Newbies and a family with
-   children).
+   children). Done (#221, #223, 2026-11-16): the Newbies, the Pleasants
+   and the Roomies; see Progress.
 4. **Player orders.** Recordings of the original with the input track's
    scripted clicks and pie-menu choices, matched through
    `Interpreter::pie_menu`, `Interpreter::pick` and `Interpreter::order`.
@@ -154,11 +155,13 @@ events, and what it asks for after them) come first.
   their attribute arrays to the saved count (0x4342ae). Two objects that
   are not solid share a tile unless both stand against the same wall
   (0x433a7f). The templates' `Patch` families are not imported (see
-  `docs/decisions/`). Next: house 9 is the third extra house, with a
-  recording of it under way; the bare lot's room map at load step 8
+  `docs/decisions/`). Next: keep the walk's flag +0x290 (0x58edec,
+  0x58ef8e), which waits for track 3's `sim/day-turn` because it touches
+  the same walk; the bare lot's room map at load step 8
   needs evidence from the original (a harness trace or a recording of a
   community lot), and whether those lots are resized is unknown.
-  **Unverified:** a person in a pool, and the clash itself (error 0x16):
+  **Unverified:** no capture covers house 9 yet; a person in a pool;
+  the clash itself (error 0x16):
   no object yet has wall rules that let both sides be other than none
   outside a container.
 
