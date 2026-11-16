@@ -61,8 +61,3 @@ below weight 1 into what the bones held (0x597c4c, not ported).
 The test of the cancel at step 825 now says what follows: the stop at
 step 828, the route's result 4 at step 829, the snack put down at step
 894 and Mortimer free at step 913.
-
-    snack, stopped at the unported route stop below; since the route
-    stop is ported, he stops the walk, carries the snack to (296, 456)
-    and puts it down
-    (`a_snack_cancelled_on_the_way_to_the_chair_stops_the_walk_and_is_put_down`).

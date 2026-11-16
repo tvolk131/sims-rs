@@ -32,9 +32,10 @@ ported from the original's code, as the inverse of Grab:
       its own (0x45d7c0). He drops the snack at step 1009, and starts
       the water at step 1028.
   - A cancel at step 825, as he walks away from the fridge with the
-    snack, stops at the unported route stop below
-    (`a_snack_cancelled_on_the_way_to_the_chair_stops_at_the_unported_route_stop`,
-    a known gap pinned so it is not mistaken for fixed).
+    snack, stopped at the unported route stop below; since the route
+    stop is ported, he stops the walk, carries the snack to (296, 456)
+    and puts it down
+    (`a_snack_cancelled_on_the_way_to_the_chair_stops_the_walk_and_is_put_down`).
 - **A manual sweep, not a test:** the snack order cancelled at each
   step from 150 to 1136 (every tenth step, then every step near each
   edge), run 400 steps on. Cancels at steps 150 to 536, 543 to 590 and
