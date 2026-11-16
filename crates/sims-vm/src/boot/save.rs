@@ -23,8 +23,11 @@ use serde::{Deserialize, Serialize};
 use sims_sim::World;
 use std::collections::{BTreeSet, VecDeque};
 
-/// The version of [`Saved::encode`]'s layout, bumped when it changes. The
-/// world inside keeps [`sims_sim::SNAPSHOT_FORMAT`], which is written too.
+/// The version of [`Saved::encode`]'s layout: the fields of [`Saved`],
+/// their order and their types (postcard is not self-describing). Bump it
+/// in the commit that changes any of them. The world inside is versioned
+/// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. A save of
+/// another version is refused, not migrated.
 pub const FORMAT: u32 = 1;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
@@ -56,7 +59,8 @@ pub enum SaveError {
         loaded: (u32, u16),
     },
     /// The save is of the same house number and family, but of a lot the
-    /// load left otherwise: another neighborhood, install or house file.
+    /// load left otherwise: another neighborhood, install or house file,
+    /// or a version of this program that loads the house differently.
     OtherLoad,
     /// The bytes are not a save this version reads.
     Format(String),
@@ -74,7 +78,8 @@ impl std::fmt::Display for SaveError {
             ),
             Self::OtherLoad => write!(
                 f,
-                "the save is of a lot loaded from other files (another neighborhood or install)"
+                "the save is of a lot loaded otherwise (another neighborhood, install or \
+                 house file, or a version that loads the house differently)"
             ),
             Self::Format(reason) => write!(f, "not a readable save: {reason}"),
         }

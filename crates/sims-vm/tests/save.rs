@@ -142,4 +142,9 @@ fn bytes_of_another_layout_are_refused() {
     header.extend(sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
     let refused = Saved::decode(&header).unwrap_err().to_string();
     assert!(refused.contains("save format 2"), "{refused}");
+    // The world's encoding is checked as well.
+    let mut header = sims_vm::boot::save::FORMAT.to_le_bytes().to_vec();
+    header.extend((sims_sim::SNAPSHOT_FORMAT - 1).to_le_bytes());
+    let refused = Saved::decode(&header).unwrap_err().to_string();
+    assert!(refused.contains("world format"), "{refused}");
 }
