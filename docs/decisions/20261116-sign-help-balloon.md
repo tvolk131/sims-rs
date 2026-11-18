@@ -27,8 +27,9 @@ precision.
   repo. A table that is missing or does not parse leaves its strings
   empty, and the HUD still opens. UIText.iff itself the game needs for
   its dialogs' labels, as the viewer does when a dialog is pending; with
-  none pending, the viewer opens without it, and the sign has no name
-  to press.
+  none pending, the viewer opens without it. The sign's name, drawn
+  and sized from the panel's own list of names (`ZODIAC_NAMES`), still
+  shows and takes a press, but no balloon opens.
 - **The press** (0x51bfb3): the control is the sign's name, sized to it
   (0x51cd7f..0x51cdfe: x 5 and y the line plus 5 above the subpanel's
   bottom, as wide as the text and as tall as the line). `layout` cannot
