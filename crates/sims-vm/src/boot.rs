@@ -12,6 +12,8 @@
 //! `sims boot` prints what this does; presentation crates use it to
 //! watch a lot run.
 
+pub mod save;
+
 use crate::play::Play;
 use crate::{Answers, Callback, Interpreter, Program, Stream, TickError, Update};
 use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People, Surfaces};
@@ -19,7 +21,6 @@ use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Anything that stops a boot, with a message that says where.
@@ -200,6 +201,10 @@ pub struct Lot {
 
     /// The house view's rotation, 0 to 3 ([`Lot::set_view_rotation`]).
     view_rotation: u8,
+    /// The world's hash as the load left it, which a save carries so it
+    /// goes back only into a lot loaded from the same files
+    /// ([`save`]).
+    loaded: [u8; 32],
 }
 
 /// A dialog the lot waits on ([`Lot::asking`]). The tick that showed it
@@ -428,6 +433,18 @@ impl Lot {
         let mut program = Program::link(&index, &catalog, catalog.objects.iter().map(|o| o.guid))?;
         program.zoning = neighborhood.zoning(context.expansions)?;
         program.expansions = context.expansions;
+        // The types registered from the neighborhood's Characters folder,
+        // which the original registers with kind 1 (0x424a8b, 0x43c228).
+        program.characters = catalog
+            .objects
+            .iter()
+            .map(|o| o.guid)
+            .filter(|&guid| {
+                catalog.object(guid).is_some_and(|o| {
+                    index.mounts[index.resources[o.resource].mount].path == Index::CHARACTERS
+                })
+            })
+            .collect();
         program.animations = Animations::load(&install, &index)?;
         let person_types = || {
             catalog
@@ -595,25 +612,11 @@ impl Lot {
             // clears global 12.
             if load.stopped.is_none() {
                 let made = interpreter.ensure_indicators(&mut world)?.is_some();
-                // The types registered from the neighborhood's
-                // Characters folder, which the original registers with
-                // kind 1 (0x424a8b, 0x43c228).
-                let characters: BTreeSet<u32> = catalog
-                    .objects
-                    .iter()
-                    .map(|o| o.guid)
-                    .filter(|&guid| {
-                        catalog.object(guid).is_some_and(|o| {
-                            index.mounts[index.resources[o.resource].mount].path
-                                == Index::CHARACTERS
-                        })
-                    })
-                    .collect();
                 world.finish_selection(&Household {
                     house: i32::try_from(number)?,
                     flags: record.flags,
                     members: &record.members,
-                    characters: &characters,
+                    characters: &program.characters,
                     residents: &residents,
                     zoning: &program.zoning,
                 })?;
@@ -635,6 +638,7 @@ impl Lot {
         load.saved_ticks = file.simulator.ticks;
         load.libraries = program.libraries.len();
         let start = world.ticks;
+        let loaded = world.hash();
         Ok(Self {
             program,
             catalog,
@@ -654,6 +658,7 @@ impl Lot {
             asking: None,
 
             view_rotation,
+            loaded,
         })
     }
 
@@ -700,6 +705,9 @@ impl Lot {
             self.tuning = Some(tuning);
         }
         if !self.asks {
+            // A lot restored from a save made once a dialog was answered
+            // takes input again after this step, as the saved lot would.
+            self.answered = false;
             let result = self.advance(play).map_err(Stop::into_step);
             if result.is_err() {
                 self.halted = true;
@@ -1136,6 +1144,7 @@ mod tests {
             ..LoadReport::default()
         };
         let start = world.ticks;
+        let loaded = world.hash();
         Lot {
             program: Program {
                 global: 0,
@@ -1147,6 +1156,7 @@ mod tests {
                 people: Default::default(),
                 icon_frames: None,
                 expansions: 0,
+                characters: Default::default(),
             },
             catalog: Catalog {
                 global: 0,
@@ -1169,6 +1179,7 @@ mod tests {
             asking: None,
 
             view_rotation: 0,
+            loaded,
         }
     }
 

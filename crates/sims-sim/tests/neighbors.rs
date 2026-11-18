@@ -335,3 +335,56 @@ fn an_empty_inventory_slot_fails() {
         Err(LoadError::Neighborhood(_))
     ));
 }
+
+#[test]
+fn a_records_friend_count_counts_mutual_friends_of_a_character_type_in_a_family() {
+    use sims_sim::neighbors::Row;
+    use std::collections::BTreeSet;
+    // Anne (1), Bob (3), Carl (4) and a second Anne (5).
+    let mut world = read(&neighborhood(), &everyone()).unwrap();
+    let rows = |world: &mut World, from: i16, to: &[(i32, i32)]| {
+        world.neighbors.get_mut(from).unwrap().relationships = to
+            .iter()
+            .map(|&(target, value)| Row {
+                target,
+                values: vec![value],
+            })
+            .collect();
+    };
+    // Anne likes the three others 30, and each of them likes her 30.
+    rows(&mut world, 1, &[(3, 30), (4, 30), (5, 30)]);
+    for other in [3, 4, 5] {
+        rows(&mut world, other, &[(1, 30)]);
+    }
+    for (id, family) in [(1, 0), (3, 2), (4, 2), (5, 7)] {
+        world.neighbors.get_mut(id).unwrap().data[FAMILY] = family;
+    }
+    // Carl's type is not one of the Characters folder's (0x423f30).
+    let characters = BTreeSet::from([ANNE, BOB]);
+    assert!(world.neighbors.get(1).unwrap().stale);
+    // 0x427148: Bob and the second Anne; Anne's own family (0) does not
+    // matter, only the others'.
+    assert_eq!(world.record_friends(1, 30, &characters), Some(2));
+    let anne = world.neighbors.get(1).unwrap();
+    // The count is kept, and the record stays out of date.
+    assert_eq!((anne.friends, anne.stale), (2, true));
+    // So it is worked out again at the next read: Bob in family 0 is not
+    // counted, nor is a friendship one way only, nor one below the
+    // threshold.
+    world.neighbors.get_mut(3).unwrap().data[FAMILY] = 0;
+    assert_eq!(world.record_friends(1, 30, &characters), Some(1));
+    rows(&mut world, 5, &[(1, 29)]);
+    assert_eq!(world.record_friends(1, 30, &characters), Some(0));
+    rows(&mut world, 5, &[(1, 30)]);
+    assert_eq!(world.record_friends(1, 31, &characters), Some(0));
+    assert_eq!(world.record_friends(1, 30, &characters), Some(1));
+    // Up to date, the kept count is read whatever changed.
+    world.neighbors.get_mut(1).unwrap().stale = false;
+    world.neighbors.get_mut(3).unwrap().data[FAMILY] = 2;
+    assert_eq!(world.record_friends(1, 30, &characters), Some(1));
+    assert_eq!(world.record_friends(1, 30, &BTreeSet::new()), Some(1));
+    // A record that is not there.
+    assert_eq!(world.record_friends(2, 30, &characters), None);
+    assert_eq!(world.record_friends(9, 30, &characters), None);
+    assert_eq!(world.record_friends(0, 30, &characters), None);
+}

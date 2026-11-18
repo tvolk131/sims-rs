@@ -1854,6 +1854,25 @@ impl Interpreter<'_> {
         }
         a.position[0] = x.to_f32();
         a.position[1] = y.to_f32();
+        // 0x58eeeb: a route under way that was asked to stop
+        // ([`ask_stop`]) stops here, unless its foreground clip may not be
+        // interrupted (layer +0x68 0): the route ends blocked (3, 0x58f682)
+        // and the update goes to its tail.
+        if world.stops_asked.contains(&id)
+            && a.arrival == 1
+            && a.foreground
+                .as_ref()
+                .is_none_or(|layer| layer.interruptible != 0)
+        {
+            if person_word(world, id, SPECIAL)? != 0 {
+                return Err(unsupported(
+                    "0x58ef2f",
+                    "stops its route where it was asked to, for a person whose word 64 is set",
+                ));
+            }
+            a.arrival = BLOCKED;
+            return Ok(false);
+        }
         Ok(true)
     }
 
@@ -1889,9 +1908,9 @@ impl Interpreter<'_> {
     ///    is moved onto the path ([`snap_to_path`], all its segments).
     /// 3. If the person fits there (virtual function 0x54) it is put there
     ///    (virtual function 0x88, [`Self::put_person`]). A person that does
-    ///    not fit would have the animator's position unset (virtual
-    ///    function 0x20) and be put back on its own tile with result 0;
-    ///    that fails loudly.
+    ///    not fit has the animator's position unset (virtual function 0x20
+    ///    with 1, 0x589361; byte +0xd9, which it also sets, is not kept)
+    ///    and is put back on its own tile (0x589dee), and the result is 0.
     pub(crate) fn route_result(&self, world: &mut World, id: u16) -> Result<i32, Trap> {
         let a = world
             .animators
@@ -1920,10 +1939,19 @@ impl Interpreter<'_> {
             .position[2];
         let to = [first, second];
         if !self.fits(world, id, to, level).map_err(|f| f.trap)? {
-            return Err(unsupported(
-                "0x589dee",
-                "ends its route where its person does not fit",
-            ));
+            // 0x589dee: the animator's position is unset (virtual function
+            // 0x20 with 1, 0x589361), and the person is put back on its
+            // own tile.
+            if let Some(a) = world.animators.get_mut(&id) {
+                a.position = [UNSET; 3];
+            }
+            let own = world
+                .objects
+                .get(&id)
+                .ok_or_else(|| Trap::native(10, "missing object"))?
+                .position;
+            self.put_person(world, id, [own[0], own[1]], level)?;
+            return Ok(0);
         }
         self.put_person(world, id, to, level)?;
         Ok(1)
@@ -2166,6 +2194,7 @@ impl Interpreter<'_> {
         let scale = (ONE.ext() * SCALE_UNIT.ext()).single().to_i32_truncate();
         set_datum(world, id, SCALE_WORD, scale as i16)?;
         a.arrival = 1;
+        world.stops_asked.remove(&id);
         a.motion.progress = F32::ZERO;
         a.motion.segment = 0;
         a.motion.near_end = 0;
@@ -2253,10 +2282,12 @@ fn end_turn(world: &mut World, id: u16, a: &mut Animator) -> Result<(), Trap> {
 
 /// The animator stops following its route (0x589e2d), as the route's
 /// steps 9 and 10 and its end ask. While the route is under way (its end,
-/// +0x188, is 1 or -1) nothing stops: +0x284 is set to 1, which nothing
-/// ported reads, and the answer is false. Otherwise the end becomes 0,
+/// +0x188, is 1 or -1) nothing stops: +0x284 is set to 1, the request
+/// [`ask_stop`] keeps, and the answer is false. Otherwise the end becomes 0,
 /// the segment -1, the destination the position, and the animator
 /// stands (state 3); the answer is true.
+///
+/// Callers on a lot use [`ask_stop`], which keeps the request.
 ///
 /// The timer of a stop at the end of a path (+0x1c0) becomes 0 too
 /// (0x589e56). The original also sets +0x18c to 1 and the global
@@ -2271,6 +2302,21 @@ pub(crate) fn stop_route(a: &mut Animator) -> bool {
     a.destination = a.position;
     a.state = 3;
     true
+}
+
+/// Person `id`'s animator stops following its route ([`stop_route`],
+/// 0x589e2d). A route under way does not stop, and the request is kept
+/// ([`World::stops_asked`], +0x284) for the walk's next step.
+pub(crate) fn ask_stop(world: &mut World, id: u16) -> Result<bool, Trap> {
+    let animator = world
+        .animators
+        .get_mut(&id)
+        .ok_or_else(|| Trap::Invalid(format!("person {id} has no animator")))?;
+    let stopped = stop_route(animator);
+    if !stopped {
+        world.stops_asked.insert(id);
+    }
+    Ok(stopped)
 }
 
 /// The start of a stop at the end of a path, with no timer set yet
@@ -2603,6 +2649,27 @@ mod tests {
         assert!(stop_route(&mut a));
         assert_eq!((a.arrival, a.motion.segment, a.state), (0, -1, 3));
         assert_eq!(a.destination, a.position);
+    }
+
+    #[test]
+    fn a_stop_asked_of_a_route_under_way_is_kept_for_the_walks_next_step() {
+        let mut world = World::empty();
+        let mut a = sims_sim::animator::LOADED;
+        a.arrival = 1;
+        world.animators.insert(7, a.clone());
+        // Under way, the route does not stop, and the request is kept
+        // (+0x284).
+        assert_eq!(ask_stop(&mut world, 7), Ok(false));
+        assert!(world.stops_asked.contains(&7));
+        assert_eq!(world.animators[&7], a);
+        // Ended, it stops, and nothing is kept.
+        world.stops_asked.clear();
+        world.animators.get_mut(&7).unwrap().arrival = 2;
+        assert_eq!(ask_stop(&mut world, 7), Ok(true));
+        assert!(world.stops_asked.is_empty());
+        assert_eq!(world.animators[&7].arrival, 0);
+        // A person with no animator is an error.
+        assert!(matches!(ask_stop(&mut world, 8), Err(Trap::Invalid(_))));
     }
 
     fn feet() -> Footfalls {

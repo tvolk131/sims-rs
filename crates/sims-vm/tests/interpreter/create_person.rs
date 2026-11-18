@@ -172,21 +172,28 @@ fn flag_0x4_runs_a_new_visitors_init_visitor_tree_at_once() {
 }
 
 #[test]
-fn what_mode_6_making_a_person_does_not_port_fails_loudly() {
-    // Person word 68, 74 or 84 (from the record) sends the original
-    // through 0x45810c.
+fn a_person_made_with_person_word_68_74_or_84_set_is_made_as_any_other() {
+    // The person test (0x44e6b6 to 0x44e727) sends such a person through
+    // 0x45810c, which touches only the screen; the port leaves it out.
     for word in [68, 74, 84] {
         let (mut fx, _, record) = visitors();
+        let before = ids(&fx);
         let slot = fx.world.neighbors.slots.last_mut().unwrap();
         let slot = slot.as_mut().unwrap();
         slot.revision = 10;
         slot.data[word] = 3;
-        let result = create(&mut fx, 0, 6, FROM_RECORD, record);
-        assert!(
-            matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x45810c")),
+        assert_eq!(
+            create(&mut fx, 0, 6, FROM_RECORD, record),
+            Ok(true),
             "word {word}"
         );
+        let id = new_object(&fx, &before);
+        assert_eq!(fx.world.objects[&id].person.as_ref().unwrap().data[word], 3);
     }
+}
+
+#[test]
+fn what_mode_6_making_a_person_does_not_port_fails_loudly() {
     // An "init visitor" tree that would wait cannot (native error 0x44f in
     // the original's synchronous run).
     let (mut fx, file, record) = visitors();

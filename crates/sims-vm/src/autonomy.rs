@@ -307,14 +307,20 @@ fn compare(a: &Candidate, b: &Candidate) -> i32 {
     }
 }
 
-/// The C runtime's `qsort` (0x6356ba) with the candidates' comparison:
-/// below nine elements a selection sort that moves the greatest to the
-/// end (0x63580e); otherwise the middle element is swapped to the front
-/// as the pivot and the rest partitioned around it, and each side sorted
-/// the same way. Ported from the old prototype's `sort`
-/// (legacy/crates/sims-vm/src/autonomy.rs) and checked against the code.
+/// The C runtime's `qsort` (0x6356ba) with the candidates' comparison.
 pub fn sort(candidates: &mut [Candidate]) {
-    let n = candidates.len();
+    qsort(candidates, &compare);
+}
+
+/// The C runtime's `qsort` (0x6356ba): below nine elements a selection
+/// sort that moves the greatest to the end (0x63580e); otherwise the
+/// middle element is swapped to the front as the pivot and the rest
+/// partitioned around it, and each side sorted the same way. It is not
+/// stable, so which of two equal elements comes first is this order's.
+/// Ported from the old prototype's `sort`
+/// (legacy/crates/sims-vm/src/autonomy.rs) and checked against the code.
+pub(crate) fn qsort<T>(items: &mut [T], compare: &impl Fn(&T, &T) -> i32) {
+    let n = items.len();
     if n < 2 {
         return;
     }
@@ -322,34 +328,34 @@ pub fn sort(candidates: &mut [Candidate]) {
         for end in (1..n).rev() {
             let mut greatest = 0;
             for i in 1..=end {
-                if compare(&candidates[i], &candidates[greatest]) > 0 {
+                if compare(&items[i], &items[greatest]) > 0 {
                     greatest = i;
                 }
             }
-            candidates.swap(greatest, end);
+            items.swap(greatest, end);
         }
         return;
     }
-    candidates.swap(0, n / 2);
+    items.swap(0, n / 2);
     let (mut low, mut high) = (0, n);
     loop {
         low += 1;
-        while low < n && compare(&candidates[low], &candidates[0]) <= 0 {
+        while low < n && compare(&items[low], &items[0]) <= 0 {
             low += 1;
         }
         high -= 1;
-        while high > 0 && compare(&candidates[high], &candidates[0]) >= 0 {
+        while high > 0 && compare(&items[high], &items[0]) >= 0 {
             high -= 1;
         }
         if high < low {
             break;
         }
-        candidates.swap(low, high);
+        items.swap(low, high);
     }
-    candidates.swap(0, high);
-    sort(&mut candidates[..high]);
+    items.swap(0, high);
+    qsort(&mut items[..high], compare);
     if low < n {
-        sort(&mut candidates[low..]);
+        qsort(&mut items[low..], compare);
     }
 }
 

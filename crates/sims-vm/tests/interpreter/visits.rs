@@ -1024,7 +1024,7 @@ fn a_new_object_can_be_created_off_the_lot_and_run_a_tree_by_name() {
 }
 
 /// A route context of `person` to slot 0 of the lamp.
-fn context(person: u16) -> sims_sim::route::Context {
+pub(crate) fn context(person: u16) -> sims_sim::route::Context {
     sims_sim::route::Context {
         candidates: Vec::new(),
         slot: sims_sim::route::RouteSlot {

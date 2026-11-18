@@ -65,3 +65,6 @@ __pycache__/
 /legacy/crates/sims-render/tests/clown_household_continuation.rs
 /crates/sims-render/tests/fresh_household_replay.rs
 /legacy/crates/sims-render/tests/fresh_household_replay.rs
+
+# The game window's saves (sims-game --saves)
+/sims-game-saves.redb

@@ -287,10 +287,17 @@ fn find_location_mode_1_on_a_tile_takes_its_group_off() {
     );
     assert_eq!(fx.world.globals[COUNT] - before, 3);
     // A tile whose type has the dynamic group function leaves its group
-    // first (0x42346a), which is not ported.
+    // first (0x42346a), so the take-off takes it alone: the lead keeps
+    // the third tile. (Its neighbours: `crate::dynamic_group`.)
     let mut fx = placed_group(true, false);
-    let result = on_tile(&mut fx, FIND_LOCATION, [1, 0, 0, 0, 0, 0, 0, 0]);
-    assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("0x42346a")));
+    let before = fx.world.globals[COUNT];
+    assert_eq!(
+        on_tile(&mut fx, FIND_LOCATION, [1, 0, 0, 0, 0, 0, 0, 0]),
+        Ok(true)
+    );
+    assert_eq!(fx.world.globals[COUNT] - before, 1);
+    assert_eq!(fx.world.next_parts, BTreeMap::from([(3, 5)]));
+    assert_eq!(fx.world.objects[&4].multipart.as_ref().unwrap().parent, 0);
 }
 
 #[test]
@@ -301,12 +308,15 @@ fn removing_a_tile_queues_its_lead() {
     assert_eq!(on_tile(&mut fx, REMOVE, [1, 0, 0, 0, 0, 0, 0, 0]), Ok(true));
     assert_eq!(fx.world.removals, [3]);
     assert_eq!(fx.world.globals[COUNT] - before, 3);
-    // A tile whose type has the dynamic group function would go alone
-    // (0x442def), which is not ported.
+    // A tile whose type has the dynamic group function goes alone
+    // (0x442def); its take-off is still its group's (0x422d86), and it
+    // stays in its group until it is deleted (0x4424a6).
     let mut fx = placed_group(true, false);
-    let result = on_tile(&mut fx, REMOVE, [1, 0, 0, 0, 0, 0, 0, 0]);
-    assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("0x442def")));
-    assert!(fx.world.removals.is_empty());
+    let before = fx.world.globals[COUNT];
+    assert_eq!(on_tile(&mut fx, REMOVE, [1, 0, 0, 0, 0, 0, 0, 0]), Ok(true));
+    assert_eq!(fx.world.removals, [4]);
+    assert_eq!(fx.world.globals[COUNT] - before, 3);
+    assert_eq!(fx.world.next_parts, BTreeMap::from([(3, 4), (4, 5)]));
 }
 
 #[test]
