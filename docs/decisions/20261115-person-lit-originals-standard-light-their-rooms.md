@@ -51,6 +51,11 @@ light side, as level 1 gives. Our old light drew his shadow side at
 0.45 and was visibly darker.
 
 **Unverified.**
+
+*Later (2026-11-18):* the light's direction was taken in the wrong frame
+and the lamps are now ported; see "The standard light shines from the
+viewer's side, and lamps light people".
+
 - That the vector is the way the light shines. A person at full light
   shows no side, so only a person in a dim room in a screenshot can
   settle it. A screenshot of Bella indoors (2026-11-14) is brighter on
