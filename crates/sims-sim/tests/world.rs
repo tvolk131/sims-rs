@@ -261,6 +261,7 @@ fn world() -> World {
             },
         )]),
         stops_asked: BTreeSet::from([5]),
+        characters: Default::default(),
     }
 }
 

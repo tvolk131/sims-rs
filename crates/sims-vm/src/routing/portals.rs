@@ -154,7 +154,9 @@ impl Interpreter<'_> {
         world
             .objects
             .get(&id)
-            .and_then(|object| self.catalog.object(object.guid))
+            .and_then(|object| {
+                crate::interpreter::object_definition(self.catalog, world, object.guid)
+            })
             .and_then(|definition| {
                 self.program
                     .libraries

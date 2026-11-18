@@ -1168,9 +1168,10 @@ impl Interpreter<'_> {
             .objects
             .get(&id)
             .ok_or_else(|| Trap::native(10, "missing object"))?;
-        let definition = self.catalog.object(object.guid).ok_or_else(|| {
-            Trap::Invalid(format!("no definition for GUID 0x{:08X}", object.guid))
-        })?;
+        let definition = crate::interpreter::object_definition(self.catalog, world, object.guid)
+            .ok_or_else(|| {
+                Trap::Invalid(format!("no definition for GUID 0x{:08X}", object.guid))
+            })?;
         let lookup = |resource: usize, table: u16| {
             self.program
                 .libraries
@@ -2088,11 +2089,7 @@ impl Interpreter<'_> {
             .get(&id)
             .ok_or_else(|| Trap::native(10, "missing object"))?
             .guid;
-        let skeleton = self.program.people.skeletons.get(&guid).ok_or_else(|| {
-            Trap::Unsupported(format!(
-                "no skeleton was supplied for the person type 0x{guid:08X}"
-            ))
-        })?;
+        let skeleton = crate::people::skeleton(&self.program.people, world, guid)?;
         let samples = self
             .program
             .animations

@@ -973,9 +973,7 @@ impl Interpreter<'_> {
                     continue;
                 };
                 let guid = object.guid;
-                let master = self
-                    .catalog
-                    .object(guid)
+                let master = crate::interpreter::object_definition(self.catalog, world, guid)
                     .and_then(|d| self.program.definition(d.resource, d.chunk))
                     .map(|words| words[10])
                     .ok_or_else(|| Fault {

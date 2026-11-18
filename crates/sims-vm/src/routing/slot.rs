@@ -1067,8 +1067,7 @@ impl Interpreter<'_> {
             .get(&seat)
             .ok_or_else(|| Trap::native(10, "missing object"))?;
         Ok(i32::from(
-            self.catalog
-                .object(object.guid)
+            crate::interpreter::object_definition(self.catalog, world, object.guid)
                 .and_then(|d| self.program.definition(d.resource, d.chunk))
                 .ok_or_else(|| Trap::Invalid(format!("seat {seat} has no definition")))?
                 [SEAT_ENTRIES],

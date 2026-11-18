@@ -21,6 +21,7 @@
 //! not state anything here can act on.
 
 pub mod animator;
+pub mod characters;
 mod error;
 pub mod grass;
 pub mod head;
