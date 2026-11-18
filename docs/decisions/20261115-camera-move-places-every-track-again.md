@@ -66,12 +66,13 @@ and night loop it picks is still not ported.
     still running once the last start's script has ended, whether or not
     its notes still play. While a note of the last start's ended thread
     plays, that thread also writes its own placement through its
-    `target`; once its last note is gone it writes nothing, and the
-    older thread's placement is the only one. Each write changes the
-    notes of the thread it lands in and no other's: in a cycle where
-    track 10's write lands in track 11 and track 11's in track 10, each
-    takes the other's placement. Otherwise a `target` that older thread had set would carry the write to another
-    track. The player keeps which thread each track's last start made,
+    `target`; once its last note is gone it writes nothing, and only
+    the track's other threads are placed: the newest running one and
+    every older ended one with a note still playing, each itself. Each
+    write changes the notes of the thread it lands in and no other's:
+    in a cycle where track 10's write lands in track 11 and track 11's
+    in track 10, each takes the other's placement. Otherwise a `target`
+    that older thread had set would carry the write to another track. The player keeps which thread each track's last start made,
     so this holds after that thread has gone with nothing left playing.
   - Every start sets the track object's `target` back to itself
     (0x57d9c3), before it checks for a hold. So a start that lets a

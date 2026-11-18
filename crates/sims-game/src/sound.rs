@@ -15,18 +15,19 @@
 //!   (0x570c3e, `sims_audio::ambience::view`; the game sends
 //!   `Game::ambience_view`).
 //!
-//! The game sends [`Input::Camera`] when the camera moves: scrolled,
-//! zoomed, turned, to another floor, or the window resized (a
-//! [`Shot`] that changes). The mixer then does what the original's kind
-//! 33 does (`sims_audio::player::Player::camera_moved`): every track is
-//! placed again from where its objects are on the moved screen, and the
-//! ambience's cursor moves. The original sends kind 33 from five places
-//! in its view code, which are not all read; that these are the moves
-//! that send it is **unverified**. The ambience's cursor also follows
-//! the hour and the view once a frame, as before, so the ambience keeps
-//! to the clock while the camera is still: the original moves it only
-//! on kind 33 as far as is read, and whether anything sends kind 33 when
-//! the hour changes is **unverified**.
+//! The game sends [`Input::Camera`] for its first view and whenever the
+//! camera moves: scrolled, zoomed, turned, to another floor, or the
+//! window resized (a [`Shot`] that changes). The mixer then does what
+//! the original's kind 33 does (`sims_audio::player::Player::camera_moved`):
+//! every track is placed again from where its objects are on the moved
+//! screen, and the ambience's cursor moves. The original sends kind 33
+//! from five places in its view code, which are not all read; that these
+//! are the moves that send it is **unverified**. The ambience's cursor
+//! also follows the latest hour and view before each block the mixer
+//! renders, so the ambience keeps to the clock while the camera is
+//! still: the original moves it only on kind 33 as far as is read, and
+//! whether anything sends kind 33 when the hour changes is
+//! **unverified**.
 //!
 //! The game pauses the sound as the original's does (its mode handler,
 //! 0x4ce470): it sends `sims_audio::SoundEvent::Pause` (in
@@ -365,8 +366,9 @@ impl Mixer {
     }
 
     /// Renders `frames` stereo frames at [`sims_audio::player::RATE`],
-    /// moving the ambience's cursor first, as the original does once a
-    /// frame.
+    /// moving the ambience's cursor to the latest hour and view first.
+    /// The original moves it on kind 33, as far as is read; this keeps
+    /// it to the clock between camera moves.
     pub fn render(&mut self, frames: usize) -> Vec<i16> {
         self.player.set_ambience_view(self.view, self.hour);
         self.player.render_stereo(frames, &self.sources)
