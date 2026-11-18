@@ -4,8 +4,9 @@
 mod common;
 
 use sha2::{Digest, Sha256};
+use sims_ui::balloon::{Help, Texts};
 use sims_ui::command::{Command, Panel};
-use sims_ui::frame::Frame;
+use sims_ui::frame::{Frame, Rect};
 use sims_ui::household;
 use sims_ui::hud::{self, Controls};
 
@@ -139,6 +140,51 @@ fn the_goths_personality_panel() {
     assert_eq!(
         digest(&frame),
         "2414e88dac8a620c6185b589d9bfa479073f314686f4c607bc6cbd09379ce669"
+    );
+}
+
+#[test]
+fn the_goths_sign_balloon() {
+    let Some(root) = common::install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to draw the control panel");
+        return;
+    };
+    let opened = common::open(&root, common::GOTH_HOUSE);
+    let texts = Texts::load(&opened.install).expect("the balloons' texts");
+    // Mortimer is a Taurus: he gets on best with Aries and Libra, worst
+    // with Virgo and Cancer.
+    let taurus = texts.get(Help::Sign(2)).expect("Taurus");
+    assert!(!taurus.title.is_empty());
+    let lines: Vec<&str> = taurus.body.lines().collect();
+    assert!(lines[lines.len() - 2].ends_with("Aries, Libra"));
+    assert!(lines[lines.len() - 1].ends_with("Virgo, Cancer"));
+
+    let mut controls = Controls {
+        expanded: true,
+        panel: Panel::Personality,
+        ..Controls::default()
+    };
+    let mut items = hud::layout([800, 600], &opened.snapshot, &controls);
+    hud::fit(&mut items, &opened.art, &texts);
+    // The sign's name, at the panel's bottom left.
+    let command = hud::press(&items, [413 + 108 + 10, 600 - 12]);
+    assert_eq!(command, Some(Command::Help(Help::Sign(2))));
+    controls.apply(&command.unwrap());
+    let mut items = hud::layout([800, 600], &opened.snapshot, &controls);
+    hud::fit(&mut items, &opened.art, &texts);
+    let mut frame = Frame::new(800, 600, [0, 0, 0]);
+    hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
+    // The balloon from 241 to the right edge and up from the strip, as
+    // tall as the least a balloon takes. On the original's screen it is
+    // there, and every one of its pixels is the same in 16-bit color
+    // (docs/decisions/20261116-sign-help-balloon.md).
+    assert_eq!(
+        items.last().map(|i| i.rect),
+        Some(Rect::new(241, 373, 559, 127))
+    );
+    assert_eq!(
+        digest(&frame),
+        "e76b2e5deafb40d16fae70da6b664f3383fdc6693d8d70a3404506d6729cb0b3"
     );
 }
 

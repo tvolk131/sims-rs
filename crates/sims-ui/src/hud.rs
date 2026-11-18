@@ -12,6 +12,7 @@
 //! the original does when its window is wider than 800.
 
 use crate::art::Art;
+use crate::balloon::{self, Balloon, Help, Texts};
 use crate::command::{Camera, Command, Mode, Panel, Relations, Speed, Walls};
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
@@ -97,7 +98,7 @@ pub mod id {
 }
 
 /// Every resource the panel may draw, for [`Art::load`].
-pub const RESOURCES: [i32; 55] = [
+pub const RESOURCES: [i32; 56] = [
     id::WALLS_DOWN,
     id::CUTAWAY,
     id::WALLS_UP,
@@ -153,6 +154,7 @@ pub const RESOURCES: [i32; 55] = [
     id::BUILD_TRIM,
     id::OPTIONS_TRIM,
     4918,
+    balloon::BACKGROUND,
 ];
 
 /// What the player has open: state of the presentation, not of the
@@ -174,6 +176,9 @@ pub struct Controls {
     /// back to it (0x51db4b).
     pub relations: Relations,
     pub relations_page: u32,
+    /// The help balloon open, if any. It shows while the panel that
+    /// opened it does.
+    pub help: Option<Help>,
 }
 
 /// What the camera buttons show. The host's camera owns it.
@@ -213,6 +218,7 @@ impl Default for Controls {
             pointer: None,
             relations: Relations::default(),
             relations_page: 0,
+            help: None,
         }
     }
 }
@@ -220,10 +226,31 @@ impl Default for Controls {
 impl Controls {
     /// Applies a command that changes only what is shown. Commands for
     /// the simulation and the camera are left to the host.
+    ///
+    /// A control's balloon closes when the control is pressed again, even
+    /// if it would now show other text (0x51c025 compares the balloon,
+    /// not the text), and when another panel opens (0x51d375); and here also when the strip closes
+    /// (**unverified**). The original also closes it on a press outside
+    /// it and on some focus changes (0x51f3e5, 0x51d312, 0x51d354), which
+    /// are not ported.
     pub fn apply(&mut self, command: &Command) {
         match command {
-            Command::TogglePanel => self.expanded = !self.expanded,
-            Command::OpenPanel(panel) => self.panel = *panel,
+            Command::TogglePanel => {
+                self.expanded = !self.expanded;
+                self.help = None;
+            }
+            Command::OpenPanel(panel) => {
+                if *panel != self.panel {
+                    self.help = None;
+                }
+                self.panel = *panel;
+            }
+            Command::Help(help) => {
+                self.help = match self.help {
+                    Some(open) if open.balloon() == help.balloon() => None,
+                    _ => Some(*help),
+                };
+            }
             Command::ShowRelations(list) => self.relations = *list,
             Command::RelationsPage(page) => self.relations_page = *page,
             _ => {}
@@ -304,6 +331,16 @@ pub enum Kind {
     /// The first name of the person of type `guid`, in a box centered
     /// over `rect`'s bottom edge, while the pointer is on their portrait.
     Name { guid: u32 },
+    /// The personality panel's sign of the zodiac, which opens its help
+    /// balloon when pressed. [`fit`] sizes `rect` to the name; until
+    /// then it is empty. The name itself is drawn with
+    /// [`Kind::Personality`].
+    Sign { sign: u8, panel: Rect },
+    /// The help balloon open over `owner`, the subpanel that opened it,
+    /// before [`fit`] lays it out ([`Kind::Balloon`]). Draws nothing.
+    Help { help: Help, owner: Rect },
+    /// A help balloon, laid out.
+    Balloon(Balloon),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -539,7 +576,53 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
         10,
         Align::Right,
     ));
+    // The help balloon, over everything, while its panel shows.
+    if let Some(help @ Help::Sign(_)) = controls.help {
+        let owner = items.iter().find_map(|i| match i.kind {
+            Kind::Personality { .. } => Some(i.rect),
+            _ => None,
+        });
+        if let Some(owner) = owner {
+            items.push(Item {
+                rect: Rect::new(owner.x + owner.width, owner.y, 0, 0),
+                kind: Kind::Help { help, owner },
+                command: None,
+            });
+        }
+    }
     items
+}
+
+/// Finishes what [`layout`] cannot without the fonts and the install's
+/// texts: sizes the sign of the zodiac's press area to its name, as the
+/// personality panel sizes its control (0x51cd7f..0x51cdfe), and lays out
+/// the help balloon. Hosts call it after [`layout`]; without it the sign
+/// cannot be pressed and no balloon shows.
+pub fn fit(items: &mut [Item], art: &Art, texts: &Texts) {
+    for item in items {
+        match &item.kind {
+            Kind::Sign { sign, panel } => {
+                if let Some(font) = art.font(ZODIAC_FONT) {
+                    let name = ZODIAC_NAMES[usize::from((*sign).clamp(1, 12) - 1)];
+                    let line = font.line_height;
+                    item.rect = Rect::new(
+                        panel.x.saturating_add(5),
+                        panel.y.saturating_add(panel.height - line - 5),
+                        font.width(name),
+                        line,
+                    );
+                }
+            }
+            Kind::Help { help, owner } => {
+                if let Some(text) = texts.get(*help) {
+                    let laid = balloon::lay_out(art, text, *owner);
+                    item.rect = laid.rect;
+                    item.kind = Kind::Balloon(laid);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The live-mode strip: portraits at the left, the gadget and the needs
@@ -666,6 +749,13 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             },
             command: None,
         });
+        if let Some(sign) = resident.zodiac {
+            items.push(Item {
+                rect: Rect::new(panel.x + 5, panel.y + panel.height - 5, 0, 0),
+                kind: Kind::Sign { sign, panel },
+                command: Some(Command::Help(Help::Sign(sign))),
+            });
+        }
     }
     if let (Some(resident), Panel::Job) = (selected, controls.panel) {
         let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
@@ -1629,6 +1719,8 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
             } => draw_work(frame, art, r, work, *performance, *family_friends),
             Kind::Relation { relation, lit } => draw_relation(frame, art, faces, r, relation, *lit),
             Kind::House { house } => draw_house(frame, art, r, house),
+            Kind::Sign { .. } | Kind::Help { .. } => {}
+            Kind::Balloon(b) => balloon::draw(frame, art, b),
             Kind::Meter(value) => {
                 let (width, left, right) = meter(*value);
                 frame.fill(r, right);
@@ -1686,6 +1778,7 @@ impl Item {
                     | Kind::Skills { .. }
                     | Kind::Work { .. }
                     | Kind::Relation { .. }
+                    | Kind::Help { .. }
             )
     }
 }
@@ -2492,6 +2585,80 @@ mod tests {
         for at in [i32::MAX - 2, i32::MIN + 2] {
             draw_zodiac(&mut frame, &art, Rect::new(at, at, 279, 100), 12);
         }
+    }
+
+    #[test]
+    fn pressing_the_sign_opens_its_balloon_over_the_panel() {
+        let mut s = snapshot();
+        s.residents[0].zodiac = Some(1);
+        let mut controls = Controls {
+            expanded: true,
+            panel: Panel::Personality,
+            ..Controls::default()
+        };
+        let mut art = Art::default();
+        art.insert_font(ZODIAC_FONT, crate::font::tests::font());
+        let line = art.font(ZODIAC_FONT).unwrap().line_height;
+        let texts = Texts::signs(&[], &[], &[]);
+        // Before fit the sign cannot be pressed; after, its name can.
+        let mut items = layout([800, 600], &s, &controls);
+        let bottom_left = [526, 600 - 5 - line];
+        assert_eq!(press(&items, bottom_left), None);
+        fit(&mut items, &art, &texts);
+        let sign = items
+            .iter()
+            .find(|i| matches!(i.kind, Kind::Sign { .. }))
+            .unwrap();
+        // Only the test font's `A` has width.
+        let width = art.font(ZODIAC_FONT).unwrap().width("Aries");
+        assert_eq!(sign.rect, Rect::new(526, 600 - 5 - line, width, line));
+        let command = press(&items, bottom_left).unwrap();
+        assert_eq!(command, Command::Help(Help::Sign(1)));
+        assert!(!command.changes_simulation());
+
+        // Open, the balloon is the last item, flush right on the strip.
+        controls.apply(&command);
+        assert_eq!(controls.help, Some(Help::Sign(1)));
+        let mut items = layout([800, 600], &s, &controls);
+        fit(&mut items, &art, &texts);
+        let last = items.last().unwrap();
+        assert!(matches!(last.kind, Kind::Balloon(_)));
+        assert_eq!(last.rect, Rect::new(241, 373, 559, 127));
+        // It takes presses over the lot, and asks for nothing.
+        assert!(covers(&items, [300, 400]));
+        assert_eq!(press(&items, [300, 400]), None);
+        draw(
+            &mut Frame::new(800, 600, [0; 3]),
+            &art,
+            &Faces::default(),
+            &items,
+            &controls,
+        );
+
+        // Another panel closes it; so does pressing the sign again.
+        let mut other = controls;
+        other.apply(&Command::OpenPanel(Panel::Needs));
+        assert_eq!(other.help, None);
+        let mut same = controls;
+        same.apply(&Command::OpenPanel(Panel::Personality));
+        assert_eq!(same.help, Some(Help::Sign(1)));
+        let mut again = controls;
+        again.apply(&command);
+        assert_eq!(again.help, None);
+        // Even another Sim's sign: the panel has one balloon (0x51c025).
+        let mut again = controls;
+        again.apply(&Command::Help(Help::Sign(4)));
+        assert_eq!(again.help, None);
+        again.apply(&Command::Help(Help::Sign(4)));
+        assert_eq!(again.help, Some(Help::Sign(4)));
+        let mut closed = controls;
+        closed.apply(&Command::TogglePanel);
+        assert_eq!(closed.help, None);
+        // With another panel showing, no balloon is laid out.
+        let mut elsewhere = controls;
+        elsewhere.panel = Panel::Needs;
+        let items = layout([800, 600], &s, &elsewhere);
+        assert!(!items.iter().any(|i| matches!(i.kind, Kind::Help { .. })));
     }
 
     #[test]

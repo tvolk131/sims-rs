@@ -1500,6 +1500,67 @@ fn the_personality_panel_shows_the_selected_goths_traits() {
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
 
+/// A press on Mortimer's sign of the zodiac opens its help balloon over
+/// the lot, with the whoosh the original plays, and a second press
+/// closes it with another (0x51bfb3, 0x50fb3f, 0x50fbc5).
+#[test]
+fn the_sign_opens_and_closes_its_help_balloon() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        play: true,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    assert_eq!(game.run(20), 20);
+    game.resize([800, 600]);
+    game.render();
+    let centre = |r: Rect| [r.x + r.width / 2, r.y + r.height / 2];
+    let find = |game: &Game, wanted: fn(&Kind) -> bool| {
+        game.panel()
+            .iter()
+            .find(|item| wanted(&item.kind))
+            .map(|item| item.rect)
+    };
+    let button = game
+        .panel()
+        .iter()
+        .find(|item| {
+            item.command
+                == Some(sims_ui::command::Command::OpenPanel(
+                    sims_ui::command::Panel::Personality,
+                ))
+        })
+        .expect("the Personality button")
+        .rect;
+    game.press(centre(button));
+    game.render();
+    game.take_sounds();
+    let sign = find(&game, |k| matches!(k, Kind::Sign { .. })).expect("the sign");
+    assert!(sign.width > 0, "the sign is sized to its name");
+    let whoosh = SoundEvent::Play {
+        object: -4,
+        name: "UI_whoosh".into(),
+    };
+    game.press(centre(sign));
+    assert!(game.take_sounds().contains(&whoosh));
+    game.render();
+    assert_eq!(
+        find(&game, |k| matches!(k, Kind::Balloon(_))),
+        Some(Rect::new(241, 373, 559, 127))
+    );
+    // The balloon takes a press over the lot, and opens no menu.
+    assert!(sims_ui::hud::covers(game.panel(), [300, 400]));
+    game.press([300, 400]);
+    assert!(game.menu().is_none());
+    game.press(centre(sign));
+    assert!(game.take_sounds().contains(&whoosh));
+    game.render();
+    assert_eq!(find(&game, |k| matches!(k, Kind::Balloon(_))), None);
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
 /// The live panel's Needs meters are the selected Sim's motives as the
 /// world holds them, in the panel's order (Hunger, Energy, Comfort, Fun,
 /// Hygiene, Social, Bladder, Room: motives 7, 5, 6, 15, 8, 14, 9 and 13).
