@@ -474,6 +474,7 @@ mod tests {
             animations: Default::default(),
             people: Default::default(),
             icon_frames: None,
+            wardrobe: None,
             expansions: 0,
             characters: Default::default(),
         }

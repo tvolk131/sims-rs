@@ -26,7 +26,7 @@
 //! record stay). Then the Character helper writes body strings 13 (the
 //! age, "9" or "27"), 0 (the skeleton, "child" or "adult"), 14 (the skin
 //! tone) and 12 (the gender), and counts the bodies and heads the type can
-//! wear.
+//! wear ([`sims_content::Wardrobe::count`]).
 //!
 //! **Mode 0, a person (0x44b13f).** With both counts above 0, one game
 //! draw picks the head and a second the body (0x46f457); the type is
@@ -234,11 +234,29 @@ impl Machine<'_, '_> {
     }
 
     /// The number of bodies and heads a person of skin tone `tone` can
-    /// wear (0x40d077, 0x40d3db).
+    /// wear (0x40d077, 0x40d3db): the length of the lists 0x408bf5 builds
+    /// ([`sims_content::Wardrobe::count`]). The original keeps each list
+    /// by skin tone, sex and age for the rest of the game (the cache at
+    /// 0x6e4890); the names it is built from do not change while the game
+    /// runs, so counting again gives the same length.
     fn suit_counts(&self, tone: &str, female: bool, child: bool) -> Result<(u32, u32), Trap> {
-        let _ = (tone, female, child);
-        Err(Trap::Unsupported(
-            "Make New Character's body and head lists (0x409663, 0x40a364) are not ported".into(),
-        ))
+        let wardrobe = self.program.wardrobe.as_ref().ok_or_else(|| {
+            Trap::Unsupported(
+                "Make New Character needs the install's suit and texture names, which were \
+                 not read"
+                    .into(),
+            )
+        })?;
+        if let Some((file, error)) = wardrobe.errors.first_key_value() {
+            return Err(Trap::Unsupported(format!(
+                "Make New Character counts the suits, and the catalog {file} could not be read \
+                 ({error})"
+            )));
+        }
+        let count = |head| {
+            u32::try_from(wardrobe.count(head, female, child, tone))
+                .map_err(|_| Trap::Invalid("more suits than a count holds".into()))
+        };
+        Ok((count(false)?, count(true)?))
     }
 }

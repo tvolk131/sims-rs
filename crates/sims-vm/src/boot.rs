@@ -458,6 +458,9 @@ impl Lot {
         // out; making a person of it fails.
         program.people = People::load_each(&install, &index, &catalog, person_types())?.0;
         program.icon_frames = crate::program::icon_frames(&install)?;
+        program.wardrobe = Some(sims_content::Wardrobe::load(&sims_content::Assets::scan(
+            &install.root,
+        )?));
         let mut world = World::empty();
         let mut load = LoadReport::default();
         {
@@ -1155,6 +1158,7 @@ mod tests {
                 animations: Default::default(),
                 people: Default::default(),
                 icon_frames: None,
+                wardrobe: None,
                 expansions: 0,
                 characters: Default::default(),
             },

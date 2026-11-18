@@ -141,6 +141,11 @@ pub struct Program {
     /// None when it was not read: showing an icon then fails.
     /// [`Program::link`] leaves it None for the caller to fill.
     pub icon_frames: Option<BTreeMap<u16, i32>>,
+    /// The suit and texture names Make New Character picks a new
+    /// person's body and head from ([`sims_content::Wardrobe`]). None when
+    /// they were not read: making a character then fails.
+    /// [`Program::link`] leaves it None for the caller to fill.
+    pub wardrobe: Option<sims_content::Wardrobe>,
     /// The installed-expansions mask: the application's word at +0x66
     /// (\[0x6e48bc\]+0x66), which the original sets from the registry at
     /// startup (0x43ae81). The person factory's pet guard reads it
@@ -172,6 +177,7 @@ impl Program {
             animations: Animations::default(),
             people: People::default(),
             icon_frames: None,
+            wardrobe: None,
             expansions: 0,
             characters: BTreeSet::new(),
         };

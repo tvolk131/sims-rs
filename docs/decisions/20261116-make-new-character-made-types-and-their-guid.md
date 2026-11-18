@@ -68,8 +68,30 @@ cover this. Both were made by the coordinator.
 - Body strings written: 13, the age ("9" below 18, else "27"); 0, the
   skeleton ("child" or "adult"); 14, the skin tone; 12, the gender
   ("male" or "female").
-- COUNTS: TODO
-- Two game draws (0x46f457): the head, then the body. Which head and
+- The bodies and heads it can wear are counted (0x40d077, 0x40d3db;
+  lists 0 and 1 of 0x408bf5, built by 0x409663 and 0x40a364). Each suit
+  name matching the list's pattern pairs with each texture whose name
+  starts with the suit's matched part and the skin tone (0x4727f1 is a
+  prefix match folding A to Z to lowercase):
+  - a body: "b", any three characters, "m" or "u" for a male ("f" or
+    "u" for a female), "c" for a child or "a", any three: nine in all;
+  - a head: "c", any three, the same sex and age letters: six in all,
+    leaving out names whose second character is "t" (the costumes,
+    0x40a453).
+
+  The suits are the avatar registry's names (every `.cmx` and `.bcf`,
+  lowercased, but those starting with "suit-"), and the textures every
+  `.bmp` on the texture path (0x40895a). `sims_content::Wardrobe` reads
+  them at boot from the person files `sims_content::assets` finds (moved
+  there from sims-people, which re-exports it). On the Complete
+  Collection its counts are the ones the original's patterns give over
+  every name: between 17 and 143 for each sex, age and real tone ("lgt",
+  "med", "drk"), and 0 for "unknown", the first of PersonGlobals' tones.
+  **Unverified:** a texture two folders hold is counted once (the
+  original may list it twice; six names, one or two more in five
+  counts), and `.tga` files are left out (sixteen, which no pattern
+  matches). The lists' order (a hash table's, a file system's) is not
+  kept, as it only picks which body and head.- Two game draws (0x46f457): the head, then the body. Which head and
   body they pick (body strings 2 and 1) is presentation and not kept.
 - The stack object takes the new record's ID, and the branch is true.
 - Presentation, not kept: the copied file, the strings written to disk,

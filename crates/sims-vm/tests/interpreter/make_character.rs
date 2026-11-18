@@ -1,8 +1,8 @@
-//! Make New Character: its locals, the person type it clones, and the
-//! body strings it writes.
+//! Make New Character: its locals, the person type it clones, the body
+//! strings it writes, and the body and head it draws.
 
 use crate::support::*;
-use sims_content::Profile;
+use sims_content::{Profile, Wardrobe};
 use sims_core::CrtRng;
 use sims_sim::characters::{self, Character};
 use sims_vm::Trap;
@@ -12,7 +12,10 @@ const TEMPLATE_PERSON: u32 = 0x7fd9_6b54;
 
 /// A fixture whose lamp's tree 4096 sets its locals 0 to 2 to `skin`,
 /// `age` and `sex`, then makes a new character from them with template
-/// byte `species`. TemplatePerson is registered, with skin tones `tones`.
+/// byte `species`, and on true puts the stack object's ID in global 34.
+/// TemplatePerson is registered, with skin tones `tones`, and the
+/// wardrobe gives an adult male of tone "lgt" two bodies and one head
+/// ([`wardrobe`]).
 fn fixture(skin: i16, age: i16, sex: i16, species: u8, tones: &[&str]) -> Fixture {
     let mut fx = Fixture::new();
     fx.add(
@@ -22,12 +25,8 @@ fn fixture(skin: i16, age: i16, sex: i16, species: u8, tones: &[&str]) -> Fixtur
             assign(scope::LOCALS, 0, scope::LITERAL, skin, 1),
             assign(scope::LOCALS, 1, scope::LITERAL, age, 2),
             assign(scope::LOCALS, 2, scope::LITERAL, sex, 3),
-            ins(
-                19,
-                RETURN_TRUE,
-                RETURN_FALSE,
-                [0, 1, 2, species, 0, 0, 0, 0],
-            ),
+            ins(19, 4, RETURN_FALSE, [0, 1, 2, species, 0, 0, 0, 0]),
+            assign(scope::GLOBAL, 34, scope::STACK_OBJECT, 0, RETURN_TRUE),
         ]),
     );
     fx.add_type(TEMPLATE_PERSON, 2, 0, 0);
@@ -38,12 +37,49 @@ fn fixture(skin: i16, age: i16, sex: i16, species: u8, tones: &[&str]) -> Fixtur
             ..Profile::default()
         },
     );
+    fx.program.wardrobe = Some(wardrobe());
     fx.world.ticks = 0x0012_3456;
     fx.world.crt_rng = CrtRng::from_state(77);
     fx
 }
 
 const TONES: [&str; 3] = ["lgt", "med", "drk"];
+
+/// Suits and textures for every sex and age in tone "lgt" and "drk", but
+/// none in "med" for a child.
+fn wardrobe() -> Wardrobe {
+    let names = |names: &[&str]| names.iter().map(|n| n.to_string()).collect();
+    Wardrobe {
+        suits: names(&[
+            "b001mafit_01",
+            "b002fafit_01",
+            "b003mcfit_01",
+            "b004fcfit_01",
+            "c001ma_bob",
+            "c002fa",
+            "c003mc",
+            "c004fc",
+        ]),
+        textures: names(&[
+            "b001mafitlgt_01.bmp",
+            "b001mafitlgt_02.bmp",
+            "b001mafitdrk.bmp",
+            "b001mafitmed.bmp",
+            "b002fafitlgt.bmp",
+            "b003mcfitlgt.bmp",
+            "b003mcfitdrk.bmp",
+            "b004fcfitlgt.bmp",
+            "c001malgt_bob.bmp",
+            "c001madrk_bob.bmp",
+            "c001mamed_bob.bmp",
+            "c002falgt.bmp",
+            "c003mclgt.bmp",
+            "c003mcdrk.bmp",
+            "c004fclgt.bmp",
+        ]),
+        errors: BTreeMap::new(),
+    }
+}
 
 /// The GUID the clone gives with the fixture's clock and C runtime state.
 fn expected_guid() -> u32 {
@@ -79,10 +115,10 @@ fn a_local_past_the_trees_locals_throws_native_error_8() {
 
 #[test]
 fn a_child_gets_a_type_cloned_from_the_template_with_a_record_and_its_body_strings() {
-    let mut fx = fixture(1, 10, 1, 0, &TONES);
+    let mut fx = fixture(0, 10, 1, 0, &TONES);
     let slots = fx.world.neighbors.slots.len();
-    // The body and head lists are the next part to port.
-    unsupported(trap(fx.run()), "0x409663");
+    let mut lot = fx.world.lot_rng;
+    assert_eq!(fx.run(), Ok(true));
     let guid = expected_guid();
     let made = &fx.world.characters.made;
     assert_eq!(made.keys().copied().collect::<Vec<_>>(), [guid]);
@@ -95,10 +131,14 @@ fn a_child_gets_a_type_cloned_from_the_template_with_a_record_and_its_body_strin
                 (characters::SKELETON, "child".into()),
                 (characters::GENDER, "female".into()),
                 (characters::AGE, "9".into()),
-                (characters::SKIN, "med".into()),
+                (characters::SKIN, "lgt".into()),
             ]),
         }
     );
+    // Two game draws: the head, then the body.
+    lot.next_u32();
+    lot.next_u32();
+    assert_eq!(fx.world.lot_rng, lot);
     assert_eq!(fx.world.characters.next_file, 1);
     // One C runtime draw, for the GUID.
     let mut crt = CrtRng::from_state(77);
@@ -108,12 +148,35 @@ fn a_child_gets_a_type_cloned_from_the_template_with_a_record_and_its_body_strin
     assert_eq!(fx.world.neighbors.slots.len(), slots + 1);
     let record = fx.world.neighbors.first_of(guid).unwrap();
     assert_eq!(usize::try_from(record.id).unwrap(), slots + 1);
+    // The stack object is the new record.
+    assert_eq!(fx.world.globals[34], record.id);
+}
+
+#[test]
+fn with_no_body_or_no_head_for_the_tone_it_fails_loudly() {
+    // No child body or head in "med", and no adult female body in "med".
+    let mut fx = fixture(1, 10, 0, 0, &TONES);
+    unsupported(trap(fx.run()), "0x44b203");
+    let mut fx = fixture(1, 30, 1, 0, &TONES);
+    unsupported(trap(fx.run()), "0x44b203");
+}
+
+#[test]
+fn with_no_suit_names_it_fails_loudly() {
+    let mut fx = fixture(0, 30, 0, 0, &TONES);
+    fx.program.wardrobe = None;
+    unsupported(trap(fx.run()), "not read");
+    let mut fx = fixture(0, 30, 0, 0, &TONES);
+    let mut wardrobe = wardrobe();
+    wardrobe.errors.insert("b.cmx".into(), "bad".into());
+    fx.program.wardrobe = Some(wardrobe);
+    unsupported(trap(fx.run()), "b.cmx");
 }
 
 #[test]
 fn an_adult_male_is_written_as_one() {
     let mut fx = fixture(2, 18, 0, 0, &TONES);
-    unsupported(trap(fx.run()), "0x409663");
+    assert_eq!(fx.run(), Ok(true));
     let strings = &fx.world.characters.made[&expected_guid()].strings;
     assert_eq!(strings[&characters::SKELETON], "adult");
     assert_eq!(strings[&characters::GENDER], "male");
@@ -135,7 +198,7 @@ fn the_file_number_skips_those_made_types_hold() {
         );
     }
     fx.world.characters.next_file = 3;
-    unsupported(trap(fx.run()), "0x409663");
+    assert_eq!(fx.run(), Ok(true));
     assert_eq!(fx.world.characters.made[&expected_guid()].file, 5);
     assert_eq!(fx.world.characters.next_file, 6);
 }
@@ -144,7 +207,7 @@ fn the_file_number_skips_those_made_types_hold() {
 fn the_file_counter_goes_back_to_0_after_the_last_number() {
     let mut fx = fixture(0, 30, 0, 0, &TONES);
     fx.world.characters.next_file = 31999;
-    unsupported(trap(fx.run()), "0x409663");
+    assert_eq!(fx.run(), Ok(true));
     assert_eq!(fx.world.characters.made[&expected_guid()].file, 31999);
     assert_eq!(fx.world.characters.next_file, 0);
 }
