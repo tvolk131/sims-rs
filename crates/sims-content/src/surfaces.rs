@@ -37,8 +37,10 @@
 
 use crate::index::Index;
 use crate::install::resolve;
+use crate::ui_graphics::US_ENGLISH;
 use crate::{Error, Install, Resource, Result};
 use sims_formats::iff::Iff;
+use sims_formats::strings::StringTable;
 use std::collections::BTreeMap;
 
 /// Floors or walls.
@@ -94,6 +96,13 @@ pub struct SurfaceFile {
     pub location: String,
     /// Each pattern's key by its number in the file.
     pub keys: BTreeMap<u16, u16>,
+    /// The price each of the file's patterns is given (0x4a0a84,
+    /// 0x4c59a0): string 1 of the file's first `STR#` in its resource
+    /// order, read as C's `atoi` reads it, or None when the file lacks it
+    /// (the pattern then costs the catalog's default). **Unverified**
+    /// that "first" is the resource order: every pattern file of the
+    /// Complete Collection that has a `STR#` has one.
+    pub price: Option<i32>,
 }
 
 /// One kind's catalog: its pattern files by index.
@@ -116,6 +125,7 @@ impl SurfaceCatalog {
             name: builtin.to_owned(),
             location: format!("GameData/{builtin}"),
             keys: BTreeMap::new(),
+            price: None,
         }];
         // The free list: 0x58055b puts each range at the front, and a key
         // is taken from the front range (0x4a1a08).
@@ -184,10 +194,17 @@ impl SurfaceCatalog {
                 keys.insert(number, low);
             }
         }
+        let price = iff
+            .resource_order(b"STR#")
+            .ok()
+            .and_then(|order| order.first().copied())
+            .and_then(|chunk| StringTable::parse(iff.data(chunk)).ok())
+            .and_then(|table| table.get(1, US_ENGLISH).map(atoi));
         Ok(Some(SurfaceFile {
             name: sims_formats::far::decode_name(&name),
             location,
             keys,
+            price,
         }))
     }
 
@@ -218,5 +235,41 @@ impl Surfaces {
             floors: SurfaceCatalog::build(install, SurfaceKind::Floor)?,
             walls: SurfaceCatalog::build(install, SurfaceKind::Wall)?,
         })
+    }
+}
+
+/// A number read from the start of a text as C's `atoi` reads it (the
+/// original's 0x636029): leading white space, an optional sign, then
+/// decimal digits up to the first other character; 0 when there are none.
+/// It wraps where the C runtime's would overflow.
+pub fn atoi(text: &str) -> i32 {
+    let rest = text.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    let (negative, rest) = match rest.as_bytes().first() {
+        Some(b'-') => (true, &rest[1..]),
+        Some(b'+') => (false, &rest[1..]),
+        _ => (false, rest),
+    };
+    let mut value = 0i32;
+    for digit in rest.bytes().take_while(u8::is_ascii_digit) {
+        value = value.wrapping_mul(10).wrapping_add(i32::from(digit - b'0'));
+    }
+    if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::atoi;
+
+    #[test]
+    fn atoi_reads_as_c_does() {
+        assert_eq!(atoi("20"), 20);
+        assert_eq!(atoi("  -7 dollars"), -7);
+        assert_eq!(atoi("+5"), 5);
+        assert_eq!(atoi("Price"), 0);
+        assert_eq!(atoi(""), 0);
     }
 }

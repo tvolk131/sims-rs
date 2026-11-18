@@ -73,10 +73,8 @@ from the exe.
     and 15. The original's memory image holds 0.33, 3 and 6.
 - **The arithmetic** is single precision, as the original's FPU is set.
 - **Not ported**, drawn as empty bars:
-  - **Furnishings** (0x416851): string 1 of `STR#` 505 weighs the
-    simulator's +0xa4 over its +0xa0. Those two come from the lot's
-    object scan (0x444cb9) and the architecture's value (0x47b006),
-    stored at 0x416118.
+  - **Furnishings** is now ported: see
+    `20261118-house-panel-furnishings.md`.
   - **Upkeep** is now ported: see
     `20261115-house-panel-upkeep-rating.md`. It also corrects the words
     this file guessed for the count.

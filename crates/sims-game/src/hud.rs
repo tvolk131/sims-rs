@@ -139,8 +139,14 @@ impl Hud {
         let faces =
             Faces::load(assets.index(), assets.catalog(), &people).map_err(|e| e.to_string())?;
         let careers = Careers::load(assets.index()).map_err(|e| e.to_string())?;
-        let house =
+        let mut house =
             house::Tuning::load(assets.index(), assets.catalog()).map_err(|e| e.to_string())?;
+        // The architecture's prices. Without the pattern catalogs only the
+        // plug-in patterns lose theirs.
+        house.prices = house::Prices::load(
+            &install,
+            &sims_content::Surfaces::build(&install).unwrap_or_default(),
+        );
         let known = Acquaintances::read(
             assets.index(),
             assets.catalog(),

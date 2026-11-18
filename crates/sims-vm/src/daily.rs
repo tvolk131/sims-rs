@@ -334,7 +334,8 @@ impl Interpreter<'_> {
     /// objects' sum above plus what 0x47b006 returns: half the prices of
     /// the walls' styles (0x6e5838), the wall patterns' prices (0x4c63cf),
     /// the floors' prices (0x4a1439, half for a diagonal half floor) and
-    /// the pool's (0x6c5ff8). The pattern catalogs here hold no prices, so
+    /// the pool's (0x6c5ff8). The house panel works it out on its own
+    /// (`sims_ui::house::Values`), but the simulation does not, so
     /// [`sims_sim::Budget::architecture_value`] keeps the value the house
     /// was saved with. Nothing ported reads it; a save written after a day
     /// turns would hold a stale value. This is a known gap, not the

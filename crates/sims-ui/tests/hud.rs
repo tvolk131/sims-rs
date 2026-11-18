@@ -365,8 +365,7 @@ fn the_goths_house_panel() {
     assert_eq!(opened.house.yard, sims_core::F32::from_f32(0.33));
     // After the load: 1,836 square feet, two bedrooms and a bathroom on
     // a large lot. Size: 612 square feet for each of three members;
-    // Yard: the outdoor rooms' score times 0.33. Furnishings and Layout
-    // are not ported.
+    // Yard: the outdoor rooms' score times 0.33. Layout is not ported.
     let house = &opened.snapshot.house;
     assert_eq!(
         (
@@ -383,7 +382,18 @@ fn the_goths_house_panel() {
     let counted = opened.kinds.counted.values().filter(|c| **c).count();
     assert_eq!((counted, opened.kinds.counted.len()), (73, 253));
     assert_eq!((opened.house.dirty, opened.house.broken), (3, 6));
-    assert_eq!(house.ratings, [Some(75), None, Some(76), Some(100), None]);
+    // The lot's values are what the original's simulator holds after
+    // the load (+0xa0 and +0xa4, track 2's capture of update 1): the
+    // house file saved 0 for both. Furnishings weighs 15,277 over 14,660,
+    // 1.042, on the curve.
+    assert_eq!(
+        (house.values.objects, house.values.architecture),
+        (14660, 15277)
+    );
+    assert_eq!(
+        house.ratings,
+        [Some(75), Some(58), Some(76), Some(100), None]
+    );
     let controls = Controls {
         expanded: true,
         panel: Panel::House,
@@ -396,6 +406,6 @@ fn the_goths_house_panel() {
     // screen (see docs/decisions/).
     assert_eq!(
         digest(&frame),
-        "c0d6ae63d03a10dc4b50717da2f6f145de43560ee3c59cec6c95b4f8dc143897"
+        "669ee756a9f2db4a3fdea9cfa89eb3a8a85945b7841f3e6f2d320995c1d35b4e"
     );
 }
