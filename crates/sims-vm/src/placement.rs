@@ -313,9 +313,13 @@ pub(crate) fn off_lot(world: &World, point: [i32; 2]) -> bool {
     !ok(point[0]) || !ok(point[1])
 }
 
-fn tile_on_lot(tile: [i8; 3]) -> bool {
-    let inside = |n: i8| n > 0 && i32::from(n) < FULL - 1;
-    inside(tile[0]) && inside(tile[1])
+/// Whether a tile is inside the lot's own border: each coordinate at
+/// least 1 and below the lot's size less 1 (the lot's +0x10, as the
+/// passes over the seats and walls beside an object and the door mark
+/// test it: 0x43363f to 0x433668, 0x4336c8 to 0x4336eb, 0x435000 to
+/// 0x435028, 0x4330da to 0x433100).
+fn tile_inside_lot(world: &World, tile: [i8; 3]) -> bool {
+    find::inside(world, tile[0], tile[1])
 }
 
 /// The grid array and the byte offset of a tile's cell.
@@ -347,7 +351,7 @@ fn write_head(world: &mut World, position: [i32; 2], level: i32, id: u16) -> Res
 }
 
 /// The first object on a tile.
-fn head(world: &World, tile: [i8; 3]) -> Option<u16> {
+pub(crate) fn head(world: &World, tile: [i8; 3]) -> Option<u16> {
     read_head(
         world,
         [i32::from(tile[0]) * 16, i32::from(tile[1]) * 16],
@@ -918,7 +922,7 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        if !tile_on_lot(at) {
+        if !tile_inside_lot(world, at) {
             return Ok(());
         }
         let Some(root) = head(world, at) else {
@@ -927,7 +931,7 @@ impl Interpreter<'_> {
         let mut seat = false;
         for direction in [0usize, 2, 4, 6] {
             let other = forward(at, direction as i16).map_err(fail)?;
-            if !tile_on_lot(other) {
+            if !tile_inside_lot(world, other) {
                 continue;
             }
             let mut current = head(world, other);
@@ -996,41 +1000,13 @@ impl Interpreter<'_> {
             .ok_or_else(|| fail(Trap::Unsupported(format!("an object on level {}", p[2]))))?;
         let [x, y, _] = tile(p);
         let mut flags = old as u16 & 0xffc0;
-        if tile_on_lot([x, y, 0]) {
-            let walls = world
-                .arrays
-                .get(&[2u16, 102][level])
-                .filter(|a| a.stride == 14 && a.data.len() == (FULL * FULL * 14) as usize)
-                .ok_or_else(|| fail(Trap::Invalid("the lot has no wall array".into())))?;
-            let cell = |x: i32, y: i32| {
-                let at = ((x * FULL + y) * 14) as usize;
-                &walls.data[at..at + 14]
-            };
-            let style = |cell: &[u8], which: usize| {
-                u16::from_le_bytes([cell[2 + which * 2], cell[3 + which * 2]])
-            };
-            let (x, y) = (i32::from(x), i32::from(y));
-            let own = cell(x, y);
-            let east = Some(cell(x + 1, y)).filter(|c| c[0] & 1 != 0);
-            let south = Some(cell(x, y + 1)).filter(|c| c[0] & 2 != 0);
-            let styles = [
-                Some(style(own, 0)),
-                Some(style(own, 1)),
-                east.map(|c| style(c, 0)),
-                south.map(|c| style(c, 1)),
-            ];
+        if tile_inside_lot(world, [x, y, 0]) {
+            // 0x435032: the facing over -2, kept to 0 to 3.
             let rotation = (i32::from(datum(world, id, data::FACING).map_err(fail)?) / -2) & 3;
-            for source in 0..4 {
-                if own[0] & (1 << source) == 0 {
-                    continue;
-                }
-                let style = styles[source].ok_or_else(|| {
-                    fail(Trap::Unsupported(
-                        "a wall segment its neighbouring tile does not mirror".into(),
-                    ))
-                })?;
-                if !matches!(style, 2 | 12 | 13 | 14) {
-                    flags |= [1, 4, 2, 8][(source + rotation as usize) % 4];
+            let sides = wall_sides(world, [x, y], level, rotation as u32).map_err(fail)?;
+            for (side, style) in sides.into_iter().enumerate() {
+                if style.is_some_and(|style| !is_fence(style)) {
+                    flags |= [1, 4, 2, 8][side];
                 }
             }
         }
@@ -1041,9 +1017,10 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    /// Sets or clears the mark a door or window keeps on its tile.
+    /// Sets or clears the mark a door or window keeps on its tile
+    /// (0x4330d7), which does nothing outside the lot's border.
     fn mark_portal(&self, world: &mut World, at: [i8; 3], set: bool) -> Result<(), Trap> {
-        if !tile_on_lot(at) {
+        if !tile_inside_lot(world, at) {
             return Ok(());
         }
         let level = usize::try_from(i32::from(at[2]) - 1)
@@ -1588,6 +1565,44 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    /// Person `id`'s second animator refresh before its animator's tick:
+    /// it took itself off the lot earlier in its tick
+    /// ([`Interpreter::take_self_off`]), and now leaves it again on its
+    /// way to removal, removing itself and yielding (the removal queue,
+    /// 0x442d70, then 0x433125 and 0x58da12 again). Whether the house view
+    /// drew the person (animator byte +0x109) was decided by its last
+    /// draw, and no draw comes in between, so both refreshes are made or
+    /// neither is. The drawn branch's refresh is made again on top of the
+    /// first, on a copy of the lot as the second take-off leaves it, and
+    /// must write nothing but the animator and its base layer and play
+    /// no sound ([`Interpreter::refresh_at_take_off`]). The person's
+    /// animator's tick then checks that both refreshes and the tick reach
+    /// what the tick alone does
+    /// ([`Interpreter::tick_animator_after_take_off`]). As at the first
+    /// take-off, a hand (slot 1) that holds anything fails, and so does a
+    /// head slot whose redraw is not read ([`head_slot_redraw`]).
+    pub(crate) fn refresh_again(
+        &self,
+        world: &World,
+        id: u16,
+        pending: &mut Pending,
+    ) -> Result<(), Trap> {
+        let person = world.objects.get(&id).ok_or_else(missing)?;
+        if person.slots.get(1).is_some_and(|slot| slot.object != 0) {
+            return Err(Trap::Unsupported(
+                "a person whose hand holds something leaving the lot a second time before its \
+                 animator's tick: its animator's refresh, if the house view drew it, is taken \
+                 to read only its head slot (0x58dae5 to 0x58dc55)"
+                    .into(),
+            ));
+        }
+        head_slot_redraw(world, id)?;
+        let mut drawn = world.clone();
+        pending.refreshed.restore(&mut drawn, id);
+        pending.refreshed = self.refresh_at_take_off(&drawn, id)?.refreshed;
+        Ok(())
+    }
+
     /// Takes an object off the lot on its way to removal: from the removal
     /// queue (0x442d70) or the removal itself (0x44123f), both of which
     /// call its virtual function 0x50 with 1. An object that is not a
@@ -1773,6 +1788,55 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    /// Turns a one-tile object by `steps` times its turn step (virtual
+    /// function 0x4c of the object and person classes, vtables 0x666d34
+    /// and 0x667378: 0x433f75), where it stands:
+    ///
+    /// 1. A `steps` of 0 or a turn step (data word 23) of 0 changes
+    ///    nothing.
+    /// 2. The facing (data word 1) becomes the old one plus the turn step
+    ///    times `steps`, kept to 0 to 7.
+    /// 3. If the object is a seat (it has function 26, 0x457c38,
+    ///    0x455fa9), the tile in front of its old facing and the tile in
+    ///    front of its new one are told whether a seat faces them
+    ///    ([`Interpreter::seats_beside`], 0x433612), in that order. The
+    ///    tiles are the object's tile one step that way (0x6c2934 and
+    ///    0x6c2958 are [`forward`]'s steps) on its level. The second tile
+    ///    is worked out after the first call, from the object's place and
+    ///    facing as they are then, since that call can run a tree.
+    /// 4. The walls beside it are worked out again
+    ///    ([`Interpreter::walls_beside`], 0x434fac).
+    ///
+    /// Not modeled, being presentation: the redraw of the object or its
+    /// outermost container (0x434101).
+    pub(crate) fn turn_one(&self, world: &mut World, id: u16, steps: i32) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let step = datum(world, id, data::TURN_STEP).map_err(fail)?;
+        if steps == 0 || step == 0 {
+            return Ok(());
+        }
+        let old = datum(world, id, data::FACING).map_err(fail)?;
+        let new = (i32::from(step)
+            .wrapping_mul(steps)
+            .wrapping_add(i32::from(old))
+            & 7) as i16;
+        set_datum(world, id, data::FACING, new).map_err(fail)?;
+        if self.has_function(world, id, SEAT) {
+            let at = tile(position(world, id).map_err(fail)?);
+            self.seats_beside(world, forward(at, old).map_err(fail)?)?;
+            // The first call can run a tree (0x4337d8), so the place and
+            // facing are read again (0x434002 to 0x43400c).
+            let at = tile(position(world, id).map_err(fail)?);
+            let facing = datum(world, id, data::FACING).map_err(fail)?;
+            self.seats_beside(world, forward(at, facing).map_err(fail)?)?;
+        }
+        self.walls_beside(world, id)
+    }
+
     /// Works out each tile's offset from its group's lead tile again
     /// (0x4229c0): the difference of their places in the group, turned to
     /// the lead tile's facing.
@@ -1801,19 +1865,87 @@ impl Interpreter<'_> {
     }
 }
 
+/// The walls on the four sides of a tile, turned `rotation` quarter turns
+/// (0x4795c5, which reads the tile's wall cell, then 0x53bc11). Entry `j`
+/// is the side whose edge bit is `1 << j` after the turn: the style of the
+/// wall there, or None for no wall. `level` is 0 for the ground and 1 for
+/// the floor above.
+///
+/// The cell's byte 0 says which of its sides have a segment: bits 1 and 2
+/// are the tile's own (styles at bytes 2 and 4), 4 and 8 its east and
+/// south neighbours' (the east tile's first style, the south tile's
+/// second), which must mirror them in their own byte 0. A turn moves each
+/// edge bit one place up, 8 becoming 1 (the table at 0x6f4670, filled by
+/// 0x53ba5f), and the style with it. The tile must be inside the lot.
+pub(crate) fn wall_sides(
+    world: &World,
+    [x, y]: [i8; 2],
+    level: usize,
+    rotation: u32,
+) -> Result<[Option<u16>; 4], Trap> {
+    let walls = world
+        .arrays
+        .get(&[2u16, 102][level])
+        .filter(|a| a.stride == 14 && a.data.len() == (FULL * FULL * 14) as usize)
+        .ok_or_else(|| Trap::Invalid("the lot has no wall array".into()))?;
+    let cell = |x: i32, y: i32| {
+        let at = ((x * FULL + y) * 14) as usize;
+        &walls.data[at..at + 14]
+    };
+    let style =
+        |cell: &[u8], which: usize| u16::from_le_bytes([cell[2 + which * 2], cell[3 + which * 2]]);
+    let (x, y) = (i32::from(x), i32::from(y));
+    let own = cell(x, y);
+    let east = Some(cell(x + 1, y)).filter(|c| c[0] & 1 != 0);
+    let south = Some(cell(x, y + 1)).filter(|c| c[0] & 2 != 0);
+    let styles = [
+        Some(style(own, 0)),
+        Some(style(own, 1)),
+        east.map(|c| style(c, 0)),
+        south.map(|c| style(c, 1)),
+    ];
+    let mut sides = [None; 4];
+    for source in 0..4 {
+        if own[0] & (1 << source) == 0 {
+            continue;
+        }
+        let style = styles[source].ok_or_else(|| {
+            Trap::Unsupported("a wall segment its neighbouring tile does not mirror".into())
+        })?;
+        sides[(source + rotation as usize) % 4] = Some(style);
+    }
+    Ok(sides)
+}
+
+/// Whether a wall style is a fence's, which does not count as a wall
+/// beside an object (styles 2, 12, 13 and 14; 0x43517c, 0x467dec).
+pub(crate) fn is_fence(style: u16) -> bool {
+    matches!(style, 2 | 12 | 13 | 14)
+}
+
+/// One step in each direction, in tiles: the first coordinate's
+/// (0x6c2934) and the second's (0x6c2958). 0x4222bc steps the same way.
+const STEPS: [(i8, i8); 8] = [
+    (0, -1),
+    (1, -1),
+    (1, 0),
+    (1, 1),
+    (0, 1),
+    (-1, 1),
+    (-1, 0),
+    (-1, -1),
+];
+
+/// The step one tile in direction `facing`, masked with 7 (0x4222bc), as
+/// tiles in each coordinate.
+pub(crate) fn step(facing: i16) -> [i32; 2] {
+    let (first, second) = STEPS[(facing & 7) as usize];
+    [i32::from(first), i32::from(second)]
+}
+
 /// The tile one step from a tile in a direction: 0 is north, toward lower
 /// second coordinates, and the directions go clockwise in eighths.
 fn forward(at: [i8; 3], facing: i16) -> Result<[i8; 3], Trap> {
-    const STEPS: [(i8, i8); 8] = [
-        (0, -1),
-        (1, -1),
-        (1, 0),
-        (1, 1),
-        (0, 1),
-        (-1, 1),
-        (-1, 0),
-        (-1, -1),
-    ];
     let (first, second) = usize::try_from(facing)
         .ok()
         .and_then(|facing| STEPS.get(facing))

@@ -902,6 +902,8 @@ impl<'a> Machine<'a, '_> {
                 .as_ref()
                 .map(|_| refreshing.borrow().person)
             && !crate::placement::reads_no_animator(instruction.opcode, &instruction.operands)
+            // Remove Object Instance checks for itself (`Machine::remove`).
+            && instruction.opcode != 18
         {
             return Err(Trap::Unsupported(format!(
                 "{} (opcode {}) after person {person} left the lot and before its \

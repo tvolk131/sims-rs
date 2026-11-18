@@ -652,3 +652,91 @@ fn each_person_is_lit_at_their_rooms_light() {
     assert!(level(16) > 0.5 && level(16) < 1.0, "{}", level(16));
     assert_eq!((room(18), level(18)), (1025, 204.0 / 255.0));
 }
+
+/// At 8 in the morning (tick 2675) Mortimer stands at the bookcase in room
+/// 4, whose two lamps are on, as they are in the original then (track 2's
+/// recording of its day has data word 16 at 1 on both). The nearer, four
+/// tiles away, lights him at full strength from in front of the viewer;
+/// the farther, five tiles away, faintly, twice. Cassandra, outside room 4,
+/// takes no lamp.
+#[test]
+fn the_lamps_of_a_persons_room_light_them() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    while lot.ticks() < 2675 {
+        lot.step().unwrap();
+    }
+    let world = lot.world();
+    let at = |id: u16| {
+        let animator = &world.animators[&id];
+        let mut root = placement(animator).unwrap().translation;
+        let fine = [animator.position[0], animator.position[1]];
+        root.y = sims_sim::head::ground_height(world, fine).unwrap().to_f32();
+        root
+    };
+    let room = |id: u16| world.room_at(world.objects[&id].position).unwrap();
+    assert_eq!(room(21), 4);
+    let lit: Vec<u16> = world
+        .objects
+        .iter()
+        .filter(|(_, o)| sims_render::lot::gives_light(o))
+        .map(|(&id, _)| id)
+        .collect();
+    assert_eq!(lit, [71, 194]);
+    let lamps = sims_people::lot::lamps(world, 1, at(21));
+    // The farther lamp's tile is listed twice in room 4, so it lights
+    // twice.
+    assert_eq!(lamps.len(), 3, "{lamps:?}");
+    assert_eq!(lamps[0].strength, 1.0);
+    assert!(
+        lamps[1].strength > 0.01 && lamps[1].strength < 0.1,
+        "{lamps:?}"
+    );
+    assert_eq!(lamps[1], lamps[2]);
+    // From the lamp's side: towards larger fine y, which is the drawing
+    // frame's smaller x, and from above.
+    assert!(
+        lamps[0].towards.x < -0.5 && lamps[0].towards.y > 0.0,
+        "{lamps:?}"
+    );
+    assert_ne!(room(16), 4);
+    assert!(sims_people::lot::lamps(world, 1, at(16)).is_empty());
+    // And the drawing takes them: with both lamps off, Mortimer is drawn
+    // darker, and nobody else changes.
+    let mut people = People::open(&root, &house).unwrap();
+    assert_eq!(people.update(world), Vec::<String>::new());
+    let camera = LotCamera {
+        zoom: Zoom::Medium,
+        rotation: 0,
+        level: 1,
+        origin: [335, -560],
+        walls: Walls::Cutaway,
+        focus: Default::default(),
+    };
+    let base = sims_render::Canvas::new(800, 600, [0, 0, 0]);
+    let mut draw = |world: &World| {
+        let mut canvas = base.clone();
+        let drawn = people.draw_on_lot(world, &camera, &mut canvas);
+        assert!(drawn.problems.is_empty(), "{:?}", drawn.problems);
+        canvas
+    };
+    let lit = draw(world);
+    let mut dark = world.clone();
+    for lamp in [71, 194] {
+        dark.objects.get_mut(&lamp).unwrap().data[16] = 0;
+    }
+    assert!(sims_people::lot::lamps(&dark, 1, at(21)).is_empty());
+    let unlit = draw(&dark);
+    let changed: Vec<usize> = (0..lit.color.len())
+        .filter(|&i| lit.color[i] != unlit.color[i])
+        .collect();
+    assert!(changed.len() > 300, "{}", changed.len());
+    let sum = |canvas: &sims_render::Canvas| -> u64 {
+        changed
+            .iter()
+            .map(|&i| canvas.color[i].iter().map(|&c| u64::from(c)).sum::<u64>())
+            .sum()
+    };
+    assert!(sum(&lit) > sum(&unlit) + changed.len() as u64 * 6);
+}

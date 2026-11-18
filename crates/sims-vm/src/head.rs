@@ -560,8 +560,8 @@ impl Interpreter<'_> {
         Ok(placed)
     }
 
-    /// Person `id`'s model matrix (0x592132; [`head::placement`]) on the
-    /// ground level. The terrain's height is that at the position rounded
+    /// Person `id`'s model matrix (0x592132; [`head::placement_on_level`]),
+    /// on any level; above the ground only with the view unturned. The terrain's height is that at the position rounded
     /// to the nearest 16th (0x478dfe; [`head::altitude_at`]): the tile is
     /// the rounded position shifted right by 4, the offsets in it the low
     /// 4 bits.
@@ -585,12 +585,6 @@ impl Interpreter<'_> {
             .get(&id)
             .ok_or_else(|| Trap::native(10, "missing object"))?;
         let level = World::tile(object.position)[2];
-        if level != 1 {
-            return Err(unsupported(
-                "0x5922ad",
-                &format!("person {id}'s model matrix on level {level}"),
-            ));
-        }
         let half = Ext::from_f64_bits(0x3fe0_0000_0000_0000);
         let round = |v: F32| (v.ext() + half).single().to_i32_truncate();
         let point = [round(a.position[0]), round(a.position[1])];
@@ -612,7 +606,17 @@ impl Interpreter<'_> {
         // 0x592242 hands 0x478dfe the rounded second coordinate, then the
         // rounded first: its first offset is the second coordinate's.
         let height = head::terrain_height(head::altitude_at(corners, point[1] & 15, point[0] & 15));
-        Ok(head::placement(a.position, height))
+        // Above the ground the level's rise is added (0x5922ad); see
+        // docs/decisions/20261115-snap-offset-order.md.
+        head::placement_on_level(a.position, height, level, self.view_rotation).ok_or_else(|| {
+            unsupported(
+                "0x5c3a20",
+                &format!(
+                    "person {id}'s model matrix on level {level} with the view turned to {}",
+                    self.view_rotation
+                ),
+            )
+        })
     }
 }
 

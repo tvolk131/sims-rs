@@ -4,6 +4,8 @@
 use sims_audio::SoundEvent;
 use sims_audio::player::RATE;
 use sims_game::sound::{Input, Mixer};
+use sims_game::view::Move;
+use sims_render::Walls;
 use sims_ui::command::Speed;
 
 #[test]
@@ -42,11 +44,21 @@ fn the_goths_sounds_play() {
         play: false,
     };
     let mut game = sims_game::Game::open(&options).expect("the Goth house opens");
+    // The walls leave every object where it is on the screen, so they
+    // send no kind 33; a scroll does.
+    let shot = game.shot();
+    game.apply(Move::Walls(Walls::Down));
+    assert_eq!(game.shot(), shot);
     let mut mixer = Mixer::open(&install).expect("the sound files");
     mixer.input(Input::Speed(Speed::Normal));
     let (mut played, mut loud, mut faults) = (Vec::new(), 0, Vec::new());
-    // A second of the lot, then a second of its sound, as the window does.
+    // A second of the lot, then a second of its sound, as the window does;
+    // the camera scrolls a little each second, so every track is placed
+    // again (kind 33).
     while game.run(20) > 0 {
+        game.apply(Move::Scroll([8, 0]));
+        assert_ne!(game.shot(), shot);
+        mixer.input(Input::Sources(game.sound_sources()));
         let sounds = game.take_sounds();
         for event in &sounds {
             if let sims_vm::SoundEvent::Play { name, .. } = event {
@@ -57,6 +69,8 @@ fn the_goths_sounds_play() {
         mixer.input(Input::Events(
             sounds.into_iter().map(sims_game::sound::event).collect(),
         ));
+        mixer.input(Input::View(game.ambience_view()));
+        mixer.input(Input::Camera);
         loud += mixer
             .render(RATE as usize)
             .iter()

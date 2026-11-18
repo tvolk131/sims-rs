@@ -4,8 +4,9 @@
 mod common;
 
 use sha2::{Digest, Sha256};
+use sims_ui::balloon::{Help, Texts};
 use sims_ui::command::{Command, Panel};
-use sims_ui::frame::Frame;
+use sims_ui::frame::{Frame, Rect};
 use sims_ui::household;
 use sims_ui::hud::{self, Controls};
 
@@ -139,6 +140,51 @@ fn the_goths_personality_panel() {
     assert_eq!(
         digest(&frame),
         "2414e88dac8a620c6185b589d9bfa479073f314686f4c607bc6cbd09379ce669"
+    );
+}
+
+#[test]
+fn the_goths_sign_balloon() {
+    let Some(root) = common::install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to draw the control panel");
+        return;
+    };
+    let opened = common::open(&root, common::GOTH_HOUSE);
+    let texts = Texts::load(&opened.install).expect("the balloons' texts");
+    // Mortimer is a Taurus: he gets on best with Aries and Libra, worst
+    // with Virgo and Cancer.
+    let taurus = texts.get(Help::Sign(2)).expect("Taurus");
+    assert!(!taurus.title.is_empty());
+    let lines: Vec<&str> = taurus.body.lines().collect();
+    assert!(lines[lines.len() - 2].ends_with("Aries, Libra"));
+    assert!(lines[lines.len() - 1].ends_with("Virgo, Cancer"));
+
+    let mut controls = Controls {
+        expanded: true,
+        panel: Panel::Personality,
+        ..Controls::default()
+    };
+    let mut items = hud::layout([800, 600], &opened.snapshot, &controls);
+    hud::fit(&mut items, &opened.art, &texts);
+    // The sign's name, at the panel's bottom left.
+    let command = hud::press(&items, [413 + 108 + 10, 600 - 12]);
+    assert_eq!(command, Some(Command::Help(Help::Sign(2))));
+    controls.apply(&command.unwrap());
+    let mut items = hud::layout([800, 600], &opened.snapshot, &controls);
+    hud::fit(&mut items, &opened.art, &texts);
+    let mut frame = Frame::new(800, 600, [0, 0, 0]);
+    hud::draw(&mut frame, &opened.art, &opened.faces, &items, &controls);
+    // The balloon from 241 to the right edge and up from the strip, as
+    // tall as the least a balloon takes. On the original's screen it is
+    // there, and every one of its pixels is the same in 16-bit color
+    // (docs/decisions/20261116-sign-help-balloon.md).
+    assert_eq!(
+        items.last().map(|i| i.rect),
+        Some(Rect::new(241, 373, 559, 127))
+    );
+    assert_eq!(
+        digest(&frame),
+        "e76b2e5deafb40d16fae70da6b664f3383fdc6693d8d70a3404506d6729cb0b3"
     );
 }
 
@@ -319,8 +365,8 @@ fn the_goths_house_panel() {
     assert_eq!(opened.house.yard, sims_core::F32::from_f32(0.33));
     // After the load: 1,836 square feet, two bedrooms and a bathroom on
     // a large lot. Size: 612 square feet for each of three members;
-    // Yard: the outdoor rooms' score times 0.33. The other three are not
-    // ported.
+    // Yard: the outdoor rooms' score times 0.33. Furnishings and Layout
+    // are not ported.
     let house = &opened.snapshot.house;
     assert_eq!(
         (
@@ -331,7 +377,13 @@ fn the_goths_house_panel() {
         ),
         (1836, 2, 1, 2)
     );
-    assert_eq!(house.ratings, [Some(75), None, Some(76), None, None]);
+    // Upkeep: 73 of the lot's 253 object types count, and nothing is
+    // dirty or broken after the load, so it is 100 whatever the
+    // penalties, which the install's table sets to 3 and 6.
+    let counted = opened.kinds.counted.values().filter(|c| **c).count();
+    assert_eq!((counted, opened.kinds.counted.len()), (73, 253));
+    assert_eq!((opened.house.dirty, opened.house.broken), (3, 6));
+    assert_eq!(house.ratings, [Some(75), None, Some(76), Some(100), None]);
     let controls = Controls {
         expanded: true,
         panel: Panel::House,
@@ -344,6 +396,6 @@ fn the_goths_house_panel() {
     // screen (see docs/decisions/).
     assert_eq!(
         digest(&frame),
-        "bbbf3165e5205438ef6c5a2e6a6da34a7b09d8fc7eb165c67636ac3e3b46a17a"
+        "c0d6ae63d03a10dc4b50717da2f6f145de43560ee3c59cec6c95b4f8dc143897"
     );
 }

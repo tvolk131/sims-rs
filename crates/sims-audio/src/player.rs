@@ -115,8 +115,11 @@
 //!   object is, and the skill track [`PIANO_SKILL`] (see
 //!   `Player::play_piano`).
 //!
-//! The game's code also calls kind 33 to move the ambience's cursor from
-//! the camera and the hour: [`Player::set_ambience_view`]. The scores'
+//! The game's code also calls kind 33 when the camera moves: it places
+//! every track again from where its objects are now, and moves the
+//! ambience's cursor from the camera and the hour
+//! ([`Player::camera_moved`]; the cursor alone is
+//! [`Player::set_ambience_view`]). The scores'
 //! voices mix with the notes, at the effects group's volume.
 //!
 //! The radio, television and music hit lists are built from directories
@@ -138,8 +141,7 @@
 //!
 //! **Unverified** against the original at run time: all of the above.
 //! Left out: priorities, and the limit of 16 voices kind 1 checks first
-//! (0x574a87); placing every track again when the camera moves (kind 33,
-//! see [`crate::placement`]); the track group's own volume beyond the host's [`Player::set_group_volume`], and
+//! (0x574a87); the track group's own volume beyond the host's [`Player::set_group_volume`], and
 //! the second pitch the original adds (taken as 3600).
 //! `seqgroup_wait`, `add_to_group`, `remove_from_group` and `test1` to
 //! `test4` are not ported: a thread that reaches one ends with a fault.
@@ -345,7 +347,9 @@ pub mod kind {
     pub const NOTHING_FOR_SOUND: [i64; 14] =
         [27, 28, 29, 31, 44, 45, 46, 47, 48, 49, 50, 51, 101, 102];
     /// Kinds the original does something for that this player does not:
-    /// reported when an event has one.
+    /// reported when an event has one. (Kind 33 is ported for the game's
+    /// own calls, [`super::Player::camera_moved`], which carry the
+    /// camera; no event in the install has it.)
     pub const NOT_PORTED: [i64; 31] = [
         2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 24, 25, 26, 32, 33, 34, 35, 37, 38,
         39, 40, 41, 42, 103, 104,
@@ -594,6 +598,21 @@ pub struct Player<S> {
     /// The master volume, 0 to 1024.
     master: i32,
     notes: Vec<Note>,
+    /// The registers of threads that ended while their notes play on, by
+    /// thread ID, kept while those notes play: what the original's track
+    /// object keeps after its script ends, for a camera move to set
+    /// again ([`Player::camera_moved`]).
+    ended: BTreeMap<u32, Thread>,
+    /// The registers kind 53 played a track's own note with when no
+    /// thread of it ran ([`Player::sequence`]), by track, kept while
+    /// that note (thread 0) plays: the original's idle track object, for
+    /// a camera move to place.
+    idle: BTreeMap<u32, Thread>,
+    /// The thread each track's last start made or let go, by track: the
+    /// one whose `target` the original's track object still has
+    /// ([`Player::camera_moved`]). Every start sets that `target` back
+    /// to itself (0x57d9c3).
+    last_start: BTreeMap<u32, u32>,
     /// *(code)* Object instances: a track and an object it plays for, as
     /// the original records them (its hash multimap at manager +0xd4),
     /// each pair once, and each track's in the order the original goes
@@ -667,6 +686,9 @@ impl<S: Samples> Player<S> {
             group_volumes: BTreeMap::new(),
             master: 1024,
             notes: Vec::new(),
+            ended: BTreeMap::new(),
+            idle: BTreeMap::new(),
+            last_start: BTreeMap::new(),
             instances: Vec::new(),
             track_objects: BTreeMap::new(),
             scores: BTreeMap::new(),
@@ -771,8 +793,176 @@ impl<S: Samples> Player<S> {
         self.ambience.and_then(|mode| self.scores.get(&mode))
     }
 
-    /// *(code)* What the game's kind 33 does, it seems once a frame
-    /// (0x574157): moves the current ambience's cursor. `view` is the
+    /// *(code)* Kind 33 (0x574157), which the original's game sends when
+    /// the camera moves (from five places: 0x4a80bb, 0x4a8d38, 0x4ce50a,
+    /// 0x4ced58 and 0x4f66c6, through 0x57a9d4 and 0x57aac5). It places
+    /// every track with object instances again from where its objects
+    /// are now (0x57447f), then moves the ambience's cursor as
+    /// [`Player::set_ambience_view`] does. `sources` is as for
+    /// [`Player::handle`], with the screen as the moved camera shows it.
+    ///
+    /// The tracks go a track's instances at a time, in the order of the
+    /// instance map (0x5746d9 for each). For each, the volume and pan
+    /// come from the same sum as kind 1's ([`crate::placement`]), with
+    /// the track's `Spl`, and are written as the track writes them,
+    /// `extvol` then `pan` (vtable +0x40 and +0x48, 0x57d57a and
+    /// 0x57d5a0). The write goes through the track's `target`
+    /// (0x57de57). Here it goes to the thread the track's last start
+    /// made, which stands for the original's one track object, and on
+    /// through its `target` ([`Player::place_through`]): into a thread
+    /// whose script has ended while its notes play, as the original's
+    /// pointer reaches a track object that outlives its script, and not
+    /// past a thread that is not its track's last start. A fade on the
+    /// `extvol` the write lands in is undone by it and goes on from the
+    /// new volume; a running thread's fade on its own `extvol`, while
+    /// its `target` names an ended thread, is left as it was.
+    ///
+    /// The original's track object outlives its script, and a note it
+    /// started plays on after the script ends (`note_on` then `end`);
+    /// the write reaches that note too. Here a thread that ends with
+    /// notes playing keeps its registers while they play, and the write
+    /// goes to every such thread of the track as well, whose notes take
+    /// their new levels at once, except the last start's thread when it
+    /// passes the write on through its `target`.
+    ///
+    /// Only the thread of the track's last start, running or ended,
+    /// writes and reads through its `target` (a held track let go by a
+    /// start counts: the newest thread let go). A later start set the
+    /// original's track object's `target` back to itself, so an older
+    /// thread takes the write itself, ended or the newest still running
+    /// once the last start's script has ended, whether or not its notes
+    /// still play. While a note of the last start's ended thread plays,
+    /// that thread also writes its own placement through its `target`;
+    /// once its last note is gone it writes nothing. Each write changes
+    /// the notes of the thread it lands in and no other's. That holds
+    /// after the last start's thread has gone with nothing left playing.
+    /// A note kind 53 played
+    /// with no thread running (thread 0) is placed too, from the
+    /// registers it started with. `Spl` is that of the thread the last
+    /// start's write lands in ([`Player::place_through`]), or else of the
+    /// newest running thread, the newest ended one or the kind 53 note,
+    /// in that order. A thread that passes the write on keeps its notes'
+    /// levels. A track with none of
+    /// these gets nothing: the original writes to its idle track object,
+    /// whose registers the next start sets again.
+    /// **Unverified:** the original's older notes follow the one track
+    /// object, so they would take its levels, not their own thread's.
+    ///
+    /// Not ported: after a kind 25 that turns the sound on (0x573c64),
+    /// the original writes the volume less 1 (or 1 for a volume of 0;
+    /// the manager's +0x114, 0x574701). Kind 25 is not ported, and the
+    /// flag starts clear. Nor is the day and night loop that kind 33
+    /// picks last (0x574978).
+    pub fn camera_moved(&mut self, view: i32, hour: u32, sources: &dyn Sources) {
+        // A track that was killed lets its notes go at once; what it kept
+        // for them goes with them.
+        let notes = &self.notes;
+        self.ended
+            .retain(|id, _| notes.iter().any(|note| note.thread == *id));
+        self.idle.retain(|track, _| {
+            notes
+                .iter()
+                .any(|note| note.thread == 0 && note.track == *track)
+        });
+        let mut tracks: Vec<u32> = Vec::new();
+        for &(track, _) in &self.instances {
+            if !tracks.contains(&track) {
+                tracks.push(track);
+            }
+        }
+        for track in tracks {
+            let ended: Vec<u32> = self
+                .ended
+                .values()
+                .filter(|t| t.track == track)
+                .map(|t| t.id)
+                .collect();
+            // Only the thread of the track's last start has the `target`
+            // the original's track object has: a later start set it back
+            // to itself, so an older thread, running or ended, is written
+            // and read itself.
+            let last = self.last_start.get(&track).copied();
+            let newest = self.newest(track).map(|at| self.threads[at].id);
+            let running = |id: u32| {
+                self.threads
+                    .iter()
+                    .chain(&self.pending)
+                    .find(|t| t.id == id)
+            };
+            // The last start's thread reads through the chain its write
+            // goes through.
+            let spl_of = |thread: &Thread| {
+                let source = if Some(thread.id) == last {
+                    self.kept_thread(self.camera_destination(thread.id))
+                        .unwrap_or(thread)
+                } else {
+                    thread
+                };
+                source.registers[usize::from(SPL)]
+            };
+            let spl = if let Some(thread) = last.and_then(running) {
+                spl_of(thread)
+            } else if let Some(thread) = last.and_then(|id| self.ended.get(&id)) {
+                spl_of(thread)
+            } else if let Some(thread) = newest.and_then(running) {
+                spl_of(thread)
+            } else if let Some(thread) = ended.last().and_then(|id| self.ended.get(id)) {
+                spl_of(thread)
+            } else if let Some(idle) = self.idle.get(&track) {
+                self.read(idle, i64::from(SPL))
+            } else {
+                continue;
+            };
+            let last_running = last.filter(|&id| running(id).is_some());
+            let Some((vol, pan)) = self.placed_with(track, spl, sources) else {
+                continue;
+            };
+            // The last start's thread, running or about to, is written as
+            // it would write; with none, the newest running one takes it
+            // itself.
+            if let Some(id) = last_running {
+                self.place_through(id, vol, pan);
+            } else if let Some(at) = self.newest(track) {
+                place_itself(&mut self.threads[at], vol, pan);
+            }
+            for id in ended {
+                // The last start's thread writes through its `target`; only
+                // the thread written takes new levels.
+                if last == Some(id) {
+                    self.place_through(id, vol, pan);
+                    continue;
+                }
+                let Some(mut thread) = self.ended.remove(&id) else {
+                    continue;
+                };
+                place_itself(&mut thread, vol, pan);
+                let levels = self.levels(&thread);
+                for note in self.notes.iter_mut().filter(|n| n.thread == id) {
+                    note.gains = levels.gains;
+                    note.step = step(levels.rate);
+                }
+                self.ended.insert(id, thread);
+            }
+            if let Some(mut idle) = self.idle.remove(&track) {
+                self.write(&mut idle, i64::from(EXTVOL), vol);
+                self.write(&mut idle, i64::from(PAN), pan);
+                let levels = self.levels(&idle);
+                for note in self
+                    .notes
+                    .iter_mut()
+                    .filter(|n| n.thread == 0 && n.track == track)
+                {
+                    note.gains = levels.gains;
+                    note.step = step(levels.rate);
+                }
+                self.idle.insert(track, idle);
+            }
+        }
+        self.set_ambience_view(view, hour);
+    }
+
+    /// *(code)* The ambience half of kind 33 (0x574157): moves the
+    /// current ambience's cursor. `view` is the
     /// share of the screen's tiles that are outdoors, in percent, which
     /// the original computes from the camera ([`crate::ambience::view`],
     /// 0x570c3e; below 30 counts as 0, as does any value while a flag of
@@ -1161,13 +1351,18 @@ impl<S: Samples> Player<S> {
     /// default, but no script writes `Spl`. A fault is reported, and
     /// gives `None`.
     fn placed(&mut self, track: u32, sources: &dyn Sources) -> Option<(i32, i32)> {
+        let spl = self.spl(track);
+        self.placed_with(track, spl, sources)
+    }
+
+    /// [`Player::placed`] with the given `Spl`.
+    fn placed_with(&mut self, track: u32, spl: i32, sources: &dyn Sources) -> Option<(i32, i32)> {
         let objects: Vec<u32> = self
             .instances
             .iter()
             .filter(|&&(t, _)| t == track)
             .map(|&(_, object)| object)
             .collect();
-        let spl = self.spl(track);
         match placement::combine(&objects, spl, sources) {
             Ok(placed) => Some(placed),
             Err(fault) => {
@@ -1256,6 +1451,72 @@ impl<S: Samples> Player<S> {
             .filter(|(_, t)| t.track == track)
             .max_by_key(|(_, t)| t.id)
             .map(|(at, _)| at)
+    }
+
+    /// Writes a camera placement as the thread `id`, the track's last
+    /// start, writes it: `extvol`, then `pan`, through its `target`
+    /// (0x57de57). The original's pointer reaches a track object that
+    /// outlives its script, so the chain goes on into a thread whose
+    /// script has ended while its notes play. Only the thread the chain
+    /// ends at takes the placement, and if it has ended its notes take
+    /// it at once; a thread that passes it on keeps its levels. A thread
+    /// on the way that is not its track's last start takes the placement
+    /// itself: a later start set the
+    /// original's track object's `target` back to itself. Script reads
+    /// and writes do not follow ended threads ([`Player::resolve`]).
+    fn place_through(&mut self, id: u32, vol: i32, pan: i32) {
+        let at = self.camera_destination(id);
+        if let Some(thread) = self
+            .threads
+            .iter_mut()
+            .chain(&mut self.pending)
+            .find(|t| t.id == at)
+        {
+            place_itself(thread, vol, pan);
+        } else if let Some(mut thread) = self.ended.remove(&at) {
+            place_itself(&mut thread, vol, pan);
+            let levels = self.levels(&thread);
+            for note in self.notes.iter_mut().filter(|n| n.thread == at) {
+                note.gains = levels.gains;
+                note.step = step(levels.rate);
+            }
+            self.ended.insert(at, thread);
+        }
+    }
+
+    /// The thread a camera placement written by thread `id` lands in, and
+    /// whose `Spl` it reads ([`Player::place_through`]): `id`, or on
+    /// through `target` from each thread that is its track's last start,
+    /// into running or pending threads, playing or not, or ended threads
+    /// whose notes still play. A link to anything else, or back to a
+    /// thread already passed, stops the chain where it is.
+    fn camera_destination(&self, id: u32) -> u32 {
+        let mut at = id;
+        let mut passed = vec![id];
+        while let Some(thread) = self.kept_thread(at)
+            && self.last_start.get(&thread.track) == Some(&thread.id)
+            && let Target::Thread(next) = thread.target
+            && !passed.contains(&next)
+            && self.kept_thread(next).is_some()
+        {
+            passed.push(next);
+            at = next;
+        }
+        at
+    }
+
+    /// The running or pending thread `id`, or the ended one if its notes
+    /// still play.
+    fn kept_thread(&self, id: u32) -> Option<&Thread> {
+        self.threads
+            .iter()
+            .chain(&self.pending)
+            .find(|t| t.id == id)
+            .or_else(|| {
+                self.ended
+                    .get(&id)
+                    .filter(|_| self.notes.iter().any(|n| n.thread == id))
+            })
     }
 
     /// Writes a register of the thread at `at` as that thread would.
@@ -1372,6 +1633,9 @@ impl<S: Samples> Player<S> {
         self.threads.clear();
         self.pending.clear();
         self.notes.clear();
+        self.ended.clear();
+        self.idle.clear();
+        self.last_start.clear();
         self.held.clear();
         self.seqgroups.clear();
         self.instances.clear();
@@ -1568,6 +1832,7 @@ impl<S: Samples> Player<S> {
                     thread.id = 0;
                     thread.registers[usize::from(PATCH)] = patch as i32;
                     self.note_on(&thread);
+                    self.idle.insert(track, thread);
                 }
             }
         }
@@ -1632,6 +1897,7 @@ impl<S: Samples> Player<S> {
             thread.registers[usize::from(PAN)] = pan as i32;
         }
         let id = thread.id;
+        self.last_start.insert(track, id);
         if defer {
             self.pending.push(thread);
         } else {
@@ -1646,6 +1912,9 @@ impl<S: Samples> Player<S> {
     /// [`Player::thread`]) and its wait ends. The threads let go: none
     /// when none of the track runs, so it is started anew. (A held thread
     /// does not run, so none of these is the thread running `play_trk`.)
+    /// The original sets its track object's `target` back to itself on
+    /// every start, this one too, so the newest thread let go becomes
+    /// the one [`Player::camera_moved`] writes through.
     fn resume_held(&mut self, args: [u32; 3], track: u32) -> Vec<u32> {
         let now = self.frame;
         let mut resumed = Vec::new();
@@ -1658,6 +1927,9 @@ impl<S: Samples> Player<S> {
             set_arguments(thread, args);
             thread.wake = now;
             resumed.push(thread.id);
+        }
+        if let Some(&newest) = resumed.iter().max() {
+            self.last_start.insert(track, newest);
         }
         resumed
     }
@@ -1798,6 +2070,14 @@ impl<S: Samples> Player<S> {
         // A held track's notes keep their place and are not heard.
         self.notes
             .retain_mut(|note| held.contains(&note.track) || mix_note(note, cache, &mut sums));
+        let notes = &self.notes;
+        self.ended
+            .retain(|id, _| notes.iter().any(|note| note.thread == *id));
+        self.idle.retain(|track, _| {
+            notes
+                .iter()
+                .any(|note| note.thread == 0 && note.track == *track)
+        });
         self.voices
             .retain_mut(|voice| mix_note(&mut voice.note, ambient_cache, &mut sums));
         out.extend(sums.iter().map(|&s| s.clamp(-32768, 32767) as i16));
@@ -1905,6 +2185,9 @@ impl<S: Samples> Player<S> {
                     for note in self.notes.iter_mut().filter(|n| n.thread == thread.id) {
                         note.gains = levels.gains;
                         note.step = step(levels.rate);
+                    }
+                    if self.notes.iter().any(|n| n.thread == thread.id) {
+                        self.ended.insert(thread.id, thread.clone());
                     }
                     self.threads.remove(at);
                     // Its ducking request goes now, before the threads
@@ -2462,6 +2745,14 @@ impl<S: Samples> Player<S> {
         };
         Ok(flow)
     }
+}
+
+/// Writes a placement into a thread's own registers, not through its
+/// `target`, as the write sets the flags: `extvol`, then `pan`.
+fn place_itself(thread: &mut Thread, vol: i32, pan: i32) {
+    thread.registers[usize::from(EXTVOL)] = vol;
+    thread.registers[usize::from(PAN)] = pan;
+    thread.kept = i64::from(pan);
 }
 
 /// Mixes a note onto `sums` (stereo frames): a mono sample plays on both

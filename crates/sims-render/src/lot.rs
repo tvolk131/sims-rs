@@ -334,14 +334,8 @@ fn lamps(
     };
     let inner = |n: i32| n >= 1 && n < size as i32 - 1;
     for object in world.objects.values() {
-        let word = |i: usize| object.data.get(i).copied().unwrap_or(0);
-        let lit = word(34) == 0
-            && word(29) >= 0
-            && word(40) as u16 & 0x400 != 0
-            && word(51) != 0
-            && word(16) == 1;
         let [x, y, on] = object.position;
-        if !lit || on != index as i32 + 1 {
+        if !gives_light(object) || on != index as i32 + 1 {
             continue;
         }
         let [x, y] = [x, y].map(|f| f.div_euclid(16));
@@ -368,6 +362,17 @@ fn lamps(
         }
     }
     records
+}
+
+/// Whether an object is a lamp that is lit, as the original's room count
+/// takes one (0x467e05): not hidden (data word 34 is 0), in a room (word
+/// 29 not negative), a light source (word 40 flag 0x400) that gives light
+/// (word 51 not 0) and is on (word 16 is 1). Such an object marks the
+/// tiles around it ([`Lot`]'s lamp records) and gives its room a light
+/// that falls on the people there (`sims_people::lot::lamps`).
+pub fn gives_light(object: &sims_sim::Object) -> bool {
+    let word = |i: usize| object.data.get(i).copied().unwrap_or(0);
+    word(34) == 0 && word(29) >= 0 && word(40) as u16 & 0x400 != 0 && word(51) != 0 && word(16) == 1
 }
 
 /// The light byte the original stores for a room's tiles: the light the

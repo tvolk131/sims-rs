@@ -2,6 +2,7 @@
 //!
 //! - [`hud`]: the live-mode control panel.
 //! - [`dialog`]: the dialogs scripts show.
+//! - [`balloon`]: the help balloons the panels open over the lot.
 //! - [`pie`]: the pie menu of what a Sim can do with an object.
 //! - [`queue`]: the selected Sim's actions, which a press cancels.
 //! - [`thumbnail`]: objects' catalog pictures, as the queue shows them.
@@ -16,6 +17,7 @@
 //! press into a [`command::Command`] for the host to carry out.
 
 pub mod art;
+pub mod balloon;
 pub mod command;
 pub mod dialog;
 pub mod font;

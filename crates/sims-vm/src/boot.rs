@@ -27,6 +27,10 @@ use std::path::Path;
 pub type BootError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The level the house view shows: the ground.
+/// Global 11: set by Special Effect's first state (0x44aad6), cleared
+/// by the idle loop before the next update (0x46dacc).
+const EFFECT_SHOWN: usize = 11;
+
 const VIEW_LEVEL: i8 = 1;
 
 /// When the house view draws a frame, as far as drawing writes the
@@ -813,6 +817,20 @@ impl Lot {
             ..update
         };
         self.ticks = tick;
+        // After each update (0x46da70) the idle call looks at global 11,
+        // which Special Effect sets (0x44aad6): when it is set, the call
+        // clears it and returns (0x46da98, 0x46dacc), leaving the rest of
+        // its time to the next idle call, which sets the idle speed again
+        // (changing nothing more) before its first update. The call
+        // returns without clearing it when 0x6e54a8 is set, or when the
+        // simulator's byte +0xd4 is set and a message is waiting (0x46da75,
+        // 0x46da86); neither is taken to happen here (unverified). Whether the message loop draws in between is
+        // the draw timer's to say, which the input schedule's frames stand
+        // for, so no draw is added (unverified). See
+        // docs/decisions/20261115-snap-offset-order.md.
+        if let Some(effect) = self.world.globals.get_mut(EFFECT_SHOWN) {
+            *effect = 0;
+        }
         // Between lot updates the game handles its messages, which
         // redraws the family panel.
         interpreter.refresh_family_panel(&mut self.world);

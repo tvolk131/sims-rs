@@ -542,56 +542,27 @@ fn the_snack_order_pays_for_the_snack() {
     }
     // Step 3603: object 354 makes two neighbors' people off the lot and
     // removes them (Create New Object Instance mode 6, flag 0x4).
-    // Their IDs, 374 and 375, come after 354's, so each has its tick in
-    // the same pass while queued, with its animator's refresh at the
-    // take-off pending (0x58da12).
+    // Their IDs are 12 and 24, the lowest free, as in strict mode.
     let update = lot.step_play().unwrap();
     assert!(update.errors.is_empty(), "{:?}", update.errors);
-    assert_eq!(update.removed, [374, 375]);
-    assert!(update.ticked.contains(&374) && update.ticked.contains(&375));
-    for step in 3604..13199 {
+    assert_eq!(update.removed, [12, 24]);
+    for step in 3604..15799 {
         let update = lot.step_play().unwrap();
         assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
     }
-    // Step 13199: object 18, in the stove's cooking (tree 0x101c node 15),
-    // starts a fire with Burn (opcode 9, 0x44d96f): fire 41 at (296, 488).
-    // The fire spreads to the tiles around it as the fires' own trees run,
-    // five fires by step 15865. Unverified: no recording has this fire.
-    let fires = |lot: &Lot| -> Vec<(u16, [i32; 3])> {
-        lot.world()
-            .objects
-            .values()
-            .filter(|o| o.guid == 0x24c9_5f99)
-            .map(|o| (o.id, o.position))
-            .collect()
+    // No fire is lit on the way: the run before Snap's slot offset was
+    // fixed lit one at step 13199 (docs/decisions/
+    // 20261115-snap-offset-order.md). Step 15799: person 21 is off the
+    // lot, where its model matrix (0x45ee1d) is not ported; play mode
+    // records the error and restarts it.
+    assert!(!lot.world().objects.values().any(|o| o.guid == 0x24c9_5f99));
+    let update = lot.step_play().unwrap();
+    let [error] = &update.errors[..] else {
+        panic!("{:?}", update.errors);
     };
-    let mut lit = Vec::new();
-    for step in 13199..15925 {
-        let before = fires(&lot).len();
-        let update = lot.step_play().unwrap();
-        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
-        if fires(&lot).len() != before {
-            lit.push(step);
-        }
-    }
-    assert_eq!(lit, [13199, 14388, 15009, 15288, 15865]);
-    assert_eq!(
-        fires(&lot),
-        [
-            (36, [280, 488, 1]),
-            (41, [296, 488, 1]),
-            (46, [296, 472, 1]),
-            (119, [312, 488, 1]),
-            (218, [264, 488, 1]),
-        ]
-    );
-    // Step 15925: object 116, under fire 36 and holding object 120 in a
-    // slot, is taken off the lot, which needs the placement services the
-    // port's removal does not have yet (`removal.rs`).
-    let error = lot.step_play().unwrap_err();
+    assert_eq!(error.object, 21);
     assert!(
-        format!("{error:?}")
-            .contains("removing object 116 needs the lot's placement and callback services"),
+        format!("{error:?}").contains("model matrix off the lot (0x45ee1d)"),
         "{error:?}"
     );
 }
@@ -714,119 +685,68 @@ fn the_player_selects_another_goth() {
     }
 }
 
+// The pins from tick 2881 on follow the run with Snap's slot offset in
+// the original's order, Special Effect shown and global 11's break of
+// the idle call; see docs/decisions/20261115-snap-offset-order.md. They hold
+// only this snapshot format: the state changed with those fixes, so no
+// earlier format's hash is kept for them.
+
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 2881
 /// --answers 3` gives this hash.
-const TICK_2881: &str = "651e560dd689a030b7dd9c2072cfb4601d16855a9de17eae4456382db9e198cc";
+const TICK_2881: &str = "8158b8c5095aa4776f7c0768efb0f3a371df91a9bbc0c66246281ea4b8c09e84";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_2881_29: &str = "841c0f85fdc10a4243dbfe5c2ed0038599a51ae12140b676c2b737759d237dea";
-/// The same state's hash under snapshot format 28, which had no record
-/// of the people whose animator was asked to stop its route
-/// ([`sims_sim::World::stops_asked`]) at the end.
-const TICK_2881_28: &str = "f9866cb5c07966e41f015df5cf5d7b71e66741c3d5973d8c9e997977285ef30a";
-/// The same state's hash under snapshot format 27, which had no poses
-/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
-const TICK_2881_27: &str = "e727213029f1e8560551ab8a4f8526994f21d862e167b3106f877ac3b70ff03b";
-/// The same state's hash under snapshot format 26.
-const TICK_2881_26: &str = "16c83a8e5f49c088dce71c67874ba7ccbb367c952b4fde8a4b3d7c78ad7a081f";
-/// The same state's hash under snapshot format 25.
-const TICK_2881_25: &str = "677bfb1d0fef771671a6b2881729604bb50d3fd2dc6ea18ca829d6cca7861aef";
-/// The same state's hash under snapshot format 24.
-const TICK_2881_24: &str = "cdd5b72c0ed8481f4db525817d1145f5445b6d2562c2ea4abfbfbfcfae4e26bf";
-
-/// `sims boot <install> UserData/Houses/House05.iff --ticks 3432
-/// --answers 3` gives this hash.
-const TICK_3432: &str = "67bfbeec110a67bd01227fae52b5ada47410d29981eb590fc9578f732432e2c6";
+const TICK_2881_29: &str = "e32437a9c22924668ff3a1823a2526ad919dfde7a11abdaf47df3d27730d4412";
+/// The same at tick 3432.
+const TICK_3432: &str = "c296be78d96171ab3ec9e68fcc2069f6896ac3001ea052a7861f4845a0abf184";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_3432_29: &str = "a14d77ec4d8c4fa5dc9c2bf7bc2701ddc6f786f4d64bcbfa77f4eaaca618654f";
-/// The same state's hash under snapshot format 28, which had no record
-/// of the people whose animator was asked to stop its route
-/// ([`sims_sim::World::stops_asked`]) at the end.
-const TICK_3432_28: &str = "6bbc6f39d6dbe24d0a6c3ab2dff1ed57a57bd5369e71b9fced29984e01210699";
-/// The same state's hash under snapshot format 27, which had no poses
-/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
-const TICK_3432_27: &str = "59dc53999c14e69ba5e83f556ff1135c75c60baa92b4701d844a5879ce983acc";
-/// The same state's hash under snapshot format 26.
-const TICK_3432_26: &str = "359095d7d0e8a141ac07a3662a3aec4de888d755c663754aa624e057a6596f5b";
-/// The same state's hash under snapshot format 25.
-const TICK_3432_25: &str = "fbb3d6685e20066970fce710ca97e397b921bad0384876d05a6bcb530a62d9a9";
-/// The same state's hash under snapshot format 24.
-const TICK_3432_24: &str = "c8d4fccd905caec7a03bb6d2872d83ba0ce462ffbc6c3e0bc1432034dade3f9a";
-
-/// `sims boot <install> UserData/Houses/House05.iff --ticks 3602
-/// --answers 3` gives this hash.
-const TICK_3602: &str = "dedb6573d6dbdc8fca34e67460ac31206f69562026c368ad5f2bc7df8c62e62c";
+const TICK_3432_29: &str = "859479e7f998ad3d9ea96061e5322d16ad10c71bf8b8c7b38a8c49dae35a8e68";
+/// The same at tick 3602, the last whose lot random stream matches track
+/// 2's recording `goth-day-20261115`.
+const TICK_3602: &str = "49132b5a47c73c9bc3d1b826d695e72400b946949e77a900d39b6758be626661";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_3602_29: &str = "a7cc5f9bf064c04f82e376d57d5d4b8c237b12e465e7f97e1f0c1520ae78fb9f";
-/// The same state's hash under snapshot format 28, which had no record
-/// of the people whose animator was asked to stop its route
-/// ([`sims_sim::World::stops_asked`]) at the end.
-const TICK_3602_28: &str = "237e310cc1a35b9f46aac605f57ce8793f1575d9623b10de89d426219c08ec39";
-/// The same state's hash under snapshot format 27, which had no poses
-/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
-const TICK_3602_27: &str = "d20b5848afafab4f927b77f6762af0e2152e7a90c61325a807398c77868a1741";
-/// The same state's hash under snapshot format 26.
-const TICK_3602_26: &str = "07ce1fc95d4c26d2b5466524759ddaa0d9cf6fbcde3c631c9b60e907c8bbe6a0";
-const TICK_3603: &str = "dbd2f17e84293db73f48b543a80cacbcd3fd559ce318be0454378fc18d369c5f";
+const TICK_3602_29: &str = "11cdf3a3dc0d26b6ceac4749266818745ca9bcdce5cf05db72be2ef5461da80e";
+/// The same at tick 3603.
+const TICK_3603: &str = "9b3b93a792d68cd5121b91fd17182aa27d11dd586e1ac8810937fb05cc5a73ea";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_3603_29: &str = "cc1c4a32014f7354838fedbe7e0876d857351fb7042d6f9ac0fd2c9faaab011f";
-/// The same state's hash under snapshot format 28, which had no record
-/// of the people whose animator was asked to stop its route
-/// ([`sims_sim::World::stops_asked`]) at the end.
-const TICK_3603_28: &str = "97e03ff640aec9f42a222dfb78c3b01e5a71f85a2f83ed82af5f827740ec1121";
-/// The same state's hash under snapshot format 27, which had no poses
-/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
-const TICK_3603_27: &str = "95156650bf0372faec254d37e4002e3c7341a67a71fbbd82254fbc28baa9b2e9";
-/// The same state's hash under snapshot format 26.
-const TICK_3603_26: &str = "82ff7567a2b43e03b5be77f7f547b8e8859c74657edecb66ce65514b42e144db";
-const TICK_3912: &str = "64fa9614f2ba4817883b210356979ffc1d0d102ae34c4f7636635820ec402aaf";
+const TICK_3603_29: &str = "eff0fb739272f0bae736110131482ba3b69500ecfe1edb6f289b88a59eefd2c1";
+/// The same at tick 3912.
+const TICK_3912: &str = "28ad3817ede8e97cca15934b22b543e94f07ca7249c563ce2722a3405cf6c3a5";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_3912_29: &str = "84d3379ffd23dbedcba91d74d5a0532b8b79f630deb0f69a532e5c6ed3ddac89";
-/// The same state's hash under snapshot format 28, which had no record
-/// of the people whose animator was asked to stop its route
-/// ([`sims_sim::World::stops_asked`]) at the end.
-const TICK_3912_28: &str = "91d31ecc335fff6c7cccc48b894956e2a07221cdb650cdfbb3c1fafa94f71a16";
-/// The same state's hash under snapshot format 27, which had no poses
-/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
-const TICK_3912_27: &str = "0045276c46ed63146dac1d55f0042b964bfb169fb1f0e26e5987f6b3c760e11c";
-/// The same state's hash under snapshot format 26.
-const TICK_3912_26: &str = "41652f2fbb6dad9eec17b3fcb49d4546da8f2fa6b4bab1957cd831491f6cc285";
-/// `sims boot <install> UserData/Houses/House05.iff --ticks 9906
-/// --answers 3` gives this hash, the last before tick 9907.
-const TICK_9906: &str = "cb7ac9e5ae458a005c600ece29f2ea757bb700abc73a1150397dea29ec78412c";
+const TICK_3912_29: &str = "60077dd07b953f0329f30c93622796f42ffd9ed471979217468459e93cfdb4ac";
+/// The same at tick 9906.
+const TICK_9906: &str = "f34e2a13360a948a34c679d784a0d522b96c061891befc6ae681afb2b5db3b3d";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_9906_29: &str = "63e341f1c0a12304891acae2478dad0c33ffa4ef32cf603aff9de597a540663c";
-/// The same state's hash under snapshot format 28, which had no record
-/// of the people whose animator was asked to stop its route
-/// ([`sims_sim::World::stops_asked`]) at the end.
-const TICK_9906_28: &str = "1e87830c107bef2b188791d6c9482e8afdfe1da341131b4482dfaac5661c0f94";
-/// The same state's hash under snapshot format 27, which had no poses
-/// the load left in the skins ([`sims_sim::World::held_poses`]) either.
-const TICK_9906_27: &str = "c8240fc703c03716105cd4d2e554ef225259aac9799c8d3e91de604f25cee599";
-/// The first update of the next day, when the day turns. Unverified: no
-/// capture reaches it.
-const TICK_31478: &str = "bd1c955e918be38807e9a99d0044a41d441a7e64bfe42854491afe7045f69a99";
+const TICK_9906_29: &str = "28db43d5360607617d9dab38da541d969c7bab671e4aa2d12e13dbd8a35f78d9";
+/// The same at tick 20186.
+const TICK_20186: &str = "9a62389993e3b5a3edde3cc809af8f29915e3f036bc38079d1b97e4a9a6cc079";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_31478_29: &str = "abaf4b5b3ce9efa9a1c28b0c2008493235beb97ce4ed0874d90dc299e131707d";
-/// A whole day, 43,200 updates, from the load. Unverified.
-const TICK_43200: &str = "9494d1e16189d5cadc0210bc304051c2479db83351fa0cc338bd176db4268a90";
+const TICK_20186_29: &str = "75d9aa22fc75355097f0b41385527cc926e58d803c7b601625e3e57645e837c3";
+/// The same at tick 31478, when the day turns.
+const TICK_31478: &str = "1d60074defac59884dea7c266b197f712c4f40df59c0fec194e3e976240c9410";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_43200_29: &str = "bc43e887614700e6ac2da54f2895bc1b8f7987a79535547af40ce35f5db33591";
+const TICK_31478_29: &str = "fef644641f0d8031a541a710bf80072e1f535e8c57e0ce5433ee85a365e0591c";
+/// The same at tick 43200, a whole day from the load.
+const TICK_43200: &str = "b980bfe8001d0e86e21fec66f6487727abc029d3d208b8f80c703ad69cc2dee7";
+/// The same state's hash under snapshot format 29, which had no person
+/// types made while the game runs ([`sims_sim::World::characters`]) at
+/// the end.
+const TICK_43200_29: &str = "9350f8b0de69676e1df4c7999151a58dbe5c851c610d944a33ddac53b3eacd07";
 
 #[test]
 fn strict_mode_runs_the_goth_houses_whole_day() {
@@ -849,14 +769,13 @@ fn strict_mode_runs_the_goth_houses_whole_day() {
     assert_school_bus(&lot);
     for _ in 2704..=2881 {
         lot.step().unwrap();
+        // At tick 2747 objects 12 and 334 run Special Effect, which sets
+        // global 11. The idle call clears it after the update that set it
+        // (0x46da98, 0x46dacc), so no update ends with it set.
+        assert_eq!(lot.world().globals[11], 0);
     }
     assert_eq!(lot.world().hash_hex(), TICK_2881);
     assert_eq!(digest(&format_29_bytes(lot.world())), TICK_2881_29);
-    assert_eq!(digest(&format_28_bytes(lot.world())), TICK_2881_28);
-    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_2881_27);
-    assert_eq!(digest(&format_26_bytes(lot.world())), TICK_2881_26);
-    assert_eq!(digest(&format_25_bytes(lot.world())), TICK_2881_25);
-    assert_eq!(digest(&format_24_bytes(lot.world())), TICK_2881_24);
     // Each update is two game seconds, 30 a game minute, so a day is
     // 43,200 updates.
     assert_eq!(clock(&lot), (8, 6, 46));
@@ -865,79 +784,36 @@ fn strict_mode_runs_the_goth_houses_whole_day() {
     }
     assert_eq!(lot.world().hash_hex(), TICK_3432);
     assert_eq!(digest(&format_29_bytes(lot.world())), TICK_3432_29);
-    assert_eq!(digest(&format_28_bytes(lot.world())), TICK_3432_28);
-    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_3432_27);
-    assert_eq!(digest(&format_26_bytes(lot.world())), TICK_3432_26);
-    assert_eq!(digest(&format_25_bytes(lot.world())), TICK_3432_25);
-    assert_eq!(digest(&format_24_bytes(lot.world())), TICK_3432_24);
     assert_eq!(clock(&lot), (8, 25, 8));
-    // Tick 3433: object 334, the lead of the car junk's group, snaps
-    // itself to a place where it does not fit (0x454e82).
-    lot.step().unwrap();
-    // Tick 3434: its group is taken off the lot (Find Location mode 1)
-    // and queued for removal, and at the end of the update all 18 tiles
-    // are deleted (0x440f37).
-    let junk = [
-        334, 336, 340, 342, 348, 349, 350, 351, 352, 355, 356, 357, 368, 369, 370, 371, 372, 373,
-    ];
-    assert!(junk.iter().all(|id| lot.world().objects.contains_key(id)));
-    let tick = lot.step().unwrap();
-    assert_eq!(tick.removed, [334]);
-    assert!(junk.iter().all(|id| !lot.world().objects.contains_key(id)));
-    for _ in 3435..=3602 {
+    for _ in 3433..=3602 {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_3602);
     assert_eq!(digest(&format_29_bytes(lot.world())), TICK_3602_29);
-    assert_eq!(digest(&format_28_bytes(lot.world())), TICK_3602_28);
-    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_3602_27);
-    assert_eq!(digest(&format_26_bytes(lot.world())), TICK_3602_26);
     assert_eq!(clock(&lot), (8, 30, 48));
     // Tick 3603: object 354 (tree 0x1022) picks two neighbor records at
     // random, makes the person of each off the lot (Create New Object
-    // Instance mode 6, flag 0x4) as objects 334 and 336, writes their
-    // person words 80 and 81, and removes them both; they are deleted at
-    // the end of the update.
+    // Instance mode 6, flag 0x4) as objects 12 and 24, the lowest IDs
+    // free, writes their person words 80 and 81, and removes them both;
+    // they are deleted at the end of the update.
     let tick = lot.step().unwrap();
-    assert_eq!(tick.removed, [334, 336]);
-    assert!(!lot.world().objects.contains_key(&334));
-    assert!(!lot.world().objects.contains_key(&336));
+    assert_eq!(tick.removed, [12, 24]);
+    assert!(!lot.world().objects.contains_key(&12));
+    assert!(!lot.world().objects.contains_key(&24));
     assert_eq!(lot.world().hash_hex(), TICK_3603);
     assert_eq!(digest(&format_29_bytes(lot.world())), TICK_3603_29);
-    assert_eq!(digest(&format_28_bytes(lot.world())), TICK_3603_28);
-    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_3603_27);
-    assert_eq!(digest(&format_26_bytes(lot.world())), TICK_3603_26);
     for _ in 3604..=3912 {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_3912);
     assert_eq!(digest(&format_29_bytes(lot.world())), TICK_3912_29);
-    assert_eq!(digest(&format_28_bytes(lot.world())), TICK_3912_28);
-    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_3912_27);
-    assert_eq!(digest(&format_26_bytes(lot.world())), TICK_3912_26);
     assert_eq!(clock(&lot), (8, 41, 8));
-    // Tick 3913: object 16, seated, asks for a route, and stands up first
-    // (0x4832d4). Tick 6756: a pet is made (the pet guard 0x440d63 lets it
-    // be, with the expansions installed), its Main's first argument the
-    // maker's temp 0, -2, as in the capture (Create flag 0x10); from 6760 it looks for a place
-    // to go with no seats (0x4823d0), on its own pace (planner data word
-    // 17) and turns at a pet's rate (0x58df67). Tick 6784: it stops
-    // running (animator state 11). Tick 7702: an inventory count goes up
-    // (Manage Inventory operation 0). Tick 9337: a route finds no door and
-    // gives up with result 2.
     for _ in 3913..=9906 {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), TICK_9906);
     assert_eq!(digest(&format_29_bytes(lot.world())), TICK_9906_29);
-    assert_eq!(digest(&format_28_bytes(lot.world())), TICK_9906_28);
-    assert_eq!(digest(&format_27_bytes(lot.world())), TICK_9906_27);
     assert_eq!(clock(&lot), (12, 0, 56));
-    // Tick 9907: object 5 walks the neighborhood's lots in order of
-    // distance (Set To Next mode 11). Tick 30320: object 243 makes person
-    // 36 (Create New Object Instance), with person words the original
-    // hands to 0x45810c, which the port leaves out as only what is drawn
-    // (unverified).
     // The date: globals 1, 7 and 8 are the day, month and year, global 28
     // the days played.
     let date = |lot: &Lot| {
@@ -945,7 +821,20 @@ fn strict_mode_runs_the_goth_houses_whole_day() {
         (globals[1], globals[7], globals[8], globals[28])
     };
     assert_eq!(date(&lot), (16, 6, 1997, 0));
-    for _ in 9907..=31477 {
+    // Tick 20187: object 16's tree 0x017f makes object 43, which turns to
+    // the facing of the frame's stack object (0x433f75).
+    for _ in 9907..=20186 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.world().hash_hex(), TICK_20186);
+    assert_eq!(digest(&format_29_bytes(lot.world())), TICK_20186_29);
+    // Tick 24770: a placement tests the walls beside the object's tile
+    // (0x476f5a). Tick 26573: a person that took itself off removes
+    // itself and yields (0x58da12), and a person using a changed object
+    // resets fully as it lets go (0x45e814). Tick 33097: Look Towards
+    // mode 1 turns towards the camera. Tick 36311: Create New Object
+    // Instance mode 0 with flags 0x9 (0x44e1e6, 0x44e51e).
+    for _ in 20187..=31477 {
         lot.step().unwrap();
     }
     assert_eq!(clock(&lot), (23, 59, 58));
@@ -960,18 +849,14 @@ fn strict_mode_runs_the_goth_houses_whole_day() {
     // date, the objects' daily update, the budget, and signal 0xdc.
     lot.step().unwrap();
     // The statistics work the objects' value out again after the objects
-    // lost value for the day. Before the loss the sum is the saved 14660,
-    // which a probe of this run checked. The architecture's value is not
-    // ported and keeps the saved one.
-    assert_eq!(values(&lot), (12524, 15277));
+    // lost value for the day. This run's objects lose more than those of
+    // the run before the fixes (12524), being in other states by then
+    // (unverified). The architecture's value is not ported and keeps the
+    // saved one.
+    assert_eq!(values(&lot), (12653, 15277));
     assert_eq!(lot.world().hash_hex(), TICK_31478);
     assert_eq!(digest(&format_29_bytes(lot.world())), TICK_31478_29);
     assert_eq!((date(&lot), clock(&lot)), ((17, 6, 1997, 1), (0, 0, 0)));
-    // Tick 34719: a Snap blocked by a person asks it to make way
-    // (0x45bd5e). Tick 35102: a balloon shows a neighbor's picture
-    // (0x44b862). Tick 37426: a puddle is made on the tile in front of its
-    // maker (Create mode 9) and joins the group beside it (0x423368).
-    // Tick 40935: an action queued before others drops them (0x45d4c8).
     for _ in 31479..=43200 {
         lot.step().unwrap();
     }

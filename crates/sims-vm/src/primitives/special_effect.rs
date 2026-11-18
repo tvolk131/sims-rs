@@ -25,11 +25,15 @@
 //! - Any other state: the true branch.
 //!
 //! The options' flag is a check box of the Options panel (0x5164ae,
-//! setter 0x4e62fa). Only the options' constructor (0x4e5f63) also
-//! writes it, with 0, and the frozen image of the running game holds 0.
-//! So it is taken as off here and the effect is never shown unless flag 8
-//! is set. Turning it on in the original changes how long a script waits
-//! here.
+//! setter 0x4e62fa). The options' constructor (0x4e5f63) writes 0, but in
+//! the frozen image of the running game the options (0x6f2628) hold 1 at
+//! +4, so the saved options turn it on. The Goth day recording agrees:
+//! at tick 2747 objects 12 and 334 run Special Effect (flags 0x43) on the
+//! residential Goth lot, and state 1 yields once more before their next
+//! sleep, which only a shown effect does. So it is taken as on here.
+//! Turning it off in the Options panel changes how long a script waits
+//! here; the panel is not ported. See
+//! docs/decisions/20261115-snap-offset-order.md.
 //!
 //! What showing does is presentation and is not modeled: the message
 //! 0x10c to the game's listeners unless flag 0x40 is set (0x40760d), the
@@ -47,16 +51,18 @@ use crate::interpreter::{Flow, Machine, word};
 const FAMILY: usize = 9;
 /// Global 10: the lot's number.
 const LOT: usize = 10;
-/// Global 11, which state 0 sets (0x46d9c4 with 0xb and 1).
+/// Global 11, which state 0 sets (0x46d9c4 with 0xb and 1). The idle
+/// loop clears it before the next update and ends its frame there
+/// (0x46da98, `crate::boot`).
 const EFFECT: usize = 11;
 /// Person data words.
 mod person {
     pub const FAMILY: usize = 61;
     pub const DATE: usize = 77;
 }
-/// Whether the game's options show effects (options +4, 0x4cfe18). Off,
-/// its only value outside the Options panel (0x4e5f63).
-const OPTION_SHOWS_EFFECTS: bool = false;
+/// Whether the game's options show effects (options +4, 0x4cfe18): on, as
+/// the running game holds it (0x6f262c is 1 in the frozen image).
+const OPTION_SHOWS_EFFECTS: bool = true;
 
 impl Machine<'_, '_> {
     pub(crate) fn special_effect(&mut self, operands: &[u8; 8]) -> Result<Flow, Trap> {

@@ -31,7 +31,9 @@
 //! word 84 has bit 0, a place inside a person and an object that must
 //! stand against a wall (data word 13 nonzero) fail loudly.
 
-use super::{FLAGS, FULL, GRIDS, data, datum, footprint, missing, registered, slot};
+use super::{
+    FLAGS, FULL, GRIDS, data, datum, footprint, is_fence, missing, registered, slot, wall_sides,
+};
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
 use sims_sim::World;
@@ -51,6 +53,72 @@ const ALLOW_OVERLAP: usize = 5;
 /// Definition word 69 (+0x8a), which two objects that are not solid on
 /// one tile compare (0x433ace): 2 in both or in neither lets them clash.
 const DEFINITION_KIND: usize = 0x8a / 2;
+
+/// Whether an object facing `facing` suits the walls of its tile by its
+/// wall rules (data word 13; 0x476f5a), and if not the code the
+/// original leaves in 0x6e4acc:
+///
+/// 1. Rule 0x40 needs a diagonal wall on the tile (code 0x17), and
+///    without rule 0x80 there may be none (code 7).
+/// 2. With no rules at all the tile suits.
+/// 3. The tile's walls are turned to the object's facing: by
+///    `((-facing) & 7) >> 1` quarter turns ([`wall_sides`]).
+/// 4. The tile is a corner when two walls meet on it: the walls of
+///    edge bits 1 and 2, 1 and 8, 2 and 4, or 8 and 4. Rule 0x20 needs
+///    a corner (code 4), and rule 0x10 forbids one (code 5).
+/// 5. Then each side in the order of edge bits 2, 1, 4 and 8: a wall
+///    on it is forbidden by rule 0x100, 0x800, 0x200 or 0x400 (code
+///    7), and needed by rule 1, 8, 2 or 4. A needed wall must not be a
+///    fence ([`is_fence`]): code 0x16 for a fence, 6 for no wall. The
+///    first side that fails decides.
+///
+/// Code 7 is [`Refusal::Wall`] and 0x16 [`Refusal::SameWall`]; the
+/// others are [`Refusal::Coded`] with their code.
+fn against_walls(
+    world: &World,
+    [a, b]: [i8; 2],
+    level: i32,
+    facing: i16,
+    rules: u16,
+) -> Result<Result<(), Refusal>, Trap> {
+    let diagonal = segments(world, a, b, level)? & 0x30 != 0;
+    if rules & 0x40 != 0 && !diagonal {
+        return Ok(Err(Refusal::Coded(0x17)));
+    }
+    if rules & 0x80 == 0 && diagonal {
+        return Ok(Err(Refusal::Wall));
+    }
+    if rules == 0 {
+        return Ok(Ok(()));
+    }
+    let index = level_index(level)?;
+    let rotation = ((-i32::from(facing)) & 7) >> 1;
+    let sides = wall_sides(world, [a, b], index, rotation as u32)?;
+    let has = |bit: usize| sides[bit].is_some();
+    let corner =
+        (has(0) && has(1)) || (has(0) && has(3)) || (has(1) && has(2)) || (has(3) && has(2));
+    if rules & 0x20 != 0 && !corner {
+        return Ok(Err(Refusal::Coded(4)));
+    }
+    if rules & 0x10 != 0 && corner {
+        return Ok(Err(Refusal::Coded(5)));
+    }
+    // Edge bits 2, 1, 4 and 8, with the rules that need and forbid a
+    // wall there (0x47707a to 0x4770db).
+    for (side, need, forbid) in [(1, 1, 0x100), (0, 8, 0x800), (2, 2, 0x200), (3, 4, 0x400)] {
+        if rules & forbid != 0 && has(side) {
+            return Ok(Err(Refusal::Wall));
+        }
+        if rules & need != 0 && !sides[side].is_some_and(|style| !is_fence(style)) {
+            return Ok(Err(if has(side) {
+                Refusal::SameWall
+            } else {
+                Refusal::Coded(6)
+            }));
+        }
+    }
+    Ok(Ok(()))
+}
 
 /// The wall an object stands against, as a wall bit of its tile (1, 2, 4
 /// or 8), or 0 for none (0x4358c3): bit 0 of data word 13 is the side of
@@ -89,6 +157,20 @@ fn side_of(rules: i16, facing: i16) -> Option<u16> {
     Some(((bit << turn) | (bit >> (4 - turn))) & 15)
 }
 
+/// The refusal a group keeps when a tile refuses `later` after the
+/// refusal `first` of the tiles before it (0x422b9e to 0x422bb3): the
+/// first, unless the later code is 0x1e or 0x1f. None when that is not
+/// told apart: a later [`Refusal::Other`] after an earlier refusal that is
+/// not. A later [`Refusal::Other`] after an earlier one is the same
+/// refusal either way.
+fn kept_by_group(first: Option<Refusal>, later: Refusal) -> Option<Refusal> {
+    match first {
+        None => Some(later),
+        Some(first) if later == Refusal::Other && first != Refusal::Other => None,
+        Some(first) => Some(first),
+    }
+}
+
 /// Why the place test refused a place: the placement error it leaves in
 /// global 0x6e4acc, as far as a caller tells the codes apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,11 +189,13 @@ pub(crate) enum Refusal {
     /// solid either stands against the same wall (0x433b56). It leaves
     /// 0x6e4ad0 as the caller set it.
     SameWall,
-    /// One of the other codes the steps of [`Interpreter::fits`] name.
+    /// A code other than these, known to be none of 0x1e and 0x1f (which
+    /// a group's later tile would keep, 0x422ba2 to 0x422bb3): the wall
+    /// rules' 0x17, 4, 5 and 6 ([`against_walls`]).
+    Coded(u16),
+    /// One of the other codes the steps of [`Interpreter::fits`] name,
+    /// which may be 0x1e or 0x1f.
     Other,
-    /// A refusal whose code was not read from the original: the wall
-    /// rules of an object that is not a person (0x476f5a).
-    Unrecorded,
 }
 
 /// Data words of the object being placed.
@@ -122,9 +206,8 @@ mod word {
     /// tile is in the way. Bit 0x1000 (of another object): it makes water
     /// standable.
     pub const FLAGS: usize = 8;
-    /// How it stands against walls: 0x40 needs a diagonal wall on its
-    /// tile, 0x80 allows one; any other nonzero value turns on tests that
-    /// are not ported.
+    /// How it stands against walls (see
+    /// [`super::against_walls`]).
     pub const WALL_RULES: usize = 13;
     /// 1: the tile must have flag 4; 2: it must not.
     pub const TILE_FLAG_RULE: usize = 30;
@@ -285,7 +368,7 @@ fn cell(a: i8, b: i8) -> Result<usize, Trap> {
 
 /// Whether a tile is inside the lot's border (0x433087 and the search's
 /// own test).
-fn inside(world: &World, a: i8, b: i8) -> bool {
+pub(super) fn inside(world: &World, a: i8, b: i8) -> bool {
     let size = i32::from(world.size);
     let ok = |n: i8| n >= 1 && i32::from(n) < size - 1;
     ok(a) && ok(b)
@@ -602,8 +685,9 @@ impl Interpreter<'_> {
     /// 1. The tile is inside the lot's border (1) and the level is 0 to 3
     ///    (2).
     /// 2. Above the ground level, placement flag 0x1000 is clear (0x1f).
-    /// 3. The tile's diagonal wall is one the object may stand against
-    ///    ([`Self::against_walls`], 0x476f5a). A person skips this.
+    /// 3. The walls of the tile suit the object's wall rules
+    ///    ([`against_walls`], 0x476f5a; 7, 0x16 and others). A
+    ///    person skips this.
     /// 4. Above the ground level without placement flag 0x200, the tile
     ///    has a floor (0x4330b7; 0x12 or 0x29).
     /// 5. On water (the ground level, water byte not 0xff) without
@@ -752,13 +836,10 @@ impl Interpreter<'_> {
     ///    [`Refusal::Collision`] of the group names the last one written
     ///    by any tile, which is not always the tile whose code is kept.
     ///
-    /// A tile that refuses without leaving a code ([`Refusal::Unrecorded`])
-    /// fails loudly: the group then reads whatever code an earlier test
-    /// left (0x422ba2), and a code of 0 would send it on to compare the
-    /// tiles' heights (0x422bbb to 0x422c01), which is not ported. So does
-    /// a later tile refusing with [`Refusal::Other`] after an earlier one
-    /// that is not: whether its code is 0x1e or 0x1f, which would replace
-    /// the earlier, is not told apart.
+    /// A later tile refusing with [`Refusal::Other`] after an earlier one
+    /// that is not fails loudly: whether its code is 0x1e or 0x1f, which
+    /// would replace the earlier, is not told apart. Any other later
+    /// refusal, [`Refusal::Coded`] among them, keeps the first.
     fn test_group(
         &self,
         world: &mut World,
@@ -817,26 +898,14 @@ impl Interpreter<'_> {
             if let Err(Refusal::Collision(Some(other))) = test {
                 written = Some(other);
             }
-            match test {
-                Ok(()) => {}
-                Err(Refusal::Unrecorded) => {
-                    return Err(fail(Trap::Unsupported(format!(
-                        "the place test of a group: tile {part} refuses without leaving a \
-                         code, so the group reads the code an earlier test left (0x422ba2), \
-                         which is not kept"
-                    ))));
-                }
-                Err(later) => match refusal {
-                    None => refusal = Some(later),
-                    Some(first) if later == Refusal::Other && first != Refusal::Other => {
-                        return Err(fail(Trap::Unsupported(format!(
-                            "the place test of a group: tile {part} refuses after an earlier \
-                             tile did, and whether its code (0x1e or 0x1f) replaces the \
-                             earlier one's (0x422ba9) is not told apart"
-                        ))));
-                    }
-                    Some(_) => {}
-                },
+            if let Err(later) = test {
+                refusal = Some(kept_by_group(refusal, later).ok_or_else(|| {
+                    fail(Trap::Unsupported(format!(
+                        "the place test of a group: tile {part} refuses after an earlier \
+                         tile did, and whether its code (0x1e or 0x1f) replaces the \
+                         earlier one's (0x422ba9) is not told apart"
+                    )))
+                })?);
             }
         }
         Ok((refusal.map_or(Ok(()), Err), written))
@@ -876,13 +945,14 @@ impl Interpreter<'_> {
         }
         // A person skips the wall rules (0x432ac5), and a place in a
         // container is not refused by them (0x432aeb).
-        if !person
-            && container.is_none()
-            && !self
-                .against_walls(world, [a, b], level, read(world, word::WALL_RULES)?)
-                .map_err(fail)?
-        {
-            return Ok(Err(Refusal::Unrecorded));
+        if !person && container.is_none() {
+            let facing = datum(world, id, data::FACING).map_err(fail)?;
+            let rules = read(world, word::WALL_RULES)?;
+            if let Err(refusal) =
+                against_walls(world, [a, b], level, facing, rules).map_err(fail)?
+            {
+                return Ok(Err(refusal));
+            }
         }
         let index = level_index(level).map_err(fail)?;
         let at = cell(a, b).map_err(fail)?;
@@ -1141,33 +1211,6 @@ impl Interpreter<'_> {
             .collect())
     }
 
-    /// Whether the tile's diagonal wall suits an object's wall rules
-    /// (0x476f5a): with rule 0x40 the tile must have a diagonal wall, and
-    /// without rule 0x80 it must not. With no rules that is all; any rule
-    /// turns on further tests of the walls around, which are not ported.
-    fn against_walls(
-        &self,
-        world: &World,
-        [a, b]: [i8; 2],
-        level: i32,
-        rules: u16,
-    ) -> Result<bool, Trap> {
-        let diagonal = segments(world, a, b, level)? & 0x30 != 0;
-        if rules & 0x40 != 0 && !diagonal {
-            return Ok(false);
-        }
-        if rules & 0x80 == 0 && diagonal {
-            return Ok(false);
-        }
-        if rules == 0 {
-            return Ok(true);
-        }
-        Err(Trap::Unsupported(format!(
-            "an object with wall rules {rules:#x} (data word 13) needs the wall tests of \
-             0x476f5a, which are not ported"
-        )))
-    }
-
     /// Whether an object at a position collides with something (0x4337f6),
     /// and if so why.
     /// Its footprint there is worked out as the lot stores footprints. On
@@ -1413,7 +1456,10 @@ impl Interpreter<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WALLS, closed_directions, crosses_wall, side_of, spiral_step, turn};
+    use super::{
+        Refusal, WALLS, against_walls, closed_directions, crosses_wall, kept_by_group, side_of,
+        spiral_step, turn,
+    };
     use sims_formats::lot::Array;
     use sims_sim::World;
 
@@ -1497,6 +1543,114 @@ mod tests {
             },
         );
         world
+    }
+
+    /// Sets a wall cell of a lot made by [`walled`]: its segments and its
+    /// two style words.
+    fn wall_cell(world: &mut World, [x, y]: [usize; 2], segments: u8, styles: [u8; 2]) {
+        let data = &mut world.arrays.get_mut(&WALLS[0]).unwrap().data;
+        let cell = (x * 64 + y) * 14;
+        data[cell] = segments;
+        data[cell + 2] = styles[0];
+        data[cell + 4] = styles[1];
+    }
+
+    #[test]
+    fn a_diagonal_wall_needs_rule_0x80_and_rule_0x40_needs_one() {
+        let bare = walled(0, 0);
+        let diagonal = walled(0x10, 1);
+        let rules = |world: &World, rules| against_walls(world, [2, 3], 1, 0, rules).unwrap();
+        // No rules: any tile without a diagonal wall (code 7 with one).
+        assert_eq!(rules(&bare, 0), Ok(()));
+        assert_eq!(rules(&diagonal, 0), Err(Refusal::Wall));
+        assert_eq!(rules(&diagonal, 0x80), Ok(()));
+        // Rule 0x40 needs one (code 0x17).
+        assert_eq!(rules(&bare, 0x40), Err(Refusal::Coded(0x17)));
+        assert_eq!(rules(&diagonal, 0xc0), Ok(()));
+    }
+
+    #[test]
+    fn a_group_keeps_its_first_refusal_unless_a_later_code_may_be_0x1e_or_0x1f() {
+        // The first refusal is kept.
+        assert_eq!(kept_by_group(None, Refusal::Wall), Some(Refusal::Wall));
+        // The wall rules' known codes (0x17, 4, 5, 6) are none of 0x1e and
+        // 0x1f: a forbidden wall (7) then a missing one (6) keeps 7.
+        for code in [0x17, 4, 5, 6] {
+            assert_eq!(
+                kept_by_group(Some(Refusal::Wall), Refusal::Coded(code)),
+                Some(Refusal::Wall)
+            );
+        }
+        assert_eq!(
+            kept_by_group(Some(Refusal::Coded(6)), Refusal::Collision(None)),
+            Some(Refusal::Coded(6))
+        );
+        // An unknown later code after a known earlier one is not told
+        // apart; after an unknown one it is the same refusal.
+        assert_eq!(kept_by_group(Some(Refusal::Coded(4)), Refusal::Other), None);
+        assert_eq!(kept_by_group(Some(Refusal::Wall), Refusal::Other), None);
+        assert_eq!(
+            kept_by_group(Some(Refusal::Other), Refusal::Other),
+            Some(Refusal::Other)
+        );
+    }
+
+    #[test]
+    fn a_needed_wall_must_be_there_and_not_a_fence() {
+        let rules = |world: &World, rules| against_walls(world, [2, 3], 1, 0, rules).unwrap();
+        // Rule 1 needs a wall on the side of edge bit 2.
+        assert_eq!(rules(&walled(2, 1), 1), Ok(()));
+        // A fence there is code 0x16, no wall code 6.
+        for fence in [2, 12, 13, 14] {
+            assert_eq!(rules(&walled(2, fence), 1), Err(Refusal::SameWall));
+        }
+        assert_eq!(rules(&walled(1, 1), 1), Err(Refusal::Coded(6)));
+        // Rule 8 needs the side of edge bit 1.
+        assert_eq!(rules(&walled(1, 1), 8), Ok(()));
+        // Rule 0x100 forbids any wall on the side of edge bit 2, a fence
+        // too (code 7).
+        assert_eq!(rules(&walled(2, 2), 0x100), Err(Refusal::Wall));
+        assert_eq!(rules(&walled(1, 1), 0x100), Ok(()));
+        // The sides are tried in the order of edge bits 2, 1, 4 and 8:
+        // edge bit 2's forbidden wall decides before edge bit 1's missing
+        // one.
+        assert_eq!(rules(&walled(2, 1), 0x108), Err(Refusal::Wall));
+    }
+
+    #[test]
+    fn the_walls_are_turned_to_the_objects_facing() {
+        // Tile (2, 3)'s third side is the east tile's first.
+        let mut world = walled(4, 0);
+        wall_cell(&mut world, [3, 3], 1, [1, 0]);
+        let needs = |facing| against_walls(&world, [2, 3], 1, facing, 1).unwrap();
+        // Facing 0 or 7 does not turn; edge bit 4 is not edge bit 2.
+        assert_eq!(needs(0), Err(Refusal::Coded(6)));
+        assert_eq!(needs(7), Err(Refusal::Coded(6)));
+        // Facings 1 and 2 turn three quarters: edge bit 4 goes to 2.
+        assert_eq!(needs(1), Ok(()));
+        assert_eq!(needs(2), Ok(()));
+        // Facings 5 and 6 turn one quarter: edge bit 4 goes to 8.
+        assert_eq!(needs(6), Err(Refusal::Coded(6)));
+        assert_eq!(against_walls(&world, [2, 3], 1, 6, 4).unwrap(), Ok(()));
+        // An east tile that does not mirror the wall fails loudly.
+        wall_cell(&mut world, [3, 3], 0, [1, 0]);
+        assert!(against_walls(&world, [2, 3], 1, 0, 1).is_err());
+    }
+
+    #[test]
+    fn rule_0x20_needs_two_walls_meeting_and_rule_0x10_forbids_them() {
+        let rules = |world: &World, rules| against_walls(world, [2, 3], 1, 0, rules).unwrap();
+        // Edge bits 1 and 2 meet (codes 4 and 5); one wall is no corner.
+        assert_eq!(rules(&walled(3, 1), 0x20), Ok(()));
+        assert_eq!(rules(&walled(1, 1), 0x20), Err(Refusal::Coded(4)));
+        assert_eq!(rules(&walled(3, 1), 0x10), Err(Refusal::Coded(5)));
+        assert_eq!(rules(&walled(1, 1), 0x10), Ok(()));
+        // A fence counts toward a corner.
+        assert_eq!(rules(&walled(3, 2), 0x20), Ok(()));
+        // Edge bits 1 and 4, across the tile, do not meet.
+        let mut world = walled(5, 1);
+        wall_cell(&mut world, [3, 3], 1, [1, 0]);
+        assert_eq!(rules(&world, 0x20), Err(Refusal::Coded(4)));
     }
 
     #[test]

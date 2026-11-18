@@ -172,14 +172,16 @@ const WORD_54: usize = 54;
 const ROOM: usize = 29;
 
 /// The place of a slot that puts me into no container slot (0x454b93 to
-/// 0x454c54): the object's `position` with the slot's `offset` across
+/// 0x454c54): the object's `position`, in the original's order (object
+/// +0xf4 first, which is our `position[1]`, then +0xf8, our
+/// `position[0]`), with the slot's `offset` across
 /// (its first two coordinates, as float bits) turned to the object's
 /// facing `dir` and added, in world units:
 ///
 /// 1. The matrix of the facing (0x455070, the raw data word, not kept in
 ///    0 to 7): its rows are `[c, 0, -s, 0]`, `[0, 1, 0, 0]`, `[s, 0, c,
 ///    0]` and `[0, 0, 0, 1]` ([`facing_cos_sin`]).
-/// 2. The position in world units (0x454f5c): `[k x, 0, k y]`, `k` being
+/// 2. The position in world units (0x454f5c): `[k p0, 0, k p1]`, `k` being
 ///    3/16 ([`to_world_units`]); the height is 0 as the level passed is
 ///    0.
 /// 3. The offset in world units (0x454ecc): `[k o1, 0, k o0]`, the
@@ -188,7 +190,8 @@ const ROOM: usize = 29;
 ///    0x5c4510), each coordinate divided by the fourth (1).
 /// 5. The two added, coordinate by coordinate, each sum stored (0x454c0a
 ///    to 0x454c37), and the first and third back in the lot's units
-///    ([`to_lot_units`], 0x454fb9) give the place.
+///    ([`to_lot_units`], 0x454fb9) give the place, in the same order
+///    as `position` (0x454c3f: the first goes back to +0xf4).
 ///
 /// Every term is kept, zeros included, in the original's order. Every
 /// add, multiply and divide is rounded to single precision.
@@ -415,8 +418,10 @@ impl Machine<'_, '_> {
             None
         };
         let position = if container.is_none() {
-            let [x, y] = place_by_offset(
-                [position[0], position[1]],
+            // The original's order, +0xf4 (our position[1]) first
+            // (0x454b93); see docs/decisions/20261115-snap-offset-order.md.
+            let [y, x] = place_by_offset(
+                [position[1], position[0]],
                 [slot.offset[0], slot.offset[1]],
                 self.facing(target)?,
             );
@@ -568,9 +573,7 @@ impl Machine<'_, '_> {
     /// The branch is then false. For a multi-tile object the code is the
     /// one its group's test keeps and the object the last collision any
     /// of its tiles wrote (0x422abb,
-    /// [`crate::Interpreter`]`::place_test_collided`). Fails loudly for a
-    /// refusal that leaves whatever code an earlier test left
-    /// ([`Refusal::Unrecorded`]).
+    /// [`crate::Interpreter`]`::place_test_collided`).
     fn not_fit(&mut self, refusal: NotFit, blocked_by_person: bool) -> Result<(), Trap> {
         let (code, collided) = match refusal {
             NotFit::Code(code) => (Some(code), None),
@@ -578,13 +581,8 @@ impl Machine<'_, '_> {
             NotFit::Refused(Refusal::Wall, collided) => (Some(7), collided),
             NotFit::Refused(Refusal::Collision(_), collided) => (Some(11), collided),
             // A code other than 1, 7 and 11, which Snap does not test.
-            NotFit::Refused(Refusal::Other | Refusal::SameWall, collided) => (None, collided),
-            NotFit::Refused(Refusal::Unrecorded, _) => {
-                return Err(unsupported(
-                    "0x454e66",
-                    "to a place where I do not fit, refused with whatever placement error an \
-                     earlier test left",
-                ));
+            NotFit::Refused(Refusal::Other | Refusal::SameWall | Refusal::Coded(_), collided) => {
+                (None, collided)
             }
         };
         let code = code.unwrap_or(0);

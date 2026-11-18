@@ -186,7 +186,7 @@ impl Viewer {
             &mut self.canvas,
         );
         if let Some(hud) = &mut self.hud {
-            hud.draw(&self.world, &self.view, &mut self.canvas);
+            hud.draw(&self.world, &self.view, &self.assets, &mut self.canvas);
         }
         self.dirty = false;
         if let Some(window) = &self.window {
