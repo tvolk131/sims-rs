@@ -601,22 +601,29 @@ fn mode_4_on_myself_turns_me_where_i_stand() {
 
 #[test]
 fn an_offset_turns_with_the_objects_facing() {
-    // The offset's first coordinate goes along the second of the
-    // position, its second along the first, turned by the lamp's facing
-    // through a matrix in world units and rounded back half away from
-    // zero (0x454b93 to 0x454c54).
+    // The original works in its own order, Y first (object +0xf4 is our
+    // position[1]): the offset's second coordinate goes along that, its
+    // first along X. Turned by the lamp's facing through a matrix in
+    // world units and rounded back half away from zero (0x454b93 to
+    // 0x454c54), the offset (0, -n) points where the facing's step does:
+    // -Y at facing 0, +X at facing 2. Tick 2515 of the Goth house's day
+    // has person 21 get up from chair 174 (facing 2) to its slot 1, (0,
+    // -16), at (440, 376) from the chair's (424, 376), as the original
+    // does.
     // The lamp stands where I do, in the middle of tile (2, 2).
-    let cases: [([f32; 2], i16, [i32; 2]); 7] = [
-        ([4.0, 0.0], 0, [40, 44]),
-        ([4.0, 0.0], 2, [44, 40]),
-        ([4.0, 0.0], 4, [40, 36]),
-        ([4.0, 0.0], 6, [36, 40]),
+    let cases: [([f32; 2], i16, [i32; 2]); 9] = [
+        ([4.0, 0.0], 0, [44, 40]),
+        ([4.0, 0.0], 2, [40, 44]),
+        ([4.0, 0.0], 4, [36, 40]),
+        ([4.0, 0.0], 6, [40, 36]),
         // 0.75 times the root of a half, 0.53033, on 7.5 in world units:
         // 42.828 back in the lot's.
         ([4.0, 0.0], 1, [43, 43]),
-        ([0.0, -2.0], 0, [38, 40]),
+        ([0.0, -2.0], 0, [40, 38]),
+        ([0.0, -16.0], 0, [40, 24]),
+        ([0.0, -16.0], 2, [56, 40]),
         // The facing is the raw data word: 10 turns as 2 does.
-        ([4.0, 0.0], 10, [44, 40]),
+        ([4.0, 0.0], 10, [40, 44]),
     ];
     for (offset, facing, place) in cases {
         let (mut fx, me) = snapper(SKIP_CHECKS);

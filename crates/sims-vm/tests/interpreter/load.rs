@@ -268,7 +268,9 @@ fn a_person_lets_go_of_a_duplicate_and_one_using_it_fails() {
         check(fx.world.objects[&9].person.as_ref().unwrap());
     }
     // Using it, or showing its icon in the running action, resets the
-    // person fully, which is not ported; it fails before anything changes.
+    // person fully (0x45e814). In this fixture that fails, and the lot is
+    // left as it was: the person's type has no profile for the reset to
+    // reload, and a use above the person's only frame is never released.
     let using: [Refer; 2] = [
         |p| p.active.icon = 1,
         |p| {
@@ -287,7 +289,11 @@ fn a_person_lets_go_of_a_duplicate_and_one_using_it_fails() {
             .reconcile_controllers(&mut fx.world)
             .unwrap_err();
         assert!(matches!(fault.trap, Trap::Unsupported(_)), "{fault}");
-        assert!(fault.to_string().contains("using object 1"), "{fault}");
+        let text = fault.to_string();
+        assert!(
+            text.contains("no profile") || text.contains("left as many uses"),
+            "{fault}"
+        );
         assert_eq!(fx.world.encode(), before.encode(), "nothing ran");
         // A reference to the instance that is kept is no obstacle.
         let person = fx.world.objects.get_mut(&9).unwrap().person.as_mut();

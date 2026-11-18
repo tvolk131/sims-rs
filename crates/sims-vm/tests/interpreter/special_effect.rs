@@ -35,19 +35,40 @@ fn turn(fx: &mut Fixture) -> Result<Status, sims_vm::Fault> {
     interpreter.turn(&mut fx.world, LAMP, 100)
 }
 
+/// Global 10: the lot's number. Lot 0 is always residential (0x40745f);
+/// lot 9 has no zoning in the fixture.
+const LOT: usize = 10;
+
 #[test]
-fn an_effect_not_shown_yields_once_then_takes_the_true_branch() {
-    // The options' flag is off, so without flag 8 nothing is shown.
+fn on_a_residential_lot_the_effect_is_shown_and_waits_a_turn_more() {
+    // The options' flag is on, as in the running game (0x6f262c), and
+    // lot 0 is residential: shown without flag 8. The Goth day recording
+    // has objects 12 and 334 wait this extra turn at tick 2748.
     let mut fx = effect(0);
+    fx.world.globals[LOT] = 0;
     assert_eq!(turn(&mut fx), Ok(Status::Yielded));
     assert_eq!(fx.world.globals[EFFECT], 1);
+    assert_eq!(fx.lamp().stack[0].primitive_state, 1);
+    assert_eq!(turn(&mut fx), Ok(Status::Yielded));
+    assert_eq!(fx.lamp().stack[0].primitive_state, 2);
+    assert_eq!(turn(&mut fx), Ok(Status::Returned(true)));
+}
+
+#[test]
+fn an_effect_not_shown_yields_once_then_takes_the_true_branch() {
+    // Off a residential lot, by an object that is not a person: not
+    // shown.
+    let mut fx = effect(0);
+    fx.world.globals[LOT] = 9;
+    assert_eq!(turn(&mut fx), Ok(Status::Yielded));
     assert_eq!(fx.lamp().stack[0].primitive_state, 1);
     assert_eq!(turn(&mut fx), Ok(Status::Returned(true)));
 }
 
 #[test]
-fn flag_8_shows_the_effect_and_waits_a_turn_more() {
+fn flag_8_shows_the_effect_on_any_lot() {
     let mut fx = effect(8);
+    fx.world.globals[LOT] = 9;
     assert_eq!(turn(&mut fx), Ok(Status::Yielded));
     assert_eq!(turn(&mut fx), Ok(Status::Yielded));
     assert_eq!(fx.lamp().stack[0].primitive_state, 2);
