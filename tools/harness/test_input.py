@@ -522,6 +522,18 @@ class RunnerTest(RunnerBase):
         self.assertEqual((inp.match_item(items, '@1'), inp.match_item(items, '@2'), inp.match_item(items, 'gossip')),
                          (1, None, 1))
         self.assertEqual(inp.parse_scenario('choose @1  # the first item')[0]['args'], ['@1'])
+        self.assertEqual(inp.match_item([dict(label='@\u00b2')], '@\u00b2'), 0)  # not a place: a label
+
+    def test_an_active_window_with_no_items_is_no_menu(self):
+        g = self.g
+        g.open_pie(['Dance...', 'Talk...'], submenus=('Talk...',))
+        g.highlight(1)
+        # The submenu window is active but shows nothing (paged past its end):
+        # the parent's items, still there, are not the menu.
+        g.m.put_words(g.picker + inp.PICKER_ACTIVE_PIE, g.pies[1])
+        self.assertIsNone(inp.read_pie(g.m))
+        g.m.put_words(g.picker + inp.PICKER_ACTIVE_PIE, 0)  # the picker names neither window
+        self.assertEqual(inp.read_pie(g.m)['pointer'], g.pies[0])
 
     def test_a_missing_entry_fails_without_raising(self):
         self.g.open_pie(['Sit'])

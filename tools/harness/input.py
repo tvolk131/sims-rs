@@ -292,15 +292,16 @@ def read_pie(m):
     """The pie menu on the screen, or None: dict(pointer, origin, highlighted, items)
     with items [dict(label, enabled, x, y, w, h)] in screen coordinates. A
     submenu opens in the panel's other window while the parent keeps its
-    items, so the picker's active window (+0xe4) is read first."""
+    items, so only the picker's active window (+0xe4) is read when it is one
+    of the two (an active window showing no items is no menu, never the
+    parent's); either window, when the picker names neither."""
     panel = m.word(PEOPLE_PANEL)
     if not panel:
         return None
     pies = [m.word(panel + off) for off in (0xdc, 0xe0)]
     active = m.word(picker(m) + PICKER_ACTIVE_PIE)
-    if active in pies:
-        pies.remove(active)
-        pies.insert(0, active)
+    if active and active in pies:
+        pies = [active]
     for pie in pies:
         if not pie:
             continue
@@ -393,7 +394,7 @@ def check_window(window):
 def match_item(items, label):
     """The index of the item whose label is label (case and surrounding space ignored), or None.
     `@N` is the N-th item (from 0), for a menu whose labels are not known ahead."""
-    if label.startswith('@') and label[1:].isdigit():
+    if re.fullmatch(r'@[0-9]+', label):
         n = int(label[1:])
         return n if n < len(items) else None
     want = label.strip().lower()
