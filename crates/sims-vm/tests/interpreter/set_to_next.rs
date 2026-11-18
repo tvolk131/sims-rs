@@ -322,7 +322,7 @@ fn the_destination_must_take_a_write() {
 #[test]
 fn modes_over_state_the_lot_lacks_fail_loudly() {
     // Mode 10 is here because the fixture's program has no career list.
-    for mode in [10, 11, 13, 127] {
+    for mode in [10, 13, 127] {
         let mut fx = Fixture::new();
         let text = trap(step(&mut fx, mode, 0)).to_string();
         assert!(
@@ -330,5 +330,17 @@ fn modes_over_state_the_lot_lacks_fail_loudly() {
             "{text}"
         );
         assert_eq!(fx.lamp().temps[0], 0);
+    }
+}
+
+#[test]
+fn mode_11_takes_the_false_branch_with_no_other_lot() {
+    // The neighborhood's other lots (+0x11c) are empty in every capture
+    // of the original, so the walk ends at once from any cursor and
+    // stores nothing.
+    for cursor in [0, 3, -1] {
+        let mut fx = Fixture::new();
+        assert_eq!(step(&mut fx, 11, cursor), Ok(false));
+        assert_eq!(fx.lamp().temps[0], cursor);
     }
 }

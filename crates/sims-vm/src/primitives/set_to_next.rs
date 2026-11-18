@@ -54,19 +54,27 @@
 //!   own GUID. A record whose GUID has no definition fails: what the
 //!   original's comparison does without a link was not seen.
 //!
-//! Mode 11 fails loudly: it needs the neighborhood's lot order. The
-//! original (0x44f08d) walks a vector of 32-bit lot numbers at
-//! neighborhood +0x11c: a cursor of 0 gives the first, any other the one
-//! after it; a cursor not in the vector, or the last, is the false
-//! branch (0x44eccf). The lot load (0x428041, at 0x428350) fills the
-//! vector with every lot number from 1 to below the length of the
-//! neighborhood's table of lot positions (+0x110, 8 bytes a lot, read by
-//! 0x42886e) but the lot being loaded, and sorts it (std::sort,
-//! 0x42ffce) by the squared distance of each lot's position from the
-//! loaded lot's (0x427fb9). The positions look like the screen
-//! coordinates of the neighborhood's `LotLocations.iff` (STR# rows
-//! `lot, x, y`), but what fills +0x110 was not found, so the order is not
-//! modeled.
+//! - 11: the neighborhood's other lots, nearest first. The original
+//!   (0x44f08d) walks a vector of 32-bit lot numbers at neighborhood
+//!   +0x11c: a cursor of 0 gives the first, any other the one after it
+//!   (the low word is stored); a cursor not in the vector, or the last,
+//!   is the false branch (0x44eccf) with nothing stored. The lot load
+//!   (0x428041, at 0x428350) fills the vector with every lot number from
+//!   1 to below the length of the neighborhood's table of lot positions
+//!   (+0x110, 8 bytes a lot, read by 0x42886e) but the lot being loaded,
+//!   and sorts it (std::sort, 0x42ffce) by the squared distance of each
+//!   lot's position from the loaded lot's (0x427fb9). Both are empty in
+//!   every capture of the original (`neighborhood_owners.coordinates`
+//!   and `.nearby_houses`, their begin pointers 0 as the neighborhood's
+//!   constructor 0x42441a leaves them): the Goth house's from its load
+//!   to update 8699, and the snack order's, the Pleasants', House 7's
+//!   and the Roomies'. A write watch on +0x110 to +0x11f from the
+//!   neighborhood view to the Goth lot's first update saw no write to
+//!   the table; the one write to the vector was the lot load clearing it
+//!   (0x428110, `erase(begin, end)` at 0x407161) before rebuilding it
+//!   from the empty table. Nothing that fills +0x110 ran, so the vector
+//!   is empty here ([`NEARBY_LOTS`]) and mode 11 always takes the false
+//!   branch.
 //!
 //! [`World::order`]: sims_sim::World::order
 //! [`World::people`]: sims_sim::World::people
@@ -74,6 +82,22 @@
 use crate::fault::Trap;
 use crate::interpreter::Machine;
 use sims_sim::Object;
+
+/// The neighborhood's other lots, nearest first (neighborhood +0x11c),
+/// for mode 11: empty in every capture of the original (module doc).
+const NEARBY_LOTS: &[i32] = &[];
+
+/// Mode 11's walk of the lot numbers `order` (0x44f08d): a cursor of 0
+/// gives the first, any other the one after it, cut to a word. A cursor
+/// that is not there, or the last, gives none.
+fn next_lot(order: &[i32], current: i16) -> Option<i16> {
+    let at = if current == 0 {
+        0
+    } else {
+        order.iter().position(|&lot| lot == i32::from(current))? + 1
+    };
+    order.get(at).map(|&lot| lot as i16)
+}
 
 /// Data word 59: an object's category, for mode 6.
 const CATEGORY: usize = 59;
@@ -141,12 +165,7 @@ impl Machine<'_, '_> {
                 self.store(destination, next.id as i16)?;
                 return Ok(true);
             }
-            11 => {
-                return Err(missing(
-                    mode,
-                    "the neighborhood's lot order (neighborhood +0x11c, 0x44f08d)",
-                ));
-            }
+            11 => next_lot(NEARBY_LOTS, current),
             _ => {
                 return Err(Trap::Unsupported(format!(
                     "Set To Next mode {mode} is not known"
@@ -471,4 +490,25 @@ fn missing(mode: u8, state: &str) -> Trap {
     Trap::Unsupported(format!(
         "Set To Next mode {mode} needs {state}, which the simulation does not hold"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_lot;
+
+    #[test]
+    fn mode_11_walks_the_lots_from_the_cursor() {
+        let order = [4, 2, 0x1_0007];
+        assert_eq!(next_lot(&order, 0), Some(4));
+        assert_eq!(next_lot(&order, 4), Some(2));
+        // The low word of the 32-bit lot number is stored.
+        assert_eq!(next_lot(&order, 2), Some(7));
+        // The cursor is sign-extended before it is matched, so the low
+        // word of a lot number over 0x7fff is not found.
+        assert_eq!(next_lot(&order, 7), None);
+        assert_eq!(next_lot(&order, 3), None);
+        assert_eq!(next_lot(&[], 0), None);
+        assert_eq!(next_lot(&[], 5), None);
+        assert_eq!(next_lot(&[-1, 9], -1), Some(9));
+    }
 }

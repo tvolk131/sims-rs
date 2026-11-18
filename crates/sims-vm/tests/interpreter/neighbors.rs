@@ -316,7 +316,7 @@ fn scope_24_reads_other_fields_of_the_record() {
     );
     // Fields that read what the simulation does not keep fail loudly,
     // naming the original's code, even in a write.
-    for (index, address) in [(5, "0x427148"), (7, "0x425c5e"), (8, "0x425cb4")] {
+    for (index, address) in [(7, "0x425c5e"), (8, "0x425cb4")] {
         for operator in [op::EQUAL, op::ASSIGN] {
             let fault = fx
                 .expression(24, index, operator, scope::LITERAL, 0)
@@ -332,6 +332,33 @@ fn scope_24_reads_other_fields_of_the_record() {
     for index in [0, 1, 2, 5, 7, 8, 9] {
         assert_eq!(field(&mut fx, index), 0);
     }
+}
+
+#[test]
+fn scope_24_field_5_counts_the_records_own_friends_of_a_character_type() {
+    // 0x427148, for Bob (record 2): of his mutual friends at the
+    // threshold 25 in a family (6, 7 and the second record of Anne's
+    // type, 8; not 11), those whose type is registered from the
+    // Characters folder.
+    let mut fx = friends();
+    fx.program.characters = [ANNE, 0x106, 0x107].into();
+    fx.world.neighbors.get_mut(2).unwrap().stale = true;
+    assert_eq!(field(&mut fx, 5), 3);
+    // The count is kept, and the record stays out of date, so the next
+    // read works it out again.
+    let bob = fx.world.neighbors.get(2).unwrap();
+    assert_eq!((bob.friends, bob.stale), (3, true));
+    fx.program.characters.remove(&ANNE);
+    assert_eq!(field(&mut fx, 5), 2);
+    // An up-to-date record's kept count is read as it is.
+    fx.world.neighbors.get_mut(2).unwrap().stale = false;
+    fx.world.neighbors.get_mut(2).unwrap().friends = 41;
+    assert_eq!(field(&mut fx, 5), 41);
+    // The value has no word pointer either.
+    assert_eq!(
+        code(fx.expression(24, 5, op::ASSIGN, scope::LITERAL, 1)),
+        Some(0x13)
+    );
 }
 
 #[test]

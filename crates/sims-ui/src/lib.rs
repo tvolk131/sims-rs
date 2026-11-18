@@ -20,6 +20,7 @@ pub mod command;
 pub mod dialog;
 pub mod font;
 pub mod frame;
+pub mod house;
 pub mod household;
 pub mod hud;
 pub mod pie;

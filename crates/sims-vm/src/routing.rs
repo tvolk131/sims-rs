@@ -18,5 +18,6 @@ mod planner;
 pub(crate) mod portals;
 mod regions;
 mod rooms;
+pub(crate) use rooms::walls_cross;
 mod search;
 pub(crate) mod slot;

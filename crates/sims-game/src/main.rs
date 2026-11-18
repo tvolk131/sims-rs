@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! sims-game [<install>] [<house file>] [--answers A,B,...] [--mute]
-//!           [--play] [--png <file> [--ticks N] [--size WxH]]
+//!           [--play] [--saves <file>] [--png <file> [--ticks N] [--size WxH]]
 //! ```
 //!
 //! The install defaults to `SIMS_INSTALL`, and the house to the Goths'
@@ -19,6 +19,13 @@
 //! wheel zoom, `[`/`]` or `,`/`.` rotate, Page Up and Page Down change the
 //! floor, `1`/`2`/`3` walls up, cutaway and down, the arrows or a
 //! right-button drag scroll, space pauses, Escape quits.
+//!
+//! F5 saves the lot and F9 goes back to the save (`sims_vm::boot::save`),
+//! one save for each house, kept in the REDB file `--saves` (default
+//! `sims-game-saves.redb` in the current directory). This is this
+//! reimplementation's save, not the original's house file: the original
+//! cannot open it. A save made while a dialog waits shows the dialog
+//! again when restored.
 //!
 //! A press on a portrait selects that Sim.
 //!
@@ -118,9 +125,9 @@ struct Still {
     size: [i32; 2],
 }
 
-fn options() -> Result<(Options, Option<Still>, bool), String> {
+fn options() -> Result<(Options, Option<Still>, bool, PathBuf), String> {
     let usage = "usage: sims-game [<install>] [<house file>] [--answers A,B,...] [--mute] \
-                 [--play] [--png <file> [--ticks N] [--size WxH]]";
+                 [--play] [--saves <file>] [--png <file> [--ticks N] [--size WxH]]";
     let mut paths = Vec::new();
     let mut answers = None;
     let mut png = None;
@@ -128,6 +135,7 @@ fn options() -> Result<(Options, Option<Still>, bool), String> {
     let mut size = [800, 600];
     let mut mute = false;
     let mut play = false;
+    let mut saves = PathBuf::from("sims-game-saves.redb");
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         let mut text = |name: &str| -> Result<String, String> {
@@ -139,6 +147,8 @@ fn options() -> Result<(Options, Option<Still>, bool), String> {
             mute = true;
         } else if arg == "--play" {
             play = true;
+        } else if arg == "--saves" {
+            saves = PathBuf::from(text("--saves")?);
         } else if arg == "--png" {
             png = Some(PathBuf::from(text("--png")?));
         } else if arg == "--ticks" {
@@ -197,6 +207,7 @@ fn options() -> Result<(Options, Option<Still>, bool), String> {
         },
         still,
         mute,
+        saves,
     ))
 }
 
@@ -221,6 +232,9 @@ struct App {
     told: Option<sims_audio::sources::Snapshot>,
     /// The camera the sound last heard move.
     shot: Option<sound::Shot>,
+    /// The REDB file of saves, and this house's name in it.
+    saves: PathBuf,
+    slot: String,
 }
 
 impl App {
@@ -268,6 +282,26 @@ impl App {
         }
     }
 
+    /// Saves the lot (F5) or goes back to its save (F9).
+    fn save(&mut self, restore: bool) {
+        let store = match sims_sim::Snapshots::open(&self.saves) {
+            Ok(store) => store,
+            Err(e) => {
+                eprintln!("sims-game: {}: {e}", self.saves.display());
+                return;
+            }
+        };
+        if !restore {
+            self.game.save_to(&store, &self.slot);
+        } else if self.game.restore_from(&store, &self.slot) {
+            // The errors and the stop are the restored lot's.
+            self.printed = 0;
+            self.reported = false;
+            self.last = Instant::now();
+        }
+        self.changed(true);
+    }
+
     fn key(&mut self, key: &Key) {
         let step = 64;
         let command = match key {
@@ -282,6 +316,8 @@ impl App {
                 self.changed(true);
                 return;
             }
+            Key::Named(NamedKey::F5) => return self.save(false),
+            Key::Named(NamedKey::F9) => return self.save(true),
             Key::Character(c) => match c.as_str() {
                 "+" | "=" => Move::ZoomIn,
                 "-" | "_" => Move::ZoomOut,
@@ -538,7 +574,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let (options, still, mute) = options()?;
+    let (options, still, mute, saves) = options()?;
     eprintln!("sims-game: booting {}", options.house.display());
     let started = Instant::now();
     let mut game = Game::open(&options)?;
@@ -592,7 +628,16 @@ fn run() -> Result<(), String> {
         heard: None,
         shot: None,
         told: None,
+        saves,
+        slot: slot(&options.house),
     };
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     event_loop.run_app(&mut app).map_err(|e| e.to_string())
+}
+
+/// The name of `house`'s save in the saves file: its full path, so houses
+/// of the same number in two neighborhoods keep apart.
+fn slot(house: &std::path::Path) -> String {
+    let path = std::fs::canonicalize(house).unwrap_or_else(|_| house.to_path_buf());
+    path.to_string_lossy().into_owned()
 }

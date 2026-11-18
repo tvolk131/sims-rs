@@ -260,6 +260,7 @@ fn world() -> World {
                 ],
             },
         )]),
+        stops_asked: BTreeSet::from([5]),
     }
 }
 
@@ -431,7 +432,25 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "1e854596699af21756dd277d321f3e0068d1f9159afa9b974e6c364ee47aa1ee";
+const PINNED: &str = "f1663444bf686193967fab0511a75eaad4599c03369d188260cc34f84ee1f9ae";
+
+#[test]
+fn without_the_stops_asked_the_encoding_is_format_28() {
+    // Snapshot format 29 added the people asked to stop their route at the
+    // end.
+    assert_eq!(digest(&format_28_bytes(&world())), PINNED_28);
+}
+const PINNED_28: &str = "1e854596699af21756dd277d321f3e0068d1f9159afa9b974e6c364ee47aa1ee";
+
+/// The encoding of `world` as snapshot format 28 wrote it: without the
+/// people asked to stop their route ([`World::stops_asked`]) that format
+/// 29 added at the end. The older formats' encodings start from this one.
+fn format_28_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let asked = postcard::to_allocvec(&world.stops_asked).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - asked.len()), asked);
+    bytes
+}
 
 #[test]
 fn without_the_held_poses_the_encoding_is_format_27() {
@@ -450,9 +469,10 @@ const PINNED_26: &str = "d550ed76e8971864d5c06fe3fbcb810ff283b751659697240ff3066
 
 /// The encoding of `world` as snapshot format 27 wrote it: without the
 /// poses the load left in the skins ([`World::held_poses`]) that format 28
-/// added at the end. The older formats' encodings start from this one.
+/// added at the end. It starts from [`format_28_bytes`], and the older
+/// formats' encodings from this one.
 fn format_27_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_28_bytes(world);
     let held = postcard::to_allocvec(&world.held_poses).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - held.len()), held);
     bytes
@@ -460,7 +480,8 @@ fn format_27_bytes(world: &World) -> Vec<u8> {
 
 /// The encoding of `world` as snapshot format 26 wrote it: without the
 /// neighborhood's data words ([`World::neighborhood_data`]) that format
-/// 27 added at the end. The older formats' encodings start from this one.
+/// 27 added at the end. It starts from [`format_27_bytes`], and the older
+/// formats' encodings from this one.
 fn format_26_bytes(world: &World) -> Vec<u8> {
     let mut bytes = format_27_bytes(world);
     let data = postcard::to_allocvec(&world.neighborhood_data).unwrap();
@@ -1259,6 +1280,29 @@ fn snapshots_round_trip_through_redb() {
     );
     assert_eq!(store.load("later").unwrap().unwrap().ticks, world.ticks + 1);
     assert!(store.load("missing").unwrap().is_none());
+}
+
+#[test]
+fn saved_lots_round_trip_through_redb_apart_from_the_snapshots() {
+    let file = Temp::new("lots");
+    let world = world();
+    {
+        let store = Snapshots::open(&file.0).unwrap();
+        // No lot table yet: nothing is saved.
+        assert!(store.load_lot("slot").unwrap().is_none());
+        store.save("slot", &world).unwrap();
+        store.save_lot("slot", b"first").unwrap();
+        store.save_lot("slot", b"second").unwrap();
+    }
+    let store = Snapshots::open(&file.0).unwrap();
+    // The later save replaced the earlier, and the snapshot of the same
+    // name is its own.
+    assert_eq!(store.load_lot("slot").unwrap().unwrap(), b"second");
+    assert_eq!(
+        store.load("slot").unwrap().unwrap().encode(),
+        world.encode()
+    );
+    assert!(store.load_lot("missing").unwrap().is_none());
 }
 
 fn person() -> sims_formats::saved_objects::Person {
