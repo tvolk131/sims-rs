@@ -1056,6 +1056,16 @@ impl Painter<'_> {
                 // A held object stands on its holder's slot: the slot's
                 // height adds to the sprite's own.
                 let object = [part.object[0], part.object[1], part.object[2] + lift];
+                // The sprite's x and y offset move where it is drawn, as
+                // they move the object's position (0x437b7e: the original
+                // projects the moved position, 0x4b9991).
+                let screen = if part.object[0] == 0.0 && part.object[1] == 0.0 {
+                    screen
+                } else {
+                    let fine = part_fine(spot, facing, object);
+                    self.camera
+                        .project_fine(self.camera.rotate_fine(fine), level, ground)
+                };
                 let at = [
                     screen[0]
                         .saturating_add(part.offset[0])
@@ -1217,15 +1227,32 @@ fn place(depth: &Depth, camera: &Camera, view: [i32; 2], level: i32, height: f32
     depth.anchor(y, height, level)
 }
 
+/// The fine position of a draw group sprite that sits `object` away from
+/// an object at fine position `position` facing `facing` (data word 1).
+/// The offset's x and y are sixteenths of a tile in the object's own
+/// frame. The original turns them a quarter turn per two steps of facing
+/// and leaves both at 0 for an odd facing (0x439109), then adds them to
+/// the object's position and rounds, adding a half and truncating
+/// (0x437b7e, 0x4b9991).
+fn part_fine(position: [i32; 2], facing: i16, object: [f32; 3]) -> [i32; 2] {
+    let [mut x, mut y, _] = sprite_offset(object);
+    if facing & 1 != 0 {
+        return position;
+    }
+    for _ in 0..(i32::from(facing) / 2).rem_euclid(4) {
+        (x, y) = (-y, x);
+    }
+    [
+        (position[0] as f32 + x + 0.5) as i32,
+        (position[1] as f32 + y + 0.5) as i32,
+    ]
+}
+
 /// The depth anchor of a draw group sprite that sits `object` away from
-/// an object at fine position `position` facing `facing` (data word 1),
-/// on `level`, on ground `base` terrain steps up. The offset's x and y are
-/// sixteenths of a tile in the object's own frame, and turn with it a
-/// quarter turn per two steps of facing, as the old prototype turned them;
-/// z is in height units of 16 near-zoom pixels (2 << 3, as
-/// [`sprite_rise`]), the same as a terrain step. The old prototype read
-/// the same units (`legacy/crates/sims-render/src/lib.rs` divides x and y
-/// by 16 to get tiles).
+/// an object at fine position `position` facing `facing`, on `level`, on
+/// ground `base` terrain steps up: at [`part_fine`], raised by the
+/// offset's z, in height units of 16 near-zoom pixels (2 << 3, as
+/// [`sprite_rise`]), the same as a terrain step.
 fn part_anchor(
     depth: &Depth,
     camera: &Camera,
@@ -1235,14 +1262,8 @@ fn part_anchor(
     level: i32,
     base: f32,
 ) -> Anchor {
-    let [mut x, mut y, z] = sprite_offset(object);
-    for _ in 0..(i32::from(facing) / 2).rem_euclid(4) {
-        (x, y) = (-y, x);
-    }
-    let fine = [
-        position[0] + x.round() as i32,
-        position[1] + y.round() as i32,
-    ];
+    let z = sprite_offset(object)[2];
+    let fine = part_fine(position, facing, object);
     place(depth, camera, camera.rotate_fine(fine), level, base + z)
 }
 
@@ -1689,11 +1710,38 @@ mod tests {
         assert_eq!(part(0, 2, [16.0, 0.0, 0.0]), at(0, [100, 216], base));
         // The camera's rotation turns the moved point like any other.
         assert_eq!(part(1, 2, [16.0, 0.0, 0.0]), at(1, [100, 216], base));
+        // An odd facing leaves the offset out (0x439109).
+        assert_eq!(part(0, 1, [16.0, 0.0, 0.0]), at(0, [100, 200], base));
         // Nonsense in a file stays bounded.
         for bad in [f32::NAN, f32::INFINITY, f32::MAX, f32::MIN] {
+            let _ = part_fine(position, i16::MIN, [bad, bad, bad]);
             let _ = part_anchor(&d, &camera(3), position, i16::MIN, [bad, bad, bad], 1, base);
             let _ = sprite_rise([bad, bad, bad], Zoom::Near);
         }
+    }
+
+    /// A dining chair scooted in to the table draws its graphic 5, whose
+    /// sprite sits 4 units back along the chair's own y. The original
+    /// moves the drawn sprite by that, not only its depth (0x437b7e).
+    #[test]
+    fn a_sprite_offset_moves_the_fine_position_it_is_drawn_at() {
+        let position = [100, 200];
+        let scooted = [0.0, -4.0, 0.0];
+        assert_eq!(part_fine(position, 0, scooted), [100, 196]);
+        // Each two steps of facing turn (x, y) to (-y, x).
+        assert_eq!(part_fine(position, 2, scooted), [104, 200]);
+        assert_eq!(part_fine(position, 4, scooted), [100, 204]);
+        assert_eq!(part_fine(position, 6, scooted), [96, 200]);
+        assert_eq!(part_fine(position, 3, scooted), position);
+        // Rounded by adding a half and dropping the fraction.
+        assert_eq!(part_fine(position, 0, [0.0, -0.8, 0.0]), [100, 199]);
+        assert_eq!(part_fine(position, 0, [0.0, -2.4, 0.0]), [100, 198]);
+        assert_eq!(part_fine(position, 0, [0.5, 0.0, 0.0]), [101, 200]);
+        // It moves where the sprite is drawn on the screen.
+        let camera = camera(0);
+        let [moved, still] = [part_fine(position, 0, scooted), position]
+            .map(|f| camera.project_fine(camera.rotate_fine(f), 1, 0));
+        assert_ne!(moved, still);
     }
 
     #[test]
