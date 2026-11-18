@@ -545,15 +545,17 @@ class RunnerTest(RunnerBase):
         self.assertEqual(self.rows('pie')[-1]['entries'][0]['label'], 'Go Here')
         self.assertEqual(self.rows('wrong_menu')[0]['targets'], [29])
 
-    def test_a_dialog_while_the_pie_window_fills_ends_the_wait(self):
+    def test_choose_presses_only_the_item_it_moved_to(self):
         g = self.g
-        g.open_pie(['Sit'], target=self.bench, caller=self.person)
-        g.m.put_words(g.pies[0] + 0x190, 0, 0)
-        r = self.runner('choose Sit\nanswer-dialog 400 400')
-        self.tick(r, 3)
-        self.assertFalse(r.finished)
-        r.on_dialog('dialog_show', self.update + 1)  # no update returns while it is up
-        self.assertIn('a dialog showed', r.failed)
+        g.open_pie(['Talk...', 'Dance...'], target=self.person, caller=self.person, submenus=('Talk...', 'Dance...'))
+        r = self.runner('choose Talk...\nwait 1')
+        self.tick_until(r, lambda: 'mousemove' in self.last_command())
+        # Another menu takes the window while the move settles; its first item is highlighted.
+        g.open_pie(['Hug...'], target=self.person, caller=self.person, submenus=('Hug...',))
+        g.highlight(0)
+        self.tick_until(r, lambda: r.finished, most=100)
+        self.assertIn('not highlighted', r.failed)
+        self.assertFalse(any('mousedown' in c for c in self.agent.commands))
 
     def test_an_item_by_its_place(self):
         items = [dict(label='Joke'), dict(label='Gossip')]

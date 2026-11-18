@@ -505,15 +505,6 @@ class UntilPush:
         self.pushes = pushes
 
 
-class UpdateOrDialog:
-    """Yielded by a step: go on at the next update return, or at the next
-    dialog_show stop once more than `shows` have been seen (a modal dialog
-    stops update returns, so a wait on memory would never end)."""
-
-    def __init__(self, shows):
-        self.shows = shows
-
-
 class Runner:
     """Runs a scenario from capture.py's stops.
 
@@ -622,7 +613,7 @@ class Runner:
                     return
                 self.write(kind='command_wait_ended', id=n, reason='dialog_show', in_update=update)
                 self.waiting = None
-            if self.waiting and self.waiting[0] not in ('event', 'job', 'push', 'update_or_dialog', 'drain'):
+            if self.waiting and self.waiting[0] not in ('event', 'job', 'push', 'drain'):
                 return
             self.tick(at_update=False)
         except Exception as e:
@@ -692,9 +683,6 @@ class Runner:
             elif kind == 'push':
                 if not at_update and len(self.pushes) <= self.waiting[1]:
                     return
-            elif kind == 'update_or_dialog':
-                if not at_update and self.count('dialog_show') <= self.waiting[1]:
-                    return
             elif kind == 'drain':
                 if self.unchecked:
                     return
@@ -754,9 +742,6 @@ class Runner:
             elif isinstance(want, Updates):
                 if want.n > 0:
                     self.waiting = ('updates', want.n)
-            elif isinstance(want, UpdateOrDialog):
-                if self.count('dialog_show') <= want.shows:
-                    self.waiting = ('update_or_dialog', want.shows)
             elif isinstance(want, UntilPush):
                 if len(self.pushes) <= want.pushes:
                     self.waiting = ('push', want.pushes)
@@ -922,29 +907,20 @@ class Runner:
     def wait_pie(self, most):
         """The pie on the screen, waiting while the picker has entries but the
         pie's window shows no items yet (it fills an update or so later)."""
-        shows = self.count('dialog_show')
         for _ in range(most):
             pie = read_pie(self.m)
             if pie or not read_entries(self.m):
                 return pie
-            yield from self.next_update(shows)
+            yield Updates(1)
         return read_pie(self.m)
 
     def wait_entries(self, most):
-        shows = self.count('dialog_show')
         for _ in range(most):
             entries = read_entries(self.m)
             if entries:
                 return entries
-            yield from self.next_update(shows)
+            yield Updates(1)
         return []
-
-    def next_update(self, shows):
-        """Wait for the next update return; fail if a dialog shows first (no
-        update returns while it is up, and the pie menu is not being opened)."""
-        yield UpdateOrDialog(shows)
-        if self.count('dialog_show') > shows:
-            raise StepFailed('a dialog showed while the pie menu opened')
 
     def close_pie(self):
         yield Job('key', key_command('Escape'), key='Escape')
@@ -998,7 +974,7 @@ class Runner:
         yield Fresh()
         for _ in range(60):  # the game takes the move late
             pie = read_pie(self.m)
-            if pie and pie['highlighted'] == i:
+            if pie and pie['highlighted'] == i < len(pie['items']) and pie['items'][i]['label'] == item['label']:
                 break
             yield Updates(1)
         else:

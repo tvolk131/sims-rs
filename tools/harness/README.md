@@ -275,6 +275,12 @@ How the checks work (the addresses are in `input.py`):
   `answer-dialog` runs on the dialog stops. It presses once, like
   `answer.sh`. If the game misses the press, the step waits until the dialog
   is answered some other way (for example with `answer.sh`).
+  A step that waits on memory (`wait`, `until`, aiming, the pie menu's
+  waits) waits on update returns, so a dialog the scenario did not open
+  (the carpool, a visitor) holds it until the dialog is answered: run
+  captures with `--answer-stuck` for those. The menu may have closed by
+  then; `choose` presses an item only while the menu shows it highlighted
+  under the same label.
 - **Buy mode.** `expect-mode` reads the lot's mode word (lot `+0x36`: 0 in
   live mode, 2 in buy mode). In buy mode the lot update still returns,
   without advancing time, so the steps go on there. `expect-new-object`
