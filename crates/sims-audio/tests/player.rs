@@ -2147,6 +2147,52 @@ fn a_camera_move_does_not_follow_a_target_a_later_start_reset() {
 }
 
 #[test]
+fn a_camera_move_reaches_a_target_whose_script_has_ended() {
+    // Track 11 (object 8, which stays in the middle) plays a long note,
+    // waits and ends while the note plays on. Track 10 (object 9) starts
+    // while it waits, sets its `target` to track 11 and loops. The camera
+    // move places track 11 itself, then track 10's write goes through its
+    // `target` to track 11's track object, which outlives its script:
+    // with object 9 at the right edge, the note turns right (Sol's
+    // review).
+    let mut ended = NOTE_ON_V1.to_vec();
+    ended.extend(loadl(5, 10));
+    ended.extend([WAIT, 5, END]);
+    let mut targets = loadl(53, 11);
+    targets.extend([SET_LOOP, LOOP]);
+    let start = on_lot(&[(8, 400), (9, 400)]);
+    let right = on_lot(&[(8, 400), (9, 800)]);
+    for moved in [true, false] {
+        let mut player = Player::new(
+            vec![module(&[&targets, &ended], 1)],
+            long_sample("one.xa"),
+            1,
+        );
+        let play = |player: &mut Player<_>, object: u32, name: &str| {
+            player.handle(
+                &SoundEvent::Play {
+                    object,
+                    name: name.into(),
+                },
+                &start,
+            );
+        };
+        play(&mut player, 8, "e1");
+        player.render(BLOCK, &start);
+        play(&mut player, 9, "e0");
+        player.render(7 * BLOCK, &start);
+        if moved {
+            player.camera_moved(0, u32::MAX, &right);
+        }
+        let out = player.render_stereo(2 * BLOCK, &right);
+        let last = out.len() - 2;
+        assert_ne!(out[last], 0);
+        assert_eq!(out[last + 1] > out[last], moved, "{:?}", &out[last..]);
+        assert!(player.faults.is_empty(), "{:?}", player.faults);
+    }
+}
+
+#[test]
 fn a_camera_move_places_a_sequenced_note_with_no_thread() {
     // Track 10's routine ends at once, so kind 53 plays its long patch
     // on the idle track object (thread 0). Started in the middle of the

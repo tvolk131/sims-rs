@@ -23,6 +23,12 @@ kind 33 only when the camera moves, and the player does the whole case.
     it goes to the thread the track's last start made, which stands for
     the original's one track object (see below), and on through its
     `target`. A fade in progress goes on from the new volume.
+  - The `target` chain reaches a thread whose script has ended while
+    its notes play on, as the original's pointer reaches a track object
+    that outlives its script, and those notes take the write at once.
+    This holds for every register access through `target`, the
+    scripts' own too. A link to a thread with nothing left playing
+    still stops the chain (**unverified**, as before).
   - The original's track object outlives its script. A note started
     with `note_on` then `end` plays on, and the write reaches that note
     too. Here a thread that ends with notes still playing keeps its
@@ -89,6 +95,9 @@ kind 33 only when the camera moves, and the player does the whole case.
   the new one waits or ends at once, or it still runs while the new one
   ended with a note playing, or the new start let a held thread go: the
   other track keeps its levels.
+- A write through a `target` whose script has ended reaches its note
+  still playing: placed by another track's object at the right edge,
+  it turns right.
 - A track whose thread has ended and left no note gets nothing, and its
   next start is placed afresh.
 - The Goths' lot plays with the camera scrolling every second.
