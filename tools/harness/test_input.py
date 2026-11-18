@@ -530,6 +530,31 @@ class RunnerTest(RunnerBase):
         self.tick_until(r, lambda: 'mousedown' in self.last_command())
         self.assertIsNone(r.failed)
 
+    def test_click_object_checks_the_menu_its_window_shows(self):
+        g = self.g
+        floor = g.add_object(29, [0, 0])
+        g.hover(173)
+        r = self.runner('click-object 173\nwait 1')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        g.open_pie(['Sit'], target=self.bench, caller=self.person)
+        g.m.put_words(g.pies[0] + 0x190, 0, 0)  # the bench's entries; its window shows nothing yet
+        self.tick(r, 8)
+        self.assertFalse(self.rows('pie'))
+        g.open_pie(['Go Here'], target=floor, caller=self.person)  # the menu that fills is the floor's
+        self.tick_until(r, lambda: self.rows('wrong_menu'))
+        self.assertEqual(self.rows('pie')[-1]['entries'][0]['label'], 'Go Here')
+        self.assertEqual(self.rows('wrong_menu')[0]['targets'], [29])
+
+    def test_a_dialog_while_the_pie_window_fills_ends_the_wait(self):
+        g = self.g
+        g.open_pie(['Sit'], target=self.bench, caller=self.person)
+        g.m.put_words(g.pies[0] + 0x190, 0, 0)
+        r = self.runner('choose Sit\nanswer-dialog 400 400')
+        self.tick(r, 3)
+        self.assertFalse(r.finished)
+        r.on_dialog('dialog_show', self.update + 1)  # no update returns while it is up
+        self.assertIn('a dialog showed', r.failed)
+
     def test_an_item_by_its_place(self):
         items = [dict(label='Joke'), dict(label='Gossip')]
         self.assertEqual((inp.match_item(items, '@1'), inp.match_item(items, '@2'), inp.match_item(items, 'gossip')),
