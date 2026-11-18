@@ -864,3 +864,159 @@ fn a_route_with_no_context_or_no_object_gives_false() {
     assert_eq!(go_to(&mut fx, me), Ok(false));
     assert!(!fx.world.routing.routes.contains_key(&me));
 }
+
+/// The lot with `me` part way through a route to the lamp's slot 0: its
+/// thread is at Go To Routing Slot in step `step`, with the lamp as stack
+/// object and the route's context made, and its animator arriving as
+/// `arrival` (1 or -1: under way, so it may not stop).
+fn mid_route(step: i32, arrival: i32) -> (Fixture, u16) {
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    let guid = fx.world.objects[&me].guid;
+    let file = fx.catalog.object(guid).unwrap().resource;
+    fx.add(
+        file,
+        TREE,
+        tree(vec![ins(
+            GO_TO_SLOT,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, 1, 0, 0, 0, 0, 0],
+        )]),
+    );
+    fx.thread(me, TREE, &[]);
+    let frame = &mut fx.world.objects.get_mut(&me).unwrap().stack[0];
+    frame.stack_object = LAMP as i16;
+    frame.primitive_state = step;
+    let mut ctx = crate::visits::context(me);
+    ctx.byte_78 = true;
+    fx.world.routing.routes.insert(
+        me,
+        sims_sim::route::Route {
+            contexts: vec![ctx],
+            path: Vec::new(),
+        },
+    );
+    fx.world.animators.insert(
+        me,
+        sims_sim::animator::Animator {
+            arrival,
+            ..sims_sim::animator::LOADED
+        },
+    );
+    (fx, me)
+}
+
+fn turn(fx: &mut Fixture, me: u16) -> Result<sims_vm::Status, sims_vm::Fault> {
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.turn(&mut fx.world, me, 100)
+}
+
+#[test]
+fn a_route_whose_stack_object_is_lost_fails() {
+    // 0x45ae8d: on a later run, a stack object that is gone, or off the
+    // lot, sends a route not under way to step 19, which fails it
+    // (0x45afc4) at once: unlike step 20, it does not wait for an
+    // animator that is under way. The route ends with result 1, the false
+    // branch, and its context goes; the end of the route asks the
+    // animator to stop (0x589e2d), and the request is kept.
+    for off in [false, true] {
+        let (mut fx, me) = mid_route(1, 1);
+        if off {
+            fx.lamp_mut().position = [-16, -16, 1];
+        } else {
+            fx.world.objects.remove(&LAMP);
+            fx.world.order.retain(|&id| id != LAMP);
+        }
+        assert_eq!(
+            turn(&mut fx, me),
+            Ok(sims_vm::Status::Returned(false)),
+            "{off}"
+        );
+        assert!(fx.world.routing.routes[&me].contexts.is_empty(), "{off}");
+        assert_eq!(route_result(&fx, me), 1, "{off}");
+        assert!(fx.world.stops_asked.contains(&me), "{off}");
+    }
+}
+
+#[test]
+fn a_route_under_way_whose_stack_object_is_lost_stops_its_animator_first() {
+    // Step 3 goes to step 20 (0x45b352): the animator is asked to stop
+    // (0x589e2d). One under way (arrival 1) does not, so the run yields
+    // in step 20 and the request is kept.
+    let (mut fx, me) = mid_route(3, 1);
+    fx.world.objects.remove(&LAMP);
+    fx.world.order.retain(|&id| id != LAMP);
+    assert_eq!(turn(&mut fx, me), Ok(sims_vm::Status::Yielded));
+    assert_eq!(fx.world.objects[&me].stack[0].primitive_state, 20);
+    assert!(fx.world.stops_asked.contains(&me));
+    assert_eq!(fx.world.routing.routes[&me].contexts.len(), 1);
+    // Once it may stop, it stops and the route fails through step 19.
+    fx.world.animators.get_mut(&me).unwrap().arrival = 0;
+    assert_eq!(turn(&mut fx, me), Ok(sims_vm::Status::Returned(false)));
+    assert_eq!(fx.world.animators[&me].state, 3);
+    assert!(fx.world.routing.routes[&me].contexts.is_empty());
+}
+
+/// Another person, whom the route of `mid_route` asked (context +0x80) to
+/// do its action numbered 77 (+0x90).
+const ASKED: u16 = 60;
+
+fn asked_to_move(fx: &mut Fixture, me: u16) {
+    let asked = fx.add_sim(ASKED);
+    let person = asked.person.as_mut().unwrap();
+    person.data[33] = 40;
+    let ctx = fx.world.routing.routes.get_mut(&me).unwrap();
+    let ctx = ctx.contexts.last_mut().unwrap();
+    ctx.objects[1] = ASKED;
+    ctx.action = 77;
+}
+
+#[test]
+fn a_route_ending_while_the_asked_person_runs_the_action_cancels_it() {
+    // 0x45b914 calls the asked person's 0x45d5f8 with the action's
+    // number; the person runs it (+0xa84), so 0x45d617 lowers its
+    // priority (person word 33) to 0 and sets the running action's flag
+    // 0x100, as the player's cancel of a running action does.
+    let (mut fx, me) = mid_route(1, 0);
+    fx.world.objects.remove(&LAMP);
+    asked_to_move(&mut fx, me);
+    let asked = fx.world.objects.get_mut(&ASKED).unwrap();
+    let person = asked.person.as_mut().unwrap();
+    person.active.uid = 77;
+    let flags = person.active.flags;
+    assert_eq!(turn(&mut fx, me), Ok(sims_vm::Status::Returned(false)));
+    let person = fx.world.objects[&ASKED].person.as_ref().unwrap();
+    assert_eq!(person.data[33], 0);
+    assert_eq!(person.active.flags, flags | 0x100);
+    assert_eq!(person.active.uid, 77);
+    // The Sim's interaction table has no entry with menu number 33
+    // (0x41f0ff), so nothing is queued.
+    assert!(person.queue.is_empty());
+}
+
+#[test]
+fn a_route_ending_takes_the_asked_action_off_the_queue() {
+    // 0x45d66e: queued, the action is dropped; the running one is left.
+    let (mut fx, me) = mid_route(1, 0);
+    fx.world.objects.remove(&LAMP);
+    asked_to_move(&mut fx, me);
+    let person = fx
+        .world
+        .objects
+        .get_mut(&ASKED)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person.active.uid = 76;
+    let mut queued = person.active.clone();
+    queued.uid = 77;
+    queued.target = 0;
+    person.queue.push(queued);
+    let flags = person.active.flags;
+    assert_eq!(turn(&mut fx, me), Ok(sims_vm::Status::Returned(false)));
+    let person = fx.world.objects[&ASKED].person.as_ref().unwrap();
+    assert!(person.queue.is_empty());
+    assert_eq!((person.active.uid, person.active.flags), (76, flags));
+    assert_eq!(person.data[33], 40);
+}
