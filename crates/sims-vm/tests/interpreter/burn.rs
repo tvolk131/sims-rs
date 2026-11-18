@@ -269,7 +269,12 @@ fn a_gathered_person_resets_and_moves_to_its_tiles_centre() {
     let people = resident(&mut fx);
     fx.program.people = people;
     // The person's Reset tree notes 6 in the lamp's attribute 5.
-    fx.world.objects.get_mut(&LAMP).unwrap().attributes.resize(8, 0);
+    fx.world
+        .objects
+        .get_mut(&LAMP)
+        .unwrap()
+        .attributes
+        .resize(8, 0);
     let sim = fx.world.objects.get_mut(&PERSON).unwrap();
     sim.position = [50, 61, 1];
     sim.data[FLAGS] = 0;
