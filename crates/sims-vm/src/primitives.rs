@@ -5,6 +5,7 @@
 mod action_string;
 mod animate;
 mod budget;
+mod burn;
 mod change_suit;
 mod create;
 mod debug;
@@ -43,6 +44,7 @@ mod sleep;
 mod snap;
 mod sound;
 mod special_effect;
+mod worst_motives;
 
 pub(crate) use distance::distance;
 
@@ -131,6 +133,7 @@ impl Machine<'_, '_> {
             6 => self.change_suit(operands)?.into(),
             7 => self.refresh(operands)?.into(),
             8 => self.random(operands)?.into(),
+            9 => self.burn(operands)?.into(),
             10 => self.own_events(operands)?.into(),
             11 => self.get_distance_to(operands)?.into(),
             12 => self.get_direction_to(operands)?.into(),
@@ -161,6 +164,7 @@ impl Machine<'_, '_> {
             47 => self.reach(operands)?,
             48 => self.stop_all_sounds(operands)?.into(),
             32 => self.test_object_type(operands)?.into(),
+            33 => self.find_worst_motives(operands)?.into(),
             35 => self.special_effect(operands)?,
             36 => self.dialog(operands)?,
             37 => self.sim_interacting_with(operands)?.into(),
