@@ -24,8 +24,11 @@ precision.
   Aries, Libra and Virgo, Cancer. They are sign numbers, kept in the
   code as the signs' trait profiles are (`household.rs`). The strings
   are read from the install at run time and are never kept in the
-  repo. If UIText.iff is missing, or a table is missing or does not
-  parse, those strings are left empty and the HUD still opens.
+  repo. A table that is missing or does not parse leaves its strings
+  empty, and the HUD still opens. UIText.iff itself the game needs for
+  its dialogs' labels, as the viewer does when a dialog is pending; with
+  none pending, the viewer opens without it, and the sign has no name
+  to press.
 - **The press** (0x51bfb3): the control is the sign's name, sized to it
   (0x51cd7f..0x51cdfe: x 5 and y the line plus 5 above the subpanel's
   bottom, as wide as the text and as tall as the line). `layout` cannot
