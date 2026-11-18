@@ -491,9 +491,9 @@ impl Interpreter<'_> {
     /// tile of a group takes what is left of its group off
     /// ([`Interpreter::take_off`], 0x422d86), so each of its tiles is
     /// asked function 10 again; any other object leaves as on its way to
-    /// deletion ([`Interpreter::leave_lot_to_delete`]). Any other is rebuilt ([`Interpreter::rebuild`]):
-    /// taken off the lot, its storage reset, its Init and a first turn
-    /// run, and put back where it was.
+    /// deletion ([`Interpreter::leave_lot_to_delete`]). Any other is
+    /// rebuilt ([`Interpreter::rebuild`]): taken off the lot, its storage
+    /// reset, its Init and a first turn run, and put back where it was.
     ///
     /// Either way the scheduler's countdown for the object is dropped, its
     /// sounds are stopped (0x4320b4, [`crate::sounds`]), and the object
