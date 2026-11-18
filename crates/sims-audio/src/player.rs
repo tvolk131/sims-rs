@@ -1450,8 +1450,9 @@ impl<S: Samples> Player<S> {
     /// start, writes it: `extvol`, then `pan`, through its `target`
     /// (0x57de57). The original's pointer reaches a track object that
     /// outlives its script, so the chain goes on into a thread whose
-    /// script has ended while its notes play, and those notes take the
-    /// placement at once. A thread on the way that is not its track's
+    /// script has ended while its notes play. Only the thread the chain
+    /// ends at takes the placement, and if it has ended its notes take
+    /// it at once; a thread that passes it on keeps its levels. A thread on the way that is not its track's
     /// last start takes the placement itself: a later start set the
     /// original's track object's `target` back to itself. Script reads
     /// and writes do not follow ended threads ([`Player::resolve`]).

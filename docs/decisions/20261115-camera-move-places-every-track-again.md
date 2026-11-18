@@ -25,8 +25,8 @@ kind 33 only when the camera moves, and the player does the whole case.
     `target`. A fade in progress goes on from the new volume.
   - The write's `target` chain reaches a thread whose script has ended
     while its notes play on, as the original's pointer reaches a track
-    object that outlives its script, and those notes take the write at
-    once. A link to a thread with nothing left playing still stops the
+    object that outlives its script. When the chain ends there, those
+    notes take the write at once. A link to a thread with nothing left playing still stops the
     chain (**unverified**, as before).
   - Only the thread the write lands in takes the new levels. A thread
     that passes the write on through its `target` keeps the levels its
