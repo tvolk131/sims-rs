@@ -361,6 +361,53 @@ fn mode_5_puts_the_new_object_where_the_running_object_stands() {
     assert_eq!(ids(&fx), before);
 }
 
+#[test]
+fn mode_0_puts_the_new_object_on_the_tile_ahead_of_me() {
+    // 0x44e1e6: my position moves one tile in my facing (0x42228a): word
+    // 0 by [0, 1, 1, 1, 0, -1, -1, -1], word 1 by [-1, -1, 0, 1, 1, 1, 0,
+    // -1]. Unlike mode 9, a diagonal is not my own tile, and no wall is
+    // tested: facing 0's tile (2, 1) is walled off from the lamp.
+    for (facing, place) in [
+        (0, [40, 24]),
+        (1, [56, 24]),
+        (2, [56, 40]),
+        (3, [56, 56]),
+        (4, [40, 56]),
+        (6, [24, 40]),
+        (8, [40, 24]),
+    ] {
+        let (mut fx, _) = container();
+        fx.lamp_mut().data[1] = facing;
+        let before = ids(&fx);
+        assert_eq!(create(&mut fx, 0, 0, 0), Ok(true), "{facing}");
+        let id = new_object(&fx, &before);
+        let widget = &fx.world.objects[&id];
+        assert_eq!(widget.position, [place[0], place[1], 1], "{facing}");
+        assert_eq!(widget.data[2], 0);
+    }
+    // Off the lot, nothing is made: tile (1, -1).
+    let (mut fx, _) = container();
+    fx.lamp_mut().position = [24, 8, 1];
+    fx.lamp_mut().data[1] = 0;
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 0, 0, 0), Ok(false));
+    assert_eq!(ids(&fx), before);
+}
+
+#[test]
+fn flag_0x8_makes_nothing_on_a_tile_where_anything_stands() {
+    // 0x44e51e: a free tile takes the new object; once it stands there,
+    // a second one is refused before it is made.
+    let (mut fx, _) = container();
+    fx.lamp_mut().data[1] = 2;
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 0, 0x8, 0), Ok(true));
+    let made = ids(&fx);
+    assert_eq!(made.len(), before.len() + 1);
+    assert_eq!(create(&mut fx, 0, 0x8, 0), Ok(false));
+    assert_eq!(ids(&fx), made);
+}
+
 /// Runs the lamp's tree 4096: local 0 is set to `turn`, then Create New
 /// Object Instance of the widget in mode 9, its turn from local 0.
 fn create_in_front(fx: &mut Fixture, turn: i16) -> Result<bool, sims_vm::Fault> {
@@ -510,7 +557,7 @@ fn what_mode_4_does_not_port_fails_loudly() {
         assert_eq!(ids(&fx), before, "word {word}");
     }
     // The modes not ported.
-    for mode in [0, 1, 3, 7, 10, 15] {
+    for mode in [1, 3, 7, 10, 15] {
         let (mut fx, _) = container();
         let result = create(&mut fx, mode, 0, LAMP as i16);
         assert!(
@@ -534,15 +581,18 @@ fn mode_6_with_flag_0x20_keeps_a_new_object_that_already_faces_right() {
     // With no stack object nothing turns.
     let (mut fx, _) = container();
     assert_eq!(create(&mut fx, 6, 0x21, 0), Ok(true));
+    // The stack object faces 2, but the widget's turn step (data word 23)
+    // is 0, so its turn (0x433f75) changes nothing, four times over.
+    let (mut fx, _) = container();
+    fx.lamp_mut().data[1] = 2;
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 6, 0x20, LAMP as i16), Ok(true));
+    let id = new_object(&fx, &before);
+    assert_eq!(fx.world.objects[&id].data[1], 0);
 }
 
 #[test]
 fn what_mode_6_does_not_port_fails_loudly() {
-    // A turn (0x433f75): the stack object faces 2.
-    let (mut fx, _) = container();
-    fx.lamp_mut().data[1] = 2;
-    let result = create(&mut fx, 6, 0x20, LAMP as i16);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x433f75")));
     // Other flags. (A person, and flag 0x4: `create_person`.)
     for flags in [0x2, 0x8, 0x40] {
         let (mut fx, _) = container();

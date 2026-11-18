@@ -20,9 +20,9 @@
 //!   route (0x589c85) and the primitive state becomes 1. Then, on that
 //!   run and the later ones, the animator's route result (0x589d47):
 //!   while it is under way (2) the thread yields; else the animator
-//!   stops (0x589e2d) and the branch is true. Mode 1, which reads the
-//!   camera's rotation (0x47bc1f) and clears object data word 9, is not
-//!   ported and fails loudly.
+//!   stops (0x589e2d) and the branch is true. Mode 1 reads no stack
+//!   object: its point is one tile towards the camera
+//!   ([`camera_point`]), and it clears object data word 9 (0x45ab66).
 //! - Any other mode is native error 0x27.
 //!
 //! The old prototype's `request_turn` (legacy/crates/sims-vm/src/look.rs)
@@ -32,10 +32,27 @@
 use crate::animator::ask_stop;
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine, word};
+use crate::primitives::find_location::turn_in_square;
 
 /// Person data words the head's target is kept in (person +0x5de to
 /// +0x5e6, data at +0x58c).
 const HEAD_TARGET: usize = 41;
+/// The object data word mode 1 clears (+0x5c, 0x45ab66).
+const CLEARED: usize = 9;
+
+/// Mode 1's point to face, one tile towards the camera, as a path point
+/// (the second coordinate first), for a person at `[x, y]` with the view
+/// turned `rotation` quarter turns (the world's +0x84,
+/// [`crate::Interpreter::view_rotation`]): the position is turned by the
+/// rotation within the square of 0x400 (0x47bc1f, its first argument the
+/// first coordinate), a tile (16, 16) is added (0x422022 with 1, 1), and
+/// the sum is turned back by (-rotation) & 3.
+fn camera_point([x, y]: [i32; 2], rotation: u8) -> [i32; 2] {
+    let rotation = i32::from(rotation);
+    let [x, y] = turn_in_square([x, y], rotation);
+    let [x, y] = turn_in_square([x.wrapping_add(16), y.wrapping_add(16)], (-rotation) & 3);
+    [y, x]
+}
 
 impl Machine<'_, '_> {
     pub(crate) fn look_towards(&mut self, operands: &[u8; 8]) -> Result<Flow, Trap> {
@@ -80,11 +97,15 @@ impl Machine<'_, '_> {
                 return Ok(Flow::Branch(false));
             }
             if mode == 1 {
-                return Err(Trap::Unsupported(
-                    "Look Towards in mode 1, a turn towards the camera (0x47bc1f), which is not \
-                     ported"
-                        .into(),
-                ));
+                // 0x45aab9 to 0x45ab66.
+                let own = self.me()?.position;
+                let at = [own[1], own[0]];
+                let to = camera_point([own[0], own[1]], self.view_rotation);
+                self.world.routing.routes.entry(me).or_default().path = vec![at, at, to];
+                self.set_datum(CLEARED, 0)?;
+                interpreter.start_route(self.world, me)?;
+                self.frame_mut()?.primitive_state = 1;
+                return self.turn_result();
             }
             let target = self.frame()?.stack_object;
             let target = u16::try_from(target)
@@ -105,6 +126,14 @@ impl Machine<'_, '_> {
             interpreter.start_route(self.world, me)?;
             self.frame_mut()?.primitive_state = 1;
         }
+        self.turn_result()
+    }
+
+    /// The animator's route result, on every run of modes 1 to 3
+    /// (0x45ab80 to 0x45abad).
+    fn turn_result(&mut self) -> Result<Flow, Trap> {
+        let me = self.me;
+        let interpreter = self.interpreter();
         let mut result = interpreter.route_result(self.world, me)?;
         if result == 0 {
             result = 1;

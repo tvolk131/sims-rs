@@ -374,20 +374,53 @@ fn mode_8_needs_a_local_naming_an_object() {
     assert_eq!(fx.world.objects.len(), before);
 }
 
-#[test]
-fn flag_0x20_turns_the_new_object_only_when_it_already_faces_right() {
-    let (mut fx, _) = placeable();
+/// [`placeable`] whose widget's Init also sets its turn step (data word
+/// 23) to `step`, with the lamp on tile (2, 2) and the Sim facing
+/// `facing`.
+fn turning(step: i16, facing: i16) -> Fixture {
+    let (mut fx, file) = placeable();
+    fx.add(
+        file,
+        4096,
+        tree(vec![
+            assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+            assign(scope::MY_DATA, 42, scope::LITERAL, 2, 2),
+            assign(scope::MY_DATA, 23, scope::LITERAL, step, RETURN_TRUE),
+        ]),
+    );
     fx.lamp_mut().position = [40, 40, 1];
+    fx.sim_mut().data[1] = facing;
+    fx
+}
+
+/// The facing of the object `create` made with flag 0x20 and the Sim as
+/// the stack object.
+fn made_facing(mut fx: Fixture) -> i16 {
+    let before: Vec<u16> = fx.world.objects.keys().copied().collect();
+    assert_eq!(create(&mut fx, 0, 0x20, SIM as i16), Ok(true));
+    let (_, made) = fx
+        .world
+        .objects
+        .iter()
+        .find(|(id, _)| !before.contains(id))
+        .unwrap();
+    made.data[1]
+}
+
+#[test]
+fn flag_0x20_turns_the_new_object_by_its_turn_step_to_the_stack_objects_facing() {
     // The stack object faces 1; with the lowest bit cleared that is the
     // new object's facing 0, so nothing turns.
-    fx.sim_mut().data[1] = 1;
-    assert_eq!(create(&mut fx, 0, 0x20, SIM as i16), Ok(true));
-    // Facing 3 asks for 2: turning is not ported.
-    let (mut fx, _) = placeable();
-    fx.lamp_mut().position = [40, 40, 1];
-    fx.sim_mut().data[1] = 3;
-    let result = create(&mut fx, 0, 0x20, SIM as i16);
-    assert!(matches!(trap(result), Trap::Unsupported(m) if m.contains("0x433f75")));
+    assert_eq!(made_facing(turning(2, 1)), 0);
+    // Facing 3 asks for 2: one turn of 2 (0x433f75).
+    assert_eq!(made_facing(turning(2, 3)), 2);
+    // A turn step of 6 takes three turns: 6, 4, then 2.
+    assert_eq!(made_facing(turning(6, 2)), 2);
+    // Facing 7 asks for 6: four turns of 1 reach only 4, and the object
+    // is put down as it is.
+    assert_eq!(made_facing(turning(1, 7)), 4);
+    // A turn step of 0 turns nothing.
+    assert_eq!(made_facing(turning(0, 4)), 0);
 }
 
 #[test]
@@ -838,4 +871,40 @@ fn mode_5_turns_its_start_by_the_inverse_of_the_view() {
             "view {rotation}"
         );
     }
+}
+
+/// Places a widget, the widgets being seats (function 26), on tile (2, 3)
+/// facing back along position word 1, toward tile (2, 2); then makes the
+/// lot `size` tiles wide and places another on tile (2, 2). Gives whether
+/// the second was told that a seat faces it (data word 8 flag 0x100).
+fn faced_by_a_seat(size: i16) -> bool {
+    let (mut fx, file) = placeable();
+    let library = fx.program.libraries.get_mut(&file).unwrap();
+    for table in library.callbacks.values_mut() {
+        table.resize_with(27, || sims_formats::execution::ObjectFunction {
+            condition: 0,
+            action: 0,
+        });
+        table[26].action = 4096;
+    }
+    let (seat, other) = (widget(&mut fx), widget(&mut fx));
+    fx.lamp_mut().position = [40, 56, 1];
+    assert_eq!(find(&mut fx, LAMP as i16, seat, 1), Ok(true));
+    assert_eq!(fx.world.objects[&seat].position, [40, 56, 1]);
+    assert_eq!(fx.world.objects[&seat].data[1], 0);
+    fx.world.size = size;
+    fx.lamp_mut().position = [40, 40, 1];
+    assert_eq!(find(&mut fx, LAMP as i16, other, 1), Ok(true));
+    assert_eq!(fx.world.objects[&other].position, [40, 40, 1]);
+    fx.world.objects[&other].data[8] & 0x100 != 0
+}
+
+#[test]
+fn a_seat_outside_the_lots_size_faces_nothing() {
+    // The pass over the tiles beside one (0x433612) skips a tile outside
+    // the lot's border, by the lot's size (+0x10; 0x4336c8 to 0x4336eb),
+    // not by the arrays' 64.
+    assert!(faced_by_a_seat(5));
+    // Four tiles wide, tile (2, 3) is on the border.
+    assert!(!faced_by_a_seat(4));
 }
