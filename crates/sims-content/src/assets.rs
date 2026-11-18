@@ -214,12 +214,7 @@ fn resolve(root: &Path, relative: &str) -> Option<PathBuf> {
         }
         // The first match in name order, so the choice doesn't depend on
         // the order the filesystem lists names in.
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(&path)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .collect();
-        entries.sort();
+        let entries = crate::index::sorted_entries(&path).ok()?;
         path = entries.into_iter().find(|p| {
             p.file_name()
                 .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(part))
@@ -231,15 +226,7 @@ fn resolve(root: &Path, relative: &str) -> Option<PathBuf> {
 /// Every file under `directory`, depth first, each directory's entries in
 /// ASCII-uppercase name order.
 fn list(directory: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = std::fs::read_dir(directory).map_err(|e| format!("{directory:?}: {e}"))?;
-    let mut paths = Vec::new();
-    for entry in entries {
-        paths.push(entry.map_err(|e| format!("{directory:?}: {e}"))?.path());
-    }
-    paths.sort_by_cached_key(|p| {
-        let name = p.file_name().unwrap_or_default().as_encoded_bytes();
-        (name.to_ascii_uppercase(), name.to_vec())
-    });
+    let paths = crate::index::sorted_entries(directory).map_err(|e| e.to_string())?;
     for path in paths {
         if path.is_dir() {
             list(&path, out)?;

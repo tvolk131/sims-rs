@@ -14,9 +14,7 @@ fn the_complete_collections_counts() {
         return;
     };
     let assets = Assets::scan(std::path::Path::new(&root)).unwrap();
-    let started = std::time::Instant::now();
     let wardrobe = Wardrobe::load(&assets);
-    eprintln!("wardrobe read in {:?}", started.elapsed());
     assert_eq!(wardrobe.errors, Default::default());
     // (head, female, child): lgt, med, drk.
     let table = [
