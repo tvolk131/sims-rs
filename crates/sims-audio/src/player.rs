@@ -828,7 +828,9 @@ impl<S: Samples> Player<S> {
     /// start counts: the newest thread let go). A later start set the
     /// original's track object's `target` back to itself, so an older
     /// thread takes the write itself, ended or the newest still running
-    /// when the last start's has gone. That holds after the last start's
+    /// once the last start's script has ended, whether or not its notes
+    /// still play (they take the write too, through its `target`). That
+    /// holds after the last start's
     /// thread has gone with nothing left playing. A note kind 53 played
     /// with no thread running (thread 0) is placed too, from the
     /// registers it started with. `Spl` is that of the thread the last
