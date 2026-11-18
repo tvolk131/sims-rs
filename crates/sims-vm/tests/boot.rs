@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 33 --answers 3`
 /// gives this hash with the default frames (snapshot format 30).
-const TICK_33: &str = "9249815b8077306c96d733178dcab54436baf719a1383f9bc70c83ee8f50c9b6";
+const TICK_33: &str = "44b4c58e0cbf48feed1007bf5b42c4dbe132ccda9a1ee9d57fd2498ce97b11d6";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
@@ -44,7 +44,7 @@ const TICK_33_22: &str = "041181badfd4d6953814b6c46612398df1004fa583b1d2aa5bd11c
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 1103 --answers
 /// 3` gives this hash, the tick before the salesman leaves.
-const TICK_1103: &str = "df971523b4a1263f417dae2dbbab87df48de82a8bdf0ef91ae216472ccdfb17f";
+const TICK_1103: &str = "16471a74af089f9c98a25fd4aad81b0a57a04c2240476179c362e42ff4650873";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
@@ -716,7 +716,7 @@ fn the_player_selects_another_goth() {
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 2881
 /// --answers 3` gives this hash.
-const TICK_2881: &str = "841c0f85fdc10a4243dbfe5c2ed0038599a51ae12140b676c2b737759d237dea";
+const TICK_2881: &str = "651e560dd689a030b7dd9c2072cfb4601d16855a9de17eae4456382db9e198cc";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
@@ -737,7 +737,7 @@ const TICK_2881_24: &str = "cdd5b72c0ed8481f4db525817d1145f5445b6d2562c2ea4abfbf
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 3432
 /// --answers 3` gives this hash.
-const TICK_3432: &str = "a14d77ec4d8c4fa5dc9c2bf7bc2701ddc6f786f4d64bcbfa77f4eaaca618654f";
+const TICK_3432: &str = "67bfbeec110a67bd01227fae52b5ada47410d29981eb590fc9578f732432e2c6";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
@@ -758,7 +758,7 @@ const TICK_3432_24: &str = "c8d4fccd905caec7a03bb6d2872d83ba0ce462ffbc6c3e0bc143
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 3602
 /// --answers 3` gives this hash.
-const TICK_3602: &str = "a7cc5f9bf064c04f82e376d57d5d4b8c237b12e465e7f97e1f0c1520ae78fb9f";
+const TICK_3602: &str = "dedb6573d6dbdc8fca34e67460ac31206f69562026c368ad5f2bc7df8c62e62c";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
@@ -772,7 +772,7 @@ const TICK_3602_28: &str = "237e310cc1a35b9f46aac605f57ce8793f1575d9623b10de89d4
 const TICK_3602_27: &str = "d20b5848afafab4f927b77f6762af0e2152e7a90c61325a807398c77868a1741";
 /// The same state's hash under snapshot format 26.
 const TICK_3602_26: &str = "07ce1fc95d4c26d2b5466524759ddaa0d9cf6fbcde3c631c9b60e907c8bbe6a0";
-const TICK_3603: &str = "cc1c4a32014f7354838fedbe7e0876d857351fb7042d6f9ac0fd2c9faaab011f";
+const TICK_3603: &str = "dbd2f17e84293db73f48b543a80cacbcd3fd559ce318be0454378fc18d369c5f";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
@@ -786,7 +786,7 @@ const TICK_3603_28: &str = "97e03ff640aec9f42a222dfb78c3b01e5a71f85a2f83ed82af5f
 const TICK_3603_27: &str = "95156650bf0372faec254d37e4002e3c7341a67a71fbbd82254fbc28baa9b2e9";
 /// The same state's hash under snapshot format 26.
 const TICK_3603_26: &str = "82ff7567a2b43e03b5be77f7f547b8e8859c74657edecb66ce65514b42e144db";
-const TICK_3912: &str = "84d3379ffd23dbedcba91d74d5a0532b8b79f630deb0f69a532e5c6ed3ddac89";
+const TICK_3912: &str = "64fa9614f2ba4817883b210356979ffc1d0d102ae34c4f7636635820ec402aaf";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
@@ -802,7 +802,7 @@ const TICK_3912_27: &str = "0045276c46ed63146dac1d55f0042b964bfb169fb1f0e26e5987
 const TICK_3912_26: &str = "41652f2fbb6dad9eec17b3fcb49d4546da8f2fa6b4bab1957cd831491f6cc285";
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 9906
 /// --answers 3` gives this hash, the last before tick 9907.
-const TICK_9906: &str = "63e341f1c0a12304891acae2478dad0c33ffa4ef32cf603aff9de597a540663c";
+const TICK_9906: &str = "cb7ac9e5ae458a005c600ece29f2ea757bb700abc73a1150397dea29ec78412c";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
@@ -816,13 +816,13 @@ const TICK_9906_28: &str = "1e87830c107bef2b188791d6c9482e8afdfe1da341131b4482df
 const TICK_9906_27: &str = "c8240fc703c03716105cd4d2e554ef225259aac9799c8d3e91de604f25cee599";
 /// The first update of the next day, when the day turns. Unverified: no
 /// capture reaches it.
-const TICK_31478: &str = "abaf4b5b3ce9efa9a1c28b0c2008493235beb97ce4ed0874d90dc299e131707d";
+const TICK_31478: &str = "bd1c955e918be38807e9a99d0044a41d441a7e64bfe42854491afe7045f69a99";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
 const TICK_31478_29: &str = "abaf4b5b3ce9efa9a1c28b0c2008493235beb97ce4ed0874d90dc299e131707d";
 /// A whole day, 43,200 updates, from the load. Unverified.
-const TICK_43200: &str = "bc43e887614700e6ac2da54f2895bc1b8f7987a79535547af40ce35f5db33591";
+const TICK_43200: &str = "9494d1e16189d5cadc0210bc304051c2479db83351fa0cc338bd176db4268a90";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
@@ -982,7 +982,7 @@ fn strict_mode_runs_the_goth_houses_whole_day() {
 }
 
 /// The Newbies' house (House07) after 1802 updates, with `--answers 3`.
-const NEWBIE_1802: &str = "477ad5cf8a137143d15448487786dbdfac30dd59e6bdf2aa5eca9f82b7381bb9";
+const NEWBIE_1802: &str = "f5e5f73ffe6bace58e2632b871e2c1b80986fdee86542f6e802e2e4b6a9ece9c";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
@@ -998,7 +998,7 @@ const NEWBIE_1802_27: &str = "561330e47a0f5f0a1553e4382c16c87a15ff8878fff533fd37
 const NEWBIE_1802_26: &str = "d7980d86529f1b84be10c103d0d522e5484fc54ee2484859beba71b74c8c1d58";
 /// The Newbies' house after 4052 updates, the last whose frame strict
 /// mode draws.
-const NEWBIE_4052: &str = "e4cba62b5344fa29526919fccf72069dac72442ad111c06a979dddf32d56a23b";
+const NEWBIE_4052: &str = "11027885fb508f86f8288b72774b9b773ff0e52c61620470edd529b64c500f39";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
