@@ -11,13 +11,11 @@
 //!    0x800), which skips P in the broadcasts it sets off; otherwise it
 //!    sets the flag, and clears it at the end.
 //! 2. Resets P fully if P is using T (a use record names it) or P's
-//!    running action shows T's icon (0x45e814): the reset of a person
-//!    with no object named ([`Interpreter::reset_fully`]), which unwinds
-//!    P's uses and restarts P's thread. Each object P used resets too,
-//!    unless T has object flag 0x1000 (where the reset with no object
-//!    reads P's own flag). P's queue is not cancelled as it is with no
-//!    object named; it goes on to step 3, which filters it.
-//! 3. Filters, in this order:
+//!    running action shows T's icon
+//!    ([`Interpreter::reset_person_letting_go`], 0x45e814 to 0x45eac4).
+//!    That reset unwinds P's uses, lets go of and resets each object used
+//!    unless T has object flag 0x1000, and restarts P's thread.
+//! 3. Then filters, in this order:
 //!    - **The queue** (0x45eac7), when an action in it names T as target
 //!      or icon: the front action is taken off, one after another, until
 //!      the queue is empty. One that names T is dropped and, when it has a
@@ -122,14 +120,7 @@ impl Interpreter<'_> {
             return Ok(());
         };
         if person.object_uses.iter().any(|u| u.target == t) || person.active.icon == t {
-            // 0x45e814: the full reset, with T's flag 0x1000 deciding
-            // whether the objects P used reset. P is already marked as in
-            // the middle of a reset. It leaves the queue to the filter,
-            // which follows. P's own deletion mark (flag 0x40) holds here
-            // too: P can be told to let go while it is being deleted, by a
-            // reset its deletion set off.
-            let deleting = self.being_deleted(me);
-            self.reset_fully(world, me, &self.program.people, deleting, Some(target))?;
+            self.reset_person_letting_go(world, me, target)?;
         }
         if person_of(world, me).map_err(fail)?.queue.iter().any(names) {
             self.filter_queue(world, me, target)?;

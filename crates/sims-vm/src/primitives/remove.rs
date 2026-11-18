@@ -54,6 +54,23 @@ impl Machine<'_, '_> {
         else {
             return Ok(Flow::Branch(false));
         };
+        // A person that took itself off the lot earlier in its tick, with
+        // its animator's refresh pending, may remove only itself, and
+        // yield: that removal's own refresh joins the pending one
+        // (`Interpreter::refresh_again`). Anything else could read or
+        // write what the refresh did.
+        let refresh_pending = self
+            .refreshing
+            .is_some_and(|r| r.borrow().person == self.me && r.borrow().pending.is_some());
+        if refresh_pending && (id != self.me || flags & 1 != 0 || self.synchronous) {
+            return Err(Trap::Unsupported(format!(
+                "Remove Object Instance (opcode 18) of object {id} with flags {flags:#x} after \
+                 person {} left the lot and before its animator's tick: the animator's refresh \
+                 at the take-off (0x58da12), if the house view drew the person, may have \
+                 written what it reads",
+                self.me
+            )));
+        }
         self.queue_removal(id, flags)?;
         if !self.synchronous && id == self.me && flags & 1 == 0 {
             return Ok(Flow::Yield);
@@ -173,6 +190,17 @@ impl Machine<'_, '_> {
             self.interpreter()
                 .take_off_to_remove(self.world, id, true)
                 .map_err(|fault| fault.nested(me))?;
+        }
+        if person && !unseen_refresh {
+            // Removing myself and yielding after taking myself off the
+            // lot earlier in this tick: the second refresh joins the
+            // first, both pending until my animator's tick.
+            if let Some(refreshing) = self.refreshing.filter(|r| r.borrow().person == id) {
+                let mut refreshing = refreshing.borrow_mut();
+                if let Some(pending) = refreshing.pending.as_mut() {
+                    self.interpreter().refresh_again(self.world, id, pending)?;
+                }
+            }
         }
         if unseen_refresh {
             let pending = self.interpreter().refresh_before_removal(self.world, id)?;

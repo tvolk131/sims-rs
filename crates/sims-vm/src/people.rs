@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
+use crate::object_uses::no_action;
 use crate::placement::capture;
 use sims_content::{People, Profile};
 use sims_sim::World;
@@ -287,10 +288,15 @@ impl Interpreter<'_> {
     /// 4. Its thread restarts at Main, and its Reset function (3) runs on
     ///    top of that.
     /// 5. Person data words 0, 40 and 59 and data words 34 and 9 are
-    ///    cleared. So are the motive changes an action left running and
-    ///    person data words 33, 71, 72 and 73.
+    ///    cleared. The running action becomes the empty action (0x45eab3,
+    ///    0x45e6cd): one with a target becomes the last action, its flag
+    ///    0x20 the object's last result (+0x20). The motive changes an
+    ///    action left running go, and person data words 33, 71, 72 and 73
+    ///    are cleared.
     /// 6. Each queued action is dropped, first to last, and its target is
-    ///    asked function 4 with the person as the stack object.
+    ///    asked function 4 with the person as the stack object (0x45ecc2).
+    ///    A reset letting go of an object skips this: the filters for the
+    ///    object follow instead ([`Interpreter::reset_person_letting_go`]).
     ///
     /// Between steps 2 and 3 the person's route contexts (person +0xaf0)
     /// are erased (0x45e8aa, 0x45fad7), whose destructors (0x5d5653) only
@@ -299,8 +305,7 @@ impl Interpreter<'_> {
     /// (`primitives::headline`).
     ///
     /// These fail, because the original does more for them and none was
-    /// seen: a person that is using an object or whose running action has
-    /// a target; a person inside another object (0x45e8dd) or, unless it is being
+    /// seen: a person inside another object (0x45e8dd) or, unless it is being
     /// deleted ([`Interpreter::reset_person_to_delete`]), off the lot
     /// (0x45e977), which the original moves; and a person whose data word
     /// 73 is set, whose footprint the original then works out again.
@@ -356,30 +361,44 @@ impl Interpreter<'_> {
             return Ok(());
         }
         busy.borrow_mut().insert(id);
-        let result = self.reset_fully(world, id, people, deleting, None);
+        let result = self.reset_marked_fully(world, id, people, deleting, None);
         busy.borrow_mut().remove(&id);
         result
     }
 
-    /// The reset itself, for a person already marked as in the middle of
-    /// one (object flag 0x800), with `named` the object the person was
-    /// told to let go of, if any (0x45e791's argument; a person using it
-    /// comes here from [`crate::forget`]):
-    ///
-    /// 1. The person's uses are released ([`Interpreter::release_uses`]).
-    ///    Each object used is let go of by everyone and resets unless the
-    ///    named object, or with none the person itself, has object flag
-    ///    0x1000 ([`sims_sim::Object::removal_skips_resets`]; byte
-    ///    [ebp-0xd], set once at 0x45e7c8).
-    /// 2. The person resets (0x45e873 to 0x45eac4).
-    /// 3. With no object named, its queue is cancelled action by action
-    ///    (0x45ecc2). With one, the caller filters the queue instead
-    ///    (0x45eac7).
+    /// A person's full reset as it lets go of object `named` that it uses
+    /// or whose icon its running action shows (0x45e791 with the object,
+    /// 0x45e7e3 to 0x45e814, then 0x45e814 to 0x45eac4): the reset of
+    /// [`Interpreter::reset_person`], except that the objects it used are
+    /// let go of and reset only if `named` lacks object flag 0x1000
+    /// (0x45e7ca, the removal queue's mark,
+    /// [`sims_sim::Object::removal_skips_resets`]), and its queue is left
+    /// for the filters that follow (0x45eac7, [`crate::forget`]) instead
+    /// of being emptied (0x45ecc2 is the path with no object). The person
+    /// is already marked as letting go (object flag 0x800). A person whose
+    /// deletion has begun keeps its deletion mark (object flag 0x40): it
+    /// can be told to let go by a reset its own deletion set off.
+    pub(crate) fn reset_person_letting_go(
+        &self,
+        world: &mut World,
+        id: u16,
+        named: u16,
+    ) -> Result<(), Fault> {
+        let deleting = self.being_deleted(id);
+        self.reset_marked_fully(world, id, &self.program.people, deleting, Some(named))
+    }
+
+    /// The reset of a person marked as resetting (object flag 0x800):
+    /// its uses released ([`Interpreter::release_uses`]), then the rest
+    /// ([`Interpreter::reset_marked`]). `named` is the object being let go
+    /// of, if any. Whether the objects used reset is decided once, before
+    /// the loop, by object flag 0x1000 (0x45e7c8 to 0x45e7db): the named
+    /// object's, or with none the person's own.
     ///
     /// A reset that releases uses and then fails leaves the lot as it was
     /// before the reset, and takes back the sounds, callbacks and
     /// deletions it noted, so the fault reports a consistent lot.
-    pub(crate) fn reset_fully(
+    fn reset_marked_fully(
         &self,
         world: &mut World,
         id: u16,
@@ -387,10 +406,10 @@ impl Interpreter<'_> {
         deleting: bool,
         named: Option<u16>,
     ) -> Result<(), Fault> {
-        let reset_used = world
+        let reset_used = !world
             .objects
             .get(&named.unwrap_or(id))
-            .is_some_and(|o| !o.removal_skips_resets);
+            .is_some_and(|o| o.removal_skips_resets);
         let using = world
             .objects
             .get(&id)
@@ -406,7 +425,7 @@ impl Interpreter<'_> {
         });
         let result = self
             .release_uses(world, id, reset_used)
-            .and_then(|()| self.reset_marked(world, id, people, deleting, named.is_none()));
+            .and_then(|()| self.reset_marked(world, id, people, deleting, named.is_some()));
         if result.is_err()
             && let Some((lot, sounds, asked, deleted)) = before
         {
@@ -433,19 +452,21 @@ impl Interpreter<'_> {
     ///    while it has more than the use's frame count less one. The last
     ///    pop releases the use ([`crate::interpreter::Machine::release_use`]),
     ///    and the person's running action ends when the list empties.
-    /// 2. When `reset_used`, every person lets go of the object
+    /// 2. If `reset_used`, every person lets go of the object
     ///    ([`Interpreter::drop_references`], 0x444306), which skips this
     ///    one, being in the middle of its reset, and the object resets (its
     ///    virtual function 0x38 with 0: [`Interpreter::reset`], or
     ///    [`Interpreter::reset_person`] for a person). The original decides
-    ///    this once, before the step (byte [ebp-0xd], 0x45e7c8): it is
-    ///    clear when the object the person was told to let go of, or with
-    ///    none the person itself, has object flag 0x1000
-    ///    ([`sims_sim::Object::removal_skips_resets`]).
+    ///    that once, before the loop, by object flag 0x1000 (0x45e7c8 to
+    ///    0x45e7db): the person's own with no object named, else the named
+    ///    object's. The flag is the removal queue's mark
+    ///    ([`sims_sim::Object::removal_skips_resets`]); the one other place
+    ///    that sets it, a new object's reset at 0x42de09, is not ported.
     ///
     /// The object is the one the entry pointed to when the step began.
-    /// One that is gone by then, when it is to reset, fails loudly, as does a step that leaves
-    /// the list as long as it was, which the original repeats forever.
+    /// One that is gone by then, when it is to reset, fails loudly, as
+    /// does a step that leaves the list as long as it was, which the
+    /// original repeats forever.
     fn release_uses(&self, world: &mut World, id: u16, reset_used: bool) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: id,
@@ -511,7 +532,7 @@ impl Interpreter<'_> {
         id: u16,
         people: &People,
         deleting: bool,
-        cancel_queue: bool,
+        letting_go: bool,
     ) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: id,
@@ -536,9 +557,6 @@ impl Interpreter<'_> {
             return Err(fail(Trap::Invalid(
                 "a person still uses an object after its uses were released".into(),
             )));
-        }
-        if person.active.target != 0 {
-            return Err(unsupported("whose running action has a target"));
         }
         if person.data.get(73).is_none_or(|&word| word != 0) {
             return Err(unsupported("whose data word 73 is set"));
@@ -590,6 +608,7 @@ impl Interpreter<'_> {
             .ok_or_else(|| fail(Trap::Invalid("the person's Reset deleted it".into())))?;
         object.data[34] = 0;
         object.data[9] = 0;
+        let last_result = object.last_result;
         let person = object
             .person
             .as_mut()
@@ -597,21 +616,31 @@ impl Interpreter<'_> {
         for word in [0, 40, 59] {
             person.data[word] = 0;
         }
-        if person.active.target != 0 {
-            return Err(unsupported("whose Reset tree started an action"));
-        }
-        person.motive_deltas.clear();
+        // 0x45eab3: the running action becomes the empty action (0x45e6cd,
+        // as `Machine::set_action` with no target): one with a target
+        // becomes the last action, its flag 0x20 the object's last result
+        // (+0x20); priority word 33 follows the empty action's, the motive
+        // changes go, and words 71 to 73 are cleared.
         if person.data[73] != 0 {
             return Err(unsupported("whose data word 73 is set"));
         }
+        if person.active.target != 0 {
+            let mut last = person.active.clone();
+            last.flags = (last.flags & !0x20) | (u32::from(last_result) << 5);
+            person.last = last;
+        }
+        person.active = no_action();
+        person.motive_deltas.clear();
         for word in [33, 71, 72, 73] {
             person.data[word] = 0;
         }
-        if !cancel_queue {
+        // 0x45eac7: letting go of an object, the queue is left to the
+        // filters (`crate::forget`); with none, it is emptied (0x45ecc2).
+        if letting_go {
             return Ok(());
         }
-        // 0x45ecc2: one action at a time, as the callback may change the
-        // rest of the queue.
+        // One action at a time: the callback may change the rest of the
+        // queue.
         loop {
             let person = world
                 .objects

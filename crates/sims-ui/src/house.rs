@@ -12,6 +12,7 @@ use sims_formats::tuning::Constants;
 use sims_sim::World;
 use sims_sim::motives::Curve;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 /// The ratings in the panel's order (Live.iff `STR#` 133, strings 1 to
 /// 5).
@@ -35,6 +36,11 @@ pub struct Tuning {
     /// What the outdoor rooms' score is multiplied by for the Yard rating:
     /// the global file's tuning table 4, "yard score multiplier".
     pub yard: F32,
+    /// What a dirty object and a broken one take off the Upkeep rating's
+    /// count: "upkeep penalty per dirty object" and "... per broken
+    /// object", cut toward zero when read (0x42434a, 0x42436c).
+    pub dirty: i32,
+    pub broken: i32,
 }
 
 /// The global file's string table with the two curves, and its tuning
@@ -47,6 +53,12 @@ const CURVE_POINTS: usize = 8;
 /// where the table lacks it (0x666cc0).
 const YARD_NAME: &str = "yard score multiplier";
 const YARD_DEFAULT: f32 = 0.33;
+/// The upkeep penalties' names, and the original's values where the
+/// table lacks them (0x666cbc, 0x666cd0).
+const DIRTY_NAME: &str = "upkeep penalty per dirty object";
+const DIRTY_DEFAULT: f32 = 6.0;
+const BROKEN_NAME: &str = "upkeep penalty per broken object";
+const BROKEN_DEFAULT: f32 = 15.0;
 
 impl Default for Tuning {
     /// No curves, and the yard multiplier's default.
@@ -86,21 +98,100 @@ impl Tuning {
             let text = curves.and_then(|t| t.get(n, US_ENGLISH)).unwrap_or("");
             Curve::parse(0, text, CURVE_POINTS)
         };
-        let yard = constants
-            .and_then(|table| {
-                table
-                    .entries
-                    .iter()
-                    .find(|entry| entry.name.eq_ignore_ascii_case(YARD_NAME))
-            })
-            .map_or(YARD_DEFAULT, |entry| entry.value);
+        let constant = |name: &str, default: f32| {
+            constants
+                .and_then(|table| {
+                    table
+                        .entries
+                        .iter()
+                        .find(|entry| entry.name.eq_ignore_ascii_case(name))
+                })
+                .map_or(default, |entry| entry.value)
+        };
+        let whole = |value: f32| F32::from_f32(value).ext().to_i32_truncate();
         Self {
             size: curve(0),
             furnishings: curve(1),
-            yard: F32::from_f32(yard),
+            yard: F32::from_f32(constant(YARD_NAME, YARD_DEFAULT)),
+            dirty: whole(constant(DIRTY_NAME, DIRTY_DEFAULT)),
+            broken: whole(constant(BROKEN_NAME, BROKEN_DEFAULT)),
         }
     }
 }
+
+/// Which object types the Upkeep rating counts, by GUID (0x4452eb): those
+/// whose definition has room flags, function flags or a build mode type
+/// (definition +0x4e, +0x50 and +0x8a: OBJD words 37, 38 and 67 after
+/// its version) that are not 0. Read from the install's definitions as
+/// the lot's objects show up ([`Kinds::learn`]); a type not read counts
+/// for nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Kinds {
+    pub counted: BTreeMap<u32, bool>,
+}
+
+/// The definition's bytes the Upkeep count tests, each a 16-bit word.
+const COUNTED_WORDS: [usize; 3] = [0x4e, 0x50, 0x8a];
+
+/// The length the original fills a definition out to (0x431759).
+const DEFINITION_BYTES: usize = 216;
+
+impl Kinds {
+    /// Reads the definition of every object type in `world` not read
+    /// yet. A type the catalog lacks, or whose file or definition cannot
+    /// be read, counts for nothing. The definition is read as the
+    /// original holds it ([`Kinds::counts`]).
+    pub fn learn(&mut self, world: &World, index: &Index, catalog: &Catalog) {
+        let mut files: BTreeMap<usize, Option<Iff>> = BTreeMap::new();
+        for object in world.objects.values() {
+            if self.counted.contains_key(&object.guid) {
+                continue;
+            }
+            let counted = catalog.object(object.guid).is_some_and(|definition| {
+                let iff = files.entry(definition.resource).or_insert_with(|| {
+                    let bytes = index.resources.get(definition.resource)?.read().ok()?;
+                    Iff::parse(bytes).ok()
+                });
+                iff.as_ref()
+                    .and_then(|iff| {
+                        let chunk = iff.get(b"OBJD", definition.chunk)?;
+                        Some(Self::counts(iff.data(chunk)))
+                    })
+                    .unwrap_or(false)
+            });
+            self.counted.insert(object.guid, counted);
+        }
+    }
+
+    /// Whether a definition's bytes make its objects count. As the
+    /// original holds a definition (0x431759, as `sims-vm` reads one): a
+    /// version 136 or 137 definition shorter than 216 bytes and odd has
+    /// its last byte cleared, and every definition is filled out with
+    /// zeros to 216 bytes, so a word cut in half keeps its low byte.
+    pub fn counts(definition: &[u8]) -> bool {
+        let mut bytes = definition.to_vec();
+        let version = bytes.first_chunk::<4>().map(|&b| u32::from_le_bytes(b));
+        if matches!(version, Some(136 | 137))
+            && bytes.len() < DEFINITION_BYTES
+            && !bytes.len().is_multiple_of(2)
+            && let Some(last) = bytes.last_mut()
+        {
+            *last = 0;
+        }
+        if bytes.len() < DEFINITION_BYTES {
+            bytes.resize(DEFINITION_BYTES, 0);
+        }
+        COUNTED_WORDS
+            .iter()
+            .any(|&at| i16::from_le_bytes([bytes[at], bytes[at + 1]]) != 0)
+    }
+}
+
+/// An object's data words the Upkeep scan reads (object +0x68 and
+/// +0x98): broken when the first is not 0, dirty when the second is above
+/// 0.
+const BROKEN: usize = 15;
+const DIRTY: usize = 39;
 
 /// The lot's size class, by the side of its square (`World::size`, global
 /// 23): under 40 tiles small, under 50 medium, otherwise large
@@ -138,14 +229,20 @@ impl House {
     ///   members (0x4167af).
     /// - Yard is the outdoor rooms' summed score (the room manager's
     ///   +0x40) times the yard multiplier, kept to 0 to 100 (0x41689a).
+    /// - Upkeep (0x4168d4) goes through every object on the lot
+    ///   (0x4452eb). Each broken one (data word 15 not 0) adds the broken
+    ///   penalty, and each other dirty one (data word 39 above 0) the
+    ///   dirty penalty, whether or not it is counted; an object counts if
+    ///   its type does ([`Kinds`]). The rating is the count less the
+    ///   penalties over the count, kept to 0 to 1, times 100; 0 when
+    ///   nothing counts.
     /// - Each rating is cut to a whole number toward zero (`__ftol`), and
     ///   the arithmetic is single precision, as the original's FPU is
     ///   set.
     ///
-    /// Not ported: Furnishings (the lot's object values, 0x444cb9),
-    /// Upkeep (its dirty and broken objects, 0x4452eb) and Layout (its
-    /// routing history, lot +0x3c to +0x64).
-    pub fn read(world: &World, tuning: &Tuning) -> Self {
+    /// Not ported: Furnishings (the lot's object values, 0x444cb9) and
+    /// Layout (its routing history, lot +0x3c to +0x64).
+    pub fn read(world: &World, tuning: &Tuning, kinds: &Kinds) -> Self {
         let mut house = Self::default();
         for room in world.rooms.rooms.values() {
             if room.outdoors || !room.dirty {
@@ -185,8 +282,42 @@ impl House {
             yard
         };
         house.ratings[YARD] = Some(yard.to_i32_truncate());
+        house.ratings[UPKEEP] = Some(upkeep(world, tuning, kinds));
         house
     }
+}
+
+/// The Upkeep rating (0x4452eb, 0x4168d4), in 32-bit sums that wrap.
+fn upkeep(world: &World, tuning: &Tuning, kinds: &Kinds) -> i32 {
+    let (mut count, mut penalty) = (0i32, 0i32);
+    for object in world.objects.values() {
+        let word = |n: usize| object.data.get(n).copied().unwrap_or(0);
+        if word(BROKEN) != 0 {
+            penalty = penalty.wrapping_add(tuning.broken);
+        } else if word(DIRTY) > 0 {
+            penalty = penalty.wrapping_add(tuning.dirty);
+        }
+        if kinds.counted.get(&object.guid).copied().unwrap_or(false) {
+            count = count.wrapping_add(1);
+        }
+    }
+    if count == 0 {
+        return 0;
+    }
+    let share = (Ext::from_i32(count.wrapping_sub(penalty)) / Ext::from_i32(count)).single();
+    // `jae` fails for an unordered compare, `jbe` holds for one.
+    let share = if share.partial_cmp(&Ext::ZERO).is_some_and(Ordering::is_ge) {
+        share
+    } else {
+        Ext::ZERO
+    };
+    let one = Ext::from_i32(1);
+    let share = if share.partial_cmp(&one) == Some(Ordering::Greater) {
+        one
+    } else {
+        share
+    };
+    (share * Ext::from_i32(100)).single().to_i32_truncate()
 }
 
 /// How many members the lot's family has (0x41024e): the first family
@@ -229,19 +360,27 @@ mod tests {
         let tuning = Tuning::default();
         assert!(tuning.size.points.is_empty() && tuning.furnishings.points.is_empty());
         assert_eq!(tuning.yard, F32::from_f32(0.33));
+        assert_eq!((tuning.dirty, tuning.broken), (6, 15));
+        let constant = |name: &str, value: f32| Constant {
+            name: name.into(),
+            value,
+            comment: String::new(),
+        };
         let constants = Constants {
             version: 1,
-            entries: vec![Constant {
-                name: "Yard Score MULTIPLIER".into(),
-                value: 0.5,
-                comment: String::new(),
-            }],
+            entries: vec![
+                constant("Yard Score MULTIPLIER", 0.5),
+                // Cut toward zero.
+                constant("upkeep penalty per dirty object", 3.9),
+                constant("upkeep penalty per broken object", -6.5),
+            ],
         };
         let tuning = Tuning::from_tables(
             Some(&strings(&["(0;0) (100;50)", "(5;0) (0;100)"])),
             Some(&constants),
         );
         assert_eq!(tuning.yard, F32::from_f32(0.5));
+        assert_eq!((tuning.dirty, tuning.broken), (3, -6));
         assert_eq!(tuning.size.points.len(), 2);
         // Sorted by x as the original's curves are.
         assert_eq!(
@@ -281,7 +420,7 @@ mod tests {
         });
         world.rooms.outdoor_sum = F32::from_f32(400.0);
         let tuning = Tuning::from_tables(Some(&strings(&["(0;0) (100;50)"])), None);
-        let house = House::read(&world, &tuning);
+        let house = House::read(&world, &tuning, &Kinds::default());
         assert_eq!(
             (
                 house.square_feet,
@@ -293,13 +432,14 @@ mod tests {
         );
         // 81 / 2 = 40.5 square feet a member, 20.25 on the curve; the
         // yard's 132 is kept to 100.
-        assert_eq!(house.ratings, [Some(20), None, Some(100), None, None]);
+        // Nothing counts for Upkeep: 0.
+        assert_eq!(house.ratings, [Some(20), None, Some(100), Some(0), None]);
 
         // No family: Size 0. A negative or unordered yard score: 0.
         world.globals[9] = 8;
         world.rooms.outdoor_sum = F32::from_f32(-1.0);
         world.size = 39;
-        let house = House::read(&world, &tuning);
+        let house = House::read(&world, &tuning, &Kinds::default());
         assert_eq!(
             (house.ratings[SIZE], house.ratings[YARD]),
             (Some(0), Some(0))
@@ -307,7 +447,118 @@ mod tests {
         assert_eq!(house.lot, 0);
         world.rooms.outdoor_sum = F32::from_f32(f32::NAN);
         world.size = 50;
-        let house = House::read(&world, &tuning);
+        let house = House::read(&world, &tuning, &Kinds::default());
         assert_eq!((house.ratings[YARD], house.lot), (Some(0), 2));
+    }
+
+    fn object(id: u16, guid: u32, broken: i16, dirty: i16) -> sims_sim::Object {
+        let mut data = vec![0; 128];
+        data[BROKEN] = broken;
+        data[DIRTY] = dirty;
+        sims_sim::Object {
+            id,
+            guid,
+            footprint: [0; 4],
+            position: [0; 3],
+            unknown_short: 0,
+            attributes: Vec::new(),
+            temps: Vec::new(),
+            data,
+            obsolete_word: 0,
+            stack_capacity_bytes: 0,
+            stack: Vec::new(),
+            relationship_flag: 0,
+            relationships: Vec::new(),
+            slots: Vec::new(),
+            dynamic_sprites: Vec::new(),
+            multipart: None,
+            portal: None,
+            person: None,
+            registry_word: None,
+            last_result: false,
+            removal_skips_resets: false,
+            selected: false,
+        }
+    }
+
+    #[test]
+    fn upkeep_takes_the_penalties_off_the_counted_objects() {
+        let tuning = Tuning {
+            dirty: 3,
+            broken: 6,
+            ..Tuning::default()
+        };
+        // GUID 1 counts and 2 does not. A broken object takes its penalty
+        // whether or not it is dirty, and an object that does not count
+        // still takes its penalty.
+        let kinds = Kinds {
+            counted: BTreeMap::from([(1, true), (2, false)]),
+        };
+        let mut world = World::empty();
+        let upkeep = |world: &World| House::read(world, &tuning, &kinds).ratings[UPKEEP];
+        for id in 1..=20 {
+            world.objects.insert(id, object(id, 1, 0, 0));
+        }
+        world.objects.insert(21, object(21, 2, 0, 5));
+        world.objects.insert(22, object(22, 1, 1, 9));
+        world.objects.insert(23, object(23, 9, 0, -1));
+        // 21 counted (GUID 9 was not read: it counts for nothing), 9
+        // taken off: 12 / 21 is 57.14 percent.
+        assert_eq!(upkeep(&world), Some(57));
+        // More taken off than counted: 0; a negative penalty can take it
+        // over 1, which is kept to 100.
+        world.objects.insert(24, object(24, 2, 2, 0));
+        world.objects.insert(25, object(25, 2, 2, 0));
+        world.objects.insert(26, object(26, 2, 2, 0));
+        world.objects.insert(27, object(27, 2, 2, 0));
+        assert_eq!(upkeep(&world), Some(0));
+        let generous = Tuning {
+            dirty: -3,
+            broken: -6,
+            ..Tuning::default()
+        };
+        assert_eq!(
+            House::read(&world, &generous, &kinds).ratings[UPKEEP],
+            Some(100)
+        );
+        // Nothing counted: 0, penalties or not.
+        assert_eq!(
+            House::read(&world, &tuning, &Kinds::default()).ratings[UPKEEP],
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_type_counts_by_its_room_and_function_flags_or_build_mode_type() {
+        let mut definition = vec![0u8; 216];
+        assert!(!Kinds::counts(&definition));
+        for at in COUNTED_WORDS {
+            definition.fill(0);
+            definition[at + 1] = 0x80;
+            assert!(Kinds::counts(&definition), "{at:#x}");
+        }
+        // The word after the room flags is the function flags; one past
+        // the build mode type does not count.
+        definition.fill(0);
+        definition[0x8c] = 1;
+        assert!(!Kinds::counts(&definition));
+        // A short definition reads the words it lacks as 0, and half a
+        // word as its low byte (Sol's review: a version 138 definition
+        // ending at 0x8b).
+        definition.fill(0);
+        definition[..4].copy_from_slice(&138u32.to_le_bytes());
+        definition[0x8a] = 1;
+        assert!(Kinds::counts(&definition[..0x8b]));
+        assert!(!Kinds::counts(&definition[..0x8a]));
+        definition[0x8a] = 0;
+        definition[0x4e] = 1;
+        assert!(Kinds::counts(&definition[..0x4f]));
+        // A version 136 or 137 definition of odd length loses its last
+        // byte; an even one keeps it.
+        for version in [136u32, 137] {
+            definition[..4].copy_from_slice(&version.to_le_bytes());
+            assert!(!Kinds::counts(&definition[..0x4f]), "{version}");
+            assert!(Kinds::counts(&definition[..0x50]), "{version}");
+        }
     }
 }

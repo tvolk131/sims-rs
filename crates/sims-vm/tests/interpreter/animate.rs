@@ -7,7 +7,7 @@ use sims_content::{Clip, Event, Profile, Track};
 use sims_core::F32;
 use sims_sim::animator::{Base, LOADED, Layer, UNSET};
 use sims_sim::motives::{Curve, Rates, Tuning};
-use sims_vm::{Status, Trap};
+use sims_vm::{Interpreter, Status, Trap};
 
 /// The clip every test plays: 100 ms over 4 frames, one motion, no
 /// events.
@@ -733,13 +733,6 @@ fn look_towards_modes_2_and_3_turn_on_the_spot() {
     assert!(!fx.world.routing.routes.contains_key(&SIM));
     // With no stack object, error 0x15.
     assert_eq!(code(run(&mut look(2), 0)), Some(0x15));
-    // Mode 1 turns towards the camera, which is not ported.
-    assert!(
-        run(&mut look(1), LAMP)
-            .unwrap_err()
-            .to_string()
-            .contains("mode 1")
-    );
     // The path holds the second coordinate first. A synchronous tree may
     // not wait for the turn (error 0x44f).
     for (mode, to) in [(2, [210, 130]), (3, [190, 70])] {
@@ -750,6 +743,47 @@ fn look_towards_modes_2_and_3_turn_on_the_spot() {
             vec![[200, 100], [200, 100], to]
         );
         assert_eq!(code(result), Some(0x44f), "mode {mode}");
+    }
+}
+
+/// Look Towards in mode 1 (0x45aab9): the person turns one tile towards
+/// the camera. Its place is turned by the view's rotation within the
+/// square of 0x400 (0x47bc1f), a tile (16, 16) is added, and the sum is
+/// turned back; object data word 9 is cleared, and no stack object is
+/// needed.
+#[test]
+fn look_towards_mode_1_turns_towards_the_camera() {
+    for (rotation, to) in [
+        (0, [216, 116]),
+        (1, [184, 116]),
+        (2, [184, 84]),
+        (3, [216, 84]),
+    ] {
+        let mut fx = Fixture::new();
+        fx.add(
+            SIM_FILE,
+            4096,
+            tree(vec![ins(
+                22,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [1, 0, 0, 0, 0, 0, 0, 0],
+            )]),
+        );
+        fx.world.animators.insert(SIM, LOADED);
+        fx.sim_mut().position = [100, 200, 1];
+        fx.sim_mut().data[9] = 5;
+        let mut interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter.view_rotation = rotation;
+        let result = interpreter.run_tree(&mut fx.world, SIM, 4096, 0, &[], 10);
+        assert_eq!(
+            fx.world.routing.routes[&SIM].path,
+            vec![[200, 100], [200, 100], to],
+            "view rotation {rotation}"
+        );
+        assert_eq!(fx.sim().data[9], 0);
+        // The turn has started; a synchronous tree may not wait for it.
+        assert_eq!(code(result), Some(0x44f));
     }
 }
 
@@ -2295,6 +2329,33 @@ fn after_taking_itself_off_only_what_reads_no_animator_may_run() {
 }
 
 #[test]
+fn after_taking_itself_off_a_person_may_remove_itself_and_yield() {
+    // The removal's take-off refreshes the animator again (0x442d70,
+    // 0x433125, 0x58da12) in the same branch as the first: both refreshes
+    // then the tick reach what the tick alone does. That the second
+    // refresh is made is shown by
+    // `the_removal_after_taking_itself_off_refreshes_the_animator_again`.
+    let mut fx = taking_itself_off(ins(18, RETURN_TRUE, RETURN_FALSE, [0; 8]));
+    tick(&mut fx).unwrap();
+    assert!(
+        fx.world.removals.contains(&SIM) || !fx.world.objects.contains_key(&SIM),
+        "the person is queued for removal or removed"
+    );
+}
+
+#[test]
+fn after_taking_itself_off_a_removal_that_does_not_yield_fails_loudly() {
+    // Flag bit 0: the thread goes on after the removal, before the
+    // animator's tick, and could read what a refresh wrote.
+    let mut fx = taking_itself_off(ins(18, RETURN_TRUE, RETURN_FALSE, [0, 0, 1, 0, 0, 0, 0, 0]));
+    let fault = tick(&mut fx).unwrap_err().to_string();
+    assert!(
+        fault.contains("0x58da12") && fault.contains("flags 0x1"),
+        "{fault}"
+    );
+}
+
+#[test]
 fn a_person_holding_something_in_its_hand_taking_itself_off_fails_loudly() {
     // The refresh is taken to read only the head slot (0x58dae5).
     let mut fx = taking_itself_off(sleep());
@@ -2613,4 +2674,48 @@ fn a_route_ending_where_the_person_does_not_fit_puts_it_back_on_its_own_tile() {
     assert_eq!(a.position, [UNSET; 3]);
     assert_eq!(a.destination, [UNSET; 3]);
     assert_eq!((a.arrival, a.state, a.motion.segment), (0, 3, -1));
+}
+
+#[test]
+fn the_removal_after_taking_itself_off_refreshes_the_animator_again() {
+    // Between the take-offs an Expression sets the head to follow (person
+    // word 42 bit 0) a target (word 41). The first refresh did not measure
+    // the head (0x5904d2 with bit 0 clear); the second, the removal's
+    // (0x442d70, 0x433125, 0x58da12), does, and it reads the head bone,
+    // which no layer playing now turns (0x5992b3, not ported). So the run
+    // fails in the removal, before the person is queued. Without the
+    // second refresh it would fail only at the animator's tick, with the
+    // person queued.
+    let mut fx = taking_itself_off_then(vec![
+        assign(18, 42, scope::LITERAL, 1, 2),
+        assign(18, 41, scope::LITERAL, 999, 3),
+        ins(18, RETURN_TRUE, RETURN_FALSE, [0; 8]),
+    ]);
+    fx.program.people.profiles.insert(
+        SIM_GUID,
+        sims_content::Profile {
+            rig: [Some("HEAD".into()), Some("Top".into()), None, None],
+            ..Default::default()
+        },
+    );
+    fx.program.people.skeletons.insert(
+        SIM_GUID,
+        sims_content::Skeleton {
+            name: "test".into(),
+            file: "test".into(),
+            place: 0,
+            scales: vec![vec![0]],
+            bones: vec![sims_content::Bone {
+                name: "HEAD".into(),
+                parent: None,
+                translation: [0; 3],
+                rotation: [0, 0, 0, 1f32.to_bits()],
+                blends: true,
+            }],
+        },
+    );
+    let fault = tick(&mut fx).unwrap_err();
+    assert_eq!(fault.at.map(|at| (at.tree, at.node)), Some((4098, 3)));
+    assert!(fault.to_string().contains("0x5992b3"), "{fault}");
+    assert!(fx.world.removals.is_empty());
 }

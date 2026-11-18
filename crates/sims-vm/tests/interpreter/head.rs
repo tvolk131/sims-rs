@@ -144,6 +144,38 @@ fn an_absent_point_measures_the_head_from_the_bones_origin() {
     assert_ne!(heading(None), F32::ZERO);
 }
 
+/// The target heading after one frame draw of [`anchored`] with the
+/// person on `level` and the view turned to `rotation`.
+fn heading_on(level: i32, rotation: u8) -> Result<F32, sims_vm::Fault> {
+    let mut fx = anchored(Some("Top"));
+    fx.sim_mut().position[2] = level;
+    let mut vm = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    vm.view_rotation = rotation;
+    vm.draw_frame(&mut fx.world, 1)?;
+    Ok(fx.world.animators[&SIM].head.target_heading)
+}
+
+#[test]
+fn upstairs_the_head_is_measured_from_the_raised_model() {
+    // The rise moves the model a half unit along both floor axes as well
+    // as up (0x4ca054), so the heading to the same target changes
+    // (2.8269 on the ground, 2.8257 a level up).
+    let ground = heading_on(1, 0).unwrap();
+    assert_eq!(heading_on(1, 2).unwrap(), ground);
+    let upstairs = heading_on(2, 0).unwrap();
+    assert_ne!(upstairs, ground);
+    assert_ne!(heading_on(3, 0).unwrap(), upstairs);
+}
+
+#[test]
+fn upstairs_with_the_view_turned_fails_loudly() {
+    let fault = heading_on(2, 1).unwrap_err();
+    assert!(
+        matches!(&fault.trap, sims_vm::Trap::Unsupported(m) if m.contains("0x5c3a20")),
+        "{fault}"
+    );
+}
+
 /// [`anchored`] with a skeleton of a root, the head under it and an arm
 /// beside the head, the foreground holding the root and the head at rest,
 /// and a carry layer at full weight playing a clip that turns `carried`.

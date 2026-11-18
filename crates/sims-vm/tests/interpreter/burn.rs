@@ -227,9 +227,9 @@ fn the_tiles_of_a_group_that_catches_are_gathered() {
 #[test]
 fn a_person_around_counts_two_units_wider_and_is_not_moved() {
     // The Sim on tile (2, 3) reaches 47 in the first coordinate, short of
-    // tile (3, 3), but a person's footprint is widened by 2. Moving a
-    // gathered person to its tile's centre is not ported. At 45 it stays
-    // short even widened.
+    // tile (3, 3), but a person's footprint is widened by 2, so it is
+    // gathered and moved, which resets it first: that fails here, as the
+    // fixture's Sim has no profile. At 45 it stays short even widened.
     for (reach, gathered) in [(47, true), (45, false)] {
         let mut fx = lot();
         let w = widget(&mut fx, [3, 3], true);
@@ -255,6 +255,41 @@ fn a_person_around_counts_two_units_wider_and_is_not_moved() {
             assert_eq!(fires(&fx), [[56, 56, 1]]);
         }
     }
+}
+
+#[test]
+fn a_gathered_person_resets_and_moves_to_its_tiles_centre() {
+    // 0x44df25: the person on the burning tile, off its centre, resets
+    // (its thread restarts at Main and its Reset tree runs), is put at the
+    // centre of the tile it stood on at its level, and the fire spreads
+    // to the tile as to anything that catches.
+    use crate::visits::{PERSON, RESIDENT_MAIN, resident};
+    let mut fx = lot();
+    let w = widget(&mut fx, [3, 3], true);
+    let people = resident(&mut fx);
+    fx.program.people = people;
+    // The person's Reset tree notes 6 in the lamp's attribute 5.
+    fx.world.objects.get_mut(&LAMP).unwrap().attributes.resize(8, 0);
+    let sim = fx.world.objects.get_mut(&PERSON).unwrap();
+    sim.position = [50, 61, 1];
+    sim.data[FLAGS] = 0;
+    sim.data[FLAGS_2] = CATCHES;
+    sim.data[62] = 0;
+    fx.thread(PERSON, 4096, &[0; 4]);
+    fx.world
+        .animators
+        .insert(PERSON, sims_sim::animator::LOADED);
+    assert_eq!(burn(&mut fx, w, 0, 1), Ok(true));
+    let sim = &fx.world.objects[&PERSON];
+    assert_eq!(sim.position, [56, 56, 1]);
+    assert_eq!((sim.stack.len(), sim.stack[0].tree), (1, RESIDENT_MAIN));
+    assert_eq!(fx.world.objects[&LAMP].attributes[5], 6);
+    // Its virtual function 0x74 unset its animator's position.
+    assert_eq!(
+        fx.world.animators[&PERSON].position,
+        [sims_sim::animator::UNSET; 3]
+    );
+    assert_eq!(fires(&fx), [[56, 56, 1]]);
 }
 
 #[test]

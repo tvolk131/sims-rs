@@ -4,8 +4,7 @@
 
 **Unverified past tick 2510, and wrong from tick 2515.** Strict mode on
 the Goth house now runs 43,200 updates, a whole day from the load, to
-06:30:44 on the next day (17 June 1997, one day played; hash bc43e887…,
-5983af01… since `20261118-fire-burns-person-resets-whoever-uses-what-burns.md`)
+06:30:44 on the next day (17 June 1997, one day played; hash bc43e887…)
 with no stop. The state at every pinned tick up to 9906 is the same:
 snapshot format 29 appends `World::stops_asked` (below), and the
 format-28 hashes kept beside the new ones match.
