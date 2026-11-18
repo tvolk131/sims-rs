@@ -36,7 +36,7 @@ pub mod speed;
 mod world;
 
 pub use error::Error;
-pub use snapshot::{ReadOnlySnapshots, Snapshots};
+pub use snapshot::{FORMAT as SNAPSHOT_FORMAT, ReadOnlySnapshots, Snapshots};
 pub use world::{
     ADVERTISEMENTS, Advertisement, Budget, Dialog, Dialogs, FULL_SIZE, FrameStorage, Headline,
     HouseUsage, MagicHistory, Object, PersonTick, TypeAttributes, Usage, Whereabouts, World,

@@ -71,6 +71,13 @@ impl World {
         self.globals.get(SPEED).copied().unwrap_or(0)
     }
 
+    /// The speed the game goes back to when the idle loop's speed ends
+    /// (global 18): the player's while the idle loop holds the game at
+    /// [`IDLE`], and -1 otherwise.
+    pub fn return_speed(&self) -> i16 {
+        self.globals.get(RETURN_SPEED).copied().unwrap_or(-1)
+    }
+
     /// Sets the game's speed as its setter does (`0x46d697`): clamped to
     /// 0 to 1000, into global 16, and into global 18 while that is not
     /// negative. Returns the milliseconds between two lot updates.

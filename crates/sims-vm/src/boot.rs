@@ -12,6 +12,8 @@
 //! `sims boot` prints what this does; presentation crates use it to
 //! watch a lot run.
 
+pub mod save;
+
 use crate::play::Play;
 use crate::{Answers, Callback, Interpreter, Program, Stream, TickError, Update};
 use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People, Surfaces};
@@ -199,6 +201,10 @@ pub struct Lot {
 
     /// The house view's rotation, 0 to 3 ([`Lot::set_view_rotation`]).
     view_rotation: u8,
+    /// The world's hash as the load left it, which a save carries so it
+    /// goes back only into a lot loaded from the same files
+    /// ([`save`]).
+    loaded: [u8; 32],
 }
 
 /// A dialog the lot waits on ([`Lot::asking`]). The tick that showed it
@@ -632,6 +638,7 @@ impl Lot {
         load.saved_ticks = file.simulator.ticks;
         load.libraries = program.libraries.len();
         let start = world.ticks;
+        let loaded = world.hash();
         Ok(Self {
             program,
             catalog,
@@ -651,6 +658,7 @@ impl Lot {
             asking: None,
 
             view_rotation,
+            loaded,
         })
     }
 
@@ -697,6 +705,9 @@ impl Lot {
             self.tuning = Some(tuning);
         }
         if !self.asks {
+            // A lot restored from a save made once a dialog was answered
+            // takes input again after this step, as the saved lot would.
+            self.answered = false;
             let result = self.advance(play).map_err(Stop::into_step);
             if result.is_err() {
                 self.halted = true;
@@ -1133,6 +1144,7 @@ mod tests {
             ..LoadReport::default()
         };
         let start = world.ticks;
+        let loaded = world.hash();
         Lot {
             program: Program {
                 global: 0,
@@ -1167,6 +1179,7 @@ mod tests {
             asking: None,
 
             view_rotation: 0,
+            loaded,
         }
     }
 
