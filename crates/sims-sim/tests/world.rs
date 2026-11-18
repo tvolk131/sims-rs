@@ -4,6 +4,7 @@ use sims_formats::lot::Array;
 use sims_formats::saved_objects::{Frame, Slot};
 use sims_sim::animator::{Animator, Base, Fade, HeldPose, LOADED, Layer, Motion, UNSET};
 use sims_sim::head::Head;
+use sims_sim::characters::{Character, Characters};
 use sims_sim::neighbors::{Family, Inventory, Item, Neighbor, Neighbors, Row};
 use sims_sim::rooms::{Half, Room, Rooms};
 use sims_sim::route::{Candidate, Context, Route, RouteSlot, Routing};
@@ -261,7 +262,17 @@ fn world() -> World {
             },
         )]),
         stops_asked: BTreeSet::from([5]),
-        characters: Default::default(),
+        characters: Characters {
+            made: BTreeMap::from([(
+                0x1234_0042,
+                Character {
+                    template: 0x7fd9_6b54,
+                    file: 3,
+                    strings: BTreeMap::from([(0, "child".into()), (14, "med".into())]),
+                },
+            )]),
+            next_file: 4,
+        },
     }
 }
 
@@ -433,7 +444,26 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "f1663444bf686193967fab0511a75eaad4599c03369d188260cc34f84ee1f9ae";
+const PINNED: &str = "76bb018abadfef18d5ac5e7d47a751fd554b6d0a8bdef220d8fb05899c4f45c6";
+
+#[test]
+fn without_the_made_characters_the_encoding_is_format_29() {
+    // Snapshot format 30 added the person types made while the game runs
+    // at the end.
+    assert_eq!(digest(&format_29_bytes(&world())), PINNED_29);
+}
+const PINNED_29: &str = "f1663444bf686193967fab0511a75eaad4599c03369d188260cc34f84ee1f9ae";
+
+/// The encoding of `world` as snapshot format 29 wrote it: without the
+/// person types made while the game runs ([`World::characters`]) that
+/// format 30 added at the end. The older formats' encodings start from
+/// this one.
+fn format_29_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let made = postcard::to_allocvec(&world.characters).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - made.len()), made);
+    bytes
+}
 
 #[test]
 fn without_the_stops_asked_the_encoding_is_format_28() {
@@ -445,9 +475,10 @@ const PINNED_28: &str = "1e854596699af21756dd277d321f3e0068d1f9159afa9b974e6c364
 
 /// The encoding of `world` as snapshot format 28 wrote it: without the
 /// people asked to stop their route ([`World::stops_asked`]) that format
-/// 29 added at the end. The older formats' encodings start from this one.
+/// 29 added at the end either. It starts from [`format_29_bytes`], and the
+/// older formats' encodings from this one.
 fn format_28_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_29_bytes(world);
     let asked = postcard::to_allocvec(&world.stops_asked).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - asked.len()), asked);
     bytes
@@ -1164,6 +1195,9 @@ fn any_field_change_changes_the_hash() {
     let base = world().hash();
     let mut changed = world();
     changed.people.push(2);
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.characters.next_file += 1;
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.dialogs.records[0].status = 5;
