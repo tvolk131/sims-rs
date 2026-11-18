@@ -347,52 +347,79 @@ impl Interpreter<'_> {
             };
             return outer.reset_person_as(world, id, people, deleting);
         };
+        // A person whose deletion has begun has its deletion mark
+        // (object flag 0x40), whoever resets it.
+        let deleting = deleting || self.being_deleted(id);
         // 0x45e7b2: a person already in the middle of a reset or of
         // letting go is skipped, as when its reset ends its use of itself.
         if busy.borrow().contains(&id) {
             return Ok(());
         }
         busy.borrow_mut().insert(id);
-        // With no object named, the person's own flag 0x1000 decides
-        // whether the objects it used reset (0x45e7c8).
-        let reset_used = world
-            .objects
-            .get(&id)
-            .is_some_and(|o| !o.removal_skips_resets);
-        let result = self.reset_fully(world, id, people, deleting, reset_used);
+        let result = self.reset_fully(world, id, people, deleting, None);
         busy.borrow_mut().remove(&id);
         result
     }
 
     /// The reset itself, for a person already marked as in the middle of
-    /// one (object flag 0x800): the person's uses are released
-    /// ([`Interpreter::release_uses`], resetting each object used when
-    /// `reset_used`) and the person resets (0x45e814 to 0x45eac4). A person
-    /// using the object it is told to let go of comes here too
-    /// ([`crate::forget`]).
+    /// one (object flag 0x800), with `named` the object the person was
+    /// told to let go of, if any (0x45e791's argument; a person using it
+    /// comes here from [`crate::forget`]):
+    ///
+    /// 1. The person's uses are released ([`Interpreter::release_uses`]).
+    ///    Each object used is let go of by everyone and resets unless the
+    ///    named object, or with none the person itself, has object flag
+    ///    0x1000 ([`sims_sim::Object::removal_skips_resets`]; byte
+    ///    [ebp-0xd], set once at 0x45e7c8).
+    /// 2. The person resets (0x45e873 to 0x45eac4).
+    /// 3. With no object named, its queue is cancelled action by action
+    ///    (0x45ecc2). With one, the caller filters the queue instead
+    ///    (0x45eac7).
+    ///
+    /// A reset that releases uses and then fails leaves the lot as it was
+    /// before the reset, and takes back the sounds, callbacks and
+    /// deletions it noted, so the fault reports a consistent lot.
     pub(crate) fn reset_fully(
         &self,
         world: &mut World,
         id: u16,
         people: &People,
         deleting: bool,
-        reset_used: bool,
+        named: Option<u16>,
     ) -> Result<(), Fault> {
-        // A reset that releases uses and then fails leaves the lot as it
-        // was before the reset, so the fault reports a consistent lot.
+        let reset_used = world
+            .objects
+            .get(&named.unwrap_or(id))
+            .is_some_and(|o| !o.removal_skips_resets);
         let using = world
             .objects
             .get(&id)
             .and_then(|o| o.person.as_ref())
             .is_some_and(|p| !p.object_uses.is_empty());
-        let before = using.then(|| world.clone());
+        let before = using.then(|| {
+            (
+                world.clone(),
+                self.sounds.map(|s| s.borrow().len()),
+                self.asked.map(|a| a.borrow().len()),
+                self.deleted.map(|d| d.borrow().len()),
+            )
+        });
         let result = self
             .release_uses(world, id, reset_used)
-            .and_then(|()| self.reset_marked(world, id, people, deleting));
+            .and_then(|()| self.reset_marked(world, id, people, deleting, named.is_none()));
         if result.is_err()
-            && let Some(before) = before
+            && let Some((lot, sounds, asked, deleted)) = before
         {
-            *world = before;
+            *world = lot;
+            if let (Some(s), Some(n)) = (self.sounds, sounds) {
+                s.borrow_mut().truncate(n);
+            }
+            if let (Some(a), Some(n)) = (self.asked, asked) {
+                a.borrow_mut().truncate(n);
+            }
+            if let (Some(d), Some(n)) = (self.deleted, deleted) {
+                d.borrow_mut().truncate(n);
+            }
         }
         result
     }
@@ -484,6 +511,7 @@ impl Interpreter<'_> {
         id: u16,
         people: &People,
         deleting: bool,
+        cancel_queue: bool,
     ) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: id,
@@ -579,8 +607,11 @@ impl Interpreter<'_> {
         for word in [33, 71, 72, 73] {
             person.data[word] = 0;
         }
-        // One action at a time: the callback may change the rest of the
-        // queue.
+        if !cancel_queue {
+            return Ok(());
+        }
+        // 0x45ecc2: one action at a time, as the callback may change the
+        // rest of the queue.
         loop {
             let person = world
                 .objects

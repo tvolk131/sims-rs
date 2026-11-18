@@ -121,6 +121,12 @@ pub struct Interpreter<'a> {
     /// 0x800, [`crate::forget`]), whom a broadcast it sets off skips. None
     /// outside one.
     pub(crate) letting_go: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
+    /// The objects whose deletion has begun and that are not freed yet
+    /// (object flag 0x40, set at 0x440fbc for a group's tiles and 0x441039
+    /// for each object before people let go of it), which a reset reads
+    /// ([`Interpreter::reset`], [`Interpreter::reset_person`]). None
+    /// outside a deletion.
+    pub(crate) deleting: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
     /// The house view's rotation, 0 to 3 (the scene at 0x6e5528, +0x84),
     /// which Generic Sims Call routine 12 reads. It is the player's
     /// choice, not the lot's, so it is an input here: [`Interpreter::new`]
@@ -166,6 +172,7 @@ impl<'a> Interpreter<'a> {
             menu: None,
             running_at_once: None,
             letting_go: None,
+            deleting: None,
             view_rotation: 0,
             refreshing: None,
             taken_off: None,
@@ -309,6 +316,7 @@ impl<'a> Interpreter<'a> {
             menu: self.menu,
             running_at_once: self.running_at_once,
             letting_go: self.letting_go,
+            deleting: self.deleting,
             view_rotation: self.view_rotation,
             refreshing: self.refreshing,
             taken_off: self.taken_off,
@@ -381,6 +389,8 @@ pub(crate) struct Machine<'a, 'w> {
     pub running_at_once: Option<AtOnce<'a>>,
     /// See [`Interpreter::letting_go`].
     pub letting_go: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
+    /// See [`Interpreter::deleting`].
+    pub(crate) deleting: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
     /// See [`Interpreter::view_rotation`].
     pub view_rotation: u8,
     /// See [`Interpreter::refreshing`].
@@ -405,6 +415,7 @@ impl<'a> Machine<'a, '_> {
             menu: self.menu,
             running_at_once: self.running_at_once,
             letting_go: self.letting_go,
+            deleting: self.deleting,
             view_rotation: self.view_rotation,
             refreshing: self.refreshing,
             taken_off: self.taken_off,

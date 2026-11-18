@@ -30,8 +30,10 @@ place-tested first, as the original does not test it.
 with an object T, jumping to 0x45e814). This happens when P has a use
 record naming T, or P's running action shows T's icon. P resets as it
 does with no object named: its uses unwind one by one, and then P
-resets. After that the filter of queue, last action, running action and
-routes runs as for any person. Whether each used object is let go of by
+resets. One difference: with no object named, the reset ends by
+cancelling P's whole queue (0x45ecc2). With T named it goes instead to
+the filter of queue, last action, running action and routes (0x45eac7),
+as for any person, so queued actions on other objects stay. Whether each used object is let go of by
 everyone and reset is decided once, before the uses unwind, from object
 flag 0x1000 (byte [ebp-0xd], 0x45e7c8): T's flag when T is given, else
 P's own. Here that flag is `Object::removal_skips_resets`. Before this,
@@ -40,6 +42,22 @@ the reset with no object always reset what P used. The port took flag
 (0x442f79, when Remove Object Instance's flag bit 1 is set: 0x451bc7
 passes the bit inverted). So the reset with no object now reads P's own
 flag.
+
+The fault rollback of a person's reset that has released uses now also
+takes back the sound events, callbacks and deletions it noted, not only
+the lot. A person whose running action shows T's icon but targets
+another object, and who uses nothing, still fails loudly. The reset
+ends the running action with the empty action (0x45e6cd), and the port
+does that only for a running action with no target.
+
+**The deletion mark is kept while a deletion runs.** The original sets
+object flag 0x40 before people let go of the object (0x441039, and
+0x440fbc for every tile of a group). The object keeps it until it is
+freed. A reset of the object meanwhile reads it: an object with no Reset
+tree is taken off the lot rather than rebuilt, and a person is not moved
+back onto the lot. That includes the reset a person makes as its reset
+ends its use of the object. The interpreter now carries the marks for
+the length of a deletion (`Interpreter::deleting`).
 
 **The strict Goth day changes at tick 5986.** That is the only change to
 the strict runs. The paper carrier, person 12, removes itself with flag
@@ -53,6 +71,10 @@ tick 9906 on are new:
 
 Ticks 1102, 3602 and 3912 and the Newbies' run are unchanged. The day is
 already unverified past tick 2510 (`20261115-strict-whole-goth-day.md`).
+At this point, though, Track 2's Goth day recording agrees: in its
+states after updates 5980, 5986 and 5987 the portal keeps the same
+three frames (0x1000, 0x100a, 0x118), where a reset would have restarted
+it at Main.
 
 **A reset of a person already in the middle of one is skipped** (object
 flag 0x800, 0x45e7b2), where it used to fail loudly. Mortimer's last use

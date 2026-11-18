@@ -13,9 +13,10 @@
 //! 2. Resets P fully if P is using T (a use record names it) or P's
 //!    running action shows T's icon (0x45e814): the reset of a person
 //!    with no object named ([`Interpreter::reset_fully`]), which unwinds
-//!    P's uses, restarts P's thread and cancels P's queue. Each object P
-//!    used resets too, unless T has object flag 0x1000 (where the reset
-//!    with no object reads P's own flag). Then it goes on to step 3.
+//!    P's uses and restarts P's thread. Each object P used resets too,
+//!    unless T has object flag 0x1000 (where the reset with no object
+//!    reads P's own flag). P's queue is not cancelled as it is with no
+//!    object named; it goes on to step 3, which filters it.
 //! 3. Filters, in this order:
 //!    - **The queue** (0x45eac7), when an action in it names T as target
 //!      or icon: the front action is taken off, one after another, until
@@ -123,12 +124,9 @@ impl Interpreter<'_> {
         if person.object_uses.iter().any(|u| u.target == t) || person.active.icon == t {
             // 0x45e814: the full reset, with T's flag 0x1000 deciding
             // whether the objects P used reset. P is already marked as in
-            // the middle of a reset. It falls through to the filter.
-            let reset_used = world
-                .objects
-                .get(&target)
-                .is_some_and(|o| !o.removal_skips_resets);
-            self.reset_fully(world, me, &self.program.people, false, reset_used)?;
+            // the middle of a reset. It leaves the queue to the filter,
+            // which follows.
+            self.reset_fully(world, me, &self.program.people, false, Some(target))?;
         }
         if person_of(world, me).map_err(fail)?.queue.iter().any(names) {
             self.filter_queue(world, me, target)?;

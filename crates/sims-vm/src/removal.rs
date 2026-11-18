@@ -35,6 +35,9 @@
 //! (0x440f37). Anything else fails with an error that says what is
 //! missing.
 
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Machine};
 use crate::sounds::SoundEvent;
@@ -301,10 +304,23 @@ impl Interpreter<'_> {
     /// interface hooks (0x4481eb, which changes nothing for a person or
     /// any object but an indicator or a star marker, and the list at
     /// registry +0x30, 0x464fa2), the interface object of GUID 0x3EEC206C
-    /// (registry +0x80), and the release of its indicator. The original
-    /// also sets the object's deletion mark (object flag 0x40), which only
-    /// a person's reset reads.
+    /// (registry +0x80), and the release of its indicator.
+    ///
+    /// Before people let go of it, the object gets its deletion mark
+    /// (object flag 0x40, 0x441039; [`Interpreter::deleting`]), which it
+    /// keeps until it is freed: a reset of it meanwhile, such as one a
+    /// person's reset makes as it ends its use of the object, is the
+    /// reset of an object being deleted. A group's lead marks every tile
+    /// before any is deleted (0x440fbc).
     pub fn delete(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        let Some(marks) = self.deleting else {
+            let marks = RefCell::new(BTreeSet::new());
+            let outer = Interpreter {
+                deleting: Some(&marks),
+                ..*self
+            };
+            return outer.delete(world, id);
+        };
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -331,12 +347,22 @@ impl Interpreter<'_> {
             }
             return self.delete(world, lead);
         }
+        marks
+            .borrow_mut()
+            .extend(self.parts(world, id).map_err(fail)?);
         let mut tile = Some(id);
         while let Some(this) = tile {
             tile = world.next_parts.get(&this).copied();
             self.delete_one(world, this)?;
         }
         Ok(())
+    }
+
+    /// Whether object `id`'s deletion has begun (object flag 0x40,
+    /// [`Interpreter::deleting`]).
+    pub(crate) fn being_deleted(&self, id: u16) -> bool {
+        self.deleting
+            .is_some_and(|marks| marks.borrow().contains(&id))
     }
 
     /// One object's deletion (0x440fff on, 0x440eeb with 1): the steps of
@@ -372,6 +398,9 @@ impl Interpreter<'_> {
         }
         if selected {
             self.select(world, None)?;
+        }
+        if let Some(marks) = self.deleting {
+            marks.borrow_mut().insert(id);
         }
         self.drop_references(world, id)?;
         if person {
@@ -411,6 +440,9 @@ impl Interpreter<'_> {
         // The object's destructor stops its sounds (0x4323c9).
         self.sound(SoundEvent::Stop { object: id as i16 });
         world.objects.remove(&id);
+        if let Some(marks) = self.deleting {
+            marks.borrow_mut().remove(&id);
+        }
         if let Some(deleted) = self.deleted {
             deleted.borrow_mut().push(id);
         }
@@ -466,12 +498,15 @@ impl Interpreter<'_> {
     /// Either way the scheduler's countdown for the object is dropped, its
     /// sounds are stopped (0x4320b4, [`crate::sounds`]), and the object
     /// gives up the ownership of interface events. Being deleted (object
-    /// flag 0x40) only spares the rebuild (0x432063): the deletion's reset
-    /// stops the object's sounds too, and its destructor then once more.
+    /// flag 0x40: `deleting`, or the object's deletion has begun,
+    /// [`Interpreter::deleting`]) only spares the rebuild (0x432063): the
+    /// deletion's reset stops the object's sounds too, and its destructor
+    /// then once more.
     ///
     /// A Reset entry whose tree is missing runs nothing but still counts
     /// as a Reset tree.
     pub fn reset(&self, world: &mut World, id: u16, deleting: bool) -> Result<(), Fault> {
+        let deleting = deleting || self.being_deleted(id);
         let fail = |trap| Fault {
             object: id,
             at: None,
