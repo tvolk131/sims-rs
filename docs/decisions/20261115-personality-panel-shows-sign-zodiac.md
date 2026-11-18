@@ -33,8 +33,9 @@ under the title (`household::zodiac`, `Resident::zodiac`, drawn by
   (0x51cdc4..0x51cdfe). The names are UIText.iff STR# 164, strings 1
   to 12 (0x48410b).
 - **Unverified:** the color (the labels' is taken).
-- **Not drawn:** the help balloon over the sign (0x51bfb3), which names
-  the most and least compatible signs (0x484344, 0x484416).
+- **The help balloon** over the sign (0x51bfb3), which names the most
+  and least compatible signs, is drawn since 2026-11-16
+  (20261116-sign-help-balloon.md).
 - **Tests:**
   - each sign's own traits give it, and a tie keeps the first;
   - saved, clamped, and hidden signs;

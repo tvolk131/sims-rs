@@ -53,11 +53,13 @@
 //! turn about the vertical by a quarter turn per rotation, built at
 //! 0x49b60e) before it sets it (0x4b49c7). A person in a room at full
 //! light is drawn in full light all over; one in a dark room shows the
-//! light's side. The room's lamps (one light each, from the lamp to the
-//! person), the level's fade over 250 ms, the dimmer daylight cap after
-//! dark (0.8) and the person's flag that draws them at full light are
-//! not ported (decisions entry "A person is lit by the original's
-//! standard light, at their room's level").
+//! light's side. Each lit lamp of the person's room adds a warm light from
+//! the lamp to the person ([`lamps`]). The level's fade over 250 ms, the
+//! dimmer daylight cap after dark (0.8) and the person's flag that draws
+//! them at full light are not ported (decisions entries "A person is lit
+//! by the original's standard light, at their room's level" and "The
+//! standard light shines from the viewer's side, and lamps light
+//! people").
 
 use crate::animation::{Clip, Library};
 use crate::appearance::{Body, Outfit};
@@ -66,7 +68,7 @@ use crate::bob::{self, Bob};
 use crate::house::Cast;
 use crate::math::{Transform, Vec3};
 use crate::person::{Player, UNITS_PER_TILE, base_clip, placement};
-use crate::raster::{Lighting, Shade, Target, draw_part, draw_shaded};
+use crate::raster::{Lamp, Lighting, Shade, Target, draw_part, draw_shaded};
 use crate::rig;
 use crate::skin::skin;
 use crate::suit::{AGE, Clothes, GENDER, JOB, JOB_LEVEL, SUIT, Wardrobe, dress};
@@ -151,6 +153,26 @@ impl View {
         )
     }
 
+    /// How far the original's model root is from the floor's on `level`,
+    /// in the drawing frame: its [`LEVEL_OFFSET`] once per level above the
+    /// first, whole (the floor's height included). The offset is fixed in
+    /// the view, so its sideways part turns back with the camera's
+    /// rotation: [`View::place`] of a point moved by it is
+    /// [`View::place_on`] of the point, but for the floor height.
+    pub fn level_lift(&self, level: i32) -> Vec3 {
+        let above = (level - 1).max(0) as f32;
+        // The view's fine axes, in units; undo the rotation's turn.
+        let [u, v] = [LEVEL_OFFSET[2] * above, LEVEL_OFFSET[0] * above];
+        let [x, y] = match self.camera.rotation & 3 {
+            1 => [v, -u],
+            2 => [-u, -v],
+            3 => [-v, u],
+            _ => [u, v],
+        };
+        // Fine (x, y) is the drawing frame's (−y, ·, −x).
+        Vec3::new(-y, LEVEL_OFFSET[1] * above, -x)
+    }
+
     /// The screen position of a fine view position on `level`, raised
     /// `elevation` near-zoom pixels: the lot renderer's
     /// [`Camera::project_fine_f32`], one column right as objects are
@@ -160,13 +182,16 @@ impl View {
         [x + OBJECT_COLUMN, y]
     }
 
-    /// The direction towards the standard light: [`STANDARD_LIGHT`] as it
-    /// is at rotation 0, turned with the view so it stays where it is
+    /// The direction towards the standard light in the drawing frame:
+    /// [`STANDARD_LIGHT`], which is in the original's model frame, turned
+    /// half a turn about the vertical into ours ([`View::place`] has
+    /// fine (x, y) at (−3y/16, 0, −3x/16), the original at (3y/16, 0,
+    /// 3x/16)), then turned with the view so it stays where it is
     /// relative to the viewer.
     pub fn light(&self) -> Vec3 {
         // The light's direction in the view at rotation 0, then back out
         // through this rotation.
-        let light = STANDARD_LIGHT;
+        let light = Vec3::new(-STANDARD_LIGHT.x, STANDARD_LIGHT.y, -STANDARD_LIGHT.z);
         let fine = [-light.z, -light.x];
         let back = rotate((4 - (self.camera.rotation & 3)) & 3, fine, 0.0);
         Vec3::new(-back[1], light.y, -back[0])
@@ -174,17 +199,20 @@ impl View {
 }
 
 /// The direction towards the original's standard light at rotation 0, in
-/// the drawing frame (the files' frame, [`crate::rig`]). The light is
+/// the original's model frame, where fine position (x, y) is at (3y/16,
+/// height, 3x/16): read from its running memory, where a lamp at fine
+/// (424, 472) has its light at (88.5, 8.674, 79.5). [`View::light`] turns
+/// it into the drawing frame. The light is
 /// `GameData/Lights/stdlight.lgt`: one white directional light of
 /// intensity 1 whose direction, the way it shines, is (−0.644, −0.418,
 /// −0.641). Towards it is the opposite: up, and back towards the house
-/// camera at rotation 0, whose eye is along (0.61, 0.5, 0.61) (0x49b0de).
-/// That direction is also the way to the position the file gives the
-/// light, (6.79, 9.55, 6.79): a light above and behind the viewer. That
-/// the direction is the way the light shines, as Direct3D takes a
-/// directional light's, is read from the file's own position, not from
-/// the running game; a person at full light, the only kind compared,
-/// shows no side.
+/// camera at rotation 0, whose eye is along (0.61, 0.5, 0.61) (0x49b0de),
+/// towards larger fine positions, which the lot renderer draws lower and
+/// nearer. That direction is also the way to the position the file gives
+/// the light, (6.79, 9.55, 6.79): a light above and behind the viewer. A
+/// person with their back to the viewer in a dim room is lit on the back,
+/// as the original's screenshot shows (decisions entry "The standard
+/// light shines from the viewer's side, and lamps light people").
 pub const STANDARD_LIGHT: Vec3 = Vec3::new(0.644_362_6, 0.417_676, 0.640_580_7);
 
 /// The level a person is lit at, 0.5 to 1: the light byte of the room
@@ -205,6 +233,101 @@ pub fn level(world: &World, person: u16) -> f32 {
         .and_then(|room| world.rooms.rooms.get(&room))
         .map_or(255, sims_render::lot::room_light);
     (f32::from(byte) / 255.0).clamp(0.5, 1.0)
+}
+
+/// The furthest a lamp's light reaches a person, squared, in model units
+/// (0x6687b8), and how far it stays at full strength (0x6687b4).
+const LAMP_REACH: f32 = 400.0;
+const LAMP_FULL: f32 = 225.0;
+
+/// How far above the ground under a lamp the original puts its light, in
+/// model units (0x467f56, 0x667678).
+const LAMP_HEIGHT: f32 = 5.0;
+
+/// The most lamp lights the original keeps for a room (0x467eff).
+const ROOM_LAMPS: usize = 6;
+
+/// The lamps' lights on a person on `level` whose skeleton's root is at
+/// `at` (the drawing frame: the ground's height under them, moved by
+/// [`View::level_lift`] on a level above the first, as the original's
+/// model root is). The original sets them with the standard light
+/// (0x4b4b04 to 0x4b4c95), from its lighting record of the person: their
+/// level and their root, rounded back to fine position (0x4b4987 through
+/// 0x454fb9, half away from zero).
+///
+/// The tile of that fine position (a sixteenth of it, rounded down) must
+/// be inside the lot's outer ring of tiles. The room is the word the
+/// level's room map holds there; a negative word (a tile a diagonal wall
+/// splits) takes no lamps. The room's lights are those its count leaves
+/// (0x467ed7): it visits the room's listed tiles in order, repeats
+/// included, and each lit lamp ([`sims_render::lot::gives_light`])
+/// standing on a tile it visits adds a light, at most [`ROOM_LAMPS`]. So a
+/// lamp on a tile listed twice lights twice. A light is at the lamp's fine
+/// position, [`LAMP_HEIGHT`] above the ground there, and shines from there
+/// to the root at [`lamp_strength`].
+///
+/// The objects on a tile are taken in ID order. The original takes them
+/// in the order the lot links them; the two differ only for a tile with
+/// two lit lamps in a room past six lights.
+pub fn lamps(world: &World, level: i32, at: Vec3) -> Vec<Lamp> {
+    let fine = [-at.z, -at.x].map(|u| (u * FINE_PER_UNIT).round() as i32);
+    let [x, y] = fine.map(|f| f.div_euclid(16));
+    let full = sims_sim::FULL_SIZE as i32;
+    let inner = |n: i32| n >= 1 && n < full - 1;
+    if !inner(x) || !inner(y) {
+        return Vec::new();
+    }
+    let room = usize::try_from(level - 1)
+        .ok()
+        .and_then(|index| world.rooms.map.get(index))
+        .and_then(|map| map.get((x * full + y) as usize).copied())
+        .filter(|&room| room >= 0);
+    let Some(room) = room.and_then(|room| world.rooms.rooms.get(&room)) else {
+        return Vec::new();
+    };
+    room.tiles
+        .iter()
+        .flat_map(|&tile| {
+            world.objects.values().filter(move |o| {
+                World::tile(o.position).map(i32::from) == tile.map(i32::from)
+                    && sims_render::lot::gives_light(o)
+            })
+        })
+        .take(ROOM_LAMPS)
+        .filter_map(|lamp| {
+            let [fx, fy, _] = lamp.position;
+            let ground = sims_sim::head::ground_height(
+                world,
+                [F32::from_f32(fx as f32), F32::from_f32(fy as f32)],
+            )
+            .map_or(0.0, F32::to_f32);
+            // The drawing frame: fine (x, y) at (−3y/16, height, −3x/16).
+            let light = Vec3::new(
+                -(fy as f32) / FINE_PER_UNIT,
+                ground + LAMP_HEIGHT,
+                -(fx as f32) / FINE_PER_UNIT,
+            );
+            let from = at - light;
+            Some(Lamp {
+                towards: (light - at).normalize(),
+                strength: lamp_strength(from.dot(from))?,
+            })
+        })
+        .collect()
+}
+
+/// A lamp's strength on a person at squared distance `squared` (model
+/// units) from its light: 1 below [`LAMP_FULL`], `1 / ((d² − 225) / 2 +
+/// 1)` from there to [`LAMP_REACH`], and none past it (0x6687b4, 0x6687b8;
+/// the half at 0x666578).
+pub fn lamp_strength(squared: f32) -> Option<f32> {
+    if squared > LAMP_REACH {
+        None
+    } else if squared < LAMP_FULL {
+        Some(1.0)
+    } else {
+        Some(1.0 / ((squared - LAMP_FULL) * 0.5 + 1.0))
+    }
 }
 
 /// The lot renderer's canvas takes people pixel by pixel, by its sprite
@@ -529,9 +652,23 @@ impl People {
             // Each pixel the person draws names them, for a click.
             target.set_id(Some(person.id));
             let lighting = Lighting::standard(light, level(world, person.id));
+            let lamps = lamps(
+                world,
+                person.level,
+                person.root.translation + view.level_lift(person.level),
+            );
             for part in person.body.parts.iter().filter(|p| p.censor == 0) {
                 let skinned = skin(part, &person.bones);
-                draw_part(target, part, &skinned, lighting, project);
+                if lamps.is_empty() {
+                    draw_part(target, part, &skinned, lighting, project);
+                    continue;
+                }
+                let shade: Vec<Shade> = skinned
+                    .normals
+                    .iter()
+                    .map(|&n| lighting.shade_with(n, &lamps))
+                    .collect();
+                draw_shaded(target, part, &skinned, &shade, project);
             }
             // The plumb bob over their head, if they hold it. Its pixels
             // name the person too.
@@ -727,13 +864,15 @@ mod tests {
             assert!((d[0] - first.0[0]).abs() < 1e-4 && (d[1] - first.0[1]).abs() < 1e-4);
             assert_eq!(y, first.1);
         }
-        assert_eq!(View::new(&camera(Zoom::Far, 0)).light(), STANDARD_LIGHT);
+        let turned = Vec3::new(-STANDARD_LIGHT.x, STANDARD_LIGHT.y, -STANDARD_LIGHT.z);
+        assert_eq!(View::new(&camera(Zoom::Far, 0)).light(), turned);
     }
 
     /// At every rotation the standard light is above and behind the
     /// viewer, straight back along the view: its fine x and y in the view
-    /// are equal and fall towards the viewer, as the house camera's eye
-    /// does.
+    /// are equal and grow, towards the viewer, as the house camera's eye
+    /// does. The lot renderer draws a larger fine position lower on the
+    /// screen, nearer.
     #[test]
     fn the_standard_light_is_above_and_behind_the_viewer() {
         for rotation in 0..4 {
@@ -743,11 +882,81 @@ mod tests {
             let (o, _) = view.place(Vec3::ZERO);
             let [x, y] = [a[0] - o[0], a[1] - o[1]];
             assert!(
-                x < 0.0 && y < 0.0 && (x - y).abs() < 0.1 * x.abs(),
+                x > 0.0 && y > 0.0 && (x - y).abs() < 0.1 * x.abs(),
                 "{x} {y}"
             );
             assert!(light.y > 0.0);
+            // Towards the viewer is down the screen.
+            let [_, near] = view.screen(a, 0.0, 1);
+            let [_, middle] = view.screen(o, 0.0, 1);
+            assert!(near > middle, "{near} {middle}, rotation {rotation}");
         }
+    }
+
+    /// A lamp adds its warm light channel by channel on the side facing
+    /// it, each channel held to 1; with no lamps the shade is the grey
+    /// one, and a side away from the lamp takes nothing from it.
+    #[test]
+    fn a_lamps_strength_falls_off_between_15_and_20_units() {
+        assert_eq!(lamp_strength(0.0), Some(1.0));
+        assert_eq!(lamp_strength(224.9), Some(1.0));
+        assert_eq!(lamp_strength(225.0), Some(1.0));
+        assert_eq!(lamp_strength(227.0), Some(0.5));
+        assert_eq!(lamp_strength(400.0), Some(1.0 / 88.5));
+        assert_eq!(lamp_strength(400.01), None);
+    }
+
+    /// The level lift is the offset `place_on` adds, at every rotation:
+    /// a point moved by it is placed where `place_on` puts the point,
+    /// but for the floor height the lot renderer raises a level by.
+    #[test]
+    fn the_level_lift_is_the_offset_place_on_adds() {
+        let floor = sims_render::Zoom::Near.floor_height() as f32;
+        let p = Vec3::new(-20.0, 3.5, -30.0);
+        for rotation in 0..4 {
+            let view = View::new(&camera(Zoom::Medium, rotation));
+            assert_eq!(view.level_lift(1), Vec3::new(0.0, 0.0, 0.0));
+            let (fine, elevation) = view.place(p + view.level_lift(2));
+            let (want, want_elevation) = view.place_on(p, 2);
+            for axis in 0..2 {
+                assert!(
+                    (fine[axis] - want[axis]).abs() < 1e-3,
+                    "{rotation}: {fine:?} {want:?}"
+                );
+            }
+            assert!(
+                (elevation - floor - want_elevation).abs() < 1e-3,
+                "{rotation}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lamp_adds_its_warm_light_facing_it() {
+        let half = Lighting::standard(STANDARD_LIGHT, 0.5);
+        let away = -STANDARD_LIGHT.normalize();
+        assert_eq!(half.shade_with(away, &[]), Shade::Grey(half.shade(away)));
+        let lamp = Lamp {
+            towards: away,
+            strength: 0.25,
+        };
+        let Shade::Colour(lit) = half.shade_with(away, &[lamp]) else {
+            panic!("a lamp gives a coloured shade");
+        };
+        let grey = 128.0 / 255.0;
+        for (channel, colour) in lit.into_iter().zip(crate::raster::LAMP_COLOUR) {
+            assert!((channel - (grey + 0.25 * colour)).abs() < 1e-6, "{lit:?}");
+        }
+        assert_eq!(
+            half.shade_with(-away, &[lamp]),
+            Shade::Colour([1.0; 3]),
+            "the side facing the standard light is already full"
+        );
+        let full = Lamp {
+            towards: away,
+            strength: 1.0,
+        };
+        assert_eq!(half.shade_with(away, &[full]), Shade::Colour([1.0; 3]));
     }
 
     /// At full light a person is at full light all over; at half light

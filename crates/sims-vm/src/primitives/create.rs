@@ -9,22 +9,26 @@
 //! Operands: the GUID (bytes 0..4), where the object goes (byte 4), flags
 //! (byte 5) and a local (byte 6). The jump table at 0x44e92e picks where
 //! the object goes; every mode then runs one common tail (0x44e4c5) that
-//! tests the place, makes the object and puts it there. Six modes are
+//! tests the place, makes the object and puts it there. Seven modes are
 //! ported:
 //!
+//! - Mode 0 (0x44e1e6), with no flag or any of 0x1, 0x4, 0x8, 0x10 and
+//!   0x20: the new object goes on the tile ahead of the running object,
+//!   one tile in its facing, on its level. Nothing about the tile is
+//!   tested before the tail. See `Machine::create_ahead`.
 //! - Mode 2 (0x44e22f), with no flag or any of 0x1, 0x4 and 0x10: the new
 //!   object goes into the running object's first container slot. See
 //!   `Machine::create_in_me`.
 //! - Mode 4 (0x44e3a2), with no flag or any of 0x1, 0x4 and 0x10: the new
 //!   object goes into the stack object's first container slot. See
 //!   `Machine::create_in_stack_object`.
-//! - Mode 5 (0x44e3e9), with no flag or any of 0x1, 0x4, 0x10 and 0x20: the
+//! - Mode 5 (0x44e3e9), with no flag or any of 0x1, 0x4, 0x8, 0x10 and 0x20: the
 //!   new object goes where the running object stands, on its level. As
 //!   mode 8 from there; see `Machine::create_at`.
 //! - Mode 6 (0x44e4b5), with no flag or any of 0x1, 0x4, 0x10 and 0x20: the
 //!   new object stays off the lot. It is not placed (the tail skips the
 //!   place test and the put, 0x44e72c). See `Machine::create_off_lot`.
-//! - Mode 8 (0x44e430), with no flag or any of 0x1, 0x4, 0x10 and 0x20: the new
+//! - Mode 8 (0x44e430), with no flag or any of 0x1, 0x4, 0x8, 0x10 and 0x20: the new
 //!   object goes where the object the local names stands. See
 //!   `Machine::create_at_local`.
 //! - Mode 9 (0x44e157), with the same flags: the new object goes on the
@@ -53,6 +57,13 @@
 //! type already stands on the tile the new object is to go to, or is held
 //! (however deep) by one that does, nothing is made and the false branch
 //! is taken. See `Machine::same_type_on_tile`.
+//!
+//! Flag 0x8 (0x44e51e), tested next in modes 0, 5, 8 and 9: if any object
+//! stands on that tile, or is held by one that does, nothing is made and
+//! the false branch is taken. See `Machine::anything_on_tile`. Mode 0 with
+//! flags 0x9 is what the Goth house's tick 36311 runs (object 16, tree
+//! 0x0183), which is **unverified**: the run has left track 2's recording
+//! by then.
 //!
 //! The person test (0x44e6b6 to 0x44e727) is left out. When the new
 //! object is a person (definition type 2) with bit 0 of person word 84
@@ -89,7 +100,7 @@ use crate::factory::TURN_BUDGET;
 use crate::factory::word::{GROUP, TYPE};
 use crate::fault::Trap;
 use crate::interpreter::Machine;
-use crate::placement::{Place, closed_directions, on_lot, standing_on};
+use crate::placement::{Place, closed_directions, head, on_lot, standing_on};
 use crate::visits::function;
 use sims_sim::World;
 use sims_sim::rooms::NO_ROOM;
@@ -97,6 +108,10 @@ use sims_sim::rooms::NO_ROOM;
 /// Flag 0x1: nothing is made where an object of the same type already
 /// stands.
 const NOT_BESIDE_ITS_TYPE: u8 = 0x1;
+
+/// Flag 0x8: nothing is made on a tile where any object stands
+/// (0x44e51e).
+const ON_A_FREE_TILE: u8 = 0x8;
 
 /// Flag 0x20: turn the new object to face as the stack object faces.
 const FACE_AS_STACK_OBJECT: u8 = 0x20;
@@ -135,8 +150,17 @@ impl Machine<'_, '_> {
         let (mode, flags) = (operands[4], operands[5]);
         let supported = match mode {
             2 | 4 => flags & !(NOT_BESIDE_ITS_TYPE | FROM_RECORD | TEMP_0_TO_NEW) == 0,
-            5 | 6 | 8 | 9 => {
+            6 => {
                 flags & !(NOT_BESIDE_ITS_TYPE | FACE_AS_STACK_OBJECT | FROM_RECORD | TEMP_0_TO_NEW)
+                    == 0
+            }
+            0 | 5 | 8 | 9 => {
+                flags
+                    & !(NOT_BESIDE_ITS_TYPE
+                        | ON_A_FREE_TILE
+                        | FACE_AS_STACK_OBJECT
+                        | FROM_RECORD
+                        | TEMP_0_TO_NEW)
                     == 0
             }
             _ => false,
@@ -161,6 +185,7 @@ impl Machine<'_, '_> {
             return Ok(false);
         }
         match mode {
+            0 => self.create_ahead(guid, flags),
             2 => self.create_in_me(guid, flags),
             4 => self.create_in_stack_object(guid, flags),
             5 => {
@@ -343,6 +368,15 @@ impl Machine<'_, '_> {
         Ok(false)
     }
 
+    /// Flag 0x8's test (0x44e51e to 0x44e541): whether any object stands
+    /// on the tile of `position` at `level`. The original starts the walk
+    /// flag 0x1's test makes ([`standing_on`], 0x43f331) and reads only
+    /// its first object, the tile's first ([`head`]), so nothing past it is
+    /// looked at.
+    fn anything_on_tile(&self, position: [i32; 2], level: i32) -> Result<bool, Trap> {
+        Ok(head(self.world, World::tile([position[0], position[1], level])).is_some())
+    }
+
     /// Whether a position is off the lot (0x422632): a tile byte below 1
     /// or at least the lot's size less 1.
     fn off_lot(&self, position: [i32; 2]) -> bool {
@@ -501,9 +535,8 @@ impl Machine<'_, '_> {
     ///    whole. Any other new object turns to the stack object's facing
     ///    with its lowest bit cleared: up to four calls of virtual function
     ///    0x4c, one step each. Nothing turns when the stack object names no
-    ///    object. Only the case with nothing to turn is ported; a turn
-    ///    (0x433f75, which redraws, updates seats and the walls beside)
-    ///    fails loudly.
+    ///    object. A group turns by 0x422937, a one-tile object by 0x433f75
+    ///    ([`crate::Interpreter::turn_one`]).
     /// 6. A new person's person test (see the module's note) touches only the
     ///    screen, and is left out.
     /// 7. The place test (virtual function 0x54, with no container) at the
@@ -516,9 +549,10 @@ impl Machine<'_, '_> {
     /// Mode 8 keeps the room filter at -5 (0x44e13c), so the room test of
     /// mode 4's step 4 never runs. An object whose definition names a
     /// group (word 10, which sends the original through a group's own
-    /// steps) fails loudly before anything is made. Flags 0x2, 0x8 and
-    /// 0x40, which this mode can also carry, are refused by the caller;
-    /// flag 0x4 only chose the type.
+    /// steps) fails loudly before anything is made. Flags 0x2 and 0x40,
+    /// which this mode can also carry, are refused by the caller; flag 0x4
+    /// only chose the type, and flag 0x8 is tested after flag 0x1
+    /// ([`Machine::create_at`]).
     fn create_at_local(&mut self, guid: u32, flags: u8, local: i8) -> Result<bool, Trap> {
         let frame = self.frame()?;
         let local = usize::try_from(local)
@@ -576,8 +610,23 @@ impl Machine<'_, '_> {
         self.create_at(guid, flags, position, level, Some(facing))
     }
 
-    /// Modes 5 and 8 of 0x44e0c8 from the position and level the mode
-    /// gives on: steps 2 to 8 of [`Machine::create_at_local`].
+    /// Mode 0 of 0x44e0c8 (0x44e1e6, then the common tail): the tile in
+    /// front of me. My position moves one tile (16 units) in my facing
+    /// (data word 1, +0x4c, masked with 7; 0x42228a and 0x4222bc, whose
+    /// steps are [`crate::placement::forward`]'s), on my level (+0x110).
+    /// No facing or room is tested, so the tail is mode 5's
+    /// ([`Machine::create_at`]).
+    fn create_ahead(&mut self, guid: u32, flags: u8) -> Result<bool, Trap> {
+        let me = self.me()?;
+        let [p0, p1, level] = me.position;
+        let [step0, step1] = crate::placement::step(me.data[1]);
+        let position = [p0.wrapping_add(step0 * 16), p1.wrapping_add(step1 * 16)];
+        self.create_at(guid, flags, position, level, None)
+    }
+
+    /// Modes 0, 5, 8 and 9 of 0x44e0c8 from the position and level the
+    /// mode gives on: steps 2 to 8 of [`Machine::create_at_local`], with
+    /// flag 0x8's test after flag 0x1's ([`Machine::anything_on_tile`]).
     fn create_at(
         &mut self,
         guid: u32,
@@ -587,6 +636,9 @@ impl Machine<'_, '_> {
         facing: Option<i32>,
     ) -> Result<bool, Trap> {
         if flags & NOT_BESIDE_ITS_TYPE != 0 && self.same_type_on_tile(guid, position, level)? {
+            return Ok(false);
+        }
+        if flags & ON_A_FREE_TILE != 0 && self.anything_on_tile(position, level)? {
             return Ok(false);
         }
         if self.off_lot(position) {
@@ -653,9 +705,8 @@ impl Machine<'_, '_> {
     /// four calls of virtual function 0x4c, one step each, while its
     /// facing differs. Nothing turns when the stack object names no
     /// object. A group turns ([`crate::Interpreter::turn_group`],
-    /// 0x422937); a one-tile object only when there is nothing to turn, as
-    /// its turn (0x433f75, which redraws, updates seats and the walls
-    /// beside) fails loudly.
+    /// 0x422937), a one-tile object by its own turn
+    /// ([`crate::Interpreter::turn_one`], 0x433f75).
     fn face_as_stack_object(&mut self, created: u16, person: bool) -> Result<(), Trap> {
         let source = self.frame()?.stack_object;
         let Some(source) = u16::try_from(source)
@@ -699,12 +750,26 @@ impl Machine<'_, '_> {
             }
             return Ok(());
         }
-        if object.data[1] != wanted {
-            return Err(Trap::Unsupported(format!(
-                "Create New Object Instance turning object {created} from facing {} to \
-                 {wanted}: turning (0x433f75) is not ported",
-                object.data[1]
-            )));
+        // A one-tile object turns by its own virtual function 0x4c
+        // (0x433f75); see docs/decisions/20261115-snap-offset-order.md.
+        let interpreter = self.interpreter();
+        for _ in 0..4 {
+            let now = self
+                .world
+                .objects
+                .get(&created)
+                .ok_or(Trap::native(10, "missing object"))?
+                .data[1];
+            if now == wanted {
+                break;
+            }
+            interpreter
+                .turn_one(self.world, created, 1)
+                .map_err(|fault| {
+                    Trap::Unsupported(format!(
+                        "Create New Object Instance turning object {created}: {fault}"
+                    ))
+                })?;
         }
         Ok(())
     }

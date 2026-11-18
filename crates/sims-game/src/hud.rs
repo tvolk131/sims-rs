@@ -13,6 +13,7 @@ use sims_content::{Install, Neighborhood};
 use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_sim::World;
 use sims_ui::art::Art;
+use sims_ui::balloon::Texts;
 use sims_ui::command::{Command, Panel as UiPanel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
@@ -39,6 +40,8 @@ pub const QUEUE_DELETE: &str = "UI_queue_delete";
 pub const ERROR: &str = "UI_error";
 /// A press on a portrait (0x4cfa51).
 pub const CLICK: &str = "UI_click";
+/// A help balloon opening or closing (0x50fa95, 0x50fb7f).
+pub const WHOOSH: &str = "UI_whoosh";
 
 pub struct Hud {
     pub art: Art,
@@ -53,11 +56,16 @@ pub struct Hud {
     /// The curves and constants the house panel's ratings are worked out
     /// with.
     house: house::Tuning,
+    /// Which of the lot's object types the Upkeep rating counts, read as
+    /// they show up while the house panel shows.
+    kinds: house::Kinds,
     /// What the relationship panel needs from outside the world: the
     /// autonomy tuning's friendship threshold (0x6c4398) for its
     /// smileys, the neighborhood's characters, and the Superstar pack.
     known: Acquaintances,
     labels: Labels,
+    /// The help balloons' texts.
+    texts: Texts,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
     pub controls: Controls,
@@ -101,8 +109,12 @@ impl Hud {
             .chain(&thumbnail::RESOURCES)
             .copied()
             .collect();
-        let art = Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
+        let mut art = Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
+        art.load_optional(&ui, US_ENGLISH, sims_ui::balloon::BACKGROUND);
         let labels = Labels::load(&install).map_err(|e| e.to_string())?;
+        // Without the balloons' strings the HUD still opens; the balloons
+        // show what text they have.
+        let texts = Texts::load(&install).unwrap_or_default();
         let neighborhood = house
             .parent()
             .and_then(Path::parent)
@@ -142,8 +154,10 @@ impl Hud {
             problems: Vec::new(),
             careers,
             house,
+            kinds: house::Kinds::default(),
             known,
             labels,
+            texts,
             members,
             // The strip opens as if Live had been pressed.
             controls: Controls {
@@ -204,7 +218,9 @@ impl Hud {
         let snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
         match self.controls.panel {
             UiPanel::Relationships => snapshot.with_relations(world, &self.members, &self.known),
-            UiPanel::House if self.controls.expanded => snapshot.with_house(world, &self.house),
+            UiPanel::House if self.controls.expanded => {
+                snapshot.with_house(world, &self.house, &self.kinds)
+            }
             _ => snapshot,
         }
     }
@@ -236,9 +252,13 @@ impl Hud {
             zoom_out: camera.zoom != Zoom::Far,
         };
         self.controls.speed = pace.speed;
+        if self.controls.expanded && self.controls.panel == UiPanel::House {
+            self.kinds.learn(world, assets.index(), assets.catalog());
+        }
         // The pause button shows global 17, which the game's pause sets.
         let snapshot = self.snapshot(world);
         self.items = hud::layout(view.size, &snapshot, &self.controls);
+        hud::fit(&mut self.items, &self.art, &self.texts);
         self.queue = Queue::read(world, snapshot.selected);
         self.pressed.keep(&self.queue);
         let objects: Vec<u32> = self.queue.objects().collect();
@@ -466,7 +486,11 @@ impl Hud {
             return command;
         }
         let command = hud::press(&self.items, point)?;
+        let open = self.controls.help.is_some();
         self.controls.apply(&command);
+        if self.controls.help.is_some() != open {
+            self.play(WHOOSH);
+        }
         Some(command)
     }
 }

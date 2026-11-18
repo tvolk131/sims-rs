@@ -330,10 +330,9 @@ fn a_person_using_a_changed_object_stops_its_visit() {
     let fault = interpreter
         .visit(&mut fx.world, id, &People::default())
         .unwrap_err();
-    assert!(
-        fault.to_string().contains("person 50 is using object"),
-        "{fault}"
-    );
+    // The person resets fully as it lets go (0x45e814), and a person
+    // whose data word 73 is set is not reset here.
+    assert!(fault.to_string().contains("data word 73"), "{fault}");
 }
 
 /// The GUID of the person type some tests add, and its trees.
@@ -573,6 +572,109 @@ fn a_changed_person_using_an_object_lets_it_go_and_the_object_resets() {
 }
 
 #[test]
+fn a_person_with_flag_0x1000_does_not_reset_the_object_it_used() {
+    // 0x45e7c8 to 0x45e7db: with no object named, the person's own flag
+    // 0x1000 (the removal queue's mark, set by Remove Object Instance's
+    // flag bit 1) skips letting go of and resetting what it used. The use
+    // is still released.
+    let (mut fx, file) = lot();
+    let people = resident(&mut fx);
+    let widget = stand(&mut fx, [2, 2]);
+    fx.add(file, CANCELLED, note(7, scope::LITERAL, 8));
+    function(&mut fx, file, 3, CANCELLED);
+    fx.world.changed_types.insert(RESIDENT);
+    let sim = fx.world.objects.get_mut(&PERSON).unwrap();
+    sim.removal_skips_resets = true;
+    sim.person
+        .as_mut()
+        .unwrap()
+        .object_uses
+        .push(sims_formats::saved_objects::ObjectUse {
+            target: widget as i16,
+            stack_depth: 1,
+            unknown: 0,
+        });
+    let visited = visit_with(&mut fx, PERSON, &people);
+    assert_eq!(visited, [(PERSON, 3), (PERSON, 0)]);
+    assert_ne!(fx.lamp().attributes[7], 8, "the widget did not reset");
+    let person = fx.world.objects[&PERSON].person.as_ref().unwrap();
+    assert!(person.object_uses.is_empty());
+}
+
+#[test]
+fn a_person_using_a_changed_object_resets_fully_as_it_lets_go() {
+    // 0x45e791 with the object: the person uses it, so it resets fully
+    // (0x45e814): the use is released, the object it used is let go of
+    // and reset (its flag 0x1000 is clear), and the person's own reset
+    // runs. The visit's Load comes first.
+    let (mut fx, file) = lot();
+    let people = resident(&mut fx);
+    fx.program.people = people.clone();
+    let widget = stand(&mut fx, [2, 2]);
+    fx.add(file, CANCELLED, note(7, scope::LITERAL, 8));
+    function(&mut fx, file, 3, CANCELLED);
+    fx.world.changed_types.insert(WIDGET);
+    let other = stand(&mut fx, [3, 3]);
+    let person = fx
+        .world
+        .objects
+        .get_mut(&PERSON)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person
+        .object_uses
+        .push(sims_formats::saved_objects::ObjectUse {
+            target: widget as i16,
+            stack_depth: 1,
+            unknown: 0,
+        });
+    // An action queued on another object is not the widget's: the full
+    // reset leaves the queue to the filter (0x45eac7), which keeps it.
+    // Only the reset with no object named empties the queue (0x45ecc2).
+    let mut queued = person.last.clone();
+    queued.target = other as i16;
+    person.queue = vec![queued];
+    let visited = visit_with(&mut fx, widget, &people);
+    assert_eq!(&visited[..3], [(widget, 2), (widget, 3), (PERSON, 3)]);
+    assert!(!visited.contains(&(other, 4)), "{visited:?}");
+    let person = fx.world.objects[&PERSON].person.as_ref().unwrap();
+    assert!(person.object_uses.is_empty());
+    assert_eq!(person.queue.len(), 1);
+    assert_eq!(person.queue[0].target, other as i16);
+    let frame = &fx.world.objects[&PERSON].stack[0];
+    assert_eq!((frame.tree, frame.node), (RESIDENT_MAIN, 0));
+}
+
+#[test]
+fn a_reset_ends_a_running_action_and_keeps_it_as_the_last() {
+    // 0x45eab3: the running action becomes the empty action (0x45e6cd).
+    // One with a target becomes the last action, its flag 0x20 the
+    // person's last result (+0x20) as it is then: after the Reset tree
+    // (0x45ea80), whose true result it holds whatever it was before.
+    for last_result in [false, true] {
+        let (mut fx, _) = lot();
+        let people = resident(&mut fx);
+        let widget = stand(&mut fx, [2, 2]);
+        fx.world.changed_types.insert(RESIDENT);
+        let sim = fx.world.objects.get_mut(&PERSON).unwrap();
+        sim.last_result = last_result;
+        let person = sim.person.as_mut().unwrap();
+        person.active.target = widget as i16;
+        person.active.icon = widget as i16;
+        person.active.uid = 9;
+        person.active.flags = 0;
+        visit_with(&mut fx, PERSON, &people);
+        let person = fx.world.objects[&PERSON].person.as_ref().unwrap();
+        assert_eq!((person.active.target, person.active.icon), (0, 0));
+        assert_eq!((person.last.target, person.last.uid), (widget as i16, 9));
+        assert_ne!(person.last.flags & 0x20, 0, "{last_result}");
+        assert_eq!(person.data[33], 0);
+    }
+}
+
+#[test]
 fn a_profile_string_that_is_missing_leaves_its_word() {
     let profile =
         |gender: Option<&str>, age: Option<&str>, skin: Option<&str>| sims_content::Profile {
@@ -632,11 +734,6 @@ fn a_person_the_reset_would_do_more_for_stops_its_visit() {
     let person = |change: &dyn Fn(&mut sims_formats::saved_objects::Person)| {
         fails(&|object| change(object.person.as_mut().unwrap()))
     };
-    let acting = person(&|p| p.active.target = 77);
-    assert!(
-        acting.contains("whose running action has a target"),
-        "{acting}"
-    );
     let wide = person(&|p| p.data[73] = 1);
     assert!(wide.contains("whose data word 73 is set"), "{wide}");
     let away = fails(&|object| object.position = [-16, -16, 1]);
@@ -1008,7 +1105,7 @@ fn a_new_object_can_be_created_off_the_lot_and_run_a_tree_by_name() {
     // stack object and the lamp's temps as its arguments.
     assert_eq!(widget.attributes[2], 4);
     assert!(fx.lamp().stack.is_empty());
-    // Placing a new object is not ported.
+    // Mode 1 is not ported.
     fx.add(
         LAMP_FILE,
         4096,
@@ -1016,11 +1113,11 @@ fn a_new_object_can_be_created_off_the_lot_and_run_a_tree_by_name() {
             42,
             RETURN_TRUE,
             RETURN_FALSE,
-            [guid[0], guid[1], guid[2], guid[3], 0, 0, 0, 0],
+            [guid[0], guid[1], guid[2], guid[3], 1, 0, 0, 0],
         )]),
     );
     let text = trap(fx.run()).to_string();
-    assert!(text.contains("Create New Object Instance mode 0"), "{text}");
+    assert!(text.contains("Create New Object Instance mode 1"), "{text}");
 }
 
 /// A route context of `person` to slot 0 of the lamp.

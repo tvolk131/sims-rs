@@ -46,8 +46,9 @@ drew between updates, not from the simulation.
 
   The free run without input matches the long captures as before, with
   and without the queue step.
-  The strict boot's hashes from tick 3432 on changed (`tests/boot.rs`),
-  and its text outputs at 1102, 3602 and 9906 did not. The frame after
+  The strict boot's hashes at ticks 3432, 3602, 3603, 3912, 9906 and
+  31478 changed (`tests/boot.rs`); those at 2881, 20186 and 43200 did
+  not, nor did its text outputs at 1102, 3602 and 9906. The frame after
   2913 clears flag 0x80 on Mortimer's action (routine 4102 on object 8,
   icon 334): 220 becomes 92. The goth day capture has 92 for that action
   from 2930 to 3350, where main had 220.
