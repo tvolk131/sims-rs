@@ -20,7 +20,7 @@ A scenario is a text file, one step per line, words split as in a shell,
                                reports it under the pointer, click, and keep
                                the pie menu only if its actions aim at ID
                                (else close it with Escape and aim again)
-  choose LABEL                 click the open pie menu's entry LABEL (#N: the
+  choose LABEL                 click the open pie menu's entry LABEL (@N: the
                                N-th item, from 0); for an entry that opens a
                                submenu ("Talk..."), wait for the submenu and
                                log it, and choose again
@@ -51,7 +51,9 @@ Ghidra on the decrypted image and checked in the running game):
 - Picker +0x58: the open pie menu's entries, a pointer to a vector
   (begin, end) of 0x28-byte records: +0 the label (begin, end, capacity of
   its characters), +0x14 nonzero for an entry that opens a submenu, +0x24
-  the action it queues. +0x64 is the index of the first shown entry.
+  the action it queues. +0x64 is the index of the first shown entry: the
+  pie's item i is entry i + (+0x64). +0xe4 is the pie window the menu is
+  in; a submenu opens in the people panel's other window.
 - The people panel (cWinPeople) is the word at 0x6f3b2c. Its +0xdc and
   +0xe0 are the two pie menus (cTSPieMenu, vtable 0x674b54) it draws.
   Pie +0x13c, +0x140: the menu window's origin on the screen; +0xd4: the
@@ -87,6 +89,7 @@ VIEW_ZOOM, VIEW_X0, VIEW_Y0 = 0x6f00d8, 0x6f00d0, 0x6f00d4
 QUEUE_PUSH = 0x48ddcb
 ACTIVE_ACTION = 0xa48  # a person's running action (0x44 bytes); the queue is at +0x820
 PICKER_TOOL = 6
+PICKER_ACTIVE_PIE = 0xe4  # the pie window the picker's menu is in (a submenu's, once one opens)
 WINDOW = '0xe00013'
 
 STEPS = {
@@ -258,6 +261,17 @@ def read_hover(m):
     return m.half(picker(m) + 0x2e)
 
 
+def entry_vector(m):
+    """The picker's entry vector: its pointer and its begin (a new menu rebuilds it)."""
+    vec = m.word(picker(m) + 0x58)
+    return (vec, m.word(vec) if vec else 0)
+
+
+def first_shown(m):
+    """The picker entry shown as the pie's item 0 (a long menu is paged)."""
+    return signed(m.word(picker(m) + 0x64))
+
+
 def read_entries(m):
     """The open pie menu's entries as the picker holds them."""
     p = picker(m)
@@ -276,12 +290,18 @@ def read_entries(m):
 
 def read_pie(m):
     """The pie menu on the screen, or None: dict(pointer, origin, highlighted, items)
-    with items [dict(label, enabled, x, y, w, h)] in screen coordinates."""
+    with items [dict(label, enabled, x, y, w, h)] in screen coordinates. A
+    submenu opens in the panel's other window while the parent keeps its
+    items, so the picker's active window (+0xe4) is read first."""
     panel = m.word(PEOPLE_PANEL)
     if not panel:
         return None
-    for off in (0xdc, 0xe0):
-        pie = m.word(panel + off)
+    pies = [m.word(panel + off) for off in (0xdc, 0xe0)]
+    active = m.word(picker(m) + PICKER_ACTIVE_PIE)
+    if active in pies:
+        pies.remove(active)
+        pies.insert(0, active)
+    for pie in pies:
         if not pie:
             continue
         begin, end = m.word(pie + 0x190), m.word(pie + 0x194)
@@ -372,8 +392,8 @@ def check_window(window):
 
 def match_item(items, label):
     """The index of the item whose label is label (case and surrounding space ignored), or None.
-    `#N` is the N-th item (from 0), for a menu whose labels are not known ahead."""
-    if label.startswith('#') and label[1:].isdigit():
+    `@N` is the N-th item (from 0), for a menu whose labels are not known ahead."""
+    if label.startswith('@') and label[1:].isdigit():
         n = int(label[1:])
         return n if n < len(items) else None
     want = label.strip().lower()
@@ -916,11 +936,12 @@ class Runner:
         i = match_item(pie['items'], label)
         if i is None:
             raise StepFailed(f'no entry {label!r} in {[it["label"] for it in pie["items"]]}')
-        if i < len(entries) and entries[i]['submenu']:
-            yield from self.open_submenu(pie, i, label, entries)
-            return
         pushes = len(self.pushes)
         self.push_cursor = pushes  # expect-queued looks only at what this choice pushes
+        k = i + first_shown(self.m)
+        if 0 <= k < len(entries) and entries[k]['submenu']:
+            yield from self.open_submenu(pie, i, label, entries)
+            return
         yield from self.press_entry(pie, i, label)
         for _ in range(200):
             if len(self.pushes) > pushes:  # known without reading memory (a dialog may be up)
@@ -950,14 +971,15 @@ class Runner:
         """Press the entry i that opens a submenu ("Talk...") and wait for the
         picker's entries to become the submenu's; log that pie. The next
         `choose` picks from it. Nothing is pushed by this press."""
-        before = [e['label'] for e in entries]
+        before = (pie['pointer'], entry_vector(self.m), [e['label'] for e in entries])
         yield from self.press_entry(pie, i, label)
         yield Fresh()
         now = entries
         for _ in range(200):  # the menu may be empty for a moment between the two
             now = read_entries(self.m)
-            if now and [e['label'] for e in now] != before:
-                self.log_pie(read_pie(self.m), now)
+            shown = read_pie(self.m)
+            if now and shown and (shown['pointer'], entry_vector(self.m), [e['label'] for e in now]) != before:
+                self.log_pie(shown, now)
                 return
             yield Updates(1)
         if not now:

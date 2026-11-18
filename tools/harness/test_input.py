@@ -84,7 +84,7 @@ class Game:
         m.put_words(game + 0x18, manager)
         tools = m.alloc(4 * 12)
         m.put_words(manager, tools)
-        self.picker = m.alloc(0x80)
+        self.picker = m.alloc(0x100)
         m.put_words(tools + 4 * inp.PICKER_TOOL, self.picker)
         self.panel = m.alloc(0x100)
         m.put_words(inp.PEOPLE_PANEL, self.panel)
@@ -116,7 +116,10 @@ class Game:
     def hover(self, oid):
         self.m.put(self.picker + 0x2e, struct.pack('<H', oid))
 
-    def open_pie(self, labels, origin=(309, 110), target=None, caller=None, submenus=()):
+    def open_pie(self, labels, origin=(309, 110), target=None, caller=None, submenus=(), window=0, first=0):
+        """A menu of entries `labels` in pie window `window`, showing the entries
+        from `first` on (a paged menu). A submenu opens in the other window
+        while the parent window keeps its items, as in the game."""
         m = self.m
         entries = m.alloc(0x28 * len(labels))
         items = m.alloc(0x28 * len(labels))
@@ -128,19 +131,24 @@ class Game:
             m.put_words(entries + 0x28 * i + 0x24, action)
             if label in submenus:
                 m.put(entries + 0x28 * i + 0x14, b'\x01')
+        shown = labels[first:]
+        for i, label in enumerate(shown):
+            b, e = m.string(label)
             m.put_words(items + 0x28 * i, b, e, e + 1)
             m.put(items + 0x28 * i + 0x10, b'\x01')
             m.put_words(items + 0x28 * i + 0x18, 10 + 40 * i, 20, 30, 20)
         vec = m.alloc(12)
         m.put_words(vec, entries, entries + 0x28 * len(labels), entries + 0x28 * len(labels))
         m.put_words(self.picker + 0x58, vec)
-        pie = self.pies[0]
-        m.put_words(pie + 0x190, items, items + 0x28 * len(labels))
+        m.put_words(self.picker + 0x64, first)
+        pie = self.pies[window]
+        m.put_words(self.picker + inp.PICKER_ACTIVE_PIE, pie)
+        m.put_words(pie + 0x190, items, items + 0x28 * len(shown))
         m.put_words(pie + 0x13c, *origin)
         m.put_words(pie + 0xd4, -1)
 
     def highlight(self, i):
-        self.m.put_words(self.pies[0] + 0xd4, i)
+        self.m.put_words(self.m.word(self.picker + inp.PICKER_ACTIVE_PIE) + 0xd4, i)
 
     def close_pie(self):
         self.m.put_words(self.picker + 0x58, 0)
@@ -427,22 +435,32 @@ class RunnerTest(RunnerBase):
         taken = self.rows('taken')[0]
         self.assertEqual((taken['person'], taken['where'], taken['active']['target']), (21, 'active', 173))
 
-    def test_choosing_a_submenu_entry_opens_it_and_the_next_choice_picks_from_it(self):
+    def open_talk(self, r, **kw):
+        """Press "Talk..." on a two-entry parent menu; returns at the press."""
         g = self.g
-        g.open_pie(['Dance...', 'Talk...'], target=self.bench, caller=self.person, submenus=('Dance...', 'Talk...'))
-        r = self.runner('choose Talk...\nchoose Joke\nexpect-queued 21 173 within 20')
+        g.open_pie(['Dance...', 'Talk...'], target=self.bench, caller=self.person,
+                   submenus=('Dance...', 'Talk...'), **kw)
         self.tick(r, 2)
         g.highlight(1)
         self.tick_until(r, lambda: 'mousedown' in self.last_command())
         self.tick(r, 3)
         self.assertEqual([x['status'] for x in self.rows('step')], ['start'])  # waiting for the submenu
-        g.open_pie(['Joke', 'Gossip'], target=self.bench, caller=self.person)
+
+    def test_choosing_a_submenu_entry_opens_it_and_the_next_choice_picks_from_it(self):
+        g = self.g
+        r = self.runner('choose Talk...\nchoose Joke\nexpect-queued 21 173 within 20')
+        self.open_talk(r)
+        g.close_pie()  # empty for a moment between the two menus
+        self.tick(r, 3)
+        # The submenu opens in the other window; the parent window keeps its items.
+        g.open_pie(['Joke', 'Gossip'], target=self.bench, caller=self.person, window=1)
         self.tick_until(r, lambda: len(self.rows('step')) > 2)
         self.assertEqual([e['label'] for e in self.rows('pie')[-1]['entries']], ['Joke', 'Gossip'])
         self.assertEqual(self.rows('step')[1]['status'], 'done')
         self.assertFalse(self.rows('queued'))  # the submenu press pushes nothing
         g.highlight(0)
         self.tick_until(r, lambda: sum('mousedown' in c for c in self.agent.commands) == 2)
+        self.assertEqual(self.rows('command')[-1]['entry'], 'Joke')
         action = g.m.alloc(0x44)
         g.m.put_words(action + 4, self.person, self.bench)
         r.on_queue_push(self.update + 1, False, g.m, dict(edi=self.person, esi=action))
@@ -451,6 +469,40 @@ class RunnerTest(RunnerBase):
         self.tick_until(r, lambda: r.finished)
         self.assertIsNone(r.failed)
         self.assertEqual(self.rows('taken')[0]['where'], 'active')
+
+    def test_a_submenu_with_the_parents_labels_is_still_seen(self):
+        g = self.g
+        r = self.runner('choose Talk...\nwait 1')
+        self.open_talk(r)
+        g.open_pie(['Dance...', 'Talk...'], target=self.bench, caller=self.person, window=1)
+        self.tick_until(r, lambda: r.finished)
+        self.assertIsNone(r.failed)
+
+    def test_a_submenu_entry_on_a_later_page(self):
+        g = self.g
+        # Entry 0 is an action, entry 1 ("Talk...") a submenu shown as item 0.
+        g.open_pie(['Invite Downtown', 'Talk...'], target=self.bench, caller=self.person,
+                   submenus=('Talk...',), first=1)
+        r = self.runner('choose Talk...\nwait 1')
+        self.tick(r, 2)
+        g.highlight(0)
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        g.open_pie(['Joke'], target=self.bench, caller=self.person, window=1)
+        self.tick_until(r, lambda: r.finished)
+        self.assertIsNone(r.failed)
+        self.assertEqual([e['label'] for e in self.rows('pie')[-1]['entries']], ['Joke'])
+
+    def test_expect_queued_after_a_submenu_ignores_an_earlier_push(self):
+        g = self.g
+        action = g.m.alloc(0x44)
+        g.m.put_words(action + 4, self.person, self.bench)
+        g.m.put_words(self.person + inp.ACTIVE_ACTION + 4, self.person, self.bench)
+        r = self.runner('choose Talk...\nexpect-queued 21 173 within 5')
+        r.on_queue_push(1, False, g.m, dict(edi=self.person, esi=action))  # an earlier order, still running
+        self.open_talk(r)
+        g.open_pie(['Joke'], target=self.bench, caller=self.person, window=1)
+        self.tick_until(r, lambda: r.finished)
+        self.assertIn('no action was queued', r.failed)
 
     def test_a_submenu_entry_that_closes_the_menu_fails(self):
         g = self.g
@@ -467,8 +519,9 @@ class RunnerTest(RunnerBase):
 
     def test_an_item_by_its_place(self):
         items = [dict(label='Joke'), dict(label='Gossip')]
-        self.assertEqual((inp.match_item(items, '#1'), inp.match_item(items, '#2'), inp.match_item(items, 'gossip')),
+        self.assertEqual((inp.match_item(items, '@1'), inp.match_item(items, '@2'), inp.match_item(items, 'gossip')),
                          (1, None, 1))
+        self.assertEqual(inp.parse_scenario('choose @1  # the first item')[0]['args'], ['@1'])
 
     def test_a_missing_entry_fails_without_raising(self):
         self.g.open_pie(['Sit'])
