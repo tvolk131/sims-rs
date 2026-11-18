@@ -2507,6 +2507,34 @@ fn a_route_asked_to_stop_stops_blocked_after_the_walks_next_step() {
     assert!(fx.world.stops_asked.contains(&SIM));
 }
 
+#[test]
+fn the_walk_tests_word_64_as_it_was_when_the_tick_began() {
+    // The walk reads person word 64 once, as the animator's tick begins
+    // (0x58dcaf, kept at [ebp-0x24]). Here the person's own placed tree
+    // (function 9) sets it as the step puts them. The asked stop still
+    // takes the path for word 64 clear: the route ends blocked, where a
+    // fresh read would take the stop clip's path (0x58ef2f, not ported).
+    const MY_PERSON_DATA: u8 = 18;
+    const PLACED_TREE: u16 = 4200;
+    let mut fx = facing_along();
+    fx.world.stops_asked.insert(SIM);
+    crate::visits::function(&mut fx, SIM_FILE, 9, PLACED_TREE);
+    fx.add(
+        SIM_FILE,
+        PLACED_TREE,
+        tree(vec![assign(
+            MY_PERSON_DATA,
+            64,
+            scope::LITERAL,
+            1,
+            RETURN_TRUE,
+        )]),
+    );
+    tick(&mut fx).unwrap();
+    assert_eq!(fx.sim().person.as_ref().unwrap().data[64], 1);
+    assert_eq!(fx.world.animators[&SIM].arrival, 3);
+}
+
 /// The standing Sim on the flat lot, its thread at Look Towards in mode 2
 /// (tree 4098) with the lamp, at [130, 210, 1], as its stack object.
 fn looking_at_the_lamp() -> Fixture {
