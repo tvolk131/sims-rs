@@ -125,8 +125,11 @@ impl Interpreter<'_> {
             // 0x45e814: the full reset, with T's flag 0x1000 deciding
             // whether the objects P used reset. P is already marked as in
             // the middle of a reset. It leaves the queue to the filter,
-            // which follows.
-            self.reset_fully(world, me, &self.program.people, false, Some(target))?;
+            // which follows. P's own deletion mark (flag 0x40) holds here
+            // too: P can be told to let go while it is being deleted, by a
+            // reset its deletion set off.
+            let deleting = self.being_deleted(me);
+            self.reset_fully(world, me, &self.program.people, deleting, Some(target))?;
         }
         if person_of(world, me).map_err(fail)?.queue.iter().any(names) {
             self.filter_queue(world, me, target)?;
