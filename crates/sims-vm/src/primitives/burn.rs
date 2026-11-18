@@ -40,9 +40,11 @@
 //! 7. **The gathered objects are tested.** Any with data word 8 flag
 //!    0x800 takes the false branch, and so, without bit 0 of byte 1, does
 //!    any with data word 8 flag 0x20 or data word 62 above 0.
-//! 8. **A person among them** moves to the centre of its tile (virtual
-//!    functions 0x38, 0x58 and 0x74, 0x44df25). That is not ported and
-//!    fails loudly.
+//! 8. **A person among them** moves to the centre of its tile (0x44df25,
+//!    [`Machine::burn_person`]): its position and level are read, it
+//!    resets (virtual function 0x38 with 0, 0x45e791), it is put at the
+//!    centre of the tile it stood on with the lot told (virtual function
+//!    0x58, 0x433340), and its virtual function 0x74 runs (0x45e519).
 //! 9. **Each gathered object** whose tile has no fire on it gets one, made
 //!    and placed at the centre of its tile, as in step 5. The place test
 //!    takes the object's level as it was; the put reads it again
@@ -175,10 +177,7 @@ impl Machine<'_, '_> {
         }
         for &id in &gathered {
             if self.interpreter().kind(self.world, id)? == PERSON {
-                return Err(Trap::Unsupported(format!(
-                    "Burn moving person {id} to the centre of its tile (virtual functions \
-                     0x38, 0x58 and 0x74, 0x44df25) is not ported"
-                )));
+                self.burn_person(id)?;
             }
         }
         let mut lit = false;
@@ -322,6 +321,50 @@ impl Machine<'_, '_> {
             .position;
         let centre = |n: i32| (n & !0xf) | 8;
         self.put_fire(fire, [centre(p0), centre(p1)], level, Some(id))
+    }
+
+    /// A person the fire spreads to moves to the centre of its tile
+    /// (0x44df25). Its position and level are read first. Then it resets
+    /// (its virtual function 0x38 with 0, 0x45e791,
+    /// [`crate::Interpreter::reset_person`]), which fails loudly for the
+    /// cases that reset does not handle. It is put at the centre of the
+    /// tile it stood on, at the level it had, with the lot told (virtual
+    /// function 0x58, 0x433340, called as the fire's put is: no container,
+    /// notify 1). Last its virtual function 0x74 runs (0x45e519,
+    /// [`crate::Interpreter::refresh_person`]): its animator's position is
+    /// unset and person word 64 says whether it stands on a pool tile.
+    ///
+    /// The put is not place-tested first, as the original does not test
+    /// it (**unverified** what the original does when the centre is
+    /// taken).
+    fn burn_person(&mut self, id: u16) -> Result<(), Trap> {
+        let [p0, p1, level] = self.burn_object(id)?.position;
+        let interpreter = self.interpreter();
+        let unsupported = |fault| {
+            Trap::Unsupported(format!(
+                "Burn moving person {id} to its tile's centre: {fault}"
+            ))
+        };
+        interpreter
+            .reset_person(self.world, id, &interpreter.program.people)
+            .map_err(unsupported)?;
+        let centre = |n: i32| (n & !0xf) | 8;
+        let position = [centre(p0), centre(p1)];
+        interpreter
+            .put(
+                self.world,
+                id,
+                Place {
+                    on_lot: on_lot(position),
+                    position,
+                    container: None,
+                    slot: -1,
+                    level,
+                },
+                true,
+            )
+            .map_err(unsupported)?;
+        interpreter.refresh_person(self.world, id)
     }
 
     /// A fire, made by the factory (0x440b2d), its Init and first turn

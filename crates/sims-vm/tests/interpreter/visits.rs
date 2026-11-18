@@ -319,21 +319,111 @@ fn a_multi_tile_object_is_rebuilt_as_a_group() {
     assert_eq!(fx.world.objects[&lead].attributes[0], 7);
 }
 
-#[test]
-fn a_person_using_a_changed_object_stops_its_visit() {
-    let (mut fx, _) = lot();
-    let id = stand(&mut fx, [2, 2]);
+/// A person of [`resident`]'s type using a widget whose type changed, the
+/// widget noting each reset (function 3) in the lamp's attribute 7, and
+/// the widget's mark not to reset what depends on it set to `skip`.
+fn using_a_changed_widget(skip: bool) -> (Fixture, People, u16) {
+    let (mut fx, file) = lot();
+    let people = resident(&mut fx);
+    let widget = stand(&mut fx, [2, 2]);
+    fx.add(file, CANCELLED, note(7, scope::LITERAL, 8));
+    function(&mut fx, file, 3, CANCELLED);
     fx.world.changed_types.insert(WIDGET);
-    let sim = fx.add_sim(PERSON);
-    sim.person.as_mut().unwrap().active.icon = id as i16;
-    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    let fault = interpreter
-        .visit(&mut fx.world, id, &People::default())
-        .unwrap_err();
-    assert!(
-        fault.to_string().contains("person 50 is using object"),
-        "{fault}"
+    fx.world
+        .objects
+        .get_mut(&widget)
+        .unwrap()
+        .removal_skips_resets = skip;
+    let person = fx
+        .world
+        .objects
+        .get_mut(&PERSON)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person
+        .object_uses
+        .push(sims_formats::saved_objects::ObjectUse {
+            target: widget as i16,
+            stack_depth: 1,
+            unknown: 0,
+        });
+    // The person told to let go resets with the program's people.
+    fx.program.people = people.clone();
+    (fx, people, widget)
+}
+
+#[test]
+fn a_person_using_a_changed_object_resets_fully() {
+    // 0x45e814: as the widget's visit resets it, the person told to let
+    // go of the widget it uses resets as with no object named. Its use
+    // ends and every person lets go of the widget again (this one
+    // skipped, being in the middle of it), the widget resets, then the
+    // person resets (its function 3). Then the widget's own reset and
+    // Init follow.
+    let (mut fx, people, widget) = using_a_changed_widget(false);
+    let visited = visit_with(&mut fx, widget, &people);
+    assert_eq!(
+        visited,
+        [
+            (widget, 2),
+            (widget, 3),
+            (PERSON, 3),
+            (widget, 3),
+            (widget, 0)
+        ]
     );
+    assert_eq!(fx.lamp().attributes[7], 8);
+    let sim = &fx.world.objects[&PERSON];
+    let person = sim.person.as_ref().unwrap();
+    assert!(person.object_uses.is_empty());
+    assert_eq!((sim.stack.len(), sim.stack[0].tree), (1, RESIDENT_MAIN));
+    // The reset reloaded the profile.
+    assert_eq!(person.data[58], 27);
+}
+
+#[test]
+fn a_person_using_an_object_marked_not_to_reset_others_does_not_reset_it() {
+    // The widget's flag 0x1000 decides it (0x45e7c8): its use ends, but
+    // the person's reset neither tells anyone to let go of it nor resets
+    // it.
+    let (mut fx, people, widget) = using_a_changed_widget(true);
+    let visited = visit_with(&mut fx, widget, &people);
+    assert_eq!(
+        visited,
+        [(widget, 2), (PERSON, 3), (widget, 3), (widget, 0)]
+    );
+    let person = fx.world.objects[&PERSON].person.as_ref().unwrap();
+    assert!(person.object_uses.is_empty());
+}
+
+#[test]
+fn a_person_whose_reset_ends_its_use_of_itself_skips_its_own_reset() {
+    // The use of itself ends; the reset of the object it used is its own,
+    // which it skips, being in the middle of it (0x45e7b2).
+    let (mut fx, _) = lot();
+    let people = resident(&mut fx);
+    fx.world.changed_types.insert(RESIDENT);
+    let person = fx
+        .world
+        .objects
+        .get_mut(&PERSON)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person
+        .object_uses
+        .push(sims_formats::saved_objects::ObjectUse {
+            target: PERSON as i16,
+            stack_depth: 1,
+            unknown: 0,
+        });
+    let visited = visit_with(&mut fx, PERSON, &people);
+    assert_eq!(visited, [(PERSON, 3), (PERSON, 0)]);
+    let person = fx.world.objects[&PERSON].person.as_ref().unwrap();
+    assert!(person.object_uses.is_empty());
 }
 
 /// The GUID of the person type some tests add, and its trees.

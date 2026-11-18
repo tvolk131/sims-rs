@@ -154,8 +154,11 @@ impl Interpreter<'_> {
     /// Removes an object at once (0x44123f): it leaves the lot (its
     /// virtual function 0x50 with 1, 0x4412a4) and is then deleted.
     ///
-    /// An object of one tile that is not a person leaves the narrow way
-    /// of [`Machine::leave_lot`], which the load was compared through. A
+    /// An object of one tile that is not a person leaves through the
+    /// lot's placement (0x433125, [`Interpreter::take_off`]) once the load
+    /// has worked the lot's rooms out, and before that the narrow way of
+    /// [`Machine::leave_lot`], which the load was compared through
+    /// ([`Interpreter::leave_lot_to_delete`]). A
     /// tile of a group takes its whole group off through the lot's
     /// placement (its vtable 0x666c20's function 0x50, 0x422d86,
     /// [`Interpreter::take_off`]), which also needs the rooms worked out.
@@ -207,10 +210,38 @@ impl Interpreter<'_> {
             }
             self.take_off(world, id, true)?;
         } else {
-            let mut machine = self.machine(world, id, 0, false);
-            machine.leave_lot(id).map_err(fail)?;
+            self.leave_lot_to_delete(world, id)?;
         }
         self.delete(world, id)
+    }
+
+    /// An object of one tile that is not a person leaves the lot on its
+    /// way to deletion: its virtual function 0x50 with 1, which for an
+    /// ordinary object is 0x433125, the lot's placement
+    /// ([`Interpreter::take_off`]). That asks it function 10, moves it and
+    /// what it holds off the lot, and asks whatever held it function 9.
+    ///
+    /// Before the load has worked the lot's rooms out (its clear, load
+    /// step 5), the placement cannot find the off-lot place's room, so
+    /// the object goes the narrow way of [`Machine::leave_lot`], which
+    /// the load was compared through and which fails loudly for anything
+    /// but an object already off the lot that holds nothing and runs no
+    /// callback for leaving.
+    pub(crate) fn leave_lot_to_delete(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        if matches!(
+            world.room_at([OFF_LOT, OFF_LOT, 1]),
+            Err(RoomError::NoRooms)
+        ) {
+            return self
+                .machine(world, id, 0, false)
+                .leave_lot(id)
+                .map_err(|trap| Fault {
+                    object: id,
+                    at: None,
+                    trap,
+                });
+        }
+        self.take_off(world, id, true)
     }
 
     /// Deletes an object that is off the lot (0x440eeb):
@@ -427,8 +458,8 @@ impl Interpreter<'_> {
     /// (its virtual function 0x50 with 1, 0x432055) and that is all: a
     /// tile of a group takes what is left of its group off
     /// ([`Interpreter::take_off`], 0x422d86), so each of its tiles is
-    /// asked function 10 again; any other object leaves the narrow way of
-    /// [`Machine::leave_lot`]. Any other is rebuilt ([`Interpreter::rebuild`]):
+    /// asked function 10 again; any other object leaves as on its way to
+    /// deletion ([`Interpreter::leave_lot_to_delete`]). Any other is rebuilt ([`Interpreter::rebuild`]):
     /// taken off the lot, its storage reset, its Init and a first turn
     /// run, and put back where it was.
     ///
@@ -467,9 +498,7 @@ impl Interpreter<'_> {
         } else if deleting && object.multipart.is_some() {
             self.take_off(world, id, true)?;
         } else if deleting {
-            self.machine(world, id, 0, false)
-                .leave_lot(id)
-                .map_err(fail)?;
+            self.leave_lot_to_delete(world, id)?;
         } else {
             self.rebuild(world, id)?;
         }

@@ -565,14 +565,37 @@ fn the_snack_order_pays_for_the_snack() {
             (218, [264, 488, 1]),
         ]
     );
-    // Step 15925: object 116, under fire 36 and holding object 120 in a
-    // slot, is taken off the lot, which needs the placement services the
-    // port's removal does not have yet (`removal.rs`).
-    let error = lot.step_play().unwrap_err();
+    // Step 15925: object 116, a counter under fire 36, is removed. It
+    // leaves the lot through the lot's placement (0x433125), and the sink
+    // it holds in a slot, object 120, goes with it.
+    let update = lot.step_play().unwrap();
+    assert!(update.errors.is_empty(), "{:?}", update.errors);
+    assert_eq!(update.removed, [116]);
+    assert_gone(&lot, 120);
+    let mut removed = Vec::new();
+    for step in 15926..16218 {
+        let update = lot.step_play().unwrap();
+        assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
+        if !update.removed.is_empty() {
+            removed.push((step, update.removed));
+        }
+    }
+    assert_eq!(removed, [(15999, vec![227]), (16151, vec![120])]);
+    // Step 16218: fire 46's tree 0x1003 burns person 27, who is moved to
+    // its tile's centre, which resets it first (0x44df25). Person 27 uses
+    // fire 41, so every person lets go of the fire, and Mortimer (21) and
+    // person 12, who use it too, reset fully (0x45e814). Person 12 sits on
+    // a sofa (object 191): a person inside an object is taken off the lot
+    // and put near the lot's centre (0x45e8dd, 0x45e977), which is not
+    // ported. The fault resets fire 46, and the lot is as it was before
+    // person 27's reset.
+    let update = lot.step_play().unwrap();
+    let errors = format!("{:?}", update.errors);
+    assert_eq!(update.errors.len(), 1, "{errors}");
     assert!(
-        format!("{error:?}")
-            .contains("removing object 116 needs the lot's placement and callback services"),
-        "{error:?}"
+        errors.contains("Burn moving person 27 to its tile's centre")
+            && errors.contains("resetting a person that is inside an object (0x45e8dd)"),
+        "{errors}"
     );
 }
 

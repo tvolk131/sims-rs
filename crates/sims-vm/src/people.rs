@@ -311,8 +311,8 @@ impl Interpreter<'_> {
     /// The person is marked as in the middle of a reset (object flag
     /// 0x800) throughout, so a broadcast to let go of an object that its
     /// callbacks set off skips it ([`crate::forget`]). A reset of a person
-    /// already marked, which the original skips, is refused, as none was
-    /// seen.
+    /// already marked does nothing (0x45e7b2), as when the person's reset
+    /// ends its use of itself and resets the object it used.
     ///
     /// Not modeled: the person's graphics and action icons.
     pub(crate) fn reset_person(
@@ -347,17 +347,37 @@ impl Interpreter<'_> {
             };
             return outer.reset_person_as(world, id, people, deleting);
         };
+        // 0x45e7b2: a person already in the middle of a reset or of
+        // letting go is skipped, as when its reset ends its use of itself.
         if busy.borrow().contains(&id) {
-            return Err(Fault {
-                object: id,
-                at: None,
-                trap: Trap::Unsupported(format!(
-                    "a reset of person {id} while it is letting go of an object or resetting \
-                     (object flag 0x800), which the original skips; not ported"
-                )),
-            });
+            return Ok(());
         }
         busy.borrow_mut().insert(id);
+        // With no object named, the person's own flag 0x1000 decides
+        // whether the objects it used reset (0x45e7c8).
+        let reset_used = world
+            .objects
+            .get(&id)
+            .is_some_and(|o| !o.removal_skips_resets);
+        let result = self.reset_fully(world, id, people, deleting, reset_used);
+        busy.borrow_mut().remove(&id);
+        result
+    }
+
+    /// The reset itself, for a person already marked as in the middle of
+    /// one (object flag 0x800): the person's uses are released
+    /// ([`Interpreter::release_uses`], resetting each object used when
+    /// `reset_used`) and the person resets (0x45e814 to 0x45eac4). A person
+    /// using the object it is told to let go of comes here too
+    /// ([`crate::forget`]).
+    pub(crate) fn reset_fully(
+        &self,
+        world: &mut World,
+        id: u16,
+        people: &People,
+        deleting: bool,
+        reset_used: bool,
+    ) -> Result<(), Fault> {
         // A reset that releases uses and then fails leaves the lot as it
         // was before the reset, so the fault reports a consistent lot.
         let using = world
@@ -367,38 +387,39 @@ impl Interpreter<'_> {
             .is_some_and(|p| !p.object_uses.is_empty());
         let before = using.then(|| world.clone());
         let result = self
-            .release_uses(world, id)
+            .release_uses(world, id, reset_used)
             .and_then(|()| self.reset_marked(world, id, people, deleting));
         if result.is_err()
             && let Some(before) = before
         {
             *world = before;
         }
-        busy.borrow_mut().remove(&id);
         result
     }
 
-    /// The first step of a person's reset with no object named (0x45e814
-    /// to 0x45e871): while the person uses an object (person +0xb00), the
-    /// last use is ended.
+    /// The first step of a person's full reset (0x45e814 to 0x45e871):
+    /// while the person uses an object (person +0xb00), the last use is
+    /// ended.
     ///
     /// 1. The person's thread pops frames (0x4752f6, then the person's
     ///    virtual function 8, [`crate::interpreter::Machine::pop_frame`])
     ///    while it has more than the use's frame count less one. The last
     ///    pop releases the use ([`crate::interpreter::Machine::release_use`]),
     ///    and the person's running action ends when the list empties.
-    /// 2. Unless the person has object flag 0x1000, every person lets go
-    ///    of the object ([`Interpreter::drop_references`], 0x444306), which
-    ///    skips this one, being in the middle of its reset, and the object
-    ///    resets (its virtual function 0x38 with 0: [`Interpreter::reset`],
-    ///    or [`Interpreter::reset_person`] for a person). Flag 0x1000 is
-    ///    set only at 0x42de09, just before that object's own reset, which
-    ///    is not ported, so it is clear here.
+    /// 2. When `reset_used`, every person lets go of the object
+    ///    ([`Interpreter::drop_references`], 0x444306), which skips this
+    ///    one, being in the middle of its reset, and the object resets (its
+    ///    virtual function 0x38 with 0: [`Interpreter::reset`], or
+    ///    [`Interpreter::reset_person`] for a person). The original decides
+    ///    this once, before the step (byte [ebp-0xd], 0x45e7c8): it is
+    ///    clear when the object the person was told to let go of, or with
+    ///    none the person itself, has object flag 0x1000
+    ///    ([`sims_sim::Object::removal_skips_resets`]).
     ///
     /// The object is the one the entry pointed to when the step began.
-    /// One that is gone by then fails loudly, as does a step that leaves
+    /// One that is gone by then, when it is to reset, fails loudly, as does a step that leaves
     /// the list as long as it was, which the original repeats forever.
-    fn release_uses(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+    fn release_uses(&self, world: &mut World, id: u16, reset_used: bool) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -429,21 +450,24 @@ impl Interpreter<'_> {
             while (machine.me().map_err(fail)?.stack.len() as i32) > last.stack_depth - 1 {
                 machine.pop_frame().map_err(|trap| machine.fault(trap))?;
             }
-            if !world.objects.contains_key(&target) {
-                return Err(fail(Trap::Unsupported(format!(
-                    "person {id}'s reset: object {target}, which it used, went as its frames \
-                     were popped; the original resets it through a stale pointer (0x45e86e)"
-                ))));
-            }
-            self.drop_references(world, target)?;
-            if world
-                .objects
-                .get(&target)
-                .is_some_and(|o| o.person.is_some())
-            {
-                self.reset_person(world, target, &self.program.people)?;
-            } else {
-                self.reset(world, target, false)?;
+            if reset_used {
+                if !world.objects.contains_key(&target) {
+                    return Err(fail(Trap::Unsupported(format!(
+                        "person {id}'s reset: object {target}, which it used, went as its \
+                         frames were popped; the original resets it through a stale pointer \
+                         (0x45e86e)"
+                    ))));
+                }
+                self.drop_references(world, target)?;
+                if world
+                    .objects
+                    .get(&target)
+                    .is_some_and(|o| o.person.is_some())
+                {
+                    self.reset_person(world, target, &self.program.people)?;
+                } else {
+                    self.reset(world, target, false)?;
+                }
             }
             if uses(world)?.0 >= count {
                 return Err(fail(Trap::Unsupported(format!(

@@ -11,10 +11,12 @@
 //!    0x800), which skips P in the broadcasts it sets off; otherwise it
 //!    sets the flag, and clears it at the end.
 //! 2. Resets P fully if P is using T (a use record names it) or P's
-//!    running action shows T's icon. That reset unwinds P's uses, resets
-//!    each object used, and restarts P's thread; it is **not ported** and
-//!    fails loudly.
-//! 3. Otherwise filters, in this order:
+//!    running action shows T's icon (0x45e814): the reset of a person
+//!    with no object named ([`Interpreter::reset_fully`]), which unwinds
+//!    P's uses, restarts P's thread and cancels P's queue. Each object P
+//!    used resets too, unless T has object flag 0x1000 (where the reset
+//!    with no object reads P's own flag). Then it goes on to step 3.
+//! 3. Filters, in this order:
 //!    - **The queue** (0x45eac7), when an action in it names T as target
 //!      or icon: the front action is taken off, one after another, until
 //!      the queue is empty. One that names T is dropped and, when it has a
@@ -119,12 +121,16 @@ impl Interpreter<'_> {
             return Ok(());
         };
         if person.object_uses.iter().any(|u| u.target == t) || person.active.icon == t {
-            return Err(fail(Trap::Unsupported(format!(
-                "person {me} is using object {target} as it resets or goes, which resets the \
-                 person fully (0x45e814); not ported"
-            ))));
+            // 0x45e814: the full reset, with T's flag 0x1000 deciding
+            // whether the objects P used reset. P is already marked as in
+            // the middle of a reset. It falls through to the filter.
+            let reset_used = world
+                .objects
+                .get(&target)
+                .is_some_and(|o| !o.removal_skips_resets);
+            self.reset_fully(world, me, &self.program.people, false, reset_used)?;
         }
-        if person.queue.iter().any(names) {
+        if person_of(world, me).map_err(fail)?.queue.iter().any(names) {
             self.filter_queue(world, me, target)?;
         }
         let person = person_of(world, me).map_err(fail)?;
