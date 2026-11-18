@@ -337,17 +337,33 @@ impl Machine<'_, '_> {
     /// The put is not place-tested first, as the original does not test
     /// it (**unverified** what the original does when the centre is
     /// taken).
+    ///
+    /// A person that is running this Burn fails loudly: its reset
+    /// replaces the stack the instruction would branch on, and what the
+    /// original's interpreter does then was not seen.
     fn burn_person(&mut self, id: u16) -> Result<(), Trap> {
+        if id == self.me {
+            return Err(Trap::Unsupported(format!(
+                "Burn moving person {id}, which is running it, to its tile's centre: its reset \
+                 restarts the thread the instruction would branch on (0x44df25)"
+            )));
+        }
         let [p0, p1, level] = self.burn_object(id)?.position;
         let interpreter = self.interpreter();
-        let unsupported = |fault| {
-            Trap::Unsupported(format!(
-                "Burn moving person {id} to its tile's centre: {fault}"
-            ))
+        let me = self.me;
+        // A fault in the reset or the put keeps its kind and where it
+        // happened.
+        let nested = |fault: crate::fault::Fault| {
+            let context = format!("Burn moving person {id} to its tile's centre");
+            match fault.nested(me) {
+                Trap::Unsupported(message) => Trap::Unsupported(format!("{context}: {message}")),
+                Trap::Invalid(message) => Trap::Invalid(format!("{context}: {message}")),
+                trap => trap,
+            }
         };
         interpreter
             .reset_person(self.world, id, &interpreter.program.people)
-            .map_err(unsupported)?;
+            .map_err(nested)?;
         let centre = |n: i32| (n & !0xf) | 8;
         let position = [centre(p0), centre(p1)];
         interpreter
@@ -363,7 +379,7 @@ impl Machine<'_, '_> {
                 },
                 true,
             )
-            .map_err(unsupported)?;
+            .map_err(nested)?;
         interpreter.refresh_person(self.world, id)
     }
 

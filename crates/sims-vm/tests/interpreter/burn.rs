@@ -280,6 +280,9 @@ fn a_gathered_person_resets_and_moves_to_its_tiles_centre() {
     sim.data[FLAGS] = 0;
     sim.data[FLAGS_2] = CATCHES;
     sim.data[62] = 0;
+    // Person word 64 says whether it stands on a pool tile: the refresh
+    // at the end (virtual function 0x74) sets it.
+    sim.person.as_mut().unwrap().data[64] = 7;
     fx.thread(PERSON, 4096, &[0; 4]);
     fx.world
         .animators
@@ -289,12 +292,44 @@ fn a_gathered_person_resets_and_moves_to_its_tiles_centre() {
     assert_eq!(sim.position, [56, 56, 1]);
     assert_eq!((sim.stack.len(), sim.stack[0].tree), (1, RESIDENT_MAIN));
     assert_eq!(fx.world.objects[&LAMP].attributes[5], 6);
+    assert_eq!(sim.person.as_ref().unwrap().data[64], 0);
     // Its virtual function 0x74 unset its animator's position.
     assert_eq!(
         fx.world.animators[&PERSON].position,
         [sims_sim::animator::UNSET; 3]
     );
     assert_eq!(fires(&fx), [[56, 56, 1]]);
+}
+
+#[test]
+fn a_person_burning_itself_fails_loudly() {
+    // The person runs Burn on its own tile: its reset would restart the
+    // thread the instruction branches on, which was not seen.
+    use crate::visits::{PERSON, resident};
+    let mut fx = lot();
+    widget(&mut fx, [3, 3], true);
+    let file = fx.program.libraries.len();
+    let people = resident(&mut fx);
+    fx.program.people = people;
+    let sim = fx.world.objects.get_mut(&PERSON).unwrap();
+    sim.data[FLAGS] = 0;
+    sim.data[FLAGS_2] = CATCHES;
+    sim.data[62] = 0;
+    fx.add(
+        file,
+        4310,
+        tree(vec![ins(
+            BURN,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 1, 0, 0, 0, 0, 0, 0],
+        )]),
+    );
+    let trap = trap(fx.run_with(PERSON, 4310, PERSON as i16, &[], 1000));
+    assert!(
+        matches!(&trap, Trap::Unsupported(m) if m.contains("which is running it")),
+        "{trap:?}"
+    );
 }
 
 #[test]
