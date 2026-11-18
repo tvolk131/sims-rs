@@ -205,6 +205,12 @@ impl Game {
         })
     }
 
+    /// What of the camera sends the sound's kind 33 when it changes
+    /// ([`sound::Shot`]).
+    pub fn shot(&self) -> sound::Shot {
+        sound::Shot::of(&self.view.camera, self.view.size)
+    }
+
     /// What the sound scripts may ask about the lot's objects, with where
     /// each is on the screen as the camera shows it now
     /// ([`sound::sources`], [`sound::screen`]).

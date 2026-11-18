@@ -230,6 +230,8 @@ struct App {
     heard: Option<(u32, Speed, i32)>,
     /// The object answers the sound was last told.
     told: Option<sims_audio::sources::Snapshot>,
+    /// The camera the sound last heard move.
+    shot: Option<sound::Shot>,
     /// The REDB file of saves, and this house's name in it.
     saves: PathBuf,
     slot: String,
@@ -382,6 +384,12 @@ impl App {
             self.sound.send(Input::Speed(now.1));
             self.sound.send(Input::View(now.2));
             self.heard = Some(now);
+        }
+        // Kind 33, after the sources and the view the moved camera shows.
+        let shot = self.game.shot();
+        if self.shot != Some(shot) {
+            self.sound.send(Input::Camera);
+            self.shot = Some(shot);
         }
     }
 
@@ -618,6 +626,7 @@ fn run() -> Result<(), String> {
         printed: 0,
         sound: Sound::start(&options.install, mute),
         heard: None,
+        shot: None,
         told: None,
         saves,
         slot: slot(&options.house),
