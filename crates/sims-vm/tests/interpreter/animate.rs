@@ -643,6 +643,24 @@ fn a_clip_can_be_named_by_an_objects_own_table() {
     fx.sim_mut().person.as_mut().unwrap().data[58] = 8;
     own(&mut fx, 130);
     assert_eq!(turn(&mut fx).unwrap(), Status::Yielded);
+    // A person type Make New Character made reads its template's tables.
+    let mut fx = sim_animates(animate(1, 0, 0, 0, 0));
+    own(&mut fx, 129);
+    let made = 0x1234_0042;
+    fx.world.characters.made.insert(
+        made,
+        sims_sim::characters::Character {
+            template: SIM_GUID,
+            file: 0,
+            strings: Default::default(),
+        },
+    );
+    fx.sim_mut().guid = made;
+    assert_eq!(turn(&mut fx).unwrap(), Status::Yielded);
+    assert_eq!(
+        fx.world.animators[&SIM].foreground.as_ref().unwrap().clip,
+        CLIP
+    );
 }
 
 /// Look Towards (opcode 22, 0x45a98e) in mode 0: the head follows the
