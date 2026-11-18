@@ -307,7 +307,7 @@ pub fn anchor_point(bone: Bone, anchor: Anchor, model: &Matrix) -> [F32; 3] {
 /// The original adds to the position three more words (+0x8c to +0x94),
 /// which the start of a route sets to 0 and which hold 0 for every person
 /// in the capture; they are taken as 0. On another level it adds an
-/// offset from the view's table, which is not ported (the caller fails).
+/// offset from the view's table ([`placement_on_level`]).
 /// In the lot the first coordinate is 3/16 of the position's second and
 /// the third 3/16 of its first.
 pub fn placement(position: [F32; 3], height: F32) -> Matrix {
@@ -341,6 +341,57 @@ pub fn placement(position: [F32; 3], height: F32) -> Matrix {
         z.to_f32(),
         i,
     ]
+}
+
+/// What each level above the ground adds to a person's model position
+/// (0x5922ad): the view's table holds one vector per zoom (+0xb8 of the
+/// house view, less 12 bytes a zoom step), and the view's setup fills
+/// every one with the same, a half, 9.300511 and a half (0x4ca054). The
+/// view object is not in the frozen image; its class is at 0x4a6b15
+/// (vtable 0x668744: +0x14 reads the zoom 0x6f00d8, +0x18 the rotation
+/// 0x6f00dc, +0x24 is +0xb8).
+const LEVEL_RISE: [F32; 3] = [
+    F32::from_bits(0x3f00_0000),
+    F32::from_bits(0x4114_cee5),
+    F32::from_bits(0x3f00_0000),
+];
+
+/// The model matrix of a person on `level` (0x592132), with the view
+/// turned to `view_rotation` (0x6f00dc, which every turn of the view
+/// sets with the scene's +0x84: 0x4a6d58, 0x4a7f28, 0x4a87d7). On the
+/// ground level it is [`placement`]'s.
+///
+/// Above it the original adds to the position the level's rise: the
+/// levels above the ground, as a float, times each of [`LEVEL_RISE`]'s
+/// three (0x5922d9 to 0x592315), turned about the second axis by minus
+/// the rotation times pi times a half (0x592318, 0x5c3a20, 0x5c39a0). At
+/// rotation 0 the turn is the identity and leaves the rise as it is; any
+/// other turn is not ported, and gives `None`. The first coordinate is
+/// then the rise's plus 3/16 of the position's second, unrounded
+/// (0x59237b); the height the rise's plus the terrain's (0x592385); the
+/// third the rise's plus 3/16 of the position's first, rounded to a float
+/// first (0x592375, 0x59238e).
+pub fn placement_on_level(
+    position: [F32; 3],
+    height: F32,
+    level: i8,
+    view_rotation: u8,
+) -> Option<Matrix> {
+    let mut matrix = placement(position, height);
+    if level == 1 {
+        return Some(matrix);
+    }
+    if view_rotation & 3 != 0 {
+        return None;
+    }
+    let above = Ext::from_i32(i32::from(level) - 1);
+    let [rx, ry, rz] = LEVEL_RISE.map(|r| s(above * r.ext()));
+    let [p0, p1] = [position[0].ext(), position[1].ext()];
+    let k = s(Ext::from_i32(3) * SIXTEENTH.ext());
+    matrix[12] = s(rx + k * p1).to_f32();
+    matrix[13] = s(ry + height.ext()).to_f32();
+    matrix[14] = s(rz + s(k * p0)).to_f32();
+    Some(matrix)
 }
 
 /// The lot's altitude array: one byte per tile corner, four to a tile.
@@ -666,6 +717,41 @@ mod tests {
         assert_eq!(model(&world, 8, position), Err(Unplaced::Missing));
         let upstairs = lot([3, 3, 3, 3], [100, 50, 2]);
         assert_eq!(model(&upstairs, 7, position), Err(Unplaced::Level(2)));
+    }
+
+    #[test]
+    fn a_level_above_the_ground_raises_the_model_by_the_views_rise() {
+        let position = [100.0, 50.0, 3.0].map(F32::from_f32);
+        let height = terrain_height(F32::from_f32(3.0));
+        let ground = placement(position, height);
+        for rotation in 0..4 {
+            assert_eq!(
+                placement_on_level(position, height, 1, rotation),
+                Some(ground)
+            );
+        }
+        let at = |level| placement_on_level(position, height, level, 0).unwrap();
+        let rise = 9.300_511_f32;
+        // 3/16 of 50 is 9.375, of 100 18.75; the turn stays the ground's.
+        let two = at(2);
+        assert_eq!(two[..12], ground[..12]);
+        assert_eq!(
+            two[12..15],
+            [f(0.5 + 9.375), f(rise + height.to_f32()), f(0.5 + 18.75)]
+        );
+        let three = at(3);
+        assert_eq!(
+            three[12..15],
+            [
+                f(1.0 + 9.375),
+                f(2.0 * rise + height.to_f32()),
+                f(1.0 + 18.75)
+            ]
+        );
+        // A turned view turns the rise: not ported.
+        assert_eq!(placement_on_level(position, height, 2, 1), None);
+        assert_eq!(placement_on_level(position, height, 2, 7), None);
+        assert_eq!(placement_on_level(position, height, 2, 4), Some(two));
     }
 
     fn f(v: f32) -> F32 {

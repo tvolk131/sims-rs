@@ -11,10 +11,11 @@
 //!    0x800), which skips P in the broadcasts it sets off; otherwise it
 //!    sets the flag, and clears it at the end.
 //! 2. Resets P fully if P is using T (a use record names it) or P's
-//!    running action shows T's icon. That reset unwinds P's uses, resets
-//!    each object used, and restarts P's thread; it is **not ported** and
-//!    fails loudly.
-//! 3. Otherwise filters, in this order:
+//!    running action shows T's icon
+//!    ([`Interpreter::reset_person_letting_go`], 0x45e814 to 0x45eac4).
+//!    That reset unwinds P's uses, lets go of and resets each object used
+//!    unless T has object flag 0x1000, and restarts P's thread.
+//! 3. Then filters, in this order:
 //!    - **The queue** (0x45eac7), when an action in it names T as target
 //!      or icon: the front action is taken off, one after another, until
 //!      the queue is empty. One that names T is dropped and, when it has a
@@ -119,12 +120,9 @@ impl Interpreter<'_> {
             return Ok(());
         };
         if person.object_uses.iter().any(|u| u.target == t) || person.active.icon == t {
-            return Err(fail(Trap::Unsupported(format!(
-                "person {me} is using object {target} as it resets or goes, which resets the \
-                 person fully (0x45e814); not ported"
-            ))));
+            self.reset_person_letting_go(world, me, target)?;
         }
-        if person.queue.iter().any(names) {
+        if person_of(world, me).map_err(fail)?.queue.iter().any(names) {
             self.filter_queue(world, me, target)?;
         }
         let person = person_of(world, me).map_err(fail)?;

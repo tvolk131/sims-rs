@@ -205,6 +205,12 @@ impl Game {
         })
     }
 
+    /// What of the camera sends the sound's kind 33 when it changes
+    /// ([`sound::Shot`]).
+    pub fn shot(&self) -> sound::Shot {
+        sound::Shot::of(&self.view.camera, self.view.size)
+    }
+
     /// What the sound scripts may ask about the lot's objects, with where
     /// each is on the screen as the camera shows it now
     /// ([`sound::sources`], [`sound::screen`]).
@@ -1070,7 +1076,8 @@ impl Game {
             Command::TogglePanel
             | Command::OpenPanel(_)
             | Command::ShowRelations(_)
-            | Command::RelationsPage(_) => Outcome::redraw(),
+            | Command::RelationsPage(_)
+            | Command::Help(_) => Outcome::redraw(),
             other => {
                 self.note = Some(format!("Not carried out yet: {other:?}"));
                 Outcome::redraw()

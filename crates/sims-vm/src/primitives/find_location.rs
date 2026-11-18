@@ -349,11 +349,20 @@ const SPAN: i32 = 0x3ff;
 /// A point turned within the square of [`SPAN`] by the inverse of the
 /// view's `rotation` (0x47bc1f with (-rotation) & 3).
 fn turn([x, y]: [i32; 2], rotation: u8) -> [i32; 2] {
-    match (4 - i32::from(rotation & 3)) & 3 {
-        1 => [y, SPAN.wrapping_sub(x)],
-        2 => [SPAN.wrapping_sub(x), SPAN.wrapping_sub(y)],
-        3 => [SPAN.wrapping_sub(y), x],
-        _ => [x, y],
+    let [y, x] = turn_in_square([y, x], (4 - i32::from(rotation & 3)) & 3);
+    [x, y]
+}
+
+/// 0x47bc1f with a square of 0x400: the point `[a, b]` (its first and
+/// second arguments) turned `turns` quarter turns, which must be 0 to 3;
+/// any other is no turn. One turn makes `[SPAN - b, a]`, two
+/// `[SPAN - a, SPAN - b]`, three `[b, SPAN - a]`.
+pub(crate) fn turn_in_square([a, b]: [i32; 2], turns: i32) -> [i32; 2] {
+    match turns {
+        1 => [SPAN.wrapping_sub(b), a],
+        2 => [SPAN.wrapping_sub(a), SPAN.wrapping_sub(b)],
+        3 => [b, SPAN.wrapping_sub(a)],
+        _ => [a, b],
     }
 }
 

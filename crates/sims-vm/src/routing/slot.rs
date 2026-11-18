@@ -505,13 +505,7 @@ fn place_answer(
         Err(Refusal::Collision(Some(other))) => {
             (if is_person(other)? { 5 } else { 1 }, Some(other))
         }
-        Err(Refusal::OffLot | Refusal::Other | Refusal::SameWall) => (0, None),
-        Err(Refusal::Unrecorded) => {
-            return Err(unsupported(
-                "0x48158c",
-                "a refusal of the place test whose placement error was not read",
-            ));
-        }
+        Err(Refusal::OffLot | Refusal::Other | Refusal::SameWall | Refusal::Coded(_)) => (0, None),
     })
 }
 
@@ -1424,7 +1418,6 @@ mod tests {
             place_answer(Err(Refusal::Collision(Some(40))), 0, person).unwrap(),
             (1, Some(40))
         );
-        assert!(place_answer(Err(Refusal::Unrecorded), 0, person).is_err());
     }
 
     #[test]
