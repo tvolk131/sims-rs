@@ -24,21 +24,19 @@ precision.
   Aries, Libra and Virgo, Cancer. They are sign numbers, kept in the
   code as the signs' trait profiles are (`household.rs`). The strings
   are read from the install at run time and are never kept in the
-  repo. A string table that is missing or does not parse leaves its
-  strings empty, so the HUD still opens.
+  repo. If UIText.iff is missing, or a table is missing or does not
+  parse, those strings are left empty and the HUD still opens.
 - **The press** (0x51bfb3): the control is the sign's name, sized to it
   (0x51cd7f..0x51cdfe: x 5 and y the line plus 5 above the subpanel's
   bottom, as wide as the text and as tall as the line). `layout` cannot
   measure text, so it leaves the control empty and `hud::fit`, which the
   hosts call after `layout`, sizes it.
-  - The sign is read at the press (0x484311), and a sign outside 1 to
-    12 does nothing. Unlike the name the panel shows, that read is not
-    held to 1 to 12, so a saved 13 shows Pisces but its press opens
-    nothing (`household::help_sign`). That 0x484311 does not hold it as
-    the name lookup does (0x4842de) is **unverified**: the press's own
-    range check suggests so. Where no sign is saved, the
-    original's panel has saved the one it works out by then (0x51cd44),
-    so that one opens.
+  - The sign is read at the press: 0x484311 matches the name the panel
+    shows against the 12 signs' names and gives its number, so the
+    balloon is the shown sign's. A saved 13, shown as Pisces (the name
+    lookup holds it to 1 to 12, 0x4842de), opens Pisces's. The press's
+    check that the number is 1 to 12 then always passes; a
+    `Command::Help` for a sign outside that range does nothing here.
   - A pressed sign is presentation only: the game redraws and changes
     nothing in the lot.
   - If the panel's balloon already shows, the press hides it, whatever
@@ -67,8 +65,12 @@ precision.
     that is x 241, with its bottom on the strip at 500. The screenshot
     agrees.
   - The original runs at 800 by 600 or more, where it always fits. In a
-    smaller window here it is held to the top left corner so its text
-    starts on the screen; that is the port's own.
+    smaller window it goes where the same sum puts it, partly off the
+    screen. Held on the screen instead, it would cover the sign that
+    closes it in a short window.
+  - Without its background (3008, loaded apart from the panel's other
+    art so a missing file does not stop the HUD opening), the balloon
+    shows its text alone.
 - **The whoosh:** "UI_whoosh" plays for the interface (object −4) when
   the balloon shows (0x50fb3f) and when it hides (0x50fbc5). A switch
   to another balloon's text plays none (0x50fbdf). The game's hud plays
@@ -87,10 +89,9 @@ precision.
   - the sign texts put together from stand-in strings, and the
     compatibility tables;
   - the balloon's height from its line count, with the least height;
-  - its place over the panel, and in a small window;
-  - the press's sign unclamped: 13 and −3 open nothing, and an unsaved
-    sign opens the one worked out;
-  - a sign outside 1 to 12 does nothing, open or not;
+  - its place over the panel, and off the screen in a small window;
+  - a `Command::Help` for a sign outside 1 to 12 does nothing, open or
+    not;
   - the press area sized by `fit`;
   - opening and closing, by the sign and by other panels;
   - the Goths' balloon drawn from the install, with its rectangle and

@@ -65,8 +65,9 @@ impl Hud {
             .chain(&dialog::RESOURCES)
             .copied()
             .collect();
-        let art =
+        let mut art =
             sims_ui::art::Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
+        art.load_optional(&ui, US_ENGLISH, sims_ui::balloon::BACKGROUND);
         let message = match dialog::pending(world) {
             Some(pending) => {
                 let labels = Labels::load(&install).map_err(|e| e.to_string())?;
@@ -107,7 +108,9 @@ impl Hud {
             install.expansions,
             friendship(assets)?,
         );
-        let texts = Texts::load(&install).map_err(|e| e.to_string())?;
+        // Without the balloons' strings the HUD still opens; the balloons
+        // show what text they have.
+        let texts = Texts::load(&install).unwrap_or_default();
         Ok(Self {
             art,
             faces,

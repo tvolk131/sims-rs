@@ -106,9 +106,12 @@ impl Hud {
             .chain(&thumbnail::RESOURCES)
             .copied()
             .collect();
-        let art = Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
+        let mut art = Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
+        art.load_optional(&ui, US_ENGLISH, sims_ui::balloon::BACKGROUND);
         let labels = Labels::load(&install).map_err(|e| e.to_string())?;
-        let texts = Texts::load(&install).map_err(|e| e.to_string())?;
+        // Without the balloons' strings the HUD still opens; the balloons
+        // show what text they have.
+        let texts = Texts::load(&install).unwrap_or_default();
         let neighborhood = house
             .parent()
             .and_then(Path::parent)

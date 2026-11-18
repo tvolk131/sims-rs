@@ -78,7 +78,8 @@ pub fn open(root: &Path, house: &str) -> Opened {
     let house = house::Tuning::load(&index, catalog).unwrap();
     let snapshot = snapshot.with_house(world, &house);
     let ui = UiGraphics::open(&install).unwrap();
-    let art = Art::load(&ui, US_ENGLISH, &sims_ui::hud::RESOURCES).unwrap();
+    let mut art = Art::load(&ui, US_ENGLISH, &sims_ui::hud::RESOURCES).unwrap();
+    art.load_optional(&ui, US_ENGLISH, sims_ui::balloon::BACKGROUND);
     let faces = Faces::load(&index, catalog, &family.members).unwrap();
     Opened {
         careers,

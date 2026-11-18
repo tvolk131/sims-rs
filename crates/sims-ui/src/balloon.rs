@@ -214,12 +214,12 @@ pub fn lay_out(art: &Art, text: &Text, owner: Rect) -> Balloon {
     let height = inner.saturating_add(PADDING);
     let right = owner.x.saturating_add(owner.width);
     // The original runs at 800 by 600 or more, where the balloon always
-    // fits. In a smaller window here it is held to the top left corner,
-    // so its text starts on the screen.
+    // fits. In a smaller window it goes where the same sum puts it, partly
+    // off the screen, and never over the panel whose control closes it.
     Balloon {
         rect: Rect::new(
-            right.saturating_sub(WIDTH).max(0),
-            owner.y.saturating_sub(height).max(0),
+            right.saturating_sub(WIDTH),
+            owner.y.saturating_sub(height),
             WIDTH,
             height,
         ),
@@ -333,10 +333,10 @@ mod tests {
         let art = Art::default();
         let b = lay_out(&art, &Text::default(), Rect::new(413, 500, 387, 100));
         assert_eq!(b.rect, Rect::new(241, 373, WIDTH, MIN_HEIGHT));
-        // In a window smaller than the original's least, the balloon is
-        // held to the top left corner so its text starts on the screen.
+        // In a window smaller than the original's least, it goes where
+        // the same sum puts it, off the top left, clear of the panel.
         let b = lay_out(&art, &Text::default(), Rect::new(113, 100, 387, 100));
-        assert_eq!(b.rect, Rect::new(0, 0, WIDTH, MIN_HEIGHT));
+        assert_eq!(b.rect, Rect::new(-59, -27, WIDTH, MIN_HEIGHT));
     }
 
     #[test]
