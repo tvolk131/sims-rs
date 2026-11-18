@@ -829,9 +829,10 @@ impl<S: Samples> Player<S> {
     /// original's track object's `target` back to itself, so an older
     /// thread takes the write itself, ended or the newest still running
     /// once the last start's script has ended, whether or not its notes
-    /// still play (they take the write too, through its `target`). That
-    /// holds after the last start's
-    /// thread has gone with nothing left playing. A note kind 53 played
+    /// still play. The last start's ended thread then writes its own
+    /// placement through its `target`, and its notes change only when
+    /// that chain ends at it. That holds after the last start's thread
+    /// has gone with nothing left playing. A note kind 53 played
     /// with no thread running (thread 0) is placed too, from the
     /// registers it started with. `Spl` is that of the thread the last
     /// start's write lands in ([`Player::place_through`]), or else of the

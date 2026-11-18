@@ -54,9 +54,9 @@ kind 33 only when the camera moves, and the player does the whole case.
     original's track object again, with its `target` back to itself, so
     an older thread takes the write itself: an ended one, or the newest
     still running once the last start's script has ended, whether or not
-    its notes still play (the last start's thread then takes the write
-    as well, through its `target`). Otherwise a
-    `target` that thread had set would carry the write to another
+    its notes still play. The last start's ended thread then writes its
+    own placement through its `target`, and its notes change only when
+    that chain ends at it. Otherwise a `target` that older thread had set would carry the write to another
     track. The player keeps which thread each track's last start made,
     so this holds after that thread has gone with nothing left playing.
   - Every start sets the track object's `target` back to itself
