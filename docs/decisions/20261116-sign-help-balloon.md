@@ -63,15 +63,16 @@ precision.
   - The text box is the title's line plus the body's lines, at least
     103. The balloon is that plus 24, so at least 127 tall.
   - The title is at (15, 12). The body starts under the title's line
-    and stops at the first line that would start below 12 above the
-    bottom.
+    and stops at the first line that would start at or below 12 above
+    the bottom.
   - It sits on the subpanel, flush with its right edge. At 800 by 600
     that is x 241, with its bottom on the strip at 500. The screenshot
     agrees.
   - The original runs at 800 by 600 or more, where it always fits. In a
-    smaller window it goes where the same sum puts it, partly off the
-    screen. Held on the screen instead, it would cover the sign that
-    closes it in a short window.
+    smaller window it goes where the same sum puts it, which is off the
+    screen only where the window is too narrow or short for it (at 640
+    by 480 the Goths' fits whole, at 81, 253). Held on the screen
+    instead, it would cover the sign that closes it in a short window.
   - Without its background (3008, loaded apart from the panel's other
     art so a missing file does not stop the HUD opening), the balloon
     shows its text alone.
