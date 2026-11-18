@@ -2193,6 +2193,111 @@ fn a_camera_move_reaches_a_target_whose_script_has_ended() {
 }
 
 #[test]
+fn a_camera_move_goes_no_further_than_a_thread_whose_track_started_again() {
+    // Track 12 (object 7, in the middle) waits 100 ms, then asks with its
+    // extvol and pan. Track 11 (object 8) plays a long note, waits, sets
+    // its `target` to track 12 and ends while the note plays on; global
+    // 110 marks it, so its second start only waits. Track 10 (object 9)
+    // starts while track 11 waits, sets its `target` to it and loops.
+    // With object 9 at the right edge, the camera move goes from track 10
+    // to track 11's ended thread and, while that is still the last
+    // start, on to track 12, which turns right. Once track 11 has started
+    // again, its old thread takes the write itself and track 12 keeps
+    // the centre (Sol's review).
+    let mut ended = vec![TEST, 110, IFNE];
+    ended.extend(long(0x103));
+    ended.extend(loadl(110, 1));
+    ended.extend(NOTE_ON_V1);
+    ended.extend(loadl(5, 10));
+    ended.extend([WAIT, 5]);
+    ended.extend(loadl(53, 12));
+    ended.push(END);
+    let mut targets = loadl(53, 11);
+    targets.extend([SET_LOOP, LOOP]);
+    let mut asks = loadl(5, 100);
+    asks.extend([WAIT, 5]);
+    asks.extend([72, 6, 1, 19, 72, 6, 1, 20, END]);
+    let wait: &[u8] = &[SET_LOOP, LOOP];
+    let start = on_lot(&[(7, 400), (8, 400), (9, 400)]);
+    for restarted in [true, false] {
+        let probe = Probe {
+            lot: on_lot(&[(7, 400), (8, 400), (9, 800)]),
+            asked: Default::default(),
+        };
+        let mut player = Player::new(
+            vec![module(&[&targets, &ended, &asks, wait], 1)],
+            long_sample("one.xa"),
+            1,
+        );
+        let play = |player: &mut Player<_>, object: u32, name: &str| {
+            player.handle(
+                &SoundEvent::Play {
+                    object,
+                    name: name.into(),
+                },
+                &start,
+            );
+        };
+        play(&mut player, 7, "e2");
+        player.render(BLOCK, &start);
+        play(&mut player, 8, "e1");
+        player.render(BLOCK, &start);
+        play(&mut player, 9, "e0");
+        player.render(5 * BLOCK, &start);
+        if restarted {
+            play(&mut player, 8, "e1");
+        }
+        player.render(BLOCK, &start);
+        player.camera_moved(0, u32::MAX, &probe);
+        player.render(40 * BLOCK, &probe);
+        let asked = probe.asked.borrow().clone();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert_eq!(asked[1] == (7, 512), restarted, "{asked:?}");
+        assert!(player.faults.is_empty(), "{:?}", player.faults);
+    }
+}
+
+#[test]
+fn a_stop_fades_its_own_note_though_its_target_has_ended() {
+    // Track 11 (object 8) plays a long note, waits and ends while the
+    // note plays on. Track 10 (object 9) plays one too, sets its `target`
+    // to track 11 while it waits, and loops. Stopping object 9 fades
+    // track 10's note: the stop's fade stays with the track it stops,
+    // and does not go on to track 11's lingering note (Sol's review).
+    let mut ended = NOTE_ON_V1.to_vec();
+    ended.extend(loadl(5, 10));
+    ended.extend([WAIT, 5, END]);
+    let mut targets = NOTE_ON_V1.to_vec();
+    targets.extend(loadl(53, 11));
+    targets.extend([SET_LOOP, LOOP]);
+    let mut player = Player::new(
+        vec![module(&[&targets, &ended], 1)],
+        long_sample("one.xa"),
+        1,
+    );
+    let play = |player: &mut Player<_>, object: u32, name: &str| {
+        player.handle(
+            &SoundEvent::Play {
+                object,
+                name: name.into(),
+            },
+            &NoSources,
+        );
+    };
+    play(&mut player, 8, "e1");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, 9, "e0");
+    player.render(5 * BLOCK, &NoSources);
+    assert_eq!(player.render(1, &NoSources), [20_000]);
+    player.handle(&SoundEvent::StopObject { object: 9 }, &NoSources);
+    player.render(2 * BLOCK, &NoSources);
+    // Two blocks into the fade, track 10's note is still heard.
+    let fading = player.render(1, &NoSources)[0];
+    assert!(fading > 10_000 && fading < 20_000, "{fading}");
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
 fn a_camera_move_places_a_sequenced_note_with_no_thread() {
     // Track 10's routine ends at once, so kind 53 plays its long patch
     // on the idle track object (thread 0). Started in the middle of the

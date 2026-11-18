@@ -23,12 +23,19 @@ kind 33 only when the camera moves, and the player does the whole case.
     it goes to the thread the track's last start made, which stands for
     the original's one track object (see below), and on through its
     `target`. A fade in progress goes on from the new volume.
-  - The `target` chain reaches a thread whose script has ended while
-    its notes play on, as the original's pointer reaches a track object
-    that outlives its script, and those notes take the write at once.
-    This holds for every register access through `target`, the
-    scripts' own too. A link to a thread with nothing left playing
-    still stops the chain (**unverified**, as before).
+  - The write's `target` chain reaches a thread whose script has ended
+    while its notes play on, as the original's pointer reaches a track
+    object that outlives its script, and those notes take the write at
+    once. A link to a thread with nothing left playing still stops the
+    chain (**unverified**, as before).
+  - The last-start rule below holds at every link: a thread on the way
+    that is not its track's last start takes the write itself, so a
+    `target` it set before its track started again carries nothing on.
+  - Only the camera's write follows ended threads. The scripts' own
+    register accesses through `target` stop at a thread that has ended,
+    as before. Following them there too would let a stop's fade or a
+    script's level write reach another track's lingering note, which is
+    not known to happen.
   - The original's track object outlives its script. A note started
     with `note_on` then `end` plays on, and the write reaches that note
     too. Here a thread that ends with notes still playing keeps its
@@ -97,7 +104,11 @@ kind 33 only when the camera moves, and the player does the whole case.
   other track keeps its levels.
 - A write through a `target` whose script has ended reaches its note
   still playing: placed by another track's object at the right edge,
-  it turns right.
+  it turns right. Through two links it reaches the track after, unless
+  the middle track has started again since; then its old thread takes
+  the write and the last track keeps the centre.
+- A stop's fade stays with the track it stops, though that track's
+  `target` names one whose script has ended with a note playing.
 - A track whose thread has ended and left no note gets nothing, and its
   next start is placed afresh.
 - The Goths' lot plays with the camera scrolling every second.

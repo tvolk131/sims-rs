@@ -38,11 +38,8 @@
 //!   thread's later reads and writes of registers other than 53 to the
 //!   newest running thread of that track, and on through that thread's
 //!   own `target`; 0, or a track with none running, sends them back here.
-//!   A target whose script has ended while its notes play on is still
-//!   followed, as the original's track object outlives its script; one
-//!   with nothing left playing stops the chain. How the original picks
-//!   among several threads of one track, and what it does once the
-//!   target's notes have ended too, are not known (see
+//!   How the original picks among several threads of one track, and what
+//!   it does once the target has ended, are not known (see
 //!   `Player::resolve`).
 //! - *(code)* `main_duckpri` (123) is a request per thread: the global
 //!   holds the largest, and a thread's request goes as soon as it ends.
@@ -812,8 +809,11 @@ impl<S: Samples> Player<S> {
     /// 0x57d5a0). The write goes through the track's `target`
     /// (0x57de57). Here it goes to the thread the track's last start
     /// made, which stands for the original's one track object, and on
-    /// through its `target`. A fade on `extvol` is undone by it and goes
-    /// on from the new volume.
+    /// through its `target` ([`Player::place_through`]): into a thread
+    /// whose script has ended while its notes play, as the original's
+    /// pointer reaches a track object that outlives its script, and not
+    /// past a thread that is not its track's last start. A fade on
+    /// `extvol` is undone by it and goes on from the new volume.
     ///
     /// The original's track object outlives its script, and a note it
     /// started plays on after the script ends (`note_on` then `end`);
@@ -907,19 +907,18 @@ impl<S: Samples> Player<S> {
             // it would write; with none, the newest running one takes it
             // itself.
             if let Some(id) = last_running {
-                self.write_to(id, EXTVOL, vol);
-                self.write_to(id, PAN, pan);
+                self.place_through(id, vol, pan);
             } else if let Some(at) = self.newest(track) {
                 place_itself(&mut self.threads[at], vol, pan);
             }
             for id in ended {
+                if last == Some(id) {
+                    self.place_through(id, vol, pan);
+                }
                 let Some(mut thread) = self.ended.remove(&id) else {
                     continue;
                 };
-                if last == Some(id) {
-                    self.write(&mut thread, i64::from(EXTVOL), vol);
-                    self.write(&mut thread, i64::from(PAN), pan);
-                } else {
+                if last != Some(id) {
                     place_itself(&mut thread, vol, pan);
                 }
                 let levels = self.levels(&thread);
@@ -1439,27 +1438,57 @@ impl<S: Samples> Player<S> {
             .map(|(at, _)| at)
     }
 
-    /// Writes a register of the running or pending thread `id` as that
-    /// thread would.
-    fn write_to(&mut self, id: u32, register: u8, value: i32) {
-        let Some(mut thread) = self
-            .threads
-            .iter()
-            .chain(&self.pending)
-            .find(|t| t.id == id)
-            .cloned()
-        else {
-            return;
-        };
-        self.write(&mut thread, i64::from(register), value);
-        if let Some(slot) = self
+    /// Writes a camera placement as the thread `id`, the track's last
+    /// start, writes it: `extvol`, then `pan`, through its `target`
+    /// (0x57de57). The original's pointer reaches a track object that
+    /// outlives its script, so the chain goes on into a thread whose
+    /// script has ended while its notes play, and those notes take the
+    /// placement at once. A thread on the way that is not its track's
+    /// last start takes the placement itself: a later start set the
+    /// original's track object's `target` back to itself. Script reads
+    /// and writes do not follow ended threads ([`Player::resolve`]).
+    fn place_through(&mut self, id: u32, vol: i32, pan: i32) {
+        let mut at = id;
+        let mut passed = vec![id];
+        while let Some(thread) = self.kept_thread(at)
+            && self.last_start.get(&thread.track) == Some(&thread.id)
+            && let Target::Thread(next) = thread.target
+            && !passed.contains(&next)
+            && self.kept_thread(next).is_some()
+        {
+            passed.push(next);
+            at = next;
+        }
+        if let Some(thread) = self
             .threads
             .iter_mut()
             .chain(&mut self.pending)
-            .find(|t| t.id == id)
+            .find(|t| t.id == at)
         {
-            *slot = thread;
+            place_itself(thread, vol, pan);
+        } else if let Some(mut thread) = self.ended.remove(&at) {
+            place_itself(&mut thread, vol, pan);
+            let levels = self.levels(&thread);
+            for note in self.notes.iter_mut().filter(|n| n.thread == at) {
+                note.gains = levels.gains;
+                note.step = step(levels.rate);
+            }
+            self.ended.insert(at, thread);
         }
+    }
+
+    /// The running or pending thread `id`, or the ended one if its notes
+    /// still play.
+    fn kept_thread(&self, id: u32) -> Option<&Thread> {
+        self.threads
+            .iter()
+            .chain(&self.pending)
+            .find(|t| t.id == id)
+            .or_else(|| {
+                self.ended
+                    .get(&id)
+                    .filter(|_| self.notes.iter().any(|n| n.thread == id))
+            })
     }
 
     /// Writes a register of the thread at `at` as that thread would.
@@ -2265,19 +2294,21 @@ impl<S: Samples> Player<S> {
     /// The thread a register access other than to `target` (53) goes
     /// to, or `None` for `thread` itself. As in the original, an access
     /// goes to the thread `target` names, then on to the one that
-    /// thread's `target` names, and so on. A thread whose script has
-    /// ended while its notes play on is still followed: the original
-    /// keeps a pointer to the track object, which outlives its script. A
-    /// link to a thread with nothing left playing (what the original then
-    /// does is not known) stops the chain there, as does a thread already
-    /// passed (the original would recurse for ever).
+    /// thread's `target` names, and so on. A link to a thread that has
+    /// ended (the original keeps a pointer to it; what it then does is
+    /// not known) stops the chain there, as does a thread already passed
+    /// (the original would recurse for ever).
     fn resolve(&self, thread: &Thread) -> Option<u32> {
         let mut at = None;
         let mut target = thread.target;
         let mut passed = vec![thread.id];
         while let Target::Thread(id) = target
             && !passed.contains(&id)
-            && let Some(next) = self.kept_thread(id)
+            && let Some(next) = self
+                .threads
+                .iter()
+                .chain(&self.pending)
+                .find(|t| t.id == id)
         {
             passed.push(id);
             at = Some(id);
@@ -2300,7 +2331,12 @@ impl<S: Samples> Player<S> {
         }
         let source = self
             .resolve(thread)
-            .and_then(|id| self.kept_thread(id))
+            .and_then(|id| {
+                self.threads
+                    .iter()
+                    .chain(&self.pending)
+                    .find(|t| t.id == id)
+            })
             .unwrap_or(thread);
         source.registers[usize::from(r)]
     }
@@ -2338,7 +2374,6 @@ impl<S: Samples> Player<S> {
                 .threads
                 .iter_mut()
                 .chain(&mut self.pending)
-                .chain(self.ended.values_mut())
                 .find(|t| t.id == id)
             {
                 Some(other) => other,
@@ -2360,29 +2395,6 @@ impl<S: Samples> Player<S> {
         } else {
             self.globals[usize::from(r - GLOBALS)] = value;
         }
-        // A thread whose script has ended updates no levels of its own:
-        // its notes take the write at once.
-        if let Some(ended) = self.ended.get(&id) {
-            let levels = self.levels(ended);
-            for note in self.notes.iter_mut().filter(|n| n.thread == id) {
-                note.gains = levels.gains;
-                note.step = step(levels.rate);
-            }
-        }
-    }
-
-    /// The running or pending thread `id`, or the ended one if its notes
-    /// still play.
-    fn kept_thread(&self, id: u32) -> Option<&Thread> {
-        self.threads
-            .iter()
-            .chain(&self.pending)
-            .find(|t| t.id == id)
-            .or_else(|| {
-                self.ended
-                    .get(&id)
-                    .filter(|_| self.notes.iter().any(|n| n.thread == id))
-            })
     }
 
     fn target(&self, thread: &Thread, id: u32) -> Result<u32, String> {
