@@ -7,6 +7,7 @@ use sims_formats::iff::Iff;
 use sims_sim::TypeAttributes;
 use sims_sim::rooms::Tuning;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 /// The SLOT entry kind that makes a routing slot (0x46e3a0).
 const ROUTING_SLOT: u16 = 3;
@@ -146,6 +147,11 @@ pub struct Program {
     /// they were not read: making a character then fails.
     /// [`Program::link`] leaves it None for the caller to fill.
     pub wardrobe: Option<sims_content::Wardrobe>,
+    /// The numbers of the `User%05d.iff` files in the neighborhood's
+    /// `Characters` folder: the file numbers Make New Character's copy
+    /// finds taken (0x4722b8), besides those of the types it makes.
+    /// [`Program::link`] leaves it empty for the caller to fill.
+    pub character_files: BTreeSet<i32>,
     /// The installed-expansions mask: the application's word at +0x66
     /// (\[0x6e48bc\]+0x66), which the original sets from the registry at
     /// startup (0x43ae81). The person factory's pet guard reads it
@@ -178,6 +184,7 @@ impl Program {
             people: People::default(),
             icon_frames: None,
             wardrobe: None,
+            character_files: Default::default(),
             expansions: 0,
             characters: BTreeSet::new(),
         };
@@ -757,6 +764,34 @@ pub struct Career {
 
 /// The careers of `work.iff`, or None when the table cannot be had from
 /// it. See [`Program::careers`].
+/// The numbers of the `User%05d.iff` files directly in `characters`, the
+/// neighborhood's `Characters` folder as the index lists it
+/// ([`sims_content::Index::add_characters`]), matching the name without
+/// regard to ASCII case, as the file system does. These are the files
+/// Make New Character's copy finds there (0x4722b8 returning -0x2b).
+pub fn character_files(index: &sims_content::Index, characters: &Path) -> BTreeSet<i32> {
+    let Some(mount) = index
+        .mounts
+        .iter()
+        .position(|m| m.path == sims_content::Index::CHARACTERS)
+    else {
+        return BTreeSet::new();
+    };
+    index
+        .resources
+        .iter()
+        .filter(|r| r.mount == mount && r.member.is_none())
+        .filter(|r| r.path.parent() == Some(characters))
+        .filter_map(|r| {
+            let name = r.name();
+            let name = name.to_ascii_lowercase();
+            let digits = name.strip_prefix("user")?.strip_suffix(".iff")?;
+            let plain = digits.len() == 5 && digits.bytes().all(|b| b.is_ascii_digit());
+            plain.then(|| digits.parse().ok()).flatten()
+        })
+        .collect()
+}
+
 /// The file the headlines' sprite cache reads: the game data directory
 /// (0x415336 entry 0) and "sprites" (entry 1), joined at 0x4ee8fe.
 pub const ICON_FILE: &str = "GameData/Sprites.iff";

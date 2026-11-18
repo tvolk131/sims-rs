@@ -48,12 +48,20 @@ cover this. Both were made by the coordinator.
 
 ## What else the clone does
 
+- **The template.** The definition copied is the one the first
+  neighbour record of the template's GUID links to (0x42571f, record
+  +8). With no such record, the clone fails (0x426335), and the port
+  fails loudly. The port's records link to the definition the GUID
+  resolves to, so a template GUID that more than one definition has
+  fails loudly too.
 - **The file number.** The copy tries the counter, and again one higher
   while the file exists (-0x2b from 0x4722b8); the counter goes up after
-  each try, and back to 0 at 32000, where the clone fails. The port has
-  no files: a number is taken when a made type holds it. The original
-  also finds the files of types made in earlier games, so this is an
-  **unverified** substitute.
+  each try, and back to 0 at 32000, where the clone fails. The port
+  writes no files. A number is taken when the neighborhood's
+  `Characters` folder held `User%05d.iff` at boot
+  (`Program::character_files`, from the index), or when a made type
+  holds it. The counter starts at 0 in a new world. **Unverified:** that
+  the original's starts at 0 too.
 - **The record.** The first person definition no record links to gets
   the record (0x43ac3a, 0x425770, 0x4257a5 with no slot asked for). The
   neighborhood's load gives every person definition a record, and the
@@ -80,18 +88,31 @@ cover this. Both were made by the coordinator.
     0x40a453).
 
   The suits are the avatar registry's names (every `.cmx` and `.bcf`,
-  lowercased, but those starting with "suit-"), and the textures every
-  `.bmp` on the texture path (0x40895a). `sims_content::Wardrobe` reads
-  them at boot from the person files `sims_content::assets` finds (moved
-  there from sims-people, which re-exports it). On the Complete
-  Collection its counts are the ones the original's patterns give over
-  every name: between 17 and 143 for each sex, age and real tone ("lgt",
-  "med", "drk"), and 0 for "unknown", the first of PersonGlobals' tones.
-  **Unverified:** a texture two folders hold is counted once (the
-  original may list it twice; six names, one or two more in five
-  counts), and `.tga` files are left out (sixteen, which no pattern
-  matches). The lists' order (a hash table's, a file system's) is not
-  kept, as it only picks which body and head.- Two game draws (0x46f457): the head, then the body. Which head and
+  lowercased, but those starting with "suit-"). The textures are every
+  `.bmp` and `.tga` on the texture path (0x40895a), which includes
+  `GameData/Textures2`. The places count characters: the original's
+  names are one byte to a character. `sims_content::Wardrobe` reads them
+  at boot from the person files `sims_content::assets` finds (moved
+  there from sims-people, which re-exports it). A person file the boot
+  cannot list is kept as the wardrobe's error, and Make New Character
+  fails loudly on it; the boot goes on.
+
+  On the Complete Collection, its counts are the ones the original's
+  patterns give over every name: between 17 and 143 for each sex, age
+  and real tone ("lgt", "med", "drk"), and 0 for "unknown", the first of
+  PersonGlobals' tones.
+
+  Only whether a count is 0 changes the simulation: the draws are taken
+  either way. **Unverified:**
+  - a texture two folders hold is counted once (the original may list
+    it twice; six names, one or two more in five counts);
+  - `Assets` lists whole folders the search paths name only parts of
+    (an expansion's, where the texture path names its `Skins` and
+    `Accessories`); on the Complete Collection this changes no count.
+
+  The lists' order (a hash table's, a file system's) is not kept, as it
+  only picks which body and head.
+- Two game draws (0x46f457): the head, then the body. Which head and
   body they pick (body strings 2 and 1) is presentation and not kept.
 - The stack object takes the new record's ID, and the branch is true.
 - Presentation, not kept: the copied file, the strings written to disk,
@@ -100,10 +121,18 @@ cover this. Both were made by the coordinator.
 
 ## Fails loudly
 
-A negative age (0x44b23c), a template byte past 2 (0x44afa6), the pets
-(0x44b051), a count of 0 (0x44b203, which deletes the type, its record
-and its objects through 0x426fcd), and a clone the original fails
-(0x426335).
+- A local that starts as half of a pointer (each read named by its
+  address).
+- A negative age (0x44b23c).
+- A template byte past 2 (0x44afa6).
+- The pets (0x44b051).
+- A count of 0 (0x44b203, which deletes the type, its record and its
+  objects through 0x426fcd).
+- A clone the original fails (0x426335): no template, no record of it,
+  or every file number taken.
+- A template GUID that more than one definition has.
+- A new GUID that is another type's (0x43bda9).
+- Suit names that could not be read.
 
 ## Where it is reached
 

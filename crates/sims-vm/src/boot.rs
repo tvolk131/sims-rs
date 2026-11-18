@@ -421,8 +421,9 @@ impl Lot {
             .ok_or("the house file must be inside a neighborhood's Houses directory")?;
         let neighborhood = Neighborhood::open(directory)?;
         let mut index = Index::build(&install)?;
-        if let Some(characters) = neighborhood.characters()? {
-            index.add_characters(&characters)?;
+        let characters = neighborhood.characters()?;
+        if let Some(characters) = &characters {
+            index.add_characters(characters)?;
         }
         let catalog = Catalog::build(&index)?;
         let file = House::load(house, &catalog)?;
@@ -458,9 +459,15 @@ impl Lot {
         // out; making a person of it fails.
         program.people = People::load_each(&install, &index, &catalog, person_types())?.0;
         program.icon_frames = crate::program::icon_frames(&install)?;
-        program.wardrobe = Some(sims_content::Wardrobe::load(&sims_content::Assets::scan(
-            &install.root,
-        )?));
+        // A person file that cannot be listed fails Make New Character,
+        // not the boot, which never reads the names otherwise.
+        program.wardrobe = Some(match sims_content::Assets::scan(&install.root) {
+            Ok(assets) => sims_content::Wardrobe::load(&assets),
+            Err(error) => sims_content::Wardrobe::unread(error),
+        });
+        if let Some(characters) = &characters {
+            program.character_files = crate::program::character_files(&index, characters);
+        }
         let mut world = World::empty();
         let mut load = LoadReport::default();
         {
@@ -1159,6 +1166,7 @@ mod tests {
                 people: Default::default(),
                 icon_frames: None,
                 wardrobe: None,
+                character_files: Default::default(),
                 expansions: 0,
                 characters: Default::default(),
             },

@@ -9,15 +9,22 @@
 //! - **Textures.** The file name of every `.bmp` and `.tga` on the texture
 //!   search path (0x40895a, the path built at 0x414633 to 0x415056).
 //!
-//! Both are read here from every appearance catalog and `.bmp` file of
-//! [`Assets`], whose sources cover both search paths in the Complete
-//! Collection. That these are exactly the original's names is
-//! **unverified**: `Assets` keeps one name for a file two folders hold,
-//! where the original may list it twice (in the Complete Collection, six
-//! texture names), and it leaves out `.tga` files (sixteen, effect
-//! textures no body or head name starts). The order is not kept: the
-//! original's is its hash table's and its file system's, and only which
-//! body and head the game's draws pick depends on it.
+//! Both are read here from every appearance catalog and `.bmp` and `.tga`
+//! file of [`Assets`], whose sources cover both search paths. That these
+//! are exactly the original's names is **unverified**:
+//!
+//! - `Assets` keeps one name for a file two folders hold, where the
+//!   original may list it twice (in the Complete Collection, six texture
+//!   names).
+//! - `Assets` lists whole folders the search paths name only parts of (an
+//!   expansion's folder, where the texture path names its `Skins` and
+//!   `Accessories`), so a texture or suit outside the original's paths
+//!   counts here. In the Complete Collection, that changes no count.
+//!
+//! Only whether a count is 0 changes the simulation: the draws are taken
+//! either way, and which body and head they pick is presentation. The
+//! order is not kept: the original's is its hash table's and its file
+//! system's, and only that pick depends on it.
 
 use crate::Assets;
 use crate::people::read_suits;
@@ -32,18 +39,28 @@ pub struct Wardrobe {
     /// Every texture's file name, lowercased, with its extension.
     pub textures: BTreeSet<String>,
     /// Each appearance catalog that could not be read, by file name, with
-    /// the error: its suits are missing from `suits`.
+    /// the error: its suits are missing from `suits`. Or the install's
+    /// person files, when they could not be listed ([`Wardrobe::unread`]).
     pub errors: BTreeMap<String, String>,
 }
 
 impl Wardrobe {
+    /// No names, as the install's person files could not be listed
+    /// ([`Assets::scan`] failing with `error`).
+    pub fn unread(error: String) -> Self {
+        Self {
+            errors: BTreeMap::from([("the install's person files".to_owned(), error)]),
+            ..Self::default()
+        }
+    }
+
     /// Reads the names from every avatar file (`.cmx`, `.bcf`) and texture
-    /// (`.bmp`) of `assets`, as the registry's scan loads every `.cmx` and
-    /// `.bcf` (0x59f844).
+    /// (`.bmp`, `.tga`, 0x6c0f80, 0x6c0f7c) of `assets`, as the registry's
+    /// scan loads every `.cmx` and `.bcf` (0x59f844).
     pub fn load(assets: &Assets) -> Self {
         let mut wardrobe = Self::default();
         for name in assets.names() {
-            if name.ends_with(".bmp") {
+            if name.ends_with(".bmp") || name.ends_with(".tga") {
                 wardrobe.textures.insert(name.to_owned());
             }
             let catalog = name.ends_with(".cmx") || name.ends_with(".bcf");
@@ -93,22 +110,25 @@ impl Wardrobe {
     /// - A head's is "c", any three, the same sex and age letters: six in
     ///   all. A name whose second character is "t" (the costumes,
     ///   0x40a453) is no head.
+    ///
+    /// The original's names are single bytes to a character (Windows-1252),
+    /// so the places count characters here, not UTF-8 bytes.
     pub fn count(&self, head: bool, female: bool, child: bool, skin: &str) -> usize {
-        let (first, length) = if head { (b'c', 6) } else { (b'b', 9) };
-        let sex = if female { b'f' } else { b'm' };
-        let age = if child { b'c' } else { b'a' };
+        let (first, length) = if head { ('c', 6) } else { ('b', 9) };
+        let sex = if female { 'f' } else { 'm' };
+        let age = if child { 'c' } else { 'a' };
         let skin = skin.to_ascii_lowercase();
         self.suits
             .iter()
             .filter_map(|suit| {
-                let bytes = suit.as_bytes();
-                let matches = bytes.len() >= length
-                    && bytes[0] == first
-                    && (bytes[4] == sex || bytes[4] == b'u')
-                    && bytes[5] == age
-                    && !(head && bytes[1] == b't');
-                let part = suit.get(..length).filter(|_| matches)?;
-                Some(format!("{part}{skin}"))
+                let chars: Vec<char> = suit.chars().take(length).collect();
+                let matches = chars.len() == length
+                    && chars[0] == first
+                    && (chars[4] == sex || chars[4] == 'u')
+                    && chars[5] == age
+                    && !(head && chars[1] == 't');
+                let part: String = chars.into_iter().collect();
+                matches.then(|| format!("{part}{skin}"))
             })
             .map(|prefix| {
                 self.textures
@@ -170,5 +190,15 @@ mod tests {
         assert_eq!(w.count(true, false, false, "lgt"), 1);
         assert_eq!(w.count(true, true, false, "lgt"), 1);
         assert_eq!(w.count(true, false, true, "lgt"), 0);
+    }
+
+    #[test]
+    fn the_places_count_characters_not_bytes() {
+        let w = wardrobe(
+            &["b00émafit_01", "c0é1ma_bob"],
+            &["b00émafitlgt.bmp", "c0é1malgt_bob.tga"],
+        );
+        assert_eq!(w.count(false, false, false, "lgt"), 1);
+        assert_eq!(w.count(true, false, false, "lgt"), 1);
     }
 }

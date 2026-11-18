@@ -30,6 +30,7 @@ use std::sync::OnceLock;
 pub const SOURCES: &[&str] = &[
     "GameData/Skins",
     "GameData/Animation",
+    "GameData/Textures2",
     "GameData/Textures",
     "ExpansionPack",
     "ExpansionPack2",
@@ -44,7 +45,9 @@ pub const SOURCES: &[&str] = &[
 ];
 
 /// The extensions of the files a person is drawn from.
-const KINDS: &[&str] = &[".bcf", ".cmx", ".bmf", ".skn", ".bmp", ".cfp"];
+/// `.tga` names a texture only Make New Character's lists read
+/// ([`crate::Wardrobe`]).
+const KINDS: &[&str] = &[".bcf", ".cmx", ".bmf", ".skn", ".bmp", ".tga", ".cfp"];
 
 /// Every person file of an install, by lowercase name.
 #[derive(Debug, Clone, Default)]

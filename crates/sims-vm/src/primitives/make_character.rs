@@ -11,8 +11,9 @@
 //! own body, 0x44b23c), and the sex (0 male, any other female). They are
 //! read in the order b0, b2, b1 (0x44ae23, 0x44ae49, 0x44ae70), and an
 //! index past the locals throws native error 8 (b0 at 0x44b3b3, b2 at
-//! 0x44b39e, b1 at 0x44b389). Byte 3 picks the template (1 TemplateDog,
-//! 2 TemplateCat, any other value TemplatePerson, 0x4260fa).
+//! 0x44b39e, b1 at 0x44b389). A local that starts as half of a pointer
+//! fails loudly. Byte 3 picks the template (1 TemplateDog, 2 TemplateCat,
+//! any other value TemplatePerson, 0x4260fa).
 //!
 //! **The clone (0x4260e1).** The template's file is copied to
 //! `Characters/User%05d.iff`, each object definition in the copy getting a
@@ -40,8 +41,10 @@
 //! **Not ported, and failing loudly:** a negative age (0x44b23c), a
 //! template byte past 2 (0x44afa6, which reads an undefined gender code),
 //! the pets (0x44b051), a count of 0 (0x44b203, whose 0x426fcd deletes the
-//! type, its record and its objects), and a clone the original fails
-//! (0x426335, after which it reads an undefined pointer).
+//! type, its record and its objects), a clone the original fails
+//! (0x426335, after which it reads an undefined pointer: no template, or
+//! no record of it), and a template whose GUID more than one definition
+//! has.
 
 use sims_sim::characters::{self, Character};
 
@@ -61,17 +64,25 @@ const ADULT_AGE: i16 = 18;
 
 impl Machine<'_, '_> {
     pub(crate) fn make_new_character(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
-        let frame = self.frame()?;
-        let local = |byte: usize| {
-            frame
+        let local = |byte: usize, at: u32| -> Result<i16, Trap> {
+            let index = usize::from(operands[byte]);
+            let value = self
+                .frame()?
                 .locals
-                .get(usize::from(operands[byte]))
+                .get(index)
                 .copied()
-                .ok_or(Trap::native(8, "Make New Character local out of range"))
+                .ok_or(Trap::native(8, "Make New Character local out of range"))?;
+            self.check_local(index).map_err(|trap| match trap {
+                Trap::Unsupported(message) => {
+                    Trap::Unsupported(format!("Make New Character (0x{at:x}) {message}"))
+                }
+                other => other,
+            })?;
+            Ok(value)
         };
-        let skin = local(0)?;
-        let sex = local(2)?;
-        let age = local(1)?;
+        let skin = local(0, 0x44ae23)?;
+        let sex = local(2, 0x44ae49)?;
+        let age = local(1, 0x44ae70)?;
         let species = operands[3];
         let template = match species {
             1 => TEMPLATE_DOG,
@@ -150,13 +161,19 @@ impl Machine<'_, '_> {
     /// Clones `template` (0x4260e1 with no slot asked for): the made type
     /// and its record, which is returned with the type's GUID.
     ///
+    /// - **The template.** The template's definition is the one the first
+    ///   neighbour record of its GUID links to (0x42571f, record +8); with
+    ///   no such record the clone fails (0x426335). The port's records
+    ///   link to the definition the GUID resolves to, so more than one
+    ///   definition of the template's GUID fails here.
     /// - **The file number.** The copy tries the neighborhood's counter,
     ///   and again with the counter one higher while the file exists
     ///   (0x4722b8 returning -0x2b); the counter goes up after each try and
-    ///   back to 0 at 32000, where the clone fails. The port has no files:
-    ///   a number exists when a made type holds it. The original also
-    ///   finds the files of types made in earlier games, which the port
-    ///   does not know of; so this is an **unverified** substitute.
+    ///   back to 0 at 32000, where the clone fails. The port writes no
+    ///   files: a number is taken when the neighborhood's `Characters`
+    ///   folder held its file at boot ([`crate::Program::character_files`])
+    ///   or a made type holds it. That the counter starts at 0 is
+    ///   **unverified**.
     /// - **The GUID.** For each object definition in the copy, 0x4725d5
     ///   writes timeGetTime << 16 XOR one C runtime draw (0x4725ff,
     ///   0x636c74) at OBJD byte 0x1c, and the old GUID at byte 0x8c. The
@@ -178,6 +195,24 @@ impl Machine<'_, '_> {
             ))
         };
         let definition = self.catalog.object(template).ok_or_else(missing)?;
+        if self.world.neighbors.first_of(template).is_none() {
+            return Err(Trap::Unsupported(format!(
+                "Make New Character's template 0x{template:08X} has no neighbour record; the \
+                 clone fails (0x426335) and the original reads an undefined pointer (0x44aec1)"
+            )));
+        }
+        let registered = self
+            .catalog
+            .objects
+            .iter()
+            .filter(|o| o.guid == template)
+            .count();
+        if registered != 1 {
+            return Err(Trap::Unsupported(format!(
+                "Make New Character's template 0x{template:08X} has {registered} definitions; \
+                 which one its record links to (0x42571f) is not ported"
+            )));
+        }
         let definitions = self
             .catalog
             .objects
@@ -190,6 +225,7 @@ impl Machine<'_, '_> {
                  {definitions} definitions, each of which the copy gives a new GUID (0x47249d)"
             )));
         }
+        let files = &self.program.character_files;
         let characters = &mut self.world.characters;
         let file = loop {
             if characters.next_file >= FILES {
@@ -202,7 +238,7 @@ impl Machine<'_, '_> {
             }
             let file = characters.next_file;
             characters.next_file += 1;
-            if !characters.made.values().any(|made| made.file == file) {
+            if !files.contains(&file) && !characters.made.values().any(|made| made.file == file) {
                 break file;
             }
         };

@@ -13,9 +13,9 @@ const TEMPLATE_PERSON: u32 = 0x7fd9_6b54;
 /// A fixture whose lamp's tree 4096 sets its locals 0 to 2 to `skin`,
 /// `age` and `sex`, then makes a new character from them with template
 /// byte `species`, and on true puts the stack object's ID in global 34.
-/// TemplatePerson is registered, with skin tones `tones`, and the
-/// wardrobe gives an adult male of tone "lgt" two bodies and one head
-/// ([`wardrobe`]).
+/// TemplatePerson is registered, with a neighbour record and skin tones
+/// `tones`, and the wardrobe gives an adult male of tone "lgt" two bodies
+/// and one head ([`wardrobe`]).
 fn fixture(skin: i16, age: i16, sex: i16, species: u8, tones: &[&str]) -> Fixture {
     let mut fx = Fixture::new();
     fx.add(
@@ -30,6 +30,7 @@ fn fixture(skin: i16, age: i16, sex: i16, species: u8, tones: &[&str]) -> Fixtur
         ]),
     );
     fx.add_type(TEMPLATE_PERSON, 2, 0, 0);
+    fx.world.neighbors.make_record(TEMPLATE_PERSON).unwrap();
     fx.program.people.profiles.insert(
         TEMPLATE_PERSON,
         Profile {
@@ -171,6 +172,10 @@ fn with_no_suit_names_it_fails_loudly() {
     wardrobe.errors.insert("b.cmx".into(), "bad".into());
     fx.program.wardrobe = Some(wardrobe);
     unsupported(trap(fx.run()), "b.cmx");
+    // The boot keeps a person file it could not list for this call.
+    let mut fx = fixture(0, 30, 0, 0, &TONES);
+    fx.program.wardrobe = Some(Wardrobe::unread("Downloads/damaged.far: bad".into()));
+    unsupported(trap(fx.run()), "damaged.far");
 }
 
 #[test]
@@ -201,6 +206,27 @@ fn the_file_number_skips_those_made_types_hold() {
     assert_eq!(fx.run(), Ok(true));
     assert_eq!(fx.world.characters.made[&expected_guid()].file, 5);
     assert_eq!(fx.world.characters.next_file, 6);
+}
+
+#[test]
+fn the_file_number_skips_the_files_the_characters_folder_held() {
+    let mut fx = fixture(0, 30, 0, 0, &TONES);
+    fx.program.character_files = (0..172).collect();
+    assert_eq!(fx.run(), Ok(true));
+    assert_eq!(fx.world.characters.made[&expected_guid()].file, 172);
+    assert_eq!(fx.world.characters.next_file, 173);
+}
+
+#[test]
+fn with_the_last_number_taken_the_clone_fails_and_the_counter_goes_back_to_0() {
+    // Numbers below 31999 are free, but the counter is past them.
+    let mut fx = fixture(0, 30, 0, 0, &TONES);
+    fx.program.character_files = [31999].into();
+    fx.world.characters.next_file = 31999;
+    unsupported(trap(fx.run()), "0x4262c0");
+    assert_eq!(fx.world.characters.next_file, 0);
+    assert!(fx.world.characters.made.is_empty());
+    assert_eq!(fx.world.crt_rng, CrtRng::from_state(77));
 }
 
 #[test]
@@ -240,6 +266,7 @@ fn a_pet_fails_loudly() {
         let mut fx = fixture(0, 30, 0, species, &TONES);
         // The pet template's file is a clone of TemplatePerson's here.
         fx.add_type(template, 2, 0, 0);
+        fx.world.neighbors.make_record(template).unwrap();
         fx.program.people.profiles.insert(
             template,
             fx.program.people.profiles[&TEMPLATE_PERSON].clone(),
@@ -254,6 +281,48 @@ fn a_missing_template_fails_loudly_before_any_draw() {
     unsupported(trap(fx.run()), "0x426335");
     assert!(fx.world.characters.made.is_empty());
     assert_eq!(fx.world.crt_rng, CrtRng::from_state(77));
+}
+
+#[test]
+fn a_template_with_no_record_or_two_definitions_fails_loudly_before_any_draw() {
+    let mut fx = fixture(0, 30, 0, 0, &TONES);
+    fx.world.neighbors.slots.iter_mut().for_each(|slot| {
+        if slot.as_ref().is_some_and(|n| n.guid == TEMPLATE_PERSON) {
+            *slot = None;
+        }
+    });
+    unsupported(trap(fx.run()), "no neighbour record");
+    assert_eq!(fx.world.characters.next_file, 0);
+    assert_eq!(fx.world.crt_rng, CrtRng::from_state(77));
+    let mut fx = fixture(0, 30, 0, 0, &TONES);
+    fx.add_type(TEMPLATE_PERSON, 2, 0, 0);
+    unsupported(trap(fx.run()), "0x42571f");
+    assert_eq!(fx.world.crt_rng, CrtRng::from_state(77));
+}
+
+#[test]
+fn a_local_that_starts_as_half_of_a_pointer_fails_loudly_before_the_clone() {
+    // Local 3 is never written: the skin (b0), then the sex (b2), read it.
+    for (operands, address) in [
+        ([3, 1, 2, 0, 0, 0, 0, 0], "0x44ae23"),
+        ([0, 1, 3, 0, 0, 0, 0, 0], "0x44ae49"),
+        ([0, 3, 2, 0, 0, 0, 0, 0], "0x44ae70"),
+    ] {
+        let mut fx = fixture(0, 30, 0, 0, &TONES);
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![ins(19, RETURN_TRUE, RETURN_FALSE, operands)]),
+        );
+        let mut storage = sims_sim::FrameStorage::default();
+        storage.unknown.insert((0, 3));
+        fx.world.frame_storage.insert(LAMP, storage);
+        let trap = trap(fx.run());
+        unsupported(trap.clone(), address);
+        unsupported(trap, "half of a pointer");
+        assert!(fx.world.characters.made.is_empty());
+        assert_eq!(fx.world.crt_rng, CrtRng::from_state(77));
+    }
 }
 
 #[test]
