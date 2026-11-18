@@ -258,7 +258,11 @@ How the checks work (the addresses are in `input.py`):
   `press` and `answer-dialog` hold the button 3 s, as `answer.sh` does.
 - **Choosing.** `choose` reads the pie menu's items and their places on the
   screen, moves to the entry, waits until the menu shows it highlighted,
-  and presses.
+  and presses. An entry that opens a submenu (picker entry `+0x14` set:
+  "Talk...", "Hug..." on a person) pushes nothing: the step waits until the
+  picker's entries change to the submenu's, logs that `pie`, and the next
+  `choose` picks from it. `choose #N` picks the N-th item (from 0), for a
+  submenu whose labels are not known ahead; the logged pie names it.
 - **Confirming.** capture.py stops at `0x48ddcb`, where the pie menu pushes
   the chosen action on the person's queue, and logs the person and the
   action. `expect-queued` waits for that record, then for the person to hold

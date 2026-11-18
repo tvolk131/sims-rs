@@ -116,7 +116,7 @@ class Game:
     def hover(self, oid):
         self.m.put(self.picker + 0x2e, struct.pack('<H', oid))
 
-    def open_pie(self, labels, origin=(309, 110), target=None, caller=None):
+    def open_pie(self, labels, origin=(309, 110), target=None, caller=None, submenus=()):
         m = self.m
         entries = m.alloc(0x28 * len(labels))
         items = m.alloc(0x28 * len(labels))
@@ -126,6 +126,8 @@ class Game:
             m.put_words(action + 4, caller or 0, target or 0)
             m.put_words(entries + 0x28 * i, b, e, e + 1)
             m.put_words(entries + 0x28 * i + 0x24, action)
+            if label in submenus:
+                m.put(entries + 0x28 * i + 0x14, b'\x01')
             m.put_words(items + 0x28 * i, b, e, e + 1)
             m.put(items + 0x28 * i + 0x10, b'\x01')
             m.put_words(items + 0x28 * i + 0x18, 10 + 40 * i, 20, 30, 20)
@@ -424,6 +426,49 @@ class RunnerTest(RunnerBase):
         self.assertEqual((queued[0]['person'], queued[0]['action']['target']), (21, 173))
         taken = self.rows('taken')[0]
         self.assertEqual((taken['person'], taken['where'], taken['active']['target']), (21, 'active', 173))
+
+    def test_choosing_a_submenu_entry_opens_it_and_the_next_choice_picks_from_it(self):
+        g = self.g
+        g.open_pie(['Dance...', 'Talk...'], target=self.bench, caller=self.person, submenus=('Dance...', 'Talk...'))
+        r = self.runner('choose Talk...\nchoose Joke\nexpect-queued 21 173 within 20')
+        self.tick(r, 2)
+        g.highlight(1)
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        self.tick(r, 3)
+        self.assertEqual([x['status'] for x in self.rows('step')], ['start'])  # waiting for the submenu
+        g.open_pie(['Joke', 'Gossip'], target=self.bench, caller=self.person)
+        self.tick_until(r, lambda: len(self.rows('step')) > 2)
+        self.assertEqual([e['label'] for e in self.rows('pie')[-1]['entries']], ['Joke', 'Gossip'])
+        self.assertEqual(self.rows('step')[1]['status'], 'done')
+        self.assertFalse(self.rows('queued'))  # the submenu press pushes nothing
+        g.highlight(0)
+        self.tick_until(r, lambda: sum('mousedown' in c for c in self.agent.commands) == 2)
+        action = g.m.alloc(0x44)
+        g.m.put_words(action + 4, self.person, self.bench)
+        r.on_queue_push(self.update + 1, False, g.m, dict(edi=self.person, esi=action))
+        g.close_pie()
+        g.m.put_words(self.person + inp.ACTIVE_ACTION + 4, self.person, self.bench)
+        self.tick_until(r, lambda: r.finished)
+        self.assertIsNone(r.failed)
+        self.assertEqual(self.rows('taken')[0]['where'], 'active')
+
+    def test_a_submenu_entry_that_closes_the_menu_fails(self):
+        g = self.g
+        g.open_pie(['Talk...'], submenus=('Talk...',))
+        r = self.runner('choose Talk...\nwait 1')
+        self.tick(r, 2)
+        g.highlight(0)
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        g.close_pie()
+        self.tick(r, 20)
+        self.assertFalse(r.finished)  # an empty menu for a moment is not yet a failure
+        self.tick_until(r, lambda: r.finished, most=250)
+        self.assertIn('closed', r.failed)
+
+    def test_an_item_by_its_place(self):
+        items = [dict(label='Joke'), dict(label='Gossip')]
+        self.assertEqual((inp.match_item(items, '#1'), inp.match_item(items, '#2'), inp.match_item(items, 'gossip')),
+                         (1, None, 1))
 
     def test_a_missing_entry_fails_without_raising(self):
         self.g.open_pie(['Sit'])

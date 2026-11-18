@@ -20,7 +20,10 @@ A scenario is a text file, one step per line, words split as in a shell,
                                reports it under the pointer, click, and keep
                                the pie menu only if its actions aim at ID
                                (else close it with Escape and aim again)
-  choose LABEL                 click the open pie menu's entry LABEL
+  choose LABEL                 click the open pie menu's entry LABEL (#N: the
+                               N-th item, from 0); for an entry that opens a
+                               submenu ("Talk..."), wait for the submenu and
+                               log it, and choose again
   expect-queued PERSON [TARGET] [within N]
                                fail unless the pie menu pushed an action on
                                PERSON (aimed at object TARGET) within N updates
@@ -368,7 +371,11 @@ def check_window(window):
 
 
 def match_item(items, label):
-    """The index of the item whose label is label (case and surrounding space ignored), or None."""
+    """The index of the item whose label is label (case and surrounding space ignored), or None.
+    `#N` is the N-th item (from 0), for a menu whose labels are not known ahead."""
+    if label.startswith('#') and label[1:].isdigit():
+        n = int(label[1:])
+        return n if n < len(items) else None
     want = label.strip().lower()
     for i, item in enumerate(items):
         if item['label'].strip().lower() == want:
@@ -903,15 +910,31 @@ class Runner:
     def step_choose(self, label):
         yield Fresh()
         pie = read_pie(self.m)
-        if not pie or not read_entries(self.m):
+        entries = read_entries(self.m)
+        if not pie or not entries:
             raise StepFailed('no pie menu is open')
         i = match_item(pie['items'], label)
         if i is None:
             raise StepFailed(f'no entry {label!r} in {[it["label"] for it in pie["items"]]}')
-        item = pie['items'][i]
-        point = clamp((item['x'] + item['w'] // 2, item['y'] + item['h'] // 2))
+        if i < len(entries) and entries[i]['submenu']:
+            yield from self.open_submenu(pie, i, label, entries)
+            return
         pushes = len(self.pushes)
         self.push_cursor = pushes  # expect-queued looks only at what this choice pushes
+        yield from self.press_entry(pie, i, label)
+        for _ in range(200):
+            if len(self.pushes) > pushes:  # known without reading memory (a dialog may be up)
+                return
+            yield Fresh()
+            if not read_entries(self.m):
+                return
+            yield UntilPush(pushes)
+        raise StepFailed(f'choosing {label!r} did nothing')
+
+    def press_entry(self, pie, i, label):
+        """Move onto the pie's item i, wait until the game highlights it, and press it."""
+        item = pie['items'][i]
+        point = clamp((item['x'] + item['w'] // 2, item['y'] + item['h'] // 2))
         yield Job('move', move_command(*point, self.agent.window), x=point[0], y=point[1], entry=label)
         yield Fresh()
         for _ in range(60):  # the game takes the move late
@@ -922,14 +945,24 @@ class Runner:
         else:
             raise StepFailed(f'entry {label!r} ({i}) is not highlighted: {pie and pie["highlighted"]}')
         yield from self.held_press(x=point[0], y=point[1], entry=label)
-        for _ in range(200):
-            if len(self.pushes) > pushes:  # known without reading memory (a dialog may be up)
+
+    def open_submenu(self, pie, i, label, entries):
+        """Press the entry i that opens a submenu ("Talk...") and wait for the
+        picker's entries to become the submenu's; log that pie. The next
+        `choose` picks from it. Nothing is pushed by this press."""
+        before = [e['label'] for e in entries]
+        yield from self.press_entry(pie, i, label)
+        yield Fresh()
+        now = entries
+        for _ in range(200):  # the menu may be empty for a moment between the two
+            now = read_entries(self.m)
+            if now and [e['label'] for e in now] != before:
+                self.log_pie(read_pie(self.m), now)
                 return
-            yield Fresh()
-            if not read_entries(self.m):
-                return
-            yield UntilPush(pushes)
-        raise StepFailed(f'choosing {label!r} did nothing')
+            yield Updates(1)
+        if not now:
+            raise StepFailed(f'the pie menu closed when {label!r} was chosen, and no submenu opened')
+        raise StepFailed(f'choosing {label!r} did not open its submenu')
 
     def step_expect_queued(self, person, target, within):
         """Wait for a push on person (aimed at target), then for the person to
