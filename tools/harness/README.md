@@ -278,7 +278,7 @@ How the checks work (the addresses are in `input.py`):
   A step that waits on memory (`wait`, `until`, aiming, the pie menu's
   waits) waits on update returns, so a dialog the scenario did not open
   (the carpool, a visitor) holds it until the dialog is answered: run
-  captures with `--answer-stuck` for those. The menu may have closed by
+  captures with `--answer-stuck` for those (it answers from update `--answer-from`, 3 by default). The menu may have closed by
   then; `choose` presses an item only while the menu shows it highlighted
   under the same label.
 - **Buy mode.** `expect-mode` reads the lot's mode word (lot `+0x36`: 0 in

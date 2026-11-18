@@ -267,6 +267,13 @@ def entry_vector(m):
     return (vec, m.word(vec) if vec else 0)
 
 
+def shows_entries(pie, entries, first):
+    """Whether the pie window shows these entries (from `first` on): its
+    items are drawn from the picker's entries, under the same labels."""
+    labels = [it['label'] for it in pie['items']]
+    return labels == [e['label'] for e in entries[first:first + len(labels)]]
+
+
 def first_shown(m):
     """The picker entry shown as the pie's item 0 (a long menu is paged)."""
     return signed(m.word(picker(m) + 0x64))
@@ -586,8 +593,10 @@ class Runner:
             row = dict(kind='queued', update=update, in_update=in_update, person=m.object_id(person),
                        action=m.action(action), action_pointer=action, step=self.index)
         except Exception as e:  # reading the push must never end the capture
-            self.write(kind='queued_unread', update=update, in_update=in_update, person_pointer=person,
-                       action_pointer=action, error=f'{type(e).__name__}: {e}')
+            row = dict(kind='queued_unread', update=update, in_update=in_update, person=None,
+                       person_pointer=person, action_pointer=action, error=f'{type(e).__name__}: {e}')
+            self.pushes.append(row)  # still a push: a choice that waits on one goes on (a dialog may follow)
+            self.write(**row)
             return
         self.pushes.append(row)
         self.write(**row)
@@ -992,7 +1001,8 @@ class Runner:
         for _ in range(200):  # the menu may be empty for a moment between the two
             now = read_entries(self.m)
             shown = read_pie(self.m)
-            if now and shown and (shown['pointer'], entry_vector(self.m), [e['label'] for e in now]) != before:
+            if (now and shown and shows_entries(shown, now, first_shown(self.m))
+                    and (shown['pointer'], entry_vector(self.m), [e['label'] for e in now]) != before):
                 self.log_pie(shown, now)
                 return
             yield Updates(1)
@@ -1010,7 +1020,8 @@ class Runner:
             if push is None:
                 for i in range(self.push_cursor, len(self.pushes)):
                     r = self.pushes[i]
-                    if r['person'] == person and (target is None or r['action']['target'] == target):
+                    if r['kind'] == 'queued' and r['person'] == person and (
+                            target is None or r['action']['target'] == target):
                         push, self.push_cursor = r, i + 1
                         break
             p = push and find_object(self.m, self.sim, person)

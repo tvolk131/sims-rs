@@ -470,6 +470,19 @@ class RunnerTest(RunnerBase):
         self.assertIsNone(r.failed)
         self.assertEqual(self.rows('taken')[0]['where'], 'active')
 
+    def test_the_submenu_wait_ends_when_its_window_shows_it(self):
+        g = self.g
+        r = self.runner('choose Talk...\nchoose Joke\nwait 1')
+        self.open_talk(r)
+        g.open_pie(['Joke', 'Gossip'], target=self.bench, caller=self.person, window=1)
+        g.m.put_words(g.picker + inp.PICKER_ACTIVE_PIE, g.pies[0])  # the new entries; the parent still shown
+        self.tick(r, 5)
+        self.assertEqual(self.rows('step')[-1]['index'], 0)
+        g.m.put_words(g.picker + inp.PICKER_ACTIVE_PIE, g.pies[1])
+        self.tick_until(r, lambda: len(self.rows('step')) > 2)
+        self.assertEqual([it['label'] for it in self.rows('pie')[-1]['items']], ['Joke', 'Gossip'])
+        self.assertIsNone(r.failed)
+
     def test_a_submenu_with_the_parents_labels_is_still_seen(self):
         g = self.g
         r = self.runner('choose Talk...\nwait 1')
@@ -740,7 +753,18 @@ class ReviewFindingsTest(RunnerBase):
         r = self.runner('wait 1')
         r.on_queue_push(1, True, self.g.m, dict(edi=0x10, esi=0x20))
         self.assertEqual(self.rows('queued_unread')[0]['action_pointer'], 0x20)
-        self.assertEqual(r.pushes, [])
+        self.assertEqual([p['kind'] for p in r.pushes], ['queued_unread'])
+
+    def test_an_unreadable_push_then_a_dialog_does_not_deadlock(self):
+        g = self.g
+        g.open_pie(['Sit'], target=self.bench, caller=self.person)
+        g.highlight(0)
+        r = self.runner('choose Sit\nanswer-dialog 400 400')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        r.on_queue_push(self.update + 1, False, g.m, dict(edi=0x10, esi=0x20))  # not a person: unread
+        self.assertTrue(self.rows('queued_unread'))
+        r.on_dialog('dialog_show', self.update + 1)
+        self.assertIn('400 400', self.last_command())
 
     def test_a_dialog_opened_by_a_choice_does_not_deadlock(self):
         g = self.g
