@@ -62,6 +62,38 @@ impl Lighting {
         let shade = self.ambient + self.diffuse * normal.dot(self.towards.normalize()).max(0.0);
         if self.held { shade.min(1.0) } else { shade }
     }
+
+    /// A vertex's shade with lamps besides: each adds its strength times
+    /// [`LAMP_COLOUR`] times the cosine to the lamp, channel by channel,
+    /// and each channel is held to 1 as the original's is. With no lamps
+    /// it is the grey [`Lighting::shade`], to the bit.
+    pub fn shade_with(&self, normal: Vec3, lamps: &[Lamp]) -> Shade {
+        if lamps.is_empty() {
+            return Shade::Grey(self.shade(normal));
+        }
+        let base = self.ambient + self.diffuse * normal.dot(self.towards.normalize()).max(0.0);
+        let mut channels = [base; 3];
+        for lamp in lamps {
+            let cosine = normal.dot(lamp.towards).max(0.0);
+            for (channel, colour) in channels.iter_mut().zip(LAMP_COLOUR) {
+                *channel += lamp.strength * colour * cosine;
+            }
+        }
+        Shade::Colour(channels.map(|c| if self.held { c.min(1.0) } else { c }))
+    }
+}
+
+/// The colour of a lamp's light on a person: (1, 251/255, 209/255), a warm
+/// white (the three floats the original gives each lamp's light, 0x4b4c49
+/// to 0x4b4c5d).
+pub const LAMP_COLOUR: [f32; 3] = [1.0, 251.0 / 255.0, 209.0 / 255.0];
+
+/// A lamp's light on a person: the unit direction towards the lamp and
+/// the light's strength, 0 to 1 (`crate::lot::lamps`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Lamp {
+    pub towards: Vec3,
+    pub strength: f32,
 }
 
 /// An orthographic camera. The view turns about the vertical axis by an
