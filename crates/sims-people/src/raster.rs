@@ -64,9 +64,11 @@ impl Lighting {
     }
 
     /// A vertex's shade with lamps besides: each adds its strength times
-    /// [`LAMP_COLOUR`] times the cosine to the lamp, channel by channel,
-    /// and each channel is held to 1 as the original's is. With no lamps
-    /// it is the grey [`Lighting::shade`], to the bit.
+    /// [`LAMP_COLOUR`] times the cosine to the lamp, channel by channel.
+    /// Each channel is held to 1, as the original's is, when the shade is
+    /// (`held`, as [`Lighting::standard`] sets it); otherwise it may pass
+    /// 1, as [`Lighting::shade`] may. With no lamps it is the grey
+    /// [`Lighting::shade`], to the bit.
     pub fn shade_with(&self, normal: Vec3, lamps: &[Lamp]) -> Shade {
         if lamps.is_empty() {
             return Shade::Grey(self.shade(normal));

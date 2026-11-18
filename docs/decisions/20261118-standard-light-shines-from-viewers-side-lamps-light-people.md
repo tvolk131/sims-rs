@@ -38,7 +38,7 @@ few dozen ticks behind ours, so pixels are compared as distributions):
 | original | 32.8 | 10.3 / 28.7 / 44.6 | 47.6 |
 | light from behind (before) | 25.9 | 8.6 / 24.5 / 30.8 | 35.6 |
 | light turned | 34.3 | 12.5 / 31.3 / 45.1 | 48.9 |
-| light turned, with lamps | 36.5 | 13.1 / 34.4 / 47.5 | 52.2 |
+| light turned, with lamps | 36.6 | 13.1 / 34.4 / 47.6 | 52.3 |
 
 With the light behind him, his back was at the ambient grey only. With
 the light turned, it is lit as the original's is. Forcing his level,
@@ -50,14 +50,30 @@ original's code gives.
 - **Which lamps.** The room count gives a room a light for each lamp it
   counts that is lit (`sims_render::lot::gives_light`, the test its lamp
   records already used, now shared). There are at most six (0x467eff).
+  The count visits the room's listed tiles in order, and a tile reached
+  twice by the partition is listed, and visited, twice. So a lamp on
+  such a tile gives two lights. Room 4 lists the farther lamp's tile
+  twice, so that lamp lights Mortimer twice. On a tile, ours are taken
+  in object ID order, the original's in the lot's link order.
 - **Where the light is.** At the lamp's fine position, 5 units above
   the ground there (0x467f56; 5.0 at 0x667678). The running memory has
   the lamp above at 8.674 while the person stands at 3.674.
 - **Which room.** The person's lighting record holds the root of their
   model (+0x48 of the transform at their model's +0xc, set at 0x590e18
-  through 0x4b4987) and their level (+0x110). The room is the word the
-  level's room map holds at that tile. A word of 0xfffb or more (a split
-  tile) takes no lamps.
+  through 0x4b4987) and their level (+0x110). It keeps the root rounded
+  back to fine position (0x454fb9, half away from zero) at +0x10. The
+  tile is a sixteenth of that, rounded down, and must be inside the
+  lot's outer ring (0x433087). So the room follows the drawn root, not
+  the person's object, which can lag a fine step behind across a
+  doorway. The room is the word the level's room map holds at that
+  tile. A word of 0xfffb or more (a split tile) takes no lamps.
+- **Upstairs.** The model's root has the view's level offset in it
+  (`20261115-upstairs-person-takes-views-level-offset.md`, added at
+  0x5922d2), so the lighting record's root does too: 9.3 units above
+  the floor per level, and half a unit towards the viewer on each of
+  the view's axes (`View::level_lift`). The lamp's light takes no level
+  (0x478dfe), so a lamp upstairs is 5 units above the ground, below a
+  person standing beside it, and lights them from below.
 - **Strength and direction.** For each light, d² is the squared
   distance from the light to the root. Past 400 (0x6687b8) the light is
   off. Below 225 (0x6687b4) its strength is 1. Between the two it is
@@ -75,10 +91,10 @@ The original's recording of the Goth day (track 2's, update 2675) has
 both of room 4's lamps on: data word 16 is 1 on objects 71 and 194, and
 word 51 is 25 and 50. So the lamps belong in the 8:00 picture. The
 nearer lamp, four tiles from Mortimer, lights him at full strength. The
-farther, five tiles away, adds about 6%.
+farther, five tiles away, adds about 6%, twice.
 
-**What is left.** With the lamps Mortimer is about 11% brighter than the
-original's (mean 36.5 to 32.8), against 5% without. The poses differ, so
+**What is left.** With the lamps Mortimer is about 12% brighter than the
+original's (mean 36.6 to 32.8), against 5% without. The poses differ, so
 part of that is the crouch. The materials' colours are still not read,
 and a material darker than white would close it.
 
@@ -89,9 +105,11 @@ and a material darker than white would close it.
   direction alone is used here.
 - The order of the lamps when a room has more than six. Ours are in
   object order, the original's in its room count's order.
-- A lamp upstairs. The light's height comes from the ground under the
-  lamp (0x478dfe takes no level). The person's root is on the ground
-  too, so the two match, but no upstairs lamp has been compared.
+- A lamp upstairs: read from the code only, not compared with a
+  screenshot.
+- The running memory held one light for room 4 at one moment of an
+  earlier run, where the code gives three when both lamps are on. That
+  run's lamps were not read, so the farther one may have been off then.
 
 **Still not ported:** the level's fade over 250 ms, the cap of 0.8 after
 dark, and the person's flag that draws them at full light.

@@ -153,6 +153,26 @@ impl View {
         )
     }
 
+    /// How far the original's model root is from the floor's on `level`,
+    /// in the drawing frame: its [`LEVEL_OFFSET`] once per level above the
+    /// first, whole (the floor's height included). The offset is fixed in
+    /// the view, so its sideways part turns back with the camera's
+    /// rotation: [`View::place`] of a point moved by it is
+    /// [`View::place_on`] of the point, but for the floor height.
+    pub fn level_lift(&self, level: i32) -> Vec3 {
+        let above = (level - 1).max(0) as f32;
+        // The view's fine axes, in units; undo the rotation's turn.
+        let [u, v] = [LEVEL_OFFSET[2] * above, LEVEL_OFFSET[0] * above];
+        let [x, y] = match self.camera.rotation & 3 {
+            1 => [v, -u],
+            2 => [-u, -v],
+            3 => [-v, u],
+            _ => [u, v],
+        };
+        // Fine (x, y) is the drawing frame's (−y, ·, −x).
+        Vec3::new(-y, LEVEL_OFFSET[1] * above, -x)
+    }
+
     /// The screen position of a fine view position on `level`, raised
     /// `elevation` near-zoom pixels: the lot renderer's
     /// [`Camera::project_fine_f32`], one column right as objects are
@@ -227,41 +247,51 @@ const LAMP_HEIGHT: f32 = 5.0;
 /// The most lamp lights the original keeps for a room (0x467eff).
 const ROOM_LAMPS: usize = 6;
 
-/// The lamps' lights on a person whose skeleton's root is at `at` (the
-/// drawing frame, the ground's height under them). The original sets them
-/// with the standard light (0x4b4b04 to 0x4b4c95). Its room keeps a light
-/// for each lit lamp counted in it ([`sims_render::lot::gives_light`]), at
-/// most [`ROOM_LAMPS`], at the lamp's fine position and [`LAMP_HEIGHT`]
-/// above the ground there (0x467ed7). A person whose tile on their level
-/// is in a room takes every light of that room within reach: it shines
-/// from the lamp's light to the root, at strength 1 up to a squared
-/// distance of 225 and `1 / ((d² − 225) / 2 + 1)` beyond, to 400. A tile a
-/// diagonal wall splits is in no room here (the room word the original
-/// reads is negative), so no lamp lights a person standing on one.
+/// The lamps' lights on a person on `level` whose skeleton's root is at
+/// `at` (the drawing frame: the ground's height under them, moved by
+/// [`View::level_lift`] on a level above the first, as the original's
+/// model root is). The original sets them with the standard light
+/// (0x4b4b04 to 0x4b4c95), from its lighting record of the person: their
+/// level and their root, rounded back to fine position (0x4b4987 through
+/// 0x454fb9, half away from zero).
 ///
-/// The lamps are taken in object order. The original's records build up
-/// as it counts the room, in its own order; where a room has more than
-/// six lit lamps the two could differ.
-pub fn lamps(world: &World, person: u16, at: Vec3) -> Vec<Lamp> {
-    let Some(object) = world.objects.get(&person) else {
-        return Vec::new();
-    };
-    let [x, y, on] = World::tile(object.position).map(i32::from);
+/// The tile of that fine position (a sixteenth of it, rounded down) must
+/// be inside the lot's outer ring of tiles. The room is the word the
+/// level's room map holds there; a negative word (a tile a diagonal wall
+/// splits) takes no lamps. The room's lights are those its count leaves
+/// (0x467ed7): it visits the room's listed tiles in order, repeats
+/// included, and each lit lamp ([`sims_render::lot::gives_light`])
+/// standing on a tile it visits adds a light, at most [`ROOM_LAMPS`]. So a
+/// lamp on a tile listed twice lights twice. A light is at the lamp's fine
+/// position, [`LAMP_HEIGHT`] above the ground there, and shines from there
+/// to the root at [`lamp_strength`].
+///
+/// The objects on a tile are taken in ID order. The original takes them
+/// in the order the lot links them; the two differ only for a tile with
+/// two lit lamps in a room past six lights.
+pub fn lamps(world: &World, level: i32, at: Vec3) -> Vec<Lamp> {
+    let fine = [-at.z, -at.x].map(|u| (u * FINE_PER_UNIT).round() as i32);
+    let [x, y] = fine.map(|f| f.div_euclid(16));
     let full = sims_sim::FULL_SIZE as i32;
-    let room = usize::try_from(on - 1)
+    let inner = |n: i32| n >= 1 && n < full - 1;
+    if !inner(x) || !inner(y) {
+        return Vec::new();
+    }
+    let room = usize::try_from(level - 1)
         .ok()
-        .and_then(|level| world.rooms.map.get(level))
-        .filter(|_| (0..full).contains(&x) && (0..full).contains(&y))
+        .and_then(|index| world.rooms.map.get(index))
         .and_then(|map| map.get((x * full + y) as usize).copied())
         .filter(|&room| room >= 0);
-    let Some(room) = room else {
+    let Some(room) = room.and_then(|room| world.rooms.rooms.get(&room)) else {
         return Vec::new();
     };
-    world
-        .objects
-        .values()
-        .filter(|o| {
-            sims_render::lot::gives_light(o) && world.room_at(o.position).is_ok_and(|r| r == room)
+    room.tiles
+        .iter()
+        .flat_map(|&tile| {
+            world.objects.values().filter(move |o| {
+                World::tile(o.position).map(i32::from) == tile.map(i32::from)
+                    && sims_render::lot::gives_light(o)
+            })
         })
         .take(ROOM_LAMPS)
         .filter_map(|lamp| {
@@ -278,21 +308,26 @@ pub fn lamps(world: &World, person: u16, at: Vec3) -> Vec<Lamp> {
                 -(fx as f32) / FINE_PER_UNIT,
             );
             let from = at - light;
-            let squared = from.dot(from);
-            if squared > LAMP_REACH {
-                return None;
-            }
-            let strength = if squared < LAMP_FULL {
-                1.0
-            } else {
-                1.0 / ((squared - LAMP_FULL) * 0.5 + 1.0)
-            };
             Some(Lamp {
                 towards: (light - at).normalize(),
-                strength,
+                strength: lamp_strength(from.dot(from))?,
             })
         })
         .collect()
+}
+
+/// A lamp's strength on a person at squared distance `squared` (model
+/// units) from its light: 1 below [`LAMP_FULL`], `1 / ((d² − 225) / 2 +
+/// 1)` from there to [`LAMP_REACH`], and none past it (0x6687b4, 0x6687b8;
+/// the half at 0x666578).
+pub fn lamp_strength(squared: f32) -> Option<f32> {
+    if squared > LAMP_REACH {
+        None
+    } else if squared < LAMP_FULL {
+        Some(1.0)
+    } else {
+        Some(1.0 / ((squared - LAMP_FULL) * 0.5 + 1.0))
+    }
 }
 
 /// The lot renderer's canvas takes people pixel by pixel, by its sprite
@@ -617,7 +652,11 @@ impl People {
             // Each pixel the person draws names them, for a click.
             target.set_id(Some(person.id));
             let lighting = Lighting::standard(light, level(world, person.id));
-            let lamps = lamps(world, person.id, person.root.translation);
+            let lamps = lamps(
+                world,
+                person.level,
+                person.root.translation + view.level_lift(person.level),
+            );
             for part in person.body.parts.iter().filter(|p| p.censor == 0) {
                 let skinned = skin(part, &person.bones);
                 if lamps.is_empty() {
@@ -857,6 +896,41 @@ mod tests {
     /// A lamp adds its warm light channel by channel on the side facing
     /// it, each channel held to 1; with no lamps the shade is the grey
     /// one, and a side away from the lamp takes nothing from it.
+    #[test]
+    fn a_lamps_strength_falls_off_between_15_and_20_units() {
+        assert_eq!(lamp_strength(0.0), Some(1.0));
+        assert_eq!(lamp_strength(224.9), Some(1.0));
+        assert_eq!(lamp_strength(225.0), Some(1.0));
+        assert_eq!(lamp_strength(227.0), Some(0.5));
+        assert_eq!(lamp_strength(400.0), Some(1.0 / 88.5));
+        assert_eq!(lamp_strength(400.01), None);
+    }
+
+    /// The level lift is the offset `place_on` adds, at every rotation:
+    /// a point moved by it is placed where `place_on` puts the point,
+    /// but for the floor height the lot renderer raises a level by.
+    #[test]
+    fn the_level_lift_is_the_offset_place_on_adds() {
+        let floor = sims_render::Zoom::Near.floor_height() as f32;
+        let p = Vec3::new(-20.0, 3.5, -30.0);
+        for rotation in 0..4 {
+            let view = View::new(&camera(Zoom::Medium, rotation));
+            assert_eq!(view.level_lift(1), Vec3::new(0.0, 0.0, 0.0));
+            let (fine, elevation) = view.place(p + view.level_lift(2));
+            let (want, want_elevation) = view.place_on(p, 2);
+            for axis in 0..2 {
+                assert!(
+                    (fine[axis] - want[axis]).abs() < 1e-3,
+                    "{rotation}: {fine:?} {want:?}"
+                );
+            }
+            assert!(
+                (elevation - floor - want_elevation).abs() < 1e-3,
+                "{rotation}"
+            );
+        }
+    }
+
     #[test]
     fn a_lamp_adds_its_warm_light_facing_it() {
         let half = Lighting::standard(STANDARD_LIGHT, 0.5);
