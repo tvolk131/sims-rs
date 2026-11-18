@@ -36,7 +36,8 @@ kind 33 only when the camera moves, and the player does the whole case.
   - The last-start rule below holds at every link: a thread on the way
     that is not its track's last start takes the write itself, so a
     `target` it set before its track started again carries nothing on.
-  - Only the camera's write follows ended threads. The scripts' own
+  - Only the camera's placement follows ended threads: its write, and
+    its read of `Spl` (below). The scripts' own
     register accesses through `target` stop at a thread that has ended,
     as before. Following them there too would let a stop's fade or a
     script's level write reach another track's lingering note, which is
@@ -45,7 +46,9 @@ kind 33 only when the camera moves, and the player does the whole case.
     with `note_on` then `end` plays on, and the write reaches that note
     too. Here a thread that ends with notes still playing keeps its
     registers while they play. The write also goes to every such thread
-    of the track, and their notes take the new levels at once.
+    of the track, and their notes take the new levels at once, except
+    the last start's thread when it passes the write on through its
+    `target` (below).
   - Only the thread of the track's last start, running or ended,
     writes and reads through its `target`. A later start set the
     original's track object again, with its `target` back to itself, so

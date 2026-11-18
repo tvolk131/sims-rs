@@ -820,7 +820,8 @@ impl<S: Samples> Player<S> {
     /// the write reaches that note too. Here a thread that ends with
     /// notes playing keeps its registers while they play, and the write
     /// goes to every such thread of the track as well, whose notes take
-    /// their new levels at once.
+    /// their new levels at once, except the last start's thread when it
+    /// passes the write on through its `target`.
     ///
     /// Only the thread of the track's last start, running or ended,
     /// writes and reads through its `target` (a held track let go by a
