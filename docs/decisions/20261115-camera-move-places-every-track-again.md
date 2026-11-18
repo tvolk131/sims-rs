@@ -67,8 +67,9 @@ and night loop it picks is still not ported.
     its notes still play. While a note of the last start's ended thread
     plays, that thread also writes its own placement through its
     `target`; once its last note is gone it writes nothing, and only
-    the track's other threads are placed: the newest running one and
-    every older ended one with a note still playing, each itself. Each
+    the track's other placements are made: the newest running thread
+    and every older ended one with a note still playing, each itself,
+    and a kind 53 note still playing with no thread (below). Each
     write changes the notes of the thread it lands in and no other's:
     in a cycle where track 10's write lands in track 11 and track 11's
     in track 10, each takes the other's placement. Otherwise a `target`
