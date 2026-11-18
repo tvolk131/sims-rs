@@ -1543,9 +1543,12 @@ fn the_sign_opens_and_closes_its_help_balloon() {
         object: -4,
         name: "UI_whoosh".into(),
     };
+    let whooshes = |game: &mut Game| game.take_sounds().iter().filter(|s| **s == whoosh).count();
     game.press(centre(sign));
-    assert!(game.take_sounds().contains(&whoosh));
+    assert_eq!(whooshes(&mut game), 1);
     game.render();
+    // The press is carried out: no status band says otherwise.
+    assert!(!game.over_panel([400, 2]), "a status band shows");
     assert_eq!(
         find(&game, |k| matches!(k, Kind::Balloon(_))),
         Some(Rect::new(241, 373, 559, 127))
@@ -1555,8 +1558,9 @@ fn the_sign_opens_and_closes_its_help_balloon() {
     game.press([300, 400]);
     assert!(game.menu().is_none());
     game.press(centre(sign));
-    assert!(game.take_sounds().contains(&whoosh));
+    assert_eq!(whooshes(&mut game), 1);
     game.render();
+    assert!(!game.over_panel([400, 2]), "a status band shows");
     assert_eq!(find(&game, |k| matches!(k, Kind::Balloon(_))), None);
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }

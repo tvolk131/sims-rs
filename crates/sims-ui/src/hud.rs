@@ -245,6 +245,8 @@ impl Controls {
                 }
                 self.panel = *panel;
             }
+            // A sign outside 1 to 12 has no balloon and does nothing.
+            Command::Help(Help::Sign(sign)) if !(1..=12).contains(sign) => {}
             Command::Help(help) => {
                 self.help = match self.help {
                     Some(open) if open.balloon() == help.balloon() => None,
@@ -753,7 +755,7 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             items.push(Item {
                 rect: Rect::new(panel.x + 5, panel.y + panel.height - 5, 0, 0),
                 kind: Kind::Sign { sign, panel },
-                command: Some(Command::Help(Help::Sign(sign))),
+                command: resident.help_sign.map(|s| Command::Help(Help::Sign(s))),
             });
         }
     }
@@ -1840,6 +1842,7 @@ mod tests {
                     motives: [50.; 16],
                     personality: [0; 5],
                     zodiac: None,
+                    help_sign: None,
                     skills: [0; 6],
                     job: [0; 2],
                     needs: [0; 6],
@@ -1938,6 +1941,7 @@ mod tests {
                 motives: [0.; 16],
                 personality: [0; 5],
                 zodiac: None,
+                help_sign: None,
                 skills: [0; 6],
                 job: [0; 2],
                 needs: [0; 6],
@@ -2591,6 +2595,7 @@ mod tests {
     fn pressing_the_sign_opens_its_balloon_over_the_panel() {
         let mut s = snapshot();
         s.residents[0].zodiac = Some(1);
+        s.residents[0].help_sign = Some(1);
         let mut controls = Controls {
             expanded: true,
             panel: Panel::Personality,
@@ -2654,6 +2659,24 @@ mod tests {
         let mut closed = controls;
         closed.apply(&Command::TogglePanel);
         assert_eq!(closed.help, None);
+        // A sign outside 1 to 12 does nothing, open or not.
+        for sign in [0, 13] {
+            let mut odd = controls;
+            odd.apply(&Command::Help(Help::Sign(sign)));
+            assert_eq!(odd.help, Some(Help::Sign(1)));
+            odd.help = None;
+            odd.apply(&Command::Help(Help::Sign(sign)));
+            assert_eq!(odd.help, None);
+        }
+        // A saved sign the press does not take (13, shown as Pisces)
+        // leaves the name unpressable.
+        let mut odd = s.clone();
+        odd.residents[0].zodiac = Some(12);
+        odd.residents[0].help_sign = None;
+        let mut items = layout([800, 600], &odd, &controls);
+        fit(&mut items, &art, &texts);
+        assert!(items.iter().any(|i| matches!(i.kind, Kind::Sign { .. })));
+        assert_eq!(press(&items, bottom_left), None);
         // With another panel showing, no balloon is laid out.
         let mut elsewhere = controls;
         elsewhere.panel = Panel::Needs;

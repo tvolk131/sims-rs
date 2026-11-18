@@ -32,6 +32,9 @@ pub struct Resident {
     /// the personality panel shows it ([`zodiac`]); none for a person
     /// the panel shows no sign for.
     pub zodiac: Option<u8>,
+    /// The sign whose help balloon a press on the shown sign opens
+    /// ([`help_sign`]); none when the press does nothing.
+    pub help_sign: Option<u8>,
     /// The skills in the job panel's order ([`SKILLS`]), in hundredths
     /// of a point (0 to 1000).
     pub skills: [i16; 6],
@@ -131,6 +134,22 @@ pub fn zodiac(data: impl Fn(usize) -> i16) -> Option<u8> {
         // Held to 1..=12 just above, so it fits.
         sign => sign.clamp(1, 12) as u8,
     })
+}
+
+/// The sign a press on the personality panel's sign opens the balloon
+/// of (0x51bfb3, which reads it through 0x484311 at the press). Unlike
+/// the name the panel shows, it is not held to 1 to 12: a saved sign
+/// outside that range opens nothing. Where none is saved (0), the
+/// original's panel has saved the sign it works out by then
+/// (0x51cd44), so that one opens. None too where the panel shows no
+/// sign.
+pub fn help_sign(data: impl Fn(usize) -> i16) -> Option<u8> {
+    let shown = zodiac(&data)?;
+    match data(ZODIAC) {
+        0 => Some(shown),
+        sign @ 1..=12 => u8::try_from(sign).ok(),
+        _ => None,
+    }
 }
 
 /// The sign whose traits are nearest `traits` (in hundredths of a point,
@@ -314,6 +333,7 @@ impl Snapshot {
                     motives: person.map(|p| p.motives).unwrap_or_default(),
                     personality: PERSONALITY.map(data),
                     zodiac: zodiac(data),
+                    help_sign: help_sign(data),
                     skills: SKILLS.map(data),
                     job: JOB.map(data),
                     needs: [0; 6],
@@ -875,6 +895,25 @@ mod tests {
     }
 
     #[test]
+    fn the_sign_s_press_reads_the_saved_sign_unclamped() {
+        let person = |words: &[(usize, i16)]| {
+            let words = words.to_vec();
+            move |n: usize| words.iter().find(|w| w.0 == n).map_or(0, |w| w.1)
+        };
+        assert_eq!(help_sign(person(&[(ZODIAC, 4)])), Some(4));
+        assert_eq!(help_sign(person(&[(ZODIAC, 12)])), Some(12));
+        // Shown as Pisces and Aries, but the press opens nothing.
+        assert_eq!(zodiac(person(&[(ZODIAC, 13)])), Some(12));
+        assert_eq!(help_sign(person(&[(ZODIAC, 13)])), None);
+        assert_eq!(zodiac(person(&[(ZODIAC, -3)])), Some(1));
+        assert_eq!(help_sign(person(&[(ZODIAC, -3)])), None);
+        // None saved: the sign worked out (Cancer for no traits), as the
+        // panel shows it.
+        assert_eq!(help_sign(person(&[])), Some(4));
+        assert_eq!(help_sign(person(&[(65, 2)])), None);
+    }
+
+    #[test]
     fn a_record_stands_for_its_type_in_the_relationship_list() {
         let listed = |viewer_rows: &[(i32, i32)]| {
             let mut world = World::empty();
@@ -1020,6 +1059,7 @@ mod tests {
             motives: [0.0; 16],
             personality: [0; 5],
             zodiac: None,
+            help_sign: None,
             skills: [0, 0, 300, 1000, 199, 0],
             job,
             needs: [7; 6],
@@ -1080,6 +1120,7 @@ mod tests {
             motives: [0.0; 16],
             personality: [0; 5],
             zodiac: None,
+            help_sign: None,
             skills: [0; 6],
             job,
             needs: [0; 6],

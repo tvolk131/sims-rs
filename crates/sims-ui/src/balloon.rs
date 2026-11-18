@@ -126,16 +126,21 @@ impl Texts {
             .map_err(Error::Content)?;
         let bytes = std::fs::read(&path).map_err(Error::Io)?;
         let iff = Iff::parse(bytes).map_err(Error::Format)?;
-        let table = |id: u16| -> Result<Vec<String>> {
+        // A table missing, or one that does not parse, leaves its strings
+        // empty: the balloons lose that text rather than the HUD failing
+        // to open (UIText.iff itself the dialogs' labels need anyway).
+        let table = |id: u16| -> Vec<String> {
             let Some(chunk) = iff.get(b"STR#", id) else {
-                return Ok(Vec::new());
+                return Vec::new();
             };
-            let table = StringTable::parse(iff.data(chunk)).map_err(Error::Format)?;
-            Ok((0..table.entries.len())
+            let Ok(table) = StringTable::parse(iff.data(chunk)) else {
+                return Vec::new();
+            };
+            (0..table.entries.len())
                 .map_while(|i| table.get(i, 1).map(str::to_owned))
-                .collect())
+                .collect()
         };
-        let (texts, names, labels) = (table(SIGN_TEXTS)?, table(SIGN_NAMES)?, table(PANEL_LABELS)?);
+        let (texts, names, labels) = (table(SIGN_TEXTS), table(SIGN_NAMES), table(PANEL_LABELS));
         Ok(Self::signs(&texts, &names, &labels))
     }
 
@@ -208,10 +213,13 @@ pub fn lay_out(art: &Art, text: &Text, owner: Rect) -> Balloon {
     }
     let height = inner.saturating_add(PADDING);
     let right = owner.x.saturating_add(owner.width);
+    // The original runs at 800 by 600 or more, where the balloon always
+    // fits. In a smaller window here it is held to the top left corner,
+    // so its text starts on the screen.
     Balloon {
         rect: Rect::new(
-            right.saturating_sub(WIDTH),
-            owner.y.saturating_sub(height),
+            right.saturating_sub(WIDTH).max(0),
+            owner.y.saturating_sub(height).max(0),
             WIDTH,
             height,
         ),
@@ -325,6 +333,10 @@ mod tests {
         let art = Art::default();
         let b = lay_out(&art, &Text::default(), Rect::new(413, 500, 387, 100));
         assert_eq!(b.rect, Rect::new(241, 373, WIDTH, MIN_HEIGHT));
+        // In a window smaller than the original's least, the balloon is
+        // held to the top left corner so its text starts on the screen.
+        let b = lay_out(&art, &Text::default(), Rect::new(113, 100, 387, 100));
+        assert_eq!(b.rect, Rect::new(0, 0, WIDTH, MIN_HEIGHT));
     }
 
     #[test]
