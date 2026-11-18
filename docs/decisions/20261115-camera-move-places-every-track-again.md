@@ -6,7 +6,9 @@ The original's sound manager places every track again when its game
 sends kind 33 (0x574157). The port used to leave this out: the game
 here moved the ambience's cursor once a frame, and placing every track
 once a frame would undo a fading `extvol` each frame. Now the game sends
-kind 33 only when the camera moves, and the player does the whole case.
+kind 33 when its first view is set and whenever the camera moves, and
+the player places every track and moves the ambience's cursor. The day
+and night loop it picks is still not ported.
 
 - **What kind 33 does** (0x574157):
   - It places every track again (0x57447f).
@@ -22,12 +24,20 @@ kind 33 only when the camera moves, and the player does the whole case.
   - The register write follows the track's `target` (0x57de57). Here
     it goes to the thread the track's last start made, which stands for
     the original's one track object (see below), and on through its
-    `target`. A fade in progress goes on from the new volume.
+    `target`. A fade in progress on the `extvol` the write lands in goes
+    on from the new volume. A running thread's fade reads and writes its
+    own `extvol` when its `target` names a thread that has ended, so a
+    camera write that went on to that thread leaves the fade where it
+    was.
   - The write's `target` chain reaches a thread whose script has ended
     while its notes play on, as the original's pointer reaches a track
     object that outlives its script. When the chain ends there, those
-    notes take the write at once. A link to a thread with nothing left playing still stops the
-    chain (**unverified**, as before).
+    notes take the write at once. A running or pending thread takes the
+    write whether or not it plays anything; only an ended thread needs a
+    note still playing. A link to an ended thread with nothing left
+    playing, to a thread that is gone, or back to one already passed
+    stops the chain where it is, and that thread takes the write
+    (**unverified**, as before).
   - Only the thread the write lands in takes the new levels. A thread
     that passes the write on through its `target` keeps the levels its
     notes have, as the original writes only the track object at the
@@ -54,9 +64,13 @@ kind 33 only when the camera moves, and the player does the whole case.
     original's track object again, with its `target` back to itself, so
     an older thread takes the write itself: an ended one, or the newest
     still running once the last start's script has ended, whether or not
-    its notes still play. The last start's ended thread then writes its
-    own placement through its `target`, and its notes change only when
-    that chain ends at it. Otherwise a `target` that older thread had set would carry the write to another
+    its notes still play. While a note of the last start's ended thread
+    plays, that thread also writes its own placement through its
+    `target`; once its last note is gone it writes nothing, and the
+    older thread's placement is the only one. Each write changes the
+    notes of the thread it lands in and no other's: in a cycle where
+    track 10's write lands in track 11 and track 11's in track 10, each
+    takes the other's placement. Otherwise a `target` that older thread had set would carry the write to another
     track. The player keeps which thread each track's last start made,
     so this holds after that thread has gone with nothing left playing.
   - Every start sets the track object's `target` back to itself
@@ -97,8 +111,9 @@ kind 33 only when the camera moves, and the player does the whole case.
     the cutaway's focus are not part of a Shot, because they leave
     every object where it is on the screen.
   - That these are the moves that send it is **unverified**.
-- **The ambience's cursor** still follows the hour and the view once a
-  frame, so the ambience keeps to the clock while the camera is still.
+- **The ambience's cursor** still follows the latest hour and view
+  before each block the mixer renders, as well as on each camera move,
+  so the ambience keeps to the clock while the camera is still.
   As far as is read, the original moves it only on kind 33. Whether
   anything sends kind 33 when the hour changes is **unverified**.
 - **Kind 33 as a sound event** is still reported as not ported: no event
@@ -123,7 +138,7 @@ kind 33 only when the camera moves, and the player does the whole case.
 - A write through a `target` whose script has ended takes that
   thread's `Spl`: with the placing object far off the screen, the note
   keeps the floor of 800 its `Spl` of 10001 gives, where the placing
-  track's own `Spl` of 0 would silence it.
+  track's own `Spl`, the usual 20, would silence it.
 - A track that passes the write on keeps its own note's levels: a
   ducking request made after the note started does not dim it when the
   camera moves.

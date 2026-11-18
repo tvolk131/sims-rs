@@ -812,8 +812,10 @@ impl<S: Samples> Player<S> {
     /// through its `target` ([`Player::place_through`]): into a thread
     /// whose script has ended while its notes play, as the original's
     /// pointer reaches a track object that outlives its script, and not
-    /// past a thread that is not its track's last start. A fade on
-    /// `extvol` is undone by it and goes on from the new volume.
+    /// past a thread that is not its track's last start. A fade on the
+    /// `extvol` the write lands in is undone by it and goes on from the
+    /// new volume; a running thread's fade on its own `extvol`, while
+    /// its `target` names an ended thread, is left as it was.
     ///
     /// The original's track object outlives its script, and a note it
     /// started plays on after the script ends (`note_on` then `end`);
@@ -829,10 +831,12 @@ impl<S: Samples> Player<S> {
     /// original's track object's `target` back to itself, so an older
     /// thread takes the write itself, ended or the newest still running
     /// once the last start's script has ended, whether or not its notes
-    /// still play. The last start's ended thread then writes its own
-    /// placement through its `target`, and its notes change only when
-    /// that chain ends at it. That holds after the last start's thread
-    /// has gone with nothing left playing. A note kind 53 played
+    /// still play. While a note of the last start's ended thread plays,
+    /// that thread also writes its own placement through its `target`;
+    /// once its last note is gone it writes nothing. Each write changes
+    /// the notes of the thread it lands in and no other's. That holds
+    /// after the last start's thread has gone with nothing left playing.
+    /// A note kind 53 played
     /// with no thread running (thread 0) is placed too, from the
     /// registers it started with. `Spl` is that of the thread the last
     /// start's write lands in ([`Player::place_through`]), or else of the
@@ -1455,8 +1459,9 @@ impl<S: Samples> Player<S> {
     /// outlives its script, so the chain goes on into a thread whose
     /// script has ended while its notes play. Only the thread the chain
     /// ends at takes the placement, and if it has ended its notes take
-    /// it at once; a thread that passes it on keeps its levels. A thread on the way that is not its track's
-    /// last start takes the placement itself: a later start set the
+    /// it at once; a thread that passes it on keeps its levels. A thread
+    /// on the way that is not its track's last start takes the placement
+    /// itself: a later start set the
     /// original's track object's `target` back to itself. Script reads
     /// and writes do not follow ended threads ([`Player::resolve`]).
     fn place_through(&mut self, id: u32, vol: i32, pan: i32) {
@@ -1482,7 +1487,9 @@ impl<S: Samples> Player<S> {
     /// The thread a camera placement written by thread `id` lands in, and
     /// whose `Spl` it reads ([`Player::place_through`]): `id`, or on
     /// through `target` from each thread that is its track's last start,
-    /// into running, pending or ended threads whose notes still play.
+    /// into running or pending threads, playing or not, or ended threads
+    /// whose notes still play. A link to anything else, or back to a
+    /// thread already passed, stops the chain where it is.
     fn camera_destination(&self, id: u32) -> u32 {
         let mut at = id;
         let mut passed = vec![id];

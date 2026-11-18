@@ -2390,7 +2390,7 @@ fn a_camera_move_reads_spl_where_it_writes() {
     // The camera move puts object 9 far off the screen; track 10's write
     // goes through to track 11's track object, and so does its read of
     // Spl: the note is quiet but heard. Read from track 10, whose Spl is
-    // 0, the note would fall silent (Sol's review).
+    // the usual 20, the note would fall silent (Sol's review).
     let mut ended = vec![LOADL, 57];
     ended.extend(long(10_001));
     ended.extend(NOTE_ON_V1);
