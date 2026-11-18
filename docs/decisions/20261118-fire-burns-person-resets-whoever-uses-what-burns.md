@@ -16,9 +16,8 @@ and what it holds move off the lot, and whatever held it is asked
 function 9. That is the way now taken once the load has worked the
 lot's rooms out. Before that, the placement cannot find the off-lot
 place's room, so the narrow way the load was compared through
-(`Machine::leave_lot`) is still taken. The strict boots go through
-neither at the points they are pinned, and their hashes are unchanged.
-Step 15925 removes a counter under a fire; the sink it holds goes too.
+(`Machine::leave_lot`) is still taken. Step 15925 removes a counter
+under a fire; the sink it holds goes too.
 
 **Burn moves a person to its tile's centre** (0x44df25). The person's
 position and level are read. It resets (virtual function 0x38 with 0)
@@ -36,9 +35,24 @@ routes runs as for any person. Whether each used object is let go of by
 everyone and reset is decided once, before the uses unwind, from object
 flag 0x1000 (byte [ebp-0xd], 0x45e7c8): T's flag when T is given, else
 P's own. Here that flag is `Object::removal_skips_resets`. Before this,
-the reset with no object always reset what P used. It now reads P's own
-flag, which only a person queued for removal with Remove Object
-Instance's flag bit 1 can have.
+the reset with no object always reset what P used. The port took flag
+0x1000 to be set only at 0x42de09. The removal queue sets it too
+(0x442f79, when Remove Object Instance's flag bit 1 is set: 0x451bc7
+passes the bit inverted). So the reset with no object now reads P's own
+flag.
+
+**The strict Goth day changes at tick 5986.** That is the only change to
+the strict runs. The paper carrier, person 12, removes itself with flag
+bit 1 while it uses the pedestrian portal, object 9. Its deletion's last
+reset ends that use. As in the original, nobody is told to let go of the
+portal, and the portal does not reset. It used to reset. The pins from
+tick 9906 on are new:
+- tick 9906: c0d24976…
+- the day's turn at 31478: 06773ebe…
+- 43,200: 5983af01… (was bc43e887…)
+
+Ticks 1102, 3602 and 3912 and the Newbies' run are unchanged. The day is
+already unverified past tick 2510 (`20261115-strict-whole-goth-day.md`).
 
 **A reset of a person already in the middle of one is skipped** (object
 flag 0x800, 0x45e7b2), where it used to fail loudly. Mortimer's last use

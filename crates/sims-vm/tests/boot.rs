@@ -784,19 +784,19 @@ const TICK_3912_27: &str = "bf8537130628fae3d3557c87d3b53e50a1c3574c2f56a3068b67
 const TICK_3912_26: &str = "4bc0bc671978c8ccf79abc8e6acdcc177d85a3e49577ccfcb738b9b54c4df2f0";
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 9906
 /// --answers 3` gives this hash, the last before tick 9907.
-const TICK_9906: &str = "cfc262d4f8e5205da0de7f182f6df167313bc556be127124d68e9be72c0016a5";
+const TICK_9906: &str = "c0d24976665fec923b388d88ae239d2f8c2e22e9a65172c6f7c68ecca3adcfbf";
 /// The same state's hash under snapshot format 28, which had no record
 /// of the people whose animator was asked to stop its route
 /// ([`sims_sim::World::stops_asked`]) at the end.
-const TICK_9906_28: &str = "a4d92991d8fef2be97743657544a2c54ca10abd23245d6e6ce51f15b04d0320c";
+const TICK_9906_28: &str = "53c4e303bbb27f8a9fe6c8c3c5b58697b7cf1f8798dd497e0d07ca9da4bf8cd4";
 /// The same state's hash under snapshot format 27, which had no poses
 /// the load left in the skins ([`sims_sim::World::held_poses`]) either.
-const TICK_9906_27: &str = "f745dc46550f483711e0f904cce6197a91cf2c8c7beb95f0cafeceae5ebdec06";
+const TICK_9906_27: &str = "52e0fea76c71e52a1f2e916218e2a42adf050bbd8b06220fd85d6a3e060f74c4";
 /// The first update of the next day, when the day turns. Unverified: no
 /// capture reaches it.
-const TICK_31478: &str = "4f258bafed1a396b119e3117d7c300d657b6d0c95b5b22e35b87c06f87b13f23";
+const TICK_31478: &str = "06773ebe37554e072ce8724d147c400d0da54269482bc48fc42d7ecd20d2dfce";
 /// A whole day, 43,200 updates, from the load. Unverified.
-const TICK_43200: &str = "bc43e887614700e6ac2da54f2895bc1b8f7987a79535547af40ce35f5db33591";
+const TICK_43200: &str = "5983af019314a1a545c0b3604e85f2b5669899c6f39b94b2455683e1bc46231f";
 
 #[test]
 fn strict_mode_runs_the_goth_houses_whole_day() {
@@ -882,7 +882,11 @@ fn strict_mode_runs_the_goth_houses_whole_day() {
     assert_eq!(digest(&format_26_bytes(lot.world())), TICK_3912_26);
     assert_eq!(clock(&lot), (8, 41, 8));
     // Tick 3913: object 16, seated, asks for a route, and stands up first
-    // (0x4832d4). Tick 6756: a pet is made (the pet guard 0x440d63 lets it
+    // (0x4832d4). Tick 5986: the paper carrier, person 12, removes itself
+    // with Remove Object Instance's flag bit 1 while it uses the
+    // pedestrian portal, object 9; its deletion's reset ends that use but
+    // neither tells anyone to let go of the portal nor resets it (object
+    // flag 0x1000, 0x45e7c8). Tick 6756: a pet is made (the pet guard 0x440d63 lets it
     // be, with the expansions installed), its Main's first argument the
     // maker's temp 0, -2, as in the capture (Create flag 0x10); from 6760 it looks for a place
     // to go with no seats (0x4823d0), on its own pace (planner data word
