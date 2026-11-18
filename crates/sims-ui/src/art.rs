@@ -47,6 +47,19 @@ impl Art {
         Ok(art)
     }
 
+    /// Loads resource `id` in `language` too, if it can: one the tables
+    /// do not name, or whose file is missing or unreadable, is only
+    /// noted in [`Art::missing`], and what draws it goes without.
+    pub fn load_optional(&mut self, ui: &UiGraphics, language: u8, id: i32) {
+        match ui.bitmap(id, language) {
+            Ok(Some(mut image)) => {
+                image.key(KEY);
+                self.images.insert(id, image);
+            }
+            Ok(None) | Err(_) => self.missing.push(id),
+        }
+    }
+
     /// Adds or replaces an image, as tests and hosts with their own art do.
     pub fn insert(&mut self, id: i32, image: Image) {
         self.images.insert(id, image);

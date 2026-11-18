@@ -15,6 +15,7 @@ use crate::view::{Command as ViewCommand, View};
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_content::{Install, Neighborhood};
 use sims_render::{Assets, Canvas, Walls, Zoom};
+use sims_ui::balloon::Texts;
 use sims_ui::command::{Camera, Command, Panel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::Frame;
@@ -40,6 +41,8 @@ pub struct Hud {
     members: Vec<u32>,
     /// What the relationship panel needs from outside the world.
     known: Acquaintances,
+    /// The help balloons' texts.
+    texts: Texts,
     pub controls: Controls,
     items: Vec<Item>,
     /// The dialog the world waits on, until it is answered here.
@@ -66,8 +69,9 @@ impl Hud {
             .chain(&dialog::RESOURCES)
             .copied()
             .collect();
-        let art =
+        let mut art =
             sims_ui::art::Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
+        art.load_optional(&ui, US_ENGLISH, sims_ui::balloon::BACKGROUND);
         let message = match dialog::pending(world) {
             Some(pending) => {
                 let labels = Labels::load(&install).map_err(|e| e.to_string())?;
@@ -108,6 +112,9 @@ impl Hud {
             install.expansions,
             friendship(assets)?,
         );
+        // Without the balloons' strings the HUD still opens; the balloons
+        // show what text they have.
+        let texts = Texts::load(&install).unwrap_or_default();
         Ok(Self {
             art,
             faces,
@@ -116,6 +123,7 @@ impl Hud {
             kinds: None,
             members,
             known,
+            texts,
             // The strip opens as if Live had been pressed.
             controls: Controls {
                 expanded: true,
@@ -163,6 +171,7 @@ impl Hud {
             snapshot = snapshot.with_house(world, &self.house, kinds);
         }
         self.items = hud::layout(view.size, &snapshot, &self.controls);
+        hud::fit(&mut self.items, &self.art, &self.texts);
         let (width, height) = (
             u32::try_from(canvas.width).unwrap_or(u32::MAX),
             u32::try_from(canvas.height).unwrap_or(u32::MAX),

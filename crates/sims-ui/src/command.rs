@@ -124,6 +124,9 @@ pub enum Command {
     RelationsPage(u32),
     /// Move the camera (presentation only).
     Camera(Camera),
+    /// Open the help balloon `help`, or close it if it is the one open
+    /// (presentation only).
+    Help(crate::balloon::Help),
 }
 
 impl Command {
@@ -156,5 +159,6 @@ mod tests {
         assert!(!Command::TogglePanel.changes_simulation());
         assert!(!Command::ShowRelations(Relations::Family).changes_simulation());
         assert!(!Command::RelationsPage(1).changes_simulation());
+        assert!(!Command::Help(crate::balloon::Help::Sign(2)).changes_simulation());
     }
 }

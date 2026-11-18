@@ -1076,7 +1076,8 @@ impl Game {
             Command::TogglePanel
             | Command::OpenPanel(_)
             | Command::ShowRelations(_)
-            | Command::RelationsPage(_) => Outcome::redraw(),
+            | Command::RelationsPage(_)
+            | Command::Help(_) => Outcome::redraw(),
             other => {
                 self.note = Some(format!("Not carried out yet: {other:?}"));
                 Outcome::redraw()
