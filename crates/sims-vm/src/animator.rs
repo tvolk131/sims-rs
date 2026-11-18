@@ -132,6 +132,10 @@ impl Interpreter<'_> {
             .ok_or_else(|| Trap::native(0x1c, "object is not a person"))?;
         let word = |data: &[i16], index: usize| data.get(index).copied().unwrap_or(0);
         let kind = word(&person.data, KIND);
+        // 0x58dcaf: word 64 is read once here; the walk's tests of it
+        // (0x58e836, 0x58e910, 0x58ed35, 0x58ef25) use this copy, not a
+        // value a callback may have written since.
+        let special = word(&person.data, SPECIAL);
         let pace = word(&object.data, PACE);
         let position = object.position;
         let direction = word(&object.data, DIRECTION);
@@ -196,7 +200,7 @@ impl Interpreter<'_> {
         };
 
         if on_lot([position[0], position[1]]) {
-            self.dispatch(world, id, &mut a, position, direction, now)?;
+            self.dispatch(world, id, special, &mut a, position, direction, now)?;
         }
 
         // 0x5992b3: the skin's update.
@@ -690,10 +694,12 @@ fn unsupported(at: &str, what: &str) -> Trap {
 impl Interpreter<'_> {
     /// The state's code (the jump table at 0x58faa2), run again each time
     /// a state hands over to another (0x58f089).
+    #[allow(clippy::too_many_arguments)]
     fn dispatch(
         &self,
         world: &mut World,
         id: u16,
+        special: i16,
         a: &mut Animator,
         position: [i32; 3],
         direction: i16,
@@ -730,7 +736,7 @@ impl Interpreter<'_> {
                 }
                 4 => turn(world, id, a)?,
                 6 | 11 => self.stop_walk(world, id, a, now)?,
-                9 | 10 => self.follow(world, id, a, now)?,
+                9 | 10 => self.follow(world, id, special, a, now)?,
                 state => {
                     return Err(Trap::Unsupported(format!(
                         "the animator in state {state} (0x58faa2), which is not ported"
@@ -1230,7 +1236,14 @@ impl Interpreter<'_> {
     /// point is only the way to face there ([`Interpreter::end_of_path`]).
     /// How far it looks ahead depends on data word 17
     /// ([`Interpreter::look_ahead`]).
-    fn follow(&self, world: &mut World, id: u16, a: &mut Animator, now: i32) -> Result<Next, Trap> {
+    fn follow(
+        &self,
+        world: &mut World,
+        id: u16,
+        special: i16,
+        a: &mut Animator,
+        now: i32,
+    ) -> Result<Next, Trap> {
         let path = world
             .routing
             .routes
@@ -1266,7 +1279,7 @@ impl Interpreter<'_> {
                 .single();
             if i64::from(segment) == count - 2 {
                 let last = point(segment + 1)?;
-                return self.end_of_path(world, id, a, p, last, now);
+                return self.end_of_path(world, id, special, a, p, last, now);
             }
             if a.foreground.as_ref().is_none_or(|l| l.interruptible != 0) {
                 a.state = if pace == 1 { 10 } else { 9 };
@@ -1318,7 +1331,7 @@ impl Interpreter<'_> {
                 };
                 let distance = ((dy * dy).single() + (dx * dx).single()).single();
                 if distance >= reach {
-                    return self.head(world, id, a, [dx, dy], distance, now);
+                    return self.head(world, id, special, a, [dx, dy], distance, now);
                 }
                 a.motion.progress = (inverse + t).single().to_f32();
             }
@@ -1362,6 +1375,7 @@ impl Interpreter<'_> {
         &self,
         world: &mut World,
         id: u16,
+        special: i16,
         a: &mut Animator,
         end: [i32; 2],
         last: [i32; 2],
@@ -1383,7 +1397,16 @@ impl Interpreter<'_> {
             (Ext::from_i32(last[0]) - end_y).single(),
         );
         if datum(world, id, STOPS)? == 0 {
-            return self.stop_on_timer(world, id, a, [end_x, end_y, facing], [dx, dy], left, now);
+            return self.stop_on_timer(
+                world,
+                id,
+                special,
+                a,
+                [end_x, end_y, facing],
+                [dx, dy],
+                left,
+                now,
+            );
         }
         let pace = datum(world, id, PACE)?;
         let stop = if pace == 1 {
@@ -1396,9 +1419,9 @@ impl Interpreter<'_> {
         if a.motion.near_end == 0 && at_least(left, stop) {
             a.state = if pace == 1 { 10 } else { 9 };
             let square = ((dy * dy).single() + (dx * dx).single()).single();
-            return self.head(world, id, a, [dx, dy], square, now);
+            return self.head(world, id, special, a, [dx, dy], square, now);
         }
-        if person_word(world, id, SPECIAL)? != 0 {
+        if special != 0 {
             return Err(unsupported(
                 "0x58e83b",
                 "stops at the end of its path for a person whose word 64 is set",
@@ -1416,7 +1439,7 @@ impl Interpreter<'_> {
         }
         let [sx, sy] = a.motion.step.map(F32::ext);
         let square = ((sy * sy).single() + (sx * sx).single()).single();
-        if !self.walk_step(world, id, a, [sx, sy], square)? {
+        if !self.walk_step(world, id, special, a, [sx, sy], square)? {
             return Ok(Next::Done);
         }
         a.destination = a.position;
@@ -1471,6 +1494,7 @@ impl Interpreter<'_> {
         &self,
         world: &mut World,
         id: u16,
+        special: i16,
         a: &mut Animator,
         [end_x, end_y, facing]: [Ext; 3],
         [dx, dy]: [Ext; 2],
@@ -1478,10 +1502,9 @@ impl Interpreter<'_> {
         now: i32,
     ) -> Result<Next, Trap> {
         let pace = datum(world, id, PACE)?;
-        let special = person_word(world, id, SPECIAL)?;
         let walk_on = |this: &Self, world: &mut World, a: &mut Animator| {
             let square = ((dy * dy).single() + (dx * dx).single()).single();
-            this.head(world, id, a, [dx, dy], square, now)
+            this.head(world, id, special, a, [dx, dy], square, now)
         };
         if a.motion.timer == 0 {
             // Whichever way the stride decides, the animator walks on with
@@ -1538,10 +1561,12 @@ impl Interpreter<'_> {
     /// first (0x58ec51): the destination becomes the position with the
     /// heading, the walk flag is cleared and the animator stands (state
     /// 3). A smaller turn walks ([`Interpreter::walk`]).
+    #[allow(clippy::too_many_arguments)]
     fn head(
         &self,
         world: &mut World,
         id: u16,
+        special: i16,
         a: &mut Animator,
         offset: [Ext; 2],
         distance: Ext,
@@ -1576,7 +1601,7 @@ impl Interpreter<'_> {
             a.walking = false;
             return Ok(Next::Again);
         }
-        self.walk(world, id, a, d, offset, distance, now)
+        self.walk(world, id, special, a, d, offset, distance, now)
     }
 
     /// State 6 (0x58e125): the person starts its walk with the posture's
@@ -1711,6 +1736,7 @@ impl Interpreter<'_> {
         &self,
         world: &mut World,
         id: u16,
+        special: i16,
         a: &mut Animator,
         d: Ext,
         offset: [Ext; 2],
@@ -1746,9 +1772,7 @@ impl Interpreter<'_> {
                 let stop = self.stride(world, id, clip, false)?;
                 Ok(distance > (stop * stop).single())
             };
-            if person_word(world, id, SPECIAL)? != 0
-                || (!held && stop(if pace == 1 { STOP_RUN } else { STOP_WALK })?)
-            {
+            if special != 0 || (!held && stop(if pace == 1 { STOP_RUN } else { STOP_WALK })?) {
                 // 0x58ed52: state 6, or 11 with data word 17 1; +0x24
                 // and +0x28 become 0 (not kept); that state's code runs.
                 a.state = if pace == 1 { 11 } else { 6 };
@@ -1779,7 +1803,7 @@ impl Interpreter<'_> {
         })?;
         layer.set_speed(rate);
         layer.phase = phase;
-        self.walk_step(world, id, a, offset, distance)?;
+        self.walk_step(world, id, special, a, offset, distance)?;
         Ok(Next::Done)
     }
 
@@ -1791,12 +1815,15 @@ impl Interpreter<'_> {
     /// rounded to whole units, is moved onto the person's path, the
     /// person must fit there, and is put there; the animator's position
     /// becomes the step's end, unrounded. Returns false, with the route's
-    /// end set to 3 and nothing moved, when the person does not fit
-    /// there. See [`Interpreter::walk`].
+    /// end set to 3, when the person does not fit there (nothing moved),
+    /// or when a stop asked for under way ends the route once the person
+    /// is put (both go to the update's tail, 0x58f682). See
+    /// [`Interpreter::walk`].
     fn walk_step(
         &self,
         world: &mut World,
         id: u16,
+        special: i16,
         a: &mut Animator,
         offset: [Ext; 2],
         distance: Ext,
@@ -1865,7 +1892,7 @@ impl Interpreter<'_> {
                 .as_ref()
                 .is_none_or(|layer| layer.interruptible != 0)
         {
-            if person_word(world, id, SPECIAL)? != 0 {
+            if special != 0 {
                 return Err(unsupported(
                     "0x58ef2f",
                     "stops its route where it was asked to, for a person whose word 64 is set",
