@@ -26,9 +26,18 @@ entry settles it: the lot view moves the sprite.
   position, turns it with the camera (0x47bc1f), takes the ground
   there (0x478dfe), and writes the screen position.
 
-Ours does the same (`part_fine`), for the screen position and the
-depth. Depth used to round x and y to the nearest, and turned them for
-an odd facing too. Both now follow the code above.
+Ours does the same (`part_fine`, `part_screen`), for the screen
+position and the depth, for every sprite. Depth used to round x and y
+to the nearest, and turned them for an odd facing too. Both now follow
+the code above.
+
+An object held in another's slot (a lamp on an end table) stands at
+its holder's position plus the slot's offset (0x437fdd). That offset
+used to be rounded to a fine step first. It is now kept as a float and
+rounded once, with the sprite's, as the original keeps both as floats:
+at x 100, a slot offset of 0.4 and a sprite offset of 0.4 give 101, not
+100. The held object's tile, ground and sort order still use the
+rounded position.
 
 **What the screenshot shows.** The original at 7:47 (medium zoom,
 rotation 0, cutaway) has Mortimer eating at the patio table's west end.
@@ -39,11 +48,18 @@ gap. With the change, a scooted chair at the table on the current main
 renders did not change: nothing in them has a nonzero x or y offset.
 
 **Unverified.**
-- The ground. The original takes it at the moved fine position. Ours
+- The ground. The original samples the terrain at the moved fine
+  position, and that sample changes within a tile on a slope. Ours
   keeps the mean of the object's own tile's corners. They differ only
-  where an offset crosses into a tile on a slope.
+  on sloped ground.
 - z. The 2026-11-14 entry's rise of `z * (2 << zoom)` pixels is
-  unchanged and still read from the preview only.
+  unchanged. The lot projection (0x4b9991) scales height above the
+  sampled ground by the same `2 << zoom`, so the factor has lot-view
+  evidence. That the sprite's z enters that height, rounded the same
+  way, is not traced here.
+- The order. Objects are still sorted by their own anchors, not their
+  moved sprites'. A sprite moved nearer than an object drawn after it
+  can blend its soft edge with what was behind instead.
 - The pixel-exact position. The original's frame and ours show
   different meals (the simulation runs a different day), so only the
   chair's place against its Sim is compared, by eye.

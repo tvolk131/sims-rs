@@ -980,7 +980,10 @@ impl Painter<'_> {
             let Some(([dx, dy], lift)) = held(&self.world.objects, slot, id) else {
                 continue;
             };
-            let [x, y] = [x + dx, y + dy];
+            // Its sprites are placed from the exact position; the tile,
+            // ground and sort anchor from the rounded one.
+            let exact = [x as f32 + dx, y as f32 + dy];
+            let [x, y] = [x + dx.round() as i32, y + dy.round() as i32];
             let view = self.camera.rotate_fine([x, y]);
             // The ground under the object: the mean of its tile's corners.
             let ground = (0..4)
@@ -989,7 +992,7 @@ impl Painter<'_> {
                 / 4;
             let height = ground as f32 / 16.0 + lift;
             let anchor = place(&self.depth, self.camera, view, level, height);
-            list.push((anchor, id, view, ground, [x, y], lift));
+            list.push((anchor, id, view, ground, exact, lift));
         }
         // Far objects first, so soft edges blend over what is behind them.
         list.sort_by_key(|&(a, id, ..)| (std::cmp::Reverse(a.depth), id));
@@ -1022,7 +1025,6 @@ impl Painter<'_> {
                 continue;
             };
             let direction = view_direction(o.data.get(1).copied().unwrap_or(0), self.camera);
-            let screen = self.camera.project_fine(view, level, ground);
             let parts = self.assets.group(&definition, group, direction, zoom);
             if parts.is_empty() {
                 self.stats.missing_objects += 1;
@@ -1056,16 +1058,7 @@ impl Painter<'_> {
                 // A held object stands on its holder's slot: the slot's
                 // height adds to the sprite's own.
                 let object = [part.object[0], part.object[1], part.object[2] + lift];
-                // The sprite's x and y offset move where it is drawn, as
-                // they move the object's position (0x437b7e: the original
-                // projects the moved position, 0x4b9991).
-                let screen = if part.object[0] == 0.0 && part.object[1] == 0.0 {
-                    screen
-                } else {
-                    let fine = part_fine(spot, facing, object);
-                    self.camera
-                        .project_fine(self.camera.rotate_fine(fine), level, ground)
-                };
+                let screen = part_screen(self.camera, spot, facing, object, level, ground);
                 let at = [
                     screen[0]
                         .saturating_add(part.offset[0])
@@ -1151,7 +1144,7 @@ fn held(
     objects: &BTreeMap<u16, Object>,
     mut slot: impl FnMut(u32, usize) -> Option<[f32; 3]>,
     id: u16,
-) -> Option<([i32; 2], f32)> {
+) -> Option<([f32; 2], f32)> {
     let mut cursor = objects.get(&id)?;
     let mut seen = BTreeSet::from([id]);
     let mut offset = [0.0f32; 3];
@@ -1166,7 +1159,7 @@ fn held(
             break;
         };
         if !seen.insert(holder_id) {
-            return Some(([0, 0], 0.0));
+            return Some(([0.0; 2], 0.0));
         }
         if holder.data.get(HIDDEN).is_some_and(|&w| w != 0) {
             return None;
@@ -1182,10 +1175,7 @@ fn held(
         offset = sprite_offset([offset[0] + x, offset[1] + y, offset[2] + z]);
         cursor = holder;
     }
-    Some((
-        [offset[0].round() as i32, offset[1].round() as i32],
-        offset[2],
-    ))
+    Some(([offset[0], offset[1]], offset[2]))
 }
 
 /// A draw group sprite's world offset (`object`), made safe: x and y in
@@ -1229,23 +1219,43 @@ fn place(depth: &Depth, camera: &Camera, view: [i32; 2], level: i32, height: f32
 
 /// The fine position of a draw group sprite that sits `object` away from
 /// an object at fine position `position` facing `facing` (data word 1).
-/// The offset's x and y are sixteenths of a tile in the object's own
-/// frame. The original turns them a quarter turn per two steps of facing
-/// and leaves both at 0 for an odd facing (0x439109), then adds them to
-/// the object's position and rounds, adding a half and truncating
-/// (0x437b7e, 0x4b9991).
-fn part_fine(position: [i32; 2], facing: i16, object: [f32; 3]) -> [i32; 2] {
+/// The position is a float: a held object's slot offset stays exact
+/// until here. The offset's x and y are sixteenths of a tile in the
+/// object's own frame. The original turns them a quarter turn per two
+/// steps of facing and leaves both at 0 for an odd facing (0x439109),
+/// then adds them to the object's position and rounds, adding a half and
+/// truncating (0x437b7e, 0x4b9991).
+fn part_fine(position: [f32; 2], facing: i16, object: [f32; 3]) -> [i32; 2] {
     let [mut x, mut y, _] = sprite_offset(object);
     if facing & 1 != 0 {
-        return position;
+        [x, y] = [0.0; 2];
     }
     for _ in 0..(i32::from(facing) / 2).rem_euclid(4) {
         (x, y) = (-y, x);
     }
     [
-        (position[0] as f32 + x + 0.5) as i32,
-        (position[1] as f32 + y + 0.5) as i32,
+        (position[0] + x + 0.5) as i32,
+        (position[1] + y + 0.5) as i32,
     ]
+}
+
+/// Where on the screen a draw group sprite that sits `object` away from
+/// an object at `position` facing `facing` is placed, before its pixel
+/// offset and rise: the camera's projection of [`part_fine`], on `level`
+/// at `ground`. The sprite's x and y offset move it, as they move the
+/// object's position (0x437b7e: the original projects the moved
+/// position, 0x4b9991). Its depth ([`part_anchor`]) is taken at the same
+/// fine position.
+fn part_screen(
+    camera: &Camera,
+    position: [f32; 2],
+    facing: i16,
+    object: [f32; 3],
+    level: i32,
+    ground: i32,
+) -> [i32; 2] {
+    let fine = part_fine(position, facing, object);
+    camera.project_fine(camera.rotate_fine(fine), level, ground)
 }
 
 /// The depth anchor of a draw group sprite that sits `object` away from
@@ -1256,7 +1266,7 @@ fn part_fine(position: [i32; 2], facing: i16, object: [f32; 3]) -> [i32; 2] {
 fn part_anchor(
     depth: &Depth,
     camera: &Camera,
-    position: [i32; 2],
+    position: [f32; 2],
     facing: i16,
     object: [f32; 3],
     level: i32,
@@ -1640,11 +1650,11 @@ mod tests {
             object(2, 9, [100, 200, 1], &[(CONTAINER, 1), (CONTAINER_SLOT, 1)]),
         );
         // The slot's x turns with the table into y; its height lifts.
-        assert_eq!(held(&objects, slot, 2), Some(([0, 4], 4.0)));
-        assert_eq!(held(&objects, slot, 1), Some(([0, 0], 0.0)));
+        assert_eq!(held(&objects, slot, 2), Some(([0.0, 4.0], 4.0)));
+        assert_eq!(held(&objects, slot, 1), Some(([0.0; 2], 0.0)));
         // A holder without that slot puts it at its own place.
         objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 5;
-        assert_eq!(held(&objects, slot, 2), Some(([0, 0], 0.0)));
+        assert_eq!(held(&objects, slot, 2), Some(([0.0; 2], 0.0)));
         objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 1;
         // A hidden holder hides what it holds.
         objects.get_mut(&1).unwrap().data[HIDDEN] = 1;
@@ -1653,12 +1663,12 @@ mod tests {
         // Holders that hold each other, or an object that holds itself,
         // give no offset, however many other objects there are.
         objects.get_mut(&1).unwrap().data[CONTAINER] = 2;
-        assert_eq!(held(&objects, slot, 2), Some(([0, 0], 0.0)));
+        assert_eq!(held(&objects, slot, 2), Some(([0.0; 2], 0.0)));
         objects.insert(
             3,
             object(3, TABLE, [0, 0, 1], &[(CONTAINER, 3), (CONTAINER_SLOT, 1)]),
         );
-        assert_eq!(held(&objects, slot, 3), Some(([0, 0], 0.0)));
+        assert_eq!(held(&objects, slot, 3), Some(([0.0; 2], 0.0)));
     }
 
     #[test]
@@ -1675,7 +1685,7 @@ mod tests {
         }
         let limit = camera::ARRAY_SIZE * 16;
         let ([x, y], lift) = held(&objects, huge, 199).unwrap();
-        assert!(x.abs() <= limit && y.abs() <= limit);
+        assert!(x.abs() <= limit as f32 && y.abs() <= limit as f32);
         assert!(lift.abs() <= limit as f32);
     }
 
@@ -1693,7 +1703,7 @@ mod tests {
 
     #[test]
     fn sprite_world_offsets_move_depth_with_the_object_and_camera() {
-        let position = [100, 200];
+        let position = [100.0, 200.0];
         let base = 2.0;
         let d = Depth::new(&camera(0));
         let at =
@@ -1725,23 +1735,34 @@ mod tests {
     /// moves the drawn sprite by that, not only its depth (0x437b7e).
     #[test]
     fn a_sprite_offset_moves_the_fine_position_it_is_drawn_at() {
-        let position = [100, 200];
+        let position = [100.0, 200.0];
         let scooted = [0.0, -4.0, 0.0];
         assert_eq!(part_fine(position, 0, scooted), [100, 196]);
         // Each two steps of facing turn (x, y) to (-y, x).
         assert_eq!(part_fine(position, 2, scooted), [104, 200]);
         assert_eq!(part_fine(position, 4, scooted), [100, 204]);
         assert_eq!(part_fine(position, 6, scooted), [96, 200]);
-        assert_eq!(part_fine(position, 3, scooted), position);
+        assert_eq!(part_fine(position, 3, scooted), [100, 200]);
         // Rounded by adding a half and dropping the fraction.
         assert_eq!(part_fine(position, 0, [0.0, -0.8, 0.0]), [100, 199]);
         assert_eq!(part_fine(position, 0, [0.0, -2.4, 0.0]), [100, 198]);
         assert_eq!(part_fine(position, 0, [0.5, 0.0, 0.0]), [101, 200]);
-        // It moves where the sprite is drawn on the screen.
+        // A held object's slot offset is added exactly, then rounded with
+        // the sprite's: 100.4 + 0.4 is 101, where rounding each first
+        // would give 100.
+        assert_eq!(part_fine([100.4, 200.0], 0, [0.4, 0.0, 0.0]), [101, 200]);
+        // Rounding drops the fraction towards zero, as the original does.
+        assert_eq!(part_fine([-1.0, 0.0], 0, [0.0, 0.0, 1.0]), [0, 0]);
+        // It moves where the sprite is drawn on the screen: a quarter tile
+        // back along y is 16 pixels right and 8 up at the near zoom.
         let camera = camera(0);
-        let [moved, still] = [part_fine(position, 0, scooted), position]
-            .map(|f| camera.project_fine(camera.rotate_fine(f), 1, 0));
-        assert_ne!(moved, still);
+        let screen = |object| part_screen(&camera, position, 0, object, 1, 0);
+        let [moved, still] = [screen(scooted), screen([0.0; 3])];
+        assert_eq!([moved[0] - still[0], moved[1] - still[1]], [16, -8]);
+        assert_eq!(
+            still,
+            camera.project_fine(camera.rotate_fine([100, 200]), 1, 0)
+        );
     }
 
     #[test]
