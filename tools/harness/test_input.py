@@ -517,6 +517,19 @@ class RunnerTest(RunnerBase):
         self.tick_until(r, lambda: r.finished, most=250)
         self.assertIn('closed', r.failed)
 
+    def test_choose_waits_while_the_pie_window_fills(self):
+        g = self.g
+        g.open_pie(['Sit'], target=self.bench, caller=self.person)
+        items = g.m.word(g.pies[0] + 0x190)
+        g.m.put_words(g.pies[0] + 0x190, 0, 0)  # entries are there; the window shows nothing yet
+        r = self.runner('choose Sit\nwait 1')
+        self.tick(r, 3)
+        self.assertFalse(r.failed)
+        g.m.put_words(g.pies[0] + 0x190, items, items + 0x28)
+        g.highlight(0)
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        self.assertIsNone(r.failed)
+
     def test_an_item_by_its_place(self):
         items = [dict(label='Joke'), dict(label='Gossip')]
         self.assertEqual((inp.match_item(items, '@1'), inp.match_item(items, '@2'), inp.match_item(items, 'gossip')),

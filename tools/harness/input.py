@@ -882,7 +882,8 @@ class Runner:
             entries = yield from self.wait_entries(200)
             if not entries:
                 raise StepFailed(f'no pie menu opened on object {oid}')
-            targets = self.log_pie(read_pie(self.m), entries)
+            pie = yield from self.wait_pie(60)
+            targets = self.log_pie(pie, entries)
             if not targets or oid in targets:
                 return
             self.write(kind='wrong_menu', want=oid, targets=sorted(targets))
@@ -900,6 +901,16 @@ class Runner:
                 break
             yield Updates(1)
         return last
+
+    def wait_pie(self, most):
+        """The pie on the screen, waiting while the picker has entries but the
+        pie's window shows no items yet (it fills an update or so later)."""
+        for _ in range(most):
+            pie = read_pie(self.m)
+            if pie or not read_entries(self.m):
+                return pie
+            yield Updates(1)
+        return read_pie(self.m)
 
     def wait_entries(self, most):
         for _ in range(most):
@@ -930,7 +941,7 @@ class Runner:
 
     def step_choose(self, label):
         yield Fresh()
-        pie = read_pie(self.m)
+        pie = yield from self.wait_pie(60)
         entries = read_entries(self.m)
         if not pie or not entries:
             raise StepFailed('no pie menu is open')
