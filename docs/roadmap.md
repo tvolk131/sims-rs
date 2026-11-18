@@ -36,7 +36,10 @@ events, and what it asks for after them) come first.
    Measure the ticks a day takes rather than guess. Record the full
    state sparsely (every tenth update, and every update around events)
    and the random streams every update. Delete the captures and dumps it
-   supersedes, and say which.
+   supersedes, and say which. Open: strict mode runs the whole day and
+   the day's turn (#233), but matches the recording only to tick 2510;
+   checking the rest against the recording is what remains. See
+   Progress.
 3. **1000 ticks on three more base-game houses**, picked for code the
    Goths do not reach (for example the Newbies and a family with
    children). Done (#221, #223, 2026-11-16): the Newbies, the Pleasants
@@ -46,7 +49,9 @@ events, and what it asks for after them) come first.
    `Interpreter::pie_menu`, `Interpreter::pick` and `Interpreter::order`.
    These also check the integration track's game.
 5. **All 49 primitives**: port the remaining ones as recordings reach
-   them, or with targeted scenarios.
+   them, or with targeted scenarios. Make New Character (19) is the last
+   one the base game's trees use outside the tutorial; UI Effect (34)
+   is used only by the Tutorial and the Help System. See Progress.
 6. **One expansion-pack lot**, after steps 1 to 5.
 
 ### Progress
@@ -77,15 +82,31 @@ events, and what it asks for after them) come first.
   which starts each search from a random walk (0x44b5a5, #218), are
   ported. **Unverified:** no recording covers a Drop Onto, Snap modes 1
   or 2, or Find Location For mode 5.
+- Step 5: Reach (opcode 47, #229) plays a reach clip picked by the
+  slot's height and moves the object at its event 0 (0x45c9ba). Burn
+  (opcode 9, #235) places fire on a tile and spreads it to what catches
+  (0x44d96f). Find 5 Worst Motives (opcode 33, #234) sorts eight motives
+  with the C runtime's qsort (0x44d077). Next: Make New Character (19,
+  a baby's birth and the mailbox's debug pet); UI Effect (34, Tutorial
+  and Help System only); moving a gathered person in Burn; removing an
+  object that holds another (`removal.rs`), where the snack order now
+  stops at step 15925; the failing modes of the ported primitives.
+  **Unverified:** none of the three against a capture. The first
+  recording with a meal should check Reach's clip choice and the step at
+  which the object moves. The first with a kitchen fire should check
+  where the fires go and the order they are made in, since that order
+  decides object IDs. No recording reaches the walk-by portal's leave
+  dialog yet, where Find 5 Worst Motives runs.
 - The integration hooks are merged: play mode (#120), player orders
   (#121), sound events (#122), Idle For Input starting a queued action
   (#131), the pie menu and picking from it (#132), and Go To Routing
   Slot's parameter and global slots (#134), which a player's snack order
   reached.
-- Strict mode on the Goth house runs to tick 9906, 12:00 on the first
-  day. One tick is two game seconds, so a day is 43,200 ticks (measured
-  from the clock globals). The carpool makes the school bus at tick 2703
-  (the multi-tile factory is ported). The base layer is kept and the
+- Strict mode on the Goth house runs the whole day, 43,200 ticks, from
+  the load to 06:30:44 the next morning, with no stop (#233). The day
+  turns at tick 31478. One tick is two game seconds, so a day is 43,200
+  ticks (measured from the clock globals). The carpool makes the school
+  bus at tick 2703 (the multi-tile factory is ported). The base layer is kept and the
   pose composed from it, and a person may take itself off the lot in
   its own tick. A multi-tile object may snap where it does not fit
   (0x454e82), and a group is deleted (0x440f37): at tick 3434 the car
@@ -94,14 +115,24 @@ events, and what it asks for after them) come first.
   removes them. At tick 3913 a seated person's route stands it up
   first; at tick 6756 a pet is made (the expansions installed allow
   pets) and walks, runs and turns at its own pace; an inventory count
-  goes up at 7702 and a route with no door gives up at 9337. Past tick
-  1000 this is unverified: there is no capture. In a live run of the
-  original Cassandra walks to the school bus at 8:06 AM, while ours keeps
-  her on the bench, a gap in the simulation's timing. At tick 9907 object 5
-  walks the neighborhood's lots in order of distance (Set To Next mode
-  11), which needs a lot-position table the simulation does not hold
-  (the snack order stops on it at the same step). Step 2 continues from
-  there.
+  goes up at 7702 and a route with no door gives up at 9337. In a live
+  run of the original Cassandra walks to the school bus at 8:06 AM,
+  while ours keeps her on the bench, a gap in the simulation's timing
+  (tracks 3 and 4's, not rendering). At tick 9907 object 5 walks the
+  neighborhood's lots in order of distance (Set To Next mode 11). That
+  is done, but over an empty list, not with a lot-position table: the
+  neighborhood's table (+0x110) and lot order (+0x11c) are empty in
+  every capture, and a write watch showed nothing fills them, so mode
+  11 always takes the false branch. Verified only to tick 2510: against
+  the partial Goth day recording (updates 1 to 14,759), the full state
+  matches up to update 2510, apart from the known head-target bit and a
+  transient motive-13 difference. In tick 2515 Snap mode 3 by a slot
+  offset (0x454b93) puts person 21 one tile off, so the run differs
+  from there on. Next: fix Snap's slot offset at tick 2515 (track 3),
+  then keep verifying the day against track 2's Goth day recording; the
+  Newbies in strict mode from tick 4052; the Pleasants and the Roomies
+  once track 2's recordings land. Known gap: the architecture's value
+  (0x47b006's prices) is not ported.
 - Of the base neighborhood's houses only the Goths' and the Newbies'
   (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
   tick 4052; a route that gives up on a slot it may end near runs the
@@ -156,9 +187,9 @@ events, and what it asks for after them) come first.
   are not solid share a tile unless both stand against the same wall
   (0x433a7f). The templates' `Patch` families are not imported (see
   `docs/decisions/`). Next: keep the walk's flag +0x290 (0x58edec,
-  0x58ef8e), which waits for track 3's `sim/day-turn` because it touches
-  the same walk; the bare lot's room map at load step 8
-  needs evidence from the original (a harness trace or a recording of a
+  0x58ef8e), which waited for track 3's `sim/day-turn` because it
+  touches the same walk (now merged, #233); the bare lot's room map at
+  load step 8 needs evidence from the original (a harness trace or a recording of a
   community lot), and whether those lots are resized is unknown.
   **Unverified:** no capture covers house 9 yet; a person in a pool;
   the clash itself (error 0x16):
@@ -1929,9 +1960,9 @@ Progress:
   bobs are not drawn, and only rotation 0 was compared.
 - Done: a person on an upper level stands on the terrain under them, as
   the floor there does (0x592132, #206). Checked against the original
-  at 7:29 AM, within a pixel or two. **Unverified:** the view table's
-  per-level offset is not ported; the floor height matched it at medium
-  zoom, rotation 0, and other zooms and rotations are unchecked. Depth
+  at 7:29 AM, within a pixel or two. A person upstairs takes the view's
+  level offset, (0.5, 9.300511, 0.5) model units per level, fixed in the
+  view, read from the running original (0x5922d2, #236). Depth
   on an upper level is checked too (#211): for the Goths at 7:29, level
   2, walls down, Bella at the dollhouse and the coffin, easel and toy box
   match the original (mean error about 1 on the objects); Bella is off
@@ -2068,11 +2099,14 @@ Progress:
 - Done: a split floor's halves are cut straight along the corners' row
   or half a tile in, as the original's clip rectangle cuts them; the
   dashed row along a porch's diagonal edge is gone.
-- Next: near-zoom fidelity below the bay's left end. The edge-on column
-  now matches from x = 99; what remains is x 90 to 98, rows 434 to 480
-  at near zoom, origin [619, −1189], where the original shows shingles
-  and we draw the flower bed. Then a screenshot with a marked edge-on
-  diagonal (a House02 capture is in progress).
+- Done, no change needed: near zoom below the bay's left end (#236).
+  The pixels at x 90 to 98, rows 434 to 480, origin [619, −1189], are
+  the original's control panel in that screenshot (x < 215, rows >
+  420), not the lot. At origin [851, −1190], with the bay's left end
+  clear of the panel, the same spot matches 225/225 pixels exactly and
+  the grass below it 1,240/1,240.
+- Next: a screenshot with a marked edge-on diagonal (a House02 capture
+  is in progress).
 
 ## Track: sound (`crates/sims-audio`)
 
@@ -2202,9 +2236,11 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   original's, read from the exe (#219): the width is searched for a
   dialog twice as wide as tall, the text goes beside and under the icon,
   and two or three buttons are spread evenly across the text. It gives
-  the measured "Magic Town" exactly. **Unverified:** the two- and
-  three-button layouts against a screenshot; a button wider than 100
-  pixels for a long label; the width of a leftover line (the font's
+  the measured "Magic Town" exactly. The Yes/No "Help System" dialog
+  (tick 2) is checked against the original's screen (#228): the layout
+  matches, and the pixels match apart from the corners. **Unverified:**
+  dialogs with three buttons; dialogs at other screen sizes; a button
+  wider than 100 pixels for a long label; the width of a leftover line (the font's
   extra, 0x60b7e2, is taken as 0); a dialog bigger than the window; the
   title box being 4 pixels wider than its text, and where the text is
   first placed (both inferred, not read).
@@ -2274,12 +2310,21 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   load's whole-number motives, not the house file's fractions; this
   follows from the step-13 scripts and is not checked against a
   screenshot.
-- **Next:** a screenshot of an open pie menu; the two-button layout
-  checked against the "Help System" screenshot (tick 2) that track 2
-  captured; the simulation side of text entry dialogs (dialog kind 3 in
-  `sims-vm`, not ported) and where the original stores the entered
-  text; the sign's help balloon (its compatible signs); the job panel's
-  blinking performance and its tooltips; the other live panels.
+- **Done: the house panel** (#230), the first of the other live
+  panels: Size, Yard, square feet, bedrooms, bathrooms and lot size.
+  **Unverified:** the panel against a screenshot of the original; the
+  labels' color, and how the labels sit in their boxes; which
+  type-record words the Upkeep count reads.
+- **Next:** a screenshot of an open pie menu; the dialog's corners,
+  which the original blends; whether frames should be cut to 16-bit
+  color as the original's screen is; the simulation side of text entry
+  dialogs (dialog kind 3 in `sims-vm`, not ported) and where the
+  original stores the entered text; the sign's help balloon (its
+  compatible signs); the job panel's blinking performance and its
+  tooltips; the house panel's Furnishings (the object scan 0x444cb9
+  plus the architecture value 0x47b006), Upkeep (the scan 0x4452eb) and
+  Layout (the routing history at lot +0x3c..+0x64); the residential-lot
+  check on the House button (0x40745f); the other live panels.
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
   - A command intake, for example `World::apply(&mut self, command:
     sims_sim::Command) -> Result<(), CommandError>`, run between ticks,
@@ -2326,9 +2371,9 @@ through their public interfaces only; the simulation never depends on it.
   error is printed and shown across the top for a while; only a failure
   play mode does not catch stops it. In play mode the Goths' house runs
   12,000 ticks (ten minutes at normal speed) without stopping, through
-  about a dozen different caught errors; in strict mode it stops after
-  tick 9906 (at tick 9907 Set To Next mode 11 needs the neighborhood's
-  lot order).
+  about a dozen different caught errors. In strict mode it runs the
+  whole day without stopping (#233); it differs from the original from
+  tick 2515 (see Progress).
   `--png <file>
   --ticks N` draws one frame without a window.
 - **Done: sound output.** The window plays `sims-audio`'s player on the
@@ -2369,9 +2414,10 @@ through their public interfaces only; the simulation never depends on it.
   his hunger goes from 94.5 to 100.0 (tick 936); at 1088 the snack goes
   off the lot and at 1136 it is deleted, and he is free again. He goes
   on to other things (object 71 at tick 1497, object 132 at 2292).
-  Strict mode now runs the order through step 9906 and stops at step
-  9907 (Set To Next mode 11 needs the neighborhood's lot order); without
-  an order it stops on the same at tick 9907.
+  Strict mode now runs the order through Burn, which fires at steps
+  13199, 14388, 15009, 15288 and 15865 (#235), and stops at step 15925,
+  on removing an object that holds another (`removal.rs`, not ported).
+  Without an order, strict mode runs the whole day (#233).
 - **Done: a player's order from the window, in play mode.** With
   `--play`, the pointer on the fridge lists its pie, a click opens it,
   and Have A Snack queues the action the listing offered. A Goth test
@@ -2438,11 +2484,26 @@ through their public interfaces only; the simulation never depends on it.
   the water's icon takes it off. A press on the snack's icon while
   Mortimer eats cancels it: he puts the snack down in front of him (Drop,
   opcode 5, 0x454430, now ported) and goes to water the plant. A cancel
-  while he walks stops his thread on a route whose animator is still
-  moving (0x45b3eb, not ported; track 4's): on the snack order, a cancel
-  at steps 150 to 536 or 543 to 590 (to the fridge) or 821 to 829 (away
-  from it with the snack). Cancels at the other steps to 1136 catch no
-  error (a manual sweep, not a test).
+  while he walks no longer stops on 0x45b3eb (#233): the route stops at
+  the walk's next step (0x58eeeb). On the way to the fridge he is free
+  at step 183; with the snack he puts it down at (280, 456) and is free
+  at step 913. The walk tests person word 64 (in a pool) as it was when
+  the animator's tick began (0x58dcaf, #237, the remainder of #188,
+  which is closed). Next: the stop clip for a person in a pool asked to
+  stop under way (state 7, clip 0x13, 0x58f010), which still fails
+  loudly. **Unverified:** the cancel while he walks against a
+  recording; word 64 changing during a walk's put has not been seen in
+  a recording (House09, track 2's capture with a person in a pool, may
+  reach it).
+- **Done: saving and going back to a save.** A lot saves between steps
+  and restores into a lot loaded from the same house, stepping as the
+  saved lot would (#231). In the window F5 saves the lot and F9 goes
+  back to the save, one save per house, kept in a REDB file (#232).
+  These saves are not the original's house file, and the original
+  cannot open them. **Unverified:** a save restored onto an install
+  whose code or tuning differs is not detected; what a long sound
+  already playing does after a restore once its object is gone. Next,
+  if wanted: a save/load panel with named slots.
 - **Needs from other crates:**
   - `sims-vm`: listings that fail today on the Goth house: check trees
     on Manage Inventory operation 4 and scope 12. A check tree's fault
