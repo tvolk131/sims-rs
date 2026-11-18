@@ -47,8 +47,9 @@ pub struct Character {
     pub template: u32,
     /// The number of its file, `Characters/User%05d.iff`.
     pub file: i32,
-    /// The body strings (the string table definition word 19 names) that
-    /// differ from the template's, by index counting from 0.
+    /// The body strings (the string table definition word 19 names) Make
+    /// New Character wrote, by index counting from 0; the others are the
+    /// template's.
     pub strings: BTreeMap<usize, String>,
 }
 

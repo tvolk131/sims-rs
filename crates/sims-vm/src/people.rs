@@ -192,7 +192,8 @@ pub(crate) fn skeleton<'p>(
             .find(|s| s.name.eq_ignore_ascii_case(name))
             .ok_or_else(|| {
                 Trap::Unsupported(format!(
-                    "no person type's skeleton is named {name:?}, which the made person type                      0x{guid:08X} names"
+                    "no person type's skeleton is named {name:?}, which the made person type \
+                         0x{guid:08X} names"
                 ))
             }),
         _ => Ok(skeleton),
