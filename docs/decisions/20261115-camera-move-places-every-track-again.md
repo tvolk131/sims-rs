@@ -28,6 +28,11 @@ kind 33 only when the camera moves, and the player does the whole case.
     object that outlives its script, and those notes take the write at
     once. A link to a thread with nothing left playing still stops the
     chain (**unverified**, as before).
+  - Only the thread the write lands in takes the new levels. A thread
+    that passes the write on through its `target` keeps the levels its
+    notes have, as the original writes only the track object at the
+    chain's end; a thread with notes playing is not placed again on the
+    way.
   - The last-start rule below holds at every link: a thread on the way
     that is not its track's last start takes the write itself, so a
     `target` it set before its track started again carries nothing on.
@@ -59,7 +64,10 @@ kind 33 only when the camera moves, and the player does the whole case.
     registers it started with, kept while it plays.
   - `Spl` comes from the thread of the track's last start, or else
     from the newest running thread, the newest ended one or the kind 53
-    note's registers, in that order.
+    note's registers, in that order. The last start's `Spl` is read
+    through the same `target` chain its write goes through, ended
+    threads included, so the volume floor is the one of the track
+    object written.
   - A track with none of these gets nothing. The original writes to its
     idle track object, and the next start sets those registers again
     anyway.
@@ -107,6 +115,13 @@ kind 33 only when the camera moves, and the player does the whole case.
   it turns right. Through two links it reaches the track after, unless
   the middle track has started again since; then its old thread takes
   the write and the last track keeps the centre.
+- A write through a `target` whose script has ended takes that
+  thread's `Spl`: with the placing object far off the screen, the note
+  keeps the floor of 800 its `Spl` of 10001 gives, where the placing
+  track's own `Spl` of 0 would silence it.
+- A track that passes the write on keeps its own note's levels: a
+  ducking request made after the note started does not dim it when the
+  camera moves.
 - A stop's fade stays with the track it stops, though that track's
   `target` names one whose script has ended with a note playing.
 - A track whose thread has ended and left no note gets nothing, and its

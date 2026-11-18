@@ -2381,3 +2381,87 @@ fn a_camera_move_follows_a_held_track_let_go_by_a_start() {
     assert_eq!(*probe.asked.borrow(), [(8, 1024), (8, 512)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
+
+#[test]
+fn a_camera_move_reads_spl_where_it_writes() {
+    // Track 11 (object 8) sets Spl to 10001, whose volume never falls
+    // below 800, plays a long note, waits and ends while the note plays
+    // on. Track 10 (object 9) sets its `target` to track 11 and loops.
+    // The camera move puts object 9 far off the screen; track 10's write
+    // goes through to track 11's track object, and so does its read of
+    // Spl: the note is quiet but heard. Read from track 10, whose Spl is
+    // 0, the note would fall silent (Sol's review).
+    let mut ended = vec![LOADL, 57];
+    ended.extend(long(10_001));
+    ended.extend(NOTE_ON_V1);
+    ended.extend(loadl(5, 10));
+    ended.extend([WAIT, 5, END]);
+    let mut targets = loadl(53, 11);
+    targets.extend([SET_LOOP, LOOP]);
+    let start = on_lot(&[(8, 400), (9, 400)]);
+    let off = on_lot(&[(8, 400), (9, -7000)]);
+    let mut player = Player::new(
+        vec![module(&[&targets, &ended], 1)],
+        long_sample("one.xa"),
+        1,
+    );
+    let play = |player: &mut Player<_>, object: u32, name: &str| {
+        player.handle(
+            &SoundEvent::Play {
+                object,
+                name: name.into(),
+            },
+            &start,
+        );
+    };
+    play(&mut player, 8, "e1");
+    player.render(BLOCK, &start);
+    play(&mut player, 9, "e0");
+    player.render(7 * BLOCK, &start);
+    player.camera_moved(0, u32::MAX, &off);
+    let out = player.render_stereo(2 * BLOCK, &off);
+    let last = out.len() - 2;
+    assert_ne!(out[last..], [0, 0], "{:?}", &out[last..]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_forwarded_camera_move_leaves_the_ended_thread_s_levels() {
+    // Track 10 (object 9) plays a long note, sets its `target` to track
+    // 11, which loops, and ends while the note plays on. Track 12 then
+    // asks for main_duckpri 30 and waits. The camera move's write goes
+    // from track 10's track object to track 11's, so track 10's note
+    // keeps the levels it was given, undimmed by the later ducking
+    // request (Sol's review).
+    let mut forwards = NOTE_ON_V1.to_vec();
+    forwards.extend(loadl(53, 11));
+    forwards.push(END);
+    let wait: &[u8] = &[SET_LOOP, LOOP];
+    let mut ducker = loadl(123, 30);
+    ducker.extend([SET_LOOP, LOOP]);
+    let lot = on_lot(&[(7, 400), (8, 400), (9, 400)]);
+    let mut player = Player::new(
+        vec![module(&[&forwards, wait, &ducker], 1)],
+        long_sample("one.xa"),
+        1,
+    );
+    let play = |player: &mut Player<_>, object: u32, name: &str| {
+        player.handle(
+            &SoundEvent::Play {
+                object,
+                name: name.into(),
+            },
+            &lot,
+        );
+    };
+    play(&mut player, 8, "e1");
+    play(&mut player, 9, "e0");
+    player.render(BLOCK, &lot);
+    play(&mut player, 7, "e2");
+    player.render(BLOCK, &lot);
+    let before = player.render(1, &lot);
+    player.camera_moved(0, u32::MAX, &lot);
+    player.render(BLOCK, &lot);
+    assert_eq!(player.render(1, &lot), before);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}

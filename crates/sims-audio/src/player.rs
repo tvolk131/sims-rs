@@ -830,9 +830,11 @@ impl<S: Samples> Player<S> {
     /// when the last start's has gone. That holds after the last start's
     /// thread has gone with nothing left playing. A note kind 53 played
     /// with no thread running (thread 0) is placed too, from the
-    /// registers it started with. `Spl` is that of the last start's
-    /// thread, or else of the newest running thread, the newest ended
-    /// one or the kind 53 note, in that order. A track with none of
+    /// registers it started with. `Spl` is that of the thread the last
+    /// start's write lands in ([`Player::place_through`]), or else of the
+    /// newest running thread, the newest ended one or the kind 53 note,
+    /// in that order. A thread that passes the write on keeps its notes'
+    /// levels. A track with none of
     /// these gets nothing: the original writes to its idle track object,
     /// whose registers the next start sets again.
     /// **Unverified:** the original's older notes follow the one track
@@ -879,12 +881,16 @@ impl<S: Samples> Player<S> {
                     .chain(&self.pending)
                     .find(|t| t.id == id)
             };
+            // The last start's thread reads through the chain its write
+            // goes through.
             let spl_of = |thread: &Thread| {
-                if Some(thread.id) == last {
-                    self.read(thread, i64::from(SPL))
+                let source = if Some(thread.id) == last {
+                    self.kept_thread(self.camera_destination(thread.id))
+                        .unwrap_or(thread)
                 } else {
-                    thread.registers[usize::from(SPL)]
-                }
+                    thread
+                };
+                source.registers[usize::from(SPL)]
             };
             let spl = if let Some(thread) = last.and_then(running) {
                 spl_of(thread)
@@ -912,15 +918,16 @@ impl<S: Samples> Player<S> {
                 place_itself(&mut self.threads[at], vol, pan);
             }
             for id in ended {
+                // The last start's thread writes through its `target`; only
+                // the thread written takes new levels.
                 if last == Some(id) {
                     self.place_through(id, vol, pan);
+                    continue;
                 }
                 let Some(mut thread) = self.ended.remove(&id) else {
                     continue;
                 };
-                if last != Some(id) {
-                    place_itself(&mut thread, vol, pan);
-                }
+                place_itself(&mut thread, vol, pan);
                 let levels = self.levels(&thread);
                 for note in self.notes.iter_mut().filter(|n| n.thread == id) {
                     note.gains = levels.gains;
@@ -1448,17 +1455,7 @@ impl<S: Samples> Player<S> {
     /// original's track object's `target` back to itself. Script reads
     /// and writes do not follow ended threads ([`Player::resolve`]).
     fn place_through(&mut self, id: u32, vol: i32, pan: i32) {
-        let mut at = id;
-        let mut passed = vec![id];
-        while let Some(thread) = self.kept_thread(at)
-            && self.last_start.get(&thread.track) == Some(&thread.id)
-            && let Target::Thread(next) = thread.target
-            && !passed.contains(&next)
-            && self.kept_thread(next).is_some()
-        {
-            passed.push(next);
-            at = next;
-        }
+        let at = self.camera_destination(id);
         if let Some(thread) = self
             .threads
             .iter_mut()
@@ -1475,6 +1472,25 @@ impl<S: Samples> Player<S> {
             }
             self.ended.insert(at, thread);
         }
+    }
+
+    /// The thread a camera placement written by thread `id` lands in, and
+    /// whose `Spl` it reads ([`Player::place_through`]): `id`, or on
+    /// through `target` from each thread that is its track's last start,
+    /// into running, pending or ended threads whose notes still play.
+    fn camera_destination(&self, id: u32) -> u32 {
+        let mut at = id;
+        let mut passed = vec![id];
+        while let Some(thread) = self.kept_thread(at)
+            && self.last_start.get(&thread.track) == Some(&thread.id)
+            && let Target::Thread(next) = thread.target
+            && !passed.contains(&next)
+            && self.kept_thread(next).is_some()
+        {
+            passed.push(next);
+            at = next;
+        }
+        at
     }
 
     /// The running or pending thread `id`, or the ended one if its notes
