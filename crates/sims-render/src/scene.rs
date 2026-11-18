@@ -992,11 +992,11 @@ impl Painter<'_> {
                 / 4;
             let height = ground as f32 / 16.0 + lift;
             let anchor = place(&self.depth, self.camera, view, level, height);
-            list.push((anchor, id, view, ground, exact, lift));
+            list.push((anchor, id, ground, exact, lift));
         }
         // Far objects first, so soft edges blend over what is behind them.
         list.sort_by_key(|&(a, id, ..)| (std::cmp::Reverse(a.depth), id));
-        for (anchor, id, view, ground, spot, lift) in list {
+        for (anchor, id, ground, spot, lift) in list {
             let o = &self.world.objects[&id];
             let Some(definition) = self.assets.definition(o.guid) else {
                 self.stats.missing_objects += 1;
