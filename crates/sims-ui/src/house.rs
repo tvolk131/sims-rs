@@ -94,12 +94,20 @@ impl Tuning {
 
     /// The tuning from the curves' string table and the constants' table.
     /// A missing curve has no points and weighs everything 0, as the
-    /// original's empty curve does (0x4167de). The original looks names
+    /// original's empty curve does (0x4167de). The curve's text ends at
+    /// its first NUL (0x4703ad). **Unverified:** the points are read by
+    /// `sims_sim::motives::Curve::parse`, which the motives' curves share;
+    /// where text is not well formed (a point such as `(100;90 coins)`)
+    /// it drops a point that the original's scanner (0x4614a2) reads.
+    /// The install's curves are well formed. The original looks names
     /// up ignoring the case of A to Z (0x4131f4) and takes the default
     /// for a missing one (0x413271).
     pub fn from_tables(curves: Option<&StringTable>, constants: Option<&Constants>) -> Self {
+        // The original copies the string as a C string (0x4703ad), so a
+        // NUL inside a length-prefixed string ends it.
         let curve = |n: usize| {
             let text = curves.and_then(|t| t.get(n, US_ENGLISH)).unwrap_or("");
+            let text = text.split('\0').next().unwrap_or("");
             Curve::parse(0, text, CURVE_POINTS)
         };
         let constant = |name: &str, default: f32| {
@@ -850,6 +858,9 @@ mod tests {
         assert_eq!(tuning.yard, F32::from_f32(0.5));
         assert_eq!((tuning.dirty, tuning.broken), (3, -6));
         assert_eq!(tuning.size.points.len(), 2);
+        // A NUL ends a curve's text.
+        let cut = Tuning::from_tables(Some(&strings(&["(0;0)\0(200;100)"])), None);
+        assert_eq!(cut.size.points.len(), 1);
         // Sorted by x as the original's curves are.
         assert_eq!(
             tuning.furnishings.points[0],
