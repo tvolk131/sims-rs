@@ -257,8 +257,15 @@ How the checks work (the addresses are in `input.py`):
   let go then (a `command` row with a `reason`).
   `press` and `answer-dialog` hold the button 3 s, as `answer.sh` does.
 - **Choosing.** `choose` reads the pie menu's items and their places on the
-  screen, moves to the entry, waits until the menu shows it highlighted,
-  and presses.
+  screen (from the pie window the picker names at `+0xe4`), moves to the
+  entry, waits until the menu shows it highlighted, and presses. A long menu
+  is paged: item i is picker entry i + `+0x64`. An entry that opens a
+  submenu (entry `+0x14` set; "Talk...", "Hug..." on a person) pushes
+  nothing: the submenu opens in the people panel's other window, the parent
+  window keeping its items. The step waits for the picker's window or
+  entries to change, logs that `pie`, and the next `choose` picks from it.
+  `choose @N` picks the N-th item (from 0), for a submenu whose labels are
+  not known ahead; the logged pie names it.
 - **Confirming.** capture.py stops at `0x48ddcb`, where the pie menu pushes
   the chosen action on the person's queue, and logs the person and the
   action. `expect-queued` waits for that record, then for the person to hold
@@ -268,6 +275,12 @@ How the checks work (the addresses are in `input.py`):
   `answer-dialog` runs on the dialog stops. It presses once, like
   `answer.sh`. If the game misses the press, the step waits until the dialog
   is answered some other way (for example with `answer.sh`).
+  A step that waits on memory (`wait`, `until`, aiming, the pie menu's
+  waits) waits on update returns, so a dialog the scenario did not open
+  (the carpool, a visitor) holds it until the dialog is answered: run
+  captures with `--answer-stuck` for those (it answers from update `--answer-from`, 3 by default). The menu may have closed by
+  then; `choose` presses an item only while the menu shows it highlighted
+  under the same label.
 - **Buy mode.** `expect-mode` reads the lot's mode word (lot `+0x36`: 0 in
   live mode, 2 in buy mode). In buy mode the lot update still returns,
   without advancing time, so the steps go on there. `expect-new-object`
