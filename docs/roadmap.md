@@ -180,13 +180,13 @@ events, and what it asks for after them) come first.
   recording covers updates 1 to 14,759. Snap mode 3 by a slot offset now
   follows the original's order (0x454b93, #244), and Set To Next mode 3
   follows a multi-tile group's links rather than the order its tiles
-  were registered in (0x44ec79, #251). At the recording's saved
-  checkpoints (every tenth update from 2820) the full state now matches
-  from 2820 through update 3340, apart from two modelled differences
-  (through 2810 the earlier comparison's exceptions still apply: the
-  head targets' last bits and neighborhood record 301): a frame
-  local that overlays a code-owner pointer, and person word 37 from
-  memory the original never set. The random stream matches through
+  were registered in (0x44ec79, #251). Through update 2810 the full
+  state matches the recording apart from the earlier comparison's
+  exceptions: the last bits of the head targets and neighborhood record
+  301. At the recording's saved checkpoints from 2820 (every tenth
+  update) through 3340 it matches apart from two modelled differences:
+  a frame local that overlays a code-owner pointer, and person word 37
+  from memory the original never set. The random stream matches through
   3602. After 3340, a transient at update 3350 is open: person 21's
   last result is 1 in the original and 0 here, and they match again at
   3360 (unverified). Each fix changed the run's path, and strict mode
