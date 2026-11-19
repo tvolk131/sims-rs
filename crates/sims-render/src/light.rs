@@ -39,12 +39,30 @@ impl Light {
     }
 
     /// The light byte a tile's light byte is drawn with, or None for full
-    /// light. The drawing context keeps the fraction between 0.5 and 1,
-    /// and a fraction of 1 draws in full light (0x4c7c59); any other
-    /// becomes `fraction * 255 + 0.5`, truncated (0x4b76a8).
+    /// light: the byte as a fraction, as [`Light::drawn_fraction`] draws it.
     pub fn drawn_byte(byte: u8) -> Option<u32> {
-        let fraction = (f32::from(byte) / 255.0).clamp(0.5, 1.0);
-        if (fraction - 1.0).abs() < 1e-6 {
+        Self::drawn_fraction(f32::from(byte) / 255.0)
+    }
+
+    /// The light for a light given as a fraction, as the original passes a
+    /// room's light straight to the drawing context (the wall-top trim,
+    /// 0x53e2f5).
+    pub fn from_fraction(light: f32) -> Self {
+        Self::drawn_fraction(light).map_or(Self::FULL, Self::from_sum)
+    }
+
+    /// The light byte a fraction is drawn with, or None for full light.
+    /// The drawing context keeps the fraction between 0.5 and 1 (0x4b4525;
+    /// a fraction that is not a number fails both comparisons and is held
+    /// to 0.5), and exactly 1 draws in full light (0x4c7c59); any other
+    /// becomes `fraction * 255 + 0.5`, truncated (0x4b76a8).
+    fn drawn_fraction(light: f32) -> Option<u32> {
+        let fraction = if light.is_nan() {
+            0.5
+        } else {
+            light.clamp(0.5, 1.0)
+        };
+        if fraction == 1.0 {
             return None;
         }
         Some((f64::from(fraction) * 255.0 + 0.5) as u32)
@@ -83,6 +101,16 @@ impl Light {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fraction_short_of_one_is_not_full_light() {
+        assert_eq!(Light::from_fraction(1.0), Light::FULL);
+        assert_eq!(Light::from_fraction(2.0), Light::FULL);
+        assert_eq!(Light::from_fraction(0.999), Light(Some(31)));
+        assert_eq!(Light::from_fraction(0.2), Light(Some(16)));
+        assert_eq!(Light::from_fraction(f32::NAN), Light(Some(16)));
+        assert_eq!(Light::from_byte(255), Light::FULL);
+    }
 
     #[test]
     fn light_is_kept_between_half_and_full() {

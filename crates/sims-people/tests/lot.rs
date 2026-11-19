@@ -424,19 +424,39 @@ fn the_lot_hides_the_people_behind_it() {
                     let report = people.draw_on_lot(&solo, &camera, &mut on);
                     assert!(report.problems.is_empty(), "{:?}", report.problems);
                     // Drawn again, noting apart from the IDs which pixels
-                    // the canvas took: those name the person, and every
-                    // other pixel names what it named before.
-                    let mut noted = Taken {
-                        canvas: base.clone(),
-                        taken: vec![false; base.width * base.height],
-                    };
+                    // the canvas took: those name the person, or the
+                    // plumb bob they hold where the bob's own draw took
+                    // them, and every other pixel names what it named
+                    // before. Which pixels are the bob's is told by a
+                    // draw without it: a pixel the body took there, with
+                    // the same colour, is the body's.
+                    let bob = sims_people::bob::held_by(&solo, id);
                     let depth = sims_render::depth::Depth::new(&camera);
-                    people.draw(&solo, &camera, &mut noted, |f, e, l| depth.point(f, e, l));
+                    let mut note = |world: &World| {
+                        let mut noted = Taken {
+                            canvas: base.clone(),
+                            taken: vec![false; base.width * base.height],
+                        };
+                        people.draw(world, &camera, &mut noted, |f, e, l| depth.point(f, e, l));
+                        noted
+                    };
+                    let noted = note(&solo);
                     assert_eq!(noted.canvas, on);
+                    let mut bobless = solo.clone();
+                    if bob.is_some() {
+                        bobless.objects.get_mut(&id).unwrap().slots[2].object = 0;
+                    }
+                    let body = note(&bobless);
                     for (x, y) in pixels(&on) {
                         let i = y as usize * on.width + x as usize;
                         let expected = if noted.taken[i] {
-                            Some(id)
+                            // The body's pixel if the bob-less draw gave it
+                            // the same colour, else the bob's. A bob pixel
+                            // drawn over the body in the body's very colour
+                            // cannot be told apart this way (none in this
+                            // fixture).
+                            let bodys = body.taken[i] && body.canvas.color[i] == on.color[i];
+                            if bodys { Some(id) } else { bob.or(Some(id)) }
                         } else {
                             assert_eq!(on.color[i], base.color[i], "{x}, {y}");
                             base.id_at(x, y)
@@ -622,8 +642,8 @@ fn the_plumb_bob_floats_over_the_selected_persons_head() {
         g.iter().sum::<u32>() / g.len() as u32
     };
     assert!(mean(&|x| x < middle) > mean(&|x| x > middle));
-    // Its pixels name Mortimer.
-    assert!(found.iter().all(|&(x, y)| canvas.id_at(x, y) == Some(21)));
+    // Its pixels name the bob, not Mortimer.
+    assert!(found.iter().all(|&(x, y)| canvas.id_at(x, y) == Some(383)));
     // Out of the slot, no bob.
     let mut without = world.clone();
     without.objects.get_mut(&21).unwrap().slots[2].object = 0;
