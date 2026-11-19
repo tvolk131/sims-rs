@@ -962,11 +962,27 @@ impl<'a> Machine<'a, '_> {
                 instruction.opcode
             )));
         }
+        let place = self.thread_place();
         let result = match self.primitive(instruction)? {
             Flow::Branch(result) => result,
             Flow::Yield => return Ok(Status::Yielded),
             Flow::Pushed => return Ok(Status::Running),
         };
+        if self.thread_place() != place {
+            // The primitive restarted the thread running it, as a reset
+            // it set off does (a person Burn moves, or one that uses this
+            // object and lets go of it). Its branch would land on the new
+            // thread; what the original does then was not seen. The work
+            // the primitive did stays, as for any fault partway through.
+            let (tree, node) = place.and_then(|(_, top)| top).unwrap_or_default();
+            return Err(Trap::Unsupported(format!(
+                "{} (opcode {}) at tree {tree:#06x} node {node} restarted the thread of object \
+                 {}, which runs it, so its branch would land on the new thread",
+                crate::primitives::primitive_name(instruction.opcode),
+                instruction.opcode,
+                self.me
+            )));
+        }
         self.frame_mut()?.primitive_state = 0;
         self.me_mut()?.last_result = result;
         self.branch(if result {
@@ -974,6 +990,15 @@ impl<'a> Machine<'a, '_> {
         } else {
             instruction.on_false
         })
+    }
+
+    /// Where the running object's thread is, for telling whether a
+    /// primitive restarted it: its depth and its top frame's tree and
+    /// node. (The stack object is not part of it: an expression can set
+    /// it.)
+    fn thread_place(&self) -> Option<(usize, Option<(u16, u16)>)> {
+        let stack = &self.world.objects.get(&self.me)?.stack;
+        Some((stack.len(), stack.last().map(|f| (f.tree, f.node))))
     }
 
     /// Calls the tree an instruction names (legacy lib.rs:1578).

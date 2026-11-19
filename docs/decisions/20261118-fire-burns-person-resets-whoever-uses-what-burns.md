@@ -29,6 +29,16 @@ the lot told (virtual function 0x58, called with the same arguments as
 the fire's put). Then its virtual function 0x74 runs. The put is not
 place-tested first, as the original does not test it.
 
+The reset can restart the very thread running the Burn: the person may
+burn itself, or its reset may reset the object that runs the Burn.
+What the original does next on the restarted thread was not seen, so it
+fails loudly. The check is general: if
+any primitive that branches leaves the running object's stack at a
+different depth, tree or node than before it ran, `Machine::step` fails
+as unsupported rather than branching on the new thread. The work the
+primitive did is kept, as with any fault partway through one. The stack
+object is not part of the check, because an expression can set it.
+
 **A reset of a person already in the middle of one is skipped** (object
 flag 0x800, 0x45e7b2), where it used to fail loudly. On the old run,
 Mortimer's last use record named himself; when his reset ended that

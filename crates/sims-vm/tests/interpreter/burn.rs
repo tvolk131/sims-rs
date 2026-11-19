@@ -303,14 +303,24 @@ fn a_gathered_person_resets_and_moves_to_its_tiles_centre() {
 
 #[test]
 fn a_person_burning_itself_fails_loudly() {
-    // The person runs Burn on its own tile: its reset would restart the
-    // thread the instruction branches on, which was not seen.
+    // The person runs Burn on its own tile: its reset restarts the thread
+    // the instruction would branch on, which was not seen (`Machine::step`).
     use crate::visits::{PERSON, resident};
     let mut fx = lot();
     widget(&mut fx, [3, 3], true);
     let file = fx.program.libraries.len();
     let people = resident(&mut fx);
     fx.program.people = people;
+    // The person's Reset tree notes 6 in the lamp's attribute 5.
+    fx.world
+        .objects
+        .get_mut(&LAMP)
+        .unwrap()
+        .attributes
+        .resize(8, 0);
+    fx.world
+        .animators
+        .insert(PERSON, sims_sim::animator::LOADED);
     let sim = fx.world.objects.get_mut(&PERSON).unwrap();
     sim.data[FLAGS] = 0;
     sim.data[FLAGS_2] = CATCHES;
@@ -327,7 +337,7 @@ fn a_person_burning_itself_fails_loudly() {
     );
     let trap = trap(fx.run_with(PERSON, 4310, PERSON as i16, &[], 1000));
     assert!(
-        matches!(&trap, Trap::Unsupported(m) if m.contains("which is running it")),
+        matches!(&trap, Trap::Unsupported(m) if m.contains(&format!("restarted the thread of object {PERSON}"))),
         "{trap:?}"
     );
 }
@@ -389,7 +399,7 @@ fn a_burned_person_whose_reset_resets_the_burner_fails_loudly() {
             unknown: 0,
         });
     let trap = trap(fx.run_with(burner, 4401, PERSON as i16, &[], 1000));
-    let running = format!("reset object {burner}, which is running it");
+    let running = format!("restarted the thread of object {burner}");
     assert!(
         matches!(&trap, Trap::Unsupported(m) if m.contains(&running)),
         "{trap:?}"
