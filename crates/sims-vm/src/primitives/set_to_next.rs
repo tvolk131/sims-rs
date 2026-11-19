@@ -195,7 +195,9 @@ impl Machine<'_, '_> {
                 return Ok(false);
             }
             if let Some(record) = self.world.neighbors.get(next) {
-                if self.catalog.object(record.guid).is_none() {
+                if crate::interpreter::object_definition(self.catalog, self.world, record.guid)
+                    .is_none()
+                {
                     return Err(Trap::Unsupported(format!(
                         "Set To Next mode 7: neighbor {next} has the GUID 0x{:08X}, which no \
                          definition has; the original compares the GUID of the definition the \

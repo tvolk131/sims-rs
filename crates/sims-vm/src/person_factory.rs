@@ -98,14 +98,8 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        let skeleton = self.program.people.skeletons.get(&guid).ok_or_else(|| {
-            fail(
-                0,
-                Trap::Unsupported(format!(
-                    "no skeleton was supplied for the person type 0x{guid:08X}"
-                )),
-            )
-        })?;
+        let skeleton =
+            crate::people::skeleton(&self.program.people, world, guid).map_err(|t| fail(0, t))?;
         if !pets_allowed(self.program.expansions)
             && ["dog", "kat"]
                 .iter()
@@ -145,13 +139,8 @@ impl Interpreter<'_> {
             stream: &mut world.crt_rng,
             count: 0,
         };
-        build_skeleton(
-            guid,
-            &self.program.people,
-            &mut draws,
-            &mut world.skeleton_files,
-        )
-        .map_err(|trap| fail(id, trap))?;
+        build_skeleton(skeleton, &mut draws, &mut world.skeleton_files)
+            .map_err(|trap| fail(id, trap))?;
         factory
             .attach_neighbor(world, id)
             .map_err(|trap| fail(id, trap))?;
@@ -234,26 +223,26 @@ impl Interpreter<'_> {
             .program
             .motive_tuning()
             .map_err(|e| fail(Trap::Unsupported(e.to_string())))?;
-        let object = world
+        let guid = world
+            .objects
+            .get(&id)
+            .ok_or_else(|| fail(Trap::native(10, "missing object")))?
+            .guid;
+        // Looked up before the person is borrowed; a missing profile still
+        // fails where it is read.
+        let profile = crate::people::profile(&self.program.people, world, guid);
+        let person = world
             .objects
             .get_mut(&id)
-            .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
-        let guid = object.guid;
-        let person = object
-            .person
-            .as_mut()
+            .and_then(|object| object.person.as_mut())
             .ok_or_else(|| fail(Trap::native(0x1c, "object is not a person")))?;
         let kept = person::KEPT.map(|word| person.data[word]);
         person.data.fill(0);
         for (word, value) in person::KEPT.into_iter().zip(kept) {
             person.data[word] = value;
         }
-        let profile = self.program.people.profiles.get(&guid).ok_or_else(|| {
-            fail(Trap::Unsupported(format!(
-                "no profile was supplied for the person type 0x{guid:08X}"
-            )))
-        })?;
-        reload_profile(&mut person.data, profile).map_err(fail)?;
+        let profile = profile.map_err(fail)?;
+        reload_profile(&mut person.data, &profile).map_err(fail)?;
         let low = interests_low(&person.data);
         self.attach_neighbor(world, id).map_err(fail)?;
         let mut machine = self.machine(world, id, 0, false);

@@ -22,6 +22,7 @@ mod group_factory;
 mod head;
 mod headline;
 mod load;
+mod make_character;
 mod memory;
 mod motive_change;
 mod named_tree;

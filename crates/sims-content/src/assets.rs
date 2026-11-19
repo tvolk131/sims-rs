@@ -17,9 +17,9 @@
 //! such names (accessory textures, a few animation and mesh files); on the
 //! Goth family every file it reads either has one source or identical
 //! copies (see the gated tests). Appearance catalogs are loaded in the
-//! original's own order instead (see [`crate::appearance::load_appearance`]).
+//! original's own order instead (see sims-people's `load_appearance`).
 
-use sims_content::{Member, Resource};
+use crate::{Member, Resource};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -30,6 +30,7 @@ use std::sync::OnceLock;
 pub const SOURCES: &[&str] = &[
     "GameData/Skins",
     "GameData/Animation",
+    "GameData/Textures2",
     "GameData/Textures",
     "ExpansionPack",
     "ExpansionPack2",
@@ -44,7 +45,9 @@ pub const SOURCES: &[&str] = &[
 ];
 
 /// The extensions of the files a person is drawn from.
-const KINDS: &[&str] = &[".bcf", ".cmx", ".bmf", ".skn", ".bmp", ".cfp"];
+/// `.tga` names a texture only Make New Character's lists read
+/// ([`crate::Wardrobe`]).
+const KINDS: &[&str] = &[".bcf", ".cmx", ".bmf", ".skn", ".bmp", ".tga", ".cfp"];
 
 /// Every person file of an install, by lowercase name.
 #[derive(Debug, Clone, Default)]
@@ -54,7 +57,7 @@ pub struct Assets {
     files: BTreeMap<String, Vec<Resource>>,
     /// Where each appearance is loaded from, by lowercase name: the
     /// catalog's file name and source. Built on first use
-    /// ([`crate::appearance::load_appearance`]).
+    /// (sims-people's `load_appearance`).
     appearances: OnceLock<BTreeMap<String, (String, Resource)>>,
 }
 
@@ -169,8 +172,8 @@ impl Assets {
     }
 
     /// The appearance index, built by `build` the first time it is asked
-    /// for.
-    pub(crate) fn appearances(
+    /// for (sims-people's `load_appearance` keeps it here).
+    pub fn appearances(
         &self,
         build: impl FnOnce() -> BTreeMap<String, (String, Resource)>,
     ) -> &BTreeMap<String, (String, Resource)> {
@@ -214,12 +217,7 @@ fn resolve(root: &Path, relative: &str) -> Option<PathBuf> {
         }
         // The first match in name order, so the choice doesn't depend on
         // the order the filesystem lists names in.
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(&path)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .collect();
-        entries.sort();
+        let entries = crate::index::sorted_entries(&path).ok()?;
         path = entries.into_iter().find(|p| {
             p.file_name()
                 .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(part))
@@ -231,15 +229,7 @@ fn resolve(root: &Path, relative: &str) -> Option<PathBuf> {
 /// Every file under `directory`, depth first, each directory's entries in
 /// ASCII-uppercase name order.
 fn list(directory: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = std::fs::read_dir(directory).map_err(|e| format!("{directory:?}: {e}"))?;
-    let mut paths = Vec::new();
-    for entry in entries {
-        paths.push(entry.map_err(|e| format!("{directory:?}: {e}"))?.path());
-    }
-    paths.sort_by_cached_key(|p| {
-        let name = p.file_name().unwrap_or_default().as_encoded_bytes();
-        (name.to_ascii_uppercase(), name.to_vec())
-    });
+    let paths = crate::index::sorted_entries(directory).map_err(|e| e.to_string())?;
     for path in paths {
         if path.is_dir() {
             list(&path, out)?;
@@ -250,13 +240,13 @@ fn list(directory: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-/// An archive's members, read by `sims_content`'s reader: the directory is
+/// An archive's members, read by this crate's reader: the directory is
 /// at most 64 MiB ([`sims_formats::far::MAX_DIRECTORY`]) and is bounded
 /// before it is read. A member that reader leaves out (compressed, or with
 /// a name too long or too deep) is not found by name here. Each member is
 /// read later through [`Resource::read`], which caps it at 128 MiB.
 fn far_members(path: &Path) -> Result<Vec<Member>, String> {
-    let (members, _skipped) = sims_content::far_members(path).map_err(|e| e.to_string())?;
+    let (members, _skipped) = crate::far_members(path).map_err(|e| e.to_string())?;
     Ok(members)
 }
 

@@ -21,6 +21,11 @@ pub struct Opened {
     pub art: Art,
     pub faces: Faces,
     pub install: Install,
+    /// The lot's world after the load, and the index and catalog it was
+    /// loaded from.
+    pub world: sims_sim::World,
+    pub index: Index,
+    pub catalog: sims_content::Catalog,
 }
 
 /// The install `SIMS_INSTALL` names, or None to skip.
@@ -92,5 +97,8 @@ pub fn open(root: &Path, house: &str) -> Opened {
         art,
         faces,
         install,
+        world: world.clone(),
+        catalog: catalog.clone(),
+        index,
     }
 }

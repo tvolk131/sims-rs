@@ -293,7 +293,9 @@ impl Machine<'_, '_> {
                     .ok_or_else(|| {
                         Trap::Invalid(format!("global 9 names family {selected}, which is gone"))
                     })?;
-                if self.catalog.object(record.guid).is_none() {
+                if crate::interpreter::object_definition(self.catalog, self.world, record.guid)
+                    .is_none()
+                {
                     return Err(Trap::Unsupported(format!(
                         "scope 24 field 1 (0x425be2) for a record of the GUID 0x{:08X}, which \
                          no definition has: the original reads through a null pointer",
@@ -442,7 +444,7 @@ impl Machine<'_, '_> {
                 // normalized to 108 words, so every index in bounds reads.
                 let index = bounded(index, DEFINITION_WORDS, 0x23)?;
                 let (_, object) = self.object(stack_object, 10)?;
-                Cell::Literal(self.definition_words(object.guid)?[index])
+                Cell::Literal(self.definition_word(object.guid, index)?)
             }
             22 => {
                 let i = bounded(index, frame.parameters.len(), 8)?;
