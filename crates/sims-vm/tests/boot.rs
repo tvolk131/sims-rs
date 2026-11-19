@@ -946,13 +946,21 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
         assert_eq!(streams(&lot), (lot_rng, 270_289_136, crt), "after {at}");
     }
     // Tick 16112: object 26's Burn moves person 18 to its tile's centre,
-    // which resets an animator playing "A2O-panic-loop2". Removing it can
-    // fade it out (0x592878), which is not ported.
+    // which resets an animator playing "A2O-panic-loop2". The reset takes
+    // the playing clip off (0x592878); with the fade gate clear it is not
+    // faded out (`Animator::clear_foreground`). The recording ends at 16111, so
+    // from here the run is unverified.
+    while tick < 17928 {
+        lot.step().unwrap();
+        tick += 1;
+    }
+    // Tick 17929: person 18's tree 0x0189 calls Generic Sims Call routine
+    // 6, which is not ported.
     match lot.step().unwrap_err() {
         StepError::Tick {
-            tick: 16112, error, ..
+            tick: 17929, error, ..
         } => {
-            for part in ["object 26, tree 0x1003", "unsupported: Burn", "0x592878"] {
+            for part in ["object 18, tree 0x0189", "Generic Sims Call routine 6"] {
                 assert!(error.contains(part), "{error}");
             }
         }

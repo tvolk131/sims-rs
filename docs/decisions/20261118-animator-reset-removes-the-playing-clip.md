@@ -55,7 +55,11 @@ tick 540; it was run to 3540 without a stop). In the pie-menu social
 test, the salesman is deleted at tick 597 with `A2O-door-knock` in the
 foreground, where the run used to stop; the test checks that he and his
 animator are gone then, and runs to tick 625 (run to 3625 without a
-stop). Neither run was compared with a recording here.
+stop). Neither run was compared with a recording here. The Goth day
+under the recording's frames used to stop at tick 16112, where object
+26's Burn resets person 18's animator with `A2O-panic-loop2` playing; it
+now runs to 17928 and stops at 17929 on Generic Sims Call routine 6.
+That recording ends at 16111, so the run past it is unverified.
 
 **Unverified.** The reference scan covers the mapped Complete Collection
 executable and direct addresses. A write through an indirect address
