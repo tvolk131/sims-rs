@@ -374,6 +374,13 @@ pub struct FrameStorage {
     /// have not been written since, as the frame's place in the stack and
     /// the local's number. Reading one fails.
     pub unknown: BTreeSet<(u32, u32)>,
+    /// How many times the object's thread has been restarted (every frame
+    /// dropped) since the lot was loaded. It is not part of the game's
+    /// state and is not encoded: the interpreter compares it across one
+    /// instruction, to see that a primitive restarted the thread running
+    /// it.
+    #[serde(skip)]
+    pub restarts: u32,
 }
 
 /// One type's shared words. See [`World::type_attributes`].

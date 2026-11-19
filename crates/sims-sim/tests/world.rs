@@ -151,6 +151,7 @@ fn world() -> World {
                 words: vec![Some(4096), Some(-1), None, Some(0)],
                 offsets: vec![0],
                 unknown: BTreeSet::from([(0, 1)]),
+                restarts: 0,
             },
         )]),
         dialogs: Dialogs {

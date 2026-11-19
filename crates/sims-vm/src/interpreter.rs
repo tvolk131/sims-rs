@@ -122,6 +122,12 @@ pub struct Interpreter<'a> {
     /// 0x800, [`crate::forget`]), whom a broadcast it sets off skips. None
     /// outside one.
     pub(crate) letting_go: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
+    /// The objects whose deletion has begun and that are not freed yet
+    /// (object flag 0x40, set at 0x440fbc for a group's tiles and 0x441039
+    /// for each object before people let go of it), which a reset reads
+    /// ([`Interpreter::reset`], [`Interpreter::reset_person`]). None
+    /// outside a deletion.
+    pub(crate) deleting: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
     /// The house view's rotation, 0 to 3 (the scene at 0x6e5528, +0x84),
     /// which Generic Sims Call routine 12 reads. It is the player's
     /// choice, not the lot's, so it is an input here: [`Interpreter::new`]
@@ -167,6 +173,7 @@ impl<'a> Interpreter<'a> {
             menu: None,
             running_at_once: None,
             letting_go: None,
+            deleting: None,
             view_rotation: 0,
             refreshing: None,
             taken_off: None,
@@ -310,12 +317,26 @@ impl<'a> Interpreter<'a> {
             menu: self.menu,
             running_at_once: self.running_at_once,
             letting_go: self.letting_go,
+            deleting: self.deleting,
             view_rotation: self.view_rotation,
             refreshing: self.refreshing,
             taken_off: self.taken_off,
             checking: false,
         }
     }
+}
+
+/// Where an object's thread is, for telling whether a primitive
+/// restarted it ([`Machine::step`]): its depth, its top frame's tree and
+/// node, and how many times it has been restarted
+/// ([`sims_sim::FrameStorage::restarts`]), so that a restart onto the same
+/// tree and node is seen too. The stack object is not part of it: an
+/// expression can set it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ThreadPlace {
+    depth: usize,
+    top: Option<(u16, u16)>,
+    restarts: u32,
 }
 
 /// Runs a tree synchronously for [`Interpreter::call_as`].
@@ -393,6 +414,8 @@ pub(crate) struct Machine<'a, 'w> {
     pub running_at_once: Option<AtOnce<'a>>,
     /// See [`Interpreter::letting_go`].
     pub letting_go: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
+    /// See [`Interpreter::deleting`].
+    pub(crate) deleting: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
     /// See [`Interpreter::view_rotation`].
     pub view_rotation: u8,
     /// See [`Interpreter::refreshing`].
@@ -417,6 +440,7 @@ impl<'a> Machine<'a, '_> {
             menu: self.menu,
             running_at_once: self.running_at_once,
             letting_go: self.letting_go,
+            deleting: self.deleting,
             view_rotation: self.view_rotation,
             refreshing: self.refreshing,
             taken_off: self.taken_off,
@@ -843,10 +867,10 @@ impl<'a> Machine<'a, '_> {
         self.sync_frames()?;
         let me = self.me;
         self.me_mut()?.stack.clear();
-        if let Some(storage) = self.world.frame_storage.get_mut(&me) {
-            storage.offsets.clear();
-            storage.unknown.clear();
-        }
+        let storage = self.world.frame_storage.entry(me).or_default();
+        storage.offsets.clear();
+        storage.unknown.clear();
+        storage.restarts = storage.restarts.wrapping_add(1);
         Ok(())
     }
 
@@ -951,17 +975,48 @@ impl<'a> Machine<'a, '_> {
                 instruction.opcode
             )));
         }
+        let place = self.thread_place();
         let result = match self.primitive(instruction)? {
             Flow::Branch(result) => result,
             Flow::Yield => return Ok(Status::Yielded),
             Flow::Pushed => return Ok(Status::Running),
         };
+        if self.thread_place() != place {
+            // The primitive restarted the thread running it, as a reset
+            // it set off does (a person Burn moves, or one that uses this
+            // object and lets go of it). Its branch would land on the new
+            // thread; what the original does then was not seen. The work
+            // the primitive did stays, as for any fault partway through.
+            let (tree, node) = place.and_then(|place| place.top).unwrap_or_default();
+            return Err(Trap::Unsupported(format!(
+                "{} (opcode {}) at tree {tree:#06x} node {node} restarted the thread of object \
+                 {}, which runs it, so its branch would land on the new thread",
+                crate::primitives::primitive_name(instruction.opcode),
+                instruction.opcode,
+                self.me
+            )));
+        }
         self.frame_mut()?.primitive_state = 0;
         self.me_mut()?.last_result = result;
         self.branch(if result {
             instruction.on_true
         } else {
             instruction.on_false
+        })
+    }
+
+    /// Where the running object's thread is ([`ThreadPlace`]). None for
+    /// an object no longer on the lot.
+    fn thread_place(&self) -> Option<ThreadPlace> {
+        let stack = &self.world.objects.get(&self.me)?.stack;
+        Some(ThreadPlace {
+            depth: stack.len(),
+            top: stack.last().map(|f| (f.tree, f.node)),
+            restarts: self
+                .world
+                .frame_storage
+                .get(&self.me)
+                .map_or(0, |storage| storage.restarts),
         })
     }
 
