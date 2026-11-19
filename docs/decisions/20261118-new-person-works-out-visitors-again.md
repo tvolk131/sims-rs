@@ -33,14 +33,24 @@ one global 9 names. That is the convention scope 24 field 1 already uses
 the selected family's pointer. With global 9 at 0 the World does not say
 which family the game holds, so the pass fails loudly
 (`Trap::Unsupported`, naming 0x42a2b4), and a global 9 that names no
-family fails as invalid. Other objects' 0xe2 changes nothing in the
-simulation, so nothing is done for them.
+family fails as invalid. That includes the load: while the house is
+read, 0x415fc6 clears global 9 and 0x415fd7 selects family 0, so a
+person made then (for example by an object's Init before the household
+selection) would be made in the original and fails loudly here. No
+ported load makes one.
+
+For a multi-tile object the signal names the group's lead, and the lot
+tests the lead's definition. `Interpreter::create` runs the pass after a
+group whose lead's definition has type 2. A single-tile object of type 2
+is always made by the person factory. Any other object's 0xe2 changes
+nothing in the simulation.
 
 The construction reset's own test (0x4599f8, before 0x459a0b) goes
 through 0x40745f too, for which lot 0 (global 10 at 0) has zoning 1
 (0x42b9e3). The port took lot 0 there as not residential. Both now use
-one test. The pass that follows decides word 32 anyway, so this changes
-no result.
+one test. The difference shows only on lot 0, for a person whose Init
+leaves word 32 at a value other than 0 and 2: the reset used to make it
+1, and now keeps it, as does the pass for someone not of the family.
 
 **What it changes at 3603.** The two new people are not of the Goth
 family, so the pass makes each a visitor (word 32 is 1). Create New
@@ -59,16 +69,24 @@ port of the "init visitor" run itself was right.
 
 - All three random streams (lot, global and C runtime) match the
   recording after every update from 3603 to 4154.
-- A comparison of every object's full state with the recording's, every
-  tenth update from 3600 to 4150, finds no difference. That covers data,
-  temps, attributes, the last result, frames with their locals and
-  arguments, and person data; the expected modelled unknowns of
-  `20261118-set-to-next-follows-group-links.md` are left out.
-- From 3340 to 3590 the only difference is still person 21's last result
-  at 3350 (see `20261118-hover-check-trees-not-ported.md`).
+- A comparison of each object's state with the recording's, every tenth
+  update from 3600 to 4150, finds no difference in the fields it
+  compares: data, temps, attributes, the last result, frames with their
+  locals and arguments, and person data. The expected modelled unknowns of
+  `20261118-set-to-next-follows-group-links.md` are left out. It does not
+  compare motives, queues, relationships or other state, so a difference
+  there would not show.
+- From 3340 to 3590 the only difference in those fields is still person
+  21's last result at 3350 (see
+  `20261118-update-3350-is-pointer-pie-menu-listing.md`).
 - At 4155 the global random stream moves in the recording, for the first
   time since the load, and not in the port. That is the next divergence,
-  and it is not worked out here. At 4160 it is the only difference.
+  and it is not worked out here. At 4160 it is the only difference in the
+compared fields. The recording's global stream moves after 4155, 4185,
+4215, 4245, 4275, 4305, 4335 and 4365 (3, 21, 24, 24, 24, 24, 21 and 6
+draws), and not otherwise; the port's never moves all day. A draw outside
+the lot update draws from the global stream, so these are likely outside
+it, which is **unverified**.
 
 **Pins.** The strict boot (`--answers 3,3`) keeps its hashes at ticks
 33, 1103, 2881, 3432 and 3602. From 3603 on every pin changes, in format
@@ -101,11 +119,12 @@ the snapshot format does not change.
 names (109), with the fixture Sim's type as its one member. New tests
 cover the pass after a new person on a residential lot (a member gets
 0, anyone else 1 for a 0, a 2 stays), with global 10 at 0, and on a lot
-not zoned residential, and the loud failures. The "init visitor" test
+not zoned residential, and the loud failures; a group whose lead has
+type 2; and the construction reset on lot 0. The "init visitor" test
 now expects the tree to run for a non-member on a residential lot and not
 for a member.
 
-**What would reopen it.** A family whose members change while the game
-runs, or a person made with global 9 at 0 (for example in the
-neighborhood view), fails loudly here. The other sender of 0xe2
-(0x42184c, after 0x4a67de) is not ported.
+**What would reopen it.** A person made with global 9 at 0 (during the
+house's load, or with no family selected) fails loudly here, and a
+capture of one would show which family the original tests. The other
+sender of 0xe2 (0x42184c, after 0x4a67de) is not ported.

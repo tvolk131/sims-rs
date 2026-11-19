@@ -311,3 +311,32 @@ fn the_visitor_pass_without_a_known_family_fails_loudly() {
     let fault = create(&mut fx, ADULT).unwrap_err();
     assert!(matches!(fault.trap, Trap::Invalid(_)), "{fault}");
 }
+
+#[test]
+fn the_construction_reset_takes_lot_0_as_residential() {
+    // Step 8 of the construction reset (0x4599f8, 0x459a0b) asks 0x40745f,
+    // for which lot 0 has zoning 1 (0x42b9e3). An Init that leaves person
+    // word 32 at 3 keeps it on lot 0, and the visitor pass keeps a word
+    // other than 0 for someone not of the family.
+    const INIT: u16 = 4098;
+    let made = |lot: i16| {
+        let (mut fx, file) = lot_with_init(11, INIT);
+        fx.add(
+            file,
+            INIT,
+            tree(vec![assign(
+                18,
+                VISITOR as i16,
+                scope::LITERAL,
+                3,
+                RETURN_TRUE,
+            )]),
+        );
+        fx.world.globals[10] = lot;
+        let id = create(&mut fx, ADULT).unwrap();
+        visitor_word(&fx, id)
+    };
+    assert_eq!(made(0), 3);
+    // On a lot not zoned residential, the reset makes it 1.
+    assert_eq!(made(110), 1);
+}
