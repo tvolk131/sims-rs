@@ -175,31 +175,54 @@ fn an_empty_or_missing_name_and_another_table_are_native_errors() {
 }
 
 #[test]
-fn an_accessory_no_skeleton_file_names_fails_before_any_change() {
+fn misses_with_no_decode_errors_append_unnamed_entries() {
     let mut fx = Fixture::new();
     name_accessories(&mut fx);
+    assert!(fx.program.people.suit_errors.is_empty());
+    assert!(run_change(&mut fx, 2, 2, 0).unwrap());
+    assert!(run_change(&mut fx, 0, 0, 0).unwrap());
     fx.program.people.suits.remove("hat");
-    let error = trap(run_change(&mut fx, 2, 2, 0)).to_string();
-    assert!(error.contains("no decoded avatar file"), "{error}");
-    assert!(!error.contains("stopped decoding"), "{error}");
-    assert!(worn(&fx).is_empty());
-    // Taking it off needs no bind.
-    fx.sim_mut().person.as_mut().unwrap().accessories = vec![Accessory {
-        name: "hat".into(),
-        binding: String::new(),
-    }];
+    assert!(run_change(&mut fx, 2, 2, 0).unwrap());
+    assert_eq!(
+        worn(&fx),
+        [("cane", ""), ("", "")].map(|(n, b)| (n.to_string(), b.to_string()))
+    );
+
+    assert!(run_change(&mut fx, 2, 2, 0).unwrap());
+    let expected = [("cane", ""), ("", ""), ("", "")].map(|(n, b)| (n.to_string(), b.to_string()));
+    assert_eq!(worn(&fx), expected);
+
+    fx.world = sims_sim::World::decode(&fx.world.encode()).unwrap();
+    assert_eq!(worn(&fx), expected);
+    assert!(run_change(&mut fx, 2, 2, 1).unwrap());
+    assert_eq!(worn(&fx), expected);
+}
+
+#[test]
+fn a_miss_with_decode_errors_traps_before_changing_the_list() {
+    let mut fx = Fixture::new();
+    name_accessories(&mut fx);
+    fx.program.people.suit_errors.extend([
+        ("GameData/x.bcf".into(), "truncated".into()),
+        ("GameData/y.cmx".into(), "invalid".into()),
+    ]);
+    assert!(run_change(&mut fx, 2, 2, 0).unwrap());
+    let before = worn(&fx);
+    fx.program.people.suits.remove("hat");
+
+    let error = trap(run_change(&mut fx, 2, 2, 0));
+    let sims_vm::Trap::Unsupported(reason) = error else {
+        panic!("{error}");
+    };
+    assert!(reason.contains("accessory \"hat\""), "{reason}");
+    assert!(
+        reason.contains("2 avatar files stopped decoding (GameData/x.bcf, GameData/y.cmx)"),
+        "{reason}"
+    );
+    assert_eq!(worn(&fx), before);
+
     assert!(run_change(&mut fx, 2, 2, 1).unwrap());
     assert!(worn(&fx).is_empty());
-    // Files that stopped decoding are named, since the suit may be in one.
-    fx.program
-        .people
-        .suit_errors
-        .insert("GameData/x.bcf".into(), "truncated".into());
-    let error = trap(run_change(&mut fx, 2, 2, 0)).to_string();
-    assert!(
-        error.contains("1 avatar files stopped decoding: GameData/x.bcf"),
-        "{error}"
-    );
 }
 
 #[test]
