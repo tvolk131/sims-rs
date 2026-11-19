@@ -154,7 +154,55 @@ impl Interpreter<'_> {
             .ok_or_else(|| fail(id, Trap::Invalid("the new person was deleted".into())))?;
         object.data[41] = words[word::PRICE];
         object.set_flags(1, true);
+        // The factory's end announces the new object (signal 0xe2,
+        // 0x440ed7), and the lot's handler works out again who is a
+        // visitor when it is a person (0x4163f7).
+        self.visitor_pass(world).map_err(|trap| fail(id, trap))?;
         Ok(id)
+    }
+
+    /// The visitor pass (0x42a2b4), which the lot runs when the factory
+    /// announces a new person (signal 0xe2, 0x440ed7, handled at
+    /// 0x4163f7): every person's word 32 is worked out again
+    /// ([`sims_sim::load::visitor_again`]), the new one's too.
+    ///
+    /// The family is the selected one (game +0x10), whose members the
+    /// pass tests (0x41019b); it is taken to be the family global 9 names,
+    /// as for scope 24 field 1. With global 9 at 0 the World does not say
+    /// which family the game holds, so that fails loudly, as does a
+    /// global 9 that names no family. The lot is residential when global
+    /// 10 is 0 or a house zoned 1 (0x40745f, 0x42b9e3).
+    pub(crate) fn visitor_pass(&self, world: &mut World) -> Result<(), Trap> {
+        let family = i32::from(world.globals.get(9).copied().unwrap_or(0));
+        if family == 0 {
+            return Err(Trap::Unsupported(
+                "0x42a2b4: the visitor pass with global 9 at 0: which family the game holds \
+                 (game +0x10) is not kept"
+                    .into(),
+            ));
+        }
+        let members = world
+            .families
+            .iter()
+            .find(|f| f.id == family)
+            .map(|f| f.members.clone())
+            .ok_or_else(|| Trap::Invalid(format!("global 9 names family {family}, which is gone")))?;
+        let lot = world.globals.get(LOT).copied().unwrap_or(0);
+        let residential = lot == 0 || self.program.zoning.get(&lot) == Some(&1);
+        for id in world.people.clone() {
+            let Some(object) = world.objects.get_mut(&id) else {
+                continue;
+            };
+            let member = members.contains(&object.guid);
+            if let Some(word) = object
+                .person
+                .as_mut()
+                .and_then(|p| p.data.get_mut(person::VISITOR))
+            {
+                *word = sims_sim::load::visitor_again(*word, member, residential);
+            }
+        }
+        Ok(())
     }
 
     /// Gives person `id` default interests and personality (0x459a9c) if
