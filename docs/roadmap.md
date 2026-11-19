@@ -37,10 +37,11 @@ events, and what it asks for after them) come first.
    state sparsely (every tenth update, and every update around events)
    and the random streams every update. Delete the captures and dumps it
    supersedes, and say which. Open: strict mode runs the whole day and
-   the day's turn (#233, #244, #251). At the recording's saved
-   checkpoints the full state matches through update 3340, apart from
-   two modelled differences, and the lot's random stream matches
-   through 3602 (#244, #251). Checking the rest against the recording
+   the day's turn (#233, #244, #251). The full state matches the
+   recording through update 2810 apart from known exceptions, and at
+   its saved checkpoints from 2820 to 3340 apart from two modelled
+   differences; a transient at 3350 is open. The lot's random stream
+   matches through 3602 (#244, #251). Checking the rest against the recording
    is what remains. See Progress.
 3. **1000 ticks on three more base-game houses**, picked for code the
    Goths do not reach (for example the Newbies and a family with
@@ -62,7 +63,8 @@ events, and what it asks for after them) come first.
    Charming family: one adult and one dog). The neighborhood's pending
    `Patch/` family files are imported into it first (0x42bd13), which
    builds the people from templates and rewrites the houses' placeholder
-   GUIDs. 6a: boot House 69 in strict mode from the original's imported
+   GUIDs (the import address and the capture status below are from
+   track 4's survey and are not yet verified). 6a: boot House 69 in strict mode from the original's imported
    files and compare it with a 1000-tick recording. 6b: port the import,
    checked file for file against the original's result. A community lot
    follows once travel is in. No recording of an expansion lot exists
@@ -74,11 +76,11 @@ events, and what it asks for after them) come first.
 
 - Step 1 is done.
 - Step 4: the first player-order recording (track 2's goth-snack
-  scenario) replayed through the window's input layer equals the
-  original's state after every update to 453, once a press lists the
-  menu again and reaching an entry checks it again. With #238 the
-  replay draws the recording's frames, and then every motive matches.
-  Through update 1000 the remaining differences are the comparisons
+  scenario) replayed through the window's input layer, once a press
+  lists the menu again and reaching an entry checks it again. With #238
+  the replay draws the recording's frames, and every motive matches.
+  Through update 1000 it equals the original's state except for the
+  comparisons
   before and after a frame at updates 33 and 891, Bella's local at
   updates 203 to 227, and Mortimer's data word 50 from 622 to 871 (see
   the decisions log). A live-mode frame lists the selected Sim's queue
@@ -135,10 +137,10 @@ events, and what it asks for after them) come first.
   pets and a negative age, then House09's coverage; UI Effect (34,
   Tutorial and Help System only); moving a gathered person in Burn;
   removing an object that holds another (`removal.rs`); the failing
-  modes of the ported primitives. Since #244 the play-mode snack test
-  no longer reaches a fire (it runs to step 15799 without an error), so
-  no run on the real install lights one, and Burn needs a new scenario
-  for real-run coverage.
+  modes of the ported primitives. The play-mode snack test no longer
+  exercises Burn: #244 changed the run's path, and since #251 it
+  reaches step 15799 without an error and with no fire at the end.
+  Burn needs a replacement scenario on the real install.
   **Unverified:** Reach, Burn and Find 5 Worst Motives against a
   capture. The first
   recording with a meal should check Reach's clip choice and the step at
@@ -180,7 +182,9 @@ events, and what it asks for after them) come first.
   follows a multi-tile group's links rather than the order its tiles
   were registered in (0x44ec79, #251). At the recording's saved
   checkpoints (every tenth update from 2820) the full state now matches
-  through update 3340, apart from two modelled differences: a frame
+  from 2820 through update 3340, apart from two modelled differences
+  (through 2810 the earlier comparison's exceptions still apply: the
+  head targets' last bits and neighborhood record 301): a frame
   local that overlays a code-owner pointer, and person word 37 from
   memory the original never set. The random stream matches through
   3602. After 3340, a transient at update 3350 is open: person 21's
@@ -198,8 +202,8 @@ events, and what it asks for after them) come first.
   The whole-day test answers No, so strict boots of the day use
   `--answers 3,3`. Next: the random-stream divergence at tick 3603 and
   the transient at 3350 (track 3), then keep verifying the day against
-  track 2's Goth day recording, including the night against its
-  midnight recording. `placement::on_lot` still uses a
+  track 2's Goth day recording, including the night.
+  `placement::on_lot` still uses a
   fixed 64-tile bound where the original tests the lot's size
   (0x422632). Also open: the
   Newbies in strict mode from tick 4052; the Pleasants and the Roomies
@@ -1559,9 +1563,11 @@ lacks.
 
 **Not verified.** The original keeps an accessory's name only when its
 suit is found and binds to the skeleton (`0x583559`); otherwise the
-entry stays with an empty name. Ours refuses, loudly, a name that no
-decoded avatar file defines (`People::suits`) and takes any other to
-bind; that this matches the original's registry is not verified. The suit
+entry stays with an empty name. Since #250 ours does the same on a
+clean lookup miss, appending an empty accessory; a miss after avatar
+decoder errors still stops loudly and names the failed files
+(`People::suits`). That this matches the original's registry and lazy
+loader is not verified. The suit
 form and taking an accessory off are ported from the code but not
 reached.
 
@@ -2407,9 +2413,7 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
 - **Done: the house panel** (#230), the first of the other live
   panels: Size, Yard, square feet, bedrooms, bathrooms and lot size.
   **Unverified:** the panel against a screenshot of the original; the
-  labels' color, and how the labels sit in their boxes; which
-  type-record words the Upkeep count reads (since found: OBJD words
-  37, 38 and 67, #240).
+  labels' color, and how the labels sit in their boxes.
 - **Next:** a screenshot of an open pie menu; the dialog's corners,
   which the original blends; whether frames should be cut to 16-bit
   color as the original's screen is; the simulation side of text entry
@@ -2422,13 +2426,14 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   residential-lot check on the House button (0x40745f); the other live
   panels.
 - **Done:** the house panel's Upkeep rating, read as the original
-  scans (0x4452eb, 0x4168d4, #240); the sign of the zodiac opens its
+  scans (0x4452eb, 0x4168d4, #240), from OBJD words 37, 38 and 67
+  counted after the version; the sign of the zodiac opens its
   help balloon on the personality panel (0x51bfb3, 0x50fc30, #246).
   **Unverified:** the Goths' Upkeep of 100 against a screenshot of the
   original; whether closing the strip hides the balloon in the
   original, as it does here. Not ported: the original closes the
-  balloon on a press outside its rectangle (0x51f3e5) and when the focus
-  changes (0x51d312, 0x51d354).
+  balloon on a press outside its rectangle (0x51f3e5) and on certain
+  focus changes (0x51d312, 0x51d354).
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
   - A command intake, for example `World::apply(&mut self, command:
     sims_sim::Command) -> Result<(), CommandError>`, run between ticks,
@@ -2611,11 +2616,8 @@ through their public interfaces only; the simulation never depends on it.
   - `sims-vm`: a play-mode step that fails should still hand
     back the errors it caught before failing, and say which frame
     (before or after the tick) was skipped.
-  - `sims-vm`: the animator's refresh (0x58da12), which deselecting a
-    Sim makes, so strict mode can switch Sims.
-  - `sims-people`: the selected Sim's head as an image, which the
-    original renders live into the pie's face bitmap; the middle of the
-    pie is empty until then.
+  - `sims-people`: the pie head's camera, light and size compared with
+    the original's.
 
 ## Working rules
 
