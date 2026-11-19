@@ -510,6 +510,10 @@ impl Prices {
             .map(|(&style, entry)| (style, price(STYLE_TABLE, entry).unwrap_or(0)))
             .collect();
         styles.insert(SECOND_STYLE, styles[&PRICED_STYLES[0]]);
+        // A style's or the pool's string missing from a table that is
+        // there costs 0 here; the original reads it without a check
+        // (0x4cd4d3, 0x470531 returning null) and crashes in `atoi`
+        // (0x635fbe). The install's tables have them all.
         let pool = price(POOL_TABLE, 1).unwrap_or(0);
         // A built-in pattern whose entry is missing costs 0 (0x4a01eb,
         // 0x4c4f1e); a plug-in without a price of its own costs the
@@ -615,11 +619,13 @@ impl Values {
     ///   toward zero when data word 15 is not 0 on it or, for a group, on
     ///   any tile from the lead along the chain.
     ///
-    /// The original's pass also sets the lot's global 22 and 37 and two of
-    /// the family's flags (0x4160e5, 0x4160f6), and puts right a slot word
-    /// of 0 on an object it asks (0x43264c). Those are the simulation's:
-    /// it keeps the globals and the slot word, and not the family's flags
-    /// (see `sims-vm`'s day's turn). Nothing here changes the world. A type [`Kinds`] has not read is passed over.
+    /// The original's pass also sets the lot's globals 22, 23 (its size,
+    /// 0x416132 to 0x416137) and 37 and two of the family's flags
+    /// (0x4160e5, 0x4160f9), and puts right a slot word of 0 on an object
+    /// it asks (0x43264c). Those are the simulation's: it keeps the
+    /// globals and the slot word, and not the family's flags (see
+    /// `sims-vm`'s day's turn). Nothing here changes the world. A type
+    /// [`Kinds`] has not read is passed over.
     ///
     /// The panel does not run this: it reads the stored values
     /// ([`Values::stored`]). This is the sum for the simulation to store

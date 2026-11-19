@@ -116,20 +116,25 @@ No screenshot of the panel was compared.
     such tables of the install's `Build.iff` and pattern files: 31 loose
     and 457 in FAR archives.
   - **Unverified:** a resource map entry whose ID or flags' high byte
-    differs from its chunk header's. The IFF reader rejects the map then
-    and reads the chunks as if there were none (`sims_formats::iff`,
-    from the frozen prototype), where the original looks the resource
-    up by the map's ID (0x41bbc5) and checks only the chunk's type
-    (0x41d33b), so a pattern's price under such an entry would be
-    missed. No file of the install has one: its 3,523 mapped files, FAR
-    members included, list 160,672 entries, each with its chunk's type,
-    ID and flags' high byte.
+    differs from its chunk header's. The IFF reader refuses the map then
+    and looks resources up as if there were none (`sims_formats::iff`,
+    from the frozen prototype; `resource_order` reports the error),
+    where the original finds the resource by the map's ID (0x41bbfb)
+    and compares only the chunk's type (0x41d33e). A price under such
+    an entry is then found only when the chunk's own ID and flags give
+    the same key. No file of the install has one: its 3,583 mapped
+    files, FAR members and family files included, list 163,797 entries,
+    each with its chunk's type, ID and flags' high byte.
 - **The prices by table:**
   - Wall styles (0x6e5838): `STR#` 129, entries 1 to 5, give styles 1,
     2, 13, 12 and 14 (0x4cd149), and entry 1 gives style 255 too
     (0x4cd48d). Every other style costs 0.
   - The pool (0x6c5ff8): `STR#` 133, entry 1 (75 here, over the exe's
     100).
+  - A style's or the pool's string missing from its table costs 0 here.
+    The original reads it without a check (0x4cd4d3; 0x470531 returns
+    null) and crashes in `atoi` (0x635fbe). The install's tables have
+    them all.
   - The built-in floors, keys 1 to 29: `STR#` 130 (0x4a01cb).
   - The built-in wall patterns, keys 0 to 30 and 248 to 255: `STR#` 131
     (0x4c4ee5). Key 0 and the high keys have no entry and cost 0.
