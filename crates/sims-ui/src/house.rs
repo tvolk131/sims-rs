@@ -1287,8 +1287,8 @@ mod tests {
         add(13, 17, on_lot, 600);
         // The lot is 10 tiles: tile 8 (its size less 2) is on it, tile 9
         // (its size less 1) is not, whatever the arrays' size.
-        add(14, 10, [8 * 16, 1 * 16, 1], 1);
-        add(15, 10, [1 * 16, 9 * 16, 1], 700);
+        add(14, 10, [8 * 16, 5 * 16, 1], 1);
+        add(15, 10, [5 * 16, 9 * 16, 1], 700);
         add(16, 18, [9 * 16, 8 * 16, 1], 2);
         world.objects.get_mut(&2).unwrap().data[BROKEN] = 1;
         world.objects.get_mut(&3).unwrap().data[FLAGS] = NOT_VALUED;
