@@ -385,17 +385,15 @@ impl Snapshot {
         self
     }
 
-    /// Works out [`Snapshot::house`] from `world`, with the lot's values
-    /// as stored (`values`, [`House::with_values`]).
+    /// Works out [`Snapshot::house`] from `world` ([`House::read`]).
     #[must_use]
     pub fn with_house(
         mut self,
         world: &World,
         tuning: &house::Tuning,
         kinds: &house::Kinds,
-        values: house::Values,
     ) -> Self {
-        self.house = House::with_values(world, tuning, kinds, values);
+        self.house = House::read(world, tuning, kinds);
         self
     }
 

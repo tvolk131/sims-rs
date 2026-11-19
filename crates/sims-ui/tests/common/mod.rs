@@ -16,6 +16,8 @@ pub const GOTH_HOUSE: &str = "UserData/Houses/House05.iff";
 pub struct Opened {
     pub careers: Careers,
     pub house: house::Tuning,
+    /// The architecture's prices, as the load's catalogs key them.
+    pub prices: house::Prices,
     pub kinds: house::Kinds,
     pub snapshot: Snapshot,
     pub art: Art,
@@ -81,13 +83,13 @@ pub fn open(root: &Path, house: &str) -> Opened {
     let snapshot = Snapshot::read(world, &family.members)
         .with_careers(&careers)
         .with_relations(world, &family.members, &known);
-    let mut house = house::Tuning::load(&index, catalog).unwrap();
-    house.prices = house::Prices::load(&install, lot.surfaces());
+    let house = house::Tuning::load(&index, catalog).unwrap();
+    // The architecture's prices, by the pattern catalogs the load keyed
+    // the lot's floors and walls by.
+    let prices = house::Prices::load(&install, lot.surfaces());
     let mut kinds = house::Kinds::default();
     kinds.learn(world, &index, catalog);
-    let mut stored = house::Stored::default();
-    stored.store(world, &kinds, &house.prices);
-    let snapshot = snapshot.with_house(world, &house, &kinds, stored.values());
+    let snapshot = snapshot.with_house(world, &house, &kinds);
     let ui = UiGraphics::open(&install).unwrap();
     let mut art = Art::load(&ui, US_ENGLISH, &sims_ui::hud::RESOURCES).unwrap();
     art.load_optional(&ui, US_ENGLISH, sims_ui::balloon::BACKGROUND);
@@ -95,6 +97,7 @@ pub fn open(root: &Path, house: &str) -> Opened {
     Opened {
         careers,
         house,
+        prices,
         kinds,
         snapshot,
         art,

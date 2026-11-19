@@ -3,14 +3,17 @@
 *Decided 2026-11-18.*
 
 The house panel's Furnishings bar now shows a rating (0x416851,
-`sims_ui::house::furnishings`). It is read from the exe. The two values
-it weighs match, to the unit, what the original's simulator held after
-loading the Goths' house: track 2's capture of update 1 has the
-simulator's +0xa0 at 14,660 and its +0xa4 at 15,277. The house file
-in the player's folder saved the same two values (the copy the
-install starts from saved 0 for both), but the panel here works them
-out from the lot and does not read them; the test checks so. Their
-Furnishings is 58. No screenshot of the panel was compared.
+`sims_ui::house::furnishings`). It weighs the lot's two values as the
+simulation keeps them (`Budget::objects_value` and
+`architecture_value`), which the original's panel reads from its
+simulator (0x41685f, 0x41687e). The lot statistics' sums that work them
+out (`sims_ui::house::Values::read`) are ported too, from the exe, for
+the simulation to store; the panel does not run them. For the Goths'
+house the two agree to the unit: track 2's capture of update 1 has the
+simulator's +0xa0 at 14,660 and its +0xa4 at 15,277, the house file in
+the player's folder saved the same two, and the sums worked out from
+the lot with those cleared come to them too. Their Furnishings is 58.
+No screenshot of the panel was compared.
 
 - **The rating** (0x416851): the architecture's value (+0xa4) over the
   objects' (+0xa0), through string 1 of the global file's `STR#` 505,
@@ -22,27 +25,28 @@ Furnishings is 58. No screenshot of the panel was compared.
   (`sims_sim::motives::Curve::parse`), which drops a point that is not
   well formed (`(100;90 coins)`) where the original's scanner (0x4614a2)
   reads it. That parser is shared with the motives, so a fix belongs to
-  the simulation; the install's curves are well formed. The objects' value is rounded to single precision
-  first; the architecture's is loaded whole and divided by it, and the
+  the simulation; the install's curves are well formed. The objects'
+  value is rounded to single precision first; the architecture's is loaded whole and divided by it, and the
   quotient is rounded to single. With the objects' value 0 the ratio is
   100 (0x66674c), not a division.
-- **When the values are worked out:** the original's lot statistics
-  (0x416085) store them at the load (0x41621f), at the day's turn
-  (0x41647e, signal 0xdc), on leaving build or buy mode (0x4cea9e,
-  through 0x416534) and from 0x50206e (through 0x416558, when word
-  +0x36 of the record at the lot's +0x20 is not 0), and the panel reads
+- **When the values are worked out:** the original keeps them in its
+  simulator (+0xa0 and +0xa4), saved and loaded in `SIMI` (0x46d1ad,
+  0x46d1bd). Its lot statistics (0x416085) store them (0x416118,
+  0x416126) on going to live mode (0x4cea9e through 0x416534), so after
+  a load, at the day's turn (0x41647e, signal 0xdc), from the budget
+  dialog (0x50206e through 0x416558) and before the house is written
+  (0x41621f, ahead of the `SIMI` write at 0x416253). The panel reads
   what was stored last, so an object that breaks or is mended shows at
-  the next of those. The game keeps them (`sims_ui::house::Stored`): it
-  works them out when the lot is loaded and again on the first frame
-  after the days played (global 28) change. That is after the frame's
-  last update rather than at the update that turned the day, a known
-  difference, not the original's behaviour. Build and buy mode are not
-  ported and what reaches 0x50206e was not read, so those passes are
-  not made. The viewer's world does not change after the load, so it
-  works them out when the panel shows. The simulation's
-  `Budget::objects_value` and `architecture_value` are left as they
-  are; were the simulation to store both at those times, the panel
-  would read them instead.
+  the next of those. Here the panel reads the world's budget, which a
+  checkpoint or snapshot keeps with the rest of the world. The
+  simulation stores the objects' value at the day's turn (`sims-vm`'s
+  `day_statistics`) and neither value elsewhere: the architecture's
+  stays what the house was saved with, and going to live mode stores
+  neither (`World::update_statistics`). So a house saved with values
+  out of date shows them, and after a day turns the new objects' value
+  is weighed against the saved architecture's. This is a known gap in
+  the simulation, not the original's behaviour; it is the simulation's
+  to close, with these sums.
 - **The objects** (0x444cb9), in the lot's order, in 32-bit sums that
   wrap:
   - A tile of a multi-tile group that is not its lead, and a type with
@@ -136,17 +140,13 @@ Furnishings is 58. No screenshot of the panel was compared.
   - Build mode's catalog, which fills the style table and the pool's
     price, is made on first request (0x4ce31a). The match with the
     capture needs the five style prices, so it was made by update 1.
-- **The catalogs:** the game's and the viewer's panels price the
-  patterns by the catalogs the load built and keyed the lot by
-  (`sims_vm::boot::Lot::surfaces`), not by catalogs built again, so a
-  pattern file added in between cannot shift the keys.
-- **The viewer:** when the house cannot be loaded as the game loads
-  it, the viewer shows the house file as saved, whose floors and walls
-  keep the house's own pattern numbers, not the catalogs' keys. Its
-  panel then leaves Furnishings out rather than price the wrong
-  patterns. It does the same for a snapshot, which does not record the
-  catalogs its patterns were keyed by: a plug-in added or removed since
-  would shift the keys.
+- **The catalogs:** the sums price the patterns by the catalogs the
+  load built and keyed the lot by (`sims_vm::boot::Lot::surfaces`), not
+  by catalogs built again, so a pattern file added in between cannot
+  shift the keys. The test prices the Goths' lot so.
+- **The viewer:** its panel reads the world's budget as the game's
+  does, so it shows Furnishings for the house file as saved and for a
+  snapshot too, with the values they hold.
 - **Unverified:**
   - A wall side whose neighbour does not own it costs 0. The original
     reads whatever its stack held there.
@@ -169,13 +169,13 @@ Furnishings is 58. No screenshot of the panel was compared.
     the lot, the lot's edge at its size less 2 and less 1, type 7, a
     group, an unread type, a person and another type without a
     master);
-  - the rating, including no valued objects;
-  - the stored values, kept until the day turns;
+  - the rating, including no valued objects, and the panel weighing
+    the budget's values;
   - the curve's text cut at a zero byte, and read past a byte order
     mark;
-  - the Goths' values (14,660 and 15,277, worked out with the saved
-    ones cleared), Furnishings 58 and the panel's digest, gated on
-    `SIMS_INSTALL`.
+  - the Goths' values (14,660 and 15,277, as saved, and the sums worked
+    out with the saved ones cleared), Furnishings 58 and the panel's
+    digest, gated on `SIMS_INSTALL`.
 
 Reopen with a screenshot of the original's house panel, or if the
 simulation takes over the lot statistics' values.

@@ -37,11 +37,6 @@ pub struct Hud {
     /// when the house panel first shows: the viewer's world does not
     /// change, so once.
     kinds: Option<house::Kinds>,
-    /// Whether the world's floor and wall patterns are known to be the
-    /// catalogs' keys, which the architecture's prices are by. When not,
-    /// as in the house file as saved or a snapshot, the Furnishings rating
-    /// is left out rather than priced by the wrong patterns.
-    pub priced: bool,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
     /// What the relationship panel needs from outside the world.
@@ -66,7 +61,6 @@ impl Hud {
         house: &Path,
         assets: &Assets,
         world: &sims_sim::World,
-        surfaces: &sims_content::Surfaces,
     ) -> Result<Self, String> {
         let install = Install::detect(install).map_err(|e| e.to_string())?;
         let ui = UiGraphics::open(&install).map_err(|e| e.to_string())?;
@@ -110,11 +104,8 @@ impl Hud {
         let faces =
             Faces::load(assets.index(), assets.catalog(), &people).map_err(|e| e.to_string())?;
         let careers = Careers::load(assets.index()).map_err(|e| e.to_string())?;
-        let mut house =
+        let house =
             house::Tuning::load(assets.index(), assets.catalog()).map_err(|e| e.to_string())?;
-        // The architecture's prices, by the pattern catalogs the load
-        // keyed the lot's floors and walls by.
-        house.prices = house::Prices::load(&install, surfaces);
         let known = Acquaintances::read(
             assets.index(),
             assets.catalog(),
@@ -130,7 +121,6 @@ impl Hud {
             careers,
             house,
             kinds: None,
-            priced: true,
             members,
             known,
             texts,
@@ -178,13 +168,7 @@ impl Hud {
                 kinds.learn(world, assets.index(), assets.catalog());
                 kinds
             });
-            // The viewer's world does not change after the load, so the
-            // values worked out now are those the load stored.
-            let values = house::Values::read(world, kinds, &self.house.prices);
-            snapshot = snapshot.with_house(world, &self.house, kinds, values);
-            if !self.priced {
-                snapshot.house.ratings[house::FURNISHINGS] = None;
-            }
+            snapshot = snapshot.with_house(world, &self.house, kinds);
         }
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         hud::fit(&mut self.items, &self.art, &self.texts);

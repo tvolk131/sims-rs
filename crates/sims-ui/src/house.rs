@@ -42,9 +42,6 @@ pub struct Tuning {
     /// object", cut toward zero when read (0x42434a, 0x42436c).
     pub dirty: i32,
     pub broken: i32,
-    /// What the architecture's value counts walls, floors and the pool
-    /// at. Empty until [`Prices::load`] reads them.
-    pub prices: Prices,
 }
 
 /// The global file's string table with the two curves, and its tuning
@@ -135,7 +132,6 @@ impl Tuning {
             yard: F32::from_f32(constant(YARD_NAME, YARD_DEFAULT)),
             dirty: whole(constant(DIRTY_NAME, DIRTY_DEFAULT)),
             broken: whole(constant(BROKEN_NAME, BROKEN_DEFAULT)),
-            prices: Prices::default(),
         }
     }
 }
@@ -327,25 +323,11 @@ impl House {
     ///   the arithmetic is single precision, as the original's FPU is
     ///   set.
     ///
-    /// - Furnishings (0x416851) weighs the lot's values ([`Values`]):
-    ///   see [`furnishings`]. This works them out now; the original reads
-    ///   the two values its lot statistics last stored, which
-    ///   [`House::with_values`] takes ([`Stored`]).
+    /// - Furnishings (0x416851) weighs the lot's values as the simulation
+    ///   keeps them ([`Values::stored`]): see [`furnishings`].
     ///
     /// Not ported: Layout (its routing history, lot +0x3c to +0x64).
     pub fn read(world: &World, tuning: &Tuning, kinds: &Kinds) -> Self {
-        Self::with_values(
-            world,
-            tuning,
-            kinds,
-            Values::read(world, kinds, &tuning.prices),
-        )
-    }
-
-    /// [`House::read`], with the lot's values as stored (`values`, from
-    /// [`Stored::values`]) rather than worked out now, as the original's
-    /// panel reads them (0x416851).
-    pub fn with_values(world: &World, tuning: &Tuning, kinds: &Kinds, values: Values) -> Self {
         let mut house = Self::default();
         for room in world.rooms.rooms.values() {
             if room.outdoors || !room.dirty {
@@ -386,7 +368,7 @@ impl House {
         };
         house.ratings[YARD] = Some(yard.to_i32_truncate());
         house.ratings[UPKEEP] = Some(upkeep(world, tuning, kinds));
-        house.values = values;
+        house.values = Values::stored(world);
         house.ratings[FURNISHINGS] = Some(furnishings(house.values, &tuning.furnishings));
         house
     }
@@ -562,58 +544,15 @@ impl Prices {
     }
 }
 
-/// The lot's two values as the original keeps them for the house panel
-/// (simulator +0xa0 and +0xa4). Its lot statistics (0x416085) store them
-/// at the load (0x41621f), at the day's turn (0x41647e, signal 0xdc), on
-/// leaving build or buy mode (0x4cea9e, through 0x416534) and from
-/// 0x50206e (through 0x416558, when word +0x36 of the record at the lot's
-/// +0x20 is not 0), and the panel reads what was stored last (0x416851):
-/// an object that breaks or is mended shows at the next of those.
-///
-/// The host stores them when the lot is loaded and again whenever the
-/// day has turned ([`Stored::stale`]). It looks once a frame, so a day's
-/// turn is stored after the frame's last update rather than at the
-/// update that turned it: a known difference, not the original's
-/// behaviour. Neither build nor buy mode is ported, and what reaches
-/// 0x50206e was not read, so those passes are not made.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Stored {
-    values: Values,
-    /// The days played (global 28) when they were stored; none before.
-    day: Option<i16>,
-}
-
-/// Global 28, the days played, which the day's turn counts up.
-const DAYS_PLAYED: usize = 28;
-
-impl Stored {
-    /// Whether the values were never stored, or the day has turned since.
-    #[must_use]
-    pub fn stale(&self, world: &World) -> bool {
-        self.day != Some(days_played(world))
-    }
-
-    /// Works the values out from `world` ([`Values::read`]) and keeps
-    /// them, with the day.
-    pub fn store(&mut self, world: &World, kinds: &Kinds, prices: &Prices) {
-        self.values = Values::read(world, kinds, prices);
-        self.day = Some(days_played(world));
-    }
-
-    /// The values last stored.
-    #[must_use]
-    pub fn values(&self) -> Values {
-        self.values
-    }
-}
-
-fn days_played(world: &World) -> i16 {
-    world.globals.get(DAYS_PLAYED).copied().unwrap_or(0)
-}
-
-/// The lot's two values, as the lot's statistics work them out (0x416085)
-/// and keep them in the simulator (+0xa0 and +0xa4, 0x416118 and
-/// 0x416126).
+/// The lot's two values, which the Furnishings rating weighs. The
+/// original keeps them in its simulator (+0xa0 and +0xa4, saved and
+/// loaded in `SIMI`, 0x46d1ad and 0x46d1bd), and the panel reads them
+/// there (0x41685f, 0x41687e). Its lot statistics (0x416085) work them
+/// out ([`Values::read`]) and store them (0x416118, 0x416126): on going
+/// to live mode (0x4cea9e through 0x416534), so after a load, at the
+/// day's turn (0x41647e, signal 0xdc), from the budget dialog (0x50206e
+/// through 0x416558) and before the house is written (0x41621f). So an
+/// object that breaks or is mended shows at the next of those.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Values {
     /// What the objects that are valued are worth.
@@ -635,6 +574,25 @@ const PERSON: i16 = 2;
 const SKIPPED: i16 = 7;
 
 impl Values {
+    /// The values as the simulation keeps them
+    /// ([`sims_sim::Budget::objects_value`] and `architecture_value`),
+    /// which the panel reads as the original's does (0x416851). A
+    /// checkpoint keeps them with the rest of the world.
+    ///
+    /// The simulation stores the objects' value at the day's turn (in
+    /// `sims-vm`) and neither value elsewhere: the architecture's stays
+    /// what the house was saved with, and going to live mode stores
+    /// neither, so a house saved with values that are out of date shows
+    /// them until the day turns. A known gap in the simulation, not the
+    /// original's behaviour; [`Values::read`] is the sum it would store.
+    #[must_use]
+    pub fn stored(world: &World) -> Self {
+        Self {
+            objects: world.budget.objects_value,
+            architecture: world.budget.architecture_value,
+        }
+    }
+
     /// The object scan (0x444cb9) and the architecture's value (0x47b006),
     /// as the lot's statistics add them up. The objects are read in the
     /// lot's order, each in 32-bit sums that wrap:
@@ -659,6 +617,10 @@ impl Values {
     /// the family's flags, and puts right a slot word of 0 on an object it
     /// asks (0x43264c); the simulation keeps those, and nothing here
     /// changes the world. A type [`Kinds`] has not read is passed over.
+    ///
+    /// The panel does not run this: it reads the stored values
+    /// ([`Values::stored`]). This is the sum for the simulation to store
+    /// when it takes the architecture's value over.
     pub fn read(world: &World, kinds: &Kinds, prices: &Prices) -> Self {
         let mut values = Self {
             objects: 0,
@@ -1432,39 +1394,20 @@ mod tests {
     }
 
     #[test]
-    fn the_stored_values_change_only_when_the_day_turns() {
+    fn the_panel_weighs_the_values_the_simulation_keeps() {
         let mut world = World::empty();
-        world.size = 10;
-        world.globals.resize(DAYS_PLAYED + 1, 0);
-        let kinds = Kinds {
-            types: BTreeMap::from([(
-                10,
-                Type {
-                    kind: 0,
-                    group: 0,
-                    build: Some(0),
-                },
-            )]),
-            ..Kinds::default()
-        };
-        let mut chair = object(1, 10, 0, 0);
-        chair.position = [5 * 16, 5 * 16, 1];
-        chair.data[VALUE] = 100;
-        world.objects.insert(1, chair);
-        world.order.push(1);
-        let prices = Prices::default();
-        let mut stored = Stored::default();
-        assert!(stored.stale(&world));
-        stored.store(&world, &kinds, &prices);
-        assert_eq!(stored.values().objects, 100);
-        // It breaks: the stored value stays until the day turns.
-        world.objects.get_mut(&1).unwrap().data[BROKEN] = 1;
-        assert!(!stored.stale(&world));
-        assert_eq!(stored.values().objects, 100);
-        world.globals[DAYS_PLAYED] += 1;
-        assert!(stored.stale(&world));
-        stored.store(&world, &kinds, &prices);
-        assert_eq!(stored.values().objects, 50);
+        world.budget.objects_value = 2;
+        world.budget.architecture_value = 300;
+        let tuning = Tuning::from_tables(Some(&strings(&["", "(0;0) (200;100)"])), None);
+        let house = House::read(&world, &tuning, &Kinds::default());
+        assert_eq!(
+            house.values,
+            Values {
+                objects: 2,
+                architecture: 300,
+            }
+        );
+        assert_eq!(house.ratings[FURNISHINGS], Some(75));
     }
 
     #[test]
