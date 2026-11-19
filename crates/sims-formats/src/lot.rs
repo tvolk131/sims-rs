@@ -191,8 +191,14 @@ impl ObjectTypes {
 /// names the types the import made. The house read loads it (0x43ddc2,
 /// 0x41578e) and passes every type-table GUID through
 /// [`GuidTable::translate`] before looking up its definition (0x43a6fb).
+///
+/// The read (0x4158a4, through the stream at 0x464ec1) takes the byte
+/// order from the payload's first byte: nonzero means each number is
+/// stored big-endian (0x464970 swaps it). It skips the version and the
+/// "batG" tag without checking them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuidTable {
+    /// The header's version, in the payload's byte order. Not checked.
     pub version: u32,
     /// Old GUID, new GUID, in the file's order (0x4158a4: a 32-bit count,
     /// then the pairs).
@@ -202,12 +208,18 @@ pub struct GuidTable {
 impl GuidTable {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
-        let version = header(&mut r, b"batG")?;
-        let count = r.u32()? as usize;
+        let swapped = r.take(4)?[0] != 0;
+        let mut number = |r: &mut Reader<'_>| -> Result<u32> {
+            let n = r.u32()?;
+            Ok(if swapped { n.swap_bytes() } else { n })
+        };
+        let version = number(&mut r)?;
+        r.take(4)?;
+        let count = number(&mut r)? as usize;
         r.count(count, 8)?;
         let mut pairs = Vec::with_capacity(count);
         for _ in 0..count {
-            pairs.push((r.u32()?, r.u32()?));
+            pairs.push((number(&mut r)?, number(&mut r)?));
         }
         Ok(Self { version, pairs })
     }
@@ -260,16 +272,25 @@ mod guid_table_tests {
     }
 
     #[test]
-    fn a_short_or_mislabelled_table_is_an_error() {
+    fn the_first_byte_picks_the_byte_order_and_the_tag_is_not_checked() {
+        // 0x464ec1 takes the order from byte 0; 0x464970 swaps each number.
+        let mut b = vec![1, 0, 0, 0, 0, 0, 0, 7, b'x', b'x', b'x', b'x'];
+        b.extend(1u32.to_be_bytes());
+        b.extend(0x1122_3344u32.to_be_bytes());
+        b.extend(0x5566_7788u32.to_be_bytes());
+        let t = GuidTable::parse(&b).unwrap();
+        assert_eq!((t.version, t.pairs), (7, vec![(0x1122_3344, 0x5566_7788)]));
+    }
+
+    #[test]
+    fn a_short_table_is_an_error() {
         let mut b = table(&[(1, 2)]);
         b.truncate(b.len() - 1);
         assert!(GuidTable::parse(&b).is_err());
         let mut b = table(&[]);
-        b[8] = b'x';
-        assert!(GuidTable::parse(&b).is_err());
-        let mut b = table(&[]);
         b[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(GuidTable::parse(&b).is_err());
+        assert!(GuidTable::parse(&b[..10]).is_err());
     }
 }
 

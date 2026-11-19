@@ -71,18 +71,23 @@ neighbor pointer) is not settled. After the members it:
    updated family file into the house's path (0x4299ff);
 5. saves the neighborhood (0x4252cc).
 
-The clone draws each new GUID from the timer and the C runtime's generator
-(0x4725d5), so two runs of the original give different files. A port can
-match a given run only when it is fed that run's draws. That is how 6b will
-be checked against the snapshot.
+The clone draws each new GUID as the timer's low 16 bits shifted up,
+exclusive-or the C runtime's random number (0x4725d5, 0x4725ff). Two runs
+of the original usually give different GUIDs. A port matches a given run
+when it has the same timer readings and generator state, or when it is
+given the GUIDs that run drew. 6b will be checked against the snapshot the
+second way.
 
 ## Order of work
 
 - **6a.** Read the `Gtab` (done with this entry). Then boot House 69 of the
   first neighborhood in strict mode and compare it with track 2's
   1000-tick recording, porting what the run reaches.
-- **6b.** Port the import: the family-file reader (#252), the import's data
-  step, then the import at neighborhood open.
+- **6b.** Port the import: the family-file reader (#252, merged), the
+  import's data step (#257), then the import at neighborhood open.
+
+This replaces the roadmap's plan for 6a, which imported into the second
+neighborhood first. The coordinator updates the roadmap.
 
 What would reopen this: the original failing to load House 69 of the first
 neighborhood, or the recording showing it imports something on that load.
