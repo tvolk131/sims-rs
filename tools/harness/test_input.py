@@ -835,8 +835,29 @@ class ReviewFindingsTest(RunnerBase):
         self.assertFalse(self.rows('taken'))  # still waiting for the call to return
         self.queue_result(r, action, eax=0x100)  # al is zero
         self.tick_until(r, lambda: r.finished)
-        self.assertIn('neither', r.failed)
+        self.assertIn('did not queue', r.failed)
         self.assertFalse(self.rows('taken'))
+        self.assertEqual([(q['accepted'], q['uid']) for q in self.rows('queue_result')], [(False, None)])
+
+    def test_a_push_whose_return_is_never_seen_says_so(self):
+        r = self.runner('expect-queued 21 173 within 3')
+        self.push(r, 8213)
+        self.tick_until(r, lambda: r.finished)
+        self.assertIn('never seen to return', r.failed)
+
+    def test_the_field_match_leaves_another_pushs_uid(self):
+        r = self.runner('expect-queued 21 173 within 3\nexpect-queued 21 173 within 3')
+        first = self.push(r, 8213)
+        r.on_queue_result(self.g.m, dict(eax=1, ebp=0x80000))
+        r.pushes[-1]['uid'] = None  # as when the uid could not be read
+        second = self.push(r, 8213, frame=0x80100)
+        self.queue_result(r, second, 7, frame=0x80100)
+        self.put_action(self.person + inp.ACTIVE_ACTION, self.person, self.bench, routine=8213, uid=7)
+        self.tick(r, 2)
+        self.assertFalse(self.rows('taken'))  # uid 7 is the second push's
+        self.put_action(self.person + inp.ACTIVE_ACTION, self.person, self.bench, routine=8213, uid=6)
+        self.tick_until(r, lambda: self.rows('taken'))
+        self.assertEqual(self.rows('taken')[0]['uid'], 6)
 
     def test_a_push_that_keeps_its_old_uid_cannot_take_that_action(self):
         r = self.runner('expect-queued 21 18 within 3')

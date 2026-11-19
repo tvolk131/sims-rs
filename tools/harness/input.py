@@ -613,9 +613,14 @@ class Runner:
             try:
                 # 0x45d5d5 copies a social's converted action back into the
                 # pie entry for the person who made the push, including its uid.
+                # (An action flagged to go first, +0x40 bit 1, takes 0x45d33c
+                # instead, which does not copy back: if a social ever does, its
+                # uid here is one nothing holds, and expect-queued says so.)
                 push['uid'] = m.word(push['action_pointer'] + 0x3c) or None
             except Exception:  # the return may be readable even when the uid is not
                 pass
+        self.write(kind='queue_result', person=push['person'], accepted=push['accepted'], uid=push['uid'],
+                   pushed_update=push['update'])
 
     def on_dialog(self, kind, update):
         """A dialog stop. A modal dialog holds the lot update it shows in, so
@@ -1040,13 +1045,17 @@ class Runner:
                             target is None or r['action']['target'] == target):
                         push, self.push_cursor = r, i + 1
                         break
+            if push and push.get('accepted') is False:
+                raise StepFailed(f'the game did not queue the action pushed on {person} (its queue call returned 0)')
             p = push and push.get('accepted') and find_object(self.m, self.sim, person)
             if p:
                 queue, active = read_queue(self.m, p), self.m.action(p + ACTIVE_ACTION)
                 uid = push['uid']
+                # The uids other pushes were given are theirs, even to the field match.
+                others = {q.get('uid') for q in self.pushes if q is not push and q.get('uid')}
                 for where, action in [('active', active)] + [('queue', a) for a in queue]:
                     held_uid = action['uid']
-                    if held_uid in self.taken_uids:
+                    if held_uid in self.taken_uids or (uid is None and held_uid in others):
                         continue
                     if uid is None:
                         matches = same_action(action, push['action'])
@@ -1060,8 +1069,11 @@ class Runner:
                                    pushed_update=push['update'], active=active, queue=queue)
                         return
             if self.update - start >= within:
+                if push and 'accepted' not in push:
+                    raise StepFailed(f'the queue call for the action pushed on {person} was never seen to return '
+                                     f'within {within} updates')
                 if push:
-                    raise StepFailed(f'the action pushed on {person} was in neither its queue nor its active '
-                                     f'action within {within} updates')
+                    raise StepFailed(f'the action pushed on {person} (uid {push["uid"]}) was in neither its queue '
+                                     f'nor its active action within {within} updates')
                 raise StepFailed(f'no action was queued on {person} within {within} updates')
             yield Updates(1)
