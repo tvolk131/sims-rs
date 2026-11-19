@@ -483,11 +483,9 @@ impl Lot {
             // neighborhood's people, the type attributes the neighborhood
             // saved and the two indicator objects; and the skeleton files
             // the game has read by then.
-            world.skeleton_files.extend(
-                crate::objects::READ_BEFORE_THE_FIRST_LOAD
-                    .iter()
-                    .map(|file| file.to_string()),
-            );
+            world
+                .skeleton_files
+                .extend(crate::objects::read_before_the_first_load(&program.people));
             world.read_neighbors(
                 &neighborhood,
                 &sims_sim::neighbors::registry(&index, &catalog),

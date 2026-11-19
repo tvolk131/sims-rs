@@ -525,16 +525,37 @@ fn construct_person(
 /// (0x598da3). Had the first cat read its file there, that update would
 /// take two (0x598af7 builds the file's one skeleton, then the copy). The
 /// stream at the entry of the first lot update is 7,212 draws on from its
-/// initial state 1, which the load's own reads (the adult and child files
-/// and the three Goths) account for. So the file was read before the
-/// load without drawing from the stream the simulation draws from (the C
-/// runtime keeps one per thread, 0x63e2b3 +0x14). Where (the avatar
-/// registry's scan at startup, 0x59f844, reads files through 0x59f087,
-/// whose skeleton records go through 0x598af7) is **unverified**, and so
-/// is the rest of the list: the same folder of `ExpansionShared.far`
+/// initial state 1, which the load's own work accounts for (the adult and
+/// child files, the three Goths' copies and default interests, and the two
+/// indicators). So the file was read without drawing from the stream the
+/// simulation draws from (the C runtime keeps one per thread, 0x63e2b3
+/// +0x14). That it was read before the load, and not between the load and
+/// the first cat, is **unverified**; so is where (the avatar registry's
+/// scan at startup, 0x59f844, reads files through 0x59f087, whose
+/// skeleton records go through 0x598af7), and so is the rest of the
+/// list: the same folder of `ExpansionShared.far`
 /// holds the "dog" and "effects1" skeletons, which no capture has made.
 pub const READ_BEFORE_THE_FIRST_LOAD: &[&str] =
     &["ExpansionShared/ExpansionShared.far/Skeletons\\kat_skeleton.cmx.bcf"];
+
+/// The files of [`READ_BEFORE_THE_FIRST_LOAD`] as `people` names them.
+/// A skeleton's file is its location in the install, spelled as it is on
+/// disk (`sims_content::Resource::location`), so a listed file is matched
+/// without regard to case. A listed file no person type's skeleton comes
+/// from is left out: no person made later would read it.
+pub fn read_before_the_first_load(people: &People) -> BTreeSet<String> {
+    people
+        .skeletons
+        .values()
+        .map(|skeleton| &skeleton.file)
+        .filter(|file| {
+            READ_BEFORE_THE_FIRST_LOAD
+                .iter()
+                .any(|listed| listed.eq_ignore_ascii_case(file))
+        })
+        .cloned()
+        .collect()
+}
 
 /// A person's skeleton, as far as building it draws random numbers (in
 /// 0x588dcb): the skeleton's file is read if the game has not read it yet

@@ -803,10 +803,11 @@ fn strict_mode_runs_the_goth_houses_whole_day() {
     assert_eq!(digest(&format_29_bytes(lot.world())), TICK_3603_29);
     // Each update to tick 4154 leaves the three random streams as track
     // 2's recording `goth-day-20261115` has them. At 4155 the recording's
-    // global stream moves, and not here: that is the censor mosaic drawn
-    // over person 18 (0x4ac707 → 0x4ac301), which the strict boot does not
-    // draw. The lot and C runtime streams go on matching under the
-    // recording's frames (see the test after this one). These are the
+    // global stream moves, and not here: taken to be the censor mosaic
+    // drawn over person 18 (0x4ac707 → 0x4ac301), which the strict boot
+    // does not draw (unverified). The lot and C runtime streams go on
+    // matching under frames fitted to the recording (see the test after
+    // this one). These are the
     // recording's values after 3603.
     let streams = |lot: &Lot| {
         let world = lot.world();
@@ -889,13 +890,14 @@ fn strict_mode_runs_the_goth_houses_whole_day() {
     assert_eq!((date(&lot), clock(&lot)), ((17, 6, 1997, 1), (6, 30, 44)));
 }
 
-/// The Goth house under the frames the recording `goth-day-20261115`
-/// drew: one after each of the first three updates and after every 30th
-/// from 33 through 4143, then after every 30th from 4155. The recording's
-/// frames drift against its updates (see
-/// `docs/decisions/20261118-goth-day-frame-schedule.md`); these two
-/// stretches are the ones its streams fix. A frame counts the rooms, and
-/// which updates find them counted shows in the lot stream (at 5490 here).
+/// The Goth house under frames fitted to the recording
+/// `goth-day-20261115`, which watched no frames: one after each of the
+/// first three updates and after every 30th from 33 through 4143, then
+/// after every 30th from 4154. The recording's frames drift against its
+/// updates (see `docs/decisions/20261118-goth-day-frame-schedule.md`);
+/// these two stretches are the ones its streams constrain, and the
+/// schedule is unverified. A frame counts the rooms, and which updates
+/// find them counted shows in the lot stream (at 5490 here).
 #[test]
 fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
@@ -908,7 +910,7 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
     after.extend((33..=4143).step_by(30));
     let frames = Frames {
         after,
-        every: vec![(4155, 30)],
+        every: vec![(4154, 30)],
     };
     let mut lot = Lot::load(&root, &house, &[3, 3], frames).unwrap();
     let streams = |lot: &Lot| {
@@ -920,15 +922,16 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
         )
     };
     // The recording's lot and C runtime streams after each update named.
-    // Its global stream is 270,289,136 through 4154 and moves from 4155
-    // with the censor mosaic, which is not drawn here; nothing in the
-    // lot's update draws from it all day, so here it stays.
+    // Its global stream is 270,289,136 through 4154 and moves from 4155,
+    // taken to be the censor mosaic, which is not drawn here (unverified;
+    // `docs/decisions/20261118-goth-day-global-draws-are-censor-mosaic.md`).
+    // Nothing the port runs draws from it, so here it stays.
     let recorded: [(u32, u32, u32); 6] = [
         (4154, 1_611_871_021, 2_930_731_800),
         (5490, 629_487_932, 3_377_018_407),
         // At 6756 the recording's C runtime stream moves 1,920 draws as
-        // a cat's skeleton is built; the kat skeleton file was read before
-        // the load (`sims_vm::objects::READ_BEFORE_THE_FIRST_LOAD`).
+        // a cat's skeleton is built, one skeleton's worth: the kat file was
+        // read before (`sims_vm::READ_BEFORE_THE_FIRST_LOAD`).
         (6756, 1_545_421_094, 3_332_047_783),
         (10358, 2_810_847_759, 2_767_048_999),
         (13960, 2_153_618_513, 1_658_190_486),
@@ -945,9 +948,15 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
     // Tick 16112: object 26's Burn moves person 18 to its tile's centre,
     // which resets an animator playing "A2O-panic-loop2". Removing it can
     // fade it out (0x592878), which is not ported.
-    let stopped = lot.step().unwrap_err().to_string();
-    for part in ["16112", "0x592878"] {
-        assert!(stopped.contains(part), "{stopped}");
+    match lot.step().unwrap_err() {
+        StepError::Tick {
+            tick: 16112, error, ..
+        } => {
+            for part in ["object 26", "unsupported: Burn", "0x592878"] {
+                assert!(error.contains(part), "{error}");
+            }
+        }
+        other => panic!("{other}"),
     }
 }
 

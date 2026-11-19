@@ -25,8 +25,8 @@ phases that matched the recording through the window were kept
 | 2110 | 20 to 29 |
 | 2920 | 11 to 18 |
 | 3370 | 11 to 20 |
-| 4155 | 15 (the censor mosaic's global draws) |
-| 5490 | 15 matches, 3 (the default) does not (the lot stream; other phases not tried) |
+| 4155 | 14 (the censor mosaic's global draws, taken to be drawn in frames; a row is saved before the frame after its update, so the draws in row 4155 come from the frame after 4154) |
+| 5490 | 14 and 15 match, 3 (the default) does not (the lot stream; other phases not tried) |
 
 So the original's frames are not every 30 updates: the phase moves
 backwards and forwards over the day, as the main loop's timing allows.
@@ -35,7 +35,8 @@ The frame schedule is an input of a recording, like the pointer.
 **What the port does.** Nothing changes in the strict boot, which keeps
 the default schedule. The new test
 `the_goth_day_under_the_recordings_frames_keeps_its_streams` uses phase 3
-through 4143 and phase 15 from 4155, the two stretches the streams fix,
+through 4143 and phase 14 from 4154, the two stretches the streams
+constrain,
 and finds the lot and C runtime streams the recording's at 4154, 5490,
 6756, 10358, 13960 and 16111. The windows between (902 to 3370) change
 motives and flags but no stream, so the test does not need their phases.
@@ -46,4 +47,6 @@ draw guard (`--watch frame=0x6f0f48:1`: set at 0x4d1b59, cleared at
 replayed exactly.
 
 **Unverified.** The phases are fitted, not seen. A phase range means
-any of those phases matches in that window.
+any of those phases matches in that window. The fit runs the port, whose
+`Lot::step` gives the state after the frame that follows the update, so
+its phases are in the port's terms (`Frames::after`).
