@@ -23,9 +23,13 @@ entry's finding still holds: turning the camera does not move the sun.
 
 **Nothing else lights the grass.** The column drawer copies palette
 blocks straight to the screen (0x49da21), and the blades are drawn the
-same way (0x49d8fb). Ours had applied room 0's light to the grass
-(#68). By day that light is full, so this changes only dusk, night and
-dawn.
+same way (0x49d8fb). Ours had applied the light of the room at each
+tile's middle to its grass (#68). By day room 0's light is full, so open
+lawn changes only at dusk, night and dawn. A tile split by a diagonal
+wall is the exception: its middle lies on the wall and can fall in the
+indoor room, so the grass in its outdoor half was drawn in that room's
+light, a dark dotted line along the foot of the Goth house's bay window.
+That line is now the lawn's green.
 
 **After dark, nothing is drawn brighter than 0.8.** On the same signal,
 the lot sets the brightest a lit tile may be drawn: 1 by day and the
@@ -48,7 +52,10 @@ rotation 0, walls down), pixels within 8 of the original:
 Most of what is left is the original's interface overlays, the sleeping
 Sim's head and a few cut-wall trims. No room in this shot is brighter
 than 0.8, so the cap changes nothing in it. The pinned renders are all
-by day and do not change.
+by day. In the far and medium views, and the near view at rotation 3,
+the bay window's dotted line changes (42 pixels at far zoom, rotation 0,
+and 83 at medium). One flower pixel also changes by one step at medium
+zoom, likely a blended edge over grass that changed.
 
 **Unverified:**
 - By day ours keeps the constructor's float, 0x3ea0d973 (0x49c187). The

@@ -248,11 +248,6 @@ impl Painter<'_> {
         i32::from(h[corner]) * 16
     }
 
-    /// The light at a fine position on a level (0 or 1).
-    fn light(&self, level: usize, fine: [i32; 2]) -> Light {
-        Light::from_byte(self.lot.light_at(level, fine), self.lot.brightest())
-    }
-
     /// The lamps whose pools reach tile (`x`, `y`) of a level, as view
     /// offsets from the lamp to the tile: those of the tile's record
     /// within the pool map's reach each way (0x4c8049).
