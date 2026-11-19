@@ -150,10 +150,23 @@ fn flag_0x4_runs_a_new_visitors_init_visitor_tree_at_once() {
     let (mut fx, _, _) = visitors();
     assert_eq!(create(&mut fx, WIDGET, 6, 0, LAMP as i16), Ok(true));
     assert_eq!(fx.world.globals[SEEN], 0);
-    // Not for a person that is not a visitor (a residential lot).
+    // On a residential lot too: the factory's signal 0xe2 works out
+    // again who is a visitor (0x42a2b4), and a person whose type is not
+    // one of the selected family's members becomes one.
     let (mut fx, _, record) = visitors();
     let lot = fx.world.globals[10];
     fx.program.zoning.insert(lot, 1);
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 0, 6, FROM_RECORD, record), Ok(true));
+    let id = new_object(&fx, &before);
+    assert_eq!(fx.world.objects[&id].person.as_ref().unwrap().data[32], 1);
+    assert_eq!(fx.world.globals[SEEN], id as i16);
+    // Not for a person that is not a visitor: one of the family's
+    // members, on a residential lot.
+    let (mut fx, _, record) = visitors();
+    let lot = fx.world.globals[10];
+    fx.program.zoning.insert(lot, 1);
+    fx.world.families[0].members.push(WIDGET);
     let before = ids(&fx);
     assert_eq!(create(&mut fx, 0, 6, FROM_RECORD, record), Ok(true));
     let id = new_object(&fx, &before);
