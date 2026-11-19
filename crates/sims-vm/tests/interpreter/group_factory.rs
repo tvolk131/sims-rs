@@ -335,3 +335,60 @@ fn a_group_removed_before_the_rooms_are_worked_out_fails_loudly() {
     );
     assert_eq!(fx.world.hash(), before.hash());
 }
+
+#[test]
+fn a_group_whose_lead_is_a_person_type_works_out_again_who_is_a_visitor() {
+    // The factory's signal 0xe2 names the lead (0x440ed7), and the lot
+    // runs the visitor pass when the lead's definition is a person's
+    // (type 2, 0x4163f7). On a residential lot the Sim, a member of the
+    // family global 9 names, gets person word 32 0.
+    let made = |lead_kind: i16| {
+        let mut fx = Fixture::new();
+        let file = group(&mut fx);
+        fx.program
+            .libraries
+            .get_mut(&file)
+            .unwrap()
+            .definitions
+            .get_mut(&130)
+            .unwrap()[9] = lead_kind;
+        let lot = fx.world.globals[10];
+        fx.program.zoning.insert(lot, 1);
+        let sim = fx.world.objects.get_mut(&SIM).unwrap();
+        sim.person.as_mut().unwrap().data[32] = 2;
+        assert_eq!(create(&mut fx, MASTER), Ok(3));
+        fx.world.objects[&SIM].person.as_ref().unwrap().data[32]
+    };
+    assert_eq!(made(2), 0);
+    // A lead of any other type leaves it.
+    assert_eq!(made(4), 2);
+    // With nobody in the person vector the pass returns before it reads
+    // the family (0x42a2cc), so global 9 at 0 does not fail. The group's
+    // tiles do not join the vector.
+    let mut fx = Fixture::new();
+    let file = group(&mut fx);
+    fx.program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .definitions
+        .get_mut(&130)
+        .unwrap()[9] = 2;
+    fx.world.people.clear();
+    fx.world.globals[9] = 0;
+    assert_eq!(create(&mut fx, MASTER), Ok(3));
+    assert!(fx.world.people.is_empty());
+    // With a person, it fails loudly.
+    let mut fx = Fixture::new();
+    let file = group(&mut fx);
+    fx.program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .definitions
+        .get_mut(&130)
+        .unwrap()[9] = 2;
+    fx.world.globals[9] = 0;
+    let fault = create(&mut fx, MASTER).unwrap_err();
+    assert!(fault.to_string().contains("0x42a2b4"), "{fault}");
+}
