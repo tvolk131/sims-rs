@@ -215,7 +215,8 @@ impl Interpreter<'_> {
     ///
     /// **Unverified**: an object whose record has no scheduler word keeps
     /// the one registration gave it; and that the game has read no
-    /// skeleton file before its first load.
+    /// skeleton file before its first load but those of
+    /// [`READ_BEFORE_THE_FIRST_LOAD`].
     pub fn read_objects(
         &self,
         world: &mut World,
@@ -514,6 +515,26 @@ fn construct_person(
     }
     Ok(())
 }
+
+/// The skeleton files the game has read before it loads its first house,
+/// so that a person of theirs made later builds only its own copy.
+///
+/// The Goth day (`goth-day-20261115`) makes a cat ("kat" skeleton) at
+/// updates 6756, 10358, 17562 and 24719, and each time the C runtime's
+/// stream moves by 1,920 draws: one skeleton's worth, its own copy
+/// (0x598da3). Had the first cat read its file there, that update would
+/// take two (0x598af7 builds the file's one skeleton, then the copy). The
+/// stream at the entry of the first lot update is 7,212 draws on from its
+/// initial state 1, which the load's own reads (the adult and child files
+/// and the three Goths) account for. So the file was read before the
+/// load without drawing from the stream the simulation draws from (the C
+/// runtime keeps one per thread, 0x63e2b3 +0x14). Where (the avatar
+/// registry's scan at startup, 0x59f844, reads files through 0x59f087,
+/// whose skeleton records go through 0x598af7) is **unverified**, and so
+/// is the rest of the list: the same folder of `ExpansionShared.far`
+/// holds the "dog" and "effects1" skeletons, which no capture has made.
+pub const READ_BEFORE_THE_FIRST_LOAD: &[&str] =
+    &["ExpansionShared/ExpansionShared.far/Skeletons\\kat_skeleton.cmx.bcf"];
 
 /// A person's skeleton, as far as building it draws random numbers (in
 /// 0x588dcb): the skeleton's file is read if the game has not read it yet
