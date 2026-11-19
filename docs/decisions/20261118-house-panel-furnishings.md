@@ -123,10 +123,12 @@ No screenshot of the panel was compared.
     and looks resources up as if there were none (`sims_formats::iff`,
     from the frozen prototype; `resource_order` reports the error),
     where the original finds the resource by the map's ID (0x41bbfb)
-    and compares only the chunk's type (0x41d33e). A price table under
-    such an entry is then found by its chunk header's ID, as the lookup
-    by ID alone ignores the flags' high byte, so it is missed only when
-    that ID differs from the map's. No file of the install has one: its 3,583 mapped
+    and compares only the chunk's type (0x41d33e), reading it by the
+    map's flags (byte order at 0x41d3a7). A price table under such an
+    entry is then found here, if at all, by its chunk header's ID and
+    read by its header's flags: it can be missed, read in the other
+    byte order and fail to parse, or dropped as deleted (header flags
+    0x0004). No file of the install has one: its 3,583 mapped
     files, FAR members and family files included, list 163,797 entries,
     each with its chunk's type, ID and flags' high byte.
 - **The prices by table:**
@@ -151,12 +153,13 @@ No screenshot of the panel was compared.
     hashes the ID sign-extended (0x41de42 to 0x41de4e), so they share a
     bucket, puts each at the head of its bucket (0x41de8f, 0x41de94)
     and its lookup walks the whole table (0x5807c2, 0x41ddef;
-    `Iff::get_by_id`). **Not ported:** past 192 resources the table
-    grows to 389 buckets and its rehash reverses each chain (0x41df8d
+    `Iff::get_by_id`). **Not ported:** each type has its own table
+    (0x41bbdc to 0x41bbef), which grows from 193 to 389 buckets when a
+    194th resource of the type is inserted (0x41c016 to 0x41c01d,
+    0x41df26 to 0x41df2f), and its rehash reverses each chain (0x41df8d
     to 0x41dfb9), so there the first of tables sharing an ID can win.
-    No `STR#` of the install shares an ID with another of its file
-    (3,782 files, FAR members included; 151 have more than 192
-    resources).
+    No `STR#` of the install shares an ID with another of its file, and
+    no file has 194 of them (3,782 files, FAR members included).
   - The built-in floors, keys 1 to 29: `STR#` 130 (0x4a01cb).
   - The built-in wall patterns, keys 0 to 30 and 248 to 255: `STR#` 131
     (0x4c4ee5). Key 0 and the high keys have no entry and cost 0.

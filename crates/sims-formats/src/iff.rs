@@ -248,11 +248,14 @@ impl Iff {
     /// (0x41de42 to 0x41de4e), so resources sharing an ID share a
     /// bucket, and put each at the head of its bucket as it was built
     /// (0x41de8f, 0x41de94): of resources sharing an ID, the last in
-    /// resource order. **Not ported:** the table grows from 193 to 389
-    /// buckets past 192 resources, and its rehash prepends each old
-    /// chain's nodes in turn (0x41df8d to 0x41dfb9), reversing them, so
-    /// there the first of resources sharing an ID can win. No `STR#` of
-    /// the install shares an ID with another of its file.
+    /// resource order. **Not ported:** each type has its own table
+    /// (0x41bbdc to 0x41bbef), which grows from 193 to 389 buckets when
+    /// a 194th resource of the type is inserted (its count plus one
+    /// against the buckets, 0x41c016 to 0x41c01d, 0x41df26 to 0x41df2f).
+    /// The rehash prepends each old chain's nodes in turn (0x41df8d to
+    /// 0x41dfb9), reversing them, so there the first of resources
+    /// sharing an ID can win. No `STR#` of the install shares an ID with
+    /// another of its file, and no file has that many.
     pub fn get_by_id(&self, tag: &[u8; 4], id: u16) -> Option<&Chunk> {
         self.resources
             .order
