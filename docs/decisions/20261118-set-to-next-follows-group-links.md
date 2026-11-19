@@ -5,9 +5,9 @@
 The Goth day (House05) matched track 2's recording `goth-day-20261115`
 through tick 2810 for every object's state, and through tick 3602 for the
 lot's random draws. At update 2811 the original and the port walk the
-school bus's tiles in different orders. Fixing that (section 1) makes
-every object's state match through tick 3340, the last update compared
-before the known random-draw divergence at tick 3603. The run after the
+school bus's tiles in different orders. With that fixed (section 1),
+every tenth update from 2820 to 3340 matches the recording, apart from
+the differences listed below. The run after the
 fix is a different one, and four more ports (sections 2 to 5) let strict
 mode run the whole day again.
 
@@ -74,12 +74,23 @@ the lot). If it is gone, the step becomes 19, or 20 if the route was
 under way (step 3). Then the run goes on to the byte +0x78 test
 (0x45ae9c) and the jump table at 0x45b9d4:
 
-- Step 20 (0x45b352) asks the animator to stop (0x589e2d). Until it
-  does, the run keeps the step and yields (0x45b9a0). Once it stops,
-  the next step is 19. No sound plays, unlike steps 10 and 11.
+- Step 20 (0x45b352) asks the animator to stop (0x589e2d). If it does
+  not, the run keeps the step and yields (0x45b9a0). Once it stops, the
+  next step is 19. No sound plays, unlike steps 10 and 11. The next run
+  tests the stack object again first, so if it is still lost, the saved
+  step 20 becomes 19, and the route fails without waiting any longer
+  for the animator.
 - Step 19 (0x45afc4) goes to step 7: the route fails.
 
-The end of the route reads nothing of the lost object.
+With byte +0x78 of the context clear, any step but 2 and 3 only sets it
+again (0x45aebb) and goes on. Steps 2 and 3 still fail loudly
+(0x45aea5). The end of the route reads nothing of the lost object.
+
+The lost test uses the port's `on_lot`, which takes the lot as 64 tiles
+across. 0x4325b5 calls 0x422632, which tests against the lot's own size
+(lot +0x10). The two differ only on a lot smaller than 64 tiles, for an
+object standing between its edge and the arrays' edge. `on_lot` is
+shared by every placement, so that fix is left for its own change.
 
 **5. A route's end cancels the asked person's running action
 (0x45d617).** At tick 24605 object 28's route ends while the person it
@@ -89,8 +100,10 @@ action, that is the player's cancel of a running action:
 
 - person word 33 becomes 0;
 - the action's flag 0x100 is set;
-- unless the person would be interrupted anyway, its own interaction 33
-  is queued.
+- unless the person would be interrupted anyway (0x45d7c0), an action
+  with menu number 33 is made (0x41f00e). It is queued (0x45d20b) only
+  if the person's own interaction table has an entry with that menu
+  number (0x41f0ff).
 
 `Machine::release_action` now runs `cancel::cancel_running` on a machine
 for the asked person. The method is the person's own, so it reads that

@@ -85,9 +85,15 @@
 //! - **19** and **20**, the stack object lost (0x45ae8d): on every run
 //!   after the first, a stack object that is gone or off the lot sends
 //!   the route to step 20 if it was under way (step 3), else to step 19.
-//!   Step 20 stops the animator (0x45b352, 0x589e2d), yielding until it
-//!   does, with no sound, and goes on to step 19; step 19 fails the
+//!   Step 20 asks the animator to stop (0x45b352, 0x589e2d), with no
+//!   sound: once it stops, the next step is 19; while it does not, the
+//!   run yields in step 20. The next run tests the stack object first,
+//!   so if it is still lost the saved step 20 becomes 19 and the route
+//!   fails without waiting for the animator any longer. Step 19 fails the
 //!   route: the next step is 7 (0x45afc4).
+//! - With byte +0x78 of the context clear, a run at any step but 2 or 3
+//!   only sets it again (0x45aebb); steps 2 and 3 fail loudly
+//!   (0x45aea5).
 //!
 //! The steps run one after another in a run until one yields or pushes a
 //! tree. Every run works on the person's last context. Its retry count
@@ -481,10 +487,17 @@ impl Machine<'_, '_> {
             };
         }
         if !ctx.byte_78 {
-            return Err(unsupported(
-                "0x45aea5",
-                "with byte +0x78 of its context clear",
-            ));
+            // 0x45aea5: steps 2 and 3 do more first (context +0x68, or
+            // step 15), which is not ported; every other step, the lost
+            // steps 19 and 20 among them, only sets the byte again
+            // (0x45aebb), written back with the context.
+            if matches!(state, PORTAL | UNDER_WAY) {
+                return Err(unsupported(
+                    "0x45aea5",
+                    &format!("at step {state} with byte +0x78 of its context clear"),
+                ));
+            }
+            ctx.byte_78 = true;
         }
         // The retry stage (+0x58) and the place of the last try (+0x60,
         // +0x64) are the run's own; they are written back when the run
@@ -912,9 +925,9 @@ impl Machine<'_, '_> {
                     state = FAILED;
                 }
                 LOST_UNDER_WAY => {
-                    // 0x45b352: the animator stops (0x589e2d), with no
-                    // sound; until it does, the run yields at this step
-                    // (0x45b9a0).
+                    // 0x45b352: the animator is asked to stop (0x589e2d),
+                    // with no sound; while it does not, the run yields at
+                    // this step (0x45b9a0).
                     if !ask_stop(self.world, me)? {
                         break;
                     }

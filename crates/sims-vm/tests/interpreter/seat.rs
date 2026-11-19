@@ -939,7 +939,7 @@ fn a_route_whose_stack_object_is_lost_fails() {
 }
 
 #[test]
-fn a_route_under_way_whose_stack_object_is_lost_stops_its_animator_first() {
+fn a_route_under_way_whose_stack_object_is_lost_asks_its_animator_to_stop() {
     // Step 3 goes to step 20 (0x45b352): the animator is asked to stop
     // (0x589e2d). One under way (arrival 1) does not, so the run yields
     // in step 20 and the request is kept.
@@ -950,11 +950,46 @@ fn a_route_under_way_whose_stack_object_is_lost_stops_its_animator_first() {
     assert_eq!(fx.world.objects[&me].stack[0].primitive_state, 20);
     assert!(fx.world.stops_asked.contains(&me));
     assert_eq!(fx.world.routing.routes[&me].contexts.len(), 1);
-    // Once it may stop, it stops and the route fails through step 19.
-    fx.world.animators.get_mut(&me).unwrap().arrival = 0;
+    // The next run tests the stack object first (0x45ae8d): still lost,
+    // the saved step 20 becomes 19, and the route fails without waiting
+    // for the animator, still under way.
     assert_eq!(turn(&mut fx, me), Ok(sims_vm::Status::Returned(false)));
-    assert_eq!(fx.world.animators[&me].state, 3);
+    assert_eq!(fx.world.animators[&me].arrival, 1);
     assert!(fx.world.routing.routes[&me].contexts.is_empty());
+}
+
+#[test]
+fn step_20_goes_on_to_fail_once_its_animator_stops() {
+    // A route saved in step 20 whose stack object is back: step 20 asks
+    // the animator, which may stop (arrival 0), stops it (its segment
+    // goes to -1) and goes on to step 19, which fails the route.
+    let (mut fx, me) = mid_route(20, 0);
+    fx.world.animators.get_mut(&me).unwrap().motion.segment = 5;
+    assert_eq!(turn(&mut fx, me), Ok(sims_vm::Status::Returned(false)));
+    assert_eq!(fx.world.animators[&me].motion.segment, -1);
+    assert_eq!(route_result(&fx, me), 1);
+    assert!(fx.world.routing.routes[&me].contexts.is_empty());
+}
+
+#[test]
+fn a_lost_route_sets_its_contexts_byte_0x78_again() {
+    // 0x45aebb: with byte +0x78 clear, any step but 2 and 3 sets it again
+    // and goes on; written back as step 20 yields.
+    let (mut fx, me) = mid_route(3, 1);
+    fx.world.objects.remove(&LAMP);
+    let route = fx.world.routing.routes.get_mut(&me).unwrap();
+    route.contexts[0].byte_78 = false;
+    assert_eq!(turn(&mut fx, me), Ok(sims_vm::Status::Yielded));
+    assert!(fx.world.routing.routes[&me].contexts[0].byte_78);
+    // Step 2 with the byte clear is not ported.
+    let (mut fx, me) = mid_route(2, 0);
+    let route = fx.world.routing.routes.get_mut(&me).unwrap();
+    route.contexts[0].byte_78 = false;
+    let result = turn(&mut fx, me);
+    assert!(
+        matches!(result, Err(ref fault) if format!("{fault}").contains("0x45aea5")),
+        "{result:?}"
+    );
 }
 
 /// Another person, whom the route of `mid_route` asked (context +0x80) to

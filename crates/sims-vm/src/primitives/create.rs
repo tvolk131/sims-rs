@@ -174,7 +174,9 @@ impl Machine<'_, '_> {
         };
         if !supported {
             return Err(Trap::Unsupported(format!(
-                "Create New Object Instance mode {mode} with flags {flags:#x}"
+                "Create New Object Instance mode {mode} with flags {flags:#x} (0x44e0c8: \
+                 the modes' jump table 0x44e92e, flag 0x2 at 0x44e88c, flag 0x40 at \
+                 0x44e56e)"
             )));
         }
         let guid = if flags & FROM_RECORD != 0 {
