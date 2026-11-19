@@ -50,7 +50,9 @@
 //! 0x44e877) a new person that is a visitor (person word 32, +0x5cc)
 //! runs the tree its file names "init visitor" at once
 //! (`Machine::finish_new`; 0x4021f2, 0x474afb). For any other object
-//! that does nothing.
+//! that does nothing. The factory has already worked out again who is a
+//! visitor (signal 0xe2, the visitor pass 0x42a2b4), so on a
+//! residential lot a new person who is not a member of the family is one.
 //!
 //! Flag 0x10 without flag 0x2 (0x44e8e1 to 0x44e90c), after "init
 //! visitor": if the new object's thread has a frame, the running object's
