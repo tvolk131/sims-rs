@@ -830,10 +830,11 @@ impl Machine<'_, '_> {
     /// does not.
     ///
     /// When the action is the person's running one, the original instead
-    /// lowers its priority and may queue the person's own interaction 0x21;
-    /// that fails loudly here. So does a function 4 that changes the queue.
-    /// The player's cancel ([`Interpreter::cancel`]) uses this for a queued
-    /// action and ports the running one's branch itself.
+    /// lowers its priority and may queue the person's own interaction 0x21
+    /// (0x45d617, [`crate::cancel::cancel_running`]), and the result is
+    /// true. A function 4 that changes the queue fails loudly. The
+    /// player's cancel ([`Interpreter::cancel`]) uses this for a queued
+    /// action and runs the running one's branch itself.
     ///
     /// [`Interpreter::cancel`]: crate::Interpreter::cancel
     pub(crate) fn release_action(&mut self, id: u16, uid: i32) -> Result<bool, Trap> {
@@ -844,10 +845,18 @@ impl Machine<'_, '_> {
             .and_then(|o| o.person.as_ref())
             .ok_or(Trap::native(0x1c, "object is not a person"))?;
         if person.active.uid == uid {
-            return Err(unsupported(
-                "0x45d617",
-                "ending while the person it asked to move is moving",
-            ));
+            // 0x45d617: the person's own method, so it reads the person's
+            // data, not the caller's.
+            if id == self.me {
+                crate::cancel::cancel_running(self, id)?;
+            } else {
+                let interpreter = self.interpreter();
+                crate::cancel::cancel_running(
+                    &mut interpreter.machine(self.world, id, 0, false),
+                    id,
+                )?;
+            }
+            return Ok(true);
         }
         let queue = person.queue.clone();
         let interpreter = self.interpreter();

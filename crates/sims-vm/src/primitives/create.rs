@@ -9,7 +9,7 @@
 //! Operands: the GUID (bytes 0..4), where the object goes (byte 4), flags
 //! (byte 5) and a local (byte 6). The jump table at 0x44e92e picks where
 //! the object goes; every mode then runs one common tail (0x44e4c5) that
-//! tests the place, makes the object and puts it there. Seven modes are
+//! tests the place, makes the object and puts it there. Eight modes are
 //! ported:
 //!
 //! - Mode 0 (0x44e1e6), with no flag or any of 0x1, 0x4, 0x8, 0x10 and
@@ -19,6 +19,13 @@
 //! - Mode 2 (0x44e22f), with no flag or any of 0x1, 0x4 and 0x10: the new
 //!   object goes into the running object's first container slot. See
 //!   `Machine::create_in_me`.
+//! - Mode 3 (0x44e34c), with no flag or any of 0x1, 0x4, 0x8, 0x10 and
+//!   0x20: the new object goes on the tile ahead of the stack object, one
+//!   tile in its facing, on its level, and only if that tile is in the
+//!   stack object's room. See `Machine::create_ahead_of_stack_object`.
+//!   Flags 0x19 are what the Goth house's tick 37803 runs (object 359,
+//!   tree 0x100a), which is **unverified**: the run has left track 2's
+//!   recording by then.
 //! - Mode 4 (0x44e3a2), with no flag or any of 0x1, 0x4 and 0x10: the new
 //!   object goes into the stack object's first container slot. See
 //!   `Machine::create_in_stack_object`.
@@ -154,7 +161,7 @@ impl Machine<'_, '_> {
                 flags & !(NOT_BESIDE_ITS_TYPE | FACE_AS_STACK_OBJECT | FROM_RECORD | TEMP_0_TO_NEW)
                     == 0
             }
-            0 | 5 | 8 | 9 => {
+            0 | 3 | 5 | 8 | 9 => {
                 flags
                     & !(NOT_BESIDE_ITS_TYPE
                         | ON_A_FREE_TILE
@@ -167,7 +174,9 @@ impl Machine<'_, '_> {
         };
         if !supported {
             return Err(Trap::Unsupported(format!(
-                "Create New Object Instance mode {mode} with flags {flags:#x}"
+                "Create New Object Instance mode {mode} with flags {flags:#x} (0x44e0c8: \
+                 the modes' jump table 0x44e92e, flag 0x2 at 0x44e88c, flag 0x40 at \
+                 0x44e56e)"
             )));
         }
         let guid = if flags & FROM_RECORD != 0 {
@@ -187,11 +196,12 @@ impl Machine<'_, '_> {
         match mode {
             0 => self.create_ahead(guid, flags),
             2 => self.create_in_me(guid, flags),
+            3 => self.create_ahead_of_stack_object(guid, flags),
             4 => self.create_in_stack_object(guid, flags),
             5 => {
                 // 0x44e3e9: where I stand, on my level (+0x110, 0x44e132).
                 let [p0, p1, level] = self.me()?.position;
-                self.create_at(guid, flags, [p0, p1], level, None)
+                self.create_at(guid, flags, [p0, p1], level, NO_ROOM, None)
             }
             8 => self.create_at_local(guid, flags, operands[6] as i8),
             9 => self.create_in_front(guid, flags, operands[6] as i8),
@@ -572,7 +582,7 @@ impl Machine<'_, '_> {
             return Ok(false);
         };
         let [p0, p1, level] = reference.position;
-        self.create_at(guid, flags, [p0, p1], level, None)
+        self.create_at(guid, flags, [p0, p1], level, NO_ROOM, None)
     }
 
     /// Mode 9 of 0x44e0c8 (0x44e157, then the common tail): the tile in
@@ -607,7 +617,7 @@ impl Machine<'_, '_> {
         };
         let position = [p0.wrapping_add(step0 * 16), p1.wrapping_add(step1 * 16)];
         let facing = (direction + 4) % 8;
-        self.create_at(guid, flags, position, level, Some(facing))
+        self.create_at(guid, flags, position, level, NO_ROOM, Some(facing))
     }
 
     /// Mode 0 of 0x44e0c8 (0x44e1e6, then the common tail): the tile in
@@ -621,18 +631,51 @@ impl Machine<'_, '_> {
         let [p0, p1, level] = me.position;
         let [step0, step1] = crate::placement::step(me.data[1]);
         let position = [p0.wrapping_add(step0 * 16), p1.wrapping_add(step1 * 16)];
-        self.create_at(guid, flags, position, level, None)
+        self.create_at(guid, flags, position, level, NO_ROOM, None)
     }
 
-    /// Modes 0, 5, 8 and 9 of 0x44e0c8 from the position and level the
+    /// Mode 3 of 0x44e0c8 (0x44e34c, then the common tail): the tile in
+    /// front of the stack object. The stack object (frame +4, 0x40743b)
+    /// must name an object, or the false branch is taken before anything
+    /// is made. Its position moves one tile (16 units) in its facing (data
+    /// word 1, +0x4c, masked with 7; 0x42228a), on its level (+0x110).
+    /// Unlike mode 0, the room filter is the stack object's room (data
+    /// word 29, +0x84; 0x44e399), so the tail's room test runs: the room
+    /// the lot's room map gives the tile must be that room, unless it is
+    /// -5 (0x44e582). No facing is tested. The rest is mode 5's
+    /// ([`Machine::create_at`]).
+    fn create_ahead_of_stack_object(&mut self, guid: u32, flags: u8) -> Result<bool, Trap> {
+        let source = self.frame()?.stack_object;
+        let Some((id, object)) = u16::try_from(source)
+            .ok()
+            .filter(|id| *id > 0)
+            .and_then(|id| Some((id, self.world.objects.get(&id)?)))
+        else {
+            return Ok(false);
+        };
+        let [p0, p1, level] = object.position;
+        let [step0, step1] = crate::placement::step(object.data[1]);
+        let room = object
+            .data
+            .get(ROOM)
+            .copied()
+            .ok_or_else(|| Trap::Invalid(format!("object {id} has no data word {ROOM}")))?;
+        let position = [p0.wrapping_add(step0 * 16), p1.wrapping_add(step1 * 16)];
+        self.create_at(guid, flags, position, level, room, None)
+    }
+
+    /// Modes 0, 3, 5, 8 and 9 of 0x44e0c8 from the position and level the
     /// mode gives on: steps 2 to 8 of [`Machine::create_at_local`], with
-    /// flag 0x8's test after flag 0x1's ([`Machine::anything_on_tile`]).
+    /// flag 0x8's test after flag 0x1's ([`Machine::anything_on_tile`]),
+    /// and, after the off-lot test, mode 4's room test for a room filter
+    /// other than -5 (0x44e582, only mode 3's here).
     fn create_at(
         &mut self,
         guid: u32,
         flags: u8,
         position: [i32; 2],
         level: i32,
+        room: i16,
         facing: Option<i32>,
     ) -> Result<bool, Trap> {
         if flags & NOT_BESIDE_ITS_TYPE != 0 && self.same_type_on_tile(guid, position, level)? {
@@ -642,6 +685,9 @@ impl Machine<'_, '_> {
             return Ok(false);
         }
         if self.off_lot(position) {
+            return Ok(false);
+        }
+        if room != NO_ROOM && self.room_at(position, level)? != room {
             return Ok(false);
         }
         if let Some(facing) = facing {
