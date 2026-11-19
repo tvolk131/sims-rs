@@ -12,8 +12,9 @@ panel was compared.
 
 - **The rating** (0x416851): the architecture's value (+0xa4) over the
   objects' (+0xa0), through string 1 of the global file's `STR#` 505,
-  cut toward zero. The curve's text ends at its first NUL, as the
-  original copies it as a C string (0x4703ad). **Unverified:** its
+  cut toward zero. The curve's text ends at its first zero byte, before
+  any decoding, as the original copies its bytes as a C string
+  (0x4703ad). **Unverified:** its
   points are read by the motives' curve parser
   (`sims_sim::motives::Curve::parse`), which drops a point that is not
   well formed (`(100;90 coins)`) where the original's scanner (0x4614a2)

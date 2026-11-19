@@ -95,7 +95,7 @@ impl Tuning {
     /// The tuning from the curves' string table and the constants' table.
     /// A missing curve has no points and weighs everything 0, as the
     /// original's empty curve does (0x4167de). The curve's text ends at
-    /// its first NUL (0x4703ad). **Unverified:** the points are read by
+    /// its first zero byte (0x4703ad). **Unverified:** the points are read by
     /// `sims_sim::motives::Curve::parse`, which the motives' curves share;
     /// where text is not well formed (a point such as `(100;90 coins)`)
     /// it drops a point that the original's scanner (0x4614a2) reads.
@@ -103,12 +103,18 @@ impl Tuning {
     /// up ignoring the case of A to Z (0x4131f4) and takes the default
     /// for a missing one (0x413271).
     pub fn from_tables(curves: Option<&StringTable>, constants: Option<&Constants>) -> Self {
-        // The original copies the string as a C string (0x4703ad), so a
-        // NUL inside a length-prefixed string ends it.
+        // The original copies the string's bytes as a C string
+        // (0x4703ad), so a zero byte inside a length-prefixed string ends
+        // it, before any decoding.
         let curve = |n: usize| {
-            let text = curves.and_then(|t| t.get(n, US_ENGLISH)).unwrap_or("");
-            let text = text.split('\0').next().unwrap_or("");
-            Curve::parse(0, text, CURVE_POINTS)
+            let text = curves
+                .and_then(|t| t.entry(n, US_ENGLISH))
+                .map(|entry| {
+                    let bytes = entry.raw_text.split(|&b| b == 0).next().unwrap_or(&[]);
+                    sims_formats::strings::decode(bytes, entry.language)
+                })
+                .unwrap_or_default();
+            Curve::parse(0, &text, CURVE_POINTS)
         };
         let constant = |name: &str, default: f32| {
             constants
@@ -858,9 +864,25 @@ mod tests {
         assert_eq!(tuning.yard, F32::from_f32(0.5));
         assert_eq!((tuning.dirty, tuning.broken), (3, -6));
         assert_eq!(tuning.size.points.len(), 2);
-        // A NUL ends a curve's text.
+        // A zero byte ends a curve's text, before decoding: here a
+        // length-prefixed string of a UTF-16 byte order mark and "(0;90)".
         let cut = Tuning::from_tables(Some(&strings(&["(0;0)\0(200;100)"])), None);
         assert_eq!(cut.size.points.len(), 1);
+        let mut bytes = vec![0xff, 0xfe];
+        for b in b"(0;90)" {
+            bytes.extend([*b, 0]);
+        }
+        let wide = StringTable::parse_chunk(
+            &[[1u8, 0].as_slice(), &[bytes.len() as u8], &bytes].concat(),
+            0x10,
+        )
+        .unwrap();
+        assert!(
+            Tuning::from_tables(Some(&wide), None)
+                .size
+                .points
+                .is_empty()
+        );
         // Sorted by x as the original's curves are.
         assert_eq!(
             tuning.furnishings.points[0],
