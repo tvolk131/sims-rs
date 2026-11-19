@@ -37,9 +37,10 @@ events, and what it asks for after them) come first.
    state sparsely (every tenth update, and every update around events)
    and the random streams every update. Delete the captures and dumps it
    supersedes, and say which. Open: strict mode runs the whole day and
-   the day's turn (#233), but matches the recording only to tick 2510;
-   checking the rest against the recording is what remains. See
-   Progress.
+   the day's turn (#233, #244, #251). The full state matches the
+   recording through update 3340 and the lot's random stream through
+   3602 (#244, #251). Checking the rest against the recording is what
+   remains. See Progress.
 3. **1000 ticks on three more base-game houses**, picked for code the
    Goths do not reach (for example the Newbies and a family with
    children). Done (#221, #223, 2026-11-16): the Newbies, the Pleasants
@@ -49,10 +50,21 @@ events, and what it asks for after them) come first.
    `Interpreter::pie_menu`, `Interpreter::pick` and `Interpreter::order`.
    These also check the integration track's game.
 5. **All 49 primitives**: port the remaining ones as recordings reach
-   them, or with targeted scenarios. Make New Character (19) is the last
-   one the base game's trees use outside the tutorial; UI Effect (34)
-   is used only by the Tutorial and the Help System. See Progress.
-6. **One expansion-pack lot**, after steps 1 to 5.
+   them, or with targeted scenarios. Make New Character (19), the last
+   one the base game's trees use outside the tutorial, is ported for a
+   person (#243). UI Effect (34) is used only by the Tutorial and the
+   Help System. What remains is the failing modes of the ported
+   primitives. See Progress.
+6. **One expansion-pack lot**, after steps 1 to 5. The plan (track 4,
+   2026-11-18): House 69 in the second neighborhood (Unleashed, the
+   Charming family: one adult and one dog). The neighborhood's pending
+   `Patch/` family files are imported into it first (0x42bd13), which
+   builds the people from templates and rewrites the houses' placeholder
+   GUIDs. 6a: boot House 69 in strict mode from the original's imported
+   files and compare it with a 1000-tick recording. 6b: port the import,
+   checked file for file against the original's result. A community lot
+   follows once travel is in. No recording of an expansion lot exists
+   yet; track 2 has the import snapshot and the House 69 capture queued.
 
 ### Progress
 
@@ -62,7 +74,15 @@ events, and what it asks for after them) come first.
   original's state after every update to 453, once a press lists the
   menu again and reaching an entry checks it again. From update 454 the
   snack's simulation differs (the Room motive, then Mortimer's data
-  word 50): see the decisions log. A press on the house view or a pie
+  word 50): see the decisions log. With #238 the replay draws the
+  recording's frames, and it matches to update 1000 apart from those
+  known items. A live-mode frame lists the selected Sim's queue and
+  clears flag 0x80 (0x4d28df, 0x41f167). Next: find what writes
+  Mortimer's data word 50 at update 622 (0x452e8e, outside the lot
+  update), and replay the Sit/Read and cancel recordings in the window.
+  **Unverified:** when the original draws frames before update 171.
+  Track 2's harness now opens pie submenus such as Talk and picks
+  entries by position (#247). A press on the house view or a pie
   menu is now held while three lot updates run (#222), which the
   remaining player-order recordings (Read A Book, a social, buy mode,
   work) need. **Unverified:** the held press has not yet opened a pie
@@ -87,11 +107,22 @@ events, and what it asks for after them) come first.
   event 0 or, if that event never arrives, at the end of the clip. Burn
   (opcode 9, #235) places fire on a tile and spreads it to what catches
   (0x44d96f). Find 5 Worst Motives (opcode 33, #234) sorts eight motives
-  with the C runtime's qsort (0x44d077). Next: Make New Character (19,
-  a baby's birth and the mailbox's debug pet); UI Effect (34, Tutorial
-  and Help System only); moving a gathered person in Burn; removing an
-  object that holds another (`removal.rs`), where the snack order now
-  stops at step 15925; the failing modes of the ported primitives.
+  with the C runtime's qsort (0x44d077). Make New Character (19) is
+  ported for a person (#243, 0x44ae08): the clone, the made-type table
+  (snapshot format 30), the body strings and the body and head draws.
+  Change Suit/Accessory keeps an unnamed accessory after a failed suit
+  lookup (0x5a044d, #250) when every avatar file decoded; a miss after
+  decoder errors still stops loudly, naming the files. Alter Budget
+  category 8 adds the amount to the simulator's pointer to its
+  neighborhood request queue (0x46d933), which the idle loop then reads
+  (0x46dbf0). It stays unsupported until a native trace and a model of
+  that access exist (#249). Next: Make New Character's suit order and
+  body strings, its name (Dialog kind 3), and pets and a negative age;
+  UI Effect (34, Tutorial and Help System only); moving a gathered
+  person in Burn; removing an object that holds another (`removal.rs`);
+  the failing modes of the ported primitives. Since #244 no run on the
+  real install lights a fire, so Burn needs a new scenario for real-run
+  coverage.
   **Unverified:** none of the three against a capture. The first
   recording with a meal should check Reach's clip choice and the step at
   which the object moves. The first with a kitchen fire should check
@@ -124,13 +155,30 @@ events, and what it asks for after them) come first.
   is done, but over an empty list, not with a lot-position table: the
   neighborhood's table (+0x110) and lot order (+0x11c) are empty in
   every capture, and a write watch showed nothing fills them, so mode
-  11 always takes the false branch. The partial Goth day recording
-  covers updates 1 to 14,759. At its saved full-state checkpoints
-  through tick 2510, the run matches apart from the known head-target
-  bit and a transient motive-13 difference. In tick 2515 Snap mode 3 by a slot
-  offset (0x454b93) puts person 21 one tile off, so the run differs
-  from there on. Next: fix Snap's slot offset at tick 2515 (track 3),
-  then keep verifying the day against track 2's Goth day recording; the
+  11 always takes the false branch. (These tick numbers are from the
+  path before #244 and #251; the run now takes the original's path for
+  longer, so later events fall at other ticks.) The partial Goth day
+  recording covers updates 1 to 14,759. Snap mode 3 by a slot offset now
+  follows the original's order (0x454b93, #244), and Set To Next mode 3
+  follows a multi-tile group's links rather than the order its tiles
+  were registered in (0x44ec79, #251). The full state now matches the
+  recording through update 3340, apart from two values the original
+  never set and a transient at update 3350 (person 21's last result,
+  matching again at 3360; unverified), and the random stream matches
+  through 3602. Each fix changed the run's path, and strict mode goes
+  through the whole day again on the new one (#244, #251). Among the
+  ports this needed: an off-lot model matrix stands at height 0
+  (0x45ee1d), a route whose stack object is lost fails (0x45ae8d), a
+  route's end cancels the asked person's running action (0x45d617), and
+  Create New Object Instance mode 3 (0x44e34c). At tick 17707 the
+  neighbor controller offers a baby for adoption (a dialog of kind 1).
+  The whole-day test answers No, so strict boots of the day use
+  `--answers 3,3`. Next: the random-stream divergence at tick 3603 and
+  the transient at 3350 (track 3), then keep verifying the day against
+  track 2's Goth day recording, including the night (ours makes people
+  at ticks 29905, 29908 and 30463). `placement::on_lot` still uses a
+  fixed 64-tile bound where the original tests the lot's size
+  (0x422632). Also open: the
   Newbies in strict mode from tick 4052; the Pleasants and the Roomies
   beyond their first 1,000 updates when longer track 2 recordings are
   available. Known gap: the architecture's value
@@ -1973,9 +2021,23 @@ Progress:
   (reading on the bench and sofa, sitting, Mortimer's lab coat, the
   bus). Eating and sleeping fall outside that span and wait on track 2's
   Goth day recording.
-- Next: compare a person behind furniture with the original. Match the
-  original's lighting (see its decisions entry); compare Mortimer
-  standing without his book.
+- Done: the standard light shines from the viewer's side, and a room's
+  lamps light its people (0x4b4b04, #241). Not ported: the level's fade
+  over 250 ms, the 0.8 cap after dark and the full-light flag; the
+  material colours are unread. A sprite's x and y offset move it on the
+  screen, so a scooted chair sits under its Sim (0x437b7e, #248), and
+  the eating pose matches the original with the chair scooted in.
+- Track 2's Goth day recording has no table meal or bed sleep: in the
+  original Bella cooks at 13:13 and starts a fire, and the household
+  panics until 21:22. The bed-sleep pose still needs a screenshot of
+  the original from a run where a Sim is ordered to bed.
+- Known simulation timing gap (tracks 3 and 4's, not rendering):
+  Mortimer is about 25 ticks ahead of the original at the bookcase,
+  Cassandra leaves for the bus at 8:06 in the original, and the meals
+  fall at other times (ours has no 13:13 fire; a visitor eats at about
+  14:40).
+- Next: compare a person behind furniture with the original; the light
+  level's fade and cap; compare Mortimer standing without his book.
 - Done: a person's base layer is the simulation's (`World::base_layers`):
   the posture's loop or a script's clip, at the phase the simulation
   advanced it to. Over the Goths' first 3,400 ticks a person is seated
@@ -2168,9 +2230,16 @@ stop-sounds events.
   track's start now also sets its levels from its arguments, as the
   track's `args` field says (0x57db01). 2 events of kinds not ported
   remain, 103 and 104, which are debug commands.
+- **Done: the camera move** (33). A camera move places every sound
+  track again (0x574157, #245). **Unverified:** which view moves send
+  kind 33 in the original (five senders, not all read); whether
+  anything sends it when the hour changes; whether the original's older
+  notes follow its one track object (here each keeps its own thread's
+  levels).
 - **Next:**
-  - Placing the tracks again when the camera moves (kind 33), once the
-    game sends it only then.
+  - Kind 25, the sound-on flag that makes kind 33 write the volume less
+    1 (and whether it is sent at startup), and the day and night loop
+    that kind 33 picks (0x574978).
   - Tracks and fades step once a block (64 frames, about 2.9 ms); the
     original's sound manager steps them once a millisecond (0x57cf37).
   - Checking any of it against the original.
@@ -2316,12 +2385,21 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   which the original blends; whether frames should be cut to 16-bit
   color as the original's screen is; the simulation side of text entry
   dialogs (dialog kind 3 in `sims-vm`, not ported) and where the
-  original stores the entered text; the sign's help balloon (its
-  compatible signs); the job panel's blinking performance and its
-  tooltips; the house panel's Furnishings (the object scan 0x444cb9
-  plus the architecture value 0x47b006), Upkeep (the scan 0x4452eb) and
-  Layout (the routing history at lot +0x3c..+0x64); the residential-lot
-  check on the House button (0x40745f); the other live panels.
+  original stores the entered text; the job panel's blinking
+  performance and its tooltips; the house panel's Furnishings (the
+  object scan 0x444cb9 plus the architecture value 0x47b006) and Layout
+  (the routing history at lot +0x3c..+0x64); the needs panel's help
+  balloons with their pictures, and the balloon's 250 ms fade; the
+  residential-lot check on the House button (0x40745f); the other live
+  panels.
+- **Done:** the house panel's Upkeep rating, read as the original
+  scans (0x4452eb, 0x4168d4, #240); the sign of the zodiac opens its
+  help balloon on the personality panel (0x51bfb3, 0x50fc30, #246).
+  **Unverified:** the Goths' Upkeep of 100 against a screenshot of the
+  original; whether closing the strip hides the balloon in the
+  original, as it does here. The balloon's hides on a press outside a
+  rectangle (0x51f3e5) and on focus changes (0x51d312, 0x51d354) are not
+  ported.
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
   - A command intake, for example `World::apply(&mut self, command:
     sims_sim::Command) -> Result<(), CommandError>`, run between ticks,
@@ -2525,6 +2603,14 @@ through their public interfaces only; the simulation never depends on it.
 - Only the coordinator edits this roadmap. A track's PR does not touch it;
   its body ends with a **Roadmap** section saying which lines should change.
   After merging, the coordinator applies those changes in one docs commit.
+- Claude agents do the coordination, merging, divergence hunting,
+  recordings and other long-horizon work. Narrow, well-specified ports
+  (one function or branch, its addresses, the files it may touch, tests
+  that fail on today's code, an unchanged strict hash, and a clause to
+  stop and report if the work turns structural) go to GPT-6.2 Sol
+  implementers. A Claude agent reviews each Sol PR against the original
+  before it merges, and Sol reviews each Claude PR (adopted 2026-11-18
+  after a two-task pilot, #249 and #250).
 - Stop and ask the maintainer only when:
   - something only they can provide is needed (a login, or files not on
     this machine);
