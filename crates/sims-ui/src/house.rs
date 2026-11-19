@@ -90,9 +90,13 @@ impl Tuning {
     }
 
     /// The tuning from the curves' string table and the constants' table.
-    /// A missing curve has no points and weighs everything 0, as the
-    /// original's empty curve does (0x4167de). The curve's text is its
-    /// bytes up to the first zero byte (0x4703ad), each read as it is. **Unverified:** the points are read by
+    /// A curve that is there but empty has no points and weighs
+    /// everything 0, as the original's empty curve does (0x4167de). A
+    /// missing table or string does the same here; the original fetches
+    /// the string without a check (0x415df9) and its scanner crashes on
+    /// the null it gets (0x415e02, 0x461435). The install's table has
+    /// both. The curve's text is its bytes up to the first zero byte
+    /// (0x4703ad), each read as it is. **Unverified:** the points are read by
     /// `sims_sim::motives::Curve::parse`, which the motives' curves share;
     /// where text is not well formed (a point such as `(100;90 coins)`)
     /// it drops a point that the original's scanner (0x4614a2) reads.
@@ -510,10 +514,11 @@ impl Prices {
             .map(|(&style, entry)| (style, price(STYLE_TABLE, entry).unwrap_or(0)))
             .collect();
         styles.insert(SECOND_STYLE, styles[&PRICED_STYLES[0]]);
-        // A style's or the pool's string missing from a table that is
-        // there costs 0 here; the original reads it without a check
-        // (0x4cd4d3, 0x470531 returning null) and crashes in `atoi`
-        // (0x635fbe). The install's tables have them all.
+        // A style's or the pool's string, or its whole table, missing
+        // costs 0 here; the original reads it without a check (0x4cd4d3,
+        // 0x470531 returning null; a missing table's failed lookup is
+        // passed over at 0x4cd45f and 0x4cd727) and crashes in `atoi`
+        // (0x4cdace, 0x635fbe). The install's tables have them all.
         let pool = price(POOL_TABLE, 1).unwrap_or(0);
         // A built-in pattern whose entry is missing costs 0 (0x4a01eb,
         // 0x4c4f1e); a plug-in without a price of its own costs the

@@ -234,8 +234,12 @@ impl Surfaces {
 /// A pattern file's own price (see [`SurfaceFile::price`]), in US
 /// English (language 1), as everything here reads: the original takes
 /// the game's language (0x47028b, 0x470256).
+///
+/// The table is the first `STR#` with ID 0 in resource order, whatever
+/// its flags' high byte: the original's lookup compares the ID alone
+/// (0x41bbfb to 0x41bc02), where [`Iff::get`] keys by the high byte too.
 fn price(iff: &Iff) -> Option<i32> {
-    let chunk = iff.get(b"STR#", 0)?;
+    let chunk = iff.all(b"STR#").find(|chunk| chunk.id == 0)?;
     let table = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk)).ok()?;
     Some(atoi(&table.entry(1, US_ENGLISH)?.raw_text))
 }
@@ -334,6 +338,9 @@ mod tests {
         big.swap(2, 3);
         assert_eq!(price(&iff_flags(&[(0, 0, big.clone())])), Some(25));
         assert_eq!(price(&iff_flags(&[(0, 0x10, big)])), None);
+        // Whatever its flags' high byte.
+        let high = iff_flags(&[(0, 0x0110, table(&["Name", "25"]))]);
+        assert_eq!(price(&high), Some(25));
         // A little-endian length-prefixed table: its count is its first word.
         let pascal = b"\x02\x00\x04Name\x0225".to_vec();
         assert_eq!(price(&iff_flags(&[(0, 0x10, pascal)])), Some(25));
