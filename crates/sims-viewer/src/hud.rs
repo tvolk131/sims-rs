@@ -37,10 +37,10 @@ pub struct Hud {
     /// when the house panel first shows: the viewer's world does not
     /// change, so once.
     kinds: Option<house::Kinds>,
-    /// Whether the world's floor and wall patterns are the catalogs' keys,
-    /// which the architecture's prices are by. When not, as in the house
-    /// file as saved, the Furnishings rating is left out rather than
-    /// priced by the wrong patterns.
+    /// Whether the world's floor and wall patterns are known to be the
+    /// catalogs' keys, which the architecture's prices are by. When not,
+    /// as in the house file as saved or a snapshot, the Furnishings rating
+    /// is left out rather than priced by the wrong patterns.
     pub priced: bool,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,

@@ -77,6 +77,23 @@ impl StringTable {
         }
         Ok(Self { format, entries })
     }
+    /// Parses a chunk's table as the original's string loader does
+    /// (0x46feac): a chunk without flag 0x10 is taken as big-endian and
+    /// handed to 0x470351, which swaps the leading word and, when that is
+    /// then -1, the count. A version -1 table in such a chunk (`FF FF`,
+    /// then a big-endian count) is read with its count swapped. Any other
+    /// leading word is read as [`StringTable::parse`] reads it, which
+    /// already takes a word that is not a version as a big-endian count
+    /// (**unverified** for a version word other than -1 in such a chunk;
+    /// none is known).
+    pub fn parse_chunk(data: &[u8], flags: u16) -> Result<Self> {
+        if flags & 0x10 == 0 && data.len() >= 4 && data[..2] == [0xff, 0xff] {
+            let mut swapped = data.to_vec();
+            swapped.swap(2, 3);
+            return Self::parse(&swapped);
+        }
+        Self::parse(data)
+    }
     pub fn get(&self, index: usize, language: u8) -> Option<&str> {
         self.entry(index, language).map(|e| e.text.as_str())
     }

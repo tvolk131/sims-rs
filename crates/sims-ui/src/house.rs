@@ -414,9 +414,9 @@ fn lot_family_members(world: &World) -> i32 {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Prices {
     /// The price of a wall by its style (the table at 0x6e5838). Build
-    /// mode's catalog fills five entries from `Build.iff` `STR#` 129
-    /// (0x4cd149): its entries 1 to 5 give styles 1, 2, 13, 12 and 14.
-    /// Every other style costs 0.
+    /// mode's catalog fills six entries from `Build.iff` `STR#` 129
+    /// (0x4cd149): its entries 1 to 5 give styles 1, 2, 13, 12 and 14, and
+    /// entry 1 style 255 too (0x4cd48d). Every other style costs 0.
     pub styles: BTreeMap<u16, i32>,
     /// The price of a pool tile (0x6c5ff8): `STR#` 133 entry 1 (0x4cd757).
     pub pool: i32,
@@ -437,6 +437,8 @@ const FLOOR_DEFAULT_TABLE: u16 = 134;
 const WALL_DEFAULT_TABLE: u16 = 135;
 /// The styles `STR#` 129's entries 1 to 5 price (0x4cd488 to 0x4cd5da).
 const PRICED_STYLES: [u16; 5] = [1, 2, 13, 12, 14];
+/// The style entry 1 also prices (0x4cd48d).
+const SECOND_STYLE: u16 = 255;
 /// The built-in floors' keys, 1 to 29 (0x4a01c5 to 0x4a02a8), and the
 /// built-in wall patterns', 0 to 255 less the plug-ins' range 31 to 247
 /// (0x4c4ee5 to 0x4c50fd).
@@ -446,9 +448,9 @@ impl Prices {
     /// Reads the prices from the install's `GameData/Build.iff` and the
     /// pattern catalogs. A missing file or table prices what it would
     /// have priced at 0. **Not ported:** the lookup (0x47028b) tries a
-    /// resource of type `'CST'` (0x00435354) with the same ID when the
-    /// `STR#` is missing; which chunk tag that matches in a file is not
-    /// read, and the install's files have no such chunk.
+    /// resource of type `'CST'` (0x00435354, the chunk tag `\0CST` on
+    /// disk) with the same ID when the `STR#` is missing, and reads it by
+    /// another path (0x470178); the install's files have no such chunk.
     pub fn load(install: &Install, surfaces: &Surfaces) -> Self {
         let tables: BTreeMap<u16, StringTable> = install
             .file("GameData/Build.iff")
@@ -466,7 +468,10 @@ impl Prices {
                 .into_iter()
                 .filter_map(|id| {
                     let chunk = iff.get(b"STR#", id)?;
-                    Some((id, StringTable::parse(iff.data(chunk)).ok()?))
+                    Some((
+                        id,
+                        StringTable::parse_chunk(iff.data(chunk), chunk.flags).ok()?,
+                    ))
                 })
                 .collect()
             })
@@ -483,11 +488,12 @@ impl Prices {
             let at = usize::from(entry).checked_sub(1)? * 3;
             Some(atoi(&tables.get(&table)?.entry(at, US_ENGLISH)?.raw_text))
         };
-        let styles = PRICED_STYLES
+        let mut styles: BTreeMap<u16, i32> = PRICED_STYLES
             .iter()
             .zip(1..)
             .map(|(&style, entry)| (style, price(STYLE_TABLE, entry).unwrap_or(0)))
             .collect();
+        styles.insert(SECOND_STYLE, styles[&PRICED_STYLES[0]]);
         let pool = price(POOL_TABLE, 1).unwrap_or(0);
         // A built-in pattern whose entry is missing costs 0 (0x4a01eb,
         // 0x4c4f1e); a plug-in without a price of its own costs the
@@ -1056,7 +1062,7 @@ mod tests {
         let prices = Prices::from_tables(&tables, &surfaces);
         assert_eq!(
             prices.styles,
-            BTreeMap::from([(1, 70), (2, 10), (13, 45), (12, 35), (14, 40)])
+            BTreeMap::from([(1, 70), (2, 10), (13, 45), (12, 35), (14, 40), (255, 70)])
         );
         assert_eq!(prices.pool, 75);
         // A built-in floor beyond the table, and one whose price is not a

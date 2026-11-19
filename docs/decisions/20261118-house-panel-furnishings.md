@@ -66,12 +66,16 @@ panel was compared.
   - **Pool:** on level 1, a pool byte below 0x10 adds the pool's price.
   - A level whose tile flags, floors or walls are missing adds nothing.
     A missing pool array leaves out only the pool's price.
-- **The prices** (`Prices::load`) come from `GameData/Build.iff`. Each
+- **The prices** (`Prices::load`) come from `GameData/Build.iff`. A
+  table in a chunk without flag 0x10 is big-endian to the original,
+  which swaps a version -1 table's count (0x470351,
+  `StringTable::parse_chunk`); so is a pattern file's. Each
   string-table entry is three strings, and the first is the price, read
   as C's `atoi` reads its bytes (0x636029, `sims_content::atoi`), so a
   byte order mark before the digits reads 0:
   - Wall styles (0x6e5838): `STR#` 129, entries 1 to 5, give styles 1,
-    2, 13, 12 and 14 (0x4cd149). Every other style costs 0.
+    2, 13, 12 and 14 (0x4cd149), and entry 1 gives style 255 too
+    (0x4cd48d). Every other style costs 0.
   - The pool (0x6c5ff8): `STR#` 133, entry 1 (75 here, over the exe's
     100).
   - The built-in floors, keys 1 to 29: `STR#` 130 (0x4a01cb).
@@ -82,9 +86,11 @@ panel was compared.
     that table or string it costs string 0 of `STR#` 134 (floors) or 135
     (walls).
   - **Not ported:** when a `STR#` is missing, the lookup (0x47028b)
-    tries a resource of type `'CST'` (0x00435354) with the same ID.
-    Which chunk tag that matches in a file was not read, and the
-    install's files have none.
+    tries a resource of type `'CST'` (0x00435354) with the same ID,
+    which is the chunk tag `\0CST` on disk (the reader reverses the
+    type's bytes, 0x41a5ab), and reads it by another path (0x470178).
+    The install's files have no such chunk.
+    Pattern files ask for `STR#` alone.
   - Build mode's catalog, which fills the style table and the pool's
     price, is made on first request (0x4ce31a). The match with the
     capture needs the five style prices, so it was made by update 1.
@@ -92,7 +98,9 @@ panel was compared.
   it, the viewer shows the house file as saved, whose floors and walls
   keep the house's own pattern numbers, not the catalogs' keys. Its
   panel then leaves Furnishings out rather than price the wrong
-  patterns.
+  patterns. It does the same for a snapshot, which does not record the
+  catalogs its patterns were keyed by: a plug-in added or removed since
+  would shift the keys.
 - **Unverified:**
   - A wall side whose neighbour does not own it costs 0. The original
     reads whatever its stack held there.
@@ -101,8 +109,9 @@ panel was compared.
     to have one.
 - **Tests:**
   - `atoi`, a byte order mark included;
-  - a pattern file's price from `STR#` 0, with another table first, and
-    without table 0 or its string;
+  - a pattern file's price from `STR#` 0, with another table first,
+    without table 0 or its string, and a big-endian count without
+    flag 0x10;
   - the prices from stand-in tables and pattern files;
   - the architecture of a hand-made lot (straight walls, a fence, a
     split floor, a diagonal that is not the lowest segment, a skipped

@@ -97,8 +97,8 @@ pub struct SurfaceFile {
     /// Each pattern's key by its number in the file.
     pub keys: BTreeMap<u16, u16>,
     /// The price each of the file's patterns is given (0x4a0a84,
-    /// 0x4c59a0): string 1, from 0, of the file's `STR#` with ID 0, read
-    /// as C's `atoi` reads its bytes, or None when the file lacks that
+    /// 0x4c59a0): string 1, from 0, of the file's `STR#` with ID 0
+    /// ([`StringTable::parse_chunk`]), read as C's `atoi` reads its bytes, or None when the file lacks that
     /// table or string (the pattern then costs the catalog's default).
     pub price: Option<i32>,
 }
@@ -234,7 +234,7 @@ impl Surfaces {
 /// A pattern file's own price (see [`SurfaceFile::price`]).
 fn price(iff: &Iff) -> Option<i32> {
     let chunk = iff.get(b"STR#", 0)?;
-    let table = StringTable::parse(iff.data(chunk)).ok()?;
+    let table = StringTable::parse_chunk(iff.data(chunk), chunk.flags).ok()?;
     Some(atoi(&table.entry(1, US_ENGLISH)?.raw_text))
 }
 
@@ -291,15 +291,25 @@ mod tests {
         data
     }
 
-    /// An IFF of `STR#` chunks by ID, in file order.
+    /// An IFF of `STR#` chunks by ID, in file order, each with flag 0x10
+    /// (little-endian).
     fn iff(tables: &[(u16, Vec<u8>)]) -> Iff {
+        let flagged: Vec<_> = tables
+            .iter()
+            .map(|(id, d)| (*id, 0x10, d.clone()))
+            .collect();
+        iff_flags(&flagged)
+    }
+
+    /// An IFF of `STR#` chunks by ID and flags, in file order.
+    fn iff_flags(tables: &[(u16, u16, Vec<u8>)]) -> Iff {
         let mut bytes = b"IFF FILE 2.5:TYPE FOLLOWED BY SIZE\0 JAMIE DOLINE 1998".to_vec();
         bytes.resize(64, 0);
-        for (id, data) in tables {
+        for (id, flags, data) in tables {
             bytes.extend(b"STR#");
             bytes.extend((76 + data.len() as u32).to_be_bytes());
             bytes.extend(id.to_be_bytes());
-            bytes.extend([0u8; 2]);
+            bytes.extend(flags.to_be_bytes());
             bytes.extend([0u8; 64]);
             bytes.extend(data);
         }
@@ -317,5 +327,10 @@ mod tests {
         assert_eq!(price(&iff(&[(0, table(&["Name"]))])), None);
         // A byte order mark before the digits reads 0.
         assert_eq!(price(&iff(&[(0, table(&["Name", "\u{feff}25"]))])), Some(0));
+        // Without flag 0x10 a version -1 table's count is big-endian.
+        let mut big = table(&["Name", "25"]);
+        big.swap(2, 3);
+        assert_eq!(price(&iff_flags(&[(0, 0, big.clone())])), Some(25));
+        assert_eq!(price(&iff_flags(&[(0, 0x10, big)])), None);
     }
 }
