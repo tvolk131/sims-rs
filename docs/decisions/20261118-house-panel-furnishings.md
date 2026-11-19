@@ -52,6 +52,17 @@ No screenshot of the panel was compared.
   new objects' value is weighed against the saved architecture's. This is a known gap in
   the simulation, not the original's behaviour; it is the simulation's
   to close, with these sums.
+- **Not ported in `sims-vm`'s linker** (`Program`), which the day's
+  turn values objects by: it reads every `STR#` and `OBJD` chunk of a
+  file, keyed by ID alone, where the original looks each up by ID and
+  flags' high byte 0 (0x41bab1; 0x43ba7b). So a `STR#` of another high
+  byte that does not parse stops the boot, and a later `OBJD` of
+  another high byte replaces the definition of high byte 0. No such
+  chunk is in the install (3,782 files, FAR members included). Its
+  master search (`group_master`) also takes a definition with
+  word 16 set, which the original does not register (0x43baba); the
+  install has one such master. Both are the simulation's to close; the
+  panel's own sums here follow the original.
 - **The objects** (0x444cb9), in the lot's order, in 32-bit sums that
   wrap:
   - A tile of a multi-tile group that is not its lead, and a type with
@@ -71,9 +82,13 @@ No screenshot of the panel was compared.
   - The definition words are read as `sims-vm` holds them. The master
     is the file's first definition, in resource order, with the group
     and word 11 -1, of each ID's definition with flags' high byte 0,
-    each ID once, as the original registers them (0x43b9dc to 0x43ba0b;
-    0x43ba7b, through 0x41bab1) and searches them (0x43ae36 to
-    0x43ae5f). A person
+    each ID once, less a definition with word 16 not 0, as the original
+    registers them (0x43b9dc to 0x43ba0b; 0x43ba7b, through 0x41bab1;
+    0x43baba to 0x43badb, with the catalog's flag set at 0x413f7d,
+    0x41415f and 0x43aee7) and searches them (0x43ae36 to 0x43ae5f). An
+    ID with no definition of flags' high byte 0 is passed over, where
+    the original reads through a null handle (0x43ba7b, 0x431759,
+    0x41fff6); no definition of the install has another high byte. A person
     without a master is still valued, since the person test comes first.
     Any other type without a master, where the original reads through a
     null pointer, is neither valued nor counted to the architecture
@@ -158,9 +173,11 @@ No screenshot of the panel was compared.
     byte is not found, wherever it stands.
   - The built-in floors, keys 1 to 29: `STR#` 130 (0x4a01cb).
   - The built-in wall patterns, keys 0 to 30 and 248 to 255: `STR#` 131
-    (0x4c4ee5; the high keys at 0x4c4ef3, 0x4c4f22 to 0x4c4f4e). The
-    install's table has no entry for key 0 or the high keys, so they
-    cost 0 with it; an entry would price them, here as there.
+    (0x4c4ee5; the high keys at 0x4c4ef3, 0x4c4f22 to 0x4c4f4e). Key 0
+    asks for string -2 (0x4c4f22), which the accessor refuses (0x470515
+    to 0x470531), so it always costs 0. The install's table has no
+    entry for the high keys, so they cost 0 with it; a longer table
+    would price them, here as there.
   - A plug-in pattern costs string 1, from 0, of its file's `STR#` with
     ID 0 and flags' high byte 0, as above (0x4a0a84, 0x4c59a0), now kept as
     `SurfaceFile::price`. Without

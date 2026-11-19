@@ -173,9 +173,10 @@ pub struct Type {
     /// (0x45728d): the type itself outside a group, else the first
     /// definition of its file, in resource order, with the same group and
     /// word 11 -1. Of each ID it reads the definition with flags' high
-    /// byte 0, once, as the original registers the file's definitions
-    /// (0x43b9dc to 0x43ba0b; 0x43ba7b, through 0x41bab1) and its search
-    /// walks them (0x43ae36 to 0x43ae5f). None when the group has no
+    /// byte 0, once, and not one with word 16 set, as the original
+    /// registers the file's definitions (0x43b9dc to 0x43ba0b; 0x43ba7b,
+    /// through 0x41bab1; 0x43baba) and its search walks them (0x43ae36 to
+    /// 0x43ae5f). None when the group has no
     /// master, where the original reads through a null pointer.
     pub build: Option<i16>,
 }
@@ -185,6 +186,10 @@ mod word {
     pub const KIND: usize = 9;
     pub const GROUP: usize = 10;
     pub const GROUP_INDEX: usize = 11;
+    /// Not 0 on a definition the object catalog does not register
+    /// (0x43baba, with the catalog's flag set: 0x413f7d, 0x41415f,
+    /// 0x43aee7).
+    pub const UNREGISTERED: usize = 16;
     /// Room flags, function flags and the build mode type (+0x4e, +0x50,
     /// +0x8a).
     pub const COUNTED: [usize; 3] = [39, 40, 69];
@@ -246,8 +251,12 @@ impl Kinds {
     /// The catalog master of group `group` in `iff` (see [`Type::build`]):
     /// its first definition, in resource order, with that group and word
     /// 11 -1, of each ID's definition with flags' high byte 0, each ID
-    /// once. None inside when there is none; None when the file's
-    /// resource map cannot be used.
+    /// once, less those with word 16 not 0, which the original does not
+    /// register (0x43baba to 0x43badb). An ID with no definition of high
+    /// byte 0 is passed over; the original reads through the null handle
+    /// it gets (0x43ba7b, 0x431759, 0x41fff6). No definition of the
+    /// install has another high byte. None inside when there is no
+    /// master; None when the file's resource map cannot be used.
     fn master(iff: &Iff, group: i16) -> Option<Option<[i16; DEFINITION_BYTES / 2]>> {
         let mut seen = BTreeSet::new();
         Some(
@@ -257,6 +266,7 @@ impl Kinds {
                 .filter(|chunk| seen.insert(chunk.id))
                 .filter_map(|chunk| iff.get(b"OBJD", chunk.id))
                 .map(|chunk| Self::words(iff.data(chunk)))
+                .filter(|other| other[word::UNREGISTERED] == 0)
                 .find(|other| other[word::GROUP] == group && other[word::GROUP_INDEX] == -1),
         )
     }
@@ -1430,11 +1440,12 @@ mod tests {
     #[test]
     fn a_groups_master_is_read_from_each_ids_definition_of_high_byte_0() {
         // A definition of group 3: its word 11 and build mode type.
-        let definition = |index: i16, build: i16| {
+        let definition = |index: i16, build: i16, unregistered: i16| {
             let mut words = [0i16; DEFINITION_BYTES / 2];
             words[word::GROUP] = 3;
             words[word::GROUP_INDEX] = index;
             words[word::BUILD] = build;
+            words[word::UNREGISTERED] = unregistered;
             words
                 .iter()
                 .flat_map(|w| w.to_le_bytes())
@@ -1444,11 +1455,13 @@ mod tests {
         bytes.resize(64, 0);
         // ID 5 with flags' high byte 1 looks like a master and comes first,
         // but the original registers ID 5 by its high byte 0 definition,
-        // which is not one; ID 6 is.
+        // which is not one. ID 4 is one with word 16 set, which the
+        // original does not register; ID 6 is the master.
         for (id, flags, data) in [
-            (5u16, 0x0110u16, definition(-1, 9)),
-            (5, 0x0010, definition(0, 1)),
-            (6, 0x0010, definition(-1, 2)),
+            (5u16, 0x0110u16, definition(-1, 9, 0)),
+            (5, 0x0010, definition(0, 1, 0)),
+            (4, 0x0010, definition(-1, 7, 1)),
+            (6, 0x0010, definition(-1, 2, 0)),
         ] {
             bytes.extend(b"OBJD");
             bytes.extend((76 + data.len() as u32).to_be_bytes());
